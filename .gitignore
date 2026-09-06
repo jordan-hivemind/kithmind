@@ -1,0 +1,13 @@
+node_modules/
+.next/
+.turbo/
+dist/
+.env
+.env.local
+.env.*.local
+.vercel
+.worktrees/
+.superpowers/
+
+# Personal build plans, tracker, and anything naming real people or accounts. Local only.
+docs/private/

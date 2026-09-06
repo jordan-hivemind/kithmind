@@ -1,0 +1,59 @@
+import { v } from "convex/values";
+
+export const thoughtType = v.union(
+  v.literal("decision"),
+  v.literal("person_note"),
+  v.literal("idea"),
+  v.literal("meeting_note"),
+  v.literal("task"),
+  v.literal("reference"),
+);
+
+export const thoughtMetadata = v.object({
+  type: thoughtType,
+  topics: v.array(v.string()),
+  people: v.array(v.string()),
+  actionItems: v.array(v.string()),
+  summary: v.string(),
+});
+
+export const memoryStatus = v.union(
+  v.literal("current"),
+  v.literal("superseded"),
+  v.literal("retracted"),
+);
+
+export const memorySourceType = v.union(
+  v.literal("user_stated"),
+  v.literal("user_confirmed"),
+  v.literal("assistant_commitment"),
+);
+
+export const thoughtLifecycleFields = {
+  // Core memories are a small, explicitly selected set suitable for always-on
+  // context. Legacy memories without the marker are treated as non-core.
+  isCore: v.optional(v.boolean()),
+  // Business-time validity is distinct from when the memory was recorded or
+  // superseded. Values are Unix timestamps in milliseconds.
+  validFrom: v.optional(v.number()),
+  validTo: v.optional(v.number()),
+  memoryStatus: v.optional(memoryStatus),
+  supersededAt: v.optional(v.number()),
+  supersededBy: v.optional(v.id("thoughts")),
+  supersedes: v.optional(v.array(v.id("thoughts"))),
+  changeReason: v.optional(v.string()),
+  sourceType: v.optional(memorySourceType),
+  sourceRef: v.optional(v.string()),
+  observedAt: v.optional(v.number()),
+  batchId: v.optional(v.string()),
+  confidence: v.optional(v.number()),
+};
+
+export const thoughtFields = {
+  content: v.string(),
+  embedding: v.array(v.float64()),
+  metadata: thoughtMetadata,
+  userId: v.id("users"),
+  updatedAt: v.optional(v.number()),
+  ...thoughtLifecycleFields,
+};

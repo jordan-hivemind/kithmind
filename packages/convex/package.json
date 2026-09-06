@@ -1,0 +1,31 @@
+{
+  "name": "@repo/db",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./convex/_generated/api": "./convex/_generated/api.js",
+    "./convex/*": "./convex/*",
+    "./models/*": "./convex/models/*"
+  },
+  "scripts": {
+    "dev": "convex dev",
+    "deploy:dev": "convex dev --once",
+    "deploy:prod": "convex deploy -y",
+    "check-types": "tsc --noEmit",
+    "test": "vitest",
+    "test:once": "vitest run"
+  },
+  "dependencies": {
+    "@auth/core": "^0.41.3",
+    "@convex-dev/auth": "^0.0.94",
+    "convex": "^1.43.0"
+  },
+  "devDependencies": {
+    "@edge-runtime/vm": "^5.0.0",
+    "@types/node": "25.3.3",
+    "convex-test": "^0.0.55",
+    "vite": "8.2.1",
+    "vitest": "^4.1.10"
+  }
+}

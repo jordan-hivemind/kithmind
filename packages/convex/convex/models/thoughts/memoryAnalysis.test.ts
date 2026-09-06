@@ -1,0 +1,245 @@
+import { describe, expect, test } from "vitest";
+
+import {
+  canReuseEmbedding,
+  fallbackThoughtMetadata,
+  MAX_CAPTURE_CONTENT_CHARS,
+  normalizeCaptureContent,
+  normalizeThoughtMetadata,
+  parseThoughtAnalysis,
+  preflightNarrativeAdmission,
+} from "./memoryAnalysis";
+
+const candidateIds = ["old-school"];
+
+describe("memory provider analysis", () => {
+  test("parses one combined add decision and metadata response", () => {
+    expect(
+      parseThoughtAnalysis(
+        JSON.stringify({
+          action: "ADD",
+          relatedThoughtIds: [],
+          reason: "Independent durable fact",
+          replacementContent: null,
+          metadata: {
+            type: "reference",
+            topics: ["Atlas Memory", "migration", "migration", "release"],
+            people: ["Noam"],
+            actionItems: [],
+            summary: "Atlas Memory uses migration ticket ATLAS-184",
+          },
+        }),
+        candidateIds,
+        "Atlas Memory v2.7.1 uses migration ticket ATLAS-184.",
+      ),
+    ).toEqual({
+      classification: {
+        action: "ADD",
+        relatedThoughtIds: [],
+        reason: "Independent durable fact",
+      },
+      metadata: {
+        type: "reference",
+        topics: ["Atlas Memory", "migration", "release"],
+        people: ["Noam"],
+        actionItems: [],
+        summary: "Atlas Memory uses migration ticket ATLAS-184",
+      },
+    });
+  });
+
+  test("uses replacement content when normalizing transition metadata", () => {
+    const analysis = parseThoughtAnalysis(
+      JSON.stringify({
+        action: "SUPERSEDE",
+        relatedThoughtIds: ["old-school"],
+        reason: "Rowan changed schools",
+        replacementContent:
+          "Rowan attends Redwood Academy and previously attended Lakeside School.",
+        metadata: {
+          type: "not-a-type",
+          topics: ["school"],
+          people: ["Rowan", 42],
+          actionItems: [],
+          summary: "",
+        },
+      }),
+      candidateIds,
+      "Rowan now attends Redwood Academy.",
+    );
+
+    expect(analysis?.classification.action).toBe("SUPERSEDE");
+    expect(analysis?.metadata).toEqual({
+      ...fallbackThoughtMetadata(
+        "Rowan attends Redwood Academy and previously attended Lakeside School.",
+      ),
+      topics: ["school"],
+      people: ["Rowan"],
+    });
+  });
+
+  test("fails closed on invalid JSON or an ungrounded transition id", () => {
+    expect(
+      parseThoughtAnalysis("not json", candidateIds, "New fact"),
+    ).toBeNull();
+    expect(
+      parseThoughtAnalysis(
+        JSON.stringify({
+          action: "RETRACT",
+          relatedThoughtIds: ["invented-id"],
+          reason: "Correction",
+          replacementContent: "Corrected fact",
+          metadata: {},
+        }),
+        candidateIds,
+        "Corrected fact",
+      ),
+    ).toBeNull();
+  });
+
+  test("parses ask and skip admission decisions without transition ids", () => {
+    for (const action of ["ASK", "SKIP"] as const) {
+      const analysis = parseThoughtAnalysis(
+        JSON.stringify({
+          action,
+          relatedThoughtIds: ["old-school"],
+          reason:
+            action === "ASK"
+              ? "Route the exact school relationship to structured facts"
+              : "Current age is derived and goes stale",
+          replacementContent: null,
+          metadata: {
+            type: "person_note",
+            topics: ["Rowan"],
+            people: ["Rowan"],
+            actionItems: [],
+            summary: "Candidate not admitted",
+          },
+        }),
+        candidateIds,
+        action === "ASK"
+          ? "Rowan attends Hillcrest School."
+          : "Rowan is 17 years old.",
+      );
+
+      expect(analysis?.classification).toEqual({
+        action,
+        relatedThoughtIds: [],
+        reason:
+          action === "ASK"
+            ? "Route the exact school relationship to structured facts"
+            : "Current age is derived and goes stale",
+      });
+    }
+  });
+
+  test("bounds and normalizes metadata supplied by a model", () => {
+    const long = "x".repeat(400);
+    expect(
+      normalizeThoughtMetadata(
+        {
+          type: "person_note",
+          topics: [" one ", "one", "two", "three", "four"],
+          people: Array.from({ length: 12 }, (_, index) => `Person ${index}`),
+          actionItems: [long],
+          summary: long,
+        },
+        "Fallback",
+      ),
+    ).toMatchObject({
+      type: "person_note",
+      topics: ["one", "two", "three"],
+      people: Array.from({ length: 10 }, (_, index) => `Person ${index}`),
+      actionItems: ["x".repeat(200)],
+      summary: "x".repeat(240),
+    });
+  });
+
+  test("rejects empty or oversized captures before provider calls", () => {
+    expect(normalizeCaptureContent("  durable fact  ")).toBe("durable fact");
+    expect(() => normalizeCaptureContent("   ")).toThrow(
+      "Memory content must contain",
+    );
+    expect(() =>
+      normalizeCaptureContent("x".repeat(MAX_CAPTURE_CONTENT_CHARS + 1)),
+    ).toThrow("Memory content must contain");
+  });
+
+  test("reuses embeddings only when the stored text is unchanged", () => {
+    expect(canReuseEmbedding("same", "same")).toBe(true);
+    expect(canReuseEmbedding("new fact", "new fact with history")).toBe(false);
+  });
+
+  test("deterministically declines derived ages and broad bootstrap buckets", () => {
+    expect(preflightNarrativeAdmission("Rowan is 17 years old.")).toEqual({
+      action: "SKIP",
+      reason: expect.stringContaining("date_of_birth"),
+    });
+    expect(
+      preflightNarrativeAdmission(
+        "About me: founder, investor, sailor, neighborhood blogger, generative artist, and advisor across several unrelated companies.",
+      ),
+    ).toEqual({
+      action: "ASK",
+      reason: expect.stringContaining("broad bucket"),
+    });
+    expect(
+      preflightNarrativeAdmission(
+        "AI Brain will use Convex because it provides the database and application functions in one service. The decision keeps the personal deployment simpler.",
+      ),
+    ).toBeNull();
+  });
+});
+
+describe("structured fact coverage in the admission gate", () => {
+  test("accepts a NOOP that cites a covering fact instead of a thought", () => {
+    // The fact id reaches parseThoughtAnalysis through the same candidate set
+    // as thought ids. If it were omitted the citation would be dropped, the
+    // NOOP would be rejected as malformed, and the narrative duplicate the
+    // gate just declined would be stored anyway.
+    const analysis = parseThoughtAnalysis(
+      JSON.stringify({
+        action: "NOOP",
+        relatedThoughtIds: ["fact-123"],
+        reason: "Already recorded as a structured date_of_birth fact",
+        replacementContent: null,
+        metadata: {
+          type: "person_note",
+          topics: ["Rowan"],
+          people: ["Rowan"],
+          actionItems: [],
+          summary: "Rowan's date of birth",
+        },
+      }),
+      ["thought-1", "fact-123"],
+      "Rowan was born on March 4, 2010",
+    );
+
+    expect(analysis?.classification).toMatchObject({
+      action: "NOOP",
+      relatedThoughtIds: ["fact-123"],
+    });
+  });
+
+  test("drops a citation naming neither a candidate thought nor a covering fact", () => {
+    expect(
+      parseThoughtAnalysis(
+        JSON.stringify({
+          action: "NOOP",
+          relatedThoughtIds: ["invented-id"],
+          reason: "Already captured",
+          replacementContent: null,
+          metadata: {
+            type: "reference",
+            topics: [],
+            people: [],
+            actionItems: [],
+            summary: "x",
+          },
+        }),
+        ["thought-1", "fact-123"],
+        "Some content",
+      ),
+    ).toBeNull();
+  });
+});

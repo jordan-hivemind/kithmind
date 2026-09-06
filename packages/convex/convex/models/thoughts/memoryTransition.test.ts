@@ -1,0 +1,336 @@
+import { convexTest } from "convex-test";
+import { describe, expect, test } from "vitest";
+
+import { internal } from "../../_generated/api";
+import schema from "../../schema";
+import { modules } from "../../test.setup";
+import { _listByUser } from "./model";
+
+const embedding = Array.from({ length: 1536 }, () => 0);
+const metadata = {
+  type: "person_note" as const,
+  topics: ["school"],
+  people: ["Rowan"],
+  actionItems: [],
+  summary: "Rowan's school",
+};
+const lakesideStart = Date.UTC(2023, 7, 21);
+const redwoodStart = Date.now() - 1_000;
+
+describe("temporal memory transitions", () => {
+  test("keeps inactive validity windows out of current recall without erasing them", async () => {
+    const t = convexTest(schema, modules);
+    const userId = await t.run((ctx) => ctx.db.insert("users", {}));
+    const now = Date.now();
+    const [expiredId, futureId, activeId] = await t.run(async (ctx) => [
+      await ctx.db.insert("thoughts", {
+        userId,
+        content: "A formerly true fact",
+        embedding,
+        metadata,
+        memoryStatus: "current",
+        validTo: now - 1,
+      }),
+      await ctx.db.insert("thoughts", {
+        userId,
+        content: "A scheduled future fact",
+        embedding,
+        metadata,
+        memoryStatus: "current",
+        validFrom: now + 60_000,
+      }),
+      await ctx.db.insert("thoughts", {
+        userId,
+        content: "A fact true now",
+        embedding,
+        metadata,
+        memoryStatus: "current",
+        validFrom: now - 60_000,
+        validTo: now + 60_000,
+      }),
+    ]);
+
+    // Each list is its own function execution in production. Convex allows one
+    // pagination chain per execution, so they cannot share a single t.run.
+    const currentMemories = await t.run((ctx) => _listByUser(ctx, userId, 20));
+    const fullHistory = await t.run((ctx) =>
+      _listByUser(ctx, userId, 20, true),
+    );
+
+    expect(currentMemories.map((memory) => memory._id)).toEqual([activeId]);
+    expect(fullHistory.map((memory) => memory._id)).toEqual([
+      activeId,
+      futureId,
+      expiredId,
+    ]);
+  });
+
+  test("fills memory result limits after lifecycle filtering", async () => {
+    const t = convexTest(schema, modules);
+    const userId = await t.run((ctx) => ctx.db.insert("users", {}));
+
+    await t.run(async (ctx) => {
+      const insertMemory = (
+        index: number,
+        memoryStatus: "current" | "retracted" | undefined,
+        validFrom?: number,
+      ) =>
+        ctx.db.insert("thoughts", {
+          userId,
+          content: `Pagination sentinel memory ${index}`,
+          embedding,
+          metadata,
+          memoryStatus,
+          validFrom,
+        });
+
+      for (let index = 0; index < 10; index += 1) {
+        await insertMemory(index, undefined);
+      }
+      for (let index = 10; index < 70; index += 1) {
+        await insertMemory(index, "current", Date.now() + 86_400_000);
+      }
+      for (let index = 70; index < 130; index += 1) {
+        await insertMemory(index, "retracted");
+      }
+    });
+
+    const current = await t.run((ctx) => _listByUser(ctx, userId, 10));
+    const historical = await t.run((ctx) => _listByUser(ctx, userId, 10, true));
+    const search = await t.query(
+      internal.models.thoughts.private.searchByText,
+      {
+        userId,
+        query: "pagination sentinel memory",
+        limit: 10,
+        activeAt: Date.now(),
+      },
+    );
+
+    expect(current).toHaveLength(10);
+    expect(current.every((memory) => memory.memoryStatus === undefined)).toBe(
+      true,
+    );
+    expect(historical).toHaveLength(10);
+    expect(
+      historical.every((memory) => memory.memoryStatus !== "retracted"),
+    ).toBe(true);
+    expect(search).toHaveLength(10);
+    expect(search.every((memory) => memory.memoryStatus === undefined)).toBe(
+      true,
+    );
+  });
+
+  test("atomically preserves and links a superseded memory", async () => {
+    const t = convexTest(schema, modules);
+    const userId = await t.run((ctx) => ctx.db.insert("users", {}));
+    const previousId = await t.run((ctx) =>
+      ctx.db.insert("thoughts", {
+        userId,
+        content: "Rowan attends Lakeside School.",
+        embedding,
+        metadata,
+        validFrom: lakesideStart,
+      }),
+    );
+    const transitionedAt = Date.now();
+
+    const currentId = await t.mutation(
+      internal.models.thoughts.private.transitionMemory,
+      {
+        userId,
+        content:
+          "Rowan currently attends Redwood Academy. He previously attended Lakeside School.",
+        embedding,
+        metadata,
+        previousIds: [previousId],
+        previousStatus: "superseded",
+        reason: "Rowan changed schools",
+        transitionedAt,
+        validFrom: redwoodStart,
+      },
+    );
+
+    const [previous, current] = await t.run(async (ctx) => [
+      await ctx.db.get(previousId),
+      await ctx.db.get(currentId),
+    ]);
+    expect(previous).toMatchObject({
+      content: "Rowan attends Lakeside School.",
+      memoryStatus: "superseded",
+      supersededAt: transitionedAt,
+      supersededBy: currentId,
+      changeReason: "Rowan changed schools",
+      validFrom: lakesideStart,
+      validTo: redwoodStart,
+    });
+    expect(current).toMatchObject({
+      content:
+        "Rowan currently attends Redwood Academy. He previously attended Lakeside School.",
+      memoryStatus: "current",
+      supersedes: [previousId],
+      validFrom: redwoodStart,
+    });
+
+    // Each list is its own function execution in production. Convex allows one
+    // pagination chain per execution, so they cannot share a single t.run.
+    const currentMemories = await t.run((ctx) => _listByUser(ctx, userId, 20));
+    const fullHistory = await t.run((ctx) =>
+      _listByUser(ctx, userId, 20, true),
+    );
+    expect(currentMemories.map((memory) => memory._id)).toEqual([currentId]);
+    expect(fullHistory.map((memory) => memory._id)).toEqual([
+      currentId,
+      previousId,
+    ]);
+  });
+
+  test("does not invent an interval end when the new start is unknown", async () => {
+    const t = convexTest(schema, modules);
+    const userId = await t.run((ctx) => ctx.db.insert("users", {}));
+    const previousId = await t.run((ctx) =>
+      ctx.db.insert("thoughts", {
+        userId,
+        content: "Rowan attends Lakeside School.",
+        embedding,
+        metadata,
+        validFrom: lakesideStart,
+      }),
+    );
+
+    await t.mutation(internal.models.thoughts.private.transitionMemory, {
+      userId,
+      content:
+        "Rowan currently attends Redwood Academy. He previously attended Lakeside School.",
+      embedding,
+      metadata,
+      previousIds: [previousId],
+      previousStatus: "superseded",
+      reason: "Rowan changed schools, but the date is unknown",
+      transitionedAt: Date.now(),
+    });
+
+    const previous = await t.run((ctx) => ctx.db.get(previousId));
+    expect(previous).toMatchObject({
+      memoryStatus: "superseded",
+      validFrom: lakesideStart,
+    });
+    expect(previous?.validTo).toBeUndefined();
+  });
+
+  test("does not turn a retracted claim into a historical validity interval", async () => {
+    const t = convexTest(schema, modules);
+    const userId = await t.run((ctx) => ctx.db.insert("users", {}));
+    const inaccurateId = await t.run((ctx) =>
+      ctx.db.insert("thoughts", {
+        userId,
+        content: "Rowan attends Lakeside School.",
+        embedding,
+        metadata,
+        validFrom: lakesideStart,
+        validTo: redwoodStart,
+      }),
+    );
+
+    const correctedId = await t.mutation(
+      internal.models.thoughts.private.transitionMemory,
+      {
+        userId,
+        content:
+          "Correction: Rowan attends Redwood Academy; the Lakeside claim was inaccurate.",
+        embedding,
+        metadata,
+        previousIds: [inaccurateId],
+        previousStatus: "retracted",
+        reason: "The earlier school was incorrect",
+        transitionedAt: Date.now(),
+        validFrom: redwoodStart,
+      },
+    );
+
+    const [inaccurate, corrected] = await t.run(async (ctx) => [
+      await ctx.db.get(inaccurateId),
+      await ctx.db.get(correctedId),
+    ]);
+    expect(inaccurate).toMatchObject({ memoryStatus: "retracted" });
+    expect(inaccurate?.validFrom).toBeUndefined();
+    expect(inaccurate?.validTo).toBeUndefined();
+    expect(corrected).toMatchObject({
+      memoryStatus: "current",
+      validFrom: redwoodStart,
+    });
+  });
+
+  test("rejects an invalid new interval without partial writes", async () => {
+    const t = convexTest(schema, modules);
+    const userId = await t.run((ctx) => ctx.db.insert("users", {}));
+    const previousId = await t.run((ctx) =>
+      ctx.db.insert("thoughts", {
+        userId,
+        content: "Previous memory",
+        embedding,
+        metadata,
+      }),
+    );
+
+    await expect(
+      t.mutation(internal.models.thoughts.private.transitionMemory, {
+        userId,
+        content: "Replacement memory",
+        embedding,
+        metadata,
+        previousIds: [previousId],
+        previousStatus: "superseded",
+        reason: "Invalid interval",
+        transitionedAt: Date.now(),
+        validFrom: redwoodStart,
+        validTo: lakesideStart,
+      }),
+    ).rejects.toThrow("Invalid memory validity interval");
+
+    const memories = await t.run((ctx) => ctx.db.query("thoughts").collect());
+    expect(memories).toHaveLength(1);
+    expect(memories[0]?.memoryStatus).toBeUndefined();
+  });
+
+  test("rejects cross-account transitions without partial writes", async () => {
+    const t = convexTest(schema, modules);
+    const [ownerId, otherId] = await t.run(async (ctx) => [
+      await ctx.db.insert("users", {}),
+      await ctx.db.insert("users", {}),
+    ]);
+    const [ownerMemoryId, otherMemoryId] = await t.run(async (ctx) => [
+      await ctx.db.insert("thoughts", {
+        userId: ownerId,
+        content: "Owner memory",
+        embedding,
+        metadata,
+      }),
+      await ctx.db.insert("thoughts", {
+        userId: otherId,
+        content: "Other memory",
+        embedding,
+        metadata,
+      }),
+    ]);
+
+    await expect(
+      t.mutation(internal.models.thoughts.private.transitionMemory, {
+        userId: ownerId,
+        content: "Replacement memory",
+        embedding,
+        metadata,
+        previousIds: [ownerMemoryId, otherMemoryId],
+        previousStatus: "superseded",
+        reason: "Invalid cross-account transition",
+        transitionedAt: Date.now(),
+      }),
+    ).rejects.toThrow("Previous memory is unavailable");
+
+    const memories = await t.run((ctx) => ctx.db.query("thoughts").collect());
+    expect(memories).toHaveLength(2);
+    expect(memories.every((memory) => memory.memoryStatus === undefined)).toBe(
+      true,
+    );
+  });
+});

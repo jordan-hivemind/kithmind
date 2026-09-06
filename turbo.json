@@ -1,0 +1,40 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "ui": "stream",
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": [".next/**", "!.next/cache/**"]
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "lint": {
+      "dependsOn": ["^lint"]
+    },
+    "check-types": {
+      "dependsOn": ["^check-types"]
+    },
+    "test": {
+      "cache": false,
+      "persistent": true
+    },
+    "test:once": {
+      "cache": false
+    }
+  },
+  "globalPassThroughEnv": ["PORT", "WEB_PORT"],
+  "globalEnv": [
+    "CONVEX_DEPLOYMENT",
+    "NEXT_PUBLIC_CONVEX_URL",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "MCP_JWT_ISSUER",
+    "MCP_JWT_PRIVATE_JWK",
+    "MCP_JWT_PUBLIC_JWK",
+    "MCP_JWT_KEY_ID",
+    "MCP_OAUTH_ENCRYPTION_KEY",
+    "MCP_TOOL_PROFILE"
+  ]
+}
