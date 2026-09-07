@@ -4,6 +4,7 @@ import {
   documentFields,
   evidenceSpanFields,
   sourceArtifactArchiveReceiptFields,
+  sourceArtifactArchiveBindingFields,
   sourceItemFields,
   sourcePageFields,
   sourceParserArtifactFields,
@@ -48,6 +49,14 @@ export const provenanceTables = {
       "archiveIdentityFingerprint",
       "archiveObjectId",
     ]),
+  sourceArtifactArchiveBindings: defineTable(sourceArtifactArchiveBindingFields)
+    .index("by_source_subject_role", [
+      "sourceAccountId",
+      "subjectKey",
+      "copyRole",
+    ])
+    .index("by_sourceItemId", ["sourceItemId"])
+    .index("by_receiptId", ["receiptId"]),
   sourceTextVersions: defineTable(sourceTextVersionFields)
     .index("by_spaceId", ["spaceId"])
     .index("by_sourceRevisionId", ["sourceRevisionId"])

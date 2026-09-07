@@ -99,7 +99,88 @@ export type FsDiscoveryEntry = {
     | {
         status: "gap";
         code: FsDiscoveryGapCode;
+      }
+    | {
+        status: "ready_binary_v1";
+        sha256: string;
+        byteLength: number;
+        mediaType: "application/pdf";
+        parserProfileId: "pdf_docqa_v1";
+        parserFingerprint: string;
+        extractionConfigurationFingerprint: string;
+        extractorFingerprint: string;
+        recordSchemaFingerprint: string;
+        normalizationFingerprint: string;
+        chunkerFingerprint: string;
+        correctionRevision: string;
       };
+};
+
+export type ArchivedWorkIdentity = {
+  sourceItemId: string;
+  scanId: string;
+  observationEpoch: number;
+  processingEpoch: number;
+  contentHash: string;
+  byteLength: number;
+  mediaType: "application/pdf";
+  parserProfileId: "pdf_docqa_v1";
+  parserFingerprint: string;
+  extractionConfigurationFingerprint: string;
+  extractorFingerprint: string;
+  recordSchemaFingerprint: string;
+  normalizationFingerprint: string;
+  chunkerFingerprint: string;
+  correctionRevision: string;
+};
+
+export type ParserArtifactSelection =
+  | {
+      kind: "create";
+      clientArtifactId: string;
+      outputHash: string;
+      outputByteLength: number;
+      outputMediaType: "application/vnd.docling+json";
+      createdAt: number;
+    }
+  | { kind: "existing"; parserArtifactId: string };
+
+export type ArchiveReceiptSelection =
+  | {
+      kind: "create";
+      subjectKind: "original_bytes" | "parser_output";
+      copyRole: "primary" | "independent_backup";
+      clientReceiptId: string;
+      archiveProfileFingerprint: string;
+      archiveIdentityFingerprint: string;
+      recipientFingerprint: string;
+      repositoryKeyDomainFingerprint: string;
+      storageFailureDomainFingerprint: string;
+      archiveObjectId: string;
+      ciphertextHash: string;
+      ciphertextByteLength: number;
+      readbackVerifiedAt: number;
+      createdAt: number;
+    }
+  | {
+      kind: "existing";
+      subjectKind: "original_bytes" | "parser_output";
+      copyRole: "primary" | "independent_backup";
+      receiptId: string;
+      bindingEpoch: number;
+    };
+
+export type ParsedTextDeclaration = {
+  extractionFingerprint: string;
+  textHash: string;
+  byteLength: number;
+  utf16Length: number;
+  pageCount: number;
+  mappingManifestHash: string;
+  normalizedBundleDigest: string;
+  expectedEvidenceSpanCount: number;
+  expectedDocumentCount: number;
+  expectedChunkCount: number;
 };
 
 type WorkerSourceRequest = {
@@ -164,6 +245,42 @@ export type WorkerRequest =
       leaseEpoch: number;
       leaseToken: string;
       text: string;
+    })
+  | (WorkerSourceRequest & {
+      operation: "discovery.preflightArchived";
+      requestId: string;
+      identity: ArchivedWorkIdentity;
+      archiveIntentDigest: string;
+    })
+  | (WorkerSourceRequest & {
+      operation: "discovery.reserveArchived";
+      requestId: string;
+      identity: ArchivedWorkIdentity;
+    })
+  | (WorkerSourceRequest & {
+      operation: "discovery.lookupArchivedAdmission";
+      requestId: string;
+      identity: ArchivedWorkIdentity;
+      lookup:
+        | { mode: "original" }
+        | {
+            mode: "processing";
+            clientArtifactId: string;
+            parserOutputHash: string;
+            parserOutputByteLength: number;
+            parserOutputMediaType: "application/vnd.docling+json";
+            parsedText: ParsedTextDeclaration;
+          };
+    })
+  | (WorkerSourceRequest & {
+      operation: "discovery.admitArchived";
+      requestId: string;
+      workId: string;
+      leaseEpoch: number;
+      leaseToken: string;
+      parserArtifact: ParserArtifactSelection;
+      archives: ArchiveReceiptSelection[];
+      parsedText: ParsedTextDeclaration;
     })
   | (WorkerSourceRequest & {
       operation: "jobs.reserve";
@@ -364,6 +481,78 @@ export type WorkerDiscoveryAdmitResult = {
   reused: boolean;
 };
 
+export type WorkerArchivedPreflightResult = {
+  operation: "discovery.preflightArchived";
+  sourceItemId: string;
+  workId: string;
+  expectedDesiredProcessingEpoch: number;
+  archiveIntentDigest: string;
+};
+
+export type WorkerArchivedReserveResult = {
+  operation: "discovery.reserveArchived";
+  workId: string;
+  sourceItemId: string;
+  observationEpoch: number;
+  processingEpoch: number;
+  leaseEpoch: number;
+  leaseToken: string;
+  leaseExpiresAt: number;
+  reused: boolean;
+};
+
+export type WorkerArchivedLookupResult =
+  | {
+      operation: "discovery.lookupArchivedAdmission";
+      mode: "original" | "processing";
+      found: false;
+    }
+  | {
+      operation: "discovery.lookupArchivedAdmission";
+      mode: "original";
+      found: true;
+      sourceRevisionId: string;
+      originalPrimaryReceiptId: string;
+      originalPrimaryBindingEpoch: number;
+      originalBackupReceiptId: string;
+      originalBackupBindingEpoch: number;
+    }
+  | {
+      operation: "discovery.lookupArchivedAdmission";
+      mode: "processing";
+      found: true;
+      sourceRevisionId: string;
+      parserArtifactId: string;
+      sourceTextVersionId: string;
+      processingGenerationId: string;
+      ingestJobId: string;
+      desiredProcessingEpoch: number;
+      archiveSetDigest: string;
+      originalPrimaryReceiptId: string;
+      originalPrimaryBindingEpoch: number;
+      originalBackupReceiptId: string;
+      originalBackupBindingEpoch: number;
+      parserPrimaryReceiptId: string;
+      parserPrimaryBindingEpoch: number;
+      parserBackupReceiptId: string;
+      parserBackupBindingEpoch: number;
+    };
+
+export type WorkerArchivedAdmitResult = {
+  operation: "discovery.admitArchived";
+  workId: string;
+  sourceItemId: string;
+  sourceRevisionId: string;
+  parserArtifactId: string;
+  sourceTextVersionId: string;
+  processingGenerationId: string;
+  ingestJobId: string;
+  desiredProcessingEpoch: number;
+  archiveSetDigest: string;
+  state: "admitted";
+  reused: boolean;
+};
+
 export type WorkerJobReserveResult = {
   operation: "jobs.reserve";
   receiptId: string;
@@ -457,6 +646,10 @@ export type WorkerResult =
   | WorkerScanReconcileResult
   | WorkerDiscoveryReserveResult
   | WorkerDiscoveryAdmitResult
+  | WorkerArchivedPreflightResult
+  | WorkerArchivedReserveResult
+  | WorkerArchivedLookupResult
+  | WorkerArchivedAdmitResult
   | WorkerJobReserveResult
   | WorkerJobRenewResult
   | WorkerJobStageResult
@@ -656,6 +849,60 @@ function discoveryEntry(value: unknown, mode: "normal" | "identity_recovery") {
       }),
       byteLength: integer(contentInput.byteLength, 1, 65_536),
     };
+  } else if (contentInput.status === "ready_binary_v1") {
+    exactKeys(contentInput, [
+      "status",
+      "sha256",
+      "byteLength",
+      "mediaType",
+      "parserProfileId",
+      "parserFingerprint",
+      "extractionConfigurationFingerprint",
+      "extractorFingerprint",
+      "recordSchemaFingerprint",
+      "normalizationFingerprint",
+      "chunkerFingerprint",
+      "correctionRevision",
+    ]);
+    if (
+      contentInput.mediaType !== "application/pdf" ||
+      contentInput.parserProfileId !== "pdf_docqa_v1"
+    ) {
+      invalid();
+    }
+    content = {
+      status: "ready_binary_v1",
+      sha256: string(contentInput.sha256, { maxUtf16: 64, pattern: SHA256 }),
+      byteLength: integer(contentInput.byteLength, 1, 16 * 1_024 * 1_024),
+      mediaType: "application/pdf",
+      parserProfileId: "pdf_docqa_v1",
+      parserFingerprint: string(contentInput.parserFingerprint, {
+        maxUtf16: 64,
+        pattern: SHA256,
+      }),
+      extractionConfigurationFingerprint: string(
+        contentInput.extractionConfigurationFingerprint,
+        {
+          maxUtf16: 64,
+          pattern: SHA256,
+        },
+      ),
+      extractorFingerprint: string(contentInput.extractorFingerprint, {
+        maxUtf8: 1_024,
+      }),
+      recordSchemaFingerprint: string(contentInput.recordSchemaFingerprint, {
+        maxUtf8: 1_024,
+      }),
+      normalizationFingerprint: string(contentInput.normalizationFingerprint, {
+        maxUtf8: 1_024,
+      }),
+      chunkerFingerprint: string(contentInput.chunkerFingerprint, {
+        maxUtf8: 1_024,
+      }),
+      correctionRevision: string(contentInput.correctionRevision, {
+        maxUtf8: 1_024,
+      }),
+    };
   } else if (contentInput.status === "gap") {
     exactKeys(contentInput, ["status", "code"]);
     content = { status: "gap", code: gapCode(contentInput.code) };
@@ -679,6 +926,205 @@ function discoveryEntry(value: unknown, mode: "normal" | "identity_recovery") {
     ),
     content,
   } satisfies FsDiscoveryEntry;
+}
+
+function archivedWorkIdentity(value: unknown): ArchivedWorkIdentity {
+  const input = object(value);
+  exactKeys(input, [
+    "sourceItemId",
+    "scanId",
+    "observationEpoch",
+    "processingEpoch",
+    "contentHash",
+    "byteLength",
+    "mediaType",
+    "parserProfileId",
+    "parserFingerprint",
+    "extractionConfigurationFingerprint",
+    "extractorFingerprint",
+    "recordSchemaFingerprint",
+    "normalizationFingerprint",
+    "chunkerFingerprint",
+    "correctionRevision",
+  ]);
+  if (
+    input.mediaType !== "application/pdf" ||
+    input.parserProfileId !== "pdf_docqa_v1"
+  ) {
+    return invalid();
+  }
+  return {
+    sourceItemId: string(input.sourceItemId, { maxUtf16: 256 }),
+    scanId: scanId(input.scanId),
+    observationEpoch: epoch(input.observationEpoch),
+    processingEpoch: epoch(input.processingEpoch),
+    contentHash: string(input.contentHash, { maxUtf16: 64, pattern: SHA256 }),
+    byteLength: integer(input.byteLength, 1, 16 * 1_024 * 1_024),
+    mediaType: "application/pdf",
+    parserProfileId: "pdf_docqa_v1",
+    parserFingerprint: string(input.parserFingerprint, {
+      maxUtf16: 64,
+      pattern: SHA256,
+    }),
+    extractionConfigurationFingerprint: string(
+      input.extractionConfigurationFingerprint,
+      {
+        maxUtf16: 64,
+        pattern: SHA256,
+      },
+    ),
+    extractorFingerprint: string(input.extractorFingerprint, {
+      maxUtf8: 1_024,
+    }),
+    recordSchemaFingerprint: string(input.recordSchemaFingerprint, {
+      maxUtf8: 1_024,
+    }),
+    normalizationFingerprint: string(input.normalizationFingerprint, {
+      maxUtf8: 1_024,
+    }),
+    chunkerFingerprint: string(input.chunkerFingerprint, { maxUtf8: 1_024 }),
+    correctionRevision: string(input.correctionRevision, { maxUtf8: 1_024 }),
+  };
+}
+
+function parserArtifactSelection(value: unknown): ParserArtifactSelection {
+  const input = object(value);
+  if (input.kind === "existing") {
+    exactKeys(input, ["kind", "parserArtifactId"]);
+    return {
+      kind: "existing",
+      parserArtifactId: string(input.parserArtifactId, { maxUtf16: 256 }),
+    };
+  }
+  if (input.kind !== "create") return invalid();
+  exactKeys(input, [
+    "kind",
+    "clientArtifactId",
+    "outputHash",
+    "outputByteLength",
+    "outputMediaType",
+    "createdAt",
+  ]);
+  if (input.outputMediaType !== "application/vnd.docling+json") invalid();
+  return {
+    kind: "create",
+    clientArtifactId: string(input.clientArtifactId, {
+      maxUtf16: 36,
+      pattern: UUID,
+    }),
+    outputHash: string(input.outputHash, { maxUtf16: 64, pattern: SHA256 }),
+    outputByteLength: integer(input.outputByteLength, 1, 64 * 1_024 * 1_024),
+    outputMediaType: "application/vnd.docling+json",
+    createdAt: epoch(input.createdAt),
+  };
+}
+
+function archiveReceiptSelection(value: unknown): ArchiveReceiptSelection {
+  const input = object(value);
+  const subjectKind =
+    input.subjectKind === "original_bytes" ||
+    input.subjectKind === "parser_output"
+      ? input.subjectKind
+      : invalid();
+  const copyRole =
+    input.copyRole === "primary" || input.copyRole === "independent_backup"
+      ? input.copyRole
+      : invalid();
+  if (input.kind === "existing") {
+    exactKeys(input, [
+      "kind",
+      "subjectKind",
+      "copyRole",
+      "receiptId",
+      "bindingEpoch",
+    ]);
+    return {
+      kind: "existing",
+      subjectKind,
+      copyRole,
+      receiptId: string(input.receiptId, { maxUtf16: 256 }),
+      bindingEpoch: epoch(input.bindingEpoch),
+    };
+  }
+  if (input.kind !== "create") return invalid();
+  exactKeys(input, [
+    "kind",
+    "subjectKind",
+    "copyRole",
+    "clientReceiptId",
+    "archiveProfileFingerprint",
+    "archiveIdentityFingerprint",
+    "recipientFingerprint",
+    "repositoryKeyDomainFingerprint",
+    "storageFailureDomainFingerprint",
+    "archiveObjectId",
+    "ciphertextHash",
+    "ciphertextByteLength",
+    "readbackVerifiedAt",
+    "createdAt",
+  ]);
+  const fingerprint = (value: unknown) =>
+    string(value, { maxUtf16: 64, pattern: SHA256 });
+  return {
+    kind: "create",
+    subjectKind,
+    copyRole,
+    clientReceiptId: string(input.clientReceiptId, {
+      maxUtf16: 36,
+      pattern: UUID,
+    }),
+    archiveProfileFingerprint: fingerprint(input.archiveProfileFingerprint),
+    archiveIdentityFingerprint: fingerprint(input.archiveIdentityFingerprint),
+    recipientFingerprint: fingerprint(input.recipientFingerprint),
+    repositoryKeyDomainFingerprint: fingerprint(
+      input.repositoryKeyDomainFingerprint,
+    ),
+    storageFailureDomainFingerprint: fingerprint(
+      input.storageFailureDomainFingerprint,
+    ),
+    archiveObjectId: string(input.archiveObjectId, {
+      maxUtf16: 36,
+      pattern: UUID,
+    }),
+    ciphertextHash: fingerprint(input.ciphertextHash),
+    ciphertextByteLength: integer(
+      input.ciphertextByteLength,
+      1,
+      65 * 1_024 * 1_024,
+    ),
+    readbackVerifiedAt: epoch(input.readbackVerifiedAt),
+    createdAt: epoch(input.createdAt),
+  };
+}
+
+function parsedTextDeclaration(value: unknown): ParsedTextDeclaration {
+  const input = object(value);
+  exactKeys(input, [
+    "extractionFingerprint",
+    "textHash",
+    "byteLength",
+    "utf16Length",
+    "pageCount",
+    "mappingManifestHash",
+    "normalizedBundleDigest",
+    "expectedEvidenceSpanCount",
+    "expectedDocumentCount",
+    "expectedChunkCount",
+  ]);
+  const hash = (value: unknown) =>
+    string(value, { maxUtf16: 64, pattern: SHA256 });
+  return {
+    extractionFingerprint: hash(input.extractionFingerprint),
+    textHash: hash(input.textHash),
+    byteLength: integer(input.byteLength, 1, 256 * 1_024),
+    utf16Length: integer(input.utf16Length, 1, 256 * 1_024),
+    pageCount: integer(input.pageCount, 1, 32),
+    mappingManifestHash: hash(input.mappingManifestHash),
+    normalizedBundleDigest: hash(input.normalizedBundleDigest),
+    expectedEvidenceSpanCount: integer(input.expectedEvidenceSpanCount, 1, 128),
+    expectedDocumentCount: integer(input.expectedDocumentCount, 1, 16),
+    expectedChunkCount: integer(input.expectedChunkCount, 1, 128),
+  };
 }
 
 function canonicalFsUri(value: unknown): string {
@@ -888,6 +1334,123 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
         }),
         text: string(input.text, { maxUtf8: 65_536 }),
       };
+    case "discovery.preflightArchived":
+      exactKeys(input, [
+        ...baseKeys,
+        "requestId",
+        "identity",
+        "archiveIntentDigest",
+      ]);
+      return {
+        ...base,
+        operation: "discovery.preflightArchived",
+        requestId: requestId(input.requestId),
+        identity: archivedWorkIdentity(input.identity),
+        archiveIntentDigest: string(input.archiveIntentDigest, {
+          maxUtf16: 64,
+          pattern: SHA256,
+        }),
+      };
+    case "discovery.reserveArchived":
+      exactKeys(input, [...baseKeys, "requestId", "identity"]);
+      return {
+        ...base,
+        operation: "discovery.reserveArchived",
+        requestId: requestId(input.requestId),
+        identity: archivedWorkIdentity(input.identity),
+      };
+    case "discovery.lookupArchivedAdmission": {
+      exactKeys(input, [...baseKeys, "requestId", "identity", "lookup"]);
+      const lookup = object(input.lookup);
+      if (lookup.mode === "original") {
+        exactKeys(lookup, ["mode"]);
+        return {
+          ...base,
+          operation: "discovery.lookupArchivedAdmission",
+          requestId: requestId(input.requestId),
+          identity: archivedWorkIdentity(input.identity),
+          lookup: { mode: "original" },
+        };
+      }
+      if (lookup.mode !== "processing") return invalid();
+      exactKeys(lookup, [
+        "mode",
+        "clientArtifactId",
+        "parserOutputHash",
+        "parserOutputByteLength",
+        "parserOutputMediaType",
+        "parsedText",
+      ]);
+      if (lookup.parserOutputMediaType !== "application/vnd.docling+json") {
+        invalid();
+      }
+      return {
+        ...base,
+        operation: "discovery.lookupArchivedAdmission",
+        requestId: requestId(input.requestId),
+        identity: archivedWorkIdentity(input.identity),
+        lookup: {
+          mode: "processing",
+          clientArtifactId: string(lookup.clientArtifactId, {
+            maxUtf16: 36,
+            pattern: UUID,
+          }),
+          parserOutputHash: string(lookup.parserOutputHash, {
+            maxUtf16: 64,
+            pattern: SHA256,
+          }),
+          parserOutputByteLength: integer(
+            lookup.parserOutputByteLength,
+            1,
+            64 * 1_024 * 1_024,
+          ),
+          parserOutputMediaType: "application/vnd.docling+json",
+          parsedText: parsedTextDeclaration(lookup.parsedText),
+        },
+      };
+    }
+    case "discovery.admitArchived": {
+      exactKeys(input, [
+        ...baseKeys,
+        "requestId",
+        "workId",
+        "leaseEpoch",
+        "leaseToken",
+        "parserArtifact",
+        "archives",
+        "parsedText",
+      ]);
+      if (!Array.isArray(input.archives) || input.archives.length !== 4) {
+        invalid();
+      }
+      const archives = input.archives.map(archiveReceiptSelection);
+      const roles = new Set(
+        archives.map((entry) => `${entry.subjectKind}:${entry.copyRole}`),
+      );
+      if (
+        roles.size !== 4 ||
+        !roles.has("original_bytes:primary") ||
+        !roles.has("original_bytes:independent_backup") ||
+        !roles.has("parser_output:primary") ||
+        !roles.has("parser_output:independent_backup")
+      ) {
+        invalid();
+      }
+      return {
+        ...base,
+        operation: "discovery.admitArchived",
+        requestId: requestId(input.requestId),
+        workId: string(input.workId, { maxUtf16: 256 }),
+        leaseEpoch: integer(input.leaseEpoch, 1, Number.MAX_SAFE_INTEGER),
+        leaseToken: string(input.leaseToken, {
+          maxUtf16: 64,
+          pattern: SHA256,
+        }),
+        parserArtifact: parserArtifactSelection(input.parserArtifact),
+        archives,
+        parsedText: parsedTextDeclaration(input.parsedText),
+      };
+    }
     case "jobs.reserve":
       exactKeys(input, [...baseKeys, "requestId", "maxItems"]);
       return {

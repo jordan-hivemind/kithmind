@@ -196,6 +196,75 @@ const workerResultValidator = v.union(
     reused: v.boolean(),
   }),
   v.object({
+    operation: v.literal("discovery.preflightArchived"),
+    sourceItemId: v.string(),
+    workId: v.string(),
+    expectedDesiredProcessingEpoch: v.number(),
+    archiveIntentDigest: v.string(),
+  }),
+  v.object({
+    operation: v.literal("discovery.reserveArchived"),
+    workId: v.string(),
+    sourceItemId: v.string(),
+    observationEpoch: v.number(),
+    processingEpoch: v.number(),
+    leaseEpoch: v.number(),
+    leaseToken: v.string(),
+    leaseExpiresAt: v.number(),
+    reused: v.boolean(),
+  }),
+  v.union(
+    v.object({
+      operation: v.literal("discovery.lookupArchivedAdmission"),
+      mode: v.union(v.literal("original"), v.literal("processing")),
+      found: v.literal(false),
+    }),
+    v.object({
+      operation: v.literal("discovery.lookupArchivedAdmission"),
+      mode: v.literal("original"),
+      found: v.literal(true),
+      sourceRevisionId: v.string(),
+      originalPrimaryReceiptId: v.string(),
+      originalPrimaryBindingEpoch: v.number(),
+      originalBackupReceiptId: v.string(),
+      originalBackupBindingEpoch: v.number(),
+    }),
+    v.object({
+      operation: v.literal("discovery.lookupArchivedAdmission"),
+      mode: v.literal("processing"),
+      found: v.literal(true),
+      sourceRevisionId: v.string(),
+      parserArtifactId: v.string(),
+      sourceTextVersionId: v.string(),
+      processingGenerationId: v.string(),
+      ingestJobId: v.string(),
+      desiredProcessingEpoch: v.number(),
+      archiveSetDigest: v.string(),
+      originalPrimaryReceiptId: v.string(),
+      originalPrimaryBindingEpoch: v.number(),
+      originalBackupReceiptId: v.string(),
+      originalBackupBindingEpoch: v.number(),
+      parserPrimaryReceiptId: v.string(),
+      parserPrimaryBindingEpoch: v.number(),
+      parserBackupReceiptId: v.string(),
+      parserBackupBindingEpoch: v.number(),
+    }),
+  ),
+  v.object({
+    operation: v.literal("discovery.admitArchived"),
+    workId: v.string(),
+    sourceItemId: v.string(),
+    sourceRevisionId: v.string(),
+    parserArtifactId: v.string(),
+    sourceTextVersionId: v.string(),
+    processingGenerationId: v.string(),
+    ingestJobId: v.string(),
+    desiredProcessingEpoch: v.number(),
+    archiveSetDigest: v.string(),
+    state: v.literal("admitted"),
+    reused: v.boolean(),
+  }),
+  v.object({
     operation: v.literal("jobs.reserve"),
     receiptId: v.string(),
     expiresAt: v.number(),
@@ -355,6 +424,30 @@ export const dispatch = action({
         case "discovery.admitUtf8":
           return await ctx.runMutation(
             internal.models.workers.private.discoveryAdmitUtf8,
+            { principal, request },
+          );
+        case "discovery.preflightArchived":
+          return await ctx.runMutation(
+            internal.models.workers.private.discoveryPreflightArchived,
+            { principal, request },
+          );
+        case "discovery.reserveArchived":
+          return await ctx.runMutation(
+            internal.models.workers.private.discoveryReserveArchived,
+            {
+              principal,
+              request,
+              leaseToken: randomLeaseTokens(1)[0]!,
+            },
+          );
+        case "discovery.lookupArchivedAdmission":
+          return await ctx.runMutation(
+            internal.models.workers.private.discoveryLookupArchivedAdmission,
+            { principal, request },
+          );
+        case "discovery.admitArchived":
+          return await ctx.runMutation(
+            internal.models.workers.private.discoveryAdmitArchived,
             { principal, request },
           );
         case "jobs.reserve":

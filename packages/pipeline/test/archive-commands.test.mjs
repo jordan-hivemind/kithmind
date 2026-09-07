@@ -6,12 +6,16 @@ import {
   mkdtemp,
   readFile,
   realpath,
+  rename,
   stat,
   symlink,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import fsPromises from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import test from "node:test";
 
 import {
@@ -23,6 +27,7 @@ import {
   probeResticRepository,
   publishAgeObject,
   readbackResticObject,
+  recoverPublishedAgeObject,
   recoverResticBackup,
 } from "../dist/archiveCommands.js";
 
@@ -255,6 +260,200 @@ test("encrypts one captured source to a prepared object and publishes no-clobber
   );
   assert.deepEqual(await readFile(existing), sentinel);
   assert.equal((await stat(second.tempOutputPath)).isFile(), true);
+});
+
+test("recovers only the exact cataloged published age object after its temp hardlink is gone", async () => {
+  const fixture = await setup();
+  const { prepared, bytes } = await preparedFixture(fixture);
+  const finalPath = join(fixture.archiveRoot, "recoverable.age");
+  await publishAgeObject(prepared, finalPath, limits());
+  await assert.rejects(() => stat(prepared.tempPath), { code: "ENOENT" });
+  await recoverPublishedAgeObject(prepared, finalPath, limits());
+
+  const unrelated = join(fixture.archiveRoot, "unrelated.age");
+  await writeFile(unrelated, "unrelated immutable object", { mode: 0o600 });
+
+  await rename(finalPath, join(fixture.archiveRoot, "retained-original.age"));
+  await writeFile(finalPath, Buffer.concat([Buffer.from("AGE"), bytes]), {
+    mode: 0o600,
+  });
+  await assert.rejects(
+    () => recoverPublishedAgeObject(prepared, finalPath, limits()),
+    (error) =>
+      error instanceof ArchiveCommandError && error.code === "digest_mismatch",
+  );
+  assert.equal((await stat(unrelated)).isFile(), true);
+
+  await unlink(finalPath);
+  await writeFile(finalPath, "wrong ciphertext", { mode: 0o600 });
+  await assert.rejects(
+    () => recoverPublishedAgeObject(prepared, finalPath, limits()),
+    (error) =>
+      error instanceof ArchiveCommandError && error.code === "digest_mismatch",
+  );
+  assert.equal((await stat(unrelated)).isFile(), true);
+});
+
+test("published age recovery rejects missing, linked, and insecure paths without mutation", async () => {
+  const fixture = await setup();
+  const { prepared } = await preparedFixture(fixture);
+  const finalPath = join(fixture.archiveRoot, "guarded.age");
+  await publishAgeObject(prepared, finalPath, limits());
+  const unrelated = join(fixture.archiveRoot, "unrelated.age");
+  await writeFile(unrelated, "keep me", { mode: 0o600 });
+
+  await chmod(fixture.archiveRoot, 0o777);
+  await assert.rejects(
+    () => recoverPublishedAgeObject(prepared, finalPath, limits()),
+    (error) =>
+      error instanceof ArchiveCommandError && error.code === "unsafe_path",
+  );
+  await chmod(fixture.archiveRoot, 0o700);
+
+  const displacedArchive = join(fixture.base, "displaced-archive");
+  const ciphertext = await readFile(finalPath);
+  await rename(fixture.archiveRoot, displacedArchive);
+  await mkdir(fixture.archiveRoot, { mode: 0o700 });
+  await chmod(fixture.archiveRoot, 0o700);
+  await writeFile(finalPath, ciphertext, { mode: 0o600 });
+  const replacementUnrelated = join(fixture.archiveRoot, "replacement.age");
+  await writeFile(replacementUnrelated, "also keep me", { mode: 0o600 });
+  await assert.rejects(
+    () => recoverPublishedAgeObject(prepared, finalPath, limits()),
+    (error) =>
+      error instanceof ArchiveCommandError && error.code === "unsafe_path",
+  );
+  assert.equal(
+    await readFile(join(displacedArchive, "unrelated.age"), "utf8"),
+    "keep me",
+  );
+  assert.equal(await readFile(replacementUnrelated, "utf8"), "also keep me");
+
+  await rename(fixture.archiveRoot, join(fixture.base, "replacement-archive"));
+  await rename(displacedArchive, fixture.archiveRoot);
+
+  await unlink(finalPath);
+  await symlink(unrelated, finalPath);
+  await assert.rejects(
+    () => recoverPublishedAgeObject(prepared, finalPath, limits()),
+    (error) =>
+      error instanceof ArchiveCommandError && error.code === "unsafe_path",
+  );
+  await unlink(finalPath);
+  await assert.rejects(
+    () => recoverPublishedAgeObject(prepared, finalPath, limits()),
+    (error) =>
+      error instanceof ArchiveCommandError && error.code === "unsafe_path",
+  );
+  assert.equal(await readFile(unrelated, "utf8"), "keep me");
+});
+
+test("publication never cleans up a replacement inserted immediately after its link", async () => {
+  const fixture = await setup();
+  const { prepared } = await preparedFixture(fixture);
+  const finalPath = join(fixture.archiveRoot, "raced.age");
+  const originalLink = fsPromises.link;
+  fsPromises.link = async (from, to) => {
+    await originalLink(from, to);
+    if (to === finalPath) {
+      await rename(to, join(fixture.archiveRoot, "retained-raced.age"));
+      await writeFile(to, "unrelated replacement", { mode: 0o600 });
+    }
+  };
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(
+      () => publishAgeObject(prepared, finalPath, limits()),
+      (error) =>
+        error instanceof ArchiveCommandError && error.code === "unsafe_path",
+    );
+    assert.equal(await readFile(finalPath, "utf8"), "unrelated replacement");
+    assert.equal((await stat(prepared.tempPath)).isFile(), true);
+  } finally {
+    fsPromises.link = originalLink;
+    syncBuiltinESMExports();
+  }
+});
+
+test("publication cleanup preserves a replacement at the temporary name", async () => {
+  const fixture = await setup();
+  const { prepared } = await preparedFixture(fixture);
+  const finalPath = join(fixture.archiveRoot, "temp-race.age");
+  const originalOpen = fsPromises.open;
+  let replaced = false;
+  fsPromises.open = async (path, ...args) => {
+    const handle = await originalOpen(path, ...args);
+    if (path === fixture.archiveRoot && !replaced) {
+      replaced = true;
+      await rename(
+        prepared.tempPath,
+        join(fixture.archiveRoot, "retained-temp.age"),
+      );
+      await writeFile(prepared.tempPath, "unrelated temporary replacement", {
+        mode: 0o600,
+      });
+    }
+    return handle;
+  };
+  syncBuiltinESMExports();
+  try {
+    await publishAgeObject(prepared, finalPath, limits());
+    assert.equal(replaced, true);
+    assert.equal(
+      await readFile(prepared.tempPath, "utf8"),
+      "unrelated temporary replacement",
+    );
+    await recoverPublishedAgeObject(prepared, finalPath, limits());
+  } finally {
+    fsPromises.open = originalOpen;
+    syncBuiltinESMExports();
+  }
+});
+
+test("publication does not clean a replaced directory even with the prepared inode", async () => {
+  for (const failRead of [false, true]) {
+    const fixture = await setup();
+    const { prepared } = await preparedFixture(fixture);
+    const finalPath = join(fixture.archiveRoot, "directory-race.age");
+    const retainedDirectory = join(fixture.base, "retained-archive");
+    const originalOpen = fsPromises.open;
+    let replaced = false;
+    fsPromises.open = async (path, ...args) => {
+      const handle = await originalOpen(path, ...args);
+      if (path === finalPath && !replaced) {
+        const originalClose = handle.close.bind(handle);
+        handle.close = async () => {
+          await originalClose();
+          await rename(fixture.archiveRoot, retainedDirectory);
+          await mkdir(fixture.archiveRoot, { mode: 0o700 });
+          await fsPromises.link(
+            join(retainedDirectory, "directory-race.age"),
+            finalPath,
+          );
+          replaced = true;
+        };
+        if (failRead) {
+          handle.read = async () => {
+            throw new Error("synthetic read failure");
+          };
+        }
+      }
+      return handle;
+    };
+    syncBuiltinESMExports();
+    try {
+      await assert.rejects(
+        () => publishAgeObject(prepared, finalPath, limits()),
+        (error) => error instanceof ArchiveCommandError,
+      );
+      assert.equal(replaced, true);
+      assert.equal((await stat(finalPath)).ino, prepared.ciphertextInode);
+      assert.deepEqual(digest(await readFile(finalPath)), prepared.ciphertext);
+    } finally {
+      fsPromises.open = originalOpen;
+      syncBuiltinESMExports();
+    }
+  }
 });
 
 test("an existing age temporary path is preserved on exclusive-create failure", async () => {

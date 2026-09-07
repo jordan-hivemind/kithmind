@@ -13,6 +13,8 @@ from parser_eval.production import (
     _normalized_bundle,
     _fingerprint,
     _extraction_fingerprint,
+    derive_extraction_fingerprint,
+    prepare_pdf_profile,
     convert_captured_pdf,
 )
 
@@ -239,6 +241,51 @@ class ProductionParserTest(unittest.TestCase):
             self.assertEqual(parser, _fingerprint(self.manifest, 150.0))
             after = _extraction_fingerprint(parser, "b" * 64)
         self.assertNotEqual(before["fingerprint"], after["fingerprint"])
+
+    def test_preparse_configuration_is_available_without_pdf_conversion(self):
+        with (
+            patch(
+                "parser_eval.production._verify_runtime_and_artifacts",
+                return_value=self.manifest,
+            ),
+            patch("parser_eval.production._convert_docling") as converter,
+        ):
+            profile = prepare_pdf_profile(
+                artifacts=Path("artifacts"), model_lock=Path("lock")
+            )
+        self.assertEqual(profile["state"], "ready")
+        converter.assert_not_called()
+        result, _ = self.call()
+        final = result["normalizedBundle"]["extractionFingerprint"]
+        self.assertEqual(
+            final["extractionConfigurationFingerprint"],
+            profile["extractionConfiguration"]["fingerprint"],
+        )
+        self.assertEqual(
+            result["rawArtifact"]["parserFingerprint"], profile["parserFingerprint"]
+        )
+        self.assertEqual(
+            final["fingerprint"],
+            derive_extraction_fingerprint(
+                profile["parserFingerprint"]["fingerprint"],
+                result["rawArtifact"]["sha256"],
+                profile["extractionConfiguration"]["fingerprint"],
+            ),
+        )
+
+    def test_extraction_identity_matches_shared_server_vector_and_binds_raw_artifact(
+        self,
+    ):
+        self.assertEqual(
+            derive_extraction_fingerprint("1" * 64, "2" * 64, "3" * 64),
+            "1317bec934444929bd672b3c59398d1656e66d500a8208713027690d926256fd",
+        )
+        self.assertNotEqual(
+            derive_extraction_fingerprint("1" * 64, "2" * 64, "3" * 64),
+            derive_extraction_fingerprint("1" * 64, "4" * 64, "3" * 64),
+        )
+        with self.assertRaises(ProductionFailure):
+            derive_extraction_fingerprint("1" * 64, "bad", "3" * 64)
 
     def test_rejects_empty_cross_page_and_duplicate_citable_locators(self):
         normalized, raw = self.conversion()

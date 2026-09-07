@@ -253,6 +253,16 @@ normalization or locator correction reuses an unchanged parser artifact, uses
 a new extraction fingerprint, and creates a new text version and processing
 generation.
 
+The binary scan carries `extractionConfigurationFingerprint`, which can be
+computed before conversion from the parser identity and normalization code and
+configuration. The final artifact-bound `extractionFingerprint` is available
+only after parsing. Admission recomputes it as SHA-256 of the UTF-8 domain
+`kith-parsed-extraction:v1`, one NUL byte, and the compact JSON array
+`[parserFingerprint, parserArtifactSha256, extractionConfigurationFingerprint]`.
+All three entries are lowercase SHA-256 strings. This avoids requiring parser
+output before the current-authority preflight. The other processing and
+correction fingerprints remain part of the scan and generation identity.
+
 Evidence spans continue to point to immutable `sourcePages` and use exact
 page-relative UTF-16 offsets and quote hashes. The locator union gains a
 bounded parser locator containing the parser artifact ID, source item or table
@@ -372,6 +382,10 @@ variant with its current 65,536-byte limit and validation. A new
 `ready_binary_v1` variant carries the SHA-256 digest, byte length, media type,
 and selected binary parser profile. It carries no text and initially accepts
 only PDF bytes up to 16 MiB.
+
+The binary profile includes the pre-parse configuration fingerprint described
+above. It does not carry a final extraction fingerprint that depends on parser
+output not yet produced.
 
 The variant is included in the inventory metadata digest, processing identity
 digest, scan entry, discovery work, processing job, and generation
@@ -550,6 +564,13 @@ bearer URLs. Permission to read hosted text does not by itself grant permission
 to retrieve original bytes. Mobile clients can read indexed text and exact
 citations while original or parser artifacts require an authorized desktop
 worker.
+
+Hosted document and search reads share a 256 KiB serialized citation budget
+per response, including quote, locator, and citation-array overhead. They omit
+whole citations when that budget is exhausted and report `partial`; search
+results also report `citationsTruncated`. Returned quotes remain complete and
+retain their exact hashes. Document page text remains available within the
+existing page and text bounds.
 
 If an original path or encrypted archive object becomes unavailable, the
 status reports that fact without hiding a still-valid hosted generation.

@@ -11,6 +11,7 @@ const MAX_LIMIT = 25;
 const MAX_READ_SPACES = 32;
 const MAX_SEARCH_CANDIDATES = 64;
 const MAX_CITATIONS_PER_RESULT = 16;
+const MAX_CITATION_OUTPUT_BYTES = 256 * 1024;
 const MAX_PAGES = 32;
 const MAX_EVIDENCE_SPANS = 128;
 const MAX_SOURCE_ACCOUNTS = 32;
@@ -19,6 +20,34 @@ const MAX_SOURCE_METADATA_ROWS = 128;
 const MAX_QUERY_LENGTH = 500;
 
 type PublicationState = "staged" | "active" | "historical";
+
+type CitationOutput = {
+  evidenceSpanId: Id<"evidenceSpans">;
+  sourcePageId: Id<"sourcePages">;
+  sourceTextVersionId: Id<"sourceTextVersions">;
+  sourceRevisionId: Id<"sourceRevisions">;
+  pageOrdinal: number;
+  start: number;
+  end: number;
+  quote: string;
+  quoteHash: string;
+  locator: Doc<"evidenceSpans">["locator"];
+};
+
+class CitationOutputBudget {
+  private readonly encoder = new TextEncoder();
+  // Reserve opening/closing delimiters for every possible per-page or
+  // per-result citation array. Each admitted citation also reserves a comma;
+  // over-reserving the first item keeps admission order-independent.
+  private used = 2 * Math.max(MAX_PAGES, MAX_LIMIT + 1);
+
+  include(value: unknown): boolean {
+    const size = this.encoder.encode(JSON.stringify(value)).byteLength + 1;
+    if (size > MAX_CITATION_OUTPUT_BYTES - this.used) return false;
+    this.used += size;
+    return true;
+  }
+}
 
 function boundedLimit(value: number | undefined) {
   if (value === undefined) return DEFAULT_LIMIT;
@@ -149,6 +178,7 @@ async function hydrateCitations(
     sourceRevisionId: Id<"sourceRevisions">;
     sourceTextVersionId: Id<"sourceTextVersions">;
   },
+  budget: CitationOutputBudget,
   cache?: {
     spans: Map<Id<"evidenceSpans">, Doc<"evidenceSpans"> | null>;
     pages: Map<Id<"sourcePages">, Doc<"sourcePages"> | null>;
@@ -175,7 +205,10 @@ async function hydrateCitations(
     }
     pages.push(page);
   }
-  const citations = spans.flatMap((span, index) => {
+  const citations: CitationOutput[] = [];
+  let invalidCitations = false;
+  let byteBudgetTruncated = false;
+  for (const [index, span] of spans.entries()) {
     const page = pages[index];
     if (
       !span ||
@@ -190,28 +223,33 @@ async function hydrateCitations(
       span.end < span.start ||
       span.end > page.text.length
     ) {
-      return [];
+      invalidCitations = true;
+      continue;
     }
-    return [
-      {
-        evidenceSpanId: span._id,
-        sourcePageId: page._id,
-        sourceTextVersionId: span.sourceTextVersionId,
-        sourceRevisionId: span.sourceRevisionId,
-        pageOrdinal: page.ordinal,
-        start: span.start,
-        end: span.end,
-        quote: page.text.slice(span.start, span.end),
-        quoteHash: span.quoteHash,
-        locator: span.locator,
-      },
-    ];
-  });
+    const citation: CitationOutput = {
+      evidenceSpanId: span._id,
+      sourcePageId: page._id,
+      sourceTextVersionId: span.sourceTextVersionId,
+      sourceRevisionId: span.sourceRevisionId,
+      pageOrdinal: page.ordinal,
+      start: span.start,
+      end: span.end,
+      quote: page.text.slice(span.start, span.end),
+      quoteHash: span.quoteHash,
+      locator: span.locator,
+    };
+    if (!budget.include(citation)) {
+      byteBudgetTruncated = true;
+      continue;
+    }
+    citations.push(citation);
+  }
   return {
     citations,
-    citationsTruncated: evidenceSpanIds.length > MAX_CITATIONS_PER_RESULT,
-    invalidCitations:
-      citations.length !== Math.min(ids.length, MAX_CITATIONS_PER_RESULT),
+    citationsTruncated:
+      evidenceSpanIds.length > MAX_CITATIONS_PER_RESULT || byteBudgetTruncated,
+    invalidCitations,
+    byteBudgetTruncated,
   };
 }
 
@@ -331,6 +369,7 @@ export async function searchDocuments(
     spans: new Map<Id<"evidenceSpans">, Doc<"evidenceSpans"> | null>(),
     pages: new Map<Id<"sourcePages">, Doc<"sourcePages"> | null>(),
   };
+  const citationBudget = new CitationOutputBudget();
   const results = [];
   let citationPartial = false;
   for (const candidate of candidates) {
@@ -368,9 +407,11 @@ export async function searchDocuments(
         sourceRevisionId: document.sourceRevisionId,
         sourceTextVersionId: document.sourceTextVersionId,
       },
+      citationBudget,
       citationCache,
     );
-    citationPartial ||= citationResult.invalidCitations;
+    citationPartial ||=
+      citationResult.invalidCitations || citationResult.byteBudgetTruncated;
     seenDocuments.add(document._id);
     results.push({
       spaceId: document.spaceId,
@@ -442,6 +483,8 @@ export async function getDocument(
     throw new Error("Document content exceeds the supported read bounds");
   }
   const allowedEvidence = new Set(document.evidenceSpanIds);
+  const citationBudget = new CitationOutputBudget();
+  let citationBudgetTruncated = false;
   const pages = pageRows
     .filter(
       (page) =>
@@ -475,22 +518,30 @@ export async function getDocument(
           (left, right) =>
             left.ordinal - right.ordinal || left._id.localeCompare(right._id),
         )
-        .map((span) => ({
-          evidenceSpanId: span._id,
-          ordinal: span.ordinal,
-          start: span.start,
-          end: span.end,
-          quote: page.text.slice(span.start, span.end),
-          quoteHash: span.quoteHash,
-          locator: span.locator,
-        })),
+        .flatMap((span) => {
+          const evidence = {
+            evidenceSpanId: span._id,
+            ordinal: span.ordinal,
+            start: span.start,
+            end: span.end,
+            quote: page.text.slice(span.start, span.end),
+            quoteHash: span.quoteHash,
+            locator: span.locator,
+          };
+          if (!citationBudget.include(evidence)) {
+            citationBudgetTruncated = true;
+            return [];
+          }
+          return [evidence];
+        }),
     }));
   const validatedEvidenceSpanIds = pages.flatMap((page) =>
     page.evidence.map((span) => span.evidenceSpanId),
   );
   const partial =
     pages.length !== pageRows.length ||
-    validatedEvidenceSpanIds.length !== allowedEvidence.size;
+    validatedEvidenceSpanIds.length !== allowedEvidence.size ||
+    citationBudgetTruncated;
   return {
     spaceId: document.spaceId,
     sourceAccountId: chain.account._id,

@@ -108,7 +108,8 @@ async function requireCurrentWorkerJob(
     job.spaceId !== source.spaceId ||
     job.sourceAccountId !== source.account._id ||
     job.workerManaged !== true ||
-    job.workerDiscoveryWorkId === undefined
+    job.workerDiscoveryWorkId === undefined ||
+    job.workerProcessingMode !== undefined
   ) {
     throw workerProtocolError("not_found");
   }
@@ -294,8 +295,8 @@ async function dueProcessingCandidates(
   sourceAccountId: Id<"sourceAccounts">,
   now: number,
 ): Promise<Array<Doc<"ingestJobs">>> {
-  const nextIndex = "by_source_worker_state_nextAttemptAt" as const;
-  const leaseIndex = "by_source_worker_state_leaseExpiresAt" as const;
+  const nextIndex = "by_source_mode_worker_state_next" as const;
+  const leaseIndex = "by_source_mode_worker_state_lease" as const;
   const [
     queuedMissing,
     queued,
@@ -310,6 +311,7 @@ async function dueProcessingCandidates(
       .withIndex(nextIndex, (q) =>
         q
           .eq("sourceAccountId", sourceAccountId)
+          .eq("workerProcessingMode", undefined)
           .eq("workerManaged", true)
           .eq("state", "queued")
           .eq("nextAttemptAt", undefined),
@@ -320,6 +322,7 @@ async function dueProcessingCandidates(
       .withIndex(nextIndex, (q) =>
         q
           .eq("sourceAccountId", sourceAccountId)
+          .eq("workerProcessingMode", undefined)
           .eq("workerManaged", true)
           .eq("state", "queued")
           .gt("nextAttemptAt", undefined)
@@ -331,6 +334,7 @@ async function dueProcessingCandidates(
       .withIndex(nextIndex, (q) =>
         q
           .eq("sourceAccountId", sourceAccountId)
+          .eq("workerProcessingMode", undefined)
           .eq("workerManaged", true)
           .eq("state", "failed")
           .gt("nextAttemptAt", undefined)
@@ -342,6 +346,7 @@ async function dueProcessingCandidates(
       .withIndex(leaseIndex, (q) =>
         q
           .eq("sourceAccountId", sourceAccountId)
+          .eq("workerProcessingMode", undefined)
           .eq("workerManaged", true)
           .eq("state", "processing")
           .eq("leaseExpiresAt", undefined),
@@ -352,6 +357,7 @@ async function dueProcessingCandidates(
       .withIndex(leaseIndex, (q) =>
         q
           .eq("sourceAccountId", sourceAccountId)
+          .eq("workerProcessingMode", undefined)
           .eq("workerManaged", true)
           .eq("state", "processing")
           .gt("leaseExpiresAt", undefined)
@@ -363,6 +369,7 @@ async function dueProcessingCandidates(
       .withIndex(leaseIndex, (q) =>
         q
           .eq("sourceAccountId", sourceAccountId)
+          .eq("workerProcessingMode", undefined)
           .eq("workerManaged", true)
           .eq("state", "staged")
           .eq("leaseExpiresAt", undefined),
@@ -373,6 +380,7 @@ async function dueProcessingCandidates(
       .withIndex(leaseIndex, (q) =>
         q
           .eq("sourceAccountId", sourceAccountId)
+          .eq("workerProcessingMode", undefined)
           .eq("workerManaged", true)
           .eq("state", "staged")
           .gt("leaseExpiresAt", undefined)
@@ -530,6 +538,9 @@ export async function reserveProcessingJobs(
     ) {
       throw workerProtocolError("scan_conflict");
     }
+    // Parsed jobs are reserved through their dedicated protocol in B2. The
+    // legacy result has no representation discriminator and must stay UTF-8.
+    if (candidate.workerProcessingMode !== undefined) continue;
     let current: CurrentWorkerJob | undefined;
     try {
       current = await requireCurrentWorkerJob(ctx, source, candidate._id);

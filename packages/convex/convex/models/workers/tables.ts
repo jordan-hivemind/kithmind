@@ -9,6 +9,7 @@ import {
   workerReservationReceiptFields,
   workerReservationTargetFields,
   workerDiscoveryWorkFields,
+  workerBinaryOperationReceiptFields,
   workerScanEntryFields,
   workerScanPageFields,
   workerSourceScanFields,
@@ -77,6 +78,18 @@ export const workerTables = {
       "state",
       "leaseExpiresAt",
     ])
+    .index("by_source_rep_state_next", [
+      "sourceAccountId",
+      "contentRepresentation",
+      "state",
+      "nextAttemptAt",
+    ])
+    .index("by_source_rep_state_lease", [
+      "sourceAccountId",
+      "contentRepresentation",
+      "state",
+      "leaseExpiresAt",
+    ])
     .index("by_sourceItemId", ["sourceItemId"])
     .index("by_sourceItemId_and_observationEpoch", [
       "sourceItemId",
@@ -109,6 +122,15 @@ export const workerTables = {
     .index("by_leaseExpiresAt", ["leaseExpiresAt"]),
   workerOperationReceipts: defineTable(workerOperationReceiptFields)
     .index("by_sourceAccountId_and_operation_and_requestId", [
+      "sourceAccountId",
+      "operation",
+      "requestId",
+    ])
+    .index("by_discoveryWorkId", ["discoveryWorkId"])
+    .index("by_sourceItemId", ["sourceItemId"])
+    .index("by_retireAt", ["retireAt"]),
+  workerBinaryOperationReceipts: defineTable(workerBinaryOperationReceiptFields)
+    .index("by_source_operation_request", [
       "sourceAccountId",
       "operation",
       "requestId",
