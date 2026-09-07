@@ -1,61 +1,49 @@
-import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
-import { parseConfig, requireCredential } from "./config.js";
+import {
+  journalBindingForConfig,
+  loadPipelineConfig,
+  requireCredential,
+} from "./config.js";
+import { doctorFromPath, formatDoctorResult } from "./doctor.js";
 import { Journal } from "./journal.js";
 import { initialCheckpoint, journalCodec, PipelineRunner } from "./runner.js";
 import { HttpWorkerTransport } from "./transport.js";
 import type { PipelineRunResult } from "./types.js";
 
 function usage(): never {
-  throw new Error("Usage: pnpm brain:worker -- <run|watch> --config <path>");
+  throw new Error(
+    "Usage: pnpm brain:worker -- <run|watch|doctor> --config <path> [--json]",
+  );
 }
-export function argumentsFor(argv: string[]): {
-  command: "run" | "watch";
-  configPath: string;
-} {
+export function argumentsFor(
+  argv: string[],
+):
+  | { command: "run" | "watch"; configPath: string }
+  | { command: "doctor"; configPath: string; json: boolean } {
   const forwarded = argv[0] === "--" ? argv.slice(1) : argv;
   const [command, flag, configPath, ...extra] = forwarded;
   if (
-    (command !== "run" && command !== "watch") ||
+    (command !== "run" && command !== "watch" && command !== "doctor") ||
     flag !== "--config" ||
     !configPath ||
-    extra.length
+    extra.some((value) => value !== "--json") ||
+    extra.length > 1 ||
+    (command !== "doctor" && extra.length)
   )
     usage();
-  return { command, configPath };
-}
-
-async function load(path: string) {
-  const raw = await readFile(path, "utf8");
-  return parseConfig(JSON.parse(raw));
+  return command === "doctor"
+    ? { command, configPath, json: extra.includes("--json") }
+    : { command, configPath };
 }
 
 async function execute(configPath: string): Promise<PipelineRunResult> {
-  const config = await load(configPath);
+  const config = await loadPipelineConfig(configPath);
   const credential = requireCredential(config);
-  const configFingerprint = createHash("sha256")
-    .update(
-      JSON.stringify({
-        endpoint: config.endpoint,
-        spaceId: config.spaceId,
-        sourceAccountId: config.sourceAccountId,
-        roots: config.roots,
-      }),
-    )
-    .digest("hex");
   const journal = await Journal.open({
     directory: config.journalDir,
-    binding: {
-      protocolVersion: 1,
-      endpoint: config.endpoint,
-      spaceId: config.spaceId,
-      sourceAccountId: config.sourceAccountId,
-      configFingerprint,
-      credentialSlot: config.credentialEnv,
-    },
+    binding: journalBindingForConfig(config),
     credential,
     initialCheckpoint,
     codec: journalCodec,
@@ -73,7 +61,21 @@ async function execute(configPath: string): Promise<PipelineRunResult> {
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
-  const { command, configPath } = argumentsFor(argv);
+  const parsed = argumentsFor(argv);
+  const { command, configPath } = parsed;
+  if (command === "doctor") {
+    const doctorResult = await doctorFromPath(
+      configPath,
+      (config, credential) => new HttpWorkerTransport(config, credential),
+    );
+    process.stdout.write(
+      parsed.json
+        ? `${JSON.stringify(doctorResult)}\n`
+        : `${formatDoctorResult(doctorResult)}\n`,
+    );
+    if (doctorResult.state === "blocked") process.exitCode = 1;
+    return;
+  }
   if (command === "run") {
     const result = await execute(configPath);
     process.stdout.write(`${JSON.stringify(result)}\n`);
@@ -83,7 +85,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   while (true) {
     const result = await execute(configPath);
     process.stdout.write(`${JSON.stringify(result)}\n`);
-    const config = await load(configPath);
+    const config = await loadPipelineConfig(configPath);
     await new Promise((resolve) => setTimeout(resolve, config.watchIntervalMs));
   }
 }

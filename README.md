@@ -38,9 +38,10 @@ are still being implemented. The public architecture and staged plan are in
   establish record or date coverage. See the [worker protocol](docs/plans/2026-09-07-worker-protocol.md).
 - A bounded filesystem text worker with local restart state, foreground polling,
   cloud identity recovery, and retained-text publication. Start with the
-  [synthetic worker recipe](docs/filesystem-worker.md). Parser support, unattended
-  service installation, monitoring, and owner-document ingestion gates remain
-  separate work.
+  [synthetic worker recipe](docs/filesystem-worker.md),
+  [read-only diagnostics](docs/worker-doctor.md), and
+  [optional user-service installation](docs/worker-service.md). Parser support,
+  cloud monitoring, and owner-document ingestion gates remain separate work.
 - A Next.js web application, Convex backend, and a Claude Code plugin source.
 
 For local development, run `npx convex dev --once` from `packages/convex`,
@@ -65,8 +66,8 @@ requirements and optional server-side OpenAI and Anthropic API credentials.
 The following are architecture commitments, not current product features:
 
 - Extraction of typed records from real sources.
-- An unattended Mac-hosted service, additional connectors, extraction
-  playbooks, and monitored background ingestion.
+- Additional connectors, extraction playbooks, cloud monitoring, and
+  verified operational recovery.
 - Desktop is the primary workflow. P2 mobile access is through hosted MCP for
   supported native clients; where a client lacks remote MCP support, a thin
   authenticated API adapter is an option to validate. An iOS Shortcut is an

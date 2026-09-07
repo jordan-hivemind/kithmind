@@ -4,7 +4,9 @@ This runbook describes the currently implemented account-isolated application.
 Family spaces, bounded inline capture, source records, and durable processing
 primitives are implemented. A bounded filesystem text worker supports foreground
 polling; use the [synthetic worker recipe](filesystem-worker.md) after deployment
-setup. Additional connectors, full operational recovery, and bulk ingestion
+setup. Check prerequisites with [worker doctor](worker-doctor.md) and use the
+[optional user-service recipes](worker-service.md) for local supervision.
+Additional connectors, full operational recovery, and bulk ingestion
 remain Phase 2 work. Desktop is primary; native mobile
 integration is P2 and is not a setup gate.
 

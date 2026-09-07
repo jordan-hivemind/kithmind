@@ -1,0 +1,14 @@
+[Unit]
+Description=Kith Mind filesystem worker
+
+[Service]
+Type=simple
+WorkingDirectory=/ABSOLUTE/PATH/TO/REPOSITORY
+ExecStart=/ABSOLUTE/PATH/TO/linux-credential-watch.sh
+LoadCredential=kithmind-worker-key:/ABSOLUTE/PATH/TO/PRIVATE/worker-key
+UMask=0077
+Restart=on-failure
+RestartSec=30s
+
+[Install]
+WantedBy=default.target
