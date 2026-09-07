@@ -323,6 +323,95 @@ describe("POST /api/ingest", () => {
     expect(mocks.action).not.toHaveBeenCalled();
   });
 
+  test("returns a structured 400 when the backend rejects an opaque space ID", async () => {
+    mocks.action.mockRejectedValue(
+      Object.assign(new Error("Server Error"), {
+        data: { type: "inline_ingest_error", code: "invalid_request" },
+      }),
+    );
+
+    const response = await POST(
+      request(JSON.stringify({ ...validPayload, spaceId: "not-a-convex-id" })),
+    );
+
+    expect(response.status).toBe(400);
+    expect(await responseBody(response)).toEqual({
+      error: { code: "invalid_request", message: "Invalid ingest request" },
+    });
+    expect(mocks.action.mock.calls[0]![1]).toMatchObject({
+      input: { spaceId: "not-a-convex-id" },
+    });
+  });
+
+  test.each([
+    ["not_authenticated", 401, "unauthorized", "Not authenticated"],
+    ["source_account_not_found", 403, "forbidden", "Source account not found"],
+    ["space_not_found", 403, "forbidden", "Space not found"],
+    [
+      "default_ingest_space_unavailable",
+      403,
+      "forbidden",
+      "Default ingest space is not available",
+    ],
+    [
+      "request_conflict",
+      409,
+      "conflict",
+      "requestId conflicts with a different request",
+    ],
+    [
+      "desired_processing_epoch_conflict",
+      409,
+      "conflict",
+      "Desired processing epoch conflict",
+    ],
+    ["invalid_request", 400, "invalid_request", "Invalid ingest request"],
+    ["ingest_rate_limited", 429, "rate_limited", "Ingest rate limit exceeded"],
+    [
+      "source_item_unavailable",
+      409,
+      "conflict",
+      "Source item is not available for admission",
+    ],
+  ])(
+    "maps structured production backend code %s",
+    async (backendCode, status, responseCode, message) => {
+      mocks.action.mockRejectedValue(
+        Object.assign(new Error("Server Error"), {
+          data: {
+            type: "inline_ingest_error",
+            code: backendCode,
+            message: "must never cross the HTTP boundary",
+          },
+        }),
+      );
+
+      const response = await POST(request());
+
+      expect(response.status).toBe(status);
+      expect(await responseBody(response)).toEqual({
+        error: { code: responseCode, message },
+      });
+    },
+  );
+
+  test.each([
+    { type: "inline_ingest_error", code: "unknown_code" },
+    { type: "different_error", code: "request_conflict" },
+    { type: "inline_ingest_error", code: 409 },
+  ])("rejects unrecognized structured backend data: %j", async (data) => {
+    mocks.action.mockRejectedValue(
+      Object.assign(new Error("Server Error"), { data }),
+    );
+
+    const response = await POST(request());
+
+    expect(response.status).toBe(500);
+    expect(await responseBody(response)).toEqual({
+      error: { code: "ingest_failed", message: "Ingestion failed" },
+    });
+  });
+
   test.each([
     ["Not authenticated", 401, "unauthorized"],
     ["Source account not found", 403, "forbidden"],
@@ -344,7 +433,12 @@ describe("POST /api/ingest", () => {
       error: {
         code,
         message:
-          code === "invalid_request" ? "Invalid ingest request" : message,
+          code === "invalid_request"
+            ? "Invalid ingest request"
+            : message === "Source item is forgetting" ||
+                message === "Source item is forgotten"
+              ? "Source item is not available for admission"
+              : message,
       },
     });
   });
@@ -367,10 +461,11 @@ describe("POST /api/ingest", () => {
     });
   });
 
-  test("does not expose unexpected backend failures", async () => {
-    mocks.action.mockRejectedValue(
-      new Error("secret database table and stack details"),
-    );
+  test.each([
+    "secret database table and stack details",
+    "Internal database index must be unique",
+  ])("does not expose unexpected backend failure: %s", async (message) => {
+    mocks.action.mockRejectedValue(new Error(message));
 
     const response = await POST(request());
 

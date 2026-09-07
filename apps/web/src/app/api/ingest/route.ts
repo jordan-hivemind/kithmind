@@ -1,5 +1,4 @@
 import { api } from "@repo/db/convex/_generated/api";
-import type { Id } from "@repo/db/convex/_generated/dataModel";
 import { ConvexHttpClient } from "convex/browser";
 
 import {
@@ -90,9 +89,7 @@ export async function POST(req: Request): Promise<Response> {
     convex.setAuth(token);
     const result = await convex.action(api.models.ingestion.inlineMcp.ingest, {
       input: {
-        ...(input.spaceId === undefined
-          ? {}
-          : { spaceId: input.spaceId as Id<"spaces"> }),
+        ...(input.spaceId === undefined ? {} : { spaceId: input.spaceId }),
         requestId: input.requestId,
         expectedDesiredProcessingEpoch: input.expectedDesiredProcessingEpoch,
         source: input.source,

@@ -4,12 +4,13 @@ import { v } from "convex/values";
 
 import { requireMcpPrincipal } from "../../lib/mcpAuth";
 import { principalRef } from "../../lib/spaces";
-import { inlineIngestInputValidator } from "./inlineInput";
+import { inlineIngestTransportInputValidator } from "./inlineInput";
+import { rethrowInlineIngestError } from "./inlineErrors";
 import type { InlineIngestResult } from "./inlineWork";
 import type { admitInlineWork } from "./inlineWork";
 
 export const ingest = action({
-  args: { input: inlineIngestInputValidator },
+  args: { input: inlineIngestTransportInputValidator },
   returns: v.object({
     sourceItemId: v.id("sourceItems"),
     sourceRevisionId: v.id("sourceRevisions"),
@@ -26,20 +27,24 @@ export const ingest = action({
     ),
   }),
   handler: async (ctx, args): Promise<InlineIngestResult> => {
-    const principal = await requireMcpPrincipal(ctx);
-    if (!principal.credentialId) throw new Error("Not authenticated");
-    const ref = principalRef(principal);
-    const admitted: Awaited<ReturnType<typeof admitInlineWork>> =
-      await ctx.runMutation(internal.models.ingestion.inlineWorker.admit, {
-        principal: ref,
-        input: args.input,
+    try {
+      const principal = await requireMcpPrincipal(ctx);
+      if (!principal.credentialId) throw new Error("Not authenticated");
+      const ref = principalRef(principal);
+      const admitted: Awaited<ReturnType<typeof admitInlineWork>> =
+        await ctx.runMutation(internal.models.ingestion.inlineWorker.admit, {
+          principal: ref,
+          input: args.input,
+        });
+      await ctx.runAction(internal.models.ingestion.inlineWorker.process, {
+        workId: admitted.workId,
       });
-    await ctx.runAction(internal.models.ingestion.inlineWorker.process, {
-      workId: admitted.workId,
-    });
-    return await ctx.runMutation(
-      internal.models.ingestion.inlineWorker.result,
-      { principal: ref, workId: admitted.workId },
-    );
+      return await ctx.runMutation(
+        internal.models.ingestion.inlineWorker.result,
+        { principal: ref, workId: admitted.workId },
+      );
+    } catch (error) {
+      rethrowInlineIngestError(error);
+    }
   },
 });

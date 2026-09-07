@@ -130,6 +130,58 @@ describe("durable inline worker", () => {
         desiredProcessingEpoch: 1,
       });
       expect(result.documentId).toBeDefined();
+      await expect(
+        mcp.action(api.models.ingestion.inlineMcp.ingest, {
+          input: input(seeded.spaceId, { title: "Conflicting title" }),
+        }),
+      ).rejects.toMatchObject({
+        data: {
+          type: "inline_ingest_error",
+          code: "request_conflict",
+        },
+      });
+      for (const [label, invalidSpaceId] of [
+        ["malformed", "not-a-convex-id"],
+        ["wrong-table", seeded.credentialId],
+        ["too-long", "x".repeat(257)],
+      ] as const) {
+        await expect(
+          mcp.action(api.models.ingestion.inlineMcp.ingest, {
+            input: {
+              ...input(seeded.spaceId, {
+                requestId: `bad-space-${label}`,
+              }),
+              spaceId: invalidSpaceId,
+            },
+          }),
+        ).rejects.toMatchObject({
+          data: {
+            type: "inline_ingest_error",
+            code: "invalid_request",
+          },
+        });
+      }
+    } finally {
+      if (priorIssuer === undefined) delete process.env.MCP_JWT_ISSUER;
+      else process.env.MCP_JWT_ISSUER = priorIssuer;
+    }
+  });
+
+  test("public MCP authentication failures use structured safe errors", async () => {
+    const seeded = await seed();
+    const priorIssuer = process.env.MCP_JWT_ISSUER;
+    process.env.MCP_JWT_ISSUER = "https://synthetic.mcp.test";
+    try {
+      await expect(
+        seeded.t.action(api.models.ingestion.inlineMcp.ingest, {
+          input: input(seeded.spaceId),
+        }),
+      ).rejects.toMatchObject({
+        data: {
+          type: "inline_ingest_error",
+          code: "not_authenticated",
+        },
+      });
     } finally {
       if (priorIssuer === undefined) delete process.env.MCP_JWT_ISSUER;
       else process.env.MCP_JWT_ISSUER = priorIssuer;

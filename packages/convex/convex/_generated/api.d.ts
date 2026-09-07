@@ -45,6 +45,7 @@ import type * as models_facts_private from "../models/facts/private.js";
 import type * as models_facts_public from "../models/facts/public.js";
 import type * as models_facts_validators from "../models/facts/validators.js";
 import type * as models_ingestion_hash from "../models/ingestion/hash.js";
+import type * as models_ingestion_inlineErrors from "../models/ingestion/inlineErrors.js";
 import type * as models_ingestion_inlineInput from "../models/ingestion/inlineInput.js";
 import type * as models_ingestion_inlineMcp from "../models/ingestion/inlineMcp.js";
 import type * as models_ingestion_inlineText from "../models/ingestion/inlineText.js";
@@ -156,6 +157,7 @@ declare const fullApi: ApiFromModules<{
   "models/facts/public": typeof models_facts_public;
   "models/facts/validators": typeof models_facts_validators;
   "models/ingestion/hash": typeof models_ingestion_hash;
+  "models/ingestion/inlineErrors": typeof models_ingestion_inlineErrors;
   "models/ingestion/inlineInput": typeof models_ingestion_inlineInput;
   "models/ingestion/inlineMcp": typeof models_ingestion_inlineMcp;
   "models/ingestion/inlineText": typeof models_ingestion_inlineText;
