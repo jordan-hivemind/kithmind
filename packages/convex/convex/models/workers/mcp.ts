@@ -161,6 +161,68 @@ const workerResultValidator = v.union(
     state: v.literal("admitted"),
     reused: v.boolean(),
   }),
+  v.object({
+    operation: v.literal("jobs.reserve"),
+    receiptId: v.string(),
+    expiresAt: v.number(),
+    reused: v.boolean(),
+    targets: v.array(
+      v.object({
+        jobId: v.string(),
+        workId: v.string(),
+        sourceItemId: v.string(),
+        observationEpoch: v.number(),
+        processingEpoch: v.number(),
+        state: v.union(v.literal("processing"), v.literal("staged")),
+        leaseEpoch: v.number(),
+        leaseToken: v.string(),
+        leaseExpiresAt: v.number(),
+      }),
+    ),
+  }),
+  v.object({
+    operation: v.literal("jobs.renew"),
+    jobId: v.string(),
+    state: v.union(v.literal("processing"), v.literal("staged")),
+    leaseExpiresAt: v.number(),
+    reused: v.boolean(),
+  }),
+  v.object({
+    operation: v.literal("jobs.stageUtf8"),
+    jobId: v.string(),
+    state: v.literal("staged"),
+    actualPageCount: v.number(),
+    actualEvidenceSpanCount: v.number(),
+    actualDocumentCount: v.number(),
+    actualChunkCount: v.number(),
+    reused: v.boolean(),
+  }),
+  v.object({
+    operation: v.literal("jobs.activate"),
+    jobId: v.string(),
+    state: v.literal("ready"),
+    activatedAt: v.number(),
+    previousGenerationId: v.optional(v.string()),
+    reused: v.boolean(),
+  }),
+  v.object({
+    operation: v.literal("jobs.fail"),
+    jobId: v.string(),
+    state: v.union(
+      v.literal("failed"),
+      v.literal("needs_review"),
+      v.literal("obsolete_generation"),
+    ),
+    retryable: v.boolean(),
+    nextAttemptAt: v.optional(v.number()),
+    failureCode: v.union(
+      v.literal("worker_interrupted"),
+      v.literal("worker_resource_exhausted"),
+      v.literal("source_bytes_invalid"),
+      v.literal("staging_invalid"),
+    ),
+    reused: v.boolean(),
+  }),
 );
 
 function randomLeaseTokens(count: number): string[] {
@@ -233,6 +295,75 @@ export const dispatch = action({
         case "discovery.admitUtf8":
           return await ctx.runMutation(
             internal.models.workers.private.discoveryAdmitUtf8,
+            { principal, request },
+          );
+        case "jobs.reserve":
+          return await ctx.runMutation(
+            internal.models.workers.private.jobsReserve,
+            {
+              principal,
+              request,
+              tokens: randomLeaseTokens(request.maxItems),
+            },
+          );
+        case "jobs.renew":
+          return await ctx.runMutation(
+            internal.models.workers.private.jobsRenew,
+            { principal, request },
+          );
+        case "jobs.stageUtf8": {
+          const begun = await ctx.runMutation(
+            internal.models.workers.private.jobsStageBegin,
+            { principal, request },
+          );
+          if (begun.state === "completed") return begun.result;
+          await ctx.runMutation(internal.models.workers.private.jobsStageText, {
+            principal,
+            request,
+          });
+          await ctx.runMutation(internal.models.workers.private.jobsStagePage, {
+            principal,
+            request,
+          });
+          let spanOffset = 0;
+          while (spanOffset < begun.chunkCount) {
+            const batch = await ctx.runMutation(
+              internal.models.workers.private.jobsStageSpans,
+              { principal, request, offset: spanOffset },
+            );
+            if (batch.nextOffset <= spanOffset) {
+              throw new Error("Worker span staging made no progress");
+            }
+            spanOffset = batch.nextOffset;
+          }
+          await ctx.runMutation(
+            internal.models.workers.private.jobsStageDocument,
+            { principal, request },
+          );
+          let chunkOffset = 0;
+          while (chunkOffset < begun.chunkCount) {
+            const batch = await ctx.runMutation(
+              internal.models.workers.private.jobsStageChunks,
+              { principal, request, offset: chunkOffset },
+            );
+            if (batch.nextOffset <= chunkOffset) {
+              throw new Error("Worker chunk staging made no progress");
+            }
+            chunkOffset = batch.nextOffset;
+          }
+          return await ctx.runMutation(
+            internal.models.workers.private.jobsStageComplete,
+            { principal, request },
+          );
+        }
+        case "jobs.activate":
+          return await ctx.runMutation(
+            internal.models.workers.private.jobsActivate,
+            { principal, request },
+          );
+        case "jobs.fail":
+          return await ctx.runMutation(
+            internal.models.workers.private.jobsFail,
             { principal, request },
           );
       }

@@ -3,9 +3,10 @@
 **Date:** 2026-09-07
 
 **Status:** Implementation in progress. This document describes the initial
-worker gateway commands currently defined in the shared protocol. Discovery
-reservation and text admission are implemented. A complete filesystem worker,
-processing queue, parser, and publication flow remain in progress.
+worker gateway commands defined in the shared protocol. Discovery reservation,
+text admission, and deterministic text processing are implemented. Source
+processing assessment, a complete filesystem worker, and parsing remain in
+progress.
 
 **Related plan:** [Phase 2 document pipeline](2026-09-07-phase2-document-pipeline.md)
 
@@ -75,7 +76,7 @@ raw backend messages, or arbitrary backend error data.
 
 ## Initial command set
 
-Protocol version 1 currently defines these eight commands:
+Protocol version 1 currently defines these thirteen commands:
 
 | Operation              | Purpose                                              | Important bound                                                                                                                                                                    |
 | ---------------------- | ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -87,6 +88,11 @@ Protocol version 1 currently defines these eight commands:
 | `scan.reconcile`       | Reconcile a sealed scan against current inventory.   | `maxItems` is 1–50 and `ordinal` fences each advancing request.                                                                                                                    |
 | `discovery.reserve`    | Lease enumerated discovery work for upload.          | `maxItems` is 1–4; the lease lasts five minutes.                                                                                                                                   |
 | `discovery.admitUtf8`  | Verify and retain one reserved text revision.        | At most 65,536 UTF-8 bytes; exact discovered hash and byte count.                                                                                                                  |
+| `jobs.reserve`         | Lease admitted text-processing jobs.                 | `maxItems` is 1–4; each lease lasts five minutes.                                                                                                                                  |
+| `jobs.renew`           | Renew a current processing lease.                    | Fixed five-minute server duration; exact retries preserve the returned expiry.                                                                                                     |
+| `jobs.stageUtf8`       | Stage retained text and evidence.                    | No text or counts accepted; server batches contain at most 25 rows.                                                                                                                |
+| `jobs.activate`        | Publish the staged generation.                       | Current source observation and lease must still match.                                                                                                                             |
+| `jobs.fail`            | Record a bounded worker failure.                     | Four published failure codes; server chooses retry policy.                                                                                                                         |
 
 All commands require `protocolVersion: 1`. Envelopes use exact fields: unknown,
 missing, malformed, empty, or invalid-Unicode values are rejected as
@@ -98,8 +104,8 @@ submits discovery entries.
 
 The source mutation limit is 60 new requests per minute for each credential
 and source-account pair. It covers `source.inventoryPage`, `scan.begin`,
-`scan.appendPage`, `scan.seal`, `scan.reconcile`, `discovery.reserve`, and
-`discovery.admitUtf8`. A retry that exactly
+`scan.appendPage`, `scan.seal`, `scan.reconcile`, `discovery.reserve`,
+`discovery.admitUtf8`, and the five `jobs.*` commands. A retry that exactly
 matches a retained request receipt does not consume the limit. Reusing a
 request ID with different inputs fails as `request_conflict`.
 
@@ -133,7 +139,20 @@ request object and nested object rejects unknown fields.
 | `discovery.reserve`    | `{ requestId, maxItems }`                                                                                      | `{ operation, receiptId, expiresAt, reused, targets }`                                                                                                                            |
 | `discovery.admitUtf8`  | `{ requestId, workId, leaseEpoch, leaseToken, text }`                                                          | `{ operation, workId, sourceItemId, sourceRevisionId, processingGenerationId, ingestJobId, desiredProcessingEpoch, state: "admitted", reused }`                                   |
 
-A reservation target is
+The processing commands use these additional request and result fields:
+
+| Operation        | Additional request fields                                   | Result fields                                                                                                                    |
+| ---------------- | ----------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `jobs.reserve`   | `{ requestId, maxItems }`                                   | `{ operation, receiptId, expiresAt, reused, targets }`                                                                           |
+| `jobs.renew`     | `{ requestId, jobId, leaseEpoch, leaseToken }`              | `{ operation, jobId, state, leaseExpiresAt, reused }`                                                                            |
+| `jobs.stageUtf8` | `{ requestId, jobId, leaseEpoch, leaseToken }`              | `{ operation, jobId, state: "staged", actualPageCount, actualEvidenceSpanCount, actualDocumentCount, actualChunkCount, reused }` |
+| `jobs.activate`  | `{ requestId, jobId, leaseEpoch, leaseToken }`              | `{ operation, jobId, state: "ready", activatedAt, previousGenerationId?, reused }`                                               |
+| `jobs.fail`      | `{ requestId, jobId, leaseEpoch, leaseToken, failureCode }` | `{ operation, jobId, state, retryable, nextAttemptAt?, failureCode, reused }`                                                    |
+
+A processing reservation target is
+`{ jobId, workId, sourceItemId, observationEpoch, processingEpoch, state, leaseEpoch, leaseToken, leaseExpiresAt }`.
+Its state is `processing` or `staged`. Reservation never selects legacy inline
+ingestion jobs. A discovery reservation target is
 `{ workId, sourceItemId, observationEpoch, processingEpoch, leaseEpoch, leaseToken, leaseExpiresAt, uri, contentHash, byteLength }`.
 Lease tokens belong to the credential that reserved them and must be treated
 as secrets. Another ingest credential cannot use or replay that lease.
@@ -212,15 +231,82 @@ after successful admission has cleared the discovery lease. Reusing its
 request ID with different text fails.
 
 Admission retains a queued revision and job. It does not publish a searchable
-document. `source.status.processing` remains `not_assessed` until the later
-processing and assessment commands are implemented.
+document. `source.status.processing` remains `not_assessed` until source processing
+assessment is implemented.
+
+## Processing retained text
+
+After admission, reserve the queued job, stage it, and activate it. Renew the
+lease when needed. A reservation may return a previously staged job after a
+worker crash; that job can proceed to activation with its new lease. Reservations
+validate at most sixteen candidates per request. Invalid or exhausted jobs,
+including jobs whose original actor lost access, move to review without being
+leased. This queue classification requires the executing credential's current
+source grant; it does not authorize processing under the revoked actor. Later
+valid jobs can then make progress. Other job operations still reject revoked
+authority before changing processing state.
+
+`jobs.stageUtf8` reads the admitted revision inside the server. The server
+verifies its bytes and hash and derives text, pages, evidence spans, document,
+and chunks using the deterministic inline-text plan. It accepts no worker text,
+metadata, processing profile, expected counts, or capture timestamp. Every
+staging batch rechecks the full source, scan, work, revision, generation, and
+lease chain. A new observation or revoked executing or original credential
+prevents further writes and activation.
+
+The first staging mutation saves a pending operation receipt before inserting
+provenance rows. An exact retry resumes that intent under the same current
+lease. A different job or body with the same request ID fails before staging
+writes. After lease expiry, reserve again and use new operation request IDs.
+Existing compatible staged rows are reused. Once a document exists, its frozen
+metadata remains immutable even if a later observation changes its path or
+title. Recovery after a gap follows the item's exact desired processing job,
+not the latest scan-detail row. It remains valid when gap details have been
+pruned or another scan was interrupted before admission. A resumed attempt uses
+a new correction generation while reusing compatible immutable evidence.
+
+Activation publishes the complete staged generation atomically. Exact renewal,
+staging, activation, and failure retries return the committed result after
+current authorization and parent checks. They do not extend a lease twice or
+publish twice. Old receipts cannot authorize a newer observation or lease.
+
+`jobs.fail` accepts `worker_interrupted`, `worker_resource_exhausted`,
+`source_bytes_invalid`, or `staging_invalid`. The server supplies a safe message,
+retryability, backoff, and attempt limit. The worker cannot submit an arbitrary
+error message or retry timestamp. Exhausted or invalid jobs require review.
+The existing web actor-replacement operation rejects worker-linked jobs;
+explicit owner-authorized worker provenance recovery is planned before pilot
+use.
 
 ## Deferred operations
 
-This initial protocol has no public processing-job reservation, lease renewal,
-staging, activation, parser, archive, or generic job command. Those operations
-remain unavailable until separately implemented and documented. Do not invent
-their request or result shapes from internal models.
+Source-wide processing assessment, parsing, binary archives, and generic job
+execution remain unavailable. A ready text document can be searched and read
+through the authorized hosted document tools, but does not establish source
+processing completeness or record/date coverage. `source.status.processing`
+remains `not_assessed`, and `recordCoverage` remains `not_established`.
+
+## Upgrading queued admissions
+
+Deploy the schema and functions before starting a B2 worker. An installation
+that retained queued admissions from the discovery-only release must backfill
+the processing-queue marker. This internal migration preserves content, actors,
+leases, and processing identity. It skips unrelated inline jobs and reports
+stale, revoked, or inconsistent admissions as blocked.
+
+Start with a development dry run:
+
+```sh
+pnpm --filter @repo/db exec convex run models/workers/migrations:backfillManagedJobs '{"cursor":null,"maxItems":10,"dryRun":true}'
+```
+
+Follow `continueCursor` until `isDone` is true. After reviewing the totals,
+restart from `cursor: null` with `dryRun: false`, and follow every page again.
+Rerun to verify that `eligible` and `updated` are zero. Resolve any `blocked`
+rows explicitly; this migration cannot replace revoked worker authority.
+Use the same development-verified command with `--prod` for the intended
+production deployment. Each invocation inspects at most ten jobs. A fresh
+installation needs no backfill.
 
 ## Retention and forgetting
 
@@ -245,7 +331,7 @@ items are preserved. Minimal tombstone and path-alias digests remain to prevent
 accidental reimport through known identities.
 
 Reservation targets become eligible for cleanup when their leases expire.
-Reservation headers and admission operation receipts retain request identity
+Reservation headers and operation receipts retain request identity
 for 30 days; headers are removed only after their targets are gone. Expired
 rate-limit windows are also cleaned up without resetting a live window.
 Forgetting removes item-specific operation receipts and reservation targets.

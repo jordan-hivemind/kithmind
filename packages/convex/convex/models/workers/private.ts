@@ -11,6 +11,19 @@ import {
   sealWorkerScan,
 } from "./model";
 import { admitDiscoveryUtf8, reserveDiscoveryWork } from "./discovery";
+import {
+  activateProcessingJob,
+  beginProcessingStage,
+  completeProcessingStage,
+  failProcessingJob,
+  renewProcessingJob,
+  reserveProcessingJobs,
+  stageProcessingChunkBatch,
+  stageProcessingDocument,
+  stageProcessingPage,
+  stageProcessingSpanBatch,
+  stageProcessingText,
+} from "./jobs";
 import { parseWorkerRequest, type WorkerRequest } from "./protocol";
 
 function operation<T extends WorkerRequest["operation"]>(
@@ -112,6 +125,142 @@ export const discoveryAdmitUtf8 = internalMutation({
       ctx,
       args.principal,
       operation(args.request, "discovery.admitUtf8"),
+      Date.now(),
+    ),
+});
+
+export const jobsReserve = internalMutation({
+  args: {
+    principal: principalRefValidator,
+    request: v.any(),
+    tokens: v.array(v.string()),
+  },
+  handler: async (ctx, args) =>
+    await reserveProcessingJobs(
+      ctx,
+      args.principal,
+      operation(args.request, "jobs.reserve"),
+      args.tokens,
+      Date.now(),
+    ),
+});
+
+export const jobsRenew = internalMutation({
+  args: { principal: principalRefValidator, request: v.any() },
+  handler: async (ctx, args) =>
+    await renewProcessingJob(
+      ctx,
+      args.principal,
+      operation(args.request, "jobs.renew"),
+      Date.now(),
+    ),
+});
+
+export const jobsStageBegin = internalMutation({
+  args: { principal: principalRefValidator, request: v.any() },
+  handler: async (ctx, args) =>
+    await beginProcessingStage(
+      ctx,
+      args.principal,
+      operation(args.request, "jobs.stageUtf8"),
+      Date.now(),
+    ),
+});
+
+export const jobsStageText = internalMutation({
+  args: { principal: principalRefValidator, request: v.any() },
+  handler: async (ctx, args) =>
+    await stageProcessingText(
+      ctx,
+      args.principal,
+      operation(args.request, "jobs.stageUtf8"),
+      Date.now(),
+    ),
+});
+
+export const jobsStagePage = internalMutation({
+  args: { principal: principalRefValidator, request: v.any() },
+  handler: async (ctx, args) =>
+    await stageProcessingPage(
+      ctx,
+      args.principal,
+      operation(args.request, "jobs.stageUtf8"),
+      Date.now(),
+    ),
+});
+
+export const jobsStageSpans = internalMutation({
+  args: {
+    principal: principalRefValidator,
+    request: v.any(),
+    offset: v.number(),
+  },
+  handler: async (ctx, args) =>
+    await stageProcessingSpanBatch(
+      ctx,
+      args.principal,
+      operation(args.request, "jobs.stageUtf8"),
+      args.offset,
+      Date.now(),
+    ),
+});
+
+export const jobsStageDocument = internalMutation({
+  args: { principal: principalRefValidator, request: v.any() },
+  handler: async (ctx, args) =>
+    await stageProcessingDocument(
+      ctx,
+      args.principal,
+      operation(args.request, "jobs.stageUtf8"),
+      Date.now(),
+    ),
+});
+
+export const jobsStageChunks = internalMutation({
+  args: {
+    principal: principalRefValidator,
+    request: v.any(),
+    offset: v.number(),
+  },
+  handler: async (ctx, args) =>
+    await stageProcessingChunkBatch(
+      ctx,
+      args.principal,
+      operation(args.request, "jobs.stageUtf8"),
+      args.offset,
+      Date.now(),
+    ),
+});
+
+export const jobsStageComplete = internalMutation({
+  args: { principal: principalRefValidator, request: v.any() },
+  handler: async (ctx, args) =>
+    await completeProcessingStage(
+      ctx,
+      args.principal,
+      operation(args.request, "jobs.stageUtf8"),
+      Date.now(),
+    ),
+});
+
+export const jobsActivate = internalMutation({
+  args: { principal: principalRefValidator, request: v.any() },
+  handler: async (ctx, args) =>
+    await activateProcessingJob(
+      ctx,
+      args.principal,
+      operation(args.request, "jobs.activate"),
+      Date.now(),
+    ),
+});
+
+export const jobsFail = internalMutation({
+  args: { principal: principalRefValidator, request: v.any() },
+  handler: async (ctx, args) =>
+    await failProcessingJob(
+      ctx,
+      args.principal,
+      operation(args.request, "jobs.fail"),
       Date.now(),
     ),
 });

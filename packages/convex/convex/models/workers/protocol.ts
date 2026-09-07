@@ -77,6 +77,12 @@ export type FsDiscoveryGapCode =
   | "unstable"
   | "unsupported";
 
+export type WorkerJobFailureCode =
+  | "worker_interrupted"
+  | "worker_resource_exhausted"
+  | "source_bytes_invalid"
+  | "staging_invalid";
+
 export type FsDiscoveryEntry = {
   externalId?: string;
   uri: string;
@@ -157,6 +163,40 @@ export type WorkerRequest =
       leaseEpoch: number;
       leaseToken: string;
       text: string;
+    })
+  | (WorkerSourceRequest & {
+      operation: "jobs.reserve";
+      requestId: string;
+      maxItems: number;
+    })
+  | (WorkerSourceRequest & {
+      operation: "jobs.renew";
+      requestId: string;
+      jobId: string;
+      leaseEpoch: number;
+      leaseToken: string;
+    })
+  | (WorkerSourceRequest & {
+      operation: "jobs.stageUtf8";
+      requestId: string;
+      jobId: string;
+      leaseEpoch: number;
+      leaseToken: string;
+    })
+  | (WorkerSourceRequest & {
+      operation: "jobs.activate";
+      requestId: string;
+      jobId: string;
+      leaseEpoch: number;
+      leaseToken: string;
+    })
+  | (WorkerSourceRequest & {
+      operation: "jobs.fail";
+      requestId: string;
+      jobId: string;
+      leaseEpoch: number;
+      leaseToken: string;
+      failureCode: WorkerJobFailureCode;
     });
 
 export type WorkerSourceStatusResult = {
@@ -280,6 +320,62 @@ export type WorkerDiscoveryAdmitResult = {
   reused: boolean;
 };
 
+export type WorkerJobReserveResult = {
+  operation: "jobs.reserve";
+  receiptId: string;
+  expiresAt: number;
+  reused: boolean;
+  targets: Array<{
+    jobId: string;
+    workId: string;
+    sourceItemId: string;
+    observationEpoch: number;
+    processingEpoch: number;
+    state: "processing" | "staged";
+    leaseEpoch: number;
+    leaseToken: string;
+    leaseExpiresAt: number;
+  }>;
+};
+
+export type WorkerJobRenewResult = {
+  operation: "jobs.renew";
+  jobId: string;
+  state: "processing" | "staged";
+  leaseExpiresAt: number;
+  reused: boolean;
+};
+
+export type WorkerJobStageResult = {
+  operation: "jobs.stageUtf8";
+  jobId: string;
+  state: "staged";
+  actualPageCount: number;
+  actualEvidenceSpanCount: number;
+  actualDocumentCount: number;
+  actualChunkCount: number;
+  reused: boolean;
+};
+
+export type WorkerJobActivateResult = {
+  operation: "jobs.activate";
+  jobId: string;
+  state: "ready";
+  activatedAt: number;
+  previousGenerationId?: string;
+  reused: boolean;
+};
+
+export type WorkerJobFailResult = {
+  operation: "jobs.fail";
+  jobId: string;
+  state: "failed" | "needs_review" | "obsolete_generation";
+  retryable: boolean;
+  nextAttemptAt?: number;
+  failureCode: WorkerJobFailureCode;
+  reused: boolean;
+};
+
 export type WorkerResult =
   | WorkerSourceStatusResult
   | WorkerInventoryPageResult
@@ -288,7 +384,12 @@ export type WorkerResult =
   | WorkerScanSealResult
   | WorkerScanReconcileResult
   | WorkerDiscoveryReserveResult
-  | WorkerDiscoveryAdmitResult;
+  | WorkerDiscoveryAdmitResult
+  | WorkerJobReserveResult
+  | WorkerJobRenewResult
+  | WorkerJobStageResult
+  | WorkerJobActivateResult
+  | WorkerJobFailResult;
 
 type JsonObject = Record<string, unknown>;
 
@@ -412,6 +513,12 @@ const GAP_CODES = new Set<FsDiscoveryGapCode>([
   "unstable",
   "unsupported",
 ]);
+const JOB_FAILURE_CODES = new Set<WorkerJobFailureCode>([
+  "worker_interrupted",
+  "worker_resource_exhausted",
+  "source_bytes_invalid",
+  "staging_invalid",
+]);
 
 function gapCode(value: unknown): FsDiscoveryGapCode {
   if (
@@ -421,6 +528,33 @@ function gapCode(value: unknown): FsDiscoveryGapCode {
     return invalid();
   }
   return value as FsDiscoveryGapCode;
+}
+
+function jobFailureCode(value: unknown): WorkerJobFailureCode {
+  if (
+    typeof value !== "string" ||
+    !JOB_FAILURE_CODES.has(value as WorkerJobFailureCode)
+  ) {
+    return invalid();
+  }
+  return value as WorkerJobFailureCode;
+}
+
+function jobLeaseRequest(input: JsonObject): {
+  requestId: string;
+  jobId: string;
+  leaseEpoch: number;
+  leaseToken: string;
+} {
+  return {
+    requestId: requestId(input.requestId),
+    jobId: string(input.jobId, { maxUtf16: 256 }),
+    leaseEpoch: integer(input.leaseEpoch, 1, Number.MAX_SAFE_INTEGER),
+    leaseToken: string(input.leaseToken, {
+      maxUtf16: 64,
+      pattern: SHA256,
+    }),
+  };
 }
 
 function discoveryEntry(value: unknown, mode: "normal" | "identity_recovery") {
@@ -679,6 +813,44 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
           pattern: SHA256,
         }),
         text: string(input.text, { maxUtf8: 65_536 }),
+      };
+    case "jobs.reserve":
+      exactKeys(input, [...baseKeys, "requestId", "maxItems"]);
+      return {
+        ...base,
+        operation: "jobs.reserve",
+        requestId: requestId(input.requestId),
+        maxItems: integer(input.maxItems, 1, MAX_WORKER_RESERVATION_ITEMS),
+      };
+    case "jobs.renew":
+    case "jobs.stageUtf8":
+    case "jobs.activate":
+      exactKeys(input, [
+        ...baseKeys,
+        "requestId",
+        "jobId",
+        "leaseEpoch",
+        "leaseToken",
+      ]);
+      return {
+        ...base,
+        operation: input.operation,
+        ...jobLeaseRequest(input),
+      };
+    case "jobs.fail":
+      exactKeys(input, [
+        ...baseKeys,
+        "requestId",
+        "jobId",
+        "leaseEpoch",
+        "leaseToken",
+        "failureCode",
+      ]);
+      return {
+        ...base,
+        operation: "jobs.fail",
+        ...jobLeaseRequest(input),
+        failureCode: jobFailureCode(input.failureCode),
       };
     default:
       return invalid();

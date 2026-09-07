@@ -87,6 +87,8 @@ export const ingestJobFields = {
   leaseEpoch: v.number(),
   leaseToken: v.optional(v.string()),
   leaseExpiresAt: v.optional(v.number()),
+  workerManaged: v.optional(v.boolean()),
+  workerLeaseOwnerCredentialId: v.optional(v.id("apiKeys")),
   nextAttemptAt: v.optional(v.number()),
   error: v.optional(ingestErrorValidator),
   workerDiscoveryWorkId: v.optional(v.id("workerDiscoveryWork")),

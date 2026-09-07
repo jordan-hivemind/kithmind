@@ -1,6 +1,7 @@
 import type { Doc, Id } from "../../_generated/dataModel";
 import type { MutationCtx, QueryCtx } from "../../_generated/server";
 import type { PrincipalRef } from "../../lib/spaces";
+import { digestProcessingConfiguration } from "../ingestion/hash";
 import {
   createOrGetSourceItem,
   markSourceItemUnavailable,
@@ -854,6 +855,7 @@ async function obsoletePriorWork(
       state: nextState,
       leaseToken: undefined,
       leaseExpiresAt: undefined,
+      workerLeaseOwnerCredentialId: undefined,
       ...(nextState === "queued" ? { nextAttemptAt: now } : {}),
     });
     if (job.state === "processing") {
@@ -866,6 +868,7 @@ async function obsoletePriorWork(
       state: "obsolete_generation",
       leaseToken: undefined,
       leaseExpiresAt: undefined,
+      workerLeaseOwnerCredentialId: undefined,
       nextAttemptAt: undefined,
     });
     await ctx.db.patch(generation._id, { state: "obsolete_generation" });
@@ -965,11 +968,13 @@ async function createDiscoveryWork(
     const nextState =
       priorJob.state === "processing" ? "queued" : priorJob.state;
     await ctx.db.patch(priorJob._id, {
+      workerManaged: true,
       workerDiscoveryWorkId: id,
       workerObservationEpoch: args.observationEpoch,
       state: nextState,
       leaseToken: undefined,
       leaseExpiresAt: undefined,
+      workerLeaseOwnerCredentialId: undefined,
       ...(nextState === "queued" ? { nextAttemptAt: args.now } : {}),
     });
     if (priorJob.state === "processing") {
@@ -993,13 +998,45 @@ async function persistResolvedEntry(
     now: number;
   },
 ): Promise<{ row: Doc<"workerScanEntries">; manifestChanged: boolean }> {
+  const [currentWorkBeforeObservation, activeGeneration] = await Promise.all([
+    currentDiscoveryWork(ctx, args.source, args.item),
+    args.item.activeGenerationId
+      ? ctx.db.get(args.item.activeGenerationId)
+      : Promise.resolve(null),
+  ]);
+  const activeRevision = activeGeneration
+    ? await ctx.db.get(activeGeneration.sourceRevisionId)
+    : null;
+  if (
+    activeGeneration &&
+    (activeGeneration.spaceId !== args.source.spaceId ||
+      activeGeneration.sourceAccountId !== args.source.account._id ||
+      activeGeneration.sourceItemId !== args.item._id ||
+      args.item.activeRevisionId !== activeGeneration.sourceRevisionId ||
+      !activeRevision ||
+      activeRevision.spaceId !== args.source.spaceId ||
+      activeRevision.sourceItemId !== args.item._id ||
+      activeRevision._id !== activeGeneration.sourceRevisionId)
+  ) {
+    throw workerProtocolError("scan_conflict");
+  }
   const inventoryChanged =
     args.item.workerInventoryMetadataDigest !==
     args.digests.inventoryMetadataDigest;
+  const resumesInterruptedDesiredProcessing =
+    args.entry.content.status === "ready" &&
+    args.item.desiredRevisionId !== undefined &&
+    currentWorkBeforeObservation === undefined &&
+    (activeGeneration === null ||
+      activeGeneration.state !== "ready" ||
+      activeGeneration.sourceRevisionId !== args.item.desiredRevisionId ||
+      activeGeneration.desiredProcessingEpoch !==
+        args.item.desiredProcessingEpoch);
   const processingIdentityChanged =
     args.entry.content.status === "ready" &&
-    args.item.workerProcessingIdentityDigest !==
-      args.digests.processingIdentityDigest;
+    (args.item.workerProcessingIdentityDigest !==
+      args.digests.processingIdentityDigest ||
+      resumesInterruptedDesiredProcessing);
   const observationEpoch = inventoryChanged
     ? (args.item.workerObservationEpoch ?? 0) + 1
     : (args.item.workerObservationEpoch ?? 0);
@@ -1036,31 +1073,131 @@ async function persistResolvedEntry(
     workerLastSeenInventoryEpoch: args.scan.inventoryEpoch,
   });
 
-  const priorWork = await currentDiscoveryWork(ctx, args.source, args.item);
-  const activeGeneration = args.item.activeGenerationId
-    ? await ctx.db.get(args.item.activeGenerationId)
-    : null;
-  const activeRevision = activeGeneration
-    ? await ctx.db.get(activeGeneration.sourceRevisionId)
-    : null;
-  if (
-    activeGeneration &&
-    (activeGeneration.spaceId !== args.source.spaceId ||
-      activeGeneration.sourceAccountId !== args.source.account._id ||
-      activeGeneration.sourceItemId !== args.item._id ||
-      args.item.activeRevisionId !== activeGeneration.sourceRevisionId ||
-      !activeRevision ||
-      activeRevision.spaceId !== args.source.spaceId ||
-      activeRevision.sourceItemId !== args.item._id ||
-      activeRevision._id !== activeGeneration.sourceRevisionId)
-  ) {
-    throw workerProtocolError("scan_conflict");
+  let priorWork = currentWorkBeforeObservation;
+  if (!priorWork && resumesInterruptedDesiredProcessing) {
+    const desiredJobs = await ctx.db
+      .query("ingestJobs")
+      .withIndex("by_sourceItemId_and_desiredProcessingEpoch", (q) =>
+        q
+          .eq("sourceItemId", args.item._id)
+          .eq("desiredProcessingEpoch", args.item.desiredProcessingEpoch),
+      )
+      .take(2);
+    if (desiredJobs.length !== 1) throw workerProtocolError("scan_conflict");
+    const desiredJob = desiredJobs[0]!;
+    if (
+      desiredJob.spaceId !== args.source.spaceId ||
+      desiredJob.sourceAccountId !== args.source.account._id ||
+      desiredJob.sourceItemId !== args.item._id ||
+      desiredJob.sourceRevisionId !== args.item.desiredRevisionId ||
+      desiredJob.workerManaged !== true ||
+      desiredJob.workerDiscoveryWorkId === undefined
+    ) {
+      throw workerProtocolError("scan_conflict");
+    }
+    const [candidate, candidateGeneration, candidateRevision] =
+      await Promise.all([
+        ctx.db.get(desiredJob.workerDiscoveryWorkId),
+        ctx.db.get(desiredJob.processingGenerationId),
+        ctx.db.get(desiredJob.sourceRevisionId),
+      ]);
+    if (
+      !candidate ||
+      !candidateGeneration ||
+      !candidateRevision ||
+      candidate.spaceId !== args.source.spaceId ||
+      candidate.sourceAccountId !== args.source.account._id ||
+      candidate.sourceItemId !== args.item._id ||
+      candidate.state !== "obsolete" ||
+      candidate.ingestJobId !== desiredJob._id ||
+      candidate.sourceRevisionId !== args.item.desiredRevisionId ||
+      candidate.processingGenerationId !== candidateGeneration._id ||
+      candidate.expectedDesiredProcessingEpoch === undefined ||
+      candidate.expectedDesiredProcessingEpoch + 1 !==
+        desiredJob.desiredProcessingEpoch ||
+      !Number.isSafeInteger(candidate.processingEpoch) ||
+      candidate.processingEpoch < 0 ||
+      candidate.processingEpoch > (args.item.workerProcessingEpoch ?? 0) ||
+      desiredJob.workerObservationEpoch !== candidate.observationEpoch ||
+      desiredJob.actorUserId !== candidate.actorUserId ||
+      desiredJob.actorCredentialId !== candidate.actorCredentialId ||
+      desiredJob.admittedByUserId !== candidate.actorUserId ||
+      desiredJob.admittedByCredentialId !== candidate.actorCredentialId ||
+      candidateRevision.spaceId !== candidate.spaceId ||
+      candidateRevision.sourceItemId !== candidate.sourceItemId ||
+      candidateRevision.contentHash !== candidate.contentHash ||
+      candidateRevision.byteLength !== candidate.byteLength ||
+      candidateRevision.mediaType !== candidate.mediaType ||
+      candidateGeneration.spaceId !== candidate.spaceId ||
+      candidateGeneration.sourceAccountId !== candidate.sourceAccountId ||
+      candidateGeneration.sourceItemId !== candidate.sourceItemId ||
+      candidateGeneration.sourceRevisionId !== candidateRevision._id ||
+      candidateGeneration.desiredProcessingEpoch !==
+        desiredJob.desiredProcessingEpoch ||
+      candidateGeneration.state !== desiredJob.state ||
+      candidateGeneration.extractionFingerprint !==
+        candidate.extractionFingerprint ||
+      candidateGeneration.extractorFingerprint !==
+        candidate.extractorFingerprint ||
+      candidateGeneration.recordSchemaFingerprint !==
+        candidate.recordSchemaFingerprint ||
+      candidateGeneration.normalizationFingerprint !==
+        candidate.normalizationFingerprint ||
+      candidateGeneration.chunkerFingerprint !== candidate.chunkerFingerprint ||
+      candidateGeneration.correctionRevision !==
+        `filesystem-observation-v1:${candidate.processingEpoch}` ||
+      candidateGeneration.processingFingerprint !==
+        (await digestProcessingConfiguration({
+          extractionFingerprint: candidate.extractionFingerprint,
+          extractorFingerprint: candidate.extractorFingerprint,
+          recordSchemaFingerprint: candidate.recordSchemaFingerprint,
+          normalizationFingerprint: candidate.normalizationFingerprint,
+          chunkerFingerprint: candidate.chunkerFingerprint,
+          correctionRevision: `filesystem-observation-v1:${candidate.processingEpoch}`,
+        }))
+    ) {
+      throw workerProtocolError("scan_conflict");
+    }
+    const [candidateEntry, candidateScan] = await Promise.all([
+      ctx.db.get(candidate.scanEntryId),
+      ctx.db.get(candidate.scanId),
+    ]);
+    const candidatePage = candidateEntry
+      ? await ctx.db.get(candidateEntry.scanPageId)
+      : null;
+    if (
+      !candidateEntry ||
+      !candidateScan ||
+      !candidatePage ||
+      candidateEntry.spaceId !== candidate.spaceId ||
+      candidateEntry.sourceAccountId !== candidate.sourceAccountId ||
+      candidateEntry.sourceItemId !== candidate.sourceItemId ||
+      candidateEntry.scanId !== candidate.scanId ||
+      candidateEntry.discoveryWorkId !== candidate._id ||
+      candidateEntry.observationEpoch !== candidate.observationEpoch ||
+      candidateEntry.processingEpoch !== candidate.processingEpoch ||
+      candidateEntry.contentHash !== candidate.contentHash ||
+      candidateEntry.byteLength !== candidate.byteLength ||
+      candidatePage.spaceId !== candidate.spaceId ||
+      candidatePage.sourceAccountId !== candidate.sourceAccountId ||
+      candidatePage.scanId !== candidate.scanId ||
+      candidatePage._id !== candidateEntry.scanPageId ||
+      candidateScan.spaceId !== candidate.spaceId ||
+      candidateScan.sourceAccountId !== candidate.sourceAccountId ||
+      candidateScan._id !== candidate.scanId
+    ) {
+      throw workerProtocolError("scan_conflict");
+    }
+    priorWork = candidate;
   }
   const alreadyReady =
     args.entry.content.status === "ready" &&
     activeGeneration !== null &&
     activeRevision !== null &&
     activeGeneration.state === "ready" &&
+    activeGeneration.sourceRevisionId === args.item.desiredRevisionId &&
+    activeGeneration.desiredProcessingEpoch ===
+      args.item.desiredProcessingEpoch &&
     activeRevision.contentHash === args.entry.content.sha256 &&
     activeRevision.byteLength === args.entry.content.byteLength &&
     activeRevision.mediaType === FS_TEXT_PROFILE.mediaType &&
