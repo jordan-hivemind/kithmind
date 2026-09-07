@@ -174,6 +174,8 @@ async function markCurrentItemReady(
       embeddingStatus: "unavailable",
     });
     await ctx.db.patch(item._id, {
+      desiredRevisionId: revisionId,
+      desiredProcessingEpoch: 1,
       activeRevisionId: revisionId,
       activeGenerationId: generationId,
     });

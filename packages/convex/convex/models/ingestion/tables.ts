@@ -25,8 +25,24 @@ export const ingestionTables = {
   ingestJobs: defineTable(ingestJobFields)
     .index("by_spaceId", ["spaceId"])
     .index("by_sourceAccountId", ["sourceAccountId"])
+    .index("by_source_worker_state_nextAttemptAt", [
+      "sourceAccountId",
+      "workerManaged",
+      "state",
+      "nextAttemptAt",
+    ])
+    .index("by_source_worker_state_leaseExpiresAt", [
+      "sourceAccountId",
+      "workerManaged",
+      "state",
+      "leaseExpiresAt",
+    ])
     .index("by_sourceAccountId_and_state", ["sourceAccountId", "state"])
     .index("by_sourceItemId", ["sourceItemId"])
+    .index("by_sourceItemId_and_desiredProcessingEpoch", [
+      "sourceItemId",
+      "desiredProcessingEpoch",
+    ])
     .index("by_processingGenerationId", ["processingGenerationId"])
     .index("by_workerDiscoveryWorkId", ["workerDiscoveryWorkId"])
     .index("by_state_and_nextAttemptAt", ["state", "nextAttemptAt"]),

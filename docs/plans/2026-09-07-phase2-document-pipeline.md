@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-07
 
-**Status:** Implementation sequence under P2-0. This plan does not claim that the worker, parser, or restore path already exists.
+**Status:** P2-7 implementation in progress. The scoped discovery and text-processing gateway is implemented; source assessment, the filesystem daemon, parsing, and isolated restore remain outstanding.
 
 ## Outcome
 
@@ -14,18 +14,18 @@ This plan implements the [architecture](2026-09-06-architecture.md), especially 
 
 ## What is already available
 
-| Existing component                            | Reuse and present limit                                                                                                                                                                                 |
-| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Family spaces, roles, entities, scoped keys   | Use the deployed authorization model. An ingest credential names both spaces and source accounts. Workers receive no deployment admin credential.                                                       |
-| Source accounts and source items              | Reuse configured connector/account identity and source-local external IDs. The public configuration mutation supports connector names; Settings exposes MCP-client and filesystem source configuration. |
-| Revision admission, leases, stage, activation | Reuse `models/ingestion/private.ts` and its model helpers. These are internal functions, not a supported remote worker API.                                                                             |
-| Text admission                                | `POST /api/ingest` accepts only `mcp-client` inline text, up to 65,536 UTF-8 bytes. It does not accept filesystem identities, PDF bytes, or parsed record batches.                                      |
-| Retained pages and evidence                   | Reuse immutable text versions, page-relative UTF-16 spans, locators, and parent-chain validation. The current source revision hash covers UTF-8 text, not original PDF bytes.                           |
-| Exact records                                 | Existing `financial_transaction`, `lab_panel`, and `vehicle_service` events, exact money values, and `query_records` already exist. Extraction and mapping from real documents remain missing.          |
-| Embeddings                                    | Fingerprinted profiles and atomic activation exist. Manifest scans remain small and operator-only; P2-6 must replace those bounds before bulk ingestion.                                                |
-| Operational state                             | Source cursor, enumeration and processing times, job states, and coverage primitives exist. Remote worker identity, heartbeat monitoring, and an ordinary daemon recipe do not.                         |
-| Public demo                                   | `pnpm demo:brain` verifies small text admission, replay, keyword retrieval, and retained citations. Extend it with synthetic pipeline fixtures.                                                         |
-| Recovery                                      | Private deployment snapshots protect current development. A public portable exporter, verified isolated restore, and archived-byte recovery are not yet implemented.                                    |
+| Existing component                            | Reuse and present limit                                                                                                                                                                                                            |
+| --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Family spaces, roles, entities, scoped keys   | Use the deployed authorization model. An ingest credential names both spaces and source accounts. Workers receive no deployment admin credential.                                                                                  |
+| Source accounts and source items              | Reuse configured connector/account identity and source-local external IDs. The public configuration mutation supports connector names; Settings exposes MCP-client and filesystem source configuration.                            |
+| Revision admission, leases, stage, activation | Reuse `models/ingestion/private.ts` and its model helpers. The scoped worker gateway now wraps these primitives for small UTF-8 filesystem documents.                                                                              |
+| Text admission                                | `POST /api/ingest` accepts only `mcp-client` inline text, up to 65,536 UTF-8 bytes. It does not accept filesystem identities, PDF bytes, or parsed record batches.                                                                 |
+| Retained pages and evidence                   | Reuse immutable text versions, page-relative UTF-16 spans, locators, and parent-chain validation. The current source revision hash covers UTF-8 text, not original PDF bytes.                                                      |
+| Exact records                                 | Existing `financial_transaction`, `lab_panel`, and `vehicle_service` events, exact money values, and `query_records` already exist. Extraction and mapping from real documents remain missing.                                     |
+| Embeddings                                    | Fingerprinted profiles and atomic activation exist. Manifest scans remain small and operator-only; P2-6 must replace those bounds before bulk ingestion.                                                                           |
+| Operational state                             | Source cursor, enumeration and processing times, job states, and coverage primitives exist. Scoped remote worker identity and discovery receipts now exist. Heartbeat monitoring and an ordinary daemon recipe remain outstanding. |
+| Public demo                                   | `pnpm demo:brain` verifies small text admission, replay, keyword retrieval, and retained citations. Extend it with synthetic pipeline fixtures.                                                                                    |
+| Recovery                                      | Private deployment snapshots protect current development. A public portable exporter, verified isolated restore, and archived-byte recovery are not yet implemented.                                                               |
 
 The evolving [worker protocol](2026-09-07-worker-protocol.md) documents the remote worker boundary. The [source-processing](2026-09-06-source-processing-contract.md), [inline-ingestion](2026-09-06-inline-ingestion-contract.md), [record-query](2026-09-06-record-query-contract.md), and [embedding](2026-09-06-embedding-contract.md) contracts remain authoritative until a reviewed implementation explicitly changes them. Do not raise limits or represent parsed PDF text as verified original bytes merely to make a pilot pass.
 

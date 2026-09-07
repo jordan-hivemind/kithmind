@@ -107,7 +107,7 @@ describe("worker protocol parser", () => {
 
   it("rejects unknown operations and extra keys", () => {
     expect(() =>
-      parseWorkerRequest({ ...source, operation: "jobs.reserve" }),
+      parseWorkerRequest({ ...source, operation: "jobs.execute" }),
     ).toThrow(WorkerProtocolParseError);
     expect(() =>
       parseWorkerRequest({

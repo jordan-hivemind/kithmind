@@ -504,6 +504,7 @@ async function markObsolete(
     state: "obsolete_generation",
     leaseToken: undefined,
     leaseExpiresAt: undefined,
+    workerLeaseOwnerCredentialId: undefined,
     nextAttemptAt: undefined,
     error: undefined,
   });
@@ -1152,6 +1153,7 @@ export async function failJob(
     state,
     leaseToken: undefined,
     leaseExpiresAt: undefined,
+    workerLeaseOwnerCredentialId: undefined,
     nextAttemptAt: retryable ? args.nextAttemptAt : undefined,
     error,
   });
@@ -1192,6 +1194,7 @@ export async function requeueJob(
     state: "queued",
     leaseToken: undefined,
     leaseExpiresAt: undefined,
+    workerLeaseOwnerCredentialId: undefined,
     nextAttemptAt: args.now,
     error: undefined,
   });
@@ -1240,6 +1243,11 @@ export async function replaceRevokedActorAndRequeueFromWeb(
     "ingest",
   );
   await validateJobParentChain(ctx, job, account.spaceId);
+  if (job.workerDiscoveryWorkId !== undefined) {
+    throw new Error(
+      "Worker-linked ingest jobs require provenance-preserving recovery",
+    );
+  }
   if (job.state === "ready" || job.state === "obsolete_generation") {
     throw new Error("Ingest job is not eligible for actor replacement");
   }
@@ -1425,6 +1433,7 @@ export async function activateGeneration(
     state: "ready",
     leaseToken: undefined,
     leaseExpiresAt: undefined,
+    workerLeaseOwnerCredentialId: undefined,
     nextAttemptAt: undefined,
     error: undefined,
   });

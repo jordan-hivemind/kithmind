@@ -25,7 +25,7 @@ type LoadedWorkerSource = Awaited<
   ReturnType<typeof requireWorkerSourceAccount>
 >;
 
-type CurrentDiscovery = {
+export type CurrentDiscovery = {
   source: LoadedWorkerSource;
   item: Doc<"sourceItems">;
   scan: Doc<"workerSourceScans">;
@@ -159,7 +159,7 @@ async function requireCurrentDiscoveryState(
   }
 }
 
-async function requireCurrentDiscovery(
+export async function requireCurrentDiscovery(
   ctx: MutationCtx,
   source: LoadedWorkerSource,
   workId: Id<"workerDiscoveryWork">,
@@ -495,7 +495,7 @@ export async function reserveDiscoveryWork(
   };
 }
 
-async function validateAdmittedChain(
+export async function validateAdmittedChain(
   ctx: MutationCtx,
   current: CurrentDiscovery,
   ids: {
@@ -737,8 +737,10 @@ export async function admitDiscoveryUtf8(
     throw workerProtocolError("scan_conflict");
   }
   await ctx.db.patch(job._id, {
+    workerManaged: true,
     workerDiscoveryWorkId: current.work._id,
     workerObservationEpoch: current.work.observationEpoch,
+    nextAttemptAt: now,
   });
   await validateAdmittedChain(ctx, current, ids, true);
   await ctx.db.patch(current.work._id, {
