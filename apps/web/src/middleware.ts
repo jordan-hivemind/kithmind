@@ -3,19 +3,27 @@ import {
   createRouteMatcher,
   nextjsMiddlewareRedirect,
 } from "@convex-dev/auth/nextjs/server";
-import { NextResponse } from "next/server";
+import { type NextRequest, NextResponse } from "next/server";
 
 import { shouldRewriteMcpRootRequest } from "@/lib/mcp/root-alias";
 
 const isSignInPage = createRouteMatcher(["/sign-in", "/sign-up"]);
-const isPublicRoute = createRouteMatcher([
+export const isPublicRoute = createRouteMatcher([
   "/sign-in",
   "/sign-up",
+  "/api/ingest",
   "/api/mcp(.*)",
   "/mcp/authorize",
 ]);
 
-export default convexAuthNextjsMiddleware(async (request, { convexAuth }) => {
+type MiddlewareAuth = {
+  isAuthenticated(): Promise<boolean>;
+};
+
+export async function handleMiddlewareRequest(
+  request: NextRequest,
+  { convexAuth }: { convexAuth: MiddlewareAuth },
+) {
   if (
     shouldRewriteMcpRootRequest(
       request.nextUrl.pathname,
@@ -35,7 +43,9 @@ export default convexAuthNextjsMiddleware(async (request, { convexAuth }) => {
   if (!isPublicRoute(request) && !(await convexAuth.isAuthenticated())) {
     return nextjsMiddlewareRedirect(request, "/sign-in");
   }
-});
+}
+
+export default convexAuthNextjsMiddleware(handleMiddlewareRequest);
 
 export const config = {
   matcher: ["/((?!.*\\..*|_next).*)"],
