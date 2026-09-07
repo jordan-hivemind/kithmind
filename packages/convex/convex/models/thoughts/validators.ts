@@ -54,7 +54,7 @@ export const thoughtFields = {
   embedding: v.array(v.float64()),
   metadata: thoughtMetadata,
   userId: v.id("users"),
-  spaceId: v.optional(v.id("spaces")),
+  spaceId: v.id("spaces"),
   updatedAt: v.optional(v.number()),
   ...thoughtLifecycleFields,
 };

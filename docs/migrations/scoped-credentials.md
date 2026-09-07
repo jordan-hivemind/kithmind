@@ -5,6 +5,11 @@ and reader while keeping transitional schema fields optional. The second makes
 ownership and credential scopes required after both deployments pass the audits.
 Do not mark P1-2 complete after only the first deployment.
 
+Fresh installations use required ownership and grant fields. To upgrade an
+existing deployment that still contains unscoped rows, deploy transitional commit
+`ba10dc4` first, complete this procedure, then deploy the required-field version.
+Deploying the required schema before migrating old rows will fail validation.
+
 ## Authorization contract
 
 Web sessions derive their user from Convex Auth. MCP sessions carry a signed API
