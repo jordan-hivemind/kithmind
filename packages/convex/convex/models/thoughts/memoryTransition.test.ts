@@ -98,7 +98,7 @@ describe("temporal memory transitions", () => {
     const current = await t.run((ctx) => _listByUser(ctx, userId, 10));
     const historical = await t.run((ctx) => _listByUser(ctx, userId, 10, true));
     const search = await t.query(
-      internal.models.thoughts.private.searchByText,
+      internal.models.thoughts.private.searchByTextTrustedLegacy,
       {
         userId,
         query: "pagination sentinel memory",
@@ -124,14 +124,15 @@ describe("temporal memory transitions", () => {
   test("atomically preserves and links a superseded memory", async () => {
     const t = convexTest(schema, modules);
     const userId = await t.run((ctx) => ctx.db.insert("users", {}));
-    const previousId = await t.run((ctx) =>
-      ctx.db.insert("thoughts", {
+    const previousId = await t.mutation(
+      internal.models.thoughts.private.insertOne,
+      {
         userId,
         content: "Rowan attends Lakeside School.",
         embedding,
         metadata,
         validFrom: lakesideStart,
-      }),
+      },
     );
     const transitionedAt = Date.now();
 
@@ -188,14 +189,15 @@ describe("temporal memory transitions", () => {
   test("does not invent an interval end when the new start is unknown", async () => {
     const t = convexTest(schema, modules);
     const userId = await t.run((ctx) => ctx.db.insert("users", {}));
-    const previousId = await t.run((ctx) =>
-      ctx.db.insert("thoughts", {
+    const previousId = await t.mutation(
+      internal.models.thoughts.private.insertOne,
+      {
         userId,
         content: "Rowan attends Lakeside School.",
         embedding,
         metadata,
         validFrom: lakesideStart,
-      }),
+      },
     );
 
     await t.mutation(internal.models.thoughts.private.transitionMemory, {
@@ -221,15 +223,16 @@ describe("temporal memory transitions", () => {
   test("does not turn a retracted claim into a historical validity interval", async () => {
     const t = convexTest(schema, modules);
     const userId = await t.run((ctx) => ctx.db.insert("users", {}));
-    const inaccurateId = await t.run((ctx) =>
-      ctx.db.insert("thoughts", {
+    const inaccurateId = await t.mutation(
+      internal.models.thoughts.private.insertOne,
+      {
         userId,
         content: "Rowan attends Lakeside School.",
         embedding,
         metadata,
         validFrom: lakesideStart,
         validTo: redwoodStart,
-      }),
+      },
     );
 
     const correctedId = await t.mutation(

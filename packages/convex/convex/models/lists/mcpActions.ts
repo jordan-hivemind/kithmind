@@ -18,7 +18,7 @@ export const createList = mutation({
     pinned: v.boolean(),
   },
   handler: async (ctx, args) => {
-    const userId = await requireMcpUserId(ctx);
+    const userId = await requireMcpUserId(ctx, "write");
     const listId = await _insertList(ctx, {
       name: args.name,
       pinned: args.pinned,
@@ -35,7 +35,7 @@ export const updateList = mutation({
     pinned: v.optional(v.boolean()),
   },
   handler: async (ctx, args) => {
-    const userId = await requireMcpUserId(ctx);
+    const userId = await requireMcpUserId(ctx, "write");
     const list = await _findListById(ctx, args.listId);
     if (!list || list.userId !== userId) {
       throw new Error("List not found");
@@ -59,7 +59,7 @@ export const archiveList = mutation({
     listId: v.id("lists"),
   },
   handler: async (ctx, args) => {
-    const userId = await requireMcpUserId(ctx);
+    const userId = await requireMcpUserId(ctx, "write");
     const list = await _findListById(ctx, args.listId);
     if (!list || list.userId !== userId) {
       throw new Error("List not found");
@@ -78,16 +78,18 @@ export const createListItem = mutation({
     properties: v.optional(v.record(v.string(), v.any())),
   },
   handler: async (ctx, args) => {
-    const userId = await requireMcpUserId(ctx);
+    const userId = await requireMcpUserId(ctx, "write");
     const list = await _findListById(ctx, args.listId);
     if (!list || list.userId !== userId) {
       throw new Error("List not found");
     }
 
     // Get max position in list
-    const items = await _itemsByList(ctx, args.listId, {
-      includeCompleted: true,
-    });
+    const items = (
+      await _itemsByList(ctx, args.listId, {
+        includeCompleted: true,
+      })
+    ).filter((item) => item.userId === userId);
     const maxPosition =
       items.length > 0 ? Math.max(...items.map((i) => i.position)) : 0;
 
@@ -125,9 +127,13 @@ export const updateListItem = mutation({
     properties: v.optional(v.record(v.string(), v.any())),
   },
   handler: async (ctx, args) => {
-    const userId = await requireMcpUserId(ctx);
+    const userId = await requireMcpUserId(ctx, "write");
     const item = await _findItemById(ctx, args.itemId);
     if (!item || item.userId !== userId) {
+      throw new Error("Item not found");
+    }
+    const list = await _findListById(ctx, item.listId);
+    if (!list || list.userId !== userId) {
       throw new Error("Item not found");
     }
 

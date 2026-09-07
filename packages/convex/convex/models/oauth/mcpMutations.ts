@@ -1,7 +1,7 @@
 import { v } from "convex/values";
 
 import { mutation } from "../../_generated/server";
-import { requireMcpUserId } from "../../lib/mcpAuth";
+import { requireMcpPrincipal } from "../../lib/mcpAuth";
 
 const MAX_AUTHORIZATION_CODE_LIFETIME_MS = 10 * 60 * 1000;
 
@@ -12,7 +12,7 @@ export const consumeAuthorizationCode = mutation({
   },
   returns: v.null(),
   handler: async (ctx, args) => {
-    const userId = await requireMcpUserId(ctx);
+    const { userId } = await requireMcpPrincipal(ctx);
     const now = Date.now();
 
     if (

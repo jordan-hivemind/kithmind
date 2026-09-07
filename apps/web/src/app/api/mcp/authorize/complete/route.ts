@@ -1,5 +1,6 @@
 import { convexAuthNextjsToken } from "@convex-dev/auth/nextjs/server";
 import { api } from "@repo/db/convex/_generated/api";
+import type { Id } from "@repo/db/convex/_generated/dataModel";
 import { ConvexHttpClient } from "convex/browser";
 
 import { getMcpResourceUri, isMcpResourceUri } from "@/lib/mcp/environment";
@@ -11,7 +12,7 @@ import {
   OAUTH_NO_STORE_HEADERS,
   readLimitedOAuthBody,
 } from "@/lib/mcp/oauth";
-import { authorizationRequestSchema } from "@/lib/mcp/oauth-validation";
+import { authorizationConsentSchema } from "@/lib/mcp/oauth-validation";
 
 function errorResponse(message: string, status: number) {
   return Response.json(
@@ -38,7 +39,7 @@ export async function POST(req: Request) {
     return errorResponse("Invalid authorization request", 400);
   }
 
-  const parsed = authorizationRequestSchema.safeParse(input);
+  const parsed = authorizationConsentSchema.safeParse(input);
   if (!parsed.success) {
     return errorResponse("Invalid authorization request", 400);
   }
@@ -73,31 +74,44 @@ export async function POST(req: Request) {
   convex.setAuth(token);
 
   let rawKey: string;
+  let keyId: Id<"apiKeys">;
   try {
     const result = await convex.mutation(api.models.apiKeys.public.create, {
       name: `MCP (${registration.clientName})`,
+      capabilities: request.capabilities,
+      spaceIds: request.spaceIds as Id<"spaces">[],
     });
     rawKey = result.rawKey;
+    keyId = result.id;
   } catch {
     return errorResponse("Failed to create API key", 500);
   }
 
-  const code = encryptAuthCode({
-    apiKey: rawKey,
-    clientId: request.clientId,
-    codeChallenge: request.codeChallenge,
-    redirectUri: request.redirectUri,
-    resource,
-    scope: request.scope ?? "open-brain",
-    exp: Date.now() + 5 * 60 * 1000,
-  });
+  try {
+    const code = encryptAuthCode({
+      apiKey: rawKey,
+      clientId: request.clientId,
+      codeChallenge: request.codeChallenge,
+      redirectUri: request.redirectUri,
+      resource,
+      scope: request.scope ?? "open-brain",
+      exp: Date.now() + 5 * 60 * 1000,
+    });
 
-  const redirect = new URL(request.redirectUri);
-  redirect.searchParams.set("code", code);
-  if (request.state) redirect.searchParams.set("state", request.state);
+    const redirect = new URL(request.redirectUri);
+    redirect.searchParams.set("code", code);
+    if (request.state) redirect.searchParams.set("state", request.state);
 
-  return Response.json(
-    { redirect_url: redirect.toString() },
-    { headers: OAUTH_NO_STORE_HEADERS },
-  );
+    return Response.json(
+      { redirect_url: redirect.toString() },
+      { headers: OAUTH_NO_STORE_HEADERS },
+    );
+  } catch {
+    try {
+      await convex.mutation(api.models.apiKeys.public.revoke, { id: keyId });
+    } catch {
+      // One bounded compensation attempt avoids hiding the original failure.
+    }
+    return errorResponse("Failed to complete authorization", 500);
+  }
 }

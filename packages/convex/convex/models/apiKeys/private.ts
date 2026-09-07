@@ -13,11 +13,27 @@ export const findByHash = internalQuery({
       keyPrefix: v.string(),
       name: v.string(),
       lastUsedAt: v.optional(v.number()),
+      capabilities: v.optional(
+        v.array(
+          v.union(v.literal("read"), v.literal("write"), v.literal("ingest")),
+        ),
+      ),
+      spaceIds: v.optional(v.array(v.id("spaces"))),
     }),
     v.null(),
   ),
   handler: async (ctx, args) => {
-    return await _findByHash(ctx, args.keyHash);
+    const key = await _findByHash(ctx, args.keyHash);
+    return key && (await ctx.db.get(key.userId)) ? key : null;
+  },
+});
+
+export const getById = internalQuery({
+  args: { id: v.string() },
+  handler: async (ctx, args) => {
+    const id = ctx.db.normalizeId("apiKeys", args.id);
+    const key = id ? await ctx.db.get(id) : null;
+    return key && (await ctx.db.get(key.userId)) ? key : null;
   },
 });
 

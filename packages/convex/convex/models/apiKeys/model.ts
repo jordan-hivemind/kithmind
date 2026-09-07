@@ -1,5 +1,6 @@
 import { QueryCtx, MutationCtx } from "../../_generated/server";
 import { Id } from "../../_generated/dataModel";
+import type { Capability } from "../../lib/spaces";
 
 export async function _findByHash(ctx: QueryCtx, keyHash: string) {
   return await ctx.db
@@ -22,9 +23,23 @@ export async function _insertOne(
     keyHash: string;
     keyPrefix: string;
     name: string;
+    capabilities: Capability[];
+    spaceIds: Id<"spaces">[];
   },
 ) {
   return await ctx.db.insert("apiKeys", fields);
+}
+
+export async function _updateOne(
+  ctx: MutationCtx,
+  id: Id<"apiKeys">,
+  fields: {
+    name?: string;
+    capabilities?: Capability[];
+    spaceIds?: Id<"spaces">[];
+  },
+) {
+  await ctx.db.patch(id, fields);
 }
 
 export async function _deleteOne(ctx: MutationCtx, id: Id<"apiKeys">) {

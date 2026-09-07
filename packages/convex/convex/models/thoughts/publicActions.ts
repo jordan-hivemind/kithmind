@@ -1,7 +1,8 @@
 import { action } from "../../_generated/server";
 import { internal as _internal } from "../../_generated/api";
 import { v } from "convex/values";
-import { requireWebUserId } from "../../lib/webAuth";
+import { requireWebPrincipal } from "../../lib/webAuth";
+import { principalRef } from "../../lib/spaces";
 import { memoryStatus, thoughtMetadata } from "./validators";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -13,6 +14,7 @@ export const capture = action({
     validFrom: v.optional(v.number()),
     validTo: v.optional(v.number()),
     isCore: v.optional(v.boolean()),
+    spaceId: v.optional(v.id("spaces")),
   },
   returns: v.object({
     thoughtId: v.optional(v.id("thoughts")),
@@ -28,12 +30,18 @@ export const capture = action({
     operationSummary: v.optional(v.string()),
   }),
   handler: async (ctx, args) => {
-    const userId = await requireWebUserId(ctx);
+    const principal = await requireWebPrincipal(ctx);
+    const ref = principalRef(principal);
+    const spaceId = await ctx.runMutation(
+      internal.models.thoughts.private.resolveWriteSpaceForAction,
+      { principal: ref, spaceId: args.spaceId },
+    );
 
     return await ctx.runAction(
       internal.models.thoughts.actions.captureThought,
       {
-        userId,
+        principal: ref,
+        spaceId,
         content: args.content,
         validFrom: args.validFrom,
         validTo: args.validTo,
@@ -48,12 +56,15 @@ export const search = action({
   args: {
     query: v.string(),
     limit: v.optional(v.number()),
+    spaceIds: v.optional(v.array(v.id("spaces"))),
   },
   returns: v.array(
     v.object({
       _id: v.id("thoughts"),
       content: v.string(),
       metadata: thoughtMetadata,
+      userId: v.id("users"),
+      spaceId: v.id("spaces"),
       score: v.float64(),
       createdAt: v.number(),
       memoryStatus,
@@ -65,10 +76,11 @@ export const search = action({
     }),
   ),
   handler: async (ctx, args) => {
-    const userId = await requireWebUserId(ctx);
+    const principal = await requireWebPrincipal(ctx);
 
     return await ctx.runAction(internal.models.thoughts.actions.hybridSearch, {
-      userId,
+      principal: principalRef(principal),
+      spaceIds: args.spaceIds,
       query: args.query,
       limit: args.limit,
     });

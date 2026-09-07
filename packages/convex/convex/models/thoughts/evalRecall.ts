@@ -62,6 +62,21 @@ export const deleteEvalSeed = internalMutation({
         .withIndex("by_userId", (q) => q.eq("userId", userId))
         .collect();
       for (const entity of entities) await ctx.db.delete(entity._id);
+      const settings = await ctx.db
+        .query("userSpaceSettings")
+        .withIndex("by_userId", (q) => q.eq("userId", userId))
+        .collect();
+      const memberships = await ctx.db
+        .query("spaceMembers")
+        .withIndex("by_userId", (q) => q.eq("userId", userId))
+        .collect();
+      for (const membership of memberships) {
+        await ctx.db.delete(membership._id);
+      }
+      for (const setting of settings) {
+        await ctx.db.delete(setting._id);
+        await ctx.db.delete(setting.personalSpaceId);
+      }
     }
     for (const id of args.userIds) await ctx.db.delete(id);
     return null;
@@ -209,7 +224,7 @@ export const runBaseline = internalAction({
           }> = await ctx.runAction(
             internal.models.thoughts.actions.hybridSearch,
             {
-              userId,
+              principal: { userId },
               query: query.query,
               limit: SEARCH_LIMIT,
               includeHistorical: query.includeHistorical,
@@ -221,11 +236,14 @@ export const runBaseline = internalAction({
             statement: string;
             status: string;
             source: "core" | "relevant";
-          }> = await ctx.runQuery(internal.models.facts.private.recallFacts, {
-            userId,
-            query: query.query,
-            includeHistorical: query.includeHistorical,
-          });
+          }> = await ctx.runQuery(
+            internal.models.facts.private.recallPersonalFacts,
+            {
+              userId,
+              query: query.query,
+              includeHistorical: query.includeHistorical,
+            },
+          );
 
           const toFactResult = (row: {
             id: string;
@@ -265,7 +283,7 @@ export const runBaseline = internalAction({
             content: string;
             memoryStatus?: "current" | "superseded" | "retracted";
           }> = await ctx.runQuery(
-            internal.models.thoughts.private.listCoreByUser,
+            internal.models.thoughts.private.listCorePersonalByUser,
             { userId, limit: coreLimitFor(SEARCH_LIMIT) },
           );
 
@@ -277,7 +295,9 @@ export const runBaseline = internalAction({
             const blend = blendRecallContext({
               coreFacts: factRows.filter((row) => row.source === "core"),
               coreThoughts: coreThoughtDocs,
-              relevantFacts: factRows.filter((row) => row.source === "relevant"),
+              relevantFacts: factRows.filter(
+                (row) => row.source === "relevant",
+              ),
               relevantThoughts: hits,
               limit,
               factId: (row) => row.id,

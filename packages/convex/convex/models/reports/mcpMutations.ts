@@ -8,7 +8,7 @@ export const deleteInsight = mutation({
   args: { insightId: v.id("insights") },
   returns: v.null(),
   handler: async (ctx, args) => {
-    const userId = await requireMcpUserId(ctx);
+    const userId = await requireMcpUserId(ctx, "write");
     const insight = await _findInsightById(ctx, args.insightId);
 
     if (!insight || insight.userId !== userId) {

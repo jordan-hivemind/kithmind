@@ -22,83 +22,254 @@ describe("MCP account isolation", () => {
     }
   });
 
-  test("rejects missing and untrusted identities", async () => {
+  test("rejects missing, untrusted, deleted, and subject-mismatched credentials", async () => {
     const t = convexTest(schema, modules);
-
     await expect(
       t.query(api.models.lists.mcpQueries.getLists, {}),
     ).rejects.toThrow("Not authenticated");
 
-    const userId = await t.run((ctx) => ctx.db.insert("users", {}));
-    const untrusted = t.withIdentity({
-      issuer: "https://attacker.example.test",
-      subject: userId,
+    const seeded = await t.run(async (ctx) => {
+      const userId = await ctx.db.insert("users", {});
+      const personalSpaceId = await ctx.db.insert("spaces", {
+        kind: "personal",
+        name: "Personal",
+        createdBy: userId,
+      });
+      await ctx.db.insert("spaceMembers", {
+        spaceId: personalSpaceId,
+        userId,
+        role: "owner",
+      });
+      await ctx.db.insert("userSpaceSettings", { userId, personalSpaceId });
+      const keyId = await ctx.db.insert("apiKeys", {
+        userId,
+        keyHash: "1".repeat(64),
+        keyPrefix: "ob_valid",
+        name: "valid",
+        capabilities: ["read", "write"],
+        spaceIds: [personalSpaceId],
+      });
+      const otherId = await ctx.db.insert("users", {});
+      return { userId, keyId, otherId };
     });
 
+    const untrusted = t.withIdentity({
+      issuer: "https://attacker.example.test",
+      subject: seeded.userId,
+      apiKeyId: seeded.keyId,
+    });
     await expect(
       untrusted.query(api.models.lists.mcpQueries.getLists, {}),
+    ).rejects.toThrow("Not authenticated");
+
+    const mismatched = t.withIdentity({
+      issuer,
+      subject: seeded.otherId,
+      apiKeyId: seeded.keyId,
+    });
+    await expect(
+      mismatched.query(api.models.lists.mcpQueries.getLists, {}),
+    ).rejects.toThrow("Not authenticated");
+
+    await t.run((ctx) => ctx.db.delete(seeded.keyId));
+    const deleted = t.withIdentity({
+      issuer,
+      subject: seeded.userId,
+      apiKeyId: seeded.keyId,
+    });
+    await expect(
+      deleted.query(api.models.lists.mcpQueries.getLists, {}),
     ).rejects.toThrow("Not authenticated");
   });
 
   test("uses the signed subject and prevents cross-account reads", async () => {
     const t = convexTest(schema, modules);
-    const [ownerId, otherId] = await t.run(async (ctx) => [
-      await ctx.db.insert("users", { name: "Owner" }),
-      await ctx.db.insert("users", { name: "Other" }),
-    ]);
-    const owner = t.withIdentity({ issuer, subject: ownerId });
-    const other = t.withIdentity({ issuer, subject: otherId });
+    const seeded = await t.run(async (ctx) => {
+      const create = async (name: string) => {
+        const userId = await ctx.db.insert("users", { name });
+        const personalSpaceId = await ctx.db.insert("spaces", {
+          kind: "personal",
+          name: "Personal",
+          createdBy: userId,
+        });
+        await ctx.db.insert("spaceMembers", {
+          spaceId: personalSpaceId,
+          userId,
+          role: "owner",
+        });
+        await ctx.db.insert("userSpaceSettings", { userId, personalSpaceId });
+        const keyId = await ctx.db.insert("apiKeys", {
+          userId,
+          keyHash: name.repeat(64).slice(0, 64),
+          keyPrefix: `ob_${name}`,
+          name,
+          capabilities: ["read", "write"],
+          spaceIds: [personalSpaceId],
+        });
+        return { userId, keyId };
+      };
+      return { owner: await create("a"), other: await create("b") };
+    });
+    const owner = t.withIdentity({
+      issuer,
+      subject: seeded.owner.userId,
+      apiKeyId: seeded.owner.keyId,
+    });
+    const other = t.withIdentity({
+      issuer,
+      subject: seeded.other.userId,
+      apiKeyId: seeded.other.keyId,
+    });
 
     const created = await owner.mutation(
       api.models.lists.mcpActions.createList,
-      { name: "Private", pinned: false },
+      {
+        name: "Private",
+        pinned: false,
+      },
     );
-
     await expect(
       other.query(api.models.lists.mcpQueries.getList, {
         listId: created.listId,
       }),
     ).rejects.toThrow("List not found");
-
-    const result = await owner.query(api.models.lists.mcpQueries.getList, {
-      listId: created.listId,
-    });
-    expect(result.name).toBe("Private");
+    expect(
+      await owner.query(api.models.lists.mcpQueries.getList, {
+        listId: created.listId,
+      }),
+    ).toMatchObject({ name: "Private" });
   });
 
-  test("does not accept a caller-supplied userId override", async () => {
+  test("requires personal read/write grants for retained private features", async () => {
     const t = convexTest(schema, modules);
-    const [ownerId, otherId] = await t.run(async (ctx) => [
-      await ctx.db.insert("users", {}),
-      await ctx.db.insert("users", {}),
-    ]);
-    const owner = t.withIdentity({ issuer, subject: ownerId });
-    const other = t.withIdentity({ issuer, subject: otherId });
-
-    const created = await owner.mutation(
-      api.models.lists.mcpActions.createList,
-      { name: "Private", pinned: false },
-    );
+    const seeded = await t.run(async (ctx) => {
+      const userId = await ctx.db.insert("users", {});
+      const personalSpaceId = await ctx.db.insert("spaces", {
+        kind: "personal",
+        name: "Personal",
+        createdBy: userId,
+      });
+      const sharedSpaceId = await ctx.db.insert("spaces", {
+        kind: "shared",
+        name: "Family",
+        createdBy: userId,
+      });
+      for (const spaceId of [personalSpaceId, sharedSpaceId]) {
+        await ctx.db.insert("spaceMembers", { spaceId, userId, role: "owner" });
+      }
+      await ctx.db.insert("userSpaceSettings", { userId, personalSpaceId });
+      const createKey = async (
+        name: string,
+        capabilities: Array<"read" | "write">,
+        spaceIds: (typeof personalSpaceId)[],
+      ) =>
+        await ctx.db.insert("apiKeys", {
+          userId,
+          keyHash: name.repeat(64).slice(0, 64),
+          keyPrefix: `ob_${name}`,
+          name,
+          capabilities,
+          spaceIds,
+        });
+      return {
+        userId,
+        readKey: await createKey("r", ["read"], [personalSpaceId]),
+        writeKey: await createKey("w", ["write"], [personalSpaceId]),
+        sharedKey: await createKey("s", ["read", "write"], [sharedSpaceId]),
+      };
+    });
+    const asKey = (keyId: typeof seeded.readKey) =>
+      t.withIdentity({ issuer, subject: seeded.userId, apiKeyId: keyId });
+    const readOnly = asKey(seeded.readKey);
+    const writeOnly = asKey(seeded.writeKey);
+    const sharedOnly = asKey(seeded.sharedKey);
 
     await expect(
-      other.query(api.models.lists.mcpQueries.getList, {
-        listId: created.listId,
-        userId: ownerId,
-      } as never),
-    ).rejects.toThrow();
+      readOnly.mutation(api.models.lists.mcpActions.createList, {
+        name: "Denied",
+        pinned: false,
+      }),
+    ).rejects.toThrow("Not authorized");
+    await expect(
+      readOnly.action(api.models.reports.mcpActions.createReport, {
+        startDate: "2026-09-01",
+        endDate: "2026-09-02",
+        sessionsAnalyzed: 1,
+        totalPrompts: 2,
+        totalToolCalls: 3,
+        projectsActive: [],
+        modelUsage: {},
+        insights: [],
+      }),
+    ).rejects.toThrow("Space not found");
+    await expect(
+      writeOnly.query(api.models.lists.mcpQueries.getLists, {}),
+    ).rejects.toThrow("Not authorized");
+    await expect(
+      writeOnly.action(api.models.thoughts.mcpActions.capture, {
+        content: "A grounded memory",
+        sourceType: "user_stated",
+      }),
+    ).rejects.toThrow("Thought capture requires read and write capabilities");
+    await expect(
+      sharedOnly.query(api.models.lists.mcpQueries.getLists, {}),
+    ).rejects.toThrow("Not authorized");
+    await expect(
+      sharedOnly.query(api.models.reports.mcpQueries.listInsights, {}),
+    ).rejects.toThrow("Not authorized");
+    await expect(
+      sharedOnly.mutation(api.models.lists.mcpActions.createList, {
+        name: "Denied",
+        pinned: false,
+      }),
+    ).rejects.toThrow("Not authorized");
+
+    const report = await writeOnly.action(
+      api.models.reports.mcpActions.createReport,
+      {
+        startDate: "2026-09-01",
+        endDate: "2026-09-02",
+        sessionsAnalyzed: 1,
+        totalPrompts: 2,
+        totalToolCalls: 3,
+        projectsActive: [],
+        modelUsage: {},
+        insights: [],
+      },
+    );
+    expect(report.insightIds).toEqual([]);
   });
 
   test("checks ownership before deleting an insight", async () => {
     const t = convexTest(schema, modules);
-    const [ownerId, otherId] = await t.run(async (ctx) => [
-      await ctx.db.insert("users", {}),
-      await ctx.db.insert("users", {}),
-    ]);
-    const owner = t.withIdentity({ issuer, subject: ownerId });
-    const other = t.withIdentity({ issuer, subject: otherId });
-    const insightId = await t.run(async (ctx) => {
+    const seeded = await t.run(async (ctx) => {
+      const create = async (name: string) => {
+        const userId = await ctx.db.insert("users", {});
+        const personalSpaceId = await ctx.db.insert("spaces", {
+          kind: "personal",
+          name: "Personal",
+          createdBy: userId,
+        });
+        await ctx.db.insert("spaceMembers", {
+          spaceId: personalSpaceId,
+          userId,
+          role: "owner",
+        });
+        await ctx.db.insert("userSpaceSettings", { userId, personalSpaceId });
+        const keyId = await ctx.db.insert("apiKeys", {
+          userId,
+          keyHash: name.repeat(64).slice(0, 64),
+          keyPrefix: `ob_${name}`,
+          name,
+          capabilities: ["read", "write"],
+          spaceIds: [personalSpaceId],
+        });
+        return { userId, keyId };
+      };
+      const owner = await create("o");
+      const other = await create("x");
       const reportId = await ctx.db.insert("reports", {
-        userId: ownerId,
+        userId: owner.userId,
         startDate: "2026-08-01",
         endDate: "2026-08-10",
         sessionsAnalyzed: 1,
@@ -107,53 +278,78 @@ describe("MCP account isolation", () => {
         projectsActive: [],
         modelUsage: {},
       });
-      return await ctx.db.insert("insights", {
+      const insightId = await ctx.db.insert("insights", {
         reportId,
-        userId: ownerId,
+        userId: owner.userId,
         category: "productivity",
         observation: "A private observation",
         recommendation: "Keep it private",
         evidence: "Private evidence",
         status: "new",
       });
+      return { owner, other, insightId };
     });
-
+    const owner = t.withIdentity({
+      issuer,
+      subject: seeded.owner.userId,
+      apiKeyId: seeded.owner.keyId,
+    });
+    const other = t.withIdentity({
+      issuer,
+      subject: seeded.other.userId,
+      apiKeyId: seeded.other.keyId,
+    });
     await expect(
       other.mutation(api.models.reports.mcpMutations.deleteInsight, {
-        insightId,
+        insightId: seeded.insightId,
       }),
     ).rejects.toThrow("Insight not found");
-
     await owner.mutation(api.models.reports.mcpMutations.deleteInsight, {
-      insightId,
+      insightId: seeded.insightId,
     });
-    expect(await t.run((ctx) => ctx.db.get(insightId))).toBeNull();
+    expect(await t.run((ctx) => ctx.db.get(seeded.insightId))).toBeNull();
   });
 
-  test("consumes each OAuth authorization code only once", async () => {
+  test("OAuth replay bookkeeping accepts any current scoped key only once", async () => {
     const t = convexTest(schema, modules);
-    const [ownerId, otherId] = await t.run(async (ctx) => [
-      await ctx.db.insert("users", {}),
-      await ctx.db.insert("users", {}),
-    ]);
-    const owner = t.withIdentity({ issuer, subject: ownerId });
-    const other = t.withIdentity({ issuer, subject: otherId });
+    const seeded = await t.run(async (ctx) => {
+      const userId = await ctx.db.insert("users", {});
+      const sharedSpaceId = await ctx.db.insert("spaces", {
+        kind: "shared",
+        name: "Family",
+        createdBy: userId,
+      });
+      await ctx.db.insert("spaceMembers", {
+        spaceId: sharedSpaceId,
+        userId,
+        role: "reader",
+      });
+      const keyId = await ctx.db.insert("apiKeys", {
+        userId,
+        keyHash: "c".repeat(64),
+        keyPrefix: "ob_code",
+        name: "read shared",
+        capabilities: ["read"],
+        spaceIds: [sharedSpaceId],
+      });
+      return { userId, keyId };
+    });
+    const caller = t.withIdentity({
+      issuer,
+      subject: seeded.userId,
+      apiKeyId: seeded.keyId,
+    });
     const codeHash = "a".repeat(64);
     const expiresAt = Date.now() + 5 * 60 * 1000;
-
-    await owner.mutation(
+    await caller.mutation(
       api.models.oauth.mcpMutations.consumeAuthorizationCode,
-      { codeHash, expiresAt },
-    );
-
-    await expect(
-      owner.mutation(api.models.oauth.mcpMutations.consumeAuthorizationCode, {
+      {
         codeHash,
         expiresAt,
-      }),
-    ).rejects.toThrow("Authorization code already used");
+      },
+    );
     await expect(
-      other.mutation(api.models.oauth.mcpMutations.consumeAuthorizationCode, {
+      caller.mutation(api.models.oauth.mcpMutations.consumeAuthorizationCode, {
         codeHash,
         expiresAt,
       }),

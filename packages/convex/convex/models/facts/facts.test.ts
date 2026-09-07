@@ -2,400 +2,598 @@ import { convexTest } from "convex-test";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
 import { api, internal } from "../../_generated/api";
+import type { Id } from "../../_generated/dataModel";
 import schema from "../../schema";
 import { modules } from "../../test.setup";
-import { listFacts, searchFacts } from "./model";
+import { MAX_CURRENT_FACTS_PER_PREDICATE } from "./model";
 
 const issuer = "https://brain.example.test";
+type Harness = ReturnType<typeof convexTest>;
 
-describe("structured durable facts", () => {
+async function createActor(t: Harness, name: string) {
+  const records = await t.run(async (ctx) => {
+    const userId = await ctx.db.insert("users", { name });
+    const personalSpaceId = await ctx.db.insert("spaces", {
+      kind: "personal",
+      name: `${name} Personal`,
+      createdBy: userId,
+    });
+    await ctx.db.insert("spaceMembers", {
+      spaceId: personalSpaceId,
+      userId,
+      role: "owner",
+    });
+    await ctx.db.insert("userSpaceSettings", { userId, personalSpaceId });
+    const credentialId = await ctx.db.insert("apiKeys", {
+      userId,
+      keyHash: `hash-${name}`,
+      keyPrefix: `prefix-${name}`,
+      name,
+      capabilities: ["read", "write"],
+      spaceIds: [personalSpaceId],
+    });
+    return { userId, personalSpaceId, credentialId };
+  });
+  return {
+    ...records,
+    mcp: t.withIdentity({
+      issuer,
+      subject: records.userId,
+      apiKeyId: records.credentialId,
+    }),
+    web: t.withIdentity({
+      issuer: `${issuer}/convex`,
+      subject: records.userId,
+    }),
+  };
+}
+
+async function addSharedSpace(
+  t: Harness,
+  creator: Id<"users">,
+  members: Array<{
+    userId: Id<"users">;
+    credentialId: Id<"apiKeys">;
+    role: "owner" | "editor" | "reader";
+  }>,
+) {
+  return await t.run(async (ctx) => {
+    const spaceId = await ctx.db.insert("spaces", {
+      kind: "shared",
+      name: "Synthetic Household",
+      createdBy: creator,
+    });
+    for (const member of members) {
+      await ctx.db.insert("spaceMembers", {
+        spaceId,
+        userId: member.userId,
+        role: member.role,
+      });
+      const key = await ctx.db.get(member.credentialId);
+      await ctx.db.patch(member.credentialId, {
+        spaceIds: [...(key?.spaceIds ?? []), spaceId],
+      });
+    }
+    return spaceId;
+  });
+}
+
+const baseFact = {
+  subject: { key: "person:rowan", kind: "person" as const, name: "Rowan" },
+  predicate: "date_of_birth",
+  value: { type: "date" as const, value: "2010-03-04" },
+  sourceType: "user_stated" as const,
+  isCore: true,
+};
+
+describe("space-scoped facts and entities", () => {
   const originalIssuer = process.env.MCP_JWT_ISSUER;
-
   beforeEach(() => {
     process.env.MCP_JWT_ISSUER = issuer;
   });
-
   afterEach(() => {
     if (originalIssuer === undefined) delete process.env.MCP_JWT_ISSUER;
     else process.env.MCP_JWT_ISSUER = originalIssuer;
   });
 
-  test("stores an exact birth date as a typed, readable, account-owned fact", async () => {
+  test("stores in Personal and returns space and author separately", async () => {
     const t = convexTest(schema, modules);
-    const userId = await t.run((ctx) => ctx.db.insert("users", {}));
-    const owner = t.withIdentity({ issuer, subject: userId });
-
-    const result = await owner.mutation(api.models.facts.mcpActions.remember, {
-      subject: {
-        key: "person:rowan",
-        kind: "person",
-        name: "Rowan",
-      },
-      predicate: "date_of_birth",
-      value: { type: "date", value: "2010-03-04" },
-      sourceType: "user_stated",
-      isCore: true,
-    });
-
+    const actor = await createActor(t, "Owner");
+    const result = await actor.mcp.mutation(
+      api.models.facts.mcpActions.remember,
+      baseFact,
+    );
     expect(result).toMatchObject({
-      statement: "Rowan — date of birth: 2010-03-04.",
       operation: "stored",
+      statement: "Rowan — date of birth: 2010-03-04.",
     });
-    const stored = await t.run((ctx) => ctx.db.get(result.factId));
-    expect(stored).toMatchObject({
-      userId,
-      predicate: "date_of_birth",
-      value: { type: "date", value: "2010-03-04" },
-      status: "current",
-      confidence: 1,
-      isCore: true,
+    expect(
+      await actor.mcp.query(api.models.facts.mcpQueries.getById, {
+        factId: result.factId,
+      }),
+    ).toMatchObject({
+      id: result.factId,
+      userId: actor.userId,
+      spaceId: actor.personalSpaceId,
     });
-    expect(stored?.validFrom).toBeUndefined();
-  });
-
-  test("rejects derived ages and rolls back the subject entity write", async () => {
-    const t = convexTest(schema, modules);
-    const userId = await t.run((ctx) => ctx.db.insert("users", {}));
-    const owner = t.withIdentity({ issuer, subject: userId });
-
     await expect(
-      owner.mutation(api.models.facts.mcpActions.remember, {
-        subject: { kind: "person", name: "Rowan" },
+      actor.mcp.mutation(api.models.facts.mcpActions.remember, {
+        ...baseFact,
         predicate: "age",
-        value: { type: "number", value: 17, unit: "years" },
-        sourceType: "user_stated",
+        value: { type: "number", value: 16 },
       }),
     ).rejects.toThrow("Do not store a derived age");
-
-    const [entities, facts] = await t.run(async (ctx) => [
-      await ctx.db.query("entities").collect(),
-      await ctx.db.query("facts").collect(),
-    ]);
-    expect(entities).toHaveLength(0);
-    expect(facts).toHaveLength(0);
   });
 
-  test("deduplicates an identical fact and keeps a stable entity identity", async () => {
+  test("shares one entity key across authors and denies reader writes", async () => {
     const t = convexTest(schema, modules);
-    const userId = await t.run((ctx) => ctx.db.insert("users", {}));
-    const owner = t.withIdentity({ issuer, subject: userId });
-    const args = {
-      subject: {
-        key: "person:alex",
-        kind: "person" as const,
-        name: "Alex Chen",
-        aliases: ["Alex"],
-      },
-      predicate: "home_city",
-      value: { type: "text" as const, value: "Portland" },
-      sourceType: "user_stated" as const,
-    };
-
-    const first = await owner.mutation(
-      api.models.facts.mcpActions.remember,
-      args,
-    );
-    const duplicate = await owner.mutation(
+    const owner = await createActor(t, "Owner");
+    const editor = await createActor(t, "Editor");
+    const reader = await createActor(t, "Reader");
+    const spaceId = await addSharedSpace(t, owner.userId, [
+      { ...owner, role: "owner" },
+      { ...editor, role: "editor" },
+      { ...reader, role: "reader" },
+    ]);
+    const first = await owner.mcp.mutation(
       api.models.facts.mcpActions.remember,
       {
-        ...args,
-        subject: { ...args.subject, name: "Alex", aliases: ["J. Chen"] },
-      },
-    );
-
-    expect(duplicate).toMatchObject({
-      factId: first.factId,
-      operation: "noop",
-    });
-    const [entities, facts] = await t.run(async (ctx) => [
-      await ctx.db.query("entities").collect(),
-      await ctx.db.query("facts").collect(),
-    ]);
-    expect(entities).toHaveLength(1);
-    expect(entities[0]).toMatchObject({
-      key: "person:alex",
-      canonicalName: "Alex Chen",
-    });
-    expect(entities[0]?.aliases).toEqual(
-      expect.arrayContaining(["Alex", "J. Chen"]),
-    );
-    expect(facts).toHaveLength(1);
-  });
-
-  test("preserves a changed PCP relationship with explicit business time", async () => {
-    const t = convexTest(schema, modules);
-    const userId = await t.run((ctx) => ctx.db.insert("users", {}));
-    const owner = t.withIdentity({ issuer, subject: userId });
-    const startedOld = Date.UTC(2020, 0, 1);
-    const startedNew = Date.UTC(2026, 7, 1);
-    const base = {
-      subject: {
-        key: "person:alex",
-        kind: "person" as const,
-        name: "Alex",
-      },
-      predicate: "primary_care_provider",
-      sourceType: "user_stated" as const,
-    };
-
-    const oldFact = await owner.mutation(api.models.facts.mcpActions.remember, {
-      ...base,
-      value: {
-        type: "entity" as const,
-        entity: {
-          key: "person:dr-old",
-          kind: "person" as const,
-          name: "Dr. Old",
-        },
-      },
-      validFrom: startedOld,
-    });
-    const newFact = await owner.mutation(api.models.facts.mcpActions.remember, {
-      ...base,
-      value: {
-        type: "entity" as const,
-        entity: {
-          key: "person:dr-new",
-          kind: "person" as const,
-          name: "Dr. New",
-        },
-      },
-      validFrom: startedNew,
-      changeKind: "changed",
-      changeReason: "Alex changed primary care providers",
-    });
-
-    expect(newFact.operation).toBe("superseded");
-    const [oldStored, newStored] = await t.run(async (ctx) => [
-      await ctx.db.get(oldFact.factId),
-      await ctx.db.get(newFact.factId),
-    ]);
-    expect(oldStored).toMatchObject({
-      status: "superseded",
-      validFrom: startedOld,
-      validTo: startedNew,
-      supersededBy: newFact.factId,
-    });
-    expect(newStored).toMatchObject({
-      status: "current",
-      validFrom: startedNew,
-      supersedes: [oldFact.factId],
-    });
-  });
-
-  test("retracts an inaccurate value without pretending it was formerly true", async () => {
-    const t = convexTest(schema, modules);
-    const userId = await t.run((ctx) => ctx.db.insert("users", {}));
-    const owner = t.withIdentity({ issuer, subject: userId });
-    const base = {
-      subject: { kind: "person" as const, name: "Rowan" },
-      predicate: "date_of_birth",
-      sourceType: "user_stated" as const,
-    };
-    const wrong = await owner.mutation(api.models.facts.mcpActions.remember, {
-      ...base,
-      value: { type: "date", value: "2009-05-11" },
-      validFrom: Date.UTC(2009, 4, 11),
-    });
-    const corrected = await owner.mutation(
-      api.models.facts.mcpActions.remember,
-      {
-        ...base,
-        value: { type: "date", value: "2010-03-04" },
-        changeKind: "corrected",
-      },
-    );
-
-    expect(corrected.operation).toBe("corrected");
-    const prior = await t.run((ctx) => ctx.db.get(wrong.factId));
-    expect(prior?.status).toBe("retracted");
-    expect(prior?.validFrom).toBeUndefined();
-    expect(prior?.validTo).toBeUndefined();
-
-    // A historical read may surface what was formerly true. It must never
-    // surface what was never true, or a correction reads as a change.
-    const history = await owner.query(api.models.facts.mcpQueries.search, {
-      query: "Rowan date of birth",
-      includeHistorical: true,
-    });
-    const returnedIds = history.map((fact: { id: string }) => fact.id);
-    expect(returnedIds).toContain(corrected.factId);
-    expect(returnedIds).not.toContain(wrong.factId);
-  });
-
-  test("rejects an entity key whose prefix contradicts its kind", async () => {
-    const t = convexTest(schema, modules);
-    const userId = await t.run((ctx) => ctx.db.insert("users", {}));
-    const owner = t.withIdentity({ issuer, subject: userId });
-
-    await expect(
-      owner.mutation(api.models.facts.mcpActions.remember, {
-        subject: {
-          key: "organization:acme",
-          kind: "person",
-          name: "Acme",
-        },
+        ...baseFact,
         predicate: "home_city",
         value: { type: "text", value: "Portland" },
-        sourceType: "user_stated",
-      }),
-    ).rejects.toThrow("Entity key must begin with its kind");
-
-    const entities = await t.run((ctx) => ctx.db.query("entities").collect());
-    expect(entities).toHaveLength(0);
-  });
-
-  test("offers only current facts as narrative coverage", async () => {
-    const t = convexTest(schema, modules);
-    const userId = await t.run((ctx) => ctx.db.insert("users", {}));
-    const owner = t.withIdentity({ issuer, subject: userId });
-    const base = {
-      subject: { kind: "person" as const, name: "Rowan" },
-      predicate: "date_of_birth",
-      sourceType: "user_stated" as const,
-    };
-    const wrong = await owner.mutation(api.models.facts.mcpActions.remember, {
-      ...base,
-      value: { type: "date", value: "2009-05-11" },
-    });
-    const corrected = await owner.mutation(
-      api.models.facts.mcpActions.remember,
-      {
-        ...base,
-        value: { type: "date", value: "2010-03-04" },
-        changeKind: "corrected",
+        cardinality: "multiple",
+        spaceId,
       },
     );
-
-    // Coverage decides whether narrative capture is refused. Offering a
-    // retracted fact would refuse a capture on the strength of a value the
-    // user already corrected.
-    const covering = await t.run((ctx) =>
-      ctx.runQuery(internal.models.facts.private.searchCoveringFacts, {
-        userId,
-        query: "Rowan date of birth",
-      }),
+    const second = await editor.mcp.mutation(
+      api.models.facts.mcpActions.remember,
+      {
+        ...baseFact,
+        subject: { ...baseFact.subject, name: "Rowan Chen", aliases: ["R"] },
+        predicate: "school",
+        value: { type: "text", value: "Synthetic Academy" },
+        spaceId,
+      },
     );
-    const ids = covering.map((fact: { id: string }) => fact.id);
-    expect(ids).toContain(corrected.factId);
-    expect(ids).not.toContain(wrong.factId);
+    const visible = await reader.mcp.query(api.models.facts.mcpQueries.search, {
+      query: "Rowan",
+      spaceIds: [spaceId],
+    });
+    expect(visible.map((fact) => fact.id)).toEqual(
+      expect.arrayContaining([first.factId, second.factId]),
+    );
+    expect(visible.map((fact) => fact.userId)).toEqual(
+      expect.arrayContaining([owner.userId, editor.userId]),
+    );
+    const core = await reader.mcp.query(api.models.facts.mcpQueries.listCore, {
+      spaceIds: [spaceId],
+    });
+    expect(core.map((fact) => fact.id)).toEqual(
+      expect.arrayContaining([first.factId, second.factId]),
+    );
+    expect(
+      await t.run((ctx) =>
+        ctx.db
+          .query("entities")
+          .withIndex("by_spaceId_and_key", (q) =>
+            q.eq("spaceId", spaceId).eq("key", "person:rowan"),
+          )
+          .collect(),
+      ),
+    ).toHaveLength(1);
+    await expect(
+      reader.mcp.mutation(api.models.facts.mcpActions.remember, {
+        ...baseFact,
+        spaceId,
+      }),
+    ).rejects.toThrow("Space not found");
+    await t.run(async (ctx) => {
+      const key = await ctx.db.get(reader.credentialId);
+      await ctx.db.patch(reader.credentialId, {
+        spaceIds: key!.spaceIds!.filter((id) => id !== spaceId),
+      });
+    });
+    await expect(
+      reader.mcp.query(api.models.facts.mcpQueries.search, {
+        query: "Rowan",
+        spaceIds: [spaceId],
+      }),
+    ).rejects.toThrow("Space not found");
   });
 
-  test("keeps MCP and dashboard fact reads isolated by account and issuer", async () => {
+  test("resolves me to each member-linked person in the selected space", async () => {
     const t = convexTest(schema, modules);
-    const [ownerId, otherId] = await t.run(async (ctx) => [
-      await ctx.db.insert("users", {}),
-      await ctx.db.insert("users", {}),
-    ]);
-    const owner = t.withIdentity({ issuer, subject: ownerId });
-    const other = t.withIdentity({ issuer, subject: otherId });
-    await owner.mutation(api.models.facts.mcpActions.remember, {
-      subject: { kind: "person", name: "Alex" },
-      predicate: "home_city",
-      value: { type: "text", value: "Portland" },
-      sourceType: "user_stated",
-      isCore: true,
-    });
-
-    expect(await other.query(api.models.facts.mcpQueries.listCore, {})).toEqual(
-      [],
-    );
-    const searchResults = await owner.query(
-      api.models.facts.mcpQueries.search,
-      { query: "Alex home city Portland" },
-    );
-    expect(searchResults.map((fact) => fact.statement)).toEqual([
-      "Alex — home city: Portland.",
+    const first = await createActor(t, "First");
+    const second = await createActor(t, "Second");
+    const spaceId = await addSharedSpace(t, first.userId, [
+      { ...first, role: "owner" },
+      { ...second, role: "editor" },
     ]);
     await expect(
-      owner.query(api.models.facts.public.listRecent, {}),
-    ).rejects.toThrow("Not authenticated");
-    const dashboard = t.withIdentity({
-      issuer: "https://brain.example.test/convex",
-      subject: ownerId,
+      first.mcp.mutation(api.models.facts.mcpActions.remember, {
+        subject: { key: "me", kind: "person", name: "Me" },
+        predicate: "favorite_color",
+        value: { type: "text", value: "blue" },
+        sourceType: "user_stated",
+        spaceId,
+      }),
+    ).rejects.toThrow("Me is not linked to a person in this space");
+    const personIds = await t.run(async (ctx) => {
+      const ids = await Promise.all(
+        [first, second].map((actor) =>
+          ctx.db.insert("entities", {
+            userId: actor.userId,
+            spaceId,
+            key: `person:${actor.userId}`,
+            kind: "person",
+            canonicalName: `${actor.userId} Person`,
+            normalizedName: `${actor.userId} person`,
+            aliases: [],
+            normalizedAliases: [],
+          }),
+        ),
+      );
+      for (const [actor, personEntityId] of [
+        [first, ids[0]],
+        [second, ids[1]],
+      ] as const) {
+        const membership = await ctx.db
+          .query("spaceMembers")
+          .withIndex("by_spaceId_and_userId", (q) =>
+            q.eq("spaceId", spaceId).eq("userId", actor.userId),
+          )
+          .unique();
+        await ctx.db.patch(membership!._id, { personEntityId });
+      }
+      return ids;
     });
-    const visible = await dashboard.query(
-      api.models.facts.public.listRecent,
-      {},
-    );
-    expect(visible.map((fact) => fact.statement)).toEqual([
-      "Alex — home city: Portland.",
+    const remember = (actor: typeof first, value: string) =>
+      actor.mcp.mutation(api.models.facts.mcpActions.remember, {
+        subject: { key: "me", kind: "person", name: "Me" },
+        predicate: "favorite_color",
+        value: { type: "text", value },
+        sourceType: "user_stated",
+        spaceId,
+      });
+    const [one, two] = await Promise.all([
+      remember(first, "blue"),
+      remember(second, "green"),
     ]);
+    expect(
+      await t.run(async (ctx) => [
+        (await ctx.db.get(one.factId))?.subjectEntityId,
+        (await ctx.db.get(two.factId))?.subjectEntityId,
+      ]),
+    ).toEqual(personIds);
   });
 
-  test("fills fact result limits after lifecycle filtering", async () => {
+  test("uses explicit, valid default, and Personal destinations and rejects a stale default", async () => {
     const t = convexTest(schema, modules);
-    const userId = await t.run((ctx) => ctx.db.insert("users", {}));
+    const actor = await createActor(t, "Owner");
+    const outsider = await createActor(t, "Outsider");
+    const sharedId = await addSharedSpace(t, actor.userId, [
+      { ...actor, role: "owner" },
+    ]);
+    const explicit = await actor.mcp.mutation(
+      api.models.facts.mcpActions.remember,
+      { ...baseFact, predicate: "explicit_value", spaceId: sharedId },
+    );
+    const settingsId = await t.run(async (ctx) => {
+      const settings = await ctx.db
+        .query("userSpaceSettings")
+        .withIndex("by_userId", (q) => q.eq("userId", actor.userId))
+        .unique();
+      await ctx.db.patch(settings!._id, { defaultWriteSpaceId: sharedId });
+      return settings!._id;
+    });
+    const defaulted = await actor.mcp.mutation(
+      api.models.facts.mcpActions.remember,
+      { ...baseFact, predicate: "default_value" },
+    );
+    await t.run((ctx) =>
+      ctx.db.patch(settingsId, { defaultWriteSpaceId: undefined }),
+    );
+    const personal = await actor.mcp.mutation(
+      api.models.facts.mcpActions.remember,
+      { ...baseFact, predicate: "personal_value" },
+    );
+    expect(
+      await t.run(async (ctx) =>
+        Promise.all(
+          [explicit, defaulted, personal].map(
+            async ({ factId }) => (await ctx.db.get(factId))?.spaceId,
+          ),
+        ),
+      ),
+    ).toEqual([sharedId, sharedId, actor.personalSpaceId]);
+    const foreignId = await t.run(async (ctx) => {
+      const id = await ctx.db.insert("spaces", {
+        kind: "shared",
+        name: "Foreign",
+        createdBy: outsider.userId,
+      });
+      await ctx.db.patch(settingsId, { defaultWriteSpaceId: id });
+      return id;
+    });
+    expect(foreignId).toBeDefined();
+    await expect(
+      actor.mcp.mutation(api.models.facts.mcpActions.remember, {
+        ...baseFact,
+        predicate: "must_not_fallback",
+      }),
+    ).rejects.toThrow("Default write space is not available");
+  });
 
-    await t.run(async (ctx) => {
-      const subjectEntityId = await ctx.db.insert("entities", {
-        userId,
-        key: "person:pagination-test",
+  test("rejects cross-space object and history hydration on search and direct get", async () => {
+    const t = convexTest(schema, modules);
+    const actor = await createActor(t, "Owner");
+    const other = await createActor(t, "Other");
+    const sharedId = await addSharedSpace(t, actor.userId, [
+      { ...actor, role: "owner" },
+    ]);
+    const ids = await t.run(async (ctx) => {
+      const sharedSubject = await ctx.db.insert("entities", {
+        userId: actor.userId,
+        spaceId: sharedId,
+        key: "person:shared",
         kind: "person",
-        canonicalName: "Pagination Test",
-        normalizedName: "pagination test",
+        canonicalName: "Shared",
+        normalizedName: "shared",
         aliases: [],
         normalizedAliases: [],
       });
-      const insertFact = (
-        index: number,
-        status: "current" | "retracted",
-        validFrom?: number,
-      ) =>
-        ctx.db.insert("facts", {
-          userId,
-          subjectEntityId,
-          predicate: "school",
-          value: { type: "text", value: `School ${index}` },
-          statement: `Pagination Test — school: School ${index}.`,
-          searchText: `pagination sentinel school School ${index}`,
-          sourceType: "user_stated",
-          confidence: 1,
-          isCore: true,
-          validFrom,
-          status,
-        });
-
-      // Retrievable rows are deliberately older. The scheduled rows exhaust
-      // the old current-only `take(limit * 5)` window, while the still-newer
-      // retractions exhaust its historical window.
-      for (let index = 0; index < 10; index += 1) {
-        await insertFact(index, "current");
-      }
-      for (let index = 10; index < 70; index += 1) {
-        await insertFact(index, "current", Date.now() + 86_400_000);
-      }
-      for (let index = 70; index < 130; index += 1) {
-        await insertFact(index, "retracted");
-      }
+      const privateEntity = await ctx.db.insert("entities", {
+        userId: other.userId,
+        spaceId: other.personalSpaceId,
+        key: "person:private",
+        kind: "person",
+        canonicalName: "Private",
+        normalizedName: "private",
+        aliases: [],
+        normalizedAliases: [],
+      });
+      const privateFact = await ctx.db.insert("facts", {
+        userId: other.userId,
+        spaceId: other.personalSpaceId,
+        subjectEntityId: privateEntity,
+        predicate: "private_value",
+        value: { type: "text", value: "Private" },
+        statement: "Private.",
+        searchText: "private",
+        sourceType: "user_stated",
+        confidence: 1,
+        status: "current",
+      });
+      const object = await ctx.db.insert("facts", {
+        userId: actor.userId,
+        spaceId: sharedId,
+        subjectEntityId: sharedSubject,
+        predicate: "doctor",
+        value: { type: "entity", entityId: privateEntity },
+        statement: "Cross-space object.",
+        searchText: "cross scope sentinel object",
+        sourceType: "user_stated",
+        confidence: 1,
+        status: "current",
+      });
+      const history = await ctx.db.insert("facts", {
+        userId: actor.userId,
+        spaceId: sharedId,
+        subjectEntityId: sharedSubject,
+        predicate: "school",
+        value: { type: "text", value: "School" },
+        statement: "Cross-space history.",
+        searchText: "cross scope sentinel history",
+        sourceType: "user_stated",
+        confidence: 1,
+        status: "current",
+        supersedes: [privateFact],
+      });
+      return { privateFact, object, history };
     });
+    for (const factId of Object.values(ids)) {
+      expect(
+        await actor.mcp.query(api.models.facts.mcpQueries.getById, {
+          factId,
+          spaceIds: [sharedId],
+        }),
+      ).toBeNull();
+    }
+    expect(
+      await actor.mcp.query(api.models.facts.mcpQueries.search, {
+        query: "cross scope sentinel",
+        spaceIds: [sharedId],
+      }),
+    ).toEqual([]);
+  });
 
-    const recent = await t.run((ctx) => listFacts(ctx, userId, { limit: 10 }));
-    const core = await t.run((ctx) =>
-      listFacts(ctx, userId, { limit: 10, coreOnly: true }),
+  test("keeps correction history scoped and bounds current-value transitions", async () => {
+    const t = convexTest(schema, modules);
+    const actor = await createActor(t, "Owner");
+    const wrong = await actor.mcp.mutation(
+      api.models.facts.mcpActions.remember,
+      { ...baseFact, value: { type: "date", value: "2009-05-11" } },
     );
-    const historical = await t.run((ctx) =>
-      listFacts(ctx, userId, { limit: 10, includeHistorical: true }),
+    const corrected = await actor.mcp.mutation(
+      api.models.facts.mcpActions.remember,
+      { ...baseFact, changeKind: "corrected" },
     );
-    const search = await t.run((ctx) =>
-      searchFacts(ctx, userId, "pagination sentinel school", { limit: 10 }),
-    );
-    const historicalSearch = await t.run((ctx) =>
-      searchFacts(ctx, userId, "pagination sentinel school", {
-        limit: 10,
-        includeHistorical: true,
+    const covering = await t.run((ctx) =>
+      ctx.runQuery(internal.models.facts.private.searchCoveringFacts, {
+        principal: {
+          userId: actor.userId,
+          credentialId: actor.credentialId,
+        },
+        query: "Rowan date of birth",
       }),
     );
+    expect(covering.map((fact) => fact.id)).toContain(corrected.factId);
+    expect(covering.map((fact) => fact.id)).not.toContain(wrong.factId);
 
-    for (const results of [
-      recent,
-      core,
-      historical,
-      search,
-      historicalSearch,
-    ]) {
-      expect(results).toHaveLength(10);
-      expect(results.every((fact) => fact.status !== "retracted")).toBe(true);
+    const subjectEntityId = (await t.run((ctx) =>
+      ctx.db.get(corrected.factId),
+    ))!.subjectEntityId;
+    await t.run(async (ctx) => {
+      for (
+        let index = 0;
+        index <= MAX_CURRENT_FACTS_PER_PREDICATE;
+        index += 1
+      ) {
+        await ctx.db.insert("facts", {
+          userId: actor.userId,
+          spaceId: actor.personalSpaceId,
+          subjectEntityId,
+          predicate: "favorite_place",
+          value: { type: "text", value: `Place ${index}` },
+          statement: `Rowan — favorite place: Place ${index}.`,
+          searchText: `overflow place ${index}`,
+          sourceType: "user_stated",
+          confidence: 1,
+          status: "current",
+        });
+      }
+    });
+    await expect(
+      actor.mcp.mutation(api.models.facts.mcpActions.remember, {
+        ...baseFact,
+        predicate: "favorite_place",
+        value: { type: "text", value: "New Place" },
+      }),
+    ).rejects.toThrow(
+      `Fact transition exceeds the ${MAX_CURRENT_FACTS_PER_PREDICATE}-record current-value limit`,
+    );
+    const current = await t.run((ctx) =>
+      ctx.db
+        .query("facts")
+        .withIndex("by_spaceId_subject_predicate_status", (q) =>
+          q
+            .eq("spaceId", actor.personalSpaceId)
+            .eq("subjectEntityId", subjectEntityId)
+            .eq("predicate", "favorite_place")
+            .eq("status", "current"),
+        )
+        .collect(),
+    );
+    expect(current).toHaveLength(MAX_CURRENT_FACTS_PER_PREDICATE + 1);
+  });
+
+  test("hydrates a maximum-size transition after it is later superseded", async () => {
+    const t = convexTest(schema, modules);
+    const actor = await createActor(t, "Owner");
+    const subjectEntityId = await t.run((ctx) =>
+      ctx.db.insert("entities", {
+        userId: actor.userId,
+        spaceId: actor.personalSpaceId,
+        key: "person:bounded-history",
+        kind: "person",
+        canonicalName: "Bounded History",
+        normalizedName: "bounded history",
+        aliases: [],
+        normalizedAliases: [],
+      }),
+    );
+    await t.run(async (ctx) => {
+      for (let index = 0; index < MAX_CURRENT_FACTS_PER_PREDICATE; index += 1) {
+        await ctx.db.insert("facts", {
+          userId: actor.userId,
+          spaceId: actor.personalSpaceId,
+          subjectEntityId,
+          predicate: "bounded_history",
+          value: { type: "text", value: `Value ${index}` },
+          statement: `Bounded History — bounded history: Value ${index}.`,
+          searchText: `bounded history value ${index}`,
+          sourceType: "user_stated",
+          confidence: 1,
+          status: "current",
+        });
+      }
+    });
+    await expect(
+      actor.mcp.mutation(api.models.facts.mcpActions.remember, {
+        subject: {
+          key: "person:bounded-history",
+          kind: "person",
+          name: "Bounded History",
+        },
+        predicate: "bounded_history",
+        value: { type: "text", value: "Must not exceed the bound" },
+        sourceType: "user_stated",
+        cardinality: "multiple",
+      }),
+    ).rejects.toThrow(
+      `Fact current-value limit of ${MAX_CURRENT_FACTS_PER_PREDICATE} reached`,
+    );
+    const maximum = await actor.mcp.mutation(
+      api.models.facts.mcpActions.remember,
+      {
+        subject: {
+          key: "person:bounded-history",
+          kind: "person",
+          name: "Bounded History",
+        },
+        predicate: "bounded_history",
+        value: { type: "text", value: "Maximum transition" },
+        sourceType: "user_stated",
+      },
+    );
+    await actor.mcp.mutation(api.models.facts.mcpActions.remember, {
+      subject: {
+        key: "person:bounded-history",
+        kind: "person",
+        name: "Bounded History",
+      },
+      predicate: "bounded_history",
+      value: { type: "text", value: "Later transition" },
+      sourceType: "user_stated",
+    });
+    const hydrated = await actor.mcp.query(
+      api.models.facts.mcpQueries.getById,
+      { factId: maximum.factId },
+    );
+    expect(hydrated).toMatchObject({ id: maximum.factId });
+    expect(hydrated?.supersedes).toHaveLength(MAX_CURRENT_FACTS_PER_PREDICATE);
+    expect(hydrated?.supersededBy).toBeDefined();
+  });
+
+  test("applies one deterministic limit after searching all authorized spaces", async () => {
+    const t = convexTest(schema, modules);
+    const actor = await createActor(t, "Owner");
+    const sharedId = await addSharedSpace(t, actor.userId, [
+      { ...actor, role: "owner" },
+    ]);
+    for (const [spaceId, value] of [
+      [actor.personalSpaceId, "personal"],
+      [sharedId, "shared"],
+    ] as const) {
+      await actor.mcp.mutation(api.models.facts.mcpActions.remember, {
+        ...baseFact,
+        predicate: "search_marker",
+        value: { type: "text", value: `deterministic sentinel ${value}` },
+        spaceId,
+      });
     }
+    const args = { query: "deterministic sentinel", limit: 1 };
+    const first = await actor.mcp.query(
+      api.models.facts.mcpQueries.search,
+      args,
+    );
+    const second = await actor.mcp.query(
+      api.models.facts.mcpQueries.search,
+      args,
+    );
+    expect(first).toEqual(second);
+    expect(first).toHaveLength(1);
+  });
+
+  test("keeps dashboard and MCP identity domains separate", async () => {
+    const t = convexTest(schema, modules);
+    const actor = await createActor(t, "Owner");
+    await actor.mcp.mutation(api.models.facts.mcpActions.remember, baseFact);
+    await expect(
+      actor.mcp.query(api.models.facts.public.listRecent, {}),
+    ).rejects.toThrow("Not authenticated");
+    expect(
+      await actor.web.query(api.models.facts.public.listRecent, {}),
+    ).toHaveLength(1);
   });
 });

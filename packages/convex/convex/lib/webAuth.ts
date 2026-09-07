@@ -1,6 +1,7 @@
 import { getAuthUserId } from "@convex-dev/auth/server";
 
 import type { Id } from "../_generated/dataModel";
+import { webPrincipal, type Principal } from "./spaces";
 
 type AuthenticatedFunctionContext = {
   auth: {
@@ -41,4 +42,21 @@ export async function requireWebUserId(
     throw new Error("Not authenticated");
   }
   return userId;
+}
+
+export async function requireWebPrincipal(
+  ctx: Parameters<typeof requireWebUserId>[0],
+): Promise<Principal> {
+  const userId = await requireWebUserId(ctx);
+  if (
+    "db" in ctx &&
+    !(await (
+      ctx as Parameters<typeof getAuthUserId>[0] & {
+        db: { get(id: Id<"users">): Promise<unknown | null> };
+      }
+    ).db.get(userId))
+  ) {
+    throw new Error("Not authenticated");
+  }
+  return webPrincipal(userId);
 }

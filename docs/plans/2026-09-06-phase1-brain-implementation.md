@@ -222,6 +222,9 @@ enable shared reads or writes. Existing writers can still create unscoped
 rows until P1-2 changes them, so a successful P1-1 audit must be repeated at
 cutover.
 
+The P1-2 scope rollout and required-field cutover are documented in
+[Scoped credentials and space authorization](../migrations/scoped-credentials.md).
+
 The migration follows the existing `models/thoughts/migrations.ts` pattern: optional field, compatible indexes, paginated dry-run mutation, count query, idempotent rerun, then a later PR makes the field required. Ordinary indexes can coexist by user and space. Convex requires one vector index per embedding field, so the existing vector index gains `spaceId` as an additional filter while retaining its name and `userId` filter for legacy queries.
 
 1. Create a personal space, owner membership, and settings row for every user. Idempotency uses the personal-space lookup and membership lookup.

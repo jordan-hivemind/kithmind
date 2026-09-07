@@ -59,6 +59,22 @@ export const authorizationRequestSchema = z.object({
   scope: z.literal("open-brain").optional(),
 });
 
+export const authorizationConsentSchema = authorizationRequestSchema.extend({
+  spaceIds: z
+    .array(z.string().trim().min(1).max(128))
+    .min(1)
+    .max(100)
+    .refine((ids) => new Set(ids).size === ids.length, "Spaces must be unique"),
+  capabilities: z
+    .array(z.enum(["read", "write"]))
+    .min(1)
+    .max(2)
+    .refine(
+      (values) => new Set(values).size === values.length,
+      "Permissions must be unique",
+    ),
+});
+
 export const tokenRequestSchema = z.object({
   grant_type: z.literal("authorization_code"),
   code: z.string().min(1).max(8192),

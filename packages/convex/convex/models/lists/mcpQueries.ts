@@ -5,7 +5,6 @@ import {
   _listsByUser,
   _itemsByList,
   _openItemsByUser,
-  _countItemsByList,
   _findListById,
 } from "./model";
 
@@ -15,7 +14,7 @@ export const getLists = query({
     includeArchived: v.optional(v.boolean()),
   },
   handler: async (ctx, args) => {
-    const userId = await requireMcpUserId(ctx);
+    const userId = await requireMcpUserId(ctx, "read");
     const lists = await _listsByUser(ctx, userId, {
       pinned: args.pinned,
       includeArchived: args.includeArchived,
@@ -23,7 +22,15 @@ export const getLists = query({
 
     const listsWithCounts = await Promise.all(
       lists.map(async (list) => {
-        const counts = await _countItemsByList(ctx, list._id);
+        const items = await _itemsByList(ctx, list._id, {
+          includeCompleted: true,
+        });
+        const ownedItems = items.filter((item) => item.userId === userId);
+        const counts = {
+          total: ownedItems.length,
+          open: ownedItems.filter((item) => item.status === "open").length,
+          done: ownedItems.filter((item) => item.status === "done").length,
+        };
         return {
           listId: list._id,
           name: list.name,
@@ -44,15 +51,17 @@ export const getList = query({
     includeCompleted: v.optional(v.boolean()),
   },
   handler: async (ctx, args) => {
-    const userId = await requireMcpUserId(ctx);
+    const userId = await requireMcpUserId(ctx, "read");
     const list = await _findListById(ctx, args.listId);
     if (!list || list.userId !== userId) {
       throw new Error("List not found");
     }
 
-    const items = await _itemsByList(ctx, args.listId, {
-      includeCompleted: args.includeCompleted,
-    });
+    const items = (
+      await _itemsByList(ctx, args.listId, {
+        includeCompleted: args.includeCompleted,
+      })
+    ).filter((item) => item.userId === userId);
 
     return {
       listId: list._id,
@@ -77,7 +86,7 @@ export const getOpenItems = query({
     limit: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
-    const userId = await requireMcpUserId(ctx);
+    const userId = await requireMcpUserId(ctx, "read");
     const limit = args.limit ?? 50;
     const items = await _openItemsByUser(ctx, userId);
 
@@ -90,8 +99,8 @@ export const getOpenItems = query({
       if (!listInfo) {
         const list = await _findListById(ctx, item.listId);
         listInfo = {
-          name: list?.name ?? "Unknown",
-          archived: list?.archivedAt !== undefined,
+          name: list?.userId === userId ? list.name : "",
+          archived: list?.userId !== userId || list.archivedAt !== undefined,
         };
         listCache.set(item.listId, listInfo);
       }

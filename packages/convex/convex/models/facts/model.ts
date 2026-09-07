@@ -21,6 +21,10 @@ export type FactSourceType = Infer<typeof factSourceType>;
 
 export const MAX_FACT_SEARCH_LIMIT = 50;
 export const DEFAULT_FACT_SEARCH_LIMIT = 10;
+export const MAX_CURRENT_FACTS_PER_PREDICATE = 100;
+const MAX_FACT_CANDIDATE_READS = 1_500;
+const MAX_FACT_HISTORY_LINK_READS = 1_500;
+const MAX_FACT_HISTORY_LINKS_PER_FACT = MAX_CURRENT_FACTS_PER_PREDICATE + 1;
 const ENTITY_NAME_MAX_CHARS = 200;
 const ENTITY_KEY_MAX_CHARS = 160;
 const FACT_TEXT_MAX_CHARS = 1_000;
@@ -146,6 +150,7 @@ function normalizeAliases(
 export async function resolveEntity(
   ctx: MutationCtx,
   userId: Id<"users">,
+  spaceId: Id<"spaces">,
   selector: EntitySelector,
 ): Promise<Doc<"entities">> {
   const canonicalName = boundedText(
@@ -154,12 +159,38 @@ export async function resolveEntity(
     ENTITY_NAME_MAX_CHARS,
   );
   const normalizedName = normalizeEntityName(canonicalName);
+  const requestedKey = selector.key
+    ?.trim()
+    .normalize("NFKC")
+    .toLocaleLowerCase("en-US");
+  const selectsMe =
+    selector.kind === "person" &&
+    (requestedKey === "me" ||
+      requestedKey === "person:me" ||
+      (requestedKey === undefined && normalizedName === "me"));
+  if (selectsMe) {
+    const memberships = await ctx.db
+      .query("spaceMembers")
+      .withIndex("by_spaceId_and_userId", (q) =>
+        q.eq("spaceId", spaceId).eq("userId", userId),
+      )
+      .take(2);
+    if (memberships.length !== 1 || !memberships[0]!.personEntityId) {
+      throw new Error("Me is not linked to a person in this space");
+    }
+    const person = await ctx.db.get(memberships[0]!.personEntityId);
+    if (!person || person.kind !== "person" || person.spaceId !== spaceId) {
+      throw new Error("Me is not linked to a person in this space");
+    }
+    return person;
+  }
+
   const key = normalizeEntityKey(selector.key, selector.kind, canonicalName);
   const incomingAliases = normalizeAliases(selector.aliases, canonicalName);
   const existing = await ctx.db
     .query("entities")
-    .withIndex("by_userId_and_key", (q) =>
-      q.eq("userId", userId).eq("key", key),
+    .withIndex("by_spaceId_and_key", (q) =>
+      q.eq("spaceId", spaceId).eq("key", key),
     )
     .unique();
 
@@ -188,6 +219,7 @@ export async function resolveEntity(
 
   const entityId = await ctx.db.insert("entities", {
     userId,
+    spaceId,
     key,
     kind: selector.kind,
     canonicalName,
@@ -208,6 +240,7 @@ function normalizeOptionalText(
 async function normalizeFactValue(
   ctx: MutationCtx,
   userId: Id<"users">,
+  spaceId: Id<"spaces">,
   value: FactValueInput,
 ): Promise<Doc<"facts">["value"]> {
   switch (value.type) {
@@ -234,7 +267,7 @@ async function normalizeFactValue(
     case "boolean":
       return value;
     case "entity": {
-      const entity = await resolveEntity(ctx, userId, value.entity);
+      const entity = await resolveEntity(ctx, userId, spaceId, value.entity);
       return { type: "entity", entityId: entity._id };
     }
   }
@@ -329,6 +362,28 @@ function currentFactValidityFilter(
   );
 }
 
+function assertBoundedFactRead(
+  spaceCount: number,
+  perSpaceLimit: number,
+): void {
+  if (spaceCount * perSpaceLimit > MAX_FACT_CANDIDATE_READS) {
+    throw new Error(
+      "Fact read scope is too broad; narrow spaces or lower limit",
+    );
+  }
+}
+
+function assertBoundedHistoryHydration(facts: readonly Doc<"facts">[]): void {
+  const linkCount = facts.reduce(
+    (count, fact) =>
+      count + (fact.supersededBy ? 1 : 0) + (fact.supersedes?.length ?? 0),
+    0,
+  );
+  if (linkCount > MAX_FACT_HISTORY_LINK_READS) {
+    throw new Error("Fact history expansion exceeds the read limit");
+  }
+}
+
 export type RememberFactArgs = {
   subject: EntitySelector;
   predicate: string;
@@ -348,21 +403,22 @@ export type RememberFactArgs = {
 export async function rememberFact(
   ctx: MutationCtx,
   userId: Id<"users">,
+  spaceId: Id<"spaces">,
   args: RememberFactArgs,
 ) {
   assertValidMemoryValidity(args);
   if (args.observedAt !== undefined && !Number.isFinite(args.observedAt)) {
     throw new Error("observedAt must be a finite timestamp");
   }
-  const subject = await resolveEntity(ctx, userId, args.subject);
+  const subject = await resolveEntity(ctx, userId, spaceId, args.subject);
   const predicate = normalizePredicate(args.predicate);
   if (predicate === "date_of_birth" && args.value.type !== "date") {
     throw new Error("date_of_birth must use an exact date value");
   }
-  const value = await normalizeFactValue(ctx, userId, args.value);
+  const value = await normalizeFactValue(ctx, userId, spaceId, args.value);
   const objectEntity =
     value.type === "entity" ? await ctx.db.get(value.entityId) : null;
-  if (objectEntity && objectEntity.userId !== userId) {
+  if (objectEntity && objectEntity.spaceId !== spaceId) {
     throw new Error("Fact value entity is unavailable");
   }
   const displayedValue = displayFactValue(value, objectEntity);
@@ -397,14 +453,19 @@ export async function rememberFact(
 
   const current = await ctx.db
     .query("facts")
-    .withIndex("by_userId_subject_predicate_status", (q) =>
+    .withIndex("by_spaceId_subject_predicate_status", (q) =>
       q
-        .eq("userId", userId)
+        .eq("spaceId", spaceId)
         .eq("subjectEntityId", subject._id)
         .eq("predicate", predicate)
         .eq("status", "current"),
     )
-    .collect();
+    .take(MAX_CURRENT_FACTS_PER_PREDICATE + 1);
+  if (current.length > MAX_CURRENT_FACTS_PER_PREDICATE) {
+    throw new Error(
+      `Fact transition exceeds the ${MAX_CURRENT_FACTS_PER_PREDICATE}-record current-value limit`,
+    );
+  }
   const valueKey = factValueKey(value);
   const duplicate = current.find(
     (fact) =>
@@ -431,10 +492,20 @@ export async function rememberFact(
     };
   }
 
+  if (
+    (args.cardinality ?? "single") === "multiple" &&
+    current.length >= MAX_CURRENT_FACTS_PER_PREDICATE
+  ) {
+    throw new Error(
+      `Fact current-value limit of ${MAX_CURRENT_FACTS_PER_PREDICATE} reached`,
+    );
+  }
+
   const affected = (args.cardinality ?? "single") === "single" ? current : [];
   const now = Date.now();
   const factId = await ctx.db.insert("facts", {
     userId,
+    spaceId,
     subjectEntityId: subject._id,
     predicate,
     value,
@@ -490,39 +561,59 @@ export async function rememberFact(
   };
 }
 
-export async function hydrateFact(ctx: QueryCtx, fact: Doc<"facts">) {
-  const [subject, objectEntity] = await Promise.all([
+export async function hydrateFact(
+  ctx: QueryCtx,
+  fact: Doc<"facts">,
+  authorizedSpaceIds: ReadonlySet<Id<"spaces">>,
+) {
+  if (fact.spaceId === undefined || !authorizedSpaceIds.has(fact.spaceId)) {
+    return null;
+  }
+  const historyIds = [
+    ...(fact.supersededBy ? [fact.supersededBy] : []),
+    ...(fact.supersedes ?? []),
+  ];
+  if (historyIds.length > MAX_FACT_HISTORY_LINKS_PER_FACT) return null;
+  const [subject, objectEntity, history] = await Promise.all([
     ctx.db.get(fact.subjectEntityId),
     fact.value.type === "entity" ? ctx.db.get(fact.value.entityId) : null,
+    Promise.all(historyIds.map((factId) => ctx.db.get(factId))),
   ]);
+  if (
+    !subject ||
+    subject.spaceId !== fact.spaceId ||
+    (fact.value.type === "entity" &&
+      (!objectEntity || objectEntity.spaceId !== fact.spaceId)) ||
+    history.some(
+      (linkedFact) => !linkedFact || linkedFact.spaceId !== fact.spaceId,
+    )
+  ) {
+    return null;
+  }
   return {
     id: fact._id,
+    spaceId: fact.spaceId,
+    userId: fact.userId,
     statement: fact.statement,
-    subject:
-      subject === null
-        ? null
-        : {
-            id: subject._id,
-            key: subject.key,
-            kind: subject.kind,
-            name: subject.canonicalName,
-            aliases: subject.aliases,
-          },
+    subject: {
+      id: subject._id,
+      key: subject.key,
+      kind: subject.kind,
+      name: subject.canonicalName,
+      aliases: subject.aliases,
+    },
     predicate: fact.predicate,
     value:
       fact.value.type === "entity"
         ? {
             type: "entity" as const,
-            entity:
-              objectEntity === null
-                ? null
-                : {
-                    id: objectEntity._id,
-                    key: objectEntity.key,
-                    kind: objectEntity.kind,
-                    name: objectEntity.canonicalName,
-                    aliases: objectEntity.aliases,
-                  },
+            entity: {
+              id: objectEntity!._id,
+              key: objectEntity!.key,
+              kind: objectEntity!.kind,
+              name: objectEntity!.canonicalName,
+              aliases: objectEntity!.aliases,
+            },
           }
         : fact.value,
     sourceType: fact.sourceType,
@@ -545,7 +636,7 @@ export async function hydrateFact(ctx: QueryCtx, fact: Doc<"facts">) {
 
 export async function listFacts(
   ctx: QueryCtx,
-  userId: Id<"users">,
+  spaceIds: readonly Id<"spaces">[],
   options: {
     limit?: number;
     includeHistorical?: boolean;
@@ -558,48 +649,68 @@ export async function listFacts(
   }
   const limit = Math.min(requested, MAX_FACT_SEARCH_LIMIT);
   const activeAt = Date.now();
-  let selected: Doc<"facts">[];
-  if (options.includeHistorical) {
-    selected = options.coreOnly
-      ? await ctx.db
-          .query("facts")
-          .withIndex("by_userId_and_isCore", (q) =>
-            q.eq("userId", userId).eq("isCore", true),
-          )
-          .order("desc")
-          .filter((q) => q.neq(q.field("status"), "retracted"))
-          .take(limit)
-      : await ctx.db
-          .query("facts")
-          .withIndex("by_userId", (q) => q.eq("userId", userId))
-          .order("desc")
-          .filter((q) => q.neq(q.field("status"), "retracted"))
-          .take(limit);
-  } else {
-    selected = options.coreOnly
-      ? await ctx.db
-          .query("facts")
-          .withIndex("by_userId_isCore_status", (q) =>
-            q.eq("userId", userId).eq("isCore", true).eq("status", "current"),
-          )
-          .order("desc")
-          .filter((q) => currentFactValidityFilter(q, activeAt))
-          .take(limit)
-      : await ctx.db
-          .query("facts")
-          .withIndex("by_userId_and_status", (q) =>
-            q.eq("userId", userId).eq("status", "current"),
-          )
-          .order("desc")
-          .filter((q) => currentFactValidityFilter(q, activeAt))
-          .take(limit);
-  }
-  return await Promise.all(selected.map((fact) => hydrateFact(ctx, fact)));
+  const uniqueSpaceIds = [...new Set(spaceIds)];
+  assertBoundedFactRead(uniqueSpaceIds.length, limit);
+  const bySpace = await Promise.all(
+    uniqueSpaceIds.map(async (spaceId) => {
+      if (options.includeHistorical) {
+        return options.coreOnly
+          ? await ctx.db
+              .query("facts")
+              .withIndex("by_spaceId_and_isCore", (q) =>
+                q.eq("spaceId", spaceId).eq("isCore", true),
+              )
+              .order("desc")
+              .filter((q) => q.neq(q.field("status"), "retracted"))
+              .take(limit)
+          : await ctx.db
+              .query("facts")
+              .withIndex("by_spaceId", (q) => q.eq("spaceId", spaceId))
+              .order("desc")
+              .filter((q) => q.neq(q.field("status"), "retracted"))
+              .take(limit);
+      }
+      return options.coreOnly
+        ? await ctx.db
+            .query("facts")
+            .withIndex("by_spaceId_isCore_status", (q) =>
+              q
+                .eq("spaceId", spaceId)
+                .eq("isCore", true)
+                .eq("status", "current"),
+            )
+            .order("desc")
+            .filter((q) => currentFactValidityFilter(q, activeAt))
+            .take(limit)
+        : await ctx.db
+            .query("facts")
+            .withIndex("by_spaceId_and_status", (q) =>
+              q.eq("spaceId", spaceId).eq("status", "current"),
+            )
+            .order("desc")
+            .filter((q) => currentFactValidityFilter(q, activeAt))
+            .take(limit);
+    }),
+  );
+  const selected = bySpace
+    .flat()
+    .sort(
+      (left, right) =>
+        right._creationTime - left._creationTime ||
+        String(left._id).localeCompare(String(right._id)),
+    )
+    .slice(0, limit);
+  assertBoundedHistoryHydration(selected);
+  const authorized = new Set(uniqueSpaceIds);
+  const hydrated = await Promise.all(
+    selected.map((fact) => hydrateFact(ctx, fact, authorized)),
+  );
+  return hydrated.filter((fact) => fact !== null);
 }
 
 export async function searchFacts(
   ctx: QueryCtx,
-  userId: Id<"users">,
+  spaceIds: readonly Id<"spaces">[],
   query: string,
   options: { limit?: number; includeHistorical?: boolean } = {},
 ) {
@@ -610,19 +721,53 @@ export async function searchFacts(
   }
   const limit = Math.min(requested, MAX_FACT_SEARCH_LIMIT);
   const activeAt = Date.now();
-  const selected = await ctx.db
-    .query("facts")
-    .withSearchIndex("by_searchText", (q) => {
-      const search = q.search("searchText", cleanedQuery).eq("userId", userId);
-      return options.includeHistorical
-        ? search
-        : search.eq("status", "current");
-    })
-    .filter((q) =>
-      options.includeHistorical
-        ? q.neq(q.field("status"), "retracted")
-        : currentFactValidityFilter(q, activeAt),
+  const uniqueSpaceIds = [...new Set(spaceIds)];
+  assertBoundedFactRead(uniqueSpaceIds.length, limit);
+  const bySpace = await Promise.all(
+    uniqueSpaceIds.map(
+      async (spaceId) =>
+        await ctx.db
+          .query("facts")
+          .withSearchIndex("by_searchText", (q) => {
+            const search = q
+              .search("searchText", cleanedQuery)
+              .eq("spaceId", spaceId);
+            return options.includeHistorical
+              ? search
+              : search.eq("status", "current");
+          })
+          .filter((q) =>
+            options.includeHistorical
+              ? q.neq(q.field("status"), "retracted")
+              : currentFactValidityFilter(q, activeAt),
+          )
+          .take(limit),
+    ),
+  );
+  const selected = bySpace
+    .flatMap((facts) => facts.map((fact, rank) => ({ fact, rank })))
+    .sort(
+      (left, right) =>
+        left.rank - right.rank ||
+        right.fact._creationTime - left.fact._creationTime ||
+        String(left.fact._id).localeCompare(String(right.fact._id)),
     )
-    .take(limit);
-  return await Promise.all(selected.map((fact) => hydrateFact(ctx, fact)));
+    .slice(0, limit)
+    .map(({ fact }) => fact);
+  assertBoundedHistoryHydration(selected);
+  const authorized = new Set(uniqueSpaceIds);
+  const hydrated = await Promise.all(
+    selected.map((fact) => hydrateFact(ctx, fact, authorized)),
+  );
+  return hydrated.filter((fact) => fact !== null);
+}
+
+export async function getFactById(
+  ctx: QueryCtx,
+  spaceIds: readonly Id<"spaces">[],
+  factId: Id<"facts">,
+) {
+  const fact = await ctx.db.get(factId);
+  if (!fact) return null;
+  return await hydrateFact(ctx, fact, new Set(spaceIds));
 }

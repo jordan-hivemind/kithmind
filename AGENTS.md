@@ -76,8 +76,18 @@ models ship.
 `apps/web/src/lib/mcp/*` require tier 2 or above and a second-model review
 before merge. Run Convex-side migrations with `npx convex run` against the
 development deployment first, then record the exact command in the owner
-tracker or a public issue or plan. Never run a production migration or
-deployment without the owner's explicit approval.
+tracker or a public issue or plan.
+
+### Standing pre-launch deployment approval
+
+On 2026-09-06, the owner explicitly pre-approved production deployments and
+the migrations needed to implement this project. The owner reports that the
+deployment has no active users yet. During this pre-launch build, agents may
+merge reviewed changes, deploy, migrate, and verify the owner's Kith Mind
+environments without asking again. This approval remains effective until the
+owner revokes it or declares the system live. Keep development-first migration
+checks, required tests, independent security review, and deployment verification.
+This approval does not apply to upstream or other contributors' deployments.
 
 The required verification commands are:
 

@@ -28,7 +28,7 @@ export const listInsights = query({
   },
   returns: v.array(insightReturn),
   handler: async (ctx, args) => {
-    const userId = await requireMcpUserId(ctx);
+    const userId = await requireMcpUserId(ctx, "read");
     const limit = args.limit ?? 50;
 
     let results;

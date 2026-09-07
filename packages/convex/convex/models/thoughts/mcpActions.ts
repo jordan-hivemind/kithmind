@@ -2,7 +2,8 @@ import { action } from "../../_generated/server";
 import { internal as _internal } from "../../_generated/api";
 import type { Id } from "../../_generated/dataModel";
 import { v, type Infer } from "convex/values";
-import { requireMcpUserId } from "../../lib/mcpAuth";
+import { requireMcpPrincipal } from "../../lib/mcpAuth";
+import { principalRef } from "../../lib/spaces";
 import type { MemoryStatus } from "./memoryLifecycle";
 import { memorySourceType, memoryStatus, thoughtMetadata } from "./validators";
 
@@ -32,6 +33,7 @@ export const capture = action({
     sourceRef: v.optional(v.string()),
     observedAt: v.optional(v.number()),
     batchId: v.optional(v.string()),
+    spaceId: v.optional(v.id("spaces")),
   },
   returns: v.object({
     thoughtId: v.optional(v.id("thoughts")),
@@ -47,11 +49,23 @@ export const capture = action({
     operationSummary: v.optional(v.string()),
   }),
   handler: async (ctx, args) => {
-    const userId = await requireMcpUserId(ctx);
+    const principal = await requireMcpPrincipal(ctx);
+    if (
+      !principal.capabilities.includes("read") ||
+      !principal.capabilities.includes("write")
+    ) {
+      throw new Error("Thought capture requires read and write capabilities");
+    }
+    const ref = principalRef(principal);
+    const spaceId: Id<"spaces"> = await ctx.runMutation(
+      internal.models.thoughts.private.resolveWriteSpaceForAction,
+      { principal: ref, spaceId: args.spaceId },
+    );
     return await ctx.runAction(
       internal.models.thoughts.actions.captureThought,
       {
-        userId,
+        principal: ref,
+        spaceId,
         content: args.content,
         validFrom: args.validFrom,
         validTo: args.validTo,
@@ -80,6 +94,7 @@ export const search = action({
     ),
     limit: v.optional(v.number()),
     includeHistorical: v.optional(v.boolean()),
+    spaceIds: v.optional(v.array(v.id("spaces"))),
   },
   returns: v.array(
     v.object({
@@ -88,6 +103,8 @@ export const search = action({
       snippet: v.string(),
       type: v.string(),
       topics: v.array(v.string()),
+      userId: v.id("users"),
+      spaceId: v.id("spaces"),
       score: v.float64(),
       createdAt: v.number(),
       memoryStatus,
@@ -99,11 +116,13 @@ export const search = action({
     }),
   ),
   handler: async (ctx, args) => {
-    const userId = await requireMcpUserId(ctx);
+    const principal = await requireMcpPrincipal(ctx);
     const hits: Array<{
       _id: Id<"thoughts">;
       content: string;
       metadata: Infer<typeof thoughtMetadata>;
+      userId: Id<"users">;
+      spaceId: Id<"spaces">;
       score: number;
       createdAt: number;
       memoryStatus: MemoryStatus;
@@ -113,7 +132,8 @@ export const search = action({
       supersededAt?: number;
       changeReason?: string;
     }> = await ctx.runAction(internal.models.thoughts.actions.hybridSearch, {
-      userId,
+      principal: principalRef(principal),
+      spaceIds: args.spaceIds,
       query: args.query,
       type: args.type,
       limit: args.limit,
@@ -126,6 +146,8 @@ export const search = action({
       snippet: truncateSnippet(h.content),
       type: h.metadata.type,
       topics: h.metadata.topics,
+      userId: h.userId,
+      spaceId: h.spaceId,
       score: h.score,
       createdAt: h.createdAt,
       memoryStatus: h.memoryStatus,
@@ -141,12 +163,15 @@ export const search = action({
 export const getByIds = action({
   args: {
     ids: v.array(v.id("thoughts")),
+    spaceIds: v.optional(v.array(v.id("spaces"))),
   },
   returns: v.array(
     v.object({
       _id: v.id("thoughts"),
       content: v.string(),
       metadata: thoughtMetadata,
+      userId: v.id("users"),
+      spaceId: v.id("spaces"),
       createdAt: v.number(),
       updatedAt: v.optional(v.number()),
       memoryStatus,
@@ -160,13 +185,15 @@ export const getByIds = action({
     }),
   ),
   handler: async (ctx, args) => {
-    const userId = await requireMcpUserId(ctx);
+    if (args.ids.length > 100) throw new Error("Too many thought IDs");
+    const principal = await requireMcpPrincipal(ctx);
     const docs: Array<{
       _id: Id<"thoughts">;
       _creationTime: number;
       content: string;
       metadata: Infer<typeof thoughtMetadata>;
       userId: string;
+      spaceId?: Id<"spaces">;
       updatedAt?: number;
       memoryStatus?: MemoryStatus;
       isCore?: boolean;
@@ -176,17 +203,23 @@ export const getByIds = action({
       supersededBy?: Id<"thoughts">;
       supersedes?: Array<Id<"thoughts">>;
       changeReason?: string;
-    }> = await ctx.runQuery(internal.models.thoughts.private.getByIds, {
-      ids: args.ids,
-    });
+    }> = await ctx.runQuery(
+      internal.models.thoughts.private.getByIdsAuthorized,
+      {
+        principal: principalRef(principal),
+        spaceIds: args.spaceIds,
+        ids: args.ids,
+      },
+    );
 
-    // Enforce ownership — drop any doc that doesn't belong to caller
     return docs
-      .filter((d) => d.userId === userId)
+      .filter((d) => d.spaceId !== undefined)
       .map((d) => ({
         _id: d._id,
         content: d.content,
         metadata: d.metadata,
+        userId: d.userId as Id<"users">,
+        spaceId: d.spaceId!,
         createdAt: d._creationTime,
         updatedAt: d.updatedAt,
         memoryStatus: d.memoryStatus ?? "current",
@@ -217,6 +250,7 @@ export const timeline = action({
         v.literal("reference"),
       ),
     ),
+    spaceIds: v.optional(v.array(v.id("spaces"))),
   },
   returns: v.array(
     v.object({
@@ -225,6 +259,8 @@ export const timeline = action({
       snippet: v.string(),
       type: v.string(),
       topics: v.array(v.string()),
+      userId: v.id("users"),
+      spaceId: v.id("spaces"),
       createdAt: v.number(),
       memoryStatus,
       isCore: v.optional(v.boolean()),
@@ -233,112 +269,49 @@ export const timeline = action({
     }),
   ),
   handler: async (ctx, args) => {
-    const userId = await requireMcpUserId(ctx);
+    const principal = await requireMcpPrincipal(ctx);
+    const ref = principalRef(principal);
     const MAX_WINDOW = 50;
     const before = Math.min(args.before ?? 5, MAX_WINDOW);
     const after = Math.min(args.after ?? 5, MAX_WINDOW);
-
-    if (args.seedId !== undefined && args.aroundMs !== undefined) {
-      throw new Error("Provide only one of seedId or aroundMs, not both");
-    }
-
-    // Resolve pivot timestamp. If seedId is provided, also keep the seed
-    // doc so we can splice it into the result (listAroundTime uses strict
-    // < / > bounds and excludes the anchor).
-    let aroundMs = args.aroundMs;
-    let seedDoc: {
-      _id: Id<"thoughts">;
-      _creationTime: number;
-      content: string;
-      metadata: Infer<typeof thoughtMetadata>;
-      memoryStatus?: MemoryStatus;
-      isCore?: boolean;
-      validFrom?: number;
-      validTo?: number;
-    } | null = null;
-    if (args.seedId) {
-      const seed = await ctx.runQuery(
-        internal.models.thoughts.private.getById,
-        { id: args.seedId },
-      );
-      if (!seed || seed.userId !== userId) {
-        throw new Error("Seed thought not found");
-      }
-      seedDoc = {
-        _id: seed._id,
-        _creationTime: seed._creationTime,
-        content: seed.content,
-        metadata: seed.metadata,
-        memoryStatus: seed.memoryStatus,
-        isCore: seed.isCore,
-        validFrom: seed.validFrom,
-        validTo: seed.validTo,
-      };
-      if (aroundMs === undefined) {
-        aroundMs = seed._creationTime;
-      }
-    }
-    if (aroundMs === undefined) {
-      throw new Error("Either seedId or aroundMs is required");
-    }
 
     const docs: Array<{
       _id: Id<"thoughts">;
       _creationTime: number;
       content: string;
       metadata: Infer<typeof thoughtMetadata>;
+      userId: Id<"users">;
+      spaceId?: Id<"spaces">;
       memoryStatus?: MemoryStatus;
       isCore?: boolean;
       validFrom?: number;
       validTo?: number;
-    }> = await ctx.runQuery(internal.models.thoughts.private.listAroundTime, {
-      userId,
-      aroundMs,
-      before,
-      after,
-      type: args.type,
-    });
+    }> = await ctx.runQuery(
+      internal.models.thoughts.private.listAroundTimeAuthorized,
+      {
+        principal: ref,
+        spaceIds: args.spaceIds,
+        seedId: args.seedId,
+        aroundMs: args.aroundMs,
+        before,
+        after,
+        type: args.type,
+      },
+    );
 
-    const mapped = docs.map((d) => ({
+    return docs.map((d) => ({
       _id: d._id,
       summary: d.metadata.summary,
       snippet: truncateSnippet(d.content),
       type: d.metadata.type,
       topics: d.metadata.topics,
+      userId: d.userId,
+      spaceId: d.spaceId!,
       createdAt: d._creationTime,
       memoryStatus: d.memoryStatus ?? "current",
       isCore: d.isCore,
       validFrom: d.validFrom,
       validTo: d.validTo,
     }));
-
-    // Splice the seed into its chronological position. listAroundTime
-    // returns results sorted ascending by _creationTime with strict < / >
-    // bounds, so the seed goes at the first index whose createdAt is
-    // greater than the seed's. If none, append.
-    if (seedDoc) {
-      const seedRow = {
-        _id: seedDoc._id,
-        summary: seedDoc.metadata.summary,
-        snippet: truncateSnippet(seedDoc.content),
-        type: seedDoc.metadata.type,
-        topics: seedDoc.metadata.topics,
-        createdAt: seedDoc._creationTime,
-        memoryStatus: seedDoc.memoryStatus ?? "current",
-        isCore: seedDoc.isCore,
-        validFrom: seedDoc.validFrom,
-        validTo: seedDoc.validTo,
-      };
-      let insertAt = mapped.length;
-      for (let i = 0; i < mapped.length; i++) {
-        if (mapped[i]!.createdAt > seedRow.createdAt) {
-          insertAt = i;
-          break;
-        }
-      }
-      mapped.splice(insertAt, 0, seedRow);
-    }
-
-    return mapped;
   },
 });

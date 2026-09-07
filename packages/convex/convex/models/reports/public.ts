@@ -156,7 +156,7 @@ export const updateInsightStatus = mutation({
     if (args.status === "dismissed" && args.dismissText) {
       await ctx.scheduler.runAfter(
         0,
-        internal.models.thoughts.actions.captureThought,
+        internal.models.thoughts.actions.captureThoughtTrustedPersonal,
         {
           userId,
           content: `[User Preference] User dismissed workflow insight about ${insight.category}. Reason: '${args.dismissText}'. Consider excluding similar recommendations from future workflow reports.`,

@@ -1,7 +1,8 @@
 import { action } from "../../_generated/server";
 import { internal as _internal } from "../../_generated/api";
 import { v } from "convex/values";
-import { requireMcpUserId } from "../../lib/mcpAuth";
+import { requireMcpPrincipal } from "../../lib/mcpAuth";
+import { principalRef } from "../../lib/spaces";
 import { insightCategory, projectActive } from "./validators";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -33,27 +34,10 @@ export const createReport = action({
     insightIds: v.array(v.id("insights")),
   }),
   handler: async (ctx, args) => {
-    const userId = await requireMcpUserId(ctx);
-    const { insights, ...reportFields } = args;
-
-    const reportId = await ctx.runMutation(
-      internal.models.reports.private.insertReport,
-      { ...reportFields, userId },
+    const principal = await requireMcpPrincipal(ctx);
+    return await ctx.runMutation(
+      internal.models.reports.private.insertReportWithInsightsAuthorized,
+      { principal: principalRef(principal), ...args },
     );
-
-    const insightIds = [];
-    for (const insight of insights) {
-      const insightId = await ctx.runMutation(
-        internal.models.reports.private.insertInsight,
-        {
-          reportId,
-          userId,
-          ...insight,
-        },
-      );
-      insightIds.push(insightId);
-    }
-
-    return { reportId, insightIds };
   },
 });

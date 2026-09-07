@@ -25,9 +25,9 @@ describe("web session boundary", () => {
 
   test("rejects unauthenticated callers", async () => {
     const t = convexTest(schema, modules);
-    await expect(t.query(api.models.thoughts.public.getStats, {})).rejects.toThrow(
-      "Not authenticated",
-    );
+    await expect(
+      t.query(api.models.thoughts.public.getStats, {}),
+    ).rejects.toThrow("Not authenticated");
   });
 
   test("accepts a dashboard session identity", async () => {
@@ -51,7 +51,11 @@ describe("web session boundary", () => {
     ).rejects.toThrow("Not authenticated");
 
     await expect(
-      mcp.mutation(api.models.apiKeys.public.create, { name: "escalated" }),
+      mcp.mutation(api.models.apiKeys.public.create, {
+        name: "escalated",
+        capabilities: ["read", "write"],
+        spaceIds: [],
+      }),
     ).rejects.toThrow("Not authenticated");
   });
 });

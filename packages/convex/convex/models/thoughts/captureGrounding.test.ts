@@ -14,7 +14,7 @@ describe("capture grounding", () => {
     // the grounding check returns before the embedding and admission calls,
     // which is also what keeps an ungrounded capture free.
     const result = await t.action(
-      internal.models.thoughts.actions.captureThought,
+      internal.models.thoughts.actions.captureThoughtTrustedPersonal,
       { userId, content: "Rowan started at Redwood Academy" },
     );
 

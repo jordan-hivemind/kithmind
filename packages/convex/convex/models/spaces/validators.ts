@@ -8,6 +8,12 @@ export const spaceRole = v.union(
   v.literal("reader"),
 );
 
+export const spaceOperation = v.union(
+  v.literal("read"),
+  v.literal("write"),
+  v.literal("ingest"),
+);
+
 export const spaceFields = {
   kind: spaceKind,
   name: v.string(),

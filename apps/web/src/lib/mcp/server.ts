@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { api } from "@repo/db/convex/_generated/api";
+import type { Id } from "@repo/db/convex/_generated/dataModel";
 import {
   blendRecallContext,
   coreLimitFor,
@@ -24,11 +25,29 @@ Capture narrative memory: Use capture_thought automatically for a single durable
 
 Admission: Direct, explicit user statements may be stored automatically when durable. Information found in email, calendars, Slack, GitHub, files, or other connectors is only a candidate: present a small atomic preview and obtain user confirmation before storage. Skip single mentions, inferred relationships, vendor/company lists, completed work, and derived values. If uncertain whether a candidate is explicit, durable, atomic, or useful later, ask rather than store.
 
+Spaces: Use list_spaces to discover authorized spaces. Read tools can narrow results with spaceIds; write tools accept a single spaceId. A returned userId is the author, not the owner of shared data. Use key me with kind person to refer to the current member in the selected space; do not substitute the deployment owner.
+
 This server cannot observe conversations or force tool calls; recall and capture remain client-mediated.`;
 
 const ISO_VALIDITY_PATTERN =
   /^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?(Z|[+-]\d{2}:\d{2}))?$/;
 const MAX_CAPTURE_CONTENT_CHARS = 2_000;
+const spaceIdSchema = z.string().trim().min(1).max(128);
+const readSpacesSchema = z
+  .array(spaceIdSchema)
+  .max(100)
+  .optional()
+  .describe(
+    "Optional space IDs from list_spaces. Omit or use an empty array to read all spaces allowed by this credential and current membership.",
+  );
+const writeSpaceSchema = spaceIdSchema
+  .optional()
+  .describe(
+    "Explicit destination from list_spaces. If omitted, use the configured default or Personal. Joining a shared space never changes this default.",
+  );
+function scopedReads(spaceIds?: string[]) {
+  return spaceIds === undefined ? {} : { spaceIds: spaceIds as Id<"spaces">[] };
+}
 
 /** Parse an explicit real-world validity date without using the server's timezone. */
 export function parseValidityTimestamp(value: string): number {
@@ -147,7 +166,7 @@ const entitySelectorSchema = z.object({
     .max(160)
     .optional()
     .describe(
-      "Stable lowercase identity key such as person:rowan. Reuse the same key across facts about this entity.",
+      "Stable lowercase identity key such as person:alex, or me for the current member in the selected space. Reuse the same key across facts about this entity.",
     ),
   kind: z.enum(["person", "organization", "project", "place", "other"]),
   name: z.string().trim().min(1).max(200),
@@ -177,6 +196,8 @@ const factValueSchema = z.discriminatedUnion("type", [
 
 type FactResult = {
   id: string;
+  spaceId?: string;
+  userId?: string;
   statement: string;
   subject: {
     id: string;
@@ -272,10 +293,26 @@ export function createMcpServer(convexAuthToken: string) {
     { instructions: SERVER_INSTRUCTIONS },
   );
 
+  const listSpacesTool = server.tool(
+    MCP_TOOL_NAMES.listSpaces,
+    "List the spaces this credential can currently read, with IDs, names and membership roles. Use these IDs to select a destination or narrow a search.",
+    {},
+    MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.listSpaces],
+    async () => {
+      const spaces = await convex.query(api.models.spaces.mcpQueries.list, {});
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(spaces, null, 2) },
+        ],
+      };
+    },
+  );
+
   const searchFactsTool = server.tool(
     MCP_TOOL_NAMES.searchFacts,
     "Search precise structured facts such as names, exact dates, relationships, providers, schools, employers, and stable preferences. Use this for direct factual questions and use search_thoughts for narrative decisions or project context. Current facts are returned by default. Set includeHistorical for what used to be true. Cite results as fact:<id>.",
     {
+      spaceIds: readSpacesSchema,
       query: z
         .string()
         .trim()
@@ -286,10 +323,10 @@ export function createMcpServer(convexAuthToken: string) {
       includeHistorical: z.boolean().default(false),
     },
     MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.searchFacts],
-    async ({ query, limit, includeHistorical }) => {
+    async ({ spaceIds, query, limit, includeHistorical }) => {
       const facts: FactResult[] = await convex.query(
         api.models.facts.mcpQueries.search,
-        { query, limit, includeHistorical },
+        { query, limit, includeHistorical, ...scopedReads(spaceIds) },
       );
       return {
         content: [
@@ -310,6 +347,7 @@ export function createMcpServer(convexAuthToken: string) {
     MCP_TOOL_NAMES.rememberFact,
     "Store one precise, independently changeable fact explicitly stated or confirmed by the user. Use one subject, one snake_case predicate, and one typed value. Use an entity value for relationships. Never store a derived age: store date_of_birth only if an exact date is known. Never use this directly for connector-derived or inferred information; preview those candidates and call only after user confirmation. Single-valued predicates preserve prior values as history; use changeKind corrected when the prior value was inaccurate.",
     {
+      spaceId: writeSpaceSchema,
       subject: entitySelectorSchema.describe("The entity this fact is about"),
       predicate: z
         .string()
@@ -370,6 +408,7 @@ export function createMcpServer(convexAuthToken: string) {
     },
     MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.rememberFact],
     async ({
+      spaceId,
       subject,
       predicate,
       value,
@@ -397,6 +436,7 @@ export function createMcpServer(convexAuthToken: string) {
         statement: string;
         operation: "stored" | "noop" | "superseded" | "corrected";
       } = await convex.mutation(api.models.facts.mcpActions.remember, {
+        spaceId: spaceId as Id<"spaces"> | undefined,
         subject,
         predicate,
         value: convertedValue,
@@ -432,6 +472,7 @@ export function createMcpServer(convexAuthToken: string) {
     MCP_TOOL_NAMES.searchThoughts,
     "Use this when you need to search durable memory by meaning and keyword. Pass the user's exact wording when possible, especially names, identifiers, and version strings. Current memories are searched by default. Set includeHistorical for questions about prior states, corrections, or how something changed. Returns a compact index; use `get_thoughts` to fetch full content. Cite sources as `thought:<id>`.",
     {
+      spaceIds: readSpacesSchema,
       query: z.string().describe("Natural language or keyword query"),
       type: z
         .enum([
@@ -458,9 +499,11 @@ export function createMcpServer(convexAuthToken: string) {
         ),
     },
     MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.searchThoughts],
-    async ({ query, type, limit, includeHistorical }) => {
+    async ({ spaceIds, query, type, limit, includeHistorical }) => {
       type IndexRow = {
         _id: string;
+        userId?: string;
+        spaceId?: string;
         summary: string;
         snippet: string;
         type: string;
@@ -477,6 +520,7 @@ export function createMcpServer(convexAuthToken: string) {
       const results: IndexRow[] = await convex.action(
         api.models.thoughts.mcpActions.search,
         {
+          ...scopedReads(spaceIds),
           query,
           type,
           limit,
@@ -502,6 +546,8 @@ export function createMcpServer(convexAuthToken: string) {
             text: JSON.stringify(
               results.map((r) => ({
                 id: r._id,
+                spaceId: r.spaceId,
+                userId: r.userId,
                 summary: r.summary,
                 snippet: r.snippet,
                 type: r.type,
@@ -537,6 +583,7 @@ export function createMcpServer(convexAuthToken: string) {
     MCP_TOOL_NAMES.recallContext,
     "Use this at the start of a relevant turn to recall precise facts and narrative context before answering. Pass the user's complete current message verbatim; do not paraphrase or normalize exact names, identifiers, project names, or version strings. Returns a bounded blend of current core facts/memories and relevant results. Set includeHistorical only for an explicitly historical question. Cite sources as fact:<id> or thought:<id>.",
     {
+      spaceIds: readSpacesSchema,
       query: z
         .string()
         .min(1)
@@ -556,9 +603,11 @@ export function createMcpServer(convexAuthToken: string) {
         ),
     },
     MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.recallContext],
-    async ({ query, limit, includeHistorical }) => {
+    async ({ spaceIds, query, limit, includeHistorical }) => {
       type IndexRow = {
         _id: string;
+        userId?: string;
+        spaceId?: string;
         summary: string;
         snippet: string;
         type: string;
@@ -574,6 +623,7 @@ export function createMcpServer(convexAuthToken: string) {
       };
       type CoreThought = {
         _id: string;
+        spaceId?: string;
         _creationTime: number;
         content: string;
         metadata: {
@@ -603,17 +653,21 @@ export function createMcpServer(convexAuthToken: string) {
         IndexRow[],
       ] = await Promise.all([
         convex.query(api.models.facts.mcpQueries.listCore, {
+          ...scopedReads(spaceIds),
           limit: coreLimit,
         }),
         convex.query(api.models.thoughts.mcpQueries.listCore, {
+          ...scopedReads(spaceIds),
           limit: coreLimit,
         }),
         convex.query(api.models.facts.mcpQueries.search, {
+          ...scopedReads(spaceIds),
           query,
           limit,
           includeHistorical,
         }),
         convex.action(api.models.thoughts.mcpActions.search, {
+          ...scopedReads(spaceIds),
           query,
           limit,
           includeHistorical,
@@ -654,6 +708,8 @@ export function createMcpServer(convexAuthToken: string) {
 
       type Thought = {
         _id: string;
+        userId?: string;
+        spaceId?: string;
         content: string;
         metadata: {
           type: string;
@@ -677,6 +733,7 @@ export function createMcpServer(convexAuthToken: string) {
         relevanceIndex.length === 0
           ? []
           : await convex.action(api.models.thoughts.mcpActions.getByIds, {
+              ...scopedReads(spaceIds),
               ids: relevanceIndex.map((row) => row._id) as never,
             });
       const thoughtById = new Map(
@@ -689,6 +746,8 @@ export function createMcpServer(convexAuthToken: string) {
       }));
       const coreContext = selectedCoreThoughts.map((thought) => ({
         id: thought._id,
+        spaceId: thought.spaceId,
+        userId: thought.userId,
         citation: `thought:${thought._id}`,
         content: truncateContext(thought.content),
         metadata: thought.metadata,
@@ -717,6 +776,8 @@ export function createMcpServer(convexAuthToken: string) {
         return [
           {
             id: thought._id,
+            spaceId: thought.spaceId,
+            userId: thought.userId,
             citation: `thought:${thought._id}`,
             content: truncateContext(thought.content),
             metadata: thought.metadata,
@@ -767,6 +828,7 @@ export function createMcpServer(convexAuthToken: string) {
     MCP_TOOL_NAMES.browseRecent,
     "Browse most recent current thoughts, optionally filtered by type or topic. Set includeHistorical to include superseded and corrected memories. Cite sources as `thought:<id>`.",
     {
+      spaceIds: readSpacesSchema,
       limit: z
         .number()
         .min(1)
@@ -791,9 +853,10 @@ export function createMcpServer(convexAuthToken: string) {
         .describe("Include superseded and retracted memories"),
     },
     MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.browseRecent],
-    async ({ limit, type, topic, includeHistorical }) => {
+    async ({ spaceIds, limit, type, topic, includeHistorical }) => {
       type Thought = {
         _id: string;
+        spaceId?: string;
         _creationTime: number;
         content: string;
         metadata: {
@@ -813,7 +876,7 @@ export function createMcpServer(convexAuthToken: string) {
       };
       const results: Thought[] = await convex.query(
         api.models.thoughts.mcpQueries.listByUser,
-        { limit, includeHistorical },
+        { limit, type, topic, includeHistorical, ...scopedReads(spaceIds) },
       );
 
       let filtered = results;
@@ -845,6 +908,8 @@ export function createMcpServer(convexAuthToken: string) {
             text: JSON.stringify(
               filtered.map((t) => ({
                 id: t._id,
+                spaceId: t.spaceId,
+                userId: t.userId,
                 content: t.content,
                 metadata: t.metadata,
                 memoryStatus: t.memoryStatus ?? "current",
@@ -877,6 +942,7 @@ export function createMcpServer(convexAuthToken: string) {
     MCP_TOOL_NAMES.getThoughts,
     "Fetch full content and lifecycle links for specific thought IDs. Use after `search_thoughts` and batch multiple IDs in one call. Treat current memories as authoritative; superseded memories were formerly current, while retracted memories were inaccurate.",
     {
+      spaceIds: readSpacesSchema,
       ids: z
         .array(z.string())
         .min(1)
@@ -884,9 +950,11 @@ export function createMcpServer(convexAuthToken: string) {
         .describe("Thought IDs (from a prior search_thoughts call)"),
     },
     MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.getThoughts],
-    async ({ ids }) => {
+    async ({ spaceIds, ids }) => {
       type Thought = {
         _id: string;
+        userId?: string;
+        spaceId?: string;
         content: string;
         metadata: {
           type: string;
@@ -908,7 +976,7 @@ export function createMcpServer(convexAuthToken: string) {
       };
       const results: Thought[] = await convex.action(
         api.models.thoughts.mcpActions.getByIds,
-        { ids: ids as never },
+        { ids: ids as never, ...scopedReads(spaceIds) },
       );
 
       if (results.length === 0) {
@@ -929,6 +997,8 @@ export function createMcpServer(convexAuthToken: string) {
             text: JSON.stringify(
               results.map((r) => ({
                 id: r._id,
+                spaceId: r.spaceId,
+                userId: r.userId,
                 content: r.content,
                 metadata: r.metadata,
                 createdAt: new Date(r.createdAt).toISOString(),
@@ -966,6 +1036,7 @@ export function createMcpServer(convexAuthToken: string) {
     MCP_TOOL_NAMES.timelineThoughts,
     "Fetch thoughts captured around a specific point in time. Provide either `seedId` (anchor on another thought) or `aroundMs` (epoch ms). Returns compact index rows ordered oldest→newest — use `get_thoughts` for full content. Cite sources as `thought:<id>`.",
     {
+      spaceIds: readSpacesSchema,
       seedId: z
         .string()
         .optional()
@@ -999,7 +1070,7 @@ export function createMcpServer(convexAuthToken: string) {
         .describe("Optional type filter"),
     },
     MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.timelineThoughts],
-    async ({ seedId, aroundMs, before, after, type }) => {
+    async ({ spaceIds, seedId, aroundMs, before, after, type }) => {
       if (!seedId && aroundMs === undefined) {
         return {
           content: [
@@ -1025,6 +1096,8 @@ export function createMcpServer(convexAuthToken: string) {
 
       type IndexRow = {
         _id: string;
+        userId?: string;
+        spaceId?: string;
         summary: string;
         snippet: string;
         type: string;
@@ -1038,6 +1111,7 @@ export function createMcpServer(convexAuthToken: string) {
       const results: IndexRow[] = await convex.action(
         api.models.thoughts.mcpActions.timeline,
         {
+          ...scopedReads(spaceIds),
           seedId: seedId as never,
           aroundMs,
           before,
@@ -1064,6 +1138,8 @@ export function createMcpServer(convexAuthToken: string) {
             text: JSON.stringify(
               results.map((r) => ({
                 id: r._id,
+                spaceId: r.spaceId,
+                userId: r.userId,
                 summary: r.summary,
                 snippet: r.snippet,
                 type: r.type,
@@ -1093,12 +1169,12 @@ export function createMcpServer(convexAuthToken: string) {
   const getStatsTool = server.tool(
     MCP_TOOL_NAMES.getStats,
     "Get overview statistics of what's stored in your brain",
-    {},
+    { spaceIds: readSpacesSchema },
     MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.getStats],
-    async () => {
+    async ({ spaceIds }) => {
       const stats = await convex.query(
         api.models.thoughts.mcpQueries.getStats,
-        {},
+        scopedReads(spaceIds),
       );
 
       return {
@@ -1114,8 +1190,9 @@ export function createMcpServer(convexAuthToken: string) {
 
   const captureThoughtTool = server.tool(
     MCP_TOOL_NAMES.captureThought,
-    "Store one atomic durable narrative memory: a decision with rationale, coherent project state, commitment, or recurring pattern whose parts change together. Use remember_fact instead for precise attributes and relationships. Never send biographies, dossiers, mixed people/projects, completed-task catalogs, activity logs, connector observations, assistant guesses, or inferred user facts. The admission gate may decline storage or request confirmation. The server deduplicates and preserves changed or corrected prior information as linked history.",
+    "Store one atomic durable narrative memory: a decision with rationale, coherent project state, commitment, or recurring pattern whose parts change together. Use remember_fact instead for precise attributes and relationships. Never send biographies, dossiers, mixed people/projects, completed-task catalogs, activity logs, connector observations, assistant guesses, or inferred user facts. The admission gate may decline storage or request confirmation. The server deduplicates and preserves changed or corrected prior information as linked history. Requires both read and write access to the destination space.",
     {
+      spaceId: writeSpaceSchema,
       content: z
         .string()
         .trim()
@@ -1166,6 +1243,7 @@ export function createMcpServer(convexAuthToken: string) {
     },
     MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.captureThought],
     async ({
+      spaceId,
       content,
       sourceType,
       sourceRef,
@@ -1197,6 +1275,7 @@ export function createMcpServer(convexAuthToken: string) {
       const result: CaptureResult = await convex.action(
         api.models.thoughts.mcpActions.capture,
         {
+          spaceId: spaceId as Id<"spaces"> | undefined,
           content,
           ...validity,
           isCore,
@@ -1342,6 +1421,7 @@ export function createMcpServer(convexAuthToken: string) {
     async ({ status, category, limit }) => {
       type Insight = {
         _id: string;
+        spaceId?: string;
         _creationTime: number;
         category: string;
         observation: string;
@@ -1770,6 +1850,7 @@ export function createMcpServer(convexAuthToken: string) {
   );
 
   const registeredTools = {
+    [MCP_TOOL_NAMES.listSpaces]: listSpacesTool,
     [MCP_TOOL_NAMES.searchFacts]: searchFactsTool,
     [MCP_TOOL_NAMES.rememberFact]: rememberFactTool,
     [MCP_TOOL_NAMES.searchThoughts]: searchThoughtsTool,
