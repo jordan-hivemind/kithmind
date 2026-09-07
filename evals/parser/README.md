@@ -15,8 +15,10 @@ requires macOS with `/usr/bin/sandbox-exec` available.
 
 ## Reproduce the authored fixtures
 
-The generator uses a vendored font and a dependency group that excludes the
-Docling runtime:
+The generator uses vendored fonts and hash-pinned canonical scan pixels, plus
+a dependency group that excludes the Docling runtime. The
+[scan asset note](assets/RASTER-SOURCE.md) explains how the scored image pixels
+are preserved across platforms:
 
 ```sh
 uv run --frozen --only-group fixture python generate_fixtures.py

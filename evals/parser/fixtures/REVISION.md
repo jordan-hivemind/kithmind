@@ -18,3 +18,11 @@ All text uses pinned vendored OFL fonts. The lab page includes BMP Unicode
 (`µ`, `é`) and the supplementary-plane globe (`🌍`). The later patient assertion
 therefore has different Python code-point and UTF-16 page offsets. The two scan
 PDFs contain only one raster image each and no native text layer.
+
+After the first scored run, Linux CI regenerated different bytes for the two
+raster PDFs while reproducing the four native PDFs exactly. The two already-scored PDF files, labels, and hashes were not changed.
+Their exact embedded RGB pixels were decoded into hashed canonical PNG assets,
+and the generator now embeds those pixels instead of rasterizing fonts at run
+time. The asset manifest preserves the authored rows and missing-value marker;
+generation rejects metadata or asset hash mismatches. This is a portability
+correction to fixture regeneration, not a corpus or scoring revision.

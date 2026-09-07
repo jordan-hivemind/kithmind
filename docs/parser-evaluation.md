@@ -19,7 +19,10 @@ committed at `667f80e` before scoring. The independently reviewed evaluator was
 frozen at `fb8d59f`. The first scored run is preserved in the
 [machine-readable report](../evals/parser/results/2026-09-07/report.json), with
 [retained normalized and lossless outputs](../evals/parser/results/2026-09-07/retained/).
-No labels or thresholds were changed after scoring.
+No labels or thresholds were changed after scoring. A later
+[generator portability correction](../evals/parser/fixtures/REVISION.md) replaced
+scan-font rasterization with canonical pixels; every scored PDF and label hash
+remains unchanged.
 
 ## Results
 

@@ -5,10 +5,11 @@ from __future__ import annotations
 
 from hashlib import sha256
 from io import BytesIO
-from json import dump
+from json import JSONDecodeError, dump, loads
 from pathlib import Path
+from typing import Any
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
@@ -25,6 +26,8 @@ TEXT_FONT_NAME = "NotoSans"
 SYMBOL_FONT_PATH = ASSETS / "NotoSansSymbols2-Regular.ttf"
 SYMBOL_FONT_SHA256 = "7d5fb73b7ca67a6798101741f5d280a3d016a56a197afcd4199dbb57b4b82a21"
 SYMBOL_FONT_NAME = "NotoSansSymbols2"
+RASTER_MANIFEST_PATH = ASSETS / "scan-rasters.v1.json"
+RASTER_MANIFEST_SHA256 = "5cb42cd8780b80346c74fc83ecdce613203c82835a293c9ce54e493a1db569dd"
 
 
 def _to_unicode_cmap(font_name: str, subset: list[int]) -> str:
@@ -59,7 +62,7 @@ def _to_unicode_cmap(font_name: str, subset: list[int]) -> str:
     )
 
 
-def require_pinned_fonts() -> None:
+def require_pinned_assets() -> dict[str, dict[str, Any]]:
     expected = {
         TEXT_FONT_PATH: TEXT_FONT_SHA256,
         SYMBOL_FONT_PATH: SYMBOL_FONT_SHA256,
@@ -72,11 +75,87 @@ def require_pinned_fonts() -> None:
         if sha256(font_bytes).hexdigest() != expected_hash:
             raise RuntimeError(f"vendored fixture font hash mismatch: {font_path.name}")
 
+    try:
+        manifest_bytes = RASTER_MANIFEST_PATH.read_bytes()
+    except OSError as exc:
+        raise RuntimeError(f"cannot read canonical raster manifest: {exc}") from exc
+    if sha256(manifest_bytes).hexdigest() != RASTER_MANIFEST_SHA256:
+        raise RuntimeError("canonical raster manifest hash mismatch")
+    try:
+        manifest = loads(manifest_bytes)
+    except (UnicodeDecodeError, JSONDecodeError) as exc:
+        raise RuntimeError("canonical raster manifest is not valid UTF-8 JSON") from exc
+    if (
+        not isinstance(manifest, dict)
+        or set(manifest) != {"schemaVersion", "rasters"}
+        or manifest.get("schemaVersion") != 1
+        or not isinstance(manifest.get("rasters"), list)
+        or len(manifest["rasters"]) != 2
+    ):
+        raise RuntimeError("canonical raster manifest has an unsupported shape")
+    rasters: dict[str, dict[str, Any]] = {}
+    expected_fields = {
+        "id",
+        "file",
+        "sha256",
+        "width",
+        "height",
+        "mode",
+        "authoredRows",
+        "missingValue",
+        "missingValueText",
+    }
+    for value in manifest["rasters"]:
+        if not isinstance(value, dict) or set(value) != expected_fields:
+            raise RuntimeError("canonical raster entry has an unsupported shape")
+        raster_id = value.get("id")
+        filename = value.get("file")
+        digest = value.get("sha256")
+        rows = value.get("authoredRows")
+        missing_value = value.get("missingValue")
+        missing_text = value.get("missingValueText")
+        if (
+            raster_id not in {"image-clear", "image-partial"}
+            or raster_id in rasters
+            or not isinstance(filename, str)
+            or Path(filename).name != filename
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or not isinstance(rows, list)
+            or not rows
+            or any(not isinstance(row, str) or not row for row in rows)
+            or not isinstance(missing_value, bool)
+            or missing_value != (missing_text is not None)
+            or (missing_text is not None and not isinstance(missing_text, str))
+            or value.get("width") != 1600
+            or value.get("height") != 2100
+            or value.get("mode") != "RGB"
+        ):
+            raise RuntimeError("canonical raster entry is invalid")
+        raster_path = ASSETS / filename
+        try:
+            raster_bytes = raster_path.read_bytes()
+        except OSError as exc:
+            raise RuntimeError(f"cannot read canonical raster: {filename}") from exc
+        if sha256(raster_bytes).hexdigest() != digest:
+            raise RuntimeError(f"canonical raster hash mismatch: {filename}")
+        try:
+            with Image.open(BytesIO(raster_bytes)) as image:
+                image.load()
+                if image.format != "PNG" or image.mode != "RGB" or image.size != (1600, 2100):
+                    raise RuntimeError(f"canonical raster format mismatch: {filename}")
+        except OSError as exc:
+            raise RuntimeError(f"cannot decode canonical raster: {filename}") from exc
+        rasters[raster_id] = value
+    if set(rasters) != {"image-clear", "image-partial"}:
+        raise RuntimeError("canonical raster manifest is incomplete")
+
     # ReportLab 4.4.3 emits non-BMP ToUnicode values as invalid odd-length hex.
     # Keep its deterministic subset embedding and supply a standards-compliant CMap.
     ttfonts.makeToUnicodeCMap = _to_unicode_cmap
     pdfmetrics.registerFont(TTFont(TEXT_FONT_NAME, TEXT_FONT_PATH))
     pdfmetrics.registerFont(TTFont(SYMBOL_FONT_NAME, SYMBOL_FONT_PATH))
+    return rasters
 
 
 def fixture_canvas(name: str) -> Canvas:
@@ -108,26 +187,20 @@ def write_text_pdf(name: str, pages: list[list[str]]) -> None:
     canvas.save()
 
 
-def write_image_pdf(name: str, rows: list[str], *, missing_value: bool = False) -> None:
-    image = Image.new("RGB", (1600, 2100), "white")
-    draw = ImageDraw.Draw(image)
-    font = ImageFont.truetype(str(TEXT_FONT_PATH), 42)
-    y = 120
-    for row in rows:
-        draw.text((110, y), row, fill="black", font=font)
-        y += 95
-    if missing_value:
-        draw.rectangle((105, y + 40, 1450, y + 180), fill=(230, 230, 230))
-        draw.text(
-            (110, y + 60),
-            "TOTAL: [value intentionally unavailable]",
-            fill=(145, 145, 145),
-            font=font,
-        )
-
-    encoded = BytesIO()
-    image.save(encoded, format="PNG", compress_level=9)
-    encoded.seek(0)
+def write_image_pdf(
+    name: str,
+    rows: list[str],
+    raster: dict[str, Any],
+    *,
+    missing_value_text: str | None = None,
+) -> None:
+    if (
+        raster.get("id") != name
+        or raster.get("authoredRows") != rows
+        or raster.get("missingValueText") != missing_value_text
+    ):
+        raise RuntimeError(f"authored raster metadata mismatch: {name}")
+    encoded = BytesIO((ASSETS / raster["file"]).read_bytes())
     canvas = fixture_canvas(f"{name}.pdf")
     canvas.drawImage(
         ImageReader(encoded),
@@ -318,7 +391,7 @@ def write_labels() -> None:
 
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
-    require_pinned_fonts()
+    rasters = require_pinned_assets()
     write_financial_pdf()
     write_text_pdf(
         "lab-report-unicode.pdf",
@@ -370,11 +443,13 @@ def main() -> None:
             "Amount due: USD 42.00",
             "Reference: CLEAR-001",
         ],
+        rasters["image-clear"],
     )
     write_image_pdf(
         "image-partial",
         ["PARTIAL IMAGE SCAN", "Reference: PARTIAL-001"],
-        missing_value=True,
+        rasters["image-partial"],
+        missing_value_text="TOTAL: [value intentionally unavailable]",
     )
     write_labels()
 

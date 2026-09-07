@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from PIL import Image
 from pypdf import PdfReader
 from pypdf.generic import ContentStream
 
@@ -24,6 +25,24 @@ ASSET_HASHES = {
     "NotoSansSymbols2-Regular.ttf": "7d5fb73b7ca67a6798101741f5d280a3d016a56a197afcd4199dbb57b4b82a21",
     "OFL-NotoSans.txt": "cee9892f9f0cc8fe882c9e9537ee6a89621d86ee7ceaf70b02e2b2b1c25c061a",
     "OFL-NotoSansSymbols2.txt": "b118dd41337806a5d4797052c77caf3bd096aed783e5eb21b4d11154351e1ac0",
+    "image-clear-raster.png": "7955240518de843118da2606f3f04ee264b0af375c65774db242fcce671253ee",
+    "image-partial-raster.png": "35f2b6c95c2d05c408432493cb71632366c697e75e5dedd901c4173a868917ea",
+    "scan-rasters.v1.json": "5cb42cd8780b80346c74fc83ecdce613203c82835a293c9ce54e493a1db569dd",
+}
+RASTER_METADATA = {
+    "image-clear": {
+        "rows": [
+            "SYNTHETIC CLEAR IMAGE SCAN",
+            "Invoice 2026-05",
+            "Amount due: USD 42.00",
+            "Reference: CLEAR-001",
+        ],
+        "missing": None,
+    },
+    "image-partial": {
+        "rows": ["PARTIAL IMAGE SCAN", "Reference: PARTIAL-001"],
+        "missing": "TOTAL: [value intentionally unavailable]",
+    },
 }
 
 
@@ -113,9 +132,46 @@ class FixtureContractTest(unittest.TestCase):
                 ]
                 self.assertEqual(len(images), 1)
 
-    def test_vendored_font_and_license_hashes(self):
+    def test_vendored_asset_hashes(self):
         for filename, expected in ASSET_HASHES.items():
             self.assertEqual(digest(ASSETS / filename), expected)
+
+    def test_canonical_scan_rasters_match_metadata_and_frozen_pdf_pixels(self):
+        manifest = json.loads(
+            (ASSETS / "scan-rasters.v1.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(manifest["schemaVersion"], 1)
+        self.assertEqual(
+            {raster["id"] for raster in manifest["rasters"]}, set(RASTER_METADATA)
+        )
+        for raster in manifest["rasters"]:
+            metadata = RASTER_METADATA[raster["id"]]
+            self.assertEqual(raster["authoredRows"], metadata["rows"])
+            self.assertEqual(raster["missingValueText"], metadata["missing"])
+            self.assertEqual(raster["missingValue"], metadata["missing"] is not None)
+            with Image.open(ASSETS / raster["file"]) as source:
+                source.load()
+                source_mode = source.mode
+                source_size = source.size
+                source_pixels = source.tobytes()
+            embedded = PdfReader(
+                str(FIXTURES / f"{raster['id']}.pdf")
+            ).pages[0].images[0].image
+            self.assertEqual(source_mode, raster["mode"])
+            self.assertEqual(source_size, (raster["width"], raster["height"]))
+            self.assertEqual(embedded.mode, source_mode)
+            self.assertEqual(embedded.size, source_size)
+            self.assertEqual(embedded.tobytes(), source_pixels)
+
+    def test_generator_rejects_metadata_that_does_not_match_frozen_raster(self):
+        generator = load_generator()
+        rasters = generator.require_pinned_assets()
+        with self.assertRaisesRegex(RuntimeError, "authored raster metadata mismatch"):
+            generator.write_image_pdf(
+                "image-clear",
+                ["changed input"],
+                rasters["image-clear"],
+            )
 
     def test_generator_reproduces_committed_bytes_without_mutating_them(self):
         generator = load_generator()
