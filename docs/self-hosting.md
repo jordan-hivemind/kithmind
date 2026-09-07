@@ -267,3 +267,19 @@ when its build artifacts were created with Preview-scoped variables.
 | Clients must authorize again unexpectedly  | Check whether `MCP_OAUTH_ENCRYPTION_KEY` changed                                                            |
 | Automatic capture is inconsistent          | Verify the client enabled the MCP server and inspect whether it called `remember_fact` or `capture_thought` |
 | Bootstrap creates broad or noisy memories  | Update/reinstall the bundled plugin, rerun `/brain-init`, and approve only the atomic preview               |
+
+## Embedding provider configuration
+
+Configure embeddings on the Convex backend. The default remains OpenAI
+`text-embedding-3-small` with 1,536 dimensions and `OPENAI_API_KEY`. Optional
+`BRAIN_EMBED_API_KEY` takes precedence. A custom `BRAIN_EMBED_ENDPOINT` requires
+explicit `BRAIN_EMBED_PROVIDER_ID` and `BRAIN_EMBED_MODEL_REVISION`; it never
+receives the default OpenAI key. `BRAIN_EMBED_MODEL` can select a compatible
+model and `BRAIN_EMBED_DIMENSIONS` must be `1536` for the current index.
+
+Changing identity requires a complete staged embedding generation before
+activation. Existing spaces need the baseline migration before canonical
+semantic recall can use their existing vectors. Keyword reads remain available
+when the provider or profile is unavailable. See the
+[embedding contract](plans/2026-09-06-embedding-contract.md) for migration,
+operator rebuild commands, limitations, and credential handling.

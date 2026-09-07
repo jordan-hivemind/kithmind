@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-06
 
-**Status:** P1-1 and P1-2 are implemented and deployed, including required ownership fields and scoped credentials. P1-3 source/evidence/job primitives and indexed read tools are implemented with synthetic integration tests. Family lifecycle, typed records, ingestion, embeddings, and installation acceptance remain pending.
+**Status:** P1-1 and P1-2 are implemented and deployed, including required ownership fields and scoped credentials. P1-3 source/evidence/job primitives and indexed read tools are implemented with synthetic integration tests. P1-4 versioned embeddings, semantic document reads, provider configuration, and keyword fallback are implemented with synthetic migration and lifecycle tests. Family lifecycle, typed records, ingestion, and installation acceptance remain pending.
 
 **Parent:** [Kith Mind architecture](./2026-09-06-architecture.md)
 
@@ -215,7 +215,7 @@ P1-1, P1-3, and P1-7 add the following logical records. Validators live beside t
 
 These are logical records, not a requirement to create an otherwise empty table for every label. Closely related metadata may be colocated where that preserves the same identities, indexes, retention, and authorization behavior. Convex does not enforce unique constraints, so every create/upsert mutation performs an indexed lookup and is covered by an idempotent-concurrency test. Denormalized `spaceId` fields are validated against their parents on write; they exist to make authorization filters indexable.
 
-Documents use state from their processing generation rather than a second conflicting lifecycle. Chunks include `spaceId`, `processingGenerationId`, document ID, ordinal, text, evidence-span IDs, embedding fingerprint, and embedding generation ID. Text chunks may cross page boundaries only by citing every covered span.
+Documents use state from their processing generation rather than a second conflicting lifecycle. Chunks include `spaceId`, `processingGenerationId`, document ID, ordinal, text, and evidence-span IDs. Canonical vectors live in a separate `embeddingVectors` table with fingerprint, embedding generation, target ID, and input hash. This lets profile generations coexist without overwriting active vectors. Text chunks may cross page boundaries only by citing every covered span.
 
 ## 4. Migration strategy
 
@@ -282,6 +282,9 @@ P1-4 exposes this configuration through `BRAIN_EMBED_ENDPOINT`, `BRAIN_EMBED_PRO
 P1-4 centralizes embedding calls behind the existing helper and adds strict response length/type checks, but keeps current default behavior. Keyword document search and `query_records` never depend on embeddings. Hybrid recall catches embedding unavailability and returns exact/keyword results with `vectorStatus: unavailable` rather than failing the whole answer.
 
 A later migration creates a staged embedding profile and generation, embeds every currently active eligible row, checks expected versus completed counts, and only then flips the space's active embedding profile in one mutation. Queries never combine fingerprints. Failed or partial generations remain inactive; the old profile remains queryable until the flip succeeds. Cleanup happens after validation and does not delete source pages or evidence.
+
+The concrete provider, vector storage, bounded operator rebuild, baseline migration,
+and fallback behavior are documented in the [embedding contract](./2026-09-06-embedding-contract.md).
 
 ## 8. Bounded Phase 1 ingest
 

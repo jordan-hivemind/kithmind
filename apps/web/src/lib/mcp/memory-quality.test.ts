@@ -198,59 +198,62 @@ describe("MCP memory quality contract", () => {
       .mockResolvedValueOnce(coreThoughts)
       .mockResolvedValueOnce([]);
     convexMocks.action
-      .mockResolvedValueOnce([
-        {
-          _id: "core-preference",
-          summary: "Communication preference",
-          snippet: "Alex prefers concise, direct answers.",
-          type: "person_note",
-          topics: ["communication"],
-          score: 0.03,
-          createdAt: Date.UTC(2026, 7, 1),
-          memoryStatus: "current",
-          isCore: true,
-        },
-        {
-          _id: "atlas-version",
-          summary: "Atlas Memory release",
-          snippet: "Atlas Memory v2.7.1 addresses ATLAS-184.",
-          type: "reference",
-          topics: ["Atlas Memory"],
-          score: 0.02,
-          createdAt: Date.UTC(2026, 7, 2),
-          memoryStatus: "current",
-        },
-        {
-          _id: "atlas-migration",
-          summary: "Atlas migration",
-          snippet: "ATLAS-184 tracks the active migration.",
-          type: "task",
-          topics: ["Atlas Memory"],
-          score: 0.019,
-          createdAt: Date.UTC(2026, 7, 3),
-          memoryStatus: "current",
-        },
-        {
-          _id: "atlas-older-release",
-          summary: "Atlas prior release",
-          snippet: "Atlas Memory v2.7.0 preceded v2.7.1.",
-          type: "reference",
-          topics: ["Atlas Memory"],
-          score: 0.018,
-          createdAt: Date.UTC(2026, 6, 15),
-          memoryStatus: "current",
-        },
-        {
-          _id: "atlas-owner",
-          summary: "Atlas project owner",
-          snippet: "Noam owns Atlas Memory.",
-          type: "person_note",
-          topics: ["Atlas Memory"],
-          score: 0.017,
-          createdAt: Date.UTC(2026, 6, 10),
-          memoryStatus: "current",
-        },
-      ])
+      .mockResolvedValueOnce({
+        vectorStatus: "ready",
+        results: [
+          {
+            _id: "core-preference",
+            summary: "Communication preference",
+            snippet: "Alex prefers concise, direct answers.",
+            type: "person_note",
+            topics: ["communication"],
+            score: 0.03,
+            createdAt: Date.UTC(2026, 7, 1),
+            memoryStatus: "current",
+            isCore: true,
+          },
+          {
+            _id: "atlas-version",
+            summary: "Atlas Memory release",
+            snippet: "Atlas Memory v2.7.1 addresses ATLAS-184.",
+            type: "reference",
+            topics: ["Atlas Memory"],
+            score: 0.02,
+            createdAt: Date.UTC(2026, 7, 2),
+            memoryStatus: "current",
+          },
+          {
+            _id: "atlas-migration",
+            summary: "Atlas migration",
+            snippet: "ATLAS-184 tracks the active migration.",
+            type: "task",
+            topics: ["Atlas Memory"],
+            score: 0.019,
+            createdAt: Date.UTC(2026, 7, 3),
+            memoryStatus: "current",
+          },
+          {
+            _id: "atlas-older-release",
+            summary: "Atlas prior release",
+            snippet: "Atlas Memory v2.7.0 preceded v2.7.1.",
+            type: "reference",
+            topics: ["Atlas Memory"],
+            score: 0.018,
+            createdAt: Date.UTC(2026, 6, 15),
+            memoryStatus: "current",
+          },
+          {
+            _id: "atlas-owner",
+            summary: "Atlas project owner",
+            snippet: "Noam owns Atlas Memory.",
+            type: "person_note",
+            topics: ["Atlas Memory"],
+            score: 0.017,
+            createdAt: Date.UTC(2026, 6, 10),
+            memoryStatus: "current",
+          },
+        ],
+      })
       .mockResolvedValueOnce([
         {
           _id: "atlas-version",
@@ -298,7 +301,7 @@ describe("MCP memory quality contract", () => {
       expect(firstContent).toMatchObject({ type: "text" });
       const context = JSON.parse(
         (firstContent as { type: "text"; text: string }).text,
-      ) as Array<{ id: string; source: string; content: string }>;
+      ).context as Array<{ id: string; source: string; content: string }>;
 
       expect(context).toEqual([
         expect.objectContaining({
@@ -340,7 +343,10 @@ describe("MCP memory quality contract", () => {
 
   test("guides an empty brain to initialization without inventing a citation", async () => {
     convexMocks.query.mockResolvedValue([]);
-    convexMocks.action.mockResolvedValue([]);
+    convexMocks.action.mockResolvedValue({
+      results: [],
+      vectorStatus: "unavailable",
+    });
     const server = createMcpServer("test-convex-auth-token");
     const client = new Client({ name: "memory-quality-test", version: "1" });
     const [clientTransport, serverTransport] =
@@ -359,7 +365,12 @@ describe("MCP memory quality contract", () => {
       expect((result as { content?: unknown[] }).content).toEqual([
         {
           type: "text",
-          text: "Run /brain-init to add initial context, then try recall_context again.",
+          text: JSON.stringify({
+            context: [],
+            vectorStatus: "unavailable",
+            message:
+              "Run /brain-init to add initial context, then try recall_context again.",
+          }),
         },
       ]);
       expect(convexMocks.action).toHaveBeenCalledTimes(1);

@@ -1,45 +1,57 @@
 import { internalAction } from "../../_generated/server";
 import { v } from "convex/values";
+import {
+  BASELINE_EMBEDDING_DIMENSIONS,
+  embeddingProfile,
+  fingerprintEmbeddingConfig,
+  loadEmbeddingConfig,
+  requestEmbedding,
+} from "../../lib/embeddingProvider";
 
-export const EMBEDDING_DIMENSIONS = 1536;
+export const EMBEDDING_DIMENSIONS = BASELINE_EMBEDDING_DIMENSIONS;
 
+const embeddingProfileValidator = v.object({
+  protocol: v.string(),
+  providerId: v.string(),
+  model: v.string(),
+  modelRevision: v.string(),
+  dimensions: v.number(),
+  normalization: v.string(),
+  preprocessing: v.string(),
+});
+
+export const getEmbeddingConfigurationIdentity = internalAction({
+  args: {},
+  returns: v.object({
+    fingerprint: v.string(),
+    profile: embeddingProfileValidator,
+  }),
+  handler: async () => {
+    const config = loadEmbeddingConfig(process.env);
+    return {
+      fingerprint: await fingerprintEmbeddingConfig(config),
+      profile: embeddingProfile(config),
+    };
+  },
+});
+
+export const generateEmbeddingWithMetadata = internalAction({
+  args: { text: v.string() },
+  returns: v.object({
+    vector: v.array(v.float64()),
+    fingerprint: v.string(),
+    profile: embeddingProfileValidator,
+  }),
+  handler: async (_ctx, args) =>
+    await requestEmbedding(args.text, loadEmbeddingConfig(process.env)),
+});
+
+/** Compatibility adapter for existing evaluation and trusted fixture callers. */
 export const generateEmbedding = internalAction({
   args: { text: v.string() },
   returns: v.array(v.float64()),
   handler: async (_ctx, args): Promise<number[]> => {
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) throw new Error("OPENAI_API_KEY is not configured");
-
-    const response = await fetch("https://api.openai.com/v1/embeddings", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "text-embedding-3-small",
-        input: args.text,
-      }),
-    });
-
-    if (!response.ok) {
-      throw new Error(`OpenAI embedding failed: ${response.statusText}`);
-    }
-
-    const data = (await response.json()) as {
-      data?: Array<{ embedding?: unknown }>;
-    };
-    const embedding = data.data?.[0]?.embedding;
-    if (
-      !Array.isArray(embedding) ||
-      embedding.length !== EMBEDDING_DIMENSIONS ||
-      !embedding.every(
-        (value): value is number =>
-          typeof value === "number" && Number.isFinite(value),
-      )
-    ) {
-      throw new Error("OpenAI embedding returned an invalid vector");
-    }
-    return embedding;
+    return (await requestEmbedding(args.text, loadEmbeddingConfig(process.env)))
+      .vector;
   },
 });

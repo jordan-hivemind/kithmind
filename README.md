@@ -19,6 +19,9 @@ transport and the background worker are still being implemented. The public arch
 - Source revisions, immutable evidence, processing leases, and atomic publication
   primitives. Indexed read tools are `search_documents`, `get_document`, and
   `list_sources`. See the [processing contract](docs/plans/2026-09-06-source-processing-contract.md).
+- Versioned embedding profiles and generations, compatible semantic document
+  search, and explicit keyword fallback. See the
+  [embedding contract](docs/plans/2026-09-06-embedding-contract.md).
 - A Next.js web application, Convex backend, and a Claude Code plugin source.
 
 Captures are client-mediated: an MCP server cannot observe a conversation
@@ -32,7 +35,7 @@ The following are architecture commitments, not current product features:
 
 - Family membership, invitations, person linking, and source configuration in
   the desktop settings workflow.
-- Public text ingestion, semantic document search, and exact typed lab and
+- Public text ingestion and exact typed lab and
   service queries.
 - A Mac-hosted daemon, filesystem and service connectors, extraction
   playbooks, and background ingestion.

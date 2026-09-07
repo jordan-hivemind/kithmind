@@ -29,6 +29,33 @@ export const memorySourceType = v.union(
   v.literal("assistant_commitment"),
 );
 
+export const vectorStatus = v.union(
+  v.literal("ready"),
+  v.literal("unavailable"),
+);
+
+export const thoughtSearchResult = v.object({
+  _id: v.id("thoughts"),
+  content: v.string(),
+  metadata: thoughtMetadata,
+  userId: v.id("users"),
+  spaceId: v.id("spaces"),
+  score: v.float64(),
+  createdAt: v.number(),
+  memoryStatus,
+  isCore: v.optional(v.boolean()),
+  validFrom: v.optional(v.number()),
+  validTo: v.optional(v.number()),
+  supersededAt: v.optional(v.number()),
+  changeReason: v.optional(v.string()),
+});
+
+export const activeThoughtEmbeddingTarget = v.object({
+  spaceId: v.id("spaces"),
+  embeddingGenerationId: v.id("embeddingGenerations"),
+  fingerprint: v.string(),
+});
+
 export const thoughtLifecycleFields = {
   // Core memories are a small, explicitly selected set suitable for always-on
   // context. Legacy memories without the marker are treated as non-core.

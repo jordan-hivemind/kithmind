@@ -225,6 +225,10 @@ export async function searchDocuments(
     limit?: number;
     includeHistorical?: boolean;
   },
+  semantic?: {
+    chunkIds: readonly Id<"chunks">[];
+    vectorStatus: "ready" | "unavailable";
+  },
 ) {
   validateSpaces(spaceIds);
   validateTimeRange(args.from, args.to);
@@ -242,7 +246,11 @@ export async function searchDocuments(
       .map((spaceId) => ({ spaceId, publicationState })),
   );
   let candidateOverflow = false;
-  let remainingCandidates = MAX_SEARCH_CANDIDATES;
+  const semanticReady = semantic?.vectorStatus === "ready";
+  const keywordBudget = semanticReady
+    ? MAX_SEARCH_CANDIDATES / 2
+    : MAX_SEARCH_CANDIDATES;
+  let remainingCandidates = keywordBudget;
   const candidates: Array<{
     chunk: Doc<"chunks">;
     publicationState: PublicationState;
@@ -277,6 +285,29 @@ export async function searchDocuments(
         rank: partitionIndex * MAX_SEARCH_CANDIDATES + rank,
       })),
     );
+  }
+  if (semanticReady) {
+    const ranks = new Map(
+      candidates.map((candidate) => [
+        candidate.chunk._id,
+        1 / (60 + candidate.rank + 1),
+      ]),
+    );
+    const seen = new Set(candidates.map((candidate) => candidate.chunk._id));
+    const ids = [...new Set(semantic.chunkIds)].slice(0, keywordBudget);
+    candidateOverflow ||= semantic.chunkIds.length > keywordBudget;
+    for (const [rank, id] of ids.entries()) {
+      const chunk = await ctx.db.get(id);
+      if (!chunk || chunk.publicationState !== "active") continue;
+      ranks.set(id, (ranks.get(id) ?? 0) + 1 / (60 + rank + 1));
+      if (!seen.has(id)) {
+        candidates.push({ chunk, publicationState: "active", rank: 0 });
+        seen.add(id);
+      }
+    }
+    for (const candidate of candidates) {
+      candidate.rank = -(ranks.get(candidate.chunk._id) ?? 0);
+    }
   }
   candidates.sort(
     (left, right) =>
@@ -362,7 +393,9 @@ export async function searchDocuments(
       sourceAvailability: chain.item.lifecycle,
       originalLinkAvailable: chain.item.originalLinkAvailable,
       retainedTextAvailable: true,
-      vectorStatus: "unavailable" as const,
+      vectorStatus: semanticReady
+        ? ("ready" as const)
+        : ("unavailable" as const),
       citations: citationResult.citations,
       citationsTruncated: citationResult.citationsTruncated,
     });
@@ -370,7 +403,7 @@ export async function searchDocuments(
   const truncated = results.length > limit;
   return {
     results: results.slice(0, limit),
-    vectorStatus: "unavailable" as const,
+    vectorStatus: semanticReady ? ("ready" as const) : ("unavailable" as const),
     partial: candidateOverflow || citationPartial,
     truncated,
   };
