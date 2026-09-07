@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -49,6 +52,25 @@ function runCli(arguments_) {
     },
   );
 }
+
+test("self-hosting preflight runs when invoked through a symlink", () => {
+  const directory = mkdtempSync(join(tmpdir(), "kithmind-preflight-"));
+  const script = fileURLToPath(
+    new URL("./check-self-hosting.mjs", import.meta.url),
+  );
+  const link = join(directory, "check-self-hosting.mjs");
+  try {
+    symlinkSync(realpathSync(script), link);
+    const result = spawnSync(process.execPath, [link, "--web"], {
+      encoding: "utf8",
+      env: { ...process.env, ...validWebEnvironment() },
+    });
+    assert.equal(result.status, 0);
+    assert.match(result.stdout, /web: ready/u);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 test("web preflight accepts complete configuration", () => {
   assert.deepEqual(validateWebEnvironment(validWebEnvironment()), []);
