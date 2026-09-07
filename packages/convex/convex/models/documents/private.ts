@@ -34,7 +34,10 @@ export const searchWithCandidates = internalQuery({
     if (args.targets.length > 32 || args.embeddingVectorIds.length > 32) {
       throw new Error("Document vector candidates exceed their bound");
     }
-    let ready = spaceIds.length > 0 && args.targets.length === spaceIds.length;
+    let ready =
+      args.searchMode !== "keyword" &&
+      spaceIds.length > 0 &&
+      args.targets.length === spaceIds.length;
     const fingerprint = args.targets[0]?.fingerprint;
     const targetSpaces = new Set(args.targets.map((target) => target.spaceId));
     ready &&= targetSpaces.size === spaceIds.length;

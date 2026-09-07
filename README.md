@@ -33,10 +33,22 @@ are still being implemented. The public architecture and staged plan are in
   [capture contract](docs/plans/2026-09-06-inline-ingestion-contract.md).
 - A Next.js web application, Convex backend, and a Claude Code plugin source.
 
+For local development, run `npx convex dev --once` from `packages/convex`,
+configure Convex Auth with
+`pnpm --filter @repo/db exec auth --web-server-url http://localhost:3000`,
+then copy `apps/web/.env.example` to the ignored `apps/web/.env.local`, set the
+development Convex URL, and run `pnpm dev`. The provider-free synthetic smoke
+test is `pnpm demo:brain`; see [self-hosting](docs/self-hosting.md) for its
+four environment inputs, authentication setup, and the family-space acceptance
+flow.
+
+Prerequisites: Node.js 22 or newer and pnpm 10.20. Public-clone setup does not
+require private files or owner credentials.
+
 Captures are client-mediated: an MCP server cannot observe a conversation
 unless a connected client calls a capture tool. See
 [`docs/self-hosting.md`](./docs/self-hosting.md) for the current deployment
-requirements, including server-side OpenAI and Anthropic API credentials.
+requirements and optional server-side OpenAI and Anthropic API credentials.
 
 ## Planned work
 

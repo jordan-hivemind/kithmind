@@ -336,9 +336,15 @@ export function createMcpServer(convexAuthToken: string) {
 
   const searchDocumentsTool = server.tool(
     MCP_TOOL_NAMES.searchDocuments,
-    "Search indexed source documents using compatible semantic vectors and keywords. Returns retained citations, vector availability and freshness flags. Falls back to keywords when vectors are unavailable. Empty results are not proof of complete coverage.",
+    "Search indexed source documents. searchMode defaults to hybrid, which uses compatible semantic vectors and keywords and falls back to keywords when vectors are unavailable. Use keyword to bypass embedding providers and vector retrieval. Returns retained citations, vector availability and freshness flags. Empty results are not proof of complete coverage.",
     {
       query: z.string().min(1).max(500),
+      searchMode: z
+        .enum(["keyword", "hybrid"])
+        .optional()
+        .describe(
+          "keyword bypasses embedding providers and vector retrieval; hybrid is the default",
+        ),
       spaceIds: readSpacesSchema,
       docType: z.string().min(1).max(100).optional(),
       from: z.number().finite().optional(),
