@@ -1,0 +1,150 @@
+{
+  "files": [
+    {
+      "bytes": 2036,
+      "path": "MODEL-LICENSES.json",
+      "sha256": "ca94fe30ab7780bdfc3d3273dffde68927e8757a1c7dc33d564b3fec1540310a"
+    },
+    {
+      "bytes": 9929594,
+      "path": "RapidOcr/PP-OCRv6_det_small.onnx",
+      "sha256": "090f04abcd9d9a7498bc4ebf677e4cb9bdce1fe4197ddb7e529f1ef44e1ff94f"
+    },
+    {
+      "bytes": 21234383,
+      "path": "RapidOcr/PP-OCRv6_rec_small.onnx",
+      "sha256": "6f327246b50388f3c176ae304bd95767ea6dc0c9ae92153ef8cbe210b3c14884"
+    },
+    {
+      "bytes": 585532,
+      "path": "RapidOcr/ch_ppocr_mobile_v2.0_cls_mobile.onnx",
+      "sha256": "e47acedf663230f8863ff1ab0e64dd2d82b838fceb5957146dab185a89d6215c"
+    },
+    {
+      "bytes": 1519,
+      "path": "docling-project--docling-layout-heron/.gitattributes",
+      "sha256": "11ad7efa24975ee4b0c3c3a38ed18737f0658a5f75a0a96787b576a78a023361"
+    },
+    {
+      "bytes": 3219,
+      "path": "docling-project--docling-layout-heron/README.md",
+      "sha256": "175700839bc7808eac6af1d0c23e4f483606ab2276fe01122f4093e61a1a65b6"
+    },
+    {
+      "bytes": 3268,
+      "path": "docling-project--docling-layout-heron/config.json",
+      "sha256": "fdea30805ce2f5666b147fca941dcdd27ad468e27d6ed21902207d3da056a97d"
+    },
+    {
+      "bytes": 96925,
+      "path": "docling-project--docling-layout-heron/docling_heron_400.png",
+      "sha256": "e7f78610372b32a7938e480d2c7fa1c3037ee170bd82282a5bd026232f6e6f9e"
+    },
+    {
+      "bytes": 171658996,
+      "path": "docling-project--docling-layout-heron/model.safetensors",
+      "sha256": "00333a43451945aaf89db8ca9c0a17e75d1537c17db60fdb91aa95f4c7929e0c"
+    },
+    {
+      "bytes": 444,
+      "path": "docling-project--docling-layout-heron/preprocessor_config.json",
+      "sha256": "cd38cd59999e7a95d68e487fbe5132df3d4e5c32a0836add57e6126ba0c4eaf1"
+    },
+    {
+      "bytes": 1905,
+      "path": "docling-project--docling-models/.gitattributes",
+      "sha256": "360aba3ff7ce75396f13f0a77925fe9e79997e8d4bac064595ebb00c82700386"
+    },
+    {
+      "bytes": 5180,
+      "path": "docling-project--docling-models/.gitignore",
+      "sha256": "b44b404189eaff3631c470946e7350c2e88cead304d332a8ad50325e6f56e95d"
+    },
+    {
+      "bytes": 3413,
+      "path": "docling-project--docling-models/README.md",
+      "sha256": "d17f233378eff1240b623b36da76ee8b40afcca05d505949713bf03f7e00822a"
+    },
+    {
+      "bytes": 41,
+      "path": "docling-project--docling-models/config.json",
+      "sha256": "9c34024dc28ff47b75818f415e769809798c29bf9bde6f2ccc63a4acb62396d9"
+    },
+    {
+      "bytes": 212758388,
+      "path": "docling-project--docling-models/model_artifacts/tableformer/accurate/tableformer_accurate.safetensors",
+      "sha256": "2a7d6c924b3cd12fb99a09280ca9c33a89c5d60b93253617d2e088c1a40374d9"
+    },
+    {
+      "bytes": 7060,
+      "path": "docling-project--docling-models/model_artifacts/tableformer/accurate/tm_config.json",
+      "sha256": "984e122ceb8ccf84d84c9d2882f6f2302a44b4f1e577babd6289892c36f3cffd"
+    },
+    {
+      "bytes": 145453276,
+      "path": "docling-project--docling-models/model_artifacts/tableformer/fast/tableformer_fast.safetensors",
+      "sha256": "3119563aab5a7c96fda4d621119b63fd8806272b86c30936d15507616422f718"
+    },
+    {
+      "bytes": 7060,
+      "path": "docling-project--docling-models/model_artifacts/tableformer/fast/tm_config.json",
+      "sha256": "dca6762508dddfae6d57d6cb4ef822c6000119dff0f3b6489db7413118c2622a"
+    }
+  ],
+  "licenses": [
+    {
+      "path": "MODEL-LICENSES.json",
+      "sha256": "ca94fe30ab7780bdfc3d3273dffde68927e8757a1c7dc33d564b3fec1540310a"
+    }
+  ],
+  "manifestSha256": "5244eecd795e10c8fd7f4be27634349e0ffd43901fc6c92a5832a7512b6e1cd9",
+  "schemaVersion": 1,
+  "sources": [
+    {
+      "declaredLicenses": [
+        {
+          "contentSha256": "175700839bc7808eac6af1d0c23e4f483606ab2276fe01122f4093e61a1a65b6",
+          "source": "https://huggingface.co/docling-project/docling-layout-heron/blob/8f39ad3c0b4c58e9c2d2c84a38465abf757272d8/README.md",
+          "spdx": "Apache-2.0"
+        }
+      ],
+      "kind": "huggingface",
+      "repository": "docling-project/docling-layout-heron",
+      "requestedRevision": "main",
+      "resolvedRevision": "8f39ad3c0b4c58e9c2d2c84a38465abf757272d8"
+    },
+    {
+      "declaredLicenses": [
+        {
+          "contentSha256": "d17f233378eff1240b623b36da76ee8b40afcca05d505949713bf03f7e00822a",
+          "source": "https://huggingface.co/docling-project/docling-models/blob/fc0f2d45e2218ea24bce5045f58a389aed16dc23/README.md",
+          "spdx": "CDLA-Permissive-2.0"
+        }
+      ],
+      "kind": "huggingface",
+      "repository": "docling-project/docling-models",
+      "requestedRevision": "v2.3.0",
+      "resolvedRevision": "fc0f2d45e2218ea24bce5045f58a389aed16dc23"
+    },
+    {
+      "declaredLicenses": [
+        {
+          "contentSha256": "3840c5c0c61c294264d2dd77b8777be6ddd90121ef4e0e64abcd22edea581d6e",
+          "copyright": "Baidu/PaddleOCR model assets",
+          "source": "https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/2661c7c0ef5c613e8f93c6e93b2e052399f0f854/LICENSE",
+          "spdx": "Apache-2.0"
+        }
+      ],
+      "kind": "versioned_urls",
+      "repository": "RapidOCR model registry",
+      "requestedRevision": "onnxruntime:english",
+      "resolvedRevision": "PP-OCRv6",
+      "urls": [
+        "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.2/onnx/PP-OCRv4/cls/ch_ppocr_mobile_v2.0_cls_mobile.onnx",
+        "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.2/onnx/PP-OCRv6/det/PP-OCRv6_det_small.onnx",
+        "https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.2/onnx/PP-OCRv6/rec/PP-OCRv6_rec_small.onnx"
+      ]
+    }
+  ],
+  "totalBytes": 561752239
+}

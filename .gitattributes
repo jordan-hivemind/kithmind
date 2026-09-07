@@ -1,0 +1,3 @@
+evals/parser/fixtures/*.pdf binary
+evals/parser/assets/*.ttf binary
+evals/parser/assets/OFL-*.txt -whitespace

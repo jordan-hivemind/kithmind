@@ -11,3 +11,6 @@ dist/
 
 # Personal build plans, tracker, and anything naming real people or accounts. Local only.
 docs/private/
+
+# Rendered synthetic PDF review intermediates.
+tmp/pdfs/
