@@ -89,6 +89,8 @@ export const ingestJobFields = {
   leaseExpiresAt: v.optional(v.number()),
   nextAttemptAt: v.optional(v.number()),
   error: v.optional(ingestErrorValidator),
+  workerDiscoveryWorkId: v.optional(v.id("workerDiscoveryWork")),
+  workerObservationEpoch: v.optional(v.number()),
 };
 
 export const spaceProcessingStateFields = {

@@ -1,0 +1,193 @@
+import { v } from "convex/values";
+
+export const workerScanModeValidator = v.union(
+  v.literal("normal"),
+  v.literal("identity_recovery"),
+);
+
+export const workerScanStateValidator = v.union(
+  v.literal("open"),
+  v.literal("sealed"),
+  v.literal("reconciling"),
+  v.literal("enumerated"),
+  v.literal("needs_review"),
+  v.literal("failed"),
+);
+
+export const workerGapCodeValidator = v.union(
+  v.literal("empty"),
+  v.literal("enumeration_interrupted"),
+  v.literal("oversized"),
+  v.literal("permission_denied"),
+  v.literal("unreadable"),
+  v.literal("unstable"),
+  v.literal("unsupported"),
+);
+
+export const workerScanEntryStateValidator = v.union(
+  v.literal("unchanged"),
+  v.literal("queued"),
+  v.literal("gap"),
+  v.literal("ignored_forgotten"),
+  v.literal("needs_review"),
+);
+
+export const workerDiscoveryStateValidator = v.union(
+  v.literal("queued"),
+  v.literal("leased"),
+  v.literal("admitted"),
+  v.literal("needs_review"),
+  v.literal("failed"),
+  v.literal("obsolete"),
+);
+
+export const workerSourceScanFields = {
+  spaceId: v.id("spaces"),
+  sourceAccountId: v.id("sourceAccounts"),
+  requestId: v.string(),
+  requestDigest: v.string(),
+  watcherId: v.string(),
+  connectorVersion: v.string(),
+  hostAffinity: v.optional(v.string()),
+  mode: workerScanModeValidator,
+  inventoryEpoch: v.number(),
+  manifestVersionAtBegin: v.number(),
+  actorUserId: v.id("users"),
+  actorCredentialId: v.id("apiKeys"),
+  state: workerScanStateValidator,
+  nextPageOrdinal: v.number(),
+  inventoryCursor: v.optional(v.string()),
+  inventoryDone: v.boolean(),
+  lastInventoryRequestId: v.optional(v.string()),
+  lastInventoryRequestDigest: v.optional(v.string()),
+  lastInventoryInputCursor: v.optional(v.string()),
+  lastInventoryOutputCursor: v.optional(v.string()),
+  lastInventoryDone: v.optional(v.boolean()),
+  pageCount: v.number(),
+  entryCount: v.number(),
+  changedCount: v.number(),
+  gapCount: v.number(),
+  reviewCount: v.number(),
+  sealRequestId: v.optional(v.string()),
+  sealRequestDigest: v.optional(v.string()),
+  manifestVersionAtSeal: v.optional(v.number()),
+  reconcileManifestVersion: v.optional(v.number()),
+  reconcileCursor: v.optional(v.string()),
+  nextReconcileOrdinal: v.number(),
+  reconcileNeedsReview: v.optional(v.boolean()),
+  lastReconcileRequestId: v.optional(v.string()),
+  lastReconcileRequestDigest: v.optional(v.string()),
+  lastReconcileResult: v.optional(
+    v.object({
+      state: v.union(
+        v.literal("reconciling"),
+        v.literal("enumerated"),
+        v.literal("needs_review"),
+      ),
+      inspected: v.number(),
+      unavailable: v.number(),
+      done: v.boolean(),
+    }),
+  ),
+  startedAt: v.number(),
+  sealedAt: v.optional(v.number()),
+  completedAt: v.optional(v.number()),
+  failureCode: v.optional(workerGapCodeValidator),
+  expiresAt: v.number(),
+  retireAt: v.number(),
+};
+
+export const workerScanPageFields = {
+  spaceId: v.id("spaces"),
+  sourceAccountId: v.id("sourceAccounts"),
+  scanId: v.id("workerSourceScans"),
+  ordinal: v.number(),
+  requestId: v.string(),
+  requestDigest: v.optional(v.string()),
+  redactedAt: v.optional(v.number()),
+  entryCount: v.number(),
+  createdAt: v.number(),
+  retireAt: v.number(),
+};
+
+export const workerScanEntryFields = {
+  spaceId: v.id("spaces"),
+  sourceAccountId: v.id("sourceAccounts"),
+  scanId: v.id("workerSourceScans"),
+  scanPageId: v.id("workerScanPages"),
+  sourceItemId: v.optional(v.id("sourceItems")),
+  discoveryWorkId: v.optional(v.id("workerDiscoveryWork")),
+  identityKeyHash: v.string(),
+  externalIdHash: v.optional(v.string()),
+  uriDigest: v.string(),
+  inventoryMetadataDigest: v.string(),
+  processingIdentityDigest: v.optional(v.string()),
+  contentHash: v.optional(v.string()),
+  byteLength: v.optional(v.number()),
+  sourceModifiedAt: v.number(),
+  observationEpoch: v.optional(v.number()),
+  processingEpoch: v.optional(v.number()),
+  state: workerScanEntryStateValidator,
+  issueCode: v.optional(v.string()),
+  proposedExternalId: v.optional(v.string()),
+  proposedUri: v.optional(v.string()),
+  proposedTitle: v.optional(v.string()),
+  proposedDocType: v.optional(v.string()),
+  observedAt: v.number(),
+  retireAt: v.number(),
+};
+
+export const workerDiscoveryWorkFields = {
+  spaceId: v.id("spaces"),
+  sourceAccountId: v.id("sourceAccounts"),
+  sourceItemId: v.id("sourceItems"),
+  scanId: v.id("workerSourceScans"),
+  scanEntryId: v.id("workerScanEntries"),
+  observationEpoch: v.number(),
+  processingEpoch: v.number(),
+  state: workerDiscoveryStateValidator,
+  contentHash: v.string(),
+  byteLength: v.number(),
+  capturedAt: v.number(),
+  sourceModifiedAt: v.number(),
+  mediaType: v.string(),
+  profileId: v.string(),
+  extractionFingerprint: v.string(),
+  extractorFingerprint: v.string(),
+  recordSchemaFingerprint: v.string(),
+  normalizationFingerprint: v.string(),
+  chunkerFingerprint: v.string(),
+  title: v.optional(v.string()),
+  docType: v.optional(v.string()),
+  uri: v.string(),
+  actorUserId: v.id("users"),
+  actorCredentialId: v.id("apiKeys"),
+  attempts: v.number(),
+  leaseEpoch: v.number(),
+  leaseToken: v.optional(v.string()),
+  leaseExpiresAt: v.optional(v.number()),
+  nextAttemptAt: v.optional(v.number()),
+  ingestRequestId: v.optional(v.string()),
+  ingestJobId: v.optional(v.id("ingestJobs")),
+  sourceRevisionId: v.optional(v.id("sourceRevisions")),
+  processingGenerationId: v.optional(v.id("processingGenerations")),
+  createdAt: v.number(),
+  retireAt: v.number(),
+};
+
+export const sourceAliasDigestFields = {
+  spaceId: v.id("spaces"),
+  sourceAccountId: v.id("sourceAccounts"),
+  sourceItemId: v.id("sourceItems"),
+  kind: v.literal("uri"),
+  digest: v.string(),
+  firstSeenAt: v.number(),
+  lastSeenAt: v.number(),
+};
+
+export const workerProtocolRateLimitFields = {
+  credentialId: v.id("apiKeys"),
+  sourceAccountId: v.id("sourceAccounts"),
+  windowStartedAt: v.number(),
+  count: v.number(),
+};

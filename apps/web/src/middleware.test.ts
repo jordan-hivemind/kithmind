@@ -17,18 +17,21 @@ function request(pathname: string, method = "GET") {
 }
 
 describe("web authentication middleware", () => {
-  test("lets the exact bearer ingest endpoint reach its route handler", async () => {
-    const isAuthenticated = vi.fn().mockResolvedValue(false);
-    const ingest = request("/api/ingest", "POST");
+  test.each(["/api/ingest", "/api/worker"])(
+    "lets the exact bearer endpoint %s reach its route handler",
+    async (pathname) => {
+      const isAuthenticated = vi.fn().mockResolvedValue(false);
+      const ingest = request(pathname, "POST");
 
-    expect(isPublicRoute(ingest)).toBe(true);
-    expect(
-      await handleMiddlewareRequest(ingest, {
-        convexAuth: { isAuthenticated },
-      }),
-    ).toBeUndefined();
-    expect(isAuthenticated).not.toHaveBeenCalled();
-  });
+      expect(isPublicRoute(ingest)).toBe(true);
+      expect(
+        await handleMiddlewareRequest(ingest, {
+          convexAuth: { isAuthenticated },
+        }),
+      ).toBeUndefined();
+      expect(isAuthenticated).not.toHaveBeenCalled();
+    },
+  );
 
   test("allows the exact invite landing page without authorizing membership", async () => {
     const isAuthenticated = vi.fn().mockResolvedValue(false);
@@ -48,6 +51,7 @@ describe("web authentication middleware", () => {
       "/spaces",
       "/invite/other",
       "/api/ingest/other",
+      "/api/worker/other",
     ]) {
       const unauthenticated = request(pathname);
       expect(isPublicRoute(unauthenticated)).toBe(false);

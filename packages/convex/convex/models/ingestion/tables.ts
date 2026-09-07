@@ -28,6 +28,7 @@ export const ingestionTables = {
     .index("by_sourceAccountId_and_state", ["sourceAccountId", "state"])
     .index("by_sourceItemId", ["sourceItemId"])
     .index("by_processingGenerationId", ["processingGenerationId"])
+    .index("by_workerDiscoveryWorkId", ["workerDiscoveryWorkId"])
     .index("by_state_and_nextAttemptAt", ["state", "nextAttemptAt"]),
   spaceProcessingState: defineTable(spaceProcessingStateFields).index(
     "by_spaceId",
