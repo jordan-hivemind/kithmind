@@ -95,6 +95,18 @@ describe("MCP space routing", () => {
       expect(calls[0]?.[1]).toMatchObject({ type: "decision", topic: "home" });
   });
 
+  test("forwards provider-free keyword document search mode", async () => {
+    const result = await call("search_documents", {
+      query: "clinic",
+      searchMode: "keyword",
+    });
+    expect(result.isError).not.toBe(true);
+    expect(mocks.action).toHaveBeenCalledWith(expect.anything(), {
+      query: "clinic",
+      searchMode: "keyword",
+    });
+  });
+
   test("preserves the selected space through recall hydration and output", async () => {
     mocks.action.mockImplementation(async (fn) =>
       getFunctionName(fn).endsWith(":searchWithStatus")

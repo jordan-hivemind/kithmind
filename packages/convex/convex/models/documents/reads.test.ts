@@ -281,8 +281,8 @@ describe("document reads", () => {
     const result = await mcp.query(api.models.documents.mcpQueries.search, {
       query: "needle",
     });
-    expect(result.results.map((row) => row.documentId)).toEqual([
-      visible.documentId,
+    expect(result.results).toEqual([
+      expect.objectContaining({ documentId: visible.documentId }),
     ]);
     await t.run((ctx) => ctx.db.delete(seeded.keyId));
     await expect(
