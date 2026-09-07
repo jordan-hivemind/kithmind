@@ -3,8 +3,13 @@ import { internalAction, internalMutation } from "../../_generated/server";
 import { v } from "convex/values";
 
 import { principalRefValidator } from "../apiKeys/validators";
+import { rethrowInlineIngestError } from "./inlineErrors";
 import { planInlineText } from "./inlineText";
-import { inlineIngestInputValidator } from "./inlineInput";
+import {
+  inlineIngestTransportInputValidator,
+  MAX_INLINE_SPACE_ID_LENGTH,
+  type InlineIngestInput,
+} from "./inlineInput";
 import {
   INLINE_WORK_FALLBACK_DELAY_MS,
   admitInlineWork,
@@ -19,26 +24,49 @@ import type { Id } from "../../_generated/dataModel";
 export const admit = internalMutation({
   args: {
     principal: principalRefValidator,
-    input: inlineIngestInputValidator,
+    input: inlineIngestTransportInputValidator,
   },
   handler: async (ctx, args) => {
-    if (!args.principal.credentialId) throw new Error("Not authenticated");
-    const admitted = await admitInlineWork(ctx, {
-      principal: {
-        userId: args.principal.userId,
-        credentialId: args.principal.credentialId,
-      },
-      input: args.input,
-      now: Date.now(),
-    });
-    if (admitted.newWork) {
-      await ctx.scheduler.runAfter(
-        INLINE_WORK_FALLBACK_DELAY_MS,
-        internal.models.ingestion.inlineWorker.process,
-        { workId: admitted.workId },
-      );
+    try {
+      if (!args.principal.credentialId) throw new Error("Not authenticated");
+      const { spaceId: rawSpaceId, ...inputWithoutSpace } = args.input;
+      let normalizedSpaceId: Id<"spaces"> | undefined;
+      if (rawSpaceId !== undefined) {
+        if (
+          rawSpaceId.trim().length === 0 ||
+          rawSpaceId.length > MAX_INLINE_SPACE_ID_LENGTH
+        ) {
+          throw new Error("spaceId is invalid");
+        }
+        const candidate = ctx.db.normalizeId("spaces", rawSpaceId);
+        if (candidate === null) throw new Error("spaceId is invalid");
+        normalizedSpaceId = candidate;
+      }
+      const input: InlineIngestInput = {
+        ...inputWithoutSpace,
+        ...(normalizedSpaceId === undefined
+          ? {}
+          : { spaceId: normalizedSpaceId }),
+      };
+      const admitted = await admitInlineWork(ctx, {
+        principal: {
+          userId: args.principal.userId,
+          credentialId: args.principal.credentialId,
+        },
+        input,
+        now: Date.now(),
+      });
+      if (admitted.newWork) {
+        await ctx.scheduler.runAfter(
+          INLINE_WORK_FALLBACK_DELAY_MS,
+          internal.models.ingestion.inlineWorker.process,
+          { workId: admitted.workId },
+        );
+      }
+      return admitted;
+    } catch (error) {
+      rethrowInlineIngestError(error);
     }
-    return admitted;
   },
 });
 
@@ -67,7 +95,13 @@ export const syncState = internalMutation({
 
 export const result = internalMutation({
   args: { principal: principalRefValidator, workId: v.id("inlineWork") },
-  handler: getInlineIngestResult,
+  handler: async (ctx, args) => {
+    try {
+      return await getInlineIngestResult(ctx, args);
+    } catch (error) {
+      rethrowInlineIngestError(error);
+    }
+  },
 });
 
 export const reserveRecoveryBatch = internalMutation({

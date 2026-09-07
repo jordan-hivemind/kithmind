@@ -1,3 +1,8 @@
+import {
+  type InlineIngestErrorCode,
+  inlineIngestErrorCode,
+  parseInlineIngestErrorData,
+} from "@repo/db/convex/models/ingestion/inlineErrors";
 import { z } from "zod";
 
 export const MAX_INGEST_JSON_BYTES = 512 * 1024;
@@ -224,6 +229,16 @@ export function parseIngestRequest(input: unknown): IngestRequest {
 }
 
 export function backendIngestError(error: unknown): IngestHttpError {
+  const structured = parseInlineIngestErrorData(
+    typeof error === "object" && error !== null && "data" in error
+      ? error.data
+      : undefined,
+  );
+  if (structured) return structuredBackendIngestError(structured.code);
+
+  const legacyCode = inlineIngestErrorCode(error);
+  if (legacyCode) return structuredBackendIngestError(legacyCode);
+
   const message = error instanceof Error ? error.message : "";
   if (message.includes("Not authenticated")) {
     return new IngestHttpError(401, "unauthorized", "Not authenticated");
@@ -272,16 +287,54 @@ export function backendIngestError(error: unknown): IngestHttpError {
       "Ingest rate limit exceeded",
     );
   }
-  if (
-    /invalid|validator error|malformed|exceeds|\bmust\b|outside the supported limit/i.test(
-      message,
-    )
-  ) {
-    return new IngestHttpError(
-      400,
-      "invalid_request",
-      "Invalid ingest request",
-    );
-  }
   return new IngestHttpError(500, "ingest_failed", "Ingestion failed");
+}
+
+function structuredBackendIngestError(
+  code: InlineIngestErrorCode,
+): IngestHttpError {
+  switch (code) {
+    case "not_authenticated":
+      return new IngestHttpError(401, "unauthorized", "Not authenticated");
+    case "source_account_not_found":
+      return new IngestHttpError(403, "forbidden", "Source account not found");
+    case "space_not_found":
+      return new IngestHttpError(403, "forbidden", "Space not found");
+    case "default_ingest_space_unavailable":
+      return new IngestHttpError(
+        403,
+        "forbidden",
+        "Default ingest space is not available",
+      );
+    case "request_conflict":
+      return new IngestHttpError(
+        409,
+        "conflict",
+        "requestId conflicts with a different request",
+      );
+    case "desired_processing_epoch_conflict":
+      return new IngestHttpError(
+        409,
+        "conflict",
+        "Desired processing epoch conflict",
+      );
+    case "ingest_rate_limited":
+      return new IngestHttpError(
+        429,
+        "rate_limited",
+        "Ingest rate limit exceeded",
+      );
+    case "source_item_unavailable":
+      return new IngestHttpError(
+        409,
+        "conflict",
+        "Source item is not available for admission",
+      );
+    case "invalid_request":
+      return new IngestHttpError(
+        400,
+        "invalid_request",
+        "Invalid ingest request",
+      );
+  }
 }

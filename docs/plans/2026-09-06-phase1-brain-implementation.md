@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-06
 
-**Status:** P1-1 and P1-2 are implemented and deployed, including required ownership fields and scoped credentials. P1-3 source/evidence/job primitives and indexed read tools are implemented with synthetic integration tests. P1-4 versioned embeddings, semantic document reads, provider configuration, and keyword fallback are implemented with synthetic migration and lifecycle tests. P1-7 typed records and exact queries are implemented with synthetic fixtures. Family lifecycle, public ingestion, and installation acceptance remain pending.
+**Status:** P1-1 and P1-2 are implemented and deployed, including required ownership fields and scoped credentials. P1-3 source/evidence/job primitives and indexed read tools are implemented with synthetic integration tests. P1-4 versioned embeddings, semantic document reads, provider configuration, and keyword fallback are implemented with synthetic migration and lifecycle tests. P1-7 typed records and exact queries are implemented with synthetic fixtures. P1-5 bounded public text ingestion, durable recovery, and an enqueue-only URL tool are implemented. Family lifecycle and installation acceptance remain pending.
 
 **Parent:** [Kith Mind architecture](./2026-09-06-architecture.md)
 

@@ -27,6 +27,7 @@ export const MAX_INLINE_EXTERNAL_ID_UTF8_BYTES = 2_048;
 export const MAX_INLINE_URI_UTF8_BYTES = 2_048;
 export const MAX_INLINE_TITLE_LENGTH = 200;
 export const MAX_INLINE_DOC_TYPE_LENGTH = 100;
+export const MAX_INLINE_SPACE_ID_LENGTH = 256;
 const RFC3339_INSTANT =
   /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,3})?(?:Z|([+-])(\d{2}):(\d{2}))$/;
 
@@ -46,8 +47,11 @@ export type InlineIngestInput = {
   docType?: string;
 };
 
-export const inlineIngestInputValidator = v.object({
-  spaceId: v.optional(v.id("spaces")),
+export type InlineIngestTransportInput = Omit<InlineIngestInput, "spaceId"> & {
+  spaceId?: string;
+};
+
+const inlineIngestFields = {
   requestId: v.string(),
   expectedDesiredProcessingEpoch: v.number(),
   source: v.object({
@@ -60,6 +64,12 @@ export const inlineIngestInputValidator = v.object({
   title: v.string(),
   text: v.string(),
   docType: v.optional(v.string()),
+};
+
+/** Transport validator defers table-specific ID normalization to a mutation. */
+export const inlineIngestTransportInputValidator = v.object({
+  spaceId: v.optional(v.string()),
+  ...inlineIngestFields,
 });
 
 export type PreparedInlineInput = {
