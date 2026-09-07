@@ -20,6 +20,7 @@ concurrency:
 
 jobs:
   publish:
+    if: github.repository == 'flippyhead/ai-brain'
     runs-on: ubuntu-latest
     steps:
       - name: Determine source ref
