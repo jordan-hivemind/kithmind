@@ -45,9 +45,14 @@ material, deployment-specific IDs, or owner records.
 
 1. Deploy the transitional schema and updated functions. Existing unscoped keys
    deliberately fail closed until the following migration finishes.
-2. Repeat the Personal-space bootstrap and content backfill/audit procedure in
-   [Personal-space migration](personal-spaces.md). All ordinary content writers
-   now assign a destination, so a clean final audit can establish cutover readiness.
+2. Finish the Personal-space bootstrap and legacy content backfill procedure in
+   [Personal-space migration](personal-spaces.md) before enabling shared writes.
+   Those legacy audits intentionally reject assignment outside the author's
+   Personal space. After shared writes are enabled, use
+   `models/spaces/scopeAudit:auditContent` for each of `entities`, `facts`, and
+   `thoughts`, following every cursor. This audit checks existing spaces, entity
+   key uniqueness, and same-space references without requiring the historical
+   author to remain a member. Require zero missing and invalid rows.
 3. Run `models/apiKeys/migrations:backfillLegacyScopes` with `dryRun: true`.
    Follow each returned cursor until `isDone` is true. Stop on invalid rows.
 4. Repeat with `dryRun: false`. A page containing invalid legacy keys is blocked

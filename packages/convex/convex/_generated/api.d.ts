@@ -47,6 +47,7 @@ import type * as models_spaces_migrations from "../models/spaces/migrations.js";
 import type * as models_spaces_model from "../models/spaces/model.js";
 import type * as models_spaces_private from "../models/spaces/private.js";
 import type * as models_spaces_public from "../models/spaces/public.js";
+import type * as models_spaces_scopeAudit from "../models/spaces/scopeAudit.js";
 import type * as models_spaces_validators from "../models/spaces/validators.js";
 import type * as models_thoughts_actions from "../models/thoughts/actions.js";
 import type * as models_thoughts_classify from "../models/thoughts/classify.js";
@@ -110,6 +111,7 @@ declare const fullApi: ApiFromModules<{
   "models/spaces/model": typeof models_spaces_model;
   "models/spaces/private": typeof models_spaces_private;
   "models/spaces/public": typeof models_spaces_public;
+  "models/spaces/scopeAudit": typeof models_spaces_scopeAudit;
   "models/spaces/validators": typeof models_spaces_validators;
   "models/thoughts/actions": typeof models_thoughts_actions;
   "models/thoughts/classify": typeof models_thoughts_classify;
