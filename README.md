@@ -32,8 +32,8 @@ are still being implemented. The public architecture and staged plan are in
   plus an explicitly unfetched URL queue. See the
   [capture contract](docs/plans/2026-09-06-inline-ingestion-contract.md).
 - A source-scoped remote worker gateway for filesystem discovery, scan retries,
-  identity recovery, and tombstones. Document processing through this gateway
-  remains in progress. See the [worker protocol](docs/plans/2026-09-07-worker-protocol.md).
+  identity recovery, tombstones, and verified text admission with resumable
+  reservations. Document processing through this gateway remains in progress. See the [worker protocol](docs/plans/2026-09-07-worker-protocol.md).
 - A Next.js web application, Convex backend, and a Claude Code plugin source.
 
 For local development, run `npx convex dev --once` from `packages/convex`,

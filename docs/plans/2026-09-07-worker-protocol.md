@@ -3,9 +3,9 @@
 **Date:** 2026-09-07
 
 **Status:** Implementation in progress. This document describes the initial
-worker gateway commands currently defined in the shared protocol. It does not
-claim a complete filesystem worker, parser, reservation queue, or acceptance
-result.
+worker gateway commands currently defined in the shared protocol. Discovery
+reservation and text admission are implemented. A complete filesystem worker,
+processing queue, parser, and publication flow remain in progress.
 
 **Related plan:** [Phase 2 document pipeline](2026-09-07-phase2-document-pipeline.md)
 
@@ -75,7 +75,7 @@ raw backend messages, or arbitrary backend error data.
 
 ## Initial command set
 
-Protocol version 1 currently defines exactly these six commands:
+Protocol version 1 currently defines these eight commands:
 
 | Operation              | Purpose                                              | Important bound                                                                                                                                                                    |
 | ---------------------- | ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -85,6 +85,8 @@ Protocol version 1 currently defines exactly these six commands:
 | `scan.appendPage`      | Submit one bounded discovery page.                   | 1–4 entries per page and at most 64 pages per scan.                                                                                                                                |
 | `scan.seal`            | Seal a scan with healthy or failed discovery health. | `expectedPageCount` is 0–64.                                                                                                                                                       |
 | `scan.reconcile`       | Reconcile a sealed scan against current inventory.   | `maxItems` is 1–50 and `ordinal` fences each advancing request.                                                                                                                    |
+| `discovery.reserve`    | Lease enumerated discovery work for upload.          | `maxItems` is 1–4; the lease lasts five minutes.                                                                                                                                   |
+| `discovery.admitUtf8`  | Verify and retain one reserved text revision.        | At most 65,536 UTF-8 bytes; exact discovered hash and byte count.                                                                                                                  |
 
 All commands require `protocolVersion: 1`. Envelopes use exact fields: unknown,
 missing, malformed, empty, or invalid-Unicode values are rejected as
@@ -96,7 +98,8 @@ submits discovery entries.
 
 The source mutation limit is 60 new requests per minute for each credential
 and source-account pair. It covers `source.inventoryPage`, `scan.begin`,
-`scan.appendPage`, `scan.seal`, and `scan.reconcile`. A retry that exactly
+`scan.appendPage`, `scan.seal`, `scan.reconcile`, `discovery.reserve`, and
+`discovery.admitUtf8`. A retry that exactly
 matches a retained request receipt does not consume the limit. Reusing a
 request ID with different inputs fails as `request_conflict`.
 
@@ -127,6 +130,13 @@ request object and nested object rejects unknown fields.
 | `scan.appendPage`      | `{ scanId, requestId, ordinal, entries }`                                                                      | `{ operation, scanId, ordinal, reused, entries: [{ state, sourceItemId?, observationEpoch?, processingEpoch? }] }`                                                                |
 | `scan.seal`            | `{ scanId, requestId, expectedPageCount, health }`                                                             | `{ operation, scanId, state, reused }`                                                                                                                                            |
 | `scan.reconcile`       | `{ scanId, requestId, expectedInventoryEpoch, ordinal, maxItems }`                                             | `{ operation, scanId, state, inspected, unavailable, done, reused }`                                                                                                              |
+| `discovery.reserve`    | `{ requestId, maxItems }`                                                                                      | `{ operation, receiptId, expiresAt, reused, targets }`                                                                                                                            |
+| `discovery.admitUtf8`  | `{ requestId, workId, leaseEpoch, leaseToken, text }`                                                          | `{ operation, workId, sourceItemId, sourceRevisionId, processingGenerationId, ingestJobId, desiredProcessingEpoch, state: "admitted", reused }`                                   |
+
+A reservation target is
+`{ workId, sourceItemId, observationEpoch, processingEpoch, leaseEpoch, leaseToken, leaseExpiresAt, uri, contentHash, byteLength }`.
+Lease tokens belong to the credential that reserved them and must be treated
+as secrets. Another ingest credential cannot use or replay that lease.
 
 `enumeration` is one of `{ state: "never" }`,
 `{ state: "in_progress", scanId }`,
@@ -182,9 +192,32 @@ separate states in the [Phase 2 plan](2026-09-07-phase2-document-pipeline.md).
 In particular, a healthy folder scan does not prove complete financial or
 record/date coverage.
 
+## Discovery reservation and admission
+
+Only work from a successfully enumerated scan is eligible for reservation.
+The server checks the current source grant, original actor, file identity,
+observation epoch, and processing identity inside the same transaction as the
+lease. Retries return the same ordered targets and do not consume another
+attempt. An expired, invalidated, or partially missing reservation fails and
+returns no token. Generate unique request IDs and never intentionally reuse
+them after receipt retention ends. Use a new request ID after the five-minute
+lease expires.
+
+Admission accepts text and the lease identity only. The server verifies the
+text hash and byte length, derives the processing plan and fingerprints, and
+uses the previously frozen discovery metadata. Worker-supplied authority,
+capture timestamps, expected counts, and processing profiles are rejected.
+An exact admission retry returns the same revision, generation, and job even
+after successful admission has cleared the discovery lease. Reusing its
+request ID with different text fails.
+
+Admission retains a queued revision and job. It does not publish a searchable
+document. `source.status.processing` remains `not_assessed` until the later
+processing and assessment commands are implemented.
+
 ## Deferred operations
 
-This initial protocol has no public reservation, due-job, lease renewal,
+This initial protocol has no public processing-job reservation, lease renewal,
 staging, activation, parser, archive, or generic job command. Those operations
 remain unavailable until separately implemented and documented. Do not invent
 their request or result shapes from internal models.
@@ -210,3 +243,11 @@ item, its metadata-derived request digest is erased. That page can no longer
 replay its original receipt, even if it also contained other items. The other
 items are preserved. Minimal tombstone and path-alias digests remain to prevent
 accidental reimport through known identities.
+
+Reservation targets become eligible for cleanup when their leases expire.
+Reservation headers and admission operation receipts retain request identity
+for 30 days; headers are removed only after their targets are gone. Expired
+rate-limit windows are also cleaned up without resetting a live window.
+Forgetting removes item-specific operation receipts and reservation targets.
+It invalidates a shared reservation header so it cannot replay a partial list,
+while leaving other items' independent leases intact.

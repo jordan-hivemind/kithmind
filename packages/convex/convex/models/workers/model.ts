@@ -86,7 +86,7 @@ async function invalidateCoverage(
   });
 }
 
-async function consumeWorkerMutationRateLimit(
+export async function consumeWorkerMutationRateLimit(
   ctx: MutationCtx,
   source: LoadedWorkerSource,
   now: number,
@@ -914,6 +914,14 @@ async function createDiscoveryWork(
     scanEntryId: args.scanEntryId,
     observationEpoch: args.observationEpoch,
     processingEpoch: args.processingEpoch,
+    ...(rebindJob
+      ? args.priorWork?.expectedDesiredProcessingEpoch === undefined
+        ? {}
+        : {
+            expectedDesiredProcessingEpoch:
+              args.priorWork.expectedDesiredProcessingEpoch,
+          }
+      : { expectedDesiredProcessingEpoch: args.item.desiredProcessingEpoch }),
     state: rebindJob ? "admitted" : "queued",
     contentHash: args.entry.content.sha256,
     byteLength: args.entry.content.byteLength,
@@ -931,10 +939,15 @@ async function createDiscoveryWork(
       ? {}
       : { docType: args.entry.docType }),
     uri: args.entry.uri,
-    actorUserId: args.source.principal.userId,
-    actorCredentialId: args.source.principal.credentialId,
+    actorUserId: rebindJob
+      ? args.priorWork!.actorUserId
+      : args.source.principal.userId,
+    actorCredentialId: rebindJob
+      ? args.priorWork!.actorCredentialId
+      : args.source.principal.credentialId,
     attempts: 0,
     leaseEpoch: 0,
+    nextAttemptAt: args.now,
     ...(rebindJob && args.priorWork?.ingestRequestId
       ? { ingestRequestId: args.priorWork.ingestRequestId }
       : {}),
@@ -1121,7 +1134,18 @@ async function persistResolvedEntry(
     });
     if (!work) await ctx.db.patch(id, { state: "unchanged" });
   } else if (priorWork && entryState === "queued") {
-    work = priorWork;
+    if (priorWork.scanId !== args.scan._id || priorWork.scanEntryId !== id) {
+      await ctx.db.patch(priorWork._id, {
+        scanId: args.scan._id,
+        scanEntryId: id,
+        retireAt: nowPlus(args.now, WORKER_DETAIL_RETENTION_MS),
+      });
+      const rebound = await ctx.db.get(priorWork._id);
+      if (!rebound) throw workerProtocolError("scan_conflict");
+      work = rebound;
+    } else {
+      work = priorWork;
+    }
   }
   if (priorWork && entryState === "unchanged") {
     await obsoletePriorWork(ctx, priorWork, false, args.now);

@@ -13,12 +13,17 @@ import {
   reconcileWorkerScan,
   sealWorkerScan,
 } from "./model";
+import { admitDiscoveryUtf8, reserveDiscoveryWork } from "./discovery";
 import { parseWorkerRequest, type FsDiscoveryEntry } from "./protocol";
 import { FS_TEXT_PROFILE } from "./profile";
+import { beginForgetFromWeb, continueForgetFromWeb } from "../ingestion/model";
 
 const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
 const UUID_A = "01890a5d-ac96-7cc4-bb7e-6f4f5ca5c139";
+const DISCOVERY_TEXT = "alpha beta";
+const DISCOVERY_TEXT_HASH =
+  "1a989ea86150171c687b0727f218eedbb94c4665a7da9b0add1bf5de607f2bf1";
 
 async function fixture() {
   const t = convexTest(schema, modules);
@@ -315,6 +320,78 @@ async function completeInitialScan(f: Awaited<ReturnType<typeof fixture>>) {
   await seal(f, scan.scanId, "seal-1", 1, { status: "healthy" });
   await reconcile(f, scan.scanId, "reconcile-1", scan.inventoryEpoch);
   return scan;
+}
+
+async function completeReservableScan(f: Awaited<ReturnType<typeof fixture>>) {
+  const scan = await begin(f, "begin-reservable", 0);
+  await append(f, scan.scanId, "page-reservable", [
+    readyEntry({
+      content: {
+        status: "ready",
+        sha256: DISCOVERY_TEXT_HASH,
+        byteLength: 10,
+      },
+    }),
+  ]);
+  await seal(f, scan.scanId, "seal-reservable", 1, { status: "healthy" });
+  await reconcile(f, scan.scanId, "reconcile-reservable", scan.inventoryEpoch);
+  return scan;
+}
+
+async function reserve(
+  f: Awaited<ReturnType<typeof fixture>>,
+  principal = f.principal,
+  requestId = "reserve-1",
+  maxItems = 1,
+  now = 2_000,
+) {
+  const request = parseWorkerRequest({
+    ...source(f),
+    operation: "discovery.reserve",
+    requestId,
+    maxItems,
+  });
+  if (request.operation !== "discovery.reserve") {
+    throw new Error("bad test request");
+  }
+  return await f.t.run((ctx) =>
+    reserveDiscoveryWork(
+      ctx,
+      principal,
+      request,
+      Array.from({ length: maxItems }, (_, index) =>
+        String(index + 1).padStart(64, "0"),
+      ),
+      now,
+    ),
+  );
+}
+
+async function admit(
+  f: Awaited<ReturnType<typeof fixture>>,
+  target: Awaited<ReturnType<typeof reserve>>["targets"][number],
+  overrides: {
+    requestId?: string;
+    text?: string;
+    principal?: typeof f.principal;
+  } = {},
+  now = 2_100,
+) {
+  const request = parseWorkerRequest({
+    ...source(f),
+    operation: "discovery.admitUtf8",
+    requestId: overrides.requestId ?? "admit-1",
+    workId: target.workId,
+    leaseEpoch: target.leaseEpoch,
+    leaseToken: target.leaseToken,
+    text: overrides.text ?? DISCOVERY_TEXT,
+  });
+  if (request.operation !== "discovery.admitUtf8") {
+    throw new Error("bad test request");
+  }
+  return await f.t.run((ctx) =>
+    admitDiscoveryUtf8(ctx, overrides.principal ?? f.principal, request, now),
+  );
 }
 
 describe("filesystem worker scans", () => {
@@ -875,5 +952,418 @@ describe("filesystem worker scans", () => {
     await expect(
       begin(f, "rate-overflow", 30, "normal", 1_100),
     ).rejects.toMatchObject({ data: { code: "rate_limited" } });
+  });
+});
+
+describe("filesystem discovery reservation and admission", () => {
+  test("public MCP dispatch returns only the B1 result contract", async () => {
+    const f = await fixture();
+    await completeReservableScan(f);
+    const priorIssuer = process.env.MCP_JWT_ISSUER;
+    process.env.MCP_JWT_ISSUER = "https://synthetic.worker.test";
+    try {
+      const mcp = f.t.withIdentity({
+        issuer: process.env.MCP_JWT_ISSUER,
+        subject: f.userId,
+        apiKeyId: f.credentialId,
+      });
+      const reservation = await mcp.action(api.models.workers.mcp.dispatch, {
+        request: {
+          ...source(f),
+          operation: "discovery.reserve",
+          requestId: "public-reserve",
+          maxItems: 1,
+        },
+      });
+      if (reservation.operation !== "discovery.reserve") {
+        throw new Error("unexpected reservation result");
+      }
+      expect(reservation.targets[0]?.leaseToken).toMatch(/^[0-9a-f]{64}$/);
+      const target = reservation.targets[0]!;
+      const admitted = await mcp.action(api.models.workers.mcp.dispatch, {
+        request: {
+          ...source(f),
+          operation: "discovery.admitUtf8",
+          requestId: "public-admit",
+          workId: target.workId,
+          leaseEpoch: target.leaseEpoch,
+          leaseToken: target.leaseToken,
+          text: DISCOVERY_TEXT,
+        },
+      });
+      expect(admitted).toMatchObject({
+        operation: "discovery.admitUtf8",
+        state: "admitted",
+        reused: false,
+      });
+    } finally {
+      if (priorIssuer === undefined) delete process.env.MCP_JWT_ISSUER;
+      else process.env.MCP_JWT_ISSUER = priorIssuer;
+    }
+  });
+
+  test("reserves once and replays only to the same live credential", async () => {
+    const f = await fixture();
+    await completeReservableScan(f);
+    const first = await reserve(f);
+    expect(first).toMatchObject({
+      operation: "discovery.reserve",
+      reused: false,
+      targets: [
+        {
+          observationEpoch: 1,
+          processingEpoch: 1,
+          leaseEpoch: 1,
+          leaseToken: "1".padStart(64, "0"),
+          contentHash: DISCOVERY_TEXT_HASH,
+          byteLength: 10,
+        },
+      ],
+    });
+    expect((await reserve(f)).reused).toBe(true);
+    const reservationState = await f.t.run(async (ctx) => ({
+      rate: await ctx.db.query("workerProtocolRateLimits").unique(),
+      receipt: await ctx.db.query("workerReservationReceipts").unique(),
+    }));
+    expect(reservationState.rate?.count).toBe(5);
+    expect(reservationState.receipt?.targetCount).toBe(1);
+    expect(reservationState.receipt?.retireAt).toBeGreaterThan(first.expiresAt);
+
+    const alternateCredentialId = await f.t.run((ctx) =>
+      ctx.db.insert("apiKeys", {
+        userId: f.userId,
+        keyHash: "d".repeat(64),
+        keyPrefix: "alternate",
+        name: "Alternate worker",
+        capabilities: ["ingest"],
+        spaceIds: [f.spaceId],
+        sourceAccountIds: [f.sourceAccountId],
+      }),
+    );
+    const alternate = {
+      userId: f.userId,
+      credentialId: alternateCredentialId,
+    };
+    await expect(reserve(f, alternate)).rejects.toMatchObject({
+      data: { code: "not_found" },
+    });
+    await expect(
+      admit(f, first.targets[0]!, { principal: alternate }),
+    ).rejects.toMatchObject({ data: { code: "lease_conflict" } });
+    await expect(
+      reserve(f, f.principal, "reserve-1", 1, first.expiresAt),
+    ).rejects.toMatchObject({ data: { code: "reservation_expired" } });
+  });
+
+  test("leaves due work queued while a newer scan is unfinished", async () => {
+    const f = await fixture();
+    await completeReservableScan(f);
+    const newer = await begin(f, "begin-open", 1, "normal", 3_000);
+
+    await expect(
+      reserve(f, f.principal, "reserve-during-open", 1, 3_100),
+    ).rejects.toMatchObject({ data: { code: "scan_not_ready" } });
+    const workDuringScan = await f.t.run((ctx) =>
+      ctx.db.query("workerDiscoveryWork").unique(),
+    );
+    expect(workDuringScan?.state).toBe("queued");
+
+    await append(f, newer.scanId, "page-open", [
+      readyEntry({
+        content: {
+          status: "ready",
+          sha256: DISCOVERY_TEXT_HASH,
+          byteLength: 10,
+        },
+      }),
+    ]);
+    await seal(f, newer.scanId, "seal-open", 1, { status: "healthy" }, 3_200);
+    await reconcile(f, newer.scanId, "reconcile-open", 2, 3_300);
+    const result = await reserve(
+      f,
+      f.principal,
+      "reserve-after-open",
+      1,
+      3_400,
+    );
+    expect(result.targets).toHaveLength(1);
+  });
+
+  test("admits exact UTF-8 bytes atomically and replays a lost response", async () => {
+    const f = await fixture();
+    await completeReservableScan(f);
+    const reservation = await reserve(f);
+    const target = reservation.targets[0]!;
+    const first = await admit(f, target);
+    expect(first).toMatchObject({
+      operation: "discovery.admitUtf8",
+      state: "admitted",
+      desiredProcessingEpoch: 1,
+      reused: false,
+    });
+    const replay = await admit(f, target);
+    expect(replay).toEqual({ ...first, reused: true });
+    await expect(
+      admit(f, target, { text: "alpha betb" }),
+    ).rejects.toMatchObject({ data: { code: "request_conflict" } });
+
+    const stored = await f.t.run(async (ctx) => ({
+      revision: await ctx.db.get(
+        ctx.db.normalizeId("sourceRevisions", first.sourceRevisionId)!,
+      ),
+      work: await ctx.db.get(
+        ctx.db.normalizeId("workerDiscoveryWork", first.workId)!,
+      ),
+      job: await ctx.db.get(
+        ctx.db.normalizeId("ingestJobs", first.ingestJobId)!,
+      ),
+      receipts: await ctx.db.query("workerOperationReceipts").collect(),
+      rate: await ctx.db.query("workerProtocolRateLimits").unique(),
+    }));
+    expect(stored.revision?.inlineText).toBe(DISCOVERY_TEXT);
+    expect(stored.work).toMatchObject({ state: "admitted" });
+    expect(stored.work?.leaseToken).toBeUndefined();
+    expect(stored.job).toMatchObject({
+      workerDiscoveryWorkId: stored.work?._id,
+      workerObservationEpoch: 1,
+    });
+    expect(stored.receipts).toHaveLength(1);
+    expect(stored.rate?.count).toBe(6);
+
+    await f.t.run(async (ctx) => {
+      const jobId = ctx.db.normalizeId("ingestJobs", first.ingestJobId);
+      if (!jobId) throw new Error("invalid admitted job");
+      await ctx.db.patch(jobId, { workerObservationEpoch: 2 });
+    });
+    await expect(admit(f, target)).rejects.toMatchObject({
+      data: { code: "scan_conflict" },
+    });
+  });
+
+  test("rejects changed bytes and original-actor revocation", async () => {
+    const hashMismatch = await fixture();
+    await completeReservableScan(hashMismatch);
+    const mismatchReservation = await reserve(hashMismatch);
+    await expect(
+      admit(hashMismatch, mismatchReservation.targets[0]!, {
+        text: "alpha betb",
+      }),
+    ).rejects.toMatchObject({ data: { code: "stale_observation" } });
+
+    const revoked = await fixture();
+    await completeReservableScan(revoked);
+    const alternateCredentialId = await revoked.t.run((ctx) =>
+      ctx.db.insert("apiKeys", {
+        userId: revoked.userId,
+        keyHash: "e".repeat(64),
+        keyPrefix: "alternate",
+        name: "Alternate worker",
+        capabilities: ["ingest"],
+        spaceIds: [revoked.spaceId],
+        sourceAccountIds: [revoked.sourceAccountId],
+      }),
+    );
+    const alternate = {
+      userId: revoked.userId,
+      credentialId: alternateCredentialId,
+    };
+    const reservation = await reserve(revoked, alternate);
+    await revoked.t.run((ctx) => ctx.db.delete(revoked.credentialId));
+    await expect(
+      admit(revoked, reservation.targets[0]!, { principal: alternate }),
+    ).rejects.toMatchObject({ data: { code: "not_authorized" } });
+  });
+
+  test("fences a lease when a newer changed discovery commits", async () => {
+    const f = await fixture();
+    await completeReservableScan(f);
+    const reservation = await reserve(f);
+    const oldTarget = reservation.targets[0]!;
+
+    const newer = await begin(f, "begin-newer", 1, "normal", 3_000);
+    await append(
+      f,
+      newer.scanId,
+      "page-newer",
+      [
+        readyEntry({
+          content: { status: "ready", sha256: HASH_B, byteLength: 10 },
+        }),
+      ],
+      3_100,
+    );
+    await seal(f, newer.scanId, "seal-newer", 1, { status: "healthy" }, 3_200);
+    await reconcile(f, newer.scanId, "reconcile-newer", 2, 3_300);
+
+    await expect(admit(f, oldTarget, {}, 3_400)).rejects.toMatchObject({
+      data: { code: "stale_observation" },
+    });
+  });
+
+  test("fences a lease on metadata-only rebinding without advancing processing", async () => {
+    const f = await fixture();
+    await completeReservableScan(f);
+    const reservation = await reserve(f);
+    const oldTarget = reservation.targets[0]!;
+
+    const newer = await begin(f, "begin-retitled", 1, "normal", 3_000);
+    const page = await append(
+      f,
+      newer.scanId,
+      "page-retitled",
+      [
+        readyEntry({
+          title: "Retitled",
+          content: {
+            status: "ready",
+            sha256: DISCOVERY_TEXT_HASH,
+            byteLength: 10,
+          },
+        }),
+      ],
+      3_100,
+    );
+    expect(page.entries[0]).toMatchObject({
+      observationEpoch: 2,
+      processingEpoch: 1,
+      state: "queued",
+    });
+    await seal(
+      f,
+      newer.scanId,
+      "seal-retitled",
+      1,
+      { status: "healthy" },
+      3_200,
+    );
+    await reconcile(f, newer.scanId, "reconcile-retitled", 2, 3_300);
+
+    await expect(admit(f, oldTarget, {}, 3_400)).rejects.toMatchObject({
+      data: { code: "stale_observation" },
+    });
+    const next = await reserve(f, f.principal, "reserve-retitled", 1, 3_500);
+    expect(next.targets[0]).toMatchObject({
+      observationEpoch: 2,
+      processingEpoch: 1,
+    });
+  });
+
+  test("does not mutate a corrupt cross-space reservation candidate", async () => {
+    const f = await fixture();
+    await completeReservableScan(f);
+    const corrupted = await f.t.run(async (ctx) => {
+      const work = await ctx.db.query("workerDiscoveryWork").unique();
+      if (!work) throw new Error("missing worker state");
+      const otherSpaceId = await ctx.db.insert("spaces", {
+        kind: "shared",
+        name: "Other synthetic space",
+        createdBy: f.userId,
+      });
+      await ctx.db.patch(work._id, { spaceId: otherSpaceId, attempts: 8 });
+      return work._id;
+    });
+
+    await expect(reserve(f)).rejects.toMatchObject({
+      data: { code: "scan_conflict" },
+    });
+    const after = await f.t.run((ctx) => ctx.db.get(corrupted));
+    expect(after).toMatchObject({ state: "queued", attempts: 8 });
+  });
+
+  test("clears a full non-retryable failed prefix across bounded reservations", async () => {
+    const f = await fixture();
+    const scan = await begin(f, "begin-prefix", 0);
+    const entries = Array.from({ length: 13 }, (_, index) =>
+      readyEntry({
+        externalId: `${UUID_A.slice(0, -2)}${index
+          .toString(16)
+          .padStart(2, "0")}`,
+        uri: `fs://documents/${index}.txt`,
+        content: {
+          status: "ready",
+          sha256: DISCOVERY_TEXT_HASH,
+          byteLength: 10,
+        },
+      }),
+    );
+    for (let ordinal = 0; ordinal < 4; ordinal += 1) {
+      await append(
+        f,
+        scan.scanId,
+        `page-prefix-${ordinal}`,
+        entries.slice(ordinal * 4, ordinal * 4 + 4),
+        1_100 + ordinal,
+        ordinal,
+      );
+    }
+    await seal(f, scan.scanId, "seal-prefix", 4, { status: "healthy" });
+    await reconcile(f, scan.scanId, "reconcile-prefix", 1);
+    await f.t.run(async (ctx) => {
+      const works = await ctx.db.query("workerDiscoveryWork").collect();
+      if (works.length !== 13) throw new Error("missing prefix test work");
+      for (const work of works) {
+        const isLast = work.uri === "fs://documents/12.txt";
+        await ctx.db.patch(work._id, {
+          state: "failed",
+          retryable: isLast,
+          nextAttemptAt: isLast ? 2 : 1,
+        });
+      }
+    });
+
+    const first = await reserve(f, f.principal, "reserve-prefix-1");
+    expect(first.targets).toHaveLength(0);
+    const second = await reserve(f, f.principal, "reserve-prefix-2");
+    expect(second.targets).toHaveLength(1);
+    expect(second.targets[0]?.uri).toBe("fs://documents/12.txt");
+    const states = await f.t.run(
+      async (ctx) => await ctx.db.query("workerDiscoveryWork").collect(),
+    );
+    expect(states.filter((work) => work.state === "needs_review")).toHaveLength(
+      12,
+    );
+  });
+
+  test("forget scrubs admitted operation receipts and immutable history", async () => {
+    const f = await fixture();
+    await completeReservableScan(f);
+    const reservation = await reserve(f);
+    const admitted = await admit(f, reservation.targets[0]!);
+    const sourceItemId = await f.t.run(async (ctx) => {
+      const id = ctx.db.normalizeId("sourceItems", admitted.sourceItemId);
+      if (!id) throw new Error("invalid admitted source item");
+      return id;
+    });
+    await f.t.run((ctx) =>
+      beginForgetFromWeb(ctx, {
+        principal: { userId: f.userId },
+        sourceItemId,
+        now: 3_000,
+      }),
+    );
+    for (let index = 0; index < 100; index += 1) {
+      const result = await f.t.run((ctx) =>
+        continueForgetFromWeb(ctx, {
+          principal: { userId: f.userId },
+          sourceItemId,
+        }),
+      );
+      if (result.done) break;
+      if (index === 99) throw new Error("forget did not complete");
+    }
+    const remaining = await f.t.run(async (ctx) => ({
+      operationReceipts: await ctx.db
+        .query("workerOperationReceipts")
+        .collect(),
+      work: await ctx.db.query("workerDiscoveryWork").collect(),
+      revisions: await ctx.db.query("sourceRevisions").collect(),
+      jobs: await ctx.db.query("ingestJobs").collect(),
+      item: await ctx.db.get(sourceItemId),
+    }));
+    expect(remaining.operationReceipts).toHaveLength(0);
+    expect(remaining.work).toHaveLength(0);
+    expect(remaining.revisions).toHaveLength(0);
+    expect(remaining.jobs).toHaveLength(0);
+    expect(remaining.item?.lifecycle).toBe("forgotten");
   });
 });
