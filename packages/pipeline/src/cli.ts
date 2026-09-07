@@ -1,6 +1,7 @@
-import { readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import { pathToFileURL } from "node:url";
+import { realpathSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 
 import { parseConfig, requireCredential } from "./config.js";
 import { Journal } from "./journal.js";
@@ -87,10 +88,19 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   }
 }
 
-if (
-  process.argv[1] !== undefined &&
-  import.meta.url === pathToFileURL(process.argv[1]).href
-) {
+function isDirectInvocation(): boolean {
+  if (process.argv[1] === undefined) return false;
+  try {
+    return (
+      realpathSync(process.argv[1]) ===
+      realpathSync(fileURLToPath(import.meta.url))
+    );
+  } catch {
+    return false;
+  }
+}
+
+if (isDirectInvocation()) {
   main().catch(() => {
     process.stderr.write("Pipeline worker failed\n");
     process.exitCode = 1;
