@@ -1,6 +1,8 @@
 # Kith Mind architecture review
 
-Date: 2026-09-06. Task: R1-1. Status: recommendations, not adopted decisions.
+Date: 2026-09-06. Task: R1-1. Status: historical review, superseded by the R2-1 revision.
+
+Update after owner response: these findings were accepted for plan revision under R2-1, with desktop as the primary use case and native mobile as P2. Mobile is no longer an implementation gate. Workout capture is optional and is not an owner requirement. Use the [revised architecture](2026-09-06-architecture.md) and [Phase 1 plan](2026-09-06-phase1-brain-implementation.md) as current instructions; the original review below is retained as history.
 
 The architecture is a reasonable starting point, but the current plans are not ready to implement unchanged. Keep the cloud Brain, separate ingestion workers, structured records, source evidence, and family spaces. Revise mobile access, event identity, family entity ownership, recovery, and the release process before a large backfill.
 
@@ -10,12 +12,12 @@ This review covers the public architecture, the owner's private architecture and
 
 The architecture's section 2 says Claude or ChatGPT, and section 13 assumes MCP clients cover mobile. That does not establish the requirement that both native mobile apps can query the Brain.
 
-| Surface | Evidence checked on the review date | Consequence |
-|---|---|---|
-| Claude iOS and Android | Anthropic documents connected services carrying over from web/desktop and supports custom remote MCP connectors. | A hosted Brain is a supported approach. Verify this deployment with real accounts. |
-| ChatGPT custom MCP apps | OpenAI's custom MCP FAQ explicitly describes mobile availability as web only. | Do not promise that adding the MCP on desktop makes it usable in native mobile ChatGPT. |
-| ChatGPT GPT Actions | OpenAI documents mobile GPT use and external API actions, but its fetched GPT creation page restricts new creation on personal accounts. | A thin authenticated API adapter is a candidate to test with an eligible account or existing GPT. It is not a proven universal workaround. |
-| Original files | Brain membership does not confer Gmail, portal, or storage permissions. | Answer from stored evidence. Separately report whether the original can be opened by this caller. |
+| Surface                 | Evidence checked on the review date                                                                                                      | Consequence                                                                                                                                |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| Claude iOS and Android  | Anthropic documents connected services carrying over from web/desktop and supports custom remote MCP connectors.                         | A hosted Brain is a supported approach. Verify this deployment with real accounts.                                                         |
+| ChatGPT custom MCP apps | OpenAI's custom MCP FAQ explicitly describes mobile availability as web only.                                                            | Do not promise that adding the MCP on desktop makes it usable in native mobile ChatGPT.                                                    |
+| ChatGPT GPT Actions     | OpenAI documents mobile GPT use and external API actions, but its fetched GPT creation page restricts new creation on personal accounts. | A thin authenticated API adapter is a candidate to test with an eligible account or existing GPT. It is not a proven universal workaround. |
+| Original files          | Brain membership does not confer Gmail, portal, or storage permissions.                                                                  | Answer from stored evidence. Separately report whether the original can be opened by this caller.                                          |
 
 Sources: [Claude connectors](https://support.claude.com/en/articles/11176164-use-connectors-to-extend-claude-s-capabilities), [ChatGPT custom MCP availability](https://help.openai.com/en/articles/12584461), [GPT creation and actions](https://help.openai.com/en/articles/8554397). Search snippets for the GPT page disagreed; the fetched page is the basis here. Recheck account eligibility and installed app versions during the prototype.
 
@@ -31,14 +33,14 @@ Existing `models/facts/model.ts` defaults to single cardinality, deduplicates cu
 
 Recommended records can remain in Convex; this does not require a graph database:
 
-| Record | Example and rule |
-|---|---|
-| Entity | Person, vehicle, account, exercise. Stable identity within a space. |
-| Event | Blood draw, oil change, workout session. Date of occurrence differs from import time. |
+| Record                   | Example and rule                                                                                                                                |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| Entity                   | Person, vehicle, account, exercise. Stable identity within a space.                                                                             |
+| Event                    | Blood draw, oil change, workout session. Date of occurrence differs from import time.                                                           |
 | Observation or line item | Lab analyte/value/unit, odometer reading, exercise/set/reps/load/unit, transaction amount/currency. Link to its event and field-level evidence. |
-| Current fact | Current address or preferred contact method. Can supersede a prior state. |
-| Evidence | Source item, immutable revision, page/cell/text span, extraction version. Several sources may support one event. |
-| Summary | Rebuildable synthesis referencing underlying records. Never the only surviving evidence. |
+| Current fact             | Current address or preferred contact method. Can supersede a prior state.                                                                       |
+| Evidence                 | Source item, immutable revision, page/cell/text span, extraction version. Several sources may support one event.                                |
+| Summary                  | Rebuildable synthesis referencing underlying records. Never the only surviving evidence.                                                        |
 
 The workout requirement is currently missing from the playbooks and acceptance tests. Choose an actual capture route, such as a workout export, a structured quick-entry form, or explicit conversational save. Distinguish body weight from exercise load and ask when the query is ambiguous.
 
@@ -112,17 +114,17 @@ Provide a portable export of records, evidence, revisions, and schema versions. 
 
 ## 8. Choices to retain, qualify, or defer
 
-| Choice or claim | Review |
-|---|---|
-| Extend the existing Brain | Reasonable because working memory and authentication code exist. “Nothing else has provenance” is an unsupported comparative claim without a cited survey. |
-| Cloud lookup; ingestion can wait | Strong fit for mobile access. Keep source processing out of the normal answer path. Add exact/keyword lookup when embeddings are unavailable. |
-| Cloud embeddings | Sensible for this hosted topology. A local model is not inherently tied to a home Mac; compatible models can be hosted elsewhere. |
-| `text-embedding-3-large` at 1536 | Treat corpus superiority as a hypothesis to measure. Version the embedding configuration and prevent mixed old/new vectors during migration. Equal dimensions do not imply compatible vectors. |
-| OCR and local-model speed/quality claims | “Best free OCR,” tokens per second, and comparative extraction quality need representative measurements, not confident prose. |
-| Existing recall harness | Useful starting point, but it currently seeds fact/thought cases. Extend it for document chunks, exact fields, citations, and coverage before claiming it evaluates the new pipeline. |
-| Backfill estimate | Keep as an accepted rough budget, not a measured forecast. Track actual pages, retries, OCR, extraction, embedding, and recurring costs during the pilot. |
-| Portal browser automation | Pilot individual flows. Signed-in pages, embedded viewers, and exports differ; an extension does not automatically capture every portal faithfully. |
-| Photos, meetings, messaging, repository inventory | Useful later. They should not delay reliable everyday family records. |
+| Choice or claim                                   | Review                                                                                                                                                                                         |
+| ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Extend the existing Brain                         | Reasonable because working memory and authentication code exist. “Nothing else has provenance” is an unsupported comparative claim without a cited survey.                                     |
+| Cloud lookup; ingestion can wait                  | Strong fit for mobile access. Keep source processing out of the normal answer path. Add exact/keyword lookup when embeddings are unavailable.                                                  |
+| Cloud embeddings                                  | Sensible for this hosted topology. A local model is not inherently tied to a home Mac; compatible models can be hosted elsewhere.                                                              |
+| `text-embedding-3-large` at 1536                  | Treat corpus superiority as a hypothesis to measure. Version the embedding configuration and prevent mixed old/new vectors during migration. Equal dimensions do not imply compatible vectors. |
+| OCR and local-model speed/quality claims          | “Best free OCR,” tokens per second, and comparative extraction quality need representative measurements, not confident prose.                                                                  |
+| Existing recall harness                           | Useful starting point, but it currently seeds fact/thought cases. Extend it for document chunks, exact fields, citations, and coverage before claiming it evaluates the new pipeline.          |
+| Backfill estimate                                 | Keep as an accepted rough budget, not a measured forecast. Track actual pages, retries, OCR, extraction, embedding, and recurring costs during the pilot.                                      |
+| Portal browser automation                         | Pilot individual flows. Signed-in pages, embedded viewers, and exports differ; an extension does not automatically capture every portal faithfully.                                            |
+| Photos, meetings, messaging, repository inventory | Useful later. They should not delay reliable everyday family records.                                                                                                                          |
 
 Plan cleanup also includes the stale “permanent name” question, the public tracker's wrong path, connector enum drift between documents, and Phase 1's blanket Sonnet-class delegation conflicting with the required judgment/security review tier.
 
@@ -136,17 +138,17 @@ Plan cleanup also includes the stale “permanent name” question, the public t
 
 The first useful release must pass these product tests:
 
-| Test | Required outcome |
-|---|---|
-| Repeated measurement | Equal workout loads on two dates remain two observations; “last” selects by event date. |
-| Out-of-order import | An older result imported later never becomes the newest event merely because of ingestion time. |
-| Family identity | Two members retrieve and update the same shared person and vehicle; “me” resolves independently. |
-| Isolation and roles | Reader cannot write; private IDs/history/entities cannot be accessed; revocation blocks subsequent operations. |
-| Answer without source access | Stored date/value/evidence is returned while the worker is off; original-file access is reported separately. |
-| Incomplete archive | Missing periods and failed imports prevent an unqualified negative answer or complete total. |
-| Corrected source | A revised record updates relevant derived facts/summaries while preserving the audit trail. |
-| Worker interruption | Crash, retry, overlapping poll, and expired cursor produce no lost durable jobs or duplicate observations. |
-| Recovery and portability | Restore/export preserves record identity and citations; a second person can install from public artifacts alone. |
+| Test                         | Required outcome                                                                                                 |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| Repeated measurement         | Equal workout loads on two dates remain two observations; “last” selects by event date.                          |
+| Out-of-order import          | An older result imported later never becomes the newest event merely because of ingestion time.                  |
+| Family identity              | Two members retrieve and update the same shared person and vehicle; “me” resolves independently.                 |
+| Isolation and roles          | Reader cannot write; private IDs/history/entities cannot be accessed; revocation blocks subsequent operations.   |
+| Answer without source access | Stored date/value/evidence is returned while the worker is off; original-file access is reported separately.     |
+| Incomplete archive           | Missing periods and failed imports prevent an unqualified negative answer or complete total.                     |
+| Corrected source             | A revised record updates relevant derived facts/summaries while preserving the audit trail.                      |
+| Worker interruption          | Crash, retry, overlapping poll, and expired cursor produce no lost durable jobs or duplicate observations.       |
+| Recovery and portability     | Restore/export preserves record identity and citations; a second person can install from public artifacts alone. |
 
 Review acceptance: findings and sources recorded; no implementation or deployment is implied by accepting this report. The native mobile tests and representative-corpus benchmarks remain future work.
 
