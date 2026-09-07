@@ -1,12 +1,19 @@
-import { v } from "convex/values";
+import { ConvexError, v } from "convex/values";
 import { mutation, query } from "../../_generated/server";
 import { requireWebPrincipal } from "../../lib/webAuth";
 import { getAuthorizedReadSpaceIds, resolveWriteSpace } from "../../lib/spaces";
 import { requireSourceAccountAccess } from "../../lib/sourceAuth";
 
 function boundedText(value: string, name: string, maximum: number) {
-  if (!value.trim() || new TextEncoder().encode(value).length > maximum) {
-    throw new Error(`${name} is empty or too long`);
+  if (
+    !value.trim() ||
+    new TextEncoder().encode(value).length > maximum ||
+    new TextDecoder().decode(new TextEncoder().encode(value)) !== value
+  ) {
+    throw new ConvexError({
+      code: "invalid_input",
+      message: `${name} is empty, malformed or too long`,
+    });
   }
 }
 function validateFreshness(value: number) {
@@ -15,7 +22,10 @@ function validateFreshness(value: number) {
     value < 60_000 ||
     value > 365 * 86_400_000
   ) {
-    throw new Error("Freshness must be between one minute and one year");
+    throw new ConvexError({
+      code: "invalid_input",
+      message: "Freshness must be between one minute and one year",
+    });
   }
 }
 
@@ -45,7 +55,11 @@ export const create = mutation({
           .eq("accountId", args.accountId),
       )
       .unique();
-    if (existing) throw new Error("Source account already exists");
+    if (existing)
+      throw new ConvexError({
+        code: "source_account_exists",
+        message: "Source account already exists",
+      });
     return await ctx.db.insert("sourceAccounts", {
       spaceId,
       connector: args.connector,
@@ -105,14 +119,21 @@ export const list = query({
         .take(101 - accounts.length);
       accounts.push(...rows);
       if (accounts.length > 100)
-        throw new Error("Too many source accounts; filter spaces");
+        throw new ConvexError({
+          code: "source_account_limit",
+          message: "Too many source accounts; filter spaces",
+        });
     }
-    return accounts.map(({ _id, spaceId, name, connector, enabled }) => ({
-      _id,
-      spaceId,
-      name,
-      connector,
-      enabled,
-    }));
+    return accounts.map(
+      ({ _id, spaceId, name, connector, accountId, freshnessMs, enabled }) => ({
+        _id,
+        spaceId,
+        name,
+        connector,
+        accountId,
+        freshnessMs,
+        enabled,
+      }),
+    );
   },
 });

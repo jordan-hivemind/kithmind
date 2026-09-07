@@ -2,7 +2,7 @@ import { ConvexAuthNextjsServerProvider } from "@convex-dev/auth/nextjs/server";
 import { ConvexClientProvider } from "./ConvexClientProvider";
 
 export const metadata = {
-  title: "Open Brain",
+  title: "Kith Mind",
   description: "Your personal AI memory layer",
 };
 

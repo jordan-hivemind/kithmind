@@ -6,6 +6,7 @@ import { ingestionTables } from "./models/ingestion/tables";
 import { inlineWorkTables } from "./models/ingestion/inlineWorkTables";
 import { urlQueueTables } from "./models/ingestion/urlQueueTables";
 import { provenanceTables } from "./models/provenance/tables";
+import { familyTables } from "./models/family/tables";
 import { authTables } from "@convex-dev/auth/server";
 import { defineSchema, defineTable } from "convex/server";
 import { v } from "convex/values";
@@ -37,6 +38,7 @@ export default defineSchema({
   ...inlineWorkTables,
   ...urlQueueTables,
   ...provenanceTables,
+  ...familyTables,
   ...recordTables,
   ...recordQueryTables,
   thoughts: defineTable({
@@ -110,6 +112,7 @@ export default defineSchema({
   ]),
   spaceMembers: defineTable(spaceMemberFields)
     .index("by_spaceId_and_userId", ["spaceId", "userId"])
+    .index("by_spaceId_personEntityId", ["spaceId", "personEntityId"])
     .index("by_spaceId", ["spaceId"])
     .index("by_userId", ["userId"]),
   userSpaceSettings: defineTable(userSpaceSettingsFields)

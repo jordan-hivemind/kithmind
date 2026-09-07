@@ -12,6 +12,7 @@ export const isPublicRoute = createRouteMatcher([
   "/sign-in",
   "/sign-up",
   "/api/ingest",
+  "/invite",
   "/api/mcp(.*)",
   "/mcp/authorize",
 ]);

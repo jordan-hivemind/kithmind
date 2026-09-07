@@ -18,11 +18,12 @@ function Nav() {
         fontFamily: "system-ui, sans-serif",
       }}
     >
-      <strong>Open Brain</strong>
+      <strong>Kith Mind</strong>
       <Link href="/">Dashboard</Link>
       <Link href="/browse">Browse</Link>
       <Link href="/insights">Insights</Link>
       <Link href="/settings">Settings</Link>
+      <Link href="/spaces">Spaces</Link>
       <Link href="/getting-started">Getting Started</Link>
       <div style={{ marginLeft: "auto" }}>
         <button onClick={() => signOut()} style={{ cursor: "pointer" }}>
