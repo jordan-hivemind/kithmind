@@ -25,6 +25,9 @@ are still being implemented. The public architecture and staged plan are in
 - Versioned lab, vehicle-service and financial records with exact decimal
   queries, retained evidence and coverage-aware pagination through `query_records`.
   See the [typed-record contract](docs/plans/2026-09-06-record-query-contract.md).
+- Desktop family spaces with Personal/shared separation, invitation approval,
+  roles, explicit person links, default write destinations, source identities,
+  and scoped API keys. See the [family spaces guide](docs/family-spaces.md).
 - Authenticated text capture with durable processing and retry-safe request IDs,
   plus an explicitly unfetched URL queue. See the
   [capture contract](docs/plans/2026-09-06-inline-ingestion-contract.md).
@@ -39,8 +42,6 @@ requirements, including server-side OpenAI and Anthropic API credentials.
 
 The following are architecture commitments, not current product features:
 
-- Family membership, invitations, person linking, and source configuration in
-  the desktop settings workflow.
 - Extraction of typed records from real sources.
 - A Mac-hosted daemon, filesystem and service connectors, extraction
   playbooks, and background ingestion.

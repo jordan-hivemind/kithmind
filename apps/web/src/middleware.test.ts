@@ -30,8 +30,25 @@ describe("web authentication middleware", () => {
     expect(isAuthenticated).not.toHaveBeenCalled();
   });
 
+  test("allows the exact invite landing page without authorizing membership", async () => {
+    const isAuthenticated = vi.fn().mockResolvedValue(false);
+    const invite = request("/invite");
+    expect(isPublicRoute(invite)).toBe(true);
+    expect(
+      await handleMiddlewareRequest(invite, {
+        convexAuth: { isAuthenticated },
+      }),
+    ).toBeUndefined();
+    expect(isAuthenticated).not.toHaveBeenCalled();
+  });
+
   test("still redirects unauthenticated web and ingest subpaths", async () => {
-    for (const pathname of ["/settings", "/api/ingest/other"]) {
+    for (const pathname of [
+      "/settings",
+      "/spaces",
+      "/invite/other",
+      "/api/ingest/other",
+    ]) {
       const unauthenticated = request(pathname);
       expect(isPublicRoute(unauthenticated)).toBe(false);
 

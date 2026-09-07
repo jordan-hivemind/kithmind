@@ -1,5 +1,5 @@
 import { query, mutation } from "../../_generated/server";
-import { v } from "convex/values";
+import { ConvexError, v } from "convex/values";
 import { requireWebPrincipal } from "../../lib/webAuth";
 import {
   ensurePersonalSpace,
@@ -11,6 +11,19 @@ import { _listByUser, _insertOne, _deleteOne, _updateOne } from "./model";
 import type { MutationCtx } from "../../_generated/server";
 import type { Id } from "../../_generated/dataModel";
 import { capability } from "./validators";
+
+function validateName(name: string) {
+  if (
+    !name.trim() ||
+    name.length > 200 ||
+    new TextDecoder().decode(new TextEncoder().encode(name)) !== name
+  ) {
+    throw new ConvexError({
+      code: "invalid_input",
+      message: "API key name must contain 1 to 200 valid characters.",
+    });
+  }
+}
 
 async function validateScopes(
   ctx: MutationCtx,
@@ -95,6 +108,7 @@ export const create = mutation({
   handler: async (ctx, args) => {
     const principal = await requireWebPrincipal(ctx);
     const { userId } = principal;
+    validateName(args.name);
     await ensurePersonalSpace(ctx, userId);
     await validateScopes(
       ctx,
@@ -150,6 +164,7 @@ export const update = mutation({
   handler: async (ctx, args) => {
     const principal = await requireWebPrincipal(ctx);
     const { userId } = principal;
+    if (args.name !== undefined) validateName(args.name);
     await validateScopes(
       ctx,
       principal,

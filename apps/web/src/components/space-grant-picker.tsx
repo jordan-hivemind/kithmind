@@ -5,18 +5,29 @@ import type { Id } from "@repo/db/convex/_generated/dataModel";
 import { useConvexAuth, useMutation, useQuery } from "convex/react";
 import { useEffect, useState } from "react";
 
-export type KeyCapability = "read" | "write";
+export type KeyCapability = "read" | "write" | "ingest";
+
+const defaultCapabilities: readonly KeyCapability[] = ["read", "write"];
+
+const capabilityCopy: Record<KeyCapability, string> = {
+  read: "Read records",
+  write: "Create and change records where your role permits",
+  ingest: "Admit content from the selected source accounts",
+};
 
 export function SpaceGrantPicker({
   spaceIds,
   onSpaceIdsChange,
   capabilities,
   onCapabilitiesChange,
+  allowedCapabilities = defaultCapabilities,
 }: {
   spaceIds: Id<"spaces">[];
   onSpaceIdsChange: (ids: Id<"spaces">[]) => void;
   capabilities: KeyCapability[];
   onCapabilitiesChange: (values: KeyCapability[]) => void;
+  /** OAuth callers use the read/write default. Settings may also grant ingest. */
+  allowedCapabilities?: readonly KeyCapability[];
 }) {
   const { isAuthenticated } = useConvexAuth();
   const ensurePersonal = useMutation(api.models.spaces.public.ensurePersonal);
@@ -55,6 +66,13 @@ export function SpaceGrantPicker({
     if (remaining.length !== spaceIds.length) onSpaceIdsChange(remaining);
   }, [spaces, spaceIds, onSpaceIdsChange]);
 
+  useEffect(() => {
+    const permitted = capabilities.filter((capability) =>
+      allowedCapabilities.includes(capability),
+    );
+    if (permitted.length !== capabilities.length) onCapabilitiesChange(permitted);
+  }, [allowedCapabilities, capabilities, onCapabilitiesChange]);
+
   return (
     <fieldset
       style={{
@@ -90,7 +108,7 @@ export function SpaceGrantPicker({
           {space.role === "reader" && " · read only"}
         </label>
       ))}
-      {(["read", "write"] as const).map((capability) => (
+      {allowedCapabilities.map((capability) => (
         <label key={capability} style={{ display: "block", marginTop: 8 }}>
           <input
             type="checkbox"
@@ -103,9 +121,7 @@ export function SpaceGrantPicker({
               )
             }
           />{" "}
-          {capability === "read"
-            ? "Read records"
-            : "Create and change records where your role permits"}
+          {capabilityCopy[capability]}
         </label>
       ))}
       <p style={{ color: "#666", fontSize: 13, marginBottom: 0 }}>
