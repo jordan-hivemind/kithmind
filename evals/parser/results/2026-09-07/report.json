@@ -1,0 +1,1024 @@
+{
+  "configuration": {
+    "addressSpaceLimit": "unavailable_on_macos",
+    "allowedFormats": [
+      "PDF"
+    ],
+    "device": "cpu",
+    "doclingPipeline": "standard",
+    "externalPlugins": false,
+    "maxInputBytes": 16777216,
+    "maxOutputBytesPerFile": 67108864,
+    "maxPages": 64,
+    "networkIsolation": "macos_sandbox_exec_deny_network_verified",
+    "ocr": "RapidOCR onnxruntime English",
+    "remoteServices": false,
+    "sampledProcessTreeRssLimitBytes": 4294967296,
+    "source": "local_bounded_bytes_document_stream",
+    "threads": 4,
+    "wallTimeoutSeconds": 210
+  },
+  "dependencyLockSha256": "fca91dc7c61abc0689de891a015c5ad8ee00d9791c3b3f1f0991d5d768ede364",
+  "fixtureHashes": {
+    "contract-continuation.pdf": "5d5cb1d4cc5b6f27feb551e8ee0934f4c9e6bbe97e0a8b6d8b0621e9d4a06118",
+    "financial-statement.pdf": "fc41a9f96413c2c97d29312304397aa453418f445a5c6b8b27c758c98ec30bb8",
+    "image-clear.pdf": "6811f16380161235ed57a1cdd9e6e6e5fe89ee494542bc006e33fc7ac1e45add",
+    "image-partial.pdf": "b07ba209ed26959a31658c7d717d69d811b145688f2b5722e849703546234cf1",
+    "lab-report-unicode.pdf": "41cf2ab4a0fb028d83e0ec616b473578e9cfeaf580bf28aa0a36fac67ea6f7e0",
+    "vehicle-receipt.pdf": "5210998900fb325493d6a46cfc1e805ff623e632fe6adf9810bf179ea5942347"
+  },
+  "fixtureLabelsSha256": "bb109c02edb3bde23b57e4c1a1832b76260fa105f35f0ebb7629ff611f652d6f",
+  "implementation": [
+    {
+      "path": "src/parser_eval/__init__.py",
+      "sha256": "7e291c9697d11b9df6c1f86176718a2d0ad1d9daf9b369dc859bd275328b7611"
+    },
+    {
+      "path": "src/parser_eval/convert_worker.py",
+      "sha256": "4427c13e38560e85d4f3fb597cf5f08e35c153621f5e0e5464a827425d417b8a"
+    },
+    {
+      "path": "src/parser_eval/manifest.py",
+      "sha256": "1ae5bf8f6ce959ca2b807dae51192ea3a585078271cbed71dbb44460b3d25e52"
+    },
+    {
+      "path": "src/parser_eval/normalize.py",
+      "sha256": "fa586775f7f47f877afd60df48ff61296e76ca63a55eec193c8bf5d33a36f8f0"
+    },
+    {
+      "path": "src/parser_eval/prepare_models.py",
+      "sha256": "f8bf187fc8721fad9cdb7abf7f8447bdd344cf9a291a68c0fb9f660538010fa0"
+    },
+    {
+      "path": "src/parser_eval/run.py",
+      "sha256": "b967c395c659ecf0e41514729f9c5c36bae1ec1f2a10125852a91b95128298d4"
+    },
+    {
+      "path": "src/parser_eval/schema.py",
+      "sha256": "085e44b9931e8e019e3b20d3311a9bffb74031ea04b55837efa10776ee980b46"
+    },
+    {
+      "path": "src/parser_eval/scoring.py",
+      "sha256": "5a38f324dac7e94bd3f03165bf904e8cf8f33fe7a3595b0b43212a851ddf46b8"
+    }
+  ],
+  "limitations": {
+    "linuxNetworkIsolation": "unverified",
+    "providerPlaceholderDetection": "not_applicable_synthetic_local_files",
+    "unknownFieldDetection": "unverified_p2_10"
+  },
+  "machine": {
+    "architecture": "arm64",
+    "cpuModel": "Apple M1 Pro",
+    "logicalCpuCount": 10,
+    "operatingSystem": "Darwin",
+    "python": "3.12.12",
+    "release": "25.6.0"
+  },
+  "modelManifestSha256": "5244eecd795e10c8fd7f4be27634349e0ffd43901fc6c92a5832a7512b6e1cd9",
+  "processingFingerprint": "4c4ecf6622cccdca4381141f52d4c5a357dfbe862e608883e7c75ef9fcf887a5",
+  "results": [
+    {
+      "candidate": "docling-standard-cpu-ocr",
+      "fixtureId": "financial-statement",
+      "mappingGaps": [],
+      "runtime": {
+        "elapsedSeconds": 8.73804,
+        "losslessOutput": "retained/docling-standard-cpu-ocr--financial-statement.lossless.json",
+        "losslessSha256": "108d7f7acfced5bf5505a1da631beefe2abe4bbd4c1392b99864e5f13aa0a54b",
+        "memoryExceeded": false,
+        "normalizedOutput": "retained/docling-standard-cpu-ocr--financial-statement.normalized.json",
+        "normalizedSha256": "93a3535902c8455c56b66d9e5bad3aae226ad2976acdd216273bfdef23aee43d",
+        "peakRssBytes": 2137915392,
+        "returnCode": 0,
+        "state": "complete",
+        "timedOut": false
+      },
+      "score": {
+        "assertions": [
+          {
+            "evidence": {
+              "end": 80,
+              "start": 55
+            },
+            "id": "summary",
+            "locator": {
+              "segmentId": "docling-item-0"
+            },
+            "page": 1,
+            "passed": true,
+            "quote": "Summary total: USD 130.00"
+          },
+          {
+            "evidence": {
+              "end": 148,
+              "start": 131
+            },
+            "id": "fee-row-0",
+            "locator": {
+              "segmentId": "docling-table-1-0-row-1"
+            },
+            "page": 1,
+            "passed": true,
+            "quote": "Fee | USD | 65.00",
+            "table": {
+              "expectedTableId": "line-items-page-1",
+              "parserRowOrdinal": 0,
+              "parserTableOrdinal": 0,
+              "passed": true,
+              "segmentId": "docling-table-1-0-row-1"
+            }
+          },
+          {
+            "evidence": {
+              "end": 166,
+              "start": 149
+            },
+            "id": "fee-row-1",
+            "locator": {
+              "segmentId": "docling-table-1-0-row-2"
+            },
+            "page": 1,
+            "passed": true,
+            "quote": "Fee | USD | 65.00",
+            "table": {
+              "expectedTableId": "line-items-page-1",
+              "parserRowOrdinal": 1,
+              "parserTableOrdinal": 0,
+              "passed": true,
+              "segmentId": "docling-table-1-0-row-2"
+            }
+          },
+          {
+            "evidence": {
+              "end": 121,
+              "start": 100
+            },
+            "id": "eur-refund",
+            "locator": {
+              "segmentId": "docling-table-2-0-row-1"
+            },
+            "page": 2,
+            "passed": true,
+            "quote": "Refund | EUR | -10.00",
+            "table": {
+              "expectedTableId": "line-items-page-2",
+              "parserRowOrdinal": 0,
+              "parserTableOrdinal": 0,
+              "passed": true,
+              "segmentId": "docling-table-2-0-row-1"
+            }
+          }
+        ],
+        "automaticGapDetection": "not_implemented_p2_10",
+        "conversionSucceeded": true,
+        "expectedGapAnnotations": [],
+        "fixtureId": "financial-statement",
+        "forbiddenValueChecks": [
+          {
+            "passed": true,
+            "value": "USD 130.01"
+          }
+        ],
+        "pageCountMatched": true,
+        "passed": true
+      }
+    },
+    {
+      "candidate": "docling-standard-cpu-ocr",
+      "fixtureId": "lab-report-unicode",
+      "mappingGaps": [],
+      "runtime": {
+        "elapsedSeconds": 5.815532,
+        "losslessOutput": "retained/docling-standard-cpu-ocr--lab-report-unicode.lossless.json",
+        "losslessSha256": "6466447870b10ce20efb89ed91a0e6b9dbfa8e6331338f2699ae010d28994a22",
+        "memoryExceeded": false,
+        "normalizedOutput": "retained/docling-standard-cpu-ocr--lab-report-unicode.normalized.json",
+        "normalizedSha256": "0d77f4a7089d9812a4d627aa911f57274697a35572da54c8317bfcec212c6b6d",
+        "peakRssBytes": 1519288320,
+        "returnCode": 0,
+        "state": "complete",
+        "timedOut": false
+      },
+      "score": {
+        "assertions": [
+          {
+            "evidence": {
+              "end": 43,
+              "start": 21
+            },
+            "id": "patient-a",
+            "locator": {
+              "segmentId": "docling-item-0"
+            },
+            "page": 1,
+            "passed": true,
+            "quote": "Patient: Alex Sample A"
+          },
+          {
+            "evidence": {
+              "end": 65,
+              "start": 44
+            },
+            "id": "draw-a",
+            "locator": {
+              "segmentId": "docling-item-0"
+            },
+            "page": 1,
+            "passed": true,
+            "quote": "Draw date: 2026-02-01"
+          },
+          {
+            "evidence": {
+              "end": 100,
+              "start": 85
+            },
+            "id": "micro",
+            "locator": {
+              "segmentId": "docling-item-0"
+            },
+            "page": 1,
+            "passed": true,
+            "quote": "Result: 25 µg/L"
+          },
+          {
+            "evidence": {
+              "end": 127,
+              "start": 101
+            },
+            "id": "astral",
+            "locator": {
+              "segmentId": "docling-item-0"
+            },
+            "page": 1,
+            "passed": true,
+            "quote": "Astral marker: 🌍 retained"
+          },
+          {
+            "evidence": {
+              "end": 151,
+              "start": 128
+            },
+            "id": "patient-b",
+            "locator": {
+              "segmentId": "docling-item-0"
+            },
+            "page": 1,
+            "passed": true,
+            "quote": "Patient: Blair Sample B"
+          },
+          {
+            "evidence": {
+              "end": 173,
+              "start": 152
+            },
+            "id": "draw-b",
+            "locator": {
+              "segmentId": "docling-item-0"
+            },
+            "page": 1,
+            "passed": true,
+            "quote": "Draw date: 2026-02-02"
+          },
+          {
+            "evidence": {
+              "end": 194,
+              "start": 174
+            },
+            "id": "accent",
+            "locator": {
+              "segmentId": "docling-item-0"
+            },
+            "page": 1,
+            "passed": true,
+            "quote": "Analyte: Café marker"
+          },
+          {
+            "evidence": {
+              "end": 211,
+              "start": 195
+            },
+            "id": "result-b",
+            "locator": {
+              "segmentId": "docling-item-0"
+            },
+            "page": 1,
+            "passed": true,
+            "quote": "Result: 8.2 mg/L"
+          }
+        ],
+        "automaticGapDetection": "not_implemented_p2_10",
+        "conversionSucceeded": true,
+        "expectedGapAnnotations": [],
+        "fixtureId": "lab-report-unicode",
+        "forbiddenValueChecks": [
+          {
+            "passed": true,
+            "value": "Patient: Alex Sample B"
+          }
+        ],
+        "pageCountMatched": true,
+        "passed": true
+      }
+    },
+    {
+      "candidate": "docling-standard-cpu-ocr",
+      "fixtureId": "vehicle-receipt",
+      "mappingGaps": [],
+      "runtime": {
+        "elapsedSeconds": 5.330731,
+        "losslessOutput": "retained/docling-standard-cpu-ocr--vehicle-receipt.lossless.json",
+        "losslessSha256": "9e28a4a00021b914c8628bc84645bc56065ba72f8de6b8bd7841761ec4fadacc",
+        "memoryExceeded": false,
+        "normalizedOutput": "retained/docling-standard-cpu-ocr--vehicle-receipt.normalized.json",
+        "normalizedSha256": "f5911f28442853a23c2dd6aa9f1e6a5acf1666fd3ebd64304b83a8cc4833a407",
+        "peakRssBytes": 1517191168,
+        "returnCode": 0,
+        "state": "complete",
+        "timedOut": false
+      },
+      "score": {
+        "assertions": [
+          {
+            "evidence": {
+              "end": 81,
+              "start": 57
+            },
+            "id": "service-date",
+            "locator": {
+              "segmentId": "docling-item-0"
+            },
+            "page": 1,
+            "passed": true,
+            "quote": "Service date: 2026-03-03"
+          },
+          {
+            "evidence": {
+              "end": 104,
+              "start": 82
+            },
+            "id": "service",
+            "locator": {
+              "segmentId": "docling-item-0"
+            },
+            "page": 1,
+            "passed": true,
+            "quote": "Oil change | USD 79.00"
+          },
+          {
+            "evidence": {
+              "end": 149,
+              "start": 133
+            },
+            "id": "total",
+            "locator": {
+              "segmentId": "docling-item-0"
+            },
+            "page": 1,
+            "passed": true,
+            "quote": "Total: USD 79.00"
+          }
+        ],
+        "automaticGapDetection": "not_implemented_p2_10",
+        "conversionSucceeded": true,
+        "expectedGapAnnotations": [],
+        "fixtureId": "vehicle-receipt",
+        "forbiddenValueChecks": [
+          {
+            "passed": true,
+            "value": "USD 79.01"
+          }
+        ],
+        "pageCountMatched": true,
+        "passed": true
+      }
+    },
+    {
+      "candidate": "docling-standard-cpu-ocr",
+      "fixtureId": "contract-continuation",
+      "mappingGaps": [],
+      "runtime": {
+        "elapsedSeconds": 5.713213,
+        "losslessOutput": "retained/docling-standard-cpu-ocr--contract-continuation.lossless.json",
+        "losslessSha256": "f9b381eca14d8e46a0d0b75d20349d4bbafdea2b265ec594846cdccba60199bc",
+        "memoryExceeded": false,
+        "normalizedOutput": "retained/docling-standard-cpu-ocr--contract-continuation.normalized.json",
+        "normalizedSha256": "4ff2c3b8220573351686fda96ec4b82bf1c993a20c24d35f083bf86c83c728a6",
+        "peakRssBytes": 1529970688,
+        "returnCode": 0,
+        "state": "complete",
+        "timedOut": false
+      },
+      "score": {
+        "assertions": [
+          {
+            "evidence": {
+              "end": 79,
+              "start": 56
+            },
+            "id": "start",
+            "locator": {
+              "segmentId": "docling-item-0"
+            },
+            "page": 1,
+            "passed": true,
+            "quote": "Term begins: 2026-04-01"
+          },
+          {
+            "evidence": {
+              "end": 81,
+              "start": 40
+            },
+            "id": "continuation",
+            "locator": {
+              "segmentId": "docling-item-1"
+            },
+            "page": 2,
+            "passed": true,
+            "quote": "Section 1. Payment is due within 30 days."
+          }
+        ],
+        "automaticGapDetection": "not_implemented_p2_10",
+        "conversionSucceeded": true,
+        "expectedGapAnnotations": [],
+        "fixtureId": "contract-continuation",
+        "forbiddenValueChecks": [
+          {
+            "passed": true,
+            "value": "within 31 days"
+          }
+        ],
+        "pageCountMatched": true,
+        "passed": true
+      }
+    },
+    {
+      "candidate": "docling-standard-cpu-ocr",
+      "fixtureId": "image-clear",
+      "mappingGaps": [],
+      "runtime": {
+        "elapsedSeconds": 5.837622,
+        "losslessOutput": "retained/docling-standard-cpu-ocr--image-clear.lossless.json",
+        "losslessSha256": "4bf449144409d2771e1cfcff3e873af8d62bce89ace625e3fa6af9209b131ae1",
+        "memoryExceeded": false,
+        "normalizedOutput": "retained/docling-standard-cpu-ocr--image-clear.normalized.json",
+        "normalizedSha256": "b1c3664e7a0c61d19333e6501289269a450ccf4a3bdee971e5b472a244581ac1",
+        "peakRssBytes": 1557889024,
+        "returnCode": 0,
+        "state": "complete",
+        "timedOut": false
+      },
+      "score": {
+        "assertions": [
+          {
+            "evidence": {
+              "end": 64,
+              "start": 43
+            },
+            "id": "amount",
+            "locator": {
+              "segmentId": "docling-item-0"
+            },
+            "page": 1,
+            "passed": true,
+            "quote": "Amount due: USD 42.00"
+          }
+        ],
+        "automaticGapDetection": "not_implemented_p2_10",
+        "conversionSucceeded": true,
+        "expectedGapAnnotations": [],
+        "fixtureId": "image-clear",
+        "forbiddenValueChecks": [
+          {
+            "passed": true,
+            "value": "USD 42.01"
+          }
+        ],
+        "pageCountMatched": true,
+        "passed": true
+      }
+    },
+    {
+      "candidate": "docling-standard-cpu-ocr",
+      "fixtureId": "image-partial",
+      "mappingGaps": [],
+      "runtime": {
+        "elapsedSeconds": 6.793795,
+        "losslessOutput": "retained/docling-standard-cpu-ocr--image-partial.lossless.json",
+        "losslessSha256": "95b1a137800ccc919876075018081a66122b9d8ba3f0c3e5edbc9a9273ee9079",
+        "memoryExceeded": false,
+        "normalizedOutput": "retained/docling-standard-cpu-ocr--image-partial.normalized.json",
+        "normalizedSha256": "e07c3884d38f65b2858ea41ce442b1bb174a81a3a6887ae81f7076b12f198978",
+        "peakRssBytes": 1978171392,
+        "returnCode": 0,
+        "state": "complete",
+        "timedOut": false
+      },
+      "score": {
+        "assertions": [
+          {
+            "evidence": {
+              "end": 41,
+              "start": 19
+            },
+            "id": "reference",
+            "locator": {
+              "segmentId": "docling-item-0"
+            },
+            "page": 1,
+            "passed": true,
+            "quote": "Reference: PARTIAL-001"
+          }
+        ],
+        "automaticGapDetection": "not_implemented_p2_10",
+        "conversionSucceeded": true,
+        "expectedGapAnnotations": [
+          {
+            "kind": "unreadable",
+            "page": 1,
+            "reason": "unknown_value"
+          }
+        ],
+        "fixtureId": "image-partial",
+        "forbiddenValueChecks": [
+          {
+            "passed": true,
+            "value": "TOTAL: USD 99.00"
+          }
+        ],
+        "pageCountMatched": true,
+        "passed": true
+      }
+    },
+    {
+      "candidate": "pdfplumber-native-text",
+      "fixtureId": "financial-statement",
+      "mappingGaps": [],
+      "runtime": {
+        "elapsedSeconds": 0.131423,
+        "losslessOutput": "retained/pdfplumber-native-text--financial-statement.lossless.json",
+        "losslessSha256": "28c658e5799c8e5f832bcb38fe22ff725d37d7fb91ed198ea982f29c13da8ff1",
+        "memoryExceeded": false,
+        "normalizedOutput": "retained/pdfplumber-native-text--financial-statement.normalized.json",
+        "normalizedSha256": "ffb48cfabcd31b2739dd32148450539795cadcf1b85567e8640830345027ba9b",
+        "peakRssBytes": 31637504,
+        "returnCode": 0,
+        "state": "complete",
+        "timedOut": false
+      },
+      "score": {
+        "assertions": [
+          {
+            "evidence": {
+              "end": 80,
+              "start": 55
+            },
+            "id": "summary",
+            "locator": {
+              "segmentId": "pdfplumber-page-1-line-2"
+            },
+            "page": 1,
+            "passed": true,
+            "quote": "Summary total: USD 130.00"
+          },
+          {
+            "evidence": {
+              "end": 148,
+              "start": 131
+            },
+            "id": "fee-row-0",
+            "locator": {
+              "segmentId": "pdfplumber-table-1-0-row-1"
+            },
+            "page": 1,
+            "passed": true,
+            "quote": "Fee | USD | 65.00",
+            "table": {
+              "expectedTableId": "line-items-page-1",
+              "parserRowOrdinal": 0,
+              "parserTableOrdinal": 0,
+              "passed": true,
+              "segmentId": "pdfplumber-table-1-0-row-1"
+            }
+          },
+          {
+            "evidence": {
+              "end": 166,
+              "start": 149
+            },
+            "id": "fee-row-1",
+            "locator": {
+              "segmentId": "pdfplumber-table-1-0-row-2"
+            },
+            "page": 1,
+            "passed": true,
+            "quote": "Fee | USD | 65.00",
+            "table": {
+              "expectedTableId": "line-items-page-1",
+              "parserRowOrdinal": 1,
+              "parserTableOrdinal": 0,
+              "passed": true,
+              "segmentId": "pdfplumber-table-1-0-row-2"
+            }
+          },
+          {
+            "evidence": {
+              "end": 121,
+              "start": 100
+            },
+            "id": "eur-refund",
+            "locator": {
+              "segmentId": "pdfplumber-table-2-0-row-1"
+            },
+            "page": 2,
+            "passed": true,
+            "quote": "Refund | EUR | -10.00",
+            "table": {
+              "expectedTableId": "line-items-page-2",
+              "parserRowOrdinal": 0,
+              "parserTableOrdinal": 0,
+              "passed": true,
+              "segmentId": "pdfplumber-table-2-0-row-1"
+            }
+          }
+        ],
+        "automaticGapDetection": "not_implemented_p2_10",
+        "conversionSucceeded": true,
+        "expectedGapAnnotations": [],
+        "fixtureId": "financial-statement",
+        "forbiddenValueChecks": [
+          {
+            "passed": true,
+            "value": "USD 130.01"
+          }
+        ],
+        "pageCountMatched": true,
+        "passed": true
+      }
+    },
+    {
+      "candidate": "pdfplumber-native-text",
+      "fixtureId": "lab-report-unicode",
+      "mappingGaps": [],
+      "runtime": {
+        "elapsedSeconds": 0.135542,
+        "losslessOutput": "retained/pdfplumber-native-text--lab-report-unicode.lossless.json",
+        "losslessSha256": "f612be15ce874f2e609ca74b358d9fec850c5c733babc88282e7379cfe3485a0",
+        "memoryExceeded": false,
+        "normalizedOutput": "retained/pdfplumber-native-text--lab-report-unicode.normalized.json",
+        "normalizedSha256": "62447d9cb87ea225ebbfc045caa20e276573e8015350d9e4a7def7ac9316c0d2",
+        "peakRssBytes": 36913152,
+        "returnCode": 0,
+        "state": "complete",
+        "timedOut": false
+      },
+      "score": {
+        "assertions": [
+          {
+            "evidence": {
+              "end": 43,
+              "start": 21
+            },
+            "id": "patient-a",
+            "locator": {
+              "segmentId": "pdfplumber-page-1-line-1"
+            },
+            "page": 1,
+            "passed": true,
+            "quote": "Patient: Alex Sample A"
+          },
+          {
+            "evidence": {
+              "end": 65,
+              "start": 44
+            },
+            "id": "draw-a",
+            "locator": {
+              "segmentId": "pdfplumber-page-1-line-2"
+            },
+            "page": 1,
+            "passed": true,
+            "quote": "Draw date: 2026-02-01"
+          },
+          {
+            "evidence": {
+              "end": 100,
+              "start": 85
+            },
+            "id": "micro",
+            "locator": {
+              "segmentId": "pdfplumber-page-1-line-4"
+            },
+            "page": 1,
+            "passed": true,
+            "quote": "Result: 25 µg/L"
+          },
+          {
+            "evidence": {
+              "end": 127,
+              "start": 101
+            },
+            "id": "astral",
+            "locator": {
+              "segmentId": "pdfplumber-page-1-line-5"
+            },
+            "page": 1,
+            "passed": true,
+            "quote": "Astral marker: 🌍 retained"
+          },
+          {
+            "evidence": {
+              "end": 151,
+              "start": 128
+            },
+            "id": "patient-b",
+            "locator": {
+              "segmentId": "pdfplumber-page-1-line-6"
+            },
+            "page": 1,
+            "passed": true,
+            "quote": "Patient: Blair Sample B"
+          },
+          {
+            "evidence": {
+              "end": 173,
+              "start": 152
+            },
+            "id": "draw-b",
+            "locator": {
+              "segmentId": "pdfplumber-page-1-line-7"
+            },
+            "page": 1,
+            "passed": true,
+            "quote": "Draw date: 2026-02-02"
+          },
+          {
+            "evidence": {
+              "end": 194,
+              "start": 174
+            },
+            "id": "accent",
+            "locator": {
+              "segmentId": "pdfplumber-page-1-line-8"
+            },
+            "page": 1,
+            "passed": true,
+            "quote": "Analyte: Café marker"
+          },
+          {
+            "evidence": {
+              "end": 211,
+              "start": 195
+            },
+            "id": "result-b",
+            "locator": {
+              "segmentId": "pdfplumber-page-1-line-9"
+            },
+            "page": 1,
+            "passed": true,
+            "quote": "Result: 8.2 mg/L"
+          }
+        ],
+        "automaticGapDetection": "not_implemented_p2_10",
+        "conversionSucceeded": true,
+        "expectedGapAnnotations": [],
+        "fixtureId": "lab-report-unicode",
+        "forbiddenValueChecks": [
+          {
+            "passed": true,
+            "value": "Patient: Alex Sample B"
+          }
+        ],
+        "pageCountMatched": true,
+        "passed": true
+      }
+    },
+    {
+      "candidate": "pdfplumber-native-text",
+      "fixtureId": "vehicle-receipt",
+      "mappingGaps": [],
+      "runtime": {
+        "elapsedSeconds": 0.136759,
+        "losslessOutput": "retained/pdfplumber-native-text--vehicle-receipt.lossless.json",
+        "losslessSha256": "5c1f2c980691caa0e94ee636971c3f749355d76f8ae165512f358baa69f4bac7",
+        "memoryExceeded": false,
+        "normalizedOutput": "retained/pdfplumber-native-text--vehicle-receipt.normalized.json",
+        "normalizedSha256": "414aa17037e5f1ac4544272cb47c0d9d4a59fdbe2f85c16f7428f61dd7cbe8cb",
+        "peakRssBytes": 36519936,
+        "returnCode": 0,
+        "state": "complete",
+        "timedOut": false
+      },
+      "score": {
+        "assertions": [
+          {
+            "evidence": {
+              "end": 81,
+              "start": 57
+            },
+            "id": "service-date",
+            "locator": {
+              "segmentId": "pdfplumber-page-1-line-2"
+            },
+            "page": 1,
+            "passed": true,
+            "quote": "Service date: 2026-03-03"
+          },
+          {
+            "evidence": {
+              "end": 104,
+              "start": 82
+            },
+            "id": "service",
+            "locator": {
+              "segmentId": "pdfplumber-page-1-line-3"
+            },
+            "page": 1,
+            "passed": true,
+            "quote": "Oil change | USD 79.00"
+          },
+          {
+            "evidence": {
+              "end": 149,
+              "start": 133
+            },
+            "id": "total",
+            "locator": {
+              "segmentId": "pdfplumber-page-1-line-5"
+            },
+            "page": 1,
+            "passed": true,
+            "quote": "Total: USD 79.00"
+          }
+        ],
+        "automaticGapDetection": "not_implemented_p2_10",
+        "conversionSucceeded": true,
+        "expectedGapAnnotations": [],
+        "fixtureId": "vehicle-receipt",
+        "forbiddenValueChecks": [
+          {
+            "passed": true,
+            "value": "USD 79.01"
+          }
+        ],
+        "pageCountMatched": true,
+        "passed": true
+      }
+    },
+    {
+      "candidate": "pdfplumber-native-text",
+      "fixtureId": "contract-continuation",
+      "mappingGaps": [],
+      "runtime": {
+        "elapsedSeconds": 0.136492,
+        "losslessOutput": "retained/pdfplumber-native-text--contract-continuation.lossless.json",
+        "losslessSha256": "fdae27def19fd86ca961312f0d5c5ae7805886d3072f249b1013afe2d3276556",
+        "memoryExceeded": false,
+        "normalizedOutput": "retained/pdfplumber-native-text--contract-continuation.normalized.json",
+        "normalizedSha256": "a387a3bdf58ea73e240bd4f6b683c136f88589ec39eeeb130192f1949d3896ad",
+        "peakRssBytes": 36536320,
+        "returnCode": 0,
+        "state": "complete",
+        "timedOut": false
+      },
+      "score": {
+        "assertions": [
+          {
+            "evidence": {
+              "end": 79,
+              "start": 56
+            },
+            "id": "start",
+            "locator": {
+              "segmentId": "pdfplumber-page-1-line-2"
+            },
+            "page": 1,
+            "passed": true,
+            "quote": "Term begins: 2026-04-01"
+          },
+          {
+            "evidence": {
+              "end": 81,
+              "start": 40
+            },
+            "id": "continuation",
+            "locator": {
+              "segmentId": "pdfplumber-page-2-line-1"
+            },
+            "page": 2,
+            "passed": true,
+            "quote": "Section 1. Payment is due within 30 days."
+          }
+        ],
+        "automaticGapDetection": "not_implemented_p2_10",
+        "conversionSucceeded": true,
+        "expectedGapAnnotations": [],
+        "fixtureId": "contract-continuation",
+        "forbiddenValueChecks": [
+          {
+            "passed": true,
+            "value": "within 31 days"
+          }
+        ],
+        "pageCountMatched": true,
+        "passed": true
+      }
+    },
+    {
+      "candidate": "pdfplumber-native-text",
+      "fixtureId": "image-clear",
+      "mappingGaps": [],
+      "runtime": {
+        "elapsedSeconds": 0.134604,
+        "losslessOutput": "retained/pdfplumber-native-text--image-clear.lossless.json",
+        "losslessSha256": "2675b116b160bebf572c3d701a5532ae3772b00dc108297022a3d55e99e59994",
+        "memoryExceeded": false,
+        "normalizedOutput": "retained/pdfplumber-native-text--image-clear.normalized.json",
+        "normalizedSha256": "215580897b5abc97206bd9f78eb63ce31b6b35c9ca7e2efc8ee2f36ad6b4805c",
+        "peakRssBytes": 36388864,
+        "returnCode": 0,
+        "state": "complete",
+        "timedOut": false
+      },
+      "score": {
+        "assertions": [
+          {
+            "id": "amount",
+            "page": 1,
+            "passed": false,
+            "quote": "Amount due: USD 42.00",
+            "reason": "exact_mapped_quote_missing"
+          }
+        ],
+        "automaticGapDetection": "not_implemented_p2_10",
+        "conversionSucceeded": true,
+        "expectedGapAnnotations": [],
+        "fixtureId": "image-clear",
+        "forbiddenValueChecks": [
+          {
+            "passed": true,
+            "value": "USD 42.01"
+          }
+        ],
+        "pageCountMatched": true,
+        "passed": false
+      }
+    },
+    {
+      "candidate": "pdfplumber-native-text",
+      "fixtureId": "image-partial",
+      "mappingGaps": [],
+      "runtime": {
+        "elapsedSeconds": 0.135363,
+        "losslessOutput": "retained/pdfplumber-native-text--image-partial.lossless.json",
+        "losslessSha256": "2675b116b160bebf572c3d701a5532ae3772b00dc108297022a3d55e99e59994",
+        "memoryExceeded": false,
+        "normalizedOutput": "retained/pdfplumber-native-text--image-partial.normalized.json",
+        "normalizedSha256": "24c022de4064bb77b49cbe00432d533f571a72ff5ccb74ebf15e7c6f87c881d0",
+        "peakRssBytes": 36569088,
+        "returnCode": 0,
+        "state": "complete",
+        "timedOut": false
+      },
+      "score": {
+        "assertions": [
+          {
+            "id": "reference",
+            "page": 1,
+            "passed": false,
+            "quote": "Reference: PARTIAL-001",
+            "reason": "exact_mapped_quote_missing"
+          }
+        ],
+        "automaticGapDetection": "not_implemented_p2_10",
+        "conversionSucceeded": true,
+        "expectedGapAnnotations": [
+          {
+            "kind": "unreadable",
+            "page": 1,
+            "reason": "unknown_value"
+          }
+        ],
+        "fixtureId": "image-partial",
+        "forbiddenValueChecks": [
+          {
+            "passed": true,
+            "value": "TOTAL: USD 99.00"
+          }
+        ],
+        "pageCountMatched": true,
+        "passed": false
+      }
+    }
+  ],
+  "schemaVersion": 1,
+  "state": "complete",
+  "versions": {
+    "docling": "2.126.0",
+    "docling-core": "2.95.0",
+    "docling-ibm-models": "4.0.2",
+    "docling-parse": "7.17.0",
+    "pdfplumber": "0.11.7",
+    "psutil": "7.0.0"
+  }
+}

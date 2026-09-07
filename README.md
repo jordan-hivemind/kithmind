@@ -77,7 +77,9 @@ The following are architecture commitments, not current product features:
 The phase table in the architecture document is the source of truth for scope
 and ordering. The [Phase 2 document-pipeline plan](docs/plans/2026-09-07-phase2-document-pipeline.md)
 breaks the worker, parser, financial playbooks, monitoring, and restore work into
-verified steps before owner-document ingestion and bulk backfill.
+verified steps before owner-document ingestion and bulk backfill. The
+[synthetic parser evaluation](docs/parser-evaluation.md) records a reproducible
+Docling/native-text comparison; real-document ingestion remains gated.
 
 ## Claude Code plugin
 

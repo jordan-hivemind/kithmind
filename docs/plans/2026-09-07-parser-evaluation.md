@@ -1,6 +1,10 @@
 # Parser feasibility evaluation
 
-Date: 2026-09-07. Task: P2-3. Status: evaluation design, before scored runs.
+Date: 2026-09-07. Task: P2-3. Status: completed; criteria below were frozen before scored runs.
+
+See the [measured results](../parser-evaluation.md): Docling passed 19/19 labeled
+checks; the native-text baseline passed 17/19 and failed both image-only checks.
+Owner-ingestion approval remains outside this evaluation.
 
 ## Decision
 
