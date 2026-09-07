@@ -1,4 +1,10 @@
-# Self-hosting AI Brain
+# Self-hosting Kith Mind
+
+This runbook describes the currently implemented account-isolated application.
+Family spaces, automated document ingestion and recovery are planned in the
+[architecture](plans/2026-09-06-architecture.md) and
+[Phase 1 implementation plan](plans/2026-09-06-phase1-brain-implementation.md).
+Desktop is primary; native mobile integration is P2 and is not a setup gate.
 
 This runbook is for a small personal deployment shared by a few independent
 accounts. It keeps the operational surface deliberately narrow: one Convex

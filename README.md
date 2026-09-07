@@ -1,124 +1,71 @@
 # Kith Mind
 
-A personal and family knowledge system that any LLM client can consult over MCP. Structured facts, narrative memory, and indexed documents, each traceable to the email, file, sheet, or portal it came from. A Convex-backed MCP server, a Next.js web UI, a Claude Code plugin, and (in progress) connectors and a background ingestion daemon.
+Kith Mind is a personal knowledge system built on the upstream
+[ai-brain](https://github.com/flippyhead/ai-brain) foundation. Its source is
+available and is intended to be MIT-licensed, pending confirmation of the
+upstream license scope (see [provenance](docs/upstream-provenance.md)). It currently stores structured facts and narrative
+thoughts, and makes them available to compatible clients through MCP. The
+public architecture and staged plan are in
+[`docs/plans/2026-09-06-architecture.md`](./docs/plans/2026-09-06-architecture.md).
 
-Design and plan: [docs/plans/2026-09-06-architecture.md](./docs/plans/2026-09-06-architecture.md). Contributor and agent guide: [AGENTS.md](./AGENTS.md).
+## Available today
 
-Kith Mind began as a fork of [ai-brain](https://github.com/flippyhead/ai-brain) by Peter Brown, which its plugin manifest licenses under MIT. Thanks to Peter for the foundation.
+- Typed entities and facts, including current, superseded, and retracted
+  records.
+- Narrative thoughts with hybrid retrieval, grounded recall, and citations.
+- Per-account isolation, API keys, and an OAuth-capable MCP gateway that
+  exchanges credentials for short-lived Convex identities.
+- A Next.js web application, Convex backend, and a Claude Code plugin source.
 
-## Plugin for Claude Code
+Captures are client-mediated: an MCP server cannot observe a conversation
+unless a connected client calls a capture tool. See
+[`docs/self-hosting.md`](./docs/self-hosting.md) for the current deployment
+requirements, including server-side OpenAI and Anthropic API credentials.
 
-The `ai-brain` Claude Code plugin lives at [`plugins/ai-brain/`](./plugins/ai-brain/). It's the recommended way to interact with AI Brain from Claude Code — five skills covering capture, sync, review, and navigation.
+## Planned work
 
-Install:
+The following are architecture commitments, not current product features:
 
-    /plugin marketplace add flippyhead/ai-brain-plugin
-    /plugin install ai-brain@ai-brain-plugin
+- Shared family spaces and per-space authorization.
+- Source-backed documents, chunks, ingestion jobs, and document-query MCP
+  tools.
+- A Mac-hosted daemon, filesystem and service connectors, extraction
+  playbooks, and background ingestion.
+- Desktop is the primary workflow. P2 mobile access is through hosted MCP for
+  supported native clients; where a client lacks remote MCP support, a thin
+  authenticated API adapter is an option to validate. An iOS Shortcut is an
+  optional capture surface only, not a query client. A native mobile app is
+  not planned.
 
-See [`plugins/ai-brain/README.md`](./plugins/ai-brain/README.md) for details.
+The phase table in the architecture document is the source of truth for scope
+and ordering.
+
+## Claude Code plugin
+
+[`plugins/ai-brain/`](./plugins/ai-brain/) contains the upstream AI Brain
+plugin source and its skills. Its checked-in
+[`.mcp.json`](./plugins/ai-brain/.mcp.json) points to the upstream hosted AI
+Brain service. It is not a Kith Mind marketplace install, and it does not add
+planned document or family-space capabilities.
+
+For local development against a Kith Mind deployment, make a copy of the
+plugin source and change the copy's `.mcp.json` URL to that deployment's
+`/api/mcp` endpoint. The copied plugin directory has no standalone marketplace
+manifest, so this repository does not yet provide a verified Kith Mind plugin
+installation command. The deployment must already have its MCP authentication
+configured as described in the self-hosting runbook. A renamed Kith Mind plugin
+and public marketplace distribution are future work.
 
 ## Development
 
-This is a pnpm monorepo (apps/, packages/, plugins/). Install dependencies with `pnpm install` and see the per-package README files for specifics.
+Install dependencies with `pnpm install`, then run:
 
-For a private deployment, follow the [self-hosting runbook](./docs/self-hosting.md). It covers the two-service layout, account isolation, configuration preflight, and the point where hosted accounts and provider credentials become necessary.
+```
+pnpm lint
+pnpm check-types
+pnpm test:once
+pnpm build
+```
 
-Run the local verification suite with:
-
-    pnpm lint
-    pnpm check-types
-    pnpm test:once
-    pnpm build
-
-## Structured facts, narrative memory, and grounded recall
-
-AI Brain uses a hybrid memory model:
-
-- `entities` give people, organizations, projects, and places stable identities.
-- `facts` store precise typed subject-predicate-value knowledge such as exact
-  dates, relationships, providers, schools, employers, and scalar preferences.
-- `thoughts` store one coherent narrative decision, project state, commitment,
-  or recurring pattern.
-
-Readable fact statements are generated from structured data for search and
-display; the typed value remains authoritative. The MCP server instructs
-capable clients to call `remember_fact` or `capture_thought` automatically for
-explicit durable information. This remains client-mediated: an MCP server
-cannot observe a conversation unless the client invokes one of its tools.
-
-For relevant prompts, `recall_context` combines a small set of explicitly
-marked core facts/memories with query-specific fact and thought search results.
-Clients are instructed to send the user's complete current message so exact
-names, identifiers, and version strings reach retrieval unchanged.
-
-Precise facts are account-isolated, source-labelled, and optionally associated
-with an import batch. A single-valued fact change creates a new current record
-and preserves the former record as `superseded`; a correction marks the
-inaccurate record `retracted`. Derived ages are rejected in favor of an exact
-`date_of_birth` value when the date is actually known.
-
-Smart Save compares each capture with the account's current memories:
-
-- Independent information is added.
-- Duplicate information is ignored.
-- Information that changed creates a new current memory and marks the former
-  memory as `superseded`.
-- A correction creates a new current memory and marks the incorrect memory as
-  `retracted`.
-- Broad, incidental, inferred, derived, or non-atomic candidates are returned
-  as `ASK` or `SKIP` without being stored.
-
-Superseded and retracted memories are preserved and linked to their replacement;
-they are not overwritten or deleted. Normal search and browsing return current
-memories. MCP clients can request historical results when answering questions
-about prior states or how something changed.
-
-Memories may also carry explicit real-world `validFrom` and `validTo` times.
-These are separate from when AI Brain recorded or superseded the memory, so a
-known school start date, project period, or former role can be represented
-without treating the database write time as the event time. Inaccurate claims
-are retracted and have no historical validity interval.
-
-## AI provider configuration
-
-The Convex backend currently uses OpenAI
-`text-embedding-3-small` for semantic search and Anthropic Claude Haiku for
-one schema-constrained Smart Save analysis that combines admission,
-classification, and metadata extraction for narrative thoughts. A narrative
-capture normally uses one embedding and one Haiku call;
-a second embedding is created only when a changed fact produces different
-standalone replacement text. Set `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` on
-your Convex deployment.
-
-These are server-side API calls. Connecting ChatGPT or Claude as an MCP client
-does not provide their API keys or charge these calls to a consumer
-subscription. A self-hosted deployment uses the API keys configured on that
-deployment.
-
-## MCP-to-Convex authentication
-
-MCP API keys are exchanged by the Next.js gateway for short-lived, signed
-Convex identities. MCP functions derive the account ID from that identity and
-do not accept a caller-provided `userId`.
-
-Generate an ES256 key pair:
-
-    pnpm generate:mcp-jwks
-
-Set all four generated values on the Next.js deployment, plus
-`MCP_JWT_ISSUER`, whose value is the public origin of that deployment without a
-trailing slash (for example, `https://brain.example.com`). Keep
-`MCP_JWT_PRIVATE_JWK` server-side and never expose it as a `NEXT_PUBLIC_`
-variable. `MCP_OAUTH_ENCRYPTION_KEY` is also server-only; it encrypts dynamic
-client registrations and short-lived authorization codes. Rotating it requires
-connected MCP clients to register and authorize again.
-
-Set the same issuer on the Convex deployment and redeploy Convex so it trusts
-tokens issued by the gateway:
-
-    pnpm --filter @repo/db exec convex env set MCP_JWT_ISSUER https://brain.example.com
-    pnpm --filter @repo/db deploy:prod
-
-The public key is served from `/.well-known/mcp-jwks.json`; Convex fetches it
-from the issuer origin. If the issuer or signing keys are absent, MCP data
-functions fail closed.
+Read [CONTRIBUTING.md](./CONTRIBUTING.md) for the public contribution workflow
+and [AGENTS.md](./AGENTS.md) for agent guidance.
