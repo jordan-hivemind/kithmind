@@ -6,6 +6,11 @@ import { reportFields, insightFields } from "./models/reports/validators";
 import { listFields, listItemFields } from "./models/lists/validators";
 import { consumedOAuthCodeFields } from "./models/oauth/validators";
 import { entityFields, factFields } from "./models/facts/validators";
+import {
+  spaceFields,
+  spaceMemberFields,
+  userSpaceSettingsFields,
+} from "./models/spaces/validators";
 
 export default defineSchema({
   ...authTables,
@@ -13,18 +18,28 @@ export default defineSchema({
     .index("by_userId", ["userId"])
     .index("by_userId_and_isCore", ["userId", "isCore"])
     .index("by_userId_and_type", ["userId", "metadata.type"])
+    .index("by_spaceId", ["spaceId"])
+    .index("by_spaceId_and_isCore", ["spaceId", "isCore"])
+    .index("by_spaceId_and_type", ["spaceId", "metadata.type"])
     .vectorIndex("by_embedding", {
       vectorField: "embedding",
       dimensions: 1536,
-      filterFields: ["userId"],
+      filterFields: ["userId", "spaceId"],
     })
     .searchIndex("by_content", {
       searchField: "content",
-      filterFields: ["userId", "metadata.type"],
+      filterFields: ["userId", "spaceId", "metadata.type"],
     }),
   entities: defineTable(entityFields)
     .index("by_userId", ["userId"])
     .index("by_userId_and_key", ["userId", "key"])
+    .index("by_spaceId", ["spaceId"])
+    .index("by_spaceId_and_key", ["spaceId", "key"])
+    .index("by_spaceId_kind_normalizedName", [
+      "spaceId",
+      "kind",
+      "normalizedName",
+    ])
     .index("by_userId_kind_normalizedName", [
       "userId",
       "kind",
@@ -41,10 +56,31 @@ export default defineSchema({
     ])
     .index("by_userId_and_isCore", ["userId", "isCore"])
     .index("by_userId_isCore_status", ["userId", "isCore", "status"])
+    .index("by_spaceId", ["spaceId"])
+    .index("by_spaceId_and_status", ["spaceId", "status"])
+    .index("by_spaceId_subject_predicate_status", [
+      "spaceId",
+      "subjectEntityId",
+      "predicate",
+      "status",
+    ])
+    .index("by_spaceId_and_isCore", ["spaceId", "isCore"])
+    .index("by_spaceId_isCore_status", ["spaceId", "isCore", "status"])
     .searchIndex("by_searchText", {
       searchField: "searchText",
-      filterFields: ["userId", "status"],
+      filterFields: ["userId", "spaceId", "status"],
     }),
+  spaces: defineTable(spaceFields).index("by_createdBy_and_kind", [
+    "createdBy",
+    "kind",
+  ]),
+  spaceMembers: defineTable(spaceMemberFields)
+    .index("by_spaceId_and_userId", ["spaceId", "userId"])
+    .index("by_spaceId", ["spaceId"])
+    .index("by_userId", ["userId"]),
+  userSpaceSettings: defineTable(userSpaceSettingsFields)
+    .index("by_userId", ["userId"])
+    .index("by_personalSpaceId", ["personalSpaceId"]),
   apiKeys: defineTable(apiKeyFields)
     .index("by_keyHash", ["keyHash"])
     .index("by_userId", ["userId"]),

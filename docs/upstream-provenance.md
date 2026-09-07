@@ -6,6 +6,12 @@ Checked 2026-09-06 against `flippyhead/ai-brain` main at commit
 Kith Mind derives from Peter Brown's ai-brain. The intended license for
 original Kith Mind work is MIT. The local LICENSE retains upstream attribution.
 
+On 2026-09-06, the owner reported that Peter Brown, the upstream author and a
+friend, has authorized the owner to fork ai-brain and continue its development
+as Kith Mind. This permission supports the fork and ongoing development of this
+project. It does not itself establish a repository-wide MIT grant or define the
+scope of public redistribution rights.
+
 The upstream [plugin manifest](https://github.com/flippyhead/ai-brain/blob/0534744fdb7f366d38e89e44c82f3da22ae4c958/plugins/ai-brain/.claude-plugin/plugin.json)
 contains an MIT declaration. The inspected root tree has no LICENSE file, the
 root package metadata has no license declaration, and GitHub's repository
@@ -15,7 +21,8 @@ is absent; it leaves the repository-wide scope unconfirmed.
 Before presenting all inherited code as covered by a confirmed MIT grant,
 obtain a repository-level license or written scope confirmation from the
 upstream author. The existing local LICENSE assertion is not independent
-evidence of the upstream grant. No author contact has been sent by the agent.
+evidence of a repository-wide grant. The agent made no author contact; the
+owner-reported permission above is the basis for continuing this fork.
 [GitHub's licensing guidance](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/licensing-a-repository)
 explains why public visibility and a reuse license are separate matters.
 

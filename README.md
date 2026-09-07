@@ -1,11 +1,11 @@
 # Kith Mind
 
 Kith Mind is a personal knowledge system built on the upstream
-[ai-brain](https://github.com/flippyhead/ai-brain) foundation. Its source is
-available and is intended to be MIT-licensed, pending confirmation of the
-upstream license scope (see [provenance](docs/upstream-provenance.md)). It currently stores structured facts and narrative
-thoughts, and makes them available to compatible clients through MCP. The
-public architecture and staged plan are in
+[ai-brain](https://github.com/flippyhead/ai-brain) foundation. Kith Mind
+contributions are intended to be MIT-licensed, with upstream attribution
+preserved in the local LICENSE. See [provenance](docs/upstream-provenance.md).
+It currently stores structured facts and narrative thoughts, and makes them
+available to compatible clients through MCP. The public architecture and staged plan are in
 [`docs/plans/2026-09-06-architecture.md`](./docs/plans/2026-09-06-architecture.md).
 
 ## Available today

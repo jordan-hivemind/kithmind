@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-06
 
-**Status:** Revised implementation plan; root Astra review of Sol draft completed under R2-1. Runtime acceptance not yet executed.
+**Status:** P1-1 implementation adds the transitional schema and personal-space migration tooling. The remaining Phase 1 runtime work and family acceptance tests are pending.
 
 **Parent:** [Kith Mind architecture](./2026-09-06-architecture.md)
 
@@ -215,11 +215,18 @@ Documents use state from their processing generation rather than a second confli
 
 ## 4. Migration strategy
 
-The migration follows the existing `models/thoughts/migrations.ts` pattern: optional field, dual indexes, paginated dry-run mutation, count query, idempotent rerun, then a later PR makes the field required.
+P1-1 implements optional ownership, space-aware indexes, personal-space bootstrap,
+content backfills and paginated audits. Its operator procedure is in
+[Personal-space migration](../migrations/personal-spaces.md). It does not
+enable shared reads or writes. Existing writers can still create unscoped
+rows until P1-2 changes them, so a successful P1-1 audit must be repeated at
+cutover.
+
+The migration follows the existing `models/thoughts/migrations.ts` pattern: optional field, compatible indexes, paginated dry-run mutation, count query, idempotent rerun, then a later PR makes the field required. Ordinary indexes can coexist by user and space. Convex requires one vector index per embedding field, so the existing vector index gains `spaceId` as an additional filter while retaining its name and `userId` filter for legacy queries.
 
 1. Create a personal space, owner membership, and settings row for every user. Idempotency uses the personal-space lookup and membership lookup.
 2. Add optional `spaceId` to entities, facts, and thoughts. Backfill entities first, then facts and thoughts to the author's personal space. Validate that every fact's subject and entity value are in the same space.
-3. Add space indexes beside current user indexes. Switch all reads and writes to authorized spaces only after missing counts reach zero in a copy of the deployment.
+3. Add space indexes beside current user indexes, or extend the existing index's filter fields when Convex requires one index per field. Switch all reads and writes to authorized spaces only after missing counts reach zero in a copy of the deployment.
 4. Make `spaceId` required. Keep author indexes only where an audit or author-filtered feature actually uses them; do not use them for authorization.
 5. Extend API keys with capabilities and space scopes. Backfill existing keys to the owner's personal space with `read` and `write`; do not grant shared spaces or `ingest` implicitly.
 6. Backfill the current embedding fingerprint and generation metadata without changing or recomputing vectors. A later benchmarked model change uses the migration in section 7.
