@@ -49,8 +49,8 @@ export const list = query({
       keyPrefix: k.keyPrefix,
       name: k.name,
       lastUsedAt: k.lastUsedAt,
-      capabilities: k.capabilities ?? [],
-      spaceIds: k.spaceIds ?? [],
+      capabilities: k.capabilities,
+      spaceIds: k.spaceIds,
     }));
   },
 });

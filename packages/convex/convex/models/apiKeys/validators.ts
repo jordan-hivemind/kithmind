@@ -17,6 +17,6 @@ export const apiKeyFields = {
   keyPrefix: v.string(),
   name: v.string(),
   lastUsedAt: v.optional(v.number()),
-  capabilities: v.optional(v.array(capability)),
-  spaceIds: v.optional(v.array(v.id("spaces"))),
+  capabilities: v.array(capability),
+  spaceIds: v.array(v.id("spaces")),
 };

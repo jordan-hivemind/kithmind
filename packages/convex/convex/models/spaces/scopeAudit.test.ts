@@ -3,7 +3,7 @@ import { describe, expect, test } from "vitest";
 
 import { internal } from "../../_generated/api";
 import type { Id } from "../../_generated/dataModel";
-import schema from "../../schema";
+import schema from "../../legacySchema";
 import { modules } from "../../test.setup";
 
 const metadata = {
