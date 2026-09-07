@@ -18,6 +18,15 @@ The highest-payoff reuse is therefore:
 
 This does not require another replacement gate before implementation. Native mobile remains priority P2 and can be tested against the hosted Brain after the desktop path works.
 
+## Parser evaluation follow-through
+
+The [P2-3 synthetic evaluation](../parser-evaluation.md) is now measured. Docling
+passed all 19 labeled checks across six PDFs. The native-text baseline passed
+all 17 native-PDF checks with lower resource use and failed the two image-only
+checks. Proceed with Docling as the next synthetic adapter reference and retain
+the baseline as a fast-path candidate. This is not general parser accuracy or
+owner-ingestion approval. Paperless 3.1.3 remains an optional separate archive.
+
 ## GBrain feasibility spike
 
 The spike inspected GBrain at commit [`ede85e2e8c510077e6505f1c30257dc64176361b`](https://github.com/garrytan/gbrain/tree/ede85e2e8c510077e6505f1c30257dc64176361b), dated 2026-09-06. It used an isolated shallow clone under `/tmp`, after inspecting repository instructions. No dependency install, server, account, hosted deployment or production data was used. Findings below are static contract findings, not runtime certification.
@@ -70,4 +79,5 @@ Khoj and Open Notebook remain useful product references. Khoj's [self-hosting](h
 
 ## Limits
 
-This was a bounded primary-source review of seven projects plus a static, pinned-source GBrain feasibility check. It did not run third-party servers or test suites, inspect every transitive license, benchmark extraction or retrieval, audit security, validate hosted terms or test mobile clients. The GBrain conclusions apply to the inspected commit and public/internal contracts named above; later operations could change the fit. Docling still needs fixture-backed accuracy and locator tests before selection.
+This was a bounded primary-source review of seven projects plus a static, pinned-source GBrain feasibility check. It did not run third-party servers or test suites, inspect every transitive license, benchmark extraction or retrieval, audit security, validate hosted terms or test mobile clients. The GBrain conclusions apply to the inspected commit and public/internal contracts named above; later operations could change the fit. The subsequent P2-3 report supplies synthetic fixture and locator results;
+real-document accuracy and owner-ingestion gates remain open.

@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "rasters": [
+    {
+      "id": "image-clear",
+      "file": "image-clear-raster.png",
+      "sha256": "7955240518de843118da2606f3f04ee264b0af375c65774db242fcce671253ee",
+      "width": 1600,
+      "height": 2100,
+      "mode": "RGB",
+      "authoredRows": [
+        "SYNTHETIC CLEAR IMAGE SCAN",
+        "Invoice 2026-05",
+        "Amount due: USD 42.00",
+        "Reference: CLEAR-001"
+      ],
+      "missingValue": false,
+      "missingValueText": null
+    },
+    {
+      "id": "image-partial",
+      "file": "image-partial-raster.png",
+      "sha256": "35f2b6c95c2d05c408432493cb71632366c697e75e5dedd901c4173a868917ea",
+      "width": 1600,
+      "height": 2100,
+      "mode": "RGB",
+      "authoredRows": [
+        "PARTIAL IMAGE SCAN",
+        "Reference: PARTIAL-001"
+      ],
+      "missingValue": true,
+      "missingValueText": "TOTAL: [value intentionally unavailable]"
+    }
+  ]
+}

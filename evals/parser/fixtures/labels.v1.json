@@ -1,0 +1,214 @@
+{
+  "version": 1,
+  "fixtures": [
+    {
+      "id": "financial-statement",
+      "file": "financial-statement.pdf",
+      "expectedPages": 2,
+      "kind": "financial_statement",
+      "assertions": [
+        {
+          "id": "summary",
+          "page": 1,
+          "quote": "Summary total: USD 130.00"
+        },
+        {
+          "id": "fee-row-0",
+          "page": 1,
+          "quote": "Fee | USD | 65.00",
+          "occurrence": 1,
+          "table": {
+            "id": "line-items-page-1",
+            "row": 0,
+            "column": 2,
+            "rowValues": [
+              "Fee",
+              "USD",
+              "65.00"
+            ],
+            "cellValue": "65.00"
+          }
+        },
+        {
+          "id": "fee-row-1",
+          "page": 1,
+          "quote": "Fee | USD | 65.00",
+          "occurrence": 2,
+          "table": {
+            "id": "line-items-page-1",
+            "row": 1,
+            "column": 2,
+            "rowValues": [
+              "Fee",
+              "USD",
+              "65.00"
+            ],
+            "cellValue": "65.00"
+          }
+        },
+        {
+          "id": "eur-refund",
+          "page": 2,
+          "quote": "Refund | EUR | -10.00",
+          "table": {
+            "id": "line-items-page-2",
+            "row": 0,
+            "column": 1,
+            "rowValues": [
+              "Refund",
+              "EUR",
+              "-10.00"
+            ],
+            "cellValue": "EUR"
+          }
+        }
+      ],
+      "forbiddenValues": [
+        "USD 130.01"
+      ],
+      "sha256": "fc41a9f96413c2c97d29312304397aa453418f445a5c6b8b27c758c98ec30bb8"
+    },
+    {
+      "id": "lab-report-unicode",
+      "file": "lab-report-unicode.pdf",
+      "expectedPages": 1,
+      "kind": "lab_report",
+      "assertions": [
+        {
+          "id": "patient-a",
+          "page": 1,
+          "quote": "Patient: Alex Sample A"
+        },
+        {
+          "id": "draw-a",
+          "page": 1,
+          "quote": "Draw date: 2026-02-01"
+        },
+        {
+          "id": "micro",
+          "page": 1,
+          "quote": "Result: 25 µg/L"
+        },
+        {
+          "id": "astral",
+          "page": 1,
+          "quote": "Astral marker: 🌍 retained"
+        },
+        {
+          "id": "patient-b",
+          "page": 1,
+          "quote": "Patient: Blair Sample B"
+        },
+        {
+          "id": "draw-b",
+          "page": 1,
+          "quote": "Draw date: 2026-02-02"
+        },
+        {
+          "id": "accent",
+          "page": 1,
+          "quote": "Analyte: Café marker"
+        },
+        {
+          "id": "result-b",
+          "page": 1,
+          "quote": "Result: 8.2 mg/L"
+        }
+      ],
+      "forbiddenValues": [
+        "Patient: Alex Sample B"
+      ],
+      "sha256": "41cf2ab4a0fb028d83e0ec616b473578e9cfeaf580bf28aa0a36fac67ea6f7e0"
+    },
+    {
+      "id": "vehicle-receipt",
+      "file": "vehicle-receipt.pdf",
+      "expectedPages": 1,
+      "kind": "vehicle_receipt",
+      "assertions": [
+        {
+          "id": "service-date",
+          "page": 1,
+          "quote": "Service date: 2026-03-03"
+        },
+        {
+          "id": "service",
+          "page": 1,
+          "quote": "Oil change | USD 79.00"
+        },
+        {
+          "id": "total",
+          "page": 1,
+          "quote": "Total: USD 79.00"
+        }
+      ],
+      "forbiddenValues": [
+        "USD 79.01"
+      ],
+      "sha256": "5210998900fb325493d6a46cfc1e805ff623e632fe6adf9810bf179ea5942347"
+    },
+    {
+      "id": "contract-continuation",
+      "file": "contract-continuation.pdf",
+      "expectedPages": 2,
+      "kind": "contract",
+      "assertions": [
+        {
+          "id": "start",
+          "page": 1,
+          "quote": "Term begins: 2026-04-01"
+        },
+        {
+          "id": "continuation",
+          "page": 2,
+          "quote": "Section 1. Payment is due within 30 days."
+        }
+      ],
+      "forbiddenValues": [
+        "within 31 days"
+      ],
+      "sha256": "5d5cb1d4cc5b6f27feb551e8ee0934f4c9e6bbe97e0a8b6d8b0621e9d4a06118"
+    },
+    {
+      "id": "image-clear",
+      "file": "image-clear.pdf",
+      "expectedPages": 1,
+      "kind": "image_clear",
+      "assertions": [
+        {
+          "id": "amount",
+          "page": 1,
+          "quote": "Amount due: USD 42.00"
+        }
+      ],
+      "forbiddenValues": [
+        "USD 42.01"
+      ],
+      "sha256": "6811f16380161235ed57a1cdd9e6e6e5fe89ee494542bc006e33fc7ac1e45add"
+    },
+    {
+      "id": "image-partial",
+      "file": "image-partial.pdf",
+      "expectedPages": 1,
+      "kind": "image_partial",
+      "assertions": [
+        {
+          "id": "reference",
+          "page": 1,
+          "quote": "Reference: PARTIAL-001"
+        }
+      ],
+      "forbiddenValues": [
+        "TOTAL: USD 99.00"
+      ],
+      "expectedGaps": [
+        {
+          "page": 1,
+          "kind": "unreadable",
+          "reason": "unknown_value"
+        }
+      ],
+      "sha256": "b07ba209ed26959a31658c7d717d69d811b145688f2b5722e849703546234cf1"
+    }
+  ]
+}

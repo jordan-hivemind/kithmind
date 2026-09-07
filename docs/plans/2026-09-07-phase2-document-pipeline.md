@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-07
 
-**Status:** P2-7 and P2-8 are complete. P2-1 adds read-only worker diagnostics and optional user-service recipes. Cloud monitoring, embedding capability probes, parsing, and isolated restore remain outstanding.
+**Status:** P2-7, P2-8, and P2-1 are complete. P2-3 has [measured synthetic parser results](../parser-evaluation.md). Original-byte archives, production parser integration, playbooks, cloud monitoring, embedding capability probes, and isolated restore remain outstanding.
 
 ## Outcome
 

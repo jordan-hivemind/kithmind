@@ -1,0 +1,33 @@
+[project]
+name = "kithmind-parser-eval"
+version = "0.1.0"
+description = "Pinned synthetic PDF parser evaluation"
+requires-python = "==3.12.12"
+dependencies = [
+  "docling==2.126.0",
+  "onnxruntime==1.23.2",
+  "pdfplumber==0.11.7",
+  "psutil==7.0.0",
+]
+
+[project.scripts]
+kith-parser-eval = "parser_eval.run:main"
+kith-parser-models = "parser_eval.prepare_models:main"
+
+[dependency-groups]
+dev = ["pytest==8.4.2"]
+fixture = [
+  "Pillow==12.3.0",
+  "pypdf==6.1.1",
+  "reportlab==4.4.3",
+]
+
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/parser_eval"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
