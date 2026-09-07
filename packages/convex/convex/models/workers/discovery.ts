@@ -5,6 +5,7 @@ import type { PrincipalRef } from "../../lib/spaces";
 import { planInlineText } from "../ingestion/inlineText";
 import { admitSourceRevision } from "../ingestion/model";
 import { sha256Utf8 } from "../provenance/model";
+import { requireInlineSourceRevision } from "../provenance/representations";
 import { requireWorkerSourceAccount } from "./auth";
 import { workerProtocolError, workerProtocolErrorCode } from "./errors";
 import { FS_TEXT_PROFILE } from "./profile";
@@ -512,12 +513,20 @@ export async function validateAdmittedChain(
     ctx.db.get(ids.processingGenerationId),
     ctx.db.get(ids.ingestJobId),
   ]);
-  const revisionTextHash = revision
-    ? await sha256Utf8(revision.inlineText)
-    : undefined;
-  const revisionByteLength = revision
-    ? new TextEncoder().encode(revision.inlineText).byteLength
-    : undefined;
+  let revisionText: string | undefined;
+  if (revision) {
+    try {
+      revisionText = requireInlineSourceRevision(revision).text;
+    } catch {
+      revisionText = undefined;
+    }
+  }
+  const revisionTextHash =
+    revisionText === undefined ? undefined : await sha256Utf8(revisionText);
+  const revisionByteLength =
+    revisionText === undefined
+      ? undefined
+      : new TextEncoder().encode(revisionText).byteLength;
   if (
     !item ||
     !revision ||

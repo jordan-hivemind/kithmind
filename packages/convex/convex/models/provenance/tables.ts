@@ -3,8 +3,10 @@ import {
   chunkFields,
   documentFields,
   evidenceSpanFields,
+  sourceArtifactArchiveReceiptFields,
   sourceItemFields,
   sourcePageFields,
+  sourceParserArtifactFields,
   sourceRevisionFields,
   sourceTextVersionFields,
 } from "./validators";
@@ -21,6 +23,31 @@ export const provenanceTables = {
     .index("by_spaceId", ["spaceId"])
     .index("by_sourceItemId", ["sourceItemId"])
     .index("by_sourceItemId_and_contentHash", ["sourceItemId", "contentHash"]),
+  sourceParserArtifacts: defineTable(sourceParserArtifactFields)
+    .index("by_spaceId", ["spaceId"])
+    .index("by_sourceAccountId", ["sourceAccountId"])
+    .index("by_sourceRevisionId", ["sourceRevisionId"])
+    .index("by_sourceRevisionId_and_parserFingerprint", [
+      "sourceRevisionId",
+      "parserFingerprint",
+    ])
+    .index("by_sourceAccountId_and_clientArtifactId", [
+      "sourceAccountId",
+      "clientArtifactId",
+    ]),
+  sourceArtifactArchiveReceipts: defineTable(sourceArtifactArchiveReceiptFields)
+    .index("by_spaceId", ["spaceId"])
+    .index("by_sourceAccountId", ["sourceAccountId"])
+    .index("by_sourceRevisionId", ["sourceRevisionId"])
+    .index("by_parserArtifactId", ["parserArtifactId"])
+    .index("by_sourceAccountId_and_clientReceiptId", [
+      "sourceAccountId",
+      "clientReceiptId",
+    ])
+    .index("by_archiveIdentity_and_objectId", [
+      "archiveIdentityFingerprint",
+      "archiveObjectId",
+    ]),
   sourceTextVersions: defineTable(sourceTextVersionFields)
     .index("by_spaceId", ["spaceId"])
     .index("by_sourceRevisionId", ["sourceRevisionId"])

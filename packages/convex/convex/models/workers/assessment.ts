@@ -6,6 +6,7 @@ import type { PrincipalRef } from "../../lib/spaces";
 import { digestProcessingConfiguration } from "../ingestion/hash";
 import { planInlineText } from "../ingestion/inlineText";
 import { sha256Utf8 } from "../provenance/model";
+import { requireInlineSourceRevision } from "../provenance/representations";
 import { requireWorkerSourceAccount, type WorkerPrincipal } from "./auth";
 import { workerProtocolError } from "./errors";
 import { consumeWorkerMutationRateLimit } from "./rateLimit";
@@ -878,13 +879,17 @@ async function terminalReady(
   ]);
   if (!revision || !generation || !detailRowsAreBounded(revision, generation))
     return false;
-  const revisionHash = await sha256Utf8(revision.inlineText);
-  const revisionByteLength = new TextEncoder().encode(
-    revision.inlineText,
-  ).byteLength;
+  let revisionText: string;
+  try {
+    revisionText = requireInlineSourceRevision(revision).text;
+  } catch {
+    return false;
+  }
+  const revisionHash = await sha256Utf8(revisionText);
+  const revisionByteLength = new TextEncoder().encode(revisionText).byteLength;
   let plan: ReturnType<typeof planInlineText>;
   try {
-    plan = planInlineText(revision.inlineText);
+    plan = planInlineText(revisionText);
   } catch {
     return false;
   }

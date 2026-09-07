@@ -3,7 +3,7 @@
 Date: 2026-09-06. Revised under R2-1 after the owner's review response.
 Status: approved direction; implementation acceptance remains tracked separately.
 
-Kith Mind is a shared family knowledge system for life records. It maintains indexed evidence and structured records so a connected assistant can answer without fetching, OCRing, or re-importing the original source during an ordinary question. Medical records, finances, and household history are the priority. Desktop is the primary client. Native mobile integration is priority P2 and does not block useful desktop delivery.
+Kith Mind is an owner-first knowledge system for life records. It maintains indexed evidence and structured records so a connected assistant can answer without fetching, OCRing, or re-importing the original source during an ordinary question. Medical records, finances, and household history are the priority. Desktop is the primary client. Native mobile integration is priority P2 and does not block useful desktop delivery. The deployed space, role, and scoped-credential architecture remains the foundation for later sharing.
 
 This is the canonical technical design. The [Phase 1 plan](2026-09-06-phase1-brain-implementation.md) specifies the first implementation. The [review](2026-09-06-architecture-review.md) records the previous findings; its proposal to gate all work on mobile has been superseded. The [reuse assessment](2026-09-06-reuse-assessment.md) informs what we build versus integrate. Owner accounts, paths, and rollout notes remain private; they are not prerequisites for contributors.
 
@@ -15,13 +15,30 @@ This is the canonical technical design. The [Phase 1 plan](2026-09-06-phase1-bra
 | Layering             | Brain query/write services; ingestion pipeline and adapters; worker scheduling and capture clients.                                                             | Services share versioned contracts and can be replaced independently. Transport must not contain a second set of business rules.                                                                                                                            |
 | Lookup               | Hosted authenticated HTTPS endpoint and cloud-accessible indexed data.                                                                                          | Questions should remain answerable when the ingestion host and original source are unavailable.                                                                                                                                                             |
 | Workers              | Start with one Mac worker for the owner's local sources. Cloud-source workers may run elsewhere.                                                                | One deployment recipe, not a universal Mac or whole-cloud-folder requirement.                                                                                                                                                                               |
-| Family               | Shared family space plus optional personal spaces, separate member accounts, explicit source routing.                                                           | New family sources can target the family space. Existing private records are never silently shared.                                                                                                                                                         |
+| Family               | Keep the deployed shared-space, personal-space, role, and explicit source-routing controls. The first trial uses one owner-controlled space.                    | Family source onboarding and new sharing enhancements are deferred. Existing private records are never silently shared.                                                                                                                                     |
 | Models               | Local extraction where measured quality is adequate; configurable cloud fallback. Hosted embeddings for the default deployment.                                 | Model names, dimensions, prompts and parser versions are recorded. Corpus quality and cost are measured, not asserted.                                                                                                                                      |
 | Agents               | Deterministic code for enumeration, validation, identity, arithmetic and authorization. Agent runtime behind an adapter for tasks needing judgment or browsers. | Claude Agent SDK is an initial candidate, not a dependency of reading records or running ordinary ingestion.                                                                                                                                                |
 | Reuse                | Reuse parsers, archives and memory components where they meet the contracts; avoid a wholesale replacement without a demonstrated advantage.                    | See the bounded comparison and component evaluation tasks. Copyleft is not a blanket reason to reject a useful separately operated application.                                                                                                             |
 | Sharing the work     | Public code, synthetic examples, simple setup instructions and independent private deployments. MIT is the intended permissive license.                         | The owner reports that the upstream author authorized this fork and its continued development. Preserve attribution; plugin metadata alone is not treated as conclusive for a repository-wide MIT grant. No hosted service or app-store launch is required. |
 
-Already implemented: account-scoped facts, entities, thoughts, lifecycle history, hybrid recall, MCP gateway, authentication and a web UI. Family spaces, indexed documents, event records, automated connectors and the operational controls below are planned until their tests pass.
+Already implemented: account-scoped facts, entities, thoughts, lifecycle
+history, hybrid recall, MCP gateway, authentication, web UI, family spaces and
+roles, indexed documents and evidence, typed event records, the scoped
+filesystem text worker, and its read-only doctor. The synthetic parser
+evaluation is complete. Production parser integration, original-byte archives,
+playbooks, cloud monitoring, portable restore, and automated connectors remain
+planned until their tests pass.
+
+### Owner-first trial
+
+The first real-data trial is one owner, one explicitly selected source, and one
+owner-controlled destination space. It requires the applicable archive,
+parser, provenance, evidence, restore, and security gates. It does not require
+new family-sharing features, multiple sources, family onboarding, or native
+mobile support. Existing space isolation, role checks, scoped credentials, and
+revocation behavior remain required regression controls; the trial does not
+remove or weaken them. Expansion to additional sources or people requires its
+own reviewed acceptance work.
 
 ## 2. Client and cloud contract
 

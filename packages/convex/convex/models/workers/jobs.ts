@@ -17,6 +17,7 @@ import {
   stageGenerationPages,
 } from "../ingestion/model";
 import { sha256Utf8 } from "../provenance/model";
+import { requireInlineSourceRevision } from "../provenance/representations";
 import { requireWorkerSourceAccount } from "./auth";
 import {
   requireCurrentDiscovery,
@@ -929,7 +930,13 @@ async function requireStageReceipt(
 }
 
 async function planCurrentText(current: CurrentWorkerJob) {
-  const plan = planInlineText(current.revision.inlineText);
+  let revisionText: string;
+  try {
+    revisionText = requireInlineSourceRevision(current.revision).text;
+  } catch {
+    throw workerProtocolError("scan_conflict");
+  }
+  const plan = planInlineText(revisionText);
   const expectedProcessingFingerprint = await processingFingerprint(
     current.work,
   );
@@ -1065,7 +1072,7 @@ export async function stageProcessingText(
   try {
     result = await createGenerationTextVersion(ctx, {
       ...leaseArgs(source, current, request, now),
-      text: current.revision.inlineText,
+      text: requireInlineSourceRevision(current.revision).text,
     });
   } catch {
     throw workerProtocolError("scan_conflict");
@@ -1118,14 +1125,20 @@ async function requireStagedPage(
     )
     .take(2);
   const page = pages[0];
+  let revisionText: string;
+  try {
+    revisionText = requireInlineSourceRevision(current.revision).text;
+  } catch {
+    throw workerProtocolError("scan_conflict");
+  }
   if (
     pages.length !== 1 ||
     !page ||
     page.spaceId !== current.source.spaceId ||
     page.ordinal !== 0 ||
     page.start !== 0 ||
-    page.end !== current.revision.inlineText.length ||
-    page.text !== current.revision.inlineText
+    page.end !== revisionText.length ||
+    page.text !== revisionText
   ) {
     throw workerProtocolError("scan_conflict");
   }
