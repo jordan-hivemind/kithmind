@@ -8,7 +8,7 @@ import { sha256Utf8 } from "../provenance/model";
 import { requireWorkerSourceAccount } from "./auth";
 import { workerProtocolError, workerProtocolErrorCode } from "./errors";
 import { FS_TEXT_PROFILE } from "./profile";
-import { consumeWorkerMutationRateLimit } from "./model";
+import { consumeWorkerMutationRateLimit } from "./rateLimit";
 import type {
   WorkerDiscoveryAdmitResult,
   WorkerDiscoveryReserveResult,

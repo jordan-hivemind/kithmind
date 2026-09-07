@@ -3,6 +3,7 @@ import { mutation, query } from "../../_generated/server";
 import { requireWebPrincipal } from "../../lib/webAuth";
 import { getAuthorizedReadSpaceIds, resolveWriteSpace } from "../../lib/spaces";
 import { requireSourceAccountAccess } from "../../lib/sourceAuth";
+import { advanceSourceAssessmentEpoch } from "../ingestion/model";
 
 function boundedText(value: string, name: string, maximum: number) {
   if (
@@ -83,7 +84,7 @@ export const update = mutation({
   returns: v.null(),
   handler: async (ctx, args) => {
     const principal = await requireWebPrincipal(ctx);
-    await requireSourceAccountAccess(
+    const account = await requireSourceAccountAccess(
       ctx,
       principal,
       args.sourceAccountId,
@@ -91,6 +92,9 @@ export const update = mutation({
     );
     if (args.name !== undefined) boundedText(args.name, "Name", 200);
     if (args.freshnessMs !== undefined) validateFreshness(args.freshnessMs);
+    if (args.enabled !== undefined && args.enabled !== account.enabled) {
+      await advanceSourceAssessmentEpoch(ctx, account._id);
+    }
     await ctx.db.patch(args.sourceAccountId, {
       ...(args.name === undefined ? {} : { name: args.name }),
       ...(args.enabled === undefined ? {} : { enabled: args.enabled }),

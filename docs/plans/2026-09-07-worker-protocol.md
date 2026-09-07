@@ -4,9 +4,8 @@
 
 **Status:** Implementation in progress. This document describes the initial
 worker gateway commands defined in the shared protocol. Discovery reservation,
-text admission, and deterministic text processing are implemented. Source
-processing assessment, a complete filesystem worker, and parsing remain in
-progress.
+text admission, deterministic text processing, and source processing assessment
+are implemented. A complete filesystem worker and parsing remain in progress.
 
 **Related plan:** [Phase 2 document pipeline](2026-09-07-phase2-document-pipeline.md)
 
@@ -76,23 +75,25 @@ raw backend messages, or arbitrary backend error data.
 
 ## Initial command set
 
-Protocol version 1 currently defines these thirteen commands:
+Protocol version 1 currently defines these fifteen commands:
 
-| Operation              | Purpose                                              | Important bound                                                                                                                                                                    |
-| ---------------------- | ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `source.status`        | Read current worker-visible status for one source.   | No command-specific collection.                                                                                                                                                    |
-| `source.inventoryPage` | Read a validated inventory page for a scan.          | A request ID and active recovery scan, inventory epoch, and manifest version bind a page retry; `paginationOpts.numItems` is 1–50 and cursor is null or at most 8,192 UTF-8 bytes. |
-| `scan.begin`           | Start a normal or identity-recovery scan.            | Request, watcher, and connector version IDs are each bounded.                                                                                                                      |
-| `scan.appendPage`      | Submit one bounded discovery page.                   | 1–4 entries per page and at most 64 pages per scan.                                                                                                                                |
-| `scan.seal`            | Seal a scan with healthy or failed discovery health. | `expectedPageCount` is 0–64.                                                                                                                                                       |
-| `scan.reconcile`       | Reconcile a sealed scan against current inventory.   | `maxItems` is 1–50 and `ordinal` fences each advancing request.                                                                                                                    |
-| `discovery.reserve`    | Lease enumerated discovery work for upload.          | `maxItems` is 1–4; the lease lasts five minutes.                                                                                                                                   |
-| `discovery.admitUtf8`  | Verify and retain one reserved text revision.        | At most 65,536 UTF-8 bytes; exact discovered hash and byte count.                                                                                                                  |
-| `jobs.reserve`         | Lease admitted text-processing jobs.                 | `maxItems` is 1–4; each lease lasts five minutes.                                                                                                                                  |
-| `jobs.renew`           | Renew a current processing lease.                    | Fixed five-minute server duration; exact retries preserve the returned expiry.                                                                                                     |
-| `jobs.stageUtf8`       | Stage retained text and evidence.                    | No text or counts accepted; server batches contain at most 25 rows.                                                                                                                |
-| `jobs.activate`        | Publish the staged generation.                       | Current source observation and lease must still match.                                                                                                                             |
-| `jobs.fail`            | Record a bounded worker failure.                     | Four published failure codes; server chooses retry policy.                                                                                                                         |
+| Operation                | Purpose                                              | Important bound                                                                                                                                                                    |
+| ------------------------ | ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `source.status`          | Read current worker-visible status for one source.   | No command-specific collection.                                                                                                                                                    |
+| `source.inventoryPage`   | Read a validated inventory page for a scan.          | A request ID and active recovery scan, inventory epoch, and manifest version bind a page retry; `paginationOpts.numItems` is 1–50 and cursor is null or at most 8,192 UTF-8 bytes. |
+| `scan.begin`             | Start a normal or identity-recovery scan.            | Request, watcher, and connector version IDs are each bounded.                                                                                                                      |
+| `scan.appendPage`        | Submit one bounded discovery page.                   | 1–4 entries per page and at most 64 pages per scan.                                                                                                                                |
+| `scan.seal`              | Seal a scan with healthy or failed discovery health. | `expectedPageCount` is 0–64.                                                                                                                                                       |
+| `scan.reconcile`         | Reconcile a sealed scan against current inventory.   | `maxItems` is 1–50 and `ordinal` fences each advancing request.                                                                                                                    |
+| `discovery.reserve`      | Lease enumerated discovery work for upload.          | `maxItems` is 1–4; the lease lasts five minutes.                                                                                                                                   |
+| `discovery.admitUtf8`    | Verify and retain one reserved text revision.        | At most 65,536 UTF-8 bytes; exact discovered hash and byte count.                                                                                                                  |
+| `jobs.reserve`           | Lease admitted text-processing jobs.                 | `maxItems` is 1–4; each lease lasts five minutes.                                                                                                                                  |
+| `jobs.renew`             | Renew a current processing lease.                    | Fixed five-minute server duration; exact retries preserve the returned expiry.                                                                                                     |
+| `jobs.stageUtf8`         | Stage retained text and evidence.                    | No text or counts accepted; server batches contain at most 25 rows.                                                                                                                |
+| `jobs.activate`          | Publish the staged generation.                       | Current source observation and lease must still match.                                                                                                                             |
+| `jobs.fail`              | Record a bounded worker failure.                     | Four published failure codes; server chooses retry policy.                                                                                                                         |
+| `processing.assessBegin` | Start an assessment of one terminal scan.            | One live assessment per source; current inventory and manifest required.                                                                                                           |
+| `processing.assessPage`  | Advance the server-owned assessment cursor.          | `maxItems` is exactly 1; only the latest committed page can replay.                                                                                                                |
 
 All commands require `protocolVersion: 1`. Envelopes use exact fields: unknown,
 missing, malformed, empty, or invalid-Unicode values are rejected as
@@ -105,7 +106,7 @@ submits discovery entries.
 The source mutation limit is 60 new requests per minute for each credential
 and source-account pair. It covers `source.inventoryPage`, `scan.begin`,
 `scan.appendPage`, `scan.seal`, `scan.reconcile`, `discovery.reserve`,
-`discovery.admitUtf8`, and the five `jobs.*` commands. A retry that exactly
+`discovery.admitUtf8`, the five `jobs.*` commands, and both `processing.*` commands. A retry that exactly
 matches a retained request receipt does not consume the limit. Reusing a
 request ID with different inputs fails as `request_conflict`.
 
@@ -128,16 +129,16 @@ are rejected. The complete URI is at most 2,048 UTF-8 bytes.
 The common fields shown above are omitted from this table for brevity. Every
 request object and nested object rejects unknown fields.
 
-| Operation              | Additional request fields                                                                                      | Result fields                                                                                                                                                                     |
-| ---------------------- | -------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `source.status`        | None.                                                                                                          | `{ operation, sourceAccountId, inventoryEpoch, completedInventoryEpoch, manifestVersion, enumeration, processing: { state: "not_assessed" }, recordCoverage: "not_established" }` |
-| `source.inventoryPage` | `{ scanId, requestId, expectedInventoryEpoch, expectedManifestVersion, paginationOpts: { cursor, numItems } }` | `{ operation, page, isDone, continueCursor }`                                                                                                                                     |
-| `scan.begin`           | `{ requestId, watcherId, connectorVersion, hostAffinity?, mode, expectedInventoryEpoch }`                      | `{ operation, scanId, inventoryEpoch, manifestVersion, state, reused }`                                                                                                           |
-| `scan.appendPage`      | `{ scanId, requestId, ordinal, entries }`                                                                      | `{ operation, scanId, ordinal, reused, entries: [{ state, sourceItemId?, observationEpoch?, processingEpoch? }] }`                                                                |
-| `scan.seal`            | `{ scanId, requestId, expectedPageCount, health }`                                                             | `{ operation, scanId, state, reused }`                                                                                                                                            |
-| `scan.reconcile`       | `{ scanId, requestId, expectedInventoryEpoch, ordinal, maxItems }`                                             | `{ operation, scanId, state, inspected, unavailable, done, reused }`                                                                                                              |
-| `discovery.reserve`    | `{ requestId, maxItems }`                                                                                      | `{ operation, receiptId, expiresAt, reused, targets }`                                                                                                                            |
-| `discovery.admitUtf8`  | `{ requestId, workId, leaseEpoch, leaseToken, text }`                                                          | `{ operation, workId, sourceItemId, sourceRevisionId, processingGenerationId, ingestJobId, desiredProcessingEpoch, state: "admitted", reused }`                                   |
+| Operation              | Additional request fields                                                                                      | Result fields                                                                                                                                                                          |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `source.status`        | None.                                                                                                          | `{ operation, sourceAccountId, inventoryEpoch, completedInventoryEpoch, manifestVersion, enumeration, processing: { state, ...assessmentStatus }, recordCoverage: "not_established" }` |
+| `source.inventoryPage` | `{ scanId, requestId, expectedInventoryEpoch, expectedManifestVersion, paginationOpts: { cursor, numItems } }` | `{ operation, page, isDone, continueCursor }`                                                                                                                                          |
+| `scan.begin`           | `{ requestId, watcherId, connectorVersion, hostAffinity?, mode, expectedInventoryEpoch }`                      | `{ operation, scanId, inventoryEpoch, manifestVersion, state, reused }`                                                                                                                |
+| `scan.appendPage`      | `{ scanId, requestId, ordinal, entries }`                                                                      | `{ operation, scanId, ordinal, reused, entries: [{ state, sourceItemId?, observationEpoch?, processingEpoch? }] }`                                                                     |
+| `scan.seal`            | `{ scanId, requestId, expectedPageCount, health }`                                                             | `{ operation, scanId, state, reused }`                                                                                                                                                 |
+| `scan.reconcile`       | `{ scanId, requestId, expectedInventoryEpoch, ordinal, maxItems }`                                             | `{ operation, scanId, state, inspected, unavailable, done, reused }`                                                                                                                   |
+| `discovery.reserve`    | `{ requestId, maxItems }`                                                                                      | `{ operation, receiptId, expiresAt, reused, targets }`                                                                                                                                 |
+| `discovery.admitUtf8`  | `{ requestId, workId, leaseEpoch, leaseToken, text }`                                                          | `{ operation, workId, sourceItemId, sourceRevisionId, processingGenerationId, ingestJobId, desiredProcessingEpoch, state: "admitted", reused }`                                        |
 
 The processing commands use these additional request and result fields:
 
@@ -148,6 +149,18 @@ The processing commands use these additional request and result fields:
 | `jobs.stageUtf8` | `{ requestId, jobId, leaseEpoch, leaseToken }`              | `{ operation, jobId, state: "staged", actualPageCount, actualEvidenceSpanCount, actualDocumentCount, actualChunkCount, reused }` |
 | `jobs.activate`  | `{ requestId, jobId, leaseEpoch, leaseToken }`              | `{ operation, jobId, state: "ready", activatedAt, previousGenerationId?, reused }`                                               |
 | `jobs.fail`      | `{ requestId, jobId, leaseEpoch, leaseToken, failureCode }` | `{ operation, jobId, state, retryable, nextAttemptAt?, failureCode, reused }`                                                    |
+
+The assessment commands use these request and result fields:
+
+| Operation                | Additional request fields                                                | Result fields                                                                                                                           |
+| ------------------------ | ------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `processing.assessBegin` | `{ requestId, scanId, expectedInventoryEpoch, expectedManifestVersion }` | `{ operation, assessmentId, scanId, inventoryEpoch, manifestVersion, state, nextOrdinal, counts?, completedAt?, reused, staleReason? }` |
+| `processing.assessPage`  | `{ requestId, assessmentId, ordinal, maxItems: 1 }`                      | `{ operation, assessmentId, state, phase, ordinal, inspected, nextOrdinal, counts?, completedAt?, reused, staleReason? }`               |
+
+Assessment states are `running`, `complete`, `incomplete`, or `stale`. Page
+phases are `items`, `unresolved_entries`, or `done`. Only complete or incomplete
+results contain counts and a completion time. Stale reasons are `source_changed`,
+`detail_unavailable`, and `expired`.
 
 A processing reservation target is
 `{ jobId, workId, sourceItemId, observationEpoch, processingEpoch, state, leaseEpoch, leaseToken, leaseExpiresAt }`.
@@ -231,8 +244,8 @@ after successful admission has cleared the discovery lease. Reusing its
 request ID with different text fails.
 
 Admission retains a queued revision and job. It does not publish a searchable
-document. `source.status.processing` remains `not_assessed` until source processing
-assessment is implemented.
+document. Run a separate processing assessment to summarize the source after
+publication; admission alone does not prove that processing is complete.
 
 ## Processing retained text
 
@@ -278,13 +291,66 @@ The existing web actor-replacement operation rejects worker-linked jobs;
 explicit owner-authorized worker provenance recovery is planned before pilot
 use.
 
+## Source processing assessment
+
+After a terminal scan, call `processing.assessBegin` with `requestId`, `scanId`,
+`expectedInventoryEpoch`, and `expectedManifestVersion`. The server records the
+current source and scan state and initializes its counters. A different start
+request cannot replace an unexpired running assessment. An exact start retry
+returns the same assessment under the original live credential.
+
+Call `processing.assessPage` with `requestId`, `assessmentId`, `ordinal`, and
+`maxItems: 1`. The server owns the cursor and performs two walks: source items,
+then unresolved scan entries. The result contains `assessmentId`, `state`,
+`phase`, `ordinal`, `inspected`, `nextOrdinal`, and `reused`. Terminal results
+include counts; running results do not expose partial counts. The client cannot
+supply a cursor, timestamps, counters, or classification.
+
+Only the most recently committed page request has a replay guarantee. Retry
+that exact request after a lost response. Once the next page commits, an older
+page cannot replay or advance the assessment. The terminal page remains
+replayable while its assessment and source state remain valid. A new assessment
+recounts the source from the beginning.
+
+A source change during either walk invalidates the assessment. The server also
+checks generic revision admissions and availability changes, so a document
+counted earlier cannot silently become unfinished before completion. Missing or
+pruned required scan detail produces `stale` with `detail_unavailable`; a new
+scan is required. Source changes and expiry have separate bounded stale reasons.
+A running assessment expires after thirty minutes without a new page. Cleanup
+retains its required scan detail while it is active and unexpired.
+
+The item counts are `ready`, `pending`, `failed`, `needsReview`, `explicitGap`,
+`unavailable`, and `ignoredForgotten`. Unresolved entries separately count
+`needsReview` and `ignoredForgotten`. Each item or unresolved entry contributes
+once. A terminal result is `complete` only when no pending, failed, review, gap,
+or unavailable category remains. A terminal scan needing review always yields
+`incomplete`. Empty sources and valid forgotten tombstones do not block completion.
+
+Ready means the item's exact desired revision and generation have been
+published. Historical failed jobs do not block a newer ready generation.
+Revoking a historical ingestion credential does not unpublish ready evidence;
+unfinished work with revoked original authority needs review. The credential
+performing an assessment must remain authorized on every request.
+
+`source.status.processing` reports `not_assessed`, `assessing`, `complete`, or
+`incomplete`. A terminal status includes its assessment and scan IDs, inventory
+and manifest versions, `completedAt`, and counts. Counts are a snapshot from
+that assessment, not live queue totals. Later processing can leave a conservative
+`incomplete` snapshot until the next assessment. A changed source fence suppresses
+old results, and publication-time changes also suppress old snapshots when detected.
+Assessment results contain no source paths, document text, or item-level IDs.
+
+Enumeration, processing, and record coverage remain distinct. Neither a healthy
+scan nor a `complete` processing assessment proves that every financial record,
+medical test, or date range has been captured.
+
 ## Deferred operations
 
-Source-wide processing assessment, parsing, binary archives, and generic job
-execution remain unavailable. A ready text document can be searched and read
-through the authorized hosted document tools, but does not establish source
-processing completeness or record/date coverage. `source.status.processing`
-remains `not_assessed`, and `recordCoverage` remains `not_established`.
+Parsing, binary archives, and generic job execution remain unavailable. A ready
+text document can be searched and read through the authorized hosted document
+tools. A completed processing assessment does not establish record or date
+coverage. `recordCoverage` remains `not_established`.
 
 ## Upgrading queued admissions
 

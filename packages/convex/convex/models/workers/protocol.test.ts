@@ -103,11 +103,41 @@ describe("worker protocol parser", () => {
         text: "alpha beta",
       }),
     ).toMatchObject({ operation: "discovery.admitUtf8", leaseEpoch: 1 });
+    expect(
+      parseWorkerRequest({
+        ...source,
+        operation: "processing.assessBegin",
+        requestId: "assess-begin-1",
+        scanId: "scan-id",
+        expectedInventoryEpoch: 2,
+        expectedManifestVersion: 4,
+      }),
+    ).toMatchObject({ operation: "processing.assessBegin" });
+    expect(
+      parseWorkerRequest({
+        ...source,
+        operation: "processing.assessPage",
+        requestId: "assess-page-1",
+        assessmentId: "assessment-id",
+        ordinal: 0,
+        maxItems: 1,
+      }),
+    ).toMatchObject({ operation: "processing.assessPage", maxItems: 1 });
   });
 
   it("rejects unknown operations and extra keys", () => {
     expect(() =>
       parseWorkerRequest({ ...source, operation: "jobs.execute" }),
+    ).toThrow(WorkerProtocolParseError);
+    expect(() =>
+      parseWorkerRequest({
+        ...source,
+        operation: "processing.assessPage",
+        requestId: "assess-page-too-wide",
+        assessmentId: "assessment-id",
+        ordinal: 0,
+        maxItems: 2,
+      }),
     ).toThrow(WorkerProtocolParseError);
     expect(() =>
       parseWorkerRequest({

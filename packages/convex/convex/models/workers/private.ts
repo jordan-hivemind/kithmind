@@ -25,6 +25,10 @@ import {
   stageProcessingText,
 } from "./jobs";
 import { parseWorkerRequest, type WorkerRequest } from "./protocol";
+import {
+  advanceProcessingAssessment,
+  beginProcessingAssessment,
+} from "./assessment";
 
 function operation<T extends WorkerRequest["operation"]>(
   value: unknown,
@@ -261,6 +265,28 @@ export const jobsFail = internalMutation({
       ctx,
       args.principal,
       operation(args.request, "jobs.fail"),
+      Date.now(),
+    ),
+});
+
+export const processingAssessBegin = internalMutation({
+  args: { principal: principalRefValidator, request: v.any() },
+  handler: async (ctx, args) =>
+    await beginProcessingAssessment(
+      ctx,
+      args.principal,
+      operation(args.request, "processing.assessBegin"),
+      Date.now(),
+    ),
+});
+
+export const processingAssessPage = internalMutation({
+  args: { principal: principalRefValidator, request: v.any() },
+  handler: async (ctx, args) =>
+    await advanceProcessingAssessment(
+      ctx,
+      args.principal,
+      operation(args.request, "processing.assessPage"),
       Date.now(),
     ),
 });

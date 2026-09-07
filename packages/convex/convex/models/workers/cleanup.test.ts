@@ -116,7 +116,7 @@ describe("worker cleanup bounds", () => {
       }
     });
     const firstCycle = [];
-    for (let index = 0; index < 19; index += 1) {
+    for (let index = 0; index < 23; index += 1) {
       firstCycle.push(
         await f.t.mutation(internal.models.workers.cleanup.removeExpired, {}),
       );
@@ -128,7 +128,7 @@ describe("worker cleanup bounds", () => {
     });
 
     const secondCycle = [];
-    for (let index = 0; index < 19; index += 1) {
+    for (let index = 0; index < 23; index += 1) {
       secondCycle.push(
         await f.t.mutation(internal.models.workers.cleanup.removeExpired, {}),
       );
@@ -359,7 +359,7 @@ describe("worker cleanup bounds", () => {
       });
     });
 
-    for (let index = 0; index < 19; index += 1) {
+    for (let index = 0; index < 23; index += 1) {
       await f.t.mutation(internal.models.workers.cleanup.removeExpired, {});
     }
     await f.t.run(async (ctx) => {
@@ -380,7 +380,7 @@ describe("worker cleanup bounds", () => {
       await ctx.db.patch(entry._id, { discoveryWorkId: undefined });
       await ctx.db.patch(work._id, { state: "queued" });
     });
-    for (let index = 0; index < 19; index += 1) {
+    for (let index = 0; index < 23; index += 1) {
       await f.t.mutation(internal.models.workers.cleanup.removeExpired, {});
     }
     await f.t.run(async (ctx) => {
@@ -680,7 +680,7 @@ describe("worker reservation receipt retention", () => {
       }
       return lastId!;
     });
-    for (let i = 0; i < 19; i++) {
+    for (let i = 0; i < 23; i++) {
       const result = await f.t.mutation(
         internal.models.workers.cleanup.removeExpired,
         {},
@@ -690,7 +690,7 @@ describe("worker reservation receipt retention", () => {
     await f.t.run(async (ctx) => {
       expect(await ctx.db.get(tailId)).not.toBeNull();
     });
-    for (let i = 0; i < 19; i++) {
+    for (let i = 0; i < 23; i++) {
       const result = await f.t.mutation(
         internal.models.workers.cleanup.removeExpired,
         {},
@@ -736,10 +736,212 @@ test("rate window cleanup preserves current limits and removes expired key state
     await ctx.db.delete(retiredCredentialId);
     return { expired, live };
   });
-  for (let i = 0; i < 19; i++)
+  for (let i = 0; i < 23; i++)
     await f.t.mutation(internal.models.workers.cleanup.removeExpired, {});
   await f.t.run(async (ctx) => {
     expect(await ctx.db.get(ids.expired)).toBeNull();
     expect(await ctx.db.get(ids.live)).toMatchObject({ count: 60 });
+  });
+});
+
+async function insertAssessment(
+  f: Awaited<ReturnType<typeof fixture>>,
+  scanId: Awaited<ReturnType<typeof insertScan>>,
+) {
+  return f.t.run(async (ctx) => {
+    const id = await ctx.db.insert("workerProcessingAssessments", {
+      spaceId: f.spaceId,
+      sourceAccountId: f.sourceAccountId,
+      scanId,
+      requestId: crypto.randomUUID(),
+      requestDigest: "d".repeat(64),
+      actorUserId: f.userId,
+      actorCredentialId: f.credentialId,
+      inventoryEpoch: 0,
+      completedInventoryEpoch: 0,
+      manifestVersion: 0,
+      assessmentEpoch: 0,
+      coverageInvalidatedAt: 0,
+      lastEnumeratedAt: 0,
+      lastProcessedAtAtStart: 0,
+      scanCompletedAt: 0,
+      scanStateAtStart: "enumerated",
+      scanEntryCount: 0,
+      scanChangedCount: 0,
+      scanGapCount: 0,
+      scanReviewCount: 0,
+      state: "running",
+      phase: "items",
+      nextOrdinal: 0,
+      counts: {
+        items: {
+          ready: 0,
+          pending: 0,
+          failed: 0,
+          needsReview: 0,
+          explicitGap: 0,
+          unavailable: 0,
+          ignoredForgotten: 0,
+        },
+        unresolvedEntries: { needsReview: 0, ignoredForgotten: 0 },
+      },
+      accountedScanEntries: 0,
+      queuedScanEntries: 0,
+      gapScanEntries: 0,
+      reviewScanEntries: 0,
+      ignoredScanEntries: 0,
+      unchangedScanEntries: 0,
+      startedAt: 0,
+      updatedAt: 0,
+      expiresAt: Date.now() + 60_000,
+      retireAt: 0,
+    });
+    await ctx.db.patch(f.sourceAccountId, { activeWorkerAssessmentId: id });
+    return id;
+  });
+}
+
+async function cleanupCycle(f: Awaited<ReturnType<typeof fixture>>) {
+  for (let index = 0; index < 23; index += 1) {
+    const result = await f.t.mutation(
+      internal.models.workers.cleanup.removeExpired,
+      {},
+    );
+    expect(result.inspected).toBeLessThanOrEqual(25);
+  }
+}
+
+describe("assessment cleanup", () => {
+  test("pins exact live scan detail, expires the run, and then releases its detail", async () => {
+    const f = await fixture();
+    const scanId = await insertScan(f.t, f);
+    const assessmentId = await insertAssessment(f, scanId);
+    const pageId = await f.t.run((ctx) =>
+      ctx.db.insert("workerScanPages", {
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        scanId,
+        ordinal: 0,
+        requestId: "pinned-page",
+        requestDigest: "c".repeat(64),
+        entryCount: 1,
+        createdAt: 0,
+        retireAt: 0,
+      }),
+    );
+    const entryId = await f.t.run((ctx) =>
+      ctx.db.insert("workerScanEntries", {
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        scanId,
+        scanPageId: pageId,
+        identityKeyHash: "pinned-gap",
+        uriDigest: "d".repeat(64),
+        inventoryMetadataDigest: "e".repeat(64),
+        sourceModifiedAt: 0,
+        state: "gap",
+        observedAt: 0,
+        retireAt: 0,
+      }),
+    );
+    await cleanupCycle(f);
+    await f.t.run(async (ctx) => {
+      expect(await ctx.db.get(scanId)).not.toBeNull();
+      expect(await ctx.db.get(pageId)).not.toBeNull();
+      expect(await ctx.db.get(entryId)).not.toBeNull();
+      await ctx.db.patch(assessmentId, { expiresAt: 0 });
+    });
+    await cleanupCycle(f);
+    await f.t.run(async (ctx) => {
+      expect(await ctx.db.get(scanId)).toBeNull();
+      expect(await ctx.db.get(pageId)).toBeNull();
+      expect(await ctx.db.get(entryId)).toBeNull();
+      expect(await ctx.db.get(assessmentId)).toMatchObject({
+        state: "stale",
+        staleReason: "expired",
+      });
+      expect(
+        (await ctx.db.get(f.sourceAccountId))?.activeWorkerAssessmentId,
+      ).toBeUndefined();
+      await ctx.db.patch(assessmentId, { retireAt: 0 });
+    });
+    await cleanupCycle(f);
+    expect(await f.t.run((ctx) => ctx.db.get(assessmentId))).toBeNull();
+  });
+
+  test("a cross-source active pointer cannot pin another source's scan", async () => {
+    const f = await fixture();
+    const scanId = await insertScan(f.t, f);
+    const assessmentId = await insertAssessment(f, scanId);
+    await f.t.run(async (ctx) => {
+      const source = await ctx.db.get(f.sourceAccountId);
+      if (!source) throw new Error("Missing fixture source");
+      const { _id, _creationTime, ...fields } = source;
+      const foreign = await ctx.db.insert("sourceAccounts", {
+        ...fields,
+        accountId: "foreign",
+        activeWorkerAssessmentId: undefined,
+      });
+      await ctx.db.patch(assessmentId, {
+        sourceAccountId: foreign,
+        retireAt: Date.now() + 60_000,
+      });
+    });
+    await cleanupCycle(f);
+    expect(await f.t.run((ctx) => ctx.db.get(scanId))).toBeNull();
+    expect(await f.t.run((ctx) => ctx.db.get(assessmentId))).not.toBeNull();
+  });
+
+  test("retains a current terminal snapshot after scan pruning and clears a stale latest pointer", async () => {
+    const f = await fixture();
+    const scanId = await insertScan(f.t, f);
+    const assessmentId = await insertAssessment(f, scanId);
+    await f.t.run(async (ctx) => {
+      await ctx.db.patch(assessmentId, {
+        state: "complete",
+        phase: "done",
+        completedAt: 1,
+        lastProcessedAtAtCompletion: 0,
+      });
+      await ctx.db.patch(f.sourceAccountId, {
+        activeWorkerAssessmentId: undefined,
+        latestWorkerAssessmentId: assessmentId,
+      });
+    });
+    await cleanupCycle(f);
+    await f.t.run(async (ctx) => {
+      expect(await ctx.db.get(scanId)).toBeNull();
+      expect(await ctx.db.get(assessmentId)).not.toBeNull();
+      await ctx.db.patch(f.sourceAccountId, { workerAssessmentEpoch: 1 });
+    });
+    await cleanupCycle(f);
+    await f.t.run(async (ctx) => {
+      expect(await ctx.db.get(assessmentId)).toBeNull();
+      expect(
+        (await ctx.db.get(f.sourceAccountId))?.latestWorkerAssessmentId,
+      ).toBeUndefined();
+    });
+  });
+
+  test("starts a fresh v4 cycle and retires the deployed v3 checkpoint", async () => {
+    const f = await fixture();
+    await f.t.run((ctx) =>
+      ctx.db.insert("workerCleanupState", {
+        key: "v3",
+        nextPhase: 18,
+        checkpoints: Array.from({ length: 19 }, () => ({ cutoff: 0 })),
+      }),
+    );
+    const result = await f.t.mutation(
+      internal.models.workers.cleanup.removeExpired,
+      {},
+    );
+    expect(result.phase).toBe(0);
+    await f.t.run(async (ctx) => {
+      const rows = await ctx.db.query("workerCleanupState").collect();
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.key).toBe("v4");
+      expect(rows[0]?.checkpoints).toHaveLength(23);
+    });
   });
 });

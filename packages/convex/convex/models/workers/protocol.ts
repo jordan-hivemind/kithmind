@@ -62,6 +62,7 @@ export const MAX_WORKER_SCAN_PAGES = 64;
 export const MAX_WORKER_INVENTORY_PAGE_ITEMS = 50;
 export const MAX_WORKER_RECONCILE_ITEMS = 50;
 export const MAX_WORKER_RESERVATION_ITEMS = 4;
+export const MAX_WORKER_ASSESSMENT_ITEMS = 1;
 
 export type WorkerPaginationOptions = {
   cursor: string | null;
@@ -197,7 +198,50 @@ export type WorkerRequest =
       leaseEpoch: number;
       leaseToken: string;
       failureCode: WorkerJobFailureCode;
+    })
+  | (WorkerSourceRequest & {
+      operation: "processing.assessBegin";
+      requestId: string;
+      scanId: string;
+      expectedInventoryEpoch: number;
+      expectedManifestVersion: number;
+    })
+  | (WorkerSourceRequest & {
+      operation: "processing.assessPage";
+      requestId: string;
+      assessmentId: string;
+      ordinal: number;
+      maxItems: number;
     });
+
+export type ProcessingAssessmentCounts = {
+  items: {
+    ready: number;
+    pending: number;
+    failed: number;
+    needsReview: number;
+    explicitGap: number;
+    unavailable: number;
+    ignoredForgotten: number;
+  };
+  unresolvedEntries: {
+    needsReview: number;
+    ignoredForgotten: number;
+  };
+};
+
+export type WorkerProcessingStatus =
+  | { state: "not_assessed" }
+  | { state: "assessing"; assessmentId: string; startedAt: number }
+  | {
+      state: "complete" | "incomplete";
+      assessmentId: string;
+      scanId: string;
+      inventoryEpoch: number;
+      manifestVersion: number;
+      completedAt: number;
+      counts: ProcessingAssessmentCounts;
+    };
 
 export type WorkerSourceStatusResult = {
   operation: "source.status";
@@ -216,7 +260,7 @@ export type WorkerSourceStatusResult = {
         completedAt?: number;
         failureCode?: FsDiscoveryGapCode;
       };
-  processing: { state: "not_assessed" };
+  processing: WorkerProcessingStatus;
   recordCoverage: "not_established";
 };
 
@@ -376,6 +420,34 @@ export type WorkerJobFailResult = {
   reused: boolean;
 };
 
+export type WorkerAssessmentBeginResult = {
+  operation: "processing.assessBegin";
+  assessmentId: string;
+  scanId: string;
+  inventoryEpoch: number;
+  manifestVersion: number;
+  state: "running" | "complete" | "incomplete" | "stale";
+  nextOrdinal: number;
+  counts?: ProcessingAssessmentCounts;
+  completedAt?: number;
+  reused: boolean;
+  staleReason?: "source_changed" | "detail_unavailable" | "expired";
+};
+
+export type WorkerAssessmentPageResult = {
+  operation: "processing.assessPage";
+  assessmentId: string;
+  state: "running" | "complete" | "incomplete" | "stale";
+  phase: "items" | "unresolved_entries" | "done";
+  ordinal: number;
+  inspected: number;
+  nextOrdinal: number;
+  counts?: ProcessingAssessmentCounts;
+  completedAt?: number;
+  reused: boolean;
+  staleReason?: "source_changed" | "detail_unavailable" | "expired";
+};
+
 export type WorkerResult =
   | WorkerSourceStatusResult
   | WorkerInventoryPageResult
@@ -389,7 +461,9 @@ export type WorkerResult =
   | WorkerJobRenewResult
   | WorkerJobStageResult
   | WorkerJobActivateResult
-  | WorkerJobFailResult;
+  | WorkerJobFailResult
+  | WorkerAssessmentBeginResult
+  | WorkerAssessmentPageResult;
 
 type JsonObject = Record<string, unknown>;
 
@@ -851,6 +925,38 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
         operation: "jobs.fail",
         ...jobLeaseRequest(input),
         failureCode: jobFailureCode(input.failureCode),
+      };
+    case "processing.assessBegin":
+      exactKeys(input, [
+        ...baseKeys,
+        "requestId",
+        "scanId",
+        "expectedInventoryEpoch",
+        "expectedManifestVersion",
+      ]);
+      return {
+        ...base,
+        operation: "processing.assessBegin",
+        requestId: requestId(input.requestId),
+        scanId: scanId(input.scanId),
+        expectedInventoryEpoch: epoch(input.expectedInventoryEpoch),
+        expectedManifestVersion: epoch(input.expectedManifestVersion),
+      };
+    case "processing.assessPage":
+      exactKeys(input, [
+        ...baseKeys,
+        "requestId",
+        "assessmentId",
+        "ordinal",
+        "maxItems",
+      ]);
+      return {
+        ...base,
+        operation: "processing.assessPage",
+        requestId: requestId(input.requestId),
+        assessmentId: string(input.assessmentId, { maxUtf16: 256 }),
+        ordinal: integer(input.ordinal, 0, Number.MAX_SAFE_INTEGER),
+        maxItems: integer(input.maxItems, 1, MAX_WORKER_ASSESSMENT_ITEMS),
       };
     default:
       return invalid();

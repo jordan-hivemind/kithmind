@@ -17,6 +17,9 @@ export const sourceAccountFields = {
   completedInventoryEpoch: v.optional(v.number()),
   manifestVersion: v.optional(v.number()),
   activeWorkerScanId: v.optional(v.id("workerSourceScans")),
+  workerAssessmentEpoch: v.optional(v.number()),
+  activeWorkerAssessmentId: v.optional(v.id("workerProcessingAssessments")),
+  latestWorkerAssessmentId: v.optional(v.id("workerProcessingAssessments")),
   createdBy: v.id("users"),
 };
 

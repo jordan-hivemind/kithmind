@@ -41,6 +41,98 @@ export const workerDiscoveryStateValidator = v.union(
   v.literal("obsolete"),
 );
 
+export const workerAssessmentStateValidator = v.union(
+  v.literal("running"),
+  v.literal("complete"),
+  v.literal("incomplete"),
+  v.literal("stale"),
+);
+
+export const workerAssessmentPhaseValidator = v.union(
+  v.literal("items"),
+  v.literal("unresolved_entries"),
+  v.literal("done"),
+);
+
+export const workerAssessmentStaleReasonValidator = v.union(
+  v.literal("source_changed"),
+  v.literal("detail_unavailable"),
+  v.literal("expired"),
+);
+
+export const workerAssessmentCountsValidator = v.object({
+  items: v.object({
+    ready: v.number(),
+    pending: v.number(),
+    failed: v.number(),
+    needsReview: v.number(),
+    explicitGap: v.number(),
+    unavailable: v.number(),
+    ignoredForgotten: v.number(),
+  }),
+  unresolvedEntries: v.object({
+    needsReview: v.number(),
+    ignoredForgotten: v.number(),
+  }),
+});
+
+export const workerProcessingAssessmentFields = {
+  spaceId: v.id("spaces"),
+  sourceAccountId: v.id("sourceAccounts"),
+  scanId: v.id("workerSourceScans"),
+  requestId: v.string(),
+  requestDigest: v.string(),
+  actorUserId: v.id("users"),
+  actorCredentialId: v.id("apiKeys"),
+  inventoryEpoch: v.number(),
+  completedInventoryEpoch: v.number(),
+  manifestVersion: v.number(),
+  assessmentEpoch: v.number(),
+  coverageInvalidatedAt: v.number(),
+  lastEnumeratedAt: v.number(),
+  lastProcessedAtAtStart: v.number(),
+  scanCompletedAt: v.number(),
+  scanStateAtStart: v.union(v.literal("enumerated"), v.literal("needs_review")),
+  scanEntryCount: v.number(),
+  scanChangedCount: v.number(),
+  scanGapCount: v.number(),
+  scanReviewCount: v.number(),
+  state: workerAssessmentStateValidator,
+  staleReason: v.optional(workerAssessmentStaleReasonValidator),
+  phase: workerAssessmentPhaseValidator,
+  cursor: v.optional(v.string()),
+  nextOrdinal: v.number(),
+  counts: workerAssessmentCountsValidator,
+  accountedScanEntries: v.number(),
+  queuedScanEntries: v.number(),
+  gapScanEntries: v.number(),
+  reviewScanEntries: v.number(),
+  ignoredScanEntries: v.number(),
+  unchangedScanEntries: v.number(),
+  lastPageRequestId: v.optional(v.string()),
+  lastPageRequestDigest: v.optional(v.string()),
+  lastPageInputPhase: v.optional(workerAssessmentPhaseValidator),
+  lastPageOrdinal: v.optional(v.number()),
+  lastPageResult: v.optional(
+    v.object({
+      state: workerAssessmentStateValidator,
+      phase: workerAssessmentPhaseValidator,
+      ordinal: v.number(),
+      inspected: v.number(),
+      nextOrdinal: v.number(),
+      counts: v.optional(workerAssessmentCountsValidator),
+      completedAt: v.optional(v.number()),
+      staleReason: v.optional(workerAssessmentStaleReasonValidator),
+    }),
+  ),
+  startedAt: v.number(),
+  updatedAt: v.number(),
+  expiresAt: v.number(),
+  completedAt: v.optional(v.number()),
+  lastProcessedAtAtCompletion: v.optional(v.number()),
+  retireAt: v.number(),
+};
+
 export const workerSourceScanFields = {
   spaceId: v.id("spaces"),
   sourceAccountId: v.id("sourceAccounts"),

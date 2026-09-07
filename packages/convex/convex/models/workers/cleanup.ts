@@ -1,11 +1,13 @@
 import type { MutationCtx } from "../../_generated/server";
+import type { Id } from "../../_generated/dataModel";
 import { internalMutation } from "../../_generated/server";
+import { isAssessmentSnapshotCurrent } from "./assessment";
 import {
   WORKER_CLEANUP_BATCH_SIZE,
   WORKER_DETAIL_RETENTION_MS,
   WORKER_SCAN_RETENTION_MS,
-  WORKER_MUTATION_RATE_WINDOW_MS,
 } from "./model";
+import { WORKER_MUTATION_RATE_WINDOW_MS } from "./rateLimit";
 
 const phases = [
   { kind: "expire_scan", state: "open" },
@@ -27,10 +29,43 @@ const phases = [
   { kind: "reservation_receipt" },
   { kind: "operation_receipt" },
   { kind: "rate_limit" },
+  { kind: "expire_assessment" },
+  { kind: "assessment", state: "stale" },
+  { kind: "assessment", state: "complete" },
+  { kind: "assessment", state: "incomplete" },
 ] as const;
 
 // Phase ordering is persisted. A new layout starts a fresh, safe sweep.
-const CHECKPOINT_KEY = "v3";
+const CHECKPOINT_KEY = "v4";
+
+/** Only the exact active source assessment can pin this scan's detail. */
+async function hasLiveAssessment(
+  ctx: MutationCtx,
+  row: {
+    spaceId: Id<"spaces">;
+    sourceAccountId: Id<"sourceAccounts">;
+    scanId: Id<"workerSourceScans">;
+  },
+  now: number,
+) {
+  const source = await ctx.db.get(row.sourceAccountId);
+  if (
+    !source ||
+    source.spaceId !== row.spaceId ||
+    !source.activeWorkerAssessmentId
+  )
+    return false;
+  const assessment = await ctx.db.get(source.activeWorkerAssessmentId);
+  return Boolean(
+    assessment &&
+    assessment.sourceAccountId === source._id &&
+    assessment.spaceId === source.spaceId &&
+    assessment.scanId === row.scanId &&
+    assessment.state === "running" &&
+    Number.isSafeInteger(assessment.expiresAt) &&
+    assessment.expiresAt > now,
+  );
+}
 
 type Checkpoint = { cursor?: string; cutoff: number };
 type Page<T> = { page: T[]; isDone: boolean; continueCursor: string };
@@ -55,6 +90,64 @@ async function sweep(
     cursor: checkpoint.cursor ?? null,
   };
   let changed = 0;
+  if (phase.kind === "expire_assessment") {
+    const page = await ctx.db
+      .query("workerProcessingAssessments")
+      .withIndex("by_state_and_expiresAt", (q) =>
+        q.eq("state", "running").lte("expiresAt", checkpoint.cutoff),
+      )
+      .paginate(paginationOpts);
+    for (const row of page.page) {
+      // A page can have renewed its deadline after this sweep began.
+      if (row.expiresAt > now) continue;
+      await ctx.db.patch(row._id, {
+        state: "stale",
+        staleReason: "expired",
+        phase: "done",
+        cursor: undefined,
+        updatedAt: now,
+        retireAt: now + WORKER_SCAN_RETENTION_MS,
+      });
+      const source = await ctx.db.get(row.sourceAccountId);
+      if (
+        source?.spaceId === row.spaceId &&
+        source.activeWorkerAssessmentId === row._id
+      )
+        await ctx.db.patch(source._id, { activeWorkerAssessmentId: undefined });
+      changed += 1;
+    }
+    return progress(page, changed);
+  }
+  if (phase.kind === "assessment") {
+    const page = await ctx.db
+      .query("workerProcessingAssessments")
+      .withIndex("by_state_and_retireAt", (q) =>
+        q.eq("state", phase.state).lte("retireAt", checkpoint.cutoff),
+      )
+      .paginate(paginationOpts);
+    for (const row of page.page) {
+      const source = await ctx.db.get(row.sourceAccountId);
+      if (
+        source?.spaceId === row.spaceId &&
+        source.latestWorkerAssessmentId === row._id &&
+        isAssessmentSnapshotCurrent(source, row)
+      )
+        continue;
+      if (source?.spaceId === row.spaceId) {
+        if (source.activeWorkerAssessmentId === row._id)
+          await ctx.db.patch(source._id, {
+            activeWorkerAssessmentId: undefined,
+          });
+        if (source.latestWorkerAssessmentId === row._id)
+          await ctx.db.patch(source._id, {
+            latestWorkerAssessmentId: undefined,
+          });
+      }
+      await ctx.db.delete(row._id);
+      changed += 1;
+    }
+    return progress(page, changed);
+  }
   if (phase.kind === "rate_limit") {
     const page = await ctx.db
       .query("workerProtocolRateLimits")
@@ -213,6 +306,7 @@ async function sweep(
       // Admission envelopes referenced by jobs remain available for recovery.
       // Advancing the cursor past them lets unrelated expired rows be pruned.
       if (row.ingestJobId !== undefined) continue;
+      if (await hasLiveAssessment(ctx, row, now)) continue;
       await ctx.db.delete(row._id);
       changed += 1;
     }
@@ -226,6 +320,7 @@ async function sweep(
       )
       .paginate(paginationOpts);
     for (const row of page.page) {
+      if (await hasLiveAssessment(ctx, row, now)) continue;
       if (row.discoveryWorkId && (await ctx.db.get(row.discoveryWorkId)))
         continue;
       await ctx.db.delete(row._id);
@@ -239,6 +334,7 @@ async function sweep(
       .withIndex("by_retireAt", (q) => q.lte("retireAt", checkpoint.cutoff))
       .paginate(paginationOpts);
     for (const row of page.page) {
+      if (await hasLiveAssessment(ctx, row, now)) continue;
       const entry = await ctx.db
         .query("workerScanEntries")
         .withIndex("by_scanPageId", (q) => q.eq("scanPageId", row._id))
@@ -256,6 +352,8 @@ async function sweep(
     )
     .paginate(paginationOpts);
   for (const row of page.page) {
+    if (await hasLiveAssessment(ctx, { ...row, scanId: row._id }, now))
+      continue;
     const [childPage, childEntry] = await Promise.all([
       ctx.db
         .query("workerScanPages")
@@ -307,7 +405,7 @@ export const removeExpired = internalMutation({
     if (state) await ctx.db.patch(state._id, fields);
     else {
       await ctx.db.insert("workerCleanupState", fields);
-      for (const oldKey of ["v1", "v2"]) {
+      for (const oldKey of ["v1", "v2", "v3"]) {
         const old = await ctx.db
           .query("workerCleanupState")
           .withIndex("by_key", (q) => q.eq("key", oldKey))

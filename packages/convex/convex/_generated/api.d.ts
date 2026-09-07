@@ -123,6 +123,7 @@ import type * as models_thoughts_private from "../models/thoughts/private.js";
 import type * as models_thoughts_public from "../models/thoughts/public.js";
 import type * as models_thoughts_publicActions from "../models/thoughts/publicActions.js";
 import type * as models_thoughts_validators from "../models/thoughts/validators.js";
+import type * as models_workers_assessment from "../models/workers/assessment.js";
 import type * as models_workers_auth from "../models/workers/auth.js";
 import type * as models_workers_cleanup from "../models/workers/cleanup.js";
 import type * as models_workers_discovery from "../models/workers/discovery.js";
@@ -134,6 +135,7 @@ import type * as models_workers_model from "../models/workers/model.js";
 import type * as models_workers_private from "../models/workers/private.js";
 import type * as models_workers_profile from "../models/workers/profile.js";
 import type * as models_workers_protocol from "../models/workers/protocol.js";
+import type * as models_workers_rateLimit from "../models/workers/rateLimit.js";
 import type * as models_workers_tables from "../models/workers/tables.js";
 import type * as models_workers_validators from "../models/workers/validators.js";
 
@@ -259,6 +261,7 @@ declare const fullApi: ApiFromModules<{
   "models/thoughts/public": typeof models_thoughts_public;
   "models/thoughts/publicActions": typeof models_thoughts_publicActions;
   "models/thoughts/validators": typeof models_thoughts_validators;
+  "models/workers/assessment": typeof models_workers_assessment;
   "models/workers/auth": typeof models_workers_auth;
   "models/workers/cleanup": typeof models_workers_cleanup;
   "models/workers/discovery": typeof models_workers_discovery;
@@ -270,6 +273,7 @@ declare const fullApi: ApiFromModules<{
   "models/workers/private": typeof models_workers_private;
   "models/workers/profile": typeof models_workers_profile;
   "models/workers/protocol": typeof models_workers_protocol;
+  "models/workers/rateLimit": typeof models_workers_rateLimit;
   "models/workers/tables": typeof models_workers_tables;
   "models/workers/validators": typeof models_workers_validators;
 }>;

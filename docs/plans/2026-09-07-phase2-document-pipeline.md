@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-07
 
-**Status:** P2-7 implementation in progress. The scoped discovery and text-processing gateway is implemented; source assessment, the filesystem daemon, parsing, and isolated restore remain outstanding.
+**Status:** P2-7 implementation in progress. The scoped discovery, text-processing, and source-assessment gateway is implemented; the filesystem daemon, parsing, and isolated restore remain outstanding.
 
 ## Outcome
 
