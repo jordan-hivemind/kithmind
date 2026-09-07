@@ -1,3 +1,15 @@
+import {
+  MAX_EVENTS_PER_GENERATION,
+  MAX_OBSERVATIONS_PER_GENERATION,
+  stageRecordBatch,
+  validateGenerationRecords,
+  deleteSourceItemRecordsBatch,
+} from "../records/model";
+import type { StagedEventRecord } from "../records/validators";
+import {
+  nextRecordActivationTime,
+  purgeRecordQuerySessionsForSpaceBatch,
+} from "../records/querySessions";
 import type { Doc, Id } from "../../_generated/dataModel";
 import type { MutationCtx } from "../../_generated/server";
 import { requireSourceAccountAccess } from "../../lib/sourceAuth";
@@ -81,6 +93,8 @@ export type AdmissionInput = {
     expectedEvidenceSpanCount: number;
     expectedDocumentCount: number;
     expectedChunkCount: number;
+    expectedEventCount?: number;
+    expectedObservationCount?: number;
   };
 };
 
@@ -153,6 +167,18 @@ function assertAdmissionBounds(input: AdmissionInput): void {
     input.processing.expectedChunkCount,
     0,
     MAX_CHUNKS,
+  );
+  requireIntegerInRange(
+    "expectedEventCount",
+    input.processing.expectedEventCount ?? 0,
+    0,
+    MAX_EVENTS_PER_GENERATION,
+  );
+  requireIntegerInRange(
+    "expectedObservationCount",
+    input.processing.expectedObservationCount ?? 0,
+    0,
+    MAX_OBSERVATIONS_PER_GENERATION,
   );
 }
 
@@ -290,7 +316,11 @@ export async function admitSourceRevision(
       existingGeneration.expectedDocumentCount !==
         input.processing.expectedDocumentCount ||
       existingGeneration.expectedChunkCount !==
-        input.processing.expectedChunkCount
+        input.processing.expectedChunkCount ||
+      (existingGeneration.expectedEventCount ?? 0) !==
+        (input.processing.expectedEventCount ?? 0) ||
+      (existingGeneration.expectedObservationCount ?? 0) !==
+        (input.processing.expectedObservationCount ?? 0)
     ) {
       throw new Error(
         "Processing generation manifest conflicts with prior work",
@@ -357,6 +387,8 @@ export async function admitSourceRevision(
     expectedEvidenceSpanCount: input.processing.expectedEvidenceSpanCount,
     expectedDocumentCount: input.processing.expectedDocumentCount,
     expectedChunkCount: input.processing.expectedChunkCount,
+    expectedEventCount: input.processing.expectedEventCount ?? 0,
+    expectedObservationCount: input.processing.expectedObservationCount ?? 0,
     embeddingStatus: "unavailable",
   });
   const ingestJobId = await ctx.db.insert("ingestJobs", {
@@ -806,6 +838,29 @@ export async function stageGenerationChunks(
   return { state: loaded.state, ids };
 }
 
+/** Typed records inherit the worker lease and live source authorization. */
+export async function stageGenerationRecords(
+  ctx: MutationCtx,
+  args: {
+    principal: PrincipalRef;
+    jobId: Id<"ingestJobs">;
+    leaseEpoch: number;
+    leaseToken: string;
+    now: number;
+    records: StagedEventRecord[];
+  },
+) {
+  const loaded = await loadLeasedGeneration(ctx, args);
+  if (loaded.state === "obsolete_generation") return loaded;
+  const result = await stageRecordBatch(ctx, {
+    spaceId: loaded.generation.spaceId,
+    processingGenerationId: loaded.generation._id,
+    userId: args.principal.userId,
+    records: args.records,
+  });
+  return { state: loaded.state, ...result };
+}
+
 function assertStageBatch(text: string[], rowCount = text.length): void {
   if (rowCount > MAX_STAGE_ROWS) throw new Error("Staging row limit exceeded");
   const bytes = text.reduce((sum, value) => sum + utf8ByteLength(value), 0);
@@ -1010,7 +1065,15 @@ async function verifyGenerationPayload(
     const ordinals = chunkOrdinals.get(document._id) ?? [];
     assertExactOrdinals(ordinals, ordinals.length, "Chunk");
   }
+  const records = await validateGenerationRecords(ctx, {
+    spaceId: generation.spaceId,
+    processingGenerationId: generation._id,
+    expectedEventCount: generation.expectedEventCount ?? 0,
+    expectedObservationCount: generation.expectedObservationCount ?? 0,
+  });
   return {
+    actualEventCount: records.eventVersions.length,
+    actualObservationCount: records.observations.length,
     actualPageCount: pages.length,
     actualEvidenceSpanCount: spans.length,
     actualDocumentCount: documents.length,
@@ -1228,7 +1291,10 @@ export async function activateGeneration(
     loaded.generation.actualEvidenceSpanCount !==
       counts.actualEvidenceSpanCount ||
     loaded.generation.actualDocumentCount !== counts.actualDocumentCount ||
-    loaded.generation.actualChunkCount !== counts.actualChunkCount
+    loaded.generation.actualChunkCount !== counts.actualChunkCount ||
+    (loaded.generation.actualEventCount ?? 0) !== counts.actualEventCount ||
+    (loaded.generation.actualObservationCount ?? 0) !==
+      counts.actualObservationCount
   ) {
     throw new Error("Staged generation counts changed before activation");
   }
@@ -1259,9 +1325,11 @@ export async function activateGeneration(
     throw new Error("Space processing state is not unique");
   }
   const priorState = activationState[0];
-  const activatedAt = priorState
-    ? Math.max(args.now, priorState.activatedAt + 1)
-    : args.now;
+  const activatedAt = await nextRecordActivationTime(ctx, {
+    spaceId: loaded.job.spaceId,
+    now: args.now,
+    previousActivatedAt: priorState?.activatedAt,
+  });
   if (priorState) {
     await ctx.db.patch(priorState._id, {
       activationEpoch: priorState.activationEpoch + 1,
@@ -1452,6 +1520,13 @@ export async function continueForgetFromWeb(
     throw new Error("Source item is not being forgotten");
   }
 
+  const sessions = await purgeRecordQuerySessionsForSpaceBatch(ctx, {
+    spaceId: item.spaceId,
+    limit: MAX_STAGE_ROWS,
+  });
+  if (sessions.deleted > 0 || !sessions.done) {
+    return { phase: "recordQuerySessions", ...sessions, done: false };
+  }
   const receipts = await ctx.db
     .query("ingestRequests")
     .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
@@ -1467,6 +1542,14 @@ export async function continueForgetFromWeb(
   for (const job of jobs) await ctx.db.delete(job._id);
   if (jobs.length > 0) {
     return { phase: "ingestJobs", deleted: jobs.length, done: false };
+  }
+  const records = await deleteSourceItemRecordsBatch(ctx, {
+    spaceId: item.spaceId,
+    sourceItemId: item._id,
+    limit: MAX_STAGE_ROWS,
+  });
+  if (records.deleted > 0 || !records.done) {
+    return { phase: "records", ...records, done: false };
   }
   const provenance = await deleteSourceItemProvenanceBatch(ctx, {
     spaceId: item.spaceId,

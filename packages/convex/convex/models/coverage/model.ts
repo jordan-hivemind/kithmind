@@ -269,12 +269,15 @@ export async function calculateCoverage(
     from: number;
     to: number;
     asOf?: number;
+    snapshotAt?: number;
   },
 ): Promise<QueryCoverage> {
   validateRange(args.from, args.to);
   const recordType = validateRecordType(args.recordType);
   const asOf = args.asOf ?? Date.now();
   requireFiniteTime(asOf, "asOf");
+  const snapshotAt = args.snapshotAt ?? asOf;
+  requireFiniteTime(snapshotAt, "snapshotAt");
   const accountIds = [...new Set(args.sourceAccountIds)];
   if (accountIds.length > MAX_COVERAGE_ACCOUNTS) {
     return {
@@ -414,6 +417,8 @@ export async function calculateCoverage(
             window.lastProcessedAt > account.coverageInvalidatedAt)) &&
         window.lastEnumeratedAt <= asOf &&
         window.lastProcessedAt <= asOf &&
+        window.lastEnumeratedAt <= snapshotAt &&
+        window.lastProcessedAt <= snapshotAt &&
         window.lastEnumeratedAt >= asOf - account.freshnessMs &&
         window.lastProcessedAt >= asOf - account.freshnessMs,
     );

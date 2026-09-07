@@ -58,10 +58,16 @@ export async function digestDecodedAdmissionEnvelope(envelope: {
   expectedEvidenceSpanCount: number;
   expectedDocumentCount: number;
   expectedChunkCount: number;
+  expectedEventCount?: number;
+  expectedObservationCount?: number;
 }): Promise<string> {
+  // Zero typed records preserve receipts created before typed ingestion existed.
+  const typed =
+    (envelope.expectedEventCount ?? 0) !== 0 ||
+    (envelope.expectedObservationCount ?? 0) !== 0;
   return await sha256Hex(
     JSON.stringify([
-      "decoded-ingest-admission-v1",
+      typed ? "decoded-ingest-admission-v2" : "decoded-ingest-admission-v1",
       envelope.sourceAccountId,
       envelope.expectedDesiredProcessingEpoch,
       envelope.externalId,
@@ -81,6 +87,12 @@ export async function digestDecodedAdmissionEnvelope(envelope: {
       envelope.expectedEvidenceSpanCount,
       envelope.expectedDocumentCount,
       envelope.expectedChunkCount,
+      ...(typed
+        ? [
+            envelope.expectedEventCount ?? 0,
+            envelope.expectedObservationCount ?? 0,
+          ]
+        : []),
     ]),
   );
 }

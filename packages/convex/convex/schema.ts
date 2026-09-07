@@ -1,3 +1,5 @@
+import { recordTables } from "./models/records/tables";
+import { recordQueryTables } from "./models/records/queryTables";
 import { embeddingTables } from "./models/embeddings/tables";
 import { coverageTables } from "./models/coverage/tables";
 import { ingestionTables } from "./models/ingestion/tables";
@@ -24,6 +26,8 @@ export default defineSchema({
   ...coverageTables,
   ...ingestionTables,
   ...provenanceTables,
+  ...recordTables,
+  ...recordQueryTables,
   thoughts: defineTable(thoughtFields)
     .index("by_userId", ["userId"])
     .index("by_userId_and_isCore", ["userId", "isCore"])

@@ -1,3 +1,5 @@
+import { deleteGenerationRecordsBatch } from "../records/model";
+import { invalidateRecordQueriesForForget } from "../records/querySessions";
 import type { Doc, Id } from "../../_generated/dataModel";
 import type { MutationCtx, QueryCtx } from "../../_generated/server";
 import { deleteChunkEmbeddingVectors } from "../embeddings/model";
@@ -1266,6 +1268,10 @@ export async function beginSourceItemForget(
     throw new Error("Source item processing epoch is exhausted");
   }
   const desiredProcessingEpoch = item.desiredProcessingEpoch + 1;
+  await invalidateRecordQueriesForForget(ctx, {
+    spaceId: input.spaceId,
+    now: input.forgottenAt,
+  });
   await ctx.db.patch(item._id, {
     lifecycle: "forgetting",
     originalLinkAvailable: false,
@@ -1574,9 +1580,31 @@ export async function deleteGenerationPayloadBatch(
     limit?: number;
   },
 ): Promise<{ deleted: number; done: boolean }> {
-  await requireGeneration(ctx, input.processingGenerationId, input.spaceId);
+  const generation = await requireGeneration(
+    ctx,
+    input.processingGenerationId,
+    input.spaceId,
+  );
+  if (generation.state === "ready" || generation.activatedAt !== undefined) {
+    const item = await requireSourceItem(
+      ctx,
+      generation.sourceItemId,
+      input.spaceId,
+    );
+    if (item.lifecycle !== "forgetting") {
+      throw new Error(
+        "Published generation cleanup requires the forget workflow",
+      );
+    }
+  }
   const limit = input.limit ?? MAX_PROVENANCE_CLEANUP_ROWS;
   requireIntegerInRange(limit, "Cleanup limit", 1, MAX_PROVENANCE_CLEANUP_ROWS);
+  const records = await deleteGenerationRecordsBatch(ctx, {
+    spaceId: input.spaceId,
+    processingGenerationId: input.processingGenerationId,
+    limit,
+  });
+  if (records.deleted > 0 || !records.done) return { ...records, done: false };
   const chunks = await ctx.db
     .query("chunks")
     .withIndex("by_processingGenerationId", (q) =>
@@ -1710,7 +1738,25 @@ export async function finalizeSourceItemTombstone(
     .query("documents")
     .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
     .take(1);
-  if (remainingRevisions.length > 0 || remainingDocuments.length > 0) {
+  const remainingRecords = await Promise.all([
+    ctx.db
+      .query("events")
+      .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+      .first(),
+    ctx.db
+      .query("eventVersions")
+      .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+      .first(),
+    ctx.db
+      .query("observations")
+      .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+      .first(),
+  ]);
+  if (
+    remainingRevisions.length > 0 ||
+    remainingDocuments.length > 0 ||
+    remainingRecords.some(Boolean)
+  ) {
     throw new Error("Source item provenance cleanup is incomplete");
   }
   await ctx.db.patch(item._id, {
