@@ -191,7 +191,7 @@ A public contributor guide, accurate current-versus-planned README and upstream 
 
 ## 10. Phases and acceptance
 
-Numbers preserve tracker references. Priority P2 for mobile is distinct from implementation Phase 2.
+Numbers preserve tracker references. Priority P2 for mobile is distinct from implementation Phase 2. The [Phase 2 implementation plan](2026-09-07-phase2-document-pipeline.md) defines the worker, parser, provenance, and restore sequence against the deployed Phase 1 contracts.
 
 | Phase                | Deliverable                                                                                                                                  | Gate                                                                                            |
 | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
