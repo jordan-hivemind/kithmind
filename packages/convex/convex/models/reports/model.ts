@@ -72,6 +72,23 @@ export async function _listInsightsByUserAndStatus(
   return await query.order("desc").take(limit);
 }
 
+export async function _filterInsightsByOwnedReports(
+  ctx: QueryCtx,
+  userId: Id<"users">,
+  insights: Doc<"insights">[],
+) {
+  const reportIds = [...new Set(insights.map((insight) => insight.reportId))];
+  const reports = await Promise.all(
+    reportIds.map((reportId) => _findReportById(ctx, reportId)),
+  );
+  const ownedReportIds = new Set(
+    reports.flatMap((report) =>
+      report?.userId === userId ? [report._id] : [],
+    ),
+  );
+  return insights.filter((insight) => ownedReportIds.has(insight.reportId));
+}
+
 export async function _insertInsight(
   ctx: MutationCtx,
   fields: {

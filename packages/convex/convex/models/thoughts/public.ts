@@ -1,6 +1,7 @@
 import { query } from "../../_generated/server";
 import { v } from "convex/values";
-import { requireWebUserId } from "../../lib/webAuth";
+import { requireWebPrincipal } from "../../lib/webAuth";
+import { getAuthorizedReadSpaceIds } from "../../lib/spaces";
 import { isMemoryActive } from "./memoryLifecycle";
 import {
   thoughtLifecycleFields,
@@ -8,9 +9,9 @@ import {
   thoughtType,
 } from "./validators";
 import {
-  _listByUser,
-  _listCoreByUser,
-  memoryRetrievabilityFilter,
+  _listBySpaces,
+  _listCoreBySpaces,
+  _loadBoundedThoughtStatsRows,
 } from "./model";
 import { isFactActive } from "../facts/model";
 
@@ -19,6 +20,8 @@ export const listRecent = query({
     limit: v.optional(v.number()),
     type: v.optional(thoughtType),
     includeHistorical: v.optional(v.boolean()),
+    topic: v.optional(v.string()),
+    spaceIds: v.optional(v.array(v.id("spaces"))),
   },
   returns: v.array(
     v.object({
@@ -27,44 +30,38 @@ export const listRecent = query({
       content: v.string(),
       metadata: thoughtMetadata,
       userId: v.id("users"),
-      spaceId: v.optional(v.id("spaces")),
+      spaceId: v.id("spaces"),
       updatedAt: v.optional(v.number()),
       ...thoughtLifecycleFields,
     }),
   ),
   handler: async (ctx, args) => {
-    const userId = await requireWebUserId(ctx);
-
-    let results;
-    if (args.type) {
-      const limit = args.limit ?? 20;
-      const activeAt = Date.now();
-      results = await ctx.db
-        .query("thoughts")
-        .withIndex("by_userId_and_type", (q) =>
-          q.eq("userId", userId).eq("metadata.type", args.type!),
-        )
-        .order("desc")
-        .filter((q) =>
-          memoryRetrievabilityFilter(q, args.includeHistorical, activeAt),
-        )
-        .take(limit);
-    } else {
-      results = await _listByUser(
-        ctx,
-        userId,
-        args.limit ?? 20,
-        args.includeHistorical,
-      );
-    }
-
-    return results.map(({ embedding: _, ...rest }) => rest);
+    const principal = await requireWebPrincipal(ctx);
+    const spaceIds = await getAuthorizedReadSpaceIds(
+      ctx,
+      principal,
+      args.spaceIds,
+    );
+    const results = await _listBySpaces(
+      ctx,
+      spaceIds,
+      args.limit,
+      args.includeHistorical,
+      { type: args.type, topic: args.topic },
+    );
+    return results
+      .filter((row) => row.spaceId !== undefined)
+      .map(({ embedding: _, ...rest }) => ({
+        ...rest,
+        spaceId: rest.spaceId!,
+      }));
   },
 });
 
 export const listCore = query({
   args: {
     limit: v.optional(v.number()),
+    spaceIds: v.optional(v.array(v.id("spaces"))),
   },
   returns: v.array(
     v.object({
@@ -73,21 +70,30 @@ export const listCore = query({
       content: v.string(),
       metadata: thoughtMetadata,
       userId: v.id("users"),
-      spaceId: v.optional(v.id("spaces")),
+      spaceId: v.id("spaces"),
       updatedAt: v.optional(v.number()),
       ...thoughtLifecycleFields,
     }),
   ),
   handler: async (ctx, args) => {
-    const userId = await requireWebUserId(ctx);
-
-    const results = await _listCoreByUser(ctx, userId, args.limit);
-    return results.map(({ embedding: _, ...rest }) => rest);
+    const principal = await requireWebPrincipal(ctx);
+    const spaceIds = await getAuthorizedReadSpaceIds(
+      ctx,
+      principal,
+      args.spaceIds,
+    );
+    const results = await _listCoreBySpaces(ctx, spaceIds, args.limit);
+    return results
+      .filter((row) => row.spaceId !== undefined)
+      .map(({ embedding: _, ...rest }) => ({
+        ...rest,
+        spaceId: rest.spaceId!,
+      }));
   },
 });
 
 export const getStats = query({
-  args: {},
+  args: { spaceIds: v.optional(v.array(v.id("spaces"))) },
   returns: v.object({
     totalThoughts: v.number(),
     totalFacts: v.number(),
@@ -105,17 +111,15 @@ export const getStats = query({
       }),
     ),
   }),
-  handler: async (ctx) => {
-    const userId = await requireWebUserId(ctx);
-
-    const allThoughts = await ctx.db
-      .query("thoughts")
-      .withIndex("by_userId", (q) => q.eq("userId", userId))
-      .collect();
-    const allFacts = await ctx.db
-      .query("facts")
-      .withIndex("by_userId", (q) => q.eq("userId", userId))
-      .collect();
+  handler: async (ctx, args) => {
+    const principal = await requireWebPrincipal(ctx);
+    const spaceIds = await getAuthorizedReadSpaceIds(
+      ctx,
+      principal,
+      args.spaceIds,
+    );
+    const { thoughts: allThoughts, facts: allFacts } =
+      await _loadBoundedThoughtStatsRows(ctx, spaceIds);
     const activeAt = Date.now();
     const currentThoughts = allThoughts.filter((thought) =>
       isMemoryActive(thought, activeAt),
@@ -140,23 +144,27 @@ export const getStats = query({
 
     const byType = [...typeCounts.entries()]
       .map(([type, count]) => ({ type, count }))
-      .sort((a, b) => b.count - a.count);
+      .sort((a, b) => b.count - a.count || a.type.localeCompare(b.type));
 
     const topTopics = [...topicCounts.entries()]
       .map(([topic, count]) => ({ topic, count }))
-      .sort((a, b) => b.count - a.count)
+      .sort((a, b) => b.count - a.count || a.topic.localeCompare(b.topic))
       .slice(0, 10);
 
     const topPeople = [...peopleCounts.entries()]
       .map(([person, count]) => ({ person, count }))
-      .sort((a, b) => b.count - a.count)
+      .sort((a, b) => b.count - a.count || a.person.localeCompare(b.person))
       .slice(0, 10);
 
     const dateRange =
       currentThoughts.length > 0
         ? {
-            earliest: currentThoughts[0]!._creationTime,
-            latest: currentThoughts[currentThoughts.length - 1]!._creationTime,
+            earliest: Math.min(
+              ...currentThoughts.map((thought) => thought._creationTime),
+            ),
+            latest: Math.max(
+              ...currentThoughts.map((thought) => thought._creationTime),
+            ),
           }
         : undefined;
 

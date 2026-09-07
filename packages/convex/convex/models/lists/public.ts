@@ -1,10 +1,9 @@
 import { query, mutation } from "../../_generated/server";
 import { v } from "convex/values";
-import { requireWebUserId } from "../../lib/webAuth";
+import { requireWebPrincipal } from "../../lib/webAuth";
 import { listItemStatus } from "./validators";
 import {
   _listsByUser,
-  _countItemsByList,
   _findListById,
   _itemsByList,
   _insertList,
@@ -23,12 +22,22 @@ export const getLists = query({
     includeArchived: v.optional(v.boolean()),
   },
   handler: async (ctx, args) => {
-    const userId = await requireWebUserId(ctx);
+    const { userId } = await requireWebPrincipal(ctx);
 
-    const lists = await _listsByUser(ctx, userId, { pinned: args.pinned, includeArchived: args.includeArchived });
+    const lists = await _listsByUser(ctx, userId, {
+      pinned: args.pinned,
+      includeArchived: args.includeArchived,
+    });
     const listsWithCounts = await Promise.all(
       lists.map(async (list) => {
-        const counts = await _countItemsByList(ctx, list._id);
+        const items = (
+          await _itemsByList(ctx, list._id, { includeCompleted: true })
+        ).filter((item) => item.userId === userId);
+        const counts = {
+          total: items.length,
+          open: items.filter((item) => item.status === "open").length,
+          done: items.filter((item) => item.status === "done").length,
+        };
         return {
           _id: list._id,
           _creationTime: list._creationTime,
@@ -49,16 +58,18 @@ export const getList = query({
     includeCompleted: v.optional(v.boolean()),
   },
   handler: async (ctx, args) => {
-    const userId = await requireWebUserId(ctx);
+    const { userId } = await requireWebPrincipal(ctx);
 
     const list = await _findListById(ctx, args.listId);
     if (!list || list.userId !== userId) {
       throw new Error("List not found");
     }
 
-    const items = await _itemsByList(ctx, args.listId, {
-      includeCompleted: args.includeCompleted,
-    });
+    const items = (
+      await _itemsByList(ctx, args.listId, {
+        includeCompleted: args.includeCompleted,
+      })
+    ).filter((item) => item.userId === userId);
 
     return {
       _id: list._id,
@@ -86,7 +97,7 @@ export const createList = mutation({
     pinned: v.boolean(),
   },
   handler: async (ctx, args) => {
-    const userId = await requireWebUserId(ctx);
+    const { userId } = await requireWebPrincipal(ctx);
 
     const listId = await _insertList(ctx, {
       name: args.name,
@@ -104,7 +115,7 @@ export const updateList = mutation({
     pinned: v.optional(v.boolean()),
   },
   handler: async (ctx, args) => {
-    const userId = await requireWebUserId(ctx);
+    const { userId } = await requireWebPrincipal(ctx);
 
     const list = await _findListById(ctx, args.listId);
     if (!list || list.userId !== userId) {
@@ -123,7 +134,7 @@ export const archiveList = mutation({
     listId: v.id("lists"),
   },
   handler: async (ctx, args) => {
-    const userId = await requireWebUserId(ctx);
+    const { userId } = await requireWebPrincipal(ctx);
 
     const list = await _findListById(ctx, args.listId);
     if (!list || list.userId !== userId) {
@@ -138,7 +149,7 @@ export const unarchiveList = mutation({
     listId: v.id("lists"),
   },
   handler: async (ctx, args) => {
-    const userId = await requireWebUserId(ctx);
+    const { userId } = await requireWebPrincipal(ctx);
 
     const list = await _findListById(ctx, args.listId);
     if (!list || list.userId !== userId) {
@@ -154,17 +165,18 @@ export const createListItem = mutation({
     title: v.string(),
   },
   handler: async (ctx, args) => {
-    const userId = await requireWebUserId(ctx);
+    const { userId } = await requireWebPrincipal(ctx);
 
     const list = await _findListById(ctx, args.listId);
     if (!list || list.userId !== userId) {
       throw new Error("List not found");
     }
 
-    const items = await _itemsByList(ctx, args.listId, { includeCompleted: true });
-    const maxPosition = items.length > 0
-      ? Math.max(...items.map((i) => i.position))
-      : 0;
+    const items = (
+      await _itemsByList(ctx, args.listId, { includeCompleted: true })
+    ).filter((item) => item.userId === userId);
+    const maxPosition =
+      items.length > 0 ? Math.max(...items.map((i) => i.position)) : 0;
 
     const itemId = await _insertItem(ctx, {
       title: args.title,
@@ -185,10 +197,14 @@ export const updateListItem = mutation({
     status: v.optional(listItemStatus),
   },
   handler: async (ctx, args) => {
-    const userId = await requireWebUserId(ctx);
+    const { userId } = await requireWebPrincipal(ctx);
 
     const item = await _findItemById(ctx, args.itemId);
     if (!item || item.userId !== userId) {
+      throw new Error("Item not found");
+    }
+    const list = await _findListById(ctx, item.listId);
+    if (!list || list.userId !== userId) {
       throw new Error("Item not found");
     }
 
@@ -216,10 +232,14 @@ export const deleteListItem = mutation({
     itemId: v.id("listItems"),
   },
   handler: async (ctx, args) => {
-    const userId = await requireWebUserId(ctx);
+    const { userId } = await requireWebPrincipal(ctx);
 
     const item = await _findItemById(ctx, args.itemId);
     if (!item || item.userId !== userId) {
+      throw new Error("Item not found");
+    }
+    const list = await _findListById(ctx, item.listId);
+    if (!list || list.userId !== userId) {
       throw new Error("Item not found");
     }
 

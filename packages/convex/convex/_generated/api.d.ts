@@ -10,9 +10,12 @@
 
 import type * as auth from "../auth.js";
 import type * as http from "../http.js";
+import type * as legacySchema from "../legacySchema.js";
 import type * as lib_mcpAuth from "../lib/mcpAuth.js";
+import type * as lib_spaces from "../lib/spaces.js";
 import type * as lib_webAuth from "../lib/webAuth.js";
 import type * as models_apiKeys_mcpAuth from "../models/apiKeys/mcpAuth.js";
+import type * as models_apiKeys_migrations from "../models/apiKeys/migrations.js";
 import type * as models_apiKeys_model from "../models/apiKeys/model.js";
 import type * as models_apiKeys_private from "../models/apiKeys/private.js";
 import type * as models_apiKeys_public from "../models/apiKeys/public.js";
@@ -39,8 +42,12 @@ import type * as models_reports_model from "../models/reports/model.js";
 import type * as models_reports_private from "../models/reports/private.js";
 import type * as models_reports_public from "../models/reports/public.js";
 import type * as models_reports_validators from "../models/reports/validators.js";
+import type * as models_spaces_mcpQueries from "../models/spaces/mcpQueries.js";
 import type * as models_spaces_migrations from "../models/spaces/migrations.js";
 import type * as models_spaces_model from "../models/spaces/model.js";
+import type * as models_spaces_private from "../models/spaces/private.js";
+import type * as models_spaces_public from "../models/spaces/public.js";
+import type * as models_spaces_scopeAudit from "../models/spaces/scopeAudit.js";
 import type * as models_spaces_validators from "../models/spaces/validators.js";
 import type * as models_thoughts_actions from "../models/thoughts/actions.js";
 import type * as models_thoughts_classify from "../models/thoughts/classify.js";
@@ -67,9 +74,12 @@ import type {
 declare const fullApi: ApiFromModules<{
   auth: typeof auth;
   http: typeof http;
+  legacySchema: typeof legacySchema;
   "lib/mcpAuth": typeof lib_mcpAuth;
+  "lib/spaces": typeof lib_spaces;
   "lib/webAuth": typeof lib_webAuth;
   "models/apiKeys/mcpAuth": typeof models_apiKeys_mcpAuth;
+  "models/apiKeys/migrations": typeof models_apiKeys_migrations;
   "models/apiKeys/model": typeof models_apiKeys_model;
   "models/apiKeys/private": typeof models_apiKeys_private;
   "models/apiKeys/public": typeof models_apiKeys_public;
@@ -96,8 +106,12 @@ declare const fullApi: ApiFromModules<{
   "models/reports/private": typeof models_reports_private;
   "models/reports/public": typeof models_reports_public;
   "models/reports/validators": typeof models_reports_validators;
+  "models/spaces/mcpQueries": typeof models_spaces_mcpQueries;
   "models/spaces/migrations": typeof models_spaces_migrations;
   "models/spaces/model": typeof models_spaces_model;
+  "models/spaces/private": typeof models_spaces_private;
+  "models/spaces/public": typeof models_spaces_public;
+  "models/spaces/scopeAudit": typeof models_spaces_scopeAudit;
   "models/spaces/validators": typeof models_spaces_validators;
   "models/thoughts/actions": typeof models_thoughts_actions;
   "models/thoughts/classify": typeof models_thoughts_classify;

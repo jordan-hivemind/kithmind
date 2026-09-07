@@ -1,7 +1,8 @@
 import { mutation } from "../../_generated/server";
 import { v } from "convex/values";
 
-import { requireMcpUserId } from "../../lib/mcpAuth";
+import { requireMcpPrincipal } from "../../lib/mcpAuth";
+import { resolveWriteSpace } from "../../lib/spaces";
 import { rememberFact } from "./model";
 import { entitySelector, factSourceType, factValueInput } from "./validators";
 
@@ -24,9 +25,11 @@ export const remember = mutation({
       v.union(v.literal("changed"), v.literal("corrected")),
     ),
     changeReason: v.optional(v.string()),
+    spaceId: v.optional(v.id("spaces")),
   },
   handler: async (ctx, args) => {
-    const userId = await requireMcpUserId(ctx);
-    return await rememberFact(ctx, userId, args);
+    const principal = await requireMcpPrincipal(ctx);
+    const spaceId = await resolveWriteSpace(ctx, principal, args.spaceId);
+    return await rememberFact(ctx, principal.userId, spaceId, args);
   },
 });

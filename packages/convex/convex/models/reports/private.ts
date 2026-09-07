@@ -1,9 +1,12 @@
 import { internalMutation } from "../../_generated/server";
 import { v } from "convex/values";
+import { principalRefValidator } from "../apiKeys/validators";
 import {
-  insightCategory,
-  projectActive,
-} from "./validators";
+  ensurePersonalSpace,
+  reloadPrincipal,
+  requireSpaceAccess,
+} from "../../lib/spaces";
+import { insightCategory, projectActive } from "./validators";
 import { _insertReport, _insertInsight, _deleteInsight } from "./model";
 
 export const insertReport = internalMutation({
@@ -58,3 +61,52 @@ export const deleteInsight = internalMutation({
   },
 });
 
+export const insertReportWithInsightsAuthorized = internalMutation({
+  args: {
+    principal: principalRefValidator,
+    startDate: v.string(),
+    endDate: v.string(),
+    sessionsAnalyzed: v.number(),
+    totalPrompts: v.number(),
+    totalToolCalls: v.number(),
+    projectsActive: v.array(projectActive),
+    modelUsage: v.any(),
+    insights: v.array(
+      v.object({
+        category: insightCategory,
+        observation: v.string(),
+        recommendation: v.string(),
+        evidence: v.string(),
+        links: v.optional(
+          v.array(v.object({ label: v.string(), url: v.string() })),
+        ),
+      }),
+    ),
+  },
+  returns: v.object({
+    reportId: v.id("reports"),
+    insightIds: v.array(v.id("insights")),
+  }),
+  handler: async (ctx, args) => {
+    const principal = await reloadPrincipal(ctx, args.principal);
+    const personalSpaceId = await ensurePersonalSpace(ctx, principal.userId);
+    await requireSpaceAccess(ctx, principal, personalSpaceId, "write");
+    const { principal: _principal, insights, ...reportFields } = args;
+    const reportId = await _insertReport(ctx, {
+      ...reportFields,
+      userId: principal.userId,
+    });
+    const insightIds = [];
+    for (const insight of insights) {
+      insightIds.push(
+        await _insertInsight(ctx, {
+          reportId,
+          userId: principal.userId,
+          ...insight,
+          status: "new",
+        }),
+      );
+    }
+    return { reportId, insightIds };
+  },
+});

@@ -1,65 +1,89 @@
 import { query } from "../../_generated/server";
 import { v } from "convex/values";
-import { requireMcpUserId } from "../../lib/mcpAuth";
-import { isMemoryActive } from "./memoryLifecycle";
-import { thoughtLifecycleFields, thoughtMetadata } from "./validators";
-import { _listByUser, _listCoreByUser } from "./model";
+
+import { requireMcpPrincipal } from "../../lib/mcpAuth";
+import { getAuthorizedReadSpaceIds } from "../../lib/spaces";
 import { isFactActive } from "../facts/model";
+import { isMemoryActive } from "./memoryLifecycle";
+import {
+  _listBySpaces,
+  _listCoreBySpaces,
+  _loadBoundedThoughtStatsRows,
+} from "./model";
+import {
+  thoughtLifecycleFields,
+  thoughtMetadata,
+  thoughtType,
+} from "./validators";
+
+const result = v.object({
+  _id: v.id("thoughts"),
+  _creationTime: v.number(),
+  content: v.string(),
+  metadata: thoughtMetadata,
+  userId: v.id("users"),
+  spaceId: v.id("spaces"),
+  updatedAt: v.optional(v.number()),
+  ...thoughtLifecycleFields,
+});
 
 export const listByUser = query({
   args: {
     limit: v.optional(v.number()),
     includeHistorical: v.optional(v.boolean()),
+    type: v.optional(thoughtType),
+    topic: v.optional(v.string()),
+    spaceIds: v.optional(v.array(v.id("spaces"))),
   },
-  returns: v.array(
-    v.object({
-      _id: v.id("thoughts"),
-      _creationTime: v.number(),
-      content: v.string(),
-      metadata: thoughtMetadata,
-      userId: v.id("users"),
-      spaceId: v.optional(v.id("spaces")),
-      updatedAt: v.optional(v.number()),
-      ...thoughtLifecycleFields,
-    }),
-  ),
+  returns: v.array(result),
   handler: async (ctx, args) => {
-    const userId = await requireMcpUserId(ctx);
-    const results = await _listByUser(
+    const principal = await requireMcpPrincipal(ctx);
+    const spaceIds = await getAuthorizedReadSpaceIds(
       ctx,
-      userId,
-      args.limit ?? 20,
-      args.includeHistorical,
+      principal,
+      args.spaceIds,
     );
-    return results.map(({ embedding: _, ...rest }) => rest);
+    const rows = await _listBySpaces(
+      ctx,
+      spaceIds,
+      args.limit,
+      args.includeHistorical,
+      { type: args.type, topic: args.topic },
+    );
+    return rows
+      .filter((row) => row.spaceId !== undefined)
+      .map(({ embedding: _embedding, ...row }) => ({
+        ...row,
+        spaceId: row.spaceId!,
+      }));
   },
 });
 
 export const listCore = query({
   args: {
     limit: v.optional(v.number()),
+    spaceIds: v.optional(v.array(v.id("spaces"))),
   },
-  returns: v.array(
-    v.object({
-      _id: v.id("thoughts"),
-      _creationTime: v.number(),
-      content: v.string(),
-      metadata: thoughtMetadata,
-      userId: v.id("users"),
-      spaceId: v.optional(v.id("spaces")),
-      updatedAt: v.optional(v.number()),
-      ...thoughtLifecycleFields,
-    }),
-  ),
+  returns: v.array(result),
   handler: async (ctx, args) => {
-    const userId = await requireMcpUserId(ctx);
-    const results = await _listCoreByUser(ctx, userId, args.limit);
-    return results.map(({ embedding: _, ...rest }) => rest);
+    const principal = await requireMcpPrincipal(ctx);
+    const spaceIds = await getAuthorizedReadSpaceIds(
+      ctx,
+      principal,
+      args.spaceIds,
+    );
+    const rows = await _listCoreBySpaces(ctx, spaceIds, args.limit);
+    return rows
+      .filter((row) => row.spaceId !== undefined)
+      .map(({ embedding: _embedding, ...row }) => ({
+        ...row,
+        spaceId: row.spaceId!,
+      }));
   },
 });
 
 export const getStats = query({
-  args: {},
+  args: { spaceIds: v.optional(v.array(v.id("spaces"))) },
   returns: v.object({
     totalThoughts: v.number(),
     totalFacts: v.number(),
@@ -71,25 +95,22 @@ export const getStats = query({
     topTopics: v.array(v.object({ topic: v.string(), count: v.number() })),
     topPeople: v.array(v.object({ person: v.string(), count: v.number() })),
   }),
-  handler: async (ctx) => {
-    const userId = await requireMcpUserId(ctx);
-    const allThoughts = await ctx.db
-      .query("thoughts")
-      .withIndex("by_userId", (q) => q.eq("userId", userId))
-      .collect();
-    const allFacts = await ctx.db
-      .query("facts")
-      .withIndex("by_userId", (q) => q.eq("userId", userId))
-      .collect();
+  handler: async (ctx, args) => {
+    const principal = await requireMcpPrincipal(ctx);
+    const spaceIds = await getAuthorizedReadSpaceIds(
+      ctx,
+      principal,
+      args.spaceIds,
+    );
+    const { thoughts: allThoughts, facts: allFacts } =
+      await _loadBoundedThoughtStatsRows(ctx, spaceIds);
     const activeAt = Date.now();
     const currentThoughts = allThoughts.filter((thought) =>
       isMemoryActive(thought, activeAt),
     );
-
     const typeCounts = new Map<string, number>();
     const topicCounts = new Map<string, number>();
     const peopleCounts = new Map<string, number>();
-
     for (const thought of currentThoughts) {
       typeCounts.set(
         thought.metadata.type,
@@ -102,7 +123,6 @@ export const getStats = query({
         peopleCounts.set(person, (peopleCounts.get(person) ?? 0) + 1);
       }
     }
-
     return {
       totalThoughts: currentThoughts.length,
       totalFacts: allFacts.filter((fact) => isFactActive(fact, activeAt))
@@ -119,14 +139,14 @@ export const getStats = query({
         .length,
       byType: [...typeCounts.entries()]
         .map(([type, count]) => ({ type, count }))
-        .sort((a, b) => b.count - a.count),
+        .sort((a, b) => b.count - a.count || a.type.localeCompare(b.type)),
       topTopics: [...topicCounts.entries()]
         .map(([topic, count]) => ({ topic, count }))
-        .sort((a, b) => b.count - a.count)
+        .sort((a, b) => b.count - a.count || a.topic.localeCompare(b.topic))
         .slice(0, 10),
       topPeople: [...peopleCounts.entries()]
         .map(([person, count]) => ({ person, count }))
-        .sort((a, b) => b.count - a.count)
+        .sort((a, b) => b.count - a.count || a.person.localeCompare(b.person))
         .slice(0, 10),
     };
   },

@@ -2,7 +2,7 @@ import { convexTest } from "convex-test";
 import { describe, expect, test } from "vitest";
 
 import { internal } from "../../_generated/api";
-import schema from "../../schema";
+import schema from "../../legacySchema";
 import { modules } from "../../test.setup";
 
 const metadata = {

@@ -1,15 +1,24 @@
 "use client";
 
-import { useQuery, useMutation } from "convex/react";
 import { api } from "@repo/db/convex/_generated/api";
-import { useState } from "react";
+import type { Id } from "@repo/db/convex/_generated/dataModel";
+import { useMutation,useQuery } from "convex/react";
 import Link from "next/link";
+import { useState } from "react";
+
+import {
+  type KeyCapability,
+  SpaceGrantPicker,
+} from "@/components/space-grant-picker";
 
 export default function SettingsPage() {
   const apiKeys = useQuery(api.models.apiKeys.public.list);
   const createKey = useMutation(api.models.apiKeys.public.create);
   const revokeKey = useMutation(api.models.apiKeys.public.revoke);
 
+  const [spaceIds, setSpaceIds] = useState<Id<"spaces">[]>([]);
+  const [capabilities, setCapabilities] = useState<KeyCapability[]>(["read"]);
+  const [error, setError] = useState("");
   const [newKeyName, setNewKeyName] = useState("");
   const [newRawKey, setNewRawKey] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
@@ -18,13 +27,20 @@ export default function SettingsPage() {
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newKeyName.trim()) return;
+    if (!newKeyName.trim() || !spaceIds.length || !capabilities.length) return;
+    setError("");
 
     setCreating(true);
     try {
-      const result = await createKey({ name: newKeyName.trim() });
+      const result = await createKey({
+        name: newKeyName.trim(),
+        spaceIds,
+        capabilities,
+      });
       setNewRawKey(result.rawKey);
       setNewKeyName("");
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "Could not create key");
     } finally {
       setCreating(false);
     }
@@ -47,10 +63,13 @@ export default function SettingsPage() {
 
       <h2>API Keys</h2>
       <p style={{ color: "#666" }}>
-        Most clients (Claude Desktop, Claude Code) connect automatically via OAuth
-        &mdash; no key needed. API keys are only required for clients like Cursor
-        that don&apos;t support OAuth.
-        See the <Link href="/getting-started" style={{ color: "#111" }}>Getting Started</Link> guide for setup instructions.
+        Clients can connect through OAuth or an API key. Both methods let you
+        choose spaces and permissions; OAuth creates a revocable client
+        credential. See the{" "}
+        <Link href="/getting-started" style={{ color: "#111" }}>
+          Getting Started
+        </Link>{" "}
+        guide for setup instructions.
       </p>
 
       {!showKeyForm && (
@@ -71,10 +90,7 @@ export default function SettingsPage() {
 
       {showKeyForm && (
         <>
-          <form
-            onSubmit={handleCreate}
-            style={{ display: "flex", gap: 8, marginBottom: 24 }}
-          >
+          <form onSubmit={handleCreate} style={{ marginBottom: 24 }}>
             <input
               type="text"
               value={newKeyName}
@@ -87,10 +103,26 @@ export default function SettingsPage() {
                 border: "1px solid #ddd",
               }}
             />
+            <SpaceGrantPicker
+              spaceIds={spaceIds}
+              onSpaceIdsChange={setSpaceIds}
+              capabilities={capabilities}
+              onCapabilitiesChange={setCapabilities}
+            />
+            {error && <p role="alert">{error}</p>}
             <button
               type="submit"
-              disabled={creating || !newKeyName.trim()}
-              style={{ padding: "8px 16px", cursor: "pointer", borderRadius: 4 }}
+              disabled={
+                creating ||
+                !newKeyName.trim() ||
+                !spaceIds.length ||
+                !capabilities.length
+              }
+              style={{
+                padding: "8px 16px",
+                cursor: "pointer",
+                borderRadius: 4,
+              }}
             >
               {creating ? "Creating..." : "Generate Key"}
             </button>
@@ -129,7 +161,11 @@ export default function SettingsPage() {
                 </code>
                 <button
                   onClick={handleCopy}
-                  style={{ padding: "8px 16px", cursor: "pointer", borderRadius: 4 }}
+                  style={{
+                    padding: "8px 16px",
+                    cursor: "pointer",
+                    borderRadius: 4,
+                  }}
                 >
                   {copied ? "Copied!" : "Copy"}
                 </button>
@@ -178,9 +214,16 @@ export default function SettingsPage() {
                   </td>
                 </tr>
               ) : (
-                apiKeys.map((key: { _id: any; _creationTime: number; keyPrefix: string; name: string; lastUsedAt?: number }) => (
+                apiKeys.map((key) => (
                   <tr key={key._id} style={{ borderBottom: "1px solid #eee" }}>
-                    <td style={{ padding: 8 }}>{key.name}</td>
+                    <td style={{ padding: 8 }}>
+                      {key.name}
+                      <br />
+                      <small>
+                        {key.capabilities?.join(", ") ?? "Personal read, write"}{" "}
+                        · {key.spaceIds?.length ?? 1} space(s)
+                      </small>
+                    </td>
                     <td style={{ padding: 8 }}>
                       <code>{key.keyPrefix}...</code>
                     </td>

@@ -18,6 +18,7 @@ import {
 } from "./memoryLifecycle";
 import { memoryStatus, thoughtMetadata, thoughtType } from "./validators";
 import { memorySourceType } from "./validators";
+import { principalRefValidator } from "../apiKeys/validators";
 
 // Break circular type inference — actions.ts exports are part of `internal`'s type,
 // so referencing `internal` here creates a cycle. Runtime behavior is unchanged.
@@ -26,7 +27,8 @@ const internal = _internal as any;
 
 export const captureThought = internalAction({
   args: {
-    userId: v.id("users"),
+    principal: principalRefValidator,
+    spaceId: v.id("spaces"),
     content: v.string(),
     validFrom: v.optional(v.number()),
     validTo: v.optional(v.number()),
@@ -50,6 +52,10 @@ export const captureThought = internalAction({
     operationSummary: v.optional(v.string()),
   }),
   handler: async (ctx, args) => {
+    await ctx.runQuery(
+      internal.models.thoughts.private.requireCaptureAccessForAction,
+      { principal: args.principal, spaceId: args.spaceId },
+    );
     assertValidMemoryValidity(args);
     if (
       (args.observedAt !== undefined && !Number.isFinite(args.observedAt)) ||
@@ -99,7 +105,7 @@ export const captureThought = internalAction({
     const similarResults = await ctx.vectorSearch("thoughts", "by_embedding", {
       vector: embedding,
       limit: 256,
-      filter: (q) => q.eq("userId", args.userId),
+      filter: (q) => q.eq("spaceId", args.spaceId),
     });
 
     const candidates = similarResults
@@ -115,12 +121,18 @@ export const captureThought = internalAction({
       content: string;
       metadata: Infer<typeof thoughtMetadata>;
       userId: string;
+      spaceId?: Id<"spaces">;
       memoryStatus?: MemoryStatus;
       validFrom?: number;
       validTo?: number;
-    }> = await ctx.runQuery(internal.models.thoughts.private.getByIds, {
-      ids: candidates.map((r) => r._id),
-    });
+    }> = await ctx.runQuery(
+      internal.models.thoughts.private.getByIdsAuthorized,
+      {
+        principal: args.principal,
+        spaceIds: [args.spaceId],
+        ids: candidates.map((r) => r._id),
+      },
+    );
     const candidateById = new Map(
       candidateDocs.map((doc) => [doc._id as string, doc]),
     );
@@ -131,7 +143,7 @@ export const captureThought = internalAction({
       .filter(
         (doc): doc is NonNullable<typeof doc> =>
           doc !== undefined &&
-          doc.userId === args.userId &&
+          doc.spaceId === args.spaceId &&
           isCurrentMemory(doc.memoryStatus),
       )
       .slice(0, MAX_CANDIDATES)
@@ -153,7 +165,8 @@ export const captureThought = internalAction({
     // covering facts before it can decide this content is new.
     const coveringFacts: Array<{ id: string; statement: string }> =
       await ctx.runQuery(internal.models.facts.private.searchCoveringFacts, {
-        userId: args.userId,
+        principal: args.principal,
+        spaceIds: [args.spaceId],
         query: content,
       });
 
@@ -176,6 +189,14 @@ export const captureThought = internalAction({
         error,
       );
     }
+
+    // Classification can take long enough for a key or membership to change.
+    // Recheck before returning any result derived from stored candidates and
+    // before dispatching the final mutation, which rechecks once more.
+    await ctx.runQuery(
+      internal.models.thoughts.private.requireCaptureAccessForAction,
+      { principal: args.principal, spaceId: args.spaceId },
+    );
 
     let classification = analysis?.classification ?? null;
 
@@ -218,20 +239,25 @@ export const captureThought = internalAction({
 
       const existingId = citedId as Id<"thoughts"> | undefined;
       const existing = existingId
-        ? await ctx.runQuery(internal.models.thoughts.private.getById, {
-            id: existingId,
-          })
+        ? await ctx.runQuery(
+            internal.models.thoughts.private.getByIdAuthorized,
+            {
+              principal: args.principal,
+              id: existingId,
+            },
+          )
         : null;
       if (
         existing &&
-        existing.userId === args.userId &&
+        existing.spaceId === args.spaceId &&
         isCurrentMemory(existing.memoryStatus)
       ) {
         if (args.isCore !== undefined) {
           await ctx.runMutation(
-            internal.models.thoughts.private.setCoreStatus,
+            internal.models.thoughts.private.setCoreStatusAuthorized,
             {
-              userId: args.userId,
+              principal: args.principal,
+              spaceId: args.spaceId,
               id: existing._id,
               isCore: args.isCore,
             },
@@ -270,12 +296,13 @@ export const captureThought = internalAction({
             analysis?.metadata ?? fallbackThoughtMetadata(replacementContent);
 
           const thoughtId: Id<"thoughts"> = await ctx.runMutation(
-            internal.models.thoughts.private.transitionMemory,
+            internal.models.thoughts.private.transitionMemoryAuthorized,
             {
+              principal: args.principal,
+              spaceId: args.spaceId,
               content: replacementContent,
               embedding: replacementEmbedding,
               metadata: replacementMetadata,
-              userId: args.userId,
               previousIds: classification.relatedThoughtIds as Array<
                 Id<"thoughts">
               >,
@@ -332,12 +359,13 @@ export const captureThought = internalAction({
         ? analysis.metadata
         : fallbackThoughtMetadata(content);
     const thoughtId: Id<"thoughts"> = await ctx.runMutation(
-      internal.models.thoughts.private.insertOne,
+      internal.models.thoughts.private.insertOneAuthorized,
       {
+        principal: args.principal,
+        spaceId: args.spaceId,
         content,
         embedding,
         metadata,
-        userId: args.userId,
         validFrom: args.validFrom,
         validTo: args.validTo,
         isCore: args.isCore,
@@ -353,9 +381,54 @@ export const captureThought = internalAction({
   },
 });
 
-export const hybridSearch = internalAction({
+/** Trusted compatibility path for deterministic internal fixtures and jobs. */
+export const captureThoughtTrustedPersonal = internalAction({
   args: {
     userId: v.id("users"),
+    content: v.string(),
+    validFrom: v.optional(v.number()),
+    validTo: v.optional(v.number()),
+    isCore: v.optional(v.boolean()),
+    sourceType: v.optional(memorySourceType),
+    sourceRef: v.optional(v.string()),
+    observedAt: v.optional(v.number()),
+    batchId: v.optional(v.string()),
+  },
+  returns: v.object({
+    thoughtId: v.optional(v.id("thoughts")),
+    metadata: thoughtMetadata,
+    disposition: v.union(
+      v.literal("stored"),
+      v.literal("duplicate"),
+      v.literal("superseded"),
+      v.literal("corrected"),
+      v.literal("needs_confirmation"),
+      v.literal("skipped"),
+    ),
+    operationSummary: v.optional(v.string()),
+  }),
+  handler: async (ctx, args) => {
+    const principal = { userId: args.userId };
+    const spaceId: Id<"spaces"> = await ctx.runMutation(
+      internal.models.thoughts.private.resolvePersonalSpaceForTrustedAction,
+      { userId: args.userId },
+    );
+    const { userId: _userId, ...capture } = args;
+    return await ctx.runAction(
+      internal.models.thoughts.actions.captureThought,
+      {
+        principal,
+        spaceId,
+        ...capture,
+      },
+    );
+  },
+});
+
+export const hybridSearch = internalAction({
+  args: {
+    principal: principalRefValidator,
+    spaceIds: v.optional(v.array(v.id("spaces"))),
     query: v.string(),
     type: v.optional(thoughtType),
     limit: v.optional(v.number()),
@@ -366,6 +439,8 @@ export const hybridSearch = internalAction({
       _id: v.id("thoughts"),
       content: v.string(),
       metadata: thoughtMetadata,
+      userId: v.id("users"),
+      spaceId: v.id("spaces"),
       score: v.float64(),
       createdAt: v.number(),
       memoryStatus,
@@ -377,25 +452,39 @@ export const hybridSearch = internalAction({
     }),
   ),
   handler: async (ctx, args) => {
-    const limit = args.limit ?? 10;
+    const limit = Math.min(args.limit ?? 10, 100);
+    if (!Number.isInteger(limit) || limit < 1) {
+      throw new Error("Thought limit must be a positive integer");
+    }
     const candidateCap = 50;
     const K = 60; // RRF constant
 
-    // Generate embedding once; run vector + text in parallel
+    const authorizedSpaceIds: Array<Id<"spaces">> = await ctx.runQuery(
+      internal.models.thoughts.private.resolveReadSpacesForAction,
+      { principal: args.principal, spaceIds: args.spaceIds },
+    );
+    if (authorizedSpaceIds.length === 0) return [];
+    // Authorize before spending an embedding request, then generate once for
+    // the globally merged vector search.
     const embedding = await ctx.runAction(
       internal.models.thoughts.helpers.generateEmbedding,
       { text: args.query },
     );
 
     const activeAt = Date.now();
-    const [vectorHits, textHits] = await Promise.all([
-      ctx.vectorSearch("thoughts", "by_embedding", {
-        vector: embedding,
-        limit: args.includeHistorical ? candidateCap : candidateCap * 4,
-        filter: (q) => q.eq("userId", args.userId),
-      }),
-      ctx.runQuery(internal.models.thoughts.private.searchByText, {
-        userId: args.userId,
+    const [vectorHitsBySpace, textHits] = await Promise.all([
+      Promise.all(
+        authorizedSpaceIds.map((spaceId) =>
+          ctx.vectorSearch("thoughts", "by_embedding", {
+            vector: embedding,
+            limit: args.includeHistorical ? candidateCap : candidateCap * 4,
+            filter: (q) => q.eq("spaceId", spaceId),
+          }),
+        ),
+      ),
+      ctx.runQuery(internal.models.thoughts.private.searchByTextAuthorized, {
+        principal: args.principal,
+        spaceIds: authorizedSpaceIds,
         query: args.query,
         type: args.type,
         limit: candidateCap,
@@ -403,6 +492,14 @@ export const hybridSearch = internalAction({
         activeAt,
       }),
     ]);
+    const vectorHits = vectorHitsBySpace
+      .flat()
+      .sort(
+        (left, right) =>
+          right._score - left._score ||
+          String(left._id).localeCompare(String(right._id)),
+      )
+      .slice(0, args.includeHistorical ? candidateCap : candidateCap * 4);
 
     // Vector indexes cannot filter optional lifecycle fields, so hydrate once
     // and post-filter historical results. Text hits are filtered in their query.
@@ -413,6 +510,7 @@ export const hybridSearch = internalAction({
       content: string;
       metadata: Infer<typeof thoughtMetadata>;
       userId: string;
+      spaceId?: Id<"spaces">;
       updatedAt?: number;
       memoryStatus?: MemoryStatus;
       isCore?: boolean;
@@ -420,9 +518,14 @@ export const hybridSearch = internalAction({
       validTo?: number;
       supersededAt?: number;
       changeReason?: string;
-    }> = await ctx.runQuery(internal.models.thoughts.private.getByIds, {
-      ids: vectorIds,
-    });
+    }> = await ctx.runQuery(
+      internal.models.thoughts.private.getByIdsAuthorized,
+      {
+        principal: args.principal,
+        spaceIds: authorizedSpaceIds,
+        ids: vectorIds,
+      },
+    );
     const docById = new Map(fetchedDocs.map((doc) => [doc._id as string, doc]));
     const filteredVectorHits = vectorHits.filter((hit) => {
       const doc = docById.get(hit._id);
@@ -444,7 +547,7 @@ export const hybridSearch = internalAction({
     });
 
     const rankedIds = [...rrf.entries()]
-      .sort((a, b) => b[1] - a[1])
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
       .slice(0, limit)
       .map(([id]) => id);
 
@@ -455,6 +558,7 @@ export const hybridSearch = internalAction({
       content: string;
       metadata: Infer<typeof thoughtMetadata>;
       userId: string;
+      spaceId?: Id<"spaces">;
       updatedAt?: number;
       memoryStatus?: MemoryStatus;
       isCore?: boolean;
@@ -462,9 +566,14 @@ export const hybridSearch = internalAction({
       validTo?: number;
       supersededAt?: number;
       changeReason?: string;
-    }> = await ctx.runQuery(internal.models.thoughts.private.getByIds, {
-      ids: rankedIds as Array<Id<"thoughts">>,
-    });
+    }> = await ctx.runQuery(
+      internal.models.thoughts.private.getByIdsAuthorized,
+      {
+        principal: args.principal,
+        spaceIds: authorizedSpaceIds,
+        ids: rankedIds as Array<Id<"thoughts">>,
+      },
+    );
     const hydratedById = new Map(hydrated.map((d) => [d._id as string, d]));
 
     return rankedIds
@@ -475,6 +584,8 @@ export const hybridSearch = internalAction({
               _id: doc._id,
               content: doc.content,
               metadata: doc.metadata,
+              userId: doc.userId as Id<"users">,
+              spaceId: doc.spaceId!,
               score: rrf.get(id)!,
               createdAt: doc._creationTime,
               memoryStatus: doc.memoryStatus ?? "current",

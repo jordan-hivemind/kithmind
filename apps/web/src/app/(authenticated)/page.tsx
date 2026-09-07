@@ -7,7 +7,7 @@ import { QuickCapture } from "@/features/thoughts/components/QuickCapture";
 import { ThoughtCard } from "@/features/thoughts/components/ThoughtCard";
 
 export default function DashboardPage() {
-  const stats = useQuery(api.models.thoughts.public.getStats);
+  const stats = useQuery(api.models.thoughts.public.getStats, {});
   const recent = useQuery(api.models.thoughts.public.listRecent, {
     limit: 10,
   });

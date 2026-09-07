@@ -6,6 +6,8 @@ import schema from "../../schema";
 import { modules } from "../../test.setup";
 import { _listByUser } from "./model";
 
+type TestBackend = ReturnType<typeof convexTest>;
+
 const embedding = Array.from({ length: 1536 }, () => 0);
 const metadata = {
   type: "person_note" as const,
@@ -17,14 +19,36 @@ const metadata = {
 const lakesideStart = Date.UTC(2023, 7, 21);
 const redwoodStart = Date.now() - 1_000;
 
+async function createPersonalUser(t: TestBackend) {
+  return await t.run(async (ctx) => {
+    const userId = await ctx.db.insert("users", {});
+    const spaceId = await ctx.db.insert("spaces", {
+      kind: "personal",
+      name: "Personal",
+      createdBy: userId,
+    });
+    await ctx.db.insert("spaceMembers", {
+      spaceId,
+      userId,
+      role: "owner",
+    });
+    await ctx.db.insert("userSpaceSettings", {
+      userId,
+      personalSpaceId: spaceId,
+    });
+    return { userId, spaceId };
+  });
+}
+
 describe("temporal memory transitions", () => {
   test("keeps inactive validity windows out of current recall without erasing them", async () => {
     const t = convexTest(schema, modules);
-    const userId = await t.run((ctx) => ctx.db.insert("users", {}));
+    const { userId, spaceId } = await createPersonalUser(t);
     const now = Date.now();
     const [expiredId, futureId, activeId] = await t.run(async (ctx) => [
       await ctx.db.insert("thoughts", {
         userId,
+        spaceId,
         content: "A formerly true fact",
         embedding,
         metadata,
@@ -33,6 +57,7 @@ describe("temporal memory transitions", () => {
       }),
       await ctx.db.insert("thoughts", {
         userId,
+        spaceId,
         content: "A scheduled future fact",
         embedding,
         metadata,
@@ -41,6 +66,7 @@ describe("temporal memory transitions", () => {
       }),
       await ctx.db.insert("thoughts", {
         userId,
+        spaceId,
         content: "A fact true now",
         embedding,
         metadata,
@@ -67,7 +93,7 @@ describe("temporal memory transitions", () => {
 
   test("fills memory result limits after lifecycle filtering", async () => {
     const t = convexTest(schema, modules);
-    const userId = await t.run((ctx) => ctx.db.insert("users", {}));
+    const { userId, spaceId } = await createPersonalUser(t);
 
     await t.run(async (ctx) => {
       const insertMemory = (
@@ -77,6 +103,7 @@ describe("temporal memory transitions", () => {
       ) =>
         ctx.db.insert("thoughts", {
           userId,
+          spaceId,
           content: `Pagination sentinel memory ${index}`,
           embedding,
           metadata,
@@ -98,7 +125,7 @@ describe("temporal memory transitions", () => {
     const current = await t.run((ctx) => _listByUser(ctx, userId, 10));
     const historical = await t.run((ctx) => _listByUser(ctx, userId, 10, true));
     const search = await t.query(
-      internal.models.thoughts.private.searchByText,
+      internal.models.thoughts.private.searchByTextTrustedLegacy,
       {
         userId,
         query: "pagination sentinel memory",
@@ -123,15 +150,16 @@ describe("temporal memory transitions", () => {
 
   test("atomically preserves and links a superseded memory", async () => {
     const t = convexTest(schema, modules);
-    const userId = await t.run((ctx) => ctx.db.insert("users", {}));
-    const previousId = await t.run((ctx) =>
-      ctx.db.insert("thoughts", {
+    const { userId } = await createPersonalUser(t);
+    const previousId = await t.mutation(
+      internal.models.thoughts.private.insertOne,
+      {
         userId,
         content: "Rowan attends Lakeside School.",
         embedding,
         metadata,
         validFrom: lakesideStart,
-      }),
+      },
     );
     const transitionedAt = Date.now();
 
@@ -187,15 +215,16 @@ describe("temporal memory transitions", () => {
 
   test("does not invent an interval end when the new start is unknown", async () => {
     const t = convexTest(schema, modules);
-    const userId = await t.run((ctx) => ctx.db.insert("users", {}));
-    const previousId = await t.run((ctx) =>
-      ctx.db.insert("thoughts", {
+    const { userId } = await createPersonalUser(t);
+    const previousId = await t.mutation(
+      internal.models.thoughts.private.insertOne,
+      {
         userId,
         content: "Rowan attends Lakeside School.",
         embedding,
         metadata,
         validFrom: lakesideStart,
-      }),
+      },
     );
 
     await t.mutation(internal.models.thoughts.private.transitionMemory, {
@@ -220,16 +249,17 @@ describe("temporal memory transitions", () => {
 
   test("does not turn a retracted claim into a historical validity interval", async () => {
     const t = convexTest(schema, modules);
-    const userId = await t.run((ctx) => ctx.db.insert("users", {}));
-    const inaccurateId = await t.run((ctx) =>
-      ctx.db.insert("thoughts", {
+    const { userId } = await createPersonalUser(t);
+    const inaccurateId = await t.mutation(
+      internal.models.thoughts.private.insertOne,
+      {
         userId,
         content: "Rowan attends Lakeside School.",
         embedding,
         metadata,
         validFrom: lakesideStart,
         validTo: redwoodStart,
-      }),
+      },
     );
 
     const correctedId = await t.mutation(
@@ -263,10 +293,11 @@ describe("temporal memory transitions", () => {
 
   test("rejects an invalid new interval without partial writes", async () => {
     const t = convexTest(schema, modules);
-    const userId = await t.run((ctx) => ctx.db.insert("users", {}));
+    const { userId, spaceId } = await createPersonalUser(t);
     const previousId = await t.run((ctx) =>
       ctx.db.insert("thoughts", {
         userId,
+        spaceId,
         content: "Previous memory",
         embedding,
         metadata,
@@ -295,19 +326,21 @@ describe("temporal memory transitions", () => {
 
   test("rejects cross-account transitions without partial writes", async () => {
     const t = convexTest(schema, modules);
-    const [ownerId, otherId] = await t.run(async (ctx) => [
-      await ctx.db.insert("users", {}),
-      await ctx.db.insert("users", {}),
-    ]);
+    const owner = await createPersonalUser(t);
+    const other = await createPersonalUser(t);
+    const ownerId = owner.userId;
+    const otherId = other.userId;
     const [ownerMemoryId, otherMemoryId] = await t.run(async (ctx) => [
       await ctx.db.insert("thoughts", {
         userId: ownerId,
+        spaceId: owner.spaceId,
         content: "Owner memory",
         embedding,
         metadata,
       }),
       await ctx.db.insert("thoughts", {
         userId: otherId,
+        spaceId: other.spaceId,
         content: "Other memory",
         embedding,
         metadata,

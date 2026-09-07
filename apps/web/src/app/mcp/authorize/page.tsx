@@ -1,9 +1,15 @@
 "use client";
 
 import { useAuthActions } from "@convex-dev/auth/react";
+import type { Id } from "@repo/db/convex/_generated/dataModel";
 import { Authenticated, AuthLoading, Unauthenticated } from "convex/react";
 import { useSearchParams } from "next/navigation";
 import { Suspense, useState } from "react";
+
+import {
+  type KeyCapability,
+  SpaceGrantPicker,
+} from "@/components/space-grant-picker";
 
 function AuthorizeFlow() {
   const searchParams = useSearchParams();
@@ -11,6 +17,8 @@ function AuthorizeFlow() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [mode, setMode] = useState<"signIn" | "signUp">("signIn");
+  const [spaceIds, setSpaceIds] = useState<Id<"spaces">[]>([]);
+  const [capabilities, setCapabilities] = useState<KeyCapability[]>(["read"]);
 
   const clientId = searchParams.get("client_id") || "";
   const redirectUri = searchParams.get("redirect_uri") || "";
@@ -63,6 +71,8 @@ function AuthorizeFlow() {
           resource,
           scope,
           state: state || undefined,
+          spaceIds,
+          capabilities,
         }),
       });
       if (!res.ok) {
@@ -213,14 +223,19 @@ function AuthorizeFlow() {
 
       <Authenticated>
         <p style={{ color: "#666", marginTop: 0 }}>
-          An MCP client is requesting permission to read and change your Open
-          Brain data. After approval, you will return to{" "}
-          <strong>{redirectDestination}</strong>.
+          Choose what this MCP client can access. After approval, you will
+          return to <strong>{redirectDestination}</strong>.
         </p>
+        <SpaceGrantPicker
+          spaceIds={spaceIds}
+          onSpaceIdsChange={setSpaceIds}
+          capabilities={capabilities}
+          onCapabilitiesChange={setCapabilities}
+        />
         {error && <p style={{ color: "#dc2626" }}>{error}</p>}
         <button
           onClick={handleAuthorize}
-          disabled={loading}
+          disabled={loading || !spaceIds.length || !capabilities.length}
           style={buttonStyle}
         >
           {loading ? "Authorizing..." : "Authorize"}

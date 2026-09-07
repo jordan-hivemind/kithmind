@@ -5,6 +5,8 @@ import { api, internal } from "../../_generated/api";
 import schema from "../../schema";
 import { modules } from "../../test.setup";
 
+type TestBackend = ReturnType<typeof convexTest>;
+
 const issuer = "https://brain.example.test";
 const embedding = Array.from({ length: 1536 }, () => 0);
 const metadata = {
@@ -14,6 +16,23 @@ const metadata = {
   actionItems: [],
   summary: "Core identity fact",
 };
+
+async function createPersonalUser(t: TestBackend) {
+  return await t.run(async (ctx) => {
+    const userId = await ctx.db.insert("users", {});
+    const spaceId = await ctx.db.insert("spaces", {
+      kind: "personal",
+      name: "Personal",
+      createdBy: userId,
+    });
+    await ctx.db.insert("spaceMembers", { spaceId, userId, role: "owner" });
+    await ctx.db.insert("userSpaceSettings", {
+      userId,
+      personalSpaceId: spaceId,
+    });
+    return { userId, spaceId };
+  });
+}
 
 describe("core memories", () => {
   const originalIssuer = process.env.MCP_JWT_ISSUER;
@@ -32,14 +51,56 @@ describe("core memories", () => {
 
   test("returns a bounded current core set for only the authenticated account", async () => {
     const t = convexTest(schema, modules);
-    const [ownerId, otherId] = await t.run(async (ctx) => [
-      await ctx.db.insert("users", {}),
-      await ctx.db.insert("users", {}),
-    ]);
+    const {
+      ownerId,
+      otherId,
+      ownerSpaceId,
+      otherSpaceId,
+      ownerKeyId,
+      otherKeyId,
+    } = await t.run(async (ctx) => {
+      const create = async (label: string) => {
+        const userId = await ctx.db.insert("users", {});
+        const spaceId = await ctx.db.insert("spaces", {
+          kind: "personal",
+          name: "Personal",
+          createdBy: userId,
+        });
+        await ctx.db.insert("spaceMembers", {
+          spaceId,
+          userId,
+          role: "owner",
+        });
+        await ctx.db.insert("userSpaceSettings", {
+          userId,
+          personalSpaceId: spaceId,
+        });
+        const keyId = await ctx.db.insert("apiKeys", {
+          userId,
+          keyHash: label.repeat(64).slice(0, 64),
+          keyPrefix: `ob_${label}`,
+          name: label,
+          capabilities: ["read"],
+          spaceIds: [spaceId],
+        });
+        return { userId, spaceId, keyId };
+      };
+      const owner = await create("o");
+      const other = await create("x");
+      return {
+        ownerId: owner.userId,
+        otherId: other.userId,
+        ownerSpaceId: owner.spaceId,
+        otherSpaceId: other.spaceId,
+        ownerKeyId: owner.keyId,
+        otherKeyId: other.keyId,
+      };
+    });
     await t.run(async (ctx) => {
       for (let index = 0; index < 30; index++) {
         await ctx.db.insert("thoughts", {
           userId: ownerId,
+          spaceId: ownerSpaceId,
           content: `Owner core memory ${index}`,
           embedding,
           metadata,
@@ -49,23 +110,24 @@ describe("core memories", () => {
       }
       await ctx.db.insert("thoughts", {
         userId: ownerId,
+        spaceId: ownerSpaceId,
         content: "Owner non-core memory",
         embedding,
         metadata,
         isCore: false,
-        memoryStatus: "current",
       });
       await ctx.db.insert("thoughts", {
         userId: ownerId,
+        spaceId: ownerSpaceId,
         content: "Owner expired core memory",
         embedding,
         metadata,
         isCore: true,
-        memoryStatus: "current",
         validTo: Date.now() - 60_000,
       });
       await ctx.db.insert("thoughts", {
         userId: ownerId,
+        spaceId: ownerSpaceId,
         content: "Owner future core memory",
         embedding,
         metadata,
@@ -75,6 +137,7 @@ describe("core memories", () => {
       });
       await ctx.db.insert("thoughts", {
         userId: ownerId,
+        spaceId: ownerSpaceId,
         content: "Owner historical core memory",
         embedding,
         metadata,
@@ -83,6 +146,7 @@ describe("core memories", () => {
       });
       await ctx.db.insert("thoughts", {
         userId: otherId,
+        spaceId: otherSpaceId,
         content: "Other account core memory",
         embedding,
         metadata,
@@ -94,6 +158,7 @@ describe("core memories", () => {
       for (let index = 0; index < 260; index += 1) {
         await ctx.db.insert("thoughts", {
           userId: ownerId,
+          spaceId: ownerSpaceId,
           content: `Owner retracted core memory ${index}`,
           embedding,
           metadata,
@@ -103,8 +168,16 @@ describe("core memories", () => {
       }
     });
 
-    const owner = t.withIdentity({ issuer, subject: ownerId });
-    const other = t.withIdentity({ issuer, subject: otherId });
+    const owner = t.withIdentity({
+      issuer,
+      subject: ownerId,
+      apiKeyId: ownerKeyId,
+    });
+    const other = t.withIdentity({
+      issuer,
+      subject: otherId,
+      apiKeyId: otherKeyId,
+    });
     await expect(
       t.query(api.models.thoughts.mcpQueries.listCore, {}),
     ).rejects.toThrow("Not authenticated");
@@ -138,24 +211,26 @@ describe("core memories", () => {
   test("inherits core status across transitions unless explicitly overridden", async () => {
     const t = convexTest(schema, modules);
     const userId = await t.run((ctx) => ctx.db.insert("users", {}));
-    const [originalId, nonCoreId] = await t.run(async (ctx) => [
-      await ctx.db.insert("thoughts", {
+    const originalId = await t.mutation(
+      internal.models.thoughts.private.insertOne,
+      {
         userId,
         content: "A durable core fact",
         embedding,
         metadata,
         isCore: true,
-        memoryStatus: "current",
-      }),
-      await ctx.db.insert("thoughts", {
+      },
+    );
+    const nonCoreId = await t.mutation(
+      internal.models.thoughts.private.insertOne,
+      {
         userId,
         content: "A related non-core fact",
         embedding,
         metadata,
         isCore: false,
-        memoryStatus: "current",
-      }),
-    ]);
+      },
+    );
 
     const inheritedId = await t.mutation(
       internal.models.thoughts.private.transitionMemory,
@@ -195,13 +270,14 @@ describe("core memories", () => {
 
   test("prevents cross-account core updates and transitions without partial writes", async () => {
     const t = convexTest(schema, modules);
-    const [ownerId, otherId] = await t.run(async (ctx) => [
-      await ctx.db.insert("users", {}),
-      await ctx.db.insert("users", {}),
-    ]);
+    const owner = await createPersonalUser(t);
+    const other = await createPersonalUser(t);
+    const ownerId = owner.userId;
+    const otherId = other.userId;
     const [ownerMemoryId, otherMemoryId] = await t.run(async (ctx) => [
       await ctx.db.insert("thoughts", {
         userId: ownerId,
+        spaceId: owner.spaceId,
         content: "Owner core memory",
         embedding,
         metadata,
@@ -209,6 +285,7 @@ describe("core memories", () => {
       }),
       await ctx.db.insert("thoughts", {
         userId: otherId,
+        spaceId: other.spaceId,
         content: "Other memory",
         embedding,
         metadata,
