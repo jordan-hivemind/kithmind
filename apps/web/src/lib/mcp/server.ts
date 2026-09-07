@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { api } from "@repo/db/convex/_generated/api";
 import type { Id } from "@repo/db/convex/_generated/dataModel";
+import { parseSpaceReadErrorData } from "@repo/db/convex/lib/spaceReadErrors";
 import {
   blendRecallContext,
   coreLimitFor,
@@ -56,6 +57,30 @@ const writeSpaceSchema = spaceIdSchema
   );
 function scopedReads(spaceIds?: string[]) {
   return spaceIds === undefined ? {} : { spaceIds: spaceIds as Id<"spaces">[] };
+}
+
+function errorData(error: unknown): unknown {
+  return typeof error === "object" && error !== null && "data" in error
+    ? error.data
+    : undefined;
+}
+
+const SPACE_READ_ERROR_MESSAGES = {
+  space_not_found: "Space not found",
+} as const;
+
+function spaceReadToolError(error: unknown) {
+  const parsed = parseSpaceReadErrorData(errorData(error));
+  if (!parsed) throw error;
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: SPACE_READ_ERROR_MESSAGES[parsed.code],
+      },
+    ],
+    isError: true,
+  };
 }
 
 /** Parse an explicit real-world validity date without using the server's timezone. */
@@ -308,12 +333,19 @@ export function createMcpServer(convexAuthToken: string) {
     {},
     MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.listSpaces],
     async () => {
-      const spaces = await convex.query(api.models.spaces.mcpQueries.list, {});
-      return {
-        content: [
-          { type: "text" as const, text: JSON.stringify(spaces, null, 2) },
-        ],
-      };
+      try {
+        const spaces = await convex.query(
+          api.models.spaces.mcpQueries.list,
+          {},
+        );
+        return {
+          content: [
+            { type: "text" as const, text: JSON.stringify(spaces, null, 2) },
+          ],
+        };
+      } catch (error) {
+        return spaceReadToolError(error);
+      }
     },
   );
 
@@ -354,13 +386,17 @@ export function createMcpServer(convexAuthToken: string) {
     },
     MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.searchDocuments],
     async ({ spaceIds, ...args }) => {
-      const result = await convex.action(
-        api.models.documents.mcpActions.search,
-        { ...args, ...scopedReads(spaceIds) },
-      );
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify(result) }],
-      };
+      try {
+        const result = await convex.action(
+          api.models.documents.mcpActions.search,
+          { ...args, ...scopedReads(spaceIds) },
+        );
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(result) }],
+        };
+      } catch (error) {
+        return spaceReadToolError(error);
+      }
     },
   );
   const getDocumentTool = server.tool(

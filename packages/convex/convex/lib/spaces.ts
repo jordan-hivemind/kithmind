@@ -6,6 +6,7 @@ import {
   inspectPersonalSpace,
 } from "../models/spaces/model";
 import { hasNoOAuthLifecycle } from "../models/apiKeys/validators";
+import { rethrowSpaceReadError, spaceReadNotFound } from "./spaceReadErrors";
 
 export type Capability = "read" | "write" | "ingest";
 export type SpaceOperation = Capability;
@@ -163,7 +164,7 @@ export async function getAuthorizedReadSpaceIds(
 ): Promise<Id<"spaces">[]> {
   const principal = await currentPrincipal(ctx, principalOrRef);
   if (!principal.capabilities.includes("read")) {
-    throw new Error("Space not found");
+    spaceReadNotFound();
   }
 
   if (explicitSpaceIds && explicitSpaceIds.length > 0) {
@@ -171,11 +172,15 @@ export async function getAuthorizedReadSpaceIds(
       throw new Error("Space filter is too large");
     }
     const requested = unique(explicitSpaceIds);
-    await Promise.all(
-      requested.map((spaceId) =>
-        requireSpaceAccess(ctx, principal, spaceId, "read"),
-      ),
-    );
+    try {
+      await Promise.all(
+        requested.map((spaceId) =>
+          requireSpaceAccess(ctx, principal, spaceId, "read"),
+        ),
+      );
+    } catch (error) {
+      rethrowSpaceReadError(error);
+    }
     return requested;
   }
 
