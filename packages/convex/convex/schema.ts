@@ -3,6 +3,8 @@ import { recordQueryTables } from "./models/records/queryTables";
 import { embeddingTables } from "./models/embeddings/tables";
 import { coverageTables } from "./models/coverage/tables";
 import { ingestionTables } from "./models/ingestion/tables";
+import { inlineWorkTables } from "./models/ingestion/inlineWorkTables";
+import { urlQueueTables } from "./models/ingestion/urlQueueTables";
 import { provenanceTables } from "./models/provenance/tables";
 import { defineSchema, defineTable } from "convex/server";
 import { authTables } from "@convex-dev/auth/server";
@@ -25,6 +27,8 @@ export default defineSchema({
   ...embeddingTables,
   ...coverageTables,
   ...ingestionTables,
+  ...inlineWorkTables,
+  ...urlQueueTables,
   ...provenanceTables,
   ...recordTables,
   ...recordQueryTables,

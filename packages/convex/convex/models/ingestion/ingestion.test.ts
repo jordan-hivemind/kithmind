@@ -675,7 +675,8 @@ describe("durable ingestion engine", () => {
   });
 
   test("cursor admission rolls back atomically and forget is hidden then bounded", async () => {
-    const { t, userId, outsiderId, sourceAccountId } = await seed();
+    const { t, userId, outsiderId, sourceAccountId, actorCredentialId } =
+      await seed();
     const principal = { userId };
     const one = admission(principal, sourceAccountId, {
       requestId: "cursor-1",
@@ -779,6 +780,23 @@ describe("durable ingestion engine", () => {
       ),
     ).rejects.toThrow("Source account not found");
 
+    await t.run(async (ctx) => {
+      const item = (await ctx.db.get(admitted.sourceItemId))!;
+      for (let index = 0; index < 30; index += 1) {
+        await ctx.db.insert("sourceFetchRequests", {
+          spaceId: item.spaceId,
+          sourceAccountId,
+          sourceItemId: item._id,
+          actorUserId: userId,
+          actorCredentialId,
+          requestId: `pending-url-${index}`,
+          requestDigest: `digest-${index}`,
+          url: `https://example.com/${index}`,
+          state: "queued",
+          createdAt: 3000,
+        });
+      }
+    });
     let cleanup = { phase: "start", deleted: 0, done: false };
     for (let attempt = 0; attempt < 20 && !cleanup.done; attempt += 1) {
       cleanup = await t.run((ctx) =>
@@ -802,6 +820,8 @@ describe("durable ingestion engine", () => {
         .length,
       jobs: (await ctx.db.query("ingestJobs").collect()).length,
       receipts: (await ctx.db.query("ingestRequests").collect()).length,
+      fetchRequests: (await ctx.db.query("sourceFetchRequests").collect())
+        .length,
     }));
     expect(forgotten.item).toMatchObject({
       lifecycle: "forgotten",
@@ -820,6 +840,7 @@ describe("durable ingestion engine", () => {
       generations: 0,
       jobs: 0,
       receipts: 0,
+      fetchRequests: 0,
     });
     await expect(
       t.run((ctx) =>

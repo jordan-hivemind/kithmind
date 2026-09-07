@@ -1196,7 +1196,28 @@ export async function requeueJob(
     error: undefined,
   });
   await ctx.db.patch(job.processingGenerationId, { state: "queued" });
+  await resetInlineWorkForRequeue(ctx, job._id, args.now);
   return { state: "queued" as const };
+}
+
+async function resetInlineWorkForRequeue(
+  ctx: MutationCtx,
+  ingestJobId: Id<"ingestJobs">,
+  now: number,
+): Promise<void> {
+  const rows = await ctx.db
+    .query("inlineWork")
+    .withIndex("by_ingestJobId", (q) => q.eq("ingestJobId", ingestJobId))
+    .take(2);
+  if (rows.length > 1) throw new Error("Inline work identity is invalid");
+  if (rows[0]) {
+    await ctx.db.patch(rows[0]._id, {
+      state: "queued",
+      nextAttemptAt: now,
+      lastErrorCode: undefined,
+      updatedAt: now,
+    });
+  }
 }
 
 /**
@@ -1264,6 +1285,7 @@ export async function replaceRevokedActorAndRequeueFromWeb(
     error: undefined,
   });
   await ctx.db.patch(job.processingGenerationId, { state });
+  await resetInlineWorkForRequeue(ctx, job._id, args.now);
   return { state };
 }
 
@@ -1526,6 +1548,26 @@ export async function continueForgetFromWeb(
   });
   if (sessions.deleted > 0 || !sessions.done) {
     return { phase: "recordQuerySessions", ...sessions, done: false };
+  }
+  const inlineWork = await ctx.db
+    .query("inlineWork")
+    .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+    .take(MAX_STAGE_ROWS);
+  for (const work of inlineWork) await ctx.db.delete(work._id);
+  if (inlineWork.length > 0) {
+    return { phase: "inlineWork", deleted: inlineWork.length, done: false };
+  }
+  const fetchRequests = await ctx.db
+    .query("sourceFetchRequests")
+    .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+    .take(MAX_STAGE_ROWS);
+  for (const request of fetchRequests) await ctx.db.delete(request._id);
+  if (fetchRequests.length > 0) {
+    return {
+      phase: "sourceFetchRequests",
+      deleted: fetchRequests.length,
+      done: false,
+    };
   }
   const receipts = await ctx.db
     .query("ingestRequests")

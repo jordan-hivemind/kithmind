@@ -2,6 +2,7 @@ import type { Doc, Id } from "../../_generated/dataModel";
 import type { QueryCtx } from "../../_generated/server";
 import {
   classifyCoverageJob,
+  classifyCoverageFetch,
   coverageEntityBelongsToSpace,
 } from "../coverage/model";
 
@@ -574,9 +575,27 @@ async function sourceAccountMetadata(
       )
       .take(limit),
   );
+  const fetchRequests = await takeWithinBudget((limit) =>
+    ctx.db
+      .query("sourceFetchRequests")
+      .withIndex("by_sourceAccountId", (q) =>
+        q.eq("sourceAccountId", account._id),
+      )
+      .take(limit),
+  );
   let pendingJobs = 0;
   let failedJobs = 0;
   let invalidJobParent = false;
+  for (const request of fetchRequests) {
+    const classification = await classifyCoverageFetch(
+      ctx,
+      account,
+      request,
+      itemCache,
+    );
+    if (classification === "current") pendingJobs += 1;
+    if (classification === "invalid") invalidJobParent = true;
+  }
   for (const batch of jobBatches) {
     for (const job of batch.rows) {
       const classification = await classifyCoverageJob(
