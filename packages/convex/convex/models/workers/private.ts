@@ -10,6 +10,7 @@ import {
   reconcileWorkerScan,
   sealWorkerScan,
 } from "./model";
+import { admitDiscoveryUtf8, reserveDiscoveryWork } from "./discovery";
 import { parseWorkerRequest, type WorkerRequest } from "./protocol";
 
 function operation<T extends WorkerRequest["operation"]>(
@@ -84,6 +85,33 @@ export const scanReconcile = internalMutation({
       ctx,
       args.principal,
       operation(args.request, "scan.reconcile"),
+      Date.now(),
+    ),
+});
+
+export const discoveryReserve = internalMutation({
+  args: {
+    principal: principalRefValidator,
+    request: v.any(),
+    tokens: v.array(v.string()),
+  },
+  handler: async (ctx, args) =>
+    await reserveDiscoveryWork(
+      ctx,
+      args.principal,
+      operation(args.request, "discovery.reserve"),
+      args.tokens,
+      Date.now(),
+    ),
+});
+
+export const discoveryAdmitUtf8 = internalMutation({
+  args: { principal: principalRefValidator, request: v.any() },
+  handler: async (ctx, args) =>
+    await admitDiscoveryUtf8(
+      ctx,
+      args.principal,
+      operation(args.request, "discovery.admitUtf8"),
       Date.now(),
     ),
 });

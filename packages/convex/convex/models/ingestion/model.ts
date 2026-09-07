@@ -1595,6 +1595,60 @@ export async function continueForgetFromWeb(
   if (inlineWork.length > 0) {
     return { phase: "inlineWork", deleted: inlineWork.length, done: false };
   }
+  const workerOperationReceipts = await ctx.db
+    .query("workerOperationReceipts")
+    .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+    .take(MAX_STAGE_ROWS);
+  for (const receipt of workerOperationReceipts) {
+    if (
+      receipt.spaceId !== item.spaceId ||
+      receipt.sourceAccountId !== item.sourceAccountId
+    ) {
+      throw new Error("Worker operation receipt parent chain is invalid");
+    }
+    await ctx.db.delete(receipt._id);
+  }
+  if (workerOperationReceipts.length > 0) {
+    return {
+      phase: "workerOperationReceipts",
+      deleted: workerOperationReceipts.length,
+      done: false,
+    };
+  }
+  const workerReservationTargets = await ctx.db
+    .query("workerReservationTargets")
+    .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+    .take(MAX_STAGE_ROWS);
+  for (const target of workerReservationTargets) {
+    if (
+      target.spaceId !== item.spaceId ||
+      target.sourceAccountId !== item.sourceAccountId
+    ) {
+      throw new Error("Worker reservation target parent chain is invalid");
+    }
+    const receipt = await ctx.db.get(target.receiptId);
+    if (receipt) {
+      if (
+        receipt.spaceId !== item.spaceId ||
+        receipt.sourceAccountId !== item.sourceAccountId
+      ) {
+        throw new Error("Worker reservation receipt parent chain is invalid");
+      }
+      // Shared receipts cannot replay a partial target list after forgetting.
+      // Other items keep their independent leases until normal expiry.
+      await ctx.db.patch(receipt._id, {
+        invalidatedAt: receipt.invalidatedAt ?? Date.now(),
+      });
+    }
+    await ctx.db.delete(target._id);
+  }
+  if (workerReservationTargets.length > 0) {
+    return {
+      phase: "workerReservationTargets",
+      deleted: workerReservationTargets.length,
+      done: false,
+    };
+  }
   const workerDiscoveryWork = await ctx.db
     .query("workerDiscoveryWork")
     .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))

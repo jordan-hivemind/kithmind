@@ -130,7 +130,48 @@ const workerResultValidator = v.union(
     done: v.boolean(),
     reused: v.boolean(),
   }),
+  v.object({
+    operation: v.literal("discovery.reserve"),
+    receiptId: v.string(),
+    expiresAt: v.number(),
+    reused: v.boolean(),
+    targets: v.array(
+      v.object({
+        workId: v.string(),
+        sourceItemId: v.string(),
+        observationEpoch: v.number(),
+        processingEpoch: v.number(),
+        leaseEpoch: v.number(),
+        leaseToken: v.string(),
+        leaseExpiresAt: v.number(),
+        uri: v.string(),
+        contentHash: v.string(),
+        byteLength: v.number(),
+      }),
+    ),
+  }),
+  v.object({
+    operation: v.literal("discovery.admitUtf8"),
+    workId: v.string(),
+    sourceItemId: v.string(),
+    sourceRevisionId: v.string(),
+    processingGenerationId: v.string(),
+    ingestJobId: v.string(),
+    desiredProcessingEpoch: v.number(),
+    state: v.literal("admitted"),
+    reused: v.boolean(),
+  }),
 );
+
+function randomLeaseTokens(count: number): string[] {
+  return Array.from({ length: count }, () => {
+    const bytes = new Uint8Array(32);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
+      "",
+    );
+  });
+}
 
 export const dispatch = action({
   args: { request: v.any() },
@@ -178,6 +219,20 @@ export const dispatch = action({
         case "scan.reconcile":
           return await ctx.runMutation(
             internal.models.workers.private.scanReconcile,
+            { principal, request },
+          );
+        case "discovery.reserve":
+          return await ctx.runMutation(
+            internal.models.workers.private.discoveryReserve,
+            {
+              principal,
+              request,
+              tokens: randomLeaseTokens(request.maxItems),
+            },
+          );
+        case "discovery.admitUtf8":
+          return await ctx.runMutation(
+            internal.models.workers.private.discoveryAdmitUtf8,
             { principal, request },
           );
       }

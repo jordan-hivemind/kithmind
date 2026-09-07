@@ -4,6 +4,9 @@ import { v } from "convex/values";
 import {
   sourceAliasDigestFields,
   workerProtocolRateLimitFields,
+  workerOperationReceiptFields,
+  workerReservationReceiptFields,
+  workerReservationTargetFields,
   workerDiscoveryWorkFields,
   workerScanEntryFields,
   workerScanPageFields,
@@ -67,6 +70,11 @@ export const workerTables = {
       "state",
       "nextAttemptAt",
     ])
+    .index("by_sourceAccountId_and_state_and_leaseExpiresAt", [
+      "sourceAccountId",
+      "state",
+      "leaseExpiresAt",
+    ])
     .index("by_sourceItemId", ["sourceItemId"])
     .index("by_sourceItemId_and_observationEpoch", [
       "sourceItemId",
@@ -78,8 +86,32 @@ export const workerTables = {
   sourceAliasDigests: defineTable(sourceAliasDigestFields)
     .index("by_sourceAccountId_and_digest", ["sourceAccountId", "digest"])
     .index("by_sourceItemId", ["sourceItemId"]),
-  workerProtocolRateLimits: defineTable(workerProtocolRateLimitFields).index(
-    "by_credentialId_and_sourceAccountId",
-    ["credentialId", "sourceAccountId"],
-  ),
+  workerProtocolRateLimits: defineTable(workerProtocolRateLimitFields)
+    .index("by_credentialId_and_sourceAccountId", [
+      "credentialId",
+      "sourceAccountId",
+    ])
+    .index("by_windowStartedAt", ["windowStartedAt"]),
+  workerReservationReceipts: defineTable(workerReservationReceiptFields)
+    .index("by_sourceAccountId_and_kind_and_requestId", [
+      "sourceAccountId",
+      "kind",
+      "requestId",
+    ])
+    .index("by_retireAt", ["retireAt"]),
+  workerReservationTargets: defineTable(workerReservationTargetFields)
+    .index("by_receiptId_and_ordinal", ["receiptId", "ordinal"])
+    .index("by_discoveryWorkId", ["discoveryWorkId"])
+    .index("by_ingestJobId", ["ingestJobId"])
+    .index("by_sourceItemId", ["sourceItemId"])
+    .index("by_leaseExpiresAt", ["leaseExpiresAt"]),
+  workerOperationReceipts: defineTable(workerOperationReceiptFields)
+    .index("by_sourceAccountId_and_operation_and_requestId", [
+      "sourceAccountId",
+      "operation",
+      "requestId",
+    ])
+    .index("by_discoveryWorkId", ["discoveryWorkId"])
+    .index("by_sourceItemId", ["sourceItemId"])
+    .index("by_retireAt", ["retireAt"]),
 };

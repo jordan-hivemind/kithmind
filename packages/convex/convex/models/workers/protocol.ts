@@ -61,6 +61,7 @@ export const MAX_WORKER_PAGE_ITEMS = 4;
 export const MAX_WORKER_SCAN_PAGES = 64;
 export const MAX_WORKER_INVENTORY_PAGE_ITEMS = 50;
 export const MAX_WORKER_RECONCILE_ITEMS = 50;
+export const MAX_WORKER_RESERVATION_ITEMS = 4;
 
 export type WorkerPaginationOptions = {
   cursor: string | null;
@@ -143,6 +144,19 @@ export type WorkerRequest =
       expectedInventoryEpoch: number;
       ordinal: number;
       maxItems: number;
+    })
+  | (WorkerSourceRequest & {
+      operation: "discovery.reserve";
+      requestId: string;
+      maxItems: number;
+    })
+  | (WorkerSourceRequest & {
+      operation: "discovery.admitUtf8";
+      requestId: string;
+      workId: string;
+      leaseEpoch: number;
+      leaseToken: string;
+      text: string;
     });
 
 export type WorkerSourceStatusResult = {
@@ -235,13 +249,46 @@ export type WorkerScanReconcileResult = {
   reused: boolean;
 };
 
+export type WorkerDiscoveryReserveResult = {
+  operation: "discovery.reserve";
+  receiptId: string;
+  expiresAt: number;
+  reused: boolean;
+  targets: Array<{
+    workId: string;
+    sourceItemId: string;
+    observationEpoch: number;
+    processingEpoch: number;
+    leaseEpoch: number;
+    leaseToken: string;
+    leaseExpiresAt: number;
+    uri: string;
+    contentHash: string;
+    byteLength: number;
+  }>;
+};
+
+export type WorkerDiscoveryAdmitResult = {
+  operation: "discovery.admitUtf8";
+  workId: string;
+  sourceItemId: string;
+  sourceRevisionId: string;
+  processingGenerationId: string;
+  ingestJobId: string;
+  desiredProcessingEpoch: number;
+  state: "admitted";
+  reused: boolean;
+};
+
 export type WorkerResult =
   | WorkerSourceStatusResult
   | WorkerInventoryPageResult
   | WorkerScanBeginResult
   | WorkerScanAppendResult
   | WorkerScanSealResult
-  | WorkerScanReconcileResult;
+  | WorkerScanReconcileResult
+  | WorkerDiscoveryReserveResult
+  | WorkerDiscoveryAdmitResult;
 
 type JsonObject = Record<string, unknown>;
 
@@ -603,6 +650,35 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
         expectedInventoryEpoch: epoch(input.expectedInventoryEpoch),
         ordinal: integer(input.ordinal, 0, Number.MAX_SAFE_INTEGER),
         maxItems: integer(input.maxItems, 1, MAX_WORKER_RECONCILE_ITEMS),
+      };
+    case "discovery.reserve":
+      exactKeys(input, [...baseKeys, "requestId", "maxItems"]);
+      return {
+        ...base,
+        operation: "discovery.reserve",
+        requestId: requestId(input.requestId),
+        maxItems: integer(input.maxItems, 1, MAX_WORKER_RESERVATION_ITEMS),
+      };
+    case "discovery.admitUtf8":
+      exactKeys(input, [
+        ...baseKeys,
+        "requestId",
+        "workId",
+        "leaseEpoch",
+        "leaseToken",
+        "text",
+      ]);
+      return {
+        ...base,
+        operation: "discovery.admitUtf8",
+        requestId: requestId(input.requestId),
+        workId: string(input.workId, { maxUtf16: 256 }),
+        leaseEpoch: integer(input.leaseEpoch, 1, Number.MAX_SAFE_INTEGER),
+        leaseToken: string(input.leaseToken, {
+          maxUtf16: 64,
+          pattern: SHA256,
+        }),
+        text: string(input.text, { maxUtf8: 65_536 }),
       };
     default:
       return invalid();

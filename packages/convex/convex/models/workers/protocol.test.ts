@@ -84,6 +84,25 @@ describe("worker protocol parser", () => {
         maxItems: 50,
       }),
     ).toMatchObject({ operation: "scan.reconcile" });
+    expect(
+      parseWorkerRequest({
+        ...source,
+        operation: "discovery.reserve",
+        requestId: "reserve-1",
+        maxItems: 4,
+      }),
+    ).toMatchObject({ operation: "discovery.reserve", maxItems: 4 });
+    expect(
+      parseWorkerRequest({
+        ...source,
+        operation: "discovery.admitUtf8",
+        requestId: "admit-1",
+        workId: "work-id",
+        leaseEpoch: 1,
+        leaseToken: "a".repeat(64),
+        text: "alpha beta",
+      }),
+    ).toMatchObject({ operation: "discovery.admitUtf8", leaseEpoch: 1 });
   });
 
   it("rejects unknown operations and extra keys", () => {
@@ -95,6 +114,25 @@ describe("worker protocol parser", () => {
         ...source,
         operation: "source.status",
         actorId: "x",
+      }),
+    ).toThrow(WorkerProtocolParseError);
+    expect(() =>
+      parseWorkerRequest({
+        ...source,
+        operation: "discovery.reserve",
+        requestId: "reserve-too-many",
+        maxItems: 5,
+      }),
+    ).toThrow(WorkerProtocolParseError);
+    expect(() =>
+      parseWorkerRequest({
+        ...source,
+        operation: "discovery.admitUtf8",
+        requestId: "bad-token",
+        workId: "work-id",
+        leaseEpoch: 1,
+        leaseToken: "not-a-token",
+        text: "alpha",
       }),
     ).toThrow(WorkerProtocolParseError);
   });

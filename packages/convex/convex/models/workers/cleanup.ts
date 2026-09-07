@@ -4,6 +4,7 @@ import {
   WORKER_CLEANUP_BATCH_SIZE,
   WORKER_DETAIL_RETENTION_MS,
   WORKER_SCAN_RETENTION_MS,
+  WORKER_MUTATION_RATE_WINDOW_MS,
 } from "./model";
 
 const phases = [
@@ -22,10 +23,14 @@ const phases = [
   { kind: "scan", state: "needs_review" },
   { kind: "scan", state: "failed" },
   { kind: "queued_work" },
+  { kind: "reservation_target" },
+  { kind: "reservation_receipt" },
+  { kind: "operation_receipt" },
+  { kind: "rate_limit" },
 ] as const;
 
 // Phase ordering is persisted. A new layout starts a fresh, safe sweep.
-const CHECKPOINT_KEY = "v2";
+const CHECKPOINT_KEY = "v3";
 
 type Checkpoint = { cursor?: string; cutoff: number };
 type Page<T> = { page: T[]; isDone: boolean; continueCursor: string };
@@ -50,6 +55,64 @@ async function sweep(
     cursor: checkpoint.cursor ?? null,
   };
   let changed = 0;
+  if (phase.kind === "rate_limit") {
+    const page = await ctx.db
+      .query("workerProtocolRateLimits")
+      .withIndex("by_windowStartedAt", (q) =>
+        q.lte(
+          "windowStartedAt",
+          checkpoint.cutoff - WORKER_MUTATION_RATE_WINDOW_MS,
+        ),
+      )
+      .paginate(paginationOpts);
+    for (const row of page.page) {
+      await ctx.db.delete(row._id);
+      changed += 1;
+    }
+    return progress(page, changed);
+  }
+  if (phase.kind === "reservation_target") {
+    const page = await ctx.db
+      .query("workerReservationTargets")
+      .withIndex("by_leaseExpiresAt", (q) =>
+        q.lte("leaseExpiresAt", checkpoint.cutoff),
+      )
+      .paginate(paginationOpts);
+    for (const row of page.page) {
+      await ctx.db.delete(row._id);
+      changed += 1;
+    }
+    return progress(page, changed);
+  }
+  if (phase.kind === "reservation_receipt") {
+    const page = await ctx.db
+      .query("workerReservationReceipts")
+      .withIndex("by_retireAt", (q) => q.lte("retireAt", checkpoint.cutoff))
+      .paginate(paginationOpts);
+    for (const row of page.page) {
+      const target = await ctx.db
+        .query("workerReservationTargets")
+        .withIndex("by_receiptId_and_ordinal", (q) =>
+          q.eq("receiptId", row._id),
+        )
+        .first();
+      if (target) continue;
+      await ctx.db.delete(row._id);
+      changed += 1;
+    }
+    return progress(page, changed);
+  }
+  if (phase.kind === "operation_receipt") {
+    const page = await ctx.db
+      .query("workerOperationReceipts")
+      .withIndex("by_retireAt", (q) => q.lte("retireAt", checkpoint.cutoff))
+      .paginate(paginationOpts);
+    for (const row of page.page) {
+      await ctx.db.delete(row._id);
+      changed += 1;
+    }
+    return progress(page, changed);
+  }
   if (phase.kind === "queued_work") {
     const page = await ctx.db
       .query("workerDiscoveryWork")
@@ -99,6 +162,7 @@ async function sweep(
         state: "needs_review",
         leaseToken: undefined,
         leaseExpiresAt: undefined,
+        leaseOwnerCredentialId: undefined,
         nextAttemptAt: undefined,
         retireAt: now + WORKER_DETAIL_RETENTION_MS,
       });
@@ -243,11 +307,13 @@ export const removeExpired = internalMutation({
     if (state) await ctx.db.patch(state._id, fields);
     else {
       await ctx.db.insert("workerCleanupState", fields);
-      const old = await ctx.db
-        .query("workerCleanupState")
-        .withIndex("by_key", (q) => q.eq("key", "v1"))
-        .unique();
-      if (old) await ctx.db.delete(old._id);
+      for (const oldKey of ["v1", "v2"]) {
+        const old = await ctx.db
+          .query("workerCleanupState")
+          .withIndex("by_key", (q) => q.eq("key", oldKey))
+          .unique();
+        if (old) await ctx.db.delete(old._id);
+      }
     }
     return {
       phase: nextPhase,

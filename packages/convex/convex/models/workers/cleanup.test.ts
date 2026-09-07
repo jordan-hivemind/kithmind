@@ -116,7 +116,7 @@ describe("worker cleanup bounds", () => {
       }
     });
     const firstCycle = [];
-    for (let index = 0; index < 15; index += 1) {
+    for (let index = 0; index < 19; index += 1) {
       firstCycle.push(
         await f.t.mutation(internal.models.workers.cleanup.removeExpired, {}),
       );
@@ -128,7 +128,7 @@ describe("worker cleanup bounds", () => {
     });
 
     const secondCycle = [];
-    for (let index = 0; index < 15; index += 1) {
+    for (let index = 0; index < 19; index += 1) {
       secondCycle.push(
         await f.t.mutation(internal.models.workers.cleanup.removeExpired, {}),
       );
@@ -359,7 +359,7 @@ describe("worker cleanup bounds", () => {
       });
     });
 
-    for (let index = 0; index < 15; index += 1) {
+    for (let index = 0; index < 19; index += 1) {
       await f.t.mutation(internal.models.workers.cleanup.removeExpired, {});
     }
     await f.t.run(async (ctx) => {
@@ -380,7 +380,7 @@ describe("worker cleanup bounds", () => {
       await ctx.db.patch(entry._id, { discoveryWorkId: undefined });
       await ctx.db.patch(work._id, { state: "queued" });
     });
-    for (let index = 0; index < 15; index += 1) {
+    for (let index = 0; index < 19; index += 1) {
       await f.t.mutation(internal.models.workers.cleanup.removeExpired, {});
     }
     await f.t.run(async (ctx) => {
@@ -552,5 +552,194 @@ describe("worker cleanup bounds", () => {
       expect(page?.requestDigest).toBeUndefined();
       expect(page?.redactedAt).toEqual(expect.any(Number));
     });
+  });
+});
+
+describe("worker reservation receipt retention", () => {
+  test("forget invalidates a mixed receipt without deleting another item's target", async () => {
+    const f = await fixture();
+    const ids = await f.t.run(async (ctx) => {
+      const a = await createOrGetSourceItem(ctx, {
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        externalId: "receipt-a",
+        uri: "fs://synthetic/a.txt",
+      });
+      const b = await createOrGetSourceItem(ctx, {
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        externalId: "receipt-b",
+        uri: "fs://synthetic/b.txt",
+      });
+      const receiptId = await ctx.db.insert("workerReservationReceipts", {
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        kind: "discovery",
+        requestId: "shared-reservation",
+        targetCount: 2,
+        requestDigest: "a".repeat(64),
+        actorUserId: f.userId,
+        actorCredentialId: f.credentialId,
+        createdAt: 0,
+        expiresAt: 4_102_444_800_000,
+        retireAt: 4_102_444_800_000,
+      });
+      const targetIds = [];
+      for (const [ordinal, item] of [a, b].entries()) {
+        targetIds.push(
+          await ctx.db.insert("workerReservationTargets", {
+            spaceId: f.spaceId,
+            sourceAccountId: f.sourceAccountId,
+            sourceItemId: item._id,
+            receiptId,
+            ordinal,
+            leaseEpoch: 1,
+            leaseToken: String(ordinal).repeat(64),
+            leaseExpiresAt: 4_102_444_800_000,
+          }),
+        );
+      }
+      return { a: a._id, b: b._id, receiptId, targetIds };
+    });
+    await f.t.run((ctx) =>
+      beginForgetFromWeb(ctx, {
+        principal: { userId: f.userId },
+        sourceItemId: ids.a,
+        now: 1,
+      }),
+    );
+    const first = await f.t.run((ctx) =>
+      continueForgetFromWeb(ctx, {
+        principal: { userId: f.userId },
+        sourceItemId: ids.a,
+      }),
+    );
+    expect(first).toMatchObject({
+      phase: "workerReservationTargets",
+      deleted: 1,
+      done: false,
+    });
+    for (let i = 0; i < 20; i++) {
+      const result = await f.t.run((ctx) =>
+        continueForgetFromWeb(ctx, {
+          principal: { userId: f.userId },
+          sourceItemId: ids.a,
+        }),
+      );
+      if (result.done) break;
+    }
+    await f.t.run(async (ctx) => {
+      expect(await ctx.db.get(ids.a)).toMatchObject({ lifecycle: "forgotten" });
+      expect(await ctx.db.get(ids.b)).toMatchObject({ lifecycle: "available" });
+      expect(await ctx.db.get(ids.targetIds[0]!)).toBeNull();
+      expect(await ctx.db.get(ids.targetIds[1]!)).toMatchObject({
+        leaseEpoch: 1,
+        leaseToken: "1".repeat(64),
+      });
+      expect(await ctx.db.get(ids.receiptId)).toMatchObject({
+        invalidatedAt: expect.any(Number),
+      });
+    });
+  });
+
+  test("receipt cleanup passes a pinned prefix and preserves unexpired targets", async () => {
+    const f = await fixture();
+    const tailId = await f.t.run(async (ctx) => {
+      const item = await createOrGetSourceItem(ctx, {
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        externalId: "receipt-retention",
+        uri: "fs://synthetic/retention.txt",
+      });
+      let lastId;
+      for (let i = 0; i < 26; i++) {
+        lastId = await ctx.db.insert("workerReservationReceipts", {
+          spaceId: f.spaceId,
+          sourceAccountId: f.sourceAccountId,
+          kind: "discovery",
+          requestId: `reservation-${i}`,
+          targetCount: i < 25 ? 1 : 0,
+          requestDigest: "a".repeat(64),
+          actorUserId: f.userId,
+          actorCredentialId: f.credentialId,
+          createdAt: 0,
+          expiresAt: 0,
+          retireAt: i,
+        });
+        if (i < 25)
+          await ctx.db.insert("workerReservationTargets", {
+            spaceId: f.spaceId,
+            sourceAccountId: f.sourceAccountId,
+            sourceItemId: item._id,
+            receiptId: lastId,
+            ordinal: 0,
+            leaseEpoch: 1,
+            leaseToken: "a".repeat(64),
+            leaseExpiresAt: 4_102_444_800_000,
+          });
+      }
+      return lastId!;
+    });
+    for (let i = 0; i < 19; i++) {
+      const result = await f.t.mutation(
+        internal.models.workers.cleanup.removeExpired,
+        {},
+      );
+      expect(result.inspected).toBeLessThanOrEqual(25);
+    }
+    await f.t.run(async (ctx) => {
+      expect(await ctx.db.get(tailId)).not.toBeNull();
+    });
+    for (let i = 0; i < 19; i++) {
+      const result = await f.t.mutation(
+        internal.models.workers.cleanup.removeExpired,
+        {},
+      );
+      expect(result.inspected).toBeLessThanOrEqual(25);
+    }
+    await f.t.run(async (ctx) => {
+      expect(await ctx.db.get(tailId)).toBeNull();
+      expect(
+        await ctx.db.query("workerReservationTargets").collect(),
+      ).toHaveLength(25);
+      expect(
+        await ctx.db.query("workerReservationReceipts").collect(),
+      ).toHaveLength(25);
+    });
+  });
+});
+
+test("rate window cleanup preserves current limits and removes expired key state", async () => {
+  const f = await fixture();
+  const ids = await f.t.run(async (ctx) => {
+    const retiredCredentialId = await ctx.db.insert("apiKeys", {
+      userId: f.userId,
+      keyHash: "b".repeat(64),
+      keyPrefix: "retired",
+      name: "Retired worker",
+      capabilities: ["ingest"],
+      spaceIds: [f.spaceId],
+      sourceAccountIds: [f.sourceAccountId],
+    });
+    const expired = await ctx.db.insert("workerProtocolRateLimits", {
+      credentialId: retiredCredentialId,
+      sourceAccountId: f.sourceAccountId,
+      windowStartedAt: 0,
+      count: 60,
+    });
+    const live = await ctx.db.insert("workerProtocolRateLimits", {
+      credentialId: f.credentialId,
+      sourceAccountId: f.sourceAccountId,
+      windowStartedAt: Date.now(),
+      count: 60,
+    });
+    await ctx.db.delete(retiredCredentialId);
+    return { expired, live };
+  });
+  for (let i = 0; i < 19; i++)
+    await f.t.mutation(internal.models.workers.cleanup.removeExpired, {});
+  await f.t.run(async (ctx) => {
+    expect(await ctx.db.get(ids.expired)).toBeNull();
+    expect(await ctx.db.get(ids.live)).toMatchObject({ count: 60 });
   });
 });
