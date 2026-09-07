@@ -54,6 +54,7 @@ export const factStatus = v.union(
 
 export const entityFields = {
   userId: v.id("users"),
+  spaceId: v.optional(v.id("spaces")),
   key: v.string(),
   kind: entityKind,
   canonicalName: v.string(),
@@ -65,6 +66,7 @@ export const entityFields = {
 
 export const factFields = {
   userId: v.id("users"),
+  spaceId: v.optional(v.id("spaces")),
   subjectEntityId: v.id("entities"),
   predicate: v.string(),
   value: factValue,
