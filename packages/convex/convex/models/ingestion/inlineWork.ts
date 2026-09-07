@@ -17,6 +17,7 @@ import {
   failJob,
   type AdmissionResult,
 } from "./model";
+import { requireInlineSourceRevision } from "../provenance/representations";
 
 export const INLINE_WORK_BATCH_SIZE = 10;
 export const INLINE_WORK_LEASE_MS = MAX_LEASE_MS;
@@ -406,7 +407,7 @@ export async function claimInlineWork(
       leaseEpoch: claim.leaseEpoch,
       leaseToken: args.leaseToken,
       alreadyStaged: claim.state === "staged",
-      text: revision.inlineText,
+      text: requireInlineSourceRevision(revision).text,
       title: item.title ?? "Untitled",
       docType: item.docType ?? "generic",
       capturedAt: revision.capturedAt,

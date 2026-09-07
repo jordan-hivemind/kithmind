@@ -150,6 +150,80 @@ describe("immutable provenance", () => {
     ).rejects.toThrow("Conflicting immutable source revision");
   });
 
+  test("does not reuse a binary revision through the legacy text identity", async () => {
+    const t = convexTest(schema, modules);
+    const base = await seedSpaceAndAccount(t, "representation-conflict");
+    const itemId = await t.run(async (ctx) => {
+      const item = await createOrGetSourceItem(ctx, {
+        spaceId: base.spaceId,
+        sourceAccountId: base.sourceAccountId,
+        externalId: "source://binary-conflict",
+      });
+      await ctx.db.insert("sourceRevisions", {
+        spaceId: base.spaceId,
+        sourceItemId: item._id,
+        representation: "archived_binary_v1",
+        contentHashAuthority: "worker_asserted",
+        contentHash:
+          "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        byteLength: 3,
+        mediaType: "application/pdf",
+        capturedAt: 10,
+        userId: base.userId,
+      });
+      return item._id;
+    });
+    await expect(
+      t.run((ctx) =>
+        createOrGetRevision(ctx, {
+          spaceId: base.spaceId,
+          sourceItemId: itemId,
+          mediaType: "application/pdf",
+          inlineText: "abc",
+          capturedAt: 10,
+          userId: base.userId,
+        }),
+      ),
+    ).rejects.toThrow("Conflicting immutable source revision");
+  });
+
+  test("replays exact explicit inline representation rows", async () => {
+    const t = convexTest(schema, modules);
+    const seeded = await seedRevisionAndTextVersion(t, "explicit😀");
+    await t.run(async (ctx) => {
+      await ctx.db.patch(seeded.revision._id, {
+        representation: "inline_utf8_v1",
+        contentHashAuthority: "server_verified_utf8",
+      });
+      await ctx.db.patch(seeded.textVersion._id, {
+        representation: "inline_text_v1",
+        textHashAuthority: "server_verified_retained_text",
+      });
+    });
+    await expect(
+      t.run((ctx) =>
+        createOrGetRevision(ctx, {
+          spaceId: seeded.spaceId,
+          sourceItemId: seeded.item._id,
+          mediaType: "text/plain",
+          inlineText: "explicit😀",
+          capturedAt: 1_700_000_000_000,
+          userId: seeded.userId,
+        }),
+      ),
+    ).resolves.toMatchObject({ _id: seeded.revision._id });
+    await expect(
+      t.run((ctx) =>
+        createOrGetTextVersion(ctx, {
+          spaceId: seeded.spaceId,
+          sourceRevisionId: seeded.revision._id,
+          extractionFingerprint: "plain-text:v1",
+          text: "explicit😀",
+        }),
+      ),
+    ).resolves.toMatchObject({ _id: seeded.textVersion._id });
+  });
+
   test("validates exact UTF-16 page and evidence boundaries", async () => {
     const t = convexTest(schema, modules);
     const seeded = await seedRevisionAndTextVersion(t);

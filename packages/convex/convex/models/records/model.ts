@@ -1,6 +1,10 @@
 import type { Doc, Id } from "../../_generated/dataModel";
 import type { MutationCtx, QueryCtx } from "../../_generated/server";
 import { sha256Utf8 } from "../provenance/model";
+import {
+  requireInlineSourceRevision,
+  requireInlineSourceTextVersion,
+} from "../provenance/representations";
 
 import type { ObservationValue, Occurrence } from "./values";
 import {
@@ -40,6 +44,8 @@ type GenerationChain = {
   sourceItem: Doc<"sourceItems">;
   sourceRevision: Doc<"sourceRevisions">;
   sourceTextVersion: Doc<"sourceTextVersions">;
+  sourceRevisionText: string;
+  sourceText: string;
   generation: Doc<"processingGenerations">;
 };
 
@@ -389,11 +395,6 @@ async function requireGenerationChain(
       ctx.db.get(generation.sourceRevisionId),
       ctx.db.get(generation.sourceTextVersionId),
     ]);
-  reserveLoadedBytes(
-    cache,
-    (sourceRevision ? utf8Length(sourceRevision.inlineText) : 0) +
-      (sourceTextVersion ? utf8Length(sourceTextVersion.text) : 0),
-  );
   if (!space) throw new Error("Record space does not exist");
   if (!sourceAccount || sourceAccount.spaceId !== spaceId) {
     throw new Error("Generation source account belongs to another space");
@@ -419,12 +420,20 @@ async function requireGenerationChain(
   ) {
     throw new Error("Generation source text version parent chain is invalid");
   }
+  const sourceRevisionText = requireInlineSourceRevision(sourceRevision).text;
+  const sourceText = requireInlineSourceTextVersion(sourceTextVersion).text;
+  reserveLoadedBytes(
+    cache,
+    utf8Length(sourceRevisionText) + utf8Length(sourceText),
+  );
   const chain = {
     space,
     sourceAccount,
     sourceItem,
     sourceRevision,
     sourceTextVersion,
+    sourceRevisionText,
+    sourceText,
     generation,
   };
   cache?.generationChains.set(processingGenerationId, chain);
@@ -495,14 +504,12 @@ async function requireEvidence(
     }
     if (!cache.validatedPageIds.has(page._id)) {
       requireUtf16Range(
-        chain.sourceTextVersion.text,
+        chain.sourceText,
         page.start,
         page.end,
         `${label} source page`,
       );
-      if (
-        chain.sourceTextVersion.text.slice(page.start, page.end) !== page.text
-      ) {
+      if (chain.sourceText.slice(page.start, page.end) !== page.text) {
         throw new Error(
           `${label} source page text does not match its text version`,
         );

@@ -39,6 +39,10 @@ import {
   stagePages,
 } from "../provenance/model";
 import {
+  requireInlineSourceRevision,
+  requireInlineSourceTextVersion,
+} from "../provenance/representations";
+import {
   digestDecodedAdmissionEnvelope,
   digestProcessingConfiguration,
   utf8ByteLength,
@@ -958,15 +962,17 @@ async function verifyGenerationPayload(
   ) {
     throw new Error("Processing generation text parent chain is invalid");
   }
+  const inlineRevision = requireInlineSourceRevision(revision);
+  const inlineTextVersion = requireInlineSourceTextVersion(textVersion);
   if (
-    revision.byteLength !== utf8ByteLength(revision.inlineText) ||
-    (await sha256Utf8(revision.inlineText)) !== revision.contentHash
+    revision.byteLength !== utf8ByteLength(inlineRevision.text) ||
+    (await sha256Utf8(inlineRevision.text)) !== revision.contentHash
   ) {
     throw new Error("Source revision length or content hash is invalid");
   }
   if (
-    textVersion.byteLength !== utf8ByteLength(textVersion.text) ||
-    (await sha256Utf8(textVersion.text)) !== textVersion.textHash
+    textVersion.byteLength !== utf8ByteLength(inlineTextVersion.text) ||
+    (await sha256Utf8(inlineTextVersion.text)) !== textVersion.textHash
   ) {
     throw new Error("Source text version length or hash is invalid");
   }
@@ -999,16 +1005,16 @@ async function verifyGenerationPayload(
     if (
       page.start !== pageCursor ||
       page.end < page.start ||
-      splitsSurrogatePair(textVersion.text, page.start) ||
-      splitsSurrogatePair(textVersion.text, page.end) ||
-      textVersion.text.slice(page.start, page.end) !== page.text ||
+      splitsSurrogatePair(inlineTextVersion.text, page.start) ||
+      splitsSurrogatePair(inlineTextVersion.text, page.end) ||
+      inlineTextVersion.text.slice(page.start, page.end) !== page.text ||
       (await sha256Utf8(page.text)) !== page.textHash
     ) {
       throw new Error("Page text coverage or hash is invalid");
     }
     pageCursor = page.end;
   }
-  if (pageCursor !== textVersion.text.length) {
+  if (pageCursor !== inlineTextVersion.text.length) {
     throw new Error("Pages do not exactly cover the source text version");
   }
   const spanIds = new Set(spans.map((span) => span._id));

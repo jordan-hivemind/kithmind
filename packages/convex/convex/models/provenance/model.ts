@@ -3,6 +3,12 @@ import { invalidateRecordQueriesForForget } from "../records/querySessions";
 import type { Doc, Id } from "../../_generated/dataModel";
 import type { MutationCtx, QueryCtx } from "../../_generated/server";
 import { deleteChunkEmbeddingVectors } from "../embeddings/model";
+import {
+  parseSourceRevisionRepresentation,
+  parseSourceTextRepresentation,
+  requireInlineSourceRevision,
+  requireInlineSourceTextVersion,
+} from "./representations";
 
 export const MAX_SOURCE_INLINE_UTF8_BYTES = 65_536;
 export const MAX_SOURCE_PAGES = 32;
@@ -334,6 +340,7 @@ async function requireSourceRevision(
   if (!revision) throw new Error("Source revision does not exist");
   if (revision.spaceId !== spaceId)
     throw new Error("Source revision belongs to another space");
+  parseSourceRevisionRepresentation(revision);
   return revision;
 }
 
@@ -347,6 +354,7 @@ async function requireTextVersion(
   if (textVersion.spaceId !== spaceId) {
     throw new Error("Source text version belongs to another space");
   }
+  parseSourceTextRepresentation(textVersion);
   return textVersion;
 }
 
@@ -459,7 +467,15 @@ export async function createOrGetRevision(
     throw new Error("Source revision identity is not unique");
   const existing = matches[0];
   if (existing) {
+    let isInlineUtf8 = false;
+    try {
+      const parsed = parseSourceRevisionRepresentation(existing);
+      isInlineUtf8 = parsed.kind === "inline_utf8_v1";
+    } catch {
+      // The immutable conflict below intentionally hides corrupt row details.
+    }
     if (
+      !isInlineUtf8 ||
       existing.spaceId !== input.spaceId ||
       existing.sourceItemId !== input.sourceItemId ||
       existing.contentHash !== contentHash ||
@@ -522,7 +538,12 @@ export async function createOrGetTextVersion(
   ctx: MutationCtx,
   input: SourceTextVersionInput,
 ): Promise<Doc<"sourceTextVersions">> {
-  await requireSourceRevision(ctx, input.sourceRevisionId, input.spaceId);
+  const revision = await requireSourceRevision(
+    ctx,
+    input.sourceRevisionId,
+    input.spaceId,
+  );
+  requireInlineSourceRevision(revision);
   requireBoundedUtf8(
     input.extractionFingerprint,
     "Extraction fingerprint",
@@ -547,7 +568,15 @@ export async function createOrGetTextVersion(
     throw new Error("Source text version identity is not unique");
   const existing = matches[0];
   if (existing) {
+    let isInlineText = false;
+    try {
+      const parsed = parseSourceTextRepresentation(existing);
+      isInlineText = parsed.kind === "inline_text_v1";
+    } catch {
+      // The immutable conflict below intentionally hides corrupt row details.
+    }
     if (
+      !isInlineText ||
       existing.spaceId !== input.spaceId ||
       existing.text !== input.text ||
       existing.textHash !== textHash ||
@@ -588,6 +617,7 @@ export async function stagePages(
     input.sourceTextVersionId,
     input.spaceId,
   );
+  const inlineTextVersion = requireInlineSourceTextVersion(textVersion);
   const existingTotal = await ctx.db
     .query("sourcePages")
     .withIndex("by_sourceTextVersionId", (q) =>
@@ -610,11 +640,11 @@ export async function stagePages(
     if (newOrdinals.has(page.ordinal))
       throw new Error("Page batch contains duplicate ordinals");
     newOrdinals.add(page.ordinal);
-    requireUtf16Boundary(textVersion.text, page.start, "Page start");
-    requireUtf16Boundary(textVersion.text, page.end, "Page end");
+    requireUtf16Boundary(inlineTextVersion.text, page.start, "Page start");
+    requireUtf16Boundary(inlineTextVersion.text, page.end, "Page end");
     if (page.end < page.start)
       throw new Error("Page end must be at or after page start");
-    if (textVersion.text.slice(page.start, page.end) !== page.text) {
+    if (inlineTextVersion.text.slice(page.start, page.end) !== page.text) {
       throw new Error("Page text does not match its full-text UTF-16 range");
     }
     const textHash = await sha256Utf8(page.text);
@@ -1342,15 +1372,17 @@ export async function inspectGenerationPayload(
   ) {
     throw new Error("Generation source parent chain is invalid");
   }
+  const inlineRevision = requireInlineSourceRevision(revision);
+  const inlineTextVersion = requireInlineSourceTextVersion(textVersion);
   if (
-    textVersion.byteLength !== utf8Length(textVersion.text) ||
-    textVersion.textHash !== (await sha256Utf8(textVersion.text))
+    textVersion.byteLength !== utf8Length(inlineTextVersion.text) ||
+    textVersion.textHash !== (await sha256Utf8(inlineTextVersion.text))
   ) {
     throw new Error("Source text version hash or byte length is invalid");
   }
   if (
-    revision.byteLength !== utf8Length(revision.inlineText) ||
-    revision.contentHash !== (await sha256Utf8(revision.inlineText))
+    revision.byteLength !== utf8Length(inlineRevision.text) ||
+    revision.contentHash !== (await sha256Utf8(inlineRevision.text))
   ) {
     throw new Error("Source revision hash or byte length is invalid");
   }
@@ -1409,15 +1441,15 @@ export async function inspectGenerationPayload(
     if (page.ordinal !== index) {
       throw new Error("Generation page ordinals must be contiguous from zero");
     }
-    requireUtf16Boundary(textVersion.text, page.start, "Page start");
-    requireUtf16Boundary(textVersion.text, page.end, "Page end");
+    requireUtf16Boundary(inlineTextVersion.text, page.start, "Page start");
+    requireUtf16Boundary(inlineTextVersion.text, page.end, "Page end");
     if (page.end < page.start) throw new Error("Page end precedes page start");
     if (page.start !== expectedStart) {
       throw new Error(
         "Generation pages do not contiguously cover extracted text",
       );
     }
-    if (textVersion.text.slice(page.start, page.end) !== page.text) {
+    if (inlineTextVersion.text.slice(page.start, page.end) !== page.text) {
       throw new Error("Generation page text does not match extracted text");
     }
     if (page.textHash !== (await sha256Utf8(page.text))) {
@@ -1425,7 +1457,7 @@ export async function inspectGenerationPayload(
     }
     expectedStart = page.end;
   }
-  if (expectedStart !== textVersion.text.length) {
+  if (expectedStart !== inlineTextVersion.text.length) {
     throw new Error("Generation pages do not completely cover extracted text");
   }
   const pageIds = new Set(pages.map((page) => page._id));

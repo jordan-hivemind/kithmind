@@ -578,6 +578,15 @@ generation's document and chunk transition payload is within the 1 MiB prior
 generation budget. A failure blocks the binary profile rather than rewriting
 the legacy generation.
 
+The initial foundation exposes `auditLegacyProvenance` as a read-only,
+paginated diagnostic for representation shape, parent references and inline
+hashes. Its result explicitly reports
+`scope: representations_parents_inline_hashes_only` and
+`binaryEnablementReady: false`. It does not yet inspect child pages, evidence,
+generation payloads, or the prior-generation transition budget. Add those
+bounded checks before using an audit to enable the binary profile. A successful
+foundation diagnostic does not satisfy the full pre-enable audit above.
+
 The migration adds optional fields and new tables and indexes. New helpers
 must parse the closed branches and reject malformed mixed rows. Existing
 capture, generic `admitSourceRevision`, `discovery.admitUtf8`, and
@@ -595,7 +604,7 @@ verification pass.
 
 | Slice                                   | Reviewable outcome                                                                                                                                                           | Completion evidence                                                                                                                                            |
 | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1. Contract and audit                   | This public contract plus a bounded legacy audit and dry-run report shape.                                                                                                   | Mixed or corrupt representations fail; valid legacy rows pass without writes.                                                                                  |
+| 1. Contract and audit                   | This contract plus a bounded representation/parent/hash diagnostic. Full payload audit remains required before binary enablement.                                            | Mixed or corrupt representations fail; valid legacy rows pass without writes.                                                                                  |
 | 2. Provenance schema                    | Closed revision/text branches, raw parser artifacts, immutable receipts, mutable role bindings, payload manifests, availability, restore verifications, and bounded indexes. | Model tests cover exact replay, additive archive repair, immutable conflicts, parent isolation, and serialized sizes. This slice alone does not complete P2-9. |
 | 3. Archive adapter and journal          | One selected encrypted archive implementation, independent backup, stable receipt intents, and bounded parser-artifact storage.                                              | Crash after archive write reuses IDs; tamper, wrong key, missing copy, and independent restore are distinct verified outcomes.                                 |
 | 4. Binary admission                     | New worker discovery representation and `admitArchived` operation with full current-chain validation.                                                                        | Same-item/hash representation conflicts fail; stale, revoked, cross-space, changed-epoch, and changed-receipt requests make no writes.                         |
@@ -654,8 +663,11 @@ The development verification uses synthetic documents only and must cover:
     stops, hosted reads disappear immediately, archive deletion remains
     retryable, and only the allowed tombstone survives.
 
-Owner documents remain gated on the archive comparison, representative
-playbooks, monitoring, final portable export and isolated restore, and the
-measured owner pilot. Passing synthetic binary fixtures establishes this
+The first bounded owner document-Q&A trial requires archive verification,
+basic monitoring, source identity recovery, final portable export and isolated
+restore against its exact schema, and measured citation acceptance. It publishes
+no automatic structured observations and leaves record/date coverage
+`not_established`. Representative playbooks and their review workflows are
+additional gates before automatic structured-record publication. Passing synthetic binary fixtures establishes this
 contract's implementation. It does not establish general PDF quality or
 production recovery objectives.

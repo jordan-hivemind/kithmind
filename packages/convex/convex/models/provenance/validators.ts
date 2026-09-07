@@ -19,6 +19,38 @@ export const publicationStateValidator = v.union(
   v.literal("historical"),
 );
 
+export const sourceRevisionRepresentationValidator = v.union(
+  v.literal("inline_utf8_v1"),
+  v.literal("archived_binary_v1"),
+);
+
+export const sourceContentHashAuthorityValidator = v.union(
+  v.literal("server_verified_utf8"),
+  v.literal("worker_asserted"),
+);
+
+export const sourceTextRepresentationValidator = v.union(
+  v.literal("inline_text_v1"),
+  v.literal("parsed_pages_v1"),
+);
+
+export const sourceTextHashAuthorityValidator = v.literal(
+  "server_verified_retained_text",
+);
+
+export const parserArtifactHashAuthorityValidator =
+  v.literal("worker_asserted");
+
+export const archiveSubjectKindValidator = v.union(
+  v.literal("original_bytes"),
+  v.literal("parser_output"),
+);
+
+export const archiveCopyRoleValidator = v.union(
+  v.literal("primary"),
+  v.literal("independent_backup"),
+);
+
 export const evidenceLocatorValidator = v.union(
   v.object({
     kind: v.literal("page"),
@@ -80,7 +112,9 @@ export const sourceRevisionFields = {
   contentHash: v.string(),
   byteLength: v.number(),
   mediaType: v.string(),
-  inlineText: v.string(),
+  representation: v.optional(sourceRevisionRepresentationValidator),
+  contentHashAuthority: v.optional(sourceContentHashAuthorityValidator),
+  inlineText: v.optional(v.string()),
   capturedAt: v.number(),
   userId: v.id("users"),
   archiveRef: v.optional(v.string()),
@@ -90,10 +124,63 @@ export const sourceTextVersionFields = {
   spaceId: v.id("spaces"),
   sourceRevisionId: v.id("sourceRevisions"),
   extractionFingerprint: v.string(),
-  text: v.string(),
+  representation: v.optional(sourceTextRepresentationValidator),
+  text: v.optional(v.string()),
   textHash: v.string(),
+  textHashAuthority: v.optional(sourceTextHashAuthorityValidator),
   byteLength: v.number(),
+  utf16Length: v.optional(v.number()),
+  pageCount: v.optional(v.number()),
+  mappingManifestHash: v.optional(v.string()),
+  parserArtifactId: v.optional(v.id("sourceParserArtifacts")),
   evidenceSealed: v.boolean(),
+};
+
+export const sourceParserArtifactFields = {
+  spaceId: v.id("spaces"),
+  sourceAccountId: v.id("sourceAccounts"),
+  sourceItemId: v.id("sourceItems"),
+  sourceRevisionId: v.id("sourceRevisions"),
+  clientArtifactId: v.string(),
+  parserFingerprint: v.string(),
+  outputHash: v.string(),
+  outputByteLength: v.number(),
+  outputMediaType: v.string(),
+  hashAuthority: parserArtifactHashAuthorityValidator,
+  userId: v.id("users"),
+  actorCredentialId: v.id("apiKeys"),
+  createdAt: v.number(),
+};
+
+export const sourceArtifactArchiveReceiptFields = {
+  spaceId: v.id("spaces"),
+  sourceAccountId: v.id("sourceAccounts"),
+  sourceItemId: v.id("sourceItems"),
+  sourceRevisionId: v.id("sourceRevisions"),
+  parserArtifactId: v.optional(v.id("sourceParserArtifacts")),
+  subjectKind: archiveSubjectKindValidator,
+  copyRole: archiveCopyRoleValidator,
+  clientReceiptId: v.string(),
+  requestDigest: v.string(),
+  receiptVersion: v.literal("archive_receipt_v1"),
+  archiveRepresentation: v.literal("age_encrypted_v1"),
+  archiveProfileFingerprint: v.string(),
+  archiveIdentityFingerprint: v.string(),
+  recipientFingerprint: v.string(),
+  repositoryKeyDomainFingerprint: v.string(),
+  storageFailureDomainFingerprint: v.string(),
+  archiveObjectId: v.string(),
+  plaintextHash: v.string(),
+  plaintextByteLength: v.number(),
+  plaintextMediaType: v.string(),
+  hashAuthority: parserArtifactHashAuthorityValidator,
+  ciphertextHash: v.string(),
+  ciphertextByteLength: v.number(),
+  verificationKind: v.literal("ciphertext_readback_sha256"),
+  readbackVerifiedAt: v.number(),
+  userId: v.id("users"),
+  actorCredentialId: v.id("apiKeys"),
+  createdAt: v.number(),
 };
 
 export const sourcePageFields = {
