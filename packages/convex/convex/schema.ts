@@ -104,9 +104,21 @@ export default defineSchema({
     .index("by_personalSpaceId", ["personalSpaceId"]),
   apiKeys: defineTable(apiKeyFields)
     .index("by_keyHash", ["keyHash"])
-    .index("by_userId", ["userId"]),
+    .index("by_userId", ["userId"])
+    .index("by_userId_and_oauthLifecycle", ["userId", "oauthLifecycle"])
+    .index("by_userId_oauthLifecycle_grantExpiresAt", [
+      "userId",
+      "oauthLifecycle",
+      "oauthGrantExpiresAt",
+    ])
+    .index("by_userId_and_oauthRequestHash", ["userId", "oauthRequestHash"])
+    .index("by_oauthLifecycle_and_oauthGrantExpiresAt", [
+      "oauthLifecycle",
+      "oauthGrantExpiresAt",
+    ]),
   consumedOAuthCodes: defineTable(consumedOAuthCodeFields)
     .index("by_codeHash", ["codeHash"])
+    .index("by_userId_and_requestHash", ["userId", "requestHash"])
     .index("by_expiresAt", ["expiresAt"]),
   reports: defineTable(reportFields).index("by_userId", ["userId"]),
   insights: defineTable(insightFields)

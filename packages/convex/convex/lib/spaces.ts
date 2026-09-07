@@ -5,6 +5,7 @@ import {
   insertMissingPersonalSpaceRecords,
   inspectPersonalSpace,
 } from "../models/spaces/model";
+import { hasNoOAuthLifecycle } from "../models/apiKeys/validators";
 
 export type Capability = "read" | "write" | "ingest";
 export type SpaceOperation = Capability;
@@ -60,6 +61,9 @@ export function principalFromApiKey(
   expectedUserId?: Id<"users">,
 ): Principal {
   if (expectedUserId !== undefined && key.userId !== expectedUserId) {
+    throw new Error("Not authenticated");
+  }
+  if (!hasNoOAuthLifecycle(key)) {
     throw new Error("Not authenticated");
   }
   if (!isFullyScopedKey(key)) {

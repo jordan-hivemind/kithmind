@@ -10,6 +10,13 @@ type McpIdentity = {
   keyId: string;
 };
 
+export type OAuthExchangeClaims = {
+  keyHash: string;
+  codeHash: string;
+  bindingHash: string;
+  requestHash: string;
+};
+
 function parseJwk(value: string, variableName: string): JWK {
   try {
     const parsed = JSON.parse(value) as unknown;
@@ -48,6 +55,7 @@ export function getPublicMcpJwk(): JWK & { kid: string } {
 
 export async function createConvexMcpToken(
   identity: McpIdentity,
+  exchange?: OAuthExchangeClaims,
 ): Promise<string> {
   const issuer = getMcpIssuer();
   const privateJwk = parseJwk(
@@ -61,7 +69,18 @@ export async function createConvexMcpToken(
   const keyId = process.env.MCP_JWT_KEY_ID ?? "mcp-1";
   const signingKey = await importJWK(privateJwk, MCP_JWT_ALGORITHM);
 
-  return await new SignJWT({ apiKeyId: identity.keyId })
+  return await new SignJWT({
+    apiKeyId: identity.keyId,
+    ...(exchange
+      ? {
+          oauthPurpose: "authorization_code_exchange",
+          oauthKeyHash: exchange.keyHash,
+          oauthCodeHash: exchange.codeHash,
+          oauthBindingHash: exchange.bindingHash,
+          oauthRequestHash: exchange.requestHash,
+        }
+      : {}),
+  })
     .setProtectedHeader({
       alg: MCP_JWT_ALGORITHM,
       kid: keyId,

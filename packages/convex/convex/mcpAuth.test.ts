@@ -344,7 +344,7 @@ describe("MCP account isolation", () => {
     ).not.toBeNull();
   });
 
-  test("OAuth replay bookkeeping accepts any current scoped key only once", async () => {
+  test("activates a pending OAuth key once and revokes it on validated replay", async () => {
     const t = convexTest(schema, modules);
     const seeded = await t.run(async (ctx) => {
       const userId = await ctx.db.insert("users", {});
@@ -365,6 +365,14 @@ describe("MCP account isolation", () => {
         name: "read shared",
         capabilities: ["read"],
         spaceIds: [sharedSpaceId],
+        sourceAccountIds: [],
+        oauthLifecycle: "pending",
+        oauthRequestHash: "b".repeat(64),
+        oauthCodeHash: "a".repeat(64),
+        oauthBindingHash: "d".repeat(64),
+        oauthBindingSeedHash: "e".repeat(64),
+        oauthEncryptedCode: "obac1.synthetic",
+        oauthGrantExpiresAt: Date.now() + 5 * 60 * 1000,
       });
       return { userId, keyId };
     });
@@ -372,21 +380,40 @@ describe("MCP account isolation", () => {
       issuer,
       subject: seeded.userId,
       apiKeyId: seeded.keyId,
+      oauthPurpose: "authorization_code_exchange",
+      oauthKeyHash: "c".repeat(64),
+      oauthCodeHash: "a".repeat(64),
+      oauthBindingHash: "d".repeat(64),
+      oauthRequestHash: "b".repeat(64),
     });
     const codeHash = "a".repeat(64);
-    const expiresAt = Date.now() + 5 * 60 * 1000;
-    await caller.mutation(
-      api.models.oauth.mcpMutations.consumeAuthorizationCode,
-      {
-        codeHash,
-        expiresAt,
-      },
+    const expiresAt = await t.run(
+      async (ctx) => (await ctx.db.get(seeded.keyId))!.oauthGrantExpiresAt!,
     );
-    await expect(
-      caller.mutation(api.models.oauth.mcpMutations.consumeAuthorizationCode, {
-        codeHash,
-        expiresAt,
-      }),
-    ).rejects.toThrow("Authorization code already used");
+    expect(
+      await caller.mutation(
+        api.models.oauth.mcpMutations.activateAuthorizationGrant,
+        {
+          codeHash,
+          keyHash: "c".repeat(64),
+          bindingHash: "d".repeat(64),
+          requestHash: "b".repeat(64),
+          expiresAt,
+        },
+      ),
+    ).toEqual({ status: "activated" });
+    expect(
+      await caller.mutation(
+        api.models.oauth.mcpMutations.activateAuthorizationGrant,
+        {
+          codeHash,
+          keyHash: "c".repeat(64),
+          bindingHash: "d".repeat(64),
+          requestHash: "b".repeat(64),
+          expiresAt,
+        },
+      ),
+    ).toEqual({ status: "replayed" });
+    expect(await t.run((ctx) => ctx.db.get(seeded.keyId))).toBeNull();
   });
 });

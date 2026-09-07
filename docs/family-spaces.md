@@ -14,11 +14,11 @@ thoughts, source records, and typed observations.
 Open **Spaces** to create a shared space and manage its members. The supported
 roles are:
 
-| Role | Access |
-| --- | --- |
-| Owner | Read and write shared content; invite, approve, revoke, remove, change roles, and transfer ownership |
-| Editor | Read and write shared content |
-| Reader | Read shared content |
+| Role   | Access                                                                                               |
+| ------ | ---------------------------------------------------------------------------------------------------- |
+| Owner  | Read and write shared content; invite, approve, revoke, remove, change roles, and transfer ownership |
+| Editor | Read and write shared content                                                                        |
+| Reader | Read shared content                                                                                  |
 
 Only an owner can manage membership. An owner can make another member an
 owner, which changes the original owner to editor, or leave when another live
@@ -100,3 +100,9 @@ Phase 1 surface. Native mobile validation is P2. Phase 1 supports bounded
 inline text capture and the family, people, destination, source-identity, and
 key-scope controls described here. It does not yet provide automatic
 connectors, polling, URL fetching, OCR, model extraction, or bulk backfill.
+
+### OAuth and credential management
+
+OAuth consent creates a temporary grant. It becomes an active credential only after the client exchanges the authorization code. Unfinished grants expire after five minutes. Repeating the same pending consent returns the same code; reusing a consumed code is rejected and revokes its associated credential. Start a fresh authorization if a token response was lost.
+
+Settings shows active keys in pages of 25. Use **Load more** to reach older keys; every loaded key can be revoked. Pending grants are not active keys and do not appear in this list. See the [OAuth lifecycle contract](plans/2026-09-07-oauth-lifecycle.md) for limits and deployment behavior.

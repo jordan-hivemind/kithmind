@@ -130,6 +130,20 @@ export function hashAuthorizationCode(code: string): string {
   return crypto.createHash("sha256").update(code, "utf8").digest("hex");
 }
 
+export function hashApiKeyCredential(rawKey: string): string {
+  return crypto.createHash("sha256").update(rawKey, "utf8").digest("hex");
+}
+
+export function hashOAuthBinding(
+  bindingSeedHash: string,
+  codeHash: string,
+): string {
+  return crypto
+    .createHash("sha256")
+    .update(`oauth-binding-v1\0${bindingSeedHash}\0${codeHash}`, "utf8")
+    .digest("hex");
+}
+
 export function hasTrustedOAuthOrigin(req: Request): boolean {
   return req.headers.get("origin") === getMcpIssuer();
 }

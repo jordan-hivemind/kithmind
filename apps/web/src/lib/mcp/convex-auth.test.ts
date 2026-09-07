@@ -54,6 +54,30 @@ describe("MCP Convex JWTs", () => {
     ).rejects.toThrow("MCP_JWT_PRIVATE_JWK is not set");
   });
 
+  it("domain-separates authorization-code exchange identities", async () => {
+    const token = await createConvexMcpToken(
+      { userId: "user-123", keyId: "key-456" },
+      {
+        keyHash: "d".repeat(64),
+        codeHash: "a".repeat(64),
+        bindingHash: "b".repeat(64),
+        requestHash: "c".repeat(64),
+      },
+    );
+    const publicKey = await importJWK(getPublicMcpJwk(), MCP_JWT_ALGORITHM);
+    const { payload } = await jwtVerify(token, publicKey, {
+      issuer: "https://brain.example.test",
+      audience: MCP_JWT_AUDIENCE,
+    });
+    expect(payload).toMatchObject({
+      oauthPurpose: "authorization_code_exchange",
+      oauthKeyHash: "d".repeat(64),
+      oauthCodeHash: "a".repeat(64),
+      oauthBindingHash: "b".repeat(64),
+      oauthRequestHash: "c".repeat(64),
+    });
+  });
+
   it("never publishes private key material", async () => {
     vi.stubEnv("MCP_JWT_PUBLIC_JWK", process.env.MCP_JWT_PRIVATE_JWK ?? "");
 
