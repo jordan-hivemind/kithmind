@@ -78,6 +78,12 @@ before merge. Run Convex-side migrations with `npx convex run` against the
 development deployment first, then record the exact command in the owner
 tracker or a public issue or plan.
 
+Before any Vercel operation, verify the authenticated Vercel identity and the
+intended team and project in that same credential context. State the intended
+scope explicitly in the command or operation; do not infer it from the current
+directory, a previous login, or a cached project link. Do not put personal
+emails, team names, or project IDs in public files.
+
 ### Standing pre-launch deployment approval
 
 On 2026-09-06, the owner explicitly pre-approved production deployments and
