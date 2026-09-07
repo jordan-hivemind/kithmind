@@ -5,8 +5,8 @@ Kith Mind is a personal knowledge system built on the upstream
 contributions are intended to be MIT-licensed, with upstream attribution
 preserved in the local LICENSE. See [provenance](docs/upstream-provenance.md).
 It stores structured facts, narrative thoughts, and indexed source documents,
-and makes them available to compatible clients through MCP. Document ingestion
-transport and the background worker are still being implemented. The public architecture and staged plan are in
+and makes them available to compatible clients through MCP. Bounded text capture is supported; automated connectors and typed extraction
+are still being implemented. The public architecture and staged plan are in
 [`docs/plans/2026-09-06-architecture.md`](./docs/plans/2026-09-06-architecture.md).
 
 ## Available today
@@ -25,6 +25,9 @@ transport and the background worker are still being implemented. The public arch
 - Versioned lab, vehicle-service and financial records with exact decimal
   queries, retained evidence and coverage-aware pagination through `query_records`.
   See the [typed-record contract](docs/plans/2026-09-06-record-query-contract.md).
+- Authenticated text capture with durable processing and retry-safe request IDs,
+  plus an explicitly unfetched URL queue. See the
+  [capture contract](docs/plans/2026-09-06-inline-ingestion-contract.md).
 - A Next.js web application, Convex backend, and a Claude Code plugin source.
 
 Captures are client-mediated: an MCP server cannot observe a conversation
@@ -38,7 +41,7 @@ The following are architecture commitments, not current product features:
 
 - Family membership, invitations, person linking, and source configuration in
   the desktop settings workflow.
-- Public text ingestion and extraction of typed records from real sources.
+- Extraction of typed records from real sources.
 - A Mac-hosted daemon, filesystem and service connectors, extraction
   playbooks, and background ingestion.
 - Desktop is the primary workflow. P2 mobile access is through hosted MCP for

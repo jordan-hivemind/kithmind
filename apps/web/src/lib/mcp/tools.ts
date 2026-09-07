@@ -1,4 +1,5 @@
 export const MCP_TOOL_NAMES = {
+  ingestUrl: "ingest_url",
   queryRecords: "query_records",
   searchDocuments: "search_documents",
   getDocument: "get_document",

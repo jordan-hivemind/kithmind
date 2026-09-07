@@ -6,6 +6,7 @@ import type { Id } from "../../_generated/dataModel";
 import schema from "../../legacySchema";
 import { modules } from "../../test.setup";
 import { calculateCoverage } from "./model";
+import { listSources } from "../documents/model";
 
 type Harness = ReturnType<typeof convexTest>;
 
@@ -420,4 +421,67 @@ describe("coverage calculation", () => {
     );
     expect(coverage).toMatchObject({ state: "partial", overflow: true });
   });
+});
+
+test("unfetched URLs prevent complete coverage, appear in source status, and hide on forget", async () => {
+  const t = convexTest(schema, modules);
+  const seed = await seedCoverageAccount(t);
+  await insertCompleteWindow(t, seed);
+  const itemId = await t.run(async (ctx) => {
+    const sourceItemId = await ctx.db.insert("sourceItems", {
+      spaceId: seed.spaceId,
+      sourceAccountId: seed.sourceAccountId,
+      externalIdHash: "url-hash",
+      externalId: "url-1",
+      lifecycle: "available",
+      originalLinkAvailable: true,
+      desiredProcessingEpoch: 0,
+    });
+    const actorCredentialId = await ctx.db.insert("apiKeys", {
+      userId: seed.userId,
+      keyHash: "synthetic-url",
+      keyPrefix: "synthetic",
+      name: "Synthetic ingest",
+      capabilities: ["ingest"],
+      spaceIds: [seed.spaceId],
+      sourceAccountIds: [seed.sourceAccountId],
+    });
+    await ctx.db.insert("sourceFetchRequests", {
+      actorCredentialId,
+      spaceId: seed.spaceId,
+      sourceAccountId: seed.sourceAccountId,
+      sourceItemId,
+      actorUserId: seed.userId,
+      requestId: "url-request",
+      requestDigest: "digest",
+      url: "https://example.com/synthetic",
+      state: "queued",
+      createdAt: 9000,
+    });
+    return sourceItemId;
+  });
+  const coverage = () =>
+    t.run((ctx) =>
+      calculateCoverage(ctx, {
+        sourceAccountIds: [seed.sourceAccountId],
+        recordType: "lab_result",
+        from: 0,
+        to: 100,
+        asOf: 10000,
+      }),
+    );
+  expect(await coverage()).toMatchObject({ state: "partial", pendingJobs: 1 });
+  const listed = await t.run((ctx) => listSources(ctx, [seed.spaceId], {}));
+  expect(listed.sources[0]).toMatchObject({ pendingJobs: 1 });
+  await t.run((ctx) => ctx.db.patch(itemId, { lifecycle: "forgetting" }));
+  expect(await coverage()).toMatchObject({ pendingJobs: 0 });
+  await t.run((ctx) =>
+    ctx.db.patch(itemId, {
+      lifecycle: "available",
+      spaceId: seed.otherSpaceId,
+    }),
+  );
+  expect(await coverage()).toMatchObject({ state: "partial", pendingJobs: 0 });
+  const invalid = await t.run((ctx) => listSources(ctx, [seed.spaceId], {}));
+  expect(invalid.sources[0]).toMatchObject({ overflow: true });
 });

@@ -260,6 +260,36 @@ export async function classifyCoverageJob(
   return "current" as const;
 }
 
+/** Unfetched URLs are pending source work, never indexed evidence. */
+export async function classifyCoverageFetch(
+  ctx: ReadCtx,
+  account: Doc<"sourceAccounts">,
+  request: Doc<"sourceFetchRequests">,
+  itemCache: Map<Id<"sourceItems">, Doc<"sourceItems"> | null>,
+) {
+  if (
+    request.spaceId !== account.spaceId ||
+    request.sourceAccountId !== account._id
+  ) {
+    return "invalid" as const;
+  }
+  let item = itemCache.get(request.sourceItemId);
+  if (item === undefined) {
+    item = await ctx.db.get(request.sourceItemId);
+    itemCache.set(request.sourceItemId, item);
+  }
+  if (
+    !item ||
+    item.spaceId !== account.spaceId ||
+    item.sourceAccountId !== account._id
+  ) {
+    return "invalid" as const;
+  }
+  return item.lifecycle === "forgetting" || item.lifecycle === "forgotten"
+    ? ("superseded" as const)
+    : ("current" as const);
+}
+
 export async function calculateCoverage(
   ctx: ReadCtx,
   args: {
@@ -454,6 +484,25 @@ export async function calculateCoverage(
         ...(gap.to === undefined ? {} : { to: gap.to }),
         reason: gap.reason,
       });
+    }
+
+    const fetchRequests = await takeWithinBudget((limit) =>
+      ctx.db
+        .query("sourceFetchRequests")
+        .withIndex("by_sourceAccountId", (q) =>
+          q.eq("sourceAccountId", sourceAccountId),
+        )
+        .take(limit),
+    );
+    for (const request of fetchRequests) {
+      const classification = await classifyCoverageFetch(
+        ctx,
+        account,
+        request,
+        itemCache,
+      );
+      if (classification === "current") pendingJobs += 1;
+      if (classification === "invalid") hasPartialSignal = true;
     }
 
     for (const state of ["queued", "processing", "staged"] as const) {

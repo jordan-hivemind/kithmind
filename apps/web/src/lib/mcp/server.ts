@@ -377,6 +377,41 @@ export function createMcpServer(convexAuthToken: string) {
       };
     },
   );
+  const ingestUrlTool = server.tool(
+    MCP_TOOL_NAMES.ingestUrl,
+    "Queue a URL for a configured source account with an ingest-scoped credential. This version does not fetch URLs. The response is queued with workerRequired true; it is not indexed content. The title remains on the pending request until fetched. Reuse the requestId only with identical arguments.",
+    {
+      spaceId: spaceIdSchema.optional(),
+      requestId: z.string().min(1).max(128),
+      source: z
+        .object({
+          connector: z.literal("mcp-client"),
+          accountId: z.string().min(1).max(512),
+          externalId: z.string().min(1).max(2048),
+        })
+        .strict(),
+      url: z.string().min(1).max(2048),
+      title: z.string().min(1).max(2048).optional(),
+    },
+    MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.ingestUrl],
+    async ({ spaceId, ...input }) => {
+      const result = await convex.mutation(
+        api.models.ingestion.urlQueue.enqueue,
+        {
+          input: {
+            ...input,
+            ...(spaceId === undefined
+              ? {}
+              : { spaceId: spaceId as Id<"spaces"> }),
+          },
+        },
+      );
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(result) }],
+      };
+    },
+  );
+
   const listSourcesTool = server.tool(
     MCP_TOOL_NAMES.listSources,
     "List authorized source accounts and bounded processing status. Partial or truncated results must not be presented as a complete source inventory.",
@@ -1960,6 +1995,7 @@ export function createMcpServer(convexAuthToken: string) {
   );
 
   const registeredTools = {
+    [MCP_TOOL_NAMES.ingestUrl]: ingestUrlTool,
     [MCP_TOOL_NAMES.queryRecords]: queryRecordsTool,
     [MCP_TOOL_NAMES.searchDocuments]: searchDocumentsTool,
     [MCP_TOOL_NAMES.getDocument]: getDocumentTool,

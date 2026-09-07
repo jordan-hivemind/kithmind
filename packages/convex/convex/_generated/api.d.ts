@@ -9,6 +9,7 @@
  */
 
 import type * as auth from "../auth.js";
+import type * as crons from "../crons.js";
 import type * as http from "../http.js";
 import type * as legacySchema from "../legacySchema.js";
 import type * as lib_embeddingProvider from "../lib/embeddingProvider.js";
@@ -44,10 +45,18 @@ import type * as models_facts_private from "../models/facts/private.js";
 import type * as models_facts_public from "../models/facts/public.js";
 import type * as models_facts_validators from "../models/facts/validators.js";
 import type * as models_ingestion_hash from "../models/ingestion/hash.js";
+import type * as models_ingestion_inlineInput from "../models/ingestion/inlineInput.js";
+import type * as models_ingestion_inlineMcp from "../models/ingestion/inlineMcp.js";
+import type * as models_ingestion_inlineText from "../models/ingestion/inlineText.js";
+import type * as models_ingestion_inlineWork from "../models/ingestion/inlineWork.js";
+import type * as models_ingestion_inlineWorkTables from "../models/ingestion/inlineWorkTables.js";
+import type * as models_ingestion_inlineWorker from "../models/ingestion/inlineWorker.js";
 import type * as models_ingestion_limits from "../models/ingestion/limits.js";
 import type * as models_ingestion_model from "../models/ingestion/model.js";
 import type * as models_ingestion_private from "../models/ingestion/private.js";
 import type * as models_ingestion_tables from "../models/ingestion/tables.js";
+import type * as models_ingestion_urlQueue from "../models/ingestion/urlQueue.js";
+import type * as models_ingestion_urlQueueTables from "../models/ingestion/urlQueueTables.js";
 import type * as models_ingestion_validators from "../models/ingestion/validators.js";
 import type * as models_lists_mcpActions from "../models/lists/mcpActions.js";
 import type * as models_lists_mcpQueries from "../models/lists/mcpQueries.js";
@@ -111,6 +120,7 @@ import type {
 
 declare const fullApi: ApiFromModules<{
   auth: typeof auth;
+  crons: typeof crons;
   http: typeof http;
   legacySchema: typeof legacySchema;
   "lib/embeddingProvider": typeof lib_embeddingProvider;
@@ -146,10 +156,18 @@ declare const fullApi: ApiFromModules<{
   "models/facts/public": typeof models_facts_public;
   "models/facts/validators": typeof models_facts_validators;
   "models/ingestion/hash": typeof models_ingestion_hash;
+  "models/ingestion/inlineInput": typeof models_ingestion_inlineInput;
+  "models/ingestion/inlineMcp": typeof models_ingestion_inlineMcp;
+  "models/ingestion/inlineText": typeof models_ingestion_inlineText;
+  "models/ingestion/inlineWork": typeof models_ingestion_inlineWork;
+  "models/ingestion/inlineWorkTables": typeof models_ingestion_inlineWorkTables;
+  "models/ingestion/inlineWorker": typeof models_ingestion_inlineWorker;
   "models/ingestion/limits": typeof models_ingestion_limits;
   "models/ingestion/model": typeof models_ingestion_model;
   "models/ingestion/private": typeof models_ingestion_private;
   "models/ingestion/tables": typeof models_ingestion_tables;
+  "models/ingestion/urlQueue": typeof models_ingestion_urlQueue;
+  "models/ingestion/urlQueueTables": typeof models_ingestion_urlQueueTables;
   "models/ingestion/validators": typeof models_ingestion_validators;
   "models/lists/mcpActions": typeof models_lists_mcpActions;
   "models/lists/mcpQueries": typeof models_lists_mcpQueries;
