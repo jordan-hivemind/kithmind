@@ -23,6 +23,17 @@ const settingsCapabilities: readonly KeyCapability[] = [
   "ingest",
 ];
 
+const sourceKinds = {
+  "mcp-client": "MCP client",
+  fs: "Filesystem",
+} as const;
+
+function sourceKindLabel(connector: string) {
+  return (
+    sourceKinds[connector as keyof typeof sourceKinds] ?? connector
+  );
+}
+
 function errorMessage(caught: unknown, fallback: string) {
   if (!(caught instanceof Error)) return fallback;
   const data = (caught as Error & { data?: unknown }).data;
@@ -225,6 +236,9 @@ export default function SettingsPage() {
   const [defaultError, setDefaultError] = useState("");
   const [savingDefault, setSavingDefault] = useState(false);
   const [sourceName, setSourceName] = useState("");
+  const [sourceConnector, setSourceConnector] = useState<
+    keyof typeof sourceKinds
+  >("mcp-client");
   const [sourceAccountId, setSourceAccountId] = useState("");
   const [sourceFreshnessMinutes, setSourceFreshnessMinutes] = useState("1440");
   const [sourceSpaceId, setSourceSpaceId] = useState<Id<"spaces"> | "">("");
@@ -362,7 +376,7 @@ export default function SettingsPage() {
     try {
       await createSourceAccount({
         spaceId: sourceSpaceId,
-        connector: "mcp-client",
+        connector: sourceConnector,
         accountId: sourceAccountId.trim(),
         name: sourceName.trim(),
         freshnessMs: freshnessMinutes * 60_000,
@@ -470,12 +484,35 @@ export default function SettingsPage() {
       </section>
 
       <section aria-labelledby="sources-heading" style={{ marginTop: 32 }}>
-        <h2 id="sources-heading">MCP client sources</h2>
+        <h2 id="sources-heading">Source accounts</h2>
         <p style={{ color: "#666" }}>
           Add each source account a client may ingest from. This only configures
-          its identity and access scope; it does not fetch or poll a source.
+          its identity and access scope; it does not fetch, poll, or scan a
+          source.
+        </p>
+        <p style={{ color: "#666" }}>
+          Filesystem configuration does not scan files until a worker is
+          configured.
         </p>
         <form onSubmit={handleCreateSource}>
+          <label htmlFor="source-kind">Source kind</label>
+          <select
+            id="source-kind"
+            value={sourceConnector}
+            onChange={(event) =>
+              setSourceConnector(
+                event.target.value as keyof typeof sourceKinds,
+              )
+            }
+            disabled={savingSource}
+            style={{ display: "block", margin: "6px 0 12px", padding: 8 }}
+          >
+            {Object.entries(sourceKinds).map(([connector, label]) => (
+              <option key={connector} value={connector}>
+                {label}
+              </option>
+            ))}
+          </select>
           <label htmlFor="source-space">Space</label>
           <select
             id="source-space"
@@ -517,8 +554,7 @@ export default function SettingsPage() {
             style={{ display: "block", margin: "6px 0", padding: 8 }}
           />
           <p id="source-account-help" style={{ color: "#666", fontSize: 13 }}>
-            A stable identifier you choose for this MCP client source in this
-            space.
+            A stable identifier you choose for this source in this space.
           </p>
           <label htmlFor="source-freshness">Freshness (minutes)</label>
           <input
@@ -542,13 +578,13 @@ export default function SettingsPage() {
               !sourceAccountId.trim()
             }
           >
-            {savingSource ? "Adding..." : "Add MCP client source"}
+            {savingSource ? "Adding..." : "Add source account"}
           </button>
         </form>
         {sourceAccounts === undefined ? (
           <p>Loading sources...</p>
         ) : sourceAccounts.length === 0 ? (
-          <p style={{ color: "#666" }}>No MCP client sources configured.</p>
+          <p style={{ color: "#666" }}>No source accounts configured.</p>
         ) : (
           <ul>
             {sourceAccounts.map((account) => (
@@ -598,7 +634,7 @@ export default function SettingsPage() {
                   </div>
                 ) : (
                   <>
-                    <strong>{account.name}</strong> ({account.connector})
+                    <strong>{account.name}</strong> ({sourceKindLabel(account.connector)})
                     {" · account ID: "}
                     <code>{account.accountId}</code>
                     {" · refreshes at most every "}
@@ -619,6 +655,21 @@ export default function SettingsPage() {
                     >
                       Edit
                     </button>
+                    {account.connector === "fs" && (
+                      <details style={{ marginTop: 8 }}>
+                        <summary>Worker identifiers</summary>
+                        <dl style={{ margin: "8px 0 0" }}>
+                          <dt>Source row ID</dt>
+                          <dd style={{ margin: "2px 0 8px" }}>
+                            <code>{account._id}</code>
+                          </dd>
+                          <dt>Space ID</dt>
+                          <dd style={{ margin: "2px 0" }}>
+                            <code>{account.spaceId}</code>
+                          </dd>
+                        </dl>
+                      </details>
+                    )}
                   </>
                 )}
                 <button
@@ -720,7 +771,7 @@ export default function SettingsPage() {
                   </p>
                   {enabledScopedSourceAccounts.length === 0 ? (
                     <p role="alert">
-                      Add and enable an MCP client source in a selected space
+                      Add and enable a source account in a selected space
                       before issuing this key.
                     </p>
                   ) : (
@@ -740,7 +791,7 @@ export default function SettingsPage() {
                             )
                           }
                         />{" "}
-                        {account.name} ({account.connector})
+                        {account.name} ({sourceKindLabel(account.connector)})
                       </label>
                     ))
                   )}

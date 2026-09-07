@@ -64,6 +64,14 @@ export const sourceItemFields = {
   lastFailure: v.optional(provenanceFailureValidator),
   forgottenAt: v.optional(v.number()),
   forgottenBy: v.optional(v.id("users")),
+  workerObservationEpoch: v.optional(v.number()),
+  workerProcessingEpoch: v.optional(v.number()),
+  workerInventoryMetadataDigest: v.optional(v.string()),
+  workerProcessingIdentityDigest: v.optional(v.string()),
+  workerContentHash: v.optional(v.string()),
+  workerSourceModifiedAt: v.optional(v.number()),
+  workerProfileId: v.optional(v.string()),
+  workerLastSeenInventoryEpoch: v.optional(v.number()),
 };
 
 export const sourceRevisionFields = {

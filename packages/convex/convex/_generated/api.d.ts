@@ -122,6 +122,16 @@ import type * as models_thoughts_private from "../models/thoughts/private.js";
 import type * as models_thoughts_public from "../models/thoughts/public.js";
 import type * as models_thoughts_publicActions from "../models/thoughts/publicActions.js";
 import type * as models_thoughts_validators from "../models/thoughts/validators.js";
+import type * as models_workers_auth from "../models/workers/auth.js";
+import type * as models_workers_cleanup from "../models/workers/cleanup.js";
+import type * as models_workers_errors from "../models/workers/errors.js";
+import type * as models_workers_mcp from "../models/workers/mcp.js";
+import type * as models_workers_model from "../models/workers/model.js";
+import type * as models_workers_private from "../models/workers/private.js";
+import type * as models_workers_profile from "../models/workers/profile.js";
+import type * as models_workers_protocol from "../models/workers/protocol.js";
+import type * as models_workers_tables from "../models/workers/tables.js";
+import type * as models_workers_validators from "../models/workers/validators.js";
 
 import type {
   ApiFromModules,
@@ -244,6 +254,16 @@ declare const fullApi: ApiFromModules<{
   "models/thoughts/public": typeof models_thoughts_public;
   "models/thoughts/publicActions": typeof models_thoughts_publicActions;
   "models/thoughts/validators": typeof models_thoughts_validators;
+  "models/workers/auth": typeof models_workers_auth;
+  "models/workers/cleanup": typeof models_workers_cleanup;
+  "models/workers/errors": typeof models_workers_errors;
+  "models/workers/mcp": typeof models_workers_mcp;
+  "models/workers/model": typeof models_workers_model;
+  "models/workers/private": typeof models_workers_private;
+  "models/workers/profile": typeof models_workers_profile;
+  "models/workers/protocol": typeof models_workers_protocol;
+  "models/workers/tables": typeof models_workers_tables;
+  "models/workers/validators": typeof models_workers_validators;
 }>;
 
 /**

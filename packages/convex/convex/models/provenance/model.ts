@@ -1770,5 +1770,13 @@ export async function finalizeSourceItemTombstone(
     activeRevisionId: undefined,
     activeGenerationId: undefined,
     lastFailure: undefined,
+    workerObservationEpoch: undefined,
+    workerProcessingEpoch: undefined,
+    workerInventoryMetadataDigest: undefined,
+    workerProcessingIdentityDigest: undefined,
+    workerContentHash: undefined,
+    workerSourceModifiedAt: undefined,
+    workerProfileId: undefined,
+    workerLastSeenInventoryEpoch: undefined,
   });
 }

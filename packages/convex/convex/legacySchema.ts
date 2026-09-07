@@ -23,6 +23,7 @@ import {
 } from "./models/spaces/validators";
 import { thoughtFields } from "./models/thoughts/validators";
 import { sourceAccountTables } from "./models/sourceAccounts/tables";
+import { workerTables } from "./models/workers/tables";
 
 /**
  * Transitional test schema for migration fixtures that intentionally omit
@@ -32,6 +33,7 @@ import { sourceAccountTables } from "./models/sourceAccounts/tables";
 export default defineSchema({
   ...authTables,
   ...sourceAccountTables,
+  ...workerTables,
   ...embeddingTables,
   ...coverageTables,
   ...ingestionTables,

@@ -16,6 +16,7 @@ import { listFields, listItemFields } from "./models/lists/validators";
 import { consumedOAuthCodeFields } from "./models/oauth/validators";
 import { entityFields, factFields } from "./models/facts/validators";
 import { sourceAccountTables } from "./models/sourceAccounts/tables";
+import { workerTables } from "./models/workers/tables";
 import {
   spaceFields,
   spaceMemberFields,
@@ -25,6 +26,7 @@ import {
 export default defineSchema({
   ...authTables,
   ...sourceAccountTables,
+  ...workerTables,
   ...embeddingTables,
   ...coverageTables,
   ...ingestionTables,

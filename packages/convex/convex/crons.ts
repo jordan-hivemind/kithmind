@@ -1,6 +1,7 @@
 import { cronJobs } from "convex/server";
 import { internal } from "./_generated/api";
 
+
 const crons = cronJobs();
 
 crons.interval(
@@ -14,6 +15,13 @@ crons.interval(
   "remove expired OAuth grants",
   { minutes: 5 },
   internal.models.oauth.cleanup.removeExpired,
+  {},
+);
+
+crons.interval(
+  "remove expired worker protocol state",
+  { minutes: 5 },
+  internal.models.workers.cleanup.removeExpired,
   {},
 );
 

@@ -1504,14 +1504,52 @@ export async function beginForgetFromWeb(
     forgottenAt: args.now,
     forgottenBy: args.principal.userId,
   });
+  if (account.connector === "fs") {
+    await ctx.db.patch(item._id, {
+      workerObservationEpoch: (item.workerObservationEpoch ?? 0) + 1,
+    });
+  }
   await ctx.db.patch(account._id, {
     coverageInvalidatedAt: Math.max(
       args.now,
       (account.coverageInvalidatedAt ?? 0) + 1,
     ),
+    ...(account.connector === "fs"
+      ? { manifestVersion: (account.manifestVersion ?? 0) + 1 }
+      : {}),
   });
   await bumpEmbeddingEligibilityEpoch(ctx, item.spaceId);
   return { lifecycle: "forgetting" as const, desiredProcessingEpoch };
+}
+
+async function eraseWorkerScanEntry(
+  ctx: MutationCtx,
+  item: Doc<"sourceItems">,
+  entry: Doc<"workerScanEntries">,
+): Promise<void> {
+  if (
+    entry.spaceId !== item.spaceId ||
+    entry.sourceAccountId !== item.sourceAccountId
+  ) {
+    throw new Error("Worker scan entry parent chain is invalid");
+  }
+  const page = await ctx.db.get(entry.scanPageId);
+  if (page) {
+    if (
+      page.spaceId !== item.spaceId ||
+      page.sourceAccountId !== item.sourceAccountId ||
+      page.scanId !== entry.scanId
+    ) {
+      throw new Error("Worker scan page parent chain is invalid");
+    }
+    // A page digest includes every entry's original metadata. A mixed page
+    // loses its replay receipt when any constituent item is forgotten.
+    await ctx.db.patch(page._id, {
+      requestDigest: undefined,
+      redactedAt: item.forgottenAt ?? Date.now(),
+    });
+  }
+  await ctx.db.delete(entry._id);
 }
 
 /**
@@ -1556,6 +1594,110 @@ export async function continueForgetFromWeb(
   for (const work of inlineWork) await ctx.db.delete(work._id);
   if (inlineWork.length > 0) {
     return { phase: "inlineWork", deleted: inlineWork.length, done: false };
+  }
+  const workerDiscoveryWork = await ctx.db
+    .query("workerDiscoveryWork")
+    .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+    .take(MAX_STAGE_ROWS);
+  for (const work of workerDiscoveryWork) {
+    if (
+      work.spaceId !== item.spaceId ||
+      work.sourceAccountId !== item.sourceAccountId
+    ) {
+      throw new Error("Worker discovery parent chain is invalid");
+    }
+    await ctx.db.delete(work._id);
+  }
+  if (workerDiscoveryWork.length > 0) {
+    return {
+      phase: "workerDiscoveryWork",
+      deleted: workerDiscoveryWork.length,
+      done: false,
+    };
+  }
+  const workerScanEntries = await ctx.db
+    .query("workerScanEntries")
+    .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+    .take(MAX_STAGE_ROWS);
+  for (const entry of workerScanEntries)
+    await eraseWorkerScanEntry(ctx, item, entry);
+  if (workerScanEntries.length > 0) {
+    return {
+      phase: "workerScanEntries",
+      deleted: workerScanEntries.length,
+      done: false,
+    };
+  }
+  const aliases = await ctx.db
+    .query("sourceAliasDigests")
+    .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+    .take(9);
+  if (aliases.length > 8) {
+    throw new Error("Source item URI alias state is invalid");
+  }
+  const unresolvedEntries: Array<Doc<"workerScanEntries">> = [];
+  for (const alias of aliases) {
+    const matches = await ctx.db
+      .query("workerScanEntries")
+      .withIndex("by_sourceAccountId_and_uriDigest_and_sourceItemId", (q) =>
+        q
+          .eq("sourceAccountId", item.sourceAccountId)
+          .eq("uriDigest", alias.digest)
+          .eq("sourceItemId", undefined),
+      )
+      .take(MAX_STAGE_ROWS - unresolvedEntries.length);
+    unresolvedEntries.push(...matches);
+    if (unresolvedEntries.length >= MAX_STAGE_ROWS) break;
+  }
+  for (const entry of unresolvedEntries)
+    await eraseWorkerScanEntry(ctx, item, entry);
+  if (unresolvedEntries.length > 0) {
+    return {
+      phase: "workerUnresolvedAliases",
+      deleted: unresolvedEntries.length,
+      done: false,
+    };
+  }
+  const ambiguousAliases: Array<Doc<"workerScanEntries">> = [];
+  for (const alias of aliases) {
+    const matches = await ctx.db
+      .query("workerScanEntries")
+      .withIndex("by_sourceAccountId_and_uriDigest_and_state", (q) =>
+        q
+          .eq("sourceAccountId", item.sourceAccountId)
+          .eq("uriDigest", alias.digest)
+          .eq("state", "needs_review"),
+      )
+      .take(MAX_STAGE_ROWS - ambiguousAliases.length);
+    ambiguousAliases.push(...matches);
+    if (ambiguousAliases.length >= MAX_STAGE_ROWS) break;
+  }
+  for (const entry of ambiguousAliases)
+    await eraseWorkerScanEntry(ctx, item, entry);
+  if (ambiguousAliases.length > 0) {
+    return {
+      phase: "workerAmbiguousAliases",
+      deleted: ambiguousAliases.length,
+      done: false,
+    };
+  }
+  const unresolvedIdentities = await ctx.db
+    .query("workerScanEntries")
+    .withIndex("by_sourceAccountId_and_externalIdHash_and_sourceItemId", (q) =>
+      q
+        .eq("sourceAccountId", item.sourceAccountId)
+        .eq("externalIdHash", item.externalIdHash)
+        .eq("sourceItemId", undefined),
+    )
+    .take(MAX_STAGE_ROWS);
+  for (const entry of unresolvedIdentities)
+    await eraseWorkerScanEntry(ctx, item, entry);
+  if (unresolvedIdentities.length > 0) {
+    return {
+      phase: "workerUnresolvedIdentities",
+      deleted: unresolvedIdentities.length,
+      done: false,
+    };
   }
   const fetchRequests = await ctx.db
     .query("sourceFetchRequests")

@@ -13,6 +13,10 @@ export const sourceAccountFields = {
   coverageInvalidatedAt: v.optional(v.number()),
   lastEnumeratedAt: v.optional(v.number()),
   lastProcessedAt: v.optional(v.number()),
+  inventoryEpoch: v.optional(v.number()),
+  completedInventoryEpoch: v.optional(v.number()),
+  manifestVersion: v.optional(v.number()),
+  activeWorkerScanId: v.optional(v.id("workerSourceScans")),
   createdBy: v.id("users"),
 };
 
