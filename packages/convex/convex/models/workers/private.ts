@@ -12,6 +12,12 @@ import {
 } from "./model";
 import { admitDiscoveryUtf8, reserveDiscoveryWork } from "./discovery";
 import {
+  admitArchivedDiscovery,
+  lookupArchivedAdmission,
+  preflightArchivedDiscovery,
+  reserveArchivedDiscovery,
+} from "./archivedDiscovery";
+import {
   activateProcessingJob,
   beginProcessingStage,
   completeProcessingStage,
@@ -129,6 +135,54 @@ export const discoveryAdmitUtf8 = internalMutation({
       ctx,
       args.principal,
       operation(args.request, "discovery.admitUtf8"),
+      Date.now(),
+    ),
+});
+
+export const discoveryPreflightArchived = internalMutation({
+  args: { principal: principalRefValidator, request: v.any() },
+  handler: async (ctx, args) =>
+    await preflightArchivedDiscovery(
+      ctx,
+      args.principal,
+      operation(args.request, "discovery.preflightArchived"),
+      Date.now(),
+    ),
+});
+
+export const discoveryReserveArchived = internalMutation({
+  args: {
+    principal: principalRefValidator,
+    request: v.any(),
+    leaseToken: v.string(),
+  },
+  handler: async (ctx, args) =>
+    await reserveArchivedDiscovery(
+      ctx,
+      args.principal,
+      operation(args.request, "discovery.reserveArchived"),
+      args.leaseToken,
+      Date.now(),
+    ),
+});
+
+export const discoveryLookupArchivedAdmission = internalMutation({
+  args: { principal: principalRefValidator, request: v.any() },
+  handler: async (ctx, args) =>
+    await lookupArchivedAdmission(
+      ctx,
+      args.principal,
+      operation(args.request, "discovery.lookupArchivedAdmission"),
+    ),
+});
+
+export const discoveryAdmitArchived = internalMutation({
+  args: { principal: principalRefValidator, request: v.any() },
+  handler: async (ctx, args) =>
+    await admitArchivedDiscovery(
+      ctx,
+      args.principal,
+      operation(args.request, "discovery.admitArchived"),
       Date.now(),
     ),
 });

@@ -17,6 +17,7 @@ import { admitDiscoveryUtf8, reserveDiscoveryWork } from "./discovery";
 import { parseWorkerRequest, type FsDiscoveryEntry } from "./protocol";
 import { FS_TEXT_PROFILE } from "./profile";
 import { beginForgetFromWeb, continueForgetFromWeb } from "../ingestion/model";
+import { sha256Utf8 } from "../provenance/model";
 
 const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
@@ -397,6 +398,103 @@ async function admit(
 }
 
 describe("filesystem worker scans", () => {
+  test("preserves the pre-binary legacy ready and gap digest formulas", async () => {
+    const digest = (domain: string, value: unknown) =>
+      sha256Utf8(`${domain}\0${JSON.stringify(value)}`);
+
+    const ready = await fixture();
+    await completeInitialScan(ready);
+    const readyPathDigest = await digest("worker-fs-uri:v1", [
+      ready.sourceAccountId,
+      "fs://documents/a.txt",
+    ]);
+    const externalHash = await sha256Utf8(UUID_A);
+    const readyInventory = await digest("worker-fs-inventory-metadata:v1", [
+      externalHash,
+      readyPathDigest,
+      "A",
+      "text",
+      100,
+      "ready",
+      HASH_A,
+      10,
+      null,
+      FS_TEXT_PROFILE.profileId,
+    ]);
+    const readyProcessing = await digest("worker-fs-processing-identity:v1", [
+      HASH_A,
+      FS_TEXT_PROFILE.mediaType,
+      FS_TEXT_PROFILE.profileId,
+      FS_TEXT_PROFILE.extractionFingerprint,
+      FS_TEXT_PROFILE.extractorFingerprint,
+      FS_TEXT_PROFILE.recordSchemaFingerprint,
+      FS_TEXT_PROFILE.normalizationFingerprint,
+      FS_TEXT_PROFILE.chunkerFingerprint,
+    ]);
+    await ready.t.run(async (ctx) => {
+      const item = await ctx.db.query("sourceItems").unique();
+      if (!item) throw new Error("missing source item");
+      await ctx.db.patch(item._id, {
+        workerInventoryMetadataDigest: readyInventory,
+        workerProcessingIdentityDigest: readyProcessing,
+      });
+    });
+    const readyScan = await begin(
+      ready,
+      "legacy-ready-begin",
+      1,
+      "normal",
+      2_000,
+    );
+    await expect(
+      append(
+        ready,
+        readyScan.scanId,
+        "legacy-ready-page",
+        [readyEntry()],
+        2_100,
+      ),
+    ).resolves.toMatchObject({
+      entries: [{ observationEpoch: 1, processingEpoch: 1 }],
+    });
+
+    const gap = await fixture();
+    await completeInitialScan(gap);
+    const gapPathDigest = await digest("worker-fs-uri:v1", [
+      gap.sourceAccountId,
+      "fs://documents/a.txt",
+    ]);
+    const gapInventory = await digest("worker-fs-inventory-metadata:v1", [
+      externalHash,
+      gapPathDigest,
+      "A",
+      "text",
+      100,
+      "gap",
+      null,
+      null,
+      "unreadable",
+      FS_TEXT_PROFILE.profileId,
+    ]);
+    await gap.t.run(async (ctx) => {
+      const item = await ctx.db.query("sourceItems").unique();
+      if (!item) throw new Error("missing source item");
+      await ctx.db.patch(item._id, {
+        workerInventoryMetadataDigest: gapInventory,
+      });
+    });
+    const gapScan = await begin(gap, "legacy-gap-begin", 1, "normal", 2_000);
+    await expect(
+      append(
+        gap,
+        gapScan.scanId,
+        "legacy-gap-page",
+        [readyEntry({ content: { status: "gap", code: "unreadable" } })],
+        2_100,
+      ),
+    ).resolves.toMatchObject({ entries: [{ observationEpoch: 1 }] });
+  });
+
   test("uses exact receipts and allocates scan epochs even after failure", async () => {
     const f = await fixture();
     const first = await begin(f, "begin-1", 0);

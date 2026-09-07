@@ -37,6 +37,20 @@ export const ingestionTables = {
       "state",
       "leaseExpiresAt",
     ])
+    .index("by_source_mode_worker_state_next", [
+      "sourceAccountId",
+      "workerProcessingMode",
+      "workerManaged",
+      "state",
+      "nextAttemptAt",
+    ])
+    .index("by_source_mode_worker_state_lease", [
+      "sourceAccountId",
+      "workerProcessingMode",
+      "workerManaged",
+      "state",
+      "leaseExpiresAt",
+    ])
     .index("by_sourceAccountId_and_state", ["sourceAccountId", "state"])
     .index("by_sourceItemId", ["sourceItemId"])
     .index("by_sourceItemId_and_desiredProcessingEpoch", [

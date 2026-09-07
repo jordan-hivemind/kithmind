@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { convexTest } from "convex-test";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
@@ -15,6 +16,7 @@ import {
   insertChunkEmbedding,
   stageEmbeddingGeneration,
 } from "../embeddings/model";
+import { inspectGenerationPayload } from "../provenance/model";
 import type { Id } from "../../_generated/dataModel";
 import schema from "../../legacySchema";
 import { modules } from "../../test.setup";
@@ -111,11 +113,33 @@ async function seedDocument(
     generationEpoch?: number;
     chunkSpaceId?: Id<"spaces">;
     generationSourceAccountId?: Id<"sourceAccounts">;
+    text?: string;
+    chunkText?: string;
+    evidenceCount?: number;
+    evidenceWholeText?: boolean;
   },
 ) {
   return await t.run(async (ctx) => {
     const publicationState = input.publicationState ?? "active";
     const lifecycle = input.lifecycle ?? "available";
+    const text = input.text ?? `needle text ${input.suffix}`;
+    const chunkText = input.chunkText ?? text;
+    const evidenceCount = input.evidenceCount ?? 1;
+    const evidenceEnd = input.evidenceWholeText ? text.length : 6;
+    const textBytes =
+      input.text === undefined ? 24 : new TextEncoder().encode(text).byteLength;
+    const contentHash =
+      input.text === undefined
+        ? `content-hash-${input.suffix}`
+        : createHash("sha256").update(text).digest("hex");
+    const textHash =
+      input.text === undefined
+        ? `text-hash-${input.suffix}`
+        : createHash("sha256").update(text).digest("hex");
+    const pageTextHash =
+      input.text === undefined
+        ? `page-hash-${input.suffix}`
+        : createHash("sha256").update(text).digest("hex");
     const itemId = await ctx.db.insert("sourceItems", {
       spaceId: input.spaceId,
       sourceAccountId: input.sourceAccountId,
@@ -131,10 +155,10 @@ async function seedDocument(
     const revisionId = await ctx.db.insert("sourceRevisions", {
       spaceId: input.spaceId,
       sourceItemId: itemId,
-      contentHash: `content-hash-${input.suffix}`,
-      byteLength: 24,
+      contentHash,
+      byteLength: textBytes,
       mediaType: "text/plain",
-      inlineText: `needle text ${input.suffix}`,
+      inlineText: text,
       capturedAt: 1_700_000_000_000,
       userId: input.userId,
     });
@@ -142,9 +166,9 @@ async function seedDocument(
       spaceId: input.spaceId,
       sourceRevisionId: revisionId,
       extractionFingerprint: `extract-${input.suffix}`,
-      text: `needle text ${input.suffix}`,
-      textHash: `text-hash-${input.suffix}`,
-      byteLength: 24,
+      text,
+      textHash,
+      byteLength: textBytes,
       evidenceSealed: publicationState !== "staged",
     });
     const generationId = await ctx.db.insert("processingGenerations", {
@@ -163,11 +187,11 @@ async function seedDocument(
       desiredProcessingEpoch: input.generationEpoch ?? 1,
       state: publicationState === "staged" ? "staged" : "ready",
       expectedPageCount: 1,
-      expectedEvidenceSpanCount: 1,
+      expectedEvidenceSpanCount: evidenceCount,
       expectedDocumentCount: 1,
       expectedChunkCount: 1,
       actualPageCount: 1,
-      actualEvidenceSpanCount: 1,
+      actualEvidenceSpanCount: evidenceCount,
       actualDocumentCount: 1,
       actualChunkCount: 1,
       embeddingStatus: "unavailable",
@@ -185,21 +209,29 @@ async function seedDocument(
       sourceTextVersionId: textVersionId,
       ordinal: 0,
       start: 0,
-      end: `needle text ${input.suffix}`.length,
-      text: `needle text ${input.suffix}`,
-      textHash: `page-hash-${input.suffix}`,
+      end: text.length,
+      text,
+      textHash: pageTextHash,
     });
-    const evidenceSpanId = await ctx.db.insert("evidenceSpans", {
-      spaceId: input.spaceId,
-      sourceRevisionId: revisionId,
-      sourceTextVersionId: textVersionId,
-      sourcePageId: pageId,
-      ordinal: 0,
-      start: 0,
-      end: 6,
-      quoteHash: `quote-hash-${input.suffix}`,
-      locator: { kind: "page", label: "1" },
-    });
+    const evidenceSpanIds: Id<"evidenceSpans">[] = [];
+    const quoteHash = input.evidenceWholeText
+      ? createHash("sha256").update(text.slice(0, evidenceEnd)).digest("hex")
+      : `quote-hash-${input.suffix}`;
+    for (let ordinal = 0; ordinal < evidenceCount; ordinal += 1) {
+      evidenceSpanIds.push(
+        await ctx.db.insert("evidenceSpans", {
+          spaceId: input.spaceId,
+          sourceRevisionId: revisionId,
+          sourceTextVersionId: textVersionId,
+          sourcePageId: pageId,
+          ordinal,
+          start: 0,
+          end: evidenceEnd,
+          quoteHash,
+          locator: { kind: "page", label: "1" },
+        }),
+      );
+    }
     const documentId = await ctx.db.insert("documents", {
       spaceId: input.spaceId,
       processingGenerationId: generationId,
@@ -210,7 +242,7 @@ async function seedDocument(
       title: `Document ${input.suffix}`,
       docType: "note",
       capturedAt: 1_700_000_000_000,
-      evidenceSpanIds: [evidenceSpanId],
+      evidenceSpanIds,
       publicationState,
     });
     const chunkId = await ctx.db.insert("chunks", {
@@ -218,8 +250,8 @@ async function seedDocument(
       processingGenerationId: generationId,
       documentId,
       ordinal: 0,
-      text: `needle text ${input.suffix}`,
-      evidenceSpanIds: [evidenceSpanId],
+      text: chunkText,
+      evidenceSpanIds,
       publicationState,
     });
     await ctx.db.patch(itemId, {
@@ -237,7 +269,8 @@ async function seedDocument(
       textVersionId,
       generationId,
       pageId,
-      evidenceSpanId,
+      evidenceSpanId: evidenceSpanIds[0]!,
+      evidenceSpanIds,
       documentId,
       chunkId,
     };
@@ -406,6 +439,121 @@ describe("document reads", () => {
       evidenceSpanId: visible.evidenceSpanId,
       quote: "needle",
     });
+  });
+
+  test("bounds whole exact citation output across document and search reads", async () => {
+    const t = convexTest(schema, modules);
+    const seeded = await seedIdentity(t);
+    const pageText = `needle "\nµ🙂\\${"x".repeat(65_000)}`;
+    const chunkText = `needle ${"x".repeat(16_377)}`;
+    const expectedQuoteHash = createHash("sha256")
+      .update(pageText)
+      .digest("hex");
+    const first = await seedDocument(t, {
+      spaceId: seeded.spaceId,
+      sourceAccountId: seeded.sourceAccountId,
+      userId: seeded.userId,
+      suffix: "large-0",
+      text: pageText,
+      chunkText,
+      evidenceCount: 128,
+      evidenceWholeText: true,
+    });
+    await expect(
+      t.run((ctx) =>
+        inspectGenerationPayload(ctx, {
+          spaceId: seeded.spaceId,
+          processingGenerationId: first.generationId,
+          sourceTextVersionId: first.textVersionId,
+          expectedPublicationState: "active",
+        }),
+      ),
+    ).resolves.toMatchObject({ pageOrdinals: [0] });
+    for (let index = 1; index < 25; index += 1) {
+      await seedDocument(t, {
+        spaceId: seeded.spaceId,
+        sourceAccountId: seeded.sourceAccountId,
+        userId: seeded.userId,
+        suffix: `large-${index}`,
+        text: pageText,
+        chunkText,
+        evidenceCount: 16,
+        evidenceWholeText: true,
+      });
+    }
+    const web = t.withIdentity({ issuer: webIssuer, subject: seeded.userId });
+    const document = await web.query(api.models.documents.public.get, {
+      documentId: first.documentId,
+    });
+    const search = await web.query(api.models.documents.public.search, {
+      query: "needle",
+      limit: 25,
+    });
+    const citationGroupBytes = (groups: unknown[][]) =>
+      groups.reduce<number>(
+        (total, group) =>
+          total + new TextEncoder().encode(JSON.stringify(group)).byteLength,
+        0,
+      );
+    const documentCitations =
+      document?.pages.flatMap((page) => page.evidence) ?? [];
+    const searchCitations = search.results.flatMap(
+      (result) => result.citations,
+    );
+
+    expect(document?.partial).toBe(true);
+    expect(documentCitations.length).toBeGreaterThan(0);
+    expect(documentCitations.length).toBeLessThan(128);
+    expect(citationGroupBytes([documentCitations])).toBeLessThanOrEqual(
+      256 * 1024,
+    );
+    expect(search.results).toHaveLength(25);
+    expect(search.partial).toBe(true);
+    expect(search.results.some((result) => result.citationsTruncated)).toBe(
+      true,
+    );
+    expect(
+      search.results.some(
+        (result) =>
+          result.documentId !== first.documentId &&
+          result.citationsTruncated &&
+          result.citations.length < 16,
+      ),
+    ).toBe(true);
+    expect(searchCitations.length).toBeLessThan(25 * 16);
+    expect(
+      citationGroupBytes(search.results.map((result) => result.citations)),
+    ).toBeLessThanOrEqual(256 * 1024);
+    for (const citation of [...documentCitations, ...searchCitations]) {
+      expect(citation.quote).toBe(pageText);
+      expect(citation.quoteHash).toBe(expectedQuoteHash);
+    }
+    expect(JSON.stringify(documentCitations[0])).toContain("\\n");
+  });
+
+  test("keeps small exact citations and existing completion flags", async () => {
+    const t = convexTest(schema, modules);
+    const seeded = await seedIdentity(t);
+    const visible = await seedDocument(t, {
+      spaceId: seeded.spaceId,
+      sourceAccountId: seeded.sourceAccountId,
+      userId: seeded.userId,
+      suffix: "small-output",
+    });
+    const web = t.withIdentity({ issuer: webIssuer, subject: seeded.userId });
+    const document = await web.query(api.models.documents.public.get, {
+      documentId: visible.documentId,
+    });
+    const search = await web.query(api.models.documents.public.search, {
+      query: "needle",
+    });
+    expect(document).toMatchObject({ partial: false });
+    expect(document?.pages[0]?.evidence).toEqual([
+      expect.objectContaining({ quote: "needle" }),
+    ]);
+    expect(search).toMatchObject({ partial: false });
+    expect(search.results[0]).toMatchObject({ citationsTruncated: false });
+    expect(search.results[0]?.citations[0]).toMatchObject({ quote: "needle" });
   });
 
   test("keyword mode bypasses embedding fetch with ready vector targets", async () => {

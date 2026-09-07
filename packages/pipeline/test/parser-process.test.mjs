@@ -1,0 +1,395 @@
+import assert from "node:assert/strict";
+import { createHash, randomUUID } from "node:crypto";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import test from "node:test";
+
+import { capturePdfFile } from "../dist/captureStore.js";
+import { canonicalRoots } from "../dist/filesystem.js";
+import {
+  DEFAULT_PARSER_PROCESS_LIMITS,
+  ParserProcessError,
+  runCapturedPdfParser,
+} from "../dist/parserProcess.js";
+
+const repository = realpath(
+  join(dirname(fileURLToPath(import.meta.url)), "../../.."),
+);
+const repo = await repository;
+const parserRoot = join(repo, "evals/parser");
+const pythonExecutable = join(parserRoot, ".venv/bin/python");
+const modelAssetsPath = join(parserRoot, "artifacts/models");
+const launcherPath = join(parserRoot, "src/parser_eval/production_launcher.py");
+const modelLockPath = join(parserRoot, "model-assets.lock.json");
+const hasRuntime =
+  process.platform === "darwin" &&
+  existsSync("/usr/bin/sandbox-exec") &&
+  existsSync(pythonExecutable) &&
+  existsSync(modelAssetsPath);
+const hasPythonRuntime =
+  process.platform === "darwin" &&
+  existsSync("/usr/bin/sandbox-exec") &&
+  existsSync(pythonExecutable);
+
+function sha256(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+async function fixture() {
+  const base = await realpath(await mkdtemp(join(tmpdir(), "parser-process-")));
+  const sourceRoot = join(base, "source");
+  const journal = join(base, "journal");
+  const captures = join(base, "captures");
+  const outputRoot = join(base, "outputs");
+  for (const path of [sourceRoot, journal, captures, outputRoot]) {
+    await mkdir(path, { mode: 0o700 });
+    await chmod(path, 0o700);
+  }
+  const sourceBytes = await readFile(
+    join(parserRoot, "fixtures/lab-report-unicode.pdf"),
+  );
+  const sourcePath = join(sourceRoot, "input.pdf");
+  await writeFile(sourcePath, sourceBytes, { mode: 0o600 });
+  const observed = await stat(sourcePath);
+  const [root] = await canonicalRoots({
+    protocolVersion: 1,
+    endpoint: "http://127.0.0.1:3100/api/worker",
+    spaceId: "space",
+    sourceAccountId: "source",
+    credentialEnv: "TOKEN",
+    roots: [{ alias: "source", path: sourceRoot }],
+    journalDir: journal,
+    watchIntervalMs: 1_000,
+    maxFiles: 256,
+    maxDepth: 16,
+    maxFileBytes: 65_536,
+  });
+  const capture = await capturePdfFile({
+    root,
+    relativePath: "input.pdf",
+    captureDirectory: captures,
+    captureId: randomUUID(),
+    expected: {
+      sha256: sha256(sourceBytes),
+      byteLength: sourceBytes.length,
+      sourceModifiedAt: Math.trunc(observed.mtimeMs),
+    },
+  });
+  const pythonBytes = await readFile(await realpath(pythonExecutable));
+  const launcherBytes = await readFile(launcherPath);
+  const modelLockBytes = await readFile(modelLockPath);
+  const common = {
+    capture,
+    pythonExecutable,
+    expectedPythonSha256: sha256(pythonBytes),
+    launcherPath,
+    expectedLauncherSha256: sha256(launcherBytes),
+    packageRoot: join(parserRoot, "src"),
+    modelAssetsPath,
+    modelLockPath,
+    expectedModelLockSha256: sha256(modelLockBytes),
+  };
+  return { base, outputRoot, common };
+}
+
+async function outputDirectory(fixture, outputId) {
+  const path = join(fixture.outputRoot, outputId);
+  await mkdir(path, { mode: 0o700 });
+  await chmod(path, 0o700);
+  return path;
+}
+
+async function faultFixture(behavior) {
+  const f = await fixture();
+  const packageRoot = join(f.base, "fault-package");
+  const modelAssets = join(f.base, "fault-models");
+  await mkdir(packageRoot, { mode: 0o700 });
+  await mkdir(modelAssets, { mode: 0o700 });
+  await chmod(packageRoot, 0o700);
+  await chmod(modelAssets, 0o700);
+  const launcher = join(packageRoot, "launcher.py");
+  const source = `
+import errno, json, os, socket, sys, time
+from pathlib import Path
+mode = sys.argv[sys.argv.index("--mode") + 1]
+def result(value):
+    sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\\n")
+    sys.stdout.flush()
+if mode == "network-probe":
+    denied = 0
+    for address in (("127.0.0.1", 9), ("203.0.113.1", 9)):
+        candidate = None
+        try:
+            candidate = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            candidate.connect(address)
+        except OSError as error:
+            if error.errno in (errno.EPERM, errno.EACCES): denied += 1
+        finally:
+            if candidate is not None: candidate.close()
+    result({"state":"complete","probe":"network_denied"} if denied == 2 else {"state":"failed"})
+elif mode == "process-probe":
+    try: os.fork()
+    except OSError as error:
+        result({"state":"complete","probe":"fork_denied"} if error.errno in (errno.EPERM, errno.EACCES) else {"state":"failed"})
+elif mode == "exec-probe":
+    try: os.execv("/bin/echo", ["echo", "unexpected"])
+    except OSError as error:
+        result({"state":"complete","probe":"exec_denied"} if error.errno in (errno.EPERM, errno.EACCES) else {"state":"failed"})
+else:
+    output = Path(sys.argv[sys.argv.index("--output-directory") + 1])
+    output.joinpath("pid").write_text(str(os.getpid()), encoding="ascii")
+    if ${JSON.stringify(behavior)} == "timeout":
+        time.sleep(60)
+    elif ${JSON.stringify(behavior)} == "stdout":
+        sys.stdout.write("x" * 100000)
+        sys.stdout.flush()
+    elif ${JSON.stringify(behavior)} == "stderr":
+        sys.stderr.write("x" * 100000)
+        sys.stderr.flush()
+`;
+  await writeFile(launcher, source, { mode: 0o600 });
+  const modelLock = join(f.base, "fault-model-lock.json");
+  await writeFile(
+    modelLock,
+    JSON.stringify({ manifestSha256: "a".repeat(64) }),
+    { mode: 0o600 },
+  );
+  return {
+    ...f,
+    common: {
+      ...f.common,
+      launcherPath: launcher,
+      expectedLauncherSha256: sha256(await readFile(launcher)),
+      packageRoot,
+      modelAssetsPath: modelAssets,
+      modelLockPath: modelLock,
+      expectedModelLockSha256: sha256(await readFile(modelLock)),
+    },
+  };
+}
+
+test(
+  "runs one useful Docling conversion with verified network and process denial",
+  { skip: !hasRuntime, timeout: 240_000 },
+  async () => {
+    const f = await fixture();
+    try {
+      const outputId = randomUUID();
+      const result = await runCapturedPdfParser({
+        ...f.common,
+        outputId,
+        outputDirectory: await outputDirectory(f, outputId),
+      });
+      assert.equal(result.state, "complete");
+      assert.equal(result.outputId, outputId);
+      assert.equal(result.sourceSha256, f.common.capture.sha256);
+      assert.equal(result.isolation.networkDenied, true);
+      assert.equal(result.isolation.processForkDenied, true);
+      assert.equal(result.isolation.processExecDenied, true);
+      assert.equal(result.isolation.rssBoundary, "sampled_process_tree");
+      assert.ok(result.peakRssBytes > 0);
+      assert.ok(
+        result.peakRssBytes <= DEFAULT_PARSER_PROCESS_LIMITS.maxRssBytes,
+      );
+      assert.equal(result.pageCount, 1);
+      assert.match(result.extractionConfigurationFingerprint, /^[a-f0-9]{64}$/);
+      assert.equal(
+        result.rawArtifact.sha256,
+        sha256(await readFile(result.rawArtifact.path)),
+      );
+      assert.equal(
+        result.normalizedBundle.sha256,
+        sha256(await readFile(result.normalizedBundle.path)),
+      );
+    } finally {
+      await rm(f.base, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "preserves a pre-existing parser destination without starting conversion",
+  { skip: !hasRuntime },
+  async () => {
+    const f = await fixture();
+    try {
+      const outputId = randomUUID();
+      const output = await outputDirectory(f, outputId);
+      const target = join(output, "lossless.json");
+      const sentinel = Buffer.from("pre-existing parser output");
+      await writeFile(target, sentinel, { mode: 0o600 });
+      await assert.rejects(
+        () =>
+          runCapturedPdfParser({
+            ...f.common,
+            outputId,
+            outputDirectory: output,
+          }),
+        (error) =>
+          error instanceof ParserProcessError &&
+          error.code === "destination_exists",
+      );
+      assert.deepEqual(await readFile(target), sentinel);
+    } finally {
+      await rm(f.base, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "rejects a shared output directory before parser execution",
+  { skip: !hasRuntime },
+  async () => {
+    const f = await fixture();
+    try {
+      await assert.rejects(
+        () =>
+          runCapturedPdfParser({
+            ...f.common,
+            outputId: randomUUID(),
+            outputDirectory: f.outputRoot,
+          }),
+        (error) =>
+          error instanceof ParserProcessError && error.code === "unsafe_path",
+      );
+    } finally {
+      await rm(f.base, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "fails closed when the sampled process tree exceeds its RSS ceiling",
+  { skip: !hasRuntime, timeout: 240_000 },
+  async () => {
+    const f = await fixture();
+    try {
+      const outputId = randomUUID();
+      const output = await outputDirectory(f, outputId);
+      await assert.rejects(
+        () =>
+          runCapturedPdfParser({
+            ...f.common,
+            outputId,
+            outputDirectory: output,
+            limits: {
+              ...DEFAULT_PARSER_PROCESS_LIMITS,
+              maxRssBytes: 64 * 1024 * 1024,
+            },
+          }),
+        (error) =>
+          error instanceof ParserProcessError &&
+          error.code === "monitored_rss_exceeded",
+      );
+      await assert.rejects(() => stat(join(output, "bundle.json")), {
+        code: "ENOENT",
+      });
+    } finally {
+      await rm(f.base, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "kills a timed-out parser process and leaves no parser artifacts",
+  { skip: !hasPythonRuntime, timeout: 10_000 },
+  async () => {
+    const f = await faultFixture("timeout");
+    try {
+      const outputId = randomUUID();
+      const output = await outputDirectory(f, outputId);
+      await assert.rejects(
+        () =>
+          runCapturedPdfParser({
+            ...f.common,
+            outputId,
+            outputDirectory: output,
+            limits: {
+              ...DEFAULT_PARSER_PROCESS_LIMITS,
+              wallDeadlineMs: 1_000,
+            },
+          }),
+        (error) =>
+          error instanceof ParserProcessError &&
+          error.code === "process_timeout" &&
+          !error.message.includes(f.base),
+      );
+      const childPid = Number(await readFile(join(output, "pid"), "ascii"));
+      assert.throws(() => process.kill(childPid, 0), { code: "ESRCH" });
+      await assert.rejects(() => stat(join(output, "lossless.json")), {
+        code: "ENOENT",
+      });
+      await assert.rejects(() => stat(join(output, "bundle.json")), {
+        code: "ENOENT",
+      });
+    } finally {
+      await rm(f.base, { recursive: true, force: true });
+    }
+  },
+);
+
+for (const stream of ["stdout", "stderr"]) {
+  test(
+    `bounds a synthetic parser ${stream} flood without creating artifacts`,
+    { skip: !hasPythonRuntime, timeout: 10_000 },
+    async () => {
+      const f = await faultFixture(stream);
+      try {
+        const outputId = randomUUID();
+        const output = await outputDirectory(f, outputId);
+        await assert.rejects(
+          () =>
+            runCapturedPdfParser({
+              ...f.common,
+              outputId,
+              outputDirectory: output,
+              limits: {
+                ...DEFAULT_PARSER_PROCESS_LIMITS,
+                maxStdoutBytes: 1_024,
+                maxStderrBytes: 1_024,
+              },
+            }),
+          (error) =>
+            error instanceof ParserProcessError &&
+            error.code === "output_limit_exceeded" &&
+            !error.message.includes(f.base),
+        );
+        const childPid = Number(await readFile(join(output, "pid"), "ascii"));
+        assert.throws(() => process.kill(childPid, 0), { code: "ESRCH" });
+        await assert.rejects(() => stat(join(output, "lossless.json")), {
+          code: "ENOENT",
+        });
+        await assert.rejects(() => stat(join(output, "bundle.json")), {
+          code: "ENOENT",
+        });
+      } finally {
+        await rm(f.base, { recursive: true, force: true });
+      }
+    },
+  );
+}
+
+test("fails closed on unsupported operating systems", async (context) => {
+  if (process.platform === "darwin") {
+    context.skip("macOS is the supported boundary");
+    return;
+  }
+  await assert.rejects(
+    () => runCapturedPdfParser({}),
+    (error) =>
+      error instanceof ParserProcessError &&
+      error.code === "unsupported_platform",
+  );
+});

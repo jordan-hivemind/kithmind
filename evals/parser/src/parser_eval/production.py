@@ -372,11 +372,10 @@ def _fingerprint(manifest: dict[str, Any], timeout_seconds: float) -> dict[str, 
     return fields
 
 
-def _extraction_fingerprint(parser: dict[str, Any], raw_hash: str) -> dict[str, Any]:
+def _extraction_configuration(parser: dict[str, Any]) -> dict[str, Any]:
     fields = {
         "schemaVersion": 1,
         "parserFingerprint": parser["fingerprint"],
-        "parserArtifactSha256": raw_hash,
         "implementationSha256": _implementation_sha256(),
         "configuration": {
             "mappingFormat": "docling_utf16_pages_v1",
@@ -387,6 +386,63 @@ def _extraction_fingerprint(parser: dict[str, Any], raw_hash: str) -> dict[str, 
     }
     fields["fingerprint"] = hashlib.sha256(_canonical_json_bytes(fields)).hexdigest()
     return fields
+
+
+def derive_extraction_fingerprint(
+    parser_fingerprint: str, raw_hash: str, configuration_fingerprint: str
+) -> str:
+    values = [parser_fingerprint, raw_hash, configuration_fingerprint]
+    if any(
+        not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{64}", value)
+        for value in values
+    ):
+        raise ProductionFailure("invalid_input")
+    return hashlib.sha256(
+        b"kith-parsed-extraction:v1\0" + _canonical_json_bytes(values)
+    ).hexdigest()
+
+
+def _extraction_fingerprint(parser: dict[str, Any], raw_hash: str) -> dict[str, Any]:
+    configuration = _extraction_configuration(parser)
+    return {
+        "schemaVersion": 2,
+        "parserFingerprint": parser["fingerprint"],
+        "parserArtifactSha256": raw_hash,
+        "extractionConfigurationFingerprint": configuration["fingerprint"],
+        "implementationSha256": configuration["implementationSha256"],
+        "configuration": configuration["configuration"],
+        "fingerprint": derive_extraction_fingerprint(
+            parser["fingerprint"], raw_hash, configuration["fingerprint"]
+        ),
+    }
+
+
+def prepare_pdf_profile(
+    *, artifacts: Path, model_lock: Path, timeout_seconds: float = 150.0
+) -> dict[str, Any]:
+    """Verify a configuration identity before scanning, without parsing a PDF.
+
+    This does not establish a sandbox or authorize subsequent capture. The
+    conversion parent must still enforce its actual execution boundary.
+    """
+    try:
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not 0 < timeout_seconds <= 150
+        ):
+            raise ProductionFailure("invalid_input")
+        manifest = _verify_runtime_and_artifacts(artifacts, model_lock)
+        parser = _fingerprint(manifest, float(timeout_seconds))
+        return {
+            "state": "ready",
+            "parserFingerprint": parser,
+            "extractionConfiguration": _extraction_configuration(parser),
+        }
+    except ProductionFailure as exc:
+        return {"state": "failed", "code": exc.code}
+    except Exception:
+        return {"state": "failed", "code": "conversion_output_invalid"}
 
 
 def convert_captured_pdf(

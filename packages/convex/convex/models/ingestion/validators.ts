@@ -37,6 +37,13 @@ export const processingGenerationFields = {
   normalizationFingerprint: v.string(),
   chunkerFingerprint: v.string(),
   correctionRevision: v.string(),
+  parserArtifactId: v.optional(v.id("sourceParserArtifacts")),
+  archiveSetDigest: v.optional(v.string()),
+  normalizedBundleDigest: v.optional(v.string()),
+  originalPrimaryReceiptId: v.optional(v.id("sourceArtifactArchiveReceipts")),
+  originalBackupReceiptId: v.optional(v.id("sourceArtifactArchiveReceipts")),
+  parserPrimaryReceiptId: v.optional(v.id("sourceArtifactArchiveReceipts")),
+  parserBackupReceiptId: v.optional(v.id("sourceArtifactArchiveReceipts")),
   desiredProcessingEpoch: v.number(),
   state: processingStateValidator,
   expectedPageCount: v.number(),
@@ -93,6 +100,7 @@ export const ingestJobFields = {
   error: v.optional(ingestErrorValidator),
   workerDiscoveryWorkId: v.optional(v.id("workerDiscoveryWork")),
   workerObservationEpoch: v.optional(v.number()),
+  workerProcessingMode: v.optional(v.literal("parsed_pages_v1")),
 };
 
 export const spaceProcessingStateFields = {

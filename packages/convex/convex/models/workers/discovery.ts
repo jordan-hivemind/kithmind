@@ -116,6 +116,43 @@ async function requireCurrentDiscoveryState(
   const { source, item, scan, entry, work } = current;
   await requireOriginalActor(ctx, source, work);
   await requireOriginalActor(ctx, source, scan);
+  const binary = work.contentRepresentation === "archived_binary_v1";
+  const profileValid = binary
+    ? source.account.binaryProfileId === "pdf_docqa_v1" &&
+      source.account.binaryProfileEnabledAt !== undefined &&
+      Number.isSafeInteger(source.account.binaryProfileEnabledAt) &&
+      source.account.binaryProfileEnabledAt >= 0 &&
+      source.account.binaryProfileAuditDigest !== undefined &&
+      /^[0-9a-f]{64}$/.test(source.account.binaryProfileAuditDigest) &&
+      entry.contentRepresentation === "archived_binary_v1" &&
+      entry.binaryParserProfileId === "pdf_docqa_v1" &&
+      entry.binaryMediaType === "application/pdf" &&
+      entry.parserFingerprint === work.parserFingerprint &&
+      entry.extractionConfigurationFingerprint ===
+        work.extractionConfigurationFingerprint &&
+      entry.extractorFingerprint === work.extractorFingerprint &&
+      entry.recordSchemaFingerprint === work.recordSchemaFingerprint &&
+      entry.normalizationFingerprint === work.normalizationFingerprint &&
+      entry.chunkerFingerprint === work.chunkerFingerprint &&
+      entry.correctionRevision === work.correctionRevision &&
+      work.mediaType === "application/pdf" &&
+      work.profileId === "pdf_docqa_v1" &&
+      typeof work.parserFingerprint === "string" &&
+      typeof work.extractionConfigurationFingerprint === "string" &&
+      typeof work.correctionRevision === "string"
+    : (work.contentRepresentation === undefined ||
+        work.contentRepresentation === "inline_utf8_v1") &&
+      (entry.contentRepresentation === undefined ||
+        entry.contentRepresentation === "inline_utf8_v1") &&
+      work.mediaType === FS_TEXT_PROFILE.mediaType &&
+      work.profileId === FS_TEXT_PROFILE.profileId &&
+      work.extractionFingerprint === FS_TEXT_PROFILE.extractionFingerprint &&
+      work.extractorFingerprint === FS_TEXT_PROFILE.extractorFingerprint &&
+      work.recordSchemaFingerprint ===
+        FS_TEXT_PROFILE.recordSchemaFingerprint &&
+      work.normalizationFingerprint ===
+        FS_TEXT_PROFILE.normalizationFingerprint &&
+      work.chunkerFingerprint === FS_TEXT_PROFILE.chunkerFingerprint;
   if (
     item.lifecycle !== "available" ||
     scan.state !== "enumerated" ||
@@ -138,14 +175,7 @@ async function requireCurrentDiscoveryState(
     item.desiredProcessingEpoch !==
       work.expectedDesiredProcessingEpoch +
         (work.state === "admitted" ? 1 : 0) ||
-    work.mediaType !== FS_TEXT_PROFILE.mediaType ||
-    work.profileId !== FS_TEXT_PROFILE.profileId ||
-    work.extractionFingerprint !== FS_TEXT_PROFILE.extractionFingerprint ||
-    work.extractorFingerprint !== FS_TEXT_PROFILE.extractorFingerprint ||
-    work.recordSchemaFingerprint !== FS_TEXT_PROFILE.recordSchemaFingerprint ||
-    work.normalizationFingerprint !==
-      FS_TEXT_PROFILE.normalizationFingerprint ||
-    work.chunkerFingerprint !== FS_TEXT_PROFILE.chunkerFingerprint ||
+    !profileValid ||
     !Number.isSafeInteger(work.observationEpoch) ||
     !Number.isSafeInteger(work.processingEpoch) ||
     !Number.isSafeInteger(work.expectedDesiredProcessingEpoch) ||
@@ -195,7 +225,11 @@ async function requireDiscoveryLease(
 function reserveTarget(
   work: Doc<"workerDiscoveryWork">,
 ): WorkerDiscoveryReserveResult["targets"][number] {
-  if (!work.leaseToken || work.leaseExpiresAt === undefined) {
+  if (
+    work.contentRepresentation === "archived_binary_v1" ||
+    !work.leaseToken ||
+    work.leaseExpiresAt === undefined
+  ) {
     throw workerProtocolError("scan_conflict");
   }
   return {
@@ -291,36 +325,44 @@ async function dueDiscoveryCandidates(
   sourceAccountId: Id<"sourceAccounts">,
   now: number,
 ): Promise<Array<Doc<"workerDiscoveryWork">>> {
-  const [queued, failed, expired] = await Promise.all([
-    ctx.db
-      .query("workerDiscoveryWork")
-      .withIndex("by_sourceAccountId_and_state_and_nextAttemptAt", (q) =>
-        q.eq("sourceAccountId", sourceAccountId).eq("state", "queued"),
-      )
-      .take(RESERVATION_CANDIDATE_OVERFETCH),
-    ctx.db
-      .query("workerDiscoveryWork")
-      .withIndex("by_sourceAccountId_and_state_and_nextAttemptAt", (q) =>
-        q
-          .eq("sourceAccountId", sourceAccountId)
-          .eq("state", "failed")
-          .gt("nextAttemptAt", undefined)
-          .lte("nextAttemptAt", now),
-      )
-      .take(RESERVATION_CANDIDATE_OVERFETCH),
-    ctx.db
-      .query("workerDiscoveryWork")
-      .withIndex("by_sourceAccountId_and_state_and_leaseExpiresAt", (q) =>
-        q
-          .eq("sourceAccountId", sourceAccountId)
-          .eq("state", "leased")
-          .gt("leaseExpiresAt", undefined)
-          .lte("leaseExpiresAt", now),
-      )
-      .take(RESERVATION_CANDIDATE_OVERFETCH),
-  ]);
+  const representations = [undefined, "inline_utf8_v1" as const];
+  const groups = await Promise.all(
+    representations.flatMap((representation) => [
+      ctx.db
+        .query("workerDiscoveryWork")
+        .withIndex("by_source_rep_state_next", (q) =>
+          q
+            .eq("sourceAccountId", sourceAccountId)
+            .eq("contentRepresentation", representation)
+            .eq("state", "queued"),
+        )
+        .take(RESERVATION_CANDIDATE_OVERFETCH),
+      ctx.db
+        .query("workerDiscoveryWork")
+        .withIndex("by_source_rep_state_next", (q) =>
+          q
+            .eq("sourceAccountId", sourceAccountId)
+            .eq("contentRepresentation", representation)
+            .eq("state", "failed")
+            .gt("nextAttemptAt", undefined)
+            .lte("nextAttemptAt", now),
+        )
+        .take(RESERVATION_CANDIDATE_OVERFETCH),
+      ctx.db
+        .query("workerDiscoveryWork")
+        .withIndex("by_source_rep_state_lease", (q) =>
+          q
+            .eq("sourceAccountId", sourceAccountId)
+            .eq("contentRepresentation", representation)
+            .eq("state", "leased")
+            .gt("leaseExpiresAt", undefined)
+            .lte("leaseExpiresAt", now),
+        )
+        .take(RESERVATION_CANDIDATE_OVERFETCH),
+    ]),
+  );
   const byId = new Map<string, Doc<"workerDiscoveryWork">>();
-  for (const row of [...queued, ...failed, ...expired]) {
+  for (const row of groups.flat()) {
     const due =
       (row.state === "queued" &&
         (row.nextAttemptAt === undefined || row.nextAttemptAt <= now)) ||
@@ -393,6 +435,9 @@ export async function reserveDiscoveryWork(
     ) {
       throw workerProtocolError("scan_conflict");
     }
+    // The legacy reservation shape promises UTF-8 targets. Binary work has a
+    // separate exact reservation operation and must never enter this result.
+    if (candidate.contentRepresentation === "archived_binary_v1") continue;
     let current: CurrentDiscovery | undefined;
     try {
       current = await loadDiscoveryChain(ctx, source, candidate._id);
@@ -671,6 +716,9 @@ export async function admitDiscoveryUtf8(
     request.leaseToken,
     now,
   );
+  if (current.work.contentRepresentation === "archived_binary_v1") {
+    throw workerProtocolError("stale_observation");
+  }
   const plan = planInlineText(request.text);
   const byteLength = new TextEncoder().encode(request.text).byteLength;
   if (

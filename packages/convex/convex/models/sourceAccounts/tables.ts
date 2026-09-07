@@ -20,6 +20,9 @@ export const sourceAccountFields = {
   workerAssessmentEpoch: v.optional(v.number()),
   activeWorkerAssessmentId: v.optional(v.id("workerProcessingAssessments")),
   latestWorkerAssessmentId: v.optional(v.id("workerProcessingAssessments")),
+  binaryProfileId: v.optional(v.literal("pdf_docqa_v1")),
+  binaryProfileAuditDigest: v.optional(v.string()),
+  binaryProfileEnabledAt: v.optional(v.number()),
   createdBy: v.id("users"),
 };
 

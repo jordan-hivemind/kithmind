@@ -38,8 +38,43 @@ export { WORKER_MUTATION_RATE_LIMIT, WORKER_MUTATION_RATE_WINDOW_MS };
 type SourceRequest = Pick<WorkerRequest, "spaceId" | "sourceAccountId">;
 type WorkerDbCtx = Pick<QueryCtx, "db"> | Pick<MutationCtx, "db">;
 type FsReadyDiscoveryEntry = Omit<FsDiscoveryEntry, "content"> & {
-  content: { status: "ready"; sha256: string; byteLength: number };
+  content: Exclude<FsDiscoveryEntry["content"], { status: "gap" }>;
 };
+
+function isReadyEntry(entry: FsDiscoveryEntry): entry is FsReadyDiscoveryEntry {
+  return entry.content.status !== "gap";
+}
+
+function processingProfile(entry: FsReadyDiscoveryEntry) {
+  return entry.content.status === "ready"
+    ? {
+        representation: "inline_utf8_v1" as const,
+        mediaType: FS_TEXT_PROFILE.mediaType,
+        profileId: FS_TEXT_PROFILE.profileId,
+        parserFingerprint: undefined,
+        extractionConfigurationFingerprint: undefined,
+        extractionFingerprint: FS_TEXT_PROFILE.extractionFingerprint,
+        extractorFingerprint: FS_TEXT_PROFILE.extractorFingerprint,
+        recordSchemaFingerprint: FS_TEXT_PROFILE.recordSchemaFingerprint,
+        normalizationFingerprint: FS_TEXT_PROFILE.normalizationFingerprint,
+        chunkerFingerprint: FS_TEXT_PROFILE.chunkerFingerprint,
+        correctionRevision: undefined,
+      }
+    : {
+        representation: "archived_binary_v1" as const,
+        mediaType: entry.content.mediaType,
+        profileId: entry.content.parserProfileId,
+        parserFingerprint: entry.content.parserFingerprint,
+        extractionConfigurationFingerprint:
+          entry.content.extractionConfigurationFingerprint,
+        extractionFingerprint: "artifact-bound-extraction:v1",
+        extractorFingerprint: entry.content.extractorFingerprint,
+        recordSchemaFingerprint: entry.content.recordSchemaFingerprint,
+        normalizationFingerprint: entry.content.normalizationFingerprint,
+        chunkerFingerprint: entry.content.chunkerFingerprint,
+        correctionRevision: entry.content.correctionRevision,
+      };
+}
 
 type LoadedWorkerSource = Awaited<
   ReturnType<typeof requireWorkerSourceAccount>
@@ -529,23 +564,50 @@ async function entryDigests(
           FS_TEXT_PROFILE.normalizationFingerprint,
           FS_TEXT_PROFILE.chunkerFingerprint,
         ])
-      : undefined;
+      : entry.content.status === "ready_binary_v1"
+        ? await digest("worker-fs-binary-processing-identity:v1", [
+            entry.content.sha256,
+            entry.content.mediaType,
+            entry.content.parserProfileId,
+            entry.content.parserFingerprint,
+            entry.content.extractionConfigurationFingerprint,
+            entry.content.extractorFingerprint,
+            entry.content.recordSchemaFingerprint,
+            entry.content.normalizationFingerprint,
+            entry.content.chunkerFingerprint,
+            entry.content.correctionRevision,
+          ])
+        : undefined;
+  const inventoryMetadataDigest =
+    entry.content.status === "ready_binary_v1"
+      ? await digest("worker-fs-binary-inventory-metadata:v1", [
+          extHash ?? null,
+          pathDigest,
+          entry.title ?? null,
+          entry.docType ?? null,
+          entry.sourceModifiedAt,
+          entry.content.status,
+          entry.content.sha256,
+          entry.content.byteLength,
+          entry.content.parserProfileId,
+        ])
+      : await digest("worker-fs-inventory-metadata:v1", [
+          extHash ?? null,
+          pathDigest,
+          entry.title ?? null,
+          entry.docType ?? null,
+          entry.sourceModifiedAt,
+          entry.content.status,
+          entry.content.status === "ready" ? entry.content.sha256 : null,
+          entry.content.status === "ready" ? entry.content.byteLength : null,
+          entry.content.status === "gap" ? entry.content.code : null,
+          FS_TEXT_PROFILE.profileId,
+        ]);
   return {
     ...(extHash === undefined ? {} : { externalIdHash: extHash }),
     uriDigest: pathDigest,
     identityKeyHash: extHash ?? pathDigest,
-    inventoryMetadataDigest: await digest("worker-fs-inventory-metadata:v1", [
-      extHash ?? null,
-      pathDigest,
-      entry.title ?? null,
-      entry.docType ?? null,
-      entry.sourceModifiedAt,
-      entry.content.status,
-      entry.content.status === "ready" ? entry.content.sha256 : null,
-      entry.content.status === "ready" ? entry.content.byteLength : null,
-      entry.content.status === "gap" ? entry.content.code : null,
-      FS_TEXT_PROFILE.profileId,
-    ]),
+    inventoryMetadataDigest,
     ...(processingIdentityDigest === undefined
       ? {}
       : { processingIdentityDigest }),
@@ -678,10 +740,27 @@ async function insertReviewEntry(
     ...(args.digests.processingIdentityDigest === undefined
       ? {}
       : { processingIdentityDigest: args.digests.processingIdentityDigest }),
-    ...(args.entry.content.status === "ready"
+    ...(isReadyEntry(args.entry)
       ? {
           contentHash: args.entry.content.sha256,
           byteLength: args.entry.content.byteLength,
+          contentRepresentation: processingProfile(args.entry).representation,
+          ...(args.entry.content.status === "ready_binary_v1"
+            ? {
+                binaryParserProfileId: args.entry.content.parserProfileId,
+                binaryMediaType: args.entry.content.mediaType,
+                parserFingerprint: args.entry.content.parserFingerprint,
+                extractionConfigurationFingerprint:
+                  args.entry.content.extractionConfigurationFingerprint,
+                extractorFingerprint: args.entry.content.extractorFingerprint,
+                recordSchemaFingerprint:
+                  args.entry.content.recordSchemaFingerprint,
+                normalizationFingerprint:
+                  args.entry.content.normalizationFingerprint,
+                chunkerFingerprint: args.entry.content.chunkerFingerprint,
+                correctionRevision: args.entry.content.correctionRevision,
+              }
+            : {}),
         }
       : {}),
     sourceModifiedAt: args.entry.sourceModifiedAt,
@@ -857,6 +936,7 @@ async function createDiscoveryWork(
     now: number;
   },
 ): Promise<Doc<"workerDiscoveryWork"> | undefined> {
+  const profile = processingProfile(args.entry);
   let priorJob: Doc<"ingestJobs"> | undefined;
   if (args.priorWork) {
     priorJob = await obsoletePriorWork(
@@ -896,13 +976,26 @@ async function createDiscoveryWork(
     byteLength: args.entry.content.byteLength,
     capturedAt: args.now,
     sourceModifiedAt: args.entry.sourceModifiedAt,
-    mediaType: FS_TEXT_PROFILE.mediaType,
-    profileId: FS_TEXT_PROFILE.profileId,
-    extractionFingerprint: FS_TEXT_PROFILE.extractionFingerprint,
-    extractorFingerprint: FS_TEXT_PROFILE.extractorFingerprint,
-    recordSchemaFingerprint: FS_TEXT_PROFILE.recordSchemaFingerprint,
-    normalizationFingerprint: FS_TEXT_PROFILE.normalizationFingerprint,
-    chunkerFingerprint: FS_TEXT_PROFILE.chunkerFingerprint,
+    mediaType: profile.mediaType,
+    profileId: profile.profileId,
+    contentRepresentation: profile.representation,
+    ...(profile.parserFingerprint === undefined
+      ? {}
+      : { parserFingerprint: profile.parserFingerprint }),
+    ...(profile.extractionConfigurationFingerprint === undefined
+      ? {}
+      : {
+          extractionConfigurationFingerprint:
+            profile.extractionConfigurationFingerprint,
+        }),
+    ...(profile.correctionRevision === undefined
+      ? {}
+      : { correctionRevision: profile.correctionRevision }),
+    extractionFingerprint: profile.extractionFingerprint,
+    extractorFingerprint: profile.extractorFingerprint,
+    recordSchemaFingerprint: profile.recordSchemaFingerprint,
+    normalizationFingerprint: profile.normalizationFingerprint,
+    chunkerFingerprint: profile.chunkerFingerprint,
     ...(args.entry.title === undefined ? {} : { title: args.entry.title }),
     ...(args.entry.docType === undefined
       ? {}
@@ -973,6 +1066,9 @@ async function persistResolvedEntry(
   const activeRevision = activeGeneration
     ? await ctx.db.get(activeGeneration.sourceRevisionId)
     : null;
+  const activeParserArtifact = activeGeneration?.parserArtifactId
+    ? await ctx.db.get(activeGeneration.parserArtifactId)
+    : null;
   if (
     activeGeneration &&
     (activeGeneration.spaceId !== args.source.spaceId ||
@@ -990,7 +1086,7 @@ async function persistResolvedEntry(
     args.item.workerInventoryMetadataDigest !==
     args.digests.inventoryMetadataDigest;
   const resumesInterruptedDesiredProcessing =
-    args.entry.content.status === "ready" &&
+    isReadyEntry(args.entry) &&
     args.item.desiredRevisionId !== undefined &&
     currentWorkBeforeObservation === undefined &&
     (activeGeneration === null ||
@@ -999,7 +1095,7 @@ async function persistResolvedEntry(
       activeGeneration.desiredProcessingEpoch !==
         args.item.desiredProcessingEpoch);
   const processingIdentityChanged =
-    args.entry.content.status === "ready" &&
+    isReadyEntry(args.entry) &&
     (args.item.workerProcessingIdentityDigest !==
       args.digests.processingIdentityDigest ||
       resumesInterruptedDesiredProcessing);
@@ -1028,11 +1124,11 @@ async function persistResolvedEntry(
     workerObservationEpoch: observationEpoch,
     workerProcessingEpoch: processingEpoch,
     workerInventoryMetadataDigest: args.digests.inventoryMetadataDigest,
-    ...(args.entry.content.status === "ready"
+    ...(isReadyEntry(args.entry)
       ? {
           workerProcessingIdentityDigest: args.digests.processingIdentityDigest,
           workerContentHash: args.entry.content.sha256,
-          workerProfileId: FS_TEXT_PROFILE.profileId,
+          workerProfileId: processingProfile(args.entry).profileId,
         }
       : {}),
     workerSourceModifiedAt: args.entry.sourceModifiedAt,
@@ -1067,6 +1163,29 @@ async function persistResolvedEntry(
         ctx.db.get(desiredJob.processingGenerationId),
         ctx.db.get(desiredJob.sourceRevisionId),
       ]);
+    const candidateArtifact = candidateGeneration?.parserArtifactId
+      ? await ctx.db.get(candidateGeneration.parserArtifactId)
+      : null;
+    const candidateBinary =
+      candidate?.contentRepresentation === "archived_binary_v1";
+    const candidateExtractionFingerprint = candidateBinary
+      ? candidate &&
+        candidateGeneration &&
+        candidateArtifact &&
+        candidate.parserFingerprint &&
+        candidate.extractionConfigurationFingerprint
+        ? await digest("kith-parsed-extraction:v1", [
+            candidate.parserFingerprint,
+            candidateArtifact.outputHash,
+            candidate.extractionConfigurationFingerprint,
+          ])
+        : undefined
+      : candidate?.extractionFingerprint;
+    const candidateCorrectionRevision = candidateBinary
+      ? candidate?.correctionRevision
+      : candidate
+        ? `filesystem-observation-v1:${candidate.processingEpoch}`
+        : undefined;
     if (
       !candidate ||
       !candidateGeneration ||
@@ -1094,6 +1213,15 @@ async function persistResolvedEntry(
       candidateRevision.contentHash !== candidate.contentHash ||
       candidateRevision.byteLength !== candidate.byteLength ||
       candidateRevision.mediaType !== candidate.mediaType ||
+      (candidateBinary &&
+        (!candidateArtifact ||
+          candidateArtifact.spaceId !== candidate.spaceId ||
+          candidateArtifact.sourceAccountId !== candidate.sourceAccountId ||
+          candidateArtifact.sourceItemId !== candidate.sourceItemId ||
+          candidateArtifact.sourceRevisionId !== candidateRevision._id ||
+          candidateArtifact._id !== candidateGeneration.parserArtifactId ||
+          candidateArtifact.parserFingerprint !==
+            candidate.parserFingerprint)) ||
       candidateGeneration.spaceId !== candidate.spaceId ||
       candidateGeneration.sourceAccountId !== candidate.sourceAccountId ||
       candidateGeneration.sourceItemId !== candidate.sourceItemId ||
@@ -1102,7 +1230,7 @@ async function persistResolvedEntry(
         desiredJob.desiredProcessingEpoch ||
       candidateGeneration.state !== desiredJob.state ||
       candidateGeneration.extractionFingerprint !==
-        candidate.extractionFingerprint ||
+        candidateExtractionFingerprint ||
       candidateGeneration.extractorFingerprint !==
         candidate.extractorFingerprint ||
       candidateGeneration.recordSchemaFingerprint !==
@@ -1110,16 +1238,15 @@ async function persistResolvedEntry(
       candidateGeneration.normalizationFingerprint !==
         candidate.normalizationFingerprint ||
       candidateGeneration.chunkerFingerprint !== candidate.chunkerFingerprint ||
-      candidateGeneration.correctionRevision !==
-        `filesystem-observation-v1:${candidate.processingEpoch}` ||
+      candidateGeneration.correctionRevision !== candidateCorrectionRevision ||
       candidateGeneration.processingFingerprint !==
         (await digestProcessingConfiguration({
-          extractionFingerprint: candidate.extractionFingerprint,
+          extractionFingerprint: candidateExtractionFingerprint!,
           extractorFingerprint: candidate.extractorFingerprint,
           recordSchemaFingerprint: candidate.recordSchemaFingerprint,
           normalizationFingerprint: candidate.normalizationFingerprint,
           chunkerFingerprint: candidate.chunkerFingerprint,
-          correctionRevision: `filesystem-observation-v1:${candidate.processingEpoch}`,
+          correctionRevision: candidateCorrectionRevision!,
         }))
     ) {
       throw workerProtocolError("scan_conflict");
@@ -1156,8 +1283,31 @@ async function persistResolvedEntry(
     }
     priorWork = candidate;
   }
+  const profile = isReadyEntry(args.entry)
+    ? processingProfile(args.entry)
+    : undefined;
+  const activeExtractionMatches =
+    profile?.representation === "archived_binary_v1"
+      ? activeGeneration !== null &&
+        activeRevision !== null &&
+        activeParserArtifact !== null &&
+        activeParserArtifact.spaceId === args.source.spaceId &&
+        activeParserArtifact.sourceAccountId === args.source.account._id &&
+        activeParserArtifact.sourceItemId === args.item._id &&
+        activeParserArtifact.sourceRevisionId === activeRevision._id &&
+        activeParserArtifact._id === activeGeneration.parserArtifactId &&
+        activeParserArtifact.parserFingerprint === profile.parserFingerprint &&
+        activeGeneration.extractionFingerprint ===
+          (await digest("kith-parsed-extraction:v1", [
+            profile.parserFingerprint,
+            activeParserArtifact.outputHash,
+            profile.extractionConfigurationFingerprint,
+          ])) &&
+        activeGeneration.correctionRevision === profile.correctionRevision
+      : activeGeneration?.extractionFingerprint ===
+        profile?.extractionFingerprint;
   const alreadyReady =
-    args.entry.content.status === "ready" &&
+    isReadyEntry(args.entry) &&
     activeGeneration !== null &&
     activeRevision !== null &&
     activeGeneration.state === "ready" &&
@@ -1166,16 +1316,14 @@ async function persistResolvedEntry(
       args.item.desiredProcessingEpoch &&
     activeRevision.contentHash === args.entry.content.sha256 &&
     activeRevision.byteLength === args.entry.content.byteLength &&
-    activeRevision.mediaType === FS_TEXT_PROFILE.mediaType &&
-    activeGeneration.extractionFingerprint ===
-      FS_TEXT_PROFILE.extractionFingerprint &&
-    activeGeneration.extractorFingerprint ===
-      FS_TEXT_PROFILE.extractorFingerprint &&
+    activeRevision.mediaType === profile?.mediaType &&
+    activeExtractionMatches &&
+    activeGeneration.extractorFingerprint === profile?.extractorFingerprint &&
     activeGeneration.recordSchemaFingerprint ===
-      FS_TEXT_PROFILE.recordSchemaFingerprint &&
+      profile?.recordSchemaFingerprint &&
     activeGeneration.normalizationFingerprint ===
-      FS_TEXT_PROFILE.normalizationFingerprint &&
-    activeGeneration.chunkerFingerprint === FS_TEXT_PROFILE.chunkerFingerprint;
+      profile?.normalizationFingerprint &&
+    activeGeneration.chunkerFingerprint === profile?.chunkerFingerprint;
   const entryState =
     args.entry.content.status === "gap"
       ? "gap"
@@ -1201,10 +1349,27 @@ async function persistResolvedEntry(
     ...(args.digests.processingIdentityDigest === undefined
       ? {}
       : { processingIdentityDigest: args.digests.processingIdentityDigest }),
-    ...(args.entry.content.status === "ready"
+    ...(isReadyEntry(args.entry)
       ? {
           contentHash: args.entry.content.sha256,
           byteLength: args.entry.content.byteLength,
+          contentRepresentation: processingProfile(args.entry).representation,
+          ...(args.entry.content.status === "ready_binary_v1"
+            ? {
+                binaryParserProfileId: args.entry.content.parserProfileId,
+                binaryMediaType: args.entry.content.mediaType,
+                parserFingerprint: args.entry.content.parserFingerprint,
+                extractionConfigurationFingerprint:
+                  args.entry.content.extractionConfigurationFingerprint,
+                extractorFingerprint: args.entry.content.extractorFingerprint,
+                recordSchemaFingerprint:
+                  args.entry.content.recordSchemaFingerprint,
+                normalizationFingerprint:
+                  args.entry.content.normalizationFingerprint,
+                chunkerFingerprint: args.entry.content.chunkerFingerprint,
+                correctionRevision: args.entry.content.correctionRevision,
+              }
+            : {}),
         }
       : {}),
     sourceModifiedAt: args.entry.sourceModifiedAt,
@@ -1219,9 +1384,12 @@ async function persistResolvedEntry(
   });
   let work: Doc<"workerDiscoveryWork"> | undefined;
   if (
-    args.entry.content.status === "ready" &&
+    isReadyEntry(args.entry) &&
     entryState === "queued" &&
-    (inventoryChanged || !priorWork || priorWork.state === "obsolete")
+    (processingIdentityChanged ||
+      inventoryChanged ||
+      !priorWork ||
+      priorWork.state === "obsolete")
   ) {
     work = await createDiscoveryWork(ctx, {
       source: args.source,
@@ -1477,6 +1645,19 @@ export async function appendWorkerScanPage(
   now: number,
 ): Promise<WorkerScanAppendResult> {
   const source = await requireWorkerSourceAccount(ctx, principal, request);
+  if (
+    request.entries.some(
+      (entry) => entry.content.status === "ready_binary_v1",
+    ) &&
+    (source.account.binaryProfileId !== "pdf_docqa_v1" ||
+      source.account.binaryProfileEnabledAt === undefined ||
+      !Number.isSafeInteger(source.account.binaryProfileEnabledAt) ||
+      source.account.binaryProfileEnabledAt < 0 ||
+      source.account.binaryProfileAuditDigest === undefined ||
+      !/^[0-9a-f]{64}$/.test(source.account.binaryProfileAuditDigest))
+  ) {
+    throw workerProtocolError("source_unavailable");
+  }
   const scan = await loadScan(ctx, source, request.scanId);
   const requestDigest = await digest("worker-scan-page:v1", [
     source.account._id,

@@ -183,6 +183,23 @@ export const sourceArtifactArchiveReceiptFields = {
   createdAt: v.number(),
 };
 
+export const sourceArtifactArchiveBindingFields = {
+  spaceId: v.id("spaces"),
+  sourceAccountId: v.id("sourceAccounts"),
+  sourceItemId: v.id("sourceItems"),
+  sourceRevisionId: v.id("sourceRevisions"),
+  parserArtifactId: v.optional(v.id("sourceParserArtifacts")),
+  subjectKind: archiveSubjectKindValidator,
+  subjectKey: v.string(),
+  copyRole: archiveCopyRoleValidator,
+  receiptId: v.id("sourceArtifactArchiveReceipts"),
+  archiveIdentityFingerprint: v.string(),
+  bindingEpoch: v.number(),
+  updatedAt: v.number(),
+  userId: v.id("users"),
+  actorCredentialId: v.id("apiKeys"),
+};
+
 export const sourcePageFields = {
   spaceId: v.id("spaces"),
   sourceTextVersionId: v.id("sourceTextVersions"),

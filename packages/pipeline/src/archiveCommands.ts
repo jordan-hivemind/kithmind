@@ -166,6 +166,36 @@ function sameIdentity(left: FileIdentity, right: FileIdentity): boolean {
   );
 }
 
+function sameDirectoryIdentity(left: Stats, right: Stats): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+async function safeDirectoryAncestors(
+  path: string,
+  label: string,
+): Promise<void> {
+  const uid = currentUid();
+  let ancestor = path;
+  for (let depth = 0; ; depth += 1) {
+    if (depth >= 256) fail("unsafe_path", `${label} ancestry is too deep`);
+    const entry = await lstat(ancestor).catch(() =>
+      fail("unsafe_path", `${label} ancestor is unavailable`),
+    );
+    const protectedSticky = entry.uid === 0 && (entry.mode & 0o1000) !== 0;
+    if (
+      !entry.isDirectory() ||
+      entry.isSymbolicLink() ||
+      (entry.uid !== uid && entry.uid !== 0) ||
+      ((entry.mode & 0o022) !== 0 && !protectedSticky)
+    ) {
+      fail("unsafe_path", `${label} ancestor is not trusted`);
+    }
+    const next = dirname(ancestor);
+    if (next === ancestor) return;
+    ancestor = next;
+  }
+}
+
 function safeDirectoryEntry(entry: Stats, label: string): void {
   if (
     entry.isSymbolicLink() ||
@@ -195,6 +225,7 @@ async function safeDirectory(path: string, label: string): Promise<Stats> {
   if (canonical !== requested) {
     fail("unsafe_path", `${label} must be canonical`);
   }
+  await safeDirectoryAncestors(canonical, label);
   const after = await lstat(canonical).catch(() =>
     fail("unsafe_path", `${label} changed during validation`),
   );
@@ -202,6 +233,7 @@ async function safeDirectory(path: string, label: string): Promise<Stats> {
   if (before.dev !== after.dev || before.ino !== after.ino) {
     fail("unsafe_path", `${label} changed during validation`);
   }
+  await safeDirectoryAncestors(canonical, label);
   return after;
 }
 
@@ -940,6 +972,10 @@ async function encryptAgeObjectInternal(
   if (sourcePath === outputPath) {
     fail("invalid_input", "source and output paths must differ");
   }
+  const archiveDirectory = await safeDirectory(
+    dirname(outputPath),
+    "archive object directory",
+  );
   const source = await readExactFile(
     sourcePath,
     commandLimits.maxSourceBytes,
@@ -966,11 +1002,25 @@ async function encryptAgeObjectInternal(
       true,
     );
     ciphertext.bytes.fill(0);
+    const archiveDirectoryAfter = await safeDirectory(
+      dirname(outputPath),
+      "archive object directory",
+    );
+    if (!sameDirectoryIdentity(archiveDirectory, archiveDirectoryAfter)) {
+      fail(
+        "source_changed",
+        "archive object directory changed during preparation",
+      );
+    }
     return {
       state: "prepared",
       tempPath: outputPath,
       source: expected,
       ciphertext: ciphertext.digest,
+      ciphertextDevice: ciphertext.identity.device,
+      ciphertextInode: ciphertext.identity.inode,
+      archiveDirectoryDevice: archiveDirectory.dev,
+      archiveDirectoryInode: archiveDirectory.ino,
       ageVersion: AGE_VERSION,
     };
   } finally {
@@ -992,6 +1042,18 @@ async function publishAgeObjectInternal(
     commandLimits.maxCipherBytes,
   );
   const source = expectedFile(prepared.source, commandLimits.maxSourceBytes);
+  if (
+    !Number.isSafeInteger(prepared.ciphertextDevice) ||
+    prepared.ciphertextDevice < 0 ||
+    !Number.isSafeInteger(prepared.ciphertextInode) ||
+    prepared.ciphertextInode < 1 ||
+    !Number.isSafeInteger(prepared.archiveDirectoryDevice) ||
+    prepared.archiveDirectoryDevice < 0 ||
+    !Number.isSafeInteger(prepared.archiveDirectoryInode) ||
+    prepared.archiveDirectoryInode < 1
+  ) {
+    fail("invalid_input", "prepared ciphertext identity is invalid");
+  }
   const tempPath = safeAbsolutePath(prepared.tempPath, "temporary object");
   const objectPath = safeAbsolutePath(finalPath, "final object");
   if (tempPath === objectPath || dirname(tempPath) !== dirname(objectPath)) {
@@ -1000,7 +1062,31 @@ async function publishAgeObjectInternal(
   if (!OBJECT_NAME.test(basename(objectPath))) {
     fail("invalid_input", "final object name is invalid");
   }
-  await safeDirectory(dirname(tempPath), "archive object directory");
+  const archiveDirectory = await safeDirectory(
+    dirname(tempPath),
+    "archive object directory",
+  );
+  if (
+    archiveDirectory.dev !== prepared.archiveDirectoryDevice ||
+    archiveDirectory.ino !== prepared.archiveDirectoryInode
+  ) {
+    fail("unsafe_path", "archive object directory does not match preparation");
+  }
+  const cleanupOwnedObject = async (
+    path: string,
+    expectedIdentity: FileIdentity,
+  ) => {
+    const currentDirectory = await safeDirectory(
+      dirname(path),
+      "archive object directory",
+    ).catch(() => undefined);
+    if (
+      currentDirectory !== undefined &&
+      sameDirectoryIdentity(archiveDirectory, currentDirectory)
+    ) {
+      await unlinkExact(path, expectedIdentity);
+    }
+  };
   const temporary = await readExactFile(
     tempPath,
     commandLimits.maxCipherBytes,
@@ -1008,6 +1094,8 @@ async function publishAgeObjectInternal(
   );
   temporary.bytes.fill(0);
   if (
+    temporary.identity.device !== prepared.ciphertextDevice ||
+    temporary.identity.inode !== prepared.ciphertextInode ||
     temporary.digest.sha256 !== expected.sha256 ||
     temporary.digest.byteLength !== expected.byteLength
   ) {
@@ -1031,23 +1119,39 @@ async function publishAgeObjectInternal(
     linkedIdentity.device !== temporary.identity.device ||
     linkedIdentity.inode !== temporary.identity.inode
   ) {
-    await unlinkExact(objectPath, linkedIdentity);
+    // The observed inode may be an unrelated replacement. Cleanup can only
+    // target the inode owned by the persisted preparation.
+    await cleanupOwnedObject(objectPath, temporary.identity);
     fail("unsafe_path", "published object does not match prepared object");
+  }
+  const archiveDirectoryBeforeRead = await safeDirectory(
+    dirname(objectPath),
+    "archive object directory",
+  );
+  if (!sameDirectoryIdentity(archiveDirectory, archiveDirectoryBeforeRead)) {
+    fail("unsafe_path", "archive object directory changed during publication");
   }
   const published = await readExactFile(
     objectPath,
     commandLimits.maxCipherBytes,
     true,
   ).catch(async (error: unknown) => {
-    await unlinkExact(objectPath, linkedIdentity);
+    await cleanupOwnedObject(objectPath, linkedIdentity);
     throw error;
   });
   published.bytes.fill(0);
+  const archiveDirectoryAfterRead = await safeDirectory(
+    dirname(objectPath),
+    "archive object directory",
+  );
+  if (!sameDirectoryIdentity(archiveDirectory, archiveDirectoryAfterRead)) {
+    fail("unsafe_path", "archive object directory changed during readback");
+  }
   if (
     published.digest.sha256 !== expected.sha256 ||
     published.digest.byteLength !== expected.byteLength
   ) {
-    await unlinkExact(objectPath, linkedIdentity);
+    await cleanupOwnedObject(objectPath, linkedIdentity);
     fail("digest_mismatch", "published ciphertext is inconsistent");
   }
   const directoryHandle = await open(
@@ -1055,8 +1159,20 @@ async function publishAgeObjectInternal(
     constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
   );
   try {
+    if (
+      !sameDirectoryIdentity(archiveDirectory, await directoryHandle.stat())
+    ) {
+      fail("unsafe_path", "archive object directory changed before cleanup");
+    }
     await directoryHandle.sync();
-    await unlink(tempPath);
+    const currentDirectory = await safeDirectory(
+      dirname(tempPath),
+      "archive object directory",
+    );
+    if (!sameDirectoryIdentity(archiveDirectory, currentDirectory)) {
+      fail("unsafe_path", "archive object directory changed before cleanup");
+    }
+    await unlinkExact(tempPath, temporary.identity);
     await directoryHandle.sync();
   } finally {
     await directoryHandle.close();
@@ -1066,8 +1182,75 @@ async function publishAgeObjectInternal(
     objectPath,
     source,
     ciphertext: expected,
+    ciphertextDevice: prepared.ciphertextDevice,
+    ciphertextInode: prepared.ciphertextInode,
     ageVersion: AGE_VERSION,
   };
+}
+
+async function recoverPublishedAgeObjectInternal(
+  prepared: PreparedAgeObject,
+  finalPath: string,
+  requestedLimits: ArchiveCommandLimits = DEFAULT_ARCHIVE_COMMAND_LIMITS,
+): Promise<void> {
+  const commandLimits = limits(requestedLimits);
+  if (prepared.state !== "prepared" || prepared.ageVersion !== AGE_VERSION) {
+    fail("invalid_input", "prepared ciphertext is invalid");
+  }
+  const ciphertext = expectedFile(
+    prepared.ciphertext,
+    commandLimits.maxCipherBytes,
+  );
+  expectedFile(prepared.source, commandLimits.maxSourceBytes);
+  if (
+    !Number.isSafeInteger(prepared.ciphertextDevice) ||
+    prepared.ciphertextDevice < 0 ||
+    !Number.isSafeInteger(prepared.ciphertextInode) ||
+    prepared.ciphertextInode < 1 ||
+    !Number.isSafeInteger(prepared.archiveDirectoryDevice) ||
+    prepared.archiveDirectoryDevice < 0 ||
+    !Number.isSafeInteger(prepared.archiveDirectoryInode) ||
+    prepared.archiveDirectoryInode < 1
+  ) {
+    fail("invalid_input", "prepared ciphertext identity is invalid");
+  }
+  const tempPath = safeAbsolutePath(prepared.tempPath, "temporary object");
+  const objectPath = safeAbsolutePath(finalPath, "final object");
+  if (tempPath === objectPath || dirname(tempPath) !== dirname(objectPath)) {
+    fail("invalid_input", "publication must stay in one directory");
+  }
+  if (!OBJECT_NAME.test(basename(objectPath))) {
+    fail("invalid_input", "final object name is invalid");
+  }
+  const archiveDirectory = await safeDirectory(
+    dirname(objectPath),
+    "archive object directory",
+  );
+  if (
+    archiveDirectory.dev !== prepared.archiveDirectoryDevice ||
+    archiveDirectory.ino !== prepared.archiveDirectoryInode
+  ) {
+    fail("unsafe_path", "archive object directory does not match preparation");
+  }
+  const recovered = await readExactFile(
+    objectPath,
+    commandLimits.maxCipherBytes,
+    true,
+  );
+  const archiveDirectoryAfter = await safeDirectory(
+    dirname(objectPath),
+    "archive object directory",
+  );
+  recovered.bytes.fill(0);
+  if (
+    !sameDirectoryIdentity(archiveDirectory, archiveDirectoryAfter) ||
+    recovered.identity.device !== prepared.ciphertextDevice ||
+    recovered.identity.inode !== prepared.ciphertextInode ||
+    recovered.digest.sha256 !== ciphertext.sha256 ||
+    recovered.digest.byteLength !== ciphertext.byteLength
+  ) {
+    fail("digest_mismatch", "published ciphertext recovery is inconsistent");
+  }
 }
 
 async function assessLocalBackupBoundaryInternal(
@@ -1371,6 +1554,21 @@ export async function publishAgeObject(
 ): Promise<PublishedAgeObject> {
   return publicOperation(() =>
     publishAgeObjectInternal(prepared, finalPath, requestedLimits),
+  );
+}
+
+/**
+ * Re-open a cataloged age object after a crash. This never creates, replaces,
+ * removes, or adopts an object: a durable catalog must already bind the stable
+ * name, ciphertext digest, and publication inode/device.
+ */
+export async function recoverPublishedAgeObject(
+  prepared: PreparedAgeObject,
+  finalPath: string,
+  requestedLimits: ArchiveCommandLimits = DEFAULT_ARCHIVE_COMMAND_LIMITS,
+): Promise<void> {
+  return publicOperation(() =>
+    recoverPublishedAgeObjectInternal(prepared, finalPath, requestedLimits),
   );
 }
 

@@ -2,11 +2,11 @@
 
 ## Status
 
-The P2-9 parser and archive helpers are currently inert. They are not wired
-into the filesystem worker, remote worker protocol, or journal. The additive
-database foundation preserves existing text ingestion; production PDF ingestion
-remains disabled. Owner documents require the integration and recovery checks
-below.
+The P2-9 parser, capture, and archive helpers are not yet wired into the
+filesystem runner or journal. The additive cloud admission protocol has an
+explicit disabled source gate. Parsed staging and activation remain future
+work. Existing text ingestion is preserved; owner documents require the
+integration and recovery checks below.
 
 The foundation converts one bounded, privately captured PDF with the pinned
 parser runtime and returns two separate artifacts:
@@ -20,14 +20,27 @@ or oversized input and unsafe conversion output. Its parent must supply the
 actual network-denied, resource-bounded subprocess boundary. A Python flag or
 the parent attestation alone is not that boundary.
 
+The optional macOS parent helper supplies that boundary with a deny-default
+OS sandbox, separate network/fork/exec probes, supported process limits, a
+wall deadline, bounded output, and process monitoring. Each invocation uses
+an empty private output directory. RSS is a sampled ceiling, not a strict
+allocation cap. Unsupported platforms fail closed. Capture deadlines do not
+guarantee cancellation of every pending kernel filesystem operation.
+
+`prepare_pdf_profile` verifies the installed runtime and model assets and
+computes the parser and extraction-configuration identities without parsing a
+PDF. The scan can therefore identify its configuration before conversion.
+After conversion, the final extraction fingerprint also binds the retained
+parser artifact digest, using the shared derivation in the
+[original-byte contract](plans/2026-09-07-original-byte-contract.md).
+
 ## What remains before use
 
-The parent integration must still provide secure capture handling, operating
-system sandboxing and resource limits, durable journal and replay behavior,
-remote binary admission, private artifact retention, and authorized cleanup or
-forget behavior. It must invoke the externally pinned archive executables and
-bind their output to the source revision. This foundation does not make the
-existing worker ready for PDFs.
+The runner must connect the capture and parser boundary to durable journal
+and replay behavior, cloud admission and parsed staging, private artifact
+retention, and authorized cleanup or forget behavior. It must invoke the
+externally pinned archive executables and bind their output to the source
+revision. This foundation does not make the existing worker ready for PDFs.
 
 The document-Q&A trial may publish verified pages and citations. It does not
 automatically publish structured records. Field extraction, review, coverage,

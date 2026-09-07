@@ -62,6 +62,12 @@ export type PreparedAgeObject = {
   tempPath: string;
   source: Sha256File;
   ciphertext: Sha256File;
+  /** Durable no-clobber publication identity for crash recovery. */
+  ciphertextDevice: number;
+  ciphertextInode: number;
+  /** Trusted archive directory identity captured with the prepared object. */
+  archiveDirectoryDevice: number;
+  archiveDirectoryInode: number;
   ageVersion: typeof AGE_VERSION;
 };
 
@@ -70,6 +76,9 @@ export type PublishedAgeObject = {
   objectPath: string;
   source: Sha256File;
   ciphertext: Sha256File;
+  /** Copied from the durable prepared publication intent. */
+  ciphertextDevice: number;
+  ciphertextInode: number;
   ageVersion: typeof AGE_VERSION;
 };
 
