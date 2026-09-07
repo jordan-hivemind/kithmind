@@ -5,6 +5,8 @@ import { api, internal } from "../../_generated/api";
 import schema from "../../schema";
 import { modules } from "../../test.setup";
 
+type TestBackend = ReturnType<typeof convexTest>;
+
 const issuer = "https://brain.example.test";
 const embedding = Array.from({ length: 1536 }, () => 0);
 const metadata = {
@@ -14,6 +16,23 @@ const metadata = {
   actionItems: [],
   summary: "Core identity fact",
 };
+
+async function createPersonalUser(t: TestBackend) {
+  return await t.run(async (ctx) => {
+    const userId = await ctx.db.insert("users", {});
+    const spaceId = await ctx.db.insert("spaces", {
+      kind: "personal",
+      name: "Personal",
+      createdBy: userId,
+    });
+    await ctx.db.insert("spaceMembers", { spaceId, userId, role: "owner" });
+    await ctx.db.insert("userSpaceSettings", {
+      userId,
+      personalSpaceId: spaceId,
+    });
+    return { userId, spaceId };
+  });
+}
 
 describe("core memories", () => {
   const originalIssuer = process.env.MCP_JWT_ISSUER;
@@ -251,13 +270,14 @@ describe("core memories", () => {
 
   test("prevents cross-account core updates and transitions without partial writes", async () => {
     const t = convexTest(schema, modules);
-    const [ownerId, otherId] = await t.run(async (ctx) => [
-      await ctx.db.insert("users", {}),
-      await ctx.db.insert("users", {}),
-    ]);
+    const owner = await createPersonalUser(t);
+    const other = await createPersonalUser(t);
+    const ownerId = owner.userId;
+    const otherId = other.userId;
     const [ownerMemoryId, otherMemoryId] = await t.run(async (ctx) => [
       await ctx.db.insert("thoughts", {
         userId: ownerId,
+        spaceId: owner.spaceId,
         content: "Owner core memory",
         embedding,
         metadata,
@@ -265,6 +285,7 @@ describe("core memories", () => {
       }),
       await ctx.db.insert("thoughts", {
         userId: otherId,
+        spaceId: other.spaceId,
         content: "Other memory",
         embedding,
         metadata,

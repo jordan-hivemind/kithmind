@@ -8,7 +8,11 @@ import {
   thoughtMetadata,
   thoughtType,
 } from "./validators";
-import { _listBySpaces, _listCoreBySpaces } from "./model";
+import {
+  _listBySpaces,
+  _listCoreBySpaces,
+  _loadBoundedThoughtStatsRows,
+} from "./model";
 import { isFactActive } from "../facts/model";
 
 export const listRecent = query({
@@ -114,29 +118,8 @@ export const getStats = query({
       principal,
       args.spaceIds,
     );
-    const [thoughtPages, factPages] = await Promise.all([
-      Promise.all(
-        spaceIds.map((spaceId) =>
-          ctx.db
-            .query("thoughts")
-            .withIndex("by_spaceId", (q) => q.eq("spaceId", spaceId))
-            .take(10_001),
-        ),
-      ),
-      Promise.all(
-        spaceIds.map((spaceId) =>
-          ctx.db
-            .query("facts")
-            .withIndex("by_spaceId", (q) => q.eq("spaceId", spaceId))
-            .take(10_001),
-        ),
-      ),
-    ]);
-    const allThoughts = thoughtPages.flat();
-    const allFacts = factPages.flat();
-    if (allThoughts.length > 10_000 || allFacts.length > 10_000) {
-      throw new Error("Thought statistics exceed the bounded scope");
-    }
+    const { thoughts: allThoughts, facts: allFacts } =
+      await _loadBoundedThoughtStatsRows(ctx, spaceIds);
     const activeAt = Date.now();
     const currentThoughts = allThoughts.filter((thought) =>
       isMemoryActive(thought, activeAt),

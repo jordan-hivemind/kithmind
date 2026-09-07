@@ -2,7 +2,10 @@ import { query } from "../../_generated/server";
 import { v } from "convex/values";
 import { requireMcpUserId } from "../../lib/mcpAuth";
 import { insightCategory, insightStatus, dismissTag } from "./validators";
-import { _listInsightsByUserAndStatus } from "./model";
+import {
+  _filterInsightsByOwnedReports,
+  _listInsightsByUserAndStatus,
+} from "./model";
 
 const insightReturn = v.object({
   _id: v.id("insights"),
@@ -84,6 +87,6 @@ export const listInsights = query({
       results = combined.slice(0, limit);
     }
 
-    return results;
+    return await _filterInsightsByOwnedReports(ctx, userId, results);
   },
 });

@@ -4,6 +4,7 @@ import { convexTest } from "convex-test";
 import { api, internal } from "../../_generated/api";
 import schema from "../../schema";
 import { modules } from "../../test.setup";
+import { _loadBoundedThoughtStatsRows } from "./model";
 
 const mcpIssuer = "https://brain.example.test";
 const sessionIssuer = "https://brain.example.test/convex";
@@ -142,6 +143,15 @@ describe("thought space authorization", () => {
     ).rejects.toThrow("Space not found");
     const stats = await member.query(api.models.thoughts.public.getStats, {});
     expect(stats.totalThoughts).toBe(4);
+    await expect(
+      t.run((ctx) =>
+        _loadBoundedThoughtStatsRows(
+          ctx,
+          [seeded.memberPersonal, seeded.sharedSpaceId],
+          3,
+        ),
+      ),
+    ).rejects.toThrow("Thought statistics exceed the bounded scope");
   });
 
   test("direct ID and timeline hydration obey live key space scopes", async () => {

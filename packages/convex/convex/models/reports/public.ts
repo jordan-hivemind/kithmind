@@ -1,7 +1,7 @@
 import { query, mutation } from "../../_generated/server";
 import { internal as _internal } from "../../_generated/api";
 import { v } from "convex/values";
-import { requireWebUserId } from "../../lib/webAuth";
+import { requireWebPrincipal } from "../../lib/webAuth";
 import {
   insightCategory,
   insightStatus,
@@ -14,6 +14,7 @@ import {
   _listReportsByUser,
   _listInsightsByReport,
   _listInsightsByUserAndStatus,
+  _filterInsightsByOwnedReports,
   _findReportById,
   _findInsightById,
   _updateInsightStatus,
@@ -57,7 +58,7 @@ export const listReports = query({
   },
   returns: v.array(reportReturn),
   handler: async (ctx, args) => {
-    const userId = await requireWebUserId(ctx);
+    const { userId } = await requireWebPrincipal(ctx);
 
     return await _listReportsByUser(ctx, userId, args.limit ?? 20);
   },
@@ -67,7 +68,7 @@ export const getLatestReport = query({
   args: {},
   returns: v.union(reportReturn, v.null()),
   handler: async (ctx) => {
-    const userId = await requireWebUserId(ctx);
+    const { userId } = await requireWebPrincipal(ctx);
 
     const results = await _listReportsByUser(ctx, userId, 1);
     return results[0] ?? null;
@@ -80,13 +81,16 @@ export const listInsightsByReport = query({
   },
   returns: v.array(insightReturn),
   handler: async (ctx, args) => {
-    const userId = await requireWebUserId(ctx);
+    const { userId } = await requireWebPrincipal(ctx);
 
     const report = await _findReportById(ctx, args.reportId);
-    if (!report) throw new Error("Report not found");
-    if (report.userId !== userId) throw new Error("Not authorized");
+    if (!report || report.userId !== userId) {
+      throw new Error("Report not found");
+    }
 
-    return await _listInsightsByReport(ctx, args.reportId);
+    return (await _listInsightsByReport(ctx, args.reportId)).filter(
+      (insight) => insight.userId === userId,
+    );
   },
 });
 
@@ -94,14 +98,17 @@ export const listUnresolvedInsights = query({
   args: {},
   returns: v.array(insightReturn),
   handler: async (ctx) => {
-    const userId = await requireWebUserId(ctx);
+    const { userId } = await requireWebPrincipal(ctx);
 
     const [newInsights, notedInsights] = await Promise.all([
       _listInsightsByUserAndStatus(ctx, userId, "new"),
       _listInsightsByUserAndStatus(ctx, userId, "noted"),
     ]);
 
-    const combined = [...newInsights, ...notedInsights];
+    const combined = await _filterInsightsByOwnedReports(ctx, userId, [
+      ...newInsights,
+      ...notedInsights,
+    ]);
     combined.sort((a, b) => b._creationTime - a._creationTime);
 
     return combined;
@@ -112,7 +119,7 @@ export const listAllInsights = query({
   args: {},
   returns: v.array(insightReturn),
   handler: async (ctx) => {
-    const userId = await requireWebUserId(ctx);
+    const { userId } = await requireWebPrincipal(ctx);
 
     const [newI, notedI, doneI, dismissedI] = await Promise.all([
       _listInsightsByUserAndStatus(ctx, userId, "new"),
@@ -121,7 +128,12 @@ export const listAllInsights = query({
       _listInsightsByUserAndStatus(ctx, userId, "dismissed"),
     ]);
 
-    const combined = [...newI, ...notedI, ...doneI, ...dismissedI];
+    const combined = await _filterInsightsByOwnedReports(ctx, userId, [
+      ...newI,
+      ...notedI,
+      ...doneI,
+      ...dismissedI,
+    ]);
     combined.sort((a, b) => b._creationTime - a._creationTime);
     return combined;
   },
@@ -140,11 +152,16 @@ export const updateInsightStatus = mutation({
   },
   returns: v.null(),
   handler: async (ctx, args) => {
-    const userId = await requireWebUserId(ctx);
+    const { userId } = await requireWebPrincipal(ctx);
 
     const insight = await _findInsightById(ctx, args.insightId);
-    if (!insight) throw new Error("Insight not found");
-    if (insight.userId !== userId) throw new Error("Not authorized");
+    if (!insight || insight.userId !== userId) {
+      throw new Error("Insight not found");
+    }
+    const report = await _findReportById(ctx, insight.reportId);
+    if (!report || report.userId !== userId) {
+      throw new Error("Insight not found");
+    }
 
     await _updateInsightStatus(ctx, insight, {
       status: args.status,
@@ -174,11 +191,15 @@ export const deleteInsight = mutation({
     insightId: v.id("insights"),
   },
   handler: async (ctx, args) => {
-    const userId = await requireWebUserId(ctx);
+    const { userId } = await requireWebPrincipal(ctx);
 
     const insight = await ctx.db.get(args.insightId);
     if (!insight || insight.userId !== userId)
       throw new Error("Insight not found");
+    const report = await _findReportById(ctx, insight.reportId);
+    if (!report || report.userId !== userId) {
+      throw new Error("Insight not found");
+    }
 
     await ctx.db.delete(args.insightId);
 
@@ -198,7 +219,7 @@ export const deleteInsight = mutation({
 export const clearAllInsightsAndReports = mutation({
   args: {},
   handler: async (ctx) => {
-    const userId = await requireWebUserId(ctx);
+    const { userId } = await requireWebPrincipal(ctx);
 
     // Delete all insights
     const [newI, notedI, doneI, dismissedI] = await Promise.all([
@@ -207,7 +228,12 @@ export const clearAllInsightsAndReports = mutation({
       _listInsightsByUserAndStatus(ctx, userId, "done"),
       _listInsightsByUserAndStatus(ctx, userId, "dismissed"),
     ]);
-    const allInsights = [...newI, ...notedI, ...doneI, ...dismissedI];
+    const allInsights = await _filterInsightsByOwnedReports(ctx, userId, [
+      ...newI,
+      ...notedI,
+      ...doneI,
+      ...dismissedI,
+    ]);
     for (const insight of allInsights) {
       await ctx.db.delete(insight._id);
     }

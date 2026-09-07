@@ -1,7 +1,7 @@
 import type { Infer } from "convex/values";
 import type { Expression, FilterBuilder, NamedTableInfo } from "convex/server";
 
-import type { DataModel, Id } from "../../_generated/dataModel";
+import type { DataModel, Doc, Id } from "../../_generated/dataModel";
 import type { MutationCtx, QueryCtx } from "../../_generated/server";
 import {
   assertValidMemoryValidity,
@@ -28,6 +28,7 @@ export const MAX_CORE_MEMORY_LIMIT = 25;
 export const DEFAULT_THOUGHT_LIMIT = 20;
 export const MAX_THOUGHT_LIMIT = 100;
 const MAX_FILTER_SCAN = 1_000;
+export const MAX_THOUGHT_STATS_ROWS = 10_000;
 
 export function boundedThoughtLimit(
   requestedLimit: number | undefined,
@@ -195,6 +196,41 @@ export async function _listCoreBySpaces(
     ),
   );
   return rows.flat().sort(compareNewestFirst).slice(0, limit);
+}
+
+/** Loads complete stats inputs under one global row budget per table. */
+export async function _loadBoundedThoughtStatsRows(
+  ctx: QueryCtx,
+  spaceIds: readonly Id<"spaces">[],
+  maxRows: number = MAX_THOUGHT_STATS_ROWS,
+) {
+  if (!Number.isInteger(maxRows) || maxRows < 1) {
+    throw new Error("Thought statistics limit must be a positive integer");
+  }
+  const thoughts: Array<Doc<"thoughts">> = [];
+  for (const spaceId of spaceIds) {
+    const rows = await ctx.db
+      .query("thoughts")
+      .withIndex("by_spaceId", (q) => q.eq("spaceId", spaceId))
+      .take(maxRows + 1 - thoughts.length);
+    thoughts.push(...rows);
+    if (thoughts.length > maxRows) {
+      throw new Error("Thought statistics exceed the bounded scope");
+    }
+  }
+
+  const facts: Array<Doc<"facts">> = [];
+  for (const spaceId of spaceIds) {
+    const rows = await ctx.db
+      .query("facts")
+      .withIndex("by_spaceId", (q) => q.eq("spaceId", spaceId))
+      .take(maxRows + 1 - facts.length);
+    facts.push(...rows);
+    if (facts.length > maxRows) {
+      throw new Error("Thought statistics exceed the bounded scope");
+    }
+  }
+  return { thoughts, facts };
 }
 
 export async function _insertOne(

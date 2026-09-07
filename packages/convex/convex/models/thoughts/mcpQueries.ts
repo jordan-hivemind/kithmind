@@ -5,7 +5,11 @@ import { requireMcpPrincipal } from "../../lib/mcpAuth";
 import { getAuthorizedReadSpaceIds } from "../../lib/spaces";
 import { isFactActive } from "../facts/model";
 import { isMemoryActive } from "./memoryLifecycle";
-import { _listBySpaces, _listCoreBySpaces } from "./model";
+import {
+  _listBySpaces,
+  _listCoreBySpaces,
+  _loadBoundedThoughtStatsRows,
+} from "./model";
 import {
   thoughtLifecycleFields,
   thoughtMetadata,
@@ -22,8 +26,6 @@ const result = v.object({
   updatedAt: v.optional(v.number()),
   ...thoughtLifecycleFields,
 });
-
-const MAX_STATS_ROWS = 10_000;
 
 export const listByUser = query({
   args: {
@@ -100,32 +102,8 @@ export const getStats = query({
       principal,
       args.spaceIds,
     );
-    const [thoughtPages, factPages] = await Promise.all([
-      Promise.all(
-        spaceIds.map((spaceId) =>
-          ctx.db
-            .query("thoughts")
-            .withIndex("by_spaceId", (q) => q.eq("spaceId", spaceId))
-            .take(MAX_STATS_ROWS + 1),
-        ),
-      ),
-      Promise.all(
-        spaceIds.map((spaceId) =>
-          ctx.db
-            .query("facts")
-            .withIndex("by_spaceId", (q) => q.eq("spaceId", spaceId))
-            .take(MAX_STATS_ROWS + 1),
-        ),
-      ),
-    ]);
-    const allThoughts = thoughtPages.flat();
-    const allFacts = factPages.flat();
-    if (
-      allThoughts.length > MAX_STATS_ROWS ||
-      allFacts.length > MAX_STATS_ROWS
-    ) {
-      throw new Error("Thought statistics exceed the bounded scope");
-    }
+    const { thoughts: allThoughts, facts: allFacts } =
+      await _loadBoundedThoughtStatsRows(ctx, spaceIds);
     const activeAt = Date.now();
     const currentThoughts = allThoughts.filter((thought) =>
       isMemoryActive(thought, activeAt),

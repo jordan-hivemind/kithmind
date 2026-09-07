@@ -287,7 +287,26 @@ describe("MCP account isolation", () => {
         evidence: "Private evidence",
         status: "new",
       });
-      return { owner, other, insightId };
+      const otherReportId = await ctx.db.insert("reports", {
+        userId: other.userId,
+        startDate: "2026-08-01",
+        endDate: "2026-08-10",
+        sessionsAnalyzed: 1,
+        totalPrompts: 1,
+        totalToolCalls: 1,
+        projectsActive: [],
+        modelUsage: {},
+      });
+      const crossLinkedInsightId = await ctx.db.insert("insights", {
+        reportId: otherReportId,
+        userId: owner.userId,
+        category: "productivity",
+        observation: "Wrong parent",
+        recommendation: "Reject the mutation",
+        evidence: "Cross-owner fixture",
+        status: "new",
+      });
+      return { owner, other, insightId, crossLinkedInsightId };
     });
     const owner = t.withIdentity({
       issuer,
@@ -299,6 +318,18 @@ describe("MCP account isolation", () => {
       subject: seeded.other.userId,
       apiKeyId: seeded.other.keyId,
     });
+    const ownerInsights = await owner.query(
+      api.models.reports.mcpQueries.listInsights,
+      {},
+    );
+    expect(ownerInsights.map((insight) => insight._id)).toEqual([
+      seeded.insightId,
+    ]);
+    await expect(
+      owner.mutation(api.models.reports.mcpMutations.deleteInsight, {
+        insightId: seeded.crossLinkedInsightId,
+      }),
+    ).rejects.toThrow("Insight not found");
     await expect(
       other.mutation(api.models.reports.mcpMutations.deleteInsight, {
         insightId: seeded.insightId,
@@ -308,6 +339,9 @@ describe("MCP account isolation", () => {
       insightId: seeded.insightId,
     });
     expect(await t.run((ctx) => ctx.db.get(seeded.insightId))).toBeNull();
+    expect(
+      await t.run((ctx) => ctx.db.get(seeded.crossLinkedInsightId)),
+    ).not.toBeNull();
   });
 
   test("OAuth replay bookkeeping accepts any current scoped key only once", async () => {
