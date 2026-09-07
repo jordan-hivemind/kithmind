@@ -2,8 +2,10 @@
 
 This runbook describes the currently implemented account-isolated application.
 Family spaces, bounded inline capture, source records, and durable processing
-primitives are implemented. Real connector polling, full worker recovery, and
-bulk ingestion remain Phase 2 work. Desktop is primary; native mobile
+primitives are implemented. A bounded filesystem text worker supports foreground
+polling; use the [synthetic worker recipe](filesystem-worker.md) after deployment
+setup. Additional connectors, full operational recovery, and bulk ingestion
+remain Phase 2 work. Desktop is primary; native mobile
 integration is P2 and is not a setup gate.
 
 Prerequisites are Node.js 22 or newer and pnpm 10.20 (the repository pins this

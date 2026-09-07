@@ -145,6 +145,15 @@ importers:
         specifier: ^5.7.0
         version: 5.9.3
 
+  packages/pipeline:
+    devDependencies:
+      '@types/node':
+        specifier: 25.3.3
+        version: 25.3.3
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
+
   packages/typescript-config: {}
 
 packages:
