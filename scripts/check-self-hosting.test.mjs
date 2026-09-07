@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   formatIssues,
+  parseArguments,
   validateConvexVariableNames,
   validateWebEnvironment,
 } from "./check-self-hosting.mjs";
@@ -31,6 +34,20 @@ function validWebEnvironment() {
     MCP_OAUTH_ENCRYPTION_KEY: "A".repeat(43),
     MCP_TOOL_PROFILE: "memory",
   };
+}
+
+function runCli(arguments_) {
+  return spawnSync(
+    process.execPath,
+    [
+      fileURLToPath(new URL("./check-self-hosting.mjs", import.meta.url)),
+      ...arguments_,
+    ],
+    {
+      encoding: "utf8",
+      env: { ...process.env, ...validWebEnvironment() },
+    },
+  );
 }
 
 test("web preflight accepts complete configuration", () => {
@@ -95,4 +112,86 @@ test("Convex preflight checks names without needing values", () => {
       { name: "JWKS", problem: "missing" },
     ],
   );
+});
+
+test("full is the default profile and preserves provider requirements", () => {
+  assert.equal(parseArguments(["--convex"]).profile, "full");
+  assert.deepEqual(
+    validateConvexVariableNames([
+      "MCP_JWT_ISSUER",
+      "SITE_URL",
+      "JWT_PRIVATE_KEY",
+      "JWKS",
+    ]),
+    [
+      { name: "OPENAI_API_KEY", problem: "missing" },
+      { name: "ANTHROPIC_API_KEY", problem: "missing" },
+    ],
+  );
+});
+
+test("core profile requires auth configuration without model providers", () => {
+  const options = parseArguments(["--convex", "--profile", "core"]);
+  assert.equal(options.profile, "core");
+  assert.deepEqual(
+    validateConvexVariableNames(
+      ["MCP_JWT_ISSUER", "SITE_URL", "JWT_PRIVATE_KEY", "JWKS"],
+      options.profile,
+    ),
+    [],
+  );
+});
+
+test("web environment file alias avoids Node's reserved option", () => {
+  assert.equal(
+    parseArguments(["--web-env-file", "synthetic.env"]).envFile,
+    "synthetic.env",
+  );
+});
+
+test("core profile reports missing authentication variables", () => {
+  assert.deepEqual(validateConvexVariableNames(["MCP_JWT_ISSUER"], "core"), [
+    { name: "SITE_URL", problem: "missing" },
+    { name: "JWT_PRIVATE_KEY", problem: "missing" },
+    { name: "JWKS", problem: "missing" },
+  ]);
+});
+
+test("invalid or missing profiles are rejected without echoing other input", () => {
+  assert.throws(() => parseArguments(["--profile", "enterprise-secret"]), {
+    message: "--profile must be core or full",
+  });
+  assert.throws(() => parseArguments(["--profile"]), {
+    message: "--profile must be core or full",
+  });
+  assert.throws(() => validateConvexVariableNames([], "enterprise-secret"), {
+    message: "--profile must be core or full",
+  });
+});
+
+test("CLI output identifies core mode and its configuration-only scope", () => {
+  const result = runCli([
+    "--web",
+    "--web-env-file",
+    "missing-synthetic-environment-file",
+    "--profile",
+    "core",
+  ]);
+  assert.equal(result.status, 0);
+  assert.equal(
+    result.stdout,
+    [
+      "profile: core",
+      "core: validates configuration only; live source access is not checked",
+      "web: ready",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("CLI output identifies the default full profile", () => {
+  const result = runCli(["--web"]);
+  assert.equal(result.status, 0);
+  assert.equal(result.stdout, "profile: full\nweb: ready\n");
+  assert.doesNotMatch(result.stdout, /configuration only/u);
 });

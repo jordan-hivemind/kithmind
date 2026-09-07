@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-06
 
-**Status:** P1-1 and P1-2 are implemented and deployed, including required ownership fields and scoped credentials. P1-3 source/evidence/job primitives and indexed read tools are implemented with synthetic integration tests. P1-4 versioned embeddings, semantic document reads, provider configuration, and keyword fallback are implemented with synthetic migration and lifecycle tests. P1-7 typed records and exact queries are implemented with synthetic fixtures. P1-5 bounded public text ingestion, durable recovery, and an enqueue-only URL tool are implemented. P1-8 family lifecycle and desktop UI are implemented and verified with two authenticated browser accounts. Installation acceptance remains pending.
+**Status:** P1-1 and P1-2 are implemented and deployed, including required ownership fields and scoped credentials. P1-3 source/evidence/job primitives and indexed read tools are implemented with synthetic integration tests. P1-4 versioned embeddings, semantic document reads, provider configuration, and keyword fallback are implemented with synthetic migration and lifecycle tests. P1-7 typed records and exact queries are implemented with synthetic fixtures. P1-5 bounded public text ingestion, durable recovery, and an enqueue-only URL tool are implemented. P1-8 family lifecycle and desktop UI are implemented and verified with two authenticated browser accounts. P1-6 provides a public installation guide, configuration profiles, and a synthetic capture/query demo.
 
 **Parent:** [Kith Mind architecture](./2026-09-06-architecture.md)
 
@@ -320,13 +320,13 @@ Synthetic event fixtures call the same internal stage/activate contract used by 
 
 Add these tools to the memory profile and tool policy:
 
-| Tool               | Phase 1 behavior                                                                                                                    |
-| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `search_documents` | Space-authorized keyword-first search with optional doc type and time range; vector contribution only when compatible and available |
-| `get_document`     | Authorized direct get with pages/evidence and active-generation check                                                               |
-| `query_records`    | The exact discriminated operations in section 2.6                                                                                   |
-| `list_sources`     | Authorized source accounts/items with freshness, job counts, coverage, and gaps                                                     |
-| `ingest_url`       | Enqueue only; clearly reports that a Phase 2 worker is required                                                                     |
+| Tool               | Phase 1 behavior                                                                                                                                                              |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `search_documents` | Space-authorized search with optional doc type and time range; `searchMode` is `keyword` or `hybrid` (default), and explicit `keyword` bypasses provider-backed vector search |
+| `get_document`     | Authorized direct get with pages/evidence and active-generation check                                                                                                         |
+| `query_records`    | The exact discriminated operations in section 2.6                                                                                                                             |
+| `list_sources`     | Authorized source accounts/items with freshness, job counts, coverage, and gaps                                                                                               |
+| `ingest_url`       | Enqueue only; clearly reports that a Phase 2 worker is required                                                                                                               |
 
 Existing read tools gain optional space filters. Existing write tools gain optional `spaceId` and use `resolveWriteSpace`. Returned records include space ID, immutable citation identifiers, and the author separately. Original-source availability is a separate field; membership in Kith Mind does not imply permission to open an external file or portal.
 
@@ -350,6 +350,7 @@ Use synthetic people, lab panels, and vehicle records only. No owner data or cre
 14. **Bounded text:** authorized text POST creates a ready, searchable document; oversized or malformed input fails before admission; cross-space or unbound-account post fails; no network is used.
 15. **T14 - Embedding compatibility:** current fingerprint is backfilled without vector changes; mismatched fingerprints never merge; failed staged migration leaves the active profile unchanged; exact/keyword fallback works with embedding calls disabled.
 16. **T16 - Desktop without worker/source:** after activation, the desktop MCP returns the stored value and evidence while worker execution is disabled and the original URI is marked unavailable; original-link availability is reported separately.
+17. **P1-6 - Installation and demo:** a clean public clone runs the repository checks without private files, the self-hosting preflight reports safe variable-name issues only, and the provider-free synthetic demo verifies bounded inline capture, idempotency, retained evidence, and keyword document retrieval.
 
 Repository checks for each PR are `pnpm lint`, `pnpm check-types`, `pnpm test:once`, and `pnpm build`, plus `git diff --check`. Lint warnings already present in the base are recorded rather than silently attributed to a Phase 1 change.
 

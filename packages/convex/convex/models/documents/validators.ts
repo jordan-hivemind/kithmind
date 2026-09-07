@@ -2,6 +2,7 @@ import { v } from "convex/values";
 
 export const documentSearchArgs = {
   query: v.string(),
+  searchMode: v.optional(v.union(v.literal("keyword"), v.literal("hybrid"))),
   spaceIds: v.optional(v.array(v.id("spaces"))),
   docType: v.optional(v.string()),
   from: v.optional(v.number()),

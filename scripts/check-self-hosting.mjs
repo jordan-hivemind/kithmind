@@ -17,13 +17,17 @@ export const WEB_REQUIRED_VARIABLES = [
   "MCP_OAUTH_ENCRYPTION_KEY",
 ];
 
-export const CONVEX_REQUIRED_VARIABLES = [
-  "OPENAI_API_KEY",
-  "ANTHROPIC_API_KEY",
+export const CORE_CONVEX_REQUIRED_VARIABLES = [
   "MCP_JWT_ISSUER",
   "SITE_URL",
   "JWT_PRIVATE_KEY",
   "JWKS",
+];
+
+export const CONVEX_REQUIRED_VARIABLES = [
+  "OPENAI_API_KEY",
+  "ANTHROPIC_API_KEY",
+  ...CORE_CONVEX_REQUIRED_VARIABLES,
 ];
 
 function isAllowedOrigin(value) {
@@ -137,24 +141,32 @@ export function validateWebEnvironment(environment) {
   return issues;
 }
 
-export function validateConvexVariableNames(names) {
+export function validateConvexVariableNames(names, profile = "full") {
+  if (profile !== "core" && profile !== "full") {
+    throw new Error("--profile must be core or full");
+  }
   const configured = new Set(names);
-  return CONVEX_REQUIRED_VARIABLES.filter((name) => !configured.has(name)).map(
-    (name) => ({ name, problem: "missing" }),
-  );
+  const required =
+    profile === "core"
+      ? CORE_CONVEX_REQUIRED_VARIABLES
+      : CONVEX_REQUIRED_VARIABLES;
+  return required
+    .filter((name) => !configured.has(name))
+    .map((name) => ({ name, problem: "missing" }));
 }
 
 export function formatIssues(scope, issues) {
   return issues.map(({ name, problem }) => `${scope}: ${problem} ${name}`);
 }
 
-function parseArguments(arguments_) {
+export function parseArguments(arguments_) {
   const options = {
     web: false,
     convex: false,
     production: false,
     deployment: undefined,
     envFile: "apps/web/.env.local",
+    profile: "full",
   };
 
   for (let index = 0; index < arguments_.length; index += 1) {
@@ -163,11 +175,18 @@ function parseArguments(arguments_) {
     else if (argument === "--web") options.web = true;
     else if (argument === "--convex") options.convex = true;
     else if (argument === "--prod") options.production = true;
-    else if (argument === "--deployment") {
+    else if (argument === "--profile") {
+      const profile = arguments_[index + 1];
+      index += 1;
+      if (profile !== "core" && profile !== "full") {
+        throw new Error("--profile must be core or full");
+      }
+      options.profile = profile;
+    } else if (argument === "--deployment") {
       options.deployment = arguments_[index + 1];
       index += 1;
       if (!options.deployment) throw new Error("--deployment requires a name");
-    } else if (argument === "--env-file") {
+    } else if (argument === "--env-file" || argument === "--web-env-file") {
       options.envFile = arguments_[index + 1];
       index += 1;
       if (!options.envFile) throw new Error("--env-file requires a path");
@@ -233,10 +252,11 @@ function printHelp() {
       "Usage: pnpm check:self-hosting [--web] [--convex] [--prod]",
       "",
       "--web                 Validate apps/web/.env.local (default)",
-      "--env-file PATH       Validate another web environment file",
+      "--web-env-file PATH   Validate another web environment file",
       "--convex              Inspect Convex environment names only",
       "--prod                Inspect the default production deployment",
       "--deployment NAME     Inspect a specific Convex deployment",
+      "--profile PROFILE     Validate core or full requirements (default: full)",
     ].join("\n") + "\n",
   );
 }
@@ -253,7 +273,10 @@ export function runPreflight(options) {
   if (options.convex) {
     results.push({
       scope: "convex",
-      issues: validateConvexVariableNames(getConvexVariableNames(options)),
+      issues: validateConvexVariableNames(
+        getConvexVariableNames(options),
+        options.profile,
+      ),
     });
   }
   return results;
@@ -269,6 +292,12 @@ if (invokedDirectly) {
     if (options.help) {
       printHelp();
     } else {
+      process.stdout.write(`profile: ${options.profile}\n`);
+      if (options.profile === "core") {
+        process.stdout.write(
+          "core: validates configuration only; live source access is not checked\n",
+        );
+      }
       const results = runPreflight(options);
       let hasIssues = false;
       for (const result of results) {

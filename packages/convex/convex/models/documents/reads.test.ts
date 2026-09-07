@@ -1,5 +1,5 @@
 import { convexTest } from "convex-test";
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { api, internal } from "../../_generated/api";
 import { beginForgetFromWeb, continueForgetFromWeb } from "../ingestion/model";
@@ -252,6 +252,8 @@ describe("document reads", () => {
   });
 
   afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
     if (originalIssuer === undefined) delete process.env.MCP_JWT_ISSUER;
     else process.env.MCP_JWT_ISSUER = originalIssuer;
   });
@@ -405,6 +407,76 @@ describe("document reads", () => {
       quote: "needle",
     });
   });
+
+  test("keyword mode bypasses embedding fetch with ready vector targets", async () => {
+    vi.stubEnv("OPENAI_API_KEY", "synthetic-openai-key");
+    for (const name of [
+      "BRAIN_EMBED_ENDPOINT",
+      "BRAIN_EMBED_PROVIDER_ID",
+      "BRAIN_EMBED_MODEL",
+      "BRAIN_EMBED_MODEL_REVISION",
+      "BRAIN_EMBED_DIMENSIONS",
+      "BRAIN_EMBED_API_KEY",
+    ]) {
+      vi.stubEnv(name, "");
+    }
+    const t = convexTest(schema, modules);
+    const seeded = await seedIdentity(t);
+    const visible = await seedDocument(t, {
+      spaceId: seeded.spaceId,
+      sourceAccountId: seeded.sourceAccountId,
+      userId: seeded.userId,
+      suffix: "keyword-provider-free",
+    });
+    const config = loadEmbeddingConfig({});
+    const profile = embeddingProfile(config);
+    const fingerprint = await fingerprintEmbeddingConfig(profile);
+    await t.run(async (ctx) => {
+      const generation = await createEmbeddingGeneration(ctx, {
+        spaceId: seeded.spaceId,
+        profile,
+        fingerprint,
+        createdAt: 1,
+      });
+      await insertChunkEmbedding(ctx, {
+        spaceId: seeded.spaceId,
+        chunkId: visible.chunkId,
+        embeddingGenerationId: generation._id,
+        fingerprint,
+        inputText: "needle text keyword-provider-free",
+        vector: Array(1536).fill(0.1),
+      });
+      await stageEmbeddingGeneration(ctx, {
+        embeddingGenerationId: generation._id,
+        stagedAt: 2,
+      });
+      await activateEmbeddingGeneration(ctx, {
+        embeddingGenerationId: generation._id,
+        activatedAt: 3,
+      });
+    });
+    let embeddingFetches = 0;
+    vi.stubGlobal("fetch", async () => {
+      embeddingFetches += 1;
+      throw new Error("Embedding provider must not be called");
+    });
+    const mcp = t.withIdentity({
+      issuer: mcpIssuer,
+      subject: seeded.userId,
+      apiKeyId: seeded.keyId,
+    });
+
+    const result = await mcp.action(api.models.documents.mcpActions.search, {
+      query: "needle",
+      searchMode: "keyword",
+    });
+
+    expect(embeddingFetches).toBe(0);
+    expect(result.vectorStatus).toBe("unavailable");
+    expect(result.results.map((row) => row.documentId)).toEqual([
+      visible.documentId,
+    ]);
+  });
 });
 
 test("semantic document hydration preserves evidence and rechecks profile, source and credentials", async () => {
@@ -476,6 +548,18 @@ test("semantic document hydration preserves evidence and rechecks profile, sourc
   );
   expect(incompatible.vectorStatus).toBe("unavailable");
   expect(incompatible.results.map((row) => row.documentId)).toEqual([
+    visible.documentId,
+  ]);
+  const keywordOnly = await t.query(
+    internal.models.documents.private.searchWithCandidates,
+    {
+      ...args,
+      query: "needle",
+      searchMode: "keyword",
+    },
+  );
+  expect(keywordOnly.vectorStatus).toBe("unavailable");
+  expect(keywordOnly.results.map((row) => row.documentId)).toEqual([
     visible.documentId,
   ]);
   await t.run((ctx) =>
