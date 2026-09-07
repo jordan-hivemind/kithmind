@@ -22,6 +22,9 @@ transport and the background worker are still being implemented. The public arch
 - Versioned embedding profiles and generations, compatible semantic document
   search, and explicit keyword fallback. See the
   [embedding contract](docs/plans/2026-09-06-embedding-contract.md).
+- Versioned lab, vehicle-service and financial records with exact decimal
+  queries, retained evidence and coverage-aware pagination through `query_records`.
+  See the [typed-record contract](docs/plans/2026-09-06-record-query-contract.md).
 - A Next.js web application, Convex backend, and a Claude Code plugin source.
 
 Captures are client-mediated: an MCP server cannot observe a conversation
@@ -35,8 +38,7 @@ The following are architecture commitments, not current product features:
 
 - Family membership, invitations, person linking, and source configuration in
   the desktop settings workflow.
-- Public text ingestion and exact typed lab and
-  service queries.
+- Public text ingestion and extraction of typed records from real sources.
 - A Mac-hosted daemon, filesystem and service connectors, extraction
   playbooks, and background ingestion.
 - Desktop is the primary workflow. P2 mobile access is through hosted MCP for

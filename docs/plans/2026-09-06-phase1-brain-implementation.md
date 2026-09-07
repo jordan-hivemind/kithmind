@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-06
 
-**Status:** P1-1 and P1-2 are implemented and deployed, including required ownership fields and scoped credentials. P1-3 source/evidence/job primitives and indexed read tools are implemented with synthetic integration tests. P1-4 versioned embeddings, semantic document reads, provider configuration, and keyword fallback are implemented with synthetic migration and lifecycle tests. Family lifecycle, typed records, ingestion, and installation acceptance remain pending.
+**Status:** P1-1 and P1-2 are implemented and deployed, including required ownership fields and scoped credentials. P1-3 source/evidence/job primitives and indexed read tools are implemented with synthetic integration tests. P1-4 versioned embeddings, semantic document reads, provider configuration, and keyword fallback are implemented with synthetic migration and lifecycle tests. P1-7 typed records and exact queries are implemented with synthetic fixtures. Family lifecycle, public ingestion, and installation acceptance remain pending.
 
 **Parent:** [Kith Mind architecture](./2026-09-06-architecture.md)
 
@@ -130,9 +130,9 @@ type ObservationValue =
 
 `events` holds that stable logical identity. Versioned occurrence, entity/type classification, evidence, and schema fields live on `eventVersions` under a processing generation. Observation rows carry `eventId`, `observationKey`, and processing generation; their logical identity is `(eventId, observationKey)` while each generation retains its immutable value representation. Queries return the stable event ID and the active event/observation version IDs. A correction activates new versions without overwriting audit history.
 
-Phase 1 keeps events from different source items separate by default. A reliable shared external event ID may resolve directly to one event; otherwise an explicit reviewed `eventLink` records the relationship and actor without deleting either source identity. Exact queries never collapse independent attachments based on matching names, dates, or values. General cross-source consolidation and automated matching are deferred until real connectors supply representative identifiers.
+Phase 1 keeps events from different source items separate. Exact queries never collapse independent attachments based on matching names, dates, or values. Reviewed event links, shared external event identity resolution, general cross-source consolidation, and automated matching are deferred until real connectors supply representative identifiers. See the [typed-record contract](./2026-09-06-record-query-contract.md) for the implementation boundary.
 
-Date-only values stay date-only and timezone-qualified datetimes retain their original offset alongside the sortable instant. Missing event dates remain `unknown`; ingestion must not substitute issue, capture, import, or current time. Deterministic ordering uses the occurrence date/instant and then record ID, never import or creation time. `latest` excludes undated events and reports their count. When date-only and datetime records on the same calendar day cannot be strictly ordered without inventing a timezone, the result reports the tied candidates rather than claiming false precision.
+Date-only values stay date-only and timezone-qualified datetimes retain their original offset alongside the sortable instant. Missing event dates remain `unknown`; ingestion must not substitute issue, capture, import, or current time. Deterministic ordering uses the occurrence date/instant and then record ID, never import or creation time. `latest` excludes undated events and reports their count. When date-only and datetime records cannot be strictly ordered without inventing a timezone, the result reports tied candidates rather than claiming false precision. The implementation uses the full possible date interval across supported offsets, so adjacent calendar dates may also be ambiguous. Stable pagination traversal is distinct from semantic recency across offsets.
 
 Decimal and money values use canonical base-10 strings validated at entry. Calculations use exact decimal arithmetic. Money always carries an ISO 4217 currency and totals group by currency unless an explicit, sourced conversion is requested. Units use a controlled code and ingestion stores the original unit where normalization occurred. No extracted typed record or query filter uses `v.any()`.
 
@@ -191,27 +191,27 @@ Exact aggregation runs against an active-generation snapshot timestamp. Generati
 
 P1-1, P1-3, and P1-7 add the following logical records. Validators live beside their models; shared enums and structured provenance live under `models/provenance/`.
 
-| Table                                    | Required identity/indexes                                                                                                                          |
-| ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `spaces`                                 | kind, name, `createdBy`; personal lookup by creator and kind                                                                                       |
-| `spaceMembers`                           | `(spaceId,userId)` unique-by-mutation, by user; role and optional linked person entity                                                             |
-| `spaceInvitations`                       | token hash, `(spaceId,normalizedEmail)`, role, expiry, pending-acceptance user ID, owner approval, accepted/revoked audit                          |
-| `userSpaceSettings`                      | user ID, personal space ID, optional default write space ID                                                                                        |
-| `apiKeys`                                | existing key hash plus capabilities, explicit space IDs, and explicit source-account IDs for ingest; legacy non-ingest keys may omit source IDs    |
-| `entities`                               | required `spaceId`; `(spaceId,key)` and `(spaceId,kind,normalizedName)`                                                                            |
-| `facts`, `thoughts`                      | required `spaceId`, author `userId`, space-filterable search/vector indexes                                                                        |
-| `sourceAccounts`                         | `(spaceId,connector,accountId)`, freshness and cursor version                                                                                      |
-| `sourceItems`                            | `(spaceId,connector,accountId,externalId)`, mutable location/original-link metadata, authoritative active revision/generation pointers             |
-| `sourceRevisions`                        | `(sourceItemId,contentHash)`, immutable capture metadata and canonical archived-content reference                                                  |
-| `sourceTextVersions`                     | revision and parser/OCR fingerprint; immutable extracted text identity                                                                             |
-| `processingGenerations`                  | unique `(sourceRevisionId,processingFingerprint)`, text version, generation number, activation interval and state                                  |
-| `sourcePages`, `evidenceSpans`           | by source-text version; spans by page and ordinal                                                                                                  |
-| `documents`, `chunks`                    | by generation/document; space-filtered text/vector indexes                                                                                         |
-| Events, versions, observations and links | event by reliable external ID or `(sourceItemId,eventKey)`; versions by generation/space/entity/type/time; reviewed links across source identities |
-| `ingestJobs`                             | by space/state/next attempt and source revision; lease fields and bounded error                                                                    |
-| `coverageWindows`, `coverageGaps`        | by space/source account/record type and time range/status                                                                                          |
-| Embedding profile/generation metadata    | immutable fingerprint/profile, state, expected/completed counts; may be stored with space/config metadata rather than empty framework tables       |
-| Exact-query resume state                 | principal/filter/snapshot-bound cursor and exact accumulator when an aggregation exceeds one bounded page                                          |
+| Table                                 | Required identity/indexes                                                                                                                       |
+| ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `spaces`                              | kind, name, `createdBy`; personal lookup by creator and kind                                                                                    |
+| `spaceMembers`                        | `(spaceId,userId)` unique-by-mutation, by user; role and optional linked person entity                                                          |
+| `spaceInvitations`                    | token hash, `(spaceId,normalizedEmail)`, role, expiry, pending-acceptance user ID, owner approval, accepted/revoked audit                       |
+| `userSpaceSettings`                   | user ID, personal space ID, optional default write space ID                                                                                     |
+| `apiKeys`                             | existing key hash plus capabilities, explicit space IDs, and explicit source-account IDs for ingest; legacy non-ingest keys may omit source IDs |
+| `entities`                            | required `spaceId`; `(spaceId,key)` and `(spaceId,kind,normalizedName)`                                                                         |
+| `facts`, `thoughts`                   | required `spaceId`, author `userId`, space-filterable search/vector indexes                                                                     |
+| `sourceAccounts`                      | `(spaceId,connector,accountId)`, freshness and cursor version                                                                                   |
+| `sourceItems`                         | `(spaceId,connector,accountId,externalId)`, mutable location/original-link metadata, authoritative active revision/generation pointers          |
+| `sourceRevisions`                     | `(sourceItemId,contentHash)`, immutable capture metadata and canonical archived-content reference                                               |
+| `sourceTextVersions`                  | revision and parser/OCR fingerprint; immutable extracted text identity                                                                          |
+| `processingGenerations`               | unique `(sourceRevisionId,processingFingerprint)`, text version, generation number, activation interval and state                               |
+| `sourcePages`, `evidenceSpans`        | by source-text version; spans by page and ordinal                                                                                               |
+| `documents`, `chunks`                 | by generation/document; space-filtered text/vector indexes                                                                                      |
+| Events, versions and observations     | event by `(sourceItemId,eventKey)`; immutable versions by generation/space/entity/type/time; cross-source links deferred                        |
+| `ingestJobs`                          | by space/state/next attempt and source revision; lease fields and bounded error                                                                 |
+| `coverageWindows`, `coverageGaps`     | by space/source account/record type and time range/status                                                                                       |
+| Embedding profile/generation metadata | immutable fingerprint/profile, state, expected/completed counts; may be stored with space/config metadata rather than empty framework tables    |
+| Exact-query resume state              | principal/filter/snapshot-bound cursor and exact accumulator when an aggregation exceeds one bounded page                                       |
 
 These are logical records, not a requirement to create an otherwise empty table for every label. Closely related metadata may be colocated where that preserves the same identities, indexes, retention, and authorization behavior. Convex does not enforce unique constraints, so every create/upsert mutation performs an indexed lookup and is covered by an idempotent-concurrency test. Denormalized `spaceId` fields are validated against their parents on write; they exist to make authorization filters indexable.
 

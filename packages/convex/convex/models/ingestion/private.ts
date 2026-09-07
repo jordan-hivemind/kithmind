@@ -1,3 +1,4 @@
+import { stagedEventRecordValidator } from "../records/validators";
 import { v } from "convex/values";
 
 import { internalMutation } from "../../_generated/server";
@@ -21,6 +22,7 @@ import {
   stageGenerationDocuments,
   stageGenerationEvidenceSpans,
   stageGenerationPages,
+  stageGenerationRecords,
 } from "./model";
 
 const processingConfiguration = {
@@ -50,6 +52,8 @@ const admissionFields = {
     expectedEvidenceSpanCount: v.number(),
     expectedDocumentCount: v.number(),
     expectedChunkCount: v.number(),
+    expectedEventCount: v.optional(v.number()),
+    expectedObservationCount: v.optional(v.number()),
   }),
 };
 
@@ -156,6 +160,12 @@ export const stageChunks = internalMutation({
   },
   handler: async (ctx, args) =>
     await stageGenerationChunks(ctx, { ...args, now: Date.now() }),
+});
+
+export const stageRecords = internalMutation({
+  args: { ...leasedJobFields, records: v.array(stagedEventRecordValidator) },
+  handler: async (ctx, args) =>
+    await stageGenerationRecords(ctx, { ...args, now: Date.now() }),
 });
 
 export const stage = internalMutation({

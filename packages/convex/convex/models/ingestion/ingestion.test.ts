@@ -3,6 +3,8 @@ import { describe, expect, test } from "vitest";
 
 import type { Id } from "../../_generated/dataModel";
 import schema from "../../schema";
+import { beginRecordQuerySnapshot } from "../records/querySessions";
+import type { StagedEventRecord } from "../records/validators";
 import { modules } from "../../test.setup";
 import {
   activateGeneration,
@@ -18,6 +20,7 @@ import {
   stageGenerationDocuments,
   stageGenerationEvidenceSpans,
   stageGenerationPages,
+  stageGenerationRecords,
 } from "./model";
 
 const processing = {
@@ -268,6 +271,166 @@ describe("durable ingestion engine", () => {
       jobs: 1,
       receipts: 2,
     });
+  });
+
+  test("typed manifest counts preserve zero-count retries and reject changed identities", async () => {
+    const { t, userId, sourceAccountId } = await seed();
+    const original = admission({ userId }, sourceAccountId);
+    const first = await t.run((ctx) => admitSourceRevision(ctx, original));
+    const zeroCounts = {
+      ...original,
+      processing: {
+        ...original.processing,
+        expectedEventCount: 0,
+        expectedObservationCount: 0,
+      },
+    };
+    expect(
+      await t.run((ctx) => admitSourceRevision(ctx, zeroCounts)),
+    ).toMatchObject({
+      reused: true,
+      processingGenerationId: first.processingGenerationId,
+    });
+    const typed = {
+      ...original,
+      processing: {
+        ...original.processing,
+        expectedEventCount: 1,
+        expectedObservationCount: 1,
+      },
+    };
+    await expect(
+      t.run((ctx) => admitSourceRevision(ctx, typed)),
+    ).rejects.toThrow("requestId conflicts");
+    await expect(
+      t.run((ctx) =>
+        admitSourceRevision(ctx, {
+          ...typed,
+          requestId: "typed-new-request",
+          expectedDesiredProcessingEpoch: 1,
+        }),
+      ),
+    ).rejects.toThrow("manifest conflicts");
+    await expect(
+      t.run((ctx) =>
+        admitSourceRevision(ctx, {
+          ...typed,
+          processing: { ...typed.processing, expectedEventCount: 33 },
+        }),
+      ),
+    ).rejects.toThrow("expectedEventCount");
+  });
+
+  test("typed publication checks counts and lease, reserves snapshots, and forget removes records", async () => {
+    const { t, userId, spaceId, sourceAccountId } = await seed();
+    const principal = { userId };
+    const input = admission(principal, sourceAccountId);
+    const admitted = await t.run((ctx) =>
+      admitSourceRevision(ctx, {
+        ...input,
+        processing: {
+          ...input.processing,
+          expectedEventCount: 1,
+          expectedObservationCount: 1,
+        },
+      }),
+    );
+    const lease = await stageCompleteGeneration(
+      t,
+      principal,
+      admitted,
+      "typed-lease",
+      1_100,
+      false,
+    );
+    await expect(t.run((ctx) => stageGeneration(ctx, lease))).rejects.toThrow(
+      "event count mismatch",
+    );
+    const { entityId, evidenceId } = await t.run(async (ctx) => ({
+      entityId: await ctx.db.insert("entities", {
+        spaceId,
+        userId,
+        key: "synthetic-person",
+        kind: "person",
+        canonicalName: "Synthetic Person",
+        normalizedName: "synthetic person",
+        aliases: [],
+        normalizedAliases: [],
+      }),
+      evidenceId: (await ctx.db.query("evidenceSpans").first())!._id,
+    }));
+    const records: StagedEventRecord[] = [
+      {
+        eventKey: "panel-1",
+        entityId,
+        eventType: "lab_panel",
+        schemaVersion: 1,
+        occurrence: { precision: "date", date: "2026-01-10" },
+        fieldEvidence: {
+          occurrence: [evidenceId],
+          entity: [evidenceId],
+          eventType: [evidenceId],
+        },
+        observations: [
+          {
+            observationKey: "glucose",
+            observationType: "glucose",
+            value: { type: "decimal", value: "090.00", unitCode: "mg/dL" },
+            valueEvidence: [evidenceId],
+          },
+        ],
+      },
+    ];
+    await expect(
+      t.run((ctx) =>
+        stageGenerationRecords(ctx, { ...lease, leaseToken: "wrong", records }),
+      ),
+    ).rejects.toThrow();
+    const staged = await t.run((ctx) =>
+      stageGenerationRecords(ctx, { ...lease, records }),
+    );
+    expect(staged).toMatchObject({
+      insertedEventCount: 1,
+      insertedObservationCount: 1,
+    });
+    expect(await t.run((ctx) => stageGeneration(ctx, lease))).toMatchObject({
+      actualEventCount: 1,
+      actualObservationCount: 1,
+    });
+    const snapshot = await t.run((ctx) =>
+      beginRecordQuerySnapshot(ctx, spaceId, lease.now),
+    );
+    await t.run((ctx) => activateGeneration(ctx, lease));
+    const generation = await t.run((ctx) =>
+      ctx.db.get(admitted.processingGenerationId),
+    );
+    expect(generation?.activatedAt).toBe(snapshot.snapshotAt + 1);
+    await t.run((ctx) =>
+      beginForgetFromWeb(ctx, {
+        principal,
+        sourceItemId: admitted.sourceItemId,
+        now: 1_200,
+      }),
+    );
+    let done = false;
+    for (let i = 0; i < 30 && !done; i++) {
+      const page = await t.run((ctx) =>
+        continueForgetFromWeb(ctx, {
+          principal,
+          sourceItemId: admitted.sourceItemId,
+        }),
+      );
+      expect(page.deleted).toBeLessThanOrEqual(25);
+      done = page.done;
+    }
+    expect(done).toBe(true);
+    expect(
+      await t.run(async (ctx) => ({
+        event: await ctx.db.query("events").first(),
+        version: await ctx.db.query("eventVersions").first(),
+        observation: await ctx.db.query("observations").first(),
+      })),
+    ).toEqual({ event: null, version: null, observation: null });
   });
 
   test("expired workers are fenced and staged work survives a crash", async () => {

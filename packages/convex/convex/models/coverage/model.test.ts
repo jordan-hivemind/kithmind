@@ -214,6 +214,43 @@ describe("coverage calculation", () => {
     expect(futureDated.state).toBe("stale");
   });
 
+  test("coverage established after a query snapshot cannot complete that snapshot", async () => {
+    const t = convexTest(schema, modules);
+    const seeded = await seedCoverageAccount(t);
+    await insertCompleteWindow(t, { ...seeded, at: 10_000 });
+    const args = {
+      sourceAccountIds: [seeded.sourceAccountId],
+      recordType: "lab_result",
+      from: 0,
+      to: 100,
+      asOf: 10_100,
+    };
+    expect((await t.run((ctx) => calculateCoverage(ctx, args))).state).toBe(
+      "complete",
+    );
+    expect(
+      (
+        await t.run((ctx) =>
+          calculateCoverage(ctx, { ...args, snapshotAt: 9_999 }),
+        )
+      ).state,
+    ).not.toBe("complete");
+    expect(
+      (
+        await t.run((ctx) =>
+          calculateCoverage(ctx, { ...args, snapshotAt: 10_000 }),
+        )
+      ).state,
+    ).toBe("complete");
+    expect(
+      (
+        await t.run((ctx) =>
+          calculateCoverage(ctx, { ...args, asOf: 12_000, snapshotAt: 10_000 }),
+        )
+      ).state,
+    ).not.toBe("complete");
+  });
+
   test("an entity-specific gap invalidates all-entity coverage", async () => {
     const t = convexTest(schema, modules);
     const seeded = await seedCoverageAccount(t);
