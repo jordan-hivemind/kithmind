@@ -1,3 +1,6 @@
+import { coverageTables } from "./models/coverage/tables";
+import { ingestionTables } from "./models/ingestion/tables";
+import { provenanceTables } from "./models/provenance/tables";
 import { authTables } from "@convex-dev/auth/server";
 import { defineSchema, defineTable } from "convex/server";
 import { v } from "convex/values";
@@ -13,6 +16,7 @@ import {
   userSpaceSettingsFields,
 } from "./models/spaces/validators";
 import { thoughtFields } from "./models/thoughts/validators";
+import { sourceAccountTables } from "./models/sourceAccounts/tables";
 
 /**
  * Transitional test schema for migration fixtures that intentionally omit
@@ -21,6 +25,10 @@ import { thoughtFields } from "./models/thoughts/validators";
  */
 export default defineSchema({
   ...authTables,
+  ...sourceAccountTables,
+  ...coverageTables,
+  ...ingestionTables,
+  ...provenanceTables,
   thoughts: defineTable({
     ...thoughtFields,
     spaceId: v.optional(v.id("spaces")),

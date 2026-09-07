@@ -25,6 +25,7 @@ export async function _insertOne(
     name: string;
     capabilities: Capability[];
     spaceIds: Id<"spaces">[];
+    sourceAccountIds?: Id<"sourceAccounts">[];
   },
 ) {
   return await ctx.db.insert("apiKeys", fields);
@@ -37,6 +38,7 @@ export async function _updateOne(
     name?: string;
     capabilities?: Capability[];
     spaceIds?: Id<"spaces">[];
+    sourceAccountIds?: Id<"sourceAccounts">[];
   },
 ) {
   await ctx.db.patch(id, fields);

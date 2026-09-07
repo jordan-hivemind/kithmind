@@ -19,4 +19,5 @@ export const apiKeyFields = {
   lastUsedAt: v.optional(v.number()),
   capabilities: v.array(capability),
   spaceIds: v.array(v.id("spaces")),
+  sourceAccountIds: v.optional(v.array(v.id("sourceAccounts"))),
 };

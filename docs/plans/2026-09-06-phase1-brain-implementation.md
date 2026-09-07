@@ -2,13 +2,13 @@
 
 **Date:** 2026-09-06
 
-**Status:** P1-1 implementation adds the transitional schema and personal-space migration tooling. The remaining Phase 1 runtime work and family acceptance tests are pending.
+**Status:** P1-1 and P1-2 are implemented and deployed, including required ownership fields and scoped credentials. P1-3 source/evidence/job primitives and indexed read tools are implemented with synthetic integration tests. Family lifecycle, typed records, ingestion, embeddings, and installation acceptance remain pending.
 
 **Parent:** [Kith Mind architecture](./2026-09-06-architecture.md)
 
 **Scope:** Desktop-first family spaces, authorization, durable source and processing records, typed events and observations, deterministic queries with coverage, bounded inline-text ingestion, and embedding compatibility controls.
 
-**Out of scope:** Production deployment, real connector polling, URL fetching, OCR, model extraction, real-data backfill, bulk ingest, and native-mobile acceptance. Connector and backfill work begins in implementation Phase 2 after the contracts below work with synthetic records. Native-mobile validation is a separate P2-priority lane and does not gate the desktop phases.
+**Out of scope:** Real connector polling, URL fetching, OCR, model extraction, real-data backfill, bulk ingest, and native-mobile acceptance. Connector and backfill work begins in implementation Phase 2 after the contracts below work with synthetic records. Native-mobile validation is a separate P2-priority lane and does not gate the desktop phases.
 
 This plan is public and self-contained. Contributors do not need `docs/private/`, owner accounts, or private fixtures to implement or verify it.
 
@@ -42,11 +42,15 @@ type Capability = "read" | "write" | "ingest";
 type Principal = {
   userId: Id<"users">;
   credentialId?: Id<"apiKeys">;
-  capabilities: ReadonlySet<Capability>;
-  credentialSpaceIds?: ReadonlySet<Id<"spaces">>;
-  credentialSourceAccountIds?: ReadonlySet<Id<"sourceAccounts">>;
+  capabilities: readonly Capability[];
+  credentialSpaceIds?: readonly Id<"spaces">[];
+  credentialSourceAccountIds?: readonly Id<"sourceAccounts">[];
 };
 ```
+
+Principal snapshots use arrays so they can cross Convex action boundaries. Actions
+pass a `PrincipalRef` containing only the authenticated user and optional key ID;
+final queries and mutations reload current grants and membership.
 
 `requireSpaceAccess(ctx, principal, spaceId, operation)` enforces both controls:
 
@@ -71,9 +75,9 @@ If no default is configured, resolution falls back to the personal space. A conf
 
 ### 2.3 Source identity, revisions, and evidence
 
-A source item is unique by `(spaceId, connector, accountId, externalId)`. `externalId` is a connector-native stable ID where one exists. The bounded manual/MCP path requires an explicit stable source item ID as well as a separate request ID for transport retries; URI and file location are mutable metadata, not identity.
+A source item is unique by `(spaceId, connector, accountId, externalId)`. `externalId` is a connector-native stable ID where one exists. The bounded manual/MCP path requires an explicit stable source item ID as well as a separate request ID for transport retries; URI and file location are mutable metadata, not identity. Storage uses a source-account reference and SHA-256 of the external ID for this identity. Forgetting erases the raw external ID and source metadata while retaining this minimal identity tombstone to prevent automatic resurrection.
 
-Each admitted payload is hashed at the trusted server boundary. Inline text hashes the exact UTF-8 bytes of the validated `text` value; a future binary fetch hashes the actual fetched bytes. Do not apply unspecified Unicode, newline, JSON, or file normalization before the source-revision hash. The route separately hashes the exact bounded request bytes for request-ID conflict detection. A source revision is immutable and unique by `(sourceItemId, contentHash)`. An identical retry returns the existing revision and processing result. Changed content for the same source item creates a new revision. The same external item intentionally imported into two spaces creates two independently authorized source items.
+Each admitted payload is hashed at the trusted server boundary. Inline text hashes the exact UTF-8 bytes of the validated `text` value; a future binary fetch hashes the actual fetched bytes. Do not apply unspecified Unicode, newline, JSON, or file normalization before the source-revision hash. For request-ID conflict detection, MCP hashes a canonical validated argument envelope that preserves text exactly. The MCP SDK provides decoded arguments, not raw HTTP bytes. A future dedicated HTTP ingestion route may separately hash its raw bounded request bytes. A source revision is immutable and unique by `(sourceItemId, contentHash)`. An identical retry returns the existing revision and processing result. Changed content for the same source item creates a new revision. Admission uses an expected desired-processing epoch compare-and-swap (zero for a new item); a matching existing receipt is checked first. Provider-specific revision ordering remains a connector responsibility, rather than a generic lexical comparison. The same external item intentionally imported into two spaces creates two independently authorized source items.
 
 Source-revision and processing idempotence are separate. A processing generation is unique by `(sourceRevisionId, processingFingerprint)`, where the fingerprint includes parser/text-extraction, extractor, record-schema, normalization, and chunker versions plus an explicit correction revision when a human fixes unchanged bytes. Reprocessing the same revision with the same fingerprint reuses the generation; a corrected extraction or changed processing contract creates another generation. Mutable location and original-link metadata live on the source item. The canonical archived-content reference, when available, lives only on the immutable source revision so an old citation cannot resolve to newer bytes.
 
@@ -193,7 +197,7 @@ P1-1, P1-3, and P1-7 add the following logical records. Validators live beside t
 | `spaceMembers`                           | `(spaceId,userId)` unique-by-mutation, by user; role and optional linked person entity                                                             |
 | `spaceInvitations`                       | token hash, `(spaceId,normalizedEmail)`, role, expiry, pending-acceptance user ID, owner approval, accepted/revoked audit                          |
 | `userSpaceSettings`                      | user ID, personal space ID, optional default write space ID                                                                                        |
-| `apiKeys`                                | existing key hash plus capabilities and explicit scoped space IDs                                                                                  |
+| `apiKeys`                                | existing key hash plus capabilities, explicit space IDs, and explicit source-account IDs for ingest; legacy non-ingest keys may omit source IDs    |
 | `entities`                               | required `spaceId`; `(spaceId,key)` and `(spaceId,kind,normalizedName)`                                                                            |
 | `facts`, `thoughts`                      | required `spaceId`, author `userId`, space-filterable search/vector indexes                                                                        |
 | `sourceAccounts`                         | `(spaceId,connector,accountId)`, freshness and cursor version                                                                                      |
@@ -261,6 +265,7 @@ Phase 1 adds a deliberately small desktop workflow:
 - Invite member: owner enters email and role `editor` or `reader`; store normalized email, hashed random token, expiry, and inviter audit. Do not create a shadow user. The UI provides the secret invite link for the owner to deliver out of band; Phase 1 does not require an email service.
 - Accept invite: the current Password provider does not prove email ownership, so email match is a routing hint rather than authorization. The logged-in invitee submits the secret invite token, which records that server-derived user ID as a pending acceptance. An owner then approves that concrete account in the members UI before membership becomes active. The client never nominates a user ID. A future provider may remove the approval step only when the server can verify the same normalized email claim.
 - Members page: show active members, pending invitations, roles, and the current user's access. Owners can change editor/reader roles, revoke invitations, and remove members.
+- Person mapping: explicitly link a member to a same-space person entity, including initial Personal setup. Never infer identity from matching names. Until linked, `me` returns a clear setup error. Members can manage their own Personal link; shared-space owners manage family member links.
 - Ownership: at least one owner must remain. Transfer adds the new owner before demoting the old one in one mutation. A last owner cannot leave or be removed.
 - Default destination: settings show Personal plus current memberships. The user can choose a default write space; joining a family space does not select it automatically.
 
@@ -303,7 +308,7 @@ A later migration creates a staged embedding profile and generation, embeds ever
 
 The route enforces content type, byte limit, title/request-ID/source-ID limits, and rate limit, then derives the principal and destination space. It resolves `source.accountId` to a configured source account permitted by the credential. The Convex action hashes the exact UTF-8 text bytes, admits the source revision and job, claims a lease, creates one source-text version, one text page, evidence spans, a generic document, and bounded chunks, stages, and activates. Chunking is a simple Phase 1 implementation with explicit maximum input, page, chunk, and chunk-count limits. Its size is configuration recorded in the chunker fingerprint, not a corpus-wide recommendation.
 
-The response reports source item, revision, generation, job, and document IDs plus `ready`, `needs_review`, or `failed`. Retrying the same request ID and exact request bytes is a no-op that returns the same authorized result. Reusing a request ID with different request bytes is a conflict. A new request ID for the same source external ID and changed text creates a new immutable revision and activates it only after complete staging.
+The response reports source item, revision, generation, job, and document IDs plus `ready`, `needs_review`, or `failed`. Retrying the same request ID and canonical validated arguments is a no-op that returns the same authorized result. Reusing a request ID with different validated arguments is a conflict. A new request ID for the same source external ID and changed text creates a new immutable revision and activates it only after complete staging.
 
 `ingest_url` may enqueue a URL-shaped source for compatibility, but Phase 1 does not fetch it and must return `queued` with `workerRequired: true`. URL fetching, redirect and private-network defenses, file downloads, OCR, portal automation, and connector credentials belong to Phase 2. Tests must not make network requests.
 

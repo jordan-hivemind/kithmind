@@ -1,3 +1,6 @@
+import { coverageTables } from "./models/coverage/tables";
+import { ingestionTables } from "./models/ingestion/tables";
+import { provenanceTables } from "./models/provenance/tables";
 import { defineSchema, defineTable } from "convex/server";
 import { authTables } from "@convex-dev/auth/server";
 import { thoughtFields } from "./models/thoughts/validators";
@@ -6,6 +9,7 @@ import { reportFields, insightFields } from "./models/reports/validators";
 import { listFields, listItemFields } from "./models/lists/validators";
 import { consumedOAuthCodeFields } from "./models/oauth/validators";
 import { entityFields, factFields } from "./models/facts/validators";
+import { sourceAccountTables } from "./models/sourceAccounts/tables";
 import {
   spaceFields,
   spaceMemberFields,
@@ -14,6 +18,10 @@ import {
 
 export default defineSchema({
   ...authTables,
+  ...sourceAccountTables,
+  ...coverageTables,
+  ...ingestionTables,
+  ...provenanceTables,
   thoughts: defineTable(thoughtFields)
     .index("by_userId", ["userId"])
     .index("by_userId_and_isCore", ["userId", "isCore"])

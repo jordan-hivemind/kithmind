@@ -41,6 +41,9 @@ const destructive = {
  * pessimistic defaults.
  */
 export const MCP_TOOL_ANNOTATIONS = {
+  [MCP_TOOL_NAMES.searchDocuments]: readOnly,
+  [MCP_TOOL_NAMES.getDocument]: readOnly,
+  [MCP_TOOL_NAMES.listSources]: readOnly,
   [MCP_TOOL_NAMES.listSpaces]: readOnly,
   [MCP_TOOL_NAMES.searchFacts]: readOnly,
   [MCP_TOOL_NAMES.rememberFact]: idempotentAdditive,
@@ -65,6 +68,9 @@ export const MCP_TOOL_ANNOTATIONS = {
 } as const satisfies Record<McpToolName, McpToolAnnotations>;
 
 export const MCP_MEMORY_TOOL_NAMES = [
+  MCP_TOOL_NAMES.searchDocuments,
+  MCP_TOOL_NAMES.getDocument,
+  MCP_TOOL_NAMES.listSources,
   MCP_TOOL_NAMES.listSpaces,
   MCP_TOOL_NAMES.searchFacts,
   MCP_TOOL_NAMES.rememberFact,
