@@ -47,10 +47,18 @@ describe("OAuth space consent", () => {
     );
     vi.stubEnv("NEXT_PUBLIC_CONVEX_URL", "https://example.convex.cloud");
     mocks.token.mockResolvedValue("web-session-token");
-    mocks.mutation.mockResolvedValue({
-      id: "created-key",
-      rawKey: "ob_" + "a".repeat(64),
-    });
+    mocks.mutation
+      .mockResolvedValueOnce({
+        status: "issued",
+        keyId: "created-key",
+        userId: "owner-user",
+        rawKey: "ob_" + "a".repeat(64),
+        requestHash: "b".repeat(64),
+        bindingSeedHash: "c".repeat(64),
+        preparationNonce: "d".repeat(64),
+        grantExpiresAt: Date.now() + 5 * 60 * 1000,
+      })
+      .mockResolvedValueOnce(null);
   });
   afterEach(() => vi.unstubAllEnvs());
 
@@ -73,6 +81,11 @@ describe("OAuth space consent", () => {
     );
     expect(response.status).toBe(200);
     expect(mocks.mutation.mock.calls[0]?.[1]).toEqual({
+      clientId: expect.any(String),
+      redirectUri: "https://client.example.test/callback",
+      resource: "https://brain.example.test/api/mcp",
+      codeChallenge: "a".repeat(43),
+      scope: "open-brain",
       name: "MCP (Synthetic client)",
       spaceIds: ["space"],
       capabilities: ["read"],
@@ -86,13 +99,20 @@ describe("OAuth space consent", () => {
     ).toBe(401);
     expect(mocks.mutation).not.toHaveBeenCalled();
   });
-  test("revokes the credential when authorization-code creation fails", async () => {
+  test("abandons the fenced preparation when authorization-code creation fails", async () => {
+    mocks.mutation.mockReset();
     mocks.mutation
       .mockImplementationOnce(async () => {
         vi.stubEnv("MCP_OAUTH_ENCRYPTION_KEY", "invalid-after-create");
         return {
-          id: "created-key",
+          status: "issued",
+          keyId: "created-key",
+          userId: "owner-user",
           rawKey: "ob_" + "a".repeat(64),
+          requestHash: "b".repeat(64),
+          bindingSeedHash: "c".repeat(64),
+          preparationNonce: "d".repeat(64),
+          grantExpiresAt: Date.now() + 5 * 60 * 1000,
         };
       })
       .mockResolvedValueOnce(null);
@@ -104,8 +124,39 @@ describe("OAuth space consent", () => {
     expect(response.status).toBe(500);
     expect(mocks.mutation).toHaveBeenNthCalledWith(
       2,
-      api.models.apiKeys.public.revoke,
-      { id: "created-key" },
+      api.models.oauth.web.abandonAuthorizationGrant,
+      {
+        keyId: "created-key",
+        requestHash: "b".repeat(64),
+        preparationNonce: "d".repeat(64),
+      },
     );
+  });
+
+  test("returns the exact stored code for an idempotent pending retry", async () => {
+    mocks.mutation.mockReset();
+    mocks.mutation.mockResolvedValueOnce({
+      status: "pending",
+      keyId: "created-key",
+      encryptedCode: "obac1.stored-code",
+      grantExpiresAt: Date.now() + 60_000,
+    });
+    const response = await POST(
+      request({ spaceIds: ["space"], capabilities: ["read"] }),
+    );
+    expect(response.status).toBe(200);
+    const location = new URL((await response.json()).redirect_url);
+    expect(location.searchParams.get("code")).toBe("obac1.stored-code");
+    expect(mocks.mutation).toHaveBeenCalledTimes(1);
+  });
+
+  test("requires a fresh authorization request after consumption", async () => {
+    mocks.mutation.mockReset();
+    mocks.mutation.mockResolvedValueOnce({ status: "consumed" });
+    const response = await POST(
+      request({ spaceIds: ["space"], capabilities: ["read"] }),
+    );
+    expect(response.status).toBe(409);
+    expect(mocks.mutation).toHaveBeenCalledTimes(1);
   });
 });

@@ -92,6 +92,10 @@ export const clientRegistrationPayloadSchema = z.object({
 
 export const authorizationCodePayloadSchema = z.object({
   apiKey: z.string().regex(/^ob_[a-f0-9]{64}$/),
+  apiKeyId: z.string().min(1).max(128),
+  userId: z.string().min(1).max(128),
+  requestHash: z.string().regex(/^[a-f0-9]{64}$/),
+  bindingSeedHash: z.string().regex(/^[a-f0-9]{64}$/),
   clientId: z.string().min(1).max(8192),
   redirectUri,
   resource: z.string().min(1).max(2048),

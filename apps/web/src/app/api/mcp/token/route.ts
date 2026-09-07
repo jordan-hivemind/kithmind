@@ -1,13 +1,14 @@
 import { api } from "@repo/db/convex/_generated/api";
 import { ConvexHttpClient } from "convex/browser";
 
-import { authenticateApiKey } from "@/lib/mcp/auth";
 import { createConvexMcpToken } from "@/lib/mcp/convex-auth";
 import { getMcpResourceUri, isMcpResourceUri } from "@/lib/mcp/environment";
 import {
   assertOAuthEncryptionConfigured,
   decryptAuthCode,
+  hashApiKeyCredential,
   hashAuthorizationCode,
+  hashOAuthBinding,
   OAUTH_NO_STORE_HEADERS,
   readLimitedOAuthBody,
   verifyCodeChallenge,
@@ -82,9 +83,8 @@ export async function POST(req: Request) {
     return tokenError("invalid_grant", "Invalid code verifier");
   }
 
-  const apiKeyIdentity = await authenticateApiKey(`Bearer ${data.apiKey}`);
   const convexUrl = process.env.NEXT_PUBLIC_CONVEX_URL;
-  if (!apiKeyIdentity || !convexUrl) {
+  if (!convexUrl) {
     return tokenError(
       "invalid_grant",
       "Authorization grant is no longer valid",
@@ -92,16 +92,34 @@ export async function POST(req: Request) {
   }
 
   try {
-    const convexToken = await createConvexMcpToken(apiKeyIdentity);
+    const codeHash = hashAuthorizationCode(request.code);
+    const keyHash = hashApiKeyCredential(data.apiKey);
+    const bindingHash = hashOAuthBinding(data.bindingSeedHash, codeHash);
+    const convexToken = await createConvexMcpToken(
+      {
+        userId: data.userId,
+        keyId: data.apiKeyId,
+      },
+      { keyHash, codeHash, bindingHash, requestHash: data.requestHash },
+    );
     const convex = new ConvexHttpClient(convexUrl);
     convex.setAuth(convexToken);
-    await convex.mutation(
-      api.models.oauth.mcpMutations.consumeAuthorizationCode,
+    const result = await convex.mutation(
+      api.models.oauth.mcpMutations.activateAuthorizationGrant,
       {
-        codeHash: hashAuthorizationCode(request.code),
+        codeHash,
+        keyHash,
+        bindingHash,
+        requestHash: data.requestHash,
         expiresAt: data.exp,
       },
     );
+    if (result.status !== "activated") {
+      return tokenError(
+        "invalid_grant",
+        "Authorization code is invalid or was already used",
+      );
+    }
   } catch {
     return tokenError(
       "invalid_grant",

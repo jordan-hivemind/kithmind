@@ -10,4 +10,11 @@ crons.interval(
   {},
 );
 
+crons.interval(
+  "remove expired OAuth grants",
+  { minutes: 5 },
+  internal.models.oauth.cleanup.removeExpired,
+  {},
+);
+
 export default crons;

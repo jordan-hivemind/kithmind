@@ -3,6 +3,11 @@ import { v } from "convex/values";
 import type { Id } from "../../_generated/dataModel";
 import { internalMutation, internalQuery } from "../../_generated/server";
 import { inspectPersonalSpace, isPersonalSpaceReady } from "../spaces/model";
+import {
+  hasNoOAuthLifecycle,
+  isPendingOAuthKey,
+  isPreparingOAuthKey,
+} from "./validators";
 
 const DEFAULT_BATCH_SIZE = 100;
 const MAX_BATCH_SIZE = 200;
@@ -166,6 +171,61 @@ export const auditScopes = internalQuery({
         invalidCount += 1;
         if (invalids.length < MAX_DIAGNOSTICS) {
           invalids.push({ id: key._id, reason: reasons.join("; ") });
+        }
+      }
+    }
+    return {
+      examined: page.page.length,
+      changed: 0,
+      wouldChange: 0,
+      invalidCount,
+      invalids,
+      blocked: invalidCount > 0,
+      isDone: page.isDone,
+      cursor: page.isDone ? null : page.continueCursor,
+    };
+  },
+});
+
+export const auditOAuthLifecycle = internalQuery({
+  args: {
+    cursor: v.optional(v.string()),
+    batchSize: v.optional(v.number()),
+  },
+  returns: result,
+  handler: async (ctx, args) => {
+    const page = await ctx.db.query("apiKeys").paginate({
+      cursor: args.cursor ?? null,
+      numItems: boundedBatchSize(args.batchSize),
+    });
+    let invalidCount = 0;
+    const invalids: Array<{ id: string; reason: string }> = [];
+    for (const key of page.page) {
+      const structurallyValid =
+        hasNoOAuthLifecycle(key) ||
+        isPreparingOAuthKey(key) ||
+        isPendingOAuthKey(key);
+      const hashFields = [
+        key.oauthRequestHash,
+        key.oauthCodeHash,
+        key.oauthBindingHash,
+        key.oauthBindingSeedHash,
+        key.oauthPreparationNonce,
+      ].filter((value): value is string => value !== undefined);
+      const hashesValid = hashFields.every((value) =>
+        /^[a-f0-9]{64}$/.test(value),
+      );
+      const encryptedCodeValid =
+        key.oauthEncryptedCode === undefined ||
+        (key.oauthEncryptedCode.startsWith("obac1.") &&
+          key.oauthEncryptedCode.length <= 8192);
+      if (!structurallyValid || !hashesValid || !encryptedCodeValid) {
+        invalidCount += 1;
+        if (invalids.length < MAX_DIAGNOSTICS) {
+          invalids.push({
+            id: key._id,
+            reason: "invalid OAuth lifecycle fields",
+          });
         }
       }
     }

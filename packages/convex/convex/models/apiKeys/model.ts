@@ -1,19 +1,23 @@
 import { QueryCtx, MutationCtx } from "../../_generated/server";
 import { Id } from "../../_generated/dataModel";
 import type { Capability } from "../../lib/spaces";
+import { hasNoOAuthLifecycle } from "./validators";
 
 export async function _findByHash(ctx: QueryCtx, keyHash: string) {
-  return await ctx.db
+  const key = await ctx.db
     .query("apiKeys")
     .withIndex("by_keyHash", (q) => q.eq("keyHash", keyHash))
     .unique();
+  return key && hasNoOAuthLifecycle(key) ? key : null;
 }
 
 export async function _listByUser(ctx: QueryCtx, userId: Id<"users">) {
   return await ctx.db
     .query("apiKeys")
-    .withIndex("by_userId", (q) => q.eq("userId", userId))
-    .collect();
+    .withIndex("by_userId_and_oauthLifecycle", (q) =>
+      q.eq("userId", userId).eq("oauthLifecycle", undefined),
+    )
+    .take(101);
 }
 
 export async function _insertOne(

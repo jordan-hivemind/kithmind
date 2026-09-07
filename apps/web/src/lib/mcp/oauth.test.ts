@@ -208,6 +208,10 @@ describe("MCP OAuth security", () => {
   it("encrypts authorization codes without confusing token types", () => {
     const payload = {
       apiKey: `ob_${"a".repeat(64)}`,
+      apiKeyId: "key-id",
+      userId: "user-id",
+      requestHash: "b".repeat(64),
+      bindingSeedHash: "c".repeat(64),
       clientId: "registered-client",
       redirectUri: "https://chatgpt.com/oauth/callback",
       resource: "https://brain.example.test/api/mcp",

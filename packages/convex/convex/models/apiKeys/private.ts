@@ -1,6 +1,7 @@
 import { internalQuery, internalMutation } from "../../_generated/server";
 import { v } from "convex/values";
 import { _findByHash } from "./model";
+import { hasNoOAuthLifecycle } from "./validators";
 
 export const findByHash = internalQuery({
   args: { keyHash: v.string() },
@@ -25,7 +26,9 @@ export const findByHash = internalQuery({
   ),
   handler: async (ctx, args) => {
     const key = await _findByHash(ctx, args.keyHash);
-    return key && (await ctx.db.get(key.userId)) ? key : null;
+    return key && hasNoOAuthLifecycle(key) && (await ctx.db.get(key.userId))
+      ? key
+      : null;
   },
 });
 
@@ -34,15 +37,21 @@ export const getById = internalQuery({
   handler: async (ctx, args) => {
     const id = ctx.db.normalizeId("apiKeys", args.id);
     const key = id ? await ctx.db.get(id) : null;
-    return key && (await ctx.db.get(key.userId)) ? key : null;
+    return key && hasNoOAuthLifecycle(key) && (await ctx.db.get(key.userId))
+      ? key
+      : null;
   },
 });
 
 export const updateLastUsed = internalMutation({
   args: { id: v.id("apiKeys") },
-  returns: v.null(),
+  returns: v.boolean(),
   handler: async (ctx, args) => {
+    const key = await ctx.db.get(args.id);
+    if (!key || !hasNoOAuthLifecycle(key) || !(await ctx.db.get(key.userId))) {
+      return false;
+    }
     await ctx.db.patch(args.id, { lastUsedAt: Date.now() });
-    return null;
+    return true;
   },
 });

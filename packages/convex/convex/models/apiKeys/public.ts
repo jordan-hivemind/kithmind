@@ -1,5 +1,9 @@
 import { query, mutation } from "../../_generated/server";
 import { ConvexError, v } from "convex/values";
+import {
+  paginationOptsValidator,
+  paginationResultValidator,
+} from "convex/server";
 import { requireWebPrincipal } from "../../lib/webAuth";
 import {
   ensurePersonalSpace,
@@ -10,9 +14,60 @@ import {
 import { _listByUser, _insertOne, _deleteOne, _updateOne } from "./model";
 import type { MutationCtx } from "../../_generated/server";
 import type { Id } from "../../_generated/dataModel";
-import { capability } from "./validators";
+import { capability, hasNoOAuthLifecycle } from "./validators";
 
-function validateName(name: string) {
+const keySummary = v.object({
+  _id: v.id("apiKeys"),
+  _creationTime: v.number(),
+  keyPrefix: v.string(),
+  name: v.string(),
+  lastUsedAt: v.optional(v.number()),
+  capabilities: v.array(capability),
+  spaceIds: v.array(v.id("spaces")),
+  sourceAccountIds: v.array(v.id("sourceAccounts")),
+});
+
+function summarizeKey(key: {
+  _id: Id<"apiKeys">;
+  _creationTime: number;
+  keyPrefix: string;
+  name: string;
+  lastUsedAt?: number;
+  capabilities: Array<"read" | "write" | "ingest">;
+  spaceIds: Id<"spaces">[];
+  sourceAccountIds?: Id<"sourceAccounts">[];
+}) {
+  return {
+    _id: key._id,
+    _creationTime: key._creationTime,
+    keyPrefix: key.keyPrefix,
+    name: key.name,
+    lastUsedAt: key.lastUsedAt,
+    capabilities: key.capabilities,
+    spaceIds: key.spaceIds,
+    sourceAccountIds: key.sourceAccountIds ?? [],
+  };
+}
+
+export async function generateApiKeyMaterial() {
+  const randomBytes = new Uint8Array(32);
+  crypto.getRandomValues(randomBytes);
+  const rawKey =
+    "ob_" +
+    Array.from(randomBytes)
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("");
+  const hashBuffer = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(rawKey),
+  );
+  const keyHash = Array.from(new Uint8Array(hashBuffer))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+  return { rawKey, keyHash };
+}
+
+export function validateApiKeyName(name: string) {
   if (
     !name.trim() ||
     name.length > 200 ||
@@ -25,7 +80,7 @@ function validateName(name: string) {
   }
 }
 
-async function validateScopes(
+export async function validateApiKeyScopes(
   ctx: MutationCtx,
   principal: Principal,
   capabilities: Array<"read" | "write" | "ingest">,
@@ -65,32 +120,52 @@ async function validateScopes(
 
 export const list = query({
   args: {},
-  returns: v.array(
-    v.object({
-      _id: v.id("apiKeys"),
-      _creationTime: v.number(),
-      keyPrefix: v.string(),
-      name: v.string(),
-      lastUsedAt: v.optional(v.number()),
-      capabilities: v.array(capability),
-      spaceIds: v.array(v.id("spaces")),
-      sourceAccountIds: v.array(v.id("sourceAccounts")),
-    }),
-  ),
+  returns: v.array(keySummary),
   handler: async (ctx) => {
     const { userId } = await requireWebPrincipal(ctx);
 
     const keys = await _listByUser(ctx, userId);
-    return keys.map((k) => ({
-      _id: k._id,
-      _creationTime: k._creationTime,
-      keyPrefix: k.keyPrefix,
-      name: k.name,
-      lastUsedAt: k.lastUsedAt,
-      capabilities: k.capabilities,
-      spaceIds: k.spaceIds,
-      sourceAccountIds: k.sourceAccountIds ?? [],
-    }));
+    if (keys.some((key) => !hasNoOAuthLifecycle(key))) {
+      throw new ConvexError({
+        code: "invalid_api_key_state",
+        message: "API key lifecycle data is invalid.",
+      });
+    }
+    if (keys.length > 100) {
+      throw new ConvexError({
+        code: "api_key_list_overflow",
+        message: "Too many API keys to list. Use paginated key management.",
+      });
+    }
+    return keys.map(summarizeKey);
+  },
+});
+
+export const listPage = query({
+  args: { paginationOpts: paginationOptsValidator },
+  returns: paginationResultValidator(keySummary),
+  handler: async (ctx, args) => {
+    const { userId } = await requireWebPrincipal(ctx);
+    const { numItems } = args.paginationOpts;
+    if (!Number.isInteger(numItems) || numItems < 1 || numItems > 50) {
+      throw new ConvexError({
+        code: "invalid_input",
+        message: "Pagination size must be between 1 and 50.",
+      });
+    }
+    const page = await ctx.db
+      .query("apiKeys")
+      .withIndex("by_userId_and_oauthLifecycle", (q) =>
+        q.eq("userId", userId).eq("oauthLifecycle", undefined),
+      )
+      .paginate(args.paginationOpts);
+    if (page.page.some((key) => !hasNoOAuthLifecycle(key))) {
+      throw new ConvexError({
+        code: "invalid_api_key_state",
+        message: "API key lifecycle data is invalid.",
+      });
+    }
+    return { ...page, page: page.page.map(summarizeKey) };
   },
 });
 
@@ -108,9 +183,9 @@ export const create = mutation({
   handler: async (ctx, args) => {
     const principal = await requireWebPrincipal(ctx);
     const { userId } = principal;
-    validateName(args.name);
+    validateApiKeyName(args.name);
     await ensurePersonalSpace(ctx, userId);
-    await validateScopes(
+    await validateApiKeyScopes(
       ctx,
       principal,
       args.capabilities,
@@ -118,22 +193,7 @@ export const create = mutation({
       args.sourceAccountIds ?? [],
     );
 
-    // Generate a random API key
-    const randomBytes = new Uint8Array(32);
-    crypto.getRandomValues(randomBytes);
-    const rawKey =
-      "ob_" +
-      Array.from(randomBytes)
-        .map((b) => b.toString(16).padStart(2, "0"))
-        .join("");
-
-    // Hash it for storage
-    const encoder = new TextEncoder();
-    const data = encoder.encode(rawKey);
-    const hashBuffer = await crypto.subtle.digest("SHA-256", data);
-    const keyHash = Array.from(new Uint8Array(hashBuffer))
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("");
+    const { rawKey, keyHash } = await generateApiKeyMaterial();
 
     const keyPrefix = rawKey.slice(0, 11); // "ob_" + first 8 hex chars
 
@@ -164,8 +224,8 @@ export const update = mutation({
   handler: async (ctx, args) => {
     const principal = await requireWebPrincipal(ctx);
     const { userId } = principal;
-    if (args.name !== undefined) validateName(args.name);
-    await validateScopes(
+    if (args.name !== undefined) validateApiKeyName(args.name);
+    await validateApiKeyScopes(
       ctx,
       principal,
       args.capabilities,
@@ -173,7 +233,9 @@ export const update = mutation({
       args.sourceAccountIds ?? [],
     );
     const key = await ctx.db.get(args.id);
-    if (!key || key.userId !== userId) throw new Error("API key not found");
+    if (!key || key.userId !== userId || !hasNoOAuthLifecycle(key)) {
+      throw new Error("API key not found");
+    }
     await _updateOne(ctx, args.id, {
       ...(args.name === undefined ? {} : { name: args.name }),
       capabilities: args.capabilities,
@@ -191,7 +253,7 @@ export const revoke = mutation({
     const { userId } = await requireWebPrincipal(ctx);
 
     const key = await ctx.db.get(args.id);
-    if (!key || key.userId !== userId) {
+    if (!key || key.userId !== userId || !hasNoOAuthLifecycle(key)) {
       throw new Error("API key not found");
     }
 

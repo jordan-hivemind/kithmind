@@ -27,9 +27,13 @@ export const authenticateKeyHash = action({
     );
     if (!apiKey) return null;
 
-    await ctx.runMutation(internal.models.apiKeys.private.updateLastUsed, {
-      id: apiKey._id,
-    });
+    const accepted = await ctx.runMutation(
+      internal.models.apiKeys.private.updateLastUsed,
+      {
+        id: apiKey._id,
+      },
+    );
+    if (!accepted) return null;
 
     return { userId: apiKey.userId, keyId: apiKey._id };
   },

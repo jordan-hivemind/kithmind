@@ -2,9 +2,14 @@
 
 import { api } from "@repo/db/convex/_generated/api";
 import type { Id } from "@repo/db/convex/_generated/dataModel";
-import { useConvexAuth, useMutation, useQuery } from "convex/react";
+import {
+  useConvexAuth,
+  useMutation,
+  usePaginatedQuery,
+  useQuery,
+} from "convex/react";
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
+import { Component, useEffect, useMemo, useState } from "react";
 
 import {
   type KeyCapability,
@@ -29,7 +34,153 @@ function errorMessage(caught: unknown, fallback: string) {
   ) {
     return data.message;
   }
-  return caught.message || fallback;
+  return fallback;
+}
+
+class ApiKeyListErrorBoundary extends Component<
+  { children: React.ReactNode; onRetry: () => void },
+  { failed: boolean }
+> {
+  state = { failed: false };
+
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+
+  render() {
+    if (this.state.failed) {
+      return (
+        <section aria-label="API key list" style={{ marginTop: 24 }}>
+          <p role="alert">Could not load API keys.</p>
+          <button
+            type="button"
+            onClick={() => {
+              this.setState({ failed: false });
+              this.props.onRetry();
+            }}
+          >
+            Retry
+          </button>
+        </section>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+function ApiKeyList({ onHasKeys }: { onHasKeys: (hasKeys: boolean) => void }) {
+  const {
+    results: apiKeys,
+    status,
+    loadMore,
+  } = usePaginatedQuery(
+    api.models.apiKeys.public.listPage,
+    {},
+    { initialNumItems: 25 },
+  );
+  const revokeKey = useMutation(api.models.apiKeys.public.revoke);
+  const [error, setError] = useState("");
+  const [revokingKeyId, setRevokingKeyId] = useState<Id<"apiKeys"> | null>(
+    null,
+  );
+
+  useEffect(() => onHasKeys(apiKeys.length > 0), [apiKeys.length, onHasKeys]);
+
+  return (
+    <section aria-label="API key list" style={{ marginTop: 24 }}>
+      {error && <p role="alert">{error}</p>}
+      <table
+        style={{
+          width: "100%",
+          borderCollapse: "collapse",
+          marginBottom: 16,
+        }}
+      >
+        <thead>
+          <tr style={{ borderBottom: "2px solid #eee", textAlign: "left" }}>
+            <th style={{ padding: 8 }}>Name</th>
+            <th style={{ padding: 8 }}>Key</th>
+            <th style={{ padding: 8 }}>Last Used</th>
+            <th style={{ padding: 8 }}>Created</th>
+            <th style={{ padding: 8 }}></th>
+          </tr>
+        </thead>
+        <tbody>
+          {status === "LoadingFirstPage" ? (
+            <tr>
+              <td colSpan={5} style={{ padding: 8 }}>
+                Loading API keys...
+              </td>
+            </tr>
+          ) : apiKeys.length === 0 ? (
+            <tr>
+              <td colSpan={5} style={{ padding: 8, color: "#666" }}>
+                No API keys yet.
+              </td>
+            </tr>
+          ) : (
+            apiKeys.map((key) => (
+              <tr key={key._id} style={{ borderBottom: "1px solid #eee" }}>
+                <td style={{ padding: 8 }}>
+                  {key.name}
+                  <br />
+                  <small>
+                    {key.capabilities.join(", ")} · {key.spaceIds.length}{" "}
+                    space(s)
+                  </small>
+                </td>
+                <td style={{ padding: 8 }}>
+                  <code>{key.keyPrefix}...</code>
+                </td>
+                <td style={{ padding: 8, color: "#666" }}>
+                  {key.lastUsedAt
+                    ? new Date(key.lastUsedAt).toLocaleDateString()
+                    : "Never"}
+                </td>
+                <td style={{ padding: 8, color: "#666" }}>
+                  {new Date(key._creationTime).toLocaleDateString()}
+                </td>
+                <td style={{ padding: 8 }}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setError("");
+                      setRevokingKeyId(key._id);
+                      void revokeKey({ id: key._id })
+                        .catch((caught: unknown) =>
+                          setError(
+                            errorMessage(caught, "Could not revoke key."),
+                          ),
+                        )
+                        .finally(() => setRevokingKeyId(null));
+                    }}
+                    disabled={revokingKeyId === key._id}
+                    style={{
+                      color: "red",
+                      cursor: "pointer",
+                      background: "none",
+                      border: "none",
+                    }}
+                  >
+                    {revokingKeyId === key._id ? "Revoking..." : "Revoke"}
+                  </button>
+                </td>
+              </tr>
+            ))
+          )}
+        </tbody>
+      </table>
+      {status === "CanLoadMore" || status === "LoadingMore" ? (
+        <button
+          type="button"
+          onClick={() => loadMore(25)}
+          disabled={status === "LoadingMore"}
+        >
+          {status === "LoadingMore" ? "Loading..." : "Load more"}
+        </button>
+      ) : null}
+    </section>
+  );
 }
 
 export default function SettingsPage() {
@@ -49,7 +200,6 @@ export default function SettingsPage() {
     api.models.sourceAccounts.public.list,
     settingsReady ? {} : "skip",
   );
-  const apiKeys = useQuery(api.models.apiKeys.public.list);
   const setDefaultWriteSpace = useMutation(
     api.models.spaces.public.setDefaultWriteSpace,
   );
@@ -60,7 +210,6 @@ export default function SettingsPage() {
     api.models.sourceAccounts.public.update,
   );
   const createKey = useMutation(api.models.apiKeys.public.create);
-  const revokeKey = useMutation(api.models.apiKeys.public.revoke);
 
   const [spaceIds, setSpaceIds] = useState<Id<"spaces">[]>([]);
   const [capabilities, setCapabilities] = useState<KeyCapability[]>(["read"]);
@@ -81,17 +230,14 @@ export default function SettingsPage() {
   const [sourceSpaceId, setSourceSpaceId] = useState<Id<"spaces"> | "">("");
   const [sourceError, setSourceError] = useState("");
   const [savingSource, setSavingSource] = useState(false);
-  const [updatingSourceAccountId, setUpdatingSourceAccountId] = useState<
-    Id<"sourceAccounts"> | null
-  >(null);
-  const [editingSourceAccountId, setEditingSourceAccountId] = useState<
-    Id<"sourceAccounts"> | null
-  >(null);
+  const [updatingSourceAccountId, setUpdatingSourceAccountId] =
+    useState<Id<"sourceAccounts"> | null>(null);
+  const [editingSourceAccountId, setEditingSourceAccountId] =
+    useState<Id<"sourceAccounts"> | null>(null);
   const [editedSourceName, setEditedSourceName] = useState("");
   const [editedFreshnessMinutes, setEditedFreshnessMinutes] = useState("");
-  const [revokingKeyId, setRevokingKeyId] = useState<Id<"apiKeys"> | null>(
-    null,
-  );
+  const [hasKeys, setHasKeys] = useState(false);
+  const [keyListRetry, setKeyListRetry] = useState(0);
 
   const writableSpaces = useMemo(
     () => spaces?.filter((space) => space.role !== "reader") ?? [],
@@ -99,7 +245,8 @@ export default function SettingsPage() {
   );
   const scopedSourceAccounts = useMemo(
     () =>
-      sourceAccounts?.filter((account) => spaceIds.includes(account.spaceId)) ?? [],
+      sourceAccounts?.filter((account) => spaceIds.includes(account.spaceId)) ??
+      [],
     [sourceAccounts, spaceIds],
   );
   const enabledScopedSourceAccounts = useMemo(
@@ -126,7 +273,9 @@ export default function SettingsPage() {
       },
       () => {
         if (active)
-          setSettingsSetupError("Could not load settings. Reload and try again.");
+          setSettingsSetupError(
+            "Could not load settings. Reload and try again.",
+          );
       },
     );
     return () => {
@@ -198,8 +347,7 @@ export default function SettingsPage() {
 
   const handleCreateSource = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (!sourceSpaceId || !sourceName.trim() || !sourceAccountId.trim())
-      return;
+    if (!sourceSpaceId || !sourceName.trim() || !sourceAccountId.trim()) return;
     const freshnessMinutes = Number(sourceFreshnessMinutes);
     if (
       !Number.isSafeInteger(freshnessMinutes) ||
@@ -236,7 +384,9 @@ export default function SettingsPage() {
       freshnessMinutes < 1 ||
       freshnessMinutes > 525_600
     ) {
-      setSourceError("Enter a source name and freshness between one minute and one year.");
+      setSourceError(
+        "Enter a source name and freshness between one minute and one year.",
+      );
       return;
     }
     setSourceError("");
@@ -245,11 +395,13 @@ export default function SettingsPage() {
       sourceAccountId,
       name: editedSourceName.trim(),
       freshnessMs: freshnessMinutes * 60_000,
-    }).then(
-      () => setEditingSourceAccountId(null),
-      (caught: unknown) =>
-        setSourceError(errorMessage(caught, "Could not update source.")),
-    ).finally(() => setUpdatingSourceAccountId(null));
+    })
+      .then(
+        () => setEditingSourceAccountId(null),
+        (caught: unknown) =>
+          setSourceError(errorMessage(caught, "Could not update source.")),
+      )
+      .finally(() => setUpdatingSourceAccountId(null));
   };
 
   const handleCopy = async () => {
@@ -260,7 +412,6 @@ export default function SettingsPage() {
     }
   };
 
-  const hasKeys = apiKeys && apiKeys.length > 0;
   const showKeyForm = hasKeys || showCreateForm;
 
   return (
@@ -277,8 +428,8 @@ export default function SettingsPage() {
         {configuredDefaultIsUnavailable && (
           <div role="alert" style={{ color: "#b45309" }}>
             <p>
-              Your configured destination is no longer writable. Reset it
-              before creating destination-less content.
+              Your configured destination is no longer writable. Reset it before
+              creating destination-less content.
             </p>
             <button
               type="button"
@@ -339,7 +490,9 @@ export default function SettingsPage() {
           >
             <option value="">Choose a writable space</option>
             {writableSpaces.map((space) => (
-              <option key={space.spaceId} value={space.spaceId}>{space.name}</option>
+              <option key={space.spaceId} value={space.spaceId}>
+                {space.name}
+              </option>
             ))}
           </select>
           <label htmlFor="source-name">Source name</label>
@@ -402,11 +555,15 @@ export default function SettingsPage() {
               <li key={account._id} style={{ marginBottom: 8 }}>
                 {editingSourceAccountId === account._id ? (
                   <div>
-                    <label htmlFor={`source-name-${account._id}`}>Source name</label>
+                    <label htmlFor={`source-name-${account._id}`}>
+                      Source name
+                    </label>
                     <input
                       id={`source-name-${account._id}`}
                       value={editedSourceName}
-                      onChange={(event) => setEditedSourceName(event.target.value)}
+                      onChange={(event) =>
+                        setEditedSourceName(event.target.value)
+                      }
                     />
                     <label htmlFor={`source-freshness-${account._id}`}>
                       Freshness (minutes)
@@ -418,7 +575,9 @@ export default function SettingsPage() {
                       max={525_600}
                       step={1}
                       value={editedFreshnessMinutes}
-                      onChange={(event) => setEditedFreshnessMinutes(event.target.value)}
+                      onChange={(event) =>
+                        setEditedFreshnessMinutes(event.target.value)
+                      }
                     />
                     <button
                       type="button"
@@ -440,10 +599,12 @@ export default function SettingsPage() {
                 ) : (
                   <>
                     <strong>{account.name}</strong> ({account.connector})
-                    {" · account ID: "}<code>{account.accountId}</code>
+                    {" · account ID: "}
+                    <code>{account.accountId}</code>
                     {" · refreshes at most every "}
                     {account.freshnessMs / 60_000} minute(s)
-                    {" · "}{account.enabled ? "enabled" : "disabled"}
+                    {" · "}
+                    {account.enabled ? "enabled" : "disabled"}
                     <button
                       type="button"
                       onClick={() => {
@@ -468,11 +629,15 @@ export default function SettingsPage() {
                     void updateSourceAccount({
                       sourceAccountId: account._id,
                       enabled: !account.enabled,
-                    }).then(
-                      () => undefined,
-                      (caught: unknown) =>
-                        setSourceError(errorMessage(caught, "Could not update source.")),
-                    ).finally(() => setUpdatingSourceAccountId(null));
+                    })
+                      .then(
+                        () => undefined,
+                        (caught: unknown) =>
+                          setSourceError(
+                            errorMessage(caught, "Could not update source."),
+                          ),
+                      )
+                      .finally(() => setUpdatingSourceAccountId(null));
                   }}
                   disabled={updatingSourceAccountId === account._id}
                   style={{ marginLeft: 8 }}
@@ -491,249 +656,182 @@ export default function SettingsPage() {
 
       <section aria-labelledby="keys-heading" style={{ marginTop: 32 }}>
         <h2 id="keys-heading">API Keys</h2>
-      <p style={{ color: "#666" }}>
-        Clients can connect through OAuth or an API key. Both methods let you
-        choose spaces and permissions; OAuth creates a revocable client
-        credential. See the{" "}
-        <Link href="/getting-started" style={{ color: "#111" }}>
-          Getting Started
-        </Link>{" "}
-        guide for setup instructions.
-      </p>
+        <p style={{ color: "#666" }}>
+          Clients can connect through OAuth or an API key. Both methods let you
+          choose spaces and permissions; OAuth creates a revocable client
+          credential. See the{" "}
+          <Link href="/getting-started" style={{ color: "#111" }}>
+            Getting Started
+          </Link>{" "}
+          guide for setup instructions.
+        </p>
 
-      {!showKeyForm && (
-        <button
-          onClick={() => setShowCreateForm(true)}
-          style={{
-            padding: "8px 16px",
-            cursor: "pointer",
-            borderRadius: 4,
-            border: "1px solid #ddd",
-            background: "white",
-            marginBottom: 24,
-          }}
-        >
-          Generate API Key
-        </button>
-      )}
+        {!showKeyForm && (
+          <button
+            onClick={() => setShowCreateForm(true)}
+            style={{
+              padding: "8px 16px",
+              cursor: "pointer",
+              borderRadius: 4,
+              border: "1px solid #ddd",
+              background: "white",
+              marginBottom: 24,
+            }}
+          >
+            Generate API Key
+          </button>
+        )}
 
-      {showKeyForm && (
-        <>
-          <form onSubmit={handleCreate} style={{ marginBottom: 24 }}>
-            <input
-              type="text"
-              value={newKeyName}
-              onChange={(e) => setNewKeyName(e.target.value)}
-              placeholder='Key name (e.g., "Cursor")'
-              style={{
-                flex: 1,
-                padding: 8,
-                borderRadius: 4,
-                border: "1px solid #ddd",
-              }}
-            />
-            <SpaceGrantPicker
-              spaceIds={spaceIds}
-              onSpaceIdsChange={setSpaceIds}
-              capabilities={capabilities}
-              onCapabilitiesChange={setCapabilities}
-              allowedCapabilities={settingsCapabilities}
-            />
-            {capabilities.includes("ingest") && (
-              <fieldset
+        {showKeyForm && (
+          <>
+            <form onSubmit={handleCreate} style={{ marginBottom: 24 }}>
+              <input
+                type="text"
+                value={newKeyName}
+                onChange={(e) => setNewKeyName(e.target.value)}
+                placeholder='Key name (e.g., "Cursor")'
                 style={{
+                  flex: 1,
+                  padding: 8,
+                  borderRadius: 4,
                   border: "1px solid #ddd",
-                  borderRadius: 6,
-                  padding: 12,
-                  margin: "12px 0",
                 }}
-              >
-                <legend>Ingest source accounts</legend>
-                <p style={{ marginTop: 0 }}>
-                  An ingest key can use only the selected enabled source accounts
-                  in its granted spaces.
-                </p>
-                {enabledScopedSourceAccounts.length === 0 ? (
-                  <p role="alert">
-                    Add and enable an MCP client source in a selected space
-                    before issuing this key.
+              />
+              <SpaceGrantPicker
+                spaceIds={spaceIds}
+                onSpaceIdsChange={setSpaceIds}
+                capabilities={capabilities}
+                onCapabilitiesChange={setCapabilities}
+                allowedCapabilities={settingsCapabilities}
+              />
+              {capabilities.includes("ingest") && (
+                <fieldset
+                  style={{
+                    border: "1px solid #ddd",
+                    borderRadius: 6,
+                    padding: 12,
+                    margin: "12px 0",
+                  }}
+                >
+                  <legend>Ingest source accounts</legend>
+                  <p style={{ marginTop: 0 }}>
+                    An ingest key can use only the selected enabled source
+                    accounts in its granted spaces.
                   </p>
-                ) : (
-                  enabledScopedSourceAccounts.map((account) => (
-                    <label
-                      key={account._id}
-                      style={{ display: "block", marginBottom: 8 }}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={sourceAccountIds.includes(account._id)}
-                        onChange={(event) => setSourceAccountIds((selected) =>
-                          event.target.checked
-                            ? [...selected, account._id]
-                            : selected.filter((id) => id !== account._id),
-                        )}
-                      /> {account.name} ({account.connector})
-                    </label>
-                  ))
-                )}
-              </fieldset>
-            )}
-            {error && <p role="alert">{error}</p>}
-            <button
-              type="submit"
-              disabled={
-                creating ||
-                !newKeyName.trim() ||
-                !spaceIds.length ||
-                !capabilities.length ||
-                (capabilities.includes("ingest") && !sourceAccountIds.length)
-              }
-              style={{
-                padding: "8px 16px",
-                cursor: "pointer",
-                borderRadius: 4,
-              }}
-            >
-              {creating ? "Creating..." : "Generate Key"}
-            </button>
-          </form>
-
-          {newRawKey && (
-            <div
-              style={{
-                padding: 16,
-                marginBottom: 24,
-                backgroundColor: "#fff3cd",
-                border: "1px solid #ffc107",
-                borderRadius: 8,
-              }}
-            >
-              <strong>Save this key now — it won&apos;t be shown again!</strong>
-              <div
-                style={{
-                  display: "flex",
-                  gap: 8,
-                  alignItems: "center",
-                  marginTop: 8,
-                }}
-              >
-                <code
-                  style={{
-                    flex: 1,
-                    padding: 8,
-                    backgroundColor: "#f5f5f5",
-                    borderRadius: 4,
-                    fontSize: 13,
-                    wordBreak: "break-all",
-                  }}
-                >
-                  {newRawKey}
-                </code>
-                <button
-                  onClick={handleCopy}
-                  style={{
-                    padding: "8px 16px",
-                    cursor: "pointer",
-                    borderRadius: 4,
-                  }}
-                >
-                  {copied ? "Copied!" : "Copy"}
-                </button>
-              </div>
+                  {enabledScopedSourceAccounts.length === 0 ? (
+                    <p role="alert">
+                      Add and enable an MCP client source in a selected space
+                      before issuing this key.
+                    </p>
+                  ) : (
+                    enabledScopedSourceAccounts.map((account) => (
+                      <label
+                        key={account._id}
+                        style={{ display: "block", marginBottom: 8 }}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={sourceAccountIds.includes(account._id)}
+                          onChange={(event) =>
+                            setSourceAccountIds((selected) =>
+                              event.target.checked
+                                ? [...selected, account._id]
+                                : selected.filter((id) => id !== account._id),
+                            )
+                          }
+                        />{" "}
+                        {account.name} ({account.connector})
+                      </label>
+                    ))
+                  )}
+                </fieldset>
+              )}
+              {error && <p role="alert">{error}</p>}
               <button
-                onClick={() => setNewRawKey(null)}
+                type="submit"
+                disabled={
+                  creating ||
+                  !newKeyName.trim() ||
+                  !spaceIds.length ||
+                  !capabilities.length ||
+                  (capabilities.includes("ingest") && !sourceAccountIds.length)
+                }
                 style={{
-                  marginTop: 8,
-                  padding: "4px 12px",
+                  padding: "8px 16px",
                   cursor: "pointer",
                   borderRadius: 4,
                 }}
               >
-                Dismiss
+                {creating ? "Creating..." : "Generate Key"}
               </button>
-            </div>
-          )}
+            </form>
 
-          <table
-            style={{
-              width: "100%",
-              borderCollapse: "collapse",
-              marginBottom: 32,
-            }}
-          >
-            <thead>
-              <tr style={{ borderBottom: "2px solid #eee", textAlign: "left" }}>
-                <th style={{ padding: 8 }}>Name</th>
-                <th style={{ padding: 8 }}>Key</th>
-                <th style={{ padding: 8 }}>Last Used</th>
-                <th style={{ padding: 8 }}>Created</th>
-                <th style={{ padding: 8 }}></th>
-              </tr>
-            </thead>
-            <tbody>
-              {apiKeys === undefined ? (
-                <tr>
-                  <td colSpan={5} style={{ padding: 8 }}>
-                    Loading...
-                  </td>
-                </tr>
-              ) : apiKeys.length === 0 ? (
-                <tr>
-                  <td colSpan={5} style={{ padding: 8, color: "#666" }}>
-                    No API keys yet.
-                  </td>
-                </tr>
-              ) : (
-                apiKeys.map((key) => (
-                  <tr key={key._id} style={{ borderBottom: "1px solid #eee" }}>
-                    <td style={{ padding: 8 }}>
-                      {key.name}
-                      <br />
-                      <small>
-                        {key.capabilities?.join(", ") ?? "Personal read, write"}{" "}
-                        · {key.spaceIds?.length ?? 1} space(s)
-                      </small>
-                    </td>
-                    <td style={{ padding: 8 }}>
-                      <code>{key.keyPrefix}...</code>
-                    </td>
-                    <td style={{ padding: 8, color: "#666" }}>
-                      {key.lastUsedAt
-                        ? new Date(key.lastUsedAt).toLocaleDateString()
-                        : "Never"}
-                    </td>
-                    <td style={{ padding: 8, color: "#666" }}>
-                      {new Date(key._creationTime).toLocaleDateString()}
-                    </td>
-                    <td style={{ padding: 8 }}>
-                      <button
-                        onClick={() => {
-                          setError("");
-                          setRevokingKeyId(key._id);
-                          void revokeKey({ id: key._id }).then(
-                            () => undefined,
-                            (caught: unknown) =>
-                              setError(errorMessage(caught, "Could not revoke key.")),
-                          ).finally(() => setRevokingKeyId(null));
-                        }}
-                        disabled={revokingKeyId === key._id}
-                        style={{
-                          color: "red",
-                          cursor: "pointer",
-                          background: "none",
-                          border: "none",
-                        }}
-                      >
-                        {revokingKeyId === key._id ? "Revoking..." : "Revoke"}
-                      </button>
-                    </td>
-                  </tr>
-                ))
-              )}
-            </tbody>
-          </table>
-        </>
-      )}
+            {newRawKey && (
+              <div
+                style={{
+                  padding: 16,
+                  marginBottom: 24,
+                  backgroundColor: "#fff3cd",
+                  border: "1px solid #ffc107",
+                  borderRadius: 8,
+                }}
+              >
+                <strong>
+                  Save this key now — it won&apos;t be shown again!
+                </strong>
+                <div
+                  style={{
+                    display: "flex",
+                    gap: 8,
+                    alignItems: "center",
+                    marginTop: 8,
+                  }}
+                >
+                  <code
+                    style={{
+                      flex: 1,
+                      padding: 8,
+                      backgroundColor: "#f5f5f5",
+                      borderRadius: 4,
+                      fontSize: 13,
+                      wordBreak: "break-all",
+                    }}
+                  >
+                    {newRawKey}
+                  </code>
+                  <button
+                    onClick={handleCopy}
+                    style={{
+                      padding: "8px 16px",
+                      cursor: "pointer",
+                      borderRadius: 4,
+                    }}
+                  >
+                    {copied ? "Copied!" : "Copy"}
+                  </button>
+                </div>
+                <button
+                  onClick={() => setNewRawKey(null)}
+                  style={{
+                    marginTop: 8,
+                    padding: "4px 12px",
+                    cursor: "pointer",
+                    borderRadius: 4,
+                  }}
+                >
+                  Dismiss
+                </button>
+              </div>
+            )}
+
+          </>
+        )}
+        <ApiKeyListErrorBoundary
+          key={keyListRetry}
+          onRetry={() => setKeyListRetry((attempt) => attempt + 1)}
+        >
+          <ApiKeyList onHasKeys={setHasKeys} />
+        </ApiKeyListErrorBoundary>
       </section>
     </div>
   );

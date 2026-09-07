@@ -378,3 +378,9 @@ semantic recall can use their existing vectors. Keyword reads remain available
 when the provider or profile is unavailable. See the
 [embedding contract](plans/2026-09-06-embedding-contract.md) for migration,
 operator rebuild commands, limitations, and credential handling.
+
+## OAuth lifecycle maintenance
+
+Unfinished OAuth grants expire automatically after five minutes. The cleanup job runs in bounded batches. Existing active credentials remain valid across this lifecycle upgrade. A client with an authorization already in progress during deployment may need to start again.
+
+Use the [OAuth lifecycle audit](plans/2026-09-07-oauth-lifecycle.md#deployment-and-audit) to check stored grants after deployment. Settings paginates active credentials and supports revocation from every page.
