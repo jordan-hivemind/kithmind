@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-07
 
-**Status:** P2-7 implementation in progress. The scoped discovery, text-processing, and source-assessment gateway is implemented; the filesystem daemon, parsing, and isolated restore remain outstanding.
+**Status:** P2-7 is complete. P2-8 adds the bounded filesystem text worker with restart state and foreground polling. Unattended service installation, operational monitoring, parsing, and isolated restore remain outstanding.
 
 ## Outcome
 

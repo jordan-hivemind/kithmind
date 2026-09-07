@@ -1,0 +1,20 @@
+{
+  "name": "@repo/pipeline",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check-types": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test test/*.test.mjs",
+    "test:once": "pnpm build && node --test test/*.test.mjs",
+    "pipeline": "node dist/cli.js"
+  },
+  "devDependencies": {
+    "@types/node": "25.3.3",
+    "typescript": "^5.7.0"
+  }
+}

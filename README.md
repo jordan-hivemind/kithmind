@@ -33,7 +33,14 @@ are still being implemented. The public architecture and staged plan are in
   [capture contract](docs/plans/2026-09-06-inline-ingestion-contract.md).
 - A source-scoped remote worker gateway for filesystem discovery, scan retries,
   identity recovery, tombstones, and verified text admission with resumable
-  reservations. Document processing through this gateway remains in progress. See the [worker protocol](docs/plans/2026-09-07-worker-protocol.md).
+  reservations, leased processing, and bounded processing assessments. Processing
+  status distinguishes ready documents from pending work and gaps; it does not
+  establish record or date coverage. See the [worker protocol](docs/plans/2026-09-07-worker-protocol.md).
+- A bounded filesystem text worker with local restart state, foreground polling,
+  cloud identity recovery, and retained-text publication. Start with the
+  [synthetic worker recipe](docs/filesystem-worker.md). Parser support, unattended
+  service installation, monitoring, and owner-document ingestion gates remain
+  separate work.
 - A Next.js web application, Convex backend, and a Claude Code plugin source.
 
 For local development, run `npx convex dev --once` from `packages/convex`,
@@ -58,8 +65,8 @@ requirements and optional server-side OpenAI and Anthropic API credentials.
 The following are architecture commitments, not current product features:
 
 - Extraction of typed records from real sources.
-- A Mac-hosted daemon, filesystem and service connectors, extraction
-  playbooks, and background ingestion.
+- An unattended Mac-hosted service, additional connectors, extraction
+  playbooks, and monitored background ingestion.
 - Desktop is the primary workflow. P2 mobile access is through hosted MCP for
   supported native clients; where a client lacks remote MCP support, a thin
   authenticated API adapter is an option to validate. An iOS Shortcut is an

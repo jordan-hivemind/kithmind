@@ -15,6 +15,7 @@
     "test:self-hosting": "node --test scripts/check-self-hosting.test.mjs",
     "generate:mcp-jwks": "node scripts/generate-mcp-jwks.mjs",
     "demo:brain": "node scripts/demo-brain.mjs",
+    "brain:worker": "pnpm --filter @repo/pipeline pipeline",
     "format": "prettier --write \"**/*.{ts,tsx,md}\""
   },
   "devDependencies": {

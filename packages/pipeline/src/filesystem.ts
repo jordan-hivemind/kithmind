@@ -1,0 +1,591 @@
+import { createHash } from "node:crypto";
+import { constants, type Stats } from "node:fs";
+import { lstat, open, opendir, realpath } from "node:fs/promises";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
+
+import type {
+  DiscoveryFile,
+  GapCode,
+  PipelineConfig,
+  RootConfig,
+} from "./types.js";
+
+const MAX_VISITED_ENTRIES = 4_096;
+const FILESYSTEM_DEADLINE_MS = 30_000;
+
+export class FilesystemFailure extends Error {
+  constructor(
+    readonly code: GapCode,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+export type SafeRoot = RootConfig & {
+  canonicalPath: string;
+  device: number;
+  inode: number;
+};
+
+function contains(root: string, candidate: string): boolean {
+  return candidate === root || candidate.startsWith(`${root}${sep}`);
+}
+
+function currentUid(): number {
+  const uid = process.getuid?.();
+  if (uid === undefined) {
+    throw new FilesystemFailure(
+      "unsupported",
+      "platform ownership checks are unavailable",
+    );
+  }
+  return uid;
+}
+
+function safeDirectory(
+  entry: Stats,
+  expectedUid: number,
+  message: string,
+): void {
+  if (
+    entry.isSymbolicLink() ||
+    !entry.isDirectory() ||
+    entry.uid !== expectedUid ||
+    (entry.mode & 0o022) !== 0
+  ) {
+    throw new FilesystemFailure("permission_denied", message);
+  }
+}
+
+function pathParts(relativePath: string): string[] {
+  if (isAbsolute(relativePath)) {
+    throw new FilesystemFailure("unstable", "relative path is absolute");
+  }
+  const parts = relativePath.split(sep);
+  if (
+    parts.length === 0 ||
+    parts.some(
+      (part) =>
+        !part ||
+        part === "." ||
+        part === ".." ||
+        part.includes("/") ||
+        part.includes("\\") ||
+        part.includes("\0"),
+    )
+  ) {
+    throw new FilesystemFailure("unstable", "relative path is invalid");
+  }
+  return parts;
+}
+
+function segment(value: string): string {
+  try {
+    return encodeURIComponent(value);
+  } catch {
+    throw new FilesystemFailure("unsupported", "path is not valid Unicode");
+  }
+}
+
+export function toFsUri(alias: string, relativePath: string): string {
+  const parts = pathParts(relativePath);
+  const uri = `fs://${alias}/${parts.map(segment).join("/")}`;
+  if (Buffer.byteLength(uri, "utf8") > 2_048) {
+    throw new FilesystemFailure("oversized", "URI is too long");
+  }
+  return uri;
+}
+
+async function beforeDeadline<T>(
+  operation: Promise<T>,
+  deadline: number,
+  code: GapCode,
+  message: string,
+): Promise<T> {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) throw new FilesystemFailure(code, message);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new FilesystemFailure(code, message)),
+          remaining,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+async function verifyAncestors(
+  root: SafeRoot,
+  relativePath: string,
+  deadline: number,
+): Promise<string> {
+  const uid = currentUid();
+  const parts = pathParts(relativePath);
+  const rootEntry = await beforeDeadline(
+    lstat(root.canonicalPath),
+    deadline,
+    "enumeration_interrupted",
+    "filesystem check timed out",
+  );
+  safeDirectory(rootEntry, uid, "configured root permissions changed");
+  if (rootEntry.dev !== root.device || rootEntry.ino !== root.inode) {
+    throw new FilesystemFailure("unstable", "configured root changed");
+  }
+  let current = root.canonicalPath;
+  for (const part of parts.slice(0, -1)) {
+    current = join(current, part);
+    const entry = await beforeDeadline(
+      lstat(current),
+      deadline,
+      "enumeration_interrupted",
+      "filesystem check timed out",
+    );
+    safeDirectory(entry, uid, "path has an unsafe directory ancestor");
+    const canonical = await beforeDeadline(
+      realpath(current),
+      deadline,
+      "enumeration_interrupted",
+      "filesystem check timed out",
+    );
+    if (!contains(root.canonicalPath, canonical)) {
+      throw new FilesystemFailure("unstable", "path escaped configured root");
+    }
+  }
+  const parent = parts.length === 1 ? root.canonicalPath : current;
+  const canonicalParent = await beforeDeadline(
+    realpath(parent),
+    deadline,
+    "enumeration_interrupted",
+    "filesystem check timed out",
+  );
+  if (!contains(root.canonicalPath, canonicalParent)) {
+    throw new FilesystemFailure("unstable", "path parent escaped root");
+  }
+  return canonicalParent;
+}
+
+export async function canonicalRoots(
+  config: PipelineConfig,
+): Promise<SafeRoot[]> {
+  const uid = currentUid();
+  const deadline = Date.now() + FILESYSTEM_DEADLINE_MS;
+  const roots = await Promise.all(
+    config.roots.map(async (root) => {
+      const entry = await beforeDeadline(
+        lstat(root.path),
+        deadline,
+        "enumeration_interrupted",
+        "root check timed out",
+      );
+      safeDirectory(entry, uid, "configured root is not a safe directory");
+      const canonicalPath = await beforeDeadline(
+        realpath(root.path),
+        deadline,
+        "enumeration_interrupted",
+        "root resolution timed out",
+      );
+      const canonicalEntry = await beforeDeadline(
+        lstat(canonicalPath),
+        deadline,
+        "enumeration_interrupted",
+        "root check timed out",
+      );
+      safeDirectory(
+        canonicalEntry,
+        uid,
+        "canonical root is not a safe directory",
+      );
+      if (
+        canonicalEntry.dev !== entry.dev ||
+        canonicalEntry.ino !== entry.ino
+      ) {
+        throw new FilesystemFailure(
+          "unstable",
+          "configured root changed during canonicalization",
+        );
+      }
+      return {
+        ...root,
+        canonicalPath,
+        device: canonicalEntry.dev,
+        inode: canonicalEntry.ino,
+      };
+    }),
+  );
+  for (let first = 0; first < roots.length; first += 1) {
+    for (let second = first + 1; second < roots.length; second += 1) {
+      const a = roots[first]!;
+      const b = roots[second]!;
+      if (
+        contains(a.canonicalPath, b.canonicalPath) ||
+        contains(b.canonicalPath, a.canonicalPath)
+      ) {
+        throw new FilesystemFailure("unstable", "roots overlap");
+      }
+    }
+  }
+
+  const journalEntry = await beforeDeadline(
+    lstat(config.journalDir),
+    deadline,
+    "enumeration_interrupted",
+    "journal check timed out",
+  );
+  if (journalEntry.isSymbolicLink() || !journalEntry.isDirectory()) {
+    throw new FilesystemFailure("unstable", "journal is not a safe directory");
+  }
+  const journal = await beforeDeadline(
+    realpath(config.journalDir),
+    deadline,
+    "enumeration_interrupted",
+    "journal resolution timed out",
+  );
+  if (
+    roots.some(
+      (root) =>
+        contains(root.canonicalPath, journal) ||
+        contains(journal, root.canonicalPath),
+    )
+  ) {
+    throw new FilesystemFailure("unstable", "journal overlaps a scanned root");
+  }
+  return roots;
+}
+
+/**
+ * Portable local-trust fallback. It detects ordinary symlink/replacement races
+ * but does not claim protection from hostile same-user ancestor replacement.
+ */
+export async function readUtf8File(
+  root: SafeRoot,
+  relativePath: string,
+  maxBytes: number,
+  deadline = Date.now() + FILESYSTEM_DEADLINE_MS,
+): Promise<DiscoveryFile> {
+  pathParts(relativePath);
+  const candidate = join(root.canonicalPath, relativePath);
+  if (!contains(root.canonicalPath, candidate)) {
+    throw new FilesystemFailure("unstable", "path escapes root");
+  }
+  const canonicalParent = await verifyAncestors(root, relativePath, deadline);
+  const resolvedBefore = await beforeDeadline(
+    realpath(candidate),
+    deadline,
+    "enumeration_interrupted",
+    "file resolution timed out",
+  );
+  if (
+    !contains(root.canonicalPath, resolvedBefore) ||
+    dirname(resolvedBefore) !== canonicalParent
+  ) {
+    throw new FilesystemFailure("unstable", "file escaped configured root");
+  }
+  const beforePath = await beforeDeadline(
+    lstat(candidate),
+    deadline,
+    "enumeration_interrupted",
+    "file check timed out",
+  );
+  if (beforePath.isSymbolicLink() || !beforePath.isFile()) {
+    throw new FilesystemFailure("unsupported", "entry is not a regular file");
+  }
+  if (beforePath.size < 1) {
+    throw new FilesystemFailure("empty", "file is empty");
+  }
+  if (beforePath.size > maxBytes) {
+    throw new FilesystemFailure("oversized", "file exceeds limit");
+  }
+  if (
+    typeof constants.O_NOFOLLOW !== "number" ||
+    constants.O_NOFOLLOW === 0 ||
+    typeof constants.O_NONBLOCK !== "number"
+  ) {
+    throw new FilesystemFailure(
+      "unsupported",
+      "platform cannot safely open files",
+    );
+  }
+  const opening = open(
+    candidate,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  );
+  let handle: Awaited<ReturnType<typeof open>>;
+  try {
+    handle = await beforeDeadline(
+      opening,
+      deadline,
+      "enumeration_interrupted",
+      "file open timed out",
+    );
+  } catch (error) {
+    void opening
+      .then((lateHandle) => lateHandle.close())
+      .catch(() => undefined);
+    throw error;
+  }
+
+  let abandoned = false;
+  try {
+    const before = await beforeDeadline(
+      handle.stat(),
+      deadline,
+      "enumeration_interrupted",
+      "file stat timed out",
+    );
+    if (
+      !before.isFile() ||
+      before.size < 1 ||
+      before.size > maxBytes ||
+      before.dev !== beforePath.dev ||
+      before.ino !== beforePath.ino
+    ) {
+      throw new FilesystemFailure(
+        "unstable",
+        "opened entry changed before read",
+      );
+    }
+    const bytes = Buffer.alloc(before.size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      let read;
+      try {
+        read = await beforeDeadline(
+          handle.read(bytes, offset, bytes.length - offset, offset),
+          deadline,
+          "enumeration_interrupted",
+          "file read timed out",
+        );
+      } catch (error) {
+        abandoned = true;
+        void handle.close().catch(() => undefined);
+        throw error;
+      }
+      if (read.bytesRead === 0) break;
+      offset += read.bytesRead;
+    }
+    if (offset !== bytes.length) {
+      throw new FilesystemFailure("unstable", "file changed while reading");
+    }
+    const after = await beforeDeadline(
+      handle.stat(),
+      deadline,
+      "enumeration_interrupted",
+      "file stat timed out",
+    );
+    const repeatedParent = await verifyAncestors(root, relativePath, deadline);
+    const afterPath = await beforeDeadline(
+      lstat(candidate),
+      deadline,
+      "enumeration_interrupted",
+      "file check timed out",
+    );
+    const resolvedAfter = await beforeDeadline(
+      realpath(candidate),
+      deadline,
+      "enumeration_interrupted",
+      "file resolution timed out",
+    );
+    if (
+      repeatedParent !== canonicalParent ||
+      resolvedAfter !== resolvedBefore ||
+      !contains(root.canonicalPath, resolvedAfter) ||
+      dirname(resolvedAfter) !== repeatedParent ||
+      after.dev !== before.dev ||
+      after.ino !== before.ino ||
+      after.size !== before.size ||
+      after.mtimeMs !== before.mtimeMs ||
+      after.ctimeMs !== before.ctimeMs ||
+      afterPath.dev !== beforePath.dev ||
+      afterPath.ino !== beforePath.ino ||
+      afterPath.size !== beforePath.size ||
+      afterPath.mtimeMs !== beforePath.mtimeMs ||
+      afterPath.ctimeMs !== beforePath.ctimeMs
+    ) {
+      throw new FilesystemFailure("unstable", "file changed during read");
+    }
+    let text: string;
+    try {
+      text = new TextDecoder("utf-8", {
+        fatal: true,
+        ignoreBOM: true,
+      }).decode(bytes);
+    } catch {
+      throw new FilesystemFailure("unsupported", "file is not UTF-8");
+    }
+    const sourceModifiedAt = Math.trunc(before.mtimeMs);
+    if (!Number.isSafeInteger(sourceModifiedAt) || sourceModifiedAt < 0) {
+      throw new FilesystemFailure(
+        "unstable",
+        "file modification time is invalid",
+      );
+    }
+    return {
+      rootAlias: root.alias,
+      relativePath,
+      uri: toFsUri(root.alias, relativePath),
+      sourceModifiedAt,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+      byteLength: bytes.length,
+      text,
+    };
+  } finally {
+    if (!abandoned) await handle.close();
+  }
+}
+
+export async function discoverFiles(
+  config: PipelineConfig,
+  roots: SafeRoot[],
+): Promise<DiscoveryFile[]> {
+  const found: DiscoveryFile[] = [];
+  const uris = new Set<string>();
+  let encountered = 0;
+  const deadline = Date.now() + FILESYSTEM_DEADLINE_MS;
+
+  async function walk(
+    root: SafeRoot,
+    directory: string,
+    depth: number,
+  ): Promise<void> {
+    if (depth > config.maxDepth) {
+      throw new FilesystemFailure(
+        "oversized",
+        "directory depth limit exceeded",
+      );
+    }
+    const beforeDirectory = await beforeDeadline(
+      lstat(directory),
+      deadline,
+      "enumeration_interrupted",
+      "filesystem enumeration timed out",
+    ).catch((error: unknown) => {
+      if (error instanceof FilesystemFailure) throw error;
+      throw new FilesystemFailure(
+        "permission_denied",
+        "directory is unreadable",
+      );
+    });
+    safeDirectory(
+      beforeDirectory,
+      currentUid(),
+      "directory is not safely owned",
+    );
+    const canonicalDirectory = await beforeDeadline(
+      realpath(directory),
+      deadline,
+      "enumeration_interrupted",
+      "filesystem enumeration timed out",
+    );
+    if (!contains(root.canonicalPath, canonicalDirectory)) {
+      throw new FilesystemFailure("unstable", "directory escaped root");
+    }
+
+    const directoryHandle = await beforeDeadline(
+      opendir(directory),
+      deadline,
+      "enumeration_interrupted",
+      "filesystem enumeration timed out",
+    ).catch((error: unknown) => {
+      if (error instanceof FilesystemFailure) throw error;
+      throw new FilesystemFailure(
+        "permission_denied",
+        "directory is unreadable",
+      );
+    });
+    const entries = [];
+    try {
+      while (true) {
+        const entry = await beforeDeadline(
+          directoryHandle.read(),
+          deadline,
+          "enumeration_interrupted",
+          "filesystem enumeration timed out",
+        );
+        if (!entry) break;
+        encountered += 1;
+        if (encountered > MAX_VISITED_ENTRIES) {
+          throw new FilesystemFailure(
+            "oversized",
+            "filesystem node limit exceeded",
+          );
+        }
+        entries.push(entry);
+      }
+    } finally {
+      await directoryHandle.close().catch(() => undefined);
+    }
+    entries.sort((a, b) =>
+      Buffer.compare(Buffer.from(a.name), Buffer.from(b.name)),
+    );
+
+    for (const entry of entries) {
+      const fullPath = join(directory, entry.name);
+      const rel = relative(root.canonicalPath, fullPath);
+      if (entry.isSymbolicLink()) {
+        throw new FilesystemFailure("unstable", "symlink found in root");
+      }
+      if (entry.isDirectory()) {
+        await walk(root, fullPath, depth + 1);
+        continue;
+      }
+      if (!entry.isFile()) {
+        throw new FilesystemFailure(
+          "unsupported",
+          "root contains a non-regular entry",
+        );
+      }
+      if (found.length >= config.maxFiles) {
+        throw new FilesystemFailure("oversized", "file count limit exceeded");
+      }
+      const file = await readUtf8File(root, rel, config.maxFileBytes, deadline);
+      if (uris.has(file.uri)) {
+        throw new FilesystemFailure("unstable", "filesystem URI collision");
+      }
+      uris.add(file.uri);
+      found.push(file);
+    }
+
+    const afterDirectory = await beforeDeadline(
+      lstat(directory),
+      deadline,
+      "enumeration_interrupted",
+      "filesystem enumeration timed out",
+    ).catch((error: unknown) => {
+      if (error instanceof FilesystemFailure) throw error;
+      throw new FilesystemFailure(
+        "unstable",
+        "directory disappeared during enumeration",
+      );
+    });
+    const resolvedAfter = await beforeDeadline(
+      realpath(directory),
+      deadline,
+      "enumeration_interrupted",
+      "filesystem enumeration timed out",
+    );
+    if (
+      resolvedAfter !== canonicalDirectory ||
+      afterDirectory.isSymbolicLink() ||
+      !afterDirectory.isDirectory() ||
+      afterDirectory.dev !== beforeDirectory.dev ||
+      afterDirectory.ino !== beforeDirectory.ino ||
+      afterDirectory.mtimeMs !== beforeDirectory.mtimeMs ||
+      afterDirectory.ctimeMs !== beforeDirectory.ctimeMs
+    ) {
+      throw new FilesystemFailure(
+        "unstable",
+        "directory changed during enumeration",
+      );
+    }
+  }
+
+  for (const root of roots) await walk(root, root.canonicalPath, 0);
+  return found;
+}
