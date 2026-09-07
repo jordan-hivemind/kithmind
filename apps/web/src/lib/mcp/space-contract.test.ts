@@ -35,6 +35,18 @@ async function call(name: string, args: Record<string, unknown>) {
   }
 }
 
+const spaceReadErrorData = {
+  type: "space_read_error",
+  code: "space_not_found",
+  message: "Space not found",
+} as const;
+
+function convexFailure(data: unknown) {
+  return Object.assign(new Error("[Request ID: synthetic] Server Error"), {
+    data,
+  });
+}
+
 describe("MCP space routing", () => {
   beforeEach(() => {
     vi.stubEnv("NEXT_PUBLIC_CONVEX_URL", "https://example.convex.cloud");
@@ -205,5 +217,47 @@ describe("MCP space routing", () => {
     const result = await call("list_spaces", {});
     expect(mocks.query.mock.calls[0]?.[1]).toEqual({});
     expect(JSON.stringify(result.content)).toContain("Family");
+  });
+
+  test.each([
+    ["list_spaces", "query", {}],
+    ["search_documents", "action", { query: "clinic" }],
+  ] as const)(
+    "%s returns the safe typed read denial",
+    async (toolName, method, args) => {
+      mocks[method].mockRejectedValueOnce(convexFailure(spaceReadErrorData));
+
+      const result = await call(toolName, args);
+
+      expect(result).toMatchObject({
+        isError: true,
+        content: [{ type: "text", text: "Space not found" }],
+      });
+      expect(result.content).toHaveLength(1);
+      const serialized = JSON.stringify(result);
+      expect(serialized).not.toContain("Request ID");
+      expect(serialized).not.toContain("Server Error");
+      expect(serialized).not.toContain("space_read_error");
+      expect(serialized).not.toContain("selected-space");
+      expect(serialized).not.toContain("ingest");
+    },
+  );
+
+  test("does not convert malformed structured errors", async () => {
+    mocks.query.mockRejectedValueOnce(
+      convexFailure({ ...spaceReadErrorData, spaceId: "sensitive-space-id" }),
+    );
+
+    const result = await call("list_spaces", {});
+
+    expect(result.isError).toBe(true);
+    expect(result.content).toEqual([
+      {
+        type: "text",
+        text: "[Request ID: synthetic] Server Error",
+      },
+    ]);
+    expect(JSON.stringify(result.content)).not.toContain("sensitive-space-id");
+    expect(JSON.stringify(result.content)).not.toContain("Space not found");
   });
 });

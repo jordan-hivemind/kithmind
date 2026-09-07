@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
 import { api, internal } from "../../_generated/api";
 import type { Id } from "../../_generated/dataModel";
+import { parseSpaceReadErrorData } from "../../lib/spaceReadErrors";
 import { requireSpaceAccess, webPrincipal } from "../../lib/spaces";
 import schema from "../../legacySchema";
 import { modules } from "../../test.setup";
@@ -74,6 +75,7 @@ async function insertKey(
   userId: Id<"users">,
   capabilities: Array<"read" | "write" | "ingest">,
   spaceIds: Id<"spaces">[],
+  sourceAccountIds?: Id<"sourceAccounts">[],
 ) {
   return await t.run((ctx) =>
     ctx.db.insert("apiKeys", {
@@ -83,8 +85,22 @@ async function insertKey(
       name: "Synthetic key",
       capabilities,
       spaceIds,
+      sourceAccountIds,
     }),
   );
+}
+
+async function rejectionData(promise: Promise<unknown>): Promise<unknown> {
+  let rejected: unknown;
+  try {
+    await promise;
+  } catch (error) {
+    rejected = error;
+  }
+  expect(rejected).toBeDefined();
+  return typeof rejected === "object" && rejected !== null && "data" in rejected
+    ? rejected.data
+    : undefined;
 }
 
 describe("space authorization", () => {
@@ -157,6 +173,63 @@ describe("space authorization", () => {
     await expect(mcp.query(api.models.spaces.mcpQueries.list)).rejects.toThrow(
       "Not authenticated",
     );
+  });
+
+  test("returns one typed non-enumerating read denial", async () => {
+    const { t, userId, personalSpaceId, inaccessibleSpaceId } =
+      await seedSpaces();
+    const sourceAccountId = await t.run((ctx) =>
+      ctx.db.insert("sourceAccounts", {
+        spaceId: personalSpaceId,
+        connector: "synthetic",
+        accountId: "synthetic-account",
+        name: "Synthetic source",
+        enabled: true,
+        cursorVersion: 1,
+        freshnessMs: 60_000,
+        createdBy: userId,
+      }),
+    );
+    const keyId = await insertKey(
+      t,
+      userId,
+      ["ingest"],
+      [personalSpaceId],
+      [sourceAccountId],
+    );
+    const mcp = t.withIdentity({
+      issuer: mcpIssuer,
+      subject: userId,
+      apiKeyId: keyId,
+    });
+    const expected = {
+      type: "space_read_error",
+      code: "space_not_found",
+      message: "Space not found",
+    } as const;
+
+    expect(
+      parseSpaceReadErrorData(
+        await rejectionData(mcp.query(api.models.spaces.mcpQueries.list)),
+      ),
+    ).toEqual(expected);
+
+    await t.run((ctx) =>
+      ctx.db.patch(keyId, {
+        capabilities: ["read"],
+        spaceIds: [personalSpaceId],
+      }),
+    );
+    expect(
+      parseSpaceReadErrorData(
+        await rejectionData(
+          t.query(internal.models.spaces.private.listAuthorizedReadSpaceIds, {
+            principal: { userId, credentialId: keyId },
+            spaceIds: [inaccessibleSpaceId],
+          }),
+        ),
+      ),
+    ).toEqual(expected);
   });
 
   test("enforces capability, current role, and exact scope on writes", async () => {

@@ -15,6 +15,7 @@ import type * as legacySchema from "../legacySchema.js";
 import type * as lib_embeddingProvider from "../lib/embeddingProvider.js";
 import type * as lib_mcpAuth from "../lib/mcpAuth.js";
 import type * as lib_sourceAuth from "../lib/sourceAuth.js";
+import type * as lib_spaceReadErrors from "../lib/spaceReadErrors.js";
 import type * as lib_spaces from "../lib/spaces.js";
 import type * as lib_webAuth from "../lib/webAuth.js";
 import type * as models_apiKeys_mcpAuth from "../models/apiKeys/mcpAuth.js";
@@ -150,6 +151,7 @@ declare const fullApi: ApiFromModules<{
   "lib/embeddingProvider": typeof lib_embeddingProvider;
   "lib/mcpAuth": typeof lib_mcpAuth;
   "lib/sourceAuth": typeof lib_sourceAuth;
+  "lib/spaceReadErrors": typeof lib_spaceReadErrors;
   "lib/spaces": typeof lib_spaces;
   "lib/webAuth": typeof lib_webAuth;
   "models/apiKeys/mcpAuth": typeof models_apiKeys_mcpAuth;
