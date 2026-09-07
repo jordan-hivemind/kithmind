@@ -14,6 +14,7 @@ import {
   claimJob,
   continueForgetFromWeb,
   createGenerationTextVersion,
+  markSourceUnavailable,
   replaceRevokedActorAndRequeueFromWeb,
   stageGeneration,
   stageGenerationChunks,
@@ -103,6 +104,7 @@ function admission(
     externalId?: string;
     text?: string;
     capturedAt?: number;
+    title?: string;
   } = {},
 ) {
   return {
@@ -113,7 +115,7 @@ function admission(
       overrides.expectedDesiredProcessingEpoch ?? 0,
     source: {
       externalId: overrides.externalId ?? "source-1",
-      title: "Synthetic source",
+      title: overrides.title ?? "Synthetic source",
       docType: "note",
       uri: "synthetic://source-1",
       capturedAt: overrides.capturedAt ?? 1_000,
@@ -213,6 +215,12 @@ describe("durable ingestion engine", () => {
     const first = await t.run((ctx) =>
       admitSourceRevision(ctx, admission(principal, sourceAccountId)),
     );
+    expect(
+      await t.run(
+        async (ctx) =>
+          (await ctx.db.get(sourceAccountId))?.workerAssessmentEpoch,
+      ),
+    ).toBe(1);
     const retry = await t.run((ctx) =>
       admitSourceRevision(ctx, admission(principal, sourceAccountId)),
     );
@@ -221,6 +229,12 @@ describe("durable ingestion engine", () => {
       ingestJobId: first.ingestJobId,
       reused: true,
     });
+    expect(
+      await t.run(
+        async (ctx) =>
+          (await ctx.db.get(sourceAccountId))?.workerAssessmentEpoch,
+      ),
+    ).toBe(1);
     await expect(
       t.run((ctx) =>
         admitSourceRevision(
@@ -243,6 +257,29 @@ describe("durable ingestion engine", () => {
       ),
     );
     expect(reobservation.sourceRevisionId).toBe(first.sourceRevisionId);
+    expect(
+      await t.run(
+        async (ctx) =>
+          (await ctx.db.get(sourceAccountId))?.workerAssessmentEpoch,
+      ),
+    ).toBe(1);
+    await t.run((ctx) =>
+      admitSourceRevision(
+        ctx,
+        admission(principal, sourceAccountId, {
+          requestId: "request-metadata-refresh",
+          expectedDesiredProcessingEpoch: 1,
+          capturedAt: 3_000,
+          title: "Renamed source",
+        }),
+      ),
+    );
+    expect(
+      await t.run(
+        async (ctx) =>
+          (await ctx.db.get(sourceAccountId))?.workerAssessmentEpoch,
+      ),
+    ).toBe(2);
     await expect(
       t.run((ctx) => {
         const changedManifest = admission(principal, sourceAccountId, {
@@ -269,8 +306,52 @@ describe("durable ingestion engine", () => {
       revisions: 1,
       generations: 1,
       jobs: 1,
-      receipts: 2,
+      receipts: 3,
     });
+  });
+
+  test("generic unavailability and forget transitions advance the assessment fence once", async () => {
+    const { t, userId, sourceAccountId } = await seed();
+    const admitted = await t.run((ctx) =>
+      admitSourceRevision(ctx, admission({ userId }, sourceAccountId)),
+    );
+    expect(
+      await t.run(
+        async (ctx) =>
+          (await ctx.db.get(sourceAccountId))?.workerAssessmentEpoch,
+      ),
+    ).toBe(1);
+    await t.run((ctx) =>
+      markSourceUnavailable(ctx, {
+        principal: { userId },
+        sourceItemId: admitted.sourceItemId,
+      }),
+    );
+    await t.run((ctx) =>
+      markSourceUnavailable(ctx, {
+        principal: { userId },
+        sourceItemId: admitted.sourceItemId,
+      }),
+    );
+    expect(
+      await t.run(
+        async (ctx) =>
+          (await ctx.db.get(sourceAccountId))?.workerAssessmentEpoch,
+      ),
+    ).toBe(2);
+    await t.run((ctx) =>
+      beginForgetFromWeb(ctx, {
+        principal: { userId },
+        sourceItemId: admitted.sourceItemId,
+        now: 4_000,
+      }),
+    );
+    expect(
+      await t.run(
+        async (ctx) =>
+          (await ctx.db.get(sourceAccountId))?.workerAssessmentEpoch,
+      ),
+    ).toBe(3);
   });
 
   test("typed manifest counts preserve zero-count retries and reject changed identities", async () => {

@@ -5,6 +5,7 @@ import {
   sourceAliasDigestFields,
   workerProtocolRateLimitFields,
   workerOperationReceiptFields,
+  workerProcessingAssessmentFields,
   workerReservationReceiptFields,
   workerReservationTargetFields,
   workerDiscoveryWorkFields,
@@ -59,6 +60,7 @@ export const workerTables = {
       "sourceItemId",
     ])
     .index("by_sourceItemId", ["sourceItemId"])
+    .index("by_scanId_and_sourceItemId", ["scanId", "sourceItemId"])
     .index("by_discoveryWorkId", ["discoveryWorkId"])
     .index("by_state_and_retireAt", ["state", "retireAt"])
     .index("by_retireAt", ["retireAt"]),
@@ -114,4 +116,15 @@ export const workerTables = {
     .index("by_discoveryWorkId", ["discoveryWorkId"])
     .index("by_sourceItemId", ["sourceItemId"])
     .index("by_retireAt", ["retireAt"]),
+  workerProcessingAssessments: defineTable(workerProcessingAssessmentFields)
+    .index("by_sourceAccountId", ["sourceAccountId"])
+    .index("by_sourceAccountId_and_requestId", ["sourceAccountId", "requestId"])
+    .index("by_sourceAccountId_and_state", ["sourceAccountId", "state"])
+    .index("by_scanId_and_state_and_expiresAt", [
+      "scanId",
+      "state",
+      "expiresAt",
+    ])
+    .index("by_state_and_expiresAt", ["state", "expiresAt"])
+    .index("by_state_and_retireAt", ["state", "retireAt"]),
 };

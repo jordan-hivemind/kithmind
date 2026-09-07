@@ -107,6 +107,24 @@ export type AdmissionResult = {
   reused: boolean;
 };
 
+export async function advanceSourceAssessmentEpoch(
+  ctx: MutationCtx,
+  sourceAccountId: Id<"sourceAccounts">,
+): Promise<number> {
+  const account = await ctx.db.get(sourceAccountId);
+  if (!account) throw new Error("Source account not found");
+  const current = account.workerAssessmentEpoch ?? 0;
+  if (!Number.isSafeInteger(current) || current < 0) {
+    throw new Error("Invalid source assessment epoch");
+  }
+  const next = current + 1;
+  if (!Number.isSafeInteger(next)) {
+    throw new Error("Source assessment epoch exhausted");
+  }
+  await ctx.db.patch(account._id, { workerAssessmentEpoch: next });
+  return next;
+}
+
 function assertAdmissionBounds(input: AdmissionInput): void {
   requireBoundedString("requestId", input.requestId, MAX_REQUEST_ID_LENGTH);
   requireBoundedString(
@@ -226,6 +244,12 @@ export async function admitSourceRevision(
   if (item.lifecycle === "forgetting" || item.lifecycle === "forgotten") {
     throw new Error("Source item is not available for admission");
   }
+  const metadataChangesAssessment =
+    item.lifecycle !== "available" ||
+    item.title !== input.source.title ||
+    item.docType !== input.source.docType ||
+    item.uri !== input.source.uri ||
+    item.originalLinkAvailable !== (input.source.uri !== undefined);
 
   const priorReceipts = await ctx.db
     .query("ingestRequests")
@@ -343,6 +367,9 @@ export async function admitSourceRevision(
     if (jobs.length !== 1)
       throw new Error("Processing generation job is invalid");
     const job = jobs[0]!;
+    if (metadataChangesAssessment) {
+      await advanceSourceAssessmentEpoch(ctx, account._id);
+    }
     const receiptId = await ctx.db.insert("ingestRequests", {
       spaceId: account.spaceId,
       sourceAccountId: account._id,
@@ -369,6 +396,7 @@ export async function admitSourceRevision(
     desiredRevisionId: revision._id,
     expectedDesiredProcessingEpoch: input.expectedDesiredProcessingEpoch,
   });
+  await advanceSourceAssessmentEpoch(ctx, account._id);
   const processingGenerationId = await ctx.db.insert("processingGenerations", {
     spaceId: account.spaceId,
     sourceAccountId: account._id,
@@ -1466,10 +1494,14 @@ export async function markSourceUnavailable(
   );
   if (account.spaceId !== item.spaceId)
     throw new Error("Source item not found");
+  const changesAssessment = item.lifecycle !== "unavailable";
   await markSourceItemUnavailable(ctx, {
     spaceId: item.spaceId,
     sourceItemId: item._id,
   });
+  if (changesAssessment) {
+    await advanceSourceAssessmentEpoch(ctx, account._id);
+  }
   return { lifecycle: "unavailable" as const };
 }
 
@@ -1527,6 +1559,7 @@ export async function beginForgetFromWeb(
       ? { manifestVersion: (account.manifestVersion ?? 0) + 1 }
       : {}),
   });
+  await advanceSourceAssessmentEpoch(ctx, account._id);
   await bumpEmbeddingEligibilityEpoch(ctx, item.spaceId);
   return { lifecycle: "forgetting" as const, desiredProcessingEpoch };
 }

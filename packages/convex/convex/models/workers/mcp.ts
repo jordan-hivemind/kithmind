@@ -6,6 +6,24 @@ import { v } from "convex/values";
 
 import { rethrowWorkerProtocolError } from "./errors";
 import { parseWorkerRequest, type WorkerResult } from "./protocol";
+import { workerAssessmentCountsValidator } from "./validators";
+
+const processingAssessmentState = v.union(
+  v.literal("running"),
+  v.literal("complete"),
+  v.literal("incomplete"),
+  v.literal("stale"),
+);
+const processingAssessmentPhase = v.union(
+  v.literal("items"),
+  v.literal("unresolved_entries"),
+  v.literal("done"),
+);
+const processingAssessmentStaleReason = v.union(
+  v.literal("source_changed"),
+  v.literal("detail_unavailable"),
+  v.literal("expired"),
+);
 
 const scanState = v.union(
   v.literal("open"),
@@ -53,7 +71,23 @@ const workerResultValidator = v.union(
         ),
       }),
     ),
-    processing: v.object({ state: v.literal("not_assessed") }),
+    processing: v.union(
+      v.object({ state: v.literal("not_assessed") }),
+      v.object({
+        state: v.literal("assessing"),
+        assessmentId: v.string(),
+        startedAt: v.number(),
+      }),
+      v.object({
+        state: v.union(v.literal("complete"), v.literal("incomplete")),
+        assessmentId: v.string(),
+        scanId: v.string(),
+        inventoryEpoch: v.number(),
+        manifestVersion: v.number(),
+        completedAt: v.number(),
+        counts: workerAssessmentCountsValidator,
+      }),
+    ),
     recordCoverage: v.literal("not_established"),
   }),
   v.object({
@@ -223,6 +257,32 @@ const workerResultValidator = v.union(
     ),
     reused: v.boolean(),
   }),
+  v.object({
+    operation: v.literal("processing.assessBegin"),
+    assessmentId: v.string(),
+    scanId: v.string(),
+    inventoryEpoch: v.number(),
+    manifestVersion: v.number(),
+    state: processingAssessmentState,
+    nextOrdinal: v.number(),
+    counts: v.optional(workerAssessmentCountsValidator),
+    completedAt: v.optional(v.number()),
+    reused: v.boolean(),
+    staleReason: v.optional(processingAssessmentStaleReason),
+  }),
+  v.object({
+    operation: v.literal("processing.assessPage"),
+    assessmentId: v.string(),
+    state: processingAssessmentState,
+    phase: processingAssessmentPhase,
+    ordinal: v.number(),
+    inspected: v.number(),
+    nextOrdinal: v.number(),
+    counts: v.optional(workerAssessmentCountsValidator),
+    completedAt: v.optional(v.number()),
+    reused: v.boolean(),
+    staleReason: v.optional(processingAssessmentStaleReason),
+  }),
 );
 
 function randomLeaseTokens(count: number): string[] {
@@ -364,6 +424,16 @@ export const dispatch = action({
         case "jobs.fail":
           return await ctx.runMutation(
             internal.models.workers.private.jobsFail,
+            { principal, request },
+          );
+        case "processing.assessBegin":
+          return await ctx.runMutation(
+            internal.models.workers.private.processingAssessBegin,
+            { principal, request },
+          );
+        case "processing.assessPage":
+          return await ctx.runMutation(
+            internal.models.workers.private.processingAssessPage,
             { principal, request },
           );
       }

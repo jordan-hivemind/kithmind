@@ -25,7 +25,7 @@ import {
   WORKER_OPERATION_RECEIPT_MS,
 } from "./discovery";
 import { workerProtocolError, workerProtocolErrorCode } from "./errors";
-import { consumeWorkerMutationRateLimit } from "./model";
+import { consumeWorkerMutationRateLimit } from "./rateLimit";
 import type {
   WorkerJobActivateResult,
   WorkerJobFailResult,

@@ -21,14 +21,19 @@ import {
   type WorkerSourceStatusResult,
 } from "./protocol";
 import { requireWorkerSourceAccount, type WorkerPrincipal } from "./auth";
+import { getProcessingAssessmentStatus } from "./assessment";
+import {
+  consumeWorkerMutationRateLimit,
+  WORKER_MUTATION_RATE_LIMIT,
+  WORKER_MUTATION_RATE_WINDOW_MS,
+} from "./rateLimit";
 
 export const WORKER_SCAN_IDLE_MS = 30 * 60 * 1_000;
 export const WORKER_DETAIL_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
 export const WORKER_SCAN_RETENTION_MS = 90 * 24 * 60 * 60 * 1_000;
 export const MAX_SOURCE_URI_ALIASES = 8;
 export const WORKER_CLEANUP_BATCH_SIZE = 25;
-export const WORKER_MUTATION_RATE_LIMIT = 60;
-export const WORKER_MUTATION_RATE_WINDOW_MS = 60_000;
+export { WORKER_MUTATION_RATE_LIMIT, WORKER_MUTATION_RATE_WINDOW_MS };
 
 type SourceRequest = Pick<WorkerRequest, "spaceId" | "sourceAccountId">;
 type WorkerDbCtx = Pick<QueryCtx, "db"> | Pick<MutationCtx, "db">;
@@ -85,45 +90,6 @@ async function invalidateCoverage(
       (account.coverageInvalidatedAt ?? 0) + 1,
     ),
   });
-}
-
-export async function consumeWorkerMutationRateLimit(
-  ctx: MutationCtx,
-  source: LoadedWorkerSource,
-  now: number,
-): Promise<void> {
-  const matches = await ctx.db
-    .query("workerProtocolRateLimits")
-    .withIndex("by_credentialId_and_sourceAccountId", (q) =>
-      q
-        .eq("credentialId", source.principal.credentialId)
-        .eq("sourceAccountId", source.account._id),
-    )
-    .take(2);
-  if (matches.length > 1) throw workerProtocolError("scan_conflict");
-  const row = matches[0];
-  if (!row || now - row.windowStartedAt >= WORKER_MUTATION_RATE_WINDOW_MS) {
-    if (row) {
-      await ctx.db.patch(row._id, { windowStartedAt: now, count: 1 });
-    } else {
-      await ctx.db.insert("workerProtocolRateLimits", {
-        credentialId: source.principal.credentialId,
-        sourceAccountId: source.account._id,
-        windowStartedAt: now,
-        count: 1,
-      });
-    }
-    return;
-  }
-  if (
-    now < row.windowStartedAt ||
-    !Number.isSafeInteger(row.count) ||
-    row.count < 0 ||
-    row.count >= WORKER_MUTATION_RATE_LIMIT
-  ) {
-    throw workerProtocolError("rate_limited");
-  }
-  await ctx.db.patch(row._id, { count: row.count + 1 });
 }
 
 async function loadScan(
@@ -294,7 +260,7 @@ export async function getWorkerSourceStatus(
     completedInventoryEpoch: source.account.completedInventoryEpoch ?? 0,
     manifestVersion: source.account.manifestVersion ?? 0,
     enumeration,
-    processing: { state: "not_assessed" },
+    processing: await getProcessingAssessmentStatus(ctx, source, now),
     recordCoverage: "not_established",
   };
 }
