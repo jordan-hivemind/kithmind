@@ -19,6 +19,7 @@ export const findByHash = internalQuery({
         ),
       ),
       spaceIds: v.optional(v.array(v.id("spaces"))),
+      sourceAccountIds: v.optional(v.array(v.id("sourceAccounts"))),
     }),
     v.null(),
   ),

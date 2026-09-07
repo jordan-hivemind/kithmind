@@ -355,7 +355,7 @@ describe("space authorization", () => {
     ).resolves.toBe(personalSpaceId);
   });
 
-  test("requires explicit new-key grants and refuses ingest before P1-3", async () => {
+  test("requires explicit new-key grants and source scopes for ingest", async () => {
     const { t, userId, personalSpaceId, editorSpaceId, readerSpaceId } =
       await seedSpaces();
     const session = t.withIdentity({ issuer: webIssuer, subject: userId });
@@ -376,14 +376,14 @@ describe("space authorization", () => {
         capabilities: ["read"],
         spaceIds: [],
       }),
-    ).rejects.toThrow("require capabilities and space scopes");
+    ).rejects.toThrow("require bounded capabilities and space scopes");
     await expect(
       session.mutation(api.models.apiKeys.public.create, {
         name: "Ingest",
         capabilities: ["ingest"],
         spaceIds: [personalSpaceId],
       }),
-    ).rejects.toThrow("not available yet");
+    ).rejects.toThrow("explicit source accounts");
   });
 });
 

@@ -146,8 +146,21 @@ export const auditScopes = internalQuery({
       if (key.spaceIds && new Set(key.spaceIds).size !== key.spaceIds.length) {
         reasons.push("duplicate spaceIds");
       }
-      if (key.capabilities?.includes("ingest")) {
-        reasons.push("ingest scope requires the P1-3 source-account boundary");
+      const sourceIds = key.sourceAccountIds ?? [];
+      if (
+        Boolean(key.capabilities?.includes("ingest")) !==
+        sourceIds.length > 0
+      )
+        reasons.push("invalid ingest source grants");
+      if (
+        sourceIds.length > 100 ||
+        new Set(sourceIds).size !== sourceIds.length
+      )
+        reasons.push("invalid source-account bounds or duplicates");
+      for (const id of sourceIds.slice(0, 100)) {
+        const account = await ctx.db.get(id);
+        if (!account || !key.spaceIds?.includes(account.spaceId))
+          reasons.push("source account outside key spaces or missing");
       }
       if (reasons.length > 0) {
         invalidCount += 1;

@@ -20,6 +20,7 @@ export type Principal = {
   credentialId?: Id<"apiKeys">;
   capabilities: readonly Capability[];
   credentialSpaceIds?: readonly Id<"spaces">[];
+  credentialSourceAccountIds?: readonly Id<"sourceAccounts">[];
 };
 
 export type PrincipalRef = {
@@ -69,6 +70,7 @@ export function principalFromApiKey(
     credentialId: key._id,
     capabilities: unique(key.capabilities),
     credentialSpaceIds: unique(key.spaceIds),
+    credentialSourceAccountIds: unique(key.sourceAccountIds ?? []),
   };
 }
 

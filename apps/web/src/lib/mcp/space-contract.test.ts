@@ -45,8 +45,35 @@ describe("MCP space routing", () => {
   });
   afterEach(() => vi.unstubAllEnvs());
 
+  test("document evidence and partial status pass through without reinterpretation", async () => {
+    const evidence = {
+      documentId: "document",
+      historical: true,
+      contentStatus: "stale",
+      originalLinkAvailable: false,
+      retainedTextAvailable: true,
+      pages: [{ text: "Synthetic retained evidence" }],
+    };
+    mocks.query.mockResolvedValue(evidence);
+    const result = await call("get_document", {
+      documentId: "document",
+      includeHistorical: true,
+    });
+    expect(result.isError).not.toBe(true);
+    expect(mocks.query).toHaveBeenCalledWith(expect.anything(), {
+      documentId: "document",
+      includeHistorical: true,
+    });
+    expect(result.content).toEqual([
+      { type: "text", text: JSON.stringify(evidence) },
+    ]);
+  });
+
   test.each([
     ["search_facts", { query: "clinic" }],
+    ["search_documents", { query: "clinic" }],
+    ["get_document", { documentId: "document" }],
+    ["list_sources", {}],
     ["search_thoughts", { query: "decision" }],
     ["recall_context", { query: "What did we decide?" }],
     ["browse_recent", { type: "decision", topic: "home" }],

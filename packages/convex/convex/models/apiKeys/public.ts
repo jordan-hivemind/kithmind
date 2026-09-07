@@ -4,25 +4,49 @@ import { requireWebPrincipal } from "../../lib/webAuth";
 import {
   ensurePersonalSpace,
   getAuthorizedReadSpaceIds,
+  requireSpaceAccess,
+  type Principal,
 } from "../../lib/spaces";
 import { _listByUser, _insertOne, _deleteOne, _updateOne } from "./model";
+import type { MutationCtx } from "../../_generated/server";
+import type { Id } from "../../_generated/dataModel";
 import { capability } from "./validators";
 
-function validateScopes(
+async function validateScopes(
+  ctx: MutationCtx,
+  principal: Principal,
   capabilities: Array<"read" | "write" | "ingest">,
-  spaceIds: string[],
+  spaceIds: Id<"spaces">[],
+  sourceAccountIds: Id<"sourceAccounts">[],
 ) {
-  if (capabilities.length === 0 || spaceIds.length === 0) {
-    throw new Error("API keys require capabilities and space scopes");
+  if (
+    !capabilities.length ||
+    !spaceIds.length ||
+    spaceIds.length > 100 ||
+    sourceAccountIds.length > 100
+  ) {
+    throw new Error("API keys require bounded capabilities and space scopes");
   }
   if (
     new Set(capabilities).size !== capabilities.length ||
-    new Set(spaceIds).size !== spaceIds.length
+    new Set(spaceIds).size !== spaceIds.length ||
+    new Set(sourceAccountIds).size !== sourceAccountIds.length
   ) {
-    throw new Error("API key capabilities and space scopes must be unique");
+    throw new Error("API key scopes must be unique");
   }
-  if (capabilities.includes("ingest")) {
-    throw new Error("Ingest API keys are not available yet");
+  const hasIngest = capabilities.includes("ingest");
+  const hasSources = sourceAccountIds.length > 0;
+  if (hasIngest !== hasSources) {
+    throw new Error(
+      "Ingest capability requires explicit source accounts; other keys cannot grant them",
+    );
+  }
+  await getAuthorizedReadSpaceIds(ctx, principal, spaceIds);
+  for (const sourceAccountId of sourceAccountIds) {
+    const account = await ctx.db.get(sourceAccountId);
+    if (!account || !account.enabled || !spaceIds.includes(account.spaceId))
+      throw new Error("Source account not found");
+    await requireSpaceAccess(ctx, principal, account.spaceId, "ingest");
   }
 }
 
@@ -37,6 +61,7 @@ export const list = query({
       lastUsedAt: v.optional(v.number()),
       capabilities: v.array(capability),
       spaceIds: v.array(v.id("spaces")),
+      sourceAccountIds: v.array(v.id("sourceAccounts")),
     }),
   ),
   handler: async (ctx) => {
@@ -51,6 +76,7 @@ export const list = query({
       lastUsedAt: k.lastUsedAt,
       capabilities: k.capabilities,
       spaceIds: k.spaceIds,
+      sourceAccountIds: k.sourceAccountIds ?? [],
     }));
   },
 });
@@ -60,6 +86,7 @@ export const create = mutation({
     name: v.string(),
     capabilities: v.array(capability),
     spaceIds: v.array(v.id("spaces")),
+    sourceAccountIds: v.optional(v.array(v.id("sourceAccounts"))),
   },
   returns: v.object({
     id: v.id("apiKeys"),
@@ -69,8 +96,13 @@ export const create = mutation({
     const principal = await requireWebPrincipal(ctx);
     const { userId } = principal;
     await ensurePersonalSpace(ctx, userId);
-    validateScopes(args.capabilities, args.spaceIds);
-    await getAuthorizedReadSpaceIds(ctx, principal, args.spaceIds);
+    await validateScopes(
+      ctx,
+      principal,
+      args.capabilities,
+      args.spaceIds,
+      args.sourceAccountIds ?? [],
+    );
 
     // Generate a random API key
     const randomBytes = new Uint8Array(32);
@@ -98,6 +130,7 @@ export const create = mutation({
       name: args.name,
       capabilities: args.capabilities,
       spaceIds: args.spaceIds,
+      sourceAccountIds: args.sourceAccountIds ?? [],
     });
 
     // rawKey is returned ONCE — never stored or retrievable again
@@ -111,19 +144,26 @@ export const update = mutation({
     name: v.optional(v.string()),
     capabilities: v.array(capability),
     spaceIds: v.array(v.id("spaces")),
+    sourceAccountIds: v.optional(v.array(v.id("sourceAccounts"))),
   },
   returns: v.null(),
   handler: async (ctx, args) => {
     const principal = await requireWebPrincipal(ctx);
     const { userId } = principal;
-    validateScopes(args.capabilities, args.spaceIds);
+    await validateScopes(
+      ctx,
+      principal,
+      args.capabilities,
+      args.spaceIds,
+      args.sourceAccountIds ?? [],
+    );
     const key = await ctx.db.get(args.id);
     if (!key || key.userId !== userId) throw new Error("API key not found");
-    await getAuthorizedReadSpaceIds(ctx, principal, args.spaceIds);
     await _updateOne(ctx, args.id, {
       ...(args.name === undefined ? {} : { name: args.name }),
       capabilities: args.capabilities,
       spaceIds: args.spaceIds,
+      sourceAccountIds: args.sourceAccountIds ?? [],
     });
     return null;
   },

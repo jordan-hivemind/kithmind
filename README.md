@@ -4,8 +4,9 @@ Kith Mind is a personal knowledge system built on the upstream
 [ai-brain](https://github.com/flippyhead/ai-brain) foundation. Kith Mind
 contributions are intended to be MIT-licensed, with upstream attribution
 preserved in the local LICENSE. See [provenance](docs/upstream-provenance.md).
-It currently stores structured facts and narrative thoughts, and makes them
-available to compatible clients through MCP. The public architecture and staged plan are in
+It stores structured facts, narrative thoughts, and indexed source documents,
+and makes them available to compatible clients through MCP. Document ingestion
+transport and the background worker are still being implemented. The public architecture and staged plan are in
 [`docs/plans/2026-09-06-architecture.md`](./docs/plans/2026-09-06-architecture.md).
 
 ## Available today
@@ -13,8 +14,11 @@ available to compatible clients through MCP. The public architecture and staged 
 - Typed entities and facts, including current, superseded, and retracted
   records.
 - Narrative thoughts with hybrid retrieval, grounded recall, and citations.
-- Per-account isolation, API keys, and an OAuth-capable MCP gateway that
-  exchanges credentials for short-lived Convex identities.
+- Space-scoped authorization, capability-scoped API keys, and an OAuth-capable
+  MCP gateway that exchanges credentials for short-lived Convex identities.
+- Source revisions, immutable evidence, processing leases, and atomic publication
+  primitives. Indexed read tools are `search_documents`, `get_document`, and
+  `list_sources`. See the [processing contract](docs/plans/2026-09-06-source-processing-contract.md).
 - A Next.js web application, Convex backend, and a Claude Code plugin source.
 
 Captures are client-mediated: an MCP server cannot observe a conversation
@@ -26,9 +30,10 @@ requirements, including server-side OpenAI and Anthropic API credentials.
 
 The following are architecture commitments, not current product features:
 
-- Shared family spaces and per-space authorization.
-- Source-backed documents, chunks, ingestion jobs, and document-query MCP
-  tools.
+- Family membership, invitations, person linking, and source configuration in
+  the desktop settings workflow.
+- Public text ingestion, semantic document search, and exact typed lab and
+  service queries.
 - A Mac-hosted daemon, filesystem and service connectors, extraction
   playbooks, and background ingestion.
 - Desktop is the primary workflow. P2 mobile access is through hosted MCP for
