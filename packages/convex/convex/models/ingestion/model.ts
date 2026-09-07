@@ -3,6 +3,10 @@ import type { MutationCtx } from "../../_generated/server";
 import { requireSourceAccountAccess } from "../../lib/sourceAuth";
 import type { PrincipalRef } from "../../lib/spaces";
 import {
+  bumpEmbeddingEligibilityEpoch,
+  getActiveEmbeddingTarget,
+} from "../embeddings/model";
+import {
   activateSourceItemGeneration,
   beginSourceItemForget,
   createOrGetRevision,
@@ -1276,6 +1280,52 @@ export async function activateGeneration(
       throw new Error("Previous generation is invalid");
     }
     await ctx.db.patch(previous._id, { deactivatedAt: activatedAt });
+    const embeddingTarget = await getActiveEmbeddingTarget(
+      ctx,
+      loaded.job.spaceId,
+    );
+    if (embeddingTarget) {
+      // Historical text remains readable. Only obsolete vectors in the current
+      // embedding generation are removed; retired profile generations survive.
+      const previousChunks = await ctx.db
+        .query("chunks")
+        .withIndex("by_processingGenerationId", (q) =>
+          q.eq("processingGenerationId", previousGenerationId),
+        )
+        .take(MAX_CHUNKS + 1);
+      if (previousChunks.length > MAX_CHUNKS) {
+        throw new Error("Previous generation exceeds its chunk bound");
+      }
+      for (const chunk of previousChunks) {
+        if (chunk.spaceId !== loaded.job.spaceId) {
+          throw new Error("Previous chunk has an invalid space");
+        }
+        const vectors = await ctx.db
+          .query("embeddingVectors")
+          .withIndex("by_generation_and_chunkId", (q) =>
+            q
+              .eq(
+                "embeddingGenerationId",
+                embeddingTarget.embeddingGenerationId,
+              )
+              .eq("chunkId", chunk._id),
+          )
+          .take(2);
+        if (vectors.length > 1)
+          throw new Error("Duplicate active chunk vector");
+        for (const vector of vectors) {
+          if (
+            vector.spaceId !== loaded.job.spaceId ||
+            vector.targetKind !== "chunk" ||
+            vector.processingGenerationId !== previousGenerationId ||
+            vector.embeddingFingerprint !== embeddingTarget.fingerprint
+          ) {
+            throw new Error("Previous chunk vector has invalid parents");
+          }
+          await ctx.db.delete(vector._id);
+        }
+      }
+    }
   }
   await ctx.db.patch(loaded.generation._id, {
     state: "ready",
@@ -1295,6 +1345,7 @@ export async function activateGeneration(
   await ctx.db.patch(account._id, {
     lastProcessedAt: Math.max(account.lastProcessedAt ?? 0, activatedAt),
   });
+  await bumpEmbeddingEligibilityEpoch(ctx, loaded.job.spaceId);
   return {
     state: "ready" as const,
     activatedAt,
@@ -1369,6 +1420,7 @@ export async function beginForgetFromWeb(
       (account.coverageInvalidatedAt ?? 0) + 1,
     ),
   });
+  await bumpEmbeddingEligibilityEpoch(ctx, item.spaceId);
   return { lifecycle: "forgetting" as const, desiredProcessingEpoch };
 }
 
@@ -1439,6 +1491,7 @@ export async function continueForgetFromWeb(
     spaceId: item.spaceId,
     sourceItemId: item._id,
   });
+  await bumpEmbeddingEligibilityEpoch(ctx, item.spaceId);
   return { phase: "complete", deleted: 0, done: true };
 }
 

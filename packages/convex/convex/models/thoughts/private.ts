@@ -20,11 +20,21 @@ import {
 } from "./model";
 import {
   memorySourceType,
+  activeThoughtEmbeddingTarget,
   thoughtLifecycleFields,
   thoughtMetadata,
   thoughtType,
 } from "./validators";
 import { isMemoryRetrievable } from "./memoryLifecycle";
+import {
+  activateEmbeddingGeneration,
+  createEmbeddingGeneration,
+  deriveEmbeddingManifest,
+  getActiveEmbeddingTarget,
+  resolveAuthorizedThoughtVectorCandidates,
+  stageEmbeddingGeneration,
+} from "../embeddings/model";
+import { embeddingProfileValidator } from "../embeddings/validators";
 
 export const getById = internalQuery({
   args: { id: v.id("thoughts") },
@@ -79,6 +89,8 @@ export const insertOne = internalMutation({
   args: {
     content: v.string(),
     embedding: v.array(v.float64()),
+    embeddingGenerationId: v.optional(v.id("embeddingGenerations")),
+    embeddingFingerprint: v.optional(v.string()),
     metadata: thoughtMetadata,
     userId: v.id("users"),
     validFrom: v.optional(v.number()),
@@ -123,6 +135,165 @@ export const resolveReadSpacesForAction = internalQuery({
     await getAuthorizedReadSpaceIds(ctx, args.principal, args.spaceIds),
 });
 
+export const resolveReadEmbeddingTargetsForAction = internalQuery({
+  args: {
+    principal: principalRefValidator,
+    spaceIds: v.optional(v.array(v.id("spaces"))),
+  },
+  returns: v.object({
+    spaceIds: v.array(v.id("spaces")),
+    targets: v.array(activeThoughtEmbeddingTarget),
+  }),
+  handler: async (ctx, args) => {
+    const spaceIds = await getAuthorizedReadSpaceIds(
+      ctx,
+      args.principal,
+      args.spaceIds,
+    );
+    const targets = [];
+    for (const spaceId of spaceIds) {
+      try {
+        const target = await getActiveEmbeddingTarget(ctx, spaceId);
+        if (target?.thoughtStatus === "ready") {
+          targets.push({
+            spaceId,
+            embeddingGenerationId: target.embeddingGenerationId,
+            fingerprint: target.fingerprint,
+          });
+        }
+      } catch {
+        // A damaged or changing profile disables vectors, not keyword recall.
+      }
+    }
+    return { spaceIds, targets };
+  },
+});
+
+export const resolveCaptureEmbeddingTargetForAction = internalQuery({
+  args: {
+    principal: principalRefValidator,
+    spaceId: v.id("spaces"),
+  },
+  returns: v.union(activeThoughtEmbeddingTarget, v.null()),
+  handler: async (ctx, args) => {
+    const principal = await reloadPrincipal(ctx, args.principal);
+    await requireSpaceAccess(ctx, principal, args.spaceId, "read");
+    await requireSpaceAccess(ctx, principal, args.spaceId, "write");
+    const target = await getActiveEmbeddingTarget(ctx, args.spaceId);
+    if (target && target.thoughtStatus !== "ready") {
+      throw new Error(
+        "The space has no complete active thought embedding index",
+      );
+    }
+    if (!target) {
+      const manifest = await deriveEmbeddingManifest(ctx, args.spaceId);
+      if (manifest.thoughtCount > 0 || manifest.chunkCount > 0) {
+        throw new Error(
+          "The space has existing content and requires an embedding migration",
+        );
+      }
+      return null;
+    }
+    return {
+      spaceId: target.spaceId,
+      embeddingGenerationId: target.embeddingGenerationId,
+      fingerprint: target.fingerprint,
+    };
+  },
+});
+
+export const resolveOrBootstrapCaptureEmbeddingTargetForAction =
+  internalMutation({
+    args: {
+      principal: principalRefValidator,
+      spaceId: v.id("spaces"),
+      fingerprint: v.string(),
+      profile: embeddingProfileValidator,
+      now: v.number(),
+    },
+    returns: activeThoughtEmbeddingTarget,
+    handler: async (ctx, args) => {
+      const principal = await reloadPrincipal(ctx, args.principal);
+      await requireSpaceAccess(ctx, principal, args.spaceId, "read");
+      await requireSpaceAccess(ctx, principal, args.spaceId, "write");
+      const active = await getActiveEmbeddingTarget(ctx, args.spaceId);
+      if (active) {
+        if (
+          active.thoughtStatus !== "ready" ||
+          active.fingerprint !== args.fingerprint
+        ) {
+          throw new Error(
+            "The configured embedding provider does not match the active space profile",
+          );
+        }
+        return {
+          spaceId: active.spaceId,
+          embeddingGenerationId: active.embeddingGenerationId,
+          fingerprint: active.fingerprint,
+        };
+      }
+      const manifest = await deriveEmbeddingManifest(ctx, args.spaceId);
+      if (manifest.thoughtCount > 0 || manifest.chunkCount > 0) {
+        throw new Error(
+          "The space has existing content and requires an embedding migration",
+        );
+      }
+      const generation = await createEmbeddingGeneration(ctx, {
+        spaceId: args.spaceId,
+        profile: args.profile,
+        fingerprint: args.fingerprint,
+        createdAt: args.now,
+      });
+      await stageEmbeddingGeneration(ctx, {
+        embeddingGenerationId: generation._id,
+        stagedAt: args.now,
+      });
+      await activateEmbeddingGeneration(ctx, {
+        embeddingGenerationId: generation._id,
+        activatedAt: args.now,
+      });
+      return {
+        spaceId: args.spaceId,
+        embeddingGenerationId: generation._id,
+        fingerprint: args.fingerprint,
+      };
+    },
+  });
+
+export const resolveThoughtVectorCandidatesAuthorized = internalQuery({
+  args: {
+    principal: principalRefValidator,
+    targets: v.array(activeThoughtEmbeddingTarget),
+    embeddingVectorIds: v.array(v.id("embeddingVectors")),
+    type: v.optional(thoughtType),
+    includeHistorical: v.optional(v.boolean()),
+    activeAt: v.optional(v.number()),
+  },
+  returns: v.array(
+    v.object({
+      embeddingVectorId: v.id("embeddingVectors"),
+      thoughtId: v.id("thoughts"),
+      spaceId: v.id("spaces"),
+    }),
+  ),
+  handler: async (ctx, args) => {
+    const resolved = await resolveAuthorizedThoughtVectorCandidates(ctx, args);
+    if (args.activeAt === undefined) return resolved;
+    const filtered = [];
+    for (const candidate of resolved) {
+      const thought = await ctx.db.get(candidate.thoughtId);
+      if (
+        thought &&
+        (args.type === undefined || thought.metadata.type === args.type) &&
+        isMemoryRetrievable(thought, args.includeHistorical, args.activeAt)
+      ) {
+        filtered.push(candidate);
+      }
+    }
+    return filtered;
+  },
+});
+
 export const requireCaptureAccessForAction = internalQuery({
   args: {
     principal: principalRefValidator,
@@ -143,6 +314,8 @@ export const insertOneAuthorized = internalMutation({
     spaceId: v.id("spaces"),
     content: v.string(),
     embedding: v.array(v.float64()),
+    embeddingGenerationId: v.optional(v.id("embeddingGenerations")),
+    embeddingFingerprint: v.optional(v.string()),
     metadata: thoughtMetadata,
     validFrom: v.optional(v.number()),
     validTo: v.optional(v.number()),
@@ -169,6 +342,8 @@ export const transitionMemory = internalMutation({
   args: {
     content: v.string(),
     embedding: v.array(v.float64()),
+    embeddingGenerationId: v.optional(v.id("embeddingGenerations")),
+    embeddingFingerprint: v.optional(v.string()),
     metadata: thoughtMetadata,
     userId: v.id("users"),
     previousIds: v.array(v.id("thoughts")),
@@ -192,6 +367,8 @@ export const transitionMemory = internalMutation({
       {
         content: args.content,
         embedding: args.embedding,
+        embeddingGenerationId: args.embeddingGenerationId,
+        embeddingFingerprint: args.embeddingFingerprint,
         metadata: args.metadata,
         userId: args.userId,
         spaceId,
@@ -218,6 +395,8 @@ export const transitionMemoryAuthorized = internalMutation({
     spaceId: v.id("spaces"),
     content: v.string(),
     embedding: v.array(v.float64()),
+    embeddingGenerationId: v.optional(v.id("embeddingGenerations")),
+    embeddingFingerprint: v.optional(v.string()),
     metadata: thoughtMetadata,
     previousIds: v.array(v.id("thoughts")),
     previousStatus: v.union(v.literal("superseded"), v.literal("retracted")),
@@ -241,6 +420,8 @@ export const transitionMemoryAuthorized = internalMutation({
       {
         content: args.content,
         embedding: args.embedding,
+        embeddingGenerationId: args.embeddingGenerationId,
+        embeddingFingerprint: args.embeddingFingerprint,
         metadata: args.metadata,
         userId: principal.userId,
         spaceId: args.spaceId,
@@ -471,6 +652,71 @@ export const getByIdsAuthorized = internalQuery({
           doc !== null &&
           doc.spaceId !== undefined &&
           spaceIds.has(doc.spaceId),
+      )
+      .map(({ embedding: _embedding, ...rest }) => rest);
+  },
+});
+
+export const hydrateHybridResultsAuthorized = internalQuery({
+  args: {
+    principal: principalRefValidator,
+    spaceIds: v.array(v.id("spaces")),
+    ids: v.array(v.id("thoughts")),
+    targets: v.array(activeThoughtEmbeddingTarget),
+    vectorCandidates: v.array(
+      v.object({
+        embeddingVectorId: v.id("embeddingVectors"),
+        thoughtId: v.id("thoughts"),
+      }),
+    ),
+  },
+  returns: v.array(
+    v.object({
+      _id: v.id("thoughts"),
+      _creationTime: v.number(),
+      content: v.string(),
+      metadata: thoughtMetadata,
+      userId: v.id("users"),
+      spaceId: v.optional(v.id("spaces")),
+      updatedAt: v.optional(v.number()),
+      ...thoughtLifecycleFields,
+    }),
+  ),
+  handler: async (ctx, args) => {
+    if (args.ids.length > 100 || args.vectorCandidates.length > 256) {
+      throw new Error("Hybrid result hydration exceeds its bound");
+    }
+    const authorizedSpaceIds = new Set(
+      await getAuthorizedReadSpaceIds(ctx, args.principal, args.spaceIds),
+    );
+    const resolved = await resolveAuthorizedThoughtVectorCandidates(ctx, {
+      principal: args.principal,
+      targets: args.targets,
+      embeddingVectorIds: args.vectorCandidates.map(
+        (candidate) => candidate.embeddingVectorId,
+      ),
+    });
+    const thoughtIdByVectorId = new Map(
+      resolved.map((candidate) => [
+        candidate.embeddingVectorId,
+        candidate.thoughtId,
+      ]),
+    );
+    for (const candidate of args.vectorCandidates) {
+      if (
+        thoughtIdByVectorId.get(candidate.embeddingVectorId) !==
+        candidate.thoughtId
+      ) {
+        throw new Error("Vector candidates changed during hydration");
+      }
+    }
+    const docs = await Promise.all(args.ids.map((id) => ctx.db.get(id)));
+    return docs
+      .filter(
+        (doc): doc is NonNullable<typeof doc> =>
+          doc !== null &&
+          doc.spaceId !== undefined &&
+          authorizedSpaceIds.has(doc.spaceId),
       )
       .map(({ embedding: _embedding, ...rest }) => rest);
   },

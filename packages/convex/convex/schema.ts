@@ -1,3 +1,4 @@
+import { embeddingTables } from "./models/embeddings/tables";
 import { coverageTables } from "./models/coverage/tables";
 import { ingestionTables } from "./models/ingestion/tables";
 import { provenanceTables } from "./models/provenance/tables";
@@ -19,6 +20,7 @@ import {
 export default defineSchema({
   ...authTables,
   ...sourceAccountTables,
+  ...embeddingTables,
   ...coverageTables,
   ...ingestionTables,
   ...provenanceTables,

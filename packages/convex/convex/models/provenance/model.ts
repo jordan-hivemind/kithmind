@@ -1,5 +1,6 @@
 import type { Doc, Id } from "../../_generated/dataModel";
 import type { MutationCtx, QueryCtx } from "../../_generated/server";
+import { deleteChunkEmbeddingVectors } from "../embeddings/model";
 
 export const MAX_SOURCE_INLINE_UTF8_BYTES = 65_536;
 export const MAX_SOURCE_PAGES = 32;
@@ -1582,8 +1583,20 @@ export async function deleteGenerationPayloadBatch(
       q.eq("processingGenerationId", input.processingGenerationId),
     )
     .take(limit);
-  for (const chunk of chunks) await ctx.db.delete(chunk._id);
-  if (chunks.length > 0) return { deleted: chunks.length, done: false };
+  let deleted = 0;
+  for (const chunk of chunks) {
+    if (deleted === limit) break;
+    const vectors = await deleteChunkEmbeddingVectors(ctx, {
+      spaceId: input.spaceId,
+      chunkId: chunk._id,
+      limit: limit - deleted,
+    });
+    deleted += vectors.deleted;
+    if (!vectors.done || deleted === limit) break;
+    await ctx.db.delete(chunk._id);
+    deleted += 1;
+  }
+  if (chunks.length > 0) return { deleted, done: false };
   const documents = await ctx.db
     .query("documents")
     .withIndex("by_processingGenerationId", (q) =>
@@ -1618,9 +1631,20 @@ export async function deleteSourceItemProvenanceBatch(
       .query("chunks")
       .withIndex("by_documentId", (q) => q.eq("documentId", document._id))
       .take(limit);
-    for (const chunk of chunks) await ctx.db.delete(chunk._id);
-    if (chunks.length > 0)
-      return { deleted: chunks.length, phase: "chunks", done: false };
+    let deleted = 0;
+    for (const chunk of chunks) {
+      if (deleted === limit) break;
+      const vectors = await deleteChunkEmbeddingVectors(ctx, {
+        spaceId: input.spaceId,
+        chunkId: chunk._id,
+        limit: limit - deleted,
+      });
+      deleted += vectors.deleted;
+      if (!vectors.done || deleted === limit) break;
+      await ctx.db.delete(chunk._id);
+      deleted += 1;
+    }
+    if (chunks.length > 0) return { deleted, phase: "chunks", done: false };
   }
   for (const document of documents) await ctx.db.delete(document._id);
   if (documents.length > 0)

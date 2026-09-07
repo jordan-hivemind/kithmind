@@ -40,7 +40,11 @@ describe("MCP space routing", () => {
     vi.stubEnv("NEXT_PUBLIC_CONVEX_URL", "https://example.convex.cloud");
     vi.resetAllMocks();
     mocks.query.mockResolvedValue([]);
-    mocks.action.mockResolvedValue([]);
+    mocks.action.mockImplementation(async (fn) =>
+      getFunctionName(fn).endsWith(":searchWithStatus")
+        ? { results: [], vectorStatus: "unavailable" }
+        : [],
+    );
     mocks.mutation.mockResolvedValue({ factId: "fact", operation: "stored" });
   });
   afterEach(() => vi.unstubAllEnvs());
@@ -93,21 +97,24 @@ describe("MCP space routing", () => {
 
   test("preserves the selected space through recall hydration and output", async () => {
     mocks.action.mockImplementation(async (fn) =>
-      getFunctionName(fn).endsWith(":search")
-        ? [
-            {
-              _id: "thought",
-              spaceId: "shared",
-              userId: "author",
-              summary: "Decision",
-              snippet: "Decision",
-              type: "decision",
-              topics: [],
-              score: 1,
-              createdAt: 1000,
-              memoryStatus: "current",
-            },
-          ]
+      getFunctionName(fn).endsWith(":searchWithStatus")
+        ? {
+            vectorStatus: "unavailable",
+            results: [
+              {
+                _id: "thought",
+                spaceId: "shared",
+                userId: "author",
+                summary: "Decision",
+                snippet: "Decision",
+                type: "decision",
+                topics: [],
+                score: 1,
+                createdAt: 1000,
+                memoryStatus: "current",
+              },
+            ],
+          }
         : [
             {
               _id: "thought",
@@ -140,6 +147,16 @@ describe("MCP space routing", () => {
     });
     expect(JSON.stringify(result.content)).toContain("spaceId");
     expect(JSON.stringify(result.content)).toContain("author");
+  });
+
+  test("empty keyword fallback preserves vector availability status", async () => {
+    const result = await call("search_thoughts", {
+      query: "synthetic missing",
+    });
+    expect(result.isError).not.toBe(true);
+    expect(
+      JSON.parse((result.content as Array<{ text: string }>)[0]!.text),
+    ).toMatchObject({ results: [], vectorStatus: "unavailable" });
   });
 
   test("forwards explicit write destinations", async () => {

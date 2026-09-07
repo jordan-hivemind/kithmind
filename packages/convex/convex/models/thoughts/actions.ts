@@ -16,9 +16,16 @@ import {
   isMemoryRetrievable,
   type MemoryStatus,
 } from "./memoryLifecycle";
-import { memoryStatus, thoughtMetadata, thoughtType } from "./validators";
+import {
+  memoryStatus,
+  thoughtMetadata,
+  thoughtSearchResult,
+  thoughtType,
+  vectorStatus as vectorStatusValidator,
+} from "./validators";
 import { memorySourceType } from "./validators";
 import { principalRefValidator } from "../apiKeys/validators";
+import { embeddingVectorSearchScope } from "../embeddings/model";
 
 // Break circular type inference — actions.ts exports are part of `internal`'s type,
 // so referencing `internal` here creates a cycle. Runtime behavior is unchanged.
@@ -97,20 +104,109 @@ export const captureThought = internalAction({
             : `Memory was skipped: ${preflight.reason}`,
       };
     }
-    const embedding = await ctx.runAction(
-      internal.models.thoughts.helpers.generateEmbedding,
-      { text: content },
+    const existingEmbeddingTarget: {
+      spaceId: Id<"spaces">;
+      embeddingGenerationId: Id<"embeddingGenerations">;
+      fingerprint: string;
+    } | null = await ctx.runQuery(
+      internal.models.thoughts.private.resolveCaptureEmbeddingTargetForAction,
+      { principal: args.principal, spaceId: args.spaceId },
+    );
+    const configuration: {
+      fingerprint: string;
+      profile: {
+        protocol: string;
+        providerId: string;
+        model: string;
+        modelRevision: string;
+        dimensions: number;
+        normalization: string;
+        preprocessing: string;
+      };
+    } = await ctx.runAction(
+      internal.models.thoughts.helpers.getEmbeddingConfigurationIdentity,
+      {},
+    );
+    if (
+      existingEmbeddingTarget &&
+      existingEmbeddingTarget.fingerprint !== configuration.fingerprint
+    ) {
+      throw new Error(
+        "The configured embedding provider does not match the active space profile",
+      );
+    }
+    const embeddingResult: { vector: number[]; fingerprint: string } =
+      await ctx.runAction(
+        internal.models.thoughts.helpers.generateEmbeddingWithMetadata,
+        { text: content },
+      );
+    if (embeddingResult.fingerprint !== configuration.fingerprint) {
+      throw new Error(
+        "The configured embedding provider does not match the active space profile",
+      );
+    }
+    const embeddingTarget: {
+      spaceId: Id<"spaces">;
+      embeddingGenerationId: Id<"embeddingGenerations">;
+      fingerprint: string;
+    } = await ctx.runMutation(
+      internal.models.thoughts.private
+        .resolveOrBootstrapCaptureEmbeddingTargetForAction,
+      {
+        principal: args.principal,
+        spaceId: args.spaceId,
+        fingerprint: configuration.fingerprint,
+        profile: configuration.profile,
+        now: Date.now(),
+      },
+    );
+    const embedding = embeddingResult.vector;
+
+    const similarResults = await ctx.vectorSearch(
+      "embeddingVectors",
+      "by_embedding_1536",
+      {
+        vector: embedding,
+        limit: 256,
+        filter: (q) =>
+          q.eq(
+            "searchScope",
+            embeddingVectorSearchScope({
+              ...embeddingTarget,
+              targetKind: "thought",
+            }),
+          ),
+      },
     );
 
-    const similarResults = await ctx.vectorSearch("thoughts", "by_embedding", {
-      vector: embedding,
-      limit: 256,
-      filter: (q) => q.eq("spaceId", args.spaceId),
-    });
-
-    const candidates = similarResults
+    const candidateVectors = similarResults
       .filter((r) => r._score >= SIMILARITY_THRESHOLD)
       .slice(0, MAX_CANDIDATES * 5);
+
+    const resolvedCandidates: Array<{
+      embeddingVectorId: Id<"embeddingVectors">;
+      thoughtId: Id<"thoughts">;
+      spaceId: Id<"spaces">;
+    }> = await ctx.runQuery(
+      internal.models.thoughts.private.resolveThoughtVectorCandidatesAuthorized,
+      {
+        principal: args.principal,
+        targets: [embeddingTarget],
+        embeddingVectorIds: candidateVectors.map((row) => row._id),
+      },
+    );
+    const thoughtIdByVectorId = new Map(
+      resolvedCandidates.map((row) => [
+        row.embeddingVectorId as string,
+        row.thoughtId,
+      ]),
+    );
+    const candidates = candidateVectors
+      .map((row) => {
+        const thoughtId = thoughtIdByVectorId.get(row._id as string);
+        return thoughtId ? { ...row, thoughtId } : null;
+      })
+      .filter((row): row is NonNullable<typeof row> => row !== null);
 
     // One batched read rather than a query per candidate. The vector search is
     // already scoped to this account; the ownership check below is defence in
@@ -130,7 +226,7 @@ export const captureThought = internalAction({
       {
         principal: args.principal,
         spaceIds: [args.spaceId],
-        ids: candidates.map((r) => r._id),
+        ids: candidates.map((r) => r.thoughtId),
       },
     );
     const candidateById = new Map(
@@ -139,7 +235,7 @@ export const captureThought = internalAction({
 
     // Preserve vector-search ranking; `getByIds` does not guarantee order.
     const validCandidates = candidates
-      .map((r) => candidateById.get(r._id as string))
+      .map((r) => candidateById.get(r.thoughtId as string))
       .filter(
         (doc): doc is NonNullable<typeof doc> =>
           doc !== undefined &&
@@ -283,15 +379,22 @@ export const captureThought = internalAction({
       const replacementContent = classification.replacementContent;
       if (replacementContent) {
         try {
-          const replacementEmbedding = canReuseEmbedding(
-            content,
-            replacementContent,
-          )
-            ? embedding
-            : await ctx.runAction(
-                internal.models.thoughts.helpers.generateEmbedding,
-                { text: replacementContent },
+          let replacementEmbedding = embedding;
+          if (!canReuseEmbedding(content, replacementContent)) {
+            const replacementResult: {
+              vector: number[];
+              fingerprint: string;
+            } = await ctx.runAction(
+              internal.models.thoughts.helpers.generateEmbeddingWithMetadata,
+              { text: replacementContent },
+            );
+            if (replacementResult.fingerprint !== embeddingTarget.fingerprint) {
+              throw new Error(
+                "The configured embedding provider does not match the active space profile",
               );
+            }
+            replacementEmbedding = replacementResult.vector;
+          }
           const replacementMetadata =
             analysis?.metadata ?? fallbackThoughtMetadata(replacementContent);
 
@@ -302,6 +405,8 @@ export const captureThought = internalAction({
               spaceId: args.spaceId,
               content: replacementContent,
               embedding: replacementEmbedding,
+              embeddingGenerationId: embeddingTarget.embeddingGenerationId,
+              embeddingFingerprint: embeddingTarget.fingerprint,
               metadata: replacementMetadata,
               previousIds: classification.relatedThoughtIds as Array<
                 Id<"thoughts">
@@ -365,6 +470,8 @@ export const captureThought = internalAction({
         spaceId: args.spaceId,
         content,
         embedding,
+        embeddingGenerationId: embeddingTarget.embeddingGenerationId,
+        embeddingFingerprint: embeddingTarget.fingerprint,
         metadata,
         validFrom: args.validFrom,
         validTo: args.validTo,
@@ -425,178 +532,320 @@ export const captureThoughtTrustedPersonal = internalAction({
   },
 });
 
-export const hybridSearch = internalAction({
+const hybridSearchArgs = {
+  principal: principalRefValidator,
+  spaceIds: v.optional(v.array(v.id("spaces"))),
+  query: v.string(),
+  type: v.optional(thoughtType),
+  limit: v.optional(v.number()),
+  includeHistorical: v.optional(v.boolean()),
+};
+
+type ActiveEmbeddingTarget = {
+  spaceId: Id<"spaces">;
+  embeddingGenerationId: Id<"embeddingGenerations">;
+  fingerprint: string;
+};
+
+type HydratedThought = {
+  _id: Id<"thoughts">;
+  _creationTime: number;
+  content: string;
+  metadata: Infer<typeof thoughtMetadata>;
+  userId: Id<"users">;
+  spaceId?: Id<"spaces">;
+  memoryStatus?: MemoryStatus;
+  isCore?: boolean;
+  validFrom?: number;
+  validTo?: number;
+  supersededAt?: number;
+  changeReason?: string;
+};
+
+export function compatibleSearchFingerprint(
+  spaceIds: readonly Id<"spaces">[],
+  targets: readonly ActiveEmbeddingTarget[],
+): string | null {
+  if (spaceIds.length === 0 || targets.length !== spaceIds.length) return null;
+  const bySpace = new Map(targets.map((target) => [target.spaceId, target]));
+  if (bySpace.size !== spaceIds.length) return null;
+  const fingerprint = bySpace.get(spaceIds[0]!)?.fingerprint;
+  if (!fingerprint) return null;
+  return spaceIds.every(
+    (spaceId) => bySpace.get(spaceId)?.fingerprint === fingerprint,
+  )
+    ? fingerprint
+    : null;
+}
+
+function fuseSearchRanks(
+  vectorThoughtIds: readonly string[],
+  textThoughtIds: readonly string[],
+  limit: number,
+) {
+  const K = 60;
+  const scores = new Map<string, number>();
+  for (const [rank, id] of vectorThoughtIds.entries()) {
+    scores.set(id, (scores.get(id) ?? 0) + 1 / (K + rank + 1));
+  }
+  for (const [rank, id] of textThoughtIds.entries()) {
+    scores.set(id, (scores.get(id) ?? 0) + 1 / (K + rank + 1));
+  }
+  const ids = [...scores.entries()]
+    .sort(
+      (left, right) => right[1] - left[1] || left[0].localeCompare(right[0]),
+    )
+    .slice(0, limit)
+    .map(([id]) => id);
+  return { ids, scores };
+}
+
+async function runHybridSearch(
+  // The generated action context type is recursive through `internal`; keep
+  // this implementation local while the public validators retain strict IO.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  ctx: any,
   args: {
-    principal: principalRefValidator,
-    spaceIds: v.optional(v.array(v.id("spaces"))),
-    query: v.string(),
-    type: v.optional(thoughtType),
-    limit: v.optional(v.number()),
-    includeHistorical: v.optional(v.boolean()),
+    principal: Infer<typeof principalRefValidator>;
+    spaceIds?: Array<Id<"spaces">>;
+    query: string;
+    type?: Infer<typeof thoughtType>;
+    limit?: number;
+    includeHistorical?: boolean;
   },
-  returns: v.array(
-    v.object({
-      _id: v.id("thoughts"),
-      content: v.string(),
-      metadata: thoughtMetadata,
-      userId: v.id("users"),
-      spaceId: v.id("spaces"),
-      score: v.float64(),
-      createdAt: v.number(),
-      memoryStatus,
-      isCore: v.optional(v.boolean()),
-      validFrom: v.optional(v.number()),
-      validTo: v.optional(v.number()),
-      supersededAt: v.optional(v.number()),
-      changeReason: v.optional(v.string()),
-    }),
-  ),
-  handler: async (ctx, args) => {
-    const limit = Math.min(args.limit ?? 10, 100);
-    if (!Number.isInteger(limit) || limit < 1) {
-      throw new Error("Thought limit must be a positive integer");
-    }
-    const candidateCap = 50;
-    const K = 60; // RRF constant
+): Promise<{
+  results: Array<Infer<typeof thoughtSearchResult>>;
+  vectorStatus: "ready" | "unavailable";
+}> {
+  const limit = Math.min(args.limit ?? 10, 100);
+  if (!Number.isInteger(limit) || limit < 1) {
+    throw new Error("Thought limit must be a positive integer");
+  }
+  const candidateCap = 50;
+  const activeAt = Date.now();
+  const scope: {
+    spaceIds: Array<Id<"spaces">>;
+    targets: ActiveEmbeddingTarget[];
+  } = await ctx.runQuery(
+    internal.models.thoughts.private.resolveReadEmbeddingTargetsForAction,
+    { principal: args.principal, spaceIds: args.spaceIds },
+  );
+  if (scope.spaceIds.length === 0) {
+    return { results: [], vectorStatus: "unavailable" };
+  }
 
-    const authorizedSpaceIds: Array<Id<"spaces">> = await ctx.runQuery(
-      internal.models.thoughts.private.resolveReadSpacesForAction,
-      { principal: args.principal, spaceIds: args.spaceIds },
-    );
-    if (authorizedSpaceIds.length === 0) return [];
-    // Authorize before spending an embedding request, then generate once for
-    // the globally merged vector search.
-    const embedding = await ctx.runAction(
-      internal.models.thoughts.helpers.generateEmbedding,
-      { text: args.query },
-    );
+  const textHitsPromise = ctx.runQuery(
+    internal.models.thoughts.private.searchByTextAuthorized,
+    {
+      principal: args.principal,
+      spaceIds: scope.spaceIds,
+      query: args.query,
+      type: args.type,
+      limit: candidateCap,
+      includeHistorical: args.includeHistorical,
+      activeAt,
+    },
+  ) as Promise<Array<{ _id: Id<"thoughts"> }>>;
 
-    const activeAt = Date.now();
-    const [vectorHitsBySpace, textHits] = await Promise.all([
-      Promise.all(
-        authorizedSpaceIds.map((spaceId) =>
-          ctx.vectorSearch("thoughts", "by_embedding", {
-            vector: embedding,
-            limit: args.includeHistorical ? candidateCap : candidateCap * 4,
-            filter: (q) => q.eq("spaceId", spaceId),
-          }),
-        ),
-      ),
-      ctx.runQuery(internal.models.thoughts.private.searchByTextAuthorized, {
-        principal: args.principal,
-        spaceIds: authorizedSpaceIds,
-        query: args.query,
-        type: args.type,
-        limit: candidateCap,
-        includeHistorical: args.includeHistorical,
-        activeAt,
-      }),
-    ]);
-    const vectorHits = vectorHitsBySpace
-      .flat()
-      .sort(
-        (left, right) =>
-          right._score - left._score ||
-          String(left._id).localeCompare(String(right._id)),
-      )
-      .slice(0, args.includeHistorical ? candidateCap : candidateCap * 4);
-
-    // Vector indexes cannot filter optional lifecycle fields, so hydrate once
-    // and post-filter historical results. Text hits are filtered in their query.
-    const vectorIds = vectorHits.map((hit) => hit._id);
-    const fetchedDocs: Array<{
-      _id: Id<"thoughts">;
-      _creationTime: number;
-      content: string;
-      metadata: Infer<typeof thoughtMetadata>;
-      userId: string;
-      spaceId?: Id<"spaces">;
-      updatedAt?: number;
-      memoryStatus?: MemoryStatus;
-      isCore?: boolean;
-      validFrom?: number;
-      validTo?: number;
-      supersededAt?: number;
-      changeReason?: string;
-    }> = await ctx.runQuery(
-      internal.models.thoughts.private.getByIdsAuthorized,
-      {
-        principal: args.principal,
-        spaceIds: authorizedSpaceIds,
-        ids: vectorIds,
-      },
-    );
-    const docById = new Map(fetchedDocs.map((doc) => [doc._id as string, doc]));
-    const filteredVectorHits = vectorHits.filter((hit) => {
-      const doc = docById.get(hit._id);
-      return (
-        doc !== undefined &&
-        (args.type === undefined || doc.metadata.type === args.type) &&
-        isMemoryRetrievable(doc, args.includeHistorical, activeAt)
+  let vectorStatus: "ready" | "unavailable" = "unavailable";
+  let vectorThoughtIds: string[] = [];
+  let vectorCandidates: Array<{
+    embeddingVectorId: Id<"embeddingVectors">;
+    thoughtId: Id<"thoughts">;
+  }> = [];
+  const expectedFingerprint = compatibleSearchFingerprint(
+    scope.spaceIds,
+    scope.targets,
+  );
+  if (expectedFingerprint) {
+    try {
+      const configuration: { fingerprint: string } = await ctx.runAction(
+        internal.models.thoughts.helpers.getEmbeddingConfigurationIdentity,
+        {},
       );
-    });
+      if (configuration.fingerprint !== expectedFingerprint) {
+        throw new Error("Configured embedding profile mismatch");
+      }
+      const generated: { vector: number[]; fingerprint: string } =
+        await ctx.runAction(
+          internal.models.thoughts.helpers.generateEmbeddingWithMetadata,
+          { text: args.query },
+        );
+      if (generated.fingerprint !== expectedFingerprint) {
+        throw new Error("Configured embedding profile mismatch");
+      }
+      const globalVectorCandidateCap = args.includeHistorical
+        ? candidateCap
+        : candidateCap * 4;
+      const perSpaceLimit = Math.max(
+        1,
+        Math.floor(globalVectorCandidateCap / scope.targets.length),
+      );
+      const vectorHits = (
+        await Promise.all(
+          scope.targets.map((target) =>
+            ctx.vectorSearch("embeddingVectors", "by_embedding_1536", {
+              vector: generated.vector,
+              limit: perSpaceLimit,
+              filter: (q: { eq: (field: string, value: unknown) => unknown }) =>
+                q.eq(
+                  "searchScope",
+                  embeddingVectorSearchScope({
+                    ...target,
+                    targetKind: "thought",
+                  }),
+                ),
+            }),
+          ),
+        )
+      )
+        .flat()
+        .sort(
+          (left, right) =>
+            right._score - left._score ||
+            String(left._id).localeCompare(String(right._id)),
+        )
+        .slice(0, globalVectorCandidateCap);
+      const resolved: Array<{
+        embeddingVectorId: Id<"embeddingVectors">;
+        thoughtId: Id<"thoughts">;
+      }> = await ctx.runQuery(
+        internal.models.thoughts.private
+          .resolveThoughtVectorCandidatesAuthorized,
+        {
+          principal: args.principal,
+          targets: scope.targets,
+          embeddingVectorIds: vectorHits.map((hit) => hit._id),
+          type: args.type,
+          includeHistorical: args.includeHistorical,
+          activeAt,
+        },
+      );
+      const thoughtIdByVectorId = new Map(
+        resolved.map((row) => [
+          row.embeddingVectorId as string,
+          row.thoughtId as string,
+        ]),
+      );
+      vectorCandidates = vectorHits.flatMap((hit) => {
+        const thoughtId = thoughtIdByVectorId.get(hit._id as string);
+        return thoughtId
+          ? [
+              {
+                embeddingVectorId: hit._id,
+                thoughtId: thoughtId as Id<"thoughts">,
+              },
+            ]
+          : [];
+      });
+      vectorThoughtIds = vectorCandidates.map(
+        (candidate) => candidate.thoughtId as string,
+      );
+      vectorStatus = "ready";
+    } catch {
+      console.error("[Recall] Vector search unavailable");
+      // Do not let a stale authorization failure turn into a keyword result.
+      await ctx.runQuery(
+        internal.models.thoughts.private.resolveReadSpacesForAction,
+        { principal: args.principal, spaceIds: scope.spaceIds },
+      );
+    }
+  }
 
-    // Reciprocal Rank Fusion uses one-based ranks: score = Σ 1 / (K + rank).
-    const rrf = new Map<string, number>();
-    filteredVectorHits.forEach((h, rank) => {
-      rrf.set(h._id, (rrf.get(h._id) ?? 0) + 1 / (K + rank + 1));
-    });
-    // Cast narrows textHits to _id only; upstream `internal as any` collapses the runQuery return type.
-    (textHits as Array<{ _id: string }>).forEach((h, rank) => {
-      rrf.set(h._id, (rrf.get(h._id) ?? 0) + 1 / (K + rank + 1));
-    });
+  const textHits = await textHitsPromise;
+  let fused = fuseSearchRanks(
+    vectorThoughtIds,
+    textHits.map((hit) => hit._id as string),
+    limit,
+  );
 
-    const rankedIds = [...rrf.entries()]
-      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-      .slice(0, limit)
-      .map(([id]) => id);
-
-    // Hydrate final ranked results with a single batch query.
-    const hydrated: Array<{
-      _id: Id<"thoughts">;
-      _creationTime: number;
-      content: string;
-      metadata: Infer<typeof thoughtMetadata>;
-      userId: string;
-      spaceId?: Id<"spaces">;
-      updatedAt?: number;
-      memoryStatus?: MemoryStatus;
-      isCore?: boolean;
-      validFrom?: number;
-      validTo?: number;
-      supersededAt?: number;
-      changeReason?: string;
-    }> = await ctx.runQuery(
-      internal.models.thoughts.private.getByIdsAuthorized,
+  let hydrated: HydratedThought[];
+  try {
+    const selectedIds = new Set(fused.ids);
+    hydrated = await ctx.runQuery(
+      internal.models.thoughts.private.hydrateHybridResultsAuthorized,
       {
         principal: args.principal,
-        spaceIds: authorizedSpaceIds,
-        ids: rankedIds as Array<Id<"thoughts">>,
+        spaceIds: scope.spaceIds,
+        ids: fused.ids as Array<Id<"thoughts">>,
+        targets: vectorStatus === "ready" ? scope.targets : [],
+        vectorCandidates:
+          vectorStatus === "ready"
+            ? vectorCandidates.filter((candidate) =>
+                selectedIds.has(candidate.thoughtId as string),
+              )
+            : [],
       },
     );
-    const hydratedById = new Map(hydrated.map((d) => [d._id as string, d]));
+  } catch (error) {
+    if (vectorStatus !== "ready") throw error;
+    console.error("[Recall] Vector generation changed during search");
+    await ctx.runQuery(
+      internal.models.thoughts.private.resolveReadSpacesForAction,
+      { principal: args.principal, spaceIds: scope.spaceIds },
+    );
+    vectorStatus = "unavailable";
+    fused = fuseSearchRanks(
+      [],
+      textHits.map((hit) => hit._id as string),
+      limit,
+    );
+    hydrated = await ctx.runQuery(
+      internal.models.thoughts.private.hydrateHybridResultsAuthorized,
+      {
+        principal: args.principal,
+        spaceIds: scope.spaceIds,
+        ids: fused.ids as Array<Id<"thoughts">>,
+        targets: [],
+        vectorCandidates: [],
+      },
+    );
+  }
 
-    return rankedIds
-      .map((id) => {
-        const doc = hydratedById.get(id);
-        return doc
-          ? {
-              _id: doc._id,
-              content: doc.content,
-              metadata: doc.metadata,
-              userId: doc.userId as Id<"users">,
-              spaceId: doc.spaceId!,
-              score: rrf.get(id)!,
-              createdAt: doc._creationTime,
-              memoryStatus: doc.memoryStatus ?? "current",
-              isCore: doc.isCore,
-              validFrom: doc.validFrom,
-              validTo: doc.validTo,
-              supersededAt: doc.supersededAt,
-              changeReason: doc.changeReason,
-            }
-          : null;
-      })
-      .filter((d): d is NonNullable<typeof d> => d !== null);
-  },
+  const hydratedById = new Map(hydrated.map((doc) => [doc._id as string, doc]));
+  const results = fused.ids
+    .map((id) => {
+      const doc = hydratedById.get(id);
+      if (
+        !doc ||
+        !doc.spaceId ||
+        (args.type !== undefined && doc.metadata.type !== args.type) ||
+        !isMemoryRetrievable(doc, args.includeHistorical, activeAt)
+      ) {
+        return null;
+      }
+      return {
+        _id: doc._id,
+        content: doc.content,
+        metadata: doc.metadata,
+        userId: doc.userId,
+        spaceId: doc.spaceId,
+        score: fused.scores.get(id)!,
+        createdAt: doc._creationTime,
+        memoryStatus: doc.memoryStatus ?? "current",
+        isCore: doc.isCore,
+        validFrom: doc.validFrom,
+        validTo: doc.validTo,
+        supersededAt: doc.supersededAt,
+        changeReason: doc.changeReason,
+      };
+    })
+    .filter((row): row is NonNullable<typeof row> => row !== null);
+  return { results, vectorStatus };
+}
+
+export const hybridSearchWithStatus = internalAction({
+  args: hybridSearchArgs,
+  returns: v.object({
+    results: v.array(thoughtSearchResult),
+    vectorStatus: vectorStatusValidator,
+  }),
+  handler: runHybridSearch,
+});
+
+/** Legacy array result retained for web and evaluation callers. */
+export const hybridSearch = internalAction({
+  args: hybridSearchArgs,
+  returns: v.array(thoughtSearchResult),
+  handler: async (ctx, args) => (await runHybridSearch(ctx, args)).results,
 });

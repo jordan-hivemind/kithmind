@@ -4,6 +4,12 @@ import type { Expression, FilterBuilder, NamedTableInfo } from "convex/server";
 import type { DataModel, Doc, Id } from "../../_generated/dataModel";
 import type { MutationCtx, QueryCtx } from "../../_generated/server";
 import {
+  bumpEmbeddingEligibilityEpoch,
+  deleteActiveThoughtEmbeddingVectors,
+  insertThoughtEmbedding,
+  requireActiveEmbeddingTarget,
+} from "../embeddings/model";
+import {
   assertValidMemoryValidity,
   isCurrentMemory,
   safeSupersededValidTo,
@@ -21,6 +27,11 @@ type ThoughtProvenance = {
   observedAt?: number;
   batchId?: string;
   confidence?: number;
+};
+
+type ThoughtEmbeddingWrite = {
+  embeddingGenerationId?: Id<"embeddingGenerations">;
+  embeddingFingerprint?: string;
 };
 
 export const DEFAULT_CORE_MEMORY_LIMIT = 10;
@@ -243,13 +254,45 @@ export async function _insertOne(
     spaceId: Id<"spaces">;
     isCore?: boolean;
   } & MemoryValidity &
-    ThoughtProvenance,
+    ThoughtProvenance &
+    ThoughtEmbeddingWrite,
 ) {
   assertValidMemoryValidity(fields);
-  return await ctx.db.insert("thoughts", {
-    ...fields,
+  const { embeddingGenerationId, embeddingFingerprint, ...thoughtFields } =
+    fields;
+  if (
+    (embeddingGenerationId === undefined) !==
+    (embeddingFingerprint === undefined)
+  ) {
+    throw new Error("Incomplete thought embedding identity");
+  }
+  const thoughtId = await ctx.db.insert("thoughts", {
+    ...thoughtFields,
     memoryStatus: "current",
   });
+  if (embeddingGenerationId && embeddingFingerprint) {
+    await insertThoughtEmbedding(ctx, {
+      spaceId: fields.spaceId,
+      thoughtId,
+      embeddingGenerationId,
+      fingerprint: embeddingFingerprint,
+      vector: fields.embedding,
+      inputText: fields.content,
+    });
+    const active = await requireActiveEmbeddingTarget(ctx, {
+      spaceId: fields.spaceId,
+      embeddingGenerationId,
+      fingerprint: embeddingFingerprint,
+    });
+    if (active.thoughtStatus !== "ready") {
+      throw new Error(
+        "Thought capture exceeds the active embedding manifest limit",
+      );
+    }
+  } else {
+    await bumpEmbeddingEligibilityEpoch(ctx, fields.spaceId);
+  }
+  return thoughtId;
 }
 
 export async function _transitionMemory(
@@ -262,7 +305,8 @@ export async function _transitionMemory(
     spaceId: Id<"spaces">;
     isCore?: boolean;
   } & MemoryValidity &
-    ThoughtProvenance,
+    ThoughtProvenance &
+    ThoughtEmbeddingWrite,
   previousIds: Array<Id<"thoughts">>,
   previousStatus: Exclude<MemoryStatus, "current">,
   reason: string,
@@ -299,12 +343,31 @@ export async function _transitionMemory(
   const isCore =
     fields.isCore ?? previousMemories.some((previous) => previous!.isCore);
 
+  const { embeddingGenerationId, embeddingFingerprint, ...thoughtFields } =
+    fields;
+  if (
+    (embeddingGenerationId === undefined) !==
+    (embeddingFingerprint === undefined)
+  ) {
+    throw new Error("Incomplete thought embedding identity");
+  }
   const newId = await ctx.db.insert("thoughts", {
-    ...fields,
+    ...thoughtFields,
     isCore,
     memoryStatus: "current",
     supersedes: uniquePreviousIds,
   });
+  if (embeddingGenerationId && embeddingFingerprint) {
+    await insertThoughtEmbedding(ctx, {
+      spaceId: fields.spaceId,
+      thoughtId: newId,
+      embeddingGenerationId,
+      fingerprint: embeddingFingerprint,
+      vector: fields.embedding,
+      inputText: fields.content,
+      bumpEligibility: false,
+    });
+  }
 
   for (const previous of previousMemories) {
     const validTo =
@@ -321,6 +384,28 @@ export async function _transitionMemory(
         : {}),
       ...(validTo === undefined ? {} : { validTo }),
     });
+  }
+
+  if (embeddingGenerationId && embeddingFingerprint) {
+    await deleteActiveThoughtEmbeddingVectors(ctx, {
+      spaceId: fields.spaceId,
+      embeddingGenerationId,
+      fingerprint: embeddingFingerprint,
+      thoughtIds: uniquePreviousIds,
+    });
+    await bumpEmbeddingEligibilityEpoch(ctx, fields.spaceId);
+    const active = await requireActiveEmbeddingTarget(ctx, {
+      spaceId: fields.spaceId,
+      embeddingGenerationId,
+      fingerprint: embeddingFingerprint,
+    });
+    if (active.thoughtStatus !== "ready") {
+      throw new Error(
+        "Thought transition exceeds the active embedding manifest limit",
+      );
+    }
+  } else {
+    await bumpEmbeddingEligibilityEpoch(ctx, fields.spaceId);
   }
 
   return newId;

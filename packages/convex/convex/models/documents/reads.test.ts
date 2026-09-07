@@ -1,7 +1,20 @@
 import { convexTest } from "convex-test";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
-import { api } from "../../_generated/api";
+import { api, internal } from "../../_generated/api";
+import { beginForgetFromWeb, continueForgetFromWeb } from "../ingestion/model";
+import {
+  embeddingProfile,
+  fingerprintEmbeddingConfig,
+  loadEmbeddingConfig,
+} from "../../lib/embeddingProvider";
+import {
+  activateEmbeddingGeneration,
+  createEmbeddingGeneration,
+  getActiveEmbeddingTarget,
+  insertChunkEmbedding,
+  stageEmbeddingGeneration,
+} from "../embeddings/model";
 import type { Id } from "../../_generated/dataModel";
 import schema from "../../legacySchema";
 import { modules } from "../../test.setup";
@@ -392,4 +405,112 @@ describe("document reads", () => {
       quote: "needle",
     });
   });
+});
+
+test("semantic document hydration preserves evidence and rechecks profile, source and credentials", async () => {
+  const t = convexTest(schema, modules);
+  const seeded = await seedIdentity(t);
+  const visible = await seedDocument(t, {
+    spaceId: seeded.spaceId,
+    sourceAccountId: seeded.sourceAccountId,
+    userId: seeded.userId,
+    suffix: "semantic",
+  });
+  const config = loadEmbeddingConfig({});
+  const profile = embeddingProfile(config);
+  const fingerprint = await fingerprintEmbeddingConfig(profile);
+  const canonical = await t.run(async (ctx) => {
+    const generation = await createEmbeddingGeneration(ctx, {
+      spaceId: seeded.spaceId,
+      profile,
+      fingerprint,
+      createdAt: 1,
+    });
+    const vectorId = await insertChunkEmbedding(ctx, {
+      spaceId: seeded.spaceId,
+      chunkId: visible.chunkId,
+      embeddingGenerationId: generation._id,
+      fingerprint,
+      inputText: "needle text semantic",
+      vector: Array(1536).fill(0.1),
+    });
+    await stageEmbeddingGeneration(ctx, {
+      embeddingGenerationId: generation._id,
+      stagedAt: 2,
+    });
+    await activateEmbeddingGeneration(ctx, {
+      embeddingGenerationId: generation._id,
+      activatedAt: 3,
+    });
+    return { generationId: generation._id, vectorId };
+  });
+  const args = {
+    principal: { userId: seeded.userId, credentialId: seeded.keyId },
+    spaceIds: [seeded.spaceId],
+    query: "unrelatedsynonym",
+    targets: [
+      {
+        spaceId: seeded.spaceId,
+        embeddingGenerationId: canonical.generationId,
+        fingerprint,
+      },
+    ],
+    embeddingVectorIds: [canonical.vectorId],
+  };
+  const result = await t.query(
+    internal.models.documents.private.searchWithCandidates,
+    args,
+  );
+  expect(result.vectorStatus).toBe("ready");
+  expect(result.results.map((row) => row.documentId)).toEqual([
+    visible.documentId,
+  ]);
+  expect(result.results[0]?.citations[0]?.quote).toBe("needle");
+  const incompatible = await t.query(
+    internal.models.documents.private.searchWithCandidates,
+    {
+      ...args,
+      query: "needle",
+      targets: [{ ...args.targets[0]!, fingerprint: "different" }],
+    },
+  );
+  expect(incompatible.vectorStatus).toBe("unavailable");
+  expect(incompatible.results.map((row) => row.documentId)).toEqual([
+    visible.documentId,
+  ]);
+  await t.run((ctx) =>
+    beginForgetFromWeb(ctx, {
+      principal: { userId: seeded.userId },
+      sourceItemId: visible.itemId,
+      now: Date.now(),
+    }),
+  );
+  expect(
+    (
+      await t.query(
+        internal.models.documents.private.searchWithCandidates,
+        args,
+      )
+    ).results,
+  ).toEqual([]);
+  let forgotten = false;
+  for (let attempt = 0; attempt < 20 && !forgotten; attempt += 1) {
+    const batch = await t.run((ctx) =>
+      continueForgetFromWeb(ctx, {
+        principal: { userId: seeded.userId },
+        sourceItemId: visible.itemId,
+      }),
+    );
+    expect(batch.deleted).toBeLessThanOrEqual(25);
+    forgotten = batch.done;
+  }
+  expect(forgotten).toBe(true);
+  expect(
+    await t.run((ctx) => getActiveEmbeddingTarget(ctx, seeded.spaceId)),
+  ).toMatchObject({ chunkStatus: "ready" });
+  expect(await t.run((ctx) => ctx.db.get(canonical.vectorId))).toBeNull();
+  await t.run((ctx) => ctx.db.delete(seeded.keyId));
+  await expect(
+    t.query(internal.models.documents.private.searchWithCandidates, args),
+  ).rejects.toThrow();
 });

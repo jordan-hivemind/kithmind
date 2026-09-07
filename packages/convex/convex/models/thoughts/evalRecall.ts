@@ -74,6 +74,29 @@ export const deleteEvalSeed = internalMutation({
         await ctx.db.delete(membership._id);
       }
       for (const setting of settings) {
+        const generations = await ctx.db
+          .query("embeddingGenerations")
+          .withIndex("by_spaceId", (q) =>
+            q.eq("spaceId", setting.personalSpaceId),
+          )
+          .collect();
+        for (const generation of generations) {
+          const vectors = await ctx.db
+            .query("embeddingVectors")
+            .withIndex("by_embeddingGenerationId", (q) =>
+              q.eq("embeddingGenerationId", generation._id),
+            )
+            .collect();
+          for (const vector of vectors) await ctx.db.delete(vector._id);
+          await ctx.db.delete(generation._id);
+        }
+        const embeddingStates = await ctx.db
+          .query("spaceEmbeddingStates")
+          .withIndex("by_spaceId", (q) =>
+            q.eq("spaceId", setting.personalSpaceId),
+          )
+          .collect();
+        for (const state of embeddingStates) await ctx.db.delete(state._id);
         await ctx.db.delete(setting._id);
         await ctx.db.delete(setting.personalSpaceId);
       }
@@ -105,6 +128,21 @@ export const runBaseline = internalAction({
     const factIdByKey = new Map<string, Id<"facts">>();
     const ownerByFactId = new Map<string, { key: string; label: string }>();
     const createdFactIds: Array<Id<"facts">> = [];
+    const configuration: {
+      fingerprint: string;
+      profile: {
+        protocol: string;
+        providerId: string;
+        model: string;
+        modelRevision: string;
+        dimensions: number;
+        normalization: string;
+        preprocessing: string;
+      };
+    } = await ctx.runAction(
+      internal.models.thoughts.helpers.getEmbeddingConfigurationIdentity,
+      {},
+    );
 
     try {
       for (const account of liveRecallCorpus) {
@@ -113,15 +151,41 @@ export const runBaseline = internalAction({
           { label: account.label },
         );
         userIdByLabel.set(account.label, userId);
+        const spaceId: Id<"spaces"> = await ctx.runMutation(
+          internal.models.thoughts.private.resolvePersonalSpaceForTrustedAction,
+          { userId },
+        );
+        const embeddingTarget: {
+          embeddingGenerationId: Id<"embeddingGenerations">;
+          fingerprint: string;
+        } = await ctx.runMutation(
+          internal.models.thoughts.private
+            .resolveOrBootstrapCaptureEmbeddingTargetForAction,
+          {
+            principal: { userId },
+            spaceId,
+            fingerprint: configuration.fingerprint,
+            profile: configuration.profile,
+            now: Date.now(),
+          },
+        );
 
         for (const memory of account.memories) {
-          const embedding: number[] = await ctx.runAction(
-            internal.models.thoughts.helpers.generateEmbedding,
-            { text: memory.content },
-          );
+          const embeddingResult: { vector: number[]; fingerprint: string } =
+            await ctx.runAction(
+              internal.models.thoughts.helpers.generateEmbeddingWithMetadata,
+              { text: memory.content },
+            );
+          if (embeddingResult.fingerprint !== embeddingTarget.fingerprint) {
+            throw new Error(
+              "Embedding configuration changed during recall evaluation",
+            );
+          }
           const shared = {
             content: memory.content,
-            embedding,
+            embedding: embeddingResult.vector,
+            embeddingGenerationId: embeddingTarget.embeddingGenerationId,
+            embeddingFingerprint: embeddingTarget.fingerprint,
             metadata: seedMetadata(memory),
             userId,
             validFrom: parseValidity(memory.validFrom),

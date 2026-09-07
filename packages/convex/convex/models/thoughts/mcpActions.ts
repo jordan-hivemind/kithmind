@@ -5,7 +5,12 @@ import { v, type Infer } from "convex/values";
 import { requireMcpPrincipal } from "../../lib/mcpAuth";
 import { principalRef } from "../../lib/spaces";
 import type { MemoryStatus } from "./memoryLifecycle";
-import { memorySourceType, memoryStatus, thoughtMetadata } from "./validators";
+import {
+  memorySourceType,
+  memoryStatus,
+  thoughtMetadata,
+  vectorStatus,
+} from "./validators";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const internal = _internal as any;
@@ -79,45 +84,61 @@ export const capture = action({
   },
 });
 
-export const search = action({
-  args: {
-    query: v.string(),
-    type: v.optional(
-      v.union(
-        v.literal("decision"),
-        v.literal("person_note"),
-        v.literal("idea"),
-        v.literal("meeting_note"),
-        v.literal("task"),
-        v.literal("reference"),
-      ),
+const searchArgs = {
+  query: v.string(),
+  type: v.optional(
+    v.union(
+      v.literal("decision"),
+      v.literal("person_note"),
+      v.literal("idea"),
+      v.literal("meeting_note"),
+      v.literal("task"),
+      v.literal("reference"),
     ),
-    limit: v.optional(v.number()),
-    includeHistorical: v.optional(v.boolean()),
-    spaceIds: v.optional(v.array(v.id("spaces"))),
-  },
-  returns: v.array(
-    v.object({
-      _id: v.id("thoughts"),
-      summary: v.string(),
-      snippet: v.string(),
-      type: v.string(),
-      topics: v.array(v.string()),
-      userId: v.id("users"),
-      spaceId: v.id("spaces"),
-      score: v.float64(),
-      createdAt: v.number(),
-      memoryStatus,
-      isCore: v.optional(v.boolean()),
-      validFrom: v.optional(v.number()),
-      validTo: v.optional(v.number()),
-      supersededAt: v.optional(v.number()),
-      changeReason: v.optional(v.string()),
-    }),
   ),
-  handler: async (ctx, args) => {
-    const principal = await requireMcpPrincipal(ctx);
-    const hits: Array<{
+  limit: v.optional(v.number()),
+  includeHistorical: v.optional(v.boolean()),
+  spaceIds: v.optional(v.array(v.id("spaces"))),
+};
+
+const searchResult = v.object({
+  _id: v.id("thoughts"),
+  summary: v.string(),
+  snippet: v.string(),
+  type: v.string(),
+  topics: v.array(v.string()),
+  userId: v.id("users"),
+  spaceId: v.id("spaces"),
+  score: v.float64(),
+  createdAt: v.number(),
+  memoryStatus,
+  isCore: v.optional(v.boolean()),
+  validFrom: v.optional(v.number()),
+  validTo: v.optional(v.number()),
+  supersededAt: v.optional(v.number()),
+  changeReason: v.optional(v.string()),
+});
+
+async function runSearch(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  ctx: any,
+  args: {
+    query: string;
+    type?:
+      | "decision"
+      | "person_note"
+      | "idea"
+      | "meeting_note"
+      | "task"
+      | "reference";
+    limit?: number;
+    includeHistorical?: boolean;
+    spaceIds?: Array<Id<"spaces">>;
+  },
+) {
+  const principal = await requireMcpPrincipal(ctx);
+  const response: {
+    results: Array<{
       _id: Id<"thoughts">;
       content: string;
       metadata: Infer<typeof thoughtMetadata>;
@@ -131,16 +152,22 @@ export const search = action({
       validTo?: number;
       supersededAt?: number;
       changeReason?: string;
-    }> = await ctx.runAction(internal.models.thoughts.actions.hybridSearch, {
+    }>;
+    vectorStatus: "ready" | "unavailable";
+  } = await ctx.runAction(
+    internal.models.thoughts.actions.hybridSearchWithStatus,
+    {
       principal: principalRef(principal),
       spaceIds: args.spaceIds,
       query: args.query,
       type: args.type,
       limit: args.limit,
       includeHistorical: args.includeHistorical,
-    });
+    },
+  );
 
-    return hits.map((h) => ({
+  return {
+    results: response.results.map((h) => ({
       _id: h._id,
       summary: h.metadata.summary,
       snippet: truncateSnippet(h.content),
@@ -156,8 +183,25 @@ export const search = action({
       validTo: h.validTo,
       supersededAt: h.supersededAt,
       changeReason: h.changeReason,
-    }));
-  },
+    })),
+    vectorStatus: response.vectorStatus,
+  };
+}
+
+export const searchWithStatus = action({
+  args: searchArgs,
+  returns: v.object({
+    results: v.array(searchResult),
+    vectorStatus,
+  }),
+  handler: runSearch,
+});
+
+/** Legacy array result retained for older MCP clients. */
+export const search = action({
+  args: searchArgs,
+  returns: v.array(searchResult),
+  handler: async (ctx, args) => (await runSearch(ctx, args)).results,
 });
 
 export const getByIds = action({
