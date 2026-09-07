@@ -105,4 +105,4 @@ connectors, polling, URL fetching, OCR, model extraction, or bulk backfill.
 
 OAuth consent creates a temporary grant. It becomes an active credential only after the client exchanges the authorization code. Unfinished grants expire after five minutes. Repeating the same pending consent returns the same code; reusing a consumed code is rejected and revokes its associated credential. Start a fresh authorization if a token response was lost.
 
-Settings shows active keys in pages of 25. Use **Load more** to reach older keys; every loaded key can be revoked. Pending grants are not active keys and do not appear in this list. See the [OAuth lifecycle contract](plans/2026-09-07-oauth-lifecycle.md) for limits and deployment behavior.
+Settings shows active keys in pages of 25. Use **Load more** to reach additional keys; every loaded key can be revoked. Pending grants are not active keys and do not appear in this list. See the [OAuth lifecycle contract](plans/2026-09-07-oauth-lifecycle.md) for limits and deployment behavior.
