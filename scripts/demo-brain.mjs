@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 const REQUEST_TIMEOUT_MS = 30_000;
 const MAX_RESPONSE_BYTES = 512 * 1024;
@@ -319,7 +322,19 @@ export async function runDemo({
   return { documentIds };
 }
 
-if (import.meta.url === new URL(process.argv[1], "file:").href) {
+function isDirectInvocation() {
+  if (!process.argv[1]) return false;
+  try {
+    return (
+      realpathSync(process.argv[1]) ===
+      realpathSync(fileURLToPath(import.meta.url))
+    );
+  } catch {
+    return false;
+  }
+}
+
+if (isDirectInvocation()) {
   runDemo().catch((error) => {
     process.stderr.write(
       `${error instanceof DemoError ? error.message : "demo: failed"}\n`,

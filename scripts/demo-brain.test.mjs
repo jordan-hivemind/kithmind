@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { loadConfig, runDemo } from "./demo-brain.mjs";
 
@@ -9,6 +14,36 @@ const environment = {
   KITHMIND_SPACE_ID: "space-id",
   KITHMIND_SOURCE_ACCOUNT_ID: "desktop-capture",
 };
+
+const demoScript = fileURLToPath(new URL("./demo-brain.mjs", import.meta.url));
+
+function runDemoCli(script) {
+  return spawnSync(process.execPath, [script], {
+    encoding: "utf8",
+    env: {},
+  });
+}
+
+test("direct CLI invocation reports missing configuration", () => {
+  const result = runDemoCli(demoScript);
+  assert.notEqual(result.status, 0);
+  assert.equal(result.stdout, "");
+  assert.equal(result.stderr, "demo: configuration invalid\n");
+});
+
+test("symlink CLI invocation runs instead of silently exiting", () => {
+  const directory = mkdtempSync(join(tmpdir(), "kithmind-demo-"));
+  const link = join(directory, "demo-brain.mjs");
+  try {
+    symlinkSync(realpathSync(demoScript), link);
+    const result = runDemoCli(link);
+    assert.notEqual(result.status, 0);
+    assert.equal(result.stdout, "");
+    assert.equal(result.stderr, "demo: configuration invalid\n");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 function json(value) {
   return new Response(JSON.stringify(value), {
