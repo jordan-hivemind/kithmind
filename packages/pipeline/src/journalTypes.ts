@@ -47,6 +47,31 @@ export type PendingRequest<R extends JsonValue> = {
 
 export type JournalCredentialStatus = "current" | "changed_quiescent";
 
+export type JournalInspection =
+  | { state: "not_initialized" }
+  | { state: "contended" }
+  | {
+      state: "safe";
+      activity: "idle" | "scan" | "processing" | "assessment" | "terminal";
+      pending: boolean;
+      cachedResult: boolean;
+      credentialSessionActive: boolean;
+      credentialBinding:
+        "current" | "changed_quiescent" | "changed_active" | "unverified";
+      recoveryArtifactCount: number;
+      manualRecoveryRequired: boolean;
+    }
+  | {
+      state: "unsafe";
+      code:
+        | "unsupported_platform"
+        | "invalid_directory"
+        | "invalid_permissions"
+        | "invalid_state"
+        | "binding_mismatch"
+        | "capacity_exceeded";
+    };
+
 export type JournalCodec<C extends JsonValue, R extends JsonValue> = {
   parseCheckpoint(value: unknown): C;
   parseResult(operation: JournalOperation, value: unknown): R;

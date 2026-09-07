@@ -43,6 +43,8 @@ start with a letter or digit, and are at most 64 characters. Aliases must be
 unique. Keep the same alias when restarting a source.
 
 Keep the configuration, credentials, and journal outside this repository.
+The configuration must be a regular UTF-8 JSON file no larger than 64 KiB.
+A symlink at the configuration path is rejected.
 Configuration names the environment variable containing the API key; it does
 not contain the key itself. The journal can temporarily contain file text,
 paths, and lease tokens needed to retry an interrupted request. Treat it as
@@ -60,6 +62,10 @@ the reusable API key is not persisted. Changing a key while a request or lease
 is unresolved stops recovery. Revoking an original actor also prevents its
 unfinished cloud work from publishing. Full operator-authorized credential
 recovery remains part of P2-4.
+
+Check the configuration with [worker diagnostics](worker-doctor.md) before
+starting a pass. [Optional user-service recipes](worker-service.md) describe
+foreground polling under a service manager.
 
 ## Run a synthetic folder
 
@@ -97,8 +103,8 @@ A lock conflict stops a second worker; it does not steal another process's
 journal. Use one canonical gateway URL consistently. This local lock does not
 coordinate different hosts; the server independently fences scans and leases.
 
-Foreground polling is not a system service or cloud monitor. Installation as
-an unattended service and alerts for a stopped host remain separate work.
+Foreground polling is not a system service or cloud monitor. Optional user-service recipes cover local process supervision. Cloud
+alerts for a stopped host remain separate work.
 The initial default waits five minutes between completed passes. Set
 `watchIntervalMs` in local configuration to change that interval. Passes do not
 overlap; this is a configurable starting point, not a measured latency target.

@@ -6,6 +6,7 @@ import {
 } from "node:crypto";
 import { constants, type Stats } from "node:fs";
 import {
+  access,
   lstat,
   mkdir,
   open,
@@ -15,7 +16,7 @@ import {
   unlink,
 } from "node:fs/promises";
 import { createServer, type Server } from "node:net";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 import {
   JOURNAL_OPERATIONS,
@@ -23,6 +24,7 @@ import {
   type JournalBinding,
   type JournalCodec,
   type JournalCredentialStatus,
+  type JournalInspection,
   type JournalOperation,
   type JsonValue,
   type PendingRequest,
@@ -549,6 +551,417 @@ async function closeServers(servers: readonly Server[]): Promise<void> {
   if (results.some((result) => result.status === "rejected"))
     fail("journal locks could not be released");
 }
+
+type InspectionUnsafeCode = Extract<
+  JournalInspection,
+  { state: "unsafe" }
+>["code"];
+
+class InspectionFailure extends Error {
+  constructor(readonly code: InspectionUnsafeCode) {
+    super("Journal inspection failed");
+  }
+}
+
+function inspectionFailure(code: InspectionUnsafeCode): never {
+  throw new InspectionFailure(code);
+}
+
+function requireInspectionDirectory(stats: Stats): void {
+  if (stats.isSymbolicLink() || !stats.isDirectory()) {
+    inspectionFailure("invalid_directory");
+  }
+  const uid = process.getuid?.();
+  if (uid === undefined) inspectionFailure("unsupported_platform");
+  if (stats.uid !== uid || (stats.mode & 0o777) !== DIRECTORY_MODE) {
+    inspectionFailure("invalid_permissions");
+  }
+}
+
+function requireInspectionFile(stats: Stats): void {
+  if (stats.isSymbolicLink() || !stats.isFile()) {
+    inspectionFailure("invalid_state");
+  }
+  const uid = process.getuid?.();
+  if (uid === undefined) inspectionFailure("unsupported_platform");
+  if (stats.uid !== uid || (stats.mode & 0o777) !== FILE_MODE) {
+    inspectionFailure("invalid_permissions");
+  }
+}
+
+async function requireCreatableJournalParent(path: string): Promise<void> {
+  if (
+    typeof constants.W_OK !== "number" ||
+    typeof constants.X_OK !== "number"
+  ) {
+    inspectionFailure("unsupported_platform");
+  }
+  let candidate = path;
+  for (let inspected = 0; inspected < 256; inspected += 1) {
+    if (Buffer.byteLength(candidate, "utf8") > 8_192) {
+      inspectionFailure("capacity_exceeded");
+    }
+    try {
+      const entry = await lstat(candidate);
+      let canonical: string;
+      try {
+        canonical = await realpath(candidate);
+      } catch {
+        inspectionFailure("invalid_directory");
+      }
+      let canonicalEntry: Stats;
+      try {
+        canonicalEntry = await lstat(canonical);
+      } catch {
+        inspectionFailure("invalid_directory");
+      }
+      if (
+        (!entry.isDirectory() && !entry.isSymbolicLink()) ||
+        !canonicalEntry.isDirectory() ||
+        canonicalEntry.isSymbolicLink()
+      ) {
+        inspectionFailure("invalid_directory");
+      }
+      try {
+        await access(canonical, constants.W_OK | constants.X_OK);
+      } catch {
+        inspectionFailure("invalid_permissions");
+      }
+      return;
+    } catch (error) {
+      if (error instanceof InspectionFailure) throw error;
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        inspectionFailure(
+          (error as NodeJS.ErrnoException).code === "EACCES"
+            ? "invalid_permissions"
+            : "invalid_directory",
+        );
+      }
+    }
+    const parent = dirname(candidate);
+    if (parent === candidate) inspectionFailure("invalid_directory");
+    candidate = parent;
+  }
+  inspectionFailure("capacity_exceeded");
+}
+
+async function requireStableInspectionDirectory(
+  requestedDirectory: string,
+  directory: string,
+  identity: Pick<Stats, "dev" | "ino">,
+): Promise<void> {
+  try {
+    const requestedStats = await lstat(requestedDirectory);
+    requireInspectionDirectory(requestedStats);
+    if ((await realpath(requestedDirectory)) !== directory) {
+      inspectionFailure("invalid_directory");
+    }
+    const currentStats = await lstat(directory);
+    requireInspectionDirectory(currentStats);
+    if (
+      requestedStats.dev !== identity.dev ||
+      requestedStats.ino !== identity.ino ||
+      currentStats.dev !== identity.dev ||
+      currentStats.ino !== identity.ino
+    ) {
+      inspectionFailure("invalid_directory");
+    }
+  } catch (error) {
+    if (error instanceof InspectionFailure) throw error;
+    inspectionFailure("invalid_directory");
+  }
+}
+
+function inspectionActivity(
+  value: JsonValue,
+): Extract<JournalInspection, { state: "safe" }>["activity"] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    inspectionFailure("invalid_state");
+  }
+  const phase = (value as Record<string, JsonValue>).phase;
+  if (phase === "idle") return "idle";
+  if (phase === "terminal") return "terminal";
+  if (
+    phase === "scan_begin" ||
+    phase === "inventory" ||
+    phase === "append" ||
+    phase === "seal_check" ||
+    phase === "seal" ||
+    phase === "reconcile" ||
+    phase === "discovery_reserve" ||
+    phase === "discovery_admit"
+  ) {
+    return "scan";
+  }
+  if (
+    phase === "jobs_reserve" ||
+    phase === "jobs_renew" ||
+    phase === "jobs_stage" ||
+    phase === "jobs_activate" ||
+    phase === "jobs_fail"
+  ) {
+    return "processing";
+  }
+  if (
+    phase === "assess_status" ||
+    phase === "assess_begin" ||
+    phase === "assess_page"
+  ) {
+    return "assessment";
+  }
+  inspectionFailure("invalid_state");
+}
+
+function manualRecoveryRequired(value: JsonValue): boolean {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    value.phase === "terminal" &&
+    value.code === "request_conflict"
+  );
+}
+
+async function inspectDirectoryEntries(directory: string): Promise<number> {
+  let inspected = 0;
+  let recoveryArtifactCount = 0;
+  let entries: Awaited<ReturnType<typeof opendir>>;
+  try {
+    entries = await opendir(directory);
+  } catch {
+    inspectionFailure("invalid_directory");
+  }
+  try {
+    for await (const entry of entries) {
+      inspected += 1;
+      if (inspected > 64) inspectionFailure("capacity_exceeded");
+      if (entry.name !== STATE_FILE && !TEMP_FILE.test(entry.name)) continue;
+      let stats: Stats;
+      try {
+        stats = await lstat(join(directory, entry.name));
+      } catch {
+        inspectionFailure("invalid_state");
+      }
+      requireInspectionFile(stats);
+      if (entry.name !== STATE_FILE) recoveryArtifactCount += 1;
+    }
+  } finally {
+    await entries.close().catch(() => undefined);
+  }
+  return recoveryArtifactCount;
+}
+
+async function inspectExistingJournal<C extends JsonValue, R extends JsonValue>(
+  requestedDirectory: string,
+  binding: JournalBinding,
+  codec: JournalCodec<C, R>,
+  credentialForComparison: string | undefined,
+): Promise<JournalInspection> {
+  let locks: Server[] = [];
+  let result: JournalInspection;
+  try {
+    let requestedStats: Stats;
+    try {
+      requestedStats = await lstat(requestedDirectory);
+    } catch {
+      inspectionFailure("invalid_directory");
+    }
+    requireInspectionDirectory(requestedStats);
+    let directory: string;
+    try {
+      directory = await realpath(requestedDirectory);
+    } catch {
+      inspectionFailure("invalid_directory");
+    }
+    let directoryStats: Stats;
+    try {
+      directoryStats = await lstat(directory);
+    } catch {
+      inspectionFailure("invalid_directory");
+    }
+    requireInspectionDirectory(directoryStats);
+    const directoryIdentity = {
+      dev: directoryStats.dev,
+      ino: directoryStats.ino,
+    };
+    try {
+      locks = await acquireLocks(binding, directory);
+    } catch (error) {
+      if (error instanceof JournalLockedError) return { state: "contended" };
+      throw error;
+    }
+    await requireStableInspectionDirectory(
+      requestedDirectory,
+      directory,
+      directoryIdentity,
+    );
+    const recoveryArtifactCount = await inspectDirectoryEntries(directory);
+    if (
+      typeof constants.O_NOFOLLOW !== "number" ||
+      typeof constants.O_NONBLOCK !== "number"
+    ) {
+      inspectionFailure("unsupported_platform");
+    }
+    let stored: unknown | undefined;
+    try {
+      stored = await readStoredState(join(directory, STATE_FILE));
+    } catch {
+      inspectionFailure("invalid_state");
+    }
+    if (stored === undefined) {
+      result = { state: "not_initialized" };
+    } else {
+      let parsed: ReturnType<typeof parseState<C, R>>;
+      try {
+        parsed = parseState(stored, codec);
+      } catch {
+        inspectionFailure("invalid_state");
+      }
+      if (!bindingEqual(parsed.state.binding, binding)) {
+        inspectionFailure("binding_mismatch");
+      }
+      let credentialBinding: Extract<
+        JournalInspection,
+        { state: "safe" }
+      >["credentialBinding"] = "unverified";
+      if (credentialForComparison !== undefined) {
+        let candidate: string;
+        try {
+          candidate = fingerprintCredential(
+            parsed.state.credentialSalt,
+            credentialForComparison,
+          );
+        } catch {
+          inspectionFailure("invalid_state");
+        }
+        if (fingerprintsEqual(parsed.state.credentialFingerprint, candidate)) {
+          credentialBinding = "current";
+        } else if (
+          parsed.state.pending !== undefined ||
+          parsed.state.credentialSessionActive
+        ) {
+          credentialBinding = "changed_active";
+        } else {
+          credentialBinding = "changed_quiescent";
+        }
+      }
+      result = {
+        state: "safe",
+        activity: inspectionActivity(parsed.checkpoint),
+        pending: parsed.state.pending !== undefined,
+        cachedResult: parsed.state.pending?.result !== undefined,
+        credentialSessionActive: parsed.state.credentialSessionActive,
+        credentialBinding,
+        recoveryArtifactCount,
+        manualRecoveryRequired: manualRecoveryRequired(parsed.checkpoint),
+      };
+    }
+    await requireStableInspectionDirectory(
+      requestedDirectory,
+      directory,
+      directoryIdentity,
+    );
+  } catch (error) {
+    result = {
+      state: "unsafe",
+      code: error instanceof InspectionFailure ? error.code : "invalid_state",
+    };
+  }
+  try {
+    await closeServers(locks);
+  } catch {
+    return { state: "unsafe", code: "invalid_state" };
+  }
+  return result!;
+}
+
+export async function inspectJournalReadOnly<
+  C extends JsonValue,
+  R extends JsonValue,
+>(args: {
+  directory: string;
+  binding: JournalBinding;
+  codec: JournalCodec<C, R>;
+  credentialForComparison?: string;
+}): Promise<JournalInspection> {
+  let binding: JournalBinding;
+  try {
+    binding = parseBinding(args.binding);
+  } catch {
+    return { state: "unsafe", code: "invalid_state" };
+  }
+  if (process.getuid?.() === undefined) {
+    return { state: "unsafe", code: "unsupported_platform" };
+  }
+  const requestedDirectory = resolve(args.directory);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      await lstat(requestedDirectory);
+      return await inspectExistingJournal(
+        requestedDirectory,
+        binding,
+        args.codec,
+        args.credentialForComparison,
+      );
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        return {
+          state: "unsafe",
+          code:
+            (error as NodeJS.ErrnoException).code === "EACCES"
+              ? "invalid_permissions"
+              : "invalid_directory",
+        };
+      }
+    }
+    let authorityLock: Server;
+    try {
+      authorityLock = await acquireLock(lockPort(authorityLockKey(binding)));
+    } catch (error) {
+      if (error instanceof JournalLockedError) return { state: "contended" };
+      return { state: "unsafe", code: "invalid_state" };
+    }
+    let appeared = false;
+    let missingResult: JournalInspection | undefined;
+    try {
+      try {
+        await lstat(requestedDirectory);
+        appeared = true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          missingResult = {
+            state: "unsafe",
+            code:
+              (error as NodeJS.ErrnoException).code === "EACCES"
+                ? "invalid_permissions"
+                : "invalid_directory",
+          };
+        }
+      }
+      if (!appeared && missingResult === undefined) {
+        try {
+          await requireCreatableJournalParent(requestedDirectory);
+          missingResult = { state: "not_initialized" };
+        } catch (error) {
+          missingResult = {
+            state: "unsafe",
+            code:
+              error instanceof InspectionFailure ? error.code : "invalid_state",
+          };
+        }
+      }
+    } finally {
+      try {
+        await closeServer(authorityLock);
+      } catch {
+        return { state: "unsafe", code: "invalid_state" };
+      }
+    }
+    if (!appeared) return missingResult!;
+  }
+  return { state: "unsafe", code: "invalid_directory" };
+}
+
 async function assertDirectoryIdentity(
   directory: string,
   expected: Pick<Stats, "dev" | "ino">,

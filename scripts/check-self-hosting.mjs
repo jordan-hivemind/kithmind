@@ -167,15 +167,32 @@ export function parseArguments(arguments_) {
     deployment: undefined,
     envFile: "apps/web/.env.local",
     profile: "full",
+    worker: false,
+    workerConfig: undefined,
+    json: false,
+  };
+  const seen = new Set();
+  const once = (name) => {
+    if (seen.has(name)) throw new Error(`Duplicate ${name} option`);
+    seen.add(name);
   };
 
   for (let index = 0; index < arguments_.length; index += 1) {
     const argument = arguments_[index];
-    if (argument === "--") continue;
-    else if (argument === "--web") options.web = true;
-    else if (argument === "--convex") options.convex = true;
-    else if (argument === "--prod") options.production = true;
-    else if (argument === "--profile") {
+    if (argument === "--") {
+      once("separator");
+      continue;
+    } else if (argument === "--web") {
+      once("--web");
+      options.web = true;
+    } else if (argument === "--convex") {
+      once("--convex");
+      options.convex = true;
+    } else if (argument === "--prod") {
+      once("--prod");
+      options.production = true;
+    } else if (argument === "--profile") {
+      once("--profile");
       const profile = arguments_[index + 1];
       index += 1;
       if (profile !== "core" && profile !== "full") {
@@ -183,21 +200,57 @@ export function parseArguments(arguments_) {
       }
       options.profile = profile;
     } else if (argument === "--deployment") {
+      once("--deployment");
       options.deployment = arguments_[index + 1];
       index += 1;
       if (!options.deployment) throw new Error("--deployment requires a name");
     } else if (argument === "--env-file" || argument === "--web-env-file") {
+      once("--web-env-file");
       options.envFile = arguments_[index + 1];
       index += 1;
       if (!options.envFile) throw new Error("--env-file requires a path");
+    } else if (argument === "--worker") {
+      once("--worker");
+      options.worker = true;
+    } else if (argument === "--config") {
+      once("--config");
+      options.workerConfig = arguments_[index + 1];
+      index += 1;
+      if (!options.workerConfig) throw new Error("--config requires a path");
+    } else if (argument === "--json") {
+      once("--json");
+      options.json = true;
     } else if (argument === "--help") {
+      once("--help");
       options.help = true;
     } else {
-      throw new Error(`Unknown option: ${argument}`);
+      throw new Error("Unknown option");
     }
   }
 
-  if (!options.web && !options.convex) options.web = true;
+  if (!options.web && !options.convex && !options.worker) options.web = true;
+  if (
+    options.worker &&
+    (options.web ||
+      options.convex ||
+      options.production ||
+      options.deployment !== undefined ||
+      seen.has("--profile") ||
+      seen.has("--web-env-file"))
+  ) {
+    throw new Error(
+      "Worker diagnostics cannot be combined with operator checks",
+    );
+  }
+  if (!options.worker && options.workerConfig !== undefined) {
+    throw new Error("--config requires --worker");
+  }
+  if (!options.worker && options.json) {
+    throw new Error("--json requires --worker");
+  }
+  if (options.help && seen.size !== 1) {
+    throw new Error("--help cannot be combined with other options");
+  }
   if (options.production && options.deployment) {
     throw new Error("Use either --prod or --deployment, not both");
   }
@@ -257,6 +310,8 @@ function printHelp() {
       "--prod                Inspect the default production deployment",
       "--deployment NAME     Inspect a specific Convex deployment",
       "--profile PROFILE     Validate core or full requirements (default: full)",
+      "--worker --config PATH Run the scoped pipeline doctor only",
+      "--json                Emit the worker doctor JSON unchanged",
     ].join("\n") + "\n",
   );
 }
@@ -301,6 +356,30 @@ if (invokedDirectly) {
     const options = parseArguments(process.argv.slice(2));
     if (options.help) {
       printHelp();
+    } else if (options.worker) {
+      if (!options.workerConfig) {
+        throw new Error("--worker requires --config PATH");
+      }
+      const workerArguments = [
+        "packages/pipeline/dist/cli.js",
+        "doctor",
+        "--config",
+        options.workerConfig,
+        ...(options.json ? ["--json"] : []),
+      ];
+      const worker = spawnSync(process.execPath, workerArguments, {
+        cwd: fileURLToPath(new URL("..", import.meta.url)),
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      if (worker.status === null) {
+        throw new Error("Worker doctor could not start");
+      }
+      process.stdout.write(worker.stdout);
+      if (worker.status !== 0) {
+        process.stderr.write("Worker doctor failed\n");
+        process.exitCode = worker.status;
+      }
     } else {
       process.stdout.write(`profile: ${options.profile}\n`);
       if (options.profile === "core") {

@@ -1,10 +1,15 @@
+import { createHash } from "node:crypto";
+import { constants } from "node:fs";
+import { open } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import type { PipelineConfig, RootConfig } from "./types.js";
+import type { JournalBinding } from "./journalTypes.js";
 
 const ROOT_ALIAS = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const ID = /^[A-Za-z0-9_-]{1,256}$/;
 const ENV = /^[A-Z_][A-Z0-9_]{0,127}$/;
+const MAX_CONFIG_BYTES = 64 * 1024;
 
 function fail(message: string): never {
   throw new Error(`Invalid pipeline config: ${message}`);
@@ -145,6 +150,53 @@ export function parseConfig(value: unknown): PipelineConfig {
   };
 }
 
+export async function loadPipelineConfig(
+  path: string,
+): Promise<PipelineConfig> {
+  const handle = await open(
+    path,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  );
+  try {
+    const entry = await handle.stat();
+    if (!entry.isFile()) fail("configuration must be a regular file");
+    const bytes = Buffer.alloc(MAX_CONFIG_BYTES + 1);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const read = await handle.read(
+        bytes,
+        offset,
+        bytes.length - offset,
+        offset,
+      );
+      if (read.bytesRead === 0) break;
+      offset += read.bytesRead;
+    }
+    if (offset > MAX_CONFIG_BYTES) fail("configuration is too large");
+    let text: string;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(
+        bytes.subarray(0, offset),
+      );
+    } catch {
+      fail("configuration must be UTF-8");
+    }
+    try {
+      return parseConfig(JSON.parse(text));
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message.startsWith("Invalid pipeline config:")
+      ) {
+        throw error;
+      }
+      fail("configuration must be JSON");
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
 export function requireCredential(config: PipelineConfig): string {
   const credential = process.env[config.credentialEnv];
   if (
@@ -154,4 +206,27 @@ export function requireCredential(config: PipelineConfig): string {
   )
     throw new Error("Worker credential is unavailable");
   return credential;
+}
+
+export function journalBindingForConfig(
+  config: PipelineConfig,
+): JournalBinding {
+  const configFingerprint = createHash("sha256")
+    .update(
+      JSON.stringify({
+        endpoint: config.endpoint,
+        spaceId: config.spaceId,
+        sourceAccountId: config.sourceAccountId,
+        roots: config.roots,
+      }),
+    )
+    .digest("hex");
+  return {
+    protocolVersion: 1,
+    endpoint: config.endpoint,
+    spaceId: config.spaceId,
+    sourceAccountId: config.sourceAccountId,
+    configFingerprint,
+    credentialSlot: config.credentialEnv,
+  };
 }
