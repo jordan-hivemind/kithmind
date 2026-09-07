@@ -473,8 +473,8 @@ describe("document reads", () => {
 
     expect(embeddingFetches).toBe(0);
     expect(result.vectorStatus).toBe("unavailable");
-    expect(result.results.map((row) => row.documentId)).toEqual([
-      visible.documentId,
+    expect(result.results).toEqual([
+      expect.objectContaining({ documentId: visible.documentId }),
     ]);
   });
 });
