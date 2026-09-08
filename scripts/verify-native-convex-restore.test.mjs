@@ -57,7 +57,7 @@ function privateTemporaryDirectory(prefix) {
   return directory;
 }
 
-function syntheticZip(path, values) {
+function syntheticZip(path, values, { zip64 = false } = {}) {
   const localParts = [];
   const centralParts = [];
   let localOffset = 0;
@@ -78,30 +78,56 @@ function syntheticZip(path, values) {
     local.writeUInt16LE(nameBytes.length, 26);
     localParts.push(local, nameBytes, compressed);
 
+    const zip64Extra = zip64 ? Buffer.alloc(28) : Buffer.alloc(0);
+    if (zip64) {
+      zip64Extra.writeUInt16LE(0x0001, 0);
+      zip64Extra.writeUInt16LE(24, 2);
+      zip64Extra.writeBigUInt64LE(BigInt(value.length), 4);
+      zip64Extra.writeBigUInt64LE(BigInt(compressed.length), 12);
+      zip64Extra.writeBigUInt64LE(BigInt(localOffset), 20);
+    }
     const central = Buffer.alloc(46);
     central.writeUInt32LE(0x02014b50, 0);
     central.writeUInt16LE(20, 4);
-    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(zip64 ? 46 : 20, 6);
     central.writeUInt16LE(0x0800, 8);
     central.writeUInt16LE(method, 10);
     central.writeUInt32LE(checksum, 16);
-    central.writeUInt32LE(compressed.length, 20);
-    central.writeUInt32LE(value.length, 24);
+    central.writeUInt32LE(zip64 ? 0xffffffff : compressed.length, 20);
+    central.writeUInt32LE(zip64 ? 0xffffffff : value.length, 24);
     central.writeUInt16LE(nameBytes.length, 28);
-    central.writeUInt32LE(localOffset, 42);
-    centralParts.push(central, nameBytes);
+    central.writeUInt16LE(zip64Extra.length, 30);
+    central.writeUInt32LE(zip64 ? 0xffffffff : localOffset, 42);
+    centralParts.push(central, nameBytes, zip64Extra);
     localOffset += local.length + nameBytes.length + compressed.length;
   }
   const centralBytes = Buffer.concat(centralParts);
+  const zip64End = Buffer.alloc(zip64 ? 56 : 0);
+  const zip64Locator = Buffer.alloc(zip64 ? 20 : 0);
+  if (zip64) {
+    zip64End.writeUInt32LE(0x06064b50, 0);
+    zip64End.writeBigUInt64LE(44n, 4);
+    zip64End.writeUInt16LE(831, 12);
+    zip64End.writeUInt16LE(46, 14);
+    zip64End.writeBigUInt64LE(BigInt(values.length), 24);
+    zip64End.writeBigUInt64LE(BigInt(values.length), 32);
+    zip64End.writeBigUInt64LE(BigInt(centralBytes.length), 40);
+    zip64End.writeBigUInt64LE(BigInt(localOffset), 48);
+    zip64Locator.writeUInt32LE(0x07064b50, 0);
+    zip64Locator.writeBigUInt64LE(BigInt(localOffset + centralBytes.length), 8);
+    zip64Locator.writeUInt32LE(1, 16);
+  }
   const end = Buffer.alloc(22);
   end.writeUInt32LE(0x06054b50, 0);
   end.writeUInt16LE(values.length, 8);
   end.writeUInt16LE(values.length, 10);
   end.writeUInt32LE(centralBytes.length, 12);
   end.writeUInt32LE(localOffset, 16);
-  writeFileSync(path, Buffer.concat([...localParts, centralBytes, end]), {
-    mode: 0o600,
-  });
+  writeFileSync(
+    path,
+    Buffer.concat([...localParts, centralBytes, zip64End, zip64Locator, end]),
+    { mode: 0o600 },
+  );
 }
 
 function validArguments() {
@@ -299,7 +325,7 @@ test("backend spawn errors become a bounded startup failure", async () => {
   });
 });
 
-test("snapshot comparison preserves application rows by ID, storage metadata, and file bytes", () => {
+test("native-style small ZIP64 snapshots preserve rows, storage metadata, and file bytes", () => {
   const root = privateTemporaryDirectory("kithmind-roundtrip-");
   const source = join(root, "source.zip");
   const restored = join(root, "restored.zip");
@@ -315,18 +341,22 @@ test("snapshot comparison preserves application rows by ID, storage metadata, an
   ];
   try {
     sourceEntries[0].push("deflate");
-    syntheticZip(source, sourceEntries);
-    syntheticZip(restored, [
+    syntheticZip(source, sourceEntries, { zip64: true });
+    syntheticZip(
+      restored,
       [
-        "users/documents.jsonl",
-        '{"_id":"user-b","name":"βeta"}\n{"_id":"user-a","name":"alpha"}\n',
-        "deflate",
+        [
+          "users/documents.jsonl",
+          '{"_id":"user-b","name":"βeta"}\n{"_id":"user-a","name":"alpha"}\n',
+          "deflate",
+        ],
+        ["_storage/documents.jsonl", '{"_id":"storage-a","size":4}\n'],
+        ["_storage/storage-a", Buffer.from([0, 1, 2, 255])],
+        ["generated_schema.jsonl", '{"schema":"synthetic"}\n'],
+        ["_tables/documents.jsonl", '{"_id":"system-b","name":"after"}\n'],
       ],
-      ["_storage/documents.jsonl", '{"_id":"storage-a","size":4}\n'],
-      ["_storage/storage-a", Buffer.from([0, 1, 2, 255])],
-      ["generated_schema.jsonl", '{"schema":"synthetic"}\n'],
-      ["_tables/documents.jsonl", '{"_id":"system-b","name":"after"}\n'],
-    ]);
+      { zip64: true },
+    );
     assert.deepEqual(compareSnapshotArchives(source, restored), {
       entriesInInventory: 5,
       tablesCompared: 2,
