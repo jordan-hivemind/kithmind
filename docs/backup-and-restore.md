@@ -7,18 +7,19 @@ the hosted database and optional Convex file storage. The filesystem worker's
 encrypted archives, journal, catalog, configuration, and keys are external to
 that snapshot and require their own protected backup.
 
-The final synthetic document-Q&A drill preserved the exact 64-table schema and
-all 219 exported rows, including table inventory. Offline checks verified the
-current document, its historical version, exact citations, and a completed
-forget tombstone. All twelve original/parser archive copies decrypted
+The final synthetic document-Q&A drill preserved the current schema: 67
+application tables, 69 document files, and 247 exported rows, including table
+inventory, with zero differences. Offline checks verified current and
+historical citations, a completed forget tombstone, one watcher, one resolved
+incident, and two reset receipts. All twelve original/parser archive copies decrypted
 successfully, including a separate six-copy backup restore with the source and
 primary archive unavailable. The backend had no application functions and was
 stopped after comparison.
 
-This was a macOS synthetic drill. Its mounted backup filesystem was on the
-same computer, so hardware-loss protection and owner key recovery remain to be
-established. It does not establish a turnkey relocated-worker recovery or
-authorize exposing a restored service.
+This was a macOS synthetic drill. Its mounted backup filesystem was on the same
+computer, so an owner backup independent of the source computer and key escrow
+remain to be established. It does not establish a turnkey relocated-worker
+recovery or authorize exposing a restored service.
 
 ## Recovery sets
 
