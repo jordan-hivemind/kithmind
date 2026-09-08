@@ -23,6 +23,12 @@
 // under concurrent acquisition. A 2+2 hex fan-out (65536 buckets) keeps any
 // one directory small at tens of thousands of documents, which stays fine
 // for a person to browse by hand.
+//
+// Each raw document also gets a `.manifest.json` sidecar next to its bytes
+// (see "self-describing manifest sidecar" below): the raw tree has to be
+// identifiable on its own, with no working archive database, because the
+// database is derived data and the raw tree is the one thing ground rule 1
+// says can never be reconstructed by re-acquiring it.
 
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -34,6 +40,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
+
+import type { AcquisitionGap, CapabilityTier } from "./adapter.js";
 
 const RAW_TREE_ROOT_ENV = "FINANCE_ARCHIVE_RAW_TREE_ROOT";
 
@@ -179,4 +187,84 @@ export function writeRetainedText(
   text: string,
 ): RawTreeWriteResult {
   return writeContentAddressed(root, "text", Buffer.from(text, "utf8"), ".txt");
+}
+
+// --- self-describing manifest sidecar --------------------------------------
+// Ground rule 1 does not stop at "raw files are immutable": "all structured
+// data is derived and can be rebuilt from scratch." The archive database is
+// structured data -- lose it, and a directory of extension-less files named
+// by hash is unlabelled unless the raw tree itself says what each one is.
+// This sidecar is that label, written into the raw tree next to the bytes it
+// describes rather than only into the (derived, rebuildable) database.
+
+/** The acquisition manifest, persisted where a rebuild with no working
+ * archive database can still find it: enough to identify what a raw-tree
+ * document is and re-import it. */
+export type RawTreeDocumentManifest = {
+  readonly sha256: string;
+  /** The institution's stable slug (e.g. "thistlebrook-trust"), not the
+   * archive's internal institution row id -- that id means nothing once the
+   * database that minted it is gone. Doubles as the identity of the adapter
+   * that produced this document, since one adapter serves one institution. */
+  readonly institutionSlug: string;
+  /** Last four digits only, matching the privacy rule the database itself
+   * enforces (accounts.acct_last4); null when the account has none on file. */
+  readonly acctLast4: string | null;
+  readonly docType: string;
+  readonly periodStart: string;
+  readonly periodEnd: string;
+  readonly capturedAt: string;
+  readonly capabilityTier: CapabilityTier;
+  readonly gaps: readonly AcquisitionGap[];
+  /** Dot-prefixed (".pdf", ".csv"), when the source gave one. The raw bytes
+   * stay content-addressed and extension-less either way -- this is where a
+   * person or a rebuild learns what to call the file, not a rename target. */
+  readonly originalExtension: string | null;
+};
+
+export type ManifestWriteResult = {
+  readonly path: string;
+  readonly status: "written" | "already_exists";
+};
+
+/**
+ * Writes the sidecar manifest for one raw-tree document, at
+ * `<root>/documents/<sha[0:2]>/<sha[2:4]>/<sha256>.manifest.json`, right next
+ * to the bytes it describes. Write-once like the document itself -- the
+ * manifest is part of what was acquired, not something to revise later --
+ * but addressed by the *document's* hash rather than its own content, so
+ * unlike `writeRawDocument`/`writeRetainedText` above there is no hash to
+ * verify a pre-existing file against: the path already being occupied is the
+ * only check, and a repeat write for the same document is a no-op.
+ */
+export function writeRawDocumentManifest(
+  root: string,
+  manifest: RawTreeDocumentManifest,
+): ManifestWriteResult {
+  const finalPath = fanoutPath(root, "documents", manifest.sha256, ".manifest.json");
+  mkdirSync(dirname(finalPath), { recursive: true });
+  if (existsSync(finalPath)) {
+    return { path: finalPath, status: "already_exists" };
+  }
+
+  const bytes = Buffer.from(JSON.stringify(manifest, null, 2), "utf8");
+  const tmpPath = join(dirname(finalPath), `.tmp-${randomUUID()}`);
+  writeFileSync(tmpPath, bytes, { flag: "wx" });
+  try {
+    linkSync(tmpPath, finalPath);
+  } catch (error) {
+    rmSync(tmpPath, { force: true });
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      return { path: finalPath, status: "already_exists" };
+    }
+    throw error;
+  }
+  rmSync(tmpPath, { force: true });
+  return { path: finalPath, status: "written" };
+}
+
+/** Reads one document's manifest sidecar back. The whole point of this file
+ * existing: a rebuild that has lost the archive database still has this. */
+export function readRawDocumentManifest(path: string): RawTreeDocumentManifest {
+  return JSON.parse(readFileSync(path, "utf8")) as RawTreeDocumentManifest;
 }

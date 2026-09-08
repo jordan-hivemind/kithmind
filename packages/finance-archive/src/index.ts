@@ -82,14 +82,19 @@ export {
   persistAcquiredDocument,
   recordRetainedTextPath,
   resolveInstrumentId,
+  type AcquisitionDescriptor,
   type AdapterPull,
   type PersistedAcquisition,
 } from "./adapterImport.js";
 export {
   readAndVerify,
+  readRawDocumentManifest,
   resolveRawTreeRoot,
   sha256HexOf,
   writeRawDocument,
+  writeRawDocumentManifest,
   writeRetainedText,
+  type ManifestWriteResult,
+  type RawTreeDocumentManifest,
   type RawTreeWriteResult,
 } from "./rawTree.js";

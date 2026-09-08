@@ -9,7 +9,9 @@ import {
   createSyntheticSession,
   importBatch,
   openArchive,
+  persistAcquiredDocument,
   resolveInstrumentId,
+  sha256HexOf,
   syntheticAdapter,
 } from "../dist/index.js";
 
@@ -36,6 +38,14 @@ function archive(t) {
   return db;
 }
 
+/** A throwaway raw-tree root, removed when the test ends. AdapterPull.persisted
+ * can only be produced by actually persisting bytes through it (F1-18). */
+function rawRoot(t) {
+  const directory = mkdtempSync(join(tmpdir(), "kith-finance-adapter-import-raw-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  return directory;
+}
+
 function seed(db) {
   db.prepare("INSERT INTO institutions (id, name, slug) VALUES (?, ?, ?)").run(
     INSTITUTION.id,
@@ -46,6 +56,17 @@ function seed(db) {
     `INSERT INTO accounts (id, institution_id, acct_last4, display_name, base_currency)
      VALUES (?, ?, ?, ?, ?)`,
   ).run(ACCOUNT.id, INSTITUTION.id, ACCOUNT.last4, "Synthetic account", ACCOUNT.currency);
+}
+
+/** Persists an acquired pull's bytes for a test, the same way a real caller
+ * must, and returns the PersistedAcquisition to use as AdapterPull.persisted. */
+function persist(t, db, acquired, docType) {
+  return persistAcquiredDocument(db, rawRoot(t), {
+    institutionId: INSTITUTION.id,
+    accountId: ACCOUNT.id,
+    docType,
+    acquired,
+  });
 }
 
 async function acquireAndParseActivity(session) {
@@ -73,7 +94,7 @@ test("the synthetic adapter's paginated activity pull imports end to end and the
     rows,
     docType: "activity_pull",
     docDate: null,
-    filePath: "synthetic/thistlebrook-activity.json",
+    persisted: persist(t, db, acquired, "activity_pull"),
   });
   // One ImportDocument per page: the boundary the plan requires the
   // occurrence ordinal to respect, structural rather than lost in parse()'s
@@ -117,7 +138,7 @@ test("the same paginated overlap collapses through row_hash and occurrence alone
     rows: anonymizedRows,
     docType: "activity_pull",
     docDate: null,
-    filePath: "synthetic/thistlebrook-activity-no-ids.json",
+    persisted: persist(t, db, acquired, "activity_pull"),
   });
 
   const summary = importBatch(db, { source: INSTITUTION.slug, documents }, new Date("2025-05-01"));
@@ -159,7 +180,7 @@ test("a paginated pull with no provider ids at all and a wrong reported total is
         rows: anonymizedRows,
         docType: "activity_pull",
         docDate: null,
-        filePath: "synthetic/thistlebrook-activity-wrong-total.json",
+        persisted: persist(t, db, wrongTotal, "activity_pull"),
       }),
     /does not reconcile against the provider's total/,
   );
@@ -186,7 +207,7 @@ test("a paginated pull with no stated provider total at all is imported but leav
     rows: anonymizedRows,
     docType: "activity_pull",
     docDate: null,
-    filePath: "synthetic/thistlebrook-activity-no-total.json",
+    persisted: persist(t, db, noStatedTotal, "activity_pull"),
   });
 
   // Ground rule 7: nothing here may claim completeness with no total to
@@ -206,14 +227,15 @@ test("a paginated pull with no stated provider total at all is imported but leav
 test("two legitimately identical rows in one document, with no provider id, both survive", (t) => {
   const db = archive(t);
   seed(db);
+  const bytes = new TextEncoder().encode("synthetic tabular export bytes");
   const acquired = {
-    bytes: new Uint8Array(),
+    bytes,
     manifest: {
       kind: "tabular_export",
       periodStart: "2025-06-01",
       periodEnd: "2025-06-30",
       capturedAt: "2025-07-01T00:00:00.000Z",
-      contentHash: "f".repeat(64),
+      contentHash: sha256HexOf(bytes),
       reportedRowCount: null,
       gaps: [],
     },
@@ -248,7 +270,7 @@ test("two legitimately identical rows in one document, with no provider id, both
     rows,
     docType: "tabular_export",
     docDate: "2025-06-30",
-    filePath: "synthetic/thistlebrook-tabular.csv",
+    persisted: persist(t, db, acquired, "tabular_export"),
   });
   assert.equal(documents.length, 1, "no pagination on this tier: one document");
 
@@ -287,7 +309,7 @@ test("the deliberately garbled PDF statement amount lands in the review queue ca
     rows,
     docType: "pdf_statement",
     docDate: statement.periodEnd,
-    filePath: `synthetic/${statement.externalId}.txt`,
+    persisted: persist(t, db, acquired, "pdf_statement"),
   });
   assert.equal(importDocuments.length, 1);
 

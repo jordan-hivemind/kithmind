@@ -23,14 +23,23 @@ import { sha256Hex } from "./adapter.js";
 import { canonicalizeDecimal } from "./decimal.js";
 import type { ImportDocument, ImportRow } from "./importer.js";
 import { toMinorUnits } from "./money.js";
-import { type RawTreeWriteResult, writeRawDocument, writeRetainedText } from "./rawTree.js";
+import {
+  type ManifestWriteResult,
+  type RawTreeWriteResult,
+  writeRawDocument,
+  writeRawDocumentManifest,
+  writeRetainedText,
+} from "./rawTree.js";
 import { contentKey, rowHash } from "./rowHash.js";
 
 /**
  * One acquired-and-parsed pull, ready to become one or more `ImportDocument`s.
- * `filePath` is where the whole pull's raw bytes live (or will live) in the
- * raw tree; writing them there is the caller's job, same as the importer's
- * own `ImportDocument.filePath`.
+ * `persisted` is the raw tree's own record of where this pull's bytes (and
+ * any retained text) actually live -- the *only* way to get one is to call
+ * `persistAcquiredDocument` first, which is what makes it structurally
+ * impossible to build an `AdapterPull` around a `filePath` nothing ever
+ * wrote (this is exactly the bug F1-18 exists to fix; see
+ * `persistAcquiredDocument`'s doc comment below).
  */
 export type AdapterPull = {
   readonly institutionId: string;
@@ -39,7 +48,7 @@ export type AdapterPull = {
   readonly rows: readonly ParsedRow[];
   readonly docType: string;
   readonly docDate: string | null;
-  readonly filePath: string;
+  readonly persisted: PersistedAcquisition;
 };
 
 function insertReviewItem(
@@ -305,7 +314,9 @@ export function adapterPullToImportDocuments(
               `${pull.acquired.manifest.contentHash}:${sourceDocument}`,
             ),
           ),
-      filePath: single ? pull.filePath : `${pull.filePath}#${sourceDocument}`,
+      filePath: single
+        ? pull.persisted.filePath
+        : `${pull.persisted.filePath}#${sourceDocument}`,
       institutionId: pull.institutionId,
       accountId: pull.accountId,
       docType: pull.docType,
@@ -322,42 +333,77 @@ export function adapterPullToImportDocuments(
 // wrote them anywhere. This is the seam: the one place an adapter pull's raw
 // bytes (and, when the caller has retained it, the document's extracted
 // text) actually get written to the raw tree, before the pull becomes an
-// `AdapterPull.filePath`/`ImportDocument.filePath` that `importBatch` records
-// on the `documents` row. Self-contained -- it only calls into rawTree.ts and
-// does its own small, targeted write to `documents.text_path` -- so it does
-// not touch `importer.ts`'s insert statement or any other function in this
-// file.
+// `AdapterPull.persisted`/`ImportDocument.filePath` that `importBatch`
+// records on the `documents` row. `persistAcquiredDocument` is also the
+// *only* way to produce a `PersistedAcquisition`, which is in turn the only
+// way to fill in `AdapterPull.persisted` -- so a caller cannot build an
+// `AdapterPull` around an invented path, and cannot skip persisting bytes
+// that a document row then claims exist. Self-contained -- it only calls
+// into rawTree.ts and does its own small, targeted write to
+// `documents.text_path` -- so it does not touch `importer.ts`'s insert
+// statement or any other function in this file.
+
+/** Everything needed to persist one acquired document: enough for the raw
+ * tree's manifest sidecar to identify it without the archive database (see
+ * `RawTreeDocumentManifest`), on top of the acquired bytes themselves. */
+export type AcquisitionDescriptor = {
+  readonly institutionId: string;
+  readonly accountId: string;
+  readonly docType: string;
+  readonly acquired: AcquiredDocument;
+  /** Dot-prefixed (".pdf", ".csv"), when the source gave one. Recorded in
+   * the manifest only; the raw bytes stay content-addressed and
+   * extension-less either way. */
+  readonly originalExtension?: string | null;
+};
 
 /** What `persistAcquiredDocument` wrote and where, for the caller to use as
- * `AdapterPull.filePath` and, after import, as the argument to
+ * `AdapterPull.persisted` and, after import, as the argument to
  * `recordRetainedTextPath`. */
 export type PersistedAcquisition = {
   readonly filePath: string;
   readonly textPath: string | null;
+  readonly manifestPath: string;
   readonly documentWrite: RawTreeWriteResult;
   readonly textWrite: RawTreeWriteResult | null;
+  readonly manifestWrite: ManifestWriteResult;
 };
 
 /**
  * Persists one acquired document's raw bytes -- and, when supplied, its
- * retained extracted text -- to the raw tree rooted at `rawTreeRoot`.
- * Write-once: a re-acquisition of identical bytes reports
- * `status: "already_exists"` on `documentWrite`/`textWrite` rather than
- * rewriting or raising an error that would abort a run (requirement 1). See
- * `rawTree.ts` for how the write-once and hash-verification guarantees are
- * implemented.
+ * retained extracted text -- to the raw tree rooted at `rawTreeRoot`, along
+ * with a manifest sidecar recording what the document is (institution,
+ * account, document type, statement period, capture time, capability tier,
+ * gaps, original extension). The manifest is what makes ground rule 1's
+ * "can be rebuilt from scratch" true in practice: the archive database is
+ * derived data, so if it is ever lost, the raw tree still says what each
+ * file is well enough to re-import, instead of becoming an unlabelled pile
+ * of hashes.
+ *
+ * Write-once throughout: a re-acquisition of identical bytes reports
+ * `status: "already_exists"` on `documentWrite`/`textWrite`/`manifestWrite`
+ * rather than rewriting or raising an error that would abort a run
+ * (requirement 1). See `rawTree.ts` for how the write-once and
+ * hash-verification guarantees are implemented.
  *
  * Cross-checks the written sha256 against the adapter's own claimed
  * `acquired.manifest.contentHash`: an adapter that mis-hashed its own bytes
  * is exactly the kind of bug provenance exists to catch, not a reason to
  * store the bytes under a path some other code goes on to trust as if the
- * two hashes agreed.
+ * two hashes agreed. Institution and account are resolved from the database
+ * by id -- both are foreign keys, so a valid id guarantees a real row exists
+ * to read the institution's slug and the account's last four digits from,
+ * rather than asking every caller to also pass and keep in sync values the
+ * database already has authoritatively.
  */
 export function persistAcquiredDocument(
+  db: DatabaseSync,
   rawTreeRoot: string,
-  acquired: AcquiredDocument,
+  descriptor: AcquisitionDescriptor,
   extractedText: string | null = null,
 ): PersistedAcquisition {
+  const { institutionId, accountId, docType, acquired, originalExtension = null } = descriptor;
+
   const documentWrite = writeRawDocument(rawTreeRoot, acquired.bytes);
   if (documentWrite.sha256 !== acquired.manifest.contentHash) {
     throw new Error(
@@ -366,13 +412,48 @@ export function persistAcquiredDocument(
         "whose adapter mis-reported its own content hash",
     );
   }
+
+  const institution = db
+    .prepare("SELECT slug FROM institutions WHERE id = ?")
+    .get(institutionId) as { slug: string } | undefined;
+  if (!institution) {
+    throw new Error(
+      `no institutions row with id ${institutionId}; provision the institution before ` +
+        "persisting one of its documents",
+    );
+  }
+  const account = db
+    .prepare("SELECT acct_last4 FROM accounts WHERE id = ?")
+    .get(accountId) as { acct_last4: string | null } | undefined;
+  if (!account) {
+    throw new Error(
+      `no accounts row with id ${accountId}; provision the account before persisting one of ` +
+        "its documents",
+    );
+  }
+
+  const manifestWrite = writeRawDocumentManifest(rawTreeRoot, {
+    sha256: documentWrite.sha256,
+    institutionSlug: institution.slug,
+    acctLast4: account.acct_last4,
+    docType,
+    periodStart: acquired.manifest.periodStart,
+    periodEnd: acquired.manifest.periodEnd,
+    capturedAt: acquired.manifest.capturedAt,
+    capabilityTier: acquired.manifest.kind,
+    gaps: acquired.manifest.gaps,
+    originalExtension,
+  });
+
   const textWrite =
     extractedText === null ? null : writeRetainedText(rawTreeRoot, extractedText);
   return {
     filePath: documentWrite.path,
     textPath: textWrite?.path ?? null,
+    manifestPath: manifestWrite.path,
     documentWrite,
     textWrite,
+    manifestWrite,
   };
 }
 

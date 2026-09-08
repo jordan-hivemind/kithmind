@@ -1,10 +1,18 @@
-// The raw tree writer (F1-18): persisting acquired bytes and retained text
-// to a configured local directory, write-once, hash-verified on write and on
-// read back. No real path, institution, account or document content appears
-// in this suite; every fixture directory is a temp dir removed on teardown.
+// The raw tree writer (F1-18): persisting acquired bytes, retained text and
+// a self-describing manifest to a configured local directory, write-once,
+// hash-verified on write and on read back. No real path, institution,
+// account or document content appears in this suite; every fixture
+// directory is a temp dir removed on teardown.
 
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -13,10 +21,12 @@ import {
   openArchive,
   persistAcquiredDocument,
   readAndVerify,
+  readRawDocumentManifest,
   recordRetainedTextPath,
   resolveRawTreeRoot,
   sha256HexOf,
   writeRawDocument,
+  writeRawDocumentManifest,
   writeRetainedText,
 } from "../dist/index.js";
 import { getEvidence } from "../dist/mcp/evidence.js";
@@ -35,8 +45,10 @@ function rawTreeRoot(t) {
   return directory;
 }
 
-/** A throwaway archive with one document row seeded, for the recordRetainedTextPath tests. */
-function archiveWithDocument(t, sha256) {
+/** A throwaway archive with one institution and one account seeded --
+ * exactly what `persistAcquiredDocument` requires to resolve a manifest's
+ * institution slug and account last4. */
+function archiveWithSeed(t) {
   const directory = mkdtempSync(join(tmpdir(), "kith-finance-raw-tree-db-"));
   const db = openArchive(join(directory, "archive.db"));
   t.after(() => {
@@ -52,11 +64,34 @@ function archiveWithDocument(t, sha256) {
     `INSERT INTO accounts (id, institution_id, acct_last4, display_name, base_currency)
      VALUES (?, ?, ?, ?, ?)`,
   ).run(ACCOUNT.id, INSTITUTION.id, ACCOUNT.last4, "Synthetic account", ACCOUNT.currency);
+  return db;
+}
+
+/** A throwaway archive with one institution, one account and one document
+ * row seeded, for the recordRetainedTextPath tests. */
+function archiveWithDocument(t, sha256) {
+  const db = archiveWithSeed(t);
   db.prepare(
     `INSERT INTO documents (id, institution_id, account_id, doc_type, file_path, sha256, parsed_ok)
      VALUES (?, ?, ?, ?, ?, ?, 1)`,
   ).run("doc_1", INSTITUTION.id, ACCOUNT.id, "pdf_statement", "/irrelevant/path", sha256);
   return db;
+}
+
+function acquiredFixture(bytes, overrides = {}) {
+  return {
+    bytes,
+    manifest: {
+      kind: "pdf_statement",
+      periodStart: "2025-01-01",
+      periodEnd: "2025-01-31",
+      capturedAt: "2025-02-01T00:00:00.000Z",
+      contentHash: sha256HexOf(bytes),
+      reportedRowCount: null,
+      gaps: [],
+      ...overrides,
+    },
+  };
 }
 
 test("resolveRawTreeRoot is a hard error naming what is missing when unset, and returns the value when set", () => {
@@ -134,78 +169,207 @@ test("writeRetainedText persists text write-once, in a namespace separate from r
   assert.ok(!first.path.includes("/documents/"), "text lives outside the documents/ namespace");
 });
 
-test("persistAcquiredDocument writes bytes and retained text together and reports both paths", (t) => {
+test("writeRawDocumentManifest is write-once: a second write for the same document is a no-op, not a rewrite", (t) => {
   const root = rawTreeRoot(t);
-  const bytes = new TextEncoder().encode("synthetic acquired statement bytes");
-  const acquired = {
-    bytes,
-    manifest: {
-      kind: "pdf_statement",
-      periodStart: "2025-01-01",
-      periodEnd: "2025-01-31",
-      capturedAt: "2025-02-01T00:00:00.000Z",
-      contentHash: sha256HexOf(bytes),
-      reportedRowCount: null,
-      gaps: [],
-    },
+  const bytes = new TextEncoder().encode("synthetic manifest write-once fixture");
+  const sha256 = sha256HexOf(bytes);
+  const manifest = {
+    sha256,
+    institutionSlug: "synthetic-institution",
+    acctLast4: "1234",
+    docType: "pdf_statement",
+    periodStart: "2025-01-01",
+    periodEnd: "2025-01-31",
+    capturedAt: "2025-02-01T00:00:00.000Z",
+    capabilityTier: "pdf_statement",
+    gaps: [],
+    originalExtension: ".pdf",
   };
 
-  const persisted = persistAcquiredDocument(root, acquired, "synthetic retained text layer");
+  const first = writeRawDocumentManifest(root, manifest);
+  assert.equal(first.status, "written");
+  assert.deepEqual(readRawDocumentManifest(first.path), manifest);
+
+  // A second write attempt, even with different content for the same
+  // document, does not overwrite: ground rule 1 covers what was acquired,
+  // and the manifest is part of what was acquired.
+  const second = writeRawDocumentManifest(root, { ...manifest, docType: "trade_confirmation" });
+  assert.equal(second.status, "already_exists");
+  assert.equal(second.path, first.path);
+  assert.equal(readRawDocumentManifest(second.path).docType, "pdf_statement", "first write wins, never edited");
+
+  assert.ok(first.path.startsWith(join(root, "documents")), "colocated with the raw bytes it describes");
+  assert.ok(first.path.endsWith(".manifest.json"));
+});
+
+test("persistAcquiredDocument writes bytes, retained text and a manifest together and reports all three paths", (t) => {
+  const root = rawTreeRoot(t);
+  const db = archiveWithSeed(t);
+  const bytes = new TextEncoder().encode("synthetic acquired statement bytes");
+  const acquired = acquiredFixture(bytes);
+  const descriptor = {
+    institutionId: INSTITUTION.id,
+    accountId: ACCOUNT.id,
+    docType: "pdf_statement",
+    acquired,
+    originalExtension: ".pdf",
+  };
+
+  const persisted = persistAcquiredDocument(db, root, descriptor, "synthetic retained text layer");
   assert.equal(persisted.documentWrite.status, "written");
   assert.equal(persisted.textWrite.status, "written");
+  assert.equal(persisted.manifestWrite.status, "written");
   assert.ok(existsSync(persisted.filePath));
   assert.ok(existsSync(persisted.textPath));
+  assert.ok(existsSync(persisted.manifestPath));
   assert.equal(readFileSync(persisted.textPath, "utf8"), "synthetic retained text layer");
 
+  const manifest = readRawDocumentManifest(persisted.manifestPath);
+  assert.equal(manifest.institutionSlug, INSTITUTION.slug);
+  assert.equal(manifest.acctLast4, ACCOUNT.last4);
+  assert.equal(manifest.originalExtension, ".pdf");
+
   // Re-acquiring the identical pull persists nothing new.
-  const again = persistAcquiredDocument(root, acquired, "synthetic retained text layer");
+  const again = persistAcquiredDocument(db, root, descriptor, "synthetic retained text layer");
   assert.equal(again.documentWrite.status, "already_exists");
   assert.equal(again.textWrite.status, "already_exists");
+  assert.equal(again.manifestWrite.status, "already_exists");
   assert.equal(again.filePath, persisted.filePath);
 });
 
-test("persistAcquiredDocument with no extracted text writes only the document", (t) => {
+test("persistAcquiredDocument with no extracted text writes only the document and its manifest", (t) => {
   const root = rawTreeRoot(t);
+  const db = archiveWithSeed(t);
   const bytes = new TextEncoder().encode("synthetic tabular export bytes");
-  const acquired = {
-    bytes,
-    manifest: {
-      kind: "tabular_export",
-      periodStart: "2025-01-01",
-      periodEnd: "2025-01-31",
-      capturedAt: "2025-02-01T00:00:00.000Z",
-      contentHash: sha256HexOf(bytes),
-      reportedRowCount: null,
-      gaps: [],
-    },
-  };
+  const acquired = acquiredFixture(bytes, { kind: "tabular_export" });
 
-  const persisted = persistAcquiredDocument(root, acquired);
+  const persisted = persistAcquiredDocument(db, root, {
+    institutionId: INSTITUTION.id,
+    accountId: ACCOUNT.id,
+    docType: "tabular_export",
+    acquired,
+  });
   assert.ok(existsSync(persisted.filePath));
+  assert.ok(existsSync(persisted.manifestPath));
   assert.equal(persisted.textPath, null);
   assert.equal(persisted.textWrite, null);
+  assert.equal(readRawDocumentManifest(persisted.manifestPath).originalExtension, null);
 });
 
 test("persistAcquiredDocument refuses a pull whose adapter mis-reported its own content hash", (t) => {
   const root = rawTreeRoot(t);
+  const db = archiveWithSeed(t);
   const bytes = new TextEncoder().encode("synthetic bytes with a mismatched manifest hash");
-  const acquired = {
-    bytes,
-    manifest: {
-      kind: "pdf_statement",
-      periodStart: "2025-01-01",
-      periodEnd: "2025-01-31",
-      capturedAt: "2025-02-01T00:00:00.000Z",
-      contentHash: "0".repeat(64),
-      reportedRowCount: null,
-      gaps: [],
-    },
-  };
+  const acquired = acquiredFixture(bytes, { contentHash: "0".repeat(64) });
 
   assert.throws(
-    () => persistAcquiredDocument(root, acquired),
+    () =>
+      persistAcquiredDocument(db, root, {
+        institutionId: INSTITUTION.id,
+        accountId: ACCOUNT.id,
+        docType: "pdf_statement",
+        acquired,
+      }),
     /does not match/,
   );
+});
+
+test("persistAcquiredDocument requires the institution and account to already be provisioned", (t) => {
+  const root = rawTreeRoot(t);
+  const db = archiveWithSeed(t);
+  const bytes = new TextEncoder().encode("synthetic bytes for an unprovisioned institution or account");
+  const acquired = acquiredFixture(bytes);
+
+  assert.throws(
+    () =>
+      persistAcquiredDocument(db, root, {
+        institutionId: "inst_never_provisioned",
+        accountId: ACCOUNT.id,
+        docType: "pdf_statement",
+        acquired,
+      }),
+    /no institutions row/,
+  );
+  assert.throws(
+    () =>
+      persistAcquiredDocument(db, root, {
+        institutionId: INSTITUTION.id,
+        accountId: "acct_never_provisioned",
+        docType: "pdf_statement",
+        acquired,
+      }),
+    /no accounts row/,
+  );
+});
+
+test("given only the raw tree, with no archive database, every document can be identified well enough to re-import", (t) => {
+  const root = rawTreeRoot(t);
+  const db = archiveWithSeed(t);
+
+  const statementBytes = new TextEncoder().encode("synthetic PDF statement bytes");
+  const statement = acquiredFixture(statementBytes, {
+    kind: "pdf_statement",
+    periodStart: "2025-03-01",
+    periodEnd: "2025-03-31",
+    capturedAt: "2025-04-01T12:00:00.000Z",
+    gaps: [{ periodStart: "2025-03-15", periodEnd: "2025-03-16", reason: "synthetic outage" }],
+  });
+  const persistedStatement = persistAcquiredDocument(db, root, {
+    institutionId: INSTITUTION.id,
+    accountId: ACCOUNT.id,
+    docType: "pdf_statement",
+    acquired: statement,
+    originalExtension: ".pdf",
+  });
+
+  const exportBytes = new TextEncoder().encode("synthetic tabular export bytes, second document");
+  const tabularExport = acquiredFixture(exportBytes, {
+    kind: "tabular_export",
+    periodStart: "2025-04-01",
+    periodEnd: "2025-04-30",
+    capturedAt: "2025-05-01T09:00:00.000Z",
+  });
+  persistAcquiredDocument(db, root, {
+    institutionId: INSTITUTION.id,
+    accountId: ACCOUNT.id,
+    docType: "tabular_export",
+    acquired: tabularExport,
+    originalExtension: ".csv",
+  });
+
+  // Simulate total loss of the archive database: everything from here on
+  // uses only what is sitting in the raw tree directory, never `db` again
+  // (teardown closes it once, as usual, when this test ends).
+  const manifestFiles = readdirSync(root, { recursive: true })
+    .filter((entry) => entry.endsWith(".manifest.json"))
+    .map((entry) => join(root, entry));
+  assert.equal(manifestFiles.length, 2, "one manifest sidecar per acquired document");
+
+  const manifests = manifestFiles.map(readRawDocumentManifest);
+  const byDocType = Object.fromEntries(manifests.map((m) => [m.docType, m]));
+
+  assert.equal(byDocType.pdf_statement.sha256, sha256HexOf(statementBytes));
+  assert.equal(byDocType.pdf_statement.institutionSlug, INSTITUTION.slug);
+  assert.equal(byDocType.pdf_statement.acctLast4, ACCOUNT.last4);
+  assert.equal(byDocType.pdf_statement.periodStart, "2025-03-01");
+  assert.equal(byDocType.pdf_statement.periodEnd, "2025-03-31");
+  assert.equal(byDocType.pdf_statement.capturedAt, "2025-04-01T12:00:00.000Z");
+  assert.equal(byDocType.pdf_statement.capabilityTier, "pdf_statement");
+  assert.deepEqual(byDocType.pdf_statement.gaps, [
+    { periodStart: "2025-03-15", periodEnd: "2025-03-16", reason: "synthetic outage" },
+  ]);
+  assert.equal(byDocType.pdf_statement.originalExtension, ".pdf");
+
+  assert.equal(byDocType.tabular_export.institutionSlug, INSTITUTION.slug);
+  assert.equal(byDocType.tabular_export.acctLast4, ACCOUNT.last4);
+  assert.equal(byDocType.tabular_export.capabilityTier, "tabular_export");
+  assert.equal(byDocType.tabular_export.originalExtension, ".csv");
+
+  // The bytes each manifest describes are still there, still content-
+  // addressed by the same hash, and still verify -- nothing here depended
+  // on the database that was just closed.
+  const bytesOnDisk = readAndVerify(persistedStatement.filePath, byDocType.pdf_statement.sha256);
+  assert.deepEqual(bytesOnDisk, Buffer.from(statementBytes));
 });
 
 test("recordRetainedTextPath sets documents.text_path, and get_evidence can then return it", (t) => {
