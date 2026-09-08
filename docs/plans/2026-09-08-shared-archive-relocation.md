@@ -22,8 +22,10 @@ marker represents the top-level parent; the adapter does not enumerate that
 root. The move disables automatic renaming and ownership transfer.
 
 The rebind intent retains exact config bytes, paths, catalog mapping/revision,
-and old/new journal state hashes. It requires a current credential and idle
-journal under the existing locks. Recovery accepts either half-written pair
+and old/new journal state hashes. It requires a current credential and quiescent
+journal under the existing locks. A quiescent checkpoint is either idle or a
+completed terminal pass with no error, pending request, or active credential
+session. The completed checkpoint and its file identity bindings remain intact. Recovery accepts either half-written pair
 only when those identities still match. The journal changes its heartbeat
 identity and invalidates its prior in-memory instance; callers must use the
 returned journal and reopen its catalog. The recovery tests use a real local
@@ -91,9 +93,21 @@ verification result before returning its proof identity. Failed attempts retain
 their own protected outputs; successful proofs must be persisted by the owner
 command before the workflow advances.
 
+The database receipt resolver binds a historical receipt to the immutable
+recipe and the verified workflow state loaded from the held session. It checks
+the exact combined pre/post artifact set and resolves only the listed receipt
+to the new database boundary. Historical receipt fields and absolute snapshot
+paths remain unchanged; deserialized state alone is not authentication.
+
+The owner-resume verifier uses the held rebound journal, the actual proposed
+configuration, a frozen filesystem baseline, and fresh catalog snapshots. It
+performs the owner watcher compare-and-set, doctor, a guarded unchanged scan,
+and a parsed heartbeat. The existing runner probes discovery and job queues;
+nonempty responses stop the operation before admission or publication. Such a
+response may reserve work and must not be reported as a mutation-free scan.
+
 The workflow still requires an owner command connecting these components to
-proof persistence, the database boundary alias, watcher reset, and unchanged
-scan/service completion. Its synthetic tests do not establish Dropbox identity
+protected proof persistence and service completion. Its synthetic tests do not establish Dropbox identity
 preservation or authorize skipping those gates. The current
 component limits are 2,048 inventory objects and 64 MiB per ciphertext object.
 Larger migrations require a separately tested limit change before preparation.
