@@ -1,7 +1,7 @@
 # Unified database and managed archive assessment
 
 Status: proposed architecture, not a migration authorization or completed implementation.
-Assessed 2026-09-08 against main `3750ff1` and finance draft PR54 `898bc30`.
+Assessed 2026-09-08 against main `3750ff1` and finance draft PR54 `898bc30`, with coordination amendments after `237ad23`.
 
 ## Decision being assessed
 
@@ -111,8 +111,25 @@ for authentication without comparing its operational burden.
 
 ## Migration proof and cutover
 
-The proof is the next development slice if this recommendation is accepted.
-It has not been run as part of this assessment.
+The proof has not been run as part of this assessment. Finance can supply its
+isolated component now: F1-20 (store/schema) and F1-22 (importer/reconciliation)
+use only synthetic fixtures and an isolated development database. This work
+produces evidence for the decision; it does not authorize a production cutover,
+real acquisition, permanent split or independently deployed financial gateway.
+
+The finance-only component is necessary but insufficient for the whole-system
+proof. Mainline owns the worker/gateway/auth/search/recovery portion below.
+F1-21 gateway integration waits for the shared typed contract. F1-23 (closed
+credential-free projection) and F1-24 (capture provenance) can proceed independently
+and both block first real acquisition/shared capture publication. Do not duplicate
+those fixes in a competing mainline writer.
+
+Before changing stored denominations, the finance slice pins canonical decimal
+strings and a versioned identity/hash policy in its schema and conversion tests.
+Equivalent decimal spellings normalize before identity calculation. Preserve
+stable record identity across a representation change; if hash preimages change,
+use explicit versioning/mapping rather than silently treating existing records as
+new. No real data is needed to test this invariant.
 
 1. Implement one isolated PostgreSQL-backed vertical slice using synthetic
    data: document revision, retained citation, financial transaction, holding,
@@ -243,8 +260,12 @@ and JSON captures, and then configured on the owner machine.
 The architecture owner coordinates identity, archive layout, auth and cutover.
 The finance workstream owns institution adapters and ledger correctness. The
 mainline workstream owns worker compatibility, integrated queries and recovery.
-PR54 should link this assessment and remain a proposal while the database choice
-is settled. Avoid independently committing to incompatible migrations.
+PR54 should link this assessment and describe finance as the isolated component
+of the shared proof. PR55 remains a proposal for the eventual platform cutover.
+Finance F1-20/F1-22 may proceed within the synthetic boundary above; mainline
+P2-39 owns the remaining parity proof. The shared archive task P2-38 consumes
+F1-23/F1-24 rather than implementing them twice. Agreement to run the proof is
+not agreement that the proof has passed.
 
 Acceptance for the shared archive is one synthetic PDF/JSON acquisition and
 mainline extraction under the same root; duplicate-byte reuse with distinct
