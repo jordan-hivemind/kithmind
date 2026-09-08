@@ -179,7 +179,9 @@ test("PDF document-Q&A config is closed, bound, and keeps legacy bindings stable
     rootAlias: "notes",
     providerRootDirectoryId: providerRootId,
     providerAccountIdHash: "e".repeat(64),
-    providerRootDirectoryIdHash: createHash("sha256").update(providerRootId).digest("hex"),
+    providerRootDirectoryIdHash: createHash("sha256")
+      .update(providerRootId)
+      .digest("hex"),
     refreshPath: "Kith Mind/Inbox",
     registryDirectory: "/private/provider-registry",
   };
@@ -667,6 +669,70 @@ test("archive forget responses bind the source hash, epoch, receipt, and acknowl
     );
 });
 
+test("provider original forget responses require exact retained-source disclosure", () => {
+  const ack = {
+    detachId: "11111111-1111-4111-8111-111111111111",
+    referenceId: "reference_1",
+    forgetEpoch: 3,
+    referenceOutcome: "detached",
+    locatorBundleOutcome: "deleted",
+    locatorAbsenceAuthority: "worker_asserted_live_repository_absence",
+    retentionDisclosure: "provider_retained_deleted_history_possible",
+    providerSourceOutcome: "retained_unchanged",
+    completedAt: 10,
+  };
+  const target = {
+    referenceId: ack.referenceId,
+    referenceFingerprint: "1".repeat(64),
+    locatorBindingId: "22222222-2222-4222-8222-222222222222",
+    locatorRepositoryId: "2".repeat(64),
+    locatorSnapshotId: "3".repeat(64),
+    locatorObjectName: "locator.age",
+    locatorCiphertextHash: "4".repeat(64),
+    locatorCiphertextByteLength: 500,
+    forgetEpoch: 3,
+    ack,
+  };
+  const page = {
+    operation: "providerOriginal.forgetTargets",
+    sourceItemId: "source_1",
+    sourceExternalIdHash: "5".repeat(64),
+    forgetEpoch: 3,
+    targets: [target],
+    isDone: true,
+    continueCursor: "done",
+  };
+  assert.equal(
+    parseWorkerResponse(JSON.stringify(page), page.operation).operation,
+    page.operation,
+  );
+  const result = {
+    operation: "providerOriginal.ackDetach",
+    ...ack,
+    reused: false,
+  };
+  assert.equal(
+    parseWorkerResponse(JSON.stringify(result), result.operation)
+      .providerSourceOutcome,
+    "retained_unchanged",
+  );
+  for (const invalid of [
+    { ...page, targets: [{ ...target, forgetEpoch: 4 }] },
+    { ...page, targets: [{ ...target, locatorObjectName: "../locator.age" }] },
+    {
+      ...page,
+      targets: [
+        { ...target, ack: { ...ack, providerSourceOutcome: "deleted" } },
+      ],
+    },
+    { ...result, retentionDisclosure: undefined },
+    { ...result, locatorAbsenceAuthority: "worker_asserted_physical_absence" },
+  ])
+    assert.throws(() =>
+      parseWorkerResponse(JSON.stringify(invalid), invalid.operation),
+    );
+});
+
 test("archived discovery responses require exact closed B1 shapes", () => {
   const ids = {
     workId: "work",
@@ -765,6 +831,23 @@ test("archived discovery responses require exact closed B1 shapes", () => {
       response.operation,
     );
   }
+  for (const response of [originalLookup, processingLookup, admit].map(
+    (value) => {
+      const provider = {
+        ...value,
+        originalProviderReferenceId: "provider-reference",
+        originalProviderBindingEpoch: 1,
+      };
+      delete provider.originalBackupReceiptId;
+      delete provider.originalBackupBindingEpoch;
+      return provider;
+    },
+  ))
+    assert.equal(
+      parseWorkerResponse(JSON.stringify(response), response.operation)
+        .originalProviderReferenceId,
+      "provider-reference",
+    );
   assert.equal(
     parseWorkerResponse(
       JSON.stringify({
@@ -788,6 +871,14 @@ test("archived discovery responses require exact closed B1 shapes", () => {
       processingLookup.operation,
     ],
     [{ ...admit, state: "queued" }, admit.operation],
+    [
+      {
+        ...admit,
+        originalProviderReferenceId: "provider-reference",
+        originalProviderBindingEpoch: 1,
+      },
+      admit.operation,
+    ],
   ]) {
     assert.throws(() =>
       parseWorkerResponse(JSON.stringify(response), operation),

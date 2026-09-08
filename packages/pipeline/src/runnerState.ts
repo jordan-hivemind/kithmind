@@ -139,7 +139,11 @@ type ArchivedRun = ActiveScan & {
     | "original_backup_snapshot"
     | "parser_primary_publish"
     | "parser_backup_publish"
-    | "parser_backup_snapshot";
+    | "parser_backup_snapshot"
+    | "provider_verify"
+    | "provider_locator_prepare"
+    | "provider_locator_publish"
+    | "provider_locator_snapshot";
   discoveryLease?: ArchivedDiscoveryLease;
   jobLease?: JobLease;
   resumeStep?:
@@ -841,7 +845,11 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
               input.preflightAction === "original_backup_snapshot" ||
               input.preflightAction === "parser_primary_publish" ||
               input.preflightAction === "parser_backup_publish" ||
-              input.preflightAction === "parser_backup_snapshot"
+              input.preflightAction === "parser_backup_snapshot" ||
+              input.preflightAction === "provider_verify" ||
+              input.preflightAction === "provider_locator_prepare" ||
+              input.preflightAction === "provider_locator_publish" ||
+              input.preflightAction === "provider_locator_snapshot"
                 ? input.preflightAction
                 : fail(),
           }),

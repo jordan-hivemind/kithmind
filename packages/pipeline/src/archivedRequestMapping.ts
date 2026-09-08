@@ -5,6 +5,7 @@ import type {
   ArchivedWorkIdentity,
   ParsedTextDeclaration,
   ParserArtifactSelection,
+  ProviderOriginalDeclaration,
 } from "@repo/worker-protocol";
 
 import type {
@@ -40,11 +41,16 @@ function copyIntent(copy: ArchiveCopyIntent): readonly string[] {
  */
 export function digestArchiveIntent(input: {
   identity: ArchivedWorkIdentity;
-  original: Pick<OriginalCatalogRow, "originalCatalogId" | "copies">;
+  original: Pick<
+    OriginalCatalogRow,
+    "originalCatalogId" | "copies" | "providerOriginal"
+  >;
   processing: Pick<ProcessingCatalogRow, "processingCatalogId" | "copies">;
 }): string {
   const value = [
-    ARCHIVE_INTENT_DOMAIN,
+    input.original.providerOriginal
+      ? "kith-archive-intent:provider-original:v1"
+      : ARCHIVE_INTENT_DOMAIN,
     input.identity.sourceItemId,
     input.identity.scanId,
     input.identity.observationEpoch,
@@ -62,13 +68,55 @@ export function digestArchiveIntent(input: {
     input.identity.correctionRevision,
     input.original.originalCatalogId,
     copyIntent(input.original.copies.primary),
-    copyIntent(input.original.copies.independent_backup),
+    ...(input.original.providerOriginal
+      ? [
+          input.original.providerOriginal.clientReferenceId,
+          input.original.providerOriginal.bindingId,
+          copyIntent(input.original.providerOriginal.locator),
+        ]
+      : [copyIntent(input.original.copies.independent_backup)]),
     input.processing.processingCatalogId,
     copyIntent(input.processing.copies.primary),
     copyIntent(input.processing.copies.independent_backup),
   ] as const;
   return createHash("sha256")
     .update(JSON.stringify(value), "utf8")
+    .digest("hex");
+}
+
+export function providerOriginalReferenceFingerprint(
+  value: ProviderOriginalDeclaration,
+): string {
+  return createHash("sha256")
+    .update(
+      `provider-original-reference:v1\0${JSON.stringify([
+        value.referenceVersion,
+        value.providerKind,
+        value.clientReferenceId,
+        value.sourceContentHash,
+        value.sourceByteLength,
+        value.providerAccountIdHash,
+        value.providerRootDirectoryIdHash,
+        value.providerFileIdHash,
+        value.providerRevision,
+        value.providerContentHash,
+        value.verifiedAt,
+        [
+          value.locatorBundle.bindingId,
+          value.locatorBundle.manifestFingerprint,
+          value.locatorBundle.recipientFingerprint,
+          value.locatorBundle.repositoryKeyDomainFingerprint,
+          value.locatorBundle.repositoryId,
+          value.locatorBundle.snapshotId,
+          value.locatorBundle.objectName,
+          value.locatorBundle.ciphertextHash,
+          value.locatorBundle.ciphertextByteLength,
+          value.locatorBundle.readbackVerifiedAt,
+        ],
+        value.createdAt,
+      ])}`,
+      "utf8",
+    )
     .digest("hex");
 }
 

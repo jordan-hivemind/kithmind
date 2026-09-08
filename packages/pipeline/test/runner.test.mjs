@@ -1171,7 +1171,7 @@ test("backup snapshot replay reuses cataloged result and readback time", async (
   }
 });
 
-test("a cached archive preflight is revalidated and revoked authority prevents publish", async () => {
+test("a cached provider preflight is revalidated and revoked authority prevents locator side effects", async () => {
   const setup = await fixture(0);
   const age = join(setup.base, "age");
   const restic = join(setup.base, "restic");
@@ -1184,13 +1184,17 @@ test("a cached archive preflight is revalidated and revoked authority prevents p
   const canonicalAge = await realpath(age);
   const canonicalRestic = await realpath(restic);
   const plan = pdfPlan();
-  const checkpoint = archivedCheckpoint(plan);
+  const checkpoint = archivedCheckpoint(plan, {
+    preflightAction: "provider_verify",
+  });
   const journal = await openJournal(setup.journalDir, checkpoint);
   const original = {
     originalCatalogId: checkpoint.originalCatalogId,
-    copies: {
-      primary: archiveCopy("primary"),
-      independent_backup: archiveCopy("independent_backup"),
+    copies: { primary: archiveCopy("primary") },
+    providerOriginal: {
+      clientReferenceId: randomUUID(),
+      bindingId: randomUUID(),
+      locator: archiveCopy("independent_backup"),
     },
   };
   const processing = {
@@ -1270,7 +1274,7 @@ test("a cached archive preflight is revalidated and revoked authority prevents p
   runner.archivedRows = () => ({ original, processing });
   runner.recordArchiveAction = async () => {
     published += 1;
-    throw new Error("publish must not run");
+    throw new Error("provider side effect must not run");
   };
   try {
     await runner.driveArchivedPreflight();
@@ -1279,6 +1283,254 @@ test("a cached archive preflight is revalidated and revoked authority prevents p
     assert.equal(journal.pending, undefined);
     assert.equal(journal.checkpoint.phase, "terminal");
     assert.equal(journal.checkpoint.code, "not_authorized");
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a durable provider admission replay does not expire its persisted declaration", async () => {
+  const setup = await fixture(0);
+  const journal = await openJournal(setup.journalDir);
+  const runner = new PipelineRunner(setup.config, journal, {
+    async call() {
+      throw new Error("unused");
+    },
+  });
+  const locator = archiveCopy("independent_backup");
+  locator.published = {
+    state: "published",
+    source: { sha256: HASH, byteLength: 100 },
+    ciphertext: { sha256: "b".repeat(64), byteLength: 200 },
+    ciphertextDevice: 1,
+    ciphertextInode: 2,
+    ageVersion: "v1.3.2",
+  };
+  locator.backup = {
+    operationId: locator.restic.operationId,
+    snapshotId: "c".repeat(64),
+    objectName: locator.objectName,
+    ciphertext: locator.published.ciphertext,
+    resticVersion: "0.19.1",
+    repositoryId: locator.restic.repositoryId,
+    verification: "destination_ciphertext_readback",
+  };
+  locator.readbackVerifiedAt = 1;
+  const row = {
+    createdAt: 1,
+    providerOriginal: {
+      clientReferenceId: randomUUID(),
+      bindingId: randomUUID(),
+      locator,
+      verified: {
+        providerAccountIdHash: "1".repeat(64),
+        providerRootDirectoryIdHash: "2".repeat(64),
+        providerFileIdHash: "3".repeat(64),
+        providerRevision: "rev1",
+        providerContentHash: "4".repeat(64),
+        sourceContentHash: HASH,
+        sourceByteLength: 100,
+        verifiedAt: 1,
+        manifestFingerprint: "5".repeat(64),
+        manifestByteLength: 300,
+      },
+    },
+  };
+  try {
+    assert.throws(
+      () => runner.providerDeclaration(row),
+      (error) => error.code === "provider_verification_stale_review_required",
+    );
+    assert.equal(
+      runner.providerDeclaration(row, false).locatorBundle.snapshotId,
+      locator.backup.snapshotId,
+    );
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("provider admission sends three recovery selections and persists the provider branch", async () => {
+  const setup = await fixture(0);
+  const plan = pdfPlan();
+  const lease = {
+    workId: "work",
+    sourceItemId: plan.sourceItemId,
+    observationEpoch: 1,
+    processingEpoch: 1,
+    leaseEpoch: 1,
+    leaseToken: TOKEN,
+    leaseExpiresAt: Date.now() + 60_000,
+  };
+  const checkpoint = archivedCheckpoint(plan, {
+    step: "admit",
+    preflightAction: undefined,
+    discoveryLease: lease,
+  });
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  const durable = (role, seed) => {
+    const value = archiveCopy(role);
+    value.published = {
+      state: "published",
+      source: { sha256: HASH, byteLength: 100 },
+      ciphertext: { sha256: seed.repeat(64), byteLength: 200 },
+      ciphertextDevice: 1,
+      ciphertextInode: 2,
+      ageVersion: "v1.3.2",
+    };
+    value.readbackVerifiedAt = Date.now();
+    if (role === "independent_backup")
+      value.backup = {
+        operationId: value.restic.operationId,
+        snapshotId: `${seed}`.repeat(64),
+        objectName: value.objectName,
+        ciphertext: value.published.ciphertext,
+        resticVersion: "0.19.1",
+        repositoryId: value.restic.repositoryId,
+        verification: "destination_ciphertext_readback",
+      };
+    return value;
+  };
+  const locator = durable("independent_backup", "4");
+  let original = {
+    originalCatalogId: checkpoint.originalCatalogId,
+    rowRevision: 1,
+    createdAt: 1,
+    copies: { primary: durable("primary", "1") },
+    providerOriginal: {
+      clientReferenceId: randomUUID(),
+      bindingId: randomUUID(),
+      locator,
+      verified: {
+        providerAccountIdHash: "1".repeat(64),
+        providerRootDirectoryIdHash: "2".repeat(64),
+        providerFileIdHash: "3".repeat(64),
+        providerRevision: "rev1",
+        providerContentHash: "4".repeat(64),
+        sourceContentHash: HASH,
+        sourceByteLength: 100,
+        verifiedAt: Date.now(),
+        manifestFingerprint: "5".repeat(64),
+        manifestByteLength: 300,
+      },
+    },
+  };
+  let processing = {
+    processingCatalogId: checkpoint.processingCatalogId,
+    rowRevision: 1,
+    createdAt: 1,
+    copies: {
+      primary: durable("primary", "2"),
+      independent_backup: durable("independent_backup", "3"),
+    },
+    parserIntent: { parserArtifactClientId: randomUUID() },
+    parserOutput: {
+      rawArtifact: { sha256: HASH, byteLength: 100 },
+      extractionFingerprint: HASH,
+    },
+  };
+  const declaration = {
+    extractionFingerprint: HASH,
+    textHash: HASH,
+    byteLength: 10,
+    utf16Length: 10,
+    pageCount: 1,
+    mappingManifestHash: HASH,
+    normalizedBundleDigest: HASH,
+    expectedEvidenceSpanCount: 1,
+    expectedDocumentCount: 1,
+    expectedChunkCount: 1,
+  };
+  const sent = [];
+  const runner = new PipelineRunner(setup.config, journal, {
+    async call(request) {
+      sent.push(request);
+      return {
+        operation: "discovery.admitArchived",
+        workId: lease.workId,
+        sourceItemId: lease.sourceItemId,
+        sourceRevisionId: "revision",
+        parserArtifactId: "artifact",
+        sourceTextVersionId: "text",
+        processingGenerationId: "generation",
+        ingestJobId: "job",
+        desiredProcessingEpoch: 1,
+        archiveSetDigest: HASH,
+        originalPrimaryReceiptId: "original-primary",
+        originalPrimaryBindingEpoch: 0,
+        originalProviderReferenceId: "provider-reference",
+        originalProviderBindingEpoch: 1,
+        parserPrimaryReceiptId: "parser-primary",
+        parserPrimaryBindingEpoch: 0,
+        parserBackupReceiptId: "parser-backup",
+        parserBackupBindingEpoch: 0,
+        state: "admitted",
+        reused: false,
+      };
+    },
+  });
+  runner.archivedRows = () => ({ original, processing });
+  runner.mappedProcessing = async () => ({ original, processing, declaration });
+  runner.archiveCatalog = {
+    async recordCloudReceipt(args) {
+      const row = args.subject === "original_bytes" ? original : processing;
+      const updated = {
+        ...row,
+        rowRevision: row.rowRevision + 1,
+        copies: {
+          ...row.copies,
+          [args.role]: {
+            ...row.copies[args.role],
+            cloudReceipt: {
+              receiptId: args.receiptId,
+              requestDigest: args.requestDigest,
+              recordedAt: args.recordedAt,
+            },
+          },
+        },
+      };
+      if (args.subject === "original_bytes") original = updated;
+      else processing = updated;
+      return updated;
+    },
+    async recordOriginalCloud(args) {
+      original = {
+        ...original,
+        rowRevision: original.rowRevision + 1,
+        cloud: args.cloud,
+      };
+      return original;
+    },
+    async recordProcessingCloud(args) {
+      processing = {
+        ...processing,
+        rowRevision: processing.rowRevision + 1,
+        cloud: args.cloud,
+      };
+      return processing;
+    },
+  };
+  try {
+    await runner.driveArchivedAdmit();
+    assert.equal(sent.length, 1);
+    assert.deepEqual(
+      sent[0].archives.map(
+        ({ subjectKind, copyRole }) => `${subjectKind}:${copyRole}`,
+      ),
+      [
+        "original_bytes:primary",
+        "parser_output:primary",
+        "parser_output:independent_backup",
+      ],
+    );
+    assert.equal(
+      sent[0].providerOriginal.clientReferenceId,
+      original.providerOriginal.clientReferenceId,
+    );
+    assert.equal("originalBackupReceiptId" in original.cloud, false);
+    assert.equal(original.cloud.providerReferenceId, "provider-reference");
+    assert.equal(journal.checkpoint.step, "parsed_reserve");
   } finally {
     await journal.close();
     await rm(setup.base, { recursive: true, force: true });
