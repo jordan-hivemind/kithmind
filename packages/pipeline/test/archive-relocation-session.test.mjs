@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import {
   chmod,
   access,
+  link,
   mkdtemp,
   readFile,
   rm,
@@ -689,6 +690,8 @@ test("session recovers config-new journal-old without releasing the held locks",
     relocationId: f.mapping.relocationId,
     now: () => 20,
   });
+  const interruptedIntentTemp = `${intentPath}.prepared.tmp`;
+  await link(intentPath, interruptedIntentTemp);
   // The durable config rename completed, then the process died before the
   // journal binding transfer. This is the only manually constructed crash
   // point in this test; it is not presented as a process-death test.
@@ -725,6 +728,7 @@ test("session recovers config-new journal-old without releasing the held locks",
     session.journal.binding,
     journalBindingForConfig(f.proposed),
   );
+  await assert.rejects(access(interruptedIntentTemp), { code: "ENOENT" });
   await assert.rejects(
     Journal.openExistingForArchiveRebind({
       directory: f.previous.journalDir,

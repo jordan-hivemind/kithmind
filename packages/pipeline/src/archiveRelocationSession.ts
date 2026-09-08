@@ -194,6 +194,15 @@ async function optionalFile(path: string): Promise<ProtectedFile | undefined> {
   return present ? await readFile(path) : undefined;
 }
 
+async function pathExists(path: string): Promise<boolean> {
+  return await lstat(path)
+    .then(() => true)
+    .catch((error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      fail("unsafe_store");
+    });
+}
+
 async function syncDirectory(path: string): Promise<void> {
   if (typeof constants.O_DIRECTORY !== "number") fail("unsafe_store");
   const handle = await open(path, constants.O_RDONLY | constants.O_DIRECTORY);
@@ -360,29 +369,45 @@ export class ProtectedArchiveRelocationStore implements ArchiveRelocationStore {
     };
     // The workflow is the full state validator. The store independently pins
     // its identity and phase so it cannot persist another relocation's bytes.
-    parseEnvelope(encodeEnvelope(envelope), this.relocationId);
+    const encoded = encodeEnvelope(envelope);
+    parseEnvelope(encoded, this.relocationId);
     const temp = this.tempPath();
     if ((await optionalFile(temp)) !== undefined) fail("store_conflict");
     const handle = await open(temp, "wx", FILE_MODE).catch(() =>
       fail("unsafe_store"),
     );
+    let created: Stats;
     try {
-      await handle.writeFile(encodeEnvelope(envelope), "utf8");
+      created = await handle.stat();
+      requireFile(created);
+      await handle.writeFile(encoded, "utf8");
       await handle.sync();
     } finally {
       await handle.close();
     }
+    const prepared = await readFile(temp);
+    if (
+      prepared.device !== created.dev ||
+      prepared.inode !== created.ino ||
+      prepared.text !== encoded ||
+      prepared.hash !== sha256(encoded)
+    )
+      fail("store_conflict");
     const beforeRename = await optionalFile(this.path);
+    const beforeRenameTemp = await optionalFile(temp);
     if (
       (current === undefined) !== (beforeRename === undefined) ||
       (current !== undefined &&
         beforeRename !== undefined &&
-        !sameFile(current, beforeRename))
+        !sameFile(current, beforeRename)) ||
+      beforeRenameTemp === undefined ||
+      !sameFile(prepared, beforeRenameTemp)
     )
       fail("store_conflict");
     await rename(temp, this.path).catch(() => fail("unsafe_store"));
     await syncDirectory(dirname(this.path));
     this.observed = await readFile(this.path);
+    if (this.observed.hash !== prepared.hash) fail("store_conflict");
   }
 
   private tempPath(): string {
@@ -561,8 +586,8 @@ export class ArchiveRelocationSession<
         )
     )
       fail("invalid_input");
-    const intentExists = await optionalFile(this.args.intentPath);
-    if (intentExists === undefined) {
+    const intentExists = await pathExists(this.args.intentPath);
+    if (!intentExists) {
       await prepareArchiveRelocationRebind({
         journal: this.currentJournal,
         configPath: this.args.configPath,
