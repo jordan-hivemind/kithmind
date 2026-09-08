@@ -42,20 +42,32 @@ records where adopted rather than re-extracting the same documents.
 
 | Question                 | Decision                                                                                                                                                                                                                                                                    |
 | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Storage engine           | SQLite. Single file, no server, exact integer or decimal-string money, full SQL for ad hoc questions, trivial to copy and hash for backup.                                                                                                                                  |
+| Storage engine           | Postgres, initially hosted on Neon. `NUMERIC` gives exact decimal arithmetic and exact aggregation, which is not the same as making money exact end to end: precision lost before insertion is stored faithfully, so validated input and tested serialization remain the guarantee. Roles and `GRANT` allow a genuinely separated reader, once designed rather than assumed. Hosted, so an always-on machine and a laptop share one archive.                                                                                                                                  |
 | Existing ledger software | Not adopted. Beancount, hledger, GnuCash and similar are double-entry spending ledgers. They have no first-class model for lot-level cost basis, per-field provenance, or reconciliation status as a gate. Reuse of their importers is not worth adopting their data model. |
 | Scope                    | Holdings as well as transactions. Positions, balances and liabilities are v1, not v2. Half the value of the archive is what is owned and what is owed.                                                                                                                      |
-| Access surface for v1    | A local read-only MCP server over the archive. Not a five-operation typed contract, and not the Kith Mind adapter.                                                                                                                                                          |
+| Access surface for v1    | An authenticated read-only MCP server for the owner's own use, connecting as a non-owner reader role whose privileges are designed and tested rather than assumed from a table grant. The Kith Mind boundary is separate and typed, and is not this surface.                                                                                                                                                          |
 | Query shape              | Read-only SQL plus a documented schema, exposed through the local server. Frequently used shapes are promoted into typed operations later, once real questions have shown which ones matter.                                                                                |
 | Where the code lives     | This repository, MIT, with synthetic fixtures.                                                                                                                                                                                                                              |
-| Where the data lives     | Outside this repository, in a configured local directory for now. Never in git. Local first because it is the simpler starting point, not a judgment about hosting: running the archive as a cloud service later is explicitly open, and the schema and money policy are engine-portable so that move is a migration rather than a redesign.                                                                                                                                                |
-| Standing CSV exports     | Not produced. A table mirror beside a live database is a second source of truth. Backup is a file copy plus a hash. Export is an on-demand script.                                                                                                                          |
+| Where the data lives     | The archive database in Neon. The raw document tree on the always-on machine's filesystem, replicated off it. Never in git, and no connection string, credential or real path in this repository.                                                                                                                                                |
+| Standing CSV exports     | Not produced. A table mirror beside a live database is a second source of truth. Export is an on-demand script. **Both halves need their own recovery.** The raw tree cannot be rebuilt from anything, and the database is not merely derived either: review decisions, corrections and reconciliation verdicts are human judgments that no amount of re-parsing reconstructs. Provider durability is not a substitute for an encrypted, independently restorable export with a proven restore.                                                                                                                          |
 
-The typed-bounded-query rule in the record contract exists to protect
-multi-user spaces and untrusted clients. This archive is single-user,
-read-only, local, and holds no credentials, so that rule does not apply to its
-own read surface. It does apply at the Kith Mind boundary, and the archive must
-be able to satisfy it there without redesign.
+An earlier revision of this plan waived the record contract's
+typed-bounded-query rule on the grounds that the archive was single-user,
+read-only and local. **That waiver is retired**, and retiring it means more
+than saying so: a `SELECT` role with limits is not a typed interface, and an
+earlier draft of this section claimed the rule was satisfied while still
+offering arbitrary SQL. Those are two different surfaces and they get two
+different answers.
+
+| Surface                          | Shape                                                                                                                            |
+| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| The owner's own exploration       | Read-only SQL, authenticated, as a non-owner reader role, with server-enforced row, time and output limits. A separately authorized tool. |
+| The Kith Mind gateway boundary    | Versioned, validated, bounded typed operations for transactions, holdings and balances, aggregates, evidence and coverage. Never arbitrary SQL. |
+
+The typed boundary is what the record contract requires, and it is not
+satisfied by pointing a scoped gateway at a SQL surface. The owner's SQL tool
+is a convenience for the person who owns the data, not the mechanism by which
+an assistant is authorized.
 
 ## Ground rules
 
@@ -115,10 +127,29 @@ is a per-adapter decision recorded in its own directory.
 
 ## Data model
 
-SQLite. Dates are ISO `YYYY-MM-DD` text. Money is exact: integer minor units or
-canonical base-10 decimal strings, one policy chosen and stated in the README,
-never binary floating-point at any point in parsing, normalization or
+Postgres. Dates are `DATE`. Money and quantities are `NUMERIC`, which is exact
+and arbitrary-precision, and which sums exactly in SQL. Binary floating point
+appears nowhere: no `REAL`, no `DOUBLE PRECISION`, no `parseFloat`, and no
+`Number` on a money value at any point in parsing, normalization or
 aggregation.
+
+This replaces the split representation the SQLite schema used, where cash
+amounts were integer minor units and quantities and prices were canonical
+decimal text. That split existed for one reason: SQLite has no decimal type, so
+integers were the only way to keep `SUM` exact, and text was the only way to
+keep a price's full precision. Postgres has a real decimal type, so one
+representation now does both, and the conversion boundary between minor units
+and decimal text disappears along with the class of bugs that live on it.
+
+Two things the split gave us are kept deliberately, because they were never
+about storage:
+
+- **A value more precise than its currency allows is ambiguous money.** The
+  importer still rejects it into `review_items` with a null value rather than
+  rounding it away. `NUMERIC` would happily store it, which is exactly why the
+  check has to stay in the importer.
+- **Totals never cross currencies.** Every money column still carries its
+  currency and every total still groups by it.
 
 ```
 institutions(id, name, slug)
@@ -171,6 +202,31 @@ review_items(id, kind, account_id, source_document_id, source_locator,
 
 Only the last four digits of any account number are stored. Raw documents keep
 whatever they contain and are not redacted.
+
+Types worth stating, because they are the money policy rather than a detail:
+every amount, quantity, price, rate and balance is `NUMERIC` with no declared
+scale, so nothing is silently truncated. Identifiers are `TEXT`. Dates are
+`DATE`. `row_hash` is `TEXT` and `UNIQUE`.
+
+**`NUMERIC` does not replace the float check, and an earlier draft of this
+section wrongly said it did.** The SQLite `CHECK (typeof(...))` constraints
+caught a value that had *already become* a float before it reached the
+database. Postgres will accept that same value into `NUMERIC` and store it
+exactly, damage included: a JavaScript `0.1 + 0.2` arrives as
+`0.30000000000000004` and is faithfully preserved.
+
+Nor was SQLite a reliable backstop, and an earlier correction of mine overstated
+in the other direction. Column affinity can coerce a value before `typeof` ever
+observes it, so the storage-class check caught some already-float inputs and not
+others. Neither engine is the guarantee. The guarantee is validated input and
+tested serialization, and it has to be built either way.
+
+So the check moves rather than disappears. Decimal input is validated as text
+before it is ever converted, non-finite values (`NaN`, `Infinity`, and
+Postgres's own `NaN` for `NUMERIC`) are rejected, and money crosses the driver,
+JSON and MCP boundaries as decimal strings rather than as JavaScript numbers. A
+driver that silently decodes `NUMERIC` to a float would reintroduce exactly the
+failure the type was chosen to prevent, so that decoding is pinned and tested.
 
 `row_hash` is the deduplication key: a hash over account, process date,
 activity type, description, quantity and amount. Overlapping pages from a
@@ -281,14 +337,45 @@ positions table and its activity table, so each new document reconciles itself.
 
 ## Access for assistants
 
-v1 exposes a local read-only MCP server over the archive file:
+v1 exposes a read-only MCP server over the hosted archive, authenticated, connecting as a reader role:
 
 | Tool              | Behavior                                                                                                                              |
 | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
 | `describe_schema` | Table and column documentation, money policy, currency policy, valuation-basis meanings.                                              |
-| `run_query`       | Read-only SQL against the archive. Bounded row count and time. No write path, no attach, no file access.                              |
+| `run_query`       | Read-only SQL against the archive, executed as a Postgres role holding `SELECT` and nothing else. Bounded row count and time.         |
 | `get_evidence`    | For a row, the source document, locator, content hash and a path to the retained text.                                                |
 | `get_coverage`    | Per account and period: what was acquired, what parsed, what reconciled, what is under review, and when each source was last updated. |
+
+Read-only is enforced by the database rather than by inspecting the SQL, but
+"a role with `SELECT` and nothing else" is a claim that has to be designed and
+proved rather than asserted. Postgres grants more than table privileges:
+`CONNECT` and `TEMPORARY` on a database and `EXECUTE` on functions are granted
+to `PUBLIC` by default, privileges inherit through role membership, and default
+privileges apply to objects created later. A table-level `SELECT` grant on its
+own establishes none of that.
+
+What the read surface requires:
+
+- A non-owner reader role that owns nothing, so it cannot alter what it reads.
+- `PUBLIC` privileges revoked deliberately, including database `CONNECT` and
+  `TEMPORARY` and function `EXECUTE`, then granted back only where needed.
+- Default privileges set so a table added by a later migration is not silently
+  readable or writable beyond intent.
+- Server-enforced limits on statement time, returned rows and concurrency. A
+  role's default `statement_timeout` is a setting, not an immutable boundary,
+  so it is not the only control.
+
+The 17 attacks probed against the SQLite surface stay as the specification of
+intent: writes, `ATTACH`, mutating and reading `PRAGMA`, multi-statement and
+comment-smuggled statements, a write hidden inside a `WITH`, and file access
+through SQL functions. Most of that syntax simply fails on Postgres, which
+proves nothing. Each intent needs a Postgres-specific equivalent, and confirming
+that SQLite syntax errors out is not a test.
+
+The surface is authenticated. It is reachable over a network now, so the
+record contract's typed-bounded-query rule applies to it rather than being
+waived, and the connection string is configuration that never enters this
+repository.
 
 Every response carries the dataset revision and an explicit completeness state.
 A partial or truncated result is never labeled complete. Zero rows with unknown
@@ -346,6 +433,45 @@ through F1-7 in parallel left responsibilities that no single task owned.
 The pattern is worth recording rather than only fixing: each gap sat exactly
 where two parallel tasks met, and each was invisible from inside either one.
 
+The move to hosted Postgres adds three more, and retires part of two finished
+tasks. It is sequenced before the first acquisition, because no real data
+exists yet and that is the only thing that makes it cheap.
+
+| Task  | Deliverable                                                                                                                        |
+| ----- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| F1-20 | Postgres store, schema and migrations. One initial schema, `NUMERIC` money, no storage-class checks to translate. Replaces F1-1's engine, keeps its policy. |
+| F1-21 | Read surface on a `SELECT`-only role, with authentication. Replaces F1-6's five in-process layers; its attack tests carry over as the specification.       |
+| F1-22 | Port the importer, both reconciliation gates and the raw-tree writer onto the new store. Not a driver swap: see below.                                    |
+| F1-23 | Credential-free projection of acquired payloads before they are hashed or written, with negative leak tests. Blocks any real acquisition.                  |
+| F1-24 | Separate byte identity from acquisition provenance in the raw tree, so two captures of identical bytes both keep their manifests.                          |
+
+F1-1 and F1-6 stay `done`: they were correct for the engine they targeted, and
+the reasoning in them, the money policy, the dedupe contract, the completeness
+states and the attack surface they mapped, is what F1-20 and F1-21 are built
+from rather than replaced by.
+
+**F1-22 is not "the driver and types move", and an earlier draft said it was.**
+Changing cash from integer minor units to decimal touches normalization,
+currency exponents, reconciliation arithmetic, driver decoding, serialized
+output, and most sharply the deduplication preimage. `row_hash` currently
+hashes the minor-unit integer. Under a decimal representation, `1`, `1.0` and
+`1.00` must not acquire three different identities, or deduplication silently
+stops working and the archive double-counts, which is the defect this
+workstream has already fixed once. So the stored denomination and the canonical
+hash and wire representation are decided and pinned *before* the engine
+changes, with conversion tests that assert identity is preserved across the
+move.
+
+F1-23 is security work and is independent of the storage decision. An adapter
+returns whatever the provider sent, and a bank's JSON response may contain
+session tokens, authorization headers echoed back, or other credential
+material. Ground rule 4 forbids an adapter *storing* a credential, and the
+session type has no field for one, but nothing yet stops a credential arriving
+inside a response body and being written to the raw tree, which is a synced
+folder. A closed allowlisted projection of the business payload happens before
+hashing or writing, and a sanitized artifact records the transformation rather
+than claiming to be the untouched response.
+
 v1 is done when a single query against the archive reproduces, with no browser:
 fees paid over a trailing twelve months by account and fee type; every purchase
 of a given instrument class with date, quantity, price and maturity; current
@@ -366,41 +492,72 @@ explicitly flagged.
 No scheduled scraper is built. If a scheduled agent participates at all, its
 job is running the import and reminding a person to do the acquisition.
 
-## Local now, cloud later
+## Where things run
 
-v1 runs on one machine. The archive file, the raw tree and the MCP server are
-all local. That is a starting point chosen because it is the simplest thing
-that works, not a position that this data must never be hosted.
+The archive is hosted from the start. An earlier revision of this plan said
+local first, with hosting left open as a later possibility. That was decided
+before an always-on machine and a laptop both needed the same archive, and it
+is superseded here rather than deferred, because the cheapest moment to change
+a storage engine is before any real data exists.
 
-Running the archive as a cloud service later is explicitly open. It buys real
-things: access from any device rather than only the desktop, and a durability
-problem a provider solves rather than the owner. Sensitive financial data lives
-in hosted services routinely and the protections for doing it are well
-understood. How a hosted deployment is secured is a decision to make when that
-move is made, with client-side encryption before upload as one option among
-several rather than a precondition.
+To be precise about what the requirement does and does not settle: several
+machines can also query one service in front of a local file, so multi-machine
+access *supports* this choice rather than compelling it. What tips it is the
+combination of exact decimal arithmetic, real privilege separation for a
+network-reachable read surface, and durability that does not depend on one
+desk.
 
-What v1 spends now to keep that option open:
+| Piece                | Runs where                                                         | Why                                                                                                                                                    |
+| -------------------- | ------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Archive database     | Postgres, Neon as the initial host                                 | Exact decimal arithmetic, real privilege separation, host-managed durability, reachable from more than one machine. Neon is a deployment choice, not an architectural requirement; the schema is ordinary Postgres. |
+| Raw document tree    | The always-on machine's filesystem, replicated off it              | Document bytes do not belong in a database. This is the half that cannot be rebuilt, so its durability is a first-class requirement, not a side effect. |
+| Acquisition, import  | The always-on machine                                              | A person authenticates a browser session there. Import is a script that writes to the hosted database.                                                 |
+| Read surface         | Wherever it is invoked, connecting to Neon as a read-only role     | The point of the workstream: an assistant with no browser and no logins can answer questions and cite them.                                             |
 
-- Money is exact integer minor units and canonical base-10 decimal strings, and
-  dates are ISO text. Nothing depends on a SQLite-specific numeric type, so
-  moving to a hosted engine is a migration rather than a redesign.
-- Accounts, instruments, transactions, documents and source revisions carry
-  stable opaque identities that survive a move.
-- The read surface is one versioned boundary. Hosting changes where the server
-  runs, not what it answers.
+Acquisition and import run on the always-on machine, but **single-writer by
+convention is not a publication boundary.** A laptop querying mid-import must
+not see half a ledger, and must never see new transactions against an old
+reconciliation verdict, which is precisely the confidently-wrong answer the
+gates exist to prevent.
 
-What that move introduces and v1 deliberately does not solve: authentication
-and authorization on the read surface, which is single-user and local today;
-network exposure, since a database port is never published directly; and the
-multi-user scope the record contract already reserves. The typed-bounded-query
-rule that this plan sets aside for a local single-user surface applies again
-the moment that surface is reachable from anywhere else.
+So an import publishes atomically, or readers select an immutable completed
+dataset revision. A second writer is excluded by the database rather than by
+everyone remembering, and retries stay idempotent. Hosting the ledger does not
+by itself coordinate anything.
 
-A single local copy of an acquired retention window is still the one loss this
-design cannot recover from, because an institution may not serve its oldest
-periods indefinitely. That is a durability requirement whatever the answer to
-hosting turns out to be.
+A free tier looked adequate against the published plans on 2026-09-08: storage
+in the hundreds of megabytes and compute-hours in the low hundreds per month,
+against an archive of tens of thousands of numeric rows queried occasionally
+and idle otherwise. That is a dated observation, not a commitment, and it sizes
+transaction rows only. Indexes, provenance, retained text references and
+correction history are additional and have not been measured. Verify current
+limits, restore-history depth and region before committing, and re-verify rather
+than trusting this paragraph.
+
+Nothing here bets on the vendor. The schema is ordinary Postgres, the money
+policy is `NUMERIC`, and the raw tree is files on a disk. Moving to another
+Postgres host, managed or self-run, is an export and an import.
+
+## What this costs, honestly
+
+The engine change is not free, and the parts it invalidates should be named
+rather than discovered:
+
+- **The read-only enforcement built for SQLite is discarded.** Five in-process
+  layers, a read-only file open, `query_only`, defensive mode, an authorizer by
+  action code and single-statement parsing, all specific to an embedded engine
+  and to `node:sqlite`. Its *tests* survive as the specification: every attack
+  they covered is still something the new surface must refuse.
+- **Authentication on the read surface is new work.** It did not exist, because
+  a local file did not need it.
+- **The schema and its migrations are rewritten**, collapsing into one initial
+  Postgres schema. There is no data to migrate, which is the whole reason to do
+  this now.
+
+What survives, and it is most of the system: the adapter interface and every
+adapter, the importer with its provenance, deduplication and review queue, both
+reconciliation gates, the raw tree with its self-describing manifests, and the
+money policy's semantics. That is what the engine-portable schema bought.
 
 ## Repository and privacy boundary
 
@@ -410,7 +567,8 @@ Public: the store, schema and migrations; the adapter interface; adapter
 implementations and their synthetic fixtures; the importer, reconciliation gate
 and MCP server; the README and this plan.
 
-Outside the repository: the archive file, the raw document tree, import logs,
+Outside the repository: the raw document tree, import logs, the Neon
+connection string and any credential, and
 and any configuration naming a real path, institution account, program, person
 or balance. These are local for now, which is a starting point rather than a
 rule against an off-machine copy or a hosted deployment; see "Local now, cloud
