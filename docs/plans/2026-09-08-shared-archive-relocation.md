@@ -80,9 +80,20 @@ outbound connections, checks loopback listener ownership, and compares the
 restored native export with the source. It does not deploy application
 functions, authentication configuration, HTTP routes, or cron definitions.
 
-The workflow still requires an owner command connecting all components
-and fresh provider readback wired into the
-decryption and database-restore gates. Its synthetic tests do not establish Dropbox identity
+The recovery-content gate now inventories both repositories, reads every exact
+ciphertext, decrypts and checks every processing plaintext and database payload,
+and invokes the isolated native verifier for the recipe-selected database
+snapshot. Tree reads run sequentially to bound subprocess and credential-refresh
+concurrency. A closed in-memory tar decoder accepts only the two expected
+regular payload members and binds native ZIP bytes to both manifest and receipt.
+The native adapter checks schema, roundtrip, isolation, and the protected saved
+verification result before returning its proof identity. Failed attempts retain
+their own protected outputs; successful proofs must be persisted by the owner
+command before the workflow advances.
+
+The workflow still requires an owner command connecting these components to
+proof persistence, the database boundary alias, watcher reset, and unchanged
+scan/service completion. Its synthetic tests do not establish Dropbox identity
 preservation or authorize skipping those gates. The current
 component limits are 2,048 inventory objects and 64 MiB per ciphertext object.
 Larger migrations require a separately tested limit change before preparation.
