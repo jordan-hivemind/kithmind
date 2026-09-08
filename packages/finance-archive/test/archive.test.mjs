@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import {
   ARCHIVE_SCHEMA_VERSION,
   fromMinorUnits,
+  MIGRATIONS,
   migrate,
   openArchive,
   rowHash,
@@ -393,5 +395,191 @@ test("the extensibility columns exist and accept values", (t) => {
     db
       .prepare("UPDATE reconciliations SET status = 'maybe' WHERE id = 'rec_1'")
       .run(),
+  );
+});
+
+// The rest of this file is the F1-17 migration test, moved here from
+// positionReconciliation.test.mjs: it proves the SQLite migration path in
+// schema.ts, not the Postgres position gate, so it belongs with the other
+// SQLite schema tests rather than with the Postgres-backed suite.
+
+function tempDirectory(t) {
+  const directory = mkdtempSync(join(tmpdir(), "kith-finance-migration-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  return directory;
+}
+
+// Synthetic institution and instruments distinct from this file's own
+// INSTITUTION/accounts, used only by the migration test below.
+const LEGACY_INSTITUTION = {
+  id: "inst_pinehollow",
+  name: "Pinehollow Federal",
+  slug: "pinehollow",
+};
+const LEGACY_INSTRUMENT = { id: "instr_alpha", symbol: "ALFA" };
+const LEGACY_OTHER_INSTRUMENT = { id: "instr_beta", symbol: "BETA" };
+
+function seedLegacyInstitutionAndInstruments(db) {
+  db.prepare("INSERT INTO institutions (id, name, slug) VALUES (?, ?, ?)").run(
+    LEGACY_INSTITUTION.id,
+    LEGACY_INSTITUTION.name,
+    LEGACY_INSTITUTION.slug,
+  );
+  for (const instrument of [LEGACY_INSTRUMENT, LEGACY_OTHER_INSTRUMENT]) {
+    db.prepare("INSERT INTO instruments (id, symbol) VALUES (?, ?)").run(
+      instrument.id,
+      instrument.symbol,
+    );
+  }
+}
+
+function seedLegacyAccount(db, id, openedDate = "2015-04-02") {
+  db.prepare(
+    `INSERT INTO accounts (id, institution_id, acct_last4, display_name, account_type,
+                           base_currency, opened_date)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    id,
+    LEGACY_INSTITUTION.id,
+    "4321",
+    "Synthetic account",
+    "brokerage",
+    "USD",
+    openedDate,
+  );
+}
+
+let legacyPositionSeq = 0;
+function insertLegacyPosition(
+  db,
+  {
+    accountId,
+    asOf,
+    quantity,
+    instrumentId = LEGACY_INSTRUMENT.id,
+    costBasis = null,
+  },
+) {
+  legacyPositionSeq += 1;
+  db.prepare(
+    `INSERT INTO positions (id, account_id, as_of, instrument_id, quantity, cost_basis, currency)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    `pos_${legacyPositionSeq}`,
+    accountId,
+    asOf,
+    instrumentId,
+    quantity,
+    costBasis,
+    "USD",
+  );
+}
+
+let legacyTxnSeq = 0;
+function insertLegacyTransaction(
+  db,
+  { accountId, processDate, quantity, instrumentId = LEGACY_INSTRUMENT.id },
+) {
+  legacyTxnSeq += 1;
+  db.prepare(
+    `INSERT INTO transactions
+       (id, account_id, process_date, activity_type, description, instrument_id,
+        quantity, currency, row_hash, imported_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    `txn_${legacyTxnSeq}`,
+    accountId,
+    processDate,
+    "trade",
+    "Synthetic trade",
+    instrumentId,
+    quantity,
+    "USD",
+    `hash_${legacyTxnSeq}`,
+    "2026-04-01T00:00:00.000Z",
+  );
+}
+
+test("migration 3 upgrades a populated database without losing rows", (t) => {
+  const path = join(tempDirectory(t), "legacy.db");
+
+  // Build a file at the pre-F1-17 schema version and put rows in it.
+  const legacy = new DatabaseSync(path);
+  legacy.exec("PRAGMA foreign_keys = ON");
+  for (const migration of MIGRATIONS) {
+    if (migration.version > 2) continue;
+    legacy.exec(migration.sql);
+    legacy.exec(`PRAGMA user_version = ${migration.version}`);
+  }
+  assert.equal(schemaVersion(legacy), 2);
+  seedLegacyInstitutionAndInstruments(legacy);
+  seedLegacyAccount(legacy, "acct_legacy");
+  insertLegacyPosition(legacy, {
+    accountId: "acct_legacy",
+    asOf: "2026-01-31",
+    quantity: "100",
+  });
+  insertLegacyPosition(legacy, {
+    accountId: "acct_legacy",
+    asOf: "2026-02-28",
+    quantity: "112",
+  });
+  insertLegacyTransaction(legacy, {
+    accountId: "acct_legacy",
+    processDate: "2026-01-06",
+    quantity: "1",
+  });
+  insertLegacyTransaction(legacy, {
+    accountId: "acct_legacy",
+    processDate: "2026-02-06",
+    quantity: "12",
+  });
+  legacy
+    .prepare(
+      `INSERT INTO reconciliations
+       (id, account_id, period_start, period_end, expected_change, computed_change,
+        delta, currency, tolerance, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      "rec_legacy",
+      "acct_legacy",
+      "2026-01-31",
+      "2026-02-28",
+      500,
+      500,
+      0,
+      "USD",
+      0,
+      "pass",
+    );
+  legacy.close();
+
+  const db = openArchive(path);
+  t.after(() => db.close());
+
+  assert.equal(schemaVersion(db), ARCHIVE_SCHEMA_VERSION);
+  // Every pre-existing row survived the upgrade.
+  assert.equal(db.prepare("SELECT count(*) AS n FROM positions").get().n, 2);
+  assert.equal(db.prepare("SELECT count(*) AS n FROM transactions").get().n, 2);
+  assert.equal(
+    db
+      .prepare("SELECT status FROM reconciliations WHERE id = ?")
+      .get("rec_legacy").status,
+    "pass",
+  );
+  // The upgrade added position_reconciliations, empty until the Postgres
+  // gate (which no longer runs against a SQLite file) writes to it.
+  assert.equal(
+    db
+      .prepare(
+        "SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'position_reconciliations'",
+      )
+      .get().n,
+    1,
+  );
+  assert.equal(
+    db.prepare("SELECT count(*) AS n FROM position_reconciliations").get().n,
+    0,
   );
 });

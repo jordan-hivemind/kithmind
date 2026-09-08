@@ -34,14 +34,20 @@
 // applies, and it is recorded on every row -- passing or not -- so a later
 // loosening cannot silently reinterpret an old pass.
 //
-// Quantities are canonical decimal TEXT, not integer minor units, so every
-// comparison and sum here goes through the decimal helpers. No parseFloat,
-// no Number, no REAL touches a quantity at any point.
+// Quantities are NUMERIC, which sums exactly in Postgres and crosses the
+// driver as decimal text (pgStore.ts pins that decoding). Every comparison
+// here goes through the exact base-10 helpers, so no quantity is ever a float
+// at any point: no parseFloat, no Number, no binary arithmetic.
 
 import { randomUUID } from "node:crypto";
-import type { DatabaseSync, StatementSync } from "node:sqlite";
 
-import { addDecimal, compareDecimal, subtractDecimal } from "./decimal.js";
+import { compareDecimal, subtractDecimal } from "./decimal.js";
+import { fromNumericText } from "./pgNumeric.js";
+import {
+  type ArchiveClient,
+  lockArchiveForWrite,
+  withArchiveTransaction,
+} from "./pgStore.js";
 import type { ReconciliationStatus } from "./reconciliation.js";
 
 /**
@@ -84,7 +90,7 @@ type PositionPairRow = {
   instrument_id: string;
   as_of: string;
   quantity: string | null;
-  prev_as_of: string | null;
+  prev_as_of: string;
   prev_quantity: string | null;
 };
 
@@ -114,39 +120,28 @@ type AccountHistory = {
  * and is skipped; such a row is already an unidentified holding rather than
  * something this gate can check.
  *
+ * Like the cash gate, this is one transaction that joins the caller's when
+ * there is one, so `publishImport` publishes rows and both verdicts together.
+ *
  * When `importRunId` is given, that run's counters are incremented and a
  * note is appended. `unverified` counts toward `reconciliations_failed`, as
  * it does for cash: neither is a clean pass and `import_runs` has no third
  * bucket. The note is appended rather than replaced so running both gates
  * against one import run does not lose the cash gate's note.
  */
-export function runPositionReconciliationGate(
-  db: DatabaseSync,
+export async function runPositionReconciliationGate(
+  client: ArchiveClient,
   importRunId?: string,
-): PositionReconciliationGateSummary {
-  const deleteExisting = db.prepare(
-    `DELETE FROM position_reconciliations
-     WHERE account_id = ? AND instrument_id = ? AND period_start = ? AND period_end = ?`,
-  );
-  const insert = db.prepare(
-    `INSERT INTO position_reconciliations
-       (id, account_id, instrument_id, period_start, period_end,
-        expected_change, computed_change, delta, tolerance, status, notes)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  );
-  const sumQuantities = db.prepare(
-    `SELECT quantity FROM transactions
-     WHERE account_id = ? AND instrument_id = ?
-       AND process_date >= ? AND process_date <= ?`,
-  );
+): Promise<PositionReconciliationGateSummary> {
+  return withArchiveTransaction(client, async () => {
+    await lockArchiveForWrite(client);
 
-  // One row per account, instrument and snapshot after the first, paired
-  // with its immediately preceding snapshot. This is the anchor: the
-  // comparison is between two consecutive stated positions, never against
-  // zero. An account/instrument with 0 or 1 snapshots yields no period,
-  // which is not a failure -- there is simply nothing to check yet.
-  const pairs = db
-    .prepare(
+    // One row per account, instrument and snapshot after the first, paired
+    // with its immediately preceding snapshot. This is the anchor: the
+    // comparison is between two consecutive stated positions, never against
+    // zero. An account/instrument with 0 or 1 snapshots yields no period,
+    // which is not a failure -- there is simply nothing to check yet.
+    const pairs = await client.query<PositionPairRow>(
       `SELECT account_id, instrument_id, as_of, quantity, prev_as_of, prev_quantity
        FROM (
          SELECT
@@ -155,33 +150,24 @@ export function runPositionReconciliationGate(
            LAG(quantity) OVER (PARTITION BY account_id, instrument_id ORDER BY as_of) AS prev_quantity
          FROM positions
          WHERE instrument_id IS NOT NULL
-       )
+       ) AS paired
        WHERE prev_as_of IS NOT NULL
        ORDER BY account_id, instrument_id, as_of`,
-    )
-    .all() as PositionPairRow[];
+    );
 
-  const histories = new Map<string, AccountHistory>();
-  const gapPeriods = new Map<string, number>();
-  const accounts = new Set<string>();
-  const instruments = new Set<string>();
-  let passed = 0;
-  let failed = 0;
-  let unverified = 0;
+    const histories = new Map<string, AccountHistory>();
+    const gapPeriods = new Map<string, number>();
+    const accounts = new Set<string>();
+    const instruments = new Set<string>();
+    let passed = 0;
+    let failed = 0;
+    let unverified = 0;
 
-  db.exec("BEGIN IMMEDIATE");
-  try {
-    for (const pair of pairs) {
-      const periodStart = pair.prev_as_of as string;
+    for (const pair of pairs.rows) {
+      const periodStart = pair.prev_as_of;
       const periodEnd = pair.as_of;
-      const history = accountHistory(db, histories, pair.account_id);
-      const result = reconcilePeriod(
-        sumQuantities,
-        pair,
-        periodStart,
-        periodEnd,
-        history,
-      );
+      const history = await accountHistory(client, histories, pair.account_id);
+      const result = await reconcilePeriod(client, pair, history);
 
       if (result.status === "pass") passed += 1;
       else if (result.status === "fail") failed += 1;
@@ -196,24 +182,29 @@ export function runPositionReconciliationGate(
         );
       }
 
-      deleteExisting.run(
-        pair.account_id,
-        pair.instrument_id,
-        periodStart,
-        periodEnd,
+      await client.query(
+        `DELETE FROM position_reconciliations
+         WHERE account_id = $1 AND instrument_id = $2 AND period_start = $3 AND period_end = $4`,
+        [pair.account_id, pair.instrument_id, periodStart, periodEnd],
       );
-      insert.run(
-        randomUUID(),
-        pair.account_id,
-        pair.instrument_id,
-        periodStart,
-        periodEnd,
-        result.expectedChange,
-        result.computedChange,
-        result.delta,
-        TOLERANCE,
-        result.status,
-        result.notes,
+      await client.query(
+        `INSERT INTO position_reconciliations
+           (id, account_id, instrument_id, period_start, period_end,
+            expected_change, computed_change, delta, tolerance, status, notes)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        [
+          randomUUID(),
+          pair.account_id,
+          pair.instrument_id,
+          periodStart,
+          periodEnd,
+          result.expectedChange,
+          result.computedChange,
+          result.delta,
+          TOLERANCE,
+          result.status,
+          result.notes,
+        ],
       );
     }
 
@@ -230,8 +221,8 @@ export function runPositionReconciliationGate(
     }
 
     if (importRunId !== undefined) {
-      appendImportRunNote(db, importRunId, {
-        periodsChecked: pairs.length,
+      await appendImportRunNote(client, importRunId, {
+        periodsChecked: pairs.rows.length,
         passed,
         failed,
         unverified,
@@ -240,10 +231,8 @@ export function runPositionReconciliationGate(
       });
     }
 
-    db.exec("COMMIT");
-
     return {
-      periodsChecked: pairs.length,
+      periodsChecked: pairs.rows.length,
       passed,
       failed,
       unverified,
@@ -251,10 +240,7 @@ export function runPositionReconciliationGate(
       instrumentsChecked: instruments.size,
       coverageGaps,
     };
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
-  }
+  });
 }
 
 /**
@@ -262,21 +248,20 @@ export function runPositionReconciliationGate(
  * `unverified` with a note, so one bad account, instrument or period never
  * blocks reconciling every other one.
  */
-function reconcilePeriod(
-  sumQuantities: StatementSync,
+async function reconcilePeriod(
+  client: ArchiveClient,
   pair: PositionPairRow,
-  periodStart: string,
-  periodEnd: string,
   history: AccountHistory,
-): PeriodResult {
+): Promise<PeriodResult> {
+  const periodStart = pair.prev_as_of;
   let computedChange: string;
   try {
-    computedChange = sumQuantityWindow(
-      sumQuantities,
+    computedChange = await sumQuantityWindow(
+      client,
       pair.account_id,
       pair.instrument_id,
       periodStart,
-      periodEnd,
+      pair.as_of,
     );
   } catch (error) {
     return {
@@ -303,7 +288,10 @@ function reconcilePeriod(
 
   let expectedChange: string;
   try {
-    expectedChange = subtractDecimal(pair.quantity, pair.prev_quantity);
+    expectedChange = subtractDecimal(
+      fromNumericText(pair.quantity),
+      fromNumericText(pair.prev_quantity),
+    );
   } catch (error) {
     return {
       status: "unverified",
@@ -363,53 +351,54 @@ function isCoverageGap(history: AccountHistory, periodStart: string): boolean {
 /**
  * Sums signed transaction quantities in [periodStart, periodEnd] for one
  * account and instrument. An empty window is a valid 0: a period with no
- * activity should show no stated change. Every add goes through the exact
- * decimal helpers, so no quantity is ever a float.
+ * activity should show no stated change. Summed by Postgres, where NUMERIC
+ * adds exactly, and read back as decimal text.
+ *
+ * An ambiguous quantity the importer already sent to review is excluded
+ * rather than guessed. Excluding a real movement is exactly what should
+ * surface as a nonzero delta instead of being masked.
  */
-function sumQuantityWindow(
-  statement: StatementSync,
+async function sumQuantityWindow(
+  client: ArchiveClient,
   accountId: string,
   instrumentId: string,
   periodStart: string,
   periodEnd: string,
-): string {
-  const rows = statement.all(
-    accountId,
-    instrumentId,
-    periodStart,
-    periodEnd,
-  ) as { quantity: string | null }[];
-  let total = "0";
-  for (const row of rows) {
-    // Ambiguous quantity the importer already sent to review is excluded
-    // rather than guessed. Excluding a real movement is exactly what should
-    // surface as a nonzero delta instead of being masked.
-    if (row.quantity === null) continue;
-    total = addDecimal(total, row.quantity);
-  }
-  return total;
+): Promise<string> {
+  const result = await client.query<{ total: string | null }>(
+    `SELECT sum(quantity)::text AS total FROM transactions
+     WHERE account_id = $1 AND instrument_id = $2
+       AND process_date >= $3 AND process_date <= $4
+       AND quantity IS NOT NULL`,
+    [accountId, instrumentId, periodStart, periodEnd],
+  );
+  const total = result.rows[0]?.total;
+  return total === null || total === undefined ? "0" : fromNumericText(total);
 }
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function accountHistory(
-  db: DatabaseSync,
+async function accountHistory(
+  client: ArchiveClient,
   cache: Map<string, AccountHistory>,
   accountId: string,
-): AccountHistory {
+): Promise<AccountHistory> {
   const cached = cache.get(accountId);
   if (cached !== undefined) return cached;
-  const transactions = db
-    .prepare("SELECT min(process_date) AS earliest FROM transactions WHERE account_id = ?")
-    .get(accountId) as { earliest: string | null };
-  const positions = db
-    .prepare("SELECT min(as_of) AS earliest FROM positions WHERE account_id = ?")
-    .get(accountId) as { earliest: string | null };
+  const earliest = await client.query<{
+    earliest_transaction: string | null;
+    first_stated_position: string | null;
+  }>(
+    `SELECT
+       (SELECT min(process_date) FROM transactions WHERE account_id = $1) AS earliest_transaction,
+       (SELECT min(as_of) FROM positions WHERE account_id = $1) AS first_stated_position`,
+    [accountId],
+  );
   const history: AccountHistory = {
-    earliestTransaction: transactions.earliest,
-    firstStatedPositionAsOf: positions.earliest,
+    earliestTransaction: earliest.rows[0]?.earliest_transaction ?? null,
+    firstStatedPositionAsOf: earliest.rows[0]?.first_stated_position ?? null,
   };
   cache.set(accountId, history);
   return history;
@@ -420,8 +409,8 @@ function accountHistory(
  * how many instruments an account holds, so an import log never turns into a
  * row dump.
  */
-function appendImportRunNote(
-  db: DatabaseSync,
+async function appendImportRunNote(
+  client: ArchiveClient,
   importRunId: string,
   summary: {
     periodsChecked: number;
@@ -431,7 +420,7 @@ function appendImportRunNote(
     instrumentsChecked: number;
     coverageGaps: readonly PositionCoverageGap[];
   },
-): void {
+): Promise<void> {
   const notPassed = summary.failed + summary.unverified;
   const note =
     notPassed === 0 && summary.coverageGaps.length === 0
@@ -441,15 +430,16 @@ function appendImportRunNote(
         `(${summary.failed} failed, ${summary.unverified} unverified); ` +
         `${summary.coverageGaps.length} account(s) have transaction history ` +
         `starting after their first stated position`;
-  db.prepare(
+  await client.query(
     `UPDATE import_runs
-     SET reconciliations_passed = reconciliations_passed + ?1,
-         reconciliations_failed = reconciliations_failed + ?2,
+     SET reconciliations_passed = reconciliations_passed + $1,
+         reconciliations_failed = reconciliations_failed + $2,
          notes = CASE
-           WHEN ?3 IS NULL THEN notes
-           WHEN notes IS NULL THEN ?3
-           ELSE notes || ' | ' || ?3
+           WHEN $3::text IS NULL THEN notes
+           WHEN notes IS NULL THEN $3::text
+           ELSE notes || ' | ' || $3::text
          END
-     WHERE id = ?4`,
-  ).run(summary.passed, notPassed, note, importRunId);
+     WHERE id = $4`,
+    [summary.passed, notPassed, note, importRunId],
+  );
 }
