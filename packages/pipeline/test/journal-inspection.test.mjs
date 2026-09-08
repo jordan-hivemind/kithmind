@@ -395,9 +395,12 @@ test("held source or path locks report contention without implying worker health
 });
 
 test("inspection rejects binding changes, unsafe state nodes, permissions, and directory overflow without cleanup", async () => {
-  const mismatchDirectory = await temporaryDirectory();
-  const authority = binding();
-  let journal = await openJournal(mismatchDirectory, authority);
+  const {
+    directory: mismatchDirectory,
+    authority,
+    journal: mismatchJournal,
+  } = await fixtureWithJournal();
+  let journal = mismatchJournal;
   await journal.close();
   assert.deepEqual(
     await inspectJournalReadOnly({
@@ -410,8 +413,12 @@ test("inspection rejects binding changes, unsafe state nodes, permissions, and d
   );
   await rm(mismatchDirectory, { recursive: true, force: true });
 
-  const permissionDirectory = await temporaryDirectory();
-  journal = await openJournal(permissionDirectory, authority);
+  const {
+    directory: permissionDirectory,
+    authority: permissionAuthority,
+    journal: permissionJournal,
+  } = await fixtureWithJournal();
+  journal = permissionJournal;
   await journal.close();
   const permissionState = join(permissionDirectory, "state.json");
   await chmod(permissionState, 0o644);
@@ -419,7 +426,7 @@ test("inspection rejects binding changes, unsafe state nodes, permissions, and d
   assert.deepEqual(
     await inspectJournalReadOnly({
       directory: permissionDirectory,
-      binding: authority,
+      binding: permissionAuthority,
       codec,
       credentialForComparison: CREDENTIAL,
     }),
@@ -428,14 +435,18 @@ test("inspection rejects binding changes, unsafe state nodes, permissions, and d
   assert.deepEqual(await snapshot(permissionDirectory), permissionBefore);
   await rm(permissionDirectory, { recursive: true, force: true });
 
-  const directoryPermission = await temporaryDirectory();
-  journal = await openJournal(directoryPermission, authority);
+  const {
+    directory: directoryPermission,
+    authority: directoryPermissionAuthority,
+    journal: directoryPermissionJournal,
+  } = await fixtureWithJournal();
+  journal = directoryPermissionJournal;
   await journal.close();
   await chmod(directoryPermission, 0o755);
   assert.deepEqual(
     await inspectJournalReadOnly({
       directory: directoryPermission,
-      binding: authority,
+      binding: directoryPermissionAuthority,
       codec,
       credentialForComparison: CREDENTIAL,
     }),
@@ -457,8 +468,12 @@ test("inspection rejects binding changes, unsafe state nodes, permissions, and d
   );
   await rm(fifoDirectory, { recursive: true, force: true });
 
-  const crowdedDirectory = await temporaryDirectory();
-  journal = await openJournal(crowdedDirectory, authority);
+  const {
+    directory: crowdedDirectory,
+    authority: crowdedAuthority,
+    journal: crowdedJournal,
+  } = await fixtureWithJournal();
+  journal = crowdedJournal;
   await journal.close();
   for (let index = 0; index < 64; index += 1) {
     await writeFile(
@@ -471,7 +486,7 @@ test("inspection rejects binding changes, unsafe state nodes, permissions, and d
   assert.deepEqual(
     await inspectJournalReadOnly({
       directory: crowdedDirectory,
-      binding: authority,
+      binding: crowdedAuthority,
       codec,
       credentialForComparison: CREDENTIAL,
     }),

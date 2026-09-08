@@ -14,7 +14,10 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { restoreResticObject } from "../dist/archiveCommands.js";
+import {
+  restoreResticObject,
+  restoreResticSnapshotPath,
+} from "../dist/archiveCommands.js";
 
 const sha = (v) => createHash("sha256").update(v).digest("hex");
 test("restores one exact ciphertext object with a no-clobber destination", async () => {
@@ -201,6 +204,78 @@ test("restore rejects a symlink destination without modifying its target", async
     await assert.rejects(() => restoreResticObject(f.input), /already exists/);
     assert.equal(await readFile(target, "utf8"), "keep");
     assert.equal((await lstat(f.input.destinationPath)).isSymbolicLink(), true);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("legacy snapshot paths stay exact and separate from the local destination", async () => {
+  const f = await failureFixture("normal");
+  try {
+    const { objectName, ...input } = f.input;
+    const objectPath = "/Users/synthetic/.local/old database/snapshot.age";
+    const restored = await restoreResticSnapshotPath({ ...input, objectPath });
+    assert.equal(restored.objectPath, objectPath);
+    assert.equal(restored.destinationPath, input.destinationPath);
+    assert.equal("objectName" in restored, false);
+    assert.deepEqual(
+      await readFile(input.destinationPath),
+      await readFile(join(f.dir, "data")),
+    );
+    const calls = (await readFile(join(f.dir, "calls"), "utf8"))
+      .trim()
+      .split("\n")
+      .map(JSON.parse);
+    assert.deepEqual(calls.find((args) => args.includes("dump")).slice(-3), [
+      "dump",
+      input.snapshotId,
+      objectPath,
+    ]);
+    await assert.rejects(
+      () =>
+        restoreResticObject({
+          ...input,
+          destinationPath: join(f.dir, "second.age"),
+          objectName: objectPath,
+        }),
+      /object name is invalid/,
+    );
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("snapshot path restore rejects ambiguous paths without starting a dump", async () => {
+  const f = await failureFixture("normal");
+  try {
+    const { objectName, ...input } = f.input;
+    for (const objectPath of [
+      "relative.age",
+      "/",
+      "//source.age",
+      "/x/../source.age",
+      "/x/./source.age",
+      "/x//source.age",
+      "/x\\source.age",
+      "/source.age\n",
+      "/" + "a".repeat(4096),
+    ]) {
+      await assert.rejects(
+        () => restoreResticSnapshotPath({ ...input, objectPath }),
+        /restore identity is invalid/,
+      );
+    }
+    const calls = (await readFile(join(f.dir, "calls"), "utf8"))
+      .trim()
+      .split("\n")
+      .map(JSON.parse);
+    assert.equal(
+      calls.some((args) => args.includes("dump")),
+      false,
+    );
+    await assert.rejects(() => lstat(input.destinationPath), {
+      code: "ENOENT",
+    });
   } finally {
     await f.cleanup();
   }

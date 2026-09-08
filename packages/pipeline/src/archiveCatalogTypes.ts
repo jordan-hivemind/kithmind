@@ -268,6 +268,22 @@ export type ArchiveBoundaryRelocationArtifact = {
   ciphertextByteLength: number;
 };
 
+export type ArchiveBoundaryRelocationArtifactBinding =
+  ArchiveBoundaryRelocationArtifact & {
+    kind: "original_backup" | "provider_locator" | "parser_backup";
+    catalogId: string;
+    plaintextSha256: string;
+    plaintextByteLength: number;
+  };
+
+export type ArchiveBoundaryRelocationPreparation = {
+  authorityDigest: string;
+  catalogRevision: number;
+  oldBoundary: RemoteBackupBoundary;
+  artifacts: ArchiveBoundaryRelocationArtifact[];
+  artifactBindings: ArchiveBoundaryRelocationArtifactBinding[];
+};
+
 /**
  * Append-only authority for resolving an exact historical remote boundary
  * after a provider metadata move. Historical copy receipts remain unchanged.

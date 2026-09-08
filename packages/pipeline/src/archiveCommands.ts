@@ -15,6 +15,8 @@ import {
   type ArchiveToolVersions,
   type BackupResticObjectInput,
   type EncryptAgeObjectInput,
+  type DecryptAgeRecoveryInput,
+  type DecryptedAgeRecoveryObject,
   type ForgetResticBackupInput,
   type ForgetResticBackupResult,
   type LocalBackupBoundary,
@@ -27,6 +29,8 @@ import {
   type ReadbackResticObjectInput,
   type RestoreResticObjectInput,
   type RestoredResticObject,
+  type RestoreResticSnapshotPathInput,
+  type RestoredResticSnapshotPath,
   type RecoveredResticBackup,
   type RecoverResticBackupInput,
   type ResticBackupResult,
@@ -695,7 +699,7 @@ async function streamAgeOutput(
   plaintext: Buffer,
   outputPath: string,
   commandLimits: ArchiveCommandLimits,
-): Promise<void> {
+): Promise<FileIdentity> {
   requiredOpenConstants();
   const parent = dirname(outputPath);
   await safeDirectory(parent, "age output parent");
@@ -784,6 +788,7 @@ async function streamAgeOutput(
     stderr?.fill(0);
     await handle.close().catch(() => undefined);
   }
+  return createdIdentity;
 }
 
 function decodeUtf8(buffer: Buffer): string {
@@ -1130,6 +1135,60 @@ async function probeArchiveToolsInternal(
     requireResticVersion(tools.resticBinary, commandLimits),
   ]);
   return { age: AGE_VERSION, restic: RESTIC_VERSION };
+}
+
+async function decryptAgeRecoveryInternal(
+  input: DecryptAgeRecoveryInput,
+): Promise<DecryptedAgeRecoveryObject> {
+  const commandLimits = limits(input.limits ?? DEFAULT_ARCHIVE_COMMAND_LIMITS);
+  if (!HEX_64.test(input.expectedPlaintextSha256))
+    fail("invalid_input", "expected plaintext hash is invalid");
+  const expected = expectedFile(input.expectedCiphertext, commandLimits.maxCipherBytes);
+  await validateExecutable(input.ageBinary, "age binary");
+  await requireAgeVersion(input.ageBinary, commandLimits);
+  const ciphertextPath = safeAbsolutePath(input.ciphertextPath, "ciphertext path");
+  const outputPath = safeAbsolutePath(input.outputPath, "recovery output path");
+  const identityPath = safeAbsolutePath(input.identityPath, "recovery identity path");
+  if (outputPath === ciphertextPath || outputPath === identityPath)
+    fail("invalid_input", "recovery paths must differ");
+  const directory = await safeDirectory(dirname(outputPath), "recovery output directory");
+  const key = await readExactFile(identityPath, 16 * 1024, true);
+  let ciphertext: Awaited<ReturnType<typeof readExactFile>> | undefined;
+  let ownedOutput: FileIdentity | undefined;
+  try {
+    const keyStats = await lstat(identityPath);
+    if (keyStats.nlink !== 1 || (keyStats.mode & 0o777) !== FILE_MODE)
+      fail("unsafe_path", "recovery identity permissions or links are invalid");
+    const lines = decodeUtf8(key.bytes).split(/\r?\n/).filter(line => line && !line.startsWith("#"));
+    if (lines.length < 1 || lines.length > 8 || lines.some(line => !/^AGE-SECRET-KEY-(?:PQ-)?1[0-9A-Z]+$/.test(line)))
+      fail("invalid_input", "only native unencrypted recovery identities are supported");
+    ciphertext = await readExactFile(ciphertextPath, commandLimits.maxCipherBytes, true);
+    if (ciphertext.digest.sha256 !== expected.sha256 || ciphertext.digest.byteLength !== expected.byteLength)
+      fail("digest_mismatch", "recovery ciphertext identity changed");
+    // Feed the key through stdin. No key value or identity path enters argv/env.
+    ownedOutput = await streamAgeOutput(input.ageBinary,
+      ["--decrypt", "--identity", "-", ciphertextPath], key.bytes, outputPath,
+      { ...commandLimits, maxCipherBytes: commandLimits.maxSourceBytes });
+    await recheckFile(ciphertextPath, ciphertext.identity);
+    const plain = await readExactFile(outputPath, commandLimits.maxSourceBytes, true);
+    plain.bytes.fill(0);
+    const after = await safeDirectory(dirname(outputPath), "recovery output directory");
+    const stats = await lstat(outputPath);
+    if (!sameDirectoryIdentity(directory, after) || stats.nlink !== 1 || (stats.mode & 0o777) !== FILE_MODE || plain.identity.device !== ownedOutput.device || plain.identity.inode !== ownedOutput.inode)
+      fail("unsafe_path", "recovery output identity changed");
+    if (plain.digest.sha256 !== input.expectedPlaintextSha256)
+      fail("digest_mismatch", "recovered plaintext does not match");
+    await dirSync(dirname(outputPath));
+    return { outputPath, plaintext: plain.digest, plaintextDevice: plain.identity.device,
+      plaintextInode: plain.identity.inode, ageVersion: AGE_VERSION,
+      verification: "decrypted_plaintext_hash" };
+  } catch (error) {
+    if (ownedOutput) await unlinkExact(outputPath, ownedOutput);
+    throw error;
+  } finally {
+    key.bytes.fill(0);
+    ciphertext?.bytes.fill(0);
+  }
 }
 
 async function encryptAgeObjectInternal(
@@ -1518,14 +1577,19 @@ async function dirSync(path: string): Promise<void> {
   }
 }
 
-async function restoreResticObjectInternal(
-  input: RestoreResticObjectInput,
-): Promise<RestoredResticObject> {
+async function restoreResticSnapshotPathInternal(
+  input: RestoreResticSnapshotPathInput,
+): Promise<RestoredResticSnapshotPath> {
   requiredOpenConstants();
   const commandLimits = limits(input.limits ?? DEFAULT_ARCHIVE_COMMAND_LIMITS);
   await validateExecutable(input.resticBinary, "restic binary");
   await requireResticVersion(input.resticBinary, commandLimits);
-  if (!HEX_64.test(input.snapshotId) || !OBJECT_NAME.test(input.objectName))
+  if (!HEX_64.test(input.snapshotId) ||
+    typeof input.objectPath !== "string" ||
+    Buffer.byteLength(input.objectPath, "utf8") > 4096 ||
+    !input.objectPath.startsWith("/") ||
+    /[\x00-\x1f\x7f\\]/.test(input.objectPath) ||
+    input.objectPath.slice(1).split("/").some(part => !part || part === "." || part === ".."))
     fail("invalid_input", "restic restore identity is invalid");
   const expected = expectedFile(
     input.expectedCiphertext,
@@ -1577,7 +1641,7 @@ async function restoreResticObjectInternal(
         ...resticBaseArgs(repository.locator, password, repository.options),
         "dump",
         input.snapshotId,
-        `/${input.objectName}`,
+        input.objectPath,
       ],
       undefined,
       repository.environment,
@@ -1693,7 +1757,7 @@ async function restoreResticObjectInternal(
     return {
       destinationPath,
       snapshotId: input.snapshotId,
-      objectName: input.objectName,
+      objectPath: input.objectPath,
       ciphertext: expected,
       resticVersion: RESTIC_VERSION,
       repositoryId: repositoryIdentity.repositoryId,
@@ -2189,6 +2253,13 @@ export async function probeResticRepository(input: ResticRepositoryLocation & {
   return publicOperation(() => probeResticRepositoryInternal(input));
 }
 
+/** Explicit owner recovery only; the ingestion worker never receives this key. */
+export async function decryptAgeRecoveryObject(
+  input: DecryptAgeRecoveryInput,
+): Promise<DecryptedAgeRecoveryObject> {
+  return publicOperation(() => decryptAgeRecoveryInternal(input));
+}
+
 export async function encryptAgeObject(
   input: EncryptAgeObjectInput,
 ): Promise<PreparedAgeObject> {
@@ -2239,7 +2310,22 @@ export async function readbackResticObject(
 export async function restoreResticObject(
   input: RestoreResticObjectInput,
 ): Promise<RestoredResticObject> {
-  return publicOperation(() => restoreResticObjectInternal(input));
+  return publicOperation(async () => {
+    if (!OBJECT_NAME.test(input.objectName))
+      fail("invalid_input", "restic restore object name is invalid");
+    const { objectName, ...shared } = input;
+    const { objectPath: _path, ...restored } = await restoreResticSnapshotPathInternal({
+      ...shared, objectPath: `/${objectName}`,
+    });
+    return { ...restored, objectName };
+  });
+}
+
+/** Restore an exact legacy receipt path inside a snapshot to a separate local destination. */
+export async function restoreResticSnapshotPath(
+  input: RestoreResticSnapshotPathInput,
+): Promise<RestoredResticSnapshotPath> {
+  return publicOperation(() => restoreResticSnapshotPathInternal(input));
 }
 
 export async function backupResticObject(

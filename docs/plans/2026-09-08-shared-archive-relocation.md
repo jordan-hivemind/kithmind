@@ -44,9 +44,30 @@ or validate its application contents. A process death can leave its random
 temporary file, so this helper alone is not resumable restore orchestration.
 The owner command must record and account for those outputs before retrying.
 
-The workflow still requires an owner command connecting all components, a
-protected recipe covering both repositories, and actual decryption and
-database-restore gates. Its synthetic tests do not establish Dropbox identity
+The recipe validator now binds both repositories, exact configuration bytes,
+retained database receipts, and the complete live processing inventory read
+under the held catalog and journal. It derives separate workflow, catalog, and
+owner watcher-reset IDs. Preparation validates the original state; resume
+parsing validates the immutable recipe without requiring that original state
+to remain current after a successful rebind. Historical receipt claims do not
+count as fresh recovery verification.
+
+The immutable recipe store uses a protected file named by the workflow ID.
+It verifies exact canonical bytes and recovers only matching prepared writes;
+conflicting files remain untouched. A recipe-aware session factory is still
+needed to hold the same journal continuously from preparation into execution.
+
+An owner-only age recovery helper verifies ciphertext and plaintext hashes.
+It sends the protected native age identity through standard input and writes
+plaintext into an exclusive protected file. A separate native Convex restore
+verifier stages a hash-pinned backend, deploys only the schema, blocks backend
+outbound connections, checks loopback listener ownership, and compares the
+restored native export with the source. It does not deploy application
+functions, authentication configuration, HTTP routes, or cron definitions.
+
+The workflow still requires an owner command connecting all components
+and fresh provider readback wired into the
+decryption and database-restore gates. Its synthetic tests do not establish Dropbox identity
 preservation or authorize skipping those gates. The current
 component limits are 2,048 inventory objects and 64 MiB per ciphertext object.
 Larger migrations require a separately tested limit change before preparation.
@@ -168,6 +189,20 @@ root-path fingerprints to the unchanged database repository and snapshot
 identities. Existing database receipts remain immutable and readable through
 the historical-boundary alias.
 
+The local rebind changes the watcher identity. Before restarting its heartbeat,
+the owner command must call the existing owner-authenticated
+`models/diagnostics/public:resetWatcher` mutation with the recorded old watcher,
+the new watcher, and a stable request ID derived from the relocation recipe.
+This is a compare-and-set operation. A different current watcher is a conflict,
+and an interrupted call is retried with the same request. The worker credential
+does not receive owner reset privileges. Resume is complete only after the old
+worker has stopped and a heartbeat from the new watcher is accepted.
+
+The command retains its journal locks through recovery and rebind. Doctor's
+lock-contention warning is not, by itself, evidence that the worker is idle.
+The command must distinguish its own held lock using the live journal handle
+and verify the rebound state before the unchanged scan.
+
 ## Required verification
 
 Before the move, retain a protected copy of the local configuration, journal,
@@ -192,8 +227,10 @@ After the metadata move and before rebind:
    environment.
 4. Run the exact-schema restore checks for graph relationships, citations,
    authorization boundaries, historical state, and forgotten-state behavior.
-5. Apply the root-path-only rebind, run doctor, and complete one unchanged scan
-   with no unexpected publication or catalog mutation.
+5. Apply the root-path-only rebind, perform the owner watcher compare-and-set,
+   run doctor, and complete one unchanged scan with no unexpected publication
+   or catalog mutation. Verify the new watcher's heartbeat before declaring
+   normal scheduling restored.
 
 The checks establish continuity of Kith-created recovery artifacts. They do
 not create a duplicate backup boundary for a curated provider original and do
@@ -215,7 +252,9 @@ The implementation requires bounded synthetic tests before an owner move:
 - processing and database ciphertext readback, age plaintext hashes, and an
   isolated native restore pass after the synthetic move; and
 - the worker is rejected while active, and the post-rebind unchanged scan
-  publishes nothing.
+  publishes nothing; and
+- the watcher reset rejects a mismatched current identity, retries the same
+  request after interruption, and cannot be invoked by a worker credential.
 
 ## Sequencing
 

@@ -106,6 +106,26 @@ export type EncryptAgeObjectInput = {
   limits?: ArchiveCommandLimits;
 };
 
+/** Owner-only recovery. Never add private identity paths to worker configuration. */
+export type DecryptAgeRecoveryInput = {
+  ageBinary: string;
+  identityPath: string;
+  ciphertextPath: string;
+  outputPath: string;
+  expectedCiphertext: Sha256File;
+  expectedPlaintextSha256: string;
+  limits?: ArchiveCommandLimits;
+};
+
+export type DecryptedAgeRecoveryObject = {
+  outputPath: string;
+  plaintext: Sha256File;
+  plaintextDevice: number;
+  plaintextInode: number;
+  ageVersion: typeof AGE_VERSION;
+  verification: "decrypted_plaintext_hash";
+};
+
 export type LocalBackupBoundary = {
   mode: "synthetic" | "independent_backup";
   readiness: "synthetic_only" | "different_device_unverified";
@@ -156,15 +176,23 @@ export type ReadbackResticObjectInput = ResticRepositoryLocation & {
   limits?: ArchiveCommandLimits;
 };
 
-export type RestoreResticObjectInput = ResticRepositoryLocation & {
+type ResticRestoreInputBase = ResticRepositoryLocation & {
   resticBinary: string;
   expectedRepositoryId: string;
   passwordCommand: PasswordCommand;
   snapshotId: string;
-  objectName: string;
   expectedCiphertext: Sha256File;
   destinationPath: string;
   limits?: ArchiveCommandLimits;
+};
+
+export type RestoreResticObjectInput = ResticRestoreInputBase & {
+  objectName: string;
+};
+
+/** The source path is inside a pinned snapshot, never a local output path. */
+export type RestoreResticSnapshotPathInput = ResticRestoreInputBase & {
+  objectPath: string;
 };
 
 export type RestoredResticObject = {
@@ -175,6 +203,13 @@ export type RestoredResticObject = {
   resticVersion: typeof RESTIC_VERSION;
   repositoryId: string;
   verification: "exact_ciphertext_restore";
+};
+
+export type RestoredResticSnapshotPath = Omit<
+  RestoredResticObject,
+  "objectName"
+> & {
+  objectPath: string;
 };
 
 export type BackupResticObjectInput = ResticRepositoryLocation & {
