@@ -14,14 +14,24 @@ import test from "node:test";
 import {
   CaptureConflictError,
   readCaptureManifest,
+  resolveRawTreeRoot,
   writeCaptureManifest,
 } from "../dist/index.js";
 
-/** A throwaway raw-tree root, removed when the test ends. */
+// Synthetic space id (F1-28): not a real space, just what exercises the
+// shared-root prefix this suite writes and reads through.
+const SPACE_ID = "space_synthetic_test";
+
+/** A throwaway raw-tree root, removed when the test ends -- the fully
+ * resolved `archive/v1/<spaceId>/` root, matching what production code gets
+ * back from `resolveRawTreeRoot`. */
 function rawTreeRoot(t) {
   const directory = mkdtempSync(join(tmpdir(), "kith-finance-captures-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
-  return directory;
+  return resolveRawTreeRoot({
+    FINANCE_ARCHIVE_RAW_TREE_ROOT: directory,
+    FINANCE_ARCHIVE_SPACE_ID: SPACE_ID,
+  });
 }
 
 const RETENTION = {

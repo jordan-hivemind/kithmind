@@ -148,7 +148,9 @@ export {
   type PersistedAcquisition,
 } from "./adapterImport.js";
 export {
+  ARCHIVE_LAYOUT_VERSION,
   readAndVerify,
+  resolveArchiveSpaceId,
   resolveRawTreeRoot,
   sha256HexOf,
   writeRawDocument,

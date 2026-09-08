@@ -5,13 +5,26 @@
 // it up. This file is where that finally happens: it is the only place in
 // this package that touches node:fs.
 //
-// Layout: content-addressed.
-//   <root>/documents/<sha[0:2]>/<sha[2:4]>/<sha256>
-//   <root>/text/<sha[0:2]>/<sha[2:4]>/<sha256>.txt
+// Layout: content-addressed, under a shared-root prefix (F1-28).
+//   <configured root>/archive/v1/<space id>/documents/<sha[0:2]>/<sha[2:4]>/<sha256>
+//   <configured root>/archive/v1/<space id>/text/<sha[0:2]>/<sha[2:4]>/<sha256>.txt
 // (the text path is hashed on the retained text's own bytes, not the
 // document's -- a separate namespace, so a text blob and a raw document can
 // never collide on path even in principle, on top of sha256 already making a
 // same-namespace collision practically impossible.)
+//
+// The `archive/v1/<space id>` prefix exists because the configured root is a
+// managed root a second subsystem can also write under (the "one managed
+// root, one layout" agreement in
+// docs/plans/2026-09-08-unified-storage-assessment.md), not a directory this
+// writer owns alone. `archive/v1` is a constant of this writer -- bumping the
+// layout version is a deliberate code change, never something a caller
+// selects by configuration -- and the space id is configuration, resolved
+// the same hard-error way as the root itself: see `resolveArchiveSpaceId`
+// below. Without the prefix, two subsystems pointed at the same configured
+// root would collide directly on `documents/`, `text/` and `captures/`.
+// Everything below the prefix -- content addressing, the fan-out, the
+// separate text namespace, write-once, hash verification -- is unchanged.
 //
 // Content addressing over date- or institution-partitioning because it makes
 // two of this task's hard requirements true by construction instead of by
@@ -54,12 +67,47 @@ import type { RetainedPayload } from "./retention.js";
 import { assertRetained } from "./retention.js";
 
 const RAW_TREE_ROOT_ENV = "FINANCE_ARCHIVE_RAW_TREE_ROOT";
+const SPACE_ID_ENV = "FINANCE_ARCHIVE_SPACE_ID";
 
 /**
- * Reads the raw tree root from FINANCE_ARCHIVE_RAW_TREE_ROOT and nowhere
- * else, mirroring the pattern src/mcp/run.ts already uses for the archive
- * path (FINANCE_ARCHIVE_DB_PATH). A real path never belongs in this
- * repository, so there is no default: a missing setting is a hard error
+ * The layout version segment every path this writer produces falls under. A
+ * constant of the writer, not free configuration: the agreed layout can
+ * change later by changing this constant in code, which is unambiguous to a
+ * reader of the tree, rather than by an environment variable that could
+ * point different writers at different, silently incompatible versions.
+ */
+export const ARCHIVE_LAYOUT_VERSION = "v1";
+
+/**
+ * Reads the space id from FINANCE_ARCHIVE_SPACE_ID and nowhere else, the
+ * same pattern `resolveRawTreeRoot` uses for the configured root. The space
+ * id is configuration, not a default: this package has no notion of a
+ * current or implied space, so a missing setting is a hard error naming
+ * exactly what is missing, never a guessed value. No real space id belongs
+ * in this repository.
+ */
+export function resolveArchiveSpaceId(
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const spaceId = env[SPACE_ID_ENV];
+  if (!spaceId) {
+    throw new Error(
+      `${SPACE_ID_ENV} is not set. Point it at the space this archive belongs to; ` +
+        "that id is never committed and this package never defaults to one.",
+    );
+  }
+  return spaceId;
+}
+
+/**
+ * Reads the raw tree root: the configured managed root
+ * (FINANCE_ARCHIVE_RAW_TREE_ROOT, the same env var and nowhere else,
+ * mirroring the pattern src/mcp/run.ts already uses for the archive path,
+ * FINANCE_ARCHIVE_DB_PATH), joined with the fixed `archive/v1` layout
+ * version and the configured space id (FINANCE_ARCHIVE_SPACE_ID, above) --
+ * the prefix a second subsystem writing under the same managed root also
+ * agrees to (F1-28). A real path never belongs in this repository, so
+ * there is no default for either setting: a missing one is a hard error
  * naming exactly what is missing, not a silent fallback to a guessed
  * location.
  */
@@ -74,7 +122,8 @@ export function resolveRawTreeRoot(
         "never committed and this package never defaults to one.",
     );
   }
-  return root;
+  const spaceId = resolveArchiveSpaceId(env);
+  return join(root, "archive", ARCHIVE_LAYOUT_VERSION, spaceId);
 }
 
 export function sha256HexOf(bytes: Uint8Array): string {
