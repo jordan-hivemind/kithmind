@@ -6,6 +6,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   realpath,
   rename,
   rm,
@@ -100,16 +101,18 @@ function config(root, journalDir) {
   };
 }
 
-function binding(journalDir) {
+function binding(endpoint) {
   return {
     protocolVersion: 1,
-    endpoint: fixtureEndpoint(journalDir),
+    endpoint,
     spaceId: "space",
     sourceAccountId: "source",
     configFingerprint: "b".repeat(64),
     credentialSlot: "PIPELINE_TOKEN",
   };
 }
+
+const fixtureJournalAllocations = new Map();
 
 async function fixture(fileCount = 1) {
   const base = await mkdtemp(join(tmpdir(), "kithmind-runner-test-"));
@@ -123,34 +126,104 @@ async function fixture(fileCount = 1) {
       mode: 0o600,
     });
   }
-  return { base, root, journalDir, config: config(root, journalDir) };
+  const setup = {
+    base,
+    root,
+    journalDir,
+    config: config(root, journalDir),
+  };
+  const allocation = { setup, opened: false, attempt: 0 };
+  fixtureJournalAllocations.set(journalDir, allocation);
+  return setup;
 }
 
-async function openJournal(directory, checkpoint = initialCheckpoint) {
-  return await Journal.open({
-    directory,
-    binding: binding(directory),
-    credential: "test-credential",
-    initialCheckpoint: checkpoint,
-    codec: journalCodec,
-  });
-}
-
-async function fixtureWithJournal(fileCount, checkpoint) {
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    const setup = await fixture(fileCount);
+async function openJournal(
+  directory,
+  checkpoint = initialCheckpoint,
+  open = (args) => Journal.open(args),
+) {
+  const allocation = fixtureJournalAllocations.get(directory);
+  if (!allocation || allocation.opened) {
+    return await open({
+      directory,
+      binding: binding(
+        allocation?.setup.config.endpoint ?? fixtureEndpoint(directory),
+      ),
+      credential: "test-credential",
+      initialCheckpoint: checkpoint,
+      codec: journalCodec,
+    });
+  }
+  for (;;) {
+    const candidate = allocation.setup.journalDir;
     try {
-      return {
-        ...setup,
-        journal: await openJournal(setup.journalDir, checkpoint),
-      };
+      const journal = await open({
+        directory: candidate,
+        binding: binding(allocation.setup.config.endpoint),
+        credential: "test-credential",
+        initialCheckpoint: checkpoint,
+        codec: journalCodec,
+      });
+      allocation.opened = true;
+      return journal;
     } catch (error) {
-      await rm(setup.base, { recursive: true, force: true });
-      if (error instanceof JournalLockedError && attempt < 4) continue;
-      throw error;
+      if (!(error instanceof JournalLockedError) || allocation.attempt >= 4)
+        throw error;
+      if ((await readdir(candidate)).length !== 0) throw error;
+      fixtureJournalAllocations.delete(candidate);
+      allocation.attempt += 1;
+      const next = join(
+        allocation.setup.base,
+        `journal-${allocation.attempt}-${randomUUID()}`,
+      );
+      await mkdir(next, { mode: 0o700 });
+      allocation.setup.journalDir = next;
+      allocation.setup.config.journalDir = next;
+      allocation.setup.config.endpoint = fixtureEndpoint(next);
+      fixtureJournalAllocations.set(next, allocation);
     }
   }
 }
+
+async function fixtureWithJournal(fileCount, checkpoint) {
+  const setup = await fixture(fileCount);
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  return { ...setup, journal };
+}
+
+test("fixture lock retries rotate only the initial synthetic binding", async () => {
+  const setup = await fixture(0);
+  const initialDirectory = setup.journalDir;
+  const attemptedEndpoints = [];
+  const journal = await openJournal(
+    setup.journalDir,
+    initialCheckpoint,
+    async (args) => {
+      attemptedEndpoints.push(args.binding.endpoint);
+      if (attemptedEndpoints.length === 1) throw new JournalLockedError();
+      return await Journal.open(args);
+    },
+  );
+  try {
+    assert.notEqual(setup.journalDir, initialDirectory);
+    assert.equal(attemptedEndpoints.length, 2);
+    assert.notEqual(attemptedEndpoints[0], attemptedEndpoints[1]);
+    assert.equal(setup.config.endpoint, attemptedEndpoints[1]);
+    await assert.rejects(
+      () => openJournal(setup.journalDir),
+      JournalLockedError,
+    );
+  } finally {
+    await journal.close();
+  }
+  const reopened = await openJournal(setup.journalDir);
+  try {
+    assert.equal(reopened.binding.endpoint, attemptedEndpoints[1]);
+  } finally {
+    await reopened.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
 
 test("version-1 checkpoints accept only closed PDF and safe-gap scan plans", () => {
   const digest = "a".repeat(64);
@@ -394,6 +467,7 @@ test("PDF seal recheck ignores server identity and disposition fields", async ()
     sha256: createHash("sha256").update(bytes).digest("hex"),
     byteLength: bytes.length,
   });
+  const journal = await openJournal(setup.journalDir);
   const localConfig = {
     ...setup.config,
     pdfDocQa: {
@@ -410,7 +484,6 @@ test("PDF seal recheck ignores server identity and disposition fields", async ()
       },
     },
   };
-  const journal = await openJournal(setup.journalDir);
   const runner = new PipelineRunner(localConfig, journal, {
     async call() {
       throw new Error("network is not used");
