@@ -1,0 +1,33 @@
+{
+  "name": "@repo/postgres-proof",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.10.0"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "node": "./dist/index.js",
+      "default": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "build": "pnpm --filter @repo/finance-contract build && tsc -p tsconfig.json",
+    "check-types": "pnpm --filter @repo/finance-contract check-types && tsc -p tsconfig.json --noEmit",
+    "test": "pnpm run build && node --test test/*.test.mjs",
+    "test:once": "pnpm run build && node --test test/*.test.mjs",
+    "test:integration": "pnpm run build && node --test integration/*.test.mjs"
+  },
+  "dependencies": {
+    "@repo/finance-contract": "workspace:*",
+    "pg": "^8.16.3"
+  },
+  "devDependencies": {
+    "@repo/typescript-config": "workspace:*",
+    "@types/node": "25.3.3",
+    "@types/pg": "^8.15.5",
+    "typescript": "^5.7.0"
+  }
+}

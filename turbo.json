@@ -39,6 +39,10 @@
     "@repo/finance-archive#test:once": {
       "cache": false,
       "dependsOn": ["build"]
+    },
+    "@repo/finance-contract#test:once": {
+      "cache": false,
+      "dependsOn": ["build"]
     }
   },
   "globalPassThroughEnv": ["PORT", "WEB_PORT"],
