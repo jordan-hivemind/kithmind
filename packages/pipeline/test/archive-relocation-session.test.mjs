@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmod,
   access,
   link,
+  mkdir,
   mkdtemp,
+  readdir,
   readFile,
   rm,
   writeFile,
@@ -14,6 +16,14 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { openArchiveCatalog } from "../dist/archiveCatalog.js";
+import {
+  fingerprintLegacyDatabaseBackupReceipt,
+  relocationIntentFromRecipe,
+} from "../dist/archiveRelocationRecipe.js";
+import {
+  prepareRecipeArchiveRelocationSession,
+  resumeRecipeArchiveRelocationSession,
+} from "../dist/archiveRelocationRecipeSession.js";
 import { prepareArchiveRelocationRebind } from "../dist/archiveRelocationRebind.js";
 import {
   ArchiveRelocationSession,
@@ -136,7 +146,7 @@ function remoteBoundary(rootPath) {
   };
 }
 
-async function fixture(t) {
+async function fixture(t, options = { recordMapping: true }) {
   const base = await mkdtemp(join(homedir(), ".kithmind-session-test-"));
   await chmod(base, 0o700);
   t.after(() => rm(base, { recursive: true, force: true }));
@@ -288,7 +298,7 @@ async function fixture(t) {
     ],
     verifiedAt: 10,
   };
-  await catalog.recordBoundaryRelocation(mapping);
+  if (options.recordMapping) await catalog.recordBoundaryRelocation(mapping);
   return {
     base,
     previous,
@@ -296,6 +306,8 @@ async function fixture(t) {
     configPath,
     proposedConfigPath,
     journal,
+    catalog,
+    archivedOriginal: row,
     mapping,
     workflowRelocationId: randomUUID(),
   };
@@ -316,6 +328,319 @@ function preparedState(relocationId) {
     },
   };
 }
+
+function databaseBoundary(rootPath) {
+  return {
+    ...remoteBoundary(rootPath),
+    rootDirectoryIdHash: "f".repeat(64),
+    repositoryId: "9".repeat(64),
+  };
+}
+
+function recipeDraft(f) {
+  const receipt = {
+    kind: "native_database_backup_receipt_v1",
+    status: "passed",
+    repositoryId: "9".repeat(64),
+    rootDirectoryIdHash: "f".repeat(64),
+    snapshotId: "8".repeat(64),
+    snapshotTag: "synthetic-native",
+    objectPath: "/database/synthetic.age",
+    ciphertextHash: "7".repeat(64),
+    ciphertextByteLength: 1_000,
+    payloadHash: "6".repeat(64),
+    nativeZipHash: "5".repeat(64),
+    remoteReadback: true,
+    exactDecryption: true,
+    schemaRestore: "Historical synthetic result",
+    sourcePDFsCopied: false,
+  };
+  const receiptFingerprint = fingerprintLegacyDatabaseBackupReceipt(receipt);
+  const copy = f.archivedOriginal.copies.independent_backup;
+  const artifact = {
+    snapshotId: copy.backup.snapshotId,
+    objectName: copy.backup.objectName,
+    ciphertextSha256: copy.backup.ciphertext.sha256,
+    ciphertextByteLength: copy.backup.ciphertext.byteLength,
+  };
+  const previousConfigText = `${JSON.stringify(f.previous)}\n`;
+  const proposedConfigText = `${JSON.stringify(f.proposed)}\n`;
+  return {
+    version: 1,
+    wholeRoot: {
+      sourceId: "source-folder",
+      sourceParentId: "old-parent",
+      destinationParentId: "new-parent",
+      destinationName: "backups",
+      oldBoundary: {
+        rootPath: "/Kith Mind Backups",
+        rootId: "source-folder",
+      },
+      newRootPath: "/Kith Mind/backups",
+    },
+    processing: {
+      repositoryRelativePath: "processing-artifacts/restic-v1",
+      oldBoundary: remoteBoundary(
+        f.previous.pdfDocQa.archive.independentBackup.repository.rootPath,
+      ),
+      newBoundary: remoteBoundary(
+        f.proposed.pdfDocQa.archive.independentBackup.repository.rootPath,
+      ),
+      artifacts: [artifact],
+      artifactBindings: [
+        {
+          kind: "original_backup",
+          catalogId: f.archivedOriginal.originalCatalogId,
+          ...artifact,
+          plaintextSha256: copy.published.source.sha256,
+          plaintextByteLength: copy.published.source.byteLength,
+        },
+      ],
+    },
+    database: {
+      repositoryRelativePath: "database/restic-v1",
+      oldBoundary: databaseBoundary("Kith Mind Backups/database/restic-v1"),
+      newBoundary: databaseBoundary("Kith Mind/backups/database/restic-v1"),
+      receipts: [{ receiptFingerprint, receipt }],
+      selectedNativeRestoreReceiptFingerprint: receiptFingerprint,
+    },
+    localBindings: {
+      previousConfigPath: f.configPath,
+      proposedConfigPath: f.proposedConfigPath,
+      previousConfigText,
+      proposedConfigText,
+      previousConfigSha256: createHash("sha256")
+        .update(previousConfigText)
+        .digest("hex"),
+      proposedConfigSha256: createHash("sha256")
+        .update(proposedConfigText)
+        .digest("hex"),
+      databaseReceiptPaths: [
+        { receiptFingerprint, path: join(f.base, "database-receipt.json") },
+      ],
+      credentialReferenceFingerprint: "4".repeat(64),
+    },
+  };
+}
+
+test("recipe-aware preparation persists identity before workflow state", async (t) => {
+  const f = await fixture(t, { recordMapping: false });
+  await f.journal.close();
+  const recipeDirectory = join(f.base, "recipes");
+  await mkdir(recipeDirectory, { mode: 0o700 });
+  const prepared = await prepareRecipeArchiveRelocationSession({
+    draft: recipeDraft(f),
+    recipeDirectory,
+    credential: "credential",
+    codec,
+  });
+  try {
+    assert.equal(await prepared.session.store.read(), undefined);
+    assert.deepEqual(
+      JSON.parse(await readFile(prepared.recipePath, "utf8")),
+      prepared.recipe,
+    );
+  } finally {
+    await prepared.session.close();
+  }
+});
+
+test("recipe-aware preparation rejects changed protected config bytes", async (t) => {
+  const f = await fixture(t, { recordMapping: false });
+  await f.journal.close();
+  const recipeDirectory = join(f.base, "recipes");
+  await mkdir(recipeDirectory, { mode: 0o700 });
+  await writeFile(f.configPath, `${JSON.stringify(f.proposed)}\n`, {
+    mode: 0o600,
+  });
+  await assert.rejects(
+    prepareRecipeArchiveRelocationSession({
+      draft: recipeDraft(f),
+      recipeDirectory,
+      credential: "credential",
+      codec,
+    }),
+    /config_conflict/,
+  );
+  assert.deepEqual(await readdir(recipeDirectory), []);
+});
+
+test("recipe-aware resume rejects a stale pre-move catalog", async (t) => {
+  const f = await fixture(t, { recordMapping: false });
+  await f.journal.close();
+  const recipeDirectory = join(f.base, "recipes");
+  await mkdir(recipeDirectory, { mode: 0o700 });
+  const prepared = await prepareRecipeArchiveRelocationSession({
+    draft: recipeDraft(f),
+    recipeDirectory,
+    credential: "credential",
+    codec,
+  });
+  await prepared.session.store.write(
+    preparedState(prepared.recipe.workflowRelocationId),
+  );
+  const original = prepared.session.catalog.listOriginals()[0];
+  await prepared.session.catalog.recordArchivePreparationIntent({
+    subject: "original_bytes",
+    catalogId: original.originalCatalogId,
+    expectedRevision: original.rowRevision,
+    role: "primary",
+    tempName: `${original.copies.primary.archiveObjectId}.tmp`,
+  });
+  await prepared.session.close();
+  await assert.rejects(
+    resumeRecipeArchiveRelocationSession({
+      recipeDirectory,
+      workflowRelocationId: prepared.recipe.workflowRelocationId,
+      expectedRecipeHash: prepared.recipe.recipeHash,
+      credential: "credential",
+      codec,
+    }),
+    /baseline_changed/,
+  );
+});
+
+test("recipe-aware resume rejects changed workflow intent before recovery", async (t) => {
+  const f = await fixture(t, { recordMapping: false });
+  await f.journal.close();
+  const recipeDirectory = join(f.base, "recipes");
+  await mkdir(recipeDirectory, { mode: 0o700 });
+  const prepared = await prepareRecipeArchiveRelocationSession({
+    draft: recipeDraft(f),
+    recipeDirectory,
+    credential: "credential",
+    codec,
+  });
+  const changed = preparedState(prepared.recipe.workflowRelocationId);
+  changed.intent.sourceParentId = "different-parent";
+  await prepared.session.store.write(changed);
+  await prepared.session.close();
+  await assert.rejects(
+    resumeRecipeArchiveRelocationSession({
+      recipeDirectory,
+      workflowRelocationId: prepared.recipe.workflowRelocationId,
+      expectedRecipeHash: prepared.recipe.recipeHash,
+      credential: "credential",
+      codec,
+    }),
+    /phase_conflict/,
+  );
+});
+
+test("recipe-aware resume accepts exact verified mapping and paired rebind", async (t) => {
+  const f = await fixture(t, { recordMapping: false });
+  await f.journal.close();
+  const recipeDirectory = join(f.base, "recipes");
+  await mkdir(recipeDirectory, { mode: 0o700 });
+  const prepared = await prepareRecipeArchiveRelocationSession({
+    draft: recipeDraft(f),
+    recipeDirectory,
+    credential: "credential",
+    codec,
+  });
+  const verifiedAt = 50;
+  const intent = relocationIntentFromRecipe(prepared.recipe);
+  await prepared.session.store.write({
+    version: 1,
+    phase: "verified",
+    intent,
+    preMoveVerifiedAt: 20,
+    preMoveVerifiedArtifacts: prepared.recipe.body.processing.artifacts,
+    destinationId: intent.sourceId,
+    newBoundary: {
+      rootPath: intent.newRootPath,
+      rootId: intent.sourceId,
+    },
+    movedAt: 30,
+    verifiedAt,
+    verifiedArtifacts: prepared.recipe.body.processing.artifacts,
+  });
+  await prepared.session.catalog.recordBoundaryRelocation({
+    relocationId: prepared.recipe.catalogRelocationId,
+    oldBoundary: prepared.recipe.body.processing.oldBoundary,
+    newBoundary: prepared.recipe.body.processing.newBoundary,
+    artifacts: prepared.recipe.body.processing.artifacts,
+    verifiedAt,
+  });
+  await prepared.session.close();
+  const resumed = await resumeRecipeArchiveRelocationSession({
+    recipeDirectory,
+    workflowRelocationId: prepared.recipe.workflowRelocationId,
+    expectedRecipeHash: prepared.recipe.recipeHash,
+    credential: "credential",
+    codec,
+  });
+  try {
+    assert.equal(resumed.state.phase, "verified");
+    assert.equal(
+      (
+        await resumed.session.journal.archiveRelocationRebindStatus({
+          previousConfig: f.previous,
+          proposedConfig: f.proposed,
+        })
+      ).state,
+      "proposed",
+    );
+    assert.equal(
+      await readFile(f.configPath, "utf8"),
+      `${JSON.stringify(f.proposed)}\n`,
+    );
+  } finally {
+    await resumed.session.close();
+  }
+});
+
+test("recipe-aware resume will not repair a premature later-phase rebind", async (t) => {
+  const f = await fixture(t, { recordMapping: false });
+  await f.journal.close();
+  const recipeDirectory = join(f.base, "recipes");
+  await mkdir(recipeDirectory, { mode: 0o700 });
+  const prepared = await prepareRecipeArchiveRelocationSession({
+    draft: recipeDraft(f),
+    recipeDirectory,
+    credential: "credential",
+    codec,
+  });
+  const verifiedAt = 50;
+  const intent = relocationIntentFromRecipe(prepared.recipe);
+  await prepared.session.store.write({
+    version: 1,
+    phase: "rebound",
+    intent,
+    preMoveVerifiedAt: 20,
+    preMoveVerifiedArtifacts: prepared.recipe.body.processing.artifacts,
+    destinationId: intent.sourceId,
+    newBoundary: {
+      rootPath: intent.newRootPath,
+      rootId: intent.sourceId,
+    },
+    movedAt: 30,
+    verifiedAt,
+    verifiedArtifacts: prepared.recipe.body.processing.artifacts,
+  });
+  await prepared.session.catalog.recordBoundaryRelocation({
+    relocationId: prepared.recipe.catalogRelocationId,
+    oldBoundary: prepared.recipe.body.processing.oldBoundary,
+    newBoundary: prepared.recipe.body.processing.newBoundary,
+    artifacts: prepared.recipe.body.processing.artifacts,
+    verifiedAt,
+  });
+  await prepared.session.close();
+  await assert.rejects(
+    resumeRecipeArchiveRelocationSession({
+      recipeDirectory,
+      workflowRelocationId: prepared.recipe.workflowRelocationId,
+      expectedRecipeHash: prepared.recipe.recipeHash,
+      credential: "credential",
+      codec,
+    }),
+    /phase_conflict/,
+  );
+  assert.equal(
+    await readFile(f.configPath, "utf8"),
+    `${JSON.stringify(f.previous)}\n`,
+  );
+});
 
 test("protected store persists with CAS and recovers only its exact next transition", async (t) => {
   const f = await fixture(t);
