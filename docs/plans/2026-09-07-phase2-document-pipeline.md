@@ -174,3 +174,7 @@ coverage-aware answers. See the
 in parallel and does not block the first document-Q&A trial. P2-10 reuses its
 canonical financial records where adopted, so the same accounts and statements
 are never ingested twice.
+# Finder metadata
+
+The client scanner ignores an exact regular file named `.DS_Store`. Finder
+metadata is excluded from observations and is never deleted from the source.

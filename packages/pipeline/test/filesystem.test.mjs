@@ -67,6 +67,19 @@ test("unsupported filesystem nodes fail the whole discovery", async () => {
   );
 });
 
+test("ignores Finder metadata after regular-file safety checks", async () => {
+  const { root, journal } = await setup();
+  for (let i = 0; i < 9; i += 1) await writeFile(join(root, `file-${i}.txt`), "synthetic");
+  await writeFile(join(root, ".DS_Store"), "synthetic Finder metadata");
+  const localConfig = config(root, journal, { maxFiles: 9 });
+  const roots = await canonicalRoots(localConfig);
+  const observations = await discoverSourceObservations(localConfig, roots);
+  assert.equal(observations.length, 9);
+  assert.ok(observations.every((observation) => observation.kind === "utf8"));
+  await writeFile(join(root, ".hidden.txt"), "ordinary hidden file");
+  assert.equal((await discoverSourceObservations(config(root, journal, { maxFiles: 10 }), roots)).length, 10);
+});
+
 test("BOM-prefixed UTF-8 preserves byte identity through text admission", async () => {
   const { root, journal } = await setup();
   const bytes = Buffer.from([0xef, 0xbb, 0xbf, 0x61, 0x62, 0x63]);
