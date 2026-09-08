@@ -91,6 +91,7 @@ import type * as models_provenance_binary from "../models/provenance/binary.js";
 import type * as models_provenance_migrations from "../models/provenance/migrations.js";
 import type * as models_provenance_model from "../models/provenance/model.js";
 import type * as models_provenance_parsedStaging from "../models/provenance/parsedStaging.js";
+import type * as models_provenance_providerOriginals from "../models/provenance/providerOriginals.js";
 import type * as models_provenance_representations from "../models/provenance/representations.js";
 import type * as models_provenance_tables from "../models/provenance/tables.js";
 import type * as models_provenance_validators from "../models/provenance/validators.js";
@@ -153,6 +154,7 @@ import type * as models_workers_parsedProtocol from "../models/workers/parsedPro
 import type * as models_workers_private from "../models/workers/private.js";
 import type * as models_workers_profile from "../models/workers/profile.js";
 import type * as models_workers_protocol from "../models/workers/protocol.js";
+import type * as models_workers_providerOriginalForget from "../models/workers/providerOriginalForget.js";
 import type * as models_workers_rateLimit from "../models/workers/rateLimit.js";
 import type * as models_workers_tables from "../models/workers/tables.js";
 import type * as models_workers_validators from "../models/workers/validators.js";
@@ -247,6 +249,7 @@ declare const fullApi: ApiFromModules<{
   "models/provenance/migrations": typeof models_provenance_migrations;
   "models/provenance/model": typeof models_provenance_model;
   "models/provenance/parsedStaging": typeof models_provenance_parsedStaging;
+  "models/provenance/providerOriginals": typeof models_provenance_providerOriginals;
   "models/provenance/representations": typeof models_provenance_representations;
   "models/provenance/tables": typeof models_provenance_tables;
   "models/provenance/validators": typeof models_provenance_validators;
@@ -309,6 +312,7 @@ declare const fullApi: ApiFromModules<{
   "models/workers/private": typeof models_workers_private;
   "models/workers/profile": typeof models_workers_profile;
   "models/workers/protocol": typeof models_workers_protocol;
+  "models/workers/providerOriginalForget": typeof models_workers_providerOriginalForget;
   "models/workers/rateLimit": typeof models_workers_rateLimit;
   "models/workers/tables": typeof models_workers_tables;
   "models/workers/validators": typeof models_workers_validators;
