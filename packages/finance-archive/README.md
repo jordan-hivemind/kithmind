@@ -161,6 +161,13 @@ is known and explaining why it is unknown when it is not. A `null`
 it, because the plan is explicit that a total-assets query with no valuation
 basis silently mixes marked securities with positions carried at cost.
 
+`ParsedRow.quantity` is signed by direction: positive for an acquisition,
+negative for a disposal, whatever the source calls the activity. A sale of
+ten shares is `"-10"`, not `"10"` with the sign carried on `amount` alone.
+The position gate replays these quantities against a stated position change,
+and the sign cannot be recovered downstream from `activityType`, which is
+free provider text with no taxonomy behind it.
+
 `capabilities` declares which of the four sources
 (`structured_api`, `tabular_export`, `pdf_statement`, `trade_confirmation`)
 an adapter actually implements, its retention window, and free-text quirks.
@@ -285,6 +292,92 @@ This gate does not populate `balances`; writing what a statement stated is a
 separate concern from checking it. Re-running after a corrected import is
 idempotent: any prior row for the same account and period is replaced, not
 added to.
+
+## Position quantity gate
+
+`runPositionReconciliationGate(db, importRunId?)`
+(`src/positionReconciliation.ts`) is the validation half of holdings and the
+position-side analogue of the cash gate. Run it after
+`runReconciliationGate` against the same `import_runs` row:
+
+```ts
+const cash = runReconciliationGate(db, runId);
+const positions = runPositionReconciliationGate(db, runId);
+```
+
+Both increment the same `import_runs` counters. The position gate appends to
+`import_runs.notes` rather than replacing it, so the cash gate's note
+survives.
+
+Stated holdings are authoritative and are what the archive reports. Derived
+holdings -- quantity replayed from transactions -- are a gate and never a
+second source of truth, so nothing here writes to `positions` and no derived
+quantity is ever reported as a holding.
+
+**What is compared.** For every account and instrument with two or more
+stated `positions` snapshots, each consecutive pair of snapshots is one
+period. The gate diffs the two stated quantities and compares that against
+the sum of `transactions.quantity` for the same account and instrument over
+the window, inclusive of both boundary dates, matching the cash gate.
+Transaction quantities must be signed: an acquisition is positive and a
+disposal negative, which is the adapter's responsibility.
+
+**The anchor is the prior stated position, never zero.** Acquired history
+rarely reaches an account's opening, so a comparison derived from zero would
+fail every period forever and teach everyone to skip the gate. An account
+holding 400 shares whose acquired history begins a decade after it opened
+still passes a period in which it bought 25 more.
+
+**Quantity only. Cost basis is not gated.** Quantity is additive and exactly
+reconcilable; cost basis depends on lot selection, wash sales, return of
+capital and provider adjustments, and tax-lot matching is deferred. This file
+never reads `cost_basis`, `market_value`, `price` or `unrealized`, so nothing
+in it can fail a period on a basis divergence. A stated basis is recorded by
+the importer and any question about it goes to `review_items`.
+
+**Corporate actions fail periods until they are modelled.** A split changes
+quantity with no transaction behind it, so under an exact tolerance those
+periods fail. That is the gate surfacing a modelling gap, not absorbing one,
+and there is deliberately no heuristic that guesses at a split.
+
+**The tolerance is exact zero**, the same owner decision the cash gate
+applies, written to `position_reconciliations.tolerance` on every row so a
+later loosening cannot silently reinterpret an old pass. Quantities are
+canonical decimal `TEXT`, so the comparison goes through `subtractDecimal`
+and `compareDecimal`; no quantity passes through `parseFloat`, `Number` or a
+`REAL` column at any point.
+
+**Coverage is reported, not tolerated.** A first stated snapshot with no
+prior snapshot has no period to check, which is not a failure. But an account
+whose transaction history begins after one of its stated positions has a
+period that cannot be checked at all, no matter what the sum comes to. Those
+periods are `unverified` with a note naming both dates, and the summary's
+`coverageGaps` measures the gap per account: the first stated position, where
+transaction history actually starts, and how many periods that left
+unverified. `get_coverage` reports the same thing per account as
+`positions.historyStartsAfterFirstStatedPosition`, alongside
+`positionPeriods` status counts. `min(transactions.process_date)` is the
+archive's only record of how far back activity was acquired, so it is what
+"history starts here" means.
+
+A position with no `instrument_id` is skipped: it has no identity to pair
+snapshots on, and pooling such rows would invent a holding.
+
+### Why a separate table
+
+`position_reconciliations` is a table of its own rather than an
+`instrument_id` column on `reconciliations`, for two reasons that are not
+stylistic. First, a cash change is `INTEGER` minor units and a quantity
+change is canonical decimal `TEXT`; the `CHECK` constraints pinning those
+storage classes are how a `REAL` from a parser is caught at write time, and
+sharing the columns would mean dropping exactly those checks.
+`reconciliations.currency` is also `NOT NULL` and meaningless for a share
+count. Second, a cash verdict and a position verdict must stay
+distinguishable: with one table, every existing `SELECT ... FROM
+reconciliations WHERE status != 'pass'` would silently start returning
+per-instrument rows and every account's period list would multiply by its
+instrument count. Two tables make the distinction the table name, which no
+query can miss.
 
 ## Wiring an adapter to the importer
 

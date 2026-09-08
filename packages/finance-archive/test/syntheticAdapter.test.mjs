@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  compareDecimal,
   createSyntheticSession,
   exhaustiveListing,
   incompleteListing,
@@ -229,6 +230,36 @@ test("parse() on the tabular export cross-checks the same activity the structure
 
   const sampleDescription = apiRows[0].description;
   assert.ok(tabularRows.some((row) => row.description === sampleDescription));
+});
+
+test("parse() signs quantity by direction: a disposal is negative, an acquisition positive", async () => {
+  const session = createSyntheticSession();
+  const acquired = await syntheticAdapter.acquire({
+    kind: "structured_api",
+    session,
+    periodStart: "2025-01-01",
+    periodEnd: "2025-04-01",
+  });
+  const { activity: rows } = await syntheticAdapter.parse({
+    kind: "structured_api",
+    bytes: acquired.bytes,
+  });
+
+  const buys = rows.filter((row) => row.activityType === "buy");
+  const sells = rows.filter((row) => row.activityType === "sell");
+  assert.ok(buys.length > 0 && sells.length > 0);
+
+  // The position gate replays these quantities against a stated position
+  // change, so an unsigned disposal would read as an acquisition and fail
+  // every period containing a sale. The sign lives on quantity itself and
+  // cannot be recovered from activityType, which is free provider text.
+  assert.ok(buys.every((row) => compareDecimal(row.quantity, "0") > 0));
+  assert.ok(sells.every((row) => compareDecimal(row.quantity, "0") < 0));
+
+  // Cash and quantity carry opposite signs on a trade: a sale pays in and
+  // reduces the holding.
+  assert.ok(sells.every((row) => compareDecimal(row.amount, "0") > 0));
+  assert.ok(buys.every((row) => compareDecimal(row.amount, "0") < 0));
 });
 
 test("parse() on a PDF statement surfaces the ambiguous row as null with a note, not a guess", async () => {

@@ -28,6 +28,8 @@ const TABLE_NOTES: Readonly<Record<string, string>> = Object.freeze({
     "One row per importer run: files seen, rows inserted or skipped, reconciliations passed or failed, review items opened.",
   reconciliations:
     "Per account and period: expected vs. computed change and pass/fail/unverified status. A period without a passing row here is not verified.",
+  position_reconciliations:
+    "Per account, instrument and period: expected vs. computed quantity change and pass/fail/unverified status. Quantity only; cost basis is never gated here.",
   review_items:
     "Ambiguous or out-of-range values a person or agent must judge. status is open, resolved or dismissed.",
 });
@@ -47,6 +49,11 @@ const COLUMN_NOTES: Readonly<Record<string, string>> = Object.freeze({
   "reconciliations.status": "pass | fail | unverified.",
   "reconciliations.tolerance":
     "INTEGER minor units. The gate's tolerance for this period, recorded even when it passed.",
+  "position_reconciliations.status": "pass | fail | unverified.",
+  "position_reconciliations.tolerance":
+    "Canonical decimal TEXT. The gate's tolerance for this period, recorded even when it passed.",
+  "position_reconciliations.expected_change":
+    "Stated quantity change between two consecutive positions snapshots. Canonical decimal TEXT, never a float.",
   "review_items.status": "open | resolved | dismissed.",
 });
 
@@ -59,6 +66,8 @@ const MONEY_POLICY =
   "Quantities, prices, rates and running balances (transactions.quantity/price/fx_rate/" +
   "running_balance, positions.quantity/price, liabilities.rate, commitments.fx_rate) are " +
   "multiplied and compared, never aggregated, and are canonical base-10 decimal TEXT instead. " +
+  "position_reconciliations.expected_change/computed_change/delta/tolerance are quantity changes, " +
+  "so they are canonical decimal TEXT too, unlike the same-named minor-unit columns on reconciliations. " +
   "No rounding happens on ingest: a value with more precision than its currency allows is stored " +
   "as NULL with a review_items row, never rounded into place.";
 
