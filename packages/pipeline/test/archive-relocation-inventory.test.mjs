@@ -166,6 +166,28 @@ test("source and destination continuity ignores only repository root paths", () 
   }
 });
 
+test("accepts actual helper boundary key order in snapshot and tree inventories", () => {
+  const input = structuredClone(inventory("old"));
+  for (const repository of [input.processing, input.database]) {
+    for (const holder of [repository.snapshots, ...repository.trees]) {
+      const boundary = holder.boundary;
+      holder.boundary = {
+        mode: boundary.mode,
+        readiness: boundary.readiness,
+        backend: boundary.backend,
+        remoteName: boundary.remoteName,
+        rootPath: boundary.rootPath,
+        rootDirectoryIdHash: boundary.rootDirectoryIdHash,
+        configIdentityFingerprint: boundary.configIdentityFingerprint,
+        resticVersion: boundary.resticVersion,
+        rcloneVersion: boundary.rcloneVersion,
+        repositoryId: boundary.repositoryId,
+      };
+    }
+  }
+  assert.doesNotThrow(() => reconcileArchiveRelocationInventory(input));
+});
+
 test("rejects missing, extra, ambiguous, or misbound snapshot trees", () => {
   const cases = [
     (value) => value.processing.snapshots.snapshots.pop(),

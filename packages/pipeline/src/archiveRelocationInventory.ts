@@ -108,7 +108,21 @@ function exactBoundary(
   actual: RemoteBackupBoundary,
   expected: RemoteBackupBoundary,
 ): void {
-  if (JSON.stringify(actual) !== JSON.stringify(expected))
+  const keys = [
+    "mode",
+    "readiness",
+    "backend",
+    "remoteName",
+    "rootPath",
+    "rootDirectoryIdHash",
+    "configIdentityFingerprint",
+    "repositoryId",
+    "resticVersion",
+    "rcloneVersion",
+  ] as const;
+  exactKeys(actual, keys);
+  exactKeys(expected, keys);
+  if (keys.some((key) => actual[key] !== expected[key]))
     fail("inventory_conflict");
 }
 
@@ -490,6 +504,11 @@ export function reconcileArchiveRelocationInventory(args: {
   }
 }
 
+/**
+ * Compares fresh, in-process reconciler outputs. This is not a parser or
+ * authenticity check for a persisted manifest; persisted evidence must be
+ * rebuilt from its immutable recipe and fresh inventories.
+ */
 export function assertArchiveRelocationInventoryContinuity(
   source: ArchiveRelocationInventoryManifest,
   destination: ArchiveRelocationInventoryManifest,
