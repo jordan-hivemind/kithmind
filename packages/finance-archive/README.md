@@ -284,6 +284,100 @@ through as `ImportRow.amountNote`; the importer opens a `review_items` entry
 for it exactly as it does for an amount `toMinorUnits` rejects, rather than
 letting it vanish.
 
+## Raw tree
+
+`acquire` (`src/adapter.ts`) returns bytes and a manifest; it does not write
+anything to disk. `src/rawTree.ts` is where those bytes -- and any retained
+extracted text -- are actually persisted, per ground rule 1: raw files are
+immutable, written once, never edited, never deleted.
+
+The root directory is configuration, read from
+`FINANCE_ARCHIVE_RAW_TREE_ROOT` and nowhere else, the same pattern
+`src/mcp/run.ts` uses for `FINANCE_ARCHIVE_DB_PATH`: a missing setting is a
+hard error naming exactly what is missing, never a default and never a
+guessed location. No real path appears in this repository, in a fixture, or
+in a test.
+
+Layout is content-addressed:
+
+```
+<root>/documents/<sha[0:2]>/<sha[2:4]>/<sha256>
+<root>/documents/<sha[0:2]>/<sha[2:4]>/<sha256>.manifest.json
+<root>/text/<sha[0:2]>/<sha[2:4]>/<sha256>.txt
+```
+
+`documents/` is addressed by the raw bytes' own hash, with a
+`.manifest.json` sidecar next to each one (see "Self-describing manifest"
+below); `text/` is addressed by the retained text's own hash, in a separate
+namespace so a text blob and a raw document can never collide on path even
+in principle. Content addressing was chosen over date- or
+institution-partitioning because it makes two of this module's hard
+requirements true by construction instead of by convention someone could get
+wrong: identical bytes always land on the same path, so a repeat write of
+the same content is caught by the layout itself rather than a lookup a
+caller has to remember to run, and two different byte strings can never
+collide on a path, because the path *is* their hash. A 2+2 hex fan-out
+(65536 buckets) keeps any one directory small at tens of thousands of
+documents, which stays fine for a person to browse by hand.
+
+Write-once is enforced with a hard link, not a rename or a plain write:
+linking a temp file into the final content-addressed path fails outright if
+that path is already occupied, rather than silently overwriting it, so a
+repeat acquisition of identical bytes is always a reported no-op
+(`status: "already_exists"`), never a rewrite and never a run-aborting
+error. Nothing in this module ever deletes an existing raw-tree file.
+
+The content hash is verified twice: once right after writing, against a temp
+file read back from disk (catches a bad write before it is ever linked into
+the tree), and once again whenever a write lands on a path that already
+exists (catches a corrupted prior file rather than silently trusting its
+presence). `readAndVerify(path, sha256)` is the same check exposed as a
+general-purpose readback function, so a mismatch anywhere -- a bit flip, a
+truncated copy, a tampered file -- is a thrown error naming both hashes,
+never wrong bytes returned as if they were fine.
+
+`persistAcquiredDocument(db, rawTreeRoot, descriptor, extractedText?)`
+(`src/adapterImport.ts`) is the call site: it writes an `AcquiredDocument`'s
+bytes, its manifest sidecar, and, when supplied, its retained extracted
+text, and cross-checks the written sha256 against the adapter's own
+`manifest.contentHash` -- an adapter that mis-hashed its own bytes is
+exactly the kind of bug provenance exists to catch. `descriptor` names the
+`institutionId`, `accountId` and `docType` a pull belongs to (both ids are
+foreign keys, so a valid one guarantees a real row to resolve the
+institution's slug and the account's last four digits from); its result is
+the *only* way to obtain an `AdapterPull.persisted` -- `AdapterPull` has no
+free-form `filePath` field a caller could invent -- so `documents.file_path`
+(`importBatch`, `src/importer.ts`) ends up pointing at a file that actually
+exists rather than a path no code ever created, structurally rather than by
+a caller remembering to persist first.
+
+`text_path` is populated after the fact, not threaded through
+`ImportDocument`/`importBatch` (out of this module's scope): once a
+document's raw bytes are imported and its text is written,
+`recordRetainedTextPath(db, sha256, textPath)` runs a targeted
+`UPDATE documents SET text_path = ... WHERE sha256 = ...`, so `get_evidence`
+can return a path to the retained text instead of null.
+
+### Self-describing manifest
+
+Ground rule 1 does not stop at "raw files are immutable." It also says
+structured data is derived and the archive can be rebuilt from scratch. The
+archive database is that structured data: lose it, and a directory of
+extension-less files named by hash is unlabelled unless the raw tree itself
+says what each one is. `writeRawDocumentManifest` writes that label as a
+`.manifest.json` sidecar next to each document's bytes, recording its
+sha256, the institution's slug (not the database's internal row id, which
+means nothing once the database that minted it is gone), the account's last
+four digits, document type, statement period, capture time, capability
+tier, any acquisition gaps, and the original file extension when the source
+gave one. It is write-once exactly like the bytes it describes -- a second
+write for the same document is a no-op, never a rewrite, even if the
+content offered would differ -- because the manifest is part of what was
+acquired, not something to revise later. `readRawDocumentManifest` reads one
+back; `test/rawTree.test.mjs` has a test that persists documents, discards
+the database entirely, and confirms every document is still identifiable
+from the raw tree alone.
+
 ## Schema and migrations
 
 `openArchive(path)` opens the file, sets `foreign_keys`, WAL and a busy timeout,
