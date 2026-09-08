@@ -16,12 +16,28 @@ yet provide an owner relocation command. No live move or deletion has occurred.
   move intent, recovers uncertain outcomes by stable identity, and requires
   identical post-move inventory before invoking rebind and scan gates.
 
+The next component adds a Dropbox adapter and paired journal/config rebind
+APIs. The adapter binds both move endpoints to stable folder IDs and checks
+the account, parent, name, and resulting path. A separate account-bound root
+marker represents the top-level parent; the adapter does not enumerate that
+root. The move disables automatic renaming and ownership transfer.
+
+The rebind intent retains exact config bytes, paths, catalog mapping/revision,
+and old/new journal state hashes. It requires a current credential and idle
+journal under the existing locks. Recovery accepts either half-written pair
+only when those identities still match. The journal changes its heartbeat
+identity and invalidates its prior in-memory instance; callers must use the
+returned journal and reopen its catalog. The recovery tests use a real local
+catalog but synthetic artifacts, not owner backup data.
+
 The workflow still requires a concrete durable store with an exclusive lease,
-the Dropbox provider adapter, a paired journal/config rebind, and the actual
-decryption and database-restore gates. Its synthetic tests do not establish
-Dropbox identity preservation or authorize skipping those gates. The current
+an owner command connecting all components, and actual decryption and
+database-restore gates. Its synthetic tests do not establish Dropbox identity
+preservation or authorize skipping those gates. The current
 component limits are 2,048 inventory objects and 64 MiB per ciphertext object.
 Larger migrations require a separately tested limit change before preparation.
+The owner command must also select an OAuth refresh path outside the moved
+root and verify that the old heartbeat stops before resuming the new one.
 
 ## Purpose
 
