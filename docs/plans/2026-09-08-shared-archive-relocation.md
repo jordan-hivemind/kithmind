@@ -52,6 +52,11 @@ parsing validates the immutable recipe without requiring that original state
 to remain current after a successful rebind. Historical receipt claims do not
 count as fresh recovery verification.
 
+The immutable recipe store uses a protected file named by the workflow ID.
+It verifies exact canonical bytes and recovers only matching prepared writes;
+conflicting files remain untouched. A recipe-aware session factory is still
+needed to hold the same journal continuously from preparation into execution.
+
 An owner-only age recovery helper verifies ciphertext and plaintext hashes.
 It sends the protected native age identity through standard input and writes
 plaintext into an exclusive protected file. A separate native Convex restore
@@ -60,8 +65,8 @@ outbound connections, checks loopback listener ownership, and compares the
 restored native export with the source. It does not deploy application
 functions, authentication configuration, HTTP routes, or cron definitions.
 
-The workflow still requires an owner command connecting all components,
-protected recipe persistence, and fresh provider readback wired into the
+The workflow still requires an owner command connecting all components
+and fresh provider readback wired into the
 decryption and database-restore gates. Its synthetic tests do not establish Dropbox identity
 preservation or authorize skipping those gates. The current
 component limits are 2,048 inventory objects and 64 MiB per ciphertext object.
