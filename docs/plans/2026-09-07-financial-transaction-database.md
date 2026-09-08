@@ -48,7 +48,7 @@ records where adopted rather than re-extracting the same documents.
 | Access surface for v1    | A local read-only MCP server over the archive. Not a five-operation typed contract, and not the Kith Mind adapter.                                                                                                                                                          |
 | Query shape              | Read-only SQL plus a documented schema, exposed through the local server. Frequently used shapes are promoted into typed operations later, once real questions have shown which ones matter.                                                                                |
 | Where the code lives     | This repository, MIT, with synthetic fixtures.                                                                                                                                                                                                                              |
-| Where the data lives     | Outside this repository, in a configured local directory. Never in git, never in a hosted service, never in a shared folder.                                                                                                                                                |
+| Where the data lives     | Outside this repository, in a configured local directory. Never in git. Local first because it is the simpler starting point, not a ban on hosting: an off-machine destination stays open, and anything that leaves the machine is encrypted before it goes.                                                                                                                                                |
 | Standing CSV exports     | Not produced. A table mirror beside a live database is a second source of truth. Backup is a file copy plus a hash. Export is an on-demand script.                                                                                                                          |
 
 The typed-bounded-query rule in the record contract exists to protect
@@ -303,10 +303,14 @@ Public: the store, schema and migrations; the adapter interface; adapter
 implementations and their synthetic fixtures; the importer, reconciliation gate
 and MCP server; the README and this plan.
 
-Local only, outside the repository: the archive file, the raw document tree,
-import logs, and any configuration naming a real path, institution account,
-program, person or balance. Institution-specific extraction notes that reference
-a real account inventory stay in the gitignored private documentation tree.
+Outside the repository, and local first: the archive file, the raw document
+tree, import logs, and any configuration naming a real path, institution
+account, program, person or balance. Local is the current default because it is
+simpler, not a rule against an off-machine copy. An encrypted backup
+destination is expected, since a single local copy of an acquired retention
+window is the one loss this design cannot recover from. Institution-specific
+extraction notes that reference a real account inventory stay in the gitignored
+private documentation tree.
 
 Public examples use root aliases and synthetic institutions. No real account
 number, balance, holding, advisor, entity or file path appears in the public
