@@ -554,8 +554,19 @@ function reconcileProviderTargets(
     });
     if (candidates.length !== 1)
       throw { code: "provider_target_identity_mismatch" };
+    const providerCopy = candidates[0]!.row.providerOriginal!.locator;
+    if (
+      providerCopy.reviewCode ||
+      !providerCopy.prepared ||
+      !providerCopy.published ||
+      !providerCopy.backup ||
+      (providerCopy.deletion &&
+        (providerCopy.deletion.reason !== "forget" ||
+          providerCopy.deletion.forgetEpoch !== target.forgetEpoch))
+    )
+      throw { code: "provider_locator_incomplete" };
     matched.set(target.referenceId, candidates[0]!.row);
-    const deletion = candidates[0]!.row.providerOriginal!.locator.deletion;
+    const deletion = providerCopy.deletion;
     if (
       target.ack &&
       (!deletion ||
