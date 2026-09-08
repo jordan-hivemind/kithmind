@@ -412,33 +412,69 @@ test("journal directory replacement poisons subsequent persistence", async () =>
   await rm(moved, { recursive: true, force: true });
 });
 
-test("SIGKILL releases the kernel source lock for automatic restart", async () => {
-  const childPath = await directory();
-  const restartPath = await directory();
-  const authority = binding();
+async function startKillFixture() {
   const moduleUrl = new URL("../dist/journal.js", import.meta.url).href;
-  const script = `
-    import { Journal } from ${JSON.stringify(moduleUrl)};
-    const codec = { parseCheckpoint: (value) => value, parseResult: (_operation, value) => value };
-    await Journal.open({ directory: ${JSON.stringify(childPath)}, binding: ${JSON.stringify(authority)}, credential: "credential", initialCheckpoint: { version: 1, phase: "idle" }, codec });
-    process.stdout.write("ready\\n");
-    setInterval(() => {}, 1000);
-  `;
-  const child = spawn(
-    process.execPath,
-    ["--input-type=module", "--eval", script],
-    { stdio: ["ignore", "pipe", "pipe"] },
-  );
-  await new Promise((resolve, reject) => {
-    child.stdout.once("data", (chunk) =>
-      chunk.toString().includes("ready")
-        ? resolve()
-        : reject(new Error("child did not lock")),
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const childPath = await directory();
+    const restartPath = await directory();
+    const authority = binding();
+    const script = `
+      import { Journal } from ${JSON.stringify(moduleUrl)};
+      const codec = { parseCheckpoint: (value) => value, parseResult: (_operation, value) => value };
+      try {
+        await Journal.open({ directory: ${JSON.stringify(childPath)}, binding: ${JSON.stringify(authority)}, credential: "credential", initialCheckpoint: { version: 1, phase: "idle" }, codec });
+        process.stdout.write("ready\\n");
+        setInterval(() => {}, 1000);
+      } catch (error) {
+        if (error?.name === "JournalLockedError") {
+          process.stderr.write("fixture_locked\\n");
+          process.exit(73);
+        }
+        process.stderr.write("fixture_failed\\n");
+        process.exit(74);
+      }
+    `;
+    const child = spawn(
+      process.execPath,
+      ["--input-type=module", "--eval", script],
+      { stdio: ["ignore", "pipe", "pipe"] },
     );
-    child.once("error", reject);
-    child.once("exit", (code) =>
-      code === null ? undefined : reject(new Error(`child exited ${code}`)),
-    );
+    let stderr = "";
+    child.stderr.on("data", (chunk) => {
+      if (stderr.length < 256) stderr += chunk.toString();
+    });
+    const outcome = await new Promise((resolve, reject) => {
+      const onData = (chunk) => {
+        if (!chunk.toString().includes("ready")) return;
+        child.stdout.off("data", onData);
+        resolve({ ready: true });
+      };
+      child.stdout.on("data", onData);
+      child.once("error", reject);
+      child.once("close", (code) => {
+        child.stdout.off("data", onData);
+        resolve({ ready: false, code });
+      });
+    });
+    if (outcome.ready) return { authority, child, childPath, restartPath };
+    await rm(childPath, { recursive: true, force: true });
+    await rm(restartPath, { recursive: true, force: true });
+    if (outcome.code === 73 && stderr === "fixture_locked\n" && attempt < 4)
+      continue;
+    throw new Error(`fixture child exited ${outcome.code}`);
+  }
+  throw new Error("fixture allocation exhausted");
+}
+
+test("SIGKILL releases the kernel source lock for automatic restart", async (t) => {
+  const { authority, child, childPath, restartPath } = await startKillFixture();
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
+      await new Promise((resolve) => child.once("exit", resolve));
+    }
+    await rm(childPath, { recursive: true, force: true });
+    await rm(restartPath, { recursive: true, force: true });
   });
   await assert.rejects(
     () =>
@@ -455,6 +491,4 @@ test("SIGKILL releases the kernel source lock for automatic restart", async () =
     credential: "credential",
   });
   await restarted.close();
-  await rm(childPath, { recursive: true, force: true });
-  await rm(restartPath, { recursive: true, force: true });
 });
