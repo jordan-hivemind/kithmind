@@ -156,6 +156,27 @@ export type ReadbackResticObjectInput = ResticRepositoryLocation & {
   limits?: ArchiveCommandLimits;
 };
 
+export type RestoreResticObjectInput = ResticRepositoryLocation & {
+  resticBinary: string;
+  expectedRepositoryId: string;
+  passwordCommand: PasswordCommand;
+  snapshotId: string;
+  objectName: string;
+  expectedCiphertext: Sha256File;
+  destinationPath: string;
+  limits?: ArchiveCommandLimits;
+};
+
+export type RestoredResticObject = {
+  destinationPath: string;
+  snapshotId: string;
+  objectName: string;
+  ciphertext: Sha256File;
+  resticVersion: typeof RESTIC_VERSION;
+  repositoryId: string;
+  verification: "exact_ciphertext_restore";
+};
+
 export type BackupResticObjectInput = ResticRepositoryLocation & {
   resticBinary: string;
   expectedRepositoryId: string;
