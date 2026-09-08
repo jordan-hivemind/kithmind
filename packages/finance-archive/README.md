@@ -188,8 +188,46 @@ transaction from being inserted at all, because `process_date` has no other
 spelling to store; every other case stores what the source stated (or NULL
 for the field in question) and flags it.
 
-The reconciliation gate (F1-4) is not implemented here; `reconciliations_passed`
-and `reconciliations_failed` are always written as 0 by this importer.
+This importer always writes `reconciliations_passed` and `reconciliations_failed`
+as 0; the reconciliation gate is a separate step run after import (see below).
+
+## Reconciliation gate
+
+`runReconciliationGate(db, importRunId?)` (`src/reconciliation.ts`) is ground
+rule 3 made concrete: reconciliation is a gate, not a report. For every
+account with two or more `balances` snapshots, it treats each consecutive
+pair of snapshots as one statement period, sums that account's transactions
+over the period (inclusive of both boundary dates), and compares the sum
+against the snapshots' stated cash change. It writes one `reconciliations`
+row per period and returns the same information as counts and period-level
+facts, never a transaction row.
+
+**The comparison is always cash, never total value.** Market movement makes
+an exact diff possible only for a cash-like balance: an unrealized gain or
+loss on a held security changes `total_value` without ever appearing as a
+transaction, so comparing against `total_value` would fail an investment
+account's every period on ordinary market movement. This file never reads
+`total_value`, `period_start_value` or `period_end_value` at all, so there is
+nothing in it that could compare against them by mistake. For a cash-only
+account (checking, savings) `cash` is the account's only balance, so the same
+comparison is correct there unchanged.
+
+**The tolerance is exact zero**, an owner decision, not a default: any
+nonzero delta fails the period. `reconciliations.tolerance` is written on
+every row, passing or not, so a future policy change can never silently
+reinterpret an old pass. A period is `pass` when the delta is exactly zero,
+`fail` when transactions were summed but do not explain the stated change,
+and `unverified` when no verdict could be computed at all -- a snapshot
+missing its cash value, or a currency change between snapshots. `fail` and
+`unverified` both count toward `import_runs.reconciliations_failed`: neither
+is a clean pass, and the table has no third bucket. A consumer finds every
+period needing attention with `SELECT * FROM reconciliations WHERE status !=
+'pass'`, which is exactly what `get_coverage` already does per account.
+
+This gate does not populate `balances`; writing what a statement stated is a
+separate concern from checking it. Re-running after a corrected import is
+idempotent: any prior row for the same account and period is replaced, not
+added to.
 
 ## Schema and migrations
 
