@@ -47,7 +47,7 @@ after export, and no listeners remained.
 | Text verification | Page hashes, UTF-16 quote slices, quote hashes, complete text hash, chunk coverage, and mapping-manifest digest matched |
 | Recovery linkage | Active item/revision/generation pointers, ready ingest job, completed activation receipt, generation ID, and activation time matched |
 | Live read linkage | Three pre-export keyword reads resolved to the same restored document and the exact restored chunks and evidence spans |
-| P2-21 indexed state | Stage, binary receipt, and payload-manifest indexed reads matched before and after the native round trip |
+| P2-21 indexed state | Pre-export indexed queries found the expected stage, binary receipts, and payload manifest; those exact rows were preserved in the restored snapshot and checked by the offline graph verifier |
 | Isolation | Outbound access denied, zero application functions, backend stopped, and zero listeners remained |
 
 The first private helper attempt stopped before archive admission because it
@@ -84,18 +84,21 @@ imported back into development.
 
 ## Commands and retained evidence
 
-The owner verification used the exact development deployment on every Convex
-command. Its bounded sequence was:
+The development exports and live fixture operations named the exact development
+deployment. The isolated deploy, import, and export instead used only the new
+local backend URL and admin key through `CONVEX_SELF_HOSTED_URL` and
+`CONVEX_SELF_HOSTED_ADMIN_KEY`; they never selected a cloud target. The bounded
+sequence was:
 
 ```text
 convex export --deployment <exact-development-name> --include-file-storage
 esbuild packages/convex/convex/schema.ts --bundle --platform=node --format=esm --external:convex/server --external:convex/values
-convex deploy --typecheck disable --codegen disable
-convex import --replace-all --yes <fixture-snapshot>
-convex export --include-file-storage
+CONVEX_SELF_HOSTED_URL=<loopback-url> CONVEX_SELF_HOSTED_ADMIN_KEY=<fresh-key> convex deploy --typecheck disable --codegen disable
+CONVEX_SELF_HOSTED_URL=<loopback-url> CONVEX_SELF_HOSTED_ADMIN_KEY=<fresh-key> convex import --replace-all --yes <fixture-snapshot>
+CONVEX_SELF_HOSTED_URL=<loopback-url> CONVEX_SELF_HOSTED_ADMIN_KEY=<fresh-key> convex export --include-file-storage
 ```
 
-Private evidence retains the three development snapshots, restored snapshot,
+Private evidence retains the four development snapshots, restored snapshot,
 schema bundle and metafile, exact row comparison, restored graph verification,
 fixture IDs, cleanup acknowledgements, failed-attempt cleanup, and final scope
 audit. Directories use mode `0700`; files use mode `0600`. No private ID,
