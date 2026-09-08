@@ -27,6 +27,8 @@ import {
   type ReadbackResticObjectInput,
   type RestoreResticObjectInput,
   type RestoredResticObject,
+  type RestoreResticSnapshotPathInput,
+  type RestoredResticSnapshotPath,
   type RecoveredResticBackup,
   type RecoverResticBackupInput,
   type ResticBackupResult,
@@ -1518,14 +1520,19 @@ async function dirSync(path: string): Promise<void> {
   }
 }
 
-async function restoreResticObjectInternal(
-  input: RestoreResticObjectInput,
-): Promise<RestoredResticObject> {
+async function restoreResticSnapshotPathInternal(
+  input: RestoreResticSnapshotPathInput,
+): Promise<RestoredResticSnapshotPath> {
   requiredOpenConstants();
   const commandLimits = limits(input.limits ?? DEFAULT_ARCHIVE_COMMAND_LIMITS);
   await validateExecutable(input.resticBinary, "restic binary");
   await requireResticVersion(input.resticBinary, commandLimits);
-  if (!HEX_64.test(input.snapshotId) || !OBJECT_NAME.test(input.objectName))
+  if (!HEX_64.test(input.snapshotId) ||
+    typeof input.objectPath !== "string" ||
+    Buffer.byteLength(input.objectPath, "utf8") > 4096 ||
+    !input.objectPath.startsWith("/") ||
+    /[\x00-\x1f\x7f\\]/.test(input.objectPath) ||
+    input.objectPath.slice(1).split("/").some(part => !part || part === "." || part === ".."))
     fail("invalid_input", "restic restore identity is invalid");
   const expected = expectedFile(
     input.expectedCiphertext,
@@ -1577,7 +1584,7 @@ async function restoreResticObjectInternal(
         ...resticBaseArgs(repository.locator, password, repository.options),
         "dump",
         input.snapshotId,
-        `/${input.objectName}`,
+        input.objectPath,
       ],
       undefined,
       repository.environment,
@@ -1693,7 +1700,7 @@ async function restoreResticObjectInternal(
     return {
       destinationPath,
       snapshotId: input.snapshotId,
-      objectName: input.objectName,
+      objectPath: input.objectPath,
       ciphertext: expected,
       resticVersion: RESTIC_VERSION,
       repositoryId: repositoryIdentity.repositoryId,
@@ -2239,7 +2246,22 @@ export async function readbackResticObject(
 export async function restoreResticObject(
   input: RestoreResticObjectInput,
 ): Promise<RestoredResticObject> {
-  return publicOperation(() => restoreResticObjectInternal(input));
+  return publicOperation(async () => {
+    if (!OBJECT_NAME.test(input.objectName))
+      fail("invalid_input", "restic restore object name is invalid");
+    const { objectName, ...shared } = input;
+    const { objectPath: _path, ...restored } = await restoreResticSnapshotPathInternal({
+      ...shared, objectPath: `/${objectName}`,
+    });
+    return { ...restored, objectName };
+  });
+}
+
+/** Restore an exact legacy receipt path inside a snapshot to a separate local destination. */
+export async function restoreResticSnapshotPath(
+  input: RestoreResticSnapshotPathInput,
+): Promise<RestoredResticSnapshotPath> {
+  return publicOperation(() => restoreResticSnapshotPathInternal(input));
 }
 
 export async function backupResticObject(
