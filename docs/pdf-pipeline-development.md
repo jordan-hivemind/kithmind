@@ -69,6 +69,13 @@ The synthetic parser evaluation remains separate. Keep its fixtures, recipes,
 and scored outputs unchanged; do not use evaluation labels or scoring code as
 the production interface. See the [parser evaluation guide](../evals/parser/README.md).
 
+For existing Dropbox originals, the optional
+[provider-reference path](plans/2026-09-08-provider-original-reference.md) verifies
+the file in place and backs up only parser output, encrypted locator metadata,
+and database state. It never uploads a second original PDF to the Kith backup
+folder. Initial ingestion is supported; automated provider-reference refresh and
+replacement-machine registry bootstrap remain separate follow-ups.
+
 ## Single-owner configuration
 
 Use the existing worker configuration and commands. Add `pdfDocQa` only for

@@ -1,7 +1,8 @@
 # Provider original reference contract
 
-**Status:** Adopted design for P2-29. Implementation is underway. Owner-data
-admission remains pending verification.
+**Status:** First-binding implementation and development lifecycle checks are complete.
+Release checks and owner admission remain pending. Replacement-machine registry
+bootstrap and reference refresh are separate follow-ups.
 
 ## Decision
 
@@ -20,8 +21,9 @@ The first supported recovery set has these members:
 
 The provider reference is evidence that exact bytes existed at a verified time.
 It is not a promise that Dropbox will retain those bytes forever. The encrypted
-locator manifest makes the reference usable after loss of the original laptop.
-It is Kith-created metadata and contains no PDF bytes.
+locator manifest preserves the information needed after loss of the original
+laptop. Registry bootstrap tooling is a follow-up. The manifest is Kith-created
+metadata and contains no PDF bytes.
 
 The legacy four-receipt path remains valid and byte compatible. New Dropbox
 admissions cannot create an `original_bytes:independent_backup` receipt.
@@ -119,14 +121,14 @@ readback. The declaration binds the plaintext manifest fingerprint, age
 recipient, restic key domain, repository, snapshot, object name, ciphertext
 hash, ciphertext length, and readback time.
 
-Recovery on another computer uses the protected credential recovery runbook to
-open the restic repository and age identity. It selects the exact repository,
-snapshot, and object name, verifies ciphertext, decrypts, verifies the canonical
-manifest fingerprint, and hashes every raw provider ID before comparing it
-with the hosted reference. It then reads exact Dropbox metadata and bytes and
-recomputes both Dropbox content hash and ordinary SHA-256. Unknown, moved,
-changed, ambiguous, or unavailable objects require review. Path lookup alone
-cannot establish recovery identity.
+The initial release records the repository, snapshot, object, ciphertext, and
+manifest identities in the encrypted native database snapshot and verifies that
+snapshot can be restored. It does not yet bootstrap a lost machine's provider
+registry from those artifacts. Follow-up P2-30 adds a runnable command to restore
+the exact locator ciphertext, verify and decrypt it, recreate the protected
+registry, hash every raw provider ID against the restored reference, and
+revalidate Dropbox metadata and bytes. Unknown, moved, changed, ambiguous, or
+unavailable objects require review. Path lookup alone cannot establish identity.
 
 ## Hosted persistence
 
@@ -236,6 +238,11 @@ verification. Provider deletion, version expiry, access revocation, or account
 loss can make the provider original unavailable without invalidating hosted
 text and citations.
 
+The initial runner does not create a refreshed reference. It fails closed when
+admission freshness expires or stored verification or locator identity differs.
+Automated same-identity refresh and historical locator reconciliation are
+follow-up P2-31.
+
 ## Forget contract
 
 Beginning forget continues to hide source links and hosted content immediately.
@@ -304,7 +311,8 @@ and version retention are outside this assertion.
 
 ## Verification
 
-Synthetic tests must cover:
+Current synthetic checks cover the initial binding. Items 8 and 10 are explicit
+follow-up acceptance requirements, not completed release claims:
 
 1. exact request bounds and rejection of mixed three/four archive sets;
 2. stale and future verification times;
@@ -315,10 +323,11 @@ Synthetic tests must cover:
 6. legacy request digest and response byte compatibility;
 7. generation, lookup, assessment, read, migration, and cleanup handling for
    both exact branches;
-8. same-identity provider refresh without processing identity changes;
+8. follow-up P2-31: same-identity provider refresh without processing identity
+   changes and cleanup of every historical locator;
 9. changed provider identity requiring review;
-10. recovery on an isolated directory using only restored credentials, hosted
-    hashes, and the encrypted locator bundle;
+10. follow-up P2-30: registry bootstrap in an isolated directory using only
+    restored credentials, native snapshot references, and encrypted locators;
 11. immediate hosted hiding and exact locator metadata deletion while the
     Dropbox source remains byte-for-byte unchanged; and
 12. assertions that no original PDF path, bytes, token, raw provider ID, or
@@ -329,3 +338,18 @@ The owner trial must verify known originals through official Dropbox metadata
 and the local block-hash algorithm before admission. It must record zero PDF
 uploads and zero Dropbox delete calls. Provider availability after the
 verification time remains an explicit limitation, not an archival guarantee.
+
+## Development verification
+
+The initial provider branch passed hosted admission, staging, activation and
+replay with three synthetic Unicode pages. Search and document reads returned
+exact page citations and admission-time provider recovery status. A schema-only,
+network-isolated native restore preserved 143 entries and 333 rows including the
+table inventory. Provider identity, locator coordinates, immutable fingerprints,
+and exactly three archive receipts were verified after restoration.
+
+Scoped synthetic forget acknowledged three Kith archive targets and one provider
+locator, replayed the acknowledgements, removed the hosted graph, revoked the
+test credential and disabled the source. The provider outcome means Kith issued
+no write or delete to the source. Remote live absence does not prove that Dropbox
+has erased retained history. No owner PDF was admitted by these synthetic checks.
