@@ -85,12 +85,25 @@ currencies, so a mixed total is a loud failure instead of a plausible number.
 ## Deduplication
 
 `rowHash` is the deduplication contract. It hashes over account, process date,
-activity type, description, quantity and amount, using canonical forms, with the
-currency included because an amount in minor units has no meaning without the
-scale its currency gives it. Activity type is lowercased and whitespace inside
-descriptions is collapsed, since PDF extraction varies the gaps between runs. A
-provider transaction ID is preferred where one exists and is stable; the hash is
-the fallback. `transactions.row_hash` is `UNIQUE`.
+activity type, description, quantity, amount and an occurrence ordinal, using
+canonical forms, with the currency included because an amount in minor units
+has no meaning without the scale its currency gives it. Activity type is
+lowercased and whitespace inside descriptions is collapsed, since PDF
+extraction varies the gaps between runs. A provider transaction ID is
+preferred where one exists and is stable; the hash is the fallback.
+`transactions.row_hash` is `UNIQUE`.
+
+The occurrence ordinal is what lets one hash formula satisfy two opposite
+requirements at once: the same transaction reappearing on an overlapping page
+must dedupe, and two really-distinct transactions that happen to share a date,
+amount and description must not merge. It is a hashed field, computed by the
+importer as "how many times has this exact content been seen so far in this
+one source document, in document order" (first occurrence is 1) — never
+appended to a hash after the fact, because a suffix appended post-hoc would
+make `row_hash` stop being a hash of the row's content and would make "unique
+row_hash count equals inserted row count" true by construction instead of a
+real invariant. See `src/importer.ts` for the full reasoning and worked
+examples.
 
 ## Institution adapter interface
 
@@ -154,19 +167,26 @@ in the row's own currency, and `providerTxnId` is a stable per-account id from
 the source when one exists.
 
 Deduplication follows the plan exactly: a stable `providerTxnId` is the
-preferred identity and is what correctly collapses an overlapping page from a
-paginated pull. Without one, the importer falls back to content hashing and
-never merges two rows on the strength of matching content alone, so two
-legitimately identical transactions (same date, amount, description) are both
-kept, each under its own disambiguated `row_hash`. Re-importing the same raw
-bytes is a no-op at the whole-document level, keyed on `documents.sha256`.
+preferred, authoritative identity and is what correctly collapses an
+overlapping page from a paginated pull regardless of row order. Without one,
+the importer looks up the computed `row_hash` (content plus the per-document
+occurrence ordinal, see "Deduplication" above) before inserting; a match found
+in a different document is skipped as a duplicate rather than colliding at
+write time, and because that collapse rests on content evidence rather than a
+stable id, it opens a `review_items` entry recording both source locators
+instead of happening silently. A match within the same document cannot
+happen, since every occurrence in one document gets its own ordinal, which is
+exactly how two legitimately identical transactions (same date, amount,
+description) both survive. Re-importing the same raw bytes is a no-op at the
+whole-document level, keyed on `documents.sha256`, checked before any of this.
 
 A value `toMinorUnits` cannot place at the currency's exponent, a malformed
-quantity, price or running balance, an unparseable process date, a future
-date, or a date before 1900 each open a `review_items` row instead of being
-guessed. Only an unparseable process date blocks the transaction from being
-inserted at all, because `process_date` has no other spelling to store; every
-other case stores what the source stated and flags it.
+quantity, price, running balance, trade date or settle date, an unparseable
+process date, a future date, or a date before 1900 each open a `review_items`
+row instead of being guessed. Only an unparseable process date blocks the
+transaction from being inserted at all, because `process_date` has no other
+spelling to store; every other case stores what the source stated (or NULL
+for the field in question) and flags it.
 
 The reconciliation gate (F1-4) is not implemented here; `reconciliations_passed`
 and `reconciliations_failed` are always written as 0 by this importer.

@@ -275,15 +275,12 @@ test("equal date, amount and description is not proof of duplication: distinct p
     .prepare("SELECT row_hash, provider_txn_id FROM transactions ORDER BY provider_txn_id")
     .all();
   assert.equal(stored.length, 2);
-  // Both rows hash identically on content; the stored row_hash values must
-  // still differ, because row_hash is UNIQUE and these are two real rows.
-  // One keeps the plain content hash; the other is disambiguated with a
-  // deterministic suffix built from its own provider id.
+  // Both rows share the same content, but they are the first and second
+  // occurrence of that content within this one document, so the occurrence
+  // ordinal hashed into row_hash differs and so do the stored values. Each
+  // is a plain sha256 hex digest; nothing is appended after the fact.
   assert.notEqual(stored[0].row_hash, stored[1].row_hash);
-  const bases = stored.map((s) => s.row_hash.split("#")[0]);
-  assert.equal(bases[0], bases[1]);
-  assert.equal(stored.some((s) => !s.row_hash.includes("#")), true);
-  assert.equal(stored.some((s) => s.row_hash.includes("#")), true);
+  for (const s of stored) assert.match(s.row_hash, /^[0-9a-f]{64}$/);
 });
 
 test("equal date, amount and description without a provider id: both distinct rows are preserved, not merged", (t) => {
@@ -320,6 +317,119 @@ test("equal date, amount and description without a provider id: both distinct ro
     .all()
     .map((r) => r.row_hash);
   assert.notEqual(hashes[0], hashes[1]);
+});
+
+test("overlapping paginated pages deduplicate with no provider id at all (regression)", (t) => {
+  const db = archive(t);
+  seed(db);
+  // One logical dividend, no providerTxnId, appearing on two overlapping
+  // pages of one pull, as from a tabular export or PDF-derived activity
+  // table. A naive import must not double the amount.
+  const dividend = row({
+    description: "Synthetic dividend",
+    amountText: "12.34",
+  });
+  const page1 = document("5".repeat(64), [
+    { ...dividend, sourceLocator: "page:1,row:1" },
+  ]);
+  const page2 = document("6".repeat(64), [
+    { ...dividend, sourceLocator: "page:2,row:1" },
+  ]);
+
+  const summary = importBatch(
+    db,
+    { source: "synthetic-pull", documents: [page1, page2] },
+    NOW,
+  );
+
+  assert.equal(summary.rowsInserted, 1);
+  assert.equal(summary.rowsSkipped, 1);
+  assert.equal(
+    db.prepare("SELECT COUNT(*) AS n FROM transactions").get().n,
+    1,
+  );
+  const statement = db.prepare("SELECT amount FROM transactions");
+  statement.setReadBigInts(true);
+  assert.equal(statement.get().amount, 1234n);
+
+  // The collapse rests on content evidence across two documents, not a
+  // stable id, so it is visible in the review queue, not silent.
+  const review = db.prepare("SELECT kind, reason FROM review_items").get();
+  assert.equal(review.kind, "cross_document_duplicate");
+  assert.match(review.reason, /page:1,row:1/);
+});
+
+test("one copy on page 1 and two copies on page 2 resolves on its own: the first dedupes, the second inserts", (t) => {
+  const db = archive(t);
+  seed(db);
+  const toll = row({ description: "Synthetic toll charge", amountText: "-5.00" });
+  const page1 = document("7".repeat(64), [
+    { ...toll, sourceLocator: "page:1,row:1" },
+  ]);
+  const page2 = document("8".repeat(64), [
+    { ...toll, sourceLocator: "page:2,row:1" },
+    { ...toll, sourceLocator: "page:2,row:2" },
+  ]);
+
+  const summary = importBatch(
+    db,
+    { source: "synthetic-pull", documents: [page1, page2] },
+    NOW,
+  );
+
+  assert.equal(summary.rowsInserted, 2);
+  assert.equal(summary.rowsSkipped, 1);
+  assert.equal(
+    db.prepare("SELECT COUNT(*) AS n FROM transactions").get().n,
+    2,
+  );
+});
+
+test("row_hash's occurrence field is required and hashed, not appended", (t) => {
+  const rows = [
+    row({ sourceLocator: "a", description: "Synthetic dup", amountText: "-1.00" }),
+    row({ sourceLocator: "b", description: "Synthetic dup", amountText: "-1.00" }),
+  ];
+  const db = archive(t);
+  seed(db);
+  importBatch(
+    db,
+    { source: "synthetic-pull", documents: [document("9".repeat(64), rows)] },
+    NOW,
+  );
+  const hashes = db
+    .prepare("SELECT row_hash FROM transactions ORDER BY source_locator")
+    .all()
+    .map((r) => r.row_hash);
+  // Two plain sha256 digests, neither derived from the other by suffixing.
+  for (const hash of hashes) assert.match(hash, /^[0-9a-f]{64}$/);
+  assert.notEqual(hashes[0], hashes[1]);
+});
+
+test("a malformed trade date opens a review item instead of aborting the batch", (t) => {
+  const db = archive(t);
+  seed(db);
+  const rows = [
+    row({ providerTxnId: "ptx-1", tradeDate: "not-a-date" }),
+    row({ providerTxnId: "ptx-2", sourceLocator: "row:2" }),
+  ];
+  const summary = importBatch(
+    db,
+    { source: "synthetic-pull", documents: [document("a1".padEnd(64, "0"), rows)] },
+    NOW,
+  );
+
+  assert.equal(summary.rowsInserted, 2);
+  assert.equal(summary.reviewItemsOpened, 1);
+  const stored = db
+    .prepare("SELECT trade_date, status FROM transactions WHERE provider_txn_id = 'ptx-1'")
+    .get();
+  assert.equal(stored.trade_date, null);
+  assert.equal(stored.status, "review");
+  assert.equal(
+    db.prepare("SELECT kind FROM review_items").get().kind,
+    "unparseable_trade_date",
+  );
 });
 
 test("every run asserts that every transaction resolves to an account", (t) => {

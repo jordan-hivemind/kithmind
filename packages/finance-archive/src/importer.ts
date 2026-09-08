@@ -18,7 +18,7 @@ import type { DatabaseSync } from "node:sqlite";
 
 import { canonicalizeDecimal } from "./decimal.js";
 import { toMinorUnits } from "./money.js";
-import { rowHash } from "./rowHash.js";
+import { normalizeText, rowHash } from "./rowHash.js";
 
 /**
  * One transaction as a source hands it to the importer, already normalized to
@@ -43,14 +43,19 @@ import { rowHash } from "./rowHash.js";
  *   is the only path from source text to the `amount` column; nothing in
  *   this file parses a float or writes a REAL.
  * - `providerTxnId` is a stable per-account transaction identifier from the
- *   source, when one exists. It is preferred over content hashing for
- *   deduplication (see "Deduplication" below) and should be supplied
- *   whenever an adapter's source offers one, including every paginated
- *   activity API — that stability is what makes overlapping pages collapse
- *   correctly instead of merely by coincidence of content.
+ *   source, when one exists. It is the preferred, authoritative dedupe
+ *   identity and should be supplied whenever an adapter's source offers one,
+ *   including every paginated activity API. Without one, the importer falls
+ *   back to content hashing scoped by document and row order (see
+ *   `rowHash`'s `occurrence` field and `importRow` in this file), which
+ *   correctly collapses the same transaction reappearing on an overlapping
+ *   page while still preserving two genuinely distinct rows that happen to
+ *   share the same date, amount and description.
  * - `sourceLocator` is a human-readable pointer into the source document
  *   (a page and row, a JSON path, a line number) for `get_evidence`. It is
- *   not part of the dedupe key.
+ *   not part of the dedupe key, but a fallback-path collapse across two
+ *   different documents is recorded with both locators in a review item,
+ *   since that collapse rests on content evidence rather than a stable id.
  */
 export type ImportRow = {
   accountId: string;
@@ -163,9 +168,8 @@ export function importBatch(
   const findByProviderTxnId = db.prepare(
     "SELECT 1 FROM transactions WHERE account_id = ? AND provider_txn_id = ?",
   );
-  const hashTaken = db.prepare("SELECT 1 FROM transactions WHERE row_hash = ?");
-  const hashOccurrences = db.prepare(
-    "SELECT COUNT(*) AS n FROM transactions WHERE row_hash = ? OR row_hash LIKE ?",
+  const findByRowHash = db.prepare(
+    "SELECT id, source_document_id, source_locator FROM transactions WHERE row_hash = ?",
   );
   const insertTransaction = db.prepare(
     `INSERT INTO transactions
@@ -199,21 +203,35 @@ export function importBatch(
     reviewItemsOpened += 1;
   }
 
-  /** Stores the next occurrence of a base hash under no stable provider id. */
-  function nextOccurrenceHash(baseHash: string): string {
-    const row = hashOccurrences.get(baseHash, `${baseHash}#%`) as {
-      n: number | bigint;
-    };
-    const occurrence = Number(row.n);
-    return occurrence === 0 ? baseHash : `${baseHash}#${occurrence}`;
+  /**
+   * How many times a given content (the fields `rowHash` hashes, before the
+   * occurrence ordinal) has been seen so far within the current document.
+   * Reset for every new document, per the fix: the ordinal must be scoped to
+   * one document, in that document's own row order, for the same real
+   * transaction on two overlapping pages to land on the same ordinal (and
+   * therefore the same hash) in each page's document.
+   */
+  function contentKey(
+    row: ImportRow,
+    quantity: string | null,
+    amount: bigint | null,
+  ): string {
+    return [
+      row.accountId,
+      row.processDate,
+      normalizeText(row.activityType).toLowerCase(),
+      normalizeText(row.description),
+      quantity ?? "-",
+      amount === null ? "-" : amount.toString(),
+      row.currency,
+    ].join(" ");
   }
 
-  /** Disambiguates a base hash with a stable, deterministic suffix. */
-  function disambiguateHash(baseHash: string, suffix: string): string {
-    return hashTaken.get(baseHash) ? `${baseHash}#${suffix}` : baseHash;
-  }
-
-  function importRow(row: ImportRow, documentId: string): "inserted" | "skipped" {
+  function importRow(
+    row: ImportRow,
+    documentId: string,
+    occurrences: Map<string, number>,
+  ): "inserted" | "skipped" {
     if (!ISO_DATE.test(row.processDate)) {
       openReview(row.accountId, documentId, row.sourceLocator, {
         kind: "unparseable_process_date",
@@ -237,6 +255,16 @@ export function importBatch(
         reason: `process date is before ${MIN_PLAUSIBLE_DATE}, the earliest plausible statement date`,
       });
     }
+
+    // trade_date and settle_date are nullable, so a malformed value is never
+    // a reason to abort the row (let alone the batch): it is stored as NULL
+    // with a review item, same spirit as process_date's plausibility checks.
+    const tradeDate = resolveOptionalDate(row.tradeDate, "trade_date", pending);
+    const settleDate = resolveOptionalDate(
+      row.settleDate,
+      "settle_date",
+      pending,
+    );
 
     let amount: bigint | null = null;
     if (row.amountText !== null) {
@@ -263,7 +291,19 @@ export function importBatch(
       pending,
     );
 
-    const baseHash = rowHash({
+    // The occurrence ordinal is a hashed input, not a suffix appended after
+    // the fact: the same real transaction reappearing on an overlapping page
+    // gets the same ordinal (first time this content is seen in this
+    // document) and therefore the same hash, so it is found by lookup below
+    // instead of colliding at insert time. Two genuinely different rows with
+    // identical content get different ordinals and therefore different
+    // hashes, so neither is lost (ground rule: equal date, amount and
+    // description is not proof of duplication).
+    const key = contentKey(row, quantity, amount);
+    const occurrence = (occurrences.get(key) ?? 0) + 1;
+    occurrences.set(key, occurrence);
+
+    const hash = rowHash({
       accountId: row.accountId,
       processDate: row.processDate,
       activityType: row.activityType,
@@ -271,33 +311,52 @@ export function importBatch(
       quantity,
       amount,
       currency: row.currency,
+      occurrence,
     });
 
-    let storedHash: string;
     if (row.providerTxnId) {
       if (findByProviderTxnId.get(row.accountId, row.providerTxnId)) {
         // Same account, same stable id: a re-encounter of an already-imported
-        // row, most often from an overlapping page in a paginated pull.
+        // row, most often from an overlapping page in a paginated pull. This
+        // is an authoritative identity match, not evidence, so no review item.
         return "skipped";
       }
-      storedHash = disambiguateHash(baseHash, row.providerTxnId);
+      // ponytail: two distinct provider ids landing on the same content and
+      // the same per-document occurrence ordinal, in two unrelated
+      // documents, would hit the row_hash UNIQUE constraint here and abort
+      // the batch loudly rather than silently merge or drop either row.
+      // Real enough only if genuinely identical transactions happen on the
+      // same account, day and ordinal position across separate pulls; widen
+      // the hash to include provider_txn_id if that ever fires.
     } else {
-      // No stable id: content hash is the only signal available. Two rows
-      // that hash identically are inserted as two rows, not merged, because
-      // equal date/amount/description is not proof of duplication (ground
-      // rule "Equal date, amount and description..." in the data model).
-      // Deduplicating an identical-content re-import still works: it is
-      // caught above at the whole-document level by sha256, before any row
-      // in that document reaches this function.
-      storedHash = nextOccurrenceHash(baseHash);
+      const existing = findByRowHash.get(hash) as
+        | { id: string; source_document_id: string | null; source_locator: string | null }
+        | undefined;
+      if (existing) {
+        // No stable id, so this collapse rests on content evidence rather
+        // than a stable identifier. Within one document that never happens
+        // (each occurrence in a document gets its own ordinal); across two
+        // documents it is exactly the overlapping-page case, or, rarely, a
+        // genuine coincidence. Either way, make the collapse visible.
+        if (existing.source_document_id !== documentId) {
+          openReview(row.accountId, documentId, row.sourceLocator, {
+            kind: "cross_document_duplicate",
+            rawValue: existing.id,
+            reason:
+              `matches an existing transaction from document ${existing.source_document_id} ` +
+              `at ${existing.source_locator}; collapsed on content evidence, not a stable id`,
+          });
+        }
+        return "skipped";
+      }
     }
 
     insertTransaction.run(
       randomUUID(),
       row.accountId,
-      row.tradeDate,
+      tradeDate,
       row.processDate,
-      row.settleDate,
+      settleDate,
       row.datePrecision,
       row.activityType,
       row.description,
@@ -309,7 +368,7 @@ export function importBatch(
       runningBalance,
       documentId,
       row.sourceLocator,
-      storedHash,
+      hash,
       row.providerTxnId,
       pending.length > 0 ? "review" : "imported",
       startedAt,
@@ -359,8 +418,11 @@ export function importBatch(
         );
       }
 
+      // Fresh per document: the occurrence ordinal is scoped to one document
+      // in its own row order (see importRow).
+      const occurrences = new Map<string, number>();
       for (const row of document.rows) {
-        const outcome = importRow(row, documentId);
+        const outcome = importRow(row, documentId, occurrences);
         if (outcome === "inserted") rowsInserted += 1;
         else rowsSkipped += 1;
       }
@@ -401,6 +463,26 @@ export function importBatch(
     reconciliationsPassed: 0,
     reconciliationsFailed: 0,
   };
+}
+
+/**
+ * trade_date and settle_date are nullable columns, so a value the source
+ * could not give a valid ISO date for is stored as NULL with a review item
+ * rather than reaching the CHECK constraint as a hard, batch-aborting error.
+ */
+function resolveOptionalDate(
+  text: string | null,
+  kind: string,
+  pending: ReviewCandidate[],
+): string | null {
+  if (text === null) return null;
+  if (ISO_DATE.test(text)) return text;
+  pending.push({
+    kind: `unparseable_${kind}`,
+    rawValue: text,
+    reason: `${kind} is not a valid ISO YYYY-MM-DD date`,
+  });
+  return null;
 }
 
 function canonicalizeAmbiguous(
