@@ -106,6 +106,26 @@ export type EncryptAgeObjectInput = {
   limits?: ArchiveCommandLimits;
 };
 
+/** Owner-only recovery. Never add private identity paths to worker configuration. */
+export type DecryptAgeRecoveryInput = {
+  ageBinary: string;
+  identityPath: string;
+  ciphertextPath: string;
+  outputPath: string;
+  expectedCiphertext: Sha256File;
+  expectedPlaintextSha256: string;
+  limits?: ArchiveCommandLimits;
+};
+
+export type DecryptedAgeRecoveryObject = {
+  outputPath: string;
+  plaintext: Sha256File;
+  plaintextDevice: number;
+  plaintextInode: number;
+  ageVersion: typeof AGE_VERSION;
+  verification: "decrypted_plaintext_hash";
+};
+
 export type LocalBackupBoundary = {
   mode: "synthetic" | "independent_backup";
   readiness: "synthetic_only" | "different_device_unverified";
