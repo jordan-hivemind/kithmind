@@ -20,6 +20,7 @@ export const workerTables = {
   workerParsedStages: defineTable(workerParsedStageFields)
     .index("by_processingGenerationId", ["processingGenerationId"])
     .index("by_ingestJobId", ["ingestJobId"])
+    .index("by_sourceItemId", ["sourceItemId"])
     .index("by_retireAt", ["retireAt"]),
   workerCleanupState: defineTable({
     key: v.string(),
@@ -141,6 +142,7 @@ export const workerTables = {
       "requestId",
     ])
     .index("by_discoveryWorkId", ["discoveryWorkId"])
+    .index("by_stageId_and_retireAt", ["stageId", "retireAt"])
     .index("by_sourceItemId", ["sourceItemId"])
     .index("by_retireAt", ["retireAt"]),
   workerProcessingAssessments: defineTable(workerProcessingAssessmentFields)
