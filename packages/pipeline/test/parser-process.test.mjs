@@ -77,7 +77,16 @@ function canonicalJsonForTest(value) {
 function fingerprintDescriptorForTest(value) {
   const fields = structuredClone(value);
   delete fields.fingerprint;
-  return sha256(Buffer.from(canonicalJsonForTest(fields), "utf8"));
+  let encoded = canonicalJsonForTest(fields);
+  const timeout = fields.configuration?.timeoutSeconds;
+  if (Number.isInteger(timeout)) {
+    const integerTimeout = `"timeoutSeconds":${timeout}`;
+    const pythonTimeout = `${integerTimeout}.0`;
+    const adjusted = encoded.replace(integerTimeout, pythonTimeout);
+    assert.notEqual(adjusted, encoded);
+    encoded = adjusted;
+  }
+  return sha256(Buffer.from(encoded, "utf8"));
 }
 
 test("bounds parser JSON nodes and depth independently", () => {
@@ -335,10 +344,21 @@ async function legacySchemaFixture(fixture) {
   await cp(join(parserRoot, "src"), packageRoot, { recursive: true });
   const productionPath = join(packageRoot, "parser_eval/production.py");
   const production = await readFile(productionPath, "utf8");
-  const legacy = production
-    .replace('"schemaVersion": 2,', '"schemaVersion": 1,')
-    .replace('            "tableStructure": table_structure,\n', "");
-  assert.notEqual(legacy, production);
+  const legacy = `${production}
+
+_current_fingerprint = _fingerprint
+def _legacy_fingerprint(manifest, timeout_seconds, table_structure="on", table_structure_bypass=None):
+    descriptor = _current_fingerprint(
+        manifest, timeout_seconds, table_structure, table_structure_bypass
+    )
+    descriptor["schemaVersion"] = 1
+    descriptor["configuration"].pop("tableStructure", None)
+    descriptor["configuration"].pop("tableStructureBypass", None)
+    fields = {key: value for key, value in descriptor.items() if key != "fingerprint"}
+    descriptor["fingerprint"] = hashlib.sha256(_canonical_json_bytes(fields)).hexdigest()
+    return descriptor
+_fingerprint = _legacy_fingerprint
+`;
   await writeFile(productionPath, legacy, { mode: 0o600 });
   const launcherPath = join(packageRoot, "parser_eval/production_launcher.py");
   return {
@@ -1252,7 +1272,8 @@ test(
         (error) =>
           error instanceof ParserProcessError &&
           error.code === "output_invalid" &&
-          error.message === "parser conversion table bypass match is invalid",
+          error.message ===
+            "Parser process failed: parser conversion table bypass match is invalid",
       );
 
       const outOfRangeBundle = JSON.parse(
@@ -1308,7 +1329,8 @@ test(
         (error) =>
           error instanceof ParserProcessError &&
           error.code === "output_invalid" &&
-          error.message === "normalized page or gap count is invalid",
+          error.message ===
+            "Parser process failed: normalized page or gap count is invalid",
       );
       context.diagnostic(
         JSON.stringify({
