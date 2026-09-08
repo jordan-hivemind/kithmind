@@ -23,6 +23,7 @@ import { sha256Hex } from "./adapter.js";
 import { canonicalizeDecimal } from "./decimal.js";
 import type { ImportDocument, ImportRow } from "./importer.js";
 import { toMinorUnits } from "./money.js";
+import { type RawTreeWriteResult, writeRawDocument, writeRetainedText } from "./rawTree.js";
 import { contentKey, rowHash } from "./rowHash.js";
 
 /**
@@ -314,4 +315,87 @@ export function adapterPullToImportDocuments(
     });
   }
   return documents;
+}
+
+// --- F1-18: raw tree persistence -------------------------------------------
+// `acquire` (adapter.ts) returns bytes and a manifest; nothing before this
+// wrote them anywhere. This is the seam: the one place an adapter pull's raw
+// bytes (and, when the caller has retained it, the document's extracted
+// text) actually get written to the raw tree, before the pull becomes an
+// `AdapterPull.filePath`/`ImportDocument.filePath` that `importBatch` records
+// on the `documents` row. Self-contained -- it only calls into rawTree.ts and
+// does its own small, targeted write to `documents.text_path` -- so it does
+// not touch `importer.ts`'s insert statement or any other function in this
+// file.
+
+/** What `persistAcquiredDocument` wrote and where, for the caller to use as
+ * `AdapterPull.filePath` and, after import, as the argument to
+ * `recordRetainedTextPath`. */
+export type PersistedAcquisition = {
+  readonly filePath: string;
+  readonly textPath: string | null;
+  readonly documentWrite: RawTreeWriteResult;
+  readonly textWrite: RawTreeWriteResult | null;
+};
+
+/**
+ * Persists one acquired document's raw bytes -- and, when supplied, its
+ * retained extracted text -- to the raw tree rooted at `rawTreeRoot`.
+ * Write-once: a re-acquisition of identical bytes reports
+ * `status: "already_exists"` on `documentWrite`/`textWrite` rather than
+ * rewriting or raising an error that would abort a run (requirement 1). See
+ * `rawTree.ts` for how the write-once and hash-verification guarantees are
+ * implemented.
+ *
+ * Cross-checks the written sha256 against the adapter's own claimed
+ * `acquired.manifest.contentHash`: an adapter that mis-hashed its own bytes
+ * is exactly the kind of bug provenance exists to catch, not a reason to
+ * store the bytes under a path some other code goes on to trust as if the
+ * two hashes agreed.
+ */
+export function persistAcquiredDocument(
+  rawTreeRoot: string,
+  acquired: AcquiredDocument,
+  extractedText: string | null = null,
+): PersistedAcquisition {
+  const documentWrite = writeRawDocument(rawTreeRoot, acquired.bytes);
+  if (documentWrite.sha256 !== acquired.manifest.contentHash) {
+    throw new Error(
+      `acquired document's manifest hash ${acquired.manifest.contentHash} does not match ` +
+        `its bytes' actual sha256 ${documentWrite.sha256}; refusing to persist a document ` +
+        "whose adapter mis-reported its own content hash",
+    );
+  }
+  const textWrite =
+    extractedText === null ? null : writeRetainedText(rawTreeRoot, extractedText);
+  return {
+    filePath: documentWrite.path,
+    textPath: textWrite?.path ?? null,
+    documentWrite,
+    textWrite,
+  };
+}
+
+/**
+ * Records the retained-text path on the `documents` row already imported for
+ * `sha256` (the same content hash `persistAcquiredDocument` just verified),
+ * so `get_evidence` can return it. A direct, targeted `UPDATE` rather than a
+ * new field threaded through `ImportDocument`/`importBatch` -- importer.ts's
+ * insert is out of this task's scope -- so this can run any time after the
+ * matching `documents` row exists: immediately after import, or later, for a
+ * document whose text is extracted after the fact.
+ */
+export function recordRetainedTextPath(
+  db: DatabaseSync,
+  sha256: string,
+  textPath: string,
+): void {
+  const result = db
+    .prepare("UPDATE documents SET text_path = ? WHERE sha256 = ?")
+    .run(textPath, sha256);
+  if (result.changes === 0) {
+    throw new Error(
+      `no documents row with sha256 ${sha256}; import the document before recording its retained text path`,
+    );
+  }
 }

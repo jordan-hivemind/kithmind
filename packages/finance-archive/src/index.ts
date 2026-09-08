@@ -79,6 +79,17 @@ export {
 } from "./reconciliation.js";
 export {
   adapterPullToImportDocuments,
+  persistAcquiredDocument,
+  recordRetainedTextPath,
   resolveInstrumentId,
   type AdapterPull,
+  type PersistedAcquisition,
 } from "./adapterImport.js";
+export {
+  readAndVerify,
+  resolveRawTreeRoot,
+  sha256HexOf,
+  writeRawDocument,
+  writeRetainedText,
+  type RawTreeWriteResult,
+} from "./rawTree.js";
