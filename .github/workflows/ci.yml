@@ -61,9 +61,16 @@ jobs:
       # did not run. Fail rather than pass on a check that did not execute.
       - name: Fail if the finance Postgres tests were skipped
         run: |
-          skipped=$(grep -E 'finance-archive:test:once: .* skipped' /tmp/test-once.log | grep -oE '[0-9]+' | tail -1)
-          echo "finance-archive skipped: ${skipped:-unknown}"
-          if [ "${skipped:-1}" != "0" ]; then
+          # Turbo emits the task name as a group header and then bare summary
+          # lines, so scope the search to that group rather than matching the
+          # task name on the same line as the count.
+          skipped=$(awk '/@repo\/finance-archive:test:once/{f=1} f && /skipped/{print $NF; exit}' /tmp/test-once.log)
+          echo "finance-archive skipped: ${skipped:-unparsed}"
+          if [ -z "$skipped" ]; then
+            echo "::error::could not read the finance skipped count; the assertion cannot verify anything"
+            exit 1
+          fi
+          if [ "$skipped" != "0" ]; then
             echo "::error::finance Postgres tests were skipped in CI; FINANCE_ARCHIVE_DATABASE_URL did not reach the task"
             exit 1
           fi
