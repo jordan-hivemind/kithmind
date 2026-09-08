@@ -73,13 +73,17 @@ The published safe error codes are:
 Messages are safe gateway messages. The endpoint does not expose source paths,
 raw backend messages, or arbitrary backend error data.
 
-## Initial command set
+## Core command set
 
-Protocol version 1 currently defines these fifteen commands:
+The following table documents the original text-worker commands and the
+source diagnostics added for the single-owner trial. Binary archive and parsed
+staging additions are specified in the related original-byte contract.
 
 | Operation                | Purpose                                              | Important bound                                                                                                                                                                    |
 | ------------------------ | ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `source.status`          | Read current worker-visible status for one source.   | No command-specific collection.                                                                                                                                                    |
+| `diagnostics.status`     | Read cloud-retained liveness for one source.         | No command-specific collection; processing, coverage, daemon internals, and embeddings remain separate.                                                                            |
+| `diagnostics.heartbeat`  | Advance one watched source's liveness.               | Canonical watcher UUID, connector version at most 100 UTF-8 bytes, server time, and at most one retained write per five seconds.                                                   |
 | `source.inventoryPage`   | Read a validated inventory page for a scan.          | A request ID and active recovery scan, inventory epoch, and manifest version bind a page retry; `paginationOpts.numItems` is 1–50 and cursor is null or at most 8,192 UTF-8 bytes. |
 | `scan.begin`             | Start a normal or identity-recovery scan.            | Request, watcher, and connector version IDs are each bounded.                                                                                                                      |
 | `scan.appendPage`        | Submit one bounded discovery page.                   | 1–4 entries per page and at most 64 pages per scan.                                                                                                                                |
@@ -110,6 +114,13 @@ and source-account pair. It covers `source.inventoryPage`, `scan.begin`,
 matches a retained request receipt does not consume the limit. Reusing a
 request ID with different inputs fails as `request_conflict`.
 
+`diagnostics.heartbeat` has an independent admission policy so ordinary worker
+traffic cannot consume all heartbeat capacity. The server coalesces repeated
+same-watcher calls within five seconds, bounding retained writes while leaving
+the 30-second client cadence unaffected. Heartbeats do not have request IDs or
+exact replay receipts. A retry is a fresh proof that the current process can
+reach the gateway.
+
 `scan.appendPage` discovery entries carry a URI, source modification time, and
 either a bounded ready-content observation or an explicit gap. A ready
 observation requires a lowercase SHA-256 and a byte length from 1 through
@@ -129,16 +140,18 @@ are rejected. The complete URI is at most 2,048 UTF-8 bytes.
 The common fields shown above are omitted from this table for brevity. Every
 request object and nested object rejects unknown fields.
 
-| Operation              | Additional request fields                                                                                      | Result fields                                                                                                                                                                          |
-| ---------------------- | -------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `source.status`        | None.                                                                                                          | `{ operation, sourceAccountId, inventoryEpoch, completedInventoryEpoch, manifestVersion, enumeration, processing: { state, ...assessmentStatus }, recordCoverage: "not_established" }` |
-| `source.inventoryPage` | `{ scanId, requestId, expectedInventoryEpoch, expectedManifestVersion, paginationOpts: { cursor, numItems } }` | `{ operation, page, isDone, continueCursor }`                                                                                                                                          |
-| `scan.begin`           | `{ requestId, watcherId, connectorVersion, hostAffinity?, mode, expectedInventoryEpoch }`                      | `{ operation, scanId, inventoryEpoch, manifestVersion, state, reused }`                                                                                                                |
-| `scan.appendPage`      | `{ scanId, requestId, ordinal, entries }`                                                                      | `{ operation, scanId, ordinal, reused, entries: [{ state, sourceItemId?, observationEpoch?, processingEpoch? }] }`                                                                     |
-| `scan.seal`            | `{ scanId, requestId, expectedPageCount, health }`                                                             | `{ operation, scanId, state, reused }`                                                                                                                                                 |
-| `scan.reconcile`       | `{ scanId, requestId, expectedInventoryEpoch, ordinal, maxItems }`                                             | `{ operation, scanId, state, inspected, unavailable, done, reused }`                                                                                                                   |
-| `discovery.reserve`    | `{ requestId, maxItems }`                                                                                      | `{ operation, receiptId, expiresAt, reused, targets }`                                                                                                                                 |
-| `discovery.admitUtf8`  | `{ requestId, workId, leaseEpoch, leaseToken, text }`                                                          | `{ operation, workId, sourceItemId, sourceRevisionId, processingGenerationId, ingestJobId, desiredProcessingEpoch, state: "admitted", reused }`                                        |
+| Operation               | Additional request fields                                                                                      | Result fields                                                                                                                                                                          |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `source.status`         | None.                                                                                                          | `{ operation, sourceAccountId, inventoryEpoch, completedInventoryEpoch, manifestVersion, enumeration, processing: { state, ...assessmentStatus }, recordCoverage: "not_established" }` |
+| `diagnostics.status`    | None.                                                                                                          | `{ operation, diagnosticsVersion: 1, sourceAccountId, source: "enabled", watcher, incident }`                                                                                          |
+| `diagnostics.heartbeat` | `{ watcherId, connectorVersion }`                                                                              | `{ operation, sourceAccountId, watcherId, receivedAt, nextExpectedAt }`                                                                                                                |
+| `source.inventoryPage`  | `{ scanId, requestId, expectedInventoryEpoch, expectedManifestVersion, paginationOpts: { cursor, numItems } }` | `{ operation, page, isDone, continueCursor }`                                                                                                                                          |
+| `scan.begin`            | `{ requestId, watcherId, connectorVersion, hostAffinity?, mode, expectedInventoryEpoch }`                      | `{ operation, scanId, inventoryEpoch, manifestVersion, state, reused }`                                                                                                                |
+| `scan.appendPage`       | `{ scanId, requestId, ordinal, entries }`                                                                      | `{ operation, scanId, ordinal, reused, entries: [{ state, sourceItemId?, observationEpoch?, processingEpoch? }] }`                                                                     |
+| `scan.seal`             | `{ scanId, requestId, expectedPageCount, health }`                                                             | `{ operation, scanId, state, reused }`                                                                                                                                                 |
+| `scan.reconcile`        | `{ scanId, requestId, expectedInventoryEpoch, ordinal, maxItems }`                                             | `{ operation, scanId, state, inspected, unavailable, done, reused }`                                                                                                                   |
+| `discovery.reserve`     | `{ requestId, maxItems }`                                                                                      | `{ operation, receiptId, expiresAt, reused, targets }`                                                                                                                                 |
+| `discovery.admitUtf8`   | `{ requestId, workId, leaseEpoch, leaseToken, text }`                                                          | `{ operation, workId, sourceItemId, sourceRevisionId, processingGenerationId, ingestJobId, desiredProcessingEpoch, state: "admitted", reused }`                                        |
 
 The processing commands use these additional request and result fields:
 
@@ -345,12 +358,56 @@ Enumeration, processing, and record coverage remain distinct. Neither a healthy
 scan nor a `complete` processing assessment proves that every financial record,
 medical test, or date range has been captured.
 
+## Worker heartbeat diagnostics
+
+Only the long-running `watch` command sends `diagnostics.heartbeat`. A one-shot
+`run` does not establish a monitoring expectation. The watcher ID is a
+canonical lowercase UUID derived from the journal's immutable random salt and
+full authority binding. The server supplies
+`receivedAt` and fixes `nextExpectedAt` at 180 seconds later. Clients cannot
+submit timestamps, intervals, hostnames, paths, pass outcomes, exception text,
+or coverage claims.
+
+Authorized pings within five seconds of the previous observation return that
+observation without another database write. This bounds heartbeat writes
+independently of the ingestion mutation budget. A lost response is safe to
+retry; no durable request receipt is created.
+
+The first authorized heartbeat claims an unbound source. Later heartbeats must
+use the same watcher ID. A different watcher receives
+`identity_review_required` and makes no write. Only a current-session owner
+operation may replace or clear the binding. A replacement selected by the owner
+has state `awaiting_heartbeat`; it has no liveness deadline and cannot be called
+current until that watcher first authenticates successfully.
+
+`diagnostics.status.watcher` is exactly one of:
+
+- `{ state: "not_configured" }` when no watcher is bound;
+- `{ state: "awaiting_heartbeat", watcherId }` after owner prebinding;
+- `{ state: "current", watcherId, lastSeenAt, nextExpectedAt }`; or
+- `{ state: "overdue", watcherId, lastSeenAt, nextExpectedAt }`.
+
+Its incident is `{ state: "none" }` or
+`{ state: "open", kind: "missing_worker", openedAt }`. Status derives overdue
+state from server time even before the minute sweep opens an incident. A current
+watcher cannot have an open missing-worker incident. The bounded sweep opens at
+most one incident for the source and watcher; a heartbeat resolves it in the
+same transaction as the liveness update. Disabled sources deny ingest
+diagnostics and do not create missing-worker incidents. The owner status view
+reports disabled sources explicitly without granting ingest authority.
+
+A heartbeat proves gateway liveness only. `source.status` remains the authority
+for enumeration and processing assessment, while record coverage and embedding
+health remain separate and may still be unverified.
+
 ## Deferred operations
 
-Parsing, binary archives, and generic job execution remain unavailable. A ready
-text document can be searched and read through the authorized hosted document
-tools. A completed processing assessment does not establish record or date
-coverage. `recordCoverage` remains `not_established`.
+Generic job execution and automatic structured-record extraction remain
+unavailable. The opt-in archived PDF path is described in the
+[PDF pipeline guide](../pdf-pipeline-development.md). Ready retained text can
+be searched and read through authorized hosted document tools. A completed
+processing assessment does not establish record or date coverage.
+`recordCoverage` remains `not_established`.
 
 ## Upgrading queued admissions
 

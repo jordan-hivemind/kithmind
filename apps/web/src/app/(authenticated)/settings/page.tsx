@@ -15,6 +15,7 @@ import {
   type KeyCapability,
   SpaceGrantPicker,
 } from "@/components/space-grant-picker";
+import { WorkerHeartbeatStatus } from "@/components/worker-heartbeat-status";
 import { sourceAccountGrantsForCapabilities } from "@/lib/api-key-scopes";
 
 const settingsCapabilities: readonly KeyCapability[] = [
@@ -29,9 +30,7 @@ const sourceKinds = {
 } as const;
 
 function sourceKindLabel(connector: string) {
-  return (
-    sourceKinds[connector as keyof typeof sourceKinds] ?? connector
-  );
+  return sourceKinds[connector as keyof typeof sourceKinds] ?? connector;
 }
 
 function errorMessage(caught: unknown, fallback: string) {
@@ -236,9 +235,8 @@ export default function SettingsPage() {
   const [defaultError, setDefaultError] = useState("");
   const [savingDefault, setSavingDefault] = useState(false);
   const [sourceName, setSourceName] = useState("");
-  const [sourceConnector, setSourceConnector] = useState<
-    keyof typeof sourceKinds
-  >("mcp-client");
+  const [sourceConnector, setSourceConnector] =
+    useState<keyof typeof sourceKinds>("mcp-client");
   const [sourceAccountId, setSourceAccountId] = useState("");
   const [sourceFreshnessMinutes, setSourceFreshnessMinutes] = useState("1440");
   const [sourceSpaceId, setSourceSpaceId] = useState<Id<"spaces"> | "">("");
@@ -500,9 +498,7 @@ export default function SettingsPage() {
             id="source-kind"
             value={sourceConnector}
             onChange={(event) =>
-              setSourceConnector(
-                event.target.value as keyof typeof sourceKinds,
-              )
+              setSourceConnector(event.target.value as keyof typeof sourceKinds)
             }
             disabled={savingSource}
             style={{ display: "block", margin: "6px 0 12px", padding: 8 }}
@@ -634,8 +630,8 @@ export default function SettingsPage() {
                   </div>
                 ) : (
                   <>
-                    <strong>{account.name}</strong> ({sourceKindLabel(account.connector)})
-                    {" · account ID: "}
+                    <strong>{account.name}</strong> (
+                    {sourceKindLabel(account.connector)}){" · account ID: "}
                     <code>{account.accountId}</code>
                     {" · refreshes at most every "}
                     {account.freshnessMs / 60_000} minute(s)
@@ -668,6 +664,7 @@ export default function SettingsPage() {
                             <code>{account.spaceId}</code>
                           </dd>
                         </dl>
+                        <WorkerHeartbeatStatus sourceAccountId={account._id} />
                       </details>
                     )}
                   </>
@@ -771,8 +768,8 @@ export default function SettingsPage() {
                   </p>
                   {enabledScopedSourceAccounts.length === 0 ? (
                     <p role="alert">
-                      Add and enable a source account in a selected space
-                      before issuing this key.
+                      Add and enable a source account in a selected space before
+                      issuing this key.
                     </p>
                   ) : (
                     enabledScopedSourceAccounts.map((account) => (
@@ -874,7 +871,6 @@ export default function SettingsPage() {
                 </button>
               </div>
             )}
-
           </>
         )}
         <ApiKeyListErrorBoundary

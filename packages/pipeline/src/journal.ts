@@ -996,6 +996,7 @@ async function cleanInterruptedTemps(directory: string): Promise<void> {
 export class Journal<C extends JsonValue, R extends JsonValue> {
   readonly directory: string;
   readonly binding: JournalBinding;
+  readonly watcherId: string;
   private readonly statePath: string;
   private readonly codec: JournalCodec<C, R>;
   private readonly locks: Server[];
@@ -1021,6 +1022,16 @@ export class Journal<C extends JsonValue, R extends JsonValue> {
     this.directory = args.directory;
     this.statePath = join(args.directory, STATE_FILE);
     this.binding = args.binding;
+    const bytes = createHash("sha256")
+      .update("kithmind-worker-heartbeat:v1\0")
+      .update(args.state.credentialSalt, "utf8")
+      .update(JSON.stringify(args.binding), "utf8")
+      .digest()
+      .subarray(0, 16);
+    bytes[6] = (bytes[6]! & 0x0f) | 0x50;
+    bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+    const hex = bytes.toString("hex");
+    this.watcherId = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
     this.codec = args.codec;
     this.locks = args.locks;
     this.directoryIdentity = args.directoryIdentity;

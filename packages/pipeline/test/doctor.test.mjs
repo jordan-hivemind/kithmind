@@ -66,6 +66,23 @@ function source(overrides = {}) {
   };
 }
 
+function diagnostics(overrides = {}) {
+  return {
+    operation: "diagnostics.status",
+    diagnosticsVersion: 1,
+    sourceAccountId: "source",
+    source: "enabled",
+    watcher: {
+      state: "current",
+      watcherId: "11111111-1111-4111-8111-111111111111",
+      lastSeenAt: 1,
+      nextExpectedAt: 180_001,
+    },
+    incident: { state: "none" },
+    ...overrides,
+  };
+}
+
 function terminalSource(state = "complete", overrides = {}) {
   return source({
     inventoryEpoch: 3,
@@ -90,8 +107,11 @@ const isolated = {
   inspectJournal: async () => ({ state: "not_initialized" }),
 };
 
-function transport(value) {
-  return { call: async () => value };
+function transport(value, diagnostic = diagnostics()) {
+  return {
+    call: async (request) =>
+      request.operation === "diagnostics.status" ? diagnostic : value,
+  };
 }
 
 function check(result, id) {
@@ -117,12 +137,14 @@ test("fresh scoped setup is operationally ready before coverage exists", async (
   );
 
   assert.equal(result.state, "ready");
+  assert.equal(result.version, 2);
   assert.deepEqual(
     result.checks.map(({ id, state }) => [id, state]),
     [
       ["config", "pass"],
       ["credential", "pass"],
       ["deployment", "pass"],
+      ["heartbeat", "pass"],
       ["roots", "pass"],
       ["journal", "pass"],
     ],
@@ -136,6 +158,11 @@ test("fresh scoped setup is operationally ready before coverage exists", async (
   assert.deepEqual(result.capabilities, {
     embeddings: "unverified",
     daemon: "unverified",
+  });
+  assert.deepEqual(check(result, "heartbeat"), {
+    id: "heartbeat",
+    state: "pass",
+    code: "current",
   });
   assert.deepEqual(await readdir(files.base), ["root"]);
   assert.equal(JSON.stringify(result).includes(files.base), false);
@@ -206,6 +233,32 @@ test("typed denial, wrong source, and unavailable transport use separate diagnos
   );
   assert.equal(check(unavailable, "deployment").code, "deployment_unavailable");
   assert.equal(JSON.stringify(unavailable).includes("secret"), false);
+});
+
+test("diagnostics status has a fixed deadline even when transport ignores abort", async (context) => {
+  const files = await fixture();
+  context.after(() => rm(files.base, { recursive: true, force: true }));
+  let aborted = false;
+  const result = await doctor(
+    config(files.root, files.journal),
+    {
+      call: async (request, signal) => {
+        if (request.operation === "source.status") return source();
+        signal.addEventListener("abort", () => {
+          aborted = true;
+        });
+        return await new Promise(() => undefined);
+      },
+    },
+    "synthetic-token",
+    { ...isolated, diagnosticDeadlineMs: 1 },
+  );
+  assert.equal(aborted, true);
+  assert.deepEqual(check(result, "heartbeat"), {
+    id: "heartbeat",
+    state: "warn",
+    code: "unavailable",
+  });
 });
 
 test("injected status responses receive the released strict parser", async (context) => {
@@ -510,7 +563,7 @@ test("invalid and oversized config files return the same closed bounded object",
   for (const path of [invalid, oversized, join(files.base, "missing.json")]) {
     const result = await doctorFromPath(path, () => transport(source()));
     assert.equal(result.state, "blocked");
-    assert.equal(result.checks.length, 5);
+    assert.equal(result.checks.length, 6);
     assert.equal(check(result, "config").code, "invalid_config");
     assert.equal(JSON.stringify(result).includes(files.base), false);
   }
@@ -564,6 +617,7 @@ test("human output is a bounded rendering of fixed diagnostics", async (context)
       "config: pass valid",
       "credential: pass authorized",
       "deployment: pass available",
+      "heartbeat: pass current",
       "roots: pass safe",
       "journal: pass not_initialized",
       "source: enumeration=not_started processing=not_assessed recordCoverage=not_established",

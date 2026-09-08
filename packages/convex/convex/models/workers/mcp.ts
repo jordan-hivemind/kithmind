@@ -7,6 +7,10 @@ import { v } from "convex/values";
 import { rethrowWorkerProtocolError } from "./errors";
 import { parseWorkerRequest, type WorkerResult } from "./protocol";
 import { workerAssessmentCountsValidator } from "./validators";
+import {
+  workerDiagnosticsHeartbeatResultValidator,
+  workerDiagnosticsStatusResultValidator,
+} from "../diagnostics/validators";
 
 const processingAssessmentState = v.union(
   v.literal("running"),
@@ -90,6 +94,8 @@ const workerResultValidator = v.union(
     ),
     recordCoverage: v.literal("not_established"),
   }),
+  workerDiagnosticsStatusResultValidator,
+  workerDiagnosticsHeartbeatResultValidator,
   v.object({
     operation: v.literal("archive.forgetTargets"),
     sourceItemId: v.string(),
@@ -545,6 +551,16 @@ export const dispatch = action({
               request,
               now: Date.now(),
             },
+          );
+        case "diagnostics.status":
+          return await ctx.runQuery(
+            internal.models.workers.private.diagnosticsStatus,
+            { principal, request, now: Date.now() },
+          );
+        case "diagnostics.heartbeat":
+          return await ctx.runMutation(
+            internal.models.workers.private.diagnosticsHeartbeat,
+            { principal, request, now: Date.now() },
           );
         case "archive.forgetTargets":
           return await ctx.runQuery(

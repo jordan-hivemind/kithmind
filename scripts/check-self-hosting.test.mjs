@@ -270,9 +270,9 @@ test("worker wrapper emits only one doctor JSON object without web preflight", (
     assert.equal(result.status, 1);
     assert.doesNotMatch(result.stdout, /profile:/u);
     const parsed = JSON.parse(result.stdout);
-    assert.equal(parsed.version, 1);
+    assert.equal(parsed.version, 2);
     assert.equal(parsed.state, "blocked");
-    assert.equal(parsed.checks.length, 5);
+    assert.equal(parsed.checks.length, 6);
     assert.doesNotMatch(
       result.stdout,
       new RegExp(directory.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"),
@@ -335,7 +335,7 @@ test("pnpm silent doctor alias forwards arguments as one JSON object", () => {
     assert.equal(result.status, 1);
     const parsed = JSON.parse(result.stdout);
     assert.equal(parsed.state, "blocked");
-    assert.equal(parsed.checks.length, 5);
+    assert.equal(parsed.checks.length, 6);
     assert.equal(result.stdout.trim().split("\n").length, 1);
     assert.doesNotMatch(result.stdout, /> kithmind@/u);
   } finally {

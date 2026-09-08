@@ -133,5 +133,8 @@ export type WorkerError = { error: { code: WorkerErrorCode } };
 export type WorkerResponse = Record<string, unknown> | WorkerError;
 
 export interface WorkerTransport {
-  call(request: Record<string, unknown>): Promise<WorkerResponse>;
+  call(
+    request: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<WorkerResponse>;
 }

@@ -6,13 +6,20 @@ import {
   loadPipelineConfig,
   requireCredential,
 } from "./config.js";
+import { WatchHeartbeat } from "./diagnostics.js";
 import { runArchiveForget } from "./archiveForget.js";
 import { openArchiveCatalog } from "./archiveCatalog.js";
 import { doctorFromPath, formatDoctorResult } from "./doctor.js";
-import { Journal } from "./journal.js";
+import { Journal, JournalCredentialChangedError } from "./journal.js";
 import { initialCheckpoint, journalCodec, PipelineRunner } from "./runner.js";
 import { HttpWorkerTransport } from "./transport.js";
-import type { PipelineRunResult } from "./types.js";
+import type {
+  PipelineConfig,
+  PipelineRunResult,
+  WorkerTransport,
+} from "./types.js";
+import type { JsonValue } from "./journalTypes.js";
+import type { RunnerCheckpoint } from "./runnerState.js";
 
 function usage(): never {
   throw new Error(
@@ -124,25 +131,143 @@ async function executeForget(
   }
 }
 
-async function execute(configPath: string): Promise<PipelineRunResult> {
-  const config = await loadPipelineConfig(configPath);
-  const credential = requireCredential(config);
-  const journal = await Journal.open({
-    directory: config.journalDir,
-    binding: journalBindingForConfig(config),
-    credential,
-    initialCheckpoint,
-    codec: journalCodec,
-  });
+async function executeConfig(
+  config: Awaited<ReturnType<typeof loadPipelineConfig>>,
+  credential: string,
+  journal?: Journal<RunnerCheckpoint, JsonValue>,
+): Promise<PipelineRunResult> {
+  const ownedJournal =
+    journal ??
+    (await Journal.open({
+      directory: config.journalDir,
+      binding: journalBindingForConfig(config),
+      credential,
+      initialCheckpoint,
+      codec: journalCodec,
+    }));
   try {
     const runner = new PipelineRunner(
       config,
-      journal,
+      ownedJournal,
       new HttpWorkerTransport(config, credential),
     );
     return await runner.runSafely();
   } finally {
+    if (journal === undefined) await ownedJournal.close();
+  }
+}
+
+async function execute(configPath: string): Promise<PipelineRunResult> {
+  const config = await loadPipelineConfig(configPath);
+  return executeConfig(config, requireCredential(config));
+}
+
+async function waitForWatchInterval(
+  interval: number,
+  signal: AbortSignal,
+): Promise<void> {
+  if (signal.aborted) return;
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(done, interval);
+    function done() {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", done);
+      resolve();
+    }
+    signal.addEventListener("abort", done, { once: true });
+  });
+}
+
+export type WatchOptions = {
+  signal?: AbortSignal;
+  loadConfig?: (path: string) => Promise<PipelineConfig>;
+  credential?: (config: PipelineConfig) => string;
+  openJournal?: (
+    config: PipelineConfig,
+    credential: string,
+  ) => Promise<Journal<RunnerCheckpoint, JsonValue>>;
+  transport?: (config: PipelineConfig, credential: string) => WorkerTransport;
+  executePass?: (
+    config: PipelineConfig,
+    credential: string,
+    journal: Journal<RunnerCheckpoint, JsonValue>,
+  ) => Promise<PipelineRunResult>;
+  write?: (value: string) => void;
+};
+
+export async function runWatch(
+  configPath: string,
+  options: WatchOptions = {},
+): Promise<void> {
+  const readConfig = options.loadConfig ?? loadPipelineConfig;
+  const readCredential = options.credential ?? requireCredential;
+  const makeTransport =
+    options.transport ??
+    ((config, credential) => new HttpWorkerTransport(config, credential));
+  const initialConfig = await readConfig(configPath);
+  const initialCredential = readCredential(initialConfig);
+  const serializedConfig = JSON.stringify(initialConfig);
+  const binding = journalBindingForConfig(initialConfig);
+  const journal = await (options.openJournal
+    ? options.openJournal(initialConfig, initialCredential)
+    : Journal.open({
+        directory: initialConfig.journalDir,
+        binding,
+        credential: initialCredential,
+        initialCheckpoint,
+        codec: journalCodec,
+      }));
+  if (journal.credentialStatus !== "current") {
     await journal.close();
+    throw new JournalCredentialChangedError();
+  }
+  const localStop = new AbortController();
+  const signal = options.signal ?? localStop.signal;
+  let heartbeat: WatchHeartbeat | undefined;
+  const shutdown = () => {
+    localStop.abort();
+    heartbeat?.stop();
+  };
+  if (options.signal === undefined) {
+    process.once("SIGINT", shutdown);
+    process.once("SIGTERM", shutdown);
+  } else {
+    options.signal.addEventListener("abort", () => heartbeat?.stop(), {
+      once: true,
+    });
+  }
+  heartbeat = new WatchHeartbeat(
+    initialConfig,
+    makeTransport(initialConfig, initialCredential),
+    journal.watcherId,
+  );
+  heartbeat.start();
+  try {
+    while (!signal.aborted) {
+      const config = await readConfig(configPath);
+      const credential = readCredential(config);
+      if (credential !== initialCredential) {
+        throw new Error("worker credential changed while watch is running");
+      }
+      if (JSON.stringify(config) !== serializedConfig) {
+        throw new Error("worker configuration changed while watch is running");
+      }
+      const result = options.executePass
+        ? await options.executePass(config, credential, journal)
+        : await executeConfig(config, credential, journal);
+      (options.write ?? process.stdout.write.bind(process.stdout))(
+        `${JSON.stringify(result)}\n`,
+      );
+      if (signal.aborted) break;
+      await waitForWatchInterval(config.watchIntervalMs, signal);
+    }
+  } finally {
+    heartbeat.stop();
+    await journal.close();
+    if (options.signal === undefined) {
+      process.removeListener("SIGINT", shutdown);
+      process.removeListener("SIGTERM", shutdown);
+    }
   }
 }
 
@@ -180,12 +305,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     if (result.state !== "complete") process.exitCode = 1;
     return;
   }
-  while (true) {
-    const result = await execute(configPath);
-    process.stdout.write(`${JSON.stringify(result)}\n`);
-    const config = await loadPipelineConfig(configPath);
-    await new Promise((resolve) => setTimeout(resolve, config.watchIntervalMs));
-  }
+  await runWatch(configPath);
 }
 
 function isDirectInvocation(): boolean {

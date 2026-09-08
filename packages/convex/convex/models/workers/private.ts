@@ -48,6 +48,10 @@ import {
   acknowledgeArchiveDeletion,
   getArchiveForgetTargets,
 } from "./archiveForget";
+import {
+  getWorkerDiagnosticsStatus,
+  recordWorkerHeartbeat,
+} from "../diagnostics/model";
 
 function operation<T extends WorkerRequest["operation"]>(
   value: unknown,
@@ -66,6 +70,28 @@ export const sourceStatus = internalQuery({
       ctx,
       args.principal,
       operation(args.request, "source.status"),
+      args.now,
+    ),
+});
+
+export const diagnosticsStatus = internalQuery({
+  args: { principal: principalRefValidator, request: v.any(), now: v.number() },
+  handler: async (ctx, args) =>
+    await getWorkerDiagnosticsStatus(
+      ctx,
+      args.principal,
+      operation(args.request, "diagnostics.status"),
+      args.now,
+    ),
+});
+
+export const diagnosticsHeartbeat = internalMutation({
+  args: { principal: principalRefValidator, request: v.any(), now: v.number() },
+  handler: async (ctx, args) =>
+    await recordWorkerHeartbeat(
+      ctx,
+      args.principal,
+      operation(args.request, "diagnostics.heartbeat"),
       args.now,
     ),
 });

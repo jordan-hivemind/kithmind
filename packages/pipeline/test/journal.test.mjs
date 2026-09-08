@@ -106,6 +106,33 @@ async function openJournal(path, options = {}) {
   });
 }
 
+test("journal heartbeat identity is stable on reopen and unique per journal", async () => {
+  const firstPath = await directory();
+  const secondPath = await directory();
+  const authority = binding();
+  const first = await openJournal(firstPath, { binding: authority });
+  const firstWatcherId = first.watcherId;
+  assert.match(
+    firstWatcherId,
+    /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+  );
+  await first.close();
+  const reopened = await openJournal(firstPath, { binding: authority });
+  try {
+    assert.equal(reopened.watcherId, firstWatcherId);
+  } finally {
+    await reopened.close();
+  }
+  const second = await openJournal(secondPath, { binding: authority });
+  try {
+    assert.notEqual(second.watcherId, firstWatcherId);
+  } finally {
+    await second.close();
+    await rm(firstPath, { recursive: true, force: true });
+    await rm(secondPath, { recursive: true, force: true });
+  }
+});
+
 test("persists one exact pending body with protected permissions", async () => {
   const path = await directory();
   const authority = binding();

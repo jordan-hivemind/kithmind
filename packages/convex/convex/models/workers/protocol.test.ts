@@ -18,6 +18,17 @@ describe("worker protocol parser", () => {
       parseWorkerRequest({ ...source, operation: "source.status" }),
     ).toEqual({ ...source, operation: "source.status" });
     expect(
+      parseWorkerRequest({ ...source, operation: "diagnostics.status" }),
+    ).toEqual({ ...source, operation: "diagnostics.status" });
+    expect(
+      parseWorkerRequest({
+        ...source,
+        operation: "diagnostics.heartbeat",
+        watcherId: "01890a5d-ac96-7cc4-8b7e-6f4f5ca5c139",
+        connectorVersion: "pipeline-1.0.0",
+      }),
+    ).toMatchObject({ operation: "diagnostics.heartbeat" });
+    expect(
       parseWorkerRequest({
         ...source,
         operation: "source.inventoryPage",
@@ -137,6 +148,23 @@ describe("worker protocol parser", () => {
         assessmentId: "assessment-id",
         ordinal: 0,
         maxItems: 2,
+      }),
+    ).toThrow(WorkerProtocolParseError);
+    expect(() =>
+      parseWorkerRequest({
+        ...source,
+        operation: "diagnostics.heartbeat",
+        watcherId: "01890A5D-AC96-7CC4-8B7E-6F4F5CA5C139",
+        connectorVersion: "pipeline-1.0.0",
+      }),
+    ).toThrow(WorkerProtocolParseError);
+    expect(() =>
+      parseWorkerRequest({
+        ...source,
+        operation: "diagnostics.heartbeat",
+        watcherId: "01890a5d-ac96-7cc4-8b7e-6f4f5ca5c139",
+        connectorVersion: "pipeline-1.0.0",
+        requestId: "not-supported",
       }),
     ).toThrow(WorkerProtocolParseError);
     expect(() =>
