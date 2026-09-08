@@ -7,6 +7,7 @@ import {
   ArchiveRelocationOwnerResumeError,
   __testOnlyVerifyArchiveRelocationOwnerResume,
 } from "../dist/archiveRelocationOwnerResume.js";
+import { relocationIntentFromRecipe } from "../dist/archiveRelocationRecipe.js";
 import { parseConfig } from "../dist/config.js";
 import { toFsUri } from "../dist/filesystem.js";
 
@@ -120,7 +121,27 @@ function setup(options = {}) {
   const config = parseConfig(
     JSON.parse(recipe.body.localBindings.proposedConfigText),
   );
-  let checkpoint = { version: 1, phase: "idle" };
+  const existingBindings = options.terminalCheckpoint
+    ? [
+        {
+          rootAlias: "notes",
+          relativePath: "note.txt",
+          sourceExternalId: "source_external_1",
+          sourceItemId: "source_item_1",
+        },
+      ]
+    : [];
+  let checkpoint = options.terminalCheckpoint
+    ? {
+        version: 1,
+        phase: "terminal",
+        outcome: "complete",
+        credentialSessionActive: false,
+        bindings: existingBindings,
+        scanned: 1,
+        published: 0,
+      }
+    : { version: 1, phase: "idle" };
   const journal = {
     directory: config.journalDir,
     watcherId,
@@ -136,7 +157,44 @@ function setup(options = {}) {
       proposedStateSha256: "1".repeat(64),
     }),
   };
-  const session = { journal };
+  const verifiedAt = 1_789_000_000_500;
+  const relocationState = {
+    version: 1,
+    phase: options.workflowPhase ?? "rebound",
+    intent: relocationIntentFromRecipe(recipe),
+    preMoveVerifiedAt: 1_789_000_000_000,
+    preMoveVerifiedArtifacts: recipe.body.processing.artifacts,
+    destinationId: recipe.body.wholeRoot.sourceId,
+    newBoundary: {
+      rootPath: recipe.body.wholeRoot.newRootPath,
+      rootId: recipe.body.wholeRoot.sourceId,
+    },
+    movedAt: 1_789_000_000_250,
+    verifiedAt,
+    verifiedArtifacts: recipe.body.processing.artifacts,
+  };
+  if (options.wrongWorkflowIntent)
+    relocationState.intent = {
+      ...relocationState.intent,
+      relocationId: "30000000-0000-4000-8000-000000000003",
+    };
+  const persistedRelocation = {
+    relocationId: recipe.catalogRelocationId,
+    oldBoundary: recipe.body.processing.oldBoundary,
+    newBoundary: recipe.body.processing.newBoundary,
+    artifacts: recipe.body.processing.artifacts,
+    verifiedAt: options.mappingVerifiedAtMismatch ? verifiedAt + 1 : verifiedAt,
+  };
+  const session = {
+    journal,
+    store: { read: async () => structuredClone(relocationState) },
+    catalog: {
+      requireBoundaryRelocation: async () => ({
+        catalogRevision: recipe.body.processing.catalogRevision + 1,
+        relocation: structuredClone(persistedRelocation),
+      }),
+    },
+  };
   const baseline = observation();
   const operations = [];
   let observationCall = 0;
@@ -235,7 +293,7 @@ function setup(options = {}) {
         phase: "terminal",
         outcome: "complete",
         credentialSessionActive: false,
-        bindings: [],
+        bindings: existingBindings,
         scanned: baseline.length,
         published: 0,
       };
@@ -297,6 +355,37 @@ test("completes one unchanged held-session scan and accepts the rebound heartbea
     "processing.assessBegin",
     "diagnostics.heartbeat",
   ]);
+});
+
+test("preserves a quiescent terminal checkpoint's source bindings", async () => {
+  const f = setup({ terminalCheckpoint: true });
+  await __testOnlyVerifyArchiveRelocationOwnerResume(f.input, f.adapters);
+  assert.deepEqual(f.input.session.journal.checkpoint.bindings, [
+    {
+      rootAlias: "notes",
+      relativePath: "note.txt",
+      sourceExternalId: "source_external_1",
+      sourceItemId: "source_item_1",
+    },
+  ]);
+});
+
+test("rejects a wrong workflow intent or catalog mapping before owner reset", async () => {
+  for (const options of [
+    { wrongWorkflowIntent: true },
+    { workflowPhase: "verified" },
+    { mappingVerifiedAtMismatch: true },
+  ]) {
+    const f = setup(options);
+    await assert.rejects(
+      () => __testOnlyVerifyArchiveRelocationOwnerResume(f.input, f.adapters),
+      (error) =>
+        error instanceof ArchiveRelocationOwnerResumeError &&
+        error.code === "session_not_ready",
+    );
+    assert.equal(f.resetInput(), undefined);
+    assert.deepEqual(f.operations, []);
+  }
 });
 
 test("rejects a changed complete filesystem before owner reset", async () => {

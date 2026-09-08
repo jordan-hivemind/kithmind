@@ -2,8 +2,12 @@ import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 
 import { openArchiveCatalog, type ArchiveCatalog } from "./archiveCatalog.js";
-import { parseOwnerArchiveRelocationRecipe } from "./archiveRelocationRecipe.js";
+import {
+  parseOwnerArchiveRelocationRecipe,
+  relocationIntentFromRecipe,
+} from "./archiveRelocationRecipe.js";
 import { ArchiveRelocationSession } from "./archiveRelocationSession.js";
+import { validateArchiveRelocationState } from "./archiveRelocationWorkflow.js";
 import { loadPipelineConfig, parseConfig } from "./config.js";
 import { parseHeartbeatResponse } from "./diagnostics.js";
 import { doctor, type DoctorResult } from "./doctor.js";
@@ -16,6 +20,7 @@ import {
 } from "./filesystem.js";
 import { PipelineRunner } from "./runner.js";
 import type { RunnerCheckpoint } from "./runnerState.js";
+import { archiveCheckpointIsQuiescent } from "./journal.js";
 import { HttpWorkerTransport, parseWorkerResponse } from "./transport.js";
 import type { JsonValue } from "./journalTypes.js";
 import type {
@@ -505,9 +510,49 @@ async function verify(
     journal.directory !== proposed.journalDir ||
     journal.credentialStatus !== "current" ||
     journal.pending !== undefined ||
-    !isDeepStrictEqual(checkpoint, { version: 1, phase: "idle" }) ||
+    !archiveCheckpointIsQuiescent(checkpoint) ||
     journal.watcherId === recipe.body.localBindings.previousWatcherId ||
     !UUID.test(journal.watcherId)
+  )
+    fail("session_not_ready");
+
+  let relocationState;
+  try {
+    relocationState = validateArchiveRelocationState(
+      await input.session.store.read(),
+    );
+  } catch {
+    fail("session_not_ready");
+  }
+  if (
+    relocationState === undefined ||
+    relocationState.phase !== "rebound" ||
+    !isDeepStrictEqual(
+      relocationState.intent,
+      relocationIntentFromRecipe(recipe),
+    ) ||
+    relocationState.newBoundary?.rootPath !==
+      recipe.body.wholeRoot.newRootPath ||
+    relocationState.verifiedAt === undefined
+  )
+    fail("session_not_ready");
+  let persistedRelocation;
+  try {
+    persistedRelocation = await input.session.catalog.requireBoundaryRelocation(
+      recipe.catalogRelocationId,
+    );
+  } catch {
+    fail("session_not_ready");
+  }
+  const { verifiedAt, ...relocation } = persistedRelocation.relocation;
+  if (
+    verifiedAt !== relocationState.verifiedAt ||
+    !isDeepStrictEqual(relocation, {
+      relocationId: recipe.catalogRelocationId,
+      oldBoundary: recipe.body.processing.oldBoundary,
+      newBoundary: recipe.body.processing.newBoundary,
+      artifacts: recipe.body.processing.artifacts,
+    })
   )
     fail("session_not_ready");
 

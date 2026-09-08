@@ -6,7 +6,11 @@ import { dirname, resolve } from "node:path";
 import { openArchiveCatalog, type ArchiveCatalog } from "./archiveCatalog.js";
 import type { ArchiveBoundaryRelocation } from "./archiveCatalogTypes.js";
 import { validateArchiveRelocationConfig } from "./archiveRelocationConfig.js";
-import { Journal, JournalSafetyError } from "./journal.js";
+import {
+  archiveCheckpointIsQuiescent,
+  Journal,
+  JournalSafetyError,
+} from "./journal.js";
 import type { JournalCodec, JsonValue } from "./journalTypes.js";
 import { RCLONE_VERSION, RESTIC_VERSION } from "./archiveTypes.js";
 
@@ -500,12 +504,7 @@ export async function prepareArchiveRelocationRebind<
       JSON.stringify(validated.previousBinding) ||
     args.journal.credentialStatus !== "current" ||
     args.journal.pending !== undefined ||
-    !(
-      args.journal.checkpoint !== null &&
-      !Array.isArray(args.journal.checkpoint) &&
-      typeof args.journal.checkpoint === "object" &&
-      args.journal.checkpoint.phase === "idle"
-    )
+    !archiveCheckpointIsQuiescent(args.journal.checkpoint)
   )
     fail("rebind_failed");
   const catalog = await openArchiveCatalog({ journal: args.journal });

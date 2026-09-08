@@ -33,7 +33,7 @@ const codec = {
       typeof value.phase !== "string"
     )
       throw new Error("bad checkpoint");
-    return { version: 1, phase: value.phase };
+    return structuredClone(value);
   },
   parseResult(_operation, value) {
     return value;
@@ -156,6 +156,7 @@ function relocation() {
 async function fixture({
   previousRoot = "Legacy/backups",
   proposedRoot = "Managed/backups",
+  initialCheckpoint = { version: 1, phase: "idle" },
 } = {}) {
   const base = await mkdtemp(join(homedir(), ".kithmind-rebind-test-"));
   await chmod(base, 0o700);
@@ -176,7 +177,7 @@ async function fixture({
     directory: previous.journalDir,
     binding: journalBindingForConfig(previous),
     credential: "credential",
-    initialCheckpoint: { version: 1, phase: "idle" },
+    initialCheckpoint,
     codec,
   });
   const mapping = relocation();
@@ -340,6 +341,50 @@ test("paired rebind preserves journal state and rotates heartbeat identity", asy
       f.proposed,
     );
     assert.throws(() => f.journal.checkpoint, JournalSafetyError);
+  } finally {
+    await journal.close();
+    await rm(f.base, { recursive: true, force: true });
+  }
+});
+
+test("paired rebind preserves a quiescent terminal checkpoint", async () => {
+  const terminal = {
+    version: 1,
+    phase: "terminal",
+    outcome: "complete",
+    credentialSessionActive: false,
+    bindings: [
+      {
+        rootAlias: "notes",
+        relativePath: "note.txt",
+        sourceExternalId: "source_external_1",
+        sourceItemId: "source_item_1",
+      },
+    ],
+    scanned: 1,
+    published: 0,
+  };
+  const f = await fixture({ initialCheckpoint: terminal });
+  let journal = f.journal;
+  try {
+    await prepare(f);
+    const result = await resumeArchiveRelocationRebind({
+      journal,
+      configPath: f.configPath,
+      intentPath: f.intentPath,
+    });
+    journal = result.journal;
+    assert.deepEqual(journal.checkpoint, terminal);
+    const reopenedCheckpoint = journal.checkpoint;
+    await journal.close();
+    journal = await Journal.openExistingForArchiveRebind({
+      directory: f.proposed.journalDir,
+      previousConfig: f.previous,
+      proposedConfig: f.proposed,
+      credential: "credential",
+      codec,
+    });
+    assert.deepEqual(journal.checkpoint, reopenedCheckpoint);
   } finally {
     await journal.close();
     await rm(f.base, { recursive: true, force: true });
