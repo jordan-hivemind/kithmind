@@ -195,6 +195,9 @@ function parseIntent(
     newRootPath: path(row.newRootPath, code),
   };
   if (
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+      result.relocationId,
+    ) ||
     result.sourceId !== result.oldBoundary.rootId ||
     result.sourceParentId === result.destinationParentId ||
     result.destinationName.includes("/") ||
@@ -218,8 +221,13 @@ function artifact(
   const sha256 = text(row.ciphertextSha256, code);
   if (
     !/^[a-f0-9]{64}$/.test(sha256) ||
+    typeof row.snapshotId !== "string" ||
+    !/^[a-f0-9]{64}$/.test(row.snapshotId) ||
+    typeof row.objectName !== "string" ||
+    !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(row.objectName) ||
     !Number.isSafeInteger(row.ciphertextByteLength) ||
-    (row.ciphertextByteLength as number) < 1
+    (row.ciphertextByteLength as number) < 1 ||
+    (row.ciphertextByteLength as number) > 64 * 1024 * 1024
   )
     fail(code);
   return {
@@ -233,7 +241,7 @@ function artifacts(
   value: unknown,
   code: ArchiveRelocationFailureCode,
 ): readonly RelocationArtifact[] {
-  if (!Array.isArray(value) || value.length === 0 || value.length > 4096)
+  if (!Array.isArray(value) || value.length === 0 || value.length > 2048)
     fail(code);
   const result = value.map((entry) => artifact(entry, code));
   const keys = result.map(

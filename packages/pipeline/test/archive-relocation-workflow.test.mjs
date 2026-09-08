@@ -7,7 +7,7 @@ import {
 } from "../dist/archiveRelocationWorkflow.js";
 
 const intent = () => ({
-  relocationId: "relocation-1",
+  relocationId: "11111111-1111-4111-8111-111111111111",
   sourceId: "legacy-root",
   sourceParentId: "legacy-parent",
   destinationParentId: "managed-parent",
@@ -95,7 +95,7 @@ function fixture({ moveThrowsAfterApplying = false } = {}) {
       calls.push("source-verify");
       return [
         {
-          snapshotId: "snapshot-1",
+          snapshotId: "e".repeat(64),
           objectName: "object-1.age",
           ciphertextSha256: "a".repeat(64),
           ciphertextByteLength: 10,
@@ -106,7 +106,7 @@ function fixture({ moveThrowsAfterApplying = false } = {}) {
       calls.push("verify");
       return [
         {
-          snapshotId: "snapshot-1",
+          snapshotId: "e".repeat(64),
           objectName: "object-1.age",
           ciphertextSha256: "a".repeat(64),
           ciphertextByteLength: 10,
@@ -243,7 +243,7 @@ test("does not rebind or resume until relocated inventory verification passes", 
 
   f.gates.verifyRelocatedInventory = async () => [
     {
-      snapshotId: "snapshot-1",
+      snapshotId: "e".repeat(64),
       objectName: "object-1.age",
       ciphertextSha256: "a".repeat(64),
       ciphertextByteLength: 10,
@@ -266,7 +266,7 @@ test("rejects a post-move inventory that differs from the durable baseline", asy
   const f = fixture();
   f.gates.verifyRelocatedInventory = async () => [
     {
-      snapshotId: "snapshot-1",
+      snapshotId: "e".repeat(64),
       objectName: "object-1.age",
       ciphertextSha256: "b".repeat(64),
       ciphertextByteLength: 10,
@@ -293,7 +293,7 @@ test("rejects a forged verified state whose inventory differs from its baseline"
     preMoveVerifiedAt: 1,
     preMoveVerifiedArtifacts: [
       {
-        snapshotId: "snapshot-1",
+        snapshotId: "e".repeat(64),
         objectName: "object-1.age",
         ciphertextSha256: "a".repeat(64),
         ciphertextByteLength: 10,
@@ -305,7 +305,7 @@ test("rejects a forged verified state whose inventory differs from its baseline"
     verifiedAt: 3,
     verifiedArtifacts: [
       {
-        snapshotId: "snapshot-1",
+        snapshotId: "e".repeat(64),
         objectName: "object-1.age",
         ciphertextSha256: "b".repeat(64),
         ciphertextByteLength: 10,
@@ -353,5 +353,29 @@ test("resumed move intent rejects substituted provider identities before moving"
     );
     assert.equal(f.moves, 0);
     assert.equal(f.state.phase, "move_requested");
+  }
+});
+
+test("rejects evidence incompatible with catalog before a provider move", async () => {
+  const invalidIntent = fixture();
+  await assert.rejects(() =>
+    invalidIntent.workflow.prepare({ ...intent(), relocationId: "not-a-uuid" }),
+  );
+  assert.equal(invalidIntent.moves, 0);
+  for (const change of [
+    { snapshotId: "not-a-snapshot" },
+    { objectName: "../object.age" },
+    { ciphertextByteLength: 64 * 1024 * 1024 + 1 },
+  ]) {
+    const f = fixture();
+    const baseline = await f.gates.verifySourceInventory();
+    f.gates.verifySourceInventory = async () => [{ ...baseline[0], ...change }];
+    await f.workflow.prepare(intent());
+    await assert.rejects(
+      () => f.workflow.resume(),
+      (error) => error.code === "inventory_changed",
+    );
+    assert.equal(f.moves, 0);
+    assert.equal(f.state.phase, "prepared");
   }
 });
