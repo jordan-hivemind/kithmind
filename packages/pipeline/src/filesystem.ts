@@ -693,6 +693,7 @@ async function discoverWith<T extends DiscoveryFile | SourceObservation>(
           "root contains a non-regular entry",
         );
       }
+      if (entry.name === ".DS_Store") continue;
       if (found.length >= config.maxFiles) {
         throw new FilesystemFailure("oversized", "file count limit exceeded");
       }
