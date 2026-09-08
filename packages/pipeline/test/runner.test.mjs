@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { Journal } from "../dist/journal.js";
+import { Journal, JournalLockedError } from "../dist/journal.js";
 import { openArchiveCatalog } from "../dist/archiveCatalog.js";
 import { digestArchiveIntent } from "../dist/archivedRequestMapping.js";
 import {
@@ -134,6 +134,22 @@ async function openJournal(directory, checkpoint = initialCheckpoint) {
     initialCheckpoint: checkpoint,
     codec: journalCodec,
   });
+}
+
+async function fixtureWithJournal(fileCount, checkpoint) {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const setup = await fixture(fileCount);
+    try {
+      return {
+        ...setup,
+        journal: await openJournal(setup.journalDir, checkpoint),
+      };
+    } catch (error) {
+      await rm(setup.base, { recursive: true, force: true });
+      if (error instanceof JournalLockedError && attempt < 4) continue;
+      throw error;
+    }
+  }
 }
 
 test("version-1 checkpoints accept only closed PDF and safe-gap scan plans", () => {
@@ -287,7 +303,6 @@ test("append serializes PDF and safe leaf gaps without changing UTF-8 entries", 
 });
 
 test("cached forgotten PDF disposition resumes without archival work or invented epochs", async () => {
-  const setup = await fixture(0);
   const forgotten = pdfPlan({ relativePath: "forgotten.pdf" });
   const unchanged = pdfPlan({ relativePath: "unchanged.pdf" });
   const review = pdfPlan({ relativePath: "review.pdf" });
@@ -304,7 +319,8 @@ test("cached forgotten PDF disposition resumes without archival work or invented
     reviewSeen: false,
     files: [forgotten, unchanged, review],
   });
-  let journal = await openJournal(setup.journalDir, checkpoint);
+  const setup = await fixtureWithJournal(0, checkpoint);
+  let journal = setup.journal;
   try {
     journal.commitResult = async () => {
       throw new Error("interrupted commit");

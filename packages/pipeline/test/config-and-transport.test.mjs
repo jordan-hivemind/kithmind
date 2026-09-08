@@ -1015,6 +1015,72 @@ test("parsed job responses require closed B2 phases, counts, and leases", () => 
   }
 });
 
+test("HTTP transport accepts current parsed stage boundaries and rejects values above them", async () => {
+  const originalFetch = globalThis.fetch;
+  let response;
+  try {
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify(response), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    const transport = new HttpWorkerTransport(
+      transportConfig("http://127.0.0.1:3100/api/worker"),
+      "credential",
+    );
+    const boundaries = [
+      {
+        operation: "jobs.stageParsedBegin",
+        jobId: "job",
+        stageId: "stage",
+        phase: "pages",
+        nextOrdinal: 64,
+        reused: true,
+      },
+      ...[
+        ["pages", 64, 8],
+        ["evidence", 256, 25],
+        ["chunks", 256, 25],
+      ].map(([phase, nextOrdinal, acceptedCount]) => ({
+        operation: "jobs.stageParsedBatch",
+        jobId: "job",
+        stageId: "stage",
+        committedPhase: phase,
+        phase,
+        nextOrdinal,
+        acceptedCount,
+        reused: false,
+      })),
+    ];
+    for (const value of boundaries) {
+      response = value;
+      assert.equal(
+        (
+          await transport.call({
+            protocolVersion: 1,
+            operation: value.operation,
+          })
+        ).operation,
+        value.operation,
+      );
+    }
+    for (const value of boundaries.map((candidate) => ({
+      ...candidate,
+      nextOrdinal: candidate.nextOrdinal + 1,
+    }))) {
+      response = value;
+      await assert.rejects(() =>
+        transport.call({
+          protocolVersion: 1,
+          operation: value.operation,
+        }),
+      );
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 function transportConfig(endpoint) {
   return {
     protocolVersion: 1,

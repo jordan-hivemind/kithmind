@@ -993,13 +993,13 @@ const PARSED_BATCH_PHASES = [
 function parsedPhaseLimit(phase: string): number {
   switch (phase) {
     case "pages":
-      return 32;
+      return 64;
     case "evidence":
-      return 128;
+      return 256;
     case "documents":
       return 16;
     case "chunks":
-      return 128;
+      return 256;
     case "seal":
     case "staged":
       return 0;
