@@ -153,6 +153,33 @@ test("PDF document-Q&A config is closed, bound, and keeps legacy bindings stable
     journalBindingForConfig(pdf).configFingerprint,
     journalBindingForConfig(legacy).configFingerprint,
   );
+  const remotePdf = pdfDocQaConfig();
+  delete remotePdf.archive.independentBackup.repositoryPath;
+  remotePdf.archive.independentBackup.repository = {
+    kind: "rclone_dropbox_v1",
+    remoteName: "kithmind_dropbox",
+    rootPath: "Kith Mind Backups/Processing",
+    rcloneBinary: "/tools/rclone",
+    configPath: "/credentials/kithmind-rclone.conf",
+    configIdentityFingerprint: "c".repeat(64),
+    expectedRootDirectoryIdHash: "d".repeat(64),
+  };
+  const parsedRemote = parseConfig({ ...base, pdfDocQa: remotePdf });
+  assert.deepEqual(
+    parsedRemote.pdfDocQa.archive.independentBackup.repository,
+    remotePdf.archive.independentBackup.repository,
+  );
+  assert.notEqual(
+    journalBindingForConfig(parsedRemote).configFingerprint,
+    journalBindingForConfig(pdf).configFingerprint,
+  );
+  const invalidRemote = structuredClone(remotePdf);
+  invalidRemote.archive.independentBackup.repository.rootPath =
+    "Kith Mind Backups/../Processing";
+  assert.throws(() => parseConfig({ ...base, pdfDocQa: invalidRemote }));
+  const extraRemote = structuredClone(remotePdf);
+  extraRemote.archive.independentBackup.repository.endpoint = "custom";
+  assert.throws(() => parseConfig({ ...base, pdfDocQa: extraRemote }));
   assert.throws(() =>
     parseConfig({
       ...base,

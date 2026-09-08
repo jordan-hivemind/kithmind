@@ -46,7 +46,10 @@ type CloudAck = {
   forgetEpoch: number;
   objectOutcome: "deleted" | "already_missing";
   backupOutcome?: "deleted" | "already_missing";
-  absenceAuthority: "worker_asserted_physical_absence";
+  absenceAuthority:
+    | "worker_asserted_physical_absence"
+    | "worker_asserted_live_repository_absence";
+  retentionDisclosure?: "provider_retained_deleted_history_possible";
   completedAt: number;
 };
 
@@ -96,6 +99,7 @@ export type ArchiveForgetResult =
       receiptCount: number;
       acknowledgedCount: number;
       localCopyCount: number;
+      retainedProviderHistoryPossible?: true;
       nextAction: "run_authenticated_owner_continue_forget";
     }
   | {
@@ -469,9 +473,14 @@ async function deleteCopy(input: {
     )
       throw { code: "backup_identity_mismatch" };
     await input.authorize();
+    const configuredBackup = input.config.archive.independentBackup;
+    if ("repository" in configuredBackup && selected.subject !== "parser_output")
+      throw { code: "archive_remote_original_unsupported" };
     const result = await input.commands.forgetBackup({
-      resticBinary: input.config.archive.independentBackup.resticBinary,
-      repositoryPath: input.config.archive.independentBackup.repositoryPath,
+      resticBinary: configuredBackup.resticBinary,
+      ...("repository" in configuredBackup
+        ? { repository: configuredBackup.repository! }
+        : { repositoryPath: configuredBackup.repositoryPath }),
       expectedRepositoryId:
         input.config.archive.independentBackup.expectedRepositoryId,
       passwordCommand: input.config.archive.independentBackup.passwordCommand,
@@ -730,11 +739,23 @@ export async function runArchiveForget(input: {
       const current = currentRow(input.catalog, matched);
       const copy = current.row.copies[target.copyRole];
       const deletion = completeDeletion(copy, input.forgetEpoch);
+      const liveRepository =
+        matched.subject === "parser_output" &&
+        matched.role === "independent_backup" &&
+        "repository" in input.config.pdfDocQa.archive.independentBackup;
+      const expectedAuthority = liveRepository
+        ? "worker_asserted_live_repository_absence" as const
+        : "worker_asserted_physical_absence" as const;
+      const expectedDisclosure = liveRepository
+        ? "provider_retained_deleted_history_possible" as const
+        : undefined;
       if (target.ack) {
         if (
           target.ack.deletionId !== deletion.deletionId ||
           target.ack.objectOutcome !== deletion.object ||
-          target.ack.backupOutcome !== deletion.backup
+          target.ack.backupOutcome !== deletion.backup ||
+          target.ack.absenceAuthority !== expectedAuthority ||
+          target.ack.retentionDisclosure !== expectedDisclosure
         )
           throw { code: "ack_identity_mismatch" };
         continue;
@@ -753,6 +774,12 @@ export async function runArchiveForget(input: {
         ...(deletion.backup === undefined
           ? {}
           : { backupOutcome: deletion.backup }),
+        ...(liveRepository
+          ? {
+              absenceAuthority: expectedAuthority,
+              retentionDisclosure: expectedDisclosure,
+            }
+          : {}),
       });
       if (isWorkerError(response)) throw { code: response.error.code };
       const ack = response as AckResult;
@@ -763,7 +790,8 @@ export async function runArchiveForget(input: {
         ack.forgetEpoch !== input.forgetEpoch ||
         ack.objectOutcome !== deletion.object ||
         ack.backupOutcome !== deletion.backup ||
-        ack.absenceAuthority !== "worker_asserted_physical_absence"
+        ack.absenceAuthority !== expectedAuthority ||
+        ack.retentionDisclosure !== expectedDisclosure
       )
         throw { code: "ack_identity_mismatch" };
     }
@@ -784,6 +812,10 @@ export async function runArchiveForget(input: {
       const after = finalById.get(target.receiptId);
       if (!after?.ack) throw { code: "ack_not_observed" };
       const matched = matches.get(target.receiptId)!;
+      const liveRepository =
+        matched.subject === "parser_output" &&
+        matched.role === "independent_backup" &&
+        "repository" in input.config.pdfDocQa.archive.independentBackup;
       const current = currentRow(input.catalog, matched);
       const deletion = completeDeletion(
         current.row.copies[target.copyRole],
@@ -792,7 +824,15 @@ export async function runArchiveForget(input: {
       if (
         after.ack.deletionId !== deletion.deletionId ||
         after.ack.objectOutcome !== deletion.object ||
-        after.ack.backupOutcome !== deletion.backup
+        after.ack.backupOutcome !== deletion.backup ||
+        after.ack.absenceAuthority !==
+          (liveRepository
+            ? "worker_asserted_live_repository_absence"
+            : "worker_asserted_physical_absence") ||
+        after.ack.retentionDisclosure !==
+          (liveRepository
+            ? "provider_retained_deleted_history_possible"
+            : undefined)
       )
         throw { code: "ack_identity_mismatch" };
     }
@@ -803,6 +843,9 @@ export async function runArchiveForget(input: {
       receiptCount: first.targets.length,
       acknowledgedCount: final.targets.filter((target) => target.ack).length,
       localCopyCount,
+      ...( "repository" in input.config.pdfDocQa.archive.independentBackup
+        ? { retainedProviderHistoryPossible: true as const }
+        : {}),
       nextAction: "run_authenticated_owner_continue_forget",
     };
   } catch (error) {

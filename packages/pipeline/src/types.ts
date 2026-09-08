@@ -51,11 +51,24 @@ export type PdfDocQaConfig = {
       directory: string;
       recipient: string;
       resticBinary: string;
-      repositoryPath: string;
       expectedRepositoryId: string;
       passwordCommand: { executable: string; publicArgs?: string[] };
       host: string;
-    };
+    } & (
+      | { repositoryPath: string; repository?: never }
+      | {
+          repositoryPath?: never;
+          repository: {
+            kind: "rclone_dropbox_v1";
+            remoteName: string;
+            rootPath: string;
+            rcloneBinary: string;
+            configPath: string;
+            configIdentityFingerprint: string;
+            expectedRootDirectoryIdHash: string;
+          };
+        }
+    );
   };
 };
 

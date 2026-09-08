@@ -332,7 +332,7 @@ function backup(value: unknown): ResticBackupResult | RecoveredResticBackup {
   if (
     row.resticVersion !== "0.19.1" ||
     row.verification !== "destination_ciphertext_readback" ||
-    own(row, "boundary") === own(row, "matchingSnapshotCount")
+    (!own(row, "boundary") && !own(row, "matchingSnapshotCount"))
   )
     fail("catalog_invalid");
   const base = {
@@ -346,9 +346,16 @@ function backup(value: unknown): ResticBackupResult | RecoveredResticBackup {
   };
   if (row.matchingSnapshotCount !== undefined) {
     if (row.matchingSnapshotCount !== 1) fail("catalog_invalid");
-    return { ...base, matchingSnapshotCount: 1 };
+    return {
+      ...base,
+      matchingSnapshotCount: 1,
+      ...(row.boundary === undefined ? {} : { boundary: remoteBoundary(row.boundary, base.repositoryId) }),
+    };
   }
   const boundary = object(row.boundary);
+  if (boundary.backend === "rclone_dropbox_v1") {
+    return { ...base, boundary: remoteBoundary(boundary, base.repositoryId) };
+  }
   exact(boundary, ["mode", "readiness", "primaryDevice", "backupDevice"]);
   if (
     (boundary.mode !== "synthetic" && boundary.mode !== "independent_backup") ||
@@ -364,6 +371,39 @@ function backup(value: unknown): ResticBackupResult | RecoveredResticBackup {
       primaryDevice: integer(boundary.primaryDevice),
       backupDevice: integer(boundary.backupDevice),
     },
+  };
+}
+
+function remoteBoundary(value: unknown, repositoryId: string) {
+  const boundary = object(value);
+  exact(boundary, ["mode", "readiness", "backend", "remoteName", "rootPath", "rootDirectoryIdHash", "configIdentityFingerprint", "repositoryId", "resticVersion", "rcloneVersion"]);
+  if (
+    boundary.mode !== "independent_backup" ||
+    boundary.readiness !== "remote_repository_verified" ||
+    boundary.backend !== "rclone_dropbox_v1" ||
+    boundary.repositoryId !== repositoryId ||
+    boundary.resticVersion !== "0.19.1" ||
+    boundary.rcloneVersion !== "v1.74.4"
+  ) fail("catalog_invalid");
+  const rootPath = string(boundary.rootPath, 512);
+  if (
+    !/^[A-Za-z0-9 _.-]+(?:\/[A-Za-z0-9 _.-]+)+$/.test(rootPath) ||
+    /[:\\]/.test(rootPath) ||
+    rootPath.split("/").some((part) =>
+      !part || part === "." || part === ".." || part.trim() !== part
+    )
+  ) fail("catalog_invalid");
+  return {
+    mode: "independent_backup" as const,
+    readiness: "remote_repository_verified" as const,
+    backend: "rclone_dropbox_v1" as const,
+    remoteName: string(boundary.remoteName, 64, /^[A-Za-z0-9][A-Za-z0-9_-]*$/),
+    rootPath,
+    rootDirectoryIdHash: string(boundary.rootDirectoryIdHash, 64, /^[a-f0-9]{64}$/),
+    configIdentityFingerprint: string(boundary.configIdentityFingerprint, 64, /^[a-f0-9]{64}$/),
+    repositoryId,
+    resticVersion: "0.19.1" as const,
+    rcloneVersion: "v1.74.4" as const,
   };
 }
 

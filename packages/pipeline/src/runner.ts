@@ -2413,6 +2413,17 @@ export class PipelineRunner {
       : pdf.archive.independentBackup;
   }
 
+  private resticLocation(subject: ArchiveSubject) {
+    const backup = this.requirePdfConfig().archive.independentBackup;
+    if ("repository" in backup) {
+      if (subject !== "parser_output") {
+        throw new PipelineWorkerError("archive_remote_original_unsupported");
+      }
+      return { repository: backup.repository! };
+    }
+    return { repositoryPath: backup.repositoryPath };
+  }
+
   private preparedArchiveObject(
     row: OriginalCatalogRow | ProcessingCatalogRow,
     role: ArchiveCopyRole,
@@ -2519,13 +2530,19 @@ export class PipelineRunner {
         if (!equalJson(copy.backup.ciphertext, recoveredBackup.ciphertext)) {
           throw new PipelineWorkerError("archive_backup_recovery_conflict");
         }
+        if (
+          recoveredBackup.boundary !== undefined &&
+          !equalJson(copy.backup.boundary, recoveredBackup.boundary)
+        ) {
+          throw new PipelineWorkerError("archive_backup_recovery_conflict");
+        }
         backup = copy.backup;
       } else if (recoveredBackup) {
         backup = recoveredBackup;
       } else {
         backup = await backupResticObject({
           resticBinary: pdf.archive.independentBackup.resticBinary,
-          repositoryPath: pdf.archive.independentBackup.repositoryPath,
+          ...this.resticLocation(subject),
           expectedRepositoryId: copy.restic.repositoryId,
           passwordCommand: pdf.archive.independentBackup.passwordCommand,
           operationId: copy.restic.operationId,
@@ -2587,7 +2604,11 @@ export class PipelineRunner {
       if (checkpoint.preflightAction.endsWith("snapshot")) {
         const repository = await probeResticRepository({
           resticBinary: pdf.archive.independentBackup.resticBinary,
-          repositoryPath: pdf.archive.independentBackup.repositoryPath,
+          ...this.resticLocation(
+            checkpoint.preflightAction.startsWith("original_")
+              ? "original_bytes"
+              : "parser_output",
+          ),
           passwordCommand: pdf.archive.independentBackup.passwordCommand,
         });
         if (
@@ -2608,7 +2629,7 @@ export class PipelineRunner {
         try {
           recoveredBackup = await recoverResticBackup({
             resticBinary: pdf.archive.independentBackup.resticBinary,
-            repositoryPath: pdf.archive.independentBackup.repositoryPath,
+            ...this.resticLocation(subject),
             expectedRepositoryId: copy.restic.repositoryId,
             passwordCommand: pdf.archive.independentBackup.passwordCommand,
             operationId: copy.restic.operationId,
