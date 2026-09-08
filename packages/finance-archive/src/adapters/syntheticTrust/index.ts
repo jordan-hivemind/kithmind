@@ -11,7 +11,6 @@ import {
   EMPTY_HOLDINGS,
   exhaustiveListing,
   incompleteListing,
-  sha256Hex,
   type AcquiredDocument,
   type AcquireSelection,
   type AdapterSession,
@@ -30,6 +29,8 @@ import {
 } from "../../adapter.js";
 import {
   buildTabularExportCsv,
+  CREDENTIAL_SHAPED_ECHO,
+  CREDENTIAL_SHAPED_ROW_ECHO,
   DOCUMENTS,
   generateActivityRows,
   HOLDINGS_INSTRUMENTS,
@@ -39,6 +40,7 @@ import {
   paginateWithOverlap,
   type ActivityRow,
 } from "./fixtures.js";
+import { retainPayload, type RetentionPolicy } from "../../retention.js";
 
 export { INSTITUTION_NAME, INSTITUTION_SLUG } from "./fixtures.js";
 
@@ -189,6 +191,14 @@ export type SyntheticSessionOptions = {
   readonly omitDocumentsTotal?: boolean;
   /** Fail the activity request for this page number, simulating an outage mid-pull. */
   readonly activityFailAtPage?: number;
+  /**
+   * F1-23. Echo credential-shaped material back inside the activity
+   * response, at the top of each page and again on each row, the way a real
+   * provider can. Nothing an adapter does causes this; it models the
+   * provider's own behavior, which is exactly why the projection cannot be
+   * the adapter's discretion.
+   */
+  readonly echoCredentialShapedFields?: boolean;
 };
 
 /**
@@ -233,6 +243,13 @@ export function createSyntheticSession(
       const page = ACTIVITY_PAGES[pageNumber - 1];
       if (!page) {
         throw new RangeError(`synthetic session: no activity page ${pageNumber}`);
+      }
+      if (options.echoCredentialShapedFields) {
+        return JSON.stringify({
+          ...page,
+          ...CREDENTIAL_SHAPED_ECHO,
+          items: page.items.map((item) => ({ ...item, ...CREDENTIAL_SHAPED_ROW_ECHO })),
+        });
       }
       return JSON.stringify(page);
     }
@@ -304,6 +321,69 @@ async function discover(session: AdapterSession): Promise<DiscoverResult> {
 }
 
 // --- acquire ---------------------------------------------------------------
+//
+// F1-23. Every tier declares what it retains before any of its bytes are
+// hashed or written. The declarations live next to the acquisition code that
+// uses them, because keeping a field means knowing why the parser wants it.
+
+/**
+ * The activity API's business payload, field by field. Anything else this
+ * institution's response carries -- a session token echoed back, an
+ * `Authorization` header, a `Set-Cookie` value, a refresh token, a device
+ * identifier, a signed-in user profile -- is simply not named here, so
+ * nothing copies it. Every path below is one the parser actually reads; a
+ * field the parser does not read has no business surviving acquisition.
+ *
+ * Bump `version` whenever this list changes.
+ */
+const ACTIVITY_RETENTION: RetentionPolicy = {
+  kind: "json_allowlist",
+  version: "thistlebrook-activity-1",
+  fields: [
+    "pages.*.page",
+    "pages.*.totalCount",
+    "pages.*.hasMore",
+    "pages.*.items.*.externalId",
+    "pages.*.items.*.date",
+    "pages.*.items.*.activityType",
+    "pages.*.items.*.description",
+    "pages.*.items.*.instrument.symbol",
+    "pages.*.items.*.instrument.cusip",
+    "pages.*.items.*.instrument.isin",
+    "pages.*.items.*.instrument.name",
+    "pages.*.items.*.quantity",
+    "pages.*.items.*.price",
+    "pages.*.items.*.amount",
+    "pages.*.items.*.currency",
+  ],
+};
+
+/**
+ * A statement or trade confirmation is a rendered document: bytes with no
+ * addressable fields, so there is nothing to allowlist and a field
+ * projection is not a thing that can be applied to it. It is retained whole
+ * and the manifest records `opaque`, so a reader knows the file is the
+ * artifact as delivered rather than a filtered payload. `retainPayload`
+ * refuses this declaration for the `structured_api` tier, which is where the
+ * risk actually lives.
+ */
+const DOCUMENT_RETENTION: RetentionPolicy = {
+  kind: "opaque",
+  version: "thistlebrook-document-1",
+  note:
+    "a statement or trade confirmation is a rendered document with no addressable " +
+    "fields; it is retained whole because there is nothing to project",
+};
+
+/** Same reasoning for the download-control export: a file the site generated
+ * for a person to open, delimited text rather than an addressable payload. */
+const TABULAR_RETENTION: RetentionPolicy = {
+  kind: "opaque",
+  version: "thistlebrook-tabular-1",
+  note:
+    "a tabular export is delimited text produced by a download control, not an " +
+    "addressable payload; it is retained whole because there is nothing to project",
+};
 
 async function acquireStructuredApi(selection: {
   readonly session: AdapterSession;
@@ -340,7 +420,11 @@ async function acquireStructuredApi(selection: {
     }
   }
 
-  const bytes = new TextEncoder().encode(JSON.stringify({ pages: rawPages }));
+  const retained = retainPayload(
+    ACTIVITY_RETENTION,
+    new TextEncoder().encode(JSON.stringify({ pages: rawPages })),
+    "structured_api",
+  );
   const gaps = failure
     ? [
         {
@@ -354,13 +438,14 @@ async function acquireStructuredApi(selection: {
     : [];
 
   return {
-    bytes,
+    bytes: retained.bytes,
+    retention: retained.record,
     manifest: {
       kind: "structured_api",
       periodStart: selection.periodStart,
       periodEnd: selection.periodEnd,
       capturedAt: new Date().toISOString(),
-      contentHash: sha256Hex(bytes),
+      contentHash: retained.sha256,
       reportedRowCount,
       gaps,
     },
@@ -376,15 +461,20 @@ async function acquireTabularExport(selection: {
     periodStart: selection.periodStart,
     periodEnd: selection.periodEnd,
   });
-  const bytes = new TextEncoder().encode(text);
+  const retained = retainPayload(
+    TABULAR_RETENTION,
+    new TextEncoder().encode(text),
+    "tabular_export",
+  );
   return {
-    bytes,
+    bytes: retained.bytes,
+    retention: retained.record,
     manifest: {
       kind: "tabular_export",
       periodStart: selection.periodStart,
       periodEnd: selection.periodEnd,
       capturedAt: new Date().toISOString(),
-      contentHash: sha256Hex(bytes),
+      contentHash: retained.sha256,
       // Documented quirk: this institution's tabular export states no row count.
       reportedRowCount: null,
       gaps: [],
@@ -400,15 +490,20 @@ async function acquireDocument(selection: {
   if (!doc) {
     throw new RangeError(`unknown document ${selection.externalId}`);
   }
-  const bytes = await selection.session.fetchBytes(`/documents/${doc.externalId}`);
+  const retained = retainPayload(
+    DOCUMENT_RETENTION,
+    await selection.session.fetchBytes(`/documents/${doc.externalId}`),
+    doc.kind,
+  );
   return {
-    bytes,
+    bytes: retained.bytes,
+    retention: retained.record,
     manifest: {
       kind: doc.kind,
       periodStart: doc.periodStart,
       periodEnd: doc.periodEnd,
       capturedAt: new Date().toISOString(),
-      contentHash: sha256Hex(bytes),
+      contentHash: retained.sha256,
       reportedRowCount: null,
       gaps: [],
     },

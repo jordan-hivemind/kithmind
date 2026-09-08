@@ -24,6 +24,23 @@ jobs:
       - run: git diff --exit-code -- evals/parser/fixtures
   verify:
     runs-on: ubuntu-latest
+    # The finance archive's Postgres tests skip when no database is configured,
+    # so without this service they would never run anywhere. A skipped test is
+    # not a passing one.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    env:
+      FINANCE_ARCHIVE_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4

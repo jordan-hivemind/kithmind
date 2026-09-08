@@ -4,15 +4,96 @@ The store, schema, migrations and money policy for the financial archive
 described in
 [`docs/plans/2026-09-07-financial-transaction-database.md`](../../docs/plans/2026-09-07-financial-transaction-database.md).
 
-This package owns the SQLite file and the rules for what a number means inside
-it. The adapter interface, importer, reconciliation gate and MCP server build on
+This package owns the store and the rules for what a number means inside it.
+The adapter interface, importer, reconciliation gate and MCP server build on
 top of it.
+
+The archive is moving from a local SQLite file to hosted Postgres, so an
+always-on machine and a laptop can share one archive. F1-20 adds the Postgres
+schema, the money representation it uses and the conversion tests beside the
+SQLite implementation; F1-22 ports the importer, both reconciliation gates and
+the raw-tree writer onto it and removes SQLite. Until then both are here, and
+the sections below say which engine each describes.
 
 The archive file, the raw document tree and the import logs live in a configured
 local directory outside this repository. No real account number, balance,
 holding, institution, advisor, entity or path appears here or in the tests.
 
-## Money and rounding policy
+## Money on Postgres (F1-20)
+
+SQLite forced a split representation: cash amounts as integer minor units so
+`SUM` stayed exact, quantities and prices as canonical decimal `TEXT` so
+precision survived. Postgres `NUMERIC` does both, so one representation
+replaces the split and the conversion boundary between them disappears along
+with the class of bugs that lived on it.
+
+**`NUMERIC` does not make money exact end to end.** It gives exact arithmetic
+and exact aggregation inside the database. It does nothing about precision
+lost _before_ insertion: a JavaScript `0.1 + 0.2` arrives as
+`0.30000000000000004` and is stored faithfully, damage included. So the
+guarantee is validated input and pinned decoding, and both are built rather
+than assumed.
+
+| Rule                                                     | Where it lives                                                       |
+| -------------------------------------------------------- | -------------------------------------------------------------------- |
+| Decimal input is validated as text before any conversion | `toNumericText` (`src/pgNumeric.ts`)                                 |
+| A JavaScript number is refused, never stringified        | `toNumericText`                                                      |
+| Non-finite values are refused, Postgres `NaN` included   | `toNumericText`, `fromNumericText`, and the `finance_numeric` domain |
+| Money crosses driver, JSON and MCP boundaries as text    | `pinNumericDecoding` (`src/pgStore.ts`)                              |
+
+The SQLite `CHECK (typeof(...))` constraints do not translate, because
+Postgres types already cover storage class. Their intent moves to input
+validation, which is the only place that can still tell a float from a
+decimal.
+
+### Overflow
+
+Columns are `NUMERIC` with no declared precision or scale. `NUMERIC(38, 18)`
+would _round_ a more precise value into place on insert, which is the silent
+loss the policy exists to prevent. The typed Kith Mind boundary carries 38
+significant digits and 18 fractional places, and that bound is enforced on the
+way in by `toNumericText`, where exceeding it throws. A caller turns that into
+a `review_items` row, exactly as it already does when `toMinorUnits` cannot
+place a value at a currency's exponent. Out of range is a rejection or a
+review outcome, never a rounding.
+
+### Driver decoding
+
+node-postgres decodes by type OID, and its current default for `NUMERIC` is
+already text. That is why the decoder is pinned rather than relied on: a
+default is a choice someone else can change in a minor release, and a driver
+that silently started returning a float for `NUMERIC` would reintroduce the
+exact failure the type was chosen to prevent, quietly and everywhere at once.
+`pinNumericDecoding` pins `NUMERIC` and `INT8`, and `test/pgMoney.test.mjs`
+asserts the pin with no database required.
+
+### The deduplication preimage is versioned
+
+`row_hash` hashed the minor-unit integer. Under a decimal representation `1`,
+`1.0` and `1.00` must resolve to one identity, or deduplication stops working
+and the archive double-counts. So the preimage is versioned, not quietly
+changed:
+
+| Domain                | Amount field in the preimage                                      |
+| --------------------- | ----------------------------------------------------------------- |
+| `kith-finance-row:v1` | minor units at the currency's exponent, USD 12.34 as `1234`       |
+| `kith-finance-row:v2` | the stated amount in canonical decimal form, USD 12.34 as `12.34` |
+
+`fromMinorUnits(amount, currency)` is the mapping between them. It is total
+and, for a fixed currency, injective, so two rows share a v1 hash if and only
+if they share a v2 hash: the identities the archive deduplicates on are the
+same set before and after the move. `test/pgMoney.test.mjs` asserts that
+property over a synthetic row set covering a zero-exponent currency, a
+three-place one, repeated content at different ordinals, an ambiguous amount
+under review and several spellings of one amount.
+
+`rowHash` and `ROW_HASH_DOMAIN` still mean what they meant. `rowHashV2` and
+`ROW_HASH_DOMAIN_V2` are new names, so nothing reinterprets a v1 hash as a v2
+one. The occurrence ordinal and its runtime validation carry over unchanged:
+it is what lets one formula both collapse an overlapping paginated page and
+keep two legitimately identical transactions in one document apart.
+
+## Money and rounding policy (SQLite)
 
 Money has two representations, and which one a column uses follows one rule:
 **amounts get summed, prices do not.** Any column added later is classified the
@@ -125,11 +206,12 @@ the provider's stated total) or `incompleteListing` (which carries why it
 stopped, and a `providerTotal` of `null` when the provider states no total at
 all, distinct from a stated total of `0`).
 
-`acquire` returns the raw bytes it captured, unedited, plus a manifest entry:
-period, capture time, a sha256 content hash (`sha256Hex`), the row count the
-provider claimed for the pull when it claims one, and any gaps the pull
-could not close. Writing those bytes to the raw tree is the importer's job,
-not the adapter's; the raw tree stays immutable either way.
+`acquire` returns the **retained** bytes plus a manifest entry: period,
+capture time, the sha256 of those retained bytes, the row count the provider
+claimed for the pull when it claims one, and any gaps the pull could not
+close. Retained, not raw: see "Retention projection" below. Writing the bytes
+to the raw tree is the importer's job, not the adapter's; the raw tree stays
+immutable either way.
 
 `parse` returns a `ParsedPull`: `{ activity, holdings }`. `activity` is
 `ParsedRow[]` as before: quantity, price and amount are canonical decimal
@@ -183,6 +265,74 @@ market-marked position, a cost-basis-only illiquid holding, a deliberately
 unparseable market value, and a EUR-denominated position alongside the USD
 ones. `test/syntheticAdapter.test.mjs` is what a new adapter's own suite
 should look like.
+
+## Retention projection
+
+No adapter can hold a credential on the way in: `AdapterSession` is two
+functions and nothing else. That closes half of it. A provider can also echo
+a credential back **inside a response body** -- a session token, an
+`Authorization` header, a `Set-Cookie` value, a refresh token, a device
+identifier, a signed-in user profile -- and the raw tree is a synced folder.
+`src/retention.ts` closes that half.
+
+An adapter declares what it retains and everything else is dropped. The
+declaration is an allowlist, never a denylist, and the projection is built up
+from it rather than filtered down from the response: a field the provider adds
+next month is not copied, because nothing copies a field that was never named.
+There is no list of credential-looking key names anywhere in this package,
+deliberately. A denylist fails open exactly once.
+
+| Declaration     | For                                                    | Behavior                                                                                       |
+| --------------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------ |
+| `json_allowlist` | A JSON payload (`structured_api`)                       | Named leaf paths are retained. `*` matches any array index or object key. Everything else is dropped. |
+| `opaque`         | `pdf_statement`, `trade_confirmation`, `tabular_export` | Bytes retained whole, with a required stated reason. Refused outright for `structured_api`.       |
+
+A PDF statement is bytes, not JSON. It has no addressable fields, so a field
+projection is not a thing that can be applied to it: it is retained whole,
+declared `opaque` with a stated reason, and the manifest records `opaque` so
+no reader mistakes the file for a filtered payload. The same holds for a
+tabular export, which is delimited text a download control produced. `opaque`
+is refused for `structured_api`, because a JSON response is exactly the shape
+that echoes session state back, and one word must never become a way to opt
+out of the allowlist on the tier that needs it.
+
+Three properties follow, and they are the ones worth stating:
+
+- **Hash what you retain.** `retainPayload` produces the bytes and hashes
+  those same bytes. The provider's original response is never hashed and never
+  stored, and a retained artifact is never normalized back toward the original
+  so that two hashes agree. `documents.sha256` is always the hash of the bytes
+  on disk.
+- **It is impossible, not discouraged.** `writeRawDocument` takes a
+  `RetainedPayload`, not a `Uint8Array`. Only `retainPayload` produces one,
+  branded at compile time and tracked in a run-time `WeakSet`, so raw provider
+  bytes have no route to the raw tree at all. `persistAcquiredDocument`
+  re-applies the projection at that seam (it is idempotent, so this is a
+  no-op for a correct adapter) and refuses any document whose declared
+  `contentHash` does not match the retained bytes.
+- **A mismatch is never a silent pass-through.** An undeclared field is
+  dropped and opens a `retention_dropped_fields` review item naming the source
+  paths -- paths only, never values. A shape the declaration cannot describe
+  (a path terminating above a nested value, an array declared without `*`, a
+  JSON allowlist over non-JSON bytes) is a `RetentionShapeError` that stops
+  the acquisition, because that is an adapter bug rather than a provider
+  change.
+
+Money keeps its exact digits across the projection. Every JSON primitive is
+captured as its own literal source text and re-emitted verbatim, so a provider
+that states an amount as a JSON number with more precision than a double holds
+is retained with that precision intact. The money policy above says binary
+floating point appears nowhere in the path; this is the one place that
+re-serializes a payload, and it keeps that true.
+
+`test/retention.test.mjs` is the negative suite. Its fixture echoes
+credential-shaped material back inside the activity response -- a bearer
+token, a `Set-Cookie` value, an `Authorization` header echo, a refresh token,
+a long opaque session id, a device id and a user profile, every one of them
+an obviously fake canary in no real token format -- and asserts against the
+**bytes written to the raw tree**, not against what the projection returned.
+Nothing in that suite prints a payload.
+
 ## Importer
 
 `importBatch(db, batch, now?)` turns normalized rows into `documents`,
@@ -393,7 +543,7 @@ caller cannot do by combining the other two files alone:
   `cusip`, then `isin`, then `symbol` and `name` together, then `symbol`
   alone, then a new row. A real identifier never merges two different
   instruments that happen to share a ticker. A bare symbol with no cusip,
-  isin or matching name resolves to the *existing* instrument with that
+  isin or matching name resolves to the _existing_ instrument with that
   symbol (deterministically the first one ever created, by SQLite `rowid`)
   rather than minting a new row every time -- unbounded row growth would
   silently break "every purchase of instrument X" just as badly as a wrong
@@ -466,7 +616,7 @@ requirements true by construction instead of by convention someone could get
 wrong: identical bytes always land on the same path, so a repeat write of
 the same content is caught by the layout itself rather than a lookup a
 caller has to remember to run, and two different byte strings can never
-collide on a path, because the path *is* their hash. A 2+2 hex fan-out
+collide on a path, because the path _is_ their hash. A 2+2 hex fan-out
 (65536 buckets) keeps any one directory small at tens of thousands of
 documents, which stays fine for a person to browse by hand.
 
@@ -495,7 +645,7 @@ exactly the kind of bug provenance exists to catch. `descriptor` names the
 `institutionId`, `accountId` and `docType` a pull belongs to (both ids are
 foreign keys, so a valid one guarantees a real row to resolve the
 institution's slug and the account's last four digits from); its result is
-the *only* way to obtain an `AdapterPull.persisted` -- `AdapterPull` has no
+the _only_ way to obtain an `AdapterPull.persisted` -- `AdapterPull` has no
 free-form `filePath` field a caller could invent -- so `documents.file_path`
 (`importBatch`, `src/importer.ts`) ends up pointing at a file that actually
 exists rather than a path no code ever created, structurally rather than by
@@ -519,8 +669,13 @@ says what each one is. `writeRawDocumentManifest` writes that label as a
 sha256, the institution's slug (not the database's internal row id, which
 means nothing once the database that minted it is gone), the account's last
 four digits, document type, statement period, capture time, capability
-tier, any acquisition gaps, and the original file extension when the source
-gave one. It is write-once exactly like the bytes it describes -- a second
+tier, any acquisition gaps, the original file extension when the source gave
+one, and the `RetentionRecord` describing the projection that produced the
+bytes (see "Retention projection"): its declaration and version, the
+projection algorithm version, and the source paths that were dropped. That
+last field is how a reader learns the file is a projection of the provider's
+response rather than the response itself. It is write-once exactly like the
+bytes it describes -- a second
 write for the same document is a no-op, never a rewrite, even if the
 content offered would differ -- because the manifest is part of what was
 acquired, not something to revise later. `readRawDocumentManifest` reads one
@@ -538,7 +693,56 @@ not (the normal case). Ground rule 7's provider-total check stays scoped to
 activity rows; `reportedRowCount` is a transaction-row count and holdings
 have no analogous provider total to reconcile against.
 
-## Schema and migrations
+## Postgres schema (F1-20)
+
+`applyPgSchema(client)` creates the schema in the connected `search_path` and
+records the applied version in a `schema_version` table. It is one initial
+schema rather than a translation of three SQLite migrations, because there is
+no data behind those migrations and that is the whole reason the engine
+changes now rather than later. The whole creation is one transaction, a
+session advisory lock excludes a second creator by the database rather than by
+convention, and running it again is a no-op returning the recorded version.
+
+All twelve tables plus `position_reconciliations` survive, with every
+constraint the SQLite schema expressed: currency on every money column,
+`positions.valuation_basis` and `valuation_note`, `commitments` designed and
+unpopulated, `source_document_id` and `source_locator` on every derived row,
+`acct_last4` constrained to exactly four digits, `row_hash` unique, and stable
+opaque text identities. Dates become `DATE`, timestamps `TIMESTAMPTZ` and
+flags `BOOLEAN`, so the SQLite `GLOB` spelling checks are unnecessary. Two
+domains carry the rules that repeat across columns: `finance_numeric` (every
+money, quantity, price and rate column, rejecting Postgres's own `NaN`) and
+`currency_code`.
+
+`position_reconciliations` keeps its own table. Under SQLite it was separated
+partly by storage class, and that reason is gone. The other reason is not: a
+cash verdict and a position verdict must stay distinguishable, or every query
+for unverified periods silently starts returning per-instrument rows.
+
+The connection string is read from `FINANCE_ARCHIVE_DATABASE_URL` and nowhere
+else, the same rule `FINANCE_ARCHIVE_DB_PATH` and
+`FINANCE_ARCHIVE_RAW_TREE_ROOT` already follow: a missing setting is a hard
+error that names what is missing, never a default and never a guess.
+
+### Running the Postgres tests
+
+`test/pgMoney.test.mjs` needs no database and always runs: input validation,
+driver decoding and the whole deduplication preimage are pure logic, and they
+are the three places this port can go quietly wrong.
+`test/pgSchema.test.mjs` needs a real server and skips cleanly, naming the
+variable, unless `FINANCE_ARCHIVE_DATABASE_URL` points at a throwaway
+database. Each run works inside a schema it creates and drops, so pointing it
+at a shared development database cannot clobber anything.
+
+The tradeoff, stated plainly: a public clone with no database still runs the
+full suite and proves everything provable without a server, but exact
+`NUMERIC` aggregation and the schema's own constraints are only exercised
+where a database is configured, so CI has to configure one. The alternative,
+requiring a container to run the suite at all, would make a clone's `pnpm
+test:once` depend on Docker, which is a worse default for a repository whose
+rule is that a public clone runs the full suite with no credentials.
+
+## Schema and migrations (SQLite)
 
 `openArchive(path)` opens the file, sets `foreign_keys`, WAL and a busy timeout,
 and applies any migration the file has not seen. The applied version is recorded
@@ -590,5 +794,7 @@ pnpm --filter @repo/finance-archive build
 pnpm --filter @repo/finance-archive test:once
 ```
 
-The suite creates its databases in a temp directory and removes them. A public
-clone runs it with no credentials and no private files.
+The suite creates its SQLite databases in a temp directory and removes them. A
+public clone runs it with no credentials and no private files; the Postgres
+integration tests skip unless `FINANCE_ARCHIVE_DATABASE_URL` is set (see
+"Running the Postgres tests" above).

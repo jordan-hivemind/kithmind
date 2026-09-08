@@ -14,8 +14,15 @@
 // headers, tokens or any other secret. AdapterSession below is deliberately
 // two async functions and nothing else, so there is no field an adapter could
 // naturally store a credential in even if it wanted to.
+//
+// That closes the input side only. A provider can echo a credential back
+// *inside a response body*, and the raw tree is a synced folder. So `acquire`
+// does not return the response: it returns the retained projection of it,
+// declared field by field in `retention.ts`. See `AcquiredDocument` below.
 
 import { createHash } from "node:crypto";
+
+import type { RetentionRecord } from "./retention.js";
 
 /**
  * A capability to read through a browser session a person has already
@@ -179,6 +186,14 @@ export type AcquisitionManifestEntry = {
   readonly periodEnd: string;
   /** ISO 8601 instant the bytes were captured, not the document's own date. */
   readonly capturedAt: string;
+  /**
+   * sha256 of the **retained** bytes -- the bytes that reach the raw tree --
+   * never of the provider's original response (F1-23). An adapter gets this
+   * value from `retainPayload().sha256` rather than hashing anything itself,
+   * and `persistAcquiredDocument` re-derives it from the projection and
+   * refuses the document if the two disagree. Hashing the original and
+   * storing the projection is the exact mistake this wording exists to stop.
+   */
   readonly contentHash: string;
   /**
    * The row count the provider claimed for this pull, when it claims one, so
@@ -192,11 +207,24 @@ export type AcquisitionManifestEntry = {
 
 export type AcquiredDocument = {
   /**
-   * The bytes as received, unmodified. The raw tree they are eventually
-   * written to is immutable (ground rule 1); nothing in this package edits
-   * them after this point, including this function.
+   * The **retained** bytes: the provider's business payload after the
+   * adapter's declared projection has been applied (F1-23, `retention.ts`).
+   * Not the response as received. An adapter produces these by calling
+   * `retainPayload(policy, responseBytes, tier)` and returning
+   * `retained.bytes`; it never hands back the response body.
+   *
+   * The raw tree these are written to is immutable (ground rule 1); nothing
+   * in this package edits them after this point.
    */
   readonly bytes: Uint8Array;
+  /**
+   * What the projection did: the declaration that produced `bytes`, the
+   * projection algorithm version, and the source paths that were dropped
+   * (paths only, never values). Persisted into the raw tree's manifest
+   * sidecar, so a retained artifact is never presented as the untouched
+   * provider response.
+   */
+  readonly retention: RetentionRecord;
   readonly manifest: AcquisitionManifestEntry;
 };
 

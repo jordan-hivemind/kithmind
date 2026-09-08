@@ -28,6 +28,20 @@ export {
   type ValuationBasis,
 } from "./adapter.js";
 export {
+  assertRetained,
+  PROJECTION_VERSION,
+  retainPayload,
+  RetentionShapeError,
+  type RetainedPayload,
+  type RetentionPolicy,
+  type RetentionRecord,
+} from "./retention.js";
+export {
+  CREDENTIAL_SHAPED_ECHO as SYNTHETIC_CREDENTIAL_SHAPED_ECHO,
+  CREDENTIAL_SHAPED_ROW_ECHO as SYNTHETIC_CREDENTIAL_SHAPED_ROW_ECHO,
+  LEAK_CANARY as SYNTHETIC_LEAK_CANARY,
+} from "./adapters/syntheticTrust/fixtures.js";
+export {
   createSyntheticSession,
   INSTITUTION_NAME as SYNTHETIC_INSTITUTION_NAME,
   INSTITUTION_SLUG as SYNTHETIC_INSTITUTION_SLUG,
@@ -58,11 +72,35 @@ export {
   type RoundingRule,
 } from "./money.js";
 export {
+  contentKeyV2,
   normalizeText,
   ROW_HASH_DOMAIN,
+  ROW_HASH_DOMAIN_V2,
   rowHash,
+  rowHashV2,
+  type RowContentV2,
   type RowHashInput,
+  type RowHashInputV2,
 } from "./rowHash.js";
+export {
+  fromNumericText,
+  NUMERIC_MAX_DIGITS,
+  NUMERIC_MAX_SCALE,
+  toNumericText,
+} from "./pgNumeric.js";
+export {
+  applyPgSchema,
+  PG_SCHEMA_VERSION,
+  PG_TABLES,
+  pgSchemaVersion,
+} from "./pgSchema.js";
+export {
+  archiveDatabaseUrl,
+  createArchivePool,
+  decodesAsText,
+  PINNED_TEXT_OIDS,
+  pinNumericDecoding,
+} from "./pgStore.js";
 export {
   ARCHIVE_SCHEMA_VERSION,
   MIGRATIONS,
