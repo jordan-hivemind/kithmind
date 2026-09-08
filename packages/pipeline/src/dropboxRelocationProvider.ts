@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { posix } from "node:path";
 
 import {
   DropboxVerificationError,
@@ -14,6 +15,8 @@ const ID = /^id:[A-Za-z0-9_-]{1,256}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
 const PATH = /^\/[^\0-\x1f\x7f]{1,2048}$/;
 const NAME = /^[^/\\\0-\x1f\x7f]{1,256}$/;
+const validName = (value: string) =>
+  NAME.test(value) && value !== "." && value !== ".." && value.trim() === value;
 const digest = (value: string) =>
   createHash("sha256").update(value).digest("hex");
 
@@ -53,9 +56,11 @@ function rawFolder(value: unknown): Omit<RelocationFolder, "parentId"> {
     typeof id !== "string" ||
     !ID.test(id) ||
     typeof name !== "string" ||
-    !NAME.test(name) ||
+    !validName(name) ||
     typeof path !== "string" ||
-    !PATH.test(path)
+    !PATH.test(path) ||
+    posix.normalize(path) !== path ||
+    posix.basename(path) !== name
   )
     fail("provider folder metadata is invalid");
   return { id, name, path };
@@ -162,6 +167,7 @@ export function createDropboxRelocationProvider(
         include_deleted: false,
       }),
     );
+    if (current.id !== id) fail("provider folder identity changed");
     const directParentPath = parentPath(current.path);
     if (directParentPath === "/")
       return { ...current, parentId: namespaceRootId };
@@ -171,6 +177,7 @@ export function createDropboxRelocationProvider(
         include_deleted: false,
       }),
     );
+    if (parent.path !== directParentPath) fail("provider parent path changed");
     return { ...current, parentId: parent.id };
   };
 
@@ -179,11 +186,12 @@ export function createDropboxRelocationProvider(
       return await withAccount(async (token) => await readFolder(token, id));
     },
     async getChild(parentId, name) {
-      if (!NAME.test(name)) fail("provider child lookup is invalid");
+      if (!ID.test(parentId) || !validName(name))
+        fail("provider child lookup is invalid");
       return await withAccount(async (token) => {
         const parent = await readFolder(token, parentId);
         const listing = await json(fetcher, token, "files/list_folder", {
-          path: parentId === namespaceRootId ? "" : parent.id,
+          path: parent.id,
           recursive: false,
           include_deleted: false,
           include_has_explicit_shared_members: false,
@@ -201,8 +209,13 @@ export function createDropboxRelocationProvider(
           if (!entry || typeof entry !== "object" || Array.isArray(entry))
             fail("provider child listing is invalid");
           const row = entry as Record<string, unknown>;
-          if (row.name !== name) continue;
-          matches.push({ ...rawFolder(row), parentId: parent.id });
+          if (typeof row.name !== "string")
+            fail("provider child listing is invalid");
+          if (row.name.toLowerCase() !== name.toLowerCase()) continue;
+          const child = rawFolder(row);
+          if (parentPath(child.path) !== parent.path)
+            fail("provider child parent changed");
+          matches.push({ ...child, parentId: parent.id });
         }
         if (matches.length > 1) fail("provider child lookup is ambiguous");
         return matches[0];
@@ -211,11 +224,10 @@ export function createDropboxRelocationProvider(
     async moveFolder(request) {
       if (
         !ID.test(request.sourceId) ||
-        !NAME.test(request.destinationName) ||
+        !validName(request.destinationName) ||
         (request.expectedSourceParentId !== namespaceRootId &&
           !ID.test(request.expectedSourceParentId)) ||
-        (request.destinationParentId !== namespaceRootId &&
-          !ID.test(request.destinationParentId))
+        !ID.test(request.destinationParentId)
       )
         fail("provider move request is invalid");
       return await withAccount(async (token) => {

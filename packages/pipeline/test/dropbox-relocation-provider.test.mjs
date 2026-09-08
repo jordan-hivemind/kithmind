@@ -25,7 +25,7 @@ function folder(id, name, path) {
   };
 }
 
-function syntheticProvider() {
+function syntheticProvider({ rewrite } = {}) {
   const folders = new Map([
     [sourceId, folder(sourceId, "Kith Mind Backups", "/Kith Mind Backups")],
     [
@@ -82,7 +82,12 @@ function syntheticProvider() {
     } else {
       assert.fail(`unexpected route ${route}`);
     }
-    return new Response(JSON.stringify(value), { status: 200 });
+    return new Response(
+      JSON.stringify(
+        rewrite ? rewrite(route, body, structuredClone(value)) : value,
+      ),
+      { status: 200 },
+    );
   };
   const provider = createDropboxRelocationProvider(
     {
@@ -96,7 +101,7 @@ function syntheticProvider() {
       fetch,
     },
   );
-  return { provider, moveBodies };
+  return { provider, moveBodies, folders };
 }
 
 test("uses stable IDs through a mixed-case root relocation workflow", async () => {
@@ -152,4 +157,64 @@ test("rejects an account-bound root sentinel from another account", async () => 
     () => provider.getFolder(dropboxNamespaceRootId("b".repeat(64))),
     /folder identity is invalid/,
   );
+});
+
+test("rejects unsafe destination names and namespace-root destinations before moving", async () => {
+  const { provider, moveBodies } = syntheticProvider();
+  for (const destinationName of [".", "..", "../other", "backups "]) {
+    await assert.rejects(() =>
+      provider.moveFolder({
+        sourceId,
+        expectedSourceParentId: rootId,
+        destinationParentId,
+        destinationName,
+      }),
+    );
+  }
+  await assert.rejects(() =>
+    provider.moveFolder({
+      sourceId,
+      expectedSourceParentId: rootId,
+      destinationParentId: rootId,
+      destinationName: "backups",
+    }),
+  );
+  await assert.rejects(() => provider.getChild(rootId, "backups"));
+  assert.equal(moveBodies.length, 0);
+});
+
+test("rejects substituted folder IDs and account mismatch before a move", async () => {
+  for (const target of [sourceId, destinationParentId, "account"]) {
+    const f = syntheticProvider({
+      rewrite(route, body, value) {
+        if (route === "get_metadata" && body.path === target)
+          value.id = "id:substituted";
+        if (route === "get_current_account" && target === "account")
+          value.account_id = "dbid:other";
+        return value;
+      },
+    });
+    await assert.rejects(() =>
+      f.provider.moveFolder({
+        sourceId,
+        expectedSourceParentId: rootId,
+        destinationParentId,
+        destinationName: "backups",
+      }),
+    );
+    assert.equal(f.moveBodies.length, 0);
+  }
+});
+
+test("detects case-insensitive Dropbox destination collisions", async () => {
+  const f = syntheticProvider();
+  f.folders.set(
+    "id:existing",
+    folder("id:existing", "Backups", "/Kith Mind/Backups"),
+  );
+  assert.equal(
+    (await f.provider.getChild(destinationParentId, "backups")).id,
+    "id:existing",
+  );
+  assert.equal(f.moveBodies.length, 0);
 });
