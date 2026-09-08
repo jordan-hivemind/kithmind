@@ -72,12 +72,14 @@ export {
   type RoundingRule,
 } from "./money.js";
 export {
+  contentKey,
   contentKeyV2,
   normalizeText,
   ROW_HASH_DOMAIN,
   ROW_HASH_DOMAIN_V2,
   rowHash,
   rowHashV2,
+  type RowContent,
   type RowContentV2,
   type RowHashInput,
   type RowHashInputV2,
@@ -95,11 +97,15 @@ export {
   pgSchemaVersion,
 } from "./pgSchema.js";
 export {
+  ARCHIVE_WRITE_LOCK_KEY,
   archiveDatabaseUrl,
   createArchivePool,
   decodesAsText,
+  lockArchiveForWrite,
   PINNED_TEXT_OIDS,
   pinNumericDecoding,
+  withArchiveTransaction,
+  type ArchiveClient,
 } from "./pgStore.js";
 export {
   ARCHIVE_SCHEMA_VERSION,
@@ -111,6 +117,7 @@ export {
 } from "./schema.js";
 export {
   importBatch,
+  publishImport,
   type ImportBalance,
   type ImportBatch,
   type ImportDocument,
@@ -118,6 +125,7 @@ export {
   type ImportPosition,
   type ImportRow,
   type ImportSummary,
+  type PublishSummary,
 } from "./importer.js";
 export {
   runReconciliationGate,

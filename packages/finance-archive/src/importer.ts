@@ -3,22 +3,53 @@
 // "Working on the archive without reading it" in the plan); a caller reads the
 // returned ImportSummary, not the database contents.
 //
-// This package does not yet have an adapter. F1-2 owns `parse()`, which will
-// eventually produce the rows below; F1-3 defines the row shape it consumes so
-// the two can be wired together later. `ImportRow` is that seam: an explicit,
-// documented contract, not an adapter interface of its own.
+// `ImportRow` is the seam an institution adapter's `parse()` output is mapped
+// to (src/adapterImport.ts does the mapping): an explicit, documented
+// contract, not an adapter interface of its own.
 //
-// The reconciliation gate (comparing a period's stated balance change against
-// the sum of its transactions) is F1-4's job, not this file's. This importer
-// only guarantees the invariants a single import run owns: idempotent
-// re-import, deduplication, provenance, and the review queue.
+// F1-22 moved this file from SQLite to Postgres, and that was not a driver
+// swap. Two things changed in the same edit and they are the whole risk:
+//
+//   - Cash stops being an integer at the currency's minor-unit exponent and
+//     becomes the stated decimal in a NUMERIC column. `toMinorUnits` stays,
+//     for a reason that was never about storage: it throws when a value is
+//     more precise than its currency allows, and that value is *ambiguous
+//     money*, which ground rule 5 says is null with a review item rather than
+//     rounded. NUMERIC would store it happily, which is exactly why the check
+//     has to stay here.
+//   - The deduplication preimage moves with it, to `rowHashV2`/`contentKeyV2`
+//     (rowHash.ts). Those two are used as a pair and never mixed with their
+//     v1 counterparts: the occurrence ordinal is counted over the content key
+//     and hashed into the row hash, so a key and a hash that disagreed about
+//     what "the same content" means would break deduplication silently. `1`,
+//     `1.0` and `1.00` are one amount and therefore one identity, which is
+//     what `toNumericText` canonicalization guarantees before either is
+//     computed.
+//
+// Publication is the other thing this file owns now that the archive is
+// hosted. Single writer by convention is not a publication boundary: a laptop
+// querying mid-import must not see half a ledger, and must never see new
+// transactions against an old reconciliation verdict. `publishImport` below is
+// that boundary.
 
 import { randomUUID } from "node:crypto";
-import type { DatabaseSync } from "node:sqlite";
 
-import { canonicalizeDecimal } from "./decimal.js";
 import { toMinorUnits } from "./money.js";
-import { contentKey, rowHash } from "./rowHash.js";
+import { toNumericText } from "./pgNumeric.js";
+import {
+  type ArchiveClient,
+  lockArchiveForWrite,
+  withArchiveTransaction,
+} from "./pgStore.js";
+import {
+  runReconciliationGate,
+  type ReconciliationGateSummary,
+} from "./reconciliation.js";
+import {
+  runPositionReconciliationGate,
+  type PositionReconciliationGateSummary,
+} from "./positionReconciliation.js";
+import { contentKeyV2, rowHashV2 } from "./rowHash.js";
 
 /**
  * One transaction as a source hands it to the importer, already normalized to
@@ -33,16 +64,17 @@ import { contentKey, rowHash } from "./rowHash.js";
  *   importer opens a review item for it instead of inserting a placeholder.
  * - `quantity`, `price`, `runningBalance` accept any spelling `parseDecimal`
  *   understands (leading `+`, leading zeros, trailing zeros); the importer
- *   canonicalizes before storing. A malformed value opens a review item and
- *   is stored as NULL rather than guessed.
+ *   canonicalizes before storing. A malformed value, or one past the typed
+ *   boundary's 38 significant digits and 18 fractional places, opens a review
+ *   item and is stored as NULL rather than guessed or rounded.
  * - `amountText` is the amount as the source stated it, in `currency`'s
  *   units (e.g. `"12.34"` for USD), or `null` when the source itself has no
  *   amount for this row (a non-monetary event) or the amount is ambiguous.
  *   A value with more precision than `currency` allows (`toMinorUnits`
  *   throwing) is ambiguous money: the importer stores NULL and opens a
  *   review item (ground rule 5). This is the only path from source text to
- *   the `amount` column; nothing in this file parses a float or writes a
- *   REAL.
+ *   the `amount` column; nothing in this file parses a float, and no money
+ *   value is ever a JavaScript number at any point.
  * - `amountNote` is required whenever `amountText` is null for a reason
  *   other than "this row has no amount": an adapter that could not read an
  *   amount (`ParsedAmount`'s `{ amount: null, amountNote: string }` case)
@@ -55,7 +87,7 @@ import { contentKey, rowHash } from "./rowHash.js";
  *   identity and should be supplied whenever an adapter's source offers one,
  *   including every paginated activity API. Without one, the importer falls
  *   back to content hashing scoped by document and row order (see
- *   `rowHash`'s `occurrence` field and `importRow` in this file), which
+ *   `rowHashV2`'s `occurrence` field and `importRow` in this file), which
  *   correctly collapses the same transaction reappearing on an overlapping
  *   page while still preserving two genuinely distinct rows that happen to
  *   share the same date, amount and description.
@@ -198,15 +230,24 @@ export type ImportSummary = {
   rowsInserted: number;
   rowsSkipped: number;
   reviewItemsOpened: number;
-  /** Always 0 here. The reconciliation gate is F1-4's, not this importer's. */
+  /** Always 0 here; `publishImport` reports what the gates found. */
   reconciliationsPassed: number;
   reconciliationsFailed: number;
+};
+
+/**
+ * What one publication produced: the import's own counts, plus both gates'
+ * verdict counts. Counts and per-period facts only, never a row.
+ */
+export type PublishSummary = ImportSummary & {
+  cash: ReconciliationGateSummary;
+  positions: PositionReconciliationGateSummary;
 };
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 /** Earliest plausible statement date. Anything before this is a review item. */
 const MIN_PLAUSIBLE_DATE = "1900-01-01";
-/** Mirrors positions.valuation_basis's CHECK constraint (schema.ts). */
+/** Mirrors positions.valuation_basis's CHECK constraint (pgSchema.ts). */
 const VALUATION_BASES = new Set([
   "market_price",
   "last_round",
@@ -221,20 +262,66 @@ type ReviewCandidate = {
 };
 
 /**
+ * Imports one batch and immediately reconciles what it imported, as one
+ * atomic publication.
+ *
+ * This is the entry point a caller should use. Running the import and then
+ * the gates as separate transactions would publish a window in which the new
+ * transactions are visible against the previous period's verdict, and a
+ * reader cannot tell that window from a settled archive -- which is precisely
+ * the confidently-wrong answer ground rule 3 exists to prevent. One
+ * transaction, so a reader sees the ledger and the verdicts that judge it
+ * change together or not at all.
+ *
+ * A second writer is excluded by the database: every writer takes the same
+ * transaction-scoped advisory lock (see `lockArchiveForWrite`), so a
+ * concurrent import waits rather than racing. Retries stay idempotent -- a
+ * document already imported contributes nothing on a second run -- so a
+ * retried publication after a lock wait inserts nothing new rather than
+ * colliding on `row_hash`.
+ */
+export async function publishImport(
+  client: ArchiveClient,
+  batch: ImportBatch,
+  now: Date = new Date(),
+): Promise<PublishSummary> {
+  return withArchiveTransaction(client, async (tx) => {
+    const summary = await importBatch(tx, batch, now);
+    const cash = await runReconciliationGate(tx, summary.importRunId);
+    const positions = await runPositionReconciliationGate(
+      tx,
+      summary.importRunId,
+    );
+    return {
+      ...summary,
+      reconciliationsPassed: cash.passed + positions.passed,
+      reconciliationsFailed:
+        cash.failed + cash.unverified + positions.failed + positions.unverified,
+      cash,
+      positions,
+    };
+  });
+}
+
+/**
  * Runs one import batch to completion inside a single database transaction:
  * either every document's rows land and the run is recorded, or nothing does.
  * A provider-count mismatch or a broken row_hash/account invariant rolls the
  * whole run back rather than leaving a partially-imported archive (ground
  * rules 3 and 7 treat these as gates, not reports).
  *
+ * Prefer `publishImport`, which additionally reconciles what it imported in
+ * the same transaction. Calling this alone is correct for an import a caller
+ * will gate separately; it is still atomic and still takes the write lock.
+ *
  * `now` is injectable so future-date and implausible-date review checks are
  * deterministic in tests; it defaults to the wall clock.
  */
-export function importBatch(
-  db: DatabaseSync,
+export async function importBatch(
+  client: ArchiveClient,
   batch: ImportBatch,
   now: Date = new Date(),
-): ImportSummary {
+): Promise<ImportSummary> {
   const importRunId = randomUUID();
   const startedAt = now.toISOString();
   const today = startedAt.slice(0, 10);
@@ -244,80 +331,36 @@ export function importBatch(
   let rowsSkipped = 0;
   let reviewItemsOpened = 0;
 
-  const insertDocument = db.prepare(
-    `INSERT INTO documents (id, institution_id, account_id, doc_type, doc_date, file_path, sha256, parsed_ok)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
-  );
-  const findDocument = db.prepare(
-    "SELECT id, parsed_ok FROM documents WHERE sha256 = ?",
-  );
-  const markParsed = db.prepare(
-    "UPDATE documents SET parsed_ok = 1 WHERE id = ?",
-  );
-  const findByProviderTxnId = db.prepare(
-    "SELECT 1 FROM transactions WHERE account_id = ? AND provider_txn_id = ?",
-  );
-  const findByRowHash = db.prepare(
-    "SELECT id, source_document_id, source_locator FROM transactions WHERE row_hash = ?",
-  );
-  const insertTransaction = db.prepare(
-    `INSERT INTO transactions
-       (id, account_id, trade_date, process_date, settle_date, date_precision,
-        activity_type, description, instrument_id, quantity, price, amount,
-        currency, running_balance, source_document_id, source_locator,
-        row_hash, provider_txn_id, status, imported_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  );
-  const insertReviewItem = db.prepare(
-    `INSERT INTO review_items
-       (id, kind, account_id, source_document_id, source_locator, raw_value, reason)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-  );
-  const insertPosition = db.prepare(
-    `INSERT INTO positions
-       (id, account_id, as_of, instrument_id, quantity, price, market_value,
-        cost_basis, unrealized, currency, valuation_basis, valuation_note,
-        source_document_id, source_locator)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  );
-  const insertBalance = db.prepare(
-    `INSERT INTO balances
-       (id, account_id, as_of, total_value, cash, currency,
-        period_start_value, period_end_value, source_document_id, source_locator)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  );
-  const insertLiability = db.prepare(
-    `INSERT INTO liabilities
-       (id, institution_id, account_id, kind, display_name, balance, currency,
-        rate, as_of, collateral_note, source_document_id, source_locator)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  );
-
-  function openReview(
+  async function openReview(
     accountId: string | null,
     documentId: string | null,
     sourceLocator: string | null,
     candidate: ReviewCandidate,
-  ): void {
-    insertReviewItem.run(
-      randomUUID(),
-      candidate.kind,
-      accountId,
-      documentId,
-      sourceLocator,
-      candidate.rawValue,
-      candidate.reason,
+  ): Promise<void> {
+    await client.query(
+      `INSERT INTO review_items
+         (id, kind, account_id, source_document_id, source_locator, raw_value, reason)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [
+        randomUUID(),
+        candidate.kind,
+        accountId,
+        documentId,
+        sourceLocator,
+        candidate.rawValue,
+        candidate.reason,
+      ],
     );
     reviewItemsOpened += 1;
   }
 
-  function importRow(
+  async function importRow(
     row: ImportRow,
     documentId: string,
     occurrences: Map<string, number>,
-  ): "inserted" | "skipped" {
+  ): Promise<"inserted" | "skipped"> {
     if (!ISO_DATE.test(row.processDate)) {
-      openReview(row.accountId, documentId, row.sourceLocator, {
+      await openReview(row.accountId, documentId, row.sourceLocator, {
         kind: "unparseable_process_date",
         rawValue: row.processDate,
         reason: "process date is not a valid ISO YYYY-MM-DD date",
@@ -381,7 +424,12 @@ export function importBatch(
     // identical content get different ordinals and therefore different
     // hashes, so neither is lost (ground rule: equal date, amount and
     // description is not proof of duplication).
-    const key = contentKey({
+    //
+    // `contentKeyV2` and `rowHashV2` are used as a pair, and the amount they
+    // are given is the canonicalized decimal that goes into the column. All
+    // three agreeing on one spelling of one amount is what keeps `1`, `1.0`
+    // and `1.00` a single identity.
+    const content = {
       accountId: row.accountId,
       processDate: row.processDate,
       activityType: row.activityType,
@@ -389,23 +437,19 @@ export function importBatch(
       quantity,
       amount,
       currency: row.currency,
-    });
+    };
+    const key = contentKeyV2(content);
     const occurrence = (occurrences.get(key) ?? 0) + 1;
     occurrences.set(key, occurrence);
 
-    const hash = rowHash({
-      accountId: row.accountId,
-      processDate: row.processDate,
-      activityType: row.activityType,
-      description: row.description,
-      quantity,
-      amount,
-      currency: row.currency,
-      occurrence,
-    });
+    const hash = rowHashV2({ ...content, occurrence });
 
     if (row.providerTxnId) {
-      if (findByProviderTxnId.get(row.accountId, row.providerTxnId)) {
+      const byProviderId = await client.query(
+        "SELECT 1 FROM transactions WHERE account_id = $1 AND provider_txn_id = $2",
+        [row.accountId, row.providerTxnId],
+      );
+      if ((byProviderId.rowCount ?? 0) > 0) {
         // Same account, same stable id: a re-encounter of an already-imported
         // row, most often from an overlapping page in a paginated pull. This
         // is an authoritative identity match, not evidence, so no review item.
@@ -419,9 +463,15 @@ export function importBatch(
       // same account, day and ordinal position across separate pulls; widen
       // the hash to include provider_txn_id if that ever fires.
     } else {
-      const existing = findByRowHash.get(hash) as
-        | { id: string; source_document_id: string | null; source_locator: string | null }
-        | undefined;
+      const byHash = await client.query<{
+        id: string;
+        source_document_id: string | null;
+        source_locator: string | null;
+      }>(
+        "SELECT id, source_document_id, source_locator FROM transactions WHERE row_hash = $1",
+        [hash],
+      );
+      const existing = byHash.rows[0];
       if (existing) {
         // No stable id, so this collapse rests on content evidence rather
         // than a stable identifier. Within one document that never happens
@@ -429,7 +479,7 @@ export function importBatch(
         // documents it is exactly the overlapping-page case, or, rarely, a
         // genuine coincidence. Either way, make the collapse visible.
         if (existing.source_document_id !== documentId) {
-          openReview(row.accountId, documentId, row.sourceLocator, {
+          await openReview(row.accountId, documentId, row.sourceLocator, {
             kind: "cross_document_duplicate",
             rawValue: existing.id,
             reason:
@@ -441,30 +491,39 @@ export function importBatch(
       }
     }
 
-    insertTransaction.run(
-      randomUUID(),
-      row.accountId,
-      tradeDate,
-      row.processDate,
-      settleDate,
-      row.datePrecision,
-      row.activityType,
-      row.description,
-      row.instrumentId,
-      quantity,
-      price,
-      amount,
-      row.currency,
-      runningBalance,
-      documentId,
-      row.sourceLocator,
-      hash,
-      row.providerTxnId,
-      pending.length > 0 ? "review" : "imported",
-      startedAt,
+    await client.query(
+      `INSERT INTO transactions
+         (id, account_id, trade_date, process_date, settle_date, date_precision,
+          activity_type, description, instrument_id, quantity, price, amount,
+          currency, running_balance, source_document_id, source_locator,
+          row_hash, provider_txn_id, status, imported_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+               $16, $17, $18, $19, $20)`,
+      [
+        randomUUID(),
+        row.accountId,
+        tradeDate,
+        row.processDate,
+        settleDate,
+        row.datePrecision,
+        row.activityType,
+        row.description,
+        row.instrumentId,
+        quantity,
+        price,
+        amount,
+        row.currency,
+        runningBalance,
+        documentId,
+        row.sourceLocator,
+        hash,
+        row.providerTxnId,
+        pending.length > 0 ? "review" : "imported",
+        startedAt,
+      ],
     );
     for (const candidate of pending) {
-      openReview(row.accountId, documentId, row.sourceLocator, candidate);
+      await openReview(row.accountId, documentId, row.sourceLocator, candidate);
     }
     return "inserted";
   }
@@ -479,13 +538,13 @@ export function importBatch(
    * store, the same reasoning as `transactions.process_date`. Every other
    * malformed or missing field stores NULL and opens a review item instead.
    */
-  function importPosition(
+  async function importPosition(
     position: ImportPosition,
     accountId: string,
     documentId: string,
-  ): "inserted" | "skipped" {
+  ): Promise<"inserted" | "skipped"> {
     if (!ISO_DATE.test(position.asOf)) {
-      openReview(accountId, documentId, position.sourceLocator, {
+      await openReview(accountId, documentId, position.sourceLocator, {
         kind: "unparseable_as_of",
         rawValue: position.asOf,
         reason: "as_of is not a valid ISO YYYY-MM-DD date",
@@ -543,35 +602,47 @@ export function importBatch(
       });
     }
 
-    insertPosition.run(
-      randomUUID(),
-      accountId,
-      position.asOf,
-      position.instrumentId,
-      quantity,
-      price,
-      marketValue,
-      costBasis,
-      unrealized,
-      position.currency,
-      valuationBasis,
-      position.valuationNote,
-      documentId,
-      position.sourceLocator,
+    await client.query(
+      `INSERT INTO positions
+         (id, account_id, as_of, instrument_id, quantity, price, market_value,
+          cost_basis, unrealized, currency, valuation_basis, valuation_note,
+          source_document_id, source_locator)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+      [
+        randomUUID(),
+        accountId,
+        position.asOf,
+        position.instrumentId,
+        quantity,
+        price,
+        marketValue,
+        costBasis,
+        unrealized,
+        position.currency,
+        valuationBasis,
+        position.valuationNote,
+        documentId,
+        position.sourceLocator,
+      ],
     );
     for (const candidate of pending) {
-      openReview(accountId, documentId, position.sourceLocator, candidate);
+      await openReview(
+        accountId,
+        documentId,
+        position.sourceLocator,
+        candidate,
+      );
     }
     return "inserted";
   }
 
-  function importBalance(
+  async function importBalance(
     balance: ImportBalance,
     accountId: string,
     documentId: string,
-  ): "inserted" | "skipped" {
+  ): Promise<"inserted" | "skipped"> {
     if (!ISO_DATE.test(balance.asOf)) {
-      openReview(accountId, documentId, balance.sourceLocator, {
+      await openReview(accountId, documentId, balance.sourceLocator, {
         kind: "unparseable_as_of",
         rawValue: balance.asOf,
         reason: "as_of is not a valid ISO YYYY-MM-DD date",
@@ -606,32 +677,38 @@ export function importBatch(
       pending,
     );
 
-    insertBalance.run(
-      randomUUID(),
-      accountId,
-      balance.asOf,
-      totalValue,
-      cash,
-      balance.currency,
-      periodStartValue,
-      periodEndValue,
-      documentId,
-      balance.sourceLocator,
+    await client.query(
+      `INSERT INTO balances
+         (id, account_id, as_of, total_value, cash, currency,
+          period_start_value, period_end_value, source_document_id, source_locator)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+      [
+        randomUUID(),
+        accountId,
+        balance.asOf,
+        totalValue,
+        cash,
+        balance.currency,
+        periodStartValue,
+        periodEndValue,
+        documentId,
+        balance.sourceLocator,
+      ],
     );
     for (const candidate of pending) {
-      openReview(accountId, documentId, balance.sourceLocator, candidate);
+      await openReview(accountId, documentId, balance.sourceLocator, candidate);
     }
     return "inserted";
   }
 
-  function importLiability(
+  async function importLiability(
     liability: ImportLiability,
     institutionId: string | null,
     accountId: string | null,
     documentId: string,
-  ): "inserted" | "skipped" {
+  ): Promise<"inserted" | "skipped"> {
     if (!ISO_DATE.test(liability.asOf)) {
-      openReview(accountId, documentId, liability.sourceLocator, {
+      await openReview(accountId, documentId, liability.sourceLocator, {
         kind: "unparseable_as_of",
         rawValue: liability.asOf,
         reason: "as_of is not a valid ISO YYYY-MM-DD date",
@@ -647,30 +724,46 @@ export function importBatch(
       "ambiguous_liability_balance",
       pending,
     );
-    const rate = canonicalizeAmbiguous(liability.rate, "ambiguous_rate", pending);
+    const rate = canonicalizeAmbiguous(
+      liability.rate,
+      "ambiguous_rate",
+      pending,
+    );
 
-    insertLiability.run(
-      randomUUID(),
-      institutionId,
-      accountId,
-      liability.kind,
-      liability.displayName,
-      balanceAmount,
-      liability.currency,
-      rate,
-      liability.asOf,
-      liability.collateralNote,
-      documentId,
-      liability.sourceLocator,
+    await client.query(
+      `INSERT INTO liabilities
+         (id, institution_id, account_id, kind, display_name, balance, currency,
+          rate, as_of, collateral_note, source_document_id, source_locator)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+      [
+        randomUUID(),
+        institutionId,
+        accountId,
+        liability.kind,
+        liability.displayName,
+        balanceAmount,
+        liability.currency,
+        rate,
+        liability.asOf,
+        liability.collateralNote,
+        documentId,
+        liability.sourceLocator,
+      ],
     );
     for (const candidate of pending) {
-      openReview(accountId, documentId, liability.sourceLocator, candidate);
+      await openReview(
+        accountId,
+        documentId,
+        liability.sourceLocator,
+        candidate,
+      );
     }
     return "inserted";
   }
 
-  db.exec("BEGIN IMMEDIATE");
-  try {
+  return withArchiveTransaction(client, async () => {
+    await lockArchiveForWrite(client);
+
     for (const document of batch.documents) {
       filesSeen += 1;
 
@@ -685,10 +778,12 @@ export function importBatch(
         );
       }
 
-      const existing = findDocument.get(document.sha256) as
-        | { id: string; parsed_ok: number }
-        | undefined;
-      if (existing?.parsed_ok === 1) {
+      const found = await client.query<{ id: string; parsed_ok: boolean }>(
+        "SELECT id, parsed_ok FROM documents WHERE sha256 = $1",
+        [document.sha256],
+      );
+      const existing = found.rows[0];
+      if (existing?.parsed_ok === true) {
         // Ground rule 1: raw files are immutable. Byte-identical bytes that
         // already imported successfully contribute nothing new. Holdings
         // dedupe the same way (see ImportDocument's doc comment): there is
@@ -703,14 +798,19 @@ export function importBatch(
 
       const documentId = existing?.id ?? randomUUID();
       if (!existing) {
-        insertDocument.run(
-          documentId,
-          document.institutionId,
-          document.accountId,
-          document.docType,
-          document.docDate,
-          document.filePath,
-          document.sha256,
+        await client.query(
+          `INSERT INTO documents
+             (id, institution_id, account_id, doc_type, doc_date, file_path, sha256, parsed_ok)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE)`,
+          [
+            documentId,
+            document.institutionId,
+            document.accountId,
+            document.docType,
+            document.docDate,
+            document.filePath,
+            document.sha256,
+          ],
         );
       }
 
@@ -718,31 +818,42 @@ export function importBatch(
       // in its own row order (see importRow).
       const occurrences = new Map<string, number>();
       for (const row of document.rows) {
-        const outcome = importRow(row, documentId, occurrences);
+        const outcome = await importRow(row, documentId, occurrences);
         if (outcome === "inserted") rowsInserted += 1;
         else rowsSkipped += 1;
       }
 
       const positions = document.positions ?? [];
       const balances = document.balances ?? [];
-      if ((positions.length > 0 || balances.length > 0) && document.accountId === null) {
+      if (
+        (positions.length > 0 || balances.length > 0) &&
+        document.accountId === null
+      ) {
         throw new Error(
           `document ${document.sha256} carries a position or balance but has no account_id; ` +
             "positions.account_id and balances.account_id are NOT NULL",
         );
       }
       for (const position of positions) {
-        const outcome = importPosition(position, document.accountId as string, documentId);
+        const outcome = await importPosition(
+          position,
+          document.accountId as string,
+          documentId,
+        );
         if (outcome === "inserted") rowsInserted += 1;
         else rowsSkipped += 1;
       }
       for (const balance of balances) {
-        const outcome = importBalance(balance, document.accountId as string, documentId);
+        const outcome = await importBalance(
+          balance,
+          document.accountId as string,
+          documentId,
+        );
         if (outcome === "inserted") rowsInserted += 1;
         else rowsSkipped += 1;
       }
       for (const liability of document.liabilities ?? []) {
-        const outcome = importLiability(
+        const outcome = await importLiability(
           liability,
           document.institutionId,
           document.accountId,
@@ -752,49 +863,47 @@ export function importBatch(
         else rowsSkipped += 1;
       }
 
-      markParsed.run(documentId);
+      await client.query(
+        "UPDATE documents SET parsed_ok = TRUE WHERE id = $1",
+        [documentId],
+      );
     }
 
-    assertInvariants(db);
+    await assertInvariants(client);
 
-    const finishedAt = new Date().toISOString();
-    db.prepare(
+    await client.query(
       `INSERT INTO import_runs
          (id, started_at, finished_at, source, files_seen, rows_inserted,
           rows_skipped, reconciliations_passed, reconciliations_failed, review_items)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?)`,
-    ).run(
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 0, $8)`,
+      [
+        importRunId,
+        startedAt,
+        new Date().toISOString(),
+        batch.source,
+        filesSeen,
+        rowsInserted,
+        rowsSkipped,
+        reviewItemsOpened,
+      ],
+    );
+
+    return {
       importRunId,
-      startedAt,
-      finishedAt,
-      batch.source,
       filesSeen,
       rowsInserted,
       rowsSkipped,
       reviewItemsOpened,
-    );
-
-    db.exec("COMMIT");
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
-  }
-
-  return {
-    importRunId,
-    filesSeen,
-    rowsInserted,
-    rowsSkipped,
-    reviewItemsOpened,
-    reconciliationsPassed: 0,
-    reconciliationsFailed: 0,
-  };
+      reconciliationsPassed: 0,
+      reconciliationsFailed: 0,
+    };
+  });
 }
 
 /**
  * trade_date and settle_date are nullable columns, so a value the source
  * could not give a valid ISO date for is stored as NULL with a review item
- * rather than reaching the CHECK constraint as a hard, batch-aborting error.
+ * rather than reaching the column as a hard, batch-aborting error.
  */
 function resolveOptionalDate(
   text: string | null,
@@ -811,6 +920,13 @@ function resolveOptionalDate(
   return null;
 }
 
+/**
+ * A quantity, price or rate: not money, so it carries no currency and gets no
+ * minor-unit check, but it is still a NUMERIC column and still bounded by the
+ * typed boundary's 38 significant digits and 18 fractional places.
+ * `toNumericText` rejects past that explicitly rather than rounding into
+ * place, and the rejection becomes a review item with a NULL stored value.
+ */
 function canonicalizeAmbiguous(
   text: string | null,
   kind: string,
@@ -818,7 +934,7 @@ function canonicalizeAmbiguous(
 ): string | null {
   if (text === null) return null;
   try {
-    return canonicalizeDecimal(text);
+    return toNumericText(text);
   } catch (error) {
     pending.push({
       kind,
@@ -831,11 +947,10 @@ function canonicalizeAmbiguous(
 
 /**
  * The transaction-amount pattern (`ImportRow.amountText`/`amountNote`),
- * generalized: `text` is decimal in `currency` units and gets converted to
- * minor units, or `note` is the reason no value exists (ground rule 5).
- * Shared by `transactions.amount` and every holdings money field that plays
- * the same load-bearing role: `positions.market_value`, `balances
- * .total_value`, `liabilities.balance`.
+ * generalized: `text` is decimal in `currency` units, or `note` is the reason
+ * no value exists (ground rule 5). Shared by `transactions.amount` and every
+ * holdings money field that plays the same load-bearing role:
+ * `positions.market_value`, `balances.total_value`, `liabilities.balance`.
  */
 function resolveAmbiguousMoney(
   text: string | null,
@@ -843,10 +958,10 @@ function resolveAmbiguousMoney(
   currency: string,
   kind: string,
   pending: ReviewCandidate[],
-): bigint | null {
+): string | null {
   if (text !== null) {
     try {
-      return toMinorUnits(text, currency);
+      return checkedMoney(text, currency);
     } catch (error) {
       pending.push({
         kind,
@@ -875,10 +990,10 @@ function canonicalizeAmbiguousMoney(
   currency: string,
   kind: string,
   pending: ReviewCandidate[],
-): bigint | null {
+): string | null {
   if (text === null) return null;
   try {
-    return toMinorUnits(text, currency);
+    return checkedMoney(text, currency);
   } catch (error) {
     pending.push({
       kind,
@@ -889,6 +1004,28 @@ function canonicalizeAmbiguousMoney(
   }
 }
 
+/**
+ * The one path from a source's stated money text to a NUMERIC column, and the
+ * one place the two checks money has to pass are applied together.
+ *
+ * `toMinorUnits` is called for its exception and not for its value. Under
+ * SQLite it was also the conversion to what got stored; here nothing is
+ * stored in minor units, and the check stays for the reason it always
+ * actually had: a value more precise than its currency allows is *ambiguous
+ * money*, and ground rule 5 says ambiguous money is null with a review item,
+ * never inferred. `NUMERIC` would accept 12.345 USD without complaint, which
+ * is exactly why dropping this check when the column type changed would have
+ * been a silent loss of the rule rather than a simplification.
+ *
+ * `toNumericText` is the second check and the value that is stored: decimal
+ * text, canonical, refused outright past the typed boundary rather than
+ * rounded into it. Both rejections reach the caller as an exception and
+ * become a review item.
+ */
+function checkedMoney(text: string, currency: string): string {
+  toMinorUnits(text, currency);
+  return toNumericText(text);
+}
 
 /**
  * Acceptance criterion 7: every run asserts that unique row_hash count equals
@@ -896,28 +1033,25 @@ function canonicalizeAmbiguousMoney(
  * a defensive re-check against the aggregate, not trust in the schema alone),
  * and that every transaction resolves to an account.
  */
-function assertInvariants(db: DatabaseSync): void {
-  const counts = db
-    .prepare(
-      "SELECT COUNT(*) AS total, COUNT(DISTINCT row_hash) AS distinctHashes FROM transactions",
-    )
-    .get() as { total: number | bigint; distinctHashes: number | bigint };
-  if (Number(counts.total) !== Number(counts.distinctHashes)) {
+async function assertInvariants(client: ArchiveClient): Promise<void> {
+  const counts = await client.query<{ total: string; distinct_hashes: string }>(
+    "SELECT count(*)::text AS total, count(DISTINCT row_hash)::text AS distinct_hashes FROM transactions",
+  );
+  const { total = "0", distinct_hashes = "0" } = counts.rows[0] ?? {};
+  if (total !== distinct_hashes) {
     throw new Error(
-      `row_hash is not unique per transaction: ${counts.total} rows but ` +
-        `${counts.distinctHashes} distinct hashes`,
+      `row_hash is not unique per transaction: ${total} rows but ` +
+        `${distinct_hashes} distinct hashes`,
     );
   }
-  const orphans = db
-    .prepare(
-      `SELECT COUNT(*) AS n FROM transactions t
-       LEFT JOIN accounts a ON a.id = t.account_id
-       WHERE a.id IS NULL`,
-    )
-    .get() as { n: number | bigint };
-  if (Number(orphans.n) !== 0) {
+  const orphans = await client.query<{ n: string }>(
+    `SELECT count(*)::text AS n FROM transactions t
+     LEFT JOIN accounts a ON a.id = t.account_id
+     WHERE a.id IS NULL`,
+  );
+  if (orphans.rows[0]?.n !== "0") {
     throw new Error(
-      `${orphans.n} transaction(s) do not resolve to an account`,
+      `${orphans.rows[0]?.n} transaction(s) do not resolve to an account`,
     );
   }
 }

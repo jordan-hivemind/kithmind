@@ -9,11 +9,19 @@ The adapter interface, importer, reconciliation gate and MCP server build on
 top of it.
 
 The archive is moving from a local SQLite file to hosted Postgres, so an
-always-on machine and a laptop can share one archive. F1-20 adds the Postgres
-schema, the money representation it uses and the conversion tests beside the
-SQLite implementation; F1-22 ports the importer, both reconciliation gates and
-the raw-tree writer onto it and removes SQLite. Until then both are here, and
-the sections below say which engine each describes.
+always-on machine and a laptop can share one archive. F1-20 added the Postgres
+schema and the money representation it uses. **F1-22 moved the write path
+onto it: the importer, both reconciliation gates and the adapter-to-importer
+seam are Postgres, `async`, and speak decimals rather than minor units.**
+
+SQLite has not gone away yet, and the reason is scope rather than nostalgia.
+The read-only MCP server (F1-6) still reads a SQLite file, and its replacement
+(F1-21) is on hold pending the shared typed contract, so `src/schema.ts` and
+`src/mcp` stay exactly as they were, along with the seventeen attack tests
+that are the specification the new read surface has to satisfy. The raw-tree
+writer (`src/rawTree.ts` and the persistence half of `src/adapterImport.ts`)
+also still takes a SQLite handle: F1-24 owns that path and is separating byte
+identity from capture provenance in it concurrently. Both are marked below.
 
 The archive file, the raw document tree and the import logs live in a configured
 local directory outside this repository. No real account number, balance,
@@ -93,11 +101,16 @@ one. The occurrence ordinal and its runtime validation carry over unchanged:
 it is what lets one formula both collapse an overlapping paginated page and
 keep two legitimately identical transactions in one document apart.
 
-## Money and rounding policy (SQLite)
+## Money and rounding policy (SQLite read surface)
 
-Money has two representations, and which one a column uses follows one rule:
-**amounts get summed, prices do not.** Any column added later is classified the
-same way.
+This is the split representation SQLite forced, and it now describes only the
+SQLite file the read surface still reads. The write path stores decimals; see
+"Money on Postgres" above. Everything in this section about canonical form,
+no-rounding-on-ingest and currency is policy rather than storage, and carries
+over unchanged.
+
+Money had two representations, and which one a column used followed one rule:
+**amounts get summed, prices do not.**
 
 | Kind                      | Storage                          | Why                                                                                                                                        |
 | ------------------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -165,7 +178,18 @@ currencies, so a mixed total is a loud failure instead of a plausible number.
 
 ## Deduplication
 
-`rowHash` is the deduplication contract. It hashes over account, process date,
+`rowHashV2` is the deduplication contract on Postgres, and `contentKeyV2` is
+the key the occurrence ordinal is counted over. They are always used as a
+pair: the ordinal is counted with the key and then hashed into the hash, so a
+key and a hash disagreeing about what "the same content" means would assign
+ordinals against one partition and hash them against another, and
+deduplication would break with nothing to see. `test/pgMoney.test.mjs` asserts
+that they partition a synthetic row set identically, and that the v1 pair
+partitions it the same way, which is what makes the identities the archive
+deduplicates on the same set before and after the representation change.
+
+`rowHash` (v1) is described below and is what the SQLite read surface's rows
+carry. It hashes over account, process date,
 activity type, description, quantity, amount and an occurrence ordinal, using
 canonical forms, with the currency included because an amount in minor units
 has no meaning without the scale its currency gives it. Activity type is
@@ -185,6 +209,47 @@ make `row_hash` stop being a hash of the row's content and would make "unique
 row_hash count equals inserted row count" true by construction instead of a
 real invariant. See `src/importer.ts` for the full reasoning and worked
 examples.
+
+## Publication
+
+The plan is explicit that hosting the ledger coordinates nothing by itself:
+
+> single writer by convention is not a publication boundary. A laptop querying
+> mid-import must not see half a ledger, and must never see new transactions
+> against an old reconciliation verdict.
+
+Two shapes satisfy that. Readers could select an immutable completed dataset
+revision, or an import could publish atomically. **Atomic publication was
+chosen**, because it needs no revision column, no reader-side protocol and no
+schema change: Postgres already hands a reader outside the transaction a
+consistent snapshot, so one transaction spanning the import and both gates is
+the entire mechanism. A dataset revision would add a column, a selection rule
+and a retention question, and would buy something the archive does not yet
+need, which is readers pinned to an old revision on purpose.
+
+Three pieces implement it, all in `src/pgStore.ts`:
+
+| Piece                    | What it does                                                                                                                                                                                                                        |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `withArchiveTransaction` | Runs a body in one transaction, and **nests**: an inner call on a client already inside one joins it. That is what lets the import and both gates each be atomic alone and atomic together, with no caller left to remember a rule. |
+| `lockArchiveForWrite`    | A transaction-scoped advisory lock every writer takes. A second import waits rather than racing, and is released by `COMMIT` or `ROLLBACK`, so it cannot leak past a crashed run.                                                   |
+| `publishImport`          | Import plus both gates inside one of those transactions. The rows and the verdicts that judge them become visible in the same instant.                                                                                              |
+
+Retries stay idempotent: a document already imported contributes nothing on a
+second run, so the import that waited for the lock finds nothing left to do
+instead of colliding on `row_hash` or `documents.sha256`.
+
+`test/pgPublication.test.mjs` proves all of it from a **second connection**,
+which is the only vantage point where the claim means anything -- a reader on
+the importing connection sees that connection's own uncommitted work however
+the code is arranged. It samples an in-flight import and finds only the
+before-state or the after-state and never a partial ledger; samples the
+transaction count and the period's verdict in one statement across a
+publication that flips a passing period to failing, and finds only `1/pass` or
+`2/fail`; shows a publication that trips ground rule 7 partway leaves no rows,
+no document and no import run; and blocks a publisher behind a held lock,
+waiting on `pg_locks` rather than on a sleep, to show the exclusion is the
+database's and not a convention.
 
 ## Institution adapter interface
 
@@ -282,10 +347,10 @@ next month is not copied, because nothing copies a field that was never named.
 There is no list of credential-looking key names anywhere in this package,
 deliberately. A denylist fails open exactly once.
 
-| Declaration     | For                                                    | Behavior                                                                                       |
-| --------------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------ |
+| Declaration      | For                                                     | Behavior                                                                                              |
+| ---------------- | ------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
 | `json_allowlist` | A JSON payload (`structured_api`)                       | Named leaf paths are retained. `*` matches any array index or object key. Everything else is dropped. |
-| `opaque`         | `pdf_statement`, `trade_confirmation`, `tabular_export` | Bytes retained whole, with a required stated reason. Refused outright for `structured_api`.       |
+| `opaque`         | `pdf_statement`, `trade_confirmation`, `tabular_export` | Bytes retained whole, with a required stated reason. Refused outright for `structured_api`.           |
 
 A PDF statement is bytes, not JSON. It has no addressable fields, so a field
 projection is not a thing that can be applied to it: it is retained whole,
@@ -335,12 +400,16 @@ Nothing in that suite prints a payload.
 
 ## Importer
 
-`importBatch(db, batch, now?)` turns normalized rows into `documents`,
-`transactions` and `review_items`, and writes one `import_runs` summary. It is
-a script, not something an agent reads rows through: it returns counts, never
-row content (see "Working on the archive without reading it" in the plan).
-The whole batch commits or rolls back as one transaction, so a provider-count
-mismatch or a broken invariant never leaves a partially-imported archive.
+`publishImport(client, batch, now?)` is the entry point. It imports the batch
+and runs both reconciliation gates over what it imported, as one atomic
+publication, and returns counts: never row content (see "Working on the
+archive without reading it" in the plan). See "Publication" below for why the
+gates are not a separate step.
+
+`importBatch(client, batch, now?)` underneath it turns normalized rows into
+`documents`, `transactions` and `review_items`, and writes one `import_runs`
+summary. It is still exported for an import a caller will gate separately, and
+is still atomic on its own. Both are `async` and take a `pg` client.
 
 `ImportRow` is the row shape it consumes, not an adapter interface. It is the
 seam an institution adapter's `parse()` output gets mapped to; see the type's
@@ -407,7 +476,7 @@ tied to one account).
 
 ## Reconciliation gate
 
-`runReconciliationGate(db, importRunId?)` (`src/reconciliation.ts`) is ground
+`runReconciliationGate(client, importRunId?)` (`src/reconciliation.ts`) is ground
 rule 3 made concrete: reconciliation is a gate, not a report. For every
 account with two or more `balances` snapshots, it treats each consecutive
 pair of snapshots as one statement period, sums that account's transactions
@@ -445,14 +514,15 @@ added to.
 
 ## Position quantity gate
 
-`runPositionReconciliationGate(db, importRunId?)`
+`runPositionReconciliationGate(client, importRunId?)`
 (`src/positionReconciliation.ts`) is the validation half of holdings and the
-position-side analogue of the cash gate. Run it after
-`runReconciliationGate` against the same `import_runs` row:
+position-side analogue of the cash gate. `publishImport` runs it against the
+same `import_runs` row the cash gate used; run them by hand only when
+re-gating after a correction:
 
 ```ts
-const cash = runReconciliationGate(db, runId);
-const positions = runPositionReconciliationGate(db, runId);
+const cash = await runReconciliationGate(client, runId);
+const positions = await runPositionReconciliationGate(client, runId);
 ```
 
 Both increment the same `import_runs` counters. The position gate appends to
@@ -516,13 +586,12 @@ snapshots on, and pooling such rows would invent a holding.
 ### Why a separate table
 
 `position_reconciliations` is a table of its own rather than an
-`instrument_id` column on `reconciliations`, for two reasons that are not
-stylistic. First, a cash change is `INTEGER` minor units and a quantity
-change is canonical decimal `TEXT`; the `CHECK` constraints pinning those
-storage classes are how a `REAL` from a parser is caught at write time, and
-sharing the columns would mean dropping exactly those checks.
-`reconciliations.currency` is also `NOT NULL` and meaningless for a share
-count. Second, a cash verdict and a position verdict must stay
+`instrument_id` column on `reconciliations`. Under SQLite there were two
+reasons: a cash change was `INTEGER` minor units and a quantity change was
+canonical decimal `TEXT`, and the storage-class `CHECK` constraints were per
+column. On Postgres both are `NUMERIC`, so that reason is gone. What remains
+is not stylistic. `reconciliations.currency` is `NOT NULL` and meaningless for
+a share count. And a cash verdict and a position verdict must stay
 distinguishable: with one table, every existing `SELECT ... FROM
 reconciliations WHERE status != 'pass'` would silently start returning
 per-instrument rows and every account's period list would multiply by its
@@ -534,7 +603,7 @@ query can miss.
 `src/adapterImport.ts` is the seam between `ParsedRow` (what an adapter's
 `parse()` returns) and `ImportRow`/`ImportDocument` (what `importBatch`
 consumes); neither the adapter interface nor the importer owns this mapping
-on its own. `adapterPullToImportDocuments(db, pull)` does two things a
+on its own. `adapterPullToImportDocuments(client, pull)` does two things a
 caller cannot do by combining the other two files alone:
 
 - **Instrument resolution.** `ParsedRow.instrument` is a descriptor (symbol,
@@ -544,7 +613,8 @@ caller cannot do by combining the other two files alone:
   alone, then a new row. A real identifier never merges two different
   instruments that happen to share a ticker. A bare symbol with no cusip,
   isin or matching name resolves to the _existing_ instrument with that
-  symbol (deterministically the first one ever created, by SQLite `rowid`)
+  symbol (the first one created for it, ordered by `ctid`, which for this
+  insert-only table is insertion order)
   rather than minting a new row every time -- unbounded row growth would
   silently break "every purchase of instrument X" just as badly as a wrong
   merge would -- and every such weak match opens a `review_items` entry
@@ -563,8 +633,8 @@ caller cannot do by combining the other two files alone:
   provider-reported total the un-split case can assert directly, so
   `adapterPullToImportDocuments` checks it separately across the whole pull:
   it recomputes each page's `occurrence` ordinal and `row_hash` the same way
-  `importBatch` will (via `contentKey` in `rowHash.ts`, shared by both so
-  they cannot drift apart) and compares the distinct-hash count against the
+  `importBatch` will (via `contentKeyV2` and `rowHashV2` in `rowHash.ts`,
+  shared by both, always used as a pair, so they cannot drift apart) and compares the distinct-hash count against the
   provider's total -- this works whether or not the rows carry a provider
   transaction id, unlike checking distinct ids alone, which goes silent the
   moment a source has none. When the provider states no total at all for a
@@ -583,6 +653,13 @@ required reason behind a `null` amount an adapter could not read -- passes
 through as `ImportRow.amountNote`; the importer opens a `review_items` entry
 for it exactly as it does for an amount `toMinorUnits` rejects, rather than
 letting it vanish.
+
+The persistence half of this file -- `persistAcquiredDocument` and
+`recordRetainedTextPath`, under "Raw tree" below -- still takes a
+`DatabaseSync`. F1-24 owns that path and is changing it concurrently, so F1-22
+left it alone rather than porting the same lines twice. Until it lands, a
+caller wiring an adapter end to end holds both handles, and
+`test/adapterImport.test.mjs` says so where it does.
 
 ## Raw tree
 
@@ -764,10 +841,18 @@ error that names what is missing, never a default and never a guess.
 `test/pgMoney.test.mjs` needs no database and always runs: input validation,
 driver decoding and the whole deduplication preimage are pure logic, and they
 are the three places this port can go quietly wrong.
-`test/pgSchema.test.mjs` needs a real server and skips cleanly, naming the
-variable, unless `FINANCE_ARCHIVE_DATABASE_URL` points at a throwaway
-database. Each run works inside a schema it creates and drops, so pointing it
-at a shared development database cannot clobber anything.
+Every suite that touches the write path -- `pgSchema`, `importer`,
+`reconciliation`, `positionReconciliation`, `adapterImport` and
+`pgPublication` -- needs a real server and skips cleanly, naming the variable,
+unless `FINANCE_ARCHIVE_DATABASE_URL` points at a throwaway database. Each
+test works inside a schema it creates and drops (`test/helpers/pgArchive.mjs`),
+so pointing them at a shared development database cannot clobber anything, and
+two tests can never see each other's rows.
+
+`turbo.json` lists `FINANCE_ARCHIVE_DATABASE_URL` in this package's
+`test:once` `passThroughEnv`. Without that entry turbo strips the variable and
+every Postgres test skips, which looks exactly like a green run: CI would have
+reported success while proving none of it.
 
 The tradeoff, stated plainly: a public clone with no database still runs the
 full suite and proves everything provable without a server, but exact

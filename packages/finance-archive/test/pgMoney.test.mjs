@@ -11,6 +11,8 @@ import pg from "pg";
 
 import {
   archiveDatabaseUrl,
+  contentKey,
+  contentKeyV2,
   decodesAsText,
   fromNumericText,
   NUMERIC_MAX_DIGITS,
@@ -103,6 +105,16 @@ test("INT8 decoding is pinned too, because counts cross 2^53", () => {
   const decode = pg.types.getTypeParser(pg.types.builtins.INT8);
   assert.equal(decode("9007199254740993"), "9007199254740993");
   assert.equal(typeof decode("1"), "string");
+});
+
+test("DATE decoding is pinned too, because a Date object shifts the day", () => {
+  // The driver's default builds a JavaScript Date at local midnight, so
+  // reading the day back out of one lands on the previous day west of UTC.
+  // Every date in this archive is ISO text end to end: it is what the gates
+  // pair periods on and what a locator cites.
+  const decode = pg.types.getTypeParser(pg.types.builtins.DATE);
+  assert.equal(decode("2026-03-01"), "2026-03-01");
+  assert.equal(typeof decode("2026-03-01"), "string");
 });
 
 test("a NUMERIC that came back as a number is a hard error, not something to coerce", () => {
@@ -215,6 +227,61 @@ test("minor units map to decimal without changing which rows are the same row", 
   // singletons, which would make the assertion above vacuous.
   assert.ok(classesV2.size < rows.length);
   assert.equal(classesV2.size, 9);
+});
+
+test("the content key and the hash agree about what the same content is", () => {
+  // The occurrence ordinal is counted over the content key and then hashed
+  // into the row hash. If the two disagreed about which rows are the same
+  // content -- one version's key with the other version's hash, say -- the
+  // ordinals would be assigned against one partition and hashed against
+  // another, and deduplication would break silently. So the key's partition
+  // is asserted to be the hash's partition, over the same synthetic row set
+  // the identity test above uses.
+  const rows = [
+    { currency: "USD", amount: "12.34" },
+    { currency: "USD", amount: "12.340" },
+    { currency: "USD", amount: "0" },
+    { currency: "USD", amount: "-0.00" },
+    { currency: "JPY", amount: "1250" },
+    { currency: "KWD", amount: "1.2340" },
+    { currency: "USD", amount: null },
+  ].map((row) => ({ ...BASE, ...row }));
+
+  const group = (keyOf) => {
+    const classes = new Map();
+    rows.forEach((row, index) => {
+      const key = keyOf(row);
+      classes.set(key, [...(classes.get(key) ?? []), index]);
+    });
+    return JSON.stringify([...classes.values()].map((g) => g.join(",")).sort());
+  };
+
+  const byKey = group((row) => contentKeyV2(row));
+  const byHash = group((row) => rowHashV2(row));
+  assert.equal(byKey, byHash);
+  // And it is not the trivial all-singletons partition: two spellings of one
+  // amount and two spellings of zero each collapse to one class.
+  assert.equal(new Set(rows.map((row) => contentKeyV2(row))).size, 5);
+
+  // The v1 pair partitions the same rows the same way, which is what makes
+  // the ordinals a row was assigned under v1 still the ordinals it gets
+  // under v2.
+  const v1 = rows.map((row) => ({
+    ...row,
+    amount: row.amount === null ? null : toMinorUnits(row.amount, row.currency),
+  }));
+  const groupV1 = (keyOf) => {
+    const classes = new Map();
+    v1.forEach((row, index) => {
+      const key = keyOf(row);
+      classes.set(key, [...(classes.get(key) ?? []), index]);
+    });
+    return JSON.stringify([...classes.values()].map((g) => g.join(",")).sort());
+  };
+  assert.equal(
+    groupV1((row) => contentKey(row)),
+    byKey,
+  );
 });
 
 test("the occurrence ordinal survives the version bump, validation included", () => {
