@@ -1,7 +1,27 @@
 # Shared archive relocation
 
-Status: proposed P2-38 design. No relocation, rebind, deletion, or live move
-has been implemented or authorized by this document.
+Status: P2-38 implementation in progress. The tested components below do not
+yet provide an owner relocation command. No live move or deletion has occurred.
+
+## Implemented foundation
+
+- Configuration validation permits only a remote repository root-path change.
+  It preserves the worker authority, credentials, watched roots, and all other
+  normalized settings.
+- The archive catalog can retain an append-only mapping for one exact old/new
+  boundary and its complete still-live snapshot/object inventory. Historical
+  receipts remain unchanged. Lost-response recovery accepts only the listed
+  ciphertext identities; chains and unrelated boundaries remain conflicts.
+- An injected relocation workflow persists a verified inventory before its
+  move intent, recovers uncertain outcomes by stable identity, and requires
+  identical post-move inventory before invoking rebind and scan gates.
+
+The workflow still requires a concrete durable store with an exclusive lease,
+the Dropbox provider adapter, a paired journal/config rebind, and the actual
+decryption and database-restore gates. Its synthetic tests do not establish
+Dropbox identity preservation or authorize skipping those gates. The current
+component limits are 2,048 inventory objects and 64 MiB per ciphertext object.
+Larger migrations require a separately tested limit change before preparation.
 
 ## Purpose
 
