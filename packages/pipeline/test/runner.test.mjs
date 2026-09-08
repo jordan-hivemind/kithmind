@@ -16,6 +16,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { Journal } from "../dist/journal.js";
+import { openArchiveCatalog } from "../dist/archiveCatalog.js";
 import { digestArchiveIntent } from "../dist/archivedRequestMapping.js";
 import {
   initialCheckpoint,
@@ -23,6 +24,7 @@ import {
   PipelineRunner,
 } from "../dist/runner.js";
 import { ParserProcessError } from "../dist/parserProcess.js";
+import { persistProviderBinding } from "../dist/providerRegistry.js";
 import { parseRunnerCheckpoint } from "../dist/runnerState.js";
 
 const HASH = "a".repeat(64);
@@ -1345,6 +1347,122 @@ test("a durable provider admission replay does not expire its persisted declarat
       runner.providerDeclaration(row, false).locatorBundle.snapshotId,
       locator.backup.snapshotId,
     );
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("provider verification projects the full verifier result into the closed catalog shape", async () => {
+  const setup = await fixture(0);
+  const registryPath = join(setup.base, "provider-registry");
+  await mkdir(registryPath, { mode: 0o700 });
+  const registryDirectory = await realpath(registryPath);
+  await chmod(registryDirectory, 0o700);
+  const plan = pdfPlan();
+  const checkpoint = archivedCheckpoint(plan, {
+    preflightAction: "provider_verify",
+  });
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  const bindingId = randomUUID();
+  const metadata = {
+    referenceVersion: "provider_original_v1",
+    providerKind: "dropbox_v1",
+    providerAccountIdHash: createHash("sha256")
+      .update("dbid:account")
+      .digest("hex"),
+    providerRootDirectoryIdHash: createHash("sha256")
+      .update("id:root")
+      .digest("hex"),
+    providerFileIdHash: createHash("sha256").update("id:file").digest("hex"),
+    providerRevision: "rev1",
+    providerContentHash: "4".repeat(64),
+    sourceContentHash: plan.sha256,
+    sourceByteLength: plan.byteLength,
+    verifiedAt: Date.now(),
+  };
+  const persisted = await persistProviderBinding({
+    registryDirectory,
+    verified: {
+      metadata,
+      binding: {
+        bindingId,
+        providerAccountId: "dbid:account",
+        providerRootDirectoryId: "id:root",
+        providerFileId: "id:file",
+        providerRevision: metadata.providerRevision,
+        relativePath: plan.relativePath,
+      },
+    },
+  });
+  const catalog = await openArchiveCatalog({ journal });
+  const original = await catalog.createOriginalIntent({
+    originalCatalogId: checkpoint.originalCatalogId,
+    sourceExternalId: randomUUID(),
+    origin: {
+      scanId: checkpoint.scanId,
+      observationEpoch: plan.observationEpoch,
+      sha256: plan.sha256,
+      byteLength: plan.byteLength,
+      mediaType: "application/pdf",
+    },
+    copies: { primary: archiveCopy("primary") },
+    providerOriginal: {
+      clientReferenceId: randomUUID(),
+      bindingId,
+      locator: archiveCopy("independent_backup"),
+    },
+    createdAt: Date.now(),
+  });
+  const processing = {
+    processingCatalogId: checkpoint.processingCatalogId,
+    copies: {
+      primary: archiveCopy("primary"),
+      independent_backup: archiveCopy("independent_backup"),
+    },
+  };
+  const runner = new PipelineRunner(
+    {
+      ...setup.config,
+      pdfDocQa: {
+        archive: {
+          independentBackup: { repository: {} },
+        },
+        providerOriginal: {
+          registryDirectory,
+          rootAlias: plan.rootAlias,
+          providerAccountIdHash: metadata.providerAccountIdHash,
+          providerRootDirectoryIdHash: metadata.providerRootDirectoryIdHash,
+          providerRootDirectoryId: "id:root",
+        },
+      },
+    },
+    journal,
+    { async call() {} },
+  );
+  runner.archiveCatalog = catalog;
+  try {
+    const next = await runner.driveProviderOriginal(
+      checkpoint,
+      original,
+      processing,
+      join(setup.root, plan.relativePath),
+      "provider_verify",
+    );
+    assert.equal(next.step, "parser_archive");
+    assert.equal(next.expectedOriginalRevision, 2);
+    assert.deepEqual(catalog.listOriginals()[0].providerOriginal.verified, {
+      providerAccountIdHash: metadata.providerAccountIdHash,
+      providerRootDirectoryIdHash: metadata.providerRootDirectoryIdHash,
+      providerFileIdHash: metadata.providerFileIdHash,
+      providerRevision: metadata.providerRevision,
+      providerContentHash: metadata.providerContentHash,
+      sourceContentHash: metadata.sourceContentHash,
+      sourceByteLength: metadata.sourceByteLength,
+      verifiedAt: metadata.verifiedAt,
+      manifestFingerprint: persisted.manifestFingerprint,
+      manifestByteLength: persisted.manifestByteLength,
+    });
   } finally {
     await journal.close();
     await rm(setup.base, { recursive: true, force: true });

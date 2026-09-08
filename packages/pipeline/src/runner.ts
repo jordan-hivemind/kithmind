@@ -3103,7 +3103,16 @@ export class PipelineRunner {
         catalogId: original.originalCatalogId,
         expectedRevision: original.rowRevision,
         verified: {
-          ...loaded.verified.metadata,
+          providerAccountIdHash:
+            loaded.verified.metadata.providerAccountIdHash,
+          providerRootDirectoryIdHash:
+            loaded.verified.metadata.providerRootDirectoryIdHash,
+          providerFileIdHash: loaded.verified.metadata.providerFileIdHash,
+          providerRevision: loaded.verified.metadata.providerRevision,
+          providerContentHash: loaded.verified.metadata.providerContentHash,
+          sourceContentHash: loaded.verified.metadata.sourceContentHash,
+          sourceByteLength: loaded.verified.metadata.sourceByteLength,
+          verifiedAt: loaded.verified.metadata.verifiedAt,
           manifestFingerprint: loaded.persisted.manifestFingerprint,
           manifestByteLength: loaded.persisted.manifestByteLength,
         },
