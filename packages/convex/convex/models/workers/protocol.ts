@@ -101,6 +101,11 @@ export type WorkerJobFailureCode =
   | "staging_invalid";
 
 export type ArchiveDeletionOutcome = "deleted" | "already_missing";
+export type ArchiveDeletionAbsenceAuthority =
+  | "worker_asserted_physical_absence"
+  | "worker_asserted_live_repository_absence";
+export type ArchiveDeletionRetentionDisclosure =
+  "provider_retained_deleted_history_possible";
 
 export type FsDiscoveryEntry = {
   externalId?: string;
@@ -181,7 +186,16 @@ export type WorkerRequest =
       receiptId: string;
       objectOutcome: ArchiveDeletionOutcome;
       backupOutcome?: ArchiveDeletionOutcome;
-    })
+    } & (
+        | {
+            absenceAuthority?: "worker_asserted_physical_absence";
+            retentionDisclosure?: never;
+          }
+        | {
+            absenceAuthority: "worker_asserted_live_repository_absence";
+            retentionDisclosure: ArchiveDeletionRetentionDisclosure;
+          }
+      ))
   | (WorkerSourceRequest & {
       operation: "source.inventoryPage";
       scanId: string;
@@ -783,15 +797,25 @@ export type WorkerAssessmentPageResult = {
   staleReason?: "source_changed" | "detail_unavailable" | "expired";
 };
 
-export type WorkerArchiveDeletionAckSummary = {
+type WorkerArchiveDeletionAckSummaryBase = {
   deletionId: string;
   receiptId: string;
   forgetEpoch: number;
   objectOutcome: ArchiveDeletionOutcome;
   backupOutcome?: ArchiveDeletionOutcome;
-  absenceAuthority: "worker_asserted_physical_absence";
   completedAt: number;
 };
+
+export type WorkerArchiveDeletionAckSummary =
+  | (WorkerArchiveDeletionAckSummaryBase & {
+      absenceAuthority: "worker_asserted_physical_absence";
+      retentionDisclosure?: never;
+    })
+  | (WorkerArchiveDeletionAckSummaryBase & {
+      absenceAuthority: "worker_asserted_live_repository_absence";
+      backupOutcome: ArchiveDeletionOutcome;
+      retentionDisclosure: ArchiveDeletionRetentionDisclosure;
+    });
 
 export type WorkerArchiveForgetTarget = {
   receiptId: string;
@@ -1409,7 +1433,7 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
           return parsed;
         })(),
       };
-    case "archive.ackDeletion":
+    case "archive.ackDeletion": {
       exactKeys(
         input,
         [
@@ -1421,7 +1445,7 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
           "receiptId",
           "objectOutcome",
         ],
-        ["backupOutcome"],
+        ["backupOutcome", "absenceAuthority", "retentionDisclosure"],
       );
       if (
         input.objectOutcome !== "deleted" &&
@@ -1434,7 +1458,20 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
         input.backupOutcome !== "already_missing"
       )
         invalid();
-      return {
+      if (
+        input.absenceAuthority !== undefined &&
+        input.absenceAuthority !== "worker_asserted_physical_absence" &&
+        input.absenceAuthority !== "worker_asserted_live_repository_absence"
+      )
+        invalid();
+      if (
+        input.absenceAuthority === "worker_asserted_live_repository_absence"
+          ? input.retentionDisclosure !==
+            "provider_retained_deleted_history_possible"
+          : input.retentionDisclosure !== undefined
+      )
+        invalid();
+      const archiveAck = {
         ...base,
         operation: "archive.ackDeletion",
         requestId: requestId(input.requestId),
@@ -1452,8 +1489,26 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
         objectOutcome: input.objectOutcome,
         ...(input.backupOutcome === undefined
           ? {}
-          : { backupOutcome: input.backupOutcome }),
+          : {
+              backupOutcome: input.backupOutcome as ArchiveDeletionOutcome,
+            }),
+      } as const;
+      if (
+        input.absenceAuthority === "worker_asserted_live_repository_absence"
+      ) {
+        return {
+          ...archiveAck,
+          absenceAuthority: input.absenceAuthority,
+          retentionDisclosure: "provider_retained_deleted_history_possible",
+        };
+      }
+      return {
+        ...archiveAck,
+        ...(input.absenceAuthority === undefined
+          ? {}
+          : { absenceAuthority: "worker_asserted_physical_absence" as const }),
       };
+    }
     case "source.inventoryPage":
       exactKeys(input, [
         ...baseKeys,

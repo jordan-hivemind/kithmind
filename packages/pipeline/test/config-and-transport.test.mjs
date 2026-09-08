@@ -550,12 +550,75 @@ test("archive forget responses bind the source hash, epoch, receipt, and acknowl
     parseWorkerResponse(JSON.stringify(ack), ack.operation).operation,
     ack.operation,
   );
+  const liveTarget = {
+    ...target,
+    subjectKind: "parser_output",
+    copyRole: "independent_backup",
+    ack: {
+      ...target.ack,
+      backupOutcome: "deleted",
+      absenceAuthority: "worker_asserted_live_repository_absence",
+      retentionDisclosure: "provider_retained_deleted_history_possible",
+    },
+  };
+  const livePage = { ...page, targets: [liveTarget] };
+  assert.equal(
+    parseWorkerResponse(JSON.stringify(livePage), livePage.operation).operation,
+    livePage.operation,
+  );
+  assert.equal(
+    parseWorkerResponse(
+      JSON.stringify({
+        operation: "archive.ackDeletion",
+        ...liveTarget.ack,
+        reused: false,
+      }),
+      "archive.ackDeletion",
+    ).retentionDisclosure,
+    "provider_retained_deleted_history_possible",
+  );
   assert.throws(() =>
     parseWorkerResponse(
       JSON.stringify({ ...ack, absenceAuthority: "filesystem_guess" }),
       ack.operation,
     ),
   );
+  for (const invalid of [
+    {
+      ...ack,
+      retentionDisclosure: "provider_retained_deleted_history_possible",
+    },
+    {
+      ...ack,
+      absenceAuthority: "worker_asserted_live_repository_absence",
+      retentionDisclosure: "provider_retained_deleted_history_possible",
+    },
+    {
+      ...ack,
+      absenceAuthority: "worker_asserted_live_repository_absence",
+    },
+    {
+      ...ack,
+      absenceAuthority: "worker_asserted_live_repository_absence",
+      retentionDisclosure: "physical_erasure_complete",
+    },
+  ])
+    assert.throws(() =>
+      parseWorkerResponse(
+        JSON.stringify(invalid),
+        invalid.operation ?? "archive.ackDeletion",
+      ),
+    );
+  for (const inconsistentTarget of [
+    { ...liveTarget, copyRole: "primary", ack: liveTarget.ack },
+    { ...liveTarget, subjectKind: "original_bytes", ack: liveTarget.ack },
+  ])
+    assert.throws(() =>
+      parseWorkerResponse(
+        JSON.stringify({ ...page, targets: [inconsistentTarget] }),
+        page.operation,
+      ),
+    );
 });
 
 test("archived discovery responses require exact closed B1 shapes", () => {

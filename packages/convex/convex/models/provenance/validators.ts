@@ -240,6 +240,15 @@ export const archiveDeletionOutcomeValidator = v.union(
   v.literal("already_missing"),
 );
 
+export const archiveDeletionAbsenceAuthorityValidator = v.union(
+  v.literal("worker_asserted_physical_absence"),
+  v.literal("worker_asserted_live_repository_absence"),
+);
+
+export const archiveDeletionRetentionDisclosureValidator = v.literal(
+  "provider_retained_deleted_history_possible",
+);
+
 export const sourceArtifactDeletionAckFields = {
   spaceId: v.id("spaces"),
   sourceAccountId: v.id("sourceAccounts"),
@@ -250,7 +259,8 @@ export const sourceArtifactDeletionAckFields = {
   requestId: v.string(),
   requestDigest: v.string(),
   ackVersion: v.literal("archive_deletion_ack_v1"),
-  absenceAuthority: v.literal("worker_asserted_physical_absence"),
+  absenceAuthority: archiveDeletionAbsenceAuthorityValidator,
+  retentionDisclosure: v.optional(archiveDeletionRetentionDisclosureValidator),
   clientReceiptId: v.string(),
   receiptRequestDigest: v.string(),
   sourceRevisionId: v.id("sourceRevisions"),

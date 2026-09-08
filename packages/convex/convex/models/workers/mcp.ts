@@ -38,6 +38,32 @@ const scanState = v.union(
   v.literal("failed"),
 );
 
+const archiveDeletionAckSummaryFields = {
+  deletionId: v.string(),
+  receiptId: v.string(),
+  forgetEpoch: v.number(),
+  objectOutcome: v.union(v.literal("deleted"), v.literal("already_missing")),
+  backupOutcome: v.optional(
+    v.union(v.literal("deleted"), v.literal("already_missing")),
+  ),
+  completedAt: v.number(),
+};
+
+const archiveDeletionAckSummaryValidator = v.union(
+  v.object({
+    ...archiveDeletionAckSummaryFields,
+    absenceAuthority: v.literal("worker_asserted_physical_absence"),
+  }),
+  v.object({
+    ...archiveDeletionAckSummaryFields,
+    backupOutcome: v.union(v.literal("deleted"), v.literal("already_missing")),
+    absenceAuthority: v.literal("worker_asserted_live_repository_absence"),
+    retentionDisclosure: v.literal(
+      "provider_retained_deleted_history_possible",
+    ),
+  }),
+);
+
 const workerResultValidator = v.union(
   v.object({
     operation: v.literal("source.status"),
@@ -119,40 +145,33 @@ const workerResultValidator = v.union(
         ciphertextHash: v.string(),
         ciphertextByteLength: v.number(),
         forgetEpoch: v.number(),
-        ack: v.optional(
-          v.object({
-            deletionId: v.string(),
-            receiptId: v.string(),
-            forgetEpoch: v.number(),
-            objectOutcome: v.union(
-              v.literal("deleted"),
-              v.literal("already_missing"),
-            ),
-            backupOutcome: v.optional(
-              v.union(v.literal("deleted"), v.literal("already_missing")),
-            ),
-            absenceAuthority: v.literal("worker_asserted_physical_absence"),
-            completedAt: v.number(),
-          }),
-        ),
+        ack: v.optional(archiveDeletionAckSummaryValidator),
       }),
     ),
     isDone: v.boolean(),
     continueCursor: v.string(),
   }),
-  v.object({
-    operation: v.literal("archive.ackDeletion"),
-    deletionId: v.string(),
-    receiptId: v.string(),
-    forgetEpoch: v.number(),
-    objectOutcome: v.union(v.literal("deleted"), v.literal("already_missing")),
-    backupOutcome: v.optional(
-      v.union(v.literal("deleted"), v.literal("already_missing")),
-    ),
-    absenceAuthority: v.literal("worker_asserted_physical_absence"),
-    completedAt: v.number(),
-    reused: v.boolean(),
-  }),
+  v.union(
+    v.object({
+      operation: v.literal("archive.ackDeletion"),
+      ...archiveDeletionAckSummaryFields,
+      absenceAuthority: v.literal("worker_asserted_physical_absence"),
+      reused: v.boolean(),
+    }),
+    v.object({
+      operation: v.literal("archive.ackDeletion"),
+      ...archiveDeletionAckSummaryFields,
+      backupOutcome: v.union(
+        v.literal("deleted"),
+        v.literal("already_missing"),
+      ),
+      absenceAuthority: v.literal("worker_asserted_live_repository_absence"),
+      retentionDisclosure: v.literal(
+        "provider_retained_deleted_history_possible",
+      ),
+      reused: v.boolean(),
+    }),
+  ),
   v.object({
     operation: v.literal("source.inventoryPage"),
     page: v.array(

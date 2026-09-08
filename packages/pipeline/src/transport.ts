@@ -156,7 +156,7 @@ function archiveDeletionAck(
       "completedAt",
       ...(options.reused ? ["reused"] : []),
     ],
-    ["backupOutcome"],
+    ["backupOutcome", "retentionDisclosure"],
   );
   if (options.operation && row.operation !== "archive.ackDeletion")
     failure("archive deletion operation is invalid");
@@ -173,8 +173,18 @@ function archiveDeletionAck(
       "already_missing",
     ] as const);
   }
-  if (row.absenceAuthority !== "worker_asserted_physical_absence")
-    failure("absence authority is invalid");
+  enumValue(row.absenceAuthority, "absenceAuthority", [
+    "worker_asserted_physical_absence",
+    "worker_asserted_live_repository_absence",
+  ] as const);
+  if (
+    row.absenceAuthority === "worker_asserted_live_repository_absence"
+      ? row.retentionDisclosure !==
+          "provider_retained_deleted_history_possible" ||
+        row.backupOutcome === undefined
+      : row.retentionDisclosure !== undefined
+  )
+    failure("archive deletion retention disclosure is invalid");
   integer(row.completedAt, "completedAt");
   if (options.reused) boolean(row.reused, "reused");
 }
@@ -250,7 +260,10 @@ function archiveForgetTargets(value: Record<string, unknown>): void {
         ack.receiptId !== receiptId ||
         ack.forgetEpoch !== forgetEpoch ||
         (target.copyRole === "independent_backup") !==
-          (ack.backupOutcome !== undefined)
+          (ack.backupOutcome !== undefined) ||
+        (ack.absenceAuthority === "worker_asserted_live_repository_absence" &&
+          (target.copyRole !== "independent_backup" ||
+            target.subjectKind !== "parser_output"))
       )
         failure("archive deletion acknowledgement is inconsistent");
     }

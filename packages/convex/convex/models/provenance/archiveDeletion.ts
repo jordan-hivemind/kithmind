@@ -16,7 +16,13 @@ export function archiveDeletionAckMatchesReceipt(
     ack.receiptId === receipt._id &&
     ack.forgetEpoch === forgetEpoch &&
     ack.ackVersion === "archive_deletion_ack_v1" &&
-    ack.absenceAuthority === "worker_asserted_physical_absence" &&
+    (ack.absenceAuthority === "worker_asserted_physical_absence"
+      ? ack.retentionDisclosure === undefined
+      : ack.absenceAuthority === "worker_asserted_live_repository_absence" &&
+        ack.retentionDisclosure ===
+          "provider_retained_deleted_history_possible" &&
+        receipt.copyRole === "independent_backup" &&
+        receipt.subjectKind === "parser_output") &&
     ack.clientReceiptId === receipt.clientReceiptId &&
     ack.receiptRequestDigest === receipt.requestDigest &&
     ack.sourceRevisionId === receipt.sourceRevisionId &&
