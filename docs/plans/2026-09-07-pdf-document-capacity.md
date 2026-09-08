@@ -112,7 +112,7 @@ while preserving keyword access.
 
 This work does not change the independent financial archive implementation.
 
-## Verification in progress
+## Verification results
 
 Independent backend and pipeline review resolved legacy-profile limit regressions.
 Development HTTP staging, sealing, activation and exact retries passed for a
@@ -121,9 +121,14 @@ searchable document. Reads returned all retained text with a matching hash and
 reported partial citations when the existing citation output budget was reached.
 Synthetic fixtures were forgotten and their credentials removed afterward.
 
-Offline remapping of seven retained pilot outputs passed with zero mapping gaps;
-13 selected invoice fields remained unchanged. A fresh complete parser replay and
-the final repository checks remain release gates.
+A fresh local replay admitted all nine pilot PDFs through parsing and mapping,
+covering 155 pages with zero mapping gaps. All source hashes and file identities
+remained unchanged. Thirteen previously checked invoice fields were preserved;
+eight outputs exactly matched the previously inspected retained text. This is
+capacity and provenance acceptance, not proof of complete source extraction.
+
+GitHub CI passes, including the Linux platform boundary. The final local check
+run follows integration of current main and the historical-wire regression.
 
 A synthetic comparison used three pages, seven segments and 26,563 UTF-8 bytes.
 Both chunk policies produced five chunks with identical text, ranges and hashes.
