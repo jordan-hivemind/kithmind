@@ -1,4 +1,33 @@
 export {
+  exhaustiveListing,
+  incompleteListing,
+  sha256Hex,
+  type AcquiredDocument,
+  type AcquireSelection,
+  type AcquisitionGap,
+  type AcquisitionManifestEntry,
+  type AdapterSession,
+  type CapabilityTier,
+  type DiscoveredDocument,
+  type DiscoveredExportRange,
+  type DiscoverResult,
+  type FieldLocator,
+  type InstitutionAdapter,
+  type InstitutionCapabilities,
+  type Listing,
+  type ParsedAmount,
+  type ParsedInstrument,
+  type ParsedRow,
+  type RawFile,
+} from "./adapter.js";
+export {
+  createSyntheticSession,
+  INSTITUTION_NAME as SYNTHETIC_INSTITUTION_NAME,
+  INSTITUTION_SLUG as SYNTHETIC_INSTITUTION_SLUG,
+  syntheticAdapter,
+  type SyntheticSessionOptions,
+} from "./adapters/syntheticTrust/index.js";
+export {
   addDecimal,
   canonicalizeDecimal,
   compareDecimal,
