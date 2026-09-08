@@ -48,6 +48,9 @@ The result uses fixed diagnostic codes and bounded source status. It omits
 credentials, server error messages, file contents, filenames, source URLs,
 and journal request or lease details.
 
+The JSON doctor result is version 2. Version 2 adds the separate heartbeat
+check while leaving the worker `source.status` protocol unchanged.
+
 ## Journal inspection and recovery
 
 Doctor inspection leaves journal content, permissions, and recovery files
@@ -89,11 +92,23 @@ existing checker's explicit deployment options for another environment.
 These checks validate configuration presence and shape within their documented
 scope. They do not establish provider reachability or complete vector coverage.
 
-The worker-only doctor's embedding and daemon capabilities remain `unverified`.
-The existing scoped source-status protocol does not carry that evidence.
-Versioned capability probes and cloud heartbeat monitoring remain P2-4 work.
-See [self-hosting](self-hosting.md) for deployment setup and
-[optional user services](worker-service.md) for local service-manager checks.
+The doctor also reads separate cloud diagnostics status. It never sends a
+heartbeat. A current heartbeat proves only that an authorized `watch` worker
+recently reached the worker gateway. It does not prove source-file access,
+queue progress, record coverage, or a service-manager process is healthy.
+The doctor keeps those observations separate from enumeration, processing, and
+record coverage. Embedding and daemon capabilities remain `unverified`.
+
+| Cloud heartbeat                                                               | Doctor check              | Doctor readiness |
+| ----------------------------------------------------------------------------- | ------------------------- | ---------------- |
+| No watcher configured                                                         | `warn not_configured`     | `degraded`       |
+| Watcher awaiting its first heartbeat                                          | `warn awaiting_heartbeat` | `degraded`       |
+| Fresh heartbeat                                                               | `pass current`            | unaffected       |
+| Overdue heartbeat with no incident yet                                        | `warn overdue`            | `degraded`       |
+| Open missing-worker incident                                                  | `fail missing_worker`     | `blocked`        |
+| Unauthorized, malformed, mismatched, or unreachable diagnostics response      | `warn unavailable`        | `degraded`       |
+| See [self-hosting](self-hosting.md) for deployment setup and                  |
+| [optional user services](worker-service.md) for local service-manager checks. |
 
 ## Fresh-installation demonstration
 

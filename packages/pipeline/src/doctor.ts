@@ -16,6 +16,10 @@ import { inspectJournalReadOnly } from "./journal.js";
 import type { JournalInspection } from "./journalTypes.js";
 import { journalCodec } from "./runner.js";
 import { parseWorkerResponse } from "./transport.js";
+import {
+  parseDiagnosticsStatus,
+  type DiagnosticsStatus,
+} from "./diagnostics.js";
 import type {
   PipelineConfig,
   WorkerErrorCode,
@@ -107,9 +111,25 @@ export type JournalCheck = {
     | "unsafe"
     | "not_checked";
 };
+export type HeartbeatCheck = {
+  id: "heartbeat";
+  state: CheckState;
+  code:
+    | "current"
+    | "not_configured"
+    | "awaiting_heartbeat"
+    | "overdue"
+    | "missing_worker"
+    | "unavailable";
+};
 
 export type DoctorCheck =
-  ConfigCheck | CredentialCheck | DeploymentCheck | RootsCheck | JournalCheck;
+  | ConfigCheck
+  | CredentialCheck
+  | DeploymentCheck
+  | RootsCheck
+  | JournalCheck
+  | HeartbeatCheck;
 
 export type ProcessingCounts = {
   items: {
@@ -143,12 +163,13 @@ export type DoctorSource = {
 };
 
 export type DoctorResult = {
-  version: 1;
+  version: 2;
   state: State;
   checks: [
     ConfigCheck,
     CredentialCheck,
     DeploymentCheck,
+    HeartbeatCheck,
     RootsCheck,
     JournalCheck,
   ];
@@ -198,6 +219,7 @@ export type DoctorAdapters = {
     config: PipelineConfig,
     credential?: string,
   ) => Promise<JournalInspection>;
+  diagnosticDeadlineMs?: number;
 };
 
 class RootDiagnosticFailure extends Error {
@@ -226,7 +248,7 @@ function result(
   source = unavailableSource(),
 ): DoctorResult {
   return {
-    version: 1,
+    version: 2,
     state: resultState(checks),
     checks,
     source,
@@ -239,9 +261,62 @@ export function invalidConfigDoctorResult(): DoctorResult {
     { id: "config", state: "fail", code: "invalid_config" },
     { id: "credential", state: "warn", code: "not_checked" },
     { id: "deployment", state: "warn", code: "not_checked" },
+    { id: "heartbeat", state: "warn", code: "unavailable" },
     { id: "roots", state: "warn", code: "not_checked" },
     { id: "journal", state: "warn", code: "not_checked" },
   ]);
+}
+
+function heartbeatCheck(status: DiagnosticsStatus): HeartbeatCheck {
+  if (status.watcher.state === "not_configured")
+    return { id: "heartbeat", state: "warn", code: "not_configured" };
+  if (status.watcher.state === "awaiting_heartbeat")
+    return { id: "heartbeat", state: "warn", code: "awaiting_heartbeat" };
+  if (status.incident.state === "open")
+    return { id: "heartbeat", state: "fail", code: "missing_worker" };
+  return status.watcher.state === "current"
+    ? { id: "heartbeat", state: "pass", code: "current" }
+    : { id: "heartbeat", state: "warn", code: "overdue" };
+}
+
+async function diagnosticStatus(
+  config: PipelineConfig,
+  transport: WorkerTransport,
+  deadlineMs = STATUS_DEADLINE_MS,
+): Promise<HeartbeatCheck> {
+  try {
+    if (!Number.isSafeInteger(deadlineMs) || deadlineMs < 1) throw new Error();
+    const controller = new AbortController();
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let response: WorkerResponse;
+    try {
+      response = await Promise.race([
+        transport.call(
+          {
+            protocolVersion: 1,
+            operation: "diagnostics.status",
+            spaceId: config.spaceId,
+            sourceAccountId: config.sourceAccountId,
+          },
+          controller.signal,
+        ),
+        new Promise<never>((_resolve, reject) => {
+          timeout = setTimeout(() => {
+            controller.abort();
+            reject(new Error("diagnostics status timed out"));
+          }, deadlineMs);
+        }),
+      ]);
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+    }
+    const parsed = parseDiagnosticsStatus(response);
+    if (parsed.sourceAccountId !== config.sourceAccountId)
+      return { id: "heartbeat", state: "warn", code: "unavailable" };
+    return heartbeatCheck(parsed);
+  } catch {
+    return { id: "heartbeat", state: "warn", code: "unavailable" };
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -609,10 +684,12 @@ async function remoteChecks(
   config: PipelineConfig,
   transport: WorkerTransport | undefined,
   credential: string | undefined,
+  diagnosticDeadlineMs?: number,
 ): Promise<{
   credential: CredentialCheck;
   deployment: DeploymentCheck;
   source: DoctorSource;
+  heartbeat: HeartbeatCheck;
 }> {
   if (credential === undefined || transport === undefined) {
     return {
@@ -623,24 +700,30 @@ async function remoteChecks(
       },
       deployment: { id: "deployment", state: "warn", code: "not_checked" },
       source: unavailableSource(),
+      heartbeat: { id: "heartbeat", state: "warn", code: "unavailable" },
     };
   }
+  const heartbeat = diagnosticStatus(config, transport, diagnosticDeadlineMs);
   let response: WorkerResponse;
   try {
+    const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       response = await Promise.race([
-        transport.call({
-          protocolVersion: 1,
-          operation: "source.status",
-          spaceId: config.spaceId,
-          sourceAccountId: config.sourceAccountId,
-        }),
+        transport.call(
+          {
+            protocolVersion: 1,
+            operation: "source.status",
+            spaceId: config.spaceId,
+            sourceAccountId: config.sourceAccountId,
+          },
+          controller.signal,
+        ),
         new Promise<never>((_resolve, reject) => {
-          timer = setTimeout(
-            () => reject(new Error("source status timed out")),
-            STATUS_DEADLINE_MS,
-          );
+          timer = setTimeout(() => {
+            controller.abort();
+            reject(new Error("source status timed out"));
+          }, STATUS_DEADLINE_MS);
         }),
       ]);
     } finally {
@@ -659,6 +742,7 @@ async function remoteChecks(
         code: "deployment_unavailable",
       },
       source: unavailableSource(),
+      heartbeat: await heartbeat,
     };
   }
 
@@ -668,6 +752,7 @@ async function remoteChecks(
       credential: { id: "credential", state: "fail", code: error },
       deployment: { id: "deployment", state: "pass", code: "available" },
       source: unavailableSource(),
+      heartbeat: await heartbeat,
     };
   }
   if (error !== undefined) {
@@ -683,6 +768,7 @@ async function remoteChecks(
         code: "deployment_unavailable",
       },
       source: unavailableSource(),
+      heartbeat: await heartbeat,
     };
   }
 
@@ -702,6 +788,7 @@ async function remoteChecks(
         code: "deployment_unavailable",
       },
       source: unavailableSource(),
+      heartbeat: await heartbeat,
     };
   }
   if (status.sourceAccountId !== config.sourceAccountId) {
@@ -717,12 +804,14 @@ async function remoteChecks(
         code: "source_mismatch",
       },
       source: unavailableSource(),
+      heartbeat: await heartbeat,
     };
   }
   return {
     credential: { id: "credential", state: "pass", code: "authorized" },
     deployment: { id: "deployment", state: "pass", code: "available" },
     source: sourceResult(status),
+    heartbeat: await heartbeat,
   };
 }
 
@@ -733,7 +822,7 @@ export async function doctor(
   adapters: DoctorAdapters = {},
 ): Promise<DoctorResult> {
   const [remote, roots, journal] = await Promise.all([
-    remoteChecks(config, transport, credential),
+    remoteChecks(config, transport, credential, adapters.diagnosticDeadlineMs),
     rootCheck(config, adapters.inspectRoots),
     inspectJournal(config, credential, adapters.inspectJournal),
   ]);
@@ -742,6 +831,7 @@ export async function doctor(
       { id: "config", state: "pass", code: "valid" },
       remote.credential,
       remote.deployment,
+      remote.heartbeat,
       roots,
       journal,
     ],

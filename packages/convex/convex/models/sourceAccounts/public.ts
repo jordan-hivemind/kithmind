@@ -4,6 +4,7 @@ import { requireWebPrincipal } from "../../lib/webAuth";
 import { getAuthorizedReadSpaceIds, resolveWriteSpace } from "../../lib/spaces";
 import { requireSourceAccountAccess } from "../../lib/sourceAuth";
 import { advanceSourceAssessmentEpoch } from "../ingestion/model";
+import { onSourceEnabledChanged } from "../diagnostics/model";
 
 function boundedText(value: string, name: string, maximum: number) {
   if (
@@ -94,6 +95,7 @@ export const update = mutation({
     if (args.freshnessMs !== undefined) validateFreshness(args.freshnessMs);
     if (args.enabled !== undefined && args.enabled !== account.enabled) {
       await advanceSourceAssessmentEpoch(ctx, account._id);
+      await onSourceEnabledChanged(ctx, account, args.enabled, Date.now());
     }
     await ctx.db.patch(args.sourceAccountId, {
       ...(args.name === undefined ? {} : { name: args.name }),

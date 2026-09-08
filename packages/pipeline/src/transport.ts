@@ -371,6 +371,36 @@ function status(value: Record<string, unknown>): void {
   }
 }
 
+function diagnosticsHeartbeat(value: Record<string, unknown>): void {
+  exact(value, [
+    "operation",
+    "sourceAccountId",
+    "watcherId",
+    "receivedAt",
+    "nextExpectedAt",
+  ]);
+  id(value.sourceAccountId, "sourceAccountId");
+  text(value.watcherId, "watcherId", { maxUtf16: 36, pattern: UUID });
+  integer(value.receivedAt, "receivedAt");
+  integer(value.nextExpectedAt, "nextExpectedAt");
+}
+
+function diagnosticsStatus(value: Record<string, unknown>): void {
+  exact(value, [
+    "operation",
+    "diagnosticsVersion",
+    "sourceAccountId",
+    "source",
+    "watcher",
+    "incident",
+  ]);
+  if (value.diagnosticsVersion !== 1 || value.source !== "enabled")
+    failure("diagnostics status is invalid");
+  id(value.sourceAccountId, "sourceAccountId");
+  record(value.watcher);
+  record(value.incident);
+}
+
 function inventory(value: Record<string, unknown>): void {
   exact(value, ["operation", "page", "isDone", "continueCursor"]);
   if (!Array.isArray(value.page) || value.page.length > MAX_INVENTORY_ITEMS) {
@@ -1087,6 +1117,12 @@ export function parseWorkerResponse(
     case "source.status":
       status(result);
       break;
+    case "diagnostics.heartbeat":
+      diagnosticsHeartbeat(result);
+      break;
+    case "diagnostics.status":
+      diagnosticsStatus(result);
+      break;
     case "archive.forgetTargets":
       archiveForgetTargets(result);
       break;
@@ -1225,7 +1261,10 @@ export class HttpWorkerTransport implements WorkerTransport {
     private readonly timeoutMs = 30_000,
   ) {}
 
-  async call(request: Record<string, unknown>): Promise<WorkerResponse> {
+  async call(
+    request: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<WorkerResponse> {
     const operation = request.operation;
     if (typeof operation !== "string") failure("request operation is missing");
     const controller = new AbortController();
@@ -1236,7 +1275,10 @@ export class HttpWorkerTransport implements WorkerTransport {
     ) {
       failure("request timeout is invalid");
     }
-    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+    const abort = () => controller.abort();
+    if (signal?.aborted) abort();
+    signal?.addEventListener("abort", abort, { once: true });
+    const timeout = setTimeout(abort, this.timeoutMs);
     try {
       const response = await fetch(this.config.endpoint, {
         method: "POST",
@@ -1277,6 +1319,8 @@ export class HttpWorkerTransport implements WorkerTransport {
       failure("request could not be completed");
     } finally {
       clearTimeout(timeout);
+      signal?.removeEventListener("abort", abort);
     }
+    throw new Error("unreachable");
   }
 }

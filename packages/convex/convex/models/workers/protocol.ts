@@ -158,6 +158,14 @@ export type WorkerRequest =
       operation: "source.status";
     })
   | (WorkerSourceRequest & {
+      operation: "diagnostics.status";
+    })
+  | (WorkerSourceRequest & {
+      operation: "diagnostics.heartbeat";
+      watcherId: string;
+      connectorVersion: string;
+    })
+  | (WorkerSourceRequest & {
       operation: "archive.forgetTargets";
       requestId: string;
       sourceItemId: string;
@@ -426,6 +434,37 @@ export type WorkerSourceStatusResult = {
       };
   processing: WorkerProcessingStatus;
   recordCoverage: "not_established";
+};
+
+export type WorkerDiagnosticsWatcher =
+  | { state: "not_configured" }
+  | { state: "awaiting_heartbeat"; watcherId: string }
+  | {
+      state: "current" | "overdue";
+      watcherId: string;
+      lastSeenAt: number;
+      nextExpectedAt: number;
+    };
+
+export type WorkerDiagnosticsIncident =
+  | { state: "none" }
+  | { state: "open"; kind: "missing_worker"; openedAt: number };
+
+export type WorkerDiagnosticsStatusResult = {
+  operation: "diagnostics.status";
+  diagnosticsVersion: 1;
+  sourceAccountId: string;
+  source: "enabled";
+  watcher: WorkerDiagnosticsWatcher;
+  incident: WorkerDiagnosticsIncident;
+};
+
+export type WorkerDiagnosticsHeartbeatResult = {
+  operation: "diagnostics.heartbeat";
+  sourceAccountId: string;
+  watcherId: string;
+  receivedAt: number;
+  nextExpectedAt: number;
 };
 
 export type WorkerInventoryItem =
@@ -785,6 +824,8 @@ export type WorkerArchiveAckDeletionResult = WorkerArchiveDeletionAckSummary & {
 
 export type WorkerResult =
   | WorkerSourceStatusResult
+  | WorkerDiagnosticsStatusResult
+  | WorkerDiagnosticsHeartbeatResult
   | WorkerArchiveForgetTargetsResult
   | WorkerArchiveAckDeletionResult
   | WorkerInventoryPageResult
@@ -1333,6 +1374,17 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
     case "source.status":
       exactKeys(input, baseKeys);
       return { ...base, operation: "source.status" };
+    case "diagnostics.status":
+      exactKeys(input, baseKeys);
+      return { ...base, operation: "diagnostics.status" };
+    case "diagnostics.heartbeat":
+      exactKeys(input, [...baseKeys, "watcherId", "connectorVersion"]);
+      return {
+        ...base,
+        operation: "diagnostics.heartbeat",
+        watcherId: string(input.watcherId, { maxUtf16: 36, pattern: UUID }),
+        connectorVersion: string(input.connectorVersion, { maxUtf8: 100 }),
+      };
     case "archive.forgetTargets":
       exactKeys(input, [
         ...baseKeys,

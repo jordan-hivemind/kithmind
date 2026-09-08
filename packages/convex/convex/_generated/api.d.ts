@@ -27,6 +27,11 @@ import type * as models_apiKeys_validators from "../models/apiKeys/validators.js
 import type * as models_coverage_model from "../models/coverage/model.js";
 import type * as models_coverage_tables from "../models/coverage/tables.js";
 import type * as models_coverage_validators from "../models/coverage/validators.js";
+import type * as models_diagnostics_model from "../models/diagnostics/model.js";
+import type * as models_diagnostics_private from "../models/diagnostics/private.js";
+import type * as models_diagnostics_public from "../models/diagnostics/public.js";
+import type * as models_diagnostics_tables from "../models/diagnostics/tables.js";
+import type * as models_diagnostics_validators from "../models/diagnostics/validators.js";
 import type * as models_documents_mcpActions from "../models/documents/mcpActions.js";
 import type * as models_documents_mcpQueries from "../models/documents/mcpQueries.js";
 import type * as models_documents_model from "../models/documents/model.js";
@@ -178,6 +183,11 @@ declare const fullApi: ApiFromModules<{
   "models/coverage/model": typeof models_coverage_model;
   "models/coverage/tables": typeof models_coverage_tables;
   "models/coverage/validators": typeof models_coverage_validators;
+  "models/diagnostics/model": typeof models_diagnostics_model;
+  "models/diagnostics/private": typeof models_diagnostics_private;
+  "models/diagnostics/public": typeof models_diagnostics_public;
+  "models/diagnostics/tables": typeof models_diagnostics_tables;
+  "models/diagnostics/validators": typeof models_diagnostics_validators;
   "models/documents/mcpActions": typeof models_documents_mcpActions;
   "models/documents/mcpQueries": typeof models_documents_mcpQueries;
   "models/documents/model": typeof models_documents_model;

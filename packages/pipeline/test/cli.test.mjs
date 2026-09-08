@@ -6,7 +6,23 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { argumentsFor } from "../dist/cli.js";
+import { argumentsFor, runWatch } from "../dist/cli.js";
+
+const watchConfig = {
+  protocolVersion: 1,
+  endpoint: "http://127.0.0.1:3100/api/worker",
+  spaceId: "space",
+  sourceAccountId: "source",
+  credentialEnv: "PIPELINE_TOKEN",
+  roots: [{ alias: "fixture", path: "/tmp/fixture" }],
+  journalDir: "/tmp/journal",
+  watchIntervalMs: 1_000,
+  maxFiles: 1,
+  maxDepth: 1,
+  maxFileBytes: 1,
+};
+
+const watcherId = "11111111-1111-4111-8111-111111111111";
 
 test("the root pnpm alias forwarding separator is consumed exactly once", () => {
   assert.deepEqual(
@@ -99,4 +115,110 @@ test("invocation through a symlink still runs the CLI", async () => {
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("a contended or unsafe journal sends no heartbeat", async () => {
+  for (const reason of ["contended", "unsafe"]) {
+    let transportCalls = 0;
+    await assert.rejects(
+      () =>
+        runWatch("ignored", {
+          loadConfig: async () => watchConfig,
+          credential: () => "synthetic-credential",
+          openJournal: async () => {
+            throw new Error(reason);
+          },
+          transport: () => ({
+            call: async () => {
+              transportCalls += 1;
+              throw new Error("must not heartbeat");
+            },
+          }),
+        }),
+      new RegExp(reason),
+    );
+    assert.equal(transportCalls, 0);
+  }
+});
+
+test("a changed quiescent credential cannot heartbeat before journal reauthorization", async () => {
+  let closed = false;
+  let transportCalls = 0;
+  await assert.rejects(
+    runWatch("ignored", {
+      loadConfig: async () => watchConfig,
+      credential: () => "replacement-synthetic-credential",
+      openJournal: async () => ({
+        watcherId,
+        credentialStatus: "changed_quiescent",
+        close: async () => {
+          closed = true;
+        },
+      }),
+      transport: () => ({
+        call: async () => {
+          transportCalls += 1;
+        },
+      }),
+    }),
+    /credential recovery is required/,
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(closed, true);
+  assert.equal(transportCalls, 0);
+});
+
+test("stopping watch during a pass stops future heartbeats and closes its journal", async () => {
+  const stop = new AbortController();
+  let heartbeatCalls = 0;
+  let closed = false;
+  let started;
+  let heartbeatStarted;
+  const passStarted = new Promise((resolve) => {
+    started = resolve;
+  });
+  const firstHeartbeat = new Promise((resolve) => {
+    heartbeatStarted = resolve;
+  });
+  const watch = runWatch("ignored", {
+    signal: stop.signal,
+    loadConfig: async () => watchConfig,
+    credential: () => "synthetic-credential",
+    openJournal: async () => ({
+      watcherId,
+      credentialStatus: "current",
+      close: async () => {
+        closed = true;
+      },
+    }),
+    transport: () => ({
+      call: async (request) => {
+        heartbeatCalls += 1;
+        heartbeatStarted();
+        return {
+          operation: "diagnostics.heartbeat",
+          sourceAccountId: "source",
+          watcherId: request.watcherId,
+          receivedAt: 1,
+          nextExpectedAt: 180_001,
+        };
+      },
+    }),
+    executePass: async () => {
+      started();
+      await new Promise((resolve) =>
+        stop.signal.addEventListener("abort", resolve, { once: true }),
+      );
+      return { state: "complete" };
+    },
+    write: () => undefined,
+  });
+  await passStarted;
+  await firstHeartbeat;
+  assert.equal(heartbeatCalls, 1);
+  stop.abort();
+  await watch;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(heartbeatCalls, 1);
+  assert.equal(closed, true);
 });

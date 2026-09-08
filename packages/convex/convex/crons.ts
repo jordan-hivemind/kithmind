@@ -1,7 +1,6 @@
 import { cronJobs } from "convex/server";
 import { internal } from "./_generated/api";
 
-
 const crons = cronJobs();
 
 crons.interval(
@@ -22,6 +21,13 @@ crons.interval(
   "remove expired worker protocol state",
   { minutes: 5 },
   internal.models.workers.cleanup.removeExpired,
+  {},
+);
+
+crons.interval(
+  "detect missing filesystem workers",
+  { minutes: 1 },
+  internal.models.diagnostics.private.sweepMissingWorkers,
   {},
 );
 

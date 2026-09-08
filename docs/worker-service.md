@@ -15,7 +15,18 @@ pnpm --silent brain:doctor -- --config /absolute/path/to/pipeline.json --json
 The doctor reports `ready`, `degraded`, or `blocked`. It checks the worker
 configuration and local prerequisites without an admin credential. Resolve a
 blocked result before continuing. A ready result does not establish unattended
-health; cloud-visible daemon monitoring and the recovery drill remain P2-4.
+health. The `watch` command sends one cloud heartbeat every 30 seconds,
+including while a pass is running. The server considers it overdue after 180
+seconds. A fresh heartbeat proves only authorized worker-to-gateway
+reachability. It does not prove file access, queue coverage, record
+completeness, or a supervised process. `run` and `doctor` never send
+heartbeats.
+
+After rotating a credential with a quiescent journal, use one authorized
+`run` to validate and accept the replacement before restarting `watch`.
+Watch refuses an unaccepted credential binding before sending a heartbeat.
+An interrupted active journal still requires explicit credential recovery;
+do not delete its pending state.
 
 Keep the pipeline configuration, journal, credential material, wrapper, and
 logs outside the repository. Use absolute paths throughout the templates. The
@@ -181,8 +192,7 @@ separate host policy decision and may require administrator authorization.
 
 The unit and wrapper both set a restrictive umask and use a 30-second restart
 delay. Service-manager status proves only that a process is supervised. Use
-the worker doctor and authorized source status for point-in-time checks; P2-4
-still owns cloud-visible liveness and recovery verification.
+the worker doctor and authorized source status for point-in-time checks.
 
 ## Template validation
 
