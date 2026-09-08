@@ -1,7 +1,100 @@
 import { v } from "convex/values";
+import type { Id } from "../../_generated/dataModel";
 import { internalMutation, type MutationCtx } from "../../_generated/server";
 import { requireWorkerSourceAccount } from "./auth";
 import { requireCurrentDiscovery, validateAdmittedChain } from "./discovery";
+
+const FORGOTTEN_REPAIR_LIMIT = 25;
+
+export async function repairForgottenProcessingStatePage(
+  ctx: MutationCtx,
+  args: { sourceItemId: Id<"sourceItems">; dryRun: boolean },
+) {
+  const item = await ctx.db.get(args.sourceItemId);
+  if (!item || item.lifecycle !== "forgotten") {
+    throw new Error("Repair requires one forgotten source item");
+  }
+  const account = await ctx.db.get(item.sourceAccountId);
+  if (!account || account.spaceId !== item.spaceId) {
+    throw new Error("Forgotten source item parent chain is invalid");
+  }
+  let remaining = FORGOTTEN_REPAIR_LIMIT;
+  const counts = {
+    workerBinaryOperationReceipts: 0,
+    workerParsedStages: 0,
+    processingGenerationPayloadManifests: 0,
+  };
+  let phase: keyof typeof counts | "complete" = "complete";
+  let exhausted = false;
+
+  const inspect = async (
+    table: keyof typeof counts,
+    rows: Array<{
+      _id: Id<
+        | "workerBinaryOperationReceipts"
+        | "workerParsedStages"
+        | "processingGenerationPayloadManifests"
+      >;
+      spaceId: Id<"spaces">;
+      sourceAccountId: Id<"sourceAccounts">;
+    }>,
+  ) => {
+    if (rows.length > 0 && phase === "complete") phase = table;
+    counts[table] = rows.length;
+    for (const row of rows) {
+      if (
+        row.spaceId !== item.spaceId ||
+        row.sourceAccountId !== item.sourceAccountId
+      ) {
+        throw new Error("Forgotten processing row parent chain is invalid");
+      }
+      if (!args.dryRun) await ctx.db.delete(row._id);
+    }
+    remaining -= rows.length;
+    if (remaining === 0) exhausted = true;
+  };
+
+  const binaryReceipts = await ctx.db
+    .query("workerBinaryOperationReceipts")
+    .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+    .take(remaining);
+  await inspect("workerBinaryOperationReceipts", binaryReceipts);
+  if (remaining > 0) {
+    const parsedStages = await ctx.db
+      .query("workerParsedStages")
+      .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+      .take(remaining);
+    await inspect("workerParsedStages", parsedStages);
+  } else exhausted = true;
+  if (remaining > 0) {
+    const manifests = await ctx.db
+      .query("processingGenerationPayloadManifests")
+      .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+      .take(remaining);
+    await inspect("processingGenerationPayloadManifests", manifests);
+  } else exhausted = true;
+  const affected = FORGOTTEN_REPAIR_LIMIT - remaining;
+  return {
+    dryRun: args.dryRun,
+    phase,
+    counts,
+    affected,
+    deleted: args.dryRun ? 0 : affected,
+    done: affected === 0 || (!args.dryRun && !exhausted),
+  };
+}
+
+export const repairForgottenProcessingState = internalMutation({
+  args: {
+    sourceItemId: v.id("sourceItems"),
+    dryRun: v.optional(v.boolean()),
+  },
+  handler: (ctx, args) =>
+    repairForgottenProcessingStatePage(ctx, {
+      sourceItemId: args.sourceItemId,
+      dryRun: args.dryRun ?? true,
+    }),
+});
 
 /** Upgrade queued B1 admissions without changing their authority or content. */
 export async function backfillManagedJobsPage(
