@@ -844,16 +844,16 @@ function assertBackendProcess(backend, backendPort, sitePort) {
   return listeners.length;
 }
 
-function captureStream(stream) {
+function captureStream(stream, maximumBytes = LIMITS.commandOutputBytes) {
   const chunks = [];
   let bytes = 0;
   let truncated = false;
   stream.on("data", (chunk) => {
-    if (bytes >= LIMITS.commandOutputBytes) {
+    if (bytes >= maximumBytes) {
       truncated = true;
       return;
     }
-    const kept = chunk.subarray(0, LIMITS.commandOutputBytes - bytes);
+    const kept = chunk.subarray(0, maximumBytes - bytes);
     chunks.push(kept);
     bytes += kept.length;
     if (kept.length !== chunk.length) truncated = true;
@@ -881,23 +881,125 @@ function redact(bytes, secrets) {
   return value;
 }
 
-function runConvexCli({ cli, arguments_, cwd, environment, logName, secrets }) {
-  const result = spawnSync(process.execPath, [cli, ...arguments_], {
+const CHILD_WAIT_TIMEOUT = Symbol("child_wait_timeout");
+
+async function settleWithin(promise, milliseconds) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((resolveTimeout) => {
+        timer = setTimeout(
+          () => resolveTimeout(CHILD_WAIT_TIMEOUT),
+          milliseconds,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function signalChildGroup(child, signal) {
+  if (!child.pid) return;
+  try {
+    process.kill(-child.pid, signal);
+  } catch {
+    try {
+      child.kill(signal);
+    } catch {
+      // The terminal-state check below determines whether cleanup succeeded.
+    }
+  }
+}
+
+export async function runBoundedChild({
+  command,
+  arguments_,
+  cwd,
+  environment,
+  timeoutMs,
+  killGraceMs = 3_000,
+  outputBytes = LIMITS.commandOutputBytes,
+}) {
+  const child = spawn(command, arguments_, {
     cwd,
     env: environment,
     stdio: ["ignore", "pipe", "pipe"],
-    timeout: 180_000,
-    maxBuffer: LIMITS.commandOutputBytes,
+    detached: true,
+  });
+  const getSpawnError = captureChildSpawnError(child);
+  const readStdout = captureStream(child.stdout, outputBytes);
+  const readStderr = captureStream(child.stderr, outputBytes);
+  const closed = new Promise((resolveClose) => {
+    child.once("close", (status, signal) => {
+      resolveClose({ kind: "close", status, signal });
+    });
+    child.once("error", () => {
+      resolveClose({ kind: "spawn_error", status: null, signal: null });
+    });
+  });
+
+  let outcome = await settleWithin(closed, timeoutMs);
+  const timedOut = outcome === CHILD_WAIT_TIMEOUT;
+  if (timedOut) {
+    signalChildGroup(child, "SIGTERM");
+    outcome = await settleWithin(closed, killGraceMs);
+    if (outcome === CHILD_WAIT_TIMEOUT) {
+      signalChildGroup(child, "SIGKILL");
+      outcome = await settleWithin(closed, killGraceMs);
+    }
+  }
+  const stopped =
+    !child.pid || child.exitCode !== null || child.signalCode !== null;
+  return {
+    status:
+      outcome !== CHILD_WAIT_TIMEOUT && outcome.kind === "close"
+        ? outcome.status
+        : child.exitCode,
+    signal:
+      outcome !== CHILD_WAIT_TIMEOUT && outcome.kind === "close"
+        ? outcome.signal
+        : child.signalCode,
+    spawnError: getSpawnError(),
+    timedOut,
+    stopped,
+    stdout: readStdout(),
+    stderr: readStderr(),
+  };
+}
+
+async function runConvexCli({
+  cli,
+  arguments_,
+  cwd,
+  environment,
+  logName,
+  secrets,
+}) {
+  const result = await runBoundedChild({
+    command: process.execPath,
+    arguments_: [cli, ...arguments_],
+    cwd,
+    environment,
+    timeoutMs: 180_000,
   });
   writePrivate(
     join(cwd, `${logName}.stdout.log`),
-    redact(result.stdout ?? Buffer.alloc(0), secrets),
+    redact(result.stdout, secrets),
   );
   writePrivate(
     join(cwd, `${logName}.stderr.log`),
-    redact(result.stderr ?? Buffer.alloc(0), secrets),
+    redact(result.stderr, secrets),
   );
-  if (result.status !== 0 || result.error) fail(`${logName}_failed`);
+  if (
+    result.status !== 0 ||
+    result.spawnError ||
+    result.timedOut ||
+    !result.stopped
+  ) {
+    fail(`${logName}_failed`);
+  }
   return result.stdout.toString("utf8");
 }
 
@@ -1120,7 +1222,7 @@ export async function runVerification(options, environment = process.env) {
     result.stage = "schema_deploy";
     assertSchemaOnlyLayout(outputDirectory);
     assertBackendProcess(backend, options.backendPort, options.sitePort);
-    runConvexCli({
+    await runConvexCli({
       cli,
       arguments_: ["deploy", "--typecheck", "disable", "--codegen", "disable"],
       cwd: outputDirectory,
@@ -1130,7 +1232,7 @@ export async function runVerification(options, environment = process.env) {
     });
     assertBackendProcess(backend, options.backendPort, options.sitePort);
     const specification = JSON.parse(
-      runConvexCli({
+      await runConvexCli({
         cli,
         arguments_: ["function-spec"],
         cwd: outputDirectory,
@@ -1156,7 +1258,7 @@ export async function runVerification(options, environment = process.env) {
       "staged_snapshot",
       LIMITS.snapshotBytes,
     );
-    runConvexCli({
+    await runConvexCli({
       cli,
       arguments_: ["import", "--replace-all", "--yes", stagedSnapshot],
       cwd: outputDirectory,
@@ -1176,7 +1278,7 @@ export async function runVerification(options, environment = process.env) {
     assertBackendProcess(backend, options.backendPort, options.sitePort);
     const restoredSnapshot = join(outputDirectory, "restored-snapshot.zip");
     if (existsSync(restoredSnapshot)) fail("restored_snapshot_exists");
-    runConvexCli({
+    await runConvexCli({
       cli,
       arguments_: [
         "export",

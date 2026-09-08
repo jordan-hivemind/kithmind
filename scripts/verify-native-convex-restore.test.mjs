@@ -28,6 +28,7 @@ import {
   parseArguments,
   prepareOutputDirectory,
   readBoundedZip,
+  runBoundedChild,
   validateAndStageBackend,
   waitForBackend,
 } from "./verify-native-convex-restore.mjs";
@@ -323,6 +324,48 @@ test("backend spawn errors become a bounded startup failure", async () => {
   await assert.rejects(waitForBackend(child, 33232, getSpawnError), {
     message: "backend_start_failed",
   });
+});
+
+test("bounded child execution live-drains and truncates large output", async () => {
+  const outputBytes = 64 * 1024;
+  const result = await runBoundedChild({
+    command: process.execPath,
+    arguments_: [
+      "-e",
+      "const b=Buffer.alloc(65536,120);for(let i=0;i<4;i+=1){process.stdout.write(b);process.stderr.write(b);}",
+    ],
+    cwd: realpathSync(tmpdir()),
+    environment: { PATH: process.env.PATH },
+    timeoutMs: 5_000,
+    killGraceMs: 100,
+    outputBytes,
+  });
+  assert.equal(result.status, 0);
+  assert.equal(result.spawnError, undefined);
+  assert.equal(result.timedOut, false);
+  assert.equal(result.stopped, true);
+  for (const output of [result.stdout, result.stderr]) {
+    assert.ok(output.length <= outputBytes + 32);
+    assert.match(output.toString("utf8"), /\[output truncated\]/u);
+  }
+});
+
+test("bounded child execution kills a process that ignores its timeout signal", async () => {
+  const result = await runBoundedChild({
+    command: process.execPath,
+    arguments_: [
+      "-e",
+      "process.on('SIGTERM',()=>{});setInterval(()=>{},1000);",
+    ],
+    cwd: realpathSync(tmpdir()),
+    environment: { PATH: process.env.PATH },
+    timeoutMs: 250,
+    killGraceMs: 100,
+    outputBytes: 1024,
+  });
+  assert.equal(result.timedOut, true);
+  assert.equal(result.stopped, true);
+  assert.equal(result.signal, "SIGKILL");
 });
 
 test("native-style small ZIP64 snapshots preserve rows, storage metadata, and file bytes", () => {
