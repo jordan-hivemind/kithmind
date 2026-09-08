@@ -20,6 +20,27 @@ MAX_PAGES = 64
 MAX_RESULT_BYTES = 64 * 1024 * 1024
 
 
+def _provenance_whitespace_only(value: str) -> bool:
+    """Match the Unicode White_Space property without runtime-specific extras."""
+    return all(
+        0x0009 <= ord(char) <= 0x000D
+        or ord(char)
+        in {
+            0x0020,
+            0x0085,
+            0x00A0,
+            0x1680,
+            0x2028,
+            0x2029,
+            0x202F,
+            0x205F,
+            0x3000,
+        }
+        or 0x2000 <= ord(char) <= 0x200A
+        for char in value
+    )
+
+
 def _locator(provenance: Any) -> dict[str, Any]:
     if hasattr(provenance, "model_dump"):
         return provenance.model_dump(mode="json", exclude_none=True)
@@ -46,6 +67,40 @@ def _append_segment(
             "locator": locator,
         }
     )
+
+
+def _same_page_text_provenance(
+    provenance: list[Any], text: str, pages: dict[int, dict[str, Any]]
+) -> int | None:
+    """Return the page when every span truthfully covers one item's text."""
+    if not 1 <= len(provenance) <= 256:
+        return None
+    page_numbers = {getattr(prov, "page_no", None) for prov in provenance}
+    if len(page_numbers) != 1:
+        return None
+    page_number = next(iter(page_numbers))
+    if page_number not in pages:
+        return None
+    if len(provenance) == 1:
+        return (
+            page_number
+            if tuple(getattr(provenance[0], "charspan", ()) or ()) != (0, 0)
+            else None
+        )
+    prior_end = 0
+    for prov in provenance:
+        charspan = tuple(getattr(prov, "charspan", ()) or ())
+        if (
+            len(charspan) != 2
+            or any(type(offset) is not int for offset in charspan)
+            or not 0 <= prior_end <= charspan[0] < charspan[1] <= len(text)
+            or not _provenance_whitespace_only(text[prior_end : charspan[0]])
+        ):
+            return None
+        prior_end = charspan[1]
+    if not _provenance_whitespace_only(text[prior_end:]):
+        return None
+    return page_number
 
 
 def _docling_normalized(
@@ -138,15 +193,14 @@ def _docling_normalized(
             )
             continue
         if isinstance(item, TextItem):
-            valid = (
-                len(provenance) == 1
-                and getattr(provenance[0], "page_no", None) in pages
-                and tuple(getattr(provenance[0], "charspan", ())) != (0, 0)
-            )
-            if not valid:
+            # Empty parser items carry no content to retain and therefore do not
+            # create a mapping gap, regardless of their provenance shape.
+            if not normalize_text(item.text).strip("\n"):
+                continue
+            page_number = _same_page_text_provenance(provenance, item.text, pages)
+            if page_number is None:
                 gaps.append({"kind": "ambiguous_text_provenance", "item": item_index})
                 continue
-            page_number = provenance[0].page_no
             _append_segment(
                 pages[page_number],
                 item.text,
@@ -154,7 +208,11 @@ def _docling_normalized(
                 {
                     "kind": "docling_item",
                     "itemRef": str(getattr(item, "self_ref", "")),
-                    "provenance": _locator(provenance[0]),
+                    "provenance": (
+                        _locator(provenance[0])
+                        if len(provenance) == 1
+                        else [_locator(prov) for prov in provenance]
+                    ),
                     "doclingCharspanSemantics": "item_local_python_codepoints_not_evidence",
                 },
             )

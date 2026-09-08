@@ -64,6 +64,7 @@ import {
   removeParserProfileWorkDirectoryExact,
   removeParserOutputExact,
   runCapturedPdfParser,
+  ParserProcessError,
   type DurableParserOutputArtifacts,
   type ParserOutputIntent,
   type PreparedPdfDocQaProfile,
@@ -120,6 +121,36 @@ const MAX_RESERVATION_ROUNDS = 64;
 const MAX_ASSESSMENT_PAGES = 4_096;
 const LEASE_SAFETY_MARGIN_MS = 30_000;
 const MAX_ARCHIVED_RESERVATION_ROUNDS = 64;
+
+const SAFE_PARSER_FAILURE_CODES = new Set([
+  "unsupported_platform",
+  "invalid_input",
+  "unsafe_path",
+  "executable_mismatch",
+  "model_lock_mismatch",
+  "destination_exists",
+  "sandbox_failed",
+  "network_not_denied",
+  "process_escape_not_denied",
+  "process_timeout",
+  "cpu_limit_exceeded",
+  "monitor_failed",
+  "monitored_rss_exceeded",
+  "process_count_exceeded",
+  "output_limit_exceeded",
+  "conversion_failed",
+  "output_invalid",
+  "execution_prerequisite_missing",
+  "input_digest_mismatch",
+  "invalid_opaque_name",
+  "runtime_mismatch",
+  "model_assets_invalid",
+  "conversion_output_invalid",
+  "page_limit_exceeded",
+  "retained_text_too_large",
+  "lossless_output_too_large",
+  "bundle_too_large",
+] as const);
 
 type ArchivedCheckpoint = Extract<RunnerCheckpoint, { phase: "archived" }>;
 
@@ -4785,7 +4816,10 @@ export class PipelineRunner {
           error instanceof FilesystemFailure ||
           error instanceof PipelineWorkerError
             ? error.code
-            : "worker_failed",
+            : error instanceof ParserProcessError &&
+                SAFE_PARSER_FAILURE_CODES.has(error.code)
+              ? error.code
+              : "worker_failed",
       };
     }
   }
