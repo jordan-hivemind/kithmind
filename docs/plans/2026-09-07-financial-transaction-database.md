@@ -139,13 +139,13 @@ transactions(id, account_id, trade_date, process_date, settle_date,
 
 positions(id, account_id, as_of, instrument_id, quantity, price,
           market_value, cost_basis, unrealized, currency,
-          valuation_basis, valuation_note, source_document_id)
+          valuation_basis, valuation_note, source_document_id, source_locator)
 
 balances(id, account_id, as_of, total_value, cash, currency,
-         period_start_value, period_end_value, source_document_id)
+         period_start_value, period_end_value, source_document_id, source_locator)
 
 liabilities(id, institution_id, account_id, kind, display_name, balance,
-            currency, rate, as_of, collateral_note, source_document_id)
+            currency, rate, as_of, collateral_note, source_document_id, source_locator)
 
 commitments(id, account_id, instrument_id, committed, called, outstanding,
             distributed, currency, committed_original, currency_original,
@@ -159,7 +159,11 @@ import_runs(id, started_at, finished_at, source, files_seen, rows_inserted,
             review_items, notes)
 
 reconciliations(id, account_id, period_start, period_end, expected_change,
-                computed_change, delta, status, notes)
+                computed_change, delta, currency, tolerance, status, notes)
+
+position_reconciliations(id, account_id, instrument_id, period_start, period_end,
+                         expected_change, computed_change, delta, tolerance,
+                         status, notes)
 
 review_items(id, kind, account_id, source_document_id, source_locator,
              raw_value, reason, status, resolved_at, resolution_note)
@@ -220,6 +224,61 @@ not a hard failure. A commitment ledger legitimately records a scheduled future
 call, and a mistyped year in a hand-maintained source is a correction to
 surface rather than a reason to abort an import.
 
+## Holdings and how they are validated
+
+Holdings are v1. They arrive from two independent directions and the two must
+not be conflated.
+
+**Stated holdings** are the positions, balances and liabilities parsed from a
+statement. They are authoritative, they are what the archive reports, and every
+row cites the document it came from.
+
+**Derived holdings** are quantity per instrument replayed from transactions.
+They are a gate, not a second source of truth. The archive never reports a
+derived holding as fact.
+
+The gate is the position-side analogue of the cash reconciliation above. Cash
+compares a stated balance change against summed transaction amounts. Positions
+compare a stated quantity change against summed transaction quantities, per
+instrument, per period.
+
+Three constraints keep it from failing constantly and being ignored, which is
+the only way a gate really dies:
+
+- **Anchor on the prior stated position, never on zero.** Acquired history
+  rarely reaches the account's opening, so a comparison derived from zero would
+  fail every period forever and teach everyone to skip it. Reconcile the change
+  between two consecutive snapshots, exactly as the cash gate diffs two balance
+  snapshots. A mismatch then means a missing or duplicated transaction inside
+  that window, which is a real finding.
+- **Quantity only. Cost basis is not gated.** Quantity is additive and exactly
+  reconcilable. Cost basis depends on lot selection, wash sales, return of
+  capital and the provider's own adjustments, and tax-lot matching is deferred.
+  Record a stated basis, route divergence to review, and never fail a period on
+  it.
+- **Corporate actions are the position-side equivalent of an activity that
+  moves no cash.** A split changes quantity with no transaction behind it.
+  Under an exact tolerance those periods fail until the action is modelled,
+  which is the gate surfacing a modelling gap rather than absorbing one.
+
+A quantity reconciliation also reports coverage rather than only correctness.
+When derived change cannot explain stated change because history does not reach
+far enough back, that is a measurement of how much history is missing, and it
+belongs in coverage rather than being silently tolerated.
+
+The gate writes to `position_reconciliations`, not to `reconciliations`. The
+two tables are separate because cash change is integer minor units and quantity
+change is canonical decimal text, and the storage-class checks that keep a
+float out are per column. Keeping them apart also keeps a cash verdict and a
+position verdict distinguishable: one table would make every existing query for
+unverified periods return per-instrument rows instead. `get_coverage` reports
+position periods as status counts per account plus whether transaction history
+begins after the account's first stated position, which is the coverage gap
+measured rather than tolerated.
+
+Ongoing maintenance needs no browser session. A statement carries both its
+positions table and its activity table, so each new document reconciles itself.
+
 ## Access for assistants
 
 v1 exposes a local read-only MCP server over the archive file:
@@ -274,6 +333,18 @@ that answers before it reconciles answers confidently and wrongly.
 | F1-5 | First real institution adapter and initial acquisition | Full available retention window acquired to the raw tree with an acquisition manifest. Structured and tabular sources cross-checked against each other. Every pull reconciled against the provider's reported total. |
 | F1-6 | Local read-only MCP server                             | The four tools above. Read-only enforcement tested against write, attach and file-access attempts. Coverage and completeness states verified against a deliberately partial fixture.                                 |
 | F1-7 | Remaining institution adapters                         | Each declares capabilities, ships fixtures, and records its quirks. An institution with a clean tabular export uses it and skips API work.                                                                           |
+
+Three tasks were added after the original sequence, because building F1-1
+through F1-7 in parallel left responsibilities that no single task owned.
+
+| Task  | Deliverable                           | Why it was missing                                                                                                                                                                                               |
+| ----- | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| F1-16 | Holdings extraction and import        | Holdings are v1, but F1-2 returned activity rows only, F1-3 imported only transactions, and F1-4 reads `balances` that nothing wrote. The gate had no input on real data.                                        |
+| F1-17 | Position quantity reconciliation gate | The validation half of holdings, described above.                                                                                                                                                                |
+| F1-18 | Raw tree writer                       | Provenance linkage was complete but nothing persisted acquired bytes, so `documents.file_path` recorded a path no code created and `text_path` was never populated. Evidence pointed at files that did not exist. |
+
+The pattern is worth recording rather than only fixing: each gap sat exactly
+where two parallel tasks met, and each was invisible from inside either one.
 
 v1 is done when a single query against the archive reproduces, with no browser:
 fees paid over a trailing twelve months by account and fee type; every purchase

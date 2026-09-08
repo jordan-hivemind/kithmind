@@ -106,6 +106,7 @@ test("migrations create the schema and record the applied version", (t) => {
     "institutions",
     "instruments",
     "liabilities",
+    "position_reconciliations",
     "positions",
     "reconciliations",
     "review_items",

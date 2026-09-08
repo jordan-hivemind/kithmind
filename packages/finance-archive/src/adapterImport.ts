@@ -18,27 +18,57 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
-import type { AcquiredDocument, ParsedInstrument, ParsedRow } from "./adapter.js";
-import { sha256Hex } from "./adapter.js";
+import type {
+  AcquiredDocument,
+  ParsedBalance,
+  ParsedHoldings,
+  ParsedInstrument,
+  ParsedLiability,
+  ParsedPosition,
+  ParsedRow,
+} from "./adapter.js";
+import { EMPTY_HOLDINGS, sha256Hex } from "./adapter.js";
 import { canonicalizeDecimal } from "./decimal.js";
-import type { ImportDocument, ImportRow } from "./importer.js";
+import type {
+  ImportBalance,
+  ImportDocument,
+  ImportLiability,
+  ImportPosition,
+  ImportRow,
+} from "./importer.js";
 import { toMinorUnits } from "./money.js";
+import {
+  type ManifestWriteResult,
+  type RawTreeWriteResult,
+  writeRawDocument,
+  writeRawDocumentManifest,
+  writeRetainedText,
+} from "./rawTree.js";
 import { contentKey, rowHash } from "./rowHash.js";
 
 /**
  * One acquired-and-parsed pull, ready to become one or more `ImportDocument`s.
- * `filePath` is where the whole pull's raw bytes live (or will live) in the
- * raw tree; writing them there is the caller's job, same as the importer's
- * own `ImportDocument.filePath`.
+ * `persisted` is the raw tree's own record of where this pull's bytes (and
+ * any retained text) actually live -- the *only* way to get one is to call
+ * `persistAcquiredDocument` first, which is what makes it structurally
+ * impossible to build an `AdapterPull` around a `filePath` nothing ever
+ * wrote (this is exactly the bug F1-18 exists to fix; see
+ * `persistAcquiredDocument`'s doc comment below).
+ *
+ * `holdings` defaults to `EMPTY_HOLDINGS` when omitted: most pulls (every
+ * paginated activity feed, every tabular export) carry none, and a caller
+ * building one from an activity-only adapter's `parse()` output does not
+ * need to spell that out.
  */
 export type AdapterPull = {
   readonly institutionId: string;
   readonly accountId: string;
   readonly acquired: AcquiredDocument;
   readonly rows: readonly ParsedRow[];
+  readonly holdings?: ParsedHoldings;
   readonly docType: string;
   readonly docDate: string | null;
-  readonly filePath: string;
+  readonly persisted: PersistedAcquisition;
 };
 
 function insertReviewItem(
@@ -169,11 +199,75 @@ function parsedRowToImportRow(
   };
 }
 
-/** Groups rows by `sourceDocument`, preserving first-seen order and each row's own order within its group. */
-function groupBySourceDocument(
-  rows: readonly ParsedRow[],
-): Map<string, ParsedRow[]> {
-  const groups = new Map<string, ParsedRow[]>();
+/**
+ * Maps one parsed holding to the importer's row shape. `sourceDocument` is
+ * used only for grouping (see `groupBySourceDocument`) and does not appear
+ * on the `Import*` row itself, the same way `ParsedRow.sourceDocument`
+ * never reaches `ImportRow` -- the document it belongs to is expressed by
+ * which `ImportDocument` the row ends up on, not a field on the row.
+ */
+function parsedPositionToImportPosition(
+  db: DatabaseSync,
+  position: ParsedPosition,
+): ImportPosition {
+  return {
+    asOf: position.asOf,
+    instrumentId:
+      position.instrument === null
+        ? null
+        : resolveInstrumentId(db, position.instrument),
+    quantity: position.quantity,
+    price: position.price,
+    marketValueText: position.marketValue,
+    marketValueNote: position.marketValueNote,
+    costBasis: position.costBasis,
+    unrealized: position.unrealized,
+    currency: position.currency,
+    valuationBasis: position.valuationBasis,
+    valuationNote: position.valuationNote,
+    sourceLocator: JSON.stringify(position.locators),
+  };
+}
+
+function parsedBalanceToImportBalance(balance: ParsedBalance): ImportBalance {
+  return {
+    asOf: balance.asOf,
+    totalValueText: balance.totalValue,
+    totalValueNote: balance.totalValueNote,
+    cash: balance.cash,
+    currency: balance.currency,
+    periodStartValue: balance.periodStartValue,
+    periodEndValue: balance.periodEndValue,
+    sourceLocator: JSON.stringify(balance.locators),
+  };
+}
+
+function parsedLiabilityToImportLiability(
+  liability: ParsedLiability,
+): ImportLiability {
+  return {
+    kind: liability.kind,
+    displayName: liability.displayName,
+    balanceText: liability.balance,
+    balanceNote: liability.balanceNote,
+    currency: liability.currency,
+    rate: liability.rate,
+    asOf: liability.asOf,
+    collateralNote: liability.collateralNote,
+    sourceLocator: JSON.stringify(liability.locators),
+  };
+}
+
+/**
+ * Groups rows by `sourceDocument`, preserving first-seen order and each
+ * row's own order within its group. Shared by activity rows and every
+ * holdings row type, all four of which carry `sourceDocument` for exactly
+ * this reason (see `ParsedRow.sourceDocument`'s doc comment).
+ */
+function groupBySourceDocument<T extends { readonly sourceDocument: string }>(
+  rows: readonly T[],
+): Map<string, T[]> {
+  const groups = new Map<string, T[]>();
   for (const row of rows) {
     const group = groups.get(row.sourceDocument);
     if (group) group.push(row);
@@ -256,31 +350,44 @@ function countDistinctRowHashes(
  * checked at all, and ground rule 7 forbids asserting it anyway: this opens
  * a `review_items` entry recording that this pull was never verified,
  * rather than importing it with no mark left behind.
+ *
+ * Holdings (`pull.holdings`) are grouped and attached to `ImportDocument`s
+ * the same way activity rows are, each `ParsedPosition`/`ParsedBalance`/
+ * `ParsedLiability` carrying its own `sourceDocument` so a holding lands on
+ * the right document even when a pull's activity is paginated and its
+ * holdings are not (the normal case: a statement's positions table is never
+ * itself paginated). Ground rule 7's provider-total check above stays scoped
+ * to activity rows -- `reportedRowCount` is a transaction-row count, and
+ * holdings have no analogous provider total to reconcile against.
  */
 export function adapterPullToImportDocuments(
   db: DatabaseSync,
   pull: AdapterPull,
 ): ImportDocument[] {
-  const groups = groupBySourceDocument(pull.rows);
+  const activityGroups = groupBySourceDocument(pull.rows);
+  const holdings = pull.holdings ?? EMPTY_HOLDINGS;
+  const positionGroups = groupBySourceDocument(holdings.positions);
+  const balanceGroups = groupBySourceDocument(holdings.balances);
+  const liabilityGroups = groupBySourceDocument(holdings.liabilities);
   const reportedRowCount = pull.acquired.manifest.reportedRowCount;
 
-  if (groups.size > 1) {
+  if (activityGroups.size > 1) {
     if (reportedRowCount === null) {
       insertReviewItem(db, {
         kind: "unverified_pagination_total",
         accountId: pull.accountId,
         rawValue: pull.acquired.manifest.contentHash,
         reason:
-          `paginated pull split into ${groups.size} page document(s), but the provider ` +
+          `paginated pull split into ${activityGroups.size} page document(s), but the provider ` +
           "reported no total for this pull; completeness cannot be asserted (ground rule 7) " +
           "without a stated total to reconcile against -- treat this pull as unverified",
       });
     } else {
-      const distinct = countDistinctRowHashes(pull.accountId, groups);
+      const distinct = countDistinctRowHashes(pull.accountId, activityGroups);
       if (distinct !== reportedRowCount) {
         throw new Error(
           `adapter pull reported ${reportedRowCount} unique row(s) but ${distinct} distinct ` +
-            `row(s) remain after per-document dedup across ${groups.size} page document(s); ` +
+            `row(s) remain after per-document dedup across ${activityGroups.size} page document(s); ` +
             "refusing to import a pull that does not reconcile against the provider's total " +
             "(ground rule 7)",
         );
@@ -288,9 +395,16 @@ export function adapterPullToImportDocuments(
     }
   }
 
+  const sourceDocuments = new Set<string>([
+    ...activityGroups.keys(),
+    ...positionGroups.keys(),
+    ...balanceGroups.keys(),
+    ...liabilityGroups.keys(),
+  ]);
+  const single = sourceDocuments.size === 1;
+
   const documents: ImportDocument[] = [];
-  for (const [sourceDocument, rows] of groups) {
-    const single = groups.size === 1;
+  for (const sourceDocument of sourceDocuments) {
     documents.push({
       // For a single document this literally is the acquired file's own
       // content hash. A page split has no bytes of its own -- the whole
@@ -304,14 +418,180 @@ export function adapterPullToImportDocuments(
               `${pull.acquired.manifest.contentHash}:${sourceDocument}`,
             ),
           ),
-      filePath: single ? pull.filePath : `${pull.filePath}#${sourceDocument}`,
+      filePath: single
+        ? pull.persisted.filePath
+        : `${pull.persisted.filePath}#${sourceDocument}`,
       institutionId: pull.institutionId,
       accountId: pull.accountId,
       docType: pull.docType,
       docDate: pull.docDate,
       providerReportedCount: single ? reportedRowCount : null,
-      rows: rows.map((row) => parsedRowToImportRow(db, pull.accountId, row)),
+      rows: (activityGroups.get(sourceDocument) ?? []).map((row) =>
+        parsedRowToImportRow(db, pull.accountId, row),
+      ),
+      positions: (positionGroups.get(sourceDocument) ?? []).map((position) =>
+        parsedPositionToImportPosition(db, position),
+      ),
+      balances: (balanceGroups.get(sourceDocument) ?? []).map(
+        parsedBalanceToImportBalance,
+      ),
+      liabilities: (liabilityGroups.get(sourceDocument) ?? []).map(
+        parsedLiabilityToImportLiability,
+      ),
     });
   }
   return documents;
+}
+
+// --- F1-18: raw tree persistence -------------------------------------------
+// `acquire` (adapter.ts) returns bytes and a manifest; nothing before this
+// wrote them anywhere. This is the seam: the one place an adapter pull's raw
+// bytes (and, when the caller has retained it, the document's extracted
+// text) actually get written to the raw tree, before the pull becomes an
+// `AdapterPull.persisted`/`ImportDocument.filePath` that `importBatch`
+// records on the `documents` row. `persistAcquiredDocument` is also the
+// *only* way to produce a `PersistedAcquisition`, which is in turn the only
+// way to fill in `AdapterPull.persisted` -- so a caller cannot build an
+// `AdapterPull` around an invented path, and cannot skip persisting bytes
+// that a document row then claims exist. Self-contained -- it only calls
+// into rawTree.ts and does its own small, targeted write to
+// `documents.text_path` -- so it does not touch `importer.ts`'s insert
+// statement or any other function in this file.
+
+/** Everything needed to persist one acquired document: enough for the raw
+ * tree's manifest sidecar to identify it without the archive database (see
+ * `RawTreeDocumentManifest`), on top of the acquired bytes themselves. */
+export type AcquisitionDescriptor = {
+  readonly institutionId: string;
+  readonly accountId: string;
+  readonly docType: string;
+  readonly acquired: AcquiredDocument;
+  /** Dot-prefixed (".pdf", ".csv"), when the source gave one. Recorded in
+   * the manifest only; the raw bytes stay content-addressed and
+   * extension-less either way. */
+  readonly originalExtension?: string | null;
+};
+
+/** What `persistAcquiredDocument` wrote and where, for the caller to use as
+ * `AdapterPull.persisted` and, after import, as the argument to
+ * `recordRetainedTextPath`. */
+export type PersistedAcquisition = {
+  readonly filePath: string;
+  readonly textPath: string | null;
+  readonly manifestPath: string;
+  readonly documentWrite: RawTreeWriteResult;
+  readonly textWrite: RawTreeWriteResult | null;
+  readonly manifestWrite: ManifestWriteResult;
+};
+
+/**
+ * Persists one acquired document's raw bytes -- and, when supplied, its
+ * retained extracted text -- to the raw tree rooted at `rawTreeRoot`, along
+ * with a manifest sidecar recording what the document is (institution,
+ * account, document type, statement period, capture time, capability tier,
+ * gaps, original extension). The manifest is what makes ground rule 1's
+ * "can be rebuilt from scratch" true in practice: the archive database is
+ * derived data, so if it is ever lost, the raw tree still says what each
+ * file is well enough to re-import, instead of becoming an unlabelled pile
+ * of hashes.
+ *
+ * Write-once throughout: a re-acquisition of identical bytes reports
+ * `status: "already_exists"` on `documentWrite`/`textWrite`/`manifestWrite`
+ * rather than rewriting or raising an error that would abort a run
+ * (requirement 1). See `rawTree.ts` for how the write-once and
+ * hash-verification guarantees are implemented.
+ *
+ * Cross-checks the written sha256 against the adapter's own claimed
+ * `acquired.manifest.contentHash`: an adapter that mis-hashed its own bytes
+ * is exactly the kind of bug provenance exists to catch, not a reason to
+ * store the bytes under a path some other code goes on to trust as if the
+ * two hashes agreed. Institution and account are resolved from the database
+ * by id -- both are foreign keys, so a valid id guarantees a real row exists
+ * to read the institution's slug and the account's last four digits from,
+ * rather than asking every caller to also pass and keep in sync values the
+ * database already has authoritatively.
+ */
+export function persistAcquiredDocument(
+  db: DatabaseSync,
+  rawTreeRoot: string,
+  descriptor: AcquisitionDescriptor,
+  extractedText: string | null = null,
+): PersistedAcquisition {
+  const { institutionId, accountId, docType, acquired, originalExtension = null } = descriptor;
+
+  const documentWrite = writeRawDocument(rawTreeRoot, acquired.bytes);
+  if (documentWrite.sha256 !== acquired.manifest.contentHash) {
+    throw new Error(
+      `acquired document's manifest hash ${acquired.manifest.contentHash} does not match ` +
+        `its bytes' actual sha256 ${documentWrite.sha256}; refusing to persist a document ` +
+        "whose adapter mis-reported its own content hash",
+    );
+  }
+
+  const institution = db
+    .prepare("SELECT slug FROM institutions WHERE id = ?")
+    .get(institutionId) as { slug: string } | undefined;
+  if (!institution) {
+    throw new Error(
+      `no institutions row with id ${institutionId}; provision the institution before ` +
+        "persisting one of its documents",
+    );
+  }
+  const account = db
+    .prepare("SELECT acct_last4 FROM accounts WHERE id = ?")
+    .get(accountId) as { acct_last4: string | null } | undefined;
+  if (!account) {
+    throw new Error(
+      `no accounts row with id ${accountId}; provision the account before persisting one of ` +
+        "its documents",
+    );
+  }
+
+  const manifestWrite = writeRawDocumentManifest(rawTreeRoot, {
+    sha256: documentWrite.sha256,
+    institutionSlug: institution.slug,
+    acctLast4: account.acct_last4,
+    docType,
+    periodStart: acquired.manifest.periodStart,
+    periodEnd: acquired.manifest.periodEnd,
+    capturedAt: acquired.manifest.capturedAt,
+    capabilityTier: acquired.manifest.kind,
+    gaps: acquired.manifest.gaps,
+    originalExtension,
+  });
+
+  const textWrite =
+    extractedText === null ? null : writeRetainedText(rawTreeRoot, extractedText);
+  return {
+    filePath: documentWrite.path,
+    textPath: textWrite?.path ?? null,
+    manifestPath: manifestWrite.path,
+    documentWrite,
+    textWrite,
+    manifestWrite,
+  };
+}
+
+/**
+ * Records the retained-text path on the `documents` row already imported for
+ * `sha256` (the same content hash `persistAcquiredDocument` just verified),
+ * so `get_evidence` can return it. A direct, targeted `UPDATE` rather than a
+ * new field threaded through `ImportDocument`/`importBatch` -- importer.ts's
+ * insert is out of this task's scope -- so this can run any time after the
+ * matching `documents` row exists: immediately after import, or later, for a
+ * document whose text is extracted after the fact.
+ */
+export function recordRetainedTextPath(
+  db: DatabaseSync,
+  sha256: string,
+  textPath: string,
+): void {
+  const result = db
+    .prepare("UPDATE documents SET text_path = ? WHERE sha256 = ?")
+    .run(textPath, sha256);
+  if (result.changes === 0) {
+    throw new Error(
+      `no documents row with sha256 ${sha256}; import the document before recording its retained text path`,
+    );
+  }
 }

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  compareDecimal,
   createSyntheticSession,
   exhaustiveListing,
   incompleteListing,
@@ -126,8 +127,8 @@ test("acquire() records a gap, not a silent truncation, when a page fetch fails 
   // The provider's claimed total survives the failure, so an importer can
   // still see exactly how far short this pull fell.
   assert.equal(typeof acquired.manifest.reportedRowCount, "number");
-  const rows = await syntheticAdapter.parse({ kind: "structured_api", bytes: acquired.bytes });
-  assert.ok(rows.length < acquired.manifest.reportedRowCount);
+  const { activity } = await syntheticAdapter.parse({ kind: "structured_api", bytes: acquired.bytes });
+  assert.ok(activity.length < acquired.manifest.reportedRowCount);
 });
 
 test("acquire() on the tabular export tier records the documented no-total quirk", async () => {
@@ -161,7 +162,7 @@ test("acquire() on a document tier fetches exactly the discovered document and r
   );
 });
 
-test("parse() on overlapping structured-API pages surfaces the raw overlap and tags each row's page", async () => {
+test("parse() on overlapping structured-API pages surfaces the raw overlap and tags each row's page, and declines holdings honestly", async () => {
   const session = createSyntheticSession();
   const acquired = await syntheticAdapter.acquire({
     kind: "structured_api",
@@ -169,8 +170,15 @@ test("parse() on overlapping structured-API pages surfaces the raw overlap and t
     periodStart: "2025-01-01",
     periodEnd: "2025-04-01",
   });
-  const rows = await syntheticAdapter.parse({ kind: "structured_api", bytes: acquired.bytes });
+  const { activity: rows, holdings } = await syntheticAdapter.parse({
+    kind: "structured_api",
+    bytes: acquired.bytes,
+  });
   assert.ok(rows.length > acquired.manifest.reportedRowCount, "the raw pull includes the overlap");
+  // An activity-only source is not asked to invent holdings it does not
+  // have: it declines with an explicit empty ParsedHoldings, not an omitted
+  // field a caller has to guess the meaning of.
+  assert.deepEqual(holdings, { positions: [], balances: [], liabilities: [] });
 
   // parse() does not dedupe; it only tags each row with which page it came
   // from (sourceDocument), which is what lets a caller scope the importer's
@@ -200,7 +208,10 @@ test("parse() on the tabular export cross-checks the same activity the structure
     periodStart: "2025-01-01",
     periodEnd: "2025-04-01",
   });
-  const apiRows = await syntheticAdapter.parse({ kind: "structured_api", bytes: apiAcquired.bytes });
+  const { activity: apiRows } = await syntheticAdapter.parse({
+    kind: "structured_api",
+    bytes: apiAcquired.bytes,
+  });
 
   const tabularAcquired = await syntheticAdapter.acquire({
     kind: "tabular_export",
@@ -208,7 +219,7 @@ test("parse() on the tabular export cross-checks the same activity the structure
     periodStart: "2025-01-01",
     periodEnd: "2025-04-01",
   });
-  const tabularRows = await syntheticAdapter.parse({
+  const { activity: tabularRows } = await syntheticAdapter.parse({
     kind: "tabular_export",
     bytes: tabularAcquired.bytes,
   });
@@ -221,6 +232,36 @@ test("parse() on the tabular export cross-checks the same activity the structure
   assert.ok(tabularRows.some((row) => row.description === sampleDescription));
 });
 
+test("parse() signs quantity by direction: a disposal is negative, an acquisition positive", async () => {
+  const session = createSyntheticSession();
+  const acquired = await syntheticAdapter.acquire({
+    kind: "structured_api",
+    session,
+    periodStart: "2025-01-01",
+    periodEnd: "2025-04-01",
+  });
+  const { activity: rows } = await syntheticAdapter.parse({
+    kind: "structured_api",
+    bytes: acquired.bytes,
+  });
+
+  const buys = rows.filter((row) => row.activityType === "buy");
+  const sells = rows.filter((row) => row.activityType === "sell");
+  assert.ok(buys.length > 0 && sells.length > 0);
+
+  // The position gate replays these quantities against a stated position
+  // change, so an unsigned disposal would read as an acquisition and fail
+  // every period containing a sale. The sign lives on quantity itself and
+  // cannot be recovered from activityType, which is free provider text.
+  assert.ok(buys.every((row) => compareDecimal(row.quantity, "0") > 0));
+  assert.ok(sells.every((row) => compareDecimal(row.quantity, "0") < 0));
+
+  // Cash and quantity carry opposite signs on a trade: a sale pays in and
+  // reduces the holding.
+  assert.ok(sells.every((row) => compareDecimal(row.amount, "0") > 0));
+  assert.ok(buys.every((row) => compareDecimal(row.amount, "0") < 0));
+});
+
 test("parse() on a PDF statement surfaces the ambiguous row as null with a note, not a guess", async () => {
   const session = createSyntheticSession();
   const { documents } = await syntheticAdapter.discover(session);
@@ -230,7 +271,7 @@ test("parse() on a PDF statement surfaces the ambiguous row as null with a note,
     session,
     externalId: statement.externalId,
   });
-  const rows = await syntheticAdapter.parse({ kind: "pdf_statement", bytes: acquired.bytes });
+  const { activity: rows } = await syntheticAdapter.parse({ kind: "pdf_statement", bytes: acquired.bytes });
 
   const ambiguous = rows.filter((row) => row.amount === null);
   assert.equal(ambiguous.length, 1);
@@ -245,19 +286,60 @@ test("parse() on a PDF statement surfaces the ambiguous row as null with a note,
   }
 });
 
-test("parse() on a trade confirmation preserves the original currency without converting it", async () => {
+test("parse() on a PDF statement's positions table separates a marked position from one carried at cost, and surfaces an ambiguous market value as null with a note", async () => {
+  const session = createSyntheticSession();
+  const { documents } = await syntheticAdapter.discover(session);
+  const statement = documents.items.find((doc) => doc.kind === "pdf_statement");
+  const acquired = await syntheticAdapter.acquire({
+    kind: "pdf_statement",
+    session,
+    externalId: statement.externalId,
+  });
+  const { holdings } = await syntheticAdapter.parse({ kind: "pdf_statement", bytes: acquired.bytes });
+
+  assert.ok(holdings.positions.length >= 3);
+  assert.ok(holdings.balances.length >= 1);
+  assert.ok(holdings.liabilities.length >= 1);
+
+  const marked = holdings.positions.filter((p) => p.valuationBasis === "market_price");
+  const atCost = holdings.positions.filter((p) => p.valuationBasis === "cost");
+  assert.ok(marked.length > 0);
+  assert.ok(atCost.length > 0);
+  // Every position states a basis and a note; F1-16's whole point is that
+  // this is never left for a total-assets query to assume.
+  for (const position of holdings.positions) {
+    assert.ok(position.valuationBasis === null || typeof position.valuationBasis === "string");
+    assert.ok(position.valuationNote.length > 0);
+  }
+
+  const ambiguous = holdings.positions.filter((p) => p.marketValue === null);
+  assert.equal(ambiguous.length, 1);
+  assert.ok(ambiguous[0].marketValueNote.length > 0);
+  assert.ok(ambiguous[0].locators.marketValue, "the ambiguous field has its own locator");
+
+  // Multi-currency: at least one holding stays in its own currency, not USD.
+  const currencies = new Set(holdings.positions.map((p) => p.currency));
+  assert.ok(currencies.has("EUR"));
+  assert.ok(currencies.has("USD"));
+});
+
+test("parse() on a trade confirmation preserves the original currency without converting it, and carries no holdings", async () => {
   const session = createSyntheticSession();
   const acquired = await syntheticAdapter.acquire({
     kind: "trade_confirmation",
     session,
     externalId: "doc-conf-2025-02-10",
   });
-  const rows = await syntheticAdapter.parse({ kind: "trade_confirmation", bytes: acquired.bytes });
+  const { activity: rows, holdings } = await syntheticAdapter.parse({
+    kind: "trade_confirmation",
+    bytes: acquired.bytes,
+  });
   assert.equal(rows.length, 1);
   assert.equal(rows[0].currency, "EUR");
   assert.equal(typeof rows[0].quantity, "string");
   assert.equal(typeof rows[0].price, "string");
   assert.equal(typeof rows[0].amount, "string");
+  assert.deepEqual(holdings, { positions: [], balances: [], liabilities: [] });
 });
 
 test("no adapter output anywhere in this suite mentions anything credential-shaped", async () => {

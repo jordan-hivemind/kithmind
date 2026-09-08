@@ -9,7 +9,9 @@ import {
   createSyntheticSession,
   importBatch,
   openArchive,
+  persistAcquiredDocument,
   resolveInstrumentId,
+  sha256HexOf,
   syntheticAdapter,
 } from "../dist/index.js";
 
@@ -36,6 +38,14 @@ function archive(t) {
   return db;
 }
 
+/** A throwaway raw-tree root, removed when the test ends. AdapterPull.persisted
+ * can only be produced by actually persisting bytes through it (F1-18). */
+function rawRoot(t) {
+  const directory = mkdtempSync(join(tmpdir(), "kith-finance-adapter-import-raw-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  return directory;
+}
+
 function seed(db) {
   db.prepare("INSERT INTO institutions (id, name, slug) VALUES (?, ?, ?)").run(
     INSTITUTION.id,
@@ -48,6 +58,17 @@ function seed(db) {
   ).run(ACCOUNT.id, INSTITUTION.id, ACCOUNT.last4, "Synthetic account", ACCOUNT.currency);
 }
 
+/** Persists an acquired pull's bytes for a test, the same way a real caller
+ * must, and returns the PersistedAcquisition to use as AdapterPull.persisted. */
+function persist(t, db, acquired, docType) {
+  return persistAcquiredDocument(db, rawRoot(t), {
+    institutionId: INSTITUTION.id,
+    accountId: ACCOUNT.id,
+    docType,
+    acquired,
+  });
+}
+
 async function acquireAndParseActivity(session) {
   const acquired = await syntheticAdapter.acquire({
     kind: "structured_api",
@@ -55,7 +76,7 @@ async function acquireAndParseActivity(session) {
     periodStart: "2025-01-01",
     periodEnd: "2025-04-01",
   });
-  const rows = await syntheticAdapter.parse({ kind: "structured_api", bytes: acquired.bytes });
+  const { activity: rows } = await syntheticAdapter.parse({ kind: "structured_api", bytes: acquired.bytes });
   return { acquired, rows };
 }
 
@@ -73,7 +94,7 @@ test("the synthetic adapter's paginated activity pull imports end to end and the
     rows,
     docType: "activity_pull",
     docDate: null,
-    filePath: "synthetic/thistlebrook-activity.json",
+    persisted: persist(t, db, acquired, "activity_pull"),
   });
   // One ImportDocument per page: the boundary the plan requires the
   // occurrence ordinal to respect, structural rather than lost in parse()'s
@@ -117,7 +138,7 @@ test("the same paginated overlap collapses through row_hash and occurrence alone
     rows: anonymizedRows,
     docType: "activity_pull",
     docDate: null,
-    filePath: "synthetic/thistlebrook-activity-no-ids.json",
+    persisted: persist(t, db, acquired, "activity_pull"),
   });
 
   const summary = importBatch(db, { source: INSTITUTION.slug, documents }, new Date("2025-05-01"));
@@ -159,7 +180,7 @@ test("a paginated pull with no provider ids at all and a wrong reported total is
         rows: anonymizedRows,
         docType: "activity_pull",
         docDate: null,
-        filePath: "synthetic/thistlebrook-activity-wrong-total.json",
+        persisted: persist(t, db, wrongTotal, "activity_pull"),
       }),
     /does not reconcile against the provider's total/,
   );
@@ -186,7 +207,7 @@ test("a paginated pull with no stated provider total at all is imported but leav
     rows: anonymizedRows,
     docType: "activity_pull",
     docDate: null,
-    filePath: "synthetic/thistlebrook-activity-no-total.json",
+    persisted: persist(t, db, noStatedTotal, "activity_pull"),
   });
 
   // Ground rule 7: nothing here may claim completeness with no total to
@@ -206,14 +227,15 @@ test("a paginated pull with no stated provider total at all is imported but leav
 test("two legitimately identical rows in one document, with no provider id, both survive", (t) => {
   const db = archive(t);
   seed(db);
+  const bytes = new TextEncoder().encode("synthetic tabular export bytes");
   const acquired = {
-    bytes: new Uint8Array(),
+    bytes,
     manifest: {
       kind: "tabular_export",
       periodStart: "2025-06-01",
       periodEnd: "2025-06-30",
       capturedAt: "2025-07-01T00:00:00.000Z",
-      contentHash: "f".repeat(64),
+      contentHash: sha256HexOf(bytes),
       reportedRowCount: null,
       gaps: [],
     },
@@ -248,7 +270,7 @@ test("two legitimately identical rows in one document, with no provider id, both
     rows,
     docType: "tabular_export",
     docDate: "2025-06-30",
-    filePath: "synthetic/thistlebrook-tabular.csv",
+    persisted: persist(t, db, acquired, "tabular_export"),
   });
   assert.equal(documents.length, 1, "no pagination on this tier: one document");
 
@@ -276,7 +298,10 @@ test("the deliberately garbled PDF statement amount lands in the review queue ca
     session,
     externalId: statement.externalId,
   });
-  const rows = await syntheticAdapter.parse({ kind: "pdf_statement", bytes: acquired.bytes });
+  const { activity: rows, holdings } = await syntheticAdapter.parse({
+    kind: "pdf_statement",
+    bytes: acquired.bytes,
+  });
   const ambiguous = rows.filter((row) => row.amount === null);
   assert.equal(ambiguous.length, 1);
 
@@ -285,18 +310,21 @@ test("the deliberately garbled PDF statement amount lands in the review queue ca
     accountId: ACCOUNT.id,
     acquired,
     rows,
+    holdings,
     docType: "pdf_statement",
     docDate: statement.periodEnd,
-    filePath: `synthetic/${statement.externalId}.txt`,
+    persisted: persist(t, db, acquired, "pdf_statement"),
   });
   assert.equal(importDocuments.length, 1);
 
+  const holdingsRowCount =
+    holdings.positions.length + holdings.balances.length + holdings.liabilities.length;
   const summary = importBatch(
     db,
     { source: INSTITUTION.slug, documents: importDocuments },
     new Date("2025-03-01"),
   );
-  assert.equal(summary.rowsInserted, rows.length);
+  assert.equal(summary.rowsInserted, rows.length + holdingsRowCount);
 
   const review = db
     .prepare("SELECT kind, reason, status FROM review_items WHERE kind = 'ambiguous_amount'")
@@ -311,10 +339,82 @@ test("the deliberately garbled PDF statement amount lands in the review queue ca
   assert.equal(flaggedTransaction.amount, null);
   assert.equal(flaggedTransaction.status, "review");
 
-  // The statement's buy, sell and dividend rows reference FKE and SGH; both
-  // resolve to one instrument row each, reused rather than duplicated.
+  // The statement's buy, sell and dividend rows reference FKE and SGH; the
+  // positions table adds a private fund (no symbol at all) and a EUR share
+  // class, so four distinct instruments in total, none duplicated.
   const instrumentCount = db.prepare("SELECT COUNT(*) AS n FROM instruments").get().n;
-  assert.equal(instrumentCount, 2);
+  assert.equal(instrumentCount, 4);
+
+  assert.equal(
+    db.prepare("SELECT COUNT(*) AS n FROM positions").get().n,
+    holdings.positions.length,
+  );
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM balances").get().n, holdings.balances.length);
+  assert.equal(
+    db.prepare("SELECT COUNT(*) AS n FROM liabilities").get().n,
+    holdings.liabilities.length,
+  );
+
+  // Every imported holdings row carries its source document and locator
+  // (ground rule 2), exactly as transactions do.
+  const positionProvenance = db
+    .prepare("SELECT source_document_id, source_locator FROM positions")
+    .all();
+  for (const row of positionProvenance) {
+    assert.ok(row.source_document_id, "every position carries its source document");
+    assert.ok(row.source_locator, "every position carries its locator");
+  }
+  const balanceProvenance = db.prepare("SELECT source_document_id, source_locator FROM balances").get();
+  assert.ok(balanceProvenance.source_document_id);
+  assert.ok(balanceProvenance.source_locator);
+  const liabilityProvenance = db
+    .prepare("SELECT source_document_id, source_locator FROM liabilities")
+    .get();
+  assert.ok(liabilityProvenance.source_document_id);
+  assert.ok(liabilityProvenance.source_locator);
+
+  // A total-assets query can separate marked positions from those carried
+  // at cost (acceptance criterion 3): mixing the two silently would be the
+  // exact confidently-wrong answer the archive exists to prevent.
+  const marked = db
+    .prepare("SELECT COALESCE(SUM(market_value), 0) AS total FROM positions WHERE valuation_basis = 'market_price' AND currency = 'USD'")
+    .get();
+  const atCost = db
+    .prepare("SELECT COALESCE(SUM(market_value), 0) AS total FROM positions WHERE valuation_basis = 'cost' AND currency = 'USD'")
+    .get();
+  assert.ok(marked.total > 0);
+  assert.ok(atCost.total > 0);
+  assert.notEqual(marked.total, atCost.total);
+
+  // The garbled market value opened its own review item too, distinct from
+  // the activity-row one asserted above.
+  const positionReview = db
+    .prepare("SELECT kind, status FROM review_items WHERE kind = 'ambiguous_market_value'")
+    .all();
+  assert.equal(positionReview.length, 1);
+  assert.equal(positionReview[0].status, "open");
+
+  // Multi-currency holdings round-trip: a EUR position's own currency is
+  // preserved, not folded into the USD positions above.
+  const eurPositions = db.prepare("SELECT COUNT(*) AS n FROM positions WHERE currency = 'EUR'").get();
+  assert.ok(eurPositions.n > 0);
+
+  // Re-importing the identical document does not duplicate holdings rows.
+  const secondSummary = importBatch(
+    db,
+    { source: INSTITUTION.slug, documents: importDocuments },
+    new Date("2025-03-01"),
+  );
+  assert.equal(secondSummary.rowsInserted, 0);
+  assert.equal(
+    db.prepare("SELECT COUNT(*) AS n FROM positions").get().n,
+    holdings.positions.length,
+  );
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM balances").get().n, holdings.balances.length);
+  assert.equal(
+    db.prepare("SELECT COUNT(*) AS n FROM liabilities").get().n,
+    holdings.liabilities.length,
+  );
 });
 
 test("resolveInstrumentId: a real identifier is preferred, and two different instruments sharing a symbol never merge on cusip or isin", (t) => {

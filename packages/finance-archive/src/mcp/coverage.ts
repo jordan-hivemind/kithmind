@@ -44,6 +44,26 @@ export type AccountCoverage = {
     lastImportedAt: string | null;
   };
   periods: PeriodCoverage[];
+  /** Stated holdings and how far transaction history reaches behind them. */
+  positions: {
+    count: number;
+    earliestAsOf: string | null;
+    latestAsOf: string | null;
+    /** True when transaction history begins after the first stated position,
+     * so the earliest position periods cannot be checked at all. A measured
+     * coverage gap, not a reconciliation failure. */
+    historyStartsAfterFirstStatedPosition: boolean;
+  };
+  /** Position quantity gate, summarized. Per-instrument verdicts are in
+   * position_reconciliations; counts here keep this response bounded by
+   * account count rather than by instrument count. */
+  positionPeriods: {
+    checked: number;
+    pass: number;
+    fail: number;
+    unverified: number;
+    instruments: number;
+  };
   reviewItems: { open: number; resolved: number; dismissed: number };
 };
 
@@ -122,6 +142,41 @@ function coverageForAccount(
     currency: row.currency,
   }));
 
+  const positionAgg = db
+    .prepare(
+      `SELECT count(*) AS n, min(as_of) AS earliest, max(as_of) AS latest
+       FROM positions WHERE account_id = ?`,
+    )
+    .get(account.id) as { n: number; earliest: string | null; latest: string | null };
+
+  const positionPeriodRows = db
+    .prepare(
+      `SELECT status, count(*) AS n
+       FROM position_reconciliations WHERE account_id = ? GROUP BY status`,
+    )
+    .all(account.id) as {
+    status: "pass" | "fail" | "unverified";
+    n: number;
+  }[];
+  const positionPeriods = {
+    checked: 0,
+    pass: 0,
+    fail: 0,
+    unverified: 0,
+    instruments: 0,
+  };
+  for (const row of positionPeriodRows) {
+    positionPeriods[row.status] = row.n;
+    positionPeriods.checked += row.n;
+  }
+  positionPeriods.instruments = (
+    db
+      .prepare(
+        "SELECT count(DISTINCT instrument_id) AS n FROM position_reconciliations WHERE account_id = ?",
+      )
+      .get(account.id) as { n: number }
+  ).n;
+
   const reviewRows = db
     .prepare(
       "SELECT status, count(*) AS n FROM review_items WHERE account_id = ? GROUP BY status",
@@ -137,6 +192,7 @@ function coverageForAccount(
     docRows.length === 0 &&
     txnAgg.n === 0 &&
     periods.length === 0 &&
+    positionAgg.n === 0 &&
     reviewRows.length === 0
       ? "never_acquired"
       : "acquired";
@@ -158,6 +214,15 @@ function coverageForAccount(
       lastImportedAt: txnAgg.last_imported,
     },
     periods,
+    positions: {
+      count: positionAgg.n,
+      earliestAsOf: positionAgg.earliest,
+      latestAsOf: positionAgg.latest,
+      historyStartsAfterFirstStatedPosition:
+        positionAgg.earliest !== null &&
+        (txnAgg.earliest === null || txnAgg.earliest > positionAgg.earliest),
+    },
+    positionPeriods,
     reviewItems,
   };
 }

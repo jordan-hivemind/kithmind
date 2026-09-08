@@ -534,3 +534,258 @@ test("the import summary never carries row content, only counts", (t) => {
   assert.equal(runRow.rows_inserted, 1);
   assert.equal(runRow.rows_skipped, 0);
 });
+
+// --- F1-16: holdings (positions, balances, liabilities) --------------------
+//
+// This section hand-builds ImportPosition/ImportBalance/ImportLiability
+// literals directly, the same way `row()`/`document()` above hand-build
+// ImportRow/ImportDocument: importBatch's own contract, not routed through
+// an adapter (that end-to-end path is test/adapterImport.test.mjs).
+
+/** A minimal, valid position. Tests override only the fields they care about. */
+function position(overrides = {}) {
+  return {
+    asOf: "2026-03-31",
+    instrumentId: null,
+    quantity: "10",
+    price: "50",
+    marketValueText: "500",
+    marketValueNote: null,
+    costBasis: "400",
+    unrealized: "100",
+    currency: "USD",
+    valuationBasis: "market_price",
+    valuationNote: "Synthetic delayed market feed.",
+    sourceLocator: "holdings:1",
+    ...overrides,
+  };
+}
+
+test("a position imports with valuation_basis populated and full provenance", (t) => {
+  const db = archive(t);
+  seed(db);
+  const summary = importBatch(
+    db,
+    {
+      source: "synthetic-pull",
+      documents: [document("10".padEnd(64, "0"), [], { positions: [position()] })],
+    },
+    NOW,
+  );
+  assert.equal(summary.rowsInserted, 1);
+  assert.equal(summary.reviewItemsOpened, 0);
+
+  const stored = db
+    .prepare(
+      "SELECT account_id, valuation_basis, valuation_note, source_document_id, source_locator, market_value, cost_basis, unrealized FROM positions",
+    )
+    .get();
+  assert.equal(stored.account_id, ACCOUNT.id);
+  assert.equal(stored.valuation_basis, "market_price");
+  assert.equal(stored.valuation_note, "Synthetic delayed market feed.");
+  assert.ok(stored.source_document_id);
+  assert.equal(stored.source_locator, "holdings:1");
+  assert.equal(stored.market_value, 50000);
+  assert.equal(stored.cost_basis, 40000);
+  assert.equal(stored.unrealized, 10000);
+});
+
+test("a null valuation basis is never silent: it opens a review item, matching the plan's warning about mixed totals", (t) => {
+  const db = archive(t);
+  seed(db);
+  const summary = importBatch(
+    db,
+    {
+      source: "synthetic-pull",
+      documents: [
+        document("11".padEnd(64, "0"), [], {
+          positions: [
+            position({
+              valuationBasis: null,
+              valuationNote: "Statement does not state a valuation basis for this line.",
+            }),
+          ],
+        }),
+      ],
+    },
+    NOW,
+  );
+  assert.equal(summary.rowsInserted, 1);
+  assert.equal(summary.reviewItemsOpened, 1);
+  const review = db
+    .prepare("SELECT kind, reason FROM review_items WHERE kind = 'ambiguous_valuation_basis'")
+    .get();
+  assert.match(review.reason, /does not state a valuation basis/);
+  const stored = db.prepare("SELECT valuation_basis FROM positions").get();
+  assert.equal(stored.valuation_basis, null);
+});
+
+test("a valuation basis outside the known four is not trusted onto the row: null, with a review item", (t) => {
+  const db = archive(t);
+  seed(db);
+  importBatch(
+    db,
+    {
+      source: "synthetic-pull",
+      documents: [
+        document("12".padEnd(64, "0"), [], {
+          positions: [position({ valuationBasis: "guessed", valuationNote: "n/a" })],
+        }),
+      ],
+    },
+    NOW,
+  );
+  const stored = db.prepare("SELECT valuation_basis FROM positions").get();
+  assert.equal(stored.valuation_basis, null);
+  const review = db
+    .prepare("SELECT reason FROM review_items WHERE kind = 'ambiguous_valuation_basis'")
+    .get();
+  assert.match(review.reason, /"guessed" is not one of/);
+});
+
+test("an ambiguous market value is null with a review item, never guessed, and never blocks the row", (t) => {
+  const db = archive(t);
+  seed(db);
+  const summary = importBatch(
+    db,
+    {
+      source: "synthetic-pull",
+      documents: [
+        document("13".padEnd(64, "0"), [], {
+          positions: [
+            position({
+              marketValueText: null,
+              marketValueNote: 'statement text has an unparseable market value: "1,2O3.45"',
+            }),
+          ],
+        }),
+      ],
+    },
+    NOW,
+  );
+  assert.equal(summary.rowsInserted, 1);
+  const stored = db.prepare("SELECT market_value FROM positions").get();
+  assert.equal(stored.market_value, null);
+  const review = db
+    .prepare("SELECT reason FROM review_items WHERE kind = 'ambiguous_market_value'")
+    .get();
+  assert.match(review.reason, /unparseable market value/);
+});
+
+test("a position with an unparseable as_of opens a review item and is not inserted, like process_date", (t) => {
+  const db = archive(t);
+  seed(db);
+  const summary = importBatch(
+    db,
+    {
+      source: "synthetic-pull",
+      documents: [
+        document("14".padEnd(64, "0"), [], {
+          positions: [position({ asOf: "not-a-date" })],
+        }),
+      ],
+    },
+    NOW,
+  );
+  assert.equal(summary.rowsInserted, 0);
+  assert.equal(summary.rowsSkipped, 1);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM positions").get().n, 0);
+  assert.equal(
+    db.prepare("SELECT kind FROM review_items").get().kind,
+    "unparseable_as_of",
+  );
+});
+
+test("re-importing the same document does not duplicate positions, balances or liabilities", (t) => {
+  const db = archive(t);
+  seed(db);
+  const balance = {
+    asOf: "2026-03-31",
+    totalValueText: "10000",
+    totalValueNote: null,
+    cash: "500",
+    currency: "USD",
+    periodStartValue: "9500",
+    periodEndValue: "10000",
+    sourceLocator: "holdings:balance",
+  };
+  const liability = {
+    kind: "margin_loan",
+    displayName: "Synthetic margin balance",
+    balanceText: "2000",
+    balanceNote: null,
+    currency: "USD",
+    rate: "4.5",
+    asOf: "2026-03-31",
+    collateralNote: "Synthetic collateral note.",
+    sourceLocator: "holdings:liability",
+  };
+  const doc = document("15".padEnd(64, "0"), [], {
+    positions: [position()],
+    balances: [balance],
+    liabilities: [liability],
+  });
+
+  const first = importBatch(db, { source: "synthetic-pull", documents: [doc] }, NOW);
+  assert.equal(first.rowsInserted, 3);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM positions").get().n, 1);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM balances").get().n, 1);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM liabilities").get().n, 1);
+
+  const second = importBatch(db, { source: "synthetic-pull", documents: [doc] }, NOW);
+  assert.equal(second.rowsInserted, 0);
+  assert.equal(second.rowsSkipped, 3);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM positions").get().n, 1);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM balances").get().n, 1);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM liabilities").get().n, 1);
+});
+
+test("a document declaring a position or balance with no account_id fails loudly rather than writing an orphaned row", (t) => {
+  const db = archive(t);
+  seed(db);
+  const doc = document("16".padEnd(64, "0"), [], {
+    accountId: null,
+    positions: [position()],
+  });
+  assert.throws(
+    () => importBatch(db, { source: "synthetic-pull", documents: [doc] }, NOW),
+    /positions\.account_id/,
+  );
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM positions").get().n, 0);
+});
+
+test("two consecutive stated position snapshots for the same account and instrument support a quantity-change query (shape F1-17 needs)", (t) => {
+  const db = archive(t);
+  seed(db);
+  db.prepare("INSERT INTO instruments (id, symbol) VALUES ('inst_1', 'FKE')").run();
+  const doc1 = document("17".padEnd(64, "0"), [], {
+    positions: [
+      position({ asOf: "2026-01-31", instrumentId: "inst_1", quantity: "10", sourceLocator: "jan" }),
+    ],
+  });
+  const doc2 = document("18".padEnd(64, "0"), [], {
+    positions: [
+      position({ asOf: "2026-02-28", instrumentId: "inst_1", quantity: "16", sourceLocator: "feb" }),
+    ],
+  });
+  importBatch(db, { source: "synthetic-pull", documents: [doc1, doc2] }, NOW);
+
+  // The comparison a quantity-reconciliation gate needs: two consecutive
+  // stated snapshots for one account and instrument, ordered by as_of, each
+  // anchored on the prior stated position rather than derived from zero.
+  const snapshots = db
+    .prepare(
+      `SELECT as_of, quantity,
+              LAG(as_of) OVER (PARTITION BY account_id, instrument_id ORDER BY as_of) AS prev_as_of,
+              LAG(quantity) OVER (PARTITION BY account_id, instrument_id ORDER BY as_of) AS prev_quantity
+       FROM positions
+       WHERE account_id = ? AND instrument_id = ?
+       ORDER BY as_of`,
+    )
+    .all(ACCOUNT.id, "inst_1");
+  assert.equal(snapshots.length, 2);
+  assert.equal(snapshots[0].prev_as_of, null);
+  assert.equal(snapshots[1].prev_as_of, "2026-01-31");
+  assert.equal(snapshots[1].prev_quantity, "10");
+  assert.equal(snapshots[1].quantity, "16");
+});

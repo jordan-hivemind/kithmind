@@ -7,7 +7,12 @@
 // invented tickers. Every date, amount and identifier here is synthetic and
 // could not be anyone's real data.
 
-import { canonicalizeDecimal, multiplyDecimal, negateDecimal } from "../../decimal.js";
+import {
+  canonicalizeDecimal,
+  multiplyDecimal,
+  negateDecimal,
+  subtractDecimal,
+} from "../../decimal.js";
 import { fromMinorUnits } from "../../money.js";
 import type { ParsedInstrument } from "../../adapter.js";
 
@@ -17,6 +22,35 @@ export const INSTITUTION_NAME = "Thistlebrook Trust";
 export const INSTRUMENTS: readonly ParsedInstrument[] = [
   { symbol: "FKE", name: "Fictional Kelp ETF", cusip: "000000FK1", isin: null },
   { symbol: "SGH", name: "Synthetic Glacier Holdings", cusip: "000000SG2", isin: null },
+];
+
+/** No symbol or cusip: an illiquid, privately held fund unit, carried at cost. */
+export const PRIVATE_FUND_INSTRUMENT: ParsedInstrument = {
+  symbol: null,
+  cusip: null,
+  isin: null,
+  name: "Synthetic Cairn Private Fund, LP",
+};
+
+/** A EUR-listed share class of the same fictional ETF, for the multi-currency holdings fixture. */
+export const EUR_INSTRUMENT: ParsedInstrument = {
+  symbol: "FKE-EUR",
+  cusip: null,
+  isin: "SY0000000FK1",
+  name: "Fictional Kelp ETF (EUR share class)",
+};
+
+/**
+ * Every instrument a holdings fixture can reference, including the two that
+ * never appear in `INSTRUMENTS` (activity-only): the symbol-less private
+ * fund and the EUR share class. `parseStatementText`'s holdings branch looks
+ * an instrument up here by symbol, falling back to name, since the private
+ * fund has no symbol at all for `instrumentBySymbol`'s lookup to find.
+ */
+export const HOLDINGS_INSTRUMENTS: readonly ParsedInstrument[] = [
+  ...INSTRUMENTS,
+  PRIVATE_FUND_INSTRUMENT,
+  EUR_INSTRUMENT,
 ];
 
 const ACTIVITY_TYPES = ["buy", "sell", "dividend", "fee", "interest"] as const;
@@ -71,16 +105,19 @@ export function generateActivityRows(
     const externalId = `tx-${String(i + 1).padStart(4, "0")}`;
     if (type === "buy" || type === "sell") {
       const instrument = instrumentAt(i);
-      const quantity = canonicalizeDecimal(String(5 + (i % 6) * 3));
+      const units = canonicalizeDecimal(String(5 + (i % 6) * 3));
       const price = fromMinorUnits(BigInt(5000 + ((i * 211) % 8000)), "USD");
-      const gross = multiplyDecimal(quantity, price);
+      const gross = multiplyDecimal(units, price);
       rows.push({
         externalId,
         date,
         activityType: type,
         description: `${type === "buy" ? "Buy" : "Sell"} ${instrument.symbol}`,
         instrument,
-        quantity,
+        // Signed: a disposal is negative (ParsedRow.quantity). Cash and
+        // quantity carry opposite signs on a trade, which is why a sale is
+        // a positive amount and a negative quantity.
+        quantity: type === "buy" ? units : negateDecimal(units),
         price,
         amount: type === "buy" ? negateDecimal(gross) : gross,
         currency: "USD",
@@ -202,6 +239,138 @@ export const AMBIGUOUS_ROW: ActivityRow = {
   currency: "USD",
 };
 
+// --- holdings fixtures ---------------------------------------------------
+//
+// F1-16: the February statement's positions table, small enough to be
+// hand-fixed (unlike the hundreds-of-rows activity feed) but still exact
+// arithmetic through the F1-1 decimal/money helpers, never a hardcoded
+// product. One marked position, one carried-at-cost position (proving a
+// total-assets query can separate the two, acceptance criterion 3), one
+// ambiguous market value (criterion 5), and one EUR position alongside the
+// USD ones (criterion 6, multi-currency round trip).
+
+export const HOLDINGS_AS_OF = "2025-02-28";
+
+const MARKET_QUANTITY = "40";
+const MARKET_PRICE = fromMinorUnits(10530n, "USD"); // 105.30
+const MARKET_VALUE = multiplyDecimal(MARKET_QUANTITY, MARKET_PRICE);
+const MARKET_COST_BASIS = fromMinorUnits(390000n, "USD"); // 3900.00
+const MARKET_UNREALIZED = subtractDecimal(MARKET_VALUE, MARKET_COST_BASIS);
+
+const COST_QUANTITY = "100";
+const COST_MARKET_VALUE = fromMinorUnits(500000n, "USD"); // 5000.00, no independent mark
+
+const EUR_QUANTITY = "12";
+const EUR_PRICE = fromMinorUnits(8850n, "EUR"); // 88.50
+const EUR_MARKET_VALUE = multiplyDecimal(EUR_QUANTITY, EUR_PRICE);
+const EUR_COST_BASIS = fromMinorUnits(90000n, "EUR"); // 900.00
+const EUR_UNREALIZED = subtractDecimal(EUR_MARKET_VALUE, EUR_COST_BASIS);
+
+export type PositionFixture = {
+  readonly asOf: string;
+  readonly instrument: ParsedInstrument | null;
+  readonly quantity: string | null;
+  readonly price: string | null;
+  /** `1,2O3.45`-style garbled text stands in for a market value parse() cannot read. */
+  readonly marketValue: string;
+  readonly costBasis: string | null;
+  readonly unrealized: string | null;
+  readonly currency: string;
+  readonly valuationBasis: "market_price" | "last_round" | "cost" | "reported_nav";
+  readonly valuationNote: string;
+};
+
+export const POSITIONS: readonly PositionFixture[] = [
+  {
+    asOf: HOLDINGS_AS_OF,
+    instrument: instrumentAt(0), // FKE
+    quantity: MARKET_QUANTITY,
+    price: MARKET_PRICE,
+    marketValue: MARKET_VALUE,
+    costBasis: MARKET_COST_BASIS,
+    unrealized: MARKET_UNREALIZED,
+    currency: "USD",
+    valuationBasis: "market_price",
+    valuationNote: "Priced from delayed market feed, end of day 2025-02-28.",
+  },
+  {
+    asOf: HOLDINGS_AS_OF,
+    instrument: PRIVATE_FUND_INSTRUMENT,
+    quantity: COST_QUANTITY,
+    price: null,
+    marketValue: COST_MARKET_VALUE,
+    costBasis: COST_MARKET_VALUE,
+    unrealized: null,
+    currency: "USD",
+    valuationBasis: "cost",
+    valuationNote: "No independent market or administrator NAV; carried at cost.",
+  },
+  {
+    asOf: HOLDINGS_AS_OF,
+    instrument: instrumentAt(1), // SGH
+    quantity: "25",
+    price: null,
+    // Deliberately garbled, same damage as AMBIGUOUS_ROW: parse() must
+    // record this as null with a note rather than guess (ground rule 5).
+    marketValue: "1,2O3.45",
+    costBasis: fromMinorUnits(120000n, "USD"),
+    unrealized: null,
+    currency: "USD",
+    valuationBasis: "market_price",
+    valuationNote: "Priced from delayed market feed, end of day 2025-02-28.",
+  },
+  {
+    asOf: HOLDINGS_AS_OF,
+    instrument: EUR_INSTRUMENT,
+    quantity: EUR_QUANTITY,
+    price: EUR_PRICE,
+    marketValue: EUR_MARKET_VALUE,
+    costBasis: EUR_COST_BASIS,
+    unrealized: EUR_UNREALIZED,
+    currency: "EUR",
+    valuationBasis: "market_price",
+    valuationNote: "Priced from the instrument's home-exchange feed, in EUR, not converted.",
+  },
+];
+
+export type BalanceFixture = {
+  readonly asOf: string;
+  readonly totalValue: string;
+  readonly cash: string;
+  readonly currency: string;
+  readonly periodStartValue: string;
+  readonly periodEndValue: string;
+};
+
+export const BALANCE: BalanceFixture = {
+  asOf: HOLDINGS_AS_OF,
+  totalValue: fromMinorUnits(1815045n, "USD"), // 18150.45
+  cash: fromMinorUnits(42010n, "USD"), // 420.10
+  currency: "USD",
+  periodStartValue: fromMinorUnits(1760000n, "USD"), // 17600.00
+  periodEndValue: fromMinorUnits(1815045n, "USD"),
+};
+
+export type LiabilityFixture = {
+  readonly kind: string;
+  readonly displayName: string;
+  readonly balance: string;
+  readonly currency: string;
+  readonly rate: string;
+  readonly asOf: string;
+  readonly collateralNote: string;
+};
+
+export const LIABILITY: LiabilityFixture = {
+  kind: "margin_loan",
+  displayName: "Margin balance",
+  balance: fromMinorUnits(500000n, "USD"), // 5000.00
+  currency: "USD",
+  rate: "4.25",
+  asOf: HOLDINGS_AS_OF,
+  collateralNote: "Collateralized by securities held in this account.",
+};
+
 export type DocumentFixture = {
   readonly externalId: string;
   readonly kind: "pdf_statement" | "trade_confirmation";
@@ -213,6 +382,54 @@ export type DocumentFixture = {
 
 const STATEMENT_ROWS = generateActivityRows(5, "2025-02-01");
 
+/**
+ * A statement's positions-table line. Unlike `statementLine`, the instrument
+ * is spelled out as both symbol and name (not just a symbol): the private
+ * fund fixture has no symbol at all, and a lookup by symbol alone -- as
+ * `instrumentBySymbol` does for activity rows -- would not find it.
+ */
+function positionLine(position: PositionFixture): string {
+  return [
+    "POSITION",
+    position.asOf,
+    position.instrument?.symbol ?? "-",
+    position.instrument?.name ?? "-",
+    position.quantity ?? "-",
+    position.price ?? "-",
+    position.marketValue,
+    position.costBasis ?? "-",
+    position.unrealized ?? "-",
+    position.currency,
+    position.valuationBasis,
+    position.valuationNote,
+  ].join("|");
+}
+
+function balanceLine(balance: BalanceFixture): string {
+  return [
+    "BALANCE",
+    balance.asOf,
+    balance.totalValue,
+    balance.cash,
+    balance.currency,
+    balance.periodStartValue,
+    balance.periodEndValue,
+  ].join("|");
+}
+
+function liabilityLine(liability: LiabilityFixture): string {
+  return [
+    "LIABILITY",
+    liability.kind,
+    liability.displayName,
+    liability.balance,
+    liability.currency,
+    liability.rate,
+    liability.asOf,
+    liability.collateralNote,
+  ].join("|");
+}
+
 function buildStatementText(): string {
   const page1 = STATEMENT_ROWS.slice(0, 3);
   const page2 = STATEMENT_ROWS.slice(3);
@@ -223,6 +440,10 @@ function buildStatementText(): string {
     "PAGE 2",
     ...page2.map((row) => statementLine(row)),
     statementLine(AMBIGUOUS_ROW, AMBIGUOUS_ROW.amount),
+    "HOLDINGS",
+    ...POSITIONS.map((position) => positionLine(position)),
+    balanceLine(BALANCE),
+    liabilityLine(LIABILITY),
   ].join("\n");
 }
 
