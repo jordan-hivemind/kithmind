@@ -28,6 +28,10 @@ import type {
   ParsedRow,
 } from "./adapter.js";
 import { EMPTY_HOLDINGS, sha256Hex } from "./adapter.js";
+import {
+  type CaptureWriteResult,
+  writeCaptureManifest,
+} from "./captures.js";
 import { canonicalizeDecimal } from "./decimal.js";
 import type {
   ImportBalance,
@@ -38,10 +42,8 @@ import type {
 } from "./importer.js";
 import { toMinorUnits } from "./money.js";
 import {
-  type ManifestWriteResult,
   type RawTreeWriteResult,
   writeRawDocument,
-  writeRawDocumentManifest,
   writeRetainedText,
 } from "./rawTree.js";
 import { retainPayload } from "./retention.js";
@@ -455,22 +457,34 @@ export function adapterPullToImportDocuments(
 // way to fill in `AdapterPull.persisted` -- so a caller cannot build an
 // `AdapterPull` around an invented path, and cannot skip persisting bytes
 // that a document row then claims exist. Self-contained -- it only calls
-// into rawTree.ts and does its own small, targeted write to
-// `documents.text_path` -- so it does not touch `importer.ts`'s insert
-// statement or any other function in this file.
+// into rawTree.ts (bytes) and captures.ts (acquisition provenance, F1-24)
+// and does its own small, targeted write to `documents.text_path` -- so it
+// does not touch `importer.ts`'s insert statement or any other function in
+// this file.
 
-/** Everything needed to persist one acquired document: enough for the raw
- * tree's manifest sidecar to identify it without the archive database (see
- * `RawTreeDocumentManifest`), on top of the acquired bytes themselves. */
+/** Everything needed to persist one acquired document and the capture that
+ * produced it: enough for the raw tree's capture manifest (captures.ts) to
+ * identify both without the archive database, on top of the acquired bytes
+ * themselves. */
 export type AcquisitionDescriptor = {
   readonly institutionId: string;
   readonly accountId: string;
   readonly docType: string;
   readonly acquired: AcquiredDocument;
-  /** Dot-prefixed (".pdf", ".csv"), when the source gave one. Recorded in
-   * the manifest only; the raw bytes stay content-addressed and
+  /** Dot-prefixed (".pdf", ".csv"), when the source gave one. Recorded on
+   * the capture manifest only; the raw bytes stay content-addressed and
    * extension-less either way. */
   readonly originalExtension?: string | null;
+  /**
+   * This acquisition attempt's own idempotency key (F1-24). Two calls with
+   * the same `captureId` are two attempts at *one* acquisition -- a retry --
+   * and must produce a byte-identical capture manifest; two calls with
+   * different `captureId`s are two acquisitions, whether or not the bytes
+   * they acquire turn out identical, and both keep their own provenance.
+   * Defaults to a fresh random id when omitted, which is correct for any
+   * caller that is not itself retrying a specific earlier attempt.
+   */
+  readonly captureId?: string;
 };
 
 /** What `persistAcquiredDocument` wrote and where, for the caller to use as
@@ -479,32 +493,41 @@ export type AcquisitionDescriptor = {
 export type PersistedAcquisition = {
   readonly filePath: string;
   readonly textPath: string | null;
-  readonly manifestPath: string;
+  readonly captureId: string;
+  readonly capturePath: string;
   readonly documentWrite: RawTreeWriteResult;
   readonly textWrite: RawTreeWriteResult | null;
-  readonly manifestWrite: ManifestWriteResult;
+  readonly captureWrite: CaptureWriteResult;
 };
 
 /**
  * Persists one acquired document's raw bytes -- and, when supplied, its
  * retained extracted text -- to the raw tree rooted at `rawTreeRoot`, along
- * with a manifest sidecar recording what the document is (institution,
- * account, document type, statement period, capture time, capability tier,
- * gaps, original extension). The manifest is what makes ground rule 1's
- * "can be rebuilt from scratch" true in practice: the archive database is
- * derived data, so if it is ever lost, the raw tree still says what each
- * file is well enough to re-import, instead of becoming an unlabelled pile
- * of hashes.
+ * with a capture manifest (captures.ts) recording what this acquisition is:
+ * institution, account, document type, statement period, capture time,
+ * capability tier, gaps, original extension. That manifest is what makes
+ * ground rule 1's "can be rebuilt from scratch" true in practice: the
+ * archive database is derived data, so if it is ever lost, the raw tree
+ * still says what each capture is well enough to re-import, instead of
+ * becoming an unlabelled pile of hashes.
  *
- * Write-once throughout: a re-acquisition of identical bytes reports
- * `status: "already_exists"` on `documentWrite`/`textWrite`/`manifestWrite`
- * rather than rewriting or raising an error that would abort a run
- * (requirement 1). See `rawTree.ts` for how the write-once and
- * hash-verification guarantees are implemented.
+ * F1-24: the document's bytes and the capture that acquired them are two
+ * different write-once records now. `writeRawDocument` still keys purely on
+ * content, so a second acquisition of byte-identical content never rewrites
+ * the bytes; `writeCaptureManifest` keys on `captureId` instead, so that
+ * second acquisition's own provenance -- its own time, source, period and
+ * retention declaration -- is written as its own capture rather than
+ * discarded because the bytes it names already exist. A repeat call with the
+ * *same* `captureId` (a retry of one attempt) reports `status:
+ * "already_exists"` on `documentWrite`/`textWrite`/`captureWrite`, never a
+ * rewrite; reusing a `captureId` for a capture that would hash differently
+ * is refused outright (`CaptureConflictError`), never silently overwritten
+ * or silently coexisting. See `rawTree.ts` and `captures.ts` for how the
+ * write-once and hash-verification guarantees are implemented.
  *
  * F1-23: re-applies the adapter's declared retention projection before
  * anything is hashed or written, and records the resulting
- * `RetentionRecord` in the manifest sidecar so the retained file is never
+ * `RetentionRecord` on the capture manifest so the retained file is never
  * presented as the untouched provider response. Undeclared source paths that
  * the projection dropped open a `review_items` entry rather than passing
  * unremarked.
@@ -525,7 +548,14 @@ export function persistAcquiredDocument(
   descriptor: AcquisitionDescriptor,
   extractedText: string | null = null,
 ): PersistedAcquisition {
-  const { institutionId, accountId, docType, acquired, originalExtension = null } = descriptor;
+  const {
+    institutionId,
+    accountId,
+    docType,
+    acquired,
+    originalExtension = null,
+    captureId = randomUUID(),
+  } = descriptor;
 
   // F1-23. The projection is re-applied here, at the one seam that produces
   // bytes for the raw tree, rather than trusted from the adapter. It is
@@ -577,8 +607,9 @@ export function persistAcquiredDocument(
     );
   }
 
-  const manifestWrite = writeRawDocumentManifest(rawTreeRoot, {
-    sha256: documentWrite.sha256,
+  const captureWrite = writeCaptureManifest(rawTreeRoot, {
+    captureId,
+    documentSha256: documentWrite.sha256,
     institutionSlug: institution.slug,
     acctLast4: account.acct_last4,
     docType,
@@ -613,10 +644,11 @@ export function persistAcquiredDocument(
   return {
     filePath: documentWrite.path,
     textPath: textWrite?.path ?? null,
-    manifestPath: manifestWrite.path,
+    captureId,
+    capturePath: captureWrite.path,
     documentWrite,
     textWrite,
-    manifestWrite,
+    captureWrite,
   };
 }
 
