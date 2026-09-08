@@ -602,23 +602,24 @@ Layout is content-addressed:
 
 ```
 <root>/documents/<sha[0:2]>/<sha[2:4]>/<sha256>
-<root>/documents/<sha[0:2]>/<sha[2:4]>/<sha256>.manifest.json
 <root>/text/<sha[0:2]>/<sha[2:4]>/<sha256>.txt
+<root>/captures/<institutionSlug>/<yyyy>/<mm>/<captureId>-<manifestSha256>.json
 ```
 
-`documents/` is addressed by the raw bytes' own hash, with a
-`.manifest.json` sidecar next to each one (see "Self-describing manifest"
-below); `text/` is addressed by the retained text's own hash, in a separate
-namespace so a text blob and a raw document can never collide on path even
-in principle. Content addressing was chosen over date- or
-institution-partitioning because it makes two of this module's hard
-requirements true by construction instead of by convention someone could get
-wrong: identical bytes always land on the same path, so a repeat write of
-the same content is caught by the layout itself rather than a lookup a
-caller has to remember to run, and two different byte strings can never
-collide on a path, because the path _is_ their hash. A 2+2 hex fan-out
-(65536 buckets) keeps any one directory small at tens of thousands of
-documents, which stays fine for a person to browse by hand.
+`documents/` is addressed by the raw bytes' own hash; `text/` is addressed by
+the retained text's own hash, in a separate namespace so a text blob and a
+raw document can never collide on path even in principle. Content addressing
+was chosen over date- or institution-partitioning because it makes two of
+this module's hard requirements true by construction instead of by
+convention someone could get wrong: identical bytes always land on the same
+path, so a repeat write of the same content is caught by the layout itself
+rather than a lookup a caller has to remember to run, and two different byte
+strings can never collide on a path, because the path _is_ their hash. A 2+2
+hex fan-out (65536 buckets) keeps any one directory small at tens of
+thousands of documents, which stays fine for a person to browse by hand.
+`captures/` is what makes an acquisition, not just a document, identifiable
+from the raw tree alone -- see "Captures: separating byte identity from
+acquisition provenance" below.
 
 Write-once is enforced with a hard link, not a rename or a plain write:
 linking a temp file into the final content-addressed path fails outright if
@@ -638,15 +639,16 @@ never wrong bytes returned as if they were fine.
 
 `persistAcquiredDocument(db, rawTreeRoot, descriptor, extractedText?)`
 (`src/adapterImport.ts`) is the call site: it writes an `AcquiredDocument`'s
-bytes, its manifest sidecar, and, when supplied, its retained extracted
-text, and cross-checks the written sha256 against the adapter's own
-`manifest.contentHash` -- an adapter that mis-hashed its own bytes is
-exactly the kind of bug provenance exists to catch. `descriptor` names the
-`institutionId`, `accountId` and `docType` a pull belongs to (both ids are
-foreign keys, so a valid one guarantees a real row to resolve the
-institution's slug and the account's last four digits from); its result is
-the _only_ way to obtain an `AdapterPull.persisted` -- `AdapterPull` has no
-free-form `filePath` field a caller could invent -- so `documents.file_path`
+bytes, its capture manifest (`src/captures.ts`, see below), and, when
+supplied, its retained extracted text, and cross-checks the written sha256
+against the adapter's own `manifest.contentHash` -- an adapter that
+mis-hashed its own bytes is exactly the kind of bug provenance exists to
+catch. `descriptor` names the `institutionId`, `accountId` and `docType` a
+pull belongs to (both ids are foreign keys, so a valid one guarantees a real
+row to resolve the institution's slug and the account's last four digits
+from), plus an optional `captureId` (see below); its result is the _only_
+way to obtain an `AdapterPull.persisted` -- `AdapterPull` has no free-form
+`filePath` field a caller could invent -- so `documents.file_path`
 (`importBatch`, `src/importer.ts`) ends up pointing at a file that actually
 exists rather than a path no code ever created, structurally rather than by
 a caller remembering to persist first.
@@ -658,30 +660,63 @@ document's raw bytes are imported and its text is written,
 `UPDATE documents SET text_path = ... WHERE sha256 = ...`, so `get_evidence`
 can return a path to the retained text instead of null.
 
-### Self-describing manifest
+### Captures: separating byte identity from acquisition provenance (F1-24)
 
 Ground rule 1 does not stop at "raw files are immutable." It also says
 structured data is derived and the archive can be rebuilt from scratch. The
 archive database is that structured data: lose it, and a directory of
 extension-less files named by hash is unlabelled unless the raw tree itself
-says what each one is. `writeRawDocumentManifest` writes that label as a
-`.manifest.json` sidecar next to each document's bytes, recording its
-sha256, the institution's slug (not the database's internal row id, which
-means nothing once the database that minted it is gone), the account's last
-four digits, document type, statement period, capture time, capability
-tier, any acquisition gaps, the original file extension when the source gave
-one, and the `RetentionRecord` describing the projection that produced the
-bytes (see "Retention projection"): its declaration and version, the
-projection algorithm version, and the source paths that were dropped. That
-last field is how a reader learns the file is a projection of the provider's
-response rather than the response itself. It is write-once exactly like the
-bytes it describes -- a second
-write for the same document is a no-op, never a rewrite, even if the
-content offered would differ -- because the manifest is part of what was
-acquired, not something to revise later. `readRawDocumentManifest` reads one
-back; `test/rawTree.test.mjs` has a test that persists documents, discards
-the database entirely, and confirms every document is still identifiable
-from the raw tree alone.
+says what each one is.
+
+An earlier version of this label lived as a `.manifest.json` sidecar keyed on
+the *document's* content hash, next to the bytes it described. That is wrong
+for the same reason a document is content-addressed and a capture is not:
+byte equality is not source identity. The same statement bytes can
+legitimately be acquired twice -- two pulls of an overlapping period, a
+re-acquisition after a parser fix, the same document reachable from two
+endpoints -- and each acquisition has its own time, source, period and
+retention declaration. Keying the label on the document's hash meant the
+second capture collapsed onto the first one's write-once slot and its
+provenance was silently discarded.
+
+`src/captures.ts` gives every capture -- every acquisition event -- its own
+record instead, addressed by a capture id rather than by the document it
+references: `writeCaptureManifest` writes it, write-once and content-hashed
+by its own bytes, at
+`<root>/captures/<institutionSlug>/<yyyy>/<mm>/<captureId>-<manifestSha256>.json`,
+recording the referenced document's sha256, the institution's slug (not the
+database's internal row id, which means nothing once the database that
+minted it is gone), the account's last four digits, document type, statement
+period, capture time, capability tier, any acquisition gaps, the original
+file extension when the source gave one, and the `RetentionRecord`
+describing the projection that produced the bytes (see "Retention
+projection"): its declaration and version, the projection algorithm version,
+and the source paths that were dropped. That last field is how a reader
+learns the file is a projection of the provider's response rather than the
+response itself. The retention record moved here from the old document
+manifest for the same reason as the rest of this section: it describes what
+one acquisition did, not a property of the bytes.
+
+`captureId` is one acquisition attempt's own idempotency key --
+`persistAcquiredDocument` mints a fresh random one when a caller does not
+supply one, which is correct for any caller that is not itself retrying a
+specific earlier attempt. Calling it twice with the *same* `captureId` is a
+retry of one attempt and is an idempotent no-op, exactly like a repeat
+document write; calling it twice with *no* `captureId` (or two different
+ones) for identical bytes is two acquisitions, and both keep their own
+capture. Reusing a `captureId` for a manifest that would hash differently is
+refused outright with `CaptureConflictError` -- a reconciliation problem for
+a person to resolve, never something written silently as a second file or
+silently dropped.
+
+Many captures may reference one document; each is independently discoverable
+by walking `<root>/captures/` -- no database required, the same
+"self-describing" property the tree has always had for documents.
+`readCaptureManifest` reads one back; `test/captures.test.mjs` covers the
+module directly, and `test/rawTree.test.mjs` has a test that persists two
+captures of byte-identical content, discards the database entirely, and
+confirms both are still identifiable from the raw tree alone.
+
 `ParsedPull.holdings` is mapped the same way, through the same
 `resolveInstrumentId` -- there is no second instrument-resolution mechanism
 for holdings, `ParsedPosition.instrument` resolves exactly like

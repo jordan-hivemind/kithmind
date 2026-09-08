@@ -1,8 +1,10 @@
-// The raw tree writer (F1-18): persisting acquired bytes, retained text and
-// a self-describing manifest to a configured local directory, write-once,
-// hash-verified on write and on read back. No real path, institution,
-// account or document content appears in this suite; every fixture
-// directory is a temp dir removed on teardown.
+// The raw tree writer (F1-18): persisting acquired bytes and retained text
+// to a configured local directory, write-once, hash-verified on write and on
+// read back. Acquisition provenance -- the self-describing manifest -- moved
+// to captures.ts (F1-24, see captures.test.mjs); this suite covers byte
+// identity only, plus persistAcquiredDocument's end-to-end wiring of both.
+// No real path, institution, account or document content appears in this
+// suite; every fixture directory is a temp dir removed on teardown.
 
 import assert from "node:assert/strict";
 import {
@@ -21,13 +23,12 @@ import {
   openArchive,
   persistAcquiredDocument,
   readAndVerify,
-  readRawDocumentManifest,
+  readCaptureManifest,
   recordRetainedTextPath,
   resolveRawTreeRoot,
   retainPayload,
   sha256HexOf,
   writeRawDocument,
-  writeRawDocumentManifest,
   writeRetainedText,
 } from "../dist/index.js";
 import { getEvidence } from "../dist/mcp/evidence.js";
@@ -185,41 +186,7 @@ test("writeRetainedText persists text write-once, in a namespace separate from r
   assert.ok(!first.path.includes("/documents/"), "text lives outside the documents/ namespace");
 });
 
-test("writeRawDocumentManifest is write-once: a second write for the same document is a no-op, not a rewrite", (t) => {
-  const root = rawTreeRoot(t);
-  const bytes = new TextEncoder().encode("synthetic manifest write-once fixture");
-  const sha256 = sha256HexOf(bytes);
-  const manifest = {
-    sha256,
-    institutionSlug: "synthetic-institution",
-    acctLast4: "1234",
-    docType: "pdf_statement",
-    periodStart: "2025-01-01",
-    periodEnd: "2025-01-31",
-    capturedAt: "2025-02-01T00:00:00.000Z",
-    capabilityTier: "pdf_statement",
-    gaps: [],
-    originalExtension: ".pdf",
-    retention: { policy: OPAQUE_POLICY, projectionVersion: "1", droppedPaths: [] },
-  };
-
-  const first = writeRawDocumentManifest(root, manifest);
-  assert.equal(first.status, "written");
-  assert.deepEqual(readRawDocumentManifest(first.path), manifest);
-
-  // A second write attempt, even with different content for the same
-  // document, does not overwrite: ground rule 1 covers what was acquired,
-  // and the manifest is part of what was acquired.
-  const second = writeRawDocumentManifest(root, { ...manifest, docType: "trade_confirmation" });
-  assert.equal(second.status, "already_exists");
-  assert.equal(second.path, first.path);
-  assert.equal(readRawDocumentManifest(second.path).docType, "pdf_statement", "first write wins, never edited");
-
-  assert.ok(first.path.startsWith(join(root, "documents")), "colocated with the raw bytes it describes");
-  assert.ok(first.path.endsWith(".manifest.json"));
-});
-
-test("persistAcquiredDocument writes bytes, retained text and a manifest together and reports all three paths", (t) => {
+test("persistAcquiredDocument writes bytes, retained text and a capture manifest together and reports all three paths", (t) => {
   const root = rawTreeRoot(t);
   const db = archiveWithSeed(t);
   const bytes = new TextEncoder().encode("synthetic acquired statement bytes");
@@ -235,26 +202,50 @@ test("persistAcquiredDocument writes bytes, retained text and a manifest togethe
   const persisted = persistAcquiredDocument(db, root, descriptor, "synthetic retained text layer");
   assert.equal(persisted.documentWrite.status, "written");
   assert.equal(persisted.textWrite.status, "written");
-  assert.equal(persisted.manifestWrite.status, "written");
+  assert.equal(persisted.captureWrite.status, "written");
   assert.ok(existsSync(persisted.filePath));
   assert.ok(existsSync(persisted.textPath));
-  assert.ok(existsSync(persisted.manifestPath));
+  assert.ok(existsSync(persisted.capturePath));
   assert.equal(readFileSync(persisted.textPath, "utf8"), "synthetic retained text layer");
 
-  const manifest = readRawDocumentManifest(persisted.manifestPath);
+  const manifest = readCaptureManifest(persisted.capturePath);
+  assert.equal(manifest.captureId, persisted.captureId);
   assert.equal(manifest.institutionSlug, INSTITUTION.slug);
   assert.equal(manifest.acctLast4, ACCOUNT.last4);
   assert.equal(manifest.originalExtension, ".pdf");
 
-  // Re-acquiring the identical pull persists nothing new.
-  const again = persistAcquiredDocument(db, root, descriptor, "synthetic retained text layer");
-  assert.equal(again.documentWrite.status, "already_exists");
-  assert.equal(again.textWrite.status, "already_exists");
-  assert.equal(again.manifestWrite.status, "already_exists");
-  assert.equal(again.filePath, persisted.filePath);
+  // Retrying the *same* acquisition attempt (the same captureId) persists
+  // nothing new -- an idempotent no-op, not a rewrite.
+  const retried = persistAcquiredDocument(
+    db,
+    root,
+    { ...descriptor, captureId: persisted.captureId },
+    "synthetic retained text layer",
+  );
+  assert.equal(retried.documentWrite.status, "already_exists");
+  assert.equal(retried.textWrite.status, "already_exists");
+  assert.equal(retried.captureWrite.status, "already_exists");
+  assert.equal(retried.filePath, persisted.filePath);
+  assert.equal(retried.capturePath, persisted.capturePath);
+
+  // Acquiring the identical pull *again*, with no captureId supplied, is a
+  // second, distinct capture (F1-24): the document's bytes are unchanged and
+  // reused, but this capture's own provenance is written and kept, not
+  // discarded because the bytes it names already exist.
+  const secondCapture = persistAcquiredDocument(db, root, descriptor, "synthetic retained text layer");
+  assert.equal(secondCapture.documentWrite.status, "already_exists", "identical bytes are not rewritten");
+  assert.equal(secondCapture.captureWrite.status, "written", "a second capture of the same bytes is its own record");
+  assert.notEqual(secondCapture.captureId, persisted.captureId);
+  assert.notEqual(secondCapture.capturePath, persisted.capturePath);
+  assert.equal(secondCapture.filePath, persisted.filePath, "both captures reference the same document");
+
+  // Both captures are still on disk, independently -- neither overwrote the
+  // other.
+  assert.deepEqual(readCaptureManifest(persisted.capturePath).documentSha256, persisted.documentWrite.sha256);
+  assert.deepEqual(readCaptureManifest(secondCapture.capturePath).documentSha256, persisted.documentWrite.sha256);
 });
 
-test("persistAcquiredDocument with no extracted text writes only the document and its manifest", (t) => {
+test("persistAcquiredDocument with no extracted text writes only the document and its capture manifest", (t) => {
   const root = rawTreeRoot(t);
   const db = archiveWithSeed(t);
   const bytes = new TextEncoder().encode("synthetic tabular export bytes");
@@ -267,10 +258,10 @@ test("persistAcquiredDocument with no extracted text writes only the document an
     acquired,
   });
   assert.ok(existsSync(persisted.filePath));
-  assert.ok(existsSync(persisted.manifestPath));
+  assert.ok(existsSync(persisted.capturePath));
   assert.equal(persisted.textPath, null);
   assert.equal(persisted.textWrite, null);
-  assert.equal(readRawDocumentManifest(persisted.manifestPath).originalExtension, null);
+  assert.equal(readCaptureManifest(persisted.capturePath).originalExtension, null);
 });
 
 test("persistAcquiredDocument refuses a pull whose adapter mis-reported its own content hash", (t) => {
@@ -319,7 +310,7 @@ test("persistAcquiredDocument requires the institution and account to already be
   );
 });
 
-test("given only the raw tree, with no archive database, every document can be identified well enough to re-import", (t) => {
+test("given only the raw tree, with no archive database, every document and every capture can be identified well enough to re-import (F1-24)", (t) => {
   const root = rawTreeRoot(t);
   const db = archiveWithSeed(t);
 
@@ -339,6 +330,27 @@ test("given only the raw tree, with no archive database, every document can be i
     originalExtension: ".pdf",
   });
 
+  // A second, later capture of byte-identical statement content -- a
+  // re-acquisition after a parser fix, say. Same bytes, different time and
+  // its own gaps; this is exactly the case the old content-keyed manifest
+  // sidecar silently discarded.
+  const restatement = acquiredFixture(statementBytes, {
+    kind: "pdf_statement",
+    periodStart: "2025-03-01",
+    periodEnd: "2025-03-31",
+    capturedAt: "2025-06-01T08:00:00.000Z",
+    gaps: [],
+  });
+  const persistedRestatement = persistAcquiredDocument(db, root, {
+    institutionId: INSTITUTION.id,
+    accountId: ACCOUNT.id,
+    docType: "pdf_statement",
+    acquired: restatement,
+    originalExtension: ".pdf",
+  });
+  assert.equal(persistedRestatement.filePath, persistedStatement.filePath, "same document, one write-once path");
+  assert.notEqual(persistedRestatement.captureId, persistedStatement.captureId, "two distinct captures");
+
   const exportBytes = new TextEncoder().encode("synthetic tabular export bytes, second document");
   const tabularExport = acquiredFixture(exportBytes, {
     kind: "tabular_export",
@@ -357,35 +369,49 @@ test("given only the raw tree, with no archive database, every document can be i
   // Simulate total loss of the archive database: everything from here on
   // uses only what is sitting in the raw tree directory, never `db` again
   // (teardown closes it once, as usual, when this test ends).
-  const manifestFiles = readdirSync(root, { recursive: true })
-    .filter((entry) => entry.endsWith(".manifest.json"))
-    .map((entry) => join(root, entry));
-  assert.equal(manifestFiles.length, 2, "one manifest sidecar per acquired document");
+  const captureFiles = readdirSync(join(root, "captures"), { recursive: true })
+    .filter((entry) => entry.endsWith(".json"))
+    .map((entry) => join(root, "captures", entry));
+  assert.equal(captureFiles.length, 3, "one capture manifest per acquisition, not per document");
 
-  const manifests = manifestFiles.map(readRawDocumentManifest);
-  const byDocType = Object.fromEntries(manifests.map((m) => [m.docType, m]));
+  const captures = captureFiles.map(readCaptureManifest);
+  const statementCaptures = captures.filter((c) => c.docType === "pdf_statement");
+  assert.equal(statementCaptures.length, 2, "both captures of the same document are still discoverable from the tree alone");
+  assert.deepEqual(
+    new Set(statementCaptures.map((c) => c.documentSha256)),
+    new Set([sha256HexOf(statementBytes)]),
+    "both captures reference the same content-addressed document",
+  );
+  assert.deepEqual(
+    new Set(statementCaptures.map((c) => c.capturedAt)),
+    new Set(["2025-04-01T12:00:00.000Z", "2025-06-01T08:00:00.000Z"]),
+    "each capture keeps its own time",
+  );
 
-  assert.equal(byDocType.pdf_statement.sha256, sha256HexOf(statementBytes));
-  assert.equal(byDocType.pdf_statement.institutionSlug, INSTITUTION.slug);
-  assert.equal(byDocType.pdf_statement.acctLast4, ACCOUNT.last4);
-  assert.equal(byDocType.pdf_statement.periodStart, "2025-03-01");
-  assert.equal(byDocType.pdf_statement.periodEnd, "2025-03-31");
-  assert.equal(byDocType.pdf_statement.capturedAt, "2025-04-01T12:00:00.000Z");
-  assert.equal(byDocType.pdf_statement.capabilityTier, "pdf_statement");
-  assert.deepEqual(byDocType.pdf_statement.gaps, [
+  const firstCapture = statementCaptures.find((c) => c.capturedAt === "2025-04-01T12:00:00.000Z");
+  assert.equal(firstCapture.institutionSlug, INSTITUTION.slug);
+  assert.equal(firstCapture.acctLast4, ACCOUNT.last4);
+  assert.equal(firstCapture.periodStart, "2025-03-01");
+  assert.equal(firstCapture.periodEnd, "2025-03-31");
+  assert.equal(firstCapture.capabilityTier, "pdf_statement");
+  assert.deepEqual(firstCapture.gaps, [
     { periodStart: "2025-03-15", periodEnd: "2025-03-16", reason: "synthetic outage" },
   ]);
-  assert.equal(byDocType.pdf_statement.originalExtension, ".pdf");
+  assert.equal(firstCapture.originalExtension, ".pdf");
 
-  assert.equal(byDocType.tabular_export.institutionSlug, INSTITUTION.slug);
-  assert.equal(byDocType.tabular_export.acctLast4, ACCOUNT.last4);
-  assert.equal(byDocType.tabular_export.capabilityTier, "tabular_export");
-  assert.equal(byDocType.tabular_export.originalExtension, ".csv");
+  const secondCapture = statementCaptures.find((c) => c.capturedAt === "2025-06-01T08:00:00.000Z");
+  assert.deepEqual(secondCapture.gaps, [], "the second capture keeps its own, different provenance");
 
-  // The bytes each manifest describes are still there, still content-
+  const exportCapture = captures.find((c) => c.docType === "tabular_export");
+  assert.equal(exportCapture.institutionSlug, INSTITUTION.slug);
+  assert.equal(exportCapture.acctLast4, ACCOUNT.last4);
+  assert.equal(exportCapture.capabilityTier, "tabular_export");
+  assert.equal(exportCapture.originalExtension, ".csv");
+
+  // The bytes each capture references are still there, still content-
   // addressed by the same hash, and still verify -- nothing here depended
   // on the database that was just closed.
-  const bytesOnDisk = readAndVerify(persistedStatement.filePath, byDocType.pdf_statement.sha256);
+  const bytesOnDisk = readAndVerify(persistedStatement.filePath, firstCapture.documentSha256);
   assert.deepEqual(bytesOnDisk, Buffer.from(statementBytes));
 });
 

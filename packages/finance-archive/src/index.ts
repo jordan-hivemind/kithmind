@@ -141,13 +141,16 @@ export {
 } from "./adapterImport.js";
 export {
   readAndVerify,
-  readRawDocumentManifest,
   resolveRawTreeRoot,
   sha256HexOf,
   writeRawDocument,
-  writeRawDocumentManifest,
   writeRetainedText,
-  type ManifestWriteResult,
-  type RawTreeDocumentManifest,
   type RawTreeWriteResult,
 } from "./rawTree.js";
+export {
+  CaptureConflictError,
+  readCaptureManifest,
+  writeCaptureManifest,
+  type CaptureManifest,
+  type CaptureWriteResult,
+} from "./captures.js";

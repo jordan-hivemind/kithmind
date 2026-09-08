@@ -23,7 +23,7 @@ import {
   createSyntheticSession,
   openArchive,
   persistAcquiredDocument,
-  readRawDocumentManifest,
+  readCaptureManifest,
   retainPayload,
   RetentionShapeError,
   sha256HexOf,
@@ -184,7 +184,7 @@ test("the manifest records that a projection was applied, which declaration prod
     acquired,
   });
 
-  const { retention } = readRawDocumentManifest(persisted.manifestPath);
+  const { retention } = readCaptureManifest(persisted.capturePath);
   assert.equal(retention.policy.kind, "json_allowlist");
   assert.equal(retention.policy.version, "thistlebrook-activity-1");
   assert.equal(retention.projectionVersion, "1");
@@ -350,7 +350,7 @@ test("a PDF-tier artifact is retained whole and says so, so no reader mistakes i
     docType: "pdf_statement",
     acquired,
   });
-  const { retention } = readRawDocumentManifest(persisted.manifestPath);
+  const { retention } = readCaptureManifest(persisted.capturePath);
   assert.equal(retention.policy.kind, "opaque");
   assert.notEqual(retention.policy.note.trim(), "");
   assert.deepEqual(retention.droppedPaths, []);
