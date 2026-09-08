@@ -65,6 +65,12 @@ snapshot. Snapshot input paths are provenance, not restore paths: a relative
 backup input can have an absolute provenance path while storing `/object.age`.
 The tree reader permits one encrypted file and its ancestor directories,
 rejecting links, special nodes, duplicates, and truncated output.
+The recipe reconciler checks the complete snapshot and stored-file sets for
+both repositories and produces distinct opaque workflow identities for processing
+and database objects. It preserves provenance separately and compares source
+and destination inventories while allowing only the approved root-path change.
+These inventories contain expected ciphertext hashes; they are not evidence of
+content readback or decryption.
 
 An owner-only age recovery helper verifies ciphertext and plaintext hashes.
 It sends the protected native age identity through standard input and writes
