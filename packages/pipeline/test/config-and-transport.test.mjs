@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import test from "node:test";
+import { validateArchiveRelocationConfig } from "../dist/archiveRelocationConfig.js";
 
 import {
   journalBindingForConfig,
@@ -87,6 +88,82 @@ function pdfDocQaConfig() {
     },
   };
 }
+
+test("archive relocation permits only a remote root path change", () => {
+  const pdf = pdfDocQaConfig();
+  delete pdf.archive.independentBackup.repositoryPath;
+  pdf.archive.independentBackup.repository = {
+    kind: "rclone_dropbox_v1",
+    remoteName: "test_dropbox",
+    rootPath: "Legacy/backups",
+    rcloneBinary: "/tools/rclone",
+    configPath: "/credentials/rclone.conf",
+    configIdentityFingerprint: "c".repeat(64),
+    expectedRootDirectoryIdHash: "d".repeat(64),
+  };
+  const before = parseConfig({
+    protocolVersion: 1,
+    endpoint: "http://127.0.0.1:3100/api/worker",
+    spaceId: "space_1",
+    sourceAccountId: "source_1",
+    credentialEnv: "PIPELINE_TOKEN",
+    roots: [{ alias: "notes", path: "/tmp/root" }],
+    journalDir: "/tmp/journal",
+    pdfDocQa: pdf,
+  });
+  const after = structuredClone(before);
+  after.pdfDocQa.archive.independentBackup.repository.rootPath =
+    "Managed/backups";
+  const result = validateArchiveRelocationConfig(before, after);
+  assert.deepEqual(result.previousBinding, journalBindingForConfig(before));
+  assert.deepEqual(result.proposedBinding, journalBindingForConfig(after));
+  assert.notEqual(
+    result.previousBinding.configFingerprint,
+    result.proposedBinding.configFingerprint,
+  );
+  assert.equal(
+    before.pdfDocQa.archive.independentBackup.repository.rootPath,
+    "Legacy/backups",
+  );
+  assert.throws(() => validateArchiveRelocationConfig(before, before));
+  for (const mutate of [
+    (value) => {
+      value.spaceId = "other";
+    },
+    (value) => {
+      value.credentialEnv = "OTHER_TOKEN";
+    },
+    (value) => {
+      value.maxFiles += 1;
+    },
+    (value) => {
+      value.roots[0].path = "/tmp/other";
+    },
+    (value) => {
+      value.journalDir = "/tmp/other-journal";
+    },
+    (value) => {
+      value.pdfDocQa.archive.independentBackup.expectedRepositoryId =
+        "b".repeat(64);
+    },
+    (value) => {
+      value.pdfDocQa.archive.independentBackup.repository.expectedRootDirectoryIdHash =
+        "b".repeat(64);
+    },
+    (value) => {
+      value.pdfDocQa.archive.independentBackup.repository.configIdentityFingerprint =
+        "b".repeat(64);
+    },
+    (value) => {
+      value.pdfDocQa.archive.independentBackup.repository.rootPath =
+        "../escape";
+    },
+  ]) {
+    const changed = structuredClone(after);
+    mutate(changed);
+    assert.throws(() => validateArchiveRelocationConfig(before, changed));
+  }
+});
 
 test("PDF document-Q&A config is closed, bound, and keeps legacy bindings stable", () => {
   const base = {

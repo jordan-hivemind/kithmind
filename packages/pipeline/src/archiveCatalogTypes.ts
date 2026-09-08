@@ -2,6 +2,7 @@ import type {
   PreparedAgeObject,
   PublishedAgeObject,
   RecoveredResticBackup,
+  RemoteBackupBoundary,
   ResticBackupResult,
 } from "./archiveTypes.js";
 
@@ -260,10 +261,30 @@ export type ArchiveDeletionTarget = {
   snapshotId?: string;
 };
 
+export type ArchiveBoundaryRelocationArtifact = {
+  snapshotId: string;
+  objectName: string;
+  ciphertextSha256: string;
+  ciphertextByteLength: number;
+};
+
+/**
+ * Append-only authority for resolving an exact historical remote boundary
+ * after a provider metadata move. Historical copy receipts remain unchanged.
+ */
+export type ArchiveBoundaryRelocation = {
+  relocationId: string;
+  oldBoundary: RemoteBackupBoundary;
+  newBoundary: RemoteBackupBoundary;
+  artifacts: ArchiveBoundaryRelocationArtifact[];
+  verifiedAt: number;
+};
+
 export type ArchiveCatalogSnapshot = {
   version: 1;
   revision: number;
   authorityDigest: string;
   originals: OriginalCatalogRow[];
   processings: ProcessingCatalogRow[];
+  boundaryRelocations: ArchiveBoundaryRelocation[];
 };

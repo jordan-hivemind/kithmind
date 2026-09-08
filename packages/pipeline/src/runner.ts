@@ -2643,11 +2643,33 @@ export class PipelineRunner {
         if (!equalJson(copy.backup.ciphertext, recoveredBackup.ciphertext)) {
           throw new PipelineWorkerError("archive_backup_recovery_conflict");
         }
+        const storedBoundary = copy.backup.boundary;
         if (
-          recoveredBackup.boundary !== undefined &&
-          !equalJson(copy.backup.boundary, recoveredBackup.boundary)
+          storedBoundary !== undefined &&
+          "backend" in storedBoundary &&
+          recoveredBackup.boundary === undefined
         ) {
           throw new PipelineWorkerError("archive_backup_recovery_conflict");
+        }
+        if (recoveredBackup.boundary !== undefined) {
+          const recoveredBoundary = recoveredBackup.boundary;
+          const relocated =
+            !equalJson(storedBoundary, recoveredBoundary) &&
+            storedBoundary !== undefined &&
+            "backend" in storedBoundary &&
+            this.requireCatalog().resolvesBoundaryRelocation({
+              oldBoundary: storedBoundary,
+              newBoundary: recoveredBoundary,
+              artifact: {
+                snapshotId: copy.backup.snapshotId,
+                objectName: copy.backup.objectName,
+                ciphertextSha256: copy.backup.ciphertext.sha256,
+                ciphertextByteLength: copy.backup.ciphertext.byteLength,
+              },
+            });
+          if (!equalJson(storedBoundary, recoveredBoundary) && !relocated) {
+            throw new PipelineWorkerError("archive_backup_recovery_conflict");
+          }
         }
         backup = copy.backup;
       } else if (recoveredBackup) {

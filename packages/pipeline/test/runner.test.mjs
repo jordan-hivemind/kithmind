@@ -1189,6 +1189,138 @@ test("backup snapshot replay reuses cataloged result and readback time", async (
   }
 });
 
+test("backup replay accepts a changed remote root only for the cataloged artifact relocation", async () => {
+  const setup = await fixture(0);
+  const requestedPrimaryDirectory = join(setup.base, "primary");
+  const requestedBackupDirectory = join(setup.base, "backup");
+  await Promise.all(
+    [requestedPrimaryDirectory, requestedBackupDirectory].map((path) =>
+      mkdir(path, { mode: 0o700 }),
+    ),
+  );
+  const [primaryDirectory, backupDirectory] = await Promise.all([
+    realpath(requestedPrimaryDirectory),
+    realpath(requestedBackupDirectory),
+  ]);
+  const plan = pdfPlan();
+  const checkpoint = archivedCheckpoint(plan, {
+    preflightAction: "original_backup_snapshot",
+  });
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  const backup = await replayableArchiveCopy(
+    backupDirectory,
+    "independent_backup",
+    26,
+  );
+  const oldBoundary = {
+    mode: "independent_backup",
+    readiness: "remote_repository_verified",
+    backend: "rclone_dropbox_v1",
+    remoteName: "kithmind_dropbox",
+    rootPath: "Kith Mind Backups/processing-artifacts/restic-v1",
+    rootDirectoryIdHash: "b".repeat(64),
+    configIdentityFingerprint: "c".repeat(64),
+    repositoryId: "d".repeat(64),
+    resticVersion: "0.19.1",
+    rcloneVersion: "v1.74.4",
+  };
+  const newBoundary = {
+    ...oldBoundary,
+    rootPath: "Kith Mind/backups/processing-artifacts/restic-v1",
+  };
+  backup.restic.repositoryId = oldBoundary.repositoryId;
+  backup.backup = {
+    operationId: backup.restic.operationId,
+    snapshotId: "e".repeat(64),
+    objectName: backup.objectName,
+    ciphertext: backup.published.ciphertext,
+    resticVersion: "0.19.1",
+    repositoryId: oldBoundary.repositoryId,
+    verification: "destination_ciphertext_readback",
+    boundary: oldBoundary,
+  };
+  const recovered = {
+    operationId: backup.restic.operationId,
+    snapshotId: backup.backup.snapshotId,
+    matchingSnapshotCount: 1,
+    objectName: backup.objectName,
+    ciphertext: backup.published.ciphertext,
+    resticVersion: "0.19.1",
+    repositoryId: oldBoundary.repositoryId,
+    verification: "destination_ciphertext_readback",
+    boundary: newBoundary,
+  };
+  const original = {
+    originalCatalogId: checkpoint.originalCatalogId,
+    rowRevision: 9,
+    copies: { primary: archiveCopy("primary"), independent_backup: backup },
+  };
+  let allow = true;
+  const runner = new PipelineRunner(
+    {
+      ...setup.config,
+      pdfDocQa: {
+        archive: {
+          primary: { directory: primaryDirectory },
+          independentBackup: { directory: backupDirectory },
+        },
+      },
+    },
+    journal,
+    { async call() {} },
+  );
+  runner.archivedRows = () => ({ original, processing: {} });
+  runner.archiveCatalog = {
+    resolvesBoundaryRelocation(args) {
+      assert.deepEqual(args, {
+        oldBoundary,
+        newBoundary,
+        artifact: {
+          snapshotId: backup.backup.snapshotId,
+          objectName: backup.backup.objectName,
+          ciphertextSha256: backup.backup.ciphertext.sha256,
+          ciphertextByteLength: backup.backup.ciphertext.byteLength,
+        },
+      });
+      return allow;
+    },
+    async recordResticBackup() {
+      return { ...original, rowRevision: original.rowRevision + 1 };
+    },
+  };
+  try {
+    const next = await runner.recordArchiveAction(
+      checkpoint,
+      "original_backup_snapshot",
+      recovered,
+    );
+    assert.equal(next.step, "original_archive");
+    allow = false;
+    await assert.rejects(
+      () =>
+        runner.recordArchiveAction(
+          checkpoint,
+          "original_backup_snapshot",
+          recovered,
+        ),
+      (error) => error.code === "archive_backup_recovery_conflict",
+    );
+    await assert.rejects(
+      () =>
+        runner.recordArchiveAction(
+          checkpoint,
+          "original_backup_snapshot",
+          { ...recovered, boundary: undefined },
+        ),
+      (error) => error.code === "archive_backup_recovery_conflict",
+      "a remote historical receipt cannot replay without a remote boundary",
+    );
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
 test("a cached provider preflight is revalidated and revoked authority prevents locator side effects", async () => {
   const setup = await fixture(0);
   const age = join(setup.base, "age");
