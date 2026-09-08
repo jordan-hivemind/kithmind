@@ -125,3 +125,19 @@ pnpm build
 - Use short sentences, no emojis or em dashes, and tables for parallel facts.
 - Use conventional commits (`feat:`, `fix:`, `docs:`, `tracker:`) with a body
   that explains why.
+
+## Shared boundary coordination
+
+For shared archive boundaries, layout, decimal or identity conventions, and typed
+contracts, read GitHub Issue 57 in `jordan-hivemind/kithmind` before work, after
+landing, and when blocked. Keep ordinary changes within a workstream in that
+workstream's PR. Sign coordination updates with the workstream and date, and
+correct inaccurate claims in issue bodies that you introduced. GitHub does not
+push notifications to the agents. Use these checkpoints and any configured
+heartbeat to poll; post actionable boundary updates directly on the issue.
+
+Before every Vercel operation, verify the live account, team, and project against
+the owner deployment configuration, using the same credentials for verification
+and execution. The owner uses separate personal and business accounts. Never
+assume the CLI is still signed into the correct account; keep owner account
+identifiers in private configuration, outside this public repository.
