@@ -1,8 +1,11 @@
 # Original-byte and parsed-text contract
 
-**Status:** Reviewed P2-9 design; implementation is in progress. Binary ingestion
-is not enabled yet. Releases follow the standing pre-launch deployment policy;
-owner document ingestion still requires the verification gates below.
+**Status:** The legacy archived-binary path is implemented. The owner trial
+still requires its recovery gates. Existing Dropbox originals now follow the
+separately adopted [provider-original reference contract](2026-09-08-provider-original-reference.md),
+whose admission integration is in progress. It replaces the second original
+archive with a verified reference and encrypted locator metadata. The legacy
+four-receipt path below remains supported.
 
 ## Purpose
 

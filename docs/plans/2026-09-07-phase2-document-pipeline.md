@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-07
 
-**Status:** P2-7, P2-8, and P2-1 are complete. The bounded PDF runner, correction and forget flows, cloud heartbeat, and doctor/Settings flows are merged and deployed; all four repository checks and CI pass. Synthetic verification passed the isolated native restore and [exact current-schema `parser_page_v1` graph checks](2026-09-08-current-schema-native-restore-verification.md). P2-3 has [measured synthetic parser results](../parser-evaluation.md). An owner backup independent of the source computer plus key escrow remain before owner ingestion. Production structured-record playbooks, embedding capability probes, and bulk capacity work remain outstanding.
+**Status:** P2-7, P2-8, and P2-1 are complete. The bounded PDF runner, correction and forget flows, cloud heartbeat, and doctor/Settings flows are merged and deployed; all four repository checks and CI pass. Synthetic verification passed the isolated native restore and [exact current-schema `parser_page_v1` graph checks](2026-09-08-current-schema-native-restore-verification.md). P2-3 has [measured synthetic parser results](../parser-evaluation.md). Recovery-key escrow is owner-confirmed. Encrypted Dropbox database backup and synthetic artifact readback passed. The [provider-original branch](2026-09-08-provider-original-reference.md) and its full admission/recovery/forget verification remain before owner ingestion; this avoids duplicating existing Dropbox PDFs. Production structured-record playbooks, embedding capability probes, and bulk capacity work remain outstanding.
 
 ## Outcome
 
