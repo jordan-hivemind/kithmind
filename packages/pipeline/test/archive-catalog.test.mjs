@@ -9,7 +9,7 @@ import {
   ArchiveCatalogError,
   openArchiveCatalog,
 } from "../dist/archiveCatalog.js";
-import { Journal } from "../dist/journal.js";
+import { Journal, JournalLockedError } from "../dist/journal.js";
 import {
   captureCatalogRecord,
   parserOutputCatalogRecord,
@@ -41,21 +41,33 @@ function binding() {
 }
 
 async function setup() {
-  const directory = await mkdtemp(join(tmpdir(), "archive-catalog-"));
-  const authority = binding();
-  const journal = await Journal.open({
-    directory,
-    binding: authority,
-    credential: "km_synthetic_high_entropy_credential",
-    initialCheckpoint: { version: 1, phase: "idle" },
-    codec,
-  });
-  return {
-    directory,
-    authority,
-    journal,
-    catalog: await openArchiveCatalog({ journal }),
-  };
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const directory = await mkdtemp(join(tmpdir(), "archive-catalog-"));
+    const authority = binding();
+    let journal;
+    try {
+      journal = await Journal.open({
+        directory,
+        binding: authority,
+        credential: "km_synthetic_high_entropy_credential",
+        initialCheckpoint: { version: 1, phase: "idle" },
+        codec,
+      });
+    } catch (error) {
+      await rm(directory, { recursive: true, force: true });
+      // Unrelated authority/path hashes can share bounded local lock ports.
+      if (error instanceof JournalLockedError && attempt < 4) continue;
+      throw error;
+    }
+    try {
+      const catalog = await openArchiveCatalog({ journal });
+      return { directory, authority, journal, catalog };
+    } catch (error) {
+      await journal.close();
+      await rm(directory, { recursive: true, force: true });
+      throw error;
+    }
+  }
 }
 
 function copy(role, seed) {
