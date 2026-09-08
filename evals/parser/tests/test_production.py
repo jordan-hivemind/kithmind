@@ -187,6 +187,117 @@ class ProductionParserTest(unittest.TestCase):
             {"state": "failed", "code": "invalid_input"},
         )
 
+    def test_table_bypass_matches_only_exact_source_and_reports_selection(self):
+        policy = {self.digest: [1]}
+        with (
+            patch(
+                "parser_eval.production._verify_runtime_and_artifacts",
+                return_value=self.manifest,
+            ),
+            patch(
+                "parser_eval.production.convert_worker._pdf_page_count",
+                return_value=1,
+            ) as page_count,
+            patch(
+                "parser_eval.production._conversion_implementation_sha256",
+                return_value="c" * 64,
+            ),
+            patch(
+                "parser_eval.production._convert_docling",
+                return_value=self.conversion(),
+            ) as converter,
+        ):
+            matched = convert_captured_pdf(
+                **self.arguments(table_structure_bypass=policy)
+            )
+        self.assertEqual(matched["state"], "complete")
+        self.assertEqual(matched["tableStructureBypassPages"], [1])
+        self.assertEqual(
+            matched["rawArtifact"]["parserFingerprint"]["schemaVersion"], 3
+        )
+        page_count.assert_called_once_with(self.data)
+        converter.assert_called_once_with(
+            self.data,
+            f"pdf-{self.digest}.pdf",
+            Path("artifacts"),
+            480.0,
+            True,
+            tuple((digest, tuple(pages)) for digest, pages in sorted(policy.items())),
+            self.digest,
+        )
+
+        unknown_data = b"%PDF-other-synthetic-capture"
+        unknown_digest = hashlib.sha256(unknown_data).hexdigest()
+        with (
+            patch(
+                "parser_eval.production._verify_runtime_and_artifacts",
+                return_value=self.manifest,
+            ),
+            patch(
+                "parser_eval.production.convert_worker._pdf_page_count"
+            ) as unknown_page_count,
+            patch(
+                "parser_eval.production._conversion_implementation_sha256",
+                return_value="c" * 64,
+            ),
+            patch(
+                "parser_eval.production._convert_docling",
+                return_value=self.conversion(),
+            ) as unknown_converter,
+        ):
+            unknown = convert_captured_pdf(
+                **self.arguments(
+                    data=unknown_data,
+                    expected_sha256=unknown_digest,
+                    opaque_input_name=f"pdf-{unknown_digest}.pdf",
+                    table_structure_bypass=policy,
+                )
+            )
+        self.assertEqual(unknown["state"], "complete")
+        self.assertEqual(unknown["tableStructureBypassPages"], [])
+        unknown_page_count.assert_not_called()
+        unknown_converter.assert_called_once_with(
+            unknown_data,
+            f"pdf-{unknown_digest}.pdf",
+            Path("artifacts"),
+            480.0,
+            True,
+            ((self.digest, (1,)),),
+            unknown_digest,
+        )
+        self.assertEqual(
+            matched["rawArtifact"]["parserFingerprint"]["fingerprint"],
+            unknown["rawArtifact"]["parserFingerprint"]["fingerprint"],
+        )
+
+    def test_table_bypass_rejects_conflict_and_matched_page_out_of_range(self):
+        policy = {self.digest: [2]}
+        self.assertEqual(
+            convert_captured_pdf(
+                **self.arguments(
+                    table_structure="off", table_structure_bypass=policy
+                )
+            ),
+            {"state": "failed", "code": "invalid_input"},
+        )
+        with (
+            patch(
+                "parser_eval.production._verify_runtime_and_artifacts",
+                return_value=self.manifest,
+            ),
+            patch(
+                "parser_eval.production.convert_worker._pdf_page_count",
+                return_value=1,
+            ) as page_count,
+            patch("parser_eval.production._convert_docling") as converter,
+        ):
+            result = convert_captured_pdf(
+                **self.arguments(table_structure_bypass=policy)
+            )
+        self.assertEqual(result, {"state": "failed", "code": "invalid_input"})
+        page_count.assert_called_once_with(self.data)
+        converter.assert_not_called()
+
     def test_retains_same_page_multi_span_items_and_ignores_empty_items(self):
         def provenance(page, start, end):
             return FakeProvenance(page, (start, end))

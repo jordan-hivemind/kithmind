@@ -18,6 +18,7 @@ import { promisify } from "node:util";
 import { spawn, type ChildProcess } from "node:child_process";
 
 import { inspectCapturedPdf, type CapturedPdf } from "./captureStore.js";
+import type { PdfDocQaConfig } from "./types.js";
 
 const execFileAsync = promisify(execFile);
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -134,10 +135,14 @@ export type RunCapturedPdfParserInput = {
   modelLockPath: string;
   expectedModelLockSha256: string;
   tableStructure?: ParserTableStructure;
+  tableStructureBypass?: ParserTableStructureBypass;
   limits?: ParserProcessLimits;
 };
 
 export type ParserTableStructure = "on" | "off";
+export type ParserTableStructureBypass = NonNullable<
+  PdfDocQaConfig["parser"]["tableStructureBypass"]
+>;
 
 export type PreparePdfDocQaProfileInput = {
   pythonExecutable: string;
@@ -149,6 +154,7 @@ export type PreparePdfDocQaProfileInput = {
   modelLockPath: string;
   expectedModelLockSha256: string;
   tableStructure?: ParserTableStructure;
+  tableStructureBypass?: ParserTableStructureBypass;
   workRoot: string;
   work: ParserProfileWorkIntent;
   limits?: ParserProcessLimits;
@@ -263,6 +269,7 @@ export type RecoveredParserOutput = {
   state: "recovered";
   artifacts: DurableParserOutputArtifacts;
   validated: ValidatedNormalizedBundleResult;
+  tableStructureBypassPages: number[];
 };
 
 export type CapturedPdfParserResult = {
@@ -276,6 +283,7 @@ export type CapturedPdfParserResult = {
   extractionFingerprint: string;
   modelManifestSha256: string;
   pageCount: number;
+  tableStructureBypassPages: number[];
   artifacts: DurableParserOutputArtifacts;
   validated: ValidatedNormalizedBundleResult;
   peakRssBytes: number;
@@ -1280,12 +1288,124 @@ function validateTableCell(value: unknown): void {
 type ValidatedParserFingerprint = {
   fingerprint: string;
   tableStructure: ParserTableStructure;
+  tableStructureBypass?: NormalizedTableStructureBypass;
 };
+
+type NormalizedTableStructureBypass = Array<{
+  sourceSha256: string;
+  pages: number[];
+}>;
 
 function requestedTableStructure(value: unknown): ParserTableStructure {
   if (value === undefined || value === "on") return "on";
   if (value === "off") return "off";
   fail("invalid_input", "parser table structure mode is invalid");
+}
+
+function requestedTableStructureBypass(
+  value: unknown,
+): NormalizedTableStructureBypass | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    fail("invalid_input", "parser table structure bypass policy is invalid");
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.length < 1 || entries.length > 32)
+    fail("invalid_input", "parser table structure bypass policy is invalid");
+  entries.sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+  return entries.map(([sourceSha256, valuePages]) => {
+    if (
+      !SHA256.test(sourceSha256) ||
+      !Array.isArray(valuePages) ||
+      valuePages.length < 1 ||
+      valuePages.length > 64
+    )
+      fail("invalid_input", "parser table structure bypass policy is invalid");
+    const pages = Array.from(valuePages, (page) => {
+      if (!integer(page, 1, 64))
+        fail(
+          "invalid_input",
+          "parser table structure bypass policy is invalid",
+        );
+      return page as number;
+    });
+    if (pages.some((page, index) => index > 0 && page <= pages[index - 1]!))
+      fail("invalid_input", "parser table structure bypass policy is invalid");
+    return { sourceSha256, pages };
+  });
+}
+
+function tableStructureBypassArgument(
+  value: NormalizedTableStructureBypass | undefined,
+): string[] {
+  if (value === undefined) return [];
+  return [
+    "--table-structure-bypass",
+    JSON.stringify(
+      Object.fromEntries(
+        value.map(({ sourceSha256, pages }) => [sourceSha256, pages]),
+      ),
+    ),
+  ];
+}
+
+function sameTableStructureBypass(
+  left: NormalizedTableStructureBypass | undefined,
+  right: NormalizedTableStructureBypass | undefined,
+): boolean {
+  return canonicalIdentity(left ?? null) === canonicalIdentity(right ?? null);
+}
+
+function matchedTableStructureBypassPages(
+  policy: NormalizedTableStructureBypass | undefined,
+  sourceSha256: string,
+): number[] {
+  return (
+    policy?.find((entry) => entry.sourceSha256 === sourceSha256)?.pages ?? []
+  );
+}
+
+function descriptorTableStructureBypass(
+  value: unknown,
+): NormalizedTableStructureBypass {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 32)
+    fail("output_invalid", "parser table structure bypass policy is invalid");
+  const result: NormalizedTableStructureBypass = [];
+  for (const entry of value) {
+    if (
+      !entry ||
+      typeof entry !== "object" ||
+      Array.isArray(entry) ||
+      !exactKeys(entry, ["sourceSha256", "pages"])
+    )
+      fail("output_invalid", "parser table structure bypass policy is invalid");
+    const record = entry as Record<string, unknown>;
+    const sourceSha256 = record.sourceSha256;
+    const pagesValue = record.pages;
+    if (
+      typeof sourceSha256 !== "string" ||
+      !SHA256.test(sourceSha256) ||
+      !Array.isArray(pagesValue) ||
+      pagesValue.length < 1 ||
+      pagesValue.length > 64
+    )
+      fail("output_invalid", "parser table structure bypass policy is invalid");
+    const pages = Array.from(pagesValue, (page) => {
+      if (!integer(page, 1, 64))
+        fail(
+          "output_invalid",
+          "parser table structure bypass policy is invalid",
+        );
+      return page as number;
+    });
+    if (
+      pages.some((page, index) => index > 0 && page <= pages[index - 1]!) ||
+      (result.length > 0 &&
+        sourceSha256 <= result[result.length - 1]!.sourceSha256)
+    )
+      fail("output_invalid", "parser table structure bypass policy is invalid");
+    result.push({ sourceSha256, pages });
+  }
+  return result;
 }
 
 function validateParserFingerprint(
@@ -1311,7 +1431,7 @@ function validateParserFingerprint(
   const runtime = parser.runtime;
   const configuration = parser.configuration;
   if (
-    (parser.schemaVersion !== 1 && parser.schemaVersion !== 2) ||
+    ![1, 2, 3].includes(parser.schemaVersion as number) ||
     parser.modelManifestSha256 !== modelManifestSha256 ||
     !SHA256.test(String(parser.implementationSha256 ?? "")) ||
     !runtime ||
@@ -1347,13 +1467,22 @@ function validateParserFingerprint(
             "outputFormat",
             "timeoutSeconds",
           ]
-        : [
-            "maxInputBytes",
-            "maxConversionPages",
-            "outputFormat",
-            "timeoutSeconds",
-            "tableStructure",
-          ],
+        : parser.schemaVersion === 2
+          ? [
+              "maxInputBytes",
+              "maxConversionPages",
+              "outputFormat",
+              "timeoutSeconds",
+              "tableStructure",
+            ]
+          : [
+              "maxInputBytes",
+              "maxConversionPages",
+              "outputFormat",
+              "timeoutSeconds",
+              "tableStructure",
+              "tableStructureBypass",
+            ],
     )
   ) {
     fail("output_invalid", "parser fingerprint fields are invalid");
@@ -1363,18 +1492,27 @@ function validateParserFingerprint(
     parser.schemaVersion === 1
       ? "on"
       : (config.tableStructure as ParserTableStructure);
+  const tableStructureBypass =
+    parser.schemaVersion === 3
+      ? descriptorTableStructureBypass(config.tableStructureBypass)
+      : undefined;
   if (
     config.maxInputBytes !== 16 * 1024 * 1024 ||
     config.maxConversionPages !== 64 ||
     config.outputFormat !== "docling_lossless_canonical_json_v1" ||
     !integer(config.timeoutSeconds, 1, 480) ||
-    (parser.schemaVersion === 2 &&
+    ((parser.schemaVersion === 2 || parser.schemaVersion === 3) &&
       tableStructure !== "on" &&
-      tableStructure !== "off")
+      tableStructure !== "off") ||
+    (parser.schemaVersion === 3 && tableStructure !== "on")
   ) {
     fail("output_invalid", "parser fingerprint configuration is invalid");
   }
-  return { fingerprint: fingerprint(parser, true), tableStructure };
+  return {
+    fingerprint: fingerprint(parser, true),
+    tableStructure,
+    ...(tableStructureBypass === undefined ? {} : { tableStructureBypass }),
+  };
 }
 
 type ExtractionMappingFormat =
@@ -1452,6 +1590,7 @@ function validateBundle(
 ): {
   parserFingerprint: string;
   tableStructure: ParserTableStructure;
+  tableStructureBypassPages: number[];
   extractionConfigurationFingerprint: string;
   extractionMappingFormat: ExtractionMappingFormat;
   extractionFingerprint: string;
@@ -1486,6 +1625,10 @@ function validateBundle(
     modelManifestSha256,
   );
   const parserFingerprint = parserDescriptor.fingerprint;
+  const tableStructureBypassPages = matchedTableStructureBypassPages(
+    parserDescriptor.tableStructureBypass,
+    capture.sha256,
+  );
   const extraction = bundle.extractionFingerprint;
   if (
     !extraction ||
@@ -1547,7 +1690,10 @@ function validateBundle(
     !Array.isArray(bundle.pages) ||
     !integer(bundle.pages.length, 1, extractionConfiguration.maxPages) ||
     !Array.isArray(bundle.mappingGaps) ||
-    bundle.mappingGaps.length > 4096
+    bundle.mappingGaps.length > 4096 ||
+    tableStructureBypassPages.some(
+      (page) => page > (bundle.pages as unknown[]).length,
+    )
   ) {
     fail("output_invalid", "normalized page or gap count is invalid");
   }
@@ -1679,6 +1825,7 @@ function validateBundle(
   return {
     parserFingerprint,
     tableStructure: parserDescriptor.tableStructure,
+    tableStructureBypassPages,
     extractionConfigurationFingerprint,
     extractionMappingFormat: extractionConfiguration.mappingFormat,
     extractionFingerprint,
@@ -2449,6 +2596,7 @@ export async function inspectCapturedPdfParserOutput(input: {
   return {
     state: "recovered",
     artifacts,
+    tableStructureBypassPages: validated.tableStructureBypassPages,
     validated: {
       bundle: validated.bundle,
       resolvedLocators: validated.resolvedLocators,
@@ -2702,6 +2850,11 @@ export async function preparePdfDocQaProfile(
   requiredPlatform();
   const limits = validateLimits(input.limits);
   const tableStructure = requestedTableStructure(input.tableStructure);
+  const tableStructureBypass = requestedTableStructureBypass(
+    input.tableStructureBypass,
+  );
+  if (tableStructure === "off" && tableStructureBypass !== undefined)
+    fail("invalid_input", "table structure bypass requires table mode on");
   const sandboxTool = await boundedFile(
     "/usr/bin/sandbox-exec",
     "macOS sandbox tool",
@@ -2901,6 +3054,7 @@ export async function preparePdfDocQaProfile(
       "480",
       "--table-structure",
       tableStructure,
+      ...tableStructureBypassArgument(tableStructureBypass),
     ],
     environment,
     limits,
@@ -2923,6 +3077,10 @@ export async function preparePdfDocQaProfile(
   );
   if (parser.tableStructure !== tableStructure)
     fail("output_invalid", "parser profile table structure mode is invalid");
+  if (
+    !sameTableStructureBypass(parser.tableStructureBypass, tableStructureBypass)
+  )
+    fail("output_invalid", "parser profile table bypass policy is invalid");
   const parserFingerprint = parser.fingerprint;
   const extractionConfigurationFingerprint =
     validateExtractionConfigurationFingerprint(
@@ -2962,6 +3120,11 @@ export async function runCapturedPdfParser(
   requiredPlatform();
   const limits = validateLimits(input.limits);
   const tableStructure = requestedTableStructure(input.tableStructure);
+  const tableStructureBypass = requestedTableStructureBypass(
+    input.tableStructureBypass,
+  );
+  if (tableStructure === "off" && tableStructureBypass !== undefined)
+    fail("invalid_input", "table structure bypass requires table mode on");
   const sandboxTool = await boundedFile(
     "/usr/bin/sandbox-exec",
     "macOS sandbox tool",
@@ -3224,6 +3387,7 @@ export async function runCapturedPdfParser(
         "480",
         "--table-structure",
         tableStructure,
+        ...tableStructureBypassArgument(tableStructureBypass),
       ],
       environment,
       limits,
@@ -3231,19 +3395,23 @@ export async function runCapturedPdfParser(
     );
     const launcherResult = parseLauncherResult(conversion.stdout);
     throwLauncherFailure(launcherResult, conversion.launcherFailure);
+    const launcherKeys = [
+      "state",
+      "sourceSha256",
+      "rawSha256",
+      "rawByteLength",
+      "bundleSha256",
+      "bundleByteLength",
+      "parserFingerprint",
+      "extractionFingerprint",
+      "modelManifestSha256",
+      "pageCount",
+      ...(tableStructureBypass === undefined
+        ? []
+        : ["tableStructureBypassPages"]),
+    ];
     if (
-      !exactKeys(launcherResult, [
-        "state",
-        "sourceSha256",
-        "rawSha256",
-        "rawByteLength",
-        "bundleSha256",
-        "bundleByteLength",
-        "parserFingerprint",
-        "extractionFingerprint",
-        "modelManifestSha256",
-        "pageCount",
-      ]) ||
+      !exactKeys(launcherResult, launcherKeys) ||
       launcherResult.state !== "complete"
     )
       fail("output_invalid", "launcher result shape is invalid");
@@ -3283,6 +3451,38 @@ export async function runCapturedPdfParser(
         "output_invalid",
         "parser conversion table structure mode is invalid",
       );
+    if (
+      !sameTableStructureBypass(
+        validateParserFingerprint(
+          validated.bundle.parserFingerprint,
+          modelManifestSha256,
+        ).tableStructureBypass,
+        tableStructureBypass,
+      )
+    )
+      fail(
+        "output_invalid",
+        "parser conversion table bypass policy is invalid",
+      );
+    const expectedBypassPages = matchedTableStructureBypassPages(
+      tableStructureBypass,
+      capture.sha256,
+    );
+    if (
+      tableStructureBypass !== undefined &&
+      (!Array.isArray(launcherResult.tableStructureBypassPages) ||
+        launcherResult.tableStructureBypassPages.some(
+          (page) => !integer(page, 1, validated.pageCount),
+        ) ||
+        canonicalIdentity(launcherResult.tableStructureBypassPages) !==
+          canonicalIdentity(expectedBypassPages))
+    )
+      fail("output_invalid", "parser conversion table bypass match is invalid");
+    if (
+      canonicalIdentity(validated.tableStructureBypassPages) !==
+      canonicalIdentity(expectedBypassPages)
+    )
+      fail("output_invalid", "parser bundle table bypass match is invalid");
     if (
       launcherResult.parserFingerprint !== validated.parserFingerprint ||
       launcherResult.extractionFingerprint !==
@@ -3342,6 +3542,7 @@ export async function runCapturedPdfParser(
       extractionFingerprint: validated.extractionFingerprint,
       modelManifestSha256,
       pageCount: validated.pageCount,
+      tableStructureBypassPages: validated.tableStructureBypassPages,
       artifacts,
       validated: {
         bundle: validated.bundle,
