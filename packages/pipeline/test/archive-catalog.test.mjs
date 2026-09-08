@@ -578,6 +578,176 @@ test("retains processing capture identity across journal restart", async () => {
   }
 });
 
+test("persists and replays an initial provider binding epoch of zero", async () => {
+  const f = await setup();
+  try {
+    const input = original();
+    input.copies = { primary: input.copies.primary };
+    input.providerOriginal = {
+      clientReferenceId: randomUUID(),
+      bindingId: randomUUID(),
+      locator: copy("independent_backup", "3"),
+    };
+    let row = await f.catalog.createOriginalIntent(input);
+    row = await f.catalog.recordProviderVerified({
+      catalogId: row.originalCatalogId,
+      expectedRevision: row.rowRevision,
+      verified: {
+        providerAccountIdHash: hash("1"),
+        providerRootDirectoryIdHash: hash("2"),
+        providerFileIdHash: hash("3"),
+        providerRevision: "rev1",
+        providerContentHash: hash("4"),
+        sourceContentHash: row.origin.sha256,
+        sourceByteLength: row.origin.byteLength,
+        verifiedAt: 20,
+        manifestFingerprint: hash("5"),
+        manifestByteLength: 200,
+      },
+    });
+    row = await f.catalog.recordArchivePreparationIntent({
+      subject: "original_bytes",
+      catalogId: row.originalCatalogId,
+      expectedRevision: row.rowRevision,
+      role: "primary",
+      tempName: `${row.copies.primary.archiveObjectId}.tmp`,
+    });
+    row = await f.catalog.recordArchivePrepared({
+      subject: "original_bytes",
+      catalogId: row.originalCatalogId,
+      expectedRevision: row.rowRevision,
+      role: "primary",
+      prepared: {
+        state: "prepared",
+        tempName: row.copies.primary.preparationIntent.tempName,
+        source: {
+          sha256: row.origin.sha256,
+          byteLength: row.origin.byteLength,
+        },
+        ciphertext: { sha256: hash("6"), byteLength: 300 },
+        ciphertextDevice: 20,
+        ciphertextInode: 21,
+        archiveDirectoryDevice: 20,
+        archiveDirectoryInode: 22,
+        ageVersion: "v1.3.2",
+      },
+    });
+    row = await f.catalog.recordArchivePublished({
+      subject: "original_bytes",
+      catalogId: row.originalCatalogId,
+      expectedRevision: row.rowRevision,
+      role: "primary",
+      published: {
+        state: "published",
+        source: row.copies.primary.prepared.source,
+        ciphertext: row.copies.primary.prepared.ciphertext,
+        ciphertextDevice: row.copies.primary.prepared.ciphertextDevice,
+        ciphertextInode: row.copies.primary.prepared.ciphertextInode,
+        ageVersion: "v1.3.2",
+      },
+      readbackVerifiedAt: 21,
+    });
+    row = await f.catalog.recordCloudReceipt({
+      subject: "original_bytes",
+      catalogId: row.originalCatalogId,
+      expectedRevision: row.rowRevision,
+      role: "primary",
+      receiptId: "receipt_primary",
+      requestDigest: hash("7"),
+      recordedAt: 22,
+    });
+    row = await f.catalog.updateProviderLocator({
+      catalogId: row.originalCatalogId,
+      expectedRevision: row.rowRevision,
+      update(locator) {
+        locator.preparationIntent = {
+          tempName: `${locator.archiveObjectId}.tmp`,
+        };
+        locator.prepared = {
+          state: "prepared",
+          tempName: locator.preparationIntent.tempName,
+          source: { sha256: hash("5"), byteLength: 200 },
+          ciphertext: { sha256: hash("8"), byteLength: 400 },
+          ciphertextDevice: 30,
+          ciphertextInode: 31,
+          archiveDirectoryDevice: 30,
+          archiveDirectoryInode: 32,
+          ageVersion: "v1.3.2",
+        };
+        locator.published = {
+          state: "published",
+          source: locator.prepared.source,
+          ciphertext: locator.prepared.ciphertext,
+          ciphertextDevice: locator.prepared.ciphertextDevice,
+          ciphertextInode: locator.prepared.ciphertextInode,
+          ageVersion: "v1.3.2",
+        };
+        locator.backup = {
+          operationId: locator.restic.operationId,
+          snapshotId: hash("9"),
+          objectName: locator.objectName,
+          ciphertext: locator.published.ciphertext,
+          resticVersion: "0.19.1",
+          repositoryId: locator.restic.repositoryId,
+          verification: "destination_ciphertext_readback",
+          boundary: {
+            mode: "independent_backup",
+            readiness: "remote_repository_verified",
+            backend: "rclone_dropbox_v1",
+            remoteName: "kithmind_dropbox",
+            rootPath: "Kith Mind Backups/Processing",
+            rootDirectoryIdHash: hash("a"),
+            configIdentityFingerprint: hash("b"),
+            repositoryId: locator.restic.repositoryId,
+            resticVersion: "0.19.1",
+            rcloneVersion: "v1.74.4",
+          },
+        };
+        locator.readbackVerifiedAt = 23;
+      },
+    });
+    const expectedRevision = row.rowRevision;
+    const cloud = {
+      sourceItemId: "source_item",
+      sourceRevisionId: "source_revision",
+      primaryReceiptId: row.copies.primary.cloudReceipt.receiptId,
+      providerReferenceId: "provider_reference",
+      providerBindingEpoch: 0,
+      admittedAt: 24,
+    };
+    const admitted = await f.catalog.recordOriginalCloud({
+      catalogId: row.originalCatalogId,
+      expectedRevision,
+      cloud,
+    });
+    assert.equal(admitted.cloud.providerBindingEpoch, 0);
+    assert.deepEqual(
+      await f.catalog.recordOriginalCloud({
+        catalogId: row.originalCatalogId,
+        expectedRevision,
+        cloud,
+      }),
+      admitted,
+    );
+    for (const providerBindingEpoch of [-1, 0.5]) {
+      await assert.rejects(
+        () =>
+          f.catalog.recordOriginalCloud({
+            catalogId: row.originalCatalogId,
+            expectedRevision: admitted.rowRevision,
+            cloud: { ...cloud, providerBindingEpoch },
+          }),
+        (error) =>
+          error instanceof ArchiveCatalogError &&
+          error.code === "catalog_invalid",
+      );
+    }
+  } finally {
+    await f.journal.close();
+    await rm(f.directory, { recursive: true, force: true });
+  }
+});
+
 test("persists archive preparation intent before encryption result", async () => {
   const f = await setup();
   let journal = f.journal;
