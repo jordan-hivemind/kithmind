@@ -1,6 +1,6 @@
 # PDF document capacity
 
-Status: implementation in progress. Tracked as P2-19, following P2-18.
+Status: adopted implementation. Tracked as P2-19, following P2-18.
 
 Ordinary long PDFs exceed the initial page, evidence and processing budgets.
 A dense document can produce thousands of parser items even when its retained
@@ -127,8 +127,8 @@ remained unchanged. Thirteen previously checked invoice fields were preserved;
 eight outputs exactly matched the previously inspected retained text. This is
 capacity and provenance acceptance, not proof of complete source extraction.
 
-GitHub CI passes, including the Linux platform boundary. The final local check
-run follows integration of current main and the historical-wire regression.
+GitHub CI passes, including the Linux platform boundary. Required release checks
+cover the integrated main branch and the historical-wire regression.
 
 A synthetic comparison used three pages, seven segments and 26,563 UTF-8 bytes.
 Both chunk policies produced five chunks with identical text, ranges and hashes.
