@@ -30,7 +30,7 @@ export const SANDBOX_PROFILE = [
 
 export const LIMITS = Object.freeze({
   snapshotBytes: 64 * 1024 * 1024,
-  backendBytes: 128 * 1024 * 1024,
+  backendBytes: 256 * 1024 * 1024,
   zipEntries: 10_000,
   inflatedEntryBytes: 32 * 1024 * 1024,
   inflatedTotalBytes: 128 * 1024 * 1024,

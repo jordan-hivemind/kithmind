@@ -390,6 +390,8 @@ test("snapshot comparison rejects row, file, inventory, and duplicate-entry chan
 
 test("snapshot archive input is bounded before inflation", () => {
   assert.equal(LIMITS.snapshotBytes, 64 * 1024 * 1024);
+  assert.equal(LIMITS.backendBytes, 256 * 1024 * 1024);
+  assert.ok(LIMITS.backendBytes >= 167_291_456);
   assert.equal(LIMITS.inflatedEntryBytes, 32 * 1024 * 1024);
   assert.equal(LIMITS.inflatedTotalBytes, 128 * 1024 * 1024);
   assert.ok(LIMITS.zipEntries <= 10_000);
