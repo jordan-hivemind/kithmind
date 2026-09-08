@@ -42,6 +42,8 @@ EXPECTED_RUNTIME_VERSIONS = {
     "pypdfium2": "5.13.0",
     "numpy": "2.5.3",
 }
+MAX_TABLE_STRUCTURE_BYPASS_SOURCES = 32
+MAX_TABLE_STRUCTURE_BYPASS_PAGES = 64
 OPAQUE_INPUT_NAME = re.compile(r"^pdf-[a-f0-9]{64}\.pdf$")
 
 ERROR_CODES = frozenset(
@@ -619,32 +621,92 @@ def _normalized_bundle(
     return bundle
 
 
+def _normalize_table_structure_bypass(
+    value: Any,
+) -> tuple[tuple[str, tuple[int, ...]], ...] | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, dict)
+        or not 1 <= len(value) <= MAX_TABLE_STRUCTURE_BYPASS_SOURCES
+        or any(
+            not isinstance(source_sha256, str)
+            or not re.fullmatch(r"[a-f0-9]{64}", source_sha256)
+            for source_sha256 in value
+        )
+    ):
+        raise ProductionFailure("invalid_input")
+    normalized: list[tuple[str, tuple[int, ...]]] = []
+    for source_sha256 in sorted(value):
+        pages = value[source_sha256]
+        if (
+            not isinstance(pages, (list, tuple))
+            or not 1 <= len(pages) <= MAX_TABLE_STRUCTURE_BYPASS_PAGES
+            or any(
+                type(page) is not int or not 1 <= page <= convert_worker.MAX_PAGES
+                for page in pages
+            )
+            or any(left >= right for left, right in zip(pages, pages[1:]))
+        ):
+            raise ProductionFailure("invalid_input")
+        normalized.append((source_sha256, tuple(pages)))
+    return tuple(normalized)
+
+
+def _table_structure_bypass_descriptor(
+    policy: tuple[tuple[str, tuple[int, ...]], ...]
+) -> list[dict[str, Any]]:
+    return [
+        {"sourceSha256": source_sha256, "pages": list(pages)}
+        for source_sha256, pages in policy
+    ]
+
+
+def _conversion_implementation_sha256() -> str:
+    return hashlib.sha256(
+        _canonical_json_bytes(
+            {
+                "convert": inspect.getsource(convert_worker._convert_docling),
+                "pageCount": inspect.getsource(convert_worker._pdf_page_count),
+                "selectiveTableModel": inspect.getsource(
+                    convert_worker._SelectiveTableModel
+                ),
+                "serialize": inspect.getsource(_canonical_json_bytes),
+            }
+        )
+    ).hexdigest()
+
+
 def _fingerprint(
-    manifest: dict[str, Any], timeout_seconds: float, table_structure: str = "on"
+    manifest: dict[str, Any],
+    timeout_seconds: float,
+    table_structure: str = "on",
+    table_structure_bypass: Any = None,
 ) -> dict[str, Any]:
+    policy = _normalize_table_structure_bypass(table_structure_bypass)
+    if policy is not None and table_structure != "on":
+        raise ProductionFailure("invalid_input")
+    configuration = {
+        "maxInputBytes": MAX_INPUT_BYTES,
+        "maxConversionPages": convert_worker.MAX_PAGES,
+        "outputFormat": "docling_lossless_canonical_json_v1",
+        "timeoutSeconds": timeout_seconds,
+        "tableStructure": table_structure,
+    }
+    if policy is not None:
+        configuration["tableStructureBypass"] = (
+            _table_structure_bypass_descriptor(policy)
+        )
     fields = {
-        "schemaVersion": 2,
+        "schemaVersion": 3 if policy is not None else 2,
         "runtime": {
             "python": ".".join(map(str, EXPECTED_PYTHON)),
             "versions": EXPECTED_RUNTIME_VERSIONS,
         },
         "modelManifestSha256": manifest.get("manifestSha256"),
         # Raw conversion and serialization identity excludes the normalizer.
-        "implementationSha256": hashlib.sha256(
-            _canonical_json_bytes(
-                {
-                    "convert": inspect.getsource(convert_worker._convert_docling),
-                    "serialize": inspect.getsource(_canonical_json_bytes),
-                }
-            )
-        ).hexdigest(),
-        "configuration": {
-            "maxInputBytes": MAX_INPUT_BYTES,
-            "maxConversionPages": convert_worker.MAX_PAGES,
-            "outputFormat": "docling_lossless_canonical_json_v1",
-            "timeoutSeconds": timeout_seconds,
-            "tableStructure": table_structure,
-        },
+        "implementationSha256": _conversion_implementation_sha256(),
+        "configuration": configuration,
     }
     if not isinstance(fields["modelManifestSha256"], str):
         raise ProductionFailure("model_assets_invalid")
@@ -703,6 +765,7 @@ def prepare_pdf_profile(
     model_lock: Path,
     timeout_seconds: float = 480.0,
     table_structure: str = "on",
+    table_structure_bypass: Any = None,
 ) -> dict[str, Any]:
     """Verify a configuration identity before scanning, without parsing a PDF.
 
@@ -717,8 +780,16 @@ def prepare_pdf_profile(
             or table_structure not in ("on", "off")
         ):
             raise ProductionFailure("invalid_input")
+        policy = _normalize_table_structure_bypass(table_structure_bypass)
+        if policy is not None and table_structure != "on":
+            raise ProductionFailure("invalid_input")
         manifest = _verify_runtime_and_artifacts(artifacts, model_lock)
-        parser = _fingerprint(manifest, float(timeout_seconds), table_structure)
+        parser = _fingerprint(
+            manifest,
+            float(timeout_seconds),
+            table_structure,
+            None if policy is None else dict(policy),
+        )
         return {
             "state": "ready",
             "parserFingerprint": parser,
@@ -740,6 +811,7 @@ def convert_captured_pdf(
     parent_boundary: ParentExecutionBoundary,
     timeout_seconds: float = 480.0,
     table_structure: str = "on",
+    table_structure_bypass: Any = None,
 ) -> dict[str, Any]:
     """Convert one private capture with pinned Docling.
 
@@ -782,18 +854,40 @@ def convert_captured_pdf(
         ):
             raise ProductionFailure("invalid_input")
 
+        policy = _normalize_table_structure_bypass(table_structure_bypass)
+        if policy is not None and table_structure != "on":
+            raise ProductionFailure("invalid_input")
+        selected_pages = () if policy is None else dict(policy).get(expected_sha256, ())
         manifest = _verify_runtime_and_artifacts(artifacts, model_lock)
-        normalized, lossless = _convert_docling(
-            data,
-            opaque_input_name,
-            artifacts,
-            float(timeout_seconds),
-            table_structure == "on",
-        )
+        if selected_pages and max(selected_pages) > convert_worker._pdf_page_count(data):
+            raise ProductionFailure("invalid_input")
+        if policy is None:
+            normalized, lossless = _convert_docling(
+                data,
+                opaque_input_name,
+                artifacts,
+                float(timeout_seconds),
+                table_structure == "on",
+            )
+        else:
+            normalized, lossless = _convert_docling(
+                data,
+                opaque_input_name,
+                artifacts,
+                float(timeout_seconds),
+                table_structure == "on",
+                policy,
+                expected_sha256,
+            )
         raw_bytes = _canonical_json_bytes(lossless)
         if len(raw_bytes) > MAX_LOSSLESS_JSON_BYTES:
             raise ProductionFailure("lossless_output_too_large")
-        fingerprint = _fingerprint(manifest, float(timeout_seconds), table_structure)
+        fingerprint = _fingerprint(
+            manifest,
+            float(timeout_seconds),
+            table_structure,
+            None if policy is None else dict(policy),
+        )
         raw_hash = hashlib.sha256(raw_bytes).hexdigest()
         normalized_bundle = _normalized_bundle(
             normalized, lossless, expected_sha256, fingerprint
@@ -812,6 +906,7 @@ def convert_captured_pdf(
                 "byteLength": len(raw_bytes),
                 "json": lossless,
             },
+            "tableStructureBypassPages": list(selected_pages),
         }
     except ProductionFailure as exc:
         return {"state": "failed", "code": exc.code}

@@ -11,13 +11,49 @@ import socket
 import sys
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from .normalize import normalize_text
 
 MAX_INPUT_BYTES = 16 * 1024 * 1024
 MAX_PAGES = 64
 MAX_RESULT_BYTES = 64 * 1024 * 1024
+
+
+class _SelectiveTableModel:
+    """Bypass table prediction on exact original pages without reordering a batch."""
+
+    def __init__(self, delegate: Any, bypass_pages: tuple[int, ...]) -> None:
+        self._delegate = delegate
+        self._bypass_pages = frozenset(bypass_pages)
+
+    def __call__(self, conv_res: Any, page_batch: Iterable[Any]) -> Iterable[Any]:
+        pages = list(page_batch)
+        page_numbers = [page.page_no for page in pages]
+        if len(set(page_numbers)) != len(page_numbers):
+            raise RuntimeError("table stage received duplicate pages")
+        ordinary = [page for page in pages if page.page_no not in self._bypass_pages]
+        processed = list(self._delegate(conv_res, ordinary)) if ordinary else []
+        if [page.page_no for page in processed] != [page.page_no for page in ordinary]:
+            raise RuntimeError("table stage changed page identity or order")
+        ordinary_by_page = {page.page_no: page for page in processed}
+        for page in pages:
+            if page.page_no in self._bypass_pages:
+                if page.predictions.tablestructure is not None:
+                    raise RuntimeError("selected page already has a table prediction")
+                yield page
+            else:
+                yield ordinary_by_page[page.page_no]
+
+
+def _pdf_page_count(data: bytes) -> int:
+    import pypdfium2
+
+    document = pypdfium2.PdfDocument(data)
+    try:
+        return len(document)
+    finally:
+        document.close()
 
 
 def _provenance_whitespace_only(value: str) -> bool:
@@ -299,6 +335,10 @@ def _convert_docling(
     artifacts: Path,
     timeout: float,
     table_structure: bool = True,
+    table_structure_bypass_policy: tuple[
+        tuple[str, tuple[int, ...]], ...
+    ] = (),
+    source_sha256: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     from docling.datamodel.accelerator_options import (
         AcceleratorDevice,
@@ -307,28 +347,74 @@ def _convert_docling(
     from docling.datamodel.base_models import ConversionStatus, InputFormat
     from docling.datamodel.pipeline_options import PdfPipelineOptions, RapidOcrOptions
     from docling.document_converter import DocumentConverter, PdfFormatOption
+    from docling.pipeline.standard_pdf_pipeline import StandardPdfPipeline
     from docling_core.types.io import DocumentStream
 
-    options = PdfPipelineOptions(
-        artifacts_path=artifacts,
-        document_timeout=timeout,
-        accelerator_options=AcceleratorOptions(
+    if table_structure_bypass_policy and not table_structure:
+        raise RuntimeError("table bypass requires table structure enabled")
+    if table_structure_bypass_policy and source_sha256 is None:
+        raise RuntimeError("table bypass requires source identity")
+    policy = dict(table_structure_bypass_policy)
+    bypass_pages = policy.get(source_sha256 or "", ())
+
+    class SelectivePdfPipelineOptions(PdfPipelineOptions):
+        table_structure_bypass_policy: tuple[
+            tuple[str, tuple[int, ...]], ...
+        ] = ()
+        active_source_sha256: str | None = None
+
+    class SelectiveStandardPdfPipeline(StandardPdfPipeline):
+        def _init_models(self) -> None:
+            super()._init_models()
+            options = self.pipeline_options
+            configured_policy = tuple(options.table_structure_bypass_policy)
+            if configured_policy != table_structure_bypass_policy:
+                raise RuntimeError("table bypass policy changed")
+            selected = dict(configured_policy).get(
+                options.active_source_sha256 or "", ()
+            )
+            if tuple(selected) != tuple(bypass_pages):
+                raise RuntimeError("table bypass selection changed")
+            self.table_model = _SelectiveTableModel(self.table_model, tuple(selected))
+
+    option_values = {
+        "artifacts_path": artifacts,
+        "document_timeout": timeout,
+        "accelerator_options": AcceleratorOptions(
             num_threads=4, device=AcceleratorDevice.CPU
         ),
-        enable_remote_services=False,
-        allow_external_plugins=False,
-        do_ocr=True,
-        ocr_options=RapidOcrOptions(lang=["english"], backend="onnxruntime"),
-        do_table_structure=table_structure,
-        do_picture_classification=False,
-        do_picture_description=False,
-        do_chart_extraction=False,
-        do_code_enrichment=False,
-        do_formula_enrichment=False,
+        "enable_remote_services": False,
+        "allow_external_plugins": False,
+        "do_ocr": True,
+        "ocr_options": RapidOcrOptions(lang=["english"], backend="onnxruntime"),
+        "do_table_structure": table_structure,
+        "do_picture_classification": False,
+        "do_picture_description": False,
+        "do_chart_extraction": False,
+        "do_code_enrichment": False,
+        "do_formula_enrichment": False,
+    }
+    options = (
+        SelectivePdfPipelineOptions(
+            **option_values,
+            table_structure_bypass_policy=table_structure_bypass_policy,
+            active_source_sha256=source_sha256,
+        )
+        if table_structure_bypass_policy
+        else PdfPipelineOptions(**option_values)
     )
     converter = DocumentConverter(
         allowed_formats=[InputFormat.PDF],
-        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=options)},
+        format_options={
+            InputFormat.PDF: PdfFormatOption(
+                **(
+                    {"pipeline_cls": SelectiveStandardPdfPipeline}
+                    if table_structure_bypass_policy
+                    else {}
+                ),
+                pipeline_options=options,
+            )
+        },
     )
     result = converter.convert(
         DocumentStream(name=name, stream=BytesIO(data)),

@@ -1,6 +1,6 @@
 # Source-bound PDF table bypass
 
-Status: design approved; implementation in progress for P2-22.
+Status: implemented for P2-22.
 
 The P2-20 comparison showed that disabling Docling table reconstruction can
 recover worksheet fields, but applying that mode to a complete document removes
@@ -40,6 +40,10 @@ fingerprint is static for the configured profile. It must not vary according to
 the PDF currently being converted. The implementation identity includes the
 custom pipeline and table-stage wrapper source as well as the existing serializer,
 pinned runtime and model manifest.
+
+Configuration accepts the policy as a digest-keyed object. Schema 3 records its
+canonical form as a lexicographically sorted array of
+`{sourceSha256, pages}` objects, with each page array already strictly increasing.
 
 Keep schema 1 as implicit whole-document table-on. Keep schema 2 as the existing
 whole-document on or off contract. Their strict validation, archived inspection
@@ -105,3 +109,9 @@ identity change when the policy is omitted. The implementation fingerprint can
 still change when conversion code changes. A maximum-size policy test must
 serialize the complete schema 3 descriptor and launcher response and prove that
 each remains below the existing 16 KiB protocol limit.
+
+A bounded private replay covered nine documents and 155 pages. Both selected
+worksheet pages retained all six reviewed fields. All 153 unselected pages
+matched the table-on baseline for normalized text, raw semantics, provenance and
+table structures. The replay produced no mapping gaps and left every source
+unchanged.
