@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import {
   chmod,
+  cp,
   mkdir,
   mkdtemp,
   readFile,
@@ -167,6 +168,87 @@ async function outputDirectory(fixture, outputId) {
   await mkdir(path, { mode: 0o700 });
   await chmod(path, 0o700);
   return path;
+}
+
+function assertQuotedSourceField(result, pageNumber, quote) {
+  const page = result.validated.bundle.pages.find(
+    (candidate) => candidate.page === pageNumber,
+  );
+  assert.ok(page, `missing page ${pageNumber}`);
+  const segment = page.segments.find((candidate) =>
+    candidate.text.includes(quote),
+  );
+  assert.ok(segment, `missing citable source field: ${quote}`);
+  assert.ok(result.validated.resolvedLocators[segment.id]);
+  return segment;
+}
+
+function assertOrderedSourceFields(result, pageNumber, fields) {
+  const page = result.validated.bundle.pages.find(
+    (candidate) => candidate.page === pageNumber,
+  );
+  assert.ok(page, `missing page ${pageNumber}`);
+  let cursor = 0;
+  for (const field of fields) {
+    const index = page.text.indexOf(field, cursor);
+    assert.ok(index >= cursor, `missing ordered source field: ${field}`);
+    cursor = index + field.length;
+  }
+  assert.ok(
+    cursor <= page.text.indexOf(fields[0]) + 64,
+    "source fields are not a compact label/value association",
+  );
+  for (const field of fields) assertQuotedSourceField(result, pageNumber, field);
+}
+
+async function assertExactRawProvenance(result) {
+  const raw = JSON.parse(await readFile(result.rawArtifact.path, "utf8"));
+  assert.deepEqual(
+    resolveRawLocators(
+      raw,
+      result.validated.bundle,
+      "docling_utf16_pages_v2",
+    ),
+    result.validated.resolvedLocators,
+  );
+}
+
+async function modeIgnoringFixture(fixture) {
+  const packageRoot = join(fixture.base, "mode-ignoring-package");
+  await cp(join(parserRoot, "src"), packageRoot, { recursive: true });
+  const launcherPath = join(packageRoot, "parser_eval/production_launcher.py");
+  const launcher = await readFile(launcherPath, "utf8");
+  const modified = launcher.replace(
+    "args = parser.parse_args(argv)",
+    'args = parser.parse_args(argv)\n        args.table_structure = "on"',
+  );
+  assert.notEqual(modified, launcher);
+  await writeFile(launcherPath, modified, { mode: 0o600 });
+  return {
+    ...fixture.common,
+    packageRoot,
+    launcherPath,
+    expectedLauncherSha256: sha256(await readFile(launcherPath)),
+  };
+}
+
+async function legacySchemaFixture(fixture) {
+  const packageRoot = join(fixture.base, "legacy-schema-package");
+  await cp(join(parserRoot, "src"), packageRoot, { recursive: true });
+  const productionPath = join(packageRoot, "parser_eval/production.py");
+  const production = await readFile(productionPath, "utf8");
+  const legacy = production
+    .replace('"schemaVersion": 2,', '"schemaVersion": 1,')
+    .replace('            "tableStructure": table_structure,\n', "");
+  assert.notEqual(legacy, production);
+  await writeFile(productionPath, legacy, { mode: 0o600 });
+  const launcherPath = join(packageRoot, "parser_eval/production_launcher.py");
+  return {
+    ...fixture.common,
+    packageRoot,
+    launcherPath,
+    expectedLauncherSha256: sha256(await readFile(launcherPath)),
+  };
 }
 
 function multiSpanLocatorFixture(separator = " ") {
@@ -597,6 +679,14 @@ test(
         expectedModelManifestSha256: result.modelManifestSha256,
       });
       assert.deepEqual(recovered.validated, result.validated);
+      for (const quote of [
+        "Patient: Alex Sample A",
+        "Result: 25 µg/L",
+        "Astral marker: 🌍 retained",
+        "Analyte: Café marker",
+      ])
+        assertQuotedSourceField(result, 1, quote);
+      await assertExactRawProvenance(result);
       const mapped = await mapParsedBundle({
         ...recovered.validated,
         title: "Synthetic pilot",
@@ -620,6 +710,171 @@ test(
           artifacts: result.artifacts,
         }),
         { state: "already_missing" },
+      );
+    } finally {
+      await rm(f.base, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "uses distinct verified table structure modes for the synthetic PDF",
+  { skip: !hasRuntime, timeout: 240_000 },
+  async () => {
+    const f = await fixture();
+    try {
+      const onWork = await createParserProfileWorkDirectory({
+        workRoot: f.outputRoot,
+        workId: randomUUID(),
+      });
+      const offWork = await createParserProfileWorkDirectory({
+        workRoot: f.outputRoot,
+        workId: randomUUID(),
+      });
+      const onProfile = await preparePdfDocQaProfile({
+        ...f.common,
+        workRoot: f.outputRoot,
+        work: onWork,
+      });
+      const offProfile = await preparePdfDocQaProfile({
+        ...f.common,
+        tableStructure: "off",
+        workRoot: f.outputRoot,
+        work: offWork,
+      });
+      assert.equal(onProfile.state, "ready");
+      assert.equal(offProfile.state, "ready");
+      assert.notEqual(onProfile.parserFingerprint, offProfile.parserFingerprint);
+      const outputId = randomUUID();
+      const output = await outputDirectory(f, outputId);
+      const result = await runCapturedPdfParser({
+        ...f.common,
+        tableStructure: "off",
+        outputId,
+        outputDirectory: output,
+      });
+      assert.equal(result.state, "complete");
+      assert.equal(result.parserFingerprint, offProfile.parserFingerprint);
+      for (const quote of [
+        "Patient: Alex Sample A",
+        "Result: 25 µg/L",
+        "Astral marker: 🌍 retained",
+        "Analyte: Café marker",
+      ])
+        assertQuotedSourceField(result, 1, quote);
+      await assertExactRawProvenance(result);
+    } finally {
+      await rm(f.base, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "rejects an ignored table structure mode in profile and conversion results",
+  { skip: !hasRuntime, timeout: 240_000 },
+  async () => {
+    const f = await fixture();
+    try {
+      const common = await modeIgnoringFixture(f);
+      const work = await createParserProfileWorkDirectory({
+        workRoot: f.outputRoot,
+        workId: randomUUID(),
+      });
+      await assert.rejects(
+        () =>
+          preparePdfDocQaProfile({
+            ...common,
+            tableStructure: "off",
+            workRoot: f.outputRoot,
+            work,
+          }),
+        (error) =>
+          error instanceof ParserProcessError && error.code === "output_invalid",
+      );
+      const outputId = randomUUID();
+      const output = await outputDirectory(f, outputId);
+      await assert.rejects(
+        () =>
+          runCapturedPdfParser({
+            ...common,
+            tableStructure: "off",
+            outputId,
+            outputDirectory: output,
+          }),
+        (error) =>
+          error instanceof ParserProcessError && error.code === "output_invalid",
+      );
+    } finally {
+      await rm(f.base, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "accepts legacy schema one profiles as table structure on only",
+  { skip: !hasRuntime, timeout: 120_000 },
+  async () => {
+    const f = await fixture();
+    try {
+      const common = await legacySchemaFixture(f);
+      const onWork = await createParserProfileWorkDirectory({
+        workRoot: f.outputRoot,
+        workId: randomUUID(),
+      });
+      const profile = await preparePdfDocQaProfile({
+        ...common,
+        workRoot: f.outputRoot,
+        work: onWork,
+      });
+      assert.equal(profile.state, "ready");
+      const outputId = randomUUID();
+      const output = await outputDirectory(f, outputId);
+      const intent = await inspectParserOutputIntent({
+        outputRoot: f.outputRoot,
+        outputId,
+      });
+      const result = await runCapturedPdfParser({
+        ...common,
+        outputId,
+        outputDirectory: output,
+      });
+      const recovered = await inspectCapturedPdfParserOutput({
+        capture: common.capture,
+        outputRoot: f.outputRoot,
+        outputIntent: intent,
+        expectedParserFingerprint: result.parserFingerprint,
+        expectedExtractionConfigurationFingerprint:
+          result.extractionConfigurationFingerprint,
+        expectedModelManifestSha256: result.modelManifestSha256,
+      });
+      assert.deepEqual(recovered.validated, result.validated);
+      const offWork = await createParserProfileWorkDirectory({
+        workRoot: f.outputRoot,
+        workId: randomUUID(),
+      });
+      await assert.rejects(
+        () =>
+          preparePdfDocQaProfile({
+            ...common,
+            tableStructure: "off",
+            workRoot: f.outputRoot,
+            work: offWork,
+          }),
+        (error) =>
+          error instanceof ParserProcessError && error.code === "output_invalid",
+      );
+      const offOutputId = randomUUID();
+      const offOutput = await outputDirectory(f, offOutputId);
+      await assert.rejects(
+        () =>
+          runCapturedPdfParser({
+            ...common,
+            tableStructure: "off",
+            outputId: offOutputId,
+            outputDirectory: offOutput,
+          }),
+        (error) =>
+          error instanceof ParserProcessError && error.code === "output_invalid",
       );
     } finally {
       await rm(f.base, { recursive: true, force: true });
@@ -700,6 +955,29 @@ test(
             entry.kind === "table" && entry.ref.startsWith("#/tables/"),
         ),
       );
+      const feeRow = assertQuotedSourceField(result, 1, "Fee | USD | 65.00");
+      assert.equal(feeRow.locator.kind, "docling_table_row");
+      assert.deepEqual(
+        feeRow.locator.cells
+          .slice()
+          .sort(
+            (left, right) =>
+              left.start_col_offset_idx - right.start_col_offset_idx,
+          )
+          .map((cell) => cell.text),
+        ["Fee", "USD", "65.00"],
+      );
+      await assertExactRawProvenance(result);
+      const offOutputId = randomUUID();
+      const offOutput = await outputDirectory(f, offOutputId);
+      const offResult = await runCapturedPdfParser({
+        ...f.common,
+        tableStructure: "off",
+        outputId: offOutputId,
+        outputDirectory: offOutput,
+      });
+      assertOrderedSourceFields(offResult, 1, ["Fee", "USD", "65.00"]);
+      await assertExactRawProvenance(offResult);
       context.diagnostic(
         JSON.stringify({
           pages: mapped.pages.length,
@@ -708,6 +986,30 @@ test(
           chunks: mapped.chunks.length,
         }),
       );
+    } finally {
+      await rm(f.base, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "retains a scanned source field with exact provenance in both table modes",
+  { skip: !hasRuntime, timeout: 240_000 },
+  async () => {
+    const f = await fixture("image-clear.pdf");
+    try {
+      for (const tableStructure of ["on", "off"]) {
+        const outputId = randomUUID();
+        const output = await outputDirectory(f, outputId);
+        const result = await runCapturedPdfParser({
+          ...f.common,
+          tableStructure,
+          outputId,
+          outputDirectory: output,
+        });
+        assertQuotedSourceField(result, 1, "Amount due: USD 42.00");
+        await assertExactRawProvenance(result);
+      }
     } finally {
       await rm(f.base, { recursive: true, force: true });
     }

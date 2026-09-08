@@ -24,7 +24,9 @@ class ProductionLauncherTests(unittest.TestCase):
 import os
 
 
-def prepare_pdf_profile(*, artifacts, model_lock, timeout_seconds):
+def prepare_pdf_profile(*, artifacts, model_lock, timeout_seconds, table_structure):
+    if table_structure != "off":
+        raise ValueError("table structure mode was not forwarded")
     os.write(1, b"native stdout noise\\n")
     os.write(2, b"native stderr noise\\n")
     return {
@@ -54,6 +56,8 @@ def prepare_pdf_profile(*, artifacts, model_lock, timeout_seconds):
                     "/model-lock",
                     "--conversion-timeout-seconds",
                     "1",
+                    "--table-structure",
+                    "off",
                 ],
                 check=False,
                 capture_output=True,

@@ -619,9 +619,11 @@ def _normalized_bundle(
     return bundle
 
 
-def _fingerprint(manifest: dict[str, Any], timeout_seconds: float) -> dict[str, Any]:
+def _fingerprint(
+    manifest: dict[str, Any], timeout_seconds: float, table_structure: str = "on"
+) -> dict[str, Any]:
     fields = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "runtime": {
             "python": ".".join(map(str, EXPECTED_PYTHON)),
             "versions": EXPECTED_RUNTIME_VERSIONS,
@@ -641,6 +643,7 @@ def _fingerprint(manifest: dict[str, Any], timeout_seconds: float) -> dict[str, 
             "maxConversionPages": convert_worker.MAX_PAGES,
             "outputFormat": "docling_lossless_canonical_json_v1",
             "timeoutSeconds": timeout_seconds,
+            "tableStructure": table_structure,
         },
     }
     if not isinstance(fields["modelManifestSha256"], str):
@@ -695,7 +698,11 @@ def _extraction_fingerprint(parser: dict[str, Any], raw_hash: str) -> dict[str, 
 
 
 def prepare_pdf_profile(
-    *, artifacts: Path, model_lock: Path, timeout_seconds: float = 480.0
+    *,
+    artifacts: Path,
+    model_lock: Path,
+    timeout_seconds: float = 480.0,
+    table_structure: str = "on",
 ) -> dict[str, Any]:
     """Verify a configuration identity before scanning, without parsing a PDF.
 
@@ -707,10 +714,11 @@ def prepare_pdf_profile(
             isinstance(timeout_seconds, bool)
             or not isinstance(timeout_seconds, (int, float))
             or not 0 < timeout_seconds <= 480
+            or table_structure not in ("on", "off")
         ):
             raise ProductionFailure("invalid_input")
         manifest = _verify_runtime_and_artifacts(artifacts, model_lock)
-        parser = _fingerprint(manifest, float(timeout_seconds))
+        parser = _fingerprint(manifest, float(timeout_seconds), table_structure)
         return {
             "state": "ready",
             "parserFingerprint": parser,
@@ -731,6 +739,7 @@ def convert_captured_pdf(
     model_lock: Path,
     parent_boundary: ParentExecutionBoundary,
     timeout_seconds: float = 480.0,
+    table_structure: str = "on",
 ) -> dict[str, Any]:
     """Convert one private capture with pinned Docling.
 
@@ -769,17 +778,22 @@ def convert_captured_pdf(
             isinstance(timeout_seconds, bool)
             or not isinstance(timeout_seconds, (int, float))
             or not 0 < timeout_seconds <= 480
+            or table_structure not in ("on", "off")
         ):
             raise ProductionFailure("invalid_input")
 
         manifest = _verify_runtime_and_artifacts(artifacts, model_lock)
         normalized, lossless = _convert_docling(
-            data, opaque_input_name, artifacts, float(timeout_seconds)
+            data,
+            opaque_input_name,
+            artifacts,
+            float(timeout_seconds),
+            table_structure == "on",
         )
         raw_bytes = _canonical_json_bytes(lossless)
         if len(raw_bytes) > MAX_LOSSLESS_JSON_BYTES:
             raise ProductionFailure("lossless_output_too_large")
-        fingerprint = _fingerprint(manifest, float(timeout_seconds))
+        fingerprint = _fingerprint(manifest, float(timeout_seconds), table_structure)
         raw_hash = hashlib.sha256(raw_bytes).hexdigest()
         normalized_bundle = _normalized_bundle(
             normalized, lossless, expected_sha256, fingerprint

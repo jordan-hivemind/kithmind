@@ -40,6 +40,7 @@ export type PdfDocQaConfig = {
     modelAssetsPath: string;
     modelLockPath: string;
     expectedModelLockSha256: string;
+    tableStructure?: "on" | "off";
   };
   profile: PdfDocQaProfile;
   archive: {
