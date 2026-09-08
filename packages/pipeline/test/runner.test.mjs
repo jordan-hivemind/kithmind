@@ -2114,7 +2114,12 @@ test(
       "macOS is the supported cleanup boundary",
   },
   async () => {
-    const setup = await fixture(0);
+    const plan = pdfPlan();
+    const checkpoint = archivedCheckpoint(plan, {
+      step: "cleanup",
+      preflightAction: undefined,
+    });
+    const { journal, ...setup } = await fixtureWithJournal(0, checkpoint);
     const requestedCaptureDirectory = join(setup.base, "captures");
     const requestedParserOutputRoot = join(setup.base, "outputs");
     const requestedSpoolDirectory = join(setup.base, "spool");
@@ -2136,12 +2141,6 @@ test(
     const [captureStat, outputStat, spoolStat] = await Promise.all(
       [captureDirectory, parserOutputRoot, spoolDirectory].map(lstat),
     );
-    const plan = pdfPlan();
-    const checkpoint = archivedCheckpoint(plan, {
-      step: "cleanup",
-      preflightAction: undefined,
-    });
-    const journal = await openJournal(setup.journalDir, checkpoint);
     const captureId = randomUUID();
     const outputId = randomUUID();
     const spoolId = randomUUID();

@@ -19,7 +19,11 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 
-import { inspectJournalReadOnly, Journal } from "../dist/journal.js";
+import {
+  inspectJournalReadOnly,
+  Journal,
+  JournalLockedError,
+} from "../dist/journal.js";
 
 const execFileAsync = promisify(execFile);
 const CREDENTIAL = "synthetic-inspection-credential";
@@ -99,6 +103,25 @@ async function openJournal(directory, authority, options = {}) {
     initialCheckpoint: options.checkpoint ?? { version: 1, phase: "idle" },
     codec,
   });
+}
+
+async function fixtureWithJournal(options = {}) {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const directory = await temporaryDirectory();
+    const authority = binding();
+    try {
+      return {
+        directory,
+        authority,
+        journal: await openJournal(directory, authority, options),
+      };
+    } catch (error) {
+      await rm(directory, { recursive: true, force: true });
+      // Unrelated authority/path hashes can share bounded local lock ports.
+      if (error instanceof JournalLockedError && attempt < 4) continue;
+      throw error;
+    }
+  }
 }
 
 function retainedMetadata(stats) {
@@ -278,9 +301,8 @@ test("inspection reports current, quiescent, active, and unverified credential b
 });
 
 test("inspection reports pending cached state and sticky manual recovery without exposing details", async () => {
-  const pendingDirectory = await temporaryDirectory();
-  const authority = binding();
-  let journal = await openJournal(pendingDirectory, authority);
+  const pendingFixture = await fixtureWithJournal();
+  const { directory: pendingDirectory, authority, journal } = pendingFixture;
   await journal.planRequest(planned(authority, "cached-request"));
   await journal.recordValidatedResult(
     { operation: "scan.begin", state: "open" },
@@ -299,18 +321,22 @@ test("inspection reports pending cached state and sticky manual recovery without
   assert.equal(JSON.stringify(pending).includes("cached-request"), false);
   await rm(pendingDirectory, { recursive: true, force: true });
 
-  const stickyDirectory = await temporaryDirectory();
-  journal = await openJournal(stickyDirectory, authority, {
+  const stickyFixture = await fixtureWithJournal({
     checkpoint: {
       version: 1,
       phase: "terminal",
       code: "request_conflict",
     },
   });
-  await journal.close();
+  const {
+    directory: stickyDirectory,
+    authority: stickyAuthority,
+    journal: stickyJournal,
+  } = stickyFixture;
+  await stickyJournal.close();
   const sticky = await inspectJournalReadOnly({
     directory: stickyDirectory,
-    binding: authority,
+    binding: stickyAuthority,
     codec,
     credentialForComparison: CREDENTIAL,
   });
