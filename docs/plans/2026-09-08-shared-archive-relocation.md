@@ -16,8 +16,7 @@ yet provide an owner relocation command. No live move or deletion has occurred.
   move intent, recovers uncertain outcomes by stable identity, and requires
   identical post-move inventory before invoking rebind and scan gates.
 
-The next component adds a Dropbox adapter and paired journal/config rebind
-APIs. The adapter binds both move endpoints to stable folder IDs and checks
+The Dropbox adapter and paired journal/config rebind APIs are implemented. The adapter binds both move endpoints to stable folder IDs and checks
 the account, parent, name, and resulting path. A separate account-bound root
 marker represents the top-level parent; the adapter does not enumerate that
 root. The move disables automatic renaming and ownership transfer.
@@ -30,12 +29,32 @@ identity and invalidates its prior in-memory instance; callers must use the
 returned journal and reopen its catalog. The recovery tests use a real local
 catalog but synthetic artifacts, not owner backup data.
 
-The workflow still requires a concrete durable store with an exclusive lease,
-an owner command connecting all components, and actual decryption and
+A protected workflow session now holds the existing journal locks through the
+move and journal transfer. Its bounded state file records exact prior-file
+hashes and validates complete workflow state before recovering a prepared
+transition. It rejects conflicting files, unsafe paths, and closed journals.
+The whole Dropbox root and the processing repository leaf have separate
+identities; the session verifies the leaf's exact relative suffix under both
+root paths before applying the persisted catalog mapping.
+
+The ciphertext restore helper reads one exact restic snapshot/object without
+a cache, checks stream and on-disk hashes, and publishes a protected file
+without overwriting an existing destination. It does not decrypt the object
+or validate its application contents. A process death can leave its random
+temporary file, so this helper alone is not resumable restore orchestration.
+The owner command must record and account for those outputs before retrying.
+
+The workflow still requires an owner command connecting all components, a
+protected recipe covering both repositories, and actual decryption and
 database-restore gates. Its synthetic tests do not establish Dropbox identity
 preservation or authorize skipping those gates. The current
 component limits are 2,048 inventory objects and 64 MiB per ciphertext object.
 Larger migrations require a separately tested limit change before preparation.
+The database repository has retained snapshots whose object paths are absolute
+paths within the snapshot. Preserve those exact receipt paths through a
+separate validated recovery interface. Do not weaken the processing-object
+name validator or reinterpret the snapshot path as a local output path.
+
 The owner command must also select an OAuth refresh path outside the moved
 root and verify that the old heartbeat stops before resuming the new one.
 
