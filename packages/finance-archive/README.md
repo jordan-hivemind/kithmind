@@ -229,6 +229,61 @@ separate concern from checking it. Re-running after a corrected import is
 idempotent: any prior row for the same account and period is replaced, not
 added to.
 
+## Wiring an adapter to the importer
+
+`src/adapterImport.ts` is the seam between `ParsedRow` (what an adapter's
+`parse()` returns) and `ImportRow`/`ImportDocument` (what `importBatch`
+consumes); neither the adapter interface nor the importer owns this mapping
+on its own. `adapterPullToImportDocuments(db, pull)` does two things a
+caller cannot do by combining the other two files alone:
+
+- **Instrument resolution.** `ParsedRow.instrument` is a descriptor (symbol,
+  cusip, isin, name); `resolveInstrumentId` turns it into a stable
+  `instruments.id`, creating the row the first time it is seen. Precedence:
+  `cusip`, then `isin`, then `symbol` and `name` together, then `symbol`
+  alone, then a new row. A real identifier never merges two different
+  instruments that happen to share a ticker. A bare symbol with no cusip,
+  isin or matching name resolves to the *existing* instrument with that
+  symbol (deterministically the first one ever created, by SQLite `rowid`)
+  rather than minting a new row every time -- unbounded row growth would
+  silently break "every purchase of instrument X" just as badly as a wrong
+  merge would -- and every such weak match opens a `review_items` entry
+  (`kind = 'weak_instrument_match'`) naming the symbol and which row it
+  matched, the same way a cross-document `row_hash` collapse is made
+  visible instead of happening quietly.
+- **Document splitting.** `ParsedRow.sourceDocument` tells the wiring layer
+  which underlying document (a page of a paginated pull, or the one file for
+  a statement, confirmation or tabular export) each row belongs to. A pull
+  that is one document end to end becomes one `ImportDocument`; a paginated
+  pull becomes one `ImportDocument` per page, so the importer's
+  per-document `occurrence` ordinal is scoped to the right boundary and the
+  same real transaction on an overlapping page lands on a matching ordinal
+  in each page's document. See `ParsedRow.sourceDocument`'s doc comment in
+  `src/adapter.ts` for the full reasoning. Splitting loses the single
+  provider-reported total the un-split case can assert directly, so
+  `adapterPullToImportDocuments` checks it separately across the whole pull:
+  it recomputes each page's `occurrence` ordinal and `row_hash` the same way
+  `importBatch` will (via `contentKey` in `rowHash.ts`, shared by both so
+  they cannot drift apart) and compares the distinct-hash count against the
+  provider's total -- this works whether or not the rows carry a provider
+  transaction id, unlike checking distinct ids alone, which goes silent the
+  moment a source has none. When the provider states no total at all for a
+  paginated pull, ground rule 7 forbids asserting completeness anyway: the
+  pull still imports, but opens a `review_items` entry
+  (`kind = 'unverified_pagination_total'`) rather than passing silently, so
+  that pull's completeness is never later assumed.
+
+Two other renames happen here, not upstream: `ParsedRow.externalId` becomes
+`ImportRow.providerTxnId` (same concept), and `ParsedRow.locators` (a
+per-field map) is JSON-encoded into the single `ImportRow.sourceLocator`
+string rather than collapsed to just the row locator, so per-field
+provenance survives into `transactions.source_locator` even though the
+column itself stays a single opaque string. `ParsedRow.amountNote` -- the
+required reason behind a `null` amount an adapter could not read -- passes
+through as `ImportRow.amountNote`; the importer opens a `review_items` entry
+for it exactly as it does for an amount `toMinorUnits` rejects, rather than
+letting it vanish.
+
 ## Schema and migrations
 
 `openArchive(path)` opens the file, sets `foreign_keys`, WAL and a busy timeout,

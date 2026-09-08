@@ -45,6 +45,9 @@ export type RowHashInput = {
   occurrence: number;
 };
 
+/** `RowHashInput` minus the occurrence ordinal: the content an occurrence counts over. */
+export type RowContent = Omit<RowHashInput, "occurrence">;
+
 /**
  * Collapses runs of whitespace and trims. PDF text extraction varies the gaps
  * inside a description between runs; the words are the identity.
@@ -53,12 +56,39 @@ export function normalizeText(value: string): string {
   return value.replace(/\s+/g, " ").trim();
 }
 
+/**
+ * The key an occurrence ordinal counts over: every `rowHash` input field
+ * except the ordinal itself, normalized the same way `rowHash` normalizes
+ * them. Shared by the importer (which counts per document while inserting)
+ * and the adapter-import wiring (which needs the same count ahead of time,
+ * to check a paginated pull's row count without inserting anything) so the
+ * two never drift into computing "how many times has this been seen" two
+ * different ways.
+ */
+export function contentKey(row: RowContent): string {
+  return [
+    row.accountId,
+    row.processDate,
+    normalizeText(row.activityType).toLowerCase(),
+    normalizeText(row.description),
+    row.quantity ?? "-",
+    row.amount === null ? "-" : row.amount.toString(),
+    row.currency,
+  ].join(" ");
+}
+
 /** Length prefixes so no field can impersonate a field boundary. */
 function field(value: string | null): string {
   return value === null ? "-" : `${Buffer.byteLength(value, "utf8")}:${value}`;
 }
 
 export function rowHash(input: RowHashInput): string {
+  if (!Number.isInteger(input.occurrence) || input.occurrence < 1) {
+    throw new RangeError(
+      `rowHash: occurrence must be an integer >= 1, got ${JSON.stringify(input.occurrence)}; ` +
+        "omitting it hashes undefined into its own namespace and silently breaks deduplication",
+    );
+  }
   currencyExponent(input.currency);
   const parts = [
     field(input.accountId),

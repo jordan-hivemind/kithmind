@@ -61,6 +61,7 @@ function row(overrides = {}) {
     quantity: null,
     price: null,
     amountText: "-42.10",
+    amountNote: null,
     currency: "USD",
     runningBalance: null,
     sourceLocator: "row:1",
@@ -173,6 +174,63 @@ test("a provider-reported total that does not match the pull fails loudly", (t) 
     db.prepare("SELECT COUNT(*) AS n FROM import_runs").get().n,
     0,
   );
+});
+
+test("an amount an adapter could not read at all enters the review queue with its note, not silently null", (t) => {
+  const db = archive(t);
+  seed(db);
+  const rows = [
+    row({
+      providerTxnId: "ptx-garbled",
+      amountText: null,
+      amountNote: 'statement text has an unparseable amount: "1,2O3.45"',
+    }),
+  ];
+  const summary = importBatch(
+    db,
+    { source: "synthetic-pull", documents: [document("b1".padEnd(64, "0"), rows)] },
+    NOW,
+  );
+
+  assert.equal(summary.rowsInserted, 1);
+  assert.equal(summary.reviewItemsOpened, 1);
+
+  const stored = db
+    .prepare("SELECT amount, status FROM transactions WHERE provider_txn_id = 'ptx-garbled'")
+    .get();
+  assert.equal(stored.amount, null);
+  assert.equal(stored.status, "review");
+
+  const review = db.prepare("SELECT kind, reason, status FROM review_items").get();
+  assert.equal(review.kind, "ambiguous_amount");
+  assert.equal(review.reason, rows[0].amountNote);
+  assert.equal(review.status, "open");
+});
+
+test("a row with genuinely no amount (a non-monetary event) opens no review item", (t) => {
+  const db = archive(t);
+  seed(db);
+  const rows = [
+    row({
+      providerTxnId: "ptx-nonmonetary",
+      activityType: "info",
+      amountText: null,
+      amountNote: null,
+    }),
+  ];
+  const summary = importBatch(
+    db,
+    { source: "synthetic-pull", documents: [document("b2".padEnd(64, "0"), rows)] },
+    NOW,
+  );
+
+  assert.equal(summary.rowsInserted, 1);
+  assert.equal(summary.reviewItemsOpened, 0);
+  const stored = db
+    .prepare("SELECT amount, status FROM transactions WHERE provider_txn_id = 'ptx-nonmonetary'")
+    .get();
+  assert.equal(stored.amount, null);
+  assert.equal(stored.status, "imported");
 });
 
 test("an amount too precise for its currency enters the review queue, never a rounded guess", (t) => {

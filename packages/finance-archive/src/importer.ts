@@ -18,7 +18,7 @@ import type { DatabaseSync } from "node:sqlite";
 
 import { canonicalizeDecimal } from "./decimal.js";
 import { toMinorUnits } from "./money.js";
-import { normalizeText, rowHash } from "./rowHash.js";
+import { contentKey, rowHash } from "./rowHash.js";
 
 /**
  * One transaction as a source hands it to the importer, already normalized to
@@ -37,11 +37,19 @@ import { normalizeText, rowHash } from "./rowHash.js";
  *   is stored as NULL rather than guessed.
  * - `amountText` is the amount as the source stated it, in `currency`'s
  *   units (e.g. `"12.34"` for USD), or `null` when the source itself has no
- *   amount for this row (a non-monetary event). A value with more precision
- *   than `currency` allows (`toMinorUnits` throwing) is ambiguous money:
- *   the importer stores NULL and opens a review item (ground rule 5). This
- *   is the only path from source text to the `amount` column; nothing in
- *   this file parses a float or writes a REAL.
+ *   amount for this row (a non-monetary event) or the amount is ambiguous.
+ *   A value with more precision than `currency` allows (`toMinorUnits`
+ *   throwing) is ambiguous money: the importer stores NULL and opens a
+ *   review item (ground rule 5). This is the only path from source text to
+ *   the `amount` column; nothing in this file parses a float or writes a
+ *   REAL.
+ * - `amountNote` is required whenever `amountText` is null for a reason
+ *   other than "this row has no amount": an adapter that could not read an
+ *   amount (`ParsedAmount`'s `{ amount: null, amountNote: string }` case)
+ *   passes that note through here rather than dropping it. The importer
+ *   opens a review item carrying the note (ground rule 5); it never lets an
+ *   unreadable amount vanish silently. Pass `null` only for a genuinely
+ *   non-monetary row.
  * - `providerTxnId` is a stable per-account transaction identifier from the
  *   source, when one exists. It is the preferred, authoritative dedupe
  *   identity and should be supplied whenever an adapter's source offers one,
@@ -71,6 +79,8 @@ export type ImportRow = {
   price: string | null;
   /** Decimal text in `currency` units, or null if the source has no amount. */
   amountText: string | null;
+  /** A reason `amountText` is null because it was unreadable, not absent. See above. */
+  amountNote: string | null;
   currency: string;
   runningBalance: string | null;
   /** Page, row or path locator within the source document. */
@@ -203,30 +213,6 @@ export function importBatch(
     reviewItemsOpened += 1;
   }
 
-  /**
-   * How many times a given content (the fields `rowHash` hashes, before the
-   * occurrence ordinal) has been seen so far within the current document.
-   * Reset for every new document, per the fix: the ordinal must be scoped to
-   * one document, in that document's own row order, for the same real
-   * transaction on two overlapping pages to land on the same ordinal (and
-   * therefore the same hash) in each page's document.
-   */
-  function contentKey(
-    row: ImportRow,
-    quantity: string | null,
-    amount: bigint | null,
-  ): string {
-    return [
-      row.accountId,
-      row.processDate,
-      normalizeText(row.activityType).toLowerCase(),
-      normalizeText(row.description),
-      quantity ?? "-",
-      amount === null ? "-" : amount.toString(),
-      row.currency,
-    ].join(" ");
-  }
-
   function importRow(
     row: ImportRow,
     documentId: string,
@@ -277,6 +263,15 @@ export function importBatch(
           reason: error instanceof Error ? error.message : String(error),
         });
       }
+    } else if (row.amountNote !== null) {
+      // Ground rule 5: an amount the source could not give at all is still
+      // null, but the reason must not vanish. This is the adapter's
+      // ParsedAmount.amountNote, carried through rather than dropped.
+      pending.push({
+        kind: "ambiguous_amount",
+        rawValue: "",
+        reason: row.amountNote,
+      });
     }
 
     const quantity = canonicalizeAmbiguous(
@@ -299,7 +294,15 @@ export function importBatch(
     // identical content get different ordinals and therefore different
     // hashes, so neither is lost (ground rule: equal date, amount and
     // description is not proof of duplication).
-    const key = contentKey(row, quantity, amount);
+    const key = contentKey({
+      accountId: row.accountId,
+      processDate: row.processDate,
+      activityType: row.activityType,
+      description: row.description,
+      quantity,
+      amount,
+      currency: row.currency,
+    });
     const occurrence = (occurrences.get(key) ?? 0) + 1;
     occurrences.set(key, occurrence);
 

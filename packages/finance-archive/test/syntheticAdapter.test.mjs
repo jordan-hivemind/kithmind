@@ -5,10 +5,8 @@ import {
   createSyntheticSession,
   exhaustiveListing,
   incompleteListing,
-  rowHash,
   sha256Hex,
   syntheticAdapter,
-  toMinorUnits,
 } from "../dist/index.js";
 
 // This suite is the acceptance test for the adapter interface itself: it
@@ -163,7 +161,7 @@ test("acquire() on a document tier fetches exactly the discovered document and r
   );
 });
 
-test("parse() on overlapping structured-API pages yields duplicate rows that row_hash collapses", async () => {
+test("parse() on overlapping structured-API pages surfaces the raw overlap and tags each row's page", async () => {
   const session = createSyntheticSession();
   const acquired = await syntheticAdapter.acquire({
     kind: "structured_api",
@@ -174,27 +172,23 @@ test("parse() on overlapping structured-API pages yields duplicate rows that row
   const rows = await syntheticAdapter.parse({ kind: "structured_api", bytes: acquired.bytes });
   assert.ok(rows.length > acquired.manifest.reportedRowCount, "the raw pull includes the overlap");
 
-  const hashes = rows.map((row) =>
-    rowHash({
-      accountId: "acct_synthetic",
-      processDate: row.processDate,
-      activityType: row.activityType,
-      description: row.description,
-      quantity: row.quantity,
-      amount: row.amount === null ? null : toMinorUnits(row.amount, row.currency),
-      currency: row.currency,
-    }),
-  );
-  const uniqueHashes = new Set(hashes);
-  // Every raw row that came from the same overlapped boundary collapses to
-  // the same hash, so the unique count matches what the provider claimed.
-  assert.equal(uniqueHashes.size, acquired.manifest.reportedRowCount);
+  // parse() does not dedupe; it only tags each row with which page it came
+  // from (sourceDocument), which is what lets a caller scope the importer's
+  // occurrence ordinal to the right document and collapse the overlap
+  // correctly. See test/adapterImport.test.mjs for the actual import and
+  // dedupe, end to end through the F1-3 importer -- rowHash requires a
+  // supplied occurrence now (F1-12), so it can no longer be computed
+  // correctly from a flat, unscoped row list the way this test used to.
+  const pageKeys = new Set(rows.map((row) => row.sourceDocument));
+  assert.ok(pageKeys.size > 1, "the pull spans more than one page document");
 
   for (const row of rows) {
     assert.ok(row.amount === null || typeof row.amount === "string");
     assert.ok(row.quantity === null || typeof row.quantity === "string");
     assert.ok(row.price === null || typeof row.price === "string");
     assert.ok(row.locators.row, "every row locates itself in its source");
+    assert.equal(typeof row.sourceDocument, "string");
+    assert.ok(row.sourceDocument.length > 0);
   }
 });
 
