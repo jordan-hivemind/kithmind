@@ -229,6 +229,47 @@ separate concern from checking it. Re-running after a corrected import is
 idempotent: any prior row for the same account and period is replaced, not
 added to.
 
+## Wiring an adapter to the importer
+
+`src/adapterImport.ts` is the seam between `ParsedRow` (what an adapter's
+`parse()` returns) and `ImportRow`/`ImportDocument` (what `importBatch`
+consumes); neither the adapter interface nor the importer owns this mapping
+on its own. `adapterPullToImportDocuments(db, pull)` does two things a
+caller cannot do by combining the other two files alone:
+
+- **Instrument resolution.** `ParsedRow.instrument` is a descriptor (symbol,
+  cusip, isin, name); `resolveInstrumentId` turns it into a stable
+  `instruments.id`, creating the row the first time it is seen. A real
+  identifier (`cusip`, then `isin`) is preferred over a symbol; without one,
+  matching requires `symbol` and `name` together and never `symbol` alone,
+  so two different instruments that happen to share a ticker are never
+  silently merged. A bare symbol with no name and no strong identifier gets
+  a fresh row every time -- a known gap for a source that never supplies a
+  name; a stronger identifier or a resolution table closes it later.
+- **Document splitting.** `ParsedRow.sourceDocument` tells the wiring layer
+  which underlying document (a page of a paginated pull, or the one file for
+  a statement, confirmation or tabular export) each row belongs to. A pull
+  that is one document end to end becomes one `ImportDocument`; a paginated
+  pull becomes one `ImportDocument` per page, so the importer's
+  per-document `occurrence` ordinal is scoped to the right boundary and the
+  same real transaction on an overlapping page lands on a matching ordinal
+  in each page's document. See `ParsedRow.sourceDocument`'s doc comment in
+  `src/adapter.ts` for the full reasoning. Splitting loses the single
+  provider-reported total the un-split case can assert directly, so
+  `adapterPullToImportDocuments` checks it separately across the whole pull
+  using distinct provider transaction ids when every row carries one.
+
+Two other renames happen here, not upstream: `ParsedRow.externalId` becomes
+`ImportRow.providerTxnId` (same concept), and `ParsedRow.locators` (a
+per-field map) is JSON-encoded into the single `ImportRow.sourceLocator`
+string rather than collapsed to just the row locator, so per-field
+provenance survives into `transactions.source_locator` even though the
+column itself stays a single opaque string. `ParsedRow.amountNote` -- the
+required reason behind a `null` amount an adapter could not read -- passes
+through as `ImportRow.amountNote`; the importer opens a `review_items` entry
+for it exactly as it does for an amount `toMinorUnits` rejects, rather than
+letting it vanish.
+
 ## Schema and migrations
 
 `openArchive(path)` opens the file, sets `foreign_keys`, WAL and a busy timeout,

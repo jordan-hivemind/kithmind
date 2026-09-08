@@ -246,6 +246,26 @@ export type ParsedInstrument = {
  * exactly what text produced the ambiguity.
  */
 export type ParsedRow = ParsedAmount & {
+    /**
+     * Which underlying source document (in the archive's `documents` sense)
+     * this row belongs to, among the rows one `parse()` call returns. Rows
+     * from the same document share this value and appear in that document's
+     * own row order; this is what a caller groups rows by to compute the
+     * per-document `occurrence` ordinal `rowHash` requires.
+     *
+     * For a single acquired file (a statement, a confirmation, a tabular
+     * export) this is a constant for the whole call, since one `parse()`
+     * call already covers exactly one document. A paginated structured-API
+     * pull acquires every page as one `RawFile` (one content hash, one
+     * immutable capture) but is logically several documents for dedupe
+     * purposes, one per page: giving each page its own `sourceDocument`
+     * value is what lets the same real transaction on two overlapping pages
+     * land on the same occurrence ordinal in each page's document and
+     * therefore collapse, while two genuinely distinct rows within one page
+     * still get distinct ordinals. See `src/importer.ts` and
+     * `src/adapterImport.ts`.
+     */
+    readonly sourceDocument: string;
     /** The provider's own transaction id, when the source has one. */
     readonly externalId: string | null;
     readonly tradeDate: string | null;

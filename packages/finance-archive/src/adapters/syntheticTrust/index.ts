@@ -80,8 +80,13 @@ type ActivityLikeRow = {
   readonly currency: string;
 };
 
-function activityRowToParsedRow(row: ActivityLikeRow, locator: FieldLocator): ParsedRow {
+function activityRowToParsedRow(
+  row: ActivityLikeRow,
+  locator: FieldLocator,
+  sourceDocument: string,
+): ParsedRow {
   return {
+    sourceDocument,
     externalId: row.externalId,
     tradeDate: null,
     processDate: row.date,
@@ -362,13 +367,17 @@ function parseStructuredApi(bytes: Uint8Array): readonly ParsedRow[] {
   const rows: ParsedRow[] = [];
   let index = 0;
   for (const page of pages) {
+    // Each page is its own document for occurrence-ordinal purposes, even
+    // though the whole pull was captured as one RawFile: see ParsedRow's
+    // sourceDocument doc comment.
+    const sourceDocument = `structured-api-page-${page.page}`;
     for (const item of page.items) {
       rows.push(
-        activityRowToParsedRow(item, {
-          source: "structured_api",
-          index,
-          field: `page ${page.page}`,
-        }),
+        activityRowToParsedRow(
+          item,
+          { source: "structured_api", index, field: `page ${page.page}` },
+          sourceDocument,
+        ),
       );
       index += 1;
     }
@@ -397,6 +406,8 @@ function parseTabularExport(bytes: Uint8Array): readonly ParsedRow[] {
           currency,
         },
         { source: "tabular_export", index },
+        // No pagination on this tier: one parse() call is one document.
+        "tabular-export",
       );
     });
 }
@@ -431,6 +442,9 @@ function parseStatementText(
     const rowLocator: FieldLocator = { source: kind, index: page, field: `line ${index}` };
     const parsedAmount = resolveAmount(amountText);
     rows.push({
+      // One PDF/confirmation file is one document regardless of how many
+      // printed pages it has; PAGE markers here are only a locator detail.
+      sourceDocument: kind,
       externalId: null,
       tradeDate: null,
       processDate: date,

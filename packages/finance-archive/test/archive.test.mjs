@@ -298,6 +298,28 @@ test("row_hash is unique and is stable across harmless spelling differences", (t
   );
 });
 
+test("row_hash rejects a missing or invalid occurrence instead of hashing it into its own namespace", () => {
+  const row = {
+    accountId: "acct_x",
+    processDate: "2026-06-15",
+    activityType: "buy",
+    description: "Synthetic purchase",
+    quantity: null,
+    amount: -100n,
+    currency: "USD",
+  };
+  // Omitted entirely: this is the exact bug F1-3 was sent back to fix,
+  // reintroduced through a caller that forgets the field.
+  assert.throws(() => rowHash(row), /occurrence/);
+  assert.throws(() => rowHash({ ...row, occurrence: 0 }), /occurrence/);
+  assert.throws(() => rowHash({ ...row, occurrence: -1 }), /occurrence/);
+  assert.throws(() => rowHash({ ...row, occurrence: 1.5 }), /occurrence/);
+  assert.throws(() => rowHash({ ...row, occurrence: null }), /occurrence/);
+  assert.throws(() => rowHash({ ...row, occurrence: "1" }), /occurrence/);
+  // A valid occurrence still works.
+  assert.match(rowHash({ ...row, occurrence: 1 }), /^[0-9a-f]{64}$/);
+});
+
 test("the extensibility columns exist and accept values", (t) => {
   const db = archive(t);
   seed(db);

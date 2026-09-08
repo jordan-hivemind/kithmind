@@ -59,6 +59,12 @@ function field(value: string | null): string {
 }
 
 export function rowHash(input: RowHashInput): string {
+  if (!Number.isInteger(input.occurrence) || input.occurrence < 1) {
+    throw new RangeError(
+      `rowHash: occurrence must be an integer >= 1, got ${JSON.stringify(input.occurrence)}; ` +
+        "omitting it hashes undefined into its own namespace and silently breaks deduplication",
+    );
+  }
   currencyExponent(input.currency);
   const parts = [
     field(input.accountId),
