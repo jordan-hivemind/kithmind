@@ -6,6 +6,9 @@ import {
   sourceArtifactArchiveReceiptFields,
   sourceArtifactArchiveBindingFields,
   sourceArtifactDeletionAckFields,
+  sourceProviderOriginalBindingFields,
+  sourceProviderOriginalDetachAckFields,
+  sourceProviderOriginalReferenceFields,
   sourceItemFields,
   sourcePageFields,
   sourceParserArtifactFields,
@@ -66,6 +69,35 @@ export const provenanceTables = {
       "sourceAccountId",
       "deletionId",
     ])
+    .index("by_sourceAccountId_and_requestId", [
+      "sourceAccountId",
+      "requestId",
+    ]),
+  sourceProviderOriginalReferences: defineTable(
+    sourceProviderOriginalReferenceFields,
+  )
+    .index("by_sourceItemId", ["sourceItemId"])
+    .index("by_sourceRevisionId", ["sourceRevisionId"])
+    .index("by_sourceAccountId_and_clientReferenceId", [
+      "sourceAccountId",
+      "clientReferenceId",
+    ])
+    .index("by_sourceRevisionId_and_referenceFingerprint", [
+      "sourceRevisionId",
+      "referenceFingerprint",
+    ]),
+  sourceProviderOriginalBindings: defineTable(
+    sourceProviderOriginalBindingFields,
+  )
+    .index("by_sourceItemId", ["sourceItemId"])
+    .index("by_sourceRevisionId", ["sourceRevisionId"])
+    .index("by_referenceId", ["referenceId"]),
+  sourceProviderOriginalDetachAcks: defineTable(
+    sourceProviderOriginalDetachAckFields,
+  )
+    .index("by_sourceItemId", ["sourceItemId"])
+    .index("by_referenceId_and_forgetEpoch", ["referenceId", "forgetEpoch"])
+    .index("by_sourceAccountId_and_detachId", ["sourceAccountId", "detachId"])
     .index("by_sourceAccountId_and_requestId", [
       "sourceAccountId",
       "requestId",

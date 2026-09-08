@@ -2023,6 +2023,27 @@ export async function continueForgetFromWeb(
       done: false,
     };
   }
+  const providerDetachAcks = await ctx.db
+    .query("sourceProviderOriginalDetachAcks")
+    .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+    .take(MAX_STAGE_ROWS);
+  for (const ack of providerDetachAcks) {
+    if (
+      ack.spaceId !== item.spaceId ||
+      ack.sourceAccountId !== item.sourceAccountId ||
+      ack.forgetEpoch !== item.desiredProcessingEpoch ||
+      ack.providerSourceOutcome !== "retained_unchanged"
+    )
+      throw new Error("Provider detach acknowledgement parent is invalid");
+    await ctx.db.delete(ack._id);
+  }
+  if (providerDetachAcks.length > 0) {
+    return {
+      phase: "providerOriginalDetachAcks",
+      deleted: providerDetachAcks.length,
+      done: false,
+    };
+  }
   await finalizeSourceItemTombstone(ctx, {
     spaceId: item.spaceId,
     sourceItemId: item._id,

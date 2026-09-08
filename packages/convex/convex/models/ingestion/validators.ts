@@ -42,6 +42,10 @@ export const processingGenerationFields = {
   normalizedBundleDigest: v.optional(v.string()),
   originalPrimaryReceiptId: v.optional(v.id("sourceArtifactArchiveReceipts")),
   originalBackupReceiptId: v.optional(v.id("sourceArtifactArchiveReceipts")),
+  originalProviderReferenceId: v.optional(
+    v.id("sourceProviderOriginalReferences"),
+  ),
+  originalProviderBindingEpoch: v.optional(v.number()),
   parserPrimaryReceiptId: v.optional(v.id("sourceArtifactArchiveReceipts")),
   parserBackupReceiptId: v.optional(v.id("sourceArtifactArchiveReceipts")),
   desiredProcessingEpoch: v.number(),

@@ -51,6 +51,21 @@ function safeInteger(value: unknown, minimum = 0): value is number {
   return Number.isSafeInteger(value) && (value as number) >= minimum;
 }
 
+export function generationOriginalRecoverySelectionIsClosed(value: {
+  originalBackupReceiptId?: unknown;
+  originalProviderReferenceId?: unknown;
+  originalProviderBindingEpoch?: unknown;
+}): boolean {
+  return (
+    (value.originalBackupReceiptId !== undefined &&
+      value.originalProviderReferenceId === undefined &&
+      value.originalProviderBindingEpoch === undefined) ||
+    (value.originalBackupReceiptId === undefined &&
+      typeof value.originalProviderReferenceId === "string" &&
+      safeInteger(value.originalProviderBindingEpoch))
+  );
+}
+
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -1030,9 +1045,9 @@ async function terminalParsedReady(
     return false;
   if (
     !generation.originalPrimaryReceiptId ||
-    !generation.originalBackupReceiptId ||
     !generation.parserPrimaryReceiptId ||
-    !generation.parserBackupReceiptId
+    !generation.parserBackupReceiptId ||
+    !generationOriginalRecoverySelectionIsClosed(generation)
   )
     return false;
   const [
@@ -1041,6 +1056,7 @@ async function terminalParsedReady(
     jobs,
     originalPrimary,
     originalBackup,
+    providerOriginal,
     parserPrimary,
     parserBackup,
   ] = await Promise.all([
@@ -1053,7 +1069,12 @@ async function terminalParsedReady(
       )
       .take(2),
     ctx.db.get(generation.originalPrimaryReceiptId),
-    ctx.db.get(generation.originalBackupReceiptId),
+    generation.originalBackupReceiptId
+      ? ctx.db.get(generation.originalBackupReceiptId)
+      : null,
+    generation.originalProviderReferenceId
+      ? ctx.db.get(generation.originalProviderReferenceId)
+      : null,
     ctx.db.get(generation.parserPrimaryReceiptId),
     ctx.db.get(generation.parserBackupReceiptId),
   ]);
@@ -1072,7 +1093,7 @@ async function terminalParsedReady(
     jobs.length !== 1 ||
     !job ||
     !originalPrimary ||
-    !originalBackup ||
+    (!originalBackup && !providerOriginal) ||
     !parserPrimary ||
     !parserBackup ||
     artifact.spaceId !== source.spaceId ||
@@ -1128,7 +1149,9 @@ async function terminalParsedReady(
     return false;
   const receipts = [
     [originalPrimary, "original_bytes", "primary"],
-    [originalBackup, "original_bytes", "independent_backup"],
+    ...(originalBackup
+      ? ([[originalBackup, "original_bytes", "independent_backup"]] as const)
+      : []),
     [parserPrimary, "parser_output", "primary"],
     [parserBackup, "parser_output", "independent_backup"],
   ] as const;
@@ -1148,15 +1171,27 @@ async function terminalParsedReady(
   )
     return false;
   if (
-    originalPrimary._id === originalBackup._id ||
-    originalPrimary.archiveIdentityFingerprint ===
-      originalBackup.archiveIdentityFingerprint ||
-    originalPrimary.recipientFingerprint ===
-      originalBackup.recipientFingerprint ||
-    originalPrimary.repositoryKeyDomainFingerprint ===
-      originalBackup.repositoryKeyDomainFingerprint ||
-    originalPrimary.storageFailureDomainFingerprint ===
-      originalBackup.storageFailureDomainFingerprint ||
+    (originalBackup &&
+      (originalPrimary._id === originalBackup._id ||
+        originalPrimary.archiveIdentityFingerprint ===
+          originalBackup.archiveIdentityFingerprint ||
+        originalPrimary.recipientFingerprint ===
+          originalBackup.recipientFingerprint ||
+        originalPrimary.repositoryKeyDomainFingerprint ===
+          originalBackup.repositoryKeyDomainFingerprint ||
+        originalPrimary.storageFailureDomainFingerprint ===
+          originalBackup.storageFailureDomainFingerprint)) ||
+    (providerOriginal &&
+      (providerOriginal.spaceId !== source.spaceId ||
+        providerOriginal.sourceAccountId !== source.account._id ||
+        providerOriginal.sourceItemId !== item._id ||
+        providerOriginal.sourceRevisionId !== revision._id ||
+        providerOriginal.referenceVersion !== "provider_original_v1" ||
+        providerOriginal.providerKind !== "dropbox_v1" ||
+        providerOriginal.verificationAuthority !== "worker_asserted" ||
+        providerOriginal.sourceContentHash !== revision.contentHash ||
+        providerOriginal.sourceByteLength !== revision.byteLength ||
+        !SHA256_PATTERN.test(providerOriginal.referenceFingerprint))) ||
     parserPrimary._id === parserBackup._id ||
     parserPrimary.archiveIdentityFingerprint ===
       parserBackup.archiveIdentityFingerprint ||

@@ -64,6 +64,38 @@ const archiveDeletionAckSummaryValidator = v.union(
   }),
 );
 
+const legacyOriginalRecoveryFields = {
+  originalPrimaryReceiptId: v.string(),
+  originalPrimaryBindingEpoch: v.number(),
+  originalBackupReceiptId: v.string(),
+  originalBackupBindingEpoch: v.number(),
+};
+
+const providerOriginalRecoveryFields = {
+  originalPrimaryReceiptId: v.string(),
+  originalPrimaryBindingEpoch: v.number(),
+  originalProviderReferenceId: v.string(),
+  originalProviderBindingEpoch: v.number(),
+};
+
+const providerOriginalDetachAckFields = {
+  detachId: v.string(),
+  referenceId: v.string(),
+  forgetEpoch: v.number(),
+  referenceOutcome: v.union(
+    v.literal("detached"),
+    v.literal("already_detached"),
+  ),
+  locatorBundleOutcome: v.union(
+    v.literal("deleted"),
+    v.literal("already_missing"),
+  ),
+  locatorAbsenceAuthority: v.literal("worker_asserted_live_repository_absence"),
+  retentionDisclosure: v.literal("provider_retained_deleted_history_possible"),
+  providerSourceOutcome: v.literal("retained_unchanged"),
+  completedAt: v.number(),
+};
+
 const workerResultValidator = v.union(
   v.object({
     operation: v.literal("source.status"),
@@ -172,6 +204,33 @@ const workerResultValidator = v.union(
       reused: v.boolean(),
     }),
   ),
+  v.object({
+    operation: v.literal("providerOriginal.forgetTargets"),
+    sourceItemId: v.string(),
+    sourceExternalIdHash: v.string(),
+    forgetEpoch: v.number(),
+    targets: v.array(
+      v.object({
+        referenceId: v.string(),
+        referenceFingerprint: v.string(),
+        locatorBindingId: v.string(),
+        locatorRepositoryId: v.string(),
+        locatorSnapshotId: v.string(),
+        locatorObjectName: v.string(),
+        locatorCiphertextHash: v.string(),
+        locatorCiphertextByteLength: v.number(),
+        forgetEpoch: v.number(),
+        ack: v.optional(v.object(providerOriginalDetachAckFields)),
+      }),
+    ),
+    isDone: v.boolean(),
+    continueCursor: v.string(),
+  }),
+  v.object({
+    operation: v.literal("providerOriginal.ackDetach"),
+    ...providerOriginalDetachAckFields,
+    reused: v.boolean(),
+  }),
   v.object({
     operation: v.literal("source.inventoryPage"),
     page: v.array(
@@ -301,59 +360,59 @@ const workerResultValidator = v.union(
       mode: v.union(v.literal("original"), v.literal("processing")),
       found: v.literal(false),
     }),
-    v.object({
-      operation: v.literal("discovery.lookupArchivedAdmission"),
-      mode: v.literal("original"),
-      found: v.literal(true),
-      sourceRevisionId: v.string(),
-      originalPrimaryReceiptId: v.string(),
-      originalPrimaryBindingEpoch: v.number(),
-      originalBackupReceiptId: v.string(),
-      originalBackupBindingEpoch: v.number(),
-    }),
-    v.object({
-      operation: v.literal("discovery.lookupArchivedAdmission"),
-      mode: v.literal("processing"),
-      found: v.literal(true),
-      sourceRevisionId: v.string(),
-      parserArtifactId: v.string(),
-      sourceTextVersionId: v.string(),
-      processingGenerationId: v.string(),
-      ingestJobId: v.string(),
-      desiredProcessingEpoch: v.number(),
-      archiveSetDigest: v.string(),
-      originalPrimaryReceiptId: v.string(),
-      originalPrimaryBindingEpoch: v.number(),
-      originalBackupReceiptId: v.string(),
-      originalBackupBindingEpoch: v.number(),
-      parserPrimaryReceiptId: v.string(),
-      parserPrimaryBindingEpoch: v.number(),
-      parserBackupReceiptId: v.string(),
-      parserBackupBindingEpoch: v.number(),
-    }),
+    ...[legacyOriginalRecoveryFields, providerOriginalRecoveryFields].map(
+      (fields) =>
+        v.object({
+          operation: v.literal("discovery.lookupArchivedAdmission"),
+          mode: v.literal("original"),
+          found: v.literal(true),
+          sourceRevisionId: v.string(),
+          ...fields,
+        }),
+    ),
+    ...[legacyOriginalRecoveryFields, providerOriginalRecoveryFields].map(
+      (fields) =>
+        v.object({
+          operation: v.literal("discovery.lookupArchivedAdmission"),
+          mode: v.literal("processing"),
+          found: v.literal(true),
+          sourceRevisionId: v.string(),
+          parserArtifactId: v.string(),
+          sourceTextVersionId: v.string(),
+          processingGenerationId: v.string(),
+          ingestJobId: v.string(),
+          desiredProcessingEpoch: v.number(),
+          archiveSetDigest: v.string(),
+          ...fields,
+          parserPrimaryReceiptId: v.string(),
+          parserPrimaryBindingEpoch: v.number(),
+          parserBackupReceiptId: v.string(),
+          parserBackupBindingEpoch: v.number(),
+        }),
+    ),
   ),
-  v.object({
-    operation: v.literal("discovery.admitArchived"),
-    workId: v.string(),
-    sourceItemId: v.string(),
-    sourceRevisionId: v.string(),
-    parserArtifactId: v.string(),
-    sourceTextVersionId: v.string(),
-    processingGenerationId: v.string(),
-    ingestJobId: v.string(),
-    desiredProcessingEpoch: v.number(),
-    archiveSetDigest: v.string(),
-    originalPrimaryReceiptId: v.string(),
-    originalPrimaryBindingEpoch: v.number(),
-    originalBackupReceiptId: v.string(),
-    originalBackupBindingEpoch: v.number(),
-    parserPrimaryReceiptId: v.string(),
-    parserPrimaryBindingEpoch: v.number(),
-    parserBackupReceiptId: v.string(),
-    parserBackupBindingEpoch: v.number(),
-    state: v.literal("admitted"),
-    reused: v.boolean(),
-  }),
+  ...[legacyOriginalRecoveryFields, providerOriginalRecoveryFields].map(
+    (fields) =>
+      v.object({
+        operation: v.literal("discovery.admitArchived"),
+        workId: v.string(),
+        sourceItemId: v.string(),
+        sourceRevisionId: v.string(),
+        parserArtifactId: v.string(),
+        sourceTextVersionId: v.string(),
+        processingGenerationId: v.string(),
+        ingestJobId: v.string(),
+        desiredProcessingEpoch: v.number(),
+        archiveSetDigest: v.string(),
+        ...fields,
+        parserPrimaryReceiptId: v.string(),
+        parserPrimaryBindingEpoch: v.number(),
+        parserBackupReceiptId: v.string(),
+        parserBackupBindingEpoch: v.number(),
+        state: v.literal("admitted"),
+        reused: v.boolean(),
+      }),
+  ),
   v.object({
     operation: v.literal("jobs.reserve"),
     receiptId: v.string(),
@@ -589,6 +648,16 @@ export const dispatch = action({
         case "archive.ackDeletion":
           return await ctx.runMutation(
             internal.models.workers.private.archiveAckDeletion,
+            { principal, request },
+          );
+        case "providerOriginal.forgetTargets":
+          return await ctx.runQuery(
+            internal.models.workers.private.providerOriginalForgetTargets,
+            { principal, request },
+          );
+        case "providerOriginal.ackDetach":
+          return await ctx.runMutation(
+            internal.models.workers.private.providerOriginalAckDetach,
             { principal, request },
           );
         case "source.inventoryPage":

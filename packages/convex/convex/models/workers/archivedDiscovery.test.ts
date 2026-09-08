@@ -32,6 +32,7 @@ import {
   sha256Utf8,
 } from "../provenance/model";
 import { verifySealedParsedPayload } from "../provenance/parsedStaging";
+import { providerOriginalReferenceFingerprint } from "../provenance/providerOriginals";
 import { getDocument } from "../documents/model";
 import {
   appendWorkerScanPage,
@@ -304,6 +305,35 @@ function archive(
   };
 }
 
+function providerOriginal(sourceContentHash = RAW_HASH) {
+  return {
+    referenceVersion: "provider_original_v1" as const,
+    providerKind: "dropbox_v1" as const,
+    clientReferenceId: "01890a5d-ac96-7cc4-bb7e-6f4f5ca5c149",
+    sourceContentHash,
+    sourceByteLength: 1_024,
+    providerAccountIdHash: "4".repeat(64),
+    providerRootDirectoryIdHash: "5".repeat(64),
+    providerFileIdHash: "6".repeat(64),
+    providerRevision: "015f00feed",
+    providerContentHash: "7".repeat(64),
+    verifiedAt: 105,
+    locatorBundle: {
+      bindingId: "01890a5d-ac96-7cc4-bb7e-6f4f5ca5c148",
+      manifestFingerprint: "8".repeat(64),
+      recipientFingerprint: "9".repeat(64),
+      repositoryKeyDomainFingerprint: "a".repeat(64),
+      repositoryId: "b".repeat(64),
+      snapshotId: "c".repeat(64),
+      objectName: "provider-locator.json.age",
+      ciphertextHash: "d".repeat(64),
+      ciphertextByteLength: 512,
+      readbackVerifiedAt: 106,
+    },
+    createdAt: 100,
+  };
+}
+
 async function admitParsedFixture(
   f: Awaited<ReturnType<typeof fixture>>,
   declaration: {
@@ -371,6 +401,178 @@ async function admitParsedFixture(
 }
 
 describe("archived discovery admission", () => {
+  test("provider reference fingerprint is independent of locator object insertion order", async () => {
+    const declaration = providerOriginal();
+    const reordered = {
+      ...declaration,
+      locatorBundle: {
+        objectName: declaration.locatorBundle.objectName,
+        snapshotId: declaration.locatorBundle.snapshotId,
+        bindingId: declaration.locatorBundle.bindingId,
+        ciphertextByteLength:
+          declaration.locatorBundle.ciphertextByteLength,
+        repositoryId: declaration.locatorBundle.repositoryId,
+        readbackVerifiedAt: declaration.locatorBundle.readbackVerifiedAt,
+        recipientFingerprint: declaration.locatorBundle.recipientFingerprint,
+        ciphertextHash: declaration.locatorBundle.ciphertextHash,
+        manifestFingerprint: declaration.locatorBundle.manifestFingerprint,
+        repositoryKeyDomainFingerprint:
+          declaration.locatorBundle.repositoryKeyDomainFingerprint,
+      },
+    };
+    await expect(
+      providerOriginalReferenceFingerprint(reordered),
+    ).resolves.toBe(await providerOriginalReferenceFingerprint(declaration));
+  });
+
+  test("admits and replays an exact provider original without a duplicate backup", async () => {
+    const f = await fixture();
+    const extractionFingerprint = await artifactBoundExtractionFingerprint(
+      PROFILE.parserFingerprint,
+      OUTPUT_HASH,
+      PROFILE.extractionConfigurationFingerprint,
+    );
+    const reserve = parseWorkerRequest({
+      ...base(f),
+      operation: "discovery.reserveArchived",
+      requestId: "reserve-provider",
+      identity: identity(f),
+    });
+    if (reserve.operation !== "discovery.reserveArchived")
+      throw new Error("bad reserve");
+    const leased = await f.t.run((ctx) =>
+      reserveArchivedDiscovery(ctx, f.principal, reserve, "a".repeat(64), 100),
+    );
+    const body = {
+      ...base(f),
+      operation: "discovery.admitArchived" as const,
+      requestId: "admit-provider",
+      workId: leased.workId,
+      leaseEpoch: leased.leaseEpoch,
+      leaseToken: leased.leaseToken,
+      parserArtifact: {
+        kind: "create" as const,
+        clientArtifactId: "01890a5d-ac96-7cc4-bb7e-6f4f5ca5c140",
+        outputHash: OUTPUT_HASH,
+        outputByteLength: 2_048,
+        outputMediaType: "application/vnd.docling+json" as const,
+        createdAt: 100,
+      },
+      archives: [
+        archive("original_bytes", "primary", 1),
+        archive("parser_output", "primary", 3),
+        archive("parser_output", "independent_backup", 4),
+      ],
+      parsedText: {
+        extractionFingerprint,
+        textHash: TEXT_HASH,
+        byteLength: 512,
+        utf16Length: 500,
+        pageCount: 2,
+        mappingManifestHash: MAPPING_HASH,
+        normalizedBundleDigest: BUNDLE_HASH,
+        expectedEvidenceSpanCount: 2,
+        expectedDocumentCount: 1,
+        expectedChunkCount: 2,
+      },
+      providerOriginal: providerOriginal(),
+    };
+    expect(() =>
+      parseWorkerRequest({
+        ...body,
+        archives: [
+          ...body.archives,
+          archive("original_bytes", "independent_backup", 2),
+        ],
+      }),
+    ).toThrow();
+    const wrongSource = parseWorkerRequest({
+      ...body,
+      requestId: "admit-provider-wrong-source",
+      providerOriginal: providerOriginal("0".repeat(64)),
+    });
+    if (wrongSource.operation !== "discovery.admitArchived")
+      throw new Error("bad provider request");
+    await expect(
+      f.t.run((ctx) =>
+        admitArchivedDiscovery(ctx, f.principal, wrongSource, 110),
+      ),
+    ).rejects.toThrow();
+    for (const [requestId, declaration, now] of [
+      [
+        "admit-provider-stale",
+        {
+          ...providerOriginal(),
+          createdAt: 1,
+          verifiedAt: 1,
+          locatorBundle: {
+            ...providerOriginal().locatorBundle,
+            readbackVerifiedAt: 1,
+          },
+        },
+        700_002,
+      ],
+      [
+        "admit-provider-future",
+        {
+          ...providerOriginal(),
+          verifiedAt: 300_111,
+          locatorBundle: {
+            ...providerOriginal().locatorBundle,
+            readbackVerifiedAt: 300_111,
+          },
+        },
+        110,
+      ],
+    ] as const) {
+      const invalid = parseWorkerRequest({
+        ...body,
+        requestId,
+        providerOriginal: declaration,
+      });
+      if (invalid.operation !== "discovery.admitArchived")
+        throw new Error("bad provider request");
+      await expect(
+        f.t.run((ctx) =>
+          admitArchivedDiscovery(ctx, f.principal, invalid, now),
+        ),
+      ).rejects.toThrow();
+    }
+    const request = parseWorkerRequest(body);
+    if (request.operation !== "discovery.admitArchived")
+      throw new Error("bad provider request");
+    const admitted = await f.t.run((ctx) =>
+      admitArchivedDiscovery(ctx, f.principal, request, 110),
+    );
+    expect(admitted).toMatchObject({
+      originalPrimaryBindingEpoch: 0,
+      originalProviderBindingEpoch: 0,
+      parserPrimaryBindingEpoch: 0,
+      parserBackupBindingEpoch: 0,
+      reused: false,
+    });
+    expect(admitted).not.toHaveProperty("originalBackupReceiptId");
+    await expect(
+      f.t.run((ctx) =>
+        admitArchivedDiscovery(ctx, f.principal, request, 700_001),
+      ),
+    ).resolves.toEqual({ ...admitted, reused: true });
+    const rows = await f.t.run(async (ctx) => ({
+      receipts: await ctx.db.query("sourceArtifactArchiveReceipts").collect(),
+      references: await ctx.db
+        .query("sourceProviderOriginalReferences")
+        .collect(),
+      generations: await ctx.db.query("processingGenerations").collect(),
+    }));
+    expect(rows.receipts).toHaveLength(3);
+    expect(rows.references).toHaveLength(1);
+    expect(rows.generations[0]).toMatchObject({
+      originalProviderReferenceId: rows.references[0]!._id,
+      originalProviderBindingEpoch: 0,
+    });
+    expect(rows.generations[0]).not.toHaveProperty("originalBackupReceiptId");
+  });
+
   test("reserves one exact parsed job without touching unrelated or cross-source jobs", async () => {
     const f = await fixture();
     const admitted = await admitParsedFixture(f, {
@@ -998,6 +1200,11 @@ describe("archived discovery admission", () => {
     ).resolves.toMatchObject({
       contentHashAuthority: "worker_asserted",
       textHashAuthority: "server_verified_retained_text",
+      originalRecovery: {
+        kind: "archive_pair_v1",
+        primary: true,
+        independentBackup: true,
+      },
     });
     const textVersionId = stagedGraph.document.sourceTextVersionId;
     await f.t.run((ctx) =>
