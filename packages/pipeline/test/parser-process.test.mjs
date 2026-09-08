@@ -102,7 +102,8 @@ test("uses the bounded large-document resource profile", async () => {
         limits: { ...DEFAULT_PARSER_PROCESS_LIMITS, cpuSeconds: 1_801 },
       }),
     (error) =>
-      error instanceof ParserProcessError && error.code === "invalid_input",
+      error instanceof ParserProcessError &&
+      error.code === (process.platform === "darwin" ? "invalid_input" : "unsupported_platform"),
   );
 });
 
