@@ -6,7 +6,14 @@ import type { PrincipalRef } from "../../lib/spaces";
 import { digestProcessingConfiguration } from "../ingestion/hash";
 import { planInlineText } from "../ingestion/inlineText";
 import { sha256Utf8 } from "../provenance/model";
-import { requireInlineSourceRevision } from "../provenance/representations";
+import {
+  MAX_PARSER_ARTIFACT_BYTES,
+  parseSourceRevisionRepresentation,
+  parseSourceTextRepresentation,
+  requireInlineSourceRevision,
+} from "../provenance/representations";
+import { verifySealedParsedPayload } from "../provenance/parsedStaging";
+import { artifactBoundExtractionFingerprint } from "./archivedDiscovery";
 import { requireWorkerSourceAccount, type WorkerPrincipal } from "./auth";
 import { workerProtocolError } from "./errors";
 import { consumeWorkerMutationRateLimit } from "./rateLimit";
@@ -42,6 +49,66 @@ type DbCtx = Pick<QueryCtx, "db"> | Pick<MutationCtx, "db">;
 
 function safeInteger(value: unknown, minimum = 0): value is number {
   return Number.isSafeInteger(value) && (value as number) >= minimum;
+}
+
+const SHA256_PATTERN = /^[a-f0-9]{64}$/;
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+function historicalArchiveReceiptIsValid(
+  receipt: Doc<"sourceArtifactArchiveReceipts">,
+  expected: {
+    revision: Doc<"sourceRevisions">;
+    artifact: Doc<"sourceParserArtifacts">;
+    subjectKind: "original_bytes" | "parser_output";
+    copyRole: "primary" | "independent_backup";
+  },
+): boolean {
+  const { revision, artifact, subjectKind, copyRole } = expected;
+  const plaintext =
+    subjectKind === "original_bytes"
+      ? {
+          hash: revision.contentHash,
+          byteLength: revision.byteLength,
+          mediaType: revision.mediaType,
+        }
+      : {
+          hash: artifact.outputHash,
+          byteLength: artifact.outputByteLength,
+          mediaType: artifact.outputMediaType,
+        };
+  return (
+    receipt.spaceId === revision.spaceId &&
+    receipt.sourceItemId === revision.sourceItemId &&
+    receipt.sourceRevisionId === revision._id &&
+    receipt.subjectKind === subjectKind &&
+    receipt.copyRole === copyRole &&
+    receipt.parserArtifactId ===
+      (subjectKind === "parser_output" ? artifact._id : undefined) &&
+    receipt.receiptVersion === "archive_receipt_v1" &&
+    receipt.archiveRepresentation === "age_encrypted_v1" &&
+    receipt.hashAuthority === "worker_asserted" &&
+    receipt.verificationKind === "ciphertext_readback_sha256" &&
+    UUID_PATTERN.test(receipt.clientReceiptId) &&
+    UUID_PATTERN.test(receipt.archiveObjectId) &&
+    [
+      receipt.requestDigest,
+      receipt.archiveProfileFingerprint,
+      receipt.archiveIdentityFingerprint,
+      receipt.recipientFingerprint,
+      receipt.repositoryKeyDomainFingerprint,
+      receipt.storageFailureDomainFingerprint,
+      receipt.plaintextHash,
+      receipt.ciphertextHash,
+    ].every((value) => SHA256_PATTERN.test(value)) &&
+    receipt.plaintextHash === plaintext.hash &&
+    receipt.plaintextByteLength === plaintext.byteLength &&
+    receipt.plaintextMediaType === plaintext.mediaType &&
+    safeInteger(receipt.ciphertextByteLength, 1) &&
+    receipt.ciphertextByteLength <= MAX_PARSER_ARTIFACT_BYTES + 1024 * 1024 &&
+    safeInteger(receipt.createdAt) &&
+    safeInteger(receipt.readbackVerifiedAt, receipt.createdAt)
+  );
 }
 
 function sourceNumber(value: number | undefined): number {
@@ -830,6 +897,290 @@ async function itemDigests(
   };
 }
 
+async function binaryItemDigests(
+  item: Doc<"sourceItems">,
+  entry: Doc<"workerScanEntries">,
+) {
+  if (
+    !item.externalId ||
+    !item.uri ||
+    !entry.contentHash ||
+    !entry.parserFingerprint ||
+    !entry.extractionConfigurationFingerprint ||
+    !entry.extractorFingerprint ||
+    !entry.recordSchemaFingerprint ||
+    !entry.normalizationFingerprint ||
+    !entry.chunkerFingerprint ||
+    !entry.correctionRevision
+  )
+    return undefined;
+  const externalIdHash = await sha256Utf8(item.externalId);
+  const uriDigest = await digest("worker-fs-uri:v1", [
+    item.sourceAccountId,
+    item.uri,
+  ]);
+  return {
+    externalIdHash,
+    uriDigest,
+    processingIdentityDigest: await digest(
+      "worker-fs-binary-processing-identity:v1",
+      [
+        entry.contentHash,
+        "application/pdf",
+        "pdf_docqa_v1",
+        entry.parserFingerprint,
+        entry.extractionConfigurationFingerprint,
+        entry.extractorFingerprint,
+        entry.recordSchemaFingerprint,
+        entry.normalizationFingerprint,
+        entry.chunkerFingerprint,
+        entry.correctionRevision,
+      ],
+    ),
+    inventoryMetadataDigest: await digest(
+      "worker-fs-binary-inventory-metadata:v1",
+      [
+        externalIdHash,
+        uriDigest,
+        item.title ?? null,
+        item.docType ?? null,
+        entry.sourceModifiedAt,
+        "ready_binary_v1",
+        entry.contentHash,
+        entry.byteLength,
+        "pdf_docqa_v1",
+      ],
+    ),
+  };
+}
+
+async function terminalParsedReady(
+  ctx: MutationCtx,
+  source: LoadedWorkerSource,
+  assessment: Assessment,
+  item: Doc<"sourceItems">,
+  entry: Doc<"workerScanEntries">,
+): Promise<boolean> {
+  if (
+    entry.contentRepresentation !== "archived_binary_v1" ||
+    entry.binaryMediaType !== "application/pdf" ||
+    entry.binaryParserProfileId !== "pdf_docqa_v1" ||
+    item.lifecycle !== "available" ||
+    item.lastFailure !== undefined ||
+    item.workerLastSeenInventoryEpoch !== assessment.inventoryEpoch ||
+    item.workerObservationEpoch !== entry.observationEpoch ||
+    item.workerProcessingEpoch !== entry.processingEpoch ||
+    item.workerContentHash !== entry.contentHash ||
+    item.workerProfileId !== "pdf_docqa_v1" ||
+    item.workerSourceModifiedAt !== entry.sourceModifiedAt ||
+    !item.desiredRevisionId ||
+    item.activeRevisionId !== item.desiredRevisionId ||
+    !item.activeGenerationId ||
+    !safeInteger(item.desiredProcessingEpoch) ||
+    !safeInteger(entry.observationEpoch) ||
+    !safeInteger(entry.processingEpoch) ||
+    !safeInteger(entry.byteLength)
+  )
+    return false;
+  const calculated = await binaryItemDigests(item, entry);
+  if (
+    !calculated ||
+    item.externalIdHash !== calculated.externalIdHash ||
+    item.workerInventoryMetadataDigest !== calculated.inventoryMetadataDigest ||
+    item.workerProcessingIdentityDigest !==
+      calculated.processingIdentityDigest ||
+    entry.externalIdHash !== calculated.externalIdHash ||
+    entry.uriDigest !== calculated.uriDigest ||
+    entry.inventoryMetadataDigest !== calculated.inventoryMetadataDigest ||
+    entry.processingIdentityDigest !== calculated.processingIdentityDigest
+  )
+    return false;
+  const [revision, generation] = await Promise.all([
+    ctx.db.get(item.desiredRevisionId),
+    ctx.db.get(item.activeGenerationId),
+  ]);
+  if (
+    !revision ||
+    !generation ||
+    revision.spaceId !== source.spaceId ||
+    revision.sourceItemId !== item._id ||
+    revision.representation !== "archived_binary_v1" ||
+    revision.contentHashAuthority !== "worker_asserted" ||
+    revision.contentHash !== entry.contentHash ||
+    revision.byteLength !== entry.byteLength ||
+    revision.mediaType !== "application/pdf" ||
+    generation.spaceId !== source.spaceId ||
+    generation.sourceAccountId !== source.account._id ||
+    generation.sourceItemId !== item._id ||
+    generation.sourceRevisionId !== revision._id ||
+    generation.desiredProcessingEpoch !== item.desiredProcessingEpoch ||
+    generation.state !== "ready" ||
+    !generation.sourceTextVersionId ||
+    !generation.parserArtifactId ||
+    !generation.archiveSetDigest ||
+    !generation.normalizedBundleDigest ||
+    !generation.payloadManifestId ||
+    !safeInteger(generation.activatedAt) ||
+    generation.deactivatedAt !== undefined ||
+    generation.expectedEventCount !== 0 ||
+    generation.expectedObservationCount !== 0 ||
+    generation.actualEventCount !== 0 ||
+    generation.actualObservationCount !== 0
+  )
+    return false;
+  if (
+    !generation.originalPrimaryReceiptId ||
+    !generation.originalBackupReceiptId ||
+    !generation.parserPrimaryReceiptId ||
+    !generation.parserBackupReceiptId
+  )
+    return false;
+  const [
+    artifact,
+    text,
+    jobs,
+    originalPrimary,
+    originalBackup,
+    parserPrimary,
+    parserBackup,
+  ] = await Promise.all([
+    ctx.db.get(generation.parserArtifactId),
+    ctx.db.get(generation.sourceTextVersionId),
+    ctx.db
+      .query("ingestJobs")
+      .withIndex("by_processingGenerationId", (q) =>
+        q.eq("processingGenerationId", generation._id),
+      )
+      .take(2),
+    ctx.db.get(generation.originalPrimaryReceiptId),
+    ctx.db.get(generation.originalBackupReceiptId),
+    ctx.db.get(generation.parserPrimaryReceiptId),
+    ctx.db.get(generation.parserBackupReceiptId),
+  ]);
+  const job = jobs[0];
+  let revisionShape;
+  let textShape;
+  try {
+    revisionShape = parseSourceRevisionRepresentation(revision);
+    textShape = text ? parseSourceTextRepresentation(text) : undefined;
+  } catch {
+    return false;
+  }
+  if (
+    !artifact ||
+    !text ||
+    jobs.length !== 1 ||
+    !job ||
+    !originalPrimary ||
+    !originalBackup ||
+    !parserPrimary ||
+    !parserBackup ||
+    artifact.spaceId !== source.spaceId ||
+    artifact.sourceAccountId !== source.account._id ||
+    artifact.sourceItemId !== item._id ||
+    artifact.sourceRevisionId !== revision._id ||
+    artifact.parserFingerprint !== entry.parserFingerprint ||
+    artifact.hashAuthority !== "worker_asserted" ||
+    !UUID_PATTERN.test(artifact.clientArtifactId) ||
+    !SHA256_PATTERN.test(artifact.outputHash) ||
+    !safeInteger(artifact.outputByteLength, 1) ||
+    artifact.outputByteLength > MAX_PARSER_ARTIFACT_BYTES ||
+    artifact.outputMediaType.length === 0 ||
+    artifact.outputMediaType.length > 255 ||
+    !safeInteger(artifact.createdAt) ||
+    revisionShape.kind !== "archived_binary_v1" ||
+    textShape?.kind !== "parsed_pages_v1" ||
+    !textShape.sealed ||
+    textShape.hashAuthority !== "server_verified_retained_text" ||
+    text.spaceId !== source.spaceId ||
+    text.sourceRevisionId !== revision._id ||
+    text.representation !== "parsed_pages_v1" ||
+    text.parserArtifactId !== artifact._id ||
+    text.extractionFingerprint !==
+      (await artifactBoundExtractionFingerprint(
+        artifact.parserFingerprint,
+        artifact.outputHash,
+        entry.extractionConfigurationFingerprint!,
+      )) ||
+    generation.extractionFingerprint !== text.extractionFingerprint ||
+    generation.processingFingerprint !==
+      (await digestProcessingConfiguration({
+        extractionFingerprint: text.extractionFingerprint,
+        extractorFingerprint: entry.extractorFingerprint!,
+        recordSchemaFingerprint: entry.recordSchemaFingerprint!,
+        normalizationFingerprint: entry.normalizationFingerprint!,
+        chunkerFingerprint: entry.chunkerFingerprint!,
+        correctionRevision: entry.correctionRevision!,
+      })) ||
+    job.spaceId !== source.spaceId ||
+    job.sourceAccountId !== source.account._id ||
+    job.sourceItemId !== item._id ||
+    job.sourceRevisionId !== revision._id ||
+    job.processingGenerationId !== generation._id ||
+    job.desiredProcessingEpoch !== item.desiredProcessingEpoch ||
+    job.workerManaged !== true ||
+    job.workerProcessingMode !== "parsed_pages_v1" ||
+    job.state !== "ready" ||
+    job.leaseToken !== undefined ||
+    job.leaseExpiresAt !== undefined ||
+    job.workerLeaseOwnerCredentialId !== undefined
+  )
+    return false;
+  const receipts = [
+    [originalPrimary, "original_bytes", "primary"],
+    [originalBackup, "original_bytes", "independent_backup"],
+    [parserPrimary, "parser_output", "primary"],
+    [parserBackup, "parser_output", "independent_backup"],
+  ] as const;
+  if (
+    receipts.some(
+      ([receipt, subject, role]) =>
+        !historicalArchiveReceiptIsValid(receipt, {
+          revision,
+          artifact,
+          subjectKind: subject,
+          copyRole: role,
+        }) ||
+        receipt.spaceId !== source.spaceId ||
+        receipt.sourceAccountId !== source.account._id ||
+        receipt.sourceItemId !== item._id,
+    )
+  )
+    return false;
+  if (
+    originalPrimary._id === originalBackup._id ||
+    originalPrimary.archiveIdentityFingerprint ===
+      originalBackup.archiveIdentityFingerprint ||
+    originalPrimary.recipientFingerprint ===
+      originalBackup.recipientFingerprint ||
+    originalPrimary.repositoryKeyDomainFingerprint ===
+      originalBackup.repositoryKeyDomainFingerprint ||
+    originalPrimary.storageFailureDomainFingerprint ===
+      originalBackup.storageFailureDomainFingerprint ||
+    parserPrimary._id === parserBackup._id ||
+    parserPrimary.archiveIdentityFingerprint ===
+      parserBackup.archiveIdentityFingerprint ||
+    parserPrimary.recipientFingerprint === parserBackup.recipientFingerprint ||
+    parserPrimary.repositoryKeyDomainFingerprint ===
+      parserBackup.repositoryKeyDomainFingerprint ||
+    parserPrimary.storageFailureDomainFingerprint ===
+      parserBackup.storageFailureDomainFingerprint ||
+    !SHA256_PATTERN.test(generation.archiveSetDigest)
+  )
+    return false;
+  try {
+    const counts = await verifySealedParsedPayload(ctx, generation);
+    return (
+      generation.actualPageCount === counts.actualPageCount &&
+      generation.actualEvidenceSpanCount === counts.actualEvidenceSpanCount &&
+      generation.actualDocumentCount === counts.actualDocumentCount &&
+      generation.actualChunkCount === counts.actualChunkCount
+    );
+  } catch {
+    return false;
+  }
+}
+
 async function terminalReady(
   ctx: MutationCtx,
   source: LoadedWorkerSource,
@@ -837,6 +1188,8 @@ async function terminalReady(
   item: Doc<"sourceItems">,
   entry: Doc<"workerScanEntries">,
 ): Promise<boolean> {
+  if (entry.contentRepresentation === "archived_binary_v1")
+    return terminalParsedReady(ctx, source, assessment, item, entry);
   if (
     item.lifecycle !== "available" ||
     item.lastFailure !== undefined ||

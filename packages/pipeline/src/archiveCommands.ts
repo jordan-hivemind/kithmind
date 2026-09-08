@@ -14,6 +14,8 @@ import {
   type ArchiveToolVersions,
   type BackupResticObjectInput,
   type EncryptAgeObjectInput,
+  type ForgetResticBackupInput,
+  type ForgetResticBackupResult,
   type LocalBackupBoundary,
   type PasswordCommand,
   type PreparedAgeObject,
@@ -24,6 +26,8 @@ import {
   type ResticBackupResult,
   type ResticReadbackResult,
   type ResticRepositoryIdentity,
+  type RemovePublishedAgeObjectInput,
+  type RemovePublishedAgeObjectResult,
   type Sha256File,
 } from "./archiveTypes.js";
 
@@ -144,6 +148,48 @@ function expectedFile(value: Sha256File, maximum: number): Sha256File {
     fail("invalid_input", "expected file identity is invalid");
   }
   return { sha256: value.sha256, byteLength: value.byteLength };
+}
+
+function expectedDirectoryIdentity(value: { device: number; inode: number }): {
+  device: number;
+  inode: number;
+} {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.keys(value).length !== 2 ||
+    !Number.isSafeInteger(value.device) ||
+    value.device < 0 ||
+    !Number.isSafeInteger(value.inode) ||
+    value.inode < 1
+  ) {
+    fail("invalid_input", "expected directory identity is invalid");
+  }
+  return { device: value.device, inode: value.inode };
+}
+
+function expectedRemovalFile(
+  value: RemovePublishedAgeObjectInput["expectedFile"],
+  maximum: number,
+) {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.keys(value).length !== 4 ||
+    !Number.isSafeInteger(value.device) ||
+    value.device < 0 ||
+    !Number.isSafeInteger(value.inode) ||
+    value.inode < 1
+  ) {
+    fail("invalid_input", "expected ciphertext identity is invalid");
+  }
+  return {
+    device: value.device,
+    inode: value.inode,
+    ...expectedFile(value, maximum),
+  };
 }
 
 function identity(entry: Stats): FileIdentity {
@@ -836,6 +882,85 @@ function parseResticSnapshots(
   return matches.sort();
 }
 
+type ResticSnapshotRow = {
+  id: string;
+  hostname: string;
+  tags: string[];
+  paths: string[];
+};
+
+function parseResticSnapshotRows(stdout: Buffer): ResticSnapshotRow[] {
+  let value: unknown;
+  try {
+    value = JSON.parse(decodeUtf8(stdout));
+  } catch {
+    fail("invalid_tool_result", "restic snapshots output is not JSON");
+  }
+  if (!Array.isArray(value) || value.length > 32) {
+    fail("invalid_tool_result", "restic snapshot count is invalid");
+  }
+  return value.map((candidate) => {
+    if (
+      !candidate ||
+      typeof candidate !== "object" ||
+      Array.isArray(candidate)
+    ) {
+      fail("invalid_tool_result", "restic snapshot row is invalid");
+    }
+    const row = candidate as Record<string, unknown>;
+    if (
+      typeof row.id !== "string" ||
+      !HEX_64.test(row.id) ||
+      typeof row.hostname !== "string" ||
+      row.hostname.length < 1 ||
+      row.hostname.length > 128 ||
+      !Array.isArray(row.tags) ||
+      row.tags.length > 32 ||
+      row.tags.some(
+        (tag) => typeof tag !== "string" || tag.length < 1 || tag.length > 128,
+      ) ||
+      !Array.isArray(row.paths) ||
+      row.paths.length !== 1 ||
+      typeof row.paths[0] !== "string" ||
+      row.paths[0].length < 1 ||
+      row.paths[0].length > 4_096
+    ) {
+      fail("invalid_tool_result", "restic snapshot row is invalid");
+    }
+    return {
+      id: row.id,
+      hostname: row.hostname,
+      tags: [...row.tags] as string[],
+      paths: [...row.paths] as string[],
+    };
+  });
+}
+
+function requireExactResticSnapshot(
+  rows: ResticSnapshotRow[],
+  expected: {
+    operationId: string;
+    host: string;
+    snapshotId: string;
+    objectName: string;
+  },
+): ResticSnapshotRow | undefined {
+  if (rows.length > 1) {
+    fail("invalid_tool_result", "restic snapshot result is ambiguous");
+  }
+  const row = rows[0];
+  if (!row) return undefined;
+  if (
+    row.id !== expected.snapshotId ||
+    row.hostname !== expected.host ||
+    !row.tags.includes(expected.operationId) ||
+    basename(row.paths[0]!) !== expected.objectName
+  ) {
+    fail("invalid_tool_result", "restic snapshot identity changed");
+  }
+  return row;
+}
+
 function parseResticRepository(stdout: Buffer): ResticRepositoryIdentity {
   let value: unknown;
   try {
@@ -1511,6 +1636,265 @@ async function recoverResticBackupInternal(
   };
 }
 
+async function removePublishedAgeObjectExactInternal(
+  input: RemovePublishedAgeObjectInput,
+): Promise<RemovePublishedAgeObjectResult> {
+  const commandLimits = limits(input.limits ?? DEFAULT_ARCHIVE_COMMAND_LIMITS);
+  const objectPath = safeAbsolutePath(input.objectPath, "archive object");
+  if (!OBJECT_NAME.test(basename(objectPath))) {
+    fail("invalid_input", "archive object name is invalid");
+  }
+  const expectedDirectory = expectedDirectoryIdentity(input.expectedDirectory);
+  const expected = expectedRemovalFile(
+    input.expectedFile,
+    commandLimits.maxCipherBytes,
+  );
+  const parentPath = dirname(objectPath);
+  const parent = await safeDirectory(parentPath, "archive object directory");
+  if (
+    parent.dev !== expectedDirectory.device ||
+    parent.ino !== expectedDirectory.inode
+  ) {
+    fail("unsafe_path", "archive object directory identity changed");
+  }
+
+  const before = await lstat(objectPath).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    rethrowSafe(error, "unsafe_path", "archive object cannot be inspected");
+  });
+  if (before === undefined) {
+    const parentAfter = await safeDirectory(
+      parentPath,
+      "archive object directory",
+    );
+    if (!sameDirectoryIdentity(parent, parentAfter)) {
+      fail("unsafe_path", "archive object directory changed during removal");
+    }
+    const after = await lstat(objectPath).catch((error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      rethrowSafe(error, "unsafe_path", "archive object cannot be inspected");
+    });
+    if (after !== undefined) {
+      fail("source_changed", "archive object appeared during removal");
+    }
+    return {
+      outcome: "already_missing",
+      verification: "exact_path_absence",
+    };
+  }
+
+  const inspected = await readExactFile(
+    objectPath,
+    commandLimits.maxCipherBytes,
+    true,
+  );
+  try {
+    if (
+      inspected.identity.device !== expected.device ||
+      inspected.identity.inode !== expected.inode ||
+      inspected.digest.sha256 !== expected.sha256 ||
+      inspected.digest.byteLength !== expected.byteLength
+    ) {
+      fail("digest_mismatch", "archive object identity does not match intent");
+    }
+  } finally {
+    inspected.bytes.fill(0);
+  }
+
+  const parentAfterRead = await safeDirectory(
+    parentPath,
+    "archive object directory",
+  );
+  if (!sameDirectoryIdentity(parent, parentAfterRead)) {
+    fail("unsafe_path", "archive object directory changed during removal");
+  }
+  requiredOpenConstants();
+  const directoryHandle = await open(
+    parentPath,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  ).catch((error: unknown) => {
+    rethrowSafe(error, "unsafe_path", "archive object directory cannot open");
+  });
+  try {
+    if (!sameDirectoryIdentity(parent, await directoryHandle.stat())) {
+      fail("unsafe_path", "archive object directory changed before removal");
+    }
+    const current = await lstat(objectPath).catch((error: unknown) => {
+      rethrowSafe(
+        error,
+        "source_changed",
+        "archive object changed before removal",
+      );
+    });
+    if (!sameIdentity(inspected.identity, identity(current))) {
+      fail("source_changed", "archive object changed before removal");
+    }
+    await unlink(objectPath).catch((error: unknown) => {
+      rethrowSafe(
+        error,
+        "process_failed",
+        "archive object could not be removed",
+      );
+    });
+    await directoryHandle.sync().catch((error: unknown) => {
+      rethrowSafe(
+        error,
+        "process_failed",
+        "archive removal could not be synced",
+      );
+    });
+    const parentAfter = await safeDirectory(
+      parentPath,
+      "archive object directory",
+    );
+    if (!sameDirectoryIdentity(parent, parentAfter)) {
+      fail("unsafe_path", "archive object directory changed after removal");
+    }
+    const remaining = await lstat(objectPath).catch((error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      rethrowSafe(error, "unsafe_path", "archive removal cannot be verified");
+    });
+    if (remaining !== undefined) {
+      fail("source_changed", "archive object path is not absent");
+    }
+  } finally {
+    await directoryHandle.close().catch(() => undefined);
+  }
+  return { outcome: "deleted", verification: "exact_path_absence" };
+}
+
+async function listResticSnapshotsForDeletion(
+  resticBinary: string,
+  baseArgs: string[],
+  args: string[],
+  commandLimits: ArchiveCommandLimits,
+): Promise<ResticSnapshotRow[]> {
+  const result = await runBounded(
+    resticBinary,
+    [...baseArgs, "snapshots", "--json", ...args],
+    commandLimits,
+  );
+  try {
+    return parseResticSnapshotRows(result.stdout);
+  } finally {
+    result.stdout.fill(0);
+    result.stderr.fill(0);
+  }
+}
+
+async function requireResticDeletionState(
+  input: {
+    resticBinary: string;
+    baseArgs: string[];
+    operationId: string;
+    host: string;
+    snapshotId: string;
+    objectName: string;
+  },
+  commandLimits: ArchiveCommandLimits,
+): Promise<"present" | "absent"> {
+  const operationRows = await listResticSnapshotsForDeletion(
+    input.resticBinary,
+    input.baseArgs,
+    ["--host", input.host, "--tag", input.operationId],
+    commandLimits,
+  );
+  const snapshotRows = await listResticSnapshotsForDeletion(
+    input.resticBinary,
+    input.baseArgs,
+    [input.snapshotId],
+    commandLimits,
+  );
+  const expected = {
+    operationId: input.operationId,
+    host: input.host,
+    snapshotId: input.snapshotId,
+    objectName: input.objectName,
+  };
+  const byOperation = requireExactResticSnapshot(operationRows, expected);
+  const bySnapshot = requireExactResticSnapshot(snapshotRows, expected);
+  if ((byOperation === undefined) !== (bySnapshot === undefined)) {
+    fail("invalid_tool_result", "restic snapshot lookup is inconsistent");
+  }
+  return byOperation === undefined ? "absent" : "present";
+}
+
+async function forgetResticBackupExactInternal(
+  input: ForgetResticBackupInput,
+): Promise<ForgetResticBackupResult> {
+  const commandLimits = limits(input.limits ?? DEFAULT_ARCHIVE_COMMAND_LIMITS);
+  await validateExecutable(input.resticBinary, "restic binary");
+  await requireResticVersion(input.resticBinary, commandLimits);
+  if (
+    !OPAQUE_ID.test(input.operationId) ||
+    !OPAQUE_ID.test(input.host) ||
+    !HEX_64.test(input.snapshotId) ||
+    !OBJECT_NAME.test(input.objectName)
+  ) {
+    fail("invalid_input", "restic deletion identity is invalid");
+  }
+  const expected = expectedFile(
+    input.expectedCiphertext,
+    commandLimits.maxCipherBytes,
+  );
+  const repository = safeAbsolutePath(
+    input.repositoryPath,
+    "restic repository",
+  );
+  const repositoryIdentity = await requireResticRepository(
+    {
+      resticBinary: input.resticBinary,
+      repositoryPath: repository,
+      passwordCommand: input.passwordCommand,
+      limits: commandLimits,
+    },
+    input.expectedRepositoryId,
+  );
+  const password = await passwordCommandArgument(input.passwordCommand);
+  const baseArgs = resticBaseArgs(repository, password);
+  const identity = {
+    resticBinary: input.resticBinary,
+    baseArgs,
+    operationId: input.operationId,
+    host: input.host,
+    snapshotId: input.snapshotId,
+    objectName: input.objectName,
+  };
+  const before = await requireResticDeletionState(identity, commandLimits);
+  if (before === "present") {
+    await readbackResticObjectInternal({
+      resticBinary: input.resticBinary,
+      repositoryPath: repository,
+      expectedRepositoryId: repositoryIdentity.repositoryId,
+      passwordCommand: input.passwordCommand,
+      snapshotId: input.snapshotId,
+      objectName: input.objectName,
+      expectedCiphertext: expected,
+      limits: commandLimits,
+    });
+  }
+  const result = await runBounded(
+    input.resticBinary,
+    before === "present"
+      ? [...baseArgs, "forget", input.snapshotId, "--prune"]
+      : [...baseArgs, "prune"],
+    commandLimits,
+  );
+  result.stdout.fill(0);
+  result.stderr.fill(0);
+  if (
+    (await requireResticDeletionState(identity, commandLimits)) !== "absent"
+  ) {
+    fail("process_failed", "restic snapshot remains after deletion");
+  }
+  return {
+    outcome: before === "present" ? "deleted" : "already_missing",
+    snapshotId: input.snapshotId,
+    repositoryId: repositoryIdentity.repositoryId,
+    verification: "snapshot_absence_after_forget_prune",
+  };
+}
+
 async function publicOperation<T>(operation: () => Promise<T>): Promise<T> {
   try {
     return await operation();
@@ -1598,4 +1982,22 @@ export async function recoverResticBackup(
   input: RecoverResticBackupInput,
 ): Promise<RecoveredResticBackup> {
   return publicOperation(() => recoverResticBackupInternal(input));
+}
+
+/**
+ * Removes one exact cataloged age object. Identity checks detect replacement;
+ * they do not promise an atomic conditional unlink against a hostile same-UID
+ * process within the supported local filesystem trust boundary.
+ */
+export async function removePublishedAgeObjectExact(
+  input: RemovePublishedAgeObjectInput,
+): Promise<RemovePublishedAgeObjectResult> {
+  return publicOperation(() => removePublishedAgeObjectExactInternal(input));
+}
+
+/** Owner-operated retention action for one exact restic snapshot. */
+export async function forgetResticBackupExact(
+  input: ForgetResticBackupInput,
+): Promise<ForgetResticBackupResult> {
+  return publicOperation(() => forgetResticBackupExactInternal(input));
 }

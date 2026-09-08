@@ -13,6 +13,17 @@ export const JOURNAL_OPERATIONS = [
   "jobs.fail",
   "processing.assessBegin",
   "processing.assessPage",
+  "discovery.preflightArchived",
+  "discovery.reserveArchived",
+  "discovery.lookupArchivedAdmission",
+  "discovery.admitArchived",
+  "jobs.reserveParsed",
+  "jobs.renewParsed",
+  "jobs.failParsed",
+  "jobs.stageParsedBegin",
+  "jobs.stageParsedBatch",
+  "jobs.stageParsedSeal",
+  "jobs.activateParsed",
 ] as const;
 
 export type JournalOperation = (typeof JOURNAL_OPERATIONS)[number];

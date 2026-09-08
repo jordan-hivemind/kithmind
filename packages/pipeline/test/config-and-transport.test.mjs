@@ -1,8 +1,14 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import test from "node:test";
 
-import { parseConfig, validateEndpoint } from "../dist/config.js";
+import {
+  journalBindingForConfig,
+  parseConfig,
+  validateEndpoint,
+} from "../dist/config.js";
+import { PDF_DOCQA_CHUNKING_FINGERPRINT } from "../dist/parsedBundleMapping.js";
 import { HttpWorkerTransport, parseWorkerResponse } from "../dist/transport.js";
 
 test("config accepts only bounded absolute worker config", () => {
@@ -19,6 +25,207 @@ test("config accepts only bounded absolute worker config", () => {
   assert.throws(() => validateEndpoint("http://example.test/api/worker"));
   assert.throws(() =>
     parseConfig({ ...config, roots: [{ alias: "notes", path: "relative" }] }),
+  );
+});
+
+function pdfDocQaConfig() {
+  const digest = "a".repeat(64);
+  const archiveIdentity = {
+    archiveProfileFingerprint: digest,
+    archiveIdentityFingerprint: digest,
+    recipientFingerprint: digest,
+    repositoryKeyDomainFingerprint: digest,
+    storageFailureDomainFingerprint: digest,
+  };
+  return {
+    captureDirectory: "/private/captures",
+    parserOutputRoot: "/private/outputs",
+    spoolDirectory: "/private/spool",
+    parser: {
+      pythonExecutable: "/tools/python",
+      expectedPythonSha256: digest,
+      launcherPath: "/parser/launcher.py",
+      expectedLauncherSha256: digest,
+      packageRoot: "/parser/package",
+      modelAssetsPath: "/parser/models",
+      modelLockPath: "/parser/model-lock.json",
+      expectedModelLockSha256: digest,
+    },
+    profile: {
+      parserProfileId: "pdf_docqa_v1",
+      parserFingerprint: digest,
+      extractionConfigurationFingerprint: digest,
+      extractorFingerprint: "extractor-v1",
+      recordSchemaFingerprint: "records-disabled-v1",
+      normalizationFingerprint: "normalization-v1",
+      chunkerFingerprint: PDF_DOCQA_CHUNKING_FINGERPRINT,
+      correctionRevision: "correction-v1",
+    },
+    archive: {
+      ageBinary: "/tools/age",
+      primary: {
+        directory: "/private/archive-primary",
+        recipient: `age1pq1${"q".repeat(40)}`,
+        ...archiveIdentity,
+      },
+      independentBackup: {
+        directory: "/private/archive-backup",
+        recipient: `age1pq1${"p".repeat(40)}`,
+        resticBinary: "/tools/restic",
+        repositoryPath: "/private/repository",
+        expectedRepositoryId: digest,
+        passwordCommand: {
+          executable: "/tools/password-selector",
+          publicArgs: ["selector-v1"],
+        },
+        host: "worker_host",
+        ...archiveIdentity,
+      },
+    },
+  };
+}
+
+test("PDF document-Q&A config is closed, bound, and keeps legacy bindings stable", () => {
+  const base = {
+    protocolVersion: 1,
+    endpoint: "http://127.0.0.1:3100/api/worker",
+    spaceId: "space_1",
+    sourceAccountId: "source_1",
+    credentialEnv: "PIPELINE_TOKEN",
+    roots: [{ alias: "notes", path: "/tmp/root" }],
+    journalDir: "/tmp/journal",
+  };
+  const legacy = parseConfig(base);
+  const legacyPreimage = JSON.stringify({
+    endpoint: legacy.endpoint,
+    spaceId: legacy.spaceId,
+    sourceAccountId: legacy.sourceAccountId,
+    roots: legacy.roots,
+  });
+  assert.equal(
+    journalBindingForConfig(legacy).configFingerprint,
+    createHash("sha256").update(legacyPreimage).digest("hex"),
+  );
+  const pdf = parseConfig({ ...base, pdfDocQa: pdfDocQaConfig() });
+  assert.equal(
+    pdf.pdfDocQa.profile.chunkerFingerprint,
+    PDF_DOCQA_CHUNKING_FINGERPRINT,
+  );
+  assert.notEqual(
+    journalBindingForConfig(pdf).configFingerprint,
+    journalBindingForConfig(legacy).configFingerprint,
+  );
+  assert.throws(() =>
+    parseConfig({
+      ...base,
+      pdfDocQa: {
+        ...pdfDocQaConfig(),
+        profile: {
+          ...pdfDocQaConfig().profile,
+          chunkerFingerprint: "b".repeat(64),
+        },
+      },
+    }),
+  );
+  assert.throws(() =>
+    parseConfig({
+      ...base,
+      pdfDocQa: {
+        ...pdfDocQaConfig(),
+        captureDirectory: "/",
+      },
+    }),
+  );
+  assert.throws(() => {
+    const pdfDocQa = pdfDocQaConfig();
+    return parseConfig({
+      ...base,
+      pdfDocQa: {
+        ...pdfDocQa,
+        parser: {
+          ...pdfDocQa.parser,
+          packageRoot: "/private/captures/parser-package",
+        },
+      },
+    });
+  });
+  assert.throws(() => {
+    const pdfDocQa = pdfDocQaConfig();
+    return parseConfig({
+      ...base,
+      pdfDocQa: {
+        ...pdfDocQa,
+        parser: {
+          ...pdfDocQa.parser,
+          launcherPath: "/tmp/root/launcher.py",
+        },
+      },
+    });
+  });
+  assert.throws(() => {
+    const pdfDocQa = pdfDocQaConfig();
+    return parseConfig({
+      ...base,
+      pdfDocQa: {
+        ...pdfDocQa,
+        archive: {
+          ...pdfDocQa.archive,
+          independentBackup: {
+            ...pdfDocQa.archive.independentBackup,
+            passwordCommand: { executable: "/private/spool/selector" },
+          },
+        },
+      },
+    });
+  });
+  assert.throws(() =>
+    parseConfig({
+      ...base,
+      pdfDocQa: {
+        ...pdfDocQaConfig(),
+        captureDirectory: "/tmp/root/captures",
+      },
+    }),
+  );
+  assert.throws(() => {
+    const pdfDocQa = pdfDocQaConfig();
+    return parseConfig({
+      ...base,
+      pdfDocQa: {
+        ...pdfDocQa,
+        archive: {
+          ...pdfDocQa.archive,
+          independentBackup: {
+            ...pdfDocQa.archive.independentBackup,
+            recipient: pdfDocQa.archive.primary.recipient,
+          },
+        },
+      },
+    });
+  });
+  assert.throws(() =>
+    parseConfig({
+      ...base,
+      pdfDocQa: {
+        ...pdfDocQaConfig(),
+        archive: {
+          ...pdfDocQaConfig().archive,
+          independentBackup: {
+            ...pdfDocQaConfig().archive.independentBackup,
+            directory: "/private/archive-primary",
+          },
+        },
+      },
+    }),
+  );
+  assert.throws(() =>
+    parseConfig({
+      ...base,
+      pdfDocQa: {
+        ...pdfDocQaConfig(),
+        profile: { ...pdfDocQaConfig().profile, unexpected: true },
+      },
+    }),
   );
 });
 
@@ -151,6 +358,326 @@ test("safe errors retain only an allowlisted code", () => {
       "scan.begin",
     ),
   );
+});
+
+test("archive forget responses bind the source hash, epoch, receipt, and acknowledgement", () => {
+  const target = {
+    receiptId: "receipt_1",
+    clientReceiptId: "11111111-1111-4111-8111-111111111111",
+    receiptRequestDigest: "1".repeat(64),
+    subjectKind: "original_bytes",
+    copyRole: "primary",
+    archiveIdentityFingerprint: "2".repeat(64),
+    archiveObjectId: "22222222-2222-4222-8222-222222222222",
+    ciphertextHash: "3".repeat(64),
+    ciphertextByteLength: 100,
+    forgetEpoch: 4,
+    ack: {
+      deletionId: "33333333-3333-4333-8333-333333333333",
+      receiptId: "receipt_1",
+      forgetEpoch: 4,
+      objectOutcome: "deleted",
+      absenceAuthority: "worker_asserted_physical_absence",
+      completedAt: 5,
+    },
+  };
+  const page = {
+    operation: "archive.forgetTargets",
+    sourceItemId: "source_item",
+    sourceExternalIdHash: "4".repeat(64),
+    forgetEpoch: 4,
+    targets: [target],
+    isDone: true,
+    continueCursor: "done",
+  };
+  assert.equal(
+    parseWorkerResponse(JSON.stringify(page), page.operation).operation,
+    page.operation,
+  );
+  for (const invalid of [
+    { ...page, sourceExternalIdHash: "bad" },
+    { ...page, targets: [{ ...target, forgetEpoch: 5 }] },
+    {
+      ...page,
+      targets: [
+        target,
+        { ...target, archiveObjectId: "44444444-4444-4444-8444-444444444444" },
+      ],
+    },
+    {
+      ...page,
+      targets: [
+        {
+          ...target,
+          ack: { ...target.ack, backupOutcome: "deleted" },
+        },
+      ],
+    },
+  ])
+    assert.throws(() =>
+      parseWorkerResponse(JSON.stringify(invalid), page.operation),
+    );
+  const ack = {
+    operation: "archive.ackDeletion",
+    ...target.ack,
+    reused: false,
+  };
+  assert.equal(
+    parseWorkerResponse(JSON.stringify(ack), ack.operation).operation,
+    ack.operation,
+  );
+  assert.throws(() =>
+    parseWorkerResponse(
+      JSON.stringify({ ...ack, absenceAuthority: "filesystem_guess" }),
+      ack.operation,
+    ),
+  );
+});
+
+test("archived discovery responses require exact closed B1 shapes", () => {
+  const ids = {
+    workId: "work",
+    sourceItemId: "item",
+    sourceRevisionId: "revision",
+    parserArtifactId: "artifact",
+    sourceTextVersionId: "text-version",
+    processingGenerationId: "generation",
+    ingestJobId: "job",
+    originalPrimaryReceiptId: "original-primary",
+    originalBackupReceiptId: "original-backup",
+    parserPrimaryReceiptId: "parser-primary",
+    parserBackupReceiptId: "parser-backup",
+  };
+  const hash = "a".repeat(64);
+  const preflight = {
+    operation: "discovery.preflightArchived",
+    sourceItemId: ids.sourceItemId,
+    workId: ids.workId,
+    expectedDesiredProcessingEpoch: 1,
+    archiveIntentDigest: hash,
+  };
+  const reserve = {
+    operation: "discovery.reserveArchived",
+    workId: ids.workId,
+    sourceItemId: ids.sourceItemId,
+    observationEpoch: 1,
+    processingEpoch: 1,
+    leaseEpoch: 1,
+    leaseToken: hash,
+    leaseExpiresAt: 2,
+    reused: false,
+  };
+  const originalLookup = {
+    operation: "discovery.lookupArchivedAdmission",
+    mode: "original",
+    found: true,
+    sourceRevisionId: ids.sourceRevisionId,
+    originalPrimaryReceiptId: ids.originalPrimaryReceiptId,
+    originalPrimaryBindingEpoch: 0,
+    originalBackupReceiptId: ids.originalBackupReceiptId,
+    originalBackupBindingEpoch: 0,
+  };
+  const processingLookup = {
+    operation: "discovery.lookupArchivedAdmission",
+    mode: "processing",
+    found: true,
+    sourceRevisionId: ids.sourceRevisionId,
+    parserArtifactId: ids.parserArtifactId,
+    sourceTextVersionId: ids.sourceTextVersionId,
+    processingGenerationId: ids.processingGenerationId,
+    ingestJobId: ids.ingestJobId,
+    desiredProcessingEpoch: 1,
+    archiveSetDigest: hash,
+    originalPrimaryReceiptId: ids.originalPrimaryReceiptId,
+    originalPrimaryBindingEpoch: 0,
+    originalBackupReceiptId: ids.originalBackupReceiptId,
+    originalBackupBindingEpoch: 0,
+    parserPrimaryReceiptId: ids.parserPrimaryReceiptId,
+    parserPrimaryBindingEpoch: 0,
+    parserBackupReceiptId: ids.parserBackupReceiptId,
+    parserBackupBindingEpoch: 0,
+  };
+  const admit = {
+    operation: "discovery.admitArchived",
+    workId: ids.workId,
+    sourceItemId: ids.sourceItemId,
+    sourceRevisionId: ids.sourceRevisionId,
+    parserArtifactId: ids.parserArtifactId,
+    sourceTextVersionId: ids.sourceTextVersionId,
+    processingGenerationId: ids.processingGenerationId,
+    ingestJobId: ids.ingestJobId,
+    desiredProcessingEpoch: 1,
+    archiveSetDigest: hash,
+    originalPrimaryReceiptId: ids.originalPrimaryReceiptId,
+    originalPrimaryBindingEpoch: 0,
+    originalBackupReceiptId: ids.originalBackupReceiptId,
+    originalBackupBindingEpoch: 0,
+    parserPrimaryReceiptId: ids.parserPrimaryReceiptId,
+    parserPrimaryBindingEpoch: 0,
+    parserBackupReceiptId: ids.parserBackupReceiptId,
+    parserBackupBindingEpoch: 0,
+    state: "admitted",
+    reused: false,
+  };
+  for (const response of [
+    preflight,
+    reserve,
+    originalLookup,
+    processingLookup,
+    admit,
+  ]) {
+    assert.equal(
+      parseWorkerResponse(JSON.stringify(response), response.operation)
+        .operation,
+      response.operation,
+    );
+  }
+  assert.equal(
+    parseWorkerResponse(
+      JSON.stringify({
+        operation: "discovery.lookupArchivedAdmission",
+        mode: "processing",
+        found: false,
+      }),
+      "discovery.lookupArchivedAdmission",
+    ).operation,
+    "discovery.lookupArchivedAdmission",
+  );
+  for (const [response, operation] of [
+    [{ ...preflight, leaked: true }, preflight.operation],
+    [{ ...reserve, leaseToken: "not-a-token" }, reserve.operation],
+    [
+      { ...originalLookup, originalPrimaryBindingEpoch: -1 },
+      originalLookup.operation,
+    ],
+    [
+      { ...processingLookup, archiveSetDigest: "not-a-digest" },
+      processingLookup.operation,
+    ],
+    [{ ...admit, state: "queued" }, admit.operation],
+  ]) {
+    assert.throws(() =>
+      parseWorkerResponse(JSON.stringify(response), operation),
+    );
+  }
+});
+
+test("parsed job responses require closed B2 phases, counts, and leases", () => {
+  const target = {
+    jobId: "job",
+    workId: "work",
+    sourceItemId: "item",
+    observationEpoch: 1,
+    processingEpoch: 1,
+    state: "processing",
+    leaseEpoch: 1,
+    leaseToken: "b".repeat(64),
+    leaseExpiresAt: 2,
+  };
+  const responses = [
+    {
+      operation: "jobs.reserveParsed",
+      receiptId: "receipt",
+      expiresAt: 2,
+      reused: false,
+      targets: [target],
+    },
+    {
+      operation: "jobs.renewParsed",
+      jobId: "job",
+      state: "processing",
+      leaseExpiresAt: 2,
+      reused: false,
+    },
+    {
+      operation: "jobs.failParsed",
+      jobId: "job",
+      state: "failed",
+      retryable: true,
+      nextAttemptAt: 3,
+      failureCode: "worker_resource_exhausted",
+      reused: false,
+    },
+    {
+      operation: "jobs.stageParsedBegin",
+      jobId: "job",
+      stageId: "stage",
+      phase: "pages",
+      nextOrdinal: 0,
+      reused: false,
+    },
+    {
+      operation: "jobs.stageParsedBatch",
+      jobId: "job",
+      stageId: "stage",
+      committedPhase: "pages",
+      phase: "pages",
+      nextOrdinal: 1,
+      acceptedCount: 1,
+      reused: false,
+    },
+    {
+      operation: "jobs.stageParsedBatch",
+      jobId: "job",
+      stageId: "stage",
+      committedPhase: "pages",
+      phase: "evidence",
+      nextOrdinal: 0,
+      acceptedCount: 8,
+      reused: true,
+    },
+    {
+      operation: "jobs.stageParsedSeal",
+      jobId: "job",
+      stageId: "stage",
+      payloadManifestId: "manifest",
+      state: "staged",
+      actualPageCount: 1,
+      actualEvidenceSpanCount: 1,
+      actualDocumentCount: 1,
+      actualChunkCount: 1,
+      reused: false,
+    },
+    {
+      operation: "jobs.activateParsed",
+      jobId: "job",
+      state: "ready",
+      activatedAt: 3,
+      previousGenerationId: "generation",
+      reused: false,
+    },
+  ];
+  for (const response of responses) {
+    assert.equal(
+      parseWorkerResponse(JSON.stringify(response), response.operation)
+        .operation,
+      response.operation,
+    );
+  }
+  for (const [response, operation] of [
+    [
+      { ...responses[0], targets: [{ ...target, state: "queued" }] },
+      "jobs.reserveParsed",
+    ],
+    [{ ...responses[1], state: "ready" }, "jobs.renewParsed"],
+    [{ ...responses[2], nextAttemptAt: undefined }, "jobs.failParsed"],
+    [
+      { ...responses[3], phase: "seal", nextOrdinal: 1 },
+      "jobs.stageParsedBegin",
+    ],
+    [
+      { ...responses[4], phase: "documents", nextOrdinal: 0 },
+      "jobs.stageParsedBatch",
+    ],
+    [{ ...responses[5], nextOrdinal: 1 }, "jobs.stageParsedBatch"],
+    [{ ...responses[4], acceptedCount: 9 }, "jobs.stageParsedBatch"],
+    [{ ...responses[6], actualPageCount: 0 }, "jobs.stageParsedSeal"],
+    [{ ...responses[7], previousGenerationId: 1 }, "jobs.activateParsed"],
+  ]) {
+    assert.throws(() =>
+      parseWorkerResponse(JSON.stringify(response), operation),
+    );
+  }
 });
 
 function transportConfig(endpoint) {

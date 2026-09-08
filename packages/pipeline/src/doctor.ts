@@ -8,6 +8,7 @@ import {
 } from "./config.js";
 import {
   discoverFiles,
+  discoverSourceObservations,
   FilesystemFailure,
   type SafeRoot,
 } from "./filesystem.js";
@@ -483,7 +484,8 @@ async function inspectRoots(config: PipelineConfig): Promise<void> {
   ) {
     throw new RootDiagnosticFailure("journal_overlap");
   }
-  await discoverFiles(config, roots);
+  if (config.pdfDocQa) await discoverSourceObservations(config, roots);
+  else await discoverFiles(config, roots);
 }
 
 function rootFailureCode(error: unknown): RootsCheck["code"] {

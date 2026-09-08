@@ -5,6 +5,10 @@ import {
   classifyCoverageFetch,
   coverageEntityBelongsToSpace,
 } from "../coverage/model";
+import {
+  parseSourceRevisionRepresentation,
+  parseSourceTextRepresentation,
+} from "../provenance/representations";
 
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 25;
@@ -150,6 +154,23 @@ async function loadReadableDocument(
     generation.sourceTextVersionId !== textVersion._id ||
     generation.state !== "ready"
   ) {
+    return null;
+  }
+  try {
+    const revisionRepresentation = parseSourceRevisionRepresentation(revision);
+    const textRepresentation = parseSourceTextRepresentation(textVersion);
+    if (
+      (revisionRepresentation.kind === "inline_utf8_v1" &&
+        textRepresentation.kind !== "inline_text_v1") ||
+      (revisionRepresentation.kind === "archived_binary_v1" &&
+        (textRepresentation.kind !== "parsed_pages_v1" ||
+          !textRepresentation.sealed ||
+          textRepresentation.hashAuthority !==
+            "server_verified_retained_text" ||
+          generation.parserArtifactId !== textRepresentation.parserArtifactId))
+    )
+      return null;
+  } catch {
     return null;
   }
   if (
@@ -565,6 +586,12 @@ export async function getDocument(
     retainedTextAvailable: true,
     archiveRef: chain.revision.archiveRef,
     contentHash: chain.revision.contentHash,
+    contentHashAuthority:
+      chain.revision.representation === "archived_binary_v1"
+        ? ("worker_asserted" as const)
+        : ("server_verified_utf8" as const),
+    textHash: chain.textVersion.textHash,
+    textHashAuthority: "server_verified_retained_text" as const,
     pages,
     evidenceSpanIds: validatedEvidenceSpanIds,
     partial,

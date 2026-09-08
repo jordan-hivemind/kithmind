@@ -9,6 +9,7 @@ import {
   readFile,
   realpath,
   rename,
+  rm,
   stat,
   symlink,
   writeFile,
@@ -20,6 +21,7 @@ import test from "node:test";
 import {
   capturePdfFile,
   CaptureStoreError,
+  inspectCaptureIntentState,
   inspectCapturedPdf,
   removeCapturedPdfExact,
 } from "../dist/captureStore.js";
@@ -98,6 +100,35 @@ test("captures one descriptor-bound PDF and removes only its exact inode", async
     state: "already_missing",
   });
   await assert.rejects(() => stat(captured.path), { code: "ENOENT" });
+});
+
+test("detects an unowned capture result without adopting or deleting it", async () => {
+  const f = await fixture();
+  try {
+    const directory = await stat(f.captures);
+    const captureId = randomUUID();
+    const input = {
+      captureDirectory: f.captures,
+      captureId,
+      expectedDirectory: {
+        path: f.captures,
+        device: directory.dev,
+        inode: directory.ino,
+      },
+    };
+    assert.deepEqual(await inspectCaptureIntentState(input), {
+      state: "absent",
+    });
+    const target = join(f.captures, `${captureId}.pdf`);
+    const bytes = Buffer.from("unowned capture result");
+    await writeFile(target, bytes, { mode: 0o600 });
+    assert.deepEqual(await inspectCaptureIntentState(input), {
+      state: "present_unowned",
+    });
+    assert.deepEqual(await readFile(target), bytes);
+  } finally {
+    await rm(f.base, { recursive: true, force: true });
+  }
 });
 
 test("rejects changed observations and leaves no capture", async () => {

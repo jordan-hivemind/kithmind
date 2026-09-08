@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "packages/convex/**"
+      - "packages/worker-protocol/**"
       - ".github/workflows/deploy-convex.yml"
 
 jobs:

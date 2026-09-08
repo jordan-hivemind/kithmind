@@ -38,7 +38,16 @@ reuses existing space and source authorization. Additional family workflows
 and dedicated archive-maintenance or archive-restore credential roles are
 deferred. Where this contract allows a dedicated role, the first release may
 use the existing owner or administrator authority instead. Ordinary read and
-ingest credentials retain their existing restrictions.
+ingest credentials retain their existing restrictions. The owner starts forget;
+a currently authorized source worker may execute exact archive deletion and
+acknowledge physical absence for that forget epoch. This narrow operation does
+not grant source workers original-byte restore access.
+
+The first trial preserves strict configuration binding for the worker journal.
+Edited source files follow the normal correction workflow under the same
+configuration. Changing parser or archive policy does not silently rebind
+existing work: stop and recover with the original configuration before an
+explicit transition. Automated processing-profile migration is deferred.
 
 ## Trust labels
 
@@ -220,10 +229,10 @@ not make hosted text disappear.
 `sourceTextVersions` remains the immutable identity of extracted text. Its
 storage also becomes a closed branch.
 
-| Representation     | Stored fields and validation                                                                                                                                                                                                                                                                                                                           |
-| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Legacy inline text | `representation` is absent on existing rows or is `inline_text_v1`. `text` remains required. Existing extraction fingerprint, UTF-8 digest, byte-length, replay, page, and activation checks remain unchanged.                                                                                                                                         |
-| Parsed pages       | `representation` is `parsed_pages_v1`. `text` must be absent. `parserArtifactId` is required. The row declares `textHash`, UTF-8 byte length, UTF-16 length, page count, normalized mapping-manifest digest, extraction fingerprint, and `server_verified_retained_text` authority. It becomes sealed only after the server verifies all staged pages. |
+| Representation     | Stored fields and validation                                                                                                                                                                                                                                                                                                                                |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Legacy inline text | `representation` is absent on existing rows or is `inline_text_v1`. `text` remains required. Existing extraction fingerprint, UTF-8 digest, byte-length, replay, page, and activation checks remain unchanged.                                                                                                                                              |
+| Parsed pages       | `representation` is `parsed_pages_v1`. `text` must be absent. `parserArtifactId` is required. The row declares `textHash`, UTF-8 byte length, UTF-16 length, page count, normalized mapping-manifest digest, and extraction fingerprint. Hash authority is absent until the server verifies all staged pages; sealing adds `server_verified_retained_text`. |
 
 For `parsed_pages_v1`, retained text is defined as the direct concatenation of
 page text in ordinal order. No implicit separator is inserted. Page `start`
@@ -270,6 +279,31 @@ row reference, page number, and optional normalized bounding box or cell
 coordinates. The server checks that its artifact, page, text version, revision,
 source, and space parents agree. A parser box is only a locator. A cited field
 must still resolve to the exact retained page slice.
+
+### First-trial document mapping
+
+The first-trial mapper emits one document per PDF. Its initial chunk policy
+uses non-overlapping page-local chunks targeting 8 KiB, cuts only between
+Unicode scalar values, and preserves the complete page concatenation. This is
+a bounded starting policy, not a measured claim of optimal retrieval quality.
+The chunking fingerprint identifies this policy. Repeated equal rows remain
+separate evidence spans. Any parser mapping gap stops this first-trial path
+for review instead of silently declaring the document fully processed.
+
+Docling table segment IDs contain page-local table ordinals. They are not raw
+JSON array indexes. Before mapping, the local validator resolves each text
+item or table row against the exact raw parser artifact by reference,
+provenance, cell contents and row position. The mapper uses the resolved raw
+reference. It keeps raw item character spans as Python-codepoint metadata,
+separate from the UTF-16 evidence offsets. Table cell hashes identify exact raw
+cell text; quote hashes identify the normalized retained page slice.
+
+The initial mapper omits optional cloud bounding boxes because four coordinates
+alone would lose the raw coordinate-origin convention. Complete boxes remain
+in the archived raw parser artifact. The protected raw parser output stays
+available through durable activation so a restarted worker can revalidate the
+normalized spool and resolve the same citations. Exact local cleanup follows
+activation; a missing required raw output before then requires recovery.
 
 Old pages, evidence spans, records, documents, and generations remain
 addressable after correction. Cleanup must retain any immutable provenance
@@ -405,17 +439,19 @@ long parser process. The worker flow is:
 2. Persist an archive intent containing stable artifact and receipt IDs, then
    open the bounded source once into a private worker-owned capture file or
    file descriptor. Hash that exact capture and verify it against the scan.
-3. Feed the same capture to both age encryption operations and the pinned
-   parser. Persist the bounded normalized page bundle in a private staging
-   spool. Encrypt the lossless parser output separately for both roles.
+3. Archive the same capture under both original-byte roles before running the
+   pinned parser. Persist the bounded normalized page bundle in a private
+   staging spool. Encrypt the lossless parser output separately for both roles.
 4. Immediately before each external object or restic snapshot commit, call a
    read-only current-authority preflight for the exact source, scan, work,
    observation epoch, processing epoch, and original actor. After each commit,
    read the ciphertext back from its destination and verify its exact digest
    and length. An archive command exit status alone is not a receipt.
 5. Persist the four verified receipt envelopes and normalized bundle digest in
-   the protected local catalog. Destroy the original capture and plaintext
-   parser output. Root-independent cloud replay starts only after this point.
+   the protected local catalog. Keep the private capture, raw parser output,
+   and normalized bundle through durable activation. Recovery reopens these
+   exact files to validate the bundle and resolve raw parser locators. The
+   original source folder may be offline once these local artifacts exist.
 6. Reserve the exact discovery work. The server requires the archive receipt
    hash and length to match the current scan and work. Parsing does not grant
    authority to admit stale work.
@@ -427,7 +463,8 @@ long parser process. The worker flow is:
    margin when another batch is required.
 9. Seal the parsed text after server recomputation, then atomically activate
    the generation using the existing publication boundary.
-10. Run a fresh processing assessment. Enumeration completion and processing
+10. Record durable activation before exact local plaintext cleanup, then run a
+    fresh processing assessment. Enumeration completion and processing
     completion remain separate.
 
 The new protocol operations are separate discriminated union members:
@@ -454,25 +491,30 @@ without the original root mounted because the pending body contains only
 bounded metadata or the sole bounded stage batch needed for that call. Raw
 original bytes and full parser JSON never enter the journal or cloud request.
 
-The normalized staging spool is a separate worker-owned canonical bundle, not
-checkpoint JSON. Retained text inside it is at most 256 KiB. The complete
-serialized bundle is at most 4 MiB and contains every bounded page, locator,
-evidence, document, chunk, event-version, and observation input needed to
-reproduce exact stage batches. It is mode `0600`, stored under the journal
-trust boundary, and bound to source item, raw hash, parser artifact, extraction
-fingerprint, byte length, and digest. Every reopen repeats path, owner, mode,
-regular-file, size, and digest validation. It is deleted only after a terminal
-cloud receipt, forget, or verified orphan cleanup. This spool lets cloud
-admission and staged replay continue while the original root is offline.
+The normalized staging spool is a separate worker-owned bundle, not checkpoint
+JSON. Retained text inside it is at most 256 KiB. The complete serialized
+bundle is at most 4 MiB. It contains the parser's normalized pages and source
+locators; the fixed mapper derives document, evidence, and chunk inputs from
+that bundle and the validated raw parser output. The first trial emits no
+record inputs. The spool is mode `0600` in an explicitly configured protected
+directory. Its catalog identity binds the source, raw parser artifact,
+extraction fingerprint, byte length, digest, and local file identity. Every
+reopen repeats path, owner, mode, regular-file, size, and digest validation,
+then validates the raw artifact and bundle together. Exact cleanup follows a
+durable activation receipt, an explicit forget plan, or verified orphan
+cleanup. The private capture and raw parser output remain available for the
+same period. These local artifacts let admission and staging resume while the
+original source folder is offline.
 
 The preflight and external commit cannot be one transaction. A forget, source
 change, actor revocation, or newer scan may race after preflight. That race may
 create only a journaled orphan object. The later cloud admission rechecks the
 full current chain and rejects it. Bounded local cleanup deletes every such
 primary object and restic snapshot from its exact catalog receipt. Forget also
-advances the cloud epoch, cancels pending local encryption, parser, and archive
-subprocesses, and prevents any later local commit. A commit that wins the race
-is handled as an orphan and never inferred as admitted content.
+advances the cloud epoch. Once the worker observes that change, it stops
+pending local work. A local commit racing with that observation is handled
+as an orphan and never inferred as admitted content; the cloud rejects its
+admission.
 
 Journal-loss recovery is source scoped. The lookup has two closed modes. The
 original mode accepts source item, current raw hash, and binary representation
@@ -500,7 +542,16 @@ row sends the job to review. Lost replies never create another version.
 When no call is pending, an expired or near-expiry lease must be renewed or the
 job must return to reservation before another stage or activation call. When a
 call is pending, the worker replays it exactly even if the recorded lease time
-has elapsed because the server may already have committed its receipt.
+has elapsed because the server may already have committed its receipt. An
+expired-lease error is consumed durably before a new reservation begins; the
+worker then asks the server for the retained stage phase and ordinal. A saved
+preflight success never substitutes for a fresh authority check immediately
+before an external archive write.
+
+The local catalog records the intended temporary ciphertext name before
+encryption. If encryption finishes but its returned inode and digest are lost
+before durable recording, that object remains untouched and requires review.
+The name alone cannot authorize adoption or deletion.
 
 ## Mutation fences and activation
 
@@ -561,9 +612,11 @@ records, and evidence. They return a structured original summary with:
 
 Normal reads do not return archive object identities, credentials, keys, or
 bearer URLs. Permission to read hosted text does not by itself grant permission
-to retrieve original bytes. Mobile clients can read indexed text and exact
-citations while original or parser artifacts require an authorized desktop
-worker.
+to retrieve original bytes. The hosted API exposes indexed text and exact citations for mobile clients.
+Actual access from a native ChatGPT or Claude mobile app depends on that
+provider and account supporting the configured connector. Mobile compatibility
+is a later priority and does not gate the desktop trial. Original or parser
+artifacts can require the authorized desktop worker.
 
 Hosted document and search reads share a 256 KiB serialized citation budget
 per response, including quote, locator, and citation-array overhead. They omit
@@ -579,13 +632,24 @@ previously verified text slice false. Coverage reports expose original,
 archive, parser-artifact, and hosted-text availability separately.
 
 Forget hides the source and hosted content through the existing immediate
-forget boundary. It also creates bounded deletion work for every primary and
-backup object. Receipt metadata and opaque object identities remain available
-only to the authorized deletion worker until each archive acknowledges
-deletion. Cloud cleanup must not erase the only deletion locator first. Backup
-retention and delayed expiry remain explicit until verified. The final
-tombstone contains only the minimal non-content identity needed to prevent
-unintended reimport.
+forget boundary. The first trial uses the existing archive receipts as bounded
+delete targets and an owner-operated local command. It adds no cloud deletion
+job or new credential role. The command binds each durable deletion plan to
+the source item, forget epoch, receipt and exact local archive identity. It
+checks and removes the exact age object and, for the backup role, the exact
+restic snapshot followed by prune and absence verification. Unknown or replaced
+objects require review. Physical results are saved locally before the source
+worker sends an idempotent cloud acknowledgement. That acknowledgement is
+explicitly worker-asserted physical absence, not server verification.
+
+Receipt metadata and opaque object identities remain restricted to the
+authorized worker until its acknowledgement permits ordered cleanup. Cloud
+cleanup must not erase the only deletion locator first. Accepted historical
+acknowledgements remain evidence after their actor is revoked; new calls still
+require current authorization. Backup retention outside the live restic
+repository, filesystem snapshots and physical-media erasure are not established
+by this command. The final tombstone retains only minimal non-content identity
+and completion evidence needed to prevent unintended reimport.
 
 ## Compatibility and migration
 

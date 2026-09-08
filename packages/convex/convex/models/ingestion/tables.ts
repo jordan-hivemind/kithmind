@@ -4,10 +4,16 @@ import {
   ingestJobFields,
   ingestRequestFields,
   processingGenerationFields,
+  processingGenerationPayloadManifestFields,
   spaceProcessingStateFields,
 } from "./validators";
 
 export const ingestionTables = {
+  processingGenerationPayloadManifests: defineTable(
+    processingGenerationPayloadManifestFields,
+  )
+    .index("by_processingGenerationId", ["processingGenerationId"])
+    .index("by_sourceItemId", ["sourceItemId"]),
   processingGenerations: defineTable(processingGenerationFields)
     .index("by_spaceId", ["spaceId"])
     .index("by_sourceAccountId", ["sourceAccountId"])

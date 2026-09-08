@@ -9,6 +9,7 @@ import {
   requireInlineSourceRevision,
   requireInlineSourceTextVersion,
 } from "./representations";
+import { loadArchiveDeletionAck } from "./archiveDeletion";
 
 export const MAX_SOURCE_INLINE_UTF8_BYTES = 65_536;
 export const MAX_SOURCE_PAGES = 32;
@@ -293,6 +294,62 @@ function requireLocator(locator: EvidenceLocator): void {
       MAX_LOCATOR_TEXT_CHARS,
     );
     requireBoundedString(locator.range, "Sheet locator range", 128);
+    return;
+  }
+  if (locator.kind === "parser_item_v1") {
+    requireIntegerInRange(
+      locator.pageNumber,
+      "Parser page number",
+      1,
+      1_000_000,
+    );
+    requireBoundedString(
+      locator.itemRef,
+      "Parser item reference",
+      MAX_LOCATOR_TEXT_CHARS,
+    );
+    requireIntegerInRange(
+      locator.sourceCharStart,
+      "Parser source start",
+      0,
+      Number.MAX_SAFE_INTEGER,
+    );
+    requireIntegerInRange(
+      locator.sourceCharEnd,
+      "Parser source end",
+      locator.sourceCharStart,
+      Number.MAX_SAFE_INTEGER,
+    );
+    if (
+      locator.bbox &&
+      (locator.bbox.length !== 4 || !locator.bbox.every(Number.isFinite))
+    )
+      throw new Error("Parser bounding box is invalid");
+    return;
+  }
+  if (locator.kind === "parser_table_row_v1") {
+    requireIntegerInRange(
+      locator.pageNumber,
+      "Parser table page number",
+      1,
+      1_000_000,
+    );
+    requireBoundedString(
+      locator.tableRef,
+      "Parser table reference",
+      MAX_LOCATOR_TEXT_CHARS,
+    );
+    requireIntegerInRange(
+      locator.sourceRowOffset,
+      "Parser row offset",
+      0,
+      Number.MAX_SAFE_INTEGER,
+    );
+    if (
+      locator.bbox &&
+      (locator.bbox.length !== 4 || !locator.bbox.every(Number.isFinite))
+    )
+      throw new Error("Parser table bounding box is invalid");
     return;
   }
   requireIntegerInRange(locator.pageNumber, "PDF page number", 1, 1_000_000);
@@ -1130,8 +1187,27 @@ export async function activateSourceItemGeneration(
     processingGenerationId: Id<"processingGenerations">;
     expectedPreviousGenerationId?: Id<"processingGenerations">;
     expectedDesiredProcessingEpoch: number;
+    verifiedPayload?: {
+      documents: Doc<"documents">[];
+      chunks: Doc<"chunks">[];
+    };
+    payloadReadBudget?: {
+      measureRow: (
+        row: Record<string, unknown>,
+        maximumBytes: number,
+      ) => number;
+      finish: () => Promise<unknown>;
+    };
   },
 ): Promise<{ previousGenerationId?: Id<"processingGenerations"> }> {
+  if (
+    (input.verifiedPayload === undefined) !==
+    (input.payloadReadBudget === undefined)
+  ) {
+    throw new Error(
+      "Verified activation payload and its read budget must be provided together",
+    );
+  }
   const [item, revision, generation] = await Promise.all([
     requireSourceItem(ctx, input.sourceItemId, input.spaceId),
     requireSourceRevision(ctx, input.sourceRevisionId, input.spaceId),
@@ -1170,24 +1246,41 @@ export async function activateSourceItemGeneration(
       "Active generation text version belongs to another revision",
     );
   }
-  const nextDocuments = await ctx.db
-    .query("documents")
-    .withIndex("by_processingGenerationId", (q) =>
-      q.eq("processingGenerationId", generation._id),
-    )
-    .take(MAX_GENERATION_DOCUMENTS + 1);
-  const nextChunks = await ctx.db
-    .query("chunks")
-    .withIndex("by_processingGenerationId", (q) =>
-      q.eq("processingGenerationId", generation._id),
-    )
-    .take(MAX_GENERATION_CHUNKS + 1);
+  const nextDocuments =
+    input.verifiedPayload?.documents ??
+    (await ctx.db
+      .query("documents")
+      .withIndex("by_processingGenerationId", (q) =>
+        q.eq("processingGenerationId", generation._id),
+      )
+      .take(MAX_GENERATION_DOCUMENTS + 1));
+  const nextChunks =
+    input.verifiedPayload?.chunks ??
+    (await ctx.db
+      .query("chunks")
+      .withIndex("by_processingGenerationId", (q) =>
+        q.eq("processingGenerationId", generation._id),
+      )
+      .take(MAX_GENERATION_CHUNKS + 1));
   if (
     nextDocuments.length > MAX_GENERATION_DOCUMENTS ||
     nextChunks.length > MAX_GENERATION_CHUNKS
   ) {
     throw new Error("Generation payload exceeds activation bounds");
   }
+  if (
+    nextDocuments.some(
+      (row) =>
+        row.spaceId !== input.spaceId ||
+        row.processingGenerationId !== generation._id,
+    ) ||
+    nextChunks.some(
+      (row) =>
+        row.spaceId !== input.spaceId ||
+        row.processingGenerationId !== generation._id,
+    )
+  )
+    throw new Error("Generation payload has invalid parents");
   const nextChunkTextBytes = nextChunks.reduce(
     (bytes, chunk) => bytes + utf8Length(chunk.text),
     0,
@@ -1209,18 +1302,61 @@ export async function activateSourceItemGeneration(
         "Previous active generation belongs to another source item",
       );
     }
-    const previousDocuments = await ctx.db
-      .query("documents")
-      .withIndex("by_processingGenerationId", (q) =>
-        q.eq("processingGenerationId", previousGenerationId),
-      )
-      .take(MAX_GENERATION_DOCUMENTS + 1);
-    const previousChunks = await ctx.db
-      .query("chunks")
-      .withIndex("by_processingGenerationId", (q) =>
-        q.eq("processingGenerationId", previousGenerationId),
-      )
-      .take(MAX_GENERATION_CHUNKS + 1);
+    let previousDocuments: Doc<"documents">[];
+    let previousChunks: Doc<"chunks">[];
+    if (input.payloadReadBudget) {
+      previousDocuments = [];
+      previousChunks = [];
+      let transitionBytes = 0;
+      await input.payloadReadBudget.finish();
+      for await (const row of ctx.db
+        .query("documents")
+        .withIndex("by_processingGenerationId", (q) =>
+          q.eq("processingGenerationId", previousGenerationId),
+        )) {
+        transitionBytes += input.payloadReadBudget.measureRow(row, 16 * 1024);
+        if (
+          !Number.isSafeInteger(transitionBytes) ||
+          transitionBytes > 1024 * 1024 ||
+          previousDocuments.length >= MAX_GENERATION_DOCUMENTS
+        )
+          throw new Error(
+            "Previous generation payload exceeds activation bounds",
+          );
+        previousDocuments.push(row);
+        await input.payloadReadBudget.finish();
+      }
+      for await (const row of ctx.db
+        .query("chunks")
+        .withIndex("by_processingGenerationId", (q) =>
+          q.eq("processingGenerationId", previousGenerationId),
+        )) {
+        transitionBytes += input.payloadReadBudget.measureRow(row, 24 * 1024);
+        if (
+          !Number.isSafeInteger(transitionBytes) ||
+          transitionBytes > 1024 * 1024 ||
+          previousChunks.length >= MAX_GENERATION_CHUNKS
+        )
+          throw new Error(
+            "Previous generation payload exceeds activation bounds",
+          );
+        previousChunks.push(row);
+        await input.payloadReadBudget.finish();
+      }
+    } else {
+      previousDocuments = await ctx.db
+        .query("documents")
+        .withIndex("by_processingGenerationId", (q) =>
+          q.eq("processingGenerationId", previousGenerationId),
+        )
+        .take(MAX_GENERATION_DOCUMENTS + 1);
+      previousChunks = await ctx.db
+        .query("chunks")
+        .withIndex("by_processingGenerationId", (q) =>
+          q.eq("processingGenerationId", previousGenerationId),
+        )
+        .take(MAX_GENERATION_CHUNKS + 1);
+    }
     if (
       previousDocuments.length > MAX_GENERATION_DOCUMENTS ||
       previousChunks.length > MAX_GENERATION_CHUNKS
@@ -1312,6 +1448,9 @@ export async function beginSourceItemForget(
     lastFailure: undefined,
     forgottenAt: input.forgottenAt,
     forgottenBy: input.forgottenBy,
+    archiveDeletionForgetEpoch: desiredProcessingEpoch,
+    archiveDeletionReceiptCount: 0,
+    archiveDeletionCompletedAt: undefined,
   });
   return desiredProcessingEpoch;
 }
@@ -1617,6 +1756,9 @@ export async function deleteGenerationPayloadBatch(
     input.processingGenerationId,
     input.spaceId,
   );
+  if (generation.archiveSetDigest !== undefined) {
+    throw new Error("archive_cleanup_required");
+  }
   if (generation.state === "ready" || generation.activatedAt !== undefined) {
     const item = await requireSourceItem(
       ctx,
@@ -1682,6 +1824,95 @@ export async function deleteSourceItemProvenanceBatch(
   }
   const limit = input.limit ?? MAX_PROVENANCE_CLEANUP_ROWS;
   requireIntegerInRange(limit, "Cleanup limit", 1, MAX_PROVENANCE_CLEANUP_ROWS);
+  const deletionCount = item.archiveDeletionReceiptCount ?? 0;
+  const deletionEpoch =
+    item.archiveDeletionForgetEpoch ?? item.desiredProcessingEpoch;
+  if (
+    deletionEpoch !== item.desiredProcessingEpoch ||
+    !Number.isSafeInteger(deletionCount) ||
+    deletionCount < 0 ||
+    (item.archiveDeletionCompletedAt !== undefined &&
+      (!Number.isSafeInteger(item.archiveDeletionCompletedAt) ||
+        item.archiveDeletionCompletedAt < 0))
+  ) {
+    throw new Error("Archive deletion summary is invalid");
+  }
+  const archived = await ctx.db
+    .query("sourceArtifactArchiveReceipts")
+    .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+    .take(1);
+  const archiveReceipt = archived[0];
+  if (archiveReceipt) {
+    if (
+      archiveReceipt.spaceId !== item.spaceId ||
+      archiveReceipt.sourceAccountId !== item.sourceAccountId
+    )
+      throw new Error("Archive receipt parent chain is invalid");
+    const ack = await loadArchiveDeletionAck(
+      ctx,
+      archiveReceipt,
+      item,
+      item.desiredProcessingEpoch,
+    );
+    if (!ack) {
+      return { deleted: 0, phase: "archive_cleanup_required", done: false };
+    }
+    const bindings = await ctx.db
+      .query("sourceArtifactArchiveBindings")
+      .withIndex("by_receiptId", (q) => q.eq("receiptId", archiveReceipt._id))
+      .take(2);
+    if (
+      bindings.length > 1 ||
+      bindings.some(
+        (binding) =>
+          binding.spaceId !== item.spaceId ||
+          binding.sourceAccountId !== item.sourceAccountId ||
+          binding.sourceItemId !== item._id ||
+          binding.sourceRevisionId !== archiveReceipt.sourceRevisionId ||
+          binding.parserArtifactId !== archiveReceipt.parserArtifactId ||
+          binding.subjectKind !== archiveReceipt.subjectKind ||
+          binding.copyRole !== archiveReceipt.copyRole ||
+          binding.archiveIdentityFingerprint !==
+            archiveReceipt.archiveIdentityFingerprint,
+      )
+    )
+      throw new Error("Archive receipt binding is incoherent");
+    const binding = bindings[0];
+    if (binding) {
+      await ctx.db.delete(binding._id);
+      if (limit === 1) {
+        return { deleted: 1, phase: "archiveBindings", done: false };
+      }
+    }
+    if (deletionCount >= Number.MAX_SAFE_INTEGER) {
+      throw new Error("Archive deletion receipt count is exhausted");
+    }
+    await ctx.db.delete(archiveReceipt._id);
+    await ctx.db.patch(item._id, {
+      archiveDeletionForgetEpoch: item.desiredProcessingEpoch,
+      archiveDeletionReceiptCount: deletionCount + 1,
+    });
+    return {
+      deleted: bindings.length + 1,
+      phase: "archiveReceipts",
+      done: false,
+    };
+  }
+  const orphanedBindings = await ctx.db
+    .query("sourceArtifactArchiveBindings")
+    .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+    .take(1);
+  if (orphanedBindings.length !== 0) {
+    throw new Error("Archive binding is missing its immutable receipt");
+  }
+  if (item.archiveDeletionCompletedAt === undefined) {
+    await ctx.db.patch(item._id, {
+      archiveDeletionForgetEpoch: item.desiredProcessingEpoch,
+      archiveDeletionReceiptCount: deletionCount,
+      archiveDeletionCompletedAt: Date.now(),
+    });
+    return { deleted: 0, phase: "archiveDeletionSummary", done: false };
+  }
   const documents = await ctx.db
     .query("documents")
     .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
@@ -1745,6 +1976,28 @@ export async function deleteSourceItemProvenanceBatch(
       await ctx.db.delete(textVersion._id);
       return { deleted: 1, phase: "sourceTextVersions", done: false };
     }
+    const parserArtifacts = await ctx.db
+      .query("sourceParserArtifacts")
+      .withIndex("by_sourceRevisionId", (q) =>
+        q.eq("sourceRevisionId", revision._id),
+      )
+      .take(limit);
+    for (const artifact of parserArtifacts) {
+      if (
+        artifact.spaceId !== item.spaceId ||
+        artifact.sourceAccountId !== item.sourceAccountId ||
+        artifact.sourceItemId !== item._id
+      )
+        throw new Error("Parser artifact parent chain is invalid");
+      await ctx.db.delete(artifact._id);
+    }
+    if (parserArtifacts.length > 0) {
+      return {
+        deleted: parserArtifacts.length,
+        phase: "sourceParserArtifacts",
+        done: false,
+      };
+    }
     await ctx.db.delete(revision._id);
     return { deleted: 1, phase: "sourceRevisions", done: false };
   }
@@ -1761,6 +2014,15 @@ export async function finalizeSourceItemTombstone(
     throw new Error(
       "Source item must be forgetting before finalizing its tombstone",
     );
+  }
+  if (
+    item.archiveDeletionForgetEpoch !== item.desiredProcessingEpoch ||
+    !Number.isSafeInteger(item.archiveDeletionReceiptCount) ||
+    (item.archiveDeletionReceiptCount ?? -1) < 0 ||
+    !Number.isSafeInteger(item.archiveDeletionCompletedAt) ||
+    (item.archiveDeletionCompletedAt ?? -1) < 0
+  ) {
+    throw new Error("Archive deletion summary is incomplete");
   }
   const remainingRevisions = await ctx.db
     .query("sourceRevisions")
@@ -1781,6 +2043,18 @@ export async function finalizeSourceItemTombstone(
       .first(),
     ctx.db
       .query("observations")
+      .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+      .first(),
+    ctx.db
+      .query("sourceArtifactArchiveReceipts")
+      .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+      .first(),
+    ctx.db
+      .query("sourceArtifactArchiveBindings")
+      .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+      .first(),
+    ctx.db
+      .query("sourceArtifactDeletionAcks")
       .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
       .first(),
   ]);

@@ -416,6 +416,23 @@ test("bounded discovery proves readability and reports content failures without 
   assert.equal(check(capacity, "roots").code, "root_capacity_exceeded");
 });
 
+test("bounded PDF discovery is accepted when the PDF profile is configured", async (context) => {
+  const files = await fixture();
+  context.after(() => rm(files.base, { recursive: true, force: true }));
+  await writeFile(
+    join(files.root, "document.pdf"),
+    "%PDF-1.7\nsynthetic\n%%EOF\n",
+  );
+  const result = await doctor(
+    config(files.root, files.journal, { pdfDocQa: {} }),
+    transport(source()),
+    "synthetic-token",
+    { inspectJournal: async () => ({ state: "not_initialized" }) },
+  );
+  assert.equal(check(result, "roots").state, "pass");
+  assert.equal(check(result, "roots").code, "safe");
+});
+
 test("journal activity degrades while recovery hazards block", async (context) => {
   const files = await fixture();
   context.after(() => rm(files.base, { recursive: true, force: true }));

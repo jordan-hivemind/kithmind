@@ -9,17 +9,20 @@
     "./models/*": "./convex/models/*"
   },
   "scripts": {
-    "dev": "convex dev",
-    "deploy:dev": "convex dev --once",
-    "deploy:prod": "convex deploy -y",
+    "build": "tsc --noEmit",
+    "dev": "pnpm run prepare:worker-protocol && convex dev",
+    "deploy:dev": "pnpm run prepare:worker-protocol && convex dev --once",
+    "deploy:prod": "pnpm run prepare:worker-protocol && convex deploy -y",
     "check-types": "tsc --noEmit",
     "test": "vitest",
-    "test:once": "vitest run"
+    "test:once": "vitest run",
+    "prepare:worker-protocol": "pnpm --filter @repo/worker-protocol build"
   },
   "dependencies": {
     "@auth/core": "^0.41.3",
     "@convex-dev/auth": "^0.0.94",
-    "convex": "^1.43.0"
+    "convex": "^1.43.0",
+    "@repo/worker-protocol": "workspace:*"
   },
   "devDependencies": {
     "@edge-runtime/vm": "^5.0.0",

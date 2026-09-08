@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
   chmod,
+  link,
   mkdir,
   mkdtemp,
   readFile,
@@ -23,12 +24,14 @@ import {
   assessLocalBackupBoundary,
   backupResticObject,
   encryptAgeObject,
+  forgetResticBackupExact,
   probeArchiveTools,
   probeResticRepository,
   publishAgeObject,
   readbackResticObject,
   recoverPublishedAgeObject,
   recoverResticBackup,
+  removePublishedAgeObjectExact,
 } from "../dist/archiveCommands.js";
 
 const RECIPIENT = `age1pq1${"q".repeat(60)}`;
@@ -84,7 +87,7 @@ if (${JSON.stringify(mode)} === "flood") {
 
 function resticProgram(mode = "normal") {
   return `
-import { chmodSync, copyFileSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 if (process.argv[2] === "version") {
   process.stdout.write(${JSON.stringify(mode === "wrong-version" ? "restic 0.18.0 compiled with go1.25.1 on darwin/arm64\n" : "restic 0.19.1 compiled with go1.25.1 on darwin/arm64\n")});
@@ -93,7 +96,23 @@ if (process.argv[2] === "version") {
 const args = process.argv.slice(2);
 const repo = args[args.indexOf("--repo") + 1];
 const passwordCommand = args[args.indexOf("--password-command") + 1];
-const command = args.find((value) => value === "backup" || value === "dump" || value === "snapshots");
+const command = args.find((value) => ["backup", "dump", "snapshots", "forget", "prune"].includes(value));
+const statePath = join(repo, "snapshots.json");
+const defaultRows = [{
+  id: ${JSON.stringify(SNAPSHOT)},
+  hostname: "kith-original-archive",
+  tags: ["operation_1"],
+  paths: [join(repo, "private-prefix", "opaque.age")]
+}];
+const loadRows = () => {
+  if (existsSync(statePath)) return JSON.parse(readFileSync(statePath, "utf8"));
+  if (${JSON.stringify(mode)} === "missing-snapshot") return [];
+  if (${JSON.stringify(mode)} === "duplicate-snapshot") {
+    return [...defaultRows, { ...defaultRows[0], id: "c".repeat(64) }];
+  }
+  return defaultRows;
+};
+const saveRows = (rows) => writeFileSync(statePath, JSON.stringify(rows), { mode: 0o600 });
 if (args.includes("cat") && args.includes("config")) {
   process.stdout.write(JSON.stringify({ version: 2, id: ${JSON.stringify(REPOSITORY)} }));
   process.exit(0);
@@ -104,6 +123,7 @@ if (command === "backup") {
   const bytes = readFileSync(source);
   copyFileSync(source, join(repo, "stored.age"));
   chmodSync(join(repo, "stored.age"), 0o600);
+  saveRows(defaultRows);
   writeFileSync(join(repo, "captured.json"), JSON.stringify({ args, passwordCommand }), { mode: 0o600 });
   if (${JSON.stringify(mode)} === "error-secret") {
     process.stderr.write(${JSON.stringify(SECRET_SENTINEL)});
@@ -128,15 +148,24 @@ if (command === "dump") {
   process.exit(0);
 }
 if (command === "snapshots") {
-  const rows = [{
-    id: ${JSON.stringify(SNAPSHOT)},
-    hostname: "kith-original-archive",
-    tags: ["operation_1"],
-    paths: [join(repo, "private-prefix", "opaque.age")]
-  }];
-  if (${JSON.stringify(mode)} === "missing-snapshot") rows.length = 0;
-  if (${JSON.stringify(mode)} === "duplicate-snapshot") rows.push({ ...rows[0], id: "c".repeat(64) });
+  let rows = loadRows();
+  const hostIndex = args.indexOf("--host");
+  const tagIndex = args.indexOf("--tag");
+  if (hostIndex >= 0) rows = rows.filter((row) => row.hostname === args[hostIndex + 1]);
+  if (tagIndex >= 0) rows = rows.filter((row) => row.tags.includes(args[tagIndex + 1]));
+  const selector = args.find((value) => /^[a-f0-9]{64}$/.test(value));
+  if (selector) rows = rows.filter((row) => row.id === selector);
   process.stdout.write(JSON.stringify(rows));
+  process.exit(0);
+}
+if (command === "forget") {
+  const snapshot = args[args.indexOf("forget") + 1];
+  saveRows(loadRows().filter((row) => row.id !== snapshot));
+  writeFileSync(join(repo, "prune-ran"), "forget-prune", { mode: 0o600 });
+  process.exit(0);
+}
+if (command === "prune") {
+  writeFileSync(join(repo, "prune-ran"), "prune", { mode: 0o600 });
   process.exit(0);
 }
 process.exit(2);
@@ -794,5 +823,231 @@ test("restic malformed summaries, readback mismatch, output flood, and stderr se
     }
     assert.ok(caught instanceof ArchiveCommandError, mode);
     assert.equal(caught.message.includes(SECRET_SENTINEL), false, mode);
+  }
+});
+
+test("removes one exact age object idempotently and preserves replacements", async () => {
+  const fixture = await setup();
+  const { prepared } = await preparedFixture(fixture);
+  const objectPath = join(fixture.archiveRoot, "opaque.age");
+  await publishAgeObject(prepared, objectPath, limits());
+  const input = {
+    objectPath,
+    expectedDirectory: {
+      device: prepared.archiveDirectoryDevice,
+      inode: prepared.archiveDirectoryInode,
+    },
+    expectedFile: {
+      device: prepared.ciphertextDevice,
+      inode: prepared.ciphertextInode,
+      ...prepared.ciphertext,
+    },
+    limits: limits(),
+  };
+  assert.deepEqual(await removePublishedAgeObjectExact(input), {
+    outcome: "deleted",
+    verification: "exact_path_absence",
+  });
+  assert.deepEqual(await removePublishedAgeObjectExact(input), {
+    outcome: "already_missing",
+    verification: "exact_path_absence",
+  });
+
+  await writeFile(objectPath, "replacement", { mode: 0o600 });
+  await assert.rejects(
+    () => removePublishedAgeObjectExact(input),
+    (error) =>
+      error instanceof ArchiveCommandError && error.code === "digest_mismatch",
+  );
+  assert.equal(await readFile(objectPath, "utf8"), "replacement");
+});
+
+test("age removal rejects a replaced directory even when it contains the original inode", async () => {
+  const fixture = await setup();
+  const { prepared } = await preparedFixture(fixture);
+  const objectPath = join(fixture.archiveRoot, "opaque.age");
+  await publishAgeObject(prepared, objectPath, limits());
+  const displaced = `${fixture.archiveRoot}-displaced`;
+  await rename(fixture.archiveRoot, displaced);
+  await mkdir(fixture.archiveRoot, { mode: 0o700 });
+  await chmod(fixture.archiveRoot, 0o700);
+  await link(join(displaced, "opaque.age"), objectPath);
+  await assert.rejects(
+    () =>
+      removePublishedAgeObjectExact({
+        objectPath,
+        expectedDirectory: {
+          device: prepared.archiveDirectoryDevice,
+          inode: prepared.archiveDirectoryInode,
+        },
+        expectedFile: {
+          device: prepared.ciphertextDevice,
+          inode: prepared.ciphertextInode,
+          ...prepared.ciphertext,
+        },
+        limits: limits(),
+      }),
+    (error) =>
+      error instanceof ArchiveCommandError && error.code === "unsafe_path",
+  );
+  assert.equal((await stat(objectPath)).ino, prepared.ciphertextInode);
+  assert.equal(
+    (await stat(join(displaced, "opaque.age"))).ino,
+    prepared.ciphertextInode,
+  );
+});
+
+test("forgets one exact restic snapshot, prunes, and preserves other snapshots", async () => {
+  const fixture = await setup();
+  const bytes = Buffer.from("AGE ciphertext");
+  await writeFile(join(fixture.repository, "stored.age"), bytes, {
+    mode: 0o600,
+  });
+  const otherSnapshot = "d".repeat(64);
+  await writeFile(
+    join(fixture.repository, "snapshots.json"),
+    JSON.stringify([
+      {
+        id: SNAPSHOT,
+        hostname: "kith-original-archive",
+        tags: ["operation_1"],
+        paths: [join(fixture.repository, "private-prefix", "opaque.age")],
+      },
+      {
+        id: otherSnapshot,
+        hostname: "kith-original-archive",
+        tags: ["operation_2"],
+        paths: [join(fixture.repository, "private-prefix", "other.age")],
+      },
+    ]),
+    { mode: 0o600 },
+  );
+  const input = {
+    resticBinary: fixture.resticBinary,
+    repositoryPath: fixture.repository,
+    expectedRepositoryId: REPOSITORY,
+    passwordCommand: fixture.passwordCommand,
+    operationId: "operation_1",
+    host: "kith-original-archive",
+    snapshotId: SNAPSHOT,
+    objectName: "opaque.age",
+    expectedCiphertext: digest(bytes),
+    limits: limits(),
+  };
+  assert.deepEqual(await forgetResticBackupExact(input), {
+    outcome: "deleted",
+    snapshotId: SNAPSHOT,
+    repositoryId: REPOSITORY,
+    verification: "snapshot_absence_after_forget_prune",
+  });
+  assert.deepEqual(
+    JSON.parse(
+      await readFile(join(fixture.repository, "snapshots.json"), "utf8"),
+    ).map((row) => row.id),
+    [otherSnapshot],
+  );
+  assert.equal(
+    await readFile(join(fixture.repository, "prune-ran"), "utf8"),
+    "forget-prune",
+  );
+  assert.deepEqual(await forgetResticBackupExact(input), {
+    outcome: "already_missing",
+    snapshotId: SNAPSHOT,
+    repositoryId: REPOSITORY,
+    verification: "snapshot_absence_after_forget_prune",
+  });
+  assert.deepEqual(
+    JSON.parse(
+      await readFile(join(fixture.repository, "snapshots.json"), "utf8"),
+    ).map((row) => row.id),
+    [otherSnapshot],
+  );
+});
+
+test("restic deletion checks the full snapshot ID when operation metadata changed", async () => {
+  const fixture = await setup();
+  const bytes = Buffer.from("AGE ciphertext");
+  await writeFile(join(fixture.repository, "stored.age"), bytes, {
+    mode: 0o600,
+  });
+  const statePath = join(fixture.repository, "snapshots.json");
+  const row = {
+    id: SNAPSHOT,
+    hostname: "kith-original-archive",
+    tags: ["changed_operation"],
+    paths: [join(fixture.repository, "private-prefix", "opaque.age")],
+  };
+  await writeFile(statePath, JSON.stringify([row]), { mode: 0o600 });
+  await assert.rejects(
+    () =>
+      forgetResticBackupExact({
+        resticBinary: fixture.resticBinary,
+        repositoryPath: fixture.repository,
+        expectedRepositoryId: REPOSITORY,
+        passwordCommand: fixture.passwordCommand,
+        operationId: "operation_1",
+        host: "kith-original-archive",
+        snapshotId: SNAPSHOT,
+        objectName: "opaque.age",
+        expectedCiphertext: digest(bytes),
+        limits: limits(),
+      }),
+    (error) =>
+      error instanceof ArchiveCommandError &&
+      error.code === "invalid_tool_result",
+  );
+  assert.deepEqual(JSON.parse(await readFile(statePath, "utf8")), [row]);
+});
+
+test("restic deletion preserves snapshots on readback mismatch or ambiguous operation", async () => {
+  for (const mode of ["readback", "ambiguous"]) {
+    const fixture = await setup();
+    const bytes = Buffer.from("AGE ciphertext");
+    await writeFile(join(fixture.repository, "stored.age"), bytes, {
+      mode: 0o600,
+    });
+    const statePath = join(fixture.repository, "snapshots.json");
+    const rows = [
+      {
+        id: SNAPSHOT,
+        hostname: "kith-original-archive",
+        tags: ["operation_1"],
+        paths: [join(fixture.repository, "private-prefix", "opaque.age")],
+      },
+      ...(mode === "ambiguous"
+        ? [
+            {
+              id: "d".repeat(64),
+              hostname: "kith-original-archive",
+              tags: ["operation_1"],
+              paths: [join(fixture.repository, "private-prefix", "opaque.age")],
+            },
+          ]
+        : []),
+    ];
+    await writeFile(statePath, JSON.stringify(rows), { mode: 0o600 });
+    await assert.rejects(
+      () =>
+        forgetResticBackupExact({
+          resticBinary: fixture.resticBinary,
+          repositoryPath: fixture.repository,
+          expectedRepositoryId: REPOSITORY,
+          passwordCommand: fixture.passwordCommand,
+          operationId: "operation_1",
+          host: "kith-original-archive",
+          snapshotId: SNAPSHOT,
+          objectName: "opaque.age",
+          expectedCiphertext:
+            mode === "readback"
+              ? digest(Buffer.from("different bytes"))
+              : digest(bytes),
+          limits: limits(),
+        }),
+      (error) =>
+        error instanceof ArchiveCommandError &&
+        (error.code === "readback_failed" ||
+          error.code === "invalid_tool_result"),
+    );
+    assert.deepEqual(JSON.parse(await readFile(statePath, "utf8")), rows);
   }
 });

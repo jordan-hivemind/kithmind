@@ -73,7 +73,7 @@ Install dependencies from the repository root and build the worker:
 
 ```sh
 pnpm install --frozen-lockfile
-pnpm --filter @repo/pipeline build
+pnpm exec turbo run build --filter=@repo/pipeline
 ```
 
 Create a regular `.txt` file in the configured synthetic folder. Resolve the

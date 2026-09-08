@@ -1,3 +1,18 @@
+import {
+  assertParsedRequestSize,
+  MAX_PARSED_PAGE_BATCH,
+  MAX_PARSED_ROW_BATCH,
+  parseParsedChunkInput,
+  parseParsedDocumentInput,
+  parseParsedEvidenceInput,
+  parseParsedPageInput,
+  type ParsedChunkInput,
+  type ParsedDocumentInput,
+  type ParsedEvidenceInput,
+  type ParsedPageInput,
+  type ParsedStagePhase,
+} from "./parsedProtocol";
+
 export const WORKER_PROTOCOL_VERSION = 1 as const;
 
 export const WORKER_PROTOCOL_ERROR_CODES = [
@@ -63,6 +78,7 @@ export const MAX_WORKER_INVENTORY_PAGE_ITEMS = 50;
 export const MAX_WORKER_RECONCILE_ITEMS = 50;
 export const MAX_WORKER_RESERVATION_ITEMS = 4;
 export const MAX_WORKER_ASSESSMENT_ITEMS = 1;
+export const MAX_WORKER_ARCHIVE_FORGET_ITEMS = 4;
 
 export type WorkerPaginationOptions = {
   cursor: string | null;
@@ -83,6 +99,8 @@ export type WorkerJobFailureCode =
   | "worker_resource_exhausted"
   | "source_bytes_invalid"
   | "staging_invalid";
+
+export type ArchiveDeletionOutcome = "deleted" | "already_missing";
 
 export type FsDiscoveryEntry = {
   externalId?: string;
@@ -116,72 +134,18 @@ export type FsDiscoveryEntry = {
       };
 };
 
-export type ArchivedWorkIdentity = {
-  sourceItemId: string;
-  scanId: string;
-  observationEpoch: number;
-  processingEpoch: number;
-  contentHash: string;
-  byteLength: number;
-  mediaType: "application/pdf";
-  parserProfileId: "pdf_docqa_v1";
-  parserFingerprint: string;
-  extractionConfigurationFingerprint: string;
-  extractorFingerprint: string;
-  recordSchemaFingerprint: string;
-  normalizationFingerprint: string;
-  chunkerFingerprint: string;
-  correctionRevision: string;
-};
-
-export type ParserArtifactSelection =
-  | {
-      kind: "create";
-      clientArtifactId: string;
-      outputHash: string;
-      outputByteLength: number;
-      outputMediaType: "application/vnd.docling+json";
-      createdAt: number;
-    }
-  | { kind: "existing"; parserArtifactId: string };
-
-export type ArchiveReceiptSelection =
-  | {
-      kind: "create";
-      subjectKind: "original_bytes" | "parser_output";
-      copyRole: "primary" | "independent_backup";
-      clientReceiptId: string;
-      archiveProfileFingerprint: string;
-      archiveIdentityFingerprint: string;
-      recipientFingerprint: string;
-      repositoryKeyDomainFingerprint: string;
-      storageFailureDomainFingerprint: string;
-      archiveObjectId: string;
-      ciphertextHash: string;
-      ciphertextByteLength: number;
-      readbackVerifiedAt: number;
-      createdAt: number;
-    }
-  | {
-      kind: "existing";
-      subjectKind: "original_bytes" | "parser_output";
-      copyRole: "primary" | "independent_backup";
-      receiptId: string;
-      bindingEpoch: number;
-    };
-
-export type ParsedTextDeclaration = {
-  extractionFingerprint: string;
-  textHash: string;
-  byteLength: number;
-  utf16Length: number;
-  pageCount: number;
-  mappingManifestHash: string;
-  normalizedBundleDigest: string;
-  expectedEvidenceSpanCount: number;
-  expectedDocumentCount: number;
-  expectedChunkCount: number;
-};
+export type {
+  ArchivedWorkIdentity,
+  ArchiveReceiptSelection,
+  ParsedTextDeclaration,
+  ParserArtifactSelection,
+} from "@repo/worker-protocol";
+import type {
+  ArchivedWorkIdentity,
+  ArchiveReceiptSelection,
+  ParsedTextDeclaration,
+  ParserArtifactSelection,
+} from "@repo/worker-protocol";
 
 type WorkerSourceRequest = {
   protocolVersion: typeof WORKER_PROTOCOL_VERSION;
@@ -192,6 +156,23 @@ type WorkerSourceRequest = {
 export type WorkerRequest =
   | (WorkerSourceRequest & {
       operation: "source.status";
+    })
+  | (WorkerSourceRequest & {
+      operation: "archive.forgetTargets";
+      requestId: string;
+      sourceItemId: string;
+      expectedForgetEpoch: number;
+      paginationOpts: WorkerPaginationOptions;
+    })
+  | (WorkerSourceRequest & {
+      operation: "archive.ackDeletion";
+      requestId: string;
+      sourceItemId: string;
+      expectedForgetEpoch: number;
+      deletionId: string;
+      receiptId: string;
+      objectOutcome: ArchiveDeletionOutcome;
+      backupOutcome?: ArchiveDeletionOutcome;
     })
   | (WorkerSourceRequest & {
       operation: "source.inventoryPage";
@@ -315,6 +296,72 @@ export type WorkerRequest =
       leaseEpoch: number;
       leaseToken: string;
       failureCode: WorkerJobFailureCode;
+    })
+  | (WorkerSourceRequest & {
+      operation: "jobs.reserveParsed";
+      requestId: string;
+      maxItems: number;
+      jobId?: string;
+    })
+  | (WorkerSourceRequest & {
+      operation: "jobs.renewParsed";
+      requestId: string;
+      jobId: string;
+      leaseEpoch: number;
+      leaseToken: string;
+    })
+  | (WorkerSourceRequest & {
+      operation: "jobs.activateParsed";
+      requestId: string;
+      jobId: string;
+      leaseEpoch: number;
+      leaseToken: string;
+    })
+  | (WorkerSourceRequest & {
+      operation: "jobs.failParsed";
+      requestId: string;
+      jobId: string;
+      leaseEpoch: number;
+      leaseToken: string;
+      failureCode: WorkerJobFailureCode;
+    })
+  | (WorkerSourceRequest & {
+      operation: "jobs.stageParsedBegin";
+      requestId: string;
+      jobId: string;
+      leaseEpoch: number;
+      leaseToken: string;
+      extractionFingerprint: string;
+      mappingManifestHash: string;
+      normalizedBundleDigest: string;
+      expectedPageCount: number;
+      expectedEvidenceSpanCount: number;
+      expectedDocumentCount: number;
+      expectedChunkCount: number;
+    })
+  | (WorkerSourceRequest & {
+      operation: "jobs.stageParsedBatch";
+      requestId: string;
+      jobId: string;
+      leaseEpoch: number;
+      leaseToken: string;
+      stageId: string;
+      phase: Exclude<ParsedStagePhase, "seal" | "staged">;
+      ordinal: number;
+      rows:
+        | ParsedPageInput[]
+        | ParsedEvidenceInput[]
+        | ParsedDocumentInput[]
+        | ParsedChunkInput[];
+    })
+  | (WorkerSourceRequest & {
+      operation: "jobs.stageParsedSeal";
+      requestId: string;
+      jobId: string;
+      leaseEpoch: number;
+      leaseToken: string;
+      stageId: string;
+      normalizedBundleDigest: string;
     })
   | (WorkerSourceRequest & {
       operation: "processing.assessBegin";
@@ -549,6 +596,14 @@ export type WorkerArchivedAdmitResult = {
   ingestJobId: string;
   desiredProcessingEpoch: number;
   archiveSetDigest: string;
+  originalPrimaryReceiptId: string;
+  originalPrimaryBindingEpoch: number;
+  originalBackupReceiptId: string;
+  originalBackupBindingEpoch: number;
+  parserPrimaryReceiptId: string;
+  parserPrimaryBindingEpoch: number;
+  parserBackupReceiptId: string;
+  parserBackupBindingEpoch: number;
   state: "admitted";
   reused: boolean;
 };
@@ -609,6 +664,58 @@ export type WorkerJobFailResult = {
   reused: boolean;
 };
 
+export type WorkerParsedReserveResult = Omit<
+  WorkerJobReserveResult,
+  "operation"
+> & {
+  operation: "jobs.reserveParsed";
+};
+export type WorkerParsedRenewResult = Omit<
+  WorkerJobRenewResult,
+  "operation"
+> & {
+  operation: "jobs.renewParsed";
+};
+export type WorkerParsedFailResult = Omit<WorkerJobFailResult, "operation"> & {
+  operation: "jobs.failParsed";
+};
+export type WorkerParsedStageBeginResult = {
+  operation: "jobs.stageParsedBegin";
+  jobId: string;
+  stageId: string;
+  phase: ParsedStagePhase;
+  nextOrdinal: number;
+  reused: boolean;
+};
+export type WorkerParsedStageBatchResult = {
+  operation: "jobs.stageParsedBatch";
+  jobId: string;
+  stageId: string;
+  committedPhase: Exclude<ParsedStagePhase, "seal" | "staged">;
+  phase: Exclude<ParsedStagePhase, "staged">;
+  nextOrdinal: number;
+  acceptedCount: number;
+  reused: boolean;
+};
+export type WorkerParsedStageSealResult = {
+  operation: "jobs.stageParsedSeal";
+  jobId: string;
+  stageId: string;
+  payloadManifestId: string;
+  state: "staged";
+  actualPageCount: number;
+  actualEvidenceSpanCount: number;
+  actualDocumentCount: number;
+  actualChunkCount: number;
+  reused: boolean;
+};
+export type WorkerParsedActivateResult = Omit<
+  WorkerJobActivateResult,
+  "operation"
+> & {
+  operation: "jobs.activateParsed";
+};
+
 export type WorkerAssessmentBeginResult = {
   operation: "processing.assessBegin";
   assessmentId: string;
@@ -637,8 +744,49 @@ export type WorkerAssessmentPageResult = {
   staleReason?: "source_changed" | "detail_unavailable" | "expired";
 };
 
+export type WorkerArchiveDeletionAckSummary = {
+  deletionId: string;
+  receiptId: string;
+  forgetEpoch: number;
+  objectOutcome: ArchiveDeletionOutcome;
+  backupOutcome?: ArchiveDeletionOutcome;
+  absenceAuthority: "worker_asserted_physical_absence";
+  completedAt: number;
+};
+
+export type WorkerArchiveForgetTarget = {
+  receiptId: string;
+  clientReceiptId: string;
+  receiptRequestDigest: string;
+  subjectKind: "original_bytes" | "parser_output";
+  copyRole: "primary" | "independent_backup";
+  archiveIdentityFingerprint: string;
+  archiveObjectId: string;
+  ciphertextHash: string;
+  ciphertextByteLength: number;
+  forgetEpoch: number;
+  ack?: WorkerArchiveDeletionAckSummary;
+};
+
+export type WorkerArchiveForgetTargetsResult = {
+  operation: "archive.forgetTargets";
+  sourceItemId: string;
+  sourceExternalIdHash: string;
+  forgetEpoch: number;
+  targets: WorkerArchiveForgetTarget[];
+  isDone: boolean;
+  continueCursor: string;
+};
+
+export type WorkerArchiveAckDeletionResult = WorkerArchiveDeletionAckSummary & {
+  operation: "archive.ackDeletion";
+  reused: boolean;
+};
+
 export type WorkerResult =
   | WorkerSourceStatusResult
+  | WorkerArchiveForgetTargetsResult
+  | WorkerArchiveAckDeletionResult
   | WorkerInventoryPageResult
   | WorkerScanBeginResult
   | WorkerScanAppendResult
@@ -655,6 +803,13 @@ export type WorkerResult =
   | WorkerJobStageResult
   | WorkerJobActivateResult
   | WorkerJobFailResult
+  | WorkerParsedReserveResult
+  | WorkerParsedRenewResult
+  | WorkerParsedFailResult
+  | WorkerParsedStageBeginResult
+  | WorkerParsedStageBatchResult
+  | WorkerParsedStageSealResult
+  | WorkerParsedActivateResult
   | WorkerAssessmentBeginResult
   | WorkerAssessmentPageResult;
 
@@ -1178,6 +1333,75 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
     case "source.status":
       exactKeys(input, baseKeys);
       return { ...base, operation: "source.status" };
+    case "archive.forgetTargets":
+      exactKeys(input, [
+        ...baseKeys,
+        "requestId",
+        "sourceItemId",
+        "expectedForgetEpoch",
+        "paginationOpts",
+      ]);
+      return {
+        ...base,
+        operation: "archive.forgetTargets",
+        requestId: requestId(input.requestId),
+        sourceItemId: string(input.sourceItemId, { maxUtf16: 256 }),
+        expectedForgetEpoch: integer(
+          input.expectedForgetEpoch,
+          1,
+          Number.MAX_SAFE_INTEGER,
+        ),
+        paginationOpts: (() => {
+          const parsed = paginationOptions(input.paginationOpts);
+          if (parsed.numItems > MAX_WORKER_ARCHIVE_FORGET_ITEMS) invalid();
+          return parsed;
+        })(),
+      };
+    case "archive.ackDeletion":
+      exactKeys(
+        input,
+        [
+          ...baseKeys,
+          "requestId",
+          "sourceItemId",
+          "expectedForgetEpoch",
+          "deletionId",
+          "receiptId",
+          "objectOutcome",
+        ],
+        ["backupOutcome"],
+      );
+      if (
+        input.objectOutcome !== "deleted" &&
+        input.objectOutcome !== "already_missing"
+      )
+        invalid();
+      if (
+        input.backupOutcome !== undefined &&
+        input.backupOutcome !== "deleted" &&
+        input.backupOutcome !== "already_missing"
+      )
+        invalid();
+      return {
+        ...base,
+        operation: "archive.ackDeletion",
+        requestId: requestId(input.requestId),
+        sourceItemId: string(input.sourceItemId, { maxUtf16: 256 }),
+        expectedForgetEpoch: integer(
+          input.expectedForgetEpoch,
+          1,
+          Number.MAX_SAFE_INTEGER,
+        ),
+        deletionId: string(input.deletionId, {
+          maxUtf16: 36,
+          pattern: UUID,
+        }),
+        receiptId: string(input.receiptId, { maxUtf16: 256 }),
+        objectOutcome: input.objectOutcome,
+        ...(input.backupOutcome === undefined
+          ? {}
+          : { backupOutcome: input.backupOutcome }),
+      };
     case "source.inventoryPage":
       exactKeys(input, [
         ...baseKeys,
@@ -1459,6 +1683,18 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
         requestId: requestId(input.requestId),
         maxItems: integer(input.maxItems, 1, MAX_WORKER_RESERVATION_ITEMS),
       };
+    case "jobs.reserveParsed":
+      exactKeys(input, [...baseKeys, "requestId", "maxItems"], ["jobId"]);
+      if (input.jobId !== undefined && input.maxItems !== 1) invalid();
+      return {
+        ...base,
+        operation: "jobs.reserveParsed",
+        requestId: requestId(input.requestId),
+        maxItems: integer(input.maxItems, 1, MAX_WORKER_RESERVATION_ITEMS),
+        ...(input.jobId === undefined
+          ? {}
+          : { jobId: string(input.jobId, { maxUtf16: 256 }) }),
+      };
     case "jobs.renew":
     case "jobs.stageUtf8":
     case "jobs.activate":
@@ -1488,6 +1724,136 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
         operation: "jobs.fail",
         ...jobLeaseRequest(input),
         failureCode: jobFailureCode(input.failureCode),
+      };
+    case "jobs.renewParsed":
+    case "jobs.activateParsed":
+      exactKeys(input, [
+        ...baseKeys,
+        "requestId",
+        "jobId",
+        "leaseEpoch",
+        "leaseToken",
+      ]);
+      return { ...base, operation: input.operation, ...jobLeaseRequest(input) };
+    case "jobs.failParsed":
+      exactKeys(input, [
+        ...baseKeys,
+        "requestId",
+        "jobId",
+        "leaseEpoch",
+        "leaseToken",
+        "failureCode",
+      ]);
+      return {
+        ...base,
+        operation: "jobs.failParsed",
+        ...jobLeaseRequest(input),
+        failureCode: jobFailureCode(input.failureCode),
+      };
+    case "jobs.stageParsedBegin": {
+      exactKeys(input, [
+        ...baseKeys,
+        "requestId",
+        "jobId",
+        "leaseEpoch",
+        "leaseToken",
+        "extractionFingerprint",
+        "mappingManifestHash",
+        "normalizedBundleDigest",
+        "expectedPageCount",
+        "expectedEvidenceSpanCount",
+        "expectedDocumentCount",
+        "expectedChunkCount",
+      ]);
+      assertParsedRequestSize(input);
+      return {
+        ...base,
+        operation: "jobs.stageParsedBegin",
+        ...jobLeaseRequest(input),
+        extractionFingerprint: string(input.extractionFingerprint, {
+          maxUtf16: 64,
+          pattern: SHA256,
+        }),
+        mappingManifestHash: string(input.mappingManifestHash, {
+          maxUtf16: 64,
+          pattern: SHA256,
+        }),
+        normalizedBundleDigest: string(input.normalizedBundleDigest, {
+          maxUtf16: 64,
+          pattern: SHA256,
+        }),
+        expectedPageCount: integer(input.expectedPageCount, 1, 32),
+        expectedEvidenceSpanCount: integer(
+          input.expectedEvidenceSpanCount,
+          1,
+          128,
+        ),
+        expectedDocumentCount: integer(input.expectedDocumentCount, 1, 16),
+        expectedChunkCount: integer(input.expectedChunkCount, 1, 128),
+      };
+    }
+    case "jobs.stageParsedBatch": {
+      exactKeys(input, [
+        ...baseKeys,
+        "requestId",
+        "jobId",
+        "leaseEpoch",
+        "leaseToken",
+        "stageId",
+        "phase",
+        "ordinal",
+        "rows",
+      ]);
+      assertParsedRequestSize(input);
+      if (!Array.isArray(input.rows) || input.rows.length < 1) invalid();
+      let rows:
+        | ParsedPageInput[]
+        | ParsedEvidenceInput[]
+        | ParsedDocumentInput[]
+        | ParsedChunkInput[];
+      if (input.phase === "pages") {
+        if (input.rows.length > MAX_PARSED_PAGE_BATCH) invalid();
+        rows = input.rows.map(parseParsedPageInput);
+      } else if (input.phase === "evidence") {
+        if (input.rows.length > MAX_PARSED_ROW_BATCH) invalid();
+        rows = input.rows.map(parseParsedEvidenceInput);
+      } else if (input.phase === "documents") {
+        if (input.rows.length > MAX_PARSED_ROW_BATCH) invalid();
+        rows = input.rows.map(parseParsedDocumentInput);
+      } else if (input.phase === "chunks") {
+        if (input.rows.length > MAX_PARSED_ROW_BATCH) invalid();
+        rows = input.rows.map(parseParsedChunkInput);
+      } else invalid();
+      return {
+        ...base,
+        operation: "jobs.stageParsedBatch",
+        ...jobLeaseRequest(input),
+        stageId: string(input.stageId, { maxUtf16: 256 }),
+        phase: input.phase,
+        ordinal: integer(input.ordinal, 0, 128),
+        rows,
+      };
+    }
+    case "jobs.stageParsedSeal":
+      exactKeys(input, [
+        ...baseKeys,
+        "requestId",
+        "jobId",
+        "leaseEpoch",
+        "leaseToken",
+        "stageId",
+        "normalizedBundleDigest",
+      ]);
+      assertParsedRequestSize(input);
+      return {
+        ...base,
+        operation: "jobs.stageParsedSeal",
+        ...jobLeaseRequest(input),
+        stageId: string(input.stageId, { maxUtf16: 256 }),
+        normalizedBundleDigest: string(input.normalizedBundleDigest, {
+          maxUtf16: 64,
+          pattern: SHA256,
+        }),
       };
     case "processing.assessBegin":
       exactKeys(input, [

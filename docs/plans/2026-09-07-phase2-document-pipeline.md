@@ -156,3 +156,14 @@ Each restore drill must use the exact schema of its trial, including every durab
 | Desktop handoff                        | T1-T3 and representative T4/T5 questions return the expected records and citations from hosted information with the worker and originals offline. Native mobile gaps are documented independently.                                                                                                                                                                                                                                                  |
 
 All implementation PRs run `pnpm lint`, `pnpm check-types`, `pnpm test:once`, and `pnpm build`. Security, schema, migration, and space-isolation work gets a second-model review. Record executable verification commands and measured results in the tracker and public synthetic recipe. Mark each runtime task complete only after its PR is merged and its deployed acceptance checks pass.
+
+## Independent historical financial database
+
+The owner also wants a separate, probably local transaction database populated
+from every available historical financial statement and export. Another agent
+team can own acquisition, normalization and reconciliation; Kith Mind owns a
+versioned query adapter and coverage-aware answers. See the
+[financial database workstream](2026-09-07-financial-transaction-database.md).
+This can run in parallel and does not block the first document-Q&A trial.
+P2-10 should reuse its canonical financial records where adopted, avoiding a
+second competing ingestion path for the same accounts and statements.

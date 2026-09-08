@@ -165,3 +165,43 @@ export type RecoveredResticBackup = {
   repositoryId: string;
   verification: "destination_ciphertext_readback";
 };
+
+export type RemovePublishedAgeObjectInput = {
+  objectPath: string;
+  expectedDirectory: {
+    device: number;
+    inode: number;
+  };
+  expectedFile: {
+    device: number;
+    inode: number;
+    sha256: string;
+    byteLength: number;
+  };
+  limits?: ArchiveCommandLimits;
+};
+
+export type RemovePublishedAgeObjectResult = {
+  outcome: "deleted" | "already_missing";
+  verification: "exact_path_absence";
+};
+
+export type ForgetResticBackupInput = {
+  resticBinary: string;
+  repositoryPath: string;
+  expectedRepositoryId: string;
+  passwordCommand: PasswordCommand;
+  operationId: string;
+  host: string;
+  snapshotId: string;
+  objectName: string;
+  expectedCiphertext: Sha256File;
+  limits?: ArchiveCommandLimits;
+};
+
+export type ForgetResticBackupResult = {
+  outcome: "deleted" | "already_missing";
+  snapshotId: string;
+  repositoryId: string;
+  verification: "snapshot_absence_after_forget_prune";
+};

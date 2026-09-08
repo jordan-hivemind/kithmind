@@ -13,9 +13,14 @@ import {
   workerScanEntryFields,
   workerScanPageFields,
   workerSourceScanFields,
+  workerParsedStageFields,
 } from "./validators";
 
 export const workerTables = {
+  workerParsedStages: defineTable(workerParsedStageFields)
+    .index("by_processingGenerationId", ["processingGenerationId"])
+    .index("by_ingestJobId", ["ingestJobId"])
+    .index("by_retireAt", ["retireAt"]),
   workerCleanupState: defineTable({
     key: v.string(),
     nextPhase: v.number(),

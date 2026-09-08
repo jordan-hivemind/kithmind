@@ -13,7 +13,26 @@ import {
 import { reserveDiscoveryWork } from "./discovery";
 import { reserveProcessingJobs } from "./jobs";
 import { parseWorkerRequest } from "./protocol";
-import { sha256Utf8 } from "../provenance/model";
+import {
+  activateParsedJob,
+  beginParsedStage,
+  renewParsedJob,
+  reserveParsedJobs,
+  sealParsedStage,
+  stageParsedBatch,
+} from "./parsedJobs";
+import { digestParsedMappingManifest } from "./parsedProtocol";
+import {
+  advanceProcessingAssessment,
+  beginProcessingAssessment,
+} from "./assessment";
+import {
+  beginSourceItemForget,
+  deleteSourceItemProvenanceBatch,
+  sha256Utf8,
+} from "../provenance/model";
+import { verifySealedParsedPayload } from "../provenance/parsedStaging";
+import { getDocument } from "../documents/model";
 import {
   appendWorkerScanPage,
   beginWorkerScan,
@@ -26,7 +45,6 @@ const OUTPUT_HASH = "b".repeat(64);
 const TEXT_HASH = "c".repeat(64);
 const BUNDLE_HASH = "d".repeat(64);
 const MAPPING_HASH = "e".repeat(64);
-const PROCESSING_DIGEST = "f".repeat(64);
 const PROFILE = {
   parserFingerprint: "1".repeat(64),
   extractionConfigurationFingerprint: "3".repeat(64),
@@ -40,6 +58,8 @@ const PROFILE = {
 async function fixture() {
   const t = convexTest(schema, modules);
   const ids = await t.run(async (ctx) => {
+    const externalId = "01890a5d-ac96-7cc4-bb7e-6f4f5ca5c139";
+    const externalIdHash = await sha256Utf8(externalId);
     const userId = await ctx.db.insert("users", { name: "Binary owner" });
     const spaceId = await ctx.db.insert("spaces", {
       kind: "shared",
@@ -73,21 +93,52 @@ async function fixture() {
       spaceIds: [spaceId],
       sourceAccountIds: [sourceAccountId],
     });
+    const uri = "fs://documents/synthetic.pdf";
+    const uriDigest = await sha256Utf8(
+      `worker-fs-uri:v1\0${JSON.stringify([sourceAccountId, uri])}`,
+    );
+    const processingIdentityDigest = await sha256Utf8(
+      `worker-fs-binary-processing-identity:v1\0${JSON.stringify([
+        RAW_HASH,
+        "application/pdf",
+        "pdf_docqa_v1",
+        PROFILE.parserFingerprint,
+        PROFILE.extractionConfigurationFingerprint,
+        PROFILE.extractorFingerprint,
+        PROFILE.recordSchemaFingerprint,
+        PROFILE.normalizationFingerprint,
+        PROFILE.chunkerFingerprint,
+        PROFILE.correctionRevision,
+      ])}`,
+    );
+    const inventoryMetadataDigest = await sha256Utf8(
+      `worker-fs-binary-inventory-metadata:v1\0${JSON.stringify([
+        externalIdHash,
+        uriDigest,
+        "Synthetic PDF",
+        "pdf",
+        20,
+        "ready_binary_v1",
+        RAW_HASH,
+        1_024,
+        "pdf_docqa_v1",
+      ])}`,
+    );
     const sourceItemId = await ctx.db.insert("sourceItems", {
       spaceId,
       sourceAccountId,
-      externalIdHash: "3".repeat(64),
-      externalId: "01890a5d-ac96-7cc4-bb7e-6f4f5ca5c139",
+      externalIdHash,
+      externalId,
       title: "Synthetic PDF",
       docType: "pdf",
-      uri: "fs://documents/synthetic.pdf",
+      uri,
       lifecycle: "available",
       originalLinkAvailable: true,
       desiredProcessingEpoch: 0,
       workerObservationEpoch: 1,
       workerProcessingEpoch: 1,
-      workerInventoryMetadataDigest: "4".repeat(64),
-      workerProcessingIdentityDigest: PROCESSING_DIGEST,
+      workerInventoryMetadataDigest: inventoryMetadataDigest,
+      workerProcessingIdentityDigest: processingIdentityDigest,
       workerContentHash: RAW_HASH,
       workerSourceModifiedAt: 20,
       workerProfileId: "pdf_docqa_v1",
@@ -140,10 +191,10 @@ async function fixture() {
       scanPageId: pageId,
       sourceItemId,
       identityKeyHash: "7".repeat(64),
-      externalIdHash: "3".repeat(64),
-      uriDigest: "8".repeat(64),
-      inventoryMetadataDigest: "4".repeat(64),
-      processingIdentityDigest: PROCESSING_DIGEST,
+      externalIdHash,
+      uriDigest,
+      inventoryMetadataDigest,
+      processingIdentityDigest,
       contentHash: RAW_HASH,
       byteLength: 1_024,
       contentRepresentation: "archived_binary_v1",
@@ -178,7 +229,7 @@ async function fixture() {
       extractionFingerprint: "artifact-bound-extraction:v1",
       title: "Synthetic PDF",
       docType: "pdf",
-      uri: "fs://documents/synthetic.pdf",
+      uri,
       actorUserId: userId,
       actorCredentialId: credentialId,
       attempts: 0,
@@ -253,7 +304,732 @@ function archive(
   };
 }
 
+async function admitParsedFixture(
+  f: Awaited<ReturnType<typeof fixture>>,
+  declaration: {
+    textHash: string;
+    byteLength: number;
+    utf16Length: number;
+    mappingManifestHash: string;
+  },
+) {
+  const extractionFingerprint = await artifactBoundExtractionFingerprint(
+    PROFILE.parserFingerprint,
+    OUTPUT_HASH,
+    PROFILE.extractionConfigurationFingerprint,
+  );
+  const reserve = parseWorkerRequest({
+    ...base(f),
+    operation: "discovery.reserveArchived",
+    requestId: "reserve-parsed",
+    identity: identity(f),
+  });
+  if (reserve.operation !== "discovery.reserveArchived")
+    throw new Error("bad reserve");
+  const leased = await f.t.run((ctx) =>
+    reserveArchivedDiscovery(ctx, f.principal, reserve, "a".repeat(64), 100),
+  );
+  const admit = parseWorkerRequest({
+    ...base(f),
+    operation: "discovery.admitArchived",
+    requestId: "admit-parsed",
+    workId: leased.workId,
+    leaseEpoch: leased.leaseEpoch,
+    leaseToken: leased.leaseToken,
+    parserArtifact: {
+      kind: "create",
+      clientArtifactId: "01890a5d-ac96-7cc4-bb7e-6f4f5ca5c140",
+      outputHash: OUTPUT_HASH,
+      outputByteLength: 2048,
+      outputMediaType: "application/vnd.docling+json",
+      createdAt: 200,
+    },
+    archives: [
+      archive("original_bytes", "primary", 1),
+      archive("original_bytes", "independent_backup", 2),
+      archive("parser_output", "primary", 3),
+      archive("parser_output", "independent_backup", 4),
+    ],
+    parsedText: {
+      extractionFingerprint,
+      ...declaration,
+      pageCount: 1,
+      normalizedBundleDigest: BUNDLE_HASH,
+      expectedEvidenceSpanCount: 1,
+      expectedDocumentCount: 1,
+      expectedChunkCount: 1,
+    },
+  });
+  if (admit.operation !== "discovery.admitArchived")
+    throw new Error("bad admit");
+  return {
+    admitted: await f.t.run((ctx) =>
+      admitArchivedDiscovery(ctx, f.principal, admit, 110),
+    ),
+    extractionFingerprint,
+  };
+}
+
 describe("archived discovery admission", () => {
+  test("reserves one exact parsed job without touching unrelated or cross-source jobs", async () => {
+    const f = await fixture();
+    const admitted = await admitParsedFixture(f, {
+      textHash: TEXT_HASH,
+      byteLength: 16,
+      utf16Length: 16,
+      mappingManifestHash: MAPPING_HASH,
+    });
+    const { unrelatedId, foreignId, foreignStateBefore } = await f.t.run(
+      async (ctx) => {
+        const desiredJobId = ctx.db.normalizeId(
+          "ingestJobs",
+          admitted.admitted.ingestJobId,
+        )!;
+        const desired = (await ctx.db.get(desiredJobId))!;
+        const {
+          _id: _desiredId,
+          _creationTime: _desiredCreationTime,
+          ...desiredFields
+        } = desired;
+        const unrelatedId = await ctx.db.insert("ingestJobs", {
+          ...desiredFields,
+          state: "queued",
+          attempts: 0,
+          leaseEpoch: 0,
+          nextAttemptAt: undefined,
+          leaseToken: undefined,
+          leaseExpiresAt: undefined,
+          workerLeaseOwnerCredentialId: undefined,
+        });
+        const foreignUserId = await ctx.db.insert("users", {
+          name: "Other binary owner",
+        });
+        const foreignSpaceId = await ctx.db.insert("spaces", {
+          kind: "shared",
+          name: "Other binary space",
+          createdBy: foreignUserId,
+        });
+        const foreignSourceId = await ctx.db.insert("sourceAccounts", {
+          spaceId: foreignSpaceId,
+          connector: "fs",
+          accountId: "foreign-binary-test",
+          name: "Foreign binary test",
+          enabled: true,
+          cursorVersion: 0,
+          freshnessMs: 60_000,
+          inventoryEpoch: 1,
+          completedInventoryEpoch: 1,
+          manifestVersion: 1,
+          workerAssessmentEpoch: 0,
+          createdBy: foreignUserId,
+        });
+        const foreignId = await ctx.db.insert("ingestJobs", {
+          ...desiredFields,
+          spaceId: foreignSpaceId,
+          sourceAccountId: foreignSourceId,
+          state: "queued",
+          attempts: 0,
+          leaseEpoch: 0,
+          nextAttemptAt: undefined,
+          leaseToken: undefined,
+          leaseExpiresAt: undefined,
+          workerLeaseOwnerCredentialId: undefined,
+        });
+        return {
+          unrelatedId,
+          foreignId,
+          foreignStateBefore: await ctx.db.get(foreignId),
+        };
+      },
+    );
+    const exact = parseWorkerRequest({
+      ...base(f),
+      operation: "jobs.reserveParsed",
+      requestId: "reserve-exact-parsed",
+      maxItems: 1,
+      jobId: admitted.admitted.ingestJobId,
+    });
+    if (exact.operation !== "jobs.reserveParsed")
+      throw new Error("bad exact reserve");
+    await expect(
+      f.t.run((ctx) =>
+        reserveParsedJobs(ctx, f.principal, exact, ["f".repeat(64)], 120),
+      ),
+    ).resolves.toMatchObject({
+      targets: [{ jobId: admitted.admitted.ingestJobId }],
+    });
+    await expect(
+      f.t.run(async (ctx) => (await ctx.db.get(unrelatedId))!.state),
+    ).resolves.toBe("queued");
+
+    const terminalBefore = await f.t.run(async (ctx) => {
+      const jobId = ctx.db.normalizeId(
+        "ingestJobs",
+        admitted.admitted.ingestJobId,
+      )!;
+      const job = (await ctx.db.get(jobId))!;
+      await ctx.db.patch(job.processingGenerationId, { state: "ready" });
+      await ctx.db.patch(jobId, {
+        state: "ready",
+        attempts: Number.MAX_SAFE_INTEGER,
+        leaseEpoch: Number.MAX_SAFE_INTEGER,
+      });
+      return await ctx.db.get(jobId);
+    });
+    const exactTerminal = parseWorkerRequest({
+      ...base(f),
+      operation: "jobs.reserveParsed",
+      requestId: "reserve-exact-terminal-parsed",
+      maxItems: 1,
+      jobId: admitted.admitted.ingestJobId,
+    });
+    if (exactTerminal.operation !== "jobs.reserveParsed")
+      throw new Error("bad exact terminal reserve");
+    await expect(
+      f.t.run((ctx) =>
+        reserveParsedJobs(
+          ctx,
+          f.principal,
+          exactTerminal,
+          ["d".repeat(64)],
+          121,
+        ),
+      ),
+    ).resolves.toMatchObject({ targets: [] });
+    await expect(
+      f.t.run(async (ctx) => {
+        const jobId = ctx.db.normalizeId(
+          "ingestJobs",
+          admitted.admitted.ingestJobId,
+        )!;
+        return await ctx.db.get(jobId);
+      }),
+    ).resolves.toEqual(terminalBefore);
+
+    const crossSource = parseWorkerRequest({
+      ...base(f),
+      operation: "jobs.reserveParsed",
+      requestId: "reserve-cross-source-parsed",
+      maxItems: 1,
+      jobId: foreignId,
+    });
+    if (crossSource.operation !== "jobs.reserveParsed")
+      throw new Error("bad cross-source reserve");
+    const rateLimitBefore = await f.t.run(async (ctx) =>
+      ctx.db.query("workerProtocolRateLimits").collect(),
+    );
+    await expect(
+      f.t.run((ctx) =>
+        reserveParsedJobs(ctx, f.principal, crossSource, ["e".repeat(64)], 122),
+      ),
+    ).rejects.toThrow();
+    await expect(
+      f.t.run(async (ctx) => await ctx.db.get(foreignId)),
+    ).resolves.toEqual(foreignStateBefore);
+    await expect(
+      f.t.run(async (ctx) =>
+        ctx.db.query("workerProtocolRateLimits").collect(),
+      ),
+    ).resolves.toEqual(rateLimitBefore);
+  });
+
+  test("stages, seals, and activates a parsed payload with exact replay fences", async () => {
+    const f = await fixture();
+    const text = "Hello😀";
+    const textHash = await sha256Utf8(text);
+    const pages = [{ ordinal: 0, start: 0, end: text.length, text, textHash }];
+    const evidence = [
+      {
+        ordinal: 0,
+        pageOrdinal: 0,
+        start: 0,
+        end: text.length,
+        quoteHash: textHash,
+        locator: {
+          kind: "parser_item_v1" as const,
+          pageNumber: 1,
+          itemRef: "#/texts/0",
+          sourceCharStart: 0,
+          sourceCharEnd: text.length,
+        },
+      },
+    ];
+    const mappingManifestHash = await digestParsedMappingManifest(
+      pages,
+      evidence,
+    );
+    const admitted = await admitParsedFixture(f, {
+      textHash,
+      byteLength: new TextEncoder().encode(text).byteLength,
+      utf16Length: text.length,
+      mappingManifestHash,
+    });
+    const reserve = parseWorkerRequest({
+      ...base(f),
+      operation: "jobs.reserveParsed",
+      requestId: "jobs-reserve-parsed",
+      maxItems: 1,
+    });
+    if (reserve.operation !== "jobs.reserveParsed")
+      throw new Error("bad job reserve");
+    const reserved = await f.t.run((ctx) =>
+      reserveParsedJobs(ctx, f.principal, reserve, ["b".repeat(64)], 120),
+    );
+    expect(reserved.targets).toHaveLength(1);
+    let lease = reserved.targets[0]!;
+    const begin = parseWorkerRequest({
+      ...base(f),
+      operation: "jobs.stageParsedBegin",
+      requestId: "stage-begin",
+      jobId: lease.jobId,
+      leaseEpoch: lease.leaseEpoch,
+      leaseToken: lease.leaseToken,
+      extractionFingerprint: admitted.extractionFingerprint,
+      mappingManifestHash,
+      normalizedBundleDigest: BUNDLE_HASH,
+      expectedPageCount: 1,
+      expectedEvidenceSpanCount: 1,
+      expectedDocumentCount: 1,
+      expectedChunkCount: 1,
+    });
+    if (begin.operation !== "jobs.stageParsedBegin")
+      throw new Error("bad begin");
+    let begun = await f.t.run((ctx) =>
+      beginParsedStage(ctx, f.principal, begin, 121),
+    );
+    const reserveAfterLostBegin = parseWorkerRequest({
+      ...base(f),
+      operation: "jobs.reserveParsed",
+      requestId: "jobs-reserve-after-lost-begin",
+      maxItems: 1,
+    });
+    if (reserveAfterLostBegin.operation !== "jobs.reserveParsed")
+      throw new Error("bad recovery reserve");
+    const recoveredLease = await f.t.run((ctx) =>
+      reserveParsedJobs(
+        ctx,
+        f.principal,
+        reserveAfterLostBegin,
+        ["c".repeat(64)],
+        300_121,
+      ),
+    );
+    lease = recoveredLease.targets[0]!;
+    const discoverBegin = parseWorkerRequest({
+      ...begin,
+      requestId: "stage-begin-after-lost-result",
+      leaseEpoch: lease.leaseEpoch,
+      leaseToken: lease.leaseToken,
+    });
+    if (discoverBegin.operation !== "jobs.stageParsedBegin")
+      throw new Error("bad recovery begin");
+    const discovered = await f.t.run((ctx) =>
+      beginParsedStage(ctx, f.principal, discoverBegin, 300_122),
+    );
+    expect(discovered).toMatchObject({
+      stageId: begun.stageId,
+      phase: "pages",
+      nextOrdinal: 0,
+      reused: true,
+    });
+    begun = discovered;
+    let operationNow = 300_123;
+    const batch = async (
+      requestId: string,
+      phase: "pages" | "evidence" | "documents" | "chunks",
+      rows: unknown[],
+    ) => {
+      const request = parseWorkerRequest({
+        ...base(f),
+        operation: "jobs.stageParsedBatch",
+        requestId,
+        jobId: lease.jobId,
+        leaseEpoch: lease.leaseEpoch,
+        leaseToken: lease.leaseToken,
+        stageId: begun.stageId,
+        phase,
+        ordinal: 0,
+        rows,
+      });
+      if (request.operation !== "jobs.stageParsedBatch")
+        throw new Error("bad batch");
+      return {
+        request,
+        result: await f.t.run((ctx) =>
+          stageParsedBatch(ctx, f.principal, request, operationNow++),
+        ),
+      };
+    };
+    const pageBatch = await batch("stage-pages", "pages", pages);
+    expect(pageBatch.result.phase).toBe("evidence");
+    await expect(
+      f.t.run((ctx) =>
+        stageParsedBatch(ctx, f.principal, pageBatch.request, 600_122),
+      ),
+    ).resolves.toMatchObject({ reused: true, phase: "evidence" });
+    const reserveAfterLostBatch = parseWorkerRequest({
+      ...base(f),
+      operation: "jobs.reserveParsed",
+      requestId: "jobs-reserve-after-lost-batch",
+      maxItems: 1,
+    });
+    if (reserveAfterLostBatch.operation !== "jobs.reserveParsed")
+      throw new Error("bad second recovery reserve");
+    const secondRecoveredLease = await f.t.run((ctx) =>
+      reserveParsedJobs(
+        ctx,
+        f.principal,
+        reserveAfterLostBatch,
+        ["d".repeat(64)],
+        600_123,
+      ),
+    );
+    lease = secondRecoveredLease.targets[0]!;
+    const discoverAfterBatch = parseWorkerRequest({
+      ...begin,
+      requestId: "stage-begin-after-lost-batch",
+      leaseEpoch: lease.leaseEpoch,
+      leaseToken: lease.leaseToken,
+    });
+    if (discoverAfterBatch.operation !== "jobs.stageParsedBegin")
+      throw new Error("bad second recovery begin");
+    begun = await f.t.run((ctx) =>
+      beginParsedStage(ctx, f.principal, discoverAfterBatch, 600_124),
+    );
+    expect(begun).toMatchObject({
+      stageId: discovered.stageId,
+      phase: "evidence",
+      nextOrdinal: 0,
+      reused: true,
+    });
+    await expect(
+      f.t.run((ctx) =>
+        stageParsedBatch(ctx, f.principal, pageBatch.request, 600_125),
+      ),
+    ).rejects.toThrow();
+    operationNow = 600_126;
+    const evidenceBatch = await batch("stage-evidence", "evidence", evidence);
+    const renew = parseWorkerRequest({
+      ...base(f),
+      operation: "jobs.renewParsed",
+      requestId: "renew-after-stage-batch",
+      jobId: lease.jobId,
+      leaseEpoch: lease.leaseEpoch,
+      leaseToken: lease.leaseToken,
+    });
+    if (renew.operation !== "jobs.renewParsed") throw new Error("bad renew");
+    await expect(
+      f.t.run((ctx) => renewParsedJob(ctx, f.principal, renew, 600_128)),
+    ).resolves.toMatchObject({ state: "processing", reused: false });
+    await expect(
+      f.t.run((ctx) =>
+        stageParsedBatch(ctx, f.principal, evidenceBatch.request, 600_129),
+      ),
+    ).rejects.toThrow();
+    operationNow = 600_130;
+    await batch("stage-documents", "documents", [
+      {
+        documentKey: "document:0",
+        title: "Synthetic",
+        docType: "pdf",
+        capturedAt: 20,
+        evidence: [{ pageOrdinal: 0, evidenceOrdinal: 0 }],
+      },
+    ]);
+    await batch("stage-chunks", "chunks", [
+      {
+        documentKey: "document:0",
+        ordinal: 0,
+        start: 0,
+        end: text.length,
+        text,
+        evidence: [{ pageOrdinal: 0, evidenceOrdinal: 0 }],
+      },
+    ]);
+    const seal = parseWorkerRequest({
+      ...base(f),
+      operation: "jobs.stageParsedSeal",
+      requestId: "stage-seal",
+      jobId: lease.jobId,
+      leaseEpoch: lease.leaseEpoch,
+      leaseToken: lease.leaseToken,
+      stageId: begun.stageId,
+      normalizedBundleDigest: BUNDLE_HASH,
+    });
+    if (seal.operation !== "jobs.stageParsedSeal") throw new Error("bad seal");
+    const sealed = await f.t.run((ctx) =>
+      sealParsedStage(ctx, f.principal, seal, 600_140),
+    );
+    expect(sealed).toMatchObject({
+      state: "staged",
+      actualPageCount: 1,
+      actualEvidenceSpanCount: 1,
+      actualDocumentCount: 1,
+      actualChunkCount: 1,
+    });
+    await expect(
+      f.t.run((ctx) => sealParsedStage(ctx, f.principal, seal, 900_129)),
+    ).resolves.toMatchObject({ reused: true, state: "staged" });
+    const reserveAfterLostSeal = parseWorkerRequest({
+      ...base(f),
+      operation: "jobs.reserveParsed",
+      requestId: "jobs-reserve-after-lost-seal",
+      maxItems: 1,
+    });
+    if (reserveAfterLostSeal.operation !== "jobs.reserveParsed")
+      throw new Error("bad staged recovery reserve");
+    const stagedLease = await f.t.run((ctx) =>
+      reserveParsedJobs(
+        ctx,
+        f.principal,
+        reserveAfterLostSeal,
+        ["e".repeat(64)],
+        900_130,
+      ),
+    );
+    lease = stagedLease.targets[0]!;
+    const discoverAfterSeal = parseWorkerRequest({
+      ...begin,
+      requestId: "stage-begin-after-lost-seal",
+      leaseEpoch: lease.leaseEpoch,
+      leaseToken: lease.leaseToken,
+    });
+    if (discoverAfterSeal.operation !== "jobs.stageParsedBegin")
+      throw new Error("bad staged recovery begin");
+    await expect(
+      f.t.run((ctx) =>
+        beginParsedStage(ctx, f.principal, discoverAfterSeal, 900_131),
+      ),
+    ).resolves.toMatchObject({
+      stageId: begun.stageId,
+      phase: "staged",
+      nextOrdinal: 0,
+      reused: true,
+    });
+    const activate = parseWorkerRequest({
+      ...base(f),
+      operation: "jobs.activateParsed",
+      requestId: "activate-parsed",
+      jobId: lease.jobId,
+      leaseEpoch: lease.leaseEpoch,
+      leaseToken: lease.leaseToken,
+    });
+    if (activate.operation !== "jobs.activateParsed")
+      throw new Error("bad activate");
+    const stagedGraph = await f.t.run(async (ctx) => ({
+      generation: (await ctx.db.query("processingGenerations").first())!,
+      document: (await ctx.db.query("documents").first())!,
+      chunk: (await ctx.db.query("chunks").first())!,
+      span: (await ctx.db.query("evidenceSpans").first())!,
+    }));
+    const hiddenDocumentId = await f.t.run((ctx) =>
+      ctx.db.insert("documents", {
+        spaceId: stagedGraph.document.spaceId,
+        processingGenerationId: stagedGraph.document.processingGenerationId,
+        sourceItemId: stagedGraph.document.sourceItemId,
+        sourceRevisionId: stagedGraph.document.sourceRevisionId,
+        sourceTextVersionId: stagedGraph.document.sourceTextVersionId,
+        documentKey: "hidden-document",
+        title: "Hidden",
+        docType: "pdf",
+        capturedAt: 20,
+        evidenceSpanIds: [stagedGraph.span._id],
+        publicationState: "staged",
+      }),
+    );
+    await expect(
+      f.t.run((ctx) => activateParsedJob(ctx, f.principal, activate, 900_132)),
+    ).rejects.toThrow();
+    await f.t.run((ctx) => ctx.db.delete(hiddenDocumentId));
+    const hiddenChunkId = await f.t.run((ctx) =>
+      ctx.db.insert("chunks", {
+        spaceId: stagedGraph.chunk.spaceId,
+        processingGenerationId: stagedGraph.chunk.processingGenerationId,
+        documentId: stagedGraph.chunk.documentId,
+        ordinal: 1,
+        sourceTextVersionId: stagedGraph.chunk.sourceTextVersionId,
+        start: stagedGraph.chunk.start,
+        end: stagedGraph.chunk.end,
+        text: stagedGraph.chunk.text,
+        evidenceSpanIds: stagedGraph.chunk.evidenceSpanIds,
+        publicationState: "staged",
+      }),
+    );
+    await expect(
+      f.t.run((ctx) => activateParsedJob(ctx, f.principal, activate, 900_133)),
+    ).rejects.toThrow();
+    await f.t.run((ctx) => ctx.db.delete(hiddenChunkId));
+    const hiddenRecords = await f.t.run(async (ctx) => {
+      const entityId = await ctx.db.insert("entities", {
+        userId: f.userId,
+        spaceId: f.spaceId,
+        key: "hidden-entity",
+        kind: "person",
+        canonicalName: "Hidden Entity",
+        normalizedName: "hidden entity",
+        aliases: [],
+        normalizedAliases: [],
+      });
+      const eventId = await ctx.db.insert("events", {
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        sourceItemId: f.sourceItemId,
+        eventKey: "hidden-event",
+        createdBy: f.userId,
+      });
+      const eventVersionId = await ctx.db.insert("eventVersions", {
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        sourceItemId: f.sourceItemId,
+        sourceRevisionId: stagedGraph.document.sourceRevisionId,
+        sourceTextVersionId: stagedGraph.document.sourceTextVersionId,
+        processingGenerationId: stagedGraph.generation._id,
+        eventId,
+        entityId,
+        eventType: "lab_panel",
+        schemaVersion: 1,
+        occurrence: { precision: "unknown" },
+        fieldEvidence: {
+          occurrence: [stagedGraph.span._id],
+          entity: [stagedGraph.span._id],
+          eventType: [stagedGraph.span._id],
+        },
+        userId: f.userId,
+      });
+      const observationId = await ctx.db.insert("observations", {
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        sourceItemId: f.sourceItemId,
+        sourceRevisionId: stagedGraph.document.sourceRevisionId,
+        sourceTextVersionId: stagedGraph.document.sourceTextVersionId,
+        processingGenerationId: stagedGraph.generation._id,
+        eventId,
+        eventVersionId,
+        entityId,
+        eventType: "lab_panel",
+        occurrence: { precision: "unknown" },
+        observationKey: "hidden-observation",
+        observationType: "hidden",
+        schemaVersion: 1,
+        value: { type: "text", value: "hidden" },
+        valueEvidence: [stagedGraph.span._id],
+        userId: f.userId,
+      });
+      return { eventVersionId, observationId };
+    });
+    await expect(
+      f.t.run((ctx) => activateParsedJob(ctx, f.principal, activate, 900_134)),
+    ).rejects.toThrow();
+    await f.t.run((ctx) => ctx.db.delete(hiddenRecords.eventVersionId));
+    await expect(
+      f.t.run((ctx) => activateParsedJob(ctx, f.principal, activate, 900_135)),
+    ).rejects.toThrow();
+    await f.t.run((ctx) => ctx.db.delete(hiddenRecords.observationId));
+    await expect(
+      f.t.run((ctx) => activateParsedJob(ctx, f.principal, activate, 900_136)),
+    ).resolves.toMatchObject({ state: "ready", reused: false });
+    const assessBegin = parseWorkerRequest({
+      ...base(f),
+      operation: "processing.assessBegin",
+      requestId: "assess-parsed",
+      scanId: f.scanId,
+      expectedInventoryEpoch: 1,
+      expectedManifestVersion: 1,
+    });
+    if (assessBegin.operation !== "processing.assessBegin")
+      throw new Error("bad assessment begin");
+    const assessment = await f.t.run((ctx) =>
+      beginProcessingAssessment(ctx, f.principal, assessBegin, 1_000_145),
+    );
+    let assessed:
+      Awaited<ReturnType<typeof advanceProcessingAssessment>> | undefined;
+    for (let ordinal = 0; ordinal < 3; ordinal += 1) {
+      const page = parseWorkerRequest({
+        ...base(f),
+        operation: "processing.assessPage",
+        requestId: `assess-page-${ordinal}`,
+        assessmentId: assessment.assessmentId,
+        ordinal,
+        maxItems: 1,
+      });
+      if (page.operation !== "processing.assessPage")
+        throw new Error("bad assessment page");
+      assessed = await f.t.run((ctx) =>
+        advanceProcessingAssessment(
+          ctx,
+          f.principal,
+          page,
+          1_000_146 + ordinal,
+        ),
+      );
+      if (assessed.state !== "running") break;
+    }
+    expect(assessed).toMatchObject({
+      state: "complete",
+      counts: { items: { ready: 1 } },
+    });
+    const documentId = await f.t.run(
+      async (ctx) => (await ctx.db.query("documents").first())!._id,
+    );
+    await expect(
+      f.t.run((ctx) => getDocument(ctx, [f.spaceId], documentId)),
+    ).resolves.toMatchObject({
+      contentHashAuthority: "worker_asserted",
+      textHashAuthority: "server_verified_retained_text",
+    });
+    const textVersionId = stagedGraph.document.sourceTextVersionId;
+    await f.t.run((ctx) =>
+      ctx.db.patch(textVersionId, { textHashAuthority: undefined }),
+    );
+    await expect(
+      f.t.run((ctx) => getDocument(ctx, [f.spaceId], documentId)),
+    ).resolves.toBeNull();
+    await f.t.run((ctx) =>
+      ctx.db.patch(textVersionId, {
+        textHashAuthority: "server_verified_retained_text",
+      }),
+    );
+    await f.t.run(async (ctx) => {
+      await ctx.db.patch(stagedGraph.generation._id, {
+        deactivatedAt: 1_000_149,
+      });
+      await ctx.db.patch(documentId, { publicationState: "historical" });
+      await ctx.db.patch(stagedGraph.chunk._id, {
+        publicationState: "historical",
+      });
+    });
+    await expect(
+      f.t.run(async (ctx) =>
+        verifySealedParsedPayload(
+          ctx,
+          (await ctx.db.get(stagedGraph.generation._id))!,
+        ),
+      ),
+    ).resolves.toMatchObject({ actualDocumentCount: 1, actualChunkCount: 1 });
+    await f.t.run((ctx) =>
+      beginSourceItemForget(ctx, {
+        spaceId: f.spaceId,
+        sourceItemId: f.sourceItemId,
+        forgottenAt: 1_000_150,
+        forgottenBy: f.userId,
+      }),
+    );
+    await expect(
+      f.t.run((ctx) => getDocument(ctx, [f.spaceId], documentId)),
+    ).resolves.toBeNull();
+    await expect(
+      f.t.run((ctx) =>
+        deleteSourceItemProvenanceBatch(ctx, {
+          spaceId: f.spaceId,
+          sourceItemId: f.sourceItemId,
+        }),
+      ),
+    ).resolves.toEqual({
+      deleted: 0,
+      phase: "archive_cleanup_required",
+      done: false,
+    });
+  });
   test("matches the parser adapter artifact-bound extraction vector", async () => {
     await expect(
       artifactBoundExtractionFingerprint(
@@ -543,6 +1319,26 @@ describe("archived discovery admission", () => {
     expect(rows.artifacts).toHaveLength(1);
     expect(rows.receipts).toHaveLength(4);
     expect(rows.bindings).toHaveLength(4);
+    const receiptId = (
+      subjectKind: "original_bytes" | "parser_output",
+      copyRole: "primary" | "independent_backup",
+    ) =>
+      rows.receipts.find(
+        (row) => row.subjectKind === subjectKind && row.copyRole === copyRole,
+      )?._id;
+    expect(admitted).toMatchObject({
+      originalPrimaryReceiptId: receiptId("original_bytes", "primary"),
+      originalPrimaryBindingEpoch: 0,
+      originalBackupReceiptId: receiptId(
+        "original_bytes",
+        "independent_backup",
+      ),
+      originalBackupBindingEpoch: 0,
+      parserPrimaryReceiptId: receiptId("parser_output", "primary"),
+      parserPrimaryBindingEpoch: 0,
+      parserBackupReceiptId: receiptId("parser_output", "independent_backup"),
+      parserBackupBindingEpoch: 0,
+    });
     expect(rows.text[0]).toMatchObject({
       representation: "parsed_pages_v1",
       evidenceSealed: false,

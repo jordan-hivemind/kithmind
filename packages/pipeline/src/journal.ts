@@ -698,7 +698,8 @@ function inspectionActivity(
     phase === "jobs_renew" ||
     phase === "jobs_stage" ||
     phase === "jobs_activate" ||
-    phase === "jobs_fail"
+    phase === "jobs_fail" ||
+    phase === "archived"
   ) {
     return "processing";
   }

@@ -25,6 +25,65 @@ test("the root pnpm alias forwarding separator is consumed exactly once", () => 
   );
 });
 
+test("archive forget requires an exact source identity and epoch", () => {
+  const parsed = argumentsFor([
+    "forget-archive",
+    "--source-item",
+    "source_item",
+    "--config",
+    "/tmp/config.json",
+    "--forget-epoch",
+    "7",
+    "--source-external-id",
+    "11111111-1111-4111-8111-111111111111",
+    "--json",
+  ]);
+  assert.deepEqual(parsed, {
+    command: "forget-archive",
+    configPath: "/tmp/config.json",
+    sourceItemId: "source_item",
+    sourceExternalId: "11111111-1111-4111-8111-111111111111",
+    forgetEpoch: 7,
+    json: true,
+  });
+  for (const args of [
+    [
+      "forget-archive",
+      "--config",
+      "/tmp/config.json",
+      "--source-item",
+      "source_item",
+      "--forget-epoch",
+      "7",
+    ],
+    [
+      "forget-archive",
+      "--config",
+      "/tmp/config.json",
+      "--source-item",
+      "source_item",
+      "--source-external-id",
+      "11111111-1111-4111-8111-111111111111",
+      "--forget-epoch",
+      "0",
+    ],
+    [
+      "forget-archive",
+      "--config",
+      "/tmp/config.json",
+      "--config",
+      "/tmp/other.json",
+      "--source-item",
+      "source_item",
+      "--source-external-id",
+      "11111111-1111-4111-8111-111111111111",
+      "--forget-epoch",
+      "7",
+    ],
+  ])
+    assert.throws(() => argumentsFor(args));
+});
+
 test("invocation through a symlink still runs the CLI", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pipeline-cli-test-"));
   const link = join(directory, "pipeline-worker");

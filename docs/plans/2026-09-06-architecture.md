@@ -247,3 +247,15 @@ Numbers preserve tracker references. Priority P2 for mobile is distinct from imp
 ## 11. Deferred choices
 
 Workout capture, a custom mobile app, photo face indexing, a dedicated graph database, a second worker host, alternative backing stores and a full local-only recipe are optional extensions. Evidence/record identities and query contracts must make those possible without requiring them now. Portal automation coverage, parser selection, extraction models and embedding-model changes are decided by the corresponding pilot, not by unverified rankings in a plan.
+
+## Independent financial database integration
+
+A separate workstream may build a local historical financial transaction
+database and statement archive. Kith Mind integrates through a versioned,
+scoped read interface with exact values, stable transaction/source IDs,
+evidence, coverage and freshness. The financial database owns transaction
+normalization and reconciliation; an optional hosted read projection is
+explicit and must preserve corrections and deletions. See the
+[financial database plan](2026-09-07-financial-transaction-database.md).
+This work can proceed in parallel without delaying the single-owner desktop
+document trial.

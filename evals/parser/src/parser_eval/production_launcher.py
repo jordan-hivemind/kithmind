@@ -150,6 +150,41 @@ def _exec_probe() -> int:
     return _safe_result({"state": "failed", "code": "exec_not_denied"}, 2)
 
 
+def _profile(args: argparse.Namespace) -> int:
+    from parser_eval.production import prepare_pdf_profile
+
+    artifacts = _absolute(args.artifacts)
+    model_lock = _absolute(args.model_lock)
+    result = prepare_pdf_profile(
+        artifacts=artifacts,
+        model_lock=model_lock,
+        timeout_seconds=float(args.conversion_timeout_seconds),
+    )
+    if result.get("state") != "ready":
+        code = result.get("code")
+        if not isinstance(code, str) or not code or len(code) > 64:
+            code = "profile_failed"
+        return _safe_result({"state": "failed", "code": code}, 2)
+    parser = result.get("parserFingerprint")
+    extraction = result.get("extractionConfiguration")
+    if (
+        not isinstance(parser, dict)
+        or not isinstance(parser.get("fingerprint"), str)
+        or not isinstance(extraction, dict)
+        or not isinstance(extraction.get("fingerprint"), str)
+    ):
+        return _safe_result(
+            {"state": "failed", "code": "profile_output_invalid"}, 2
+        )
+    return _safe_result(
+        {
+            "state": "ready",
+            "parserFingerprint": parser,
+            "extractionConfiguration": extraction,
+        }
+    )
+
+
 def _convert(args: argparse.Namespace) -> int:
     from parser_eval.production import ParentExecutionBoundary, convert_captured_pdf
 
@@ -246,7 +281,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument(
         "--mode",
-        choices=("network-probe", "process-probe", "exec-probe", "convert"),
+        choices=(
+            "network-probe",
+            "process-probe",
+            "exec-probe",
+            "profile",
+            "convert",
+        ),
         required=True,
     )
     parser.add_argument(
@@ -284,6 +325,17 @@ def main(argv: list[str] | None = None) -> int:
             return _process_probe()
         if args.mode == "exec-probe":
             return _exec_probe()
+        if args.mode == "profile":
+            required = (
+                args.artifacts,
+                args.model_lock,
+                args.conversion_timeout_seconds,
+            )
+            if any(value is None for value in required):
+                return _safe_result(
+                    {"state": "failed", "code": "invalid_input"}, 2
+                )
+            return _profile(args)
         required = (
             args.input,
             args.expected_sha256,

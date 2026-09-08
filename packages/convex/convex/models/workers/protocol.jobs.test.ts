@@ -147,4 +147,20 @@ describe("worker processing request authority boundary", () => {
       ).toThrow(WorkerProtocolParseError);
     }
   });
+
+  it("accepts only a single exact parsed-job reservation", () => {
+    const exact = {
+      ...source,
+      operation: "jobs.reserveParsed",
+      maxItems: 1,
+      jobId: "synthetic-job",
+    };
+    expect(parseWorkerRequest(exact)).toEqual(exact);
+    expect(() => parseWorkerRequest({ ...exact, maxItems: 2 })).toThrow(
+      WorkerProtocolParseError,
+    );
+    expect(() => parseWorkerRequest({ ...exact, jobId: "" })).toThrow(
+      WorkerProtocolParseError,
+    );
+  });
 });
