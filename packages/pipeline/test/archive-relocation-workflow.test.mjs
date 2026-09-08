@@ -332,3 +332,26 @@ test("requires an identical intent when reusing a relocation identity", async ()
       error.code === "state_conflict",
   );
 });
+
+test("resumed move intent rejects substituted provider identities before moving", async () => {
+  for (const target of ["legacy-root", "managed-parent"]) {
+    const f = fixture();
+    await f.workflow.prepare(intent());
+    Object.assign(f.state, {
+      phase: "move_requested",
+      preMoveVerifiedAt: 1,
+      preMoveVerifiedArtifacts: await f.gates.verifySourceInventory(),
+    });
+    f.folders.get(target).id = "substituted-folder";
+    await assert.rejects(
+      () => f.workflow.resume(),
+      (error) =>
+        error instanceof ArchiveRelocationError &&
+        ["destination_parent_changed", "move_outcome_ambiguous"].includes(
+          error.code,
+        ),
+    );
+    assert.equal(f.moves, 0);
+    assert.equal(f.state.phase, "move_requested");
+  }
+});

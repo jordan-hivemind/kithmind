@@ -415,7 +415,7 @@ export class ArchiveRelocationWorkflow {
       phase: "prepared",
       intent: validated,
     };
-    await this.store.write(state);
+    await this.persist(state);
     return state;
   }
   async resume(): Promise<ArchiveRelocationState> {
@@ -434,18 +434,18 @@ export class ArchiveRelocationWorkflow {
         preMoveVerifiedAt: this.now(),
         preMoveVerifiedArtifacts: baseline,
       };
-      await this.store.write(state);
+      await this.persist(state);
     }
     if (state.phase === "source_verified") {
       await this.assertSourceAndDestination(state.intent);
       state = { ...state, phase: "move_requested" };
-      await this.store.write(state);
+      await this.persist(state);
     }
     if (state.phase === "move_requested") {
       state = await this.completeOrRecoverMove(
         state as ArchiveRelocationState & { phase: "move_requested" },
       );
-      await this.store.write(state);
+      await this.persist(state);
     }
     if (state.phase === "moved") {
       const after = artifacts(
@@ -467,19 +467,23 @@ export class ArchiveRelocationWorkflow {
         verifiedAt: this.now(),
         verifiedArtifacts: after,
       };
-      await this.store.write(state);
+      await this.persist(state);
     }
     if (state.phase === "verified") {
       await this.gates.rebindRootPath(evidence(state));
       state = { ...state, phase: "rebound" };
-      await this.store.write(state);
+      await this.persist(state);
     }
     if (state.phase === "rebound") {
       await this.gates.resumeUnchangedScan(evidence(state));
       state = { ...state, phase: "resumed" };
-      await this.store.write(state);
+      await this.persist(state);
     }
     return state;
+  }
+  private async persist(state: ArchiveRelocationState): Promise<void> {
+    // Apply the same invariants to new transitions and recovered state.
+    await this.store.write(parseState(state)!);
   }
   private async assertSourceAndDestination(
     intent: RelocationIntent,
@@ -527,6 +531,7 @@ export class ArchiveRelocationWorkflow {
     ]).then((values) => values.map(parseFolder));
     if (
       destinationParent === undefined ||
+      destinationParent.id !== intent.destinationParentId ||
       posix.join(destinationParent.path, intent.destinationName) !==
         intent.newRootPath
     )
@@ -545,6 +550,7 @@ export class ArchiveRelocationWorkflow {
     if (destination !== undefined) fail("destination_collision");
     if (
       source === undefined ||
+      source.id !== intent.sourceId ||
       source.parentId !== intent.sourceParentId ||
       source.path !== intent.oldBoundary.rootPath
     )
