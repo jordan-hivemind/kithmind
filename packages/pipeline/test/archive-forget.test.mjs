@@ -34,7 +34,7 @@ function config(directory) {
   };
   return {
     protocolVersion: 1,
-    endpoint: "https://worker.example/api/worker",
+    endpoint: `https://worker-${hash(directory).slice(0, 32)}.example/api/worker`,
     spaceId: "space_1",
     sourceAccountId: "source_1",
     credentialEnv: "TEST_KEY",
