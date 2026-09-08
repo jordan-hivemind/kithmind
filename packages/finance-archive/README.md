@@ -206,11 +206,12 @@ the provider's stated total) or `incompleteListing` (which carries why it
 stopped, and a `providerTotal` of `null` when the provider states no total at
 all, distinct from a stated total of `0`).
 
-`acquire` returns the raw bytes it captured, unedited, plus a manifest entry:
-period, capture time, a sha256 content hash (`sha256Hex`), the row count the
-provider claimed for the pull when it claims one, and any gaps the pull
-could not close. Writing those bytes to the raw tree is the importer's job,
-not the adapter's; the raw tree stays immutable either way.
+`acquire` returns the **retained** bytes plus a manifest entry: period,
+capture time, the sha256 of those retained bytes, the row count the provider
+claimed for the pull when it claims one, and any gaps the pull could not
+close. Retained, not raw: see "Retention projection" below. Writing the bytes
+to the raw tree is the importer's job, not the adapter's; the raw tree stays
+immutable either way.
 
 `parse` returns a `ParsedPull`: `{ activity, holdings }`. `activity` is
 `ParsedRow[]` as before: quantity, price and amount are canonical decimal
@@ -264,6 +265,73 @@ market-marked position, a cost-basis-only illiquid holding, a deliberately
 unparseable market value, and a EUR-denominated position alongside the USD
 ones. `test/syntheticAdapter.test.mjs` is what a new adapter's own suite
 should look like.
+
+## Retention projection
+
+No adapter can hold a credential on the way in: `AdapterSession` is two
+functions and nothing else. That closes half of it. A provider can also echo
+a credential back **inside a response body** -- a session token, an
+`Authorization` header, a `Set-Cookie` value, a refresh token, a device
+identifier, a signed-in user profile -- and the raw tree is a synced folder.
+`src/retention.ts` closes that half.
+
+An adapter declares what it retains and everything else is dropped. The
+declaration is an allowlist, never a denylist, and the projection is built up
+from it rather than filtered down from the response: a field the provider adds
+next month is not copied, because nothing copies a field that was never named.
+There is no list of credential-looking key names anywhere in this package,
+deliberately. A denylist fails open exactly once.
+
+| Declaration     | For                                                    | Behavior                                                                                       |
+| --------------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------ |
+| `json_allowlist` | A JSON payload (`structured_api`)                       | Named leaf paths are retained. `*` matches any array index or object key. Everything else is dropped. |
+| `opaque`         | `pdf_statement`, `trade_confirmation`, `tabular_export` | Bytes retained whole, with a required stated reason. Refused outright for `structured_api`.       |
+
+A PDF statement is bytes, not JSON. It has no addressable fields, so a field
+projection is not a thing that can be applied to it: it is retained whole,
+declared `opaque` with a stated reason, and the manifest records `opaque` so
+no reader mistakes the file for a filtered payload. The same holds for a
+tabular export, which is delimited text a download control produced. `opaque`
+is refused for `structured_api`, because a JSON response is exactly the shape
+that echoes session state back, and one word must never become a way to opt
+out of the allowlist on the tier that needs it.
+
+Three properties follow, and they are the ones worth stating:
+
+- **Hash what you retain.** `retainPayload` produces the bytes and hashes
+  those same bytes. The provider's original response is never hashed and never
+  stored, and a retained artifact is never normalized back toward the original
+  so that two hashes agree. `documents.sha256` is always the hash of the bytes
+  on disk.
+- **It is impossible, not discouraged.** `writeRawDocument` takes a
+  `RetainedPayload`, not a `Uint8Array`. Only `retainPayload` produces one,
+  branded at compile time and tracked in a run-time `WeakSet`, so raw provider
+  bytes have no route to the raw tree at all. `persistAcquiredDocument`
+  re-applies the projection at that seam (it is idempotent, so this is a
+  no-op for a correct adapter) and refuses any document whose declared
+  `contentHash` does not match the retained bytes.
+- **A mismatch is never a silent pass-through.** An undeclared field is
+  dropped and opens a `retention_dropped_fields` review item naming the source
+  paths -- paths only, never values. A shape the declaration cannot describe
+  (a path terminating above a nested value, an array declared without `*`, a
+  JSON allowlist over non-JSON bytes) is a `RetentionShapeError` that stops
+  the acquisition, because that is an adapter bug rather than a provider
+  change.
+
+Money keeps its exact digits across the projection. Every JSON primitive is
+captured as its own literal source text and re-emitted verbatim, so a provider
+that states an amount as a JSON number with more precision than a double holds
+is retained with that precision intact. The money policy above says binary
+floating point appears nowhere in the path; this is the one place that
+re-serializes a payload, and it keeps that true.
+
+`test/retention.test.mjs` is the negative suite. Its fixture echoes
+credential-shaped material back inside the activity response -- a bearer
+token, a `Set-Cookie` value, an `Authorization` header echo, a refresh token,
+a long opaque session id, a device id and a user profile, every one of them
+an obviously fake canary in no real token format -- and asserts against the
+**bytes written to the raw tree**, not against what the projection returned.
+Nothing in that suite prints a payload.
 
 ## Importer
 
@@ -601,8 +669,13 @@ says what each one is. `writeRawDocumentManifest` writes that label as a
 sha256, the institution's slug (not the database's internal row id, which
 means nothing once the database that minted it is gone), the account's last
 four digits, document type, statement period, capture time, capability
-tier, any acquisition gaps, and the original file extension when the source
-gave one. It is write-once exactly like the bytes it describes -- a second
+tier, any acquisition gaps, the original file extension when the source gave
+one, and the `RetentionRecord` describing the projection that produced the
+bytes (see "Retention projection"): its declaration and version, the
+projection algorithm version, and the source paths that were dropped. That
+last field is how a reader learns the file is a projection of the provider's
+response rather than the response itself. It is write-once exactly like the
+bytes it describes -- a second
 write for the same document is a no-op, never a rewrite, even if the
 content offered would differ -- because the manifest is part of what was
 acquired, not something to revise later. `readRawDocumentManifest` reads one

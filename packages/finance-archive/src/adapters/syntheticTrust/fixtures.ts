@@ -498,3 +498,44 @@ export const DOCUMENTS: readonly DocumentFixture[] = [
     text: buildConfirmationText,
   },
 ];
+
+// --- F1-23 leak fixture ------------------------------------------------------
+//
+// Credential-shaped material for the negative tests. It is deliberately not
+// in any real token format: every value is the same obviously-fake canary
+// string with a prefix naming the shape it stands for, so the tests can
+// assert one substring is absent from the bytes on disk and no reader could
+// mistake any of it for a live secret. Nothing here is ever printed.
+
+/** The one substring every piece of the fixture below contains. A negative
+ * test asserts this cannot be found anywhere in the raw tree. */
+export const LEAK_CANARY = "SYNTHETIC-LEAK-CANARY-DO-NOT-RETAIN";
+
+/**
+ * The shapes a provider actually echoes back alongside a business payload: a
+ * bearer token, a `Set-Cookie` value, an `Authorization` header echo, a
+ * refresh token, a long opaque session id, a device identifier, and a
+ * signed-in user profile. None of them is named by any adapter's retention
+ * declaration, which is the entire point: the allowlist never had to know
+ * these key names to keep them out.
+ */
+export const CREDENTIAL_SHAPED_ECHO: Readonly<Record<string, unknown>> = {
+  sessionToken: `session-token-${LEAK_CANARY}`,
+  authorization: `Bearer ${LEAK_CANARY}`,
+  setCookie: `synthetic_session=${LEAK_CANARY}; Path=/; HttpOnly`,
+  refreshToken: `refresh-token-${LEAK_CANARY}`,
+  deviceId: `device-${LEAK_CANARY}`,
+  opaqueSessionId: `${LEAK_CANARY}-000000000000000000000000000000000000`,
+  userProfile: {
+    displayName: `Synthetic Placeholder ${LEAK_CANARY}`,
+    email: `nobody-${LEAK_CANARY}@example.invalid`,
+  },
+};
+
+/** The same material nested one level deeper, on an individual activity row,
+ * so the tests prove the projection drops undeclared keys inside a declared
+ * array element and not only at the top of a response. */
+export const CREDENTIAL_SHAPED_ROW_ECHO: Readonly<Record<string, unknown>> = {
+  rowSessionToken: `row-session-token-${LEAK_CANARY}`,
+  rowAuthorization: `Bearer ${LEAK_CANARY}`,
+};

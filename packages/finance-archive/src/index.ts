@@ -28,6 +28,20 @@ export {
   type ValuationBasis,
 } from "./adapter.js";
 export {
+  assertRetained,
+  PROJECTION_VERSION,
+  retainPayload,
+  RetentionShapeError,
+  type RetainedPayload,
+  type RetentionPolicy,
+  type RetentionRecord,
+} from "./retention.js";
+export {
+  CREDENTIAL_SHAPED_ECHO as SYNTHETIC_CREDENTIAL_SHAPED_ECHO,
+  CREDENTIAL_SHAPED_ROW_ECHO as SYNTHETIC_CREDENTIAL_SHAPED_ROW_ECHO,
+  LEAK_CANARY as SYNTHETIC_LEAK_CANARY,
+} from "./adapters/syntheticTrust/fixtures.js";
+export {
   createSyntheticSession,
   INSTITUTION_NAME as SYNTHETIC_INSTITUTION_NAME,
   INSTITUTION_SLUG as SYNTHETIC_INSTITUTION_SLUG,

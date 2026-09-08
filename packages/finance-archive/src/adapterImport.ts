@@ -44,6 +44,7 @@ import {
   writeRawDocumentManifest,
   writeRetainedText,
 } from "./rawTree.js";
+import { retainPayload } from "./retention.js";
 import { contentKey, rowHash } from "./rowHash.js";
 
 /**
@@ -501,6 +502,13 @@ export type PersistedAcquisition = {
  * (requirement 1). See `rawTree.ts` for how the write-once and
  * hash-verification guarantees are implemented.
  *
+ * F1-23: re-applies the adapter's declared retention projection before
+ * anything is hashed or written, and records the resulting
+ * `RetentionRecord` in the manifest sidecar so the retained file is never
+ * presented as the untouched provider response. Undeclared source paths that
+ * the projection dropped open a `review_items` entry rather than passing
+ * unremarked.
+ *
  * Cross-checks the written sha256 against the adapter's own claimed
  * `acquired.manifest.contentHash`: an adapter that mis-hashed its own bytes
  * is exactly the kind of bug provenance exists to catch, not a reason to
@@ -519,12 +527,34 @@ export function persistAcquiredDocument(
 ): PersistedAcquisition {
   const { institutionId, accountId, docType, acquired, originalExtension = null } = descriptor;
 
-  const documentWrite = writeRawDocument(rawTreeRoot, acquired.bytes);
-  if (documentWrite.sha256 !== acquired.manifest.contentHash) {
+  // F1-23. The projection is re-applied here, at the one seam that produces
+  // bytes for the raw tree, rather than trusted from the adapter. It is
+  // idempotent, so for an adapter that projected correctly this is a no-op
+  // that costs one parse; for an adapter that returned the response body, it
+  // produces different bytes and the hash cross-check below fails loudly.
+  // Combined with `writeRawDocument` accepting only a `RetainedPayload`,
+  // there is no path by which an unprojected payload is hashed or written.
+  const retained = retainPayload(
+    acquired.retention.policy,
+    acquired.bytes,
+    acquired.manifest.kind,
+  );
+  if (retained.sha256 !== acquired.manifest.contentHash) {
     throw new Error(
       `acquired document's manifest hash ${acquired.manifest.contentHash} does not match ` +
-        `its bytes' actual sha256 ${documentWrite.sha256}; refusing to persist a document ` +
-        "whose adapter mis-reported its own content hash",
+        `the sha256 ${retained.sha256} of its retained bytes; refusing to persist a document ` +
+        "whose adapter mis-reported its own content hash or hashed the provider's response " +
+        "instead of the projection it retained",
+    );
+  }
+  const documentWrite = writeRawDocument(rawTreeRoot, retained);
+  if (documentWrite.sha256 !== retained.sha256) {
+    // The raw tree hashes what it actually wrote. If that disagrees with the
+    // projection's own hash, the bytes changed between the two, and the
+    // whole point of the content hash is that it is the hash of the file.
+    throw new Error(
+      `retained bytes hashed ${retained.sha256} but landed on disk as ${documentWrite.sha256}; ` +
+        "the content hash must always be the hash of the bytes in the raw tree",
     );
   }
 
@@ -558,7 +588,25 @@ export function persistAcquiredDocument(
     capabilityTier: acquired.manifest.kind,
     gaps: acquired.manifest.gaps,
     originalExtension,
+    retention: acquired.retention,
   });
+
+  // A provider field the declaration does not name is dropped, which is the
+  // safe outcome, but it is never a *silent* one: the adapter's allowlist has
+  // fallen behind the provider's response and someone has to look. Paths
+  // only, never values -- a leak report that quotes the leak is not a fix.
+  if (acquired.retention.droppedPaths.length > 0) {
+    insertReviewItem(db, {
+      kind: "retention_dropped_fields",
+      accountId,
+      rawValue: acquired.retention.droppedPaths.join(" "),
+      reason:
+        `the retained projection of this document dropped ${acquired.retention.droppedPaths.length} ` +
+        `undeclared source path(s) under policy ${JSON.stringify(acquired.retention.policy.version)}; ` +
+        "the provider's payload carries fields the adapter does not declare -- confirm none of " +
+        "them is business data the archive should be retaining, then extend the declaration",
+    });
+  }
 
   const textWrite =
     extractedText === null ? null : writeRetainedText(rawTreeRoot, extractedText);

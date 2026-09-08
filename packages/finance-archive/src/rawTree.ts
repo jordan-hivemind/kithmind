@@ -42,6 +42,8 @@ import {
 import { dirname, join } from "node:path";
 
 import type { AcquisitionGap, CapabilityTier } from "./adapter.js";
+import type { RetainedPayload, RetentionRecord } from "./retention.js";
+import { assertRetained } from "./retention.js";
 
 const RAW_TREE_ROOT_ENV = "FINANCE_ARCHIVE_RAW_TREE_ROOT";
 
@@ -170,12 +172,26 @@ function writeContentAddressed(
   return { path: finalPath, sha256, status: "written" };
 }
 
-/** Persists one acquired document's raw bytes, write-once, under `root`. */
+/**
+ * Persists one acquired document's retained bytes, write-once, under `root`.
+ *
+ * Takes a `RetainedPayload` and not a `Uint8Array` (F1-23). This file is the
+ * only place in the package that touches `node:fs` for a document, and
+ * `retainPayload` is the only thing that produces a `RetainedPayload` --
+ * branded at compile time and tracked in a run-time WeakSet -- so an
+ * unprojected provider response has no route to the raw tree at all. That is
+ * the same structural move F1-18 made with `AdapterPull.persisted`: not a
+ * rule someone has to remember, a shape they cannot construct.
+ *
+ * The hash under which the bytes land is the hash of these retained bytes,
+ * computed by `retainPayload` over exactly what is written here. The original
+ * response is never hashed and never stored.
+ */
 export function writeRawDocument(
   root: string,
-  bytes: Uint8Array,
+  retained: RetainedPayload,
 ): RawTreeWriteResult {
-  return writeContentAddressed(root, "documents", bytes, "");
+  return writeContentAddressed(root, "documents", assertRetained(retained).bytes, "");
 }
 
 /**
@@ -220,6 +236,20 @@ export type RawTreeDocumentManifest = {
    * stay content-addressed and extension-less either way -- this is where a
    * person or a rebuild learns what to call the file, not a rename target. */
   readonly originalExtension: string | null;
+  /**
+   * F1-23. What was retained and how, so a reader who opens this file learns
+   * that it is a projection of the provider's response rather than the
+   * response itself: the adapter's declaration and its version, the
+   * projection algorithm version, and the source paths that were dropped
+   * (paths only, never values). `mode` is `policy.kind`: `json_allowlist`
+   * means fields were selected, `opaque` means the artifact had no
+   * addressable fields and its bytes were retained whole.
+   *
+   * This is the only field F1-23 adds to the manifest. F1-24 separates byte
+   * identity from capture provenance in this same type; this addition is
+   * capture provenance and moves with that half.
+   */
+  readonly retention: RetentionRecord;
 };
 
 export type ManifestWriteResult = {

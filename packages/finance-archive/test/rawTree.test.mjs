@@ -24,6 +24,7 @@ import {
   readRawDocumentManifest,
   recordRetainedTextPath,
   resolveRawTreeRoot,
+  retainPayload,
   sha256HexOf,
   writeRawDocument,
   writeRawDocumentManifest,
@@ -78,15 +79,30 @@ function archiveWithDocument(t, sha256) {
   return db;
 }
 
+/** A statement's bytes as the F1-23 projection retains them: a rendered
+ * document has no addressable fields, so the declaration is `opaque` and the
+ * bytes are retained whole. `writeRawDocument` accepts nothing else. */
+const OPAQUE_POLICY = {
+  kind: "opaque",
+  version: "test-opaque-1",
+  note: "synthetic fixture bytes, no addressable fields",
+};
+
+function opaque(bytes) {
+  return retainPayload(OPAQUE_POLICY, bytes, "pdf_statement");
+}
+
 function acquiredFixture(bytes, overrides = {}) {
+  const retained = opaque(bytes);
   return {
-    bytes,
+    bytes: retained.bytes,
+    retention: retained.record,
     manifest: {
       kind: "pdf_statement",
       periodStart: "2025-01-01",
       periodEnd: "2025-01-31",
       capturedAt: "2025-02-01T00:00:00.000Z",
-      contentHash: sha256HexOf(bytes),
+      contentHash: retained.sha256,
       reportedRowCount: null,
       gaps: [],
       ...overrides,
@@ -109,13 +125,13 @@ test("writeRawDocument persists bytes once; a repeat write of identical bytes is
   const root = rawTreeRoot(t);
   const bytes = new TextEncoder().encode("synthetic statement bytes, first version");
 
-  const first = writeRawDocument(root, bytes);
+  const first = writeRawDocument(root, opaque(bytes));
   assert.equal(first.status, "written");
   assert.equal(first.sha256, sha256HexOf(bytes));
   assert.ok(existsSync(first.path));
   assert.deepEqual(readFileSync(first.path), Buffer.from(bytes));
 
-  const second = writeRawDocument(root, bytes);
+  const second = writeRawDocument(root, opaque(bytes));
   assert.equal(second.status, "already_exists", "re-acquiring identical bytes is a no-op, not an error");
   assert.equal(second.path, first.path);
   assert.deepEqual(readFileSync(second.path), Buffer.from(bytes), "content is unchanged, not rewritten");
@@ -123,8 +139,8 @@ test("writeRawDocument persists bytes once; a repeat write of identical bytes is
 
 test("writeRawDocument makes an accidental collision impossible: two different byte strings never land on the same path", (t) => {
   const root = rawTreeRoot(t);
-  const a = writeRawDocument(root, new TextEncoder().encode("synthetic document A"));
-  const b = writeRawDocument(root, new TextEncoder().encode("synthetic document B"));
+  const a = writeRawDocument(root, opaque(new TextEncoder().encode("synthetic document A")));
+  const b = writeRawDocument(root, opaque(new TextEncoder().encode("synthetic document B")));
   assert.notEqual(a.path, b.path);
   assert.notEqual(a.sha256, b.sha256);
 });
@@ -132,7 +148,7 @@ test("writeRawDocument makes an accidental collision impossible: two different b
 test("readAndVerify detects a corrupted raw-tree file instead of returning wrong bytes", (t) => {
   const root = rawTreeRoot(t);
   const bytes = new TextEncoder().encode("synthetic statement bytes, to be corrupted");
-  const written = writeRawDocument(root, bytes);
+  const written = writeRawDocument(root, opaque(bytes));
 
   // Simulate on-disk corruption directly, bypassing the writer entirely.
   writeFileSync(written.path, "corrupted content, different from what was written");
@@ -146,12 +162,12 @@ test("readAndVerify detects a corrupted raw-tree file instead of returning wrong
 test("a write-once path that has been corrupted is caught on the next acquisition attempt too", (t) => {
   const root = rawTreeRoot(t);
   const bytes = new TextEncoder().encode("synthetic statement bytes, corrupted before re-acquisition");
-  const written = writeRawDocument(root, bytes);
+  const written = writeRawDocument(root, opaque(bytes));
   writeFileSync(written.path, "corrupted content");
 
   // Re-acquiring the same original bytes must not silently treat the
   // corrupted file on disk as an already-written match.
-  assert.throws(() => writeRawDocument(root, bytes), /raw tree corruption detected/);
+  assert.throws(() => writeRawDocument(root, opaque(bytes)), /raw tree corruption detected/);
 });
 
 test("writeRetainedText persists text write-once, in a namespace separate from raw documents", (t) => {
@@ -184,6 +200,7 @@ test("writeRawDocumentManifest is write-once: a second write for the same docume
     capabilityTier: "pdf_statement",
     gaps: [],
     originalExtension: ".pdf",
+    retention: { policy: OPAQUE_POLICY, projectionVersion: "1", droppedPaths: [] },
   };
 
   const first = writeRawDocumentManifest(root, manifest);
