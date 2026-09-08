@@ -218,6 +218,85 @@ export const sourceArtifactArchiveReceiptFields = {
   createdAt: v.number(),
 };
 
+export const sourceProviderOriginalReferenceFields = {
+  spaceId: v.id("spaces"),
+  sourceAccountId: v.id("sourceAccounts"),
+  sourceItemId: v.id("sourceItems"),
+  sourceRevisionId: v.id("sourceRevisions"),
+  clientReferenceId: v.string(),
+  requestDigest: v.string(),
+  referenceVersion: v.literal("provider_original_v1"),
+  providerKind: v.literal("dropbox_v1"),
+  referenceFingerprint: v.string(),
+  sourceContentHash: v.string(),
+  sourceByteLength: v.number(),
+  providerAccountIdHash: v.string(),
+  providerRootDirectoryIdHash: v.string(),
+  providerFileIdHash: v.string(),
+  providerRevision: v.string(),
+  providerContentHash: v.string(),
+  verifiedAt: v.number(),
+  locatorBindingId: v.string(),
+  locatorManifestFingerprint: v.string(),
+  locatorRecipientFingerprint: v.string(),
+  locatorRepositoryKeyDomainFingerprint: v.string(),
+  locatorRepositoryId: v.string(),
+  locatorSnapshotId: v.string(),
+  locatorObjectName: v.string(),
+  locatorCiphertextHash: v.string(),
+  locatorCiphertextByteLength: v.number(),
+  locatorReadbackVerifiedAt: v.number(),
+  verificationAuthority: v.literal("worker_asserted"),
+  userId: v.id("users"),
+  actorCredentialId: v.id("apiKeys"),
+  createdAt: v.number(),
+};
+
+export const sourceProviderOriginalBindingFields = {
+  spaceId: v.id("spaces"),
+  sourceAccountId: v.id("sourceAccounts"),
+  sourceItemId: v.id("sourceItems"),
+  sourceRevisionId: v.id("sourceRevisions"),
+  referenceId: v.id("sourceProviderOriginalReferences"),
+  bindingEpoch: v.number(),
+  verifiedAt: v.number(),
+  userId: v.id("users"),
+  actorCredentialId: v.id("apiKeys"),
+  updatedAt: v.number(),
+};
+
+export const sourceProviderOriginalDetachAckFields = {
+  ackVersion: v.literal("provider_original_detach_ack_v1"),
+  spaceId: v.id("spaces"),
+  sourceAccountId: v.id("sourceAccounts"),
+  sourceItemId: v.id("sourceItems"),
+  sourceRevisionId: v.id("sourceRevisions"),
+  referenceId: v.id("sourceProviderOriginalReferences"),
+  forgetEpoch: v.number(),
+  detachId: v.string(),
+  requestId: v.string(),
+  requestDigest: v.string(),
+  referenceFingerprint: v.string(),
+  locatorBindingId: v.string(),
+  locatorRepositoryId: v.string(),
+  locatorSnapshotId: v.string(),
+  locatorObjectName: v.string(),
+  referenceOutcome: v.union(
+    v.literal("detached"),
+    v.literal("already_detached"),
+  ),
+  locatorBundleOutcome: v.union(
+    v.literal("deleted"),
+    v.literal("already_missing"),
+  ),
+  locatorAbsenceAuthority: v.literal("worker_asserted_live_repository_absence"),
+  retentionDisclosure: v.literal("provider_retained_deleted_history_possible"),
+  providerSourceOutcome: v.literal("retained_unchanged"),
+  actorUserId: v.id("users"),
+  actorCredentialId: v.id("apiKeys"),
+  completedAt: v.number(),
+};
+
 export const sourceArtifactArchiveBindingFields = {
   spaceId: v.id("spaces"),
   sourceAccountId: v.id("sourceAccounts"),
@@ -240,6 +319,15 @@ export const archiveDeletionOutcomeValidator = v.union(
   v.literal("already_missing"),
 );
 
+export const archiveDeletionAbsenceAuthorityValidator = v.union(
+  v.literal("worker_asserted_physical_absence"),
+  v.literal("worker_asserted_live_repository_absence"),
+);
+
+export const archiveDeletionRetentionDisclosureValidator = v.literal(
+  "provider_retained_deleted_history_possible",
+);
+
 export const sourceArtifactDeletionAckFields = {
   spaceId: v.id("spaces"),
   sourceAccountId: v.id("sourceAccounts"),
@@ -250,7 +338,8 @@ export const sourceArtifactDeletionAckFields = {
   requestId: v.string(),
   requestDigest: v.string(),
   ackVersion: v.literal("archive_deletion_ack_v1"),
-  absenceAuthority: v.literal("worker_asserted_physical_absence"),
+  absenceAuthority: archiveDeletionAbsenceAuthorityValidator,
+  retentionDisclosure: v.optional(archiveDeletionRetentionDisclosureValidator),
   clientReceiptId: v.string(),
   receiptRequestDigest: v.string(),
   sourceRevisionId: v.id("sourceRevisions"),

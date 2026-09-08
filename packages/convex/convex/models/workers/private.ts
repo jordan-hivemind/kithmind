@@ -49,6 +49,10 @@ import {
   getArchiveForgetTargets,
 } from "./archiveForget";
 import {
+  acknowledgeProviderOriginalDetach,
+  getProviderOriginalForgetTargets,
+} from "./providerOriginalForget";
+import {
   getWorkerDiagnosticsStatus,
   recordWorkerHeartbeat,
 } from "../diagnostics/model";
@@ -113,6 +117,27 @@ export const archiveAckDeletion = internalMutation({
       ctx,
       args.principal,
       operation(args.request, "archive.ackDeletion"),
+      Date.now(),
+    ),
+});
+
+export const providerOriginalForgetTargets = internalQuery({
+  args: { principal: principalRefValidator, request: v.any() },
+  handler: async (ctx, args) =>
+    await getProviderOriginalForgetTargets(
+      ctx,
+      args.principal,
+      operation(args.request, "providerOriginal.forgetTargets"),
+    ),
+});
+
+export const providerOriginalAckDetach = internalMutation({
+  args: { principal: principalRefValidator, request: v.any() },
+  handler: async (ctx, args) =>
+    await acknowledgeProviderOriginalDetach(
+      ctx,
+      args.principal,
+      operation(args.request, "providerOriginal.ackDetach"),
       Date.now(),
     ),
 });

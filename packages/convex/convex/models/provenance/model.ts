@@ -1937,6 +1937,98 @@ export async function deleteSourceItemProvenanceBatch(
   if (orphanedBindings.length !== 0) {
     throw new Error("Archive binding is missing its immutable receipt");
   }
+  const providerReferences = await ctx.db
+    .query("sourceProviderOriginalReferences")
+    .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+    .take(1);
+  const providerReference = providerReferences[0];
+  if (providerReference) {
+    if (
+      providerReference.spaceId !== item.spaceId ||
+      providerReference.sourceAccountId !== item.sourceAccountId
+    )
+      throw new Error("Provider original reference parent chain is invalid");
+    const detachAcks = await ctx.db
+      .query("sourceProviderOriginalDetachAcks")
+      .withIndex("by_referenceId_and_forgetEpoch", (q) =>
+        q
+          .eq("referenceId", providerReference._id)
+          .eq("forgetEpoch", item.desiredProcessingEpoch),
+      )
+      .take(2);
+    const detachAck = detachAcks[0];
+    if (detachAcks.length !== 1 || !detachAck) {
+      return {
+        deleted: 0,
+        phase: "provider_original_cleanup_required",
+        done: false,
+      };
+    }
+    if (
+      detachAck.ackVersion !== "provider_original_detach_ack_v1" ||
+      detachAck.spaceId !== item.spaceId ||
+      detachAck.sourceAccountId !== item.sourceAccountId ||
+      detachAck.sourceItemId !== item._id ||
+      detachAck.sourceRevisionId !== providerReference.sourceRevisionId ||
+      detachAck.referenceFingerprint !==
+        providerReference.referenceFingerprint ||
+      !/^[a-f0-9]{64}$/.test(detachAck.requestDigest) ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+        detachAck.detachId,
+      ) ||
+      detachAck.locatorBindingId !== providerReference.locatorBindingId ||
+      detachAck.locatorRepositoryId !== providerReference.locatorRepositoryId ||
+      detachAck.locatorSnapshotId !== providerReference.locatorSnapshotId ||
+      detachAck.locatorObjectName !== providerReference.locatorObjectName ||
+      (detachAck.referenceOutcome !== "detached" &&
+        detachAck.referenceOutcome !== "already_detached") ||
+      (detachAck.locatorBundleOutcome !== "deleted" &&
+        detachAck.locatorBundleOutcome !== "already_missing") ||
+      detachAck.locatorAbsenceAuthority !==
+        "worker_asserted_live_repository_absence" ||
+      detachAck.retentionDisclosure !==
+        "provider_retained_deleted_history_possible" ||
+      detachAck.providerSourceOutcome !== "retained_unchanged"
+    )
+      throw new Error("Provider original detach acknowledgement is invalid");
+    const providerBindings = await ctx.db
+      .query("sourceProviderOriginalBindings")
+      .withIndex("by_referenceId", (q) =>
+        q.eq("referenceId", providerReference._id),
+      )
+      .take(2);
+    if (
+      providerBindings.length > 1 ||
+      providerBindings.some(
+        (binding) =>
+          binding.spaceId !== item.spaceId ||
+          binding.sourceAccountId !== item.sourceAccountId ||
+          binding.sourceItemId !== item._id ||
+          binding.sourceRevisionId !== providerReference.sourceRevisionId,
+      )
+    )
+      throw new Error("Provider original binding is incoherent");
+    if (providerBindings[0]) {
+      await ctx.db.delete(providerBindings[0]._id);
+      return {
+        deleted: 1,
+        phase: "providerOriginalBindings",
+        done: false,
+      };
+    }
+    await ctx.db.delete(providerReference._id);
+    return {
+      deleted: 1,
+      phase: "providerOriginalReferences",
+      done: false,
+    };
+  }
+  const orphanedProviderBindings = await ctx.db
+    .query("sourceProviderOriginalBindings")
+    .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+    .take(1);
+  if (orphanedProviderBindings.length !== 0)
+    throw new Error("Provider original binding is missing its reference");
   if (item.archiveDeletionCompletedAt === undefined) {
     await ctx.db.patch(item._id, {
       archiveDeletionForgetEpoch: item.desiredProcessingEpoch,
@@ -2087,6 +2179,18 @@ export async function finalizeSourceItemTombstone(
       .first(),
     ctx.db
       .query("sourceArtifactDeletionAcks")
+      .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+      .first(),
+    ctx.db
+      .query("sourceProviderOriginalReferences")
+      .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+      .first(),
+    ctx.db
+      .query("sourceProviderOriginalBindings")
+      .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+      .first(),
+    ctx.db
+      .query("sourceProviderOriginalDetachAcks")
       .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
       .first(),
     ctx.db

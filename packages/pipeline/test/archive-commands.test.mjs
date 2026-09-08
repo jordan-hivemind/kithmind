@@ -7,13 +7,14 @@ import {
   mkdtemp,
   readFile,
   realpath,
+  rm,
   rename,
   stat,
   symlink,
   unlink,
   writeFile,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import fsPromises from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
@@ -38,6 +39,23 @@ const RECIPIENT = `age1pq1${"q".repeat(60)}`;
 const SNAPSHOT = "a".repeat(64);
 const REPOSITORY = "b".repeat(64);
 const SECRET_SENTINEL = "must-not-appear-in-arguments-or-errors";
+let protectedFixtureRoot;
+
+async function protectedTestRoot() {
+  if (!protectedFixtureRoot) {
+    protectedFixtureRoot = await realpath(
+      await mkdtemp(join(homedir(), ".kithmind-archive-test-")),
+    );
+    await chmod(protectedFixtureRoot, 0o700);
+  }
+  return protectedFixtureRoot;
+}
+
+test.after(async () => {
+  if (protectedFixtureRoot) {
+    await rm(protectedFixtureRoot, { recursive: true, force: true });
+  }
+});
 
 function digest(bytes) {
   return {
@@ -45,6 +63,11 @@ function digest(bytes) {
     byteLength: bytes.length,
   };
 }
+
+const configIdentity = (path, remoteName) =>
+  createHash("sha256")
+    .update(`dropbox-config:v1\0${JSON.stringify([path, remoteName, "dropbox"])}`)
+    .digest("hex");
 
 function limits(overrides = {}) {
   return {
@@ -85,7 +108,7 @@ if (${JSON.stringify(mode)} === "flood") {
 `;
 }
 
-function resticProgram(mode = "normal") {
+function resticProgram(mode = "normal", remoteRepository = "") {
   return `
 import { chmodSync, copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -94,7 +117,8 @@ if (process.argv[2] === "version") {
   process.exit(0);
 }
 const args = process.argv.slice(2);
-const repo = args[args.indexOf("--repo") + 1];
+const repoArg = args[args.indexOf("--repo") + 1];
+const repo = repoArg.startsWith("rclone:") ? ${JSON.stringify(remoteRepository)} : repoArg;
 const passwordCommand = args[args.indexOf("--password-command") + 1];
 const command = args.find((value) => ["backup", "dump", "snapshots", "forget", "prune"].includes(value));
 const statePath = join(repo, "snapshots.json");
@@ -123,7 +147,12 @@ if (command === "backup") {
   const bytes = readFileSync(source);
   copyFileSync(source, join(repo, "stored.age"));
   chmodSync(join(repo, "stored.age"), 0o600);
-  saveRows(defaultRows);
+  saveRows([{
+    id: ${JSON.stringify(SNAPSHOT)},
+    hostname: args[args.indexOf("--host") + 1],
+    tags: [args[args.indexOf("--tag") + 1]],
+    paths: [join(repo, "private-prefix", objectName)]
+  }]);
   writeFileSync(join(repo, "captured.json"), JSON.stringify({ args, passwordCommand }), { mode: 0o600 });
   if (${JSON.stringify(mode)} === "error-secret") {
     process.stderr.write(${JSON.stringify(SECRET_SENTINEL)});
@@ -173,8 +202,9 @@ process.exit(2);
 }
 
 async function setup(options = {}) {
+  const parent = options.protectedRoot ? await protectedTestRoot() : tmpdir();
   const base = await realpath(
-    await mkdtemp(join(tmpdir(), "pipeline-archive-test-")),
+    await mkdtemp(join(parent, "pipeline-archive-test-")),
   );
   await chmod(base, 0o700);
   const tools = join(base, "tools");
@@ -193,8 +223,29 @@ async function setup(options = {}) {
   );
   const resticBinary = await executable(
     join(tools, "restic"),
-    resticProgram(options.resticMode),
+    resticProgram(options.resticMode, repository),
   );
+  const directoryId = "id:dropbox-directory-id";
+  const rcloneBinary = await executable(
+    join(tools, "rclone"),
+    `
+if (process.argv[2] === "version") {
+  process.stdout.write("rclone v1.74.4\\n");
+  process.exit(0);
+}
+if (process.argv[2] === "config" && process.argv[3] === "redacted") {
+  process.stdout.write("[kithmind_dropbox]\\ntype = dropbox\\ntoken = XXX\\n");
+  process.exit(0);
+}
+if (process.argv[2] === "lsjson") {
+  process.stdout.write(JSON.stringify([{Path:"Processing",Name:"Processing",Size:-1,ModTime:"",IsDir:true,ID:${JSON.stringify(directoryId)}}]));
+  process.exit(0);
+}
+process.exit(2);
+`,
+  );
+  const rcloneConfig = join(base, "rclone.conf");
+  await writeFile(rcloneConfig, `[kithmind_dropbox]\ntype = dropbox\ntoken = ${JSON.stringify({ access_token: "synthetic-token", token_type: "bearer" })}\n`, { mode: 0o600 });
   const passwordExecutable = await executable(
     join(tools, "password-command"),
     `process.stdout.write("synthetic-password\\n");`,
@@ -207,6 +258,9 @@ async function setup(options = {}) {
     repository,
     ageBinary,
     resticBinary,
+    rcloneBinary,
+    rcloneConfig,
+    directoryIdHash: createHash("sha256").update(directoryId).digest("hex"),
     passwordCommand: {
       executable: passwordExecutable,
       publicArgs: ["service with space", "owner's selector"],
@@ -745,6 +799,95 @@ test("restic backup requires a closed summary and verifies destination ciphertex
       repositoryId: REPOSITORY,
       verification: "destination_ciphertext_readback",
     },
+  );
+});
+
+test("rclone Dropbox repository binds the real directory and performs a separate remote dump", async () => {
+  const fixture = await setup({ protectedRoot: true });
+  const bytes = Buffer.from("remote AGE ciphertext");
+  const ciphertextPath = join(fixture.archiveRoot, "remote.age");
+  await writeFile(ciphertextPath, bytes, { mode: 0o600 });
+  const repository = {
+    kind: "rclone_dropbox_v1",
+    remoteName: "kithmind_dropbox",
+    rootPath: "Kith Mind Backups/Processing",
+    rcloneBinary: fixture.rcloneBinary,
+    configPath: fixture.rcloneConfig,
+    configIdentityFingerprint: configIdentity(fixture.rcloneConfig, "kithmind_dropbox"),
+    expectedRootDirectoryIdHash: fixture.directoryIdHash,
+  };
+  const result = await backupResticObject({
+    resticBinary: fixture.resticBinary,
+    repository,
+    expectedRepositoryId: REPOSITORY,
+    passwordCommand: fixture.passwordCommand,
+    operationId: "operation_1",
+    host: "kith-original-archive",
+    ciphertextPath,
+    expectedCiphertext: digest(bytes),
+    primaryArchiveRoot: fixture.archiveRoot,
+    backupMode: "independent_backup",
+    limits: limits(),
+  });
+  assert.equal(result.boundary.backend, "rclone_dropbox_v1");
+  assert.equal(result.boundary.rootDirectoryIdHash, fixture.directoryIdHash);
+  assert.equal(result.boundary.repositoryId, REPOSITORY);
+  const recovered = await recoverResticBackup({
+    resticBinary: fixture.resticBinary,
+    repository,
+    expectedRepositoryId: REPOSITORY,
+    passwordCommand: fixture.passwordCommand,
+    operationId: "operation_1",
+    host: "kith-original-archive",
+    objectName: "remote.age",
+    expectedCiphertext: digest(bytes),
+    limits: limits(),
+  });
+  assert.equal(recovered.snapshotId, SNAPSHOT);
+  assert.deepEqual(recovered.boundary, result.boundary);
+  assert.deepEqual(
+    await readbackResticObject({
+      resticBinary: fixture.resticBinary,
+      repository,
+      expectedRepositoryId: REPOSITORY,
+      passwordCommand: fixture.passwordCommand,
+      snapshotId: SNAPSHOT,
+      objectName: "remote.age",
+      expectedCiphertext: digest(bytes),
+      limits: limits(),
+    }),
+    {
+      snapshotId: SNAPSHOT,
+      objectName: "remote.age",
+      ciphertext: digest(bytes),
+      resticVersion: "0.19.1",
+      repositoryId: REPOSITORY,
+      verification: "destination_ciphertext_readback",
+    },
+  );
+  await assert.rejects(
+    () => probeResticRepository({
+      resticBinary: fixture.resticBinary,
+      repository: { ...repository, expectedRootDirectoryIdHash: "f".repeat(64) },
+      passwordCommand: fixture.passwordCommand,
+      limits: limits(),
+    }),
+    (error) => error instanceof ArchiveCommandError && error.code === "digest_mismatch",
+  );
+  assert.equal(
+    (await forgetResticBackupExact({
+      resticBinary: fixture.resticBinary,
+      repository,
+      expectedRepositoryId: REPOSITORY,
+      passwordCommand: fixture.passwordCommand,
+      operationId: "operation_1",
+      host: "kith-original-archive",
+      snapshotId: SNAPSHOT,
+      objectName: "remote.age",
+      expectedCiphertext: digest(bytes),
+      limits: limits(),
+    })).outcome,
+    "deleted",
   );
 });
 

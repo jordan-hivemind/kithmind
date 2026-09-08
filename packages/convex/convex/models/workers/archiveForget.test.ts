@@ -211,9 +211,10 @@ function ackRequest(
     deletionId: string;
     receiptId: Id<"sourceArtifactArchiveReceipts">;
     backup?: boolean;
+    liveRepository?: boolean;
   },
 ): Extract<WorkerRequest, { operation: "archive.ackDeletion" }> {
-  return {
+  const request = {
     protocolVersion: 1,
     operation: "archive.ackDeletion",
     spaceId: f.spaceId,
@@ -225,7 +226,14 @@ function ackRequest(
     receiptId: input.receiptId,
     objectOutcome: "deleted",
     ...(input.backup ? { backupOutcome: "already_missing" as const } : {}),
-  };
+  } as const;
+  return input.liveRepository
+    ? {
+        ...request,
+        absenceAuthority: "worker_asserted_live_repository_absence",
+        retentionDisclosure: "provider_retained_deleted_history_possible",
+      }
+    : request;
 }
 
 async function beginForget(f: Awaited<ReturnType<typeof fixture>>) {
@@ -266,6 +274,30 @@ describe("archive forget acknowledgements", () => {
         unexpected: true,
       }),
     ).toThrow("Invalid worker request");
+    const physical = ackRequest(f, {
+      requestId: "00000000-0000-4000-8000-000000000052",
+      deletionId: "00000000-0000-4000-8000-000000000053",
+      receiptId: f.receipts[0]!,
+    });
+    expect(parseWorkerRequest(physical)).toEqual(physical);
+    for (const invalid of [
+      {
+        ...physical,
+        retentionDisclosure: "provider_retained_deleted_history_possible",
+      },
+      {
+        ...physical,
+        absenceAuthority: "worker_asserted_live_repository_absence",
+      },
+      {
+        ...physical,
+        absenceAuthority: "worker_asserted_physical_absence",
+        retentionDisclosure: "provider_retained_deleted_history_possible",
+      },
+    ])
+      expect(() => parseWorkerRequest(invalid)).toThrow(
+        "Invalid worker request",
+      );
   });
 
   test("enumerates bounded immutable targets only after the owner begins forget", async () => {
@@ -408,6 +440,22 @@ describe("archive forget acknowledgements", () => {
       verificationKind: "ciphertext_readback_sha256",
       receiptActorCredentialId: f.credentialId,
     });
+    expect(storedAck?.retentionDisclosure).toBeUndefined();
+    expect(storedAck?.requestDigest).toBe(
+      await sha256Utf8(
+        `archive-deletion-ack:v1\0${JSON.stringify([
+          request.spaceId,
+          request.sourceAccountId,
+          request.requestId,
+          request.sourceItemId,
+          request.expectedForgetEpoch,
+          request.deletionId,
+          request.receiptId,
+          request.objectOutcome,
+          request.backupOutcome ?? null,
+        ])}`,
+      ),
+    );
     const acknowledgedPage = await f.t.run((ctx) =>
       getArchiveForgetTargets(
         ctx,
@@ -481,6 +529,98 @@ describe("archive forget acknowledgements", () => {
         ),
       ),
     ).rejects.toThrow("invalid_request");
+  });
+
+  test("binds live repository absence and provider retention to parser backups only", async () => {
+    const f = await fixture();
+    await beginForget(f);
+    const request = ackRequest(f, {
+      requestId: "00000000-0000-4000-8000-000000000025",
+      deletionId: "00000000-0000-4000-8000-000000000026",
+      receiptId: f.receipts[3]!,
+      backup: true,
+      liveRepository: true,
+    });
+    await expect(
+      f.t.run((ctx) =>
+        acknowledgeArchiveDeletion(
+          ctx,
+          principal(f.userId, f.credentialId),
+          request,
+          25,
+        ),
+      ),
+    ).resolves.toMatchObject({
+      absenceAuthority: "worker_asserted_live_repository_absence",
+      retentionDisclosure: "provider_retained_deleted_history_possible",
+      reused: false,
+    });
+    await expect(
+      f.t.run((ctx) =>
+        acknowledgeArchiveDeletion(
+          ctx,
+          principal(f.userId, f.credentialId),
+          request,
+          26,
+        ),
+      ),
+    ).resolves.toMatchObject({ reused: true, completedAt: 25 });
+    await expect(
+      f.t.run((ctx) =>
+        acknowledgeArchiveDeletion(
+          ctx,
+          principal(f.userId, f.credentialId),
+          {
+            ...request,
+            absenceAuthority: "worker_asserted_physical_absence",
+            retentionDisclosure: undefined,
+          },
+          26,
+        ),
+      ),
+    ).rejects.toThrow("request_conflict");
+    const firstPage = await f.t.run((ctx) =>
+      getArchiveForgetTargets(
+        ctx,
+        principal(f.userId, f.credentialId),
+        targetsRequest(f, 1),
+      ),
+    );
+    const page = await f.t.run((ctx) =>
+      getArchiveForgetTargets(
+        ctx,
+        principal(f.userId, f.credentialId),
+        targetsRequest(f, 1, firstPage.continueCursor),
+      ),
+    );
+    expect(
+      page.targets.find((target) => target.receiptId === f.receipts[3])?.ack,
+    ).toMatchObject({
+      absenceAuthority: "worker_asserted_live_repository_absence",
+      retentionDisclosure: "provider_retained_deleted_history_possible",
+    });
+
+    for (const [receiptId, backup, suffix] of [
+      [f.receipts[2]!, false, "7"],
+      [f.receipts[1]!, true, "8"],
+    ] as const) {
+      await expect(
+        f.t.run((ctx) =>
+          acknowledgeArchiveDeletion(
+            ctx,
+            principal(f.userId, f.credentialId),
+            ackRequest(f, {
+              requestId: `00000000-0000-4000-8000-00000000002${suffix}`,
+              deletionId: `00000000-0000-4000-8000-00000000003${suffix}`,
+              receiptId,
+              backup,
+              liveRepository: true,
+            }),
+            27,
+          ),
+        ),
+      ).rejects.toThrow("invalid_request");
+    }
   });
 
   test("denies disabled and revoked callers without invalidating accepted acks", async () => {

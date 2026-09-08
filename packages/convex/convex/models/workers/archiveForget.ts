@@ -149,7 +149,7 @@ async function requireReceiptChain(
 function ackSummary(
   ack: Doc<"sourceArtifactDeletionAcks">,
 ): WorkerArchiveDeletionAckSummary {
-  return {
+  const common = {
     deletionId: ack.deletionId,
     receiptId: ack.receiptId,
     forgetEpoch: ack.forgetEpoch,
@@ -157,8 +157,28 @@ function ackSummary(
     ...(ack.backupOutcome === undefined
       ? {}
       : { backupOutcome: ack.backupOutcome }),
-    absenceAuthority: "worker_asserted_physical_absence",
     completedAt: ack.completedAt,
+  };
+  if (ack.absenceAuthority === "worker_asserted_live_repository_absence") {
+    if (
+      ack.copyRole !== "independent_backup" ||
+      ack.subjectKind !== "parser_output" ||
+      ack.backupOutcome === undefined ||
+      ack.retentionDisclosure !== "provider_retained_deleted_history_possible"
+    )
+      throw new Error("Archive deletion acknowledgement is incoherent");
+    return {
+      ...common,
+      backupOutcome: ack.backupOutcome,
+      absenceAuthority: ack.absenceAuthority,
+      retentionDisclosure: ack.retentionDisclosure,
+    };
+  }
+  if (ack.retentionDisclosure !== undefined)
+    throw new Error("Archive deletion acknowledgement is incoherent");
+  return {
+    ...common,
+    absenceAuthority: "worker_asserted_physical_absence",
   };
 }
 
@@ -225,19 +245,31 @@ export async function getArchiveForgetTargets(
 async function deletionRequestDigest(
   request: Extract<WorkerRequest, { operation: "archive.ackDeletion" }>,
 ): Promise<string> {
-  return sha256Utf8(
-    `archive-deletion-ack:v1\0${JSON.stringify([
-      request.spaceId,
-      request.sourceAccountId,
-      request.requestId,
-      request.sourceItemId,
-      request.expectedForgetEpoch,
-      request.deletionId,
-      request.receiptId,
-      request.objectOutcome,
-      request.backupOutcome ?? null,
-    ])}`,
-  );
+  const fields: unknown[] = [
+    request.spaceId,
+    request.sourceAccountId,
+    request.requestId,
+    request.sourceItemId,
+    request.expectedForgetEpoch,
+    request.deletionId,
+    request.receiptId,
+    request.objectOutcome,
+    request.backupOutcome ?? null,
+  ];
+  if (request.absenceAuthority !== undefined) {
+    fields.push(
+      "absence_authority_v1",
+      request.absenceAuthority,
+      request.retentionDisclosure ?? null,
+    );
+  }
+  return sha256Utf8(`archive-deletion-ack:v1\0${JSON.stringify(fields)}`);
+}
+
+function requestedAbsenceAuthority(
+  request: Extract<WorkerRequest, { operation: "archive.ackDeletion" }>,
+) {
+  return request.absenceAuthority ?? "worker_asserted_physical_absence";
 }
 
 function sameAckRequest(
@@ -254,6 +286,8 @@ function sameAckRequest(
     ack.deletionId === request.deletionId &&
     ack.objectOutcome === request.objectOutcome &&
     ack.backupOutcome === request.backupOutcome &&
+    ack.absenceAuthority === requestedAbsenceAuthority(request) &&
+    ack.retentionDisclosure === request.retentionDisclosure &&
     ack.actorUserId === source.principal.userId &&
     ack.actorCredentialId === source.principal.credentialId &&
     archiveDeletionAckMatchesReceipt(
@@ -283,10 +317,18 @@ function sameAckReplayWithoutReceipt(
     ack.deletionId === request.deletionId &&
     ack.objectOutcome === request.objectOutcome &&
     ack.backupOutcome === request.backupOutcome &&
+    ack.absenceAuthority === requestedAbsenceAuthority(request) &&
+    ack.retentionDisclosure === request.retentionDisclosure &&
     ack.actorUserId === source.principal.userId &&
     ack.actorCredentialId === source.principal.credentialId &&
     ack.ackVersion === "archive_deletion_ack_v1" &&
-    ack.absenceAuthority === "worker_asserted_physical_absence" &&
+    (ack.absenceAuthority === "worker_asserted_physical_absence"
+      ? ack.retentionDisclosure === undefined
+      : ack.absenceAuthority === "worker_asserted_live_repository_absence" &&
+        ack.retentionDisclosure ===
+          "provider_retained_deleted_history_possible" &&
+        ack.copyRole === "independent_backup" &&
+        ack.subjectKind === "parser_output") &&
     UUID.test(ack.deletionId) &&
     validDigest(ack.requestDigest) &&
     validDigest(ack.receiptRequestDigest) &&
@@ -377,6 +419,13 @@ export async function acknowledgeArchiveDeletion(
     (request.backupOutcome !== undefined)
   )
     throw workerProtocolError("invalid_request");
+  if (
+    requestedAbsenceAuthority(request) ===
+      "worker_asserted_live_repository_absence" &&
+    (receipt.copyRole !== "independent_backup" ||
+      receipt.subjectKind !== "parser_output")
+  )
+    throw workerProtocolError("invalid_request");
   const byReceipt = await ctx.db
     .query("sourceArtifactDeletionAcks")
     .withIndex("by_receiptId_and_forgetEpoch", (q) =>
@@ -412,7 +461,10 @@ export async function acknowledgeArchiveDeletion(
     requestId: request.requestId,
     requestDigest: digest,
     ackVersion: "archive_deletion_ack_v1",
-    absenceAuthority: "worker_asserted_physical_absence",
+    absenceAuthority: requestedAbsenceAuthority(request),
+    ...(request.retentionDisclosure === undefined
+      ? {}
+      : { retentionDisclosure: request.retentionDisclosure }),
     clientReceiptId: receipt.clientReceiptId,
     receiptRequestDigest: receipt.requestDigest,
     sourceRevisionId: receipt.sourceRevisionId,

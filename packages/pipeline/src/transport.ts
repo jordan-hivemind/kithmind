@@ -156,7 +156,7 @@ function archiveDeletionAck(
       "completedAt",
       ...(options.reused ? ["reused"] : []),
     ],
-    ["backupOutcome"],
+    ["backupOutcome", "retentionDisclosure"],
   );
   if (options.operation && row.operation !== "archive.ackDeletion")
     failure("archive deletion operation is invalid");
@@ -173,8 +173,18 @@ function archiveDeletionAck(
       "already_missing",
     ] as const);
   }
-  if (row.absenceAuthority !== "worker_asserted_physical_absence")
-    failure("absence authority is invalid");
+  enumValue(row.absenceAuthority, "absenceAuthority", [
+    "worker_asserted_physical_absence",
+    "worker_asserted_live_repository_absence",
+  ] as const);
+  if (
+    row.absenceAuthority === "worker_asserted_live_repository_absence"
+      ? row.retentionDisclosure !==
+          "provider_retained_deleted_history_possible" ||
+        row.backupOutcome === undefined
+      : row.retentionDisclosure !== undefined
+  )
+    failure("archive deletion retention disclosure is invalid");
   integer(row.completedAt, "completedAt");
   if (options.reused) boolean(row.reused, "reused");
 }
@@ -250,7 +260,10 @@ function archiveForgetTargets(value: Record<string, unknown>): void {
         ack.receiptId !== receiptId ||
         ack.forgetEpoch !== forgetEpoch ||
         (target.copyRole === "independent_backup") !==
-          (ack.backupOutcome !== undefined)
+          (ack.backupOutcome !== undefined) ||
+        (ack.absenceAuthority === "worker_asserted_live_repository_absence" &&
+          (target.copyRole !== "independent_backup" ||
+            target.subjectKind !== "parser_output"))
       )
         failure("archive deletion acknowledgement is inconsistent");
     }
@@ -259,6 +272,115 @@ function archiveForgetTargets(value: Record<string, unknown>): void {
   text(value.continueCursor, "continueCursor", {
     maxUtf8: MAX_CURSOR_BYTES,
   });
+}
+
+function providerDetachAck(
+  value: unknown,
+  options: { operation: boolean; reused: boolean },
+): void {
+  const row = record(value);
+  exact(row, [
+    ...(options.operation ? ["operation"] : []),
+    "detachId",
+    "referenceId",
+    "forgetEpoch",
+    "referenceOutcome",
+    "locatorBundleOutcome",
+    "locatorAbsenceAuthority",
+    "retentionDisclosure",
+    "providerSourceOutcome",
+    "completedAt",
+    ...(options.reused ? ["reused"] : []),
+  ]);
+  if (options.operation && row.operation !== "providerOriginal.ackDetach")
+    failure("provider detach operation is invalid");
+  text(row.detachId, "detachId", { maxUtf16: 36, pattern: UUID });
+  id(row.referenceId, "referenceId");
+  integer(row.forgetEpoch, "forgetEpoch", 1);
+  enumValue(row.referenceOutcome, "referenceOutcome", [
+    "detached",
+    "already_detached",
+  ] as const);
+  enumValue(row.locatorBundleOutcome, "locatorBundleOutcome", [
+    "deleted",
+    "already_missing",
+  ] as const);
+  if (
+    row.locatorAbsenceAuthority !== "worker_asserted_live_repository_absence" ||
+    row.retentionDisclosure !== "provider_retained_deleted_history_possible" ||
+    row.providerSourceOutcome !== "retained_unchanged"
+  )
+    failure("provider detach disclosure is invalid");
+  integer(row.completedAt, "completedAt");
+  if (options.reused) boolean(row.reused, "reused");
+}
+
+function providerForgetTargets(value: Record<string, unknown>): void {
+  exact(value, [
+    "operation",
+    "sourceItemId",
+    "sourceExternalIdHash",
+    "forgetEpoch",
+    "targets",
+    "isDone",
+    "continueCursor",
+  ]);
+  id(value.sourceItemId, "sourceItemId");
+  digest(value.sourceExternalIdHash, "sourceExternalIdHash");
+  const forgetEpoch = integer(value.forgetEpoch, "forgetEpoch", 1);
+  if (!Array.isArray(value.targets) || value.targets.length > MAX_PAGE_ITEMS)
+    failure("provider forget target page is invalid");
+  const references = new Set<string>();
+  for (const item of value.targets) {
+    const target = record(item);
+    exact(
+      target,
+      [
+        "referenceId",
+        "referenceFingerprint",
+        "locatorBindingId",
+        "locatorRepositoryId",
+        "locatorSnapshotId",
+        "locatorObjectName",
+        "locatorCiphertextHash",
+        "locatorCiphertextByteLength",
+        "forgetEpoch",
+      ],
+      ["ack"],
+    );
+    const referenceId = id(target.referenceId, "referenceId");
+    if (references.has(referenceId))
+      failure("provider reference is duplicated");
+    references.add(referenceId);
+    digest(target.referenceFingerprint, "referenceFingerprint");
+    text(target.locatorBindingId, "locatorBindingId", {
+      maxUtf16: 36,
+      pattern: UUID,
+    });
+    digest(target.locatorRepositoryId, "locatorRepositoryId");
+    id(target.locatorSnapshotId, "locatorSnapshotId");
+    text(target.locatorObjectName, "locatorObjectName", {
+      maxUtf16: 128,
+      pattern: /^[A-Za-z0-9._-]{1,128}$/,
+    });
+    digest(target.locatorCiphertextHash, "locatorCiphertextHash");
+    integer(
+      target.locatorCiphertextByteLength,
+      "locatorCiphertextByteLength",
+      1,
+      1024 * 1024,
+    );
+    if (integer(target.forgetEpoch, "target forgetEpoch", 1) !== forgetEpoch)
+      failure("provider forget epoch is inconsistent");
+    if (target.ack !== undefined) {
+      providerDetachAck(target.ack, { operation: false, reused: false });
+      const ack = target.ack as Record<string, unknown>;
+      if (ack.referenceId !== referenceId || ack.forgetEpoch !== forgetEpoch)
+        failure("provider detach acknowledgement is inconsistent");
+    }
+  }
+  boolean(value.isDone, "isDone");
+  text(value.continueCursor, "continueCursor", { maxUtf8: MAX_CURSOR_BYTES });
 }
 
 function counts(value: unknown): void {
@@ -702,6 +824,9 @@ function archivedLookup(value: Record<string, unknown>): void {
   }
   if (value.found !== true) failure("lookup found is invalid");
   if (mode === "original") {
+    const provider =
+      "originalProviderReferenceId" in value ||
+      "originalProviderBindingEpoch" in value;
     exact(value, [
       "operation",
       "mode",
@@ -709,8 +834,9 @@ function archivedLookup(value: Record<string, unknown>): void {
       "sourceRevisionId",
       "originalPrimaryReceiptId",
       "originalPrimaryBindingEpoch",
-      "originalBackupReceiptId",
-      "originalBackupBindingEpoch",
+      ...(provider
+        ? ["originalProviderReferenceId", "originalProviderBindingEpoch"]
+        : ["originalBackupReceiptId", "originalBackupBindingEpoch"]),
     ]);
     id(value.sourceRevisionId, "sourceRevisionId");
     id(value.originalPrimaryReceiptId, "originalPrimaryReceiptId");
@@ -719,10 +845,26 @@ function archivedLookup(value: Record<string, unknown>): void {
       "originalPrimaryBindingEpoch",
       0,
     );
-    id(value.originalBackupReceiptId, "originalBackupReceiptId");
-    integer(value.originalBackupBindingEpoch, "originalBackupBindingEpoch", 0);
+    if (provider) {
+      id(value.originalProviderReferenceId, "originalProviderReferenceId");
+      integer(
+        value.originalProviderBindingEpoch,
+        "originalProviderBindingEpoch",
+        0,
+      );
+    } else {
+      id(value.originalBackupReceiptId, "originalBackupReceiptId");
+      integer(
+        value.originalBackupBindingEpoch,
+        "originalBackupBindingEpoch",
+        0,
+      );
+    }
     return;
   }
+  const provider =
+    "originalProviderReferenceId" in value ||
+    "originalProviderBindingEpoch" in value;
   exact(value, [
     "operation",
     "mode",
@@ -736,8 +878,9 @@ function archivedLookup(value: Record<string, unknown>): void {
     "archiveSetDigest",
     "originalPrimaryReceiptId",
     "originalPrimaryBindingEpoch",
-    "originalBackupReceiptId",
-    "originalBackupBindingEpoch",
+    ...(provider
+      ? ["originalProviderReferenceId", "originalProviderBindingEpoch"]
+      : ["originalBackupReceiptId", "originalBackupBindingEpoch"]),
     "parserPrimaryReceiptId",
     "parserPrimaryBindingEpoch",
     "parserBackupReceiptId",
@@ -750,7 +893,9 @@ function archivedLookup(value: Record<string, unknown>): void {
     "processingGenerationId",
     "ingestJobId",
     "originalPrimaryReceiptId",
-    "originalBackupReceiptId",
+    ...(provider
+      ? ["originalProviderReferenceId"]
+      : ["originalBackupReceiptId"]),
     "parserPrimaryReceiptId",
     "parserBackupReceiptId",
   ]) {
@@ -760,7 +905,9 @@ function archivedLookup(value: Record<string, unknown>): void {
   digest(value.archiveSetDigest, "archiveSetDigest");
   for (const field of [
     "originalPrimaryBindingEpoch",
-    "originalBackupBindingEpoch",
+    ...(provider
+      ? ["originalProviderBindingEpoch"]
+      : ["originalBackupBindingEpoch"]),
     "parserPrimaryBindingEpoch",
     "parserBackupBindingEpoch",
   ]) {
@@ -769,6 +916,9 @@ function archivedLookup(value: Record<string, unknown>): void {
 }
 
 function archivedAdmit(value: Record<string, unknown>): void {
+  const provider =
+    "originalProviderReferenceId" in value ||
+    "originalProviderBindingEpoch" in value;
   exact(value, [
     "operation",
     "workId",
@@ -782,8 +932,9 @@ function archivedAdmit(value: Record<string, unknown>): void {
     "archiveSetDigest",
     "originalPrimaryReceiptId",
     "originalPrimaryBindingEpoch",
-    "originalBackupReceiptId",
-    "originalBackupBindingEpoch",
+    ...(provider
+      ? ["originalProviderReferenceId", "originalProviderBindingEpoch"]
+      : ["originalBackupReceiptId", "originalBackupBindingEpoch"]),
     "parserPrimaryReceiptId",
     "parserPrimaryBindingEpoch",
     "parserBackupReceiptId",
@@ -800,7 +951,9 @@ function archivedAdmit(value: Record<string, unknown>): void {
     "processingGenerationId",
     "ingestJobId",
     "originalPrimaryReceiptId",
-    "originalBackupReceiptId",
+    ...(provider
+      ? ["originalProviderReferenceId"]
+      : ["originalBackupReceiptId"]),
     "parserPrimaryReceiptId",
     "parserBackupReceiptId",
   ]) {
@@ -810,7 +963,9 @@ function archivedAdmit(value: Record<string, unknown>): void {
   digest(value.archiveSetDigest, "archiveSetDigest");
   for (const field of [
     "originalPrimaryBindingEpoch",
-    "originalBackupBindingEpoch",
+    ...(provider
+      ? ["originalProviderBindingEpoch"]
+      : ["originalBackupBindingEpoch"]),
     "parserPrimaryBindingEpoch",
     "parserBackupBindingEpoch",
   ]) {
@@ -1128,6 +1283,12 @@ export function parseWorkerResponse(
       break;
     case "archive.ackDeletion":
       archiveDeletionAck(result, { operation: true, reused: true });
+      break;
+    case "providerOriginal.forgetTargets":
+      providerForgetTargets(result);
+      break;
+    case "providerOriginal.ackDetach":
+      providerDetachAck(result, { operation: true, reused: true });
       break;
     case "source.inventoryPage":
       inventory(result);

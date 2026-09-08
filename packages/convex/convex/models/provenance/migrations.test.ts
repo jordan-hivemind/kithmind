@@ -361,6 +361,69 @@ describe("legacy provenance audit", () => {
     });
   });
 
+  test("recognizes a closed provider-original parsed generation", async () => {
+    const f = await fixture();
+    const { generationId } = await insertParsedGeneration(f);
+    await f.t.run(async (ctx) => {
+      const generation = await ctx.db.get(generationId);
+      if (!generation) throw new Error("missing generation");
+      const referenceId = await ctx.db.insert(
+        "sourceProviderOriginalReferences",
+        {
+          spaceId: f.spaceId,
+          sourceAccountId: f.sourceAccountId,
+          sourceItemId: f.sourceItemId,
+          sourceRevisionId: generation.sourceRevisionId,
+          clientReferenceId: "01890a5d-ac96-7cc4-bb7e-6f4f5ca5c190",
+          requestDigest: "3".repeat(64),
+          referenceVersion: "provider_original_v1",
+          providerKind: "dropbox_v1",
+          referenceFingerprint: "4".repeat(64),
+          sourceContentHash: "5".repeat(64),
+          sourceByteLength: 10,
+          providerAccountIdHash: "6".repeat(64),
+          providerRootDirectoryIdHash: "7".repeat(64),
+          providerFileIdHash: "8".repeat(64),
+          providerRevision: "015f00feed",
+          providerContentHash: "9".repeat(64),
+          verifiedAt: 3,
+          locatorBindingId: "01890a5d-ac96-7cc4-bb7e-6f4f5ca5c191",
+          locatorManifestFingerprint: "a".repeat(64),
+          locatorRecipientFingerprint: "b".repeat(64),
+          locatorRepositoryKeyDomainFingerprint: "c".repeat(64),
+          locatorRepositoryId: "d".repeat(64),
+          locatorSnapshotId: "e".repeat(64),
+          locatorObjectName: "provider-locator.json.age",
+          locatorCiphertextHash: "f".repeat(64),
+          locatorCiphertextByteLength: 30,
+          locatorReadbackVerifiedAt: 3,
+          verificationAuthority: "worker_asserted",
+          userId: f.userId,
+          actorCredentialId: f.credentialId,
+          createdAt: 3,
+        },
+      );
+      await ctx.db.patch(generationId, {
+        originalBackupReceiptId: undefined,
+        originalProviderReferenceId: referenceId,
+        originalProviderBindingEpoch: 0,
+      });
+    });
+    await expect(
+      f.t.run((ctx) =>
+        auditFullLegacyPayloadPage(ctx, {
+          phase: "processing_generations",
+          cursor: null,
+          maxItems: 1,
+        }),
+      ),
+    ).resolves.toMatchObject({
+      applicable: 0,
+      invalidCount: 0,
+      pagePassed: true,
+    });
+  });
+
   test("reports partial binary generation metadata on inline text", async () => {
     const f = await fixture();
     const { generationId } = await insertParsedGeneration(f);

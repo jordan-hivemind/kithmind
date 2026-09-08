@@ -7,6 +7,7 @@ import { basename, dirname, isAbsolute, resolve } from "node:path";
 import {
   AGE_VERSION,
   DEFAULT_ARCHIVE_COMMAND_LIMITS,
+  RCLONE_VERSION,
   RESTIC_VERSION,
   type ArchiveCommandFailureCode,
   type ArchiveCommandLimits,
@@ -17,6 +18,9 @@ import {
   type ForgetResticBackupInput,
   type ForgetResticBackupResult,
   type LocalBackupBoundary,
+  type RemoteBackupBoundary,
+  type ResticRepositoryLocation,
+  type RcloneDropboxRepository,
   type PasswordCommand,
   type PreparedAgeObject,
   type PublishedAgeObject,
@@ -30,6 +34,7 @@ import {
   type RemovePublishedAgeObjectResult,
   type Sha256File,
 } from "./archiveTypes.js";
+import { verifyDropboxDirectoryBinding } from "./dropboxCredentials.js";
 
 const HEX_64 = /^[a-f0-9]{64}$/;
 const OPAQUE_ID = /^[A-Za-z0-9_-]{1,128}$/;
@@ -376,11 +381,12 @@ function child(
   executable: string,
   args: readonly string[],
   cwd?: string,
+  extraEnv?: Readonly<Record<string, string>>,
 ): ChildProcessWithoutNullStreams {
   return spawn(executable, args, {
     cwd,
     detached: true,
-    env: { LANG: "C", LC_ALL: "C" },
+    env: { LANG: "C", LC_ALL: "C", ...extraEnv },
     shell: false,
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -457,8 +463,9 @@ async function runBounded(
   args: readonly string[],
   commandLimits: ArchiveCommandLimits,
   cwd?: string,
+  extraEnv?: Readonly<Record<string, string>>,
 ): Promise<ProcessResult> {
-  const running = child(executable, args, cwd);
+  const running = child(executable, args, cwd, extraEnv);
   running.stdin.end();
   const stdoutPromise = collect(
     running.stdout,
@@ -490,8 +497,9 @@ async function runHashedOutput(
   args: readonly string[],
   maximumBytes: number,
   commandLimits: ArchiveCommandLimits,
+  extraEnv?: Readonly<Record<string, string>>,
 ): Promise<Sha256File> {
-  const running = child(executable, args);
+  const running = child(executable, args, undefined, extraEnv);
   running.stdin.end();
   const digest = createHash("sha256");
   let byteLength = 0;
@@ -1006,35 +1014,79 @@ async function passwordCommandArgument(
   return [command.executable, ...args].map(quoteShellWord).join(" ");
 }
 
-function resticBaseArgs(repository: string, passwordCommand: string): string[] {
+function resticBaseArgs(repository: string, passwordCommand: string, options: readonly string[] = []): string[] {
   return [
     "--repo",
     repository,
     "--password-command",
     passwordCommand,
     "--no-cache",
+    ...options,
   ];
 }
 
-async function probeResticRepositoryInternal(input: {
+type ResolvedRepository = {
+  locator: string;
+  options: string[];
+  environment?: Readonly<Record<string, string>>;
+  localPath?: string;
+  remoteBoundary?: Omit<RemoteBackupBoundary, "repositoryId">;
+};
+
+function location(input: ResticRepositoryLocation): ResticRepositoryLocation {
+  const local = typeof input.repositoryPath === "string";
+  const remote = input.repository !== undefined;
+  if (local === remote) fail("invalid_input", "exactly one restic repository is required");
+  return remote ? { repository: input.repository! } : { repositoryPath: input.repositoryPath! };
+}
+
+async function resolveRepository(input: ResticRepositoryLocation, commandLimits: ArchiveCommandLimits): Promise<ResolvedRepository> {
+  const selected = location(input);
+  if (selected.repositoryPath !== undefined) {
+    const localPath = safeAbsolutePath(selected.repositoryPath, "restic repository");
+    await safeDirectory(localPath, "restic repository");
+    return { locator: localPath, options: [], localPath };
+  }
+  const remote: RcloneDropboxRepository = selected.repository!;
+  if (remote.kind !== "rclone_dropbox_v1" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(remote.remoteName) || !/^[A-Za-z0-9 _.-]+(?:\/[A-Za-z0-9 _.-]+)+$/.test(remote.rootPath) || /[:\\]/.test(remote.rootPath) || remote.rootPath.split("/").some((part) => !part || part === "." || part === ".." || part.trim() !== part) || !HEX_64.test(remote.configIdentityFingerprint) || !HEX_64.test(remote.expectedRootDirectoryIdHash)) fail("invalid_input", "rclone Dropbox repository is invalid");
+  if (/\s|[\x00-\x1f\x7f]/.test(remote.rcloneBinary)) fail("invalid_input", "rclone binary path is unsafe");
+  try {
+    await verifyDropboxDirectoryBinding({
+      rcloneBinary: remote.rcloneBinary,
+      configPath: remote.configPath,
+      remoteName: remote.remoteName,
+      configIdentityFingerprint: remote.configIdentityFingerprint,
+      rootPath: remote.rootPath,
+      expectedRootDirectoryIdHash: remote.expectedRootDirectoryIdHash,
+    });
+  } catch {
+    fail("digest_mismatch", "Dropbox repository binding could not be verified");
+  }
+  const environment = { RCLONE_CONFIG: remote.configPath } as const;
+  return {
+    locator: `rclone:${remote.remoteName}:${remote.rootPath}`,
+    options: ["-o", `rclone.program=${remote.rcloneBinary}`, "-o", "rclone.args=serve restic --stdio --cache-objects=false"],
+    environment,
+    remoteBoundary: { mode: "independent_backup", readiness: "remote_repository_verified", backend: "rclone_dropbox_v1", remoteName: remote.remoteName, rootPath: remote.rootPath, rootDirectoryIdHash: remote.expectedRootDirectoryIdHash, configIdentityFingerprint: remote.configIdentityFingerprint, resticVersion: RESTIC_VERSION, rcloneVersion: RCLONE_VERSION },
+  };
+}
+
+async function probeResticRepositoryInternal(input: ResticRepositoryLocation & {
   resticBinary: string;
-  repositoryPath: string;
   passwordCommand: PasswordCommand;
   limits?: ArchiveCommandLimits;
 }): Promise<ResticRepositoryIdentity> {
   const commandLimits = limits(input.limits ?? DEFAULT_ARCHIVE_COMMAND_LIMITS);
   await validateExecutable(input.resticBinary, "restic binary");
   await requireResticVersion(input.resticBinary, commandLimits);
-  const repository = safeAbsolutePath(
-    input.repositoryPath,
-    "restic repository",
-  );
-  await safeDirectory(repository, "restic repository");
+  const repository = await resolveRepository(input, commandLimits);
   const password = await passwordCommandArgument(input.passwordCommand);
   const result = await runBounded(
     input.resticBinary,
-    [...resticBaseArgs(repository, password), "cat", "config"],
+    [...resticBaseArgs(repository.locator, password, repository.options), "cat", "config"],
     commandLimits,
+    undefined,
+    repository.environment,
   );
   try {
     return parseResticRepository(result.stdout);
@@ -1045,9 +1097,8 @@ async function probeResticRepositoryInternal(input: {
 }
 
 async function requireResticRepository(
-  input: {
+  input: ResticRepositoryLocation & {
     resticBinary: string;
-    repositoryPath: string;
     passwordCommand: PasswordCommand;
     limits?: ArchiveCommandLimits;
   },
@@ -1410,14 +1461,11 @@ async function readbackResticObjectInternal(
   const commandLimits = limits(input.limits ?? DEFAULT_ARCHIVE_COMMAND_LIMITS);
   await validateExecutable(input.resticBinary, "restic binary");
   await requireResticVersion(input.resticBinary, commandLimits);
-  const repository = safeAbsolutePath(
-    input.repositoryPath,
-    "restic repository",
-  );
+  const repository = await resolveRepository(input, commandLimits);
   const repositoryIdentity = await requireResticRepository(
     {
       resticBinary: input.resticBinary,
-      repositoryPath: repository,
+      ...location(input),
       passwordCommand: input.passwordCommand,
       limits: commandLimits,
     },
@@ -1434,13 +1482,14 @@ async function readbackResticObjectInternal(
   const restored = await runHashedOutput(
     input.resticBinary,
     [
-      ...resticBaseArgs(repository, password),
+      ...resticBaseArgs(repository.locator, password, repository.options),
       "dump",
       input.snapshotId,
       `/${input.objectName}`,
     ],
     commandLimits.maxCipherBytes,
     commandLimits,
+    repository.environment,
   );
   if (
     restored.sha256 !== expected.sha256 ||
@@ -1467,27 +1516,28 @@ async function backupResticObjectInternal(
   if (!OPAQUE_ID.test(input.operationId) || !OPAQUE_ID.test(input.host)) {
     fail("invalid_input", "backup operation identity is invalid");
   }
-  const repository = safeAbsolutePath(
-    input.repositoryPath,
-    "restic repository",
-  );
+  const repository = await resolveRepository(input, commandLimits);
+  if (
+    repository.remoteBoundary !== undefined &&
+    input.backupMode !== "independent_backup"
+  ) {
+    fail("invalid_input", "remote repository requires independent backup mode");
+  }
   const repositoryIdentity = await requireResticRepository(
     {
       resticBinary: input.resticBinary,
-      repositoryPath: repository,
+      ...location(input),
       passwordCommand: input.passwordCommand,
       limits: commandLimits,
     },
     input.expectedRepositoryId,
   );
-  const boundary = await assessLocalBackupBoundaryInternal(
-    input.primaryArchiveRoot,
-    repository,
-    input.backupMode,
-  );
-  const repositoryEntry = await safeDirectory(repository, "restic repository");
-  if (repositoryEntry.dev !== boundary.backupDevice) {
-    fail("unsafe_path", "backup repository device changed");
+  const boundary = repository.remoteBoundary
+    ? { ...repository.remoteBoundary, repositoryId: repositoryIdentity.repositoryId }
+    : await assessLocalBackupBoundaryInternal(input.primaryArchiveRoot, repository.localPath!, input.backupMode);
+  if (repository.localPath !== undefined) {
+    const repositoryEntry = await safeDirectory(repository.localPath, "restic repository");
+    if ("backupDevice" in boundary && repositoryEntry.dev !== boundary.backupDevice) fail("unsafe_path", "backup repository device changed");
   }
   const cipherPath = safeAbsolutePath(input.ciphertextPath, "ciphertext path");
   const objectName = basename(cipherPath);
@@ -1516,7 +1566,7 @@ async function backupResticObjectInternal(
     result = await runBounded(
       input.resticBinary,
       [
-        ...resticBaseArgs(repository, password),
+        ...resticBaseArgs(repository.locator, password, repository.options),
         "backup",
         "--json",
         "--host",
@@ -1527,12 +1577,13 @@ async function backupResticObjectInternal(
       ],
       commandLimits,
       dirname(cipherPath),
+      repository.environment,
     );
     const snapshotId = parseResticSummary(result.stdout, expected);
     await recheckFile(cipherPath, before.identity);
     await readbackResticObjectInternal({
       resticBinary: input.resticBinary,
-      repositoryPath: repository,
+      ...location(input),
       expectedRepositoryId: repositoryIdentity.repositoryId,
       passwordCommand: input.passwordCommand,
       snapshotId,
@@ -1573,14 +1624,11 @@ async function recoverResticBackupInternal(
     input.expectedCiphertext,
     commandLimits.maxCipherBytes,
   );
-  const repository = safeAbsolutePath(
-    input.repositoryPath,
-    "restic repository",
-  );
+  const repository = await resolveRepository(input, commandLimits);
   const repositoryIdentity = await requireResticRepository(
     {
       resticBinary: input.resticBinary,
-      repositoryPath: repository,
+      ...location(input),
       passwordCommand: input.passwordCommand,
       limits: commandLimits,
     },
@@ -1590,7 +1638,7 @@ async function recoverResticBackupInternal(
   const result = await runBounded(
     input.resticBinary,
     [
-      ...resticBaseArgs(repository, password),
+      ...resticBaseArgs(repository.locator, password, repository.options),
       "snapshots",
       "--json",
       "--host",
@@ -1599,6 +1647,8 @@ async function recoverResticBackupInternal(
       input.operationId,
     ],
     commandLimits,
+    undefined,
+    repository.environment,
   );
   let snapshotIds: string[];
   try {
@@ -1615,7 +1665,7 @@ async function recoverResticBackupInternal(
   for (const snapshotId of snapshotIds) {
     await readbackResticObjectInternal({
       resticBinary: input.resticBinary,
-      repositoryPath: repository,
+      ...location(input),
       expectedRepositoryId: repositoryIdentity.repositoryId,
       passwordCommand: input.passwordCommand,
       snapshotId,
@@ -1633,6 +1683,9 @@ async function recoverResticBackupInternal(
     resticVersion: RESTIC_VERSION,
     repositoryId: repositoryIdentity.repositoryId,
     verification: "destination_ciphertext_readback",
+    ...(repository.remoteBoundary === undefined
+      ? {}
+      : { boundary: { ...repository.remoteBoundary, repositoryId: repositoryIdentity.repositoryId } }),
   };
 }
 
@@ -1768,11 +1821,14 @@ async function listResticSnapshotsForDeletion(
   baseArgs: string[],
   args: string[],
   commandLimits: ArchiveCommandLimits,
+  environment?: Readonly<Record<string, string>>,
 ): Promise<ResticSnapshotRow[]> {
   const result = await runBounded(
     resticBinary,
     [...baseArgs, "snapshots", "--json", ...args],
     commandLimits,
+    undefined,
+    environment,
   );
   try {
     return parseResticSnapshotRows(result.stdout);
@@ -1790,6 +1846,7 @@ async function requireResticDeletionState(
     host: string;
     snapshotId: string;
     objectName: string;
+    environment?: Readonly<Record<string, string>>;
   },
   commandLimits: ArchiveCommandLimits,
 ): Promise<"present" | "absent"> {
@@ -1798,12 +1855,14 @@ async function requireResticDeletionState(
     input.baseArgs,
     ["--host", input.host, "--tag", input.operationId],
     commandLimits,
+    input.environment,
   );
   const snapshotRows = await listResticSnapshotsForDeletion(
     input.resticBinary,
     input.baseArgs,
     [input.snapshotId],
     commandLimits,
+    input.environment,
   );
   const expected = {
     operationId: input.operationId,
@@ -1837,21 +1896,18 @@ async function forgetResticBackupExactInternal(
     input.expectedCiphertext,
     commandLimits.maxCipherBytes,
   );
-  const repository = safeAbsolutePath(
-    input.repositoryPath,
-    "restic repository",
-  );
+  const repository = await resolveRepository(input, commandLimits);
   const repositoryIdentity = await requireResticRepository(
     {
       resticBinary: input.resticBinary,
-      repositoryPath: repository,
+      ...location(input),
       passwordCommand: input.passwordCommand,
       limits: commandLimits,
     },
     input.expectedRepositoryId,
   );
   const password = await passwordCommandArgument(input.passwordCommand);
-  const baseArgs = resticBaseArgs(repository, password);
+  const baseArgs = resticBaseArgs(repository.locator, password, repository.options);
   const identity = {
     resticBinary: input.resticBinary,
     baseArgs,
@@ -1859,12 +1915,13 @@ async function forgetResticBackupExactInternal(
     host: input.host,
     snapshotId: input.snapshotId,
     objectName: input.objectName,
+    environment: repository.environment,
   };
   const before = await requireResticDeletionState(identity, commandLimits);
   if (before === "present") {
     await readbackResticObjectInternal({
       resticBinary: input.resticBinary,
-      repositoryPath: repository,
+      ...location(input),
       expectedRepositoryId: repositoryIdentity.repositoryId,
       passwordCommand: input.passwordCommand,
       snapshotId: input.snapshotId,
@@ -1879,6 +1936,8 @@ async function forgetResticBackupExactInternal(
       ? [...baseArgs, "forget", input.snapshotId, "--prune"]
       : [...baseArgs, "prune"],
     commandLimits,
+    undefined,
+    repository.environment,
   );
   result.stdout.fill(0);
   result.stderr.fill(0);
@@ -1916,9 +1975,8 @@ export async function probeArchiveTools(
   );
 }
 
-export async function probeResticRepository(input: {
+export async function probeResticRepository(input: ResticRepositoryLocation & {
   resticBinary: string;
-  repositoryPath: string;
   passwordCommand: PasswordCommand;
   limits?: ArchiveCommandLimits;
 }): Promise<ResticRepositoryIdentity> {

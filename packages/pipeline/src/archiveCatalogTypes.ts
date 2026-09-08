@@ -90,27 +90,55 @@ export type OriginalCatalogIdentity = {
     byteLength: number;
     mediaType: "application/pdf";
   };
-  copies: {
-    primary: ArchiveCopyIntent;
-    independent_backup: ArchiveCopyIntent;
-  };
+  copies:
+    | { primary: ArchiveCopyIntent; independent_backup: ArchiveCopyIntent }
+    | { primary: ArchiveCopyIntent; independent_backup: never };
+  providerOriginal?: ProviderOriginalCatalog;
   createdAt: number;
 };
 
 export type OriginalCatalogRow = Omit<OriginalCatalogIdentity, "copies"> & {
   rowRevision: number;
-  copies: {
-    primary: ArchiveCopyRecord;
-    independent_backup: ArchiveCopyRecord;
-  };
+  copies:
+    | { primary: ArchiveCopyRecord; independent_backup: ArchiveCopyRecord }
+    | { primary: ArchiveCopyRecord; independent_backup: never };
+  providerOriginal?: ProviderOriginalCatalog;
   cloud?: {
     sourceItemId: string;
     sourceRevisionId: string;
     primaryReceiptId: string;
-    backupReceiptId: string;
     admittedAt: number;
-  };
+  } & (
+    | {
+        backupReceiptId: string;
+        providerReferenceId?: never;
+        providerBindingEpoch?: never;
+      }
+    | {
+        backupReceiptId?: never;
+        providerReferenceId: string;
+        providerBindingEpoch: number;
+      }
+  );
   updatedAt: number;
+};
+
+export type ProviderOriginalCatalog = {
+  clientReferenceId: string;
+  bindingId: string;
+  locator: ArchiveCopyRecord;
+  verified?: {
+    providerAccountIdHash: string;
+    providerRootDirectoryIdHash: string;
+    providerFileIdHash: string;
+    providerRevision: string;
+    providerContentHash: string;
+    sourceContentHash: string;
+    sourceByteLength: number;
+    verifiedAt: number;
+    manifestFingerprint: string;
+    manifestByteLength: number;
+  };
 };
 
 export type OriginalReuseIdentity = {

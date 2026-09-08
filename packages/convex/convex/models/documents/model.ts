@@ -9,6 +9,7 @@ import {
   parseSourceRevisionRepresentation,
   parseSourceTextRepresentation,
 } from "../provenance/representations";
+import { loadProviderOriginalReference } from "../provenance/providerOriginals";
 
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 25;
@@ -189,6 +190,91 @@ async function loadReadableDocument(
     return null;
   }
   return { item, revision, textVersion, generation, account };
+}
+
+async function originalRecoveryStatus(
+  ctx: Pick<QueryCtx, "db">,
+  generation: Doc<"processingGenerations">,
+) {
+  const receiptMatches = (
+    receipt: Doc<"sourceArtifactArchiveReceipts"> | null,
+    copyRole: "primary" | "independent_backup",
+  ) =>
+    Boolean(
+      receipt &&
+        receipt.spaceId === generation.spaceId &&
+        receipt.sourceAccountId === generation.sourceAccountId &&
+        receipt.sourceItemId === generation.sourceItemId &&
+        receipt.sourceRevisionId === generation.sourceRevisionId &&
+        receipt.subjectKind === "original_bytes" &&
+        receipt.copyRole === copyRole &&
+        receipt.parserArtifactId === undefined,
+    );
+  if (
+    generation.originalPrimaryReceiptId === undefined ||
+    generation.archiveSetDigest === undefined
+  )
+    return undefined;
+  if (generation.originalBackupReceiptId !== undefined) {
+    if (
+      generation.originalProviderReferenceId !== undefined ||
+      generation.originalProviderBindingEpoch !== undefined
+    )
+      return undefined;
+    const [primary, independentBackup] = await Promise.all([
+      ctx.db.get(generation.originalPrimaryReceiptId),
+      ctx.db.get(generation.originalBackupReceiptId),
+    ]);
+    return {
+      kind: "archive_pair_v1" as const,
+      primary: receiptMatches(primary, "primary"),
+      independentBackup: receiptMatches(
+        independentBackup,
+        "independent_backup",
+      ),
+    };
+  }
+  if (
+    generation.originalProviderReferenceId === undefined ||
+    generation.originalProviderBindingEpoch === undefined
+  )
+    return undefined;
+  const [primary, reference] = await Promise.all([
+    ctx.db.get(generation.originalPrimaryReceiptId),
+    ctx.db.get(generation.originalProviderReferenceId),
+  ]);
+  if (
+    !receiptMatches(primary, "primary") ||
+    !reference ||
+    reference.spaceId !== generation.spaceId ||
+    reference.sourceAccountId !== generation.sourceAccountId ||
+    reference.sourceItemId !== generation.sourceItemId ||
+    reference.sourceRevisionId !== generation.sourceRevisionId
+  )
+    return undefined;
+  let hasAdmissionAudit = false;
+  try {
+    await loadProviderOriginalReference(ctx, {
+      referenceId: reference._id,
+      spaceId: generation.spaceId,
+      sourceAccountId: generation.sourceAccountId,
+      sourceItemId: generation.sourceItemId,
+      sourceRevisionId: generation.sourceRevisionId,
+    });
+    hasAdmissionAudit = true;
+  } catch {
+    // A corrupt immutable reference is reported without exposing provider data.
+  }
+  return {
+    kind: "provider_original_v1" as const,
+    localPrimaryArchived: true,
+    providerVerification: hasAdmissionAudit
+      ? ("verified_at_admission" as const)
+      : ("audit_unavailable" as const),
+    verifiedAt: reference.verifiedAt,
+    continuousAvailability: false as const,
+    desktopRecoveryRequired: true as const,
+  };
 }
 
 async function hydrateCitations(
@@ -434,6 +520,7 @@ export async function searchDocuments(
     citationPartial ||=
       citationResult.invalidCitations || citationResult.byteBudgetTruncated;
     seenDocuments.add(document._id);
+    const recovery = await originalRecoveryStatus(ctx, chain.generation);
     results.push({
       spaceId: document.spaceId,
       sourceAccountId: chain.account._id,
@@ -456,6 +543,7 @@ export async function searchDocuments(
       sourceAvailability: chain.item.lifecycle,
       originalLinkAvailable: chain.item.originalLinkAvailable,
       retainedTextAvailable: true,
+      ...(recovery ? { originalRecovery: recovery } : {}),
       vectorStatus: semanticReady
         ? ("ready" as const)
         : ("unavailable" as const),
@@ -563,6 +651,7 @@ export async function getDocument(
     pages.length !== pageRows.length ||
     validatedEvidenceSpanIds.length !== allowedEvidence.size ||
     citationBudgetTruncated;
+  const recovery = await originalRecoveryStatus(ctx, chain.generation);
   return {
     spaceId: document.spaceId,
     sourceAccountId: chain.account._id,
@@ -584,6 +673,7 @@ export async function getDocument(
     originalLinkAvailable: chain.item.originalLinkAvailable,
     originalUri: chain.item.uri,
     retainedTextAvailable: true,
+    ...(recovery ? { originalRecovery: recovery } : {}),
     archiveRef: chain.revision.archiveRef,
     contentHash: chain.revision.contentHash,
     contentHashAuthority:
@@ -863,6 +953,9 @@ export async function listSources(
         generation.state === "ready" &&
         generation.deactivatedAt === undefined,
       );
+      const recovery = generation
+        ? await originalRecoveryStatus(ctx, generation)
+        : undefined;
       items.push({
         sourceItemId: item._id,
         externalId: item.externalId,
@@ -885,6 +978,7 @@ export async function listSources(
             : ("ready" as const),
         originalLinkAvailable: item.originalLinkAvailable,
         retainedTextAvailable,
+        ...(recovery ? { originalRecovery: recovery } : {}),
         lastFailure: item.lastFailure,
       });
     }

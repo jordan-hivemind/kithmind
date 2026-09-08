@@ -22,6 +22,8 @@ import {
   inspectParserOutputIntent,
   removeParserOutputExact,
 } from "./parserProcess.js";
+import { providerOriginalReferenceFingerprint } from "./archivedRequestMapping.js";
+import { removeProviderBindingExact } from "./providerRegistry.js";
 import {
   inspectSpoolIntentState,
   removeNormalizedBundleSpoolExact,
@@ -46,7 +48,10 @@ type CloudAck = {
   forgetEpoch: number;
   objectOutcome: "deleted" | "already_missing";
   backupOutcome?: "deleted" | "already_missing";
-  absenceAuthority: "worker_asserted_physical_absence";
+  absenceAuthority:
+    | "worker_asserted_physical_absence"
+    | "worker_asserted_live_repository_absence";
+  retentionDisclosure?: "provider_retained_deleted_history_possible";
   completedAt: number;
 };
 
@@ -79,6 +84,41 @@ type AckResult = CloudAck & {
   reused: boolean;
 };
 
+type ProviderAck = {
+  detachId: string;
+  referenceId: string;
+  forgetEpoch: number;
+  referenceOutcome: "detached" | "already_detached";
+  locatorBundleOutcome: "deleted" | "already_missing";
+  locatorAbsenceAuthority: "worker_asserted_live_repository_absence";
+  retentionDisclosure: "provider_retained_deleted_history_possible";
+  providerSourceOutcome: "retained_unchanged";
+  completedAt: number;
+};
+
+type ProviderTarget = {
+  referenceId: string;
+  referenceFingerprint: string;
+  locatorBindingId: string;
+  locatorRepositoryId: string;
+  locatorSnapshotId: string;
+  locatorObjectName: string;
+  locatorCiphertextHash: string;
+  locatorCiphertextByteLength: number;
+  forgetEpoch: number;
+  ack?: ProviderAck;
+};
+
+type ProviderForgetPage = {
+  operation: "providerOriginal.forgetTargets";
+  sourceItemId: string;
+  sourceExternalIdHash: string;
+  forgetEpoch: number;
+  targets: ProviderTarget[];
+  isDone: boolean;
+  continueCursor: string;
+};
+
 type SelectedRow =
   | { subject: "original_bytes"; row: OriginalCatalogRow }
   | { subject: "parser_output"; row: ProcessingCatalogRow };
@@ -96,6 +136,9 @@ export type ArchiveForgetResult =
       receiptCount: number;
       acknowledgedCount: number;
       localCopyCount: number;
+      providerReferenceCount?: number;
+      providerOriginalOutcome?: "provider_original_reference_detached_source_retained";
+      retainedProviderHistoryPossible?: true;
       nextAction: "run_authenticated_owner_continue_forget";
     }
   | {
@@ -112,6 +155,7 @@ export type ArchiveForgetCommands = {
   inspectParserIntent: typeof inspectParserOutputIntent;
   inspectSpoolIntent: typeof inspectSpoolIntentState;
   removeSpool: typeof removeNormalizedBundleSpoolExact;
+  removeProviderBinding: typeof removeProviderBindingExact;
 };
 
 const defaultCommands: ArchiveForgetCommands = {
@@ -123,6 +167,7 @@ const defaultCommands: ArchiveForgetCommands = {
   inspectParserIntent: inspectParserOutputIntent,
   inspectSpoolIntent: inspectSpoolIntentState,
   removeSpool: removeNormalizedBundleSpoolExact,
+  removeProviderBinding: removeProviderBindingExact,
 };
 
 function sha256(value: string): string {
@@ -164,7 +209,15 @@ function operationalFailure(error: unknown): ArchiveForgetResult {
     code === "spool_unpublished" ||
     code === "lost_spool_result" ||
     code === "lost_capture_result" ||
-    code === "parser_intent_changed"
+    code === "parser_intent_changed" ||
+    code === "provider_locator_incomplete" ||
+    code === "provider_locator_configuration_missing" ||
+    code === "provider_target_identity_mismatch" ||
+    code === "provider_ack_identity_mismatch" ||
+    code === "provider_reference_set_mismatch" ||
+    code === "provider_reference_set_changed" ||
+    code === "provider_ack_not_observed" ||
+    code === "provider_forget_authority_missing"
   )
     return { state: "needs_review", code };
   return { state: "failed", code };
@@ -257,6 +310,71 @@ async function validateForgetAuthority(input: {
     throw { code: "forget_authority_changed" };
 }
 
+async function enumerateProviderTargets(input: {
+  config: PipelineConfig;
+  transport: WorkerTransport;
+  sourceItemId: string;
+  forgetEpoch: number;
+}): Promise<{ sourceExternalIdHash: string; targets: ProviderTarget[] }> {
+  let cursor: string | null = null;
+  let sourceExternalIdHash: string | undefined;
+  const seenCursors = new Set<string>();
+  const seenReferences = new Set<string>();
+  const targets: ProviderTarget[] = [];
+  for (let pageNumber = 0; pageNumber < MAX_PAGES; pageNumber += 1) {
+    const response = await input.transport.call({
+      protocolVersion: 1,
+      operation: "providerOriginal.forgetTargets",
+      spaceId: input.config.spaceId,
+      sourceAccountId: input.config.sourceAccountId,
+      requestId: randomUUID(),
+      sourceItemId: input.sourceItemId,
+      expectedForgetEpoch: input.forgetEpoch,
+      paginationOpts: { cursor, numItems: 4 },
+    });
+    if (isWorkerError(response)) throw { code: response.error.code };
+    const page = response as ProviderForgetPage;
+    if (
+      page.operation !== "providerOriginal.forgetTargets" ||
+      page.sourceItemId !== input.sourceItemId ||
+      page.forgetEpoch !== input.forgetEpoch ||
+      !SHA256.test(page.sourceExternalIdHash)
+    )
+      throw { code: "invalid_response" };
+    if (
+      sourceExternalIdHash !== undefined &&
+      page.sourceExternalIdHash !== sourceExternalIdHash
+    )
+      throw { code: "invalid_response" };
+    sourceExternalIdHash = page.sourceExternalIdHash;
+    for (const target of page.targets) {
+      if (seenReferences.has(target.referenceId))
+        throw { code: "duplicate_provider_reference" };
+      seenReferences.add(target.referenceId);
+      targets.push(target);
+      if (targets.length > MAX_TARGETS) throw { code: "target_limit" };
+    }
+    if (page.isDone) return { sourceExternalIdHash, targets };
+    if (!page.continueCursor || seenCursors.has(page.continueCursor))
+      throw { code: "cursor_cycle" };
+    seenCursors.add(page.continueCursor);
+    cursor = page.continueCursor;
+  }
+  throw { code: "page_limit" };
+}
+
+async function validateProviderForgetAuthority(input: {
+  config: PipelineConfig;
+  transport: WorkerTransport;
+  sourceItemId: string;
+  forgetEpoch: number;
+  sourceExternalIdHash: string;
+}): Promise<void> {
+  const page = await enumerateProviderTargets({ ...input });
+  if (page.sourceExternalIdHash !== input.sourceExternalIdHash)
+    throw { code: "forget_authority_changed" };
+}
+
 function copyKey(subject: ArchiveSubject, catalogId: string, role: string) {
   return `${subject}\0${catalogId}\0${role}`;
 }
@@ -296,7 +414,10 @@ function selectedRows(
 
 function allCopies(rows: SelectedRow[]): MatchedCopy[] {
   return rows.flatMap((selected) =>
-    (["primary", "independent_backup"] as const).map((role) => ({
+    (selected.subject === "original_bytes" && selected.row.providerOriginal
+      ? (["primary"] as const)
+      : (["primary", "independent_backup"] as const)
+    ).map((role) => ({
       ...selected,
       role,
       copy: selected.row.copies[role],
@@ -356,6 +477,120 @@ function reconcileTargets(rows: SelectedRow[], targets: CloudTarget[]) {
   return matched;
 }
 
+function providerDeclarationForForget(row: OriginalCatalogRow) {
+  const provider = row.providerOriginal;
+  const verified = provider?.verified;
+  const locator = provider?.locator;
+  if (
+    !provider ||
+    !verified ||
+    !locator?.published ||
+    !locator.backup ||
+    locator.readbackVerifiedAt === undefined
+  )
+    throw { code: "provider_locator_incomplete" };
+  return {
+    referenceVersion: "provider_original_v1" as const,
+    providerKind: "dropbox_v1" as const,
+    clientReferenceId: provider.clientReferenceId,
+    sourceContentHash: verified.sourceContentHash,
+    sourceByteLength: verified.sourceByteLength,
+    providerAccountIdHash: verified.providerAccountIdHash,
+    providerRootDirectoryIdHash: verified.providerRootDirectoryIdHash,
+    providerFileIdHash: verified.providerFileIdHash,
+    providerRevision: verified.providerRevision,
+    providerContentHash: verified.providerContentHash,
+    verifiedAt: verified.verifiedAt,
+    locatorBundle: {
+      bindingId: provider.bindingId,
+      manifestFingerprint: verified.manifestFingerprint,
+      recipientFingerprint: locator.recipientFingerprint,
+      repositoryKeyDomainFingerprint: locator.repositoryKeyDomainFingerprint,
+      repositoryId: locator.backup.repositoryId,
+      snapshotId: locator.backup.snapshotId,
+      objectName: locator.objectName,
+      ciphertextHash: locator.published.ciphertext.sha256,
+      ciphertextByteLength: locator.published.ciphertext.byteLength,
+      readbackVerifiedAt: locator.readbackVerifiedAt,
+    },
+    createdAt: row.createdAt,
+  };
+}
+
+function reconcileProviderTargets(
+  rows: SelectedRow[],
+  targets: ProviderTarget[],
+) {
+  const originals = rows.filter(
+    (
+      selected,
+    ): selected is { subject: "original_bytes"; row: OriginalCatalogRow } =>
+      selected.subject === "original_bytes" &&
+      selected.row.providerOriginal !== undefined,
+  );
+  const matched = new Map<string, OriginalCatalogRow>();
+  for (const target of targets) {
+    const candidates = originals.filter(({ row }) => {
+      const cloud = row.cloud;
+      if (
+        !cloud ||
+        !("providerReferenceId" in cloud) ||
+        cloud.providerReferenceId !== target.referenceId
+      )
+        return false;
+      const declaration = providerDeclarationForForget(row);
+      return (
+        providerOriginalReferenceFingerprint(declaration) ===
+          target.referenceFingerprint &&
+        declaration.locatorBundle.bindingId === target.locatorBindingId &&
+        declaration.locatorBundle.repositoryId === target.locatorRepositoryId &&
+        declaration.locatorBundle.snapshotId === target.locatorSnapshotId &&
+        declaration.locatorBundle.objectName === target.locatorObjectName &&
+        declaration.locatorBundle.ciphertextHash ===
+          target.locatorCiphertextHash &&
+        declaration.locatorBundle.ciphertextByteLength ===
+          target.locatorCiphertextByteLength
+      );
+    });
+    if (candidates.length !== 1)
+      throw { code: "provider_target_identity_mismatch" };
+    const providerCopy = candidates[0]!.row.providerOriginal!.locator;
+    if (
+      providerCopy.reviewCode ||
+      !providerCopy.prepared ||
+      !providerCopy.published ||
+      !providerCopy.backup ||
+      (providerCopy.deletion &&
+        (providerCopy.deletion.reason !== "forget" ||
+          providerCopy.deletion.forgetEpoch !== target.forgetEpoch))
+    )
+      throw { code: "provider_locator_incomplete" };
+    matched.set(target.referenceId, candidates[0]!.row);
+    const deletion = providerCopy.deletion;
+    if (
+      target.ack &&
+      (!deletion ||
+        deletion.state !== "complete" ||
+        deletion.reason !== "forget" ||
+        deletion.forgetEpoch !== target.forgetEpoch ||
+        deletion.deletionId !== target.ack.detachId ||
+        deletion.backup !== target.ack.locatorBundleOutcome)
+    )
+      throw { code: "provider_ack_identity_mismatch" };
+  }
+  for (const { row } of originals) {
+    if (
+      row.cloud &&
+      "providerReferenceId" in row.cloud &&
+      !targets.some(
+        (target) => target.referenceId === row.cloud!.providerReferenceId,
+      )
+    )
+      throw { code: "provider_reference_set_mismatch" };
+  }
+  return matched;
+}
+
 function catalogId(selected: SelectedRow): string {
   return selected.subject === "original_bytes"
     ? selected.row.originalCatalogId
@@ -379,7 +614,11 @@ function currentRow(
 
 function preflightCopies(rows: SelectedRow[], forgetEpoch: number): void {
   for (const selected of rows) {
-    for (const role of ["primary", "independent_backup"] as const) {
+    const roles =
+      selected.subject === "original_bytes" && selected.row.providerOriginal
+        ? (["primary"] as const)
+        : (["primary", "independent_backup"] as const);
+    for (const role of roles) {
       const copy = selected.row.copies[role];
       if (copy.reviewCode) throw { code: copy.reviewCode };
       if (copy.preparationIntent && !copy.prepared)
@@ -469,9 +708,17 @@ async function deleteCopy(input: {
     )
       throw { code: "backup_identity_mismatch" };
     await input.authorize();
+    const configuredBackup = input.config.archive.independentBackup;
+    if (
+      "repository" in configuredBackup &&
+      selected.subject !== "parser_output"
+    )
+      throw { code: "archive_remote_original_unsupported" };
     const result = await input.commands.forgetBackup({
-      resticBinary: input.config.archive.independentBackup.resticBinary,
-      repositoryPath: input.config.archive.independentBackup.repositoryPath,
+      resticBinary: configuredBackup.resticBinary,
+      ...("repository" in configuredBackup
+        ? { repository: configuredBackup.repository! }
+        : { repositoryPath: configuredBackup.repositoryPath }),
       expectedRepositoryId:
         input.config.archive.independentBackup.expectedRepositoryId,
       passwordCommand: input.config.archive.independentBackup.passwordCommand,
@@ -512,6 +759,128 @@ async function deleteCopy(input: {
     ...(backup === undefined ? {} : { backup }),
   });
   return true;
+}
+
+async function deleteProviderLocator(input: {
+  pdf: PdfDocQaConfig;
+  catalog: ArchiveCatalog;
+  row: OriginalCatalogRow;
+  target: ProviderTarget;
+  forgetEpoch: number;
+  commands: ArchiveForgetCommands;
+  now: () => number;
+  authorize: () => Promise<void>;
+}): Promise<{
+  row: OriginalCatalogRow;
+  deletion: Extract<ArchiveCopyRecord["deletion"], { state: "complete" }>;
+}> {
+  const providerConfig = input.pdf.providerOriginal;
+  if (
+    !input.row.providerOriginal ||
+    !providerConfig ||
+    !("repository" in input.pdf.archive.independentBackup)
+  )
+    throw { code: "provider_locator_configuration_missing" };
+  let row = input.catalog
+    .listOriginals()
+    .find((value) => value.originalCatalogId === input.row.originalCatalogId);
+  if (!row?.providerOriginal) throw { code: "catalog_not_found" };
+  let copy = row.providerOriginal.locator;
+  if (
+    copy.reviewCode ||
+    !copy.prepared ||
+    !copy.published ||
+    !copy.backup ||
+    !copy.restic
+  )
+    throw { code: "provider_locator_incomplete" };
+  if (
+    copy.deletion &&
+    (copy.deletion.reason !== "forget" ||
+      copy.deletion.forgetEpoch !== input.forgetEpoch)
+  )
+    throw { code: "deletion_identity_conflict" };
+  if (!copy.deletion) {
+    row = await input.catalog.updateProviderLocator({
+      catalogId: row.originalCatalogId,
+      expectedRevision: row.rowRevision,
+      update: (value) => {
+        value.deletion = {
+          state: "pending",
+          deletionId: randomUUID(),
+          reason: "forget",
+          plannedAt: input.now(),
+          forgetEpoch: input.forgetEpoch,
+        };
+      },
+    });
+    copy = row.providerOriginal!.locator;
+  }
+  if (copy.deletion?.state !== "complete") {
+    const restic = copy.restic;
+    const prepared = copy.prepared;
+    const published = copy.published;
+    if (!restic || !prepared || !published)
+      throw { code: "provider_locator_incomplete" };
+    await input.authorize();
+    const backup = await input.commands.forgetBackup({
+      resticBinary: input.pdf.archive.independentBackup.resticBinary,
+      repository: input.pdf.archive.independentBackup.repository!,
+      expectedRepositoryId: input.target.locatorRepositoryId,
+      passwordCommand: input.pdf.archive.independentBackup.passwordCommand,
+      operationId: restic.operationId,
+      host: restic.host,
+      snapshotId: input.target.locatorSnapshotId,
+      objectName: input.target.locatorObjectName,
+      expectedCiphertext: {
+        sha256: input.target.locatorCiphertextHash,
+        byteLength: input.target.locatorCiphertextByteLength,
+      },
+    });
+    await input.authorize();
+    const object = await input.commands.removeAge({
+      objectPath: join(
+        input.pdf.archive.independentBackup.directory,
+        copy.objectName,
+      ),
+      expectedDirectory: {
+        device: prepared.archiveDirectoryDevice,
+        inode: prepared.archiveDirectoryInode,
+      },
+      expectedFile: {
+        device: published.ciphertextDevice,
+        inode: published.ciphertextInode,
+        sha256: published.ciphertext.sha256,
+        byteLength: published.ciphertext.byteLength,
+      },
+    });
+    const deletion = copy.deletion!;
+    row = await input.catalog.updateProviderLocator({
+      catalogId: row.originalCatalogId,
+      expectedRevision: row.rowRevision,
+      update: (value) => {
+        value.deletion = {
+          ...deletion,
+          state: "complete",
+          completedAt: input.now(),
+          object: object.outcome,
+          backup: backup.outcome,
+        };
+      },
+    });
+    copy = row.providerOriginal!.locator;
+  }
+  const deletion = copy.deletion;
+  if (deletion?.state !== "complete" || deletion.backup === undefined)
+    throw { code: "local_deletion_incomplete" };
+  await input.authorize();
+  await input.commands.removeProviderBinding({
+    registryDirectory: providerConfig.registryDirectory,
+    bindingId: input.target.locatorBindingId,
+    manifestFingerprint: row.providerOriginal!.verified!.manifestFingerprint,
+    manifestByteLength: row.providerOriginal!.verified!.manifestByteLength,
+  });
+  return { row, deletion };
 }
 
 function parserArtifacts(
@@ -672,6 +1041,19 @@ export async function runArchiveForget(input: {
       input.sourceExternalId,
       input.sourceItemId,
     );
+    const hasProviderOriginal = rows.some(
+      (selected) =>
+        selected.subject === "original_bytes" &&
+        selected.row.providerOriginal !== undefined,
+    );
+    const providerFirst = hasProviderOriginal
+      ? await enumerateProviderTargets(input)
+      : undefined;
+    if (
+      providerFirst &&
+      providerFirst.sourceExternalIdHash !== first.sourceExternalIdHash
+    )
+      throw { code: "source_identity_conflict" };
     preflightCopies(rows, input.forgetEpoch);
     await preflightPlaintext({
       pdf: input.config.pdfDocQa,
@@ -679,6 +1061,9 @@ export async function runArchiveForget(input: {
       commands,
     });
     const matches = reconcileTargets(rows, first.targets);
+    const providerMatches = providerFirst
+      ? reconcileProviderTargets(rows, providerFirst.targets)
+      : new Map<string, OriginalCatalogRow>();
     const authorize = async () =>
       await validateForgetAuthority({
         config: input.config,
@@ -687,6 +1072,16 @@ export async function runArchiveForget(input: {
         forgetEpoch: input.forgetEpoch,
         sourceExternalIdHash: first.sourceExternalIdHash,
       });
+    const authorizeProvider = async () => {
+      if (!providerFirst) throw { code: "provider_forget_authority_missing" };
+      await validateProviderForgetAuthority({
+        config: input.config,
+        transport: input.transport,
+        sourceItemId: input.sourceItemId,
+        forgetEpoch: input.forgetEpoch,
+        sourceExternalIdHash: providerFirst.sourceExternalIdHash,
+      });
+    };
     const targetsByCopy = new Map<string, CloudTarget>();
     for (const target of first.targets) {
       const matched = matches.get(target.receiptId)!;
@@ -697,7 +1092,11 @@ export async function runArchiveForget(input: {
     }
     let localCopyCount = 0;
     for (const selected of rows) {
-      for (const role of ["primary", "independent_backup"] as const) {
+      const roles =
+        selected.subject === "original_bytes" && selected.row.providerOriginal
+          ? (["primary"] as const)
+          : (["primary", "independent_backup"] as const);
+      for (const role of roles) {
         if (
           await deleteCopy({
             config: input.config.pdfDocQa,
@@ -716,6 +1115,71 @@ export async function runArchiveForget(input: {
           localCopyCount += 1;
       }
     }
+    for (const target of providerFirst?.targets ?? []) {
+      const row = providerMatches.get(target.referenceId)!;
+      const local = await deleteProviderLocator({
+        pdf: input.config.pdfDocQa,
+        catalog: input.catalog,
+        row,
+        target,
+        forgetEpoch: input.forgetEpoch,
+        commands,
+        now,
+        authorize: authorizeProvider,
+      });
+      if (target.ack) {
+        if (
+          target.ack.detachId !== local.deletion.deletionId ||
+          target.ack.locatorBundleOutcome !== local.deletion.backup ||
+          target.ack.locatorAbsenceAuthority !==
+            "worker_asserted_live_repository_absence" ||
+          target.ack.retentionDisclosure !==
+            "provider_retained_deleted_history_possible" ||
+          target.ack.providerSourceOutcome !== "retained_unchanged"
+        )
+          throw { code: "provider_ack_identity_mismatch" };
+        continue;
+      }
+      const response = await input.transport.call({
+        protocolVersion: 1,
+        operation: "providerOriginal.ackDetach",
+        spaceId: input.config.spaceId,
+        sourceAccountId: input.config.sourceAccountId,
+        requestId: local.deletion.deletionId,
+        sourceItemId: input.sourceItemId,
+        expectedForgetEpoch: input.forgetEpoch,
+        detachId: local.deletion.deletionId,
+        referenceId: target.referenceId,
+        locatorBindingId: target.locatorBindingId,
+        locatorRepositoryId: target.locatorRepositoryId,
+        locatorSnapshotId: target.locatorSnapshotId,
+        locatorObjectName: target.locatorObjectName,
+        referenceOutcome: "detached",
+        locatorBundleOutcome: local.deletion.backup,
+        locatorAbsenceAuthority: "worker_asserted_live_repository_absence",
+        retentionDisclosure: "provider_retained_deleted_history_possible",
+        providerSourceOutcome: "retained_unchanged",
+      });
+      if (isWorkerError(response)) throw { code: response.error.code };
+      const ack = response as ProviderAck & {
+        operation: "providerOriginal.ackDetach";
+        reused: boolean;
+      };
+      if (
+        ack.operation !== "providerOriginal.ackDetach" ||
+        ack.detachId !== local.deletion.deletionId ||
+        ack.referenceId !== target.referenceId ||
+        ack.forgetEpoch !== input.forgetEpoch ||
+        ack.referenceOutcome !== "detached" ||
+        ack.locatorBundleOutcome !== local.deletion.backup ||
+        ack.locatorAbsenceAuthority !==
+          "worker_asserted_live_repository_absence" ||
+        ack.retentionDisclosure !==
+          "provider_retained_deleted_history_possible" ||
+        ack.providerSourceOutcome !== "retained_unchanged"
+      )
+        throw { code: "provider_ack_identity_mismatch" };
+    }
     for (const selected of rows) {
       if (selected.subject === "parser_output")
         await removePlaintext({
@@ -730,11 +1194,23 @@ export async function runArchiveForget(input: {
       const current = currentRow(input.catalog, matched);
       const copy = current.row.copies[target.copyRole];
       const deletion = completeDeletion(copy, input.forgetEpoch);
+      const liveRepository =
+        matched.subject === "parser_output" &&
+        matched.role === "independent_backup" &&
+        "repository" in input.config.pdfDocQa.archive.independentBackup;
+      const expectedAuthority = liveRepository
+        ? ("worker_asserted_live_repository_absence" as const)
+        : ("worker_asserted_physical_absence" as const);
+      const expectedDisclosure = liveRepository
+        ? ("provider_retained_deleted_history_possible" as const)
+        : undefined;
       if (target.ack) {
         if (
           target.ack.deletionId !== deletion.deletionId ||
           target.ack.objectOutcome !== deletion.object ||
-          target.ack.backupOutcome !== deletion.backup
+          target.ack.backupOutcome !== deletion.backup ||
+          target.ack.absenceAuthority !== expectedAuthority ||
+          target.ack.retentionDisclosure !== expectedDisclosure
         )
           throw { code: "ack_identity_mismatch" };
         continue;
@@ -753,6 +1229,12 @@ export async function runArchiveForget(input: {
         ...(deletion.backup === undefined
           ? {}
           : { backupOutcome: deletion.backup }),
+        ...(liveRepository
+          ? {
+              absenceAuthority: expectedAuthority,
+              retentionDisclosure: expectedDisclosure,
+            }
+          : {}),
       });
       if (isWorkerError(response)) throw { code: response.error.code };
       const ack = response as AckResult;
@@ -763,11 +1245,15 @@ export async function runArchiveForget(input: {
         ack.forgetEpoch !== input.forgetEpoch ||
         ack.objectOutcome !== deletion.object ||
         ack.backupOutcome !== deletion.backup ||
-        ack.absenceAuthority !== "worker_asserted_physical_absence"
+        ack.absenceAuthority !== expectedAuthority ||
+        ack.retentionDisclosure !== expectedDisclosure
       )
         throw { code: "ack_identity_mismatch" };
     }
     const final = await enumerateTargets(input);
+    const providerFinal = providerFirst
+      ? await enumerateProviderTargets(input)
+      : undefined;
     if (
       final.sourceExternalIdHash !== first.sourceExternalIdHash ||
       final.targets.length !== first.targets.length
@@ -777,6 +1263,20 @@ export async function runArchiveForget(input: {
       rows.map((selected) => currentRow(input.catalog, selected)),
       final.targets,
     );
+    if (providerFinal) {
+      if (
+        providerFinal.sourceExternalIdHash !==
+          providerFirst!.sourceExternalIdHash ||
+        providerFinal.targets.length !== providerFirst!.targets.length
+      )
+        throw { code: "provider_reference_set_changed" };
+      reconcileProviderTargets(
+        rows.map((selected) => currentRow(input.catalog, selected)),
+        providerFinal.targets,
+      );
+      for (const target of providerFinal.targets)
+        if (!target.ack) throw { code: "provider_ack_not_observed" };
+    }
     const finalById = new Map(
       final.targets.map((target) => [target.receiptId, target]),
     );
@@ -784,6 +1284,10 @@ export async function runArchiveForget(input: {
       const after = finalById.get(target.receiptId);
       if (!after?.ack) throw { code: "ack_not_observed" };
       const matched = matches.get(target.receiptId)!;
+      const liveRepository =
+        matched.subject === "parser_output" &&
+        matched.role === "independent_backup" &&
+        "repository" in input.config.pdfDocQa.archive.independentBackup;
       const current = currentRow(input.catalog, matched);
       const deletion = completeDeletion(
         current.row.copies[target.copyRole],
@@ -792,7 +1296,15 @@ export async function runArchiveForget(input: {
       if (
         after.ack.deletionId !== deletion.deletionId ||
         after.ack.objectOutcome !== deletion.object ||
-        after.ack.backupOutcome !== deletion.backup
+        after.ack.backupOutcome !== deletion.backup ||
+        after.ack.absenceAuthority !==
+          (liveRepository
+            ? "worker_asserted_live_repository_absence"
+            : "worker_asserted_physical_absence") ||
+        after.ack.retentionDisclosure !==
+          (liveRepository
+            ? "provider_retained_deleted_history_possible"
+            : undefined)
       )
         throw { code: "ack_identity_mismatch" };
     }
@@ -803,6 +1315,16 @@ export async function runArchiveForget(input: {
       receiptCount: first.targets.length,
       acknowledgedCount: final.targets.filter((target) => target.ack).length,
       localCopyCount,
+      ...(providerFinal
+        ? {
+            providerReferenceCount: providerFinal.targets.length,
+            providerOriginalOutcome:
+              "provider_original_reference_detached_source_retained" as const,
+          }
+        : {}),
+      ...("repository" in input.config.pdfDocQa.archive.independentBackup
+        ? { retainedProviderHistoryPossible: true as const }
+        : {}),
       nextAction: "run_authenticated_owner_continue_forget",
     };
   } catch (error) {

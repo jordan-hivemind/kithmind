@@ -666,15 +666,27 @@ export async function auditFullLegacyPayloadPage(
         generation.normalizedBundleDigest,
         generation.originalPrimaryReceiptId,
         generation.originalBackupReceiptId,
+        generation.originalProviderReferenceId,
+        generation.originalProviderBindingEpoch,
         generation.parserPrimaryReceiptId,
         generation.parserBackupReceiptId,
       ];
       const hasAnyBinaryMarker = binaryMarkers.some(
         (value) => value !== undefined,
       );
-      const hasEveryBinaryMarker = binaryMarkers.every(
-        (value) => value !== undefined,
-      );
+      const hasEveryBinaryMarker =
+        generation.parserArtifactId !== undefined &&
+        generation.archiveSetDigest !== undefined &&
+        generation.normalizedBundleDigest !== undefined &&
+        generation.originalPrimaryReceiptId !== undefined &&
+        generation.parserPrimaryReceiptId !== undefined &&
+        generation.parserBackupReceiptId !== undefined &&
+        ((generation.originalBackupReceiptId !== undefined &&
+          generation.originalProviderReferenceId === undefined &&
+          generation.originalProviderBindingEpoch === undefined) ||
+          (generation.originalBackupReceiptId === undefined &&
+            generation.originalProviderReferenceId !== undefined &&
+            generation.originalProviderBindingEpoch !== undefined));
       const text = generation.sourceTextVersionId
         ? await ctx.db.get(generation.sourceTextVersionId)
         : null;

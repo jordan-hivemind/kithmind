@@ -12,11 +12,38 @@ import { sha256Utf8 } from "../provenance/model";
 import {
   advanceProcessingAssessment,
   beginProcessingAssessment,
+  generationOriginalRecoverySelectionIsClosed,
   isAssessmentSnapshotCurrent,
 } from "./assessment";
 import { getWorkerSourceStatus } from "./model";
 import { FS_TEXT_PROFILE } from "./profile";
 import { parseWorkerRequest, type WorkerRequest } from "./protocol";
+
+test("assessment accepts only exact legacy or provider original recovery selection", () => {
+  expect(
+    generationOriginalRecoverySelectionIsClosed({
+      originalBackupReceiptId: "backup",
+    }),
+  ).toBe(true);
+  expect(
+    generationOriginalRecoverySelectionIsClosed({
+      originalProviderReferenceId: "provider",
+      originalProviderBindingEpoch: 0,
+    }),
+  ).toBe(true);
+  expect(
+    generationOriginalRecoverySelectionIsClosed({
+      originalBackupReceiptId: "backup",
+      originalProviderReferenceId: "provider",
+      originalProviderBindingEpoch: 0,
+    }),
+  ).toBe(false);
+  expect(
+    generationOriginalRecoverySelectionIsClosed({
+      originalProviderReferenceId: "provider",
+    }),
+  ).toBe(false);
+});
 
 async function fixture() {
   const t = convexTest(schema, modules);

@@ -101,6 +101,11 @@ export type WorkerJobFailureCode =
   | "staging_invalid";
 
 export type ArchiveDeletionOutcome = "deleted" | "already_missing";
+export type ArchiveDeletionAbsenceAuthority =
+  | "worker_asserted_physical_absence"
+  | "worker_asserted_live_repository_absence";
+export type ArchiveDeletionRetentionDisclosure =
+  "provider_retained_deleted_history_possible";
 
 export type FsDiscoveryEntry = {
   externalId?: string;
@@ -139,12 +144,14 @@ export type {
   ArchiveReceiptSelection,
   ParsedTextDeclaration,
   ParserArtifactSelection,
+  ProviderOriginalDeclaration,
 } from "@repo/worker-protocol";
 import type {
   ArchivedWorkIdentity,
   ArchiveReceiptSelection,
   ParsedTextDeclaration,
   ParserArtifactSelection,
+  ProviderOriginalDeclaration,
 } from "@repo/worker-protocol";
 
 type WorkerSourceRequest = {
@@ -181,6 +188,39 @@ export type WorkerRequest =
       receiptId: string;
       objectOutcome: ArchiveDeletionOutcome;
       backupOutcome?: ArchiveDeletionOutcome;
+    } & (
+        | {
+            absenceAuthority?: "worker_asserted_physical_absence";
+            retentionDisclosure?: never;
+          }
+        | {
+            absenceAuthority: "worker_asserted_live_repository_absence";
+            retentionDisclosure: ArchiveDeletionRetentionDisclosure;
+          }
+      ))
+  | (WorkerSourceRequest & {
+      operation: "providerOriginal.forgetTargets";
+      requestId: string;
+      sourceItemId: string;
+      expectedForgetEpoch: number;
+      paginationOpts: WorkerPaginationOptions;
+    })
+  | (WorkerSourceRequest & {
+      operation: "providerOriginal.ackDetach";
+      requestId: string;
+      sourceItemId: string;
+      expectedForgetEpoch: number;
+      detachId: string;
+      referenceId: string;
+      locatorBindingId: string;
+      locatorRepositoryId: string;
+      locatorSnapshotId: string;
+      locatorObjectName: string;
+      referenceOutcome: "detached" | "already_detached";
+      locatorBundleOutcome: ArchiveDeletionOutcome;
+      locatorAbsenceAuthority: "worker_asserted_live_repository_absence";
+      retentionDisclosure: ArchiveDeletionRetentionDisclosure;
+      providerSourceOutcome: "retained_unchanged";
     })
   | (WorkerSourceRequest & {
       operation: "source.inventoryPage";
@@ -270,6 +310,7 @@ export type WorkerRequest =
       parserArtifact: ParserArtifactSelection;
       archives: ArchiveReceiptSelection[];
       parsedText: ParsedTextDeclaration;
+      providerOriginal?: ProviderOriginalDeclaration;
     })
   | (WorkerSourceRequest & {
       operation: "jobs.reserve";
@@ -587,23 +628,39 @@ export type WorkerArchivedReserveResult = {
   reused: boolean;
 };
 
-export type WorkerArchivedLookupResult =
+export type WorkerOriginalRecoverySelection =
   | {
-      operation: "discovery.lookupArchivedAdmission";
-      mode: "original" | "processing";
-      found: false;
-    }
-  | {
-      operation: "discovery.lookupArchivedAdmission";
-      mode: "original";
-      found: true;
-      sourceRevisionId: string;
       originalPrimaryReceiptId: string;
       originalPrimaryBindingEpoch: number;
       originalBackupReceiptId: string;
       originalBackupBindingEpoch: number;
+      originalProviderReferenceId?: never;
+      originalProviderBindingEpoch?: never;
     }
   | {
+      originalPrimaryReceiptId: string;
+      originalPrimaryBindingEpoch: number;
+      originalProviderReferenceId: string;
+      originalProviderBindingEpoch: number;
+      originalBackupReceiptId?: never;
+      originalBackupBindingEpoch?: never;
+    };
+
+export type WorkerArchivedLookupResult =
+  | (
+      | {
+          operation: "discovery.lookupArchivedAdmission";
+          mode: "original" | "processing";
+          found: false;
+        }
+      | ({
+          operation: "discovery.lookupArchivedAdmission";
+          mode: "original";
+          found: true;
+          sourceRevisionId: string;
+        } & WorkerOriginalRecoverySelection)
+    )
+  | ({
       operation: "discovery.lookupArchivedAdmission";
       mode: "processing";
       found: true;
@@ -614,15 +671,11 @@ export type WorkerArchivedLookupResult =
       ingestJobId: string;
       desiredProcessingEpoch: number;
       archiveSetDigest: string;
-      originalPrimaryReceiptId: string;
-      originalPrimaryBindingEpoch: number;
-      originalBackupReceiptId: string;
-      originalBackupBindingEpoch: number;
       parserPrimaryReceiptId: string;
       parserPrimaryBindingEpoch: number;
       parserBackupReceiptId: string;
       parserBackupBindingEpoch: number;
-    };
+    } & WorkerOriginalRecoverySelection);
 
 export type WorkerArchivedAdmitResult = {
   operation: "discovery.admitArchived";
@@ -635,17 +688,13 @@ export type WorkerArchivedAdmitResult = {
   ingestJobId: string;
   desiredProcessingEpoch: number;
   archiveSetDigest: string;
-  originalPrimaryReceiptId: string;
-  originalPrimaryBindingEpoch: number;
-  originalBackupReceiptId: string;
-  originalBackupBindingEpoch: number;
   parserPrimaryReceiptId: string;
   parserPrimaryBindingEpoch: number;
   parserBackupReceiptId: string;
   parserBackupBindingEpoch: number;
   state: "admitted";
   reused: boolean;
-};
+} & WorkerOriginalRecoverySelection;
 
 export type WorkerJobReserveResult = {
   operation: "jobs.reserve";
@@ -783,15 +832,25 @@ export type WorkerAssessmentPageResult = {
   staleReason?: "source_changed" | "detail_unavailable" | "expired";
 };
 
-export type WorkerArchiveDeletionAckSummary = {
+type WorkerArchiveDeletionAckSummaryBase = {
   deletionId: string;
   receiptId: string;
   forgetEpoch: number;
   objectOutcome: ArchiveDeletionOutcome;
   backupOutcome?: ArchiveDeletionOutcome;
-  absenceAuthority: "worker_asserted_physical_absence";
   completedAt: number;
 };
+
+export type WorkerArchiveDeletionAckSummary =
+  | (WorkerArchiveDeletionAckSummaryBase & {
+      absenceAuthority: "worker_asserted_physical_absence";
+      retentionDisclosure?: never;
+    })
+  | (WorkerArchiveDeletionAckSummaryBase & {
+      absenceAuthority: "worker_asserted_live_repository_absence";
+      backupOutcome: ArchiveDeletionOutcome;
+      retentionDisclosure: ArchiveDeletionRetentionDisclosure;
+    });
 
 export type WorkerArchiveForgetTarget = {
   receiptId: string;
@@ -822,12 +881,55 @@ export type WorkerArchiveAckDeletionResult = WorkerArchiveDeletionAckSummary & {
   reused: boolean;
 };
 
+export type WorkerProviderOriginalDetachAckSummary = {
+  detachId: string;
+  referenceId: string;
+  forgetEpoch: number;
+  referenceOutcome: "detached" | "already_detached";
+  locatorBundleOutcome: ArchiveDeletionOutcome;
+  locatorAbsenceAuthority: "worker_asserted_live_repository_absence";
+  retentionDisclosure: ArchiveDeletionRetentionDisclosure;
+  providerSourceOutcome: "retained_unchanged";
+  completedAt: number;
+};
+
+export type WorkerProviderOriginalForgetTarget = {
+  referenceId: string;
+  referenceFingerprint: string;
+  locatorBindingId: string;
+  locatorRepositoryId: string;
+  locatorSnapshotId: string;
+  locatorObjectName: string;
+  locatorCiphertextHash: string;
+  locatorCiphertextByteLength: number;
+  forgetEpoch: number;
+  ack?: WorkerProviderOriginalDetachAckSummary;
+};
+
+export type WorkerProviderOriginalForgetTargetsResult = {
+  operation: "providerOriginal.forgetTargets";
+  sourceItemId: string;
+  sourceExternalIdHash: string;
+  forgetEpoch: number;
+  targets: WorkerProviderOriginalForgetTarget[];
+  isDone: boolean;
+  continueCursor: string;
+};
+
+export type WorkerProviderOriginalAckDetachResult =
+  WorkerProviderOriginalDetachAckSummary & {
+    operation: "providerOriginal.ackDetach";
+    reused: boolean;
+  };
+
 export type WorkerResult =
   | WorkerSourceStatusResult
   | WorkerDiagnosticsStatusResult
   | WorkerDiagnosticsHeartbeatResult
   | WorkerArchiveForgetTargetsResult
   | WorkerArchiveAckDeletionResult
+  | WorkerProviderOriginalForgetTargetsResult
+  | WorkerProviderOriginalAckDetachResult
   | WorkerInventoryPageResult
   | WorkerScanBeginResult
   | WorkerScanAppendResult
@@ -967,6 +1069,8 @@ function paginationOptions(value: unknown): WorkerPaginationOptions {
 const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
+const PROVIDER_REVISION = /^[\x20-\x7e]{1,128}$/;
+const PROVIDER_OBJECT_NAME = /^(?!\.{1,2}$)[A-Za-z0-9._-]{1,128}$/;
 const GAP_CODES = new Set<FsDiscoveryGapCode>([
   "empty",
   "enumeration_interrupted",
@@ -1293,6 +1397,91 @@ function archiveReceiptSelection(value: unknown): ArchiveReceiptSelection {
   };
 }
 
+function providerOriginalDeclaration(
+  value: unknown,
+): ProviderOriginalDeclaration {
+  const input = object(value);
+  exactKeys(input, [
+    "referenceVersion",
+    "providerKind",
+    "clientReferenceId",
+    "sourceContentHash",
+    "sourceByteLength",
+    "providerAccountIdHash",
+    "providerRootDirectoryIdHash",
+    "providerFileIdHash",
+    "providerRevision",
+    "providerContentHash",
+    "verifiedAt",
+    "locatorBundle",
+    "createdAt",
+  ]);
+  if (
+    input.referenceVersion !== "provider_original_v1" ||
+    input.providerKind !== "dropbox_v1"
+  )
+    invalid();
+  const locator = object(input.locatorBundle);
+  exactKeys(locator, [
+    "bindingId",
+    "manifestFingerprint",
+    "recipientFingerprint",
+    "repositoryKeyDomainFingerprint",
+    "repositoryId",
+    "snapshotId",
+    "objectName",
+    "ciphertextHash",
+    "ciphertextByteLength",
+    "readbackVerifiedAt",
+  ]);
+  const hash = (entry: unknown) =>
+    string(entry, { maxUtf16: 64, pattern: SHA256 });
+  return {
+    referenceVersion: "provider_original_v1",
+    providerKind: "dropbox_v1",
+    clientReferenceId: string(input.clientReferenceId, {
+      maxUtf16: 36,
+      pattern: UUID,
+    }),
+    sourceContentHash: hash(input.sourceContentHash),
+    sourceByteLength: integer(input.sourceByteLength, 1, 16 * 1_024 * 1_024),
+    providerAccountIdHash: hash(input.providerAccountIdHash),
+    providerRootDirectoryIdHash: hash(input.providerRootDirectoryIdHash),
+    providerFileIdHash: hash(input.providerFileIdHash),
+    providerRevision: string(input.providerRevision, {
+      maxUtf16: 128,
+      pattern: PROVIDER_REVISION,
+    }),
+    providerContentHash: hash(input.providerContentHash),
+    verifiedAt: epoch(input.verifiedAt),
+    locatorBundle: {
+      bindingId: string(locator.bindingId, {
+        maxUtf16: 36,
+        pattern: UUID,
+      }),
+      manifestFingerprint: hash(locator.manifestFingerprint),
+      recipientFingerprint: hash(locator.recipientFingerprint),
+      repositoryKeyDomainFingerprint: hash(
+        locator.repositoryKeyDomainFingerprint,
+      ),
+      repositoryId: hash(locator.repositoryId),
+      snapshotId: hash(locator.snapshotId),
+      objectName: string(locator.objectName, {
+        maxUtf16: 128,
+        pattern: PROVIDER_OBJECT_NAME,
+      }),
+      ciphertextHash: hash(locator.ciphertextHash),
+      ciphertextByteLength: integer(
+        locator.ciphertextByteLength,
+        1,
+        1_024 * 1_024,
+      ),
+      readbackVerifiedAt: epoch(locator.readbackVerifiedAt),
+    },
+    createdAt: epoch(input.createdAt),
+  };
+}
+
 function parsedTextDeclaration(value: unknown): ParsedTextDeclaration {
   const input = object(value);
   exactKeys(input, [
@@ -1409,7 +1598,7 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
           return parsed;
         })(),
       };
-    case "archive.ackDeletion":
+    case "archive.ackDeletion": {
       exactKeys(
         input,
         [
@@ -1421,7 +1610,7 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
           "receiptId",
           "objectOutcome",
         ],
-        ["backupOutcome"],
+        ["backupOutcome", "absenceAuthority", "retentionDisclosure"],
       );
       if (
         input.objectOutcome !== "deleted" &&
@@ -1434,7 +1623,20 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
         input.backupOutcome !== "already_missing"
       )
         invalid();
-      return {
+      if (
+        input.absenceAuthority !== undefined &&
+        input.absenceAuthority !== "worker_asserted_physical_absence" &&
+        input.absenceAuthority !== "worker_asserted_live_repository_absence"
+      )
+        invalid();
+      if (
+        input.absenceAuthority === "worker_asserted_live_repository_absence"
+          ? input.retentionDisclosure !==
+            "provider_retained_deleted_history_possible"
+          : input.retentionDisclosure !== undefined
+      )
+        invalid();
+      const archiveAck = {
         ...base,
         operation: "archive.ackDeletion",
         requestId: requestId(input.requestId),
@@ -1452,7 +1654,113 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
         objectOutcome: input.objectOutcome,
         ...(input.backupOutcome === undefined
           ? {}
-          : { backupOutcome: input.backupOutcome }),
+          : {
+              backupOutcome: input.backupOutcome as ArchiveDeletionOutcome,
+            }),
+      } as const;
+      if (
+        input.absenceAuthority === "worker_asserted_live_repository_absence"
+      ) {
+        return {
+          ...archiveAck,
+          absenceAuthority: input.absenceAuthority,
+          retentionDisclosure: "provider_retained_deleted_history_possible",
+        };
+      }
+      return {
+        ...archiveAck,
+        ...(input.absenceAuthority === undefined
+          ? {}
+          : { absenceAuthority: "worker_asserted_physical_absence" as const }),
+      };
+    }
+    case "providerOriginal.forgetTargets":
+      exactKeys(input, [
+        ...baseKeys,
+        "requestId",
+        "sourceItemId",
+        "expectedForgetEpoch",
+        "paginationOpts",
+      ]);
+      return {
+        ...base,
+        operation: "providerOriginal.forgetTargets",
+        requestId: requestId(input.requestId),
+        sourceItemId: string(input.sourceItemId, { maxUtf16: 256 }),
+        expectedForgetEpoch: integer(
+          input.expectedForgetEpoch,
+          1,
+          Number.MAX_SAFE_INTEGER,
+        ),
+        paginationOpts: (() => {
+          const parsed = paginationOptions(input.paginationOpts);
+          if (parsed.numItems > MAX_WORKER_ARCHIVE_FORGET_ITEMS) invalid();
+          return parsed;
+        })(),
+      };
+    case "providerOriginal.ackDetach":
+      exactKeys(input, [
+        ...baseKeys,
+        "requestId",
+        "sourceItemId",
+        "expectedForgetEpoch",
+        "detachId",
+        "referenceId",
+        "locatorBindingId",
+        "locatorRepositoryId",
+        "locatorSnapshotId",
+        "locatorObjectName",
+        "referenceOutcome",
+        "locatorBundleOutcome",
+        "locatorAbsenceAuthority",
+        "retentionDisclosure",
+        "providerSourceOutcome",
+      ]);
+      if (
+        (input.referenceOutcome !== "detached" &&
+          input.referenceOutcome !== "already_detached") ||
+        (input.locatorBundleOutcome !== "deleted" &&
+          input.locatorBundleOutcome !== "already_missing") ||
+        input.locatorAbsenceAuthority !==
+          "worker_asserted_live_repository_absence" ||
+        input.retentionDisclosure !==
+          "provider_retained_deleted_history_possible" ||
+        input.providerSourceOutcome !== "retained_unchanged"
+      )
+        invalid();
+      return {
+        ...base,
+        operation: "providerOriginal.ackDetach",
+        requestId: requestId(input.requestId),
+        sourceItemId: string(input.sourceItemId, { maxUtf16: 256 }),
+        expectedForgetEpoch: integer(
+          input.expectedForgetEpoch,
+          1,
+          Number.MAX_SAFE_INTEGER,
+        ),
+        detachId: string(input.detachId, { maxUtf16: 36, pattern: UUID }),
+        referenceId: string(input.referenceId, { maxUtf16: 256 }),
+        locatorBindingId: string(input.locatorBindingId, {
+          maxUtf16: 36,
+          pattern: UUID,
+        }),
+        locatorRepositoryId: string(input.locatorRepositoryId, {
+          maxUtf16: 64,
+          pattern: SHA256,
+        }),
+        locatorSnapshotId: string(input.locatorSnapshotId, {
+          maxUtf16: 64,
+          pattern: SHA256,
+        }),
+        locatorObjectName: string(input.locatorObjectName, {
+          maxUtf16: 128,
+          pattern: PROVIDER_OBJECT_NAME,
+        }),
+        referenceOutcome: input.referenceOutcome,
+        locatorBundleOutcome: input.locatorBundleOutcome,
+        locatorAbsenceAuthority: "worker_asserted_live_repository_absence",
+        retentionDisclosure: "provider_retained_deleted_history_possible",
+        providerSourceOutcome: "retained_unchanged",
       };
     case "source.inventoryPage":
       exactKeys(input, [
@@ -1686,17 +1994,25 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
       };
     }
     case "discovery.admitArchived": {
-      exactKeys(input, [
-        ...baseKeys,
-        "requestId",
-        "workId",
-        "leaseEpoch",
-        "leaseToken",
-        "parserArtifact",
-        "archives",
-        "parsedText",
-      ]);
-      if (!Array.isArray(input.archives) || input.archives.length !== 4) {
+      exactKeys(
+        input,
+        [
+          ...baseKeys,
+          "requestId",
+          "workId",
+          "leaseEpoch",
+          "leaseToken",
+          "parserArtifact",
+          "archives",
+          "parsedText",
+        ],
+        ["providerOriginal"],
+      );
+      const provider = input.providerOriginal !== undefined;
+      if (
+        !Array.isArray(input.archives) ||
+        input.archives.length !== (provider ? 3 : 4)
+      ) {
         invalid();
       }
       const archives = input.archives.map(archiveReceiptSelection);
@@ -1704,11 +2020,13 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
         archives.map((entry) => `${entry.subjectKind}:${entry.copyRole}`),
       );
       if (
-        roles.size !== 4 ||
+        roles.size !== (provider ? 3 : 4) ||
         !roles.has("original_bytes:primary") ||
-        !roles.has("original_bytes:independent_backup") ||
         !roles.has("parser_output:primary") ||
-        !roles.has("parser_output:independent_backup")
+        !roles.has("parser_output:independent_backup") ||
+        (provider
+          ? roles.has("original_bytes:independent_backup")
+          : !roles.has("original_bytes:independent_backup"))
       ) {
         invalid();
       }
@@ -1725,6 +2043,13 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
         parserArtifact: parserArtifactSelection(input.parserArtifact),
         archives,
         parsedText: parsedTextDeclaration(input.parsedText),
+        ...(provider
+          ? {
+              providerOriginal: providerOriginalDeclaration(
+                input.providerOriginal,
+              ),
+            }
+          : {}),
       };
     }
     case "jobs.reserve":

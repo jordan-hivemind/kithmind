@@ -318,6 +318,10 @@ export const workerBinaryOperationReceiptFields = {
   ingestJobId: v.optional(v.id("ingestJobs")),
   desiredProcessingEpoch: v.optional(v.number()),
   archiveSetDigest: v.optional(v.string()),
+  originalProviderReferenceId: v.optional(
+    v.id("sourceProviderOriginalReferences"),
+  ),
+  originalProviderBindingEpoch: v.optional(v.number()),
   stageId: v.optional(v.id("workerParsedStages")),
   stagePhase: v.optional(
     v.union(

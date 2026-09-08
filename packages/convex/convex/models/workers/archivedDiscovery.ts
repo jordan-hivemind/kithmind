@@ -17,6 +17,11 @@ import {
   createOrGetParsedTextVersion,
 } from "../provenance/binary";
 import { sha256Utf8 } from "../provenance/model";
+import {
+  createAndBindProviderOriginal,
+  loadProviderOriginalBinding,
+  loadProviderOriginalReference,
+} from "../provenance/providerOriginals";
 import { parseSourceTextRepresentation } from "../provenance/representations";
 import { requireWorkerSourceAccount } from "./auth";
 import {
@@ -162,16 +167,29 @@ export async function validateAdmittedArchiveChain(
     archiveSetDigest: string;
     parsedText?: ParsedTextDeclaration;
   },
-): Promise<{
-  originalPrimaryReceiptId: Id<"sourceArtifactArchiveReceipts">;
-  originalPrimaryBindingEpoch: number;
-  originalBackupReceiptId: Id<"sourceArtifactArchiveReceipts">;
-  originalBackupBindingEpoch: number;
-  parserPrimaryReceiptId: Id<"sourceArtifactArchiveReceipts">;
-  parserPrimaryBindingEpoch: number;
-  parserBackupReceiptId: Id<"sourceArtifactArchiveReceipts">;
-  parserBackupBindingEpoch: number;
-}> {
+): Promise<
+  {
+    originalPrimaryReceiptId: Id<"sourceArtifactArchiveReceipts">;
+    originalPrimaryBindingEpoch: number;
+    parserPrimaryReceiptId: Id<"sourceArtifactArchiveReceipts">;
+    parserPrimaryBindingEpoch: number;
+    parserBackupReceiptId: Id<"sourceArtifactArchiveReceipts">;
+    parserBackupBindingEpoch: number;
+  } & (
+    | {
+        originalBackupReceiptId: Id<"sourceArtifactArchiveReceipts">;
+        originalBackupBindingEpoch: number;
+        originalProviderReferenceId?: never;
+        originalProviderBindingEpoch?: never;
+      }
+    | {
+        originalProviderReferenceId: Id<"sourceProviderOriginalReferences">;
+        originalProviderBindingEpoch: number;
+        originalBackupReceiptId?: never;
+        originalBackupBindingEpoch?: never;
+      }
+  )
+> {
   requireStoredBinaryWork(current);
   const [revision, artifact, text, generation, job] = await Promise.all([
     ctx.db.get(ids.sourceRevisionId),
@@ -290,6 +308,26 @@ export async function validateAdmittedArchiveChain(
   ) {
     throw workerProtocolError("scan_conflict");
   }
+  if (
+    (generation.originalProviderReferenceId === undefined) !==
+    (generation.originalProviderBindingEpoch === undefined)
+  )
+    throw workerProtocolError("scan_conflict");
+  const providerGeneration =
+    generation.originalProviderReferenceId === undefined
+      ? null
+      : {
+          reference: await loadProviderOriginalReference(ctx, {
+            referenceId: generation.originalProviderReferenceId,
+            spaceId: source.spaceId,
+            sourceAccountId: source.account._id,
+            sourceItemId: current.item._id,
+            sourceRevisionId: revision._id,
+            expectedSourceContentHash: revision.contentHash,
+            expectedSourceByteLength: revision.byteLength,
+          }),
+          bindingEpoch: generation.originalProviderBindingEpoch,
+        };
   const [originalPrimary, originalBackup, parserPrimary, parserBackup] =
     await Promise.all([
       loadCurrentArchiveBinding(ctx, {
@@ -327,43 +365,87 @@ export async function validateAdmittedArchiveChain(
         copyRole: "independent_backup",
       }),
     ]);
-  if (!originalPrimary || !originalBackup || !parserPrimary || !parserBackup) {
+  if (
+    !originalPrimary ||
+    (!originalBackup && !providerGeneration) ||
+    (originalBackup && providerGeneration) ||
+    !parserPrimary ||
+    !parserBackup
+  ) {
     throw workerProtocolError("scan_conflict");
   }
-  requireIndependentArchivePair(
-    originalPrimary.receipt,
-    originalBackup.receipt,
-  );
+  if (originalBackup)
+    requireIndependentArchivePair(
+      originalPrimary.receipt,
+      originalBackup.receipt,
+    );
   requireIndependentArchivePair(parserPrimary.receipt, parserBackup.receipt);
-  const archiveSetDigest = await digest("archive-set:v1", [
-    ...[originalPrimary, originalBackup, parserPrimary, parserBackup].map(
-      ({ receipt, binding }) => [
-        receipt.subjectKind,
-        receipt.copyRole,
-        receipt._id,
-        binding.bindingEpoch,
-      ],
-    ),
-  ]);
+  const archiveSetDigest = originalBackup
+    ? await digest("archive-set:v1", [
+        ...[originalPrimary, originalBackup, parserPrimary, parserBackup].map(
+          ({ receipt, binding }) => [
+            receipt.subjectKind,
+            receipt.copyRole,
+            receipt._id,
+            binding.bindingEpoch,
+          ],
+        ),
+      ])
+    : await digest("recovery-set:provider-original:v1", [
+        [
+          originalPrimary.receipt.subjectKind,
+          originalPrimary.receipt.copyRole,
+          originalPrimary.receipt._id,
+          originalPrimary.binding.bindingEpoch,
+        ],
+        [
+          "provider_original",
+          providerGeneration!.reference._id,
+          providerGeneration!.bindingEpoch,
+        ],
+        ...[parserPrimary, parserBackup].map(({ receipt, binding }) => [
+          receipt.subjectKind,
+          receipt.copyRole,
+          receipt._id,
+          binding.bindingEpoch,
+        ]),
+      ]);
   if (
     archiveSetDigest !== ids.archiveSetDigest ||
     generation.originalPrimaryReceiptId !== originalPrimary.receipt._id ||
-    generation.originalBackupReceiptId !== originalBackup.receipt._id ||
+    (originalBackup
+      ? generation.originalBackupReceiptId !== originalBackup.receipt._id ||
+        generation.originalProviderReferenceId !== undefined ||
+        generation.originalProviderBindingEpoch !== undefined
+      : generation.originalBackupReceiptId !== undefined ||
+        generation.originalProviderReferenceId !==
+          providerGeneration!.reference._id ||
+        generation.originalProviderBindingEpoch !==
+          providerGeneration!.bindingEpoch) ||
     generation.parserPrimaryReceiptId !== parserPrimary.receipt._id ||
     generation.parserBackupReceiptId !== parserBackup.receipt._id
   ) {
     throw workerProtocolError("scan_conflict");
   }
-  return {
+  const common = {
     originalPrimaryReceiptId: originalPrimary.receipt._id,
     originalPrimaryBindingEpoch: originalPrimary.binding.bindingEpoch,
-    originalBackupReceiptId: originalBackup.receipt._id,
-    originalBackupBindingEpoch: originalBackup.binding.bindingEpoch,
     parserPrimaryReceiptId: parserPrimary.receipt._id,
     parserPrimaryBindingEpoch: parserPrimary.binding.bindingEpoch,
     parserBackupReceiptId: parserBackup.receipt._id,
     parserBackupBindingEpoch: parserBackup.binding.bindingEpoch,
   };
+  return originalBackup
+    ? {
+        ...common,
+        originalBackupReceiptId: originalBackup.receipt._id,
+        originalBackupBindingEpoch: originalBackup.binding.bindingEpoch,
+      }
+    : {
+        ...common,
+        originalProviderReferenceId: providerGeneration!.reference._id,
+        originalProviderBindingEpoch: providerGeneration!.bindingEpoch!,
+      };
 }
 
 async function resolveCurrentArchivedWork(
@@ -630,46 +712,63 @@ export async function lookupArchivedAdmission(
   ) {
     throw workerProtocolError("scan_conflict");
   }
-  const [originalPrimary, originalBackup] = await Promise.all([
-    loadCurrentArchiveBinding(ctx, {
-      spaceId: source.spaceId,
-      sourceAccountId: source.account._id,
-      sourceItemId: current.item._id,
-      sourceRevisionId: revision._id,
-      subjectKind: "original_bytes",
-      copyRole: "primary",
-    }),
-    loadCurrentArchiveBinding(ctx, {
-      spaceId: source.spaceId,
-      sourceAccountId: source.account._id,
-      sourceItemId: current.item._id,
-      sourceRevisionId: revision._id,
-      subjectKind: "original_bytes",
-      copyRole: "independent_backup",
-    }),
-  ]);
-  if (!originalPrimary || !originalBackup) {
+  const [originalPrimary, originalBackup, providerOriginal] = await Promise.all(
+    [
+      loadCurrentArchiveBinding(ctx, {
+        spaceId: source.spaceId,
+        sourceAccountId: source.account._id,
+        sourceItemId: current.item._id,
+        sourceRevisionId: revision._id,
+        subjectKind: "original_bytes",
+        copyRole: "primary",
+      }),
+      loadCurrentArchiveBinding(ctx, {
+        spaceId: source.spaceId,
+        sourceAccountId: source.account._id,
+        sourceItemId: current.item._id,
+        sourceRevisionId: revision._id,
+        subjectKind: "original_bytes",
+        copyRole: "independent_backup",
+      }),
+      loadProviderOriginalBinding(ctx, revision._id),
+    ],
+  );
+  if (
+    !originalPrimary ||
+    (!originalBackup && !providerOriginal) ||
+    (originalBackup && providerOriginal)
+  ) {
     return {
       operation: "discovery.lookupArchivedAdmission",
       mode: request.lookup.mode,
       found: false,
     };
   }
-  requireIndependentArchivePair(
-    originalPrimary.receipt,
-    originalBackup.receipt,
-  );
+  if (originalBackup)
+    requireIndependentArchivePair(
+      originalPrimary.receipt,
+      originalBackup.receipt,
+    );
   if (request.lookup.mode === "original") {
-    return {
+    const common = {
       operation: "discovery.lookupArchivedAdmission",
       mode: "original",
       found: true,
       sourceRevisionId: revision._id,
       originalPrimaryReceiptId: originalPrimary.receipt._id,
       originalPrimaryBindingEpoch: originalPrimary.binding.bindingEpoch,
-      originalBackupReceiptId: originalBackup.receipt._id,
-      originalBackupBindingEpoch: originalBackup.binding.bindingEpoch,
-    };
+    } as const;
+    return originalBackup
+      ? {
+          ...common,
+          originalBackupReceiptId: originalBackup.receipt._id,
+          originalBackupBindingEpoch: originalBackup.binding.bindingEpoch,
+        }
+      : {
+          ...common,
+          originalProviderReferenceId: providerOriginal!.reference._id,
+          originalProviderBindingEpoch: providerOriginal!.binding.bindingEpoch,
+        };
   }
   const processingLookup = request.lookup;
   const artifacts = await ctx.db
@@ -787,6 +886,31 @@ export async function lookupArchivedAdmission(
     };
   }
   const generation = generations[0]!;
+  if (
+    (generation.originalProviderReferenceId === undefined) !==
+    (generation.originalProviderBindingEpoch === undefined)
+  )
+    throw workerProtocolError("scan_conflict");
+  const generationProvider =
+    generation.originalProviderReferenceId === undefined
+      ? null
+      : {
+          reference: await loadProviderOriginalReference(ctx, {
+            referenceId: generation.originalProviderReferenceId,
+            spaceId: source.spaceId,
+            sourceAccountId: source.account._id,
+            sourceItemId: current.item._id,
+            sourceRevisionId: revision._id,
+            expectedSourceContentHash: revision.contentHash,
+            expectedSourceByteLength: revision.byteLength,
+          }),
+          bindingEpoch: generation.originalProviderBindingEpoch,
+        };
+  if (
+    (!originalBackup && !generationProvider) ||
+    (originalBackup && generationProvider)
+  )
+    throw workerProtocolError("scan_conflict");
   const jobs = await ctx.db
     .query("ingestJobs")
     .withIndex("by_processingGenerationId", (q) =>
@@ -794,16 +918,36 @@ export async function lookupArchivedAdmission(
     )
     .take(2);
   const job = jobs[0];
-  const archiveSetDigest = await digest("archive-set:v1", [
-    ...[originalPrimary, originalBackup, parserPrimary, parserBackup].map(
-      ({ receipt, binding }) => [
-        receipt.subjectKind,
-        receipt.copyRole,
-        receipt._id,
-        binding.bindingEpoch,
-      ],
-    ),
-  ]);
+  const archiveSetDigest = originalBackup
+    ? await digest("archive-set:v1", [
+        ...[originalPrimary, originalBackup, parserPrimary, parserBackup].map(
+          ({ receipt, binding }) => [
+            receipt.subjectKind,
+            receipt.copyRole,
+            receipt._id,
+            binding.bindingEpoch,
+          ],
+        ),
+      ])
+    : await digest("recovery-set:provider-original:v1", [
+        [
+          "original_bytes",
+          "primary",
+          originalPrimary.receipt._id,
+          originalPrimary.binding.bindingEpoch,
+        ],
+        [
+          "provider_original",
+          generationProvider!.reference._id,
+          generationProvider!.bindingEpoch,
+        ],
+        ...[parserPrimary, parserBackup].map(({ receipt, binding }) => [
+          receipt.subjectKind,
+          receipt.copyRole,
+          receipt._id,
+          binding.bindingEpoch,
+        ]),
+      ]);
   if (
     jobs.length !== 1 ||
     !job ||
@@ -823,7 +967,14 @@ export async function lookupArchivedAdmission(
       processingLookup.parsedText.expectedChunkCount ||
     generation.archiveSetDigest !== archiveSetDigest ||
     generation.originalPrimaryReceiptId !== originalPrimary.receipt._id ||
-    generation.originalBackupReceiptId !== originalBackup.receipt._id ||
+    (originalBackup
+      ? generation.originalBackupReceiptId !== originalBackup.receipt._id ||
+        generation.originalProviderReferenceId !== undefined
+      : generation.originalBackupReceiptId !== undefined ||
+        generation.originalProviderReferenceId !==
+          generationProvider!.reference._id ||
+        generation.originalProviderBindingEpoch !==
+          generationProvider!.bindingEpoch) ||
     generation.parserPrimaryReceiptId !== parserPrimary.receipt._id ||
     generation.parserBackupReceiptId !== parserBackup.receipt._id ||
     job.workerProcessingMode !== "parsed_pages_v1" ||
@@ -845,7 +996,7 @@ export async function lookupArchivedAdmission(
     archiveSetDigest,
     parsedText: processingLookup.parsedText,
   });
-  return {
+  const common = {
     operation: "discovery.lookupArchivedAdmission",
     mode: "processing",
     found: true,
@@ -858,13 +1009,22 @@ export async function lookupArchivedAdmission(
     archiveSetDigest,
     originalPrimaryReceiptId: originalPrimary.receipt._id,
     originalPrimaryBindingEpoch: originalPrimary.binding.bindingEpoch,
-    originalBackupReceiptId: originalBackup.receipt._id,
-    originalBackupBindingEpoch: originalBackup.binding.bindingEpoch,
     parserPrimaryReceiptId: parserPrimary.receipt._id,
     parserPrimaryBindingEpoch: parserPrimary.binding.bindingEpoch,
     parserBackupReceiptId: parserBackup.receipt._id,
     parserBackupBindingEpoch: parserBackup.binding.bindingEpoch,
-  };
+  } as const;
+  return originalBackup
+    ? {
+        ...common,
+        originalBackupReceiptId: originalBackup.receipt._id,
+        originalBackupBindingEpoch: originalBackup.binding.bindingEpoch,
+      }
+    : {
+        ...common,
+        originalProviderReferenceId: generationProvider!.reference._id,
+        originalProviderBindingEpoch: generationProvider!.bindingEpoch!,
+      };
 }
 
 async function resolveParserArtifact(
@@ -1069,6 +1229,13 @@ export async function admitArchivedDiscovery(
         parsedText: request.parsedText,
       },
     );
+    if (
+      prior.originalProviderReferenceId !==
+        archiveReceipts.originalProviderReferenceId ||
+      prior.originalProviderBindingEpoch !==
+        archiveReceipts.originalProviderBindingEpoch
+    )
+      throw workerProtocolError("scan_conflict");
     return {
       operation: "discovery.admitArchived",
       workId,
@@ -1168,24 +1335,69 @@ export async function admitArchivedDiscovery(
       ]),
     );
     const originalPrimary = byRole.get("original_bytes:primary")!;
-    const originalBackup = byRole.get("original_bytes:independent_backup")!;
+    const originalBackup = byRole.get("original_bytes:independent_backup");
     const parserPrimary = byRole.get("parser_output:primary")!;
     const parserBackup = byRole.get("parser_output:independent_backup")!;
-    requireIndependentArchivePair(
-      originalPrimary.receipt,
-      originalBackup.receipt,
-    );
+    if (
+      request.providerOriginal &&
+      (request.providerOriginal.sourceContentHash !== revision.contentHash ||
+        request.providerOriginal.sourceByteLength !== revision.byteLength)
+    )
+      throw workerProtocolError("stale_observation");
+    const providerOriginal = request.providerOriginal
+      ? await createAndBindProviderOriginal(ctx, {
+          spaceId: source.spaceId,
+          sourceAccountId: source.account._id,
+          sourceItemId: current.item._id,
+          sourceRevisionId: revision._id,
+          declaration: request.providerOriginal,
+          requestDigest,
+          userId: source.principal.userId,
+          actorCredentialId: source.principal.credentialId,
+          now,
+        })
+      : null;
+    if (
+      (!originalBackup && !providerOriginal) ||
+      (originalBackup && providerOriginal)
+    )
+      throw workerProtocolError("invalid_request");
+    if (originalBackup)
+      requireIndependentArchivePair(
+        originalPrimary.receipt,
+        originalBackup.receipt,
+      );
     requireIndependentArchivePair(parserPrimary.receipt, parserBackup.receipt);
-    const archiveSetDigest = await digest("archive-set:v1", [
-      ...[originalPrimary, originalBackup, parserPrimary, parserBackup].map(
-        ({ receipt, binding }) => [
-          receipt.subjectKind,
-          receipt.copyRole,
-          receipt._id,
-          binding.bindingEpoch,
-        ],
-      ),
-    ]);
+    const archiveSetDigest = originalBackup
+      ? await digest("archive-set:v1", [
+          ...[originalPrimary, originalBackup, parserPrimary, parserBackup].map(
+            ({ receipt, binding }) => [
+              receipt.subjectKind,
+              receipt.copyRole,
+              receipt._id,
+              binding.bindingEpoch,
+            ],
+          ),
+        ])
+      : await digest("recovery-set:provider-original:v1", [
+          [
+            originalPrimary.receipt.subjectKind,
+            originalPrimary.receipt.copyRole,
+            originalPrimary.receipt._id,
+            originalPrimary.binding.bindingEpoch,
+          ],
+          [
+            "provider_original",
+            providerOriginal!.reference._id,
+            providerOriginal!.binding.bindingEpoch,
+          ],
+          ...[parserPrimary, parserBackup].map(({ receipt, binding }) => [
+            receipt.subjectKind,
+            receipt.copyRole,
+            receipt._id,
+            binding.bindingEpoch,
+          ]),
+        ]);
     const textVersion = await createOrGetParsedTextVersion(ctx, {
       spaceId: source.spaceId,
       sourceRevisionId: revision._id,
@@ -1206,7 +1418,13 @@ export async function admitArchivedDiscovery(
       archiveSetDigest,
       normalizedBundleDigest: request.parsedText.normalizedBundleDigest,
       originalPrimaryReceiptId: originalPrimary.receipt._id,
-      originalBackupReceiptId: originalBackup.receipt._id,
+      ...(originalBackup
+        ? { originalBackupReceiptId: originalBackup.receipt._id }
+        : {
+            originalProviderReferenceId: providerOriginal!.reference._id,
+            originalProviderBindingEpoch:
+              providerOriginal!.binding.bindingEpoch,
+          }),
       parserPrimaryReceiptId: parserPrimary.receipt._id,
       parserBackupReceiptId: parserBackup.receipt._id,
       processing: {
@@ -1268,6 +1486,14 @@ export async function admitArchivedDiscovery(
       ingestJobId: admitted.job._id,
       desiredProcessingEpoch: admitted.desiredProcessingEpoch,
       archiveSetDigest,
+      ...(archiveReceipts.originalProviderReferenceId === undefined
+        ? {}
+        : {
+            originalProviderReferenceId:
+              archiveReceipts.originalProviderReferenceId,
+            originalProviderBindingEpoch:
+              archiveReceipts.originalProviderBindingEpoch,
+          }),
     });
     return {
       operation: "discovery.admitArchived",

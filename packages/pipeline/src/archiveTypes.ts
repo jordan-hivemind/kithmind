@@ -1,5 +1,6 @@
 export const AGE_VERSION = "v1.3.2" as const;
 export const RESTIC_VERSION = "0.19.1" as const;
+export const RCLONE_VERSION = "v1.74.4" as const;
 
 export type Sha256File = {
   sha256: string;
@@ -52,6 +53,20 @@ export type ArchiveToolVersions = {
   restic: typeof RESTIC_VERSION;
 };
 
+export type RcloneDropboxRepository = {
+  kind: "rclone_dropbox_v1";
+  remoteName: string;
+  rootPath: string;
+  rcloneBinary: string;
+  configPath: string;
+  configIdentityFingerprint: string;
+  expectedRootDirectoryIdHash: string;
+};
+
+export type ResticRepositoryLocation =
+  | { repositoryPath: string; repository?: never }
+  | { repositoryPath?: never; repository: RcloneDropboxRepository };
+
 export type ResticRepositoryIdentity = {
   repositoryId: string;
   repositoryVersion: 2;
@@ -98,6 +113,19 @@ export type LocalBackupBoundary = {
   backupDevice: number;
 };
 
+export type RemoteBackupBoundary = {
+  mode: "independent_backup";
+  readiness: "remote_repository_verified";
+  backend: "rclone_dropbox_v1";
+  remoteName: string;
+  rootPath: string;
+  rootDirectoryIdHash: string;
+  configIdentityFingerprint: string;
+  repositoryId: string;
+  resticVersion: typeof RESTIC_VERSION;
+  rcloneVersion: typeof RCLONE_VERSION;
+};
+
 export type ResticBackupResult = {
   operationId: string;
   snapshotId: string;
@@ -106,7 +134,7 @@ export type ResticBackupResult = {
   resticVersion: typeof RESTIC_VERSION;
   repositoryId: string;
   verification: "destination_ciphertext_readback";
-  boundary: LocalBackupBoundary;
+  boundary: LocalBackupBoundary | RemoteBackupBoundary;
 };
 
 export type ResticReadbackResult = {
@@ -118,9 +146,8 @@ export type ResticReadbackResult = {
   verification: "destination_ciphertext_readback";
 };
 
-export type ReadbackResticObjectInput = {
+export type ReadbackResticObjectInput = ResticRepositoryLocation & {
   resticBinary: string;
-  repositoryPath: string;
   expectedRepositoryId: string;
   passwordCommand: PasswordCommand;
   snapshotId: string;
@@ -129,9 +156,8 @@ export type ReadbackResticObjectInput = {
   limits?: ArchiveCommandLimits;
 };
 
-export type BackupResticObjectInput = {
+export type BackupResticObjectInput = ResticRepositoryLocation & {
   resticBinary: string;
-  repositoryPath: string;
   expectedRepositoryId: string;
   passwordCommand: PasswordCommand;
   operationId: string;
@@ -143,9 +169,8 @@ export type BackupResticObjectInput = {
   limits?: ArchiveCommandLimits;
 };
 
-export type RecoverResticBackupInput = {
+export type RecoverResticBackupInput = ResticRepositoryLocation & {
   resticBinary: string;
-  repositoryPath: string;
   expectedRepositoryId: string;
   passwordCommand: PasswordCommand;
   operationId: string;
@@ -164,6 +189,7 @@ export type RecoveredResticBackup = {
   resticVersion: typeof RESTIC_VERSION;
   repositoryId: string;
   verification: "destination_ciphertext_readback";
+  boundary?: RemoteBackupBoundary;
 };
 
 export type RemovePublishedAgeObjectInput = {
@@ -186,9 +212,8 @@ export type RemovePublishedAgeObjectResult = {
   verification: "exact_path_absence";
 };
 
-export type ForgetResticBackupInput = {
+export type ForgetResticBackupInput = ResticRepositoryLocation & {
   resticBinary: string;
-  repositoryPath: string;
   expectedRepositoryId: string;
   passwordCommand: PasswordCommand;
   operationId: string;

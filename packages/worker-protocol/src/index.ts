@@ -446,6 +446,33 @@ export type ArchiveReceiptSelection =
       bindingEpoch: number;
     };
 
+export type ProviderOriginalDeclaration = {
+  referenceVersion: "provider_original_v1";
+  providerKind: "dropbox_v1";
+  clientReferenceId: string;
+  sourceContentHash: string;
+  sourceByteLength: number;
+  providerAccountIdHash: string;
+  providerRootDirectoryIdHash: string;
+  providerFileIdHash: string;
+  providerRevision: string;
+  providerContentHash: string;
+  verifiedAt: number;
+  locatorBundle: {
+    bindingId: string;
+    manifestFingerprint: string;
+    recipientFingerprint: string;
+    repositoryKeyDomainFingerprint: string;
+    repositoryId: string;
+    snapshotId: string;
+    objectName: string;
+    ciphertextHash: string;
+    ciphertextByteLength: number;
+    readbackVerifiedAt: number;
+  };
+  createdAt: number;
+};
+
 export type ParsedTextDeclaration = {
   extractionFingerprint: string;
   textHash: string;

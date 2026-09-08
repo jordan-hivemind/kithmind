@@ -153,6 +153,54 @@ test("PDF document-Q&A config is closed, bound, and keeps legacy bindings stable
     journalBindingForConfig(pdf).configFingerprint,
     journalBindingForConfig(legacy).configFingerprint,
   );
+  const remotePdf = pdfDocQaConfig();
+  delete remotePdf.archive.independentBackup.repositoryPath;
+  remotePdf.archive.independentBackup.repository = {
+    kind: "rclone_dropbox_v1",
+    remoteName: "kithmind_dropbox",
+    rootPath: "Kith Mind Backups/Processing",
+    rcloneBinary: "/tools/rclone",
+    configPath: "/credentials/kithmind-rclone.conf",
+    configIdentityFingerprint: "c".repeat(64),
+    expectedRootDirectoryIdHash: "d".repeat(64),
+  };
+  const parsedRemote = parseConfig({ ...base, pdfDocQa: remotePdf });
+  assert.deepEqual(
+    parsedRemote.pdfDocQa.archive.independentBackup.repository,
+    remotePdf.archive.independentBackup.repository,
+  );
+  assert.notEqual(
+    journalBindingForConfig(parsedRemote).configFingerprint,
+    journalBindingForConfig(pdf).configFingerprint,
+  );
+  const providerPdf = structuredClone(remotePdf);
+  const providerRootId = "id:synthetic_root";
+  providerPdf.providerOriginal = {
+    rootAlias: "notes",
+    providerRootDirectoryId: providerRootId,
+    providerAccountIdHash: "e".repeat(64),
+    providerRootDirectoryIdHash: createHash("sha256")
+      .update(providerRootId)
+      .digest("hex"),
+    refreshPath: "Kith Mind/Inbox",
+    registryDirectory: "/private/provider-registry",
+  };
+  const parsedProvider = parseConfig({ ...base, pdfDocQa: providerPdf });
+  assert.equal(parsedProvider.pdfDocQa.providerOriginal.rootAlias, "notes");
+  assert.notEqual(
+    journalBindingForConfig(parsedProvider).configFingerprint,
+    journalBindingForConfig(parsedRemote).configFingerprint,
+  );
+  const invalidProvider = structuredClone(providerPdf);
+  invalidProvider.providerOriginal.providerRootDirectoryIdHash = "f".repeat(64);
+  assert.throws(() => parseConfig({ ...base, pdfDocQa: invalidProvider }));
+  const invalidRemote = structuredClone(remotePdf);
+  invalidRemote.archive.independentBackup.repository.rootPath =
+    "Kith Mind Backups/../Processing";
+  assert.throws(() => parseConfig({ ...base, pdfDocQa: invalidRemote }));
+  const extraRemote = structuredClone(remotePdf);
+  extraRemote.archive.independentBackup.repository.endpoint = "custom";
+  assert.throws(() => parseConfig({ ...base, pdfDocQa: extraRemote }));
   assert.throws(() =>
     parseConfig({
       ...base,
@@ -550,12 +598,139 @@ test("archive forget responses bind the source hash, epoch, receipt, and acknowl
     parseWorkerResponse(JSON.stringify(ack), ack.operation).operation,
     ack.operation,
   );
+  const liveTarget = {
+    ...target,
+    subjectKind: "parser_output",
+    copyRole: "independent_backup",
+    ack: {
+      ...target.ack,
+      backupOutcome: "deleted",
+      absenceAuthority: "worker_asserted_live_repository_absence",
+      retentionDisclosure: "provider_retained_deleted_history_possible",
+    },
+  };
+  const livePage = { ...page, targets: [liveTarget] };
+  assert.equal(
+    parseWorkerResponse(JSON.stringify(livePage), livePage.operation).operation,
+    livePage.operation,
+  );
+  assert.equal(
+    parseWorkerResponse(
+      JSON.stringify({
+        operation: "archive.ackDeletion",
+        ...liveTarget.ack,
+        reused: false,
+      }),
+      "archive.ackDeletion",
+    ).retentionDisclosure,
+    "provider_retained_deleted_history_possible",
+  );
   assert.throws(() =>
     parseWorkerResponse(
       JSON.stringify({ ...ack, absenceAuthority: "filesystem_guess" }),
       ack.operation,
     ),
   );
+  for (const invalid of [
+    {
+      ...ack,
+      retentionDisclosure: "provider_retained_deleted_history_possible",
+    },
+    {
+      ...ack,
+      absenceAuthority: "worker_asserted_live_repository_absence",
+      retentionDisclosure: "provider_retained_deleted_history_possible",
+    },
+    {
+      ...ack,
+      absenceAuthority: "worker_asserted_live_repository_absence",
+    },
+    {
+      ...ack,
+      absenceAuthority: "worker_asserted_live_repository_absence",
+      retentionDisclosure: "physical_erasure_complete",
+    },
+  ])
+    assert.throws(() =>
+      parseWorkerResponse(
+        JSON.stringify(invalid),
+        invalid.operation ?? "archive.ackDeletion",
+      ),
+    );
+  for (const inconsistentTarget of [
+    { ...liveTarget, copyRole: "primary", ack: liveTarget.ack },
+    { ...liveTarget, subjectKind: "original_bytes", ack: liveTarget.ack },
+  ])
+    assert.throws(() =>
+      parseWorkerResponse(
+        JSON.stringify({ ...page, targets: [inconsistentTarget] }),
+        page.operation,
+      ),
+    );
+});
+
+test("provider original forget responses require exact retained-source disclosure", () => {
+  const ack = {
+    detachId: "11111111-1111-4111-8111-111111111111",
+    referenceId: "reference_1",
+    forgetEpoch: 3,
+    referenceOutcome: "detached",
+    locatorBundleOutcome: "deleted",
+    locatorAbsenceAuthority: "worker_asserted_live_repository_absence",
+    retentionDisclosure: "provider_retained_deleted_history_possible",
+    providerSourceOutcome: "retained_unchanged",
+    completedAt: 10,
+  };
+  const target = {
+    referenceId: ack.referenceId,
+    referenceFingerprint: "1".repeat(64),
+    locatorBindingId: "22222222-2222-4222-8222-222222222222",
+    locatorRepositoryId: "2".repeat(64),
+    locatorSnapshotId: "3".repeat(64),
+    locatorObjectName: "locator.age",
+    locatorCiphertextHash: "4".repeat(64),
+    locatorCiphertextByteLength: 500,
+    forgetEpoch: 3,
+    ack,
+  };
+  const page = {
+    operation: "providerOriginal.forgetTargets",
+    sourceItemId: "source_1",
+    sourceExternalIdHash: "5".repeat(64),
+    forgetEpoch: 3,
+    targets: [target],
+    isDone: true,
+    continueCursor: "done",
+  };
+  assert.equal(
+    parseWorkerResponse(JSON.stringify(page), page.operation).operation,
+    page.operation,
+  );
+  const result = {
+    operation: "providerOriginal.ackDetach",
+    ...ack,
+    reused: false,
+  };
+  assert.equal(
+    parseWorkerResponse(JSON.stringify(result), result.operation)
+      .providerSourceOutcome,
+    "retained_unchanged",
+  );
+  for (const invalid of [
+    { ...page, targets: [{ ...target, forgetEpoch: 4 }] },
+    { ...page, targets: [{ ...target, locatorObjectName: "../locator.age" }] },
+    {
+      ...page,
+      targets: [
+        { ...target, ack: { ...ack, providerSourceOutcome: "deleted" } },
+      ],
+    },
+    { ...result, retentionDisclosure: undefined },
+    { ...result, locatorAbsenceAuthority: "worker_asserted_physical_absence" },
+  ])
+    assert.throws(() =>
+      parseWorkerResponse(JSON.stringify(invalid), invalid.operation),
+    );
 });
 
 test("archived discovery responses require exact closed B1 shapes", () => {
@@ -656,6 +831,23 @@ test("archived discovery responses require exact closed B1 shapes", () => {
       response.operation,
     );
   }
+  for (const response of [originalLookup, processingLookup, admit].map(
+    (value) => {
+      const provider = {
+        ...value,
+        originalProviderReferenceId: "provider-reference",
+        originalProviderBindingEpoch: 1,
+      };
+      delete provider.originalBackupReceiptId;
+      delete provider.originalBackupBindingEpoch;
+      return provider;
+    },
+  ))
+    assert.equal(
+      parseWorkerResponse(JSON.stringify(response), response.operation)
+        .originalProviderReferenceId,
+      "provider-reference",
+    );
   assert.equal(
     parseWorkerResponse(
       JSON.stringify({
@@ -679,6 +871,14 @@ test("archived discovery responses require exact closed B1 shapes", () => {
       processingLookup.operation,
     ],
     [{ ...admit, state: "queued" }, admit.operation],
+    [
+      {
+        ...admit,
+        originalProviderReferenceId: "provider-reference",
+        originalProviderBindingEpoch: 1,
+      },
+      admit.operation,
+    ],
   ]) {
     assert.throws(() =>
       parseWorkerResponse(JSON.stringify(response), operation),

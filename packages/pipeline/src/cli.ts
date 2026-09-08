@@ -280,7 +280,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       parsed.json
         ? `${JSON.stringify(result)}\n`
         : result.state === "owner_finalization_required"
-          ? `archive forget: owner finalization required (${result.receiptCount} receipts acknowledged)\n`
+          ? `archive forget: owner finalization required (${result.receiptCount} receipts acknowledged; ${result.retainedProviderHistoryPossible ? "live repository removed, Dropbox may retain deleted/version history" : "physical absence asserted"})\n`
           : `archive forget: ${result.state} (${result.code})\n`,
     );
     if (result.state !== "owner_finalization_required") process.exitCode = 1;

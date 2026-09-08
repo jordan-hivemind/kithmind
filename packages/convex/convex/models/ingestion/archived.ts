@@ -15,7 +15,6 @@ export async function createArchivedIngestWork(
     archiveSetDigest: string;
     normalizedBundleDigest: string;
     originalPrimaryReceiptId: Id<"sourceArtifactArchiveReceipts">;
-    originalBackupReceiptId: Id<"sourceArtifactArchiveReceipts">;
     parserPrimaryReceiptId: Id<"sourceArtifactArchiveReceipts">;
     parserBackupReceiptId: Id<"sourceArtifactArchiveReceipts">;
     processing: {
@@ -35,7 +34,18 @@ export async function createArchivedIngestWork(
     expectedDesiredProcessingEpoch: number;
     workerDiscoveryWorkId: Id<"workerDiscoveryWork">;
     workerObservationEpoch: number;
-  },
+  } & (
+    | {
+        originalBackupReceiptId: Id<"sourceArtifactArchiveReceipts">;
+        originalProviderReferenceId?: never;
+        originalProviderBindingEpoch?: never;
+      }
+    | {
+        originalProviderReferenceId: Id<"sourceProviderOriginalReferences">;
+        originalProviderBindingEpoch: number;
+        originalBackupReceiptId?: never;
+      }
+  ),
 ): Promise<{
   generation: Doc<"processingGenerations">;
   job: Doc<"ingestJobs">;
@@ -87,7 +97,12 @@ export async function createArchivedIngestWork(
     archiveSetDigest: input.archiveSetDigest,
     normalizedBundleDigest: input.normalizedBundleDigest,
     originalPrimaryReceiptId: input.originalPrimaryReceiptId,
-    originalBackupReceiptId: input.originalBackupReceiptId,
+    ...(input.originalBackupReceiptId === undefined
+      ? {
+          originalProviderReferenceId: input.originalProviderReferenceId,
+          originalProviderBindingEpoch: input.originalProviderBindingEpoch,
+        }
+      : { originalBackupReceiptId: input.originalBackupReceiptId }),
     parserPrimaryReceiptId: input.parserPrimaryReceiptId,
     parserBackupReceiptId: input.parserBackupReceiptId,
     desiredProcessingEpoch,

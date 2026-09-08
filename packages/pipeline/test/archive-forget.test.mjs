@@ -7,6 +7,7 @@ import test from "node:test";
 
 import { openArchiveCatalog } from "../dist/archiveCatalog.js";
 import { runArchiveForget } from "../dist/archiveForget.js";
+import { providerOriginalReferenceFingerprint } from "../dist/archivedRequestMapping.js";
 import { Journal } from "../dist/journal.js";
 
 const hash = (value) =>
@@ -33,7 +34,7 @@ function config(directory) {
   };
   return {
     protocolVersion: 1,
-    endpoint: "https://worker.example/api/worker",
+    endpoint: `https://worker-${hash(directory).slice(0, 32)}.example/api/worker`,
     spaceId: "space_1",
     sourceAccountId: "source_1",
     credentialEnv: "TEST_KEY",
@@ -272,7 +273,10 @@ function commands(catalog, calls) {
       const rows = catalog.listOriginals();
       assert.ok(
         rows.some((row) =>
-          Object.values(row.copies).some(
+          [
+            ...Object.values(row.copies),
+            ...(row.providerOriginal ? [row.providerOriginal.locator] : []),
+          ].some(
             (value) =>
               value.deletion?.state === "pending" &&
               (value.cloudReceipt === undefined ||
@@ -317,6 +321,10 @@ function commands(catalog, calls) {
     async removeSpool(input) {
       calls.push(["spool", input]);
       return { state: "removed" };
+    },
+    async removeProviderBinding(input) {
+      calls.push(["provider-binding", input]);
+      return { outcome: "deleted" };
     },
   };
 }
@@ -794,6 +802,393 @@ test("a lost acknowledgement response resumes from the durable deletion identity
     assert.equal(
       ackRequests[0].requestId,
       deletionIds.primary.deletion.deletionId,
+    );
+  } finally {
+    await f.journal.close();
+    await rm(f.directory, { recursive: true, force: true });
+  }
+});
+
+test("provider forget deletes only Kith locator metadata and reports the retained Dropbox source", async () => {
+  const f = await setup();
+  try {
+    const sourceExternalId = randomUUID();
+    const sourceItemId = "source_item";
+    const remote = {
+      kind: "rclone_dropbox_v1",
+      remoteName: "kithmind_dropbox",
+      rootPath: "Kith Mind Backups/Processing",
+      rcloneBinary: "/tools/rclone",
+      configPath: "/private/rclone.conf",
+      configIdentityFingerprint: repeatedHash("c"),
+      expectedRootDirectoryIdHash: repeatedHash("d"),
+    };
+    f.config.pdfDocQa.archive.independentBackup = {
+      ...f.config.pdfDocQa.archive.independentBackup,
+      repository: remote,
+    };
+    delete f.config.pdfDocQa.archive.independentBackup.repositoryPath;
+    f.config.pdfDocQa.providerOriginal = {
+      rootAlias: "root",
+      providerRootDirectoryId: "id:root",
+      providerAccountIdHash: hash("dbid:account"),
+      providerRootDirectoryIdHash: hash("id:root"),
+      refreshPath: "/Dropbox/Kith Mind",
+      registryDirectory: join(f.directory, "provider-registry"),
+    };
+    const primary = copy("primary", "2");
+    const locator = copy("independent_backup", "3");
+    locator.restic.repositoryId = "repository_1";
+    let row = await f.catalog.createOriginalIntent({
+      originalCatalogId: randomUUID(),
+      sourceExternalId,
+      origin: {
+        scanId: "scan_1",
+        observationEpoch: 1,
+        sha256: repeatedHash("1"),
+        byteLength: 100,
+        mediaType: "application/pdf",
+      },
+      copies: { primary },
+      providerOriginal: {
+        clientReferenceId: randomUUID(),
+        bindingId: randomUUID(),
+        locator,
+      },
+      createdAt: 1,
+    });
+    const primaryCipher = { sha256: repeatedHash("4"), byteLength: 200 };
+    row = await f.catalog.recordArchivePreparationIntent({
+      subject: "original_bytes",
+      catalogId: row.originalCatalogId,
+      expectedRevision: row.rowRevision,
+      role: "primary",
+      tempName: `${primary.archiveObjectId}.tmp`,
+    });
+    row = await f.catalog.recordArchivePrepared({
+      subject: "original_bytes",
+      catalogId: row.originalCatalogId,
+      expectedRevision: row.rowRevision,
+      role: "primary",
+      prepared: {
+        state: "prepared",
+        tempName: row.copies.primary.preparationIntent.tempName,
+        source: {
+          sha256: row.origin.sha256,
+          byteLength: row.origin.byteLength,
+        },
+        ciphertext: primaryCipher,
+        ciphertextDevice: 10,
+        ciphertextInode: 11,
+        archiveDirectoryDevice: 10,
+        archiveDirectoryInode: 12,
+        ageVersion: "v1.3.2",
+      },
+    });
+    row = await f.catalog.recordArchivePublished({
+      subject: "original_bytes",
+      catalogId: row.originalCatalogId,
+      expectedRevision: row.rowRevision,
+      role: "primary",
+      published: {
+        state: "published",
+        source: row.copies.primary.prepared.source,
+        ciphertext: primaryCipher,
+        ciphertextDevice: 10,
+        ciphertextInode: 11,
+        ageVersion: "v1.3.2",
+      },
+      readbackVerifiedAt: 2,
+    });
+    row = await f.catalog.recordCloudReceipt({
+      subject: "original_bytes",
+      catalogId: row.originalCatalogId,
+      expectedRevision: row.rowRevision,
+      role: "primary",
+      receiptId: "receipt_primary",
+      requestDigest: repeatedHash("7"),
+      recordedAt: 2,
+    });
+    const verified = {
+      providerAccountIdHash: hash("dbid:account"),
+      providerRootDirectoryIdHash: hash("id:root"),
+      providerFileIdHash: hash("id:file"),
+      providerRevision: "rev1",
+      providerContentHash: repeatedHash("5"),
+      sourceContentHash: row.origin.sha256,
+      sourceByteLength: row.origin.byteLength,
+      verifiedAt: 2,
+      manifestFingerprint: repeatedHash("6"),
+      manifestByteLength: 300,
+    };
+    row = await f.catalog.recordProviderVerified({
+      catalogId: row.originalCatalogId,
+      expectedRevision: row.rowRevision,
+      verified,
+    });
+    const locatorCipher = { sha256: repeatedHash("8"), byteLength: 400 };
+    row = await f.catalog.updateProviderLocator({
+      catalogId: row.originalCatalogId,
+      expectedRevision: row.rowRevision,
+      update(value) {
+        value.preparationIntent = { tempName: `${value.archiveObjectId}.tmp` };
+      },
+    });
+    row = await f.catalog.updateProviderLocator({
+      catalogId: row.originalCatalogId,
+      expectedRevision: row.rowRevision,
+      update(value) {
+        value.prepared = {
+          state: "prepared",
+          tempName: value.preparationIntent.tempName,
+          source: {
+            sha256: verified.manifestFingerprint,
+            byteLength: verified.manifestByteLength,
+          },
+          ciphertext: locatorCipher,
+          ciphertextDevice: 20,
+          ciphertextInode: 21,
+          archiveDirectoryDevice: 20,
+          archiveDirectoryInode: 22,
+          ageVersion: "v1.3.2",
+        };
+      },
+    });
+    row = await f.catalog.updateProviderLocator({
+      catalogId: row.originalCatalogId,
+      expectedRevision: row.rowRevision,
+      update(value) {
+        value.published = {
+          state: "published",
+          source: value.prepared.source,
+          ciphertext: locatorCipher,
+          ciphertextDevice: 20,
+          ciphertextInode: 21,
+          ageVersion: "v1.3.2",
+        };
+      },
+    });
+    row = await f.catalog.updateProviderLocator({
+      catalogId: row.originalCatalogId,
+      expectedRevision: row.rowRevision,
+      update(value) {
+        value.backup = {
+          operationId: value.restic.operationId,
+          snapshotId: repeatedHash("9"),
+          objectName: value.objectName,
+          ciphertext: locatorCipher,
+          resticVersion: "0.19.1",
+          repositoryId: value.restic.repositoryId,
+          verification: "destination_ciphertext_readback",
+          boundary: {
+            mode: "independent_backup",
+            readiness: "remote_repository_verified",
+            backend: "rclone_dropbox_v1",
+            remoteName: remote.remoteName,
+            rootPath: remote.rootPath,
+            rootDirectoryIdHash: remote.expectedRootDirectoryIdHash,
+            configIdentityFingerprint: remote.configIdentityFingerprint,
+            repositoryId: value.restic.repositoryId,
+            resticVersion: "0.19.1",
+            rcloneVersion: "v1.74.4",
+          },
+        };
+        value.readbackVerifiedAt = 3;
+      },
+    });
+    const referenceId = "provider_reference_1";
+    row = await f.catalog.recordOriginalCloud({
+      catalogId: row.originalCatalogId,
+      expectedRevision: row.rowRevision,
+      cloud: {
+        sourceItemId,
+        sourceRevisionId: "revision_1",
+        primaryReceiptId: row.copies.primary.cloudReceipt.receiptId,
+        providerReferenceId: referenceId,
+        providerBindingEpoch: 1,
+        admittedAt: 4,
+      },
+    });
+    const declaration = {
+      referenceVersion: "provider_original_v1",
+      providerKind: "dropbox_v1",
+      clientReferenceId: row.providerOriginal.clientReferenceId,
+      sourceContentHash: verified.sourceContentHash,
+      sourceByteLength: verified.sourceByteLength,
+      providerAccountIdHash: verified.providerAccountIdHash,
+      providerRootDirectoryIdHash: verified.providerRootDirectoryIdHash,
+      providerFileIdHash: verified.providerFileIdHash,
+      providerRevision: verified.providerRevision,
+      providerContentHash: verified.providerContentHash,
+      verifiedAt: verified.verifiedAt,
+      locatorBundle: {
+        bindingId: row.providerOriginal.bindingId,
+        manifestFingerprint: verified.manifestFingerprint,
+        recipientFingerprint: row.providerOriginal.locator.recipientFingerprint,
+        repositoryKeyDomainFingerprint:
+          row.providerOriginal.locator.repositoryKeyDomainFingerprint,
+        repositoryId: row.providerOriginal.locator.backup.repositoryId,
+        snapshotId: row.providerOriginal.locator.backup.snapshotId,
+        objectName: row.providerOriginal.locator.objectName,
+        ciphertextHash: locatorCipher.sha256,
+        ciphertextByteLength: locatorCipher.byteLength,
+        readbackVerifiedAt: row.providerOriginal.locator.readbackVerifiedAt,
+      },
+      createdAt: row.createdAt,
+    };
+    const archiveTarget = cloudTargets(
+      {
+        copies: {
+          primary: row.copies.primary,
+          independent_backup: row.copies.primary,
+        },
+      },
+      7,
+    )[0];
+    const providerTarget = {
+      referenceId,
+      referenceFingerprint: providerOriginalReferenceFingerprint(declaration),
+      locatorBindingId: declaration.locatorBundle.bindingId,
+      locatorRepositoryId: declaration.locatorBundle.repositoryId,
+      locatorSnapshotId: declaration.locatorBundle.snapshotId,
+      locatorObjectName: declaration.locatorBundle.objectName,
+      locatorCiphertextHash: declaration.locatorBundle.ciphertextHash,
+      locatorCiphertextByteLength:
+        declaration.locatorBundle.ciphertextByteLength,
+      forgetEpoch: 7,
+    };
+    const archiveAcks = new Map();
+    let providerAck;
+    const requests = [];
+    const worker = {
+      async call(request) {
+        requests.push(structuredClone(request));
+        if (request.operation === "archive.forgetTargets")
+          return {
+            operation: request.operation,
+            sourceItemId,
+            sourceExternalIdHash: hash(sourceExternalId),
+            forgetEpoch: 7,
+            targets: [
+              {
+                ...archiveTarget,
+                ...(archiveAcks.has(archiveTarget.receiptId)
+                  ? { ack: archiveAcks.get(archiveTarget.receiptId) }
+                  : {}),
+              },
+            ],
+            isDone: true,
+            continueCursor: "done",
+          };
+        if (request.operation === "providerOriginal.forgetTargets")
+          return {
+            operation: request.operation,
+            sourceItemId,
+            sourceExternalIdHash: hash(sourceExternalId),
+            forgetEpoch: 7,
+            targets: [
+              {
+                ...providerTarget,
+                ...(providerAck ? { ack: providerAck } : {}),
+              },
+            ],
+            isDone: true,
+            continueCursor: "done",
+          };
+        if (request.operation === "archive.ackDeletion") {
+          const ack = {
+            deletionId: request.deletionId,
+            receiptId: request.receiptId,
+            forgetEpoch: 7,
+            objectOutcome: request.objectOutcome,
+            absenceAuthority: "worker_asserted_physical_absence",
+            completedAt: 10,
+          };
+          archiveAcks.set(request.receiptId, ack);
+          return { operation: request.operation, ...ack, reused: false };
+        }
+        assert.equal(request.operation, "providerOriginal.ackDetach");
+        providerAck = {
+          detachId: request.detachId,
+          referenceId,
+          forgetEpoch: 7,
+          referenceOutcome: "detached",
+          locatorBundleOutcome: request.locatorBundleOutcome,
+          locatorAbsenceAuthority: "worker_asserted_live_repository_absence",
+          retentionDisclosure: "provider_retained_deleted_history_possible",
+          providerSourceOutcome: "retained_unchanged",
+          completedAt: 11,
+        };
+        return { operation: request.operation, ...providerAck, reused: false };
+      },
+    };
+    const calls = [];
+    const result = await runArchiveForget({
+      config: f.config,
+      catalog: f.catalog,
+      transport: worker,
+      sourceItemId,
+      sourceExternalId,
+      forgetEpoch: 7,
+      commands: commands(f.catalog, calls),
+      now: () => 5,
+    });
+    assert.equal(
+      result.state,
+      "owner_finalization_required",
+      JSON.stringify(result),
+    );
+    assert.equal(result.receiptCount, 1);
+    assert.equal(result.providerReferenceCount, 1);
+    assert.equal(
+      result.providerOriginalOutcome,
+      "provider_original_reference_detached_source_retained",
+    );
+    assert.equal(
+      calls.filter(([kind]) => kind === "provider-binding").length,
+      1,
+    );
+    assert.equal(
+      requests.filter(
+        (request) => request.operation === "providerOriginal.ackDetach",
+      ).length,
+      1,
+    );
+    assert.equal(
+      requests.some(
+        (request) =>
+          request.operation === "archive.ackDeletion" &&
+          request.receiptId === referenceId,
+      ),
+      false,
+    );
+    const destructiveCalls = calls.filter(
+      ([kind]) => kind === "age" || kind === "backup",
+    ).length;
+    const replay = await runArchiveForget({
+      config: f.config,
+      catalog: f.catalog,
+      transport: worker,
+      sourceItemId,
+      sourceExternalId,
+      forgetEpoch: 7,
+      commands: commands(f.catalog, calls),
+      now: () => 6,
+    });
+    assert.equal(
+      replay.state,
+      "owner_finalization_required",
+      JSON.stringify(replay),
+    );
+    assert.equal(
+      calls.filter(([kind]) => kind === "age" || kind === "backup").length,
+      destructiveCalls,
+    );
+    assert.equal(
+      requests.filter(
+        (request) => request.operation === "providerOriginal.ackDetach",
+      ).length,
+      1,
     );
   } finally {
     await f.journal.close();
