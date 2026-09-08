@@ -8,7 +8,7 @@ until the isolated restore and owner-pilot gates in the
 Build and check the worker before configuring a service:
 
 ```sh
-pnpm --filter @repo/pipeline build
+pnpm exec turbo run build --filter=@repo/pipeline
 pnpm --silent brain:doctor -- --config /absolute/path/to/pipeline.json --json
 ```
 

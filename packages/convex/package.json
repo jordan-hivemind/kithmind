@@ -9,6 +9,7 @@
     "./models/*": "./convex/models/*"
   },
   "scripts": {
+    "build": "tsc --noEmit",
     "dev": "pnpm run prepare:worker-protocol && convex dev",
     "deploy:dev": "pnpm run prepare:worker-protocol && convex dev --once",
     "deploy:prod": "pnpm run prepare:worker-protocol && convex deploy -y",

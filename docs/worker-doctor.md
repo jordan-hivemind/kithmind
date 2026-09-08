@@ -14,7 +14,7 @@ installing dependencies:
 
 ```sh
 pnpm install --frozen-lockfile
-pnpm --filter @repo/pipeline build
+pnpm exec turbo run build --filter=@repo/pipeline
 pnpm --silent brain:doctor -- --config /absolute/path/to/pipeline.json --json
 ```
 

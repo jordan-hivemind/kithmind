@@ -6,6 +6,10 @@
       "dependsOn": ["^build"],
       "outputs": [".next/**", "!.next/cache/**", "dist/**"]
     },
+    "@repo/db#build": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
     "dev": {
       "cache": false,
       "persistent": true
@@ -21,7 +25,16 @@
       "persistent": true
     },
     "test:once": {
-      "cache": false
+      "cache": false,
+      "dependsOn": ["^build"]
+    },
+    "@repo/worker-protocol#test:once": {
+      "cache": false,
+      "dependsOn": ["build"]
+    },
+    "@repo/pipeline#test:once": {
+      "cache": false,
+      "dependsOn": ["build"]
     }
   },
   "globalPassThroughEnv": ["PORT", "WEB_PORT"],

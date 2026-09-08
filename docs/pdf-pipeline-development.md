@@ -112,9 +112,12 @@ filename alone.
 
 Run these from the repository root:
 
+The Turbo commands build workspace dependencies first. Package-local build
+and test scripts assume those dependencies are already prepared.
+
 ```sh
 PYTHONPATH=evals/parser/src python3 -m unittest discover -s evals/parser/tests -p 'test_*.py'
-pnpm --filter @repo/pipeline test:once
+pnpm exec turbo run test:once --filter=@repo/pipeline
 pnpm --filter @repo/db test:once
 pnpm lint
 pnpm check-types
