@@ -1312,14 +1312,14 @@ function parsedTextDeclaration(value: unknown): ParsedTextDeclaration {
   return {
     extractionFingerprint: hash(input.extractionFingerprint),
     textHash: hash(input.textHash),
-    byteLength: integer(input.byteLength, 1, 256 * 1_024),
-    utf16Length: integer(input.utf16Length, 1, 256 * 1_024),
-    pageCount: integer(input.pageCount, 1, 32),
+    byteLength: integer(input.byteLength, 1, 1_024 * 1_024),
+    utf16Length: integer(input.utf16Length, 1, 1_024 * 1_024),
+    pageCount: integer(input.pageCount, 1, 64),
     mappingManifestHash: hash(input.mappingManifestHash),
     normalizedBundleDigest: hash(input.normalizedBundleDigest),
-    expectedEvidenceSpanCount: integer(input.expectedEvidenceSpanCount, 1, 128),
+    expectedEvidenceSpanCount: integer(input.expectedEvidenceSpanCount, 1, 256),
     expectedDocumentCount: integer(input.expectedDocumentCount, 1, 16),
-    expectedChunkCount: integer(input.expectedChunkCount, 1, 128),
+    expectedChunkCount: integer(input.expectedChunkCount, 1, 256),
   };
 }
 
@@ -1834,14 +1834,14 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
           maxUtf16: 64,
           pattern: SHA256,
         }),
-        expectedPageCount: integer(input.expectedPageCount, 1, 32),
+        expectedPageCount: integer(input.expectedPageCount, 1, 64),
         expectedEvidenceSpanCount: integer(
           input.expectedEvidenceSpanCount,
           1,
-          128,
+          256,
         ),
         expectedDocumentCount: integer(input.expectedDocumentCount, 1, 16),
-        expectedChunkCount: integer(input.expectedChunkCount, 1, 128),
+        expectedChunkCount: integer(input.expectedChunkCount, 1, 256),
       };
     }
     case "jobs.stageParsedBatch": {
@@ -1882,7 +1882,7 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
         ...jobLeaseRequest(input),
         stageId: string(input.stageId, { maxUtf16: 256 }),
         phase: input.phase,
-        ordinal: integer(input.ordinal, 0, 128),
+        ordinal: integer(input.ordinal, 0, 256),
         rows,
       };
     }

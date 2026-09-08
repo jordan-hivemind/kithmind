@@ -1,7 +1,7 @@
 export const MAX_ARCHIVED_BINARY_BYTES = 16 * 1_024 * 1_024;
 export const MAX_PARSER_ARTIFACT_BYTES = 64 * 1_024 * 1_024;
-export const MAX_PARSED_TEXT_UTF8_BYTES = 256 * 1_024;
-export const MAX_PARSED_TEXT_PAGES = 32;
+export const MAX_PARSED_TEXT_UTF8_BYTES = 1_024 * 1_024;
+export const MAX_PARSED_TEXT_PAGES = 64;
 export const MAX_LEGACY_INLINE_UTF8_BYTES = 65_536;
 
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;

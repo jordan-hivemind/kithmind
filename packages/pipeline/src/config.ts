@@ -3,7 +3,10 @@ import { constants } from "node:fs";
 import { open } from "node:fs/promises";
 import { resolve } from "node:path";
 
-import { PDF_DOCQA_CHUNKING_FINGERPRINT } from "./parsedBundleMapping.js";
+import {
+  PDF_DOCQA_CHUNKING_FINGERPRINT,
+  PDF_DOCQA_LEGACY_CHUNKING_FINGERPRINT,
+} from "./parsedBundleMapping.js";
 import type { PipelineConfig, RootConfig } from "./types.js";
 import type { JournalBinding } from "./journalTypes.js";
 
@@ -284,7 +287,10 @@ function pdfDocQa(value: unknown, roots: RootConfig[], journalDir: string) {
       "pdfDocQa.profile.correctionRevision",
     ),
   };
-  if (profile.chunkerFingerprint !== PDF_DOCQA_CHUNKING_FINGERPRINT) {
+  if (
+    profile.chunkerFingerprint !== PDF_DOCQA_CHUNKING_FINGERPRINT &&
+    profile.chunkerFingerprint !== PDF_DOCQA_LEGACY_CHUNKING_FINGERPRINT
+  ) {
     fail(
       "pdfDocQa.profile.chunkerFingerprint is not the PDF document-Q&A policy",
     );

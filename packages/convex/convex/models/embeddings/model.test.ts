@@ -13,6 +13,7 @@ import {
   bumpEmbeddingEligibilityEpoch,
   createEmbeddingGeneration,
   deleteThoughtEmbeddingVectors,
+  deriveEmbeddingManifest,
   embeddingVectorSearchScope,
   getActiveEmbeddingTarget,
   insertThoughtEmbedding,
@@ -64,6 +65,111 @@ async function seed() {
 }
 
 describe("embedding generations", () => {
+  test("fails closed when one thought and 256 active chunks exceed the bounded manifest", async () => {
+    const seeded = await seed();
+    await seeded.t.run(async (ctx) => {
+      const sourceAccountId = await ctx.db.insert("sourceAccounts", {
+        spaceId: seeded.spaceId,
+        connector: "synthetic",
+        accountId: "large-pdf",
+        name: "Synthetic source",
+        enabled: true,
+        cursorVersion: 0,
+        freshnessMs: 60_000,
+        createdBy: seeded.userId,
+      });
+      const sourceItemId = await ctx.db.insert("sourceItems", {
+        spaceId: seeded.spaceId,
+        sourceAccountId,
+        externalIdHash: "large-pdf-hash",
+        externalId: "large-pdf",
+        lifecycle: "available",
+        originalLinkAvailable: false,
+        desiredProcessingEpoch: 1,
+      });
+      const sourceRevisionId = await ctx.db.insert("sourceRevisions", {
+        spaceId: seeded.spaceId,
+        sourceItemId,
+        contentHash: "content-hash",
+        byteLength: 1,
+        mediaType: "text/plain",
+        inlineText: "x",
+        capturedAt: 1,
+        userId: seeded.userId,
+      });
+      const sourceTextVersionId = await ctx.db.insert("sourceTextVersions", {
+        spaceId: seeded.spaceId,
+        sourceRevisionId,
+        extractionFingerprint: "extract-v1",
+        text: "x",
+        textHash: "text-hash",
+        byteLength: 1,
+        evidenceSealed: true,
+      });
+      const processingGenerationId = await ctx.db.insert(
+        "processingGenerations",
+        {
+          spaceId: seeded.spaceId,
+          sourceAccountId,
+          sourceItemId,
+          sourceRevisionId,
+          sourceTextVersionId,
+          processingFingerprint: "processing-v1",
+          extractionFingerprint: "extract-v1",
+          extractorFingerprint: "extractor-v1",
+          recordSchemaFingerprint: "schema-v1",
+          normalizationFingerprint: "normalization-v1",
+          chunkerFingerprint: "chunker-v1",
+          correctionRevision: "0",
+          desiredProcessingEpoch: 1,
+          state: "ready",
+          expectedPageCount: 1,
+          expectedEvidenceSpanCount: 0,
+          expectedDocumentCount: 1,
+          expectedChunkCount: 256,
+          actualPageCount: 1,
+          actualEvidenceSpanCount: 0,
+          actualDocumentCount: 1,
+          actualChunkCount: 256,
+          embeddingStatus: "unavailable",
+          activatedAt: 2,
+        },
+      );
+      const documentId = await ctx.db.insert("documents", {
+        spaceId: seeded.spaceId,
+        processingGenerationId,
+        sourceItemId,
+        sourceRevisionId,
+        sourceTextVersionId,
+        documentKey: "main",
+        title: "Synthetic large PDF",
+        docType: "pdf",
+        capturedAt: 1,
+        evidenceSpanIds: [],
+        publicationState: "active",
+      });
+      for (let ordinal = 0; ordinal < 256; ordinal += 1) {
+        await ctx.db.insert("chunks", {
+          spaceId: seeded.spaceId,
+          processingGenerationId,
+          documentId,
+          ordinal,
+          text: "x",
+          evidenceSpanIds: [],
+          publicationState: "active",
+        });
+      }
+      await ctx.db.patch(sourceItemId, {
+        desiredRevisionId: sourceRevisionId,
+        activeRevisionId: sourceRevisionId,
+        activeGenerationId: processingGenerationId,
+      });
+    });
+    await expect(
+      seeded.t.run((ctx) => deriveEmbeddingManifest(ctx, seeded.spaceId)),
+    ).rejects.toThrow("global row budget");
+  });
+
   test("copies an existing vector into a staged generation and activates atomically", async () => {
     const seeded = await seed();
     const fingerprint = await fingerprintEmbeddingConfig(baselineProfile);

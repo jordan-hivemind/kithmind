@@ -132,6 +132,34 @@ describe("parsed worker protocol", () => {
     ).toThrow();
   });
 
+  it("accepts only exact page locators within the parsed profile", () => {
+    expect(
+      parseParsedLocator({
+        kind: "parser_page_v1",
+        pageNumber: 64,
+        pageTextHash: "a".repeat(64),
+      }),
+    ).toEqual({
+      kind: "parser_page_v1",
+      pageNumber: 64,
+      pageTextHash: "a".repeat(64),
+    });
+    expect(() =>
+      parseParsedLocator({
+        kind: "parser_page_v1",
+        pageNumber: 65,
+        pageTextHash: "a".repeat(64),
+      }),
+    ).toThrow();
+    expect(() =>
+      parseParsedLocator({
+        kind: "parser_page_v1",
+        pageNumber: 1,
+        pageTextHash: "A".repeat(64),
+      }),
+    ).toThrow();
+  });
+
   it("enforces UTF-16 ranges and exact closed row shapes", () => {
     expect(
       parseParsedPageInput({

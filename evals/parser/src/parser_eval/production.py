@@ -26,8 +26,8 @@ from .convert_worker import (
 from .manifest import ManifestError, load_manifest, verify_manifest
 from .normalize import codepoint_to_utf16, normalize_text
 
-MAX_PAGES = 32
-MAX_RETAINED_UTF8_BYTES = 256 * 1024
+MAX_PAGES = 64
+MAX_RETAINED_UTF8_BYTES = 1024 * 1024
 MAX_SERIALIZED_BUNDLE_BYTES = 4 * 1024 * 1024
 MAX_LOSSLESS_JSON_BYTES = 64 * 1024 * 1024
 EXPECTED_PYTHON = (3, 12, 12)
@@ -178,6 +178,138 @@ def _item_provenance_pages(
     return pages
 
 
+def _raw_cross_page_slices(
+    item: Any, maximum_page: int
+) -> list[tuple[int, int, int, int, int]] | None:
+    if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+        return None
+    text = item["text"]
+    provenance = item.get("prov")
+    if not isinstance(provenance, list) or not 2 <= len(provenance) <= 256:
+        return None
+    prior_end = 0
+    prior_page = 0
+    groups: list[tuple[int, int, int]] = []
+    for index, span in enumerate(provenance):
+        if not isinstance(span, dict):
+            return None
+        page = span.get("page_no")
+        charspan = span.get("charspan")
+        if (
+            type(page) is not int
+            or not 1 <= page <= maximum_page
+            or page < prior_page
+            or not isinstance(charspan, list)
+            or len(charspan) != 2
+            or any(type(offset) is not int for offset in charspan)
+            or not 0 <= prior_end <= charspan[0] < charspan[1] <= len(text)
+            or not _provenance_whitespace_only(text[prior_end : charspan[0]])
+        ):
+            return None
+        if not groups or groups[-1][0] != page:
+            groups.append((page, index, index + 1))
+        else:
+            groups[-1] = (page, groups[-1][1], index + 1)
+        prior_end = charspan[1]
+        prior_page = page
+    if (
+        len(groups) < 2
+        or not _provenance_whitespace_only(text[prior_end:])
+        or any(left[0] >= right[0] for left, right in zip(groups, groups[1:]))
+    ):
+        return None
+    slices = []
+    for ordinal, (page, provenance_start, provenance_end) in enumerate(groups):
+        text_start = 0 if ordinal == 0 else provenance[provenance_start]["charspan"][0]
+        text_end = (
+            len(text)
+            if ordinal + 1 == len(groups)
+            else provenance[groups[ordinal + 1][1]]["charspan"][0]
+        )
+        if not normalize_text(text[text_start:text_end]).strip("\n"):
+            return None
+        slices.append(
+            (page, provenance_start, provenance_end, text_start, text_end)
+        )
+    return slices
+
+
+def _body_text_refs(lossless: dict[str, Any]) -> set[str]:
+    """Return text items reachable through Docling's traversed body tree."""
+    body = lossless.get("body")
+    if not isinstance(body, dict):
+        raise ProductionFailure("conversion_output_invalid")
+    collection_names = (
+        "groups",
+        "texts",
+        "pictures",
+        "tables",
+        "key_value_items",
+        "form_items",
+        "field_regions",
+        "field_items",
+    )
+    collections = {
+        name: lossless.get(name) for name in collection_names
+    }
+    refs: set[str] = set()
+    pending: list[tuple[Any, str | None]] = [(body, None)]
+    visited: set[str] = set()
+    visited_count = 0
+    while pending:
+        node, node_ref = pending.pop()
+        if not isinstance(node, dict):
+            raise ProductionFailure("conversion_output_invalid")
+        visited_count += 1
+        if visited_count > 50_000:
+            raise ProductionFailure("conversion_output_invalid")
+        if (
+            node_ref is not None
+            and node_ref.startswith("#/texts/")
+            and node.get("content_layer", "body") == "body"
+        ):
+            refs.add(node_ref)
+        children = node.get("children")
+        if not isinstance(children, list):
+            raise ProductionFailure("conversion_output_invalid")
+        allowed_picture_refs = None
+        if node_ref is not None and node_ref.startswith("#/pictures/"):
+            captions = node.get("captions")
+            if not isinstance(captions, list):
+                raise ProductionFailure("conversion_output_invalid")
+            allowed_picture_refs = {
+                caption.get("$ref")
+                for caption in captions
+                if isinstance(caption, dict) and isinstance(caption.get("$ref"), str)
+            }
+            if len(allowed_picture_refs) != len(captions):
+                raise ProductionFailure("conversion_output_invalid")
+        for child in reversed(children):
+            if not isinstance(child, dict) or not isinstance(child.get("$ref"), str):
+                raise ProductionFailure("conversion_output_invalid")
+            child_ref = child["$ref"]
+            if allowed_picture_refs is not None and child_ref not in allowed_picture_refs:
+                continue
+            match = re.fullmatch(
+                r"#/([a-z_]+)/(0|[1-9][0-9]{0,6})", child_ref
+            )
+            if match is None or match.group(1) not in collections:
+                raise ProductionFailure("conversion_output_invalid")
+            collection = collections[match.group(1)]
+            index = int(match.group(2))
+            if (
+                not isinstance(collection, list)
+                or index >= len(collection)
+                or not isinstance(collection[index], dict)
+            ):
+                raise ProductionFailure("conversion_output_invalid")
+            if child_ref in visited:
+                raise ProductionFailure("conversion_output_invalid")
+            visited.add(child_ref)
+            pending.append((collection[index], child_ref))
+    return refs
+
+
 def _validate_citable_locator(
     locator: dict[str, Any], page_number: int, lossless: dict[str, Any], text: str
 ) -> None:
@@ -214,6 +346,64 @@ def _validate_citable_locator(
             len(matches) != 1
             or not isinstance(matches[0].get("text"), str)
             or normalize_text(matches[0]["text"]).strip("\n") != text
+        ):
+            raise ProductionFailure("conversion_output_invalid")
+        return
+    if kind == "docling_item_slice":
+        item_ref = locator.get("itemRef")
+        provenance = locator.get("provenance")
+        provenance_indexes = locator.get("provenanceIndexes")
+        item_text_charspan = locator.get("itemTextCharspan")
+        if (
+            not isinstance(item_ref, str)
+            or not isinstance(provenance, list)
+            or not isinstance(provenance_indexes, list)
+            or len(provenance_indexes) != 2
+            or any(type(offset) is not int for offset in provenance_indexes)
+            or not isinstance(item_text_charspan, list)
+            or len(item_text_charspan) != 2
+            or any(type(offset) is not int for offset in item_text_charspan)
+            or locator.get("doclingCharspanSemantics")
+            != "item_local_python_codepoints"
+        ):
+            raise ProductionFailure("conversion_output_invalid")
+        texts = lossless.get("texts")
+        matches = (
+            []
+            if not isinstance(texts, list)
+            else [
+                item
+                for item in texts
+                if isinstance(item, dict)
+                and item.get("self_ref") == item_ref
+                and _same_json(item.get("prov"), provenance)
+                and isinstance(item.get("text"), str)
+            ]
+        )
+        if len(matches) != 1:
+            raise ProductionFailure("conversion_output_invalid")
+        provenance_pages = [
+            span.get("page_no") for span in provenance if isinstance(span, dict)
+        ]
+        maximum_page = max(
+            (page for page in provenance_pages if type(page) is int),
+            default=page_number,
+        )
+        expected = _raw_cross_page_slices(matches[0], maximum_page)
+        target = (
+            page_number,
+            provenance_indexes[0],
+            provenance_indexes[1],
+            item_text_charspan[0],
+            item_text_charspan[1],
+        )
+        if (
+            expected is None
+            or target not in expected
+            or normalize_text(
+                matches[0]["text"][item_text_charspan[0] : item_text_charspan[1]]
+            ).strip("\n")
+            != text
         ):
             raise ProductionFailure("conversion_output_invalid")
         return
@@ -378,6 +568,39 @@ def _normalized_bundle(
     segment_count = sum(len(page["segments"]) for page in safe_pages)
     if len(segment_ids) != segment_count:
         raise ProductionFailure("conversion_output_invalid")
+    actual_slices: dict[str, list[tuple[int, int, int, int, int]]] = {}
+    for page in safe_pages:
+        for segment in page["segments"]:
+            locator = segment["locator"]
+            if locator.get("kind") == "docling_item_slice":
+                actual_slices.setdefault(locator["itemRef"], []).append(
+                    (
+                        page["page"],
+                        locator["provenanceIndexes"][0],
+                        locator["provenanceIndexes"][1],
+                        locator["itemTextCharspan"][0],
+                        locator["itemTextCharspan"][1],
+                    )
+                )
+    expected_slices: dict[str, list[tuple[int, int, int, int, int]]] = {}
+    raw_texts = lossless.get("texts")
+    required_refs = _body_text_refs(lossless)
+    # A directly encountered slice is always checked as a complete unit. The
+    # v2 producer additionally inventories every traversed body text item,
+    # while leaving furniture and other untraversed collections alone.
+    required_refs.update(actual_slices)
+    if isinstance(raw_texts, list):
+        for item in raw_texts:
+            if not isinstance(item, dict) or item.get("self_ref") not in required_refs:
+                continue
+            expected = _raw_cross_page_slices(item, len(safe_pages))
+            if expected is not None:
+                item_ref = item.get("self_ref")
+                if not isinstance(item_ref, str) or item_ref in expected_slices:
+                    raise ProductionFailure("conversion_output_invalid")
+                expected_slices[item_ref] = expected
+    if actual_slices != expected_slices:
+        raise ProductionFailure("conversion_output_invalid")
     retained_bytes = sum(len(page["text"].encode("utf-8")) for page in safe_pages)
     if retained_bytes > MAX_RETAINED_UTF8_BYTES:
         raise ProductionFailure("retained_text_too_large")
@@ -432,7 +655,7 @@ def _extraction_configuration(parser: dict[str, Any]) -> dict[str, Any]:
         "parserFingerprint": parser["fingerprint"],
         "implementationSha256": _implementation_sha256(),
         "configuration": {
-            "mappingFormat": "docling_utf16_pages_v1",
+            "mappingFormat": "docling_utf16_pages_v2",
             "maxPages": MAX_PAGES,
             "maxRetainedUtf8Bytes": MAX_RETAINED_UTF8_BYTES,
             "maxBundleBytes": MAX_SERIALIZED_BUNDLE_BYTES,
@@ -472,7 +695,7 @@ def _extraction_fingerprint(parser: dict[str, Any], raw_hash: str) -> dict[str, 
 
 
 def prepare_pdf_profile(
-    *, artifacts: Path, model_lock: Path, timeout_seconds: float = 150.0
+    *, artifacts: Path, model_lock: Path, timeout_seconds: float = 480.0
 ) -> dict[str, Any]:
     """Verify a configuration identity before scanning, without parsing a PDF.
 
@@ -483,7 +706,7 @@ def prepare_pdf_profile(
         if (
             isinstance(timeout_seconds, bool)
             or not isinstance(timeout_seconds, (int, float))
-            or not 0 < timeout_seconds <= 150
+            or not 0 < timeout_seconds <= 480
         ):
             raise ProductionFailure("invalid_input")
         manifest = _verify_runtime_and_artifacts(artifacts, model_lock)
@@ -507,7 +730,7 @@ def convert_captured_pdf(
     artifacts: Path,
     model_lock: Path,
     parent_boundary: ParentExecutionBoundary,
-    timeout_seconds: float = 150.0,
+    timeout_seconds: float = 480.0,
 ) -> dict[str, Any]:
     """Convert one private capture with pinned Docling.
 
@@ -545,7 +768,7 @@ def convert_captured_pdf(
         if (
             isinstance(timeout_seconds, bool)
             or not isinstance(timeout_seconds, (int, float))
-            or not 0 < timeout_seconds <= 150
+            or not 0 < timeout_seconds <= 480
         ):
             raise ProductionFailure("invalid_input")
 

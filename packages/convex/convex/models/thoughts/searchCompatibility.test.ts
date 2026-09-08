@@ -293,9 +293,9 @@ describe("thought vector compatibility", () => {
           state: "active",
           eligibilityEpoch: 0,
           manifestHash: "bounded-manifest",
-          expectedThoughtCount: 128,
+          expectedThoughtCount: 256,
           expectedChunkCount: 0,
-          completedThoughtCount: 128,
+          completedThoughtCount: 256,
           completedChunkCount: 0,
           createdAt: 1,
           stagedAt: 1,
@@ -309,7 +309,7 @@ describe("thought vector compatibility", () => {
         activeFingerprint: fingerprint,
         activatedAt: 1,
       });
-      for (let index = 0; index < 128; index += 1) {
+      for (let index = 0; index < 256; index += 1) {
         await ctx.db.insert("thoughts", {
           userId,
           spaceId,
@@ -358,7 +358,7 @@ describe("thought vector compatibility", () => {
         .collect(),
       generation: await ctx.db.get(seeded.embeddingGenerationId),
     }));
-    expect(after.thoughts).toHaveLength(128);
+    expect(after.thoughts).toHaveLength(256);
     expect(after.vectors).toHaveLength(0);
     expect(after.generation?.coverageInvalid).not.toBe(true);
 
@@ -382,7 +382,7 @@ describe("thought vector compatibility", () => {
         .collect(),
       generation: await ctx.db.get(seeded.embeddingGenerationId),
     }));
-    expect(invalidated.thoughts).toHaveLength(129);
+    expect(invalidated.thoughts).toHaveLength(257);
     expect(invalidated.generation?.coverageInvalid).toBe(true);
   });
 });

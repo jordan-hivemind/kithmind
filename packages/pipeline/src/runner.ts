@@ -3187,6 +3187,7 @@ export class PipelineRunner {
       ...validated,
       title: basename(plan.relativePath),
       capturedAt: plan.sourceModifiedAt,
+      chunkingFingerprint: plan.chunkerFingerprint,
     });
     if (mapping.chunkingFingerprint !== plan.chunkerFingerprint) {
       throw new PipelineWorkerError("parsed_chunking_conflict");

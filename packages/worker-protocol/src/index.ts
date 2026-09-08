@@ -31,7 +31,16 @@ export type ParserTableRowLocator = {
   cells: ParserTableCell[];
 };
 
-export type ParsedLocator = ParserItemLocator | ParserTableRowLocator;
+export type ParserPageLocator = {
+  kind: "parser_page_v1";
+  pageNumber: number;
+  pageTextHash: string;
+};
+
+export type ParsedLocator =
+  | ParserItemLocator
+  | ParserTableRowLocator
+  | ParserPageLocator;
 
 export type ParsedPageInput = {
   ordinal: number;
@@ -157,6 +166,14 @@ function box(value: unknown): ParsedBox | undefined {
 
 export function parseParsedLocator(value: unknown): ParsedLocator {
   const input = record(value);
+  if (input.kind === "parser_page_v1") {
+    keys(input, ["kind", "pageNumber", "pageTextHash"]);
+    return {
+      kind: "parser_page_v1",
+      pageNumber: integer(input.pageNumber, 1, 64),
+      pageTextHash: hash(input.pageTextHash),
+    };
+  }
   if (input.kind === "parser_item_v1") {
     keys(
       input,
@@ -167,7 +184,7 @@ export function parseParsedLocator(value: unknown): ParsedLocator {
     const end = integer(input.sourceCharEnd, start);
     return {
       kind: "parser_item_v1",
-      pageNumber: integer(input.pageNumber, 1, 32),
+      pageNumber: integer(input.pageNumber, 1, 64),
       itemRef: text(input.itemRef, 1024),
       sourceCharStart: start,
       sourceCharEnd: end,
@@ -203,7 +220,7 @@ export function parseParsedLocator(value: unknown): ParsedLocator {
   });
   return {
     kind: "parser_table_row_v1",
-    pageNumber: integer(input.pageNumber, 1, 32),
+    pageNumber: integer(input.pageNumber, 1, 64),
     tableRef: text(input.tableRef, 1024),
     sourceRowOffset: integer(input.sourceRowOffset, 0, 1_000_000),
     ...(input.bbox === undefined ? {} : { bbox: box(input.bbox)! }),
@@ -214,12 +231,12 @@ export function parseParsedLocator(value: unknown): ParsedLocator {
 export function parseParsedPageInput(value: unknown): ParsedPageInput {
   const input = record(value);
   keys(input, ["ordinal", "start", "end", "text", "textHash"]);
-  const start = integer(input.start, 0, 262_144);
-  const end = integer(input.end, start, 262_144);
+  const start = integer(input.start, 0, 1_024 * 1_024);
+  const end = integer(input.end, start, 1_024 * 1_024);
   const parsedText = text(input.text, 65_536, true);
   if (parsedText.length !== end - start) invalid();
   return {
-    ordinal: integer(input.ordinal, 0, 31),
+    ordinal: integer(input.ordinal, 0, 63),
     start,
     end,
     text: parsedText,
@@ -237,12 +254,12 @@ export function parseParsedEvidenceInput(value: unknown): ParsedEvidenceInput {
     "quoteHash",
     "locator",
   ]);
-  const pageOrdinal = integer(input.pageOrdinal, 0, 31);
+  const pageOrdinal = integer(input.pageOrdinal, 0, 63);
   const locator = parseParsedLocator(input.locator);
   if (locator.pageNumber !== pageOrdinal + 1) invalid();
   const start = integer(input.start, 0, 65_536);
   return {
-    ordinal: integer(input.ordinal, 0, 127),
+    ordinal: integer(input.ordinal, 0, 255),
     pageOrdinal,
     start,
     end: integer(input.end, start, 65_536),
@@ -252,13 +269,13 @@ export function parseParsedEvidenceInput(value: unknown): ParsedEvidenceInput {
 }
 
 function evidenceRefs(value: unknown): ParsedEvidenceRef[] {
-  if (!Array.isArray(value) || value.length > 128) invalid();
+  if (!Array.isArray(value) || value.length > 256) invalid();
   return value.map((entry) => {
     const input = record(entry);
     keys(input, ["pageOrdinal", "evidenceOrdinal"]);
     return {
-      pageOrdinal: integer(input.pageOrdinal, 0, 31),
-      evidenceOrdinal: integer(input.evidenceOrdinal, 0, 127),
+      pageOrdinal: integer(input.pageOrdinal, 0, 63),
+      evidenceOrdinal: integer(input.evidenceOrdinal, 0, 255),
     };
   });
 }
@@ -278,13 +295,13 @@ export function parseParsedDocumentInput(value: unknown): ParsedDocumentInput {
 export function parseParsedChunkInput(value: unknown): ParsedChunkInput {
   const input = record(value);
   keys(input, ["documentKey", "ordinal", "start", "end", "text", "evidence"]);
-  const start = integer(input.start, 0, 262_144);
-  const end = integer(input.end, start, 262_144);
+  const start = integer(input.start, 0, 1_024 * 1_024);
+  const end = integer(input.end, start, 1_024 * 1_024);
   const parsedText = text(input.text, 65_536, true);
   if (parsedText.length !== end - start) invalid();
   return {
     documentKey: text(input.documentKey, 256),
-    ordinal: integer(input.ordinal, 0, 127),
+    ordinal: integer(input.ordinal, 0, 255),
     start,
     end,
     text: parsedText,
@@ -298,7 +315,9 @@ function canonicalBox(value: ParsedBox | undefined): ParsedBox | null {
 
 export function canonicalParsedLocator(locator: ParsedLocator): unknown[] {
   const parsed = parseParsedLocator(locator);
-  return parsed.kind === "parser_item_v1"
+  return parsed.kind === "parser_page_v1"
+    ? [parsed.kind, parsed.pageNumber, parsed.pageTextHash]
+    : parsed.kind === "parser_item_v1"
     ? [
         parsed.kind,
         parsed.pageNumber,

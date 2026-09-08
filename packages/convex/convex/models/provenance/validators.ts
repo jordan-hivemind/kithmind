@@ -78,6 +78,12 @@ export const evidenceLocatorValidator = v.union(
     ),
   }),
   v.object({
+    kind: v.literal("parser_page_v1"),
+    parserArtifactId: v.id("sourceParserArtifacts"),
+    pageNumber: v.number(),
+    pageTextHash: v.string(),
+  }),
+  v.object({
     kind: v.literal("parser_item_v1"),
     parserArtifactId: v.id("sourceParserArtifacts"),
     pageNumber: v.number(),

@@ -13,6 +13,38 @@ const source = {
 } as const;
 
 describe("worker protocol parser", () => {
+  it("bounds the expanded parsed profile without changing scan limits", () => {
+    const request = {
+      ...source,
+      operation: "jobs.stageParsedBegin",
+      requestId: "parsed-capacity",
+      jobId: "job-id",
+      leaseEpoch: 1,
+      leaseToken: "a".repeat(64),
+      extractionFingerprint: "b".repeat(64),
+      mappingManifestHash: "c".repeat(64),
+      normalizedBundleDigest: "d".repeat(64),
+      expectedPageCount: 64,
+      expectedEvidenceSpanCount: 256,
+      expectedDocumentCount: 1,
+      expectedChunkCount: 256,
+    } as const;
+    expect(parseWorkerRequest(request)).toMatchObject({
+      expectedPageCount: 64,
+      expectedEvidenceSpanCount: 256,
+      expectedChunkCount: 256,
+    });
+    expect(() =>
+      parseWorkerRequest({ ...request, expectedPageCount: 65 }),
+    ).toThrow(WorkerProtocolParseError);
+    expect(() =>
+      parseWorkerRequest({ ...request, expectedEvidenceSpanCount: 257 }),
+    ).toThrow(WorkerProtocolParseError);
+    expect(() =>
+      parseWorkerRequest({ ...request, expectedChunkCount: 257 }),
+    ).toThrow(WorkerProtocolParseError);
+  });
+
   it("parses and normalizes each implemented operation", () => {
     expect(
       parseWorkerRequest({ ...source, operation: "source.status" }),

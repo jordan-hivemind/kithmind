@@ -19,9 +19,69 @@ const MAX_PAGE_ROW_BYTES = 96 * 1024;
 const MAX_EVIDENCE_ROW_BYTES = 8 * 1024;
 const MAX_DOCUMENT_ROW_BYTES = 16 * 1024;
 const MAX_CHUNK_ROW_BYTES = 24 * 1024;
+const MAX_PAGE_PROFILE_CHUNK_TEXT_BYTES = 8 * 1_024;
 const MAX_ROW_BYTES = MAX_PAGE_ROW_BYTES;
 const MAX_MANIFEST_BYTES = 64 * 1024;
-const MAX_RETAINED_TEXT_BYTES = 256 * 1024;
+const MAX_RETAINED_TEXT_BYTES = 1_024 * 1_024;
+const MAX_LEGACY_PAGES = 32;
+const MAX_LEGACY_RETAINED_TEXT_BYTES = 256 * 1_024;
+const MAX_LEGACY_EVIDENCE_SPANS = 128;
+const MAX_LEGACY_CHUNKS = 128;
+export const MAX_PARSED_CHUNKS = 256;
+export const MAX_PARSED_STORED_PAYLOAD_BYTES = 4 * 1_024 * 1_024;
+
+export function isParsedStoredPayloadWithinLimit(
+  ...sizes: readonly number[]
+): boolean {
+  let total = 0;
+  for (const size of sizes) {
+    if (!Number.isSafeInteger(size) || size < 0) return false;
+    total += size;
+    if (!Number.isSafeInteger(total) || total > MAX_PARSED_STORED_PAYLOAD_BYTES)
+      return false;
+  }
+  return true;
+}
+
+export function isParsedProfileWithinLimits(input: {
+  usesPageLocators: boolean;
+  pageCount: number;
+  retainedTextBytes: number;
+  evidenceSpanCount: number;
+  chunkCount: number;
+}): boolean {
+  const values = [
+    input.pageCount,
+    input.retainedTextBytes,
+    input.evidenceSpanCount,
+    input.chunkCount,
+  ];
+  if (values.some((value) => !Number.isSafeInteger(value) || value < 0))
+    return false;
+  return input.usesPageLocators
+    ? input.pageCount <= 64 &&
+        input.retainedTextBytes <= MAX_RETAINED_TEXT_BYTES &&
+        input.evidenceSpanCount <= 256 &&
+        input.chunkCount <= MAX_PARSED_CHUNKS
+    : input.pageCount <= MAX_LEGACY_PAGES &&
+        input.retainedTextBytes <= MAX_LEGACY_RETAINED_TEXT_BYTES &&
+        input.evidenceSpanCount <= MAX_LEGACY_EVIDENCE_SPANS &&
+        input.chunkCount <= MAX_LEGACY_CHUNKS;
+}
+
+export function isParsedChunkTextWithinLimits(
+  usesPageLocators: boolean,
+  chunkTextBytes: number,
+): boolean {
+  return (
+    Number.isSafeInteger(chunkTextBytes) &&
+    chunkTextBytes >= 0 &&
+    chunkTextBytes <=
+      (usesPageLocators
+        ? MAX_RETAINED_TEXT_BYTES
+        : MAX_LEGACY_RETAINED_TEXT_BYTES)
+  );
+}
 
 type Stage = Doc<"workerParsedStages">;
 
@@ -107,7 +167,7 @@ async function collectPayloadRows(
 ) {
   const pages = await collectIndexedRows(
     budget,
-    32,
+    64,
     MAX_PAGE_ROW_BYTES,
     ctx.db
       .query("sourcePages")
@@ -117,7 +177,7 @@ async function collectPayloadRows(
   );
   const spans = await collectIndexedRows(
     budget,
-    128,
+    256,
     MAX_EVIDENCE_ROW_BYTES,
     ctx.db
       .query("evidenceSpans")
@@ -137,7 +197,7 @@ async function collectPayloadRows(
   );
   const chunks = await collectIndexedRows(
     budget,
-    128,
+    MAX_PARSED_CHUNKS,
     MAX_CHUNK_ROW_BYTES,
     ctx.db
       .query("chunks")
@@ -263,6 +323,13 @@ export async function insertParsedEvidence(
       ...row.locator,
       parserArtifactId: stage.parserArtifactId,
     };
+    if (
+      locator.kind === "parser_page_v1" &&
+      (locator.pageNumber !== page.ordinal + 1 ||
+        locator.pageTextHash !== page.textHash)
+    ) {
+      throw workerProtocolError("invalid_request");
+    }
     const value = {
       spaceId: stage.spaceId,
       sourceRevisionId: stage.sourceRevisionId,
@@ -404,12 +471,64 @@ function strippedLocator(
   locator: NonNullable<Doc<"evidenceSpans">["locator"]>,
 ) {
   if (
+    locator.kind !== "parser_page_v1" &&
     locator.kind !== "parser_item_v1" &&
     locator.kind !== "parser_table_row_v1"
   )
     throw workerProtocolError("scan_conflict");
   const { parserArtifactId: _ignored, ...rest } = locator;
   return parseParsedLocator(rest);
+}
+
+export async function requirePageChunkProfile(
+  pages: readonly Doc<"sourcePages">[],
+  spans: readonly Doc<"evidenceSpans">[],
+  documents: readonly Doc<"documents">[],
+  chunks: readonly Doc<"chunks">[],
+): Promise<void> {
+  const document = documents[0];
+  if (
+    documents.length !== 1 ||
+    !document ||
+    document.evidenceSpanIds.length !== spans.length ||
+    new Set(document.evidenceSpanIds).size !== spans.length
+  )
+    throw workerProtocolError("scan_conflict");
+  const pageById = new Map(pages.map((page) => [page._id, page]));
+  const spanById = new Map(spans.map((span) => [span._id, span]));
+  const consumedSpanIds = new Set<string>();
+  const ranges: Array<readonly [number, number]> = [];
+  for (const chunk of chunks) {
+    const spanId = chunk.evidenceSpanIds[0];
+    const span = spanId ? spanById.get(spanId) : undefined;
+    const page = span ? pageById.get(span.sourcePageId) : undefined;
+    if (
+      chunk.documentId !== document._id ||
+      chunk.evidenceSpanIds.length !== 1 ||
+      !spanId ||
+      !span ||
+      !page ||
+      consumedSpanIds.has(spanId) ||
+      chunk.start !== page.start + span.start ||
+      chunk.end !== page.start + span.end ||
+      new TextEncoder().encode(chunk.text).byteLength >
+        MAX_PAGE_PROFILE_CHUNK_TEXT_BYTES ||
+      (await sha256Utf8(chunk.text)) !== span.quoteHash
+    )
+      throw workerProtocolError("scan_conflict");
+    consumedSpanIds.add(spanId);
+    ranges.push([chunk.start, chunk.end]);
+  }
+  if (
+    consumedSpanIds.size !== spans.length ||
+    document.evidenceSpanIds.some((id) => !consumedSpanIds.has(id))
+  )
+    throw workerProtocolError("scan_conflict");
+  ranges.sort((left, right) => left[0] - right[0] || left[1] - right[1]);
+  for (let index = 1; index < ranges.length; index += 1) {
+    if (ranges[index]![0] < ranges[index - 1]![1])
+      throw workerProtocolError("scan_conflict");
+  }
 }
 
 async function digestRows(domain: string, rows: unknown[]): Promise<string> {
@@ -501,9 +620,13 @@ export async function sealParsedPayload(
     const storedLocator = span.locator;
     if (
       !storedLocator ||
-      (storedLocator.kind !== "parser_item_v1" &&
+      (storedLocator.kind !== "parser_page_v1" &&
+        storedLocator.kind !== "parser_item_v1" &&
         storedLocator.kind !== "parser_table_row_v1") ||
-      storedLocator.parserArtifactId !== stage.parserArtifactId
+      storedLocator.parserArtifactId !== stage.parserArtifactId ||
+      (storedLocator.kind === "parser_page_v1" &&
+        (storedLocator.pageNumber !== page.ordinal + 1 ||
+          storedLocator.pageTextHash !== page.textHash))
     )
       throw workerProtocolError("scan_conflict");
     const locator = strippedLocator(storedLocator);
@@ -524,6 +647,24 @@ export async function sealParsedPayload(
     )
       throw workerProtocolError("scan_conflict");
   }
+  const usesPageLocators = evidenceInputs.some(
+    (input) => input.locator.kind === "parser_page_v1",
+  );
+  if (
+    usesPageLocators &&
+    evidenceInputs.some((input) => input.locator.kind !== "parser_page_v1")
+  )
+    throw workerProtocolError("scan_conflict");
+  if (
+    !isParsedProfileWithinLimits({
+      usesPageLocators,
+      pageCount: pages.length,
+      retainedTextBytes: textBytes,
+      evidenceSpanCount: spans.length,
+      chunkCount: chunks.length,
+    })
+  )
+    throw workerProtocolError("scan_conflict");
   if (
     (await digestParsedMappingManifest(pageInputs, evidenceInputs)) !==
     stage.mappingManifestHash
@@ -586,6 +727,8 @@ export async function sealParsedPayload(
       return [chunk.start, chunk.end] as const;
     })
     .sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  if (usesPageLocators)
+    await requirePageChunkProfile(pages, spans, documents, chunks);
   let cursor = 0;
   for (const [start, end] of coverage) {
     if (start > cursor) throw workerProtocolError("scan_conflict");
@@ -593,7 +736,7 @@ export async function sealParsedPayload(
   }
   if (
     cursor !== completeText.length ||
-    chunkTextBytes > MAX_RETAINED_TEXT_BYTES
+    !isParsedChunkTextWithinLimits(usesPageLocators, chunkTextBytes)
   )
     throw workerProtocolError("scan_conflict");
   for (const ordinals of chunkOrdinals.values()) {
@@ -708,6 +851,19 @@ export async function sealParsedPayload(
     "processingGenerationPayloadManifests",
     manifest,
   );
+  const storedManifest = await ctx.db.get(manifestId);
+  if (
+    !storedManifest ||
+    (usesPageLocators &&
+      !isParsedStoredPayloadWithinLimit(
+        pageBytes,
+        evidenceBytes,
+        documentBytes,
+        chunkBytes,
+        storedRowSize(storedManifest, MAX_MANIFEST_BYTES),
+      ))
+  )
+    throw workerProtocolError("scan_conflict");
   await ctx.db.patch(stage.sourceTextVersionId, {
     evidenceSealed: true,
     textHashAuthority: "server_verified_retained_text",
@@ -852,9 +1008,13 @@ export async function verifySealedParsedPayload(
       span.end <= span.start ||
       span.end > page.text.length ||
       !locator ||
-      (locator.kind !== "parser_item_v1" &&
+      (locator.kind !== "parser_page_v1" &&
+        locator.kind !== "parser_item_v1" &&
         locator.kind !== "parser_table_row_v1") ||
       locator.parserArtifactId !== generation.parserArtifactId ||
+      (locator.kind === "parser_page_v1" &&
+        (locator.pageNumber !== page.ordinal + 1 ||
+          locator.pageTextHash !== page.textHash)) ||
       (await sha256Utf8(page.text.slice(span.start, span.end))) !==
         span.quoteHash
     )
@@ -869,6 +1029,24 @@ export async function verifySealedParsedPayload(
     });
   }
   const textBytes = new TextEncoder().encode(completeText).byteLength;
+  const usesPageLocators = evidenceInputs.some(
+    (input) => input.locator.kind === "parser_page_v1",
+  );
+  if (
+    usesPageLocators &&
+    evidenceInputs.some((input) => input.locator.kind !== "parser_page_v1")
+  )
+    throw workerProtocolError("scan_conflict");
+  if (
+    !isParsedProfileWithinLimits({
+      usesPageLocators,
+      pageCount: pages.length,
+      retainedTextBytes: textBytes,
+      evidenceSpanCount: spans.length,
+      chunkCount: chunks.length,
+    })
+  )
+    throw workerProtocolError("scan_conflict");
   if (
     textBytes > MAX_RETAINED_TEXT_BYTES ||
     text.textHash !== (await sha256Utf8(completeText)) ||
@@ -951,6 +1129,8 @@ export async function verifySealedParsedPayload(
       chunk.evidenceSpanIds,
     ]);
   }
+  if (usesPageLocators)
+    await requirePageChunkProfile(pages, spans, documents, chunks);
   coverage.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
   let cursor = 0;
   for (const [start, end] of coverage) {
@@ -959,7 +1139,7 @@ export async function verifySealedParsedPayload(
   }
   if (
     cursor !== completeText.length ||
-    chunkTextBytes > MAX_RETAINED_TEXT_BYTES
+    !isParsedChunkTextWithinLimits(usesPageLocators, chunkTextBytes)
   )
     throw workerProtocolError("scan_conflict");
   for (const ordinals of chunkOrdinals.values()) {
@@ -1002,6 +1182,14 @@ export async function verifySealedParsedPayload(
     manifest.evidenceBytes !== evidenceBytes ||
     manifest.documentBytes !== documentBytes ||
     manifest.chunkBytes !== chunkBytes ||
+    (usesPageLocators &&
+      !isParsedStoredPayloadWithinLimit(
+        pageBytes,
+        evidenceBytes,
+        documentBytes,
+        chunkBytes,
+        storedRowSize(manifest, MAX_MANIFEST_BYTES),
+      )) ||
     manifest.pageDigest !==
       (await digestRows(
         "parsed-pages:v1",

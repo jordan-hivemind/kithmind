@@ -80,8 +80,8 @@ describe("provenance representation parsing", () => {
       representation: "parsed_pages_v1" as const,
       extractionFingerprint: "docling:locked",
       textHash: HASH,
-      byteLength: 256 * 1_024,
-      utf16Length: 256 * 1_024,
+      byteLength: 1_024 * 1_024,
+      utf16Length: 1_024 * 1_024,
       pageCount: 2,
       mappingManifestHash: "b".repeat(64),
       parserArtifactId: "artifact-id",
@@ -117,9 +117,9 @@ describe("provenance representation parsing", () => {
     expect(() =>
       parseSourceTextRepresentation({
         ...parsed,
-        byteLength: 256 * 1_024 + 1,
+        byteLength: 1_024 * 1_024 + 1,
         evidenceSealed: false,
       }),
-    ).toThrow("safe integer from 0 to 262144");
+    ).toThrow("safe integer from 0 to 1048576");
   });
 });

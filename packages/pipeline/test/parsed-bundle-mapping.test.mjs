@@ -5,6 +5,7 @@ import {
   mapParsedBundle,
   ParsedBundleMappingError,
   PDF_DOCQA_CHUNKING_FINGERPRINT,
+  PDF_DOCQA_LEGACY_CHUNKING_FINGERPRINT,
 } from "../dist/parsedBundleMapping.js";
 
 const hash = (text) => createHash("sha256").update(text).digest("hex");
@@ -48,6 +49,7 @@ function fixture(pageSegments) {
     resolvedLocators,
     title: "Synthetic pilot report",
     capturedAt: 1_800_000_000_000,
+    chunkingFingerprint: PDF_DOCQA_LEGACY_CHUNKING_FINGERPRINT,
   };
 }
 
@@ -113,8 +115,64 @@ test("maps direct page concatenation, exact Unicode quotes and separate source o
   assert.equal(result.documents[0].evidence.length, 3);
   assert.equal(result.chunks.map((chunk) => chunk.text).join(""), complete);
   assert.match(result.mappingManifestHash, /^[a-f0-9]{64}$/);
-  assert.equal(result.chunkingFingerprint, PDF_DOCQA_CHUNKING_FINGERPRINT);
+  assert.equal(
+    result.chunkingFingerprint,
+    PDF_DOCQA_LEGACY_CHUNKING_FINGERPRINT,
+  );
   assert.deepEqual(await mapParsedBundle(structuredClone(input)), result);
+});
+
+test("current profile emits one page-bound evidence span per 8 KiB scalar-safe chunk", async () => {
+  const pageText = "a".repeat(8191) + "🧪" + "界".repeat(3000);
+  const input = fixture([[item(pageText, 1, 0)]]);
+  input.chunkingFingerprint = PDF_DOCQA_CHUNKING_FINGERPRINT;
+  const result = await mapParsedBundle(input);
+  assert.ok(result.chunks.length > 1);
+  assert.equal(result.chunks.length, result.evidence.length);
+  assert.equal(result.chunks.map((chunk) => chunk.text).join(""), pageText);
+  for (const [index, chunk] of result.chunks.entries()) {
+    assert.ok(Buffer.byteLength(chunk.text, "utf8") <= 8192);
+    assert.deepEqual(chunk.evidence, [
+      { pageOrdinal: 0, evidenceOrdinal: index },
+    ]);
+    const span = result.evidence[index];
+    assert.equal(span.start, chunk.start);
+    assert.equal(span.end, chunk.end);
+    assert.deepEqual(span.locator, {
+      kind: "parser_page_v1",
+      pageNumber: 1,
+      pageTextHash: hash(pageText),
+    });
+  }
+});
+
+test("current profile maps the exact 64-page and 1 MiB retained-text boundary", async () => {
+  const pageText = "x".repeat(16 * 1024);
+  const input = fixture(
+    Array.from({ length: 64 }, (_, index) => [
+      item(pageText, index + 1, index),
+    ]),
+  );
+  input.chunkingFingerprint = PDF_DOCQA_CHUNKING_FINGERPRINT;
+  const result = await mapParsedBundle(input);
+  assert.equal(result.pages.length, 64);
+  assert.equal(result.textUtf8Length, 1024 * 1024);
+  assert.equal(result.chunks.length, 128);
+  assert.equal(result.evidence.length, 128);
+
+  const tooManyPages = fixture(
+    Array.from({ length: 65 }, (_, index) => [item("x", index + 1, index)]),
+  );
+  tooManyPages.chunkingFingerprint = PDF_DOCQA_CHUNKING_FINGERPRINT;
+  await rejected(tooManyPages, "mapping_limit");
+
+  const tooManyBytes = fixture(
+    Array.from({ length: 17 }, (_, index) => [
+      item("x".repeat(64 * 1024), index + 1, index),
+    ]),
+  );
+  tooManyBytes.chunkingFingerprint = PDF_DOCQA_CHUNKING_FINGERPRINT;
+  await rejected(tooManyBytes, "mapping_limit");
 });
 
 test("maps Unicode same-page multi-span item to its codepoint source envelope", async () => {
@@ -143,6 +201,49 @@ test("maps Unicode same-page multi-span item to its codepoint source envelope", 
     4, 10,
   ];
   await rejected(overlapping);
+});
+
+test("maps page-local slices of one cross-page raw item", async () => {
+  const provenance = [
+    { page_no: 1, charspan: [0, 5], bbox: box },
+    { page_no: 2, charspan: [6, 7], bbox: box },
+    { page_no: 2, charspan: [8, 12], bbox: box },
+  ];
+  const slice = (text, page, id, indexes, charspan) => ({
+    id,
+    text,
+    citable: true,
+    locator: {
+      kind: "docling_item_slice",
+      itemRef: "#/texts/0",
+      provenance,
+      provenanceIndexes: indexes,
+      itemTextCharspan: charspan,
+      doclingCharspanSemantics: "item_local_python_codepoints",
+    },
+  });
+  const input = fixture([
+    [slice("Alpha ", 1, "slice-0", [0, 1], [0, 6])],
+    [slice("🧪 beta", 2, "slice-1", [1, 3], [6, 12])],
+  ]);
+  input.resolvedLocators["slice-0"] = { kind: "item", ref: "#/texts/0" };
+  input.resolvedLocators["slice-1"] = { kind: "item", ref: "#/texts/0" };
+  const result = await mapParsedBundle(input);
+  assert.deepEqual(
+    result.evidence.map((entry) => [
+      entry.pageOrdinal,
+      entry.locator.sourceCharStart,
+      entry.locator.sourceCharEnd,
+    ]),
+    [
+      [0, 0, 6],
+      [1, 6, 12],
+    ],
+  );
+
+  const wrongSelection = structuredClone(input);
+  wrongSelection.bundle.pages[1].segments[0].locator.provenanceIndexes = [0, 3];
+  await rejected(wrongSelection);
 });
 
 test("uses raw-resolved table references and exact cell hashes, never page-local table ordinal", async () => {

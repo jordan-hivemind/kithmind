@@ -23,6 +23,7 @@ import {
   createParserProfileWorkDirectory,
   inspectCapturedPdfParserOutput,
   inspectParserOutputIntent,
+  parseBoundedParserJson,
   ParserProcessError,
   preparePdfDocQaProfile,
   removeParserProfileWorkDirectoryExact,
@@ -30,7 +31,11 @@ import {
   resolveRawLocators,
   runCapturedPdfParser,
 } from "../dist/parserProcess.js";
-import { mapParsedBundle } from "../dist/parsedBundleMapping.js";
+import {
+  mapParsedBundle,
+  PDF_DOCQA_CHUNKING_FINGERPRINT,
+  PDF_DOCQA_LEGACY_CHUNKING_FINGERPRINT,
+} from "../dist/parsedBundleMapping.js";
 
 const repository = realpath(
   join(dirname(fileURLToPath(import.meta.url)), "../../.."),
@@ -54,6 +59,52 @@ const hasPythonRuntime =
 function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
 }
+
+test("bounds parser JSON nodes and depth independently", () => {
+  const maximum = 4 * 1024 * 1024;
+  const atNodeBound = Buffer.from(JSON.stringify(Array(499_999).fill(null)));
+  assert.equal(parseBoundedParserJson(atNodeBound, maximum).length, 499_999);
+  const overNodeBound = Buffer.from(JSON.stringify(Array(500_000).fill(null)));
+  assert.throws(
+    () => parseBoundedParserJson(overNodeBound, maximum),
+    (error) =>
+      error instanceof ParserProcessError &&
+      error.code === "output_invalid" &&
+      error.message.includes("node bound"),
+  );
+  let tooDeep = null;
+  for (let depth = 0; depth < 49; depth += 1) tooDeep = [tooDeep];
+  assert.throws(
+    () => parseBoundedParserJson(Buffer.from(JSON.stringify(tooDeep)), maximum),
+    (error) =>
+      error instanceof ParserProcessError &&
+      error.code === "output_invalid" &&
+      error.message.includes("depth bound"),
+  );
+});
+
+test("uses the bounded large-document resource profile", async () => {
+  assert.deepEqual(
+    {
+      wallDeadlineMs: DEFAULT_PARSER_PROCESS_LIMITS.wallDeadlineMs,
+      cpuSeconds: DEFAULT_PARSER_PROCESS_LIMITS.cpuSeconds,
+      maxRssBytes: DEFAULT_PARSER_PROCESS_LIMITS.maxRssBytes,
+    },
+    {
+      wallDeadlineMs: 600_000,
+      cpuSeconds: 1_800,
+      maxRssBytes: 8 * 1024 * 1024 * 1024,
+    },
+  );
+  await assert.rejects(
+    () =>
+      runCapturedPdfParser({
+        limits: { ...DEFAULT_PARSER_PROCESS_LIMITS, cpuSeconds: 1_801 },
+      }),
+    (error) =>
+      error instanceof ParserProcessError && error.code === "invalid_input",
+  );
+});
 
 async function fixture(pdfName = "lab-report-unicode.pdf") {
   const base = await realpath(await mkdtemp(join(tmpdir(), "parser-process-")));
@@ -156,6 +207,65 @@ function multiSpanLocatorFixture(separator = " ") {
   };
 }
 
+function crossPageSliceFixture() {
+  const text = "Alpha 🧪 beta";
+  const provenance = [
+    {
+      page_no: 1,
+      charspan: [0, 5],
+      bbox: { l: 0, t: 0, r: 1, b: 1, coord_origin: "TOPLEFT" },
+    },
+    {
+      page_no: 2,
+      charspan: [6, 7],
+      bbox: { l: 0, t: 0, r: 1, b: 1, coord_origin: "TOPLEFT" },
+    },
+    {
+      page_no: 2,
+      charspan: [8, 12],
+      bbox: { l: 0, t: 0, r: 1, b: 1, coord_origin: "TOPLEFT" },
+    },
+  ];
+  const locator = (indexes, charspan) => ({
+    kind: "docling_item_slice",
+    itemRef: "#/texts/0",
+    provenance: structuredClone(provenance),
+    provenanceIndexes: indexes,
+    itemTextCharspan: charspan,
+    doclingCharspanSemantics: "item_local_python_codepoints",
+  });
+  return {
+    raw: {
+      texts: [
+        { self_ref: "#/texts/0", text, prov: provenance, children: [] },
+      ],
+      tables: [],
+    },
+    bundle: {
+      pages: [
+        {
+          page: 1,
+          text: "Alpha ",
+          segments: [
+            { id: "slice-0", text: "Alpha ", locator: locator([0, 1], [0, 6]) },
+          ],
+        },
+        {
+          page: 2,
+          text: "🧪 beta",
+          segments: [
+            {
+              id: "slice-1",
+              text: "🧪 beta",
+              locator: locator([1, 3], [6, 12]),
+            },
+          ],
+        },
+      ],
+    },
+  };
+}
+
 test("raw locator resolution enforces exact multi-span provenance and whitespace", () => {
   for (const separator of ["\u0085", "\u00a0"]) {
     const fixture = multiSpanLocatorFixture(separator);
@@ -187,6 +297,126 @@ test("raw locator resolution enforces exact multi-span provenance and whitespace
   const uncoveredContent = multiSpanLocatorFixture("!");
   assert.throws(() =>
     resolveRawLocators(uncoveredContent.raw, uncoveredContent.bundle),
+  );
+});
+
+test("raw locator resolution requires the complete exact cross-page slice inventory", () => {
+  const valid = crossPageSliceFixture();
+  const resolved = resolveRawLocators(valid.raw, valid.bundle);
+  assert.deepEqual(resolved["slice-0"], {
+    kind: "item",
+    ref: "#/texts/0",
+  });
+  assert.deepEqual(resolved["slice-1"], {
+    kind: "item",
+    ref: "#/texts/0",
+  });
+
+  const omitted = crossPageSliceFixture();
+  omitted.bundle.pages[1].segments = [];
+  assert.throws(() => resolveRawLocators(omitted.raw, omitted.bundle));
+
+  const duplicate = crossPageSliceFixture();
+  duplicate.bundle.pages[0].segments.push({
+    ...structuredClone(duplicate.bundle.pages[0].segments[0]),
+    id: "slice-duplicate",
+  });
+  assert.throws(() => resolveRawLocators(duplicate.raw, duplicate.bundle));
+
+  const reordered = crossPageSliceFixture();
+  reordered.bundle.pages[0].segments[0].locator.provenance.reverse();
+  assert.throws(() => resolveRawLocators(reordered.raw, reordered.bundle));
+
+  const wrongPage = crossPageSliceFixture();
+  wrongPage.bundle.pages[1].segments[0].locator.provenance[1].page_no = 1;
+  assert.throws(() => resolveRawLocators(wrongPage.raw, wrongPage.bundle));
+
+  const overlapping = crossPageSliceFixture();
+  overlapping.raw.texts[0].prov[1].charspan = [4, 7];
+  overlapping.bundle.pages[0].segments[0].locator.provenance[1].charspan = [
+    4, 7,
+  ];
+  overlapping.bundle.pages[1].segments[0].locator.provenance[1].charspan = [
+    4, 7,
+  ];
+  assert.throws(() => resolveRawLocators(overlapping.raw, overlapping.bundle));
+
+  const alteredContent = crossPageSliceFixture();
+  alteredContent.raw.texts[0].text = "Alpha ! beta";
+  assert.throws(() =>
+    resolveRawLocators(alteredContent.raw, alteredContent.bundle),
+  );
+});
+
+test("v2 inventories traversed body slices while legacy gaps and furniture remain inspectable", () => {
+  const current = crossPageSliceFixture();
+  current.raw.texts.push({
+    ...structuredClone(current.raw.texts[0]),
+    self_ref: "#/texts/1",
+    children: [],
+  });
+  current.raw.groups = [];
+  current.raw.body = { children: [{ $ref: "#/texts/0" }] };
+  current.raw.furniture = { children: [{ $ref: "#/texts/1" }] };
+  assert.doesNotThrow(() =>
+    resolveRawLocators(
+      current.raw,
+      current.bundle,
+      "docling_utf16_pages_v2",
+    ),
+  );
+
+  const legacyGap = structuredClone(current);
+  for (const page of legacyGap.bundle.pages) page.segments = [];
+  legacyGap.bundle.mappingGaps = [
+    { kind: "ambiguous_text_provenance", item: 0 },
+  ];
+  assert.deepEqual(
+    Object.keys(resolveRawLocators(legacyGap.raw, legacyGap.bundle)),
+    [],
+  );
+  assert.throws(() =>
+    resolveRawLocators(
+      legacyGap.raw,
+      legacyGap.bundle,
+      "docling_utf16_pages_v2",
+    ),
+  );
+
+  const nestedText = structuredClone(current);
+  nestedText.raw.texts[0].children = [{ $ref: "#/texts/1" }];
+  assert.throws(() =>
+    resolveRawLocators(
+      nestedText.raw,
+      nestedText.bundle,
+      "docling_utf16_pages_v2",
+    ),
+  );
+
+  const excludedLayer = structuredClone(nestedText);
+  excludedLayer.raw.texts[1].content_layer = "furniture";
+  assert.doesNotThrow(() =>
+    resolveRawLocators(
+      excludedLayer.raw,
+      excludedLayer.bundle,
+      "docling_utf16_pages_v2",
+    ),
+  );
+
+  const pictureCaption = structuredClone(current);
+  pictureCaption.raw.body = { children: [{ $ref: "#/pictures/0" }] };
+  pictureCaption.raw.pictures = [
+    {
+      children: [{ $ref: "#/texts/0" }, { $ref: "#/texts/1" }],
+      captions: [{ $ref: "#/texts/0" }],
+    },
+  ];
+  assert.doesNotThrow(() =>
+    resolveRawLocators(
+      pictureCaption.raw,
+      pictureCaption.bundle,
+      "docling_utf16_pages_v2",
+    ),
   );
 });
 
@@ -370,6 +600,7 @@ test(
         ...recovered.validated,
         title: "Synthetic pilot",
         capturedAt: 1_800_000_000_000,
+        chunkingFingerprint: PDF_DOCQA_CHUNKING_FINGERPRINT,
       });
       assert.equal(mapped.pages.length, 1);
       assert.ok(mapped.evidence.length > 0);
@@ -454,6 +685,7 @@ test(
         ...recovered.validated,
         title: "Synthetic pilot",
         capturedAt: 1_800_000_000_000,
+        chunkingFingerprint: PDF_DOCQA_LEGACY_CHUNKING_FINGERPRINT,
       });
       assert.equal(mapped.pages.length, 2);
       assert.ok(

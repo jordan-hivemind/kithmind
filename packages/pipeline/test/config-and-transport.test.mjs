@@ -8,7 +8,10 @@ import {
   parseConfig,
   validateEndpoint,
 } from "../dist/config.js";
-import { PDF_DOCQA_CHUNKING_FINGERPRINT } from "../dist/parsedBundleMapping.js";
+import {
+  PDF_DOCQA_CHUNKING_FINGERPRINT,
+  PDF_DOCQA_LEGACY_CHUNKING_FINGERPRINT,
+} from "../dist/parsedBundleMapping.js";
 import { HttpWorkerTransport, parseWorkerResponse } from "../dist/transport.js";
 
 test("config accepts only bounded absolute worker config", () => {
@@ -110,6 +113,14 @@ test("PDF document-Q&A config is closed, bound, and keeps legacy bindings stable
   assert.equal(
     pdf.pdfDocQa.profile.chunkerFingerprint,
     PDF_DOCQA_CHUNKING_FINGERPRINT,
+  );
+  const archivedProfile = pdfDocQaConfig();
+  archivedProfile.profile.chunkerFingerprint =
+    PDF_DOCQA_LEGACY_CHUNKING_FINGERPRINT;
+  assert.equal(
+    parseConfig({ ...base, pdfDocQa: archivedProfile }).pdfDocQa.profile
+      .chunkerFingerprint,
+    PDF_DOCQA_LEGACY_CHUNKING_FINGERPRINT,
   );
   assert.notEqual(
     journalBindingForConfig(pdf).configFingerprint,
@@ -654,6 +665,17 @@ test("parsed job responses require closed B2 phases, counts, and leases", () => 
       response.operation,
     );
   }
+  const maximumSeal = {
+    ...responses[6],
+    actualPageCount: 64,
+    actualEvidenceSpanCount: 256,
+    actualChunkCount: 256,
+  };
+  assert.equal(
+    parseWorkerResponse(JSON.stringify(maximumSeal), "jobs.stageParsedSeal")
+      .operation,
+    "jobs.stageParsedSeal",
+  );
   for (const [response, operation] of [
     [
       { ...responses[0], targets: [{ ...target, state: "queued" }] },
