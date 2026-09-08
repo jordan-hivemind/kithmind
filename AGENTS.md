@@ -46,6 +46,21 @@ that surfaced it.
 Never commit, publish, or ask contributors to supply `docs/private/`; use a
 public issue or plan for work that others can take on.
 
+## Cross-workstream coordination
+
+Mainline and the financial archive workstream coordinate through
+[GitHub Issue #57](https://github.com/jordan-hivemind/kithmind/issues/57).
+Read its body and new comments before starting shared-boundary work, after
+landing shared-contract changes, and when blocked on the other workstream.
+There are no push notifications; check at those points rather than assuming
+the other agent has received a message.
+
+Post shared contract changes, cross-workstream defects, boundary questions,
+and ownership changes there. Sign each entry with the workstream and date.
+Keep ordinary implementation discussion in its own PR. Correct stale
+mainline status in the issue body without overwriting the other workstream's
+updates. The owner should not need to relay messages between agents.
+
 ## Model tiers
 
 The owner is on flat-rate plans for both vendors, so the cost that matters is
