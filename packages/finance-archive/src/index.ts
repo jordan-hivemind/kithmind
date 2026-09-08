@@ -50,7 +50,12 @@ export {
   type MoneyAmount,
   type RoundingRule,
 } from "./money.js";
-export { ROW_HASH_DOMAIN, rowHash, type RowHashInput } from "./rowHash.js";
+export {
+  normalizeText,
+  ROW_HASH_DOMAIN,
+  rowHash,
+  type RowHashInput,
+} from "./rowHash.js";
 export {
   ARCHIVE_SCHEMA_VERSION,
   MIGRATIONS,
@@ -59,3 +64,10 @@ export {
   schemaVersion,
   type Migration,
 } from "./schema.js";
+export {
+  importBatch,
+  type ImportBatch,
+  type ImportDocument,
+  type ImportRow,
+  type ImportSummary,
+} from "./importer.js";

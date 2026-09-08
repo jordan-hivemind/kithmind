@@ -81,6 +81,7 @@ function insertTransaction(db, row) {
         quantity: row.quantity ?? null,
         amount: row.amount,
         currency: row.currency,
+        occurrence: row.occurrence ?? 1,
       }),
     "2026-01-01T00:00:00.000Z",
   );
@@ -275,6 +276,7 @@ test("row_hash is unique and is stable across harmless spelling differences", (t
     quantity: "12.5",
     amount: -130469n,
     currency: "USD",
+    occurrence: 1,
   };
   const noisy = {
     ...row,
@@ -286,6 +288,7 @@ test("row_hash is unique and is stable across harmless spelling differences", (t
   assert.notEqual(rowHash(row), rowHash({ ...row, amount: -130468n }));
   assert.notEqual(rowHash(row), rowHash({ ...row, currency: "JPY" }));
   assert.notEqual(rowHash(row), rowHash({ ...row, quantity: null }));
+  assert.notEqual(rowHash(row), rowHash({ ...row, occurrence: 2 }));
 
   insertTransaction(db, { id: "txn_first", ...row, price: "104.375" });
   assert.throws(
