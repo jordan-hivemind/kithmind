@@ -1,123 +1,321 @@
-# Historical financial transaction database
+# Financial archive: holdings and transactions
 
-**Status:** Planned independent workstream. Added at the owner's request on
-2026-09-07. It does not block the single-owner document-Q&A trial.
+**Status:** Planned workstream inside this repository. It does not block the
+single-owner document-Q&A trial and does not depend on it.
 
-## Goal and ownership
+## Goal
 
-Build a durable database of the owner's financial transactions, starting with
-every historical statement and transaction export available from the selected
-institutions. Provider examples include Morgan Stanley, Chase and Vanguard.
-Track unavailable periods explicitly; available online history is not assumed
-to equal the account's full lifetime.
+Build a durable, local, queryable archive of one person's financial accounts
+across every institution they use, so that an assistant with no browser access
+and no logins can answer questions about the money and cite where each number
+came from.
 
-A separate agent team can build acquisition, the database, reconciliation and
-its query service in parallel. The Kith Mind team owns the integration adapter,
-existing access-scope enforcement, coverage/freshness reporting and end-to-end
-question tests. Do not duplicate the financial ingestion implementation inside
-Kith Mind or make its completion a prerequisite for the current PDF trial.
+Today this data is reachable only by signing into each institution's site. Every
+analysis restarts from nothing and nothing accumulates. Success is not that
+files were downloaded. Success is that a single query answers what was paid in
+fees last year across all institutions, what the current holdings and cost bases
+are, what is owed, and which document supports each figure.
 
-Local storage is the initial preference, not an adopted database-engine choice.
-Assess existing financial importers and ledger software before building another
-one. Select an engine and reuse strategy against the actual history volume,
-statement formats, exact numeric requirements, portability and backup needs.
-Record the tradeoff; SQLite, for example, is a candidate rather than a presumed
-best choice. The public implementation and synthetic fixtures should be usable
-without owner credentials or private files.
+## Relationship to Kith Mind
 
-## Independent team's deliverables
+This archive is a source, not a second brain. The relationship has three parts
+and they are fixed:
 
-1. Inventory the selected institutions and accounts with opaque stable account
-   IDs. Establish the history actually available from each portal, supported
-   exports, statement formats, access requirements and acquisition limits.
-   Download all available historical statements and complementary structured
-   transaction exports through authorized access. Preserve an acquisition
-   manifest with statement period, download time, content hash and gaps.
-2. Retain original files in a recoverable encrypted archive. Prefer a supported
-   structured export when it preserves transaction detail; retain statements
-   as evidence and reconcile overlapping exports instead of importing both as
-   separate transactions. Browser-assisted/manual export is acceptable when
-   no suitable connector exists. Provider capabilities must be verified during
-   implementation, not inferred from a provider name.
-3. Normalize transactions into a versioned schema with source evidence. Keep
-   original descriptions, transaction and posting/settlement dates, date
-   precision, account, currency, exact signed amount and status. Preserve
-   investment-specific activity, instrument identifiers, quantities, prices
-   and fees without forcing every activity into a cash-spending row. Use exact
-   decimal or integer representations; never binary floating-point money.
-4. Reconcile repeated downloads, overlapping periods, pending-to-posted changes,
-   reversals and corrected statements. Prefer provider transaction identifiers
-   where trustworthy; otherwise use evidence-based identities and explicit
-   ambiguity review. Equal date/amount/description is not proof of duplication.
-   Transfers between owned accounts must not become spending twice; investment
-   trades, distributions and reinvestments need explicit aggregation semantics.
-5. Record coverage per account and period, including acquisition, parsing,
-   reconciliation, uncertainty and any missing statements. Reconcile against
-   statement totals/balances where the document permits it. A completed import
-   job alone cannot establish complete transaction history.
-6. Provide repeatable incremental updates, an inspectable error/review queue,
-   correction history, deletion handling, backup and a verified restore. A new
-   download must not erase a prior recoverable version before replacement is
-   validated. Keep raw statements, credentials and real transactions out of
-   the public repository; publish synthetic fixtures and reproducible setup.
+1. **The archive owns canonical financial identity.** Transaction and position
+   identity, deduplication, and reconciliation happen here. Kith Mind does not
+   build a competing authoritative financial record set from the same statements.
+2. **The plugin point for reuse is the institution adapter.** Acquisition and
+   parsing for one institution is a self-contained module against a published
+   interface. Someone else can use the adapters shipped here or write their own
+   without touching the store, the schema, or the query layer.
+3. **Kith Mind consumes the archive through a versioned read interface.** It may
+   link to archive records or maintain a deliberate read projection. The same
+   institution adapters feed both, so there is never a second ingestion path for
+   the same statements.
 
-## Integration contract to agree before parallel implementation
+The `financial_transaction` event type, exact money values and `query_records`
+in the [record-query contract](./2026-09-06-record-query-contract.md) remain the
+Kith Mind side of that boundary. The P2-10 financial playbooks reuse archive
+records where adopted rather than re-extracting the same documents.
 
-Use a small versioned read-only service boundary. The transport can change
-without changing the transaction schema. The following are proposed operations
-for agreement with the independent team:
+## Decisions
 
-| Operation                  | Required behavior                                                                                                                                           |
-| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| List accounts              | Opaque stable IDs, institution label, account type, currency and authorized scope. No account secrets.                                                      |
-| Query transactions         | Bounded filters for accounts, dates, amount/currency, activity type and description; deterministic pagination; explicit transaction/posting date semantics. |
-| Aggregate transactions     | Exact sums and counts with currency separation, transfer/activity inclusion rules, and the same coverage qualifications as row queries.                     |
-| Get transaction evidence   | Stable transaction and source-revision IDs, original statement/row/page locator, field provenance, correction status and permitted document access.         |
-| Get coverage and freshness | Account/period availability, unresolved items, last acquisition/reconciliation, dataset revision and whether the service is reachable.                      |
+| Question                 | Decision                                                                                                                                                                                                                                                                    |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Storage engine           | SQLite. Single file, no server, exact integer or decimal-string money, full SQL for ad hoc questions, trivial to copy and hash for backup.                                                                                                                                  |
+| Existing ledger software | Not adopted. Beancount, hledger, GnuCash and similar are double-entry spending ledgers. They have no first-class model for lot-level cost basis, per-field provenance, or reconciliation status as a gate. Reuse of their importers is not worth adopting their data model. |
+| Scope                    | Holdings as well as transactions. Positions, balances and liabilities are v1, not v2. Half the value of the archive is what is owned and what is owed.                                                                                                                      |
+| Access surface for v1    | A local read-only MCP server over the archive. Not a five-operation typed contract, and not the Kith Mind adapter.                                                                                                                                                          |
+| Query shape              | Read-only SQL plus a documented schema, exposed through the local server. Frequently used shapes are promoted into typed operations later, once real questions have shown which ones matter.                                                                                |
+| Where the code lives     | This repository, MIT, with synthetic fixtures.                                                                                                                                                                                                                              |
+| Where the data lives     | Outside this repository, in a configured local directory. Never in git, never in a hosted service, never in a shared folder.                                                                                                                                                |
+| Standing CSV exports     | Not produced. A table mirror beside a live database is a second source of truth. Backup is a file copy plus a hash. Export is an on-demand script.                                                                                                                          |
 
-Responses include a schema version, stable IDs, dataset revision/as-of time,
-source references and explicit incomplete/truncated status. Queries must not
-silently cross currencies, include unresolved transactions as settled facts,
-or imply full history when only selected periods were obtained. Expose typed
-bounded queries to AI clients, not unrestricted SQL or database credentials.
+The typed-bounded-query rule in the record contract exists to protect
+multi-user spaces and untrusted clients. This archive is single-user,
+read-only, local, and holds no credentials, so that rule does not apply to its
+own read surface. It does apply at the Kith Mind boundary, and the archive must
+be able to satisfy it there without redesign.
 
-The financial database owns canonical transaction identity and reconciliation.
-Kith Mind may link to those records or maintain a deliberate read projection;
-it must not independently create a competing authoritative transaction set
-from the same statements. An optional projection uses stable upstream IDs,
-revision checkpoints, idempotent updates and deletion tombstones. Map its
-semantics to existing Kith Mind financial records/query capabilities where
-appropriate rather than forcing incompatible investment activity into them.
+## Ground rules
 
-## Local and cloud boundary
+1. **Raw files are immutable.** Everything acquired is written once to the raw
+   tree, never edited, never deleted. All structured data is derived and can be
+   rebuilt from scratch. A parsing bug must never require re-acquisition.
+2. **Every derived row carries provenance:** source document, page or row
+   locator, and a content hash.
+3. **Reconciliation is a gate, not a report.** An import that cannot tie
+   transactions to stated balances fails loudly and marks the affected periods
+   unverified. A discrepancy is never silently absorbed.
+4. **Authentication is never automated.** No stored credentials, no scripted
+   logins, no MFA handling. A person signs in; the adapter captures what is on
+   the other side. Recurring updates process a drop folder, they do not sign in.
+5. **Ambiguous money is null with a note,** never inferred. Financial data that
+   is confidently wrong is worse than data that is missing.
+6. **Text extraction before OCR.** These are generated PDFs with a text layer.
+   OCR is a fallback for a document that genuinely has none, and any such
+   document is flagged in the import log.
+7. **Never assert absence from a paginated listing.** An absence claim requires
+   an exhaustive source: a server-reported total that the pull reconciles
+   against, or a listing paginated to completion against that total.
 
-Keep the database local unless the implementation decision says otherwise.
-Use authenticated service access scoped to the owner's existing Kith Mind
-space/account selection. No new family-sharing UI or permission system is
-required for v1; the contract retains explicit scope for later multi-user use.
+## Institution adapter interface
 
-Desktop operation is primary. The architecture should allow an authorized
-cloud-accessible read service or an explicitly chosen hosted read projection
-later. Do not expose a raw database port to the internet. Cloud/mobile access
-must report whether it is querying current local data, a dated projection, or
-an unavailable source. If the computer is offline and no approved projection
-covers the question, Kith Mind should state what information is available and
-that the desktop service is needed for the remainder. Native mobile connector
-support remains provider-dependent and a later priority.
+An adapter is the unit of contribution and the unit of reuse. It knows one
+institution and nothing about the store.
 
-## Acceptance and handoff
+```
+discover(session)  -> inventory of available documents and export ranges,
+                      with the provider's own count where one is reported
+acquire(selection) -> raw bytes written to the raw tree, plus an acquisition
+                      manifest entry: period, capture time, content hash, gaps
+parse(raw_file)    -> normalized rows with per-field locators, amounts as
+                      strings, original currency preserved
+capabilities()     -> which of {structured API, tabular export, PDF statement,
+                      trade confirmation} this institution supports, retention
+                      window, and known quirks
+```
 
-The independent team supplies the agreed schema/API, synthetic dataset,
-contract tests, coverage manifest, exact-arithmetic/reconciliation tests and
-restore evidence. The Kith Mind adapter is accepted when it can answer, with
-transaction evidence and coverage qualifications:
+Three capability tiers exist and an adapter declares which it implements. A
+structured activity API is richest and usually carries per-trade price. A
+tabular export from a download control is simpler and more stable across site
+redesigns; it is a cross-check on an API rather than a replacement, and for a
+small institution it is sufficient on its own. PDF statements and trade
+confirmations are the archival ground truth and the only source that survives
+the site changing, so they are acquired for the full retention window once.
 
-- What transactions match a payee or description during a selected period?
-- How much was spent in a selected currency and period, with transfer rules
-  stated and missing history disclosed?
-- Which statement supports a specific transaction, and was it corrected?
-- Which accounts and periods are missing or not yet reconciled?
+Adapters run in a browser session a person has already authenticated. An
+adapter never stores a credential, and credentials never appear in adapter
+configuration, journals, logs or fixtures. Where a provider reports its own row
+or document total, the adapter returns it and the importer asserts against it.
 
-Test repeated imports without duplicates, corrected records replacing current
-answers while preserving history, scope denial, unavailable local service,
-stale projections and exact totals.
+Every adapter ships with synthetic fixtures that exercise its parser without a
+real account. Whether a given institution's adapter is published or kept local
+is a per-adapter decision recorded in its own directory.
+
+## Data model
+
+SQLite. Dates are ISO `YYYY-MM-DD` text. Money is exact: integer minor units or
+canonical base-10 decimal strings, one policy chosen and stated in the README,
+never binary floating-point at any point in parsing, normalization or
+aggregation.
+
+```
+institutions(id, name, slug)
+
+accounts(id, institution_id, acct_last4, display_name, account_type,
+         program, registration, owner_entity_id, is_pledged,
+         base_currency, opened_date, closed_date, notes)
+
+instruments(id, symbol, cusip, isin, name, instrument_kind, asset_class,
+            issuer_note)
+
+transactions(id, account_id, trade_date, process_date, settle_date,
+             date_precision, activity_type, description,
+             instrument_id, quantity, price, amount, currency,
+             amount_base, fx_rate, running_balance,
+             source_document_id, source_locator, row_hash UNIQUE,
+             provider_txn_id, status, imported_at)
+
+positions(id, account_id, as_of, instrument_id, quantity, price,
+          market_value, cost_basis, unrealized, currency,
+          valuation_basis, valuation_note, source_document_id)
+
+balances(id, account_id, as_of, total_value, cash, currency,
+         period_start_value, period_end_value, source_document_id)
+
+liabilities(id, institution_id, account_id, kind, display_name, balance,
+            currency, rate, as_of, collateral_note, source_document_id)
+
+commitments(id, account_id, instrument_id, committed, called, outstanding,
+            distributed, currency, committed_original, currency_original,
+            fx_rate, status, as_of, source_document_id)
+
+documents(id, institution_id, account_id, doc_type, doc_date, file_path,
+          sha256, text_path, parsed_ok, notes)
+
+import_runs(id, started_at, finished_at, source, files_seen, rows_inserted,
+            rows_skipped, reconciliations_passed, reconciliations_failed,
+            review_items, notes)
+
+reconciliations(id, account_id, period_start, period_end, expected_change,
+                computed_change, delta, status, notes)
+
+review_items(id, kind, account_id, source_document_id, source_locator,
+             raw_value, reason, status, resolved_at, resolution_note)
+```
+
+Only the last four digits of any account number are stored. Raw documents keep
+whatever they contain and are not redacted.
+
+`row_hash` is the deduplication key: a hash over account, process date,
+activity type, description, quantity and amount. Overlapping pages from a
+paginated activity API are normal and a naive import double-counts. A provider
+transaction ID is preferred where one exists and is stable; the hash is the
+fallback. Equal date, amount and description is not proof of duplication, so
+repeated equal amounts on distinct source rows are preserved.
+
+### Fields that exist for extensibility
+
+Three parts of the model are designed in and left unpopulated in v1. They cost
+nothing now and cannot be retrofitted cheaply later.
+
+- **Currency on every money column, plus `currency_original`, `fx_rate` and
+  `amount_base`.** Totals group by currency. No implicit conversion is ever
+  performed. A commitment denominated in one currency and called in another
+  records both sides and the rate used.
+- **`positions.valuation_basis`.** One of market price, last round, cost, or
+  reported NAV, with a `valuation_note`. Without it, a total-assets query
+  silently mixes marked securities with positions carried at cost. This matters
+  more the more of a portfolio is illiquid.
+- **`commitments`.** Committed, called, outstanding and distributed. A
+  commitment is not a transaction and has no representation in a pure ledger.
+  Fund and private investment tracking is unanswerable without it, and listed
+  brokerage holdings never need it.
+
+`accounts.owner_entity_id` and `instruments` carry stable identity so an
+account, a property, an institution and a person can be joined to Kith Mind
+entities later. Entity resolution itself is deferred; the columns are not.
+
+## Reconciliation gate
+
+For every account and every statement period:
+
+1. Extract stated period start and end values from the statement.
+2. Sum transaction amounts over that window.
+3. Compare expected against computed change. Market movement makes this exact
+   only for cash-like balances, so for investment accounts reconcile the cash
+   balance rather than total value.
+4. Write a `reconciliations` row. Status is pass within a documented tolerance,
+   otherwise fail.
+5. Report failures prominently in the import log and the README status section.
+   The affected period is queryable as unverified.
+
+Every run additionally asserts that unique row-hash count equals inserted row
+count, that every transaction resolves to an account, and that any bulk pull
+matches the provider's own reported total for that range.
+
+A date outside a plausible range or in the future is a `review_items` entry,
+not a hard failure. A commitment ledger legitimately records a scheduled future
+call, and a mistyped year in a hand-maintained source is a correction to
+surface rather than a reason to abort an import.
+
+## Access for assistants
+
+v1 exposes a local read-only MCP server over the archive file:
+
+| Tool              | Behavior                                                                                                                              |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `describe_schema` | Table and column documentation, money policy, currency policy, valuation-basis meanings.                                              |
+| `run_query`       | Read-only SQL against the archive. Bounded row count and time. No write path, no attach, no file access.                              |
+| `get_evidence`    | For a row, the source document, locator, content hash and a path to the retained text.                                                |
+| `get_coverage`    | Per account and period: what was acquired, what parsed, what reconciled, what is under review, and when each source was last updated. |
+
+Every response carries the dataset revision and an explicit completeness state.
+A partial or truncated result is never labeled complete. Zero rows with unknown
+coverage means no indexed match, not proof that no event occurred.
+
+Coverage is reported at the same granularity as the record contract requires,
+so the later Kith Mind adapter wraps this surface rather than re-deriving it.
+
+## Working on the archive without reading it
+
+The archive is large. A single institution's activity history runs to tens of
+thousands of rows and its document set to thousands of pages. None of that
+belongs in an agent's context, during development or afterwards.
+
+- Acquisition writes provider responses and documents straight to the raw tree.
+  A response is never returned through an agent on its way to disk.
+- Parsing and import are scripts. An agent runs them and reads their summary:
+  files seen, rows inserted, rows skipped, reconciliations passed and failed,
+  review items opened.
+- Verification uses aggregates. Counts, sums, hashes and reconciliation deltas
+  answer whether an import is correct. A row dump does not.
+- The review queue is the exception and is bounded by design. Items surface
+  individually because a person or an agent has to judge them.
+
+This is a correctness rule as much as a cost one. An agent that has read a
+sample of rows is prone to generalizing from the sample, which is the failure
+mode the reconciliation gate and the never-assert-absence rule exist to prevent.
+
+## Sequence
+
+**v1 is initial ingestion and assistant access.** Idempotent re-import and the
+reconciliation gate belong here, not in v2. Re-import is a property of the
+importer and gets exercised dozens of times during development, and an archive
+that answers before it reconciles answers confidently and wrongly.
+
+| Task | Deliverable                                            | Acceptance                                                                                                                                                                                                           |
+| ---- | ------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| F1-1 | Store, schema, migrations and money policy             | Schema created from migrations. Exact-arithmetic tests over decimal strings. Round-trip tests for multi-currency rows. Documented money and rounding policy in the README.                                           |
+| F1-2 | Adapter interface and synthetic reference adapter      | A synthetic institution implements all three capability tiers against generated fixtures. No real account required to run the suite.                                                                                 |
+| F1-3 | Importer with provenance, dedupe and review queue      | Repeated import of the same raw tree inserts nothing new. Overlapping paginated pages deduplicate. Provider totals are asserted. Ambiguous values enter review rather than being guessed.                            |
+| F1-4 | Reconciliation gate                                    | Synthetic statements with a known injected discrepancy fail the gate and mark the period unverified. Passing periods are marked verified with the tolerance recorded.                                                |
+| F1-5 | First real institution adapter and initial acquisition | Full available retention window acquired to the raw tree with an acquisition manifest. Structured and tabular sources cross-checked against each other. Every pull reconciled against the provider's reported total. |
+| F1-6 | Local read-only MCP server                             | The four tools above. Read-only enforcement tested against write, attach and file-access attempts. Coverage and completeness states verified against a deliberately partial fixture.                                 |
+| F1-7 | Remaining institution adapters                         | Each declares capabilities, ships fixtures, and records its quirks. An institution with a clean tabular export uses it and skips API work.                                                                           |
+
+v1 is done when a single query against the archive reproduces, with no browser:
+fees paid over a trailing twelve months by account and fee type; every purchase
+of a given instrument class with date, quantity, price and maturity; current
+positions with cost basis by account and asset class, each labeled with its
+valuation basis; and total assets and liabilities as of the most recent
+statement date. Every period in `reconciliations` is either passed or
+explicitly flagged.
+
+**v2 is freshness and integration.**
+
+| Task  | Deliverable                                                                                                                                       |
+| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| F1-8  | Drop-folder top-up: a single entry point that scans an inbox, imports what is new, skips what is already hashed, runs the gate and writes a log.  |
+| F1-9  | Coverage and freshness reporting, including staleness per source and an actionable reminder for the human acquisition step.                       |
+| F1-10 | Kith Mind read adapter or deliberate read projection, using stable archive IDs, revision checkpoints, idempotent updates and deletion tombstones. |
+| F1-11 | Additional record kinds where a source introduces them, including commitment tracking from a maintained spreadsheet.                              |
+
+No scheduled scraper is built. If a scheduled agent participates at all, its
+job is running the import and reminding a person to do the acquisition.
+
+## Repository and privacy boundary
+
+The code is public and MIT. The data is not in the repository at any point.
+
+Public: the store, schema and migrations; the adapter interface; adapter
+implementations and their synthetic fixtures; the importer, reconciliation gate
+and MCP server; the README and this plan.
+
+Local only, outside the repository: the archive file, the raw document tree,
+import logs, and any configuration naming a real path, institution account,
+program, person or balance. Institution-specific extraction notes that reference
+a real account inventory stay in the gitignored private documentation tree.
+
+Public examples use root aliases and synthetic institutions. No real account
+number, balance, holding, advisor, entity or file path appears in the public
+repository, in fixtures, in test names, or in commit messages. A public clone
+runs the full suite with no owner credentials and no private files.
+
+## Deferred
+
+Cross-institution instrument consolidation, tax-lot matching, performance
+attribution, automated valuation of illiquid positions, and any write path back
+to an institution are out of scope. The schema must make them possible without
+requiring them now.
