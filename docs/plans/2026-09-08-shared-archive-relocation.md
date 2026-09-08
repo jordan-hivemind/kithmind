@@ -54,8 +54,17 @@ count as fresh recovery verification.
 
 The immutable recipe store uses a protected file named by the workflow ID.
 It verifies exact canonical bytes and recovers only matching prepared writes;
-conflicting files remain untouched. A recipe-aware session factory is still
-needed to hold the same journal continuously from preparation into execution.
+conflicting files remain untouched. The recipe-aware session factory holds the
+same journal continuously from preparation into execution. Resume checks the
+recipe against the full workflow intent, original state before verification,
+and exact catalog mapping and journal phase during paired rebind recovery.
+
+Remote inventory reads every snapshot without host or tag filters. A separate
+bounded tree inventory reads the actual stored file paths for each exact
+snapshot. Snapshot input paths are provenance, not restore paths: a relative
+backup input can have an absolute provenance path while storing `/object.age`.
+The tree reader permits one encrypted file and its ancestor directories,
+rejecting links, special nodes, duplicates, and truncated output.
 
 An owner-only age recovery helper verifies ciphertext and plaintext hashes.
 It sends the protected native age identity through standard input and writes
