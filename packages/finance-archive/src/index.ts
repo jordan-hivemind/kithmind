@@ -71,3 +71,9 @@ export {
   type ImportRow,
   type ImportSummary,
 } from "./importer.js";
+export {
+  runReconciliationGate,
+  type ReconciliationGateSummary,
+  type ReconciliationOutcome,
+  type ReconciliationStatus,
+} from "./reconciliation.js";
