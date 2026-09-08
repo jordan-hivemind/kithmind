@@ -1314,9 +1314,7 @@ export async function activateSourceItemGeneration(
     ? MAX_PARSED_GENERATION_CHUNK_TEXT_UTF8_BYTES
     : MAX_GENERATION_CHUNK_TEXT_UTF8_BYTES;
   if (nextChunkTextBytes > chunkTextLimit) {
-    throw new Error(
-      `Generation exceeds ${chunkTextLimit} chunk text bytes`,
-    );
+    throw new Error(`Generation exceeds ${chunkTextLimit} chunk text bytes`);
   }
   const previousGenerationId = item.activeGenerationId;
   if (previousGenerationId && previousGenerationId !== generation._id) {
@@ -2089,6 +2087,18 @@ export async function finalizeSourceItemTombstone(
       .first(),
     ctx.db
       .query("sourceArtifactDeletionAcks")
+      .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+      .first(),
+    ctx.db
+      .query("workerBinaryOperationReceipts")
+      .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+      .first(),
+    ctx.db
+      .query("workerParsedStages")
+      .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+      .first(),
+    ctx.db
+      .query("processingGenerationPayloadManifests")
       .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
       .first(),
   ]);

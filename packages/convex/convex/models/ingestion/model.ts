@@ -1889,6 +1889,60 @@ export async function continueForgetFromWeb(
   if (receipts.length > 0) {
     return { phase: "ingestRequests", deleted: receipts.length, done: false };
   }
+  const binaryReceipts = await ctx.db
+    .query("workerBinaryOperationReceipts")
+    .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+    .take(MAX_STAGE_ROWS);
+  for (const row of binaryReceipts) {
+    if (
+      row.spaceId !== item.spaceId ||
+      row.sourceAccountId !== item.sourceAccountId
+    )
+      throw new Error("Worker binary receipt parent chain is invalid");
+    await ctx.db.delete(row._id);
+  }
+  if (binaryReceipts.length)
+    return {
+      phase: "workerBinaryOperationReceipts",
+      deleted: binaryReceipts.length,
+      done: false,
+    };
+  const parsedStages = await ctx.db
+    .query("workerParsedStages")
+    .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+    .take(MAX_STAGE_ROWS);
+  for (const row of parsedStages) {
+    if (
+      row.spaceId !== item.spaceId ||
+      row.sourceAccountId !== item.sourceAccountId
+    )
+      throw new Error("Worker parsed stage parent chain is invalid");
+    await ctx.db.delete(row._id);
+  }
+  if (parsedStages.length)
+    return {
+      phase: "workerParsedStages",
+      deleted: parsedStages.length,
+      done: false,
+    };
+  const manifests = await ctx.db
+    .query("processingGenerationPayloadManifests")
+    .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+    .take(MAX_STAGE_ROWS);
+  for (const row of manifests) {
+    if (
+      row.spaceId !== item.spaceId ||
+      row.sourceAccountId !== item.sourceAccountId
+    )
+      throw new Error("Processing payload manifest parent chain is invalid");
+    await ctx.db.delete(row._id);
+  }
+  if (manifests.length)
+    return {
+      phase: "processingGenerationPayloadManifests",
+      deleted: manifests.length,
+      done: false,
+    };
   const jobs = await ctx.db
     .query("ingestJobs")
     .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
@@ -1924,6 +1978,22 @@ export async function continueForgetFromWeb(
       done: false,
     };
   }
+  const residual = await Promise.all([
+    ctx.db
+      .query("workerBinaryOperationReceipts")
+      .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+      .first(),
+    ctx.db
+      .query("workerParsedStages")
+      .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+      .first(),
+    ctx.db
+      .query("processingGenerationPayloadManifests")
+      .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+      .first(),
+  ]);
+  if (residual.some(Boolean))
+    throw new Error("Source item cleanup has residual processing state");
   if (
     item.archiveDeletionForgetEpoch !== item.desiredProcessingEpoch ||
     !Number.isSafeInteger(item.archiveDeletionReceiptCount) ||

@@ -33,10 +33,12 @@ const phases = [
   { kind: "assessment", state: "stale" },
   { kind: "assessment", state: "complete" },
   { kind: "assessment", state: "incomplete" },
+  { kind: "binary_operation_receipt" },
+  { kind: "parsed_stage" },
 ] as const;
 
 // Phase ordering is persisted. A new layout starts a fresh, safe sweep.
-const CHECKPOINT_KEY = "v4";
+const CHECKPOINT_KEY = "v5";
 
 /** Only the exact active source assessment can pin this scan's detail. */
 async function hasLiveAssessment(
@@ -90,6 +92,71 @@ async function sweep(
     cursor: checkpoint.cursor ?? null,
   };
   let changed = 0;
+  if (phase.kind === "binary_operation_receipt") {
+    const page = await ctx.db
+      .query("workerBinaryOperationReceipts")
+      .withIndex("by_retireAt", (q) => q.lte("retireAt", checkpoint.cutoff))
+      .paginate(paginationOpts);
+    for (const row of page.page) {
+      // A receipt is the authoritative retry result through its replay window.
+      if (row.retireAt > now) continue;
+      await ctx.db.delete(row._id);
+      changed += 1;
+    }
+    return progress(page, changed);
+  }
+  if (phase.kind === "parsed_stage") {
+    const page = await ctx.db
+      .query("workerParsedStages")
+      .withIndex("by_retireAt", (q) => q.lte("retireAt", checkpoint.cutoff))
+      .paginate(paginationOpts);
+    for (const row of page.page) {
+      if (row.retireAt > now) continue;
+      const job = await ctx.db.get(row.ingestJobId);
+      // Batch and seal retries can outlive the stage's original deadline.
+      const liveReceipt = await ctx.db
+        .query("workerBinaryOperationReceipts")
+        .withIndex("by_stageId_and_retireAt", (q) =>
+          q.eq("stageId", row._id).gt("retireAt", now),
+        )
+        .first();
+      if (liveReceipt) continue;
+      if (!job) {
+        const [item, account] = await Promise.all([
+          ctx.db.get(row.sourceItemId),
+          ctx.db.get(row.sourceAccountId),
+        ]);
+        const isForgottenOrphan =
+          item?.lifecycle === "forgotten" &&
+          item.spaceId === row.spaceId &&
+          item.sourceAccountId === row.sourceAccountId &&
+          account?.spaceId === row.spaceId;
+        if (!isForgottenOrphan) continue;
+        await ctx.db.delete(row._id);
+        changed += 1;
+        continue;
+      }
+      const hasCoherentJob =
+        job.spaceId === row.spaceId &&
+        job.sourceAccountId === row.sourceAccountId &&
+        job.sourceItemId === row.sourceItemId &&
+        job.processingGenerationId === row.processingGenerationId &&
+        job.sourceRevisionId === row.sourceRevisionId &&
+        job.workerProcessingMode === "parsed_pages_v1";
+      // Unknown or incoherent parents are retained for explicit review. A
+      // coherent live job still owns the stage regardless of its old deadline.
+      if (!hasCoherentJob) continue;
+      if (
+        job.state === "queued" ||
+        job.state === "processing" ||
+        job.state === "staged"
+      )
+        continue;
+      await ctx.db.delete(row._id);
+      changed += 1;
+    }
+    return progress(page, changed);
+  }
   if (phase.kind === "expire_assessment") {
     const page = await ctx.db
       .query("workerProcessingAssessments")
@@ -405,7 +472,7 @@ export const removeExpired = internalMutation({
     if (state) await ctx.db.patch(state._id, fields);
     else {
       await ctx.db.insert("workerCleanupState", fields);
-      for (const oldKey of ["v1", "v2", "v3"]) {
+      for (const oldKey of ["v1", "v2", "v3", "v4"]) {
         const old = await ctx.db
           .query("workerCleanupState")
           .withIndex("by_key", (q) => q.eq("key", oldKey))

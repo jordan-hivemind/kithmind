@@ -116,7 +116,7 @@ describe("worker cleanup bounds", () => {
       }
     });
     const firstCycle = [];
-    for (let index = 0; index < 23; index += 1) {
+    for (let index = 0; index < 25; index += 1) {
       firstCycle.push(
         await f.t.mutation(internal.models.workers.cleanup.removeExpired, {}),
       );
@@ -128,7 +128,7 @@ describe("worker cleanup bounds", () => {
     });
 
     const secondCycle = [];
-    for (let index = 0; index < 23; index += 1) {
+    for (let index = 0; index < 25; index += 1) {
       secondCycle.push(
         await f.t.mutation(internal.models.workers.cleanup.removeExpired, {}),
       );
@@ -359,7 +359,7 @@ describe("worker cleanup bounds", () => {
       });
     });
 
-    for (let index = 0; index < 23; index += 1) {
+    for (let index = 0; index < 25; index += 1) {
       await f.t.mutation(internal.models.workers.cleanup.removeExpired, {});
     }
     await f.t.run(async (ctx) => {
@@ -380,7 +380,7 @@ describe("worker cleanup bounds", () => {
       await ctx.db.patch(entry._id, { discoveryWorkId: undefined });
       await ctx.db.patch(work._id, { state: "queued" });
     });
-    for (let index = 0; index < 23; index += 1) {
+    for (let index = 0; index < 25; index += 1) {
       await f.t.mutation(internal.models.workers.cleanup.removeExpired, {});
     }
     await f.t.run(async (ctx) => {
@@ -680,7 +680,7 @@ describe("worker reservation receipt retention", () => {
       }
       return lastId!;
     });
-    for (let i = 0; i < 23; i++) {
+    for (let i = 0; i < 25; i++) {
       const result = await f.t.mutation(
         internal.models.workers.cleanup.removeExpired,
         {},
@@ -690,7 +690,7 @@ describe("worker reservation receipt retention", () => {
     await f.t.run(async (ctx) => {
       expect(await ctx.db.get(tailId)).not.toBeNull();
     });
-    for (let i = 0; i < 23; i++) {
+    for (let i = 0; i < 25; i++) {
       const result = await f.t.mutation(
         internal.models.workers.cleanup.removeExpired,
         {},
@@ -736,7 +736,7 @@ test("rate window cleanup preserves current limits and removes expired key state
     await ctx.db.delete(retiredCredentialId);
     return { expired, live };
   });
-  for (let i = 0; i < 23; i++)
+  for (let i = 0; i < 25; i++)
     await f.t.mutation(internal.models.workers.cleanup.removeExpired, {});
   await f.t.run(async (ctx) => {
     expect(await ctx.db.get(ids.expired)).toBeNull();
@@ -802,7 +802,7 @@ async function insertAssessment(
 }
 
 async function cleanupCycle(f: Awaited<ReturnType<typeof fixture>>) {
-  for (let index = 0; index < 23; index += 1) {
+  for (let index = 0; index < 25; index += 1) {
     const result = await f.t.mutation(
       internal.models.workers.cleanup.removeExpired,
       {},
@@ -923,7 +923,7 @@ describe("assessment cleanup", () => {
     });
   });
 
-  test("starts a fresh v4 cycle and retires the deployed v3 checkpoint", async () => {
+  test("starts a fresh v5 cycle and retires the deployed v3 checkpoint", async () => {
     const f = await fixture();
     await f.t.run((ctx) =>
       ctx.db.insert("workerCleanupState", {
@@ -940,8 +940,8 @@ describe("assessment cleanup", () => {
     await f.t.run(async (ctx) => {
       const rows = await ctx.db.query("workerCleanupState").collect();
       expect(rows).toHaveLength(1);
-      expect(rows[0]?.key).toBe("v4");
-      expect(rows[0]?.checkpoints).toHaveLength(23);
+      expect(rows[0]?.key).toBe("v5");
+      expect(rows[0]?.checkpoints).toHaveLength(25);
     });
   });
 });
