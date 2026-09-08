@@ -205,6 +205,37 @@ Never edit a migration that has shipped.
 Only the last four digits of an account number are stored, in
 `accounts.acct_last4`, enforced by a `CHECK` constraint.
 
+## Local read-only MCP server
+
+`src/mcp` is the v1 assistant access surface described in the plan: a local,
+read-only [MCP](https://modelcontextprotocol.io) server over one archive
+file, run as `pnpm --filter @repo/finance-archive mcp` after a build, with
+`FINANCE_ARCHIVE_DB_PATH` set to the archive file. That path is read from the
+environment only; it is never committed and the server never defaults to a
+location.
+
+Four tools: `describe_schema` (table and column documentation, plus the
+money, currency and valuation-basis policy), `run_query` (read-only SQL,
+bounded rows and time), `get_evidence` (source document, locator, content
+hash and retained-text path for one row), and `get_coverage` (per account:
+what was acquired, parsed, reconciled, and under review). Every response
+carries `datasetRevision` (SQLite's own `data_version`, which changes when
+the importer writes the file) and an explicit `completeness` state; a
+truncated `run_query` result is marked `truncated`, never `complete`, and a
+zero-row result always carries `resultSemantics` explaining that it means no
+indexed match, not proof that nothing happened.
+
+`run_query` enforces read-only in depth rather than by inspecting the SQL
+string: the file is opened `SQLITE_OPEN_READONLY`, `PRAGMA query_only` and
+defensive mode are both on, and an authorizer callback allow-lists `SELECT`,
+table/column reads and a small function list, denying every write, every DDL
+verb, `ATTACH`/`DETACH`, every `PRAGMA`, and file-access functions like
+`readfile` -- including one hidden inside a `WITH` clause or a subquery. A
+single-statement check on top of that, using SQLite's own parser rather than
+a regex, rejects a second statement smuggled after a semicolon or inside a
+comment. See `src/mcp/queryGuard.ts` for the full layer list and
+`test/mcpQueryGuard.test.mjs` for the attack-by-attack tests.
+
 ## Checks
 
 ```

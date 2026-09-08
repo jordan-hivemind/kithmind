@@ -4,20 +4,30 @@
   "private": true,
   "type": "module",
   "engines": {
-    "node": ">=24"
+    "node": ">=24.10.0"
   },
   "exports": {
     ".": {
       "types": "./src/index.ts",
       "node": "./dist/index.js",
       "default": "./src/index.ts"
+    },
+    "./mcp": {
+      "types": "./src/mcp/server.ts",
+      "node": "./dist/mcp/server.js",
+      "default": "./src/mcp/server.ts"
     }
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check-types": "tsc -p tsconfig.json --noEmit",
     "test": "node --test test/*.test.mjs",
-    "test:once": "node --test test/*.test.mjs"
+    "test:once": "node --test test/*.test.mjs",
+    "mcp": "node dist/mcp/run.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^3.24.0"
   },
   "devDependencies": {
     "@repo/typescript-config": "workspace:*",
