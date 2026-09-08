@@ -13,6 +13,8 @@ import { basename, join } from "node:path";
 import type {
   ArchiveBoundaryRelocation,
   ArchiveBoundaryRelocationArtifact,
+  ArchiveBoundaryRelocationArtifactBinding,
+  ArchiveBoundaryRelocationPreparation,
   ArchiveCatalogSnapshot,
   ArchiveCopyRecord,
   ArchiveDeletionTarget,
@@ -1616,6 +1618,109 @@ export class ArchiveCatalog {
   listProcessings(): ProcessingCatalogRow[] {
     this.assertUsable();
     return structuredClone(this.snapshot.processings);
+  }
+
+  /**
+   * Snapshot the complete still-live remote inventory while the exact journal
+   * session and durable catalog bytes remain held and unchanged.
+   */
+  async snapshotRemoteBoundaryForRelocation(args: {
+    expectedJournal: Journal<JsonValue, JsonValue>;
+    oldBoundary: RemoteBackupBoundary;
+    newBoundary: RemoteBackupBoundary;
+  }): Promise<ArchiveBoundaryRelocationPreparation> {
+    return await this.enter(async () => {
+      if (this.journal !== args.expectedJournal) fail("catalog_conflict");
+      const current = await this.read();
+      if (
+        current === undefined ||
+        this.storedIdentity === undefined ||
+        !equal(current.identity, this.storedIdentity) ||
+        !equal(
+          parseSnapshot(current.value, this.snapshot.authorityDigest),
+          this.snapshot,
+        )
+      )
+        fail("catalog_conflict");
+      const repositoryId = sha(args.oldBoundary.repositoryId);
+      const oldBoundary = remoteBoundary(args.oldBoundary, repositoryId);
+      const newBoundary = remoteBoundary(args.newBoundary, repositoryId);
+      if (
+        newBoundary.rootPath === oldBoundary.rootPath ||
+        !equal(oldBoundary, {
+          ...newBoundary,
+          rootPath: oldBoundary.rootPath,
+        }) ||
+        this.snapshot.boundaryRelocations.some(
+          (relocation) =>
+            equal(relocation.oldBoundary, oldBoundary) ||
+            equal(relocation.newBoundary, newBoundary) ||
+            equal(relocation.oldBoundary, newBoundary) ||
+            equal(relocation.newBoundary, oldBoundary),
+        )
+      )
+        fail("catalog_conflict");
+      const artifacts: ArchiveBoundaryRelocationArtifact[] = [];
+      const artifactBindings: ArchiveBoundaryRelocationArtifactBinding[] = [];
+      const collect = (
+        copy: ArchiveCopyRecord,
+        kind: ArchiveBoundaryRelocationArtifactBinding["kind"],
+        catalogId: string,
+      ) => {
+        const artifact = relocationArtifactForCopy(copy, oldBoundary);
+        if (!artifact) return;
+        if (!copy.published) fail("invalid_transition");
+        artifacts.push(artifact);
+        artifactBindings.push({
+          kind,
+          catalogId,
+          ...artifact,
+          plaintextSha256: copy.published.source.sha256,
+          plaintextByteLength: copy.published.source.byteLength,
+        });
+      };
+      for (const original of this.snapshot.originals) {
+        const backup = original.copies.independent_backup;
+        if (backup)
+          collect(backup, "original_backup", original.originalCatalogId);
+        if (original.providerOriginal)
+          collect(
+            original.providerOriginal.locator,
+            "provider_locator",
+            original.originalCatalogId,
+          );
+      }
+      for (const processing of this.snapshot.processings) {
+        collect(
+          processing.copies.independent_backup,
+          "parser_backup",
+          processing.processingCatalogId,
+        );
+      }
+      artifacts.sort(artifactOrder);
+      artifactBindings.sort((left, right) =>
+        JSON.stringify([
+          left.snapshotId,
+          left.objectName,
+          left.kind,
+          left.catalogId,
+        ]).localeCompare(
+          JSON.stringify([
+            right.snapshotId,
+            right.objectName,
+            right.kind,
+            right.catalogId,
+          ]),
+        ),
+      );
+      return {
+        authorityDigest: this.snapshot.authorityDigest,
+        catalogRevision: this.snapshot.revision,
+        oldBoundary: structuredClone(oldBoundary),
+        artifacts: structuredClone(artifacts),
+        artifactBindings: structuredClone(artifactBindings),
+      };
+    });
   }
 
   /**
