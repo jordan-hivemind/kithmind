@@ -7,13 +7,14 @@ import {
   mkdtemp,
   readFile,
   realpath,
+  rm,
   rename,
   stat,
   symlink,
   unlink,
   writeFile,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import fsPromises from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
@@ -38,6 +39,23 @@ const RECIPIENT = `age1pq1${"q".repeat(60)}`;
 const SNAPSHOT = "a".repeat(64);
 const REPOSITORY = "b".repeat(64);
 const SECRET_SENTINEL = "must-not-appear-in-arguments-or-errors";
+let protectedFixtureRoot;
+
+async function protectedTestRoot() {
+  if (!protectedFixtureRoot) {
+    protectedFixtureRoot = await realpath(
+      await mkdtemp(join(homedir(), ".kithmind-archive-test-")),
+    );
+    await chmod(protectedFixtureRoot, 0o700);
+  }
+  return protectedFixtureRoot;
+}
+
+test.after(async () => {
+  if (protectedFixtureRoot) {
+    await rm(protectedFixtureRoot, { recursive: true, force: true });
+  }
+});
 
 function digest(bytes) {
   return {
@@ -184,8 +202,9 @@ process.exit(2);
 }
 
 async function setup(options = {}) {
+  const parent = options.protectedRoot ? await protectedTestRoot() : tmpdir();
   const base = await realpath(
-    await mkdtemp(join(tmpdir(), "pipeline-archive-test-")),
+    await mkdtemp(join(parent, "pipeline-archive-test-")),
   );
   await chmod(base, 0o700);
   const tools = join(base, "tools");
@@ -784,7 +803,7 @@ test("restic backup requires a closed summary and verifies destination ciphertex
 });
 
 test("rclone Dropbox repository binds the real directory and performs a separate remote dump", async () => {
-  const fixture = await setup();
+  const fixture = await setup({ protectedRoot: true });
   const bytes = Buffer.from("remote AGE ciphertext");
   const ciphertextPath = join(fixture.archiveRoot, "remote.age");
   await writeFile(ciphertextPath, bytes, { mode: 0o600 });
