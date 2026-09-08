@@ -238,6 +238,9 @@ export function createDropboxRelocationProvider(
         if (source.parentId !== request.expectedSourceParentId)
           fail("provider source parent changed");
         // Dropbox documents ID-relative child paths as id:<parent>/<child>.
+        // https://www.dropbox.com/developers/documentation/http/documentation#path-formats
+        // Both relocation fields accept WritePathOrId in the official spec:
+        // https://github.com/dropbox/dropbox-api-spec/blob/6d985dfaf901f1a909aa5e268bcfa524b0b7966e/files.stone#L544
         const target = `${destinationParent.id}/${request.destinationName}`;
         const result = await json(fetcher, token, "files/move_v2", {
           from_path: request.sourceId,
