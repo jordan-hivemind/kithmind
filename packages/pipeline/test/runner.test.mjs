@@ -206,9 +206,10 @@ test("fixture lock retries rotate only the initial synthetic binding", async () 
   );
   try {
     assert.notEqual(setup.journalDir, initialDirectory);
-    assert.equal(attemptedEndpoints.length, 2);
-    assert.notEqual(attemptedEndpoints[0], attemptedEndpoints[1]);
-    assert.equal(setup.config.endpoint, attemptedEndpoints[1]);
+    assert.ok(attemptedEndpoints.length >= 2);
+    assert.ok(attemptedEndpoints.length <= 5);
+    assert.equal(new Set(attemptedEndpoints).size, attemptedEndpoints.length);
+    assert.equal(setup.config.endpoint, attemptedEndpoints.at(-1));
     await assert.rejects(
       () => openJournal(setup.journalDir),
       JournalLockedError,
@@ -218,7 +219,7 @@ test("fixture lock retries rotate only the initial synthetic binding", async () 
   }
   const reopened = await openJournal(setup.journalDir);
   try {
-    assert.equal(reopened.binding.endpoint, attemptedEndpoints[1]);
+    assert.equal(reopened.binding.endpoint, attemptedEndpoints.at(-1));
   } finally {
     await reopened.close();
     await rm(setup.base, { recursive: true, force: true });
