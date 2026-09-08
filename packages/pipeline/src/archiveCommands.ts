@@ -1016,11 +1016,7 @@ async function passwordCommandArgument(
   return [command.executable, ...args].map(quoteShellWord).join(" ");
 }
 
-function resticBaseArgs(
-  repository: string,
-  passwordCommand: string,
-  options: readonly string[] = [],
-): string[] {
+function resticBaseArgs(repository: string, passwordCommand: string, options: readonly string[] = []): string[] {
   return [
     "--repo",
     repository,
@@ -1042,44 +1038,20 @@ type ResolvedRepository = {
 function location(input: ResticRepositoryLocation): ResticRepositoryLocation {
   const local = typeof input.repositoryPath === "string";
   const remote = input.repository !== undefined;
-  if (local === remote)
-    fail("invalid_input", "exactly one restic repository is required");
-  return remote
-    ? { repository: input.repository! }
-    : { repositoryPath: input.repositoryPath! };
+  if (local === remote) fail("invalid_input", "exactly one restic repository is required");
+  return remote ? { repository: input.repository! } : { repositoryPath: input.repositoryPath! };
 }
 
-async function resolveRepository(
-  input: ResticRepositoryLocation,
-  commandLimits: ArchiveCommandLimits,
-): Promise<ResolvedRepository> {
+async function resolveRepository(input: ResticRepositoryLocation, commandLimits: ArchiveCommandLimits): Promise<ResolvedRepository> {
   const selected = location(input);
   if (selected.repositoryPath !== undefined) {
-    const localPath = safeAbsolutePath(
-      selected.repositoryPath,
-      "restic repository",
-    );
+    const localPath = safeAbsolutePath(selected.repositoryPath, "restic repository");
     await safeDirectory(localPath, "restic repository");
     return { locator: localPath, options: [], localPath };
   }
   const remote: RcloneDropboxRepository = selected.repository!;
-  if (
-    remote.kind !== "rclone_dropbox_v1" ||
-    !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(remote.remoteName) ||
-    !/^[A-Za-z0-9 _.-]+(?:\/[A-Za-z0-9 _.-]+)+$/.test(remote.rootPath) ||
-    /[:\\]/.test(remote.rootPath) ||
-    remote.rootPath
-      .split("/")
-      .some(
-        (part) =>
-          !part || part === "." || part === ".." || part.trim() !== part,
-      ) ||
-    !HEX_64.test(remote.configIdentityFingerprint) ||
-    !HEX_64.test(remote.expectedRootDirectoryIdHash)
-  )
-    fail("invalid_input", "rclone Dropbox repository is invalid");
-  if (/\s|[\x00-\x1f\x7f]/.test(remote.rcloneBinary))
-    fail("invalid_input", "rclone binary path is unsafe");
+  if (remote.kind !== "rclone_dropbox_v1" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(remote.remoteName) || !/^[A-Za-z0-9 _.-]+(?:\/[A-Za-z0-9 _.-]+)+$/.test(remote.rootPath) || /[:\\]/.test(remote.rootPath) || remote.rootPath.split("/").some((part) => !part || part === "." || part === ".." || part.trim() !== part) || !HEX_64.test(remote.configIdentityFingerprint) || !HEX_64.test(remote.expectedRootDirectoryIdHash)) fail("invalid_input", "rclone Dropbox repository is invalid");
+  if (/\s|[\x00-\x1f\x7f]/.test(remote.rcloneBinary)) fail("invalid_input", "rclone binary path is unsafe");
   try {
     await verifyDropboxDirectoryBinding({
       rcloneBinary: remote.rcloneBinary,
@@ -1095,34 +1067,17 @@ async function resolveRepository(
   const environment = { RCLONE_CONFIG: remote.configPath } as const;
   return {
     locator: `rclone:${remote.remoteName}:${remote.rootPath}`,
-    options: [
-      "-o",
-      `rclone.program=${remote.rcloneBinary}`,
-      "-o",
-      "rclone.args=serve restic --stdio --cache-objects=false",
-    ],
+    options: ["-o", `rclone.program=${remote.rcloneBinary}`, "-o", "rclone.args=serve restic --stdio --cache-objects=false"],
     environment,
-    remoteBoundary: {
-      mode: "independent_backup",
-      readiness: "remote_repository_verified",
-      backend: "rclone_dropbox_v1",
-      remoteName: remote.remoteName,
-      rootPath: remote.rootPath,
-      rootDirectoryIdHash: remote.expectedRootDirectoryIdHash,
-      configIdentityFingerprint: remote.configIdentityFingerprint,
-      resticVersion: RESTIC_VERSION,
-      rcloneVersion: RCLONE_VERSION,
-    },
+    remoteBoundary: { mode: "independent_backup", readiness: "remote_repository_verified", backend: "rclone_dropbox_v1", remoteName: remote.remoteName, rootPath: remote.rootPath, rootDirectoryIdHash: remote.expectedRootDirectoryIdHash, configIdentityFingerprint: remote.configIdentityFingerprint, resticVersion: RESTIC_VERSION, rcloneVersion: RCLONE_VERSION },
   };
 }
 
-async function probeResticRepositoryInternal(
-  input: ResticRepositoryLocation & {
-    resticBinary: string;
-    passwordCommand: PasswordCommand;
-    limits?: ArchiveCommandLimits;
-  },
-): Promise<ResticRepositoryIdentity> {
+async function probeResticRepositoryInternal(input: ResticRepositoryLocation & {
+  resticBinary: string;
+  passwordCommand: PasswordCommand;
+  limits?: ArchiveCommandLimits;
+}): Promise<ResticRepositoryIdentity> {
   const commandLimits = limits(input.limits ?? DEFAULT_ARCHIVE_COMMAND_LIMITS);
   await validateExecutable(input.resticBinary, "restic binary");
   await requireResticVersion(input.resticBinary, commandLimits);
@@ -1130,11 +1085,7 @@ async function probeResticRepositoryInternal(
   const password = await passwordCommandArgument(input.passwordCommand);
   const result = await runBounded(
     input.resticBinary,
-    [
-      ...resticBaseArgs(repository.locator, password, repository.options),
-      "cat",
-      "config",
-    ],
+    [...resticBaseArgs(repository.locator, password, repository.options), "cat", "config"],
     commandLimits,
     undefined,
     repository.environment,
@@ -1570,6 +1521,7 @@ async function dirSync(path: string): Promise<void> {
 async function restoreResticObjectInternal(
   input: RestoreResticObjectInput,
 ): Promise<RestoredResticObject> {
+  requiredOpenConstants();
   const commandLimits = limits(input.limits ?? DEFAULT_ARCHIVE_COMMAND_LIMITS);
   await validateExecutable(input.resticBinary, "restic binary");
   await requireResticVersion(input.resticBinary, commandLimits);
@@ -1690,6 +1642,9 @@ async function restoreResticObjectInternal(
       restored.digest.byteLength !== expected.byteLength
     )
       fail("readback_failed", "restore temporary changed");
+    const temporaryStats = await handle.stat();
+    if (temporaryStats.nlink !== 1 || (temporaryStats.mode & 0o777) !== FILE_MODE)
+      fail("unsafe_path", "restore temporary permissions or links changed");
     await handle.close();
     const currentDirectory = await safeDirectory(
       dirname(destinationPath),
@@ -1697,6 +1652,7 @@ async function restoreResticObjectInternal(
     );
     if (!sameDirectoryIdentity(destinationDirectory, currentDirectory))
       fail("unsafe_path", "restore destination directory changed");
+    await recheckFile(tempPath, restored.identity);
     await link(tempPath, destinationPath).catch((error: unknown) => {
       if ((error as NodeJS.ErrnoException).code === "EEXIST")
         fail("destination_exists", "restore destination already exists");
@@ -1726,8 +1682,14 @@ async function restoreResticObjectInternal(
     } finally {
       await dir.close();
     }
+    const publishedStats = await lstat(destinationPath);
+    if (publishedStats.nlink !== 2 || (publishedStats.mode & 0o777) !== FILE_MODE)
+      fail("unsafe_path", "restore publication permissions or links changed");
     await unlinkExact(tempPath, tempIdentity!);
     await dirSync(dirname(destinationPath));
+    const finalStats = await lstat(destinationPath);
+    if (finalStats.dev !== tempIdentity.device || finalStats.ino !== tempIdentity.inode || finalStats.nlink !== 1 || (finalStats.mode & 0o777) !== FILE_MODE)
+      fail("unsafe_path", "restore final identity changed");
     return {
       destinationPath,
       snapshotId: input.snapshotId,
@@ -1746,7 +1708,7 @@ async function restoreResticObjectInternal(
     }
     await handle.close().catch(() => undefined);
     if (!published && tempIdentity)
-      await unlink(tempPath).catch(() => undefined);
+      await unlinkExact(tempPath, tempIdentity).catch(() => undefined);
     throw error;
   }
 }
@@ -1777,25 +1739,11 @@ async function backupResticObjectInternal(
     input.expectedRepositoryId,
   );
   const boundary = repository.remoteBoundary
-    ? {
-        ...repository.remoteBoundary,
-        repositoryId: repositoryIdentity.repositoryId,
-      }
-    : await assessLocalBackupBoundaryInternal(
-        input.primaryArchiveRoot,
-        repository.localPath!,
-        input.backupMode,
-      );
+    ? { ...repository.remoteBoundary, repositoryId: repositoryIdentity.repositoryId }
+    : await assessLocalBackupBoundaryInternal(input.primaryArchiveRoot, repository.localPath!, input.backupMode);
   if (repository.localPath !== undefined) {
-    const repositoryEntry = await safeDirectory(
-      repository.localPath,
-      "restic repository",
-    );
-    if (
-      "backupDevice" in boundary &&
-      repositoryEntry.dev !== boundary.backupDevice
-    )
-      fail("unsafe_path", "backup repository device changed");
+    const repositoryEntry = await safeDirectory(repository.localPath, "restic repository");
+    if ("backupDevice" in boundary && repositoryEntry.dev !== boundary.backupDevice) fail("unsafe_path", "backup repository device changed");
   }
   const cipherPath = safeAbsolutePath(input.ciphertextPath, "ciphertext path");
   const objectName = basename(cipherPath);
@@ -1943,12 +1891,7 @@ async function recoverResticBackupInternal(
     verification: "destination_ciphertext_readback",
     ...(repository.remoteBoundary === undefined
       ? {}
-      : {
-          boundary: {
-            ...repository.remoteBoundary,
-            repositoryId: repositoryIdentity.repositoryId,
-          },
-        }),
+      : { boundary: { ...repository.remoteBoundary, repositoryId: repositoryIdentity.repositoryId } }),
   };
 }
 
@@ -2170,11 +2113,7 @@ async function forgetResticBackupExactInternal(
     input.expectedRepositoryId,
   );
   const password = await passwordCommandArgument(input.passwordCommand);
-  const baseArgs = resticBaseArgs(
-    repository.locator,
-    password,
-    repository.options,
-  );
+  const baseArgs = resticBaseArgs(repository.locator, password, repository.options);
   const identity = {
     resticBinary: input.resticBinary,
     baseArgs,
@@ -2242,13 +2181,11 @@ export async function probeArchiveTools(
   );
 }
 
-export async function probeResticRepository(
-  input: ResticRepositoryLocation & {
-    resticBinary: string;
-    passwordCommand: PasswordCommand;
-    limits?: ArchiveCommandLimits;
-  },
-): Promise<ResticRepositoryIdentity> {
+export async function probeResticRepository(input: ResticRepositoryLocation & {
+  resticBinary: string;
+  passwordCommand: PasswordCommand;
+  limits?: ArchiveCommandLimits;
+}): Promise<ResticRepositoryIdentity> {
   return publicOperation(() => probeResticRepositoryInternal(input));
 }
 
