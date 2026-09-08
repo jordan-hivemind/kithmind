@@ -22,6 +22,7 @@ import {
   journalCodec,
   PipelineRunner,
 } from "../dist/runner.js";
+import { ParserProcessError } from "../dist/parserProcess.js";
 import { parseRunnerCheckpoint } from "../dist/runnerState.js";
 
 const HASH = "a".repeat(64);
@@ -661,6 +662,31 @@ class CompleteCloud {
     }
   }
 }
+
+test("preserves an allowlisted parser failure through the safe runner boundary", async () => {
+  const setup = await fixture();
+  const journal = await openJournal(setup.journalDir);
+  try {
+    const runner = new PipelineRunner(
+      setup.config,
+      journal,
+      new CompleteCloud(),
+    );
+    runner.run = async () => {
+      throw new ParserProcessError(
+        "page_limit_exceeded",
+        "parser reported a bounded failure",
+      );
+    };
+    assert.deepEqual(await runner.runSafely(), {
+      state: "failed",
+      code: "page_limit_exceeded",
+    });
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
 
 test("publishes a bounded multi-page scan and stores only metadata after completion", async () => {
   const setup = await fixture(9);

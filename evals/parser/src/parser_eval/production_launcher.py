@@ -22,6 +22,44 @@ MAX_INPUT_BYTES = 16 * 1024 * 1024
 MAX_RAW_BYTES = 64 * 1024 * 1024
 MAX_BUNDLE_BYTES = 4 * 1024 * 1024
 SHA256 = frozenset("0123456789abcdef")
+_PROTOCOL_STDOUT: int | None = None
+
+
+def _configure_machine_stdio() -> None:
+    """Reserve one protocol descriptor and discard ordinary native log writes.
+
+    Several parser dependencies contain native code which can write straight to
+    descriptors 1 and 2, bypassing ``sys.stdout`` and ``sys.stderr``. The parent
+    accepts exactly one JSON result on stdout, so keep a private duplicate for
+    that result and point both ordinary descriptors at /dev/null before
+    importing the production converter. This prevents document-derived
+    dependency logs from entering the parent's bounded stderr capture.
+    """
+
+    global _PROTOCOL_STDOUT
+    if _PROTOCOL_STDOUT is not None:
+        return
+    sys.stdout.flush()
+    sys.stderr.flush()
+    protocol = os.dup(sys.stdout.fileno())
+    null = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(null, sys.stdout.fileno())
+        os.dup2(null, sys.stderr.fileno())
+    finally:
+        os.close(null)
+    _PROTOCOL_STDOUT = protocol
+
+
+def _write_protocol(value: bytes) -> None:
+    if _PROTOCOL_STDOUT is None:
+        raise RuntimeError("protocol stdout is unavailable")
+    offset = 0
+    while offset < len(value):
+        written = os.write(_PROTOCOL_STDOUT, value[offset:])
+        if written <= 0:
+            raise OSError("protocol write did not progress")
+        offset += written
 
 
 def _safe_result(value: dict[str, Any], exit_code: int = 0) -> int:
@@ -35,8 +73,7 @@ def _safe_result(value: dict[str, Any], exit_code: int = 0) -> int:
     if len(data) > 16 * 1024:
         data = b'{"code":"launcher_failed","state":"failed"}'
         exit_code = 2
-    sys.stdout.buffer.write(data + b"\n")
-    sys.stdout.buffer.flush()
+    _write_protocol(data + b"\n")
     return exit_code
 
 
@@ -317,6 +354,7 @@ def main(argv: list[str] | None = None) -> int:
         type=lambda value: _positive_integer(value, 150),
     )
     try:
+        _configure_machine_stdio()
         args = parser.parse_args(argv)
         _apply_limits(args.cpu_seconds, args.file_bytes, args.open_files)
         if args.mode == "network-probe":
@@ -351,6 +389,11 @@ def main(argv: list[str] | None = None) -> int:
         return _convert(args)
     except BaseException:
         return _safe_result({"state": "failed", "code": "launcher_failed"}, 2)
+    finally:
+        global _PROTOCOL_STDOUT
+        if _PROTOCOL_STDOUT is not None:
+            os.close(_PROTOCOL_STDOUT)
+            _PROTOCOL_STDOUT = None
 
 
 if __name__ == "__main__":

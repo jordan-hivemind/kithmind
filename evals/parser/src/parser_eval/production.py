@@ -18,7 +18,11 @@ from pathlib import Path
 from typing import Any
 
 from . import convert_worker
-from .convert_worker import MAX_INPUT_BYTES, _convert_docling
+from .convert_worker import (
+    MAX_INPUT_BYTES,
+    _convert_docling,
+    _provenance_whitespace_only,
+)
 from .manifest import ManifestError, load_manifest, verify_manifest
 from .normalize import codepoint_to_utf16, normalize_text
 
@@ -130,6 +134,50 @@ def _locator_page(locator: dict[str, Any], key: str) -> int | None:
     return page if isinstance(page, int) and not isinstance(page, bool) else None
 
 
+def _item_provenance_pages(
+    value: Any, source_text: str | None = None
+) -> list[int] | None:
+    multiple = isinstance(value, list)
+    provenance = value if isinstance(value, list) else [value]
+    if not 1 <= len(provenance) <= 256 or (multiple and len(provenance) < 2):
+        return None
+    pages = []
+    prior_end = 0
+    for index, span in enumerate(provenance):
+        if not isinstance(span, dict):
+            return None
+        page = span.get("page_no")
+        charspan = span.get("charspan")
+        if (
+            type(page) is not int
+            or not isinstance(charspan, list)
+            or len(charspan) != 2
+            or any(type(offset) is not int for offset in charspan)
+            or not 0 <= charspan[0] < charspan[1]
+            or (index and charspan[0] < prior_end)
+            or (
+                multiple
+                and source_text is not None
+                and (
+                    charspan[1] > len(source_text)
+                    or not _provenance_whitespace_only(
+                        source_text[prior_end : charspan[0]]
+                    )
+                )
+            )
+        ):
+            return None
+        pages.append(page)
+        prior_end = charspan[1]
+    if (
+        multiple
+        and source_text is not None
+        and not _provenance_whitespace_only(source_text[prior_end:])
+    ):
+        return None
+    return pages
+
+
 def _validate_citable_locator(
     locator: dict[str, Any], page_number: int, lossless: dict[str, Any], text: str
 ) -> None:
@@ -137,9 +185,11 @@ def _validate_citable_locator(
     if kind == "docling_item":
         item_ref = locator.get("itemRef")
         provenance = locator.get("provenance")
+        provenance_pages = _item_provenance_pages(provenance)
         if (
             not isinstance(item_ref, str)
-            or _locator_page(locator, "provenance") != page_number
+            or provenance_pages is None
+            or any(page != page_number for page in provenance_pages)
         ):
             raise ProductionFailure("conversion_output_invalid")
         texts = lossless.get("texts")
@@ -152,8 +202,12 @@ def _validate_citable_locator(
                 if isinstance(item, dict)
                 and item.get("self_ref") == item_ref
                 and isinstance(item.get("prov"), list)
-                and len(item["prov"]) == 1
-                and _same_json(item["prov"][0], provenance)
+                and _same_json(
+                    item["prov"],
+                    provenance if isinstance(provenance, list) else [provenance],
+                )
+                and isinstance(item.get("text"), str)
+                and _item_provenance_pages(provenance, item["text"]) is not None
             ]
         )
         if (

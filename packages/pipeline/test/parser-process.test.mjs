@@ -27,6 +27,7 @@ import {
   preparePdfDocQaProfile,
   removeParserProfileWorkDirectoryExact,
   removeParserOutputExact,
+  resolveRawLocators,
   runCapturedPdfParser,
 } from "../dist/parserProcess.js";
 import { mapParsedBundle } from "../dist/parsedBundleMapping.js";
@@ -116,6 +117,79 @@ async function outputDirectory(fixture, outputId) {
   return path;
 }
 
+function multiSpanLocatorFixture(separator = " ") {
+  const text = `A${separator}B`;
+  const provenance = [
+    {
+      page_no: 1,
+      charspan: [0, 1],
+      bbox: { l: 0, t: 0, r: 1, b: 1, coord_origin: "TOPLEFT" },
+    },
+    {
+      page_no: 1,
+      charspan: [2, 3],
+      bbox: { l: 1, t: 0, r: 2, b: 1, coord_origin: "TOPLEFT" },
+    },
+  ];
+  const locator = {
+    kind: "docling_item",
+    itemRef: "#/texts/0",
+    provenance,
+    doclingCharspanSemantics: "item_local_python_codepoints_not_evidence",
+  };
+  return {
+    raw: {
+      texts: [
+        { self_ref: "#/texts/0", text, prov: structuredClone(provenance) },
+      ],
+      tables: [],
+    },
+    bundle: {
+      pages: [
+        {
+          page: 1,
+          text,
+          segments: [{ id: "item-0", text, locator }],
+        },
+      ],
+    },
+  };
+}
+
+test("raw locator resolution enforces exact multi-span provenance and whitespace", () => {
+  for (const separator of ["\u0085", "\u00a0"]) {
+    const fixture = multiSpanLocatorFixture(separator);
+    assert.deepEqual(
+      resolveRawLocators(fixture.raw, fixture.bundle)["item-0"],
+      {
+        kind: "item",
+        ref: "#/texts/0",
+      },
+    );
+  }
+  for (const separator of ["\u001c", "\ufeff", "🧪"]) {
+    const fixture = multiSpanLocatorFixture(separator);
+    assert.throws(
+      () => resolveRawLocators(fixture.raw, fixture.bundle),
+      (error) =>
+        error instanceof ParserProcessError && error.code === "output_invalid",
+    );
+  }
+
+  const reordered = multiSpanLocatorFixture();
+  reordered.bundle.pages[0].segments[0].locator.provenance.reverse();
+  assert.throws(() => resolveRawLocators(reordered.raw, reordered.bundle));
+
+  const wrongPage = multiSpanLocatorFixture();
+  wrongPage.bundle.pages[0].segments[0].locator.provenance[1].page_no = 2;
+  assert.throws(() => resolveRawLocators(wrongPage.raw, wrongPage.bundle));
+
+  const uncoveredContent = multiSpanLocatorFixture("!");
+  assert.throws(() =>
+    resolveRawLocators(uncoveredContent.raw, uncoveredContent.bundle),
+  );
+});
+
 async function faultFixture(behavior) {
   const f = await fixture();
   const packageRoot = join(f.base, "fault-package");
@@ -126,7 +200,7 @@ async function faultFixture(behavior) {
   await chmod(modelAssets, 0o700);
   const launcher = join(packageRoot, "launcher.py");
   const source = `
-import errno, json, os, socket, sys, time
+import errno, json, os, signal, socket, sys, time
 from pathlib import Path
 mode = sys.argv[sys.argv.index("--mode") + 1]
 def result(value):
@@ -163,6 +237,31 @@ else:
     elif ${JSON.stringify(behavior)} == "stderr":
         sys.stderr.write("x" * 100000)
         sys.stderr.flush()
+    elif ${JSON.stringify(behavior)} == "page_limit":
+        result({"state":"failed","code":"page_limit_exceeded"})
+        raise SystemExit(2)
+    elif ${JSON.stringify(behavior)} == "zero_exit_failure":
+        result({"state":"failed","code":"page_limit_exceeded"})
+    elif ${JSON.stringify(behavior)} == "unknown_failure":
+        result({"state":"failed","code":"unexpected_failure"})
+        raise SystemExit(2)
+    elif ${JSON.stringify(behavior)} == "extra_field_failure":
+        result({"state":"failed","code":"page_limit_exceeded","extra":True})
+        raise SystemExit(2)
+    elif ${JSON.stringify(behavior)} == "malformed_failure":
+        sys.stdout.write("{malformed")
+        sys.stdout.flush()
+        raise SystemExit(2)
+    elif ${JSON.stringify(behavior)} == "overflow_failure":
+        sys.stdout.write("x" * 100000)
+        result({"state":"failed","code":"page_limit_exceeded"})
+        raise SystemExit(2)
+    elif ${JSON.stringify(behavior)} == "cpu_limit":
+        os.kill(os.getpid(), signal.SIGXCPU)
+    elif ${JSON.stringify(behavior)} == "overflow_cpu_limit":
+        sys.stdout.write("x" * 100000)
+        sys.stdout.flush()
+        os.kill(os.getpid(), signal.SIGXCPU)
 `;
   await writeFile(launcher, source, { mode: 0o600 });
   const modelLock = join(f.base, "fault-model-lock.json");
@@ -473,6 +572,164 @@ test(
     }
   },
 );
+
+test(
+  "preserves a strictly shaped allowlisted launcher failure",
+  { skip: !hasPythonRuntime, timeout: 10_000 },
+  async () => {
+    const f = await faultFixture("page_limit");
+    try {
+      const outputId = randomUUID();
+      const output = await outputDirectory(f, outputId);
+      await assert.rejects(
+        () =>
+          runCapturedPdfParser({
+            ...f.common,
+            outputId,
+            outputDirectory: output,
+          }),
+        (error) =>
+          error instanceof ParserProcessError &&
+          error.code === "page_limit_exceeded" &&
+          !error.message.includes(f.base),
+      );
+      await assert.rejects(() => stat(join(output, "lossless.json")), {
+        code: "ENOENT",
+      });
+      await assert.rejects(() => stat(join(output, "bundle.json")), {
+        code: "ENOENT",
+      });
+    } finally {
+      await rm(f.base, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "rejects malformed output from a nonzero parser exit",
+  { skip: !hasPythonRuntime, timeout: 10_000 },
+  async () => {
+    const f = await faultFixture("malformed_failure");
+    try {
+      const outputId = randomUUID();
+      const output = await outputDirectory(f, outputId);
+      await assert.rejects(
+        () =>
+          runCapturedPdfParser({
+            ...f.common,
+            outputId,
+            outputDirectory: output,
+          }),
+        (error) =>
+          error instanceof ParserProcessError &&
+          error.code === "output_invalid" &&
+          !error.message.includes(f.base),
+      );
+    } finally {
+      await rm(f.base, { recursive: true, force: true });
+    }
+  },
+);
+
+for (const behavior of [
+  "zero_exit_failure",
+  "unknown_failure",
+  "extra_field_failure",
+]) {
+  test(
+    `rejects a ${behavior} launcher result`,
+    { skip: !hasPythonRuntime, timeout: 10_000 },
+    async () => {
+      const f = await faultFixture(behavior);
+      try {
+        const outputId = randomUUID();
+        const output = await outputDirectory(f, outputId);
+        await assert.rejects(
+          () =>
+            runCapturedPdfParser({
+              ...f.common,
+              outputId,
+              outputDirectory: output,
+            }),
+          (error) =>
+            error instanceof ParserProcessError &&
+            error.code ===
+              (behavior === "zero_exit_failure"
+                ? "output_invalid"
+                : "conversion_failed") &&
+            !error.message.includes(f.base),
+        );
+      } finally {
+        await rm(f.base, { recursive: true, force: true });
+      }
+    },
+  );
+}
+
+test(
+  "preserves output limits ahead of a structured nonzero failure",
+  { skip: !hasPythonRuntime, timeout: 10_000 },
+  async () => {
+    const f = await faultFixture("overflow_failure");
+    try {
+      const outputId = randomUUID();
+      const output = await outputDirectory(f, outputId);
+      await assert.rejects(
+        () =>
+          runCapturedPdfParser({
+            ...f.common,
+            outputId,
+            outputDirectory: output,
+            limits: {
+              ...DEFAULT_PARSER_PROCESS_LIMITS,
+              maxStdoutBytes: 1_024,
+            },
+          }),
+        (error) =>
+          error instanceof ParserProcessError &&
+          error.code === "output_limit_exceeded" &&
+          !error.message.includes(f.base),
+      );
+    } finally {
+      await rm(f.base, { recursive: true, force: true });
+    }
+  },
+);
+
+for (const [behavior, expectedCode] of [
+  ["cpu_limit", "cpu_limit_exceeded"],
+  ["overflow_cpu_limit", "output_limit_exceeded"],
+]) {
+  test(
+    `reports ${expectedCode} for a ${behavior} parser termination`,
+    { skip: !hasPythonRuntime, timeout: 10_000 },
+    async () => {
+      const f = await faultFixture(behavior);
+      try {
+        const outputId = randomUUID();
+        const output = await outputDirectory(f, outputId);
+        await assert.rejects(
+          () =>
+            runCapturedPdfParser({
+              ...f.common,
+              outputId,
+              outputDirectory: output,
+              limits: {
+                ...DEFAULT_PARSER_PROCESS_LIMITS,
+                maxStdoutBytes: 1_024,
+              },
+            }),
+          (error) =>
+            error instanceof ParserProcessError &&
+            error.code === expectedCode &&
+            !error.message.includes(f.base),
+        );
+      } finally {
+        await rm(f.base, { recursive: true, force: true });
+      }
+    },
+  );
+}
 
 for (const stream of ["stdout", "stderr"]) {
   test(

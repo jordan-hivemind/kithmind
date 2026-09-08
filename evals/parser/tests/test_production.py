@@ -1,11 +1,17 @@
+import copy
 import hashlib
 import json
-import copy
+import sys
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from parser_eval.convert_worker import MAX_INPUT_BYTES
+from parser_eval.convert_worker import (
+    MAX_INPUT_BYTES,
+    _docling_normalized,
+    _provenance_whitespace_only,
+)
 from parser_eval.production import (
     MAX_SERIALIZED_BUNDLE_BYTES,
     ParentExecutionBoundary,
@@ -19,6 +25,40 @@ from parser_eval.production import (
 )
 
 
+class FakeProvenance:
+    def __init__(self, page_no, charspan):
+        self.page_no = page_no
+        self.charspan = charspan
+
+    def model_dump(self, **_kwargs):
+        return {
+            "page_no": self.page_no,
+            "charspan": list(self.charspan),
+            "bbox": {"l": 0, "t": 0, "r": 1, "b": 1, "coord_origin": "TOPLEFT"},
+        }
+
+
+class FakeTextItem:
+    def __init__(self, self_ref, text, prov):
+        self.self_ref = self_ref
+        self.text = text
+        self.prov = prov
+
+
+class FakeTableItem:
+    pass
+
+
+FAKE_DOCLING_DOC = types.ModuleType("docling_core.types.doc")
+FAKE_DOCLING_DOC.TextItem = FakeTextItem
+FAKE_DOCLING_DOC.TableItem = FakeTableItem
+FAKE_DOCLING_MODULES = {
+    "docling_core": types.ModuleType("docling_core"),
+    "docling_core.types": types.ModuleType("docling_core.types"),
+    "docling_core.types.doc": FAKE_DOCLING_DOC,
+}
+
+
 class ProductionParserTest(unittest.TestCase):
     data = b"%PDF-synthetic-capture"
     digest = hashlib.sha256(data).hexdigest()
@@ -27,7 +67,11 @@ class ProductionParserTest(unittest.TestCase):
 
     @staticmethod
     def conversion():
-        provenance = {"page_no": 1}
+        provenance = {
+            "page_no": 1,
+            "charspan": [0, 13],
+            "bbox": {"l": 0, "t": 0, "r": 1, "b": 1, "coord_origin": "TOPLEFT"},
+        }
         return (
             {
                 "pages": [
@@ -115,6 +159,112 @@ class ProductionParserTest(unittest.TestCase):
                 ).encode()
             ).hexdigest(),
         )
+
+    def test_retains_same_page_multi_span_items_and_ignores_empty_items(self):
+        def provenance(page, start, end):
+            return FakeProvenance(page, (start, end))
+
+        retained = FakeTextItem(
+            self_ref="#/texts/0",
+            text="Alpha beta gamma",
+            prov=[provenance(1, 0, 5), provenance(1, 6, 10), provenance(1, 11, 16)],
+        )
+        empty = FakeTextItem(
+            self_ref="#/texts/1",
+            text="",
+            prov=[],
+        )
+
+        class Document:
+            @staticmethod
+            def iterate_items():
+                return iter(((retained, 1), (empty, 1)))
+
+        with patch.dict(sys.modules, FAKE_DOCLING_MODULES):
+            pages, tables, gaps = _docling_normalized(Document(), 1)
+        self.assertEqual(tables, [])
+        self.assertEqual(gaps, [])
+        self.assertEqual(pages[0]["text"], retained.text)
+        segment = pages[0]["segments"][0]
+        self.assertEqual(len(segment["locator"]["provenance"]), 3)
+        self.assertEqual(
+            [span["charspan"] for span in segment["locator"]["provenance"]],
+            [[0, 5], [6, 10], [11, 16]],
+        )
+
+    def test_provenance_whitespace_policy_matches_protocol_vectors(self):
+        self.assertTrue(_provenance_whitespace_only("\u0085"))
+        self.assertTrue(_provenance_whitespace_only("\u00a0"))
+        self.assertFalse(_provenance_whitespace_only("\u001c"))
+        self.assertFalse(_provenance_whitespace_only("\ufeff"))
+        self.assertFalse(_provenance_whitespace_only("🧪"))
+
+    def test_multi_span_items_fail_closed_on_cross_page_or_uncovered_text(self):
+        def item(ref, spans):
+            return FakeTextItem(
+                self_ref=ref,
+                text="Alpha beta",
+                prov=[
+                    FakeProvenance(page, charspan)
+                    for page, charspan in spans
+                ],
+            )
+
+        cross_page = item("#/texts/0", [(1, (0, 5)), (2, (6, 10))])
+        uncovered = item("#/texts/1", [(1, (0, 4)), (1, (6, 10))])
+
+        class Document:
+            @staticmethod
+            def iterate_items():
+                return iter(((cross_page, 1), (uncovered, 1)))
+
+        with patch.dict(sys.modules, FAKE_DOCLING_MODULES):
+            pages, _tables, gaps = _docling_normalized(Document(), 2)
+        self.assertEqual([page["text"] for page in pages], ["", ""])
+        self.assertEqual(
+            gaps,
+            [
+                {"kind": "ambiguous_text_provenance", "item": 0},
+                {"kind": "ambiguous_text_provenance", "item": 1},
+            ],
+        )
+
+    def test_normalized_bundle_binds_exact_multi_span_raw_provenance(self):
+        normalized, raw = self.conversion()
+        text = "Alpha beta gamma"
+        provenance = [
+            {"page_no": 1, "charspan": [0, 5]},
+            {"page_no": 1, "charspan": [6, 10]},
+            {"page_no": 1, "charspan": [11, 16]},
+        ]
+        normalized["pages"][0].update(
+            {
+                "text": text,
+                "segments": [
+                    {
+                        "id": "docling-item-0",
+                        "text": text,
+                        "startCodepoint": 0,
+                        "endCodepoint": len(text),
+                        "citable": True,
+                        "locator": {
+                            "kind": "docling_item",
+                            "itemRef": "#/texts/0",
+                            "provenance": provenance,
+                        },
+                    }
+                ],
+            }
+        )
+        raw["texts"][0].update({"text": text, "prov": provenance})
+        bundle = _normalized_bundle(normalized, raw, self.digest, {})
+        self.assertEqual(bundle["pages"][0]["text"], text)
+        altered = copy.deepcopy(normalized)
+        altered["pages"][0]["segments"][0]["locator"]["provenance"][1][
+            "charspan"
+        ] = [4, 10]
+        with self.assertRaises(ProductionFailure):
+            _normalized_bundle(altered, raw, self.digest, {})
 
     def test_refuses_without_parent_network_and_resource_boundary(self):
         result, converter = self.call(

@@ -87,23 +87,43 @@ function locator(
   // The source bounding box remains in the raw artifact. Do not discard its
   // coordinate-origin metadata by forwarding four numbers as an ambiguous box.
   if (input.kind === "docling_item") {
-    const provenance = object(input.provenance);
+    const provenanceValue = input.provenance;
+    const multiple = Array.isArray(provenanceValue);
+    const provenance = multiple
+      ? provenanceValue.map(object)
+      : [object(provenanceValue)];
     if (
       resolved.kind !== "item" ||
       input.itemRef !== resolved.ref ||
-      provenance.page_no !== pageNumber ||
+      provenance.length < (multiple ? 2 : 1) ||
+      provenance.length > 256 ||
       input.doclingCharspanSemantics !==
-        "item_local_python_codepoints_not_evidence" ||
-      !Array.isArray(provenance.charspan) ||
-      provenance.charspan.length !== 2
+        "item_local_python_codepoints_not_evidence"
     )
       fail();
+    let previousEnd = -1;
+    let sourceStart = -1;
+    for (const [index, span] of provenance.entries()) {
+      if (
+        span.page_no !== pageNumber ||
+        !Array.isArray(span.charspan) ||
+        span.charspan.length !== 2 ||
+        !span.charspan.every(
+          (offset: unknown) => Number.isInteger(offset) && Number(offset) >= 0,
+        ) ||
+        Number(span.charspan[0]) >= Number(span.charspan[1]) ||
+        Number(span.charspan[0]) < previousEnd
+      )
+        fail();
+      if (index === 0) sourceStart = Number(span.charspan[0]);
+      previousEnd = Number(span.charspan[1]);
+    }
     return {
       kind: "parser_item_v1",
       pageNumber,
       itemRef: resolved.ref,
-      sourceCharStart: number(provenance.charspan[0]),
-      sourceCharEnd: number(provenance.charspan[1]),
+      sourceCharStart: sourceStart,
+      sourceCharEnd: previousEnd,
     };
   }
   if (input.kind !== "docling_table_row" || resolved.kind !== "table") fail();

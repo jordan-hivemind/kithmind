@@ -63,12 +63,40 @@ export type ParserProcessFailureCode =
   | "network_not_denied"
   | "process_escape_not_denied"
   | "process_timeout"
+  | "cpu_limit_exceeded"
   | "monitor_failed"
   | "monitored_rss_exceeded"
   | "process_count_exceeded"
   | "output_limit_exceeded"
   | "conversion_failed"
-  | "output_invalid";
+  | "output_invalid"
+  | "execution_prerequisite_missing"
+  | "input_digest_mismatch"
+  | "invalid_opaque_name"
+  | "runtime_mismatch"
+  | "model_assets_invalid"
+  | "conversion_output_invalid"
+  | "page_limit_exceeded"
+  | "retained_text_too_large"
+  | "lossless_output_too_large"
+  | "bundle_too_large";
+
+const LAUNCHER_FAILURE_CODES = [
+  "execution_prerequisite_missing",
+  "invalid_input",
+  "input_digest_mismatch",
+  "invalid_opaque_name",
+  "runtime_mismatch",
+  "model_assets_invalid",
+  "conversion_failed",
+  "conversion_output_invalid",
+  "page_limit_exceeded",
+  "retained_text_too_large",
+  "lossless_output_too_large",
+  "bundle_too_large",
+] as const satisfies readonly ParserProcessFailureCode[];
+
+type LauncherFailureCode = (typeof LAUNCHER_FAILURE_CODES)[number];
 
 export class ParserProcessError extends Error {
   constructor(
@@ -178,7 +206,8 @@ export type ValidatedNormalizedBundle = {
         | {
             kind: "docling_item";
             itemRef: string;
-            provenance: Record<string, unknown>;
+            provenance:
+              Record<string, unknown> | Array<Record<string, unknown>>;
             doclingCharspanSemantics: "item_local_python_codepoints_not_evidence";
           }
         | {
@@ -263,7 +292,15 @@ type ProcessResult = {
   stderr: Buffer;
   peakRssBytes: number;
   elapsedMs: number;
+  launcherFailure?: LauncherFailureCode;
 };
+
+function isLauncherFailureCode(value: unknown): value is LauncherFailureCode {
+  return (
+    typeof value === "string" &&
+    (LAUNCHER_FAILURE_CODES as readonly string[]).includes(value)
+  );
+}
 
 function fail(code: ParserProcessFailureCode, message: string): never {
   throw new ParserProcessError(code, message);
@@ -693,6 +730,7 @@ async function runSandboxed(
   modeArgs: readonly string[],
   env: NodeJS.ProcessEnv,
   limits: ParserProcessLimits,
+  allowStructuredFailure = false,
 ): Promise<ProcessResult> {
   const started = Date.now();
   const child = spawn(
@@ -811,10 +849,30 @@ async function runSandboxed(
   ) {
     fail("output_limit_exceeded", "parser output exceeded its bound");
   }
-  if (status.code !== 0 || status.signal !== null)
+  const capturedStdout = Buffer.concat(stdout);
+  if (status.code !== 0 || status.signal !== null) {
+    if (status.signal === "SIGXCPU")
+      fail("cpu_limit_exceeded", "parser exceeded its CPU limit");
+    if (allowStructuredFailure && status.code === 2 && status.signal === null) {
+      const result = parseLauncherResult(capturedStdout);
+      if (
+        exactKeys(result, ["state", "code"]) &&
+        result.state === "failed" &&
+        isLauncherFailureCode(result.code)
+      ) {
+        return {
+          stdout: capturedStdout,
+          stderr: Buffer.concat(stderr),
+          peakRssBytes,
+          elapsedMs: Date.now() - started,
+          launcherFailure: result.code,
+        };
+      }
+    }
     fail("conversion_failed", "parser returned failure");
+  }
   return {
-    stdout: Buffer.concat(stdout),
+    stdout: capturedStdout,
     stderr: Buffer.concat(stderr),
     peakRssBytes,
     elapsedMs: Date.now() - started,
@@ -964,6 +1022,63 @@ function validateProvenance(value: unknown, page: number): void {
   ) {
     fail("output_invalid", "locator provenance is invalid");
   }
+}
+
+function validateItemProvenance(value: unknown, page: number): void {
+  if (!Array.isArray(value)) {
+    validateProvenance(value, page);
+    return;
+  }
+  if (value.length < 2 || value.length > 256)
+    fail("output_invalid", "item provenance span count is invalid");
+  let priorEnd = -1;
+  for (const span of value) {
+    validateProvenance(span, page);
+    const charspan = (span as Record<string, unknown>).charspan as number[];
+    if (charspan[0]! < priorEnd)
+      fail("output_invalid", "item provenance spans overlap or are unordered");
+    priorEnd = charspan[1]!;
+  }
+}
+
+function provenanceWhitespaceOnly(value: readonly string[]): boolean {
+  return value.every((char) => {
+    const codepoint = char.codePointAt(0)!;
+    return (
+      (codepoint >= 0x0009 && codepoint <= 0x000d) ||
+      codepoint === 0x0020 ||
+      codepoint === 0x0085 ||
+      codepoint === 0x00a0 ||
+      codepoint === 0x1680 ||
+      (codepoint >= 0x2000 && codepoint <= 0x200a) ||
+      codepoint === 0x2028 ||
+      codepoint === 0x2029 ||
+      codepoint === 0x202f ||
+      codepoint === 0x205f ||
+      codepoint === 0x3000
+    );
+  });
+}
+
+function multiSpanProvenanceCoversText(
+  value: Record<string, unknown> | Array<Record<string, unknown>>,
+  text: string,
+): boolean {
+  if (!Array.isArray(value)) return true;
+  const codepoints = Array.from(text);
+  let priorEnd = 0;
+  for (const span of value) {
+    const charspan = span.charspan as number[];
+    const start = charspan[0]!;
+    const end = charspan[1]!;
+    if (
+      end > codepoints.length ||
+      !provenanceWhitespaceOnly(codepoints.slice(priorEnd, start))
+    )
+      return false;
+    priorEnd = end;
+  }
+  return provenanceWhitespaceOnly(codepoints.slice(priorEnd));
 }
 
 function validateTableCell(value: unknown): void {
@@ -1307,7 +1422,7 @@ function validateBundle(
             "item_local_python_codepoints_not_evidence"
         )
           fail("output_invalid", "item locator is invalid");
-        validateProvenance(locator.provenance, pageIndex + 1);
+        validateItemProvenance(locator.provenance, pageIndex + 1);
       } else if (locator.kind === "docling_table_row") {
         if (
           !exactKeys(locator, ["kind", "tableProvenance", "cells"]) ||
@@ -1367,7 +1482,7 @@ function canonicalIdentity(value: unknown): string {
   return canonicalJson(value).toString("base64");
 }
 
-function resolveRawLocators(
+export function resolveRawLocators(
   rawValue: unknown,
   bundle: ValidatedNormalizedBundle,
 ): Record<string, ResolvedParserLocator> {
@@ -1389,13 +1504,16 @@ function resolveRawLocators(
           )
             return false;
           const item = candidate as Record<string, unknown>;
+          const expectedProvenance = Array.isArray(locator.provenance)
+            ? locator.provenance
+            : [locator.provenance];
           return (
             item.self_ref === locator.itemRef &&
             Array.isArray(item.prov) &&
-            item.prov.length === 1 &&
-            canonicalIdentity(item.prov[0]) ===
-              canonicalIdentity(locator.provenance) &&
+            canonicalIdentity(item.prov) ===
+              canonicalIdentity(expectedProvenance) &&
             typeof item.text === "string" &&
+            multiSpanProvenanceCoversText(locator.provenance, item.text) &&
             normalizedRawText(item.text) === segment.text
           );
         });
@@ -1590,6 +1708,20 @@ function parseLauncherResult(bytes: Buffer): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value))
     fail("output_invalid", "launcher result is invalid");
   return value as Record<string, unknown>;
+}
+
+function throwLauncherFailure(
+  result: Record<string, unknown>,
+  expected: LauncherFailureCode | undefined,
+): void {
+  if (expected === undefined) return;
+  if (
+    exactKeys(result, ["state", "code"]) &&
+    result.state === "failed" &&
+    result.code === expected
+  )
+    fail(expected, "parser reported a bounded failure");
+  fail("output_invalid", "launcher failure result changed before validation");
 }
 
 async function requireSandboxIsolation(input: {
@@ -2351,28 +2483,27 @@ export async function preparePdfDocQaProfile(
     common,
     limits,
   });
-  const result = parseLauncherResult(
-    (
-      await runSandboxed(
-        profile,
-        python.requested,
-        launcher.requested,
-        [
-          "--mode",
-          "profile",
-          ...common,
-          "--artifacts",
-          modelAssets.path,
-          "--model-lock",
-          modelLock.canonical,
-          "--conversion-timeout-seconds",
-          String(Math.min(150, limits.cpuSeconds)),
-        ],
-        environment,
-        limits,
-      )
-    ).stdout,
+  const profileExecution = await runSandboxed(
+    profile,
+    python.requested,
+    launcher.requested,
+    [
+      "--mode",
+      "profile",
+      ...common,
+      "--artifacts",
+      modelAssets.path,
+      "--model-lock",
+      modelLock.canonical,
+      "--conversion-timeout-seconds",
+      String(Math.min(150, limits.cpuSeconds)),
+    ],
+    environment,
+    limits,
+    true,
   );
+  const result = parseLauncherResult(profileExecution.stdout);
+  throwLauncherFailure(result, profileExecution.launcherFailure);
   if (
     !exactKeys(result, [
       "state",
@@ -2683,8 +2814,10 @@ export async function runCapturedPdfParser(
       ],
       environment,
       limits,
+      true,
     );
     const launcherResult = parseLauncherResult(conversion.stdout);
+    throwLauncherFailure(launcherResult, conversion.launcherFailure);
     if (
       !exactKeys(launcherResult, [
         "state",

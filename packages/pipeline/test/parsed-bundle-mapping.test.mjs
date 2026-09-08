@@ -117,6 +117,34 @@ test("maps direct page concatenation, exact Unicode quotes and separate source o
   assert.deepEqual(await mapParsedBundle(structuredClone(input)), result);
 });
 
+test("maps Unicode same-page multi-span item to its codepoint source envelope", async () => {
+  const segment = item("🧪 alpha β", 1, 0);
+  segment.locator.provenance = [
+    { page_no: 1, charspan: [0, 1], bbox: box },
+    { page_no: 1, charspan: [2, 7], bbox: box },
+    { page_no: 1, charspan: [8, 9], bbox: box },
+  ];
+  const input = fixture([[segment]]);
+  const result = await mapParsedBundle(input);
+  assert.equal(result.evidence[0].locator.sourceCharStart, 0);
+  assert.equal(result.evidence[0].locator.sourceCharEnd, 9);
+
+  const singletonArray = structuredClone(input);
+  singletonArray.bundle.pages[0].segments[0].locator.provenance = [
+    { page_no: 1, charspan: [0, 9], bbox: box },
+  ];
+  await rejected(singletonArray);
+
+  const crossPage = structuredClone(input);
+  crossPage.bundle.pages[0].segments[0].locator.provenance[1].page_no = 2;
+  await rejected(crossPage);
+  const overlapping = structuredClone(input);
+  overlapping.bundle.pages[0].segments[0].locator.provenance[1].charspan = [
+    4, 10,
+  ];
+  await rejected(overlapping);
+});
+
 test("uses raw-resolved table references and exact cell hashes, never page-local table ordinal", async () => {
   const input = fixture([
     [item("First page", 1, 0)],
