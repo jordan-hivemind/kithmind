@@ -42,10 +42,10 @@ records where adopted rather than re-extracting the same documents.
 
 | Question                 | Decision                                                                                                                                                                                                                                                                    |
 | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Storage engine           | Neon Postgres. `NUMERIC` is an exact arbitrary-precision decimal, so money is exact by type rather than by convention. Roles and `GRANT` give a real read-only surface. Hosted, so an always-on machine and a laptop share one archive. Postgres is also the safest long bet for something meant to outlive its tooling.                                                                                                                                  |
+| Storage engine           | Postgres, initially hosted on Neon. `NUMERIC` gives exact decimal arithmetic and exact aggregation, which is not the same as making money exact end to end: precision lost before insertion is stored faithfully, so validated input and tested serialization remain the guarantee. Roles and `GRANT` allow a genuinely separated reader, once designed rather than assumed. Hosted, so an always-on machine and a laptop share one archive.                                                                                                                                  |
 | Existing ledger software | Not adopted. Beancount, hledger, GnuCash and similar are double-entry spending ledgers. They have no first-class model for lot-level cost basis, per-field provenance, or reconciliation status as a gate. Reuse of their importers is not worth adopting their data model. |
 | Scope                    | Holdings as well as transactions. Positions, balances and liabilities are v1, not v2. Half the value of the archive is what is owned and what is owed.                                                                                                                      |
-| Access surface for v1    | A read-only MCP server over the archive, authenticated, connecting as a Postgres role with `SELECT` only. Not a five-operation typed contract, and not the Kith Mind adapter.                                                                                                                                                          |
+| Access surface for v1    | An authenticated read-only MCP server for the owner's own use, connecting as a non-owner reader role whose privileges are designed and tested rather than assumed from a table grant. The Kith Mind boundary is separate and typed, and is not this surface.                                                                                                                                                          |
 | Query shape              | Read-only SQL plus a documented schema, exposed through the local server. Frequently used shapes are promoted into typed operations later, once real questions have shown which ones matter.                                                                                |
 | Where the code lives     | This repository, MIT, with synthetic fixtures.                                                                                                                                                                                                                              |
 | Where the data lives     | The archive database in Neon. The raw document tree on the always-on machine's filesystem, replicated off it. Never in git, and no connection string, credential or real path in this repository.                                                                                                                                                |
@@ -213,9 +213,13 @@ section wrongly said it did.** The SQLite `CHECK (typeof(...))` constraints
 caught a value that had *already become* a float before it reached the
 database. Postgres will accept that same value into `NUMERIC` and store it
 exactly, damage included: a JavaScript `0.1 + 0.2` arrives as
-`0.30000000000000004` and is faithfully preserved. Postgres is strictly weaker
-at catching this than SQLite was, because a storage class is observable and a
-lost digit is not.
+`0.30000000000000004` and is faithfully preserved.
+
+Nor was SQLite a reliable backstop, and an earlier correction of mine overstated
+in the other direction. Column affinity can coerce a value before `typeof` ever
+observes it, so the storage-class check caught some already-float inputs and not
+others. Neither engine is the guarantee. The guarantee is validated input and
+tested serialization, and it has to be built either way.
 
 So the check moves rather than disappears. Decimal input is validated as text
 before it is ever converted, non-finite values (`NaN`, `Infinity`, and
@@ -333,7 +337,7 @@ positions table and its activity table, so each new document reconciles itself.
 
 ## Access for assistants
 
-v1 exposes a local read-only MCP server over the archive file:
+v1 exposes a read-only MCP server over the hosted archive, authenticated, connecting as a reader role:
 
 | Tool              | Behavior                                                                                                                              |
 | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
@@ -521,11 +525,14 @@ dataset revision. A second writer is excluded by the database rather than by
 everyone remembering, and retries stay idempotent. Hosting the ledger does not
 by itself coordinate anything.
 
-Neon's free tier is sized for this: 0.5 GB of storage per project against an
-archive that is tens of thousands of numeric rows, and 100 compute-hours a
-month against a database queried occasionally and idle otherwise. Scale-to-zero
-means a cold query pays a cold start, which is nothing for an archive. If it
-outgrows that, it outgrows it into a usage-based tier rather than a redesign.
+A free tier looked adequate against the published plans on 2026-09-08: storage
+in the hundreds of megabytes and compute-hours in the low hundreds per month,
+against an archive of tens of thousands of numeric rows queried occasionally
+and idle otherwise. That is a dated observation, not a commitment, and it sizes
+transaction rows only. Indexes, provenance, retained text references and
+correction history are additional and have not been measured. Verify current
+limits, restore-history depth and region before committing, and re-verify rather
+than trusting this paragraph.
 
 Nothing here bets on the vendor. The schema is ordinary Postgres, the money
 policy is `NUMERIC`, and the raw tree is files on a disk. Moving to another
