@@ -219,11 +219,23 @@ test("runner filesystem results project to strict catalog records", async () => 
           row.fingerprints.extractionConfigurationFingerprint,
         extractionFingerprint: hash("a"),
         modelManifestSha256: hash("b"),
-        pageCount: 1,
+        pageCount: 64,
       }),
     });
     assert.equal("path" in row.parserOutput.rawArtifact, false);
     assert.equal("path" in row.parserOutput.normalizedBundle, false);
+    assert.equal(row.parserOutput.pageCount, 64);
+    await assert.rejects(
+      () =>
+        f.catalog.recordParserOutput({
+          catalogId: row.processingCatalogId,
+          expectedRevision: row.rowRevision,
+          output: { ...row.parserOutput, pageCount: 65 },
+        }),
+      (error) =>
+        error instanceof ArchiveCatalogError &&
+        error.code === "catalog_invalid",
+    );
 
     const primary = row.copies.primary;
     row = await f.catalog.recordArchivePreparationIntent({

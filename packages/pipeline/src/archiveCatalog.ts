@@ -745,7 +745,7 @@ function durableParserOutput(value: unknown): DurableParserOutput {
     ),
     extractionFingerprint: sha(row.extractionFingerprint),
     modelManifestSha256: sha(row.modelManifestSha256),
-    pageCount: integer(row.pageCount, 1, 32),
+    pageCount: integer(row.pageCount, 1, 64),
   };
 }
 
