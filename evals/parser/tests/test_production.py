@@ -142,7 +142,7 @@ class ProductionParserTest(unittest.TestCase):
         result, converter = self.call()
         self.assertEqual(result["state"], "complete")
         converter.assert_called_once_with(
-            self.data, f"pdf-{self.digest}.pdf", Path("artifacts"), 480.0
+            self.data, f"pdf-{self.digest}.pdf", Path("artifacts"), 480.0, True
         )
         bundle = result["normalizedBundle"]
         segment = bundle["pages"][0]["segments"][0]
@@ -161,6 +161,30 @@ class ProductionParserTest(unittest.TestCase):
                     separators=(",", ":"),
                 ).encode()
             ).hexdigest(),
+        )
+
+    def test_table_structure_mode_changes_identity_and_converter_option(self):
+        table_on, _ = self.call(table_structure="on")
+        table_off, converter = self.call(table_structure="off")
+        self.assertEqual(table_on["state"], "complete")
+        self.assertEqual(table_off["state"], "complete")
+        self.assertNotEqual(
+            table_on["rawArtifact"]["parserFingerprint"]["fingerprint"],
+            table_off["rawArtifact"]["parserFingerprint"]["fingerprint"],
+        )
+        self.assertEqual(
+            table_off["rawArtifact"]["parserFingerprint"]["schemaVersion"], 2
+        )
+        self.assertEqual(
+            table_off["rawArtifact"]["parserFingerprint"]["configuration"]["tableStructure"],
+            "off",
+        )
+        converter.assert_called_once_with(
+            self.data, f"pdf-{self.digest}.pdf", Path("artifacts"), 480.0, False
+        )
+        self.assertEqual(
+            convert_captured_pdf(**self.arguments(table_structure="automatic")),
+            {"state": "failed", "code": "invalid_input"},
         )
 
     def test_retains_same_page_multi_span_items_and_ignores_empty_items(self):
@@ -566,6 +590,8 @@ class ProductionParserTest(unittest.TestCase):
                 artifacts=Path("artifacts"), model_lock=Path("lock")
             )
         self.assertEqual(profile["state"], "ready")
+        self.assertEqual(profile["parserFingerprint"]["schemaVersion"], 2)
+        self.assertEqual(profile["parserFingerprint"]["configuration"]["tableStructure"], "on")
         self.assertEqual(profile["parserFingerprint"]["configuration"]["timeoutSeconds"], 480.0)
         with patch(
             "parser_eval.production._verify_runtime_and_artifacts",

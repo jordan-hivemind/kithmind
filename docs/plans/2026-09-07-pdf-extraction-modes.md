@@ -1,6 +1,6 @@
 # Explicit PDF extraction modes
 
-Status: implementation in progress, tracked as P2-20.
+Status: implemented and independently reviewed, tracked as P2-20.
 
 The P2-19 pilot exposed visible worksheet fields missing from Docling's raw
 output. A private single-page comparison recovered all three labeled fields and
@@ -15,6 +15,8 @@ Add an optional `pdfDocQa.parser.tableStructure` setting with exactly `on` or
 `off`; omission selects `on`. Apply it to the whole document through Docling's
 `do_table_structure` option. Keep OCR and the existing sandbox/resource budgets.
 Do not automatically merge outputs or select a mode using a one-cell heuristic.
+Preserve an omitted setting in normalized configuration so existing journal
+configuration bindings do not change solely because a default was added.
 
 A new parser fingerprint descriptor version records the selected mode. Preserve
 strict validation and inspection of the existing descriptor version, whose
@@ -51,3 +53,23 @@ omissions, keep that document in review and evaluate another explicit strategy.
 
 Owner publication still depends on independent backup and recoverable keys.
 The independent financial archive and its plans remain outside this change.
+
+## Measured outcome
+
+Both modes passed local conversion and exact provenance checks for all nine pilot
+PDFs, totaling 155 pages. Source files were unchanged. Disabling table recognition
+recovered six selected worksheet label/value fields across two pages and retained
+thirteen selected invoice values. It also removed structured table cells and made
+some invoice summaries and multi-column tables ambiguous. Token retention alone
+therefore does not justify choosing this mode.
+
+Keep table recognition enabled by default. The alternative is available for
+explicit, measured use; it is not adopted for the complete pilot collection.
+Recovering worksheet omissions while preserving other tables in the same document
+requires a narrower strategy. The affected documents remain under quality review.
+
+Synthetic actual-model checks passed for Unicode text, scanned text, table
+label/value associations, both modes, and raw-to-normalized provenance. Legacy
+profile recovery and mismatched-mode rejection passed. Repository lint, types,
+tests and build passed. These results establish the mode contract and observed
+tradeoff, not automatic extraction completeness.

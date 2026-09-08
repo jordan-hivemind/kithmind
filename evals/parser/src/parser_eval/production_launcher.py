@@ -196,6 +196,7 @@ def _profile(args: argparse.Namespace) -> int:
         artifacts=artifacts,
         model_lock=model_lock,
         timeout_seconds=float(args.conversion_timeout_seconds),
+        table_structure=args.table_structure,
     )
     if result.get("state") != "ready":
         code = result.get("code")
@@ -258,6 +259,7 @@ def _convert(args: argparse.Namespace) -> int:
             network_denied=True, resource_bounded=True
         ),
         timeout_seconds=float(args.conversion_timeout_seconds),
+        table_structure=args.table_structure,
     )
     data = b""
     if result.get("state") != "complete":
@@ -353,6 +355,7 @@ def main(argv: list[str] | None = None) -> int:
         "--conversion-timeout-seconds",
         type=lambda value: _positive_integer(value, 480),
     )
+    parser.add_argument("--table-structure", choices=("on", "off"), default="on")
     try:
         _configure_machine_stdio()
         args = parser.parse_args(argv)

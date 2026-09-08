@@ -133,8 +133,11 @@ export type RunCapturedPdfParserInput = {
   modelAssetsPath: string;
   modelLockPath: string;
   expectedModelLockSha256: string;
+  tableStructure?: ParserTableStructure;
   limits?: ParserProcessLimits;
 };
+
+export type ParserTableStructure = "on" | "off";
 
 export type PreparePdfDocQaProfileInput = {
   pythonExecutable: string;
@@ -145,6 +148,7 @@ export type PreparePdfDocQaProfileInput = {
   modelAssetsPath: string;
   modelLockPath: string;
   expectedModelLockSha256: string;
+  tableStructure?: ParserTableStructure;
   workRoot: string;
   work: ParserProfileWorkIntent;
   limits?: ParserProcessLimits;
@@ -887,7 +891,10 @@ async function runSandboxed(
   };
 }
 
-export function parseBoundedParserJson(bytes: Buffer, maximum: number): unknown {
+export function parseBoundedParserJson(
+  bytes: Buffer,
+  maximum: number,
+): unknown {
   if (bytes.length < 1 || bytes.length > maximum)
     fail("output_invalid", "parser JSON is outside its bound");
   let value: unknown;
@@ -1270,10 +1277,21 @@ function validateTableCell(value: unknown): void {
   }
 }
 
+type ValidatedParserFingerprint = {
+  fingerprint: string;
+  tableStructure: ParserTableStructure;
+};
+
+function requestedTableStructure(value: unknown): ParserTableStructure {
+  if (value === undefined || value === "on") return "on";
+  if (value === "off") return "off";
+  fail("invalid_input", "parser table structure mode is invalid");
+}
+
 function validateParserFingerprint(
   value: unknown,
   modelManifestSha256: string,
-): string {
+): ValidatedParserFingerprint {
   if (
     !value ||
     typeof value !== "object" ||
@@ -1293,7 +1311,7 @@ function validateParserFingerprint(
   const runtime = parser.runtime;
   const configuration = parser.configuration;
   if (
-    parser.schemaVersion !== 1 ||
+    (parser.schemaVersion !== 1 && parser.schemaVersion !== 2) ||
     parser.modelManifestSha256 !== modelManifestSha256 ||
     !SHA256.test(String(parser.implementationSha256 ?? "")) ||
     !runtime ||
@@ -1320,30 +1338,47 @@ function validateParserFingerprint(
     !configuration ||
     typeof configuration !== "object" ||
     Array.isArray(configuration) ||
-    !exactKeys(configuration, [
-      "maxInputBytes",
-      "maxConversionPages",
-      "outputFormat",
-      "timeoutSeconds",
-    ])
+    !exactKeys(
+      configuration,
+      parser.schemaVersion === 1
+        ? [
+            "maxInputBytes",
+            "maxConversionPages",
+            "outputFormat",
+            "timeoutSeconds",
+          ]
+        : [
+            "maxInputBytes",
+            "maxConversionPages",
+            "outputFormat",
+            "timeoutSeconds",
+            "tableStructure",
+          ],
+    )
   ) {
     fail("output_invalid", "parser fingerprint fields are invalid");
   }
   const config = configuration as Record<string, unknown>;
+  const tableStructure: ParserTableStructure =
+    parser.schemaVersion === 1
+      ? "on"
+      : (config.tableStructure as ParserTableStructure);
   if (
     config.maxInputBytes !== 16 * 1024 * 1024 ||
     config.maxConversionPages !== 64 ||
     config.outputFormat !== "docling_lossless_canonical_json_v1" ||
-    !integer(config.timeoutSeconds, 1, 480)
+    !integer(config.timeoutSeconds, 1, 480) ||
+    (parser.schemaVersion === 2 &&
+      tableStructure !== "on" &&
+      tableStructure !== "off")
   ) {
     fail("output_invalid", "parser fingerprint configuration is invalid");
   }
-  return fingerprint(parser, true);
+  return { fingerprint: fingerprint(parser, true), tableStructure };
 }
 
 type ExtractionMappingFormat =
-  | "docling_utf16_pages_v1"
-  | "docling_utf16_pages_v2";
+  "docling_utf16_pages_v1" | "docling_utf16_pages_v2";
 
 type ExtractionConfiguration = {
   fingerprint: string;
@@ -1416,6 +1451,7 @@ function validateBundle(
   rawSha256: string,
 ): {
   parserFingerprint: string;
+  tableStructure: ParserTableStructure;
   extractionConfigurationFingerprint: string;
   extractionMappingFormat: ExtractionMappingFormat;
   extractionFingerprint: string;
@@ -1445,11 +1481,11 @@ function validateBundle(
   ) {
     fail("output_invalid", "normalized bundle identity is invalid");
   }
-  const parser = bundle.parserFingerprint;
-  const parserFingerprint = validateParserFingerprint(
-    parser,
+  const parserDescriptor = validateParserFingerprint(
+    bundle.parserFingerprint,
     modelManifestSha256,
   );
+  const parserFingerprint = parserDescriptor.fingerprint;
   const extraction = bundle.extractionFingerprint;
   if (
     !extraction ||
@@ -1481,18 +1517,18 @@ function validateBundle(
       "extraction fingerprint is not bound to the raw artifact",
     );
   }
-  const extractionConfiguration =
-    validateExtractionConfigurationFingerprint(
-      {
-        schemaVersion: 1,
-        parserFingerprint,
-        implementationSha256: extractionRecord.implementationSha256,
-        configuration: extractionRecord.configuration,
-        fingerprint: extractionRecord.extractionConfigurationFingerprint,
-      },
+  const extractionConfiguration = validateExtractionConfigurationFingerprint(
+    {
+      schemaVersion: 1,
       parserFingerprint,
-    );
-  const extractionConfigurationFingerprint = extractionConfiguration.fingerprint;
+      implementationSha256: extractionRecord.implementationSha256,
+      configuration: extractionRecord.configuration,
+      fingerprint: extractionRecord.extractionConfigurationFingerprint,
+    },
+    parserFingerprint,
+  );
+  const extractionConfigurationFingerprint =
+    extractionConfiguration.fingerprint;
   const expectedExtraction = createHash("sha256")
     .update(Buffer.from("kith-parsed-extraction:v1\0", "utf8"))
     .update(
@@ -1642,6 +1678,7 @@ function validateBundle(
   }
   return {
     parserFingerprint,
+    tableStructure: parserDescriptor.tableStructure,
     extractionConfigurationFingerprint,
     extractionMappingFormat: extractionConfiguration.mappingFormat,
     extractionFingerprint,
@@ -1958,7 +1995,10 @@ export function resolveRawLocators(
   for (const item of raw.texts) {
     if (!item || typeof item !== "object" || Array.isArray(item)) continue;
     const record = item as Record<string, unknown>;
-    if (typeof record.self_ref !== "string" || !requiredRefs.has(record.self_ref))
+    if (
+      typeof record.self_ref !== "string" ||
+      !requiredRefs.has(record.self_ref)
+    )
       continue;
     const slices = rawCrossPageSlices(record, bundle.pages.length);
     if (!slices) continue;
@@ -2661,6 +2701,7 @@ export async function preparePdfDocQaProfile(
 ): Promise<PreparedPdfDocQaProfile> {
   requiredPlatform();
   const limits = validateLimits(input.limits);
+  const tableStructure = requestedTableStructure(input.tableStructure);
   const sandboxTool = await boundedFile(
     "/usr/bin/sandbox-exec",
     "macOS sandbox tool",
@@ -2746,7 +2787,10 @@ export async function preparePdfDocQaProfile(
       "model_lock_mismatch",
       "model lock identity does not match configuration",
     );
-  const modelLockValue = parseBoundedParserJson(modelLock.bytes, MAX_MODEL_LOCK_BYTES);
+  const modelLockValue = parseBoundedParserJson(
+    modelLock.bytes,
+    MAX_MODEL_LOCK_BYTES,
+  );
   if (
     !modelLockValue ||
     typeof modelLockValue !== "object" ||
@@ -2855,6 +2899,8 @@ export async function preparePdfDocQaProfile(
       modelLock.canonical,
       "--conversion-timeout-seconds",
       "480",
+      "--table-structure",
+      tableStructure,
     ],
     environment,
     limits,
@@ -2871,10 +2917,13 @@ export async function preparePdfDocQaProfile(
     result.state !== "ready"
   )
     fail("output_invalid", "parser profile result shape is invalid");
-  const parserFingerprint = validateParserFingerprint(
+  const parser = validateParserFingerprint(
     result.parserFingerprint,
     modelManifestSha256,
   );
+  if (parser.tableStructure !== tableStructure)
+    fail("output_invalid", "parser profile table structure mode is invalid");
+  const parserFingerprint = parser.fingerprint;
   const extractionConfigurationFingerprint =
     validateExtractionConfigurationFingerprint(
       result.extractionConfiguration,
@@ -2912,6 +2961,7 @@ export async function runCapturedPdfParser(
 ): Promise<CapturedPdfParserResult> {
   requiredPlatform();
   const limits = validateLimits(input.limits);
+  const tableStructure = requestedTableStructure(input.tableStructure);
   const sandboxTool = await boundedFile(
     "/usr/bin/sandbox-exec",
     "macOS sandbox tool",
@@ -2999,7 +3049,10 @@ export async function runCapturedPdfParser(
       "model_lock_mismatch",
       "model lock identity does not match configuration",
     );
-  const modelLockValue = parseBoundedParserJson(modelLock.bytes, MAX_MODEL_LOCK_BYTES);
+  const modelLockValue = parseBoundedParserJson(
+    modelLock.bytes,
+    MAX_MODEL_LOCK_BYTES,
+  );
   if (
     !modelLockValue ||
     typeof modelLockValue !== "object" ||
@@ -3169,6 +3222,8 @@ export async function runCapturedPdfParser(
         modelLock.canonical,
         "--conversion-timeout-seconds",
         "480",
+        "--table-structure",
+        tableStructure,
       ],
       environment,
       limits,
@@ -3223,6 +3278,11 @@ export async function runCapturedPdfParser(
       modelManifestSha256,
       rawSha256,
     );
+    if (validated.tableStructure !== tableStructure)
+      fail(
+        "output_invalid",
+        "parser conversion table structure mode is invalid",
+      );
     if (
       launcherResult.parserFingerprint !== validated.parserFingerprint ||
       launcherResult.extractionFingerprint !==

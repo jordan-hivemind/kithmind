@@ -114,6 +114,33 @@ test("PDF document-Q&A config is closed, bound, and keeps legacy bindings stable
     pdf.pdfDocQa.profile.chunkerFingerprint,
     PDF_DOCQA_CHUNKING_FINGERPRINT,
   );
+  assert.equal(pdf.pdfDocQa.parser.tableStructure, undefined);
+  const historicalPdf = structuredClone(pdf);
+  delete historicalPdf.pdfDocQa.parser.tableStructure;
+  const historicalPdfPreimage = JSON.stringify({
+    endpoint: historicalPdf.endpoint,
+    spaceId: historicalPdf.spaceId,
+    sourceAccountId: historicalPdf.sourceAccountId,
+    roots: historicalPdf.roots,
+    pdfDocQa: historicalPdf.pdfDocQa,
+  });
+  assert.equal(
+    journalBindingForConfig(pdf).configFingerprint,
+    createHash("sha256").update(historicalPdfPreimage).digest("hex"),
+  );
+  const tableOff = pdfDocQaConfig();
+  tableOff.parser.tableStructure = "off";
+  const explicitTableOff = parseConfig({ ...base, pdfDocQa: tableOff });
+  assert.equal(explicitTableOff.pdfDocQa.parser.tableStructure, "off");
+  assert.notEqual(
+    journalBindingForConfig(explicitTableOff).configFingerprint,
+    journalBindingForConfig(pdf).configFingerprint,
+  );
+  const invalidTableStructure = pdfDocQaConfig();
+  invalidTableStructure.parser.tableStructure = "automatic";
+  assert.throws(() =>
+    parseConfig({ ...base, pdfDocQa: invalidTableStructure }),
+  );
   const archivedProfile = pdfDocQaConfig();
   archivedProfile.profile.chunkerFingerprint =
     PDF_DOCQA_LEGACY_CHUNKING_FINGERPRINT;

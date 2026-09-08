@@ -294,7 +294,11 @@ def _docling_normalized(
 
 
 def _convert_docling(
-    data: bytes, name: str, artifacts: Path, timeout: float
+    data: bytes,
+    name: str,
+    artifacts: Path,
+    timeout: float,
+    table_structure: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     from docling.datamodel.accelerator_options import (
         AcceleratorDevice,
@@ -315,7 +319,7 @@ def _convert_docling(
         allow_external_plugins=False,
         do_ocr=True,
         ocr_options=RapidOcrOptions(lang=["english"], backend="onnxruntime"),
-        do_table_structure=True,
+        do_table_structure=table_structure,
         do_picture_classification=False,
         do_picture_description=False,
         do_chart_extraction=False,

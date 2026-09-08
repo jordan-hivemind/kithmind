@@ -7,7 +7,7 @@ import {
   PDF_DOCQA_CHUNKING_FINGERPRINT,
   PDF_DOCQA_LEGACY_CHUNKING_FINGERPRINT,
 } from "./parsedBundleMapping.js";
-import type { PipelineConfig, RootConfig } from "./types.js";
+import type { PdfDocQaConfig, PipelineConfig, RootConfig } from "./types.js";
 import type { JournalBinding } from "./journalTypes.js";
 
 const ROOT_ALIAS = /^[a-z0-9][a-z0-9._-]{0,63}$/;
@@ -198,16 +198,27 @@ function pdfDocQa(value: unknown, roots: RootConfig[], journalDir: string) {
     "pdfDocQa.spoolDirectory",
   );
   const parserInput = object(input.parser, "pdfDocQa.parser");
-  exact(parserInput, [
-    "pythonExecutable",
-    "expectedPythonSha256",
-    "launcherPath",
-    "expectedLauncherSha256",
-    "packageRoot",
-    "modelAssetsPath",
-    "modelLockPath",
-    "expectedModelLockSha256",
-  ]);
+  exact(
+    parserInput,
+    [
+      "pythonExecutable",
+      "expectedPythonSha256",
+      "launcherPath",
+      "expectedLauncherSha256",
+      "packageRoot",
+      "modelAssetsPath",
+      "modelLockPath",
+      "expectedModelLockSha256",
+    ],
+    ["tableStructure"],
+  );
+  const tableStructure: PdfDocQaConfig["parser"]["tableStructure"] =
+    parserInput.tableStructure === undefined
+      ? undefined
+      : parserInput.tableStructure === "on" ||
+          parserInput.tableStructure === "off"
+        ? parserInput.tableStructure
+        : fail("pdfDocQa.parser.tableStructure is invalid");
   const parser = {
     pythonExecutable: absolutePath(
       parserInput.pythonExecutable,
@@ -241,6 +252,7 @@ function pdfDocQa(value: unknown, roots: RootConfig[], journalDir: string) {
       parserInput.expectedModelLockSha256,
       "pdfDocQa.parser.expectedModelLockSha256",
     ),
+    ...(tableStructure === undefined ? {} : { tableStructure }),
   };
   const profileInput = object(input.profile, "pdfDocQa.profile");
   exact(profileInput, [
