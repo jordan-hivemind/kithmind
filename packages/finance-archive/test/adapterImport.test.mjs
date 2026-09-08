@@ -76,7 +76,7 @@ async function acquireAndParseActivity(session) {
     periodStart: "2025-01-01",
     periodEnd: "2025-04-01",
   });
-  const rows = await syntheticAdapter.parse({ kind: "structured_api", bytes: acquired.bytes });
+  const { activity: rows } = await syntheticAdapter.parse({ kind: "structured_api", bytes: acquired.bytes });
   return { acquired, rows };
 }
 
@@ -298,7 +298,10 @@ test("the deliberately garbled PDF statement amount lands in the review queue ca
     session,
     externalId: statement.externalId,
   });
-  const rows = await syntheticAdapter.parse({ kind: "pdf_statement", bytes: acquired.bytes });
+  const { activity: rows, holdings } = await syntheticAdapter.parse({
+    kind: "pdf_statement",
+    bytes: acquired.bytes,
+  });
   const ambiguous = rows.filter((row) => row.amount === null);
   assert.equal(ambiguous.length, 1);
 
@@ -307,18 +310,21 @@ test("the deliberately garbled PDF statement amount lands in the review queue ca
     accountId: ACCOUNT.id,
     acquired,
     rows,
+    holdings,
     docType: "pdf_statement",
     docDate: statement.periodEnd,
     persisted: persist(t, db, acquired, "pdf_statement"),
   });
   assert.equal(importDocuments.length, 1);
 
+  const holdingsRowCount =
+    holdings.positions.length + holdings.balances.length + holdings.liabilities.length;
   const summary = importBatch(
     db,
     { source: INSTITUTION.slug, documents: importDocuments },
     new Date("2025-03-01"),
   );
-  assert.equal(summary.rowsInserted, rows.length);
+  assert.equal(summary.rowsInserted, rows.length + holdingsRowCount);
 
   const review = db
     .prepare("SELECT kind, reason, status FROM review_items WHERE kind = 'ambiguous_amount'")
@@ -333,10 +339,82 @@ test("the deliberately garbled PDF statement amount lands in the review queue ca
   assert.equal(flaggedTransaction.amount, null);
   assert.equal(flaggedTransaction.status, "review");
 
-  // The statement's buy, sell and dividend rows reference FKE and SGH; both
-  // resolve to one instrument row each, reused rather than duplicated.
+  // The statement's buy, sell and dividend rows reference FKE and SGH; the
+  // positions table adds a private fund (no symbol at all) and a EUR share
+  // class, so four distinct instruments in total, none duplicated.
   const instrumentCount = db.prepare("SELECT COUNT(*) AS n FROM instruments").get().n;
-  assert.equal(instrumentCount, 2);
+  assert.equal(instrumentCount, 4);
+
+  assert.equal(
+    db.prepare("SELECT COUNT(*) AS n FROM positions").get().n,
+    holdings.positions.length,
+  );
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM balances").get().n, holdings.balances.length);
+  assert.equal(
+    db.prepare("SELECT COUNT(*) AS n FROM liabilities").get().n,
+    holdings.liabilities.length,
+  );
+
+  // Every imported holdings row carries its source document and locator
+  // (ground rule 2), exactly as transactions do.
+  const positionProvenance = db
+    .prepare("SELECT source_document_id, source_locator FROM positions")
+    .all();
+  for (const row of positionProvenance) {
+    assert.ok(row.source_document_id, "every position carries its source document");
+    assert.ok(row.source_locator, "every position carries its locator");
+  }
+  const balanceProvenance = db.prepare("SELECT source_document_id, source_locator FROM balances").get();
+  assert.ok(balanceProvenance.source_document_id);
+  assert.ok(balanceProvenance.source_locator);
+  const liabilityProvenance = db
+    .prepare("SELECT source_document_id, source_locator FROM liabilities")
+    .get();
+  assert.ok(liabilityProvenance.source_document_id);
+  assert.ok(liabilityProvenance.source_locator);
+
+  // A total-assets query can separate marked positions from those carried
+  // at cost (acceptance criterion 3): mixing the two silently would be the
+  // exact confidently-wrong answer the archive exists to prevent.
+  const marked = db
+    .prepare("SELECT COALESCE(SUM(market_value), 0) AS total FROM positions WHERE valuation_basis = 'market_price' AND currency = 'USD'")
+    .get();
+  const atCost = db
+    .prepare("SELECT COALESCE(SUM(market_value), 0) AS total FROM positions WHERE valuation_basis = 'cost' AND currency = 'USD'")
+    .get();
+  assert.ok(marked.total > 0);
+  assert.ok(atCost.total > 0);
+  assert.notEqual(marked.total, atCost.total);
+
+  // The garbled market value opened its own review item too, distinct from
+  // the activity-row one asserted above.
+  const positionReview = db
+    .prepare("SELECT kind, status FROM review_items WHERE kind = 'ambiguous_market_value'")
+    .all();
+  assert.equal(positionReview.length, 1);
+  assert.equal(positionReview[0].status, "open");
+
+  // Multi-currency holdings round-trip: a EUR position's own currency is
+  // preserved, not folded into the USD positions above.
+  const eurPositions = db.prepare("SELECT COUNT(*) AS n FROM positions WHERE currency = 'EUR'").get();
+  assert.ok(eurPositions.n > 0);
+
+  // Re-importing the identical document does not duplicate holdings rows.
+  const secondSummary = importBatch(
+    db,
+    { source: INSTITUTION.slug, documents: importDocuments },
+    new Date("2025-03-01"),
+  );
+  assert.equal(secondSummary.rowsInserted, 0);
+  assert.equal(
+    db.prepare("SELECT COUNT(*) AS n FROM positions").get().n,
+    holdings.positions.length,
+  );
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM balances").get().n, holdings.balances.length);
+  assert.equal(
+    db.prepare("SELECT COUNT(*) AS n FROM liabilities").get().n,
+    holdings.liabilities.length,
+  );
 });
 
 test("resolveInstrumentId: a real identifier is preferred, and two different instruments sharing a symbol never merge on cusip or isin", (t) => {

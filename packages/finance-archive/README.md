@@ -131,12 +131,35 @@ provider claimed for the pull when it claims one, and any gaps the pull
 could not close. Writing those bytes to the raw tree is the importer's job,
 not the adapter's; the raw tree stays immutable either way.
 
-`parse` returns `ParsedRow[]`: quantity, price and amount are canonical
-decimal text or `null`, never a `number`, and an amount that could not be
-read is `null` with a required `amountNote` rather than a guess. Every row
-carries a `locators` map keyed by field name, so a row and, where it matters,
-one ambiguous field on that row can each be traced back to a page, line or
-API row in the source.
+`parse` returns a `ParsedPull`: `{ activity, holdings }`. `activity` is
+`ParsedRow[]` as before: quantity, price and amount are canonical decimal
+text or `null`, never a `number`, and an amount that could not be read is
+`null` with a required `amountNote` rather than a guess. Every row carries a
+`locators` map keyed by field name, so a row and, where it matters, one
+ambiguous field on that row can each be traced back to a page, line or API
+row in the source.
+
+`holdings` is `{ positions, balances, liabilities }`: what a statement's
+positions table and summary section state, alongside its activity table, from
+the one parse of that document's bytes. An adapter with only activity (a
+structured API, a tabular export, a single trade confirmation) declines
+honestly with `EMPTY_HOLDINGS` rather than inventing a positions table it does
+not have. Every holdings row carries its own `sourceDocument`, the same field
+`ParsedRow` uses, so a holding lands on the right `ImportDocument` even when a
+pull's activity is paginated and its holdings are not (the normal case: a
+statement's positions table is never itself paginated).
+
+`ParsedPosition.marketValue` follows the same ground-rule-5 pattern as
+`ParsedRow.amount`: decimal text or `null` with a required
+`marketValueNote`. `costBasis` and `unrealized` are secondary and optional,
+plain decimal text or `null`. `valuationBasis` is one of `market_price`,
+`last_round`, `cost` or `reported_nav`, or `null` when the source does not
+say; `valuationNote` is always required text, explaining the basis when one
+is known and explaining why it is unknown when it is not. A `null`
+`valuationBasis` is never silent: the importer opens a
+`weak_instrument_match`-style review item (`ambiguous_valuation_basis`) for
+it, because the plan is explicit that a total-assets query with no valuation
+basis silently mixes marked securities with positions carried at cost.
 
 `capabilities` declares which of the four sources
 (`structured_api`, `tabular_export`, `pdf_statement`, `trade_confirmation`)
@@ -147,9 +170,12 @@ incomplete one.
 `src/adapters/syntheticTrust/` is the reference implementation: a wholly
 invented institution ("Thistlebrook Trust") implementing all four sources
 against fixtures generated in `fixtures.ts`, including a paginated activity
-feed with a deliberate page-boundary overlap and one deliberately
-unparseable statement amount. `test/syntheticAdapter.test.mjs` is what a new
-adapter's own suite should look like.
+feed with a deliberate page-boundary overlap, one deliberately unparseable
+statement amount, and a positions table on its PDF statement with a
+market-marked position, a cost-basis-only illiquid holding, a deliberately
+unparseable market value, and a EUR-denominated position alongside the USD
+ones. `test/syntheticAdapter.test.mjs` is what a new adapter's own suite
+should look like.
 ## Importer
 
 `importBatch(db, batch, now?)` turns normalized rows into `documents`,
@@ -190,6 +216,37 @@ for the field in question) and flags it.
 
 This importer always writes `reconciliations_passed` and `reconciliations_failed`
 as 0; the reconciliation gate is a separate step run after import (see below).
+
+### Holdings (positions, balances, liabilities)
+
+`ImportDocument.positions`, `.balances` and `.liabilities` get the same
+provenance and review-queue treatment as `.rows`, with one difference:
+`positions`, `balances` and `liabilities` have no per-row dedupe key of their
+own (no `providerTxnId`, no `row_hash`), so they dedupe at the whole-document
+level instead, the same immutable-raw-file check that already skips a
+byte-identical document's transactions (`documents.sha256`, checked before
+any row is inserted). Re-importing the same document is a no-op for holdings
+exactly as it is for transactions.
+
+Only `as_of` unparseable to ISO blocks a holdings row from being inserted at
+all, the same reasoning as `process_date`: the column is `NOT NULL` with no
+other spelling to store. Every other malformed or missing field -- quantity,
+price, cost basis, unrealized, cash, a liability's rate -- stores `NULL` and
+opens a `review_items` row instead of guessing. `positions.market_value`,
+`balances.total_value` and `liabilities.balance` follow the transaction
+`amount`/`amountNote` pattern: a value that fails `toMinorUnits`, or a value
+the adapter never had, opens `ambiguous_market_value` /
+`ambiguous_total_value` / `ambiguous_liability_balance`. A `valuation_basis`
+outside the four known values, or left `null`, opens
+`ambiguous_valuation_basis` rather than being written silently -- this is the
+plan's own warning made concrete: an unlabeled position in a total-assets
+query is indistinguishable from a labeled one until it is too late.
+
+`positions.account_id` and `balances.account_id` are `NOT NULL` in the
+schema; a document that carries a position or balance with no `accountId`
+fails the whole batch loudly rather than writing an orphaned row.
+`liabilities.account_id` may be `null` (an institution-level liability not
+tied to one account).
 
 ## Reconciliation gate
 
@@ -377,6 +434,16 @@ acquired, not something to revise later. `readRawDocumentManifest` reads one
 back; `test/rawTree.test.mjs` has a test that persists documents, discards
 the database entirely, and confirms every document is still identifiable
 from the raw tree alone.
+`ParsedPull.holdings` is mapped the same way, through the same
+`resolveInstrumentId` -- there is no second instrument-resolution mechanism
+for holdings, `ParsedPosition.instrument` resolves exactly like
+`ParsedRow.instrument` does. Each `ParsedPosition`/`ParsedBalance`/
+`ParsedLiability` carries its own `sourceDocument`, grouped into
+`ImportDocument`s the same way activity rows are, so a holding lands on the
+right document even when a pull's activity is paginated and its holdings are
+not (the normal case). Ground rule 7's provider-total check stays scoped to
+activity rows; `reportedRowCount` is a transaction-row count and holdings
+have no analogous provider total to reconcile against.
 
 ## Schema and migrations
 

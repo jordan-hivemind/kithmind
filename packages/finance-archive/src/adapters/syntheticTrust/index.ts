@@ -8,6 +8,7 @@ import {
   canonicalizeDecimal,
 } from "../../decimal.js";
 import {
+  EMPTY_HOLDINGS,
   exhaustiveListing,
   incompleteListing,
   sha256Hex,
@@ -19,7 +20,11 @@ import {
   type InstitutionAdapter,
   type InstitutionCapabilities,
   type ParsedAmount,
+  type ParsedBalance,
   type ParsedInstrument,
+  type ParsedLiability,
+  type ParsedPosition,
+  type ParsedPull,
   type ParsedRow,
   type RawFile,
 } from "../../adapter.js";
@@ -27,6 +32,7 @@ import {
   buildTabularExportCsv,
   DOCUMENTS,
   generateActivityRows,
+  HOLDINGS_INSTRUMENTS,
   INSTITUTION_NAME,
   INSTITUTION_SLUG,
   INSTRUMENTS,
@@ -66,6 +72,69 @@ function instrumentBySymbol(symbol: string): ParsedInstrument {
       name: null,
     }
   );
+}
+
+/**
+ * A holdings-table instrument lookup: symbol first, then name, since the
+ * private-fund fixture has no symbol at all for `instrumentBySymbol`'s
+ * lookup to find. `symbol` and `name` are `"-"` sentinels, not null, because
+ * they come straight off a split pipe-delimited line (see `splitFields`).
+ */
+function instrumentForHolding(
+  symbol: string,
+  name: string,
+): ParsedInstrument | null {
+  if (symbol === "-" && name === "-") return null;
+  const bySymbol =
+    symbol === "-"
+      ? undefined
+      : HOLDINGS_INSTRUMENTS.find((instrument) => instrument.symbol === symbol);
+  if (bySymbol) return bySymbol;
+  const byName =
+    name === "-"
+      ? undefined
+      : HOLDINGS_INSTRUMENTS.find((instrument) => instrument.name === name);
+  if (byName) return byName;
+  return {
+    symbol: symbol === "-" ? null : symbol,
+    cusip: null,
+    isin: null,
+    name: name === "-" ? null : name,
+  };
+}
+
+type Tuple12 = [
+  string, string, string, string, string, string,
+  string, string, string, string, string, string,
+];
+type Tuple8 = [string, string, string, string, string, string, string, string];
+type Tuple7 = [string, string, string, string, string, string, string];
+
+/** Splits a "POSITION|..." holdings line into its 12 fields, or throws. */
+function splitPositionFields(line: string): Tuple12 {
+  const fields = line.split("|");
+  if (fields.length !== 12) {
+    throw new Error(`expected 12 fields, got ${fields.length}: ${JSON.stringify(line)}`);
+  }
+  return fields as Tuple12;
+}
+
+/** Splits a "LIABILITY|..." holdings line into its 8 fields, or throws. */
+function splitLiabilityFields(line: string): Tuple8 {
+  const fields = line.split("|");
+  if (fields.length !== 8) {
+    throw new Error(`expected 8 fields, got ${fields.length}: ${JSON.stringify(line)}`);
+  }
+  return fields as Tuple8;
+}
+
+/** Splits a "BALANCE|..." holdings line into its 7 fields, or throws. */
+function splitBalanceFields(line: string): Tuple7 {
+  const fields = line.split("|");
+  if (fields.length !== 7) {
+    throw new Error(`expected 7 fields, got ${fields.length}: ${JSON.stringify(line)}`);
+  }
+  return fields as Tuple7;
 }
 
 type ActivityLikeRow = {
@@ -423,25 +492,119 @@ function resolveAmount(text: string): ParsedAmount {
   }
 }
 
+/**
+ * A PDF statement's raw text carries both its activity table and, when it
+ * has one, a "HOLDINGS" section after it -- exactly the two tables one
+ * parse() of one document's bytes needs to return (see ParsedHoldings'
+ * comment on adapter.ts). A trade confirmation uses the same line format
+ * for its one activity row and never emits a "HOLDINGS" marker, so it comes
+ * through here too, honestly declining holdings by producing none rather
+ * than a separate code path.
+ */
 function parseStatementText(
   bytes: Uint8Array,
   kind: "pdf_statement" | "trade_confirmation",
-): readonly ParsedRow[] {
-  const rows: ParsedRow[] = [];
+): ParsedPull {
+  const activity: ParsedRow[] = [];
+  const positions: ParsedPosition[] = [];
+  const balances: ParsedBalance[] = [];
+  const liabilities: ParsedLiability[] = [];
   let page = 1;
   let index = 0;
+  let inHoldings = false;
+  let holdingsIndex = 0;
+
   for (const line of new TextDecoder().decode(bytes).split("\n")) {
     if (line.startsWith("#") || line.trim() === "") continue;
+    if (line === "HOLDINGS") {
+      inHoldings = true;
+      continue;
+    }
     const pageMatch = /^PAGE (\d+)$/.exec(line);
     if (pageMatch) {
       page = Number(pageMatch[1]);
       continue;
     }
+
+    if (inHoldings) {
+      const holdingLocator: FieldLocator = {
+        source: kind,
+        index: page,
+        field: `holdings line ${holdingsIndex}`,
+      };
+      holdingsIndex += 1;
+      if (line.startsWith("POSITION|")) {
+        const [
+          ,
+          asOf,
+          symbol,
+          name,
+          quantity,
+          price,
+          marketValueText,
+          costBasis,
+          unrealized,
+          currency,
+          valuationBasis,
+          valuationNote,
+        ] = splitPositionFields(line);
+        const parsedMarketValue = resolveAmount(marketValueText);
+        positions.push({
+          sourceDocument: kind,
+          asOf,
+          instrument: instrumentForHolding(symbol, name),
+          quantity: quantity === "-" ? null : quantity,
+          price: price === "-" ? null : price,
+          marketValue: parsedMarketValue.amount,
+          marketValueNote: parsedMarketValue.amountNote,
+          costBasis: costBasis === "-" ? null : costBasis,
+          unrealized: unrealized === "-" ? null : unrealized,
+          currency,
+          valuationBasis: valuationBasis as ParsedPosition["valuationBasis"],
+          valuationNote,
+          locators:
+            parsedMarketValue.amount === null
+              ? { row: holdingLocator, marketValue: holdingLocator }
+              : { row: holdingLocator },
+        });
+      } else if (line.startsWith("BALANCE|")) {
+        const [, asOf, totalValue, cash, currency, periodStartValue, periodEndValue] =
+          splitBalanceFields(line);
+        balances.push({
+          sourceDocument: kind,
+          asOf,
+          totalValue,
+          totalValueNote: null,
+          cash,
+          currency,
+          periodStartValue,
+          periodEndValue,
+          locators: { row: holdingLocator },
+        });
+      } else if (line.startsWith("LIABILITY|")) {
+        const [, liabilityKind, displayName, balance, currency, rate, asOf, collateralNote] =
+          splitLiabilityFields(line);
+        liabilities.push({
+          sourceDocument: kind,
+          kind: liabilityKind,
+          displayName,
+          balance,
+          balanceNote: null,
+          currency,
+          rate,
+          asOf,
+          collateralNote,
+          locators: { row: holdingLocator },
+        });
+      }
+      continue;
+    }
+
     const [date, activityType, description, symbol, quantity, price, amountText, currency] =
       splitEightFields(line, "|");
     const rowLocator: FieldLocator = { source: kind, index: page, field: `line ${index}` };
     const parsedAmount = resolveAmount(amountText);
-    rows.push({
+    activity.push({
       // One PDF/confirmation file is one document regardless of how many
       // printed pages it has; PAGE markers here are only a locator detail.
       sourceDocument: kind,
@@ -465,15 +628,15 @@ function parseStatementText(
     });
     index += 1;
   }
-  return rows;
+  return { activity, holdings: { positions, balances, liabilities } };
 }
 
-async function parse(rawFile: RawFile): Promise<readonly ParsedRow[]> {
+async function parse(rawFile: RawFile): Promise<ParsedPull> {
   switch (rawFile.kind) {
     case "structured_api":
-      return parseStructuredApi(rawFile.bytes);
+      return { activity: parseStructuredApi(rawFile.bytes), holdings: EMPTY_HOLDINGS };
     case "tabular_export":
-      return parseTabularExport(rawFile.bytes);
+      return { activity: parseTabularExport(rawFile.bytes), holdings: EMPTY_HOLDINGS };
     case "pdf_statement":
     case "trade_confirmation":
       return parseStatementText(rawFile.bytes, rawFile.kind);
@@ -497,6 +660,7 @@ function capabilities(): InstitutionCapabilities {
       "Structured activity API pages overlap by one row at each page boundary; dedupe by row hash, not by page arithmetic.",
       "Tabular export carries no provider row id and states no total row count.",
       "PDF statement text occasionally has an unparseable amount; such rows must enter review rather than being guessed.",
+      "Only the PDF statement carries a positions table; the structured API, tabular export and trade confirmation are activity-only and report no holdings.",
     ],
   };
 }
