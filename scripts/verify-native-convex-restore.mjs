@@ -49,6 +49,8 @@ const REQUIRED_OPTIONS = [
 ];
 const HEX_SHA256 = /^[a-f0-9]{64}$/u;
 const ZIP_EOCD = 0x06054b50;
+const ZIP64_EOCD = 0x06064b50;
+const ZIP64_LOCATOR = 0x07064b50;
 const ZIP_CENTRAL_ENTRY = 0x02014b50;
 const ZIP_LOCAL_ENTRY = 0x04034b50;
 const CRC_TABLE = buildCrcTable();
@@ -337,6 +339,134 @@ function decodeZipName(bytes) {
   return name;
 }
 
+function readBoundedUint64(bytes, offset, end = bytes.length) {
+  if (offset < 0 || offset + 8 > end) fail("zip64_invalid");
+  const value = bytes.readBigUInt64LE(offset);
+  if (value > BigInt(Number.MAX_SAFE_INTEGER)) fail("zip64_invalid");
+  return Number(value);
+}
+
+function classicMatches(classic, sentinel, zip64) {
+  return classic === sentinel || classic === zip64;
+}
+
+function readCentralDirectory(bytes, eocd) {
+  const classic = {
+    disk: bytes.readUInt16LE(eocd + 4),
+    directoryDisk: bytes.readUInt16LE(eocd + 6),
+    diskEntries: bytes.readUInt16LE(eocd + 8),
+    totalEntries: bytes.readUInt16LE(eocd + 10),
+    directoryBytes: bytes.readUInt32LE(eocd + 12),
+    directoryOffset: bytes.readUInt32LE(eocd + 16),
+  };
+  const locatorOffset = eocd - 20;
+  const hasZip64Locator =
+    locatorOffset >= 0 && bytes.readUInt32LE(locatorOffset) === ZIP64_LOCATOR;
+  const hasSentinel =
+    classic.disk === 0xffff ||
+    classic.directoryDisk === 0xffff ||
+    classic.diskEntries === 0xffff ||
+    classic.totalEntries === 0xffff ||
+    classic.directoryBytes === 0xffffffff ||
+    classic.directoryOffset === 0xffffffff;
+
+  if (!hasZip64Locator) {
+    if (
+      hasSentinel ||
+      classic.disk !== 0 ||
+      classic.directoryDisk !== 0 ||
+      classic.diskEntries !== classic.totalEntries
+    ) {
+      fail("zip_multidisk_or_zip64_invalid");
+    }
+    return {
+      totalEntries: classic.totalEntries,
+      directoryBytes: classic.directoryBytes,
+      directoryOffset: classic.directoryOffset,
+      directoryEnd: eocd,
+    };
+  }
+
+  const locatorDisk = bytes.readUInt32LE(locatorOffset + 4);
+  const zip64Offset = readBoundedUint64(bytes, locatorOffset + 8, eocd);
+  const totalDisks = bytes.readUInt32LE(locatorOffset + 16);
+  if (
+    locatorDisk !== 0 ||
+    totalDisks !== 1 ||
+    zip64Offset + 56 > locatorOffset ||
+    bytes.readUInt32LE(zip64Offset) !== ZIP64_EOCD
+  ) {
+    fail("zip64_invalid");
+  }
+  const recordBytes = readBoundedUint64(bytes, zip64Offset + 4, locatorOffset);
+  if (recordBytes < 44 || zip64Offset + 12 + recordBytes !== locatorOffset) {
+    fail("zip64_invalid");
+  }
+  const zip64 = {
+    disk: bytes.readUInt32LE(zip64Offset + 16),
+    directoryDisk: bytes.readUInt32LE(zip64Offset + 20),
+    diskEntries: readBoundedUint64(bytes, zip64Offset + 24, locatorOffset),
+    totalEntries: readBoundedUint64(bytes, zip64Offset + 32, locatorOffset),
+    directoryBytes: readBoundedUint64(bytes, zip64Offset + 40, locatorOffset),
+    directoryOffset: readBoundedUint64(bytes, zip64Offset + 48, locatorOffset),
+  };
+  if (
+    zip64.disk !== 0 ||
+    zip64.directoryDisk !== 0 ||
+    zip64.diskEntries !== zip64.totalEntries ||
+    !classicMatches(classic.disk, 0xffff, zip64.disk) ||
+    !classicMatches(classic.directoryDisk, 0xffff, zip64.directoryDisk) ||
+    !classicMatches(classic.diskEntries, 0xffff, zip64.diskEntries) ||
+    !classicMatches(classic.totalEntries, 0xffff, zip64.totalEntries) ||
+    !classicMatches(classic.directoryBytes, 0xffffffff, zip64.directoryBytes) ||
+    !classicMatches(classic.directoryOffset, 0xffffffff, zip64.directoryOffset)
+  ) {
+    fail("zip64_invalid");
+  }
+  return {
+    totalEntries: zip64.totalEntries,
+    directoryBytes: zip64.directoryBytes,
+    directoryOffset: zip64.directoryOffset,
+    directoryEnd: zip64Offset,
+  };
+}
+
+function readZip64EntryValues(extra, needed) {
+  let offset = 0;
+  let zip64;
+  while (offset < extra.length) {
+    if (offset + 4 > extra.length) fail("zip_extra_invalid");
+    const id = extra.readUInt16LE(offset);
+    const size = extra.readUInt16LE(offset + 2);
+    const end = offset + 4 + size;
+    if (end > extra.length) fail("zip_extra_invalid");
+    if (id === 0x0001) {
+      if (zip64) fail("zip_extra_invalid");
+      zip64 = extra.subarray(offset + 4, end);
+    }
+    offset = end;
+  }
+  if (!needed.some(Boolean)) return {};
+  if (!zip64) fail("zip64_entry_invalid");
+  const values = {};
+  let zip64Offset = 0;
+  for (const [name, isNeeded, width] of [
+    ["inflatedBytes", needed[0], 8],
+    ["compressedBytes", needed[1], 8],
+    ["localOffset", needed[2], 8],
+    ["entryDisk", needed[3], 4],
+  ]) {
+    if (!isNeeded) continue;
+    if (zip64Offset + width > zip64.length) fail("zip64_entry_invalid");
+    values[name] =
+      width === 8
+        ? readBoundedUint64(zip64, zip64Offset, zip64.length)
+        : zip64.readUInt32LE(zip64Offset);
+    zip64Offset += width;
+  }
+  return values;
+}
+
 export function readBoundedZip(path) {
   const source = assertInputFile(
     path,
@@ -346,25 +476,11 @@ export function readBoundedZip(path) {
   const bytes = readFileSync(source.path);
   if (bytes.length > LIMITS.snapshotBytes) fail("snapshot_archive_too_large");
   const eocd = findEocd(bytes);
-  const disk = bytes.readUInt16LE(eocd + 4);
-  const directoryDisk = bytes.readUInt16LE(eocd + 6);
-  const diskEntries = bytes.readUInt16LE(eocd + 8);
-  const totalEntries = bytes.readUInt16LE(eocd + 10);
-  const directoryBytes = bytes.readUInt32LE(eocd + 12);
-  const directoryOffset = bytes.readUInt32LE(eocd + 16);
-  if (
-    disk !== 0 ||
-    directoryDisk !== 0 ||
-    diskEntries !== totalEntries ||
-    totalEntries === 0xffff ||
-    directoryBytes === 0xffffffff ||
-    directoryOffset === 0xffffffff
-  ) {
-    fail("zip64_or_multidisk_unsupported");
-  }
+  const { totalEntries, directoryBytes, directoryOffset, directoryEnd } =
+    readCentralDirectory(bytes, eocd);
   if (
     totalEntries > LIMITS.zipEntries ||
-    directoryOffset + directoryBytes !== eocd ||
+    directoryOffset + directoryBytes !== directoryEnd ||
     directoryOffset > bytes.length
   ) {
     fail("zip_directory_invalid");
@@ -375,7 +491,7 @@ export function readBoundedZip(path) {
   let inflatedTotal = 0;
   for (let index = 0; index < totalEntries; index += 1) {
     if (
-      offset + 46 > eocd ||
+      offset + 46 > directoryEnd ||
       bytes.readUInt32LE(offset) !== ZIP_CENTRAL_ENTRY
     ) {
       fail("zip_directory_invalid");
@@ -383,27 +499,44 @@ export function readBoundedZip(path) {
     const flags = bytes.readUInt16LE(offset + 8);
     const method = bytes.readUInt16LE(offset + 10);
     const expectedCrc = bytes.readUInt32LE(offset + 16);
-    const compressedBytes = bytes.readUInt32LE(offset + 20);
-    const inflatedBytes = bytes.readUInt32LE(offset + 24);
+    let compressedBytes = bytes.readUInt32LE(offset + 20);
+    let inflatedBytes = bytes.readUInt32LE(offset + 24);
     const nameBytes = bytes.readUInt16LE(offset + 28);
     const extraBytes = bytes.readUInt16LE(offset + 30);
     const commentBytes = bytes.readUInt16LE(offset + 32);
-    const entryDisk = bytes.readUInt16LE(offset + 34);
-    const localOffset = bytes.readUInt32LE(offset + 42);
+    let entryDisk = bytes.readUInt16LE(offset + 34);
+    let localOffset = bytes.readUInt32LE(offset + 42);
     const nextOffset = offset + 46 + nameBytes + extraBytes + commentBytes;
     if (
-      nextOffset > eocd ||
-      entryDisk !== 0 ||
+      nextOffset > directoryEnd ||
       (flags & 1) !== 0 ||
       (flags & ~0x0808) !== 0 ||
-      (method !== 0 && method !== 8) ||
-      compressedBytes === 0xffffffff ||
-      inflatedBytes === 0xffffffff ||
-      inflatedBytes > LIMITS.inflatedEntryBytes
+      (method !== 0 && method !== 8)
     ) {
       fail("zip_entry_invalid");
     }
     const encodedName = bytes.subarray(offset + 46, offset + 46 + nameBytes);
+    const extra = bytes.subarray(
+      offset + 46 + nameBytes,
+      offset + 46 + nameBytes + extraBytes,
+    );
+    const zip64Values = readZip64EntryValues(extra, [
+      inflatedBytes === 0xffffffff,
+      compressedBytes === 0xffffffff,
+      localOffset === 0xffffffff,
+      entryDisk === 0xffff,
+    ]);
+    inflatedBytes = zip64Values.inflatedBytes ?? inflatedBytes;
+    compressedBytes = zip64Values.compressedBytes ?? compressedBytes;
+    localOffset = zip64Values.localOffset ?? localOffset;
+    entryDisk = zip64Values.entryDisk ?? entryDisk;
+    if (
+      entryDisk !== 0 ||
+      compressedBytes > LIMITS.snapshotBytes ||
+      inflatedBytes > LIMITS.inflatedEntryBytes
+    ) {
+      fail("zip_entry_invalid");
+    }
     const name = decodeZipName(encodedName);
     if (entries.has(name)) fail("zip_duplicate_entry");
     if (
@@ -451,7 +584,7 @@ export function readBoundedZip(path) {
     entries.set(name, content);
     offset = nextOffset;
   }
-  if (offset !== eocd) fail("zip_directory_invalid");
+  if (offset !== directoryEnd) fail("zip_directory_invalid");
   return entries;
 }
 
@@ -711,16 +844,16 @@ function assertBackendProcess(backend, backendPort, sitePort) {
   return listeners.length;
 }
 
-function captureStream(stream) {
+function captureStream(stream, maximumBytes = LIMITS.commandOutputBytes) {
   const chunks = [];
   let bytes = 0;
   let truncated = false;
   stream.on("data", (chunk) => {
-    if (bytes >= LIMITS.commandOutputBytes) {
+    if (bytes >= maximumBytes) {
       truncated = true;
       return;
     }
-    const kept = chunk.subarray(0, LIMITS.commandOutputBytes - bytes);
+    const kept = chunk.subarray(0, maximumBytes - bytes);
     chunks.push(kept);
     bytes += kept.length;
     if (kept.length !== chunk.length) truncated = true;
@@ -748,23 +881,125 @@ function redact(bytes, secrets) {
   return value;
 }
 
-function runConvexCli({ cli, arguments_, cwd, environment, logName, secrets }) {
-  const result = spawnSync(process.execPath, [cli, ...arguments_], {
+const CHILD_WAIT_TIMEOUT = Symbol("child_wait_timeout");
+
+async function settleWithin(promise, milliseconds) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((resolveTimeout) => {
+        timer = setTimeout(
+          () => resolveTimeout(CHILD_WAIT_TIMEOUT),
+          milliseconds,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function signalChildGroup(child, signal) {
+  if (!child.pid) return;
+  try {
+    process.kill(-child.pid, signal);
+  } catch {
+    try {
+      child.kill(signal);
+    } catch {
+      // The terminal-state check below determines whether cleanup succeeded.
+    }
+  }
+}
+
+export async function runBoundedChild({
+  command,
+  arguments_,
+  cwd,
+  environment,
+  timeoutMs,
+  killGraceMs = 3_000,
+  outputBytes = LIMITS.commandOutputBytes,
+}) {
+  const child = spawn(command, arguments_, {
     cwd,
     env: environment,
     stdio: ["ignore", "pipe", "pipe"],
-    timeout: 180_000,
-    maxBuffer: LIMITS.commandOutputBytes,
+    detached: true,
+  });
+  const getSpawnError = captureChildSpawnError(child);
+  const readStdout = captureStream(child.stdout, outputBytes);
+  const readStderr = captureStream(child.stderr, outputBytes);
+  const closed = new Promise((resolveClose) => {
+    child.once("close", (status, signal) => {
+      resolveClose({ kind: "close", status, signal });
+    });
+    child.once("error", () => {
+      resolveClose({ kind: "spawn_error", status: null, signal: null });
+    });
+  });
+
+  let outcome = await settleWithin(closed, timeoutMs);
+  const timedOut = outcome === CHILD_WAIT_TIMEOUT;
+  if (timedOut) {
+    signalChildGroup(child, "SIGTERM");
+    outcome = await settleWithin(closed, killGraceMs);
+    if (outcome === CHILD_WAIT_TIMEOUT) {
+      signalChildGroup(child, "SIGKILL");
+      outcome = await settleWithin(closed, killGraceMs);
+    }
+  }
+  const stopped =
+    !child.pid || child.exitCode !== null || child.signalCode !== null;
+  return {
+    status:
+      outcome !== CHILD_WAIT_TIMEOUT && outcome.kind === "close"
+        ? outcome.status
+        : child.exitCode,
+    signal:
+      outcome !== CHILD_WAIT_TIMEOUT && outcome.kind === "close"
+        ? outcome.signal
+        : child.signalCode,
+    spawnError: getSpawnError(),
+    timedOut,
+    stopped,
+    stdout: readStdout(),
+    stderr: readStderr(),
+  };
+}
+
+async function runConvexCli({
+  cli,
+  arguments_,
+  cwd,
+  environment,
+  logName,
+  secrets,
+}) {
+  const result = await runBoundedChild({
+    command: process.execPath,
+    arguments_: [cli, ...arguments_],
+    cwd,
+    environment,
+    timeoutMs: 180_000,
   });
   writePrivate(
     join(cwd, `${logName}.stdout.log`),
-    redact(result.stdout ?? Buffer.alloc(0), secrets),
+    redact(result.stdout, secrets),
   );
   writePrivate(
     join(cwd, `${logName}.stderr.log`),
-    redact(result.stderr ?? Buffer.alloc(0), secrets),
+    redact(result.stderr, secrets),
   );
-  if (result.status !== 0 || result.error) fail(`${logName}_failed`);
+  if (
+    result.status !== 0 ||
+    result.spawnError ||
+    result.timedOut ||
+    !result.stopped
+  ) {
+    fail(`${logName}_failed`);
+  }
   return result.stdout.toString("utf8");
 }
 
@@ -987,7 +1222,7 @@ export async function runVerification(options, environment = process.env) {
     result.stage = "schema_deploy";
     assertSchemaOnlyLayout(outputDirectory);
     assertBackendProcess(backend, options.backendPort, options.sitePort);
-    runConvexCli({
+    await runConvexCli({
       cli,
       arguments_: ["deploy", "--typecheck", "disable", "--codegen", "disable"],
       cwd: outputDirectory,
@@ -997,7 +1232,7 @@ export async function runVerification(options, environment = process.env) {
     });
     assertBackendProcess(backend, options.backendPort, options.sitePort);
     const specification = JSON.parse(
-      runConvexCli({
+      await runConvexCli({
         cli,
         arguments_: ["function-spec"],
         cwd: outputDirectory,
@@ -1023,7 +1258,7 @@ export async function runVerification(options, environment = process.env) {
       "staged_snapshot",
       LIMITS.snapshotBytes,
     );
-    runConvexCli({
+    await runConvexCli({
       cli,
       arguments_: ["import", "--replace-all", "--yes", stagedSnapshot],
       cwd: outputDirectory,
@@ -1043,7 +1278,7 @@ export async function runVerification(options, environment = process.env) {
     assertBackendProcess(backend, options.backendPort, options.sitePort);
     const restoredSnapshot = join(outputDirectory, "restored-snapshot.zip");
     if (existsSync(restoredSnapshot)) fail("restored_snapshot_exists");
-    runConvexCli({
+    await runConvexCli({
       cli,
       arguments_: [
         "export",
