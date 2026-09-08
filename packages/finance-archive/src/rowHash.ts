@@ -23,7 +23,9 @@ import { createHash } from "node:crypto";
 
 import { canonicalizeDecimal } from "./decimal.js";
 import { currencyExponent } from "./money.js";
+import { toNumericText } from "./pgNumeric.js";
 
+/** v1: the amount field is minor units. See ROW_HASH_DOMAIN_V2 below. */
 export const ROW_HASH_DOMAIN = "kith-finance-row:v1\0";
 
 export type RowHashInput = {
@@ -82,15 +84,25 @@ function field(value: string | null): string {
   return value === null ? "-" : `${Buffer.byteLength(value, "utf8")}:${value}`;
 }
 
-export function rowHash(input: RowHashInput): string {
-  if (!Number.isInteger(input.occurrence) || input.occurrence < 1) {
+function assertOccurrence(occurrence: number): void {
+  if (!Number.isInteger(occurrence) || occurrence < 1) {
     throw new RangeError(
-      `rowHash: occurrence must be an integer >= 1, got ${JSON.stringify(input.occurrence)}; ` +
+      `rowHash: occurrence must be an integer >= 1, got ${JSON.stringify(occurrence)}; ` +
         "omitting it hashes undefined into its own namespace and silently breaks deduplication",
     );
   }
+}
+
+function digest(domain: string, parts: readonly string[]): string {
+  return createHash("sha256")
+    .update(domain + parts.join("\0"), "utf8")
+    .digest("hex");
+}
+
+export function rowHash(input: RowHashInput): string {
+  assertOccurrence(input.occurrence);
   currencyExponent(input.currency);
-  const parts = [
+  return digest(ROW_HASH_DOMAIN, [
     field(input.accountId),
     field(input.processDate),
     field(normalizeText(input.activityType).toLowerCase()),
@@ -99,8 +111,75 @@ export function rowHash(input: RowHashInput): string {
     field(input.amount === null ? null : input.amount.toString()),
     field(input.currency),
     field(String(input.occurrence)),
-  ];
-  return createHash("sha256")
-    .update(ROW_HASH_DOMAIN + parts.join("\0"), "utf8")
-    .digest("hex");
+  ]);
+}
+
+// ---------------------------------------------------------------------------
+// v2: the preimage under a decimal amount representation.
+//
+// The preimage is versioned rather than quietly changed. v1 meant one thing
+// and still does; nothing reinterprets a v1 hash as a v2 one.
+//
+//   v1 amount field: the minor-unit integer at the currency's exponent, as
+//     produced by `toMinorUnits`. USD 12.34 hashed as "1234".
+//   v2 amount field: the stated amount in canonical decimal form, as produced
+//     by `toNumericText`. USD 12.34 hashes as "12.34".
+//
+// The mapping between them is exactly `fromMinorUnits(amount, currency)`,
+// which is total and, for a fixed currency, injective. So two rows share a v1
+// hash if and only if they share a v2 hash: the identities the archive
+// deduplicates on are the same set before and after the move. That is the
+// property `test/pgRowHashV2.test.mjs` asserts over a synthetic row set.
+//
+// Canonicalization is what makes this safe, and skipping it is how the
+// archive would start double-counting: `1`, `1.0` and `1.00` are one amount
+// and must be one identity, so the amount is canonicalized before it is
+// hashed rather than hashed as the source spelled it.
+//
+// Everything else about the preimage is unchanged, including the occurrence
+// ordinal and its validation. The ordinal is what lets one formula both
+// collapse an overlapping paginated page and keep two legitimately identical
+// transactions in one document apart, and it is still a hashed field rather
+// than a suffix appended after the fact.
+// ---------------------------------------------------------------------------
+
+export const ROW_HASH_DOMAIN_V2 = "kith-finance-row:v2\0";
+
+export type RowHashInputV2 = Omit<RowHashInput, "amount"> & {
+  /**
+   * The stated amount as decimal text in `currency`, or null where the amount
+   * is ambiguous and under review. Never a number, and never minor units.
+   */
+  amount: string | null;
+};
+
+/** `RowHashInputV2` minus the ordinal: the content an occurrence counts over. */
+export type RowContentV2 = Omit<RowHashInputV2, "occurrence">;
+
+/** The v2 counterpart of `contentKey`, so the two never drift apart. */
+export function contentKeyV2(row: RowContentV2): string {
+  return [
+    row.accountId,
+    row.processDate,
+    normalizeText(row.activityType).toLowerCase(),
+    normalizeText(row.description),
+    row.quantity === null ? "-" : canonicalizeDecimal(row.quantity),
+    row.amount === null ? "-" : toNumericText(row.amount),
+    row.currency,
+  ].join(" ");
+}
+
+export function rowHashV2(input: RowHashInputV2): string {
+  assertOccurrence(input.occurrence);
+  currencyExponent(input.currency);
+  return digest(ROW_HASH_DOMAIN_V2, [
+    field(input.accountId),
+    field(input.processDate),
+    field(normalizeText(input.activityType).toLowerCase()),
+    field(normalizeText(input.description)),
+    field(input.quantity === null ? null : canonicalizeDecimal(input.quantity)),
+    field(input.amount === null ? null : toNumericText(input.amount)),
+    field(input.currency),
+    field(String(input.occurrence)),
+  ]);
 }

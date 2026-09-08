@@ -4,15 +4,96 @@ The store, schema, migrations and money policy for the financial archive
 described in
 [`docs/plans/2026-09-07-financial-transaction-database.md`](../../docs/plans/2026-09-07-financial-transaction-database.md).
 
-This package owns the SQLite file and the rules for what a number means inside
-it. The adapter interface, importer, reconciliation gate and MCP server build on
+This package owns the store and the rules for what a number means inside it.
+The adapter interface, importer, reconciliation gate and MCP server build on
 top of it.
+
+The archive is moving from a local SQLite file to hosted Postgres, so an
+always-on machine and a laptop can share one archive. F1-20 adds the Postgres
+schema, the money representation it uses and the conversion tests beside the
+SQLite implementation; F1-22 ports the importer, both reconciliation gates and
+the raw-tree writer onto it and removes SQLite. Until then both are here, and
+the sections below say which engine each describes.
 
 The archive file, the raw document tree and the import logs live in a configured
 local directory outside this repository. No real account number, balance,
 holding, institution, advisor, entity or path appears here or in the tests.
 
-## Money and rounding policy
+## Money on Postgres (F1-20)
+
+SQLite forced a split representation: cash amounts as integer minor units so
+`SUM` stayed exact, quantities and prices as canonical decimal `TEXT` so
+precision survived. Postgres `NUMERIC` does both, so one representation
+replaces the split and the conversion boundary between them disappears along
+with the class of bugs that lived on it.
+
+**`NUMERIC` does not make money exact end to end.** It gives exact arithmetic
+and exact aggregation inside the database. It does nothing about precision
+lost _before_ insertion: a JavaScript `0.1 + 0.2` arrives as
+`0.30000000000000004` and is stored faithfully, damage included. So the
+guarantee is validated input and pinned decoding, and both are built rather
+than assumed.
+
+| Rule                                                     | Where it lives                                                       |
+| -------------------------------------------------------- | -------------------------------------------------------------------- |
+| Decimal input is validated as text before any conversion | `toNumericText` (`src/pgNumeric.ts`)                                 |
+| A JavaScript number is refused, never stringified        | `toNumericText`                                                      |
+| Non-finite values are refused, Postgres `NaN` included   | `toNumericText`, `fromNumericText`, and the `finance_numeric` domain |
+| Money crosses driver, JSON and MCP boundaries as text    | `pinNumericDecoding` (`src/pgStore.ts`)                              |
+
+The SQLite `CHECK (typeof(...))` constraints do not translate, because
+Postgres types already cover storage class. Their intent moves to input
+validation, which is the only place that can still tell a float from a
+decimal.
+
+### Overflow
+
+Columns are `NUMERIC` with no declared precision or scale. `NUMERIC(38, 18)`
+would _round_ a more precise value into place on insert, which is the silent
+loss the policy exists to prevent. The typed Kith Mind boundary carries 38
+significant digits and 18 fractional places, and that bound is enforced on the
+way in by `toNumericText`, where exceeding it throws. A caller turns that into
+a `review_items` row, exactly as it already does when `toMinorUnits` cannot
+place a value at a currency's exponent. Out of range is a rejection or a
+review outcome, never a rounding.
+
+### Driver decoding
+
+node-postgres decodes by type OID, and its current default for `NUMERIC` is
+already text. That is why the decoder is pinned rather than relied on: a
+default is a choice someone else can change in a minor release, and a driver
+that silently started returning a float for `NUMERIC` would reintroduce the
+exact failure the type was chosen to prevent, quietly and everywhere at once.
+`pinNumericDecoding` pins `NUMERIC` and `INT8`, and `test/pgMoney.test.mjs`
+asserts the pin with no database required.
+
+### The deduplication preimage is versioned
+
+`row_hash` hashed the minor-unit integer. Under a decimal representation `1`,
+`1.0` and `1.00` must resolve to one identity, or deduplication stops working
+and the archive double-counts. So the preimage is versioned, not quietly
+changed:
+
+| Domain                | Amount field in the preimage                                      |
+| --------------------- | ----------------------------------------------------------------- |
+| `kith-finance-row:v1` | minor units at the currency's exponent, USD 12.34 as `1234`       |
+| `kith-finance-row:v2` | the stated amount in canonical decimal form, USD 12.34 as `12.34` |
+
+`fromMinorUnits(amount, currency)` is the mapping between them. It is total
+and, for a fixed currency, injective, so two rows share a v1 hash if and only
+if they share a v2 hash: the identities the archive deduplicates on are the
+same set before and after the move. `test/pgMoney.test.mjs` asserts that
+property over a synthetic row set covering a zero-exponent currency, a
+three-place one, repeated content at different ordinals, an ambiguous amount
+under review and several spellings of one amount.
+
+`rowHash` and `ROW_HASH_DOMAIN` still mean what they meant. `rowHashV2` and
+`ROW_HASH_DOMAIN_V2` are new names, so nothing reinterprets a v1 hash as a v2
+one. The occurrence ordinal and its runtime validation carry over unchanged:
+it is what lets one formula both collapse an overlapping paginated page and
+keep two legitimately identical transactions in one document apart.
+
+## Money and rounding policy (SQLite)
 
 Money has two representations, and which one a column uses follows one rule:
 **amounts get summed, prices do not.** Any column added later is classified the
@@ -183,6 +264,7 @@ market-marked position, a cost-basis-only illiquid holding, a deliberately
 unparseable market value, and a EUR-denominated position alongside the USD
 ones. `test/syntheticAdapter.test.mjs` is what a new adapter's own suite
 should look like.
+
 ## Importer
 
 `importBatch(db, batch, now?)` turns normalized rows into `documents`,
@@ -393,7 +475,7 @@ caller cannot do by combining the other two files alone:
   `cusip`, then `isin`, then `symbol` and `name` together, then `symbol`
   alone, then a new row. A real identifier never merges two different
   instruments that happen to share a ticker. A bare symbol with no cusip,
-  isin or matching name resolves to the *existing* instrument with that
+  isin or matching name resolves to the _existing_ instrument with that
   symbol (deterministically the first one ever created, by SQLite `rowid`)
   rather than minting a new row every time -- unbounded row growth would
   silently break "every purchase of instrument X" just as badly as a wrong
@@ -466,7 +548,7 @@ requirements true by construction instead of by convention someone could get
 wrong: identical bytes always land on the same path, so a repeat write of
 the same content is caught by the layout itself rather than a lookup a
 caller has to remember to run, and two different byte strings can never
-collide on a path, because the path *is* their hash. A 2+2 hex fan-out
+collide on a path, because the path _is_ their hash. A 2+2 hex fan-out
 (65536 buckets) keeps any one directory small at tens of thousands of
 documents, which stays fine for a person to browse by hand.
 
@@ -495,7 +577,7 @@ exactly the kind of bug provenance exists to catch. `descriptor` names the
 `institutionId`, `accountId` and `docType` a pull belongs to (both ids are
 foreign keys, so a valid one guarantees a real row to resolve the
 institution's slug and the account's last four digits from); its result is
-the *only* way to obtain an `AdapterPull.persisted` -- `AdapterPull` has no
+the _only_ way to obtain an `AdapterPull.persisted` -- `AdapterPull` has no
 free-form `filePath` field a caller could invent -- so `documents.file_path`
 (`importBatch`, `src/importer.ts`) ends up pointing at a file that actually
 exists rather than a path no code ever created, structurally rather than by
@@ -538,7 +620,56 @@ not (the normal case). Ground rule 7's provider-total check stays scoped to
 activity rows; `reportedRowCount` is a transaction-row count and holdings
 have no analogous provider total to reconcile against.
 
-## Schema and migrations
+## Postgres schema (F1-20)
+
+`applyPgSchema(client)` creates the schema in the connected `search_path` and
+records the applied version in a `schema_version` table. It is one initial
+schema rather than a translation of three SQLite migrations, because there is
+no data behind those migrations and that is the whole reason the engine
+changes now rather than later. The whole creation is one transaction, a
+session advisory lock excludes a second creator by the database rather than by
+convention, and running it again is a no-op returning the recorded version.
+
+All twelve tables plus `position_reconciliations` survive, with every
+constraint the SQLite schema expressed: currency on every money column,
+`positions.valuation_basis` and `valuation_note`, `commitments` designed and
+unpopulated, `source_document_id` and `source_locator` on every derived row,
+`acct_last4` constrained to exactly four digits, `row_hash` unique, and stable
+opaque text identities. Dates become `DATE`, timestamps `TIMESTAMPTZ` and
+flags `BOOLEAN`, so the SQLite `GLOB` spelling checks are unnecessary. Two
+domains carry the rules that repeat across columns: `finance_numeric` (every
+money, quantity, price and rate column, rejecting Postgres's own `NaN`) and
+`currency_code`.
+
+`position_reconciliations` keeps its own table. Under SQLite it was separated
+partly by storage class, and that reason is gone. The other reason is not: a
+cash verdict and a position verdict must stay distinguishable, or every query
+for unverified periods silently starts returning per-instrument rows.
+
+The connection string is read from `FINANCE_ARCHIVE_DATABASE_URL` and nowhere
+else, the same rule `FINANCE_ARCHIVE_DB_PATH` and
+`FINANCE_ARCHIVE_RAW_TREE_ROOT` already follow: a missing setting is a hard
+error that names what is missing, never a default and never a guess.
+
+### Running the Postgres tests
+
+`test/pgMoney.test.mjs` needs no database and always runs: input validation,
+driver decoding and the whole deduplication preimage are pure logic, and they
+are the three places this port can go quietly wrong.
+`test/pgSchema.test.mjs` needs a real server and skips cleanly, naming the
+variable, unless `FINANCE_ARCHIVE_DATABASE_URL` points at a throwaway
+database. Each run works inside a schema it creates and drops, so pointing it
+at a shared development database cannot clobber anything.
+
+The tradeoff, stated plainly: a public clone with no database still runs the
+full suite and proves everything provable without a server, but exact
+`NUMERIC` aggregation and the schema's own constraints are only exercised
+where a database is configured, so CI has to configure one. The alternative,
+requiring a container to run the suite at all, would make a clone's `pnpm
+test:once` depend on Docker, which is a worse default for a repository whose
+rule is that a public clone runs the full suite with no credentials.
+
+## Schema and migrations (SQLite)
 
 `openArchive(path)` opens the file, sets `foreign_keys`, WAL and a busy timeout,
 and applies any migration the file has not seen. The applied version is recorded
@@ -590,5 +721,7 @@ pnpm --filter @repo/finance-archive build
 pnpm --filter @repo/finance-archive test:once
 ```
 
-The suite creates its databases in a temp directory and removes them. A public
-clone runs it with no credentials and no private files.
+The suite creates its SQLite databases in a temp directory and removes them. A
+public clone runs it with no credentials and no private files; the Postgres
+integration tests skip unless `FINANCE_ARCHIVE_DATABASE_URL` is set (see
+"Running the Postgres tests" above).
