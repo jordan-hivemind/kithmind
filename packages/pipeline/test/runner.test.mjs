@@ -221,7 +221,6 @@ test("version-1 checkpoints accept only closed PDF and safe-gap scan plans", () 
 });
 
 test("append serializes PDF and safe leaf gaps without changing UTF-8 entries", async () => {
-  const { base, root, journalDir, config: localConfig } = await fixture();
   const digest = "a".repeat(64);
   const checkpoint = parseRunnerCheckpoint({
     version: 1,
@@ -270,7 +269,8 @@ test("append serializes PDF and safe leaf gaps without changing UTF-8 entries", 
       },
     ],
   });
-  const journal = await openJournal(journalDir, checkpoint);
+  const { base, root, journalDir, config: localConfig, journal } =
+    await fixtureWithJournal(1, checkpoint);
   const calls = [];
   const transport = {
     async call(request) {
