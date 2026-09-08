@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 
 import {
   ProofError,
+  addSyntheticApiKey,
   sha256,
   validateStageGenerationInput,
 } from "../dist/index.js";
@@ -101,5 +102,17 @@ test("financial fixture uses the shared 38 digit, 18 place canonical contract", 
   assert.throws(
     () => validateStageGenerationInput(unsupportedCurrency),
     (error) => error instanceof ProofError && error.code === "invalid_currency",
+  );
+});
+
+test("non-string API keys fail closed before database access", async () => {
+  const owner = {
+    query() {
+      throw new Error("database_should_not_be_called");
+    },
+  };
+  await assert.rejects(
+    addSyntheticApiKey(owner, randomUUID(), null),
+    (error) => error instanceof ProofError && error.code === "invalid_api_key",
   );
 });

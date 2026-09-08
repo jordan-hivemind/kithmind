@@ -77,6 +77,47 @@ export type Citation = {
   quoteHash: string;
 };
 
+export type EnqueueWorkerJobInput = {
+  requestId: string;
+  workKind: "synthetic_document_processing";
+  workKey: string;
+  inputHash: string;
+  maxAttempts: number;
+};
+
+export type WorkerJobState = "queued" | "running" | "succeeded" | "failed";
+
+export type WorkerJob = {
+  jobId: string;
+  workKind: "synthetic_document_processing";
+  workKey: string;
+  inputHash: string;
+  state: WorkerJobState;
+  attemptCount: number;
+  maxAttempts: number;
+  leaseEpoch: number;
+  outputHash?: string;
+  failureCode?: "attempts_exhausted";
+};
+
+export type WorkerLease = WorkerJob & {
+  state: "running";
+  leaseToken: string;
+  leaseExpiresAt: string;
+};
+
+export type EnqueueWorkerJobResult = {
+  jobId: string;
+  accepted: true;
+};
+
+export type CompleteWorkerJobResult = WorkerJob & {
+  state: "succeeded";
+  outputHash: string;
+  completedAt: string;
+  reused: boolean;
+};
+
 export function sha256(value: string | Uint8Array): string {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -87,6 +128,7 @@ export function newSyntheticApiKey(): string {
 
 function keyHash(apiKey: string): Buffer {
   if (
+    typeof apiKey !== "string" ||
     apiKey.length < 32 ||
     apiKey.length > 256 ||
     !/^[\x21-\x7e]+$/.test(apiKey)
@@ -323,7 +365,14 @@ export function validateStageGenerationInput(
   }
 }
 
-const migrationUrl = new URL("../migrations/001_init.sql", import.meta.url);
+const migrations = [
+  { version: 1, url: new URL("../migrations/001_init.sql", import.meta.url) },
+  {
+    version: 2,
+    url: new URL("../migrations/002_worker_jobs.sql", import.meta.url),
+  },
+] as const;
+const MIGRATION_LOCK_KEY = 4_119_239_002;
 
 export async function applyProofMigration(
   owner: Pool,
@@ -331,8 +380,58 @@ export async function applyProofMigration(
 ): Promise<void> {
   if (!/^[a-z][a-z0-9_]{0,62}$/.test(appRole))
     throw new ProofError("invalid_app_role");
-  const sql = await readFile(fileURLToPath(migrationUrl), "utf8");
-  await owner.query(sql);
+  const client = await owner.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("SELECT pg_advisory_xact_lock($1)", [
+      MIGRATION_LOCK_KEY,
+    ]);
+    const present = await client.query<{ present: boolean }>(
+      "SELECT to_regclass('kith.schema_migrations') IS NOT NULL AS present",
+    );
+    let current = 0;
+    if (present.rows[0]?.present) {
+      const result = await client.query<{ version: number }>(
+        "SELECT version::int AS version FROM kith.schema_migrations ORDER BY version",
+      );
+      const versions = result.rows.map((row) => row.version);
+      if (
+        versions.length === 0 ||
+        versions.some((version, index) => version !== index + 1)
+      ) {
+        throw new ProofError("schema_history_invalid");
+      }
+      current = versions.at(-1)!;
+    }
+    if (current > migrations.length) throw new ProofError("schema_too_new");
+    for (const migration of migrations) {
+      if (migration.version <= current) continue;
+      if (migration.version !== current + 1)
+        throw new ProofError("schema_version_gap");
+      const sql = await readFile(fileURLToPath(migration.url), "utf8");
+      await client.query(sql);
+      await client.query(
+        "INSERT INTO kith.schema_migrations(version) VALUES ($1)",
+        [migration.version],
+      );
+      current = migration.version;
+    }
+    const verified = await client.query<{ version: number }>(
+      "SELECT version::int AS version FROM kith.schema_migrations ORDER BY version",
+    );
+    if (
+      current !== migrations.length ||
+      verified.rows.length !== migrations.length ||
+      verified.rows.some((row, index) => row.version !== index + 1)
+    )
+      throw new ProofError("schema_version_incomplete");
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
   await grantProofAppRole(owner, appRole);
 }
 
@@ -351,7 +450,7 @@ export async function grantProofAppRole(
   await owner.query(`GRANT INSERT, UPDATE, DELETE ON
     kith.documents, kith.source_revisions, kith.generations, kith.pages,
     kith.evidence, kith.chunks, kith.synthetic_financial_attachments,
-    kith.idempotency_receipts TO "${appRole}"`);
+    kith.idempotency_receipts, kith.worker_jobs TO "${appRole}"`);
 }
 
 export async function seedSyntheticSpace(
@@ -383,6 +482,21 @@ export async function seedSyntheticSpace(
   return { spaceId, apiKeyId };
 }
 
+export async function addSyntheticApiKey(
+  owner: Pool,
+  spaceId: string,
+  apiKey: string,
+): Promise<{ apiKeyId: string }> {
+  expectUuid(spaceId, "invalid_space_id");
+  const apiKeyId = randomUUID();
+  const result = await owner.query(
+    "INSERT INTO kith.api_keys(id, space_id, key_hash) SELECT $1, id, $2 FROM kith.spaces WHERE id=$3 RETURNING id",
+    [apiKeyId, keyHash(apiKey), spaceId],
+  );
+  if (result.rowCount !== 1) throw new ProofError("space_not_found");
+  return { apiKeyId };
+}
+
 export async function revokeSyntheticApiKey(
   owner: Pool,
   apiKeyId: string,
@@ -399,6 +513,17 @@ type ProofOptions = {
   afterDocumentWrite?: (client: PoolClient) => Promise<void>;
 };
 
+type AuthContext = { spaceId: string; apiKeyId: string };
+
+function isSerializationFailure(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === "40001"
+  );
+}
+
 export class PostgresProof {
   constructor(
     private readonly pool: Pool,
@@ -408,37 +533,40 @@ export class PostgresProof {
   private async authenticate(
     client: PoolClient,
     apiKey: string,
-  ): Promise<string> {
-    const result = await client.query<{ space_id: string }>(
-      "SELECT space_id FROM kith.api_keys WHERE key_hash = $1 AND revoked_at IS NULL",
+  ): Promise<AuthContext> {
+    const result = await client.query<{ id: string; space_id: string }>(
+      "SELECT id, space_id FROM kith.api_keys WHERE key_hash = $1 AND revoked_at IS NULL",
       [keyHash(apiKey)],
     );
     if (result.rowCount !== 1) throw new ProofError("unauthorized");
-    return result.rows[0]!.space_id;
+    return { spaceId: result.rows[0]!.space_id, apiKeyId: result.rows[0]!.id };
   }
 
   private async transaction<T>(
-    work: (client: PoolClient, spaceId: string) => Promise<T>,
+    work: (client: PoolClient, spaceId: string, apiKeyId: string) => Promise<T>,
     apiKey: string,
   ): Promise<T> {
-    const client = await this.pool.connect();
-    try {
-      await client.query("BEGIN ISOLATION LEVEL SERIALIZABLE");
-      await client.query("SET LOCAL statement_timeout = '5s'");
-      await client.query("SET LOCAL lock_timeout = '2s'");
-      await client.query(
-        "SET LOCAL idle_in_transaction_session_timeout = '5s'",
-      );
-      const spaceId = await this.authenticate(client, apiKey);
-      const result = await work(client, spaceId);
-      await client.query("COMMIT");
-      return result;
-    } catch (error) {
-      await client.query("ROLLBACK");
-      throw error;
-    } finally {
-      client.release();
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const client = await this.pool.connect();
+      try {
+        await client.query("BEGIN ISOLATION LEVEL SERIALIZABLE");
+        await client.query("SET LOCAL statement_timeout = '5s'");
+        await client.query("SET LOCAL lock_timeout = '2s'");
+        await client.query(
+          "SET LOCAL idle_in_transaction_session_timeout = '5s'",
+        );
+        const auth = await this.authenticate(client, apiKey);
+        const result = await work(client, auth.spaceId, auth.apiKeyId);
+        await client.query("COMMIT");
+        return result;
+      } catch (error) {
+        await client.query("ROLLBACK");
+        if (!isSerializationFailure(error) || attempt === 3) throw error;
+      } finally {
+        client.release();
+      }
     }
+    throw new ProofError("transaction_retry_exhausted");
   }
 
   private async idempotent<T extends object>(
@@ -788,6 +916,255 @@ export class PostgresProof {
       apiKey,
     );
   }
+
+  async enqueueWorkerJob(
+    apiKey: string,
+    input: EnqueueWorkerJobInput,
+  ): Promise<EnqueueWorkerJobResult> {
+    assertExactKeys(
+      input,
+      ["requestId", "workKind", "workKey", "inputHash", "maxAttempts"],
+      "invalid_enqueue_shape",
+    );
+    expectUuid(input.requestId, "invalid_request_id");
+    if (input.workKind !== "synthetic_document_processing")
+      throw new ProofError("invalid_work_kind");
+    expectText(input.workKey, 1, 128, "invalid_work_key");
+    expectHash(input.inputHash, "invalid_input_hash");
+    if (
+      !Number.isSafeInteger(input.maxAttempts) ||
+      input.maxAttempts < 1 ||
+      input.maxAttempts > 5
+    ) {
+      throw new ProofError("invalid_max_attempts");
+    }
+    const requestHash = sha256(canonical(input));
+    return this.transaction(async (client, spaceId, apiKeyId) => {
+      const jobId = randomUUID();
+      const inserted = await client.query<{ id: string }>(
+        `INSERT INTO kith.worker_jobs
+          (id, space_id, enqueue_request_id, enqueue_request_hash, enqueued_by_api_key_id,
+           work_kind, work_key, input_hash, state, max_attempts)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'queued',$9)
+         ON CONFLICT (space_id, enqueue_request_id) DO NOTHING
+         RETURNING id`,
+        [
+          jobId,
+          spaceId,
+          input.requestId,
+          requestHash,
+          apiKeyId,
+          input.workKind,
+          input.workKey,
+          input.inputHash,
+          input.maxAttempts,
+        ],
+      );
+      if (inserted.rowCount === 1) return { jobId, accepted: true };
+      const prior = await client.query<{
+        id: string;
+        enqueue_request_hash: string;
+      }>(
+        "SELECT id, enqueue_request_hash FROM kith.worker_jobs WHERE space_id=$1 AND enqueue_request_id=$2",
+        [spaceId, input.requestId],
+      );
+      if (prior.rowCount !== 1)
+        throw new ProofError("enqueue_conflict_unresolved");
+      if (prior.rows[0]!.enqueue_request_hash !== requestHash)
+        throw new ProofError("idempotency_conflict");
+      return { jobId: prior.rows[0]!.id, accepted: true };
+    }, apiKey);
+  }
+
+  async claimWorkerJob(
+    apiKey: string,
+    input: { leaseSeconds: number },
+  ): Promise<WorkerLease | null> {
+    assertExactKeys(input, ["leaseSeconds"], "invalid_claim_shape");
+    if (
+      !Number.isSafeInteger(input.leaseSeconds) ||
+      input.leaseSeconds < 1 ||
+      input.leaseSeconds > 300
+    ) {
+      throw new ProofError("invalid_lease_seconds");
+    }
+    return this.transaction(async (client, spaceId, apiKeyId) => {
+      await client.query(
+        `WITH exhausted AS (
+           SELECT id FROM kith.worker_jobs
+            WHERE space_id=$1 AND state='running' AND lease_expires_at <= clock_timestamp()
+              AND attempt_count >= max_attempts
+            ORDER BY lease_expires_at, id
+            FOR UPDATE SKIP LOCKED LIMIT 25
+         )
+         UPDATE kith.worker_jobs j
+            SET state='failed', lease_token_hash=NULL, leased_by_api_key_id=NULL,
+                lease_expires_at=NULL, failure_code='attempts_exhausted', failed_at=clock_timestamp()
+           FROM exhausted e WHERE j.id=e.id AND j.space_id=$1`,
+        [spaceId],
+      );
+      const leaseToken = randomBytes(32).toString("base64url");
+      const leaseTokenHash = createHash("sha256")
+        .update(leaseToken, "utf8")
+        .digest();
+      const claimed = await client.query<
+        WorkerJobRow & { lease_expires_at: Date }
+      >(
+        `WITH candidate AS (
+           SELECT id FROM kith.worker_jobs
+            WHERE space_id=$1 AND attempt_count < max_attempts
+              AND ((state='queued' AND available_at <= clock_timestamp())
+                OR (state='running' AND lease_expires_at <= clock_timestamp()))
+            ORDER BY available_at, created_at, id
+            FOR UPDATE SKIP LOCKED LIMIT 1
+         )
+         UPDATE kith.worker_jobs j
+            SET state='running', attempt_count=j.attempt_count+1, lease_epoch=j.lease_epoch+1,
+                lease_token_hash=$2, leased_by_api_key_id=$3,
+                lease_expires_at=clock_timestamp()+make_interval(secs => $4)
+           FROM candidate c WHERE j.id=c.id AND j.space_id=$1
+         RETURNING j.*, j.lease_expires_at`,
+        [spaceId, leaseTokenHash, apiKeyId, input.leaseSeconds],
+      );
+      if (claimed.rowCount === 0) return null;
+      const row = claimed.rows[0]!;
+      return {
+        ...workerJobFromRow(row),
+        state: "running",
+        leaseToken,
+        leaseExpiresAt: row.lease_expires_at.toISOString(),
+      };
+    }, apiKey);
+  }
+
+  async completeWorkerJob(
+    apiKey: string,
+    input: {
+      jobId: string;
+      leaseEpoch: number;
+      leaseToken: string;
+      outputHash: string;
+    },
+  ): Promise<CompleteWorkerJobResult> {
+    assertExactKeys(
+      input,
+      ["jobId", "leaseEpoch", "leaseToken", "outputHash"],
+      "invalid_completion_shape",
+    );
+    expectUuid(input.jobId, "invalid_job_id");
+    if (
+      !Number.isSafeInteger(input.leaseEpoch) ||
+      input.leaseEpoch < 1 ||
+      input.leaseEpoch > 5
+    )
+      throw new ProofError("invalid_lease_epoch");
+    if (
+      typeof input.leaseToken !== "string" ||
+      !/^[A-Za-z0-9_-]{43}$/.test(input.leaseToken)
+    )
+      throw new ProofError("invalid_lease_token");
+    expectHash(input.outputHash, "invalid_output_hash");
+    const tokenHash = createHash("sha256")
+      .update(input.leaseToken, "utf8")
+      .digest();
+    return this.transaction(async (client, spaceId, apiKeyId) => {
+      const locked = await client.query<{ state: WorkerJobState }>(
+        "SELECT state FROM kith.worker_jobs WHERE id=$1 AND space_id=$2 FOR UPDATE",
+        [input.jobId, spaceId],
+      );
+      if (locked.rowCount !== 1) throw new ProofError("lease_not_owned");
+      const completed = await client.query<
+        WorkerJobRow & { completed_at: Date }
+      >(
+        `UPDATE kith.worker_jobs
+            SET state='succeeded', output_hash=$1, completed_at=clock_timestamp()
+          WHERE id=$2 AND space_id=$3 AND state='running' AND lease_epoch=$4
+            AND lease_token_hash=$5 AND leased_by_api_key_id=$6
+            AND lease_expires_at > clock_timestamp()
+          RETURNING *`,
+        [
+          input.outputHash,
+          input.jobId,
+          spaceId,
+          input.leaseEpoch,
+          tokenHash,
+          apiKeyId,
+        ],
+      );
+      if (completed.rowCount === 1) {
+        const row = completed.rows[0]!;
+        return {
+          ...workerJobFromRow(row),
+          state: "succeeded",
+          outputHash: row.output_hash!,
+          completedAt: row.completed_at!.toISOString(),
+          reused: false,
+        };
+      }
+      const replay = await client.query<WorkerJobRow & { completed_at: Date }>(
+        `SELECT * FROM kith.worker_jobs
+          WHERE id=$1 AND space_id=$2 AND state='succeeded' AND lease_epoch=$3
+            AND lease_token_hash=$4 AND leased_by_api_key_id=$5 AND output_hash=$6`,
+        [
+          input.jobId,
+          spaceId,
+          input.leaseEpoch,
+          tokenHash,
+          apiKeyId,
+          input.outputHash,
+        ],
+      );
+      if (replay.rowCount !== 1) throw new ProofError("lease_not_owned");
+      const row = replay.rows[0]!;
+      return {
+        ...workerJobFromRow(row),
+        state: "succeeded",
+        outputHash: row.output_hash!,
+        completedAt: row.completed_at!.toISOString(),
+        reused: true,
+      };
+    }, apiKey);
+  }
+
+  async getWorkerJob(apiKey: string, jobId: string): Promise<WorkerJob> {
+    expectUuid(jobId, "invalid_job_id");
+    return this.transaction(async (client, spaceId) => {
+      const result = await client.query<WorkerJobRow>(
+        "SELECT * FROM kith.worker_jobs WHERE id=$1 AND space_id=$2",
+        [jobId, spaceId],
+      );
+      if (result.rowCount !== 1) throw new ProofError("job_not_found");
+      return workerJobFromRow(result.rows[0]!);
+    }, apiKey);
+  }
+}
+
+type WorkerJobRow = QueryResultRow & {
+  id: string;
+  work_kind: "synthetic_document_processing";
+  work_key: string;
+  input_hash: string;
+  state: WorkerJobState;
+  attempt_count: number;
+  max_attempts: number;
+  lease_epoch: number;
+  output_hash: string | null;
+  failure_code: "attempts_exhausted" | null;
+};
+
+function workerJobFromRow(row: WorkerJobRow): WorkerJob {
+  return {
+    jobId: row.id,
+    workKind: row.work_kind,
+    workKey: row.work_key,
+    inputHash: row.input_hash,
+    state: row.state,
+    attemptCount: row.attempt_count,
+    maxAttempts: row.max_attempts,
+    leaseEpoch: row.lease_epoch,
+    ...(row.output_hash === null ? {} : { outputHash: row.output_hash }),
+    ...(row.failure_code === null ? {} : { failureCode: row.failure_code }),
+  };
 }
 
 type CitationRow = QueryResultRow & {

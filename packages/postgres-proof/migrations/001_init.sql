@@ -1,5 +1,3 @@
-BEGIN;
-
 CREATE SCHEMA IF NOT EXISTS kith;
 
 CREATE TABLE kith.schema_migrations (
@@ -135,7 +133,3 @@ CREATE TABLE kith.idempotency_receipts (
 
 CREATE INDEX chunks_ready_search_idx ON kith.chunks (space_id, generation_id, ordinal);
 CREATE INDEX financial_ready_idx ON kith.synthetic_financial_attachments (space_id, generation_id, currency);
-
-INSERT INTO kith.schema_migrations(version) VALUES (1);
-
-COMMIT;
