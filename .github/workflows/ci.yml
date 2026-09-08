@@ -55,6 +55,7 @@ jobs:
       - run: pnpm lint
       - run: pnpm check-types
       - run: pnpm test:once | tee /tmp/test-once.log
+        shell: bash
       # The Postgres tests skip when no database is configured, which is what
       # lets a public clone run the suite. In CI a database IS configured, so a
       # skip means the variable never reached the task and the tests silently
