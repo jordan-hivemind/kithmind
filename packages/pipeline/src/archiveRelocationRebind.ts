@@ -316,6 +316,28 @@ function parseJson(text: string): unknown {
   }
 }
 
+/** Verify the exact protected configuration bytes before any relocation side effect. */
+export async function requireArchiveRelocationPreviousConfigFiles(args: {
+  configPath: string;
+  proposedConfigPath: string;
+  previousConfigText: string;
+  proposedConfigText: string;
+}): Promise<void> {
+  const previous = await readProtected(
+    resolve(args.configPath),
+    MAX_CONFIG_BYTES,
+  );
+  const proposed = await readProtected(
+    resolve(args.proposedConfigPath),
+    MAX_CONFIG_BYTES,
+  );
+  if (
+    previous.text !== args.previousConfigText ||
+    proposed.text !== args.proposedConfigText
+  )
+    fail("config_conflict");
+}
+
 function canonicalRelocation(value: ArchiveBoundaryRelocation): string {
   return JSON.stringify(value);
 }

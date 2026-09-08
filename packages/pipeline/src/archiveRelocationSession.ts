@@ -6,9 +6,14 @@ import { basename, dirname, posix, resolve } from "node:path";
 import { openArchiveCatalog, type ArchiveCatalog } from "./archiveCatalog.js";
 import {
   prepareArchiveRelocationRebind,
+  requireArchiveRelocationPreviousConfigFiles,
   resumeArchiveRelocationRebind,
 } from "./archiveRelocationRebind.js";
 import { validateArchiveRelocationConfig } from "./archiveRelocationConfig.js";
+import {
+  parseOwnerArchiveRelocationRecipe,
+  type OwnerArchiveRelocationRecipe,
+} from "./archiveRelocationRecipe.js";
 import type {
   ArchiveRelocationEvidence,
   ArchiveRelocationState,
@@ -552,6 +557,97 @@ export class ArchiveRelocationSession<
       });
     } catch (error) {
       await journal.close();
+      throw error;
+    }
+  }
+
+  /**
+   * Transfer an already-held journal into a recipe-bound session. Ownership is
+   * consumed by this call: a failure closes the journal, and a success makes
+   * the returned session solely responsible for closing it.
+   */
+  static async adoptHeldForRecipe<
+    C extends JsonValue,
+    R extends JsonValue,
+  >(args: {
+    journal: Journal<C, R>;
+    catalog: ArchiveCatalog;
+    recipe: OwnerArchiveRelocationRecipe;
+  }): Promise<ArchiveRelocationSession<C, R>> {
+    try {
+      const recipe = parseOwnerArchiveRelocationRecipe(args.recipe);
+      const previousConfig = JSON.parse(
+        recipe.body.localBindings.previousConfigText,
+      ) as unknown;
+      const proposedConfig = JSON.parse(
+        recipe.body.localBindings.proposedConfigText,
+      ) as unknown;
+      validateArchiveRelocationConfig(previousConfig, proposedConfig);
+      await requireArchiveRelocationPreviousConfigFiles({
+        configPath: recipe.body.localBindings.previousConfigPath,
+        proposedConfigPath: recipe.body.localBindings.proposedConfigPath,
+        previousConfigText: recipe.body.localBindings.previousConfigText,
+        proposedConfigText: recipe.body.localBindings.proposedConfigText,
+      });
+      const previous = record(previousConfig);
+      if (
+        typeof previous.journalDir !== "string" ||
+        args.journal.directory !== resolve(previous.journalDir) ||
+        args.journal.watcherId !==
+          recipe.body.localBindings.previousWatcherId ||
+        args.journal.credentialStatus !== "current"
+      )
+        fail("invalid_input");
+      const status = await args.journal.archiveRelocationRebindStatus({
+        previousConfig,
+        proposedConfig,
+      });
+      if (
+        status.state !== "previous" ||
+        status.stateSha256 !==
+          recipe.body.localBindings.previousJournalStateSha256
+      )
+        fail("invalid_input");
+      const snapshot = await args.catalog.snapshotRemoteBoundaryForRelocation({
+        expectedJournal: args.journal,
+        oldBoundary: recipe.body.processing.oldBoundary,
+        newBoundary: recipe.body.processing.newBoundary,
+      });
+      if (
+        JSON.stringify(snapshot) !==
+        JSON.stringify({
+          authorityDigest: recipe.body.processing.catalogAuthorityDigest,
+          catalogRevision: recipe.body.processing.catalogRevision,
+          oldBoundary: recipe.body.processing.oldBoundary,
+          artifacts: recipe.body.processing.artifacts,
+          artifactBindings: recipe.body.processing.artifactBindings,
+        })
+      )
+        fail("invalid_input");
+      const statePath = resolve(
+        args.journal.directory,
+        `archive-relocation-${recipe.workflowRelocationId}.json`,
+      );
+      const store = await ProtectedArchiveRelocationStore.open({
+        path: statePath,
+        relocationId: recipe.workflowRelocationId,
+        journal: args.journal,
+      });
+      return new ArchiveRelocationSession(args.journal, args.catalog, store, {
+        configPath: resolve(recipe.body.localBindings.previousConfigPath),
+        proposedConfigPath: resolve(
+          recipe.body.localBindings.proposedConfigPath,
+        ),
+        intentPath: resolve(
+          args.journal.directory,
+          "archive-rebind-intent.json",
+        ),
+        workflowRelocationId: recipe.workflowRelocationId,
+        catalogRelocationId: recipe.catalogRelocationId,
+        repositoryRelativePath: recipe.body.processing.repositoryRelativePath,
+      });
+    } catch (error) {
+      await args.journal.close();
       throw error;
     }
   }

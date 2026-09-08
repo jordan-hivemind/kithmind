@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { constants, type Stats } from "node:fs";
 import { access, lstat, link, open, realpath, unlink } from "node:fs/promises";
-import { basename, dirname, isAbsolute, resolve } from "node:path";
+import { basename, dirname, isAbsolute, posix, resolve } from "node:path";
 
 import {
   AGE_VERSION,
@@ -19,6 +19,8 @@ import {
   type DecryptedAgeRecoveryObject,
   type ForgetResticBackupInput,
   type ForgetResticBackupResult,
+  type InventoryResticSnapshotTreeInput,
+  type InventoryResticSnapshotsInput,
   type LocalBackupBoundary,
   type RemoteBackupBoundary,
   type ResticRepositoryLocation,
@@ -36,6 +38,10 @@ import {
   type ResticBackupResult,
   type ResticReadbackResult,
   type ResticRepositoryIdentity,
+  type ResticSnapshotInventory,
+  type ResticSnapshotInventoryRow,
+  type ResticSnapshotTreeEntry,
+  type ResticSnapshotTreeInventory,
   type RemovePublishedAgeObjectInput,
   type RemovePublishedAgeObjectResult,
   type Sha256File,
@@ -48,6 +54,15 @@ const OBJECT_NAME = /^[A-Za-z0-9_-]{1,128}\.age$/;
 const PQ_RECIPIENT = /^age1pq1[023456789acdefghjklmnpqrstuvwxyz]{40,4090}$/;
 const MAX_PASSWORD_COMMAND_ARGS = 16;
 const MAX_PASSWORD_COMMAND_ARG_BYTES = 256;
+const MAX_INVENTORY_SNAPSHOTS = 2_048;
+const MAX_INVENTORY_TREE_NODES = 2_048;
+const MAX_INVENTORY_TAGS = 32;
+const MAX_INVENTORY_PATHS = 32;
+const MAX_INVENTORY_HOSTNAME_BYTES = 255;
+const MAX_INVENTORY_NAME_BYTES = 255;
+const MAX_INVENTORY_TAG_BYTES = 128;
+const MAX_INVENTORY_PATH_BYTES = 4_096;
+const MAX_INVENTORY_OUTPUT_BYTES = 2 * 1024 * 1024;
 const FILE_MODE = 0o600;
 
 type ProcessResult = { stdout: Buffer; stderr: Buffer };
@@ -951,6 +966,175 @@ function parseResticSnapshotRows(stdout: Buffer): ResticSnapshotRow[] {
   });
 }
 
+function boundedInventoryText(
+  value: unknown,
+  maximumBytes: number,
+): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    Buffer.byteLength(value, "utf8") <= maximumBytes &&
+    !/[\x00-\x1f\x7f]/.test(value)
+  );
+}
+
+function boundedInventoryPath(value: unknown): value is string {
+  return (
+    boundedInventoryText(value, MAX_INVENTORY_PATH_BYTES) &&
+    value !== "/" &&
+    !value.includes("\\") &&
+    posix.isAbsolute(value) &&
+    posix.normalize(value) === value &&
+    !value
+      .slice(1)
+      .split("/")
+      .some((part) => !part || part === "." || part === "..")
+  );
+}
+
+function parseResticSnapshotInventory(
+  stdout: Buffer,
+): ResticSnapshotInventoryRow[] {
+  let value: unknown;
+  try {
+    value = JSON.parse(decodeUtf8(stdout));
+  } catch {
+    fail("invalid_tool_result", "restic snapshot inventory is not JSON");
+  }
+  if (!Array.isArray(value) || value.length > MAX_INVENTORY_SNAPSHOTS) {
+    fail("invalid_tool_result", "restic snapshot inventory count is invalid");
+  }
+  const snapshotIds = new Set<string>();
+  const snapshots = value.map((candidate) => {
+    if (
+      !candidate ||
+      typeof candidate !== "object" ||
+      Array.isArray(candidate)
+    ) {
+      fail("invalid_tool_result", "restic snapshot inventory row is invalid");
+    }
+    const row = candidate as Record<string, unknown>;
+    if (
+      typeof row.id !== "string" ||
+      !HEX_64.test(row.id) ||
+      snapshotIds.has(row.id) ||
+      !boundedInventoryText(row.hostname, MAX_INVENTORY_HOSTNAME_BYTES) ||
+      !Array.isArray(row.tags) ||
+      row.tags.length > MAX_INVENTORY_TAGS ||
+      row.tags.some(
+        (tag) => !boundedInventoryText(tag, MAX_INVENTORY_TAG_BYTES),
+      ) ||
+      new Set(row.tags).size !== row.tags.length ||
+      !Array.isArray(row.paths) ||
+      row.paths.length < 1 ||
+      row.paths.length > MAX_INVENTORY_PATHS ||
+      row.paths.some((path) => !boundedInventoryPath(path)) ||
+      new Set(row.paths).size !== row.paths.length
+    ) {
+      fail("invalid_tool_result", "restic snapshot inventory row is invalid");
+    }
+    snapshotIds.add(row.id);
+    return {
+      snapshotId: row.id,
+      hostname: row.hostname,
+      tags: [...row.tags] as string[],
+      paths: [...row.paths] as string[],
+    };
+  });
+  return snapshots.sort((left, right) =>
+    left.snapshotId.localeCompare(right.snapshotId),
+  );
+}
+
+function parseResticSnapshotTree(
+  stdout: Buffer,
+  snapshotId: string,
+  maxCipherBytes: number,
+): { treeId: string; entries: ResticSnapshotTreeEntry[] } {
+  if (stdout.length < 1 || stdout.at(-1) !== 0x0a) {
+    fail("invalid_tool_result", "restic snapshot tree output is truncated");
+  }
+  const lines = decodeUtf8(stdout).split("\n");
+  lines.pop();
+  if (lines.length < 2 || lines.length > MAX_INVENTORY_TREE_NODES + 1) {
+    fail("invalid_tool_result", "restic snapshot tree node count is invalid");
+  }
+  const records = lines.map((line) => {
+    try {
+      return JSON.parse(line) as unknown;
+    } catch {
+      fail("invalid_tool_result", "restic snapshot tree record is not JSON");
+    }
+  });
+  const header = records[0];
+  const headerRow = header as Record<string, unknown> | undefined;
+  if (
+    !headerRow ||
+    typeof headerRow !== "object" ||
+    Array.isArray(header) ||
+    headerRow.struct_type !== "snapshot" ||
+    headerRow.message_type !== "snapshot" ||
+    headerRow.id !== snapshotId ||
+    typeof headerRow.tree !== "string" ||
+    !HEX_64.test(headerRow.tree)
+  ) {
+    fail("invalid_tool_result", "restic snapshot tree header is invalid");
+  }
+  const treeId = headerRow.tree;
+  const paths = new Set<string>();
+  const entries = records.slice(1).map((record): ResticSnapshotTreeEntry => {
+    if (!record || typeof record !== "object" || Array.isArray(record)) {
+      fail("invalid_tool_result", "restic snapshot tree node is invalid");
+    }
+    const node = record as Record<string, unknown>;
+    if (
+      node.struct_type !== "node" ||
+      node.message_type !== "node" ||
+      (node.type !== "dir" && node.type !== "file") ||
+      !boundedInventoryText(node.name, MAX_INVENTORY_NAME_BYTES) ||
+      !boundedInventoryPath(node.path) ||
+      posix.basename(node.path) !== node.name ||
+      paths.has(node.path)
+    ) {
+      fail("invalid_tool_result", "restic snapshot tree node is invalid");
+    }
+    paths.add(node.path);
+    if (node.type === "dir") {
+      return { type: "dir", name: node.name, path: node.path };
+    }
+    if (
+      !Number.isSafeInteger(node.size) ||
+      (node.size as number) < 1 ||
+      (node.size as number) > maxCipherBytes
+    ) {
+      fail("invalid_tool_result", "restic snapshot tree file size is invalid");
+    }
+    return {
+      type: "file",
+      name: node.name,
+      path: node.path,
+      byteLength: node.size as number,
+    };
+  });
+  const files = entries.filter(
+    (entry): entry is Extract<ResticSnapshotTreeEntry, { type: "file" }> =>
+      entry.type === "file",
+  );
+  if (
+    files.length !== 1 ||
+    entries.some(
+      (entry) =>
+        entry.type === "dir" && !files[0]!.path.startsWith(`${entry.path}/`),
+    )
+  ) {
+    fail("invalid_tool_result", "restic snapshot tree contents are invalid");
+  }
+  return {
+    treeId,
+    entries,
+  };
+}
+
 function requireExactResticSnapshot(
   rows: ResticSnapshotRow[],
   expected: {
@@ -1040,6 +1224,31 @@ type ResolvedRepository = {
   remoteBoundary?: Omit<RemoteBackupBoundary, "repositoryId">;
 };
 
+async function readResticRepositoryIdentity(
+  resticBinary: string,
+  repository: ResolvedRepository,
+  password: string,
+  commandLimits: ArchiveCommandLimits,
+): Promise<ResticRepositoryIdentity> {
+  const result = await runBounded(
+    resticBinary,
+    [
+      ...resticBaseArgs(repository.locator, password, repository.options),
+      "cat",
+      "config",
+    ],
+    commandLimits,
+    undefined,
+    repository.environment,
+  );
+  try {
+    return parseResticRepository(result.stdout);
+  } finally {
+    result.stdout.fill(0);
+    result.stderr.fill(0);
+  }
+}
+
 function location(input: ResticRepositoryLocation): ResticRepositoryLocation {
   const local = typeof input.repositoryPath === "string";
   const remote = input.repository !== undefined;
@@ -1088,19 +1297,12 @@ async function probeResticRepositoryInternal(input: ResticRepositoryLocation & {
   await requireResticVersion(input.resticBinary, commandLimits);
   const repository = await resolveRepository(input, commandLimits);
   const password = await passwordCommandArgument(input.passwordCommand);
-  const result = await runBounded(
+  return readResticRepositoryIdentity(
     input.resticBinary,
-    [...resticBaseArgs(repository.locator, password, repository.options), "cat", "config"],
+    repository,
+    password,
     commandLimits,
-    undefined,
-    repository.environment,
   );
-  try {
-    return parseResticRepository(result.stdout);
-  } finally {
-    result.stdout.fill(0);
-    result.stderr.fill(0);
-  }
 }
 
 async function requireResticRepository(
@@ -1135,6 +1337,158 @@ async function probeArchiveToolsInternal(
     requireResticVersion(tools.resticBinary, commandLimits),
   ]);
   return { age: AGE_VERSION, restic: RESTIC_VERSION };
+}
+
+async function verifyInventoryRepository(
+  input: InventoryResticSnapshotsInput,
+  commandLimits: ArchiveCommandLimits,
+): Promise<{
+  repository: ResolvedRepository;
+  password: string;
+  boundary: RemoteBackupBoundary;
+}> {
+  if (!HEX_64.test(input.expectedRepositoryId)) {
+    fail("invalid_input", "expected restic repository identity is invalid");
+  }
+  await validateExecutable(input.resticBinary, "restic binary");
+  await requireResticVersion(input.resticBinary, commandLimits);
+  const repository = await resolveRepository(
+    { repository: input.repository },
+    commandLimits,
+  );
+  if (!repository.remoteBoundary) {
+    fail("invalid_input", "remote restic repository is required");
+  }
+  const password = await passwordCommandArgument(input.passwordCommand);
+  const identity = await readResticRepositoryIdentity(
+    input.resticBinary,
+    repository,
+    password,
+    commandLimits,
+  );
+  if (identity.repositoryId !== input.expectedRepositoryId) {
+    fail("digest_mismatch", "restic repository identity changed");
+  }
+  return {
+    repository,
+    password,
+    boundary: {
+      ...repository.remoteBoundary,
+      repositoryId: identity.repositoryId,
+    },
+  };
+}
+
+function requireSameRemoteBoundary(
+  before: RemoteBackupBoundary,
+  after: RemoteBackupBoundary,
+): void {
+  if (
+    before.mode !== after.mode ||
+    before.readiness !== after.readiness ||
+    before.backend !== after.backend ||
+    before.remoteName !== after.remoteName ||
+    before.rootPath !== after.rootPath ||
+    before.rootDirectoryIdHash !== after.rootDirectoryIdHash ||
+    before.configIdentityFingerprint !== after.configIdentityFingerprint ||
+    before.repositoryId !== after.repositoryId ||
+    before.resticVersion !== after.resticVersion ||
+    before.rcloneVersion !== after.rcloneVersion
+  ) {
+    fail("digest_mismatch", "remote backup boundary changed during inventory");
+  }
+}
+
+async function inventoryResticSnapshotsInternal(
+  input: InventoryResticSnapshotsInput,
+): Promise<ResticSnapshotInventory> {
+  const commandLimits = limits(input.limits ?? DEFAULT_ARCHIVE_COMMAND_LIMITS);
+  if (commandLimits.maxOutputBytes > MAX_INVENTORY_OUTPUT_BYTES) {
+    fail("invalid_input", "restic snapshot inventory output limit is invalid");
+  }
+  const before = await verifyInventoryRepository(input, commandLimits);
+  const result = await runBounded(
+    input.resticBinary,
+    [
+      ...resticBaseArgs(
+        before.repository.locator,
+        before.password,
+        before.repository.options,
+      ),
+      "snapshots",
+      "--json",
+    ],
+    commandLimits,
+    undefined,
+    before.repository.environment,
+  );
+  let snapshots: ResticSnapshotInventoryRow[];
+  try {
+    snapshots = parseResticSnapshotInventory(result.stdout);
+  } finally {
+    result.stdout.fill(0);
+    result.stderr.fill(0);
+  }
+  const after = await verifyInventoryRepository(input, commandLimits);
+  requireSameRemoteBoundary(before.boundary, after.boundary);
+  return {
+    repositoryId: input.expectedRepositoryId,
+    resticVersion: RESTIC_VERSION,
+    boundary: after.boundary,
+    snapshots,
+    verification: "unfiltered_snapshot_inventory",
+  };
+}
+
+async function inventoryResticSnapshotTreeInternal(
+  input: InventoryResticSnapshotTreeInput,
+): Promise<ResticSnapshotTreeInventory> {
+  const commandLimits = limits(input.limits ?? DEFAULT_ARCHIVE_COMMAND_LIMITS);
+  if (commandLimits.maxOutputBytes > MAX_INVENTORY_OUTPUT_BYTES) {
+    fail("invalid_input", "restic snapshot tree output limit is invalid");
+  }
+  if (!HEX_64.test(input.snapshotId)) {
+    fail("invalid_input", "restic snapshot identity is invalid");
+  }
+  const before = await verifyInventoryRepository(input, commandLimits);
+  const result = await runBounded(
+    input.resticBinary,
+    [
+      ...resticBaseArgs(
+        before.repository.locator,
+        before.password,
+        before.repository.options,
+      ),
+      "ls",
+      "--json",
+      input.snapshotId,
+    ],
+    commandLimits,
+    undefined,
+    before.repository.environment,
+  );
+  let tree: ReturnType<typeof parseResticSnapshotTree>;
+  try {
+    tree = parseResticSnapshotTree(
+      result.stdout,
+      input.snapshotId,
+      commandLimits.maxCipherBytes,
+    );
+  } finally {
+    result.stdout.fill(0);
+    result.stderr.fill(0);
+  }
+  const after = await verifyInventoryRepository(input, commandLimits);
+  requireSameRemoteBoundary(before.boundary, after.boundary);
+  return {
+    repositoryId: input.expectedRepositoryId,
+    resticVersion: RESTIC_VERSION,
+    boundary: after.boundary,
+    snapshotId: input.snapshotId,
+    treeId: tree.treeId,
+    entries: tree.entries,
+    verification: "exact_snapshot_tree_inventory",
+  };
 }
 
 async function decryptAgeRecoveryInternal(
@@ -2251,6 +2605,20 @@ export async function probeResticRepository(input: ResticRepositoryLocation & {
   limits?: ArchiveCommandLimits;
 }): Promise<ResticRepositoryIdentity> {
   return publicOperation(() => probeResticRepositoryInternal(input));
+}
+
+/** Read-only inventory of every snapshot in one verified remote repository. */
+export async function inventoryResticSnapshots(
+  input: InventoryResticSnapshotsInput,
+): Promise<ResticSnapshotInventory> {
+  return publicOperation(() => inventoryResticSnapshotsInternal(input));
+}
+
+/** Read-only inventory of one exact snapshot's files and ancestor directories. */
+export async function inventoryResticSnapshotTree(
+  input: InventoryResticSnapshotTreeInput,
+): Promise<ResticSnapshotTreeInventory> {
+  return publicOperation(() => inventoryResticSnapshotTreeInternal(input));
 }
 
 /** Explicit owner recovery only; the ingestion worker never receives this key. */

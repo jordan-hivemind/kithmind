@@ -26,6 +26,8 @@ import {
   backupResticObject,
   encryptAgeObject,
   forgetResticBackupExact,
+  inventoryResticSnapshotTree,
+  inventoryResticSnapshots,
   probeArchiveTools,
   probeResticRepository,
   publishAgeObject,
@@ -110,8 +112,9 @@ if (${JSON.stringify(mode)} === "flood") {
 
 function resticProgram(mode = "normal", remoteRepository = "") {
   return `
-import { chmodSync, copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+appendFileSync(join(${JSON.stringify(remoteRepository)}, "restic-invocations.jsonl"), JSON.stringify(process.argv.slice(2)) + "\\n", { mode: 0o600 });
 if (process.argv[2] === "version") {
   process.stdout.write(${JSON.stringify(mode === "wrong-version" ? "restic 0.18.0 compiled with go1.25.1 on darwin/arm64\n" : "restic 0.19.1 compiled with go1.25.1 on darwin/arm64\n")});
   process.exit(0);
@@ -120,7 +123,7 @@ const args = process.argv.slice(2);
 const repoArg = args[args.indexOf("--repo") + 1];
 const repo = repoArg.startsWith("rclone:") ? ${JSON.stringify(remoteRepository)} : repoArg;
 const passwordCommand = args[args.indexOf("--password-command") + 1];
-const command = args.find((value) => ["backup", "dump", "snapshots", "forget", "prune"].includes(value));
+const command = args.find((value) => ["backup", "dump", "snapshots", "ls", "forget", "prune"].includes(value));
 const statePath = join(repo, "snapshots.json");
 const defaultRows = [{
   id: ${JSON.stringify(SNAPSHOT)},
@@ -138,7 +141,11 @@ const loadRows = () => {
 };
 const saveRows = (rows) => writeFileSync(statePath, JSON.stringify(rows), { mode: 0o600 });
 if (args.includes("cat") && args.includes("config")) {
-  process.stdout.write(JSON.stringify({ version: 2, id: ${JSON.stringify(REPOSITORY)} }));
+  const inventoryComplete = existsSync(join(repo, "inventory-enumerated"));
+  const id = ${JSON.stringify(mode)} === "repository-change-after-inventory" && inventoryComplete
+    ? "c".repeat(64)
+    : ${JSON.stringify(REPOSITORY)};
+  process.stdout.write(JSON.stringify(${JSON.stringify(mode)} === "missing-repository-id" ? { version: 2 } : { version: 2, id }));
   process.exit(0);
 }
 if (command === "backup") {
@@ -176,6 +183,11 @@ if (command === "dump") {
   process.stdout.write(${JSON.stringify(mode)} === "bad-readback" ? Buffer.concat([bytes, Buffer.from("x")]) : bytes);
   process.exit(0);
 }
+if (command === "ls") {
+  writeFileSync(join(repo, "inventory-enumerated"), "complete", { mode: 0o600 });
+  process.stdout.write(readFileSync(join(repo, "tree.jsonl")));
+  process.exit(0);
+}
 if (command === "snapshots") {
   let rows = loadRows();
   const hostIndex = args.indexOf("--host");
@@ -184,6 +196,9 @@ if (command === "snapshots") {
   if (tagIndex >= 0) rows = rows.filter((row) => row.tags.includes(args[tagIndex + 1]));
   const selector = args.find((value) => /^[a-f0-9]{64}$/.test(value));
   if (selector) rows = rows.filter((row) => row.id === selector);
+  if (hostIndex < 0 && tagIndex < 0 && !selector) {
+    writeFileSync(join(repo, "inventory-enumerated"), "complete", { mode: 0o600 });
+  }
   process.stdout.write(JSON.stringify(rows));
   process.exit(0);
 }
@@ -229,6 +244,8 @@ async function setup(options = {}) {
   const rcloneBinary = await executable(
     join(tools, "rclone"),
     `
+import { appendFileSync } from "node:fs";
+appendFileSync(${JSON.stringify(join(base, "rclone-invocations.jsonl"))}, JSON.stringify(process.argv.slice(2)) + "\\n", { mode: 0o600 });
 if (process.argv[2] === "version") {
   process.stdout.write("rclone v1.74.4\\n");
   process.exit(0);
@@ -266,6 +283,52 @@ process.exit(2);
       publicArgs: ["service with space", "owner's selector"],
     },
   };
+}
+
+function remoteRepository(fixture) {
+  return {
+    kind: "rclone_dropbox_v1",
+    remoteName: "kithmind_dropbox",
+    rootPath: "Kith Mind Backups/Processing",
+    rcloneBinary: fixture.rcloneBinary,
+    configPath: fixture.rcloneConfig,
+    configIdentityFingerprint: configIdentity(
+      fixture.rcloneConfig,
+      "kithmind_dropbox",
+    ),
+    expectedRootDirectoryIdHash: fixture.directoryIdHash,
+  };
+}
+
+function inventoryInput(fixture, overrides = {}) {
+  return {
+    resticBinary: fixture.resticBinary,
+    repository: remoteRepository(fixture),
+    expectedRepositoryId: REPOSITORY,
+    passwordCommand: fixture.passwordCommand,
+    limits: limits({ maxOutputBytes: 2 * 1024 * 1024 }),
+    ...overrides,
+  };
+}
+
+function treeInventoryInput(fixture, snapshotId = SNAPSHOT, overrides = {}) {
+  return {
+    ...inventoryInput(fixture),
+    snapshotId,
+    ...overrides,
+  };
+}
+
+function treeNdjson(records, trailingNewline = true) {
+  return `${records.map((record) => JSON.stringify(record)).join("\n")}${trailingNewline ? "\n" : ""}`;
+}
+
+async function readInvocationLog(path) {
+  return (await readFile(path, "utf8"))
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
 }
 
 async function preparedFixture(
@@ -314,6 +377,425 @@ test("probes only the pinned age and restic versions with total limits", async (
     (error) =>
       error instanceof ArchiveCommandError &&
       error.code === "tool_version_mismatch",
+  );
+});
+
+test("inventories every remote snapshot without filters and rechecks all identities", async () => {
+  const fixture = await setup({ protectedRoot: true });
+  const firstSnapshot = "1".repeat(64);
+  const secondSnapshot = "2".repeat(64);
+  const firstPath =
+    "/Users/Synthetic Owner/Dropbox/Legacy Backups/Database/native snapshot.zip.age";
+  const secondPath =
+    "/Users/Synthetic Owner/Dropbox/Legacy Backups/Finance/archive object.age";
+  await writeFile(
+    join(fixture.repository, "snapshots.json"),
+    JSON.stringify([
+      {
+        id: secondSnapshot,
+        hostname: "legacy-finance-host",
+        tags: [],
+        paths: [secondPath],
+      },
+      {
+        id: firstSnapshot,
+        hostname: "legacy-database-host",
+        tags: ["database backup", "pre-relocation"],
+        paths: [firstPath],
+      },
+    ]),
+    { mode: 0o600 },
+  );
+
+  assert.deepEqual(await inventoryResticSnapshots(inventoryInput(fixture)), {
+    repositoryId: REPOSITORY,
+    resticVersion: "0.19.1",
+    boundary: {
+      mode: "independent_backup",
+      readiness: "remote_repository_verified",
+      backend: "rclone_dropbox_v1",
+      remoteName: "kithmind_dropbox",
+      rootPath: "Kith Mind Backups/Processing",
+      rootDirectoryIdHash: fixture.directoryIdHash,
+      configIdentityFingerprint: configIdentity(
+        fixture.rcloneConfig,
+        "kithmind_dropbox",
+      ),
+      repositoryId: REPOSITORY,
+      resticVersion: "0.19.1",
+      rcloneVersion: "v1.74.4",
+    },
+    snapshots: [
+      {
+        snapshotId: firstSnapshot,
+        hostname: "legacy-database-host",
+        tags: ["database backup", "pre-relocation"],
+        paths: [firstPath],
+      },
+      {
+        snapshotId: secondSnapshot,
+        hostname: "legacy-finance-host",
+        tags: [],
+        paths: [secondPath],
+      },
+    ],
+    verification: "unfiltered_snapshot_inventory",
+  });
+
+  const resticCalls = await readInvocationLog(
+    join(fixture.repository, "restic-invocations.jsonl"),
+  );
+  const snapshotCalls = resticCalls.filter((args) =>
+    args.includes("snapshots"),
+  );
+  assert.equal(snapshotCalls.length, 1);
+  assert.deepEqual(snapshotCalls[0].slice(-2), ["snapshots", "--json"]);
+  assert.equal(
+    snapshotCalls[0].filter((arg) => arg === "--no-cache").length,
+    1,
+  );
+  assert.equal(snapshotCalls[0].includes("--host"), false);
+  assert.equal(snapshotCalls[0].includes("--tag"), false);
+  assert.equal(
+    snapshotCalls[0].some((arg) => /^[a-f0-9]{64}$/.test(arg)),
+    false,
+  );
+  assert.equal(
+    resticCalls.filter((args) => args.length === 1 && args[0] === "version")
+      .length,
+    2,
+  );
+  assert.equal(
+    resticCalls.filter(
+      (args) => args.includes("cat") && args.includes("config"),
+    ).length,
+    2,
+  );
+  const rcloneCalls = await readInvocationLog(
+    join(fixture.base, "rclone-invocations.jsonl"),
+  );
+  assert.equal(rcloneCalls.filter((args) => args[0] === "version").length, 2);
+  assert.equal(rcloneCalls.filter((args) => args[0] === "lsjson").length, 2);
+});
+
+test("snapshot inventory rejects duplicate and malformed identity fields", async () => {
+  const fixture = await setup({ protectedRoot: true });
+  const valid = {
+    id: "3".repeat(64),
+    hostname: "synthetic-host",
+    tags: ["synthetic-tag"],
+    paths: ["/Users/Synthetic Owner/Legacy Backups/object.age"],
+  };
+  const invalidRows = [
+    [valid, { ...valid }],
+    [{ ...valid, id: "short" }],
+    [{ ...valid, tags: ["duplicate", "duplicate"] }],
+    [{ ...valid, paths: [valid.paths[0], valid.paths[0]] }],
+    [{ ...valid, paths: ["/Users/Synthetic Owner/Legacy/../object.age"] }],
+    [{ ...valid, paths: ["/"] }],
+    [{ ...valid, paths: ["/Users/Synthetic Owner/Legacy\\object.age"] }],
+    [{ ...valid, paths: ["relative legacy path/object.age"] }],
+    [{ ...valid, hostname: "bad\nhost" }],
+  ];
+  for (const rows of invalidRows) {
+    await writeFile(
+      join(fixture.repository, "snapshots.json"),
+      JSON.stringify(rows),
+      { mode: 0o600 },
+    );
+    await assert.rejects(
+      () => inventoryResticSnapshots(inventoryInput(fixture)),
+      (error) =>
+        error instanceof ArchiveCommandError &&
+        error.code === "invalid_tool_result",
+    );
+  }
+});
+
+test("snapshot inventory rejects more than 2048 rows within the output byte bound", async () => {
+  const fixture = await setup({ protectedRoot: true });
+  const rows = Array.from({ length: 2_049 }, (_, index) => ({
+    id: index.toString(16).padStart(64, "0"),
+    hostname: "synthetic-host",
+    tags: [],
+    paths: [`/Users/Synthetic Owner/Legacy Backups/object ${index}.age`],
+  }));
+  await writeFile(
+    join(fixture.repository, "snapshots.json"),
+    JSON.stringify(rows),
+    { mode: 0o600 },
+  );
+  await assert.rejects(
+    () => inventoryResticSnapshots(inventoryInput(fixture)),
+    (error) =>
+      error instanceof ArchiveCommandError &&
+      error.code === "invalid_tool_result",
+  );
+});
+
+test("snapshot inventory enforces the caller's stdout byte bound", async () => {
+  const fixture = await setup({ protectedRoot: true });
+  const rows = Array.from({ length: 16 }, (_, index) => ({
+    id: (index + 1).toString(16).padStart(64, "0"),
+    hostname: "synthetic-host",
+    tags: [],
+    paths: [`/Users/Synthetic Owner/Legacy Backups/object ${index}.age`],
+  }));
+  await writeFile(
+    join(fixture.repository, "snapshots.json"),
+    JSON.stringify(rows),
+    { mode: 0o600 },
+  );
+  await assert.rejects(
+    () =>
+      inventoryResticSnapshots(
+        inventoryInput(fixture, {
+          limits: limits({ maxOutputBytes: 512 }),
+        }),
+      ),
+    (error) =>
+      error instanceof ArchiveCommandError &&
+      error.code === "output_limit_exceeded",
+  );
+  await assert.rejects(
+    () =>
+      inventoryResticSnapshots(
+        inventoryInput(fixture, {
+          limits: limits({ maxOutputBytes: 2 * 1024 * 1024 + 1 }),
+        }),
+      ),
+    (error) =>
+      error instanceof ArchiveCommandError && error.code === "invalid_input",
+  );
+});
+
+test("snapshot inventory rejects missing and post-enumeration repository identities", async () => {
+  for (const [mode, code] of [
+    ["missing-repository-id", "invalid_tool_result"],
+    ["repository-change-after-inventory", "digest_mismatch"],
+  ]) {
+    const fixture = await setup({ protectedRoot: true, resticMode: mode });
+    await assert.rejects(
+      () => inventoryResticSnapshots(inventoryInput(fixture)),
+      (error) => error instanceof ArchiveCommandError && error.code === code,
+    );
+    if (mode === "repository-change-after-inventory") {
+      assert.equal(
+        await readFile(
+          join(fixture.repository, "inventory-enumerated"),
+          "utf8",
+        ),
+        "complete",
+      );
+    }
+  }
+});
+
+test("inventories pinned restic relative and absolute snapshot tree shapes", async () => {
+  const fixture = await setup({ protectedRoot: true });
+  const relativeTree = "4".repeat(64);
+  const absoluteTree = "5".repeat(64);
+  const relativeEntries = [
+    {
+      struct_type: "node",
+      message_type: "node",
+      type: "file",
+      name: "processing-object.age",
+      path: "/processing-object.age",
+      size: 17,
+    },
+  ];
+  await writeFile(
+    join(fixture.repository, "tree.jsonl"),
+    treeNdjson([
+      {
+        struct_type: "snapshot",
+        message_type: "snapshot",
+        id: SNAPSHOT,
+        tree: relativeTree,
+      },
+      ...relativeEntries,
+    ]),
+    { mode: 0o600 },
+  );
+  const relative = await inventoryResticSnapshotTree(
+    treeInventoryInput(fixture),
+  );
+  assert.deepEqual(relative.entries, [
+    {
+      type: "file",
+      name: "processing-object.age",
+      path: "/processing-object.age",
+      byteLength: 17,
+    },
+  ]);
+  assert.equal(relative.snapshotId, SNAPSHOT);
+  assert.equal(relative.treeId, relativeTree);
+  assert.equal(relative.boundary.repositoryId, REPOSITORY);
+  assert.equal(relative.verification, "exact_snapshot_tree_inventory");
+
+  const absoluteFile =
+    "/Users/Synthetic Owner/Legacy Database Receipts/native-snapshot.zip.age";
+  await writeFile(
+    join(fixture.repository, "tree.jsonl"),
+    treeNdjson([
+      {
+        struct_type: "snapshot",
+        message_type: "snapshot",
+        id: SNAPSHOT,
+        tree: absoluteTree,
+      },
+      {
+        struct_type: "node",
+        message_type: "node",
+        type: "dir",
+        name: "Users",
+        path: "/Users",
+      },
+      {
+        struct_type: "node",
+        message_type: "node",
+        type: "dir",
+        name: "Synthetic Owner",
+        path: "/Users/Synthetic Owner",
+      },
+      {
+        struct_type: "node",
+        message_type: "node",
+        type: "dir",
+        name: "Legacy Database Receipts",
+        path: "/Users/Synthetic Owner/Legacy Database Receipts",
+      },
+      {
+        struct_type: "node",
+        message_type: "node",
+        type: "file",
+        name: "native-snapshot.zip.age",
+        path: absoluteFile,
+        size: 23,
+      },
+    ]),
+    { mode: 0o600 },
+  );
+  const absolute = await inventoryResticSnapshotTree(
+    treeInventoryInput(fixture),
+  );
+  assert.equal(absolute.treeId, absoluteTree);
+  assert.deepEqual(absolute.entries.at(-1), {
+    type: "file",
+    name: "native-snapshot.zip.age",
+    path: absoluteFile,
+    byteLength: 23,
+  });
+  assert.equal(
+    absolute.entries.filter((entry) => entry.type === "dir").length,
+    3,
+  );
+
+  const resticCalls = await readInvocationLog(
+    join(fixture.repository, "restic-invocations.jsonl"),
+  );
+  const treeCalls = resticCalls.filter((args) => args.includes("ls"));
+  assert.equal(treeCalls.length, 2);
+  for (const args of treeCalls) {
+    assert.deepEqual(args.slice(-3), ["ls", "--json", SNAPSHOT]);
+    assert.equal(args.includes("--host"), false);
+    assert.equal(args.includes("--tag"), false);
+    assert.equal(args.filter((arg) => arg === "--no-cache").length, 1);
+  }
+});
+
+test("snapshot tree inventory rejects an oversized output limit before spawning tools", async () => {
+  const fixture = await setup({ protectedRoot: true });
+  await assert.rejects(
+    () =>
+      inventoryResticSnapshotTree(
+        treeInventoryInput(fixture, SNAPSHOT, {
+          limits: limits({ maxOutputBytes: 2 * 1024 * 1024 + 1 }),
+        }),
+      ),
+    (error) =>
+      error instanceof ArchiveCommandError && error.code === "invalid_input",
+  );
+  await assert.rejects(
+    () =>
+      readFile(join(fixture.repository, "restic-invocations.jsonl"), "utf8"),
+    (error) => error?.code === "ENOENT",
+  );
+});
+
+test("snapshot tree inventory rejects malformed, unsafe, and over-capacity records", async () => {
+  const fixture = await setup({ protectedRoot: true });
+  const tree = "6".repeat(64);
+  const header = {
+    struct_type: "snapshot",
+    message_type: "snapshot",
+    id: SNAPSHOT,
+    tree,
+  };
+  const file = {
+    struct_type: "node",
+    message_type: "node",
+    type: "file",
+    name: "object.age",
+    path: "/object.age",
+    size: 17,
+  };
+  const invalidTrees = [
+    { records: [{ ...header, id: "c".repeat(64) }, file] },
+    { records: [header, header, file] },
+    { records: [{ ...header, tree: "short" }, file] },
+    { records: [header, { ...file, type: "symlink" }] },
+    { records: [header, { ...file, type: "fifo" }] },
+    { records: [header, { ...file, message_type: "unknown" }] },
+    { records: [header, { ...file, name: "different.age" }] },
+    { records: [header, file, { ...file }] },
+    {
+      records: [
+        header,
+        {
+          struct_type: "node",
+          message_type: "node",
+          type: "dir",
+          name: "unrelated",
+          path: "/unrelated",
+        },
+        file,
+      ],
+    },
+    { records: [header, { ...file, size: limits().maxCipherBytes + 1 }] },
+    { records: [header, file], trailingNewline: false },
+    {
+      records: [
+        header,
+        ...Array.from({ length: 2_048 }, (_, index) => ({
+          struct_type: "node",
+          message_type: "node",
+          type: "dir",
+          name: `d${index}`,
+          path: `/d${index}`,
+        })),
+        file,
+      ],
+    },
+  ];
+  for (const invalid of invalidTrees) {
+    await writeFile(
+      join(fixture.repository, "tree.jsonl"),
+      treeNdjson(invalid.records, invalid.trailingNewline),
+      { mode: 0o600 },
+    );
+    await assert.rejects(
+      () => inventoryResticSnapshotTree(treeInventoryInput(fixture)),
+      (error) =>
+        error instanceof ArchiveCommandError &&
+        error.code === "invalid_tool_result",
+    );
+  }
+  await assert.rejects(
+    () => inventoryResticSnapshotTree(treeInventoryInput(fixture, "short")),
+    (error) =>
+      error instanceof ArchiveCommandError && error.code === "invalid_input",
   );
 });
 
