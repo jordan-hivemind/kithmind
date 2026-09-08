@@ -113,10 +113,16 @@ function rejects(bytes, code = "invalid_payload", overrides = {}) {
 
 test("decodes the closed two-member native database payload in memory", () => {
   const bytes = payload();
+  const originalPayload = Buffer.from(bytes);
   const result = decode(bytes);
   assert.deepEqual(result.nativeZip, nativeZip);
-  assert.notEqual(result.nativeZip.buffer, bytes.buffer);
   assert.deepEqual(result.manifest, manifest());
+  result.nativeZip[0] ^= 0xff;
+  assert.deepEqual(
+    bytes,
+    originalPayload,
+    "mutating the decoded ZIP must not mutate its source payload",
+  );
 });
 
 test("rejects unsafe tar members, headers, padding, and truncation", () => {
