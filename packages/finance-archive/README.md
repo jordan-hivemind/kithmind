@@ -92,6 +92,52 @@ descriptions is collapsed, since PDF extraction varies the gaps between runs. A
 provider transaction ID is preferred where one exists and is stable; the hash is
 the fallback. `transactions.row_hash` is `UNIQUE`.
 
+## Institution adapter interface
+
+`InstitutionAdapter` (`src/adapter.ts`) is the published contract for one
+institution: `discover`, `acquire`, `parse`, `capabilities`. It is the only
+part of this package a third party is expected to write, and the only part
+meant to be read without also reading the store. An adapter imports no
+schema, opens no database file, and returns data for an importer to write.
+
+No adapter handles a credential. A person authenticates a browser session out
+of band; `AdapterSession` hands the adapter two functions to read through that
+session (`fetchText`, `fetchBytes`) and nothing else, so there is no field to
+put a cookie, header or token in even by accident.
+
+`discover` never lets a caller mistake a partial result for a complete one.
+Its document inventory is a `Listing<T>`, built only through
+`exhaustiveListing` (which throws unless the items actually reconcile against
+the provider's stated total) or `incompleteListing` (which carries why it
+stopped, and a `providerTotal` of `null` when the provider states no total at
+all, distinct from a stated total of `0`).
+
+`acquire` returns the raw bytes it captured, unedited, plus a manifest entry:
+period, capture time, a sha256 content hash (`sha256Hex`), the row count the
+provider claimed for the pull when it claims one, and any gaps the pull
+could not close. Writing those bytes to the raw tree is the importer's job,
+not the adapter's; the raw tree stays immutable either way.
+
+`parse` returns `ParsedRow[]`: quantity, price and amount are canonical
+decimal text or `null`, never a `number`, and an amount that could not be
+read is `null` with a required `amountNote` rather than a guess. Every row
+carries a `locators` map keyed by field name, so a row and, where it matters,
+one ambiguous field on that row can each be traced back to a page, line or
+API row in the source.
+
+`capabilities` declares which of the four sources
+(`structured_api`, `tabular_export`, `pdf_statement`, `trade_confirmation`)
+an adapter actually implements, its retention window, and free-text quirks.
+An adapter declaring a subset honestly is the expected case, not an
+incomplete one.
+
+`src/adapters/syntheticTrust/` is the reference implementation: a wholly
+invented institution ("Thistlebrook Trust") implementing all four sources
+against fixtures generated in `fixtures.ts`, including a paginated activity
+feed with a deliberate page-boundary overlap and one deliberately
+unparseable statement amount. `test/syntheticAdapter.test.mjs` is what a new
+adapter's own suite should look like.
+
 ## Schema and migrations
 
 `openArchive(path)` opens the file, sets `foreign_keys`, WAL and a busy timeout,
