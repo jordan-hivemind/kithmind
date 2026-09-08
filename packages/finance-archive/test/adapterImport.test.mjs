@@ -11,6 +11,7 @@ import {
   openArchive,
   persistAcquiredDocument,
   resolveInstrumentId,
+  resolveRawTreeRoot,
   retainPayload,
   syntheticAdapter,
 } from "../dist/index.js";
@@ -40,6 +41,10 @@ const INSTITUTION = {
 };
 const ACCOUNT = { id: "acct_synthetic", last4: "0142", currency: "USD" };
 
+// Synthetic space id (F1-28): not a real space, just what exercises the
+// shared-root prefix this suite writes and reads through.
+const SPACE_ID = "space_synthetic_test";
+
 function sqliteArchive(t) {
   const directory = mkdtempSync(join(tmpdir(), "kith-finance-adapter-import-"));
   const db = openArchive(join(directory, "archive.db"));
@@ -50,14 +55,19 @@ function sqliteArchive(t) {
   return db;
 }
 
-/** A throwaway raw-tree root, removed when the test ends. AdapterPull.persisted
- * can only be produced by actually persisting bytes through it (F1-18). */
+/** A throwaway raw-tree root, removed when the test ends -- the fully
+ * resolved `archive/v1/<spaceId>/` root, matching what production code gets
+ * back from `resolveRawTreeRoot`. AdapterPull.persisted can only be produced
+ * by actually persisting bytes through it (F1-18). */
 function rawRoot(t) {
   const directory = mkdtempSync(
     join(tmpdir(), "kith-finance-adapter-import-raw-"),
   );
   t.after(() => rmSync(directory, { recursive: true, force: true }));
-  return directory;
+  return resolveRawTreeRoot({
+    FINANCE_ARCHIVE_RAW_TREE_ROOT: directory,
+    FINANCE_ARCHIVE_SPACE_ID: SPACE_ID,
+  });
 }
 
 function seedSqlite(db) {

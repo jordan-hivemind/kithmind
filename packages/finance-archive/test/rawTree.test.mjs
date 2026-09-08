@@ -20,11 +20,13 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
+  ARCHIVE_LAYOUT_VERSION,
   openArchive,
   persistAcquiredDocument,
   readAndVerify,
   readCaptureManifest,
   recordRetainedTextPath,
+  resolveArchiveSpaceId,
   resolveRawTreeRoot,
   retainPayload,
   sha256HexOf,
@@ -40,11 +42,21 @@ const INSTITUTION = {
 };
 const ACCOUNT = { id: "acct_synthetic_r1", last4: "0511", currency: "USD" };
 
-/** A throwaway raw-tree root, removed when the test ends. */
+// Synthetic space id (F1-28): not a real space, just what exercises the
+// shared-root prefix this suite writes and reads through everywhere below.
+const SPACE_ID = "space_synthetic_test";
+
+/** A throwaway raw-tree root, removed when the test ends -- the fully
+ * resolved `archive/v1/<spaceId>/` root, the same value production code
+ * gets back from `resolveRawTreeRoot`, so every test in this file exercises
+ * the shared-root prefix rather than a bare directory. */
 function rawTreeRoot(t) {
   const directory = mkdtempSync(join(tmpdir(), "kith-finance-raw-tree-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
-  return directory;
+  return resolveRawTreeRoot({
+    FINANCE_ARCHIVE_RAW_TREE_ROOT: directory,
+    FINANCE_ARCHIVE_SPACE_ID: SPACE_ID,
+  });
 }
 
 /** A throwaway archive with one institution and one account seeded --
@@ -111,14 +123,33 @@ function acquiredFixture(bytes, overrides = {}) {
   };
 }
 
-test("resolveRawTreeRoot is a hard error naming what is missing when unset, and returns the value when set", () => {
+test("resolveArchiveSpaceId is a hard error naming what is missing when unset, and returns the value when set", () => {
+  assert.throws(
+    () => resolveArchiveSpaceId({}),
+    /FINANCE_ARCHIVE_SPACE_ID is not set/,
+  );
+  assert.equal(
+    resolveArchiveSpaceId({ FINANCE_ARCHIVE_SPACE_ID: "space_synthetic" }),
+    "space_synthetic",
+  );
+});
+
+test("resolveRawTreeRoot is a hard error naming what is missing when either the root or the space id is unset, and otherwise composes the configured root with the archive/v1 prefix and the space id (F1-28)", () => {
   assert.throws(
     () => resolveRawTreeRoot({}),
     /FINANCE_ARCHIVE_RAW_TREE_ROOT is not set/,
   );
+  assert.throws(
+    () => resolveRawTreeRoot({ FINANCE_ARCHIVE_RAW_TREE_ROOT: "/synthetic/raw-tree" }),
+    /FINANCE_ARCHIVE_SPACE_ID is not set/,
+    "a configured root does not paper over a missing space id -- no guessed value",
+  );
   assert.equal(
-    resolveRawTreeRoot({ FINANCE_ARCHIVE_RAW_TREE_ROOT: "/synthetic/raw-tree" }),
-    "/synthetic/raw-tree",
+    resolveRawTreeRoot({
+      FINANCE_ARCHIVE_RAW_TREE_ROOT: "/synthetic/raw-tree",
+      FINANCE_ARCHIVE_SPACE_ID: "space_synthetic",
+    }),
+    join("/synthetic/raw-tree", "archive", ARCHIVE_LAYOUT_VERSION, "space_synthetic"),
   );
 });
 
@@ -310,8 +341,12 @@ test("persistAcquiredDocument requires the institution and account to already be
   );
 });
 
-test("given only the raw tree, with no archive database, every document and every capture can be identified well enough to re-import (F1-24)", (t) => {
+test("given only the raw tree, with no archive database, every document and every capture can be identified well enough to re-import (F1-24), and this still holds under the shared archive/v1/<spaceId> prefix (F1-28)", (t) => {
   const root = rawTreeRoot(t);
+  assert.ok(
+    root.endsWith(join("archive", ARCHIVE_LAYOUT_VERSION, SPACE_ID)),
+    "the root this test writes and reads through is the shared-root-prefixed one, not a bare directory",
+  );
   const db = archiveWithSeed(t);
 
   const statementBytes = new TextEncoder().encode("synthetic PDF statement bytes");
@@ -329,6 +364,14 @@ test("given only the raw tree, with no archive database, every document and ever
     acquired: statement,
     originalExtension: ".pdf",
   });
+  assert.ok(
+    persistedStatement.filePath.includes(join("archive", ARCHIVE_LAYOUT_VERSION, SPACE_ID, "documents")),
+    "the document actually lands under the agreed archive/v1/<spaceId>/documents/ path, not directly under the configured root",
+  );
+  assert.ok(
+    persistedStatement.capturePath.includes(join("archive", ARCHIVE_LAYOUT_VERSION, SPACE_ID, "captures")),
+    "the capture manifest actually lands under the agreed archive/v1/<spaceId>/captures/ path",
+  );
 
   // A second, later capture of byte-identical statement content -- a
   // re-acquisition after a parser fix, say. Same bytes, different time and

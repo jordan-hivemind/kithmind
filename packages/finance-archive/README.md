@@ -668,20 +668,36 @@ anything to disk. `src/rawTree.ts` is where those bytes -- and any retained
 extracted text -- are actually persisted, per ground rule 1: raw files are
 immutable, written once, never edited, never deleted.
 
-The root directory is configuration, read from
+The managed root directory is configuration, read from
 `FINANCE_ARCHIVE_RAW_TREE_ROOT` and nowhere else, the same pattern
 `src/mcp/run.ts` uses for `FINANCE_ARCHIVE_DB_PATH`: a missing setting is a
 hard error naming exactly what is missing, never a default and never a
 guessed location. No real path appears in this repository, in a fixture, or
 in a test.
 
+That managed root can be shared with a second subsystem writing under the
+same directory (F1-28,
+[`docs/plans/2026-09-08-unified-storage-assessment.md`](../../docs/plans/2026-09-08-unified-storage-assessment.md)'s
+"one managed Dropbox root"), so `resolveRawTreeRoot` returns the configured
+root joined with a fixed `archive/v1` layout-version segment, which is a
+constant of this writer and never configuration, and a space id, which is
+configuration: read from `FINANCE_ARCHIVE_SPACE_ID` and nowhere else,
+following the exact same hard-error pattern. No real space id appears in
+this repository, in a fixture, or in a test.
+
 Layout is content-addressed:
 
 ```
-<root>/documents/<sha[0:2]>/<sha[2:4]>/<sha256>
-<root>/text/<sha[0:2]>/<sha[2:4]>/<sha256>.txt
-<root>/captures/<institutionSlug>/<yyyy>/<mm>/<captureId>-<manifestSha256>.json
+<root>/archive/v1/<spaceId>/documents/<sha[0:2]>/<sha[2:4]>/<sha256>
+<root>/archive/v1/<spaceId>/text/<sha[0:2]>/<sha[2:4]>/<sha256>.txt
+<root>/archive/v1/<spaceId>/captures/<institutionSlug>/<yyyy>/<mm>/<captureId>-<manifestSha256>.json
 ```
+
+Everything below the `archive/v1/<spaceId>/` prefix is unchanged: the write
+functions (`writeRawDocument`, `writeRetainedText`, `writeCaptureManifest`)
+take that already-scoped directory as their `root` argument and know nothing
+about the prefix or where it came from -- `resolveRawTreeRoot` is the only
+place that composes it.
 
 `documents/` is addressed by the raw bytes' own hash; `text/` is addressed by
 the retained text's own hash, in a separate namespace so a text blob and a

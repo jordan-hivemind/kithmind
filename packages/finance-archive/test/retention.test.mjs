@@ -14,6 +14,7 @@
 
 import assert from "node:assert/strict";
 import {
+  existsSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -30,6 +31,7 @@ import {
   openArchive,
   persistAcquiredDocument,
   readCaptureManifest,
+  resolveRawTreeRoot,
   retainPayload,
   RetentionShapeError,
   sha256HexOf,
@@ -48,6 +50,10 @@ const INSTITUTION = {
   slug: SYNTHETIC_INSTITUTION_SLUG,
 };
 const ACCOUNT = { id: "acct_synthetic_f1_23", last4: "0000" };
+
+// Synthetic space id (F1-28): not a real space, just what exercises the
+// shared-root prefix this suite writes and reads through.
+const SPACE_ID = "space_synthetic_test";
 
 function archive(t) {
   const directory = mkdtempSync(join(tmpdir(), "kith-finance-retention-db-"));
@@ -92,11 +98,19 @@ async function pgSeeded(t) {
 function rawRoot(t) {
   const directory = mkdtempSync(join(tmpdir(), "kith-finance-retention-raw-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
-  return directory;
+  return resolveRawTreeRoot({
+    FINANCE_ARCHIVE_RAW_TREE_ROOT: directory,
+    FINANCE_ARCHIVE_SPACE_ID: SPACE_ID,
+  });
 }
 
-/** Every file under `directory`, recursively. */
+/** Every file under `directory`, recursively. `directory` itself may not
+ * exist yet -- the scoped archive/v1/<spaceId> root is only created lazily
+ * on a first write (rawTree.ts), so a refused write that landed nothing on
+ * disk can mean the directory was never created at all, which is still
+ * zero files, not an error. */
 function everyFile(directory) {
+  if (!existsSync(directory)) return [];
   const found = [];
   for (const entry of readdirSync(directory)) {
     const path = join(directory, entry);
