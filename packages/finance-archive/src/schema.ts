@@ -206,8 +206,18 @@ CREATE INDEX reconciliations_account_period ON reconciliations (account_id, peri
 CREATE INDEX review_items_status ON review_items (status, kind);
 `;
 
+// F1-16: holdings rows need the same per-row locator provenance transactions
+// already have (ground rule 2). The plan's data-model table listed only
+// source_document_id for these three tables; source_locator was the gap.
+const ADD_HOLDINGS_SOURCE_LOCATOR = `
+ALTER TABLE positions ADD COLUMN source_locator TEXT;
+ALTER TABLE balances ADD COLUMN source_locator TEXT;
+ALTER TABLE liabilities ADD COLUMN source_locator TEXT;
+`;
+
 export const MIGRATIONS: readonly Migration[] = Object.freeze([
   { version: 1, name: "initial archive schema", sql: INITIAL_SCHEMA },
+  { version: 2, name: "add holdings source_locator", sql: ADD_HOLDINGS_SOURCE_LOCATOR },
 ]);
 
 export const ARCHIVE_SCHEMA_VERSION: number = MIGRATIONS.at(-1)?.version ?? 0;

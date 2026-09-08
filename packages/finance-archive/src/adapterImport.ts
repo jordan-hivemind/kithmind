@@ -18,10 +18,24 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
-import type { AcquiredDocument, ParsedInstrument, ParsedRow } from "./adapter.js";
-import { sha256Hex } from "./adapter.js";
+import type {
+  AcquiredDocument,
+  ParsedBalance,
+  ParsedHoldings,
+  ParsedInstrument,
+  ParsedLiability,
+  ParsedPosition,
+  ParsedRow,
+} from "./adapter.js";
+import { EMPTY_HOLDINGS, sha256Hex } from "./adapter.js";
 import { canonicalizeDecimal } from "./decimal.js";
-import type { ImportDocument, ImportRow } from "./importer.js";
+import type {
+  ImportBalance,
+  ImportDocument,
+  ImportLiability,
+  ImportPosition,
+  ImportRow,
+} from "./importer.js";
 import { toMinorUnits } from "./money.js";
 import {
   type ManifestWriteResult,
@@ -40,12 +54,18 @@ import { contentKey, rowHash } from "./rowHash.js";
  * impossible to build an `AdapterPull` around a `filePath` nothing ever
  * wrote (this is exactly the bug F1-18 exists to fix; see
  * `persistAcquiredDocument`'s doc comment below).
+ *
+ * `holdings` defaults to `EMPTY_HOLDINGS` when omitted: most pulls (every
+ * paginated activity feed, every tabular export) carry none, and a caller
+ * building one from an activity-only adapter's `parse()` output does not
+ * need to spell that out.
  */
 export type AdapterPull = {
   readonly institutionId: string;
   readonly accountId: string;
   readonly acquired: AcquiredDocument;
   readonly rows: readonly ParsedRow[];
+  readonly holdings?: ParsedHoldings;
   readonly docType: string;
   readonly docDate: string | null;
   readonly persisted: PersistedAcquisition;
@@ -179,11 +199,75 @@ function parsedRowToImportRow(
   };
 }
 
-/** Groups rows by `sourceDocument`, preserving first-seen order and each row's own order within its group. */
-function groupBySourceDocument(
-  rows: readonly ParsedRow[],
-): Map<string, ParsedRow[]> {
-  const groups = new Map<string, ParsedRow[]>();
+/**
+ * Maps one parsed holding to the importer's row shape. `sourceDocument` is
+ * used only for grouping (see `groupBySourceDocument`) and does not appear
+ * on the `Import*` row itself, the same way `ParsedRow.sourceDocument`
+ * never reaches `ImportRow` -- the document it belongs to is expressed by
+ * which `ImportDocument` the row ends up on, not a field on the row.
+ */
+function parsedPositionToImportPosition(
+  db: DatabaseSync,
+  position: ParsedPosition,
+): ImportPosition {
+  return {
+    asOf: position.asOf,
+    instrumentId:
+      position.instrument === null
+        ? null
+        : resolveInstrumentId(db, position.instrument),
+    quantity: position.quantity,
+    price: position.price,
+    marketValueText: position.marketValue,
+    marketValueNote: position.marketValueNote,
+    costBasis: position.costBasis,
+    unrealized: position.unrealized,
+    currency: position.currency,
+    valuationBasis: position.valuationBasis,
+    valuationNote: position.valuationNote,
+    sourceLocator: JSON.stringify(position.locators),
+  };
+}
+
+function parsedBalanceToImportBalance(balance: ParsedBalance): ImportBalance {
+  return {
+    asOf: balance.asOf,
+    totalValueText: balance.totalValue,
+    totalValueNote: balance.totalValueNote,
+    cash: balance.cash,
+    currency: balance.currency,
+    periodStartValue: balance.periodStartValue,
+    periodEndValue: balance.periodEndValue,
+    sourceLocator: JSON.stringify(balance.locators),
+  };
+}
+
+function parsedLiabilityToImportLiability(
+  liability: ParsedLiability,
+): ImportLiability {
+  return {
+    kind: liability.kind,
+    displayName: liability.displayName,
+    balanceText: liability.balance,
+    balanceNote: liability.balanceNote,
+    currency: liability.currency,
+    rate: liability.rate,
+    asOf: liability.asOf,
+    collateralNote: liability.collateralNote,
+    sourceLocator: JSON.stringify(liability.locators),
+  };
+}
+
+/**
+ * Groups rows by `sourceDocument`, preserving first-seen order and each
+ * row's own order within its group. Shared by activity rows and every
+ * holdings row type, all four of which carry `sourceDocument` for exactly
+ * this reason (see `ParsedRow.sourceDocument`'s doc comment).
+ */
+function groupBySourceDocument<T extends { readonly sourceDocument: string }>(
+  rows: readonly T[],
+): Map<string, T[]> {
+  const groups = new Map<string, T[]>();
   for (const row of rows) {
     const group = groups.get(row.sourceDocument);
     if (group) group.push(row);
@@ -266,31 +350,44 @@ function countDistinctRowHashes(
  * checked at all, and ground rule 7 forbids asserting it anyway: this opens
  * a `review_items` entry recording that this pull was never verified,
  * rather than importing it with no mark left behind.
+ *
+ * Holdings (`pull.holdings`) are grouped and attached to `ImportDocument`s
+ * the same way activity rows are, each `ParsedPosition`/`ParsedBalance`/
+ * `ParsedLiability` carrying its own `sourceDocument` so a holding lands on
+ * the right document even when a pull's activity is paginated and its
+ * holdings are not (the normal case: a statement's positions table is never
+ * itself paginated). Ground rule 7's provider-total check above stays scoped
+ * to activity rows -- `reportedRowCount` is a transaction-row count, and
+ * holdings have no analogous provider total to reconcile against.
  */
 export function adapterPullToImportDocuments(
   db: DatabaseSync,
   pull: AdapterPull,
 ): ImportDocument[] {
-  const groups = groupBySourceDocument(pull.rows);
+  const activityGroups = groupBySourceDocument(pull.rows);
+  const holdings = pull.holdings ?? EMPTY_HOLDINGS;
+  const positionGroups = groupBySourceDocument(holdings.positions);
+  const balanceGroups = groupBySourceDocument(holdings.balances);
+  const liabilityGroups = groupBySourceDocument(holdings.liabilities);
   const reportedRowCount = pull.acquired.manifest.reportedRowCount;
 
-  if (groups.size > 1) {
+  if (activityGroups.size > 1) {
     if (reportedRowCount === null) {
       insertReviewItem(db, {
         kind: "unverified_pagination_total",
         accountId: pull.accountId,
         rawValue: pull.acquired.manifest.contentHash,
         reason:
-          `paginated pull split into ${groups.size} page document(s), but the provider ` +
+          `paginated pull split into ${activityGroups.size} page document(s), but the provider ` +
           "reported no total for this pull; completeness cannot be asserted (ground rule 7) " +
           "without a stated total to reconcile against -- treat this pull as unverified",
       });
     } else {
-      const distinct = countDistinctRowHashes(pull.accountId, groups);
+      const distinct = countDistinctRowHashes(pull.accountId, activityGroups);
       if (distinct !== reportedRowCount) {
         throw new Error(
           `adapter pull reported ${reportedRowCount} unique row(s) but ${distinct} distinct ` +
-            `row(s) remain after per-document dedup across ${groups.size} page document(s); ` +
+            `row(s) remain after per-document dedup across ${activityGroups.size} page document(s); ` +
             "refusing to import a pull that does not reconcile against the provider's total " +
             "(ground rule 7)",
         );
@@ -298,9 +395,16 @@ export function adapterPullToImportDocuments(
     }
   }
 
+  const sourceDocuments = new Set<string>([
+    ...activityGroups.keys(),
+    ...positionGroups.keys(),
+    ...balanceGroups.keys(),
+    ...liabilityGroups.keys(),
+  ]);
+  const single = sourceDocuments.size === 1;
+
   const documents: ImportDocument[] = [];
-  for (const [sourceDocument, rows] of groups) {
-    const single = groups.size === 1;
+  for (const sourceDocument of sourceDocuments) {
     documents.push({
       // For a single document this literally is the acquired file's own
       // content hash. A page split has no bytes of its own -- the whole
@@ -322,7 +426,18 @@ export function adapterPullToImportDocuments(
       docType: pull.docType,
       docDate: pull.docDate,
       providerReportedCount: single ? reportedRowCount : null,
-      rows: rows.map((row) => parsedRowToImportRow(db, pull.accountId, row)),
+      rows: (activityGroups.get(sourceDocument) ?? []).map((row) =>
+        parsedRowToImportRow(db, pull.accountId, row),
+      ),
+      positions: (positionGroups.get(sourceDocument) ?? []).map((position) =>
+        parsedPositionToImportPosition(db, position),
+      ),
+      balances: (balanceGroups.get(sourceDocument) ?? []).map(
+        parsedBalanceToImportBalance,
+      ),
+      liabilities: (liabilityGroups.get(sourceDocument) ?? []).map(
+        parsedLiabilityToImportLiability,
+      ),
     });
   }
   return documents;

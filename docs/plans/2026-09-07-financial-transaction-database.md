@@ -139,13 +139,13 @@ transactions(id, account_id, trade_date, process_date, settle_date,
 
 positions(id, account_id, as_of, instrument_id, quantity, price,
           market_value, cost_basis, unrealized, currency,
-          valuation_basis, valuation_note, source_document_id)
+          valuation_basis, valuation_note, source_document_id, source_locator)
 
 balances(id, account_id, as_of, total_value, cash, currency,
-         period_start_value, period_end_value, source_document_id)
+         period_start_value, period_end_value, source_document_id, source_locator)
 
 liabilities(id, institution_id, account_id, kind, display_name, balance,
-            currency, rate, as_of, collateral_note, source_document_id)
+            currency, rate, as_of, collateral_note, source_document_id, source_locator)
 
 commitments(id, account_id, instrument_id, committed, called, outstanding,
             distributed, currency, committed_original, currency_original,

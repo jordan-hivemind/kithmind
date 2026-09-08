@@ -282,12 +282,102 @@ export type ParsedRow = ParsedAmount & {
     readonly locators: Readonly<Record<string, FieldLocator>>;
   };
 
+// --- holdings ------------------------------------------------------------
+//
+// A statement's raw bytes carry both its activity table and its positions
+// table; parse() returns both from the one parse of those bytes rather than
+// asking an adapter to read the same document twice. An adapter with only
+// activity (a structured API, a tabular export) is not asked to invent a
+// positions table it does not have: it returns EMPTY_HOLDINGS, an honest
+// declaration of "this source has none," not an omission a caller has to
+// guess at (plan: "capabilities... an adapter declaring a subset honestly
+// is the expected case").
+
+export type ValuationBasis = "market_price" | "last_round" | "cost" | "reported_nav";
+
+/**
+ * One point-in-time holding from a statement's positions table. `marketValue`
+ * is this row's load-bearing money value -- what a total-assets query sums --
+ * so an adapter that saw text it could not read reports it as null with
+ * `marketValueNote` rather than a guess, exactly like `ParsedRow.amount` /
+ * `amountNote` (ground rule 5). `costBasis` and `unrealized` are secondary
+ * and optional: most statements report them, some do not; plain decimal text
+ * or null, validated downstream the same way `quantity`/`price` already are.
+ *
+ * `valuationBasis` and `valuationNote` must not both be left unset: the plan
+ * is explicit that a total-assets query with no valuation basis silently
+ * mixes marked securities with positions carried at cost. `valuationNote` is
+ * always required text -- it explains the basis when one is known, and
+ * explains why it is unknown when `valuationBasis` is null (ground rule 5:
+ * never inferred).
+ */
+export type ParsedPosition = {
+  readonly sourceDocument: string;
+  readonly asOf: string;
+  readonly instrument: ParsedInstrument | null;
+  readonly quantity: string | null;
+  readonly price: string | null;
+  readonly marketValue: string | null;
+  readonly marketValueNote: string | null;
+  readonly costBasis: string | null;
+  readonly unrealized: string | null;
+  readonly currency: string;
+  readonly valuationBasis: ValuationBasis | null;
+  readonly valuationNote: string;
+  readonly locators: Readonly<Record<string, FieldLocator>>;
+};
+
+/** One point-in-time account total from a statement's summary section. */
+export type ParsedBalance = {
+  readonly sourceDocument: string;
+  readonly asOf: string;
+  readonly totalValue: string | null;
+  readonly totalValueNote: string | null;
+  readonly cash: string | null;
+  readonly currency: string;
+  readonly periodStartValue: string | null;
+  readonly periodEndValue: string | null;
+  readonly locators: Readonly<Record<string, FieldLocator>>;
+};
+
+/** What is owed: a loan, margin balance or similar, from a statement. */
+export type ParsedLiability = {
+  readonly sourceDocument: string;
+  readonly kind: string;
+  readonly displayName: string | null;
+  readonly balance: string | null;
+  readonly balanceNote: string | null;
+  readonly currency: string;
+  readonly rate: string | null;
+  readonly asOf: string;
+  readonly collateralNote: string | null;
+  readonly locators: Readonly<Record<string, FieldLocator>>;
+};
+
+export type ParsedHoldings = {
+  readonly positions: readonly ParsedPosition[];
+  readonly balances: readonly ParsedBalance[];
+  readonly liabilities: readonly ParsedLiability[];
+};
+
+/** What an activity-only source declines with: no positions, no invention. */
+export const EMPTY_HOLDINGS: ParsedHoldings = Object.freeze({
+  positions: [],
+  balances: [],
+  liabilities: [],
+});
+
+export type ParsedPull = {
+  readonly activity: readonly ParsedRow[];
+  readonly holdings: ParsedHoldings;
+};
+
 // --- the interface itself ----------------------------------------------
 
 export type InstitutionAdapter = {
   readonly institutionSlug: string;
   discover(session: AdapterSession): Promise<DiscoverResult>;
   acquire(selection: AcquireSelection): Promise<AcquiredDocument>;
-  parse(rawFile: RawFile): Promise<readonly ParsedRow[]>;
+  parse(rawFile: RawFile): Promise<ParsedPull>;
   capabilities(): InstitutionCapabilities;
 };
