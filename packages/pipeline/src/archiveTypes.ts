@@ -97,6 +97,30 @@ export type ResticSnapshotInventory = {
   verification: "unfiltered_snapshot_inventory";
 };
 
+export type InventoryResticSnapshotTreeInput = {
+  resticBinary: string;
+  repository: RcloneDropboxRepository;
+  repositoryPath?: never;
+  expectedRepositoryId: string;
+  passwordCommand: PasswordCommand;
+  snapshotId: string;
+  limits?: ArchiveCommandLimits;
+};
+
+export type ResticSnapshotTreeEntry =
+  | { type: "dir"; name: string; path: string }
+  | { type: "file"; name: string; path: string; byteLength: number };
+
+export type ResticSnapshotTreeInventory = {
+  repositoryId: string;
+  resticVersion: typeof RESTIC_VERSION;
+  boundary: RemoteBackupBoundary;
+  snapshotId: string;
+  treeId: string;
+  entries: ResticSnapshotTreeEntry[];
+  verification: "exact_snapshot_tree_inventory";
+};
+
 export type PreparedAgeObject = {
   state: "prepared";
   tempPath: string;
