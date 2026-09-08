@@ -173,6 +173,25 @@ test("PDF document-Q&A config is closed, bound, and keeps legacy bindings stable
     journalBindingForConfig(parsedRemote).configFingerprint,
     journalBindingForConfig(pdf).configFingerprint,
   );
+  const providerPdf = structuredClone(remotePdf);
+  const providerRootId = "id:synthetic_root";
+  providerPdf.providerOriginal = {
+    rootAlias: "notes",
+    providerRootDirectoryId: providerRootId,
+    providerAccountIdHash: "e".repeat(64),
+    providerRootDirectoryIdHash: createHash("sha256").update(providerRootId).digest("hex"),
+    refreshPath: "Kith Mind/Inbox",
+    registryDirectory: "/private/provider-registry",
+  };
+  const parsedProvider = parseConfig({ ...base, pdfDocQa: providerPdf });
+  assert.equal(parsedProvider.pdfDocQa.providerOriginal.rootAlias, "notes");
+  assert.notEqual(
+    journalBindingForConfig(parsedProvider).configFingerprint,
+    journalBindingForConfig(parsedRemote).configFingerprint,
+  );
+  const invalidProvider = structuredClone(providerPdf);
+  invalidProvider.providerOriginal.providerRootDirectoryIdHash = "f".repeat(64);
+  assert.throws(() => parseConfig({ ...base, pdfDocQa: invalidProvider }));
   const invalidRemote = structuredClone(remotePdf);
   invalidRemote.archive.independentBackup.repository.rootPath =
     "Kith Mind Backups/../Processing";

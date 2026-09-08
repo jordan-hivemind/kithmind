@@ -44,6 +44,14 @@ export type PdfDocQaConfig = {
     tableStructureBypass?: Record<string, number[]>;
   };
   profile: PdfDocQaProfile;
+  providerOriginal?: {
+    rootAlias: string;
+    providerRootDirectoryId: string;
+    providerAccountIdHash: string;
+    providerRootDirectoryIdHash: string;
+    refreshPath: string;
+    registryDirectory: string;
+  };
   archive: {
     ageBinary: string;
     primary: PdfDocQaArchiveIdentity & { directory: string; recipient: string };

@@ -245,14 +245,11 @@ function overlaps(left: string, right: string): boolean {
 
 function pdfDocQa(value: unknown, roots: RootConfig[], journalDir: string) {
   const input = object(value, "pdfDocQa");
-  exact(input, [
-    "captureDirectory",
-    "parserOutputRoot",
-    "spoolDirectory",
-    "parser",
-    "profile",
-    "archive",
-  ]);
+  exact(
+    input,
+    ["captureDirectory", "parserOutputRoot", "spoolDirectory", "parser", "profile", "archive"],
+    ["providerOriginal"],
+  );
   const captureDirectory = absolutePath(
     input.captureDirectory,
     "pdfDocQa.captureDirectory",
@@ -498,6 +495,27 @@ function pdfDocQa(value: unknown, roots: RootConfig[], journalDir: string) {
   if (primary.recipient === independentBackup.recipient) {
     fail("pdfDocQa archive recipients must differ");
   }
+  const providerOriginal = input.providerOriginal === undefined
+    ? undefined
+    : (() => {
+        const provider = object(input.providerOriginal, "pdfDocQa.providerOriginal");
+        exact(provider, ["rootAlias", "providerRootDirectoryId", "providerAccountIdHash", "providerRootDirectoryIdHash", "refreshPath", "registryDirectory"]);
+        const rootAlias = string(provider.rootAlias, "pdfDocQa.providerOriginal.rootAlias");
+        if (!ROOT_ALIAS.test(rootAlias) || !roots.some((root) => root.alias === rootAlias)) fail("pdfDocQa provider rootAlias is invalid");
+        const rootId = string(provider.providerRootDirectoryId, "pdfDocQa.providerOriginal.providerRootDirectoryId");
+        if (!/^id:[A-Za-z0-9_-]{1,256}$/.test(rootId)) fail("pdfDocQa provider root ID is invalid");
+        const rootHash = sha256(provider.providerRootDirectoryIdHash, "pdfDocQa.providerOriginal.providerRootDirectoryIdHash");
+        if (createHash("sha256").update(rootId).digest("hex") !== rootHash) fail("pdfDocQa provider root identity mismatch");
+        return {
+          rootAlias,
+          providerRootDirectoryId: rootId,
+          providerAccountIdHash: sha256(provider.providerAccountIdHash, "pdfDocQa.providerOriginal.providerAccountIdHash"),
+          providerRootDirectoryIdHash: rootHash,
+          refreshPath: remoteRootPath(provider.refreshPath),
+          registryDirectory: absolutePath(provider.registryDirectory, "pdfDocQa.providerOriginal.registryDirectory"),
+        };
+      })();
+  if (providerOriginal !== undefined && !("repository" in independentBackup)) fail("pdfDocQa provider original requires remote independent backup");
   const privatePaths = [
     captureDirectory,
     parserOutputRoot,
@@ -505,6 +523,7 @@ function pdfDocQa(value: unknown, roots: RootConfig[], journalDir: string) {
     primary.directory,
     independentBackup.directory,
     ...("repositoryPath" in independentBackup ? [independentBackup.repositoryPath] : []),
+    ...(providerOriginal === undefined ? [] : [providerOriginal.registryDirectory]),
   ];
   for (let left = 0; left < privatePaths.length; left += 1) {
     for (let right = left + 1; right < privatePaths.length; right += 1) {
@@ -564,6 +583,7 @@ function pdfDocQa(value: unknown, roots: RootConfig[], journalDir: string) {
       primary,
       independentBackup,
     },
+    ...(providerOriginal === undefined ? {} : { providerOriginal }),
   };
 }
 
