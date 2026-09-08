@@ -137,6 +137,39 @@ against fixtures generated in `fixtures.ts`, including a paginated activity
 feed with a deliberate page-boundary overlap and one deliberately
 unparseable statement amount. `test/syntheticAdapter.test.mjs` is what a new
 adapter's own suite should look like.
+## Importer
+
+`importBatch(db, batch, now?)` turns normalized rows into `documents`,
+`transactions` and `review_items`, and writes one `import_runs` summary. It is
+a script, not something an agent reads rows through: it returns counts, never
+row content (see "Working on the archive without reading it" in the plan).
+The whole batch commits or rolls back as one transaction, so a provider-count
+mismatch or a broken invariant never leaves a partially-imported archive.
+
+`ImportRow` is the row shape it consumes, not an adapter interface. It is the
+seam an institution adapter's `parse()` output gets mapped to; see the type's
+doc comment in `src/importer.ts` for every field. In short: `accountId` must
+already exist, `processDate` is a required ISO date, amounts are decimal text
+in the row's own currency, and `providerTxnId` is a stable per-account id from
+the source when one exists.
+
+Deduplication follows the plan exactly: a stable `providerTxnId` is the
+preferred identity and is what correctly collapses an overlapping page from a
+paginated pull. Without one, the importer falls back to content hashing and
+never merges two rows on the strength of matching content alone, so two
+legitimately identical transactions (same date, amount, description) are both
+kept, each under its own disambiguated `row_hash`. Re-importing the same raw
+bytes is a no-op at the whole-document level, keyed on `documents.sha256`.
+
+A value `toMinorUnits` cannot place at the currency's exponent, a malformed
+quantity, price or running balance, an unparseable process date, a future
+date, or a date before 1900 each open a `review_items` row instead of being
+guessed. Only an unparseable process date blocks the transaction from being
+inserted at all, because `process_date` has no other spelling to store; every
+other case stores what the source stated and flags it.
+
+The reconciliation gate (F1-4) is not implemented here; `reconciliations_passed`
+and `reconciliations_failed` are always written as 0 by this importer.
 
 ## Schema and migrations
 

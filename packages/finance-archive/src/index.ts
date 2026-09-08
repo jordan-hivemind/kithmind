@@ -59,3 +59,10 @@ export {
   schemaVersion,
   type Migration,
 } from "./schema.js";
+export {
+  importBatch,
+  type ImportBatch,
+  type ImportDocument,
+  type ImportRow,
+  type ImportSummary,
+} from "./importer.js";
