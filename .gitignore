@@ -14,3 +14,8 @@ docs/private/
 
 # Rendered synthetic PDF review intermediates.
 tmp/pdfs/
+
+# The financial archive file lives outside the repository. Never commit one.
+*.db
+*.db-wal
+*.db-shm

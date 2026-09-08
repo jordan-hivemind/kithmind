@@ -1,0 +1,27 @@
+{
+  "name": "@repo/finance-archive",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "node": "./dist/index.js",
+      "default": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check-types": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test test/*.test.mjs",
+    "test:once": "node --test test/*.test.mjs"
+  },
+  "devDependencies": {
+    "@repo/typescript-config": "workspace:*",
+    "@types/node": "25.3.3",
+    "typescript": "^5.7.0"
+  }
+}
