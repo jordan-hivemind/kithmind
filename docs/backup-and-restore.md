@@ -7,12 +7,18 @@ the hosted database and optional Convex file storage. The filesystem worker's
 encrypted archives, journal, catalog, configuration, and keys are external to
 that snapshot and require their own protected backup.
 
-An isolated native restore rehearsal has preserved exact rows from the earlier
-B2 63-table schema on the tested macOS setup. The current schema bundle has not
-yet completed that import drill. Full synthetic acceptance with the completed
-PDF lifecycle, archive catalog, citations, forget state, and independent
-archive restore is still pending. Do not use this guide as authority to resume
-a restored service or ingest owner documents.
+The final synthetic document-Q&A drill preserved the exact 64-table schema and
+all 219 exported rows, including table inventory. Offline checks verified the
+current document, its historical version, exact citations, and a completed
+forget tombstone. All twelve original/parser archive copies decrypted
+successfully, including a separate six-copy backup restore with the source and
+primary archive unavailable. The backend had no application functions and was
+stopped after comparison.
+
+This was a macOS synthetic drill. Its mounted backup filesystem was on the
+same computer, so hardware-loss protection and owner key recovery remain to be
+established. It does not establish a turnkey relocated-worker recovery or
+authorize exposing a restored service.
 
 ## Recovery sets
 

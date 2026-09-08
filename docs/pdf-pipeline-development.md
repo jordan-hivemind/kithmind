@@ -4,9 +4,9 @@
 
 The optional PDF path connects the filesystem runner to protected capture,
 encrypted archives, parsing, durable journal replay, cloud admission, and
-parsed staging and activation. Integration and recovery verification remain
-in progress. Source binary ingestion is explicitly gated; do not enable an
-owner source until its trial acceptance checks pass. Existing text ingestion
+parsed staging and activation. The bounded synthetic lifecycle and recovery
+checks have passed on macOS. Source binary ingestion is explicitly gated; do
+not enable an owner source until its operational and backup checks pass. Existing text ingestion
 continues without the optional PDF configuration.
 
 The foundation converts one bounded, privately captured PDF with the pinned
@@ -37,14 +37,28 @@ parser artifact digest, using the shared derivation in the
 
 ## What remains before use
 
-Before owner files, verify the complete workflow with synthetic PDFs,
-interruption/restart, an unchanged rescan, a correction, exact citations,
-forget, and isolated restore. Confirm an independent backup destination that
+Before owner files, confirm source recovery and monitoring, plus an independent backup destination that
 survives loss of the source computer and primary archive. Passing parser or
 unit tests alone does not establish this recovery boundary.
 
 The [backup and restore guide](backup-and-restore.md) separates hosted data
 recovery from encrypted archives, worker state, configuration, and keys.
+
+The synthetic acceptance run published two PDFs, published nothing on an
+unchanged scan, and resumed a corrected PDF from a durable pending upload.
+Hosted reads verified the current and historical text and exact UTF-16 quote
+hashes. All twelve archive copies decrypted to their expected original or
+parser-artifact hashes. Six backup copies also restored with the source folder
+and primary archive unavailable. The backup used a separate mounted filesystem
+on the same computer, so it does not establish physical failure independence.
+
+Owner-begun forget removed four configured archive copies, replayed the CLI
+without changing its result, and finalized a content-free tombstone. A later
+scan completed without reimporting the still-present forgotten source file.
+Isolated native restore preserved the exact final schema and exported values,
+including correction history and the tombstone. Copies deliberately made for
+isolated restore or operator diagnostics are outside the configured worker's
+forget operation.
 
 The document-Q&A trial may publish verified pages and citations. It does not
 automatically publish structured records. Field extraction, review, coverage,
