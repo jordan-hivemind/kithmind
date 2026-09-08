@@ -41,13 +41,15 @@ import type {
   ImportRow,
 } from "./importer.js";
 import { toMinorUnits } from "./money.js";
+import { toNumericText } from "./pgNumeric.js";
+import type { ArchiveClient } from "./pgStore.js";
 import {
   type RawTreeWriteResult,
   writeRawDocument,
   writeRetainedText,
 } from "./rawTree.js";
 import { retainPayload } from "./retention.js";
-import { contentKey, rowHash } from "./rowHash.js";
+import { contentKeyV2, rowHashV2 } from "./rowHash.js";
 
 /**
  * One acquired-and-parsed pull, ready to become one or more `ImportDocument`s.
@@ -74,15 +76,36 @@ export type AdapterPull = {
   readonly persisted: PersistedAcquisition;
 };
 
-function insertReviewItem(
-  db: DatabaseSync,
-  fields: {
-    kind: string;
-    accountId: string | null;
-    rawValue: string | null;
-    reason: string;
-  },
-): void {
+type ReviewItemFields = {
+  kind: string;
+  accountId: string | null;
+  rawValue: string | null;
+  reason: string;
+};
+
+async function openReviewItem(
+  client: ArchiveClient,
+  fields: ReviewItemFields,
+): Promise<void> {
+  await client.query(
+    `INSERT INTO review_items (id, kind, account_id, source_document_id, source_locator, raw_value, reason)
+     VALUES ($1, $2, $3, NULL, NULL, $4, $5)`,
+    [
+      randomUUID(),
+      fields.kind,
+      fields.accountId,
+      fields.rawValue,
+      fields.reason,
+    ],
+  );
+}
+
+/**
+ * The SQLite-handle counterpart, still used by the raw-tree persistence half
+ * of this file below. F1-24 owns that half and is moving it in parallel; when
+ * it lands on the archive client this function goes with it.
+ */
+function insertReviewItem(db: DatabaseSync, fields: ReviewItemFields): void {
   db.prepare(
     `INSERT INTO review_items (id, kind, account_id, source_document_id, source_locator, raw_value, reason)
      VALUES (?, ?, ?, NULL, NULL, ?, ?)`,
@@ -106,37 +129,49 @@ function insertReviewItem(
  * `instrument_id`s and silently breaking any "every purchase of instrument
  * X" query. A flagged, stable match is the smaller failure of the two.
  */
-export function resolveInstrumentId(
-  db: DatabaseSync,
+export async function resolveInstrumentId(
+  client: ArchiveClient,
   instrument: ParsedInstrument,
-): string {
+): Promise<string> {
   if (instrument.cusip) {
-    return findOrCreateInstrument(db, "cusip", instrument.cusip, instrument);
+    return findOrCreateInstrument(
+      client,
+      "cusip",
+      instrument.cusip,
+      instrument,
+    );
   }
   if (instrument.isin) {
-    return findOrCreateInstrument(db, "isin", instrument.isin, instrument);
+    return findOrCreateInstrument(client, "isin", instrument.isin, instrument);
   }
   if (instrument.symbol && instrument.name) {
-    const existing = db
-      .prepare("SELECT id FROM instruments WHERE symbol = ? AND name = ?")
-      .get(instrument.symbol, instrument.name) as { id: string } | undefined;
+    const found = await client.query<{ id: string }>(
+      "SELECT id FROM instruments WHERE symbol = $1 AND name = $2",
+      [instrument.symbol, instrument.name],
+    );
+    const existing = found.rows[0];
     if (existing) return existing.id;
   }
   if (instrument.symbol) {
-    // rowid orders by insertion, so this is deterministically the first
-    // instrument row ever created for this symbol -- a naive heuristic
-    // (there is no way to know if it is the *right* one without a stronger
-    // identifier), which is exactly why the match is flagged for review
-    // rather than trusted silently.
-    const weak = db
-      .prepare(
-        "SELECT id, cusip, isin, name FROM instruments WHERE symbol = ? ORDER BY rowid LIMIT 1",
-      )
-      .get(instrument.symbol) as
-      | { id: string; cusip: string | null; isin: string | null; name: string | null }
-      | undefined;
+    // ponytail: ctid orders by physical position, which for this
+    // insert-only table is insertion order, so this is the first instrument
+    // row created for this symbol. A rewrite (VACUUM FULL, a future UPDATE)
+    // could reorder it; add an inserted_at column if that ever matters.
+    // Either way it is a naive heuristic -- there is no way to know if it is
+    // the *right* row without a stronger identifier -- which is exactly why
+    // the match is flagged for review rather than trusted silently.
+    const found = await client.query<{
+      id: string;
+      cusip: string | null;
+      isin: string | null;
+      name: string | null;
+    }>(
+      "SELECT id, cusip, isin, name FROM instruments WHERE symbol = $1 ORDER BY ctid LIMIT 1",
+      [instrument.symbol],
+    );
+    const weak = found.rows[0];
     if (weak) {
-      insertReviewItem(db, {
+      await openReviewItem(client, {
         kind: "weak_instrument_match",
         accountId: null,
         rawValue: JSON.stringify(instrument),
@@ -149,35 +184,43 @@ export function resolveInstrumentId(
       return weak.id;
     }
   }
-  return insertInstrument(db, instrument);
+  return insertInstrument(client, instrument);
 }
 
-function findOrCreateInstrument(
-  db: DatabaseSync,
+async function findOrCreateInstrument(
+  client: ArchiveClient,
   column: "cusip" | "isin",
   value: string,
   instrument: ParsedInstrument,
-): string {
-  const existing = db
-    .prepare(`SELECT id FROM instruments WHERE ${column} = ?`)
-    .get(value) as { id: string } | undefined;
+): Promise<string> {
+  // The column name is one of two literals chosen by this file, never caller
+  // input, so it is safe to interpolate where a placeholder cannot go.
+  const found = await client.query<{ id: string }>(
+    `SELECT id FROM instruments WHERE ${column} = $1`,
+    [value],
+  );
+  const existing = found.rows[0];
   if (existing) return existing.id;
-  return insertInstrument(db, instrument);
+  return insertInstrument(client, instrument);
 }
 
-function insertInstrument(db: DatabaseSync, instrument: ParsedInstrument): string {
+async function insertInstrument(
+  client: ArchiveClient,
+  instrument: ParsedInstrument,
+): Promise<string> {
   const id = randomUUID();
-  db.prepare(
-    "INSERT INTO instruments (id, symbol, cusip, isin, name) VALUES (?, ?, ?, ?, ?)",
-  ).run(id, instrument.symbol, instrument.cusip, instrument.isin, instrument.name);
+  await client.query(
+    "INSERT INTO instruments (id, symbol, cusip, isin, name) VALUES ($1, $2, $3, $4, $5)",
+    [id, instrument.symbol, instrument.cusip, instrument.isin, instrument.name],
+  );
   return id;
 }
 
-function parsedRowToImportRow(
-  db: DatabaseSync,
+async function parsedRowToImportRow(
+  client: ArchiveClient,
   accountId: string,
   row: ParsedRow,
-): ImportRow {
+): Promise<ImportRow> {
   return {
     accountId,
     tradeDate: row.tradeDate,
@@ -187,7 +230,9 @@ function parsedRowToImportRow(
     activityType: row.activityType,
     description: row.description,
     instrumentId:
-      row.instrument === null ? null : resolveInstrumentId(db, row.instrument),
+      row.instrument === null
+        ? null
+        : await resolveInstrumentId(client, row.instrument),
     quantity: row.quantity,
     price: row.price,
     amountText: row.amount,
@@ -209,16 +254,16 @@ function parsedRowToImportRow(
  * never reaches `ImportRow` -- the document it belongs to is expressed by
  * which `ImportDocument` the row ends up on, not a field on the row.
  */
-function parsedPositionToImportPosition(
-  db: DatabaseSync,
+async function parsedPositionToImportPosition(
+  client: ArchiveClient,
   position: ParsedPosition,
-): ImportPosition {
+): Promise<ImportPosition> {
   return {
     asOf: position.asOf,
     instrumentId:
       position.instrument === null
         ? null
-        : resolveInstrumentId(db, position.instrument),
+        : await resolveInstrumentId(client, position.instrument),
     quantity: position.quantity,
     price: position.price,
     marketValueText: position.marketValue,
@@ -279,15 +324,27 @@ function groupBySourceDocument<T extends { readonly sourceDocument: string }>(
   return groups;
 }
 
+/** `Array.map` for an async mapper, one at a time and in order. */
+async function mapSeries<T, R>(
+  items: readonly T[],
+  map: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const out: R[] = [];
+  for (const item of items) out.push(await map(item));
+  return out;
+}
+
 /**
  * How many distinct transactions this pull's rows reduce to once each
  * page-document's own occurrence ordinal is applied, i.e. exactly the count
  * `importBatch` will insert for this pull if nothing else collides with an
- * earlier import. Computed with `rowHash`'s own `contentKey` (shared with
- * `importer.ts`, see rowHash.ts) so this count is never allowed to drift
- * from what the importer actually does. Works with or without provider
- * transaction ids -- unlike an id-based count, it cannot go silent just
- * because a source has none.
+ * earlier import. Computed with `contentKeyV2` and `rowHashV2` -- the same
+ * pair `importer.ts` uses, in the same order, over the same normalized values
+ * -- so this count is never allowed to drift from what the importer actually
+ * does. Using one version's key with the other's hash is the specific way
+ * this goes silently wrong, so the two are always taken together. Works with
+ * or without provider transaction ids: unlike an id-based count, it cannot go
+ * silent just because a source has none.
  */
 function countDistinctRowHashes(
   accountId: string,
@@ -300,19 +357,24 @@ function countDistinctRowHashes(
     // lands on the same ordinal (and hash) in each page's document.
     const occurrences = new Map<string, number>();
     for (const row of rows) {
-      let amount: bigint | null = null;
+      let amount: string | null = null;
       if (row.amount !== null) {
         try {
-          amount = toMinorUnits(row.amount, row.currency);
+          // Both of the importer's checks, in the importer's order: the
+          // minor-unit check for ambiguous money, then canonicalization to
+          // the decimal that is stored and hashed. A value failing either
+          // becomes NULL on import (ground rule 5), so NULL is what belongs
+          // in the hash here as well.
+          toMinorUnits(row.amount, row.currency);
+          amount = toNumericText(row.amount);
         } catch {
-          // Ambiguous money: importBatch stores NULL for this too (ground
-          // rule 5), so NULL is what belongs in the hash here as well.
+          // Ambiguous money: importBatch stores NULL for this too.
         }
       }
       let quantity: string | null = null;
       if (row.quantity !== null) {
         try {
-          quantity = canonicalizeDecimal(row.quantity);
+          quantity = toNumericText(row.quantity);
         } catch {
           // A malformed quantity becomes NULL on import too; same reasoning.
         }
@@ -326,10 +388,10 @@ function countDistinctRowHashes(
         amount,
         currency: row.currency,
       };
-      const key = contentKey(content);
+      const key = contentKeyV2(content);
       const occurrence = (occurrences.get(key) ?? 0) + 1;
       occurrences.set(key, occurrence);
-      hashes.add(rowHash({ ...content, occurrence }));
+      hashes.add(rowHashV2({ ...content, occurrence }));
     }
   }
   return hashes.size;
@@ -363,10 +425,10 @@ function countDistinctRowHashes(
  * to activity rows -- `reportedRowCount` is a transaction-row count, and
  * holdings have no analogous provider total to reconcile against.
  */
-export function adapterPullToImportDocuments(
-  db: DatabaseSync,
+export async function adapterPullToImportDocuments(
+  client: ArchiveClient,
   pull: AdapterPull,
-): ImportDocument[] {
+): Promise<ImportDocument[]> {
   const activityGroups = groupBySourceDocument(pull.rows);
   const holdings = pull.holdings ?? EMPTY_HOLDINGS;
   const positionGroups = groupBySourceDocument(holdings.positions);
@@ -376,7 +438,7 @@ export function adapterPullToImportDocuments(
 
   if (activityGroups.size > 1) {
     if (reportedRowCount === null) {
-      insertReviewItem(db, {
+      await openReviewItem(client, {
         kind: "unverified_pagination_total",
         accountId: pull.accountId,
         rawValue: pull.acquired.manifest.contentHash,
@@ -429,11 +491,15 @@ export function adapterPullToImportDocuments(
       docType: pull.docType,
       docDate: pull.docDate,
       providerReportedCount: single ? reportedRowCount : null,
-      rows: (activityGroups.get(sourceDocument) ?? []).map((row) =>
-        parsedRowToImportRow(db, pull.accountId, row),
+      // Sequential rather than concurrent on purpose: instrument resolution
+      // creates rows, and two rows for the same new instrument resolved in
+      // parallel would each fail to find it and mint a second id.
+      rows: await mapSeries(activityGroups.get(sourceDocument) ?? [], (row) =>
+        parsedRowToImportRow(client, pull.accountId, row),
       ),
-      positions: (positionGroups.get(sourceDocument) ?? []).map((position) =>
-        parsedPositionToImportPosition(db, position),
+      positions: await mapSeries(
+        positionGroups.get(sourceDocument) ?? [],
+        (position) => parsedPositionToImportPosition(client, position),
       ),
       balances: (balanceGroups.get(sourceDocument) ?? []).map(
         parsedBalanceToImportBalance,

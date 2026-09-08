@@ -129,7 +129,10 @@ export function rowHash(input: RowHashInput): string {
 // which is total and, for a fixed currency, injective. So two rows share a v1
 // hash if and only if they share a v2 hash: the identities the archive
 // deduplicates on are the same set before and after the move. That is the
-// property `test/pgRowHashV2.test.mjs` asserts over a synthetic row set.
+// property `test/pgMoney.test.mjs` asserts over a synthetic row set, along
+// with the matching property for `contentKey`/`contentKeyV2`: the ordinal a
+// row is assigned is unchanged by the move, because the key partitions the
+// same rows the same way.
 //
 // Canonicalization is what makes this safe, and skipping it is how the
 // archive would start double-counting: `1`, `1.0` and `1.00` are one amount

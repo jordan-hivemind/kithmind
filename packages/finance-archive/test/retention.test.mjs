@@ -13,7 +13,13 @@
 // task exists to prevent, so the tests read the raw tree back.
 
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import {
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -33,6 +39,8 @@ import {
   SYNTHETIC_LEAK_CANARY,
   writeRawDocument,
 } from "../dist/index.js";
+
+import { archive as pgArchive, skip } from "./helpers/pgArchive.mjs";
 
 const INSTITUTION = {
   id: "inst_synthetic_f1_23",
@@ -60,6 +68,27 @@ function archive(t) {
   return db;
 }
 
+/**
+ * The Postgres half. `persistAcquiredDocument` is still on a SQLite handle
+ * (F1-24 owns that path and is changing it concurrently), while
+ * `adapterPullToImportDocuments` is on the archive client, so the one test
+ * below that spans both seams holds both. It collapses to one handle when
+ * F1-24 lands.
+ */
+async function pgSeeded(t) {
+  const client = await pgArchive(t);
+  await client.query(
+    "INSERT INTO institutions (id, name, slug) VALUES ($1, $2, $3)",
+    [INSTITUTION.id, INSTITUTION.name, INSTITUTION.slug],
+  );
+  await client.query(
+    `INSERT INTO accounts (id, institution_id, acct_last4, display_name, base_currency)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [ACCOUNT.id, INSTITUTION.id, ACCOUNT.last4, "Synthetic account", "USD"],
+  );
+  return client;
+}
+
 function rawRoot(t) {
   const directory = mkdtempSync(join(tmpdir(), "kith-finance-retention-raw-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
@@ -84,7 +113,8 @@ function everyFile(directory) {
  */
 function filesContaining(root, needle) {
   const target = Buffer.from(needle, "utf8");
-  return everyFile(root).filter((path) => readFileSync(path).includes(target)).length;
+  return everyFile(root).filter((path) => readFileSync(path).includes(target))
+    .length;
 }
 
 async function acquireEchoedActivity(session) {
@@ -100,12 +130,16 @@ test("the provider fixture really does echo credential-shaped material, so the l
   const echoing = createSyntheticSession({ echoCredentialShapedFields: true });
   const clean = createSyntheticSession();
   assert.equal(
-    (await echoing.fetchText("/activity", { page: "1" })).includes(SYNTHETIC_LEAK_CANARY),
+    (await echoing.fetchText("/activity", { page: "1" })).includes(
+      SYNTHETIC_LEAK_CANARY,
+    ),
     true,
     "the echoing session's own response carries the canary",
   );
   assert.equal(
-    (await clean.fetchText("/activity", { page: "1" })).includes(SYNTHETIC_LEAK_CANARY),
+    (await clean.fetchText("/activity", { page: "1" })).includes(
+      SYNTHETIC_LEAK_CANARY,
+    ),
     false,
     "the ordinary session does not, so the canary can only come from the echo",
   );
@@ -130,7 +164,9 @@ test("credential-shaped material a provider echoes back is absent from every byt
   // header echo, a refresh token, a device id, a long opaque session id and
   // a user profile all carry the same canary; none of them reached disk.
   assert.equal(
-    readFileSync(persisted.filePath).includes(Buffer.from(SYNTHETIC_LEAK_CANARY, "utf8")),
+    readFileSync(persisted.filePath).includes(
+      Buffer.from(SYNTHETIC_LEAK_CANARY, "utf8"),
+    ),
     false,
     "the retained document holds none of the credential-shaped material",
   );
@@ -168,7 +204,10 @@ test("the business payload survives the projection intact: an echoed pull parses
     bytes: clean.bytes,
   });
   assert.deepEqual(echoedRows, cleanRows);
-  assert.ok(echoedRows.activity.length > 0, "the projection kept the transactions");
+  assert.ok(
+    echoedRows.activity.length > 0,
+    "the projection kept the transactions",
+  );
 });
 
 test("the manifest records that a projection was applied, which declaration produced it, and what it dropped", async (t) => {
@@ -223,7 +262,9 @@ test("a dropped undeclared field opens a review item: safe, but never silent", a
   });
 
   const opened = db
-    .prepare("SELECT COUNT(*) AS n FROM review_items WHERE kind = 'retention_dropped_fields'")
+    .prepare(
+      "SELECT COUNT(*) AS n FROM review_items WHERE kind = 'retention_dropped_fields'",
+    )
     .get().n;
   assert.equal(opened, 1);
 
@@ -232,7 +273,11 @@ test("a dropped undeclared field opens a review item: safe, but never silent", a
       "SELECT COUNT(*) AS n FROM review_items WHERE raw_value LIKE ? OR reason LIKE ?",
     )
     .get(`%${SYNTHETIC_LEAK_CANARY}%`, `%${SYNTHETIC_LEAK_CANARY}%`).n;
-  assert.equal(leaked, 0, "the review item names paths, not the material it dropped");
+  assert.equal(
+    leaked,
+    0,
+    "the review item names paths, not the material it dropped",
+  );
 });
 
 test("a payload that matches its declaration exactly drops nothing and opens no review item", async (t) => {
@@ -249,7 +294,9 @@ test("a payload that matches its declaration exactly drops nothing and opens no 
   });
   assert.equal(
     db
-      .prepare("SELECT COUNT(*) AS n FROM review_items WHERE kind = 'retention_dropped_fields'")
+      .prepare(
+        "SELECT COUNT(*) AS n FROM review_items WHERE kind = 'retention_dropped_fields'",
+      )
       .get().n,
     0,
   );
@@ -266,7 +313,9 @@ test("an adapter that hashed the provider's response instead of the projection i
   // "hash the original, store the projection" mistake, backwards.
   const session = createSyntheticSession({ echoCredentialShapedFields: true });
   const responseBytes = new TextEncoder().encode(
-    JSON.stringify({ pages: [JSON.parse(await session.fetchText("/activity", { page: "1" }))] }),
+    JSON.stringify({
+      pages: [JSON.parse(await session.fetchText("/activity", { page: "1" }))],
+    }),
   );
 
   assert.throws(
@@ -278,17 +327,26 @@ test("an adapter that hashed the provider's response instead of the projection i
         acquired: {
           bytes: responseBytes,
           retention: acquired.retention,
-          manifest: { ...acquired.manifest, contentHash: sha256HexOf(responseBytes) },
+          manifest: {
+            ...acquired.manifest,
+            contentHash: sha256HexOf(responseBytes),
+          },
         },
       }),
     /does not match the sha256 .* of its retained bytes/,
   );
-  assert.equal(everyFile(root).length, 0, "the refusal happened before anything was written");
+  assert.equal(
+    everyFile(root).length,
+    0,
+    "the refusal happened before anything was written",
+  );
 });
 
 test("the raw tree writer accepts nothing but a payload the projection produced", (t) => {
   const root = rawRoot(t);
-  const bytes = new TextEncoder().encode("synthetic bytes that never went through a projection");
+  const bytes = new TextEncoder().encode(
+    "synthetic bytes that never went through a projection",
+  );
 
   assert.throws(() => writeRawDocument(root, bytes), TypeError);
   // A hand-built object with the right shape is not a RetainedPayload either:
@@ -298,7 +356,11 @@ test("the raw tree writer accepts nothing but a payload the projection produced"
       writeRawDocument(root, {
         bytes,
         sha256: sha256HexOf(bytes),
-        record: { policy: { kind: "opaque", version: "x", note: "x" }, projectionVersion: "1", droppedPaths: [] },
+        record: {
+          policy: { kind: "opaque", version: "x", note: "x" },
+          projectionVersion: "1",
+          droppedPaths: [],
+        },
       }),
     TypeError,
   );
@@ -320,14 +382,23 @@ test("a structured_api payload may not declare itself opaque: the tier that echo
   // allowlist -- with a stated reason, never a bare opt-out.
   assert.equal(
     retainPayload(
-      { kind: "opaque", version: "v1", note: "a rendered document has no addressable fields" },
+      {
+        kind: "opaque",
+        version: "v1",
+        note: "a rendered document has no addressable fields",
+      },
       bytes,
       "pdf_statement",
     ).record.policy.kind,
     "opaque",
   );
   assert.throws(
-    () => retainPayload({ kind: "opaque", version: "v1", note: "  " }, bytes, "pdf_statement"),
+    () =>
+      retainPayload(
+        { kind: "opaque", version: "v1", note: "  " },
+        bytes,
+        "pdf_statement",
+      ),
     RetentionShapeError,
   );
 });
@@ -337,7 +408,9 @@ test("a PDF-tier artifact is retained whole and says so, so no reader mistakes i
   const root = rawRoot(t);
   const session = createSyntheticSession();
   const { documents } = await syntheticAdapter.discover(session);
-  const statement = documents.items.find((item) => item.kind === "pdf_statement");
+  const statement = documents.items.find(
+    (item) => item.kind === "pdf_statement",
+  );
   const acquired = await syntheticAdapter.acquire({
     kind: "pdf_statement",
     session,
@@ -354,52 +427,91 @@ test("a PDF-tier artifact is retained whole and says so, so no reader mistakes i
   assert.equal(retention.policy.kind, "opaque");
   assert.notEqual(retention.policy.note.trim(), "");
   assert.deepEqual(retention.droppedPaths, []);
-  assert.equal(sha256HexOf(readFileSync(persisted.filePath)), acquired.manifest.contentHash);
+  assert.equal(
+    sha256HexOf(readFileSync(persisted.filePath)),
+    acquired.manifest.contentHash,
+  );
 });
 
 test("a payload shape the declaration does not describe is an error, never a silent pass-through", () => {
   const encode = (value) => new TextEncoder().encode(JSON.stringify(value));
-  const policy = (fields) => ({ kind: "json_allowlist", version: "v1", fields });
+  const policy = (fields) => ({
+    kind: "json_allowlist",
+    version: "v1",
+    fields,
+  });
 
   // A declaration that stops above a nested value would retain an object
   // nobody described. That is the pass-through, so it is refused.
   assert.throws(
-    () => retainPayload(policy(["holder"]), encode({ holder: { nested: "x" } }), "structured_api"),
+    () =>
+      retainPayload(
+        policy(["holder"]),
+        encode({ holder: { nested: "x" } }),
+        "structured_api",
+      ),
     RetentionShapeError,
   );
   // An array the declaration describes without "*".
   assert.throws(
-    () => retainPayload(policy(["items.id"]), encode({ items: [{ id: "1" }] }), "structured_api"),
+    () =>
+      retainPayload(
+        policy(["items.id"]),
+        encode({ items: [{ id: "1" }] }),
+        "structured_api",
+      ),
     RetentionShapeError,
   );
   // A declaration naming fields where the payload holds a scalar.
   assert.throws(
-    () => retainPayload(policy(["items.*.id"]), encode({ items: "not-an-array" }), "structured_api"),
+    () =>
+      retainPayload(
+        policy(["items.*.id"]),
+        encode({ items: "not-an-array" }),
+        "structured_api",
+      ),
     RetentionShapeError,
   );
   // A JSON allowlist declared over bytes that are not JSON at all.
   assert.throws(
-    () => retainPayload(policy(["a"]), new TextEncoder().encode("not json"), "structured_api"),
+    () =>
+      retainPayload(
+        policy(["a"]),
+        new TextEncoder().encode("not json"),
+        "structured_api",
+      ),
     RetentionShapeError,
   );
   // A declaration that retains nothing is a bug, not a policy.
-  assert.throws(() => retainPayload(policy([]), encode({}), "structured_api"), RetentionShapeError);
+  assert.throws(
+    () => retainPayload(policy([]), encode({}), "structured_api"),
+    RetentionShapeError,
+  );
   // A declared subtree the provider states as null is absent, not malformed.
   assert.equal(
     new TextDecoder().decode(
-      retainPayload(policy(["items.*.instrument.symbol"]), encode({ items: [{ instrument: null }] }), "structured_api")
-        .bytes,
+      retainPayload(
+        policy(["items.*.instrument.symbol"]),
+        encode({ items: [{ instrument: null }] }),
+        "structured_api",
+      ).bytes,
     ),
     '{"items":[{"instrument":null}]}',
   );
 });
 
 test("the projection is idempotent and preserves a provider's exact digits, so re-projecting at the write seam costs nothing", () => {
-  const policy = { kind: "json_allowlist", version: "v1", fields: ["amount", "count"] };
+  const policy = {
+    kind: "json_allowlist",
+    version: "v1",
+    fields: ["amount", "count"],
+  };
   // A decimal with more precision than a double holds, stated by the
   // provider as a JSON number. Re-serializing must not round it: the money
   // policy says binary floating point appears nowhere in the path.
-  const source = new TextEncoder().encode('{"amount":1.00000000000000000001,"count":3,"extra":"dropped"}');
+  const source = new TextEncoder().encode(
+    '{"amount":1.00000000000000000001,"count":3,"extra":"dropped"}',
+  );
 
   const once = retainPayload(policy, source, "structured_api");
   assert.equal(
@@ -413,8 +525,9 @@ test("the projection is idempotent and preserves a provider's exact digits, so r
   assert.deepEqual(twice.record.droppedPaths, []);
 });
 
-test("a projected pull still imports: the document rows the archive records cite the retained bytes", async (t) => {
+test("a projected pull still imports: the document rows the archive records cite the retained bytes", { skip }, async (t) => {
   const db = archive(t);
+  const client = await pgSeeded(t);
   const root = rawRoot(t);
   const acquired = await acquireEchoedActivity(
     createSyntheticSession({ echoCredentialShapedFields: true }),
@@ -430,7 +543,7 @@ test("a projected pull still imports: the document rows the archive records cite
     acquired,
   });
 
-  const documents = adapterPullToImportDocuments(db, {
+  const documents = await adapterPullToImportDocuments(client, {
     institutionId: INSTITUTION.id,
     accountId: ACCOUNT.id,
     acquired,
@@ -441,7 +554,9 @@ test("a projected pull still imports: the document rows the archive records cite
   });
   assert.ok(documents.length > 0);
   assert.equal(
-    documents.every((document) => document.filePath.startsWith(persisted.filePath)),
+    documents.every((document) =>
+      document.filePath.startsWith(persisted.filePath),
+    ),
     true,
     "every document row points at the retained file that actually exists",
   );
