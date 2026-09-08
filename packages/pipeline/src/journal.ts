@@ -30,6 +30,7 @@ import {
   type PendingRequest,
   type PlanRequest,
 } from "./journalTypes.js";
+import { validateArchiveRelocationConfig } from "./archiveRelocationConfig.js";
 
 const STATE_FILE = "state.json";
 const FILE_MODE = 0o600;
@@ -233,6 +234,29 @@ function bindingEqual(left: JournalBinding, right: JournalBinding): boolean {
     left.sourceAccountId === right.sourceAccountId &&
     left.configFingerprint === right.configFingerprint &&
     left.credentialSlot === right.credentialSlot
+  );
+}
+
+function relocationBindingPair(
+  previous: JournalBinding,
+  proposed: JournalBinding,
+): boolean {
+  return (
+    previous.protocolVersion === proposed.protocolVersion &&
+    previous.endpoint === proposed.endpoint &&
+    previous.spaceId === proposed.spaceId &&
+    previous.sourceAccountId === proposed.sourceAccountId &&
+    previous.credentialSlot === proposed.credentialSlot &&
+    previous.configFingerprint !== proposed.configFingerprint
+  );
+}
+
+function archiveCheckpointIsIdle(value: JsonValue): boolean {
+  return (
+    value !== null &&
+    !Array.isArray(value) &&
+    typeof value === "object" &&
+    value.phase === "idle"
   );
 }
 function parseRequestBody(
@@ -999,7 +1023,7 @@ export class Journal<C extends JsonValue, R extends JsonValue> {
   readonly watcherId: string;
   private readonly statePath: string;
   private readonly codec: JournalCodec<C, R>;
-  private readonly locks: Server[];
+  private locks: Server[];
   private readonly directoryIdentity: Pick<Stats, "dev" | "ino">;
   private state: StoredState;
   private parsedCheckpoint: C;
@@ -1143,6 +1167,96 @@ export class Journal<C extends JsonValue, R extends JsonValue> {
     }
   }
 
+  /**
+   * Opens an existing journal under one exact root-only configuration rebind.
+   * Unlike open(), this entrypoint never initializes a missing state file.
+   */
+  static async openExistingForArchiveRebind<
+    C extends JsonValue,
+    R extends JsonValue,
+  >(args: {
+    directory: string;
+    previousConfig: unknown;
+    proposedConfig: unknown;
+    credential: string;
+    codec: JournalCodec<C, R>;
+  }): Promise<Journal<C, R>> {
+    const validated = validateArchiveRelocationConfig(
+      args.previousConfig,
+      args.proposedConfig,
+    );
+    const previousBinding = parseBinding(validated.previousBinding);
+    const proposedBinding = parseBinding(validated.proposedBinding);
+    if (!relocationBindingPair(previousBinding, proposedBinding))
+      fail("archive rebind bindings are invalid");
+    const requestedDirectory = resolve(args.directory);
+    let locks: Server[] = [];
+    try {
+      const requestedStats = await lstat(requestedDirectory);
+      if (requestedStats.isSymbolicLink()) fail("directory is a symlink");
+      assertOwned(requestedStats, DIRECTORY_MODE, "directory");
+      const directory = await realpath(requestedDirectory);
+      const directoryStats = await lstat(directory);
+      assertOwned(directoryStats, DIRECTORY_MODE, "directory");
+      const directoryIdentity = {
+        dev: directoryStats.dev,
+        ino: directoryStats.ino,
+      };
+      locks = await acquireLocks(previousBinding, directory);
+      if ((await realpath(requestedDirectory)) !== directory)
+        fail("journal directory path changed");
+      await assertDirectoryIdentity(directory, directoryIdentity);
+      await cleanInterruptedTemps(directory);
+      await assertDirectoryIdentity(directory, directoryIdentity);
+      const stored = await readStoredState(join(directory, STATE_FILE));
+      if (stored === undefined) fail("archive rebind journal is missing");
+      const parsed = parseState(stored, args.codec);
+      if (
+        !bindingEqual(parsed.state.binding, previousBinding) &&
+        !bindingEqual(parsed.state.binding, proposedBinding)
+      )
+        fail("archive rebind journal binding is unexpected");
+      const candidateFingerprint = fingerprintCredential(
+        parsed.state.credentialSalt,
+        args.credential,
+      );
+      if (
+        !fingerprintsEqual(
+          parsed.state.credentialFingerprint,
+          candidateFingerprint,
+        )
+      )
+        throw new JournalCredentialChangedError();
+      if (
+        parsed.state.pending !== undefined ||
+        parsed.state.credentialSessionActive ||
+        !archiveCheckpointIsIdle(parsed.checkpoint)
+      )
+        fail("archive rebind requires an idle journal");
+      return new Journal<C, R>({
+        directory,
+        binding: parsed.state.binding,
+        codec: args.codec,
+        locks,
+        directoryIdentity,
+        state: parsed.state,
+        checkpoint: parsed.checkpoint,
+        result: parsed.result,
+      });
+    } catch (error) {
+      await closeServers(locks).catch(() => undefined);
+      if (
+        error instanceof JournalSafetyError ||
+        error instanceof JournalLockedError ||
+        error instanceof JournalCredentialChangedError
+      )
+        throw error;
+      throw new JournalSafetyError(
+        "archive rebind journal could not be opened safely",
+      );
+    }
+  }
+
   get credentialStatus(): JournalCredentialStatus {
     this.assertUsable(false);
     return this.candidateCredentialFingerprint === undefined
@@ -1168,6 +1282,95 @@ export class Journal<C extends JsonValue, R extends JsonValue> {
             },
           }),
     }) as PendingRequest<R>;
+  }
+  async archiveRelocationRebindStatus(args: {
+    previousConfig: unknown;
+    proposedConfig: unknown;
+  }): Promise<{
+    state: "previous" | "proposed";
+    stateSha256: string;
+    previousStateSha256: string;
+    proposedStateSha256: string;
+  }> {
+    this.assertUsable();
+    const validated = validateArchiveRelocationConfig(
+      args.previousConfig,
+      args.proposedConfig,
+    );
+    const previousBinding = parseBinding(validated.previousBinding);
+    const proposedBinding = parseBinding(validated.proposedBinding);
+    if (
+      !relocationBindingPair(previousBinding, proposedBinding) ||
+      (!bindingEqual(this.binding, previousBinding) &&
+        !bindingEqual(this.binding, proposedBinding)) ||
+      this.state.pending !== undefined ||
+      this.state.credentialSessionActive ||
+      !archiveCheckpointIsIdle(this.parsedCheckpoint)
+    )
+      fail("archive rebind state is invalid");
+    const stored = await readStoredState(this.statePath);
+    if (stored === undefined) fail("archive rebind journal is missing");
+    const parsed = parseState(stored, this.codec);
+    if (
+      !bindingEqual(parsed.state.binding, this.binding) ||
+      serializeState(parsed.state) !== serializeState(this.state)
+    )
+      fail("archive rebind journal changed");
+    const previousState = { ...this.state, binding: previousBinding };
+    const proposedState = { ...this.state, binding: proposedBinding };
+    return {
+      state: bindingEqual(this.binding, previousBinding)
+        ? "previous"
+        : "proposed",
+      stateSha256: sha256Hex(serializeState(this.state)),
+      previousStateSha256: sha256Hex(serializeState(previousState)),
+      proposedStateSha256: sha256Hex(serializeState(proposedState)),
+    };
+  }
+  /**
+   * Rewrites only the journal binding while retaining the held authority/path
+   * locks. The old object is invalidated and ownership of its locks transfers
+   * to the returned object, whose heartbeat identity reflects the new binding.
+   */
+  async rebindForArchiveRelocation(args: {
+    previousConfig: unknown;
+    proposedConfig: unknown;
+  }): Promise<Journal<C, R>> {
+    const validated = validateArchiveRelocationConfig(
+      args.previousConfig,
+      args.proposedConfig,
+    );
+    const previousBinding = parseBinding(validated.previousBinding);
+    const proposedBinding = parseBinding(validated.proposedBinding);
+    const status = await this.archiveRelocationRebindStatus(args);
+    if (bindingEqual(this.binding, proposedBinding)) return this;
+    if (status.state !== "previous") fail("archive rebind state is invalid");
+    const next: StoredState = { ...this.state, binding: proposedBinding };
+    await this.persistCandidate(next);
+    try {
+      const storedAfter = await readStoredState(this.statePath);
+      if (storedAfter === undefined) fail("archive rebind journal is missing");
+      const parsedAfter = parseState(storedAfter, this.codec);
+      if (serializeState(parsedAfter.state) !== serializeState(next))
+        fail("archive rebind journal readback changed");
+    } catch (error) {
+      this.poisoned = true;
+      throw error;
+    }
+    const transferredLocks = this.locks;
+    this.locks = [];
+    this.closed = true;
+    this.candidateCredentialFingerprint = undefined;
+    this.state = next;
+    return new Journal<C, R>({
+      directory: this.directory,
+      binding: proposedBinding,
+      codec: this.codec,
+      locks: transferredLocks,
+      directoryIdentity: this.directoryIdentity,
+      state: next,
+      checkpoint: this.parsedCheckpoint,
+    });
   }
   private assertUsable(requireCurrentCredential = true): void {
     if (this.closed) fail("journal is closed");
