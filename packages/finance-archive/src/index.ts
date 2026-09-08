@@ -88,6 +88,11 @@ export {
   type ReconciliationStatus,
 } from "./reconciliation.js";
 export {
+  runPositionReconciliationGate,
+  type PositionCoverageGap,
+  type PositionReconciliationGateSummary,
+} from "./positionReconciliation.js";
+export {
   adapterPullToImportDocuments,
   persistAcquiredDocument,
   recordRetainedTextPath,

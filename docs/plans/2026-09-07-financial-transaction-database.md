@@ -159,7 +159,11 @@ import_runs(id, started_at, finished_at, source, files_seen, rows_inserted,
             review_items, notes)
 
 reconciliations(id, account_id, period_start, period_end, expected_change,
-                computed_change, delta, status, notes)
+                computed_change, delta, currency, tolerance, status, notes)
+
+position_reconciliations(id, account_id, instrument_id, period_start, period_end,
+                         expected_change, computed_change, delta, tolerance,
+                         status, notes)
 
 review_items(id, kind, account_id, source_document_id, source_locator,
              raw_value, reason, status, resolved_at, resolution_note)
@@ -261,6 +265,16 @@ A quantity reconciliation also reports coverage rather than only correctness.
 When derived change cannot explain stated change because history does not reach
 far enough back, that is a measurement of how much history is missing, and it
 belongs in coverage rather than being silently tolerated.
+
+The gate writes to `position_reconciliations`, not to `reconciliations`. The
+two tables are separate because cash change is integer minor units and quantity
+change is canonical decimal text, and the storage-class checks that keep a
+float out are per column. Keeping them apart also keeps a cash verdict and a
+position verdict distinguishable: one table would make every existing query for
+unverified periods return per-instrument rows instead. `get_coverage` reports
+position periods as status counts per account plus whether transaction history
+begins after the account's first stated position, which is the coverage gap
+measured rather than tolerated.
 
 Ongoing maintenance needs no browser session. A statement carries both its
 positions table and its activity table, so each new document reconciles itself.

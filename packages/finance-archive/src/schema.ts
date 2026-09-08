@@ -215,9 +215,56 @@ ALTER TABLE balances ADD COLUMN source_locator TEXT;
 ALTER TABLE liabilities ADD COLUMN source_locator TEXT;
 `;
 
+// F1-17: the position quantity gate is per account, per instrument, per
+// period, and `reconciliations` is per account and period with no
+// instrument. It gets its own table rather than an `instrument_id` column on
+// that one, for two reasons that are not stylistic:
+//
+//   1. Cash change is INTEGER minor units and quantity change is canonical
+//      decimal TEXT. Those are different storage classes, and the CHECK
+//      constraints that pin them are how a REAL from a parser is caught at
+//      write time. Sharing `expected_change`/`computed_change`/`delta`/
+//      `tolerance` between the two would mean dropping exactly those checks.
+//      `reconciliations.currency` is also NOT NULL and meaningless for a
+//      share count.
+//   2. A cash verdict and a position verdict must stay distinguishable. With
+//      one table, every existing `SELECT ... FROM reconciliations WHERE
+//      status != 'pass'` would silently start returning per-instrument rows
+//      and every account's period list would multiply by its instrument
+//      count. Two tables make the distinction the table name, which no query
+//      can miss.
+//
+// Additive, so it cannot lose data.
+const ADD_POSITION_RECONCILIATIONS = `
+CREATE TABLE position_reconciliations (
+  id TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL REFERENCES accounts(id),
+  instrument_id TEXT NOT NULL REFERENCES instruments(id),
+  period_start TEXT NOT NULL CHECK (period_start GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+  period_end TEXT NOT NULL CHECK (period_end GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+  -- Quantities, so canonical decimal TEXT and never INTEGER or REAL.
+  expected_change TEXT CHECK (typeof(expected_change) IN ('text', 'null')),
+  computed_change TEXT CHECK (typeof(computed_change) IN ('text', 'null')),
+  delta TEXT CHECK (typeof(delta) IN ('text', 'null')),
+  -- The gate tolerance is exact zero; the value is recorded per period so a
+  -- passing period says what it was allowed.
+  tolerance TEXT NOT NULL DEFAULT '0' CHECK (typeof(tolerance) = 'text'),
+  status TEXT NOT NULL CHECK (status IN ('pass', 'fail', 'unverified')),
+  notes TEXT
+);
+
+CREATE INDEX position_reconciliations_account_period
+  ON position_reconciliations (account_id, instrument_id, period_start, period_end);
+`;
+
 export const MIGRATIONS: readonly Migration[] = Object.freeze([
   { version: 1, name: "initial archive schema", sql: INITIAL_SCHEMA },
   { version: 2, name: "add holdings source_locator", sql: ADD_HOLDINGS_SOURCE_LOCATOR },
+  {
+    version: 3,
+    name: "add position_reconciliations",
+    sql: ADD_POSITION_RECONCILIATIONS,
+  },
 ]);
 
 export const ARCHIVE_SCHEMA_VERSION: number = MIGRATIONS.at(-1)?.version ?? 0;
