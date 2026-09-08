@@ -9,6 +9,7 @@ import {
   opendir,
   realpath,
   readlink,
+  rmdir,
   unlink,
 } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -26,7 +27,7 @@ const MAX_PATH_BYTES = 4_096;
 const MAX_JSON_NODES = 50_000;
 const MAX_JSON_DEPTH = 48;
 const MAX_MODEL_LOCK_BYTES = 4 * 1024 * 1024;
-const PROCESS_MONITOR_TIMEOUT_MS = 250;
+const PROCESS_MONITOR_TIMEOUT_MS = 1_000;
 const EXPECTED_RUNTIME_VERSIONS = {
   docling: "2.126.0",
   "docling-core": "2.95.0",
@@ -107,11 +108,120 @@ export type RunCapturedPdfParserInput = {
   limits?: ParserProcessLimits;
 };
 
+export type PreparePdfDocQaProfileInput = {
+  pythonExecutable: string;
+  expectedPythonSha256: string;
+  launcherPath: string;
+  expectedLauncherSha256: string;
+  packageRoot: string;
+  modelAssetsPath: string;
+  modelLockPath: string;
+  expectedModelLockSha256: string;
+  workRoot: string;
+  work: ParserProfileWorkIntent;
+  limits?: ParserProcessLimits;
+};
+
+export type ParserProfileWorkIntent = {
+  workId: string;
+  path: string;
+  workRoot: { device: number; inode: number };
+  workDirectory: { device: number; inode: number };
+};
+
+export type PreparedPdfDocQaProfile = {
+  state: "ready";
+  parserFingerprint: string;
+  extractionConfigurationFingerprint: string;
+  modelManifestSha256: string;
+  isolation: {
+    networkDenied: true;
+    processForkDenied: true;
+    processExecDenied: true;
+    rssBoundary: "sampled_process_tree";
+    pollIntervalMs: number;
+    monitorCommandTimeoutMs: number;
+  };
+};
+
 export type ParsedArtifactIdentity = {
   path: string;
+  device: number;
+  inode: number;
   sha256: string;
   byteLength: number;
   mediaType: "application/vnd.docling+json" | "application/json";
+};
+
+export type ParserOutputIntent = {
+  outputId: string;
+  outputRoot: { device: number; inode: number };
+  outputDirectory: { device: number; inode: number };
+};
+
+export type ValidatedNormalizedBundle = {
+  schemaVersion: 1;
+  candidate: "docling-standard-cpu-ocr";
+  sourceSha256: string;
+  parserFingerprint: Record<string, unknown>;
+  extractionFingerprint: Record<string, unknown>;
+  pages: Array<{
+    page: number;
+    text: string;
+    segments: Array<{
+      id: string;
+      text: string;
+      startUtf16: number;
+      endUtf16: number;
+      citable: true;
+      locator:
+        | {
+            kind: "docling_item";
+            itemRef: string;
+            provenance: Record<string, unknown>;
+            doclingCharspanSemantics: "item_local_python_codepoints_not_evidence";
+          }
+        | {
+            kind: "docling_table_row";
+            tableProvenance: Record<string, unknown>;
+            cells: Array<Record<string, unknown>>;
+          };
+    }>;
+  }>;
+  mappingGaps: Array<{
+    kind: "ambiguous_text_provenance" | "ambiguous_table_provenance";
+    item: number;
+  }>;
+};
+
+export type ResolvedParserLocator = {
+  kind: "item" | "table";
+  ref: string;
+};
+
+export type ValidatedNormalizedBundleResult = {
+  bundle: ValidatedNormalizedBundle;
+  resolvedLocators: Record<string, ResolvedParserLocator>;
+};
+
+export type DurableParserOutputArtifacts = {
+  outputId: string;
+  outputRoot: { device: number; inode: number };
+  outputDirectory: { device: number; inode: number };
+  sourceSha256: string;
+  rawArtifact: ParsedArtifactIdentity;
+  normalizedBundle: ParsedArtifactIdentity;
+  parserFingerprint: string;
+  extractionConfigurationFingerprint: string;
+  extractionFingerprint: string;
+  modelManifestSha256: string;
+  pageCount: number;
+};
+
+export type RecoveredParserOutput = {
+  state: "recovered";
+  artifacts: DurableParserOutputArtifacts;
+  validated: ValidatedNormalizedBundleResult;
 };
 
 export type CapturedPdfParserResult = {
@@ -125,6 +235,8 @@ export type CapturedPdfParserResult = {
   extractionFingerprint: string;
   modelManifestSha256: string;
   pageCount: number;
+  artifacts: DurableParserOutputArtifacts;
+  validated: ValidatedNormalizedBundleResult;
   peakRssBytes: number;
   elapsedMs: number;
   isolation: {
@@ -451,12 +563,12 @@ function sandboxProfile(paths: {
   packageRoot: string;
   modelAssets: string;
   modelLock: string;
-  capture: string;
+  capture?: string;
   output: string;
 }): string {
   const literalReads = [
     paths.modelLock,
-    paths.capture,
+    ...(paths.capture === undefined ? [] : [paths.capture]),
     "/",
     "/dev/urandom",
     "/private/etc/apache2/mime.types",
@@ -601,6 +713,15 @@ async function runSandboxed(
   let peakRssBytes = 0;
   let failure: ParserProcessError | undefined;
   let closed = false;
+  const wallDeadline = setTimeout(() => {
+    if (closed) return;
+    failure ??= new ParserProcessError(
+      "process_timeout",
+      "parser exceeded its wall deadline",
+    );
+    killGroup(child);
+  }, limits.wallDeadlineMs);
+  wallDeadline.unref();
   const completion = new Promise<{
     code: number | null;
     signal: NodeJS.Signals | null;
@@ -644,19 +765,19 @@ async function runSandboxed(
         try {
           const usage = await processTree(child.pid);
           peakRssBytes = Math.max(peakRssBytes, usage.rssBytes);
-          if (usage.count > limits.maxProcessCount) {
+          if (!failure && usage.count > limits.maxProcessCount) {
             failure = new ParserProcessError(
               "process_count_exceeded",
               "parser process count exceeded its bound",
             );
-          } else if (usage.rssBytes > limits.maxRssBytes) {
+          } else if (!failure && usage.rssBytes > limits.maxRssBytes) {
             failure = new ParserProcessError(
               "monitored_rss_exceeded",
               "parser exceeded its monitored RSS boundary",
             );
           }
         } catch (error) {
-          failure =
+          failure ??=
             error instanceof ParserProcessError
               ? error
               : new ParserProcessError(
@@ -676,10 +797,12 @@ async function runSandboxed(
   try {
     status = await completion;
   } catch (error) {
+    clearTimeout(wallDeadline);
     killGroup(child);
     await monitor.catch(() => undefined);
     safeRethrow(error, "sandbox_failed", "sandbox failed");
   }
+  clearTimeout(wallDeadline);
   await monitor;
   if (failure) throw failure;
   if (
@@ -955,6 +1078,50 @@ function validateParserFingerprint(
   return fingerprint(parser, true);
 }
 
+function validateExtractionConfigurationFingerprint(
+  value: unknown,
+  parserFingerprint: string,
+): string {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    !exactKeys(value, [
+      "schemaVersion",
+      "parserFingerprint",
+      "implementationSha256",
+      "configuration",
+      "fingerprint",
+    ])
+  )
+    fail("output_invalid", "extraction configuration shape is invalid");
+  const descriptor = value as Record<string, unknown>;
+  const configuration = descriptor.configuration;
+  if (
+    descriptor.schemaVersion !== 1 ||
+    descriptor.parserFingerprint !== parserFingerprint ||
+    !SHA256.test(String(descriptor.implementationSha256 ?? "")) ||
+    !configuration ||
+    typeof configuration !== "object" ||
+    Array.isArray(configuration) ||
+    !exactKeys(configuration, [
+      "mappingFormat",
+      "maxPages",
+      "maxRetainedUtf8Bytes",
+      "maxBundleBytes",
+    ]) ||
+    (configuration as Record<string, unknown>).mappingFormat !==
+      "docling_utf16_pages_v1" ||
+    (configuration as Record<string, unknown>).maxPages !== 32 ||
+    (configuration as Record<string, unknown>).maxRetainedUtf8Bytes !==
+      256 * 1024 ||
+    (configuration as Record<string, unknown>).maxBundleBytes !==
+      4 * 1024 * 1024
+  )
+    fail("output_invalid", "extraction configuration is invalid");
+  return fingerprint(descriptor);
+}
+
 function validateBundle(
   value: unknown,
   capture: CapturedPdf,
@@ -965,6 +1132,7 @@ function validateBundle(
   extractionConfigurationFingerprint: string;
   extractionFingerprint: string;
   pageCount: number;
+  bundle: ValidatedNormalizedBundle;
 } {
   if (!value || typeof value !== "object" || Array.isArray(value))
     fail("output_invalid", "normalized bundle is invalid");
@@ -1025,40 +1193,17 @@ function validateBundle(
       "extraction fingerprint is not bound to the raw artifact",
     );
   }
-  const configurationDescriptor = {
-    schemaVersion: 1,
-    parserFingerprint,
-    implementationSha256: extractionRecord.implementationSha256,
-    configuration: extractionRecord.configuration,
-  };
-  const extractionConfiguration = extractionRecord.configuration;
-  if (
-    !extractionConfiguration ||
-    typeof extractionConfiguration !== "object" ||
-    Array.isArray(extractionConfiguration) ||
-    !exactKeys(extractionConfiguration, [
-      "mappingFormat",
-      "maxPages",
-      "maxRetainedUtf8Bytes",
-      "maxBundleBytes",
-    ]) ||
-    (extractionConfiguration as Record<string, unknown>).mappingFormat !==
-      "docling_utf16_pages_v1" ||
-    (extractionConfiguration as Record<string, unknown>).maxPages !== 32 ||
-    (extractionConfiguration as Record<string, unknown>)
-      .maxRetainedUtf8Bytes !==
-      256 * 1024 ||
-    (extractionConfiguration as Record<string, unknown>).maxBundleBytes !==
-      4 * 1024 * 1024
-  ) {
-    fail("output_invalid", "extraction configuration is invalid");
-  }
-  if (
-    digest(canonicalJson(configurationDescriptor)) !==
-    extractionRecord.extractionConfigurationFingerprint
-  ) {
-    fail("output_invalid", "extraction configuration fingerprint is invalid");
-  }
+  const extractionConfigurationFingerprint =
+    validateExtractionConfigurationFingerprint(
+      {
+        schemaVersion: 1,
+        parserFingerprint,
+        implementationSha256: extractionRecord.implementationSha256,
+        configuration: extractionRecord.configuration,
+        fingerprint: extractionRecord.extractionConfigurationFingerprint,
+      },
+      parserFingerprint,
+    );
   const expectedExtraction = createHash("sha256")
     .update(Buffer.from("kith-parsed-extraction:v1\0", "utf8"))
     .update(
@@ -1073,8 +1218,6 @@ function validateBundle(
     fail("output_invalid", "extraction fingerprint is invalid");
   }
   const extractionFingerprint = expectedExtraction;
-  const extractionConfigurationFingerprint =
-    extractionRecord.extractionConfigurationFingerprint as string;
   if (
     !Array.isArray(bundle.pages) ||
     !integer(bundle.pages.length, 1, 32) ||
@@ -1084,6 +1227,7 @@ function validateBundle(
     fail("output_invalid", "normalized page or gap count is invalid");
   }
   const segmentIds = new Set<string>();
+  const locatorIdentities = new Set<string>();
   let retainedBytes = 0;
   for (let pageIndex = 0; pageIndex < bundle.pages.length; pageIndex += 1) {
     const page = bundle.pages[pageIndex];
@@ -1175,6 +1319,10 @@ function validateBundle(
         validateProvenance(locator.tableProvenance, pageIndex + 1);
         for (const cell of locator.cells) validateTableCell(cell);
       } else fail("output_invalid", "locator kind is invalid");
+      const locatorIdentity = canonicalJson(locator).toString("base64");
+      if (locatorIdentities.has(locatorIdentity))
+        fail("output_invalid", "normalized locator is duplicated");
+      locatorIdentities.add(locatorIdentity);
       segmentIds.add(row.id);
       texts.push(row.text);
       priorEnd = row.endUtf16;
@@ -1203,6 +1351,186 @@ function validateBundle(
     extractionConfigurationFingerprint,
     extractionFingerprint,
     pageCount: bundle.pages.length,
+    bundle: structuredClone(bundle) as ValidatedNormalizedBundle,
+  };
+}
+
+function normalizedRawText(value: string): string {
+  return value
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .normalize("NFC")
+    .replace(/^\n+|\n+$/g, "");
+}
+
+function canonicalIdentity(value: unknown): string {
+  return canonicalJson(value).toString("base64");
+}
+
+function resolveRawLocators(
+  rawValue: unknown,
+  bundle: ValidatedNormalizedBundle,
+): Record<string, ResolvedParserLocator> {
+  if (!rawValue || typeof rawValue !== "object" || Array.isArray(rawValue))
+    fail("output_invalid", "raw parser artifact is invalid");
+  const raw = rawValue as Record<string, unknown>;
+  if (!Array.isArray(raw.texts) || !Array.isArray(raw.tables))
+    fail("output_invalid", "raw parser artifact lacks locator parents");
+  const result = Object.create(null) as Record<string, ResolvedParserLocator>;
+  for (const page of bundle.pages) {
+    for (const segment of page.segments) {
+      const locator = segment.locator;
+      if (locator.kind === "docling_item") {
+        const matches = raw.texts.filter((candidate) => {
+          if (
+            !candidate ||
+            typeof candidate !== "object" ||
+            Array.isArray(candidate)
+          )
+            return false;
+          const item = candidate as Record<string, unknown>;
+          return (
+            item.self_ref === locator.itemRef &&
+            Array.isArray(item.prov) &&
+            item.prov.length === 1 &&
+            canonicalIdentity(item.prov[0]) ===
+              canonicalIdentity(locator.provenance) &&
+            typeof item.text === "string" &&
+            normalizedRawText(item.text) === segment.text
+          );
+        });
+        if (
+          matches.length !== 1 ||
+          !/^#\/texts\/(?:0|[1-9][0-9]{0,6})$/.test(locator.itemRef)
+        )
+          fail("output_invalid", "item locator does not bind one raw item");
+        const index = Number(locator.itemRef.slice("#/texts/".length));
+        if (raw.texts[index] !== matches[0])
+          fail("output_invalid", "item locator index is inconsistent");
+        result[segment.id] = { kind: "item", ref: locator.itemRef };
+        continue;
+      }
+
+      const rowOffsets = new Set(
+        locator.cells.map((cell) => cell.start_row_offset_idx),
+      );
+      if (rowOffsets.size !== 1)
+        fail("output_invalid", "table row is ambiguous");
+      const sourceRowOffset = [...rowOffsets][0];
+      if (!integer(sourceRowOffset, 0, 4096))
+        fail("output_invalid", "table row offset is invalid");
+      const expectedCells = locator.cells
+        .map(canonicalIdentity)
+        .sort()
+        .join("\0");
+      const matchingTables: Array<{ ref: string }> = [];
+      for (let index = 0; index < raw.tables.length; index += 1) {
+        const candidate = raw.tables[index];
+        if (
+          !candidate ||
+          typeof candidate !== "object" ||
+          Array.isArray(candidate)
+        )
+          continue;
+        const table = candidate as Record<string, unknown>;
+        const provenance =
+          Array.isArray(table.prov) && table.prov.length === 1
+            ? table.prov[0]
+            : undefined;
+        const provenanceRecord =
+          provenance &&
+          typeof provenance === "object" &&
+          !Array.isArray(provenance)
+            ? (provenance as Record<string, unknown>)
+            : undefined;
+        const samePage = provenanceRecord?.page_no === page.page;
+        if (
+          !samePage ||
+          canonicalIdentity(provenance) !==
+            canonicalIdentity(locator.tableProvenance) ||
+          typeof table.self_ref !== "string" ||
+          table.self_ref !== `#/tables/${index}`
+        )
+          continue;
+        const data =
+          table.data &&
+          typeof table.data === "object" &&
+          !Array.isArray(table.data)
+            ? (table.data as Record<string, unknown>)
+            : undefined;
+        const cells = Array.isArray(data?.table_cells)
+          ? data.table_cells.filter((cell) => {
+              return (
+                cell !== null &&
+                typeof cell === "object" &&
+                !Array.isArray(cell) &&
+                (cell as Record<string, unknown>).start_row_offset_idx ===
+                  sourceRowOffset
+              );
+            })
+          : [];
+        if (cells.map(canonicalIdentity).sort().join("\0") !== expectedCells)
+          continue;
+        const orderedCells = [...locator.cells].sort(
+          (left, right) =>
+            Number(left.start_col_offset_idx) -
+            Number(right.start_col_offset_idx),
+        );
+        const maxColumn = Math.max(
+          ...orderedCells.map((cell) => Number(cell.end_col_offset_idx)),
+        );
+        const values = Array.from({ length: maxColumn }, () => "");
+        for (const cell of orderedCells) {
+          const start = Number(cell.start_col_offset_idx);
+          const end = Number(cell.end_col_offset_idx);
+          if (
+            !integer(start, 0, 4095) ||
+            !integer(end, start + 1, 4096) ||
+            typeof cell.text !== "string"
+          )
+            fail("output_invalid", "table cell text is invalid");
+          for (let column = start; column < end; column += 1)
+            values[column] = normalizedRawText(cell.text);
+        }
+        if (normalizedRawText(values.join(" | ")) !== segment.text)
+          fail("output_invalid", "table row text is inconsistent");
+        matchingTables.push({ ref: table.self_ref });
+      }
+      if (matchingTables.length !== 1)
+        fail("output_invalid", "table locator does not bind one raw table");
+      const segmentPattern = new RegExp(
+        `^docling-table-${page.page}-(?:0|[1-9][0-9]{0,6})-row-${sourceRowOffset}$`,
+      );
+      if (!segmentPattern.test(segment.id))
+        fail("output_invalid", "table segment identity is inconsistent");
+      result[segment.id] = { kind: "table", ref: matchingTables[0]!.ref };
+    }
+  }
+  const segmentCount = bundle.pages.reduce(
+    (count, page) => count + page.segments.length,
+    0,
+  );
+  if (Object.keys(result).length !== segmentCount)
+    fail("output_invalid", "locator resolution is incomplete");
+  return result;
+}
+
+function validateBundleAndRaw(
+  rawValue: unknown,
+  bundleValue: unknown,
+  capture: CapturedPdf,
+  modelManifestSha256: string,
+  rawSha256: string,
+) {
+  const validated = validateBundle(
+    bundleValue,
+    capture,
+    modelManifestSha256,
+    rawSha256,
+  );
+  return {
+    ...validated,
+    resolvedLocators: resolveRawLocators(rawValue, validated.bundle),
   };
 }
 
@@ -1264,6 +1592,832 @@ function parseLauncherResult(bytes: Buffer): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+async function requireSandboxIsolation(input: {
+  profile: string;
+  python: string;
+  launcher: string;
+  environment: NodeJS.ProcessEnv;
+  common: string[];
+  limits: ParserProcessLimits;
+}): Promise<void> {
+  const network = parseLauncherResult(
+    (
+      await runSandboxed(
+        input.profile,
+        input.python,
+        input.launcher,
+        ["--mode", "network-probe", ...input.common],
+        input.environment,
+        input.limits,
+      )
+    ).stdout,
+  );
+  if (
+    !exactKeys(network, ["state", "probe"]) ||
+    network.state !== "complete" ||
+    network.probe !== "network_denied"
+  )
+    fail("network_not_denied", "network denial probe failed");
+  const fork = parseLauncherResult(
+    (
+      await runSandboxed(
+        input.profile,
+        input.python,
+        input.launcher,
+        ["--mode", "process-probe", ...input.common],
+        input.environment,
+        input.limits,
+      )
+    ).stdout,
+  );
+  if (
+    !exactKeys(fork, ["state", "probe"]) ||
+    fork.state !== "complete" ||
+    fork.probe !== "fork_denied"
+  )
+    fail("process_escape_not_denied", "process fork denial probe failed");
+  const executable = parseLauncherResult(
+    (
+      await runSandboxed(
+        input.profile,
+        input.python,
+        input.launcher,
+        ["--mode", "exec-probe", ...input.common],
+        input.environment,
+        input.limits,
+      )
+    ).stdout,
+  );
+  if (
+    !exactKeys(executable, ["state", "probe"]) ||
+    executable.state !== "complete" ||
+    executable.probe !== "exec_denied"
+  )
+    fail("process_escape_not_denied", "process exec denial probe failed");
+}
+
+async function inspectAuxiliaryOutputDirectory(
+  path: string,
+  remove = false,
+): Promise<void> {
+  const entry = await lstat(path).catch(() =>
+    fail("output_invalid", "parser auxiliary output is unavailable"),
+  );
+  if (
+    entry.isSymbolicLink() ||
+    !entry.isDirectory() ||
+    entry.uid !== uid() ||
+    (entry.mode & 0o777) !== 0o700
+  )
+    fail("output_invalid", "parser auxiliary output is unsafe");
+  let nodes = 0;
+  const visit = async (directoryPath: string, depth: number): Promise<void> => {
+    if (depth > 32)
+      fail("output_invalid", "parser auxiliary output exceeds its bound");
+    const directoryEntry = await lstat(directoryPath).catch(() =>
+      fail("output_invalid", "parser auxiliary output changed"),
+    );
+    if (
+      directoryEntry.isSymbolicLink() ||
+      !directoryEntry.isDirectory() ||
+      directoryEntry.uid !== uid()
+    )
+      fail("output_invalid", "parser auxiliary output is unsafe");
+    const directory = await opendir(directoryPath).catch(() =>
+      fail("output_invalid", "parser auxiliary output cannot be inspected"),
+    );
+    const children: Array<{
+      path: string;
+      device: number;
+      inode: number;
+      kind: "directory" | "entry";
+    }> = [];
+    try {
+      for await (const child of directory) {
+        nodes += 1;
+        if (nodes > 4096)
+          fail("output_invalid", "parser auxiliary output exceeds its bound");
+        const childPath = join(directoryPath, child.name);
+        const childEntry = await lstat(childPath).catch(() =>
+          fail("output_invalid", "parser auxiliary output changed"),
+        );
+        if (
+          childEntry.uid !== uid() ||
+          (!childEntry.isDirectory() &&
+            !childEntry.isFile() &&
+            !childEntry.isSymbolicLink())
+        )
+          fail("output_invalid", "parser auxiliary output is unsafe");
+        children.push({
+          path: childPath,
+          device: childEntry.dev,
+          inode: childEntry.ino,
+          kind: childEntry.isDirectory() ? "directory" : "entry",
+        });
+      }
+    } finally {
+      await directory.close().catch(() => undefined);
+    }
+    for (const child of children) {
+      if (child.kind === "directory") await visit(child.path, depth + 1);
+      if (remove) {
+        const current = await lstat(child.path).catch(() =>
+          fail("unsafe_path", "parser auxiliary output changed"),
+        );
+        if (current.dev !== child.device || current.ino !== child.inode)
+          fail("unsafe_path", "parser auxiliary output changed");
+        if (child.kind === "directory")
+          await rmdir(child.path).catch(() =>
+            fail("unsafe_path", "parser auxiliary output could not be removed"),
+          );
+        else
+          await unlink(child.path).catch(() =>
+            fail("unsafe_path", "parser auxiliary output could not be removed"),
+          );
+      }
+    }
+  };
+  await visit(path, 0);
+}
+
+async function requireParserOutputEntries(
+  directory: DirectoryIdentity,
+  outputId: string,
+  allowEmpty: boolean,
+): Promise<void> {
+  const entries = await opendir(directory.path).catch(() =>
+    fail("output_invalid", "parser output directory cannot be inspected"),
+  );
+  const names: string[] = [];
+  try {
+    for await (const entry of entries) {
+      names.push(entry.name);
+      if (names.length > 4)
+        fail("output_invalid", "parser output directory has extra entries");
+    }
+  } finally {
+    await entries.close().catch(() => undefined);
+  }
+  if (allowEmpty && names.length === 0) return;
+  if (allowEmpty)
+    fail("destination_exists", "parser output directory is not empty");
+  const required = new Set(["lossless.json", "bundle.json"]);
+  const auxiliary = new Set([`.home-${outputId}`, `.tmp-${outputId}`]);
+  for (const name of names) {
+    if (required.delete(name)) continue;
+    if (!auxiliary.delete(name))
+      fail("output_invalid", "parser output directory has an unknown entry");
+    await inspectAuxiliaryOutputDirectory(join(directory.path, name));
+  }
+  if (required.size !== 0)
+    fail("output_invalid", "parser output is incomplete");
+}
+
+export async function inspectParserOutputIntent(input: {
+  outputRoot: string;
+  outputId: string;
+  requireEmpty?: boolean;
+}): Promise<ParserOutputIntent> {
+  requiredPlatform();
+  if (!OPAQUE_ID.test(input.outputId))
+    fail("invalid_input", "parser output ID is invalid");
+  const root = await trustedDirectory(input.outputRoot, "parser output root", {
+    private: true,
+    rejectBroad: true,
+  });
+  const directory = await trustedDirectory(
+    join(root.path, input.outputId),
+    "parser output directory",
+    { private: true, rejectBroad: true },
+  );
+  if (
+    dirname(directory.path) !== root.path ||
+    basename(directory.path) !== input.outputId
+  )
+    fail("unsafe_path", "parser output directory is inconsistent");
+  if (input.requireEmpty !== false)
+    await requireParserOutputEntries(directory, input.outputId, true);
+  await recheckDirectory(root, "parser output root");
+  await recheckDirectory(directory, "parser output directory");
+  return {
+    outputId: input.outputId,
+    outputRoot: { device: root.device, inode: root.inode },
+    outputDirectory: { device: directory.device, inode: directory.inode },
+  };
+}
+
+export async function inspectCapturedPdfParserOutput(input: {
+  capture: CapturedPdf;
+  outputRoot: string;
+  outputIntent: ParserOutputIntent;
+  expectedParserFingerprint: string;
+  expectedExtractionConfigurationFingerprint: string;
+  expectedModelManifestSha256: string;
+  limits?: ParserProcessLimits;
+}): Promise<RecoveredParserOutput> {
+  requiredPlatform();
+  const limits = validateLimits(input.limits);
+  if (
+    !OPAQUE_ID.test(input.outputIntent.outputId) ||
+    !SHA256.test(input.expectedParserFingerprint) ||
+    !SHA256.test(input.expectedExtractionConfigurationFingerprint) ||
+    !SHA256.test(input.expectedModelManifestSha256)
+  )
+    fail("invalid_input", "parser recovery identity is invalid");
+  const root = await trustedDirectory(input.outputRoot, "parser output root", {
+    private: true,
+    rejectBroad: true,
+  });
+  const directory = await trustedDirectory(
+    join(root.path, input.outputIntent.outputId),
+    "parser output directory",
+    { private: true, rejectBroad: true },
+  );
+  if (
+    root.device !== input.outputIntent.outputRoot.device ||
+    root.inode !== input.outputIntent.outputRoot.inode ||
+    directory.device !== input.outputIntent.outputDirectory.device ||
+    directory.inode !== input.outputIntent.outputDirectory.inode ||
+    dirname(directory.path) !== root.path ||
+    basename(directory.path) !== input.outputIntent.outputId
+  )
+    fail("unsafe_path", "parser output intent changed");
+  await requireParserOutputEntries(
+    directory,
+    input.outputIntent.outputId,
+    false,
+  );
+  const capture = await inspectCapturedPdf({
+    captureDirectory: input.capture.captureDirectory.path,
+    captureId: input.capture.captureId,
+    expected: {
+      sha256: input.capture.sha256,
+      byteLength: input.capture.byteLength,
+      sourceModifiedAt: input.capture.sourceModifiedAt,
+    },
+    expectedDirectory: input.capture.captureDirectory,
+  });
+  if (
+    capture.device !== input.capture.device ||
+    capture.inode !== input.capture.inode ||
+    capture.path !== input.capture.path
+  )
+    fail("unsafe_path", "captured PDF identity changed");
+  const rawPath = join(directory.path, "lossless.json");
+  const bundlePath = join(directory.path, "bundle.json");
+  const raw = await protectedOutputFile(rawPath, directory, limits.maxRawBytes);
+  const bundle = await protectedOutputFile(
+    bundlePath,
+    directory,
+    limits.maxBundleBytes,
+  );
+  const rawSha256 = digest(raw.bytes);
+  const bundleSha256 = digest(bundle.bytes);
+  const validated = validateBundleAndRaw(
+    parseJson(raw.bytes, limits.maxRawBytes),
+    parseJson(bundle.bytes, limits.maxBundleBytes),
+    capture,
+    input.expectedModelManifestSha256,
+    rawSha256,
+  );
+  if (
+    validated.parserFingerprint !== input.expectedParserFingerprint ||
+    validated.extractionConfigurationFingerprint !==
+      input.expectedExtractionConfigurationFingerprint
+  )
+    fail("output_invalid", "parser recovery fingerprint changed");
+  await recheckDirectory(root, "parser output root");
+  await recheckDirectory(directory, "parser output directory");
+  const artifacts: DurableParserOutputArtifacts = {
+    outputId: input.outputIntent.outputId,
+    outputRoot: { device: root.device, inode: root.inode },
+    outputDirectory: { device: directory.device, inode: directory.inode },
+    sourceSha256: capture.sha256,
+    rawArtifact: {
+      path: rawPath,
+      device: raw.identity.device,
+      inode: raw.identity.inode,
+      sha256: rawSha256,
+      byteLength: raw.bytes.length,
+      mediaType: "application/vnd.docling+json",
+    },
+    normalizedBundle: {
+      path: bundlePath,
+      device: bundle.identity.device,
+      inode: bundle.identity.inode,
+      sha256: bundleSha256,
+      byteLength: bundle.bytes.length,
+      mediaType: "application/json",
+    },
+    parserFingerprint: validated.parserFingerprint,
+    extractionConfigurationFingerprint:
+      validated.extractionConfigurationFingerprint,
+    extractionFingerprint: validated.extractionFingerprint,
+    modelManifestSha256: input.expectedModelManifestSha256,
+    pageCount: validated.pageCount,
+  };
+  return {
+    state: "recovered",
+    artifacts,
+    validated: {
+      bundle: validated.bundle,
+      resolvedLocators: validated.resolvedLocators,
+    },
+  };
+}
+
+export async function removeParserOutputExact(input: {
+  outputRoot: string;
+  outputIntent: ParserOutputIntent;
+  artifacts: DurableParserOutputArtifacts;
+}): Promise<{ state: "removed" | "already_missing" }> {
+  requiredPlatform();
+  if (
+    !OPAQUE_ID.test(input.outputIntent.outputId) ||
+    input.artifacts.outputId !== input.outputIntent.outputId ||
+    !exactKeys(input.outputIntent.outputRoot, ["device", "inode"]) ||
+    !exactKeys(input.outputIntent.outputDirectory, ["device", "inode"])
+  )
+    fail("invalid_input", "parser deletion identity is invalid");
+  const root = await trustedDirectory(input.outputRoot, "parser output root", {
+    private: true,
+    rejectBroad: true,
+  });
+  if (
+    root.device !== input.outputIntent.outputRoot.device ||
+    root.inode !== input.outputIntent.outputRoot.inode
+  )
+    fail("unsafe_path", "parser output root changed");
+  const directoryPath = join(root.path, input.outputIntent.outputId);
+  const initial = await lstat(directoryPath).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    fail("unsafe_path", "parser output directory is unavailable");
+  });
+  if (initial === null) {
+    await recheckDirectory(root, "parser output root");
+    return { state: "already_missing" };
+  }
+  const directory = await trustedDirectory(
+    directoryPath,
+    "parser output directory",
+    { private: true, rejectBroad: true },
+  );
+  if (
+    directory.device !== input.outputIntent.outputDirectory.device ||
+    directory.inode !== input.outputIntent.outputDirectory.inode ||
+    dirname(directory.path) !== root.path
+  )
+    fail("unsafe_path", "parser output directory changed");
+
+  const expectedFiles = [
+    ["lossless.json", input.artifacts.rawArtifact],
+    ["bundle.json", input.artifacts.normalizedBundle],
+  ] as const;
+  for (const [name, expected] of expectedFiles) {
+    if (
+      expected.path !== join(directory.path, name) ||
+      !integer(expected.device, 0, Number.MAX_SAFE_INTEGER) ||
+      !integer(expected.inode, 1, Number.MAX_SAFE_INTEGER) ||
+      !integer(expected.byteLength, 1, Number.MAX_SAFE_INTEGER) ||
+      !SHA256.test(expected.sha256)
+    )
+      fail("invalid_input", "parser output file identity is invalid");
+    const path = join(directory.path, name);
+    const current = await lstat(path).catch((error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      fail("unsafe_path", "parser output file is unavailable");
+    });
+    if (current === null) continue;
+    const inspected = await protectedOutputFile(
+      path,
+      directory,
+      name === "lossless.json"
+        ? DEFAULT_PARSER_PROCESS_LIMITS.maxRawBytes
+        : DEFAULT_PARSER_PROCESS_LIMITS.maxBundleBytes,
+    );
+    if (
+      inspected.identity.device !== expected.device ||
+      inspected.identity.inode !== expected.inode ||
+      inspected.bytes.length !== expected.byteLength ||
+      digest(inspected.bytes) !== expected.sha256
+    )
+      fail("unsafe_path", "parser output file changed");
+    await recheckDirectory(directory, "parser output directory");
+    const final = await lstat(path).catch(() =>
+      fail("unsafe_path", "parser output file changed"),
+    );
+    if (
+      final.dev !== expected.device ||
+      final.ino !== expected.inode ||
+      final.nlink !== 1
+    )
+      fail("unsafe_path", "parser output file changed");
+    await unlink(path).catch(() =>
+      fail("unsafe_path", "parser output file could not be removed"),
+    );
+    const handle = await open(directory.path, "r").catch(() =>
+      fail("unsafe_path", "parser output directory cannot be synced"),
+    );
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close().catch(() => undefined);
+    }
+  }
+
+  for (const name of [
+    `.home-${input.outputIntent.outputId}`,
+    `.tmp-${input.outputIntent.outputId}`,
+  ]) {
+    const path = join(directory.path, name);
+    const current = await lstat(path).catch((error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      fail("unsafe_path", "parser auxiliary output is unavailable");
+    });
+    if (current === null) continue;
+    await inspectAuxiliaryOutputDirectory(path, true);
+    await recheckDirectory(directory, "parser output directory");
+    await rmdir(path).catch(() =>
+      fail("unsafe_path", "parser auxiliary output could not be removed"),
+    );
+  }
+  await recheckDirectory(directory, "parser output directory");
+  const entries = await opendir(directory.path).catch(() =>
+    fail("unsafe_path", "parser output directory cannot be inspected"),
+  );
+  try {
+    if ((await entries.read()) !== null)
+      fail("unsafe_path", "parser output directory is not empty");
+  } finally {
+    await entries.close().catch(() => undefined);
+  }
+  await rmdir(directory.path).catch(() =>
+    fail("unsafe_path", "parser output directory could not be removed"),
+  );
+  await recheckDirectory(root, "parser output root");
+  const rootHandle = await open(root.path, "r").catch(() =>
+    fail("unsafe_path", "parser output root cannot be synced"),
+  );
+  try {
+    await rootHandle.sync();
+  } finally {
+    await rootHandle.close().catch(() => undefined);
+  }
+  return { state: "removed" };
+}
+
+export async function createParserProfileWorkDirectory(input: {
+  workRoot: string;
+  workId: string;
+}): Promise<ParserProfileWorkIntent> {
+  requiredPlatform();
+  if (!OPAQUE_ID.test(input.workId))
+    fail("invalid_input", "parser profile work ID is invalid");
+  const root = await trustedDirectory(
+    input.workRoot,
+    "parser profile work root",
+    {
+      private: true,
+      rejectBroad: true,
+    },
+  );
+  const path = join(root.path, input.workId);
+  await recheckDirectory(root, "parser profile work root");
+  await mkdir(path, { mode: 0o700 }).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST")
+      fail("destination_exists", "parser profile work directory exists");
+    safeRethrow(
+      error,
+      "unsafe_path",
+      "parser profile work directory cannot be created",
+    );
+  });
+  const directory = await trustedDirectory(
+    path,
+    "parser profile work directory",
+    {
+      private: true,
+      rejectBroad: true,
+    },
+  );
+  await recheckDirectory(root, "parser profile work root");
+  return {
+    workId: input.workId,
+    path: directory.path,
+    workRoot: { device: root.device, inode: root.inode },
+    workDirectory: { device: directory.device, inode: directory.inode },
+  };
+}
+
+export async function removeParserProfileWorkDirectoryExact(input: {
+  workRoot: string;
+  intent: ParserProfileWorkIntent;
+}): Promise<{ state: "removed" | "already_missing" }> {
+  requiredPlatform();
+  if (!OPAQUE_ID.test(input.intent.workId))
+    fail("invalid_input", "parser profile deletion identity is invalid");
+  const root = await trustedDirectory(
+    input.workRoot,
+    "parser profile work root",
+    {
+      private: true,
+      rejectBroad: true,
+    },
+  );
+  if (
+    root.device !== input.intent.workRoot.device ||
+    root.inode !== input.intent.workRoot.inode ||
+    input.intent.path !== join(root.path, input.intent.workId)
+  )
+    fail("unsafe_path", "parser profile work root changed");
+  const current = await lstat(input.intent.path).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    fail("unsafe_path", "parser profile work directory is unavailable");
+  });
+  if (current === null) return { state: "already_missing" };
+  if (
+    !current.isDirectory() ||
+    current.isSymbolicLink() ||
+    current.dev !== input.intent.workDirectory.device ||
+    current.ino !== input.intent.workDirectory.inode
+  )
+    fail("unsafe_path", "parser profile work directory changed");
+  await inspectAuxiliaryOutputDirectory(input.intent.path, true);
+  await recheckDirectory(root, "parser profile work root");
+  const final = await lstat(input.intent.path).catch(() =>
+    fail("unsafe_path", "parser profile work directory changed"),
+  );
+  if (
+    final.dev !== input.intent.workDirectory.device ||
+    final.ino !== input.intent.workDirectory.inode
+  )
+    fail("unsafe_path", "parser profile work directory changed");
+  await rmdir(input.intent.path).catch(() =>
+    fail("unsafe_path", "parser profile work directory could not be removed"),
+  );
+  const handle = await open(root.path, "r").catch(() =>
+    fail("unsafe_path", "parser profile work root cannot be synced"),
+  );
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+  return { state: "removed" };
+}
+
+export async function preparePdfDocQaProfile(
+  input: PreparePdfDocQaProfileInput,
+): Promise<PreparedPdfDocQaProfile> {
+  requiredPlatform();
+  const limits = validateLimits(input.limits);
+  const sandboxTool = await boundedFile(
+    "/usr/bin/sandbox-exec",
+    "macOS sandbox tool",
+    16 * 1024 * 1024,
+    { executable: true },
+  );
+  const processTool = await boundedFile(
+    "/bin/ps",
+    "macOS process monitor",
+    16 * 1024 * 1024,
+    { executable: true },
+  );
+  if (
+    (await lstat(sandboxTool.canonical)).uid !== 0 ||
+    (await lstat(processTool.canonical)).uid !== 0
+  )
+    fail("unsafe_path", "required macOS tools are not system owned");
+  if (
+    !OPAQUE_ID.test(input.work.workId) ||
+    !SHA256.test(input.expectedPythonSha256) ||
+    !SHA256.test(input.expectedLauncherSha256) ||
+    !SHA256.test(input.expectedModelLockSha256)
+  )
+    fail("invalid_input", "parser profile identity input is invalid");
+  const workDirectory = await trustedDirectory(
+    input.work.path,
+    "parser profile work directory",
+    { private: true, rejectBroad: true },
+  );
+  const workRoot = await trustedDirectory(
+    input.workRoot,
+    "parser profile work root",
+    { private: true, rejectBroad: true },
+  );
+  if (
+    dirname(workDirectory.path) !== workRoot.path ||
+    basename(workDirectory.path) !== input.work.workId ||
+    workRoot.device !== input.work.workRoot.device ||
+    workRoot.inode !== input.work.workRoot.inode ||
+    workDirectory.device !== input.work.workDirectory.device ||
+    workDirectory.inode !== input.work.workDirectory.inode
+  )
+    fail("unsafe_path", "parser profile work directory is inconsistent");
+  const initialEntries = await opendir(workDirectory.path).catch(() =>
+    fail("unsafe_path", "parser profile work directory cannot be inspected"),
+  );
+  try {
+    if ((await initialEntries.read()) !== null)
+      fail("destination_exists", "parser profile work directory is not empty");
+  } finally {
+    await initialEntries.close().catch(() => undefined);
+  }
+  const packageRoot = await trustedDirectory(
+    input.packageRoot,
+    "parser package root",
+    { private: false, rejectBroad: true },
+  );
+  const modelAssets = await trustedDirectory(
+    input.modelAssetsPath,
+    "model asset root",
+    { private: false, rejectBroad: true },
+  );
+  const launcher = await boundedFile(
+    input.launcherPath,
+    "parser launcher",
+    1024 * 1024,
+  );
+  if (
+    !contains(packageRoot.path, launcher.canonical) ||
+    digest(launcher.bytes) !== input.expectedLauncherSha256
+  )
+    fail(
+      "executable_mismatch",
+      "parser launcher identity does not match configuration",
+    );
+  const modelLock = await boundedFile(
+    input.modelLockPath,
+    "model lock",
+    MAX_MODEL_LOCK_BYTES,
+  );
+  if (digest(modelLock.bytes) !== input.expectedModelLockSha256)
+    fail(
+      "model_lock_mismatch",
+      "model lock identity does not match configuration",
+    );
+  const modelLockValue = parseJson(modelLock.bytes, MAX_MODEL_LOCK_BYTES);
+  if (
+    !modelLockValue ||
+    typeof modelLockValue !== "object" ||
+    Array.isArray(modelLockValue) ||
+    !SHA256.test(
+      String((modelLockValue as Record<string, unknown>).manifestSha256 ?? ""),
+    )
+  )
+    fail("model_lock_mismatch", "model lock manifest identity is invalid");
+  const modelManifestSha256 = (modelLockValue as Record<string, unknown>)
+    .manifestSha256 as string;
+  const python = await boundedFile(
+    input.pythonExecutable,
+    "Python executable",
+    128 * 1024 * 1024,
+    { executable: true, allowSymlink: true },
+  );
+  if (digest(python.bytes) !== input.expectedPythonSha256)
+    fail(
+      "executable_mismatch",
+      "Python executable identity does not match configuration",
+    );
+  const pythonEnvironmentRoot = resolve(dirname(input.pythonExecutable), "..");
+  const pythonRuntimeRoot = resolve(dirname(python.canonical), "..");
+  await trustedDirectory(pythonEnvironmentRoot, "Python environment root", {
+    private: false,
+    rejectBroad: true,
+  });
+  await trustedDirectory(pythonRuntimeRoot, "Python runtime root", {
+    private: false,
+    rejectBroad: true,
+  });
+  if (python.requested !== python.canonical) {
+    const target = await readlink(python.requested).catch(() =>
+      fail("unsafe_path", "Python executable link is unavailable"),
+    );
+    if (resolve(dirname(python.requested), target) !== python.canonical)
+      fail("unsafe_path", "Python executable link changed");
+  }
+  for (const readRoot of [
+    packageRoot.path,
+    modelAssets.path,
+    pythonEnvironmentRoot,
+    pythonRuntimeRoot,
+  ]) {
+    if (
+      contains(readRoot, workDirectory.path) ||
+      contains(workDirectory.path, readRoot)
+    )
+      fail("unsafe_path", "parser profile read and write roots overlap");
+  }
+  const profile = sandboxProfile({
+    pythonExecutable: python.requested,
+    pythonTarget: python.canonical,
+    pythonEnvironmentRoot,
+    pythonRuntimeRoot,
+    packageRoot: packageRoot.path,
+    modelAssets: modelAssets.path,
+    modelLock: modelLock.canonical,
+    output: workDirectory.path,
+  });
+  const environment: NodeJS.ProcessEnv = {
+    LANG: "C.UTF-8",
+    LC_ALL: "C.UTF-8",
+    PATH: "/usr/bin:/bin",
+    HOME: workDirectory.path,
+    TMPDIR: workDirectory.path,
+    PYTHONPATH: packageRoot.path,
+    VIRTUAL_ENV: pythonEnvironmentRoot,
+    PYTHONUTF8: "1",
+    PYTHONNOUSERSITE: "1",
+    PYTHONDONTWRITEBYTECODE: "1",
+    HF_HUB_OFFLINE: "1",
+    TRANSFORMERS_OFFLINE: "1",
+    DOCLING_DEVICE: "cpu",
+    OMP_NUM_THREADS: "4",
+    TOKENIZERS_PARALLELISM: "false",
+  };
+  const common = [
+    "--cpu-seconds",
+    String(limits.cpuSeconds),
+    "--file-bytes",
+    String(Math.max(limits.maxRawBytes, limits.maxBundleBytes)),
+    "--open-files",
+    String(limits.maxOpenFiles),
+  ];
+  await requireSandboxIsolation({
+    profile,
+    python: python.requested,
+    launcher: launcher.requested,
+    environment,
+    common,
+    limits,
+  });
+  const result = parseLauncherResult(
+    (
+      await runSandboxed(
+        profile,
+        python.requested,
+        launcher.requested,
+        [
+          "--mode",
+          "profile",
+          ...common,
+          "--artifacts",
+          modelAssets.path,
+          "--model-lock",
+          modelLock.canonical,
+          "--conversion-timeout-seconds",
+          String(Math.min(150, limits.cpuSeconds)),
+        ],
+        environment,
+        limits,
+      )
+    ).stdout,
+  );
+  if (
+    !exactKeys(result, [
+      "state",
+      "parserFingerprint",
+      "extractionConfiguration",
+    ]) ||
+    result.state !== "ready"
+  )
+    fail("output_invalid", "parser profile result shape is invalid");
+  const parserFingerprint = validateParserFingerprint(
+    result.parserFingerprint,
+    modelManifestSha256,
+  );
+  const extractionConfigurationFingerprint =
+    validateExtractionConfigurationFingerprint(
+      result.extractionConfiguration,
+      parserFingerprint,
+    );
+  await recheckDirectory(workRoot, "parser profile work root");
+  await recheckDirectory(workDirectory, "parser profile work directory");
+  const finalEntries = await opendir(workDirectory.path).catch(() =>
+    fail("unsafe_path", "parser profile work directory cannot be inspected"),
+  );
+  try {
+    if ((await finalEntries.read()) !== null)
+      fail("output_invalid", "parser profile left unexpected local output");
+  } finally {
+    await finalEntries.close().catch(() => undefined);
+  }
+  return {
+    state: "ready",
+    parserFingerprint,
+    extractionConfigurationFingerprint,
+    modelManifestSha256,
+    isolation: {
+      networkDenied: true,
+      processForkDenied: true,
+      processExecDenied: true,
+      rssBoundary: "sampled_process_tree",
+      pollIntervalMs: limits.pollIntervalMs,
+      monitorCommandTimeoutMs: PROCESS_MONITOR_TIMEOUT_MS,
+    },
+  };
+}
+
 export async function runCapturedPdfParser(
   input: RunCapturedPdfParserInput,
 ): Promise<CapturedPdfParserResult> {
@@ -1299,6 +2453,13 @@ export async function runCapturedPdfParser(
     "parser output directory",
     { private: true, rejectBroad: true },
   );
+  const outputRoot = await trustedDirectory(
+    dirname(outputDirectory.path),
+    "parser output root",
+    { private: true, rejectBroad: true },
+  );
+  if (dirname(outputDirectory.path) !== outputRoot.path)
+    fail("unsafe_path", "parser output root is inconsistent");
   if (basename(outputDirectory.path) !== input.outputId) {
     fail(
       "unsafe_path",
@@ -1487,60 +2648,14 @@ export async function runCapturedPdfParser(
   let rawIdentity: FileIdentity | undefined;
   let bundleIdentity: FileIdentity | undefined;
   try {
-    const network = parseLauncherResult(
-      (
-        await runSandboxed(
-          profile,
-          python.requested,
-          launcher.requested,
-          ["--mode", "network-probe", ...common],
-          environment,
-          limits,
-        )
-      ).stdout,
-    );
-    if (
-      !exactKeys(network, ["state", "probe"]) ||
-      network.state !== "complete" ||
-      network.probe !== "network_denied"
-    )
-      fail("network_not_denied", "network denial probe failed");
-    const fork = parseLauncherResult(
-      (
-        await runSandboxed(
-          profile,
-          python.requested,
-          launcher.requested,
-          ["--mode", "process-probe", ...common],
-          environment,
-          limits,
-        )
-      ).stdout,
-    );
-    if (
-      !exactKeys(fork, ["state", "probe"]) ||
-      fork.state !== "complete" ||
-      fork.probe !== "fork_denied"
-    )
-      fail("process_escape_not_denied", "process fork denial probe failed");
-    const executable = parseLauncherResult(
-      (
-        await runSandboxed(
-          profile,
-          python.requested,
-          launcher.requested,
-          ["--mode", "exec-probe", ...common],
-          environment,
-          limits,
-        )
-      ).stdout,
-    );
-    if (
-      !exactKeys(executable, ["state", "probe"]) ||
-      executable.state !== "complete" ||
-      executable.probe !== "exec_denied"
-    )
-      fail("process_escape_not_denied", "process exec denial probe failed");
+    await requireSandboxIsolation({
+      profile,
+      python: python.requested,
+      launcher: launcher.requested,
+      environment,
+      common,
+      limits,
+    });
     const conversion = await runSandboxed(
       profile,
       python.requested,
@@ -1609,8 +2724,9 @@ export async function runCapturedPdfParser(
       launcherResult.modelManifestSha256 !== modelManifestSha256
     )
       fail("output_invalid", "launcher result does not match output bytes");
-    parseJson(raw.bytes, limits.maxRawBytes);
-    const validated = validateBundle(
+    const rawValue = parseJson(raw.bytes, limits.maxRawBytes);
+    const validated = validateBundleAndRaw(
+      rawValue,
       parseJson(bundle.bytes, limits.maxBundleBytes),
       capture,
       modelManifestSha256,
@@ -1627,28 +2743,59 @@ export async function runCapturedPdfParser(
         "launcher result does not match normalized output",
       );
     await recheckDirectory(outputDirectory, "parser output directory");
-    return {
-      state: "complete",
+    const rawArtifact: ParsedArtifactIdentity = {
+      path: rawPath,
+      device: rawIdentity.device,
+      inode: rawIdentity.inode,
+      sha256: rawSha256,
+      byteLength: raw.bytes.length,
+      mediaType: "application/vnd.docling+json",
+    };
+    const normalizedBundle: ParsedArtifactIdentity = {
+      path: bundlePath,
+      device: bundleIdentity.device,
+      inode: bundleIdentity.inode,
+      sha256: bundleSha256,
+      byteLength: bundle.bytes.length,
+      mediaType: "application/json",
+    };
+    const artifacts: DurableParserOutputArtifacts = {
       outputId: input.outputId,
+      outputRoot: {
+        device: outputRoot.device,
+        inode: outputRoot.inode,
+      },
+      outputDirectory: {
+        device: outputDirectory.device,
+        inode: outputDirectory.inode,
+      },
       sourceSha256: capture.sha256,
-      rawArtifact: {
-        path: rawPath,
-        sha256: rawSha256,
-        byteLength: raw.bytes.length,
-        mediaType: "application/vnd.docling+json",
-      },
-      normalizedBundle: {
-        path: bundlePath,
-        sha256: bundleSha256,
-        byteLength: bundle.bytes.length,
-        mediaType: "application/json",
-      },
+      rawArtifact,
+      normalizedBundle,
       parserFingerprint: validated.parserFingerprint,
       extractionConfigurationFingerprint:
         validated.extractionConfigurationFingerprint,
       extractionFingerprint: validated.extractionFingerprint,
       modelManifestSha256,
       pageCount: validated.pageCount,
+    };
+    return {
+      state: "complete",
+      outputId: input.outputId,
+      sourceSha256: capture.sha256,
+      rawArtifact,
+      normalizedBundle,
+      parserFingerprint: validated.parserFingerprint,
+      extractionConfigurationFingerprint:
+        validated.extractionConfigurationFingerprint,
+      extractionFingerprint: validated.extractionFingerprint,
+      modelManifestSha256,
+      pageCount: validated.pageCount,
+      artifacts,
+      validated: {
+        bundle: validated.bundle,
+        resolvedLocators: validated.resolvedLocators,
+      },
       peakRssBytes: conversion.peakRssBytes,
       elapsedMs: conversion.elapsedMs,
       isolation: {

@@ -1,12 +1,13 @@
-# PDF pipeline development foundation
+# PDF document-Q&A pipeline
 
 ## Status
 
-The P2-9 parser, capture, and archive helpers are not yet wired into the
-filesystem runner or journal. The additive cloud admission protocol has an
-explicit disabled source gate. Parsed staging and activation remain future
-work. Existing text ingestion is preserved; owner documents require the
-integration and recovery checks below.
+The optional PDF path connects the filesystem runner to protected capture,
+encrypted archives, parsing, durable journal replay, cloud admission, and
+parsed staging and activation. Integration and recovery verification remain
+in progress. Source binary ingestion is explicitly gated; do not enable an
+owner source until its trial acceptance checks pass. Existing text ingestion
+continues without the optional PDF configuration.
 
 The foundation converts one bounded, privately captured PDF with the pinned
 parser runtime and returns two separate artifacts:
@@ -36,11 +37,14 @@ parser artifact digest, using the shared derivation in the
 
 ## What remains before use
 
-The runner must connect the capture and parser boundary to durable journal
-and replay behavior, cloud admission and parsed staging, private artifact
-retention, and authorized cleanup or forget behavior. It must invoke the
-externally pinned archive executables and bind their output to the source
-revision. This foundation does not make the existing worker ready for PDFs.
+Before owner files, verify the complete workflow with synthetic PDFs,
+interruption/restart, an unchanged rescan, a correction, exact citations,
+forget, and isolated restore. Confirm an independent backup destination that
+survives loss of the source computer and primary archive. Passing parser or
+unit tests alone does not establish this recovery boundary.
+
+The [backup and restore guide](backup-and-restore.md) separates hosted data
+recovery from encrypted archives, worker state, configuration, and keys.
 
 The document-Q&A trial may publish verified pages and citations. It does not
 automatically publish structured records. Field extraction, review, coverage,
@@ -49,6 +53,46 @@ and record activation remain later work.
 The synthetic parser evaluation remains separate. Keep its fixtures, recipes,
 and scored outputs unchanged; do not use evaluation labels or scoring code as
 the production interface. See the [parser evaluation guide](../evals/parser/README.md).
+
+## Single-owner configuration
+
+Use the existing worker configuration and commands. Add `pdfDocQa` only for
+an explicitly enabled PDF source. The JSON loader rejects unknown fields,
+unpinned profiles and unsafe paths. Do not put private keys or passwords in
+the configuration or repository.
+
+| Configuration group                                      | Required values and purpose                                                                                                                                                                                                      |
+| -------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `captureDirectory`, `parserOutputRoot`, `spoolDirectory` | Separate private local working directories. Capture and parser/spool plaintext are retained through durable activation, then removed by exact identity.                                                                          |
+| `parser`                                                 | Absolute Python/launcher/package/model paths and the verified Python, launcher and model-lock digests. Profile preparation checks the installed runtime before scanning.                                                         |
+| `profile`                                                | `pdf_docqa_v1`, parser and extraction-configuration identities, extractor/record/normalization/chunker fingerprints, and correction revision. Use measured runtime identities, never invented digests.                           |
+| `archive.ageBinary`                                      | Verified pinned age executable.                                                                                                                                                                                                  |
+| `archive.primary`                                        | Private archive directory, public age recipient, and recorded archive/recipient/key-domain/storage-domain fingerprints.                                                                                                          |
+| `archive.independentBackup`                              | Separate directory and age recipient, restic executable/repository/expected repository ID, password-command selector, host and identity fingerprints. Private passwords are returned by the configured local credential command. |
+
+The exact closed fields are defined in
+[`PdfDocQaConfig`](../packages/pipeline/src/types.ts). Keep the source roots
+separate from capture, parser, spool and archive directories. The source must
+not ingest its own generated artifacts. Use a small explicitly selected folder
+for the first trial.
+
+```sh
+pnpm brain:worker -- doctor --config /absolute/path/worker.json --json
+pnpm brain:worker -- run --config /absolute/path/worker.json
+```
+
+A completed document assessment means the configured document inventory was
+processed. It does not establish medical or financial record/date coverage.
+The PDF path publishes no automatic structured records. Hosted text and
+citations remain readable when the local worker is offline; opening original
+bytes or reprocessing can require the desktop and archive keys.
+
+Changing parser or archive configuration is not a routine restart. The journal
+binding rejects an incompatible profile. Preserve the original configuration
+and catalog for explicit recovery; automatic profile migration is deferred.
+An interrupted encryption whose output identity was never recorded requires
+review and preserves that temporary ciphertext. Do not delete or adopt it by
+filename alone.
 
 ## Focused verification
 

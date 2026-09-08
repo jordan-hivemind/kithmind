@@ -5,13 +5,17 @@ import { dirname, isAbsolute, join, relative, sep } from "node:path";
 
 import type {
   DiscoveryFile,
+  DiscoveryGap,
   GapCode,
   PipelineConfig,
+  PdfDiscoveryFile,
   RootConfig,
+  SourceObservation,
 } from "./types.js";
 
 const MAX_VISITED_ENTRIES = 4_096;
 const FILESYSTEM_DEADLINE_MS = 30_000;
+export const MAX_DISCOVERED_PDF_BYTES = 16 * 1024 * 1024;
 
 export class FilesystemFailure extends Error {
   constructor(
@@ -259,16 +263,28 @@ export async function canonicalRoots(
   return roots;
 }
 
+type SafeFileBytes = Omit<DiscoveryFile, "text"> & {
+  kind: "bytes";
+  bytes: Buffer;
+  linkCount: number;
+};
+
+type SafeLeafGap = {
+  kind: "gap";
+  gap: DiscoveryGap;
+};
+
 /**
  * Portable local-trust fallback. It detects ordinary symlink/replacement races
  * but does not claim protection from hostile same-user ancestor replacement.
  */
-export async function readUtf8File(
+async function readFileBytes(
   root: SafeRoot,
   relativePath: string,
   maxBytes: number,
   deadline = Date.now() + FILESYSTEM_DEADLINE_MS,
-): Promise<DiscoveryFile> {
+  sourceMaxTextBytes?: number,
+): Promise<SafeFileBytes | SafeLeafGap> {
   pathParts(relativePath);
   const candidate = join(root.canonicalPath, relativePath);
   if (!contains(root.canonicalPath, candidate)) {
@@ -296,10 +312,10 @@ export async function readUtf8File(
   if (beforePath.isSymbolicLink() || !beforePath.isFile()) {
     throw new FilesystemFailure("unsupported", "entry is not a regular file");
   }
-  if (beforePath.size < 1) {
+  if (beforePath.size < 1 && sourceMaxTextBytes === undefined) {
     throw new FilesystemFailure("empty", "file is empty");
   }
-  if (beforePath.size > maxBytes) {
+  if (beforePath.size > maxBytes && sourceMaxTextBytes === undefined) {
     throw new FilesystemFailure("oversized", "file exceeds limit");
   }
   if (
@@ -341,8 +357,8 @@ export async function readUtf8File(
     );
     if (
       !before.isFile() ||
-      before.size < 1 ||
-      before.size > maxBytes ||
+      (sourceMaxTextBytes === undefined &&
+        (before.size < 1 || before.size > maxBytes)) ||
       before.dev !== beforePath.dev ||
       before.ino !== beforePath.ino
     ) {
@@ -351,27 +367,50 @@ export async function readUtf8File(
         "opened entry changed before read",
       );
     }
-    const bytes = Buffer.alloc(before.size);
-    let offset = 0;
-    while (offset < bytes.length) {
-      let read;
-      try {
-        read = await beforeDeadline(
-          handle.read(bytes, offset, bytes.length - offset, offset),
+    let leafGapCode: DiscoveryGap["code"] | undefined;
+    if (sourceMaxTextBytes !== undefined) {
+      const header = Buffer.alloc(Math.min(5, before.size));
+      if (header.length > 0) {
+        const read = await beforeDeadline(
+          handle.read(header, 0, header.length, 0),
           deadline,
           "enumeration_interrupted",
           "file read timed out",
         );
-      } catch (error) {
-        abandoned = true;
-        void handle.close().catch(() => undefined);
-        throw error;
+        if (read.bytesRead !== header.length) {
+          throw new FilesystemFailure("unstable", "file changed while reading");
+        }
       }
-      if (read.bytesRead === 0) break;
-      offset += read.bytesRead;
+      const selectedMax = header.equals(Buffer.from("%PDF-"))
+        ? maxBytes
+        : sourceMaxTextBytes;
+      if (before.size < 1) leafGapCode = "empty";
+      else if (before.size > selectedMax) leafGapCode = "oversized";
     }
-    if (offset !== bytes.length) {
-      throw new FilesystemFailure("unstable", "file changed while reading");
+    let bytes: Buffer | undefined;
+    if (leafGapCode === undefined) {
+      bytes = Buffer.alloc(before.size);
+      let offset = 0;
+      while (offset < bytes.length) {
+        let read;
+        try {
+          read = await beforeDeadline(
+            handle.read(bytes, offset, bytes.length - offset, offset),
+            deadline,
+            "enumeration_interrupted",
+            "file read timed out",
+          );
+        } catch (error) {
+          abandoned = true;
+          void handle.close().catch(() => undefined);
+          throw error;
+        }
+        if (read.bytesRead === 0) break;
+        offset += read.bytesRead;
+      }
+      if (offset !== bytes.length) {
+        throw new FilesystemFailure("unstable", "file changed while reading");
+      }
     }
     const after = await beforeDeadline(
       handle.stat(),
@@ -400,24 +439,17 @@ export async function readUtf8File(
       after.dev !== before.dev ||
       after.ino !== before.ino ||
       after.size !== before.size ||
+      after.nlink !== before.nlink ||
       after.mtimeMs !== before.mtimeMs ||
       after.ctimeMs !== before.ctimeMs ||
       afterPath.dev !== beforePath.dev ||
       afterPath.ino !== beforePath.ino ||
       afterPath.size !== beforePath.size ||
+      afterPath.nlink !== beforePath.nlink ||
       afterPath.mtimeMs !== beforePath.mtimeMs ||
       afterPath.ctimeMs !== beforePath.ctimeMs
     ) {
       throw new FilesystemFailure("unstable", "file changed during read");
-    }
-    let text: string;
-    try {
-      text = new TextDecoder("utf-8", {
-        fatal: true,
-        ignoreBOM: true,
-      }).decode(bytes);
-    } catch {
-      throw new FilesystemFailure("unsupported", "file is not UTF-8");
     }
     const sourceModifiedAt = Math.trunc(before.mtimeMs);
     if (!Number.isSafeInteger(sourceModifiedAt) || sourceModifiedAt < 0) {
@@ -426,25 +458,145 @@ export async function readUtf8File(
         "file modification time is invalid",
       );
     }
+    if (leafGapCode !== undefined) {
+      return {
+        kind: "gap",
+        gap: {
+          rootAlias: root.alias,
+          relativePath,
+          uri: toFsUri(root.alias, relativePath),
+          sourceModifiedAt,
+          code: leafGapCode,
+        },
+      };
+    }
     return {
+      kind: "bytes",
       rootAlias: root.alias,
       relativePath,
       uri: toFsUri(root.alias, relativePath),
       sourceModifiedAt,
-      sha256: createHash("sha256").update(bytes).digest("hex"),
-      byteLength: bytes.length,
-      text,
+      sha256: createHash("sha256").update(bytes!).digest("hex"),
+      byteLength: bytes!.length,
+      bytes: bytes!,
+      linkCount: before.nlink,
     };
   } finally {
     if (!abandoned) await handle.close();
   }
 }
 
-export async function discoverFiles(
+function utf8DiscoveryFile(
+  file: SafeFileBytes,
+  maxBytes: number,
+): DiscoveryFile {
+  if (file.byteLength > maxBytes) {
+    throw new FilesystemFailure("oversized", "file exceeds limit");
+  }
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", {
+      fatal: true,
+      ignoreBOM: true,
+    }).decode(file.bytes);
+  } catch {
+    throw new FilesystemFailure("unsupported", "file is not UTF-8");
+  }
+  const {
+    kind: _kind,
+    bytes: _bytes,
+    linkCount: _linkCount,
+    ...descriptor
+  } = file;
+  return { ...descriptor, text };
+}
+
+function pdfDiscoveryFile(file: SafeFileBytes): PdfDiscoveryFile {
+  if (file.linkCount !== 1) {
+    throw new FilesystemFailure("unstable", "PDF has multiple hard links");
+  }
+  if (!file.bytes.subarray(0, 5).equals(Buffer.from("%PDF-"))) {
+    throw new FilesystemFailure("unsupported", "file is not a PDF");
+  }
+  const {
+    kind: _kind,
+    bytes: _bytes,
+    linkCount: _linkCount,
+    ...descriptor
+  } = file;
+  return { ...descriptor, mediaType: "application/pdf" };
+}
+
+export async function readUtf8File(
+  root: SafeRoot,
+  relativePath: string,
+  maxBytes: number,
+  deadline = Date.now() + FILESYSTEM_DEADLINE_MS,
+): Promise<DiscoveryFile> {
+  const result = await readFileBytes(root, relativePath, maxBytes, deadline);
+  if (result.kind === "gap") {
+    throw new FilesystemFailure(result.gap.code, "file is not readable");
+  }
+  return utf8DiscoveryFile(result, maxBytes);
+}
+
+export async function readPdfFile(
+  root: SafeRoot,
+  relativePath: string,
+  deadline = Date.now() + FILESYSTEM_DEADLINE_MS,
+): Promise<PdfDiscoveryFile> {
+  const result = await readFileBytes(
+    root,
+    relativePath,
+    MAX_DISCOVERED_PDF_BYTES,
+    deadline,
+  );
+  if (result.kind === "gap") {
+    throw new FilesystemFailure(result.gap.code, "file is not readable");
+  }
+  return pdfDiscoveryFile(result);
+}
+
+async function readSourceObservation(
+  root: SafeRoot,
+  relativePath: string,
+  maxTextBytes: number,
+  deadline: number,
+): Promise<SourceObservation> {
+  const result = await readFileBytes(
+    root,
+    relativePath,
+    MAX_DISCOVERED_PDF_BYTES,
+    deadline,
+    maxTextBytes,
+  );
+  if (result.kind === "gap") return result;
+  const file = result;
+  if (file.bytes.subarray(0, 5).equals(Buffer.from("%PDF-"))) {
+    return { kind: "pdf", file: pdfDiscoveryFile(file) };
+  }
+  try {
+    return { kind: "utf8", file: utf8DiscoveryFile(file, maxTextBytes) };
+  } catch (error) {
+    if (!(error instanceof FilesystemFailure) || error.code !== "unsupported") {
+      throw error;
+    }
+    const {
+      kind: _kind,
+      bytes: _bytes,
+      linkCount: _linkCount,
+      ...descriptor
+    } = file;
+    return { kind: "gap", gap: { ...descriptor, code: "unsupported" } };
+  }
+}
+
+async function discoverWith<T extends DiscoveryFile | SourceObservation>(
   config: PipelineConfig,
   roots: SafeRoot[],
-): Promise<DiscoveryFile[]> {
-  const found: DiscoveryFile[] = [];
+  read: (root: SafeRoot, relativePath: string, deadline: number) => Promise<T>,
+): Promise<T[]> {
+  const found: T[] = [];
   const uris = new Set<string>();
   let encountered = 0;
   const deadline = Date.now() + FILESYSTEM_DEADLINE_MS;
@@ -544,11 +696,17 @@ export async function discoverFiles(
       if (found.length >= config.maxFiles) {
         throw new FilesystemFailure("oversized", "file count limit exceeded");
       }
-      const file = await readUtf8File(root, rel, config.maxFileBytes, deadline);
-      if (uris.has(file.uri)) {
+      const file = await read(root, rel, deadline);
+      const uri =
+        "uri" in file
+          ? file.uri
+          : file.kind === "gap"
+            ? file.gap.uri
+            : file.file.uri;
+      if (uris.has(uri)) {
         throw new FilesystemFailure("unstable", "filesystem URI collision");
       }
-      uris.add(file.uri);
+      uris.add(uri);
       found.push(file);
     }
 
@@ -588,4 +746,28 @@ export async function discoverFiles(
 
   for (const root of roots) await walk(root, root.canonicalPath, 0);
   return found;
+}
+
+export async function discoverFiles(
+  config: PipelineConfig,
+  roots: SafeRoot[],
+): Promise<DiscoveryFile[]> {
+  return discoverWith(config, roots, (root, relativePath, deadline) =>
+    readUtf8File(root, relativePath, config.maxFileBytes, deadline),
+  );
+}
+
+/**
+ * Scans the same trusted roots as legacy UTF-8 discovery, but keeps PDF bytes
+ * out of the text reader. PDF entries are descriptors only; a later runner
+ * must first obtain a verified parser-profile preparation result before it can
+ * send a binary admission entry or capture bytes.
+ */
+export async function discoverSourceObservations(
+  config: PipelineConfig,
+  roots: SafeRoot[],
+): Promise<SourceObservation[]> {
+  return discoverWith(config, roots, (root, relativePath, deadline) =>
+    readSourceObservation(root, relativePath, config.maxFileBytes, deadline),
+  );
 }

@@ -785,6 +785,37 @@ export async function inspectCapturedPdf(input: {
   }
 }
 
+/** Read-only lost-result check. A present path has no adoptable identity. */
+export async function inspectCaptureIntentState(input: {
+  captureDirectory: string;
+  captureId: string;
+  expectedDirectory: CapturedPdf["captureDirectory"];
+}): Promise<{ state: "absent" | "present_unowned" }> {
+  try {
+    requiredOpenConstants();
+    const directory = await protectedDirectory(
+      input.captureDirectory,
+      "capture directory",
+    );
+    if (
+      directory.path !== input.expectedDirectory.path ||
+      directory.device !== input.expectedDirectory.device ||
+      directory.inode !== input.expectedDirectory.inode
+    )
+      fail("unsafe_path", "capture directory identity changed");
+    const captureId = captureIdentifier(input.captureId);
+    const path = join(directory.path, `${captureId}.pdf`);
+    const present = await lstat(path).catch((error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      rethrowSafe(error, "io_failed", "capture intent cannot be checked");
+    });
+    await recheckDirectory(directory, "capture directory");
+    return { state: present === null ? "absent" : "present_unowned" };
+  } catch (error) {
+    rethrowSafe(error, "io_failed", "capture intent could not be checked");
+  }
+}
+
 function parsedCapture(value: CapturedPdf): CapturedPdf {
   if (
     !value ||

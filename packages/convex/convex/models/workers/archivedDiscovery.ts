@@ -55,7 +55,7 @@ async function digest(domain: string, value: unknown): Promise<string> {
   return sha256Utf8(`${domain}\0${JSON.stringify(value)}`);
 }
 
-function requireBinaryGate(source: LoadedWorkerSource): void {
+export function requireBinaryGate(source: LoadedWorkerSource): void {
   if (
     source.account.binaryProfileId !== "pdf_docqa_v1" ||
     source.account.binaryProfileEnabledAt === undefined ||
@@ -68,7 +68,7 @@ function requireBinaryGate(source: LoadedWorkerSource): void {
   }
 }
 
-function requireStoredBinaryWork(
+export function requireStoredBinaryWork(
   current: Awaited<ReturnType<typeof requireCurrentDiscovery>>,
 ): void {
   const { work, item, scan, entry } = current;
@@ -148,7 +148,7 @@ export async function artifactBoundExtractionFingerprint(
   ]);
 }
 
-async function validateAdmittedArchiveChain(
+export async function validateAdmittedArchiveChain(
   ctx: MutationCtx,
   source: LoadedWorkerSource,
   current: Awaited<ReturnType<typeof requireCurrentDiscovery>>,
@@ -162,7 +162,16 @@ async function validateAdmittedArchiveChain(
     archiveSetDigest: string;
     parsedText?: ParsedTextDeclaration;
   },
-): Promise<void> {
+): Promise<{
+  originalPrimaryReceiptId: Id<"sourceArtifactArchiveReceipts">;
+  originalPrimaryBindingEpoch: number;
+  originalBackupReceiptId: Id<"sourceArtifactArchiveReceipts">;
+  originalBackupBindingEpoch: number;
+  parserPrimaryReceiptId: Id<"sourceArtifactArchiveReceipts">;
+  parserPrimaryBindingEpoch: number;
+  parserBackupReceiptId: Id<"sourceArtifactArchiveReceipts">;
+  parserBackupBindingEpoch: number;
+}> {
   requireStoredBinaryWork(current);
   const [revision, artifact, text, generation, job] = await Promise.all([
     ctx.db.get(ids.sourceRevisionId),
@@ -345,6 +354,16 @@ async function validateAdmittedArchiveChain(
   ) {
     throw workerProtocolError("scan_conflict");
   }
+  return {
+    originalPrimaryReceiptId: originalPrimary.receipt._id,
+    originalPrimaryBindingEpoch: originalPrimary.binding.bindingEpoch,
+    originalBackupReceiptId: originalBackup.receipt._id,
+    originalBackupBindingEpoch: originalBackup.binding.bindingEpoch,
+    parserPrimaryReceiptId: parserPrimary.receipt._id,
+    parserPrimaryBindingEpoch: parserPrimary.binding.bindingEpoch,
+    parserBackupReceiptId: parserBackup.receipt._id,
+    parserBackupBindingEpoch: parserBackup.binding.bindingEpoch,
+  };
 }
 
 async function resolveCurrentArchivedWork(
@@ -1035,16 +1054,21 @@ export async function admitArchivedDiscovery(
     ) {
       throw workerProtocolError("stale_observation");
     }
-    await validateAdmittedArchiveChain(ctx, source, current, {
-      sourceRevisionId: prior.sourceRevisionId,
-      parserArtifactId: prior.parserArtifactId,
-      sourceTextVersionId: prior.sourceTextVersionId,
-      processingGenerationId: prior.processingGenerationId,
-      ingestJobId: prior.ingestJobId,
-      desiredProcessingEpoch: prior.desiredProcessingEpoch,
-      archiveSetDigest: prior.archiveSetDigest,
-      parsedText: request.parsedText,
-    });
+    const archiveReceipts = await validateAdmittedArchiveChain(
+      ctx,
+      source,
+      current,
+      {
+        sourceRevisionId: prior.sourceRevisionId,
+        parserArtifactId: prior.parserArtifactId,
+        sourceTextVersionId: prior.sourceTextVersionId,
+        processingGenerationId: prior.processingGenerationId,
+        ingestJobId: prior.ingestJobId,
+        desiredProcessingEpoch: prior.desiredProcessingEpoch,
+        archiveSetDigest: prior.archiveSetDigest,
+        parsedText: request.parsedText,
+      },
+    );
     return {
       operation: "discovery.admitArchived",
       workId,
@@ -1056,6 +1080,7 @@ export async function admitArchivedDiscovery(
       ingestJobId: prior.ingestJobId,
       desiredProcessingEpoch: prior.desiredProcessingEpoch,
       archiveSetDigest: prior.archiveSetDigest,
+      ...archiveReceipts,
       state: "admitted",
       reused: true,
     };
@@ -1219,16 +1244,21 @@ export async function admitArchivedDiscovery(
       source,
       current.work._id,
     );
-    await validateAdmittedArchiveChain(ctx, source, admittedCurrent, {
-      sourceRevisionId: revision._id,
-      parserArtifactId: artifact._id,
-      sourceTextVersionId: textVersion._id,
-      processingGenerationId: admitted.generation._id,
-      ingestJobId: admitted.job._id,
-      desiredProcessingEpoch: admitted.desiredProcessingEpoch,
-      archiveSetDigest,
-      parsedText: request.parsedText,
-    });
+    const archiveReceipts = await validateAdmittedArchiveChain(
+      ctx,
+      source,
+      admittedCurrent,
+      {
+        sourceRevisionId: revision._id,
+        parserArtifactId: artifact._id,
+        sourceTextVersionId: textVersion._id,
+        processingGenerationId: admitted.generation._id,
+        ingestJobId: admitted.job._id,
+        desiredProcessingEpoch: admitted.desiredProcessingEpoch,
+        archiveSetDigest,
+        parsedText: request.parsedText,
+      },
+    );
     await ctx.db.patch(pendingId, {
       phase: "completed",
       sourceRevisionId: revision._id,
@@ -1250,6 +1280,7 @@ export async function admitArchivedDiscovery(
       ingestJobId: admitted.job._id,
       desiredProcessingEpoch: admitted.desiredProcessingEpoch,
       archiveSetDigest,
+      ...archiveReceipts,
       state: "admitted",
       reused: false,
     };

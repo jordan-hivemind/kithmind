@@ -91,6 +91,63 @@ const workerResultValidator = v.union(
     recordCoverage: v.literal("not_established"),
   }),
   v.object({
+    operation: v.literal("archive.forgetTargets"),
+    sourceItemId: v.string(),
+    sourceExternalIdHash: v.string(),
+    forgetEpoch: v.number(),
+    targets: v.array(
+      v.object({
+        receiptId: v.string(),
+        clientReceiptId: v.string(),
+        receiptRequestDigest: v.string(),
+        subjectKind: v.union(
+          v.literal("original_bytes"),
+          v.literal("parser_output"),
+        ),
+        copyRole: v.union(
+          v.literal("primary"),
+          v.literal("independent_backup"),
+        ),
+        archiveIdentityFingerprint: v.string(),
+        archiveObjectId: v.string(),
+        ciphertextHash: v.string(),
+        ciphertextByteLength: v.number(),
+        forgetEpoch: v.number(),
+        ack: v.optional(
+          v.object({
+            deletionId: v.string(),
+            receiptId: v.string(),
+            forgetEpoch: v.number(),
+            objectOutcome: v.union(
+              v.literal("deleted"),
+              v.literal("already_missing"),
+            ),
+            backupOutcome: v.optional(
+              v.union(v.literal("deleted"), v.literal("already_missing")),
+            ),
+            absenceAuthority: v.literal("worker_asserted_physical_absence"),
+            completedAt: v.number(),
+          }),
+        ),
+      }),
+    ),
+    isDone: v.boolean(),
+    continueCursor: v.string(),
+  }),
+  v.object({
+    operation: v.literal("archive.ackDeletion"),
+    deletionId: v.string(),
+    receiptId: v.string(),
+    forgetEpoch: v.number(),
+    objectOutcome: v.union(v.literal("deleted"), v.literal("already_missing")),
+    backupOutcome: v.optional(
+      v.union(v.literal("deleted"), v.literal("already_missing")),
+    ),
+    absenceAuthority: v.literal("worker_asserted_physical_absence"),
+    completedAt: v.number(),
+    reused: v.boolean(),
+  }),
+  v.object({
     operation: v.literal("source.inventoryPage"),
     page: v.array(
       v.union(
@@ -261,6 +318,14 @@ const workerResultValidator = v.union(
     ingestJobId: v.string(),
     desiredProcessingEpoch: v.number(),
     archiveSetDigest: v.string(),
+    originalPrimaryReceiptId: v.string(),
+    originalPrimaryBindingEpoch: v.number(),
+    originalBackupReceiptId: v.string(),
+    originalBackupBindingEpoch: v.number(),
+    parserPrimaryReceiptId: v.string(),
+    parserPrimaryBindingEpoch: v.number(),
+    parserBackupReceiptId: v.string(),
+    parserBackupBindingEpoch: v.number(),
     state: v.literal("admitted"),
     reused: v.boolean(),
   }),
@@ -327,6 +392,106 @@ const workerResultValidator = v.union(
     reused: v.boolean(),
   }),
   v.object({
+    operation: v.literal("jobs.reserveParsed"),
+    receiptId: v.string(),
+    expiresAt: v.number(),
+    reused: v.boolean(),
+    targets: v.array(
+      v.object({
+        jobId: v.string(),
+        workId: v.string(),
+        sourceItemId: v.string(),
+        observationEpoch: v.number(),
+        processingEpoch: v.number(),
+        state: v.union(v.literal("processing"), v.literal("staged")),
+        leaseEpoch: v.number(),
+        leaseToken: v.string(),
+        leaseExpiresAt: v.number(),
+      }),
+    ),
+  }),
+  v.object({
+    operation: v.literal("jobs.renewParsed"),
+    jobId: v.string(),
+    state: v.union(v.literal("processing"), v.literal("staged")),
+    leaseExpiresAt: v.number(),
+    reused: v.boolean(),
+  }),
+  v.object({
+    operation: v.literal("jobs.failParsed"),
+    jobId: v.string(),
+    state: v.union(
+      v.literal("failed"),
+      v.literal("needs_review"),
+      v.literal("obsolete_generation"),
+    ),
+    retryable: v.boolean(),
+    nextAttemptAt: v.optional(v.number()),
+    failureCode: v.union(
+      v.literal("worker_interrupted"),
+      v.literal("worker_resource_exhausted"),
+      v.literal("source_bytes_invalid"),
+      v.literal("staging_invalid"),
+    ),
+    reused: v.boolean(),
+  }),
+  v.object({
+    operation: v.literal("jobs.stageParsedBegin"),
+    jobId: v.string(),
+    stageId: v.string(),
+    phase: v.union(
+      v.literal("pages"),
+      v.literal("evidence"),
+      v.literal("documents"),
+      v.literal("chunks"),
+      v.literal("seal"),
+      v.literal("staged"),
+    ),
+    nextOrdinal: v.number(),
+    reused: v.boolean(),
+  }),
+  v.object({
+    operation: v.literal("jobs.stageParsedBatch"),
+    jobId: v.string(),
+    stageId: v.string(),
+    committedPhase: v.union(
+      v.literal("pages"),
+      v.literal("evidence"),
+      v.literal("documents"),
+      v.literal("chunks"),
+    ),
+    phase: v.union(
+      v.literal("pages"),
+      v.literal("evidence"),
+      v.literal("documents"),
+      v.literal("chunks"),
+      v.literal("seal"),
+    ),
+    nextOrdinal: v.number(),
+    acceptedCount: v.number(),
+    reused: v.boolean(),
+  }),
+  v.object({
+    operation: v.literal("jobs.stageParsedSeal"),
+    jobId: v.string(),
+    stageId: v.string(),
+    payloadManifestId: v.string(),
+    state: v.literal("staged"),
+    actualPageCount: v.number(),
+    actualEvidenceSpanCount: v.number(),
+    actualDocumentCount: v.number(),
+    actualChunkCount: v.number(),
+    reused: v.boolean(),
+  }),
+  v.object({
+    operation: v.literal("jobs.activateParsed"),
+    jobId: v.string(),
+    state: v.literal("ready"),
+    activatedAt: v.number(),
+    previousGenerationId: v.optional(v.string()),
+    reused: v.boolean(),
+  }),
+  v.object({
     operation: v.literal("processing.assessBegin"),
     assessmentId: v.string(),
     scanId: v.string(),
@@ -380,6 +545,16 @@ export const dispatch = action({
               request,
               now: Date.now(),
             },
+          );
+        case "archive.forgetTargets":
+          return await ctx.runQuery(
+            internal.models.workers.private.archiveForgetTargets,
+            { principal, request },
+          );
+        case "archive.ackDeletion":
+          return await ctx.runMutation(
+            internal.models.workers.private.archiveAckDeletion,
+            { principal, request },
           );
         case "source.inventoryPage":
           return await ctx.runMutation(
@@ -517,6 +692,41 @@ export const dispatch = action({
         case "jobs.fail":
           return await ctx.runMutation(
             internal.models.workers.private.jobsFail,
+            { principal, request },
+          );
+        case "jobs.reserveParsed":
+          return await ctx.runMutation(
+            internal.models.workers.private.jobsReserveParsed,
+            { principal, request, tokens: randomLeaseTokens(request.maxItems) },
+          );
+        case "jobs.renewParsed":
+          return await ctx.runMutation(
+            internal.models.workers.private.jobsRenewParsed,
+            { principal, request },
+          );
+        case "jobs.failParsed":
+          return await ctx.runMutation(
+            internal.models.workers.private.jobsFailParsed,
+            { principal, request },
+          );
+        case "jobs.stageParsedBegin":
+          return await ctx.runMutation(
+            internal.models.workers.private.jobsStageParsedBegin,
+            { principal, request },
+          );
+        case "jobs.stageParsedBatch":
+          return await ctx.runMutation(
+            internal.models.workers.private.jobsStageParsedBatch,
+            { principal, request },
+          );
+        case "jobs.stageParsedSeal":
+          return await ctx.runMutation(
+            internal.models.workers.private.jobsStageParsedSeal,
+            { principal, request },
+          );
+        case "jobs.activateParsed":
+          return await ctx.runMutation(
+            internal.models.workers.private.jobsActivateParsed,
             { principal, request },
           );
         case "processing.assessBegin":

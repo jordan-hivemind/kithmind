@@ -39,9 +39,12 @@ import {
   stagePages,
 } from "../provenance/model";
 import {
+  parseSourceTextRepresentation,
   requireInlineSourceRevision,
   requireInlineSourceTextVersion,
 } from "../provenance/representations";
+import { verifySealedParsedPayload } from "../provenance/parsedStaging";
+import { boundedDocumentSize, PayloadReadBudget } from "./payloadBudget";
 import {
   digestDecodedAdmissionEnvelope,
   digestProcessingConfiguration,
@@ -695,6 +698,20 @@ async function loadLeasedGeneration(
   return { state: job.state, job, generation };
 }
 
+function requireLegacyStaging(
+  loaded: Exclude<
+    Awaited<ReturnType<typeof loadLeasedGeneration>>,
+    { state: "obsolete_generation" }
+  >,
+) {
+  if (
+    loaded.job.workerProcessingMode === "parsed_pages_v1" ||
+    loaded.generation.parserArtifactId !== undefined
+  ) {
+    throw new Error("Parsed generations require parsed staging operations");
+  }
+}
+
 export async function createGenerationTextVersion(
   ctx: MutationCtx,
   args: {
@@ -708,6 +725,7 @@ export async function createGenerationTextVersion(
 ) {
   const loaded = await loadLeasedGeneration(ctx, args);
   if (loaded.state === "obsolete_generation") return loaded;
+  requireLegacyStaging(loaded);
   if (utf8ByteLength(args.text) > MAX_INLINE_TEXT_BYTES) {
     throw new Error("text exceeds the supported byte limit");
   }
@@ -744,6 +762,7 @@ export async function stageGenerationPages(
 ) {
   const loaded = await loadLeasedGeneration(ctx, args);
   if (loaded.state === "obsolete_generation") return loaded;
+  requireLegacyStaging(loaded);
   if (!loaded.generation.sourceTextVersionId) {
     throw new Error("Processing generation has no text version");
   }
@@ -756,20 +775,7 @@ export async function stageGenerationPages(
   return { state: loaded.state, ids };
 }
 
-type EvidenceLocator =
-  | { kind: "page"; label?: string }
-  | { kind: "section"; heading: string }
-  | { kind: "sheet"; sheet: string; range: string }
-  | {
-      kind: "pdf";
-      pageNumber: number;
-      boundingBox?: {
-        left: number;
-        top: number;
-        right: number;
-        bottom: number;
-      };
-    };
+type EvidenceLocator = Doc<"evidenceSpans">["locator"];
 
 export async function stageGenerationEvidenceSpans(
   ctx: MutationCtx,
@@ -790,6 +796,7 @@ export async function stageGenerationEvidenceSpans(
 ) {
   const loaded = await loadLeasedGeneration(ctx, args);
   if (loaded.state === "obsolete_generation") return loaded;
+  requireLegacyStaging(loaded);
   if (!loaded.generation.sourceTextVersionId) {
     throw new Error("Processing generation has no text version");
   }
@@ -822,6 +829,7 @@ export async function stageGenerationDocuments(
 ) {
   const loaded = await loadLeasedGeneration(ctx, args);
   if (loaded.state === "obsolete_generation") return loaded;
+  requireLegacyStaging(loaded);
   if (!loaded.generation.sourceTextVersionId) {
     throw new Error("Processing generation has no text version");
   }
@@ -862,6 +870,7 @@ export async function stageGenerationChunks(
 ) {
   const loaded = await loadLeasedGeneration(ctx, args);
   if (loaded.state === "obsolete_generation") return loaded;
+  requireLegacyStaging(loaded);
   assertStageBatch(args.chunks.map((chunk) => chunk.text));
   const ids = await stageChunks(ctx, {
     spaceId: loaded.generation.spaceId,
@@ -885,6 +894,7 @@ export async function stageGenerationRecords(
 ) {
   const loaded = await loadLeasedGeneration(ctx, args);
   if (loaded.state === "obsolete_generation") return loaded;
+  requireLegacyStaging(loaded);
   const result = await stageRecordBatch(ctx, {
     spaceId: loaded.generation.spaceId,
     processingGenerationId: loaded.generation._id,
@@ -919,39 +929,15 @@ function assertExactOrdinals(
 async function verifyGenerationPayload(
   ctx: MutationCtx,
   generation: Doc<"processingGenerations">,
+  parsedBudget?: PayloadReadBudget,
 ) {
   if (!generation.sourceTextVersionId) {
     throw new Error("Processing generation has no text version");
   }
-  const [textVersion, revision, pages, spans, documents, chunks] =
-    await Promise.all([
-      ctx.db.get(generation.sourceTextVersionId),
-      ctx.db.get(generation.sourceRevisionId),
-      ctx.db
-        .query("sourcePages")
-        .withIndex("by_sourceTextVersionId", (q) =>
-          q.eq("sourceTextVersionId", generation.sourceTextVersionId!),
-        )
-        .take(MAX_PAGES + 1),
-      ctx.db
-        .query("evidenceSpans")
-        .withIndex("by_sourceTextVersionId", (q) =>
-          q.eq("sourceTextVersionId", generation.sourceTextVersionId!),
-        )
-        .take(MAX_EVIDENCE_SPANS + 1),
-      ctx.db
-        .query("documents")
-        .withIndex("by_processingGenerationId", (q) =>
-          q.eq("processingGenerationId", generation._id),
-        )
-        .take(MAX_DOCUMENTS + 1),
-      ctx.db
-        .query("chunks")
-        .withIndex("by_processingGenerationId", (q) =>
-          q.eq("processingGenerationId", generation._id),
-        )
-        .take(MAX_CHUNKS + 1),
-    ]);
+  const [textVersion, revision] = await Promise.all([
+    ctx.db.get(generation.sourceTextVersionId),
+    ctx.db.get(generation.sourceRevisionId),
+  ]);
   if (
     !textVersion ||
     textVersion.spaceId !== generation.spaceId ||
@@ -962,6 +948,36 @@ async function verifyGenerationPayload(
   ) {
     throw new Error("Processing generation text parent chain is invalid");
   }
+  const textRepresentation = parseSourceTextRepresentation(textVersion);
+  if (textRepresentation.kind === "parsed_pages_v1") {
+    return await verifySealedParsedPayload(ctx, generation, parsedBudget);
+  }
+  const [pages, spans, documents, chunks] = await Promise.all([
+    ctx.db
+      .query("sourcePages")
+      .withIndex("by_sourceTextVersionId", (q) =>
+        q.eq("sourceTextVersionId", generation.sourceTextVersionId!),
+      )
+      .take(MAX_PAGES + 1),
+    ctx.db
+      .query("evidenceSpans")
+      .withIndex("by_sourceTextVersionId", (q) =>
+        q.eq("sourceTextVersionId", generation.sourceTextVersionId!),
+      )
+      .take(MAX_EVIDENCE_SPANS + 1),
+    ctx.db
+      .query("documents")
+      .withIndex("by_processingGenerationId", (q) =>
+        q.eq("processingGenerationId", generation._id),
+      )
+      .take(MAX_DOCUMENTS + 1),
+    ctx.db
+      .query("chunks")
+      .withIndex("by_processingGenerationId", (q) =>
+        q.eq("processingGenerationId", generation._id),
+      )
+      .take(MAX_CHUNKS + 1),
+  ]);
   const inlineRevision = requireInlineSourceRevision(revision);
   const inlineTextVersion = requireInlineSourceTextVersion(textVersion);
   if (
@@ -1137,6 +1153,7 @@ export async function stageGeneration(
 ) {
   const loaded = await loadLeasedGeneration(ctx, args);
   if (loaded.state === "obsolete_generation") return loaded;
+  requireLegacyStaging(loaded);
   const counts = await verifyGenerationPayload(ctx, loaded.generation);
   await ctx.db.patch(loaded.generation._id, { state: "staged", ...counts });
   await ctx.db.patch(loaded.job._id, { state: "staged" });
@@ -1349,7 +1366,15 @@ export async function activateGeneration(
   if (loaded.job.state !== "staged" || loaded.generation.state !== "staged") {
     throw new Error("Processing generation is not staged");
   }
-  const counts = await verifyGenerationPayload(ctx, loaded.generation);
+  const parsedBudget =
+    loaded.generation.parserArtifactId === undefined
+      ? undefined
+      : new PayloadReadBudget(ctx);
+  const counts = await verifyGenerationPayload(
+    ctx,
+    loaded.generation,
+    parsedBudget,
+  );
   if (
     loaded.generation.actualPageCount !== counts.actualPageCount ||
     loaded.generation.actualEvidenceSpanCount !==
@@ -1372,6 +1397,45 @@ export async function activateGeneration(
     return { state: await markObsolete(ctx, loaded.job) };
   }
   const previousGenerationId = item.activeGenerationId;
+  let previousGeneration: Doc<"processingGenerations"> | null = null;
+  let previousChunks: Doc<"chunks">[] = [];
+  const embeddingTarget = await getActiveEmbeddingTarget(
+    ctx,
+    loaded.job.spaceId,
+  );
+  if (previousGenerationId && previousGenerationId !== loaded.generation._id) {
+    previousGeneration = await ctx.db.get(previousGenerationId);
+    if (
+      !previousGeneration ||
+      previousGeneration.spaceId !== loaded.job.spaceId
+    )
+      throw new Error("Previous generation is invalid");
+    if (embeddingTarget) {
+      if (parsedBudget) {
+        await parsedBudget.finish();
+        for await (const row of ctx.db
+          .query("chunks")
+          .withIndex("by_processingGenerationId", (q) =>
+            q.eq("processingGenerationId", previousGenerationId),
+          )) {
+          boundedDocumentSize(row, 24 * 1024);
+          if (previousChunks.length >= MAX_CHUNKS)
+            throw new Error("Previous generation exceeds its chunk bound");
+          previousChunks.push(row);
+          await parsedBudget.finish();
+        }
+      } else {
+        previousChunks = await ctx.db
+          .query("chunks")
+          .withIndex("by_processingGenerationId", (q) =>
+            q.eq("processingGenerationId", previousGenerationId),
+          )
+          .take(MAX_CHUNKS + 1);
+      }
+      if (previousChunks.length > MAX_CHUNKS)
+        throw new Error("Previous generation exceeds its chunk bound");
+    }
+  }
   await activateSourceItemGeneration(ctx, {
     spaceId: loaded.job.spaceId,
     sourceItemId: loaded.job.sourceItemId,
@@ -1379,6 +1443,19 @@ export async function activateGeneration(
     processingGenerationId: loaded.generation._id,
     expectedPreviousGenerationId: previousGenerationId,
     expectedDesiredProcessingEpoch: loaded.job.desiredProcessingEpoch,
+    ...(parsedBudget && "verifiedDocuments" in counts
+      ? {
+          verifiedPayload: {
+            documents: counts.verifiedDocuments,
+            chunks: counts.verifiedChunks,
+          },
+          payloadReadBudget: {
+            measureRow: (row: Record<string, unknown>, maximumBytes: number) =>
+              boundedDocumentSize(row as never, maximumBytes),
+            finish: () => parsedBudget.finish(),
+          },
+        }
+      : {}),
   });
 
   const activationState = await ctx.db
@@ -1407,27 +1484,10 @@ export async function activateGeneration(
     });
   }
   if (previousGenerationId && previousGenerationId !== loaded.generation._id) {
-    const previous = await ctx.db.get(previousGenerationId);
-    if (!previous || previous.spaceId !== loaded.job.spaceId) {
-      throw new Error("Previous generation is invalid");
-    }
-    await ctx.db.patch(previous._id, { deactivatedAt: activatedAt });
-    const embeddingTarget = await getActiveEmbeddingTarget(
-      ctx,
-      loaded.job.spaceId,
-    );
+    await ctx.db.patch(previousGeneration!._id, { deactivatedAt: activatedAt });
     if (embeddingTarget) {
       // Historical text remains readable. Only obsolete vectors in the current
       // embedding generation are removed; retired profile generations survive.
-      const previousChunks = await ctx.db
-        .query("chunks")
-        .withIndex("by_processingGenerationId", (q) =>
-          q.eq("processingGenerationId", previousGenerationId),
-        )
-        .take(MAX_CHUNKS + 1);
-      if (previousChunks.length > MAX_CHUNKS) {
-        throw new Error("Previous generation exceeds its chunk bound");
-      }
       for (const chunk of previousChunks) {
         if (chunk.spaceId !== loaded.job.spaceId) {
           throw new Error("Previous chunk has an invalid space");
@@ -1443,6 +1503,7 @@ export async function activateGeneration(
               .eq("chunkId", chunk._id),
           )
           .take(2);
+        if (parsedBudget) await parsedBudget.finish();
         if (vectors.length > 1)
           throw new Error("Duplicate active chunk vector");
         for (const vector of vectors) {
@@ -1479,6 +1540,7 @@ export async function activateGeneration(
     lastProcessedAt: Math.max(account.lastProcessedAt ?? 0, activatedAt),
   });
   await bumpEmbeddingEligibilityEpoch(ctx, loaded.job.spaceId);
+  if (parsedBudget) await parsedBudget.finish();
   return {
     state: "ready" as const,
     activatedAt,
@@ -1853,6 +1915,35 @@ export async function continueForgetFromWeb(
     return {
       phase: "processingGenerations",
       deleted: generations.length,
+      done: false,
+    };
+  }
+  if (
+    item.archiveDeletionForgetEpoch !== item.desiredProcessingEpoch ||
+    !Number.isSafeInteger(item.archiveDeletionReceiptCount) ||
+    (item.archiveDeletionReceiptCount ?? -1) < 0 ||
+    !Number.isSafeInteger(item.archiveDeletionCompletedAt) ||
+    (item.archiveDeletionCompletedAt ?? -1) < 0
+  ) {
+    throw new Error("Archive deletion summary is incomplete");
+  }
+  const archiveDeletionAcks = await ctx.db
+    .query("sourceArtifactDeletionAcks")
+    .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", item._id))
+    .take(MAX_STAGE_ROWS);
+  for (const ack of archiveDeletionAcks) {
+    if (
+      ack.spaceId !== item.spaceId ||
+      ack.sourceAccountId !== item.sourceAccountId ||
+      ack.forgetEpoch !== item.desiredProcessingEpoch
+    )
+      throw new Error("Archive deletion acknowledgement parent is invalid");
+    await ctx.db.delete(ack._id);
+  }
+  if (archiveDeletionAcks.length > 0) {
+    return {
+      phase: "archiveDeletionAcks",
+      deleted: archiveDeletionAcks.length,
       done: false,
     };
   }

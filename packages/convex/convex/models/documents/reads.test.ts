@@ -126,20 +126,10 @@ async function seedDocument(
     const chunkText = input.chunkText ?? text;
     const evidenceCount = input.evidenceCount ?? 1;
     const evidenceEnd = input.evidenceWholeText ? text.length : 6;
-    const textBytes =
-      input.text === undefined ? 24 : new TextEncoder().encode(text).byteLength;
-    const contentHash =
-      input.text === undefined
-        ? `content-hash-${input.suffix}`
-        : createHash("sha256").update(text).digest("hex");
-    const textHash =
-      input.text === undefined
-        ? `text-hash-${input.suffix}`
-        : createHash("sha256").update(text).digest("hex");
-    const pageTextHash =
-      input.text === undefined
-        ? `page-hash-${input.suffix}`
-        : createHash("sha256").update(text).digest("hex");
+    const textBytes = new TextEncoder().encode(text).byteLength;
+    const contentHash = createHash("sha256").update(text).digest("hex");
+    const textHash = createHash("sha256").update(text).digest("hex");
+    const pageTextHash = createHash("sha256").update(text).digest("hex");
     const itemId = await ctx.db.insert("sourceItems", {
       spaceId: input.spaceId,
       sourceAccountId: input.sourceAccountId,
@@ -214,9 +204,9 @@ async function seedDocument(
       textHash: pageTextHash,
     });
     const evidenceSpanIds: Id<"evidenceSpans">[] = [];
-    const quoteHash = input.evidenceWholeText
-      ? createHash("sha256").update(text.slice(0, evidenceEnd)).digest("hex")
-      : `quote-hash-${input.suffix}`;
+    const quoteHash = createHash("sha256")
+      .update(text.slice(0, evidenceEnd))
+      .digest("hex");
     for (let ordinal = 0; ordinal < evidenceCount; ordinal += 1) {
       evidenceSpanIds.push(
         await ctx.db.insert("evidenceSpans", {

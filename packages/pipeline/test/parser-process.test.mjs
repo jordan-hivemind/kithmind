@@ -20,9 +20,16 @@ import { capturePdfFile } from "../dist/captureStore.js";
 import { canonicalRoots } from "../dist/filesystem.js";
 import {
   DEFAULT_PARSER_PROCESS_LIMITS,
+  createParserProfileWorkDirectory,
+  inspectCapturedPdfParserOutput,
+  inspectParserOutputIntent,
   ParserProcessError,
+  preparePdfDocQaProfile,
+  removeParserProfileWorkDirectoryExact,
+  removeParserOutputExact,
   runCapturedPdfParser,
 } from "../dist/parserProcess.js";
+import { mapParsedBundle } from "../dist/parsedBundleMapping.js";
 
 const repository = realpath(
   join(dirname(fileURLToPath(import.meta.url)), "../../.."),
@@ -47,7 +54,7 @@ function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-async function fixture() {
+async function fixture(pdfName = "lab-report-unicode.pdf") {
   const base = await realpath(await mkdtemp(join(tmpdir(), "parser-process-")));
   const sourceRoot = join(base, "source");
   const journal = join(base, "journal");
@@ -57,9 +64,7 @@ async function fixture() {
     await mkdir(path, { mode: 0o700 });
     await chmod(path, 0o700);
   }
-  const sourceBytes = await readFile(
-    join(parserRoot, "fixtures/lab-report-unicode.pdf"),
-  );
+  const sourceBytes = await readFile(join(parserRoot, "fixtures", pdfName));
   const sourcePath = join(sourceRoot, "input.pdf");
   await writeFile(sourcePath, sourceBytes, { mode: 0o600 });
   const observed = await stat(sourcePath);
@@ -186,11 +191,41 @@ test(
   async () => {
     const f = await fixture();
     try {
+      const profileId = randomUUID();
+      const profileWork = await createParserProfileWorkDirectory({
+        workRoot: f.outputRoot,
+        workId: profileId,
+      });
+      const profile = await preparePdfDocQaProfile({
+        ...f.common,
+        capture: undefined,
+        workRoot: f.outputRoot,
+        work: profileWork,
+      });
+      assert.deepEqual(
+        await removeParserProfileWorkDirectoryExact({
+          workRoot: f.outputRoot,
+          intent: profileWork,
+        }),
+        { state: "removed" },
+      );
+      assert.deepEqual(
+        await removeParserProfileWorkDirectoryExact({
+          workRoot: f.outputRoot,
+          intent: profileWork,
+        }),
+        { state: "already_missing" },
+      );
       const outputId = randomUUID();
+      const output = await outputDirectory(f, outputId);
+      const intent = await inspectParserOutputIntent({
+        outputRoot: f.outputRoot,
+        outputId,
+      });
       const result = await runCapturedPdfParser({
         ...f.common,
         outputId,
-        outputDirectory: await outputDirectory(f, outputId),
+        outputDirectory: output,
       });
       assert.equal(result.state, "complete");
       assert.equal(result.outputId, outputId);
@@ -204,6 +239,15 @@ test(
         result.peakRssBytes <= DEFAULT_PARSER_PROCESS_LIMITS.maxRssBytes,
       );
       assert.equal(result.pageCount, 1);
+      assert.equal(profile.state, "ready");
+      assert.equal(profile.parserFingerprint, result.parserFingerprint);
+      assert.equal(
+        profile.extractionConfigurationFingerprint,
+        result.extractionConfigurationFingerprint,
+      );
+      assert.equal(profile.modelManifestSha256, result.modelManifestSha256);
+      assert.equal(profile.isolation.networkDenied, true);
+      assert.equal(profile.isolation.monitorCommandTimeoutMs, 1_000);
       assert.match(result.extractionConfigurationFingerprint, /^[a-f0-9]{64}$/);
       assert.equal(
         result.rawArtifact.sha256,
@@ -212,6 +256,39 @@ test(
       assert.equal(
         result.normalizedBundle.sha256,
         sha256(await readFile(result.normalizedBundle.path)),
+      );
+      const recovered = await inspectCapturedPdfParserOutput({
+        capture: f.common.capture,
+        outputRoot: f.outputRoot,
+        outputIntent: intent,
+        expectedParserFingerprint: result.parserFingerprint,
+        expectedExtractionConfigurationFingerprint:
+          result.extractionConfigurationFingerprint,
+        expectedModelManifestSha256: result.modelManifestSha256,
+      });
+      assert.deepEqual(recovered.validated, result.validated);
+      const mapped = await mapParsedBundle({
+        ...recovered.validated,
+        title: "Synthetic pilot",
+        capturedAt: 1_800_000_000_000,
+      });
+      assert.equal(mapped.pages.length, 1);
+      assert.ok(mapped.evidence.length > 0);
+      assert.deepEqual(
+        await removeParserOutputExact({
+          outputRoot: f.outputRoot,
+          outputIntent: intent,
+          artifacts: result.artifacts,
+        }),
+        { state: "removed" },
+      );
+      assert.deepEqual(
+        await removeParserOutputExact({
+          outputRoot: f.outputRoot,
+          outputIntent: intent,
+          artifacts: result.artifacts,
+        }),
+        { state: "already_missing" },
       );
     } finally {
       await rm(f.base, { recursive: true, force: true });
@@ -242,6 +319,63 @@ test(
           error.code === "destination_exists",
       );
       assert.deepEqual(await readFile(target), sentinel);
+    } finally {
+      await rm(f.base, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "recovers and maps exact raw table locators from a financial statement",
+  { skip: !hasRuntime, timeout: 240_000 },
+  async (context) => {
+    const f = await fixture("financial-statement.pdf");
+    try {
+      const outputId = randomUUID();
+      const output = await outputDirectory(f, outputId);
+      const intent = await inspectParserOutputIntent({
+        outputRoot: f.outputRoot,
+        outputId,
+      });
+      const result = await runCapturedPdfParser({
+        ...f.common,
+        outputId,
+        outputDirectory: output,
+      });
+      const recovered = await inspectCapturedPdfParserOutput({
+        capture: f.common.capture,
+        outputRoot: f.outputRoot,
+        outputIntent: intent,
+        expectedParserFingerprint: result.parserFingerprint,
+        expectedExtractionConfigurationFingerprint:
+          result.extractionConfigurationFingerprint,
+        expectedModelManifestSha256: result.modelManifestSha256,
+      });
+      const mapped = await mapParsedBundle({
+        ...recovered.validated,
+        title: "Synthetic pilot",
+        capturedAt: 1_800_000_000_000,
+      });
+      assert.equal(mapped.pages.length, 2);
+      assert.ok(
+        mapped.evidence.some(
+          (entry) => entry.locator.kind === "parser_table_row_v1",
+        ),
+      );
+      assert.ok(
+        Object.values(recovered.validated.resolvedLocators).some(
+          (entry) =>
+            entry.kind === "table" && entry.ref.startsWith("#/tables/"),
+        ),
+      );
+      context.diagnostic(
+        JSON.stringify({
+          pages: mapped.pages.length,
+          evidence: mapped.evidence.length,
+          documents: mapped.documents.length,
+          chunks: mapped.chunks.length,
+        }),
+      );
     } finally {
       await rm(f.base, { recursive: true, force: true });
     }

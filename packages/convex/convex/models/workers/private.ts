@@ -30,11 +30,24 @@ import {
   stageProcessingSpanBatch,
   stageProcessingText,
 } from "./jobs";
+import {
+  beginParsedStage,
+  activateParsedJob,
+  failParsedJob,
+  renewParsedJob,
+  reserveParsedJobs,
+  sealParsedStage,
+  stageParsedBatch,
+} from "./parsedJobs";
 import { parseWorkerRequest, type WorkerRequest } from "./protocol";
 import {
   advanceProcessingAssessment,
   beginProcessingAssessment,
 } from "./assessment";
+import {
+  acknowledgeArchiveDeletion,
+  getArchiveForgetTargets,
+} from "./archiveForget";
 
 function operation<T extends WorkerRequest["operation"]>(
   value: unknown,
@@ -54,6 +67,27 @@ export const sourceStatus = internalQuery({
       args.principal,
       operation(args.request, "source.status"),
       args.now,
+    ),
+});
+
+export const archiveForgetTargets = internalQuery({
+  args: { principal: principalRefValidator, request: v.any() },
+  handler: async (ctx, args) =>
+    await getArchiveForgetTargets(
+      ctx,
+      args.principal,
+      operation(args.request, "archive.forgetTargets"),
+    ),
+});
+
+export const archiveAckDeletion = internalMutation({
+  args: { principal: principalRefValidator, request: v.any() },
+  handler: async (ctx, args) =>
+    await acknowledgeArchiveDeletion(
+      ctx,
+      args.principal,
+      operation(args.request, "archive.ackDeletion"),
+      Date.now(),
     ),
 });
 
@@ -319,6 +353,88 @@ export const jobsFail = internalMutation({
       ctx,
       args.principal,
       operation(args.request, "jobs.fail"),
+      Date.now(),
+    ),
+});
+
+export const jobsReserveParsed = internalMutation({
+  args: {
+    principal: principalRefValidator,
+    request: v.any(),
+    tokens: v.array(v.string()),
+  },
+  handler: async (ctx, args) =>
+    await reserveParsedJobs(
+      ctx,
+      args.principal,
+      operation(args.request, "jobs.reserveParsed"),
+      args.tokens,
+      Date.now(),
+    ),
+});
+
+export const jobsRenewParsed = internalMutation({
+  args: { principal: principalRefValidator, request: v.any() },
+  handler: async (ctx, args) =>
+    await renewParsedJob(
+      ctx,
+      args.principal,
+      operation(args.request, "jobs.renewParsed"),
+      Date.now(),
+    ),
+});
+
+export const jobsFailParsed = internalMutation({
+  args: { principal: principalRefValidator, request: v.any() },
+  handler: async (ctx, args) =>
+    await failParsedJob(
+      ctx,
+      args.principal,
+      operation(args.request, "jobs.failParsed"),
+      Date.now(),
+    ),
+});
+
+export const jobsStageParsedBegin = internalMutation({
+  args: { principal: principalRefValidator, request: v.any() },
+  handler: async (ctx, args) =>
+    await beginParsedStage(
+      ctx,
+      args.principal,
+      operation(args.request, "jobs.stageParsedBegin"),
+      Date.now(),
+    ),
+});
+
+export const jobsStageParsedBatch = internalMutation({
+  args: { principal: principalRefValidator, request: v.any() },
+  handler: async (ctx, args) =>
+    await stageParsedBatch(
+      ctx,
+      args.principal,
+      operation(args.request, "jobs.stageParsedBatch"),
+      Date.now(),
+    ),
+});
+
+export const jobsStageParsedSeal = internalMutation({
+  args: { principal: principalRefValidator, request: v.any() },
+  handler: async (ctx, args) =>
+    await sealParsedStage(
+      ctx,
+      args.principal,
+      operation(args.request, "jobs.stageParsedSeal"),
+      Date.now(),
+    ),
+});
+
+export const jobsActivateParsed = internalMutation({
+  args: { principal: principalRefValidator, request: v.any() },
+  handler: async (ctx, args) =>
+    await activateParsedJob(
+      ctx,
+      args.principal,
+      operation(args.request, "jobs.activateParsed"),
       Date.now(),
     ),
 });

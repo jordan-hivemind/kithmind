@@ -14,6 +14,7 @@ const MAX_INVENTORY_ITEMS = 50;
 const MAX_PAGE_ITEMS = 4;
 const MAX_URI_ALIASES = 8;
 const MAX_FILE_BYTES = 65_536;
+const MAX_ARCHIVE_CIPHER_BYTES = 65 * 1024 * 1024;
 const ID = /^[A-Za-z0-9_-]{1,256}$/;
 const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -136,6 +137,128 @@ function optionalId(value: unknown, name: string): void {
 
 function optionalInteger(value: unknown, name: string): void {
   if (value !== undefined) integer(value, name);
+}
+
+function archiveDeletionAck(
+  value: unknown,
+  options: { operation: boolean; reused: boolean },
+): void {
+  const row = record(value);
+  exact(
+    row,
+    [
+      ...(options.operation ? ["operation"] : []),
+      "deletionId",
+      "receiptId",
+      "forgetEpoch",
+      "objectOutcome",
+      "absenceAuthority",
+      "completedAt",
+      ...(options.reused ? ["reused"] : []),
+    ],
+    ["backupOutcome"],
+  );
+  if (options.operation && row.operation !== "archive.ackDeletion")
+    failure("archive deletion operation is invalid");
+  text(row.deletionId, "deletionId", { maxUtf16: 36, pattern: UUID });
+  id(row.receiptId, "receiptId");
+  integer(row.forgetEpoch, "forgetEpoch", 1);
+  enumValue(row.objectOutcome, "objectOutcome", [
+    "deleted",
+    "already_missing",
+  ] as const);
+  if (row.backupOutcome !== undefined) {
+    enumValue(row.backupOutcome, "backupOutcome", [
+      "deleted",
+      "already_missing",
+    ] as const);
+  }
+  if (row.absenceAuthority !== "worker_asserted_physical_absence")
+    failure("absence authority is invalid");
+  integer(row.completedAt, "completedAt");
+  if (options.reused) boolean(row.reused, "reused");
+}
+
+function archiveForgetTargets(value: Record<string, unknown>): void {
+  exact(value, [
+    "operation",
+    "sourceItemId",
+    "sourceExternalIdHash",
+    "forgetEpoch",
+    "targets",
+    "isDone",
+    "continueCursor",
+  ]);
+  id(value.sourceItemId, "sourceItemId");
+  digest(value.sourceExternalIdHash, "sourceExternalIdHash");
+  const forgetEpoch = integer(value.forgetEpoch, "forgetEpoch", 1);
+  if (!Array.isArray(value.targets) || value.targets.length > MAX_PAGE_ITEMS)
+    failure("archive forget target page is invalid");
+  const receiptIds = new Set<string>();
+  for (const targetValue of value.targets) {
+    const target = record(targetValue);
+    exact(
+      target,
+      [
+        "receiptId",
+        "clientReceiptId",
+        "receiptRequestDigest",
+        "subjectKind",
+        "copyRole",
+        "archiveIdentityFingerprint",
+        "archiveObjectId",
+        "ciphertextHash",
+        "ciphertextByteLength",
+        "forgetEpoch",
+      ],
+      ["ack"],
+    );
+    const receiptId = id(target.receiptId, "receiptId");
+    if (receiptIds.has(receiptId)) failure("archive receipt is duplicated");
+    receiptIds.add(receiptId);
+    text(target.clientReceiptId, "clientReceiptId", {
+      maxUtf16: 36,
+      pattern: UUID,
+    });
+    digest(target.receiptRequestDigest, "receiptRequestDigest");
+    enumValue(target.subjectKind, "subjectKind", [
+      "original_bytes",
+      "parser_output",
+    ] as const);
+    enumValue(target.copyRole, "copyRole", [
+      "primary",
+      "independent_backup",
+    ] as const);
+    digest(target.archiveIdentityFingerprint, "archiveIdentityFingerprint");
+    text(target.archiveObjectId, "archiveObjectId", {
+      maxUtf16: 36,
+      pattern: UUID,
+    });
+    digest(target.ciphertextHash, "ciphertextHash");
+    integer(
+      target.ciphertextByteLength,
+      "ciphertextByteLength",
+      1,
+      MAX_ARCHIVE_CIPHER_BYTES,
+    );
+    if (integer(target.forgetEpoch, "target forgetEpoch", 1) !== forgetEpoch)
+      failure("archive forget epoch is inconsistent");
+    if (target.ack !== undefined) {
+      archiveDeletionAck(target.ack, { operation: false, reused: false });
+      const ack = target.ack as Record<string, unknown>;
+      if (
+        ack.receiptId !== receiptId ||
+        ack.forgetEpoch !== forgetEpoch ||
+        (target.copyRole === "independent_backup") !==
+          (ack.backupOutcome !== undefined)
+      )
+        failure("archive deletion acknowledgement is inconsistent");
+    }
+  }
+  boolean(value.isDone, "isDone");
+  text(value.continueCursor, "continueCursor", {
+    maxUtf8: MAX_CURSOR_BYTES,
+  });
 }
 
 function counts(value: unknown): void {
@@ -499,6 +622,363 @@ function job(value: Record<string, unknown>, operation: string): void {
   boolean(value.reused, "reused");
 }
 
+function archivedPreflight(value: Record<string, unknown>): void {
+  exact(value, [
+    "operation",
+    "sourceItemId",
+    "workId",
+    "expectedDesiredProcessingEpoch",
+    "archiveIntentDigest",
+  ]);
+  id(value.sourceItemId, "sourceItemId");
+  id(value.workId, "workId");
+  integer(
+    value.expectedDesiredProcessingEpoch,
+    "expectedDesiredProcessingEpoch",
+  );
+  digest(value.archiveIntentDigest, "archiveIntentDigest");
+}
+
+function archivedReserve(value: Record<string, unknown>): void {
+  exact(value, [
+    "operation",
+    "workId",
+    "sourceItemId",
+    "observationEpoch",
+    "processingEpoch",
+    "leaseEpoch",
+    "leaseToken",
+    "leaseExpiresAt",
+    "reused",
+  ]);
+  id(value.workId, "workId");
+  id(value.sourceItemId, "sourceItemId");
+  integer(value.observationEpoch, "observationEpoch");
+  integer(value.processingEpoch, "processingEpoch");
+  integer(value.leaseEpoch, "leaseEpoch", 1);
+  text(value.leaseToken, "leaseToken", { maxUtf16: 64, pattern: HEX_64 });
+  integer(value.leaseExpiresAt, "leaseExpiresAt", 1);
+  boolean(value.reused, "reused");
+}
+
+function archivedLookup(value: Record<string, unknown>): void {
+  const mode = enumValue(value.mode, "lookup mode", [
+    "original",
+    "processing",
+  ] as const);
+  if (value.found === false) {
+    exact(value, ["operation", "mode", "found"]);
+    return;
+  }
+  if (value.found !== true) failure("lookup found is invalid");
+  if (mode === "original") {
+    exact(value, [
+      "operation",
+      "mode",
+      "found",
+      "sourceRevisionId",
+      "originalPrimaryReceiptId",
+      "originalPrimaryBindingEpoch",
+      "originalBackupReceiptId",
+      "originalBackupBindingEpoch",
+    ]);
+    id(value.sourceRevisionId, "sourceRevisionId");
+    id(value.originalPrimaryReceiptId, "originalPrimaryReceiptId");
+    integer(
+      value.originalPrimaryBindingEpoch,
+      "originalPrimaryBindingEpoch",
+      0,
+    );
+    id(value.originalBackupReceiptId, "originalBackupReceiptId");
+    integer(value.originalBackupBindingEpoch, "originalBackupBindingEpoch", 0);
+    return;
+  }
+  exact(value, [
+    "operation",
+    "mode",
+    "found",
+    "sourceRevisionId",
+    "parserArtifactId",
+    "sourceTextVersionId",
+    "processingGenerationId",
+    "ingestJobId",
+    "desiredProcessingEpoch",
+    "archiveSetDigest",
+    "originalPrimaryReceiptId",
+    "originalPrimaryBindingEpoch",
+    "originalBackupReceiptId",
+    "originalBackupBindingEpoch",
+    "parserPrimaryReceiptId",
+    "parserPrimaryBindingEpoch",
+    "parserBackupReceiptId",
+    "parserBackupBindingEpoch",
+  ]);
+  for (const field of [
+    "sourceRevisionId",
+    "parserArtifactId",
+    "sourceTextVersionId",
+    "processingGenerationId",
+    "ingestJobId",
+    "originalPrimaryReceiptId",
+    "originalBackupReceiptId",
+    "parserPrimaryReceiptId",
+    "parserBackupReceiptId",
+  ]) {
+    id(value[field], field);
+  }
+  integer(value.desiredProcessingEpoch, "desiredProcessingEpoch");
+  digest(value.archiveSetDigest, "archiveSetDigest");
+  for (const field of [
+    "originalPrimaryBindingEpoch",
+    "originalBackupBindingEpoch",
+    "parserPrimaryBindingEpoch",
+    "parserBackupBindingEpoch",
+  ]) {
+    integer(value[field], field, 0);
+  }
+}
+
+function archivedAdmit(value: Record<string, unknown>): void {
+  exact(value, [
+    "operation",
+    "workId",
+    "sourceItemId",
+    "sourceRevisionId",
+    "parserArtifactId",
+    "sourceTextVersionId",
+    "processingGenerationId",
+    "ingestJobId",
+    "desiredProcessingEpoch",
+    "archiveSetDigest",
+    "originalPrimaryReceiptId",
+    "originalPrimaryBindingEpoch",
+    "originalBackupReceiptId",
+    "originalBackupBindingEpoch",
+    "parserPrimaryReceiptId",
+    "parserPrimaryBindingEpoch",
+    "parserBackupReceiptId",
+    "parserBackupBindingEpoch",
+    "state",
+    "reused",
+  ]);
+  for (const field of [
+    "workId",
+    "sourceItemId",
+    "sourceRevisionId",
+    "parserArtifactId",
+    "sourceTextVersionId",
+    "processingGenerationId",
+    "ingestJobId",
+    "originalPrimaryReceiptId",
+    "originalBackupReceiptId",
+    "parserPrimaryReceiptId",
+    "parserBackupReceiptId",
+  ]) {
+    id(value[field], field);
+  }
+  integer(value.desiredProcessingEpoch, "desiredProcessingEpoch");
+  digest(value.archiveSetDigest, "archiveSetDigest");
+  for (const field of [
+    "originalPrimaryBindingEpoch",
+    "originalBackupBindingEpoch",
+    "parserPrimaryBindingEpoch",
+    "parserBackupBindingEpoch",
+  ]) {
+    integer(value[field], field, 0);
+  }
+  if (value.state !== "admitted") failure("archived admit state is invalid");
+  boolean(value.reused, "reused");
+}
+
+const PARSED_STAGE_PHASES = [
+  "pages",
+  "evidence",
+  "documents",
+  "chunks",
+  "seal",
+  "staged",
+] as const;
+const PARSED_BATCH_PHASES = [
+  "pages",
+  "evidence",
+  "documents",
+  "chunks",
+] as const;
+
+function parsedPhaseLimit(phase: string): number {
+  switch (phase) {
+    case "pages":
+      return 32;
+    case "evidence":
+      return 128;
+    case "documents":
+      return 16;
+    case "chunks":
+      return 128;
+    case "seal":
+    case "staged":
+      return 0;
+    default:
+      failure("parsed stage phase is invalid");
+  }
+}
+
+function parsedNextPhase(phase: string): string {
+  switch (phase) {
+    case "pages":
+      return "evidence";
+    case "evidence":
+      return "documents";
+    case "documents":
+      return "chunks";
+    case "chunks":
+      return "seal";
+    default:
+      failure("parsed batch phase is invalid");
+  }
+}
+
+function parsedJobRenew(value: Record<string, unknown>): void {
+  exact(value, ["operation", "jobId", "state", "leaseExpiresAt", "reused"]);
+  id(value.jobId, "jobId");
+  enumValue(value.state, "parsed job state", ["processing", "staged"] as const);
+  integer(value.leaseExpiresAt, "leaseExpiresAt", 1);
+  boolean(value.reused, "reused");
+}
+
+function parsedJobFail(value: Record<string, unknown>): void {
+  exact(
+    value,
+    ["operation", "jobId", "state", "retryable", "failureCode", "reused"],
+    ["nextAttemptAt"],
+  );
+  id(value.jobId, "jobId");
+  const state = enumValue(value.state, "parsed failure state", [
+    "failed",
+    "needs_review",
+    "obsolete_generation",
+  ] as const);
+  const retryable = boolean(value.retryable, "retryable");
+  enumValue(value.failureCode, "failureCode", [
+    "worker_interrupted",
+    "worker_resource_exhausted",
+    "source_bytes_invalid",
+    "staging_invalid",
+  ] as const);
+  optionalInteger(value.nextAttemptAt, "nextAttemptAt");
+  if (
+    (state === "failed" && (!retryable || value.nextAttemptAt === undefined)) ||
+    (state !== "failed" && (retryable || value.nextAttemptAt !== undefined))
+  ) {
+    failure("parsed job failure result is inconsistent");
+  }
+  boolean(value.reused, "reused");
+}
+
+function parsedStageBegin(value: Record<string, unknown>): void {
+  exact(value, [
+    "operation",
+    "jobId",
+    "stageId",
+    "phase",
+    "nextOrdinal",
+    "reused",
+  ]);
+  id(value.jobId, "jobId");
+  id(value.stageId, "stageId");
+  const phase = enumValue(
+    value.phase,
+    "parsed stage phase",
+    PARSED_STAGE_PHASES,
+  );
+  integer(value.nextOrdinal, "nextOrdinal", 0, parsedPhaseLimit(phase));
+  boolean(value.reused, "reused");
+}
+
+function parsedStageBatch(value: Record<string, unknown>): void {
+  exact(value, [
+    "operation",
+    "jobId",
+    "stageId",
+    "committedPhase",
+    "phase",
+    "nextOrdinal",
+    "acceptedCount",
+    "reused",
+  ]);
+  id(value.jobId, "jobId");
+  id(value.stageId, "stageId");
+  const committed = enumValue(
+    value.committedPhase,
+    "parsed committed phase",
+    PARSED_BATCH_PHASES,
+  );
+  const phase = enumValue(value.phase, "parsed stage phase", [
+    "pages",
+    "evidence",
+    "documents",
+    "chunks",
+    "seal",
+  ] as const);
+  const advanced = phase === parsedNextPhase(committed);
+  if (phase !== committed && !advanced) {
+    failure("parsed stage phase does not follow committed phase");
+  }
+  const nextOrdinal = integer(
+    value.nextOrdinal,
+    "nextOrdinal",
+    0,
+    parsedPhaseLimit(phase),
+  );
+  if ((advanced && nextOrdinal !== 0) || (!advanced && nextOrdinal < 1)) {
+    failure("parsed stage ordinal is inconsistent");
+  }
+  integer(
+    value.acceptedCount,
+    "acceptedCount",
+    1,
+    committed === "pages" ? 8 : 25,
+  );
+  boolean(value.reused, "reused");
+}
+
+function parsedStageSeal(value: Record<string, unknown>): void {
+  exact(value, [
+    "operation",
+    "jobId",
+    "stageId",
+    "payloadManifestId",
+    "state",
+    "actualPageCount",
+    "actualEvidenceSpanCount",
+    "actualDocumentCount",
+    "actualChunkCount",
+    "reused",
+  ]);
+  id(value.jobId, "jobId");
+  id(value.stageId, "stageId");
+  id(value.payloadManifestId, "payloadManifestId");
+  if (value.state !== "staged") failure("parsed stage seal state is invalid");
+  integer(value.actualPageCount, "actualPageCount", 1, 32);
+  integer(value.actualEvidenceSpanCount, "actualEvidenceSpanCount", 1, 128);
+  integer(value.actualDocumentCount, "actualDocumentCount", 1, 16);
+  integer(value.actualChunkCount, "actualChunkCount", 1, 128);
+  boolean(value.reused, "reused");
+}
+
+function parsedActivate(value: Record<string, unknown>): void {
+  exact(
+    value,
+    ["operation", "jobId", "state", "activatedAt", "reused"],
+    ["previousGenerationId"],
+  );
+  id(value.jobId, "jobId");
+  if (value.state !== "ready") failure("parsed activate state is invalid");
+  integer(value.activatedAt, "activatedAt");
+  optionalId(value.previousGenerationId, "previousGenerationId");
+  boolean(value.reused, "reused");
+}
+
 function assessment(value: Record<string, unknown>, page: boolean): void {
   const required = page
     ? [
@@ -607,6 +1087,12 @@ export function parseWorkerResponse(
     case "source.status":
       status(result);
       break;
+    case "archive.forgetTargets":
+      archiveForgetTargets(result);
+      break;
+    case "archive.ackDeletion":
+      archiveDeletionAck(result, { operation: true, reused: true });
+      break;
     case "source.inventoryPage":
       inventory(result);
       break;
@@ -648,6 +1134,39 @@ export function parseWorkerResponse(
       integer(result.desiredProcessingEpoch, "desiredProcessingEpoch");
       if (result.state !== "admitted") failure("admit state is invalid");
       boolean(result.reused, "reused");
+      break;
+    case "discovery.preflightArchived":
+      archivedPreflight(result);
+      break;
+    case "discovery.reserveArchived":
+      archivedReserve(result);
+      break;
+    case "discovery.lookupArchivedAdmission":
+      archivedLookup(result);
+      break;
+    case "discovery.admitArchived":
+      archivedAdmit(result);
+      break;
+    case "jobs.reserveParsed":
+      reserve(result, "jobs");
+      break;
+    case "jobs.renewParsed":
+      parsedJobRenew(result);
+      break;
+    case "jobs.failParsed":
+      parsedJobFail(result);
+      break;
+    case "jobs.stageParsedBegin":
+      parsedStageBegin(result);
+      break;
+    case "jobs.stageParsedBatch":
+      parsedStageBatch(result);
+      break;
+    case "jobs.stageParsedSeal":
+      parsedStageSeal(result);
+      break;
+    case "jobs.activateParsed":
+      parsedActivate(result);
       break;
     case "jobs.renew":
     case "jobs.stageUtf8":

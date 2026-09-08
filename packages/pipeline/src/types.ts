@@ -8,6 +8,55 @@ export type GapCode =
   | "unsupported";
 
 export type RootConfig = { alias: string; path: string };
+export type PdfDocQaProfile = {
+  parserProfileId: "pdf_docqa_v1";
+  parserFingerprint: string;
+  extractionConfigurationFingerprint: string;
+  extractorFingerprint: string;
+  recordSchemaFingerprint: string;
+  normalizationFingerprint: string;
+  chunkerFingerprint: string;
+  correctionRevision: string;
+};
+
+export type PdfDocQaArchiveIdentity = {
+  archiveProfileFingerprint: string;
+  archiveIdentityFingerprint: string;
+  recipientFingerprint: string;
+  repositoryKeyDomainFingerprint: string;
+  storageFailureDomainFingerprint: string;
+};
+
+export type PdfDocQaConfig = {
+  captureDirectory: string;
+  parserOutputRoot: string;
+  spoolDirectory: string;
+  parser: {
+    pythonExecutable: string;
+    expectedPythonSha256: string;
+    launcherPath: string;
+    expectedLauncherSha256: string;
+    packageRoot: string;
+    modelAssetsPath: string;
+    modelLockPath: string;
+    expectedModelLockSha256: string;
+  };
+  profile: PdfDocQaProfile;
+  archive: {
+    ageBinary: string;
+    primary: PdfDocQaArchiveIdentity & { directory: string; recipient: string };
+    independentBackup: PdfDocQaArchiveIdentity & {
+      directory: string;
+      recipient: string;
+      resticBinary: string;
+      repositoryPath: string;
+      expectedRepositoryId: string;
+      passwordCommand: { executable: string; publicArgs?: string[] };
+      host: string;
+    };
+  };
+};
+
 export type PipelineConfig = {
   protocolVersion: 1;
   endpoint: string;
@@ -21,6 +70,7 @@ export type PipelineConfig = {
   maxFiles: number;
   maxDepth: number;
   maxFileBytes: number;
+  pdfDocQa?: PdfDocQaConfig;
 };
 
 export type DiscoveryFile = {
@@ -32,6 +82,24 @@ export type DiscoveryFile = {
   byteLength: number;
   text: string;
 };
+
+/** A binary source observation is only a local descriptor. It carries no proof
+ * that the configured parser profile has been prepared or is safe to use. */
+export type PdfDiscoveryFile = Omit<DiscoveryFile, "text"> & {
+  mediaType: "application/pdf";
+};
+
+export type DiscoveryGap = Pick<
+  DiscoveryFile,
+  "rootAlias" | "relativePath" | "uri" | "sourceModifiedAt"
+> & {
+  code: "empty" | "oversized" | "unsupported";
+};
+
+export type SourceObservation =
+  | { kind: "utf8"; file: DiscoveryFile }
+  | { kind: "pdf"; file: PdfDiscoveryFile }
+  | { kind: "gap"; gap: DiscoveryGap };
 
 export type IdentityBinding = {
   rootAlias: string;

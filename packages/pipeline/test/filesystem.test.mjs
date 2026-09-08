@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  link,
+  mkdir,
+  mkdtemp,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -10,7 +17,10 @@ import test from "node:test";
 import {
   canonicalRoots,
   discoverFiles,
+  discoverSourceObservations,
   FilesystemFailure,
+  MAX_DISCOVERED_PDF_BYTES,
+  readPdfFile,
   readUtf8File,
 } from "../dist/filesystem.js";
 
@@ -66,6 +76,100 @@ test("BOM-prefixed UTF-8 preserves byte identity through text admission", async 
   assert.deepEqual(Buffer.from(result.text, "utf8"), bytes);
   assert.equal(result.byteLength, bytes.byteLength);
   assert.equal(result.sha256, createHash("sha256").update(bytes).digest("hex"));
+});
+
+test("PDF observations use a bounded binary descriptor without text admission", async () => {
+  const { root, journal } = await setup();
+  const bytes = Buffer.concat([
+    Buffer.from("%PDF-1.7\n"),
+    Buffer.alloc(70 * 1024, 0),
+  ]);
+  await writeFile(join(root, "document.pdf"), bytes);
+  await writeFile(join(root, "large-not-pdf.bin"), Buffer.alloc(70 * 1024));
+  await writeFile(join(root, "note.txt"), "synthetic text");
+  const localConfig = config(root, journal);
+  const [safeRoot] = await canonicalRoots(localConfig);
+  const pdf = await readPdfFile(safeRoot, "document.pdf");
+  assert.equal(pdf.mediaType, "application/pdf");
+  assert.equal(pdf.byteLength, bytes.byteLength);
+  assert.equal(pdf.sha256, createHash("sha256").update(bytes).digest("hex"));
+  await assert.rejects(
+    () => readUtf8File(safeRoot, "document.pdf", 65_536),
+    (error) => error instanceof FilesystemFailure && error.code === "oversized",
+  );
+  const observations = await discoverSourceObservations(localConfig, [
+    safeRoot,
+  ]);
+  assert.deepEqual(
+    observations.map((observation) => observation.kind),
+    ["pdf", "gap", "utf8"],
+  );
+  const binary = observations.find((observation) => observation.kind === "pdf");
+  assert.ok(binary && binary.kind === "pdf");
+  assert.equal(binary.file.uri, "fs://test/document.pdf");
+  assert.equal("text" in binary.file, false);
+  const oversized = observations.find(
+    (observation) => observation.kind === "gap",
+  );
+  assert.ok(oversized && oversized.kind === "gap");
+  assert.deepEqual(oversized.gap.code, "oversized");
+  assert.equal(oversized.gap.uri, "fs://test/large-not-pdf.bin");
+});
+
+test("PDF descriptor scan rejects non-PDF, hard-linked, and oversized files", async () => {
+  const { root, journal } = await setup();
+  const [safeRoot] = await canonicalRoots(config(root, journal));
+  await writeFile(join(root, "not-a-pdf"), "synthetic text");
+  await assert.rejects(
+    () => readPdfFile(safeRoot, "not-a-pdf"),
+    (error) =>
+      error instanceof FilesystemFailure && error.code === "unsupported",
+  );
+  await writeFile(join(root, "original.pdf"), "%PDF-1.7\nsynthetic");
+  await link(join(root, "original.pdf"), join(root, "linked.pdf"));
+  await assert.rejects(
+    () => readPdfFile(safeRoot, "original.pdf"),
+    (error) => error instanceof FilesystemFailure && error.code === "unstable",
+  );
+  await writeFile(
+    join(root, "oversized.pdf"),
+    Buffer.concat([
+      Buffer.from("%PDF-1.7\n"),
+      Buffer.alloc(MAX_DISCOVERED_PDF_BYTES),
+    ]),
+  );
+  await assert.rejects(
+    () => readPdfFile(safeRoot, "oversized.pdf"),
+    (error) => error instanceof FilesystemFailure && error.code === "oversized",
+  );
+});
+
+test("source observation gaps are leaf-only and do not hide unsafe entries", async () => {
+  const { root, journal } = await setup();
+  await writeFile(join(root, "invalid.bin"), Buffer.from([0xc3, 0x28]));
+  await writeFile(
+    join(root, "too-large.pdf"),
+    Buffer.concat([
+      Buffer.from("%PDF-1.7\n"),
+      Buffer.alloc(MAX_DISCOVERED_PDF_BYTES),
+    ]),
+  );
+  const localConfig = config(root, journal);
+  const [safeRoot] = await canonicalRoots(localConfig);
+  const observations = await discoverSourceObservations(localConfig, [
+    safeRoot,
+  ]);
+  assert.deepEqual(
+    observations.map((observation) =>
+      observation.kind === "gap" ? observation.gap.code : observation.kind,
+    ),
+    ["unsupported", "oversized"],
+  );
+  await symlink(join(root, "invalid.bin"), join(root, "unsafe-link"));
+  await assert.rejects(
+    () => discoverSourceObservations(localConfig, [safeRoot]),
+    (error) => error instanceof FilesystemFailure && error.code === "unstable",
+  );
 });
 
 test("empty, oversized, malformed UTF-8, and FIFO entries fail closed", async () => {

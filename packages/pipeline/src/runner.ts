@@ -1,14 +1,81 @@
 import { createHash, randomUUID } from "node:crypto";
-import { basename } from "node:path";
+import { lstat, mkdir, realpath } from "node:fs/promises";
+import { basename, join } from "node:path";
+
+import {
+  MAX_PARSED_PAGE_BATCH,
+  MAX_PARSED_REQUEST_BYTES,
+  MAX_PARSED_ROW_BATCH,
+  assertParsedRequestSize,
+  type ArchivedWorkIdentity,
+  type ParsedStagePhase,
+} from "@repo/worker-protocol";
+
+import {
+  ArchiveCommandError,
+  backupResticObject,
+  encryptAgeObject,
+  probeArchiveTools,
+  probeResticRepository,
+  publishAgeObject,
+  recoverPublishedAgeObject,
+  recoverResticBackup,
+} from "./archiveCommands.js";
+import type {
+  PreparedAgeObject,
+  PublishedAgeObject,
+  RecoveredResticBackup,
+} from "./archiveTypes.js";
+import { openArchiveCatalog, type ArchiveCatalog } from "./archiveCatalog.js";
+import type {
+  ArchiveCopyRole,
+  ArchiveSubject,
+  DurableParserOutput,
+  OriginalCatalogRow,
+  ProcessingCatalogRow,
+} from "./archiveCatalogTypes.js";
+import {
+  createArchiveReceiptSelection,
+  createParserArtifactSelection,
+  digestArchiveIntent,
+  parsedTextDeclaration,
+} from "./archivedRequestMapping.js";
+import {
+  capturePdfFile,
+  inspectCapturedPdf,
+  removeCapturedPdfExact,
+  type CapturedPdf,
+} from "./captureStore.js";
 
 import {
   canonicalRoots,
   discoverFiles,
+  discoverSourceObservations,
   FilesystemFailure,
   readUtf8File,
   toFsUri,
   type SafeRoot,
 } from "./filesystem.js";
+import {
+  createParserProfileWorkDirectory,
+  inspectCapturedPdfParserOutput,
+  inspectParserOutputIntent,
+  preparePdfDocQaProfile,
+  removeParserProfileWorkDirectoryExact,
+  removeParserOutputExact,
+  runCapturedPdfParser,
+  type DurableParserOutputArtifacts,
+  type ParserOutputIntent,
+  type PreparedPdfDocQaProfile,
+} from "./parserProcess.js";
+import { mapParsedBundle } from "./parsedBundleMapping.js";
+import {
+  inspectNormalizedBundleSpool,
+  inspectSpoolRoot,
+  prepareNormalizedBundleSpool,
+  recoverNormalizedBundleSpool,
+  removeNormalizedBundleSpoolExact,
+} from "./spoolStore.js";
 import { Journal } from "./journal.js";
 import {
   runJournaledCall,
@@ -25,10 +92,14 @@ import {
   parseRunnerCheckpoint,
   workerErrorCode,
   type DiscoveryLease,
+  type ArchivedStep,
   type FilePlan,
+  type GapFilePlan,
   type InventoryIdentity,
   type JobLease,
   type RunnerCheckpoint,
+  type PdfFilePlan,
+  type Utf8FilePlan,
 } from "./runnerState.js";
 import { parseWorkerResponse } from "./transport.js";
 import type {
@@ -36,6 +107,7 @@ import type {
   IdentityBinding,
   PipelineConfig,
   PipelineRunResult,
+  SourceObservation,
   WorkerErrorCode,
   WorkerResponse,
   WorkerTransport,
@@ -47,11 +119,169 @@ const MAX_RECONCILE_PAGES = 256;
 const MAX_RESERVATION_ROUNDS = 64;
 const MAX_ASSESSMENT_PAGES = 4_096;
 const LEASE_SAFETY_MARGIN_MS = 30_000;
+const MAX_ARCHIVED_RESERVATION_ROUNDS = 64;
+
+type ArchivedCheckpoint = Extract<RunnerCheckpoint, { phase: "archived" }>;
+
+function stableUuid(...parts: readonly unknown[]): string {
+  const bytes = createHash("sha256")
+    .update("kithmind-pdf-runner-id:v1\0")
+    .update(JSON.stringify(parts))
+    .digest()
+    .subarray(0, 16);
+  bytes[6] = (bytes[6]! & 0x0f) | 0x50;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function sha256Json(value: unknown): string {
+  return createHash("sha256")
+    .update(canonicalJson(value), "utf8")
+    .digest("hex");
+}
+
+function archivedIdentity(
+  checkpoint: ArchivedCheckpoint,
+  plan: PdfFilePlan,
+): ArchivedWorkIdentity {
+  if (
+    plan.sourceItemId === undefined ||
+    plan.observationEpoch === undefined ||
+    plan.processingEpoch === undefined
+  ) {
+    throw new PipelineWorkerError("archived_parent_missing");
+  }
+  return {
+    sourceItemId: plan.sourceItemId,
+    scanId: checkpoint.scanId,
+    observationEpoch: plan.observationEpoch,
+    processingEpoch: plan.processingEpoch,
+    contentHash: plan.sha256,
+    byteLength: plan.byteLength,
+    mediaType: "application/pdf",
+    parserProfileId: plan.parserProfileId,
+    parserFingerprint: plan.parserFingerprint,
+    extractionConfigurationFingerprint: plan.extractionConfigurationFingerprint,
+    extractorFingerprint: plan.extractorFingerprint,
+    recordSchemaFingerprint: plan.recordSchemaFingerprint,
+    normalizationFingerprint: plan.normalizationFingerprint,
+    chunkerFingerprint: plan.chunkerFingerprint,
+    correctionRevision: plan.correctionRevision,
+  };
+}
+
+function archivedBase(
+  checkpoint: ArchivedCheckpoint,
+  updates: Partial<ArchivedCheckpoint> = {},
+): ArchivedCheckpoint {
+  return { ...checkpoint, ...updates, version: 1, phase: "archived" };
+}
+
+function captureFromRows(
+  config: NonNullable<PipelineConfig["pdfDocQa"]>,
+  original: OriginalCatalogRow,
+  processing: ProcessingCatalogRow,
+): CapturedPdf {
+  if (!processing.capture) throw new PipelineWorkerError("capture_missing");
+  return {
+    version: 1,
+    captureId: processing.captureIntent.captureId,
+    captureDirectory: {
+      path: config.captureDirectory,
+      ...processing.captureIntent.directory,
+    },
+    path: join(
+      config.captureDirectory,
+      `${processing.captureIntent.captureId}.pdf`,
+    ),
+    sha256: original.origin.sha256,
+    byteLength: original.origin.byteLength,
+    sourceModifiedAt: processing.capture.sourceModifiedAt,
+    device: processing.capture.device,
+    inode: processing.capture.inode,
+  };
+}
+
+export function captureCatalogRecord(capture: CapturedPdf): NonNullable<
+  ProcessingCatalogRow["capture"]
+> & {
+  directory: { device: number; inode: number };
+} {
+  return {
+    opaqueName: capture.captureId,
+    device: capture.device,
+    inode: capture.inode,
+    sha256: capture.sha256,
+    byteLength: capture.byteLength,
+    sourceModifiedAt: capture.sourceModifiedAt,
+    directory: {
+      device: capture.captureDirectory.device,
+      inode: capture.captureDirectory.inode,
+    },
+  };
+}
+
+export function parserOutputIntentCore(
+  intent: ProcessingCatalogRow["parserIntent"],
+): ParserOutputIntent {
+  return {
+    outputId: intent.outputId,
+    outputRoot: intent.outputRoot,
+    outputDirectory: intent.outputDirectory,
+  };
+}
+
+export function parserOutputCatalogRecord(
+  artifacts: DurableParserOutputArtifacts,
+): DurableParserOutput {
+  const { path: rawPath, ...rawArtifact } = artifacts.rawArtifact;
+  const { path: bundlePath, ...normalizedBundle } = artifacts.normalizedBundle;
+  return {
+    ...artifacts,
+    rawArtifact: {
+      ...rawArtifact,
+      opaqueName: basename(rawPath),
+      mediaType: "application/vnd.docling+json",
+    },
+    normalizedBundle: {
+      ...normalizedBundle,
+      opaqueName: basename(bundlePath),
+      mediaType: "application/json",
+    },
+  };
+}
+
+export function preparedArchiveCatalogRecord(prepared: PreparedAgeObject) {
+  const { tempPath, ...record } = prepared;
+  return { ...record, tempName: basename(tempPath) };
+}
+
+export function publishedArchiveCatalogRecord(published: PublishedAgeObject) {
+  const { objectPath: _objectPath, ...record } = published;
+  return record;
+}
+
+async function privateDirectoryIdentity(path: string) {
+  const before = await lstat(path);
+  if (
+    before.isSymbolicLink() ||
+    !before.isDirectory() ||
+    before.uid !== process.getuid?.() ||
+    (before.mode & 0o777) !== 0o700 ||
+    (await realpath(path)) !== path
+  ) {
+    throw new PipelineWorkerError("protected_directory_invalid");
+  }
+  return { device: before.dev, inode: before.ino };
+}
 class PipelineWorkerError extends Error {
   constructor(readonly code: string) {
     super("Pipeline worker operation failed");
   }
 }
+
+class PipelineRetryableError extends PipelineWorkerError {}
 
 function json(value: unknown): JsonValue {
   return JSON.parse(JSON.stringify(value)) as JsonValue;
@@ -206,8 +436,102 @@ function filePlan(file: DiscoveryFile): FilePlan {
   };
 }
 
+function observationPlan(
+  observation: SourceObservation,
+  config: NonNullable<PipelineConfig["pdfDocQa"]>,
+): FilePlan {
+  if (observation.kind === "utf8") return filePlan(observation.file);
+  if (observation.kind === "gap") {
+    return {
+      rootAlias: observation.gap.rootAlias,
+      relativePath: observation.gap.relativePath,
+      sourceModifiedAt: observation.gap.sourceModifiedAt,
+      kind: "gap",
+      code: observation.gap.code,
+    };
+  }
+  return {
+    rootAlias: observation.file.rootAlias,
+    relativePath: observation.file.relativePath,
+    sourceModifiedAt: observation.file.sourceModifiedAt,
+    kind: "pdf",
+    sha256: observation.file.sha256,
+    byteLength: observation.file.byteLength,
+    parserProfileId: config.profile.parserProfileId,
+    parserFingerprint: config.profile.parserFingerprint,
+    extractionConfigurationFingerprint:
+      config.profile.extractionConfigurationFingerprint,
+    extractorFingerprint: config.profile.extractorFingerprint,
+    recordSchemaFingerprint: config.profile.recordSchemaFingerprint,
+    normalizationFingerprint: config.profile.normalizationFingerprint,
+    chunkerFingerprint: config.profile.chunkerFingerprint,
+    correctionRevision: config.profile.correctionRevision,
+  };
+}
+
+function isUtf8Plan(plan: FilePlan): plan is Utf8FilePlan {
+  return !isPdfPlan(plan) && !isGapPlan(plan);
+}
+
+function isPdfPlan(plan: FilePlan): plan is PdfFilePlan {
+  return "kind" in plan && plan.kind === "pdf";
+}
+
+function isGapPlan(plan: FilePlan): plan is GapFilePlan {
+  return "kind" in plan && plan.kind === "gap";
+}
+
+function scanEntry(
+  plan: FilePlan,
+  mode: "normal" | "identity_recovery",
+): Record<string, unknown> {
+  const entry = {
+    ...(mode === "identity_recovery" || plan.externalId === undefined
+      ? {}
+      : { externalId: plan.externalId }),
+    uri: toFsUri(plan.rootAlias, plan.relativePath),
+    title: basename(plan.relativePath),
+    sourceModifiedAt: plan.sourceModifiedAt,
+  };
+  if (isPdfPlan(plan)) {
+    return {
+      ...entry,
+      content: {
+        status: "ready_binary_v1",
+        sha256: plan.sha256,
+        byteLength: plan.byteLength,
+        mediaType: "application/pdf",
+        parserProfileId: plan.parserProfileId,
+        parserFingerprint: plan.parserFingerprint,
+        extractionConfigurationFingerprint:
+          plan.extractionConfigurationFingerprint,
+        extractorFingerprint: plan.extractorFingerprint,
+        recordSchemaFingerprint: plan.recordSchemaFingerprint,
+        normalizationFingerprint: plan.normalizationFingerprint,
+        chunkerFingerprint: plan.chunkerFingerprint,
+        correctionRevision: plan.correctionRevision,
+      },
+    };
+  }
+  if (isGapPlan(plan)) {
+    return { ...entry, content: { status: "gap", code: plan.code } };
+  }
+  if (!isUtf8Plan(plan)) {
+    throw new PipelineWorkerError("scan_plan_invalid");
+  }
+  return {
+    ...entry,
+    content: {
+      status: "ready",
+      sha256: plan.sha256,
+      byteLength: plan.byteLength,
+    },
+  };
+}
+
 function samePlan(file: DiscoveryFile, plan: FilePlan): boolean {
   return (
+    isUtf8Plan(plan) &&
     file.rootAlias === plan.rootAlias &&
     file.relativePath === plan.relativePath &&
     file.sourceModifiedAt === plan.sourceModifiedAt &&
@@ -225,6 +549,25 @@ function sameSnapshot(files: DiscoveryFile[], plans: FilePlan[]): boolean {
       return plan !== undefined && samePlan(file, plan);
     })
   );
+}
+
+function sameObservationPlan(
+  observation: SourceObservation,
+  plan: FilePlan,
+  config: NonNullable<PipelineConfig["pdfDocQa"]>,
+): boolean {
+  const current = observationPlan(observation, config);
+  const observedPlan = { ...plan } as Record<string, unknown>;
+  for (const field of [
+    "externalId",
+    "sourceItemId",
+    "observationEpoch",
+    "processingEpoch",
+    "discoveryState",
+  ]) {
+    delete observedPlan[field];
+  }
+  return equalJson(current, observedPlan);
 }
 
 function bindingsFromScan(checkpoint: {
@@ -293,7 +636,8 @@ function scanTerminal(
         | "seal"
         | "reconcile"
         | "discovery_reserve"
-        | "discovery_admit";
+        | "discovery_admit"
+        | "archived";
     }
   >,
   outcome: "complete" | "incomplete" | "failed",
@@ -308,7 +652,11 @@ function scanTerminal(
     code,
     scanId: checkpoint.scanId,
     scanned: checkpoint.files.length,
-    published: 0,
+    published:
+      "archivedPublished" in checkpoint &&
+      typeof checkpoint.archivedPublished === "number"
+        ? checkpoint.archivedPublished
+        : 0,
     bindings: bindingsFromScan(checkpoint),
   };
 }
@@ -416,6 +764,9 @@ function afterDiscoveryTarget(
         phase: "discovery_reserve",
         ...activeScanBase(checkpoint),
         round: checkpoint.round + 1,
+        ...(checkpoint.archivedPublished === undefined
+          ? {}
+          : { archivedPublished: checkpoint.archivedPublished }),
       };
 }
 
@@ -431,11 +782,314 @@ function resultFromTerminal(
 }
 
 export class PipelineRunner {
+  private preparedPdfProfile: PreparedPdfDocQaProfile | undefined;
+  private archiveCatalog: ArchiveCatalog | undefined;
+
   constructor(
     private readonly config: PipelineConfig,
     private readonly journal: Journal<RunnerCheckpoint, JsonValue>,
     private readonly transport: WorkerTransport,
   ) {}
+
+  private requirePdfConfig(): NonNullable<PipelineConfig["pdfDocQa"]> {
+    if (!this.config.pdfDocQa) {
+      throw new PipelineWorkerError("pdf_profile_missing");
+    }
+    return this.config.pdfDocQa;
+  }
+
+  private requireCatalog(): ArchiveCatalog {
+    if (!this.archiveCatalog) {
+      throw new PipelineWorkerError("archive_catalog_missing");
+    }
+    return this.archiveCatalog;
+  }
+
+  private archivedPlan(checkpoint: ArchivedCheckpoint): PdfFilePlan {
+    const plan = checkpoint.files[checkpoint.pdfIndex];
+    if (!plan || !isPdfPlan(plan)) {
+      throw new PipelineWorkerError("archived_plan_missing");
+    }
+    return plan;
+  }
+
+  private archivedRows(checkpoint: ArchivedCheckpoint): {
+    original: OriginalCatalogRow;
+    processing: ProcessingCatalogRow;
+  } {
+    if (!checkpoint.originalCatalogId || !checkpoint.processingCatalogId) {
+      throw new PipelineWorkerError("archive_catalog_reference_missing");
+    }
+    const original = this.requireCatalog()
+      .listOriginals()
+      .find((row) => row.originalCatalogId === checkpoint.originalCatalogId);
+    const processing = this.requireCatalog()
+      .listProcessings()
+      .find(
+        (row) => row.processingCatalogId === checkpoint.processingCatalogId,
+      );
+    if (!original || !processing) {
+      throw new PipelineWorkerError("archive_catalog_reference_missing");
+    }
+    if (
+      original.rowRevision < (checkpoint.expectedOriginalRevision ?? 1) ||
+      processing.rowRevision < (checkpoint.expectedProcessingRevision ?? 1)
+    ) {
+      throw new PipelineWorkerError("archive_catalog_revision_conflict");
+    }
+    return { original, processing };
+  }
+
+  private copyIntent(
+    subject: ArchiveSubject,
+    role: ArchiveCopyRole,
+    seed: string,
+  ) {
+    const pdf = this.requirePdfConfig();
+    const configured =
+      role === "primary" ? pdf.archive.primary : pdf.archive.independentBackup;
+    const archiveObjectId = stableUuid(seed, subject, role, "object");
+    return {
+      role,
+      clientReceiptId: stableUuid(seed, subject, role, "receipt"),
+      archiveObjectId,
+      objectName: `${archiveObjectId}.age`,
+      archiveIdentityFingerprint: configured.archiveIdentityFingerprint,
+      archiveProfileFingerprint: configured.archiveProfileFingerprint,
+      recipientFingerprint: configured.recipientFingerprint,
+      repositoryKeyDomainFingerprint: configured.repositoryKeyDomainFingerprint,
+      storageFailureDomainFingerprint:
+        configured.storageFailureDomainFingerprint,
+      ...(role === "independent_backup"
+        ? {
+            restic: {
+              operationId: stableUuid(seed, subject, role, "restic"),
+              host: pdf.archive.independentBackup.host,
+              repositoryId: pdf.archive.independentBackup.expectedRepositoryId,
+            },
+          }
+        : {}),
+    };
+  }
+
+  private processingFingerprints(plan: PdfFilePlan) {
+    return {
+      parserFingerprint: plan.parserFingerprint,
+      extractionConfigurationFingerprint:
+        plan.extractionConfigurationFingerprint,
+      discoveryProfileFingerprint: sha256Json([
+        plan.parserProfileId,
+        plan.extractorFingerprint,
+        plan.recordSchemaFingerprint,
+        plan.normalizationFingerprint,
+        plan.chunkerFingerprint,
+      ]),
+      processingPolicyFingerprint: sha256Json([
+        plan.extractionConfigurationFingerprint,
+        plan.chunkerFingerprint,
+      ]),
+      correctionFingerprint: createHash("sha256")
+        .update(plan.correctionRevision, "utf8")
+        .digest("hex"),
+    };
+  }
+
+  private matchingProcessingRows(plan: PdfFilePlan): ProcessingCatalogRow[] {
+    if (
+      !plan.externalId ||
+      plan.observationEpoch === undefined ||
+      plan.processingEpoch === undefined
+    ) {
+      return [];
+    }
+    const original = this.requireCatalog().findOriginalExact({
+      sourceExternalId: plan.externalId,
+      sha256: plan.sha256,
+      byteLength: plan.byteLength,
+      mediaType: "application/pdf",
+    });
+    if (!original) return [];
+    const fingerprints = this.processingFingerprints(plan);
+    return this.requireCatalog()
+      .listProcessings()
+      .filter(
+        (row) =>
+          row.originalCatalogId === original.originalCatalogId &&
+          row.currentObservation.observationEpoch === plan.observationEpoch &&
+          row.currentObservation.processingEpoch === plan.processingEpoch &&
+          equalJson(row.fingerprints, fingerprints),
+      );
+  }
+
+  private async processingArtifactsPresent(
+    processing: ProcessingCatalogRow,
+  ): Promise<boolean> {
+    if (!processing.capture || !processing.parserOutput || !processing.spool) {
+      return false;
+    }
+    const pdf = this.requirePdfConfig();
+    const candidates = [
+      join(pdf.captureDirectory, `${processing.captureIntent.captureId}.pdf`),
+      join(pdf.parserOutputRoot, processing.parserIntent.outputId),
+      join(pdf.spoolDirectory, processing.spool.opaqueName),
+    ];
+    for (const path of candidates) {
+      const present = await lstat(path)
+        .then(() => true)
+        .catch((error: unknown) => {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+          return true;
+        });
+      if (present) return true;
+    }
+    return false;
+  }
+
+  private async pdfNeedsArchivedWork(plan: PdfFilePlan): Promise<boolean> {
+    if (plan.discoveryState === "queued") return true;
+    if (plan.discoveryState !== "unchanged") return false;
+    const matches = this.matchingProcessingRows(plan);
+    if (matches.length > 1) {
+      throw new PipelineWorkerError("archive_catalog_revision_conflict");
+    }
+    if (matches[0]?.activation) {
+      return await this.processingArtifactsPresent(matches[0]);
+    }
+    return true;
+  }
+
+  private async nextPdfWorkIndex(
+    files: FilePlan[],
+    start: number,
+  ): Promise<number> {
+    for (let index = start; index < files.length; index += 1) {
+      const plan = files[index];
+      if (plan && isPdfPlan(plan) && (await this.pdfNeedsArchivedWork(plan))) {
+        return index;
+      }
+    }
+    return -1;
+  }
+
+  private async createArchivedIntents(
+    checkpoint: ArchivedCheckpoint,
+  ): Promise<ArchivedCheckpoint> {
+    const catalog = this.requireCatalog();
+    const pdf = this.requirePdfConfig();
+    const plan = this.archivedPlan(checkpoint);
+    const identity = archivedIdentity(checkpoint, plan);
+    if (!plan.externalId) {
+      throw new PipelineWorkerError("archived_external_id_missing");
+    }
+    const originalSeed = stableUuid(
+      plan.externalId,
+      plan.sha256,
+      plan.byteLength,
+      "original",
+    );
+    let original = catalog.findOriginalExact({
+      sourceExternalId: plan.externalId,
+      sha256: plan.sha256,
+      byteLength: plan.byteLength,
+      mediaType: "application/pdf",
+    });
+    if (!original) {
+      original = await catalog.createOriginalIntent({
+        originalCatalogId: originalSeed,
+        sourceExternalId: plan.externalId,
+        origin: {
+          scanId: checkpoint.scanId,
+          observationEpoch: identity.observationEpoch,
+          sha256: plan.sha256,
+          byteLength: plan.byteLength,
+          mediaType: "application/pdf",
+        },
+        copies: {
+          primary: this.copyIntent("original_bytes", "primary", originalSeed),
+          independent_backup: this.copyIntent(
+            "original_bytes",
+            "independent_backup",
+            originalSeed,
+          ),
+        },
+        createdAt: plan.sourceModifiedAt,
+      });
+    }
+    const fingerprints = this.processingFingerprints(plan);
+    const processingProbe = {
+      originalCatalogId: original.originalCatalogId,
+      currentObservation: {
+        scanId: checkpoint.scanId,
+        observationEpoch: identity.observationEpoch,
+        processingEpoch: identity.processingEpoch,
+      },
+      fingerprints,
+    };
+    let processing = catalog.findProcessingExact(processingProbe);
+    if (!processing && plan.discoveryState === "unchanged") {
+      const prior = this.matchingProcessingRows(plan);
+      if (prior.length > 1) {
+        throw new PipelineWorkerError("archive_catalog_revision_conflict");
+      }
+      processing = prior[0];
+    }
+    if (!processing) {
+      const processingId = stableUuid(
+        original.originalCatalogId,
+        processingProbe.currentObservation,
+        fingerprints,
+        "processing",
+      );
+      const outputId = stableUuid(processingId, "parser-output");
+      const outputPath = join(pdf.parserOutputRoot, outputId);
+      await mkdir(outputPath, { mode: 0o700 }).catch((error: unknown) => {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      });
+      const [captureDirectory, outputRoot, outputDirectory, spoolRoot] =
+        await Promise.all([
+          privateDirectoryIdentity(pdf.captureDirectory),
+          privateDirectoryIdentity(pdf.parserOutputRoot),
+          privateDirectoryIdentity(outputPath),
+          inspectSpoolRoot(pdf.spoolDirectory),
+        ]);
+      processing = await catalog.createProcessingIntent({
+        processingCatalogId: processingId,
+        ...processingProbe,
+        captureIntent: {
+          captureId: stableUuid(processingId, "capture"),
+          directory: captureDirectory,
+        },
+        parserIntent: {
+          outputId,
+          outputRoot,
+          outputDirectory,
+          parserArtifactClientId: stableUuid(processingId, "parser-artifact"),
+        },
+        spoolIntent: {
+          spoolId: stableUuid(processingId, "spool"),
+          root: spoolRoot,
+        },
+        copies: {
+          primary: this.copyIntent("parser_output", "primary", processingId),
+          independent_backup: this.copyIntent(
+            "parser_output",
+            "independent_backup",
+            processingId,
+          ),
+        },
+        createdAt: plan.sourceModifiedAt,
+      });
+    }
+    return archivedBase(checkpoint, {
+      step: processing.activation ? "cleanup" : "preflight",
+      preflightAction: processing.activation ? undefined : "initial",
+      countPublication: processing.activation ? false : true,
+      originalCatalogId: original.originalCatalogId,
+      expectedOriginalRevision: original.rowRevision,
+      processingCatalogId: processing.processingCatalogId,
+      expectedProcessingRevision: processing.rowRevision,
+    });
+  }
 
   private async sourceStatus(): Promise<Record<string, unknown>> {
     return object(
@@ -444,10 +1098,74 @@ export class PipelineRunner {
     );
   }
 
-  private validatePendingBody(
+  private async preparePdfProfile(): Promise<void> {
+    const pdf = this.config.pdfDocQa;
+    if (pdf === undefined) return;
+    const work = await createParserProfileWorkDirectory({
+      workRoot: pdf.parserOutputRoot,
+      workId: randomUUID(),
+    });
+    try {
+      const prepared = await preparePdfDocQaProfile({
+        ...pdf.parser,
+        workRoot: pdf.parserOutputRoot,
+        work,
+      });
+      if (
+        prepared.parserFingerprint !== pdf.profile.parserFingerprint ||
+        prepared.extractionConfigurationFingerprint !==
+          pdf.profile.extractionConfigurationFingerprint
+      ) {
+        throw new PipelineWorkerError("parser_profile_mismatch");
+      }
+      this.preparedPdfProfile = prepared;
+    } finally {
+      await removeParserProfileWorkDirectoryExact({
+        workRoot: pdf.parserOutputRoot,
+        intent: work,
+      });
+    }
+  }
+
+  private async discoverPlans(roots: SafeRoot[]): Promise<FilePlan[]> {
+    if (this.config.pdfDocQa === undefined) {
+      return (await discoverFiles(this.config, roots)).map(filePlan);
+    }
+    if (this.preparedPdfProfile === undefined) {
+      throw new PipelineWorkerError("parser_profile_unverified");
+    }
+    return (await discoverSourceObservations(this.config, roots)).map(
+      (observation) => observationPlan(observation, this.config.pdfDocQa!),
+    );
+  }
+
+  private async sameDiscoveredSnapshot(
+    roots: SafeRoot[],
+    plans: FilePlan[],
+  ): Promise<boolean> {
+    if (this.config.pdfDocQa === undefined) {
+      return sameSnapshot(await discoverFiles(this.config, roots), plans);
+    }
+    if (this.preparedPdfProfile === undefined) {
+      throw new PipelineWorkerError("parser_profile_unverified");
+    }
+    const observations = await discoverSourceObservations(this.config, roots);
+    return (
+      observations.length === plans.length &&
+      observations.every((observation, index) => {
+        const plan = plans[index];
+        return (
+          plan !== undefined &&
+          sameObservationPlan(observation, plan, this.config.pdfDocQa!)
+        );
+      })
+    );
+  }
+
+  private async validatePendingBody(
     operation: JournalOperation,
     body: Record<string, unknown>,
-  ): void {
+  ): Promise<void> {
     const checkpoint = this.journal.checkpoint;
     const requestId = text(body.requestId, "request_id");
     let expected: Record<string, unknown>;
@@ -459,7 +1177,8 @@ export class PipelineRunner {
         expected = request(this.config, operation, {
           requestId,
           watcherId: `pipeline-${this.config.sourceAccountId.slice(0, 64)}`,
-          connectorVersion: "p2-8-text-v1",
+          connectorVersion:
+            this.config.pdfDocQa === undefined ? "p2-8-text-v1" : "p2-9-pdf-v1",
           ...(this.config.hostAffinity
             ? { hostAffinity: this.config.hostAffinity }
             : {}),
@@ -490,20 +1209,9 @@ export class PipelineRunner {
           scanId: checkpoint.scanId,
           requestId,
           ordinal: checkpoint.nextOrdinal,
-          entries: checkpoint.files.slice(offset, offset + 4).map((plan) => ({
-            ...(checkpoint.mode === "identity_recovery" ||
-            plan.externalId === undefined
-              ? {}
-              : { externalId: plan.externalId }),
-            uri: toFsUri(plan.rootAlias, plan.relativePath),
-            title: basename(plan.relativePath),
-            sourceModifiedAt: plan.sourceModifiedAt,
-            content: {
-              status: "ready",
-              sha256: plan.sha256,
-              byteLength: plan.byteLength,
-            },
-          })),
+          entries: checkpoint.files
+            .slice(offset, offset + 4)
+            .map((plan) => scanEntry(plan, checkpoint.mode)),
         });
         break;
       }
@@ -553,6 +1261,7 @@ export class PipelineRunner {
         );
         if (
           !plan ||
+          !isUtf8Plan(plan) ||
           plan.sha256 !== target.contentHash ||
           plan.byteLength !== target.byteLength
         ) {
@@ -651,6 +1360,225 @@ export class PipelineRunner {
         });
         break;
       }
+      case "discovery.preflightArchived": {
+        if (checkpoint.phase !== "archived") {
+          throw new PipelineWorkerError("journal_phase_conflict");
+        }
+        const plan = this.archivedPlan(checkpoint);
+        if (checkpoint.step !== "preflight") {
+          throw new PipelineWorkerError("journal_phase_conflict");
+        }
+        const rows = this.archivedRows(checkpoint);
+        const identity = archivedIdentity(checkpoint, plan);
+        expected = request(this.config, operation, {
+          requestId,
+          identity,
+          archiveIntentDigest: digestArchiveIntent({
+            identity,
+            original: rows.original,
+            processing: rows.processing,
+          }),
+        });
+        break;
+      }
+      case "discovery.lookupArchivedAdmission": {
+        if (checkpoint.phase !== "archived") {
+          throw new PipelineWorkerError("journal_phase_conflict");
+        }
+        const identity = archivedIdentity(
+          checkpoint,
+          this.archivedPlan(checkpoint),
+        );
+        if (checkpoint.step === "lookup_original") {
+          expected = request(this.config, operation, {
+            requestId,
+            identity,
+            lookup: { mode: "original" },
+          });
+          break;
+        }
+        if (checkpoint.step !== "lookup_processing") {
+          throw new PipelineWorkerError("journal_phase_conflict");
+        }
+        const mapped = await this.mappedProcessing(checkpoint);
+        const output = mapped.processing.parserOutput!;
+        expected = request(this.config, operation, {
+          requestId,
+          identity,
+          lookup: {
+            mode: "processing",
+            clientArtifactId:
+              mapped.processing.parserIntent.parserArtifactClientId,
+            parserOutputHash: output.rawArtifact.sha256,
+            parserOutputByteLength: output.rawArtifact.byteLength,
+            parserOutputMediaType: "application/vnd.docling+json",
+            parsedText: mapped.declaration,
+          },
+        });
+        break;
+      }
+      case "discovery.reserveArchived": {
+        if (checkpoint.phase !== "archived" || checkpoint.step !== "reserve") {
+          throw new PipelineWorkerError("journal_phase_conflict");
+        }
+        expected = request(this.config, operation, {
+          requestId,
+          identity: archivedIdentity(checkpoint, this.archivedPlan(checkpoint)),
+        });
+        break;
+      }
+      case "discovery.admitArchived": {
+        if (checkpoint.phase !== "archived" || checkpoint.step !== "admit") {
+          throw new PipelineWorkerError("journal_phase_conflict");
+        }
+        const lease = checkpoint.discoveryLease;
+        if (!lease) {
+          throw new PipelineWorkerError("journal_phase_conflict");
+        }
+        const mapped = await this.mappedProcessing(checkpoint);
+        expected = request(this.config, operation, {
+          requestId,
+          workId: lease.workId,
+          leaseEpoch: lease.leaseEpoch,
+          leaseToken: lease.leaseToken,
+          parserArtifact: createParserArtifactSelection(mapped.processing),
+          archives: [
+            createArchiveReceiptSelection(
+              "original_bytes",
+              mapped.original,
+              "primary",
+            ),
+            createArchiveReceiptSelection(
+              "original_bytes",
+              mapped.original,
+              "independent_backup",
+            ),
+            createArchiveReceiptSelection(
+              "parser_output",
+              mapped.processing,
+              "primary",
+            ),
+            createArchiveReceiptSelection(
+              "parser_output",
+              mapped.processing,
+              "independent_backup",
+            ),
+          ],
+          parsedText: mapped.declaration,
+        });
+        break;
+      }
+      case "jobs.reserveParsed": {
+        if (
+          checkpoint.phase !== "archived" ||
+          checkpoint.step !== "parsed_reserve"
+        ) {
+          throw new PipelineWorkerError("journal_phase_conflict");
+        }
+        const { processing } = this.archivedRows(checkpoint);
+        if (!processing.cloud) {
+          throw new PipelineWorkerError("admission_missing");
+        }
+        expected = request(this.config, operation, {
+          requestId,
+          maxItems: 1,
+          jobId: processing.cloud.ingestJobId,
+        });
+        break;
+      }
+      case "jobs.renewParsed": {
+        if (
+          checkpoint.phase !== "archived" ||
+          checkpoint.step !== "parsed_renew" ||
+          !checkpoint.jobLease
+        ) {
+          throw new PipelineWorkerError("journal_phase_conflict");
+        }
+        expected = request(this.config, operation, {
+          requestId,
+          jobId: checkpoint.jobLease.jobId,
+          leaseEpoch: checkpoint.jobLease.leaseEpoch,
+          leaseToken: checkpoint.jobLease.leaseToken,
+        });
+        break;
+      }
+      case "jobs.stageParsedBegin": {
+        if (
+          checkpoint.phase !== "archived" ||
+          checkpoint.step !== "parsed_begin" ||
+          !checkpoint.jobLease
+        ) {
+          throw new PipelineWorkerError("journal_phase_conflict");
+        }
+        const mapped = await this.mappedProcessing(checkpoint);
+        const declaration = mapped.declaration;
+        expected = request(this.config, operation, {
+          requestId,
+          jobId: checkpoint.jobLease.jobId,
+          leaseEpoch: checkpoint.jobLease.leaseEpoch,
+          leaseToken: checkpoint.jobLease.leaseToken,
+          extractionFingerprint: declaration.extractionFingerprint,
+          mappingManifestHash: declaration.mappingManifestHash,
+          normalizedBundleDigest: declaration.normalizedBundleDigest,
+          expectedPageCount: declaration.pageCount,
+          expectedEvidenceSpanCount: declaration.expectedEvidenceSpanCount,
+          expectedDocumentCount: declaration.expectedDocumentCount,
+          expectedChunkCount: declaration.expectedChunkCount,
+        });
+        break;
+      }
+      case "jobs.stageParsedBatch": {
+        if (checkpoint.phase !== "archived" || !checkpoint.jobLease) {
+          throw new PipelineWorkerError("journal_phase_conflict");
+        }
+        if (checkpoint.step !== "parsed_batch") {
+          throw new PipelineWorkerError("journal_phase_conflict");
+        }
+        const mapped = await this.mappedProcessing(checkpoint);
+        expected = this.parsedBatchBody(checkpoint, mapped.mapping, requestId);
+        assertParsedRequestSize(expected);
+        break;
+      }
+      case "jobs.stageParsedSeal": {
+        if (
+          checkpoint.phase !== "archived" ||
+          checkpoint.step !== "parsed_seal" ||
+          !checkpoint.jobLease
+        ) {
+          throw new PipelineWorkerError("journal_phase_conflict");
+        }
+        const mapped = await this.mappedProcessing(checkpoint);
+        expected = request(this.config, operation, {
+          requestId,
+          jobId: checkpoint.jobLease.jobId,
+          leaseEpoch: checkpoint.jobLease.leaseEpoch,
+          leaseToken: checkpoint.jobLease.leaseToken,
+          stageId: checkpoint.stageId,
+          normalizedBundleDigest: mapped.declaration.normalizedBundleDigest,
+        });
+        break;
+      }
+      case "jobs.activateParsed": {
+        if (
+          checkpoint.phase !== "archived" ||
+          checkpoint.step !== "parsed_activate" ||
+          !checkpoint.jobLease
+        ) {
+          throw new PipelineWorkerError("journal_phase_conflict");
+        }
+        expected = request(this.config, operation, {
+          requestId,
+          jobId: checkpoint.jobLease.jobId,
+          leaseEpoch: checkpoint.jobLease.leaseEpoch,
+          leaseToken: checkpoint.jobLease.leaseToken,
+        });
+        break;
+      }
+      case "jobs.failParsed": {
+        throw new PipelineWorkerError("journal_phase_conflict");
+      }
+      default:
+        throw new PipelineWorkerError("journal_phase_conflict");
     }
     if (!equalJson(body, expected)) {
       throw new PipelineWorkerError("journal_phase_conflict");
@@ -663,7 +1591,13 @@ export class PipelineRunner {
     transition: (
       checkpoint: RunnerCheckpoint,
       result: WorkerResponse,
-    ) => RunnerCheckpoint,
+      pending: {
+        requestId: string;
+        requestBody: string;
+        requestDigest: string;
+        receivedAt: number;
+      },
+    ) => RunnerCheckpoint | Promise<RunnerCheckpoint>,
   ): Promise<WorkerResponse> {
     const pending = this.journal.pending;
     if (pending && pending.operation !== operation) {
@@ -679,7 +1613,10 @@ export class PipelineRunner {
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
         throw new PipelineWorkerError("journal_phase_conflict");
       }
-      this.validatePendingBody(operation, parsed as Record<string, unknown>);
+      await this.validatePendingBody(
+        operation,
+        parsed as Record<string, unknown>,
+      );
     }
     const sendExact = async (
       requestBody: string,
@@ -689,17 +1626,22 @@ export class PipelineRunner {
         throw new PipelineWorkerError("journal_phase_conflict");
       }
       const parsed = JSON.parse(requestBody) as Record<string, unknown>;
-      this.validatePendingBody(exactOperation, parsed);
+      await this.validatePendingBody(exactOperation, parsed);
       return await this.transport.call(parsed);
     };
-    const nextCheckpoint = ({
+    const nextCheckpoint = async ({
       checkpoint,
+      pending,
       result,
-    }: ReplayContext<
-      RunnerCheckpoint,
-      JsonValue
-    >): CheckpointTransition<RunnerCheckpoint> => {
-      const next = transition(checkpoint, asWorkerResponse(result));
+    }: ReplayContext<RunnerCheckpoint, JsonValue>): Promise<
+      CheckpointTransition<RunnerCheckpoint>
+    > => {
+      const next = await transition(checkpoint, asWorkerResponse(result), {
+        requestId: pending.requestId,
+        requestBody: pending.requestBody,
+        requestDigest: pending.requestDigest,
+        receivedAt: pending.result?.receivedAt ?? Date.now(),
+      });
       return {
         checkpoint: next,
         credentialSessionActive: checkpointActive(next),
@@ -732,8 +1674,7 @@ export class PipelineRunner {
       this.journal.checkpoint.phase === "terminal"
         ? this.journal.checkpoint.bindings
         : [];
-    const discovered = await discoverFiles(this.config, roots);
-    const plans = discovered.map(filePlan);
+    const plans = await this.discoverPlans(roots);
     const byPath = new Map(prior.map((binding) => [fileKey(binding), binding]));
     const currentPaths = new Set(plans.map(fileKey));
     const missingBindings = prior.filter(
@@ -789,7 +1730,8 @@ export class PipelineRunner {
         request(this.config, "scan.begin", {
           requestId: randomUUID(),
           watcherId: `pipeline-${this.config.sourceAccountId.slice(0, 64)}`,
-          connectorVersion: "p2-8-text-v1",
+          connectorVersion:
+            this.config.pdfDocQa === undefined ? "p2-8-text-v1" : "p2-9-pdf-v1",
           ...(this.config.hostAffinity
             ? { hostAffinity: this.config.hostAffinity }
             : {}),
@@ -981,20 +1923,7 @@ export class PipelineRunner {
           scanId: checkpoint.scanId,
           requestId: randomUUID(),
           ordinal: checkpoint.nextOrdinal,
-          entries: pagePlans.map((plan) => ({
-            ...(checkpoint.mode === "identity_recovery" ||
-            plan.externalId === undefined
-              ? {}
-              : { externalId: plan.externalId }),
-            uri: toFsUri(plan.rootAlias, plan.relativePath),
-            title: basename(plan.relativePath),
-            sourceModifiedAt: plan.sourceModifiedAt,
-            content: {
-              status: "ready",
-              sha256: plan.sha256,
-              byteLength: plan.byteLength,
-            },
-          })),
+          entries: pagePlans.map((plan) => scanEntry(plan, checkpoint.mode)),
         }),
       (current, response) => {
         if (current.phase !== "append") {
@@ -1029,6 +1958,26 @@ export class PipelineRunner {
         for (let index = 0; index < output.length; index += 1) {
           const row = output[index]!;
           const plan = files[current.nextOrdinal * 4 + index]!;
+          if (isPdfPlan(plan)) {
+            const sourceItemId = row.sourceItemId;
+            const observationEpoch = row.observationEpoch;
+            const processingEpoch = row.processingEpoch;
+            if (
+              typeof sourceItemId !== "string" ||
+              !Number.isSafeInteger(observationEpoch) ||
+              !Number.isSafeInteger(processingEpoch)
+            ) {
+              throw new PipelineWorkerError("archived_append_parent_missing");
+            }
+            plan.sourceItemId = sourceItemId;
+            plan.observationEpoch = observationEpoch as number;
+            plan.processingEpoch = processingEpoch as number;
+            if (row.state === "queued" || row.state === "unchanged") {
+              plan.discoveryState = row.state;
+            } else {
+              delete plan.discoveryState;
+            }
+          }
           if (row.state === "needs_review") {
             reviewSeen = true;
             delete plan.externalId;
@@ -1087,8 +2036,7 @@ export class PipelineRunner {
     let health: { status: "healthy" } | { status: "failed"; code: string };
     try {
       const roots = await canonicalRoots(this.config);
-      const current = await discoverFiles(this.config, roots);
-      health = sameSnapshot(current, checkpoint.files)
+      health = (await this.sameDiscoveredSnapshot(roots, checkpoint.files))
         ? { status: "healthy" }
         : { status: "failed", code: "unstable" };
     } catch (error) {
@@ -1181,7 +2129,7 @@ export class PipelineRunner {
           ordinal: checkpoint.ordinal,
           maxItems: 50,
         }),
-      (current, response) => {
+      async (current, response) => {
         if (current.phase !== "reconcile") {
           throw new PipelineWorkerError("journal_phase_conflict");
         }
@@ -1205,6 +2153,18 @@ export class PipelineRunner {
           }
           if (value.state !== "enumerated") {
             throw new PipelineWorkerError("reconcile_state_invalid");
+          }
+          const pdfIndex = await this.nextPdfWorkIndex(current.files, 0);
+          if (pdfIndex >= 0) {
+            return {
+              version: 1,
+              phase: "archived",
+              ...activeScanBase(current),
+              pdfIndex,
+              step: "intent",
+              reservationRound: 0,
+              archivedPublished: 0,
+            };
           }
           return {
             version: 1,
@@ -1263,7 +2223,7 @@ export class PipelineRunner {
             phase: "jobs_reserve",
             scanId: current.scanId,
             scanned: current.files.length,
-            published: 0,
+            published: current.archivedPublished ?? 0,
             bindings: bindingsFromScan(current),
             round: 0,
           };
@@ -1283,6 +2243,9 @@ export class PipelineRunner {
           round: current.round,
           targets,
           index: 0,
+          ...(current.archivedPublished === undefined
+            ? {}
+            : { archivedPublished: current.archivedPublished }),
         };
       },
     );
@@ -1326,7 +2289,7 @@ export class PipelineRunner {
         });
         return;
       }
-      if (!plan) {
+      if (!plan || !isUtf8Plan(plan)) {
         await this.journal.transitionCheckpoint({
           checkpoint: scanTerminal(
             checkpoint,
@@ -1407,6 +2370,1770 @@ export class PipelineRunner {
     if (code && this.journal.checkpoint.phase === "discovery_admit") {
       throw new PipelineWorkerError(code);
     }
+  }
+
+  private archiveConfiguration(role: ArchiveCopyRole) {
+    const pdf = this.requirePdfConfig();
+    return role === "primary"
+      ? pdf.archive.primary
+      : pdf.archive.independentBackup;
+  }
+
+  private preparedArchiveObject(
+    row: OriginalCatalogRow | ProcessingCatalogRow,
+    role: ArchiveCopyRole,
+  ) {
+    const copy = row.copies[role];
+    if (!copy.prepared)
+      throw new PipelineWorkerError("archive_prepare_missing");
+    return {
+      ...copy.prepared,
+      tempPath: join(
+        this.archiveConfiguration(role).directory,
+        copy.prepared.tempName,
+      ),
+    };
+  }
+
+  private async recordArchiveAction(
+    checkpoint: ArchivedCheckpoint,
+    action: NonNullable<ArchivedCheckpoint["preflightAction"]>,
+    recoveredBackup?: RecoveredResticBackup,
+  ): Promise<ArchivedCheckpoint> {
+    if (action === "initial") {
+      return archivedBase(checkpoint, {
+        step: "lookup_original",
+        preflightAction: undefined,
+      });
+    }
+    const subject: ArchiveSubject = action.startsWith("original_")
+      ? "original_bytes"
+      : "parser_output";
+    const role: ArchiveCopyRole = action.includes("primary")
+      ? "primary"
+      : "independent_backup";
+    const snapshot = action.endsWith("snapshot");
+    const { original, processing } = this.archivedRows(checkpoint);
+    const row = subject === "original_bytes" ? original : processing;
+    const copy = row.copies[role];
+    const configured = this.archiveConfiguration(role);
+    const prepared = this.preparedArchiveObject(row, role);
+    const pdf = this.requirePdfConfig();
+    let nextRow: OriginalCatalogRow | ProcessingCatalogRow;
+    if (!snapshot) {
+      const finalPath = join(configured.directory, copy.objectName);
+      let published;
+      if (copy.published) {
+        await recoverPublishedAgeObject(prepared, finalPath);
+        published = { ...copy.published, objectPath: finalPath };
+      } else {
+        try {
+          published = await publishAgeObject(prepared, finalPath);
+        } catch (error) {
+          if (
+            !(error instanceof ArchiveCommandError) ||
+            error.code !== "destination_exists"
+          ) {
+            throw error;
+          }
+          await recoverPublishedAgeObject(prepared, finalPath);
+          published = {
+            state: "published" as const,
+            objectPath: finalPath,
+            source: prepared.source,
+            ciphertext: prepared.ciphertext,
+            ciphertextDevice: prepared.ciphertextDevice,
+            ciphertextInode: prepared.ciphertextInode,
+            ageVersion: prepared.ageVersion,
+          };
+        }
+      }
+      nextRow = await this.requireCatalog().recordArchivePublished({
+        subject,
+        catalogId:
+          subject === "original_bytes"
+            ? original.originalCatalogId
+            : processing.processingCatalogId,
+        expectedRevision: row.rowRevision,
+        role,
+        published: publishedArchiveCatalogRecord(published),
+        ...(role === "primary"
+          ? { readbackVerifiedAt: copy.readbackVerifiedAt ?? Date.now() }
+          : {}),
+      });
+    } else {
+      if (role !== "independent_backup" || !copy.published || !copy.restic) {
+        throw new PipelineWorkerError("archive_backup_parent_missing");
+      }
+      let backup;
+      if (copy.backup) {
+        if (!recoveredBackup) {
+          throw new PipelineWorkerError("archive_backup_recovery_missing");
+        }
+        for (const field of [
+          "operationId",
+          "snapshotId",
+          "objectName",
+          "resticVersion",
+          "repositoryId",
+          "verification",
+        ] as const) {
+          if (copy.backup[field] !== recoveredBackup[field]) {
+            throw new PipelineWorkerError("archive_backup_recovery_conflict");
+          }
+        }
+        if (!equalJson(copy.backup.ciphertext, recoveredBackup.ciphertext)) {
+          throw new PipelineWorkerError("archive_backup_recovery_conflict");
+        }
+        backup = copy.backup;
+      } else if (recoveredBackup) {
+        backup = recoveredBackup;
+      } else {
+        backup = await backupResticObject({
+          resticBinary: pdf.archive.independentBackup.resticBinary,
+          repositoryPath: pdf.archive.independentBackup.repositoryPath,
+          expectedRepositoryId: copy.restic.repositoryId,
+          passwordCommand: pdf.archive.independentBackup.passwordCommand,
+          operationId: copy.restic.operationId,
+          host: copy.restic.host,
+          ciphertextPath: join(configured.directory, copy.objectName),
+          expectedCiphertext: copy.published.ciphertext,
+          primaryArchiveRoot: pdf.archive.primary.directory,
+          backupMode: "independent_backup",
+        });
+      }
+      nextRow = await this.requireCatalog().recordResticBackup({
+        subject,
+        catalogId:
+          subject === "original_bytes"
+            ? original.originalCatalogId
+            : processing.processingCatalogId,
+        expectedRevision: row.rowRevision,
+        role: "independent_backup",
+        backup,
+        readbackVerifiedAt: copy.readbackVerifiedAt ?? Date.now(),
+      });
+    }
+    return archivedBase(checkpoint, {
+      step:
+        subject === "original_bytes" ? "original_archive" : "parser_archive",
+      preflightAction: undefined,
+      ...(subject === "original_bytes"
+        ? { expectedOriginalRevision: nextRow.rowRevision }
+        : { expectedProcessingRevision: nextRow.rowRevision }),
+    });
+  }
+
+  private async driveArchivedPreflight(): Promise<void> {
+    const checkpoint = this.journal.checkpoint;
+    if (
+      checkpoint.phase !== "archived" ||
+      checkpoint.step !== "preflight" ||
+      !checkpoint.preflightAction
+    ) {
+      throw new PipelineWorkerError("journal_phase_conflict");
+    }
+    const rows = this.archivedRows(checkpoint);
+    const identity = archivedIdentity(
+      checkpoint,
+      this.archivedPlan(checkpoint),
+    );
+    const intentDigest = digestArchiveIntent({
+      identity,
+      original: rows.original,
+      processing: rows.processing,
+    });
+    let recoveredBackup: RecoveredResticBackup | undefined;
+    if (checkpoint.preflightAction !== "initial") {
+      const pdf = this.requirePdfConfig();
+      await probeArchiveTools({
+        ageBinary: pdf.archive.ageBinary,
+        resticBinary: pdf.archive.independentBackup.resticBinary,
+      });
+      if (checkpoint.preflightAction.endsWith("snapshot")) {
+        const repository = await probeResticRepository({
+          resticBinary: pdf.archive.independentBackup.resticBinary,
+          repositoryPath: pdf.archive.independentBackup.repositoryPath,
+          passwordCommand: pdf.archive.independentBackup.passwordCommand,
+        });
+        if (
+          repository.repositoryId !==
+          pdf.archive.independentBackup.expectedRepositoryId
+        ) {
+          throw new PipelineWorkerError("archive_repository_conflict");
+        }
+        const { original, processing } = this.archivedRows(checkpoint);
+        const subject = checkpoint.preflightAction.startsWith("original_")
+          ? "original_bytes"
+          : "parser_output";
+        const row = subject === "original_bytes" ? original : processing;
+        const copy = row.copies.independent_backup;
+        if (!copy.published || !copy.restic) {
+          throw new PipelineWorkerError("archive_backup_parent_missing");
+        }
+        try {
+          recoveredBackup = await recoverResticBackup({
+            resticBinary: pdf.archive.independentBackup.resticBinary,
+            repositoryPath: pdf.archive.independentBackup.repositoryPath,
+            expectedRepositoryId: copy.restic.repositoryId,
+            passwordCommand: pdf.archive.independentBackup.passwordCommand,
+            operationId: copy.restic.operationId,
+            host: copy.restic.host,
+            objectName: copy.objectName,
+            expectedCiphertext: copy.published.ciphertext,
+          });
+        } catch (error) {
+          if (
+            !(error instanceof ArchiveCommandError) ||
+            error.code !== "not_found"
+          ) {
+            throw error;
+          }
+        }
+      }
+    }
+    const cached = this.journal.pending;
+    if (
+      cached?.operation === "discovery.preflightArchived" &&
+      cached.result !== undefined
+    ) {
+      const parsedBody = JSON.parse(cached.requestBody) as Record<
+        string,
+        unknown
+      >;
+      await this.validatePendingBody("discovery.preflightArchived", parsedBody);
+      const fresh = asWorkerResponse(
+        parseDurableResult(
+          "discovery.preflightArchived",
+          await this.transport.call(parsedBody),
+        ),
+      );
+      const freshError = errorCode(fresh);
+      if (freshError) {
+        if (freshError === "rate_limited") {
+          throw new PipelineWorkerError(freshError);
+        }
+        await this.journal.commitResult({
+          checkpoint: scanTerminal(checkpoint, "failed", freshError, true),
+          credentialSessionActive: true,
+        });
+        return;
+      }
+      const freshValue = object(fresh, "discovery.preflightArchived");
+      if (
+        freshValue.sourceItemId !== identity.sourceItemId ||
+        Number(freshValue.expectedDesiredProcessingEpoch) + 1 !==
+          identity.processingEpoch ||
+        freshValue.archiveIntentDigest !== parsedBody.archiveIntentDigest
+      ) {
+        throw new PipelineWorkerError("archived_preflight_parent_conflict");
+      }
+    }
+    const result = await this.mutation(
+      "discovery.preflightArchived",
+      () =>
+        request(this.config, "discovery.preflightArchived", {
+          requestId: randomUUID(),
+          identity,
+          archiveIntentDigest: intentDigest,
+        }),
+      async (current, response, pending) => {
+        if (current.phase !== "archived" || current.step !== "preflight") {
+          throw new PipelineWorkerError("journal_phase_conflict");
+        }
+        const code = errorCode(response);
+        if (code) {
+          return code === "rate_limited"
+            ? current
+            : scanTerminal(current, "failed", code, true);
+        }
+        const value = object(response, "discovery.preflightArchived");
+        const plan = this.archivedPlan(current);
+        const pendingBody = JSON.parse(pending.requestBody) as Record<
+          string,
+          unknown
+        >;
+        if (
+          value.sourceItemId !== plan.sourceItemId ||
+          Number(value.expectedDesiredProcessingEpoch) + 1 !==
+            plan.processingEpoch ||
+          value.archiveIntentDigest !== pendingBody.archiveIntentDigest
+        ) {
+          throw new PipelineWorkerError("archived_preflight_parent_conflict");
+        }
+        return await this.recordArchiveAction(
+          current,
+          current.preflightAction!,
+          recoveredBackup,
+        );
+      },
+    );
+    if (
+      errorCode(result) &&
+      this.journal.checkpoint.phase === "archived" &&
+      this.journal.checkpoint.step === "preflight"
+    ) {
+      throw new PipelineWorkerError(errorCode(result)!);
+    }
+  }
+
+  private async driveArchiveCopies(
+    checkpoint: ArchivedCheckpoint,
+    subject: ArchiveSubject,
+  ): Promise<void> {
+    const { original, processing } = this.archivedRows(checkpoint);
+    const row = subject === "original_bytes" ? original : processing;
+    const pdf = this.requirePdfConfig();
+    const capture = captureFromRows(pdf, original, processing);
+    const source =
+      subject === "original_bytes"
+        ? {
+            path: capture.path,
+            sha256: capture.sha256,
+            byteLength: capture.byteLength,
+          }
+        : processing.parserOutput
+          ? {
+              path: join(
+                pdf.parserOutputRoot,
+                processing.parserIntent.outputId,
+                processing.parserOutput.rawArtifact.opaqueName,
+              ),
+              sha256: processing.parserOutput.rawArtifact.sha256,
+              byteLength: processing.parserOutput.rawArtifact.byteLength,
+            }
+          : undefined;
+    if (!source) throw new PipelineWorkerError("parser_output_missing");
+    for (const role of ["primary", "independent_backup"] as const) {
+      const copy = row.copies[role];
+      if (!copy.prepared) {
+        const configured = this.archiveConfiguration(role);
+        const catalogId =
+          subject === "original_bytes"
+            ? original.originalCatalogId
+            : processing.processingCatalogId;
+        if (!copy.preparationIntent) {
+          const intended =
+            await this.requireCatalog().recordArchivePreparationIntent({
+              subject,
+              catalogId,
+              expectedRevision: row.rowRevision,
+              role,
+              tempName: `${copy.archiveObjectId}.tmp`,
+            });
+          await this.journal.transitionCheckpoint({
+            checkpoint: archivedBase(checkpoint, {
+              ...(subject === "original_bytes"
+                ? { expectedOriginalRevision: intended.rowRevision }
+                : { expectedProcessingRevision: intended.rowRevision }),
+            }),
+            credentialSessionActive: true,
+          });
+          return;
+        }
+        let prepared;
+        try {
+          prepared = await encryptAgeObject({
+            ageBinary: pdf.archive.ageBinary,
+            sourcePath: source.path,
+            tempOutputPath: join(
+              configured.directory,
+              copy.preparationIntent.tempName,
+            ),
+            recipient: configured.recipient,
+            expectedSource: {
+              sha256: source.sha256,
+              byteLength: source.byteLength,
+            },
+          });
+        } catch (error) {
+          if (
+            !(error instanceof ArchiveCommandError) ||
+            error.code !== "destination_exists"
+          ) {
+            throw error;
+          }
+          const reviewed = await this.requireCatalog().markReview({
+            subject,
+            catalogId:
+              subject === "original_bytes"
+                ? original.originalCatalogId
+                : processing.processingCatalogId,
+            expectedRevision: row.rowRevision,
+            role,
+            code: "replacement_detected",
+          });
+          const reviewedCheckpoint = archivedBase(checkpoint, {
+            ...(subject === "original_bytes"
+              ? { expectedOriginalRevision: reviewed.rowRevision }
+              : { expectedProcessingRevision: reviewed.rowRevision }),
+          });
+          await this.journal.transitionCheckpoint({
+            checkpoint: scanTerminal(
+              reviewedCheckpoint,
+              "incomplete",
+              "archive_recovery_review_required",
+            ),
+            credentialSessionActive: false,
+          });
+          return;
+        }
+        const next = await this.requireCatalog().recordArchivePrepared({
+          subject,
+          catalogId,
+          expectedRevision: row.rowRevision,
+          role,
+          prepared: preparedArchiveCatalogRecord(prepared),
+        });
+        await this.journal.transitionCheckpoint({
+          checkpoint: archivedBase(checkpoint, {
+            ...(subject === "original_bytes"
+              ? { expectedOriginalRevision: next.rowRevision }
+              : { expectedProcessingRevision: next.rowRevision }),
+          }),
+          credentialSessionActive: true,
+        });
+        return;
+      }
+      if (!copy.published) {
+        await this.journal.transitionCheckpoint({
+          checkpoint: archivedBase(checkpoint, {
+            step: "preflight",
+            preflightAction: `${subject === "original_bytes" ? "original" : "parser"}_${role === "primary" ? "primary" : "backup"}_publish`,
+          }),
+          credentialSessionActive: true,
+        });
+        return;
+      }
+      if (role === "independent_backup" && !copy.backup) {
+        await this.journal.transitionCheckpoint({
+          checkpoint: archivedBase(checkpoint, {
+            step: "preflight",
+            preflightAction: `${subject === "original_bytes" ? "original" : "parser"}_backup_snapshot`,
+          }),
+          credentialSessionActive: true,
+        });
+        return;
+      }
+    }
+    await this.journal.transitionCheckpoint({
+      checkpoint: archivedBase(checkpoint, {
+        step: subject === "original_bytes" ? "parse" : "reserve",
+      }),
+      credentialSessionActive: true,
+    });
+  }
+
+  private async driveArchivedLookupOriginal(): Promise<void> {
+    const checkpoint = this.journal.checkpoint;
+    if (
+      checkpoint.phase !== "archived" ||
+      checkpoint.step !== "lookup_original"
+    ) {
+      throw new PipelineWorkerError("journal_phase_conflict");
+    }
+    const identity = archivedIdentity(
+      checkpoint,
+      this.archivedPlan(checkpoint),
+    );
+    const result = await this.mutation(
+      "discovery.lookupArchivedAdmission",
+      () =>
+        request(this.config, "discovery.lookupArchivedAdmission", {
+          requestId: randomUUID(),
+          identity,
+          lookup: { mode: "original" },
+        }),
+      async (current, response, pending) => {
+        if (
+          current.phase !== "archived" ||
+          current.step !== "lookup_original"
+        ) {
+          throw new PipelineWorkerError("journal_phase_conflict");
+        }
+        const code = errorCode(response);
+        if (code) {
+          return code === "rate_limited"
+            ? current
+            : scanTerminal(current, "failed", code, true);
+        }
+        const value = object(response, "discovery.lookupArchivedAdmission");
+        if (value.mode !== "original") {
+          throw new PipelineWorkerError("archived_lookup_mode_conflict");
+        }
+        if (value.found !== true) {
+          return archivedBase(current, { step: "capture" });
+        }
+        let { original } = this.archivedRows(current);
+        for (const [role, receiptField] of [
+          ["primary", "originalPrimaryReceiptId"],
+          ["independent_backup", "originalBackupReceiptId"],
+        ] as const) {
+          if (!original.copies[role].published) {
+            throw new PipelineWorkerError(
+              "archived_original_recovery_incomplete",
+            );
+          }
+          if (!original.copies[role].cloudReceipt) {
+            original = (await this.requireCatalog().recordCloudReceipt({
+              subject: "original_bytes",
+              catalogId: original.originalCatalogId,
+              expectedRevision: original.rowRevision,
+              role,
+              receiptId: text(value[receiptField], "archive_receipt_id"),
+              requestDigest: pending.requestDigest,
+              recordedAt: pending.receivedAt,
+            })) as OriginalCatalogRow;
+          }
+        }
+        if (!original.cloud) {
+          original = await this.requireCatalog().recordOriginalCloud({
+            catalogId: original.originalCatalogId,
+            expectedRevision: original.rowRevision,
+            cloud: {
+              sourceItemId: identity.sourceItemId,
+              sourceRevisionId: text(
+                value.sourceRevisionId,
+                "source_revision_id",
+              ),
+              primaryReceiptId: original.copies.primary.cloudReceipt!.receiptId,
+              backupReceiptId:
+                original.copies.independent_backup.cloudReceipt!.receiptId,
+              admittedAt: pending.receivedAt,
+            },
+          });
+        }
+        return archivedBase(current, {
+          step: "capture",
+          expectedOriginalRevision: original.rowRevision,
+        });
+      },
+    );
+    if (
+      errorCode(result) &&
+      this.journal.checkpoint.phase === "archived" &&
+      this.journal.checkpoint.step === "lookup_original"
+    ) {
+      throw new PipelineWorkerError(errorCode(result)!);
+    }
+  }
+
+  private async driveArchivedCapture(): Promise<void> {
+    const checkpoint = this.journal.checkpoint;
+    if (checkpoint.phase !== "archived" || checkpoint.step !== "capture") {
+      throw new PipelineWorkerError("journal_phase_conflict");
+    }
+    const pdf = this.requirePdfConfig();
+    const plan = this.archivedPlan(checkpoint);
+    const rows = this.archivedRows(checkpoint);
+    let processing = rows.processing;
+    if (processing.capture) {
+      await inspectCapturedPdf({
+        captureDirectory: pdf.captureDirectory,
+        captureId: processing.captureIntent.captureId,
+        expected: {
+          sha256: rows.original.origin.sha256,
+          byteLength: rows.original.origin.byteLength,
+          sourceModifiedAt: processing.capture.sourceModifiedAt,
+        },
+        expectedDirectory: {
+          path: pdf.captureDirectory,
+          ...processing.captureIntent.directory,
+        },
+      });
+    } else {
+      const expected = {
+        sha256: plan.sha256,
+        byteLength: plan.byteLength,
+        sourceModifiedAt: plan.sourceModifiedAt,
+      };
+      const capturePath = join(
+        pdf.captureDirectory,
+        `${processing.captureIntent.captureId}.pdf`,
+      );
+      const exists = await lstat(capturePath)
+        .then(() => true)
+        .catch((error: unknown) => {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+          throw error;
+        });
+      const capture = exists
+        ? await inspectCapturedPdf({
+            captureDirectory: pdf.captureDirectory,
+            captureId: processing.captureIntent.captureId,
+            expected,
+            expectedDirectory: {
+              path: pdf.captureDirectory,
+              ...processing.captureIntent.directory,
+            },
+          })
+        : await capturePdfFile({
+            root: this.findRoot(
+              await canonicalRoots(this.config),
+              plan.rootAlias,
+            ),
+            relativePath: plan.relativePath,
+            captureDirectory: pdf.captureDirectory,
+            captureId: processing.captureIntent.captureId,
+            expected,
+          });
+      processing = await this.requireCatalog().recordCapture({
+        catalogId: processing.processingCatalogId,
+        expectedRevision: processing.rowRevision,
+        capture: captureCatalogRecord(capture),
+      });
+    }
+    await this.journal.transitionCheckpoint({
+      checkpoint: archivedBase(checkpoint, {
+        step: rows.original.cloud ? "parse" : "original_archive",
+        expectedProcessingRevision: processing.rowRevision,
+      }),
+      credentialSessionActive: true,
+    });
+  }
+
+  private parserRecovery(
+    original: OriginalCatalogRow,
+    processing: ProcessingCatalogRow,
+  ) {
+    const pdf = this.requirePdfConfig();
+    if (!this.preparedPdfProfile) {
+      throw new PipelineWorkerError("parser_profile_unverified");
+    }
+    return {
+      capture: captureFromRows(pdf, original, processing),
+      outputRoot: pdf.parserOutputRoot,
+      outputIntent: parserOutputIntentCore(processing.parserIntent),
+      expectedParserFingerprint: processing.fingerprints.parserFingerprint,
+      expectedExtractionConfigurationFingerprint:
+        processing.fingerprints.extractionConfigurationFingerprint,
+      expectedModelManifestSha256: this.preparedPdfProfile.modelManifestSha256,
+    };
+  }
+
+  private async driveArchivedParse(): Promise<void> {
+    const checkpoint = this.journal.checkpoint;
+    if (checkpoint.phase !== "archived" || checkpoint.step !== "parse") {
+      throw new PipelineWorkerError("journal_phase_conflict");
+    }
+    const { original, processing: current } = this.archivedRows(checkpoint);
+    const pdf = this.requirePdfConfig();
+    let processing = current;
+    if (processing.parserOutput) {
+      await inspectCapturedPdfParserOutput(
+        this.parserRecovery(original, processing),
+      );
+    } else {
+      const intent = await inspectParserOutputIntent({
+        outputRoot: pdf.parserOutputRoot,
+        outputId: processing.parserIntent.outputId,
+        requireEmpty: false,
+      });
+      if (!equalJson(intent, parserOutputIntentCore(processing.parserIntent))) {
+        throw new PipelineWorkerError("parser_output_intent_conflict");
+      }
+      const outputDirectory = join(
+        pdf.parserOutputRoot,
+        processing.parserIntent.outputId,
+      );
+      const outputPresence = await Promise.all(
+        ["lossless.json", "bundle.json"].map((name) =>
+          lstat(join(outputDirectory, name))
+            .then(() => true)
+            .catch((error: unknown) => {
+              if ((error as NodeJS.ErrnoException).code === "ENOENT")
+                return false;
+              throw error;
+            }),
+        ),
+      );
+      if (outputPresence[0] !== outputPresence[1]) {
+        throw new PipelineWorkerError("parser_output_incomplete");
+      }
+      const output = outputPresence[0]
+        ? await inspectCapturedPdfParserOutput(
+            this.parserRecovery(original, processing),
+          )
+        : await runCapturedPdfParser({
+            capture: captureFromRows(pdf, original, processing),
+            outputDirectory,
+            outputId: processing.parserIntent.outputId,
+            ...pdf.parser,
+          });
+      processing = await this.requireCatalog().recordParserOutput({
+        catalogId: processing.processingCatalogId,
+        expectedRevision: processing.rowRevision,
+        output: parserOutputCatalogRecord(output.artifacts),
+      });
+    }
+    await this.journal.transitionCheckpoint({
+      checkpoint: archivedBase(checkpoint, {
+        step: "spool",
+        expectedProcessingRevision: processing.rowRevision,
+      }),
+      credentialSessionActive: true,
+    });
+  }
+
+  private async driveArchivedSpool(): Promise<void> {
+    const checkpoint = this.journal.checkpoint;
+    if (checkpoint.phase !== "archived" || checkpoint.step !== "spool") {
+      throw new PipelineWorkerError("journal_phase_conflict");
+    }
+    const { original, processing: current } = this.archivedRows(checkpoint);
+    const pdf = this.requirePdfConfig();
+    let processing = current;
+    if (processing.spool) {
+      await inspectNormalizedBundleSpool({
+        spoolRoot: pdf.spoolDirectory,
+        expectedRoot: processing.spoolIntent.root,
+        spool: processing.spool,
+        parserRecovery: this.parserRecovery(original, processing),
+      });
+    } else {
+      if (!processing.parserOutput) {
+        throw new PipelineWorkerError("parser_output_missing");
+      }
+      if (!processing.spoolPrepared) {
+        const parserOutput = await inspectCapturedPdfParserOutput(
+          this.parserRecovery(original, processing),
+        );
+        const prepared = await prepareNormalizedBundleSpool({
+          spoolRoot: pdf.spoolDirectory,
+          expectedRoot: processing.spoolIntent.root,
+          spoolId: processing.spoolIntent.spoolId,
+          parserOutput,
+        });
+        processing = await this.requireCatalog().recordSpoolPrepared({
+          catalogId: processing.processingCatalogId,
+          expectedRevision: processing.rowRevision,
+          prepared,
+        });
+        await this.journal.transitionCheckpoint({
+          checkpoint: archivedBase(checkpoint, {
+            expectedProcessingRevision: processing.rowRevision,
+          }),
+          credentialSessionActive: true,
+        });
+        return;
+      }
+      const spool = await recoverNormalizedBundleSpool({
+        spoolRoot: pdf.spoolDirectory,
+        expectedRoot: processing.spoolIntent.root,
+        spoolId: processing.spoolIntent.spoolId,
+        prepared: processing.spoolPrepared,
+      });
+      processing = await this.requireCatalog().recordSpool({
+        catalogId: processing.processingCatalogId,
+        expectedRevision: processing.rowRevision,
+        spool,
+      });
+    }
+    await this.journal.transitionCheckpoint({
+      checkpoint: archivedBase(checkpoint, {
+        step: "lookup_processing",
+        expectedProcessingRevision: processing.rowRevision,
+      }),
+      credentialSessionActive: true,
+    });
+  }
+
+  private async mappedProcessing(checkpoint: ArchivedCheckpoint) {
+    const { original, processing } = this.archivedRows(checkpoint);
+    if (!processing.spool) throw new PipelineWorkerError("spool_missing");
+    const pdf = this.requirePdfConfig();
+    const validated = await inspectNormalizedBundleSpool({
+      spoolRoot: pdf.spoolDirectory,
+      expectedRoot: processing.spoolIntent.root,
+      spool: processing.spool,
+      parserRecovery: this.parserRecovery(original, processing),
+    });
+    const plan = this.archivedPlan(checkpoint);
+    const mapping = await mapParsedBundle({
+      ...validated,
+      title: basename(plan.relativePath),
+      capturedAt: plan.sourceModifiedAt,
+    });
+    if (mapping.chunkingFingerprint !== plan.chunkerFingerprint) {
+      throw new PipelineWorkerError("parsed_chunking_conflict");
+    }
+    return {
+      original,
+      processing,
+      mapping,
+      declaration: parsedTextDeclaration({ processing, mapping }),
+    };
+  }
+
+  private async driveArchivedLookupProcessing(): Promise<void> {
+    const checkpoint = this.journal.checkpoint;
+    if (
+      checkpoint.phase !== "archived" ||
+      checkpoint.step !== "lookup_processing"
+    ) {
+      throw new PipelineWorkerError("journal_phase_conflict");
+    }
+    const mapped = await this.mappedProcessing(checkpoint);
+    const identity = archivedIdentity(
+      checkpoint,
+      this.archivedPlan(checkpoint),
+    );
+    const output = mapped.processing.parserOutput!;
+    const result = await this.mutation(
+      "discovery.lookupArchivedAdmission",
+      () =>
+        request(this.config, "discovery.lookupArchivedAdmission", {
+          requestId: randomUUID(),
+          identity,
+          lookup: {
+            mode: "processing",
+            clientArtifactId:
+              mapped.processing.parserIntent.parserArtifactClientId,
+            parserOutputHash: output.rawArtifact.sha256,
+            parserOutputByteLength: output.rawArtifact.byteLength,
+            parserOutputMediaType: "application/vnd.docling+json",
+            parsedText: mapped.declaration,
+          },
+        }),
+      async (current, response, pending) => {
+        if (
+          current.phase !== "archived" ||
+          current.step !== "lookup_processing"
+        ) {
+          throw new PipelineWorkerError("journal_phase_conflict");
+        }
+        const code = errorCode(response);
+        if (code) {
+          return code === "rate_limited"
+            ? current
+            : scanTerminal(current, "failed", code, true);
+        }
+        const value = object(response, "discovery.lookupArchivedAdmission");
+        if (value.mode !== "processing") {
+          throw new PipelineWorkerError("archived_lookup_mode_conflict");
+        }
+        if (value.found !== true) {
+          return archivedBase(current, { step: "parser_archive" });
+        }
+        if (value.desiredProcessingEpoch !== identity.processingEpoch) {
+          throw new PipelineWorkerError("archived_lookup_parent_conflict");
+        }
+        let { original, processing } = this.archivedRows(current);
+        const receipts = [
+          ["original_bytes", original, "primary", "originalPrimaryReceiptId"],
+          [
+            "original_bytes",
+            original,
+            "independent_backup",
+            "originalBackupReceiptId",
+          ],
+          ["parser_output", processing, "primary", "parserPrimaryReceiptId"],
+          [
+            "parser_output",
+            processing,
+            "independent_backup",
+            "parserBackupReceiptId",
+          ],
+        ] as const;
+        for (const [subject, row, role, field] of receipts) {
+          const live = subject === "original_bytes" ? original : processing;
+          if (!live.copies[role].published) {
+            throw new PipelineWorkerError("archived_receipt_parent_missing");
+          }
+          if (!live.copies[role].cloudReceipt) {
+            const updated = await this.requireCatalog().recordCloudReceipt({
+              subject,
+              catalogId:
+                subject === "original_bytes"
+                  ? original.originalCatalogId
+                  : processing.processingCatalogId,
+              expectedRevision: live.rowRevision,
+              role,
+              receiptId: text(value[field], "archive_receipt_id"),
+              requestDigest: pending.requestDigest,
+              recordedAt: pending.receivedAt,
+            });
+            if (subject === "original_bytes") {
+              original = updated as OriginalCatalogRow;
+            } else {
+              processing = updated as ProcessingCatalogRow;
+            }
+          }
+          void row;
+        }
+        if (!original.cloud) {
+          original = await this.requireCatalog().recordOriginalCloud({
+            catalogId: original.originalCatalogId,
+            expectedRevision: original.rowRevision,
+            cloud: {
+              sourceItemId: identity.sourceItemId,
+              sourceRevisionId: text(
+                value.sourceRevisionId,
+                "source_revision_id",
+              ),
+              primaryReceiptId: original.copies.primary.cloudReceipt!.receiptId,
+              backupReceiptId:
+                original.copies.independent_backup.cloudReceipt!.receiptId,
+              admittedAt: pending.receivedAt,
+            },
+          });
+        }
+        if (!processing.cloud) {
+          processing = await this.requireCatalog().recordProcessingCloud({
+            catalogId: processing.processingCatalogId,
+            expectedRevision: processing.rowRevision,
+            cloud: {
+              sourceItemId: identity.sourceItemId,
+              sourceRevisionId: text(
+                value.sourceRevisionId,
+                "source_revision_id",
+              ),
+              parserArtifactId: text(
+                value.parserArtifactId,
+                "parser_artifact_id",
+              ),
+              sourceTextVersionId: text(
+                value.sourceTextVersionId,
+                "source_text_version_id",
+              ),
+              processingGenerationId: text(
+                value.processingGenerationId,
+                "processing_generation_id",
+              ),
+              ingestJobId: text(value.ingestJobId, "ingest_job_id"),
+              processingFingerprint: output.extractionFingerprint,
+              admissionRequestDigest: pending.requestDigest,
+              admittedAt: pending.receivedAt,
+            },
+          });
+        }
+        return archivedBase(current, {
+          step: processing.activation ? "cleanup" : "parsed_reserve",
+          expectedOriginalRevision: original.rowRevision,
+          expectedProcessingRevision: processing.rowRevision,
+          reservationRound: 0,
+        });
+      },
+    );
+    if (
+      errorCode(result) &&
+      this.journal.checkpoint.phase === "archived" &&
+      this.journal.checkpoint.step === "lookup_processing"
+    ) {
+      throw new PipelineWorkerError(errorCode(result)!);
+    }
+  }
+
+  private async driveArchivedReserve(): Promise<void> {
+    const checkpoint = this.journal.checkpoint;
+    if (checkpoint.phase !== "archived" || checkpoint.step !== "reserve") {
+      throw new PipelineWorkerError("journal_phase_conflict");
+    }
+    const identity = archivedIdentity(
+      checkpoint,
+      this.archivedPlan(checkpoint),
+    );
+    const result = await this.mutation(
+      "discovery.reserveArchived",
+      () =>
+        request(this.config, "discovery.reserveArchived", {
+          requestId: randomUUID(),
+          identity,
+        }),
+      (current, response) => {
+        if (current.phase !== "archived" || current.step !== "reserve") {
+          throw new PipelineWorkerError("journal_phase_conflict");
+        }
+        const code = errorCode(response);
+        if (code) {
+          return code === "rate_limited"
+            ? current
+            : scanTerminal(current, "failed", code, true);
+        }
+        const value = object(response, "discovery.reserveArchived");
+        if (
+          value.sourceItemId !== identity.sourceItemId ||
+          value.observationEpoch !== identity.observationEpoch ||
+          value.processingEpoch !== identity.processingEpoch
+        ) {
+          throw new PipelineWorkerError("archived_reserve_parent_conflict");
+        }
+        return archivedBase(current, {
+          step: "admit",
+          discoveryLease: {
+            workId: text(value.workId, "work_id"),
+            sourceItemId: text(value.sourceItemId, "source_item_id"),
+            observationEpoch: integer(
+              value.observationEpoch,
+              "observation_epoch",
+            ),
+            processingEpoch: integer(value.processingEpoch, "processing_epoch"),
+            leaseEpoch: integer(value.leaseEpoch, "lease_epoch"),
+            leaseToken: text(value.leaseToken, "lease_token"),
+            leaseExpiresAt: integer(value.leaseExpiresAt, "lease_expires_at"),
+          },
+        });
+      },
+    );
+    if (
+      errorCode(result) &&
+      this.journal.checkpoint.phase === "archived" &&
+      this.journal.checkpoint.step === "reserve"
+    ) {
+      throw new PipelineWorkerError(errorCode(result)!);
+    }
+  }
+
+  private async driveArchivedAdmit(): Promise<void> {
+    const checkpoint = this.journal.checkpoint;
+    if (checkpoint.phase !== "archived" || checkpoint.step !== "admit") {
+      throw new PipelineWorkerError("journal_phase_conflict");
+    }
+    const lease = checkpoint.discoveryLease;
+    if (!lease) throw new PipelineWorkerError("archived_lease_missing");
+    if (
+      !this.journal.pending &&
+      lease.leaseExpiresAt <= Date.now() + LEASE_SAFETY_MARGIN_MS
+    ) {
+      await this.journal.transitionCheckpoint({
+        checkpoint: archivedBase(checkpoint, {
+          step: "reserve",
+          discoveryLease: undefined,
+        }),
+        credentialSessionActive: true,
+      });
+      return;
+    }
+    const mapped = await this.mappedProcessing(checkpoint);
+    const archives = [
+      createArchiveReceiptSelection(
+        "original_bytes",
+        mapped.original,
+        "primary",
+      ),
+      createArchiveReceiptSelection(
+        "original_bytes",
+        mapped.original,
+        "independent_backup",
+      ),
+      createArchiveReceiptSelection(
+        "parser_output",
+        mapped.processing,
+        "primary",
+      ),
+      createArchiveReceiptSelection(
+        "parser_output",
+        mapped.processing,
+        "independent_backup",
+      ),
+    ];
+    const parserArtifact = createParserArtifactSelection(mapped.processing);
+    const result = await this.mutation(
+      "discovery.admitArchived",
+      () =>
+        request(this.config, "discovery.admitArchived", {
+          requestId: randomUUID(),
+          workId: lease.workId,
+          leaseEpoch: lease.leaseEpoch,
+          leaseToken: lease.leaseToken,
+          parserArtifact,
+          archives,
+          parsedText: mapped.declaration,
+        }),
+      async (current, response, pending) => {
+        if (current.phase !== "archived" || current.step !== "admit") {
+          throw new PipelineWorkerError("journal_phase_conflict");
+        }
+        const code = errorCode(response);
+        if (code === "lease_conflict" || code === "reservation_expired") {
+          return archivedBase(current, {
+            step: "reserve",
+            discoveryLease: undefined,
+          });
+        }
+        if (code) {
+          return code === "rate_limited"
+            ? current
+            : scanTerminal(current, "failed", code, true);
+        }
+        const value = object(response, "discovery.admitArchived");
+        if (
+          value.workId !== lease.workId ||
+          value.sourceItemId !== lease.sourceItemId ||
+          value.desiredProcessingEpoch !== lease.processingEpoch ||
+          value.state !== "admitted"
+        ) {
+          throw new PipelineWorkerError("archived_admit_parent_conflict");
+        }
+        let { original, processing } = this.archivedRows(current);
+        for (const [subject, role, receiptField] of [
+          ["original_bytes", "primary", "originalPrimaryReceiptId"],
+          ["original_bytes", "independent_backup", "originalBackupReceiptId"],
+          ["parser_output", "primary", "parserPrimaryReceiptId"],
+          ["parser_output", "independent_backup", "parserBackupReceiptId"],
+        ] as const) {
+          const live = subject === "original_bytes" ? original : processing;
+          if (!live.copies[role].cloudReceipt) {
+            const updated = await this.requireCatalog().recordCloudReceipt({
+              subject,
+              catalogId:
+                subject === "original_bytes"
+                  ? original.originalCatalogId
+                  : processing.processingCatalogId,
+              expectedRevision: live.rowRevision,
+              role,
+              receiptId: text(value[receiptField], receiptField),
+              requestDigest: pending.requestDigest,
+              recordedAt: pending.receivedAt,
+            });
+            if (subject === "original_bytes")
+              original = updated as OriginalCatalogRow;
+            else processing = updated as ProcessingCatalogRow;
+          }
+        }
+        if (!original.cloud) {
+          original = await this.requireCatalog().recordOriginalCloud({
+            catalogId: original.originalCatalogId,
+            expectedRevision: original.rowRevision,
+            cloud: {
+              sourceItemId: lease.sourceItemId,
+              sourceRevisionId: text(
+                value.sourceRevisionId,
+                "source_revision_id",
+              ),
+              primaryReceiptId: original.copies.primary.cloudReceipt!.receiptId,
+              backupReceiptId:
+                original.copies.independent_backup.cloudReceipt!.receiptId,
+              admittedAt: pending.receivedAt,
+            },
+          });
+        }
+        if (!processing.cloud) {
+          processing = await this.requireCatalog().recordProcessingCloud({
+            catalogId: processing.processingCatalogId,
+            expectedRevision: processing.rowRevision,
+            cloud: {
+              sourceItemId: lease.sourceItemId,
+              sourceRevisionId: text(
+                value.sourceRevisionId,
+                "source_revision_id",
+              ),
+              parserArtifactId: text(
+                value.parserArtifactId,
+                "parser_artifact_id",
+              ),
+              sourceTextVersionId: text(
+                value.sourceTextVersionId,
+                "source_text_version_id",
+              ),
+              processingGenerationId: text(
+                value.processingGenerationId,
+                "processing_generation_id",
+              ),
+              ingestJobId: text(value.ingestJobId, "ingest_job_id"),
+              processingFingerprint:
+                mapped.processing.parserOutput!.extractionFingerprint,
+              admissionRequestDigest: pending.requestDigest,
+              admittedAt: pending.receivedAt,
+            },
+          });
+        }
+        return archivedBase(current, {
+          step: "parsed_reserve",
+          expectedOriginalRevision: original.rowRevision,
+          expectedProcessingRevision: processing.rowRevision,
+          discoveryLease: undefined,
+          reservationRound: 0,
+        });
+      },
+    );
+    if (
+      errorCode(result) &&
+      this.journal.checkpoint.phase === "archived" &&
+      this.journal.checkpoint.step === "admit"
+    ) {
+      throw new PipelineWorkerError(errorCode(result)!);
+    }
+  }
+
+  private async driveParsedReserve(): Promise<void> {
+    const checkpoint = this.journal.checkpoint;
+    if (
+      checkpoint.phase !== "archived" ||
+      checkpoint.step !== "parsed_reserve"
+    ) {
+      throw new PipelineWorkerError("journal_phase_conflict");
+    }
+    const { processing } = this.archivedRows(checkpoint);
+    if (!processing.cloud) throw new PipelineWorkerError("admission_missing");
+    const cloud = processing.cloud;
+    const result = await this.mutation(
+      "jobs.reserveParsed",
+      () =>
+        request(this.config, "jobs.reserveParsed", {
+          requestId: randomUUID(),
+          maxItems: 1,
+          jobId: cloud.ingestJobId,
+        }),
+      (current, response) => {
+        if (current.phase !== "archived" || current.step !== "parsed_reserve") {
+          throw new PipelineWorkerError("journal_phase_conflict");
+        }
+        const code = errorCode(response);
+        if (code) {
+          return code === "rate_limited"
+            ? current
+            : scanTerminal(current, "failed", code, true);
+        }
+        const value = object(response, "jobs.reserveParsed");
+        const targets = records(
+          value.targets,
+          "parsed_targets",
+        ) as unknown as JobLease[];
+        const target = targets[0];
+        if (!target) {
+          if (current.reservationRound >= MAX_ARCHIVED_RESERVATION_ROUNDS) {
+            throw new PipelineWorkerError("parsed_job_missing");
+          }
+          return archivedBase(current, {
+            reservationRound: current.reservationRound + 1,
+          });
+        }
+        if (
+          targets.length !== 1 ||
+          target.jobId !== cloud.ingestJobId ||
+          target.sourceItemId !== cloud.sourceItemId ||
+          target.observationEpoch !==
+            processing.currentObservation.observationEpoch ||
+          target.processingEpoch !==
+            processing.currentObservation.processingEpoch
+        ) {
+          throw new PipelineWorkerError("parsed_job_parent_conflict");
+        }
+        return archivedBase(current, {
+          step: "parsed_begin",
+          jobLease: target,
+          reservationRound: 0,
+        });
+      },
+    );
+    if (
+      errorCode(result) &&
+      this.journal.checkpoint.phase === "archived" &&
+      this.journal.checkpoint.step === "parsed_reserve"
+    ) {
+      const code = errorCode(result)!;
+      throw code === "rate_limited"
+        ? new PipelineRetryableError(code)
+        : new PipelineWorkerError(code);
+    }
+    if (
+      this.journal.checkpoint.phase === "archived" &&
+      this.journal.checkpoint.step === "parsed_reserve"
+    ) {
+      throw new PipelineRetryableError("parsed_job_deferred");
+    }
+  }
+
+  private parsedLeaseRecovery(
+    checkpoint: ArchivedCheckpoint,
+  ): ArchivedCheckpoint {
+    return archivedBase(checkpoint, {
+      step: "parsed_reserve",
+      reservationRound: 0,
+      jobLease: undefined,
+      resumeStep: undefined,
+      stageId: undefined,
+      stagePhase: undefined,
+      stageOrdinal: undefined,
+    });
+  }
+
+  private async requireFreshParsedLease(
+    checkpoint: ArchivedCheckpoint,
+    resumeStep:
+      "parsed_begin" | "parsed_batch" | "parsed_seal" | "parsed_activate",
+  ): Promise<boolean> {
+    const lease = checkpoint.jobLease;
+    if (!lease) throw new PipelineWorkerError("parsed_lease_missing");
+    if (
+      !this.journal.pending &&
+      lease.leaseExpiresAt <= Date.now() + LEASE_SAFETY_MARGIN_MS
+    ) {
+      await this.journal.transitionCheckpoint({
+        checkpoint: archivedBase(checkpoint, {
+          step: "parsed_renew",
+          resumeStep,
+        }),
+        credentialSessionActive: true,
+      });
+      return false;
+    }
+    return true;
+  }
+
+  private async driveParsedRenew(): Promise<void> {
+    const checkpoint = this.journal.checkpoint;
+    if (
+      checkpoint.phase !== "archived" ||
+      checkpoint.step !== "parsed_renew" ||
+      !checkpoint.jobLease ||
+      !checkpoint.resumeStep
+    ) {
+      throw new PipelineWorkerError("journal_phase_conflict");
+    }
+    const lease = checkpoint.jobLease;
+    const result = await this.mutation(
+      "jobs.renewParsed",
+      () =>
+        request(this.config, "jobs.renewParsed", {
+          requestId: randomUUID(),
+          jobId: lease.jobId,
+          leaseEpoch: lease.leaseEpoch,
+          leaseToken: lease.leaseToken,
+        }),
+      (current, response) => {
+        if (
+          current.phase !== "archived" ||
+          current.step !== "parsed_renew" ||
+          !current.jobLease ||
+          !current.resumeStep
+        ) {
+          throw new PipelineWorkerError("journal_phase_conflict");
+        }
+        const code = errorCode(response);
+        if (code === "lease_conflict" || code === "reservation_expired") {
+          return this.parsedLeaseRecovery(current);
+        }
+        if (code) {
+          return code === "rate_limited"
+            ? current
+            : scanTerminal(current, "failed", code, true);
+        }
+        const value = object(response, "jobs.renewParsed");
+        if (value.jobId !== current.jobLease.jobId) {
+          throw new PipelineWorkerError("parsed_renew_parent_conflict");
+        }
+        return archivedBase(current, {
+          step: current.resumeStep,
+          jobLease: {
+            ...current.jobLease,
+            state: value.state as "processing" | "staged",
+            leaseExpiresAt: integer(value.leaseExpiresAt, "lease_expires_at"),
+          },
+          resumeStep: undefined,
+        });
+      },
+    );
+    if (
+      errorCode(result) &&
+      this.journal.checkpoint.phase === "archived" &&
+      this.journal.checkpoint.step === "parsed_renew"
+    ) {
+      throw new PipelineWorkerError(errorCode(result)!);
+    }
+  }
+
+  private async driveParsedBegin(): Promise<void> {
+    const checkpoint = this.journal.checkpoint;
+    if (checkpoint.phase !== "archived" || checkpoint.step !== "parsed_begin") {
+      throw new PipelineWorkerError("journal_phase_conflict");
+    }
+    if (!(await this.requireFreshParsedLease(checkpoint, "parsed_begin")))
+      return;
+    const lease = checkpoint.jobLease!;
+    const mapped = await this.mappedProcessing(checkpoint);
+    const declaration = mapped.declaration;
+    const result = await this.mutation(
+      "jobs.stageParsedBegin",
+      () =>
+        request(this.config, "jobs.stageParsedBegin", {
+          requestId: randomUUID(),
+          jobId: lease.jobId,
+          leaseEpoch: lease.leaseEpoch,
+          leaseToken: lease.leaseToken,
+          extractionFingerprint: declaration.extractionFingerprint,
+          mappingManifestHash: declaration.mappingManifestHash,
+          normalizedBundleDigest: declaration.normalizedBundleDigest,
+          expectedPageCount: declaration.pageCount,
+          expectedEvidenceSpanCount: declaration.expectedEvidenceSpanCount,
+          expectedDocumentCount: declaration.expectedDocumentCount,
+          expectedChunkCount: declaration.expectedChunkCount,
+        }),
+      (current, response) => {
+        if (current.phase !== "archived" || current.step !== "parsed_begin") {
+          throw new PipelineWorkerError("journal_phase_conflict");
+        }
+        const code = errorCode(response);
+        if (code === "lease_conflict" || code === "reservation_expired") {
+          return this.parsedLeaseRecovery(current);
+        }
+        if (code) {
+          return code === "rate_limited"
+            ? current
+            : scanTerminal(current, "failed", code, true);
+        }
+        const value = object(response, "jobs.stageParsedBegin");
+        if (value.jobId !== lease.jobId) {
+          throw new PipelineWorkerError("parsed_stage_parent_conflict");
+        }
+        const phase = value.phase as ParsedStagePhase;
+        return archivedBase(current, {
+          step:
+            phase === "staged"
+              ? "parsed_activate"
+              : phase === "seal"
+                ? "parsed_seal"
+                : "parsed_batch",
+          stageId: text(value.stageId, "stage_id"),
+          stagePhase: phase,
+          stageOrdinal: integer(value.nextOrdinal, "stage_ordinal"),
+        });
+      },
+    );
+    if (
+      errorCode(result) &&
+      this.journal.checkpoint.phase === "archived" &&
+      this.journal.checkpoint.step === "parsed_begin"
+    ) {
+      throw new PipelineWorkerError(errorCode(result)!);
+    }
+  }
+
+  private parsedRows(
+    mapping: Awaited<ReturnType<PipelineRunner["mappedProcessing"]>>["mapping"],
+    phase: "pages" | "evidence" | "documents" | "chunks",
+  ) {
+    return phase === "pages"
+      ? mapping.pages
+      : phase === "evidence"
+        ? mapping.evidence
+        : phase === "documents"
+          ? mapping.documents
+          : mapping.chunks;
+  }
+
+  private parsedBatchBody(
+    checkpoint: ArchivedCheckpoint,
+    mapping: Awaited<ReturnType<PipelineRunner["mappedProcessing"]>>["mapping"],
+    requestId: string,
+  ) {
+    const lease = checkpoint.jobLease!;
+    const phase = checkpoint.stagePhase;
+    const ordinal = checkpoint.stageOrdinal;
+    if (
+      !checkpoint.stageId ||
+      ordinal === undefined ||
+      (phase !== "pages" &&
+        phase !== "evidence" &&
+        phase !== "documents" &&
+        phase !== "chunks")
+    ) {
+      throw new PipelineWorkerError("parsed_stage_state_invalid");
+    }
+    const allRows = this.parsedRows(mapping, phase);
+    const maximum =
+      phase === "pages" ? MAX_PARSED_PAGE_BATCH : MAX_PARSED_ROW_BATCH;
+    let rows = allRows.slice(ordinal, ordinal + maximum);
+    while (rows.length) {
+      const body = request(this.config, "jobs.stageParsedBatch", {
+        requestId,
+        jobId: lease.jobId,
+        leaseEpoch: lease.leaseEpoch,
+        leaseToken: lease.leaseToken,
+        stageId: checkpoint.stageId,
+        phase,
+        ordinal,
+        rows,
+      });
+      if (
+        Buffer.byteLength(JSON.stringify(body), "utf8") <=
+        MAX_PARSED_REQUEST_BYTES
+      ) {
+        assertParsedRequestSize(body);
+        return body;
+      }
+      rows = rows.slice(0, -1);
+    }
+    throw new PipelineWorkerError("parsed_batch_too_large");
+  }
+
+  private async driveParsedBatch(): Promise<void> {
+    const checkpoint = this.journal.checkpoint;
+    if (checkpoint.phase !== "archived" || checkpoint.step !== "parsed_batch") {
+      throw new PipelineWorkerError("journal_phase_conflict");
+    }
+    if (!(await this.requireFreshParsedLease(checkpoint, "parsed_batch")))
+      return;
+    const mapped = await this.mappedProcessing(checkpoint);
+    const plannedRequestId = this.journal.pending?.requestId ?? randomUUID();
+    const body = this.parsedBatchBody(
+      checkpoint,
+      mapped.mapping,
+      plannedRequestId,
+    );
+    const submittedRows = body.rows as unknown[];
+    const submittedPhase = body.phase;
+    const result = await this.mutation(
+      "jobs.stageParsedBatch",
+      () => body,
+      (current, response) => {
+        if (current.phase !== "archived" || current.step !== "parsed_batch") {
+          throw new PipelineWorkerError("journal_phase_conflict");
+        }
+        const code = errorCode(response);
+        if (code === "lease_conflict" || code === "reservation_expired") {
+          return this.parsedLeaseRecovery(current);
+        }
+        if (code) {
+          return code === "rate_limited"
+            ? current
+            : scanTerminal(current, "failed", code, true);
+        }
+        const value = object(response, "jobs.stageParsedBatch");
+        if (
+          value.jobId !== current.jobLease?.jobId ||
+          value.stageId !== current.stageId ||
+          value.committedPhase !== submittedPhase ||
+          value.acceptedCount !== submittedRows.length
+        ) {
+          throw new PipelineWorkerError("parsed_batch_parent_conflict");
+        }
+        const phase = value.phase as ParsedStagePhase;
+        return archivedBase(current, {
+          step: phase === "seal" ? "parsed_seal" : "parsed_batch",
+          stagePhase: phase,
+          stageOrdinal: integer(value.nextOrdinal, "stage_ordinal"),
+        });
+      },
+    );
+    if (
+      errorCode(result) &&
+      this.journal.checkpoint.phase === "archived" &&
+      this.journal.checkpoint.step === "parsed_batch"
+    ) {
+      throw new PipelineWorkerError(errorCode(result)!);
+    }
+  }
+
+  private async driveParsedSeal(): Promise<void> {
+    const checkpoint = this.journal.checkpoint;
+    if (checkpoint.phase !== "archived" || checkpoint.step !== "parsed_seal") {
+      throw new PipelineWorkerError("journal_phase_conflict");
+    }
+    if (!(await this.requireFreshParsedLease(checkpoint, "parsed_seal")))
+      return;
+    const mapped = await this.mappedProcessing(checkpoint);
+    const lease = checkpoint.jobLease!;
+    const result = await this.mutation(
+      "jobs.stageParsedSeal",
+      () =>
+        request(this.config, "jobs.stageParsedSeal", {
+          requestId: randomUUID(),
+          jobId: lease.jobId,
+          leaseEpoch: lease.leaseEpoch,
+          leaseToken: lease.leaseToken,
+          stageId: checkpoint.stageId,
+          normalizedBundleDigest: mapped.declaration.normalizedBundleDigest,
+        }),
+      (current, response) => {
+        if (current.phase !== "archived" || current.step !== "parsed_seal") {
+          throw new PipelineWorkerError("journal_phase_conflict");
+        }
+        const code = errorCode(response);
+        if (code === "lease_conflict" || code === "reservation_expired") {
+          return this.parsedLeaseRecovery(current);
+        }
+        if (code) {
+          return code === "rate_limited"
+            ? current
+            : scanTerminal(current, "failed", code, true);
+        }
+        const value = object(response, "jobs.stageParsedSeal");
+        if (
+          value.jobId !== lease.jobId ||
+          value.stageId !== current.stageId ||
+          value.state !== "staged" ||
+          value.actualPageCount !== mapped.declaration.pageCount ||
+          value.actualEvidenceSpanCount !==
+            mapped.declaration.expectedEvidenceSpanCount ||
+          value.actualDocumentCount !==
+            mapped.declaration.expectedDocumentCount ||
+          value.actualChunkCount !== mapped.declaration.expectedChunkCount
+        ) {
+          throw new PipelineWorkerError("parsed_seal_parent_conflict");
+        }
+        return archivedBase(current, {
+          step: "parsed_activate",
+          stagePhase: "staged",
+          stageOrdinal: 0,
+          jobLease: { ...lease, state: "staged" },
+        });
+      },
+    );
+    if (
+      errorCode(result) &&
+      this.journal.checkpoint.phase === "archived" &&
+      this.journal.checkpoint.step === "parsed_seal"
+    ) {
+      throw new PipelineWorkerError(errorCode(result)!);
+    }
+  }
+
+  private async driveParsedActivate(): Promise<void> {
+    const checkpoint = this.journal.checkpoint;
+    if (
+      checkpoint.phase !== "archived" ||
+      checkpoint.step !== "parsed_activate"
+    ) {
+      throw new PipelineWorkerError("journal_phase_conflict");
+    }
+    if (!(await this.requireFreshParsedLease(checkpoint, "parsed_activate")))
+      return;
+    const lease = checkpoint.jobLease!;
+    const result = await this.mutation(
+      "jobs.activateParsed",
+      () =>
+        request(this.config, "jobs.activateParsed", {
+          requestId: randomUUID(),
+          jobId: lease.jobId,
+          leaseEpoch: lease.leaseEpoch,
+          leaseToken: lease.leaseToken,
+        }),
+      async (current, response, pending) => {
+        if (
+          current.phase !== "archived" ||
+          current.step !== "parsed_activate"
+        ) {
+          throw new PipelineWorkerError("journal_phase_conflict");
+        }
+        const code = errorCode(response);
+        if (code === "lease_conflict" || code === "reservation_expired") {
+          return this.parsedLeaseRecovery(current);
+        }
+        if (code) {
+          return code === "rate_limited"
+            ? current
+            : scanTerminal(current, "failed", code, true);
+        }
+        const value = object(response, "jobs.activateParsed");
+        const { processing } = this.archivedRows(current);
+        if (
+          !processing.cloud ||
+          value.jobId !== processing.cloud.ingestJobId ||
+          value.state !== "ready"
+        ) {
+          throw new PipelineWorkerError("parsed_activation_parent_conflict");
+        }
+        const updated = await this.requireCatalog().recordActivation({
+          catalogId: processing.processingCatalogId,
+          expectedRevision: processing.rowRevision,
+          activation: {
+            requestId: pending.requestId,
+            requestDigest: pending.requestDigest,
+            jobId: processing.cloud.ingestJobId,
+            processingGenerationId: processing.cloud.processingGenerationId,
+            state: "ready",
+            activatedAt: integer(value.activatedAt, "activated_at"),
+            reused: value.reused === true,
+            ...(value.previousGenerationId === undefined
+              ? {}
+              : {
+                  previousGenerationId: text(
+                    value.previousGenerationId,
+                    "previous_generation_id",
+                  ),
+                }),
+          },
+        });
+        return archivedBase(current, {
+          step: "cleanup",
+          expectedProcessingRevision: updated.rowRevision,
+        });
+      },
+    );
+    if (
+      errorCode(result) &&
+      this.journal.checkpoint.phase === "archived" &&
+      this.journal.checkpoint.step === "parsed_activate"
+    ) {
+      throw new PipelineWorkerError(errorCode(result)!);
+    }
+  }
+
+  private async driveArchivedCleanup(): Promise<void> {
+    const checkpoint = this.journal.checkpoint;
+    if (checkpoint.phase !== "archived" || checkpoint.step !== "cleanup") {
+      throw new PipelineWorkerError("journal_phase_conflict");
+    }
+    const { original, processing } = this.archivedRows(checkpoint);
+    this.requireCatalog().requireProcessingActivation(
+      processing.processingCatalogId,
+    );
+    const pdf = this.requirePdfConfig();
+    if (!processing.spool || !processing.parserOutput || !processing.capture) {
+      throw new PipelineWorkerError("cleanup_parent_missing");
+    }
+    await removeNormalizedBundleSpoolExact({
+      spoolRoot: pdf.spoolDirectory,
+      expectedRoot: processing.spoolIntent.root,
+      spool: processing.spool,
+    });
+    await removeParserOutputExact({
+      outputRoot: pdf.parserOutputRoot,
+      outputIntent: parserOutputIntentCore(processing.parserIntent),
+      artifacts: {
+        ...processing.parserOutput,
+        rawArtifact: {
+          ...processing.parserOutput.rawArtifact,
+          path: join(
+            pdf.parserOutputRoot,
+            processing.parserIntent.outputId,
+            processing.parserOutput.rawArtifact.opaqueName,
+          ),
+        },
+        normalizedBundle: {
+          ...processing.parserOutput.normalizedBundle,
+          path: join(
+            pdf.parserOutputRoot,
+            processing.parserIntent.outputId,
+            processing.parserOutput.normalizedBundle.opaqueName,
+          ),
+        },
+      },
+    });
+    await removeCapturedPdfExact(captureFromRows(pdf, original, processing));
+    const nextPdf = await this.nextPdfWorkIndex(
+      checkpoint.files,
+      checkpoint.pdfIndex + 1,
+    );
+    const publicationIncrement = checkpoint.countPublication === false ? 0 : 1;
+    if (nextPdf >= 0) {
+      await this.journal.transitionCheckpoint({
+        checkpoint: {
+          version: 1,
+          phase: "archived",
+          ...activeScanBase(checkpoint),
+          pdfIndex: nextPdf,
+          step: "intent",
+          reservationRound: 0,
+          archivedPublished:
+            checkpoint.archivedPublished + publicationIncrement,
+        },
+        credentialSessionActive: true,
+      });
+      return;
+    }
+    await this.journal.transitionCheckpoint({
+      checkpoint: {
+        version: 1,
+        phase: "discovery_reserve",
+        ...activeScanBase(checkpoint),
+        round: 0,
+        archivedPublished: checkpoint.archivedPublished + publicationIncrement,
+      },
+      credentialSessionActive: true,
+    });
   }
 
   private async driveJobsReserve(): Promise<void> {
@@ -1890,7 +4617,131 @@ export class PipelineRunner {
     if (errorCode(result)) throw new PipelineWorkerError(errorCode(result)!);
   }
 
+  private async driveArchived(): Promise<void> {
+    const checkpoint = this.journal.checkpoint;
+    if (checkpoint.phase !== "archived") {
+      throw new PipelineWorkerError("journal_phase_conflict");
+    }
+    switch (checkpoint.step) {
+      case "intent": {
+        const next = await this.createArchivedIntents(checkpoint);
+        await this.journal.transitionCheckpoint({
+          checkpoint: next,
+          credentialSessionActive: true,
+        });
+        return;
+      }
+      case "preflight":
+        return await this.driveArchivedPreflight();
+      case "lookup_original":
+        return await this.driveArchivedLookupOriginal();
+      case "capture":
+        return await this.driveArchivedCapture();
+      case "original_archive":
+        return await this.driveArchiveCopies(checkpoint, "original_bytes");
+      case "parse":
+        return await this.driveArchivedParse();
+      case "spool":
+        return await this.driveArchivedSpool();
+      case "lookup_processing":
+        return await this.driveArchivedLookupProcessing();
+      case "parser_archive":
+        return await this.driveArchiveCopies(checkpoint, "parser_output");
+      case "reserve":
+        return await this.driveArchivedReserve();
+      case "admit":
+        return await this.driveArchivedAdmit();
+      case "parsed_reserve":
+        return await this.driveParsedReserve();
+      case "parsed_renew":
+        return await this.driveParsedRenew();
+      case "parsed_begin":
+        return await this.driveParsedBegin();
+      case "parsed_batch":
+        return await this.driveParsedBatch();
+      case "parsed_seal":
+        return await this.driveParsedSeal();
+      case "parsed_activate":
+        return await this.driveParsedActivate();
+      case "cleanup":
+        return await this.driveArchivedCleanup();
+    }
+  }
+
+  private async driveCheckpoint(): Promise<PipelineRunResult | undefined> {
+    const checkpoint = this.journal.checkpoint;
+    switch (checkpoint.phase) {
+      case "idle":
+        throw new PipelineWorkerError("journal_phase_conflict");
+      case "terminal":
+        return resultFromTerminal(checkpoint);
+      case "scan_begin":
+        await this.driveScanBegin();
+        break;
+      case "inventory":
+        await this.driveInventory();
+        break;
+      case "append":
+        await this.driveAppend();
+        break;
+      case "seal_check":
+        await this.driveSealCheck();
+        break;
+      case "seal":
+        await this.driveSeal();
+        break;
+      case "reconcile":
+        await this.driveReconcile();
+        break;
+      case "discovery_reserve":
+        await this.driveDiscoveryReserve();
+        break;
+      case "discovery_admit":
+        await this.driveDiscoveryAdmit();
+        break;
+      case "archived":
+        await this.driveArchived();
+        break;
+      case "jobs_reserve":
+        await this.driveJobsReserve();
+        break;
+      case "jobs_renew":
+        await this.driveJobsRenew();
+        break;
+      case "jobs_stage":
+        await this.driveJobsStage();
+        break;
+      case "jobs_activate":
+        await this.driveJobsActivate();
+        break;
+      case "jobs_fail":
+        await this.driveJobsFail();
+        break;
+      case "assess_status":
+        await this.driveAssessStatus();
+        break;
+      case "assess_begin":
+        await this.driveAssessBegin();
+        break;
+      case "assess_page":
+        await this.driveAssessPage();
+        break;
+    }
+    return undefined;
+  }
+
   async run(): Promise<PipelineRunResult> {
+    await this.preparePdfProfile();
+    if (this.config.pdfDocQa) {
+      this.archiveCatalog = await openArchiveCatalog({ journal: this.journal });
+    }
+    if (this.journal.pending) {
+      const replayed = await this.driveCheckpoint();
+      if (replayed) return replayed;
+      if (this.journal.checkpoint.phase === "terminal") {
+        return resultFromTerminal(this.journal.checkpoint);
+      }
+    }
     const status = await this.sourceStatus();
     if (status.sourceAccountId !== this.config.sourceAccountId) {
       throw new PipelineWorkerError("source_mismatch");
@@ -1914,61 +4765,8 @@ export class PipelineRunner {
     }
 
     for (let steps = 0; steps < 10_000; steps += 1) {
-      const checkpoint = this.journal.checkpoint;
-      switch (checkpoint.phase) {
-        case "idle":
-          throw new PipelineWorkerError("journal_phase_conflict");
-        case "terminal":
-          return resultFromTerminal(checkpoint);
-        case "scan_begin":
-          await this.driveScanBegin();
-          break;
-        case "inventory":
-          await this.driveInventory();
-          break;
-        case "append":
-          await this.driveAppend();
-          break;
-        case "seal_check":
-          await this.driveSealCheck();
-          break;
-        case "seal":
-          await this.driveSeal();
-          break;
-        case "reconcile":
-          await this.driveReconcile();
-          break;
-        case "discovery_reserve":
-          await this.driveDiscoveryReserve();
-          break;
-        case "discovery_admit":
-          await this.driveDiscoveryAdmit();
-          break;
-        case "jobs_reserve":
-          await this.driveJobsReserve();
-          break;
-        case "jobs_renew":
-          await this.driveJobsRenew();
-          break;
-        case "jobs_stage":
-          await this.driveJobsStage();
-          break;
-        case "jobs_activate":
-          await this.driveJobsActivate();
-          break;
-        case "jobs_fail":
-          await this.driveJobsFail();
-          break;
-        case "assess_status":
-          await this.driveAssessStatus();
-          break;
-        case "assess_begin":
-          await this.driveAssessBegin();
-          break;
-        case "assess_page":
-          await this.driveAssessPage();
-          break;
-      }
+      const result = await this.driveCheckpoint();
+      if (result) return result;
     }
     throw new PipelineWorkerError("worker_step_limit");
   }
@@ -1978,7 +4776,8 @@ export class PipelineRunner {
       return await this.run();
     } catch (error) {
       return {
-        state: "failed",
+        state:
+          error instanceof PipelineRetryableError ? "incomplete" : "failed",
         code:
           error instanceof FilesystemFailure ||
           error instanceof PipelineWorkerError

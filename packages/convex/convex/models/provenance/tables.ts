@@ -5,6 +5,7 @@ import {
   evidenceSpanFields,
   sourceArtifactArchiveReceiptFields,
   sourceArtifactArchiveBindingFields,
+  sourceArtifactDeletionAckFields,
   sourceItemFields,
   sourcePageFields,
   sourceParserArtifactFields,
@@ -40,6 +41,7 @@ export const provenanceTables = {
     .index("by_spaceId", ["spaceId"])
     .index("by_sourceAccountId", ["sourceAccountId"])
     .index("by_sourceRevisionId", ["sourceRevisionId"])
+    .index("by_sourceItemId", ["sourceItemId"])
     .index("by_parserArtifactId", ["parserArtifactId"])
     .index("by_sourceAccountId_and_clientReceiptId", [
       "sourceAccountId",
@@ -57,6 +59,17 @@ export const provenanceTables = {
     ])
     .index("by_sourceItemId", ["sourceItemId"])
     .index("by_receiptId", ["receiptId"]),
+  sourceArtifactDeletionAcks: defineTable(sourceArtifactDeletionAckFields)
+    .index("by_sourceItemId", ["sourceItemId"])
+    .index("by_receiptId_and_forgetEpoch", ["receiptId", "forgetEpoch"])
+    .index("by_sourceAccountId_and_deletionId", [
+      "sourceAccountId",
+      "deletionId",
+    ])
+    .index("by_sourceAccountId_and_requestId", [
+      "sourceAccountId",
+      "requestId",
+    ]),
   sourceTextVersions: defineTable(sourceTextVersionFields)
     .index("by_spaceId", ["spaceId"])
     .index("by_sourceRevisionId", ["sourceRevisionId"])
