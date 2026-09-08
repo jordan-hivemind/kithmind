@@ -251,12 +251,15 @@ function relocationBindingPair(
   );
 }
 
-function archiveCheckpointIsIdle(value: JsonValue): boolean {
+export function archiveCheckpointIsQuiescent(value: JsonValue): boolean {
+  if (value === null || Array.isArray(value) || typeof value !== "object")
+    return false;
+  if (value.phase === "idle") return true;
   return (
-    value !== null &&
-    !Array.isArray(value) &&
-    typeof value === "object" &&
-    value.phase === "idle"
+    value.phase === "terminal" &&
+    value.outcome === "complete" &&
+    value.code === undefined &&
+    value.credentialSessionActive === false
   );
 }
 function parseRequestBody(
@@ -1230,9 +1233,9 @@ export class Journal<C extends JsonValue, R extends JsonValue> {
       if (
         parsed.state.pending !== undefined ||
         parsed.state.credentialSessionActive ||
-        !archiveCheckpointIsIdle(parsed.checkpoint)
+        !archiveCheckpointIsQuiescent(parsed.checkpoint)
       )
-        fail("archive rebind requires an idle journal");
+        fail("archive rebind requires a quiescent journal");
       return new Journal<C, R>({
         directory,
         binding: parsed.state.binding,
@@ -1305,7 +1308,7 @@ export class Journal<C extends JsonValue, R extends JsonValue> {
         !bindingEqual(this.binding, proposedBinding)) ||
       this.state.pending !== undefined ||
       this.state.credentialSessionActive ||
-      !archiveCheckpointIsIdle(this.parsedCheckpoint)
+      !archiveCheckpointIsQuiescent(this.parsedCheckpoint)
     )
       fail("archive rebind state is invalid");
     const stored = await readStoredState(this.statePath);
