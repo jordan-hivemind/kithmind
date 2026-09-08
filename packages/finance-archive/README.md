@@ -239,13 +239,18 @@ caller cannot do by combining the other two files alone:
 
 - **Instrument resolution.** `ParsedRow.instrument` is a descriptor (symbol,
   cusip, isin, name); `resolveInstrumentId` turns it into a stable
-  `instruments.id`, creating the row the first time it is seen. A real
-  identifier (`cusip`, then `isin`) is preferred over a symbol; without one,
-  matching requires `symbol` and `name` together and never `symbol` alone,
-  so two different instruments that happen to share a ticker are never
-  silently merged. A bare symbol with no name and no strong identifier gets
-  a fresh row every time -- a known gap for a source that never supplies a
-  name; a stronger identifier or a resolution table closes it later.
+  `instruments.id`, creating the row the first time it is seen. Precedence:
+  `cusip`, then `isin`, then `symbol` and `name` together, then `symbol`
+  alone, then a new row. A real identifier never merges two different
+  instruments that happen to share a ticker. A bare symbol with no cusip,
+  isin or matching name resolves to the *existing* instrument with that
+  symbol (deterministically the first one ever created, by SQLite `rowid`)
+  rather than minting a new row every time -- unbounded row growth would
+  silently break "every purchase of instrument X" just as badly as a wrong
+  merge would -- and every such weak match opens a `review_items` entry
+  (`kind = 'weak_instrument_match'`) naming the symbol and which row it
+  matched, the same way a cross-document `row_hash` collapse is made
+  visible instead of happening quietly.
 - **Document splitting.** `ParsedRow.sourceDocument` tells the wiring layer
   which underlying document (a page of a paginated pull, or the one file for
   a statement, confirmation or tabular export) each row belongs to. A pull
@@ -256,8 +261,17 @@ caller cannot do by combining the other two files alone:
   in each page's document. See `ParsedRow.sourceDocument`'s doc comment in
   `src/adapter.ts` for the full reasoning. Splitting loses the single
   provider-reported total the un-split case can assert directly, so
-  `adapterPullToImportDocuments` checks it separately across the whole pull
-  using distinct provider transaction ids when every row carries one.
+  `adapterPullToImportDocuments` checks it separately across the whole pull:
+  it recomputes each page's `occurrence` ordinal and `row_hash` the same way
+  `importBatch` will (via `contentKey` in `rowHash.ts`, shared by both so
+  they cannot drift apart) and compares the distinct-hash count against the
+  provider's total -- this works whether or not the rows carry a provider
+  transaction id, unlike checking distinct ids alone, which goes silent the
+  moment a source has none. When the provider states no total at all for a
+  paginated pull, ground rule 7 forbids asserting completeness anyway: the
+  pull still imports, but opens a `review_items` entry
+  (`kind = 'unverified_pagination_total'`) rather than passing silently, so
+  that pull's completeness is never later assumed.
 
 Two other renames happen here, not upstream: `ParsedRow.externalId` becomes
 `ImportRow.providerTxnId` (same concept), and `ParsedRow.locators` (a

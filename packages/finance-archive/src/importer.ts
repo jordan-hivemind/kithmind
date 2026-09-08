@@ -18,7 +18,7 @@ import type { DatabaseSync } from "node:sqlite";
 
 import { canonicalizeDecimal } from "./decimal.js";
 import { toMinorUnits } from "./money.js";
-import { normalizeText, rowHash } from "./rowHash.js";
+import { contentKey, rowHash } from "./rowHash.js";
 
 /**
  * One transaction as a source hands it to the importer, already normalized to
@@ -213,30 +213,6 @@ export function importBatch(
     reviewItemsOpened += 1;
   }
 
-  /**
-   * How many times a given content (the fields `rowHash` hashes, before the
-   * occurrence ordinal) has been seen so far within the current document.
-   * Reset for every new document, per the fix: the ordinal must be scoped to
-   * one document, in that document's own row order, for the same real
-   * transaction on two overlapping pages to land on the same ordinal (and
-   * therefore the same hash) in each page's document.
-   */
-  function contentKey(
-    row: ImportRow,
-    quantity: string | null,
-    amount: bigint | null,
-  ): string {
-    return [
-      row.accountId,
-      row.processDate,
-      normalizeText(row.activityType).toLowerCase(),
-      normalizeText(row.description),
-      quantity ?? "-",
-      amount === null ? "-" : amount.toString(),
-      row.currency,
-    ].join(" ");
-  }
-
   function importRow(
     row: ImportRow,
     documentId: string,
@@ -318,7 +294,15 @@ export function importBatch(
     // identical content get different ordinals and therefore different
     // hashes, so neither is lost (ground rule: equal date, amount and
     // description is not proof of duplication).
-    const key = contentKey(row, quantity, amount);
+    const key = contentKey({
+      accountId: row.accountId,
+      processDate: row.processDate,
+      activityType: row.activityType,
+      description: row.description,
+      quantity,
+      amount,
+      currency: row.currency,
+    });
     const occurrence = (occurrences.get(key) ?? 0) + 1;
     occurrences.set(key, occurrence);
 

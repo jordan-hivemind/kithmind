@@ -135,6 +135,74 @@ test("the same paginated overlap collapses through row_hash and occurrence alone
   assert.equal(crossDocDuplicates, rows.length - acquired.manifest.reportedRowCount);
 });
 
+test("a paginated pull with no provider ids at all and a wrong reported total is caught, not silently accepted", async (t) => {
+  const db = archive(t);
+  seed(db);
+  const session = createSyntheticSession();
+  const { acquired, rows } = await acquireAndParseActivity(session);
+  const anonymizedRows = rows.map((row) => ({ ...row, externalId: null }));
+  // A provider total that does not match the real, deduplicated row count.
+  // Without provider ids the old id-only check had nothing to compare and
+  // silently did nothing; this must be caught the same way an id-based
+  // mismatch already is.
+  const wrongTotal = {
+    ...acquired,
+    manifest: { ...acquired.manifest, reportedRowCount: acquired.manifest.reportedRowCount + 1 },
+  };
+
+  assert.throws(
+    () =>
+      adapterPullToImportDocuments(db, {
+        institutionId: INSTITUTION.id,
+        accountId: ACCOUNT.id,
+        acquired: wrongTotal,
+        rows: anonymizedRows,
+        docType: "activity_pull",
+        docDate: null,
+        filePath: "synthetic/thistlebrook-activity-wrong-total.json",
+      }),
+    /does not reconcile against the provider's total/,
+  );
+  // Refused before importBatch ever ran: no transaction, instrument or
+  // review item leaked out of a pull that was never accepted.
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM transactions").get().n, 0);
+});
+
+test("a paginated pull with no stated provider total at all is imported but leaves a durable unverified mark, never silently", async (t) => {
+  const db = archive(t);
+  seed(db);
+  const session = createSyntheticSession();
+  const { acquired, rows } = await acquireAndParseActivity(session);
+  const anonymizedRows = rows.map((row) => ({ ...row, externalId: null }));
+  const noStatedTotal = {
+    ...acquired,
+    manifest: { ...acquired.manifest, reportedRowCount: null },
+  };
+
+  const documents = adapterPullToImportDocuments(db, {
+    institutionId: INSTITUTION.id,
+    accountId: ACCOUNT.id,
+    acquired: noStatedTotal,
+    rows: anonymizedRows,
+    docType: "activity_pull",
+    docDate: null,
+    filePath: "synthetic/thistlebrook-activity-no-total.json",
+  });
+
+  // Ground rule 7: nothing here may claim completeness with no total to
+  // reconcile against, but the pull is not refused outright either -- it is
+  // recorded as unverified rather than imported (or dropped) silently.
+  const unverified = db
+    .prepare("SELECT kind, account_id, reason FROM review_items WHERE kind = 'unverified_pagination_total'")
+    .all();
+  assert.equal(unverified.length, 1);
+  assert.equal(unverified[0].account_id, ACCOUNT.id);
+  assert.match(unverified[0].reason, /provider reported no total/);
+
+  const summary = importBatch(db, { source: INSTITUTION.slug, documents }, new Date("2025-05-01"));
+  assert.ok(summary.rowsInserted > 0);
+});
+
 test("two legitimately identical rows in one document, with no provider id, both survive", (t) => {
   const db = archive(t);
   seed(db);
@@ -249,7 +317,7 @@ test("the deliberately garbled PDF statement amount lands in the review queue ca
   assert.equal(instrumentCount, 2);
 });
 
-test("resolveInstrumentId: a real identifier is preferred, and two different instruments sharing a symbol never merge", (t) => {
+test("resolveInstrumentId: a real identifier is preferred, and two different instruments sharing a symbol never merge on cusip or isin", (t) => {
   const db = archive(t);
   seed(db);
 
@@ -259,19 +327,45 @@ test("resolveInstrumentId: a real identifier is preferred, and two different ins
   const zenithId = resolveInstrumentId(db, zenith);
   assert.notEqual(zephyrId, zenithId, "same symbol, different cusip: never the same instrument");
 
-  // Stable: resolving the same descriptor again returns the same row.
+  // Stable: resolving the same descriptor again returns the same row, and a
+  // real identifier never needs a review item to justify the match.
   assert.equal(resolveInstrumentId(db, zephyr), zephyrId);
   assert.equal(resolveInstrumentId(db, { ...zephyr, cusip: "111111ZZ1" }), zephyrId);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM review_items").get().n, 0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM instruments").get().n, 2);
+});
 
-  // No cusip or isin at all: matching never falls back to symbol alone, so a
-  // third, differently-named instrument sharing the same symbol is its own
-  // row, not silently merged into either of the above.
-  const unknown = { symbol: "ZZZ", cusip: null, isin: null, name: "Unrelated Zeta Corp" };
-  const unknownId = resolveInstrumentId(db, unknown);
-  assert.notEqual(unknownId, zephyrId);
-  assert.notEqual(unknownId, zenithId);
-  // But resolving that same (symbol, name) pair again is stable too.
-  assert.equal(resolveInstrumentId(db, unknown), unknownId);
+test("resolveInstrumentId: a bare symbol with no cusip, isin, or matching name stabilizes on the first match instead of growing without bound, and opens a review item", (t) => {
+  const db = archive(t);
+  seed(db);
+  const zephyr = { symbol: "ZZZ", cusip: "111111ZZ1", isin: null, name: "Synthetic Zephyr Fund" };
+  const zephyrId = resolveInstrumentId(db, zephyr);
 
-  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM instruments").get().n, 3);
+  // No cusip, no isin, and a name that does not match anything on file:
+  // never merges silently, but never mints a fresh row forever either. It
+  // resolves to the existing instrument sharing this symbol and leaves the
+  // weak identity for review, rather than scattering one real holding
+  // across an unbounded number of instrument ids.
+  const unrelatedName = { symbol: "ZZZ", cusip: null, isin: null, name: "Unrelated Zeta Corp" };
+  const weakId = resolveInstrumentId(db, unrelatedName);
+  assert.equal(weakId, zephyrId, "resolves to the existing row rather than minting a new one");
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM instruments").get().n, 1);
+
+  const review = db
+    .prepare("SELECT kind, reason FROM review_items WHERE kind = 'weak_instrument_match'")
+    .all();
+  assert.equal(review.length, 1);
+  assert.match(review[0].reason, /symbol "ZZZ"/);
+  assert.match(review[0].reason, new RegExp(zephyrId));
+
+  // Resolving the same weak descriptor again is stable, and flagged again:
+  // every match carries the same merge risk, so every match is made visible.
+  const again = resolveInstrumentId(db, { symbol: "ZZZ", cusip: null, isin: null, name: null });
+  assert.equal(again, zephyrId);
+  assert.equal(
+    db
+      .prepare("SELECT COUNT(*) AS n FROM review_items WHERE kind = 'weak_instrument_match'")
+      .get().n,
+    2,
+  );
 });
