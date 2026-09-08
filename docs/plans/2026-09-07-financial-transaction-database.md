@@ -48,7 +48,7 @@ records where adopted rather than re-extracting the same documents.
 | Access surface for v1    | A local read-only MCP server over the archive. Not a five-operation typed contract, and not the Kith Mind adapter.                                                                                                                                                          |
 | Query shape              | Read-only SQL plus a documented schema, exposed through the local server. Frequently used shapes are promoted into typed operations later, once real questions have shown which ones matter.                                                                                |
 | Where the code lives     | This repository, MIT, with synthetic fixtures.                                                                                                                                                                                                                              |
-| Where the data lives     | Outside this repository, in a configured local directory. Never in git. Local first because it is the simpler starting point, not a ban on hosting: an off-machine destination stays open, and anything that leaves the machine is encrypted before it goes.                                                                                                                                                |
+| Where the data lives     | Outside this repository, in a configured local directory for now. Never in git. Local first because it is the simpler starting point, not a judgment about hosting: running the archive as a cloud service later is explicitly open, and the schema and money policy are engine-portable so that move is a migration rather than a redesign.                                                                                                                                                |
 | Standing CSV exports     | Not produced. A table mirror beside a live database is a second source of truth. Backup is a file copy plus a hash. Export is an on-demand script.                                                                                                                          |
 
 The typed-bounded-query rule in the record contract exists to protect
@@ -295,6 +295,42 @@ explicitly flagged.
 No scheduled scraper is built. If a scheduled agent participates at all, its
 job is running the import and reminding a person to do the acquisition.
 
+## Local now, cloud later
+
+v1 runs on one machine. The archive file, the raw tree and the MCP server are
+all local. That is a starting point chosen because it is the simplest thing
+that works, not a position that this data must never be hosted.
+
+Running the archive as a cloud service later is explicitly open. It buys real
+things: access from any device rather than only the desktop, and a durability
+problem a provider solves rather than the owner. Sensitive financial data lives
+in hosted services routinely and the protections for doing it are well
+understood. How a hosted deployment is secured is a decision to make when that
+move is made, with client-side encryption before upload as one option among
+several rather than a precondition.
+
+What v1 spends now to keep that option open:
+
+- Money is exact integer minor units and canonical base-10 decimal strings, and
+  dates are ISO text. Nothing depends on a SQLite-specific numeric type, so
+  moving to a hosted engine is a migration rather than a redesign.
+- Accounts, instruments, transactions, documents and source revisions carry
+  stable opaque identities that survive a move.
+- The read surface is one versioned boundary. Hosting changes where the server
+  runs, not what it answers.
+
+What that move introduces and v1 deliberately does not solve: authentication
+and authorization on the read surface, which is single-user and local today;
+network exposure, since a database port is never published directly; and the
+multi-user scope the record contract already reserves. The typed-bounded-query
+rule that this plan sets aside for a local single-user surface applies again
+the moment that surface is reachable from anywhere else.
+
+A single local copy of an acquired retention window is still the one loss this
+design cannot recover from, because an institution may not serve its oldest
+periods indefinitely. That is a durability requirement whatever the answer to
+hosting turns out to be.
+
 ## Repository and privacy boundary
 
 The code is public and MIT. The data is not in the repository at any point.
@@ -303,14 +339,12 @@ Public: the store, schema and migrations; the adapter interface; adapter
 implementations and their synthetic fixtures; the importer, reconciliation gate
 and MCP server; the README and this plan.
 
-Outside the repository, and local first: the archive file, the raw document
-tree, import logs, and any configuration naming a real path, institution
-account, program, person or balance. Local is the current default because it is
-simpler, not a rule against an off-machine copy. An encrypted backup
-destination is expected, since a single local copy of an acquired retention
-window is the one loss this design cannot recover from. Institution-specific
-extraction notes that reference a real account inventory stay in the gitignored
-private documentation tree.
+Outside the repository: the archive file, the raw document tree, import logs,
+and any configuration naming a real path, institution account, program, person
+or balance. These are local for now, which is a starting point rather than a
+rule against an off-machine copy or a hosted deployment; see "Local now, cloud
+later". Institution-specific extraction notes that reference a real account
+inventory stay in the gitignored private documentation tree.
 
 Public examples use root aliases and synthetic institutions. No real account
 number, balance, holding, advisor, entity or file path appears in the public
