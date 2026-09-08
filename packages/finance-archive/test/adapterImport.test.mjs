@@ -11,7 +11,7 @@ import {
   openArchive,
   persistAcquiredDocument,
   resolveInstrumentId,
-  sha256HexOf,
+  retainPayload,
   syntheticAdapter,
 } from "../dist/index.js";
 
@@ -227,15 +227,24 @@ test("a paginated pull with no stated provider total at all is imported but leav
 test("two legitimately identical rows in one document, with no provider id, both survive", (t) => {
   const db = archive(t);
   seed(db);
-  const bytes = new TextEncoder().encode("synthetic tabular export bytes");
+  const retained = retainPayload(
+    {
+      kind: "opaque",
+      version: "test-tabular-1",
+      note: "delimited text from a download control, no addressable fields",
+    },
+    new TextEncoder().encode("synthetic tabular export bytes"),
+    "tabular_export",
+  );
   const acquired = {
-    bytes,
+    bytes: retained.bytes,
+    retention: retained.record,
     manifest: {
       kind: "tabular_export",
       periodStart: "2025-06-01",
       periodEnd: "2025-06-30",
       capturedAt: "2025-07-01T00:00:00.000Z",
-      contentHash: sha256HexOf(bytes),
+      contentHash: retained.sha256,
       reportedRowCount: null,
       gaps: [],
     },
