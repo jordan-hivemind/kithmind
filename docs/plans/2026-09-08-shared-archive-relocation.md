@@ -44,9 +44,25 @@ or validate its application contents. A process death can leave its random
 temporary file, so this helper alone is not resumable restore orchestration.
 The owner command must record and account for those outputs before retrying.
 
-The workflow still requires an owner command connecting all components, a
-protected recipe covering both repositories, and actual decryption and
-database-restore gates. Its synthetic tests do not establish Dropbox identity
+The recipe validator now binds both repositories, exact configuration bytes,
+retained database receipts, and the complete live processing inventory read
+under the held catalog and journal. It derives separate workflow, catalog, and
+owner watcher-reset IDs. Preparation validates the original state; resume
+parsing validates the immutable recipe without requiring that original state
+to remain current after a successful rebind. Historical receipt claims do not
+count as fresh recovery verification.
+
+An owner-only age recovery helper verifies ciphertext and plaintext hashes.
+It sends the protected native age identity through standard input and writes
+plaintext into an exclusive protected file. A separate native Convex restore
+verifier stages a hash-pinned backend, deploys only the schema, blocks backend
+outbound connections, checks loopback listener ownership, and compares the
+restored native export with the source. It does not deploy application
+functions, authentication configuration, HTTP routes, or cron definitions.
+
+The workflow still requires an owner command connecting all components,
+protected recipe persistence, and fresh provider readback wired into the
+decryption and database-restore gates. Its synthetic tests do not establish Dropbox identity
 preservation or authorize skipping those gates. The current
 component limits are 2,048 inventory objects and 64 MiB per ciphertext object.
 Larger migrations require a separately tested limit change before preparation.
