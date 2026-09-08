@@ -168,6 +168,9 @@ test("source and destination continuity ignores only repository root paths", () 
 
 test("accepts actual helper boundary key order in snapshot and tree inventories", () => {
   const input = structuredClone(inventory("old"));
+  input.processing.snapshots.snapshots[0].paths = [
+    "/private/decomposed-e\u0301/synthetic.age",
+  ];
   for (const repository of [input.processing, input.database]) {
     for (const holder of [repository.snapshots, ...repository.trees]) {
       const boundary = holder.boundary;
@@ -208,6 +211,10 @@ test("rejects missing, extra, ambiguous, or misbound snapshot trees", () => {
     (value) =>
       (value.processing.snapshots.snapshots[0].paths = [
         "/different/not-the-object.age",
+      ]),
+    (value) =>
+      (value.processing.snapshots.snapshots[0].paths = [
+        "relative/synthetic.age",
       ]),
     (value) => value.database.snapshots.snapshots[0].tags.push("unexpected"),
     (value) =>

@@ -74,8 +74,7 @@ function text(value: unknown, maximum = 1_024): string {
     typeof value !== "string" ||
     value.length < 1 ||
     Buffer.byteLength(value, "utf8") > maximum ||
-    /[\x00-\x1f\x7f]/.test(value) ||
-    value.normalize("NFC") !== value
+    /[\x00-\x1f\x7f]/.test(value)
   )
     fail();
   return value;
@@ -146,9 +145,14 @@ function safeStoredPath(value: unknown): string {
 function safeProvenancePath(value: unknown): string {
   const path = text(value, MAX_PATH_BYTES);
   if (
+    !posix.isAbsolute(path) ||
+    path === "/" ||
     path.includes("\\") ||
     posix.normalize(path) !== path ||
-    path.split("/").some((part) => part === "." || part === "..")
+    path
+      .slice(1)
+      .split("/")
+      .some((part) => !part || part === "." || part === "..")
   )
     fail();
   return path;
@@ -156,16 +160,17 @@ function safeProvenancePath(value: unknown): string {
 
 function sortedUniqueText(
   values: unknown,
-  maximum: number,
+  maximumCount: number,
+  maximumBytes: number,
   allowEmpty = false,
 ): string[] {
   if (
     !Array.isArray(values) ||
     (!allowEmpty && values.length < 1) ||
-    values.length > maximum
+    values.length > maximumCount
   )
     fail();
-  const result = values.map((value) => text(value, MAX_PATH_BYTES)).sort();
+  const result = values.map((value) => text(value, maximumBytes)).sort();
   if (new Set(result).size !== result.length) fail("inventory_conflict");
   return result;
 }
@@ -196,8 +201,10 @@ function snapshotRows(
     exactKeys(input, ["snapshotId", "hostname", "tags", "paths"]);
     const snapshotId = sha(input.snapshotId);
     const hostname = text(input.hostname, 255);
-    const tags = sortedUniqueText(input.tags, 128, true);
-    const paths = sortedUniqueText(input.paths, 128).map(safeProvenancePath);
+    const tags = sortedUniqueText(input.tags, 32, 128, true);
+    const paths = sortedUniqueText(input.paths, 32, MAX_PATH_BYTES).map(
+      safeProvenancePath,
+    );
     if (rows.has(snapshotId)) fail("inventory_conflict");
     rows.set(snapshotId, { snapshotId, hostname, tags, paths });
   }
