@@ -591,6 +591,10 @@ test("persists an exact root-path-only boundary relocation for the complete live
     const recorded = await f.catalog.recordBoundaryRelocation(input);
     assert.deepEqual(recorded, input);
     assert.deepEqual(
+      await f.catalog.requireBoundaryRelocation(input.relocationId),
+      { relocation: input, catalogRevision: f.catalog.revision },
+    );
+    assert.deepEqual(
       await f.catalog.recordBoundaryRelocation(input),
       recorded,
       "an exact retry is idempotent",

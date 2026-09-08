@@ -1721,6 +1721,34 @@ export class ArchiveCatalog {
     return matches.length === 1;
   }
 
+  async requireBoundaryRelocation(relocationId: string): Promise<{
+    relocation: ArchiveBoundaryRelocation;
+    catalogRevision: number;
+  }> {
+    return await this.enter(async () => {
+      const current = await this.read();
+      if (
+        current === undefined ||
+        this.storedIdentity === undefined ||
+        !equal(current.identity, this.storedIdentity) ||
+        !equal(
+          parseSnapshot(current.value, this.snapshot.authorityDigest),
+          this.snapshot,
+        )
+      )
+        fail("catalog_conflict");
+      const key = uuid(relocationId);
+      const relocation = this.snapshot.boundaryRelocations.find(
+        (candidate) => candidate.relocationId === key,
+      );
+      if (!relocation) fail("catalog_not_found");
+      return {
+        relocation: structuredClone(relocation),
+        catalogRevision: this.snapshot.revision,
+      };
+    });
+  }
+
   requireProcessingActivation(catalogId: string) {
     this.assertUsable();
     const key = uuid(catalogId);
