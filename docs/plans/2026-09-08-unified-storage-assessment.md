@@ -121,7 +121,11 @@ The finance-only component is necessary but insufficient for the whole-system
 proof. Mainline owns the worker/gateway/auth/search/recovery portion below.
 F1-21 gateway integration waits for the shared typed contract. F1-23 (closed
 credential-free projection) and F1-24 (capture provenance) can proceed independently
-and both block first real acquisition/shared capture publication. Do not duplicate
+and both block first real acquisition/shared capture publication. They are also
+prerequisites for accepting the F1-22 raw-writer port: its synthetic fixture must
+use the closed payload projection and preserve distinct captures of equal bytes.
+Freeze the shared decimal/document/capture identity contract before accepting
+the integrated slice. Do not duplicate
 those fixes in a competing mainline writer.
 
 Before changing stored denominations, the finance slice pins canonical decimal
