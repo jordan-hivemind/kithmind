@@ -103,9 +103,12 @@ class ProductionParserTest(unittest.TestCase):
                         "self_ref": "#/texts/0",
                         "prov": [provenance],
                         "text": "Before \U0001f30d Caf\u00e9",
+                        "children": [],
                     }
                 ],
                 "tables": [],
+                "groups": [],
+                "body": {"children": [{"$ref": "#/texts/0"}]},
             },
         )
 
@@ -139,7 +142,7 @@ class ProductionParserTest(unittest.TestCase):
         result, converter = self.call()
         self.assertEqual(result["state"], "complete")
         converter.assert_called_once_with(
-            self.data, f"pdf-{self.digest}.pdf", Path("artifacts"), 150.0
+            self.data, f"pdf-{self.digest}.pdf", Path("artifacts"), 480.0
         )
         bundle = result["normalizedBundle"]
         segment = bundle["pages"][0]["segments"][0]
@@ -199,7 +202,7 @@ class ProductionParserTest(unittest.TestCase):
         self.assertFalse(_provenance_whitespace_only("\ufeff"))
         self.assertFalse(_provenance_whitespace_only("🧪"))
 
-    def test_multi_span_items_fail_closed_on_cross_page_or_uncovered_text(self):
+    def test_cross_page_item_splits_in_neighbor_order_and_preserves_whitespace(self):
         def item(ref, spans):
             return FakeTextItem(
                 self_ref=ref,
@@ -210,22 +213,86 @@ class ProductionParserTest(unittest.TestCase):
                 ],
             )
 
-        cross_page = item("#/texts/0", [(1, (0, 5)), (2, (6, 10))])
-        uncovered = item("#/texts/1", [(1, (0, 4)), (1, (6, 10))])
+        before = FakeTextItem("#/texts/0", "Before", [FakeProvenance(1, (0, 6))])
+        cross_page = item("#/texts/1", [(1, (0, 5)), (2, (6, 10))])
+        after = FakeTextItem("#/texts/2", "After", [FakeProvenance(2, (0, 5))])
+        uncovered = item("#/texts/3", [(1, (0, 4)), (1, (6, 10))])
 
         class Document:
             @staticmethod
             def iterate_items():
-                return iter(((cross_page, 1), (uncovered, 1)))
+                return iter(
+                    ((before, 1), (cross_page, 1), (after, 1), (uncovered, 1))
+                )
 
         with patch.dict(sys.modules, FAKE_DOCLING_MODULES):
             pages, _tables, gaps = _docling_normalized(Document(), 2)
-        self.assertEqual([page["text"] for page in pages], ["", ""])
+        self.assertEqual(
+            [page["text"] for page in pages], ["Before\nAlpha ", "beta\nAfter"]
+        )
+        self.assertEqual(
+            [[segment["id"] for segment in page["segments"]] for page in pages],
+            [
+                ["docling-item-0", "docling-item-1-slice-0"],
+                ["docling-item-1-slice-1", "docling-item-2"],
+            ],
+        )
+        slices = [pages[0]["segments"][1], pages[1]["segments"][0]]
+        self.assertEqual(
+            [segment["locator"]["itemTextCharspan"] for segment in slices],
+            [[0, 6], [6, 10]],
+        )
+        self.assertEqual(
+            gaps,
+            [{"kind": "ambiguous_text_provenance", "item": 3}],
+        )
+
+    def test_cross_page_item_owns_outer_whitespace_across_three_unicode_pages(self):
+        text = "\u00a0Cafe\u0301 \nβ \t🧪\u0085"
+        valid = FakeTextItem(
+            "#/texts/0",
+            text,
+            [
+                FakeProvenance(1, (1, 6)),
+                FakeProvenance(2, (8, 9)),
+                FakeProvenance(3, (11, 12)),
+            ],
+        )
+        overlap = FakeTextItem(
+            "#/texts/1",
+            "Alpha beta",
+            [FakeProvenance(1, (0, 5)), FakeProvenance(2, (4, 10))],
+        )
+        decreasing = FakeTextItem(
+            "#/texts/2",
+            "Alpha beta",
+            [FakeProvenance(2, (0, 5)), FakeProvenance(1, (6, 10))],
+        )
+
+        class Document:
+            @staticmethod
+            def iterate_items():
+                return iter(((valid, 1), (overlap, 1), (decreasing, 1)))
+
+        with patch.dict(sys.modules, FAKE_DOCLING_MODULES):
+            pages, _tables, gaps = _docling_normalized(Document(), 3)
+        self.assertEqual(
+            [page["text"] for page in pages],
+            ["\u00a0Café ", "β \t", "🧪\u0085"],
+        )
+        self.assertEqual(
+            [
+                segment["locator"]["itemTextCharspan"]
+                for page in pages
+                for segment in page["segments"]
+            ],
+            [[0, 8], [8, 11], [11, 13]],
+        )
         self.assertEqual(
             gaps,
             [
-                {"kind": "ambiguous_text_provenance", "item": 0},
                 {"kind": "ambiguous_text_provenance", "item": 1},
+                {"kind": "ambiguous_text_provenance", "item": 2},
             ],
         )
 
@@ -265,6 +332,101 @@ class ProductionParserTest(unittest.TestCase):
         ] = [4, 10]
         with self.assertRaises(ProductionFailure):
             _normalized_bundle(altered, raw, self.digest, {})
+
+    def test_normalized_bundle_requires_complete_cross_page_slice_inventory(self):
+        text = "Alpha 🧪 beta"
+        provenance = [
+            {"page_no": 1, "charspan": [0, 5]},
+            {"page_no": 2, "charspan": [6, 7]},
+            {"page_no": 2, "charspan": [8, 12]},
+        ]
+
+        def segment(identifier, page, indexes, charspan):
+            start, end = charspan
+            return {
+                "id": identifier,
+                "text": text[start:end],
+                "startCodepoint": 0,
+                "endCodepoint": end - start,
+                "citable": True,
+                "locator": {
+                    "kind": "docling_item_slice",
+                    "itemRef": "#/texts/0",
+                    "provenance": provenance,
+                    "provenanceIndexes": indexes,
+                    "itemTextCharspan": charspan,
+                    "doclingCharspanSemantics": "item_local_python_codepoints",
+                },
+            }
+
+        first = segment("docling-item-0-slice-0", 1, [0, 1], [0, 6])
+        second = segment("docling-item-0-slice-1", 2, [1, 3], [6, 12])
+        normalized = {
+            "pages": [
+                {"page": 1, "text": first["text"], "segments": [first]},
+                {"page": 2, "text": second["text"], "segments": [second]},
+            ],
+            "tables": [],
+            "mappingGaps": [],
+        }
+        raw = {
+            "texts": [
+                {
+                    "self_ref": "#/texts/0",
+                    "text": text,
+                    "prov": provenance,
+                    "children": [],
+                },
+                {
+                    "self_ref": "#/texts/1",
+                    "text": text,
+                    "prov": provenance,
+                    "children": [],
+                },
+            ],
+            "tables": [],
+            "groups": [],
+            "body": {"children": [{"$ref": "#/texts/0"}]},
+            "furniture": {"children": [{"$ref": "#/texts/1"}]},
+        }
+        bundle = _normalized_bundle(normalized, raw, self.digest, {})
+        self.assertEqual([page["text"] for page in bundle["pages"]], ["Alpha ", "🧪 beta"])
+
+        omitted = copy.deepcopy(normalized)
+        omitted["pages"][1].update({"text": "", "segments": []})
+        with self.assertRaises(ProductionFailure):
+            _normalized_bundle(omitted, raw, self.digest, {})
+
+        fully_omitted = copy.deepcopy(normalized)
+        for page in fully_omitted["pages"]:
+            page.update({"text": "", "segments": []})
+        fully_omitted["mappingGaps"] = [
+            {"kind": "ambiguous_text_provenance", "item": 0}
+        ]
+        with self.assertRaises(ProductionFailure):
+            _normalized_bundle(fully_omitted, raw, self.digest, {})
+
+        nested_text = copy.deepcopy(raw)
+        nested_text["texts"][0]["children"] = [{"$ref": "#/texts/1"}]
+        with self.assertRaises(ProductionFailure):
+            _normalized_bundle(normalized, nested_text, self.digest, {})
+
+        excluded_layer = copy.deepcopy(nested_text)
+        excluded_layer["texts"][1]["content_layer"] = "furniture"
+        _normalized_bundle(normalized, excluded_layer, self.digest, {})
+
+        picture_caption = copy.deepcopy(raw)
+        picture_caption["body"] = {"children": [{"$ref": "#/pictures/0"}]}
+        picture_caption["pictures"] = [
+            {
+                "children": [
+                    {"$ref": "#/texts/0"},
+                    {"$ref": "#/texts/1"},
+                ],
+                "captions": [{"$ref": "#/texts/0"}],
+            }
+        ]
+        _normalized_bundle(normalized, picture_caption, self.digest, {})
 
     def test_refuses_without_parent_network_and_resource_boundary(self):
         result, converter = self.call(
@@ -404,6 +566,33 @@ class ProductionParserTest(unittest.TestCase):
                 artifacts=Path("artifacts"), model_lock=Path("lock")
             )
         self.assertEqual(profile["state"], "ready")
+        self.assertEqual(profile["parserFingerprint"]["configuration"]["timeoutSeconds"], 480.0)
+        with patch(
+            "parser_eval.production._verify_runtime_and_artifacts",
+            return_value=self.manifest,
+        ):
+            legacy_profile = prepare_pdf_profile(
+                artifacts=Path("artifacts"), model_lock=Path("lock"), timeout_seconds=150
+            )
+        self.assertEqual(legacy_profile["state"], "ready")
+        self.assertEqual(
+            legacy_profile["parserFingerprint"]["configuration"]["timeoutSeconds"], 150.0
+        )
+        self.assertEqual(
+            prepare_pdf_profile(
+                artifacts=Path("artifacts"), model_lock=Path("lock"), timeout_seconds=481
+            ),
+            {"state": "failed", "code": "invalid_input"},
+        )
+        self.assertEqual(
+            profile["extractionConfiguration"]["configuration"],
+            {
+                "mappingFormat": "docling_utf16_pages_v2",
+                "maxPages": 64,
+                "maxRetainedUtf8Bytes": 1024 * 1024,
+                "maxBundleBytes": 4 * 1024 * 1024,
+            },
+        )
         converter.assert_not_called()
         result, _ = self.call()
         final = result["normalizedBundle"]["extractionFingerprint"]

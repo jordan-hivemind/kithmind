@@ -4,6 +4,8 @@ import test from "node:test";
 import {
   canonicalParsedMappingManifestInput,
   digestParsedMappingManifest,
+  parseParsedChunkInput,
+  parseParsedLocator,
   parseParsedPageInput,
 } from "../dist/index.js";
 
@@ -91,5 +93,54 @@ test("emitted Node export preserves the B2 mapping golden vector", async () => {
       textHash: "a".repeat(64),
     }).end,
     2,
+  );
+});
+
+test("accepts a closed page locator through page 64", () => {
+  assert.deepEqual(
+    parseParsedLocator({
+      kind: "parser_page_v1",
+      pageNumber: 64,
+      pageTextHash: "a".repeat(64),
+    }),
+    {
+      kind: "parser_page_v1",
+      pageNumber: 64,
+      pageTextHash: "a".repeat(64),
+    },
+  );
+  assert.throws(() =>
+    parseParsedLocator({
+      kind: "parser_page_v1",
+      pageNumber: 65,
+      pageTextHash: "a".repeat(64),
+    }),
+  );
+  assert.throws(() =>
+    parseParsedLocator({
+      kind: "parser_page_v1",
+      pageNumber: 1,
+      pageTextHash: "A".repeat(64),
+    }),
+  );
+});
+
+test("keeps historical parsed chunk wire rows above the current mapper target readable", () => {
+  const historicalText = "x".repeat(20 * 1024);
+  const parsed = parseParsedChunkInput({
+    documentKey: "pdf:primary",
+    ordinal: 0,
+    start: 0,
+    end: historicalText.length,
+    text: historicalText,
+    evidence: [{ pageOrdinal: 0, evidenceOrdinal: 0 }],
+  });
+  assert.equal(parsed.text.length, 20 * 1024);
+  assert.throws(() =>
+    parseParsedChunkInput({
+      ...parsed,
+      end: 65_537,
+      text: "x".repeat(65_537),
+    }),
   );
 });

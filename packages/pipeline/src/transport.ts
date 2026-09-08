@@ -989,10 +989,10 @@ function parsedStageSeal(value: Record<string, unknown>): void {
   id(value.stageId, "stageId");
   id(value.payloadManifestId, "payloadManifestId");
   if (value.state !== "staged") failure("parsed stage seal state is invalid");
-  integer(value.actualPageCount, "actualPageCount", 1, 32);
-  integer(value.actualEvidenceSpanCount, "actualEvidenceSpanCount", 1, 128);
+  integer(value.actualPageCount, "actualPageCount", 1, 64);
+  integer(value.actualEvidenceSpanCount, "actualEvidenceSpanCount", 1, 256);
   integer(value.actualDocumentCount, "actualDocumentCount", 1, 16);
-  integer(value.actualChunkCount, "actualChunkCount", 1, 128);
+  integer(value.actualChunkCount, "actualChunkCount", 1, 256);
   boolean(value.reused, "reused");
 }
 

@@ -103,6 +103,56 @@ def _same_page_text_provenance(
     return page_number
 
 
+def _cross_page_text_slices(
+    provenance: list[Any], text: str, pages: dict[int, dict[str, Any]]
+) -> list[tuple[int, int, int, int, int]] | None:
+    """Return page, provenance-index, and raw-text bounds for each page slice."""
+    if not 2 <= len(provenance) <= 256:
+        return None
+    prior_end = 0
+    prior_page = 0
+    groups: list[tuple[int, int, int]] = []
+    for index, prov in enumerate(provenance):
+        page = getattr(prov, "page_no", None)
+        charspan = tuple(getattr(prov, "charspan", ()) or ())
+        if (
+            type(page) is not int
+            or page not in pages
+            or page < prior_page
+            or len(charspan) != 2
+            or any(type(offset) is not int for offset in charspan)
+            or not 0 <= prior_end <= charspan[0] < charspan[1] <= len(text)
+            or not _provenance_whitespace_only(text[prior_end : charspan[0]])
+        ):
+            return None
+        if not groups or groups[-1][0] != page:
+            groups.append((page, index, index + 1))
+        else:
+            groups[-1] = (page, groups[-1][1], index + 1)
+        prior_end = charspan[1]
+        prior_page = page
+    if (
+        len(groups) < 2
+        or not _provenance_whitespace_only(text[prior_end:])
+        or any(left[0] >= right[0] for left, right in zip(groups, groups[1:]))
+    ):
+        return None
+    slices = []
+    for ordinal, (page, provenance_start, provenance_end) in enumerate(groups):
+        text_start = 0 if ordinal == 0 else provenance[provenance_start].charspan[0]
+        text_end = (
+            len(text)
+            if ordinal + 1 == len(groups)
+            else provenance[groups[ordinal + 1][1]].charspan[0]
+        )
+        if not normalize_text(text[text_start:text_end]).strip("\n"):
+            return None
+        slices.append(
+            (page, provenance_start, provenance_end, text_start, text_end)
+        )
+    return slices
+
+
 def _docling_normalized(
     document: Any, page_count: int
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
@@ -198,24 +248,48 @@ def _docling_normalized(
             if not normalize_text(item.text).strip("\n"):
                 continue
             page_number = _same_page_text_provenance(provenance, item.text, pages)
-            if page_number is None:
+            if page_number is not None:
+                _append_segment(
+                    pages[page_number],
+                    item.text,
+                    f"docling-item-{item_index}",
+                    {
+                        "kind": "docling_item",
+                        "itemRef": str(getattr(item, "self_ref", "")),
+                        "provenance": (
+                            _locator(provenance[0])
+                            if len(provenance) == 1
+                            else [_locator(prov) for prov in provenance]
+                        ),
+                        "doclingCharspanSemantics": "item_local_python_codepoints_not_evidence",
+                    },
+                )
+                continue
+            slices = _cross_page_text_slices(provenance, item.text, pages)
+            if slices is None:
                 gaps.append({"kind": "ambiguous_text_provenance", "item": item_index})
                 continue
-            _append_segment(
-                pages[page_number],
-                item.text,
-                f"docling-item-{item_index}",
-                {
-                    "kind": "docling_item",
-                    "itemRef": str(getattr(item, "self_ref", "")),
-                    "provenance": (
-                        _locator(provenance[0])
-                        if len(provenance) == 1
-                        else [_locator(prov) for prov in provenance]
-                    ),
-                    "doclingCharspanSemantics": "item_local_python_codepoints_not_evidence",
-                },
-            )
+            raw_provenance = [_locator(prov) for prov in provenance]
+            for slice_ordinal, (
+                page,
+                provenance_start,
+                provenance_end,
+                text_start,
+                text_end,
+            ) in enumerate(slices):
+                _append_segment(
+                    pages[page],
+                    item.text[text_start:text_end],
+                    f"docling-item-{item_index}-slice-{slice_ordinal}",
+                    {
+                        "kind": "docling_item_slice",
+                        "itemRef": str(getattr(item, "self_ref", "")),
+                        "provenance": raw_provenance,
+                        "provenanceIndexes": [provenance_start, provenance_end],
+                        "itemTextCharspan": [text_start, text_end],
+                        "doclingCharspanSemantics": "item_local_python_codepoints",
+                    },
+                )
     return list(pages.values()), tables, gaps
 
 

@@ -8,7 +8,7 @@ import {
 import { sha256Hex, utf8ByteLength } from "../ingestion/hash";
 import { getAuthorizedReadSpaceIds, type PrincipalRef } from "../../lib/spaces";
 
-export const MAX_EMBEDDING_MANIFEST_TARGETS = 128;
+export const MAX_EMBEDDING_MANIFEST_TARGETS = 256;
 export const MAX_EMBEDDING_MANIFEST_BYTES = 2 * 1024 * 1024;
 export const MAX_EMBEDDING_VECTOR_ROWS = 256;
 export const MAX_EMBEDDING_MANIFEST_SCAN_ROWS = 256;

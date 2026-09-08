@@ -546,11 +546,9 @@ describe("archived discovery admission", () => {
         end: text.length,
         quoteHash: textHash,
         locator: {
-          kind: "parser_item_v1" as const,
+          kind: "parser_page_v1" as const,
           pageNumber: 1,
-          itemRef: "#/texts/0",
-          sourceCharStart: 0,
-          sourceCharEnd: text.length,
+          pageTextHash: textHash,
         },
       },
     ];
@@ -708,6 +706,30 @@ describe("archived discovery admission", () => {
       ),
     ).rejects.toThrow();
     operationNow = 600_126;
+    const mismatchedPageHash = parseWorkerRequest({
+      ...base(f),
+      operation: "jobs.stageParsedBatch",
+      requestId: "stage-evidence-wrong-page-hash",
+      jobId: lease.jobId,
+      leaseEpoch: lease.leaseEpoch,
+      leaseToken: lease.leaseToken,
+      stageId: begun.stageId,
+      phase: "evidence",
+      ordinal: 0,
+      rows: [
+        {
+          ...evidence[0],
+          locator: { ...evidence[0]!.locator, pageTextHash: "f".repeat(64) },
+        },
+      ],
+    });
+    if (mismatchedPageHash.operation !== "jobs.stageParsedBatch")
+      throw new Error("bad mismatched page hash batch");
+    await expect(
+      f.t.run((ctx) =>
+        stageParsedBatch(ctx, f.principal, mismatchedPageHash, operationNow++),
+      ),
+    ).rejects.toThrow();
     const evidenceBatch = await batch("stage-evidence", "evidence", evidence);
     const renew = parseWorkerRequest({
       ...base(f),

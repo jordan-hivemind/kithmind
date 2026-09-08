@@ -24,7 +24,7 @@ const SHA256 = /^[a-f0-9]{64}$/;
 const OPAQUE_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const MAX_PATH_BYTES = 4_096;
-const MAX_JSON_NODES = 50_000;
+const MAX_JSON_NODES = 500_000;
 const MAX_JSON_DEPTH = 48;
 const MAX_MODEL_LOCK_BYTES = 4 * 1024 * 1024;
 const PROCESS_MONITOR_TIMEOUT_MS = 1_000;
@@ -40,9 +40,9 @@ const EXPECTED_RUNTIME_VERSIONS = {
 } as const;
 
 export const DEFAULT_PARSER_PROCESS_LIMITS: ParserProcessLimits = {
-  wallDeadlineMs: 210_000,
-  cpuSeconds: 180,
-  maxRssBytes: 4 * 1024 * 1024 * 1024,
+  wallDeadlineMs: 600_000,
+  cpuSeconds: 1_800,
+  maxRssBytes: 8 * 1024 * 1024 * 1024,
   maxProcessCount: 16,
   pollIntervalMs: 50,
   maxStdoutBytes: 16 * 1024,
@@ -214,6 +214,14 @@ export type ValidatedNormalizedBundle = {
             kind: "docling_table_row";
             tableProvenance: Record<string, unknown>;
             cells: Array<Record<string, unknown>>;
+          }
+        | {
+            kind: "docling_item_slice";
+            itemRef: string;
+            provenance: Array<Record<string, unknown>>;
+            provenanceIndexes: [number, number];
+            itemTextCharspan: [number, number];
+            doclingCharspanSemantics: "item_local_python_codepoints";
           };
     }>;
   }>;
@@ -573,7 +581,7 @@ function validateLimits(
   }
   if (
     !integer(selected.wallDeadlineMs, 1_000, 10 * 60_000) ||
-    !integer(selected.cpuSeconds, 1, 600) ||
+    !integer(selected.cpuSeconds, 1, 1_800) ||
     !integer(selected.maxRssBytes, 64 * 1024 * 1024, 8 * 1024 * 1024 * 1024) ||
     !integer(selected.maxProcessCount, 1, 64) ||
     !integer(selected.pollIntervalMs, 25, 250) ||
@@ -879,7 +887,7 @@ async function runSandboxed(
   };
 }
 
-function parseJson(bytes: Buffer, maximum: number): unknown {
+export function parseBoundedParserJson(bytes: Buffer, maximum: number): unknown {
   if (bytes.length < 1 || bytes.length > maximum)
     fail("output_invalid", "parser JSON is outside its bound");
   let value: unknown;
@@ -891,8 +899,10 @@ function parseJson(bytes: Buffer, maximum: number): unknown {
   let nodes = 0;
   const visit = (current: unknown, depth: number): void => {
     nodes += 1;
-    if (nodes > MAX_JSON_NODES || depth > MAX_JSON_DEPTH)
-      fail("output_invalid", "parser JSON exceeds structural bounds");
+    if (nodes > MAX_JSON_NODES)
+      fail("output_invalid", "parser JSON exceeds its node bound");
+    if (depth > MAX_JSON_DEPTH)
+      fail("output_invalid", "parser JSON exceeds its depth bound");
     if (Array.isArray(current)) {
       for (const item of current) visit(item, depth + 1);
     } else if (current !== null && typeof current === "object") {
@@ -947,7 +957,7 @@ function fingerprint(value: unknown, pythonTimeoutFloat = false): string {
       configuration && typeof configuration === "object"
         ? (configuration as Record<string, unknown>).timeoutSeconds
         : undefined;
-    if (!integer(timeout, 1, 150)) {
+    if (!integer(timeout, 1, 480)) {
       fail("output_invalid", "parser timeout fingerprint field is invalid");
     }
     const text = encoded.toString("utf8");
@@ -1081,6 +1091,144 @@ function multiSpanProvenanceCoversText(
   return provenanceWhitespaceOnly(codepoints.slice(priorEnd));
 }
 
+type RawItemSlice = {
+  page: number;
+  provenanceStart: number;
+  provenanceEnd: number;
+  textStart: number;
+  textEnd: number;
+};
+
+function rawCrossPageSlices(
+  item: Record<string, unknown>,
+  maximumPage: number,
+): RawItemSlice[] | undefined {
+  if (typeof item.text !== "string" || !Array.isArray(item.prov)) return;
+  const provenance = item.prov;
+  if (provenance.length < 2 || provenance.length > 256) return;
+  const codepoints = Array.from(item.text);
+  const groups: Array<{ page: number; start: number; end: number }> = [];
+  let priorEnd = 0;
+  let priorPage = 0;
+  for (const [index, value] of provenance.entries()) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return;
+    const span = value as Record<string, unknown>;
+    if (
+      !integer(span.page_no, 1, maximumPage) ||
+      Number(span.page_no) < priorPage ||
+      !Array.isArray(span.charspan) ||
+      span.charspan.length !== 2 ||
+      !integer(span.charspan[0], priorEnd, codepoints.length) ||
+      !integer(
+        span.charspan[1],
+        Number(span.charspan[0]) + 1,
+        codepoints.length,
+      ) ||
+      !provenanceWhitespaceOnly(
+        codepoints.slice(priorEnd, Number(span.charspan[0])),
+      )
+    )
+      return;
+    const page = Number(span.page_no);
+    if (!groups.length || groups.at(-1)!.page !== page)
+      groups.push({ page, start: index, end: index + 1 });
+    else groups.at(-1)!.end = index + 1;
+    priorEnd = Number(span.charspan[1]);
+    priorPage = page;
+  }
+  if (
+    groups.length < 2 ||
+    !provenanceWhitespaceOnly(codepoints.slice(priorEnd)) ||
+    groups.some(
+      (group, index) => index > 0 && groups[index - 1]!.page >= group.page,
+    )
+  )
+    return;
+  const slices: RawItemSlice[] = [];
+  for (const [ordinal, group] of groups.entries()) {
+    const first = provenance[group.start] as Record<string, unknown>;
+    const next = provenance[groups[ordinal + 1]?.start ?? -1] as
+      Record<string, unknown> | undefined;
+    const textStart =
+      ordinal === 0 ? 0 : Number((first.charspan as number[])[0]);
+    const textEnd = next
+      ? Number((next.charspan as number[])[0])
+      : codepoints.length;
+    if (!normalizedRawText(codepoints.slice(textStart, textEnd).join("")))
+      return;
+    slices.push({
+      page: group.page,
+      provenanceStart: group.start,
+      provenanceEnd: group.end,
+      textStart,
+      textEnd,
+    });
+  }
+  return slices;
+}
+
+function validateItemSliceLocator(
+  locator: Record<string, unknown>,
+  page: number,
+  maximumPage: number,
+): void {
+  if (
+    !exactKeys(locator, [
+      "kind",
+      "itemRef",
+      "provenance",
+      "provenanceIndexes",
+      "itemTextCharspan",
+      "doclingCharspanSemantics",
+    ]) ||
+    typeof locator.itemRef !== "string" ||
+    !locator.itemRef ||
+    locator.doclingCharspanSemantics !== "item_local_python_codepoints" ||
+    !Array.isArray(locator.provenance) ||
+    locator.provenance.length < 2 ||
+    locator.provenance.length > 256 ||
+    !Array.isArray(locator.provenanceIndexes) ||
+    locator.provenanceIndexes.length !== 2 ||
+    !integer(locator.provenanceIndexes[0], 0, locator.provenance.length - 1) ||
+    !integer(
+      locator.provenanceIndexes[1],
+      Number(locator.provenanceIndexes[0]) + 1,
+      locator.provenance.length,
+    ) ||
+    !Array.isArray(locator.itemTextCharspan) ||
+    locator.itemTextCharspan.length !== 2 ||
+    !integer(locator.itemTextCharspan[0], 0, 10_000_000) ||
+    !integer(
+      locator.itemTextCharspan[1],
+      Number(locator.itemTextCharspan[0]) + 1,
+      10_000_000,
+    )
+  )
+    fail("output_invalid", "item slice locator is invalid");
+  let priorEnd = -1;
+  let priorPage = 0;
+  for (const [index, span] of locator.provenance.entries()) {
+    if (!span || typeof span !== "object" || Array.isArray(span))
+      fail("output_invalid", "item slice provenance is invalid");
+    const record = span as Record<string, unknown>;
+    const spanPage = Number(record.page_no);
+    validateProvenance(record, spanPage);
+    if (
+      !integer(spanPage, 1, maximumPage) ||
+      spanPage < priorPage ||
+      Number((record.charspan as number[])[0]) < priorEnd
+    )
+      fail("output_invalid", "item slice provenance is unordered");
+    const selected =
+      index >= Number(locator.provenanceIndexes[0]) &&
+      index < Number(locator.provenanceIndexes[1]);
+    if (selected !== (spanPage === page))
+      fail("output_invalid", "item slice page selection is invalid");
+    priorEnd = Number((record.charspan as number[])[1]);
+    priorPage = spanPage;
+  }
+}
+
 function validateTableCell(value: unknown): void {
   if (
     !value ||
@@ -1186,17 +1334,29 @@ function validateParserFingerprint(
     config.maxInputBytes !== 16 * 1024 * 1024 ||
     config.maxConversionPages !== 64 ||
     config.outputFormat !== "docling_lossless_canonical_json_v1" ||
-    !integer(config.timeoutSeconds, 1, 150)
+    !integer(config.timeoutSeconds, 1, 480)
   ) {
     fail("output_invalid", "parser fingerprint configuration is invalid");
   }
   return fingerprint(parser, true);
 }
 
+type ExtractionMappingFormat =
+  | "docling_utf16_pages_v1"
+  | "docling_utf16_pages_v2";
+
+type ExtractionConfiguration = {
+  fingerprint: string;
+  mappingFormat: ExtractionMappingFormat;
+  maxPages: 32 | 64;
+  maxRetainedUtf8Bytes: number;
+  maxBundleBytes: number;
+};
+
 function validateExtractionConfigurationFingerprint(
   value: unknown,
   parserFingerprint: string,
-): string {
+): ExtractionConfiguration {
   if (
     !value ||
     typeof value !== "object" ||
@@ -1224,17 +1384,29 @@ function validateExtractionConfigurationFingerprint(
       "maxPages",
       "maxRetainedUtf8Bytes",
       "maxBundleBytes",
-    ]) ||
-    (configuration as Record<string, unknown>).mappingFormat !==
-      "docling_utf16_pages_v1" ||
-    (configuration as Record<string, unknown>).maxPages !== 32 ||
-    (configuration as Record<string, unknown>).maxRetainedUtf8Bytes !==
-      256 * 1024 ||
-    (configuration as Record<string, unknown>).maxBundleBytes !==
-      4 * 1024 * 1024
+    ])
   )
     fail("output_invalid", "extraction configuration is invalid");
-  return fingerprint(descriptor);
+  const config = configuration as Record<string, unknown>;
+  const legacy =
+    config.mappingFormat === "docling_utf16_pages_v1" &&
+    config.maxPages === 32 &&
+    config.maxRetainedUtf8Bytes === 256 * 1024 &&
+    config.maxBundleBytes === 4 * 1024 * 1024;
+  const current =
+    config.mappingFormat === "docling_utf16_pages_v2" &&
+    config.maxPages === 64 &&
+    config.maxRetainedUtf8Bytes === 1024 * 1024 &&
+    config.maxBundleBytes === 4 * 1024 * 1024;
+  if (!legacy && !current)
+    fail("output_invalid", "extraction configuration is invalid");
+  return {
+    fingerprint: fingerprint(descriptor),
+    mappingFormat: config.mappingFormat as ExtractionMappingFormat,
+    maxPages: config.maxPages as 32 | 64,
+    maxRetainedUtf8Bytes: config.maxRetainedUtf8Bytes as number,
+    maxBundleBytes: config.maxBundleBytes as number,
+  };
 }
 
 function validateBundle(
@@ -1245,6 +1417,7 @@ function validateBundle(
 ): {
   parserFingerprint: string;
   extractionConfigurationFingerprint: string;
+  extractionMappingFormat: ExtractionMappingFormat;
   extractionFingerprint: string;
   pageCount: number;
   bundle: ValidatedNormalizedBundle;
@@ -1308,7 +1481,7 @@ function validateBundle(
       "extraction fingerprint is not bound to the raw artifact",
     );
   }
-  const extractionConfigurationFingerprint =
+  const extractionConfiguration =
     validateExtractionConfigurationFingerprint(
       {
         schemaVersion: 1,
@@ -1319,6 +1492,7 @@ function validateBundle(
       },
       parserFingerprint,
     );
+  const extractionConfigurationFingerprint = extractionConfiguration.fingerprint;
   const expectedExtraction = createHash("sha256")
     .update(Buffer.from("kith-parsed-extraction:v1\0", "utf8"))
     .update(
@@ -1335,7 +1509,7 @@ function validateBundle(
   const extractionFingerprint = expectedExtraction;
   if (
     !Array.isArray(bundle.pages) ||
-    !integer(bundle.pages.length, 1, 32) ||
+    !integer(bundle.pages.length, 1, extractionConfiguration.maxPages) ||
     !Array.isArray(bundle.mappingGaps) ||
     bundle.mappingGaps.length > 4096
   ) {
@@ -1361,7 +1535,10 @@ function validateBundle(
     )
       fail("output_invalid", "normalized page is invalid");
     retainedBytes += Buffer.byteLength(pageRecord.text, "utf8");
-    if (retainedBytes > 256 * 1024 || pageRecord.segments.length > 10_000)
+    if (
+      retainedBytes > extractionConfiguration.maxRetainedUtf8Bytes ||
+      pageRecord.segments.length > 10_000
+    )
       fail("output_invalid", "normalized text exceeds its bound");
     const texts: string[] = [];
     let priorEnd = 0;
@@ -1423,6 +1600,8 @@ function validateBundle(
         )
           fail("output_invalid", "item locator is invalid");
         validateItemProvenance(locator.provenance, pageIndex + 1);
+      } else if (locator.kind === "docling_item_slice") {
+        validateItemSliceLocator(locator, pageIndex + 1, bundle.pages.length);
       } else if (locator.kind === "docling_table_row") {
         if (
           !exactKeys(locator, ["kind", "tableProvenance", "cells"]) ||
@@ -1464,6 +1643,7 @@ function validateBundle(
   return {
     parserFingerprint,
     extractionConfigurationFingerprint,
+    extractionMappingFormat: extractionConfiguration.mappingFormat,
     extractionFingerprint,
     pageCount: bundle.pages.length,
     bundle: structuredClone(bundle) as ValidatedNormalizedBundle,
@@ -1482,9 +1662,93 @@ function canonicalIdentity(value: unknown): string {
   return canonicalJson(value).toString("base64");
 }
 
+function bodyTextRefs(raw: Record<string, unknown>): Set<string> {
+  const refs = new Set<string>();
+  if (!raw.body || typeof raw.body !== "object" || Array.isArray(raw.body))
+    fail("output_invalid", "raw body traversal is invalid");
+  const collectionNames = new Set([
+    "groups",
+    "texts",
+    "pictures",
+    "tables",
+    "key_value_items",
+    "form_items",
+    "field_regions",
+    "field_items",
+  ]);
+  const pending: Array<{ value: unknown; ref?: string }> = [
+    { value: raw.body },
+  ];
+  const visited = new Set<string>();
+  let visitedCount = 0;
+  while (pending.length) {
+    const current = pending.pop()!;
+    if (
+      !current.value ||
+      typeof current.value !== "object" ||
+      Array.isArray(current.value)
+    )
+      fail("output_invalid", "raw body traversal is invalid");
+    const node = current.value as Record<string, unknown>;
+    visitedCount += 1;
+    if (visitedCount > MAX_JSON_NODES)
+      fail("output_invalid", "raw body traversal is too large");
+    if (
+      current.ref?.startsWith("#/texts/") &&
+      (node.content_layer === undefined || node.content_layer === "body")
+    )
+      refs.add(current.ref);
+    if (!Array.isArray(node.children))
+      fail("output_invalid", "raw body traversal is invalid");
+    let allowedPictureRefs: Set<string> | undefined;
+    if (current.ref?.startsWith("#/pictures/")) {
+      if (!Array.isArray(node.captions))
+        fail("output_invalid", "raw picture traversal is invalid");
+      allowedPictureRefs = new Set<string>();
+      for (const caption of node.captions) {
+        if (
+          !caption ||
+          typeof caption !== "object" ||
+          Array.isArray(caption) ||
+          typeof (caption as Record<string, unknown>).$ref !== "string"
+        )
+          fail("output_invalid", "raw picture traversal is invalid");
+        allowedPictureRefs.add(
+          (caption as Record<string, unknown>).$ref as string,
+        );
+      }
+    }
+    for (let index = node.children.length - 1; index >= 0; index -= 1) {
+      const child = node.children[index];
+      if (
+        !child ||
+        typeof child !== "object" ||
+        Array.isArray(child) ||
+        typeof (child as Record<string, unknown>).$ref !== "string"
+      )
+        fail("output_invalid", "raw body traversal is invalid");
+      const childRef = (child as Record<string, unknown>).$ref as string;
+      if (allowedPictureRefs && !allowedPictureRefs.has(childRef)) continue;
+      const match = /^#\/([a-z_]+)\/(0|[1-9][0-9]{0,6})$/.exec(childRef);
+      if (!match || !collectionNames.has(match[1]!))
+        fail("output_invalid", "raw body reference is invalid");
+      const collection = raw[match[1]!];
+      const itemIndex = Number(match[2]);
+      if (!Array.isArray(collection) || itemIndex >= collection.length)
+        fail("output_invalid", "raw body reference is invalid");
+      if (visited.has(childRef))
+        fail("output_invalid", "raw body traversal is cyclic");
+      visited.add(childRef);
+      pending.push({ value: collection[itemIndex], ref: childRef });
+    }
+  }
+  return refs;
+}
+
 export function resolveRawLocators(
   rawValue: unknown,
   bundle: ValidatedNormalizedBundle,
+  mappingFormat: ExtractionMappingFormat = "docling_utf16_pages_v1",
 ): Record<string, ResolvedParserLocator> {
   if (!rawValue || typeof rawValue !== "object" || Array.isArray(rawValue))
     fail("output_invalid", "raw parser artifact is invalid");
@@ -1492,6 +1756,7 @@ export function resolveRawLocators(
   if (!Array.isArray(raw.texts) || !Array.isArray(raw.tables))
     fail("output_invalid", "raw parser artifact lacks locator parents");
   const result = Object.create(null) as Record<string, ResolvedParserLocator>;
+  const actualSlices = new Map<string, RawItemSlice[]>();
   for (const page of bundle.pages) {
     for (const segment of page.segments) {
       const locator = segment.locator;
@@ -1525,6 +1790,66 @@ export function resolveRawLocators(
         const index = Number(locator.itemRef.slice("#/texts/".length));
         if (raw.texts[index] !== matches[0])
           fail("output_invalid", "item locator index is inconsistent");
+        result[segment.id] = { kind: "item", ref: locator.itemRef };
+        continue;
+      }
+      if (locator.kind === "docling_item_slice") {
+        const matches = raw.texts.filter((candidate) => {
+          if (
+            !candidate ||
+            typeof candidate !== "object" ||
+            Array.isArray(candidate)
+          )
+            return false;
+          const item = candidate as Record<string, unknown>;
+          if (
+            item.self_ref !== locator.itemRef ||
+            canonicalIdentity(item.prov) !==
+              canonicalIdentity(locator.provenance) ||
+            typeof item.text !== "string"
+          )
+            return false;
+          const expected = rawCrossPageSlices(item, bundle.pages.length);
+          const target: RawItemSlice = {
+            page: page.page,
+            provenanceStart: locator.provenanceIndexes[0],
+            provenanceEnd: locator.provenanceIndexes[1],
+            textStart: locator.itemTextCharspan[0],
+            textEnd: locator.itemTextCharspan[1],
+          };
+          if (
+            !expected?.some(
+              (slice) => canonicalIdentity(slice) === canonicalIdentity(target),
+            )
+          )
+            return false;
+          const codepoints = Array.from(item.text);
+          return (
+            normalizedRawText(
+              codepoints.slice(target.textStart, target.textEnd).join(""),
+            ) === segment.text
+          );
+        });
+        if (
+          matches.length !== 1 ||
+          !/^#\/texts\/(?:0|[1-9][0-9]{0,6})$/.test(locator.itemRef)
+        )
+          fail(
+            "output_invalid",
+            "item slice locator does not bind one raw item",
+          );
+        const index = Number(locator.itemRef.slice("#/texts/".length));
+        if (raw.texts[index] !== matches[0])
+          fail("output_invalid", "item slice locator index is inconsistent");
+        const inventory = actualSlices.get(locator.itemRef) ?? [];
+        inventory.push({
+          page: page.page,
+          provenanceStart: locator.provenanceIndexes[0],
+          provenanceEnd: locator.provenanceIndexes[1],
+          textStart: locator.itemTextCharspan[0],
+          textEnd: locator.itemTextCharspan[1],
+        });
+        actualSlices.set(locator.itemRef, inventory);
         result[segment.id] = { kind: "item", ref: locator.itemRef };
         continue;
       }
@@ -1624,6 +1949,35 @@ export function resolveRawLocators(
       result[segment.id] = { kind: "table", ref: matchingTables[0]!.ref };
     }
   }
+  const expectedSlices = new Map<string, RawItemSlice[]>();
+  const requiredRefs =
+    mappingFormat === "docling_utf16_pages_v2"
+      ? bodyTextRefs(raw)
+      : new Set<string>();
+  for (const ref of actualSlices.keys()) requiredRefs.add(ref);
+  for (const item of raw.texts) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const record = item as Record<string, unknown>;
+    if (typeof record.self_ref !== "string" || !requiredRefs.has(record.self_ref))
+      continue;
+    const slices = rawCrossPageSlices(record, bundle.pages.length);
+    if (!slices) continue;
+    if (
+      typeof record.self_ref !== "string" ||
+      expectedSlices.has(record.self_ref)
+    )
+      fail("output_invalid", "cross-page raw item identity is invalid");
+    expectedSlices.set(record.self_ref, slices);
+  }
+  if (
+    canonicalIdentity(
+      [...actualSlices].sort(([left], [right]) => left.localeCompare(right)),
+    ) !==
+    canonicalIdentity(
+      [...expectedSlices].sort(([left], [right]) => left.localeCompare(right)),
+    )
+  )
+    fail("output_invalid", "cross-page item slice inventory is incomplete");
   const segmentCount = bundle.pages.reduce(
     (count, page) => count + page.segments.length,
     0,
@@ -1648,7 +2002,11 @@ function validateBundleAndRaw(
   );
   return {
     ...validated,
-    resolvedLocators: resolveRawLocators(rawValue, validated.bundle),
+    resolvedLocators: resolveRawLocators(
+      rawValue,
+      validated.bundle,
+      validated.extractionMappingFormat,
+    ),
   };
 }
 
@@ -1704,7 +2062,7 @@ async function removeExact(
 }
 
 function parseLauncherResult(bytes: Buffer): Record<string, unknown> {
-  const value = parseJson(bytes, 16 * 1024);
+  const value = parseBoundedParserJson(bytes, 16 * 1024);
   if (!value || typeof value !== "object" || Array.isArray(value))
     fail("output_invalid", "launcher result is invalid");
   return value as Record<string, unknown>;
@@ -2006,8 +2364,8 @@ export async function inspectCapturedPdfParserOutput(input: {
   const rawSha256 = digest(raw.bytes);
   const bundleSha256 = digest(bundle.bytes);
   const validated = validateBundleAndRaw(
-    parseJson(raw.bytes, limits.maxRawBytes),
-    parseJson(bundle.bytes, limits.maxBundleBytes),
+    parseBoundedParserJson(raw.bytes, limits.maxRawBytes),
+    parseBoundedParserJson(bundle.bytes, limits.maxBundleBytes),
     capture,
     input.expectedModelManifestSha256,
     rawSha256,
@@ -2388,7 +2746,7 @@ export async function preparePdfDocQaProfile(
       "model_lock_mismatch",
       "model lock identity does not match configuration",
     );
-  const modelLockValue = parseJson(modelLock.bytes, MAX_MODEL_LOCK_BYTES);
+  const modelLockValue = parseBoundedParserJson(modelLock.bytes, MAX_MODEL_LOCK_BYTES);
   if (
     !modelLockValue ||
     typeof modelLockValue !== "object" ||
@@ -2496,7 +2854,7 @@ export async function preparePdfDocQaProfile(
       "--model-lock",
       modelLock.canonical,
       "--conversion-timeout-seconds",
-      String(Math.min(150, limits.cpuSeconds)),
+      "480",
     ],
     environment,
     limits,
@@ -2521,7 +2879,7 @@ export async function preparePdfDocQaProfile(
     validateExtractionConfigurationFingerprint(
       result.extractionConfiguration,
       parserFingerprint,
-    );
+    ).fingerprint;
   await recheckDirectory(workRoot, "parser profile work root");
   await recheckDirectory(workDirectory, "parser profile work directory");
   const finalEntries = await opendir(workDirectory.path).catch(() =>
@@ -2641,7 +2999,7 @@ export async function runCapturedPdfParser(
       "model_lock_mismatch",
       "model lock identity does not match configuration",
     );
-  const modelLockValue = parseJson(modelLock.bytes, MAX_MODEL_LOCK_BYTES);
+  const modelLockValue = parseBoundedParserJson(modelLock.bytes, MAX_MODEL_LOCK_BYTES);
   if (
     !modelLockValue ||
     typeof modelLockValue !== "object" ||
@@ -2810,7 +3168,7 @@ export async function runCapturedPdfParser(
         "--model-lock",
         modelLock.canonical,
         "--conversion-timeout-seconds",
-        String(Math.min(150, limits.cpuSeconds)),
+        "480",
       ],
       environment,
       limits,
@@ -2857,10 +3215,10 @@ export async function runCapturedPdfParser(
       launcherResult.modelManifestSha256 !== modelManifestSha256
     )
       fail("output_invalid", "launcher result does not match output bytes");
-    const rawValue = parseJson(raw.bytes, limits.maxRawBytes);
+    const rawValue = parseBoundedParserJson(raw.bytes, limits.maxRawBytes);
     const validated = validateBundleAndRaw(
       rawValue,
-      parseJson(bundle.bytes, limits.maxBundleBytes),
+      parseBoundedParserJson(bundle.bytes, limits.maxBundleBytes),
       capture,
       modelManifestSha256,
       rawSha256,

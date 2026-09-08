@@ -329,7 +329,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--cpu-seconds",
-        type=lambda value: _positive_integer(value, 600),
+        type=lambda value: _positive_integer(value, 1800),
         required=True,
     )
     parser.add_argument(
@@ -351,7 +351,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model-lock")
     parser.add_argument(
         "--conversion-timeout-seconds",
-        type=lambda value: _positive_integer(value, 150),
+        type=lambda value: _positive_integer(value, 480),
     )
     try:
         _configure_machine_stdio()

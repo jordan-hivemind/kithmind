@@ -43,7 +43,10 @@ import {
   requireInlineSourceRevision,
   requireInlineSourceTextVersion,
 } from "../provenance/representations";
-import { verifySealedParsedPayload } from "../provenance/parsedStaging";
+import {
+  MAX_PARSED_CHUNKS,
+  verifySealedParsedPayload,
+} from "../provenance/parsedStaging";
 import { boundedDocumentSize, PayloadReadBudget } from "./payloadBudget";
 import {
   digestDecodedAdmissionEnvelope,
@@ -1411,6 +1414,9 @@ export async function activateGeneration(
     )
       throw new Error("Previous generation is invalid");
     if (embeddingTarget) {
+      const previousChunkLimit = previousGeneration.parserArtifactId
+        ? MAX_PARSED_CHUNKS
+        : MAX_CHUNKS;
       if (parsedBudget) {
         await parsedBudget.finish();
         for await (const row of ctx.db
@@ -1419,7 +1425,7 @@ export async function activateGeneration(
             q.eq("processingGenerationId", previousGenerationId),
           )) {
           boundedDocumentSize(row, 24 * 1024);
-          if (previousChunks.length >= MAX_CHUNKS)
+          if (previousChunks.length >= previousChunkLimit)
             throw new Error("Previous generation exceeds its chunk bound");
           previousChunks.push(row);
           await parsedBudget.finish();
@@ -1430,9 +1436,9 @@ export async function activateGeneration(
           .withIndex("by_processingGenerationId", (q) =>
             q.eq("processingGenerationId", previousGenerationId),
           )
-          .take(MAX_CHUNKS + 1);
+          .take(previousChunkLimit + 1);
       }
-      if (previousChunks.length > MAX_CHUNKS)
+      if (previousChunks.length > previousChunkLimit)
         throw new Error("Previous generation exceeds its chunk bound");
     }
   }

@@ -13,9 +13,13 @@ import { loadArchiveDeletionAck } from "./archiveDeletion";
 
 export const MAX_SOURCE_INLINE_UTF8_BYTES = 65_536;
 export const MAX_SOURCE_PAGES = 32;
+const MAX_PARSED_SOURCE_PAGES = 64;
 export const MAX_EVIDENCE_SPANS = 128;
 export const MAX_GENERATION_DOCUMENTS = 16;
 export const MAX_GENERATION_CHUNKS = 128;
+const MAX_PARSED_GENERATION_CHUNKS = 256;
+const MAX_PARSED_GENERATION_CHUNK_TEXT_UTF8_BYTES = 1_024 * 1_024;
+const MAX_PARSED_TRANSITION_BYTES = 2 * 1_024 * 1_024;
 export const MAX_CHUNK_TEXT_UTF8_BYTES = 16 * 1_024;
 export const MAX_GENERATION_CHUNK_TEXT_UTF8_BYTES = 256 * 1_024;
 export const MAX_STAGING_ROWS = 25;
@@ -217,6 +221,13 @@ function sameLocator(left: EvidenceLocator, right: EvidenceLocator): boolean {
   if (left.kind === "sheet" && right.kind === "sheet") {
     return left.sheet === right.sheet && left.range === right.range;
   }
+  if (left.kind === "parser_page_v1" && right.kind === "parser_page_v1") {
+    return (
+      left.parserArtifactId === right.parserArtifactId &&
+      left.pageNumber === right.pageNumber &&
+      left.pageTextHash === right.pageTextHash
+    );
+  }
   if (left.kind !== "pdf" || right.kind !== "pdf") return false;
   if (left.pageNumber !== right.pageNumber) return false;
   if (left.boundingBox === undefined || right.boundingBox === undefined) {
@@ -325,6 +336,17 @@ function requireLocator(locator: EvidenceLocator): void {
       (locator.bbox.length !== 4 || !locator.bbox.every(Number.isFinite))
     )
       throw new Error("Parser bounding box is invalid");
+    return;
+  }
+  if (locator.kind === "parser_page_v1") {
+    requireIntegerInRange(
+      locator.pageNumber,
+      "Parser page number",
+      1,
+      MAX_PARSED_SOURCE_PAGES,
+    );
+    if (!/^[a-f0-9]{64}$/.test(locator.pageTextHash))
+      throw new Error("Parser page text hash is invalid");
     return;
   }
   if (locator.kind === "parser_table_row_v1") {
@@ -1254,6 +1276,9 @@ export async function activateSourceItemGeneration(
         q.eq("processingGenerationId", generation._id),
       )
       .take(MAX_GENERATION_DOCUMENTS + 1));
+  const chunkLimit = input.verifiedPayload
+    ? MAX_PARSED_GENERATION_CHUNKS
+    : MAX_GENERATION_CHUNKS;
   const nextChunks =
     input.verifiedPayload?.chunks ??
     (await ctx.db
@@ -1261,10 +1286,10 @@ export async function activateSourceItemGeneration(
       .withIndex("by_processingGenerationId", (q) =>
         q.eq("processingGenerationId", generation._id),
       )
-      .take(MAX_GENERATION_CHUNKS + 1));
+      .take(chunkLimit + 1));
   if (
     nextDocuments.length > MAX_GENERATION_DOCUMENTS ||
-    nextChunks.length > MAX_GENERATION_CHUNKS
+    nextChunks.length > chunkLimit
   ) {
     throw new Error("Generation payload exceeds activation bounds");
   }
@@ -1285,9 +1310,12 @@ export async function activateSourceItemGeneration(
     (bytes, chunk) => bytes + utf8Length(chunk.text),
     0,
   );
-  if (nextChunkTextBytes > MAX_GENERATION_CHUNK_TEXT_UTF8_BYTES) {
+  const chunkTextLimit = input.verifiedPayload
+    ? MAX_PARSED_GENERATION_CHUNK_TEXT_UTF8_BYTES
+    : MAX_GENERATION_CHUNK_TEXT_UTF8_BYTES;
+  if (nextChunkTextBytes > chunkTextLimit) {
     throw new Error(
-      `Generation exceeds ${MAX_GENERATION_CHUNK_TEXT_UTF8_BYTES} chunk text bytes`,
+      `Generation exceeds ${chunkTextLimit} chunk text bytes`,
     );
   }
   const previousGenerationId = item.activeGenerationId;
@@ -1302,6 +1330,12 @@ export async function activateSourceItemGeneration(
         "Previous active generation belongs to another source item",
       );
     }
+    const previousChunkLimit = previousGeneration.parserArtifactId
+      ? MAX_PARSED_GENERATION_CHUNKS
+      : MAX_GENERATION_CHUNKS;
+    const previousChunkTextLimit = previousGeneration.parserArtifactId
+      ? MAX_PARSED_GENERATION_CHUNK_TEXT_UTF8_BYTES
+      : MAX_GENERATION_CHUNK_TEXT_UTF8_BYTES;
     let previousDocuments: Doc<"documents">[];
     let previousChunks: Doc<"chunks">[];
     if (input.payloadReadBudget) {
@@ -1317,7 +1351,7 @@ export async function activateSourceItemGeneration(
         transitionBytes += input.payloadReadBudget.measureRow(row, 16 * 1024);
         if (
           !Number.isSafeInteger(transitionBytes) ||
-          transitionBytes > 1024 * 1024 ||
+          transitionBytes > MAX_PARSED_TRANSITION_BYTES ||
           previousDocuments.length >= MAX_GENERATION_DOCUMENTS
         )
           throw new Error(
@@ -1334,8 +1368,8 @@ export async function activateSourceItemGeneration(
         transitionBytes += input.payloadReadBudget.measureRow(row, 24 * 1024);
         if (
           !Number.isSafeInteger(transitionBytes) ||
-          transitionBytes > 1024 * 1024 ||
-          previousChunks.length >= MAX_GENERATION_CHUNKS
+          transitionBytes > MAX_PARSED_TRANSITION_BYTES ||
+          previousChunks.length >= previousChunkLimit
         )
           throw new Error(
             "Previous generation payload exceeds activation bounds",
@@ -1355,11 +1389,11 @@ export async function activateSourceItemGeneration(
         .withIndex("by_processingGenerationId", (q) =>
           q.eq("processingGenerationId", previousGenerationId),
         )
-        .take(MAX_GENERATION_CHUNKS + 1);
+        .take(previousChunkLimit + 1);
     }
     if (
       previousDocuments.length > MAX_GENERATION_DOCUMENTS ||
-      previousChunks.length > MAX_GENERATION_CHUNKS
+      previousChunks.length > previousChunkLimit
     ) {
       throw new Error("Previous generation payload exceeds activation bounds");
     }
@@ -1367,9 +1401,9 @@ export async function activateSourceItemGeneration(
       (bytes, chunk) => bytes + utf8Length(chunk.text),
       0,
     );
-    if (previousChunkTextBytes > MAX_GENERATION_CHUNK_TEXT_UTF8_BYTES) {
+    if (previousChunkTextBytes > previousChunkTextLimit) {
       throw new Error(
-        `Previous generation exceeds ${MAX_GENERATION_CHUNK_TEXT_UTF8_BYTES} chunk text bytes`,
+        `Previous generation exceeds ${previousChunkTextLimit} chunk text bytes`,
       );
     }
     for (const document of previousDocuments) {

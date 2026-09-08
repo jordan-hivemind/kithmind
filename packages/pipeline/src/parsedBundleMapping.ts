@@ -13,7 +13,8 @@ import {
 } from "@repo/worker-protocol";
 
 const CHUNK_TARGET_BYTES = 8_192;
-const MAX_TEXT_BYTES = 262_144;
+const LEGACY_MAX_TEXT_BYTES = 262_144;
+const MAX_TEXT_BYTES = 1024 * 1024;
 const DOCUMENT_KEY = "pdf:primary";
 
 function sha256(text: string): string {
@@ -21,13 +22,25 @@ function sha256(text: string): string {
 }
 
 /** A bounded initial policy, not a claim of optimal retrieval quality. */
-export const PDF_DOCQA_CHUNKING_FINGERPRINT = sha256(
+export const PDF_DOCQA_LEGACY_CHUNKING_FINGERPRINT = sha256(
   JSON.stringify([
     "pdf_docqa_chunks_v1",
     CHUNK_TARGET_BYTES,
     "page_local_nonoverlapping_unicode_scalars",
     "direct_page_concatenation",
     "merge_uncited_separator_tail",
+  ]),
+);
+
+export const PDF_DOCQA_CHUNKING_FINGERPRINT = sha256(
+  JSON.stringify([
+    "pdf_docqa_page_chunks_v2",
+    CHUNK_TARGET_BYTES,
+    "page_local_nonoverlapping_unicode_scalars",
+    "one_parser_page_evidence_per_chunk",
+    64,
+    MAX_TEXT_BYTES,
+    256,
   ]),
 );
 
@@ -126,6 +139,65 @@ function locator(
       sourceCharEnd: previousEnd,
     };
   }
+  if (input.kind === "docling_item_slice") {
+    if (
+      resolved.kind !== "item" ||
+      input.itemRef !== resolved.ref ||
+      input.doclingCharspanSemantics !== "item_local_python_codepoints" ||
+      !Array.isArray(input.provenance) ||
+      input.provenance.length < 2 ||
+      input.provenance.length > 256 ||
+      !Array.isArray(input.provenanceIndexes) ||
+      input.provenanceIndexes.length !== 2 ||
+      !Array.isArray(input.itemTextCharspan) ||
+      input.itemTextCharspan.length !== 2
+    )
+      fail();
+    const provenance = input.provenance.map(object);
+    const provenanceStart = Number(input.provenanceIndexes[0]);
+    const provenanceEnd = Number(input.provenanceIndexes[1]);
+    const sourceStart = Number(input.itemTextCharspan[0]);
+    const sourceEnd = Number(input.itemTextCharspan[1]);
+    if (
+      !Number.isInteger(provenanceStart) ||
+      !Number.isInteger(provenanceEnd) ||
+      provenanceStart < 0 ||
+      provenanceEnd <= provenanceStart ||
+      provenanceEnd > provenance.length ||
+      !Number.isInteger(sourceStart) ||
+      !Number.isInteger(sourceEnd) ||
+      sourceStart < 0 ||
+      sourceEnd <= sourceStart
+    )
+      fail();
+    let priorEnd = -1;
+    let priorPage = 0;
+    for (const [index, span] of provenance.entries()) {
+      if (
+        !Number.isInteger(span.page_no) ||
+        Number(span.page_no) < priorPage ||
+        !Array.isArray(span.charspan) ||
+        span.charspan.length !== 2 ||
+        !span.charspan.every(
+          (offset: unknown) => Number.isInteger(offset) && Number(offset) >= 0,
+        ) ||
+        Number(span.charspan[0]) >= Number(span.charspan[1]) ||
+        Number(span.charspan[0]) < priorEnd ||
+        (index >= provenanceStart && index < provenanceEnd) !==
+          (span.page_no === pageNumber)
+      )
+        fail();
+      priorEnd = Number(span.charspan[1]);
+      priorPage = Number(span.page_no);
+    }
+    return {
+      kind: "parser_item_v1",
+      pageNumber,
+      itemRef: resolved.ref,
+      sourceCharStart: sourceStart,
+      sourceCharEnd: sourceEnd,
+    };
+  }
   if (input.kind !== "docling_table_row" || resolved.kind !== "table") fail();
   if (
     object(input.tableProvenance).page_no !== pageNumber ||
@@ -183,10 +255,7 @@ function references(
     }));
 }
 
-function pageChunks(
-  page: ParsedPageInput,
-  evidence: ParsedEvidenceInput[],
-): ParsedChunkInput[] {
+function pageChunkRanges(page: ParsedPageInput) {
   const ranges: Array<{ start: number; end: number }> = [];
   let start = 0;
   let end = 0;
@@ -202,6 +271,14 @@ function pageChunks(
     bytes += length;
   }
   if (end > start) ranges.push({ start, end });
+  return ranges;
+}
+
+function legacyPageChunks(
+  page: ParsedPageInput,
+  evidence: ParsedEvidenceInput[],
+): ParsedChunkInput[] {
+  const ranges = pageChunkRanges(page);
   const last = ranges.at(-1);
   if (
     last &&
@@ -239,13 +316,19 @@ export async function mapParsedBundle(input: {
   resolvedLocators: Record<string, ResolvedParserLocator>;
   title: string;
   capturedAt: number;
+  chunkingFingerprint: string;
 }) {
   try {
+    const legacy =
+      input.chunkingFingerprint === PDF_DOCQA_LEGACY_CHUNKING_FINGERPRINT;
+    if (!legacy && input.chunkingFingerprint !== PDF_DOCQA_CHUNKING_FINGERPRINT)
+      fail();
     const bundle = object(input.bundle);
     if (!Array.isArray(bundle.pages) || !Array.isArray(bundle.mappingGaps))
       fail();
     if (bundle.mappingGaps.length) fail("mapping_gap");
-    if (!bundle.pages.length || bundle.pages.length > 32) fail("mapping_limit");
+    if (!bundle.pages.length || bundle.pages.length > (legacy ? 32 : 64))
+      fail("mapping_limit");
     const pages: ParsedPageInput[] = [];
     const evidence: ParsedEvidenceInput[] = [];
     const seen = new Set<string>();
@@ -258,7 +341,7 @@ export async function mapParsedBundle(input: {
       if (page.page !== ordinal + 1 || !Array.isArray(page.segments)) fail();
       textBytes += Buffer.byteLength(pageText, "utf8");
       if (
-        textBytes > MAX_TEXT_BYTES ||
+        textBytes > (legacy ? LEGACY_MAX_TEXT_BYTES : MAX_TEXT_BYTES) ||
         Buffer.byteLength(pageText, "utf8") > 65_536
       )
         fail("mapping_limit");
@@ -297,17 +380,24 @@ export async function mapParsedBundle(input: {
           (resolved.kind !== "item" && resolved.kind !== "table")
         )
           fail();
-        evidence.push(
-          parseParsedEvidenceInput({
-            ordinal: evidence.length,
-            pageOrdinal: ordinal,
-            start: expectedStart,
-            end: expectedStart + segmentText.length,
-            quoteHash: sha256(segmentText),
-            locator: locator(object(segment.locator), resolved, ordinal + 1),
-          }),
+        const sourceLocator = locator(
+          object(segment.locator),
+          resolved,
+          ordinal + 1,
         );
-        if (evidence.length > 128) fail("mapping_limit");
+        if (legacy) {
+          evidence.push(
+            parseParsedEvidenceInput({
+              ordinal: evidence.length,
+              pageOrdinal: ordinal,
+              start: expectedStart,
+              end: expectedStart + segmentText.length,
+              quoteHash: sha256(segmentText),
+              locator: sourceLocator,
+            }),
+          );
+          if (evidence.length > 128) fail("mapping_limit");
+        }
         expectedStart += segmentText.length + 1;
         segmentTexts.push(segmentText);
       }
@@ -316,13 +406,58 @@ export async function mapParsedBundle(input: {
     if (
       Object.keys(input.resolvedLocators).length !== seen.size ||
       !completeText ||
-      !evidence.length
+      (legacy && !evidence.length)
     )
       fail();
-    const chunks = pages
-      .flatMap((page) => pageChunks(page, evidence))
-      .map((chunk, ordinal) => parseParsedChunkInput({ ...chunk, ordinal }));
-    if (!chunks.length || chunks.length > 128) fail("mapping_limit");
+    let chunks: ParsedChunkInput[];
+    if (legacy) {
+      chunks = pages
+        .flatMap((page) => legacyPageChunks(page, evidence))
+        .map((chunk, ordinal) => parseParsedChunkInput({ ...chunk, ordinal }));
+    } else {
+      const pendingChunks: ParsedChunkInput[] = [];
+      for (const page of pages) {
+        for (const range of pageChunkRanges(page)) {
+          const chunkText = page.text.slice(range.start, range.end);
+          const evidenceOrdinal = evidence.length;
+          evidence.push(
+            parseParsedEvidenceInput({
+              ordinal: evidenceOrdinal,
+              pageOrdinal: page.ordinal,
+              start: range.start,
+              end: range.end,
+              quoteHash: sha256(chunkText),
+              locator: {
+                kind: "parser_page_v1",
+                pageNumber: page.ordinal + 1,
+                pageTextHash: page.textHash,
+              },
+            }),
+          );
+          pendingChunks.push(
+            parseParsedChunkInput({
+              documentKey: DOCUMENT_KEY,
+              ordinal: pendingChunks.length,
+              start: page.start + range.start,
+              end: page.start + range.end,
+              text: chunkText,
+              evidence: [
+                { pageOrdinal: page.ordinal, evidenceOrdinal },
+              ],
+            }),
+          );
+        }
+      }
+      chunks = pendingChunks;
+    }
+    const countLimit = legacy ? 128 : 256;
+    if (
+      !chunks.length ||
+      chunks.length > countLimit ||
+      !evidence.length ||
+      evidence.length > countLimit
+    )
+      fail("mapping_limit");
     const documents = [
       parseParsedDocumentInput({
         documentKey: DOCUMENT_KEY,
@@ -344,7 +479,7 @@ export async function mapParsedBundle(input: {
       textHash: sha256(completeText),
       textUtf8Length: textBytes,
       textUtf16Length: completeText.length,
-      chunkingFingerprint: PDF_DOCQA_CHUNKING_FINGERPRINT,
+      chunkingFingerprint: input.chunkingFingerprint,
     };
   } catch (error) {
     if (error instanceof ParsedBundleMappingError) throw error;
