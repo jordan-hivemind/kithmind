@@ -87,7 +87,7 @@ function copy(role, seed) {
           restic: {
             operationId: randomUUID(),
             host: `host_${seed}`,
-            repositoryId: `repository_${seed}`,
+            repositoryId: hash(seed),
           },
         }
       : {}),
@@ -415,7 +415,7 @@ async function completeProcessingAdmission(catalog, row, originalRow) {
         role,
         backup: {
           operationId: row.copies[role].restic.operationId,
-          snapshotId: "snapshot_1",
+          snapshotId: hash("1"),
           objectName: row.copies[role].objectName,
           ciphertext,
           resticVersion: "0.19.1",
@@ -491,6 +491,31 @@ test("reuses one catalog instance and durable original identity across scans", a
   }
 });
 
+test("opens a legacy catalog with no boundary relocation field", async () => {
+  const f = await setup();
+  let journal = f.journal;
+  try {
+    await f.catalog.createOriginalIntent(original());
+    await journal.close();
+    const path = join(f.directory, "archive-catalog.json");
+    const legacy = JSON.parse(await readFile(path, "utf8"));
+    delete legacy.boundaryRelocations;
+    await writeFile(path, JSON.stringify(legacy), { mode: 0o600 });
+    journal = await Journal.open({
+      directory: f.directory,
+      binding: f.authority,
+      credential: "km_synthetic_high_entropy_credential",
+      initialCheckpoint: { version: 1, phase: "idle" },
+      codec,
+    });
+    const catalog = await openArchiveCatalog({ journal });
+    assert.equal(catalog.listOriginals().length, 1);
+  } finally {
+    await journal.close();
+    await rm(f.directory, { recursive: true, force: true });
+  }
+});
+
 test("a stable catalog ID cannot be redirected to another existing identity", async () => {
   const f = await setup();
   try {
@@ -524,6 +549,199 @@ test("a stable catalog ID cannot be redirected to another existing identity", as
       (error) =>
         error instanceof ArchiveCatalogError &&
         error.code === "catalog_conflict",
+    );
+  } finally {
+    await f.journal.close();
+    await rm(f.directory, { recursive: true, force: true });
+  }
+});
+
+test("persists an exact root-path-only boundary relocation for the complete live catalog inventory", async () => {
+  const f = await setup();
+  let journal = f.journal;
+  try {
+    const originalRow = await f.catalog.createOriginalIntent(original());
+    let processingRow = await f.catalog.createProcessingIntent(
+      processing(originalRow.originalCatalogId),
+    );
+    processingRow = await completeProcessingAdmission(
+      f.catalog,
+      processingRow,
+      originalRow,
+    );
+    const backup = processingRow.copies.independent_backup.backup;
+    const oldBoundary = backup.boundary;
+    const newBoundary = {
+      ...oldBoundary,
+      rootPath: "Kith Mind/backups/processing-artifacts/restic-v1",
+    };
+    const artifact = {
+      snapshotId: backup.snapshotId,
+      objectName: backup.objectName,
+      ciphertextSha256: backup.ciphertext.sha256,
+      ciphertextByteLength: backup.ciphertext.byteLength,
+    };
+    const input = {
+      relocationId: randomUUID(),
+      oldBoundary,
+      newBoundary,
+      artifacts: [artifact],
+      verifiedAt: 50,
+    };
+    const recorded = await f.catalog.recordBoundaryRelocation(input);
+    assert.deepEqual(recorded, input);
+    assert.deepEqual(
+      await f.catalog.recordBoundaryRelocation(input),
+      recorded,
+      "an exact retry is idempotent",
+    );
+    assert.equal(
+      f.catalog.resolvesBoundaryRelocation({
+        oldBoundary,
+        newBoundary,
+        artifact,
+      }),
+      true,
+    );
+    assert.equal(
+      f.catalog.resolvesBoundaryRelocation({
+        oldBoundary,
+        newBoundary,
+        artifact: { ...artifact, snapshotId: hash("2") },
+      }),
+      false,
+      "an uninventoried snapshot is not covered by the path alias",
+    );
+    assert.equal(
+      f.catalog.resolvesBoundaryRelocation({
+        oldBoundary: newBoundary,
+        newBoundary: oldBoundary,
+        artifact,
+      }),
+      false,
+      "the mapping cannot be used in reverse",
+    );
+
+    await journal.close();
+    journal = await Journal.open({
+      directory: f.directory,
+      binding: f.authority,
+      credential: "km_synthetic_high_entropy_credential",
+      initialCheckpoint: { version: 1, phase: "idle" },
+      codec,
+    });
+    const reopened = await openArchiveCatalog({ journal });
+    assert.equal(
+      reopened.resolvesBoundaryRelocation({
+        oldBoundary,
+        newBoundary,
+        artifact,
+      }),
+      true,
+      "the append-only mapping survives catalog reopen",
+    );
+  } finally {
+    await journal.close();
+    await rm(f.directory, { recursive: true, force: true });
+  }
+});
+
+test("rejects boundary relocation tampering and incomplete or invented inventories", async () => {
+  const f = await setup();
+  try {
+    const originalRow = await f.catalog.createOriginalIntent(original());
+    let processingRow = await f.catalog.createProcessingIntent(
+      processing(originalRow.originalCatalogId),
+    );
+    processingRow = await completeProcessingAdmission(
+      f.catalog,
+      processingRow,
+      originalRow,
+    );
+    let secondProcessing = await f.catalog.createProcessingIntent(
+      processing(originalRow.originalCatalogId, { processingEpoch: 2 }),
+    );
+    secondProcessing = await completeProcessingAdmission(
+      f.catalog,
+      secondProcessing,
+      originalRow,
+    );
+    const backup = processingRow.copies.independent_backup.backup;
+    const secondBackup = secondProcessing.copies.independent_backup.backup;
+    const oldBoundary = backup.boundary;
+    const newBoundary = {
+      ...oldBoundary,
+      rootPath: "Kith Mind/backups/processing-artifacts/restic-v1",
+    };
+    const artifact = {
+      snapshotId: backup.snapshotId,
+      objectName: backup.objectName,
+      ciphertextSha256: backup.ciphertext.sha256,
+      ciphertextByteLength: backup.ciphertext.byteLength,
+    };
+    const secondArtifact = {
+      snapshotId: secondBackup.snapshotId,
+      objectName: secondBackup.objectName,
+      ciphertextSha256: secondBackup.ciphertext.sha256,
+      ciphertextByteLength: secondBackup.ciphertext.byteLength,
+    };
+    const completeArtifacts = [artifact, secondArtifact].sort((left, right) =>
+      JSON.stringify(left).localeCompare(JSON.stringify(right)),
+    );
+    const base = {
+      relocationId: randomUUID(),
+      oldBoundary,
+      newBoundary,
+      artifacts: completeArtifacts,
+      verifiedAt: 50,
+    };
+    for (const changed of [
+      { remoteName: "other_remote" },
+      { rootDirectoryIdHash: hash("e") },
+      { configIdentityFingerprint: hash("f") },
+      { repositoryId: hash("e") },
+      { resticVersion: "0.18.0" },
+      { rcloneVersion: "v1.73.0" },
+    ]) {
+      await assert.rejects(
+        () =>
+          f.catalog.recordBoundaryRelocation({
+            ...base,
+            newBoundary: { ...newBoundary, ...changed },
+          }),
+        (error) =>
+          error instanceof ArchiveCatalogError &&
+          error.code === "invalid_input",
+      );
+    }
+    for (const artifacts of [
+      [],
+      [artifact],
+      [...completeArtifacts, { ...artifact, snapshotId: hash("2") }],
+    ]) {
+      await assert.rejects(
+        () => f.catalog.recordBoundaryRelocation({ ...base, artifacts }),
+        (error) =>
+          error instanceof ArchiveCatalogError &&
+          (error.code === "invalid_input" || error.code === "catalog_conflict"),
+      );
+    }
+    const recorded = await f.catalog.recordBoundaryRelocation(base);
+    await assert.rejects(
+      () =>
+        f.catalog.recordBoundaryRelocation({
+          ...base,
+          relocationId: randomUUID(),
+          oldBoundary: recorded.newBoundary,
+          newBoundary: {
+            ...recorded.newBoundary,
+            rootPath: "Kith Mind/future/processing-artifacts/restic-v1",
+          },
+        }),
+      (error) =>
+        error instanceof ArchiveCatalogError &&
+        error.code === "catalog_conflict",
+      "relocation chains require a separate reviewed design",
     );
   } finally {
     await f.journal.close();

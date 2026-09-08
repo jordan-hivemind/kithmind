@@ -11,6 +11,8 @@ import {
 import { basename, join } from "node:path";
 
 import type {
+  ArchiveBoundaryRelocation,
+  ArchiveBoundaryRelocationArtifact,
   ArchiveCatalogSnapshot,
   ArchiveCopyRecord,
   ArchiveDeletionTarget,
@@ -23,10 +25,16 @@ import type {
   ProcessingCatalogIdentity,
   ProcessingCatalogRow,
 } from "./archiveCatalogTypes.js";
+import {
+  ArchiveBoundaryRelocationError,
+  assertRootPathOnlyBoundaryRelocation,
+  relocationAuthorizesArtifact,
+} from "./archiveBoundaryRelocation.js";
 import type {
   PreparedAgeObject,
   PublishedAgeObject,
   RecoveredResticBackup,
+  RemoteBackupBoundary,
   ResticBackupResult,
 } from "./archiveTypes.js";
 import { Journal } from "./journal.js";
@@ -40,6 +48,7 @@ const MAX_JSON_DEPTH = 48;
 const MAX_JSON_NODES = 100_000;
 const MAX_ORIGINALS = 256;
 const MAX_PROCESSINGS = 512;
+const MAX_BOUNDARY_RELOCATIONS = 16;
 const MAX_DIRECTORY_ENTRIES = 64;
 const TEMP_FILE = /^\.archive-catalog\.json\.[0-9a-f-]{36}\.tmp$/;
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -431,6 +440,57 @@ function remoteBoundary(value: unknown, repositoryId: string) {
     resticVersion: "0.19.1" as const,
     rcloneVersion: "v1.74.4" as const,
   };
+}
+
+function relocationArtifact(value: unknown): ArchiveBoundaryRelocationArtifact {
+  const row = object(value);
+  exact(row, [
+    "snapshotId",
+    "objectName",
+    "ciphertextSha256",
+    "ciphertextByteLength",
+  ]);
+  return {
+    snapshotId: sha(row.snapshotId),
+    objectName: string(row.objectName, 128, OPAQUE_NAME),
+    ciphertextSha256: sha(row.ciphertextSha256),
+    ciphertextByteLength: integer(
+      row.ciphertextByteLength,
+      1,
+      64 * 1024 * 1024,
+    ),
+  };
+}
+
+function boundaryRelocation(value: unknown): ArchiveBoundaryRelocation {
+  const row = object(value);
+  exact(row, [
+    "relocationId",
+    "oldBoundary",
+    "newBoundary",
+    "artifacts",
+    "verifiedAt",
+  ]);
+  if (!Array.isArray(row.artifacts) || row.artifacts.length > 2_048)
+    fail("catalog_invalid");
+  const oldRecord = object(row.oldBoundary);
+  const newRecord = object(row.newBoundary);
+  const oldRepositoryId = sha(oldRecord.repositoryId);
+  const newRepositoryId = sha(newRecord.repositoryId);
+  if (oldRepositoryId !== newRepositoryId) fail("catalog_invalid");
+  try {
+    return assertRootPathOnlyBoundaryRelocation({
+      relocationId: uuid(row.relocationId),
+      oldBoundary: remoteBoundary(oldRecord, oldRepositoryId),
+      newBoundary: remoteBoundary(newRecord, newRepositoryId),
+      artifacts: row.artifacts.map(relocationArtifact),
+      verifiedAt: integer(row.verifiedAt),
+    });
+  } catch (error) {
+    if (error instanceof ArchiveBoundaryRelocationError)
+      fail("catalog_invalid");
+    throw error;
+  }
 }
 
 function deletion(value: unknown) {
@@ -993,20 +1053,21 @@ function processingRow(value: unknown): ProcessingCatalogRow {
 
 function parseSnapshot(value: unknown, authorityDigest: string) {
   const row = object(normalizeJson(value));
-  exact(row, [
-    "version",
-    "revision",
-    "authorityDigest",
-    "originals",
-    "processings",
-  ]);
+  exact(
+    row,
+    ["version", "revision", "authorityDigest", "originals", "processings"],
+    ["boundaryRelocations"],
+  );
   if (
     row.version !== 1 ||
     row.authorityDigest !== authorityDigest ||
     !Array.isArray(row.originals) ||
     !Array.isArray(row.processings) ||
     row.originals.length > MAX_ORIGINALS ||
-    row.processings.length > MAX_PROCESSINGS
+    row.processings.length > MAX_PROCESSINGS ||
+    (row.boundaryRelocations !== undefined &&
+      (!Array.isArray(row.boundaryRelocations) ||
+        row.boundaryRelocations.length > MAX_BOUNDARY_RELOCATIONS))
   )
     fail("catalog_invalid");
   const snapshot: ArchiveCatalogSnapshot = {
@@ -1015,6 +1076,10 @@ function parseSnapshot(value: unknown, authorityDigest: string) {
     authorityDigest,
     originals: row.originals.map(originalRow),
     processings: row.processings.map(processingRow),
+    boundaryRelocations:
+      row.boundaryRelocations === undefined
+        ? []
+        : row.boundaryRelocations.map(boundaryRelocation),
   };
   const originalIds = new Set<string>();
   const processingIds = new Set<string>();
@@ -1071,6 +1136,35 @@ function parseSnapshot(value: unknown, authorityDigest: string) {
       }
       if (objectNames.has(copy.objectName)) fail("catalog_invalid");
       objectNames.add(copy.objectName);
+    }
+  }
+  const relocationIds = new Set<string>();
+  const oldBoundaries = new Set<string>();
+  const newBoundaries = new Set<string>();
+  for (const relocation of snapshot.boundaryRelocations) {
+    if (
+      relocationIds.has(relocation.relocationId) ||
+      oldBoundaries.has(JSON.stringify(relocation.oldBoundary)) ||
+      newBoundaries.has(JSON.stringify(relocation.newBoundary)) ||
+      oldBoundaries.has(JSON.stringify(relocation.newBoundary)) ||
+      newBoundaries.has(JSON.stringify(relocation.oldBoundary))
+    )
+      fail("catalog_invalid");
+    relocationIds.add(relocation.relocationId);
+    oldBoundaries.add(JSON.stringify(relocation.oldBoundary));
+    newBoundaries.add(JSON.stringify(relocation.newBoundary));
+    const copies = snapshotCopies(snapshot);
+    for (const artifact of relocation.artifacts) {
+      if (
+        copies.filter((copy) =>
+          copyMatchesRelocationArtifact(
+            copy,
+            relocation.oldBoundary,
+            artifact,
+          ),
+        ).length !== 1
+      )
+        fail("catalog_invalid");
     }
   }
   return snapshot;
@@ -1131,6 +1225,73 @@ function equal(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+function isRemoteBoundary(
+  value: ResticBackupResult["boundary"] | undefined,
+): value is RemoteBackupBoundary {
+  return (
+    value !== undefined &&
+    "backend" in value &&
+    value.backend === "rclone_dropbox_v1"
+  );
+}
+
+function relocationArtifactForCopy(
+  copy: ArchiveCopyRecord,
+  boundary: RemoteBackupBoundary,
+): ArchiveBoundaryRelocationArtifact | undefined {
+  if (
+    !copy.backup ||
+    !isRemoteBoundary(copy.backup.boundary) ||
+    !equal(copy.backup.boundary, boundary) ||
+    copy.deletion?.state === "complete"
+  )
+    return undefined;
+  if (copy.deletion?.state === "pending") fail("invalid_transition");
+  return {
+    snapshotId: copy.backup.snapshotId,
+    objectName: copy.backup.objectName,
+    ciphertextSha256: copy.backup.ciphertext.sha256,
+    ciphertextByteLength: copy.backup.ciphertext.byteLength,
+  };
+}
+
+function copyMatchesRelocationArtifact(
+  copy: ArchiveCopyRecord,
+  boundary: RemoteBackupBoundary,
+  artifact: ArchiveBoundaryRelocationArtifact,
+): boolean {
+  return (
+    copy.backup !== undefined &&
+    isRemoteBoundary(copy.backup.boundary) &&
+    equal(copy.backup.boundary, boundary) &&
+    copy.backup.snapshotId === artifact.snapshotId &&
+    copy.backup.objectName === artifact.objectName &&
+    copy.backup.ciphertext.sha256 === artifact.ciphertextSha256 &&
+    copy.backup.ciphertext.byteLength === artifact.ciphertextByteLength
+  );
+}
+
+function snapshotCopies(snapshot: ArchiveCatalogSnapshot): ArchiveCopyRecord[] {
+  return [
+    ...snapshot.originals.flatMap((original) => [
+      ...Object.values(original.copies),
+      ...(original.providerOriginal === undefined
+        ? []
+        : [original.providerOriginal.locator]),
+    ]),
+    ...snapshot.processings.flatMap((processing) =>
+      Object.values(processing.copies),
+    ),
+  ];
+}
+
+function artifactOrder(
+  left: ArchiveBoundaryRelocationArtifact,
+  right: ArchiveBoundaryRelocationArtifact,
+): number {
+  return JSON.stringify(left).localeCompare(JSON.stringify(right));
+}
+
 type StoredCatalog = {
   value: unknown;
   identity: { device: number; inode: number; size: number; sha256: string };
@@ -1188,6 +1349,7 @@ export class ArchiveCatalog {
       authorityDigest: digest,
       originals: [],
       processings: [],
+      boundaryRelocations: [],
     });
     await catalog.enter(async () => {
       await catalog.cleanTemps();
@@ -1454,6 +1616,109 @@ export class ArchiveCatalog {
   listProcessings(): ProcessingCatalogRow[] {
     this.assertUsable();
     return structuredClone(this.snapshot.processings);
+  }
+
+  /**
+   * Records one verified physical root-path relocation without rewriting any
+   * historical archive receipt. The supplied inventory must be the complete
+   * set of still-live catalog objects at the old boundary.
+   */
+  async recordBoundaryRelocation(args: {
+    relocationId: string;
+    oldBoundary: RemoteBackupBoundary;
+    newBoundary: RemoteBackupBoundary;
+    artifacts: ArchiveBoundaryRelocationArtifact[];
+    verifiedAt: number;
+  }): Promise<ArchiveBoundaryRelocation> {
+    return await this.enter(async () => {
+      let candidate: ArchiveBoundaryRelocation;
+      try {
+        candidate = assertRootPathOnlyBoundaryRelocation(args);
+      } catch (error) {
+        if (error instanceof ArchiveBoundaryRelocationError)
+          fail("invalid_input");
+        throw error;
+      }
+      const sameId = this.snapshot.boundaryRelocations.find(
+        (relocation) => relocation.relocationId === candidate.relocationId,
+      );
+      if (sameId) {
+        if (equal(sameId, candidate)) return structuredClone(sameId);
+        fail("catalog_conflict");
+      }
+      if (
+        this.snapshot.boundaryRelocations.some(
+          (relocation) =>
+            equal(relocation.oldBoundary, candidate.oldBoundary) ||
+            equal(relocation.newBoundary, candidate.newBoundary) ||
+            equal(relocation.oldBoundary, candidate.newBoundary) ||
+            equal(relocation.newBoundary, candidate.oldBoundary),
+        )
+      )
+        fail("catalog_conflict");
+      if (
+        this.snapshot.boundaryRelocations.length >= MAX_BOUNDARY_RELOCATIONS
+      )
+        fail("catalog_capacity_exceeded");
+
+      const catalogArtifacts: ArchiveBoundaryRelocationArtifact[] = [];
+      for (const original of this.snapshot.originals) {
+        for (const copy of Object.values(original.copies)) {
+          const artifact = relocationArtifactForCopy(
+            copy,
+            candidate.oldBoundary,
+          );
+          if (artifact) catalogArtifacts.push(artifact);
+        }
+        if (original.providerOriginal) {
+          const artifact = relocationArtifactForCopy(
+            original.providerOriginal.locator,
+            candidate.oldBoundary,
+          );
+          if (artifact) catalogArtifacts.push(artifact);
+        }
+      }
+      for (const processing of this.snapshot.processings) {
+        for (const copy of Object.values(processing.copies)) {
+          const artifact = relocationArtifactForCopy(
+            copy,
+            candidate.oldBoundary,
+          );
+          if (artifact) catalogArtifacts.push(artifact);
+        }
+      }
+      catalogArtifacts.sort(artifactOrder);
+      if (!equal(catalogArtifacts, candidate.artifacts))
+        fail("catalog_conflict");
+
+      const next = parseSnapshot(
+        {
+          ...this.snapshot,
+          revision: this.snapshot.revision + 1,
+          boundaryRelocations: [
+            ...this.snapshot.boundaryRelocations,
+            candidate,
+          ],
+        },
+        this.snapshot.authorityDigest,
+      );
+      await this.persist(next);
+      this.snapshot = next;
+      return structuredClone(candidate);
+    });
+  }
+
+  resolvesBoundaryRelocation(args: {
+    oldBoundary: RemoteBackupBoundary;
+    newBoundary: RemoteBackupBoundary;
+    artifact: ArchiveBoundaryRelocationArtifact;
+  }): boolean {
+    this.assertUsable();
+    const matches = this.snapshot.boundaryRelocations.filter((relocation) =>
+      relocationAuthorizesArtifact({ relocation, ...args }),
+    );
+    if (matches.length > 1) fail("catalog_conflict");
+    return matches.length === 1;
   }
 
   requireProcessingActivation(catalogId: string) {
