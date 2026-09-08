@@ -278,6 +278,86 @@ test("append serializes PDF and safe leaf gaps without changing UTF-8 entries", 
   }
 });
 
+test("cached forgotten PDF disposition resumes without archival work or invented epochs", async () => {
+  const setup = await fixture(0);
+  const forgotten = pdfPlan({ relativePath: "forgotten.pdf" });
+  const unchanged = pdfPlan({ relativePath: "unchanged.pdf" });
+  const review = pdfPlan({ relativePath: "review.pdf" });
+  const checkpoint = parseRunnerCheckpoint({
+    version: 1,
+    phase: "append",
+    mode: "normal",
+    scanId: "scan",
+    inventoryEpoch: 1,
+    manifestVersion: 1,
+    missingBindings: [],
+    identities: [],
+    nextOrdinal: 0,
+    reviewSeen: false,
+    files: [forgotten, unchanged, review],
+  });
+  let journal = await openJournal(setup.journalDir, checkpoint);
+  try {
+    journal.commitResult = async () => {
+      throw new Error("interrupted commit");
+    };
+    const first = new PipelineRunner(setup.config, journal, {
+      async call() {
+        return {
+          operation: "scan.appendPage",
+          scanId: "scan",
+          ordinal: 0,
+          reused: false,
+          entries: [
+            { state: "ignored_forgotten", sourceItemId: "forgotten-item" },
+            {
+              state: "unchanged",
+              sourceItemId: "unchanged-item",
+              observationEpoch: 2,
+              processingEpoch: 3,
+            },
+            { state: "needs_review", sourceItemId: "review-item" },
+          ],
+        };
+      },
+    });
+    await assert.rejects(() => first.driveAppend(), /interrupted commit/);
+    assert.ok(journal.pending?.result);
+    await journal.close();
+    journal = await openJournal(setup.journalDir);
+    const resumed = new PipelineRunner(setup.config, journal, {
+      async call() {
+        throw new Error("cached result must not use transport");
+      },
+    });
+    await resumed.driveAppend();
+    assert.equal(journal.pending, undefined);
+    assert.equal(journal.checkpoint.phase, "seal_check");
+    assert.equal(journal.checkpoint.reviewSeen, true);
+    const [forgottenAfter, unchangedAfter, reviewAfter] =
+      journal.checkpoint.files;
+    for (const entry of [forgottenAfter, reviewAfter]) {
+      for (const key of [
+        "sourceItemId",
+        "observationEpoch",
+        "processingEpoch",
+        "discoveryState",
+      ])
+        assert.equal(entry[key], undefined);
+      assert.equal(await resumed.pdfNeedsArchivedWork(entry), false);
+    }
+    assert.equal(forgottenAfter.externalId, forgotten.externalId);
+    assert.equal(reviewAfter.externalId, undefined);
+    assert.equal(unchangedAfter.sourceItemId, "unchanged-item");
+    assert.equal(unchangedAfter.observationEpoch, 2);
+    assert.equal(unchangedAfter.processingEpoch, 3);
+    assert.equal(unchangedAfter.discoveryState, "unchanged");
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
 test("PDF seal recheck ignores server identity and disposition fields", async () => {
   const setup = await fixture(0);
   const path = join(setup.root, "document.pdf");
@@ -1609,119 +1689,127 @@ test("parsed reservation targets only the admitted job and waits without leasing
   }
 });
 
-test("cleanup checkpoint replay succeeds after every exact local artifact is already absent", async () => {
-  const setup = await fixture(0);
-  const requestedCaptureDirectory = join(setup.base, "captures");
-  const requestedParserOutputRoot = join(setup.base, "outputs");
-  const requestedSpoolDirectory = join(setup.base, "spool");
-  await Promise.all(
-    [
-      requestedCaptureDirectory,
-      requestedParserOutputRoot,
-      requestedSpoolDirectory,
-    ].map((path) => mkdir(path, { mode: 0o700 })),
-  );
-  const [captureDirectory, parserOutputRoot, spoolDirectory] =
+test(
+  "cleanup checkpoint replay succeeds after every exact local artifact is already absent",
+  {
+    skip:
+      process.platform !== "darwin" &&
+      "macOS is the supported cleanup boundary",
+  },
+  async () => {
+    const setup = await fixture(0);
+    const requestedCaptureDirectory = join(setup.base, "captures");
+    const requestedParserOutputRoot = join(setup.base, "outputs");
+    const requestedSpoolDirectory = join(setup.base, "spool");
     await Promise.all(
       [
         requestedCaptureDirectory,
         requestedParserOutputRoot,
         requestedSpoolDirectory,
-      ].map((path) => realpath(path)),
+      ].map((path) => mkdir(path, { mode: 0o700 })),
     );
-  const [captureStat, outputStat, spoolStat] = await Promise.all(
-    [captureDirectory, parserOutputRoot, spoolDirectory].map(lstat),
-  );
-  const plan = pdfPlan();
-  const checkpoint = archivedCheckpoint(plan, {
-    step: "cleanup",
-    preflightAction: undefined,
-  });
-  const journal = await openJournal(setup.journalDir, checkpoint);
-  const captureId = randomUUID();
-  const outputId = randomUUID();
-  const spoolId = randomUUID();
-  const original = {
-    originalCatalogId: checkpoint.originalCatalogId,
-    origin: { sha256: plan.sha256, byteLength: plan.byteLength },
-  };
-  const processing = {
-    processingCatalogId: checkpoint.processingCatalogId,
-    captureIntent: {
-      captureId,
-      directory: { device: captureStat.dev, inode: captureStat.ino },
-    },
-    capture: {
-      opaqueName: captureId,
-      device: 10,
-      inode: 11,
-      sha256: plan.sha256,
-      byteLength: plan.byteLength,
-      sourceModifiedAt: plan.sourceModifiedAt,
-      directory: { device: captureStat.dev, inode: captureStat.ino },
-    },
-    parserIntent: {
-      outputId,
-      outputRoot: { device: outputStat.dev, inode: outputStat.ino },
-      outputDirectory: { device: 10, inode: 12 },
-      parserArtifactClientId: randomUUID(),
-    },
-    parserOutput: {
-      outputId,
-      outputRoot: { device: outputStat.dev, inode: outputStat.ino },
-      outputDirectory: { device: 10, inode: 12 },
-      rawArtifact: {
-        opaqueName: "lossless.json",
+    const [captureDirectory, parserOutputRoot, spoolDirectory] =
+      await Promise.all(
+        [
+          requestedCaptureDirectory,
+          requestedParserOutputRoot,
+          requestedSpoolDirectory,
+        ].map((path) => realpath(path)),
+      );
+    const [captureStat, outputStat, spoolStat] = await Promise.all(
+      [captureDirectory, parserOutputRoot, spoolDirectory].map(lstat),
+    );
+    const plan = pdfPlan();
+    const checkpoint = archivedCheckpoint(plan, {
+      step: "cleanup",
+      preflightAction: undefined,
+    });
+    const journal = await openJournal(setup.journalDir, checkpoint);
+    const captureId = randomUUID();
+    const outputId = randomUUID();
+    const spoolId = randomUUID();
+    const original = {
+      originalCatalogId: checkpoint.originalCatalogId,
+      origin: { sha256: plan.sha256, byteLength: plan.byteLength },
+    };
+    const processing = {
+      processingCatalogId: checkpoint.processingCatalogId,
+      captureIntent: {
+        captureId,
+        directory: { device: captureStat.dev, inode: captureStat.ino },
+      },
+      capture: {
+        opaqueName: captureId,
         device: 10,
-        inode: 13,
+        inode: 11,
+        sha256: plan.sha256,
+        byteLength: plan.byteLength,
+        sourceModifiedAt: plan.sourceModifiedAt,
+        directory: { device: captureStat.dev, inode: captureStat.ino },
+      },
+      parserIntent: {
+        outputId,
+        outputRoot: { device: outputStat.dev, inode: outputStat.ino },
+        outputDirectory: { device: 10, inode: 12 },
+        parserArtifactClientId: randomUUID(),
+      },
+      parserOutput: {
+        outputId,
+        outputRoot: { device: outputStat.dev, inode: outputStat.ino },
+        outputDirectory: { device: 10, inode: 12 },
+        rawArtifact: {
+          opaqueName: "lossless.json",
+          device: 10,
+          inode: 13,
+          sha256: HASH,
+          byteLength: 10,
+        },
+        normalizedBundle: {
+          opaqueName: "bundle.json",
+          device: 10,
+          inode: 14,
+          sha256: HASH,
+          byteLength: 10,
+        },
+      },
+      spoolIntent: {
+        spoolId,
+        root: { device: spoolStat.dev, inode: spoolStat.ino },
+      },
+      spool: {
+        opaqueName: `${spoolId}.json`,
+        device: 10,
+        inode: 15,
         sha256: HASH,
         byteLength: 10,
       },
-      normalizedBundle: {
-        opaqueName: "bundle.json",
-        device: 10,
-        inode: 14,
-        sha256: HASH,
-        byteLength: 10,
+    };
+    const runner = new PipelineRunner(
+      {
+        ...setup.config,
+        pdfDocQa: { captureDirectory, parserOutputRoot, spoolDirectory },
       },
-    },
-    spoolIntent: {
-      spoolId,
-      root: { device: spoolStat.dev, inode: spoolStat.ino },
-    },
-    spool: {
-      opaqueName: `${spoolId}.json`,
-      device: 10,
-      inode: 15,
-      sha256: HASH,
-      byteLength: 10,
-    },
-  };
-  const runner = new PipelineRunner(
-    {
-      ...setup.config,
-      pdfDocQa: { captureDirectory, parserOutputRoot, spoolDirectory },
-    },
-    journal,
-    {
-      async call() {
-        throw new Error("network is not used");
+      journal,
+      {
+        async call() {
+          throw new Error("network is not used");
+        },
       },
-    },
-  );
-  runner.archivedRows = () => ({ original, processing });
-  runner.archiveCatalog = {
-    requireProcessingActivation(id) {
-      assert.equal(id, processing.processingCatalogId);
-      return { state: "ready" };
-    },
-  };
-  try {
-    await runner.driveArchivedCleanup();
-    assert.equal(journal.checkpoint.phase, "discovery_reserve");
-    assert.equal(journal.checkpoint.archivedPublished, 1);
-  } finally {
-    await journal.close();
-    await rm(setup.base, { recursive: true, force: true });
-  }
-});
+    );
+    runner.archivedRows = () => ({ original, processing });
+    runner.archiveCatalog = {
+      requireProcessingActivation(id) {
+        assert.equal(id, processing.processingCatalogId);
+        return { state: "ready" };
+      },
+    };
+    try {
+      await runner.driveArchivedCleanup();
+      assert.equal(journal.checkpoint.phase, "discovery_reserve");
+      assert.equal(journal.checkpoint.archivedPublished, 1);
+    } finally {
+      await journal.close();
+      await rm(setup.base, { recursive: true, force: true });
+    }
+  },
+);

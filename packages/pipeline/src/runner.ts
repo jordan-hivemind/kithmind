@@ -1959,23 +1959,26 @@ export class PipelineRunner {
           const row = output[index]!;
           const plan = files[current.nextOrdinal * 4 + index]!;
           if (isPdfPlan(plan)) {
-            const sourceItemId = row.sourceItemId;
-            const observationEpoch = row.observationEpoch;
-            const processingEpoch = row.processingEpoch;
-            if (
-              typeof sourceItemId !== "string" ||
-              !Number.isSafeInteger(observationEpoch) ||
-              !Number.isSafeInteger(processingEpoch)
-            ) {
-              throw new PipelineWorkerError("archived_append_parent_missing");
-            }
-            plan.sourceItemId = sourceItemId;
-            plan.observationEpoch = observationEpoch as number;
-            plan.processingEpoch = processingEpoch as number;
-            if (row.state === "queued" || row.state === "unchanged") {
-              plan.discoveryState = row.state;
-            } else {
+            if (row.state !== "queued" && row.state !== "unchanged") {
+              delete plan.sourceItemId;
+              delete plan.observationEpoch;
+              delete plan.processingEpoch;
               delete plan.discoveryState;
+            } else {
+              const sourceItemId = row.sourceItemId;
+              const observationEpoch = row.observationEpoch;
+              const processingEpoch = row.processingEpoch;
+              if (
+                typeof sourceItemId !== "string" ||
+                !Number.isSafeInteger(observationEpoch) ||
+                !Number.isSafeInteger(processingEpoch)
+              ) {
+                throw new PipelineWorkerError("archived_append_parent_missing");
+              }
+              plan.sourceItemId = sourceItemId;
+              plan.observationEpoch = observationEpoch as number;
+              plan.processingEpoch = processingEpoch as number;
+              plan.discoveryState = row.state;
             }
           }
           if (row.state === "needs_review") {
