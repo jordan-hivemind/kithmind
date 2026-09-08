@@ -814,7 +814,7 @@ function originalRow(value: unknown): OriginalCatalogRow {
         : {
             ...base,
             providerReferenceId: id(cloud.providerReferenceId),
-            providerBindingEpoch: integer(cloud.providerBindingEpoch, 1),
+            providerBindingEpoch: integer(cloud.providerBindingEpoch),
           };
   }
   return result;
