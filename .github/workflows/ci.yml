@@ -64,7 +64,7 @@ jobs:
           # Turbo emits the task name as a group header and then bare summary
           # lines, so scope the search to that group rather than matching the
           # task name on the same line as the count.
-          skipped=$(awk '/@repo\/finance-archive:test:once/{f=1} f && /skipped/{print $NF; exit}' /tmp/test-once.log)
+          skipped=$(awk '/@repo\/finance-archive:test:once/{f=1} f && /skipped [0-9]+$/{print $NF; exit}' /tmp/test-once.log)
           echo "finance-archive skipped: ${skipped:-unparsed}"
           if [ -z "$skipped" ]; then
             echo "::error::could not read the finance skipped count; the assertion cannot verify anything"
