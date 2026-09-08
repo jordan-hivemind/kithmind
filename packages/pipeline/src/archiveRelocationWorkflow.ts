@@ -350,6 +350,13 @@ function parseState(value: unknown): ArchiveRelocationState | undefined {
     fail("state_invalid");
   return state;
 }
+
+/** Closed validation for durable owner orchestration stores. */
+export function validateArchiveRelocationState(
+  value: unknown,
+): ArchiveRelocationState | undefined {
+  return parseState(value);
+}
 function parseFolder(
   value: RelocationFolder | undefined,
 ): RelocationFolder | undefined {
