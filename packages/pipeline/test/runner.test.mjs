@@ -77,10 +77,15 @@ function archivedCheckpoint(plan, overrides = {}) {
 
 const TOKEN = "a".repeat(64);
 
+function fixtureEndpoint(journalDir) {
+  const digest = createHash("sha256").update(journalDir).digest("hex");
+  return `https://runner-${digest.slice(0, 32)}.invalid/api/worker`;
+}
+
 function config(root, journalDir) {
   return {
     protocolVersion: 1,
-    endpoint: "http://127.0.0.1:3100/api/worker",
+    endpoint: fixtureEndpoint(journalDir),
     spaceId: "space",
     sourceAccountId: "source",
     credentialEnv: "PIPELINE_TOKEN",
@@ -93,10 +98,10 @@ function config(root, journalDir) {
   };
 }
 
-function binding() {
+function binding(journalDir) {
   return {
     protocolVersion: 1,
-    endpoint: "http://127.0.0.1:3100/api/worker",
+    endpoint: fixtureEndpoint(journalDir),
     spaceId: "space",
     sourceAccountId: "source",
     configFingerprint: "b".repeat(64),
@@ -122,7 +127,7 @@ async function fixture(fileCount = 1) {
 async function openJournal(directory, checkpoint = initialCheckpoint) {
   return await Journal.open({
     directory,
-    binding: binding(),
+    binding: binding(directory),
     credential: "test-credential",
     initialCheckpoint: checkpoint,
     codec: journalCodec,

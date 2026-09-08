@@ -267,6 +267,92 @@ test("PDF document-Q&A config is closed, bound, and keeps legacy bindings stable
   );
 });
 
+test("PDF table structure bypass policy is bounded, canonical, and bound", () => {
+  const base = {
+    protocolVersion: 1,
+    endpoint: "http://127.0.0.1:3100/api/worker",
+    spaceId: "space_1",
+    sourceAccountId: "source_1",
+    credentialEnv: "PIPELINE_TOKEN",
+    roots: [{ alias: "notes", path: "/tmp/root" }],
+    journalDir: "/tmp/journal",
+  };
+  const first = "b".repeat(64);
+  const second = "a".repeat(64);
+  const omitted = parseConfig({ ...base, pdfDocQa: pdfDocQaConfig() });
+  const omittedHistorical = structuredClone(omitted);
+  delete omittedHistorical.pdfDocQa.parser.tableStructure;
+  assert.equal(
+    journalBindingForConfig(omitted).configFingerprint,
+    createHash("sha256")
+      .update(
+        JSON.stringify({
+          endpoint: omittedHistorical.endpoint,
+          spaceId: omittedHistorical.spaceId,
+          sourceAccountId: omittedHistorical.sourceAccountId,
+          roots: omittedHistorical.roots,
+          pdfDocQa: omittedHistorical.pdfDocQa,
+        }),
+      )
+      .digest("hex"),
+  );
+  assert.equal("tableStructureBypass" in omitted.pdfDocQa.parser, false);
+
+  const withPolicy = pdfDocQaConfig();
+  withPolicy.parser.tableStructureBypass = {
+    [first]: [2, 7],
+    [second]: [1, 4],
+  };
+  const normalized = parseConfig({ ...base, pdfDocQa: withPolicy });
+  assert.deepEqual(normalized.pdfDocQa.parser.tableStructureBypass, {
+    [second]: [1, 4],
+    [first]: [2, 7],
+  });
+  assert.notEqual(
+    journalBindingForConfig(normalized).configFingerprint,
+    journalBindingForConfig(omitted).configFingerprint,
+  );
+  const reordered = pdfDocQaConfig();
+  reordered.parser.tableStructureBypass = {
+    [second]: [1, 4],
+    [first]: [2, 7],
+  };
+  assert.equal(
+    journalBindingForConfig(parseConfig({ ...base, pdfDocQa: reordered }))
+      .configFingerprint,
+    journalBindingForConfig(normalized).configFingerprint,
+  );
+
+  const invalidPolicies = [
+    {},
+    { ["A".repeat(64)]: [1] },
+    { [first]: [] },
+    { [first]: [1, 1] },
+    { [first]: [2, 1] },
+    { [first]: [0] },
+    { [first]: [65] },
+    { [first]: [1.5] },
+    { [first]: [true] },
+    { [first]: [1, , 3] },
+    Object.fromEntries(
+      Array.from({ length: 33 }, (_, index) => [
+        index.toString(16).padStart(64, "0"),
+        [1],
+      ]),
+    ),
+    { [first]: Array.from({ length: 65 }, (_, index) => index + 1) },
+  ];
+  for (const tableStructureBypass of invalidPolicies) {
+    const invalid = pdfDocQaConfig();
+    invalid.parser.tableStructureBypass = tableStructureBypass;
+    assert.throws(() => parseConfig({ ...base, pdfDocQa: invalid }));
+  }
+  const conflict = pdfDocQaConfig();
+  conflict.parser.tableStructure = "off";
+  conflict.parser.tableStructureBypass = { [first]: [1] };
+  assert.throws(() => parseConfig({ ...base, pdfDocQa: conflict }));
+});
+
 test("transport response parser rejects extra and malformed success fields", () => {
   const valid = JSON.stringify({
     operation: "scan.begin",

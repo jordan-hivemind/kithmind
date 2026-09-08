@@ -17,6 +17,8 @@ const SHA256 = /^[a-f0-9]{64}$/;
 const AGE_RECIPIENT = /^age1pq1[023456789acdefghjklmnpqrstuvwxyz]{40,4090}$/;
 const HOST = /^[A-Za-z0-9_-]{1,128}$/;
 const MAX_CONFIG_BYTES = 64 * 1024;
+const MAX_TABLE_STRUCTURE_BYPASS_SOURCES = 32;
+const MAX_TABLE_STRUCTURE_BYPASS_PAGES = 64;
 
 function fail(message: string): never {
   throw new Error(`Invalid pipeline config: ${message}`);
@@ -77,6 +79,57 @@ function sha256(value: unknown, label: string): string {
   const fingerprint = string(value, label);
   if (!SHA256.test(fingerprint)) fail(`${label} must be a SHA-256 digest`);
   return fingerprint;
+}
+
+function tableStructureBypass(value: unknown): Record<string, number[]> {
+  const policy = object(value, "pdfDocQa.parser.tableStructureBypass");
+  const entries = Object.entries(policy);
+  if (
+    entries.length < 1 ||
+    entries.length > MAX_TABLE_STRUCTURE_BYPASS_SOURCES
+  ) {
+    fail(
+      "pdfDocQa.parser.tableStructureBypass must contain 1 through 32 sources",
+    );
+  }
+  const normalized: Array<[string, number[]]> = entries.map(
+    ([digest, pages]) => {
+      if (!SHA256.test(digest)) {
+        fail(
+          "pdfDocQa.parser.tableStructureBypass has an invalid source digest",
+        );
+      }
+      if (
+        !Array.isArray(pages) ||
+        pages.length < 1 ||
+        pages.length > MAX_TABLE_STRUCTURE_BYPASS_PAGES
+      ) {
+        fail(
+          "pdfDocQa.parser.tableStructureBypass source pages must contain 1 through 64 entries",
+        );
+      }
+      const parsed = Array.from(pages, (page, index) =>
+        integer(
+          page,
+          `pdfDocQa.parser.tableStructureBypass.${digest}[${index}]`,
+          1,
+          MAX_TABLE_STRUCTURE_BYPASS_PAGES,
+        ),
+      );
+      if (
+        parsed.some((page, index) => index > 0 && page <= parsed[index - 1]!)
+      ) {
+        fail(
+          "pdfDocQa.parser.tableStructureBypass source pages must be strictly increasing",
+        );
+      }
+      return [digest, parsed];
+    },
+  );
+  normalized.sort(([left], [right]) =>
+    left < right ? -1 : left > right ? 1 : 0,
+  );
+  return Object.fromEntries(normalized);
 }
 
 function profileText(value: unknown, label: string): string {
@@ -210,7 +263,7 @@ function pdfDocQa(value: unknown, roots: RootConfig[], journalDir: string) {
       "modelLockPath",
       "expectedModelLockSha256",
     ],
-    ["tableStructure"],
+    ["tableStructure", "tableStructureBypass"],
   );
   const tableStructure: PdfDocQaConfig["parser"]["tableStructure"] =
     parserInput.tableStructure === undefined
@@ -219,6 +272,15 @@ function pdfDocQa(value: unknown, roots: RootConfig[], journalDir: string) {
           parserInput.tableStructure === "off"
         ? parserInput.tableStructure
         : fail("pdfDocQa.parser.tableStructure is invalid");
+  const bypass =
+    parserInput.tableStructureBypass === undefined
+      ? undefined
+      : tableStructureBypass(parserInput.tableStructureBypass);
+  if (tableStructure === "off" && bypass !== undefined) {
+    fail(
+      "pdfDocQa.parser.tableStructureBypass requires tableStructure to be on or omitted",
+    );
+  }
   const parser = {
     pythonExecutable: absolutePath(
       parserInput.pythonExecutable,
@@ -253,6 +315,7 @@ function pdfDocQa(value: unknown, roots: RootConfig[], journalDir: string) {
       "pdfDocQa.parser.expectedModelLockSha256",
     ),
     ...(tableStructure === undefined ? {} : { tableStructure }),
+    ...(bypass === undefined ? {} : { tableStructureBypass: bypass }),
   };
   const profileInput = object(input.profile, "pdfDocQa.profile");
   exact(profileInput, [

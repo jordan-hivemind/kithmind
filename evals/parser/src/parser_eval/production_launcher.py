@@ -21,6 +21,7 @@ from typing import Any
 MAX_INPUT_BYTES = 16 * 1024 * 1024
 MAX_RAW_BYTES = 64 * 1024 * 1024
 MAX_BUNDLE_BYTES = 4 * 1024 * 1024
+MAX_TABLE_STRUCTURE_BYPASS_ARGUMENT_BYTES = 12 * 1024
 SHA256 = frozenset("0123456789abcdef")
 _PROTOCOL_STDOUT: int | None = None
 
@@ -84,6 +85,18 @@ def _positive_integer(value: str, maximum: int) -> int:
         raise argparse.ArgumentTypeError("invalid integer") from exc
     if parsed < 1 or parsed > maximum:
         raise argparse.ArgumentTypeError("integer is out of range")
+    return parsed
+
+
+def _table_structure_bypass(value: str) -> dict[str, Any]:
+    if not 0 < len(value.encode("utf-8")) <= MAX_TABLE_STRUCTURE_BYPASS_ARGUMENT_BYTES:
+        raise argparse.ArgumentTypeError("table bypass policy is out of range")
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("table bypass policy is invalid") from exc
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError("table bypass policy is invalid")
     return parsed
 
 
@@ -197,6 +210,7 @@ def _profile(args: argparse.Namespace) -> int:
         model_lock=model_lock,
         timeout_seconds=float(args.conversion_timeout_seconds),
         table_structure=args.table_structure,
+        table_structure_bypass=args.table_structure_bypass,
     )
     if result.get("state") != "ready":
         code = result.get("code")
@@ -260,6 +274,7 @@ def _convert(args: argparse.Namespace) -> int:
         ),
         timeout_seconds=float(args.conversion_timeout_seconds),
         table_structure=args.table_structure,
+        table_structure_bypass=args.table_structure_bypass,
     )
     data = b""
     if result.get("state") != "complete":
@@ -278,12 +293,27 @@ def _convert(args: argparse.Namespace) -> int:
     parser = raw.get("parserFingerprint")
     extraction = bundle.get("extractionFingerprint")
     pages = bundle.get("pages")
+    selected_pages = result.get("tableStructureBypassPages")
+    expected_selected_pages = (
+        []
+        if args.table_structure_bypass is None
+        else args.table_structure_bypass.get(expected_sha256, [])
+    )
     if (
         not isinstance(parser, dict)
         or not isinstance(parser.get("fingerprint"), str)
         or not isinstance(extraction, dict)
         or not isinstance(extraction.get("fingerprint"), str)
         or not isinstance(pages, list)
+        or not isinstance(selected_pages, list)
+        or any(
+            type(page) is not int or not 1 <= page <= 64
+            for page in selected_pages
+        )
+        or any(
+            left >= right for left, right in zip(selected_pages, selected_pages[1:])
+        )
+        or selected_pages != expected_selected_pages
     ):
         return _safe_result(
             {"state": "failed", "code": "conversion_output_invalid"}, 2
@@ -300,8 +330,7 @@ def _convert(args: argparse.Namespace) -> int:
     _write_exclusive(raw_path, raw_bytes, MAX_RAW_BYTES)
     _write_exclusive(bundle_path, bundle_bytes, MAX_BUNDLE_BYTES)
     _sync_directory(output_directory)
-    return _safe_result(
-        {
+    response = {
             "state": "complete",
             "sourceSha256": expected_sha256,
             "rawSha256": _digest(raw_bytes),
@@ -312,8 +341,10 @@ def _convert(args: argparse.Namespace) -> int:
             "extractionFingerprint": extraction["fingerprint"],
             "modelManifestSha256": parser.get("modelManifestSha256"),
             "pageCount": len(pages),
-        }
-    )
+    }
+    if args.table_structure_bypass is not None:
+        response["tableStructureBypassPages"] = selected_pages
+    return _safe_result(response)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -356,6 +387,10 @@ def main(argv: list[str] | None = None) -> int:
         type=lambda value: _positive_integer(value, 480),
     )
     parser.add_argument("--table-structure", choices=("on", "off"), default="on")
+    parser.add_argument(
+        "--table-structure-bypass",
+        type=_table_structure_bypass,
+    )
     try:
         _configure_machine_stdio()
         args = parser.parse_args(argv)

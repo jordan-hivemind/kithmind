@@ -61,6 +61,34 @@ function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+function canonicalJsonForTest(value) {
+  if (Array.isArray(value))
+    return `[${value.map((entry) => canonicalJsonForTest(entry)).join(",")}]`;
+  if (value !== null && typeof value === "object")
+    return `{${Object.keys(value)
+      .sort()
+      .map(
+        (key) => `${JSON.stringify(key)}:${canonicalJsonForTest(value[key])}`,
+      )
+      .join(",")}}`;
+  return JSON.stringify(value);
+}
+
+function fingerprintDescriptorForTest(value) {
+  const fields = structuredClone(value);
+  delete fields.fingerprint;
+  let encoded = canonicalJsonForTest(fields);
+  const timeout = fields.configuration?.timeoutSeconds;
+  if (Number.isInteger(timeout)) {
+    const integerTimeout = `"timeoutSeconds":${timeout}`;
+    const pythonTimeout = `${integerTimeout}.0`;
+    const adjusted = encoded.replace(integerTimeout, pythonTimeout);
+    assert.notEqual(adjusted, encoded);
+    encoded = adjusted;
+  }
+  return sha256(Buffer.from(encoded, "utf8"));
+}
+
 test("bounds parser JSON nodes and depth independently", () => {
   const maximum = 4 * 1024 * 1024;
   const atNodeBound = Buffer.from(JSON.stringify(Array(499_999).fill(null)));
@@ -104,7 +132,10 @@ test("uses the bounded large-document resource profile", async () => {
       }),
     (error) =>
       error instanceof ParserProcessError &&
-      error.code === (process.platform === "darwin" ? "invalid_input" : "unsupported_platform"),
+      error.code ===
+        (process.platform === "darwin"
+          ? "invalid_input"
+          : "unsupported_platform"),
   );
 });
 
@@ -198,17 +229,14 @@ function assertOrderedSourceFields(result, pageNumber, fields) {
     cursor <= page.text.indexOf(fields[0]) + 64,
     "source fields are not a compact label/value association",
   );
-  for (const field of fields) assertQuotedSourceField(result, pageNumber, field);
+  for (const field of fields)
+    assertQuotedSourceField(result, pageNumber, field);
 }
 
 async function assertExactRawProvenance(result) {
   const raw = JSON.parse(await readFile(result.rawArtifact.path, "utf8"));
   assert.deepEqual(
-    resolveRawLocators(
-      raw,
-      result.validated.bundle,
-      "docling_utf16_pages_v2",
-    ),
+    resolveRawLocators(raw, result.validated.bundle, "docling_utf16_pages_v2"),
     result.validated.resolvedLocators,
   );
 }
@@ -232,15 +260,105 @@ async function modeIgnoringFixture(fixture) {
   };
 }
 
+async function bypassMutatingFixture(fixture, replacement) {
+  const packageRoot = join(fixture.base, "bypass-mutating-package");
+  await cp(join(parserRoot, "src"), packageRoot, { recursive: true });
+  const launcherPath = join(packageRoot, "parser_eval/production_launcher.py");
+  const launcher = await readFile(launcherPath, "utf8");
+  const modified = launcher.replace(
+    "args = parser.parse_args(argv)",
+    `args = parser.parse_args(argv)\n        args.table_structure_bypass = ${replacement}`,
+  );
+  assert.notEqual(modified, launcher);
+  await writeFile(launcherPath, modified, { mode: 0o600 });
+  return {
+    ...fixture.common,
+    packageRoot,
+    launcherPath,
+    expectedLauncherSha256: sha256(await readFile(launcherPath)),
+  };
+}
+
+async function bypassSelectionReportingFixture(fixture, result, reportedPages) {
+  const packageRoot = join(
+    fixture.base,
+    `bypass-reporting-package-${randomUUID()}`,
+  );
+  await mkdir(packageRoot, { mode: 0o700 });
+  await chmod(packageRoot, 0o700);
+  const rawFixture = join(packageRoot, "lossless-fixture.json");
+  const bundleFixture = join(packageRoot, "bundle-fixture.json");
+  const rawBytes = await readFile(result.rawArtifact.path);
+  const bundleBytes = await readFile(result.normalizedBundle.path);
+  await writeFile(rawFixture, rawBytes, { mode: 0o600 });
+  await writeFile(bundleFixture, bundleBytes, { mode: 0o600 });
+  const response = {
+    state: "complete",
+    sourceSha256: fixture.common.capture.sha256,
+    rawSha256: sha256(rawBytes),
+    rawByteLength: rawBytes.length,
+    bundleSha256: sha256(bundleBytes),
+    bundleByteLength: bundleBytes.length,
+    parserFingerprint: result.parserFingerprint,
+    extractionFingerprint: result.extractionFingerprint,
+    modelManifestSha256: result.modelManifestSha256,
+    pageCount: result.pageCount,
+    tableStructureBypassPages: reportedPages,
+  };
+  const launcherPath = join(packageRoot, "launcher.py");
+  const source = `
+import json, os, sys
+from pathlib import Path
+mode = sys.argv[sys.argv.index("--mode") + 1]
+def emit(value):
+    sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\\n")
+if mode == "network-probe":
+    emit({"state":"complete","probe":"network_denied"})
+elif mode == "process-probe":
+    emit({"state":"complete","probe":"fork_denied"})
+elif mode == "exec-probe":
+    emit({"state":"complete","probe":"exec_denied"})
+elif mode == "convert":
+    base = Path(__file__).parent
+    for argument, name in (("--raw-output", "lossless-fixture.json"), ("--bundle-output", "bundle-fixture.json")):
+        target = Path(sys.argv[sys.argv.index(argument) + 1])
+        data = base.joinpath(name).read_bytes()
+        descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(data)
+    emit(json.loads(${JSON.stringify(JSON.stringify(response))}))
+else:
+    emit({"state":"failed","code":"invalid_input"})
+`;
+  await writeFile(launcherPath, source, { mode: 0o600 });
+  return {
+    ...fixture.common,
+    packageRoot,
+    launcherPath,
+    expectedLauncherSha256: sha256(await readFile(launcherPath)),
+  };
+}
+
 async function legacySchemaFixture(fixture) {
   const packageRoot = join(fixture.base, "legacy-schema-package");
   await cp(join(parserRoot, "src"), packageRoot, { recursive: true });
   const productionPath = join(packageRoot, "parser_eval/production.py");
   const production = await readFile(productionPath, "utf8");
-  const legacy = production
-    .replace('"schemaVersion": 2,', '"schemaVersion": 1,')
-    .replace('            "tableStructure": table_structure,\n', "");
-  assert.notEqual(legacy, production);
+  const legacy = `${production}
+
+_current_fingerprint = _fingerprint
+def _legacy_fingerprint(manifest, timeout_seconds, table_structure="on", table_structure_bypass=None):
+    descriptor = _current_fingerprint(
+        manifest, timeout_seconds, table_structure, table_structure_bypass
+    )
+    descriptor["schemaVersion"] = 1
+    descriptor["configuration"].pop("tableStructure", None)
+    descriptor["configuration"].pop("tableStructureBypass", None)
+    fields = {key: value for key, value in descriptor.items() if key != "fingerprint"}
+    descriptor["fingerprint"] = hashlib.sha256(_canonical_json_bytes(fields)).hexdigest()
+    return descriptor
+_fingerprint = _legacy_fingerprint
+`;
   await writeFile(productionPath, legacy, { mode: 0o600 });
   const launcherPath = join(packageRoot, "parser_eval/production_launcher.py");
   return {
@@ -319,9 +437,7 @@ function crossPageSliceFixture() {
   });
   return {
     raw: {
-      texts: [
-        { self_ref: "#/texts/0", text, prov: provenance, children: [] },
-      ],
+      texts: [{ self_ref: "#/texts/0", text, prov: provenance, children: [] }],
       tables: [],
     },
     bundle: {
@@ -442,11 +558,7 @@ test("v2 inventories traversed body slices while legacy gaps and furniture remai
   current.raw.body = { children: [{ $ref: "#/texts/0" }] };
   current.raw.furniture = { children: [{ $ref: "#/texts/1" }] };
   assert.doesNotThrow(() =>
-    resolveRawLocators(
-      current.raw,
-      current.bundle,
-      "docling_utf16_pages_v2",
-    ),
+    resolveRawLocators(current.raw, current.bundle, "docling_utf16_pages_v2"),
   );
 
   const legacyGap = structuredClone(current);
@@ -744,7 +856,10 @@ test(
       });
       assert.equal(onProfile.state, "ready");
       assert.equal(offProfile.state, "ready");
-      assert.notEqual(onProfile.parserFingerprint, offProfile.parserFingerprint);
+      assert.notEqual(
+        onProfile.parserFingerprint,
+        offProfile.parserFingerprint,
+      );
       const outputId = randomUUID();
       const output = await outputDirectory(f, outputId);
       const result = await runCapturedPdfParser({
@@ -789,7 +904,8 @@ test(
             work,
           }),
         (error) =>
-          error instanceof ParserProcessError && error.code === "output_invalid",
+          error instanceof ParserProcessError &&
+          error.code === "output_invalid",
       );
       const outputId = randomUUID();
       const output = await outputDirectory(f, outputId);
@@ -802,10 +918,92 @@ test(
             outputDirectory: output,
           }),
         (error) =>
-          error instanceof ParserProcessError && error.code === "output_invalid",
+          error instanceof ParserProcessError &&
+          error.code === "output_invalid",
       );
     } finally {
       await rm(f.base, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "rejects ignored or changed table structure bypass policies in profile results",
+  { skip: !hasRuntime, timeout: 120_000 },
+  async () => {
+    const f = await fixture();
+    try {
+      const policy = { [f.common.capture.sha256]: [1] };
+      for (const replacement of ["None", '{"c" * 64: [1]}']) {
+        const common = await bypassMutatingFixture(f, replacement);
+        const work = await createParserProfileWorkDirectory({
+          workRoot: f.outputRoot,
+          workId: randomUUID(),
+        });
+        await assert.rejects(
+          () =>
+            preparePdfDocQaProfile({
+              ...common,
+              tableStructureBypass: policy,
+              workRoot: f.outputRoot,
+              work,
+            }),
+          (error) =>
+            error instanceof ParserProcessError &&
+            error.code === "output_invalid",
+        );
+      }
+    } finally {
+      await rm(f.base, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "rejects malformed table structure bypass policies before parser execution",
+  { skip: !hasPythonRuntime },
+  async () => {
+    const digest = "a".repeat(64);
+    const policies = [
+      { [digest]: [1, , 3] },
+      { [digest]: [true] },
+      { [digest]: [1.5] },
+      { [digest]: [1, 1] },
+      { [digest]: [2, 1] },
+      { [digest]: [0] },
+      { [digest]: [65] },
+      { ["A".repeat(64)]: [1] },
+    ];
+    for (const tableStructureBypass of policies) {
+      for (const invoke of [
+        () => preparePdfDocQaProfile({ tableStructureBypass }),
+        () => runCapturedPdfParser({ tableStructureBypass }),
+      ]) {
+        await assert.rejects(
+          invoke,
+          (error) =>
+            error instanceof ParserProcessError &&
+            error.code === "invalid_input",
+        );
+      }
+    }
+    for (const invoke of [
+      () =>
+        preparePdfDocQaProfile({
+          tableStructure: "off",
+          tableStructureBypass: { [digest]: [1] },
+        }),
+      () =>
+        runCapturedPdfParser({
+          tableStructure: "off",
+          tableStructureBypass: { [digest]: [1] },
+        }),
+    ]) {
+      await assert.rejects(
+        invoke,
+        (error) =>
+          error instanceof ParserProcessError && error.code === "invalid_input",
+      );
     }
   },
 );
@@ -861,7 +1059,8 @@ test(
             work: offWork,
           }),
         (error) =>
-          error instanceof ParserProcessError && error.code === "output_invalid",
+          error instanceof ParserProcessError &&
+          error.code === "output_invalid",
       );
       const offOutputId = randomUUID();
       const offOutput = await outputDirectory(f, offOutputId);
@@ -874,7 +1073,8 @@ test(
             outputDirectory: offOutput,
           }),
         (error) =>
-          error instanceof ParserProcessError && error.code === "output_invalid",
+          error instanceof ParserProcessError &&
+          error.code === "output_invalid",
       );
     } finally {
       await rm(f.base, { recursive: true, force: true });
@@ -978,6 +1178,160 @@ test(
       });
       assertOrderedSourceFields(offResult, 1, ["Fee", "USD", "65.00"]);
       await assertExactRawProvenance(offResult);
+
+      const tableStructureBypass = { [f.common.capture.sha256]: [1] };
+      const policyWork = await createParserProfileWorkDirectory({
+        workRoot: f.outputRoot,
+        workId: randomUUID(),
+      });
+      const policyProfile = await preparePdfDocQaProfile({
+        ...f.common,
+        tableStructureBypass,
+        workRoot: f.outputRoot,
+        work: policyWork,
+      });
+      assert.equal(policyProfile.state, "ready");
+      const policyOutputId = randomUUID();
+      const policyOutput = await outputDirectory(f, policyOutputId);
+      const policyIntent = await inspectParserOutputIntent({
+        outputRoot: f.outputRoot,
+        outputId: policyOutputId,
+      });
+      const policyResult = await runCapturedPdfParser({
+        ...f.common,
+        tableStructureBypass,
+        outputId: policyOutputId,
+        outputDirectory: policyOutput,
+      });
+      assert.equal(
+        policyResult.parserFingerprint,
+        policyProfile.parserFingerprint,
+      );
+      assert.deepEqual(policyResult.tableStructureBypassPages, [1]);
+      assertOrderedSourceFields(policyResult, 1, ["Fee", "USD", "65.00"]);
+      const refundRow = assertQuotedSourceField(
+        policyResult,
+        2,
+        "Refund | EUR | -10.00",
+      );
+      assert.equal(refundRow.locator.kind, "docling_table_row");
+      assert.deepEqual(
+        refundRow.locator.cells
+          .slice()
+          .sort(
+            (left, right) =>
+              left.start_col_offset_idx - right.start_col_offset_idx,
+          )
+          .map((cell) => cell.text),
+        ["Refund", "EUR", "-10.00"],
+      );
+      await assertExactRawProvenance(policyResult);
+      const policyRecovered = await inspectCapturedPdfParserOutput({
+        capture: f.common.capture,
+        outputRoot: f.outputRoot,
+        outputIntent: policyIntent,
+        expectedParserFingerprint: policyResult.parserFingerprint,
+        expectedExtractionConfigurationFingerprint:
+          policyResult.extractionConfigurationFingerprint,
+        expectedModelManifestSha256: policyResult.modelManifestSha256,
+      });
+      assert.deepEqual(policyRecovered.tableStructureBypassPages, [1]);
+      assert.deepEqual(policyRecovered.validated, policyResult.validated);
+
+      const replayCommon = await bypassSelectionReportingFixture(
+        f,
+        policyResult,
+        [1],
+      );
+      const replayOutputId = randomUUID();
+      const replayOutput = await outputDirectory(f, replayOutputId);
+      const replayResult = await runCapturedPdfParser({
+        ...replayCommon,
+        tableStructureBypass,
+        outputId: replayOutputId,
+        outputDirectory: replayOutput,
+      });
+      assert.deepEqual(replayResult.tableStructureBypassPages, [1]);
+      assert.deepEqual(replayResult.validated, policyResult.validated);
+
+      const falseReportCommon = await bypassSelectionReportingFixture(
+        f,
+        policyResult,
+        [2],
+      );
+      const falseReportOutputId = randomUUID();
+      const falseReportOutput = await outputDirectory(f, falseReportOutputId);
+      await assert.rejects(
+        () =>
+          runCapturedPdfParser({
+            ...falseReportCommon,
+            tableStructureBypass,
+            outputId: falseReportOutputId,
+            outputDirectory: falseReportOutput,
+          }),
+        (error) =>
+          error instanceof ParserProcessError &&
+          error.code === "output_invalid" &&
+          error.message ===
+            "Parser process failed: parser conversion table bypass match is invalid",
+      );
+
+      const outOfRangeBundle = JSON.parse(
+        await readFile(policyResult.normalizedBundle.path, "utf8"),
+      );
+      const parserDescriptor = outOfRangeBundle.parserFingerprint;
+      assert.equal(
+        fingerprintDescriptorForTest(parserDescriptor),
+        parserDescriptor.fingerprint,
+      );
+      parserDescriptor.configuration.tableStructureBypass[0].pages = [3];
+      parserDescriptor.fingerprint =
+        fingerprintDescriptorForTest(parserDescriptor);
+      const extraction = outOfRangeBundle.extractionFingerprint;
+      extraction.parserFingerprint = parserDescriptor.fingerprint;
+      const extractionConfiguration = {
+        schemaVersion: 1,
+        parserFingerprint: parserDescriptor.fingerprint,
+        implementationSha256: extraction.implementationSha256,
+        configuration: extraction.configuration,
+      };
+      extraction.extractionConfigurationFingerprint = sha256(
+        Buffer.from(canonicalJsonForTest(extractionConfiguration), "utf8"),
+      );
+      extraction.fingerprint = sha256(
+        Buffer.concat([
+          Buffer.from("kith-parsed-extraction:v1\0", "utf8"),
+          Buffer.from(
+            canonicalJsonForTest([
+              parserDescriptor.fingerprint,
+              policyResult.rawArtifact.sha256,
+              extraction.extractionConfigurationFingerprint,
+            ]),
+            "utf8",
+          ),
+        ]),
+      );
+      await writeFile(
+        policyResult.normalizedBundle.path,
+        JSON.stringify(outOfRangeBundle),
+      );
+      await assert.rejects(
+        () =>
+          inspectCapturedPdfParserOutput({
+            capture: f.common.capture,
+            outputRoot: f.outputRoot,
+            outputIntent: policyIntent,
+            expectedParserFingerprint: parserDescriptor.fingerprint,
+            expectedExtractionConfigurationFingerprint:
+              extraction.extractionConfigurationFingerprint,
+            expectedModelManifestSha256: policyResult.modelManifestSha256,
+          }),
+        (error) =>
+          error instanceof ParserProcessError &&
+          error.code === "output_invalid" &&
+          error.message ===
+            "Parser process failed: normalized page or gap count is invalid",
+      );
       context.diagnostic(
         JSON.stringify({
           pages: mapped.pages.length,
