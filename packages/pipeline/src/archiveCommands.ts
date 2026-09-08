@@ -25,6 +25,8 @@ import {
   type PreparedAgeObject,
   type PublishedAgeObject,
   type ReadbackResticObjectInput,
+  type RestoreResticObjectInput,
+  type RestoredResticObject,
   type RecoveredResticBackup,
   type RecoverResticBackupInput,
   type ResticBackupResult,
@@ -1507,6 +1509,210 @@ async function readbackResticObjectInternal(
   };
 }
 
+async function dirSync(path: string): Promise<void> {
+  const dir = await open(path, constants.O_RDONLY | constants.O_DIRECTORY);
+  try {
+    await dir.sync();
+  } finally {
+    await dir.close();
+  }
+}
+
+async function restoreResticObjectInternal(
+  input: RestoreResticObjectInput,
+): Promise<RestoredResticObject> {
+  requiredOpenConstants();
+  const commandLimits = limits(input.limits ?? DEFAULT_ARCHIVE_COMMAND_LIMITS);
+  await validateExecutable(input.resticBinary, "restic binary");
+  await requireResticVersion(input.resticBinary, commandLimits);
+  if (!HEX_64.test(input.snapshotId) || !OBJECT_NAME.test(input.objectName))
+    fail("invalid_input", "restic restore identity is invalid");
+  const expected = expectedFile(
+    input.expectedCiphertext,
+    commandLimits.maxCipherBytes,
+  );
+  const destinationPath = safeAbsolutePath(
+    input.destinationPath,
+    "restore destination",
+  );
+  const destinationDirectory = await safeDirectory(
+    dirname(destinationPath),
+    "restore destination directory",
+  );
+  const existing = await lstat(destinationPath).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    fail("unsafe_path", "restore destination could not be inspected");
+  });
+  if (existing !== undefined)
+    fail("destination_exists", "restore destination already exists");
+  const repository = await resolveRepository(input, commandLimits);
+  const repositoryIdentity = await requireResticRepository(
+    {
+      resticBinary: input.resticBinary,
+      ...location(input),
+      passwordCommand: input.passwordCommand,
+      limits: commandLimits,
+    },
+    input.expectedRepositoryId,
+  );
+  const password = await passwordCommandArgument(input.passwordCommand);
+  const tempPath = `${destinationPath}.restore-${crypto.randomUUID()}.tmp`;
+  const handle = await open(
+    tempPath,
+    constants.O_CREAT |
+      constants.O_EXCL |
+      constants.O_WRONLY |
+      constants.O_NOFOLLOW,
+    FILE_MODE,
+  ).catch(() => fail("unsafe_path", "restore temporary could not be created"));
+  let tempIdentity: FileIdentity | undefined;
+  let published = false;
+  let running: ChildProcessWithoutNullStreams | undefined;
+  try {
+    await handle.chmod(FILE_MODE);
+    tempIdentity = identity(await handle.stat());
+    running = child(
+      input.resticBinary,
+      [
+        ...resticBaseArgs(repository.locator, password, repository.options),
+        "dump",
+        input.snapshotId,
+        `/${input.objectName}`,
+      ],
+      undefined,
+      repository.environment,
+    );
+    running.stdin.end();
+    const digest = createHash("sha256");
+    let byteLength = 0;
+    let fileOffset = 0;
+    const output = (async () => {
+      for await (const value of running.stdout) {
+        const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+        byteLength += chunk.length;
+        if (byteLength > commandLimits.maxCipherBytes) {
+          killProcessTree(running);
+          fail("output_limit_exceeded", "restore exceeded limit");
+        }
+        digest.update(chunk);
+        let offset = 0;
+        while (offset < chunk.length) {
+          const result = await handle.write(
+            chunk,
+            offset,
+            chunk.length - offset,
+            fileOffset + offset,
+          );
+          if (!result.bytesWritten)
+            fail("process_failed", "restore write made no progress");
+          offset += result.bytesWritten;
+        }
+        fileOffset += chunk.length;
+        chunk.fill(0);
+      }
+    })();
+    const stderr = collect(
+      running.stderr,
+      commandLimits.maxOutputBytes,
+      running,
+    );
+    await withinProcessDeadline(
+      running,
+      Promise.all([output, stderr, processCompletion(running)]),
+      commandLimits.deadlineMs,
+    );
+    if (
+      byteLength < 1 ||
+      digest.digest("hex") !== expected.sha256 ||
+      byteLength !== expected.byteLength
+    )
+      fail("readback_failed", "restic restore did not match ciphertext");
+    await handle.sync();
+    const restored = await readExactFile(
+      tempPath,
+      commandLimits.maxCipherBytes,
+      true,
+    );
+    restored.bytes.fill(0);
+    if (
+      !tempIdentity ||
+      restored.identity.device !== tempIdentity.device ||
+      restored.identity.inode !== tempIdentity.inode ||
+      restored.digest.sha256 !== expected.sha256 ||
+      restored.digest.byteLength !== expected.byteLength
+    )
+      fail("readback_failed", "restore temporary changed");
+    const temporaryStats = await handle.stat();
+    if (temporaryStats.nlink !== 1 || (temporaryStats.mode & 0o777) !== FILE_MODE)
+      fail("unsafe_path", "restore temporary permissions or links changed");
+    await handle.close();
+    const currentDirectory = await safeDirectory(
+      dirname(destinationPath),
+      "restore destination directory",
+    );
+    if (!sameDirectoryIdentity(destinationDirectory, currentDirectory))
+      fail("unsafe_path", "restore destination directory changed");
+    await recheckFile(tempPath, restored.identity);
+    await link(tempPath, destinationPath).catch((error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST")
+        fail("destination_exists", "restore destination already exists");
+      fail("unsafe_path", "restore destination could not be published");
+    });
+    published = true;
+    const publishedFile = await readExactFile(
+      destinationPath,
+      commandLimits.maxCipherBytes,
+      true,
+    );
+    publishedFile.bytes.fill(0);
+    if (
+      !tempIdentity ||
+      publishedFile.identity.device !== tempIdentity.device ||
+      publishedFile.identity.inode !== tempIdentity.inode ||
+      publishedFile.digest.sha256 !== expected.sha256 ||
+      publishedFile.digest.byteLength !== expected.byteLength
+    )
+      fail("readback_failed", "restore publication changed");
+    const dir = await open(
+      dirname(destinationPath),
+      constants.O_RDONLY | constants.O_DIRECTORY,
+    );
+    try {
+      await dir.sync();
+    } finally {
+      await dir.close();
+    }
+    const publishedStats = await lstat(destinationPath);
+    if (publishedStats.nlink !== 2 || (publishedStats.mode & 0o777) !== FILE_MODE)
+      fail("unsafe_path", "restore publication permissions or links changed");
+    await unlinkExact(tempPath, tempIdentity!);
+    await dirSync(dirname(destinationPath));
+    const finalStats = await lstat(destinationPath);
+    if (finalStats.dev !== tempIdentity.device || finalStats.ino !== tempIdentity.inode || finalStats.nlink !== 1 || (finalStats.mode & 0o777) !== FILE_MODE)
+      fail("unsafe_path", "restore final identity changed");
+    return {
+      destinationPath,
+      snapshotId: input.snapshotId,
+      objectName: input.objectName,
+      ciphertext: expected,
+      resticVersion: RESTIC_VERSION,
+      repositoryId: repositoryIdentity.repositoryId,
+      verification: "exact_ciphertext_restore",
+    };
+  } catch (error) {
+    if (running) {
+      killProcessTree(running);
+      running.stdin.destroy();
+      running.stdout.destroy();
+      running.stderr.destroy();
+    }
+    await handle.close().catch(() => undefined);
+    if (!published && tempIdentity)
+      await unlinkExact(tempPath, tempIdentity).catch(() => undefined);
+    throw error;
+  }
+}
+
 async function backupResticObjectInternal(
   input: BackupResticObjectInput,
 ): Promise<ResticBackupResult> {
@@ -2028,6 +2234,12 @@ export async function readbackResticObject(
   input: ReadbackResticObjectInput,
 ): Promise<ResticReadbackResult> {
   return publicOperation(() => readbackResticObjectInternal(input));
+}
+
+export async function restoreResticObject(
+  input: RestoreResticObjectInput,
+): Promise<RestoredResticObject> {
+  return publicOperation(() => restoreResticObjectInternal(input));
 }
 
 export async function backupResticObject(
