@@ -85,12 +85,25 @@ currencies, so a mixed total is a loud failure instead of a plausible number.
 ## Deduplication
 
 `rowHash` is the deduplication contract. It hashes over account, process date,
-activity type, description, quantity and amount, using canonical forms, with the
-currency included because an amount in minor units has no meaning without the
-scale its currency gives it. Activity type is lowercased and whitespace inside
-descriptions is collapsed, since PDF extraction varies the gaps between runs. A
-provider transaction ID is preferred where one exists and is stable; the hash is
-the fallback. `transactions.row_hash` is `UNIQUE`.
+activity type, description, quantity, amount and an occurrence ordinal, using
+canonical forms, with the currency included because an amount in minor units
+has no meaning without the scale its currency gives it. Activity type is
+lowercased and whitespace inside descriptions is collapsed, since PDF
+extraction varies the gaps between runs. A provider transaction ID is
+preferred where one exists and is stable; the hash is the fallback.
+`transactions.row_hash` is `UNIQUE`.
+
+The occurrence ordinal is what lets one hash formula satisfy two opposite
+requirements at once: the same transaction reappearing on an overlapping page
+must dedupe, and two really-distinct transactions that happen to share a date,
+amount and description must not merge. It is a hashed field, computed by the
+importer as "how many times has this exact content been seen so far in this
+one source document, in document order" (first occurrence is 1) — never
+appended to a hash after the fact, because a suffix appended post-hoc would
+make `row_hash` stop being a hash of the row's content and would make "unique
+row_hash count equals inserted row count" true by construction instead of a
+real invariant. See `src/importer.ts` for the full reasoning and worked
+examples.
 
 ## Institution adapter interface
 
@@ -137,6 +150,84 @@ against fixtures generated in `fixtures.ts`, including a paginated activity
 feed with a deliberate page-boundary overlap and one deliberately
 unparseable statement amount. `test/syntheticAdapter.test.mjs` is what a new
 adapter's own suite should look like.
+## Importer
+
+`importBatch(db, batch, now?)` turns normalized rows into `documents`,
+`transactions` and `review_items`, and writes one `import_runs` summary. It is
+a script, not something an agent reads rows through: it returns counts, never
+row content (see "Working on the archive without reading it" in the plan).
+The whole batch commits or rolls back as one transaction, so a provider-count
+mismatch or a broken invariant never leaves a partially-imported archive.
+
+`ImportRow` is the row shape it consumes, not an adapter interface. It is the
+seam an institution adapter's `parse()` output gets mapped to; see the type's
+doc comment in `src/importer.ts` for every field. In short: `accountId` must
+already exist, `processDate` is a required ISO date, amounts are decimal text
+in the row's own currency, and `providerTxnId` is a stable per-account id from
+the source when one exists.
+
+Deduplication follows the plan exactly: a stable `providerTxnId` is the
+preferred, authoritative identity and is what correctly collapses an
+overlapping page from a paginated pull regardless of row order. Without one,
+the importer looks up the computed `row_hash` (content plus the per-document
+occurrence ordinal, see "Deduplication" above) before inserting; a match found
+in a different document is skipped as a duplicate rather than colliding at
+write time, and because that collapse rests on content evidence rather than a
+stable id, it opens a `review_items` entry recording both source locators
+instead of happening silently. A match within the same document cannot
+happen, since every occurrence in one document gets its own ordinal, which is
+exactly how two legitimately identical transactions (same date, amount,
+description) both survive. Re-importing the same raw bytes is a no-op at the
+whole-document level, keyed on `documents.sha256`, checked before any of this.
+
+A value `toMinorUnits` cannot place at the currency's exponent, a malformed
+quantity, price, running balance, trade date or settle date, an unparseable
+process date, a future date, or a date before 1900 each open a `review_items`
+row instead of being guessed. Only an unparseable process date blocks the
+transaction from being inserted at all, because `process_date` has no other
+spelling to store; every other case stores what the source stated (or NULL
+for the field in question) and flags it.
+
+This importer always writes `reconciliations_passed` and `reconciliations_failed`
+as 0; the reconciliation gate is a separate step run after import (see below).
+
+## Reconciliation gate
+
+`runReconciliationGate(db, importRunId?)` (`src/reconciliation.ts`) is ground
+rule 3 made concrete: reconciliation is a gate, not a report. For every
+account with two or more `balances` snapshots, it treats each consecutive
+pair of snapshots as one statement period, sums that account's transactions
+over the period (inclusive of both boundary dates), and compares the sum
+against the snapshots' stated cash change. It writes one `reconciliations`
+row per period and returns the same information as counts and period-level
+facts, never a transaction row.
+
+**The comparison is always cash, never total value.** Market movement makes
+an exact diff possible only for a cash-like balance: an unrealized gain or
+loss on a held security changes `total_value` without ever appearing as a
+transaction, so comparing against `total_value` would fail an investment
+account's every period on ordinary market movement. This file never reads
+`total_value`, `period_start_value` or `period_end_value` at all, so there is
+nothing in it that could compare against them by mistake. For a cash-only
+account (checking, savings) `cash` is the account's only balance, so the same
+comparison is correct there unchanged.
+
+**The tolerance is exact zero**, an owner decision, not a default: any
+nonzero delta fails the period. `reconciliations.tolerance` is written on
+every row, passing or not, so a future policy change can never silently
+reinterpret an old pass. A period is `pass` when the delta is exactly zero,
+`fail` when transactions were summed but do not explain the stated change,
+and `unverified` when no verdict could be computed at all -- a snapshot
+missing its cash value, or a currency change between snapshots. `fail` and
+`unverified` both count toward `import_runs.reconciliations_failed`: neither
+is a clean pass, and the table has no third bucket. A consumer finds every
+period needing attention with `SELECT * FROM reconciliations WHERE status !=
+'pass'`, which is exactly what `get_coverage` already does per account.
+
+This gate does not populate `balances`; writing what a statement stated is a
+separate concern from checking it. Re-running after a corrected import is
+idempotent: any prior row for the same account and period is replaced, not
+added to.
 
 ## Schema and migrations
 
@@ -151,6 +242,37 @@ Never edit a migration that has shipped.
 
 Only the last four digits of an account number are stored, in
 `accounts.acct_last4`, enforced by a `CHECK` constraint.
+
+## Local read-only MCP server
+
+`src/mcp` is the v1 assistant access surface described in the plan: a local,
+read-only [MCP](https://modelcontextprotocol.io) server over one archive
+file, run as `pnpm --filter @repo/finance-archive mcp` after a build, with
+`FINANCE_ARCHIVE_DB_PATH` set to the archive file. That path is read from the
+environment only; it is never committed and the server never defaults to a
+location.
+
+Four tools: `describe_schema` (table and column documentation, plus the
+money, currency and valuation-basis policy), `run_query` (read-only SQL,
+bounded rows and time), `get_evidence` (source document, locator, content
+hash and retained-text path for one row), and `get_coverage` (per account:
+what was acquired, parsed, reconciled, and under review). Every response
+carries `datasetRevision` (SQLite's own `data_version`, which changes when
+the importer writes the file) and an explicit `completeness` state; a
+truncated `run_query` result is marked `truncated`, never `complete`, and a
+zero-row result always carries `resultSemantics` explaining that it means no
+indexed match, not proof that nothing happened.
+
+`run_query` enforces read-only in depth rather than by inspecting the SQL
+string: the file is opened `SQLITE_OPEN_READONLY`, `PRAGMA query_only` and
+defensive mode are both on, and an authorizer callback allow-lists `SELECT`,
+table/column reads and a small function list, denying every write, every DDL
+verb, `ATTACH`/`DETACH`, every `PRAGMA`, and file-access functions like
+`readfile` -- including one hidden inside a `WITH` clause or a subquery. A
+single-statement check on top of that, using SQLite's own parser rather than
+a regex, rejects a second statement smuggled after a semicolon or inside a
+comment. See `src/mcp/queryGuard.ts` for the full layer list and
+`test/mcpQueryGuard.test.mjs` for the attack-by-attack tests.
 
 ## Checks
 
