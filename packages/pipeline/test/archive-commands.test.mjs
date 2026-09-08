@@ -705,6 +705,25 @@ test("inventories pinned restic relative and absolute snapshot tree shapes", asy
   }
 });
 
+test("snapshot tree inventory rejects an oversized output limit before spawning tools", async () => {
+  const fixture = await setup({ protectedRoot: true });
+  await assert.rejects(
+    () =>
+      inventoryResticSnapshotTree(
+        treeInventoryInput(fixture, SNAPSHOT, {
+          limits: limits({ maxOutputBytes: 2 * 1024 * 1024 + 1 }),
+        }),
+      ),
+    (error) =>
+      error instanceof ArchiveCommandError && error.code === "invalid_input",
+  );
+  await assert.rejects(
+    () =>
+      readFile(join(fixture.repository, "restic-invocations.jsonl"), "utf8"),
+    (error) => error?.code === "ENOENT",
+  );
+});
+
 test("snapshot tree inventory rejects malformed, unsafe, and over-capacity records", async () => {
   const fixture = await setup({ protectedRoot: true });
   const tree = "6".repeat(64);

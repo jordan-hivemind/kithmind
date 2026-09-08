@@ -1444,6 +1444,9 @@ async function inventoryResticSnapshotTreeInternal(
   input: InventoryResticSnapshotTreeInput,
 ): Promise<ResticSnapshotTreeInventory> {
   const commandLimits = limits(input.limits ?? DEFAULT_ARCHIVE_COMMAND_LIMITS);
+  if (commandLimits.maxOutputBytes > MAX_INVENTORY_OUTPUT_BYTES) {
+    fail("invalid_input", "restic snapshot tree output limit is invalid");
+  }
   if (!HEX_64.test(input.snapshotId)) {
     fail("invalid_input", "restic snapshot identity is invalid");
   }
