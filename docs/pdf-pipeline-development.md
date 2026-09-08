@@ -55,8 +55,9 @@ on the same computer, so it does not establish physical failure independence.
 Owner-begun forget removed four configured archive copies, replayed the CLI
 without changing its result, and finalized a content-free tombstone. A later
 scan completed without reimporting the still-present forgotten source file.
-Isolated native restore preserved the exact final schema and exported values,
-including correction history and the tombstone. Copies deliberately made for
+Synthetic isolated native restore preserved the current schema: 67 application
+tables, 69 document files, and 247 exported rows with zero differences. Graph
+checks verified citations and the tombstone; copies deliberately made for
 isolated restore or operator diagnostics are outside the configured worker's
 forget operation.
 

@@ -2,7 +2,8 @@
 
 These optional recipes run the existing filesystem worker `watch` command as
 a per-user service. Start with synthetic files. Do not ingest owner documents
-until the isolated restore and owner-pilot gates in the
+until a backup independent of the source computer, key escrow, and the
+restore and owner-pilot gates in the
 [Phase 2 plan](plans/2026-09-07-phase2-document-pipeline.md) are complete.
 
 Build and check the worker before configuring a service:
@@ -25,8 +26,12 @@ heartbeats.
 After rotating a credential with a quiescent journal, use one authorized
 `run` to validate and accept the replacement before restarting `watch`.
 Watch refuses an unaccepted credential binding before sending a heartbeat.
-An interrupted active journal still requires explicit credential recovery;
-do not delete its pending state.
+Synthetic verification passed this quiescent rotation sequence with the journal
+unchanged before acceptance and the old key revoked. The replacement run
+completed without publication or catalog changes; the subsequent watch kept
+the same watcher identity and published no documents. An
+interrupted active journal still requires explicit credential recovery; do not
+delete its pending state.
 
 Keep the pipeline configuration, journal, credential material, wrapper, and
 logs outside the repository. Use absolute paths throughout the templates. The
