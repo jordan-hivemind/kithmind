@@ -224,6 +224,59 @@ test("a missing transaction fails the period and leaves it unverified", (t) => {
   );
 });
 
+test("a period containing a sale reconciles when the stated position goes down", (t) => {
+  const db = archive(t);
+  seedAccount(db, "acct_sale");
+  insertPosition(db, { accountId: "acct_sale", asOf: "2026-01-31", quantity: "100" });
+  // The holding shrinks, so the derived change must be negative too. A
+  // disposal recorded with an unsigned quantity would read as an
+  // acquisition and put this period 60 shares out.
+  insertPosition(db, { accountId: "acct_sale", asOf: "2026-02-28", quantity: "70" });
+  insertTransaction(db, {
+    accountId: "acct_sale",
+    processDate: "2026-01-11",
+    quantity: "1",
+  });
+  insertTransaction(db, {
+    accountId: "acct_sale",
+    processDate: "2026-02-06",
+    quantity: "-30",
+  });
+
+  const summary = runPositionReconciliationGate(db);
+
+  assert.equal(summary.passed, 1);
+  assert.equal(summary.failed, 0);
+  const rows = periodRows(db, "acct_sale");
+  assert.equal(rows[0].status, "pass");
+  assert.equal(rows[0].expected_change, "-30");
+  assert.equal(rows[0].computed_change, "-30");
+  assert.equal(rows[0].delta, "0");
+});
+
+test("a sale and a purchase in one period net exactly", (t) => {
+  const db = archive(t);
+  seedAccount(db, "acct_netting");
+  insertPosition(db, { accountId: "acct_netting", asOf: "2026-01-31", quantity: "100" });
+  insertPosition(db, { accountId: "acct_netting", asOf: "2026-02-28", quantity: "95.5" });
+  insertTransaction(db, {
+    accountId: "acct_netting",
+    processDate: "2026-01-11",
+    quantity: "1",
+  });
+  for (const [processDate, quantity] of [
+    ["2026-02-04", "-40"],
+    ["2026-02-14", "35.5"],
+  ]) {
+    insertTransaction(db, { accountId: "acct_netting", processDate, quantity });
+  }
+
+  const summary = runPositionReconciliationGate(db);
+
+  assert.equal(summary.passed, 1);
+  assert.equal(periodRows(db, "acct_netting")[0].delta, "0");
+});
+
 test("a duplicated transaction fails the period", (t) => {
   const db = archive(t);
   seedAccount(db, "acct_dupe");

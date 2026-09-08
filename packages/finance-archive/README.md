@@ -161,6 +161,13 @@ is known and explaining why it is unknown when it is not. A `null`
 it, because the plan is explicit that a total-assets query with no valuation
 basis silently mixes marked securities with positions carried at cost.
 
+`ParsedRow.quantity` is signed by direction: positive for an acquisition,
+negative for a disposal, whatever the source calls the activity. A sale of
+ten shares is `"-10"`, not `"10"` with the sign carried on `amount` alone.
+The position gate replays these quantities against a stated position change,
+and the sign cannot be recovered downstream from `activityType`, which is
+free provider text with no taxonomy behind it.
+
 `capabilities` declares which of the four sources
 (`structured_api`, `tabular_export`, `pdf_statement`, `trade_confirmation`)
 an adapter actually implements, its retention window, and free-text quirks.

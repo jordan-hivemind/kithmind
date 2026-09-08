@@ -105,16 +105,19 @@ export function generateActivityRows(
     const externalId = `tx-${String(i + 1).padStart(4, "0")}`;
     if (type === "buy" || type === "sell") {
       const instrument = instrumentAt(i);
-      const quantity = canonicalizeDecimal(String(5 + (i % 6) * 3));
+      const units = canonicalizeDecimal(String(5 + (i % 6) * 3));
       const price = fromMinorUnits(BigInt(5000 + ((i * 211) % 8000)), "USD");
-      const gross = multiplyDecimal(quantity, price);
+      const gross = multiplyDecimal(units, price);
       rows.push({
         externalId,
         date,
         activityType: type,
         description: `${type === "buy" ? "Buy" : "Sell"} ${instrument.symbol}`,
         instrument,
-        quantity,
+        // Signed: a disposal is negative (ParsedRow.quantity). Cash and
+        // quantity carry opposite signs on a trade, which is why a sale is
+        // a positive amount and a negative quantity.
+        quantity: type === "buy" ? units : negateDecimal(units),
         price,
         amount: type === "buy" ? negateDecimal(gross) : gross,
         currency: "USD",

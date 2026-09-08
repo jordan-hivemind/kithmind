@@ -275,6 +275,23 @@ export type ParsedRow = ParsedAmount & {
     readonly activityType: string;
     readonly description: string;
     readonly instrument: ParsedInstrument | null;
+    /**
+     * Signed, in the instrument's own units: **positive for an acquisition
+     * and negative for a disposal**, whatever the source calls the activity.
+     * A sale of ten shares is `"-10"`, not `"10"` with the sign carried on
+     * `amount` alone.
+     *
+     * This is not a formatting preference. The position reconciliation gate
+     * (`src/positionReconciliation.ts`) replays these quantities to check a
+     * stated position change, so an unsigned disposal reads as an
+     * acquisition and fails every period that contains one. The sign cannot
+     * be recovered downstream from `activityType`: that is free provider
+     * text with no taxonomy behind it, and guessing at it is exactly what
+     * the plan says to surface for review instead.
+     *
+     * `null` when the source's own value is missing or ambiguous, which the
+     * importer routes to `review_items` rather than guessing (ground rule 5).
+     */
     readonly quantity: string | null;
     readonly price: string | null;
     readonly currency: string;
