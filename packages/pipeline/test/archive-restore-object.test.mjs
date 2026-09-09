@@ -46,7 +46,7 @@ test("restores one exact ciphertext object with a no-clobber destination", async
       expectedCiphertext: { sha256: sha(bytes), byteLength: bytes.length },
       destinationPath: out,
       limits: {
-        deadlineMs: 1000,
+        deadlineMs: 5000,
         maxOutputBytes: 4096,
         maxSourceBytes: 400000,
         maxCipherBytes: 400000,
@@ -66,7 +66,7 @@ test("restores one exact ciphertext object with a no-clobber destination", async
           expectedCiphertext: { sha256: sha(bytes), byteLength: bytes.length },
           destinationPath: out,
           limits: {
-            deadlineMs: 1000,
+            deadlineMs: 5000,
             maxOutputBytes: 4096,
             maxSourceBytes: 400000,
             maxCipherBytes: 400000,

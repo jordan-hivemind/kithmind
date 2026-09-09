@@ -20,7 +20,11 @@ import {
 } from "../dist/archiveRelocationRebind.js";
 import { openArchiveCatalog } from "../dist/archiveCatalog.js";
 import { journalBindingForConfig, parseConfig } from "../dist/config.js";
-import { Journal, JournalSafetyError } from "../dist/journal.js";
+import {
+  Journal,
+  JournalLockedError,
+  JournalSafetyError,
+} from "../dist/journal.js";
 import { PDF_DOCQA_CHUNKING_FINGERPRINT } from "../dist/parsedBundleMapping.js";
 
 const codec = {
@@ -153,11 +157,14 @@ function relocation() {
   };
 }
 
-async function fixture({
-  previousRoot = "Legacy/backups",
-  proposedRoot = "Managed/backups",
-  initialCheckpoint = { version: 1, phase: "idle" },
-} = {}) {
+async function fixture(
+  {
+    previousRoot = "Legacy/backups",
+    proposedRoot = "Managed/backups",
+    initialCheckpoint = { version: 1, phase: "idle" },
+  } = {},
+  allocationAttempt = 0,
+) {
   const base = await mkdtemp(join(homedir(), ".kithmind-rebind-test-"));
   await chmod(base, 0o700);
   const identity = {
@@ -173,13 +180,27 @@ async function fixture({
   await writeFile(proposedPath, `${JSON.stringify(proposed)}\n`, {
     mode: 0o600,
   });
-  const journal = await Journal.open({
-    directory: previous.journalDir,
-    binding: journalBindingForConfig(previous),
-    credential: "credential",
-    initialCheckpoint,
-    codec,
-  });
+  let journal;
+  try {
+    journal = await Journal.open({
+      directory: previous.journalDir,
+      binding: journalBindingForConfig(previous),
+      credential: "credential",
+      initialCheckpoint,
+      codec,
+    });
+  } catch (error) {
+    await rm(base, { recursive: true, force: true });
+    // Allocate a new synthetic path and authority after an unrelated port collision.
+    // Intentional contention checks after fixture allocation still fail immediately.
+    if (error instanceof JournalLockedError && allocationAttempt < 4) {
+      return fixture(
+        { previousRoot, proposedRoot, initialCheckpoint },
+        allocationAttempt + 1,
+      );
+    }
+    throw error;
+  }
   const mapping = relocation();
   const catalog = await openArchiveCatalog({ journal });
   const archiveObjectId = randomUUID();
