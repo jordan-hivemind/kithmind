@@ -17,12 +17,40 @@ import {
   stageEmbeddingGeneration,
 } from "../embeddings/model";
 import { inspectGenerationPayload } from "../provenance/model";
+import { fuseDocumentCandidateRanks, searchDocuments } from "./model";
 import type { Id } from "../../_generated/dataModel";
 import schema from "../../legacySchema";
 import { modules } from "../../test.setup";
 
 const mcpIssuer = "https://brain.example.test";
 const webIssuer = "https://brain.example.test/convex";
+
+test("document fusion favors strong semantic matches without overwhelming keyword agreement", () => {
+  const semanticIds = [
+    "semantic-only",
+    ...Array.from({ length: 29 }, (_, index) => `semantic-filler-${index}`),
+    "agreement-tail",
+    "exact-keyword",
+  ];
+  const scores = fuseDocumentCandidateRanks(
+    [
+      { id: "keyword-only", rank: 0 },
+      { id: "exact-keyword", rank: 1 },
+      { id: "agreement-tail", rank: 128 },
+    ],
+    semanticIds.map((id, rank) => ({ id, rank })),
+  );
+
+  expect(scores.get("semantic-only")).toBeGreaterThan(
+    scores.get("keyword-only")!,
+  );
+  expect(scores.get("semantic-only")).toBeGreaterThan(
+    scores.get("agreement-tail")!,
+  );
+  expect(scores.get("exact-keyword")).toBeGreaterThan(
+    scores.get("semantic-only")!,
+  );
+});
 
 type Harness = ReturnType<typeof convexTest>;
 
@@ -397,6 +425,82 @@ describe("document reads", () => {
       historical: false,
       contentStatus: "stale",
     });
+  });
+
+  test("semantic-only candidates do not receive a keyword vote", async () => {
+    const t = convexTest(schema, modules);
+    const seeded = await seedIdentity(t);
+    const source = {
+      spaceId: seeded.spaceId,
+      sourceAccountId: seeded.sourceAccountId,
+      userId: seeded.userId,
+    };
+    const agreement = await seedDocument(t, {
+      ...source,
+      suffix: "agreement",
+      text: "needle supporting evidence",
+    });
+    const semanticOnly = await seedDocument(t, {
+      ...source,
+      suffix: "semantic-only",
+      text: "paraphrased supporting evidence",
+    });
+    const args = { query: "needle" };
+    const keyword = await t.run((ctx) =>
+      searchDocuments(ctx, [seeded.spaceId], args),
+    );
+    expect(keyword.results.map((result) => result.chunkId)).toEqual([
+      agreement.chunkId,
+    ]);
+    const hybrid = await t.run((ctx) =>
+      searchDocuments(ctx, [seeded.spaceId], args, {
+        chunkIds: [semanticOnly.chunkId, agreement.chunkId],
+        vectorStatus: "ready",
+      }),
+    );
+    expect(hybrid.results.map((result) => result.chunkId)).toEqual([
+      agreement.chunkId,
+      semanticOnly.chunkId,
+    ]);
+  });
+
+  test("does not let stale semantic IDs boost historical keyword candidates", async () => {
+    const t = convexTest(schema, modules);
+    const seeded = await seedIdentity(t);
+    await seedDocument(t, {
+      spaceId: seeded.spaceId,
+      sourceAccountId: seeded.sourceAccountId,
+      userId: seeded.userId,
+      suffix: "historical-fusion-first",
+      publicationState: "historical",
+    });
+    await seedDocument(t, {
+      spaceId: seeded.spaceId,
+      sourceAccountId: seeded.sourceAccountId,
+      userId: seeded.userId,
+      suffix: "historical-fusion-second",
+      publicationState: "historical",
+    });
+    const args = {
+      query: "needle",
+      includeHistorical: true,
+    };
+    const keyword = await t.run((ctx) =>
+      searchDocuments(ctx, [seeded.spaceId], args),
+    );
+    expect(keyword.results).toHaveLength(2);
+    const staleSemanticId = keyword.results[1]!.chunkId;
+
+    const hybrid = await t.run((ctx) =>
+      searchDocuments(ctx, [seeded.spaceId], args, {
+        chunkIds: [staleSemanticId],
+        vectorStatus: "ready",
+      }),
+    );
+
+    expect(hybrid.results.map((result) => result.chunkId)).toEqual(
+      keyword.results.map((result) => result.chunkId),
+    );
   });
 
   test("returns retained evidence for unavailable originals and filters foreign evidence IDs", async () => {

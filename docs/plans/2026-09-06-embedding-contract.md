@@ -116,6 +116,12 @@ comparison enforces the complete scope. It rechecks
 authorization and active-generation state while resolving results. This keeps
 incompatible fingerprints from mixing in a ranked result.
 
+Document hybrid search uses bounded reciprocal-rank fusion with `k = 60`, a
+keyword weight of `1`, and a semantic weight of `1.25`. It retains 32 candidates
+from each source within the existing 64-candidate budget. This modest weighting
+is a pilot-informed candidate policy for a hosted acceptance gate. It does not
+select an embedding model or establish held-out retrieval quality.
+
 Legacy vectors remain retained. If the corresponding compatible profile is
 configured and active again, they can serve through their matching generation.
 Changing the configured identity never reinterprets those vectors as vectors
