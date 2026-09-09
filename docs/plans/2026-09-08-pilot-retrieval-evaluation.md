@@ -38,12 +38,12 @@ is not an answer, and an empty ranking does not prove downstream abstention.
 No answer-level hallucination or exact structured-record accuracy is claimed.
 Authorization and citation-chain failures block release regardless of scores.
 
-## Initial verified state
+## Current index
 
-Live inspection found 163 active document chunks and no chunk vectors. The
-17 existing vectors belong to conversational thoughts. The active profile is
-the existing baseline, with incomplete document coverage. PDF activation does
-not automatically generate document vectors.
+The current index audit found 17 thought vectors and 163 chunk vectors: all
+180 active targets are present, with no missing, extra, duplicate or invalid
+rows. The active profile is unchanged. This audit establishes index shape, not
+retrieval quality or a model comparison.
 
 Current manifest limits are 256 eligible targets, 256 vector rows per
 generation, a 256-row thought scan and a 2 MiB estimated manifest budget.
@@ -51,30 +51,36 @@ The pilot currently has 180 eligible targets. The remaining 76-target row
 headroom is not a promise that any 76 documents fit. Pages, text bytes,
 per-document bounds and concurrent additions must also pass.
 
-## Hosted baseline
+## Hosted baseline and rerun
 
-The frozen run completed 42 hosted requests across 21 questions, with no
-request or citation-validation errors. All 334 returned citations matched
-retained text and immutable parent references. The temporary scoped read key
-was revoked after the run.
+The initial frozen run completed 42 hosted requests across the same 21
+questions. Keyword and hybrid each retrieved supporting evidence at rank five
+for 11/18 answerable questions, with MRR 0.611. Hybrid had semantic candidates
+for 0/21 requests and fell back to keyword. It returned 334 valid citations;
+the scoped read key was revoked afterward.
 
-| Measure                               | Keyword       | Hybrid request |
-| ------------------------------------- | ------------- | -------------- |
-| Supporting evidence in top five       | 11/18 (61.1%) | 11/18 (61.1%)  |
-| Evidence MRR at five                  | 0.611         | 0.611          |
-| All-gold evidence recall at five      | 0.583         | 0.583          |
-| Correct document in top two           | 18/18         | 18/18          |
-| Request p95                           | 682 ms        | 655 ms         |
-| Semantic candidates available         | Not requested | 0/21           |
-| Negative queries returning candidates | 3/3           | 3/3            |
+The combined frozen rerun completed 42 hosted requests across 21 questions,
+with no request or citation-validation errors. All 734 returned citations
+matched retained text and immutable parent references. The temporary scoped
+read key was revoked after the run.
 
-Both requests failed the frozen retrieval target. Hybrid fell back to keyword,
-so this is not a measured comparison of embedding models. The seven evidence
-misses still found the right document; the selected chunk omitted the needed
-page. Every request reported the bounded candidate search as partial. This
-qualifies search breadth, not the validity of returned citations. A subsequent
-`get_document` can expose additional pages, but that two-step workflow is not
-counted as search-only evidence success here.
+| Measure                         | Keyword       | Hybrid request |
+| ------------------------------- | ------------- | -------------- |
+| Supporting evidence in top five | 13/18 (72.2%) | 14/18 (77.8%)  |
+| Evidence MRR at five            | 0.648148      | 0.668519       |
+| Request p95                     | 752 ms        | 1.789 s        |
+| Semantic candidates available   | Not requested | 21/21          |
+
+Both requests still fail the frozen 85% success-at-five target. The hybrid
+result now has semantic candidates for every request, but remains a bounded
+hosted measurement rather than a proof of answer quality. Every request
+reported the bounded candidate search as partial. This qualifies search
+breadth, not the validity of returned citations or any downstream answer.
+
+PR #84 was merged at `4651036` and the existing deployment workflow
+automatically deployed it in CI run `34309952297` before the rerun. The rerun
+therefore cannot isolate a single index change. Future measurement plans must
+account for this automatic deployment behavior.
 
 The corpus has similar tax forms and duplicated facts. It is a diagnostic
 pilot, not a held-out estimate of quality across the owner's filing system.
@@ -83,25 +89,36 @@ pilot, not a held-out estimate of quality across the owner's filing system.
 
 The frozen labels were also scored offline against immutable retained chunks
 and evidence IDs. This records local cosine ranking, not hosted request
-latency or a deployed model change. The active small profile remains in place
-while missing document vectors are restored; the large profile is prospective.
+latency or a deployed model change. The missing document-vector repair is
+complete and the active small profile remains in place. The large profile is
+prospective.
 
-| Candidate                                                   | Answerable success at five |          Evidence MRR at five | Status                                   |
-| ----------------------------------------------------------- | -------------------------: | ----------------------------: | ---------------------------------------- |
-| Existing 163 chunks, small 1,536 dimensions, raw chunk rank |                      13/18 |                       0.62037 | Diagnostic baseline                      |
-| Existing 163 chunks, large 1,536 dimensions, raw chunk rank |                      17/18 |                       0.76389 | Prospective candidate                    |
-| Existing chunks, small, one result per document             |                      12/18 |       Not a deployment target | Superseded selection policy              |
-| Existing chunks, large, one result per document             |                      13/18 |       Not a deployment target | Superseded selection policy              |
-| Existing chunks, small, up to three passages per document   |                      13/18 | Not a model comparison change | Current passage-selection policy         |
-| Existing chunks, large, up to three passages per document   |                      16/18 |       Not a deployment target | Prospective passage policy               |
-| Page split near 1,200 characters with 180 overlap           |  11/18 parent-page success |               Diagnostic only | 475 chunks, exceeds current target bound |
-| Page split near 2,400 characters with 300 overlap           |  13/18 parent-page success |               Diagnostic only | 263 chunks, exceeds current target bound |
+| Candidate                                                   | Answerable success at five |          Evidence MRR at five | Status                                    |
+| ----------------------------------------------------------- | -------------------------: | ----------------------------: | ----------------------------------------- |
+| Existing 163 chunks, small 1,536 dimensions, raw chunk rank |                      13/18 |                       0.62037 | Diagnostic baseline                       |
+| Existing 163 chunks, large 1,536 dimensions, raw chunk rank |                      17/18 |                       0.76389 | Prospective candidate                     |
+| Existing chunks, small, one result per document             |                      12/18 |       Not a deployment target | Superseded selection policy               |
+| Existing chunks, large, one result per document             |                      13/18 |       Not a deployment target | Superseded selection policy               |
+| Existing chunks, small, up to three passages per document   |                      13/18 | Not a model comparison change | Current passage-selection policy          |
+| Existing chunks, large, up to three passages per document   |                      16/18 |       Not a deployment target | Current passage policy; prospective model |
+| Page split near 1,200 characters with 180 overlap           |  11/18 parent-page success |               Diagnostic only | 475 chunks, exceeds current target bound  |
+| Page split near 2,400 characters with 300 overlap           |  13/18 parent-page success |               Diagnostic only | 263 chunks, exceeds current target bound  |
 
 The offline run made 55 provider requests with zero retries and reported
 511,224 input tokens. It does not infer cost. A split chunk inherits no proof
 that it supports all page evidence; exact span identity remains required. Both
 split candidates exceed the current 256 eligible-target limit before thoughts,
 so neither can be activated under the present manifest bound.
+
+## Thought-only comparison
+
+A separate private ten-query thought-only comparison was 10/10 at rank five
+for both models. Small had MRR 0.8 and large had MRR 1.0; paired ordering was
+4/6 for small and 6/6 for large. The comparison made six provider requests,
+reported 5,356 input tokens, and had zero retries. Its historical and
+lifecycle filtering was offline evaluation logic, not a production security
+proof. Large remains prospective pending live development recall and capture
+regression checks plus a safe shared-profile migration.
 
 ## Controlled expansion
 
