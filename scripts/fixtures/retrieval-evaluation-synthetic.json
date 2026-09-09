@@ -1,0 +1,102 @@
+{
+  "version": 1,
+  "metadata": { "corpus": "synthetic-public-fixture" },
+  "thresholds": {
+    "atK": {
+      "1": {
+        "minimumRecall": 0.5,
+        "minimumMrr": 0.5,
+        "minimumSuccessRate": 0.5
+      },
+      "3": { "minimumRecall": 0.75, "minimumMrr": 0.5, "minimumSuccessRate": 1 }
+    },
+    "maximumFalsePositiveRate": 0,
+    "maximumP95LatencyMs": 100
+  },
+  "cases": [
+    {
+      "id": "synthetic-lab",
+      "category": "health",
+      "query": "Which synthetic sample was retained?",
+      "kind": "answerable",
+      "relevantEvidenceIds": ["evidence-lab-a", "evidence-lab-b"]
+    },
+    {
+      "id": "synthetic-service",
+      "category": "household",
+      "query": "What service marker was recorded?",
+      "kind": "answerable",
+      "relevantEvidenceIds": ["evidence-service-a"]
+    },
+    {
+      "id": "synthetic-unknown",
+      "category": "unanswerable",
+      "query": "What is the synthetic passport number?",
+      "kind": "unanswerable"
+    }
+  ],
+  "runs": [
+    {
+      "id": "semantic-public-v1-run-1",
+      "mode": "semantic",
+      "fingerprint": "synthetic-embedding-v1",
+      "timing": {
+        "request": "latencyMs measures one completed retrieval request, including provider work",
+        "cli": "latencyMs excludes local fixture serialization and evaluator CLI work"
+      },
+      "observations": [
+        {
+          "caseId": "synthetic-lab",
+          "rankedEvidenceIds": [
+            "evidence-lab-a",
+            "evidence-other",
+            "evidence-lab-b"
+          ],
+          "latencyMs": 20,
+          "semanticCandidateStatus": "available"
+        },
+        {
+          "caseId": "synthetic-service",
+          "rankedEvidenceIds": ["evidence-service-a"],
+          "latencyMs": 35,
+          "semanticCandidateStatus": "available"
+        },
+        {
+          "caseId": "synthetic-unknown",
+          "rankedEvidenceIds": [],
+          "latencyMs": 25,
+          "semanticCandidateStatus": "available"
+        }
+      ]
+    },
+    {
+      "id": "keyword-public-v1-run-1",
+      "mode": "keyword",
+      "fingerprint": "keyword-v1",
+      "timing": {
+        "request": "latencyMs measures one completed keyword retrieval request",
+        "cli": "latencyMs excludes local fixture serialization and evaluator CLI work"
+      },
+      "observations": [
+        {
+          "caseId": "synthetic-lab",
+          "rankedEvidenceIds": ["evidence-lab-a", "evidence-lab-b"],
+          "latencyMs": 10,
+          "semanticCandidateStatus": "not_requested"
+        },
+        {
+          "caseId": "synthetic-service",
+          "rankedEvidenceIds": ["evidence-service-a"],
+          "latencyMs": 15,
+          "semanticCandidateStatus": "not_requested"
+        },
+        {
+          "caseId": "synthetic-unknown",
+          "rankedEvidenceIds": [],
+          "latencyMs": 12,
+          "semanticCandidateStatus": "not_requested"
+        }
+      ]
+    }
+  ]
+}

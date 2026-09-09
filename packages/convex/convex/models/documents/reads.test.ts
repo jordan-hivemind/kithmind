@@ -115,6 +115,7 @@ async function seedDocument(
     generationSourceAccountId?: Id<"sourceAccounts">;
     text?: string;
     chunkText?: string;
+    extraChunkTexts?: string[];
     evidenceCount?: number;
     evidenceWholeText?: boolean;
   },
@@ -126,6 +127,7 @@ async function seedDocument(
     const chunkText = input.chunkText ?? text;
     const evidenceCount = input.evidenceCount ?? 1;
     const evidenceEnd = input.evidenceWholeText ? text.length : 6;
+    const chunkTexts = [chunkText, ...(input.extraChunkTexts ?? [])];
     const textBytes = new TextEncoder().encode(text).byteLength;
     const contentHash = createHash("sha256").update(text).digest("hex");
     const textHash = createHash("sha256").update(text).digest("hex");
@@ -179,11 +181,11 @@ async function seedDocument(
       expectedPageCount: 1,
       expectedEvidenceSpanCount: evidenceCount,
       expectedDocumentCount: 1,
-      expectedChunkCount: 1,
+      expectedChunkCount: chunkTexts.length,
       actualPageCount: 1,
       actualEvidenceSpanCount: evidenceCount,
       actualDocumentCount: 1,
-      actualChunkCount: 1,
+      actualChunkCount: chunkTexts.length,
       embeddingStatus: "unavailable",
       ...(publicationState === "staged"
         ? {}
@@ -235,15 +237,19 @@ async function seedDocument(
       evidenceSpanIds,
       publicationState,
     });
-    const chunkId = await ctx.db.insert("chunks", {
-      spaceId: input.chunkSpaceId ?? input.spaceId,
-      processingGenerationId: generationId,
-      documentId,
-      ordinal: 0,
-      text: chunkText,
-      evidenceSpanIds,
-      publicationState,
-    });
+    const chunkIds = await Promise.all(
+      chunkTexts.map((chunkText, ordinal) =>
+        ctx.db.insert("chunks", {
+          spaceId: input.chunkSpaceId ?? input.spaceId,
+          processingGenerationId: generationId,
+          documentId,
+          ordinal,
+          text: chunkText,
+          evidenceSpanIds,
+          publicationState,
+        }),
+      ),
+    );
     await ctx.db.patch(itemId, {
       desiredRevisionId: revisionId,
       ...(publicationState === "active"
@@ -262,7 +268,8 @@ async function seedDocument(
       evidenceSpanId: evidenceSpanIds[0]!,
       evidenceSpanIds,
       documentId,
-      chunkId,
+      chunkId: chunkIds[0]!,
+      chunkIds,
     };
   });
 }
@@ -735,4 +742,103 @@ test("semantic document hydration preserves evidence and rechecks profile, sourc
   await expect(
     t.query(internal.models.documents.private.searchWithCandidates, args),
   ).rejects.toThrow();
+});
+
+test("search keeps three ranked passages per document while preserving later documents", async () => {
+  const t = convexTest(schema, modules);
+  const seeded = await seedIdentity(t);
+  const first = await seedDocument(t, {
+    spaceId: seeded.spaceId,
+    sourceAccountId: seeded.sourceAccountId,
+    userId: seeded.userId,
+    suffix: "passage-limit-first",
+    extraChunkTexts: [
+      "later passage one",
+      "later passage two",
+      "later passage three",
+    ],
+  });
+  const second = await seedDocument(t, {
+    spaceId: seeded.spaceId,
+    sourceAccountId: seeded.sourceAccountId,
+    userId: seeded.userId,
+    suffix: "passage-limit-second",
+  });
+  const third = await seedDocument(t, {
+    spaceId: seeded.spaceId,
+    sourceAccountId: seeded.sourceAccountId,
+    userId: seeded.userId,
+    suffix: "passage-limit-third",
+  });
+  const config = loadEmbeddingConfig({});
+  const profile = embeddingProfile(config);
+  const fingerprint = await fingerprintEmbeddingConfig(profile);
+  const vectors = await t.run(async (ctx) => {
+    const generation = await createEmbeddingGeneration(ctx, {
+      spaceId: seeded.spaceId,
+      profile,
+      fingerprint,
+      createdAt: 1,
+    });
+    const vectorIds = [];
+    for (const chunkId of [
+      ...first.chunkIds,
+      ...second.chunkIds,
+      ...third.chunkIds,
+    ]) {
+      const chunk = await ctx.db.get(chunkId);
+      if (!chunk) throw new Error("synthetic chunk missing");
+      vectorIds.push(
+        await insertChunkEmbedding(ctx, {
+          spaceId: seeded.spaceId,
+          chunkId,
+          embeddingGenerationId: generation._id,
+          fingerprint,
+          inputText: chunk.text,
+          vector: Array(1536).fill(0.1),
+        }),
+      );
+    }
+    await stageEmbeddingGeneration(ctx, {
+      embeddingGenerationId: generation._id,
+      stagedAt: 2,
+    });
+    await activateEmbeddingGeneration(ctx, {
+      embeddingGenerationId: generation._id,
+      activatedAt: 3,
+    });
+    return { generationId: generation._id, vectorIds };
+  });
+  const result = await t.query(
+    internal.models.documents.private.searchWithCandidates,
+    {
+      principal: { userId: seeded.userId, credentialId: seeded.keyId },
+      spaceIds: [seeded.spaceId],
+      query: "unrelated semantic passage",
+      limit: 4,
+      targets: [
+        {
+          spaceId: seeded.spaceId,
+          embeddingGenerationId: vectors.generationId,
+          fingerprint,
+        },
+      ],
+      embeddingVectorIds: vectors.vectorIds,
+    },
+  );
+  expect(result.results).toHaveLength(4);
+  expect(result.results.map((row) => row.chunkId)).toEqual([
+    ...first.chunkIds.slice(0, 3),
+    second.chunkId,
+  ]);
+  expect(
+    result.results.filter((row) => row.documentId === first.documentId),
+  ).toHaveLength(3);
+  expect(result.results.some((row) => row.chunkId === first.chunkIds[3])).toBe(
+    false,
+  );
+  expect(
+    result.results.some((row) => row.documentId === second.documentId),
+  ).toBe(true);
+  expect(result.truncated).toBe(true);
 });
