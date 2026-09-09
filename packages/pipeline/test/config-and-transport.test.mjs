@@ -32,6 +32,62 @@ test("config accepts only bounded absolute worker config", () => {
   );
 });
 
+test("config accepts only bounded normalized exact-file roots", () => {
+  const base = {
+    protocolVersion: 1,
+    endpoint: "http://127.0.0.1:3100/api/worker",
+    spaceId: "space_1",
+    sourceAccountId: "source_1",
+    credentialEnv: "PIPELINE_TOKEN",
+    roots: [
+      {
+        alias: "notes",
+        path: "/tmp/notes",
+        includeFiles: ["reports/zeta.pdf", "reports/alpha.pdf"],
+      },
+    ],
+    journalDir: "/tmp/journal",
+  };
+  const parsed = parseConfig(base);
+  assert.deepEqual(parsed.roots[0].includeFiles, [
+    "reports/alpha.pdf",
+    "reports/zeta.pdf",
+  ]);
+  const reversed = structuredClone(base);
+  reversed.roots[0].includeFiles.reverse();
+  assert.equal(
+    journalBindingForConfig(parseConfig(reversed)).configFingerprint,
+    journalBindingForConfig(parsed).configFingerprint,
+  );
+  const unrestricted = structuredClone(base);
+  delete unrestricted.roots[0].includeFiles;
+  assert.notEqual(
+    journalBindingForConfig(parseConfig(unrestricted)).configFingerprint,
+    journalBindingForConfig(parsed).configFingerprint,
+  );
+  for (const includeFiles of [
+    [],
+    ["reports/alpha.pdf", "reports/alpha.pdf"],
+    ["reports", "reports/alpha.pdf"],
+    ["reports", "reports-old/alpha.pdf", "reports/alpha.pdf"],
+    ["/reports/alpha.pdf"],
+    ["reports//alpha.pdf"],
+    ["reports/../alpha.pdf"],
+    ["reports\\alpha.pdf"],
+    [" reports/alpha.pdf"],
+    ["reports/alpha.pdf "],
+    [`reports/${"a".repeat(2_048)}.pdf`],
+    Array.from({ length: 257 }, (_, index) => `report-${index}.pdf`),
+  ]) {
+    const invalid = structuredClone(base);
+    invalid.roots[0].includeFiles = includeFiles;
+    assert.throws(() => parseConfig(invalid));
+  }
+  const unknown = structuredClone(base);
+  unknown.roots[0].includeGlobs = ["reports/*.pdf"];
+  assert.throws(() => parseConfig(unknown));
+});
+
 function pdfDocQaConfig() {
   const digest = "a".repeat(64);
   const archiveIdentity = {

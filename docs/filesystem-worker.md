@@ -42,6 +42,27 @@ Root aliases use lowercase letters, digits, dots, underscores, and hyphens,
 start with a letter or digit, and are at most 64 characters. Aliases must be
 unique. Keep the same alias when restarting a source.
 
+Each root may add an exact `includeFiles` list when only named files should be
+in scope:
+
+```json
+{
+  "alias": "demo",
+  "path": "/absolute/path/to/synthetic-files",
+  "includeFiles": ["reports/first.pdf", "reports/second.pdf"]
+}
+```
+
+The list contains 1 to 256 unique normalized relative paths, each at most 2,048
+UTF-8 bytes. Paths use `/` separators and cannot be absolute, contain control
+characters or backslashes, use empty or dot segments, have leading or trailing
+segment whitespace, or place one included path beneath another. The worker
+traverses only listed ancestor directories and observes only exact listed
+files. Every listed file must exist as a safe regular file or the pass fails.
+Unlisted entries are outside the scan. `maxFiles`, `maxDepth`, and the visited
+entry limit still apply independently. Omitting `includeFiles` retains the
+unrestricted root behavior.
+
 Keep the configuration, credentials, and journal outside this repository.
 The configuration must be a regular UTF-8 JSON file no larger than 64 KiB.
 A symlink at the configuration path is rejected.

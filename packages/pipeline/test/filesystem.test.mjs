@@ -67,6 +67,157 @@ test("unsupported filesystem nodes fail the whole discovery", async () => {
   );
 });
 
+test("exact-file roots traverse selected ancestors and observe only exact leaves", async () => {
+  const { root, journal } = await setup();
+  await mkdir(join(root, "reports"));
+  await mkdir(join(root, "excluded"));
+  await writeFile(join(root, "reports", "first.txt"), "first synthetic");
+  await writeFile(join(root, "reports", "second.txt"), "second synthetic");
+  await writeFile(join(root, "reports", "excluded.txt"), "excluded");
+  await writeFile(join(root, "excluded", "ignored.txt"), "ignored");
+  await symlink(
+    join(root, "reports", "first.txt"),
+    join(root, "excluded-link"),
+  );
+  const localConfig = config(root, journal, {
+    roots: [
+      {
+        alias: "test",
+        path: root,
+        includeFiles: ["reports/second.txt", "reports/first.txt"],
+      },
+    ],
+  });
+  const roots = await canonicalRoots(localConfig);
+  const files = await discoverFiles(localConfig, roots);
+  assert.deepEqual(
+    files.map((file) => [file.relativePath, file.text]),
+    [
+      ["reports/first.txt", "first synthetic"],
+      ["reports/second.txt", "second synthetic"],
+    ],
+  );
+});
+
+test("exact-file roots fail closed for missing or unsafe selected paths", async () => {
+  for (const kind of [
+    "missing",
+    "symlink",
+    "directory",
+    "fifo",
+    "ancestor-file",
+    "ancestor-symlink",
+    "unsafe-ancestor",
+  ]) {
+    const { root, journal } = await setup();
+    await mkdir(join(root, "reports"));
+    await writeFile(join(root, "safe.txt"), "synthetic");
+    let includeFiles;
+    if (kind === "missing") {
+      includeFiles = ["reports/missing.txt"];
+    } else if (kind === "symlink") {
+      await symlink(join(root, "safe.txt"), join(root, "reports", "item.txt"));
+      includeFiles = ["reports/item.txt"];
+    } else if (kind === "directory") {
+      await mkdir(join(root, "reports", "item.txt"));
+      includeFiles = ["reports/item.txt"];
+    } else if (kind === "fifo") {
+      await execFileAsync("mkfifo", [join(root, "reports", "item.txt")]);
+      includeFiles = ["reports/item.txt"];
+    } else if (kind === "ancestor-file") {
+      await writeFile(join(root, "ancestor"), "synthetic");
+      includeFiles = ["ancestor/item.txt"];
+    } else if (kind === "ancestor-symlink") {
+      await symlink(join(root, "reports"), join(root, "ancestor"));
+      includeFiles = ["ancestor/item.txt"];
+    } else {
+      await mkdir(join(root, "unsafe"), { mode: 0o770 });
+      await chmod(join(root, "unsafe"), 0o770);
+      await writeFile(join(root, "unsafe", "item.txt"), "synthetic");
+      includeFiles = ["unsafe/item.txt"];
+    }
+    const localConfig = config(root, journal, {
+      roots: [{ alias: "test", path: root, includeFiles }],
+    });
+    const roots = await canonicalRoots(localConfig);
+    await assert.rejects(
+      () => discoverFiles(localConfig, roots),
+      (error) =>
+        error instanceof FilesystemFailure &&
+        (kind === "missing" || kind === "symlink" || kind === "ancestor-symlink"
+          ? error.code === "unstable"
+          : kind === "unsafe-ancestor"
+            ? error.code === "permission_denied"
+            : error.code === "unsupported"),
+      kind,
+    );
+  }
+});
+
+test("exact-file roots retain independent depth and file-count bounds", async () => {
+  const { root, journal } = await setup();
+  await mkdir(join(root, "nested"));
+  await mkdir(join(root, "nested", "deeper"));
+  await writeFile(join(root, "nested", "first.txt"), "first");
+  await writeFile(join(root, "nested", "second.txt"), "second");
+  await writeFile(join(root, "nested", "deeper", "third.txt"), "third");
+  const selectedRoots = [
+    {
+      alias: "test",
+      path: root,
+      includeFiles: ["nested/first.txt", "nested/second.txt"],
+    },
+  ];
+  const fileLimited = config(root, journal, {
+    roots: selectedRoots,
+    maxFiles: 1,
+  });
+  const fileLimitedRoots = await canonicalRoots(fileLimited);
+  await assert.rejects(
+    () => discoverFiles(fileLimited, fileLimitedRoots),
+    (error) => error instanceof FilesystemFailure && error.code === "oversized",
+  );
+  const depthLimited = config(root, journal, {
+    roots: [
+      {
+        alias: "test",
+        path: root,
+        includeFiles: ["nested/deeper/third.txt"],
+      },
+    ],
+    maxDepth: 1,
+  });
+  const depthLimitedRoots = await canonicalRoots(depthLimited);
+  await assert.rejects(
+    () => discoverFiles(depthLimited, depthLimitedRoots),
+    (error) => error instanceof FilesystemFailure && error.code === "oversized",
+  );
+});
+
+test("exact-file source observations retain selected PDF provenance", async () => {
+  const { root, journal } = await setup();
+  await mkdir(join(root, "reports"));
+  await writeFile(join(root, "reports", "selected.pdf"), "%PDF-1.7\nselected");
+  await writeFile(join(root, "reports", "excluded.pdf"), "%PDF-1.7\nexcluded");
+  const localConfig = config(root, journal, {
+    roots: [
+      {
+        alias: "test",
+        path: root,
+        includeFiles: ["reports/selected.pdf"],
+      },
+    ],
+  });
+  const observations = await discoverSourceObservations(
+    localConfig,
+    await canonicalRoots(localConfig),
+  );
+  assert.equal(observations.length, 1);
+  assert.equal(observations[0].kind, "pdf");
+  assert.equal(observations[0].file.relativePath, "reports/selected.pdf");
+  assert.equal(observations[0].file.uri, "fs://test/reports/selected.pdf");
+});
+
 test("ignores Finder metadata after regular-file safety checks", async () => {
   const { root, journal } = await setup();
   for (let i = 0; i < 9; i += 1) await writeFile(join(root, `file-${i}.txt`), "synthetic");

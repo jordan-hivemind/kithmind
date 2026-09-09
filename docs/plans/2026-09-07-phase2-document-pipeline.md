@@ -94,7 +94,7 @@ Processing claims use the existing five-minute lease and fenced renewal/completi
 
 ## Filesystem identity and safe reads
 
-The first filesystem worker watches only explicitly configured roots. Record root aliases in public examples and keep absolute owner paths in local configuration. Resolve credentials through a host credential store or an explicitly supplied process environment; never put them in the source inventory, journal payload logs, or public fixtures.
+The first filesystem worker watches only explicitly configured roots. A root may use a bounded exact-file allowlist; discovery then traverses only listed ancestors, observes only exact leaves, and fails if any listed leaf is missing or unsafe. Record root aliases in public examples and keep absolute owner paths in local configuration. Resolve credentials through a host credential store or an explicitly supplied process environment; never put them in the source inventory, journal payload logs, or public fixtures.
 
 Assign each discovered item a source-local UUID and persist its identity and path mapping in both the local journal and a paginated, source-scoped cloud identity manifest. The current capped `list_sources` response is not that recovery protocol; P2-7 must add it. Manifest list/read/reconcile operations require the live credential's exact source-account ingest grant and current space membership. They return only connector identity/path/reconciliation state, not retained document text, and do not require broad read capability. Separate equal-content files receive separate identities. Exact known path bindings can recover the current mapping, but a filename, content hash, or inode alone cannot establish a rename or merge two identities.
 
