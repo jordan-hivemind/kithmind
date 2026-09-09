@@ -24,6 +24,9 @@ const MAX_SOURCE_ACCOUNTS = 32;
 const MAX_SOURCE_ITEMS = 128;
 const MAX_SOURCE_METADATA_ROWS = 128;
 const MAX_QUERY_LENGTH = 500;
+const DOCUMENT_FUSION_RRF_K = 60;
+const DOCUMENT_FUSION_KEYWORD_WEIGHT = 1;
+const DOCUMENT_FUSION_SEMANTIC_WEIGHT = 1.25;
 
 type PublicationState = "staged" | "active" | "historical";
 
@@ -53,6 +56,26 @@ class CitationOutputBudget {
     this.used += size;
     return true;
   }
+}
+
+export function fuseDocumentCandidateRanks(
+  keywordCandidates: readonly { id: string; rank: number }[],
+  semanticCandidates: readonly { id: string; rank: number }[],
+) {
+  const scores = new Map(
+    keywordCandidates.map(({ id, rank }) => [
+      id,
+      DOCUMENT_FUSION_KEYWORD_WEIGHT / (DOCUMENT_FUSION_RRF_K + rank + 1),
+    ]),
+  );
+  for (const { id, rank } of semanticCandidates) {
+    scores.set(
+      id,
+      (scores.get(id) ?? 0) +
+        DOCUMENT_FUSION_SEMANTIC_WEIGHT / (DOCUMENT_FUSION_RRF_K + rank + 1),
+    );
+  }
+  return scores;
 }
 
 function boundedLimit(value: number | undefined) {
@@ -434,24 +457,27 @@ export async function searchDocuments(
     );
   }
   if (semanticReady) {
-    const ranks = new Map(
-      candidates.map((candidate) => [
-        candidate.chunk._id,
-        1 / (60 + candidate.rank + 1),
-      ]),
-    );
+    const keywordCandidates = candidates.map((candidate) => ({
+      id: candidate.chunk._id,
+      rank: candidate.rank,
+    }));
     const seen = new Set(candidates.map((candidate) => candidate.chunk._id));
     const ids = [...new Set(semantic.chunkIds)].slice(0, keywordBudget);
     candidateOverflow ||= semantic.chunkIds.length > keywordBudget;
+    const semanticCandidates: Array<{ id: Id<"chunks">; rank: number }> = [];
     for (const [rank, id] of ids.entries()) {
       const chunk = await ctx.db.get(id);
       if (!chunk || chunk.publicationState !== "active") continue;
-      ranks.set(id, (ranks.get(id) ?? 0) + 1 / (60 + rank + 1));
+      semanticCandidates.push({ id, rank });
       if (!seen.has(id)) {
         candidates.push({ chunk, publicationState: "active", rank: 0 });
         seen.add(id);
       }
     }
+    const ranks = fuseDocumentCandidateRanks(
+      keywordCandidates,
+      semanticCandidates,
+    );
     for (const candidate of candidates) {
       candidate.rank = -(ranks.get(candidate.chunk._id) ?? 0);
     }
