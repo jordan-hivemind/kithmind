@@ -15,6 +15,7 @@ const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 25;
 const MAX_READ_SPACES = 32;
 const MAX_SEARCH_CANDIDATES = 64;
+const MAX_RESULTS_PER_DOCUMENT = 3;
 const MAX_CITATIONS_PER_RESULT = 16;
 const MAX_CITATION_OUTPUT_BYTES = 256 * 1024;
 const MAX_PAGES = 64;
@@ -467,7 +468,8 @@ export async function searchDocuments(
   );
 
   const authorized = new Set(spaceIds);
-  const seenDocuments = new Set<Id<"documents">>();
+  const resultCountByDocument = new Map<Id<"documents">, number>();
+  const returnedChunks = new Set<Id<"chunks">>();
   const chainCache = new Map<
     Id<"documents">,
     Awaited<ReturnType<typeof loadReadableDocument>>
@@ -489,7 +491,9 @@ export async function searchDocuments(
       chunk.spaceId !== document.spaceId ||
       document.processingGenerationId !== chunk.processingGenerationId ||
       document.publicationState !== chunk.publicationState ||
-      seenDocuments.has(document._id) ||
+      returnedChunks.has(chunk._id) ||
+      (resultCountByDocument.get(document._id) ?? 0) >=
+        MAX_RESULTS_PER_DOCUMENT ||
       (args.docType !== undefined && document.docType !== args.docType) ||
       !inTimeRange(document.capturedAt, args.from, args.to)
     ) {
@@ -519,7 +523,11 @@ export async function searchDocuments(
     );
     citationPartial ||=
       citationResult.invalidCitations || citationResult.byteBudgetTruncated;
-    seenDocuments.add(document._id);
+    returnedChunks.add(chunk._id);
+    resultCountByDocument.set(
+      document._id,
+      (resultCountByDocument.get(document._id) ?? 0) + 1,
+    );
     const recovery = await originalRecoveryStatus(ctx, chain.generation);
     results.push({
       spaceId: document.spaceId,

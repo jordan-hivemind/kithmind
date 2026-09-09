@@ -25,8 +25,9 @@ offline comparison.
 The [offline scorer](../retrieval-evaluation.md) reports evidence-rank recall,
 reciprocal rank, successful retrieval, negative candidate-return rates and
 request latency. Record document-rank success separately because the hosted
-search returns at most one chunk per document. Multiple citations from one
-result must not be mistaken for multiple ranked documents.
+search returns ranked passages, capped at three distinct chunks per document.
+Multiple citations from one result must not be mistaken for multiple ranked
+documents.
 
 The primary diagnostic targets are successful answerable retrieval at rank
 five of at least 0.85 and mean reciprocal rank at five of at least 0.65.
@@ -77,6 +78,30 @@ counted as search-only evidence success here.
 
 The corpus has similar tax forms and duplicated facts. It is a diagnostic
 pilot, not a held-out estimate of quality across the owner's filing system.
+
+## Offline embedding and passage comparison
+
+The frozen labels were also scored offline against immutable retained chunks
+and evidence IDs. This records local cosine ranking, not hosted request
+latency or a deployed model change. The active small profile remains in place
+while missing document vectors are restored; the large profile is prospective.
+
+| Candidate                                                   | Answerable success at five |          Evidence MRR at five | Status                                   |
+| ----------------------------------------------------------- | -------------------------: | ----------------------------: | ---------------------------------------- |
+| Existing 163 chunks, small 1,536 dimensions, raw chunk rank |                      13/18 |                       0.62037 | Diagnostic baseline                      |
+| Existing 163 chunks, large 1,536 dimensions, raw chunk rank |                      17/18 |                       0.76389 | Prospective candidate                    |
+| Existing chunks, small, one result per document             |                      12/18 |       Not a deployment target | Superseded selection policy              |
+| Existing chunks, large, one result per document             |                      13/18 |       Not a deployment target | Superseded selection policy              |
+| Existing chunks, small, up to three passages per document   |                      13/18 | Not a model comparison change | Current passage-selection policy         |
+| Existing chunks, large, up to three passages per document   |                      16/18 |       Not a deployment target | Prospective passage policy               |
+| Page split near 1,200 characters with 180 overlap           |  11/18 parent-page success |               Diagnostic only | 475 chunks, exceeds current target bound |
+| Page split near 2,400 characters with 300 overlap           |  13/18 parent-page success |               Diagnostic only | 263 chunks, exceeds current target bound |
+
+The offline run made 55 provider requests with zero retries and reported
+511,224 input tokens. It does not infer cost. A split chunk inherits no proof
+that it supports all page evidence; exact span identity remains required. Both
+split candidates exceed the current 256 eligible-target limit before thoughts,
+so neither can be activated under the present manifest bound.
 
 ## Controlled expansion
 
