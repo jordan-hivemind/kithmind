@@ -72,3 +72,10 @@ prune staging directories, prune remote backups, or forget snapshots.
 Owner export and backup adapters remain private. The public setup does not
 install a schedule. Operators must configure and verify their own scheduler and
 adapter implementation.
+
+## Archive changes
+
+Before an archive-root relocation or runtime or dependency change, quiesce all
+archive writers, including ingestion workers and scheduled database backups.
+Verify no backup runner or child process remains active, preserve locks and
+failure evidence, and resume schedules only after required checks pass.

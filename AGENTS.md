@@ -141,3 +141,8 @@ the owner deployment configuration, using the same credentials for verification
 and execution. The owner uses separate personal and business accounts. Never
 assume the CLI is still signed into the correct account; keep owner account
 identifiers in private configuration, outside this public repository.
+
+Before an archive-root relocation or runtime or dependency change, identify and
+quiesce every archive writer, including ingestion workers and scheduled database
+backups. Verify no backup runner or child process remains active, preserve locks
+and failure evidence, and resume schedules only after required checks pass.
