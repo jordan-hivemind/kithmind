@@ -17,8 +17,7 @@ staging directory, pass that directory explicitly to an export adapter, then
 pass the same directory explicitly to a backup adapter. It must retain bounded
 status evidence and fail closed if another run holds its lock.
 
-A future daily schedule runs only when the owner machine is logged in and
-awake. A missed time is handled by the next available scheduled run; this guide
+A daily schedule runs only when the owner machine is logged in and awake. A missed time is handled by the next available scheduled run; this guide
 does not promise provider behavior or an exact catch-up time.
 
 Automatic prune and forget are not part of this workflow. Retention changes
@@ -70,5 +69,6 @@ closed. Before manual lock recovery, verify no runner or child process remains
 active and preserve failed status evidence. The runner does not automatically
 prune staging directories, prune remote backups, or forget snapshots.
 
-Owner export and backup adapters remain private. Scheduling is not yet
-installed.
+Owner export and backup adapters remain private. The public setup does not
+install a schedule. Operators must configure and verify their own scheduler and
+adapter implementation.
