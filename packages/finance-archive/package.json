@@ -27,6 +27,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
+    "@repo/finance-contract": "workspace:*",
     "pg": "^8.23.0",
     "zod": "^3.24.0"
   },

@@ -17,7 +17,12 @@
 
 import { randomBytes } from "node:crypto";
 
-import { applyPgSchema, createArchiveClient } from "../../dist/index.js";
+import {
+  applyPgReaderRole,
+  applyPgSchema,
+  createArchiveClient,
+  READER_ROLE_LOCK_KEY,
+} from "../../dist/index.js";
 
 const url = process.env.FINANCE_ARCHIVE_DATABASE_URL;
 
@@ -90,4 +95,71 @@ export async function one(client, sql, values = []) {
 export async function all(client, sql, values = []) {
   const result = await client.query(sql, values);
   return result.rows;
+}
+
+// --- the reader role (F1-21) ------------------------------------------------
+//
+// The read surface connects as a non-owner reader, so the surface tests and
+// every attack test need one. The role is created per test schema, so its
+// name is as throwaway as the schema, and it is dropped with `DROP OWNED BY`
+// first: a role still holding a grant or a default-privilege entry cannot be
+// dropped, and leaving either behind would leak between tests.
+
+/** A throwaway reader password. Never a fixture value, never committed. */
+export function testReaderPassword() {
+  return randomBytes(24).toString("hex");
+}
+
+/** The same connection string with the reader's own credentials. */
+export function readerUrlFor(role, password) {
+  const parsed = new URL(url);
+  parsed.username = role;
+  parsed.password = password;
+  return parsed.toString();
+}
+
+/**
+ * Applies the reader role to `client`'s archive and returns a client
+ * authenticated as that reader, plus what it took to get there.
+ */
+export async function reader(t, client, options = {}) {
+  const password = testReaderPassword();
+  const summary = await applyPgReaderRole(client, { password, ...options });
+  const readerUrl = readerUrlFor(summary.role, password);
+  const connection = createArchiveClient(readerUrl, summary.schema);
+  await connection.connect();
+  // One self-contained hook, on its own short-lived admin connection. Hanging
+  // the role drop off the caller's client would depend on that client
+  // outliving this hook, and when it does not the reader connection is never
+  // closed and the whole run hangs on an open handle rather than failing.
+  t.after(async () => {
+    await connection.end().catch(() => {});
+    const admin = createArchiveClient(url, summary.schema);
+    await admin.connect();
+    try {
+      // Same advisory lock the setup takes: dropping a role rewrites the same
+      // shared catalog rows, and two test files doing it at once fail with
+      // "tuple concurrently updated" rather than converging.
+      await admin.query("BEGIN");
+      await admin.query("SELECT pg_advisory_xact_lock($1)", [
+        READER_ROLE_LOCK_KEY,
+      ]);
+      await admin.query(`DROP OWNED BY ${summary.role}`);
+      await admin.query(`DROP ROLE IF EXISTS ${summary.role}`);
+      await admin.query("COMMIT");
+    } finally {
+      await admin.end();
+    }
+  });
+  return { client: connection, summary, url: readerUrl, password };
+}
+
+/** The error running `sql` as the reader raised, or null when it succeeded. */
+export async function refused(readerClient, sql, values = []) {
+  try {
+    await readerClient.query(sql, values);
+    return null;
+  } catch (error) {
+    return error;
+  }
 }

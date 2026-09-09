@@ -91,6 +91,18 @@ export {
   toNumericText,
 } from "./pgNumeric.js";
 export {
+  applyPgReaderRole,
+  READER_CONNECTION_LIMIT,
+  READER_ROLE_LOCK_KEY,
+  READER_IDLE_TRANSACTION_TIMEOUT_MS,
+  READER_LOCK_TIMEOUT_MS,
+  READER_STATEMENT_TIMEOUT_MS,
+  readerRoleName,
+  type ReaderRoleOptions,
+  type ReaderRoleSummary,
+} from "./pgReaderRole.js";
+export { serveFinanceRead } from "./mcp/pgRead.js";
+export {
   applyPgSchema,
   PG_SCHEMA_VERSION,
   PG_TABLES,

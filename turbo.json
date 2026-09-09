@@ -42,7 +42,8 @@
       "passThroughEnv": [
         "FINANCE_ARCHIVE_DATABASE_URL",
         "FINANCE_ARCHIVE_REQUIRE_DATABASE",
-        "FINANCE_ARCHIVE_SCHEMA"
+        "FINANCE_ARCHIVE_SCHEMA",
+        "FINANCE_ARCHIVE_SPACE_ID"
       ]
     },
     "@repo/finance-contract#test:once": {

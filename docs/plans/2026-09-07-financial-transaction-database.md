@@ -342,12 +342,28 @@ positions table and its activity table, so each new document reconciles itself.
 
 v1 exposes a read-only MCP server over the hosted archive, authenticated, connecting as a reader role:
 
-| Tool              | Behavior                                                                                                                              |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `describe_schema` | Table and column documentation, money policy, currency policy, valuation-basis meanings.                                              |
-| `run_query`       | Read-only SQL against the archive, executed as a Postgres role holding `SELECT` and nothing else. Bounded row count and time.         |
-| `get_evidence`    | For a row, the source document, locator, content hash and a path to the retained text.                                                |
-| `get_coverage`    | Per account and period: what was acquired, what parsed, what reconciled, what is under review, and when each source was last updated. |
+F1-21 replaced the four-tool sketch below with the six typed operations
+`@repo/finance-contract` defines. `run_query` and `describe_schema` are gone:
+this section retired the typed-bounded-query waiver, and a scoped surface
+offering arbitrary SQL does not satisfy the rule it was retired for.
+`describe_schema` existed only to help a caller write that SQL.
+
+| Operation           | Behavior                                                                                                                             |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `list_transactions` | Transactions by source, account, currency and date range, paged and cursored.                                                        |
+| `list_holdings`     | Stated positions by source and account as of a date, with valuation basis.                                                           |
+| `list_balances`     | Stated balances by source, account and date range.                                                                                   |
+| `aggregate_money`   | Exact `NUMERIC` totals of transaction amount, market value, cost basis or cash, always grouped by currency and never crossing one.    |
+| `get_evidence`      | For a record, the retained text span behind it.                                                                                      |
+| `get_coverage`      | Per source, record kind and period: what was acquired, what reconciled, what is under review, and what nothing vouches for.          |
+
+The three list operations withhold every row today and say so, because the
+archive cannot yet build the contract's `retained_text_span_v1` evidence: the
+parsers produce row and page indices rather than character offsets, and
+`documents` carries no byte length or media type. A fabricated citation on a
+financial figure is worse than a withheld row, so the record is withheld and
+the response carries `retained_evidence_unavailable`. `aggregate_money` and
+`get_coverage` are fully served.
 
 Read-only is enforced by the database rather than by inspecting the SQL, but
 "a role with `SELECT` and nothing else" is a claim that has to be designed and

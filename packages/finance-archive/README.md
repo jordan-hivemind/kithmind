@@ -672,7 +672,7 @@ immutable, written once, never edited, never deleted.
 
 The managed root directory is configuration, read from
 `FINANCE_ARCHIVE_RAW_TREE_ROOT` and nowhere else, the same pattern
-`src/mcp/run.ts` uses for `FINANCE_ARCHIVE_DB_PATH`: a missing setting is a
+`src/mcp/run.ts` uses for `FINANCE_ARCHIVE_READER_DATABASE_URL`: a missing setting is a
 hard error naming exactly what is missing, never a default and never a
 guessed location. No real path appears in this repository, in a fixture, or
 in a test.
@@ -926,7 +926,11 @@ are the three places this port can go quietly wrong.
 Every suite that touches the write path -- `pgSchema`, `importer`,
 `reconciliation`, `positionReconciliation`, `adapterImport` and
 `pgPublication` -- needs a real server and skips cleanly, naming the variable,
-unless `FINANCE_ARCHIVE_DATABASE_URL` points at a throwaway database. Each
+unless `FINANCE_ARCHIVE_DATABASE_URL` points at a throwaway database. So do
+`pgReaderRole` and `pgReadSurface`, which additionally need that connection to
+be able to `CREATE ROLE` and to revoke `PUBLIC`'s grants on the database: they
+create a throwaway reader per test schema and drop it afterwards. Point them
+at a container, never at the hosted archive. Each
 test works inside a schema it creates and drops (`test/helpers/pgArchive.mjs`),
 so pointing them at a shared development database cannot clobber anything, and
 two tests can never see each other's rows.
@@ -968,36 +972,165 @@ Never edit a migration that has shipped.
 Only the last four digits of an account number are stored, in
 `accounts.acct_last4`, enforced by a `CHECK` constraint.
 
-## Local read-only MCP server
+## Read surface (F1-21)
 
-`src/mcp` is the v1 assistant access surface described in the plan: a local,
-read-only [MCP](https://modelcontextprotocol.io) server over one archive
-file, run as `pnpm --filter @repo/finance-archive mcp` after a build, with
-`FINANCE_ARCHIVE_DB_PATH` set to the archive file. That path is read from the
-environment only; it is never committed and the server never defaults to a
-location.
+`src/mcp` is the v1 assistant access surface: the six operations
+[`@repo/finance-contract`](../finance-contract) defines, served over
+[MCP](https://modelcontextprotocol.io) against the hosted archive, connecting
+as a non-owner reader role. Run it with
+`pnpm --filter @repo/finance-archive mcp` after a build.
 
-Four tools: `describe_schema` (table and column documentation, plus the
-money, currency and valuation-basis policy), `run_query` (read-only SQL,
-bounded rows and time), `get_evidence` (source document, locator, content
-hash and retained-text path for one row), and `get_coverage` (per account:
-what was acquired, parsed, reconciled, and under review). Every response
-carries `datasetRevision` (SQLite's own `data_version`, which changes when
-the importer writes the file) and an explicit `completeness` state; a
-truncated `run_query` result is marked `truncated`, never `complete`, and a
-zero-row result always carries `resultSemantics` explaining that it means no
-indexed match, not proof that nothing happened.
+`FINANCE_ARCHIVE_READER_DATABASE_URL`, `FINANCE_ARCHIVE_PRINCIPAL_ID` and
+`FINANCE_ARCHIVE_SPACE_ID` are read from the environment and nowhere else,
+with no default for any of them. The reader's connection string is
+deliberately a different variable from the importer's
+`FINANCE_ARCHIVE_DATABASE_URL`: one is the owner's credential and one is the
+reader's, and the whole point of this task is that they are not the same.
 
-`run_query` enforces read-only in depth rather than by inspecting the SQL
-string: the file is opened `SQLITE_OPEN_READONLY`, `PRAGMA query_only` and
-defensive mode are both on, and an authorizer callback allow-lists `SELECT`,
-table/column reads and a small function list, denying every write, every DDL
-verb, `ATTACH`/`DETACH`, every `PRAGMA`, and file-access functions like
-`readfile` -- including one hidden inside a `WITH` clause or a subquery. A
-single-statement check on top of that, using SQLite's own parser rather than
-a regex, rejects a second statement smuggled after a semicolon or inside a
-comment. See `src/mcp/queryGuard.ts` for the full layer list and
-`test/mcpQueryGuard.test.mjs` for the attack-by-attack tests.
+`serveFinanceRead(client, request, spaceId)` is the archive side on its own,
+without MCP. It takes a parsed contract request, returns a contract response,
+and runs that response back through the contract's own parser before returning
+it. The gateway that authenticates a caller belongs to the other workstream;
+this is what it calls.
+
+There is no `run_query` and no `describe_schema`. The plan's
+typed-bounded-query waiver was retired, and a scoped gateway pointed at a SQL
+surface does not satisfy the rule it was retired for. No caller-supplied SQL
+reaches the database at all, so injection, multi-statement submission and
+comment smuggling have no entry point rather than a defence.
+
+### What the archive cannot serve yet
+
+The contract requires at least one `retained_text_span_v1` evidence item on
+every transaction, holding and balance record: a character span inside a
+retained text blob, with `start`, `end`, `quote` and `quoteSha256` in Unicode
+code points, plus the text's own hash, byte length and codepoint length, the
+retained object's byte length and media type, and capture and revision
+identity.
+
+The archive has none of that. `source_locator` holds a `FieldLocator` -- a
+capability tier, a row index or page number, a column label -- and a row index
+is not a character offset. `documents` carries no byte length and no media
+type. Capture and revision identity live in the raw tree's capture manifests
+on the always-on machine's filesystem, which the read surface does not have.
+
+So `list_transactions`, `list_holdings` and `list_balances` **withhold every
+row** rather than fabricating a citation to fill the shape, and every response
+that withholds one says so: `coverage.reasons` carries
+`retained_evidence_unavailable` and `completeness` is `partial`. `truncated`
+still reports that rows matched, so "there is something here you cannot cite
+yet" stays distinguishable from "nothing happened". `aggregate_money` and
+`get_coverage` need no evidence and are fully served.
+
+Closing this needs character-offset locators from the parsers, retained byte
+length and media type on `documents`, and capture and revision identity
+reachable from the database. `retainedTextSpanEvidence` in `src/mcp/pgRead.ts`
+is where they get assembled when they exist.
+
+### Completeness, truncation and coverage
+
+Every response carries `datasetRevision` and an explicit `completeness`. All
+of one response's queries run inside one `REPEATABLE READ`, `READ ONLY`
+transaction, so the revision is the snapshot every number in it was computed
+from: a laptop querying mid-import sees one settled dataset, never half a
+ledger. The revision is derived from the archive's own content, so two reads
+of an unchanged archive report the same one and `expectedDatasetRevision`
+pinning works.
+
+A truncated page is marked `truncated` and carries a `nextCursor`. It is never
+silently short.
+
+**Zero rows with unknown coverage means no indexed match, not proof that no
+event occurred.** Every list and aggregate call computes coverage for its own
+filters, not only `get_coverage`, precisely so an empty page over an
+unacquired range cannot come back against `complete` coverage.
+
+`get_coverage` keeps apart three states that must never collapse:
+
+| State                                     | `status`   | Gap code         |
+| ----------------------------------------- | ---------- | ---------------- |
+| Nothing ever acquired for this source     | `unknown`  | `source_gap`     |
+| A period no reconciliation verdict covers | `unknown`  | `source_gap`     |
+| A period whose gate has not passed        | `partial`  | `pending_import` |
+| A period that passed but is under review  | `partial`  | `failed_import`  |
+| A period that passed with nothing open    | `complete` | none             |
+
+`unknown` is reserved for "nothing in the archive vouches for this range",
+which is the state a caller must never read as absence.
+
+Money crosses the wire as decimal strings and never as a JavaScript number,
+`NUMERIC` decoding is pinned per connection, and every aggregate groups by
+currency, so no request shape sums two currencies into one number. A value
+past the contract's 38 significant digits or 18 fractional places is withheld
+with `unsupported_value`, never rounded and never silently omitted.
+
+## The reader role (F1-21)
+
+`applyPgReaderRole(client, { password })` in `src/pgReaderRole.ts` is the whole
+setup path: code that is run and tested, not instructions someone follows by
+hand once. It is idempotent, and re-running it is the documented step after a
+migration adds a table.
+
+"A role with `SELECT`" is not a privilege state. Postgres grants `CONNECT` and
+`TEMPORARY` on a database and `EXECUTE` on functions to `PUBLIC` by default,
+privileges reach a role through membership, and default privileges decide what
+a later table is born with. So:
+
+| Concern             | What the setup does                                                                              |
+| ------------------- | ------------------------------------------------------------------------------------------------ |
+| Ownership           | A non-owner role that owns nothing, so it cannot alter what it reads                              |
+| Attributes          | `NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS`                         |
+| Membership          | Asserted empty; `NOINHERIT` does not stop `SET ROLE`, so a membership is an error, not a warning  |
+| Database            | `REVOKE ALL ... FROM PUBLIC`, then `GRANT CONNECT` only. `TEMPORARY` is never granted back        |
+| Schema `public`     | `REVOKE ALL ... FROM PUBLIC`, so the reader cannot reach a co-located component's tables          |
+| Archive schema      | `USAGE` only, never `CREATE`                                                                      |
+| Tables              | `REVOKE ALL` from `PUBLIC` and from the reader, then `GRANT SELECT`                               |
+| Sequences, routines | `REVOKE ALL` from `PUBLIC` and from the reader                                                    |
+| Domains             | `REVOKE ALL` from `PUBLIC`, then `GRANT USAGE` to the reader, which needs it to read the columns  |
+| Default privileges  | Revocations only. **No** default `SELECT` grant, so a later table is not silently readable        |
+| Statement time      | `statement_timeout`, `lock_timeout` and `idle_in_transaction_session_timeout` on the role         |
+| Transaction mode    | `default_transaction_read_only = on`, plus an explicit `READ ONLY` transaction per response       |
+| Rows                | Every generated statement carries its own `LIMIT`; the contract caps a page at 100                |
+| Concurrency         | `CONNECTION LIMIT`, enforced at connection time and not settable from inside a session            |
+
+The role's `statement_timeout` is a setting the role can raise, so it is
+deliberately not the only control. `CONNECTION LIMIT` cannot be raised from
+inside a session, which needs `CREATEROLE`; the `LIMIT` is in the SQL the
+surface generates; and there is no caller-supplied statement for a raised
+timeout to run.
+
+Revoking `PUBLIC`'s `USAGE` on schema `public` is a database-wide change and
+it is deliberate. A privilege held via `PUBLIC` cannot be revoked from one
+role, so keeping the reader out of `public` means `PUBLIC`'s own grant has to
+go. A co-located component gets an explicit grant rather than inheriting one.
+
+One measured limitation, asserted in both directions in the tests so it cannot
+rot into a false claim: `ALTER DEFAULT PRIVILEGES ... REVOKE ... ON FUNCTIONS
+FROM PUBLIC` **does not take effect**. Postgres stores a default-privilege
+entry as a delta over the built-in default and merges the two at creation
+time, so a function created later still carries `PUBLIC`'s `EXECUTE`. The
+concrete revoke on a re-run is what removes it. Default privileges do work for
+tables and sequences, which is where the "a later migration must not be
+silently readable" requirement bites.
+
+### The attack tests
+
+`test/pgReaderRole.test.mjs` re-expresses each of the seventeen SQLite attacks
+as its Postgres equivalent and asserts refusal against a real server. The
+mapping is in a table at the top of that file. Confirming that a `PRAGMA` is a
+syntax error on Postgres would prove nothing, so none of these do that. They
+test writes and DDL under the reader role, `COPY` to and from a file and to a
+program, large object functions, `pg_read_file` and friends, `dblink` and
+`postgres_fdw` as the `ATTACH` analogue, `ALTER SYSTEM` and
+`session_replication_role` as the mutating-`PRAGMA` analogue, reading another
+schema and `pg_authid` as the reading-`PRAGMA` analogue, `CREATE EXTENSION` as
+the `load_extension` analogue, multi-statement submission through the simple
+query protocol, a write hidden in a CTE, and `SET ROLE` escalation.
+
+Every write is asserted refused twice: once under the role's read-only default
+(`read_only_sql_transaction`), and again with that default turned off, where
+the refusal has to come from `insufficient_privilege`. Testing only the first
+would test the softest layer and call it a boundary.
 
 ## Checks
 

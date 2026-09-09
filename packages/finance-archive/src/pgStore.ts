@@ -119,7 +119,7 @@ export function archiveSchemaOf(client: object): string {
 
 /**
  * The connection string, from the environment and nowhere else. There is no
- * default, the same rule `FINANCE_ARCHIVE_DB_PATH` and
+ * default, the same rule `FINANCE_ARCHIVE_READER_DATABASE_URL` and
  * `FINANCE_ARCHIVE_RAW_TREE_ROOT` already follow: a missing setting is a hard
  * error that names what is missing. A connection string never enters this
  * repository, and a guessed default would let a misconfigured client open
