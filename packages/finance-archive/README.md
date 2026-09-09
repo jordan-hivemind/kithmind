@@ -46,8 +46,8 @@ than assumed.
 | -------------------------------------------------------- | -------------------------------------------------------------------- |
 | Decimal input is validated as text before any conversion | `toNumericText` (`src/pgNumeric.ts`)                                 |
 | A JavaScript number is refused, never stringified        | `toNumericText`                                                      |
-| Non-finite values are refused, Postgres `NaN` included   | `toNumericText`, `fromNumericText`, and the `finance_numeric` domain |
-| Money crosses driver, JSON and MCP boundaries as text    | `pinNumericDecoding` (`src/pgStore.ts`)                              |
+| Non-finite values are refused, all three Postgres ones   | `toNumericText`, `fromNumericText`, and the `finance_numeric` domain |
+| Money crosses driver, JSON and MCP boundaries as text    | `ARCHIVE_TYPES` (`src/pgStore.ts`)                                   |
 
 The SQLite `CHECK (typeof(...))` constraints do not translate, because
 Postgres types already cover storage class. Their intent moves to input
@@ -72,8 +72,10 @@ already text. That is why the decoder is pinned rather than relied on: a
 default is a choice someone else can change in a minor release, and a driver
 that silently started returning a float for `NUMERIC` would reintroduce the
 exact failure the type was chosen to prevent, quietly and everywhere at once.
-`pinNumericDecoding` pins `NUMERIC` and `INT8`, and `test/pgMoney.test.mjs`
-asserts the pin with no database required.
+`ARCHIVE_TYPES` pins `NUMERIC`, `INT8` and `DATE` per connection rather than
+process-wide, and `test/pgMoney.test.mjs` asserts both the pin and that the
+process-wide parsers were left alone, with no database required. See "Driver
+decoding is pinned per connection" below.
 
 ### The deduplication preimage is versioned
 
@@ -762,7 +764,7 @@ extension-less files named by hash is unlabelled unless the raw tree itself
 says what each one is.
 
 An earlier version of this label lived as a `.manifest.json` sidecar keyed on
-the *document's* content hash, next to the bytes it described. That is wrong
+the _document's_ content hash, next to the bytes it described. That is wrong
 for the same reason a document is content-addressed and a capture is not:
 byte equality is not source identity. The same statement bytes can
 legitimately be acquired twice -- two pulls of an overlapping period, a
@@ -793,9 +795,9 @@ one acquisition did, not a property of the bytes.
 `captureId` is one acquisition attempt's own idempotency key --
 `persistAcquiredDocument` mints a fresh random one when a caller does not
 supply one, which is correct for any caller that is not itself retrying a
-specific earlier attempt. Calling it twice with the *same* `captureId` is a
+specific earlier attempt. Calling it twice with the _same_ `captureId` is a
 retry of one attempt and is an idempotent no-op, exactly like a repeat
-document write; calling it twice with *no* `captureId` (or two different
+document write; calling it twice with _no_ `captureId` (or two different
 ones) for identical bytes is two acquisitions, and both keep their own
 capture. Reusing a `captureId` for a manifest that would hash differently is
 refused outright with `CaptureConflictError` -- a reconciliation problem for
@@ -823,13 +825,47 @@ have no analogous provider total to reconcile against.
 
 ## Postgres schema (F1-20)
 
-`applyPgSchema(client)` creates the schema in the connected `search_path` and
-records the applied version in a `schema_version` table. It is one initial
-schema rather than a translation of three SQLite migrations, because there is
-no data behind those migrations and that is the whole reason the engine
-changes now rather than later. The whole creation is one transaction, a
-session advisory lock excludes a second creator by the database rather than by
-convention, and running it again is a no-op returning the recorded version.
+`applyPgSchema(client)` creates the archive in its own named schema and
+records the applied version in a `schema_version` table inside it. It is one
+initial schema rather than a translation of three SQLite migrations, because
+there is no data behind those migrations and that is the whole reason the
+engine changes now rather than later. The whole creation is one transaction,
+an advisory lock keyed on the schema name excludes a second creator by the
+database rather than by convention, and running it again is a no-op returning
+the recorded version.
+
+### Which schema, and why it is not `search_path`
+
+Archive objects live in the schema named by `FINANCE_ARCHIVE_SCHEMA`,
+defaulting to `finance`, and never in whatever the connection's `search_path`
+happens to be. Co-locating databases is the plan of record, so a neighbouring
+component's `schema_version` could otherwise answer for the archive's, and
+`applyPgSchema` would conclude the schema was already current against a
+database that does not have it. `pgSchemaVersion` reads a schema-qualified
+table for exactly that reason.
+
+Pinning the path is done twice, because once is not enough on the archive's
+default endpoint:
+
+| Where                                        | Mechanism                                        |
+| -------------------------------------------- | ------------------------------------------------ |
+| `createArchiveClient` / `createArchivePool`  | `search_path` in the connection's startup packet |
+| `applyPgSchema` and `withArchiveTransaction` | `SET LOCAL search_path`, inside the transaction  |
+
+The archive's default endpoint is a **pooled** one, where a session-level
+`SET` issued outside a transaction is unreliable: the pooler can hand the next
+transaction a different backend and the path is gone. `SET LOCAL` inside the
+transaction is the part a pooler cannot take away. Requiring a direct endpoint
+instead would be a workaround for a defect rather than a fix, so it is not the
+answer here. `test/pgSchema.test.mjs` proves both halves against a connection
+whose ambient path is a neighbour's schema: a foreign `schema_version` holding
+version 99 is not mistaken for the archive's, and a full write path lands in
+the archive's tables while a decoy `documents` table earlier on the path stays
+empty.
+
+A schema name is interpolated into DDL and into `SET LOCAL search_path`, where
+a bind parameter is not allowed, so it is validated as a plain lowercase
+identifier rather than quoted. Anything else is a configuration error.
 
 All twelve tables plus `position_reconciliations` survive, with every
 constraint the SQLite schema expressed: currency on every money column,
@@ -839,8 +875,19 @@ unpopulated, `source_document_id` and `source_locator` on every derived row,
 opaque text identities. Dates become `DATE`, timestamps `TIMESTAMPTZ` and
 flags `BOOLEAN`, so the SQLite `GLOB` spelling checks are unnecessary. Two
 domains carry the rules that repeat across columns: `finance_numeric` (every
-money, quantity, price and rate column, rejecting Postgres's own `NaN`) and
-`currency_code`.
+money, quantity, price and rate column) and `currency_code`.
+
+`finance_numeric` rejects all three of Postgres's non-finite `NUMERIC` values,
+not just one. `NaN` has always existed; `Infinity` and `-Infinity` have been
+accepted for `NUMERIC` since Postgres 14. An infinite balance is not a
+rounding problem, it is a value that makes every aggregate over the column
+meaningless. The comparison is subtle in both directions: `'NaN'::numeric =
+'NaN'::numeric` is true, unlike float `NaN`, so `VALUE = VALUE` would not
+catch it, and `NaN` sorts above `Infinity`, so a range test would depend on
+remembering that. Listing the three values under `=` needs neither fact.
+Application-side validation in `pgNumeric.ts` refuses the same spellings on
+the way in, but the domain is what makes it a database invariant, so the tests
+insert each one as a server-side literal and assert the insert fails.
 
 `position_reconciliations` keeps its own table. Under SQLite it was separated
 partly by storage class, and that reason is gone. The other reason is not: a
@@ -851,6 +898,25 @@ The connection string is read from `FINANCE_ARCHIVE_DATABASE_URL` and nowhere
 else, the same rule `FINANCE_ARCHIVE_DB_PATH` and
 `FINANCE_ARCHIVE_RAW_TREE_ROOT` already follow: a missing setting is a hard
 error that names what is missing, never a default and never a guess.
+
+### Driver decoding is pinned per connection
+
+`NUMERIC`, `INT8` and `DATE` are pinned to arrive as text. The driver's
+current defaults already do that for `NUMERIC` and `INT8`, which is exactly
+why they are pinned rather than relied on: a default is a choice someone else
+can change in a minor release. `DATE` is not a default -- the driver builds a
+`Date` at local midnight, and reading the day back out of one lands on the
+previous day west of UTC.
+
+The pin is per connection, not per process. `pg.types.setTypeParser` is
+module-global state shared by every `pg` consumer in the process, so a package
+that sets it decides how other people's pools decode their own columns. That
+was tolerable while this package was the only `pg` consumer and stops being
+tolerable once pools are co-hosted. `ARCHIVE_TYPES` is handed to each archive
+`Client` and `Pool` through node-postgres' own `types` config instead.
+`test/pgMoney.test.mjs` asserts both halves with no database: that an archive
+connection decodes the pinned OIDs as text, and that the process-wide parsers
+were left alone.
 
 ### Running the Postgres tests
 
@@ -869,6 +935,16 @@ two tests can never see each other's rows.
 `test:once` `passThroughEnv`. Without that entry turbo strips the variable and
 every Postgres test skips, which looks exactly like a green run: CI would have
 reported success while proving none of it.
+
+Set `FINANCE_ARCHIVE_REQUIRE_DATABASE=1` where a skip is the failure. It makes
+`test/helpers/pgArchive.mjs` throw on load when no URL is set, so every suite
+that needs a database fails instead of skipping. CI sets it beside the URL. It
+replaces an earlier CI step that grepped turbo's console output for a skipped
+count: that assertion took three corrections to get right, first matching
+nothing and then matching the word "skipped" inside a test name, and an
+assertion that silently stops asserting is worse than none. The guarantee
+belongs in the tests. Locally, with neither variable set, skipping is still
+the behaviour, because a public clone runs the suite with no credentials.
 
 The tradeoff, stated plainly: a public clone with no database still runs the
 full suite and proves everything provable without a server, but exact

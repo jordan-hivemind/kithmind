@@ -97,13 +97,17 @@ export {
   pgSchemaVersion,
 } from "./pgSchema.js";
 export {
+  ARCHIVE_TYPES,
   ARCHIVE_WRITE_LOCK_KEY,
   archiveDatabaseUrl,
+  archiveSchemaName,
+  archiveSchemaOf,
+  createArchiveClient,
   createArchivePool,
   decodesAsText,
+  DEFAULT_ARCHIVE_SCHEMA,
   lockArchiveForWrite,
   PINNED_TEXT_OIDS,
-  pinNumericDecoding,
   withArchiveTransaction,
   type ArchiveClient,
 } from "./pgStore.js";

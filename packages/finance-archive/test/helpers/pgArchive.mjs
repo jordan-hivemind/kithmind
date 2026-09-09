@@ -8,19 +8,36 @@
 // Each test works inside its own freshly created schema and drops it
 // afterwards, so pointing this at a shared development database cannot
 // clobber anything and two tests can never see each other's rows.
+//
+// Where a database is *supposed* to be configured, skipping is the failure,
+// not the safety net. FINANCE_ARCHIVE_REQUIRE_DATABASE=1 turns a missing URL
+// into a loaded-file failure here, so the guarantee lives in the tests rather
+// than in a grep over another tool's console output. CI sets it; a public
+// clone sets neither variable and still skips cleanly.
 
 import { randomBytes } from "node:crypto";
 
-import pg from "pg";
-
-import { applyPgSchema } from "../../dist/index.js";
+import { applyPgSchema, createArchiveClient } from "../../dist/index.js";
 
 const url = process.env.FINANCE_ARCHIVE_DATABASE_URL;
+
+if (process.env.FINANCE_ARCHIVE_REQUIRE_DATABASE === "1" && !url) {
+  throw new Error(
+    "FINANCE_ARCHIVE_REQUIRE_DATABASE=1 but FINANCE_ARCHIVE_DATABASE_URL is not set. " +
+      "These tests must run rather than skip here: point the URL at a throwaway " +
+      "Postgres, or unset the flag to allow skipping.",
+  );
+}
 
 /** node:test's `skip` option: false when a database is configured. */
 export const skip = url
   ? false
   : "set FINANCE_ARCHIVE_DATABASE_URL to a throwaway Postgres to run the archive tests";
+
+/** A throwaway schema name, unique per client. */
+export function testSchemaName() {
+  return `finance_archive_test_${randomBytes(8).toString("hex")}`;
+}
 
 /** Where `archive` records the schema it created, so `reader` can join it. */
 const SCHEMA = Symbol("archive schema");
@@ -29,15 +46,13 @@ const SCHEMA = Symbol("archive schema");
  * A connected client on a fresh archive schema, dropped when the test ends.
  */
 export async function archive(t) {
-  const name = `finance_archive_test_${randomBytes(8).toString("hex")}`;
-  const client = new pg.Client({ connectionString: url });
+  const name = testSchemaName();
+  const client = createArchiveClient(url, name);
   await client.connect();
-  await client.query(`CREATE SCHEMA "${name}"`);
-  await client.query(`SET search_path TO "${name}"`);
   await applyPgSchema(client);
   client[SCHEMA] = name;
   t.after(async () => {
-    await client.query(`DROP SCHEMA IF EXISTS "${name}" CASCADE`);
+    await client.query(`DROP SCHEMA IF EXISTS ${name} CASCADE`);
     await client.end();
   });
   return client;
@@ -50,9 +65,8 @@ export async function archive(t) {
  * observe from outside whether a publication is atomic.
  */
 export async function connect(t, client) {
-  const second = new pg.Client({ connectionString: url });
+  const second = createArchiveClient(url, client[SCHEMA]);
   await second.connect();
-  await second.query(`SET search_path TO "${client[SCHEMA]}"`);
   t.after(() => second.end());
   return second;
 }

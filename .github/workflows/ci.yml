@@ -41,6 +41,11 @@ jobs:
           - 5432:5432
     env:
       FINANCE_ARCHIVE_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # Turns skipping into a failure inside the test files themselves. A
+      # public clone sets neither variable and still skips cleanly; here a
+      # skip would mean the database never reached the task, which looks
+      # exactly like a green run.
+      FINANCE_ARCHIVE_REQUIRE_DATABASE: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -54,27 +59,11 @@ jobs:
       - run: pnpm audit --prod --audit-level high
       - run: pnpm lint
       - run: pnpm check-types
-      - run: pnpm test:once | tee /tmp/test-once.log
-        shell: bash
-      # The Postgres tests skip when no database is configured, which is what
-      # lets a public clone run the suite. In CI a database IS configured, so a
-      # skip means the variable never reached the task and the tests silently
-      # did not run. Fail rather than pass on a check that did not execute.
-      - name: Fail if the finance Postgres tests were skipped
-        run: |
-          # Turbo emits the task name as a group header and then bare summary
-          # lines, so scope the search to that group rather than matching the
-          # task name on the same line as the count.
-          skipped=$(awk '/@repo\/finance-archive:test:once/{f=1} f && /skipped [0-9]+$/{print $NF; exit}' /tmp/test-once.log)
-          echo "finance-archive skipped: ${skipped:-unparsed}"
-          if [ -z "$skipped" ]; then
-            echo "::error::could not read the finance skipped count; the assertion cannot verify anything"
-            exit 1
-          fi
-          if [ "$skipped" != "0" ]; then
-            echo "::error::finance Postgres tests were skipped in CI; FINANCE_ARCHIVE_DATABASE_URL did not reach the task"
-            exit 1
-          fi
+      # No log scraping. FINANCE_ARCHIVE_REQUIRE_DATABASE above makes each
+      # suite that needs a database fail to load rather than skip when the URL
+      # is missing, so the guarantee lives in the tests instead of in a grep
+      # over another tool's console output, which can silently stop asserting.
+      - run: pnpm test:once
       - run: pnpm build
 
   postgres-proof:

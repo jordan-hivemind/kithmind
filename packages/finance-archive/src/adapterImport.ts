@@ -28,10 +28,7 @@ import type {
   ParsedRow,
 } from "./adapter.js";
 import { EMPTY_HOLDINGS, sha256Hex } from "./adapter.js";
-import {
-  type CaptureWriteResult,
-  writeCaptureManifest,
-} from "./captures.js";
+import { type CaptureWriteResult, writeCaptureManifest } from "./captures.js";
 import { canonicalizeDecimal } from "./decimal.js";
 import type {
   ImportBalance,
@@ -42,7 +39,7 @@ import type {
 } from "./importer.js";
 import { toMinorUnits } from "./money.js";
 import { toNumericText } from "./pgNumeric.js";
-import type { ArchiveClient } from "./pgStore.js";
+import { type ArchiveClient, withArchiveTransaction } from "./pgStore.js";
 import {
   type RawTreeWriteResult,
   writeRawDocument,
@@ -109,7 +106,13 @@ function insertReviewItem(db: DatabaseSync, fields: ReviewItemFields): void {
   db.prepare(
     `INSERT INTO review_items (id, kind, account_id, source_document_id, source_locator, raw_value, reason)
      VALUES (?, ?, ?, NULL, NULL, ?, ?)`,
-  ).run(randomUUID(), fields.kind, fields.accountId, fields.rawValue, fields.reason);
+  ).run(
+    randomUUID(),
+    fields.kind,
+    fields.accountId,
+    fields.rawValue,
+    fields.reason,
+  );
 }
 
 /**
@@ -429,6 +432,17 @@ export async function adapterPullToImportDocuments(
   client: ArchiveClient,
   pull: AdapterPull,
 ): Promise<ImportDocument[]> {
+  // In a transaction, and nesting into the caller's when there is one. The
+  // instrument and review rows this opens are writes, so they belong in one
+  // unit rather than autocommitting one statement at a time, and the
+  // transaction is also what pins `search_path` on a pooled endpoint.
+  return withArchiveTransaction(client, () => collectDocuments(client, pull));
+}
+
+async function collectDocuments(
+  client: ArchiveClient,
+  pull: AdapterPull,
+): Promise<ImportDocument[]> {
   const activityGroups = groupBySourceDocument(pull.rows);
   const holdings = pull.holdings ?? EMPTY_HOLDINGS;
   const positionGroups = groupBySourceDocument(holdings.positions);
@@ -706,7 +720,9 @@ export function persistAcquiredDocument(
   }
 
   const textWrite =
-    extractedText === null ? null : writeRetainedText(rawTreeRoot, extractedText);
+    extractedText === null
+      ? null
+      : writeRetainedText(rawTreeRoot, extractedText);
   return {
     filePath: documentWrite.path,
     textPath: textWrite?.path ?? null,

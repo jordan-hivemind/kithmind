@@ -27,21 +27,48 @@
 // row carries source_document_id and source_locator; acct_last4 is exactly
 // four digits; row_hash is UNIQUE; identities stay stable opaque text.
 
+// Where the objects live is part of the schema, not an ambient property of
+// whoever connects. Everything below is created in one named schema and the
+// version table is read schema-qualified. An unqualified `schema_version`
+// resolves through `search_path`, so a co-located component's own version
+// table could answer for the archive's and this code would conclude the
+// schema was already current against a database that does not have it. That
+// is not hypothetical: co-locating databases is the plan of record, and the
+// archive's default endpoint is a pooled one where a `SET search_path` issued
+// outside a transaction may be gone by the next transaction.
+
 import type pg from "pg";
+
+import { archiveSchemaOf, pinArchiveSchema } from "./pgStore.js";
 
 /** Bumped when INITIAL_SCHEMA changes. Recorded in `schema_version`. */
 export const PG_SCHEMA_VERSION = 1;
 const PG_SCHEMA_NAME = "initial postgres archive schema";
 
-/** Key for the advisory lock two concurrent creators contend on. */
-const SCHEMA_LOCK_KEY = 4_119_205_001;
+/**
+ * Key for the advisory lock two concurrent creators contend on, paired with a
+ * hash of the schema name so creating one archive does not block creating an
+ * unrelated one in the same database. The two-key form is a separate keyspace
+ * from the one-key `ARCHIVE_WRITE_LOCK_KEY`, so schema creation and an import
+ * cannot collide by accident. Both keys are int4 in this form.
+ */
+const SCHEMA_LOCK_KEY = 411_920_501;
 
 const INITIAL_SCHEMA = `
 -- Every money, quantity, price and rate column. The domain is where the
--- non-finite rejection lives: Postgres NUMERIC has its own NaN, and
--- 'NaN'::numeric = 'NaN'::numeric is true, so the guard is an inequality.
+-- non-finite rejection lives, and Postgres NUMERIC has three non-finite
+-- values, not one: NaN since forever, and Infinity and -Infinity since
+-- Postgres 14. An infinite balance is not a rounding problem, it is a value
+-- that makes every aggregate over the column meaningless.
+--
+-- The comparison is subtle in both directions and the spelling matters.
+-- 'NaN'::numeric = 'NaN'::numeric is true, unlike float NaN, so VALUE =
+-- VALUE would not catch it; and NaN sorts above Infinity in numeric
+-- ordering, so a range test would need that fact to be remembered. Listing
+-- the three values under = is the spelling that needs neither.
 CREATE DOMAIN finance_numeric AS NUMERIC
-  CHECK (VALUE IS NULL OR VALUE <> 'NaN'::numeric);
+  CHECK (VALUE IS NULL OR VALUE NOT IN
+    ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric));
 
 CREATE DOMAIN currency_code AS TEXT
   CHECK (VALUE IS NULL OR VALUE ~ '^[A-Z]{3}$');
@@ -282,39 +309,63 @@ export const PG_TABLES: readonly string[] = Object.freeze([
   "review_items",
 ]);
 
-/** The recorded version of the schema in a database, or 0 for an empty one. */
-export async function pgSchemaVersion(client: pg.ClientBase): Promise<number> {
+/**
+ * The recorded version of the archive schema, or 0 when this database has no
+ * archive in that schema. Qualified deliberately: another component's
+ * `schema_version` in the same database must never answer this question.
+ */
+export async function pgSchemaVersion(
+  client: pg.ClientBase,
+  schema: string = archiveSchemaOf(client),
+): Promise<number> {
   const present = await client.query<{ present: boolean }>(
-    "SELECT to_regclass('schema_version') IS NOT NULL AS present",
+    "SELECT to_regclass($1) IS NOT NULL AS present",
+    [`${schema}.schema_version`],
   );
   if (!present.rows[0]?.present) return 0;
   const result = await client.query<{ version: string | null }>(
-    "SELECT max(version)::text AS version FROM schema_version",
+    `SELECT max(version)::text AS version FROM ${schema}.schema_version`,
   );
   return Number(result.rows[0]?.version ?? 0);
 }
 
 /**
- * Creates the schema in the connected search_path and records the applied
+ * Creates the archive in its own named schema and records the applied
  * version. Running it again is a no-op returning the recorded version, which
  * is what makes rebuilding the archive from the raw tree routine rather than
  * an event.
  *
- * The whole thing is one transaction, and a session-scoped advisory lock
- * excludes a second creator by the database rather than by everyone
- * remembering that only one machine imports.
+ * The whole thing is one transaction, and an advisory lock excludes a second
+ * creator by the database rather than by everyone remembering that only one
+ * machine imports. The lock is keyed on the schema name as well, so creating
+ * one archive does not block creating an unrelated one in the same database.
+ *
+ * `search_path` is pinned with `SET LOCAL` rather than `SET`, so the
+ * unqualified DDL below lands in this schema even on a pooled endpoint, where
+ * a session-level `SET` can be handed to a backend the next statement never
+ * sees. The pin is recorded on the client, so every later transaction on it
+ * resolves the same objects.
  */
-export async function applyPgSchema(client: pg.ClientBase): Promise<number> {
+export async function applyPgSchema(
+  client: pg.ClientBase,
+  schema: string = archiveSchemaOf(client),
+): Promise<number> {
+  const name = pinArchiveSchema(client, schema);
   await client.query("BEGIN");
   try {
-    await client.query("SELECT pg_advisory_xact_lock($1)", [SCHEMA_LOCK_KEY]);
+    await client.query("SELECT pg_advisory_xact_lock($1, hashtext($2))", [
+      SCHEMA_LOCK_KEY,
+      name,
+    ]);
+    await client.query(`CREATE SCHEMA IF NOT EXISTS ${name}`);
+    await client.query(`SET LOCAL search_path TO ${name}`);
     await client.query(`
-      CREATE TABLE IF NOT EXISTS schema_version (
+      CREATE TABLE IF NOT EXISTS ${name}.schema_version (
         version INTEGER PRIMARY KEY,
         name TEXT NOT NULL,
         applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
       )`);
-    const current = await pgSchemaVersion(client);
+    const current = await pgSchemaVersion(client, name);
     if (current > PG_SCHEMA_VERSION) {
       throw new Error(
         `archive is at schema ${current}, newer than this build understands (${PG_SCHEMA_VERSION})`,
@@ -323,7 +374,7 @@ export async function applyPgSchema(client: pg.ClientBase): Promise<number> {
     if (current < PG_SCHEMA_VERSION) {
       await client.query(INITIAL_SCHEMA);
       await client.query(
-        "INSERT INTO schema_version (version, name) VALUES ($1, $2)",
+        `INSERT INTO ${name}.schema_version (version, name) VALUES ($1, $2)`,
         [PG_SCHEMA_VERSION, PG_SCHEMA_NAME],
       );
     }

@@ -39,7 +39,11 @@
     "@repo/finance-archive#test:once": {
       "cache": false,
       "dependsOn": ["build"],
-      "passThroughEnv": ["FINANCE_ARCHIVE_DATABASE_URL"]
+      "passThroughEnv": [
+        "FINANCE_ARCHIVE_DATABASE_URL",
+        "FINANCE_ARCHIVE_REQUIRE_DATABASE",
+        "FINANCE_ARCHIVE_SCHEMA"
+      ]
     },
     "@repo/finance-contract#test:once": {
       "cache": false,

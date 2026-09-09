@@ -10,10 +10,13 @@ import test from "node:test";
 import pg from "pg";
 
 import {
+  ARCHIVE_TYPES,
   archiveDatabaseUrl,
+  archiveSchemaName,
   contentKey,
   contentKeyV2,
   decodesAsText,
+  DEFAULT_ARCHIVE_SCHEMA,
   fromNumericText,
   NUMERIC_MAX_DIGITS,
   NUMERIC_MAX_SCALE,
@@ -85,7 +88,7 @@ test("NUMERIC decoding is pinned to text, so it can never arrive as a float", ()
   for (const oid of PINNED_TEXT_OIDS) {
     assert.equal(decodesAsText(oid), true);
   }
-  const decode = pg.types.getTypeParser(pg.types.builtins.NUMERIC);
+  const decode = ARCHIVE_TYPES.getTypeParser(pg.types.builtins.NUMERIC);
   // A parser that went through parseFloat would return a number here, and
   // would have already lost these digits.
   for (const wire of [
@@ -102,9 +105,27 @@ test("NUMERIC decoding is pinned to text, so it can never arrive as a float", ()
 });
 
 test("INT8 decoding is pinned too, because counts cross 2^53", () => {
-  const decode = pg.types.getTypeParser(pg.types.builtins.INT8);
+  const decode = ARCHIVE_TYPES.getTypeParser(pg.types.builtins.INT8);
   assert.equal(decode("9007199254740993"), "9007199254740993");
   assert.equal(typeof decode("1"), "string");
+});
+
+test("the pin is per connection and leaves the process-wide parsers alone", () => {
+  // `pg.types.setTypeParser` is module-global: a package that calls it decides
+  // how every other `pg` consumer in the process decodes its own columns. The
+  // archive hands `ARCHIVE_TYPES` to its own clients and pools instead, so a
+  // co-hosted pool keeps whatever decoding it chose.
+  for (const oid of PINNED_TEXT_OIDS) {
+    assert.notEqual(
+      pg.types.getTypeParser(oid),
+      ARCHIVE_TYPES.getTypeParser(oid),
+    );
+  }
+  // An OID the archive does not pin falls through to the driver's own parser,
+  // rather than the archive quietly deciding the whole type map.
+  const bool = pg.types.builtins.BOOL;
+  assert.equal(decodesAsText(bool), false);
+  assert.equal(ARCHIVE_TYPES.getTypeParser(bool), pg.types.getTypeParser(bool));
 });
 
 test("DATE decoding is pinned too, because a Date object shifts the day", () => {
@@ -112,7 +133,7 @@ test("DATE decoding is pinned too, because a Date object shifts the day", () => 
   // reading the day back out of one lands on the previous day west of UTC.
   // Every date in this archive is ISO text end to end: it is what the gates
   // pair periods on and what a locator cites.
-  const decode = pg.types.getTypeParser(pg.types.builtins.DATE);
+  const decode = ARCHIVE_TYPES.getTypeParser(pg.types.builtins.DATE);
   assert.equal(decode("2026-03-01"), "2026-03-01");
   assert.equal(typeof decode("2026-03-01"), "string");
 });
@@ -122,8 +143,10 @@ test("a NUMERIC that came back as a number is a hard error, not something to coe
   assert.throws(() => fromNumericText(1234), TypeError);
 });
 
-test("Postgres's own NaN for NUMERIC is refused on the way out", () => {
-  assert.throws(() => fromNumericText("NaN"), RangeError);
+test("every non-finite NUMERIC spelling is refused on the way out", () => {
+  for (const nonFinite of ["NaN", "Infinity", "-Infinity"]) {
+    assert.throws(() => fromNumericText(nonFinite), RangeError);
+  }
   assert.equal(fromNumericText("12.3400"), "12.34");
   assert.equal(fromNumericText("0.30000000000000004"), "0.30000000000000004");
 });
@@ -137,6 +160,34 @@ test("the connection string has no default and names itself when missing", () =>
     archiveDatabaseUrl({ FINANCE_ARCHIVE_DATABASE_URL: "postgres://x/y" }),
     "postgres://x/y",
   );
+});
+
+test("the archive schema is a dedicated one, and a name that is not an identifier is refused", () => {
+  // Archive objects live in a named schema rather than wherever the
+  // connection's search_path points, so a co-located component's tables can
+  // never answer for the archive's.
+  assert.equal(archiveSchemaName({}), DEFAULT_ARCHIVE_SCHEMA);
+  assert.notEqual(DEFAULT_ARCHIVE_SCHEMA, "public");
+  assert.equal(
+    archiveSchemaName({ FINANCE_ARCHIVE_SCHEMA: "archive_two" }),
+    "archive_two",
+  );
+  // The name is interpolated into DDL and into SET LOCAL search_path, where a
+  // bind parameter is not allowed, so anything but a plain identifier is a
+  // configuration error rather than something to escape and hope about.
+  for (const bad of [
+    "public; DROP SCHEMA finance",
+    "Finance",
+    "2finance",
+    "fin ance",
+    '"finance"',
+    "",
+  ]) {
+    assert.throws(
+      () => archiveSchemaName({ FINANCE_ARCHIVE_SCHEMA: bad }),
+      /usable archive schema name/,
+    );
+  }
 });
 
 // --- the versioned deduplication preimage ----------------------------------
