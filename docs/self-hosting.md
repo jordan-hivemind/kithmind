@@ -239,29 +239,29 @@ returns configured values:
 curl --fail-with-body https://your-ai-brain.example.com/api/mcp/health
 ```
 
-## 5. Create the two accounts and family space
+## 5. Create the first account and connect MCP
 
 1. Open the deployed web application and create the primary account.
-2. Sign out or use a separate browser profile and create the second account.
-3. In each account, create its own Kith Mind API key if direct MCP setup asks for
-   one. Never share one account's key with the other account.
-4. Connect each person's ChatGPT and Claude clients to
+2. Connect a hosted MCP client to
    `https://your-ai-brain.example.com/api/mcp` and complete OAuth while signed
-   in as that person.
+   in as that account.
+3. Grant the client Personal-space `read` permission first. Add broader
+   permissions only when a later workflow needs them.
 
-The same optional server-side OpenAI and Anthropic credentials serve both
-accounts. Those provider keys are not exposed to either user or MCP client.
+The optional server-side OpenAI and Anthropic credentials serve the account.
+Those provider keys are not exposed to the user or MCP client.
 
-To verify family access with synthetic labels, use **Spaces** in the first
-account to create a shared space and invite the second account. Copy the secret
-invite link immediately; it expires after seven days. The second account must
-accept the link, after which the first account approves the concrete accepted
-account. Create one person record per synthetic member and explicitly link
-each member. Verify that both accounts can read the shared record, neither can
-read the other's Personal record, a Reader cannot write, and an Editor can
-write. Transfer ownership to the second account, confirm the first becomes an
-Editor, then verify that removing a member ends access. The last owner cannot
-be removed or leave.
+### Optional family-space verification
+
+If a second account and shared family space are needed, create the second
+account in a separate browser profile. Keep each account's direct MCP key
+separate. Use **Spaces** in the first account to create a shared space and
+invite the second account. Copy the secret invite link immediately; it expires
+after seven days. The second account accepts the link and the first account
+approves the accepted account. Create one person record per synthetic member
+and explicitly link each member. Verify shared access, Personal-space
+isolation, Reader and Editor permissions, ownership transfer, and member
+removal. The last owner cannot be removed or leave.
 
 In **Settings**, add a synthetic MCP client source to the shared space, then
 generate a temporary key with `read` and `ingest`, granting that shared space
