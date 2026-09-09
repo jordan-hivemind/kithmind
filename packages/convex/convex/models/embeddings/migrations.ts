@@ -34,6 +34,37 @@ export const BASELINE_EMBEDDING_PROFILE: EmbeddingProfile = {
   preprocessing: EMBEDDING_PREPROCESSING,
 };
 
+const MAX_BASELINE_COPY_GENERATION_HISTORY = 256;
+const NON_BASELINE_HISTORY_REASON =
+  "Embedding generation history includes a non-baseline profile; rebuild baseline vectors from source inputs";
+
+/**
+ * Generation rows are the bounded provenance boundary for this legacy copy.
+ * Future generation cleanup must preserve profile-use evidence or retire this
+ * copy path before deleting history that the guard depends on.
+ */
+async function baselineLegacyCopyBlockReason(
+  ctx: Parameters<typeof ensureEmbeddingProfile>[0],
+  spaceId: Id<"spaces">,
+  baselineFingerprint: string,
+): Promise<string | undefined> {
+  const generations = await ctx.db
+    .query("embeddingGenerations")
+    .withIndex("by_spaceId", (q) => q.eq("spaceId", spaceId))
+    .take(MAX_BASELINE_COPY_GENERATION_HISTORY + 1);
+  if (generations.length > MAX_BASELINE_COPY_GENERATION_HISTORY) {
+    return "Embedding generation history exceeds the baseline legacy-copy safety bound; rebuild baseline vectors from source inputs";
+  }
+  if (
+    generations.some(
+      (generation) => generation.fingerprint !== baselineFingerprint,
+    )
+  ) {
+    return NON_BASELINE_HISTORY_REASON;
+  }
+  return undefined;
+}
+
 const preparationResult = v.object({
   dryRun: v.boolean(),
   blocked: v.boolean(),
@@ -63,6 +94,21 @@ export const prepareBaselineGeneration = internalMutation({
       BASELINE_EMBEDDING_PROFILE,
     );
     const manifest = await deriveEmbeddingManifest(ctx, args.spaceId);
+    const historyBlockReason = await baselineLegacyCopyBlockReason(
+      ctx,
+      args.spaceId,
+      fingerprint,
+    );
+    if (historyBlockReason) {
+      return {
+        dryRun,
+        blocked: true,
+        reason: historyBlockReason,
+        eligibleThoughtCount: manifest.thoughtCount,
+        eligibleChunkCount: manifest.chunkCount,
+        reused: false,
+      };
+    }
     if (manifest.chunkCount > 0) {
       return {
         dryRun,
@@ -177,6 +223,12 @@ export const backfillBaselineThoughtVectors = internalMutation({
     if (generation.fingerprint !== fingerprint) {
       throw new Error("Baseline embedding generation has the wrong profile");
     }
+    const historyBlockReason = await baselineLegacyCopyBlockReason(
+      ctx,
+      args.spaceId,
+      fingerprint,
+    );
+    if (historyBlockReason) throw new Error(historyBlockReason);
     const page = await ctx.db
       .query("thoughts")
       .withIndex("by_spaceId", (q) => q.eq("spaceId", args.spaceId))
