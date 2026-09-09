@@ -1884,11 +1884,10 @@ function bodyTextRefs(raw: Record<string, unknown>): Set<string> {
       refs.add(current.ref);
     if (!Array.isArray(node.children))
       fail("output_invalid", "raw body traversal is invalid");
-    let allowedPictureRefs: Set<string> | undefined;
     if (current.ref?.startsWith("#/pictures/")) {
       if (!Array.isArray(node.captions))
         fail("output_invalid", "raw picture traversal is invalid");
-      allowedPictureRefs = new Set<string>();
+      const captionRefs = new Set<string>();
       for (const caption of node.captions) {
         if (
           !caption ||
@@ -1897,10 +1896,12 @@ function bodyTextRefs(raw: Record<string, unknown>): Set<string> {
           typeof (caption as Record<string, unknown>).$ref !== "string"
         )
           fail("output_invalid", "raw picture traversal is invalid");
-        allowedPictureRefs.add(
+        captionRefs.add(
           (caption as Record<string, unknown>).$ref as string,
         );
       }
+      if (captionRefs.size !== node.captions.length)
+        fail("output_invalid", "raw picture traversal is invalid");
     }
     for (let index = node.children.length - 1; index >= 0; index -= 1) {
       const child = node.children[index];
@@ -1912,7 +1913,6 @@ function bodyTextRefs(raw: Record<string, unknown>): Set<string> {
       )
         fail("output_invalid", "raw body traversal is invalid");
       const childRef = (child as Record<string, unknown>).$ref as string;
-      if (allowedPictureRefs && !allowedPictureRefs.has(childRef)) continue;
       const match = /^#\/([a-z_]+)\/(0|[1-9][0-9]{0,6})$/.exec(childRef);
       if (!match || !collectionNames.has(match[1]!))
         fail("output_invalid", "raw body reference is invalid");

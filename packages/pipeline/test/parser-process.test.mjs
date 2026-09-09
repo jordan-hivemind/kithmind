@@ -606,10 +606,42 @@ test("v2 inventories traversed body slices while legacy gaps and furniture remai
       captions: [{ $ref: "#/texts/0" }],
     },
   ];
-  assert.doesNotThrow(() =>
+  assert.throws(() =>
     resolveRawLocators(
       pictureCaption.raw,
       pictureCaption.bundle,
+      "docling_utf16_pages_v2",
+    ),
+  );
+
+  const excludedPictureChild = structuredClone(pictureCaption);
+  excludedPictureChild.raw.texts[1].content_layer = "furniture";
+  assert.doesNotThrow(() =>
+    resolveRawLocators(
+      excludedPictureChild.raw,
+      excludedPictureChild.bundle,
+      "docling_utf16_pages_v2",
+    ),
+  );
+
+  const duplicatePictureChild = structuredClone(pictureCaption);
+  duplicatePictureChild.raw.pictures[0].children.push({
+    $ref: "#/texts/0",
+  });
+  assert.throws(() =>
+    resolveRawLocators(
+      duplicatePictureChild.raw,
+      duplicatePictureChild.bundle,
+      "docling_utf16_pages_v2",
+    ),
+  );
+
+  const cyclicPicture = structuredClone(pictureCaption);
+  cyclicPicture.raw.pictures[0].children = [{ $ref: "#/pictures/0" }];
+  assert.throws(() =>
+    resolveRawLocators(
+      cyclicPicture.raw,
+      cyclicPicture.bundle,
       "docling_utf16_pages_v2",
     ),
   );

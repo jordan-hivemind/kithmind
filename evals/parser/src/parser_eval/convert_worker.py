@@ -201,7 +201,9 @@ def _docling_normalized(
     tables: list[dict[str, Any]] = []
     gaps: list[dict[str, Any]] = []
     table_ordinal_by_page: dict[int, int] = {}
-    for item_index, (item, _level) in enumerate(document.iterate_items()):
+    for item_index, (item, _level) in enumerate(
+        document.iterate_items(traverse_pictures=True)
+    ):
         provenance = list(getattr(item, "prov", []) or [])
         if isinstance(item, TableItem):
             page_numbers = {getattr(prov, "page_no", None) for prov in provenance}

@@ -315,7 +315,8 @@ class ProductionParserTest(unittest.TestCase):
 
         class Document:
             @staticmethod
-            def iterate_items():
+            def iterate_items(*, traverse_pictures=False):
+                assert traverse_pictures
                 return iter(((retained, 1), (empty, 1)))
 
         with patch.dict(sys.modules, FAKE_DOCLING_MODULES):
@@ -328,6 +329,51 @@ class ProductionParserTest(unittest.TestCase):
         self.assertEqual(
             [span["charspan"] for span in segment["locator"]["provenance"]],
             [[0, 5], [6, 10], [11, 16]],
+        )
+
+    def test_traverses_picture_children_in_source_order_with_exact_geometry(self):
+        before = FakeTextItem(
+            "#/texts/0", "Before", [FakeProvenance(1, (0, 6))]
+        )
+        first_child = FakeTextItem(
+            "#/texts/1", "Picture label", [FakeProvenance(1, (0, 13))]
+        )
+        second_child = FakeTextItem(
+            "#/texts/2", "Picture value", [FakeProvenance(1, (0, 13))]
+        )
+        after = FakeTextItem(
+            "#/texts/3", "After", [FakeProvenance(1, (0, 5))]
+        )
+        calls = []
+
+        class Document:
+            @staticmethod
+            def iterate_items(*, traverse_pictures=False):
+                calls.append(traverse_pictures)
+                items = (
+                    (before, 1),
+                    (first_child, 2),
+                    (second_child, 2),
+                    (after, 1),
+                )
+                return iter(items if traverse_pictures else (items[0], items[-1]))
+
+        with patch.dict(sys.modules, FAKE_DOCLING_MODULES):
+            pages, tables, gaps = _docling_normalized(Document(), 1)
+
+        self.assertEqual(calls, [True])
+        self.assertEqual(tables, [])
+        self.assertEqual(gaps, [])
+        self.assertEqual(
+            pages[0]["text"], "Before\nPicture label\nPicture value\nAfter"
+        )
+        self.assertEqual(
+            [segment["locator"]["itemRef"] for segment in pages[0]["segments"]],
+            ["#/texts/0", "#/texts/1", "#/texts/2", "#/texts/3"],
+        )
+        self.assertEqual(
+            pages[0]["segments"][1]["locator"]["provenance"],
+            first_child.prov[0].model_dump(),
         )
 
     def test_provenance_whitespace_policy_matches_protocol_vectors(self):
@@ -355,7 +401,8 @@ class ProductionParserTest(unittest.TestCase):
 
         class Document:
             @staticmethod
-            def iterate_items():
+            def iterate_items(*, traverse_pictures=False):
+                assert traverse_pictures
                 return iter(
                     ((before, 1), (cross_page, 1), (after, 1), (uncovered, 1))
                 )
@@ -406,7 +453,8 @@ class ProductionParserTest(unittest.TestCase):
 
         class Document:
             @staticmethod
-            def iterate_items():
+            def iterate_items(*, traverse_pictures=False):
+                assert traverse_pictures
                 return iter(((valid, 1), (overlap, 1), (decreasing, 1)))
 
         with patch.dict(sys.modules, FAKE_DOCLING_MODULES):
@@ -561,7 +609,26 @@ class ProductionParserTest(unittest.TestCase):
                 "captions": [{"$ref": "#/texts/0"}],
             }
         ]
-        _normalized_bundle(normalized, picture_caption, self.digest, {})
+        with self.assertRaises(ProductionFailure):
+            _normalized_bundle(normalized, picture_caption, self.digest, {})
+
+        excluded_picture_child = copy.deepcopy(picture_caption)
+        excluded_picture_child["texts"][1]["content_layer"] = "furniture"
+        _normalized_bundle(normalized, excluded_picture_child, self.digest, {})
+
+        duplicate_picture_child = copy.deepcopy(picture_caption)
+        duplicate_picture_child["pictures"][0]["children"].append(
+            {"$ref": "#/texts/0"}
+        )
+        with self.assertRaises(ProductionFailure):
+            _normalized_bundle(normalized, duplicate_picture_child, self.digest, {})
+
+        cyclic_picture = copy.deepcopy(picture_caption)
+        cyclic_picture["pictures"][0]["children"] = [
+            {"$ref": "#/pictures/0"}
+        ]
+        with self.assertRaises(ProductionFailure):
+            _normalized_bundle(normalized, cyclic_picture, self.digest, {})
 
     def test_refuses_without_parent_network_and_resource_boundary(self):
         result, converter = self.call(
