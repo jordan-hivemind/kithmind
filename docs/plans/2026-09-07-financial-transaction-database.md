@@ -222,9 +222,12 @@ others. Neither engine is the guarantee. The guarantee is validated input and
 tested serialization, and it has to be built either way.
 
 So the check moves rather than disappears. Decimal input is validated as text
-before it is ever converted, non-finite values (`NaN`, `Infinity`, and
-Postgres's own `NaN` for `NUMERIC`) are rejected, and money crosses the driver,
-JSON and MCP boundaries as decimal strings rather than as JavaScript numbers. A
+before it is ever converted, non-finite values are rejected on the way in and
+again by the column's own domain, and money crosses the driver,
+JSON and MCP boundaries as decimal strings rather than as JavaScript numbers.
+`NUMERIC` has three non-finite values, not one: `NaN`, and `Infinity` and
+`-Infinity` since Postgres 14. All three are rejected, and the domain is what
+makes that a database invariant rather than a convention. A
 driver that silently decodes `NUMERIC` to a float would reintroduce exactly the
 failure the type was chosen to prevent, so that decoding is pinned and tested.
 
@@ -524,6 +527,24 @@ So an import publishes atomically, or readers select an immutable completed
 dataset revision. A second writer is excluded by the database rather than by
 everyone remembering, and retries stay idempotent. Hosting the ledger does not
 by itself coordinate anything.
+
+**The archive owns a named schema, not a `search_path`.** Co-locating this
+database with other components is the plan of record, so every archive object
+is created in one dedicated schema and the version table is read
+schema-qualified. Left unqualified, a neighbouring component's own
+`schema_version` could answer for the archive's and schema creation would be
+skipped against a database that has no archive in it. The default endpoint is
+a pooled one, where a session-level `SET search_path` outside a transaction is
+unreliable: the pooler can hand the next transaction a different backend. The
+path is therefore set in the connection's startup packet and re-set with `SET
+LOCAL` inside each transaction. Requiring a direct endpoint would be a
+workaround for the defect rather than a fix.
+
+**Driver decoding is pinned per connection, not per process.** The pinned
+`NUMERIC`, `INT8` and `DATE` decoders are handed to the archive's own clients
+and pools. Setting them process-wide would decide how a co-hosted component's
+pool decodes its own columns, which is the same co-location the paragraph
+above is about.
 
 A free tier looked adequate against the published plans on 2026-09-08: storage
 in the hundreds of megabytes and compute-hours in the low hundreds per month,

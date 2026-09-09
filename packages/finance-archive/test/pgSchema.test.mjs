@@ -11,37 +11,34 @@
 // this at a shared development database cannot clobber anything.
 
 import assert from "node:assert/strict";
-import { randomBytes } from "node:crypto";
 import test from "node:test";
 
 import pg from "pg";
 
 import {
   applyPgSchema,
+  ARCHIVE_TYPES,
+  createArchiveClient,
   fromNumericText,
   PG_SCHEMA_VERSION,
   PG_TABLES,
   pgSchemaVersion,
+  withArchiveTransaction,
 } from "../dist/index.js";
 
+import { skip, testSchemaName } from "./helpers/pgArchive.mjs";
+
 const url = process.env.FINANCE_ARCHIVE_DATABASE_URL;
-const skip = url
-  ? false
-  : "set FINANCE_ARCHIVE_DATABASE_URL to a throwaway Postgres to run the integration tests";
 
 /** Runs `body` against a freshly created, freshly dropped schema. */
-async function withArchive(body) {
-  const client = new pg.Client({ connectionString: url });
+async function withArchive(body, schema = testSchemaName()) {
+  const client = createArchiveClient(url, schema);
   await client.connect();
-  const name = `finance_archive_test_${randomBytes(8).toString("hex")}`;
   try {
-    await client.query(`CREATE SCHEMA "${name}"`);
-    await client.query(`SET search_path TO "${name}"`);
     await applyPgSchema(client);
-    await body(client);
+    await body(client, schema);
   } finally {
-    await client.query("RESET search_path");
-    await client.query(`DROP SCHEMA IF EXISTS "${name}" CASCADE`);
+    await client.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
     await client.end();
   }
 }
@@ -197,15 +194,50 @@ test(
 );
 
 test(
-  "a non-finite NUMERIC is rejected by the database, not stored",
+  "every non-finite NUMERIC is rejected by the database, not stored",
   { skip },
   async () => {
     await withArchive(async (client) => {
       const account = await seedAccount(client);
+      // Postgres NUMERIC has three non-finite values, not one: Infinity and
+      // -Infinity have been accepted since Postgres 14. Application-side
+      // validation is not what is under test here -- each insert goes to the
+      // server as a literal and has to come back an error, because the domain
+      // is what makes this a database invariant rather than a convention.
+      for (const nonFinite of ["NaN", "Infinity", "-Infinity"]) {
+        await assert.rejects(
+          insertAmount(client, account, nonFinite),
+          /finance_numeric/,
+          `${nonFinite} was accepted into a money column`,
+        );
+      }
+
+      // Every finance_numeric column, not just the one the loop above used:
+      // an infinite balance or quantity is the same defect as an infinite
+      // amount, and a domain that only covered transactions.amount would be
+      // a guarantee about one column rather than about the type.
       await assert.rejects(
-        insertAmount(client, account, "NaN"),
+        client.query(
+          `INSERT INTO balances (id, account_id, as_of, cash, currency)
+           VALUES ('bal-inf', $1, DATE '2026-03-04', 'Infinity'::numeric, 'USD')`,
+          [account],
+        ),
         /finance_numeric/,
       );
+      await assert.rejects(
+        client.query(
+          `INSERT INTO positions (id, account_id, as_of, quantity, currency)
+           VALUES ('pos-inf', $1, DATE '2026-03-04', '-Infinity'::numeric, 'USD')`,
+          [account],
+        ),
+        /finance_numeric/,
+      );
+
+      // The server really does accept these into a bare NUMERIC, which is
+      // what makes the domain load-bearing rather than decorative.
+      const bare = await client.query("SELECT 'Infinity'::numeric::text AS v");
+      assert.equal(bare.rows[0].v, "Infinity");
+
       const count = await client.query(
         "SELECT count(*)::text AS n FROM transactions",
       );
@@ -264,5 +296,174 @@ test(
       );
       assert.equal(Number(commitments.rows[0].n), 0);
     });
+  },
+);
+
+// --- coexistence with another component in the same database ---------------
+//
+// Co-locating databases is the plan of record, so "whatever the connection's
+// search_path happens to be" is not a safe place to put the archive. These
+// two tests are the concrete failures that would follow: a neighbour's
+// schema_version answering for the archive's, and the archive resolving a
+// neighbour's table because it is earlier on the path.
+
+/**
+ * A connection whose ambient search_path is somebody else's schema. Built
+ * from a bare pg.Client on purpose: `createArchiveClient` would pin the path
+ * in the startup packet, and the point here is that the archive stays correct
+ * without that help, the way it must on a pooled endpoint where a
+ * session-level path can be handed to a backend the next statement never sees.
+ */
+async function neighbourConnection(foreign) {
+  const client = new pg.Client({
+    connectionString: url,
+    types: ARCHIVE_TYPES,
+    options: `-c search_path=${foreign}`,
+  });
+  await client.connect();
+  return client;
+}
+
+test(
+  "another component's schema_version in the same database is not the archive's",
+  { skip },
+  async () => {
+    const foreign = testSchemaName();
+    const archiveSchema = testSchemaName();
+    const setup = createArchiveClient(url, foreign);
+    await setup.connect();
+    await setup.query(`CREATE SCHEMA ${foreign}`);
+    await setup.query(
+      `CREATE TABLE ${foreign}.schema_version (
+         version INTEGER PRIMARY KEY, name TEXT NOT NULL,
+         applied_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
+    );
+    await setup.query(
+      `INSERT INTO ${foreign}.schema_version (version, name) VALUES (99, 'some other component')`,
+    );
+    await setup.end();
+
+    const client = await neighbourConnection(foreign);
+    try {
+      // The trap is armed: an unqualified schema_version on this connection
+      // resolves to the neighbour's, and it claims a version far past ours.
+      const unqualified = await client.query(
+        "SELECT max(version)::text AS v FROM schema_version",
+      );
+      assert.equal(unqualified.rows[0].v, "99");
+
+      // The archive reads its own, which does not exist yet. Version 99 would
+      // have been read as "newer than this build understands" and 1 as
+      // "already current"; both skip creation against a database that has no
+      // archive in it.
+      assert.equal(await pgSchemaVersion(client, archiveSchema), 0);
+      assert.equal(
+        await applyPgSchema(client, archiveSchema),
+        PG_SCHEMA_VERSION,
+      );
+      assert.equal(
+        await pgSchemaVersion(client, archiveSchema),
+        PG_SCHEMA_VERSION,
+      );
+
+      // The archive landed in its own schema, whole.
+      const created = await client.query(
+        `SELECT count(*)::text AS n FROM information_schema.tables
+         WHERE table_schema = $1 AND table_name = ANY($2)`,
+        [archiveSchema, [...PG_TABLES]],
+      );
+      assert.equal(Number(created.rows[0].n), PG_TABLES.length);
+
+      // And the neighbour is untouched: still one table, still version 99,
+      // still one row. Creation wrote nothing into it.
+      const neighbourTables = await client.query(
+        "SELECT count(*)::text AS n FROM information_schema.tables WHERE table_schema = $1",
+        [foreign],
+      );
+      assert.equal(Number(neighbourTables.rows[0].n), 1);
+      const neighbourVersions = await client.query(
+        `SELECT count(*)::text AS n, max(version)::text AS v FROM ${foreign}.schema_version`,
+      );
+      assert.equal(Number(neighbourVersions.rows[0].n), 1);
+      assert.equal(neighbourVersions.rows[0].v, "99");
+    } finally {
+      await client.query(`DROP SCHEMA IF EXISTS ${archiveSchema} CASCADE`);
+      await client.query(`DROP SCHEMA IF EXISTS ${foreign} CASCADE`);
+      await client.end();
+    }
+  },
+);
+
+test(
+  "the archive reads and writes its own tables when it is not first on the search_path",
+  { skip },
+  async () => {
+    const foreign = testSchemaName();
+    const archiveSchema = testSchemaName();
+    const setup = createArchiveClient(url, foreign);
+    await setup.connect();
+    await setup.query(`CREATE SCHEMA ${foreign}`);
+    // A decoy with the same name as one of ours, earlier on the path, so an
+    // unqualified `documents` on this connection is the neighbour's.
+    await setup.query(
+      `CREATE TABLE ${foreign}.documents (id TEXT PRIMARY KEY)`,
+    );
+    await setup.end();
+
+    const client = await neighbourConnection(foreign);
+    try {
+      await applyPgSchema(client, archiveSchema);
+
+      // A whole write path, through the package's own transaction helper.
+      await withArchiveTransaction(client, async (tx) => {
+        await tx.query(
+          "INSERT INTO institutions (id, name, slug) VALUES ('inst-2', 'Thistlebrook Trust', 'thistlebrook-2')",
+        );
+        await tx.query(
+          "INSERT INTO accounts (id, institution_id, acct_last4, base_currency) VALUES ('acct-2', 'inst-2', '0042', 'USD')",
+        );
+        await tx.query(
+          `INSERT INTO documents (id, doc_type, file_path, sha256)
+           VALUES ('doc-2', 'statement', 'synthetic/statement.pdf', $1)`,
+          ["0".repeat(64)],
+        );
+        await tx.query(
+          `INSERT INTO transactions
+             (id, account_id, process_date, activity_type, amount, currency, row_hash, imported_at)
+           VALUES ('txn-2', 'acct-2', DATE '2026-03-04', 'fee', '12.34'::numeric, 'USD', 'hash-coexist', now())`,
+        );
+      });
+
+      const rows = await client.query(
+        `SELECT
+           (SELECT count(*)::text FROM ${archiveSchema}.documents) AS ours,
+           (SELECT count(*)::text FROM ${foreign}.documents) AS theirs,
+           (SELECT count(*)::text FROM ${archiveSchema}.transactions) AS txns`,
+      );
+      assert.equal(rows.rows[0].ours, "1");
+      assert.equal(rows.rows[0].theirs, "0");
+      assert.equal(rows.rows[0].txns, "1");
+
+      // The decoy is still what an unqualified name resolves to on this
+      // connection, so the assertion above is about the archive pinning its
+      // own path rather than about the path being harmless.
+      const resolved = await client.query(
+        `SELECT n.nspname AS s FROM pg_class c
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE c.oid = to_regclass('documents')`,
+      );
+      assert.equal(resolved.rows[0].s, foreign);
+
+      // And the money still crossed the driver as decimal text.
+      const amount = await client.query(
+        `SELECT amount FROM ${archiveSchema}.transactions`,
+      );
+      assert.equal(typeof amount.rows[0].amount, "string");
+      assert.equal(fromNumericText(amount.rows[0].amount), "12.34");
+    } finally {
+      await client.query(`DROP SCHEMA IF EXISTS ${archiveSchema} CASCADE`);
+      await client.query(`DROP SCHEMA IF EXISTS ${foreign} CASCADE`);
+      await client.end();
+    }
   },
 );

@@ -6,7 +6,18 @@
 // choice someone else can change in a minor release, and a driver that
 // silently started returning a float for NUMERIC would reintroduce the
 // failure the type was chosen to prevent, quietly and everywhere at once.
-// `test/pgMoney.test.mjs` asserts the pin, with no database required.
+//
+// The pin is per connection, not per process. `pg.types.setTypeParser` is
+// module-global state shared by every `pg` consumer in the process, so a
+// package that sets it decides how *other* people's pools decode their own
+// columns. That was tolerable while this package was the only `pg` consumer
+// and stops being tolerable the moment archives and other components are
+// co-hosted, which is the direction of travel. `ARCHIVE_TYPES` is handed to
+// each archive `Client` and `Pool` through node-postgres' own `types` config
+// instead, so the guarantee reaches every archive connection and nothing
+// else. `test/pgMoney.test.mjs` asserts both halves -- that an archive
+// connection decodes as text, and that the process-wide parser was left
+// alone -- with no database required.
 //
 // INT8 is pinned for the same reason: counts and sums of counts cross 2^53.
 //
@@ -17,6 +28,11 @@
 // reconciliation gates pair periods on and compare, and what a locator cites
 // -- so a Date object is the same class of silent damage for a date that a
 // float is for an amount.
+//
+// Schema resolution is pinned for a third reason of the same shape. Archive
+// objects live in one named schema, never in whatever the connection's
+// `search_path` happens to be, so a co-located component's `documents` or
+// `schema_version` can never answer for the archive's. See `pgSchema.ts`.
 
 import pg from "pg";
 
@@ -27,34 +43,78 @@ export const PINNED_TEXT_OIDS: readonly number[] = Object.freeze([
   pg.types.builtins.DATE,
 ]);
 
-/**
- * What the importer and both gates write through. Deliberately node-postgres'
- * own client type rather than an interface of this package's own: there is
- * exactly one implementation, and a one-implementation interface would buy
- * nothing but a layer to keep in sync. A `Client` and a pooled client both
- * satisfy it, which is all the substitution this package actually needs.
- */
-export type ArchiveClient = pg.ClientBase;
-
 /** Hands the wire text back untouched. Never `parseFloat`, never `Number`. */
 const decodeAsText = (value: string): string => value;
 
 /**
- * Installs the pinned decoders. Idempotent, and called at module load so
- * importing this package is enough; exported so a test can assert the pin
- * rather than trust it.
+ * The decoding every archive connection is opened with. Passed as
+ * node-postgres' `types` config, which is per client and per pool, so it
+ * never reaches another component's pool the way `setTypeParser` would.
  */
-export function pinNumericDecoding(): void {
-  for (const oid of PINNED_TEXT_OIDS) {
-    pg.types.setTypeParser(oid, decodeAsText);
-  }
+export const ARCHIVE_TYPES: pg.CustomTypesConfig = Object.freeze({
+  getTypeParser: (id: number, format?: unknown) =>
+    PINNED_TEXT_OIDS.includes(id)
+      ? decodeAsText
+      : (pg.types.getTypeParser as (i: number, f?: unknown) => unknown)(
+          id,
+          format,
+        ),
+}) as pg.CustomTypesConfig;
+
+/** True when an archive connection hands this OID back as text, unparsed. */
+export function decodesAsText(oid: number): boolean {
+  return ARCHIVE_TYPES.getTypeParser(oid) === decodeAsText;
 }
 
-pinNumericDecoding();
+/**
+ * The schema archive objects live in when nothing says otherwise. A dedicated
+ * name rather than `public`: co-locating databases is the plan of record, and
+ * `public` is where every other component's tables land by default.
+ */
+export const DEFAULT_ARCHIVE_SCHEMA = "finance";
 
-/** True when the driver would hand this OID back as text, unparsed. */
-export function decodesAsText(oid: number): boolean {
-  return pg.types.getTypeParser(oid) === decodeAsText;
+/**
+ * Schema names are interpolated into DDL and into `SET LOCAL search_path`,
+ * where a bind parameter is not allowed, so the name is validated to a plain
+ * lowercase identifier rather than quoted. Anything else is a configuration
+ * error, not something to escape and hope about.
+ */
+const SCHEMA_NAME = /^[a-z_][a-z0-9_]{0,62}$/;
+
+/**
+ * The archive schema, from the environment. `FINANCE_ARCHIVE_SCHEMA` exists
+ * so one database can host more than one archive (a throwaway per test, say),
+ * not so the archive can be pointed at a shared `public`.
+ */
+export function archiveSchemaName(
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  return assertSchemaName(env.FINANCE_ARCHIVE_SCHEMA ?? DEFAULT_ARCHIVE_SCHEMA);
+}
+
+function assertSchemaName(name: string): string {
+  if (!SCHEMA_NAME.test(name)) {
+    throw new Error(
+      `${JSON.stringify(name)} is not a usable archive schema name; ` +
+        "use lowercase letters, digits and underscores, starting with a letter or underscore",
+    );
+  }
+  return name;
+}
+
+/** The schema each connection was opened against. */
+const pinnedSchemas = new WeakMap<object, string>();
+
+/** Records the schema a connection resolves archive objects in. */
+export function pinArchiveSchema(client: object, schema: string): string {
+  const name = assertSchemaName(schema);
+  pinnedSchemas.set(client, name);
+  return name;
+}
+
+/** The schema a connection resolves archive objects in. */
+export function archiveSchemaOf(client: object): string {
+  return pinnedSchemas.get(client) ?? archiveSchemaName();
 }
 
 /**
@@ -78,10 +138,59 @@ export function archiveDatabaseUrl(
   return url;
 }
 
-/** A pool against the archive, with decoding pinned before the first query. */
-export function createArchivePool(url: string = archiveDatabaseUrl()): pg.Pool {
-  pinNumericDecoding();
-  return new pg.Pool({ connectionString: url });
+/**
+ * What the importer and both gates write through. Deliberately node-postgres'
+ * own client type rather than an interface of this package's own: there is
+ * exactly one implementation, and a one-implementation interface would buy
+ * nothing but a layer to keep in sync. A `Client` and a pooled client both
+ * satisfy it, which is all the substitution this package actually needs.
+ */
+export type ArchiveClient = pg.ClientBase;
+
+/**
+ * How every archive connection is opened: decoding pinned per connection, and
+ * `search_path` set in the startup packet so even a statement issued outside a
+ * transaction resolves archive objects in the archive schema.
+ *
+ * The startup packet is not the whole answer, because the archive's default
+ * endpoint is a pooled one, where a `SET` outside a transaction may land on a
+ * backend the next transaction never sees. `withArchiveTransaction` and
+ * `applyPgSchema` therefore re-pin the path with `SET LOCAL` inside their own
+ * transaction, which is the part a pooler cannot take away.
+ */
+function archiveConnectionConfig(url: string, schema: string): pg.ClientConfig {
+  return {
+    connectionString: url,
+    types: ARCHIVE_TYPES,
+    options: `-c search_path=${schema}`,
+  };
+}
+
+/** A single connection to the archive, decoding and schema both pinned. */
+export function createArchiveClient(
+  url: string = archiveDatabaseUrl(),
+  schema: string = archiveSchemaName(),
+): pg.Client {
+  const name = assertSchemaName(schema);
+  const client = new pg.Client(archiveConnectionConfig(url, name));
+  pinArchiveSchema(client, name);
+  return client;
+}
+
+/** A pool against the archive, decoding and schema both pinned. */
+export function createArchivePool(
+  url: string = archiveDatabaseUrl(),
+  schema: string = archiveSchemaName(),
+): pg.Pool {
+  const name = assertSchemaName(schema);
+  const pool = new pg.Pool(archiveConnectionConfig(url, name));
+  pinArchiveSchema(pool, name);
+  // Each client the pool opens is a separate object, and it is the client
+  // `withArchiveTransaction` is handed, so the pin has to reach it too.
+  pool.on("connect", (client) => {
+    pinArchiveSchema(client, name);
+  });
+  return pool;
 }
 
 /**
@@ -128,6 +237,11 @@ export async function withArchiveTransaction<T>(
   openTransactions.add(client);
   await client.query("BEGIN");
   try {
+    // Re-pinned inside the transaction, so a pooler cannot hand the next
+    // statement a backend that never saw the startup packet's path. The
+    // schema name is a validated identifier, which is why it can be
+    // interpolated where a bind parameter is not allowed.
+    await client.query(`SET LOCAL search_path TO ${archiveSchemaOf(client)}`);
     const result = await body(client);
     await client.query("COMMIT");
     return result;

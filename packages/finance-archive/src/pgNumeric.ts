@@ -15,8 +15,9 @@
 // silently stored -- moves here, to input validation, which is the only place
 // that can see the difference. Decimal input is validated as text before any
 // conversion, a JavaScript number is refused outright rather than stringified,
-// non-finite values are refused (including Postgres's own NaN for NUMERIC),
-// and money crosses the driver, JSON and MCP boundaries as decimal strings.
+// non-finite values are refused (including all three that NUMERIC itself has:
+// NaN, Infinity and -Infinity), and money crosses the driver, JSON and MCP
+// boundaries as decimal strings.
 
 import { canonicalizeDecimal } from "./decimal.js";
 
@@ -72,13 +73,13 @@ export function toNumericText(value: string): string {
  * A `number` here means the driver decoded NUMERIC as binary floating point,
  * which reintroduces exactly the failure NUMERIC was chosen to prevent. That
  * is a hard error, not something to coerce past: by the time it is a number
- * the digits are already gone. See `pinNumericDecoding` in pgStore.ts.
+ * the digits are already gone. See `ARCHIVE_TYPES` in pgStore.ts.
  */
 export function fromNumericText(value: unknown): string {
   if (typeof value === "number") {
     throw new TypeError(
       "the driver decoded NUMERIC as a JavaScript number; money must cross the " +
-        "driver boundary as decimal text (see pinNumericDecoding)",
+        "driver boundary as decimal text (see ARCHIVE_TYPES)",
     );
   }
   if (typeof value !== "string") {
@@ -86,9 +87,13 @@ export function fromNumericText(value: unknown): string {
       `expected NUMERIC as decimal text, got ${value === null ? "null" : typeof value}`,
     );
   }
-  if (value === "NaN") {
+  // NUMERIC has three non-finite spellings, not one: Infinity and -Infinity
+  // have been accepted since Postgres 14. The finance_numeric domain refuses
+  // all three, so seeing one here means the value came from a bare NUMERIC
+  // expression rather than a domain column, which is still not a finance value.
+  if (value === "NaN" || value === "Infinity" || value === "-Infinity") {
     throw new RangeError(
-      "Postgres returned NUMERIC NaN, which is not a finance value; " +
+      `Postgres returned NUMERIC ${value}, which is not a finance value; ` +
         "a non-finite amount is a review item, never a number to carry forward",
     );
   }
