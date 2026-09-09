@@ -39,8 +39,12 @@ and age identities through protected key recovery before decrypting.
 ## Status and acceptance
 
 The first production baseline operation passed export and exact remote decrypt
-verification on 2026-09-08. The generic export command and scheduling,
-and the refresh required after a new schema, remain pending. No recurring database backup service is enabled yet.
+verification on 2026-09-08. The public generic runner merged in PR79. Private
+owner adapters now run through an installed daily service; its first actual
+service run passed export, encryption, remote readback and decryption. A new schema still requires a fresh evidence bundle.
+The additional current-schema evidence is local only and is not part of the
+remote version-1 manifest. A scheduled snapshot does not itself perform an
+isolated restore.
 
 The previous isolated native restore proof from P223 is separate evidence. It
 does not claim that the latest production ZIP was imported.
