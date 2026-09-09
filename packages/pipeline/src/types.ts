@@ -7,7 +7,11 @@ export type GapCode =
   | "unstable"
   | "unsupported";
 
-export type RootConfig = { alias: string; path: string };
+export type RootConfig = {
+  alias: string;
+  path: string;
+  includeFiles?: string[];
+};
 export type PdfDocQaProfile = {
   parserProfileId: "pdf_docqa_v1";
   parserFingerprint: string;

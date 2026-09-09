@@ -18,6 +18,8 @@ const AGE_RECIPIENT = /^age1pq1[023456789acdefghjklmnpqrstuvwxyz]{40,4090}$/;
 const HOST = /^[A-Za-z0-9_-]{1,128}$/;
 const RCLONE_REMOTE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const MAX_CONFIG_BYTES = 64 * 1024;
+const MAX_INCLUDED_FILES_PER_ROOT = 256;
+const MAX_INCLUDED_FILE_PATH_BYTES = 2_048;
 const MAX_TABLE_STRUCTURE_BYPASS_SOURCES = 32;
 const MAX_TABLE_STRUCTURE_BYPASS_PAGES = 64;
 
@@ -47,6 +49,49 @@ function integer(
   )
     fail(`${label} is out of range`);
   return value as number;
+}
+
+function includedFiles(value: unknown, label: string): string[] {
+  if (
+    !Array.isArray(value) ||
+    value.length < 1 ||
+    value.length > MAX_INCLUDED_FILES_PER_ROOT
+  ) {
+    fail(`${label} must contain 1 through 256 paths`);
+  }
+  const paths = value.map((entry, index) => {
+    const path = string(entry, `${label}[${index}]`);
+    const parts = path.split("/");
+    if (
+      path.startsWith("/") ||
+      path.includes("\\") ||
+      /[\x00-\x1f\x7f]/.test(path) ||
+      Buffer.byteLength(path, "utf8") > MAX_INCLUDED_FILE_PATH_BYTES ||
+      parts.some(
+        (part) =>
+          !part || part === "." || part === ".." || part.trim() !== part,
+      )
+    ) {
+      fail(`${label}[${index}] must be a normalized relative path`);
+    }
+    return path;
+  });
+  if (new Set(paths).size !== paths.length) {
+    fail(`${label} paths must be unique`);
+  }
+  paths.sort((left, right) =>
+    Buffer.compare(Buffer.from(left), Buffer.from(right)),
+  );
+  const selected = new Set(paths);
+  for (const path of paths) {
+    const parts = path.split("/");
+    for (let length = 1; length < parts.length; length += 1) {
+      if (selected.has(parts.slice(0, length).join("/"))) {
+        fail(`${label} cannot include a path beneath another included path`);
+      }
+    }
+  }
+  return paths;
 }
 
 function exact(
@@ -640,13 +685,28 @@ export function parseConfig(value: unknown): PipelineConfig {
     fail("roots must contain 1 through 16 entries");
   const roots: RootConfig[] = rootsValue.map((entry, index) => {
     const root = object(entry, `roots[${index}]`);
-    if (Object.keys(root).some((key) => key !== "alias" && key !== "path"))
+    if (
+      Object.keys(root).some(
+        (key) => key !== "alias" && key !== "path" && key !== "includeFiles",
+      )
+    )
       fail(`roots[${index}] has an unknown field`);
     const alias = string(root.alias, `roots[${index}].alias`);
     if (!ROOT_ALIAS.test(alias)) fail(`roots[${index}].alias is invalid`);
     const path = string(root.path, `roots[${index}].path`);
     if (!path.startsWith("/")) fail(`roots[${index}].path must be absolute`);
-    return { alias, path: resolve(path) };
+    return {
+      alias,
+      path: resolve(path),
+      ...(root.includeFiles === undefined
+        ? {}
+        : {
+            includeFiles: includedFiles(
+              root.includeFiles,
+              `roots[${index}].includeFiles`,
+            ),
+          }),
+    };
   });
   if (new Set(roots.map((root) => root.alias)).size !== roots.length)
     fail("root aliases must be unique");

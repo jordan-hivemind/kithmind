@@ -601,10 +601,30 @@ async function discoverWith<T extends DiscoveryFile | SourceObservation>(
   let encountered = 0;
   const deadline = Date.now() + FILESYSTEM_DEADLINE_MS;
 
+  function inclusion(root: SafeRoot):
+    | {
+        leaves: Set<string>;
+        ancestors: Set<string>;
+        matched: Set<string>;
+      }
+    | undefined {
+    if (root.includeFiles === undefined) return undefined;
+    const leaves = new Set(root.includeFiles);
+    const ancestors = new Set<string>();
+    for (const path of root.includeFiles) {
+      const parts = pathParts(path);
+      for (let length = 1; length < parts.length; length += 1) {
+        ancestors.add(parts.slice(0, length).join(sep));
+      }
+    }
+    return { leaves, ancestors, matched: new Set() };
+  }
+
   async function walk(
     root: SafeRoot,
     directory: string,
     depth: number,
+    selected: ReturnType<typeof inclusion>,
   ): Promise<void> {
     if (depth > config.maxDepth) {
       throw new FilesystemFailure(
@@ -680,17 +700,45 @@ async function discoverWith<T extends DiscoveryFile | SourceObservation>(
     for (const entry of entries) {
       const fullPath = join(directory, entry.name);
       const rel = relative(root.canonicalPath, fullPath);
+      const selectedLeaf = selected?.leaves.has(rel) ?? false;
+      const selectedAncestor = selected?.ancestors.has(rel) ?? false;
+      if (selected !== undefined && !selectedLeaf && !selectedAncestor) {
+        continue;
+      }
       if (entry.isSymbolicLink()) {
-        throw new FilesystemFailure("unstable", "symlink found in root");
+        throw new FilesystemFailure(
+          "unstable",
+          selected === undefined
+            ? "symlink found in root"
+            : "included path is a symlink",
+        );
+      }
+      if (selectedAncestor) {
+        if (!entry.isDirectory()) {
+          throw new FilesystemFailure(
+            "unsupported",
+            "included file ancestor is not a directory",
+          );
+        }
+        await walk(root, fullPath, depth + 1, selected);
+        continue;
       }
       if (entry.isDirectory()) {
-        await walk(root, fullPath, depth + 1);
+        if (selectedLeaf) {
+          throw new FilesystemFailure(
+            "unsupported",
+            "included file is not a regular file",
+          );
+        }
+        await walk(root, fullPath, depth + 1, selected);
         continue;
       }
       if (!entry.isFile()) {
         throw new FilesystemFailure(
           "unsupported",
-          "root contains a non-regular entry",
+          selectedLeaf
+            ? "included file is not a regular file"
+            : "root contains a non-regular entry",
         );
       }
       if (entry.name === ".DS_Store") continue;
@@ -709,6 +757,7 @@ async function discoverWith<T extends DiscoveryFile | SourceObservation>(
       }
       uris.add(uri);
       found.push(file);
+      selected?.matched.add(rel);
     }
 
     const afterDirectory = await beforeDeadline(
@@ -745,7 +794,16 @@ async function discoverWith<T extends DiscoveryFile | SourceObservation>(
     }
   }
 
-  for (const root of roots) await walk(root, root.canonicalPath, 0);
+  for (const root of roots) {
+    const selected = inclusion(root);
+    await walk(root, root.canonicalPath, 0, selected);
+    if (
+      selected !== undefined &&
+      selected.matched.size !== selected.leaves.size
+    ) {
+      throw new FilesystemFailure("unstable", "included file is missing");
+    }
+  }
   return found;
 }
 
