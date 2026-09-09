@@ -40,8 +40,8 @@ and age identities through protected key recovery before decrypting.
 
 The first production baseline operation passed export and exact remote decrypt
 verification on 2026-09-08. The public generic runner merged in PR79. Private
-owner adapters now run on an installed daily 09:00 schedule; its first scheduled
-run completed in 73 seconds. A new schema still requires a fresh evidence bundle.
+owner adapters now run through an installed daily service; its first actual
+service run passed export, encryption, remote readback and decryption. A new schema still requires a fresh evidence bundle.
 The additional current-schema evidence is local only and is not part of the
 remote version-1 manifest. A scheduled snapshot does not itself perform an
 isolated restore.
