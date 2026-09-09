@@ -1,4 +1,10 @@
-import { exportJWK, generateKeyPair, importJWK, jwtVerify } from "jose";
+import {
+  exportJWK,
+  generateKeyPair,
+  importJWK,
+  jwtVerify,
+  SignJWT,
+} from "jose";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -26,6 +32,8 @@ describe("MCP Convex JWTs", () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
     vi.unstubAllEnvs();
   });
 
@@ -43,6 +51,32 @@ describe("MCP Convex JWTs", () => {
     expect(protectedHeader.kid).toBe("test-key");
     expect(payload.sub).toBe("user-123");
     expect(payload.apiKeyId).toBe("key-456");
+    expect(payload.exp! - payload.iat!).toBe(60);
+  });
+
+  it("keeps an exact 60-second lifetime across a wall-clock second boundary", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-08T12:00:00.999Z"));
+    const setIssuedAt = SignJWT.prototype.setIssuedAt;
+    vi.spyOn(SignJWT.prototype, "setIssuedAt").mockImplementation(function (
+      this: SignJWT,
+      value,
+    ) {
+      const result = setIssuedAt.call(this, value);
+      vi.setSystemTime(new Date("2026-09-08T12:00:01.001Z"));
+      return result;
+    });
+
+    const token = await createConvexMcpToken({
+      userId: "user-123",
+      keyId: "key-456",
+    });
+    const publicKey = await importJWK(getPublicMcpJwk(), MCP_JWT_ALGORITHM);
+    const { payload } = await jwtVerify(token, publicKey, {
+      issuer: "https://brain.example.test",
+      audience: MCP_JWT_AUDIENCE,
+    });
+
     expect(payload.exp! - payload.iat!).toBe(60);
   });
 

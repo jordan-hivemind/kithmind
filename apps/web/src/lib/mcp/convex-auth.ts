@@ -68,6 +68,7 @@ export async function createConvexMcpToken(
   }
   const keyId = process.env.MCP_JWT_KEY_ID ?? "mcp-1";
   const signingKey = await importJWK(privateJwk, MCP_JWT_ALGORITHM);
+  const issuedAt = Math.floor(Date.now() / 1000);
 
   return await new SignJWT({
     apiKeyId: identity.keyId,
@@ -89,8 +90,8 @@ export async function createConvexMcpToken(
     .setIssuer(issuer)
     .setAudience(MCP_JWT_AUDIENCE)
     .setSubject(identity.userId)
-    .setIssuedAt()
-    .setExpirationTime("60s")
+    .setIssuedAt(issuedAt)
+    .setExpirationTime(issuedAt + 60)
     .setJti(crypto.randomUUID())
     .sign(signingKey);
 }
