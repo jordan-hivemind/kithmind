@@ -33,11 +33,12 @@ export implementation, backup implementation, schedule, or recovery key. Run
 it with one protected absolute configuration path:
 
 ```sh
-node scripts/run-database-backup.mjs /absolute/protected/database-backup.json
+node scripts/run-database-backup.mjs --config /absolute/protected/database-backup.json
 ```
 
-A synthetic configuration uses owner-only, existing absolute directories and
-absolute executable paths:
+The configuration file must be canonical, protected, and mode `0600`. Its
+state and staging directories must be canonical, existing, protected, and mode
+`0700`; command paths must be absolute. A synthetic configuration is:
 
 ```json
 {
@@ -59,9 +60,9 @@ absolute executable paths:
 
 The runner creates a fresh protected staging directory. It appends
 `--output-directory` and that directory to the export command, then requires a
-small closed JSON success result. Only after export succeeds does it append
+exact stdout JSON `{ "status": "passed" }`. Only after export succeeds does it append
 `--input-directory` and the same directory to the backup command, which also
-must emit a small closed JSON success result. Commands run without a shell.
+must emit a exact stdout JSON `{ "status": "passed" }`. Commands run without a shell.
 
 The state directory records bounded `running`, `failed`, or `succeeded` status
 and preserves the last successful time across a failure. A lock conflict fails
