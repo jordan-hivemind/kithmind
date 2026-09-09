@@ -175,5 +175,12 @@ The legacy baseline uses `models/embeddings/migrations`:
 is paginated and copies current thought vectors without a provider request;
 `stageBaselineGeneration`, `activateBaselineGeneration`, and
 `auditBaselineGeneration` complete and verify the migration. Prepare reuses an
-existing active baseline on rerun. The copy path refuses spaces with active
-chunks, because those chunks have no attributable legacy vector to copy.
+existing active baseline on rerun. The preparation helper refuses spaces with
+active chunks, because those chunks have no attributable legacy vector to
+copy. Preparation and backfill both refuse a space when its bounded generation
+history contains a non-baseline profile, including retired profiles after a
+switchback, because the legacy thought field no longer has attributable
+baseline provenance. Historical baseline generations remain auditable after
+later profile changes. Future generation cleanup must preserve profile-use
+evidence or permanently retire the legacy-copy path before deleting generation
+history.
