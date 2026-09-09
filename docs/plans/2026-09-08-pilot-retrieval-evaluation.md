@@ -42,7 +42,8 @@ Authorization and citation-chain failures block release regardless of scores.
 
 The current index audit found 17 thought vectors and 163 chunk vectors: all
 180 active targets are present, with no missing, extra, duplicate or invalid
-rows. The active profile is unchanged. This audit establishes index shape, not
+rows. After the candidate trial below, the active profile is restored to small.
+This audit establishes index shape, not
 retrieval quality or a model comparison.
 
 Current manifest limits are 256 eligible targets, 256 vector rows per
@@ -90,19 +91,19 @@ pilot, not a held-out estimate of quality across the owner's filing system.
 The frozen labels were also scored offline against immutable retained chunks
 and evidence IDs. This records local cosine ranking, not hosted request
 latency or a deployed model change. The missing document-vector repair is
-complete and the active small profile remains in place. The large profile is
-prospective.
+complete and the active small profile remains in place. The large profile was subsequently evaluated in production and was not adopted
+after the hosted gate failed.
 
-| Candidate                                                   | Answerable success at five |          Evidence MRR at five | Status                                    |
-| ----------------------------------------------------------- | -------------------------: | ----------------------------: | ----------------------------------------- |
-| Existing 163 chunks, small 1,536 dimensions, raw chunk rank |                      13/18 |                       0.62037 | Diagnostic baseline                       |
-| Existing 163 chunks, large 1,536 dimensions, raw chunk rank |                      17/18 |                       0.76389 | Prospective candidate                     |
-| Existing chunks, small, one result per document             |                      12/18 |       Not a deployment target | Superseded selection policy               |
-| Existing chunks, large, one result per document             |                      13/18 |       Not a deployment target | Superseded selection policy               |
-| Existing chunks, small, up to three passages per document   |                      13/18 | Not a model comparison change | Current passage-selection policy          |
-| Existing chunks, large, up to three passages per document   |                      16/18 |       Not a deployment target | Current passage policy; prospective model |
-| Page split near 1,200 characters with 180 overlap           |  11/18 parent-page success |               Diagnostic only | 475 chunks, exceeds current target bound  |
-| Page split near 2,400 characters with 300 overlap           |  13/18 parent-page success |               Diagnostic only | 263 chunks, exceeds current target bound  |
+| Candidate                                                   | Answerable success at five |          Evidence MRR at five | Status                                              |
+| ----------------------------------------------------------- | -------------------------: | ----------------------------: | --------------------------------------------------- |
+| Existing 163 chunks, small 1,536 dimensions, raw chunk rank |                      13/18 |                       0.62037 | Diagnostic baseline                                 |
+| Existing 163 chunks, large 1,536 dimensions, raw chunk rank |                      17/18 |                       0.76389 | Evaluated; not adopted after hosted gate failure    |
+| Existing chunks, small, one result per document             |                      12/18 |       Not a deployment target | Superseded selection policy                         |
+| Existing chunks, large, one result per document             |                      13/18 |       Not a deployment target | Superseded selection policy                         |
+| Existing chunks, small, up to three passages per document   |                      13/18 | Not a model comparison change | Current passage-selection policy                    |
+| Existing chunks, large, up to three passages per document   |                      16/18 |       Not a deployment target | Current passage policy; evaluated model not adopted |
+| Page split near 1,200 characters with 180 overlap           |  11/18 parent-page success |               Diagnostic only | 475 chunks, exceeds current target bound            |
+| Page split near 2,400 characters with 300 overlap           |  13/18 parent-page success |               Diagnostic only | 263 chunks, exceeds current target bound            |
 
 The offline run made 55 provider requests with zero retries and reported
 511,224 input tokens. It does not infer cost. A split chunk inherits no proof
@@ -117,8 +118,49 @@ for both models. Small had MRR 0.8 and large had MRR 1.0; paired ordering was
 4/6 for small and 6/6 for large. The comparison made six provider requests,
 reported 5,356 input tokens, and had zero retries. Its historical and
 lifecycle filtering was offline evaluation logic, not a production security
-proof. Large remains prospective pending live development recall and capture
-regression checks plus a safe shared-profile migration.
+proof. The trial below completes the shared-profile safety check for this
+candidate, but its hosted document score does not meet the gate.
+
+## Shared-profile trial and rollback
+
+The development recall suite passed for both profiles: recall at five was
+0.944 and recall at ten was 1.0, with no blocking, scope or lifecycle failures.
+Both preserved exact-duplicate identity, stored unrelated content and avoided
+collapsing a close but materially different thought. Small requested confirmation
+for that close case; large stored it. Synthetic fixtures were removed and the
+original configuration restored.
+
+A separate two-target development generation rehearsal verified exact vectors,
+activation, rollback and restoration of the original configuration. It also
+recovered from a configuration change before activation and from an already
+active candidate with a missing final journal event. Independent review checked
+the frozen driver and both durable recovery proofs before production execution.
+
+Production staged and verified all 180 large-profile vectors before activation.
+It then staged a complete small-profile rollback. The pinned watcher was paused
+for this window; the daily backup service remained enabled. The same frozen
+21 questions produced the following hosted results:
+
+| Measure                         | Keyword       | Large hybrid  |
+| ------------------------------- | ------------- | ------------- |
+| Supporting evidence in top five | 13/18 (72.2%) | 15/18 (83.3%) |
+| Evidence MRR at five            | 0.648148      | 0.736111      |
+| Request p95                     | 819 ms        | 1.097 s       |
+| Semantic candidates available   | Not requested | 21/21         |
+
+All 734 returned citations validated, with zero request errors. The actual
+profile was verified before and after the run, and the temporary read key was
+revoked. Four frozen current-only production thought queries passed under both
+profiles, with semantic retrieval available and every returned result checked
+against the current owner and space membership. These checks do not measure
+historical-query behavior or production capture writes.
+
+The large hybrid result failed the unchanged 85% success target, which requires
+at least 16/18. Production therefore activated the verified small rollback and
+restored the original model configuration. Its 180-vector audit passed and the
+pinned watcher resumed with a complete pass. The candidate is not adopted.
+The next retrieval step is to diagnose fusion and passage-ranking misses while
+preserving the frozen labels and reporting any tuning as pilot diagnostics.
 
 ## Controlled expansion
 
