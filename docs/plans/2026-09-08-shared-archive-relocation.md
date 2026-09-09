@@ -1,7 +1,9 @@
 # Shared archive relocation
 
-Status: P2-38 implementation in progress. The tested components below do not
-yet provide an owner relocation command. No live move or deletion has occurred.
+Status: P2-38 owner relocation completed and verified. The owner operation
+reconciled all referenced processing and database objects, completed native
+restore verification, re-bound configuration and catalog state, ran an unchanged
+scan, and restarted the watcher. A public packaged relocation CLI remains unfinished.
 
 ## Implemented foundation
 
@@ -106,9 +108,9 @@ and a parsed heartbeat. The existing runner probes discovery and job queues;
 nonempty responses stop the operation before admission or publication. Such a
 response may reserve work and must not be reported as a mutation-free scan.
 
-The workflow still requires an owner command connecting these components to
-protected proof persistence and service completion. Its synthetic tests do not establish Dropbox identity
-preservation or authorize skipping those gates. The current
+The verified owner operation connected these components to protected proof
+persistence and service completion. Its public packaged CLI remains unfinished.
+Synthetic tests alone do not establish Dropbox identity preservation. The current
 component limits are 2,048 inventory objects and 64 MiB per ciphertext object.
 Larger migrations require a separately tested limit change before preparation.
 The database repository has retained snapshots whose object paths are absolute
@@ -155,11 +157,11 @@ fingerprint, snapshot identity, and object identity. Provider-original
 references also bind the recovery repository, snapshot, and object. They do
 not expose a Dropbox source path or raw provider identifier.
 
-Changing only the configured remote root path currently changes the journal
-binding. Existing recovery also requires the recovered remote boundary to
-equal the stored boundary. There is no supported command that relocates a
-repository or rebinds a journal to a relocated root. A credential rebind is
-not a repository relocation.
+Historically, changing only the configured remote root path changed the journal
+binding and recovery required exact boundary equality. The verified operation
+used narrow root-path rebind and exact historical-boundary resolution. A public
+packaged command remains unfinished. A credential rebind is not a repository
+relocation.
 
 The database backup recipe has the same practical boundary: retained receipts
 refer to an exact repository and snapshot. It must be updated through a
