@@ -75,7 +75,8 @@ adapter implementation.
 
 ## Archive changes
 
-Before an archive-root relocation or runtime or dependency change, quiesce all
-archive writers, including ingestion workers and scheduled database backups.
+Before an archive-root relocation, quiesce all archive writers that use the
+root, including ingestion workers and scheduled database backups. Before a
+writer’s runtime or dependency change, quiesce the affected writers.
 Verify no backup runner or child process remains active, preserve locks and
 failure evidence, and resume schedules only after required checks pass.
