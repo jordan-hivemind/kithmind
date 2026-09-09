@@ -33,7 +33,6 @@ import {
   writeRawDocument,
   writeRetainedText,
 } from "../dist/index.js";
-import { getEvidence } from "../dist/mcp/evidence.js";
 
 const INSTITUTION = {
   id: "inst_marrow_creek",
@@ -458,7 +457,7 @@ test("given only the raw tree, with no archive database, every document and ever
   assert.deepEqual(bytesOnDisk, Buffer.from(statementBytes));
 });
 
-test("recordRetainedTextPath sets documents.text_path, and get_evidence can then return it", (t) => {
+test("recordRetainedTextPath sets documents.text_path to a file that exists", (t) => {
   const root = rawTreeRoot(t);
   const text = "Synthetic statement text an assistant can cite.";
   const textWrite = writeRetainedText(root, text);
@@ -472,26 +471,12 @@ test("recordRetainedTextPath sets documents.text_path, and get_evidence can then
   assert.ok(existsSync(row.text_path));
   assert.equal(readFileSync(row.text_path, "utf8"), text);
 
-  // The same path get_evidence hands back for a row citing this document.
-  db.prepare(
-    `INSERT INTO transactions
-       (id, account_id, process_date, activity_type, currency, source_document_id,
-        row_hash, imported_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    "txn_1",
-    ACCOUNT.id,
-    "2025-01-15",
-    "fee",
-    ACCOUNT.currency,
-    "doc_1",
-    "synthetic-row-hash-1",
-    "2025-02-01T00:00:00.000Z",
-  );
-  const evidence = getEvidence(db, "transactions", "txn_1");
-  assert.equal(evidence.found, true);
-  assert.equal(evidence.document.textPath, textWrite.path);
-  assert.ok(existsSync(evidence.document.textPath), "get_evidence returns a path that actually exists");
+  // This used to also assert the SQLite get_evidence tool handed the same
+  // path back. That surface is gone (F1-21), and the Postgres read surface
+  // cannot build the contract's evidence type yet -- see
+  // `retainedTextSpanEvidence` in src/mcp/pgRead.ts. What this test is really
+  // about survives unchanged: the path recorded on the document is a file
+  // that exists and holds the retained text.
 });
 
 test("recordRetainedTextPath fails loudly rather than silently no-op'ing when no document matches", (t) => {

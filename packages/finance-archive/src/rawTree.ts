@@ -102,8 +102,9 @@ export function resolveArchiveSpaceId(
 /**
  * Reads the raw tree root: the configured managed root
  * (FINANCE_ARCHIVE_RAW_TREE_ROOT, the same env var and nowhere else,
- * mirroring the pattern src/mcp/run.ts already uses for the archive path,
- * FINANCE_ARCHIVE_DB_PATH), joined with the fixed `archive/v1` layout
+ * mirroring the pattern src/mcp/run.ts already uses for the reader's
+ * connection string, FINANCE_ARCHIVE_READER_DATABASE_URL), joined with the
+ * fixed `archive/v1` layout
  * version and the configured space id (FINANCE_ARCHIVE_SPACE_ID, above) --
  * the prefix a second subsystem writing under the same managed root also
  * agrees to (F1-28). A real path never belongs in this repository, so
