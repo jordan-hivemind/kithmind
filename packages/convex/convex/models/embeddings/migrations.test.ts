@@ -4,12 +4,16 @@ import { describe, expect, test } from "vitest";
 import { internal } from "../../_generated/api";
 import schema from "../../schema";
 import { modules } from "../../test.setup";
-import { BASELINE_EMBEDDING_DIMENSIONS } from "../../lib/embeddingProvider";
+import {
+  BASELINE_EMBEDDING_DIMENSIONS,
+  fingerprintEmbeddingConfig,
+} from "../../lib/embeddingProvider";
 import {
   bumpEmbeddingEligibilityEpoch,
   getActiveEmbeddingTarget,
   insertChunkEmbedding,
 } from "./model";
+import { BASELINE_EMBEDDING_PROFILE } from "./migrations";
 
 const metadata = {
   type: "reference" as const,
@@ -374,5 +378,184 @@ describe("baseline embedding migration", () => {
       copied: 0,
       invalid: 1,
     });
+  });
+
+  test("refuses legacy copying after a non-baseline profile even after switching back", async () => {
+    const seeded = await seedThought();
+    const baselineFingerprint = await fingerprintEmbeddingConfig(
+      BASELINE_EMBEDDING_PROFILE,
+    );
+    const largeProfile = {
+      ...BASELINE_EMBEDDING_PROFILE,
+      model: "text-embedding-3-large",
+      modelRevision: "synthetic-large-1536-v1",
+    };
+    const largeFingerprint = await fingerprintEmbeddingConfig(largeProfile);
+    const stagingBaselineGenerationId = await seeded.t.run(async (ctx) => {
+      const baselineProfileId = await ctx.db.insert("embeddingProfiles", {
+        ...BASELINE_EMBEDDING_PROFILE,
+        fingerprint: baselineFingerprint,
+        createdAt: 1,
+      });
+      const largeProfileId = await ctx.db.insert("embeddingProfiles", {
+        ...largeProfile,
+        fingerprint: largeFingerprint,
+        createdAt: 2,
+      });
+      await ctx.db.insert("embeddingGenerations", {
+        spaceId: seeded.spaceId,
+        embeddingProfileId: largeProfileId,
+        fingerprint: largeFingerprint,
+        state: "retired",
+        eligibilityEpoch: 0,
+        manifestHash: "large-manifest",
+        expectedThoughtCount: 1,
+        expectedChunkCount: 0,
+        completedThoughtCount: 1,
+        completedChunkCount: 0,
+        createdAt: 2,
+        stagedAt: 3,
+        activatedAt: 4,
+        deactivatedAt: 5,
+      });
+      const activeBaselineGenerationId = await ctx.db.insert(
+        "embeddingGenerations",
+        {
+          spaceId: seeded.spaceId,
+          embeddingProfileId: baselineProfileId,
+          fingerprint: baselineFingerprint,
+          state: "active",
+          eligibilityEpoch: 0,
+          manifestHash: "active-baseline-manifest",
+          expectedThoughtCount: 1,
+          expectedChunkCount: 0,
+          completedThoughtCount: 1,
+          completedChunkCount: 0,
+          createdAt: 5,
+          stagedAt: 6,
+          activatedAt: 7,
+        },
+      );
+      const stagingId = await ctx.db.insert("embeddingGenerations", {
+        spaceId: seeded.spaceId,
+        embeddingProfileId: baselineProfileId,
+        fingerprint: baselineFingerprint,
+        state: "staging",
+        eligibilityEpoch: 0,
+        manifestHash: "staging-baseline-manifest",
+        expectedThoughtCount: 1,
+        expectedChunkCount: 0,
+        completedThoughtCount: 0,
+        completedChunkCount: 0,
+        createdAt: 8,
+      });
+      await ctx.db.insert("spaceEmbeddingStates", {
+        spaceId: seeded.spaceId,
+        eligibilityEpoch: 0,
+        activeEmbeddingGenerationId: activeBaselineGenerationId,
+        activeFingerprint: baselineFingerprint,
+        activatedAt: 7,
+      });
+      return stagingId;
+    });
+
+    const prepared = await seeded.t.mutation(
+      internal.models.embeddings.migrations.prepareBaselineGeneration,
+      { spaceId: seeded.spaceId, dryRun: true, now: 9 },
+    );
+    expect(prepared).toMatchObject({
+      dryRun: true,
+      blocked: true,
+      eligibleThoughtCount: 1,
+      eligibleChunkCount: 0,
+      reused: false,
+    });
+    expect(prepared.reason).toContain("non-baseline profile");
+
+    await expect(
+      seeded.t.mutation(
+        internal.models.embeddings.migrations.backfillBaselineThoughtVectors,
+        {
+          spaceId: seeded.spaceId,
+          embeddingGenerationId: stagingBaselineGenerationId,
+        },
+      ),
+    ).rejects.toThrow("non-baseline profile");
+    expect(
+      await seeded.t.run((ctx) =>
+        ctx.db
+          .query("embeddingVectors")
+          .withIndex("by_embeddingGenerationId", (q) =>
+            q.eq("embeddingGenerationId", stagingBaselineGenerationId),
+          )
+          .collect(),
+      ),
+    ).toHaveLength(0);
+  });
+
+  test("fails closed when generation history exceeds the provenance bound", async () => {
+    const seeded = await seedThought();
+    const baselineFingerprint = await fingerprintEmbeddingConfig(
+      BASELINE_EMBEDDING_PROFILE,
+    );
+    const largeProfile = {
+      ...BASELINE_EMBEDDING_PROFILE,
+      model: "text-embedding-3-large",
+      modelRevision: "synthetic-large-1536-v1",
+    };
+    const largeFingerprint = await fingerprintEmbeddingConfig(largeProfile);
+    await seeded.t.run(async (ctx) => {
+      const baselineProfileId = await ctx.db.insert("embeddingProfiles", {
+        ...BASELINE_EMBEDDING_PROFILE,
+        fingerprint: baselineFingerprint,
+        createdAt: 1,
+      });
+      const largeProfileId = await ctx.db.insert("embeddingProfiles", {
+        ...largeProfile,
+        fingerprint: largeFingerprint,
+        createdAt: 2,
+      });
+      for (let index = 0; index < 256; index += 1) {
+        await ctx.db.insert("embeddingGenerations", {
+          spaceId: seeded.spaceId,
+          embeddingProfileId: baselineProfileId,
+          fingerprint: baselineFingerprint,
+          state: "failed",
+          eligibilityEpoch: 0,
+          manifestHash: `baseline-${index}`,
+          expectedThoughtCount: 1,
+          expectedChunkCount: 0,
+          completedThoughtCount: 0,
+          completedChunkCount: 0,
+          createdAt: index + 1,
+        });
+      }
+      await ctx.db.insert("embeddingGenerations", {
+        spaceId: seeded.spaceId,
+        embeddingProfileId: largeProfileId,
+        fingerprint: largeFingerprint,
+        state: "failed",
+        eligibilityEpoch: 0,
+        manifestHash: "non-baseline-after-bound",
+        expectedThoughtCount: 1,
+        expectedChunkCount: 0,
+        completedThoughtCount: 0,
+        completedChunkCount: 0,
+        createdAt: 257,
+      });
+    });
+
+    const prepared = await seeded.t.mutation(
+      internal.models.embeddings.migrations.prepareBaselineGeneration,
+      { spaceId: seeded.spaceId, dryRun: true, now: 258 },
+    );
+    expect(prepared).toMatchObject({
+      dryRun: true,
+      blocked: true,
+      eligibleThoughtCount: 1,
+      eligibleChunkCount: 0,
+      reused: false,
+    });
+    expect(prepared.reason).toContain("safety bound");
   });
 });
