@@ -663,6 +663,88 @@ left it alone rather than porting the same lines twice. Until it lands, a
 caller wiring an adapter end to end holds both handles, and
 `test/adapterImport.test.mjs` says so where it does.
 
+## Running an import
+
+`src/run.ts` (`./run`, `pnpm --filter @repo/finance-archive import`, or
+`node dist/run.js` after a build) is the operator command: one full
+acquisition-to-verdict pass for one adapter, composed entirely from the
+pieces above -- it adds no import, gate or publication logic of its own.
+
+```
+node dist/run.js \
+  --adapter <path to a module exporting an InstitutionAdapter> \
+  --session <path to a module whose default export builds an AdapterSession> \
+  --selection <path to a JSON selection file> \
+  [--now <ISO instant, for a reproducible run>] \
+  [--dry-run]
+```
+
+`--adapter` is a module with a default export, or a named `adapter` export,
+implementing `InstitutionAdapter`. `--session` is a module whose default
+export is a function that builds an `AdapterSession` for this run -- a real
+adapter's own browser bridge, kept out of this repository; the synthetic
+adapter's suite wraps `createSyntheticSession` the same way (see
+`test/run.test.mjs`). `--selection` is a JSON file naming what to acquire,
+because discovery alone does not say which of what it finds an operator
+wants pulled this run:
+
+```json
+{
+  "institutionId": "<institutions.id, already provisioned>",
+  "pulls": [
+    {
+      "accountId": "<accounts.id, already provisioned>",
+      "docType": "activity_pull",
+      "docDate": null,
+      "selection": {
+        "kind": "structured_api",
+        "periodStart": "<yyyy-mm-dd>",
+        "periodEnd": "<yyyy-mm-dd>"
+      }
+    }
+  ]
+}
+```
+
+A document-tier pull (`pdf_statement`, `trade_confirmation`) selects by
+`{ "kind": ..., "externalId": "<id from a prior discover() call>" }` instead
+of a period. Every `institutionId` and `accountId` named in the file must
+already exist -- in both the raw tree's SQLite provenance file and the
+Postgres archive -- before the run; provisioning an institution or account is
+out of this command's scope.
+
+The command runs `discover`, then `acquire`, `parse` and
+`persistAcquiredDocument` for each pull, then wires every pull to
+`ImportDocument`s with `adapterPullToImportDocuments` and hands the whole
+batch to `publishImport` -- import, both gates and publication as the one
+atomic step it already is. `--dry-run` runs the identical pass inside one
+Postgres transaction and always rolls it back, so nothing commits; the raw
+tree write still happens (content-addressed and idempotent, and structurally
+required to produce a valid pull -- see "Wiring an adapter to the importer"
+above), but "the database" a dry run never touches is the Postgres archive.
+
+The summary is counts, sums and per-period verdicts, never a row: documents
+acquired, bytes acquired, a sha256 standing for this run's whole acquisition
+manifest, rows parsed, inserted, deduplicated and opened for review, exact
+decimal money sums per currency computed by Postgres, and both gates'
+verdicts per account (and, for the position gate, per instrument) and
+period, each with its tolerance. No transaction row, description, payload or
+account identifier beyond the adapter's own opaque ids is ever printed.
+
+Every setting is the environment or a flag, with no default for any
+connection string or path, mirroring `src/mcp/run.ts`:
+`FINANCE_ARCHIVE_DATABASE_URL`, `FINANCE_ARCHIVE_RAW_TREE_ROOT`,
+`FINANCE_ARCHIVE_SPACE_ID`, and `FINANCE_ARCHIVE_DB_PATH` (the local SQLite
+file `persistAcquiredDocument` reads institution and account rows from --
+see "Raw tree" below). `FINANCE_ARCHIVE_SCHEMA` is optional, defaulting to
+`finance` as it does everywhere else in this package.
+
+`test/run.test.mjs` runs the command against the synthetic adapter and a
+throwaway Postgres, the same way every other Postgres-backed suite does, and
+skips with the same message when `FINANCE_ARCHIVE_DATABASE_URL` is unset. It
+asserts the summary's shape, that nothing in it looks like a row, and that a
+second pass over the identical selection inserts nothing new.
+
 ## Raw tree
 
 `acquire` (`src/adapter.ts`) returns bytes and a manifest; it does not write
