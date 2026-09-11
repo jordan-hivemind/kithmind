@@ -444,7 +444,7 @@ function documentPeriod(kind, documentDate) {
  * call or two after the app refreshes its bearer (seen live 2026-09-11, the
  * same request succeeding seconds later). Retry that exact failure a few
  * times with a short pause; anything else propagates unchanged. */
-async function fetchWithServiceErrorRetry(call, attempts = 4) {
+async function fetchWithServiceErrorRetry(call, attempts = 8) {
   let last;
   for (let i = 0; i < attempts; i += 1) {
     try {
@@ -453,7 +453,7 @@ async function fetchWithServiceErrorRetry(call, attempts = 4) {
       const message = error instanceof Error ? error.message : String(error);
       if (!/request failed: 400\b/.test(message) || !/Service Error/.test(message)) throw error;
       last = error;
-      await new Promise((resolve) => setTimeout(resolve, 1500 * (i + 1)));
+      await new Promise((resolve) => setTimeout(resolve, 2000 * (i + 1)));
     }
   }
   throw last;
@@ -586,10 +586,14 @@ async function fetchAccounts(session) {
 }
 
 async function discover(session) {
-  const [results, accounts] = await Promise.all([
-    Promise.all(DOCUMENT_TYPES.map(({ docType, kind }) => fetchDocumentsForType(session, docType, kind))),
-    fetchAccounts(session),
-  ]);
+  // Sequential on purpose: the documents service answers a transient 400 to
+  // a noticeable share of concurrent calls from one session (seen live
+  // 2026-09-11), so the listings run one after another, accounts first.
+  const accounts = await fetchAccounts(session);
+  const results = [];
+  for (const { docType, kind } of DOCUMENT_TYPES) {
+    results.push(await fetchDocumentsForType(session, docType, kind));
+  }
   const allItems = results.flatMap((r) => r.items);
   const problems = [];
   for (const r of results) {
