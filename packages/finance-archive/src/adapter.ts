@@ -149,9 +149,31 @@ export type DiscoveredExportRange = {
   readonly reportedRowCount: number | null;
 };
 
+/**
+ * One account an institution's session can see, for a selection to name by
+ * `externalKey` instead of a caller having to already know the archive's own
+ * `accounts.id` (F1-32). No account number: `last4` is the same
+ * last-four-digits-only rule `accounts.acct_last4` enforces everywhere else
+ * in this package.
+ */
+export type DiscoveredAccount = {
+  readonly externalKey: string;
+  readonly label: string;
+  readonly last4: string;
+  readonly kind:
+    | "brokerage"
+    | "retirement"
+    | "trust"
+    | "bank"
+    | "credit_line"
+    | "mortgage"
+    | "other";
+};
+
 export type DiscoverResult = {
   readonly documents: Listing<DiscoveredDocument>;
   readonly exportRanges: readonly DiscoveredExportRange[];
+  readonly accounts: readonly DiscoveredAccount[];
 };
 
 // --- acquire --------------------------------------------------------------

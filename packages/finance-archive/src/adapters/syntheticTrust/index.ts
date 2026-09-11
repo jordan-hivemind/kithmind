@@ -29,6 +29,7 @@ import {
   type RawFile,
 } from "../../adapter.js";
 import {
+  ACCOUNTS,
   buildTabularExportCsv,
   CREDENTIAL_SHAPED_ECHO,
   CREDENTIAL_SHAPED_ROW_ECHO,
@@ -318,6 +319,7 @@ async function discover(session: AdapterSession): Promise<DiscoverResult> {
         reportedRowCount: null,
       },
     ],
+    accounts: ACCOUNTS,
   };
 }
 

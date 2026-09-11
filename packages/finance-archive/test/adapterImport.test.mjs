@@ -8,7 +8,6 @@ import {
   adapterPullToImportDocuments,
   createSyntheticSession,
   importBatch,
-  openArchive,
   persistAcquiredDocument,
   resolveInstrumentId,
   resolveRawTreeRoot,
@@ -23,16 +22,10 @@ import { all, archive, count, one, skip } from "./helpers/pgArchive.mjs";
 // output anywhere in this file. Synthetic institution, synthetic account, no
 // real data.
 //
-// Two handles, deliberately. `adapterPullToImportDocuments` and `importBatch`
-// were ported to Postgres (F1-22/F1-25ish) and now take the `client` from
-// `helpers/pgArchive.mjs`'s `archive(t)`. `persistAcquiredDocument`, at the
-// bottom of src/adapterImport.ts, was NOT ported -- F1-24 owns that raw-tree
-// path and is moving it in parallel -- so it still takes a `DatabaseSync` and
-// still writes to a SQLite archive opened with `openArchive`. Both handles
-// are seeded with the same synthetic institution and account: the SQLite one
-// because `persistAcquiredDocument` reads those rows to build the raw tree
-// manifest, the Postgres one because the importer's foreign keys require
-// them. This collapses to one handle once F1-24 lands.
+// One handle. `persistAcquiredDocument` writes only to the raw tree (F1-33:
+// it no longer opens a database at all, SQLite or otherwise), so only the
+// Postgres client from `helpers/pgArchive.mjs`'s `archive(t)` needs seeding,
+// for `adapterPullToImportDocuments`/`importBatch`'s foreign keys.
 
 const INSTITUTION = {
   id: "inst_thistlebrook",
@@ -44,16 +37,6 @@ const ACCOUNT = { id: "acct_synthetic", last4: "0142", currency: "USD" };
 // Synthetic space id (F1-28): not a real space, just what exercises the
 // shared-root prefix this suite writes and reads through.
 const SPACE_ID = "space_synthetic_test";
-
-function sqliteArchive(t) {
-  const directory = mkdtempSync(join(tmpdir(), "kith-finance-adapter-import-"));
-  const db = openArchive(join(directory, "archive.db"));
-  t.after(() => {
-    db.close();
-    rmSync(directory, { recursive: true, force: true });
-  });
-  return db;
-}
 
 /** A throwaway raw-tree root, removed when the test ends -- the fully
  * resolved `archive/v1/<spaceId>/` root, matching what production code gets
@@ -68,24 +51,6 @@ function rawRoot(t) {
     FINANCE_ARCHIVE_RAW_TREE_ROOT: directory,
     FINANCE_ARCHIVE_SPACE_ID: SPACE_ID,
   });
-}
-
-function seedSqlite(db) {
-  db.prepare("INSERT INTO institutions (id, name, slug) VALUES (?, ?, ?)").run(
-    INSTITUTION.id,
-    INSTITUTION.name,
-    INSTITUTION.slug,
-  );
-  db.prepare(
-    `INSERT INTO accounts (id, institution_id, acct_last4, display_name, base_currency)
-     VALUES (?, ?, ?, ?, ?)`,
-  ).run(
-    ACCOUNT.id,
-    INSTITUTION.id,
-    ACCOUNT.last4,
-    "Synthetic account",
-    ACCOUNT.currency,
-  );
 }
 
 async function seedPg(client) {
@@ -108,11 +73,14 @@ async function seedPg(client) {
 
 /** Persists an acquired pull's bytes for a test, the same way a real caller
  * must, and returns the PersistedAcquisition to use as AdapterPull.persisted.
- * Still SQLite-backed (F1-24 has not landed); see the file header. */
-function persist(t, db, acquired, docType) {
-  return persistAcquiredDocument(db, rawRoot(t), {
+ * No SQLite handle (F1-33): institution slug and account last4 are the same
+ * plain constants `seedPg` wrote to Postgres. */
+function persist(t, acquired, docType) {
+  return persistAcquiredDocument(rawRoot(t), {
     institutionId: INSTITUTION.id,
     accountId: ACCOUNT.id,
+    institutionSlug: INSTITUTION.slug,
+    accountLast4: ACCOUNT.last4,
     docType,
     acquired,
   });
@@ -143,8 +111,6 @@ test(
   "the synthetic adapter's paginated activity pull imports end to end and the page-boundary overlap deduplicates",
   { skip },
   async (t) => {
-    const db = sqliteArchive(t);
-    seedSqlite(db);
     const client = await archive(t);
     await seedPg(client);
     const session = createSyntheticSession();
@@ -154,7 +120,7 @@ test(
       "fixture still carries the overlap",
     );
 
-    const persisted = persist(t, db, acquired, "activity_pull");
+    const persisted = persist(t, acquired, "activity_pull");
     const documents = await adapterPullToImportDocuments(client, {
       institutionId: INSTITUTION.id,
       accountId: ACCOUNT.id,
@@ -234,8 +200,6 @@ test(
   "the same paginated overlap collapses through row_hash and occurrence alone, with no provider id to lean on",
   { skip },
   async (t) => {
-    const db = sqliteArchive(t);
-    seedSqlite(db);
     const client = await archive(t);
     await seedPg(client);
     const session = createSyntheticSession();
@@ -254,7 +218,7 @@ test(
       rows: anonymizedRows,
       docType: "activity_pull",
       docDate: null,
-      persisted: persist(t, db, acquired, "activity_pull"),
+      persisted: persist(t, acquired, "activity_pull"),
     });
 
     const summary = await importBatch(
@@ -290,8 +254,6 @@ test(
   "a paginated pull with no provider ids at all and a wrong reported total is caught, not silently accepted",
   { skip },
   async (t) => {
-    const db = sqliteArchive(t);
-    seedSqlite(db);
     const client = await archive(t);
     await seedPg(client);
     const session = createSyntheticSession();
@@ -317,7 +279,7 @@ test(
         rows: anonymizedRows,
         docType: "activity_pull",
         docDate: null,
-        persisted: persist(t, db, wrongTotal, "activity_pull"),
+        persisted: persist(t, wrongTotal, "activity_pull"),
       }),
       /does not reconcile against the provider's total/,
     );
@@ -331,8 +293,6 @@ test(
   "a paginated pull with no stated provider total at all is imported but leaves a durable unverified mark, never silently",
   { skip },
   async (t) => {
-    const db = sqliteArchive(t);
-    seedSqlite(db);
     const client = await archive(t);
     await seedPg(client);
     const session = createSyntheticSession();
@@ -350,7 +310,7 @@ test(
       rows: anonymizedRows,
       docType: "activity_pull",
       docDate: null,
-      persisted: persist(t, db, noStatedTotal, "activity_pull"),
+      persisted: persist(t, noStatedTotal, "activity_pull"),
     });
 
     // Ground rule 7: nothing here may claim completeness with no total to
@@ -378,8 +338,6 @@ test(
   "two legitimately identical rows in one document, with no provider id, both survive",
   { skip },
   async (t) => {
-    const db = sqliteArchive(t);
-    seedSqlite(db);
     const client = await archive(t);
     await seedPg(client);
     const retained = retainPayload(
@@ -435,7 +393,7 @@ test(
       rows,
       docType: "tabular_export",
       docDate: "2025-06-30",
-      persisted: persist(t, db, acquired, "tabular_export"),
+      persisted: persist(t, acquired, "tabular_export"),
     });
     assert.equal(
       documents.length,
@@ -465,8 +423,6 @@ test(
   "the deliberately garbled PDF statement amount lands in the review queue carrying its note, and instruments resolve to stable rows",
   { skip },
   async (t) => {
-    const db = sqliteArchive(t);
-    seedSqlite(db);
     const client = await archive(t);
     await seedPg(client);
     const session = createSyntheticSession();
@@ -494,7 +450,7 @@ test(
       holdings,
       docType: "pdf_statement",
       docDate: statement.periodEnd,
-      persisted: persist(t, db, acquired, "pdf_statement"),
+      persisted: persist(t, acquired, "pdf_statement"),
     });
     assert.equal(importDocuments.length, 1);
 
@@ -614,6 +570,73 @@ test(
       await count(client, "liabilities"),
       holdings.liabilities.length,
     );
+  },
+);
+
+test(
+  "persistAcquiredDocument needs no SQLite handle, and the retained text path it writes reaches documents.text_path in Postgres",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedPg(client);
+    const session = createSyntheticSession();
+    const { documents: discovered } = await syntheticAdapter.discover(session);
+    const statement = discovered.items.find(
+      (doc) => doc.kind === "pdf_statement",
+    );
+    const acquired = await syntheticAdapter.acquire({
+      kind: "pdf_statement",
+      session,
+      externalId: statement.externalId,
+    });
+    const { activity: rows, holdings } = await syntheticAdapter.parse({
+      kind: "pdf_statement",
+      bytes: acquired.bytes,
+    });
+
+    // No `db` argument anywhere in this test: persistAcquiredDocument opens
+    // no database at all (F1-33), SQLite or otherwise.
+    const persisted = persistAcquiredDocument(
+      rawRoot(t),
+      {
+        institutionId: INSTITUTION.id,
+        accountId: ACCOUNT.id,
+        institutionSlug: INSTITUTION.slug,
+        accountLast4: ACCOUNT.last4,
+        docType: "pdf_statement",
+        acquired,
+      },
+      "synthetic retained statement text",
+    );
+    assert.ok(persisted.textPath);
+
+    const documents = await adapterPullToImportDocuments(client, {
+      institutionId: INSTITUTION.id,
+      accountId: ACCOUNT.id,
+      acquired,
+      rows,
+      holdings,
+      docType: "pdf_statement",
+      docDate: statement.periodEnd,
+      persisted,
+    });
+    await importBatch(
+      client,
+      { source: INSTITUTION.slug, documents },
+      new Date("2025-03-01"),
+    );
+
+    // The path used to reach the archive through a separate
+    // recordRetainedTextPath UPDATE against a SQLite provenance file the
+    // Postgres importer never read (dead by construction: nothing queried
+    // it). It is gone; ImportDocument.textPath carries the same value onto
+    // the same INSERT the rest of a document's provenance lands on.
+    const row = await one(
+      client,
+      "SELECT text_path FROM documents WHERE sha256 = $1",
+      [acquired.manifest.contentHash],
+    );
+    assert.equal(row.text_path, persisted.textPath);
   },
 );
 

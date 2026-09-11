@@ -14,10 +14,18 @@ import {
   subtractDecimal,
 } from "../../decimal.js";
 import { fromMinorUnits } from "../../money.js";
-import type { ParsedInstrument } from "../../adapter.js";
+import type { DiscoveredAccount, ParsedInstrument } from "../../adapter.js";
 
 export const INSTITUTION_SLUG = "thistlebrook-trust";
 export const INSTITUTION_NAME = "Thistlebrook Trust";
+
+/** The two accounts `discover()` reports (F1-32): one brokerage, one trust,
+ * each with its own opaque external key an operator's selection file can
+ * name instead of already knowing the archive's own `accounts.id`. */
+export const ACCOUNTS: readonly DiscoveredAccount[] = [
+  { externalKey: "acct-brokerage-01", label: "Brokerage", last4: "4471", kind: "brokerage" },
+  { externalKey: "acct-trust-01", label: "Living Trust", last4: "9902", kind: "trust" },
+];
 
 export const INSTRUMENTS: readonly ParsedInstrument[] = [
   { symbol: "FKE", name: "Fictional Kelp ETF", cusip: "000000FK1", isin: null },

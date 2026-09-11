@@ -226,6 +226,15 @@ export type ImportDocument = {
   retainedByteLength?: number | null;
   mediaType?: string | null;
   captureId?: string | null;
+  /**
+   * Path to this document's retained extracted text in the raw tree
+   * (`persistAcquiredDocument`'s `PersistedAcquisition.textPath`), when the
+   * caller extracted one. Written on the same insert as the rest of this
+   * document's provenance rather than through a separate targeted `UPDATE`
+   * after the fact (F1-33): `get_evidence` needs nothing after import to
+   * return a path to the retained text.
+   */
+  textPath?: string | null;
   rows: readonly ImportRow[];
   /** Most documents (activity pulls) carry none of these. */
   positions?: readonly ImportPosition[];
@@ -816,8 +825,8 @@ export async function importBatch(
         await client.query(
           `INSERT INTO documents
              (id, institution_id, account_id, doc_type, doc_date, file_path, sha256, parsed_ok,
-              retained_sha256, retained_byte_length, media_type, capture_id)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE, $8, $9, $10, $11)`,
+              retained_sha256, retained_byte_length, media_type, capture_id, text_path)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE, $8, $9, $10, $11, $12)`,
           [
             documentId,
             document.institutionId,
@@ -830,6 +839,7 @@ export async function importBatch(
             document.retainedByteLength ?? null,
             document.mediaType ?? null,
             document.captureId ?? null,
+            document.textPath ?? null,
           ],
         );
       }

@@ -6,14 +6,16 @@ import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 
-import { applyPgSchema, createArchiveClient, openArchive } from "../dist/index.js";
+import { applyPgSchema, createArchiveClient } from "../dist/index.js";
 import { all, count, skip, testSchemaName } from "./helpers/pgArchive.mjs";
 
 // The operator command end to end (src/run.ts, "one full acquisition-to-
 // verdict pass"), run as an actual subprocess against a throwaway Postgres
-// schema and a throwaway raw tree / SQLite provenance file, exactly the way
-// an operator would invoke it. Synthetic institution, synthetic account, no
-// real data anywhere.
+// schema and a throwaway raw tree, exactly the way an operator would invoke
+// it. F1-33: no SQLite provenance file anywhere in this suite -- run.ts
+// reads institution slug and account last4 straight from the same Postgres
+// schema it imports into, so there is no second database to keep in sync by
+// hand. Synthetic institution, synthetic account, no real data anywhere.
 
 const url = process.env.FINANCE_ARCHIVE_DATABASE_URL;
 
@@ -30,112 +32,140 @@ const distIndexUrl = pathToFileURL(
 ).href;
 const runScript = fileURLToPath(new URL("../dist/run.js", import.meta.url));
 
+/** The adapter and session modules run.ts loads by path -- the same two
+ * small files every test in this suite points --adapter/--session at. */
+function writeAdapterFixtures(t) {
+  const fixturesDir = mkdtempSync(
+    join(tmpdir(), "kith-finance-run-fixtures-"),
+  );
+  t.after(() => rmSync(fixturesDir, { recursive: true, force: true }));
+
+  const adapterModulePath = join(fixturesDir, "adapter.mjs");
+  writeFileSync(
+    adapterModulePath,
+    `import { syntheticAdapter } from ${JSON.stringify(distIndexUrl)};\n` +
+      `export default syntheticAdapter;\n`,
+  );
+
+  const sessionModulePath = join(fixturesDir, "session.mjs");
+  writeFileSync(
+    sessionModulePath,
+    `import { createSyntheticSession } from ${JSON.stringify(distIndexUrl)};\n` +
+      `export default function buildSession() {\n  return createSyntheticSession();\n}\n`,
+  );
+
+  return { fixturesDir, adapterModulePath, sessionModulePath };
+}
+
+/** A throwaway Postgres schema with the institution provisioned and,
+ * unless the caller opts out, the account too. Opting out is how the
+ * external-key test below proves an account needs no separate provisioning
+ * step (F1-32): run.ts's own resolveDiscoveredAccounts call provisions it. */
+async function seededSchema(t, { seedAccount = true } = {}) {
+  const schema = testSchemaName();
+  const client = createArchiveClient(url, schema);
+  await client.connect();
+  await applyPgSchema(client);
+  t.after(async () => {
+    await client.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    await client.end();
+  });
+
+  await client.query(
+    "INSERT INTO institutions (id, name, slug) VALUES ($1, $2, $3)",
+    [INSTITUTION.id, INSTITUTION.name, INSTITUTION.slug],
+  );
+  if (seedAccount) {
+    await client.query(
+      `INSERT INTO accounts (id, institution_id, acct_last4, display_name, base_currency)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        ACCOUNT.id,
+        INSTITUTION.id,
+        ACCOUNT.last4,
+        "Synthetic account",
+        ACCOUNT.currency,
+      ],
+    );
+  }
+  return { schema, client };
+}
+
+function writeSelection(fixturesDir, pulls) {
+  const selectionPath = join(fixturesDir, "selection.json");
+  writeFileSync(
+    selectionPath,
+    JSON.stringify({ institutionId: INSTITUTION.id, pulls }),
+  );
+  return selectionPath;
+}
+
+function makeRunner({
+  adapterModulePath,
+  sessionModulePath,
+  selectionPath,
+  schema,
+  rawDir,
+}) {
+  return function runImport(extraArgs = []) {
+    return execFileSync(
+      process.execPath,
+      [
+        runScript,
+        "--adapter",
+        adapterModulePath,
+        "--session",
+        sessionModulePath,
+        "--selection",
+        selectionPath,
+        "--now",
+        "2025-05-01T00:00:00.000Z",
+        ...extraArgs,
+      ],
+      {
+        env: {
+          ...process.env,
+          FINANCE_ARCHIVE_DATABASE_URL: url,
+          FINANCE_ARCHIVE_SCHEMA: schema,
+          FINANCE_ARCHIVE_RAW_TREE_ROOT: rawDir,
+          FINANCE_ARCHIVE_SPACE_ID: SPACE_ID,
+        },
+        encoding: "utf8",
+      },
+    );
+  };
+}
+
 test(
   "the run command takes an adapter from acquisition through both gate verdicts, prints only a summary, and a second pass inserts nothing new",
   { skip },
   async (t) => {
-    const schema = testSchemaName();
-    const client = createArchiveClient(url, schema);
-    await client.connect();
-    await applyPgSchema(client);
-    t.after(async () => {
-      await client.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
-      await client.end();
-    });
-
-    await client.query(
-      "INSERT INTO institutions (id, name, slug) VALUES ($1, $2, $3)",
-      [INSTITUTION.id, INSTITUTION.name, INSTITUTION.slug],
-    );
-    await client.query(
-      `INSERT INTO accounts (id, institution_id, acct_last4, display_name, base_currency)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [ACCOUNT.id, INSTITUTION.id, ACCOUNT.last4, "Synthetic account", ACCOUNT.currency],
-    );
+    const { schema, client } = await seededSchema(t);
 
     const rawDir = mkdtempSync(join(tmpdir(), "kith-finance-run-raw-"));
     t.after(() => rmSync(rawDir, { recursive: true, force: true }));
 
-    const dbDir = mkdtempSync(join(tmpdir(), "kith-finance-run-db-"));
-    t.after(() => rmSync(dbDir, { recursive: true, force: true }));
-    const dbPath = join(dbDir, "archive.db");
-    const sqliteDb = openArchive(dbPath);
-    sqliteDb
-      .prepare("INSERT INTO institutions (id, name, slug) VALUES (?, ?, ?)")
-      .run(INSTITUTION.id, INSTITUTION.name, INSTITUTION.slug);
-    sqliteDb
-      .prepare(
-        `INSERT INTO accounts (id, institution_id, acct_last4, display_name, base_currency)
-         VALUES (?, ?, ?, ?, ?)`,
-      )
-      .run(ACCOUNT.id, INSTITUTION.id, ACCOUNT.last4, "Synthetic account", ACCOUNT.currency);
-    sqliteDb.close();
-
-    const fixturesDir = mkdtempSync(join(tmpdir(), "kith-finance-run-fixtures-"));
-    t.after(() => rmSync(fixturesDir, { recursive: true, force: true }));
-
-    const adapterModulePath = join(fixturesDir, "adapter.mjs");
-    writeFileSync(
-      adapterModulePath,
-      `import { syntheticAdapter } from ${JSON.stringify(distIndexUrl)};\n` +
-        `export default syntheticAdapter;\n`,
-    );
-
-    const sessionModulePath = join(fixturesDir, "session.mjs");
-    writeFileSync(
-      sessionModulePath,
-      `import { createSyntheticSession } from ${JSON.stringify(distIndexUrl)};\n` +
-        `export default function buildSession() {\n  return createSyntheticSession();\n}\n`,
-    );
-
-    const selectionPath = join(fixturesDir, "selection.json");
-    writeFileSync(
-      selectionPath,
-      JSON.stringify({
-        institutionId: INSTITUTION.id,
-        pulls: [
-          {
-            accountId: ACCOUNT.id,
-            docType: "activity_pull",
-            docDate: null,
-            selection: {
-              kind: "structured_api",
-              periodStart: "2025-01-01",
-              periodEnd: "2025-04-01",
-            },
-          },
-        ],
-      }),
-    );
-
-    function runImport(extraArgs = []) {
-      return execFileSync(
-        process.execPath,
-        [
-          runScript,
-          "--adapter",
-          adapterModulePath,
-          "--session",
-          sessionModulePath,
-          "--selection",
-          selectionPath,
-          "--now",
-          "2025-05-01T00:00:00.000Z",
-          ...extraArgs,
-        ],
-        {
-          env: {
-            ...process.env,
-            FINANCE_ARCHIVE_DATABASE_URL: url,
-            FINANCE_ARCHIVE_SCHEMA: schema,
-            FINANCE_ARCHIVE_RAW_TREE_ROOT: rawDir,
-            FINANCE_ARCHIVE_SPACE_ID: SPACE_ID,
-            FINANCE_ARCHIVE_DB_PATH: dbPath,
-          },
-          encoding: "utf8",
+    const { fixturesDir, adapterModulePath, sessionModulePath } =
+      writeAdapterFixtures(t);
+    const selectionPath = writeSelection(fixturesDir, [
+      {
+        accountId: ACCOUNT.id,
+        docType: "activity_pull",
+        docDate: null,
+        selection: {
+          kind: "structured_api",
+          periodStart: "2025-01-01",
+          periodEnd: "2025-04-01",
         },
-      );
-    }
+      },
+    ]);
+    const runImport = makeRunner({
+      adapterModulePath,
+      sessionModulePath,
+      selectionPath,
+      schema,
+      rawDir,
+    });
 
     // --dry-run first: the summary shape appears, but nothing commits.
     const dryOutput = runImport(["--dry-run"]);
@@ -178,6 +208,84 @@ test(
     // immutable and re-importing the same acquired bytes inserts nothing.
     const secondOutput = runImport();
     assert.match(secondOutput, /rows inserted: 0/);
+    assert.equal(await count(client, "transactions"), inserted);
+  },
+);
+
+test(
+  "a selection can name an account by the adapter's own external key (F1-32), with no separate account-provisioning step, and a second pass inserts nothing new",
+  { skip },
+  async (t) => {
+    // Institution only -- the account is discovered and upserted by run.ts
+    // itself, via resolveDiscoveredAccounts, never provisioned by this test.
+    const { schema, client } = await seededSchema(t, { seedAccount: false });
+
+    const rawDir = mkdtempSync(join(tmpdir(), "kith-finance-run-ext-raw-"));
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+
+    const { fixturesDir, adapterModulePath, sessionModulePath } =
+      writeAdapterFixtures(t);
+    const selectionPath = writeSelection(fixturesDir, [
+      {
+        accountExternalKey: "acct-brokerage-01",
+        docType: "activity_pull",
+        docDate: null,
+        selection: {
+          kind: "structured_api",
+          periodStart: "2025-01-01",
+          periodEnd: "2025-04-01",
+        },
+      },
+    ]);
+    const runImport = makeRunner({
+      adapterModulePath,
+      sessionModulePath,
+      selectionPath,
+      schema,
+      rawDir,
+    });
+
+    const output = runImport();
+    assert.match(output, /^mode: committed$/m);
+    const insertedMatch = output.match(/rows inserted: (\d+)/);
+    assert.ok(insertedMatch, "prints rows inserted");
+    const inserted = Number(insertedMatch[1]);
+    assert.ok(inserted > 0);
+
+    // run.ts resolves every account discover() reports, not only the one the
+    // selection names -- the synthetic adapter's fixture reports two.
+    const accounts = await all(
+      client,
+      "SELECT external_key, acct_last4, display_name, account_type FROM accounts WHERE institution_id = $1",
+      [INSTITUTION.id],
+    );
+    assert.equal(
+      accounts.length,
+      2,
+      "every account discover() reported was provisioned by run.ts itself, from discover() alone",
+    );
+    const brokerage = accounts.find(
+      (account) => account.external_key === "acct-brokerage-01",
+    );
+    assert.ok(brokerage, "the selection's own account is among them");
+    assert.equal(brokerage.acct_last4, "4471");
+    assert.equal(brokerage.display_name, "Brokerage");
+    assert.equal(brokerage.account_type, "brokerage");
+
+    assert.equal(await count(client, "transactions"), inserted);
+
+    // A second pass, same selection: resolveDiscoveredAccounts upserts the
+    // same rows rather than minting new ones, and the raw tree's
+    // immutability makes the import itself a no-op exactly as it is for a
+    // selection that names its account by id.
+    const second = runImport();
+    assert.match(second, /rows inserted: 0/);
+    assert.equal(
+      await count(client, "accounts", "WHERE institution_id = $1", [
+        INSTITUTION.id,
+      ]),
+      2,
+    );
     assert.equal(await count(client, "transactions"), inserted);
   },
 );

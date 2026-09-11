@@ -21,11 +21,9 @@ import test from "node:test";
 
 import {
   ARCHIVE_LAYOUT_VERSION,
-  openArchive,
   persistAcquiredDocument,
   readAndVerify,
   readCaptureManifest,
-  recordRetainedTextPath,
   resolveArchiveSpaceId,
   resolveRawTreeRoot,
   retainPayload,
@@ -56,39 +54,6 @@ function rawTreeRoot(t) {
     FINANCE_ARCHIVE_RAW_TREE_ROOT: directory,
     FINANCE_ARCHIVE_SPACE_ID: SPACE_ID,
   });
-}
-
-/** A throwaway archive with one institution and one account seeded --
- * exactly what `persistAcquiredDocument` requires to resolve a manifest's
- * institution slug and account last4. */
-function archiveWithSeed(t) {
-  const directory = mkdtempSync(join(tmpdir(), "kith-finance-raw-tree-db-"));
-  const db = openArchive(join(directory, "archive.db"));
-  t.after(() => {
-    db.close();
-    rmSync(directory, { recursive: true, force: true });
-  });
-  db.prepare("INSERT INTO institutions (id, name, slug) VALUES (?, ?, ?)").run(
-    INSTITUTION.id,
-    INSTITUTION.name,
-    INSTITUTION.slug,
-  );
-  db.prepare(
-    `INSERT INTO accounts (id, institution_id, acct_last4, display_name, base_currency)
-     VALUES (?, ?, ?, ?, ?)`,
-  ).run(ACCOUNT.id, INSTITUTION.id, ACCOUNT.last4, "Synthetic account", ACCOUNT.currency);
-  return db;
-}
-
-/** A throwaway archive with one institution, one account and one document
- * row seeded, for the recordRetainedTextPath tests. */
-function archiveWithDocument(t, sha256) {
-  const db = archiveWithSeed(t);
-  db.prepare(
-    `INSERT INTO documents (id, institution_id, account_id, doc_type, file_path, sha256, parsed_ok)
-     VALUES (?, ?, ?, ?, ?, ?, 1)`,
-  ).run("doc_1", INSTITUTION.id, ACCOUNT.id, "pdf_statement", "/irrelevant/path", sha256);
-  return db;
 }
 
 /** A statement's bytes as the F1-23 projection retains them: a rendered
@@ -218,18 +183,19 @@ test("writeRetainedText persists text write-once, in a namespace separate from r
 
 test("persistAcquiredDocument writes bytes, retained text and a capture manifest together and reports all three paths", (t) => {
   const root = rawTreeRoot(t);
-  const db = archiveWithSeed(t);
   const bytes = new TextEncoder().encode("synthetic acquired statement bytes");
   const acquired = acquiredFixture(bytes);
   const descriptor = {
     institutionId: INSTITUTION.id,
     accountId: ACCOUNT.id,
+    institutionSlug: INSTITUTION.slug,
+    accountLast4: ACCOUNT.last4,
     docType: "pdf_statement",
     acquired,
     originalExtension: ".pdf",
   };
 
-  const persisted = persistAcquiredDocument(db, root, descriptor, "synthetic retained text layer");
+  const persisted = persistAcquiredDocument(root, descriptor, "synthetic retained text layer");
   assert.equal(persisted.documentWrite.status, "written");
   assert.equal(persisted.textWrite.status, "written");
   assert.equal(persisted.captureWrite.status, "written");
@@ -247,7 +213,6 @@ test("persistAcquiredDocument writes bytes, retained text and a capture manifest
   // Retrying the *same* acquisition attempt (the same captureId) persists
   // nothing new -- an idempotent no-op, not a rewrite.
   const retried = persistAcquiredDocument(
-    db,
     root,
     { ...descriptor, captureId: persisted.captureId },
     "synthetic retained text layer",
@@ -262,7 +227,7 @@ test("persistAcquiredDocument writes bytes, retained text and a capture manifest
   // second, distinct capture (F1-24): the document's bytes are unchanged and
   // reused, but this capture's own provenance is written and kept, not
   // discarded because the bytes it names already exist.
-  const secondCapture = persistAcquiredDocument(db, root, descriptor, "synthetic retained text layer");
+  const secondCapture = persistAcquiredDocument(root, descriptor, "synthetic retained text layer");
   assert.equal(secondCapture.documentWrite.status, "already_exists", "identical bytes are not rewritten");
   assert.equal(secondCapture.captureWrite.status, "written", "a second capture of the same bytes is its own record");
   assert.notEqual(secondCapture.captureId, persisted.captureId);
@@ -277,13 +242,14 @@ test("persistAcquiredDocument writes bytes, retained text and a capture manifest
 
 test("persistAcquiredDocument with no extracted text writes only the document and its capture manifest", (t) => {
   const root = rawTreeRoot(t);
-  const db = archiveWithSeed(t);
   const bytes = new TextEncoder().encode("synthetic tabular export bytes");
   const acquired = acquiredFixture(bytes, { kind: "tabular_export" });
 
-  const persisted = persistAcquiredDocument(db, root, {
+  const persisted = persistAcquiredDocument(root, {
     institutionId: INSTITUTION.id,
     accountId: ACCOUNT.id,
+    institutionSlug: INSTITUTION.slug,
+    accountLast4: ACCOUNT.last4,
     docType: "tabular_export",
     acquired,
   });
@@ -296,15 +262,16 @@ test("persistAcquiredDocument with no extracted text writes only the document an
 
 test("persistAcquiredDocument refuses a pull whose adapter mis-reported its own content hash", (t) => {
   const root = rawTreeRoot(t);
-  const db = archiveWithSeed(t);
   const bytes = new TextEncoder().encode("synthetic bytes with a mismatched manifest hash");
   const acquired = acquiredFixture(bytes, { contentHash: "0".repeat(64) });
 
   assert.throws(
     () =>
-      persistAcquiredDocument(db, root, {
+      persistAcquiredDocument(root, {
         institutionId: INSTITUTION.id,
         accountId: ACCOUNT.id,
+        institutionSlug: INSTITUTION.slug,
+        accountLast4: ACCOUNT.last4,
         docType: "pdf_statement",
         acquired,
       }),
@@ -312,32 +279,20 @@ test("persistAcquiredDocument refuses a pull whose adapter mis-reported its own 
   );
 });
 
-test("persistAcquiredDocument requires the institution and account to already be provisioned", (t) => {
+test("persistAcquiredDocument accepts a null account last4: not every account has one on file", (t) => {
   const root = rawTreeRoot(t);
-  const db = archiveWithSeed(t);
-  const bytes = new TextEncoder().encode("synthetic bytes for an unprovisioned institution or account");
+  const bytes = new TextEncoder().encode("synthetic bytes for an account with no last4 on file");
   const acquired = acquiredFixture(bytes);
 
-  assert.throws(
-    () =>
-      persistAcquiredDocument(db, root, {
-        institutionId: "inst_never_provisioned",
-        accountId: ACCOUNT.id,
-        docType: "pdf_statement",
-        acquired,
-      }),
-    /no institutions row/,
-  );
-  assert.throws(
-    () =>
-      persistAcquiredDocument(db, root, {
-        institutionId: INSTITUTION.id,
-        accountId: "acct_never_provisioned",
-        docType: "pdf_statement",
-        acquired,
-      }),
-    /no accounts row/,
-  );
+  const persisted = persistAcquiredDocument(root, {
+    institutionId: INSTITUTION.id,
+    accountId: ACCOUNT.id,
+    institutionSlug: INSTITUTION.slug,
+    accountLast4: null,
+    docType: "pdf_statement",
+    acquired,
+  });
+  assert.equal(readCaptureManifest(persisted.capturePath).acctLast4, null);
 });
 
 test("given only the raw tree, with no archive database, every document and every capture can be identified well enough to re-import (F1-24), and this still holds under the shared archive/v1/<spaceId> prefix (F1-28)", (t) => {
@@ -346,7 +301,6 @@ test("given only the raw tree, with no archive database, every document and ever
     root.endsWith(join("archive", ARCHIVE_LAYOUT_VERSION, SPACE_ID)),
     "the root this test writes and reads through is the shared-root-prefixed one, not a bare directory",
   );
-  const db = archiveWithSeed(t);
 
   const statementBytes = new TextEncoder().encode("synthetic PDF statement bytes");
   const statement = acquiredFixture(statementBytes, {
@@ -356,9 +310,11 @@ test("given only the raw tree, with no archive database, every document and ever
     capturedAt: "2025-04-01T12:00:00.000Z",
     gaps: [{ periodStart: "2025-03-15", periodEnd: "2025-03-16", reason: "synthetic outage" }],
   });
-  const persistedStatement = persistAcquiredDocument(db, root, {
+  const persistedStatement = persistAcquiredDocument(root, {
     institutionId: INSTITUTION.id,
     accountId: ACCOUNT.id,
+    institutionSlug: INSTITUTION.slug,
+    accountLast4: ACCOUNT.last4,
     docType: "pdf_statement",
     acquired: statement,
     originalExtension: ".pdf",
@@ -383,9 +339,11 @@ test("given only the raw tree, with no archive database, every document and ever
     capturedAt: "2025-06-01T08:00:00.000Z",
     gaps: [],
   });
-  const persistedRestatement = persistAcquiredDocument(db, root, {
+  const persistedRestatement = persistAcquiredDocument(root, {
     institutionId: INSTITUTION.id,
     accountId: ACCOUNT.id,
+    institutionSlug: INSTITUTION.slug,
+    accountLast4: ACCOUNT.last4,
     docType: "pdf_statement",
     acquired: restatement,
     originalExtension: ".pdf",
@@ -400,17 +358,19 @@ test("given only the raw tree, with no archive database, every document and ever
     periodEnd: "2025-04-30",
     capturedAt: "2025-05-01T09:00:00.000Z",
   });
-  persistAcquiredDocument(db, root, {
+  persistAcquiredDocument(root, {
     institutionId: INSTITUTION.id,
     accountId: ACCOUNT.id,
+    institutionSlug: INSTITUTION.slug,
+    accountLast4: ACCOUNT.last4,
     docType: "tabular_export",
     acquired: tabularExport,
     originalExtension: ".csv",
   });
 
-  // Simulate total loss of the archive database: everything from here on
-  // uses only what is sitting in the raw tree directory, never `db` again
-  // (teardown closes it once, as usual, when this test ends).
+  // Everything from here on uses only what is sitting in the raw tree
+  // directory: persistAcquiredDocument never opened a database to write any
+  // of this (F1-33), so there is nothing to simulate losing.
   const captureFiles = readdirSync(join(root, "captures"), { recursive: true })
     .filter((entry) => entry.endsWith(".json"))
     .map((entry) => join(root, "captures", entry));
@@ -457,32 +417,10 @@ test("given only the raw tree, with no archive database, every document and ever
   assert.deepEqual(bytesOnDisk, Buffer.from(statementBytes));
 });
 
-test("recordRetainedTextPath sets documents.text_path to a file that exists", (t) => {
-  const root = rawTreeRoot(t);
-  const text = "Synthetic statement text an assistant can cite.";
-  const textWrite = writeRetainedText(root, text);
-  const sha256 = "a".repeat(64);
-  const db = archiveWithDocument(t, sha256);
-
-  recordRetainedTextPath(db, sha256, textWrite.path);
-
-  const row = db.prepare("SELECT text_path FROM documents WHERE id = ?").get("doc_1");
-  assert.equal(row.text_path, textWrite.path);
-  assert.ok(existsSync(row.text_path));
-  assert.equal(readFileSync(row.text_path, "utf8"), text);
-
-  // This used to also assert the SQLite get_evidence tool handed the same
-  // path back. That surface is gone (F1-21), and the Postgres read surface
-  // cannot build the contract's evidence type yet -- see
-  // `retainedTextSpanEvidence` in src/mcp/pgRead.ts. What this test is really
-  // about survives unchanged: the path recorded on the document is a file
-  // that exists and holds the retained text.
-});
-
-test("recordRetainedTextPath fails loudly rather than silently no-op'ing when no document matches", (t) => {
-  const db = archiveWithDocument(t, "b".repeat(64));
-  assert.throws(
-    () => recordRetainedTextPath(db, "c".repeat(64), "/synthetic/text/path.txt"),
-    /no documents row/,
-  );
-});
+// F1-33: the retained-text path used to be recorded with a targeted
+// `recordRetainedTextPath` UPDATE against the SQLite provenance file, after
+// import. It is gone: `PersistedAcquisition.textPath` now flows straight
+// into `ImportDocument.textPath` (importer.ts) on the same insert as the
+// rest of a document's provenance, so this suite has nothing left to persist
+// after the fact. `writeRetainedText` above already covers the raw-tree
+// write; `adapterImport.test.mjs` covers the field reaching Postgres.

@@ -9,6 +9,7 @@ export {
   type AcquisitionManifestEntry,
   type AdapterSession,
   type CapabilityTier,
+  type DiscoveredAccount,
   type DiscoveredDocument,
   type DiscoveredExportRange,
   type DiscoverResult,
@@ -160,7 +161,7 @@ export {
 export {
   adapterPullToImportDocuments,
   persistAcquiredDocument,
-  recordRetainedTextPath,
+  resolveDiscoveredAccounts,
   resolveInstrumentId,
   type AcquisitionDescriptor,
   type AdapterPull,
