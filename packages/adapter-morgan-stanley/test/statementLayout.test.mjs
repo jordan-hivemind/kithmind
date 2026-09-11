@@ -19,6 +19,8 @@ import {
   ambiguousBlockLines,
   balanceSheetLines,
   bondBlockLines,
+  CONSOLIDATED_ACCOUNT_ONE,
+  CONSOLIDATED_ACCOUNT_TWO,
   CONSOLIDATED_LAYOUT_TEXT,
   equityBlockLines,
   STATEMENT_LAYOUT_TEXT,
@@ -259,11 +261,43 @@ test("an unreadable market value is null with a note and a marketValue locator",
   assert.equal(position.locators.marketValue.source, kind);
 });
 
-test("a consolidated statement is refused whole: a holding carries no account key", () => {
+// F1-46: a consolidated statement is parsed, not refused. Each account's own
+// running header (a line carrying only that account's number) attributes
+// every position, balance and liability found under it.
+test("a consolidated statement attributes each balance to its own account", () => {
   const parsed = parseStatementLines(CONSOLIDATED_LAYOUT_TEXT, kind);
-  assert.deepEqual(parsed.holdings, { positions: [], balances: [], liabilities: [] });
-  assert.match(parsed.parseNote, /prints 2 account numbers/);
-  assert.match(parsed.parseNote, /no account key of its own/);
+  assert.equal(parsed.parseNote, undefined);
+  assert.equal(parsed.holdings.balances.length, 2);
+  const [first, second] = parsed.holdings.balances;
+  assert.equal(first.accountExternalKey, CONSOLIDATED_ACCOUNT_ONE);
+  assert.equal(first.totalValue, "1302775.5");
+  assert.equal(second.accountExternalKey, CONSOLIDATED_ACCOUNT_TWO);
+  assert.equal(second.totalValue, "512340");
+});
+
+test("a consolidated statement attributes each position to the account whose pages it was printed under", () => {
+  const parsed = parseStatementLines(CONSOLIDATED_LAYOUT_TEXT, kind);
+  assert.equal(parsed.holdings.positions.length, 2);
+  const [equity, bond] = parsed.holdings.positions;
+  assert.equal(equity.accountExternalKey, CONSOLIDATED_ACCOUNT_ONE);
+  assert.equal(bond.accountExternalKey, CONSOLIDATED_ACCOUNT_TWO);
+});
+
+test("a consolidated statement attributes a liability to its own account, not the other one", () => {
+  const parsed = parseStatementLines(CONSOLIDATED_LAYOUT_TEXT, kind);
+  assert.equal(parsed.holdings.liabilities.length, 1);
+  const [liability] = parsed.holdings.liabilities;
+  assert.equal(liability.accountExternalKey, CONSOLIDATED_ACCOUNT_TWO);
+  assert.equal(liability.balance, "1500");
+});
+
+test("a single-account statement still omits accountExternalKey: this pull's own account, unchanged", () => {
+  const parsed = parseStatementLines(STATEMENT_LAYOUT_TEXT, kind);
+  const [balance] = parsed.holdings.balances;
+  assert.equal(balance.accountExternalKey, undefined);
+  for (const position of parsed.holdings.positions) {
+    assert.equal(position.accountExternalKey, undefined);
+  }
 });
 
 test("a statement with no period line is refused rather than dated by inference", () => {

@@ -424,15 +424,26 @@ Ambiguity is always a null with a note and a locator, never a guess:
 ### Consolidated statements
 
 About one statement in five prints several accounts in one PDF (up to eleven
-seen), under a `TOTAL FOR ALL ACCOUNTS` page. Those are refused whole, with
-the reason on `parseNote`, because `ParsedPosition`, `ParsedBalance` and
-`ParsedLiability` carry no account key of their own -- only `ParsedRow` does.
-Every holding in such a document would be imported under whichever single
-account the pull names, which is a wrong answer rather than a partial one. The
-bytes and the extracted text are retained, so a later slice that can attribute
-per account has everything it needs. Extending the contract with a per-holding
-account key is the fix, and it is a shared-boundary change (Issue 57), not an
-adapter-local one.
+seen), under a `TOTAL FOR ALL ACCOUNTS` page. F1-46: these are parsed, not
+refused. `ParsedPosition`, `ParsedBalance` and `ParsedLiability` now carry the
+same optional `accountExternalKey` `ParsedRow` always has (Issue 57's
+shared-boundary change), and each holding is attributed to the account whose
+own pages it was printed under.
+
+Every account's own pages repeat a running header before that account's
+`BALANCE SHEET` and holdings tables: a line whose only content is that
+account's number (`NNN-NNNNNN-NNN`), one line above a line reading
+`Account <name>`. A single-account statement carries the same header,
+constant throughout the document, which is what lets `parseRealStatement`
+key on this header unconditionally rather than branching on whether the
+statement is consolidated. `src/statementLayout.mjs`'s `BARE_ACCOUNT_LINE`
+matches the header line; `accountKeysByLine` forward-fills every line in the
+document with the account number of the nearest one at or before it, so a
+`BALANCE SHEET` anchor or a holdings table occurring under a given header
+resolves to that account. Content before the first such header (a
+household-wide summary page some consolidated statements print first, under
+the `TOTAL FOR ALL ACCOUNTS` heading) resolves to no account; nothing this
+parser reads lives there.
 
 ### Trade confirmations
 
@@ -457,9 +468,9 @@ and the raw bytes are content-addressed, so re-acquiring writes no second copy
 of them -- only a new capture manifest recording that second acquisition. The
 reimport reuses the existing `documents` row (the bytes, and so the sha256,
 have not changed), and fills in its `text_path` from the text artifact this
-run retained, which the first run had none of. A
-statement this parser still declines (a consolidated one, say) simply stays
-`parsed_ok` false with an updated note, ready for the run after that.
+run retained, which the first run had none of. A statement this parser still
+declines (no readable `BALANCE SHEET` block, say) simply stays `parsed_ok`
+false with an updated note, ready for the run after that.
 
 A real statement's compressed content stream (`/Filter /FlateDecode`) or
 embedded/CID fonts can leave the dependency-free extractor with no `Tj` text
@@ -719,9 +730,11 @@ extraction, a PDF with no text layer being reported rather than read as empty,
 then period and balance parsing, the `CASH FLOW` table beside the balance
 sheet never bleeding into it, an equity `Total` row as the position with its
 share price filled only from lots that agree, a bond's market value and CUSIP
-off its detail line, and the review routes: an unreadable amount, an ambiguous
-security block, a consolidated statement, a missing period line, and text in
-neither grammar. Its fixtures are generated in-process from the label
+off its detail line, a consolidated statement attributing each balance,
+position and liability to the account named in its own section (F1-46), and
+the review routes: an unreadable amount, an ambiguous security block, a
+missing period line, and text in neither grammar. Its fixtures are generated
+in-process from the label
 vocabulary in "Statement layout" with invented values; no real document
 content is in this repository.
 

@@ -143,6 +143,14 @@ export type ImportRow = {
  * silently mix marked securities with positions carried at cost.
  */
 export type ImportPosition = {
+  /**
+   * F1-46. This holding's own account, when the caller resolved one (a
+   * consolidated statement's per-section attribution, `adapterImport.ts`).
+   * Falls back to the enclosing `ImportDocument.accountId` when omitted --
+   * the ordinary case, one document naming one account -- exactly as before
+   * this field existed.
+   */
+  accountId?: string | null;
   /** ISO YYYY-MM-DD. Required; positions.as_of has no other spelling to store. */
   asOf: string;
   instrumentId: string | null;
@@ -160,6 +168,8 @@ export type ImportPosition = {
 
 /** One point-in-time account total from a statement's summary section. */
 export type ImportBalance = {
+  /** F1-46. Same fallback rule as `ImportPosition.accountId`. */
+  accountId?: string | null;
   /** ISO YYYY-MM-DD. Required; balances.as_of has no other spelling to store. */
   asOf: string;
   totalValueText: string | null;
@@ -173,6 +183,8 @@ export type ImportBalance = {
 
 /** What is owed: a loan, margin balance or similar, from a statement. */
 export type ImportLiability = {
+  /** F1-46. Same fallback rule as `ImportPosition.accountId`. */
+  accountId?: string | null;
   kind: string;
   displayName: string | null;
   balanceText: string | null;
@@ -932,21 +944,19 @@ export async function importBatch(
       // if a real pull ever mixes the two this way.
       const positions = document.positions ?? [];
       const balances = document.balances ?? [];
-      if (
-        (positions.length > 0 || balances.length > 0) &&
-        document.accountId === null
-      ) {
-        throw new Error(
-          `document ${document.sha256} carries a position or balance but has no account_id; ` +
-            "positions.account_id and balances.account_id are NOT NULL",
-        );
-      }
+      // F1-46: each holding's own accountId (a consolidated statement's
+      // per-section attribution) wins over the document's, which stays the
+      // fallback for the ordinary one-document-one-account case -- see
+      // ImportPosition.accountId's doc comment.
       for (const position of positions) {
-        const outcome = await importPosition(
-          position,
-          document.accountId as string,
-          documentId,
-        );
+        const accountId = position.accountId ?? document.accountId;
+        if (accountId === null) {
+          throw new Error(
+            `document ${document.sha256} carries a position with no account_id; ` +
+              "positions.account_id and balances.account_id are NOT NULL",
+          );
+        }
+        const outcome = await importPosition(position, accountId, documentId);
         if (outcome === "inserted") rowsInserted += 1;
         else {
           rowsRefused += 1;
@@ -954,11 +964,14 @@ export async function importBatch(
         }
       }
       for (const balance of balances) {
-        const outcome = await importBalance(
-          balance,
-          document.accountId as string,
-          documentId,
-        );
+        const accountId = balance.accountId ?? document.accountId;
+        if (accountId === null) {
+          throw new Error(
+            `document ${document.sha256} carries a balance with no account_id; ` +
+              "positions.account_id and balances.account_id are NOT NULL",
+          );
+        }
+        const outcome = await importBalance(balance, accountId, documentId);
         if (outcome === "inserted") rowsInserted += 1;
         else {
           rowsRefused += 1;
@@ -969,7 +982,7 @@ export async function importBatch(
         const outcome = await importLiability(
           liability,
           document.institutionId,
-          document.accountId,
+          liability.accountId ?? document.accountId,
           documentId,
         );
         if (outcome === "inserted") rowsInserted += 1;
