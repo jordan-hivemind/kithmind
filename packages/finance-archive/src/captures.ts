@@ -108,7 +108,10 @@ export type CaptureManifest = {
    * not this capture's identity and not a path segment. */
   readonly institutionSlug: string;
   /** Last four digits only, matching the privacy rule the database itself
-   * enforces (accounts.acct_last4); null when the account has none on file. */
+   * enforces (accounts.acct_last4); null when the account has none on file;
+   * or the literal `"all"` (F1-35) for an institution-wide pull that names
+   * no single account -- this capture belongs to the institution, not to one
+   * account, and `"all"` says so rather than a guessed or borrowed last4. */
   readonly acctLast4: string | null;
   readonly docType: string;
   readonly periodStart: string;
@@ -306,7 +309,9 @@ const MANIFEST_FIELDS: Record<string, (value: unknown) => boolean> = {
   documentSha256: (value) => typeof value === "string" && SHA256.test(value),
   institutionSlug: isText,
   acctLast4: (value) =>
-    value === null || (typeof value === "string" && /^[0-9]{4}$/.test(value)),
+    value === null ||
+    value === "all" ||
+    (typeof value === "string" && /^[0-9]{4}$/.test(value)),
   docType: isText,
   periodStart: isDate,
   periodEnd: isDate,

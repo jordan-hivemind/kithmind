@@ -151,6 +151,11 @@ type ActivityLikeRow = {
   readonly price: string | null;
   readonly amount: string;
   readonly currency: string;
+  /** F1-35. Present only for a structured-API row (`ActivityRow`); the
+   * tabular-export and statement/confirmation callers below build their own
+   * row objects and never set it, so it stays undefined there -- a
+   * single-account pull, exactly the pre-F1-35 behavior. */
+  readonly accountExternalKey?: string;
 };
 
 function activityRowToParsedRow(
@@ -160,6 +165,7 @@ function activityRowToParsedRow(
 ): ParsedRow {
   return {
     sourceDocument,
+    accountExternalKey: row.accountExternalKey,
     externalId: row.externalId,
     tradeDate: null,
     processDate: row.date,
@@ -341,7 +347,9 @@ async function discover(session: AdapterSession): Promise<DiscoverResult> {
  */
 const ACTIVITY_RETENTION: RetentionPolicy = {
   kind: "json_allowlist",
-  version: "thistlebrook-activity-1",
+  // F1-35: version bumped for accountExternalKey, below -- the field the
+  // parser now reads to attribute a row within an institution-wide pull.
+  version: "thistlebrook-activity-2",
   fields: [
     "pages.*.page",
     "pages.*.totalCount",
@@ -358,6 +366,7 @@ const ACTIVITY_RETENTION: RetentionPolicy = {
     "pages.*.items.*.price",
     "pages.*.items.*.amount",
     "pages.*.items.*.currency",
+    "pages.*.items.*.accountExternalKey",
   ],
 };
 

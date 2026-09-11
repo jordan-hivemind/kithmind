@@ -399,6 +399,16 @@ export type ParsedRow = ParsedAmount & {
      * `src/adapterImport.ts`.
      */
     readonly sourceDocument: string;
+    /**
+     * F1-35. The account this row belongs to, when one `acquire()` pull
+     * spans several accounts (an institution-wide structured-API or
+     * tabular-export pull, e.g. `run.ts`'s `"scope": "institution"` selection).
+     * Matches a `DiscoveredAccount.externalKey` from this institution's own
+     * `discover()`. Omitted for the ordinary case, one pull naming one
+     * account: such a row is attributed to that pull's own account exactly
+     * as before this field existed.
+     */
+    readonly accountExternalKey?: string;
     /** The provider's own transaction id, when the source has one. */
     readonly externalId: string | null;
     readonly tradeDate: string | null;

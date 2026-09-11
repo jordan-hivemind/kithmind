@@ -1038,3 +1038,174 @@ test(
     assert.equal(outcome.delta, "5");
   },
 );
+
+// --- F1-35: institution-wide pulls, rows attributed by their own account ---
+//
+// A real institution's structured activity API can return every account's
+// rows in one pull, each row carrying that account's own external key
+// (ParsedRow.accountExternalKey). The synthetic adapter's structured_api
+// rows alternate between its two fixture accounts' external keys,
+// "acct-brokerage-01" and "acct-trust-01" (fixtures.ts), for exactly this.
+
+test(
+  "a row's own accountExternalKey attributes it to a different account than the pull names, and an unresolved key opens unknown_account_key and falls back",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedPg(client);
+    const BROKERAGE = { id: "acct_brokerage_f135", last4: "4471" };
+    const TRUST = { id: "acct_trust_f135", last4: "9902" };
+    for (const account of [BROKERAGE, TRUST]) {
+      await client.query(
+        `INSERT INTO accounts (id, institution_id, acct_last4, display_name, base_currency)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [account.id, INSTITUTION.id, account.last4, "Discovered account", "USD"],
+      );
+    }
+    const accountsByExternalKey = new Map([
+      ["acct-brokerage-01", BROKERAGE.id],
+      ["acct-trust-01", TRUST.id],
+    ]);
+
+    const session = createSyntheticSession();
+    const { acquired, rows } = await acquireAndParseActivity(session);
+
+    // Index 3 sits inside page 1 only (paginateWithOverlap's one-row overlap
+    // falls at indices 9 and 18 for a 24-row, 10-per-page pull), so this
+    // targets exactly one parsed row instance -- not a duplicate half of an
+    // overlapping pair that would otherwise stop collapsing to one hash once
+    // only one copy's account changes.
+    const targetIndex = 3;
+    assert.equal(typeof rows[targetIndex].accountExternalKey, "string");
+    const taggedRows = rows.map((row, index) =>
+      index === targetIndex
+        ? { ...row, accountExternalKey: "acct-unknown-99" }
+        : row,
+    );
+
+    const documents = await adapterPullToImportDocuments(client, {
+      institutionId: INSTITUTION.id,
+      accountId: ACCOUNT.id,
+      acquired,
+      rows: taggedRows,
+      docType: "activity_pull",
+      docDate: null,
+      persisted: persist(t, acquired, "activity_pull"),
+      accountsByExternalKey,
+    });
+    await importBatch(
+      client,
+      { source: INSTITUTION.slug, documents },
+      new Date("2025-05-01"),
+    );
+
+    const brokerageCount = await count(
+      client,
+      "transactions",
+      "WHERE account_id = $1",
+      [BROKERAGE.id],
+    );
+    const trustCount = await count(client, "transactions", "WHERE account_id = $1", [
+      TRUST.id,
+    ]);
+    const fallbackCount = await count(
+      client,
+      "transactions",
+      "WHERE account_id = $1",
+      [ACCOUNT.id],
+    );
+    assert.ok(brokerageCount > 0, "rows keyed to the brokerage account land there");
+    assert.ok(trustCount > 0, "rows keyed to the trust account land there");
+    // Exactly the one row whose key does not resolve falls back to the
+    // pull's own account, never silently dropped.
+    assert.equal(fallbackCount, 1);
+    assert.equal(
+      brokerageCount + trustCount + fallbackCount,
+      acquired.manifest.reportedRowCount,
+    );
+
+    const [review] = await all(
+      client,
+      "SELECT kind, account_id, raw_value FROM review_items WHERE kind = $1",
+      ["unknown_account_key"],
+    );
+    assert.ok(review, "an unresolved key opens a review item");
+    assert.equal(review.account_id, ACCOUNT.id);
+    assert.equal(review.raw_value, "acct-unknown-99");
+  },
+);
+
+test(
+  "an institution-wide pull persists with a null document account, while its rows still land on their own accounts",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedPg(client);
+    const BROKERAGE = { id: "acct_brokerage_f135_wide", last4: "4471" };
+    const TRUST = { id: "acct_trust_f135_wide", last4: "9902" };
+    for (const account of [BROKERAGE, TRUST]) {
+      await client.query(
+        `INSERT INTO accounts (id, institution_id, acct_last4, display_name, base_currency)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [account.id, INSTITUTION.id, account.last4, "Discovered account", "USD"],
+      );
+    }
+    const accountsByExternalKey = new Map([
+      ["acct-brokerage-01", BROKERAGE.id],
+      ["acct-trust-01", TRUST.id],
+    ]);
+
+    const session = createSyntheticSession();
+    const { acquired, rows } = await acquireAndParseActivity(session);
+
+    // No accountId, no accountLast4: an institution-wide pull names no
+    // single account, so persistAcquiredDocument's capture manifest records
+    // the literal "all" in place of one (captures.ts's acctLast4).
+    const persisted = persistAcquiredDocument(rawRoot(t), {
+      institutionId: INSTITUTION.id,
+      accountId: null,
+      institutionSlug: INSTITUTION.slug,
+      accountLast4: "all",
+      docType: "activity_pull",
+      acquired,
+    });
+
+    const documents = await adapterPullToImportDocuments(client, {
+      institutionId: INSTITUTION.id,
+      accountId: null,
+      acquired,
+      rows,
+      docType: "activity_pull",
+      docDate: null,
+      persisted,
+      accountsByExternalKey,
+    });
+    assert.ok(documents.length > 0);
+    for (const document of documents) {
+      assert.equal(document.accountId, null);
+    }
+
+    await importBatch(
+      client,
+      { source: INSTITUTION.slug, documents },
+      new Date("2025-05-01"),
+    );
+
+    assert.equal(
+      await count(client, "documents", "WHERE account_id IS NULL"),
+      documents.length,
+    );
+    const brokerageCount = await count(
+      client,
+      "transactions",
+      "WHERE account_id = $1",
+      [BROKERAGE.id],
+    );
+    const trustCount = await count(client, "transactions", "WHERE account_id = $1", [
+      TRUST.id,
+    ]);
+    assert.ok(brokerageCount > 0);
+    assert.ok(trustCount > 0);
+    assert.equal(brokerageCount + trustCount, acquired.manifest.reportedRowCount);
+  },
+);

@@ -87,6 +87,15 @@ export type ActivityRow = {
   readonly price: string | null;
   readonly amount: string;
   readonly currency: string;
+  /**
+   * F1-35. Which of `ACCOUNTS` this row belongs to -- real institutions with
+   * a structured activity API commonly return every account's activity in
+   * one pull, exactly what an operator's `"scope": "institution"` selection
+   * exercises. `generateActivityRows` alternates the two fixture accounts
+   * deterministically so a test can assert specific rows land on specific
+   * accounts.
+   */
+  readonly accountExternalKey: string;
 };
 
 /** Pure calendar math, no money involved. */
@@ -111,6 +120,10 @@ export function generateActivityRows(
     const type = activityTypeAt(i);
     const date = addDaysIso(startDate, i * 3);
     const externalId = `tx-${String(i + 1).padStart(4, "0")}`;
+    // F1-35: alternates the two ACCOUNTS entries deterministically, standing
+    // in for a real institution-wide pull that returns every account's
+    // activity together.
+    const accountExternalKey = ACCOUNTS[i % ACCOUNTS.length]!.externalKey;
     if (type === "buy" || type === "sell") {
       const instrument = instrumentAt(i);
       const units = canonicalizeDecimal(String(5 + (i % 6) * 3));
@@ -129,6 +142,7 @@ export function generateActivityRows(
         price,
         amount: type === "buy" ? negateDecimal(gross) : gross,
         currency: "USD",
+        accountExternalKey,
       });
       continue;
     }
@@ -149,6 +163,7 @@ export function generateActivityRows(
       price: null,
       amount,
       currency: "USD",
+      accountExternalKey,
     });
   }
   return rows;
@@ -245,6 +260,9 @@ export const AMBIGUOUS_ROW: ActivityRow = {
   price: null,
   amount: "1,2O3.45",
   currency: "USD",
+  // Unused: statementLine() never reads it, since a PDF-tier row is always
+  // one account's own statement, not an institution-wide pull.
+  accountExternalKey: ACCOUNTS[0]!.externalKey,
 };
 
 // --- holdings fixtures ---------------------------------------------------
@@ -465,6 +483,8 @@ const CONFIRMATION_ROW: ActivityRow = {
   price: "101.20",
   amount: "-1518.00",
   currency: "EUR",
+  // Unused: same reasoning as AMBIGUOUS_ROW above.
+  accountExternalKey: ACCOUNTS[0]!.externalKey,
 };
 
 function buildConfirmationText(): string {
