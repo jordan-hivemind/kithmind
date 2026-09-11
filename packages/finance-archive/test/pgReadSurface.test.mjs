@@ -903,3 +903,86 @@ test("a binding that disagrees with the stored amount withholds its row", { skip
   assert.ok(!after.items.some((item) => item.recordId === target.recordId));
   assert.ok(after.coverage.reasons.includes("retained_evidence_unavailable"));
 });
+
+/**
+ * Rewrites one transaction's `source_locator`, keeping the binding the
+ * adapter actually recorded so the bound token still agrees with the stored
+ * amount. Hand-built because no adapter binds two fields yet, and the
+ * selection rule has to hold before one does.
+ */
+async function rebind(client, recordId, locatorsFor) {
+  const id = recordId.slice("txn:".length);
+  const stored = await one(
+    client,
+    "SELECT source_locator FROM transactions WHERE id = $1",
+    [id],
+  );
+  const binding = Object.values(JSON.parse(stored.source_locator))
+    .map((locator) => locator?.binding)
+    .find((candidate) => candidate);
+  assert.ok(binding, "the row this test rewrites really is bound");
+  await client.query(
+    "UPDATE transactions SET source_locator = $2 WHERE id = $1",
+    [id, JSON.stringify(locatorsFor(binding))],
+  );
+  return binding;
+}
+
+/** One bound transaction from a tier whose locator carries a pointer. */
+async function boundTransaction(t) {
+  const { client } = await importedPull(t);
+  const r = await reader(t, client);
+  const before = await serve(r, { operation: "list_transactions", limit: 100 });
+  const target = before.items.find(
+    (item) => item.evidence[0].locator.format === "json_pointer_v1",
+  );
+  assert.ok(target, "the fixture still returns a JSON-tier row");
+  return { client, reader: r, before, target };
+}
+
+test("two bindings on one record are told apart by name, not by key order", { skip }, async (t) => {
+  const { client, reader: r, target } = await boundTransaction(t);
+  const cited = target.evidence[0].locator.pointer;
+  // Two bound locators whose rawValues are identical -- a price that happens
+  // to equal the amount -- so the decimal cross-check cannot separate them,
+  // with the wrong one first in key order.
+  await rebind(client, target.recordId, (binding) => ({
+    price: {
+      source: "structured_api",
+      index: 0,
+      field: "price",
+      binding: { ...binding, pointer: cited.replace(/amount$/, "price") },
+    },
+    amount: { source: "structured_api", index: 0, field: "amount", binding },
+  }));
+
+  const after = await serve(r, { operation: "list_transactions", limit: 100 });
+  const item = after.items.find((row) => row.recordId === target.recordId);
+  assert.ok(item, "a record whose amount is bound is still citable");
+  assert.equal(
+    item.evidence[0].locator.pointer,
+    cited,
+    "the binding named for the load-bearing field is the cited one",
+  );
+});
+
+test("several bindings and none for the money field withholds the row", { skip }, async (t) => {
+  const { client, reader: r, before, target } = await boundTransaction(t);
+  const cited = target.evidence[0].locator.pointer;
+  // Neither key names the record's load-bearing field, so which binding the
+  // amount belongs to is not stated anywhere. Withheld beats guessing.
+  await rebind(client, target.recordId, (binding) => ({
+    row: { source: "structured_api", index: 0, binding },
+    quantity: {
+      source: "structured_api",
+      index: 0,
+      field: "quantity",
+      binding: { ...binding, pointer: cited.replace(/amount$/, "quantity") },
+    },
+  }));
+
+  const after = await serve(r, { operation: "list_transactions", limit: 100 });
+  assert.equal(after.items.length, before.items.length - 1);
+  assert.ok(!after.items.some((row) => row.recordId === target.recordId));
+  assert.ok(after.coverage.reasons.includes("retained_evidence_unavailable"));
+});

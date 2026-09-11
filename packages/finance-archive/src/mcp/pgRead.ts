@@ -181,14 +181,20 @@ function documentOf(row: EvidenceRow): RetainedSourceObject | null {
 }
 
 /**
- * The `FieldBinding` an adapter recorded on this record's `source_locator`.
+ * The `FieldBinding` an adapter recorded for this record's load-bearing money
+ * field, named by `field` as the parsers spell it ("amount", "marketValue",
+ * "totalValue").
  *
- * A parser emits at most one binding per record, on the record's load-bearing
- * money field, so the first one found is that field's. Which locator key it
- * sits under is not what makes it the right datum -- `evidenceFor` proves
- * that by comparing the bound token to the stored money value.
+ * Today's parsers emit exactly one binding per record, and it sits on the
+ * `row` locator rather than under a key named for the field, so a lone
+ * binding is taken as that field's. Once more than one locator is bound --
+ * an adapter that also binds `price` -- key order is not evidence of
+ * anything, and the decimal cross-check cannot separate two bindings whose
+ * values coincide. So several bindings must be disambiguated by name, and a
+ * record whose load-bearing field is not among them is withheld rather than
+ * cited from whichever binding happened to be first.
  */
-function bindingOf(sourceLocator: string | null): unknown {
+function bindingOf(sourceLocator: string | null, field: string): unknown {
   if (sourceLocator === null) return null;
   let parsed: unknown;
   try {
@@ -199,11 +205,18 @@ function bindingOf(sourceLocator: string | null): unknown {
     return null;
   }
   if (parsed === null || typeof parsed !== "object") return null;
-  for (const locator of Object.values(parsed as Record<string, unknown>)) {
-    if (locator !== null && typeof locator === "object" && "binding" in locator)
-      return (locator as { binding: unknown }).binding;
-  }
-  return null;
+  const bound = Object.entries(parsed as Record<string, unknown>).filter(
+    ([, locator]) =>
+      locator !== null &&
+      typeof locator === "object" &&
+      typeof (locator as { binding?: unknown }).binding === "object" &&
+      (locator as { binding?: unknown }).binding !== null,
+  );
+  const chosen =
+    bound.length === 1 ? bound[0] : bound.find(([key]) => key === field);
+  return chosen === undefined
+    ? null
+    : (chosen[1] as { binding: unknown }).binding;
 }
 
 /**
@@ -314,7 +327,9 @@ function evidenceFor(
 ): FinanceEvidence[] | null {
   if (document === null || record.money === null || record.currency === null)
     return null;
-  const locator = structuredLocator(bindingOf(record.sourceLocator));
+  const locator = structuredLocator(
+    bindingOf(record.sourceLocator, record.field),
+  );
   if (locator === null || !bindingAgrees(locator.rawValue, record.money))
     return null;
   return [
