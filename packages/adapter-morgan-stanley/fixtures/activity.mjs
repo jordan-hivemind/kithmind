@@ -1,8 +1,10 @@
 // Synthetic Morgan Stanley activity-API fixtures. Real field names
 // (activityId, transactionSequenceNumber, CCY, processDate, activityDate,
-// tradeDate, settlementDate, accountName, keyAccount, activity, trnType,
-// category, subCategory, description, amount, quantity, price,
-// runningBalances (a scalar), symbol, cusip, checkNumber), entirely invented
+// tradeDate, settlementDate, payDate, referenceNumber, accountName,
+// keyAccount, activity, trnType, category, subCategory, description, memo,
+// cardNumber, amount, quantity, price, runningBalances (a scalar), symbol,
+// cusip, checkNumber, fxCurrency, fxSourceCurrency, fxSourceAmount,
+// fxLocalCurrency, fxLocalAmount, fxMarketRate, fxType), entirely invented
 // values. No real account number, no person.
 
 import { MS_ACTIVITY_ROWS_KEY } from "../src/adapter.mjs";
@@ -206,6 +208,47 @@ export const ACTIVITY_PAGES = [
   page([ROW_6_UNKNOWN_ACTIVITY, ROW_7_DIVIDEND]),
 ];
 
+/** A foreign-currency row: CCY carries an ISO code instead of the base-currency
+ * "-", and the row states the FX detail fields alongside a person-shaped
+ * `memo` and a `cardNumber` -- present here only so retention.test.mjs can
+ * prove the FX fields are retained (README, "Retention") while memo and
+ * cardNumber are still dropped. Not part of ACTIVITY_PAGES; parse() does not
+ * read the FX fields (retained for evidence and later use, not parsed yet). */
+export const ROW_9_FOREIGN_CURRENCY = {
+  activityId: "ACT-0001-000009",
+  transactionSequenceNumber: 1000009,
+  CCY: "EUR",
+  processDate: "2025-03-04",
+  activityDate: "2025-03-04",
+  tradeDate: null,
+  settlementDate: "2025-03-04",
+  payDate: "2025-03-05",
+  referenceNumber: "REF-0001-000009",
+  accountName: "Sample Brokerage Account",
+  keyAccount: KEY_ACCOUNT,
+  activity: "ACH Disbursement",
+  trnType: "Cash",
+  category: "Payment",
+  subCategory: "International",
+  description: "INTERNATIONAL WIRE",
+  memo: "Birthday gift for Sample Person",
+  cardNumber: "4111-XXXX-XXXX-1234",
+  amount: -100.0,
+  quantity: null,
+  price: null,
+  symbol: "-",
+  cusip: null,
+  checkNumber: null,
+  runningBalances: 22095.67,
+  fxCurrency: "EUR",
+  fxSourceCurrency: "USD",
+  fxSourceAmount: 108.35,
+  fxLocalCurrency: "EUR",
+  fxLocalAmount: 100.0,
+  fxMarketRate: 1.0835,
+  fxType: "Spot",
+};
+
 /** A page whose response also echoes credential-shaped material: a session
  * token, a device id, and (per-row) accountName -- the field the retention
  * declaration deliberately excludes because it can carry a person's name.
@@ -216,7 +259,7 @@ export const ACTIVITY_PAGE_WITH_CREDENTIAL_ECHO = {
     postedActivityCount: POSTED_ACTIVITY_COUNT,
     SessionToken: "eyFAKE.CREDENTIAL.TOKEN",
     DeviceFootprintEcho: "fp-fake-0000",
-    [MS_ACTIVITY_ROWS_KEY]: [ROW_1_TREASURY],
+    [MS_ACTIVITY_ROWS_KEY]: [ROW_1_TREASURY, ROW_9_FOREIGN_CURRENCY],
   },
 };
 

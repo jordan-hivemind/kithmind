@@ -134,17 +134,41 @@ becomes a recorded gap rather than a silent absence.
 
 ## Retention
 
-The activity JSON declares a `json_allowlist` policy, version `ms-activity-1`,
+The activity JSON declares a `json_allowlist` policy, version `ms-activity-3`,
 wrapping the pull as `{"pages": [ ...responses ]}` the way the reference
-adapter does. Every declared path is one the parser reads: the posted-activity
-count, the row-level dates, `keyAccount`, `activity`, `description`, `amount`,
-`quantity`, `price`, `symbol`, `cusip` and `checkNumber`.
+adapter does. Most declared paths are ones the parser reads: the
+posted-activity count, the row-level dates, `keyAccount`, `activity`,
+`description`, `amount`, `quantity`, `price`, `symbol`, `cusip` and
+`checkNumber`. `payDate`, `referenceNumber` and the FX fields
+(`fxCurrency`, `fxSourceCurrency`, `fxSourceAmount`, `fxLocalCurrency`,
+`fxLocalAmount`, `fxMarketRate`, `fxType`) are retained for evidence and later
+use -- `parse()` does not read them yet.
 
-Two deliberate exclusions. `accountName` is not retained: it can carry a
-person's name, the raw tree may be a synced folder, and `keyAccount` already
-identifies the account. `runningBalances` is a nested object whose leaf names
-are unknown, and an allowlist path must terminate on a scalar, so guessing a
-leaf here would be exactly the silent guess this design refuses.
+`runningBalances` is confirmed as a scalar (a JSON number), so it is retained
+directly rather than guessed at as a nested object.
+
+The first live capture's `retention_dropped_fields` review item named the
+fields below. Each stays excluded, for the reason given:
+
+| Field                                | Why it stays excluded                        |
+| ------------------------------------- | --------------------------------------------- |
+| `accountName`                        | can carry a person's name                     |
+| `cardNumber`                         | card identifier                               |
+| `checkAndCardNumber`                 | card and check identifier                     |
+| `checkBlockSequence`                 | check identifier                              |
+| `checkDate`                          | check identifier                              |
+| `checkImageAvailable`                | check identifier                              |
+| `memo`                               | free text a person typed                      |
+| `institutionName`                    | not load-bearing; provider-echoed label       |
+| `TagsString`                         | not load-bearing; provider-echoed label       |
+| `TranSourceCode`                     | not load-bearing; provider-echoed label       |
+| `rowID`                              | not load-bearing; provider-echoed identifier  |
+| `symbolCusip`                        | not load-bearing; redundant with symbol/cusip |
+| `parentSubCategory`                  | not load-bearing; redundant with subCategory  |
+| `FxAmt`                              | not load-bearing; redundant with the FX fields kept |
+| `pendingTransaction`                 | redundant or presentation                     |
+| `descriptionList`                    | shape unconfirmed; revisit when a live capture shows it |
+| every envelope field (`InternalStatusCode`, `Notification`, `ServerTimestamp`, `footnotesAndDisclaimers`, `hasActiveLoans`, `hasETradeAVCryptoAccounts`, `hasETradeAVNonConvertedAccounts`, `hasExternalAccounts`, `hasNonETExternalAccounts`, `isLending`, `loanNotes`, `pendingActivities`, `pendingActivityCount`, `showCategory`, `tags`, `totalRow`) | page-level metadata, not a transaction field |
 
 Everything else the response carries is excluded by saying nothing about it,
 which is how an allowlist works. The request id, the sequence id, any echoed
