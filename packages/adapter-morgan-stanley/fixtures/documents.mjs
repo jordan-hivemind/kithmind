@@ -18,3 +18,26 @@ export const CONFIRMATION_DOCS = [
 export function documentsPage(items, { docType, totalCount }) {
   return { [MS_DOCUMENTS_ITEMS_KEY]: items, [MS_DOCUMENTS_TOTAL_KEY]: totalCount, docType };
 }
+
+/** Matches MS_DOCUMENTS_PAGE_SIZE in ../src/adapter.mjs: the listing
+ * paginates at roughly fifty rows. */
+export const DOCUMENTS_PAGE_SIZE = 50;
+
+/** More statements than fit on one page, so the pagination path is exercised
+ * end to end. Invented ids and dates, one synthetic account, no person. */
+function manyStatementDocs(count) {
+  return Array.from({ length: count }, (_, i) => {
+    const year = 2015 + Math.floor(i / 12);
+    const month = String((i % 12) + 1).padStart(2, "0");
+    return {
+      externalId: `STMT-${year}-${month}`,
+      keyAccount: "MS-ACCT-0001",
+      periodStart: `${year}-${month}-01`,
+      periodEnd: `${year}-${month}-28`,
+      label: `${year}-${month} statement`,
+    };
+  });
+}
+
+/** Two full pages and a partial third. */
+export const PAGINATED_STATEMENT_DOCS = manyStatementDocs(DOCUMENTS_PAGE_SIZE * 2 + 3);

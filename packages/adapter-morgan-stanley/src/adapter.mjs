@@ -28,6 +28,8 @@ const MS_DESCRIPTION_SEPARATOR = "<br/>";
 const MAX_ACTIVITY_PAGES_PER_PULL = 50;
 const MS_DOCUMENTS_PAGE_SIZE = 50; // the listing paginates at roughly 50 rows
 const MAX_DOCUMENTS_PAGES_PER_TYPE = 200;
+// Every document tier this adapter acquires is served as a PDF; see assertPdfBytes.
+const PDF_MAGIC = "%PDF";
 
 // --- Unconfirmed institution response shapes --------------------------------
 //
@@ -45,9 +47,11 @@ const MAX_DOCUMENTS_PAGES_PER_TYPE = 200;
 //     unconfirmed for a while longer.
 //   - MS_DOCUMENTS_ITEMS_KEY / MS_DOCUMENTS_TOTAL_KEY: same "missing <key>
 //     array" pattern, but discover() also tolerates the documents pull
-//     failing outright (e.g. the still-missing Authorization bearer, see
+//     failing outright (e.g. the bridge has not captured the app's bearer
+//     because its Documents page was never opened in the tab, see
 //     fetchDocumentsForType) and returns an incompleteListing with the
-//     reason instead of throwing.
+//     reason instead of throwing. The per-item field names below are read
+//     straight off each row and are unconfirmed for the same reason.
 const MS_ACTIVITY_ROWS_KEY = "postedActivities";
 const MS_DOCUMENTS_ITEMS_KEY = "documents";
 const MS_DOCUMENTS_TOTAL_KEY = "totalCount";
@@ -336,11 +340,12 @@ function decodeDocumentExternalId(externalId) {
 // --- discover ----------------------------------------------------------------
 
 /**
- * Documents tier tolerance: the documents-list request needs an Authorization
- * bearer the bridge's two-header allowlist does not carry, so a real pull can
- * fail outright, not just report a missing key. Catching that here, per
- * document type, is what lets an activity-only bounded pull proceed instead
- * of discover() rejecting entirely.
+ * Documents tier tolerance: the documents-list request needs the app's own
+ * Authorization bearer, which the bridge captures page-side only once the
+ * app's Documents page has loaded in the tab (README, "Operator runbook"), so
+ * a real pull can still fail outright, not just report a missing key.
+ * Catching that here, per document type, is what lets an activity-only
+ * bounded pull proceed instead of discover() rejecting entirely.
  */
 async function fetchDocumentsForType(session, docType, kind) {
   try {
@@ -637,9 +642,27 @@ async function acquireTabularExport(selection) {
   };
 }
 
+/**
+ * The per-document download path is unconfirmed (MS_DOCUMENT_DOWNLOAD_PATH_PREFIX,
+ * see src/bridge.mjs), and a signed-out or wrong-path download answers with an
+ * HTML login or error page at HTTP 200. Retaining that would archive a page
+ * that says nothing under a statement's content hash, so the bytes are checked
+ * for the PDF magic number before they are retained.
+ */
+function assertPdfBytes(bytes, docId) {
+  const header = String.fromCharCode(...bytes.slice(0, PDF_MAGIC.length));
+  if (header === PDF_MAGIC) return;
+  throw new Error(
+    `document download for ${docId} did not return a PDF (it starts ${JSON.stringify(header)}, ` +
+      `not ${JSON.stringify(PDF_MAGIC)}) -- an HTML login or error page is the usual cause. ` +
+      "Check the signed-in tab and MS_DOCUMENT_DOWNLOAD_PATH_PREFIX (README, 'Environment').",
+  );
+}
+
 async function acquireDocument(selection) {
   const { docId, keyAccount, periodStart, periodEnd } = decodeDocumentExternalId(selection.externalId);
   const bytes = await selection.session.fetchBytes(`/documents/${docId}::${keyAccount}`);
+  assertPdfBytes(bytes, docId);
   const retained = retainPayload(DOCUMENT_RETENTION, bytes, selection.kind);
   return {
     bytes: retained.bytes,
@@ -980,11 +1003,18 @@ function capabilities() {
         "postedActivityCount). The documents-list and accounts JSON envelopes remain this " +
         "adapter's working assumption -- see the \"Unconfirmed institution response shapes\" " +
         "comment in src/adapter.mjs.",
-      "The documents-list request needs an Authorization bearer the session bridge's " +
-        "two-header allowlist does not carry; discover() catches that per document type and " +
-        "returns an incompleteListing with the reason instead of failing the whole pull, so an " +
-        "activity-only bounded pull can still proceed. Acquiring the bearer page-side is " +
-        "deferred to the full pull.",
+      "The documents-list request needs the app's own Authorization bearer. The session bridge " +
+        "captures it page-side alongside the XSRF and footprint headers, but only once the app's " +
+        "Documents page has loaded in the signed-in tab; until then the documents endpoints " +
+        "refuse by name. discover() catches that per document type and returns an " +
+        "incompleteListing with the reason instead of failing the whole pull, so an " +
+        "activity-only bounded pull can still proceed.",
+      "The documents-list request path, query and body keys are confirmed live " +
+        "(POST searchItems; endDate, pageNum, filters[DocType/DocSubType/KeyAccountNo], sortBy, " +
+        "startDate, TimeFrame). Which values TimeFrame accepts, the response envelope, the " +
+        "per-item field names and the per-document download path are not; a download that " +
+        "answers with an HTML login or error page instead of a PDF is refused by name rather " +
+        "than retained.",
       "The accounts endpoint (confirmed request shape) returns 403 from a page-context fetch " +
         "even with the captured XSRF header and a permissive Accept header, so it cannot be " +
         "relied on today. discover() falls back to deriving accounts from one activity pull " +

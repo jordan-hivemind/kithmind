@@ -1,8 +1,8 @@
 // Credential-free proof of the session bridge the README describes:
 // attach over the Chrome DevTools Protocol to a Chrome the person is already
-// using, hook XMLHttpRequest.prototype.setRequestHeader inside the page,
-// and issue the adapter's fetches from page context so the app's own XSRF
-// and device-footprint headers ride along.
+// using, hook XMLHttpRequest.prototype.setRequestHeader and window.fetch
+// inside the page, and issue the adapter's fetches from page context so the
+// app's own XSRF, device-footprint and Authorization headers ride along.
 //
 // No login, no real institution, no dependency: Node 24 has fetch and a
 // global WebSocket, which is the whole CDP client. Run: node bridge-spike.mjs
@@ -44,6 +44,18 @@ function startApp() {
     }
     const xsrf = req.headers["x-xsrf-token"];
     const footprint = req.headers["x-device-footprint"];
+    const authorization = req.headers["authorization"];
+    if (req.url === "/api/documents") {
+      // The documents tier: the app sends a bearer here and nothing else will do.
+      if (!xsrf || !authorization) {
+        res.writeHead(401, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "Authentication Failed" }));
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ xsrf, authorization }));
+      return;
+    }
     if (!xsrf || !footprint) {
       // Exactly what the institution does to a request rebuilt from outside
       // the page: "Authentication Failed."
@@ -106,12 +118,24 @@ async function evaluate(cdp, expression) {
 // values out; the page re-applies them to its own fetches.
 
 const HOOK = `(() => {
-  const WANTED = ["x-xsrf-token", "x-device-footprint"];
+  const WANTED = ["x-xsrf-token", "x-device-footprint", "authorization"];
   const slot = (globalThis[Symbol.for(${JSON.stringify(CAPTURED)})] ??= {});
-  const original = XMLHttpRequest.prototype.setRequestHeader;
+  const capture = (name, value) => {
+    const canonical = String(name).toLowerCase();
+    if (value && WANTED.includes(canonical)) slot[canonical] = value;
+  };
+  const originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
   XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
-    if (WANTED.includes(String(name).toLowerCase())) slot[String(name)] = value;
-    return original.call(this, name, value);
+    capture(name, value);
+    return originalSetRequestHeader.call(this, name, value);
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = function (input, init) {
+    try {
+      const headers = new Headers((init && init.headers) || (input && input.headers) || undefined);
+      for (const name of WANTED) capture(name, headers.get(name));
+    } catch {}
+    return originalFetch.apply(this, arguments);
   };
 })()`;
 
@@ -158,33 +182,50 @@ try {
   await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source: HOOK });
   await cdp.send("Page.reload");
 
-  // 2. The app's own on-load XHR is what carries the headers.
+  // 2. The app's own on-load calls are what carry the headers: an XHR for
+  //    activity, and a fetch for documents, which is the one with the bearer.
   const appEcho = await until("the app's on-load XHR", () =>
     evaluate(cdp, "window.__onLoadEcho ?? null"),
+  );
+  const appDocumentsEcho = await until("the app's on-load documents fetch", () =>
+    evaluate(cdp, "window.__documentsEcho ?? null"),
   );
   const captured = await evaluate(
     cdp,
     `Object.keys(globalThis[Symbol.for(${JSON.stringify(CAPTURED)})] ?? {})`,
   );
-  assert.deepEqual(captured.map((n) => n.toLowerCase()).sort(), [
-    "x-device-footprint",
-    "x-xsrf-token",
-  ]);
+  assert.deepEqual(captured.sort(), ["authorization", "x-device-footprint", "x-xsrf-token"]);
 
   // 3. A fetch issued from page context with the captured headers is accepted
-  //    and echoes back the same values the app itself sent.
+  //    and echoes back the same values the app itself sent -- including the
+  //    documents bearer, which only the fetch wrapper could have captured.
   const bridgeEcho = await evaluate(cdp, pageFetch(origin, "/api/activity"));
   assert.equal(bridgeEcho, appEcho);
   assert.match(bridgeEcho, /^200 /);
 
-  // 4. The same request from outside the page is refused, which is why the
+  const bridgeDocumentsEcho = await evaluate(cdp, pageFetch(origin, "/api/documents"));
+  assert.equal(bridgeDocumentsEcho, appDocumentsEcho);
+  assert.match(bridgeDocumentsEcho, /^200 /);
+
+  // 4. The same requests from outside the page are refused, which is why the
   //    bridge exists at all.
   const outside = await fetch(`${origin}/api/activity`, { method: "POST", body: "{}" });
   assert.equal(outside.status, 401);
+  const outsideDocuments = await fetch(`${origin}/api/documents`, { method: "POST", body: "{}" });
+  assert.equal(outsideDocuments.status, 401);
+
+  // 5. Nothing but header *names* ever came back over the debugging
+  //    connection: the values the server echoed appear in no value the bridge
+  //    read out of the page.
+  const values = JSON.parse(appDocumentsEcho.slice(4));
+  for (const value of Object.values(values)) {
+    assert.equal(captured.some((name) => name.includes(value)), false);
+  }
 
   await cdp.close();
   console.log("captured header names:", captured.join(", "));
   console.log("page-context fetch   :", bridgeEcho.slice(0, 12) + "...");
+  console.log("documents fetch      :", bridgeDocumentsEcho.slice(0, 12) + "...");
   console.log("node-context fetch   :", outside.status, (await outside.json()).error);
   console.log("PASS");
 } catch (error) {

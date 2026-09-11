@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import adapter from "../src/adapter.mjs";
 import { createFixtureSession } from "../fixtures/session.mjs";
-import { STATEMENT_DOCS, CONFIRMATION_DOCS } from "../fixtures/documents.mjs";
+import { STATEMENT_DOCS, CONFIRMATION_DOCS, PAGINATED_STATEMENT_DOCS } from "../fixtures/documents.mjs";
 
 test("discover returns an exhaustive listing when the provider states a total for every doc type", async () => {
   const session = createFixtureSession({ documentsMode: "exhaustive" });
@@ -62,6 +62,36 @@ test("a document's externalId round-trips through acquire without a second docum
   const acquired = await adapter.acquire({ kind: "pdf_statement", session, externalId: statement.externalId });
   assert.equal(acquired.manifest.periodStart, statement.periodStart);
   assert.equal(acquired.manifest.periodEnd, statement.periodEnd);
+});
+
+test("the documents listing pages through to the provider's stated total", async () => {
+  const documentsPagesRequested = [];
+  const session = createFixtureSession({ documentsMode: "paginated", documentsPagesRequested });
+  const result = await adapter.discover(session);
+
+  assert.equal(result.documents.status, "exhaustive");
+  assert.equal(result.documents.items.length, PAGINATED_STATEMENT_DOCS.length + CONFIRMATION_DOCS.length);
+  // Three pages for the statements (two full, one partial), one for the
+  // confirmations -- never a conclusion drawn from page one alone.
+  assert.deepEqual(
+    documentsPagesRequested.filter((r) => r.docType === "Statements").map((r) => r.page),
+    ["1", "2", "3"],
+  );
+  assert.deepEqual(
+    documentsPagesRequested.filter((r) => r.docType !== "Statements").map((r) => r.page),
+    ["1"],
+  );
+});
+
+test("a document download that answers with an HTML page is refused, not retained", async () => {
+  const session = createFixtureSession({ documentDownloadHtml: true });
+  const { documents } = await adapter.discover(session);
+  const statement = documents.items.find((d) => d.kind === "pdf_statement");
+
+  await assert.rejects(
+    adapter.acquire({ kind: "pdf_statement", session, externalId: statement.externalId }),
+    /did not return a PDF/,
+  );
 });
 
 test("discover tolerates a documents pull failing outright (e.g. the missing Authorization bearer) and still returns accounts", async () => {

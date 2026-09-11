@@ -1,16 +1,19 @@
 // The session bridge (README, "How the session works"): attaches over the Chrome
 // DevTools Protocol to a Chrome tab a person is already signed in to,
 // installs a header-capture hook inside the page, reloads once, and issues
-// every fetch from *inside* that page so the app's own X-XSRF-TOKEN and
-// X-DEVICE-FOOTPRINT headers ride along. Proven credential-free against a
-// local page in ../spike/bridge-spike.mjs; this file is that same mechanism
-// wired to an AdapterSession and to Morgan Stanley's specific requests.
+// every fetch from *inside* that page so the app's own X-XSRF-TOKEN,
+// X-DEVICE-FOOTPRINT and Authorization headers ride along. Proven
+// credential-free against a local page in ../spike/bridge-spike.mjs; this
+// file is that same mechanism wired to an AdapterSession and to Morgan
+// Stanley's specific requests.
 //
 // No login, no navigation to a login form, no credential anywhere in this
 // file: the captured header *values* never cross the CDP boundary (see
 // fetchInPage below). If the capture slot is empty, every call throws and
 // tells the operator to open the Activity tab -- it never synthesizes a header
-// or drives the site's UI.
+// or drives the site's UI. The documents endpoints additionally need the
+// bearer the app sets only once its own Documents page has loaded, so they
+// throw their own named error naming that header, never its value.
 //
 // This module is exercised end to end only by the spike; nothing in the
 // test suite runs against the institution or a browser. The pure
@@ -18,7 +21,13 @@
 // their own fixture-only tests in test/bridge.test.mjs.
 
 const CAPTURED_HEADERS_SLOT = "kithmind.capturedHeaders";
-const WANTED_HEADERS = ["x-xsrf-token", "x-device-footprint"];
+/** The only header names that are ever captured, and the only ones this
+ * module ever names. `authorization` is the bearer the app obtains for its
+ * own documents calls; it is captured, stored and re-applied entirely inside
+ * the page, exactly like the other two. Exported for tests: names only, the
+ * values live nowhere in Node. */
+export const WANTED_HEADERS = ["x-xsrf-token", "x-device-footprint", "authorization"];
+const AUTHORIZATION_HEADER = "authorization";
 
 // --- pure request building (no CDP, no network, unit-testable) -------------
 
@@ -35,10 +44,10 @@ function randomActivityQueryIds() {
   return { requestId, seqId };
 }
 
-/** `RequestID=<uuid>&SeqID=<4 digits>`, per the confirmed accounts request --
- * a real UUID, unlike the activity endpoint's 8-hex-group format above.
- * Generated fresh per call, same as the activity ids. */
-function randomAccountsQueryIds() {
+/** `RequestID=<uuid>&SeqID=<4 digits>`, per the confirmed accounts and
+ * documents-list requests -- a real UUID, unlike the activity endpoint's
+ * 8-hex-group format above. Generated fresh per call, same as the activity ids. */
+function randomUuidQueryIds() {
   const requestId = crypto.randomUUID();
   const seqId = String(Math.floor(Math.random() * 10000)).padStart(4, "0");
   return { requestId, seqId };
@@ -73,34 +82,51 @@ export function buildActivityRequestBody(query = {}) {
   });
 }
 
+// The documents-list body *keys* are confirmed (endDate, pageNum, filters,
+// sortBy, startDate, TimeFrame), and so are the `filters` entry's fields
+// (DocType, DocSubType, KeyAccountNo). Which values TimeFrame accepts is not:
+// a caller-supplied period sends "Custom" alongside the explicit dates, and
+// everything else asks for the whole history. Confirm both on the first real
+// run rather than trusting them silently (README, "Documents listing").
+const MS_DOCUMENTS_TIMEFRAME_ALL = "All";
+const MS_DOCUMENTS_TIMEFRAME_CUSTOM = "Custom";
+
 /**
- * The documents-list POST body. The observed request names its
- * `filters` array fields (DocType, DocSubType, KeyAccountNo) and `TimeFrame`
- * but not the exact envelope beyond that, so this is the adapter's working
- * assumption for the request shape -- confirmed the same way as the response
- * envelope keys in src/adapter.mjs, by running it once and reading the error
- * or the result rather than trusting the guess silently.
+ * The documents-list POST body, built from the confirmed keys. `query`
+ * carries only logical request parameters (document type, account key, page
+ * number, dates) -- nothing here is a header, cookie or token.
  */
 export function buildDocumentsRequestBody(query = {}) {
+  const startDate = query.startDate ?? "";
+  const endDate = query.endDate ?? "";
   return JSON.stringify({
+    endDate,
+    pageNum: Number(query.page ?? "1"),
     filters: [
       { DocType: query.docType ?? "", DocSubType: query.docSubType ?? "", KeyAccountNo: query.keyAccount ?? "" },
     ],
-    TimeFrame: query.timeFrame ?? "All",
-    PageNumber: Number(query.page ?? "1"),
+    sortBy: query.sortBy ?? "",
+    startDate,
+    TimeFrame:
+      query.timeFrame ??
+      (startDate && endDate ? MS_DOCUMENTS_TIMEFRAME_CUSTOM : MS_DOCUMENTS_TIMEFRAME_ALL),
   });
 }
 
 /**
  * Endpoint routing for every logical path this adapter's `AdapterSession`
- * calls. Only the activity path is known; the rest
- * (documents, tabular export, per-document download, account list) are not,
- * so they are read from the environment with no guessed default -- an unset
- * one throws a clear, named error rather than silently posting to a made-up
- * URL. Confirm each real path during the first discover() run
+ * calls. The activity, accounts and documents-list paths are confirmed
+ * against the live site; the rest (tabular export, per-document download) are
+ * not, so they are read from the environment with no guessed default -- an
+ * unset one throws a clear, named error rather than silently posting to a
+ * made-up URL. Confirm each remaining path during the first discover() run
  * (README, "Operator runbook") and set it once in the operator's environment.
+ *
+ * `needsAuthorization` marks the endpoints the app only ever calls with its
+ * own bearer: the page-side fetch refuses them by name, before issuing the
+ * request, when that header has not been captured yet.
  */
-function resolveEndpoint(path, query) {
+export function resolveEndpoint(path, query) {
   if (path === "/activity") {
     const { requestId, seqId } = randomActivityQueryIds();
     return {
@@ -111,10 +137,13 @@ function resolveEndpoint(path, query) {
     };
   }
   if (path === "/documents") {
+    const { requestId, seqId } = randomUuidQueryIds();
     return {
       method: "POST",
-      url: requiredEnv("MS_DOCUMENTS_PATH"),
+      // Confirmed against the observed request (README, "Documents listing").
+      url: `/msoaz/api/acdsal/accountdocs/v2/searchItems?RequestID=${requestId}&SeqID=${seqId}`,
       body: buildDocumentsRequestBody(query),
+      needsAuthorization: true,
     };
   }
   if (path.startsWith("/documents/")) {
@@ -123,6 +152,7 @@ function resolveEndpoint(path, query) {
       method: "GET",
       url: `${requiredEnv("MS_DOCUMENT_DOWNLOAD_PATH_PREFIX")}${encodeURIComponent(externalId)}`,
       body: null,
+      needsAuthorization: true,
     };
   }
   if (path === "/export/tabular") {
@@ -133,7 +163,7 @@ function resolveEndpoint(path, query) {
     };
   }
   if (path === "/accounts") {
-    const { requestId, seqId } = randomAccountsQueryIds();
+    const { requestId, seqId } = randomUuidQueryIds();
     // Confirmed request shape -- see adapter.mjs's fetchAccountsFromEndpoint/
     // fetchAccountsFromActivityFallback doc comment: this still 403s from a
     // page-context fetch today, hence the fallback, but the request itself
@@ -210,15 +240,34 @@ async function evaluate(cdp, expression) {
   return result.value;
 }
 
-/** Installed once, before the tab's next navigation. Allowlisted by name;
- * stores values in a page-side slot the bridge never reads out of the page. */
+/** Installed once, before the tab's next navigation. Allowlisted by name --
+ * exactly WANTED_HEADERS, stored under those canonical lowercase names (HTTP
+ * header names are case-insensitive, and one key per header keeps two
+ * spellings of the same name from being sent as one combined value) -- in a
+ * page-side slot the bridge never reads values out of. Both mechanisms the app
+ * sets these headers with are wrapped: XMLHttpRequest, which carries them
+ * today, and fetch, in case the documents calls use it, so the bearer is
+ * captured either way. A captured value is written to the slot and nowhere
+ * else: not returned, not logged, not sent over the debugging connection. */
 const HEADER_HOOK = `(() => {
   const WANTED = ${JSON.stringify(WANTED_HEADERS)};
   const slot = (globalThis[Symbol.for(${JSON.stringify(CAPTURED_HEADERS_SLOT)})] ??= {});
-  const original = XMLHttpRequest.prototype.setRequestHeader;
+  const capture = (name, value) => {
+    const canonical = String(name).toLowerCase();
+    if (value && WANTED.includes(canonical)) slot[canonical] = value;
+  };
+  const originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
   XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
-    if (WANTED.includes(String(name).toLowerCase())) slot[String(name)] = value;
-    return original.call(this, name, value);
+    capture(name, value);
+    return originalSetRequestHeader.call(this, name, value);
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = function (input, init) {
+    try {
+      const headers = new Headers((init && init.headers) || (input && input.headers) || undefined);
+      for (const name of WANTED) capture(name, headers.get(name));
+    } catch {}
+    return originalFetch.apply(this, arguments);
   };
 })()`;
 
@@ -226,12 +275,22 @@ const HEADER_HOOK = `(() => {
  * headers out of the page-side slot and spreads them into the request, so
  * only the response body -- never a header value -- crosses the CDP
  * boundary back to Node. Throws in-page, with an instruction to open the
- * Activity tab, when the slot is still empty. */
-function pageFetchExpression(origin, { method, url, body, headers }) {
+ * Activity tab, when the slot is still empty, and -- for the documents
+ * endpoints, which the app only ever calls with its own bearer -- when that
+ * header has not been captured. Both errors name the header, never its
+ * value. Exported for tests. */
+export function pageFetchExpression(origin, { method, url, body, headers, needsAuthorization }) {
   return `(async () => {
     const slot = globalThis[Symbol.for(${JSON.stringify(CAPTURED_HEADERS_SLOT)})] ?? {};
     if (Object.keys(slot).length === 0) {
       throw new Error("no session headers captured yet: open the Activity tab in this Chrome window, then retry");
+    }
+    ${
+      needsAuthorization
+        ? `if (!(${JSON.stringify(AUTHORIZATION_HEADER)} in slot)) {
+      throw new Error("no Authorization bearer captured yet: the documents tier also needs the app's own Documents page to have been loaded once in this Chrome window -- open it, then retry");
+    }`
+        : ""
     }
     const response = await fetch(${JSON.stringify(origin)} + ${JSON.stringify(url)}, {
       method: ${JSON.stringify(method)},
