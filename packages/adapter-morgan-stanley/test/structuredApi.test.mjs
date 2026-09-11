@@ -218,3 +218,11 @@ test("every key a parsed row carries is one discover() reports, so it resolves d
     assert.ok(discovered.has(row.accountExternalKey), `${row.accountExternalKey} is not a discovered account`);
   }
 });
+
+test("a window before last year, or spanning years, is a Custom date-range pull", async () => {
+  const { selectDateRangeType } = await import("../src/adapter.mjs");
+  const y = new Date().getUTCFullYear();
+  assert.equal(selectDateRangeType(`${y - 3}-01-01`, `${y - 3}-12-31`), "Custom");
+  assert.equal(selectDateRangeType(`${y - 2}-06-01`, `${y - 1}-06-01`), "Custom");
+  assert.equal(selectDateRangeType(`${y - 1}-01-01`, `${y - 1}-12-31`), "LastYear");
+});

@@ -180,7 +180,7 @@ test("selectDateRangeType maps a window inside the prior calendar year to LastYe
   assert.equal(selectDateRangeType(`${thisYear - 1}-02-01`, `${thisYear - 1}-11-30`), "LastYear");
   // A window that also reaches back a further year is not covered by
   // LastYear and falls through to the existing YearToDate default.
-  assert.equal(selectDateRangeType(`${thisYear - 2}-06-01`, `${thisYear - 1}-11-30`), "YearToDate");
+  assert.equal(selectDateRangeType(`${thisYear - 2}-06-01`, `${thisYear - 1}-11-30`), "Custom");
 });
 
 test("overlapping items from Last12Months and the prior calendar year are merged once by documentId, and the reported total is the unique count", async () => {
