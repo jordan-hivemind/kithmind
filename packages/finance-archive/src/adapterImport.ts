@@ -830,6 +830,11 @@ async function collectDocuments(
     ...balanceGroups.keys(),
     ...liabilityGroups.keys(),
   ]);
+  // A document-tier pull the adapter could not parse (or a genuinely empty
+  // one) has no rows to group by, but the retained file still has to be
+  // recorded: otherwise nothing marks it acquired, a rerun downloads it
+  // again, and the parse note has nowhere to live. One record, no rows.
+  if (sourceDocuments.size === 0) sourceDocuments.add("document");
   const single = sourceDocuments.size === 1;
 
   const documents: ImportDocument[] = [];
