@@ -82,6 +82,12 @@ importers:
         specifier: ^4.1.10
         version: 4.1.10(@edge-runtime/vm@5.0.0)(@types/node@25.3.3)(vite@8.2.1(@types/node@25.3.3)(esbuild@0.27.0))
 
+  packages/adapter-morgan-stanley:
+    dependencies:
+      '@repo/finance-archive':
+        specifier: workspace:*
+        version: link:../finance-archive
+
   packages/convex:
     dependencies:
       '@auth/core':

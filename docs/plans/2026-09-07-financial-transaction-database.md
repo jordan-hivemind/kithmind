@@ -652,7 +652,9 @@ The code is public and MIT. The data is not in the repository at any point.
 
 Public: the store, schema and migrations; the adapter interface; adapter
 implementations and their synthetic fixtures; the importer, reconciliation gate
-and MCP server; the README and this plan.
+and MCP server; the README and this plan. The first adapter, Morgan Stanley,
+is public at `packages/adapter-morgan-stanley`; publishing an adapter is a
+per-adapter decision, not a blanket rule, so a later adapter may stay private.
 
 Outside the repository: the raw document tree, import logs, the Neon
 connection string and any credential, and

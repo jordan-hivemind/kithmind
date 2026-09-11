@@ -715,10 +715,13 @@ node dist/run.js \
 `--adapter` is a module with a default export, or a named `adapter` export,
 implementing `InstitutionAdapter`. `--session` is a module whose default
 export is a function that builds an `AdapterSession` for this run -- a real
-adapter's own browser bridge, kept out of this repository; the synthetic
-adapter's suite wraps `createSyntheticSession` the same way (see
-`test/run.test.mjs`). `--selection` is a JSON file naming what to acquire,
-because discovery alone does not say which of what it finds an operator
+adapter's own browser bridge. Publishing an institution adapter is a
+per-adapter decision: the first one, Morgan Stanley, is public at
+[`packages/adapter-morgan-stanley`](../adapter-morgan-stanley); other
+adapters may stay private. The synthetic adapter's suite wraps
+`createSyntheticSession` the same way (see `test/run.test.mjs`).
+`--selection` is a JSON file naming what to acquire, because discovery alone
+does not say which of what it finds an operator
 wants pulled this run:
 
 ```json
