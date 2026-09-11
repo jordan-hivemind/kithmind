@@ -109,28 +109,45 @@ off.
 
 ## Documents listing
 
-The listing paginates at about fifty rows with no total shown on screen. Two
-paths, in order of preference:
+The listing paginates at about fifty rows with no total shown on screen, and
+there is no "all time" value for `TimeFrame`, so this adapter queries one
+calendar year at a time for the seven most recent years
+(`documentTimeFrames()` in `src/adapter.mjs`) and combines the results.
 
-1. Use the underlying POST. Confirmed live: `POST
-   /msoaz/api/acdsal/accountdocs/v2/searchItems` with `RequestID` and `SeqID`
-   query parameters, and a body carrying `endDate`, `pageNum`, `filters`,
-   `sortBy`, `startDate` and `TimeFrame`, where each `filters` entry carries
-   `DocType`, `DocSubType` and `KeyAccountNo`. `pageNum` paginates and
-   `TimeFrame` follows the requested period (`Custom` with explicit dates,
-   otherwise the whole history) -- which values it accepts is not confirmed.
-   If the response states a total, paginate to that total and return
-   `exhaustiveListing(items, total)`.
-2. If no total is stated anywhere, paginate until a page returns fewer than the
-   page size and the next returns nothing, and still return
-   `incompleteListing(items, null, reason)`. The interface requires a
-   provider-stated number for exhaustive, and a count the pull arrived at is
-   the pull's own, not the provider's.
+Confirmed live 2026-09-11:
 
-Absence is never concluded from a single page. A second, independent check on
-statement coverage: statements are monthly, so per account the acquired period
-set must be a contiguous month sequence across the retention window. Any hole
-becomes a recorded gap rather than a silent absence.
+1. `POST /msoaz/api/acdsal/accountdocs/v2/searchItems` with `RequestID`
+   (eight groups of four hex characters, e.g.
+   `9dcc-c38e-8651-77c9-722a-51b4-b9f8-a90a`) and `SeqID` query parameters,
+   and a body carrying `endDate`, `pageNum` (a string), `filters`, `sortBy`,
+   `startDate` and `TimeFrame`. `filters` is an array of named entries --
+   `{ filterName: "KeyAccountNo", values: [...] }`, `{ filterName: "DocType",
+   values: ["ClientStatements" | "TradeConfirmations"] }` and `{ filterName:
+   "DocSubType", values: ["All"] }` -- and `sortBy` is `[{ fieldName:
+   "DocDate", sortOrder: "DESC" }, { fieldName: "KeyAccountNo", sortOrder:
+   "DESC" }]`. `pageNum` paginates within one calendar year. `TimeFrame`
+   takes `Last30Days`, `Last90Days`, `Last12Months` or a calendar year as a
+   string; a caller wanting an explicit range instead sends `TimeFrame:
+   "Custom"` alongside `startDate` and `endDate`.
+2. The response is `{ defaultDocumentList: [...], numFound: "<total, a
+   string>" }`. Each item carries `documentGuid`, `documentId`,
+   `documentTypeName`, `documentDisplayName`, `documentTitle`, `documentDate`
+   (an ISO datetime), `documentLoadDate`, `documentSource`, `docFormat`,
+   `byteLength`, `fileName`, `keyAccountNo`, `displayMultipleAccounts` and
+   `optionalAttributeList`. Within a year, if the response states a total,
+   this adapter paginates to that total; the totals for the seven years sum
+   to that document type's provider total.
+3. If any one year reports no total, that document type's whole pull stops
+   there and returns `incompleteListing(items, null, reason)` with whatever
+   years were already retrieved. The interface requires a provider-stated
+   number for exhaustive, and a count the pull arrived at on its own is not
+   the provider's.
+
+Absence is never concluded from a single page or a single year. A second,
+independent check on statement coverage: statements are monthly, so per
+account the acquired period set must be a contiguous month sequence across
+the retention window. Any hole becomes a recorded gap rather than a silent
+absence.
 
 ## Retention
 
@@ -232,17 +249,16 @@ Also returned by `capabilities().quirks`.
   `runningBalances` is confirmed a scalar and is retained by the allowlist,
   but not yet surfaced as `ParsedRow.runningBalance` (still always `null` in
   v1).
-- **Unconfirmed response shapes.** The documents-list and accounts JSON
-  envelopes, and the documents list's per-item field names, remain this
-  adapter's working assumption, not confirmed against a live response. See
-  the "Unconfirmed institution response shapes" comment block at the top of
-  `src/adapter.mjs`. Confirm each one on the first real
-  `discover()`/`acquire()` run:
-  - `MS_DOCUMENTS_ITEMS_KEY`, `MS_DOCUMENTS_TOTAL_KEY` and
-    `MS_ACCOUNTS_ITEMS_KEY`: `discover()` throws a named `missing "<key>"
-array` error against a real response if the guess is wrong (the accounts
-    error also lists the response's actual top-level key names, never
-    values). Fix the constant, not a downstream caller.
+- **Confirmed live 2026-09-11: the documents-list response.** The list is
+  `defaultDocumentList` (`MS_DOCUMENTS_ITEMS_KEY`) and the total is `numFound`
+  (`MS_DOCUMENTS_TOTAL_KEY`), a string. Per-item field names (`documentGuid`,
+  `documentTypeName`, `documentDate`, `keyAccountNo` and the rest -- see
+  "Documents listing" above) are confirmed the same way. The accounts JSON
+  envelope (`MS_ACCOUNTS_ITEMS_KEY`) remains this adapter's working
+  assumption, not confirmed against a live response: `discover()` throws a
+  named `missing "<key>" array` error listing the response's actual
+  top-level key names if the guess is wrong. Fix the constant, not a
+  downstream caller.
   - The per-document-download endpoint path is read from the environment with
     no guessed default. An unset one throws a clear error rather than getting
     a made-up URL.
@@ -271,9 +287,10 @@ array` error against a real response if the guess is wrong (the accounts
   30 days -- the full pull must revisit the real accounts endpoint once its
   response envelope is confirmed.
 - The documents list paginates at roughly 50 rows with no total shown on
-  screen. This adapter always paginates to the underlying POST's stated
-  total, or returns an `incompleteListing` -- never concludes absence from
-  one page (an earlier manual review wrongly concluded no Treasury purchases
+  screen, and takes one calendar year at a time (see "Documents listing"
+  above). This adapter always paginates to each year's stated total, or
+  returns an `incompleteListing` -- never concludes absence from one page or
+  one year (an earlier manual review wrongly concluded no Treasury purchases
   existed from page one alone).
 - `exportRanges.earliest` for `structured_api` and `tabular_export` is an
   approximation, the start of the last calendar year, not a provider-confirmed

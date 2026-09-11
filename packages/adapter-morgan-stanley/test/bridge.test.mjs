@@ -37,37 +37,63 @@ test("buildActivityRequestBody defaults page 1 and YearToDate when the caller om
 
 test("buildDocumentsRequestBody sends the confirmed body keys and nothing else", () => {
   const body = JSON.parse(
-    buildDocumentsRequestBody({ docType: "Statements", keyAccount: "MS-ACCT-0001", page: "3" }),
+    buildDocumentsRequestBody({ docType: "ClientStatements", keyAccount: "MS-ACCT-0001", page: "3" }),
   );
   assert.deepEqual(Object.keys(body).sort(), ["TimeFrame", "endDate", "filters", "pageNum", "sortBy", "startDate"].sort());
-  assert.equal(body.pageNum, 3);
-  assert.equal(body.filters.length, 1);
-  assert.deepEqual(Object.keys(body.filters[0]).sort(), ["DocSubType", "DocType", "KeyAccountNo"].sort());
-  assert.equal(body.filters[0].DocType, "Statements");
-  assert.equal(body.filters[0].KeyAccountNo, "MS-ACCT-0001");
+  // Confirmed live: pageNum is a string.
+  assert.equal(body.pageNum, "3");
+  // Confirmed live: filters are named entries, one each for KeyAccountNo,
+  // DocType and DocSubType, every one carrying its value(s) in `values`.
+  assert.equal(body.filters.length, 3);
+  assert.deepEqual(
+    body.filters.map((f) => f.filterName),
+    ["KeyAccountNo", "DocType", "DocSubType"],
+  );
+  assert.deepEqual(body.filters[0].values, ["MS-ACCT-0001"]);
+  assert.deepEqual(body.filters[1].values, ["ClientStatements"]);
+  assert.deepEqual(body.filters[2].values, ["All"]);
+  // Confirmed live: sortBy is an array, newest first by date then account.
+  assert.deepEqual(body.sortBy, [
+    { fieldName: "DocDate", sortOrder: "DESC" },
+    { fieldName: "KeyAccountNo", sortOrder: "DESC" },
+  ]);
   // No period requested, so the listing asks for the whole history.
   assert.equal(body.TimeFrame, "All");
   assert.equal(body.startDate, "");
 });
 
-test("buildDocumentsRequestBody takes its TimeFrame from the requested period", () => {
+test("buildDocumentsRequestBody defaults the KeyAccountNo and DocSubType filters to All", () => {
+  const body = JSON.parse(buildDocumentsRequestBody({ docType: "TradeConfirmations" }));
+  assert.deepEqual(body.filters[0].values, ["All"]);
+  assert.deepEqual(body.filters[2].values, ["All"]);
+  assert.equal(body.pageNum, "1");
+});
+
+test("buildDocumentsRequestBody carries an explicit TimeFrame -- Last30Days, Last90Days, Last12Months or a calendar year -- through unchanged", () => {
+  for (const timeFrame of ["Last30Days", "Last90Days", "Last12Months", "2025"]) {
+    const body = JSON.parse(buildDocumentsRequestBody({ docType: "ClientStatements", timeFrame }));
+    assert.equal(body.TimeFrame, timeFrame);
+  }
+});
+
+test("buildDocumentsRequestBody carries an explicit Custom TimeFrame alongside caller-supplied dates", () => {
   const body = JSON.parse(
-    buildDocumentsRequestBody({ docType: "Statements", startDate: "2025-01-01", endDate: "2025-03-31" }),
+    buildDocumentsRequestBody({ docType: "ClientStatements", timeFrame: "Custom", startDate: "2025-01-01", endDate: "2025-03-31" }),
   );
   assert.equal(body.TimeFrame, "Custom");
   assert.equal(body.startDate, "2025-01-01");
   assert.equal(body.endDate, "2025-03-31");
-  assert.equal(body.pageNum, 1);
 });
 
 test("the documents list posts to the confirmed path with a fresh RequestID and SeqID", () => {
-  const request = resolveEndpoint("/documents", { docType: "Statements" });
+  const request = resolveEndpoint("/documents", { docType: "ClientStatements" });
   assert.equal(request.method, "POST");
+  // Confirmed live: eight groups of four hex characters.
   assert.match(
     request.url,
-    /^\/msoaz\/api\/acdsal\/accountdocs\/v2\/searchItems\?RequestID=[0-9a-f-]{36}&SeqID=\d{4}$/,
+    /^\/msoaz\/api\/acdsal\/accountdocs\/v2\/searchItems\?RequestID=([0-9a-f]{4}-){7}[0-9a-f]{4}&SeqID=\d{4}$/,
   );
-  assert.notEqual(request.url, resolveEndpoint("/documents", { docType: "Statements" }).url);
+  assert.notEqual(request.url, resolveEndpoint("/documents", { docType: "ClientStatements" }).url);
 });
 
 test("the header allowlist is exactly three header names", () => {
@@ -111,7 +137,7 @@ test("the documents endpoints refuse by header name until the bearer is captured
 test("neither builder ever emits a header, cookie or token field", () => {
   const forbidden = /token|cookie|header|auth|secret|password/i;
   const activityBody = buildActivityRequestBody({ page: "1" });
-  const documentsBody = buildDocumentsRequestBody({ docType: "Statements" });
+  const documentsBody = buildDocumentsRequestBody({ docType: "ClientStatements" });
   assert.equal(forbidden.test(activityBody), false);
   assert.equal(forbidden.test(documentsBody), false);
 });

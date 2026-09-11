@@ -53,8 +53,8 @@ const PDF_MAGIC = "%PDF";
 //     reason instead of throwing. The per-item field names below are read
 //     straight off each row and are unconfirmed for the same reason.
 const MS_ACTIVITY_ROWS_KEY = "postedActivities";
-const MS_DOCUMENTS_ITEMS_KEY = "documents";
-const MS_DOCUMENTS_TOTAL_KEY = "totalCount";
+const MS_DOCUMENTS_ITEMS_KEY = "defaultDocumentList"; // confirmed live 2026-09-11
+const MS_DOCUMENTS_TOTAL_KEY = "numFound"; // confirmed live 2026-09-11 (a string)
 // The list is `Result.Accounts`.
 const MS_ACCOUNTS_ITEMS_KEY = "Accounts";
 
@@ -72,8 +72,8 @@ export {
 // CapabilityTier in the public interface; v1 does not invent one (see
 // capabilities().quirks).
 const DOCUMENT_TYPES = [
-  { docType: "Statements", kind: "pdf_statement" },
-  { docType: "Trade confirmations", kind: "trade_confirmation" },
+  { docType: "ClientStatements", kind: "pdf_statement" },
+  { docType: "TradeConfirmations", kind: "trade_confirmation" },
 ];
 
 // Signed direction for this institution's unsigned `quantity` magnitude.
@@ -423,52 +423,63 @@ async function fetchDocumentsForType(session, docType, kind) {
   }
 }
 
+/** Calendar years the documents service is asked for: seven years back through
+ * this year. Confirmed live 2026-09-11 that TimeFrame accepts a year as a
+ * string; there is no "all" value, so the window is covered year by year and
+ * exhaustiveness is judged per year against that year's numFound. */
+export function documentTimeFrames(now = new Date()) {
+  const thisYear = now.getUTCFullYear();
+  return Array.from({ length: 7 }, (_, i) => String(thisYear - 6 + i));
+}
+
+function documentPeriod(kind, documentDate) {
+  const day = String(documentDate ?? "").slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return { periodStart: day, periodEnd: day };
+  if (kind === "pdf_statement") return { periodStart: `${day.slice(0, 7)}-01`, periodEnd: day };
+  return { periodStart: day, periodEnd: day };
+}
+
 async function fetchDocumentsPages(session, docType, kind) {
   const items = [];
-  let providerTotal = null;
-  let pageNumber = 1;
-  for (;;) {
-    const pageText = await session.fetchText("/documents", {
-      docType,
-      timeFrame: "All",
-      page: String(pageNumber),
-    });
-    const page = JSON.parse(pageText);
-    const pageItems = page?.[MS_DOCUMENTS_ITEMS_KEY];
-    if (!Array.isArray(pageItems)) {
-      throw new Error(
-        `documents response for docType=${docType} has no "${MS_DOCUMENTS_ITEMS_KEY}" array ` +
-          "(see the \"Unconfirmed institution response shapes\" comment in src/adapter.mjs)",
-      );
+  let providerTotal = 0;
+  for (const timeFrame of documentTimeFrames()) {
+    let pageNumber = 1;
+    let yearTotal = null;
+    let yearCount = 0;
+    for (;;) {
+      const pageText = await session.fetchText("/documents", { docType, timeFrame, page: String(pageNumber) });
+      const page = JSON.parse(pageText);
+      const pageItems = page?.[MS_DOCUMENTS_ITEMS_KEY];
+      if (!Array.isArray(pageItems)) {
+        throw new Error(
+          `documents response for docType=${docType} has no "${MS_DOCUMENTS_ITEMS_KEY}" array; ` +
+            `top-level keys: ${Object.keys(page ?? {}).join(", ") || "(none)"}`,
+        );
+      }
+      const total = Number(page?.[MS_DOCUMENTS_TOTAL_KEY]);
+      if (Number.isFinite(total)) yearTotal = total;
+      for (const raw of pageItems) {
+        const { periodStart, periodEnd } = documentPeriod(kind, raw.documentDate);
+        const keyAccount = typeof raw.keyAccountNo === "string" ? raw.keyAccountNo : "";
+        items.push({
+          externalId: encodeDocumentExternalId(raw.documentGuid, keyAccount, periodStart, periodEnd),
+          kind,
+          periodStart,
+          periodEnd,
+          label: `${raw.documentTypeName ?? docType} ${periodEnd}`,
+          accountExternalKey: rowAccountExternalKey(keyAccount),
+        });
+        yearCount += 1;
+      }
+      if (yearTotal !== null && yearCount >= yearTotal) break;
+      if (pageItems.length < MS_DOCUMENTS_PAGE_SIZE) break;
+      pageNumber += 1;
+      if (pageNumber > MAX_DOCUMENTS_PAGES_PER_TYPE) {
+        return { docType, items, providerTotal: null, reason: `documents pull for docType=${docType} stopped: exceeded the safety page cap of ${MAX_DOCUMENTS_PAGES_PER_TYPE}` };
+      }
     }
-    const total = page?.[MS_DOCUMENTS_TOTAL_KEY];
-    if (typeof total === "number") providerTotal = total;
-    for (const raw of pageItems) {
-      items.push({
-        externalId: encodeDocumentExternalId(raw.externalId, raw.keyAccount, raw.periodStart, raw.periodEnd),
-        kind,
-        periodStart: raw.periodStart,
-        periodEnd: raw.periodEnd,
-        label: raw.label,
-        // F1-40. The same keyAccount already folded into externalId above
-        // (decodeDocumentExternalId recovers it at acquire time) -- also
-        // reported directly so run.ts can file this document's pull under
-        // the account it resolves to, same as rowAccountExternalKey does
-        // for an activity row.
-        accountExternalKey: rowAccountExternalKey(raw.keyAccount),
-      });
-    }
-    if (providerTotal !== null && items.length >= providerTotal) break;
-    if (providerTotal === null && pageItems.length < MS_DOCUMENTS_PAGE_SIZE) break;
-    pageNumber += 1;
-    if (pageNumber > MAX_DOCUMENTS_PAGES_PER_TYPE) {
-      return {
-        docType,
-        items,
-        providerTotal,
-        reason: `documents pull for docType=${docType} stopped: exceeded the safety page cap of ${MAX_DOCUMENTS_PAGES_PER_TYPE}`,
-      };
-    }
+    if (yearTotal === null) return { docType, items, providerTotal: null, reason: `documents pull for docType=${docType} timeFrame=${timeFrame} reported no total` };
+    providerTotal += yearTotal;
   }
   return { docType, items, providerTotal, reason: null };
 }
