@@ -243,7 +243,11 @@ async function connectCdp(wsUrl) {
 
 const EVALUATE_TIMEOUT_MS = 90_000;
 
-async function evaluate(cdp, expression) {
+// Exported for test/bridge.test.mjs only, to prove the deadline rejects by
+// name without a real CDP connection or a real 90-second wait (the test
+// drives it with a fake cdp and node:test's mock timers). Every other caller
+// still reaches it only through createMorganStanleySession, unchanged.
+export async function evaluate(cdp, expression) {
   // A page navigation or reload mid-call drops the reply to a pending
   // Runtime.evaluate, and without a deadline the operator command waits
   // forever with nothing in flight (seen live 2026-09-11). Fail by name

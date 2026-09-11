@@ -13,6 +13,10 @@ import { MS_DOCUMENTS_ITEMS_KEY, MS_DOCUMENTS_TOTAL_KEY, documentTimeFrames } fr
 const YEARS = documentTimeFrames();
 export const OLDEST_YEAR = YEARS[0];
 export const NEWER_YEAR = YEARS[1];
+// The calendar year immediately before "Last12Months" in documentTimeFrames()
+// -- the one whose listing the Last12Months query overlaps, per F1-42. Used
+// only by the overlap fixtures below.
+export const MOST_RECENT_YEAR = YEARS[YEARS.length - 2];
 
 function rawDocument({ documentGuid, documentTypeName, documentDate, keyAccountNo }) {
   return {
@@ -51,6 +55,25 @@ export const CONFIRMATION_DOCS = [
   // an empty string, so run.ts files this one institution-wide.
   rawDocument({ documentGuid: "DOC-CONF-0410", documentTypeName: "TradeConfirmations", documentDate: `${OLDEST_YEAR}-04-10T11:00:00.000Z`, keyAccountNo: undefined }),
 ];
+
+// The site can list the same document under both its own calendar year and
+// "Last12Months" (F1-42): OVERLAP_DOC is that one document, seen under
+// MOST_RECENT_YEAR and again under Last12Months with the same documentId.
+// LAST12MONTHS_ONLY_DOC is a second document Last12Months alone reports, so
+// the dedupe is proven to keep the non-overlapping item too, not just drop
+// the duplicate.
+export const OVERLAP_DOC = rawDocument({
+  documentGuid: "DOC-STMT-OVERLAP",
+  documentTypeName: "ClientStatements",
+  documentDate: `${MOST_RECENT_YEAR}-11-30T00:00:00.000Z`,
+  keyAccountNo: "MS-ACCT-0001",
+});
+export const LAST12MONTHS_ONLY_DOC = rawDocument({
+  documentGuid: "DOC-STMT-RECENT",
+  documentTypeName: "ClientStatements",
+  documentDate: `${MOST_RECENT_YEAR}-12-20T00:00:00.000Z`,
+  keyAccountNo: "MS-ACCT-0001",
+});
 
 /** One year's `/documents` response body. `numFound` is confirmed a string;
  * omitting it entirely (rather than sending "0") reproduces the provider
