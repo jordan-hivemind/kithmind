@@ -11,6 +11,10 @@
 // follows.
 
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import {
@@ -18,8 +22,17 @@ import {
   parseFinanceReadRequest,
 } from "@repo/finance-contract";
 
-import { archive, one, reader, skip } from "./helpers/pgArchive.mjs";
-import { serveFinanceRead } from "../dist/index.js";
+import { archive, count, one, reader, skip } from "./helpers/pgArchive.mjs";
+import {
+  adapterPullToImportDocuments,
+  createSyntheticSession,
+  importBatch,
+  openArchive,
+  persistAcquiredDocument,
+  resolveRawTreeRoot,
+  serveFinanceRead,
+  syntheticAdapter,
+} from "../dist/index.js";
 
 const SPACE = "space-synthetic-f121";
 const TRUSTED = {
@@ -541,4 +554,352 @@ test("an aggregate over more contributors than the contract carries offers a bre
   assert.equal(item.contributorRecordIds.length, 25);
   assert.ok(item.breakdown, "a shortened contributor list must carry a breakdown");
   assert.equal(item.total.decimal, "-30");
+});
+
+// --- F1-29: structured field evidence ---------------------------------------
+//
+// The tests above read a hand-seeded archive, which is the right shape for
+// coverage states and money edge cases and the wrong one for citations: a
+// citation is only worth anything if it resolves in bytes some adapter
+// actually retained. So these run the real composition -- the synthetic
+// adapter acquires, `persistAcquiredDocument` writes the retained bytes to a
+// throwaway raw tree, the importer lands the rows -- and then check every
+// returned citation twice: once against the response, and once against the
+// bytes on disk with no access to the archive database at all, which is
+// exactly what a consumer of the contract has.
+
+const ADAPTER = {
+  institution: {
+    id: "inst_thistlebrook",
+    name: "Thistlebrook Trust (synthetic)",
+    slug: "thistlebrook-trust",
+  },
+  // Two accounts, because the tabular export restates the same activity the
+  // structured API served: imported against one account the second tier
+  // deduplicates away by row hash, which is the importer working correctly
+  // and would leave this test with only one tier to check.
+  accounts: [
+    { id: "acct_synthetic", last4: "0142" },
+    { id: "acct_synthetic_export", last4: "0143" },
+  ],
+  spaceId: "space_synthetic_f129",
+};
+
+/** The media type each capability tier declares for what it retained. */
+const JSON_TIER = "application/json";
+const TABULAR_TIER = "text/csv; charset=utf-8";
+const PDF_TIER = "text/plain; charset=utf-8";
+
+/**
+ * Every synthetic tier acquired, persisted and imported into one archive.
+ * Returns the owner client plus the retained bytes' paths on disk, keyed by
+ * the same content hash a citation carries.
+ */
+async function importedPull(t) {
+  const directory = mkdtempSync(join(tmpdir(), "kith-finance-read-"));
+  const db = openArchive(join(directory, "archive.db"));
+  t.after(() => {
+    db.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  const rawTreeRoot = resolveRawTreeRoot({
+    FINANCE_ARCHIVE_RAW_TREE_ROOT: join(directory, "raw"),
+    FINANCE_ARCHIVE_SPACE_ID: ADAPTER.spaceId,
+  });
+
+  const client = await archive(t);
+  await client.query(
+    "INSERT INTO institutions (id, name, slug) VALUES ($1, $2, $3)",
+    [ADAPTER.institution.id, ADAPTER.institution.name, ADAPTER.institution.slug],
+  );
+  db.prepare("INSERT INTO institutions (id, name, slug) VALUES (?, ?, ?)").run(
+    ADAPTER.institution.id,
+    ADAPTER.institution.name,
+    ADAPTER.institution.slug,
+  );
+  for (const account of ADAPTER.accounts) {
+    await client.query(
+      `INSERT INTO accounts (id, institution_id, acct_last4, base_currency)
+       VALUES ($1, $2, $3, 'USD')`,
+      [account.id, ADAPTER.institution.id, account.last4],
+    );
+    db.prepare(
+      `INSERT INTO accounts (id, institution_id, acct_last4, base_currency)
+       VALUES (?, ?, ?, ?)`,
+    ).run(account.id, ADAPTER.institution.id, account.last4, "USD");
+  }
+
+  const session = createSyntheticSession();
+  const retainedPaths = new Map();
+  async function pull(selection, docType, docDate, accountId = ADAPTER.accounts[0].id) {
+    const acquired = await syntheticAdapter.acquire({ session, ...selection });
+    const { activity: rows, holdings } = await syntheticAdapter.parse({
+      kind: selection.kind,
+      bytes: acquired.bytes,
+    });
+    const persisted = persistAcquiredDocument(db, rawTreeRoot, {
+      institutionId: ADAPTER.institution.id,
+      accountId,
+      docType,
+      acquired,
+    });
+    retainedPaths.set(
+      persisted.documentWrite.sha256,
+      persisted.documentWrite.path,
+    );
+    const documents = await adapterPullToImportDocuments(client, {
+      institutionId: ADAPTER.institution.id,
+      accountId,
+      acquired,
+      rows,
+      holdings,
+      docType,
+      docDate,
+      persisted,
+    });
+    await importBatch(
+      client,
+      { source: ADAPTER.institution.slug, documents },
+      new Date("2025-05-01"),
+    );
+  }
+
+  await pull(
+    {
+      kind: "structured_api",
+      periodStart: "2025-01-01",
+      periodEnd: "2025-04-01",
+    },
+    "activity_pull",
+    null,
+  );
+  await pull(
+    {
+      kind: "tabular_export",
+      periodStart: "2025-01-01",
+      periodEnd: "2025-04-01",
+    },
+    "tabular_export",
+    "2025-04-01",
+    ADAPTER.accounts[1].id,
+  );
+  const { documents: discovered } = await syntheticAdapter.discover(session);
+  const statement = discovered.items.find(
+    (doc) => doc.kind === "pdf_statement",
+  );
+  await pull(
+    { kind: "pdf_statement", externalId: statement.externalId },
+    "pdf_statement",
+    statement.periodEnd,
+  );
+
+  // A verdict spanning everything the pull landed, so these responses report
+  // the state this suite is about -- rows withheld for want of a citation --
+  // rather than the unrelated "nothing vouches for this range" an
+  // unreconciled archive is always in.
+  const period = `least((SELECT min(process_date) FROM transactions),
+                        (SELECT min(as_of) FROM positions),
+                        (SELECT min(as_of) FROM balances)),
+                  greatest((SELECT max(process_date) FROM transactions),
+                           (SELECT max(as_of) FROM positions),
+                           (SELECT max(as_of) FROM balances))`;
+  for (const account of ADAPTER.accounts) {
+    await client.query(
+      `INSERT INTO reconciliations
+         (id, account_id, period_start, period_end, currency, status)
+       SELECT $2, $1, ${period}, 'USD', 'pass'`,
+      [account.id, `rec_${account.id}`],
+    );
+    await client.query(
+      `INSERT INTO position_reconciliations
+         (id, account_id, instrument_id, period_start, period_end, status)
+       SELECT $2, $1, (SELECT id FROM instruments ORDER BY id LIMIT 1),
+              ${period}, 'pass'`,
+      [account.id, `posrec_${account.id}`],
+    );
+  }
+  return { client, retainedPaths };
+}
+
+/** The retained bytes a citation names, checked against the citation's own
+ * hash and byte length before anything is read out of them. */
+function retainedBytesFor(retainedPaths, sourceObject) {
+  const path = retainedPaths.get(sourceObject.retainedSha256);
+  assert.ok(path, "a citation names retained bytes this pull actually wrote");
+  const bytes = readFileSync(path);
+  assert.equal(bytes.byteLength, sourceObject.retainedByteLength);
+  assert.equal(
+    createHash("sha256").update(bytes).digest("hex"),
+    sourceObject.retainedSha256,
+  );
+  return bytes;
+}
+
+/** An RFC 6901 pointer resolved against retained JSON, returning the target's
+ * exact source token -- what `json_pointer_v1` binds -- rather than a decoded
+ * value re-serialized back into one. */
+function resolveJsonPointer(bytes, pointer) {
+  const parsed = JSON.parse(
+    new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+    (_key, value, context) =>
+      context?.source === undefined ? value : context.source,
+  );
+  let node = parsed;
+  for (const escaped of pointer.slice(1).split("/")) {
+    const segment = escaped.replaceAll("~1", "/").replaceAll("~0", "~");
+    node = node[Array.isArray(node) ? Number(segment) : segment];
+  }
+  return node;
+}
+
+/** `delimited_row_v1` resolved against retained bytes: split, drop the
+ * header, index the physical data record, index the field. */
+function resolveDelimitedField(bytes, locator) {
+  const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  const records = text.split(locator.recordSeparator === "lf" ? "\n" : "\r\n");
+  // One trailing record separator at end of file does not create a record.
+  if (records.at(-1) === "") records.pop();
+  const record = records.slice(locator.headerRows)[locator.rowIndex];
+  assert.ok(record !== undefined, "the cited row exists in the retained bytes");
+  if (locator.headerRows === 1) {
+    assert.equal(
+      records[0].split(locator.delimiter)[locator.columnIndex],
+      locator.columnName,
+      "the cited column is the one the header names",
+    );
+  }
+  return record.split(locator.delimiter)[locator.columnIndex];
+}
+
+/** Every check a consumer can run with the retained bytes and nothing else. */
+function assertCitationResolves(retainedPaths, item) {
+  assert.equal(item.kind, "structured_field_v1");
+  assert.equal(
+    createHash("sha256").update(item.locator.rawValue, "utf8").digest("hex"),
+    item.locator.rawValueSha256,
+  );
+  const bytes = retainedBytesFor(retainedPaths, item.sourceObject);
+  const resolved =
+    item.locator.format === "json_pointer_v1"
+      ? resolveJsonPointer(bytes, item.locator.pointer)
+      : resolveDelimitedField(bytes, item.locator);
+  assert.equal(
+    resolved,
+    item.locator.rawValue,
+    "the cited datum must be the one actually at that position",
+  );
+}
+
+test("a cited record resolves in the retained bytes it names", { skip }, async (t) => {
+  const { client, retainedPaths } = await importedPull(t);
+  const r = await reader(t, client);
+  const response = await serve(r, { operation: "list_transactions", limit: 100 });
+
+  // Exactly the rows whose tier can bind a datum, cited once each.
+  const citable = await count(
+    client,
+    "transactions t JOIN documents d ON d.id = t.source_document_id",
+    "WHERE d.media_type = ANY($1)",
+    [[JSON_TIER, TABULAR_TIER]],
+  );
+  assert.ok(citable > 0, "the fixture still has citable rows");
+  assert.equal(response.items.length, citable);
+
+  const formats = new Set();
+  for (const item of response.items) {
+    assert.equal(item.evidence.length, 1);
+    const [evidence] = item.evidence;
+    assert.equal(evidence.evidenceId, `ev:${item.recordId}:amount`);
+    assert.equal(evidence.sourceObject.sourceId, ADAPTER.institution.slug);
+    assert.equal(
+      evidence.sourceObject.revisionId,
+      `sha256-${evidence.sourceObject.retainedSha256}`,
+    );
+    assertCitationResolves(retainedPaths, evidence);
+    formats.add(evidence.locator.format);
+  }
+  assert.deepEqual(
+    [...formats].sort(),
+    ["delimited_row_v1", "json_pointer_v1"],
+    "both bindable tiers are represented",
+  );
+  assert.ok(
+    !response.items.some(
+      (item) => item.evidence[0].sourceObject.mediaType === PDF_TIER,
+    ),
+    "the PDF tier binds nothing, so it is never cited",
+  );
+  assert.equal(response.completeness, "partial");
+  assert.ok(response.coverage.reasons.includes("retained_evidence_unavailable"));
+
+  // `get_evidence` for a returned record answers with that same item.
+  const [first] = response.items;
+  const evidence = await serve(r, {
+    operation: "get_evidence",
+    recordId: first.recordId,
+  });
+  assert.deepEqual(evidence.items, first.evidence);
+});
+
+test("PDF-tier holdings and balances stay withheld", { skip }, async (t) => {
+  const { client } = await importedPull(t);
+  const r = await reader(t, client);
+  for (const operation of ["list_holdings", "list_balances"]) {
+    const table = operation === "list_holdings" ? "positions" : "balances";
+    assert.ok(
+      (await count(client, table)) > 0,
+      `${table} has rows, so an empty page here is a withholding, not an empty table`,
+    );
+    const response = await serve(r, { operation, limit: 100 });
+    assert.equal(response.items.length, 0, operation);
+    assert.equal(response.completeness, "partial", operation);
+    assert.equal(response.coverage.status, "partial", operation);
+    assert.ok(
+      response.coverage.reasons.includes("retained_evidence_unavailable"),
+      operation,
+    );
+  }
+});
+
+test("a document whose retained bytes were never recorded cites nothing", { skip }, async (t) => {
+  const { client } = await importedPull(t);
+  const r = await reader(t, client);
+  const before = await serve(r, { operation: "list_transactions", limit: 100 });
+  // What a document imported before F1-29 looks like: four nulls, all or
+  // nothing, which is what the `documents` CHECK enforces.
+  await client.query(
+    `UPDATE documents
+        SET retained_sha256 = NULL, retained_byte_length = NULL,
+            media_type = NULL, capture_id = NULL
+      WHERE media_type = $1`,
+    [TABULAR_TIER],
+  );
+  const after = await serve(r, { operation: "list_transactions", limit: 100 });
+  assert.ok(after.items.length < before.items.length);
+  assert.ok(
+    after.items.every(
+      (item) => item.evidence[0].sourceObject.mediaType === JSON_TIER,
+    ),
+    "a row whose document names no bytes is withheld, never cited to nothing",
+  );
+  assert.ok(after.coverage.reasons.includes("retained_evidence_unavailable"));
+});
+
+test("a binding that disagrees with the stored amount withholds its row", { skip }, async (t) => {
+  const { client } = await importedPull(t);
+  const r = await reader(t, client);
+  const before = await serve(r, { operation: "list_transactions", limit: 100 });
+  const [target] = before.items;
+  // The stored value moves and the binding does not. The citation would still
+  // resolve in the retained bytes; it would just cite a different number than
+  // the row asserts, which is the wrong-bytes failure the cross-check exists
+  // to catch.
+  await client.query(
+    "UPDATE transactions SET amount = amount + 1 WHERE id = $1",
+    [target.recordId.slice("txn:".length)],
+  );
+  const after = await serve(r, { operation: "list_transactions", limit: 100 });
+  assert.equal(after.items.length, before.items.length - 1);
+  assert.ok(!after.items.some((item) => item.recordId === target.recordId));
+  assert.ok(after.coverage.reasons.includes("retained_evidence_unavailable"));
 });

@@ -18,8 +18,15 @@
 //      clean empty range as `complete`. This workstream has been burned once
 //      by a confident false negative.
 //
-// What the archive cannot satisfy today, stated here rather than approximated
-// (see `retainedTextSpanEvidence` below): the contract's evidence type.
+// A fourth, added by F1-29: a record is returned only when its load-bearing
+// money value can be cited inside the retained bytes it was parsed from (see
+// `evidenceFor` below). A record that cannot be is withheld with
+// `retained_evidence_unavailable` rather than returned beside a citation that
+// points at nothing, and the response says so through partial coverage. The
+// PDF tier has no such binding yet, so its rows stay withheld in full
+// (docs/plans/2026-09-11-structured-evidence.md, section 4).
+
+import { createHash } from "node:crypto";
 
 import type pg from "pg";
 
@@ -29,16 +36,25 @@ import {
   canonicalizeFinanceDecimal,
   type FinanceAccountId,
   type FinanceAggregateRecord,
+  type FinanceBalanceRecord,
+  type FinanceCaptureId,
   type FinanceCoverageRecord,
   type FinanceCoverageSummary,
   type FinanceCurrency,
   type FinanceDatasetRevision,
+  type FinanceDocumentId,
+  type FinanceEvidence,
+  type FinanceEvidenceId,
+  type FinanceHoldingRecord,
+  type FinanceInstrumentId,
   type FinanceReadRequest,
   type FinanceReadResponse,
   type FinanceRecordId,
   type FinanceRecordKind,
+  type FinanceRevisionId,
   type FinanceSourceId,
   type FinanceSpaceId,
+  type FinanceTransactionRecord,
   FinanceContractError,
   type GetCoverageRequest,
   type GetEvidenceRequest,
@@ -47,7 +63,8 @@ import {
   type ListTransactionsRequest,
   parseFinanceCurrency,
   parseFinanceReadResponseShape,
-  type RetainedTextSpanEvidence,
+  type RetainedSourceObject,
+  type StructuredFieldLocator,
   SUPPORTED_FINANCE_CURRENCIES,
 } from "@repo/finance-contract";
 
@@ -79,42 +96,235 @@ type WithholdReason =
   | "failed_import"
   | "stale_source";
 
+// --- evidence ---------------------------------------------------------------
+//
+// The contract requires at least one evidence item on every transaction,
+// holding and balance record, so a record whose evidence cannot be built
+// cannot be returned at all. The choice is between fabricating a citation to
+// fill the shape and withholding the record. A fabricated citation on a
+// financial figure is the worst failure this archive has, so such records are
+// withheld, and every response that withholds one says so: coverage carries
+// `retained_evidence_unavailable` and completeness is `partial`. A caller can
+// still see that rows *matched* -- `truncated` and the coverage reason
+// together say "there is something here you cannot cite yet", which is not
+// the same claim as absence.
+
+/** The four `documents` provenance columns, plus the joined identities, that
+ * every citable row selects. Written for a query that aliases the document
+ * `d` and the institution `i`. */
+const EVIDENCE_COLUMNS = `i.slug,
+            d.id AS document_id, d.retained_sha256,
+            d.retained_byte_length::text AS retained_byte_length,
+            d.media_type, d.capture_id`;
+
+/** What `EVIDENCE_COLUMNS` and a record's own money columns select. */
+type EvidenceRow = {
+  slug: string;
+  money: string | null;
+  currency: string | null;
+  source_document_id: string | null;
+  source_locator: string | null;
+  document_id: string | null;
+  retained_sha256: string | null;
+  retained_byte_length: string | null;
+  media_type: string | null;
+  capture_id: string | null;
+};
+
+/** The media types the contract's `RetainedSourceObject` can carry. A
+ * document declaring anything else names bytes no consumer of this contract
+ * knows how to read, so it is not cited. */
+const RETAINED_MEDIA_TYPES = new Set<string>([
+  "application/pdf",
+  "application/json",
+  "text/csv; charset=utf-8",
+  "text/plain; charset=utf-8",
+]);
+
 /**
- * **The archive cannot produce the contract's evidence type today.**
+ * The immutable retained bytes this row's data was parsed from, or null when
+ * the archive cannot name them.
  *
- * `RetainedTextSpanEvidence` is a character span inside a retained text blob:
- * it requires `start`, `end`, `quote` and `quoteSha256` in Unicode code
- * points, plus `textSha256`, `textByteLength`, `textCodepointLength`,
- * `retainedByteLength`, `mediaType`, `revisionId` and `captureId`.
+ * All four provenance columns or none: `documents` carries a CHECK saying so,
+ * and a document imported before that migration has four nulls, which is the
+ * honest answer for bytes whose identity was never recorded.
  *
- * What the archive has is `documents.sha256`, `documents.file_path`,
- * `documents.text_path`, and a `source_locator` that adapters fill with
- * `FieldLocator` values -- a capability tier, a row index or page number, and
- * a column label. A row index is not a character offset, and no code in this
- * package has ever produced one. `documents` carries no byte length and no
- * media type, and capture and revision identity live in the raw tree's
- * capture manifests on the always-on machine's filesystem, which the read
- * surface does not have.
- *
- * The contract requires at least one evidence item on every transaction,
- * holding and balance record, so a record whose evidence cannot be built
- * cannot be returned at all. The choice is between fabricating a quote to
- * fill the shape and withholding the record. A fabricated citation on a
- * financial figure is the worst failure this archive has, so records are
- * withheld, and every response that withholds one says so: coverage carries
- * `retained_evidence_unavailable` and completeness is `partial`. A caller can
- * still see that rows *matched* -- `truncated` and the coverage reason
- * together say "there is something here you cannot cite yet", which is not
- * the same claim as absence.
- *
- * Closing this needs three things outside F1-21's scope: character-offset
- * locators from the parsers, retained byte length and media type on
- * `documents`, and capture and revision identity reachable from the database.
- * When they exist, this function is where they are assembled and the three
- * list operations start returning rows with no other change here.
+ * `revisionId` is derived rather than stored. One revision is one immutable
+ * retained byte object, which `retained_sha256` already identifies, so a
+ * stored column would be a second copy of one value. Every page row of a
+ * paginated pull therefore shares a revision and differs by document id,
+ * which is the correct reading: one byte revision, several row slices of it.
  */
-function retainedTextSpanEvidence(): RetainedTextSpanEvidence[] | null {
+function documentOf(row: EvidenceRow): RetainedSourceObject | null {
+  if (
+    row.source_document_id === null ||
+    row.document_id === null ||
+    row.retained_sha256 === null ||
+    row.retained_byte_length === null ||
+    row.media_type === null ||
+    row.capture_id === null ||
+    !RETAINED_MEDIA_TYPES.has(row.media_type)
+  )
+    return null;
+  const retainedByteLength = Number(row.retained_byte_length);
+  if (!Number.isSafeInteger(retainedByteLength) || retainedByteLength < 1)
+    return null;
+  return {
+    sourceId: row.slug as FinanceSourceId,
+    documentId: row.document_id as FinanceDocumentId,
+    revisionId: `sha256-${row.retained_sha256}` as FinanceRevisionId,
+    captureId: row.capture_id as FinanceCaptureId,
+    retainedSha256: row.retained_sha256,
+    retainedByteLength,
+    mediaType: row.media_type as RetainedSourceObject["mediaType"],
+  };
+}
+
+/**
+ * The `FieldBinding` an adapter recorded on this record's `source_locator`.
+ *
+ * A parser emits at most one binding per record, on the record's load-bearing
+ * money field, so the first one found is that field's. Which locator key it
+ * sits under is not what makes it the right datum -- `evidenceFor` proves
+ * that by comparing the bound token to the stored money value.
+ */
+function bindingOf(sourceLocator: string | null): unknown {
+  if (sourceLocator === null) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(sourceLocator);
+  } catch {
+    // A `source_locator` that is not JSON carries no binding to read, which
+    // is a withheld row rather than a failed response.
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object") return null;
+  for (const locator of Object.values(parsed as Record<string, unknown>)) {
+    if (locator !== null && typeof locator === "object" && "binding" in locator)
+      return (locator as { binding: unknown }).binding;
+  }
   return null;
+}
+
+/**
+ * A stored binding as a contract locator, or null when it is not one.
+ *
+ * Rebuilt field by field rather than spread: `source_locator` is JSON in a
+ * TEXT column, and a key that does not belong in the locator must not travel
+ * into a response the contract's parser would then reject whole. A binding
+ * that does not check out withholds its own row, exactly as no binding does.
+ */
+function structuredLocator(value: unknown): StructuredFieldLocator | null {
+  if (value === null || typeof value !== "object") return null;
+  const binding = value as Record<string, unknown>;
+  const rawValue = binding.rawValue;
+  if (typeof rawValue !== "string" || rawValue.length === 0) return null;
+  const rawValueSha256 = createHash("sha256")
+    .update(rawValue, "utf8")
+    .digest("hex");
+  if (binding.format === "json_pointer_v1") {
+    const pointer = binding.pointer;
+    return typeof pointer === "string"
+      ? { format: "json_pointer_v1", pointer, rawValue, rawValueSha256 }
+      : null;
+  }
+  if (binding.format !== "delimited_row_v1") return null;
+  const { delimiter, quote, headerRows, recordSeparator } = binding;
+  const { rowIndex, columnIndex, columnName } = binding;
+  if (
+    binding.encoding !== "utf-8" ||
+    (delimiter !== "," &&
+      delimiter !== "\t" &&
+      delimiter !== ";" &&
+      delimiter !== "|") ||
+    (quote !== '"' && quote !== "none") ||
+    (headerRows !== 0 && headerRows !== 1) ||
+    (recordSeparator !== "lf" && recordSeparator !== "crlf") ||
+    typeof rowIndex !== "number" ||
+    !Number.isSafeInteger(rowIndex) ||
+    typeof columnIndex !== "number" ||
+    !Number.isSafeInteger(columnIndex) ||
+    typeof columnName !== "string"
+  )
+    return null;
+  return {
+    format: "delimited_row_v1",
+    encoding: "utf-8",
+    delimiter,
+    quote,
+    headerRows,
+    recordSeparator,
+    rowIndex,
+    columnIndex,
+    columnName,
+    rawValue,
+    rawValueSha256,
+  };
+}
+
+/**
+ * Whether the bound token and the stored money value are the same number.
+ *
+ * The comparison is canonical decimal equality, never float equality: a
+ * `json_pointer_v1` binding cites the exact JSON source token, which for a
+ * string target arrives with its quotes, and `1200.00` and `1200` are one
+ * value written two ways. A disagreement means the locator points at a datum
+ * that is not the one this row asserts, which is precisely the wrong-bytes
+ * citation this work exists to prevent, so the row is withheld instead.
+ */
+function bindingAgrees(
+  rawValue: string,
+  money: CanonicalFinanceDecimal,
+): boolean {
+  let token = rawValue;
+  if (token.startsWith('"')) {
+    try {
+      const decoded: unknown = JSON.parse(token);
+      if (typeof decoded !== "string") return false;
+      token = decoded;
+    } catch {
+      return false;
+    }
+  }
+  try {
+    return canonicalizeFinanceDecimal(token) === money;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * One record's evidence, or null when the archive cannot cite it.
+ *
+ * Null -- and a row withheld with `retained_evidence_unavailable` -- whenever
+ * any of these is missing or unusable: the source document, any of its four
+ * retained-provenance columns, a parsable `source_locator`, a binding on the
+ * record's load-bearing money field, a usable money value and currency for
+ * that field, or agreement between the two.
+ */
+function evidenceFor(
+  record: {
+    recordId: FinanceRecordId;
+    field: string;
+    money: CanonicalFinanceDecimal | null;
+    currency: FinanceCurrency | null;
+    sourceLocator: string | null;
+  },
+  document: RetainedSourceObject | null,
+): FinanceEvidence[] | null {
+  if (document === null || record.money === null || record.currency === null)
+    return null;
+  const locator = structuredLocator(bindingOf(record.sourceLocator));
+  if (locator === null || !bindingAgrees(locator.rawValue, record.money))
+    return null;
+  return [
+    {
+      kind: "structured_field_v1",
+      evidenceId: `ev:${record.recordId}:${record.field}` as FinanceEvidenceId,
+      sourceObject: document,
+      locator,
+    },
+  ];
 }
 
 type ReadScope = {
@@ -292,7 +502,7 @@ function envelope(
 
 // --- list operations --------------------------------------------------------
 
-type ListRow = {
+type ListRow = EvidenceRow & {
   id: string;
   account_id: string;
   ordinal: string;
@@ -301,33 +511,184 @@ type ListRow = {
 /**
  * Runs one page of a list operation and reports how much of it survived.
  *
- * Every list operation withholds every row today, for the reason
- * `retainedTextSpanEvidence` gives. The query still runs and the page is
- * still bounded, because "rows matched but none can be cited" and "no row
- * matched" are different answers and a caller has to be able to tell them
- * apart.
+ * A row that `itemOf` cannot build is dropped from the page but not from the
+ * page's bounds: the query still runs and the cursor still advances over it,
+ * because "rows matched but none can be cited" and "no row matched" are
+ * different answers and a caller has to be able to tell them apart.
  */
-async function listPage(
+async function listPage<Row extends ListRow, Item>(
   client: pg.ClientBase,
   scope: ReadScope,
   sql: string,
   values: unknown[],
   limit: number,
-): Promise<{ truncated: boolean; nextCursor: string | undefined }> {
-  const result = await client.query<ListRow>(sql, [...values, limit + 1]);
+  itemOf: (row: Row, scope: ReadScope) => Item | null,
+): Promise<{
+  items: Item[];
+  truncated: boolean;
+  nextCursor: string | undefined;
+}> {
+  const result = await client.query<Row>(sql, [...values, limit + 1]);
   const rows = result.rows;
   const page = rows.slice(0, limit);
-  for (const _row of page) {
-    if (retainedTextSpanEvidence() === null) {
-      scope.withheld.add("retained_evidence_unavailable");
-    }
+  const items: Item[] = [];
+  for (const row of page) {
+    const item = itemOf(row, scope);
+    if (item !== null) items.push(item);
   }
   const truncated = rows.length > limit;
   const last = page[page.length - 1];
   return {
+    items,
     truncated,
     nextCursor:
       truncated && last ? encodeCursor([last.ordinal, last.id]) : undefined,
+  };
+}
+
+type TransactionRow = ListRow & {
+  activity_type: string;
+  description: string;
+  quantity: string | null;
+  price: string | null;
+};
+
+type HoldingRow = ListRow & {
+  instrument_id: string | null;
+  quantity: string | null;
+  price: string | null;
+  cost_basis: string | null;
+  valuation_basis: string | null;
+};
+
+type BalanceRow = ListRow & { cash: string | null };
+
+function transactionItem(
+  row: TransactionRow,
+  scope: ReadScope,
+): FinanceTransactionRecord | null {
+  const recordId = `txn:${row.id}` as FinanceRecordId;
+  const decimal = decimalOrNull(row.money, scope);
+  const currency = currencyOrNull(row.currency, scope);
+  const evidence = evidenceFor(
+    {
+      recordId,
+      field: "amount",
+      money: decimal,
+      currency,
+      sourceLocator: row.source_locator,
+    },
+    documentOf(row),
+  );
+  if (evidence === null || decimal === null || currency === null) {
+    scope.withheld.add("retained_evidence_unavailable");
+    return null;
+  }
+  const quantity = decimalOrNull(row.quantity, scope);
+  const price = decimalOrNull(row.price, scope);
+  return {
+    recordId,
+    accountId: row.account_id as FinanceAccountId,
+    occurredOn: row.ordinal,
+    activityType: row.activity_type,
+    description: row.description,
+    amount: { decimal, currency },
+    ...(quantity === null ? {} : { quantity }),
+    ...(price === null ? {} : { price: { decimal: price, currency } }),
+    evidence,
+  };
+}
+
+function holdingItem(
+  row: HoldingRow,
+  scope: ReadScope,
+): FinanceHoldingRecord | null {
+  const recordId = `pos:${row.id}` as FinanceRecordId;
+  const decimal = decimalOrNull(row.money, scope);
+  const currency = currencyOrNull(row.currency, scope);
+  const evidence = evidenceFor(
+    {
+      recordId,
+      field: "marketValue",
+      money: decimal,
+      currency,
+      sourceLocator: row.source_locator,
+    },
+    documentOf(row),
+  );
+  if (evidence === null || decimal === null || currency === null) {
+    scope.withheld.add("retained_evidence_unavailable");
+    return null;
+  }
+  const quantity = decimalOrNull(row.quantity, scope);
+  const basis = row.valuation_basis;
+  if (
+    row.instrument_id === null ||
+    quantity === null ||
+    basis === null ||
+    !VALUATION_BASES.has(basis)
+  ) {
+    // A holding with no instrument, no quantity or no stated valuation basis
+    // cannot be a contract record at all: a total-assets query over one would
+    // mix marked securities with positions carried at cost. Withheld as an
+    // unsupported value, which is what it is -- the citation is fine.
+    scope.withheld.add("unsupported_value");
+    return null;
+  }
+  const price = decimalOrNull(row.price, scope);
+  const costBasis = decimalOrNull(row.cost_basis, scope);
+  return {
+    recordId,
+    accountId: row.account_id as FinanceAccountId,
+    instrumentId: row.instrument_id as FinanceInstrumentId,
+    asOf: row.ordinal,
+    quantity,
+    valuationBasis: basis as FinanceHoldingRecord["valuationBasis"],
+    ...(price === null ? {} : { price: { decimal: price, currency } }),
+    marketValue: { decimal, currency },
+    ...(costBasis === null
+      ? {}
+      : { costBasis: { decimal: costBasis, currency } }),
+    evidence,
+  };
+}
+
+const VALUATION_BASES = new Set<string>([
+  "market_price",
+  "last_round",
+  "cost",
+  "reported_nav",
+]);
+
+function balanceItem(
+  row: BalanceRow,
+  scope: ReadScope,
+): FinanceBalanceRecord | null {
+  const recordId = `bal:${row.id}` as FinanceRecordId;
+  const decimal = decimalOrNull(row.money, scope);
+  const currency = currencyOrNull(row.currency, scope);
+  const evidence = evidenceFor(
+    {
+      recordId,
+      field: "totalValue",
+      money: decimal,
+      currency,
+      sourceLocator: row.source_locator,
+    },
+    documentOf(row),
+  );
+  if (evidence === null || decimal === null || currency === null) {
+    scope.withheld.add("retained_evidence_unavailable");
+    return null;
+  }
+  const cash = decimalOrNull(row.cash, scope);
+  return {
+    recordId,
+    accountId: row.account_id as FinanceAccountId,
+    asOf: row.ordinal,
+    totalValue: { decimal, currency },
+    ...(cash === null ? {} : { cash: { decimal: cash, currency } }),
+    evidence,
   };
 }
 
@@ -354,10 +715,14 @@ async function listTransactions(
   const page = await listPage(
     client,
     scope,
-    `SELECT t.id, t.account_id, t.process_date AS ordinal
+    `SELECT t.id, t.account_id, t.process_date::text AS ordinal,
+            t.activity_type, t.description, t.amount AS money, t.currency,
+            t.quantity, t.price, t.source_document_id, t.source_locator,
+            ${EVIDENCE_COLUMNS}
        FROM transactions t
        JOIN accounts a ON a.id = t.account_id
        JOIN institutions i ON i.id = a.institution_id
+       LEFT JOIN documents d ON d.id = t.source_document_id
       WHERE ($1::text IS NULL OR i.slug = $1)
         AND ($2::text IS NULL OR t.account_id = $2)
         AND ($3::text IS NULL OR t.currency = $3)
@@ -376,6 +741,7 @@ async function listTransactions(
       afterId,
     ],
     request.limit,
+    transactionItem,
   );
   await foldScopeCoverage(client, scope, {
     ...(request.sourceId === undefined ? {} : { sourceId: request.sourceId }),
@@ -388,7 +754,7 @@ async function listTransactions(
   return {
     ...envelope(scope, "list_transactions", page.truncated, page.nextCursor),
     operation: "list_transactions",
-    items: [],
+    items: page.items,
   } as FinanceReadResponse;
 }
 
@@ -401,10 +767,15 @@ async function listHoldings(
   const page = await listPage(
     client,
     scope,
-    `SELECT p.id, p.account_id, p.as_of AS ordinal
+    `SELECT p.id, p.account_id, p.as_of::text AS ordinal,
+            p.instrument_id, p.quantity, p.price, p.market_value AS money,
+            p.cost_basis, p.currency, p.valuation_basis,
+            p.source_document_id, p.source_locator,
+            ${EVIDENCE_COLUMNS}
        FROM positions p
        JOIN accounts a ON a.id = p.account_id
        JOIN institutions i ON i.id = a.institution_id
+       LEFT JOIN documents d ON d.id = p.source_document_id
       WHERE ($1::text IS NULL OR i.slug = $1)
         AND ($2::text IS NULL OR p.account_id = $2)
         AND ($3::date IS NULL OR p.as_of <= $3::date)
@@ -419,6 +790,7 @@ async function listHoldings(
       afterId,
     ],
     request.limit,
+    holdingItem,
   );
   await foldScopeCoverage(client, scope, {
     ...(request.sourceId === undefined ? {} : { sourceId: request.sourceId }),
@@ -428,7 +800,7 @@ async function listHoldings(
   return {
     ...envelope(scope, "list_holdings", page.truncated, page.nextCursor),
     operation: "list_holdings",
-    items: [],
+    items: page.items,
   } as FinanceReadResponse;
 }
 
@@ -441,10 +813,14 @@ async function listBalances(
   const page = await listPage(
     client,
     scope,
-    `SELECT b.id, b.account_id, b.as_of AS ordinal
+    `SELECT b.id, b.account_id, b.as_of::text AS ordinal,
+            b.total_value AS money, b.cash, b.currency,
+            b.source_document_id, b.source_locator,
+            ${EVIDENCE_COLUMNS}
        FROM balances b
        JOIN accounts a ON a.id = b.account_id
        JOIN institutions i ON i.id = a.institution_id
+       LEFT JOIN documents d ON d.id = b.source_document_id
       WHERE ($1::text IS NULL OR i.slug = $1)
         AND ($2::text IS NULL OR b.account_id = $2)
         AND ($3::date IS NULL OR b.as_of >= $3::date)
@@ -461,6 +837,7 @@ async function listBalances(
       afterId,
     ],
     request.limit,
+    balanceItem,
   );
   await foldScopeCoverage(client, scope, {
     ...(request.sourceId === undefined ? {} : { sourceId: request.sourceId }),
@@ -473,7 +850,7 @@ async function listBalances(
   return {
     ...envelope(scope, "list_balances", page.truncated, page.nextCursor),
     operation: "list_balances",
-    items: [],
+    items: page.items,
   } as FinanceReadResponse;
 }
 
@@ -650,10 +1027,15 @@ async function aggregateMoney(
 
 // --- get_evidence -----------------------------------------------------------
 
-const RECORD_TABLES: Readonly<Record<string, string>> = Object.freeze({
-  txn: "transactions",
-  pos: "positions",
-  bal: "balances",
+/** Each record kind's table, its load-bearing money column, and the contract
+ * field name that column fills. Frozen and keyed by the id prefix this
+ * surface itself mints: nothing a caller sends reaches the SQL below. */
+const RECORD_TABLES: Readonly<
+  Record<string, { table: string; money: string; field: string } | undefined>
+> = Object.freeze({
+  txn: { table: "transactions", money: "amount", field: "amount" },
+  pos: { table: "positions", money: "market_value", field: "marketValue" },
+  bal: { table: "balances", money: "total_value", field: "totalValue" },
 });
 
 async function getEvidence(
@@ -662,26 +1044,46 @@ async function getEvidence(
   request: GetEvidenceRequest,
 ): Promise<FinanceReadResponse> {
   const separator = request.recordId.indexOf(":");
-  const table = RECORD_TABLES[request.recordId.slice(0, separator)];
+  const record = RECORD_TABLES[request.recordId.slice(0, separator)];
   const id = request.recordId.slice(separator + 1);
-  if (!table || id.length === 0) {
+  let items: FinanceEvidence[] = [];
+  if (!record || id.length === 0) {
     // Not a record id this surface mints. Absence of evidence for an id the
     // archive has never heard of is a coverage gap, not a citation-free row.
     scope.withheld.add("source_gap");
   } else {
-    const found = await client.query<{ id: string }>(
-      `SELECT id FROM ${table} WHERE id = $1`,
+    const found = await client.query<EvidenceRow>(
+      `SELECT r.${record.money} AS money, r.currency,
+              r.source_document_id, r.source_locator,
+              ${EVIDENCE_COLUMNS}
+         FROM ${record.table} r
+         JOIN accounts a ON a.id = r.account_id
+         JOIN institutions i ON i.id = a.institution_id
+         LEFT JOIN documents d ON d.id = r.source_document_id
+        WHERE r.id = $1`,
       [id],
     );
-    scope.withheld.add(
-      found.rowCount ? "retained_evidence_unavailable" : "source_gap",
-    );
+    const row = found.rows[0];
+    const evidence = row
+      ? evidenceFor(
+          {
+            recordId: request.recordId,
+            field: record.field,
+            money: decimalOrNull(row.money, scope),
+            currency: currencyOrNull(row.currency, scope),
+            sourceLocator: row.source_locator,
+          },
+          documentOf(row),
+        )
+      : null;
+    if (evidence !== null) items = evidence;
+    else scope.withheld.add(row ? "retained_evidence_unavailable" : "source_gap");
   }
   return {
     ...envelope(scope, "get_evidence", false, undefined),
     operation: "get_evidence",
     recordId: request.recordId,
-    items: [],
+    items,
   } as FinanceReadResponse;
 }
 
