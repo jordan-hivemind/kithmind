@@ -48,7 +48,7 @@ function randomActivityQueryIds() {
  * documents-list requests -- a real UUID, unlike the activity endpoint's
  * 8-hex-group format above. Generated fresh per call, same as the activity ids. */
 function randomUuidQueryIds() {
-  const requestId = crypto.randomUUID();
+  const requestId = Array.from({ length: 8 }, () => Math.floor(Math.random() * 65536).toString(16).padStart(4, "0")).join("-");
   const seqId = String(Math.floor(Math.random() * 10000)).padStart(4, "0");
   return { requestId, seqId };
 }
@@ -97,19 +97,26 @@ const MS_DOCUMENTS_TIMEFRAME_CUSTOM = "Custom";
  * number, dates) -- nothing here is a header, cookie or token.
  */
 export function buildDocumentsRequestBody(query = {}) {
+  // Confirmed live 2026-09-11: filters are named entries, pageNum is a string,
+  // sortBy is an array, TimeFrame is one of Last30Days, Last90Days,
+  // Last12Months or a calendar year as a string; KeyAccountNo and DocSubType
+  // take "All". Dates are empty unless a custom range is used.
   const startDate = query.startDate ?? "";
   const endDate = query.endDate ?? "";
   return JSON.stringify({
     endDate,
-    pageNum: Number(query.page ?? "1"),
+    pageNum: String(query.page ?? "1"),
     filters: [
-      { DocType: query.docType ?? "", DocSubType: query.docSubType ?? "", KeyAccountNo: query.keyAccount ?? "" },
+      { filterName: "KeyAccountNo", values: [query.keyAccount ?? "All"] },
+      { filterName: "DocType", values: [query.docType ?? ""] },
+      { filterName: "DocSubType", values: [query.docSubType ?? "All"] },
     ],
-    sortBy: query.sortBy ?? "",
+    sortBy: [
+      { fieldName: "DocDate", sortOrder: "DESC" },
+      { fieldName: "KeyAccountNo", sortOrder: "DESC" },
+    ],
     startDate,
-    TimeFrame:
-      query.timeFrame ??
-      (startDate && endDate ? MS_DOCUMENTS_TIMEFRAME_CUSTOM : MS_DOCUMENTS_TIMEFRAME_ALL),
+    TimeFrame: query.timeFrame ?? MS_DOCUMENTS_TIMEFRAME_ALL,
   });
 }
 
@@ -281,7 +288,7 @@ const HEADER_HOOK = `(() => {
  * value. Exported for tests. */
 export function pageFetchExpression(origin, { method, url, body, headers, needsAuthorization }) {
   return `(async () => {
-    const slot = globalThis[Symbol.for(${JSON.stringify(CAPTURED_HEADERS_SLOT)})] ?? {};
+    const slot = Object.fromEntries(Object.entries(globalThis[Symbol.for(${JSON.stringify(CAPTURED_HEADERS_SLOT)})] ?? {}).map(([k, v]) => [k.toLowerCase(), v]));
     if (Object.keys(slot).length === 0) {
       throw new Error("no session headers captured yet: open the Activity tab in this Chrome window, then retry");
     }
