@@ -83,6 +83,8 @@ export type AdapterPull = {
   readonly acquired: AcquiredDocument;
   readonly rows: readonly ParsedRow[];
   readonly holdings?: ParsedHoldings;
+  /** The adapter's parse note when the bytes were retained but not parsed. */
+  readonly parseNote?: string;
   readonly docType: string;
   readonly docDate: string | null;
   readonly persisted: PersistedAcquisition;
@@ -860,6 +862,7 @@ async function collectDocuments(
       mediaType: pull.acquired.manifest.mediaType,
       captureId: pull.persisted.captureId,
       textPath: pull.persisted.textPath,
+      parseNote: pull.parseNote ?? null,
       institutionId: pull.institutionId,
       accountId: pull.accountId,
       docType: pull.docType,

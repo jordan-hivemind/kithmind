@@ -835,6 +835,7 @@ async function main(): Promise<void> {
           acquired,
           rows: parsed.activity,
           holdings: parsed.holdings,
+          parseNote: parsed.parseNote,
           docType: spec.docType,
           docDate: spec.docDate,
           persisted,

@@ -1092,8 +1092,19 @@ async function parse(rawFile) {
       // "nothing here has been read yet," not a missing source.
       return { activity: [], holdings: EMPTY_HOLDINGS };
     case "pdf_statement":
-    case "trade_confirmation":
-      return parseStatementLines(extractStatementText(rawFile.bytes), rawFile.kind);
+    case "trade_confirmation": {
+      // Real statements carry compressed content streams the dependency-free
+      // extractor cannot read (seen live 2026-09-11). The bytes are retained
+      // either way; the document is recorded as not parsed with the reason,
+      // so a real extractor can revisit it rather than the archive losing it.
+      let text;
+      try {
+        text = extractStatementText(rawFile.bytes);
+      } catch (error) {
+        return { activity: [], holdings: EMPTY_HOLDINGS, parseNote: `not parsed: ${error instanceof Error ? error.message : String(error)}` };
+      }
+      return parseStatementLines(text, rawFile.kind);
+    }
     default:
       throw new RangeError(`unknown rawFile.kind ${rawFile.kind}`);
   }

@@ -540,6 +540,14 @@ export const EMPTY_HOLDINGS: ParsedHoldings = Object.freeze({
 export type ParsedPull = {
   readonly activity: readonly ParsedRow[];
   readonly holdings: ParsedHoldings;
+  /**
+   * Set when the bytes were acquired and retained but could not be parsed
+   * (for example a PDF whose text the adapter's extractor cannot read). The
+   * importer records the document as not parsed and opens a review item, so
+   * a later parser can revisit it; the archive never loses the bytes over a
+   * parser gap.
+   */
+  readonly parseNote?: string;
 };
 
 // --- the interface itself ----------------------------------------------
