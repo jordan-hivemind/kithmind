@@ -154,11 +154,17 @@ export function resolveEndpoint(path, query) {
     };
   }
   if (path.startsWith("/documents/")) {
-    const [externalId] = path.slice("/documents/".length).split("::");
+    // Confirmed live 2026-09-11 from the app's own document service: a POST
+    // with an empty body to accountdocs/document/<documentId> answers with the
+    // PDF bytes directly (the app reads it as a blob). The id is the
+    // listing's documentId, which already names the account and date.
+    const [documentId] = path.slice("/documents/".length).split("::");
+    const { requestId, seqId } = randomUuidQueryIds();
     return {
-      method: "GET",
-      url: `${requiredEnv("MS_DOCUMENT_DOWNLOAD_PATH_PREFIX")}${encodeURIComponent(externalId)}`,
-      body: null,
+      method: "POST",
+      url: `/msoaz/api/acdsal/accountdocs/document/${encodeURIComponent(documentId)}?RequestID=${requestId}&SeqID=${seqId}`,
+      body: "",
+      headers: { Accept: "application/json, text/plain, */*" },
       needsAuthorization: true,
     };
   }

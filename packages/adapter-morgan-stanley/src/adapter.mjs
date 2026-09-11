@@ -462,7 +462,7 @@ async function fetchDocumentsPages(session, docType, kind) {
         const { periodStart, periodEnd } = documentPeriod(kind, raw.documentDate);
         const keyAccount = typeof raw.keyAccountNo === "string" ? raw.keyAccountNo : "";
         items.push({
-          externalId: encodeDocumentExternalId(raw.documentGuid, keyAccount, periodStart, periodEnd),
+          externalId: encodeDocumentExternalId(raw.documentId, keyAccount, periodStart, periodEnd),
           kind,
           periodStart,
           periodEnd,
