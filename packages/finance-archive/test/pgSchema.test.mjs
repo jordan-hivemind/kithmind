@@ -20,6 +20,7 @@ import {
   ARCHIVE_TYPES,
   createArchiveClient,
   fromNumericText,
+  PG_MIGRATIONS,
   PG_SCHEMA_VERSION,
   PG_TABLES,
   pgSchemaVersion,
@@ -87,12 +88,13 @@ test(
       assert.equal(Number(tables.rows[0].n), PG_TABLES.length);
       assert.equal(PG_TABLES.length, 13);
 
-      // Running it again is a no-op, not a second version row and not an error.
+      // Running it again is a no-op: one row per migration applied, no extra
+      // row and no error.
       assert.equal(await applyPgSchema(client), PG_SCHEMA_VERSION);
       const versions = await client.query(
         "SELECT count(*)::text AS n FROM schema_version",
       );
-      assert.equal(Number(versions.rows[0].n), 1);
+      assert.equal(Number(versions.rows[0].n), PG_MIGRATIONS.length);
     });
   },
 );
@@ -296,6 +298,98 @@ test(
       );
       assert.equal(Number(commitments.rows[0].n), 0);
     });
+  },
+);
+
+// An archive that already exists is the case a migration is for: the columns
+// F1-29 adds are worth nothing if applying them drops what is already there.
+test(
+  "an archive at the previous version migrates to the current one without data loss",
+  { skip },
+  async () => {
+    const schema = testSchemaName();
+    const client = createArchiveClient(url, schema);
+    await client.connect();
+    try {
+      // A genuine older archive: the first migration and its version row,
+      // nothing after it. Not the current schema with columns dropped back
+      // off, which would prove only that the test can undo its own setup.
+      const [first] = PG_MIGRATIONS;
+      await client.query(`CREATE SCHEMA ${schema}`);
+      await client.query(
+        `CREATE TABLE ${schema}.schema_version (
+           version INTEGER PRIMARY KEY, name TEXT NOT NULL,
+           applied_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
+      );
+      await client.query(first.sql);
+      await client.query(
+        `INSERT INTO ${schema}.schema_version (version, name) VALUES ($1, $2)`,
+        [first.version, first.name],
+      );
+      assert.equal(await pgSchemaVersion(client, schema), first.version);
+      assert.ok(
+        PG_SCHEMA_VERSION > first.version,
+        "there is a later version to migrate to",
+      );
+
+      const sha = "9".repeat(64);
+      await client.query(
+        "INSERT INTO institutions (id, name, slug) VALUES ('inst-1', 'Thistlebrook Trust', 'thistlebrook')",
+      );
+      await client.query(
+        `INSERT INTO documents (id, institution_id, doc_type, doc_date, file_path, sha256)
+         VALUES ('doc-1', 'inst-1', 'activity_pull', DATE '2026-03-04', '/raw/doc-1', $1)`,
+        [sha],
+      );
+
+      assert.equal(await applyPgSchema(client, schema), PG_SCHEMA_VERSION);
+
+      // The row is still there, unchanged, and the new columns are null: no
+      // backfill, so a document imported before this migration honestly says
+      // it names no retained bytes.
+      const migrated = await client.query(
+        `SELECT file_path, sha256, doc_date::text AS doc_date, retained_sha256,
+                retained_byte_length, media_type, capture_id
+         FROM documents WHERE id = 'doc-1'`,
+      );
+      assert.equal(migrated.rowCount, 1);
+      assert.deepEqual(migrated.rows[0], {
+        file_path: "/raw/doc-1",
+        sha256: sha,
+        doc_date: "2026-03-04",
+        retained_sha256: null,
+        retained_byte_length: null,
+        media_type: null,
+        capture_id: null,
+      });
+
+      // Three of the four is a provenance record that reads as complete and
+      // resolves to nothing. The table refuses it.
+      await assert.rejects(
+        client.query(
+          "UPDATE documents SET media_type = 'application/json' WHERE id = 'doc-1'",
+        ),
+        /documents_retained_provenance_complete/,
+      );
+
+      // All four together is what the write path produces, and BIGINT crosses
+      // the driver boundary as text like every other exact number here.
+      await client.query(
+        `UPDATE documents
+         SET retained_sha256 = $1, retained_byte_length = 2048,
+             media_type = 'application/json', capture_id = 'cap-1'
+         WHERE id = 'doc-1'`,
+        [sha],
+      );
+      const filled = await client.query(
+        "SELECT retained_byte_length::text AS n, media_type FROM documents WHERE id = 'doc-1'",
+      );
+      assert.equal(filled.rows[0].n, "2048");
+      assert.equal(filled.rows[0].media_type, "application/json");
+    } finally {
+      await client.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+      await client.end();
+    }
   },
 );
 

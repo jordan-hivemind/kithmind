@@ -908,13 +908,41 @@ have no analogous provider total to reconcile against.
 ## Postgres schema (F1-20)
 
 `applyPgSchema(client)` creates the archive in its own named schema and
-records the applied version in a `schema_version` table inside it. It is one
-initial schema rather than a translation of three SQLite migrations, because
-there is no data behind those migrations and that is the whole reason the
-engine changes now rather than later. The whole creation is one transaction,
-an advisory lock keyed on the schema name excludes a second creator by the
-database rather than by convention, and running it again is a no-op returning
-the recorded version.
+records the applied version in a `schema_version` table inside it. It started
+as one initial schema rather than a translation of three SQLite migrations,
+because there is no data behind those migrations and that is the whole reason
+the engine changes now rather than later. The whole creation is one
+transaction, an advisory lock keyed on the schema name excludes a second
+creator by the database rather than by convention, and running it again is a
+no-op returning the recorded version.
+
+Anything after that first schema is an additive migration appended to
+`PG_MIGRATIONS`, never an edit to the initial `CREATE`: once an archive
+exists, the version table is the only thing that says what it already has.
+`applyPgSchema` applies every migration whose version is above the recorded
+one, in order, inside the same transaction and lock, and records each one.
+
+| # | Migration                              | What it adds                                                                 |
+| - | -------------------------------------- | ----------------------------------------------------------------------------- |
+| 1 | initial postgres archive schema        | Every table, domain and index below.                                           |
+| 2 | documents retained byte provenance     | `documents.retained_sha256`, `retained_byte_length`, `media_type`, `capture_id`. |
+
+Migration 2 (F1-29,
+[`docs/plans/2026-09-11-structured-evidence.md`](../../docs/plans/2026-09-11-structured-evidence.md))
+names the immutable retained bytes a document's rows were parsed from, so a
+citation can be checked against those bytes rather than trusted. All four
+columns are nullable, there is no backfill, and a CHECK makes them
+all-or-nothing: a document imported before this migration honestly says it
+names no retained bytes and produces no evidence, while three of four would
+be a provenance record that reads as complete and resolves to nothing.
+`retained_sha256` is deliberately **not** `documents.sha256` and not unique.
+For a single acquired file the two are equal, but a paginated pull is captured
+as one immutable file and split into one `documents` row per page, and a page
+row's `sha256` is a derived row identity naming no bytes; every page row of
+one pull shares the same retained object. `media_type` is the adapter's own
+declaration on `AcquisitionManifestEntry`, never inferred from the capability
+tier -- a `pdf_statement` tier does not make the bytes a PDF, and the
+synthetic fixture's statement bytes are UTF-8 text.
 
 ### Which schema, and why it is not `search_path`
 

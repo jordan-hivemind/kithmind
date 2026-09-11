@@ -27,6 +27,10 @@
 // row carries source_document_id and source_locator; acct_last4 is exactly
 // four digits; row_hash is UNIQUE; identities stay stable opaque text.
 
+// Later changes are additive migrations appended to PG_MIGRATIONS, not edits
+// to the CREATE above: once an archive exists, the version table is the only
+// thing that says what it already has.
+//
 // Where the objects live is part of the schema, not an ambient property of
 // whoever connects. Everything below is created in one named schema and the
 // version table is read schema-qualified. An unqualified `schema_version`
@@ -41,9 +45,13 @@ import type pg from "pg";
 
 import { archiveSchemaOf, pinArchiveSchema } from "./pgStore.js";
 
-/** Bumped when INITIAL_SCHEMA changes. Recorded in `schema_version`. */
-export const PG_SCHEMA_VERSION = 1;
-const PG_SCHEMA_NAME = "initial postgres archive schema";
+/** One versioned, additive step. Every step's version is recorded in
+ * `schema_version`, so an existing archive applies only what it is missing. */
+export type PgMigration = {
+  readonly version: number;
+  readonly name: string;
+  readonly sql: string;
+};
 
 /**
  * Key for the advisory lock two concurrent creators contend on, paired with a
@@ -292,6 +300,52 @@ CREATE INDEX position_reconciliations_account_period
 CREATE INDEX review_items_status ON review_items (status, kind);
 `;
 
+// F1-29. Four nullable columns naming the immutable retained bytes a
+// document's rows were parsed from, so a citation can be checked against
+// those bytes rather than trusted (docs/plans/2026-09-11-structured-evidence.md).
+//
+// `retained_sha256` is not `documents.sha256` and cannot be. For a single
+// acquired file the two are equal, but a paginated pull is captured as one
+// RawFile and split into one row per page, and each page row's `sha256` is a
+// derived hash that names no bytes. So `sha256` keeps its UNIQUE row-identity
+// role and `retained_sha256` is deliberately not unique: every page row of one
+// pull shares the bytes.
+//
+// No backfill. A document imported before this migration keeps four nulls and
+// produces no evidence, which is the honest answer for a row whose bytes were
+// never recorded. The CHECK makes that all-or-nothing: three of four is a
+// half-written provenance record that reads as complete.
+const RETAINED_PROVENANCE = `
+ALTER TABLE documents
+  ADD COLUMN retained_sha256 TEXT
+    CHECK (retained_sha256 IS NULL OR retained_sha256 ~ '^[0-9a-f]{64}$'),
+  ADD COLUMN retained_byte_length BIGINT
+    CHECK (retained_byte_length IS NULL OR retained_byte_length >= 0),
+  ADD COLUMN media_type TEXT,
+  ADD COLUMN capture_id TEXT,
+  ADD CONSTRAINT documents_retained_provenance_complete CHECK (
+    num_nonnulls(retained_sha256, retained_byte_length, media_type, capture_id)
+      IN (0, 4));
+`;
+
+/** Every migration, in order. The last one's version is the current schema. */
+export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
+  {
+    version: 1,
+    name: "initial postgres archive schema",
+    sql: INITIAL_SCHEMA,
+  },
+  {
+    version: 2,
+    name: "documents retained byte provenance",
+    sql: RETAINED_PROVENANCE,
+  },
+]);
+
+/** The version an archive reaches once every migration has been applied. */
+export const PG_SCHEMA_VERSION =
+  PG_MIGRATIONS[PG_MIGRATIONS.length - 1]!.version;
+
 /** Every table the schema creates, in creation order. */
 export const PG_TABLES: readonly string[] = Object.freeze([
   "institutions",
@@ -330,10 +384,10 @@ export async function pgSchemaVersion(
 }
 
 /**
- * Creates the archive in its own named schema and records the applied
- * version. Running it again is a no-op returning the recorded version, which
- * is what makes rebuilding the archive from the raw tree routine rather than
- * an event.
+ * Creates the archive in its own named schema, applies every migration the
+ * recorded version says is missing, and records each one it applied. Running
+ * it again is a no-op returning the recorded version, which is what makes
+ * rebuilding the archive from the raw tree routine rather than an event.
  *
  * The whole thing is one transaction, and an advisory lock excludes a second
  * creator by the database rather than by everyone remembering that only one
@@ -371,11 +425,12 @@ export async function applyPgSchema(
         `archive is at schema ${current}, newer than this build understands (${PG_SCHEMA_VERSION})`,
       );
     }
-    if (current < PG_SCHEMA_VERSION) {
-      await client.query(INITIAL_SCHEMA);
+    for (const migration of PG_MIGRATIONS) {
+      if (migration.version <= current) continue;
+      await client.query(migration.sql);
       await client.query(
         `INSERT INTO ${name}.schema_version (version, name) VALUES ($1, $2)`,
-        [PG_SCHEMA_VERSION, PG_SCHEMA_NAME],
+        [migration.version, migration.name],
       );
     }
     await client.query("COMMIT");

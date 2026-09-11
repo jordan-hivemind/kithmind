@@ -154,6 +154,7 @@ test(
       "fixture still carries the overlap",
     );
 
+    const persisted = persist(t, db, acquired, "activity_pull");
     const documents = await adapterPullToImportDocuments(client, {
       institutionId: INSTITUTION.id,
       accountId: ACCOUNT.id,
@@ -161,7 +162,7 @@ test(
       rows,
       docType: "activity_pull",
       docDate: null,
-      persisted: persist(t, db, acquired, "activity_pull"),
+      persisted,
     });
     // One ImportDocument per page: the boundary the plan requires the
     // occurrence ordinal to respect, structural rather than lost in parse()'s
@@ -184,6 +185,38 @@ test(
     assert.equal(
       await count(client, "transactions"),
       acquired.manifest.reportedRowCount,
+    );
+
+    // F1-29. Every page row of one pull names the same retained bytes --
+    // that is one immutable capture, split for dedupe, not several files --
+    // while its own `sha256` row identity stays unique, because a page row's
+    // is derived and names no bytes at all.
+    const documentRows = await all(
+      client,
+      `SELECT sha256, retained_sha256, retained_byte_length::text AS retained_byte_length,
+              media_type, capture_id
+       FROM documents ORDER BY file_path`,
+    );
+    assert.equal(documentRows.length, documents.length);
+    assert.equal(
+      new Set(documentRows.map((row) => row.sha256)).size,
+      documentRows.length,
+    );
+    for (const row of documentRows) {
+      assert.equal(row.retained_sha256, acquired.manifest.contentHash);
+      assert.equal(
+        row.retained_byte_length,
+        String(acquired.bytes.byteLength),
+      );
+      assert.equal(row.media_type, "application/json");
+      assert.equal(row.capture_id, persisted.captureId);
+      // A page row's identity is derived, so it is never the bytes' hash.
+      assert.notEqual(row.sha256, row.retained_sha256);
+    }
+    assert.equal(
+      new Set(documentRows.map((row) => row.retained_sha256)).size,
+      1,
+      "one pull is one retained object however many page documents it splits into",
     );
 
     // Re-importing the identical pull is a no-op: the raw tree is immutable
@@ -367,6 +400,7 @@ test(
         periodEnd: "2025-06-30",
         capturedAt: "2025-07-01T00:00:00.000Z",
         contentHash: retained.sha256,
+        mediaType: "text/csv; charset=utf-8",
         reportedRowCount: null,
         gaps: [],
       },

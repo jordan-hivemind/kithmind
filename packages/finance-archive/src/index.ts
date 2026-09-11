@@ -25,6 +25,7 @@ export {
   type ParsedPull,
   type ParsedRow,
   type RawFile,
+  type RetainedMediaType,
   type ValuationBasis,
 } from "./adapter.js";
 export {
@@ -104,8 +105,10 @@ export {
 export { serveFinanceRead } from "./mcp/pgRead.js";
 export {
   applyPgSchema,
+  PG_MIGRATIONS,
   PG_SCHEMA_VERSION,
   PG_TABLES,
+  type PgMigration,
   pgSchemaVersion,
 } from "./pgSchema.js";
 export {

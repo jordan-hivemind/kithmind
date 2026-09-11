@@ -446,6 +446,8 @@ async function acquireStructuredApi(selection: {
       periodEnd: selection.periodEnd,
       capturedAt: new Date().toISOString(),
       contentHash: retained.sha256,
+      // The pages are re-serialized as one JSON object above.
+      mediaType: "application/json",
       reportedRowCount,
       gaps,
     },
@@ -475,6 +477,7 @@ async function acquireTabularExport(selection: {
       periodEnd: selection.periodEnd,
       capturedAt: new Date().toISOString(),
       contentHash: retained.sha256,
+      mediaType: "text/csv; charset=utf-8",
       // Documented quirk: this institution's tabular export states no row count.
       reportedRowCount: null,
       gaps: [],
@@ -504,6 +507,10 @@ async function acquireDocument(selection: {
       periodEnd: doc.periodEnd,
       capturedAt: new Date().toISOString(),
       contentHash: retained.sha256,
+      // Declared, not inferred from the tier: this fixture's "statement" and
+      // "confirmation" bytes are UTF-8 text, not PDF, and saying otherwise
+      // would make the fixture lie about what a consumer has to parse.
+      mediaType: "text/plain; charset=utf-8",
       reportedRowCount: null,
       gaps: [],
     },
