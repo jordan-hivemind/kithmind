@@ -241,12 +241,22 @@ async function connectCdp(wsUrl) {
   };
 }
 
+const EVALUATE_TIMEOUT_MS = 90_000;
+
 async function evaluate(cdp, expression) {
-  const { result, exceptionDetails } = await cdp.send("Runtime.evaluate", {
-    expression,
-    awaitPromise: true,
-    returnByValue: true,
-  });
+  // A page navigation or reload mid-call drops the reply to a pending
+  // Runtime.evaluate, and without a deadline the operator command waits
+  // forever with nothing in flight (seen live 2026-09-11). Fail by name
+  // instead so the run counts the document as failed and moves on.
+  const { result, exceptionDetails } = await Promise.race([
+    cdp.send("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true }),
+    new Promise((_, reject) =>
+      setTimeout(
+        () => reject(new Error(`page evaluation timed out after ${EVALUATE_TIMEOUT_MS}ms: the tab may have navigated or the request never answered`)),
+        EVALUATE_TIMEOUT_MS,
+      ),
+    ),
+  ]);
   if (exceptionDetails) {
     throw new Error(exceptionDetails.text + " " + (result?.description ?? ""));
   }
