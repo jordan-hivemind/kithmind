@@ -66,6 +66,53 @@ function writeAdapterFixtures(t) {
   return { fixturesDir, adapterModulePath, sessionModulePath };
 }
 
+/**
+ * F1-39. Same adapter fixture as `writeAdapterFixtures`, but the session
+ * module withholds the document total (`omitDocumentsTotal`) or serves fewer
+ * documents than exist (`documentsLimit`), so `discover()`'s document
+ * listing comes back incomplete -- the shape `"requireExhaustive": true`
+ * refuses to start against.
+ */
+function writeIncompleteDiscoveryFixtures(t, sessionOptions) {
+  const { fixturesDir, adapterModulePath } = writeAdapterFixtures(t);
+  const sessionModulePath = join(fixturesDir, "session-incomplete.mjs");
+  writeFileSync(
+    sessionModulePath,
+    `import { createSyntheticSession } from ${JSON.stringify(distIndexUrl)};\n` +
+      `export default function buildSession() {\n` +
+      `  return createSyntheticSession(${JSON.stringify(sessionOptions)});\n` +
+      `}\n`,
+  );
+  return { fixturesDir, adapterModulePath, sessionModulePath };
+}
+
+/**
+ * F1-39. Same adapter fixture, but the session throws fetching one named
+ * document's bytes -- an injected acquisition failure, standing in for a
+ * real provider outage on one document of a pull that names several.
+ */
+function writeFailingDocumentFixtures(t, failingExternalId) {
+  const { fixturesDir, adapterModulePath } = writeAdapterFixtures(t);
+  const sessionModulePath = join(fixturesDir, "session-failing.mjs");
+  writeFileSync(
+    sessionModulePath,
+    `import { createSyntheticSession } from ${JSON.stringify(distIndexUrl)};\n` +
+      `export default function buildSession() {\n` +
+      `  const base = createSyntheticSession();\n` +
+      `  return {\n` +
+      `    ...base,\n` +
+      `    async fetchBytes(path, query) {\n` +
+      `      if (path === ${JSON.stringify(`/documents/${failingExternalId}`)}) {\n` +
+      `        throw new Error("synthetic outage fetching this document");\n` +
+      `      }\n` +
+      `      return base.fetchBytes(path, query);\n` +
+      `    },\n` +
+      `  };\n` +
+      `}\n`,
+  );
+  return { fixturesDir, adapterModulePath, sessionModulePath };
+}
+
 /** A throwaway Postgres schema with the institution provisioned and,
  * unless the caller opts out, the account too. Opting out is how the
  * external-key test below proves an account needs no separate provisioning
@@ -455,5 +502,286 @@ test(
     const second = runImport();
     assert.match(second, /rows inserted: 0/);
     assert.equal(await count(client, "transactions"), inserted);
+  },
+);
+
+// --- F1-39: expanded selections and commit-every batching ------------------
+
+test(
+  '"expand": "discovered" acquires every discovered document of the requested kinds, filed institution-wide',
+  { skip },
+  async (t) => {
+    const { schema, client } = await seededSchema(t, { seedAccount: false });
+
+    const rawDir = mkdtempSync(join(tmpdir(), "kith-finance-run-expand-raw-"));
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+
+    const { fixturesDir, adapterModulePath, sessionModulePath } =
+      writeAdapterFixtures(t);
+    // The synthetic fixture discovers 3 documents (2 pdf_statement, 1
+    // trade_confirmation, see fixtures.ts's DOCUMENTS) -- naming only
+    // "trade_confirmation" here proves the "kinds" filter actually filters,
+    // not merely that every discovered document gets pulled.
+    const selectionPath = writeSelection(fixturesDir, [
+      {
+        expand: "discovered",
+        kinds: ["trade_confirmation"],
+        docType: "trade_confirmation",
+        requireExhaustive: true,
+      },
+    ]);
+    const runImport = makeRunner({
+      adapterModulePath,
+      sessionModulePath,
+      selectionPath,
+      schema,
+      rawDir,
+    });
+
+    const output = runImport();
+    assert.match(output, /^mode: committed$/m);
+    // documentsDiscoveredByKind reflects the whole discover() result, not
+    // only the kinds this entry asked for.
+    assert.match(output, /documents discovered by kind:\s*\n\s*pdf_statement: 2/);
+    assert.match(output, /trade_confirmation: 1/);
+    // The document itself was acquired -- bytes fetched and persisted to the
+    // raw tree -- regardless of what happens at import.
+    assert.match(output, /documents acquired: 1/);
+    assert.match(output, /bytes acquired: [1-9]\d*/);
+
+    // The synthetic adapter's document-tier parse() (pdf_statement/
+    // trade_confirmation) never tags a row with its own accountExternalKey
+    // -- pre-F1-39 that was fine, since a document-tier pull always named
+    // its own real account (README: "a document-tier pull always belongs to
+    // one account"). An institution-wide one (this pull, since
+    // DiscoveredDocument names no account) has no such fallback either, so
+    // adapterImport.ts's resolveRowAccountId correctly refuses to guess: the
+    // import fails rather than silently filing the row under the wrong (or
+    // no) account. This is the safe outcome, not a bug -- and it exercises
+    // the same failure-reporting path as an acquisition-stage failure (see
+    // the --commit-every test below), proving the summary reports an
+    // import-stage refusal by kind and count too.
+    assert.match(output, /document pulls acquired: 0/);
+    assert.match(output, /document pulls failed: 1/);
+    assert.match(output, /trade_confirmation: acquired=0 skipped=0 failed=1/);
+
+    assert.equal(
+      await count(client, "documents", "WHERE institution_id = $1", [
+        INSTITUTION.id,
+      ]),
+      0,
+      "an unattributable row is refused, never silently imported unattributed",
+    );
+    assert.equal(await count(client, "transactions"), 0);
+  },
+);
+
+test(
+  '"requireExhaustive": true refuses to start when discover()\'s document listing is incomplete',
+  { skip },
+  async (t) => {
+    const { schema } = await seededSchema(t, { seedAccount: false });
+
+    const rawDir = mkdtempSync(
+      join(tmpdir(), "kith-finance-run-expand-incomplete-raw-"),
+    );
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+
+    // Withholds the document total, so discover() cannot mark its listing
+    // exhaustive (see createSyntheticSession's omitDocumentsTotal option).
+    const { fixturesDir, adapterModulePath, sessionModulePath } =
+      writeIncompleteDiscoveryFixtures(t, { omitDocumentsTotal: true });
+    const selectionPath = writeSelection(fixturesDir, [
+      {
+        expand: "discovered",
+        kinds: ["pdf_statement", "trade_confirmation"],
+        docType: "statement_or_confirmation",
+        requireExhaustive: true,
+      },
+    ]);
+    const runImport = makeRunner({
+      adapterModulePath,
+      sessionModulePath,
+      selectionPath,
+      schema,
+      rawDir,
+    });
+
+    assert.throws(
+      () => runImport(["--dry-run"]),
+      (error) => {
+        assert.match(String(error.stderr), /requireExhaustive/);
+        assert.match(
+          String(error.stderr),
+          /provider does not report a document total/,
+        );
+        return true;
+      },
+    );
+  },
+);
+
+test(
+  '"expand": "activity-ranges" splits a multi-year window into one institution-wide pull per calendar year',
+  { skip },
+  async (t) => {
+    const { schema, client } = await seededSchema(t, { seedAccount: false });
+
+    const rawDir = mkdtempSync(
+      join(tmpdir(), "kith-finance-run-expand-years-raw-"),
+    );
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+
+    const { fixturesDir, adapterModulePath, sessionModulePath } =
+      writeAdapterFixtures(t);
+    // 2023-06-15..2025-02-10 touches three calendar years: 2023, 2024, 2025.
+    const selectionPath = writeSelection(fixturesDir, [
+      {
+        expand: "activity-ranges",
+        kind: "structured_api",
+        docType: "activity_pull",
+        periodStart: "2023-06-15",
+        periodEnd: "2025-02-10",
+      },
+    ]);
+    const runImport = makeRunner({
+      adapterModulePath,
+      sessionModulePath,
+      selectionPath,
+      schema,
+      rawDir,
+    });
+
+    const output = runImport();
+    assert.match(output, /^mode: committed$/m);
+    // Three pulls acquired -- one per calendar year the window touches.
+    assert.match(output, /documents acquired: 3/);
+
+    // Each pull publishes as its own transaction (structured pulls are
+    // never batched by --commit-every), so import_runs gets one row per
+    // year even though the synthetic adapter returns byte-identical
+    // activity for every period and every row after the first pull dedupes.
+    assert.equal(await count(client, "import_runs"), 3);
+    assert.ok(await count(client, "transactions") > 0);
+  },
+);
+
+test(
+  "a second pass over a document-tier selection imports nothing new for a document already imported",
+  { skip },
+  async (t) => {
+    // A plain (non-"expand") document-tier entry naming a real account --
+    // exactly the pre-F1-39 shape -- run through F1-39's new default
+    // commit-every-1 machinery (each document pull is now its own
+    // transaction). Proves the "skipped (already imported)" counter, not the
+    // expansion feature; see the "expand": "discovered" test above for why an
+    // institution-wide document pull cannot itself demonstrate a successful
+    // import with this adapter.
+    const { schema, client } = await seededSchema(t);
+
+    const rawDir = mkdtempSync(
+      join(tmpdir(), "kith-finance-run-doc-rerun-raw-"),
+    );
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+
+    const { fixturesDir, adapterModulePath, sessionModulePath } =
+      writeAdapterFixtures(t);
+    const selectionPath = writeSelection(fixturesDir, [
+      {
+        accountId: ACCOUNT.id,
+        docType: "confirmation",
+        docDate: null,
+        selection: {
+          kind: "trade_confirmation",
+          externalId: "doc-conf-2025-02-10",
+        },
+      },
+    ]);
+    const runImport = makeRunner({
+      adapterModulePath,
+      sessionModulePath,
+      selectionPath,
+      schema,
+      rawDir,
+    });
+
+    const first = runImport();
+    assert.match(first, /document pulls acquired: 1/);
+    assert.match(first, /document pulls skipped \(already imported\): 0/);
+    assert.match(first, /document pulls failed: 0/);
+    const inserted = await count(client, "transactions");
+    assert.ok(inserted > 0);
+
+    // Raw-tree content addressing plus documents.sha256 dedupe (importer.ts)
+    // already make a re-run a no-op; F1-39 only has to report it as a
+    // "skip", not re-derive the dedupe itself.
+    const second = runImport();
+    assert.match(second, /rows inserted: 0/);
+    assert.match(second, /document pulls acquired: 0/);
+    assert.match(second, /document pulls skipped \(already imported\): 1/);
+    assert.match(second, /document pulls failed: 0/);
+    assert.equal(await count(client, "transactions"), inserted);
+  },
+);
+
+test(
+  "--commit-every defaults to one document pull per transaction: a refused/failed document is reported and skipped, and the run continues",
+  { skip },
+  async (t) => {
+    const { schema, client } = await seededSchema(t);
+
+    const rawDir = mkdtempSync(
+      join(tmpdir(), "kith-finance-run-failure-raw-"),
+    );
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+
+    // doc-stmt-2025-q2 fails to acquire; doc-conf-2025-02-10 does not. Both
+    // name a real, seeded account (not an "expand": "discovered" pull), so
+    // the only thing under test is failure isolation between two document
+    // pulls in the same run.
+    const { fixturesDir, adapterModulePath, sessionModulePath } =
+      writeFailingDocumentFixtures(t, "doc-stmt-2025-q2");
+    const selectionPath = writeSelection(fixturesDir, [
+      {
+        accountId: ACCOUNT.id,
+        docType: "statement",
+        docDate: null,
+        selection: { kind: "pdf_statement", externalId: "doc-stmt-2025-q2" },
+      },
+      {
+        accountId: ACCOUNT.id,
+        docType: "confirmation",
+        docDate: null,
+        selection: {
+          kind: "trade_confirmation",
+          externalId: "doc-conf-2025-02-10",
+        },
+      },
+    ]);
+    const runImport = makeRunner({
+      adapterModulePath,
+      sessionModulePath,
+      selectionPath,
+      schema,
+      rawDir,
+    });
+
+    // Does not throw: a refused/failed document is reported (stderr) and
+    // skipped, the run continues and exits 0.
+    const output = runImport();
+    assert.match(output, /^mode: committed$/m);
+    assert.match(output, /document pulls acquired: 1/);
+    assert.match(output, /document pulls failed: 1/);
+    assert.match(output, /pdf_statement: acquired=0 skipped=0 failed=1/);
+    assert.match(output, /trade_confirmation: acquired=1 skipped=0 failed=0/);
+
+    const documents = await all(
+      client,
+      "SELECT doc_type FROM documents WHERE institution_id = $1",
+      [INSTITUTION.id],
+    );
+    assert.equal(documents.length, 1, "only the surviving document imported");
+    assert.equal(documents[0].doc_type, "confirmation");
+    assert.ok(await count(client, "transactions") > 0);
   },
 );
