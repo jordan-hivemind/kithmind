@@ -72,28 +72,80 @@ const DOCUMENT_TYPES = [
   { docType: "Trade confirmations", kind: "trade_confirmation" },
 ];
 
-// Bought/Sold are the only activity values this table has been reviewed for.
+// Signed direction for this institution's unsigned `quantity` magnitude.
+// Every taxonomy entry with `movesQuantity: true` must appear here, because a
+// value missing from this table resolves to `quantity: null` -- so declaring a
+// type as quantity-moving without a sign here would drop the quantity from
+// the position gate silently, which is worse than not declaring it at all.
+//
 // Grows by review, never by pattern-matching the description text (README,
-// "Parsing"). An activity value not in this table with a non-zero
-// quantity routes to `quantity: null` -> review_items rather than a guess.
+// "Parsing"). An activity value not in this table with a non-zero quantity
+// routes to `quantity: null` -> review_items rather than a guess.
 const ACTIVITY_SIGN_TABLE = new Map([
+  // Trades.
   ["Bought", 1],
   ["Buy", 1],
   ["Sold", -1],
   ["Sell", -1],
+  ["Security Sold", -1],
+  // A dividend reinvestment's purchase leg acquires shares.
+  ["Dividend Reinvestment", 1],
+  // A redemption retires the position it pays out.
+  ["Redemption", -1],
+  // In-kind movement between accounts, one direction each.
+  ["Exchange Deliver Out", -1],
+  ["Exchange Received In", 1],
+  // An expiring contract leaves the position.
+  ["Option Expired", -1],
+  // Shares paid as the dividend itself.
+  ["Dividend Stock", 1],
 ]);
 
-// `InstitutionCapabilities.activityTaxonomy`: declared only
-// for the activity values ACTIVITY_SIGN_TABLE already knows -- growing this
-// by pattern-matching an unreviewed value would be the same guess the sign
-// table above already refuses. A real run's `undeclared_activity_type`
-// review items are the list to grow it from; each addition is its own
-// reviewed decision (README, "Operator runbook").
+// `InstitutionCapabilities.activityTaxonomy`, declared from the activity
+// values the first live pull actually produced (F1-19). Every entry here is
+// its own reviewed decision about what that value does to cash and to a
+// position; values the pull produced but that are not reviewed below stay out
+// of this table on purpose, so they keep opening `undeclared_activity_type`
+// review items instead of being counted on a guess (README, "Activity
+// taxonomy"). See the README table for the per-value rationale.
+//
+// One shape assumption is load-bearing and stated here as well as in the
+// README: the site books a reinvested dividend as two rows -- the credit
+// under `Dividend`/`Qualified Dividend`, then `Dividend Reinvestment` as the
+// purchase leg carrying a negative amount and a positive quantity, exactly
+// like `Bought`. If a later pull shows it as one row crediting the dividend
+// and delivering the shares together, `movesCash: true` here would have the
+// cash gate count a credit that never changed the balance, and this entry
+// has to be revisited rather than the gate loosened.
 const ACTIVITY_TAXONOMY = {
+  // --- trades and other quantity movement --------------------------------
   Bought: { movesCash: true, movesQuantity: true, quantitySign: "positive" },
   Buy: { movesCash: true, movesQuantity: true, quantitySign: "positive" },
   Sold: { movesCash: true, movesQuantity: true, quantitySign: "negative" },
   Sell: { movesCash: true, movesQuantity: true, quantitySign: "negative" },
+  "Security Sold": { movesCash: true, movesQuantity: true, quantitySign: "negative" },
+  "Dividend Reinvestment": { movesCash: true, movesQuantity: true, quantitySign: "positive" },
+  Redemption: { movesCash: true, movesQuantity: true, quantitySign: "negative" },
+  // In-kind: the position moves, no cash crosses the account boundary.
+  "Exchange Deliver Out": { movesCash: false, movesQuantity: true, quantitySign: "negative" },
+  "Exchange Received In": { movesCash: false, movesQuantity: true, quantitySign: "positive" },
+  "Option Expired": { movesCash: false, movesQuantity: true, quantitySign: "negative" },
+  "Dividend Stock": { movesCash: false, movesQuantity: true, quantitySign: "positive" },
+
+  // --- cash only ----------------------------------------------------------
+  Dividend: { movesCash: true, movesQuantity: false, quantitySign: "none" },
+  "Qualified Dividend": { movesCash: true, movesQuantity: false, quantitySign: "none" },
+  "Tax Exempt Dividend": { movesCash: true, movesQuantity: false, quantitySign: "none" },
+  "Interest Income": { movesCash: true, movesQuantity: false, quantitySign: "none" },
+  "Tax Exempt Interest Income": { movesCash: true, movesQuantity: false, quantitySign: "none" },
+  "Return of Capital": { movesCash: true, movesQuantity: false, quantitySign: "none" },
+  "Cash in Lieu": { movesCash: true, movesQuantity: false, quantitySign: "none" },
+  "Service Fee": { movesCash: true, movesQuantity: false, quantitySign: "none" },
+  "CASH TRANSFER": { movesCash: true, movesQuantity: false, quantitySign: "none" },
+  "Funds Transferred": { movesCash: true, movesQuantity: false, quantitySign: "none" },
+  Withdrawal: { movesCash: true, movesQuantity: false, quantitySign: "none" },
+  Contribution: { movesCash: true, movesQuantity: false, quantitySign: "none" },
+  "Automated Payment": { movesCash: true, movesQuantity: false, quantitySign: "none" },
 };
 
 // --- retention ------------------------------------------------------

@@ -248,12 +248,69 @@ array` error against a real response if the guess is wrong (the accounts
 ### Activity taxonomy
 
 `capabilities().activityTaxonomy` declares `{ movesCash, movesQuantity,
-quantitySign }` for exactly the activity values `ACTIVITY_SIGN_TABLE` already
-knows. It is not grown by guessing what an unreviewed value probably means,
-which is the same rule the sign table follows. A real run's
-`undeclared_activity_type` review items are the list to grow both tables from.
-Each addition is its own reviewed decision, not a batch import of every string
-the site happens to use.
+quantitySign }` per activity value. It is not grown by guessing what an
+unreviewed value probably means, which is the same rule the sign table
+follows. A real run's `undeclared_activity_type` review items are the list to
+grow both tables from. Each addition is its own reviewed decision, not a batch
+import of every string the site happens to use.
+
+Every value declared `movesQuantity: true` must also carry a sign in
+`ACTIVITY_SIGN_TABLE`, because the site's `quantity` is an unsigned magnitude
+and a value with no sign resolves to `quantity: null`. Declaring a value as
+quantity-moving without a sign would therefore drop it from the position gate
+with no review item to explain the loss -- worse than leaving it undeclared.
+`test/capabilities.test.mjs` enforces the pairing in both directions.
+
+The table below is the reviewed vocabulary from the first live pull (F1-19).
+The site's `amount` is signed as displayed (purchases and fees negative,
+sales and income positive), so `movesCash` says only whether the value touches
+cash at all, not which way.
+
+| Activity value             | Cash | Qty | Sign     | Rationale                                                       |
+| -------------------------- | ---- | --- | -------- | --------------------------------------------------------------- |
+| Bought                     | yes  | yes | positive | A purchase pays cash and acquires the position.                   |
+| Buy                        | yes  | yes | positive | Same event as `Bought` under the site's other spelling.           |
+| Sold                       | yes  | yes | negative | A sale receives cash and disposes of the position.                |
+| Sell                       | yes  | yes | negative | Same event as `Sold` under the site's other spelling.             |
+| Security Sold              | yes  | yes | negative | A disposal booked under the site's security-level wording.        |
+| Dividend Reinvestment      | yes  | yes | positive | The purchase leg of a reinvested dividend; see the assumption below. |
+| Redemption                 | yes  | yes | negative | A maturing or called instrument pays out and retires the position. |
+| Exchange Deliver Out       | no   | yes | negative | In-kind delivery out; the position leaves, no cash crosses.       |
+| Exchange Received In       | no   | yes | positive | In-kind receipt; the position arrives, no cash crosses.           |
+| Option Expired             | no   | yes | negative | An expiring contract leaves the position with no settlement.      |
+| Dividend Stock             | no   | yes | positive | The dividend is paid in shares, so quantity moves and cash does not. |
+| Dividend                   | yes  | no  | none     | An income credit against a holding; no quantity changes.          |
+| Qualified Dividend         | yes  | no  | none     | A dividend the site tags for tax treatment; same cash-only shape. |
+| Tax Exempt Dividend        | yes  | no  | none     | A dividend the site tags as exempt; same cash-only shape.         |
+| Interest Income            | yes  | no  | none     | An interest credit; no quantity changes.                          |
+| Tax Exempt Interest Income | yes  | no  | none     | Interest the site tags as exempt; same cash-only shape.           |
+| Return of Capital          | yes  | no  | none     | A cash distribution against basis; the site books no share change. |
+| Cash in Lieu               | yes  | no  | none     | Cash paid for a fractional share the site does not book as quantity. |
+| Service Fee                | yes  | no  | none     | A fee debit; no quantity changes.                                 |
+| CASH TRANSFER              | yes  | no  | none     | Cash moved between accounts; the label states cash.               |
+| Funds Transferred          | yes  | no  | none     | Cash moved between accounts under the site's other wording.       |
+| Withdrawal                 | yes  | no  | none     | Cash leaving the account.                                         |
+| Contribution               | yes  | no  | none     | Cash entering the account.                                        |
+| Automated Payment          | yes  | no  | none     | A scheduled cash debit to a payee.                                |
+
+Load-bearing assumption for `Dividend Reinvestment`: the site is assumed to
+book a reinvested dividend as two rows -- the credit under `Dividend` or
+`Qualified Dividend`, then `Dividend Reinvestment` as the purchase leg with a
+negative amount and a positive quantity, exactly like `Bought`. The live
+vocabulary carrying both labels is what this reading rests on. If a later pull
+shows one row that credits the dividend and delivers the shares together, the
+cash gate would count a credit that never changed the balance, and this entry
+must be revisited rather than the gate loosened.
+
+Left undeclared on purpose, so each keeps opening `undeclared_activity_type`
+review items until it is reviewed against real rows:
+
+| Activity value | Why not declared                                                                 |
+| -------------- | --------------------------------------------------------------------------------- |
+| Stock Split    | Direction is not stated on the row: a forward split delivers shares and a reverse split removes them. `quantitySign: "none"` is expressible in the taxonomy but not producible here -- with no sign the quantity resolves to null and, being declared, opens no review item, so the position gate would lose the row silently. Undeclared is the loud option. |
+| Stock Spin-Off | Same direction problem, and the row may be either the shares received or the parent-side adjustment. |
+| Other Debits   | The site's own catch-all, so its membership is unknown by construction. Declaring `movesCash: true` would assert every row in a miscellaneous bucket moved cash, and an in-kind member would fail the cash gate with no explanation. |
+| The pull's remaining rarer values | Not enumerated by the triage and not visible in the fixtures. The fixtures' activity labels (`Fee`, `ACH Disbursement`, `Dividend Received`, `Zzyzx Adjustment`) are synthetic stand-ins, not the site's vocabulary -- the live pull spells the same events `Service Fee` and `Automated Payment` -- so they are not evidence for a declaration. |
 
 ## Environment
 
