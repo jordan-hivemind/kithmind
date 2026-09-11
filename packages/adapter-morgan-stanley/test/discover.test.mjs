@@ -1,8 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import adapter from "../src/adapter.mjs";
+import adapter, { documentTimeFrames } from "../src/adapter.mjs";
 import { createFixtureSession } from "../fixtures/session.mjs";
-import { STATEMENT_DOCS, CONFIRMATION_DOCS, PAGINATED_STATEMENT_DOCS } from "../fixtures/documents.mjs";
+import {
+  STATEMENT_DOCS,
+  CONFIRMATION_DOCS,
+  PAGINATED_STATEMENT_DOCS,
+  OLDEST_YEAR,
+  NEWER_YEAR,
+} from "../fixtures/documents.mjs";
 
 test("discover returns an exhaustive listing when the provider states a total for every doc type", async () => {
   const session = createFixtureSession({ documentsMode: "exhaustive" });
@@ -32,8 +38,11 @@ test("discover never claims exhaustive when a doc type reports no total -- groun
   const result = await adapter.discover(session);
 
   assert.equal(result.documents.status, "incomplete");
-  assert.match(result.documents.reason, /reports no document total/);
-  // What was actually seen is still returned, never discarded.
+  assert.match(result.documents.reason, /reported no total/);
+  // What was actually seen is still returned, never discarded. The pull
+  // stops at the first year that reports no total -- the oldest year in the
+  // seven-year window, which the adapter queries first, and exactly where
+  // these fixtures' items live.
   assert.equal(result.documents.items.length, STATEMENT_DOCS.length + CONFIRMATION_DOCS.length);
 });
 
@@ -41,12 +50,12 @@ test("discover sets each document's accountExternalKey from the account it alrea
   const session = createFixtureSession({ documentsMode: "exhaustive" });
   const result = await adapter.discover(session);
 
-  const byExternalId = new Map(
-    [...STATEMENT_DOCS, ...CONFIRMATION_DOCS].map((d) => [d.externalId, d.keyAccount]),
+  const byDocumentGuid = new Map(
+    [...STATEMENT_DOCS, ...CONFIRMATION_DOCS].map((d) => [d.documentGuid, d.keyAccountNo]),
   );
   for (const doc of result.documents.items) {
-    const [rawExternalId] = doc.externalId.split("::");
-    const expectedKey = byExternalId.get(rawExternalId);
+    const [rawDocId] = doc.externalId.split("::");
+    const expectedKey = byDocumentGuid.get(rawDocId);
     if (expectedKey === undefined) {
       // F1-40: the fixture's one keyless document -- discover() must not
       // invent a key the provider never sent.
@@ -84,21 +93,41 @@ test("a document's externalId round-trips through acquire without a second docum
   assert.equal(acquired.manifest.periodEnd, statement.periodEnd);
 });
 
-test("the documents listing pages through to the provider's stated total", async () => {
+test("the documents listing pages within a calendar year, and the per-year totals sum to the provider total", async () => {
   const documentsPagesRequested = [];
   const session = createFixtureSession({ documentsMode: "paginated", documentsPagesRequested });
   const result = await adapter.discover(session);
 
   assert.equal(result.documents.status, "exhaustive");
   assert.equal(result.documents.items.length, PAGINATED_STATEMENT_DOCS.length + CONFIRMATION_DOCS.length);
-  // Three pages for the statements (two full, one partial), one for the
-  // confirmations -- never a conclusion drawn from page one alone.
+  assert.equal(result.documents.providerTotal, PAGINATED_STATEMENT_DOCS.length + CONFIRMATION_DOCS.length);
+
+  // Every year in the confirmed seven-year window is queried once per doc
+  // type -- even the empty ones, which is how a per-year total of zero is
+  // told apart from a missing total.
+  const statementYears = documentsPagesRequested.filter((r) => r.docType === "ClientStatements").map((r) => r.timeFrame);
+  assert.deepEqual(new Set(statementYears), new Set(documentTimeFrames()));
+
+  // Three different per-year totals -- two full pages and a partial third,
+  // one full page, and zero -- summing to the provider total above.
   assert.deepEqual(
-    documentsPagesRequested.filter((r) => r.docType === "Statements").map((r) => r.page),
+    documentsPagesRequested.filter((r) => r.docType === "ClientStatements" && r.timeFrame === OLDEST_YEAR).map((r) => r.page),
     ["1", "2", "3"],
   );
   assert.deepEqual(
-    documentsPagesRequested.filter((r) => r.docType !== "Statements").map((r) => r.page),
+    documentsPagesRequested.filter((r) => r.docType === "ClientStatements" && r.timeFrame === NEWER_YEAR).map((r) => r.page),
+    ["1"],
+  );
+  for (const year of documentTimeFrames()) {
+    if (year === OLDEST_YEAR || year === NEWER_YEAR) continue;
+    assert.deepEqual(
+      documentsPagesRequested.filter((r) => r.docType === "ClientStatements" && r.timeFrame === year).map((r) => r.page),
+      ["1"],
+    );
+  }
+  // The confirmations, all in the oldest year, take one page.
+  assert.deepEqual(
+    documentsPagesRequested.filter((r) => r.docType === "TradeConfirmations" && r.timeFrame === OLDEST_YEAR).map((r) => r.page),
     ["1"],
   );
 });
@@ -119,8 +148,8 @@ test("discover tolerates a documents pull failing outright (e.g. the missing Aut
   const result = await adapter.discover(session);
 
   assert.equal(result.documents.status, "incomplete");
-  assert.match(result.documents.reason, /docType=Statements failed/);
-  assert.match(result.documents.reason, /docType=Trade confirmations failed/);
+  assert.match(result.documents.reason, /docType=ClientStatements failed/);
+  assert.match(result.documents.reason, /docType=TradeConfirmations failed/);
   assert.equal(result.documents.items.length, 0);
   // The activity-only bounded pull can still proceed: accounts are unaffected.
   assert.equal(result.accounts.length, 8);
