@@ -32,7 +32,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { archive, count, one, reader, refused, skip } from "./helpers/pgArchive.mjs";
+import {
+  adminFor,
+  count,
+  nonSuperuserArchive,
+  one,
+  reader,
+  refused,
+  skip,
+} from "./helpers/pgArchive.mjs";
 import {
   applyPgReaderRole,
   createArchiveClient,
@@ -62,8 +70,14 @@ async function seed(client) {
   );
 }
 
+/**
+ * Every attack below runs against a reader the *hosted* owner could actually
+ * have created: a role with CREATEROLE and CREATEDB and no superuser bit. A
+ * superuser owner would have hidden F1-30, where `ALTER ROLE ... NOSUPERUSER
+ * NOBYPASSRLS` was refused with 42501 and no reader existed at all.
+ */
 async function fixture(t, options = {}) {
-  const owner = await archive(t);
+  const owner = await nonSuperuserArchive(t);
   await seed(owner);
   const readerHandle = await reader(t, owner, options);
   return { owner, reader: readerHandle };
@@ -518,7 +532,7 @@ test("a READ ONLY transaction refuses a write even where privilege would allow i
 });
 
 test("concurrency is bounded at connection time, not by a setting", { skip }, async (t) => {
-  const owner = await archive(t);
+  const owner = await nonSuperuserArchive(t);
   await seed(owner);
   const r = await reader(t, owner, { connectionLimit: 1 });
   // The first connection is already open. A second one is refused by the
@@ -533,4 +547,76 @@ test("concurrency is bounded at connection time, not by a setting", { skip }, as
   }
   assert.ok(error, "a second concurrent reader connection must be refused");
   assert.equal(error.code, "53300", "too_many_connections");
+});
+
+test("the whole setup runs as a non-superuser owner (F1-30)", { skip }, async (t) => {
+  const { owner, reader: r } = await fixture(t);
+  const actor = await one(
+    owner,
+    `SELECT rolsuper, rolcreaterole, rolcreatedb
+       FROM pg_roles WHERE rolname = current_user`,
+  );
+  assert.equal(actor.rolsuper, false, "the hosted archive owner is not a superuser");
+  assert.equal(actor.rolcreaterole, true);
+  assert.equal(actor.rolcreatedb, true);
+
+  // The re-run path, which is the documented step after a migration. It has
+  // to verify the superuser-gated attributes rather than re-assert them:
+  // Postgres refuses to let this role so much as *name* SUPERUSER, BYPASSRLS
+  // or REPLICATION in an ALTER ROLE, even to set the value the role already
+  // has. That refusal is asserted directly below, so a statement quietly
+  // reintroduced into the setup fails this test rather than production.
+  await applyPgReaderRole(owner, { password: r.password });
+  const attributes = await one(
+    owner,
+    `SELECT rolsuper, rolbypassrls, rolreplication
+       FROM pg_roles WHERE rolname = $1`,
+    [r.summary.role],
+  );
+  assert.deepEqual(
+    { ...attributes },
+    { rolsuper: false, rolbypassrls: false, rolreplication: false },
+  );
+  for (const attribute of ["NOSUPERUSER", "NOBYPASSRLS", "NOREPLICATION"]) {
+    const error = await refused(
+      owner,
+      `ALTER ROLE ${r.summary.role} WITH ${attribute}`,
+    );
+    assert.ok(error, attribute);
+    assert.equal(
+      error.code,
+      "42501",
+      `${attribute} in ALTER ROLE is superuser-only even when it changes nothing`,
+    );
+  }
+});
+
+test("a pre-existing role that bypasses row security is refused, not adopted", { skip }, async (t) => {
+  const owner = await nonSuperuserArchive(t);
+  const admin = await adminFor(t, owner);
+  const schema = (await one(owner, "SELECT current_schema() AS name")).name;
+  const role = readerRoleName(schema);
+  const password = "f1_30_throwaway_password";
+
+  // The verification's whole point: a role that already exists outside this
+  // path may hold an attribute a non-superuser owner cannot remove. Adopting
+  // it would hand back a "reader" that reads past every row security policy.
+  await admin.query(`CREATE ROLE ${role} WITH LOGIN BYPASSRLS PASSWORD '${password}'`);
+  try {
+    const error = await applyPgReaderRole(owner, { password }).then(
+      () => null,
+      (caught) => caught,
+    );
+    assert.ok(error, "an existing BYPASSRLS role must not be accepted as a reader");
+    assert.match(error.message, /BYPASSRLS/);
+    const still = await one(
+      owner,
+      "SELECT rolbypassrls FROM pg_roles WHERE rolname = $1",
+      [role],
+    );
+    assert.equal(still.rolbypassrls, true, "and nothing silently claimed otherwise");
+  } finally {
+    await admin.query(`DROP OWNED BY ${role}`);
+    await admin.query(`DROP ROLE IF EXISTS ${role}`);
+  }
 });

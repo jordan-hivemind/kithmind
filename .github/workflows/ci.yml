@@ -29,7 +29,7 @@ jobs:
     # not a passing one.
     services:
       postgres:
-        image: postgres:16
+        image: postgres:17
         env:
           POSTGRES_PASSWORD: postgres
         options: >-
