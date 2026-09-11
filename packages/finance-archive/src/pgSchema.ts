@@ -356,6 +356,23 @@ ALTER TABLE accounts
   ADD CONSTRAINT accounts_external_key_unique UNIQUE (institution_id, external_key);
 `;
 
+// F1-36. review_items.source_document_id already carries a foreign key to
+// documents(id) -- the initial schema declared it inline, with the default
+// NO ACTION -- so a document could not be deleted at all while any review
+// item still named it. A review item is about that document's own content;
+// once the document is gone there is nothing left for it to point evidence
+// at, so its right place is to go with the document rather than to block
+// the delete. The constraint is dropped and re-added under its default
+// (Postgres-assigned) name rather than named explicitly, since the initial
+// schema never named it either and a migration should not invent a name the
+// running schema does not already have.
+const REVIEW_ITEMS_CASCADE = `
+ALTER TABLE review_items
+  DROP CONSTRAINT review_items_source_document_id_fkey,
+  ADD CONSTRAINT review_items_source_document_id_fkey
+    FOREIGN KEY (source_document_id) REFERENCES documents(id) ON DELETE CASCADE;
+`;
+
 /** Every migration, in order. The last one's version is the current schema. */
 export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
   {
@@ -372,6 +389,11 @@ export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
     version: 3,
     name: "accounts external key",
     sql: ACCOUNT_EXTERNAL_KEY,
+  },
+  {
+    version: 4,
+    name: "review_items.source_document_id cascades on document delete",
+    sql: REVIEW_ITEMS_CASCADE,
   },
 ]);
 

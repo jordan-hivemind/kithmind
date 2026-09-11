@@ -621,3 +621,41 @@ test(
     }
   },
 );
+
+// F1-36. review_items.source_document_id already carried a foreign key to
+// documents(id) (the initial schema, inline REFERENCES), just with the
+// default NO ACTION -- so deleting a document any review item still named
+// blocked outright. The version-4 migration adds ON DELETE CASCADE; this
+// proves that against a real archive rather than trusting the DDL to have
+// parsed the way it reads.
+test(
+  "review_items.source_document_id cascades when its document is deleted (F1-36)",
+  { skip },
+  async () => {
+    await withArchive(async (client) => {
+      await client.query(
+        "INSERT INTO institutions (id, name, slug) VALUES ('inst-1', 'Thistlebrook Trust', 'thistlebrook')",
+      );
+      await client.query(
+        `INSERT INTO documents (id, institution_id, doc_type, doc_date, file_path, sha256)
+         VALUES ('doc-1', 'inst-1', 'activity_pull', DATE '2026-03-04', '/raw/doc-1', $1)`,
+        ["a".repeat(64)],
+      );
+      await client.query(
+        `INSERT INTO review_items (id, kind, source_document_id, reason)
+         VALUES ('review-1', 'unparseable_process_date', 'doc-1', 'not a valid date')`,
+      );
+
+      await client.query("DELETE FROM documents WHERE id = 'doc-1'");
+
+      const remaining = await client.query(
+        "SELECT count(*)::text AS n FROM review_items WHERE id = 'review-1'",
+      );
+      assert.equal(
+        remaining.rows[0].n,
+        "0",
+        "the review item about the deleted document's content should not outlive it",
+      );
+    });
+  },
+);
