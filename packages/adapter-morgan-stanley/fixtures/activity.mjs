@@ -1,7 +1,8 @@
 // Synthetic Morgan Stanley activity-API fixtures. Real field names
 // (processDate, activityDate, tradeDate, settlementDate, accountName,
-// keyAccount, activity, description, amount, quantity, price, symbol, cusip,
-// checkNumber), entirely invented values. No real account number, no person.
+// keyAccount, activity, CCY, description, amount, quantity, price, symbol,
+// cusip, checkNumber), entirely invented values. No real account number, no
+// person.
 
 import { MS_ACTIVITY_ROWS_KEY } from "../src/adapter.mjs";
 
@@ -23,6 +24,7 @@ export const ROW_1_TREASURY = {
   accountName: "Sample Brokerage Account",
   keyAccount: KEY_ACCOUNT,
   activity: "Bought",
+  CCY: "-",
   description: "TREASURY BILL PURCHASE<br/>RATE:4.500 DUE:2026-03-15",
   amount: -9875.0,
   quantity: 10000,
@@ -41,6 +43,7 @@ export const ROW_2_SELL_TRADE = {
   accountName: "Sample Brokerage Account",
   keyAccount: KEY_ACCOUNT,
   activity: "Sold",
+  CCY: "-",
   description: "EQUITY SALE",
   amount: 5321.1,
   quantity: 25,
@@ -59,6 +62,7 @@ export const ROW_3_AUTOMATED_PAYMENT = {
   accountName: "Sample Brokerage Account",
   keyAccount: KEY_ACCOUNT,
   activity: "ACH Disbursement",
+  CCY: "-",
   description: "AUTOMATED PAYMENT<br/>PAYEE:Example Utility Co<br/>ACCT:...4821",
   amount: -150.0,
   quantity: null,
@@ -77,6 +81,7 @@ export const ROW_4_BUY_TRADE = {
   accountName: "Sample Brokerage Account",
   keyAccount: KEY_ACCOUNT,
   activity: "Bought",
+  CCY: "-",
   description: "EQUITY PURCHASE",
   amount: -4578.0,
   quantity: 15,
@@ -95,6 +100,7 @@ export const ROW_5_UNPARSEABLE_AMOUNT = {
   accountName: "Sample Brokerage Account",
   keyAccount: KEY_ACCOUNT,
   activity: "Fee",
+  CCY: "-",
   description: "ACCOUNT MAINTENANCE FEE",
   amount: "N/A",
   quantity: null,
@@ -113,6 +119,7 @@ export const ROW_6_UNKNOWN_ACTIVITY = {
   accountName: "Sample Brokerage Account",
   keyAccount: KEY_ACCOUNT,
   activity: "Zzyzx Adjustment",
+  CCY: "-",
   description: "UNCLASSIFIED SHARE ADJUSTMENT",
   amount: 0.0,
   quantity: 5,
@@ -131,6 +138,7 @@ export const ROW_7_DIVIDEND = {
   accountName: "Sample Retirement Account",
   keyAccount: SECOND_KEY_ACCOUNT,
   activity: "Dividend Received",
+  CCY: "-",
   description: "QUARTERLY DIVIDEND",
   amount: 42.17,
   quantity: null,
@@ -168,4 +176,26 @@ export const ACTIVITY_PAGE_WITH_CREDENTIAL_ECHO = {
     DeviceFootprintEcho: "fp-fake-0000",
     [MS_ACTIVITY_ROWS_KEY]: [ROW_1_TREASURY],
   },
+};
+
+/** A row with a missing CCY, for resolveRowCurrency's review-routing path
+ * (src/adapter.mjs). Not part of ACTIVITY_PAGES; used only where a test
+ * needs one row with a currency problem. */
+export const ROW_8_MISSING_CURRENCY = {
+  processDate: "2025-02-20",
+  activityDate: "2025-02-20",
+  tradeDate: null,
+  settlementDate: "2025-02-20",
+  accountName: "Sample Brokerage Account",
+  keyAccount: KEY_ACCOUNT,
+  activity: "Dividend Received",
+  CCY: null,
+  description: "QUARTERLY DIVIDEND",
+  amount: 10.0,
+  quantity: null,
+  price: null,
+  symbol: "WNDF",
+  cusip: "00000WNF1",
+  checkNumber: null,
+  runningBalances: { cash: "22247.84", totalValue: "208883.19" },
 };

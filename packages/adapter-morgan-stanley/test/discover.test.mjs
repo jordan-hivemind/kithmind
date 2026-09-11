@@ -48,6 +48,9 @@ test("discover's accounts map every account kind mapAccountKind recognises", asy
   assert.deepEqual(kinds, new Set(["brokerage", "retirement", "trust", "bank", "credit_line", "mortgage"]));
   // No "other" fallbacks for any of this fixture's accounts.
   assert.ok(accounts.every((a) => a.kind !== "other"));
+  // An aggregated outside-institution account (IsExternal: true) is listed
+  // by the site but not held here, and discover() excludes it.
+  assert.ok(accounts.every((a) => a.externalKey !== "EXT-ACCT-0009"));
 });
 
 test("a document's externalId round-trips through acquire without a second documents-list call", async () => {

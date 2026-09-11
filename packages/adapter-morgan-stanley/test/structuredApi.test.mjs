@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import adapter, { MS_ACTIVITY_ROWS_KEY } from "../src/adapter.mjs";
 import { createFixtureSession } from "../fixtures/session.mjs";
-import { POSTED_ACTIVITY_COUNT } from "../fixtures/activity.mjs";
+import { POSTED_ACTIVITY_COUNT, ROW_8_MISSING_CURRENCY } from "../fixtures/activity.mjs";
 
 const SELECTION = { kind: "structured_api", periodStart: "2025-01-01", periodEnd: "2025-02-28" };
 
@@ -150,6 +150,42 @@ test("a pull that captures more unique rows than the provider stated is a defect
     adapter.acquire({ ...SELECTION, session: overclaimingSession }),
     /activity pull defect: captured 2 unique row\(s\) but the provider stated postedActivityCount=1/,
   );
+});
+
+test("CCY becomes the row currency; a missing or non-three-letter CCY routes an otherwise-valid amount to review", async () => {
+  const session = createFixtureSession();
+  const acquired = await adapter.acquire({ ...SELECTION, session });
+  const parsed = await adapter.parse({ kind: "structured_api", bytes: acquired.bytes });
+  const treasury = parsed.activity.find((r) => r.description.startsWith("TREASURY"));
+  assert.equal(treasury.currency, "USD");
+
+  const missingCurrencySession = {
+    institutionSlug: "morgan-stanley",
+    async fetchText(path, query) {
+      assert.equal(path, "/activity");
+      assert.equal(query.page, "1");
+      return JSON.stringify({
+        Result: { postedActivityCount: 1, [MS_ACTIVITY_ROWS_KEY]: [ROW_8_MISSING_CURRENCY] },
+      });
+    },
+    async fetchBytes() {
+      throw new Error("not used");
+    },
+  };
+  const acquired2 = await adapter.acquire({ ...SELECTION, session: missingCurrencySession });
+  const parsed2 = await adapter.parse({ kind: "structured_api", bytes: acquired2.bytes });
+  assert.equal(parsed2.activity.length, 1);
+  assert.equal(parsed2.activity[0].amount, null, "a currency problem routes the row to review like an ambiguous amount");
+  assert.match(parsed2.activity[0].amountNote, /missing or non-three-letter CCY/);
+  assert.equal(parsed2.activity[0].currency, "USD", "the base currency is carried with the amount nulled, so no money is asserted under an unstated code");
+});
+
+test("live US dates normalize to ISO and anything else passes through for the importer to refuse", async () => {
+  const { normalizeActivityDate } = await import("../src/adapter.mjs");
+  assert.equal(normalizeActivityDate("09/10/2026\n"), "2026-09-10");
+  assert.equal(normalizeActivityDate("2026-09-10"), "2026-09-10");
+  assert.equal(normalizeActivityDate("10 Sep 2026"), "10 Sep 2026");
+  assert.equal(normalizeActivityDate(null), null);
 });
 
 test("each row is attributed to its own account, so an institution-wide pull does not collapse", async () => {

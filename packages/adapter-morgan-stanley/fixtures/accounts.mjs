@@ -5,16 +5,18 @@
 import { MS_ACCOUNTS_ITEMS_KEY } from "../src/adapter.mjs";
 
 export const ACCOUNTS_RAW = [
-  { keyAccount: "MS-ACCT-0001", label: "Brokerage", last4: "1111", accountType: "Brokerage" },
-  { keyAccount: "MS-ACCT-0002", label: "Managed Program", last4: "2222", accountType: "Investment Advisory" },
-  { keyAccount: "MS-ACCT-0003", label: "Traditional IRA", last4: "3333", accountType: "IRA" },
-  { keyAccount: "MS-ACCT-0004", label: "Roth IRA", last4: "4444", accountType: "IRA" },
-  { keyAccount: "MS-ACCT-0005", label: "Trust Account", last4: "5555", accountType: "Trust" },
-  { keyAccount: "MS-ACCT-0006", label: "Cash Account", last4: "6666", accountType: "Checking" },
-  { keyAccount: "MS-ACCT-0007", label: "Securities-Based Line of Credit", last4: "7777", accountType: "Securities-Based Line of Credit" },
-  { keyAccount: "MS-ACCT-0008", label: "Mortgage", last4: "8888", accountType: "Mortgage" },
+  { Id: "MS-ACCT-0001", Name: "nickname", Category: "Investments", AccountType: "Brokerage", IsExternal: false },
+  { Id: "MS-ACCT-0002", Name: "nickname", Category: "Investments", AccountType: "Investment Advisory", IsExternal: false },
+  { Id: "MS-ACCT-0003", Name: "nickname", Category: "Retirement Accounts", AccountType: "Traditional IRA", IsExternal: false },
+  { Id: "MS-ACCT-0004", Name: "nickname", Category: "Retirement Accounts", AccountType: "Roth IRA", IsExternal: false },
+  { Id: "MS-ACCT-0005", Name: "nickname", Category: "Trust", AccountType: "Trust", IsExternal: false },
+  { Id: "MS-ACCT-0006", Name: "nickname", Category: "Cash Management", AccountType: "Checking", IsExternal: false },
+  { Id: "MS-ACCT-0007", Name: "nickname", Category: "Other Loans", AccountType: "Securities-Based Line of Credit", IsExternal: false },
+  { Id: "MS-ACCT-0008", Name: "nickname", Category: "Mortgage Loans", AccountType: "Mortgage", IsExternal: false },
+  // An aggregated outside-institution account: listed by the site, not held here, excluded by discover.
+  { Id: "EXT-ACCT-0009", Name: "nickname", Category: "Investments", AccountType: "Brokerage", IsExternal: true },
 ];
 
 export function accountsResponse() {
-  return { [MS_ACCOUNTS_ITEMS_KEY]: ACCOUNTS_RAW };
+  return { Result: { [MS_ACCOUNTS_ITEMS_KEY]: ACCOUNTS_RAW } };
 }

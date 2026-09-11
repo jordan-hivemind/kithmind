@@ -33,7 +33,7 @@ test("json_allowlist drops credential-shaped and person-shaped fields, never cop
       "pages.*.Result.activityDetails.*.runningBalances",
     ].sort(),
   );
-  assert.equal(retained.record.policy.version, "ms-activity-1");
+  assert.equal(retained.record.policy.version, "ms-activity-2");
 });
 
 test("a structured_api payload may never be retained opaque", () => {

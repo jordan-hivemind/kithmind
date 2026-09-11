@@ -11,6 +11,8 @@
     "./session": "./src/bridge.mjs"
   },
   "scripts": {
+    "build": "echo 'no build step: plain ES modules, nothing to compile' && exit 0",
+    "check-types": "echo 'no check-types step: plain JavaScript, no type checker configured' && exit 0",
     "test": "node --test test/*.test.mjs",
     "test:once": "node --test test/*.test.mjs"
   },

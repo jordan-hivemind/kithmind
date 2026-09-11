@@ -262,20 +262,30 @@ export default async function createMorganStanleySession(options = {}) {
   await cdp.send("Page.enable");
   await cdp.send("Runtime.enable");
   await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source: HEADER_HOOK });
-  await cdp.send("Page.reload");
 
-  // The app's own on-load request populates the slot; wait for it rather
-  // than assuming the reload is instantaneous.
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    const keys = await evaluate(
-      cdp,
-      `Object.keys(globalThis[Symbol.for(${JSON.stringify(CAPTURED_HEADERS_SLOT)})] ?? {})`,
-    );
-    if (keys.length > 0) break;
-    if (attempt === 99) {
-      throw new Error("no session headers captured after reload: open the Activity tab and retry");
+  const slotKeys = () =>
+    evaluate(cdp, `Object.keys(globalThis[Symbol.for(${JSON.stringify(CAPTURED_HEADERS_SLOT)})] ?? {})`);
+
+  // A document that already carries captured headers (a hook installed by an
+  // earlier session in this tab) is usable as is; reloading it would only
+  // race the app's on-load request. Otherwise reload and wait for the *new*
+  // document, marked by the disappearance of a sentinel set on the old one,
+  // before trusting the slot: reading the old document's slot right after
+  // Page.reload returns stale keys and the fetch that follows finds nothing.
+  if ((await slotKeys()).length === 0) {
+    await evaluate(cdp, "globalThis.__kithmindReloadSentinel = true; true");
+    await cdp.send("Page.reload");
+    let fresh = false;
+    for (let attempt = 0; attempt < 300; attempt += 1) {
+      if (!fresh) {
+        fresh = await evaluate(cdp, "globalThis.__kithmindReloadSentinel === undefined").catch(() => false);
+      }
+      if (fresh && (await slotKeys().catch(() => [])).length > 0) break;
+      if (attempt === 299) {
+        throw new Error("no session headers captured after reload: open the Activity tab and retry");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
     }
-    await new Promise((resolve) => setTimeout(resolve, 100));
   }
 
   async function fetchText(path, query = {}) {

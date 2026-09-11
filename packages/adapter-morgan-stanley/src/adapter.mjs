@@ -19,7 +19,11 @@ import {
 
 export const INSTITUTION_SLUG = "morgan-stanley";
 export const INSTITUTION_NAME = "Morgan Stanley";
-const CURRENCY = "USD"; // documented quirk: no per-row currency field is known to exist.
+// Every account this adapter has seen is USD-based; structured_api rows
+// spell the base currency "-" (see resolveRowCurrency). tabular_export and
+// pdf_statement/trade_confirmation have no confirmed per-row currency source
+// and default to this.
+const BASE_CURRENCY = "USD";
 const MS_DESCRIPTION_SEPARATOR = "<br/>";
 const MAX_ACTIVITY_PAGES_PER_PULL = 50;
 const MS_DOCUMENTS_PAGE_SIZE = 50; // the listing paginates at roughly 50 rows
@@ -42,7 +46,7 @@ const MAX_DOCUMENTS_PAGES_PER_TYPE = 200;
 const MS_ACTIVITY_ROWS_KEY = "activityDetails";
 const MS_DOCUMENTS_ITEMS_KEY = "documents";
 const MS_DOCUMENTS_TOTAL_KEY = "totalCount";
-const MS_ACCOUNTS_ITEMS_KEY = "accounts";
+const MS_ACCOUNTS_ITEMS_KEY = "Accounts";
 
 export {
   MS_ACTIVITY_ROWS_KEY,
@@ -100,9 +104,10 @@ const ACTIVITY_TAXONOMY = {
  */
 const ACTIVITY_RETENTION = {
   kind: "json_allowlist",
-  version: "ms-activity-1",
+  version: "ms-activity-2",
   fields: [
     "pages.*.Result.postedActivityCount",
+    `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.CCY`,
     `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.processDate`,
     `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.activityDate`,
     `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.tradeDate`,
@@ -141,6 +146,16 @@ export { ACTIVITY_RETENTION, DOCUMENT_RETENTION, TABULAR_RETENTION };
 
 // --- shared helpers ----------------------------------------------------------
 
+/** Activity dates are US "MM/DD/YYYY"; the archive wants ISO "YYYY-MM-DD".
+ * Anything else passes through untouched so the importer's own date check
+ * routes it to review rather than a guess. */
+export function normalizeActivityDate(value) {
+  if (typeof value !== "string") return value ?? null;
+  const t = value.trim();
+  const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(t);
+  return m ? `${m[3]}-${m[1]}-${m[2]}` : t;
+}
+
 /** Splits an embedded `<br/>`-delimited description into newline-joined text,
  * keeping every segment (README, "Parsing"). A no-op when the
  * separator is absent, so it is safe to apply uniformly across tiers. */
@@ -155,6 +170,32 @@ export function resolveAmount(text) {
   } catch {
     return { amount: null, amountNote: `unparseable amount: ${JSON.stringify(text)}` };
   }
+}
+
+/**
+ * The per-row `CCY` field, normalized to an uppercase three-letter code.
+ * `ParsedRow.currency` is a required string (not nullable), so a missing or
+ * non-three-letter value cannot itself become null -- instead this reports a
+ * problem the caller routes through the same review-style null-with-a-note
+ * path `resolveAmount` already uses for ambiguous money (ground rule 5),
+ * carrying the raw value through as-is so nothing is lost.
+ */
+export function resolveRowCurrency(rawCcy) {
+  const normalized = typeof rawCcy === "string" ? rawCcy.trim().toUpperCase() : "";
+  // CCY is "-" on the large majority of rows and carries an ISO code only on
+  // foreign-currency rows (e.g. CAD, GBP, EUR, CHF). The dash is the
+  // institution's spelling of "the account's base currency", which is USD
+  // for every account this adapter has seen. Values also carry a trailing
+  // newline, hence the trim.
+  if (normalized === "-") return { currency: BASE_CURRENCY, currencyProblem: null };
+  if (/^[A-Z]{3}$/.test(normalized)) return { currency: normalized, currencyProblem: null };
+  // ParsedRow.currency must be a valid code, so the row carries the base
+  // currency with its amount nulled and the problem noted: no money value is
+  // asserted under a currency the row did not state.
+  return {
+    currency: BASE_CURRENCY,
+    currencyProblem: `missing or non-three-letter CCY: ${JSON.stringify(rawCcy)}`,
+  };
 }
 
 /**
@@ -331,19 +372,26 @@ async function fetchDocumentsForType(session, docType, kind) {
 async function fetchAccounts(session) {
   const text = await session.fetchText("/accounts", {});
   const parsed = JSON.parse(text);
-  const items = parsed?.[MS_ACCOUNTS_ITEMS_KEY];
+  const items = parsed?.Result?.[MS_ACCOUNTS_ITEMS_KEY];
   if (!Array.isArray(items)) {
     throw new Error(
-      `accounts response has no "${MS_ACCOUNTS_ITEMS_KEY}" array ` +
+      `accounts response has no "Result.${MS_ACCOUNTS_ITEMS_KEY}" array ` +
         "(see the \"Unconfirmed institution response shapes\" comment in src/adapter.mjs)",
     );
   }
-  return items.map((raw) => ({
-    externalKey: raw.keyAccount,
-    label: raw.label,
-    last4: raw.last4,
-    kind: mapAccountKind(raw.accountType),
-  }));
+  // Field names: Id (opaque string), Name (a nickname, which can carry a
+  // person's name and is therefore never used), Category (the site's own
+  // grouping, e.g. Investments, Trust, Retirement Accounts, Cash Management,
+  // Mortgage Loans, Other Loans), AccountType, IsExternal (an aggregated
+  // outside-institution account, not held here, excluded).
+  return items
+    .filter((raw) => raw?.IsExternal !== true && typeof raw?.Id === "string" && raw.Id.length > 0)
+    .map((raw) => ({
+      externalKey: raw.Id,
+      label: [raw.Category, raw.AccountType].filter(Boolean).join(": ") || "account",
+      last4: raw.Id.slice(-4),
+      kind: mapAccountKind(`${raw.Category ?? ""} ${raw.AccountType ?? ""}`),
+    }));
 }
 
 async function discover(session) {
@@ -581,7 +629,22 @@ function parseStructuredApi(bytes) {
         field: `page ${pageArrayIndex + 1}`,
         binding,
       };
-      const parsedAmount = resolveAmount(String(item.amount));
+      // Live rows carry trailing newlines on scalar strings.
+      for (const k of ["amount", "quantity", "price", "activity", "symbol", "cusip", "tradeDate", "processDate", "settlementDate", "activityDate"]) {
+        if (typeof item[k] === "string") item[k] = item[k].trim();
+      }
+      for (const k of ["tradeDate", "processDate", "settlementDate", "activityDate"]) {
+        item[k] = normalizeActivityDate(item[k]);
+      }
+      let parsedAmount = resolveAmount(String(item.amount));
+      const { currency, currencyProblem } = resolveRowCurrency(item.CCY);
+      // A currency problem routes the row to review the same way an
+      // unparseable amount already does (ground rule 5): only when the
+      // amount itself was otherwise readable, so one row never reports two
+      // conflicting reasons for its own null amount.
+      if (currencyProblem !== null && parsedAmount.amount !== null) {
+        parsedAmount = { amount: null, amountNote: currencyProblem };
+      }
 
       rows.push({
         sourceDocument,
@@ -598,7 +661,7 @@ function parseStructuredApi(bytes) {
         instrument: instrumentFromSymbol(item.symbol, item.cusip),
         quantity: resolveSignedQuantity(item.activity, item.quantity ?? null),
         price: item.price === null || item.price === undefined ? null : canonicalizeDecimal(String(item.price)),
-        currency: CURRENCY,
+        currency,
         // Leaf field names inside runningBalances are unknown and not
         // retained in v1 (see ACTIVITY_RETENTION's doc comment).
         runningBalance: null,
@@ -660,7 +723,7 @@ function parseTabularExport(bytes) {
       instrument: instrumentFromSymbol(symbol, null),
       quantity: resolveSignedQuantity(activityType, quantity === "-" ? null : quantity),
       price: price === "-" ? null : canonicalizeDecimal(price),
-      currency: CURRENCY,
+      currency: BASE_CURRENCY,
       runningBalance: null,
       locators: parsedAmount.amount === null ? { row: rowLocator, amount: rowLocator } : { row: rowLocator },
       ...parsedAmount,
@@ -882,8 +945,11 @@ function capabilities() {
         "embedded in description text in v1.",
       "exportRanges.earliest for structured_api and tabular_export is an approximation (start " +
         "of last calendar year), not a provider-confirmed bound.",
-      "All money is assumed USD; no per-row currency field is known to exist for the " +
-        "activity API or the tabular export.",
+      "structured_api rows carry a per-row CCY currency field, used as " +
+        "ParsedRow.currency (a missing or non-three-letter value routes the row to review the " +
+        "same way an unparseable amount does). tabular_export and pdf_statement/" +
+        "trade_confirmation still have no confirmed per-row currency source and default to " +
+        "the base currency.",
     ],
     activityTaxonomy: ACTIVITY_TAXONOMY,
   };
