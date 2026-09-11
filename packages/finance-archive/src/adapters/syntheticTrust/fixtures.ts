@@ -404,6 +404,11 @@ export type DocumentFixture = {
   readonly periodEnd: string;
   readonly label: string;
   readonly text: () => string;
+  /** F1-40. Which of `ACCOUNTS` this document belongs to, mirroring what a
+   * real adapter's discover() already encodes into the document's own
+   * externalId. Omitted on one fixture document on purpose, so the suite
+   * exercises the "no key" institution-wide fallback too. */
+  readonly accountExternalKey?: string;
 };
 
 const STATEMENT_ROWS = generateActivityRows(5, "2025-02-01");
@@ -503,6 +508,10 @@ export const DOCUMENTS: readonly DocumentFixture[] = [
     periodEnd: "2025-02-28",
     label: "February 2025 statement",
     text: buildStatementText,
+    // F1-40: this is the one document fixture with a HOLDINGS section
+    // (positions, a balance and a liability) -- assigning it an account
+    // lets the suite check that an expanded pull lands them all there.
+    accountExternalKey: ACCOUNTS[0]!.externalKey,
   },
   {
     externalId: "doc-stmt-2025-q2",
@@ -516,6 +525,8 @@ export const DOCUMENTS: readonly DocumentFixture[] = [
         "PAGE 1",
         ...generateActivityRows(2, "2025-03-04").map((row) => statementLine(row)),
       ].join("\n"),
+    // F1-40: no accountExternalKey on purpose -- the suite's institution-wide
+    // fallback case.
   },
   {
     externalId: "doc-conf-2025-02-10",
@@ -524,6 +535,9 @@ export const DOCUMENTS: readonly DocumentFixture[] = [
     periodEnd: "2025-02-10",
     label: "Trade confirmation, 2025-02-10",
     text: buildConfirmationText,
+    // F1-40: no accountExternalKey either -- test/run.test.mjs's existing
+    // "expand": "discovered" test already covers a keyless document staying
+    // institution-wide and unattributable, using this one.
   },
 ];
 

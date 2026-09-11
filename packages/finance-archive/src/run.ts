@@ -452,6 +452,12 @@ type RunOutcome = {
   readonly documentPullsSkipped: number;
   readonly documentPullsFailed: number;
   readonly documentPullsByKind: Readonly<Record<string, DocKindCounts>>;
+  /** F1-40. How document-tier pulls were filed: under the single account
+   * their own `accountExternalKey` resolved to, or institution-wide (no key,
+   * or a key this run discovered no account for). Independent of whether the
+   * pull went on to be acquired, skipped or failed. */
+  readonly documentsFiledByAccount: number;
+  readonly documentsFiledInstitutionWide: number;
 };
 
 type DocKindCounts = {
@@ -590,9 +596,16 @@ function expandSelectionPulls(
       for (const doc of discovered.documents.items) {
         if (!wanted.has(doc.kind)) continue;
         specs.push({
-          // DiscoveredDocument names no account (adapter.ts): the pull is
-          // filed institution-wide, exactly like "scope": "institution".
-          accountId: null,
+          // F1-40. A statement or confirmation belongs to exactly one
+          // account, and a real adapter's discover() already encodes which
+          // one into accountExternalKey -- file the pull under it, same as
+          // an explicit per-account selection. No key, or a key this run
+          // never discovered an account for, stays institution-wide exactly
+          // as it did before this field existed.
+          accountId:
+            doc.accountExternalKey !== undefined
+              ? (accountsByExternalKey.get(doc.accountExternalKey) ?? null)
+              : null,
           docType: entry.docType,
           docDate: doc.periodEnd,
           selection: { kind: doc.kind, externalId: doc.externalId },
@@ -713,6 +726,16 @@ async function main(): Promise<void> {
     // entries into concrete pulls; a plain entry passes through unchanged
     // (same resolveEntryAccountId call the loop below used to make itself).
     const pullSpecs = expandSelectionPulls(selectionFile.pulls, discovered, accountsByExternalKey);
+
+    // F1-40: how document-tier pulls were filed, independent of whether they
+    // go on to be acquired, skipped or failed below.
+    let documentsFiledByAccount = 0;
+    let documentsFiledInstitutionWide = 0;
+    for (const spec of pullSpecs) {
+      if (!isDocumentTierKind(spec.selection.kind)) continue;
+      if (spec.accountId === null) documentsFiledInstitutionWide += 1;
+      else documentsFiledByAccount += 1;
+    }
 
     // F1-35: an institution-wide pull's own accountId is null, and its rows
     // are attributed by their own accountExternalKey instead -- include
@@ -982,6 +1005,8 @@ async function main(): Promise<void> {
         documentPullsSkipped,
         documentPullsFailed,
         documentPullsByKind: Object.fromEntries(documentPullsByKind),
+        documentsFiledByAccount,
+        documentsFiledInstitutionWide,
       };
     }
 
@@ -1051,6 +1076,10 @@ function printSummary(
     );
   }
   if (Object.keys(outcome.documentPullsByKind).length === 0) console.log("  (none)");
+  console.log(
+    `documents filed: by account=${outcome.documentsFiledByAccount} ` +
+      `institution-wide=${outcome.documentsFiledInstitutionWide}`,
+  );
   console.log(`bytes acquired: ${outcome.bytesAcquired}`);
   console.log(`acquisition manifest sha256: ${outcome.manifestSha256}`);
   console.log(`rows parsed: ${outcome.rowsParsed}`);

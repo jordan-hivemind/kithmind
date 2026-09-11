@@ -13,6 +13,11 @@ export const STATEMENT_DOCS = [
 export const CONFIRMATION_DOCS = [
   { externalId: "CONF-2025-0117", keyAccount: "MS-ACCT-0001", periodStart: "2025-01-17", periodEnd: "2025-01-17", label: "Trade confirmation, January 17 2025" },
   { externalId: "CONF-2025-0304", keyAccount: "MS-ACCT-0001", periodStart: "2025-03-04", periodEnd: "2025-03-04", label: "Trade confirmation, March 4 2025" },
+  // F1-40. No keyAccount: what the listing looks like when the provider
+  // omits it for one item -- rowAccountExternalKey (and therefore this
+  // document's own accountExternalKey) must come back undefined rather than
+  // an empty string, so run.ts files this one institution-wide.
+  { externalId: "CONF-2025-0410", keyAccount: undefined, periodStart: "2025-04-10", periodEnd: "2025-04-10", label: "Trade confirmation, April 10 2025" },
 ];
 
 export function documentsPage(items, { docType, totalCount }) {

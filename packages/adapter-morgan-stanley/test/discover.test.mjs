@@ -37,6 +37,26 @@ test("discover never claims exhaustive when a doc type reports no total -- groun
   assert.equal(result.documents.items.length, STATEMENT_DOCS.length + CONFIRMATION_DOCS.length);
 });
 
+test("discover sets each document's accountExternalKey from the account it already encodes into externalId", async () => {
+  const session = createFixtureSession({ documentsMode: "exhaustive" });
+  const result = await adapter.discover(session);
+
+  const byExternalId = new Map(
+    [...STATEMENT_DOCS, ...CONFIRMATION_DOCS].map((d) => [d.externalId, d.keyAccount]),
+  );
+  for (const doc of result.documents.items) {
+    const [rawExternalId] = doc.externalId.split("::");
+    const expectedKey = byExternalId.get(rawExternalId);
+    if (expectedKey === undefined) {
+      // F1-40: the fixture's one keyless document -- discover() must not
+      // invent a key the provider never sent.
+      assert.equal(doc.accountExternalKey, undefined);
+    } else {
+      assert.equal(doc.accountExternalKey, expectedKey);
+    }
+  }
+});
+
 test("discover's accounts map every account kind mapAccountKind recognises", async () => {
   const session = createFixtureSession();
   const { accounts } = await adapter.discover(session);
