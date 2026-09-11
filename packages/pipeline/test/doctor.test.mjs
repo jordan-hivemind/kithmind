@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   chmod,
   mkdtemp,
@@ -20,10 +21,20 @@ import {
   formatDoctorResult,
 } from "../dist/doctor.js";
 
+// The journal authority lock port is derived from endpoint+spaceId+sourceAccountId
+// (see acquireLocks in journal.ts). A fixed literal here would bind the same TCP
+// port on every run, so concurrent suites (e.g. two worktrees) would collide even
+// though they are exercising unrelated journals. Deriving it from the per-run
+// journal directory keeps each fixture's authority unique.
+function fixtureEndpoint(journalDir) {
+  const digest = createHash("sha256").update(journalDir).digest("hex");
+  return `https://doctor-${digest.slice(0, 32)}.invalid/api/worker`;
+}
+
 function config(root, journal, overrides = {}) {
   return {
     protocolVersion: 1,
-    endpoint: "http://127.0.0.1:3100/api/worker",
+    endpoint: fixtureEndpoint(journal),
     spaceId: "space",
     sourceAccountId: "source",
     credentialEnv: "SYNTHETIC_DOCTOR_TOKEN",
@@ -166,6 +177,34 @@ test("fresh scoped setup is operationally ready before coverage exists", async (
   });
   assert.deepEqual(await readdir(files.base), ["root"]);
   assert.equal(JSON.stringify(result).includes(files.base), false);
+});
+
+test("concurrent doctor checks for unrelated journal roots do not contend on the authority lock", async (context) => {
+  // Regression guard for the fixed doctor() test authority (see fixtureEndpoint
+  // above): a literal endpoint/spaceId/sourceAccountId shared by every fixture
+  // would make two unrelated journals bind the *same* authority lock port
+  // (acquireLocks in journal.ts derives it from endpoint+spaceId+sourceAccountId
+  // alone when the journal directory does not exist yet). Racing two doctor()
+  // calls against distinct, never-created journal roots must not report
+  // "contended" for either, or the authority key stopped varying per fixture.
+  const first = await fixture();
+  const second = await fixture();
+  context.after(() =>
+    Promise.all([
+      rm(first.base, { recursive: true, force: true }),
+      rm(second.base, { recursive: true, force: true }),
+    ]),
+  );
+
+  const [firstResult, secondResult] = await Promise.all([
+    doctor(config(first.root, first.journal), transport(source()), "synthetic-token"),
+    doctor(config(second.root, second.journal), transport(source()), "synthetic-token"),
+  ]);
+
+  assert.notEqual(check(firstResult, "journal")?.code, "contended");
+  assert.notEqual(check(secondResult, "journal")?.code, "contended");
+  assert.equal(check(firstResult, "journal")?.state, "pass");
+  assert.equal(check(secondResult, "journal")?.state, "pass");
 });
 
 test("missing credential still runs local root and journal diagnostics", async (context) => {

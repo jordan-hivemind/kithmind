@@ -10,7 +10,7 @@
     "build": "tsc -p tsconfig.json",
     "check-types": "pnpm --filter @repo/worker-protocol check-types && tsc -p tsconfig.json --noEmit",
     "test": "node --test test/*.test.mjs",
-    "test:once": "node --test test/*.test.mjs",
+    "test:once": "node --test --test-concurrency=1 test/*.test.mjs",
     "pipeline": "node dist/cli.js"
   },
   "devDependencies": {
