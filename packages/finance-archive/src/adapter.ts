@@ -180,6 +180,17 @@ export type AcquisitionGap = {
   readonly reason: string;
 };
 
+/**
+ * What retained bytes are. The same four spellings the read contract's
+ * evidence `sourceObject.mediaType` accepts; an adapter that retains
+ * something else needs both this union and that one widened together.
+ */
+export type RetainedMediaType =
+  | "application/pdf"
+  | "application/json"
+  | "text/csv; charset=utf-8"
+  | "text/plain; charset=utf-8";
+
 export type AcquisitionManifestEntry = {
   readonly kind: CapabilityTier;
   readonly periodStart: string;
@@ -195,6 +206,15 @@ export type AcquisitionManifestEntry = {
    * storing the projection is the exact mistake this wording exists to stop.
    */
   readonly contentHash: string;
+  /**
+   * The media type of the **retained** bytes, declared rather than inferred
+   * from `kind`. Only the adapter knows what it actually retained: a
+   * `pdf_statement` tier does not make the bytes a PDF, and the synthetic
+   * fixture's statement bytes are UTF-8 text. The archive records this on the
+   * document so a citation can say what a consumer has to parse
+   * (docs/plans/2026-09-11-structured-evidence.md).
+   */
+  readonly mediaType: RetainedMediaType;
   /**
    * The row count the provider claimed for this pull, when it claims one, so
    * the importer can assert against it (ground rule 7). Null when not

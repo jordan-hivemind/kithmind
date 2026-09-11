@@ -211,6 +211,21 @@ export type ImportDocument = {
    * a pull is never recorded as complete coverage by this importer alone.
    */
   providerReportedCount: number | null;
+  /**
+   * What this document's rows were parsed from, all four or none (F1-29,
+   * docs/plans/2026-09-11-structured-evidence.md). `retainedSha256` is the
+   * sha256 of the immutable retained bytes, which is *not* `sha256` for a
+   * page row of a paginated pull: that one is a derived row identity naming
+   * no bytes, and every page of one pull shares these four values.
+   * `mediaType` is the adapter's own declaration, never inferred from the
+   * capability tier. Omitted (or null) for a document whose bytes were never
+   * recorded; the columns are nullable and such a row simply produces no
+   * evidence. A partial set is refused by the table's CHECK.
+   */
+  retainedSha256?: string | null;
+  retainedByteLength?: number | null;
+  mediaType?: string | null;
+  captureId?: string | null;
   rows: readonly ImportRow[];
   /** Most documents (activity pulls) carry none of these. */
   positions?: readonly ImportPosition[];
@@ -800,8 +815,9 @@ export async function importBatch(
       if (!existing) {
         await client.query(
           `INSERT INTO documents
-             (id, institution_id, account_id, doc_type, doc_date, file_path, sha256, parsed_ok)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE)`,
+             (id, institution_id, account_id, doc_type, doc_date, file_path, sha256, parsed_ok,
+              retained_sha256, retained_byte_length, media_type, capture_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE, $8, $9, $10, $11)`,
           [
             documentId,
             document.institutionId,
@@ -810,6 +826,10 @@ export async function importBatch(
             document.docDate,
             document.filePath,
             document.sha256,
+            document.retainedSha256 ?? null,
+            document.retainedByteLength ?? null,
+            document.mediaType ?? null,
+            document.captureId ?? null,
           ],
         );
       }

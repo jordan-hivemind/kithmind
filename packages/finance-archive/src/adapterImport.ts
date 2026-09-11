@@ -500,6 +500,17 @@ async function collectDocuments(
       filePath: single
         ? pull.persisted.filePath
         : `${pull.persisted.filePath}#${sourceDocument}`,
+      // The bytes themselves, as opposed to the row identity above. One pull
+      // is one immutable retained object however many page documents it
+      // splits into, so every page row carries the same four values and a
+      // citation resolves to the bytes that were actually parsed (F1-29).
+      // `acquired.bytes` is what `persistAcquiredDocument` re-projected,
+      // hashed and wrote, and it refuses the pull if that hash disagrees with
+      // the manifest's, so the length here belongs to these exact bytes.
+      retainedSha256: pull.acquired.manifest.contentHash,
+      retainedByteLength: pull.acquired.bytes.byteLength,
+      mediaType: pull.acquired.manifest.mediaType,
+      captureId: pull.persisted.captureId,
       institutionId: pull.institutionId,
       accountId: pull.accountId,
       docType: pull.docType,
