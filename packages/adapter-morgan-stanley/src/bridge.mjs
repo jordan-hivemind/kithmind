@@ -301,7 +301,10 @@ export function pageFetchExpression(origin, { method, url, body, headers, needsA
     }
     const response = await fetch(${JSON.stringify(origin)} + ${JSON.stringify(url)}, {
       method: ${JSON.stringify(method)},
-      headers: { "Content-Type": "application/json", ...${JSON.stringify(headers ?? {})}, ...slot },
+      // The documents service refuses a request without an explicit JSON
+      // Accept (confirmed live 2026-09-11); the app sends it on every call.
+      headers: { "Content-Type": "application/json", "Accept": "application/json", ...${JSON.stringify(headers ?? {})}, ...slot },
+      credentials: "include",
       body: ${body === null ? "undefined" : JSON.stringify(body)},
     });
     if (!response.ok) {
