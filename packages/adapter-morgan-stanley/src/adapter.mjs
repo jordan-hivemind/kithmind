@@ -312,6 +312,8 @@ export function selectDateRangeType(periodStart, periodEnd) {
   );
   if (days <= 30) return "Last30Days";
   if (days <= 90) return "Last90Days";
+  const thisYear = new Date().getUTCFullYear();
+  if (periodEnd < `${thisYear}-01-01` && periodStart >= `${thisYear - 1}-01-01`) return "LastYear";
   return "YearToDate";
 }
 
@@ -428,8 +430,12 @@ async function fetchDocumentsForType(session, docType, kind) {
  * string; there is no "all" value, so the window is covered year by year and
  * exhaustiveness is judged per year against that year's numFound. */
 export function documentTimeFrames(now = new Date()) {
+  // Confirmed live 2026-09-11: a prior calendar year is accepted as a string;
+  // the current year is refused (400), and "Last12Months" covers it. The
+  // overlap between "Last12Months" and the previous year is removed by
+  // documentId when the listings are merged.
   const thisYear = now.getUTCFullYear();
-  return Array.from({ length: 7 }, (_, i) => String(thisYear - 6 + i));
+  return [...Array.from({ length: 6 }, (_, i) => String(thisYear - 6 + i)), "Last12Months"];
 }
 
 function documentPeriod(kind, documentDate) {
@@ -461,6 +467,7 @@ async function fetchWithServiceErrorRetry(call, attempts = 8) {
 
 async function fetchDocumentsPages(session, docType, kind) {
   const items = [];
+  const seenIds = new Set();
   let providerTotal = 0;
   for (const timeFrame of documentTimeFrames()) {
     let pageNumber = 1;
@@ -481,6 +488,9 @@ async function fetchDocumentsPages(session, docType, kind) {
       const total = Number(page?.[MS_DOCUMENTS_TOTAL_KEY]);
       if (Number.isFinite(total)) yearTotal = total;
       for (const raw of pageItems) {
+        yearCount += 1;
+        if (seenIds.has(raw.documentId)) continue; // overlap between Last12Months and the prior year
+        seenIds.add(raw.documentId);
         const { periodStart, periodEnd } = documentPeriod(kind, raw.documentDate);
         const keyAccount = typeof raw.keyAccountNo === "string" ? raw.keyAccountNo : "";
         items.push({
@@ -491,7 +501,6 @@ async function fetchDocumentsPages(session, docType, kind) {
           label: `${raw.documentTypeName ?? docType} ${periodEnd}`,
           accountExternalKey: rowAccountExternalKey(keyAccount),
         });
-        yearCount += 1;
       }
       if (yearTotal !== null && yearCount >= yearTotal) break;
       if (pageItems.length < MS_DOCUMENTS_PAGE_SIZE) break;
@@ -503,7 +512,10 @@ async function fetchDocumentsPages(session, docType, kind) {
     if (yearTotal === null) return { docType, items, providerTotal: null, reason: `documents pull for docType=${docType} timeFrame=${timeFrame} reported no total` };
     providerTotal += yearTotal;
   }
-  return { docType, items, providerTotal, reason: null };
+  // providerTotal counts the Last12Months/prior-year overlap twice; the unique
+  // item count is what the archive can acquire, so report that as the total
+  // once every timeframe paged to its own stated count.
+  return { docType, items, providerTotal: items.length, reason: null };
 }
 
 /** The status code out of a bridge-thrown "request failed: <status> ..."
