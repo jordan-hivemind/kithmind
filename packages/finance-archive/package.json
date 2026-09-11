@@ -16,6 +16,11 @@
       "types": "./src/mcp/server.ts",
       "node": "./dist/mcp/server.js",
       "default": "./src/mcp/server.ts"
+    },
+    "./run": {
+      "types": "./src/run.ts",
+      "node": "./dist/run.js",
+      "default": "./src/run.ts"
     }
   },
   "scripts": {
@@ -23,7 +28,8 @@
     "check-types": "tsc -p tsconfig.json --noEmit",
     "test": "node --test test/*.test.mjs",
     "test:once": "node --test test/*.test.mjs",
-    "mcp": "node dist/mcp/run.js"
+    "mcp": "node dist/mcp/run.js",
+    "import": "node dist/run.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
