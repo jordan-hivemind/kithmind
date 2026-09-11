@@ -314,3 +314,115 @@ describe("response truth and evidence", () => {
     );
   });
 });
+
+describe("structured field evidence", () => {
+  const structured = (index, mutate) => {
+    const exchange = clone(syntheticFinanceReadExchanges[index]);
+    mutate(exchange.response.items[0].evidence[1]);
+    return exchange;
+  };
+  const holding = (mutate) => structured(1, mutate);
+  const balance = (mutate) => structured(2, mutate);
+
+  it("accepts both locator formats, both JSON token shapes, and CSV bytes", () => {
+    const pointerItem = parseExchange(syntheticFinanceReadExchanges[1]).response
+      .items[0].evidence[1];
+    assert.equal(pointerItem.kind, "structured_field_v1");
+    assert.equal(pointerItem.locator.pointer, "/pages/0/items/0/marketValue");
+    assert.equal(pointerItem.locator.rawValue, "210");
+
+    const delimitedItem = parseExchange(syntheticFinanceReadExchanges[2])
+      .response.items[0].evidence[1];
+    assert.equal(
+      delimitedItem.sourceObject.mediaType,
+      "text/csv; charset=utf-8",
+    );
+    assert.equal(delimitedItem.locator.columnName, "total_value");
+    assert.equal(delimitedItem.locator.rowIndex, 0);
+
+    const stringToken = holding((item) => {
+      item.locator.rawValue = '"210"';
+      item.locator.rawValueSha256 =
+        "455147df5a65a39f52a96e12612ca7f850fcc024972f12a07d1ef1f6b3f307f4";
+    });
+    assert.equal(
+      parseExchange(stringToken).response.items[0].evidence[1].locator.rawValue,
+      '"210"',
+    );
+  });
+
+  it("refuses an unknown kind, an unknown format, and a wrong-arm key", () => {
+    rejects("invalid_response", () =>
+      parseExchange(
+        holding((item) => {
+          item.kind = "structured_field_v2";
+        }),
+      ),
+    );
+    rejects("invalid_response", () =>
+      parseExchange(
+        holding((item) => {
+          item.locator.format = "json_pointer_v2";
+        }),
+      ),
+    );
+    rejects("invalid_response", () =>
+      parseExchange(
+        holding((item) => {
+          item.locator.rowIndex = 0;
+        }),
+      ),
+    );
+    rejects("invalid_response", () =>
+      parseExchange(
+        balance((item) => {
+          delete item.locator.columnIndex;
+        }),
+      ),
+    );
+  });
+
+  it("refuses an unbound value, an unresolvable pointer, and an empty list", () => {
+    rejects("invalid_response", () =>
+      parseExchange(
+        holding((item) => {
+          item.locator.rawValueSha256 = "c".repeat(64);
+        }),
+      ),
+    );
+    rejects("invalid_response", () =>
+      parseExchange(
+        holding((item) => {
+          item.locator.rawValue = "true";
+          item.locator.rawValueSha256 =
+            "b5bea41b6c623f7c09f1bf24dcae58ebab3c0cdd90ad966bc43a45b44867e12b";
+        }),
+      ),
+    );
+    for (const pointer of [
+      "/pages/-/items/0/marketValue",
+      "/pages/01/items/0/marketValue",
+      "pages/0/items/0/marketValue",
+      "/pages/~2/items/0/marketValue",
+    ]) {
+      rejects("invalid_response", () =>
+        parseExchange(
+          holding((item) => {
+            item.locator.pointer = pointer;
+          }),
+        ),
+      );
+    }
+    rejects("invalid_response", () =>
+      parseExchange(
+        balance((item) => {
+          item.locator.headerRows = 0;
+        }),
+      ),
+    );
+
+    const empty = clone(syntheticFinanceReadExchanges[1]);
+    empty.response.items[0].evidence = [];
+    rejects("invalid_response", () => parseExchange(empty));
+  });
+});

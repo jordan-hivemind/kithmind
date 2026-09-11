@@ -36,7 +36,8 @@ const OPAQUE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const CURSOR = /^[A-Za-z0-9_-]{16,2048}$/;
 const RELATIVE_SEGMENT = /^[^/\\\u0000-\u001f\u007f]{1,128}$/u;
 const MEDIA_TYPE =
-  /^(?:application\/pdf|application\/json|text\/plain; charset=utf-8)$/;
+  /^(?:application\/pdf|application\/json|text\/csv; charset=utf-8|text\/plain; charset=utf-8)$/;
+const JSON_POINTER_SEGMENT = /^(?:[^~\u0000-\u001f\u007f]|~[01])*$/u;
 const CANONICAL_DECIMAL =
   /^(?:0|-?(?:[1-9]\d*|0\.\d*[1-9]|[1-9]\d*\.\d*[1-9]))$/;
 const DECIMAL_INPUT = /^(-?)(\d+)(?:\.(\d+))?$/;
@@ -84,19 +85,30 @@ export type FinanceMoney = {
   currency: FinanceCurrency;
 };
 
+/**
+ * The immutable retained bytes an evidence item cites. Shared by both evidence
+ * kinds: same identities, same byte length, same SHA-256 binding, one
+ * definition. Not a path. The retained tree is content addressed, so
+ * `retainedSha256` is what resolves the bytes.
+ */
+export type RetainedSourceObject = {
+  sourceId: FinanceSourceId;
+  documentId: FinanceDocumentId;
+  revisionId: FinanceRevisionId;
+  captureId: FinanceCaptureId;
+  retainedSha256: string;
+  retainedByteLength: number;
+  mediaType:
+    | "application/pdf"
+    | "application/json"
+    | "text/csv; charset=utf-8"
+    | "text/plain; charset=utf-8";
+};
+
 export type RetainedTextSpanEvidence = {
   kind: "retained_text_span_v1";
   evidenceId: FinanceEvidenceId;
-  sourceObject: {
-    sourceId: FinanceSourceId;
-    documentId: FinanceDocumentId;
-    revisionId: FinanceRevisionId;
-    captureId: FinanceCaptureId;
-    retainedSha256: string;
-    retainedByteLength: number;
-    mediaType:
-      "application/pdf" | "application/json" | "text/plain; charset=utf-8";
-  };
+  sourceObject: RetainedSourceObject;
   locator: {
     relativePath: string;
     textSha256: string;
@@ -110,6 +122,48 @@ export type RetainedTextSpanEvidence = {
   };
 };
 
+/**
+ * Exactly two formats. Each one resolves to a single scalar inside the
+ * retained bytes named by `sourceObject`, and each one carries that scalar as
+ * retained so a consumer can check the cited datum rather than trust it.
+ */
+export type StructuredFieldLocator =
+  | {
+      format: "json_pointer_v1";
+      /** An RFC 6901 JSON Pointer resolving to a JSON string or number. */
+      pointer: string;
+      /** The target's exact JSON source token, quotes and escapes included. */
+      rawValue: string;
+      rawValueSha256: string;
+    }
+  | {
+      format: "delimited_row_v1";
+      encoding: "utf-8";
+      delimiter: "," | "\t" | ";" | "|";
+      quote: '"' | "none";
+      headerRows: 0 | 1;
+      recordSeparator: "lf" | "crlf";
+      /** Zero based, over data records only, after `headerRows`. */
+      rowIndex: number;
+      /** Zero based, within the record. */
+      columnIndex: number;
+      /** The header cell at `columnIndex`. Empty only when `headerRows` is 0. */
+      columnName: string;
+      /** The field's text after unquoting, untrimmed, exactly as retained. */
+      rawValue: string;
+      rawValueSha256: string;
+    };
+
+export type StructuredFieldEvidence = {
+  kind: "structured_field_v1";
+  evidenceId: FinanceEvidenceId;
+  sourceObject: RetainedSourceObject;
+  locator: StructuredFieldLocator;
+};
+
+export type FinanceEvidence =
+  RetainedTextSpanEvidence | StructuredFieldEvidence;
+
 export type FinanceTransactionRecord = {
   recordId: FinanceRecordId;
   accountId: FinanceAccountId;
@@ -119,7 +173,7 @@ export type FinanceTransactionRecord = {
   amount: FinanceMoney;
   quantity?: CanonicalFinanceDecimal;
   price?: FinanceMoney;
-  evidence: RetainedTextSpanEvidence[];
+  evidence: FinanceEvidence[];
 };
 
 export type FinanceHoldingRecord = {
@@ -132,7 +186,7 @@ export type FinanceHoldingRecord = {
   marketValue?: FinanceMoney;
   costBasis?: FinanceMoney;
   valuationBasis: "market_price" | "last_round" | "cost" | "reported_nav";
-  evidence: RetainedTextSpanEvidence[];
+  evidence: FinanceEvidence[];
 };
 
 export type FinanceBalanceRecord = {
@@ -141,7 +195,7 @@ export type FinanceBalanceRecord = {
   asOf: string;
   totalValue: FinanceMoney;
   cash?: FinanceMoney;
-  evidence: RetainedTextSpanEvidence[];
+  evidence: FinanceEvidence[];
 };
 
 export type FinanceAggregateRecord = {
@@ -193,12 +247,12 @@ export type FinanceOutputIssue =
       sourceText: string;
       significantDigits: number;
       fractionalDigits: number;
-      evidence: RetainedTextSpanEvidence[];
+      evidence: FinanceEvidence[];
     }
   | {
       code: "retained_evidence_unavailable";
       recordId: FinanceRecordId;
-      evidence: RetainedTextSpanEvidence[];
+      evidence: FinanceEvidence[];
     };
 
 type PageRequest = {
@@ -295,7 +349,7 @@ export type AggregateMoneyResponse =
   };
 export type GetEvidenceResponse = FinanceReadResponseBase<"get_evidence"> & {
   recordId: FinanceRecordId;
-  items: RetainedTextSpanEvidence[];
+  items: FinanceEvidence[];
 };
 export type GetCoverageResponse = FinanceReadResponseBase<"get_coverage"> & {
   items: FinanceCoverageRecord[];
@@ -579,17 +633,13 @@ function relativePath(value: unknown, code: FinanceContractErrorCode): string {
   return result;
 }
 
-function evidence(
+function retainedSourceObject(
   value: unknown,
   code: FinanceContractErrorCode,
-): RetainedTextSpanEvidence {
+): RetainedSourceObject {
   const input = object(value, code);
-  exact(input, ["kind", "evidenceId", "sourceObject", "locator"], [], code);
-  if (input.kind !== "retained_text_span_v1") fail(code);
-
-  const sourceObject = object(input.sourceObject, code);
   exact(
-    sourceObject,
+    input,
     [
       "sourceId",
       "documentId",
@@ -602,10 +652,29 @@ function evidence(
     [],
     code,
   );
-  const mediaType = text(sourceObject.mediaType, 32, code);
+  const mediaType = text(input.mediaType, 32, code);
   if (!MEDIA_TYPE.test(mediaType)) fail(code);
+  return {
+    sourceId: opaqueId<"source">(input.sourceId, code),
+    documentId: opaqueId<"document">(input.documentId, code),
+    revisionId: opaqueId<"revision">(input.revisionId, code),
+    captureId: opaqueId<"capture">(input.captureId, code),
+    retainedSha256: sha256(input.retainedSha256, code),
+    retainedByteLength: integer(
+      input.retainedByteLength,
+      1,
+      64 * 1024 * 1024,
+      code,
+    ),
+    mediaType: mediaType as RetainedSourceObject["mediaType"],
+  };
+}
 
-  const locator = object(input.locator, code);
+function textSpanLocator(
+  value: unknown,
+  code: FinanceContractErrorCode,
+): RetainedTextSpanEvidence["locator"] {
+  const locator = object(value, code);
   exact(
     locator,
     [
@@ -640,46 +709,151 @@ function evidence(
   if (quoteSha256 !== calculatedQuoteSha256) fail(code);
 
   return {
-    kind: "retained_text_span_v1",
-    evidenceId: opaqueId<"evidence">(input.evidenceId, code),
-    sourceObject: {
-      sourceId: opaqueId<"source">(sourceObject.sourceId, code),
-      documentId: opaqueId<"document">(sourceObject.documentId, code),
-      revisionId: opaqueId<"revision">(sourceObject.revisionId, code),
-      captureId: opaqueId<"capture">(sourceObject.captureId, code),
-      retainedSha256: sha256(sourceObject.retainedSha256, code),
-      retainedByteLength: integer(
-        sourceObject.retainedByteLength,
-        1,
-        64 * 1024 * 1024,
-        code,
-      ),
-      mediaType:
-        mediaType as RetainedTextSpanEvidence["sourceObject"]["mediaType"],
-    },
-    locator: {
-      relativePath: relativePath(locator.relativePath, code),
-      textSha256: sha256(locator.textSha256, code),
-      textByteLength: integer(
-        locator.textByteLength,
-        Math.max(textCodepointLength, encoder.encode(quote).byteLength),
-        64 * 1024 * 1024,
-        code,
-      ),
-      textCodepointLength,
-      offsetUnit: "unicode_code_points",
-      start,
-      end,
-      quote,
-      quoteSha256,
-    },
+    relativePath: relativePath(locator.relativePath, code),
+    textSha256: sha256(locator.textSha256, code),
+    textByteLength: integer(
+      locator.textByteLength,
+      Math.max(textCodepointLength, encoder.encode(quote).byteLength),
+      64 * 1024 * 1024,
+      code,
+    ),
+    textCodepointLength,
+    offsetUnit: "unicode_code_points",
+    start,
+    end,
+    quote,
+    quoteSha256,
   };
+}
+
+/**
+ * RFC 6901 syntax only. The validator cannot resolve the pointer without the
+ * retained bytes, so it rejects what can never resolve to one scalar: the `-`
+ * array token, a leading-zero array index, a traversal segment, a control
+ * character, and a `~` that escapes nothing.
+ */
+function jsonPointer(value: unknown, code: FinanceContractErrorCode): string {
+  const result = text(value, 1024, code);
+  if (!result.startsWith("/")) fail(code);
+  for (const segment of result.slice(1).split("/")) {
+    if (
+      !JSON_POINTER_SEGMENT.test(segment) ||
+      segment === "-" ||
+      segment === "." ||
+      segment === ".." ||
+      /^0\d+$/.test(segment)
+    )
+      fail(code);
+  }
+  return result;
+}
+
+/** Exactly one JSON string token or one JSON number token, nothing else. */
+function jsonScalarToken(value: string, code: FinanceContractErrorCode): void {
+  if (value.trim() !== value) fail(code);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    fail(code);
+  }
+  if (typeof parsed !== "string" && typeof parsed !== "number") fail(code);
+}
+
+function boundRawValue(
+  input: Record<string, unknown>,
+  code: FinanceContractErrorCode,
+): { rawValue: string; rawValueSha256: string } {
+  const rawValue = text(input.rawValue, MAX_FINANCE_EVIDENCE_QUOTE_BYTES, code);
+  const rawValueSha256 = sha256(input.rawValueSha256, code);
+  if (
+    rawValueSha256 !==
+    createHash("sha256").update(rawValue, "utf8").digest("hex")
+  )
+    fail(code);
+  return { rawValue, rawValueSha256 };
+}
+
+function structuredFieldLocator(
+  value: unknown,
+  code: FinanceContractErrorCode,
+): StructuredFieldLocator {
+  const locator = object(value, code);
+  const format = oneOf(
+    locator.format,
+    ["json_pointer_v1", "delimited_row_v1"],
+    code,
+  );
+  if (format === "json_pointer_v1") {
+    exact(
+      locator,
+      ["format", "pointer", "rawValue", "rawValueSha256"],
+      [],
+      code,
+    );
+    const bound = boundRawValue(locator, code);
+    jsonScalarToken(bound.rawValue, code);
+    return { format, pointer: jsonPointer(locator.pointer, code), ...bound };
+  }
+  exact(
+    locator,
+    [
+      "format",
+      "encoding",
+      "delimiter",
+      "quote",
+      "headerRows",
+      "recordSeparator",
+      "rowIndex",
+      "columnIndex",
+      "columnName",
+      "rawValue",
+      "rawValueSha256",
+    ],
+    [],
+    code,
+  );
+  const headerRows = integer(locator.headerRows, 0, 1, code) as 0 | 1;
+  const columnName = text(locator.columnName, 128, code, true);
+  if ((columnName === "") !== (headerRows === 0)) fail(code);
+  return {
+    format,
+    encoding: oneOf(locator.encoding, ["utf-8"], code),
+    delimiter: oneOf(locator.delimiter, [",", "\t", ";", "|"], code),
+    quote: oneOf(locator.quote, ['"', "none"], code),
+    headerRows,
+    recordSeparator: oneOf(locator.recordSeparator, ["lf", "crlf"], code),
+    rowIndex: integer(locator.rowIndex, 0, 16_777_215, code),
+    columnIndex: integer(locator.columnIndex, 0, 4095, code),
+    columnName,
+    ...boundRawValue(locator, code),
+  };
+}
+
+function evidence(
+  value: unknown,
+  code: FinanceContractErrorCode,
+): FinanceEvidence {
+  const input = object(value, code);
+  exact(input, ["kind", "evidenceId", "sourceObject", "locator"], [], code);
+  const kind = oneOf(
+    input.kind,
+    ["retained_text_span_v1", "structured_field_v1"],
+    code,
+  );
+  const base = {
+    evidenceId: opaqueId<"evidence">(input.evidenceId, code),
+    sourceObject: retainedSourceObject(input.sourceObject, code),
+  };
+  return kind === "retained_text_span_v1"
+    ? { kind, ...base, locator: textSpanLocator(input.locator, code) }
+    : { kind, ...base, locator: structuredFieldLocator(input.locator, code) };
 }
 
 function evidenceList(
   value: unknown,
   code: FinanceContractErrorCode,
-): RetainedTextSpanEvidence[] {
+): FinanceEvidence[] {
   const items = denseArray(value, 1, MAX_FINANCE_EVIDENCE_REFS, code).map(
     (item) => evidence(item, code),
   );
@@ -931,7 +1105,7 @@ export function authorizeFinanceReadRequest(
 function parseEvidenceBearingRecordBase(input: Record<string, unknown>): {
   recordId: FinanceRecordId;
   accountId: FinanceAccountId;
-  evidence: RetainedTextSpanEvidence[];
+  evidence: FinanceEvidence[];
 } {
   return {
     recordId: opaqueId<"record">(input.recordId, "invalid_response"),
@@ -1397,7 +1571,7 @@ export function parseFinanceReadResponseShape(
 }
 
 function evidenceMatchesSource(
-  evidenceItems: readonly RetainedTextSpanEvidence[],
+  evidenceItems: readonly FinanceEvidence[],
   sourceId: FinanceSourceId | undefined,
 ): boolean {
   return (
