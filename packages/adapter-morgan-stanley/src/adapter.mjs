@@ -773,7 +773,7 @@ function assertPdfBytes(bytes, docId) {
   throw new Error(
     `document download for ${docId} did not return a PDF (it starts ${JSON.stringify(header)}, ` +
       `not ${JSON.stringify(PDF_MAGIC)}) -- an HTML login or error page is the usual cause. ` +
-      "Check the signed-in tab and MS_DOCUMENT_DOWNLOAD_PATH_PREFIX (README, 'Environment').",
+      "Check the signed-in tab: the document endpoint answered with something that is not a PDF (README, 'Documents').",
   );
 }
 
