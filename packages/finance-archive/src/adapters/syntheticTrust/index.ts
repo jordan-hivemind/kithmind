@@ -223,6 +223,7 @@ export function createSyntheticSession(
     periodStart: doc.periodStart,
     periodEnd: doc.periodEnd,
     label: doc.label,
+    accountExternalKey: doc.accountExternalKey,
   }));
 
   async function fetchText(

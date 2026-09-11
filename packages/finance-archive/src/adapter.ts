@@ -174,6 +174,16 @@ export type DiscoveredDocument = {
   readonly periodEnd: string;
   /** Human-readable, e.g. "Q1 statement". Never an account number or name. */
   readonly label: string;
+  /**
+   * F1-40. The single account this document belongs to, matching a
+   * `DiscoveredAccount.externalKey` from this same `discover()` call, when
+   * the adapter can name it (a statement or confirmation always belongs to
+   * exactly one account, and a real adapter's own `discover()` already
+   * encodes that account into the document's `externalId`). Omitted when the
+   * adapter cannot name it, in which case a pull for this document stays
+   * institution-wide exactly as it was before this field existed.
+   */
+  readonly accountExternalKey?: string;
 };
 
 export type DiscoveredExportRange = {

@@ -577,6 +577,98 @@ test(
 );
 
 test(
+  '"expand": "discovered" (F1-40) files a document under the account its own accountExternalKey resolves to, landing its positions and balances there too, while a keyless document stays institution-wide',
+  { skip },
+  async (t) => {
+    const { schema, client } = await seededSchema(t, { seedAccount: false });
+
+    const rawDir = mkdtempSync(
+      join(tmpdir(), "kith-finance-run-expand-account-raw-"),
+    );
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+
+    const { fixturesDir, adapterModulePath, sessionModulePath } =
+      writeAdapterFixtures(t);
+    // The synthetic fixture's two pdf_statement documents: doc-stmt-2025-q1
+    // carries accountExternalKey "acct-brokerage-01" and a HOLDINGS section
+    // (positions, a balance, a liability); doc-stmt-2025-q2 carries none
+    // (fixtures.ts's DOCUMENTS, F1-40).
+    const selectionPath = writeSelection(fixturesDir, [
+      {
+        expand: "discovered",
+        kinds: ["pdf_statement"],
+        docType: "statement",
+        requireExhaustive: true,
+      },
+    ]);
+    const runImport = makeRunner({
+      adapterModulePath,
+      sessionModulePath,
+      selectionPath,
+      schema,
+      rawDir,
+    });
+
+    const output = runImport();
+    assert.match(output, /^mode: committed$/m);
+    // Both statements are acquired regardless of import outcome.
+    assert.match(output, /documents acquired: 2/);
+    // doc-stmt-2025-q1 imports (filed under its own account); doc-stmt-2025-q2
+    // stays institution-wide and fails for the same reason the keyless
+    // trade_confirmation does in the test above -- no accountExternalKey on
+    // its rows and no pull-level account to fall back on.
+    assert.match(output, /document pulls acquired: 1/);
+    assert.match(output, /document pulls failed: 1/);
+    assert.match(output, /pdf_statement: acquired=1 skipped=0 failed=1/);
+    // F1-40's own summary line: one document filed by account, one
+    // institution-wide -- independent of the acquired/failed split above.
+    assert.match(output, /documents filed: by account=1 institution-wide=1/);
+
+    const accounts = await all(
+      client,
+      "SELECT id, external_key FROM accounts WHERE institution_id = $1",
+      [INSTITUTION.id],
+    );
+    const brokerage = accounts.find(
+      (account) => account.external_key === "acct-brokerage-01",
+    );
+    assert.ok(brokerage, "the account discover() reported is provisioned");
+
+    const documents = await all(
+      client,
+      "SELECT id, account_id, doc_type FROM documents WHERE institution_id = $1",
+      [INSTITUTION.id],
+    );
+    assert.equal(
+      documents.length,
+      1,
+      "only the account-attributed statement imported -- the keyless one failed",
+    );
+    assert.equal(documents[0].account_id, brokerage.id);
+
+    // The whole point: an expanded document pull's positions, balances and
+    // liabilities -- not just its own document row -- carry the resolved
+    // account_id, exactly like an explicit per-account selection.
+    assert.ok(
+      (await count(client, "positions", "WHERE account_id = $1", [brokerage.id])) > 0,
+      "positions landed on the resolved account",
+    );
+    assert.ok(
+      (await count(client, "balances", "WHERE account_id = $1", [brokerage.id])) > 0,
+      "balances landed on the resolved account",
+    );
+    assert.ok(
+      (await count(client, "liabilities", "WHERE account_id = $1", [brokerage.id])) > 0,
+      "liabilities landed on the resolved account",
+    );
+    assert.ok(
+      (await count(client, "transactions", "WHERE account_id = $1", [brokerage.id])) > 0,
+      "activity rows landed on the resolved account",
+    );
+  },
+);
+
+test(
   '"requireExhaustive": true refuses to start when discover()\'s document listing is incomplete',
   { skip },
   async (t) => {

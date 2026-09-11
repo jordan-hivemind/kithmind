@@ -450,6 +450,12 @@ async function fetchDocumentsPages(session, docType, kind) {
         periodStart: raw.periodStart,
         periodEnd: raw.periodEnd,
         label: raw.label,
+        // F1-40. The same keyAccount already folded into externalId above
+        // (decodeDocumentExternalId recovers it at acquire time) -- also
+        // reported directly so run.ts can file this document's pull under
+        // the account it resolves to, same as rowAccountExternalKey does
+        // for an activity row.
+        accountExternalKey: rowAccountExternalKey(raw.keyAccount),
       });
     }
     if (providerTotal !== null && items.length >= providerTotal) break;
