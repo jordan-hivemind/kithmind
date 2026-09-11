@@ -879,13 +879,24 @@ export async function importBatch(
       const occurrences = new Map<string, number>();
       let documentRefused = false;
       if (document.parseNote) {
-        // Retained but unparsed: keep it re-importable and say so in the queue.
+        // Retained but unparsed: keep it re-importable (parsed_ok stays
+        // FALSE below) and say so in the queue -- but only once. The same
+        // still-unparsed bytes produce the identical parseNote on every
+        // rerun until a real extractor replaces this one, so without this
+        // check a rerun reopens a duplicate document_unparsed row forever
+        // instead of being recognized as already flagged.
         documentRefused = true;
-        await client.query(
-          `INSERT INTO review_items (id, kind, account_id, source_document_id, source_locator, raw_value, reason)
-           VALUES ($1, 'document_unparsed', $2, $3, NULL, NULL, $4)`,
-          [randomUUID(), document.accountId, documentId, document.parseNote.slice(0, 500)],
+        const alreadyFlagged = await client.query(
+          "SELECT 1 FROM review_items WHERE kind = 'document_unparsed' AND source_document_id = $1",
+          [documentId],
         );
+        if (alreadyFlagged.rowCount === 0) {
+          await client.query(
+            `INSERT INTO review_items (id, kind, account_id, source_document_id, source_locator, raw_value, reason)
+             VALUES ($1, 'document_unparsed', $2, $3, NULL, NULL, $4)`,
+            [randomUUID(), document.accountId, documentId, document.parseNote.slice(0, 500)],
+          );
+        }
       }
       for (const row of document.rows) {
         const outcome = await importRow(row, documentId, occurrences);

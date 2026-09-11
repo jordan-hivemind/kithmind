@@ -89,6 +89,22 @@ and saying to open the Documents page. It never synthesizes a header.
 Statements and confirmations are small, and base64 over a local socket is
 cheaper than owning a download directory.
 
+A long import between two site calls can idle the app session out (twenty
+minutes did, once, and failed every one of 20,757 queued document pulls). The
+bridge keeps it alive on its own: every four minutes it calls the app's own
+session-extend endpoint through the same page-side fetch, needing no
+authorization and touching no credential. The timer is `unref`'d, so it never
+keeps the process running on its own.
+
+If the tab has navigated away from the app origin -- a session timeout
+redirects to the login page -- every fetch throws a distinct `SIGNED_OUT`
+error instead of the generic "no session headers captured" one. `run.ts`
+treats that class of failure as fatal rather than skipping the document: a
+lost session fails every remaining document pull the same way within
+milliseconds, so it stops the run instead of grinding through thousands of
+guaranteed failures. What already committed stays committed; sign in again
+and rerun the same selection to pick up where it left off.
+
 ## Activity pagination
 
 Per requested range, POST with `Pagination.Posted.PageNumber` starting at one
@@ -259,6 +275,15 @@ confirmations return `EMPTY_HOLDINGS`, honestly rather than by omission. The
 statement path splits text extraction from text parsing, so the parser is
 testable on text fixtures and the extractor is tested separately against one
 small generated PDF.
+
+A real statement's compressed content stream (`/Filter /FlateDecode`) or
+embedded/CID fonts can leave the dependency-free extractor with no `Tj` text
+at all. `parse()` does not throw in that case: it returns a noted empty
+pull (`{ activity: [], holdings: EMPTY_HOLDINGS, parseNote }`), and
+`finance-archive` records the document with `parsed_ok` false and a
+`document_unparsed` review item instead of losing the retained bytes. A real
+PDF text-extraction dependency, once chosen, revisits those documents; the
+retained bytes never depended on this extractor succeeding.
 
 ## Quirks
 

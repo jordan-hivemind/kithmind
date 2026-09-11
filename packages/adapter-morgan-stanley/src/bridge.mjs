@@ -429,11 +429,24 @@ export default async function createMorganStanleySession(options = {}) {
     return Uint8Array.from(Buffer.from(base64, "base64"));
   }
 
-  // Keep-alive. A long import between two site calls (twenty minutes on the
-  // first full pull) let the app session idle out and every later document
-  // fetch failed on an empty header slot. The app itself extends its session
-  // with this call; doing the same every four minutes keeps it alive without
-  // touching any credential. `unref` so the timer never keeps the process up.
+  const keepAlive = startKeepAlive(cdp, origin);
+
+  return { institutionSlug: "morgan-stanley", fetchText, fetchBytes, close: () => clearInterval(keepAlive) };
+}
+
+const KEEP_ALIVE_INTERVAL_MS = 4 * 60 * 1000;
+
+/**
+ * Keep-alive. A long import between two site calls (twenty minutes on the
+ * first full pull) let the app session idle out and every later document
+ * fetch failed on an empty header slot. The app itself extends its session
+ * with this call; doing the same every four minutes keeps it alive without
+ * touching any credential. `unref` so the timer never keeps the process up.
+ * Exported for test/bridge.test.mjs only (same convention as `evaluate`
+ * above): every other caller reaches it only through
+ * createMorganStanleySession, unchanged.
+ */
+export function startKeepAlive(cdp, origin) {
   const keepAlive = setInterval(() => {
     const { requestId, seqId } = randomUuidQueryIds();
     evaluate(
@@ -446,8 +459,7 @@ export default async function createMorganStanleySession(options = {}) {
         needsAuthorization: false,
       }),
     ).catch(() => {});
-  }, 4 * 60 * 1000);
+  }, KEEP_ALIVE_INTERVAL_MS);
   keepAlive.unref();
-
-  return { institutionSlug: "morgan-stanley", fetchText, fetchBytes, close: () => clearInterval(keepAlive) };
+  return keepAlive;
 }

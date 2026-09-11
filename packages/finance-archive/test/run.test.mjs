@@ -90,8 +90,16 @@ function writeIncompleteDiscoveryFixtures(t, sessionOptions) {
  * F1-39. Same adapter fixture, but the session throws fetching one named
  * document's bytes -- an injected acquisition failure, standing in for a
  * real provider outage on one document of a pull that names several.
+ *
+ * F1-43: `message` defaults to a generic outage (continues, per the test
+ * below using it unchanged); pass one matching run.ts's SIGNED_OUT-class
+ * regex to stand in for a lost browser session instead.
  */
-function writeFailingDocumentFixtures(t, failingExternalId) {
+function writeFailingDocumentFixtures(
+  t,
+  failingExternalId,
+  message = "synthetic outage fetching this document",
+) {
   const { fixturesDir, adapterModulePath } = writeAdapterFixtures(t);
   const sessionModulePath = join(fixturesDir, "session-failing.mjs");
   writeFileSync(
@@ -103,7 +111,7 @@ function writeFailingDocumentFixtures(t, failingExternalId) {
       `    ...base,\n` +
       `    async fetchBytes(path, query) {\n` +
       `      if (path === ${JSON.stringify(`/documents/${failingExternalId}`)}) {\n` +
-      `        throw new Error("synthetic outage fetching this document");\n` +
+      `        throw new Error(${JSON.stringify(message)});\n` +
       `      }\n` +
       `      return base.fetchBytes(path, query);\n` +
       `    },\n` +
@@ -875,5 +883,110 @@ test(
     assert.equal(documents.length, 1, "only the surviving document imported");
     assert.equal(documents[0].doc_type, "confirmation");
     assert.ok(await count(client, "transactions") > 0);
+  },
+);
+
+test(
+  "a SIGNED_OUT-class failure stops the run instead of skipping it: what committed before stays committed, and nothing after it is even attempted",
+  { skip },
+  async (t) => {
+    const { schema, client } = await seededSchema(t);
+
+    const rawDir = mkdtempSync(
+      join(tmpdir(), "kith-finance-run-signed-out-raw-"),
+    );
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+
+    // doc-stmt-2025-q1 acquires first and commits (commitEvery defaults to
+    // 1); doc-stmt-2025-q2 then fails the way a lost browser session does
+    // (bridge.mjs's own SIGNED_OUT wording); doc-conf-2025-02-10 comes last
+    // in the selection and must never even be attempted -- a lost session
+    // fails every remaining document pull the same way within milliseconds
+    // (F1-43), so continuing through thousands of them is pure waste.
+    const { fixturesDir, adapterModulePath, sessionModulePath } =
+      writeFailingDocumentFixtures(
+        t,
+        "doc-stmt-2025-q2",
+        "SIGNED_OUT: the tab left the app origin (a session timeout redirects to the login page); sign in again and retry",
+      );
+    const selectionPath = writeSelection(fixturesDir, [
+      {
+        accountId: ACCOUNT.id,
+        docType: "statement",
+        docDate: null,
+        selection: { kind: "pdf_statement", externalId: "doc-stmt-2025-q1" },
+      },
+      {
+        accountId: ACCOUNT.id,
+        docType: "statement",
+        docDate: null,
+        selection: { kind: "pdf_statement", externalId: "doc-stmt-2025-q2" },
+      },
+      {
+        accountId: ACCOUNT.id,
+        docType: "confirmation",
+        docDate: null,
+        selection: {
+          kind: "trade_confirmation",
+          externalId: "doc-conf-2025-02-10",
+        },
+      },
+    ]);
+    const runImport = makeRunner({
+      adapterModulePath,
+      sessionModulePath,
+      selectionPath,
+      schema,
+      rawDir,
+    });
+
+    assert.throws(
+      () => runImport(),
+      (error) => {
+        assert.match(String(error.stderr), /run stopped: the browser session is gone/);
+        assert.match(String(error.stderr), /SIGNED_OUT/);
+        assert.match(
+          String(error.stderr),
+          /1 document pull\(s\) were committed before this/,
+        );
+        return true;
+      },
+    );
+
+    const documents = await all(
+      client,
+      "SELECT doc_type FROM documents WHERE institution_id = $1",
+      [INSTITUTION.id],
+    );
+    assert.equal(
+      documents.length,
+      1,
+      "only the document acquired before the SIGNED_OUT failure was committed",
+    );
+    assert.equal(documents[0].doc_type, "statement");
+    assert.ok(await count(client, "transactions") > 0);
+    assert.equal(
+      await count(client, "documents", "WHERE doc_type = $1", ["confirmation"]),
+      0,
+      "the pull after the failing one was never attempted",
+    );
+
+    // Sign in again, rerun the same selection: the committed document is
+    // skipped and the run reaches the point of failure again unchanged
+    // (still doc-stmt-2025-q2 itself, since the fixture always fails it).
+    assert.throws(
+      () => runImport(),
+      (error) => {
+        assert.match(String(error.stderr), /run stopped: the browser session is gone/);
+        return true;
+      },
+    );
+    assert.equal(
+      await count(client, "documents", "WHERE institution_id = $1", [
+        INSTITUTION.id,
+      ]),
+      1,
+      "the rerun does not double-commit the already-imported document, and stops at the same failing one",
+    );
   },
 );

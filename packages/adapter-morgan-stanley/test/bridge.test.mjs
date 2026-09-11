@@ -5,6 +5,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import vm from "node:vm";
 import {
   WANTED_HEADERS,
   buildActivityRequestBody,
@@ -12,6 +13,7 @@ import {
   pageFetchExpression,
   resolveEndpoint,
   evaluate,
+  startKeepAlive,
 } from "../src/bridge.mjs";
 
 test("buildActivityRequestBody follows the captured request template exactly", () => {
@@ -170,4 +172,82 @@ test("the evaluate deadline rejects by name instead of hanging when the CDP repl
   t.mock.timers.tick(90_001);
 
   await assert.rejects(pending, /page evaluation timed out after 90000ms/);
+});
+
+// F1-43: a page navigation away from the app (a session timeout redirects to
+// the login page) leaves `location.href` off the app's own origin. The fetch
+// expression is plain, self-invoking JS -- running it in a throwaway vm
+// context with a fake `location` proves the throw without a browser, a
+// credential or the app's own fetch/Headers ever being reached (the origin
+// check happens before either is touched, see src/bridge.mjs).
+test("the page fetch expression throws SIGNED_OUT, by name, when the tab has left the app origin", async () => {
+  const expression = pageFetchExpression("https://app.example.invalid", {
+    method: "GET",
+    url: "/anything",
+    body: null,
+  });
+  const sandbox = { location: { href: "https://signin.example.invalid/login" } };
+  vm.createContext(sandbox);
+  await assert.rejects(
+    vm.runInContext(expression, sandbox),
+    /^Error: SIGNED_OUT: the tab left the app origin/,
+  );
+});
+
+test("the page fetch expression does not confuse a same-origin tab for a signed-out one", async () => {
+  const expression = pageFetchExpression("https://app.example.invalid", {
+    method: "GET",
+    url: "/anything",
+    body: null,
+  });
+  const sandbox = { location: { href: "https://app.example.invalid/activity" } };
+  vm.createContext(sandbox);
+  // Falls through past the origin check to the next guard (no headers
+  // captured yet) rather than a SIGNED_OUT it has no business raising.
+  await assert.rejects(
+    vm.runInContext(expression, sandbox),
+    /^Error: no session headers captured yet/,
+  );
+});
+
+test("startKeepAlive returns an interval that is unref'd -- it must never be the reason the process stays up", (t) => {
+  // Real timers here: node:test's mock Timeout stubs hasRef()/unref() to
+  // always report ref'd, so this has to run against the genuine one.
+  const cdp = { send: () => new Promise(() => {}) };
+  const keepAlive = startKeepAlive(cdp, "https://app.example.invalid");
+  t.after(() => clearInterval(keepAlive));
+  assert.equal(keepAlive.hasRef(), false);
+});
+
+test("startKeepAlive extends the app session every four minutes through the page-side fetch, and needs no authorization", (t) => {
+  // Mocks setTimeout too: evaluate()'s own 90s deadline timer (src/bridge.mjs)
+  // is real and un-unref'd otherwise, which would leave this test holding
+  // the process open for a genuine 90 seconds after the fake cdp already
+  // resolved the race.
+  t.mock.timers.enable({ apis: ["setInterval", "setTimeout"] });
+  const calls = [];
+  const cdp = {
+    send: (method, params) => {
+      calls.push({ method, params });
+      return Promise.resolve({ result: { value: "{}" } });
+    },
+  };
+
+  const keepAlive = startKeepAlive(cdp, "https://app.example.invalid");
+  t.after(() => clearInterval(keepAlive));
+  assert.equal(calls.length, 0, "no call before the first four minutes elapse");
+
+  t.mock.timers.tick(4 * 60 * 1000);
+  assert.equal(calls.length, 1);
+  const [{ method, params }] = calls;
+  assert.equal(method, "Runtime.evaluate");
+  assert.match(
+    params.expression,
+    /\/shell\/handler\/proxy\/sal\/api\/AzureSession\/Extend\?RequestID=([0-9a-f]{4}-){7}[0-9a-f]{4}&SeqID=\d{4}/,
+  );
+  // needsAuthorization: false -- the extend call never gates on the bearer.
+  assert.equal(/"authorization" in slot/.test(params.expression), false);
+
+  t.mock.timers.tick(4 * 60 * 1000);
+  assert.equal(calls.length, 2, "fires again every four minutes, not just once");
 });
