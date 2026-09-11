@@ -808,6 +808,19 @@ async function parse(rawFile: RawFile): Promise<ParsedPull> {
 
 // --- capabilities --------------------------------------------------------
 
+// F1-19. Every activityType generateActivityRows/the statement/confirmation
+// fixtures emit (fixtures.ts's ACTIVITY_TYPES, plus the two hand-written
+// document fixtures, which reuse the same five strings). "buy" and "sell"
+// move both cash and quantity, in opposite directions per ParsedRow.quantity's
+// own doc comment (a disposal is negative); the other three move cash only.
+const ACTIVITY_TAXONOMY: InstitutionCapabilities["activityTaxonomy"] = {
+  buy: { movesCash: true, movesQuantity: true, quantitySign: "positive" },
+  sell: { movesCash: true, movesQuantity: true, quantitySign: "negative" },
+  dividend: { movesCash: true, movesQuantity: false, quantitySign: "none" },
+  fee: { movesCash: true, movesQuantity: false, quantitySign: "none" },
+  interest: { movesCash: true, movesQuantity: false, quantitySign: "none" },
+};
+
 function capabilities(): InstitutionCapabilities {
   return {
     institutionSlug: INSTITUTION_SLUG,
@@ -825,6 +838,7 @@ function capabilities(): InstitutionCapabilities {
       "PDF statement text occasionally has an unparseable amount; such rows must enter review rather than being guessed.",
       "Only the PDF statement carries a positions table; the structured API, tabular export and trade confirmation are activity-only and report no holdings.",
     ],
+    activityTaxonomy: ACTIVITY_TAXONOMY,
   };
 }
 

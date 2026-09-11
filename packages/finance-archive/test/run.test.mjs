@@ -6,7 +6,12 @@ import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 
-import { applyPgSchema, createArchiveClient } from "../dist/index.js";
+import {
+  applyPgSchema,
+  createArchiveClient,
+  SYNTHETIC_INSTITUTION_NAME,
+  SYNTHETIC_INSTITUTION_SLUG,
+} from "../dist/index.js";
 import { all, count, skip, testSchemaName } from "./helpers/pgArchive.mjs";
 
 // The operator command end to end (src/run.ts, "one full acquisition-to-
@@ -19,10 +24,14 @@ import { all, count, skip, testSchemaName } from "./helpers/pgArchive.mjs";
 
 const url = process.env.FINANCE_ARCHIVE_DATABASE_URL;
 
+// F1-19: `slug`/`name` are the synthetic adapter's own, not arbitrary test
+// values -- `resolveInstitution` upserts by slug, so pre-seeding a row under
+// a different slug would leave it unmatched and mint a second, orphaned
+// institution row every one of these tests would then have to account for.
 const INSTITUTION = {
   id: "inst_thistlebrook_run",
-  name: "Thistlebrook Trust (synthetic)",
-  slug: "thistlebrook-trust-run",
+  name: SYNTHETIC_INSTITUTION_NAME,
+  slug: SYNTHETIC_INSTITUTION_SLUG,
 };
 const ACCOUNT = { id: "acct_synthetic_run", last4: "0142", currency: "USD" };
 const SPACE_ID = "space_synthetic_run_test";
@@ -91,11 +100,22 @@ async function seededSchema(t, { seedAccount = true } = {}) {
   return { schema, client };
 }
 
-function writeSelection(fixturesDir, pulls) {
+/**
+ * F1-19: `institutionId` is omitted by default -- main() resolves the real
+ * one from the adapter's own capabilities() before discover
+ * (resolveInstitution), so a selection file no longer has to already name an
+ * existing institutions row. Pass one explicitly only to exercise the
+ * compatibility path (a selection file that still names one, agreeing or
+ * disagreeing with what gets resolved).
+ */
+function writeSelection(fixturesDir, pulls, institutionId) {
   const selectionPath = join(fixturesDir, "selection.json");
   writeFileSync(
     selectionPath,
-    JSON.stringify({ institutionId: INSTITUTION.id, pulls }),
+    JSON.stringify({
+      ...(institutionId === undefined ? {} : { institutionId }),
+      pulls,
+    }),
   );
   return selectionPath;
 }
@@ -147,6 +167,7 @@ test(
 
     const { fixturesDir, adapterModulePath, sessionModulePath } =
       writeAdapterFixtures(t);
+    // F1-19 operator gap: no "institutionId" in this selection at all.
     const selectionPath = writeSelection(fixturesDir, [
       {
         accountId: ACCOUNT.id,
@@ -204,11 +225,67 @@ test(
     assert.equal(importRuns.length, 1);
     assert.equal(importRuns[0].source, "thistlebrook-trust");
 
+    // The institution row F1-19's resolveInstitution upserted is the one
+    // already seeded (matched by slug), not a second row for one adapter.
+    assert.equal(await count(client, "institutions"), 1);
+
     // A second pass over the identical selection is a no-op: the raw tree is
     // immutable and re-importing the same acquired bytes inserts nothing.
     const secondOutput = runImport();
     assert.match(secondOutput, /rows inserted: 0/);
     assert.equal(await count(client, "transactions"), inserted);
+  },
+);
+
+test(
+  "a selection file's institutionId, when present, must agree with what the adapter's capabilities() resolve to",
+  { skip },
+  async (t) => {
+    const { schema } = await seededSchema(t);
+
+    const rawDir = mkdtempSync(join(tmpdir(), "kith-finance-run-mismatch-raw-"));
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+
+    const { fixturesDir, adapterModulePath, sessionModulePath } =
+      writeAdapterFixtures(t);
+    // Compatibility only: a caller who still names an institutionId gets a
+    // loud refusal, not a silent import against a different institution,
+    // when it disagrees with what resolveInstitution actually resolves to.
+    const selectionPath = writeSelection(
+      fixturesDir,
+      [
+        {
+          accountId: ACCOUNT.id,
+          docType: "activity_pull",
+          docDate: null,
+          selection: {
+            kind: "structured_api",
+            periodStart: "2025-01-01",
+            periodEnd: "2025-04-01",
+          },
+        },
+      ],
+      "not-the-real-institution-id",
+    );
+    const runImport = makeRunner({
+      adapterModulePath,
+      sessionModulePath,
+      selectionPath,
+      schema,
+      rawDir,
+    });
+
+    assert.throws(
+      () => runImport(["--dry-run"]),
+      (error) => {
+        assert.match(
+          String(error.stderr),
+          /names institutionId not-the-real-institution-id/,
+        );
+        assert.match(String(error.stderr), new RegExp(INSTITUTION.slug));
+        return true;
+      },
+    );
   },
 );
 

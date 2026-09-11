@@ -39,6 +39,7 @@ import {
   adapterPullToImportDocuments,
   persistAcquiredDocument,
   resolveDiscoveredAccounts,
+  resolveInstitution,
   type AdapterPull,
 } from "./adapterImport.js";
 import {
@@ -83,7 +84,15 @@ type SelectionEntry = {
 };
 
 type SelectionFile = {
-  readonly institutionId: string;
+  /**
+   * F1-19 operator gap. No longer required: `main()` resolves the real
+   * institution id from the adapter's own `capabilities()` before `discover`
+   * (see `resolveInstitution`). Accepted only for compatibility with an
+   * existing selection file; when present it must name the same institution
+   * the adapter resolves to, or the run refuses rather than silently using
+   * whichever one the caller actually meant.
+   */
+  readonly institutionId?: string;
   readonly pulls: readonly SelectionEntry[];
 };
 
@@ -100,8 +109,11 @@ function readSelectionFile(path: string): SelectionFile {
     throw new Error(`${path}: expected a JSON object`);
   }
   const raw = parsed as Record<string, unknown>;
-  if (typeof raw.institutionId !== "string" || raw.institutionId.length === 0) {
-    throw new Error(`${path}: "institutionId" is required`);
+  if (
+    raw.institutionId !== undefined &&
+    (typeof raw.institutionId !== "string" || raw.institutionId.length === 0)
+  ) {
+    throw new Error(`${path}: "institutionId", when present, must be a non-empty string`);
   }
   if (!Array.isArray(raw.pulls) || raw.pulls.length === 0) {
     throw new Error(`${path}: "pulls" must be a non-empty array`);
@@ -314,27 +326,6 @@ class DryRunAbort extends Error {
   }
 }
 
-/** `institutions.slug` for `institutionId`, read once per run -- `run.ts`'s
- * own lookup now that `persistAcquiredDocument` no longer opens a database
- * (F1-33). A missing row is a hard error naming what is missing, the same
- * pattern every other required setting in this file uses. */
-async function resolveInstitutionSlug(
-  client: ArchiveClient,
-  institutionId: string,
-): Promise<string> {
-  const found = await client.query<{ slug: string }>(
-    "SELECT slug FROM institutions WHERE id = $1",
-    [institutionId],
-  );
-  const row = found.rows[0];
-  if (!row) {
-    throw new Error(
-      `no institutions row with id ${institutionId}; provision the institution before running`,
-    );
-  }
-  return row.slug;
-}
-
 /** `accounts.acct_last4` for `accountId`, cached per run since the same
  * account is often named by several pulls. */
 async function resolveAccountLast4(
@@ -407,6 +398,7 @@ async function main(): Promise<void> {
   const adapter = await loadAdapter(values.adapter);
   const buildSession = await loadSessionBuilder(values.session);
   const selectionFile = readSelectionFile(values.selection);
+  const capabilities = adapter.capabilities();
 
   // Hard errors when unset -- FINANCE_ARCHIVE_RAW_TREE_ROOT, FINANCE_ARCHIVE_SPACE_ID.
   const rawTreeRoot = resolveRawTreeRoot();
@@ -416,21 +408,37 @@ async function main(): Promise<void> {
   await pgClient.connect();
 
   try {
+    // F1-19 operator gap: upserts the institutions row from the adapter's
+    // own capabilities() before discover, so the selection file no longer
+    // has to already name an existing row -- see resolveInstitution's doc
+    // comment. A selection file that still names one (compatibility) must
+    // agree with what the adapter resolves to, or the run refuses rather
+    // than silently importing against whichever institution it actually
+    // resolved.
+    const institutionId = await resolveInstitution(pgClient, capabilities);
+    if (
+      selectionFile.institutionId !== undefined &&
+      selectionFile.institutionId !== institutionId
+    ) {
+      throw new Error(
+        `--selection names institutionId ${selectionFile.institutionId}, but the adapter's ` +
+          `capabilities() (slug ${capabilities.institutionSlug}) resolved to ${institutionId}; ` +
+          "refusing to import against a different institution than the selection file names",
+      );
+    }
+
     const session = await buildSession();
     const discovered = await adapter.discover(session);
     // F1-32: makes every account discover() reported resolvable by its own
     // external key, so a selection can name one without a separate
-    // provisioning step.
+    // provisioning step. Keyed on the resolved institutionId, not
+    // selectionFile.institutionId, which the file no longer has to name.
     const accountsByExternalKey = await resolveDiscoveredAccounts(
       pgClient,
-      selectionFile.institutionId,
+      institutionId,
       discovered.accounts,
     );
 
-    const institutionSlug = await resolveInstitutionSlug(
-      pgClient,
-      selectionFile.institutionId,
-    );
     const accountLast4Cache = new Map<string, string | null>();
 
     const pulls: AdapterPull[] = [];
@@ -451,9 +459,9 @@ async function main(): Promise<void> {
         bytes: acquired.bytes,
       });
       const persisted = persistAcquiredDocument(rawTreeRoot, {
-        institutionId: selectionFile.institutionId,
+        institutionId,
         accountId,
-        institutionSlug,
+        institutionSlug: capabilities.institutionSlug,
         accountLast4,
         docType: entry.docType,
         acquired,
@@ -461,7 +469,7 @@ async function main(): Promise<void> {
       bytesAcquired += acquired.bytes.length;
       manifestHashes.push(acquired.manifest.contentHash);
       pulls.push({
-        institutionId: selectionFile.institutionId,
+        institutionId,
         accountId,
         acquired,
         rows: parsed.activity,
@@ -469,6 +477,7 @@ async function main(): Promise<void> {
         docType: entry.docType,
         docDate: entry.docDate,
         persisted,
+        activityTaxonomy: capabilities.activityTaxonomy,
       });
     }
 

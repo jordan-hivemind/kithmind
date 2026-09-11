@@ -55,6 +55,39 @@ export type CapabilityTier =
   | "pdf_statement"
   | "trade_confirmation";
 
+/**
+ * F1-19. Per activity-type-string convention the two reconciliation gates
+ * (reconciliation.ts, positionReconciliation.ts) depend on: the cash gate
+ * sums every non-null `amount`, and the position gate sums every non-null
+ * `quantity`, so a type that carries an amount but moves no cash (an in-kind
+ * transfer), or that has a fixed disposal/acquisition direction, has to say
+ * so or a gate fails loudly with no way for an adapter author to have known
+ * why short of hitting the failure. Declaring it here makes the convention
+ * checked at import (adapterImport.ts validates every parsed row against its
+ * declared type) rather than merely hoped for.
+ */
+export type ActivityTaxonomyEntry = {
+  readonly movesCash: boolean;
+  readonly movesQuantity: boolean;
+  /**
+   * Required sign of `ParsedRow.quantity` when `movesQuantity` is true and
+   * this type has a fixed direction (a disposal is always negative, ground
+   * rule the position gate depends on). `"none"` when this type moves no
+   * quantity, or moves it with no fixed sign -- a split or spinoff changes a
+   * stated position either way and is not itself an acquisition or disposal.
+   */
+  readonly quantitySign: "positive" | "negative" | "none";
+};
+
+/**
+ * Keyed by the exact `ParsedRow.activityType` string this adapter emits. A
+ * type this institution's `parse()` can produce but this taxonomy does not
+ * key is not rejected: `adapterImport.ts` imports the row as-is and both
+ * reconciliation gates count it exactly as they did before this taxonomy
+ * existed -- the conservative default, not a silently trusted one.
+ */
+export type ActivityTaxonomy = Readonly<Record<string, ActivityTaxonomyEntry>>;
+
 export type InstitutionCapabilities = {
   readonly institutionSlug: string;
   readonly institutionName: string;
@@ -66,6 +99,8 @@ export type InstitutionCapabilities = {
   };
   /** Free-text, institution-specific gotchas. No real account or person. */
   readonly quirks: readonly string[];
+  /** See `ActivityTaxonomy`. Required so declaring it is not optional to remember. */
+  readonly activityTaxonomy: ActivityTaxonomy;
 };
 
 // --- discover -----------------------------------------------------------

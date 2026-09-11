@@ -19,7 +19,9 @@ import { randomUUID } from "node:crypto";
 
 import type {
   AcquiredDocument,
+  ActivityTaxonomy,
   DiscoveredAccount,
+  InstitutionCapabilities,
   ParsedBalance,
   ParsedHoldings,
   ParsedInstrument,
@@ -33,7 +35,7 @@ import {
   type CaptureWriteResult,
   writeCaptureManifest,
 } from "./captures.js";
-import { canonicalizeDecimal } from "./decimal.js";
+import { canonicalizeDecimal, compareDecimal } from "./decimal.js";
 import type {
   ImportBalance,
   ImportDocument,
@@ -75,6 +77,15 @@ export type AdapterPull = {
   readonly docType: string;
   readonly docDate: string | null;
   readonly persisted: PersistedAcquisition;
+  /**
+   * F1-19. The institution's declared `ActivityTaxonomy` (adapter.ts),
+   * normally `adapter.capabilities().activityTaxonomy`. Optional so every
+   * `AdapterPull` built before this taxonomy existed keeps working exactly
+   * as before: omitting it skips the validation below entirely (no review
+   * items, no nulled fields), rather than treating every row as
+   * undeclared. A real caller (`run.ts`) always supplies it.
+   */
+  readonly activityTaxonomy?: ActivityTaxonomy;
 };
 
 type ReviewItemFields = {
@@ -99,6 +110,42 @@ async function openReviewItem(
       fields.reason,
     ],
   );
+}
+
+/**
+ * F1-19 operator gap. `run.ts` required the selection file's `institutionId`
+ * to already name an existing `institutions` row, and the README called
+ * provisioning one out of this package's scope -- so a first run against a
+ * fresh archive could not start at all. An adapter's own `capabilities()`
+ * already states its slug and name, which is everything the row needs, so
+ * `run.ts` now resolves it here before `discover` instead of requiring an
+ * operator to have inserted it by hand first.
+ *
+ * Upserts by `slug` (the schema's own UNIQUE constraint): a first call for a
+ * new institution inserts it and returns the new id; a later call for the
+ * same slug updates only `name` and returns the same id it always has,
+ * rather than minting a second row for one institution every run.
+ */
+export async function resolveInstitution(
+  client: ArchiveClient,
+  capabilities: InstitutionCapabilities,
+): Promise<string> {
+  return withArchiveTransaction(client, async () => {
+    const result = await client.query<{ id: string }>(
+      `INSERT INTO institutions (id, name, slug)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (slug) DO UPDATE SET name = EXCLUDED.name
+       RETURNING id`,
+      [
+        randomUUID(),
+        capabilities.institutionName,
+        capabilities.institutionSlug,
+      ],
+    );
+    // ON CONFLICT ... RETURNING always yields exactly one row for a single
+    // VALUES insert, whichever branch fired.
+    return result.rows[0]!.id;
+  });
 }
 
 /**
@@ -251,11 +298,146 @@ export async function resolveDiscoveredAccounts(
   return resolved;
 }
 
+type ActivityViolation = {
+  readonly kind: string;
+  readonly rawValue: string;
+  readonly reason: string;
+};
+
+type ClassifiedActivity = {
+  readonly quantity: string | null;
+  readonly amount: string | null;
+  readonly violations: readonly ActivityViolation[];
+};
+
+/**
+ * -1, 0 or 1, tolerant of text too malformed to parse as a decimal (returns
+ * 0, i.e. "no sign opinion"). A malformed quantity is `importer.ts`'s
+ * `ambiguous_quantity` review item to raise, not this function's -- this
+ * only judges the sign of a quantity that parses.
+ */
+function signOf(text: string): -1 | 0 | 1 {
+  try {
+    return compareDecimal(text, "0");
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * F1-19. Validates one parsed row against its institution's declared
+ * `ActivityTaxonomy` (adapter.ts). Pure and side-effect free -- it only
+ * decides what belongs in `review_items` and what the row's stored
+ * `quantity`/`amount` become -- so both `parsedRowToImportRow` (which opens
+ * the review items this returns) and `countDistinctRowHashes` (which needs
+ * the same final values to predict the same row hashes `importer.ts` will
+ * compute) can share it rather than risk disagreeing.
+ *
+ * A row whose type is not declared in `taxonomy` is not rejected: it passes
+ * through unvalidated and is flagged for review, which is what leaves it
+ * counting in both reconciliation gates exactly as an untaxonomied row
+ * always did (ground rule: never silently correct, but also never silently
+ * invent a declaration nobody made). `taxonomy` itself being `undefined`
+ * (no `AdapterPull.activityTaxonomy` supplied at all) skips validation
+ * entirely, with no violation and no review item -- pre-F1-19 behavior,
+ * for a caller that has not adopted this taxonomy yet.
+ *
+ * A row whose sign, amount or quantity disagrees with its declared type
+ * never has the offending field silently corrected: it is nulled and a
+ * review item explains why, exactly like every other ambiguous value this
+ * package refuses to guess at (ground rule 5).
+ */
+function classifyActivity(
+  taxonomy: ActivityTaxonomy | undefined,
+  row: ParsedRow,
+): ClassifiedActivity {
+  if (!taxonomy) {
+    return { quantity: row.quantity, amount: row.amount, violations: [] };
+  }
+
+  const entry = taxonomy[row.activityType];
+  if (!entry) {
+    return {
+      quantity: row.quantity,
+      amount: row.amount,
+      violations: [
+        {
+          kind: "undeclared_activity_type",
+          rawValue: row.activityType,
+          reason:
+            `activity type "${row.activityType}" is not declared in this institution's ` +
+            "activityTaxonomy; imported as-is, and counted toward both reconciliation " +
+            "gates conservatively, until the adapter declares it",
+        },
+      ],
+    };
+  }
+
+  const violations: ActivityViolation[] = [];
+  let quantity = row.quantity;
+  let amount = row.amount;
+
+  if (!entry.movesCash && amount !== null) {
+    violations.push({
+      kind: "cash_on_noncash_activity",
+      rawValue: amount,
+      reason:
+        `activity type "${row.activityType}" is declared movesCash: false, but this row ` +
+        `carries a non-null amount ("${amount}"); nulling the amount rather than silently ` +
+        "correcting it",
+    });
+    amount = null;
+  }
+
+  if (!entry.movesQuantity) {
+    if (quantity !== null) {
+      violations.push({
+        kind: "quantity_on_nonquantity_activity",
+        rawValue: quantity,
+        reason:
+          `activity type "${row.activityType}" is declared movesQuantity: false, but this ` +
+          `row carries a non-null quantity ("${quantity}"); nulling the quantity rather ` +
+          "than silently correcting it",
+      });
+      quantity = null;
+    }
+  } else if (entry.quantitySign !== "none" && quantity !== null) {
+    const sign = signOf(quantity);
+    const wrongSign =
+      sign !== 0 &&
+      ((entry.quantitySign === "positive" && sign < 0) ||
+        (entry.quantitySign === "negative" && sign > 0));
+    if (wrongSign) {
+      violations.push({
+        kind: "activity_sign_mismatch",
+        rawValue: quantity,
+        reason:
+          `activity type "${row.activityType}" is declared quantitySign: ` +
+          `${entry.quantitySign}, but this row's quantity ("${quantity}") has the opposite ` +
+          "sign; nulling the quantity rather than silently correcting it",
+      });
+      quantity = null;
+    }
+  }
+
+  return { quantity, amount, violations };
+}
+
 async function parsedRowToImportRow(
   client: ArchiveClient,
   accountId: string,
+  taxonomy: ActivityTaxonomy | undefined,
   row: ParsedRow,
 ): Promise<ImportRow> {
+  const classified = classifyActivity(taxonomy, row);
+  for (const violation of classified.violations) {
+    await openReviewItem(client, {
+      kind: violation.kind,
+      accountId,
+      rawValue: violation.rawValue,
+      reason: violation.reason,
+    });
+  }
   return {
     accountId,
     tradeDate: row.tradeDate,
@@ -268,9 +450,9 @@ async function parsedRowToImportRow(
       row.instrument === null
         ? null
         : await resolveInstrumentId(client, row.instrument),
-    quantity: row.quantity,
+    quantity: classified.quantity,
     price: row.price,
-    amountText: row.amount,
+    amountText: classified.amount,
     amountNote: row.amountNote,
     currency: row.currency,
     runningBalance: row.runningBalance,
@@ -380,10 +562,19 @@ async function mapSeries<T, R>(
  * this goes silently wrong, so the two are always taken together. Works with
  * or without provider transaction ids: unlike an id-based count, it cannot go
  * silent just because a source has none.
+ *
+ * F1-19: runs every row through the same `classifyActivity` taxonomy
+ * validation `parsedRowToImportRow` applies, so a row whose amount or
+ * quantity gets nulled for a declared-type violation predicts the same
+ * content and hash here that `importBatch` will actually store -- taking one
+ * of the pair's inputs from before validation and the other from after would
+ * silently miscount, exactly the drift this function's own doc comment above
+ * warns against for `contentKeyV2`/`rowHashV2`.
  */
 function countDistinctRowHashes(
   accountId: string,
   groups: ReadonlyMap<string, readonly ParsedRow[]>,
+  taxonomy: ActivityTaxonomy | undefined,
 ): number {
   const hashes = new Set<string>();
   for (const rows of groups.values()) {
@@ -392,24 +583,25 @@ function countDistinctRowHashes(
     // lands on the same ordinal (and hash) in each page's document.
     const occurrences = new Map<string, number>();
     for (const row of rows) {
+      const classified = classifyActivity(taxonomy, row);
       let amount: string | null = null;
-      if (row.amount !== null) {
+      if (classified.amount !== null) {
         try {
           // Both of the importer's checks, in the importer's order: the
           // minor-unit check for ambiguous money, then canonicalization to
           // the decimal that is stored and hashed. A value failing either
           // becomes NULL on import (ground rule 5), so NULL is what belongs
           // in the hash here as well.
-          toMinorUnits(row.amount, row.currency);
-          amount = toNumericText(row.amount);
+          toMinorUnits(classified.amount, row.currency);
+          amount = toNumericText(classified.amount);
         } catch {
           // Ambiguous money: importBatch stores NULL for this too.
         }
       }
       let quantity: string | null = null;
-      if (row.quantity !== null) {
+      if (classified.quantity !== null) {
         try {
-          quantity = toNumericText(row.quantity);
+          quantity = toNumericText(classified.quantity);
         } catch {
           // A malformed quantity becomes NULL on import too; same reasoning.
         }
@@ -513,7 +705,11 @@ async function collectDocuments(
           "without a stated total to reconcile against -- treat this pull as unverified",
       });
     } else {
-      const distinct = countDistinctRowHashes(pull.accountId, activityGroups);
+      const distinct = countDistinctRowHashes(
+        pull.accountId,
+        activityGroups,
+        pull.activityTaxonomy,
+      );
       if (distinct !== reportedRowCount) {
         throw new Error(
           `adapter pull reported ${reportedRowCount} unique row(s) but ${distinct} distinct ` +
@@ -572,7 +768,7 @@ async function collectDocuments(
       // creates rows, and two rows for the same new instrument resolved in
       // parallel would each fail to find it and mint a second id.
       rows: await mapSeries(activityGroups.get(sourceDocument) ?? [], (row) =>
-        parsedRowToImportRow(client, pull.accountId, row),
+        parsedRowToImportRow(client, pull.accountId, pull.activityTaxonomy, row),
       ),
       positions: await mapSeries(
         positionGroups.get(sourceDocument) ?? [],
