@@ -316,6 +316,12 @@ export function selectDateRangeType(periodStart, periodEnd) {
   if (days <= 90) return "Last90Days";
   const thisYear = new Date().getUTCFullYear();
   if (periodEnd < `${thisYear}-01-01` && periodStart >= `${thisYear - 1}-01-01`) return "LastYear";
+  // Confirmed live 2026-09-11: DateRangeType "Custom" honours StartDate and
+  // EndDate (ISO accepted) for any window, and it is the only way to reach
+  // years before last year. A window that ends before last year, or spans
+  // more than one calendar year, is a Custom pull; the caller splits long
+  // windows by year so each pull stays a bounded page walk.
+  if (periodEnd < `${thisYear - 1}-01-01` || periodStart.slice(0, 4) !== periodEnd.slice(0, 4)) return "Custom";
   return "YearToDate";
 }
 
