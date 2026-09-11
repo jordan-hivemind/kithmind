@@ -15,6 +15,7 @@ import {
   type AcquireSelection,
   type AdapterSession,
   type DiscoverResult,
+  type FieldBinding,
   type FieldLocator,
   type InstitutionAdapter,
   type InstitutionCapabilities,
@@ -524,22 +525,59 @@ async function acquire(selection: AcquireSelection): Promise<AcquiredDocument> {
 
 // --- parse -------------------------------------------------------------
 
+/**
+ * Every "amount" field's exact JSON source token, in the order JSON.parse's
+ * reviver visits it: pages[0].items[0], pages[0].items[1], ...,
+ * pages[1].items[0], .... That is the same (page, item) order
+ * parseStructuredApi already iterates in, so the two line up one-to-one.
+ * `context.source` (Node 22+, already used by retention.ts) is defined only
+ * for a revived primitive, which is what lets this collect just the "amount"
+ * tokens without a custom scanner and without disturbing the plain-value
+ * parse used for everything else.
+ */
+function readAmountSourceTokens(text: string): readonly string[] {
+  const tokens: string[] = [];
+  (JSON.parse as (text: string, reviver: unknown) => unknown)(
+    text,
+    (key: string, value: unknown, context?: { source?: string }) => {
+      if (key === "amount" && context?.source !== undefined) tokens.push(context.source);
+      return value;
+    },
+  );
+  return tokens;
+}
+
 function parseStructuredApi(bytes: Uint8Array): readonly ParsedRow[] {
-  const { pages } = JSON.parse(new TextDecoder().decode(bytes)) as {
+  const text = new TextDecoder().decode(bytes);
+  const { pages } = JSON.parse(text) as {
     pages: ReadonlyArray<{ page: number; items: readonly ActivityRow[] }>;
   };
+  const amountTokens = readAmountSourceTokens(text);
   const rows: ParsedRow[] = [];
   let index = 0;
-  for (const page of pages) {
+  let tokenIndex = 0;
+  for (const [pageArrayIndex, page] of pages.entries()) {
     // Each page is its own document for occurrence-ordinal purposes, even
     // though the whole pull was captured as one RawFile: see ParsedRow's
     // sourceDocument doc comment.
     const sourceDocument = `structured-api-page-${page.page}`;
-    for (const item of page.items) {
+    for (const [itemArrayIndex, item] of page.items.entries()) {
+      const rawValue = amountTokens[tokenIndex];
+      tokenIndex += 1;
+      if (rawValue === undefined) {
+        throw new Error("structured_api parse: missing amount source token");
+      }
+      // The pointer is built from array positions, not page.page: that
+      // value is the provider's own page number, not a position in `pages`.
+      const binding: FieldBinding = {
+        format: "json_pointer_v1",
+        pointer: `/pages/${pageArrayIndex}/items/${itemArrayIndex}/amount`,
+        rawValue,
+      };
       rows.push(
         activityRowToParsedRow(
           item,
-          { source: "structured_api", index, field: `page ${page.page}` },
+          { source: "structured_api", index, field: `page ${page.page}`, binding },
           sourceDocument,
         ),
       );
@@ -550,30 +588,46 @@ function parseStructuredApi(bytes: Uint8Array): readonly ParsedRow[] {
 }
 
 function parseTabularExport(bytes: Uint8Array): readonly ParsedRow[] {
-  const [, ...dataLines] = new TextDecoder().decode(bytes).split("\n");
-  return dataLines
-    .filter((line) => line.trim() !== "")
-    .map((line, index) => {
-      const [date, activityType, description, symbol, quantity, price, amount, currency] =
-        splitEightFields(line, ",");
-      return activityRowToParsedRow(
-        {
-          // Documented quirk: this export carries no provider row id.
-          externalId: null,
-          date,
-          activityType,
-          description,
-          instrument: symbol === "-" ? null : instrumentBySymbol(symbol),
-          quantity: quantity === "-" ? null : quantity,
-          price: price === "-" ? null : price,
-          amount,
-          currency,
-        },
-        { source: "tabular_export", index },
-        // No pagination on this tier: one parse() call is one document.
-        "tabular-export",
-      );
-    });
+  const [, ...rest] = new TextDecoder().decode(bytes).split("\n");
+  // One trailing record separator at end of file does not create a final
+  // record (delimited_row_v1 format rule): drop that one blank tail entry,
+  // but no others, so `rowIndex` below is the physical data-record position
+  // and a genuine blank line in the middle still surfaces as a field-count
+  // error from splitEightFields rather than being silently skipped past.
+  const dataLines = rest.length > 0 && rest.at(-1) === "" ? rest.slice(0, -1) : rest;
+  return dataLines.map((line, rowIndex) => {
+    const [date, activityType, description, symbol, quantity, price, amount, currency] =
+      splitEightFields(line, ",");
+    const binding: FieldBinding = {
+      format: "delimited_row_v1",
+      encoding: "utf-8",
+      delimiter: ",",
+      quote: "none",
+      headerRows: 1,
+      recordSeparator: "lf",
+      rowIndex,
+      columnIndex: 6,
+      columnName: "amount",
+      rawValue: amount,
+    };
+    return activityRowToParsedRow(
+      {
+        // Documented quirk: this export carries no provider row id.
+        externalId: null,
+        date,
+        activityType,
+        description,
+        instrument: symbol === "-" ? null : instrumentBySymbol(symbol),
+        quantity: quantity === "-" ? null : quantity,
+        price: price === "-" ? null : price,
+        amount,
+        currency,
+      },
+      { source: "tabular_export", index: rowIndex, binding },
+      // No pagination on this tier: one parse() call is one document.
+      "tabular-export",
+    );
+  });
 }
 
 function resolveAmount(text: string): ParsedAmount {

@@ -240,12 +240,40 @@ export type RawFile = {
   readonly bytes: Uint8Array;
 };
 
+/**
+ * How a `FieldLocator`'s datum resolves inside the retained bytes it came
+ * from. Mirrors `StructuredFieldLocator`
+ * (docs/plans/2026-09-11-structured-evidence.md, section 1) minus
+ * `rawValueSha256`, which is derived from `rawValue` at assembly time rather
+ * than carried here as a second copy of one fact.
+ */
+export type FieldBinding =
+  | {
+      readonly format: "json_pointer_v1";
+      readonly pointer: string;
+      readonly rawValue: string;
+    }
+  | {
+      readonly format: "delimited_row_v1";
+      readonly encoding: "utf-8";
+      readonly delimiter: "," | "\t" | ";" | "|";
+      readonly quote: '"' | "none";
+      readonly headerRows: 0 | 1;
+      readonly recordSeparator: "lf" | "crlf";
+      readonly rowIndex: number;
+      readonly columnIndex: number;
+      readonly columnName: string;
+      readonly rawValue: string;
+    };
+
 export type FieldLocator = {
   readonly source: CapabilityTier;
   /** 0-based row index within the source page/file, or 1-based page number for a PDF-tier source. */
   readonly index: number;
   /** Column header or on-page label near the value, when the source has one. */
   readonly field?: string;
+  /** Present only when this exact datum resolves inside the retained bytes. */
+  readonly binding?: FieldBinding;
 };
 
 /**
