@@ -11,51 +11,20 @@ test("acquire retains the export opaque with no row count -- the provider states
 
   assert.equal(acquired.manifest.kind, "tabular_export");
   assert.equal(acquired.manifest.reportedRowCount, null);
-  assert.equal(acquired.manifest.mediaType, "text/csv; charset=utf-8");
+  // The export is an Excel workbook, not delimited text.
+  assert.equal(
+    acquired.manifest.mediaType,
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  );
   assert.equal(acquired.retention.policy.kind, "opaque");
   assert.deepEqual(acquired.retention.droppedPaths, []);
 });
 
-test("parse reads the real header row, signs quantity by the same table as the API tier, and binds amount by column", async () => {
+test("parse returns zero rows for tabular_export -- acquire-only until an xlsx reader is chosen", async () => {
   const session = createFixtureSession();
   const acquired = await adapter.acquire({ ...SELECTION, session });
   const parsed = await adapter.parse({ kind: "tabular_export", bytes: acquired.bytes });
 
-  assert.equal(parsed.activity.length, 5);
+  assert.deepEqual(parsed.activity, []);
   assert.deepEqual(parsed.holdings, { positions: [], balances: [], liabilities: [] });
-
-  const sell = parsed.activity.find((r) => r.activityType === "Sold");
-  assert.equal(sell.quantity, "-25", "signed the same way as the structured_api tier");
-  assert.equal(sell.amount, "5321.1");
-
-  const csvText = new TextDecoder().decode(acquired.bytes);
-  const dataLines = csvText.split("\n").filter((l) => l.length > 0).slice(1);
-
-  parsed.activity.forEach((row, i) => {
-    const binding = row.locators.row.binding;
-    assert.equal(binding.format, "delimited_row_v1");
-    assert.equal(binding.columnName, "Amount");
-    assert.equal(binding.columnIndex, 6);
-    assert.equal(binding.rowIndex, i, "rowIndex is the physical data-record position");
-    const fieldsInLine = dataLines[i].split(",");
-    assert.equal(fieldsInLine[binding.columnIndex], binding.rawValue, "the binding resolves against the retained bytes");
-  });
-});
-
-test("no row's externalId is fabricated -- the export states no provider row id", async () => {
-  const session = createFixtureSession();
-  const acquired = await adapter.acquire({ ...SELECTION, session });
-  const parsed = await adapter.parse({ kind: "tabular_export", bytes: acquired.bytes });
-  assert.ok(parsed.activity.every((r) => r.externalId === null));
-});
-
-test("the KeyAccount column attributes each row, not the account the selection named", async () => {
-  const session = createFixtureSession();
-  const acquired = await adapter.acquire({ ...SELECTION, session });
-  const parsed = await adapter.parse({ kind: "tabular_export", bytes: acquired.bytes });
-
-  const dividend = parsed.activity.find((r) => r.activityType === "Dividend Received");
-  assert.equal(dividend.accountExternalKey, "MS-ACCT-0003");
-  assert.ok(parsed.activity.every((r) => typeof r.accountExternalKey === "string"));
-  assert.equal(new Set(parsed.activity.map((r) => r.accountExternalKey)).size, 2);
 });

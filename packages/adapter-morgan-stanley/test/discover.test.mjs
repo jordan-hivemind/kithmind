@@ -63,3 +63,26 @@ test("a document's externalId round-trips through acquire without a second docum
   assert.equal(acquired.manifest.periodStart, statement.periodStart);
   assert.equal(acquired.manifest.periodEnd, statement.periodEnd);
 });
+
+test("discover tolerates a documents pull failing outright (e.g. the missing Authorization bearer) and still returns accounts", async () => {
+  const session = createFixtureSession({ documentsFail: true });
+  const result = await adapter.discover(session);
+
+  assert.equal(result.documents.status, "incomplete");
+  assert.match(result.documents.reason, /docType=Statements failed/);
+  assert.match(result.documents.reason, /docType=Trade confirmations failed/);
+  assert.equal(result.documents.items.length, 0);
+  // The activity-only bounded pull can still proceed: accounts are unaffected.
+  assert.equal(result.accounts.length, 8);
+});
+
+test("discover falls back to deriving accounts from the activity API when the accounts endpoint 403s", async () => {
+  const session = createFixtureSession({ accountsStatus: 403 });
+  const result = await adapter.discover(session);
+
+  assert.deepEqual(result.accounts, [
+    { externalKey: "MS-ACCT-0001", label: "MS-ACCT-0001", last4: "0001", kind: "other" },
+  ]);
+  // The documents pull is unaffected by the accounts fallback.
+  assert.equal(result.documents.status, "exhaustive");
+});

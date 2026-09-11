@@ -1,8 +1,9 @@
 // Synthetic Morgan Stanley activity-API fixtures. Real field names
-// (processDate, activityDate, tradeDate, settlementDate, accountName,
-// keyAccount, activity, CCY, description, amount, quantity, price, symbol,
-// cusip, checkNumber), entirely invented values. No real account number, no
-// person.
+// (activityId, transactionSequenceNumber, CCY, processDate, activityDate,
+// tradeDate, settlementDate, accountName, keyAccount, activity, trnType,
+// category, subCategory, description, amount, quantity, price,
+// runningBalances (a scalar), symbol, cusip, checkNumber), entirely invented
+// values. No real account number, no person.
 
 import { MS_ACTIVITY_ROWS_KEY } from "../src/adapter.mjs";
 
@@ -17,6 +18,9 @@ const SECOND_KEY_ACCOUNT = "MS-ACCT-0003";
 // amount, a row with an unknown (unreviewed) activity value, and a dividend
 // on a second account.
 export const ROW_1_TREASURY = {
+  activityId: "ACT-0001-000001",
+  transactionSequenceNumber: 1000001,
+  CCY: "-",
   processDate: "2025-01-22",
   activityDate: "2025-01-22",
   tradeDate: "2025-01-21",
@@ -24,7 +28,9 @@ export const ROW_1_TREASURY = {
   accountName: "Sample Brokerage Account",
   keyAccount: KEY_ACCOUNT,
   activity: "Bought",
-  CCY: "-",
+  trnType: "Trade",
+  category: "Investment",
+  subCategory: "Fixed Income",
   description: "TREASURY BILL PURCHASE<br/>RATE:4.500 DUE:2026-03-15",
   amount: -9875.0,
   quantity: 10000,
@@ -32,10 +38,13 @@ export const ROW_1_TREASURY = {
   symbol: "-",
   cusip: "912796ZZ1",
   checkNumber: null,
-  runningBalances: { cash: "12345.67", totalValue: "204981.02" },
+  runningBalances: 12345.67,
 };
 
 export const ROW_2_SELL_TRADE = {
+  activityId: "ACT-0001-000002",
+  transactionSequenceNumber: 1000002,
+  CCY: "-",
   processDate: "2025-01-15",
   activityDate: "2025-01-15",
   tradeDate: "2025-01-14",
@@ -43,7 +52,9 @@ export const ROW_2_SELL_TRADE = {
   accountName: "Sample Brokerage Account",
   keyAccount: KEY_ACCOUNT,
   activity: "Sold",
-  CCY: "-",
+  trnType: "Trade",
+  category: "Investment",
+  subCategory: "Equity",
   description: "EQUITY SALE",
   amount: 5321.1,
   quantity: 25,
@@ -51,10 +62,13 @@ export const ROW_2_SELL_TRADE = {
   symbol: "WNDF",
   cusip: "00000WNF1",
   checkNumber: null,
-  runningBalances: { cash: "22345.67", totalValue: "208981.02" },
+  runningBalances: 22345.67,
 };
 
 export const ROW_3_AUTOMATED_PAYMENT = {
+  activityId: "ACT-0001-000003",
+  transactionSequenceNumber: 1000003,
+  CCY: "-",
   processDate: "2025-02-03",
   activityDate: "2025-02-03",
   tradeDate: null,
@@ -62,7 +76,9 @@ export const ROW_3_AUTOMATED_PAYMENT = {
   accountName: "Sample Brokerage Account",
   keyAccount: KEY_ACCOUNT,
   activity: "ACH Disbursement",
-  CCY: "-",
+  trnType: "Cash",
+  category: "Payment",
+  subCategory: "ACH",
   description: "AUTOMATED PAYMENT<br/>PAYEE:Example Utility Co<br/>ACCT:...4821",
   amount: -150.0,
   quantity: null,
@@ -70,10 +86,13 @@ export const ROW_3_AUTOMATED_PAYMENT = {
   symbol: "-",
   cusip: null,
   checkNumber: null,
-  runningBalances: { cash: "22195.67", totalValue: "208831.02" },
+  runningBalances: 22195.67,
 };
 
 export const ROW_4_BUY_TRADE = {
+  activityId: "ACT-0001-000004",
+  transactionSequenceNumber: 1000004,
+  CCY: "-",
   processDate: "2025-01-08",
   activityDate: "2025-01-08",
   tradeDate: "2025-01-07",
@@ -81,7 +100,9 @@ export const ROW_4_BUY_TRADE = {
   accountName: "Sample Brokerage Account",
   keyAccount: KEY_ACCOUNT,
   activity: "Bought",
-  CCY: "-",
+  trnType: "Trade",
+  category: "Investment",
+  subCategory: "Equity",
   description: "EQUITY PURCHASE",
   amount: -4578.0,
   quantity: 15,
@@ -89,10 +110,13 @@ export const ROW_4_BUY_TRADE = {
   symbol: "WNDF",
   cusip: "00000WNF1",
   checkNumber: null,
-  runningBalances: { cash: "17767.67", totalValue: "204403.02" },
+  runningBalances: 17767.67,
 };
 
 export const ROW_5_UNPARSEABLE_AMOUNT = {
+  activityId: "ACT-0001-000005",
+  transactionSequenceNumber: 1000005,
+  CCY: "-",
   processDate: "2025-02-10",
   activityDate: "2025-02-10",
   tradeDate: null,
@@ -100,7 +124,9 @@ export const ROW_5_UNPARSEABLE_AMOUNT = {
   accountName: "Sample Brokerage Account",
   keyAccount: KEY_ACCOUNT,
   activity: "Fee",
-  CCY: "-",
+  trnType: "Fee",
+  category: "Fee",
+  subCategory: "Account",
   description: "ACCOUNT MAINTENANCE FEE",
   amount: "N/A",
   quantity: null,
@@ -108,10 +134,13 @@ export const ROW_5_UNPARSEABLE_AMOUNT = {
   symbol: "-",
   cusip: null,
   checkNumber: null,
-  runningBalances: { cash: "22195.67", totalValue: "208831.02" },
+  runningBalances: 22195.67,
 };
 
 export const ROW_6_UNKNOWN_ACTIVITY = {
+  activityId: "ACT-0001-000006",
+  transactionSequenceNumber: 1000006,
+  CCY: "-",
   processDate: "2025-02-18",
   activityDate: "2025-02-18",
   tradeDate: null,
@@ -119,7 +148,9 @@ export const ROW_6_UNKNOWN_ACTIVITY = {
   accountName: "Sample Brokerage Account",
   keyAccount: KEY_ACCOUNT,
   activity: "Zzyzx Adjustment",
-  CCY: "-",
+  trnType: "Adjustment",
+  category: "Other",
+  subCategory: "Other",
   description: "UNCLASSIFIED SHARE ADJUSTMENT",
   amount: 0.0,
   quantity: 5,
@@ -127,10 +158,13 @@ export const ROW_6_UNKNOWN_ACTIVITY = {
   symbol: "WNDF",
   cusip: "00000WNF1",
   checkNumber: null,
-  runningBalances: { cash: "22195.67", totalValue: "208831.02" },
+  runningBalances: 22195.67,
 };
 
 export const ROW_7_DIVIDEND = {
+  activityId: "ACT-0001-000007",
+  transactionSequenceNumber: 1000007,
+  CCY: "-",
   processDate: "2025-02-14",
   activityDate: "2025-02-14",
   tradeDate: null,
@@ -138,7 +172,9 @@ export const ROW_7_DIVIDEND = {
   accountName: "Sample Retirement Account",
   keyAccount: SECOND_KEY_ACCOUNT,
   activity: "Dividend Received",
-  CCY: "-",
+  trnType: "Income",
+  category: "Income",
+  subCategory: "Dividend",
   description: "QUARTERLY DIVIDEND",
   amount: 42.17,
   quantity: null,
@@ -146,13 +182,19 @@ export const ROW_7_DIVIDEND = {
   symbol: "WNDF",
   cusip: "00000WNF1",
   checkNumber: null,
-  runningBalances: { cash: "22237.84", totalValue: "208873.19" },
+  runningBalances: 22237.84,
 };
 
 export const POSTED_ACTIVITY_COUNT = 7;
 
 function page(rows) {
-  return { Result: { postedActivityCount: POSTED_ACTIVITY_COUNT, [MS_ACTIVITY_ROWS_KEY]: rows } };
+  return {
+    Result: {
+      postedActivityCount: POSTED_ACTIVITY_COUNT,
+      pendingActivityCount: 0,
+      [MS_ACTIVITY_ROWS_KEY]: rows,
+    },
+  };
 }
 
 /** Three pages with a deliberate one-row overlap (ROW_6, repeated on pages 2
@@ -182,6 +224,9 @@ export const ACTIVITY_PAGE_WITH_CREDENTIAL_ECHO = {
  * (src/adapter.mjs). Not part of ACTIVITY_PAGES; used only where a test
  * needs one row with a currency problem. */
 export const ROW_8_MISSING_CURRENCY = {
+  activityId: "ACT-0001-000008",
+  transactionSequenceNumber: 1000008,
+  CCY: null,
   processDate: "2025-02-20",
   activityDate: "2025-02-20",
   tradeDate: null,
@@ -189,7 +234,9 @@ export const ROW_8_MISSING_CURRENCY = {
   accountName: "Sample Brokerage Account",
   keyAccount: KEY_ACCOUNT,
   activity: "Dividend Received",
-  CCY: null,
+  trnType: "Income",
+  category: "Income",
+  subCategory: "Dividend",
   description: "QUARTERLY DIVIDEND",
   amount: 10.0,
   quantity: null,
@@ -197,5 +244,5 @@ export const ROW_8_MISSING_CURRENCY = {
   symbol: "WNDF",
   cusip: "00000WNF1",
   checkNumber: null,
-  runningBalances: { cash: "22247.84", totalValue: "208883.19" },
+  runningBalances: 22247.84,
 };

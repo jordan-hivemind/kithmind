@@ -35,6 +35,15 @@ function randomActivityQueryIds() {
   return { requestId, seqId };
 }
 
+/** `RequestID=<uuid>&SeqID=<4 digits>`, per the confirmed accounts request --
+ * a real UUID, unlike the activity endpoint's 8-hex-group format above.
+ * Generated fresh per call, same as the activity ids. */
+function randomAccountsQueryIds() {
+  const requestId = crypto.randomUUID();
+  const seqId = String(Math.floor(Math.random() * 10000)).padStart(4, "0");
+  return { requestId, seqId };
+}
+
 /**
  * The activity POST body, from the observed request template. `query`
  * carries only logical, non-secret request parameters (page number, date
@@ -124,7 +133,26 @@ function resolveEndpoint(path, query) {
     };
   }
   if (path === "/accounts") {
-    return { method: "GET", url: requiredEnv("MS_ACCOUNTS_PATH"), body: null };
+    const { requestId, seqId } = randomAccountsQueryIds();
+    // Confirmed request shape -- see adapter.mjs's fetchAccountsFromEndpoint/
+    // fetchAccountsFromActivityFallback doc comment: this still 403s from a
+    // page-context fetch today, hence the fallback, but the request itself
+    // is confirmed, not guessed.
+    const params = new URLSearchParams({
+      "accountInfo.grouping": "0",
+      "accountInfo.id": "",
+      isLendingCacheRefreshRequired: "false",
+      isCacheRefreshRequired: "false",
+      topRail: "true",
+      RequestID: requestId,
+      SeqID: seqId,
+    });
+    return {
+      method: "GET",
+      url: `/shell/handler/restproxy/financialsal/api/v1/accounts?${params}`,
+      body: null,
+      headers: { Accept: "application/json, text/plain, */*" },
+    };
   }
   throw new RangeError(`morgan-stanley bridge: unknown logical path ${path}`);
 }
@@ -199,7 +227,7 @@ const HEADER_HOOK = `(() => {
  * only the response body -- never a header value -- crosses the CDP
  * boundary back to Node. Throws in-page, with an instruction to open the
  * Activity tab, when the slot is still empty. */
-function pageFetchExpression(origin, { method, url, body }) {
+function pageFetchExpression(origin, { method, url, body, headers }) {
   return `(async () => {
     const slot = globalThis[Symbol.for(${JSON.stringify(CAPTURED_HEADERS_SLOT)})] ?? {};
     if (Object.keys(slot).length === 0) {
@@ -207,7 +235,7 @@ function pageFetchExpression(origin, { method, url, body }) {
     }
     const response = await fetch(${JSON.stringify(origin)} + ${JSON.stringify(url)}, {
       method: ${JSON.stringify(method)},
-      headers: { "Content-Type": "application/json", ...slot },
+      headers: { "Content-Type": "application/json", ...${JSON.stringify(headers ?? {})}, ...slot },
       body: ${body === null ? "undefined" : JSON.stringify(body)},
     });
     if (!response.ok) {

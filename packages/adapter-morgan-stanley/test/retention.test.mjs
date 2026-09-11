@@ -29,8 +29,7 @@ test("json_allowlist drops credential-shaped and person-shaped fields, never cop
     [
       "pages.*.Result.DeviceFootprintEcho",
       "pages.*.Result.SessionToken",
-      "pages.*.Result.activityDetails.*.accountName",
-      "pages.*.Result.activityDetails.*.runningBalances",
+      "pages.*.Result.postedActivities.*.accountName",
     ].sort(),
   );
   assert.equal(retained.record.policy.version, "ms-activity-2");

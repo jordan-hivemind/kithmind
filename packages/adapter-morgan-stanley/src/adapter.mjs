@@ -31,21 +31,27 @@ const MAX_DOCUMENTS_PAGES_PER_TYPE = 200;
 
 // --- Unconfirmed institution response shapes --------------------------------
 //
-// Only the *request* shapes are known (the activity POST body, the documents
-// `filters` array) along with the activity endpoint's *row field* names. No
-// full response envelope has been observed. Each constant below is this adapter's
-// working assumption for a JSON key this v1 has never seen a live response
-// for. Confirm each one on the first real discover()/acquire() run
-// (README, "Operator runbook") rather than trusting the guess silently:
-//   - MS_ACTIVITY_ROWS_KEY: read the resulting RetentionRecord.droppedPaths
-//     If it lists activity rows dropped under a different key than
-//     declared here, rename this constant and bump ACTIVITY_RETENTION.version.
-//   - The rest: discover()/acquire() throw a named "missing <key> array"
-//     error against a real response if the guess is wrong. Fix the constant
-//     here, not in a downstream caller.
-const MS_ACTIVITY_ROWS_KEY = "activityDetails";
+// The activity envelope is confirmed against a live response: `Result`
+// carries `postedActivityCount`/`pendingActivityCount`, and the rows array is
+// `Result.postedActivities`. The documents and accounts envelopes remain this
+// adapter's working assumption -- only their *request* shapes are known so
+// far, never a confirmed response envelope. Confirm each remaining one on the
+// first real discover()/acquire() run (README, "Operator runbook") rather
+// than trusting the guess silently:
+//   - MS_ACCOUNTS_ITEMS_KEY: discover() throws a "missing <key> array" error
+//     naming the response's actual top-level keys if the guess is wrong (see
+//     fetchAccountsFromEndpoint). The accounts endpoint itself is currently
+//     unreliable (see fetchAccountsFromActivityFallback) so this may go
+//     unconfirmed for a while longer.
+//   - MS_DOCUMENTS_ITEMS_KEY / MS_DOCUMENTS_TOTAL_KEY: same "missing <key>
+//     array" pattern, but discover() also tolerates the documents pull
+//     failing outright (e.g. the still-missing Authorization bearer, see
+//     fetchDocumentsForType) and returns an incompleteListing with the
+//     reason instead of throwing.
+const MS_ACTIVITY_ROWS_KEY = "postedActivities";
 const MS_DOCUMENTS_ITEMS_KEY = "documents";
 const MS_DOCUMENTS_TOTAL_KEY = "totalCount";
+// The list is `Result.Accounts`.
 const MS_ACCOUNTS_ITEMS_KEY = "Accounts";
 
 export {
@@ -93,20 +99,19 @@ const ACTIVITY_TAXONOMY = {
 // --- retention ------------------------------------------------------
 
 /**
- * Every path the parser actually reads from one activity page. `accountName`
- * is deliberately excluded: it can carry a person's name, and `keyAccount`
- * already identifies the account. `runningBalances` is also excluded for v1:
- * its leaf field names are unknown, and a
- * json_allowlist path must terminate on a scalar, so guessing a leaf name
- * here would be the exact silent guess the design forbids. It shows up
- * whole in RetentionRecord.droppedPaths on the first real pull; add its
- * leaves individually once that path is read, and bump `version`.
+ * Every path the parser actually reads from one activity page, plus the
+ * fields review and dedupe need. `accountName` is deliberately excluded: it
+ * can carry a person's name, and `keyAccount` already identifies the
+ * account. `runningBalances` is confirmed as a scalar (a JSON number), so it
+ * is retained directly.
  */
 const ACTIVITY_RETENTION = {
   kind: "json_allowlist",
   version: "ms-activity-2",
   fields: [
     "pages.*.Result.postedActivityCount",
+    `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.activityId`,
+    `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.transactionSequenceNumber`,
     `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.CCY`,
     `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.processDate`,
     `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.activityDate`,
@@ -114,10 +119,14 @@ const ACTIVITY_RETENTION = {
     `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.settlementDate`,
     `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.keyAccount`,
     `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.activity`,
+    `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.trnType`,
+    `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.category`,
+    `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.subCategory`,
     `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.description`,
     `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.amount`,
     `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.quantity`,
     `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.price`,
+    `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.runningBalances`,
     `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.symbol`,
     `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.cusip`,
     `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.checkNumber`,
@@ -138,7 +147,7 @@ const TABULAR_RETENTION = {
   kind: "opaque",
   version: "ms-tabular-1",
   note:
-    "the download-control export is delimited text produced for a person to open, not " +
+    "the download-control export is an Excel workbook produced for a person to open, not " +
     "an addressable payload; it is retained whole because there is nothing to project",
 };
 
@@ -296,8 +305,9 @@ function mapAccountKind(rawType) {
   if (t.includes("trust")) return "trust";
   if (t.includes("line of credit") || t.includes("sbloc")) return "credit_line";
   if (t.includes("mortgage")) return "mortgage";
-  if (t.includes("bank") || t.includes("checking") || t.includes("savings")) return "bank";
-  if (t.includes("brokerage") || t.includes("advisory") || t.includes("managed")) return "brokerage";
+  if (t.includes("other loans") || t.includes("loan")) return "credit_line";
+  if (t.includes("bank") || t.includes("checking") || t.includes("savings") || t.includes("cash management")) return "bank";
+  if (t.includes("brokerage") || t.includes("advisory") || t.includes("managed") || t.includes("investments")) return "brokerage";
   return "other";
 }
 
@@ -325,7 +335,27 @@ function decodeDocumentExternalId(externalId) {
 
 // --- discover ----------------------------------------------------------------
 
+/**
+ * Documents tier tolerance: the documents-list request needs an Authorization
+ * bearer the bridge's two-header allowlist does not carry, so a real pull can
+ * fail outright, not just report a missing key. Catching that here, per
+ * document type, is what lets an activity-only bounded pull proceed instead
+ * of discover() rejecting entirely.
+ */
 async function fetchDocumentsForType(session, docType, kind) {
+  try {
+    return await fetchDocumentsPages(session, docType, kind);
+  } catch (error) {
+    return {
+      docType,
+      items: [],
+      providerTotal: null,
+      reason: `documents pull for docType=${docType} failed: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
+async function fetchDocumentsPages(session, docType, kind) {
   const items = [];
   let providerTotal = null;
   let pageNumber = 1;
@@ -369,13 +399,24 @@ async function fetchDocumentsForType(session, docType, kind) {
   return { docType, items, providerTotal, reason: null };
 }
 
-async function fetchAccounts(session) {
+/** The status code out of a bridge-thrown "request failed: <status> ..."
+ * error (see src/bridge.mjs's pageFetchExpression), or null when the error
+ * does not carry one (a thrown-before-fetch error, e.g. no headers captured
+ * yet). */
+function httpStatusOf(error) {
+  const match = /request failed: (\d{3})\b/.exec(error instanceof Error ? error.message : String(error));
+  return match ? Number(match[1]) : null;
+}
+
+async function fetchAccountsFromEndpoint(session) {
   const text = await session.fetchText("/accounts", {});
   const parsed = JSON.parse(text);
   const items = parsed?.Result?.[MS_ACCOUNTS_ITEMS_KEY];
   if (!Array.isArray(items)) {
     throw new Error(
-      `accounts response has no "Result.${MS_ACCOUNTS_ITEMS_KEY}" array ` +
+      `accounts response has no "Result.${MS_ACCOUNTS_ITEMS_KEY}" array; top-level keys: ` +
+        `${Object.keys(parsed ?? {}).join(", ") || "(none)"}; Result keys: ` +
+        `${Object.keys(parsed?.Result ?? {}).join(", ") || "(none)"} ` +
         "(see the \"Unconfirmed institution response shapes\" comment in src/adapter.mjs)",
     );
   }
@@ -392,6 +433,49 @@ async function fetchAccounts(session) {
       last4: raw.Id.slice(-4),
       kind: mapAccountKind(`${raw.Category ?? ""} ${raw.AccountType ?? ""}`),
     }));
+}
+
+/**
+ * A page-context fetch to the accounts endpoint returns 403 even with the
+ * app's own exact URL, the captured XSRF header and a permissive Accept
+ * header, so it cannot be relied on today. Falls back to the one endpoint
+ * already known to work: one activity pull over the trailing 30 days,
+ * deriving one `DiscoveredAccount` per unique `keyAccount` seen there. `kind`
+ * is "other" (not `mapAccountKind`'s guess) because this path never sees
+ * `accountType`. This only lists accounts with activity in the last 30 days
+ * -- the full pull must revisit the real accounts endpoint once its response
+ * envelope is confirmed (README quirks).
+ */
+async function fetchAccountsFromActivityFallback(session) {
+  const pageText = await session.fetchText("/activity", {
+    page: "1",
+    pageSize: "500",
+    dateRangeType: "Last30Days",
+  });
+  const page = JSON.parse(pageText);
+  const rows = page?.Result?.[MS_ACTIVITY_ROWS_KEY];
+  if (!Array.isArray(rows)) {
+    throw new Error(
+      `accounts fallback: activity response has no Result.${MS_ACTIVITY_ROWS_KEY} array`,
+    );
+  }
+  const keys = [...new Set(rows.map((row) => row.keyAccount))];
+  return keys.map((keyAccount) => ({
+    externalKey: keyAccount,
+    label: keyAccount,
+    last4: String(keyAccount).slice(-4),
+    kind: "other",
+  }));
+}
+
+async function fetchAccounts(session) {
+  try {
+    return await fetchAccountsFromEndpoint(session);
+  } catch (error) {
+    const status = httpStatusOf(error);
+    if (status !== 403 && status !== 404) throw error;
+    return fetchAccountsFromActivityFallback(session);
+  }
 }
 
 async function discover(session) {
@@ -524,12 +608,18 @@ async function acquireStructuredApi(selection) {
   };
 }
 
+/**
+ * /generateexcel produces an Excel workbook (binary zip), not delimited
+ * text, so this reads it the same way acquireDocument reads a PDF --
+ * fetchBytes, not fetchText -- and retains it opaque. See parse()'s
+ * tabular_export case: this tier is acquire-only in v1.
+ */
 async function acquireTabularExport(selection) {
-  const text = await selection.session.fetchText("/export/tabular", {
+  const bytes = await selection.session.fetchBytes("/export/tabular", {
     periodStart: selection.periodStart,
     periodEnd: selection.periodEnd,
   });
-  const retained = retainPayload(TABULAR_RETENTION, new TextEncoder().encode(text), "tabular_export");
+  const retained = retainPayload(TABULAR_RETENTION, bytes, "tabular_export");
   return {
     bytes: retained.bytes,
     retention: retained.record,
@@ -539,7 +629,7 @@ async function acquireTabularExport(selection) {
       periodEnd: selection.periodEnd,
       capturedAt: new Date().toISOString(),
       contentHash: retained.sha256,
-      mediaType: "text/csv; charset=utf-8",
+      mediaType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
       // Documented quirk: the download-control export states no row count.
       reportedRowCount: null,
       gaps: [],
@@ -645,13 +735,12 @@ function parseStructuredApi(bytes) {
       if (currencyProblem !== null && parsedAmount.amount !== null) {
         parsedAmount = { amount: null, amountNote: currencyProblem };
       }
+      const rawExternalId = item.activityId ?? item.transactionSequenceNumber ?? null;
 
       rows.push({
         sourceDocument,
+        externalId: rawExternalId === null ? null : String(rawExternalId),
         accountExternalKey: rowAccountExternalKey(item.keyAccount),
-        // Documented quirk: the activity API carries no provider-issued
-        // per-row id; overlap dedupe relies on occurrence ordinals instead.
-        externalId: null,
         tradeDate: item.tradeDate ?? null,
         processDate: item.processDate,
         settleDate: item.settlementDate ?? null,
@@ -662,8 +751,9 @@ function parseStructuredApi(bytes) {
         quantity: resolveSignedQuantity(item.activity, item.quantity ?? null),
         price: item.price === null || item.price === undefined ? null : canonicalizeDecimal(String(item.price)),
         currency,
-        // Leaf field names inside runningBalances are unknown and not
-        // retained in v1 (see ACTIVITY_RETENTION's doc comment).
+        // runningBalances is retained in the raw bytes (ACTIVITY_RETENTION)
+        // now that it is confirmed a scalar, but not yet surfaced as
+        // ParsedRow.runningBalance in v1 -- deferred, not blocked.
         runningBalance: null,
         locators:
           parsedAmount.amount === null ? { row: rowLocator, amount: rowLocator } : { row: rowLocator },
@@ -681,54 +771,6 @@ function splitEightFields(line, separator) {
     throw new Error(`expected 8 fields, got ${fields.length}: ${JSON.stringify(line)}`);
   }
   return fields;
-}
-
-function parseTabularExport(bytes) {
-  const [, ...rest] = new TextDecoder().decode(bytes).split("\n");
-  // One trailing record separator at end of file does not create a final
-  // record: drop that one blank tail entry, but no others, so `rowIndex`
-  // below is the physical data-record position (applied
-  // here from the start rather than repeated as a later bug).
-  const dataLines = rest.length > 0 && rest.at(-1) === "" ? rest.slice(0, -1) : rest;
-
-  return dataLines.map((line, rowIndex) => {
-    const [date, activityType, description, symbol, quantity, price, amount, keyAccount] = splitEightFields(
-      line,
-      ",",
-    );
-    const binding = {
-      format: "delimited_row_v1",
-      encoding: "utf-8",
-      delimiter: ",",
-      quote: "none",
-      headerRows: 1,
-      recordSeparator: "lf",
-      rowIndex,
-      columnIndex: 6,
-      columnName: "Amount",
-      rawValue: amount,
-    };
-    const parsedAmount = resolveAmount(amount);
-    const rowLocator = { source: "tabular_export", index: rowIndex, binding };
-    return {
-      sourceDocument: "tabular-export",
-      accountExternalKey: rowAccountExternalKey(keyAccount),
-      externalId: null,
-      tradeDate: null,
-      processDate: date,
-      settleDate: null,
-      datePrecision: "day",
-      activityType,
-      description: splitDescription(description),
-      instrument: instrumentFromSymbol(symbol, null),
-      quantity: resolveSignedQuantity(activityType, quantity === "-" ? null : quantity),
-      price: price === "-" ? null : canonicalizeDecimal(price),
-      currency: BASE_CURRENCY,
-      runningBalance: null,
-      locators: parsedAmount.amount === null ? { row: rowLocator, amount: rowLocator } : { row: rowLocator },
-      ...parsedAmount,
-    };
-  });
 }
 
 function splitPositionFields(line) {
@@ -903,7 +945,11 @@ async function parse(rawFile) {
     case "structured_api":
       return { activity: parseStructuredApi(rawFile.bytes), holdings: EMPTY_HOLDINGS };
     case "tabular_export":
-      return { activity: parseTabularExport(rawFile.bytes), holdings: EMPTY_HOLDINGS };
+      // The export is an Excel workbook (see acquireTabularExport), not
+      // delimited text. Acquire-only until an xlsx reader is chosen (no new
+      // dependency added for this); zero rows is the honest answer for
+      // "nothing here has been read yet," not a missing source.
+      return { activity: [], holdings: EMPTY_HOLDINGS };
     case "pdf_statement":
     case "trade_confirmation":
       return parseStatementLines(extractStatementText(rawFile.bytes), rawFile.kind);
@@ -927,22 +973,33 @@ function capabilities() {
         "back they serve; neither is a multi-year source.",
     },
     quirks: [
-      "Activity API rows carry no provider-issued row id; page overlap is deduped by " +
-        "occurrence ordinal within each page's sourceDocument, not by an externalId.",
-      "The activity JSON's row-array key and the documents-list JSON's item/total keys are " +
-        "this adapter's working assumption, unconfirmed against a live response -- see the " +
-        "\"Unconfirmed institution response shapes\" comment in src/adapter.mjs.",
-      "runningBalances is a nested object whose leaf field names are unknown; it is dropped " +
-        "by the retention allowlist in v1 and ParsedRow.runningBalance is always null for " +
-        "structured_api rows.",
+      "Activity API rows do carry a provider row id (activityId, falling back to " +
+        "transactionSequenceNumber) and it is used as ParsedRow.externalId. Page-overlap " +
+        "dedupe still uses occurrence ordinals, unchanged.",
+      "The activity JSON envelope is confirmed live (Result.postedActivities, " +
+        "postedActivityCount). The documents-list and accounts JSON envelopes remain this " +
+        "adapter's working assumption -- see the \"Unconfirmed institution response shapes\" " +
+        "comment in src/adapter.mjs.",
+      "The documents-list request needs an Authorization bearer the session bridge's " +
+        "two-header allowlist does not carry; discover() catches that per document type and " +
+        "returns an incompleteListing with the reason instead of failing the whole pull, so an " +
+        "activity-only bounded pull can still proceed. Acquiring the bearer page-side is " +
+        "deferred to the full pull.",
+      "The accounts endpoint (confirmed request shape) returns 403 from a page-context fetch " +
+        "even with the captured XSRF header and a permissive Accept header, so it cannot be " +
+        "relied on today. discover() falls back to deriving accounts from one activity pull " +
+        "over the trailing 30 days (unique keyAccount values, kind \"other\"), so an account " +
+        "with no activity in that window is not listed; the full pull must revisit the real " +
+        "accounts endpoint once its response envelope is confirmed.",
+      "runningBalances is confirmed as a scalar and is retained in the allowlist, but not yet " +
+        "surfaced as ParsedRow.runningBalance (always null for structured_api rows in v1).",
       "General correspondence and tax documents are visible in the site's documents list but " +
         "have no capability tier in this interface; v1 does not acquire them.",
       "The documents list paginates at roughly 50 rows with no total shown on screen; this " +
         "adapter always paginates to the underlying POST's stated total or returns an " +
-        "incomplete listing, and never concludes absence from a single page.",
-      "Whether the tabular export carries a price column, and whether trade confirmations' " +
-        "FINRA Rule 2232 markup is separately fielded, are not confirmed; markup stays " +
-        "embedded in description text in v1.",
+        "incomplete listing, never concludes absence from one page.",
+      "Whether trade confirmations' FINRA Rule 2232 markup is separately fielded is not " +
+        "confirmed; markup stays embedded in description text in v1.",
       "exportRanges.earliest for structured_api and tabular_export is an approximation (start " +
         "of last calendar year), not a provider-confirmed bound.",
       "structured_api rows carry a per-row CCY currency field, used as " +
@@ -950,6 +1007,9 @@ function capabilities() {
         "same way an unparseable amount does). tabular_export and pdf_statement/" +
         "trade_confirmation still have no confirmed per-row currency source and default to " +
         "the base currency.",
+      "The activity export (tabular_export) is generated by /generateexcel and is an Excel " +
+        "workbook, not delimited text. v1 acquires it opaque and does not parse it -- parse() " +
+        "returns zero rows for this tier until an xlsx reader is chosen.",
     ],
     activityTaxonomy: ACTIVITY_TAXONOMY,
   };

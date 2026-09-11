@@ -16,6 +16,8 @@ import { buildMinimalPdf } from "./pdf.mjs";
  * @param {object} [options]
  * @param {number} [options.activityFailAtPage] fail the activity fetch for this page number once
  * @param {"exhaustive"|"noTotal"} [options.documentsMode] how the documents-list fixture reports its total
+ * @param {boolean} [options.documentsFail] make every /documents fetch throw (e.g. the missing Authorization bearer)
+ * @param {number} [options.accountsStatus] make /accounts throw a bridge-shaped "request failed: <status> ..." error
  */
 export function createFixtureSession(options = {}) {
   const documentsMode = options.documentsMode ?? "exhaustive";
@@ -31,6 +33,9 @@ export function createFixtureSession(options = {}) {
       return JSON.stringify(page);
     }
     if (path === "/documents") {
+      if (options.documentsFail) {
+        throw new Error("request failed: 401 missing Authorization bearer (synthetic)");
+      }
       const source = query.docType === "Statements" ? STATEMENT_DOCS : CONFIRMATION_DOCS;
       if (documentsMode === "noTotal") {
         return JSON.stringify(documentsPage(source, { docType: query.docType, totalCount: null }));
@@ -41,6 +46,9 @@ export function createFixtureSession(options = {}) {
       return TABULAR_EXPORT_CSV;
     }
     if (path === "/accounts") {
+      if (options.accountsStatus) {
+        throw new Error(`request failed: ${options.accountsStatus} synthetic accounts outage`);
+      }
       return JSON.stringify(accountsResponse());
     }
     throw new RangeError(`fixture session: unknown path ${path}`);

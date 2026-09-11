@@ -24,7 +24,7 @@ suite needs no site, no browser and no session.
 | Source                                    | Tier                 | Role                                                                                                                                  |
 | ----------------------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
 | Activity API, a POST behind the web app   | `structured_api`     | Richest source and the only clean per-trade price. Paginated against the server's own stated total.                                   |
-| Download control on Activity and Holdings | `tabular_export`     | Cross-check on the API, more stable across redesigns. Whether it carries a price column is confirmed at discover time, never assumed. |
+| Download control on Activity and Holdings | `tabular_export`     | Retained opaque via the site's `/generateexcel` download control (an Excel workbook, not delimited text). `parse()` returns zero rows for this tier until an xlsx reader is chosen; states no row count. Acquire-only in v1. |
 | Statements                                | `pdf_statement`      | Archival ground truth: period balances, positions with cost basis, liabilities. Holdings come from this tier only.                    |
 | Trade confirmations                       | `trade_confirmation` | Carries the per-trade markup printed under FINRA Rule 2232, which is hard to obtain any other way.                                    |
 
@@ -176,41 +176,67 @@ small generated PDF.
 Also returned by `capabilities().quirks`.
 
 - **One pull spans every account.** The activity POST sends
-  `AccountInformation.Grouping: "All"`, and the tabular export carries a
-  `KeyAccount` column, so both tiers return rows for every account at once.
-  Each parsed row therefore sets `accountExternalKey` to its own account's
-  key, which is the same value `discover()` reports as
+  `AccountInformation.Grouping: "All"`, so the tier returns rows for every
+  account at once. Each parsed row therefore sets `accountExternalKey` to its
+  own account's key, which is the same value `discover()` reports as
   `DiscoveredAccount.externalKey`. Statement and confirmation rows set nothing:
   each of those documents belongs to one account, which the pull already names.
-- The activity API carries no provider-issued row id. Page overlap is deduped
-  downstream by occurrence ordinal within each page's `sourceDocument`, never
-  by an `externalId`.
-- **Unconfirmed response shapes.** Only the request shapes and the activity
-  endpoint's row field names are known. The activity JSON's row-array key
-  (`MS_ACTIVITY_ROWS_KEY`) and the documents-list JSON's item and total keys
-  are this adapter's working assumptions, not confirmed against a live
-  response. See the comment block at the top of `src/adapter.mjs`. Confirm each
-  on the first real `discover()` or `acquire()` run:
-  - `MS_ACTIVITY_ROWS_KEY`: read the resulting `RetentionRecord.droppedPaths`,
-    printed by `run.ts` and also available on `AcquiredDocument.retention`. If
-    it lists activity rows dropped under a different key, rename the constant
-    and bump `ACTIVITY_RETENTION.version`.
+- **Confirmed live: the activity envelope.** `Result` carries
+  `postedActivityCount`/`pendingActivityCount`, and the rows array is
+  `Result.postedActivities` (`MS_ACTIVITY_ROWS_KEY`). Rows do carry a
+  provider row id (`activityId`, falling back to
+  `transactionSequenceNumber`), used as `ParsedRow.externalId`; page-overlap
+  dedupe still uses occurrence ordinals, unchanged. Rows also carry a per-row
+  currency (`CCY`), used as `ParsedRow.currency` -- a missing or
+  non-three-letter value routes the row to review the same way an
+  unparseable amount does (`resolveRowCurrency` in `src/adapter.mjs`).
+  `runningBalances` is confirmed a scalar and is retained by the allowlist,
+  but not yet surfaced as `ParsedRow.runningBalance` (still always `null` in
+  v1).
+- **Unconfirmed response shapes.** The documents-list and accounts JSON
+  envelopes remain this adapter's working assumption, not confirmed against a
+  live response. See the "Unconfirmed institution response shapes" comment
+  block at the top of `src/adapter.mjs`. Confirm each one on the first real
+  `discover()`/`acquire()` run:
   - `MS_DOCUMENTS_ITEMS_KEY`, `MS_DOCUMENTS_TOTAL_KEY` and
     `MS_ACCOUNTS_ITEMS_KEY`: `discover()` throws a named `missing "<key>"
-array` error against a real response if the guess is wrong. Fix the
-    constant, not a downstream caller.
-  - The documents, tabular-export, per-document-download and accounts endpoint
-    paths are read from the environment with no guessed default. An unset one
-    throws a clear error rather than posting to a made-up URL.
-- `runningBalances` is dropped by the retention allowlist in v1, so
-  `ParsedRow.runningBalance` is always `null` for `structured_api` rows.
+array` error against a real response if the guess is wrong (the accounts
+    error also lists the response's actual top-level key names, never
+    values). Fix the constant, not a downstream caller.
+  - The documents and per-document-download endpoint paths are read from the
+    environment with no guessed default. An unset one throws a clear error
+    rather than posting to a made-up URL.
+- **The documents tier needs a bearer the session bridge does not carry.**
+  The documents-list request requires an `Authorization` header in addition
+  to the XSRF and footprint headers; `src/bridge.mjs`'s header allowlist
+  (`WANTED_HEADERS`) has exactly two names and this does not add a third.
+  `discover()` instead catches a documents failure per document type and
+  returns an `incompleteListing` with the reason, so an activity-only bounded
+  pull can proceed without it. Capturing the bearer page-side is deferred to
+  the full pull.
+- **The accounts endpoint is confirmed but currently 403s.** A page-context
+  fetch to it still returns 403 even with the captured XSRF header and a
+  permissive `Accept` header, so `discover()` falls back on a 403/404 to
+  deriving accounts from one activity pull over the trailing 30 days: one
+  `DiscoveredAccount` per unique `keyAccount` seen there, `kind: "other"`
+  (never `accountName`). This only lists accounts with activity in the last
+  30 days -- the full pull must revisit the real accounts endpoint once its
+  response envelope is confirmed.
+- The documents list paginates at roughly 50 rows with no total shown on
+  screen. This adapter always paginates to the underlying POST's stated
+  total, or returns an `incompleteListing` -- never concludes absence from
+  one page (an earlier manual review wrongly concluded no Treasury purchases
+  existed from page one alone).
 - `exportRanges.earliest` for `structured_api` and `tabular_export` is an
   approximation, the start of the last calendar year, not a provider-confirmed
   bound. `DateRangeType` has no explicit earliest-bound value.
-- All money is assumed USD. Neither the activity API nor the tabular export is
-  known to carry a per-row currency field.
-- The FINRA Rule 2232 markup on a trade confirmation stays embedded in
-  `description` text in v1. There is no schema field for it yet.
+- Whether trade confirmations' FINRA Rule 2232 markup is separately fielded is
+  not confirmed; markup stays embedded in `description` text in v1. There is
+  no schema field for it yet.
+- Only `structured_api` rows use the confirmed `CCY` field for currency.
+  `tabular_export` is acquire-only in v1 (nothing to parse yet); a
+  `pdf_statement`/`trade_confirmation` row's currency comes from its own
+  statement-line column, unrelated to `CCY`.
 - `discover()` returns `accounts: DiscoveredAccount[]`, each
   `{ externalKey, label, last4, kind }` with `kind` one of `brokerage`,
   `retirement`, `trust`, `bank`, `credit_line`, `mortgage` or `other`. The
@@ -238,9 +264,13 @@ the site happens to use.
 | `MS_CDP_HTTP_BASE`                 | Every session build, for example `http://127.0.0.1:9222` | Set at Chrome launch, see the runbook below. |
 | `MS_ORIGIN`                        | Every session build, the signed-in tab's origin          | Set by the operator.                         |
 | `MS_DOCUMENTS_PATH`                | `discover()` and document acquisition                    | Not confirmed, see quirks.                   |
-| `MS_TABULAR_EXPORT_PATH`           | `tabular_export` acquisition                             | Not confirmed.                               |
+| `MS_TABULAR_EXPORT_PATH`           | `tabular_export` acquisition                             | Confirmed endpoint: `POST /shell/handler/proxy/msomactivitysal/v1/generateexcel`. Set this to that path; the response is an Excel workbook, acquired opaque (see Capabilities above). |
 | `MS_DOCUMENT_DOWNLOAD_PATH_PREFIX` | `pdf_statement` and `trade_confirmation` acquisition     | Not confirmed.                               |
-| `MS_ACCOUNTS_PATH`                 | The accounts fetch in `discover()`                       | Not confirmed.                               |
+
+The accounts endpoint path is confirmed and hardcoded in `src/bridge.mjs`
+(`GET /shell/handler/restproxy/financialsal/api/v1/accounts`, no environment
+variable) -- see the accounts quirk above for why `discover()` still falls
+back off it today.
 
 `run.ts`, the operator command in `@repo/finance-archive`, additionally needs
 `FINANCE_ARCHIVE_DATABASE_URL`, `FINANCE_ARCHIVE_RAW_TREE_ROOT` and
@@ -287,8 +317,8 @@ Runs `node --test test/*.test.mjs`: pagination to the provider total, overlap
 dedupe, per-row account attribution against the keys `discover()` reports, credential-shaped-field dropping asserted on the retained bytes,
 decimal-string exactness and sign resolution, review routing for ambiguous
 amounts and unreviewed activity values, exhaustive versus incomplete document
-listings, `json_pointer_v1` and `delimited_row_v1` binding resolution against
-the retained bytes, PDF-tier rows carrying no binding, holdings extraction,
+listings, `json_pointer_v1` binding resolution against the retained bytes,
+PDF-tier rows carrying no binding, holdings extraction,
 `activityTaxonomy` agreeing with `ACTIVITY_SIGN_TABLE`, and the PDF text
 extractor against a small generated PDF.
 
