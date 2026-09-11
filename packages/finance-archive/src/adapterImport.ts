@@ -326,17 +326,26 @@ export async function resolveDiscoveredAccounts(
 }
 
 /**
- * F1-35. The account one row's `accountExternalKey` resolves to against
- * `pull.accountsByExternalKey`, or `pull.accountId` when the row carries no
- * external key, or when this `AdapterPull` was built with no resolution map
- * at all (opt-in: see `AdapterPull.accountsByExternalKey`'s doc comment).
+ * F1-46. What `lookupRowAccountId`/`resolveRowAccountId` need from a row or a
+ * holding: just the same optional `accountExternalKey` `ParsedRow`,
+ * `ParsedPosition`, `ParsedBalance` and `ParsedLiability` all carry. Neither
+ * function reads anything else, so one pair serves activity rows and every
+ * holdings row type rather than four near-identical copies.
+ */
+type AccountAttributable = { readonly accountExternalKey?: string };
+
+/**
+ * F1-35. The account one row or holding's `accountExternalKey` resolves to
+ * against `pull.accountsByExternalKey`, or `pull.accountId` when it carries
+ * no external key, or when this `AdapterPull` was built with no resolution
+ * map at all (opt-in: see `AdapterPull.accountsByExternalKey`'s doc comment).
  * Pure -- no query, no review item -- so `countDistinctRowHashes` can reuse
  * it to predict the same account id `resolveRowAccountId` will actually
  * assign, and the two can never disagree about what "the same content"
  * hashes to. Null only when nothing resolves and the pull itself names no
  * account (an institution-wide pull with an unattributable row).
  */
-function lookupRowAccountId(pull: AdapterPull, row: ParsedRow): string | null {
+function lookupRowAccountId(pull: AdapterPull, row: AccountAttributable): string | null {
   if (row.accountExternalKey === undefined || pull.accountsByExternalKey === undefined) {
     return pull.accountId;
   }
@@ -344,22 +353,28 @@ function lookupRowAccountId(pull: AdapterPull, row: ParsedRow): string | null {
 }
 
 /**
- * The account one row imports under: `lookupRowAccountId`'s result, plus the
- * side effect of opening `unknown_account_key` when the row named a key that
- * did not resolve against `pull.accountsByExternalKey` -- flagged rather
- * than silently dropped (ground rule 5), the same pattern
- * `resolveInstrumentId`'s weak-symbol match uses. The row still imports
- * under `pull.accountId` when that fallback exists.
+ * The account one row or holding imports under: `lookupRowAccountId`'s
+ * result, plus the side effect of opening `unknown_account_key` when it
+ * named a key that did not resolve against `pull.accountsByExternalKey` --
+ * flagged rather than silently dropped (ground rule 5), the same pattern
+ * `resolveInstrumentId`'s weak-symbol match uses. It still imports under
+ * `pull.accountId` when that fallback exists.
  *
  * Throws only for an institution-wide pull (`pull.accountId === null`) whose
- * row's key did not resolve: there is no account left to fall back to, and
- * `transactions.account_id` is `NOT NULL`, so this refuses to write an
- * unattributable transaction rather than guess one.
+ * key did not resolve: there is no account left to fall back to, and
+ * `positions`/`balances`/`transactions.account_id` are all `NOT NULL`, so
+ * this refuses to write an unattributable row rather than guess one. F1-46:
+ * a consolidated statement's own pull always names one account (its
+ * "primary" one), so a position, balance or liability whose own section
+ * names a *different* account still resolves through
+ * `pull.accountsByExternalKey` here rather than ever hitting this throw --
+ * the throw stays reachable only for the institution-wide activity case
+ * F1-35 already covered.
  */
 async function resolveRowAccountId(
   client: ArchiveClient,
   pull: AdapterPull,
-  row: ParsedRow,
+  row: AccountAttributable,
 ): Promise<string> {
   const resolved = lookupRowAccountId(pull, row);
   const unresolvedKey =
@@ -563,12 +578,19 @@ async function parsedRowToImportRow(
  * on the `Import*` row itself, the same way `ParsedRow.sourceDocument`
  * never reaches `ImportRow` -- the document it belongs to is expressed by
  * which `ImportDocument` the row ends up on, not a field on the row.
+ *
+ * F1-46: `accountId` is this holding's own resolved account (`resolveRowAccountId`
+ * against `position.accountExternalKey`), not necessarily the enclosing
+ * document's -- a consolidated statement's positions span several accounts,
+ * one per section.
  */
 async function parsedPositionToImportPosition(
   client: ArchiveClient,
   position: ParsedPosition,
+  accountId: string,
 ): Promise<ImportPosition> {
   return {
+    accountId,
     asOf: position.asOf,
     instrumentId:
       position.instrument === null
@@ -587,8 +609,12 @@ async function parsedPositionToImportPosition(
   };
 }
 
-function parsedBalanceToImportBalance(balance: ParsedBalance): ImportBalance {
+function parsedBalanceToImportBalance(
+  balance: ParsedBalance,
+  accountId: string,
+): ImportBalance {
   return {
+    accountId,
     asOf: balance.asOf,
     totalValueText: balance.totalValue,
     totalValueNote: balance.totalValueNote,
@@ -602,8 +628,10 @@ function parsedBalanceToImportBalance(balance: ParsedBalance): ImportBalance {
 
 function parsedLiabilityToImportLiability(
   liability: ParsedLiability,
+  accountId: string | null,
 ): ImportLiability {
   return {
+    accountId,
     kind: liability.kind,
     displayName: liability.displayName,
     balanceText: liability.balance,
@@ -882,13 +910,28 @@ async function collectDocuments(
       }),
       positions: await mapSeries(
         positionGroups.get(sourceDocument) ?? [],
-        (position) => parsedPositionToImportPosition(client, position),
+        async (position) =>
+          parsedPositionToImportPosition(
+            client,
+            position,
+            await resolveRowAccountId(client, pull, position),
+          ),
       ),
-      balances: (balanceGroups.get(sourceDocument) ?? []).map(
-        parsedBalanceToImportBalance,
+      balances: await mapSeries(
+        balanceGroups.get(sourceDocument) ?? [],
+        async (balance) =>
+          parsedBalanceToImportBalance(
+            balance,
+            await resolveRowAccountId(client, pull, balance),
+          ),
       ),
-      liabilities: (liabilityGroups.get(sourceDocument) ?? []).map(
-        parsedLiabilityToImportLiability,
+      liabilities: await mapSeries(
+        liabilityGroups.get(sourceDocument) ?? [],
+        async (liability) =>
+          parsedLiabilityToImportLiability(
+            liability,
+            await resolveRowAccountId(client, pull, liability),
+          ),
       ),
     });
   }

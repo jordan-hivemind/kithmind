@@ -1210,6 +1210,155 @@ test(
   },
 );
 
+// --- F1-46: consolidated statements, holdings attributed per section -------
+//
+// A consolidated statement's positions, balances and liabilities can span
+// several accounts, one per section (adapter-morgan-stanley's
+// statementLayout.mjs). ParsedPosition/ParsedBalance/ParsedLiability now
+// carry the same optional accountExternalKey ParsedRow already had (F1-35);
+// this proves finance-archive resolves it the same way for holdings as for
+// rows: a known key lands on its own account, and an unknown key opens
+// unknown_account_key and falls back to the pull's own account rather than
+// being dropped.
+
+async function acquirePdfStatementForHoldings() {
+  const session = createSyntheticSession();
+  const { documents: discovered } = await syntheticAdapter.discover(session);
+  const statement = discovered.items.find((doc) => doc.kind === "pdf_statement");
+  return syntheticAdapter.acquire({
+    kind: "pdf_statement",
+    session,
+    externalId: statement.externalId,
+  });
+}
+
+test(
+  "a consolidated statement's positions and balances land on the account named in their own section, and an unknown key opens unknown_account_key",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedPg(client);
+    const BROKERAGE = { id: "acct_brokerage_f146", last4: "4471" };
+    const TRUST = { id: "acct_trust_f146", last4: "9902" };
+    for (const account of [BROKERAGE, TRUST]) {
+      await client.query(
+        `INSERT INTO accounts (id, institution_id, acct_last4, display_name, base_currency)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [account.id, INSTITUTION.id, account.last4, "Discovered account", "USD"],
+      );
+    }
+    const accountsByExternalKey = new Map([
+      ["acct-brokerage-01", BROKERAGE.id],
+      ["acct-trust-01", TRUST.id],
+    ]);
+
+    const acquired = await acquirePdfStatementForHoldings();
+    const persisted = persist(t, acquired, "pdf_statement");
+
+    const position = (overrides) => ({
+      sourceDocument: "statement",
+      asOf: "2026-03-31",
+      instrument: null,
+      quantity: "10",
+      price: "50",
+      marketValue: "500",
+      marketValueNote: null,
+      costBasis: "400",
+      unrealized: "100",
+      currency: "USD",
+      valuationBasis: "market_price",
+      valuationNote: "Synthetic delayed market feed.",
+      locators: { row: { source: "pdf_statement", index: 1 } },
+      ...overrides,
+    });
+    const balance = (overrides) => ({
+      sourceDocument: "statement",
+      asOf: "2026-03-31",
+      totalValue: "10000",
+      totalValueNote: null,
+      cash: "500",
+      currency: "USD",
+      periodStartValue: "9500",
+      periodEndValue: "10000",
+      locators: { row: { source: "pdf_statement", index: 1 } },
+      ...overrides,
+    });
+
+    const pull = {
+      institutionId: INSTITUTION.id,
+      accountId: ACCOUNT.id,
+      acquired,
+      rows: [],
+      holdings: {
+        positions: [
+          position({ accountExternalKey: "acct-brokerage-01" }),
+          position({ accountExternalKey: "acct-trust-01" }),
+          position({ accountExternalKey: "acct-unknown-99" }),
+        ],
+        balances: [
+          balance({ accountExternalKey: "acct-brokerage-01", totalValue: "10000" }),
+          balance({ accountExternalKey: "acct-trust-01", totalValue: "25000" }),
+        ],
+        liabilities: [],
+      },
+      docType: "pdf_statement",
+      docDate: "2026-03-31",
+      persisted,
+      accountsByExternalKey,
+    };
+
+    const documents = await adapterPullToImportDocuments(client, pull);
+    await importBatch(
+      client,
+      { source: INSTITUTION.slug, documents },
+      new Date("2026-04-01"),
+    );
+
+    const brokeragePositions = await count(
+      client,
+      "positions",
+      "WHERE account_id = $1",
+      [BROKERAGE.id],
+    );
+    const trustPositions = await count(client, "positions", "WHERE account_id = $1", [
+      TRUST.id,
+    ]);
+    const fallbackPositions = await count(
+      client,
+      "positions",
+      "WHERE account_id = $1",
+      [ACCOUNT.id],
+    );
+    assert.equal(brokeragePositions, 1);
+    assert.equal(trustPositions, 1);
+    // The unresolved key falls back to the pull's own account rather than
+    // being silently dropped (ground rule 5).
+    assert.equal(fallbackPositions, 1);
+
+    const brokerageBalance = await one(
+      client,
+      "SELECT total_value FROM balances WHERE account_id = $1",
+      [BROKERAGE.id],
+    );
+    const trustBalance = await one(
+      client,
+      "SELECT total_value FROM balances WHERE account_id = $1",
+      [TRUST.id],
+    );
+    assert.equal(brokerageBalance.total_value, "10000");
+    assert.equal(trustBalance.total_value, "25000");
+
+    const [review] = await all(
+      client,
+      "SELECT kind, account_id, raw_value FROM review_items WHERE kind = $1",
+      ["unknown_account_key"],
+    );
+    assert.ok(review, "an unresolved key on a holding opens a review item, same as a row's");
+    assert.equal(review.account_id, ACCOUNT.id);
+    assert.equal(review.raw_value, "acct-unknown-99");
+  },
+);
+
 // F1-43. A real institution's PDF statements use compressed content streams
 // the adapter's dependency-free extractor cannot read; parse() then returns
 // a parseNote instead of throwing, and the retained bytes must still be

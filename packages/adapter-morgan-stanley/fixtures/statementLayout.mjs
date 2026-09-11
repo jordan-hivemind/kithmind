@@ -283,9 +283,51 @@ export const STATEMENT_LAYOUT_TEXT = statementPages()
   .map((page) => page.join("\n"))
   .join("\n\f\n");
 
-/** Two account numbers on one document: a consolidated statement. */
+// --- consolidated (F1-46) ---------------------------------------------------
+//
+// About one real statement in five prints several accounts in one PDF
+// (README, "Consolidated statements"). Each account's own pages repeat a
+// running header before its BALANCE SHEET and holdings: a line carrying only
+// that account's number, one line above a line reading "Account <name>". This
+// is the shape the parser keys on (`BARE_ACCOUNT_LINE`,
+// `accountKeysByLine`) to attribute each position, balance and liability to
+// the account whose pages it was printed under. The account numbers and every
+// other value below are invented.
+
+export const CONSOLIDATED_ACCOUNT_ONE = "123-456789-012";
+export const CONSOLIDATED_ACCOUNT_TWO = "987-654321-098";
+
+/** The running per-account page header a consolidated statement repeats
+ * before each account's own BALANCE SHEET and holdings tables. */
+function consolidatedAccountHeader(accountNumber) {
+  return [accountNumber, "        Account Synthetic Household"];
+}
+
+/** Two accounts, each with its own BALANCE SHEET and one holdings table, so a
+ * position, a balance and a liability each land on the right account rather
+ * than all three on whichever account the pull names. */
 export const CONSOLIDATED_LAYOUT_TEXT = [
-  ...ACCOUNT_HEADER,
-  "        Synthetic Retirement Account    987-654321-098",
-  ...balanceSheetLines(),
-].join("\n");
+  [
+    "        Page 1 of 2",
+    "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+    "        Synthetic Active Assets Account",
+    ...consolidatedAccountHeader(CONSOLIDATED_ACCOUNT_ONE),
+    ...balanceSheetLines(),
+    "        HOLDINGS",
+    ...equityBlockLines(),
+  ].join("\n"),
+  [
+    "        Page 2 of 2",
+    "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+    "        Synthetic Retirement Assets Account",
+    ...consolidatedAccountHeader(CONSOLIDATED_ACCOUNT_TWO),
+    ...balanceSheetLines({
+      totalValueLast: "$500,000.00",
+      totalValueThis: "$512,340.00",
+      cashThis: "$8,200.00",
+      liabilityThis: "$1,500.00",
+    }),
+    "        HOLDINGS",
+    ...bondBlockLines(),
+  ].join("\n"),
+].join("\n\f\n");

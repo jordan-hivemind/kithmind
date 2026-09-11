@@ -483,6 +483,14 @@ export type ValuationBasis = "market_price" | "last_round" | "cost" | "reported_
  */
 export type ParsedPosition = {
   readonly sourceDocument: string;
+  /**
+   * F1-46. Same meaning as `ParsedRow.accountExternalKey`: which account this
+   * holding belongs to, when one statement's holdings span several accounts
+   * (a consolidated statement). Omitted for the ordinary case, one document
+   * naming one account: the holding imports under that document's own
+   * account exactly as before this field existed.
+   */
+  readonly accountExternalKey?: string;
   readonly asOf: string;
   readonly instrument: ParsedInstrument | null;
   readonly quantity: string | null;
@@ -500,6 +508,8 @@ export type ParsedPosition = {
 /** One point-in-time account total from a statement's summary section. */
 export type ParsedBalance = {
   readonly sourceDocument: string;
+  /** F1-46. Same meaning as `ParsedRow.accountExternalKey`; see `ParsedPosition`. */
+  readonly accountExternalKey?: string;
   readonly asOf: string;
   readonly totalValue: string | null;
   readonly totalValueNote: string | null;
@@ -513,6 +523,8 @@ export type ParsedBalance = {
 /** What is owed: a loan, margin balance or similar, from a statement. */
 export type ParsedLiability = {
   readonly sourceDocument: string;
+  /** F1-46. Same meaning as `ParsedRow.accountExternalKey`; see `ParsedPosition`. */
+  readonly accountExternalKey?: string;
   readonly kind: string;
   readonly displayName: string | null;
   readonly balance: string | null;

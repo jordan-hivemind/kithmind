@@ -13,8 +13,14 @@ import { canonicalizeDecimal, negateDecimal, EMPTY_HOLDINGS } from "@repo/financ
 import { PAGE_SEPARATOR } from "./pdfText.mjs";
 
 const BASE_CURRENCY = "USD";
-/** The provider's own account key, as printed on every page. */
-const ACCOUNT_NUMBER = /\b\d{3}-\d{6}-\d{3}\b/g;
+/**
+ * F1-46. The running per-page header a consolidated statement prints before
+ * each account's own pages: a line whose only content is that account's
+ * number, one line above a line reading "Account <name>" (README, "Statement
+ * layout" / "Consolidated statements"). A single-account statement prints
+ * the same line; there it is simply constant throughout the document.
+ */
+const BARE_ACCOUNT_LINE = /^\s*(\d{3}-\d{6}-\d{3})\s*$/;
 /** The one period spelling the corpus uses: "For the Period March 1-31, 2026". */
 const PERIOD_LINE =
   /For the Period\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})-(\d{1,2}),\s*(\d{4})/;
@@ -116,6 +122,35 @@ function locator(kind, page, field) {
   return { source: kind, index: page, field };
 }
 
+/**
+ * F1-46. Forward-fills every line with the account key of the nearest
+ * preceding `BARE_ACCOUNT_LINE` -- the account whose own pages that line was
+ * printed on. `null` for any line before the first such marker (the
+ * household-wide summary pages a consolidated statement prints before its
+ * first account's own pages; nothing this parser reads lives there). A
+ * single-account statement has exactly one marker, repeated on every page,
+ * so every line resolves to that one account -- unchanged behavior.
+ */
+function accountKeysByLine(lines) {
+  const keys = new Array(lines.length).fill(null);
+  let current = null;
+  lines.forEach(({ text }, i) => {
+    const match = BARE_ACCOUNT_LINE.exec(text);
+    if (match !== null) current = match[1];
+    keys[i] = current;
+  });
+  return keys;
+}
+
+/** `{ accountExternalKey: key }` when non-null, else `{}` -- spread onto a
+ * parsed holding so an unresolved account key (should never happen once a
+ * statement's own `BARE_ACCOUNT_LINE` has appeared, but is possible before
+ * the first one) leaves the field omitted rather than set to null, matching
+ * every other adapter's "omitted means this pull's own account" contract. */
+function accountKeyField(key) {
+  return key === null ? {} : { accountExternalKey: key };
+}
+
 /** "December", "1", "31", "2025" -> ISO period bounds. */
 function resolvePeriod(lines) {
   for (const { text } of lines) {
@@ -155,8 +190,12 @@ const BALANCE_BLOCK_LINES = 40;
  * "This Period (as of ...)", printed to the left of an unrelated CASH FLOW
  * table on the same visual lines. The two are told apart by column position
  * alone, which is why the extractor keeps it.
+ *
+ * `accountKey` (F1-46) is this anchor's own account, from
+ * `accountKeysByLine` -- the account whose `BALANCE SHEET` this is, which a
+ * consolidated statement prints once per account.
  */
-function parseBalanceSheet(lines, anchorIndex, kind) {
+function parseBalanceSheet(lines, anchorIndex, kind, accountKey) {
   const block = lines.slice(anchorIndex, anchorIndex + BALANCE_BLOCK_LINES);
   const headerLine = block.find(({ text }) => (text.match(AS_OF_HEADER) ?? []).length > 0);
   if (headerLine === undefined) return null;
@@ -192,6 +231,7 @@ function parseBalanceSheet(lines, anchorIndex, kind) {
 
   const balance = {
     sourceDocument: "statement",
+    ...accountKeyField(accountKey),
     asOf,
     totalValue: total.value,
     totalValueNote: total.note,
@@ -213,6 +253,7 @@ function parseBalanceSheet(lines, anchorIndex, kind) {
     const liabilityLocator = locator(kind, page, "BALANCE SHEET / Total Liabilities");
     liabilities.push({
       sourceDocument: "statement",
+      ...accountKeyField(accountKey),
       kind: "outstanding_balance",
       displayName: "Total Liabilities (outstanding balance)",
       balance: liability.value,
@@ -407,6 +448,7 @@ function positionFromBlock(block, columns, context) {
   return {
     position: {
       sourceDocument: "statement",
+      ...accountKeyField(context.accountKey ?? null),
       asOf: context.asOf,
       instrument: resolveInstrument(
         context.description,
@@ -433,8 +475,10 @@ function positionFromBlock(block, columns, context) {
 }
 
 /** Every holdings table in the document -> positions, plus the blocks that
- * could not be read, counted for the parse note. */
-function parseHoldings(lines, kind, asOf) {
+ * could not be read, counted for the parse note. `accountKeys` (F1-46) is
+ * `accountKeysByLine`'s per-line array, so each table's positions are
+ * attributed to the account whose pages that table was printed on. */
+function parseHoldings(lines, kind, asOf, accountKeys) {
   const positions = [];
   const skipped = [];
   for (let i = 0; i < lines.length; i += 1) {
@@ -448,6 +492,7 @@ function parseHoldings(lines, kind, asOf) {
         .reverse()
         .map(({ text }) => text.trim())
         .find((text) => /^[A-Z][A-Z0-9 ,&%'/()+^-]{3,}$/.test(text)) ?? "HOLDINGS";
+    const accountKey = accountKeys[i];
 
     let block = [];
     let description = null;
@@ -458,6 +503,7 @@ function parseHoldings(lines, kind, asOf) {
         asOf,
         section,
         description,
+        accountKey,
       });
       if (position === null) skipped.push(reason);
       else positions.push(position);
@@ -499,30 +545,20 @@ export function isRealStatementLayout(text) {
 }
 
 /**
- * The real layout -> ParsedPull. A consolidated statement covering more than
- * one account is refused rather than guessed at: ParsedPosition,
- * ParsedBalance and ParsedLiability carry no account key (only ParsedRow
- * does), so every holding in a multi-account document would be imported under
- * whichever account the pull names. That is a wrong answer, not a partial
- * one, so the document is recorded unparsed with the reason and its retained
- * text is kept for a later slice that can attribute per account.
+ * The real layout -> ParsedPull. F1-46: a consolidated statement covering
+ * several accounts is no longer refused. `ParsedPosition`, `ParsedBalance`
+ * and `ParsedLiability` now carry the same optional `accountExternalKey`
+ * `ParsedRow` always has, resolved per account section via
+ * `accountKeysByLine` (README, "Statement layout" / "Consolidated
+ * statements") -- one `BALANCE SHEET` anchor and one run of holdings tables
+ * per account, each attributed to the account whose running page header
+ * they were printed under. A single-account statement has exactly one such
+ * header, constant throughout, so every holding still resolves to that one
+ * account exactly as before this field existed.
  */
 export function parseRealStatement(text, kind) {
   const lines = pagedLines(text);
-  const accountKeys = new Set();
-  for (const { text: line } of lines) {
-    for (const match of line.matchAll(ACCOUNT_NUMBER)) accountKeys.add(match[0]);
-  }
-  if (accountKeys.size !== 1) {
-    return {
-      activity: [],
-      holdings: EMPTY_HOLDINGS,
-      parseNote:
-        `not parsed: this statement prints ${accountKeys.size} account numbers, and a holding ` +
-        "on this contract carries no account key of its own, so every position would be " +
-        "imported under the account the pull names (README, 'Consolidated statements')",
-    };
-  }
+  const accountKeys = accountKeysByLine(lines);
 
   const period = resolvePeriod(lines);
   if (period === null) {
@@ -535,12 +571,20 @@ export function parseRealStatement(text, kind) {
     };
   }
 
-  const anchorIndex = lines.findIndex(({ text: line }) => BALANCE_SHEET_ANCHOR.test(line));
-  const sheet = anchorIndex < 0 ? null : parseBalanceSheet(lines, anchorIndex, kind);
-  const { positions, skipped } = parseHoldings(lines, kind, period.end);
+  // One BALANCE SHEET anchor per account (a consolidated statement repeats
+  // it once per account's own first page); a false-positive match elsewhere
+  // (disclosure text mentioning the phrase, say) has no TOTAL VALUE row
+  // nearby and parseBalanceSheet returns null for it, contributing nothing.
+  const sheets = [];
+  lines.forEach(({ text: line }, anchorIndex) => {
+    if (!BALANCE_SHEET_ANCHOR.test(line)) return;
+    const sheet = parseBalanceSheet(lines, anchorIndex, kind, accountKeys[anchorIndex]);
+    if (sheet !== null) sheets.push(sheet);
+  });
+  const { positions, skipped } = parseHoldings(lines, kind, period.end, accountKeys);
 
   const notes = [];
-  if (sheet === null) {
+  if (sheets.length === 0) {
     notes.push(
       "no readable BALANCE SHEET block, so no account total, cash or liability was recorded",
     );
@@ -553,8 +597,8 @@ export function parseRealStatement(text, kind) {
     activity: [],
     holdings: {
       positions,
-      balances: sheet === null ? [] : [sheet.balance],
-      liabilities: sheet === null ? [] : sheet.liabilities,
+      balances: sheets.map((sheet) => sheet.balance),
+      liabilities: sheets.flatMap((sheet) => sheet.liabilities),
     },
     ...(notes.length > 0 ? { parseNote: `partially parsed: ${notes.join("; ")}` } : {}),
   };
