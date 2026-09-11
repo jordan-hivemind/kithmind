@@ -58,32 +58,37 @@ test("a trade confirmation carries its FINRA markup in description and honestly 
   assert.equal(parsed.activity[0].quantity, "50");
 });
 
-test("extractStatementText reads a generated PDF's Tj text back out unchanged", () => {
+test("extractStatementText reads a generated PDF's text back out in order", async () => {
   const pdfBytes = buildMinimalPdf(STATEMENT_LINES.split("\n"));
   assert.ok(Buffer.from(pdfBytes).toString("latin1").startsWith("%PDF-"));
-  assert.equal(extractStatementText(pdfBytes), STATEMENT_LINES);
+  const extracted = await extractStatementText(pdfBytes);
+  // The extractor lays each datum out at the character column its x
+  // coordinate falls in, so lines come back indented; the order and the
+  // content of each line are what the parser depends on.
+  assert.deepEqual(
+    extracted.split("\n").map((line) => line.trim()),
+    STATEMENT_LINES.split("\n"),
+  );
 });
 
-test("extractStatementText falls back to plain UTF-8 decoding for non-PDF bytes", () => {
+test("extractStatementText falls back to plain UTF-8 decoding for non-PDF bytes", async () => {
   const text = "not a pdf, just text";
-  assert.equal(extractStatementText(new TextEncoder().encode(text)), text);
+  assert.equal(await extractStatementText(new TextEncoder().encode(text)), text);
 });
 
-// F1-43. A real statement's compressed content stream has no literal Tj
-// operator this dependency-free extractor can find; `buildMinimalPdf([])`
-// (a real PDF, zero text lines) is the smallest fixture that reproduces the
-// same "found a PDF but no Tj text operators in it" failure without needing
-// a real compressed stream. parse() must retain the bytes as a noted empty
+// F1-43, updated for F1-44's extractor. `buildMinimalPdf([])` is a real PDF
+// with no text layer at all: neither pdfjs nor the dependency-free Tj scan
+// can read a word from it. parse() must retain the bytes as a noted empty
 // pull, not throw and lose them.
 test("parse() retains the bytes and returns a noted empty pull when the PDF extractor finds no text", async () => {
   const unreadablePdf = buildMinimalPdf([]);
   assert.ok(Buffer.from(unreadablePdf).toString("latin1").startsWith("%PDF-"), "still a real PDF");
-  assert.throws(() => extractStatementText(unreadablePdf), /found a PDF but no Tj text operators/);
+  await assert.rejects(() => extractStatementText(unreadablePdf), /no readable text/);
 
   const parsed = await adapter.parse({ kind: "pdf_statement", bytes: unreadablePdf });
   assert.deepEqual(parsed.activity, []);
   assert.deepEqual(parsed.holdings, { positions: [], balances: [], liabilities: [] });
-  assert.match(parsed.parseNote, /^not parsed: .*found a PDF but no Tj text operators/);
+  assert.match(parsed.parseNote, /^not parsed: .*no readable text/);
 });
 
 test("parse() notes the same unreadable-PDF failure for a trade confirmation", async () => {

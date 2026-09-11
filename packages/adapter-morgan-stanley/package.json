@@ -17,6 +17,7 @@
     "test:once": "node --test test/*.test.mjs"
   },
   "dependencies": {
-    "@repo/finance-archive": "workspace:*"
+    "@repo/finance-archive": "workspace:*",
+    "pdfjs-dist": "5.4.530"
   }
 }

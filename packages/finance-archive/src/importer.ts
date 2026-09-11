@@ -868,6 +868,18 @@ export async function importBatch(
             document.textPath ?? null,
           ],
         );
+      } else if (document.textPath !== null && document.textPath !== undefined) {
+        // F1-44: a document retained before there was an extractor has no
+        // retained text. Its bytes are immutable and its sha256 therefore
+        // unchanged, so the reimport that finally parses it reuses this row --
+        // and without this, the text artifact it just wrote would have nothing
+        // pointing at it. COALESCE, not assignment: an existing path is a
+        // content-addressed artifact that is already correct, and is never
+        // repointed.
+        await client.query(
+          "UPDATE documents SET text_path = COALESCE(text_path, $2) WHERE id = $1",
+          [documentId, document.textPath],
+        );
       }
 
       // Fresh per document: the occurrence ordinal is scoped to one document
