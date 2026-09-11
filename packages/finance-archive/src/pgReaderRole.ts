@@ -230,6 +230,12 @@ async function applyPrivileges(
          CONNECTION LIMIT ${connectionLimit} PASSWORD ${password}`,
     );
   } else {
+    // Verify the superuser-gated boundary *before* touching the role. On
+    // Postgres 16 and later a CREATEROLE owner may only ALTER roles it
+    // administers, so a pre-existing privileged role would otherwise fail
+    // with "permission denied to alter role" and the boundary refusal
+    // below would never be reached.
+    await verifyAttributes(client, role);
     // Only the attributes a non-superuser owner may legitimately alter.
     await client.query(
       `ALTER ROLE ${role} WITH LOGIN NOCREATEDB NOCREATEROLE NOINHERIT
