@@ -812,14 +812,19 @@ async function main(): Promise<void> {
         spec.accountId === null
           ? "all"
           : await resolveAccountLast4(pgClient, spec.accountId, accountLast4Cache);
-      const persisted = persistAcquiredDocument(rawTreeRoot, {
-        institutionId,
-        accountId: spec.accountId,
-        institutionSlug: capabilities.institutionSlug,
-        accountLast4,
-        docType: spec.docType,
-        acquired,
-      });
+      const persisted = persistAcquiredDocument(
+        rawTreeRoot,
+        {
+          institutionId,
+          accountId: spec.accountId,
+          institutionSlug: capabilities.institutionSlug,
+          accountLast4,
+          docType: spec.docType,
+          acquired,
+        },
+        // F1-44: retained whenever the adapter extracted any, parsed or not.
+        parsed.extractedText ?? null,
+      );
       bytesAcquired += acquired.bytes.length;
       manifestHashes.push(acquired.manifest.contentHash);
       documentsAcquiredCount += 1;

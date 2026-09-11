@@ -548,6 +548,20 @@ export type ParsedPull = {
    * parser gap.
    */
   readonly parseNote?: string;
+  /**
+   * The document's text as the adapter extracted it, when the tier has one
+   * (a PDF statement, say). The runner hands this to
+   * `persistAcquiredDocument`, which writes it to the raw tree as the
+   * document's retained text artifact and records its path on
+   * `ImportDocument.textPath` -- what a later `retained_text_span_v1`
+   * citation resolves against (docs/plans/2026-09-11-structured-evidence.md,
+   * section 4).
+   *
+   * Returned independently of `parseNote`: a document whose layout no parser
+   * reads yet still has text worth retaining, and retaining it is the
+   * prerequisite for citing it later.
+   */
+  readonly extractedText?: string;
 };
 
 // --- the interface itself ----------------------------------------------

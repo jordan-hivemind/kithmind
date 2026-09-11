@@ -16,6 +16,8 @@ import {
   negateDecimal,
   retainPayload,
 } from "@repo/finance-archive";
+import { extractWithPdfjs, extractWithTjScan } from "./pdfText.mjs";
+import { isRealStatementLayout, parseRealStatement } from "./statementLayout.mjs";
 
 export const INSTITUTION_SLUG = "morgan-stanley";
 export const INSTITUTION_NAME = "Morgan Stanley";
@@ -943,6 +945,36 @@ function splitLiabilityFields(line) {
  * that account, so the pull's own account is the right one.
  */
 export function parseStatementLines(text, kind) {
+  if (isRealStatementLayout(text)) return parseRealStatement(text, kind);
+  if (isSyntheticStatementText(text)) return parseSyntheticStatementLines(text, kind);
+  // Neither grammar. The bytes and their extracted text are retained either
+  // way; the document routes to review rather than being fed to a parser that
+  // would read a layout it has never seen (ground rule 5). This is the path a
+  // real trade confirmation takes today: no confirmation has been acquired
+  // yet, so its layout has never been studied (README, "Trade confirmations").
+  return {
+    activity: [],
+    holdings: EMPTY_HOLDINGS,
+    parseNote:
+      `not parsed: text extracted (${text.length} characters) but it matches neither the ` +
+      "CLIENT STATEMENT layout nor this adapter's delimited fixture grammar, so no field " +
+      "map for it has been reviewed",
+  };
+}
+
+/** The fixture grammar's own marker: a "PAGE n" line or a pipe-delimited row. */
+function isSyntheticStatementText(text) {
+  const first = text.split("\n").find((line) => line.trim() !== "") ?? "";
+  return /^PAGE \d+$/.test(first.trim()) || first.includes("|");
+}
+
+/**
+ * The synthetic fixture grammar: "PAGE n" markers, one pipe-delimited row per
+ * line, a "HOLDINGS" marker, then POSITION/BALANCE/LIABILITY lines. Kept as
+ * its own function now that the real layout has a parser of its own
+ * (statementLayout.mjs), so neither grammar has to tolerate the other.
+ */
+export function parseSyntheticStatementLines(text, kind) {
   const activity = [];
   const positions = [];
   const balances = [];
@@ -952,8 +984,11 @@ export function parseStatementLines(text, kind) {
   let inHoldings = false;
   let holdingsIndex = 0;
 
-  for (const line of text.split("\n")) {
-    if (line.trim() === "") continue;
+  // Trimmed per line: the real extractor lays text out at the character
+  // column each datum sits in, so a fixture PDF's lines come back indented.
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    if (line === "") continue;
     if (line === "HOLDINGS") {
       inHoldings = true;
       continue;
@@ -1055,30 +1090,40 @@ export function parseStatementLines(text, kind) {
 }
 
 /**
- * Bytes -> text for the PDF tier. ponytail: only reads literal-string `Tj`
- * operators inside an uncompressed content stream -- exactly what
- * fixtures/pdf.mjs's generator produces -- and falls back to decoding the
- * bytes directly as UTF-8 when they are not a PDF at all. A real Morgan
- * Stanley statement may use compressed streams (`/Filter /FlateDecode`) or
- * embedded/CID fonts this does not decode. Upgrade path: swap in a real PDF
- * text-extraction dependency once acquired against a real statement;
- * parseStatementLines' text-based signature does not need to change.
+ * Bytes -> text for the PDF tier: UTF-8, one line per visual line, a form
+ * feed between pages, deterministic for the same bytes (src/pdfText.mjs).
+ *
+ * pdfjs-dist is what reads the real statements. Their content streams are
+ * compressed and their fonts embedded, which is exactly why the
+ * dependency-free `Tj` scan read nothing from any of them and every live
+ * document landed with `parsed_ok` false (F1-43). That scan is kept as the
+ * fallback: it is what reads this package's generated fixture PDFs, and it
+ * costs one regex to keep.
+ *
+ * Bytes that are not a PDF at all are decoded as UTF-8 unchanged, which is
+ * how a text fixture reaches the parser directly.
  */
-export function extractStatementText(bytes) {
-  const latin1 = Buffer.from(bytes).toString("latin1");
-  if (!latin1.startsWith("%PDF-")) {
+export async function extractStatementText(bytes) {
+  const header = String.fromCharCode(...bytes.slice(0, PDF_MAGIC.length));
+  if (header !== PDF_MAGIC) {
     return new TextDecoder().decode(bytes);
   }
-  const lines = [];
-  const tjPattern = /\(((?:[^()\\]|\\.)*)\)\s*Tj/g;
-  let match;
-  while ((match = tjPattern.exec(latin1)) !== null) {
-    lines.push(match[1].replace(/\\\(/g, "(").replace(/\\\)/g, ")").replace(/\\\\/g, "\\"));
+  let pdfjsError = null;
+  try {
+    const extracted = await extractWithPdfjs(bytes);
+    if (extracted !== null) return extracted;
+  } catch (error) {
+    pdfjsError = error instanceof Error ? error.message : String(error);
   }
-  if (lines.length === 0) {
-    throw new Error("extractStatementText: found a PDF but no Tj text operators in it");
-  }
-  return lines.join("\n");
+  const scanned = extractWithTjScan(bytes);
+  if (scanned !== null) return scanned;
+  throw new Error(
+    "extractStatementText: found a PDF with no readable text" +
+      (pdfjsError === null
+        ? " (pdfjs-dist read no text items, and there are no literal Tj operators either)"
+        : ` (pdfjs-dist failed: ${pdfjsError})`) +
+      " -- a scanned image with no text layer is the usual cause",
+  );
 }
 
 async function parse(rawFile) {
@@ -1099,11 +1144,20 @@ async function parse(rawFile) {
       // so a real extractor can revisit it rather than the archive losing it.
       let text;
       try {
-        text = extractStatementText(rawFile.bytes);
+        text = await extractStatementText(rawFile.bytes);
       } catch (error) {
-        return { activity: [], holdings: EMPTY_HOLDINGS, parseNote: `not parsed: ${error instanceof Error ? error.message : String(error)}` };
+        return {
+          activity: [],
+          holdings: EMPTY_HOLDINGS,
+          parseNote: `not parsed: ${error instanceof Error ? error.message : String(error)}`,
+        };
       }
-      return parseStatementLines(text, rawFile.kind);
+      // F1-44: the extracted text is returned whatever the parser makes of
+      // it, so `persistAcquiredDocument` writes it as this document's
+      // retained text artifact and hashes it. A later retained_text_span_v1
+      // citation then has bytes to point at even for a document whose layout
+      // this parser declines to read.
+      return { ...parseStatementLines(text, rawFile.kind), extractedText: text };
     }
     default:
       throw new RangeError(`unknown rawFile.kind ${rawFile.kind}`);

@@ -273,8 +273,193 @@ the risk actually lives.
 Holdings come from `pdf_statement` only. The API, the tabular export and the
 confirmations return `EMPTY_HOLDINGS`, honestly rather than by omission. The
 statement path splits text extraction from text parsing, so the parser is
-testable on text fixtures and the extractor is tested separately against one
-small generated PDF.
+testable on text fixtures and the extractor is tested separately against
+generated PDFs.
+
+## PDF text extraction
+
+Real statements put their content in compressed streams (`/Filter
+/FlateDecode`) with embedded fonts. The adapter's original dependency-free
+reader scanned for literal `(...) Tj` operators, so it read nothing from any
+of them: every live document landed with `parsed_ok` false and a
+`document_unparsed` review item.
+
+`src/pdfText.mjs` reads them with **`pdfjs-dist`**, pinned to an exact
+version, imported from its `legacy/build/pdf.mjs` entry. Why that one:
+
+| Requirement | Why pdfjs-dist |
+| --- | --- |
+| No native addon, no Python | Pure JavaScript; `pnpm install` needs no toolchain and no system package |
+| Runs under plain Node | The legacy build needs no DOM, no canvas and no worker |
+| Ordered text | `getTextContent()` reports a transform per item, so lines can be rebuilt from baselines |
+| **Column position** | The same transform gives an x per item, which is the only thing that separates two tables printed side by side |
+
+That last row is not a nicety. A statement page prints `BALANCE SHEET` on the
+left and an unrelated `CASH FLOW` table on the right at the same heights, so
+text that keeps only reading order interleaves one table's numbers with the
+other's. The extractor therefore emits **fixed-pitch layout**: one line per
+visual line, each datum at the character column its x falls in, pages
+separated by a form feed (`\f`). That is the shape `pdftotext -layout`
+produces, which is the documented fallback if this dependency ever has to go:
+`parseRealStatement` reads character offsets, not pdfjs objects.
+
+The output is deterministic for the same bytes -- no clock, locale or host
+font enters it. Two details worth keeping:
+
+- pdfjs **transfers** (and so detaches) the buffer it is handed. The bytes are
+  the retained archive object, so the extractor passes a copy.
+- A PDF reader clips glyphs outside the MediaBox. The fixture generator sizes
+  its page to its content for the same reason.
+
+The dependency-free `Tj` scan is kept as the fallback: it is what reads this
+package's uncompressed fixture PDFs, and it costs one regex. Bytes that are
+not a PDF at all are decoded as UTF-8, which is how a text fixture reaches the
+parser directly. A PDF neither reader can read (a scan with no text layer)
+raises, and `parse()` turns that into a `parseNote` -- the bytes are retained
+either way.
+
+Whatever the parser then makes of the text, `parse()` returns it as
+`ParsedPull.extractedText`. The runner hands that to
+`persistAcquiredDocument`, which writes it to the raw tree and hashes it, and
+`ImportDocument.textPath` records where. A document whose layout no parser
+reads yet still has text worth retaining, and retaining it is the prerequisite
+for a later `retained_text_span_v1` citation
+(`docs/plans/2026-09-11-structured-evidence.md`, section 4).
+
+## Statement layout
+
+The vocabulary `src/statementLayout.mjs` keys on, so a third party can
+maintain the parser without a statement in front of them. Labels only: every
+value in this repository's fixtures is invented.
+
+**Document and period.** Every page carries `CLIENT STATEMENT   For the
+Period <Month> D-DD, YYYY`, and that is the only period spelling the corpus
+uses. The account number prints as `NNN-NNNNNN-NNN`.
+
+**`BALANCE SHEET`**, left half of the page, two columns headed `Last Period`
+and `This Period`, each with an `(as of MM/DD/YY)` line beneath it. Row
+labels: `Cash, BDP, MMFs`, then one row per asset class (`Stocks`, `Mutual
+Funds`, `ETFs & CEFs`, `Municipal Bonds^`, `Corporate Fixed Income^`,
+`Government Securities`, `Alternative Investments+`, `Savings and Time
+Deposits`), then `Total Assets` (sometimes split into `Total Assets Held At
+Morgan Stanley` and `Total Assets Externally Held`), `Total Liabilities
+(outstanding balance)` and `TOTAL VALUE`.
+
+**`CASH FLOW`**, right half of the same lines, columns `This Period
+(M/D/YY-MM/DD/YY)` and `This Year (M/D/YY-MM/DD/YY)`. Rows: `OPENING CASH,
+BDP, MMFs`, `Purchases`, `Sales and Redemptions`, `Dividend Reinvestments`,
+`Income and Distributions`, `Total Investment Related Activity`, `Electronic
+Transfers-Credits`, `Electronic Transfers-Debits`, `Other Credits`, `Other
+Debits`, `Total Cash Related Activity`, `Total Card/Check Activity`, `CLOSING
+CASH, BDP, MMFs`. Nothing here is parsed today; it is written down because it
+shares the lines the balance sheet is read from.
+
+**`HOLDINGS`**, then one table per asset class under its own all-caps title
+(`CASH, BANK DEPOSIT PROGRAM AND MONEY MARKET FUNDS`, `STOCKS` / `COMMON
+STOCKS`, `MUTUAL FUNDS`, `GOVERNMENT SECURITIES`, `USD SAVINGS DEPOSITS`, and
+so on). Six column-header spellings appear:
+
+| Table | Header |
+| --- | --- |
+| Equities, funds, cash | `Security Description  Trade Date  Quantity  Unit Cost  Share Price  Total Cost  Market Value  Gain/(Loss)  Est Ann Income  Yield %` |
+| Fixed income | `Security Description  Trade Date  Face Value  Adj Unit Cost  Unit Price  Adj Total Cost  Market Value  Gain/(Loss)  Accrued Interest  Yield %` |
+| Options | `Security Description  Trade Date  Contracts  Unit Cost  Contract Price  Total Cost  Market Value  Gain/(Loss)` |
+| NAV-priced funds | `Security Description  Trade Date  Quantity  Unit Cost  NAV  Total Cost  Value  Gain/(Loss)  Date` |
+| Aggregate private holdings | `Security Description  Aggregate Investment  Total Cost  Value + Distributions  Total Return  Date` |
+| Realized gain/loss (**not** holdings) | `Security Description  Acquired  Sold  Quantity  Proceeds  Total Cost  Gain/(Loss)  Comments` |
+
+The parser reads whichever of those labels a given table prints rather than
+keying on the table's identity, and skips the realized table by name: it
+reports closed lots, not a holding. Adjacent headers printed one space apart
+arrive as a single cell, so each header cell is scanned for the labels inside
+it. `Unit Cost` / `Adj Unit Cost` are bound and then ignored:
+`ParsedPosition.price` is the market price, not what the lot cost.
+
+Two security-block shapes occur, and both are read:
+
+- An equity or fund prints one row per tax lot and a `Total` row carrying the
+  aggregate, followed by `Next Dividend Payable MM/YYYY; Asset Class: <class>`.
+  The `Total` row is the position. A column that row leaves blank (the share
+  price, which is per-lot in the printing) is filled from the lots **only when
+  every lot states the same number**; compared as numbers, since the first lot
+  prints `$318.400` and the rest print `318.400`.
+- A bond prints the security on one row and its market value on the detail row
+  beneath it (`Coupon Rate x%; Matures MM/DD/YYYY; CUSIP nnnnnnnnn`), with no
+  `Total` row. The block's rows are merged under the same agree-or-leave-null
+  rule, and the CUSIP is read off the detail line.
+
+Values are right-aligned under right-aligned headers and descriptions are
+left-aligned under left-aligned ones, so a cell binds to the column whose
+nearer edge it lines up with, within three characters. A cell counts as a
+value only if it carries a digit, which is what keeps a sub-header reprinted
+mid-table (`Percentage of Holdings`, `Market Value`) from being read as one.
+Money spellings: `$1,234.56`, `(1,234.56)` for negative, a trailing one- or
+two-letter footnote reference, and `—` for "none".
+
+### What parses and what routes to review
+
+| Field | Source | Notes |
+| --- | --- | --- |
+| Period start, period end | `For the Period` line | Absent -> whole document refused |
+| `ParsedBalance.totalValue`, `.periodEndValue` | `TOTAL VALUE` / `This Period` | |
+| `ParsedBalance.periodStartValue` | `TOTAL VALUE` / `Last Period` | |
+| `ParsedBalance.cash` | `Cash, BDP, MMFs` / `This Period` | |
+| `ParsedBalance.asOf` | `(as of MM/DD/YY)` under `This Period` | |
+| `ParsedLiability.balance` | `Total Liabilities (outstanding balance)` | `—` means no liability, which is **not** recorded as zero |
+| `ParsedPosition` quantity, price, cost basis, market value, unrealized | the holdings tables above | |
+| `ParsedPosition.instrument` | `NAME (SYMBOL)`, or the detail line's CUSIP | |
+| `ParsedPosition.valuationBasis` | `market_price` under a `Market Value` column, `reported_nav` under `NAV`, otherwise null with `valuationNote` saying why | |
+| Statement activity rows | not parsed | The `structured_api` tier is this institution's activity source; a statement is not read twice |
+
+Ambiguity is always a null with a note and a locator, never a guess:
+
+- An amount that will not canonicalize -> null, `amountNote`/`marketValueNote`/
+  `totalValueNote`, and a field locator naming the cell.
+- A security block with several valued lots and no `Total` row -> no position,
+  and a `parseNote` counting the blocks and naming the first reason. Across the
+  live corpus this is about 5% of blocks.
+- A statement with no readable `BALANCE SHEET` -> holdings still reported, and
+  a `parseNote` saying no balance was.
+
+### Consolidated statements
+
+About one statement in five prints several accounts in one PDF (up to eleven
+seen), under a `TOTAL FOR ALL ACCOUNTS` page. Those are refused whole, with
+the reason on `parseNote`, because `ParsedPosition`, `ParsedBalance` and
+`ParsedLiability` carry no account key of their own -- only `ParsedRow` does.
+Every holding in such a document would be imported under whichever single
+account the pull names, which is a wrong answer rather than a partial one. The
+bytes and the extracted text are retained, so a later slice that can attribute
+per account has everything it needs. Extending the contract with a per-holding
+account key is the fix, and it is a shared-boundary change (Issue 57), not an
+adapter-local one.
+
+### Trade confirmations
+
+No trade confirmation has been acquired yet: every document in the archive is
+a `ClientStatements` pull. The confirmation layout has therefore never been
+seen, and this adapter does not invent a field map for it. Confirmation text
+that matches neither the `CLIENT STATEMENT` layout nor the fixture grammar
+returns no rows with a `parseNote` saying so, and its extracted text is
+retained. Write the parser against real bytes once a confirmation is pulled;
+the fields to look for are trade date, settlement date, action, quantity,
+price, principal, commission or markup, net amount, and symbol or CUSIP.
+
+### Reprocessing documents already retained
+
+Documents acquired before this parser landed are recorded with `parsed_ok`
+false and a `document_unparsed` review item. They are re-imported by running
+the operator command a second time, which is by design:
+`isDocumentAlreadyImported` skips a document only when its row has `parsed_ok`
+true, so a refused document is re-acquired, re-parsed and re-imported on the
+next run rather than skipped as already seen. Nothing has to be deleted first,
+and the raw bytes are content-addressed, so re-acquiring writes no second copy
+of them -- only a new capture manifest recording that second acquisition. The
+reimport reuses the existing `documents` row (the bytes, and so the sha256,
+have not changed), and fills in its `text_path` from the text artifact this
+run retained, which the first run had none of. A
+statement this parser still declines (a consolidated one, say) simply stays
+`parsed_ok` false with an updated note, ready for the run after that.
 
 A real statement's compressed content stream (`/Filter /FlateDecode`) or
 embedded/CID fonts can leave the dependency-free extractor with no `Tj` text
@@ -523,9 +708,22 @@ bytes, PDF-tier rows carrying no binding, holdings extraction,
 `activityTaxonomy` agreeing with `ACTIVITY_SIGN_TABLE`, the documents request
 body and page-fetch expression (which forwards the captured headers without
 ever reading a value back out), the confirmed per-document download request,
-a document download that answers with HTML being refused, the page-evaluate
-deadline rejecting by name, and the PDF text extractor against a small
-generated PDF.
+a document download that answers with HTML being refused, and the
+page-evaluate deadline rejecting by name.
+
+`test/statementLayout.test.mjs` covers F1-44: extraction order and page
+separators against generated PDFs both uncompressed and deflated (the
+deflated one proving the dependency-free scan reads nothing from it and pdfjs
+does), determinism over the same bytes, the caller's bytes surviving
+extraction, a PDF with no text layer being reported rather than read as empty,
+then period and balance parsing, the `CASH FLOW` table beside the balance
+sheet never bleeding into it, an equity `Total` row as the position with its
+share price filled only from lots that agree, a bond's market value and CUSIP
+off its detail line, and the review routes: an unreadable amount, an ambiguous
+security block, a consolidated statement, a missing period line, and text in
+neither grammar. Its fixtures are generated in-process from the label
+vocabulary in "Statement layout" with invented values; no real document
+content is in this repository.
 
 The bridge's CDP mechanism has its own proof in `spike/bridge-spike.mjs`. Run
 it with `node spike/bridge-spike.mjs`. It opens a local Chrome instance against
