@@ -33,6 +33,7 @@ import {
   type AcquireSelection,
   type AdapterSession,
   type CapabilityTier,
+  type DiscoverResult,
   type InstitutionAdapter,
 } from "./adapter.js";
 import {
@@ -95,7 +96,44 @@ type SelectionEntry = {
   readonly docType: string;
   readonly docDate: string | null;
   readonly selection: AcquireSelectionInput;
+  /** Absent on a plain entry; discriminates `SelectionPull` against the two
+   * `"expand"` entries below. */
+  readonly expand?: undefined;
 };
+
+/**
+ * F1-39. `discover()` can return thousands of documents across a full
+ * retention-window pull -- one selection entry per document is not something
+ * anyone should hand-write. This entry expands, after `discover` runs, into
+ * one document pull per discovered item of `kinds`: institution-wide (see
+ * `DiscoveredDocument` in adapter.ts -- it names no account), `docDate` the
+ * discovered `periodEnd`. `requireExhaustive: true` refuses the whole run
+ * before anything is acquired if `discover()`'s document listing came back
+ * incomplete, rather than silently importing a partial retention window.
+ */
+type ExpandDiscoveredEntry = {
+  readonly expand: "discovered";
+  readonly kinds: readonly Extract<CapabilityTier, "pdf_statement" | "trade_confirmation">[];
+  readonly docType: string;
+  readonly requireExhaustive: boolean;
+};
+
+/**
+ * F1-39. One caller-stated window, split on calendar-year boundaries into
+ * one institution-wide pull per year -- so a seven-year retention pull is one
+ * selection entry, not one per native range. `docDate` is null for every
+ * generated pull, the same convention every other `structured_api`/
+ * `tabular_export` entry in this file uses: a period, not a single date.
+ */
+type ExpandActivityRangesEntry = {
+  readonly expand: "activity-ranges";
+  readonly kind: Extract<CapabilityTier, "structured_api" | "tabular_export">;
+  readonly docType: string;
+  readonly periodStart: string;
+  readonly periodEnd: string;
+};
+
+type SelectionPull = SelectionEntry | ExpandDiscoveredEntry | ExpandActivityRangesEntry;
 
 type SelectionFile = {
   /**
@@ -107,7 +145,7 @@ type SelectionFile = {
    * whichever one the caller actually meant.
    */
   readonly institutionId?: string;
-  readonly pulls: readonly SelectionEntry[];
+  readonly pulls: readonly SelectionPull[];
 };
 
 const CAPABILITY_TIERS = new Set<CapabilityTier>([
@@ -137,6 +175,50 @@ function readSelectionFile(path: string): SelectionFile {
       throw new Error(`${path}: pulls[${index}] must be an object`);
     }
     const pull = entry as Record<string, unknown>;
+
+    if (pull.expand === "discovered") {
+      const kinds = pull.kinds;
+      if (
+        !Array.isArray(kinds) ||
+        kinds.length === 0 ||
+        !kinds.every((k) => k === "pdf_statement" || k === "trade_confirmation")
+      ) {
+        throw new Error(
+          `${path}: pulls[${index}].kinds must be a non-empty array of "pdf_statement" or "trade_confirmation"`,
+        );
+      }
+      if (typeof pull.docType !== "string" || pull.docType.length === 0) {
+        throw new Error(`${path}: pulls[${index}].docType is required`);
+      }
+      if (typeof pull.requireExhaustive !== "boolean") {
+        throw new Error(`${path}: pulls[${index}].requireExhaustive must be a boolean`);
+      }
+      return;
+    }
+
+    if (pull.expand === "activity-ranges") {
+      if (pull.kind !== "structured_api" && pull.kind !== "tabular_export") {
+        throw new Error(
+          `${path}: pulls[${index}].kind must be "structured_api" or "tabular_export"`,
+        );
+      }
+      if (typeof pull.docType !== "string" || pull.docType.length === 0) {
+        throw new Error(`${path}: pulls[${index}].docType is required`);
+      }
+      if (typeof pull.periodStart !== "string" || typeof pull.periodEnd !== "string") {
+        throw new Error(
+          `${path}: pulls[${index}] needs "periodStart" and "periodEnd"`,
+        );
+      }
+      return;
+    }
+
+    if (pull.expand !== undefined) {
+      throw new Error(
+        `${path}: pulls[${index}].expand, when present, must be "discovered" or "activity-ranges"`,
+      );
+    }
+
     const selection = pull.selection as Record<string, unknown> | undefined;
     if (
       !selection ||
@@ -360,6 +442,22 @@ type RunOutcome = {
   readonly currencySums: readonly CurrencySum[];
   readonly cashVerdicts: readonly CashVerdict[];
   readonly positionVerdicts: readonly PositionVerdict[];
+  /** F1-39. How many documents `discover()` reported, by kind -- independent
+   * of whether anything in `selection.pulls` actually asked for them. */
+  readonly documentsDiscoveredByKind: Readonly<Record<string, number>>;
+  /** F1-39. Counts for document-tier (`pdf_statement`/`trade_confirmation`)
+   * pulls specifically -- `documentsAcquired` above already counts every
+   * pull, document- and export-tier alike. */
+  readonly documentPullsAcquired: number;
+  readonly documentPullsSkipped: number;
+  readonly documentPullsFailed: number;
+  readonly documentPullsByKind: Readonly<Record<string, DocKindCounts>>;
+};
+
+type DocKindCounts = {
+  readonly acquired: number;
+  readonly skipped: number;
+  readonly failed: number;
 };
 
 /**
@@ -418,13 +516,113 @@ function resolveEntryAccountId(
   return id;
 }
 
-function documentRowCount(document: ImportDocument): number {
-  return (
-    document.rows.length +
-    (document.positions?.length ?? 0) +
-    (document.balances?.length ?? 0) +
-    (document.liabilities?.length ?? 0)
-  );
+const DOCUMENT_TIER_KINDS = new Set<CapabilityTier>(["pdf_statement", "trade_confirmation"]);
+
+function isDocumentTierKind(
+  kind: CapabilityTier,
+): kind is Extract<CapabilityTier, "pdf_statement" | "trade_confirmation"> {
+  return DOCUMENT_TIER_KINDS.has(kind);
+}
+
+/** F1-39. One resolved pull, after any `"expand"` entry has been expanded --
+ * account already resolved (or null, institution-wide), exactly what
+ * `main()`'s pull loop used to build straight from `SelectionEntry`. */
+type PullSpec = {
+  readonly accountId: string | null;
+  readonly docType: string;
+  readonly docDate: string | null;
+  readonly selection: AcquireSelectionInput;
+};
+
+/**
+ * F1-39. Splits `[periodStart, periodEnd]` on calendar-year boundaries. A
+ * window inside one year is one range; a multi-year window is one range per
+ * year it touches, each clipped to the caller's own start/end. The real
+ * adapter's own native-range limit (the synthetic adapter has none) is the
+ * adapter's problem once it receives one of these one-year-or-shorter
+ * requests, not this function's.
+ */
+function splitIntoCalendarYears(
+  periodStart: string,
+  periodEnd: string,
+): Array<{ readonly periodStart: string; readonly periodEnd: string }> {
+  const startYear = Number(periodStart.slice(0, 4));
+  const endYear = Number(periodEnd.slice(0, 4));
+  if (!Number.isInteger(startYear) || !Number.isInteger(endYear) || endYear < startYear) {
+    throw new Error(
+      `"expand": "activity-ranges" needs periodStart <= periodEnd, both YYYY-MM-DD; got ` +
+        `${periodStart}..${periodEnd}`,
+    );
+  }
+  const ranges: Array<{ periodStart: string; periodEnd: string }> = [];
+  for (let year = startYear; year <= endYear; year += 1) {
+    ranges.push({
+      periodStart: year === startYear ? periodStart : `${year}-01-01`,
+      periodEnd: year === endYear ? periodEnd : `${year}-12-31`,
+    });
+  }
+  return ranges;
+}
+
+/**
+ * F1-39. Turns `selectionFile.pulls` into a flat list of concrete pulls: a
+ * plain entry passes through (its account resolved exactly as before), an
+ * `"expand": "discovered"` entry becomes one pull per matching discovered
+ * document, and an `"expand": "activity-ranges"` entry becomes one
+ * institution-wide pull per calendar year. Runs after `discover()`, since
+ * both expansions read its result.
+ */
+function expandSelectionPulls(
+  entries: readonly SelectionPull[],
+  discovered: DiscoverResult,
+  accountsByExternalKey: ReadonlyMap<string, string>,
+): PullSpec[] {
+  const specs: PullSpec[] = [];
+  for (const entry of entries) {
+    if (entry.expand === "discovered") {
+      if (entry.requireExhaustive && discovered.documents.status === "incomplete") {
+        throw new Error(
+          `"expand": "discovered" with "requireExhaustive": true refuses to start: discover()'s ` +
+            `document listing is incomplete (${discovered.documents.reason})`,
+        );
+      }
+      const wanted = new Set<string>(entry.kinds);
+      for (const doc of discovered.documents.items) {
+        if (!wanted.has(doc.kind)) continue;
+        specs.push({
+          // DiscoveredDocument names no account (adapter.ts): the pull is
+          // filed institution-wide, exactly like "scope": "institution".
+          accountId: null,
+          docType: entry.docType,
+          docDate: doc.periodEnd,
+          selection: { kind: doc.kind, externalId: doc.externalId },
+        });
+      }
+      continue;
+    }
+    if (entry.expand === "activity-ranges") {
+      for (const range of splitIntoCalendarYears(entry.periodStart, entry.periodEnd)) {
+        specs.push({
+          accountId: null,
+          docType: entry.docType,
+          docDate: null,
+          selection: {
+            kind: entry.kind,
+            periodStart: range.periodStart,
+            periodEnd: range.periodEnd,
+          },
+        });
+      }
+      continue;
+    }
+    specs.push({
+      accountId: resolveEntryAccountId(entry, accountsByExternalKey),
+      docType: entry.docType,
+      docDate: entry.docDate,
+      selection: entry.selection,
+    });
+  }
+  return specs;
 }
 
 async function main(): Promise<void> {
@@ -435,6 +633,7 @@ async function main(): Promise<void> {
       selection: { type: "string" },
       now: { type: "string" },
       "dry-run": { type: "boolean", default: false },
+      "commit-every": { type: "string", default: "1" },
     },
   });
 
@@ -445,6 +644,16 @@ async function main(): Promise<void> {
   const now = values.now ? new Date(values.now) : new Date();
   if (Number.isNaN(now.getTime())) {
     throw new Error(`--now ${values.now} is not a valid date`);
+  }
+  // F1-39. How many document-tier pulls (pdf_statement/trade_confirmation)
+  // share one publishImport transaction. Default 1: each document is
+  // acquired, persisted and imported on its own, so one refused or failed
+  // document never loses any other document's already-committed work.
+  // structured_api/tabular_export pulls are never batched by this flag --
+  // each of those always gets its own transaction (see runPulls below).
+  const commitEvery = Number(values["commit-every"]);
+  if (!Number.isInteger(commitEvery) || commitEvery < 1) {
+    throw new Error(`--commit-every must be a positive integer, got ${values["commit-every"]}`);
   }
 
   const adapter = await loadAdapter(values.adapter);
@@ -493,54 +702,17 @@ async function main(): Promise<void> {
 
     const accountLast4Cache = new Map<string, string | null>();
 
-    const pulls: AdapterPull[] = [];
-    let bytesAcquired = 0;
-    const manifestHashes: string[] = [];
-
-    for (const entry of selectionFile.pulls) {
-      const accountId = resolveEntryAccountId(entry, accountsByExternalKey);
-      // F1-35: an institution-wide pull names no single account, so there is
-      // no accounts.acct_last4 to look up either -- "all" says so on the
-      // capture manifest rather than a guessed or borrowed last4 (see
-      // captures.ts's acctLast4 doc comment).
-      const accountLast4 =
-        accountId === null
-          ? "all"
-          : await resolveAccountLast4(pgClient, accountId, accountLast4Cache);
-      const selection = { ...entry.selection, session } as AcquireSelection;
-      const acquired = await adapter.acquire(selection);
-      const parsed = await adapter.parse({
-        kind: entry.selection.kind,
-        bytes: acquired.bytes,
-      });
-      const persisted = persistAcquiredDocument(rawTreeRoot, {
-        institutionId,
-        accountId,
-        institutionSlug: capabilities.institutionSlug,
-        accountLast4,
-        docType: entry.docType,
-        acquired,
-      });
-      bytesAcquired += acquired.bytes.length;
-      manifestHashes.push(acquired.manifest.contentHash);
-      pulls.push({
-        institutionId,
-        accountId,
-        acquired,
-        rows: parsed.activity,
-        holdings: parsed.holdings,
-        docType: entry.docType,
-        docDate: entry.docDate,
-        persisted,
-        activityTaxonomy: capabilities.activityTaxonomy,
-        // F1-35: lets adapterImport.ts resolve a row's own
-        // ParsedRow.accountExternalKey (an institution-wide pull's rows, or
-        // any row an adapter attributes this way) against the accounts this
-        // run already discovered, instead of always importing under
-        // `accountId` above.
-        accountsByExternalKey,
-      });
+    // F1-39: documents discovered by kind, independent of whether any
+    // selection entry actually asked for them.
+    const documentsDiscoveredByKind: Record<string, number> = {};
+    for (const doc of discovered.documents.items) {
+      documentsDiscoveredByKind[doc.kind] = (documentsDiscoveredByKind[doc.kind] ?? 0) + 1;
     }
+
+    // F1-39: expands "expand": "discovered" and "expand": "activity-ranges"
+    // entries into concrete pulls; a plain entry passes through unchanged
+    // (same resolveEntryAccountId call the loop below used to make itself).
+    const pullSpecs = expandSelectionPulls(selectionFile.pulls, discovered, accountsByExternalKey);
 
     // F1-35: an institution-wide pull's own accountId is null, and its rows
     // are attributed by their own accountExternalKey instead -- include
@@ -548,27 +720,142 @@ async function main(): Promise<void> {
     // happened, or the accounts those rows actually landed on would be
     // silently absent from "cash reconciliation verdicts" / "position
     // reconciliation verdicts" below.
-    const namedAccountIds = pulls
-      .map((pull) => pull.accountId)
+    const namedAccountIds = pullSpecs
+      .map((spec) => spec.accountId)
       .filter((id): id is string => id !== null);
     const accountIds = [
       ...new Set(
-        pulls.some((pull) => pull.accountId === null)
+        pullSpecs.some((spec) => spec.accountId === null)
           ? [...namedAccountIds, ...accountsByExternalKey.values()]
           : namedAccountIds,
       ),
     ];
-    // One digest standing for this run's whole acquisition manifest: the
-    // sha256 of every acquired document's own content hash, sorted so the
-    // digest does not depend on acquisition order.
-    const manifestSha256 = sha256Hex(
-      new TextEncoder().encode([...manifestHashes].sort().join("\n")),
-    );
 
-    let outcome!: RunOutcome;
-    let committed = true;
-    try {
-      outcome = await withArchiveTransaction(pgClient, async (tx) => {
+    let bytesAcquired = 0;
+    const manifestHashes: string[] = [];
+    let documentsAcquiredCount = 0;
+    let rowsParsed = 0;
+    let rowsInserted = 0;
+    let rowsDeduplicated = 0;
+    let rowsRefused = 0;
+    let reviewItemsOpened = 0;
+    const allDocumentShas: string[] = [];
+
+    let documentPullsAcquired = 0;
+    let documentPullsSkipped = 0;
+    let documentPullsFailed = 0;
+    const documentPullsByKind = new Map<string, DocKindCounts>();
+
+    function bumpDocKind(kind: string, field: keyof DocKindCounts): void {
+      const existing = documentPullsByKind.get(kind) ?? {
+        acquired: 0,
+        skipped: 0,
+        failed: 0,
+      };
+      documentPullsByKind.set(kind, { ...existing, [field]: existing[field] + 1 });
+    }
+
+    function reportFailure(spec: PullSpec, error: unknown): void {
+      const message = error instanceof Error ? error.message : String(error);
+      const locator =
+        "externalId" in spec.selection
+          ? `externalId=${spec.selection.externalId}`
+          : `period=${spec.selection.periodStart}..${spec.selection.periodEnd}`;
+      console.error(
+        `document pull refused/failed and was skipped: kind=${spec.selection.kind} ${locator}: ${message}`,
+      );
+    }
+
+    type Acquired = {
+      readonly pull: AdapterPull;
+      readonly kind: CapabilityTier;
+      readonly contentHash: string;
+      readonly parsedRowCount: number;
+    };
+
+    /** Acquires, parses and persists one pull -- the raw-tree write, and
+     * therefore `bytesAcquired`/`manifestHashes`/`documentsAcquiredCount`,
+     * happen here regardless of whether the pull's rows go on to import,
+     * dedupe or fail: acquisition and import are different facts. */
+    async function acquireAndPersist(spec: PullSpec): Promise<Acquired> {
+      const selection = { ...spec.selection, session } as AcquireSelection;
+      const acquired = await adapter.acquire(selection);
+      const parsed = await adapter.parse({ kind: spec.selection.kind, bytes: acquired.bytes });
+      // F1-35: an institution-wide pull names no single account, so there is
+      // no accounts.acct_last4 to look up either -- "all" says so on the
+      // capture manifest rather than a guessed or borrowed last4 (see
+      // captures.ts's acctLast4 doc comment).
+      const accountLast4 =
+        spec.accountId === null
+          ? "all"
+          : await resolveAccountLast4(pgClient, spec.accountId, accountLast4Cache);
+      const persisted = persistAcquiredDocument(rawTreeRoot, {
+        institutionId,
+        accountId: spec.accountId,
+        institutionSlug: capabilities.institutionSlug,
+        accountLast4,
+        docType: spec.docType,
+        acquired,
+      });
+      bytesAcquired += acquired.bytes.length;
+      manifestHashes.push(acquired.manifest.contentHash);
+      documentsAcquiredCount += 1;
+      rowsParsed +=
+        parsed.activity.length +
+        parsed.holdings.positions.length +
+        parsed.holdings.balances.length +
+        parsed.holdings.liabilities.length;
+      return {
+        pull: {
+          institutionId,
+          accountId: spec.accountId,
+          acquired,
+          rows: parsed.activity,
+          holdings: parsed.holdings,
+          docType: spec.docType,
+          docDate: spec.docDate,
+          persisted,
+          activityTaxonomy: capabilities.activityTaxonomy,
+          // F1-35: lets adapterImport.ts resolve a row's own
+          // ParsedRow.accountExternalKey (an institution-wide pull's rows,
+          // or any row an adapter attributes this way) against the accounts
+          // this run already discovered, instead of always importing under
+          // `accountId` above.
+          accountsByExternalKey,
+        },
+        kind: spec.selection.kind,
+        contentHash: acquired.manifest.contentHash,
+        parsedRowCount:
+          parsed.activity.length +
+          parsed.holdings.positions.length +
+          parsed.holdings.balances.length +
+          parsed.holdings.liabilities.length,
+      };
+    }
+
+    /** `documents.sha256` is content-addressed and unique (importer.ts's
+     * whole-document skip); checking it directly, before ever building an
+     * ImportBatch, is what lets an already-imported document be reported as
+     * "skipped" rather than folded into `rowsDeduplicated`, and lets a
+     * commit-every batch leave it out of the transaction entirely. */
+    async function isDocumentAlreadyImported(sha256: string): Promise<boolean> {
+      const found = await pgClient.query<{ parsed_ok: boolean }>(
+        "SELECT parsed_ok FROM documents WHERE sha256 = $1",
+        [sha256],
+      );
+      return found.rows[0]?.parsed_ok === true;
+    }
+
+    /** Converts and publishes `acquiredPulls` as one transaction. Called
+     * with exactly one `Acquired` for a structured_api/tabular_export pull
+     * (always its own transaction) or with up to `commitEvery` document-tier
+     * ones. Uses `pgClient` directly rather than a passed-down handle: every
+     * archive connection this file opens is that one client, and
+     * `withArchiveTransaction` already joins a transaction already open on
+     * it (see `main`'s `--dry-run` branch below) rather than nesting a
+     * second one, so this needs no dry-run-specific branch of its own. */
+    async function publishOne(acquiredPulls: readonly Acquired[]): Promise<void> {
+      await withArchiveTransaction(pgClient, async (tx) => {
         // F1-36: adapterPullToImportDocuments (adapterImport.ts) opens its
         // own review items during conversion -- weak instrument matches,
         // unknown account keys, undeclared activity types, an unverified
@@ -580,58 +867,148 @@ async function main(): Promise<void> {
         // already destructures as a plain ImportDocument[].
         const reviewItemsBeforeConversion = await countReviewItems(tx);
         const documents: ImportDocument[] = [];
-        for (const pull of pulls) {
-          documents.push(...(await adapterPullToImportDocuments(tx, pull)));
+        for (const acquired of acquiredPulls) {
+          documents.push(...(await adapterPullToImportDocuments(tx, acquired.pull)));
         }
         const conversionReviewItemsOpened =
           (await countReviewItems(tx)) - reviewItemsBeforeConversion;
-        const batch: ImportBatch = {
-          source: adapter.institutionSlug,
-          documents,
-        };
+        const batch: ImportBatch = { source: adapter.institutionSlug, documents };
         // Reuses publishImport: import both gates and publication happen
         // exactly as it already defines them, as one atomic step.
         const publishSummary = await publishImport(tx, batch, now);
-        const currencySums = await sumByCurrency(
-          tx,
-          documents.map((document) => document.sha256),
-        );
-        const cashVerdicts = await fetchCashVerdicts(tx, accountIds);
-        const positionVerdicts = await fetchPositionVerdicts(tx, accountIds);
-        const rowsParsed = documents.reduce(
-          (sum, document) => sum + documentRowCount(document),
-          0,
-        );
-        const result: RunOutcome = {
-          discoverStatus: discovered.documents.status,
-          discoverDocuments: discovered.documents.items.length,
-          discoverExportRanges: discovered.exportRanges.length,
-          documentsAcquired: pulls.length,
-          bytesAcquired,
-          manifestSha256,
-          rowsParsed,
-          rowsInserted: publishSummary.rowsInserted,
-          rowsDeduplicated: publishSummary.rowsDeduplicated,
-          rowsRefused: publishSummary.rowsRefused,
-          reviewItemsOpened:
-            conversionReviewItemsOpened + publishSummary.reviewItemsOpened,
-          currencySums,
-          cashVerdicts,
-          positionVerdicts,
-        };
-        if (dryRun) throw new DryRunAbort(result);
-        return result;
+        rowsInserted += publishSummary.rowsInserted;
+        rowsDeduplicated += publishSummary.rowsDeduplicated;
+        rowsRefused += publishSummary.rowsRefused;
+        reviewItemsOpened += conversionReviewItemsOpened + publishSummary.reviewItemsOpened;
+        allDocumentShas.push(...documents.map((document) => document.sha256));
       });
-    } catch (error) {
-      if (error instanceof DryRunAbort) {
-        outcome = error.result;
-        committed = false;
-      } else {
-        throw error;
+    }
+
+    let pendingDocBatch: Array<{ readonly spec: PullSpec; readonly acquired: Acquired }> = [];
+
+    async function flushDocBatch(): Promise<void> {
+      if (pendingDocBatch.length === 0) return;
+      const batch = pendingDocBatch;
+      pendingDocBatch = [];
+      const toImport: Array<{ readonly spec: PullSpec; readonly acquired: Acquired }> = [];
+      for (const item of batch) {
+        // ponytail: already acquired/persisted above (flushDocBatch only
+        // ever receives entries acquireAndPersist already succeeded for);
+        // the dedupe check itself cannot fail here short of a database
+        // outage, which is fatal regardless.
+        const already = await isDocumentAlreadyImported(item.acquired.contentHash);
+        if (already) {
+          documentPullsSkipped += 1;
+          bumpDocKind(item.acquired.kind, "skipped");
+          allDocumentShas.push(item.acquired.contentHash);
+          continue;
+        }
+        toImport.push(item);
+      }
+      if (toImport.length === 0) return;
+      try {
+        await publishOne(toImport.map((item) => item.acquired));
+        documentPullsAcquired += toImport.length;
+        for (const item of toImport) bumpDocKind(item.acquired.kind, "acquired");
+      } catch (error) {
+        documentPullsFailed += toImport.length;
+        for (const item of toImport) {
+          bumpDocKind(item.acquired.kind, "failed");
+          reportFailure(item.spec, error);
+        }
       }
     }
 
-    printSummary(outcome, { dryRun, committed });
+    /**
+     * F1-39. Processes every pull in order: document-tier pulls
+     * (`pdf_statement`/`trade_confirmation`) batch up to `commitEvery` at a
+     * time, each batch its own transaction, and a refused or failed one is
+     * reported and skipped rather than aborting the run.
+     * `structured_api`/`tabular_export` pulls are never batched -- each gets
+     * its own transaction, and a failure there still aborts the run exactly
+     * as it always has (no selection here names thousands of those the way
+     * a full document retention window does).
+     */
+    async function runPulls(): Promise<void> {
+      for (const spec of pullSpecs) {
+        if (isDocumentTierKind(spec.selection.kind)) {
+          let acquired: Acquired;
+          try {
+            acquired = await acquireAndPersist(spec);
+          } catch (error) {
+            documentPullsFailed += 1;
+            bumpDocKind(spec.selection.kind, "failed");
+            reportFailure(spec, error);
+            continue;
+          }
+          pendingDocBatch.push({ spec, acquired });
+          if (pendingDocBatch.length >= commitEvery) await flushDocBatch();
+        } else {
+          await flushDocBatch();
+          const acquired = await acquireAndPersist(spec);
+          await publishOne([acquired]);
+        }
+      }
+      await flushDocBatch();
+    }
+
+    async function buildOutcome(): Promise<RunOutcome> {
+      const currencySums = await sumByCurrency(pgClient, allDocumentShas);
+      const cashVerdicts = await fetchCashVerdicts(pgClient, accountIds);
+      const positionVerdicts = await fetchPositionVerdicts(pgClient, accountIds);
+      // One digest standing for this run's whole acquisition manifest: the
+      // sha256 of every acquired document's own content hash, sorted so the
+      // digest does not depend on acquisition order.
+      const manifestSha256 = sha256Hex(
+        new TextEncoder().encode([...manifestHashes].sort().join("\n")),
+      );
+      return {
+        discoverStatus: discovered.documents.status,
+        discoverDocuments: discovered.documents.items.length,
+        discoverExportRanges: discovered.exportRanges.length,
+        documentsAcquired: documentsAcquiredCount,
+        bytesAcquired,
+        manifestSha256,
+        rowsParsed,
+        rowsInserted,
+        rowsDeduplicated,
+        rowsRefused,
+        reviewItemsOpened,
+        currencySums,
+        cashVerdicts,
+        positionVerdicts,
+        documentsDiscoveredByKind,
+        documentPullsAcquired,
+        documentPullsSkipped,
+        documentPullsFailed,
+        documentPullsByKind: Object.fromEntries(documentPullsByKind),
+      };
+    }
+
+    let outcome: RunOutcome;
+    if (dryRun) {
+      // Runs the identical pass inside one Postgres transaction and always
+      // rolls it back. `runPulls`'s own `withArchiveTransaction` calls
+      // (inside `publishOne`) join this one instead of opening their own
+      // (see `withArchiveTransaction`'s reentrancy doc comment), so this
+      // still commits nothing, exactly as before commit-every batching
+      // existed.
+      try {
+        await withArchiveTransaction(pgClient, async () => {
+          await runPulls();
+          throw new DryRunAbort(await buildOutcome());
+        });
+        throw new Error("unreachable: dry run always throws DryRunAbort");
+      } catch (error) {
+        if (!(error instanceof DryRunAbort)) throw error;
+        outcome = error.result;
+      }
+    } else {
+      await runPulls();
+      outcome = await buildOutcome();
+    }
+
+    printSummary(outcome, { dryRun, committed: !dryRun });
   } finally {
     // F1-36: never `pgClient.end()` directly here. A connection already
     // torn down (by the server, or by the transaction error this `finally`
@@ -659,6 +1036,21 @@ function printSummary(
     `discover: ${outcome.discoverStatus} (${outcome.discoverDocuments} document(s), ${outcome.discoverExportRanges} export range(s))`,
   );
   console.log(`documents acquired: ${outcome.documentsAcquired}`);
+  console.log("documents discovered by kind:");
+  for (const [kind, n] of Object.entries(outcome.documentsDiscoveredByKind)) {
+    console.log(`  ${kind}: ${n}`);
+  }
+  if (Object.keys(outcome.documentsDiscoveredByKind).length === 0) console.log("  (none)");
+  console.log(`document pulls acquired: ${outcome.documentPullsAcquired}`);
+  console.log(`document pulls skipped (already imported): ${outcome.documentPullsSkipped}`);
+  console.log(`document pulls failed: ${outcome.documentPullsFailed}`);
+  console.log("document pulls by kind:");
+  for (const [kind, counts] of Object.entries(outcome.documentPullsByKind)) {
+    console.log(
+      `  ${kind}: acquired=${counts.acquired} skipped=${counts.skipped} failed=${counts.failed}`,
+    );
+  }
+  if (Object.keys(outcome.documentPullsByKind).length === 0) console.log("  (none)");
   console.log(`bytes acquired: ${outcome.bytesAcquired}`);
   console.log(`acquisition manifest sha256: ${outcome.manifestSha256}`);
   console.log(`rows parsed: ${outcome.rowsParsed}`);

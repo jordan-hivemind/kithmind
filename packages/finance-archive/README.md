@@ -709,7 +709,8 @@ node dist/run.js \
   --session <path to a module whose default export builds an AdapterSession> \
   --selection <path to a JSON selection file> \
   [--now <ISO instant, for a reproducible run>] \
-  [--dry-run]
+  [--dry-run] \
+  [--commit-every <N, default 1>]
 ```
 
 `--adapter` is a module with a default export, or a named `adapter` export,
@@ -788,6 +789,73 @@ such a row is refused rather than imported unattributed. The pull's own
 not to any one account -- and its capture manifest records `"all"` in place
 of an `acctLast4`, since there is no single account's last four digits to
 record either.
+
+### Expanded selections (F1-39)
+
+A full retention-window pull is every discovered document across every
+account for years, and no one should hand-write one entry per document. Two
+entry shapes expand after `discover()` runs, instead of naming a pull
+directly:
+
+```json
+{
+  "pulls": [
+    {
+      "expand": "discovered",
+      "kinds": ["pdf_statement", "trade_confirmation"],
+      "docType": "statement_or_confirmation",
+      "requireExhaustive": true
+    },
+    {
+      "expand": "activity-ranges",
+      "kind": "structured_api",
+      "docType": "activity_pull",
+      "periodStart": "<yyyy-mm-dd>",
+      "periodEnd": "<yyyy-mm-dd>"
+    }
+  ]
+}
+```
+
+`"expand": "discovered"` becomes one document pull per document `discover()`
+reported of the listed `kinds`, using the discovered document's own
+`periodEnd` as `docDate`. `DiscoveredDocument` (`adapter.ts`) names no
+account, so every such pull is filed institution-wide with a null document
+`account_id`, exactly like `"scope": "institution"` -- and the same rule
+follows from that: a document-tier pull's activity rows need their own
+`ParsedRow.accountExternalKey` to attribute to an account, or the pull is
+refused (see "scope": "institution" above) rather than silently imported
+unattributed. `"requireExhaustive": true` refuses the whole run before
+anything is acquired if `discover()`'s document listing came back
+incomplete, printing why, rather than silently importing a partial
+retention window.
+
+`"expand": "activity-ranges"` splits one caller-stated `periodStart`/
+`periodEnd` window on calendar-year boundaries into one institution-wide
+pull per year it touches, so a seven-year retention pull is one entry, not
+one per native range; each year's pull still lets the adapter pick whatever
+range it can actually serve. `docDate` is null for every generated pull, the
+same convention every other `structured_api`/`tabular_export` entry uses.
+
+`--commit-every N` (default 1) governs document-tier pulls only --
+`pdf_statement`/`trade_confirmation`, whether named directly or expanded
+from `"expand": "discovered"`. Thousands of documents in one atomic
+`publishImport` means one failure loses the whole session's import, while
+the raw tree keeps every capture regardless; committing one document pull
+at a time (the default) means a refused or failed document is reported
+(stderr) and skipped, and the run continues rather than losing every
+already-acquired document behind it. A `structured_api`/`tabular_export`
+pull, direct or from `"expand": "activity-ranges"`, always gets its own
+transaction and is never batched by this flag. Re-running the same
+selection later imports nothing new for a document already imported --
+raw-tree content addressing plus `documents.sha256` dedupe already give
+this; the summary reports it as "skipped (already imported)" rather than
+folding it into "deduplicated".
+
+The summary additionally reports documents discovered by kind (from
+`discover()`, independent of any selection entry), and document-tier pulls
+acquired, skipped as already imported, and failed, both overall and broken
+down per kind -- counts only, no external ids.
 
 `institutionId` is no
 longer named here either (F1-19): before `discover`, `main()` calls
