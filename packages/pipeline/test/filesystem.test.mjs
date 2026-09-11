@@ -6,6 +6,7 @@ import {
   link,
   mkdir,
   mkdtemp,
+  rm,
   symlink,
   writeFile,
 } from "node:fs/promises";
@@ -43,8 +44,16 @@ function config(root, journal, overrides = {}) {
   };
 }
 
+const createdBases = [];
+test.after(async () => {
+  await Promise.all(
+    createdBases.map((base) => rm(base, { recursive: true, force: true })),
+  );
+});
+
 async function setup() {
   const base = await mkdtemp(join(tmpdir(), "pipeline-fs-test-"));
+  createdBases.push(base);
   const root = join(base, "root");
   const journal = join(base, "journal");
   await mkdir(root, { mode: 0o700 });

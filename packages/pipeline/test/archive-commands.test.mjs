@@ -216,11 +216,19 @@ process.exit(2);
 `;
 }
 
+const createdBases = [];
+test.after(async () => {
+  await Promise.all(
+    createdBases.map((base) => rm(base, { recursive: true, force: true })),
+  );
+});
+
 async function setup(options = {}) {
   const parent = options.protectedRoot ? await protectedTestRoot() : tmpdir();
   const base = await realpath(
     await mkdtemp(join(parent, "pipeline-archive-test-")),
   );
+  createdBases.push(base);
   await chmod(base, 0o700);
   const tools = join(base, "tools");
   const sourceRoot = join(base, "source");
