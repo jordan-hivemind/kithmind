@@ -28,7 +28,6 @@ import test from "node:test";
 import {
   adapterPullToImportDocuments,
   createSyntheticSession,
-  openArchive,
   persistAcquiredDocument,
   readCaptureManifest,
   resolveRawTreeRoot,
@@ -42,7 +41,7 @@ import {
   writeRawDocument,
 } from "../dist/index.js";
 
-import { archive as pgArchive, skip } from "./helpers/pgArchive.mjs";
+import { archive as pgArchive, count, skip } from "./helpers/pgArchive.mjs";
 
 const INSTITUTION = {
   id: "inst_synthetic_f1_23",
@@ -55,31 +54,12 @@ const ACCOUNT = { id: "acct_synthetic_f1_23", last4: "0000" };
 // shared-root prefix this suite writes and reads through.
 const SPACE_ID = "space_synthetic_test";
 
-function archive(t) {
-  const directory = mkdtempSync(join(tmpdir(), "kith-finance-retention-db-"));
-  const db = openArchive(join(directory, "archive.db"));
-  t.after(() => {
-    db.close();
-    rmSync(directory, { recursive: true, force: true });
-  });
-  db.prepare("INSERT INTO institutions (id, name, slug) VALUES (?, ?, ?)").run(
-    INSTITUTION.id,
-    INSTITUTION.name,
-    INSTITUTION.slug,
-  );
-  db.prepare(
-    `INSERT INTO accounts (id, institution_id, acct_last4, display_name, base_currency)
-     VALUES (?, ?, ?, ?, ?)`,
-  ).run(ACCOUNT.id, INSTITUTION.id, ACCOUNT.last4, "Synthetic account", "USD");
-  return db;
-}
-
 /**
- * The Postgres half. `persistAcquiredDocument` is still on a SQLite handle
- * (F1-24 owns that path and is changing it concurrently), while
- * `adapterPullToImportDocuments` is on the archive client, so the one test
- * below that spans both seams holds both. It collapses to one handle when
- * F1-24 lands.
+ * A seeded Postgres archive. `persistAcquiredDocument` (F1-18) writes to the
+ * raw tree only and needs no database at all (F1-33); the one archive
+ * client here is what `adapterPullToImportDocuments` writes to, including
+ * the `retention_dropped_fields` review item a dropped undeclared field
+ * opens.
  */
 async function pgSeeded(t) {
   const client = await pgArchive(t);
@@ -160,15 +140,16 @@ test("the provider fixture really does echo credential-shaped material, so the l
 });
 
 test("credential-shaped material a provider echoes back is absent from every byte written to the raw tree", async (t) => {
-  const db = archive(t);
   const root = rawRoot(t);
   const acquired = await acquireEchoedActivity(
     createSyntheticSession({ echoCredentialShapedFields: true }),
   );
 
-  const persisted = persistAcquiredDocument(db, root, {
+  const persisted = persistAcquiredDocument(root, {
     institutionId: INSTITUTION.id,
     accountId: ACCOUNT.id,
+    institutionSlug: INSTITUTION.slug,
+    accountLast4: ACCOUNT.last4,
     docType: "activity_pull",
     acquired,
   });
@@ -225,14 +206,15 @@ test("the business payload survives the projection intact: an echoed pull parses
 });
 
 test("the manifest records that a projection was applied, which declaration produced it, and what it dropped", async (t) => {
-  const db = archive(t);
   const root = rawRoot(t);
   const acquired = await acquireEchoedActivity(
     createSyntheticSession({ echoCredentialShapedFields: true }),
   );
-  const persisted = persistAcquiredDocument(db, root, {
+  const persisted = persistAcquiredDocument(root, {
     institutionId: INSTITUTION.id,
     accountId: ACCOUNT.id,
+    institutionSlug: INSTITUTION.slug,
+    accountLast4: ACCOUNT.last4,
     docType: "activity_pull",
     acquired,
   });
@@ -262,31 +244,52 @@ test("the manifest records that a projection was applied, which declaration prod
   );
 });
 
-test("a dropped undeclared field opens a review item: safe, but never silent", async (t) => {
-  const db = archive(t);
+// F1-33: the retention_dropped_fields review item moved from a direct
+// SQLite write inside persistAcquiredDocument to adapterPullToImportDocuments
+// (against the archive client), alongside the unverified_pagination_total
+// review item it already opens for the same pull. These two tests now need
+// Postgres to observe it.
+
+test("a dropped undeclared field opens a review item: safe, but never silent", { skip }, async (t) => {
+  const client = await pgSeeded(t);
   const root = rawRoot(t);
   const acquired = await acquireEchoedActivity(
     createSyntheticSession({ echoCredentialShapedFields: true }),
   );
-  persistAcquiredDocument(db, root, {
+  const { activity: rows } = await syntheticAdapter.parse({
+    kind: "structured_api",
+    bytes: acquired.bytes,
+  });
+  const persisted = persistAcquiredDocument(root, {
     institutionId: INSTITUTION.id,
     accountId: ACCOUNT.id,
+    institutionSlug: INSTITUTION.slug,
+    accountLast4: ACCOUNT.last4,
     docType: "activity_pull",
     acquired,
   });
+  await adapterPullToImportDocuments(client, {
+    institutionId: INSTITUTION.id,
+    accountId: ACCOUNT.id,
+    acquired,
+    rows,
+    docType: "activity_pull",
+    docDate: null,
+    persisted,
+  });
 
-  const opened = db
-    .prepare(
-      "SELECT COUNT(*) AS n FROM review_items WHERE kind = 'retention_dropped_fields'",
-    )
-    .get().n;
-  assert.equal(opened, 1);
-
-  const leaked = db
-    .prepare(
-      "SELECT COUNT(*) AS n FROM review_items WHERE raw_value LIKE ? OR reason LIKE ?",
-    )
-    .get(`%${SYNTHETIC_LEAK_CANARY}%`, `%${SYNTHETIC_LEAK_CANARY}%`).n;
+  assert.equal(
+    await count(client, "review_items", "WHERE kind = $1", [
+      "retention_dropped_fields",
+    ]),
+    1,
+  );
+  const leaked = await count(
+    client,
+    "review_items",
+    "WHERE raw_value LIKE $1 OR reason LIKE $2",
+    [`%${SYNTHETIC_LEAK_CANARY}%`, `%${SYNTHETIC_LEAK_CANARY}%`],
+  );
   assert.equal(
     leaked,
     0,
@@ -294,30 +297,42 @@ test("a dropped undeclared field opens a review item: safe, but never silent", a
   );
 });
 
-test("a payload that matches its declaration exactly drops nothing and opens no review item", async (t) => {
-  const db = archive(t);
+test("a payload that matches its declaration exactly drops nothing and opens no review item", { skip }, async (t) => {
+  const client = await pgSeeded(t);
   const root = rawRoot(t);
   const acquired = await acquireEchoedActivity(createSyntheticSession());
   assert.deepEqual(acquired.retention.droppedPaths, []);
 
-  persistAcquiredDocument(db, root, {
+  const { activity: rows } = await syntheticAdapter.parse({
+    kind: "structured_api",
+    bytes: acquired.bytes,
+  });
+  const persisted = persistAcquiredDocument(root, {
     institutionId: INSTITUTION.id,
     accountId: ACCOUNT.id,
+    institutionSlug: INSTITUTION.slug,
+    accountLast4: ACCOUNT.last4,
     docType: "activity_pull",
     acquired,
   });
+  await adapterPullToImportDocuments(client, {
+    institutionId: INSTITUTION.id,
+    accountId: ACCOUNT.id,
+    acquired,
+    rows,
+    docType: "activity_pull",
+    docDate: null,
+    persisted,
+  });
   assert.equal(
-    db
-      .prepare(
-        "SELECT COUNT(*) AS n FROM review_items WHERE kind = 'retention_dropped_fields'",
-      )
-      .get().n,
+    await count(client, "review_items", "WHERE kind = $1", [
+      "retention_dropped_fields",
+    ]),
     0,
   );
 });
 
 test("an adapter that hashed the provider's response instead of the projection is refused, and nothing lands on disk", async (t) => {
-  const db = archive(t);
   const root = rawRoot(t);
   const acquired = await acquireEchoedActivity(
     createSyntheticSession({ echoCredentialShapedFields: true }),
@@ -334,9 +349,11 @@ test("an adapter that hashed the provider's response instead of the projection i
 
   assert.throws(
     () =>
-      persistAcquiredDocument(db, root, {
+      persistAcquiredDocument(root, {
         institutionId: INSTITUTION.id,
         accountId: ACCOUNT.id,
+        institutionSlug: INSTITUTION.slug,
+        accountLast4: ACCOUNT.last4,
         docType: "activity_pull",
         acquired: {
           bytes: responseBytes,
@@ -418,7 +435,6 @@ test("a structured_api payload may not declare itself opaque: the tier that echo
 });
 
 test("a PDF-tier artifact is retained whole and says so, so no reader mistakes it for a filtered payload", async (t) => {
-  const db = archive(t);
   const root = rawRoot(t);
   const session = createSyntheticSession();
   const { documents } = await syntheticAdapter.discover(session);
@@ -431,9 +447,11 @@ test("a PDF-tier artifact is retained whole and says so, so no reader mistakes i
     externalId: statement.externalId,
   });
 
-  const persisted = persistAcquiredDocument(db, root, {
+  const persisted = persistAcquiredDocument(root, {
     institutionId: INSTITUTION.id,
     accountId: ACCOUNT.id,
+    institutionSlug: INSTITUTION.slug,
+    accountLast4: ACCOUNT.last4,
     docType: "pdf_statement",
     acquired,
   });
@@ -540,7 +558,6 @@ test("the projection is idempotent and preserves a provider's exact digits, so r
 });
 
 test("a projected pull still imports: the document rows the archive records cite the retained bytes", { skip }, async (t) => {
-  const db = archive(t);
   const client = await pgSeeded(t);
   const root = rawRoot(t);
   const acquired = await acquireEchoedActivity(
@@ -550,9 +567,11 @@ test("a projected pull still imports: the document rows the archive records cite
     kind: "structured_api",
     bytes: acquired.bytes,
   });
-  const persisted = persistAcquiredDocument(db, root, {
+  const persisted = persistAcquiredDocument(root, {
     institutionId: INSTITUTION.id,
     accountId: ACCOUNT.id,
+    institutionSlug: INSTITUTION.slug,
+    accountLast4: ACCOUNT.last4,
     docType: "activity_pull",
     acquired,
   });

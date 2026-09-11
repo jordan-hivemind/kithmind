@@ -16,10 +16,10 @@
 //    See ParsedRow.sourceDocument's doc comment for the reasoning.
 
 import { randomUUID } from "node:crypto";
-import type { DatabaseSync } from "node:sqlite";
 
 import type {
   AcquiredDocument,
+  DiscoveredAccount,
   ParsedBalance,
   ParsedHoldings,
   ParsedInstrument,
@@ -94,24 +94,6 @@ async function openReviewItem(
       fields.rawValue,
       fields.reason,
     ],
-  );
-}
-
-/**
- * The SQLite-handle counterpart, still used by the raw-tree persistence half
- * of this file below. F1-24 owns that half and is moving it in parallel; when
- * it lands on the archive client this function goes with it.
- */
-function insertReviewItem(db: DatabaseSync, fields: ReviewItemFields): void {
-  db.prepare(
-    `INSERT INTO review_items (id, kind, account_id, source_document_id, source_locator, raw_value, reason)
-     VALUES (?, ?, ?, NULL, NULL, ?, ?)`,
-  ).run(
-    randomUUID(),
-    fields.kind,
-    fields.accountId,
-    fields.rawValue,
-    fields.reason,
   );
 }
 
@@ -217,6 +199,52 @@ async function insertInstrument(
     [id, instrument.symbol, instrument.cusip, instrument.isin, instrument.name],
   );
   return id;
+}
+
+/**
+ * Upserts one `accounts` row per account an adapter's `discover()` reported,
+ * keyed on `accounts.external_key` (F1-32), and returns the id each
+ * `externalKey` resolved to so a selection file can name an account by the
+ * adapter's own opaque id instead of already knowing `accounts.id`. Matches
+ * `resolveInstrumentId`'s job for instruments: neither the adapter interface
+ * nor the importer owns turning an adapter-reported identity into a stable
+ * archive row on its own.
+ *
+ * `label` maps to `display_name` and `kind` to `account_type` -- the two
+ * columns with an honest one-to-one counterpart in `pgSchema.ts`.
+ * `DiscoveredAccount` carries no currency, so a newly discovered account's
+ * `base_currency` is left null rather than guessed (see the migration's own
+ * comment); every other `accounts` column stays whatever a human operator
+ * already set, since a repeat discovery only updates the three fields the
+ * adapter actually reports.
+ */
+export async function resolveDiscoveredAccounts(
+  client: ArchiveClient,
+  institutionId: string,
+  accounts: readonly DiscoveredAccount[],
+): Promise<ReadonlyMap<string, string>> {
+  const resolved = new Map<string, string>();
+  for (const account of accounts) {
+    const result = await client.query<{ id: string }>(
+      `INSERT INTO accounts (id, institution_id, external_key, acct_last4, display_name, account_type)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (institution_id, external_key) DO UPDATE
+         SET acct_last4 = EXCLUDED.acct_last4,
+             display_name = EXCLUDED.display_name,
+             account_type = EXCLUDED.account_type
+       RETURNING id`,
+      [
+        randomUUID(),
+        institutionId,
+        account.externalKey,
+        account.last4,
+        account.label,
+        account.kind,
+      ],
+    );
+    resolved.set(account.externalKey, result.rows[0]!.id);
+  }
+  return resolved;
 }
 
 async function parsedRowToImportRow(
@@ -450,6 +478,25 @@ async function collectDocuments(
   const liabilityGroups = groupBySourceDocument(holdings.liabilities);
   const reportedRowCount = pull.acquired.manifest.reportedRowCount;
 
+  // F1-23, moved here from persistAcquiredDocument (F1-33): a provider field
+  // the adapter's retention declaration does not name is dropped, which is
+  // the safe outcome, but it is never a *silent* one. Opened once per pull,
+  // against the archive `review_items` reads, rather than the SQLite
+  // provenance file no reader of the archive ever consulted. Paths only,
+  // never values -- a leak report that quotes the leak is not a fix.
+  if (pull.acquired.retention.droppedPaths.length > 0) {
+    await openReviewItem(client, {
+      kind: "retention_dropped_fields",
+      accountId: pull.accountId,
+      rawValue: pull.acquired.retention.droppedPaths.join(" "),
+      reason:
+        `the retained projection of this document dropped ${pull.acquired.retention.droppedPaths.length} ` +
+        `undeclared source path(s) under policy ${JSON.stringify(pull.acquired.retention.policy.version)}; ` +
+        "the provider's payload carries fields the adapter does not declare -- confirm none of " +
+        "them is business data the archive should be retaining, then extend the declaration",
+    });
+  }
+
   if (activityGroups.size > 1) {
     if (reportedRowCount === null) {
       await openReviewItem(client, {
@@ -511,6 +558,7 @@ async function collectDocuments(
       retainedByteLength: pull.acquired.bytes.byteLength,
       mediaType: pull.acquired.manifest.mediaType,
       captureId: pull.persisted.captureId,
+      textPath: pull.persisted.textPath,
       institutionId: pull.institutionId,
       accountId: pull.accountId,
       docType: pull.docType,
@@ -547,11 +595,20 @@ async function collectDocuments(
 // *only* way to produce a `PersistedAcquisition`, which is in turn the only
 // way to fill in `AdapterPull.persisted` -- so a caller cannot build an
 // `AdapterPull` around an invented path, and cannot skip persisting bytes
-// that a document row then claims exist. Self-contained -- it only calls
-// into rawTree.ts (bytes) and captures.ts (acquisition provenance, F1-24)
-// and does its own small, targeted write to `documents.text_path` -- so it
-// does not touch `importer.ts`'s insert statement or any other function in
-// this file.
+// that a document row then claims exist.
+//
+// F1-33: this used to take a `node:sqlite` `DatabaseSync` handle, opened
+// purely to read `institutions.slug` and `accounts.acct_last4` for the
+// capture manifest -- a SQLite provenance file `run.ts` had to keep in sync
+// with the real archive (Postgres) by hand, and that nothing downstream ever
+// read. The caller already knows both values (an operator command reads them
+// from the same Postgres archive it is about to import into; a test already
+// has its own fixture), so they are plain fields on `AcquisitionDescriptor`
+// now and this function touches no database at all: it only calls into
+// rawTree.ts (bytes) and captures.ts (acquisition provenance, F1-24). The
+// retention_dropped_fields review item it used to write straight to that
+// same SQLite file moved to `collectDocuments` below, which already opens
+// `review_items` against the archive client for the same pull.
 
 /** Everything needed to persist one acquired document and the capture that
  * produced it: enough for the raw tree's capture manifest (captures.ts) to
@@ -560,6 +617,13 @@ async function collectDocuments(
 export type AcquisitionDescriptor = {
   readonly institutionId: string;
   readonly accountId: string;
+  /** The institution's `institutions.slug`, for the capture manifest path
+   * (see rawTree.ts's "Raw tree" layout) and its own field. The caller's own
+   * lookup, not this function's: see the file header. */
+  readonly institutionSlug: string;
+  /** The account's `accounts.acct_last4`, or null for an account with none
+   * recorded. Same reasoning as `institutionSlug`. */
+  readonly accountLast4: string | null;
   readonly docType: string;
   readonly acquired: AcquiredDocument;
   /** Dot-prefixed (".pdf", ".csv"), when the source gave one. Recorded on
@@ -579,8 +643,8 @@ export type AcquisitionDescriptor = {
 };
 
 /** What `persistAcquiredDocument` wrote and where, for the caller to use as
- * `AdapterPull.persisted` and, after import, as the argument to
- * `recordRetainedTextPath`. */
+ * `AdapterPull.persisted` -- `textPath` ends up on `ImportDocument.textPath`,
+ * written on the same insert as the rest of a document's provenance. */
 export type PersistedAcquisition = {
   readonly filePath: string;
   readonly textPath: string | null;
@@ -619,29 +683,24 @@ export type PersistedAcquisition = {
  * F1-23: re-applies the adapter's declared retention projection before
  * anything is hashed or written, and records the resulting
  * `RetentionRecord` on the capture manifest so the retained file is never
- * presented as the untouched provider response. Undeclared source paths that
- * the projection dropped open a `review_items` entry rather than passing
- * unremarked.
+ * presented as the untouched provider response.
  *
  * Cross-checks the written sha256 against the adapter's own claimed
  * `acquired.manifest.contentHash`: an adapter that mis-hashed its own bytes
  * is exactly the kind of bug provenance exists to catch, not a reason to
  * store the bytes under a path some other code goes on to trust as if the
- * two hashes agreed. Institution and account are resolved from the database
- * by id -- both are foreign keys, so a valid id guarantees a real row exists
- * to read the institution's slug and the account's last four digits from,
- * rather than asking every caller to also pass and keep in sync values the
- * database already has authoritatively.
+ * two hashes agreed. Institution and account are named by the caller
+ * (`descriptor.institutionSlug`/`accountLast4`), not resolved from a
+ * database here -- see the file header (F1-33).
  */
 export function persistAcquiredDocument(
-  db: DatabaseSync,
   rawTreeRoot: string,
   descriptor: AcquisitionDescriptor,
   extractedText: string | null = null,
 ): PersistedAcquisition {
   const {
-    institutionId,
-    accountId,
+    institutionSlug,
+    accountLast4,
     docType,
     acquired,
     originalExtension = null,
@@ -679,30 +738,11 @@ export function persistAcquiredDocument(
     );
   }
 
-  const institution = db
-    .prepare("SELECT slug FROM institutions WHERE id = ?")
-    .get(institutionId) as { slug: string } | undefined;
-  if (!institution) {
-    throw new Error(
-      `no institutions row with id ${institutionId}; provision the institution before ` +
-        "persisting one of its documents",
-    );
-  }
-  const account = db
-    .prepare("SELECT acct_last4 FROM accounts WHERE id = ?")
-    .get(accountId) as { acct_last4: string | null } | undefined;
-  if (!account) {
-    throw new Error(
-      `no accounts row with id ${accountId}; provision the account before persisting one of ` +
-        "its documents",
-    );
-  }
-
   const captureWrite = writeCaptureManifest(rawTreeRoot, {
     captureId,
     documentSha256: documentWrite.sha256,
-    institutionSlug: institution.slug,
-    acctLast4: account.acct_last4,
+    institutionSlug,
+    acctLast4: accountLast4,
     docType,
     periodStart: acquired.manifest.periodStart,
     periodEnd: acquired.manifest.periodEnd,
@@ -712,23 +752,6 @@ export function persistAcquiredDocument(
     originalExtension,
     retention: acquired.retention,
   });
-
-  // A provider field the declaration does not name is dropped, which is the
-  // safe outcome, but it is never a *silent* one: the adapter's allowlist has
-  // fallen behind the provider's response and someone has to look. Paths
-  // only, never values -- a leak report that quotes the leak is not a fix.
-  if (acquired.retention.droppedPaths.length > 0) {
-    insertReviewItem(db, {
-      kind: "retention_dropped_fields",
-      accountId,
-      rawValue: acquired.retention.droppedPaths.join(" "),
-      reason:
-        `the retained projection of this document dropped ${acquired.retention.droppedPaths.length} ` +
-        `undeclared source path(s) under policy ${JSON.stringify(acquired.retention.policy.version)}; ` +
-        "the provider's payload carries fields the adapter does not declare -- confirm none of " +
-        "them is business data the archive should be retaining, then extend the declaration",
-    });
-  }
 
   const textWrite =
     extractedText === null
@@ -743,28 +766,4 @@ export function persistAcquiredDocument(
     textWrite,
     captureWrite,
   };
-}
-
-/**
- * Records the retained-text path on the `documents` row already imported for
- * `sha256` (the same content hash `persistAcquiredDocument` just verified),
- * so `get_evidence` can return it. A direct, targeted `UPDATE` rather than a
- * new field threaded through `ImportDocument`/`importBatch` -- importer.ts's
- * insert is out of this task's scope -- so this can run any time after the
- * matching `documents` row exists: immediately after import, or later, for a
- * document whose text is extracted after the fact.
- */
-export function recordRetainedTextPath(
-  db: DatabaseSync,
-  sha256: string,
-  textPath: string,
-): void {
-  const result = db
-    .prepare("UPDATE documents SET text_path = ? WHERE sha256 = ?")
-    .run(textPath, sha256);
-  if (result.changes === 0) {
-    throw new Error(
-      `no documents row with sha256 ${sha256}; import the document before recording its retained text path`,
-    );
-  }
 }

@@ -38,6 +38,7 @@ import {
 import {
   adapterPullToImportDocuments,
   persistAcquiredDocument,
+  resolveDiscoveredAccounts,
   type AdapterPull,
 } from "./adapterImport.js";
 import {
@@ -51,7 +52,6 @@ import {
   type ArchiveClient,
 } from "./pgStore.js";
 import { resolveRawTreeRoot } from "./rawTree.js";
-import { openArchive } from "./schema.js";
 
 // --- selection file ----------------------------------------------------
 
@@ -67,7 +67,16 @@ type AcquireSelectionInput =
     };
 
 type SelectionEntry = {
-  readonly accountId: string;
+  /** `accounts.id`, already provisioned. Mutually exclusive with
+   * `accountExternalKey`; exactly one names the account this pull is for. */
+  readonly accountId?: string;
+  /**
+   * An account by the adapter's own opaque id from `DiscoverResult.accounts`
+   * (F1-32) instead of the archive's `accounts.id` -- resolved after
+   * `discover()` runs, via `resolveDiscoveredAccounts`, so naming an account
+   * this way needs no separate provisioning step.
+   */
+  readonly accountExternalKey?: string;
   readonly docType: string;
   readonly docDate: string | null;
   readonly selection: AcquireSelectionInput;
@@ -102,8 +111,15 @@ function readSelectionFile(path: string): SelectionFile {
       throw new Error(`${path}: pulls[${index}] must be an object`);
     }
     const pull = entry as Record<string, unknown>;
-    if (typeof pull.accountId !== "string" || pull.accountId.length === 0) {
-      throw new Error(`${path}: pulls[${index}].accountId is required`);
+    const hasAccountId =
+      typeof pull.accountId === "string" && pull.accountId.length > 0;
+    const hasExternalKey =
+      typeof pull.accountExternalKey === "string" &&
+      pull.accountExternalKey.length > 0;
+    if (hasAccountId === hasExternalKey) {
+      throw new Error(
+        `${path}: pulls[${index}] must name its account with exactly one of "accountId" or "accountExternalKey"`,
+      );
     }
     if (typeof pull.docType !== "string" || pull.docType.length === 0) {
       throw new Error(`${path}: pulls[${index}].docType is required`);
@@ -167,16 +183,6 @@ async function loadSessionBuilder(path: string): Promise<SessionBuilder> {
     );
   }
   return build;
-}
-
-// --- env ------------------------------------------------------------------
-
-function requiredEnv(name: string, hint: string): string {
-  const value = process.env[name];
-  if (!value) {
-    throw new Error(`${name} is not set. ${hint}`);
-  }
-  return value;
 }
 
 // --- summary queries --------------------------------------------------
@@ -308,6 +314,67 @@ class DryRunAbort extends Error {
   }
 }
 
+/** `institutions.slug` for `institutionId`, read once per run -- `run.ts`'s
+ * own lookup now that `persistAcquiredDocument` no longer opens a database
+ * (F1-33). A missing row is a hard error naming what is missing, the same
+ * pattern every other required setting in this file uses. */
+async function resolveInstitutionSlug(
+  client: ArchiveClient,
+  institutionId: string,
+): Promise<string> {
+  const found = await client.query<{ slug: string }>(
+    "SELECT slug FROM institutions WHERE id = $1",
+    [institutionId],
+  );
+  const row = found.rows[0];
+  if (!row) {
+    throw new Error(
+      `no institutions row with id ${institutionId}; provision the institution before running`,
+    );
+  }
+  return row.slug;
+}
+
+/** `accounts.acct_last4` for `accountId`, cached per run since the same
+ * account is often named by several pulls. */
+async function resolveAccountLast4(
+  client: ArchiveClient,
+  accountId: string,
+  cache: Map<string, string | null>,
+): Promise<string | null> {
+  const cached = cache.get(accountId);
+  if (cached !== undefined) return cached;
+  const found = await client.query<{ acct_last4: string | null }>(
+    "SELECT acct_last4 FROM accounts WHERE id = $1",
+    [accountId],
+  );
+  const row = found.rows[0];
+  if (!row) {
+    throw new Error(
+      `no accounts row with id ${accountId}; provision the account before running`,
+    );
+  }
+  cache.set(accountId, row.acct_last4);
+  return row.acct_last4;
+}
+
+/** The account this pull names, by id directly or by the external key an
+ * earlier `resolveDiscoveredAccounts` call resolved (F1-32). Exactly one of
+ * the two is present -- `readSelectionFile` already enforced that. */
+function resolveEntryAccountId(
+  entry: SelectionEntry,
+  accountsByExternalKey: ReadonlyMap<string, string>,
+): string {
+  if (entry.accountId) return entry.accountId;
+  const id = accountsByExternalKey.get(entry.accountExternalKey!);
+  if (!id) {
+    throw new Error(
+      `no discovered account with external key ${entry.accountExternalKey}`,
+    );
+  }
+  return id;
+}
+
 function documentRowCount(document: ImportDocument): number {
   return (
     document.rows.length +
@@ -341,16 +408,9 @@ async function main(): Promise<void> {
   const buildSession = await loadSessionBuilder(values.session);
   const selectionFile = readSelectionFile(values.selection);
 
-  const dbPath = requiredEnv(
-    "FINANCE_ARCHIVE_DB_PATH",
-    "Point it at the local SQLite archive file that records raw-tree provenance " +
-      "(persistAcquiredDocument's institution/account lookups); that path is never " +
-      "committed and this command never defaults to one.",
-  );
   // Hard errors when unset -- FINANCE_ARCHIVE_RAW_TREE_ROOT, FINANCE_ARCHIVE_SPACE_ID.
   const rawTreeRoot = resolveRawTreeRoot();
 
-  const sqliteDb = openArchive(dbPath);
   // Hard error when FINANCE_ARCHIVE_DATABASE_URL is unset.
   const pgClient = createArchiveClient();
   await pgClient.connect();
@@ -358,21 +418,43 @@ async function main(): Promise<void> {
   try {
     const session = await buildSession();
     const discovered = await adapter.discover(session);
+    // F1-32: makes every account discover() reported resolvable by its own
+    // external key, so a selection can name one without a separate
+    // provisioning step.
+    const accountsByExternalKey = await resolveDiscoveredAccounts(
+      pgClient,
+      selectionFile.institutionId,
+      discovered.accounts,
+    );
+
+    const institutionSlug = await resolveInstitutionSlug(
+      pgClient,
+      selectionFile.institutionId,
+    );
+    const accountLast4Cache = new Map<string, string | null>();
 
     const pulls: AdapterPull[] = [];
     let bytesAcquired = 0;
     const manifestHashes: string[] = [];
 
     for (const entry of selectionFile.pulls) {
+      const accountId = resolveEntryAccountId(entry, accountsByExternalKey);
+      const accountLast4 = await resolveAccountLast4(
+        pgClient,
+        accountId,
+        accountLast4Cache,
+      );
       const selection = { ...entry.selection, session } as AcquireSelection;
       const acquired = await adapter.acquire(selection);
       const parsed = await adapter.parse({
         kind: entry.selection.kind,
         bytes: acquired.bytes,
       });
-      const persisted = persistAcquiredDocument(sqliteDb, rawTreeRoot, {
+      const persisted = persistAcquiredDocument(rawTreeRoot, {
         institutionId: selectionFile.institutionId,
-        accountId: entry.accountId,
+        accountId,
+        institutionSlug,
+        accountLast4,
         docType: entry.docType,
         acquired,
       });
@@ -380,7 +462,7 @@ async function main(): Promise<void> {
       manifestHashes.push(acquired.manifest.contentHash);
       pulls.push({
         institutionId: selectionFile.institutionId,
-        accountId: entry.accountId,
+        accountId,
         acquired,
         rows: parsed.activity,
         holdings: parsed.holdings,
@@ -390,7 +472,7 @@ async function main(): Promise<void> {
       });
     }
 
-    const accountIds = [...new Set(selectionFile.pulls.map((p) => p.accountId))];
+    const accountIds = [...new Set(pulls.map((p) => p.accountId))];
     // One digest standing for this run's whole acquisition manifest: the
     // sha256 of every acquired document's own content hash, sorted so the
     // digest does not depend on acquisition order.
@@ -453,7 +535,6 @@ async function main(): Promise<void> {
     printSummary(outcome, { dryRun, committed });
   } finally {
     await pgClient.end();
-    sqliteDb.close();
   }
 }
 

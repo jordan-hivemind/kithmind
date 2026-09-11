@@ -20,8 +20,11 @@ The read-only MCP server (F1-6) still reads a SQLite file, and its replacement
 `src/mcp` stay exactly as they were, along with the seventeen attack tests
 that are the specification the new read surface has to satisfy. The raw-tree
 writer (`src/rawTree.ts` and the persistence half of `src/adapterImport.ts`)
-also still takes a SQLite handle: F1-24 owns that path and is separating byte
-identity from capture provenance in it concurrently. Both are marked below.
+opens no database at all now (F1-33): the institution slug and account last4
+its capture manifest needs are plain fields the caller supplies (an operator
+command reads them from the same Postgres archive it is about to import
+into), so there is no second, SQLite-backed provenance file to keep in sync
+with Postgres by hand.
 
 The archive file, the raw document tree and the import logs live in a configured
 local directory outside this repository. No real account number, balance,
@@ -272,6 +275,17 @@ Its document inventory is a `Listing<T>`, built only through
 the provider's stated total) or `incompleteListing` (which carries why it
 stopped, and a `providerTotal` of `null` when the provider states no total at
 all, distinct from a stated total of `0`).
+
+`DiscoverResult.accounts` (F1-32) is every account the session can see:
+`{ externalKey, label, last4, kind }`, `kind` one of `brokerage`,
+`retirement`, `trust`, `bank`, `credit_line`, `mortgage` or `other`. This is
+what closes the side channel a real adapter would otherwise need:
+`persistAcquiredDocument` (see "Raw tree" below) needs an account id, and
+without `accounts` on the discover result an adapter would have no honest way
+to hand one back except a private, undocumented field of its own.
+`resolveDiscoveredAccounts` (`src/adapterImport.ts`) is the wiring layer that
+turns this list into `accounts` rows, the same job `resolveInstrumentId` does
+for instruments; see "Running an import" for how a selection file names one.
 
 `acquire` returns the **retained** bytes plus a manifest entry: period,
 capture time, the sha256 of those retained bytes, the row count the provider
@@ -656,12 +670,12 @@ through as `ImportRow.amountNote`; the importer opens a `review_items` entry
 for it exactly as it does for an amount `toMinorUnits` rejects, rather than
 letting it vanish.
 
-The persistence half of this file -- `persistAcquiredDocument` and
-`recordRetainedTextPath`, under "Raw tree" below -- still takes a
-`DatabaseSync`. F1-24 owns that path and is changing it concurrently, so F1-22
-left it alone rather than porting the same lines twice. Until it lands, a
-caller wiring an adapter end to end holds both handles, and
-`test/adapterImport.test.mjs` says so where it does.
+The persistence half of this file -- `persistAcquiredDocument`, under "Raw
+tree" below -- opens no database at all (F1-33): a caller wiring an adapter
+end to end (`src/run.ts`, `test/adapterImport.test.mjs`) needs only the one
+archive client, `ArchiveClient` from `pgStore.ts`, for everything in this
+file. `recordRetainedTextPath` is gone with it; see "Raw tree" for where its
+job went.
 
 ## Running an import
 
@@ -701,6 +715,16 @@ wants pulled this run:
         "periodStart": "<yyyy-mm-dd>",
         "periodEnd": "<yyyy-mm-dd>"
       }
+    },
+    {
+      "accountExternalKey": "<a DiscoveredAccount.externalKey from this adapter's discover()>",
+      "docType": "activity_pull",
+      "docDate": null,
+      "selection": {
+        "kind": "structured_api",
+        "periodStart": "<yyyy-mm-dd>",
+        "periodEnd": "<yyyy-mm-dd>"
+      }
     }
   ]
 }
@@ -708,17 +732,23 @@ wants pulled this run:
 
 A document-tier pull (`pdf_statement`, `trade_confirmation`) selects by
 `{ "kind": ..., "externalId": "<id from a prior discover() call>" }` instead
-of a period. Every `institutionId` and `accountId` named in the file must
-already exist -- in both the raw tree's SQLite provenance file and the
-Postgres archive -- before the run; provisioning an institution or account is
-out of this command's scope.
+of a period. Every pull names its account with exactly one of `accountId` or
+`accountExternalKey` -- never both, never neither. `accountId` is
+`accounts.id`, already provisioned. `accountExternalKey` (F1-32) is one of
+the adapter's own opaque ids from `DiscoverResult.accounts`, resolved to a
+real `accounts.id` by the run itself: the command calls
+`resolveDiscoveredAccounts` right after `discover()`, which upserts an
+`accounts` row per discovered account keyed on `external_key`, so naming an
+account this way needs no separate provisioning step. `institutionId` must
+still already exist in the Postgres archive before the run; provisioning the
+institution itself is out of this command's scope.
 
-The command runs `discover`, then `acquire`, `parse` and
-`persistAcquiredDocument` for each pull, then wires every pull to
-`ImportDocument`s with `adapterPullToImportDocuments` and hands the whole
-batch to `publishImport` -- import, both gates and publication as the one
-atomic step it already is. `--dry-run` runs the identical pass inside one
-Postgres transaction and always rolls it back, so nothing commits; the raw
+The command runs `discover`, resolves every discovered account, then
+`acquire`, `parse` and `persistAcquiredDocument` for each pull, then wires
+every pull to `ImportDocument`s with `adapterPullToImportDocuments` and hands
+the whole batch to `publishImport` -- import, both gates and publication as
+the one atomic step it already is. `--dry-run` runs the identical pass inside
+one Postgres transaction and always rolls it back, so nothing commits; the raw
 tree write still happens (content-addressed and idempotent, and structurally
 required to produce a valid pull -- see "Wiring an adapter to the importer"
 above), but "the database" a dry run never touches is the Postgres archive.
@@ -733,17 +763,23 @@ account identifier beyond the adapter's own opaque ids is ever printed.
 
 Every setting is the environment or a flag, with no default for any
 connection string or path, mirroring `src/mcp/run.ts`:
-`FINANCE_ARCHIVE_DATABASE_URL`, `FINANCE_ARCHIVE_RAW_TREE_ROOT`,
-`FINANCE_ARCHIVE_SPACE_ID`, and `FINANCE_ARCHIVE_DB_PATH` (the local SQLite
-file `persistAcquiredDocument` reads institution and account rows from --
-see "Raw tree" below). `FINANCE_ARCHIVE_SCHEMA` is optional, defaulting to
-`finance` as it does everywhere else in this package.
+`FINANCE_ARCHIVE_DATABASE_URL`, `FINANCE_ARCHIVE_RAW_TREE_ROOT` and
+`FINANCE_ARCHIVE_SPACE_ID`. `FINANCE_ARCHIVE_SCHEMA` is optional, defaulting
+to `finance` as it does everywhere else in this package. There is no
+`FINANCE_ARCHIVE_DB_PATH` (F1-33): the institution slug and account last4
+`persistAcquiredDocument` needs for the capture manifest are read from
+`FINANCE_ARCHIVE_DATABASE_URL`, the same archive the run imports into, so
+there is nothing else to configure or keep in sync.
 
 `test/run.test.mjs` runs the command against the synthetic adapter and a
 throwaway Postgres, the same way every other Postgres-backed suite does, and
 skips with the same message when `FINANCE_ARCHIVE_DATABASE_URL` is unset. It
 asserts the summary's shape, that nothing in it looks like a row, and that a
-second pass over the identical selection inserts nothing new.
+second pass over the identical selection inserts nothing new -- once for a
+selection naming its account by `accountId`, and again for one naming it by
+`accountExternalKey` (F1-32), where a second pass also asserts
+`resolveDiscoveredAccounts` upserts the same account row rather than minting
+a second one.
 
 ## Raw tree
 
@@ -814,28 +850,40 @@ general-purpose readback function, so a mismatch anywhere -- a bit flip, a
 truncated copy, a tampered file -- is a thrown error naming both hashes,
 never wrong bytes returned as if they were fine.
 
-`persistAcquiredDocument(db, rawTreeRoot, descriptor, extractedText?)`
+`persistAcquiredDocument(rawTreeRoot, descriptor, extractedText?)`
 (`src/adapterImport.ts`) is the call site: it writes an `AcquiredDocument`'s
 bytes, its capture manifest (`src/captures.ts`, see below), and, when
 supplied, its retained extracted text, and cross-checks the written sha256
 against the adapter's own `manifest.contentHash` -- an adapter that
 mis-hashed its own bytes is exactly the kind of bug provenance exists to
 catch. `descriptor` names the `institutionId`, `accountId` and `docType` a
-pull belongs to (both ids are foreign keys, so a valid one guarantees a real
-row to resolve the institution's slug and the account's last four digits
-from), plus an optional `captureId` (see below); its result is the _only_
+pull belongs to, plus `institutionSlug` and `accountLast4` for the capture
+manifest and an optional `captureId` (see below); its result is the _only_
 way to obtain an `AdapterPull.persisted` -- `AdapterPull` has no free-form
 `filePath` field a caller could invent -- so `documents.file_path`
 (`importBatch`, `src/importer.ts`) ends up pointing at a file that actually
 exists rather than a path no code ever created, structurally rather than by
 a caller remembering to persist first.
 
-`text_path` is populated after the fact, not threaded through
-`ImportDocument`/`importBatch` (out of this module's scope): once a
-document's raw bytes are imported and its text is written,
-`recordRetainedTextPath(db, sha256, textPath)` runs a targeted
-`UPDATE documents SET text_path = ... WHERE sha256 = ...`, so `get_evidence`
-can return a path to the retained text instead of null.
+F1-33: this function opens no database. It used to take a `node:sqlite`
+`DatabaseSync` handle purely to read `institutions.slug` and
+`accounts.acct_last4` -- a second, SQLite-backed provenance file an operator
+command (`src/run.ts`) had to provision and keep in sync with the real
+archive (Postgres) by hand, for two columns the caller already has a much
+better source for. `institutionSlug` and `accountLast4` are plain fields on
+`AcquisitionDescriptor` now: `run.ts` reads them from the same Postgres
+archive it is about to import into, and a test supplies its own fixture
+values directly.
+
+`text_path` is threaded through `ImportDocument`/`importBatch` like every
+other retained-provenance field (F1-33): `PersistedAcquisition.textPath`
+becomes `ImportDocument.textPath`, and lands on the same `INSERT` as the rest
+of a document's provenance, so `get_evidence` can return a path to the
+retained text instead of null with nothing to run after import. This
+replaces a separate `recordRetainedTextPath(db, sha256, textPath)` call that
+ran a targeted `UPDATE` against the SQLite provenance file above -- a file
+the Postgres importer never read, so the path it recorded never reached the
+archive `get_evidence` actually serves. `recordRetainedTextPath` is gone.
 
 ### Captures: separating byte identity from acquisition provenance (F1-24)
 
@@ -926,6 +974,7 @@ one, in order, inside the same transaction and lock, and records each one.
 | - | -------------------------------------- | ----------------------------------------------------------------------------- |
 | 1 | initial postgres archive schema        | Every table, domain and index below.                                           |
 | 2 | documents retained byte provenance     | `documents.retained_sha256`, `retained_byte_length`, `media_type`, `capture_id`. |
+| 3 | accounts external key                  | `accounts.external_key` (unique per institution), and `base_currency` becomes nullable. |
 
 Migration 2 (F1-29,
 [`docs/plans/2026-09-11-structured-evidence.md`](../../docs/plans/2026-09-11-structured-evidence.md))
@@ -943,6 +992,20 @@ one pull shares the same retained object. `media_type` is the adapter's own
 declaration on `AcquisitionManifestEntry`, never inferred from the capability
 tier -- a `pdf_statement` tier does not make the bytes a PDF, and the
 synthetic fixture's statement bytes are UTF-8 text.
+
+Migration 3 (F1-32) lets `resolveDiscoveredAccounts` (`src/adapterImport.ts`)
+upsert an `accounts` row per account an adapter's `discover()` reports,
+keyed on `external_key` and scoped `UNIQUE (institution_id, external_key)`
+so two institutions may reuse the same opaque key without colliding. No
+backfill: an account provisioned by hand before this migration has a `null`
+`external_key`, and Postgres never treats two `NULL`s as equal, so any number
+of hand-provisioned accounts with none coexist under the same institution.
+`base_currency` loses its `NOT NULL` in the same migration -- a
+`DiscoveredAccount` carries no currency, and a guessed default would be
+exactly the invented fact ground rule 5 forbids, so a newly discovered
+account is honestly of unknown base currency until an operator sets one; the
+only column that reads `base_currency`, `transactions.amount_base`, is
+already unpopulated in v1.
 
 ### Which schema, and why it is not `search_path`
 
@@ -1005,9 +1068,9 @@ cash verdict and a position verdict must stay distinguishable, or every query
 for unverified periods silently starts returning per-instrument rows.
 
 The connection string is read from `FINANCE_ARCHIVE_DATABASE_URL` and nowhere
-else, the same rule `FINANCE_ARCHIVE_DB_PATH` and
-`FINANCE_ARCHIVE_RAW_TREE_ROOT` already follow: a missing setting is a hard
-error that names what is missing, never a default and never a guess.
+else, the same rule `FINANCE_ARCHIVE_RAW_TREE_ROOT` already follows: a
+missing setting is a hard error that names what is missing, never a default
+and never a guess.
 
 ### Driver decoding is pinned per connection
 

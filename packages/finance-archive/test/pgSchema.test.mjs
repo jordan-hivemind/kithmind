@@ -341,8 +341,52 @@ test(
          VALUES ('doc-1', 'inst-1', 'activity_pull', DATE '2026-03-04', '/raw/doc-1', $1)`,
         [sha],
       );
+      // An account provisioned by hand before F1-32, on the columns v1
+      // actually had: base_currency was NOT NULL then, so a pre-migration
+      // account always states one.
+      await client.query(
+        "INSERT INTO accounts (id, institution_id, acct_last4, base_currency) VALUES ('acct-1', 'inst-1', '0042', 'USD')",
+      );
 
       assert.equal(await applyPgSchema(client, schema), PG_SCHEMA_VERSION);
+
+      // F1-32. No backfill, the same policy F1-29's columns above use: the
+      // pre-migration account honestly names no external key.
+      const migratedAccount = await client.query(
+        "SELECT external_key, base_currency FROM accounts WHERE id = 'acct-1'",
+      );
+      assert.deepEqual(migratedAccount.rows[0], {
+        external_key: null,
+        base_currency: "USD",
+      });
+
+      // The unique constraint is scoped per institution, and Postgres never
+      // treats two NULLs as equal: a second hand-provisioned account with no
+      // external key coexists with the first rather than colliding on it.
+      await client.query(
+        "INSERT INTO accounts (id, institution_id, acct_last4) VALUES ('acct-2', 'inst-1', '0043')",
+      );
+      // A discovered account can now state one, and no base_currency at all
+      // -- the column lost its NOT NULL in the same migration, since a
+      // DiscoveredAccount carries no currency.
+      await client.query(
+        "INSERT INTO accounts (id, institution_id, acct_last4, external_key) VALUES ('acct-3', 'inst-1', '0044', 'ext-1')",
+      );
+      // But the same institution cannot state the same external key twice.
+      await assert.rejects(
+        client.query(
+          "INSERT INTO accounts (id, institution_id, acct_last4, external_key) VALUES ('acct-4', 'inst-1', '0045', 'ext-1')",
+        ),
+        /accounts_external_key_unique/,
+      );
+      // A different institution reusing the same opaque external key is
+      // unrelated and not a collision.
+      await client.query(
+        "INSERT INTO institutions (id, name, slug) VALUES ('inst-2', 'Marrow Creek Trust', 'marrow-creek')",
+      );
+      await client.query(
+        "INSERT INTO accounts (id, institution_id, acct_last4, external_key) VALUES ('acct-5', 'inst-2', '0046', 'ext-1')",
+      );
 
       // The row is still there, unchanged, and the new columns are null: no
       // backfill, so a document imported before this migration honestly says

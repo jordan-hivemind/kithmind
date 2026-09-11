@@ -328,6 +328,30 @@ ALTER TABLE documents
       IN (0, 4));
 `;
 
+// F1-32. `resolveDiscoveredAccounts` (adapterImport.ts) upserts an
+// `accounts` row per account an adapter's `discover()` reports, keyed on
+// this column so a selection file can name an account by the adapter's own
+// opaque id instead of already knowing the archive's `accounts.id`. NULL for
+// every account provisioned by hand before this migration and for any
+// account no adapter has reported yet -- no backfill, the same honest-null
+// policy F1-29's retained-provenance columns use -- so the UNIQUE constraint
+// is scoped per institution rather than globally (two institutions may
+// reuse the same opaque key) and, because Postgres never treats two NULLs as
+// equal, does not collide on the many existing rows that have none.
+//
+// `base_currency` loses its NOT NULL for the same reason: an adapter's
+// `DiscoveredAccount` carries no currency, and a guessed default would be
+// exactly the kind of invented fact ground rule 5 exists to forbid. An
+// account discovered this way is honestly of unknown base currency until an
+// operator sets one; `amount_base`, the only column that reads it, is
+// already unpopulated in v1.
+const ACCOUNT_EXTERNAL_KEY = `
+ALTER TABLE accounts
+  ADD COLUMN external_key TEXT,
+  ALTER COLUMN base_currency DROP NOT NULL,
+  ADD CONSTRAINT accounts_external_key_unique UNIQUE (institution_id, external_key);
+`;
+
 /** Every migration, in order. The last one's version is the current schema. */
 export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
   {
@@ -339,6 +363,11 @@ export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
     version: 2,
     name: "documents retained byte provenance",
     sql: RETAINED_PROVENANCE,
+  },
+  {
+    version: 3,
+    name: "accounts external key",
+    sql: ACCOUNT_EXTERNAL_KEY,
   },
 ]);
 

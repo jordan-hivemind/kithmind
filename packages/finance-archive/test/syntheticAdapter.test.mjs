@@ -64,6 +64,30 @@ test("discover() returns an exhaustive document listing when the provider's coun
   assert.deepEqual(kinds, ["structured_api", "tabular_export"]);
 });
 
+test("discover() reports its fixture accounts, each with an external key a selection can name (F1-32)", async () => {
+  const result = await syntheticAdapter.discover(createSyntheticSession());
+  assert.ok(result.accounts.length > 0);
+  const keys = result.accounts.map((account) => account.externalKey);
+  assert.equal(new Set(keys).size, keys.length, "every external key is unique");
+  const kinds = new Set([
+    "brokerage",
+    "retirement",
+    "trust",
+    "bank",
+    "credit_line",
+    "mortgage",
+    "other",
+  ]);
+  for (const account of result.accounts) {
+    assert.equal(typeof account.externalKey, "string");
+    assert.ok(account.externalKey.length > 0);
+    assert.equal(typeof account.label, "string");
+    assert.ok(account.label.length > 0);
+    assert.match(account.last4, /^\d{4}$/);
+    assert.ok(kinds.has(account.kind), `unexpected kind ${account.kind}`);
+  }
+});
+
 test("discover() never claims completeness when the pull came up short of a stated total", async () => {
   const session = createSyntheticSession({ documentsLimit: 1 });
   const result = await syntheticAdapter.discover(session);
