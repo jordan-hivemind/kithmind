@@ -1017,6 +1017,17 @@ grammar above forbids in a source id, so it can never collide with a
 source's own directory. A directory walk for `*.json` skips it: the index
 entries carry no extension.
 
+That guarantee is a property of one filesystem, not of the tree's bytes, so
+it is the one thing a copy of the tree has to be deliberate about. A backup,
+a replication or a root relocation must either preserve the link or write a
+second copy of the same bytes; a tool that copies `captures/` without
+preserving hard links still produces a correct tree, but one that skips
+dot-prefixed entries, or that copies the index entry as an empty placeholder
+because it treated a link as a pointer, produces an index that names
+captures nothing can read. The check that matters after any copy is
+therefore per entry, not per directory: every `captures/.by-id/<captureId>`
+resolves to a readable capture manifest whose `captureId` is that same id.
+
 #### Source identity is opaque (F1-34)
 
 The capture path segment and the read contract's
