@@ -27,7 +27,6 @@ import {
   adapterPullToImportDocuments,
   createSyntheticSession,
   importBatch,
-  openArchive,
   persistAcquiredDocument,
   resolveRawTreeRoot,
   serveFinanceRead,
@@ -55,10 +54,16 @@ const SOURCES = {
   neverAcquired: "quiet-harbor",
 };
 
+/** The opaque source identity the read surface emits and filters on
+ * (F1-34): `institutions.id`, never the slug. */
+function sourceIdOf(slug) {
+  return `inst_${slug.replace(/-/g, "_")}`;
+}
+
 let documentCounter = 0;
 
 async function institution(client, slug, { accounts = 1 } = {}) {
-  const id = `inst_${slug.replace(/-/g, "_")}`;
+  const id = sourceIdOf(slug);
   await client.query(
     "INSERT INTO institutions (id, name, slug) VALUES ($1, $2, $3)",
     [id, `Synthetic ${slug}`, slug],
@@ -286,7 +291,7 @@ test("money crosses the wire as decimal strings and never crosses currencies", {
     operation: "aggregate_money",
     metric: "transaction_amount",
     groupBy: "currency",
-    sourceId: SOURCES.settled,
+    sourceId: sourceIdOf(SOURCES.settled),
     from: "2026-01-01",
     toExclusive: "2026-02-01",
   });
@@ -411,13 +416,13 @@ test("get_coverage keeps the three states apart", { skip }, async (t) => {
   const bySource = new Map(response.items.map((item) => [item.sourceId, item]));
 
   // 1. Reconciled, nothing open.
-  const settled = bySource.get(SOURCES.settled);
+  const settled = bySource.get(sourceIdOf(SOURCES.settled));
   assert.equal(settled.status, "complete");
   assert.deepEqual(settled.gaps, []);
   assert.equal(typeof settled.lastVerifiedAt, "number");
 
   // 2. An unreconciled period. Not complete, and not the same state as 3.
-  const unreconciled = bySource.get(SOURCES.unreconciled);
+  const unreconciled = bySource.get(sourceIdOf(SOURCES.unreconciled));
   assert.equal(unreconciled.status, "partial");
   assert.deepEqual(
     unreconciled.gaps.map((gap) => gap.code),
@@ -425,7 +430,7 @@ test("get_coverage keeps the three states apart", { skip }, async (t) => {
   );
 
   // 3. A period that passed but still has an open review item.
-  const underReview = bySource.get(SOURCES.underReview);
+  const underReview = bySource.get(sourceIdOf(SOURCES.underReview));
   assert.equal(underReview.status, "partial");
   assert.deepEqual(
     underReview.gaps.map((gap) => gap.code),
@@ -433,7 +438,7 @@ test("get_coverage keeps the three states apart", { skip }, async (t) => {
   );
 
   // 4. An account nothing was ever acquired for. Never "complete and empty".
-  const neverAcquired = bySource.get(SOURCES.neverAcquired);
+  const neverAcquired = bySource.get(sourceIdOf(SOURCES.neverAcquired));
   assert.equal(neverAcquired.status, "unknown");
   assert.deepEqual(
     neverAcquired.gaps.map((gap) => gap.code),
@@ -597,11 +602,7 @@ const PDF_TIER = "text/plain; charset=utf-8";
  */
 async function importedPull(t) {
   const directory = mkdtempSync(join(tmpdir(), "kith-finance-read-"));
-  const db = openArchive(join(directory, "archive.db"));
-  t.after(() => {
-    db.close();
-    rmSync(directory, { recursive: true, force: true });
-  });
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
   const rawTreeRoot = resolveRawTreeRoot({
     FINANCE_ARCHIVE_RAW_TREE_ROOT: join(directory, "raw"),
     FINANCE_ARCHIVE_SPACE_ID: ADAPTER.spaceId,
@@ -612,21 +613,12 @@ async function importedPull(t) {
     "INSERT INTO institutions (id, name, slug) VALUES ($1, $2, $3)",
     [ADAPTER.institution.id, ADAPTER.institution.name, ADAPTER.institution.slug],
   );
-  db.prepare("INSERT INTO institutions (id, name, slug) VALUES (?, ?, ?)").run(
-    ADAPTER.institution.id,
-    ADAPTER.institution.name,
-    ADAPTER.institution.slug,
-  );
   for (const account of ADAPTER.accounts) {
     await client.query(
       `INSERT INTO accounts (id, institution_id, acct_last4, base_currency)
        VALUES ($1, $2, $3, 'USD')`,
       [account.id, ADAPTER.institution.id, account.last4],
     );
-    db.prepare(
-      `INSERT INTO accounts (id, institution_id, acct_last4, base_currency)
-       VALUES (?, ?, ?, ?)`,
-    ).run(account.id, ADAPTER.institution.id, account.last4, "USD");
   }
 
   const session = createSyntheticSession();
@@ -637,9 +629,12 @@ async function importedPull(t) {
       kind: selection.kind,
       bytes: acquired.bytes,
     });
-    const persisted = persistAcquiredDocument(db, rawTreeRoot, {
+    const persisted = persistAcquiredDocument(rawTreeRoot, {
       institutionId: ADAPTER.institution.id,
       accountId,
+      institutionSlug: ADAPTER.institution.slug,
+      accountLast4:
+        ADAPTER.accounts.find((account) => account.id === accountId)?.last4 ?? null,
       docType,
       acquired,
     });
@@ -810,7 +805,11 @@ test("a cited record resolves in the retained bytes it names", { skip }, async (
     assert.equal(item.evidence.length, 1);
     const [evidence] = item.evidence;
     assert.equal(evidence.evidenceId, `ev:${item.recordId}:amount`);
-    assert.equal(evidence.sourceObject.sourceId, ADAPTER.institution.slug);
+    assert.equal(
+    evidence.sourceObject.sourceId,
+    ADAPTER.institution.id,
+    "the cited source identity is the opaque institution id, not the slug (F1-34)",
+  );
     assert.equal(
       evidence.sourceObject.revisionId,
       `sha256-${evidence.sourceObject.retainedSha256}`,

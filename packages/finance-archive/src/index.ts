@@ -169,6 +169,9 @@ export {
 } from "./adapterImport.js";
 export {
   ARCHIVE_LAYOUT_VERSION,
+  ARCHIVE_SEGMENT,
+  assertArchiveSegment,
+  rawDocumentPath,
   readAndVerify,
   resolveArchiveSpaceId,
   resolveRawTreeRoot,
@@ -178,7 +181,9 @@ export {
   type RawTreeWriteResult,
 } from "./rawTree.js";
 export {
+  CAPTURE_MANIFEST_VERSION,
   CaptureConflictError,
+  CaptureIntegrityError,
   readCaptureManifest,
   writeCaptureManifest,
   type CaptureManifest,

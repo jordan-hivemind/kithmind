@@ -43,7 +43,11 @@
 
 import type pg from "pg";
 
-import { archiveSchemaOf, pinArchiveSchema } from "./pgStore.js";
+import {
+  archiveSchemaOf,
+  assertSchemaName,
+  pinArchiveSchema,
+} from "./pgStore.js";
 
 /** One versioned, additive step. Every step's version is recorded in
  * `schema_version`, so an existing archive applies only what it is missing. */
@@ -401,13 +405,18 @@ export async function pgSchemaVersion(
   client: pg.ClientBase,
   schema: string = archiveSchemaOf(client),
 ): Promise<number> {
+  // F1-34: the schema name is interpolated into SQL below, so it goes
+  // through the same validator every other entry point uses. A default
+  // argument is not a guarantee -- this one is public and takes a caller's
+  // string.
+  const name = assertSchemaName(schema);
   const present = await client.query<{ present: boolean }>(
     "SELECT to_regclass($1) IS NOT NULL AS present",
-    [`${schema}.schema_version`],
+    [`${name}.schema_version`],
   );
   if (!present.rows[0]?.present) return 0;
   const result = await client.query<{ version: string | null }>(
-    `SELECT max(version)::text AS version FROM ${schema}.schema_version`,
+    `SELECT max(version)::text AS version FROM ${name}.schema_version`,
   );
   return Number(result.rows[0]?.version ?? 0);
 }

@@ -92,7 +92,7 @@ export function archiveSchemaName(
   return assertSchemaName(env.FINANCE_ARCHIVE_SCHEMA ?? DEFAULT_ARCHIVE_SCHEMA);
 }
 
-function assertSchemaName(name: string): string {
+export function assertSchemaName(name: string): string {
   if (!SCHEMA_NAME.test(name)) {
     throw new Error(
       `${JSON.stringify(name)} is not a usable archive schema name; ` +

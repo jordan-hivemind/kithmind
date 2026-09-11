@@ -28,7 +28,11 @@ import type {
   ParsedRow,
 } from "./adapter.js";
 import { EMPTY_HOLDINGS, sha256Hex } from "./adapter.js";
-import { type CaptureWriteResult, writeCaptureManifest } from "./captures.js";
+import {
+  CAPTURE_MANIFEST_VERSION,
+  type CaptureWriteResult,
+  writeCaptureManifest,
+} from "./captures.js";
 import { canonicalizeDecimal } from "./decimal.js";
 import type {
   ImportBalance,
@@ -615,11 +619,14 @@ async function collectDocuments(
  * identify both without the archive database, on top of the acquired bytes
  * themselves. */
 export type AcquisitionDescriptor = {
+  /** The archive's `institutions.id`. Also the capture's opaque source
+   * identity: the path segment under `captures/` and the manifest's
+   * `sourceId` (F1-34, see captures.ts). */
   readonly institutionId: string;
   readonly accountId: string;
-  /** The institution's `institutions.slug`, for the capture manifest path
-   * (see rawTree.ts's "Raw tree" layout) and its own field. The caller's own
-   * lookup, not this function's: see the file header. */
+  /** The institution's `institutions.slug`, recorded on the capture manifest
+   * as metadata -- never a path segment (F1-34). The caller's own lookup,
+   * not this function's: see the file header. */
   readonly institutionSlug: string;
   /** The account's `accounts.acct_last4`, or null for an account with none
    * recorded. Same reasoning as `institutionSlug`. */
@@ -699,6 +706,7 @@ export function persistAcquiredDocument(
   extractedText: string | null = null,
 ): PersistedAcquisition {
   const {
+    institutionId,
     institutionSlug,
     accountLast4,
     docType,
@@ -739,7 +747,15 @@ export function persistAcquiredDocument(
   }
 
   const captureWrite = writeCaptureManifest(rawTreeRoot, {
+    version: CAPTURE_MANIFEST_VERSION,
     captureId,
+    // F1-34: the capture's source identity is the institution row id, the
+    // same opaque id the read contract's `sourceObject.sourceId` carries.
+    // The descriptor already names it, and `AdapterPull` carries the same
+    // `institutionId` onto the document rows, so there is no second value
+    // here to drift from it; the slug rides along inside the record as
+    // metadata rather than as the path segment.
+    sourceId: institutionId,
     documentSha256: documentWrite.sha256,
     institutionSlug,
     acctLast4: accountLast4,
