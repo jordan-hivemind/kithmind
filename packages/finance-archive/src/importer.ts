@@ -252,7 +252,24 @@ export type ImportSummary = {
   importRunId: string;
   filesSeen: number;
   rowsInserted: number;
+  /**
+   * F1-36. Every row that did not insert used to be reported as
+   * "deduplicated", which is only true of a provider id or row hash match
+   * (a genuine re-encounter of already-imported content, including the
+   * whole-document skip below). A row a source gave that this importer
+   * could not parse or trust (`rowsRefused`) is a different fact, and
+   * conflating the two is what let 1602 rows a bad date format sent to
+   * review get reported as 1602 duplicates. Kept for whatever still reads
+   * it; it is always `rowsDeduplicated + rowsRefused`.
+   */
   rowsSkipped: number;
+  /** A provider id or row hash matched an existing row -- content this
+   * importer has already stored, including a whole document skipped
+   * outright because it was already fully imported (see `importBatch`). */
+  rowsDeduplicated: number;
+  /** A review item was opened for the row instead of inserting it: an
+   * unparseable process date or `as_of`, not a duplicate. */
+  rowsRefused: number;
   reviewItemsOpened: number;
   /** Always 0 here; `publishImport` reports what the gates found. */
   reconciliationsPassed: number;
@@ -352,7 +369,8 @@ export async function importBatch(
 
   let filesSeen = 0;
   let rowsInserted = 0;
-  let rowsSkipped = 0;
+  let rowsDeduplicated = 0;
+  let rowsRefused = 0;
   let reviewItemsOpened = 0;
 
   async function openReview(
@@ -382,14 +400,14 @@ export async function importBatch(
     row: ImportRow,
     documentId: string,
     occurrences: Map<string, number>,
-  ): Promise<"inserted" | "skipped"> {
+  ): Promise<"inserted" | "deduplicated" | "refused"> {
     if (!ISO_DATE.test(row.processDate)) {
       await openReview(row.accountId, documentId, row.sourceLocator, {
         kind: "unparseable_process_date",
         rawValue: row.processDate,
         reason: "process date is not a valid ISO YYYY-MM-DD date",
       });
-      return "skipped";
+      return "refused";
     }
 
     const pending: ReviewCandidate[] = [];
@@ -477,7 +495,7 @@ export async function importBatch(
         // Same account, same stable id: a re-encounter of an already-imported
         // row, most often from an overlapping page in a paginated pull. This
         // is an authoritative identity match, not evidence, so no review item.
-        return "skipped";
+        return "deduplicated";
       }
       // ponytail: two distinct provider ids landing on the same content and
       // the same per-document occurrence ordinal, in two unrelated
@@ -511,7 +529,7 @@ export async function importBatch(
               `at ${existing.source_locator}; collapsed on content evidence, not a stable id`,
           });
         }
-        return "skipped";
+        return "deduplicated";
       }
     }
 
@@ -566,14 +584,14 @@ export async function importBatch(
     position: ImportPosition,
     accountId: string,
     documentId: string,
-  ): Promise<"inserted" | "skipped"> {
+  ): Promise<"inserted" | "refused"> {
     if (!ISO_DATE.test(position.asOf)) {
       await openReview(accountId, documentId, position.sourceLocator, {
         kind: "unparseable_as_of",
         rawValue: position.asOf,
         reason: "as_of is not a valid ISO YYYY-MM-DD date",
       });
-      return "skipped";
+      return "refused";
     }
 
     const pending: ReviewCandidate[] = [];
@@ -664,14 +682,14 @@ export async function importBatch(
     balance: ImportBalance,
     accountId: string,
     documentId: string,
-  ): Promise<"inserted" | "skipped"> {
+  ): Promise<"inserted" | "refused"> {
     if (!ISO_DATE.test(balance.asOf)) {
       await openReview(accountId, documentId, balance.sourceLocator, {
         kind: "unparseable_as_of",
         rawValue: balance.asOf,
         reason: "as_of is not a valid ISO YYYY-MM-DD date",
       });
-      return "skipped";
+      return "refused";
     }
 
     const pending: ReviewCandidate[] = [];
@@ -730,14 +748,14 @@ export async function importBatch(
     institutionId: string | null,
     accountId: string | null,
     documentId: string,
-  ): Promise<"inserted" | "skipped"> {
+  ): Promise<"inserted" | "refused"> {
     if (!ISO_DATE.test(liability.asOf)) {
       await openReview(accountId, documentId, liability.sourceLocator, {
         kind: "unparseable_as_of",
         rawValue: liability.asOf,
         reason: "as_of is not a valid ISO YYYY-MM-DD date",
       });
-      return "skipped";
+      return "refused";
     }
 
     const pending: ReviewCandidate[] = [];
@@ -811,12 +829,17 @@ export async function importBatch(
         // Ground rule 1: raw files are immutable. Byte-identical bytes that
         // already imported successfully contribute nothing new. Holdings
         // dedupe the same way (see ImportDocument's doc comment): there is
-        // no per-row key for them, only "which document stated this."
-        rowsSkipped +=
+        // no per-row key for them, only "which document stated this." A
+        // whole-document skip is a dedupe, not a refusal -- F1-36's
+        // `parsed_ok` fix below is what keeps this branch honest: it only
+        // ever fires for a document every one of whose rows actually
+        // imported or matched last time, never one this importer refused.
+        const skipped =
           document.rows.length +
           (document.positions?.length ?? 0) +
           (document.balances?.length ?? 0) +
           (document.liabilities?.length ?? 0);
+        rowsDeduplicated += skipped;
         continue;
       }
 
@@ -845,14 +868,33 @@ export async function importBatch(
       }
 
       // Fresh per document: the occurrence ordinal is scoped to one document
-      // in its own row order (see importRow).
+      // in its own row order (see importRow). F1-36: `documentRefused`
+      // tracks whether anything in this document was refused rather than
+      // inserted or deduplicated, which decides `parsed_ok` below -- a
+      // document is only "already fully imported" (safe to whole-document
+      // skip next time) if nothing in it was ever refused.
       const occurrences = new Map<string, number>();
+      let documentRefused = false;
       for (const row of document.rows) {
         const outcome = await importRow(row, documentId, occurrences);
         if (outcome === "inserted") rowsInserted += 1;
-        else rowsSkipped += 1;
+        else if (outcome === "deduplicated") rowsDeduplicated += 1;
+        else {
+          rowsRefused += 1;
+          documentRefused = true;
+        }
       }
 
+      // ponytail: a retried document (parsed_ok false, existing above) that
+      // mixes activity rows with holdings, and whose holdings already
+      // inserted cleanly on an earlier attempt that only a row refusal
+      // reopened, re-inserts those holdings here -- positions, balances and
+      // liabilities have no per-row identity to dedupe on (see
+      // ImportDocument's doc comment), only the whole-document skip this
+      // very fix had to stop trusting blindly. Narrow: it needs one document
+      // to carry both a refused activity row and already-successful
+      // holdings. Give holdings their own content hash (mirroring row_hash)
+      // if a real pull ever mixes the two this way.
       const positions = document.positions ?? [];
       const balances = document.balances ?? [];
       if (
@@ -871,7 +913,10 @@ export async function importBatch(
           documentId,
         );
         if (outcome === "inserted") rowsInserted += 1;
-        else rowsSkipped += 1;
+        else {
+          rowsRefused += 1;
+          documentRefused = true;
+        }
       }
       for (const balance of balances) {
         const outcome = await importBalance(
@@ -880,7 +925,10 @@ export async function importBatch(
           documentId,
         );
         if (outcome === "inserted") rowsInserted += 1;
-        else rowsSkipped += 1;
+        else {
+          rowsRefused += 1;
+          documentRefused = true;
+        }
       }
       for (const liability of document.liabilities ?? []) {
         const outcome = await importLiability(
@@ -890,17 +938,33 @@ export async function importBatch(
           documentId,
         );
         if (outcome === "inserted") rowsInserted += 1;
-        else rowsSkipped += 1;
+        else {
+          rowsRefused += 1;
+          documentRefused = true;
+        }
       }
 
-      await client.query(
-        "UPDATE documents SET parsed_ok = TRUE WHERE id = $1",
-        [documentId],
-      );
+      // F1-36. Previously always TRUE, which is what let a document every
+      // one of whose rows was refused (a bad date format on 1602 rows, say)
+      // get recorded as fully, successfully imported. The next run's
+      // whole-document skip above then trusted that lie and never looked at
+      // this document's rows again -- not even after the parser that
+      // produced them was fixed, because the document's sha256 (the raw
+      // file's bytes) does not change when only its parsing does. `FALSE`
+      // here leaves the document eligible for the whole-document skip only
+      // once nothing in it needs a second look; until then every rerun
+      // reprocesses it, and every row and holding in it is idempotent on
+      // its own (row_hash/provider_txn_id for rows; the skip itself for
+      // holdings, which only applies once this flips TRUE).
+      await client.query("UPDATE documents SET parsed_ok = $2 WHERE id = $1", [
+        documentId,
+        !documentRefused,
+      ]);
     }
 
     await assertInvariants(client);
 
+    const rowsSkipped = rowsDeduplicated + rowsRefused;
     await client.query(
       `INSERT INTO import_runs
          (id, started_at, finished_at, source, files_seen, rows_inserted,
@@ -923,6 +987,8 @@ export async function importBatch(
       filesSeen,
       rowsInserted,
       rowsSkipped,
+      rowsDeduplicated,
+      rowsRefused,
       reviewItemsOpened,
       reconciliationsPassed: 0,
       reconciliationsFailed: 0,

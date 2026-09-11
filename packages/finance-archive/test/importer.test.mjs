@@ -588,7 +588,9 @@ test(
       "reconciliationsFailed",
       "reconciliationsPassed",
       "reviewItemsOpened",
+      "rowsDeduplicated",
       "rowsInserted",
+      "rowsRefused",
       "rowsSkipped",
     ]);
     const runRow = await one(
@@ -917,5 +919,141 @@ test(
     assert.equal(snapshots[1].prev_as_of, "2026-01-31");
     assert.equal(snapshots[1].prev_quantity, "10");
     assert.equal(snapshots[1].quantity, "16");
+  },
+);
+
+// F1-36. Before this fix, every row that did not insert -- a genuine
+// duplicate and a row this importer refused alike -- was folded into one
+// "skipped" count, which is what let 1602 rows an unparseable date sent to
+// review get reported as 1602 *deduplicated* rows. `rowsDeduplicated` and
+// `rowsRefused` split that back apart; `rowsSkipped` stays their sum for
+// whatever already reads it.
+test(
+  "rowsDeduplicated and rowsRefused are counted separately, not folded into one honest-sounding but wrong number",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+    const rows = [
+      row({ sourceLocator: "row:1", providerTxnId: "ptx-1" }),
+      row({
+        sourceLocator: "row:2",
+        providerTxnId: "ptx-2",
+        description: "Synthetic transit fare",
+        amountText: "-3.25",
+      }),
+      row({ sourceLocator: "row:3", processDate: "not-a-date" }),
+      row({ sourceLocator: "row:4", processDate: "also-not-a-date" }),
+    ];
+    const batch = {
+      source: "synthetic-pull",
+      documents: [document("b1".padEnd(64, "0"), rows)],
+    };
+
+    const first = await importBatch(client, batch, NOW);
+    assert.equal(first.rowsInserted, 2);
+    assert.equal(first.rowsDeduplicated, 0);
+    assert.equal(first.rowsRefused, 2);
+    assert.equal(first.rowsSkipped, 2);
+
+    // A second pass over the identical batch: the two good rows are now
+    // duplicates (matched by provider id), the two bad rows are refused
+    // again (still unparseable) -- neither count should collapse into the
+    // other, and rowsInserted must stay 0 either way.
+    const second = await importBatch(client, batch, NOW);
+    assert.equal(second.rowsInserted, 0);
+    assert.equal(second.rowsDeduplicated, 2);
+    assert.equal(second.rowsRefused, 2);
+    assert.equal(second.rowsSkipped, 4);
+  },
+);
+
+// F1-36. The reported bug: a document every one of whose rows was refused
+// (an unparseable date format) got recorded as fully imported anyway, so a
+// rerun after fixing the parser skipped the whole document -- via the
+// documents.sha256/parsed_ok fast path -- and inserted nothing, forever.
+// The raw bytes (and therefore sha256) never change when only the parser
+// does, so nothing short of fixing parsed_ok itself could ever let this
+// document back in.
+test(
+  "a document whose rows were all refused is not recorded as imported, and re-parsing it inserts rows once the refusal is fixed",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+    const sha = "c2".padEnd(64, "0");
+    const badRows = [
+      row({ sourceLocator: "row:1", processDate: "not-a-date" }),
+      row({ sourceLocator: "row:2", processDate: "also-not-a-date" }),
+    ];
+
+    const first = await importBatch(
+      client,
+      { source: "synthetic-pull", documents: [document(sha, badRows)] },
+      NOW,
+    );
+    assert.equal(first.rowsInserted, 0);
+    assert.equal(first.rowsRefused, 2);
+
+    const stored = await one(
+      client,
+      "SELECT parsed_ok FROM documents WHERE sha256 = $1",
+      [sha],
+    );
+    assert.equal(
+      stored.parsed_ok,
+      false,
+      "a document that inserted nothing must not be recorded as successfully imported",
+    );
+
+    // Same raw bytes (same sha256, exactly what an unchanged file on disk
+    // produces), but the parser is now fixed: the rows it produces this time
+    // have valid dates. Before this fix, the whole-document skip above would
+    // have short-circuited this and inserted nothing at all.
+    const fixedRows = [
+      row({ sourceLocator: "row:1", providerTxnId: "ptx-1" }),
+      row({
+        sourceLocator: "row:2",
+        providerTxnId: "ptx-2",
+        description: "Synthetic transit fare",
+        amountText: "-3.25",
+      }),
+    ];
+    const second = await importBatch(
+      client,
+      { source: "synthetic-pull", documents: [document(sha, fixedRows)] },
+      NOW,
+    );
+    assert.equal(second.rowsInserted, 2);
+    assert.equal(await count(client, "transactions"), 2);
+
+    const stillOneDocument = await count(
+      client,
+      "documents",
+      "WHERE sha256 = $1",
+      [sha],
+    );
+    assert.equal(
+      stillOneDocument,
+      1,
+      "the retry reuses the existing document row rather than minting a second one",
+    );
+    const reparsed = await one(
+      client,
+      "SELECT parsed_ok FROM documents WHERE sha256 = $1",
+      [sha],
+    );
+    assert.equal(reparsed.parsed_ok, true);
+
+    // Now that every row imported cleanly, a third pass is the ordinary
+    // whole-document dedup fast path again.
+    const third = await importBatch(
+      client,
+      { source: "synthetic-pull", documents: [document(sha, fixedRows)] },
+      NOW,
+    );
+    assert.equal(third.rowsInserted, 0);
+    assert.equal(third.rowsDeduplicated, 2);
+    assert.equal(await count(client, "transactions"), 2);
   },
 );

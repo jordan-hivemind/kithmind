@@ -120,6 +120,7 @@ export {
   archiveDatabaseUrl,
   archiveSchemaName,
   archiveSchemaOf,
+  closeArchiveClient,
   createArchiveClient,
   createArchivePool,
   decodesAsText,

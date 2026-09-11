@@ -209,6 +209,10 @@ test(
     const inserted = Number(insertedMatch[1]);
     assert.ok(inserted > 0, "the paginated pull inserted rows");
     assert.match(firstOutput, /rows deduplicated: \d+/);
+    // F1-36: a row this importer refused (opened a review item for, never
+    // inserted) is a distinct line from a deduplicated row, not folded into
+    // it.
+    assert.match(firstOutput, /rows refused: \d+/);
     assert.match(firstOutput, /review items opened: \d+/);
     assert.match(firstOutput, /money by currency:/);
     assert.match(firstOutput, /cash reconciliation verdicts:/);

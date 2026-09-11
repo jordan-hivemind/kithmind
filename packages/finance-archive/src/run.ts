@@ -48,6 +48,7 @@ import {
   type ImportDocument,
 } from "./importer.js";
 import {
+  closeArchiveClient,
   createArchiveClient,
   withArchiveTransaction,
   type ArchiveClient,
@@ -293,6 +294,21 @@ async function fetchCashVerdicts(
   }));
 }
 
+/**
+ * How many `review_items` rows exist right now, inside the caller's own
+ * transaction. `openReviewItem` (adapterImport.ts) and `openReview`
+ * (importer.ts) both just INSERT -- neither counts across the two files it
+ * runs in -- so the only way to know how many a whole run opened, conversion
+ * included, is to diff this before and after (see the F1-36 comment in
+ * `main` below).
+ */
+async function countReviewItems(client: ArchiveClient): Promise<number> {
+  const result = await client.query<{ n: string }>(
+    "SELECT count(*)::text AS n FROM review_items",
+  );
+  return Number(result.rows[0]?.n ?? "0");
+}
+
 async function fetchPositionVerdicts(
   client: ArchiveClient,
   accountIds: readonly string[],
@@ -334,7 +350,12 @@ type RunOutcome = {
   readonly manifestSha256: string;
   readonly rowsParsed: number;
   readonly rowsInserted: number;
-  readonly rowsSkipped: number;
+  /** A provider id or row hash matched an existing row (importer.ts). */
+  readonly rowsDeduplicated: number;
+  /** A review item was opened for the row instead of inserting it. */
+  readonly rowsRefused: number;
+  /** Conversion (adapterImport.ts) plus publish (importer.ts) -- every
+   * review item this run opened, not only the publish-time ones. */
   readonly reviewItemsOpened: number;
   readonly currencySums: readonly CurrencySum[];
   readonly cashVerdicts: readonly CashVerdict[];
@@ -548,10 +569,22 @@ async function main(): Promise<void> {
     let committed = true;
     try {
       outcome = await withArchiveTransaction(pgClient, async (tx) => {
+        // F1-36: adapterPullToImportDocuments (adapterImport.ts) opens its
+        // own review items during conversion -- weak instrument matches,
+        // unknown account keys, undeclared activity types, an unverified
+        // pagination total -- before importBatch (via publishImport below)
+        // ever runs. Diffing the table's count around this loop is the only
+        // way to count those alongside publishSummary.reviewItemsOpened
+        // without adapterPullToImportDocuments returning its own count, which
+        // every one of its other callers (see test/adapterImport.test.mjs)
+        // already destructures as a plain ImportDocument[].
+        const reviewItemsBeforeConversion = await countReviewItems(tx);
         const documents: ImportDocument[] = [];
         for (const pull of pulls) {
           documents.push(...(await adapterPullToImportDocuments(tx, pull)));
         }
+        const conversionReviewItemsOpened =
+          (await countReviewItems(tx)) - reviewItemsBeforeConversion;
         const batch: ImportBatch = {
           source: adapter.institutionSlug,
           documents,
@@ -578,8 +611,10 @@ async function main(): Promise<void> {
           manifestSha256,
           rowsParsed,
           rowsInserted: publishSummary.rowsInserted,
-          rowsSkipped: publishSummary.rowsSkipped,
-          reviewItemsOpened: publishSummary.reviewItemsOpened,
+          rowsDeduplicated: publishSummary.rowsDeduplicated,
+          rowsRefused: publishSummary.rowsRefused,
+          reviewItemsOpened:
+            conversionReviewItemsOpened + publishSummary.reviewItemsOpened,
           currencySums,
           cashVerdicts,
           positionVerdicts,
@@ -598,7 +633,13 @@ async function main(): Promise<void> {
 
     printSummary(outcome, { dryRun, committed });
   } finally {
-    await pgClient.end();
+    // F1-36: never `pgClient.end()` directly here. A connection already
+    // torn down (by the server, or by the transaction error this `finally`
+    // exists to let through) can leave `end()` waiting on an event that
+    // already fired, which blocks this whole function -- and therefore the
+    // `main().catch()` below that prints the real error -- indefinitely.
+    // See closeArchiveClient's doc comment (pgStore.ts).
+    await closeArchiveClient(pgClient);
   }
 }
 
@@ -622,7 +663,8 @@ function printSummary(
   console.log(`acquisition manifest sha256: ${outcome.manifestSha256}`);
   console.log(`rows parsed: ${outcome.rowsParsed}`);
   console.log(`rows inserted: ${outcome.rowsInserted}`);
-  console.log(`rows deduplicated: ${outcome.rowsSkipped}`);
+  console.log(`rows deduplicated: ${outcome.rowsDeduplicated}`);
+  console.log(`rows refused: ${outcome.rowsRefused}`);
   console.log(`review items opened: ${outcome.reviewItemsOpened}`);
   console.log("money by currency:");
   for (const sum of outcome.currencySums) {

@@ -252,3 +252,52 @@ export async function withArchiveTransaction<T>(
     openTransactions.delete(client);
   }
 }
+
+/**
+ * Ends an archive connection the way a CLI's own `finally` block must: never
+ * hanging, whatever state the connection is actually in.
+ *
+ * node-postgres' own `client.end()` resolves once the connection emits its
+ * `end` event -- correct when the connection is still alive, but a
+ * connection the server already closed, or one an earlier query error tore
+ * down, does not reliably emit a second one. `end()` then waits forever, and
+ * because a caller's `finally` block is awaiting it, whatever the caller was
+ * about to do next -- print the real error, set an exit code -- never runs
+ * either. That is exactly what left a real run (F1-36) idle for 26 minutes
+ * with its actual transaction error never printed: the hang was silent, not
+ * loud, because it happened *inside* cleanup, after the interesting error
+ * had already been thrown and was simply waiting its turn.
+ *
+ * This races `client.end()` against `timeoutMs` instead of trusting it to
+ * always settle. A connection that closes normally resolves this almost
+ * immediately, same as calling `end()` directly; a connection already gone
+ * resolves it about as fast (node-postgres itself short-circuits `end()`
+ * once it has seen the connection's own `end`/`error` event); a connection
+ * that is neither is bounded rather than open-ended. Never rejects -- a
+ * failure or timeout during cleanup must not overwrite or delay whatever
+ * real error the caller is already propagating.
+ *
+ * Takes an `EndableClient` rather than `ArchiveClient`: `pg.ClientBase`'s own
+ * type declares no `end` (it belongs to `pg.Client`, which every concrete
+ * archive connection this package hands out actually is), and this function
+ * only ever needs the one method anyway.
+ */
+export type EndableClient = { end(): unknown };
+
+export async function closeArchiveClient(
+  client: EndableClient,
+  timeoutMs = 5_000,
+): Promise<void> {
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, timeoutMs);
+    Promise.resolve(client.end())
+      .catch(() => {
+        // A failure to close cleanly is not the caller's problem to
+        // surface; the connection is going away either way.
+      })
+      .finally(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+  });
+}
