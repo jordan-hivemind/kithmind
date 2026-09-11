@@ -132,3 +132,15 @@ server is responsible for choosing the latest eligible stored observation.
 - The package builds and tests independently without a database or personal data.
 - Store-specific adapters and the cross-store parity proof must use this contract
   before any production finance migration or publication switch.
+
+## Update 2026-09-11: a second evidence kind
+
+Evidence is now a union. `retained_text_span_v1` is unchanged.
+`structured_field_v1` cites one scalar datum inside retained JSON or delimited
+bytes, by JSON pointer or by row and column, with the exact retained token
+bound by value and hash. `RetainedSourceObject` is shared by both kinds and
+accepts `text/csv; charset=utf-8`. Every evidence list on a record, an issue,
+and the `get_evidence` response is now `FinanceEvidence[]`, so a consumer must
+discriminate on `kind` before reading a locator. See
+[`2026-09-11-structured-evidence.md`](2026-09-11-structured-evidence.md) for
+the type, the format rules, and the validator table.

@@ -27,6 +27,57 @@ const evidence = {
   },
 } as const;
 
+const jsonFieldEvidence = {
+  kind: "structured_field_v1",
+  evidenceId: "evidence-synthetic-002",
+  sourceObject: {
+    sourceId: "source-synthetic-001",
+    documentId: "document-synthetic-002",
+    revisionId: "revision-synthetic-002",
+    captureId: "capture-synthetic-002",
+    retainedSha256:
+      "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    retainedByteLength: 512,
+    mediaType: "application/json",
+  },
+  locator: {
+    format: "json_pointer_v1",
+    pointer: "/pages/0/items/0/marketValue",
+    rawValue: "210",
+    rawValueSha256:
+      "d29d53701d3c859e29e1b90028eec1ca8e2f29439198b6e036c60951fb458aa1",
+  },
+} as const;
+
+const delimitedFieldEvidence = {
+  kind: "structured_field_v1",
+  evidenceId: "evidence-synthetic-003",
+  sourceObject: {
+    sourceId: "source-synthetic-001",
+    documentId: "document-synthetic-003",
+    revisionId: "revision-synthetic-003",
+    captureId: "capture-synthetic-003",
+    retainedSha256:
+      "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    retainedByteLength: 256,
+    mediaType: "text/csv; charset=utf-8",
+  },
+  locator: {
+    format: "delimited_row_v1",
+    encoding: "utf-8",
+    delimiter: ",",
+    quote: "none",
+    headerRows: 1,
+    recordSeparator: "lf",
+    rowIndex: 0,
+    columnIndex: 3,
+    columnName: "total_value",
+    rawValue: "210",
+    rawValueSha256:
+      "d29d53701d3c859e29e1b90028eec1ca8e2f29439198b6e036c60951fb458aa1",
+  },
+} as const;
+
 const requestBase = {
   contractVersion: 1,
   spaceId: "space-synthetic-001",
@@ -94,7 +145,7 @@ export const syntheticFinanceReadExchanges = [
           price: { decimal: "20", currency: "USD" },
           marketValue: { decimal: "210", currency: "USD" },
           valuationBasis: "market_price",
-          evidence: [evidence],
+          evidence: [evidence, jsonFieldEvidence],
         },
       ],
     },
@@ -115,7 +166,7 @@ export const syntheticFinanceReadExchanges = [
           asOf: "2026-01-31",
           totalValue: { decimal: "210", currency: "USD" },
           cash: { decimal: "25", currency: "USD" },
-          evidence: [evidence],
+          evidence: [evidence, delimitedFieldEvidence],
         },
       ],
     },
@@ -181,3 +232,7 @@ export const syntheticFinanceReadExchanges = [
 ] as const;
 
 export const syntheticRetainedTextSpanEvidence = evidence;
+export const syntheticStructuredFieldEvidence = {
+  jsonPointer: jsonFieldEvidence,
+  delimitedRow: delimitedFieldEvidence,
+} as const;
