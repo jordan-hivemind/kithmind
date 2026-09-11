@@ -391,6 +391,16 @@ export default async function createMorganStanleySession(options = {}) {
     }
   }
 
+  // The documents bearer rides on the app's own Documents call, which lands
+  // a little after the first XHR headers. Give it up to twenty seconds; a
+  // session that never sees it still works for the activity tier, and the
+  // documents tier then fails by name as before.
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const keys = (await slotKeys().catch(() => [])).map((k) => k.toLowerCase());
+    if (keys.includes(AUTHORIZATION_HEADER)) break;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+
   async function fetchText(path, query = {}) {
     const request = resolveEndpoint(path, query);
     return evaluate(cdp, pageFetchExpression(origin, request));
