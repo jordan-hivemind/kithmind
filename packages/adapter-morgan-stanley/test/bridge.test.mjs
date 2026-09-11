@@ -11,6 +11,7 @@ import {
   buildDocumentsRequestBody,
   pageFetchExpression,
   resolveEndpoint,
+  evaluate,
 } from "../src/bridge.mjs";
 
 test("buildActivityRequestBody follows the captured request template exactly", () => {
@@ -118,8 +119,24 @@ test("the page fetch expression forwards the captured headers without ever readi
   assert.equal(/x-xsrf-token|x-device-footprint|authorization/i.test(expression), false);
 });
 
+test("document acquisition posts an empty body to the confirmed accountdocs/document path with the listing's documentId", () => {
+  const request = resolveEndpoint("/documents/DOC-STMT-0001::MS-ACCT-0001", {});
+  assert.equal(request.method, "POST");
+  // Confirmed live 2026-09-11: no download-path environment variable is
+  // read any more -- the documentId from the documents listing names the
+  // request directly.
+  assert.match(
+    request.url,
+    /^\/msoaz\/api\/acdsal\/accountdocs\/document\/DOC-STMT-0001\?RequestID=([0-9a-f]{4}-){7}[0-9a-f]{4}&SeqID=\d{4}$/,
+  );
+  assert.equal(request.body, "");
+  assert.equal(request.headers.Accept, "application/json, text/plain, */*");
+  assert.equal(request.needsAuthorization, true);
+  // A fresh RequestID/SeqID per call, same as the documents listing.
+  assert.notEqual(request.url, resolveEndpoint("/documents/DOC-STMT-0001::MS-ACCT-0001", {}).url);
+});
+
 test("the documents endpoints refuse by header name until the bearer is captured", () => {
-  process.env.MS_DOCUMENT_DOWNLOAD_PATH_PREFIX = "/synthetic/download/";
   for (const path of ["/documents", "/documents/STMT-2025-01::MS-ACCT-0001"]) {
     const request = resolveEndpoint(path, {});
     assert.equal(request.needsAuthorization, true);
@@ -140,4 +157,17 @@ test("neither builder ever emits a header, cookie or token field", () => {
   const documentsBody = buildDocumentsRequestBody({ docType: "ClientStatements" });
   assert.equal(forbidden.test(activityBody), false);
   assert.equal(forbidden.test(documentsBody), false);
+});
+
+test("the evaluate deadline rejects by name instead of hanging when the CDP reply never comes", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  // A page navigation mid-call drops the reply: this fake cdp never
+  // resolves or rejects its send(), the same shape as that failure.
+  const cdp = { send: () => new Promise(() => {}) };
+
+  const pending = evaluate(cdp, "1 + 1");
+  // Advance past EVALUATE_TIMEOUT_MS (90s) without a real wait.
+  t.mock.timers.tick(90_001);
+
+  await assert.rejects(pending, /page evaluation timed out after 90000ms/);
 });

@@ -154,11 +154,17 @@ export function resolveEndpoint(path, query) {
     };
   }
   if (path.startsWith("/documents/")) {
-    const [externalId] = path.slice("/documents/".length).split("::");
+    // Confirmed live 2026-09-11 from the app's own document service: a POST
+    // with an empty body to accountdocs/document/<documentId> answers with the
+    // PDF bytes directly (the app reads it as a blob). The id is the
+    // listing's documentId, which already names the account and date.
+    const [documentId] = path.slice("/documents/".length).split("::");
+    const { requestId, seqId } = randomUuidQueryIds();
     return {
-      method: "GET",
-      url: `${requiredEnv("MS_DOCUMENT_DOWNLOAD_PATH_PREFIX")}${encodeURIComponent(externalId)}`,
-      body: null,
+      method: "POST",
+      url: `/msoaz/api/acdsal/accountdocs/document/${encodeURIComponent(documentId)}?RequestID=${requestId}&SeqID=${seqId}`,
+      body: "",
+      headers: { Accept: "application/json, text/plain, */*" },
       needsAuthorization: true,
     };
   }
@@ -235,12 +241,26 @@ async function connectCdp(wsUrl) {
   };
 }
 
-async function evaluate(cdp, expression) {
-  const { result, exceptionDetails } = await cdp.send("Runtime.evaluate", {
-    expression,
-    awaitPromise: true,
-    returnByValue: true,
-  });
+const EVALUATE_TIMEOUT_MS = 90_000;
+
+// Exported for test/bridge.test.mjs only, to prove the deadline rejects by
+// name without a real CDP connection or a real 90-second wait (the test
+// drives it with a fake cdp and node:test's mock timers). Every other caller
+// still reaches it only through createMorganStanleySession, unchanged.
+export async function evaluate(cdp, expression) {
+  // A page navigation or reload mid-call drops the reply to a pending
+  // Runtime.evaluate, and without a deadline the operator command waits
+  // forever with nothing in flight (seen live 2026-09-11). Fail by name
+  // instead so the run counts the document as failed and moves on.
+  const { result, exceptionDetails } = await Promise.race([
+    cdp.send("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true }),
+    new Promise((_, reject) =>
+      setTimeout(
+        () => reject(new Error(`page evaluation timed out after ${EVALUATE_TIMEOUT_MS}ms: the tab may have navigated or the request never answered`)),
+        EVALUATE_TIMEOUT_MS,
+      ),
+    ),
+  ]);
   if (exceptionDetails) {
     throw new Error(exceptionDetails.text + " " + (result?.description ?? ""));
   }
@@ -383,6 +403,16 @@ export default async function createMorganStanleySession(options = {}) {
       }
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
+  }
+
+  // The documents bearer rides on the app's own Documents call, which lands
+  // a little after the first XHR headers. Give it up to twenty seconds; a
+  // session that never sees it still works for the activity tier, and the
+  // documents tier then fails by name as before.
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const keys = (await slotKeys().catch(() => [])).map((k) => k.toLowerCase());
+    if (keys.includes(AUTHORIZATION_HEADER)) break;
+    await new Promise((resolve) => setTimeout(resolve, 500));
   }
 
   async function fetchText(path, query = {}) {

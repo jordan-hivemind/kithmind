@@ -107,12 +107,22 @@ that stops early never reports exhaustive coverage. A unique count above the
 stated total is a defect and fails the acquisition rather than being rounded
 off.
 
+Each request also carries a `DateRangeType` -- `Last30Days`, `Last90Days`,
+`LastYear` or `YearToDate` -- chosen by `selectDateRangeType(periodStart,
+periodEnd)` for the smallest native range that covers the requested period: 30
+days or fewer, 90 days or fewer, entirely inside the prior calendar year
+(`LastYear`), or `YearToDate` otherwise. `LastYear` is this tier's equivalent
+of the documents tier's `Last12Months` overlap handling below, for windows
+that land in the year before this one.
+
 ## Documents listing
 
 The listing paginates at about fifty rows with no total shown on screen, and
-there is no "all time" value for `TimeFrame`, so this adapter queries one
-calendar year at a time for the seven most recent years
-(`documentTimeFrames()` in `src/adapter.mjs`) and combines the results.
+there is no "all time" value for `TimeFrame`. There is also no value that
+covers the current calendar year: the site refuses it outright (see "TimeFrame
+and the current year" below). So this adapter queries one `TimeFrame` at a
+time -- the six most recent prior calendar years, then `Last12Months`
+(`documentTimeFrames()` in `src/adapter.mjs`) -- and combines the results.
 
 Confirmed live 2026-09-11:
 
@@ -125,25 +135,48 @@ Confirmed live 2026-09-11:
    values: ["ClientStatements" | "TradeConfirmations"] }` and `{ filterName:
    "DocSubType", values: ["All"] }` -- and `sortBy` is `[{ fieldName:
    "DocDate", sortOrder: "DESC" }, { fieldName: "KeyAccountNo", sortOrder:
-   "DESC" }]`. `pageNum` paginates within one calendar year. `TimeFrame`
-   takes `Last30Days`, `Last90Days`, `Last12Months` or a calendar year as a
-   string; a caller wanting an explicit range instead sends `TimeFrame:
+   "DESC" }]`. `pageNum` paginates within one `TimeFrame`. `TimeFrame`
+   takes `Last30Days`, `Last90Days`, `Last12Months` or a prior calendar year
+   as a string; a caller wanting an explicit range instead sends `TimeFrame:
    "Custom"` alongside `startDate` and `endDate`.
 2. The response is `{ defaultDocumentList: [...], numFound: "<total, a
    string>" }`. Each item carries `documentGuid`, `documentId`,
    `documentTypeName`, `documentDisplayName`, `documentTitle`, `documentDate`
    (an ISO datetime), `documentLoadDate`, `documentSource`, `docFormat`,
    `byteLength`, `fileName`, `keyAccountNo`, `displayMultipleAccounts` and
-   `optionalAttributeList`. Within a year, if the response states a total,
-   this adapter paginates to that total; the totals for the seven years sum
-   to that document type's provider total.
-3. If any one year reports no total, that document type's whole pull stops
-   there and returns `incompleteListing(items, null, reason)` with whatever
-   years were already retrieved. The interface requires a provider-stated
-   number for exhaustive, and a count the pull arrived at on its own is not
-   the provider's.
+   `optionalAttributeList`. Within a `TimeFrame`, if the response states a
+   total, this adapter paginates to that total.
+3. If any one `TimeFrame` reports no total, that document type's whole pull
+   stops there and returns `incompleteListing(items, null, reason)` with
+   whatever `TimeFrame`s were already retrieved. The interface requires a
+   provider-stated number for exhaustive, and a count the pull arrived at on
+   its own is not the provider's.
 
-Absence is never concluded from a single page or a single year. A second,
+### TimeFrame and the current year
+
+The current calendar year is refused as a `TimeFrame` value (a 400); a prior
+calendar year is accepted as a string. `Last12Months` is what this adapter
+asks for instead, to cover the current year's documents, and it necessarily
+overlaps the most recent prior calendar year's own listing. Both listings can
+therefore return the same document; `documentTimeFrames()`'s pull merges them
+by `documentId` as it collects items, so a document is never counted or
+acquired twice. The provider total this adapter reports is the number of
+unique documents actually collected, once every `TimeFrame` has paged to its
+own stated total -- not the raw sum of the per-`TimeFrame` totals, which
+double-counts the overlap.
+
+The same overlap is why the two document types are listed one after another,
+not concurrently: the documents service answers a transient 400 ("Service
+Error") to a noticeable share of concurrent calls from one session (seen live
+2026-09-11). Each `/documents` call retries that one failure a few times with
+a short pause before giving up; anything else propagates immediately,
+unretried.
+
+The activity tier has its own, separate mapping for a prior-year window:
+`selectDateRangeType` returns `LastYear` when the requested period falls
+entirely inside the prior calendar year (see "Activity pagination" above).
+
+Absence is never concluded from a single page or a single `TimeFrame`. A second,
 independent check on statement coverage: statements are monthly, so per
 account the acquired period set must be a contiguous month sequence across
 the retention window. Any hole becomes a recorded gap rather than a silent
@@ -259,25 +292,32 @@ Also returned by `capabilities().quirks`.
   named `missing "<key>" array` error listing the response's actual
   top-level key names if the guess is wrong. Fix the constant, not a
   downstream caller.
-  - The per-document-download endpoint path is read from the environment with
-    no guessed default. An unset one throws a clear error rather than getting
-    a made-up URL.
+  - **Confirmed live 2026-09-11: the per-document download.** A `POST` with
+    an empty body to `accountdocs/document/<documentId>` (the listing's own
+    `documentId`, no separate lookup) returns the PDF bytes directly. No
+    environment variable names this path any more; it is hardcoded in
+    `src/bridge.mjs`'s `resolveEndpoint` alongside the accounts and
+    documents-list paths.
 - **The documents tier needs a bearer, captured page-side on one extra
-  click.** The documents endpoints require an `Authorization` header in
-  addition to the XSRF and footprint headers. `src/bridge.mjs`'s allowlist
-  (`WANTED_HEADERS`) carries its name as a third entry and the hook captures
-  its value the same way as the other two: written into the page-side slot,
-  read only by the page's own fetch, never over the debugging connection and
-  never logged. The app sets it only on its own documents calls, so the
-  Documents page has to have loaded once in the tab; until then those
-  endpoints throw naming the header. `discover()` still catches a documents
-  failure per document type and returns an `incompleteListing` with the
-  reason, so an activity-only bounded pull can proceed without it.
-- **A document download is verified to be a PDF.** The download path is
-  unconfirmed and a signed-out or mis-routed download answers with an HTML
-  login or error page at HTTP 200. `acquire()` checks the `%PDF` magic number
-  before retaining and refuses anything else by name, rather than archiving a
-  page that says nothing under a statement's content hash.
+  click, plus a short wait after reload.** The documents endpoints require an
+  `Authorization` header in addition to the XSRF and footprint headers.
+  `src/bridge.mjs`'s allowlist (`WANTED_HEADERS`) carries its name as a third
+  entry and the hook captures its value the same way as the other two:
+  written into the page-side slot, read only by the page's own fetch, never
+  over the debugging connection and never logged. The app sets it only on its
+  own documents calls, so the Documents page has to have loaded once in the
+  tab; until then those endpoints throw naming the header. Because that
+  bearer can land a little after the activity headers do, session creation
+  waits up to twenty seconds after reload for it before returning -- a
+  session that never sees it still works for the activity tier, and the
+  documents tier then fails by name as before. `discover()` still catches a
+  documents failure per document type and returns an `incompleteListing` with
+  the reason, so an activity-only bounded pull can proceed without it.
+- **A document download is verified to be a PDF.** A signed-out or
+  mis-routed download answers with an HTML login or error page at HTTP 200.
+  `acquire()` checks the `%PDF` magic number before retaining and refuses
+  anything else by name, rather than archiving a page that says nothing under
+  a statement's content hash.
 - **The accounts endpoint is confirmed but currently 403s.** A page-context
   fetch to it still returns 403 even with the captured XSRF header and a
   permissive `Accept` header, so `discover()` falls back on a 403/404 to
@@ -379,20 +419,22 @@ review items until it is reviewed against real rows:
 
 ## Environment
 
-`src/bridge.mjs` reads everything from the environment, with no defaults.
+`src/bridge.mjs` reads everything not yet confirmed from the environment, with
+no defaults.
 
-| Variable                           | Required for                                             | Confirmed?                                   |
-| ---------------------------------- | -------------------------------------------------------- | -------------------------------------------- |
-| `MS_CDP_HTTP_BASE`                 | Every session build, for example `http://127.0.0.1:9222` | Set at Chrome launch, see the runbook below. |
-| `MS_ORIGIN`                        | Every session build, the signed-in tab's origin          | Set by the operator.                         |
-| `MS_TABULAR_EXPORT_PATH`           | `tabular_export` acquisition                             | Confirmed endpoint: `POST /shell/handler/proxy/msomactivitysal/v1/generateexcel`. Set this to that path; the response is an Excel workbook, acquired opaque (see Capabilities above). |
-| `MS_DOCUMENT_DOWNLOAD_PATH_PREFIX` | `pdf_statement` and `trade_confirmation` acquisition     | Not confirmed.                               |
+| Variable                 | Required for                                             | Confirmed?                                   |
+| ------------------------- | -------------------------------------------------------- | -------------------------------------------- |
+| `MS_CDP_HTTP_BASE`         | Every session build, for example `http://127.0.0.1:9222` | Set at Chrome launch, see the runbook below. |
+| `MS_ORIGIN`                | Every session build, the signed-in tab's origin          | Set by the operator.                         |
+| `MS_TABULAR_EXPORT_PATH`   | `tabular_export` acquisition                             | Confirmed endpoint: `POST /shell/handler/proxy/msomactivitysal/v1/generateexcel`. Set this to that path; the response is an Excel workbook, acquired opaque (see Capabilities above). |
 
-The accounts and documents-list endpoint paths are confirmed and hardcoded in
-`src/bridge.mjs` (`GET /shell/handler/restproxy/financialsal/api/v1/accounts`
-and `POST /msoaz/api/acdsal/accountdocs/v2/searchItems`, no environment
-variable) -- see the accounts quirk above for why `discover()` still falls
-back off it today.
+The accounts, documents-list and per-document-download endpoint paths are all
+confirmed and hardcoded in `src/bridge.mjs` (`GET
+/shell/handler/restproxy/financialsal/api/v1/accounts`, `POST
+/msoaz/api/acdsal/accountdocs/v2/searchItems` and `POST
+/msoaz/api/acdsal/accountdocs/document/<documentId>`, no environment variable
+for any of the three) -- see the accounts quirk above for why `discover()`
+still falls back off the accounts endpoint today.
 
 `run.ts`, the operator command in `@repo/finance-archive`, additionally needs
 `FINANCE_ARCHIVE_DATABASE_URL`, `FINANCE_ARCHIVE_RAW_TREE_ROOT` and
@@ -409,10 +451,13 @@ A bounded first pull, in nine steps.
    `MS_CDP_HTTP_BASE` to that port and `MS_ORIGIN` to the site's origin.
 3. Sign in by hand in that window, completing MFA normally. Nothing here
    automates this step.
-4. Open the Activity tab for all accounts, then open the Documents page once.
-   The activity headers are captured on the reload; the documents bearer is
-   set only on the app's own documents calls, so that one extra click is what
-   captures it. Skip it and the documents tier alone reports incomplete.
+4. After signing in, open the Activity tab for all accounts, then open the
+   Documents page once. The activity headers are captured on the reload; the
+   documents bearer is set only on the app's own documents calls, so that one
+   extra click is what captures it. Session creation already waits up to
+   twenty seconds after reload for that bearer to appear, so step 5 does not
+   need to be delayed by hand -- but skip the click into Documents entirely
+   and the documents tier alone reports incomplete.
 5. Run discover, either `node dist/run.js --adapter src/adapter.mjs --session
 src/bridge.mjs --selection <selection file> --dry-run` against `run.ts`, or a
    small script calling `adapter.discover(session)` directly. It attaches to the
@@ -438,16 +483,24 @@ src/bridge.mjs --selection <selection file> --dry-run` against `run.ts`, or a
 pnpm --filter @repo/adapter-morgan-stanley test
 ```
 
-Runs `node --test test/*.test.mjs`: pagination to the provider total, overlap
-dedupe, per-row account attribution against the keys `discover()` reports, credential-shaped-field dropping asserted on the retained bytes,
-decimal-string exactness and sign resolution, review routing for ambiguous
-amounts and unreviewed activity values, exhaustive versus incomplete document
-listings, `json_pointer_v1` binding resolution against the retained bytes,
-PDF-tier rows carrying no binding, holdings extraction,
+Runs `node --test test/*.test.mjs`: pagination to the provider total, activity
+page-overlap dedupe, per-row account attribution against the keys
+`discover()` reports, credential-shaped-field dropping asserted on the
+retained bytes, decimal-string exactness and sign resolution, review routing
+for ambiguous amounts and unreviewed activity values, exhaustive versus
+incomplete document listings, `documentTimeFrames()`'s six-prior-years-plus-
+`Last12Months` window, the `Last12Months`/prior-year overlap merged once by
+`documentId` with the reported total as the unique count, the two document
+types pulled sequentially, the documents service's transient-400 retry (both
+recovering and exhausting its attempt budget), `selectDateRangeType`'s
+`LastYear` mapping, `json_pointer_v1` binding resolution against the retained
+bytes, PDF-tier rows carrying no binding, holdings extraction,
 `activityTaxonomy` agreeing with `ACTIVITY_SIGN_TABLE`, the documents request
 body and page-fetch expression (which forwards the captured headers without
-ever reading a value back out), a document download that answers with HTML
-being refused, and the PDF text extractor against a small generated PDF.
+ever reading a value back out), the confirmed per-document download request,
+a document download that answers with HTML being refused, the page-evaluate
+deadline rejecting by name, and the PDF text extractor against a small
+generated PDF.
 
 The bridge's CDP mechanism has its own proof in `spike/bridge-spike.mjs`. Run
 it with `node spike/bridge-spike.mjs`. It opens a local Chrome instance against
