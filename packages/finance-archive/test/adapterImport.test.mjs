@@ -12,6 +12,8 @@ import {
   resolveInstrumentId,
   resolveRawTreeRoot,
   retainPayload,
+  runPositionReconciliationGate,
+  runReconciliationGate,
   syntheticAdapter,
 } from "../dist/index.js";
 import { all, archive, count, one, skip } from "./helpers/pgArchive.mjs";
@@ -736,5 +738,303 @@ test(
       ]),
       2,
     );
+  },
+);
+
+// --- F1-19: activity taxonomy --------------------------------------------
+//
+// Two reconciliation gates depend on conventions nothing enforced and no
+// adapter author could discover except by failing a gate: the position gate
+// sums signed quantities (a disposal must be negative), and the cash gate
+// sums every non-null amount (a type that carries an amount but moves no
+// cash fails its period). ActivityTaxonomy (adapter.ts) makes both
+// conventions declared and checked at import, per activity-type string.
+
+/** A minimal, single-document tabular_export "acquisition" wrapping `rows`,
+ * built the same way the duplicate-rows test above does -- enough to
+ * exercise adapterPullToImportDocuments/importBatch with no real session or
+ * the synthetic adapter's own fixtures. `label` only needs to be unique
+ * enough to give each test its own content hash. */
+function buildTabularPull(label) {
+  const retained = retainPayload(
+    {
+      kind: "opaque",
+      version: "test-tabular-1",
+      note: "delimited text from a download control, no addressable fields",
+    },
+    new TextEncoder().encode(label),
+    "tabular_export",
+  );
+  return {
+    bytes: retained.bytes,
+    retention: retained.record,
+    manifest: {
+      kind: "tabular_export",
+      periodStart: "2025-01-01",
+      periodEnd: "2025-02-01",
+      capturedAt: "2025-02-01T00:00:00.000Z",
+      contentHash: retained.sha256,
+      mediaType: "text/csv; charset=utf-8",
+      reportedRowCount: null,
+      gaps: [],
+    },
+  };
+}
+
+/** A minimal, valid activity row for the taxonomy tests. Each test overrides
+ * only what it cares about. */
+function activityRow(overrides = {}) {
+  return {
+    sourceDocument: "tabular-export",
+    externalId: null,
+    tradeDate: null,
+    processDate: "2025-01-15",
+    settleDate: null,
+    datePrecision: "day",
+    activityType: "fee",
+    description: "Synthetic activity",
+    instrument: null,
+    quantity: null,
+    price: null,
+    amount: "-1.00",
+    amountNote: null,
+    currency: "USD",
+    runningBalance: null,
+    locators: { row: { source: "tabular_export", index: 0 } },
+    ...overrides,
+  };
+}
+
+async function insertBalance(client, id, asOf, cash) {
+  await client.query(
+    "INSERT INTO balances (id, account_id, as_of, cash, currency) VALUES ($1, $2, $3, $4, $5)",
+    [id, ACCOUNT.id, asOf, cash, "USD"],
+  );
+}
+
+test(
+  "F1-19: an undeclared activity type opens a review item and both gates count it exactly as before this taxonomy existed",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedPg(client);
+
+    const acquired = buildTabularPull("f1-19 undeclared activity type");
+    const rows = [activityRow({ activityType: "unknown_type", amount: "-50.00" })];
+
+    const documents = await adapterPullToImportDocuments(client, {
+      institutionId: INSTITUTION.id,
+      accountId: ACCOUNT.id,
+      acquired,
+      rows,
+      docType: "tabular_export",
+      docDate: "2025-02-01",
+      persisted: persist(t, acquired, "tabular_export"),
+      // Declares other types, but not "unknown_type".
+      activityTaxonomy: {
+        fee: { movesCash: true, movesQuantity: false, quantitySign: "none" },
+      },
+    });
+
+    const review = await all(
+      client,
+      "SELECT kind, account_id, raw_value, reason FROM review_items WHERE kind = $1",
+      ["undeclared_activity_type"],
+    );
+    assert.equal(review.length, 1);
+    assert.equal(review[0].account_id, ACCOUNT.id);
+    assert.equal(review[0].raw_value, "unknown_type");
+    assert.match(review[0].reason, /not declared/);
+
+    await importBatch(
+      client,
+      { source: INSTITUTION.slug, documents },
+      new Date("2025-05-01"),
+    );
+
+    // Conservative, not corrected: an undeclared type's amount is neither
+    // validated nor nulled, so it still counts toward the cash gate exactly
+    // as it always did.
+    const stored = await one(
+      client,
+      "SELECT amount::text AS amount FROM transactions WHERE account_id = $1",
+      [ACCOUNT.id],
+    );
+    // Canonical decimal form drops trailing fraction zeros (decimal.ts).
+    assert.equal(stored.amount, "-50");
+
+    await insertBalance(client, "bal_before", "2025-01-01", "1000.00");
+    await insertBalance(client, "bal_after", "2025-02-01", "950.00");
+    const cash = await runReconciliationGate(client);
+    assert.equal(cash.periodsChecked, 1);
+    assert.equal(
+      cash.passed,
+      1,
+      "the undeclared row's amount still balances the period",
+    );
+  },
+);
+
+test(
+  "F1-19: an amount on a type declared movesCash: false is nulled, reviewed, and excluded from the cash gate",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedPg(client);
+
+    const acquired = buildTabularPull("f1-19 cash on noncash activity");
+    const rows = [
+      activityRow({ activityType: "transfer_in_kind", amount: "100.00" }),
+    ];
+
+    const documents = await adapterPullToImportDocuments(client, {
+      institutionId: INSTITUTION.id,
+      accountId: ACCOUNT.id,
+      acquired,
+      rows,
+      docType: "tabular_export",
+      docDate: "2025-02-01",
+      persisted: persist(t, acquired, "tabular_export"),
+      activityTaxonomy: {
+        transfer_in_kind: {
+          movesCash: false,
+          movesQuantity: false,
+          quantitySign: "none",
+        },
+      },
+    });
+
+    const review = await all(
+      client,
+      "SELECT kind, raw_value, reason FROM review_items WHERE kind = $1",
+      ["cash_on_noncash_activity"],
+    );
+    assert.equal(review.length, 1);
+    assert.equal(review[0].raw_value, "100.00");
+    assert.match(review[0].reason, /movesCash: false/);
+
+    await importBatch(
+      client,
+      { source: INSTITUTION.slug, documents },
+      new Date("2025-05-01"),
+    );
+
+    // Never silently corrected: the amount is nulled, not dropped or fixed
+    // to whatever value would make the period balance.
+    const stored = await one(
+      client,
+      "SELECT amount FROM transactions WHERE account_id = $1",
+      [ACCOUNT.id],
+    );
+    assert.equal(stored.amount, null);
+
+    // Cash genuinely did not move -- securities moved in kind -- and the
+    // gate agrees, because the nulled amount is excluded from its sum
+    // instead of being counted as if cash had moved.
+    await insertBalance(client, "bal_before", "2025-01-01", "500.00");
+    await insertBalance(client, "bal_after", "2025-02-01", "500.00");
+    const cash = await runReconciliationGate(client);
+    assert.equal(cash.periodsChecked, 1);
+    assert.equal(cash.passed, 1);
+  },
+);
+
+test(
+  "F1-19: a quantity whose sign disagrees with its declared type is nulled, reviewed, and the position gate surfaces the resulting mismatch",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedPg(client);
+
+    const acquired = buildTabularPull("f1-19 wrong sign");
+    const rows = [
+      activityRow({
+        processDate: "2025-01-01",
+        activityType: "sell",
+        instrument: {
+          symbol: "ZINC",
+          cusip: null,
+          isin: null,
+          name: "Zinc Corp (synthetic)",
+        },
+        // Wrong: a "sell" is a disposal and must be negative. This is +5.
+        quantity: "5",
+        price: "100.00",
+        amount: "500.00",
+      }),
+    ];
+
+    const documents = await adapterPullToImportDocuments(client, {
+      institutionId: INSTITUTION.id,
+      accountId: ACCOUNT.id,
+      acquired,
+      rows,
+      docType: "tabular_export",
+      docDate: "2025-02-01",
+      persisted: persist(t, acquired, "tabular_export"),
+      activityTaxonomy: {
+        sell: { movesCash: true, movesQuantity: true, quantitySign: "negative" },
+      },
+    });
+
+    const review = await all(
+      client,
+      "SELECT kind, raw_value, reason FROM review_items WHERE kind = $1",
+      ["activity_sign_mismatch"],
+    );
+    assert.equal(review.length, 1);
+    assert.equal(review[0].raw_value, "5");
+    assert.match(review[0].reason, /quantitySign: negative/);
+
+    await importBatch(
+      client,
+      { source: INSTITUTION.slug, documents },
+      new Date("2025-05-01"),
+    );
+
+    // Never silently corrected: the quantity is nulled, not flipped to
+    // match the declared sign. The amount is untouched -- "sell" does move
+    // cash, and the sign mismatch is a quantity-only violation.
+    const stored = await one(
+      client,
+      "SELECT quantity, amount::text AS amount FROM transactions WHERE account_id = $1",
+      [ACCOUNT.id],
+    );
+    assert.equal(stored.quantity, null);
+    // Canonical decimal form drops trailing fraction zeros (decimal.ts).
+    assert.equal(stored.amount, "500");
+
+    const instrument = await one(
+      client,
+      "SELECT id FROM instruments WHERE symbol = $1",
+      ["ZINC"],
+    );
+
+    // The stated position fell by 5 shares, but with the quantity nulled
+    // there is no transaction left to explain it: under the gate's exact
+    // tolerance, that surfaces loudly as a failed period, never a silent
+    // pass that only worked because a wrongly-signed value happened to
+    // cancel out.
+    await client.query(
+      `INSERT INTO positions (id, account_id, as_of, instrument_id, quantity, currency)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      ["pos_before", ACCOUNT.id, "2025-01-01", instrument.id, "10", "USD"],
+    );
+    await client.query(
+      `INSERT INTO positions (id, account_id, as_of, instrument_id, quantity, currency)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      ["pos_after", ACCOUNT.id, "2025-02-01", instrument.id, "5", "USD"],
+    );
+    const positions = await runPositionReconciliationGate(client);
+    assert.equal(positions.periodsChecked, 1);
+    assert.equal(positions.failed, 1);
+
+    const [outcome] = await all(
+      client,
+      "SELECT status, delta::text AS delta FROM position_reconciliations WHERE account_id = $1",
+      [ACCOUNT.id],
+    );
+    assert.equal(outcome.status, "fail");
+    assert.equal(outcome.delta, "5");
   },
 );

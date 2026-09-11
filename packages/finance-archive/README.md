@@ -328,14 +328,33 @@ basis silently mixes marked securities with positions carried at cost.
 negative for a disposal, whatever the source calls the activity. A sale of
 ten shares is `"-10"`, not `"10"` with the sign carried on `amount` alone.
 The position gate replays these quantities against a stated position change,
-and the sign cannot be recovered downstream from `activityType`, which is
-free provider text with no taxonomy behind it.
+and the sign cannot be recovered downstream from `activityType` alone --
+that is free provider text -- so an adapter declares what each string it
+emits actually means in its `capabilities().activityTaxonomy` (see below).
 
 `capabilities` declares which of the four sources
 (`structured_api`, `tabular_export`, `pdf_statement`, `trade_confirmation`)
-an adapter actually implements, its retention window, and free-text quirks.
-An adapter declaring a subset honestly is the expected case, not an
-incomplete one.
+an adapter actually implements, its retention window, free-text quirks, and
+(F1-19) an `activityTaxonomy`: for every `ParsedRow.activityType` string this
+adapter emits, whether it moves cash, whether it moves a position's
+quantity, and (when it does) the required sign. Two of this package's
+gates depend on conventions that taxonomy makes explicit rather than merely
+hoped for -- the cash gate (`reconciliation.ts`) sums every non-null
+`amount`, so a type that carries an amount but moves no cash (an in-kind
+transfer) has to say so, or its rows are wrongly counted; the position gate
+sums signed quantities, so a disposal that is not declared `negative` reads
+as an acquisition. `adapterPullToImportDocuments` (`adapterImport.ts`)
+validates every parsed row against its declared type at import: a row whose
+sign disagrees, whose amount is non-null for a type declared to move no
+cash, or whose quantity is non-null for a type declared to move none, opens
+a `review_items` entry and is imported with the offending field nulled --
+never silently corrected, so the gate then surfaces the resulting mismatch
+loudly rather than passing on a value nobody actually stated. An activity
+type this adapter emits but does not key in `activityTaxonomy` is not
+rejected: `adapterImport.ts` opens an `undeclared_activity_type` review item
+and imports the row as-is, and both gates count it exactly as they did
+before this taxonomy existed. An adapter declaring a subset of the four
+sources honestly is the expected case, not an incomplete one.
 
 `src/adapters/syntheticTrust/` is the reference implementation: a wholly
 invented institution ("Thistlebrook Trust") implementing all four sources
@@ -704,7 +723,6 @@ wants pulled this run:
 
 ```json
 {
-  "institutionId": "<institutions.id, already provisioned>",
   "pulls": [
     {
       "accountId": "<accounts.id, already provisioned>",
@@ -739,9 +757,18 @@ the adapter's own opaque ids from `DiscoverResult.accounts`, resolved to a
 real `accounts.id` by the run itself: the command calls
 `resolveDiscoveredAccounts` right after `discover()`, which upserts an
 `accounts` row per discovered account keyed on `external_key`, so naming an
-account this way needs no separate provisioning step. `institutionId` must
-still already exist in the Postgres archive before the run; provisioning the
-institution itself is out of this command's scope.
+account this way needs no separate provisioning step. `institutionId` is no
+longer named here either (F1-19): before `discover`, `main()` calls
+`resolveInstitution` (`adapterImport.ts`), which upserts the `institutions`
+row from the adapter's own `capabilities()` (slug, name) and uses the id it
+resolves to for the rest of the run, so a first run against a fresh archive
+can start without an operator hand-provisioning either row first. A
+selection file may still name `institutionId`, for compatibility with an
+existing one; the run refuses outright if it disagrees with what
+`resolveInstitution` actually resolved to, rather than silently importing
+against a different institution than the file names. An `accountId` named
+directly must still already exist in the Postgres archive before the run;
+provisioning one that way is out of this command's scope.
 
 The command runs `discover`, resolves every discovered account, then
 `acquire`, `parse` and `persistAcquiredDocument` for each pull, then wires

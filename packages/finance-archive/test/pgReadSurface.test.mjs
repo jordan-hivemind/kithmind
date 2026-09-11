@@ -629,6 +629,9 @@ async function importedPull(t) {
       kind: selection.kind,
       bytes: acquired.bytes,
     });
+    // F1-33: persistAcquiredDocument opens no database; institution slug and
+    // account last4 are the same plain fixture values seeded into Postgres
+    // above, not read back from a SQLite provenance file.
     const persisted = persistAcquiredDocument(rawTreeRoot, {
       institutionId: ADAPTER.institution.id,
       accountId,
