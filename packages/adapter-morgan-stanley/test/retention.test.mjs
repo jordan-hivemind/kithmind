@@ -19,10 +19,24 @@ test("json_allowlist drops credential-shaped and person-shaped fields, never cop
   assert.equal(retainedText.includes("SessionToken"), false);
   assert.equal(retainedText.includes("DeviceFootprintEcho"), false);
   assert.equal(retainedText.includes("accountName"), false);
+  assert.equal(retainedText.includes("Birthday gift for Sample Person"), false);
+  assert.equal(retainedText.includes("4111-XXXX-XXXX-1234"), false);
 
   // The retained data everyone actually reads is still present.
   assert.equal(retainedText.includes("912796ZZ1"), true);
   assert.equal(retainedText.includes("TREASURY BILL PURCHASE"), true);
+
+  // FX fields, payDate and referenceNumber are retained for evidence and
+  // later use (README, "Retention"), even though parse() does not read them.
+  assert.equal(retainedText.includes("2025-03-05"), true); // payDate
+  assert.equal(retainedText.includes("REF-0001-000009"), true); // referenceNumber
+  assert.equal(retainedText.includes("fxCurrency"), true);
+  assert.equal(retainedText.includes("fxSourceCurrency"), true);
+  assert.equal(retainedText.includes("fxSourceAmount"), true);
+  assert.equal(retainedText.includes("fxLocalCurrency"), true);
+  assert.equal(retainedText.includes("fxLocalAmount"), true);
+  assert.equal(retainedText.includes("fxMarketRate"), true);
+  assert.equal(retainedText.includes("fxType"), true);
 
   assert.deepEqual(
     [...retained.record.droppedPaths].sort(),
@@ -30,9 +44,11 @@ test("json_allowlist drops credential-shaped and person-shaped fields, never cop
       "pages.*.Result.DeviceFootprintEcho",
       "pages.*.Result.SessionToken",
       "pages.*.Result.postedActivities.*.accountName",
+      "pages.*.Result.postedActivities.*.memo",
+      "pages.*.Result.postedActivities.*.cardNumber",
     ].sort(),
   );
-  assert.equal(retained.record.policy.version, "ms-activity-2");
+  assert.equal(retained.record.policy.version, "ms-activity-3");
 });
 
 test("a structured_api payload may never be retained opaque", () => {

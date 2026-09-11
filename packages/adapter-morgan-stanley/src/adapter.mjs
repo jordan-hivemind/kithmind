@@ -156,14 +156,16 @@ const ACTIVITY_TAXONOMY = {
 
 /**
  * Every path the parser actually reads from one activity page, plus the
- * fields review and dedupe need. `accountName` is deliberately excluded: it
- * can carry a person's name, and `keyAccount` already identifies the
- * account. `runningBalances` is confirmed as a scalar (a JSON number), so it
- * is retained directly.
+ * fields review and dedupe need, plus a small set of fields retained for
+ * evidence and later use but not yet parsed (README, "Retention"). Excluded
+ * fields -- `accountName`, `memo`, card/check identifiers, and every envelope
+ * field -- are listed with reasons in the README, not here: an allowlist is
+ * built up, never explained by what's missing from it. `runningBalances` is
+ * confirmed as a scalar (a JSON number), so it is retained directly.
  */
 const ACTIVITY_RETENTION = {
   kind: "json_allowlist",
-  version: "ms-activity-2",
+  version: "ms-activity-3",
   fields: [
     "pages.*.Result.postedActivityCount",
     `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.activityId`,
@@ -173,6 +175,7 @@ const ACTIVITY_RETENTION = {
     `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.activityDate`,
     `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.tradeDate`,
     `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.settlementDate`,
+    `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.payDate`,
     `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.keyAccount`,
     `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.activity`,
     `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.trnType`,
@@ -186,6 +189,14 @@ const ACTIVITY_RETENTION = {
     `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.symbol`,
     `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.cusip`,
     `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.checkNumber`,
+    `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.referenceNumber`,
+    `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.fxCurrency`,
+    `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.fxSourceCurrency`,
+    `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.fxSourceAmount`,
+    `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.fxLocalCurrency`,
+    `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.fxLocalAmount`,
+    `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.fxMarketRate`,
+    `pages.*.Result.${MS_ACTIVITY_ROWS_KEY}.*.fxType`,
   ],
 };
 
