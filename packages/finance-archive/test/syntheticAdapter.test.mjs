@@ -440,6 +440,62 @@ test("parse() on the structured API tier binds each row's amount to a JSON point
   }
 });
 
+test("parse() on the structured API tier binds by position, not by visit order, so an unrelated nested \"amount\" key elsewhere in the payload cannot shift a citation onto the wrong bytes", async () => {
+  // A page that carries a sibling object with its own "amount" key, placed
+  // before "items" in source order. A token list built by collecting every
+  // "amount" in reviver visit order and zipping it positionally against the
+  // (page, item) loop would consume this one first and cite every
+  // subsequent transaction's amount off by one -- the exact regression this
+  // test guards against.
+  const decoyPayload = {
+    pages: [
+      {
+        page: 1,
+        decoy: { amount: "DECOY-DO-NOT-CITE" },
+        items: [
+          {
+            externalId: "tx-decoy-0001",
+            date: "2025-01-06",
+            activityType: "buy",
+            description: "Buy FKE",
+            instrument: { symbol: "FKE", cusip: null, isin: null, name: "Fictional Kelp ETF" },
+            quantity: "5",
+            price: "50.00",
+            amount: "-250.00",
+            currency: "USD",
+          },
+          {
+            externalId: "tx-decoy-0002",
+            date: "2025-01-09",
+            activityType: "sell",
+            description: "Sell FKE",
+            instrument: { symbol: "FKE", cusip: null, isin: null, name: "Fictional Kelp ETF" },
+            quantity: "-5",
+            price: "51.00",
+            amount: "255.00",
+            currency: "USD",
+          },
+        ],
+      },
+    ],
+  };
+  const bytes = new TextEncoder().encode(JSON.stringify(decoyPayload));
+  const { activity: rows } = await syntheticAdapter.parse({ kind: "structured_api", bytes });
+  assert.equal(rows.length, 2);
+
+  for (const [i, row] of rows.entries()) {
+    const { binding } = row.locators.row;
+    assert.equal(binding.pointer, `/pages/0/items/${i}/amount`);
+    assert.notEqual(binding.rawValue, "DECOY-DO-NOT-CITE");
+    const resolved = resolveJsonPointer(bytes, binding.pointer);
+    assert.equal(resolved, binding.rawValue);
+  }
+  assert.equal(rows[0].amount, "-250.00");
+  assert.equal(rows[0].locators.row.binding.rawValue, "\"-250.00\"");
+  assert.equal(rows[1].amount, "255.00");
+  assert.equal(rows[1].locators.row.binding.rawValue, "\"255.00\"");
+});
+
 test("parse() on the tabular export tier binds each row's amount to a delimited row/column that resolves against the retained bytes, with physical row indices", async () => {
   const session = createSyntheticSession();
   const acquired = await syntheticAdapter.acquire({

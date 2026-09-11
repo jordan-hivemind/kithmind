@@ -526,25 +526,28 @@ async function acquire(selection: AcquireSelection): Promise<AcquiredDocument> {
 // --- parse -------------------------------------------------------------
 
 /**
- * Every "amount" field's exact JSON source token, in the order JSON.parse's
- * reviver visits it: pages[0].items[0], pages[0].items[1], ...,
- * pages[1].items[0], .... That is the same (page, item) order
- * parseStructuredApi already iterates in, so the two line up one-to-one.
- * `context.source` (Node 22+, already used by retention.ts) is defined only
- * for a revived primitive, which is what lets this collect just the "amount"
- * tokens without a custom scanner and without disturbing the plain-value
- * parse used for everything else.
+ * Parses `text` a second time with a reviver that replaces every primitive
+ * with its exact JSON source token (`context.source`, Node 22+, the same
+ * technique retention.ts's `rawPrimitiveReviver` uses). The result has the
+ * same shape as `JSON.parse(text)` -- same objects, same arrays, same key
+ * order -- except every leaf is the literal text that produced it instead of
+ * the decoded value, so a leaf can be read back out **by position**.
+ *
+ * This is deliberately not a scan that collects every "amount" token in
+ * visit order and zips it positionally against the (page, item) loop: that
+ * approach silently misaligns the moment any other "amount" key appears
+ * anywhere else in the payload, nested or not, and a misaligned binding
+ * cites the wrong bytes -- the exact failure this work exists to prevent.
+ * Reading `sourceTokens.pages[i].items[j].amount` instead ties each binding
+ * to the one token actually at that position, no matter what else the
+ * payload contains.
  */
-function readAmountSourceTokens(text: string): readonly string[] {
-  const tokens: string[] = [];
-  (JSON.parse as (text: string, reviver: unknown) => unknown)(
+function parseSourceTokens(text: string): unknown {
+  return (JSON.parse as (text: string, reviver: unknown) => unknown)(
     text,
-    (key: string, value: unknown, context?: { source?: string }) => {
-      if (key === "amount" && context?.source !== undefined) tokens.push(context.source);
-      return value;
-    },
+    (_key: string, value: unknown, context?: { source?: string }) =>
+      context?.source === undefined ? value : context.source,
   );
-  return tokens;
 }
 
 function parseStructuredApi(bytes: Uint8Array): readonly ParsedRow[] {
@@ -552,20 +555,22 @@ function parseStructuredApi(bytes: Uint8Array): readonly ParsedRow[] {
   const { pages } = JSON.parse(text) as {
     pages: ReadonlyArray<{ page: number; items: readonly ActivityRow[] }>;
   };
-  const amountTokens = readAmountSourceTokens(text);
+  const sourceTokens = parseSourceTokens(text) as {
+    pages?: ReadonlyArray<{ items?: ReadonlyArray<{ amount?: unknown }> }>;
+  };
   const rows: ParsedRow[] = [];
   let index = 0;
-  let tokenIndex = 0;
   for (const [pageArrayIndex, page] of pages.entries()) {
     // Each page is its own document for occurrence-ordinal purposes, even
     // though the whole pull was captured as one RawFile: see ParsedRow's
     // sourceDocument doc comment.
     const sourceDocument = `structured-api-page-${page.page}`;
     for (const [itemArrayIndex, item] of page.items.entries()) {
-      const rawValue = amountTokens[tokenIndex];
-      tokenIndex += 1;
-      if (rawValue === undefined) {
-        throw new Error("structured_api parse: missing amount source token");
+      const rawValue = sourceTokens.pages?.[pageArrayIndex]?.items?.[itemArrayIndex]?.amount;
+      if (typeof rawValue !== "string") {
+        throw new Error(
+          `structured_api parse: no amount source token at pages/${pageArrayIndex}/items/${itemArrayIndex}`,
+        );
       }
       // The pointer is built from array positions, not page.page: that
       // value is the provider's own page number, not a position in `pages`.
