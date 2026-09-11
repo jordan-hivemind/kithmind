@@ -21,7 +21,7 @@ test("parse reads the real header row, signs quantity by the same table as the A
   const acquired = await adapter.acquire({ ...SELECTION, session });
   const parsed = await adapter.parse({ kind: "tabular_export", bytes: acquired.bytes });
 
-  assert.equal(parsed.activity.length, 4);
+  assert.equal(parsed.activity.length, 5);
   assert.deepEqual(parsed.holdings, { positions: [], balances: [], liabilities: [] });
 
   const sell = parsed.activity.find((r) => r.activityType === "Sold");
@@ -47,4 +47,15 @@ test("no row's externalId is fabricated -- the export states no provider row id"
   const acquired = await adapter.acquire({ ...SELECTION, session });
   const parsed = await adapter.parse({ kind: "tabular_export", bytes: acquired.bytes });
   assert.ok(parsed.activity.every((r) => r.externalId === null));
+});
+
+test("the KeyAccount column attributes each row, not the account the selection named", async () => {
+  const session = createFixtureSession();
+  const acquired = await adapter.acquire({ ...SELECTION, session });
+  const parsed = await adapter.parse({ kind: "tabular_export", bytes: acquired.bytes });
+
+  const dividend = parsed.activity.find((r) => r.activityType === "Dividend Received");
+  assert.equal(dividend.accountExternalKey, "MS-ACCT-0003");
+  assert.ok(parsed.activity.every((r) => typeof r.accountExternalKey === "string"));
+  assert.equal(new Set(parsed.activity.map((r) => r.accountExternalKey)).size, 2);
 });

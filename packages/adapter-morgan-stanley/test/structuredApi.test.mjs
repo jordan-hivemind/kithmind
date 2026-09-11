@@ -151,3 +151,34 @@ test("a pull that captures more unique rows than the provider stated is a defect
     /activity pull defect: captured 2 unique row\(s\) but the provider stated postedActivityCount=1/,
   );
 });
+
+test("each row is attributed to its own account, so an institution-wide pull does not collapse", async () => {
+  const session = createFixtureSession();
+  const acquired = await adapter.acquire({ ...SELECTION, session });
+  const parsed = await adapter.parse({ kind: "structured_api", bytes: acquired.bytes });
+
+  // AccountInformation.Grouping is "All": one pull returns every account's
+  // rows, each naming its own. Without accountExternalKey every row here
+  // would import under whichever single account the selection named.
+  const dividend = parsed.activity.find((r) => r.activityType === "Dividend Received");
+  assert.equal(dividend.accountExternalKey, "MS-ACCT-0003");
+  const treasury = parsed.activity.find((r) => r.description.startsWith("TREASURY"));
+  assert.equal(treasury.accountExternalKey, "MS-ACCT-0001");
+  assert.equal(new Set(parsed.activity.map((r) => r.accountExternalKey)).size, 2);
+  assert.ok(parsed.activity.every((r) => typeof r.accountExternalKey === "string"));
+});
+
+test("every key a parsed row carries is one discover() reports, so it resolves downstream", async () => {
+  const session = createFixtureSession();
+  const { accounts } = await adapter.discover(session);
+  const acquired = await adapter.acquire({ ...SELECTION, session });
+  const parsed = await adapter.parse({ kind: "structured_api", bytes: acquired.bytes });
+
+  // adapterImport resolves accountExternalKey against the map run.ts builds
+  // from these same accounts. A key outside that set opens an
+  // unknown_account_key review item instead of importing.
+  const discovered = new Set(accounts.map((a) => a.externalKey));
+  for (const row of parsed.activity) {
+    assert.ok(discovered.has(row.accountExternalKey), `${row.accountExternalKey} is not a discovered account`);
+  }
+});

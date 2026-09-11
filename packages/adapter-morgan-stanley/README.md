@@ -175,6 +175,13 @@ small generated PDF.
 
 Also returned by `capabilities().quirks`.
 
+- **One pull spans every account.** The activity POST sends
+  `AccountInformation.Grouping: "All"`, and the tabular export carries a
+  `KeyAccount` column, so both tiers return rows for every account at once.
+  Each parsed row therefore sets `accountExternalKey` to its own account's
+  key, which is the same value `discover()` reports as
+  `DiscoveredAccount.externalKey`. Statement and confirmation rows set nothing:
+  each of those documents belongs to one account, which the pull already names.
 - The activity API carries no provider-issued row id. Page overlap is deduped
   downstream by occurrence ordinal within each page's `sourceDocument`, never
   by an `externalId`.
@@ -277,7 +284,7 @@ pnpm --filter @repo/adapter-morgan-stanley test
 ```
 
 Runs `node --test test/*.test.mjs`: pagination to the provider total, overlap
-dedupe, credential-shaped-field dropping asserted on the retained bytes,
+dedupe, per-row account attribution against the keys `discover()` reports, credential-shaped-field dropping asserted on the retained bytes,
 decimal-string exactness and sign resolution, review routing for ambiguous
 amounts and unreviewed activity values, exhaustive versus incomplete document
 listings, `json_pointer_v1` and `delimited_row_v1` binding resolution against

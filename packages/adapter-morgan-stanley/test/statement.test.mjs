@@ -95,3 +95,12 @@ test("acquire + parse round-trip a confirmation, which reports EMPTY_HOLDINGS", 
   assert.equal(parsed.activity.length, 1);
   assert.deepEqual(parsed.holdings, { positions: [], balances: [], liabilities: [] });
 });
+
+test("a statement row sets no accountExternalKey -- the document is one account's", () => {
+  const { activity } = parseStatementLines(STATEMENT_LINES, "pdf_statement");
+
+  assert.ok(activity.length > 0);
+  // Omitted, not empty: adapterImport treats undefined as "this pull's own
+  // account" and an unresolvable string as a review item.
+  assert.ok(activity.every((r) => r.accountExternalKey === undefined));
+});

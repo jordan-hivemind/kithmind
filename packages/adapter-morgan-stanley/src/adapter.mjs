@@ -231,6 +231,24 @@ function rowFingerprint(row) {
   ]);
 }
 
+/**
+ * The account a row belongs to, as `ParsedRow.accountExternalKey`. The
+ * activity POST sends `AccountInformation.Grouping: "All"`, and the tabular
+ * export carries an account column, so both tiers return rows for every
+ * account in one pull. Each row is attributed by its own key rather than by
+ * the pull's account.
+ *
+ * The value is the same `keyAccount` discover() reports as
+ * `DiscoveredAccount.externalKey`, so it resolves against the map run.ts
+ * builds. Anything that is not a non-empty string yields undefined, which
+ * means "this pull's own account" and is the behavior from before the field
+ * existed. Returning an empty string instead would open an
+ * `unknown_account_key` review item for a key the provider never sent.
+ */
+function rowAccountExternalKey(rawKeyAccount) {
+  return typeof rawKeyAccount === "string" && rawKeyAccount.length > 0 ? rawKeyAccount : undefined;
+}
+
 function mapAccountKind(rawType) {
   const t = String(rawType ?? "").toLowerCase();
   if (t.includes("ira") || t.includes("retirement")) return "retirement";
@@ -567,6 +585,7 @@ function parseStructuredApi(bytes) {
 
       rows.push({
         sourceDocument,
+        accountExternalKey: rowAccountExternalKey(item.keyAccount),
         // Documented quirk: the activity API carries no provider-issued
         // per-row id; overlap dedupe relies on occurrence ordinals instead.
         externalId: null,
@@ -614,7 +633,6 @@ function parseTabularExport(bytes) {
       line,
       ",",
     );
-    void keyAccount; // present in the export, not part of ParsedRow
     const binding = {
       format: "delimited_row_v1",
       encoding: "utf-8",
@@ -631,6 +649,7 @@ function parseTabularExport(bytes) {
     const rowLocator = { source: "tabular_export", index: rowIndex, binding };
     return {
       sourceDocument: "tabular-export",
+      accountExternalKey: rowAccountExternalKey(keyAccount),
       externalId: null,
       tradeDate: null,
       processDate: date,
@@ -672,6 +691,10 @@ function splitLiabilityFields(line) {
  * for the two API-shaped tiers. `kind` selects whether a "HOLDINGS" section
  * is meaningful; a trade confirmation never emits one and so always returns
  * EMPTY_HOLDINGS, honestly rather than by omission.
+ *
+ * No row here sets `accountExternalKey`. A statement and a confirmation are
+ * each one account's document, acquired by an externalId that already names
+ * that account, so the pull's own account is the right one.
  */
 export function parseStatementLines(text, kind) {
   const activity = [];

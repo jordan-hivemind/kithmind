@@ -1,16 +1,20 @@
-// Synthetic Morgan Stanley activity-API fixtures. Real field names (from the
-// private, gitignored institution notes: processDate, activityDate,
-// tradeDate, settlementDate, accountName, keyAccount, activity, description,
-// amount, quantity, price, symbol, cusip, checkNumber), entirely invented
-// values. No real account number, no person.
+// Synthetic Morgan Stanley activity-API fixtures. Real field names
+// (processDate, activityDate, tradeDate, settlementDate, accountName,
+// keyAccount, activity, description, amount, quantity, price, symbol, cusip,
+// checkNumber), entirely invented values. No real account number, no person.
 
 import { MS_ACTIVITY_ROWS_KEY } from "../src/adapter.mjs";
 
 const KEY_ACCOUNT = "MS-ACCT-0001";
+// The activity POST sends AccountInformation.Grouping "All", so one pull
+// returns rows for every account. ROW_7 sits on a second account so the
+// fixtures exercise that instead of pretending a pull is single-account.
+const SECOND_KEY_ACCOUNT = "MS-ACCT-0003";
 
 // Seven unique rows: a treasury purchase, a sell trade with a price, an
 // automated payment, a buy trade with a price, a row with an unparseable
-// amount, a row with an unknown (unreviewed) activity value, and a dividend.
+// amount, a row with an unknown (unreviewed) activity value, and a dividend
+// on a second account.
 export const ROW_1_TREASURY = {
   processDate: "2025-01-22",
   activityDate: "2025-01-22",
@@ -124,8 +128,8 @@ export const ROW_7_DIVIDEND = {
   activityDate: "2025-02-14",
   tradeDate: null,
   settlementDate: "2025-02-14",
-  accountName: "Sample Brokerage Account",
-  keyAccount: KEY_ACCOUNT,
+  accountName: "Sample Retirement Account",
+  keyAccount: SECOND_KEY_ACCOUNT,
   activity: "Dividend Received",
   description: "QUARTERLY DIVIDEND",
   amount: 42.17,
