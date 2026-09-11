@@ -36,8 +36,10 @@ than leaving it an accidental omission.
 ## How the session works
 
 The activity endpoint requires the web app's own `X-XSRF-TOKEN` and
-`X-DEVICE-FOOTPRINT` headers. A request rebuilt outside the page is refused, so
-`fetchText` and `fetchBytes` have to execute inside the signed-in page.
+`X-DEVICE-FOOTPRINT` headers, and the documents endpoints additionally require
+the `Authorization` bearer the app obtains for itself. A request rebuilt
+outside the page is refused, so `fetchText` and `fetchBytes` have to execute
+inside the signed-in page.
 
 The bridge attaches over the Chrome DevTools Protocol to a tab that already
 exists. The alternative, a Playwright persistent context with its own profile,
@@ -62,18 +64,26 @@ Header capture, in order:
 
 1. Connect to the page target, then `Page.enable` and `Runtime.enable`.
 2. `Page.addScriptToEvaluateOnNewDocument` installs a hook wrapping
-   `XMLHttpRequest.prototype.setRequestHeader`. The hook allowlists exactly two
-   header names and writes their values into a page-side slot at
-   `globalThis[Symbol.for("kithmind.capturedHeaders")]`.
+   `XMLHttpRequest.prototype.setRequestHeader` and `window.fetch`, the two
+   mechanisms the app sets these headers with. The hook allowlists exactly
+   three header names -- `X-XSRF-TOKEN`, `X-DEVICE-FOOTPRINT` and
+   `Authorization` -- and writes their values into a page-side slot at
+   `globalThis[Symbol.for("kithmind.capturedHeaders")]`, under canonical
+   lowercase names so one header is never sent twice.
 3. Reload the tab once. The reload does not re-authenticate, and it makes
    capture deterministic instead of depending on a click that happens to fire
    an XHR.
+4. For the documents tier only, open the app's own Documents page once. The
+   bearer is set on those calls and on no others, so it is captured on that
+   click and not before. That is the one extra click the documents tier costs.
 
 The captured values never cross the CDP boundary. `fetchText` and `fetchBytes`
 evaluate a fetch expression that reads the slot inside the page; only response
 bodies come back to Node. There is no variable, no log line and no file in
-which a session value could be stored. If the slot is empty the bridge throws
-and says to open the Activity tab. It never synthesizes a header.
+which a session value could be stored, and the bridge reports header names
+only. If the slot is empty the bridge throws and says to open the Activity
+tab; a documents endpoint with no bearer captured throws naming that header
+and saying to open the Documents page. It never synthesizes a header.
 
 `fetchBytes` is the same call with `arrayBuffer()` and base64 on the page side.
 Statements and confirmations are small, and base64 over a local socket is
@@ -102,9 +112,14 @@ off.
 The listing paginates at about fifty rows with no total shown on screen. Two
 paths, in order of preference:
 
-1. Use the underlying POST, whose `filters` array carries `DocType`,
-   `DocSubType` and `KeyAccountNo` alongside `TimeFrame`. If its response
-   states a total, paginate to that total and return
+1. Use the underlying POST. Confirmed live: `POST
+   /msoaz/api/acdsal/accountdocs/v2/searchItems` with `RequestID` and `SeqID`
+   query parameters, and a body carrying `endDate`, `pageNum`, `filters`,
+   `sortBy`, `startDate` and `TimeFrame`, where each `filters` entry carries
+   `DocType`, `DocSubType` and `KeyAccountNo`. `pageNum` paginates and
+   `TimeFrame` follows the requested period (`Custom` with explicit dates,
+   otherwise the whole history) -- which values it accepts is not confirmed.
+   If the response states a total, paginate to that total and return
    `exhaustiveListing(items, total)`.
 2. If no total is stated anywhere, paginate until a page returns fewer than the
    page size and the next returns nothing, and still return
@@ -194,26 +209,35 @@ Also returned by `capabilities().quirks`.
   but not yet surfaced as `ParsedRow.runningBalance` (still always `null` in
   v1).
 - **Unconfirmed response shapes.** The documents-list and accounts JSON
-  envelopes remain this adapter's working assumption, not confirmed against a
-  live response. See the "Unconfirmed institution response shapes" comment
-  block at the top of `src/adapter.mjs`. Confirm each one on the first real
+  envelopes, and the documents list's per-item field names, remain this
+  adapter's working assumption, not confirmed against a live response. See
+  the "Unconfirmed institution response shapes" comment block at the top of
+  `src/adapter.mjs`. Confirm each one on the first real
   `discover()`/`acquire()` run:
   - `MS_DOCUMENTS_ITEMS_KEY`, `MS_DOCUMENTS_TOTAL_KEY` and
     `MS_ACCOUNTS_ITEMS_KEY`: `discover()` throws a named `missing "<key>"
 array` error against a real response if the guess is wrong (the accounts
     error also lists the response's actual top-level key names, never
     values). Fix the constant, not a downstream caller.
-  - The documents and per-document-download endpoint paths are read from the
-    environment with no guessed default. An unset one throws a clear error
-    rather than posting to a made-up URL.
-- **The documents tier needs a bearer the session bridge does not carry.**
-  The documents-list request requires an `Authorization` header in addition
-  to the XSRF and footprint headers; `src/bridge.mjs`'s header allowlist
-  (`WANTED_HEADERS`) has exactly two names and this does not add a third.
-  `discover()` instead catches a documents failure per document type and
-  returns an `incompleteListing` with the reason, so an activity-only bounded
-  pull can proceed without it. Capturing the bearer page-side is deferred to
-  the full pull.
+  - The per-document-download endpoint path is read from the environment with
+    no guessed default. An unset one throws a clear error rather than getting
+    a made-up URL.
+- **The documents tier needs a bearer, captured page-side on one extra
+  click.** The documents endpoints require an `Authorization` header in
+  addition to the XSRF and footprint headers. `src/bridge.mjs`'s allowlist
+  (`WANTED_HEADERS`) carries its name as a third entry and the hook captures
+  its value the same way as the other two: written into the page-side slot,
+  read only by the page's own fetch, never over the debugging connection and
+  never logged. The app sets it only on its own documents calls, so the
+  Documents page has to have loaded once in the tab; until then those
+  endpoints throw naming the header. `discover()` still catches a documents
+  failure per document type and returns an `incompleteListing` with the
+  reason, so an activity-only bounded pull can proceed without it.
+- **A document download is verified to be a PDF.** The download path is
+  unconfirmed and a signed-out or mis-routed download answers with an HTML
+  login or error page at HTTP 200. `acquire()` checks the `%PDF` magic number
+  before retaining and refuses anything else by name, rather than archiving a
+  page that says nothing under a statement's content hash.
 - **The accounts endpoint is confirmed but currently 403s.** A page-context
   fetch to it still returns 403 even with the captured XSRF header and a
   permissive `Accept` header, so `discover()` falls back on a 403/404 to
@@ -320,12 +344,12 @@ review items until it is reviewed against real rows:
 | ---------------------------------- | -------------------------------------------------------- | -------------------------------------------- |
 | `MS_CDP_HTTP_BASE`                 | Every session build, for example `http://127.0.0.1:9222` | Set at Chrome launch, see the runbook below. |
 | `MS_ORIGIN`                        | Every session build, the signed-in tab's origin          | Set by the operator.                         |
-| `MS_DOCUMENTS_PATH`                | `discover()` and document acquisition                    | Not confirmed, see quirks.                   |
 | `MS_TABULAR_EXPORT_PATH`           | `tabular_export` acquisition                             | Confirmed endpoint: `POST /shell/handler/proxy/msomactivitysal/v1/generateexcel`. Set this to that path; the response is an Excel workbook, acquired opaque (see Capabilities above). |
 | `MS_DOCUMENT_DOWNLOAD_PATH_PREFIX` | `pdf_statement` and `trade_confirmation` acquisition     | Not confirmed.                               |
 
-The accounts endpoint path is confirmed and hardcoded in `src/bridge.mjs`
-(`GET /shell/handler/restproxy/financialsal/api/v1/accounts`, no environment
+The accounts and documents-list endpoint paths are confirmed and hardcoded in
+`src/bridge.mjs` (`GET /shell/handler/restproxy/financialsal/api/v1/accounts`
+and `POST /msoaz/api/acdsal/accountdocs/v2/searchItems`, no environment
 variable) -- see the accounts quirk above for why `discover()` still falls
 back off it today.
 
@@ -344,7 +368,10 @@ A bounded first pull, in nine steps.
    `MS_CDP_HTTP_BASE` to that port and `MS_ORIGIN` to the site's origin.
 3. Sign in by hand in that window, completing MFA normally. Nothing here
    automates this step.
-4. Open the Activity tab for all accounts.
+4. Open the Activity tab for all accounts, then open the Documents page once.
+   The activity headers are captured on the reload; the documents bearer is
+   set only on the app's own documents calls, so that one extra click is what
+   captures it. Skip it and the documents tier alone reports incomplete.
 5. Run discover, either `node dist/run.js --adapter src/adapter.mjs --session
 src/bridge.mjs --selection <selection file> --dry-run` against `run.ts`, or a
    small script calling `adapter.discover(session)` directly. It attaches to the
@@ -376,8 +403,10 @@ decimal-string exactness and sign resolution, review routing for ambiguous
 amounts and unreviewed activity values, exhaustive versus incomplete document
 listings, `json_pointer_v1` binding resolution against the retained bytes,
 PDF-tier rows carrying no binding, holdings extraction,
-`activityTaxonomy` agreeing with `ACTIVITY_SIGN_TABLE`, and the PDF text
-extractor against a small generated PDF.
+`activityTaxonomy` agreeing with `ACTIVITY_SIGN_TABLE`, the documents request
+body and page-fetch expression (which forwards the captured headers without
+ever reading a value back out), a document download that answers with HTML
+being refused, and the PDF text extractor against a small generated PDF.
 
 The bridge's CDP mechanism has its own proof in `spike/bridge-spike.mjs`. Run
 it with `node spike/bridge-spike.mjs`. It opens a local Chrome instance against
