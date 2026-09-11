@@ -1,0 +1,20 @@
+{
+  "name": "@repo/adapter-morgan-stanley",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.10.0"
+  },
+  "exports": {
+    ".": "./src/adapter.mjs",
+    "./session": "./src/bridge.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "test:once": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@repo/finance-archive": "workspace:*"
+  }
+}

@@ -1,0 +1,32 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>fake signed-in app</title>
+<h1>fake signed-in app</h1>
+<pre id="out">loading</pre>
+<script>
+  // Stands in for the institution's SPA: it mints its own XSRF token and
+  // device footprint and attaches them to every XHR via setRequestHeader.
+  // Nothing outside the page can reconstruct them.
+  const xsrf = "xsrf-" + Math.random().toString(36).slice(2);
+  const footprint = "fp-" + Math.random().toString(36).slice(2);
+
+  function appXhr(path) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", path);
+      xhr.setRequestHeader("Content-Type", "application/json");
+      xhr.setRequestHeader("X-XSRF-TOKEN", xsrf);
+      xhr.setRequestHeader("X-DEVICE-FOOTPRINT", footprint);
+      xhr.onload = () => resolve(xhr.status + " " + xhr.responseText);
+      xhr.onerror = reject;
+      xhr.send("{}");
+    });
+  }
+
+  appXhr("/api/activity").then((text) => {
+    // What the server saw on the app's own request. The spike compares its
+    // page-context fetch against this.
+    window.__onLoadEcho = text;
+    document.getElementById("out").textContent = text;
+  });
+</script>
