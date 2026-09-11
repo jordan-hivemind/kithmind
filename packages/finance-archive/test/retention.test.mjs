@@ -221,7 +221,7 @@ test("the manifest records that a projection was applied, which declaration prod
 
   const { retention } = readCaptureManifest(persisted.capturePath);
   assert.equal(retention.policy.kind, "json_allowlist");
-  assert.equal(retention.policy.version, "thistlebrook-activity-1");
+  assert.equal(retention.policy.version, "thistlebrook-activity-2");
   assert.equal(retention.projectionVersion, "1");
 
   // Path names only, never values -- which is what makes this record safe to

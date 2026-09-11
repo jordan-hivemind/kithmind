@@ -70,7 +70,16 @@ import { contentKeyV2, rowHashV2 } from "./rowHash.js";
  */
 export type AdapterPull = {
   readonly institutionId: string;
-  readonly accountId: string;
+  /**
+   * F1-35. Null only for an institution-wide pull (`run.ts`'s
+   * `"scope": "institution"` selection, `structured_api`/`tabular_export`
+   * only): such a pull names no single account, so `ImportDocument.accountId`
+   * becomes null too. Every row still needs its own account to import under
+   * -- see `accountsByExternalKey` below -- a row that cannot resolve one is
+   * refused rather than written with no account (`transactions.account_id`
+   * is `NOT NULL`).
+   */
+  readonly accountId: string | null;
   readonly acquired: AcquiredDocument;
   readonly rows: readonly ParsedRow[];
   readonly holdings?: ParsedHoldings;
@@ -86,6 +95,22 @@ export type AdapterPull = {
    * undeclared. A real caller (`run.ts`) always supplies it.
    */
   readonly activityTaxonomy?: ActivityTaxonomy;
+  /**
+   * F1-35. What `resolveDiscoveredAccounts` returned for this institution,
+   * keyed by `DiscoveredAccount.externalKey` -- `run.ts` calls it once per
+   * run and passes the same map to every pull. A row carrying
+   * `ParsedRow.accountExternalKey` resolves against this map instead of
+   * always importing under `accountId`, which is what lets one pull's rows
+   * span several accounts (an institution-wide structured-API/tabular-export
+   * response that returns every account's activity together).
+   *
+   * Optional, and deliberately inert when omitted: a caller that builds an
+   * `AdapterPull` without this map is not asking for per-row attribution, so
+   * every row keeps importing under `accountId` exactly as it did before
+   * this field existed, even if the row itself carries an
+   * `accountExternalKey` -- no query, no review item, no behavior change.
+   */
+  readonly accountsByExternalKey?: ReadonlyMap<string, string>;
 };
 
 type ReviewItemFields = {
@@ -294,6 +319,72 @@ export async function resolveDiscoveredAccounts(
       ],
     );
     resolved.set(account.externalKey, result.rows[0]!.id);
+  }
+  return resolved;
+}
+
+/**
+ * F1-35. The account one row's `accountExternalKey` resolves to against
+ * `pull.accountsByExternalKey`, or `pull.accountId` when the row carries no
+ * external key, or when this `AdapterPull` was built with no resolution map
+ * at all (opt-in: see `AdapterPull.accountsByExternalKey`'s doc comment).
+ * Pure -- no query, no review item -- so `countDistinctRowHashes` can reuse
+ * it to predict the same account id `resolveRowAccountId` will actually
+ * assign, and the two can never disagree about what "the same content"
+ * hashes to. Null only when nothing resolves and the pull itself names no
+ * account (an institution-wide pull with an unattributable row).
+ */
+function lookupRowAccountId(pull: AdapterPull, row: ParsedRow): string | null {
+  if (row.accountExternalKey === undefined || pull.accountsByExternalKey === undefined) {
+    return pull.accountId;
+  }
+  return pull.accountsByExternalKey.get(row.accountExternalKey) ?? pull.accountId;
+}
+
+/**
+ * The account one row imports under: `lookupRowAccountId`'s result, plus the
+ * side effect of opening `unknown_account_key` when the row named a key that
+ * did not resolve against `pull.accountsByExternalKey` -- flagged rather
+ * than silently dropped (ground rule 5), the same pattern
+ * `resolveInstrumentId`'s weak-symbol match uses. The row still imports
+ * under `pull.accountId` when that fallback exists.
+ *
+ * Throws only for an institution-wide pull (`pull.accountId === null`) whose
+ * row's key did not resolve: there is no account left to fall back to, and
+ * `transactions.account_id` is `NOT NULL`, so this refuses to write an
+ * unattributable transaction rather than guess one.
+ */
+async function resolveRowAccountId(
+  client: ArchiveClient,
+  pull: AdapterPull,
+  row: ParsedRow,
+): Promise<string> {
+  const resolved = lookupRowAccountId(pull, row);
+  const unresolvedKey =
+    row.accountExternalKey !== undefined &&
+    pull.accountsByExternalKey !== undefined &&
+    !pull.accountsByExternalKey.has(row.accountExternalKey)
+      ? row.accountExternalKey
+      : null;
+  if (unresolvedKey !== null) {
+    await openReviewItem(client, {
+      kind: "unknown_account_key",
+      accountId: pull.accountId,
+      rawValue: unresolvedKey,
+      reason:
+        `row carries accountExternalKey ${JSON.stringify(unresolvedKey)}, which does not ` +
+        "resolve to any account this institution's discover() reported; " +
+        (pull.accountId === null
+          ? "this institution-wide pull names no fallback account, so the row cannot be attributed"
+          : "importing under the pull's own account instead"),
+    });
+  }
+  if (resolved === null) {
+    throw new Error(
+      `row's accountExternalKey ${unresolvedKey === null ? "(missing)" : JSON.stringify(unresolvedKey)} ` +
+        "did not resolve to an account, and this institution-wide pull names no fallback account " +
+        "(accountId is null); refusing to import an unattributable transaction",
+    );
   }
   return resolved;
 }
@@ -570,11 +661,17 @@ async function mapSeries<T, R>(
  * of the pair's inputs from before validation and the other from after would
  * silently miscount, exactly the drift this function's own doc comment above
  * warns against for `contentKeyV2`/`rowHashV2`.
+ *
+ * F1-35: resolves each row's own account with `lookupRowAccountId` rather
+ * than one account shared across every row, since an institution-wide (or
+ * otherwise multi-account) pull's rows do not all share `pull.accountId`.
+ * Two rows that are otherwise identical but post to different accounts must
+ * predict different hashes here, exactly as `resolveRowAccountId` will make
+ * them import under different accounts.
  */
 function countDistinctRowHashes(
-  accountId: string,
+  pull: AdapterPull,
   groups: ReadonlyMap<string, readonly ParsedRow[]>,
-  taxonomy: ActivityTaxonomy | undefined,
 ): number {
   const hashes = new Set<string>();
   for (const rows of groups.values()) {
@@ -583,7 +680,15 @@ function countDistinctRowHashes(
     // lands on the same ordinal (and hash) in each page's document.
     const occurrences = new Map<string, number>();
     for (const row of rows) {
-      const classified = classifyActivity(taxonomy, row);
+      const accountId = lookupRowAccountId(pull, row);
+      if (accountId === null) {
+        throw new Error(
+          `row's accountExternalKey ${row.accountExternalKey ? JSON.stringify(row.accountExternalKey) : "(missing)"} ` +
+            "did not resolve to an account, and this institution-wide pull names no fallback account; " +
+            "refusing to import an unattributable transaction",
+        );
+      }
+      const classified = classifyActivity(pull.activityTaxonomy, row);
       let amount: string | null = null;
       if (classified.amount !== null) {
         try {
@@ -705,11 +810,7 @@ async function collectDocuments(
           "without a stated total to reconcile against -- treat this pull as unverified",
       });
     } else {
-      const distinct = countDistinctRowHashes(
-        pull.accountId,
-        activityGroups,
-        pull.activityTaxonomy,
-      );
+      const distinct = countDistinctRowHashes(pull, activityGroups);
       if (distinct !== reportedRowCount) {
         throw new Error(
           `adapter pull reported ${reportedRowCount} unique row(s) but ${distinct} distinct ` +
@@ -767,9 +868,10 @@ async function collectDocuments(
       // Sequential rather than concurrent on purpose: instrument resolution
       // creates rows, and two rows for the same new instrument resolved in
       // parallel would each fail to find it and mint a second id.
-      rows: await mapSeries(activityGroups.get(sourceDocument) ?? [], (row) =>
-        parsedRowToImportRow(client, pull.accountId, pull.activityTaxonomy, row),
-      ),
+      rows: await mapSeries(activityGroups.get(sourceDocument) ?? [], async (row) => {
+        const accountId = await resolveRowAccountId(client, pull, row);
+        return parsedRowToImportRow(client, accountId, pull.activityTaxonomy, row);
+      }),
       positions: await mapSeries(
         positionGroups.get(sourceDocument) ?? [],
         (position) => parsedPositionToImportPosition(client, position),
@@ -819,13 +921,21 @@ export type AcquisitionDescriptor = {
    * identity: the path segment under `captures/` and the manifest's
    * `sourceId` (F1-34, see captures.ts). */
   readonly institutionId: string;
-  readonly accountId: string;
+  /**
+   * F1-35: null for an institution-wide pull, which names no single account.
+   * Not read by `persistAcquiredDocument` itself (it never opens a database
+   * and has no account-scoped work to do); carried here only so a caller
+   * building this descriptor from an `AdapterPull` never has to special-case
+   * the institution-wide shape to satisfy this type.
+   */
+  readonly accountId: string | null;
   /** The institution's `institutions.slug`, recorded on the capture manifest
    * as metadata -- never a path segment (F1-34). The caller's own lookup,
    * not this function's: see the file header. */
   readonly institutionSlug: string;
   /** The account's `accounts.acct_last4`, or null for an account with none
-   * recorded. Same reasoning as `institutionSlug`. */
+   * recorded, or the literal `"all"` for an institution-wide pull that names
+   * no single account (F1-35). Same reasoning as `institutionSlug`. */
   readonly accountLast4: string | null;
   readonly docType: string;
   readonly acquired: AcquiredDocument;

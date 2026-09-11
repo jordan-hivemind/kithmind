@@ -366,3 +366,90 @@ test(
     assert.equal(await count(client, "transactions"), inserted);
   },
 );
+
+test(
+  "a scope: institution selection (F1-35) attributes rows to their own discovered accounts and persists a null document account",
+  { skip },
+  async (t) => {
+    // No account seeded: an institution-wide pull names none, and the two
+    // it needs come entirely from discover(), same as the external-key test
+    // above.
+    const { schema, client } = await seededSchema(t, { seedAccount: false });
+
+    const rawDir = mkdtempSync(
+      join(tmpdir(), "kith-finance-run-institution-raw-"),
+    );
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+
+    const { fixturesDir, adapterModulePath, sessionModulePath } =
+      writeAdapterFixtures(t);
+    const selectionPath = writeSelection(fixturesDir, [
+      {
+        scope: "institution",
+        docType: "activity_pull",
+        docDate: null,
+        selection: {
+          kind: "structured_api",
+          periodStart: "2025-01-01",
+          periodEnd: "2025-04-01",
+        },
+      },
+    ]);
+    const runImport = makeRunner({
+      adapterModulePath,
+      sessionModulePath,
+      selectionPath,
+      schema,
+      rawDir,
+    });
+
+    const output = runImport();
+    assert.match(output, /^mode: committed$/m);
+    const insertedMatch = output.match(/rows inserted: (\d+)/);
+    assert.ok(insertedMatch, "prints rows inserted");
+    const inserted = Number(insertedMatch[1]);
+    assert.ok(inserted > 0);
+
+    const accounts = await all(
+      client,
+      "SELECT id, external_key FROM accounts WHERE institution_id = $1",
+      [INSTITUTION.id],
+    );
+    assert.equal(
+      accounts.length,
+      2,
+      "both accounts discover() reported are provisioned, same as any other pull",
+    );
+
+    // The synthetic activity feed is paginated, so this one institution-wide
+    // pull becomes one document per page (adapterImport.ts's documented
+    // per-page splitting); every one of them belongs to the institution, not
+    // to any one account -- never one row's account standing in for every
+    // row's.
+    const documentCount = await count(client, "documents");
+    assert.ok(documentCount > 0);
+    assert.equal(
+      await count(client, "documents", "WHERE account_id IS NULL"),
+      documentCount,
+    );
+
+    // The whole point of attributing rows by their own accountExternalKey:
+    // every discovered account actually has transactions, not just the one
+    // an old single-accountId pull would have filed everything under.
+    for (const account of accounts) {
+      const accountCount = await count(
+        client,
+        "transactions",
+        "WHERE account_id = $1",
+        [account.id],
+      );
+      assert.ok(accountCount > 0, `account ${account.external_key} has rows`);
+    }
+    assert.equal(await count(client, "transactions"), inserted);
+
+    // A second pass over the identical selection is still a no-op.
+    const second = runImport();
+    assert.match(second, /rows inserted: 0/);
+    assert.equal(await count(client, "transactions"), inserted);
+  },
+);

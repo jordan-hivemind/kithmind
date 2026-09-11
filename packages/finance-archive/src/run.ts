@@ -69,7 +69,8 @@ type AcquireSelectionInput =
 
 type SelectionEntry = {
   /** `accounts.id`, already provisioned. Mutually exclusive with
-   * `accountExternalKey`; exactly one names the account this pull is for. */
+   * `accountExternalKey` and `scope`; exactly one names the account (or
+   * institution-wide scope) this pull is for. */
   readonly accountId?: string;
   /**
    * An account by the adapter's own opaque id from `DiscoverResult.accounts`
@@ -78,6 +79,18 @@ type SelectionEntry = {
    * this way needs no separate provisioning step.
    */
   readonly accountExternalKey?: string;
+  /**
+   * F1-35. `"institution"` instead of an account, for a pull whose source
+   * returns every account's activity in one response (a real institution's
+   * structured-API or tabular-export pull). Valid only for
+   * `selection.kind` `structured_api` or `tabular_export` -- a document-tier
+   * pull (`pdf_statement`, `trade_confirmation`) always belongs to one
+   * account. Each row is attributed by its own `ParsedRow.accountExternalKey`
+   * (adapterImport.ts's `resolveRowAccountId`); the pull's own document gets
+   * a null `account_id` rather than one row's account standing in for all of
+   * them.
+   */
+  readonly scope?: "institution";
   readonly docType: string;
   readonly docDate: string | null;
   readonly selection: AcquireSelectionInput;
@@ -123,22 +136,6 @@ function readSelectionFile(path: string): SelectionFile {
       throw new Error(`${path}: pulls[${index}] must be an object`);
     }
     const pull = entry as Record<string, unknown>;
-    const hasAccountId =
-      typeof pull.accountId === "string" && pull.accountId.length > 0;
-    const hasExternalKey =
-      typeof pull.accountExternalKey === "string" &&
-      pull.accountExternalKey.length > 0;
-    if (hasAccountId === hasExternalKey) {
-      throw new Error(
-        `${path}: pulls[${index}] must name its account with exactly one of "accountId" or "accountExternalKey"`,
-      );
-    }
-    if (typeof pull.docType !== "string" || pull.docType.length === 0) {
-      throw new Error(`${path}: pulls[${index}].docType is required`);
-    }
-    if (pull.docDate !== null && typeof pull.docDate !== "string") {
-      throw new Error(`${path}: pulls[${index}].docDate must be a string or null`);
-    }
     const selection = pull.selection as Record<string, unknown> | undefined;
     if (
       !selection ||
@@ -149,15 +146,46 @@ function readSelectionFile(path: string): SelectionFile {
         `${path}: pulls[${index}].selection.kind must be one of ${[...CAPABILITY_TIERS].join(", ")}`,
       );
     }
-    if (selection.kind === "structured_api" || selection.kind === "tabular_export") {
+    const kind = selection.kind as CapabilityTier;
+
+    const hasAccountId =
+      typeof pull.accountId === "string" && pull.accountId.length > 0;
+    const hasExternalKey =
+      typeof pull.accountExternalKey === "string" &&
+      pull.accountExternalKey.length > 0;
+    if (pull.scope !== undefined && pull.scope !== "institution") {
+      throw new Error(
+        `${path}: pulls[${index}].scope, when present, must be "institution"`,
+      );
+    }
+    const hasScope = pull.scope === "institution";
+    if ([hasAccountId, hasExternalKey, hasScope].filter(Boolean).length !== 1) {
+      throw new Error(
+        `${path}: pulls[${index}] must name its account with exactly one of "accountId", ` +
+          `"accountExternalKey", or "scope": "institution"`,
+      );
+    }
+    if (hasScope && kind !== "structured_api" && kind !== "tabular_export") {
+      throw new Error(
+        `${path}: pulls[${index}]."scope": "institution" is only valid for a structured_api or ` +
+          `tabular_export selection, got ${kind}`,
+      );
+    }
+    if (typeof pull.docType !== "string" || pull.docType.length === 0) {
+      throw new Error(`${path}: pulls[${index}].docType is required`);
+    }
+    if (pull.docDate !== null && typeof pull.docDate !== "string") {
+      throw new Error(`${path}: pulls[${index}].docDate must be a string or null`);
+    }
+    if (kind === "structured_api" || kind === "tabular_export") {
       if (typeof selection.periodStart !== "string" || typeof selection.periodEnd !== "string") {
         throw new Error(
-          `${path}: pulls[${index}].selection needs "periodStart" and "periodEnd" for kind ${selection.kind}`,
+          `${path}: pulls[${index}].selection needs "periodStart" and "periodEnd" for kind ${kind}`,
         );
       }
     } else if (typeof selection.externalId !== "string") {
       throw new Error(
-        `${path}: pulls[${index}].selection needs "externalId" for kind ${selection.kind}`,
+        `${path}: pulls[${index}].selection needs "externalId" for kind ${kind}`,
       );
     }
   });
@@ -350,12 +378,15 @@ async function resolveAccountLast4(
 }
 
 /** The account this pull names, by id directly or by the external key an
- * earlier `resolveDiscoveredAccounts` call resolved (F1-32). Exactly one of
- * the two is present -- `readSelectionFile` already enforced that. */
+ * earlier `resolveDiscoveredAccounts` call resolved (F1-32), or null for an
+ * institution-wide pull (F1-35, `"scope": "institution"`). Exactly one of
+ * `accountId`, `accountExternalKey` or `scope` is present -- `readSelectionFile`
+ * already enforced that. */
 function resolveEntryAccountId(
   entry: SelectionEntry,
   accountsByExternalKey: ReadonlyMap<string, string>,
-): string {
+): string | null {
+  if (entry.scope === "institution") return null;
   if (entry.accountId) return entry.accountId;
   const id = accountsByExternalKey.get(entry.accountExternalKey!);
   if (!id) {
@@ -447,11 +478,14 @@ async function main(): Promise<void> {
 
     for (const entry of selectionFile.pulls) {
       const accountId = resolveEntryAccountId(entry, accountsByExternalKey);
-      const accountLast4 = await resolveAccountLast4(
-        pgClient,
-        accountId,
-        accountLast4Cache,
-      );
+      // F1-35: an institution-wide pull names no single account, so there is
+      // no accounts.acct_last4 to look up either -- "all" says so on the
+      // capture manifest rather than a guessed or borrowed last4 (see
+      // captures.ts's acctLast4 doc comment).
+      const accountLast4 =
+        accountId === null
+          ? "all"
+          : await resolveAccountLast4(pgClient, accountId, accountLast4Cache);
       const selection = { ...entry.selection, session } as AcquireSelection;
       const acquired = await adapter.acquire(selection);
       const parsed = await adapter.parse({
@@ -478,10 +512,31 @@ async function main(): Promise<void> {
         docDate: entry.docDate,
         persisted,
         activityTaxonomy: capabilities.activityTaxonomy,
+        // F1-35: lets adapterImport.ts resolve a row's own
+        // ParsedRow.accountExternalKey (an institution-wide pull's rows, or
+        // any row an adapter attributes this way) against the accounts this
+        // run already discovered, instead of always importing under
+        // `accountId` above.
+        accountsByExternalKey,
       });
     }
 
-    const accountIds = [...new Set(pulls.map((p) => p.accountId))];
+    // F1-35: an institution-wide pull's own accountId is null, and its rows
+    // are attributed by their own accountExternalKey instead -- include
+    // every discovered account in the summary's verdict lookups when that
+    // happened, or the accounts those rows actually landed on would be
+    // silently absent from "cash reconciliation verdicts" / "position
+    // reconciliation verdicts" below.
+    const namedAccountIds = pulls
+      .map((pull) => pull.accountId)
+      .filter((id): id is string => id !== null);
+    const accountIds = [
+      ...new Set(
+        pulls.some((pull) => pull.accountId === null)
+          ? [...namedAccountIds, ...accountsByExternalKey.values()]
+          : namedAccountIds,
+      ),
+    ];
     // One digest standing for this run's whole acquisition manifest: the
     // sha256 of every acquired document's own content hash, sorted so the
     // digest does not depend on acquisition order.

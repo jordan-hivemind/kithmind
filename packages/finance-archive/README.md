@@ -743,6 +743,16 @@ wants pulled this run:
         "periodStart": "<yyyy-mm-dd>",
         "periodEnd": "<yyyy-mm-dd>"
       }
+    },
+    {
+      "scope": "institution",
+      "docType": "activity_pull",
+      "docDate": null,
+      "selection": {
+        "kind": "structured_api",
+        "periodStart": "<yyyy-mm-dd>",
+        "periodEnd": "<yyyy-mm-dd>"
+      }
     }
   ]
 }
@@ -750,14 +760,33 @@ wants pulled this run:
 
 A document-tier pull (`pdf_statement`, `trade_confirmation`) selects by
 `{ "kind": ..., "externalId": "<id from a prior discover() call>" }` instead
-of a period. Every pull names its account with exactly one of `accountId` or
-`accountExternalKey` -- never both, never neither. `accountId` is
-`accounts.id`, already provisioned. `accountExternalKey` (F1-32) is one of
-the adapter's own opaque ids from `DiscoverResult.accounts`, resolved to a
-real `accounts.id` by the run itself: the command calls
-`resolveDiscoveredAccounts` right after `discover()`, which upserts an
-`accounts` row per discovered account keyed on `external_key`, so naming an
-account this way needs no separate provisioning step. `institutionId` is no
+of a period. Every pull names its account with exactly one of `accountId`,
+`accountExternalKey`, or `"scope": "institution"` -- never more than one,
+never none. `accountId` is `accounts.id`, already provisioned.
+`accountExternalKey` (F1-32) is one of the adapter's own opaque ids from
+`DiscoverResult.accounts`, resolved to a real `accounts.id` by the run
+itself: the command calls `resolveDiscoveredAccounts` right after
+`discover()`, which upserts an `accounts` row per discovered account keyed on
+`external_key`, so naming an account this way needs no separate provisioning
+step.
+
+`"scope": "institution"` (F1-35) is for a source that returns every
+account's activity in one pull -- a real institution's structured-API or
+tabular-export response commonly does, whatever account (if any) the request
+named -- so it is valid only for `selection.kind` `structured_api` or
+`tabular_export`; a document-tier pull always belongs to one account. Such a
+pull's rows are attributed individually, by each row's own
+`ParsedRow.accountExternalKey` resolved against the same accounts
+`resolveDiscoveredAccounts` already provisioned; a row whose key does not
+resolve opens an `unknown_account_key` review item and imports under the
+pull's own account, which for an institution-wide pull does not exist, so
+such a row is refused rather than imported unattributed. The pull's own
+`documents` row gets a null `account_id` -- it belongs to the institution,
+not to any one account -- and its capture manifest records `"all"` in place
+of an `acctLast4`, since there is no single account's last four digits to
+record either.
+
+`institutionId` is no
 longer named here either (F1-19): before `discover`, `main()` calls
 `resolveInstitution` (`adapterImport.ts`), which upserts the `institutions`
 row from the adapter's own `capabilities()` (slug, name) and uses the id it
