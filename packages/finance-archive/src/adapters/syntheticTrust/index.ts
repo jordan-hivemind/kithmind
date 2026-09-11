@@ -15,6 +15,7 @@ import {
   type AcquireSelection,
   type AdapterSession,
   type DiscoverResult,
+  type FieldBinding,
   type FieldLocator,
   type InstitutionAdapter,
   type InstitutionCapabilities,
@@ -531,22 +532,64 @@ async function acquire(selection: AcquireSelection): Promise<AcquiredDocument> {
 
 // --- parse -------------------------------------------------------------
 
+/**
+ * Parses `text` a second time with a reviver that replaces every primitive
+ * with its exact JSON source token (`context.source`, Node 22+, the same
+ * technique retention.ts's `rawPrimitiveReviver` uses). The result has the
+ * same shape as `JSON.parse(text)` -- same objects, same arrays, same key
+ * order -- except every leaf is the literal text that produced it instead of
+ * the decoded value, so a leaf can be read back out **by position**.
+ *
+ * This is deliberately not a scan that collects every "amount" token in
+ * visit order and zips it positionally against the (page, item) loop: that
+ * approach silently misaligns the moment any other "amount" key appears
+ * anywhere else in the payload, nested or not, and a misaligned binding
+ * cites the wrong bytes -- the exact failure this work exists to prevent.
+ * Reading `sourceTokens.pages[i].items[j].amount` instead ties each binding
+ * to the one token actually at that position, no matter what else the
+ * payload contains.
+ */
+function parseSourceTokens(text: string): unknown {
+  return (JSON.parse as (text: string, reviver: unknown) => unknown)(
+    text,
+    (_key: string, value: unknown, context?: { source?: string }) =>
+      context?.source === undefined ? value : context.source,
+  );
+}
+
 function parseStructuredApi(bytes: Uint8Array): readonly ParsedRow[] {
-  const { pages } = JSON.parse(new TextDecoder().decode(bytes)) as {
+  const text = new TextDecoder().decode(bytes);
+  const { pages } = JSON.parse(text) as {
     pages: ReadonlyArray<{ page: number; items: readonly ActivityRow[] }>;
+  };
+  const sourceTokens = parseSourceTokens(text) as {
+    pages?: ReadonlyArray<{ items?: ReadonlyArray<{ amount?: unknown }> }>;
   };
   const rows: ParsedRow[] = [];
   let index = 0;
-  for (const page of pages) {
+  for (const [pageArrayIndex, page] of pages.entries()) {
     // Each page is its own document for occurrence-ordinal purposes, even
     // though the whole pull was captured as one RawFile: see ParsedRow's
     // sourceDocument doc comment.
     const sourceDocument = `structured-api-page-${page.page}`;
-    for (const item of page.items) {
+    for (const [itemArrayIndex, item] of page.items.entries()) {
+      const rawValue = sourceTokens.pages?.[pageArrayIndex]?.items?.[itemArrayIndex]?.amount;
+      if (typeof rawValue !== "string") {
+        throw new Error(
+          `structured_api parse: no amount source token at pages/${pageArrayIndex}/items/${itemArrayIndex}`,
+        );
+      }
+      // The pointer is built from array positions, not page.page: that
+      // value is the provider's own page number, not a position in `pages`.
+      const binding: FieldBinding = {
+        format: "json_pointer_v1",
+        pointer: `/pages/${pageArrayIndex}/items/${itemArrayIndex}/amount`,
+        rawValue,
+      };
       rows.push(
         activityRowToParsedRow(
           item,
-          { source: "structured_api", index, field: `page ${page.page}` },
+          { source: "structured_api", index, field: `page ${page.page}`, binding },
           sourceDocument,
         ),
       );
@@ -557,30 +600,46 @@ function parseStructuredApi(bytes: Uint8Array): readonly ParsedRow[] {
 }
 
 function parseTabularExport(bytes: Uint8Array): readonly ParsedRow[] {
-  const [, ...dataLines] = new TextDecoder().decode(bytes).split("\n");
-  return dataLines
-    .filter((line) => line.trim() !== "")
-    .map((line, index) => {
-      const [date, activityType, description, symbol, quantity, price, amount, currency] =
-        splitEightFields(line, ",");
-      return activityRowToParsedRow(
-        {
-          // Documented quirk: this export carries no provider row id.
-          externalId: null,
-          date,
-          activityType,
-          description,
-          instrument: symbol === "-" ? null : instrumentBySymbol(symbol),
-          quantity: quantity === "-" ? null : quantity,
-          price: price === "-" ? null : price,
-          amount,
-          currency,
-        },
-        { source: "tabular_export", index },
-        // No pagination on this tier: one parse() call is one document.
-        "tabular-export",
-      );
-    });
+  const [, ...rest] = new TextDecoder().decode(bytes).split("\n");
+  // One trailing record separator at end of file does not create a final
+  // record (delimited_row_v1 format rule): drop that one blank tail entry,
+  // but no others, so `rowIndex` below is the physical data-record position
+  // and a genuine blank line in the middle still surfaces as a field-count
+  // error from splitEightFields rather than being silently skipped past.
+  const dataLines = rest.length > 0 && rest.at(-1) === "" ? rest.slice(0, -1) : rest;
+  return dataLines.map((line, rowIndex) => {
+    const [date, activityType, description, symbol, quantity, price, amount, currency] =
+      splitEightFields(line, ",");
+    const binding: FieldBinding = {
+      format: "delimited_row_v1",
+      encoding: "utf-8",
+      delimiter: ",",
+      quote: "none",
+      headerRows: 1,
+      recordSeparator: "lf",
+      rowIndex,
+      columnIndex: 6,
+      columnName: "amount",
+      rawValue: amount,
+    };
+    return activityRowToParsedRow(
+      {
+        // Documented quirk: this export carries no provider row id.
+        externalId: null,
+        date,
+        activityType,
+        description,
+        instrument: symbol === "-" ? null : instrumentBySymbol(symbol),
+        quantity: quantity === "-" ? null : quantity,
+        price: price === "-" ? null : price,
+        amount,
+        currency,
+      },
+      { source: "tabular_export", index: rowIndex, binding },
+      // No pagination on this tier: one parse() call is one document.
+      "tabular-export",
+    );
+  });
 }
 
 function resolveAmount(text: string): ParsedAmount {

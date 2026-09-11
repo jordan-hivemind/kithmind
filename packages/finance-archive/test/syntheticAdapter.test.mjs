@@ -361,3 +361,211 @@ test("no adapter output anywhere in this suite mentions anything credential-shap
     assert.ok(!serialized.includes(forbidden), `output must not mention "${forbidden}"`);
   }
 });
+
+// --- F1-29 slice 3: FieldLocator.binding ------------------------------------
+//
+// Each bound record's locator names retained-byte coordinates (a JSON
+// pointer, or a delimited row/column) rather than a value to trust. These
+// tests resolve each binding independently, against the retained bytes
+// themselves, with small resolvers that duplicate no adapter code -- the
+// point is to prove the binding actually points at the value it claims to,
+// not just that the adapter produced *some* binding object. Money is decimal
+// text throughout: every comparison here is a string comparison.
+
+/**
+ * A JSON pointer resolver built the same way the design
+ * (docs/plans/2026-09-11-structured-evidence.md, "How a consumer verifies a
+ * citation") describes: parse with the source-text reviver so every
+ * primitive's exact token survives, then walk the pointer segments. Kept
+ * independent of readAmountSourceTokens in the adapter so a bug in one is not
+ * masked by the other.
+ */
+function resolveJsonPointer(jsonBytes, pointer) {
+  const text = new TextDecoder().decode(jsonBytes);
+  const root = JSON.parse(text, (_key, value, context) =>
+    context?.source === undefined ? value : { __token: context.source },
+  );
+  assert.ok(pointer.startsWith("/"), `not a JSON pointer: ${pointer}`);
+  const segments = pointer
+    .slice(1)
+    .split("/")
+    .map((segment) => segment.replace(/~1/g, "/").replace(/~0/g, "~"));
+  let node = root;
+  for (const segment of segments) {
+    assert.ok(node !== null && typeof node === "object", `pointer ${pointer} ran off the tree`);
+    node = node[segment];
+  }
+  assert.ok(
+    node !== null && typeof node === "object" && "__token" in node,
+    `pointer ${pointer} did not resolve to a primitive`,
+  );
+  return node.__token;
+}
+
+/** Splits retained delimited bytes on the record separator and indexes the
+ * field named by the binding, the way a consumer with no quoting to undo
+ * (`quote: "none"`) would. */
+function resolveDelimitedField(delimitedBytes, binding) {
+  assert.equal(binding.quote, "none", "resolver below assumes no quoting to undo");
+  const separator = binding.recordSeparator === "lf" ? "\n" : "\r\n";
+  const records = new TextDecoder().decode(delimitedBytes).split(separator);
+  const dataRecords = records.slice(binding.headerRows);
+  const record = dataRecords[binding.rowIndex];
+  assert.ok(record !== undefined, `no data record at rowIndex ${binding.rowIndex}`);
+  const fields = record.split(binding.delimiter);
+  return fields[binding.columnIndex];
+}
+
+test("parse() on the structured API tier binds each row's amount to a JSON pointer that resolves against the retained bytes", async () => {
+  const session = createSyntheticSession();
+  const acquired = await syntheticAdapter.acquire({
+    kind: "structured_api",
+    session,
+    periodStart: "2025-01-01",
+    periodEnd: "2025-04-01",
+  });
+  const { activity: rows } = await syntheticAdapter.parse({
+    kind: "structured_api",
+    bytes: acquired.bytes,
+  });
+  assert.ok(rows.length > 0);
+
+  for (const row of rows) {
+    const { binding } = row.locators.row;
+    assert.equal(binding.format, "json_pointer_v1");
+    assert.match(binding.pointer, /^\/pages\/\d+\/items\/\d+\/amount$/);
+    const resolved = resolveJsonPointer(acquired.bytes, binding.pointer);
+    // Byte for byte, never a numeric comparison: money is decimal text.
+    assert.equal(resolved, binding.rawValue);
+  }
+});
+
+test("parse() on the structured API tier binds by position, not by visit order, so an unrelated nested \"amount\" key elsewhere in the payload cannot shift a citation onto the wrong bytes", async () => {
+  // A page that carries a sibling object with its own "amount" key, placed
+  // before "items" in source order. A token list built by collecting every
+  // "amount" in reviver visit order and zipping it positionally against the
+  // (page, item) loop would consume this one first and cite every
+  // subsequent transaction's amount off by one -- the exact regression this
+  // test guards against.
+  const decoyPayload = {
+    pages: [
+      {
+        page: 1,
+        decoy: { amount: "DECOY-DO-NOT-CITE" },
+        items: [
+          {
+            externalId: "tx-decoy-0001",
+            date: "2025-01-06",
+            activityType: "buy",
+            description: "Buy FKE",
+            instrument: { symbol: "FKE", cusip: null, isin: null, name: "Fictional Kelp ETF" },
+            quantity: "5",
+            price: "50.00",
+            amount: "-250.00",
+            currency: "USD",
+          },
+          {
+            externalId: "tx-decoy-0002",
+            date: "2025-01-09",
+            activityType: "sell",
+            description: "Sell FKE",
+            instrument: { symbol: "FKE", cusip: null, isin: null, name: "Fictional Kelp ETF" },
+            quantity: "-5",
+            price: "51.00",
+            amount: "255.00",
+            currency: "USD",
+          },
+        ],
+      },
+    ],
+  };
+  const bytes = new TextEncoder().encode(JSON.stringify(decoyPayload));
+  const { activity: rows } = await syntheticAdapter.parse({ kind: "structured_api", bytes });
+  assert.equal(rows.length, 2);
+
+  for (const [i, row] of rows.entries()) {
+    const { binding } = row.locators.row;
+    assert.equal(binding.pointer, `/pages/0/items/${i}/amount`);
+    assert.notEqual(binding.rawValue, "DECOY-DO-NOT-CITE");
+    const resolved = resolveJsonPointer(bytes, binding.pointer);
+    assert.equal(resolved, binding.rawValue);
+  }
+  assert.equal(rows[0].amount, "-250.00");
+  assert.equal(rows[0].locators.row.binding.rawValue, "\"-250.00\"");
+  assert.equal(rows[1].amount, "255.00");
+  assert.equal(rows[1].locators.row.binding.rawValue, "\"255.00\"");
+});
+
+test("parse() on the tabular export tier binds each row's amount to a delimited row/column that resolves against the retained bytes, with physical row indices", async () => {
+  const session = createSyntheticSession();
+  const acquired = await syntheticAdapter.acquire({
+    kind: "tabular_export",
+    session,
+    periodStart: "2025-01-01",
+    periodEnd: "2025-04-01",
+  });
+  const { activity: rows } = await syntheticAdapter.parse({
+    kind: "tabular_export",
+    bytes: acquired.bytes,
+  });
+  assert.ok(rows.length > 0);
+
+  for (const row of rows) {
+    const { binding } = row.locators.row;
+    assert.deepEqual(
+      { delimiter: binding.delimiter, quote: binding.quote, headerRows: binding.headerRows, recordSeparator: binding.recordSeparator },
+      { delimiter: ",", quote: "none", headerRows: 1, recordSeparator: "lf" },
+    );
+    assert.equal(binding.columnIndex, 6);
+    assert.equal(binding.columnName, "amount");
+    const resolved = resolveDelimitedField(acquired.bytes, binding);
+    assert.equal(resolved, binding.rawValue);
+  }
+
+  // rowIndex is the physical zero-based data-record position: sequential,
+  // no gaps, one per row, matching what parseTabularExport's own index
+  // (locators.row.index) reports -- the bug this slice fixes was that a
+  // filtered index and a physical position could disagree.
+  const rowIndices = rows.map((row) => row.locators.row.binding.rowIndex);
+  assert.deepEqual(rowIndices, rows.map((_row, i) => i));
+  assert.deepEqual(
+    rows.map((row) => row.locators.row.index),
+    rowIndices,
+  );
+});
+
+test("parse() on a PDF statement and a trade confirmation carries no binding anywhere", async () => {
+  const session = createSyntheticSession();
+  const { documents } = await syntheticAdapter.discover(session);
+  const statement = documents.items.find((doc) => doc.kind === "pdf_statement");
+  const statementAcquired = await syntheticAdapter.acquire({
+    kind: "pdf_statement",
+    session,
+    externalId: statement.externalId,
+  });
+  const statementParsed = await syntheticAdapter.parse({
+    kind: "pdf_statement",
+    bytes: statementAcquired.bytes,
+  });
+  const confirmationAcquired = await syntheticAdapter.acquire({
+    kind: "trade_confirmation",
+    session,
+    externalId: "doc-conf-2025-02-10",
+  });
+  const confirmationParsed = await syntheticAdapter.parse({
+    kind: "trade_confirmation",
+    bytes: confirmationAcquired.bytes,
+  });
+
+  const allLocators = [
+    ...statementParsed.activity.flatMap((row) => Object.values(row.locators)),
+    ...statementParsed.holdings.positions.flatMap((p) => Object.values(p.locators)),
+    ...statementParsed.holdings.balances.flatMap((b) => Object.values(b.locators)),
+    ...statementParsed.holdings.liabilities.flatMap((l) => Object.values(l.locators)),
+    ...confirmationParsed.activity.flatMap((row) => Object.values(row.locators)),
+  ];
+  assert.ok(allLocators.length > 0);
+  for (const locator of allLocators) {
+    assert.equal(locator.binding, undefined, "the PDF tier emits no binding in this slice");
+  }
+});
