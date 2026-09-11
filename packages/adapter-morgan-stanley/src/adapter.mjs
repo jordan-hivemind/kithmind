@@ -439,6 +439,26 @@ function documentPeriod(kind, documentDate) {
   return { periodStart: day, periodEnd: day };
 }
 
+
+/** The documents service answers a transient 400 "Service Error" on the first
+ * call or two after the app refreshes its bearer (seen live 2026-09-11, the
+ * same request succeeding seconds later). Retry that exact failure a few
+ * times with a short pause; anything else propagates unchanged. */
+async function fetchWithServiceErrorRetry(call, attempts = 4) {
+  let last;
+  for (let i = 0; i < attempts; i += 1) {
+    try {
+      return await call();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!/request failed: 400\b/.test(message) || !/Service Error/.test(message)) throw error;
+      last = error;
+      await new Promise((resolve) => setTimeout(resolve, 1500 * (i + 1)));
+    }
+  }
+  throw last;
+}
+
 async function fetchDocumentsPages(session, docType, kind) {
   const items = [];
   let providerTotal = 0;
@@ -447,7 +467,9 @@ async function fetchDocumentsPages(session, docType, kind) {
     let yearTotal = null;
     let yearCount = 0;
     for (;;) {
-      const pageText = await session.fetchText("/documents", { docType, timeFrame, page: String(pageNumber) });
+      const pageText = await fetchWithServiceErrorRetry(() =>
+        session.fetchText("/documents", { docType, timeFrame, page: String(pageNumber) }),
+      );
       const page = JSON.parse(pageText);
       const pageItems = page?.[MS_DOCUMENTS_ITEMS_KEY];
       if (!Array.isArray(pageItems)) {
