@@ -212,18 +212,35 @@ async function applyPrivileges(
     "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1) AS present",
     [role],
   );
-  if (!exists.rows[0]!.present) {
-    await client.query(`CREATE ROLE ${role} WITH LOGIN`);
-  }
-
+  // SUPERUSER, BYPASSRLS and REPLICATION are stated once, here. Postgres lets
+  // a non-superuser CREATE ROLE *mention* them -- only setting them true is
+  // gated -- but ALTER ROLE refuses the mention itself unless the actor is a
+  // superuser, even when it names the value the role already has. The hosted
+  // archive owner has CREATEROLE and CREATEDB and is not a superuser, so an
+  // ALTER that re-asserted them failed with 42501 and the reader was never
+  // created. The re-run path verifies them instead (verifyAttributes).
+  //
   // NOINHERIT so a membership someone adds later does not silently hand the
   // reader another role's privileges. The membership assertion below closes
   // the SET ROLE half, which NOINHERIT does not.
-  await client.query(
-    `ALTER ROLE ${role} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
-       NOINHERIT NOREPLICATION NOBYPASSRLS
-       CONNECTION LIMIT ${connectionLimit} PASSWORD ${password}`,
-  );
+  if (!exists.rows[0]!.present) {
+    await client.query(
+      `CREATE ROLE ${role} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+         NOINHERIT NOREPLICATION NOBYPASSRLS
+         CONNECTION LIMIT ${connectionLimit} PASSWORD ${password}`,
+    );
+  } else {
+    // Only the attributes a non-superuser owner may legitimately alter.
+    await client.query(
+      `ALTER ROLE ${role} WITH LOGIN NOCREATEDB NOCREATEROLE NOINHERIT
+         CONNECTION LIMIT ${connectionLimit} PASSWORD ${password}`,
+    );
+  }
+
+  // The boundary is asserted rather than assumed, on both paths: a role that
+  // already existed with SUPERUSER or BYPASSRLS cannot be demoted from here,
+  // so it is refused loudly instead of being reported as a reader.
+  await verifyAttributes(client, role);
 
   // Role-level defaults. Each is a floor rather than a boundary -- the role
   // can raise any of them with its own SET -- which is why the surface does
@@ -334,6 +351,59 @@ async function applyPrivileges(
         .map((row) => row.grantor)
         .join(", ")}; a reader must own nothing and inherit nothing, so remove ` +
         "the membership rather than relying on NOINHERIT, which does not stop SET ROLE",
+    );
+  }
+}
+
+/**
+ * The attribute half of the boundary, read back from the catalog.
+ *
+ * Three of these (`rolsuper`, `rolbypassrls`, `rolreplication`) can only be
+ * named in `ALTER ROLE` by a superuser, so on a re-run there is no statement
+ * the archive owner could issue to force them. Checking is what is left, and
+ * an existing role that does not already satisfy the boundary is an error:
+ * silently handing back a reader that can bypass row security would be worse
+ * than failing.
+ */
+async function verifyAttributes(
+  client: pg.ClientBase,
+  role: string,
+): Promise<void> {
+  const attributes = await client.query<{
+    rolsuper: boolean;
+    rolbypassrls: boolean;
+    rolreplication: boolean;
+    rolcreatedb: boolean;
+    rolcreaterole: boolean;
+    rolinherit: boolean;
+  }>(
+    `SELECT rolsuper, rolbypassrls, rolreplication, rolcreatedb, rolcreaterole,
+            rolinherit
+       FROM pg_roles WHERE rolname = $1`,
+    [role],
+  );
+  const row = attributes.rows[0];
+  if (!row) {
+    throw new Error(`${role} does not exist after its setup ran`);
+  }
+  const held = (
+    [
+      ["SUPERUSER", row.rolsuper],
+      ["BYPASSRLS", row.rolbypassrls],
+      ["REPLICATION", row.rolreplication],
+      ["CREATEDB", row.rolcreatedb],
+      ["CREATEROLE", row.rolcreaterole],
+      ["INHERIT", row.rolinherit],
+    ] as const
+  )
+    .filter(([, value]) => value)
+    .map(([name]) => name);
+  if (held.length) {
+    throw new Error(
+      `${role} already exists with ${held.join(", ")}; a reader must hold none of ` +
+        "SUPERUSER, BYPASSRLS, REPLICATION, CREATEDB, CREATEROLE or INHERIT. " +
+        "SUPERUSER, BYPASSRLS and REPLICATION cannot be removed by a non-superuser " +
+        "owner, so drop the role and let this function create it",
     );
   }
 }

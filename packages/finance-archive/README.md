@@ -1175,6 +1175,14 @@ a later table is born with. So:
 | Rows                | Every generated statement carries its own `LIMIT`; the contract caps a page at 100                |
 | Concurrency         | `CONNECTION LIMIT`, enforced at connection time and not settable from inside a session            |
 
+`SUPERUSER`, `BYPASSRLS` and `REPLICATION` are stated once, in `CREATE ROLE`.
+Postgres lets a non-superuser mention them there -- only setting them true is
+gated -- but refuses the mention in `ALTER ROLE`, even when it names the value
+the role already has. The hosted owner has `CREATEROLE` and `CREATEDB` and is
+not a superuser, so the re-run path reads those attributes back from
+`pg_roles` and refuses a role that does not already satisfy the boundary
+rather than issuing a statement the owner cannot run (F1-30).
+
 The role's `statement_timeout` is a setting the role can raise, so it is
 deliberately not the only control. `CONNECTION LIMIT` cannot be raised from
 inside a session, which needs `CREATEROLE`; the `LIMIT` is in the SQL the
@@ -1199,6 +1207,9 @@ silently readable" requirement bites.
 
 `test/pgReaderRole.test.mjs` re-expresses each of the seventeen SQLite attacks
 as its Postgres equivalent and asserts refusal against a real server. The
+setup under them runs as a non-superuser role with `CREATEROLE` and
+`CREATEDB` that owns its own throwaway database, which is what the hosted
+owner is; running it as a superuser hid F1-30. The
 mapping is in a table at the top of that file. Confirming that a `PRAGMA` is a
 syntax error on Postgres would prove nothing, so none of these do that. They
 test writes and DDL under the reader role, `COPY` to and from a file and to a

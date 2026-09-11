@@ -16,6 +16,7 @@
 // clone sets neither variable and still skips cleanly.
 
 import { randomBytes } from "node:crypto";
+import { after } from "node:test";
 
 import {
   applyPgReaderRole,
@@ -48,6 +49,22 @@ export function testSchemaName() {
 const SCHEMA = Symbol("archive schema");
 
 /**
+ * Where an archive records the credentials it was opened with, so `reader`
+ * builds its connection string against the right database and role rather
+ * than assuming the configured superuser's.
+ */
+const URLS = Symbol("archive urls");
+
+/** The configured connection string with different credentials or database. */
+function urlFor({ user, password, database }, base = url) {
+  const parsed = new URL(base);
+  if (user !== undefined) parsed.username = user;
+  if (password !== undefined) parsed.password = password;
+  if (database !== undefined) parsed.pathname = `/${database}`;
+  return parsed.toString();
+}
+
+/**
  * A connected client on a fresh archive schema, dropped when the test ends.
  */
 export async function archive(t) {
@@ -56,11 +73,111 @@ export async function archive(t) {
   await client.connect();
   await applyPgSchema(client);
   client[SCHEMA] = name;
+  client[URLS] = { owner: url, admin: url };
   t.after(async () => {
     await client.query(`DROP SCHEMA IF EXISTS ${name} CASCADE`);
     await client.end();
   });
   return client;
+}
+
+// --- a non-superuser owner (F1-30) ------------------------------------------
+//
+// The hosted archive owner has CREATEROLE and CREATEDB and is *not* a
+// superuser. A setup path exercised only as a superuser cannot tell a
+// statement that works from one Postgres gates on superuser, which is how
+// `ALTER ROLE ... NOSUPERUSER NOBYPASSRLS` shipped: legal to write, refused
+// with 42501 for the role that actually runs it.
+//
+// Such an owner needs a database of its own. Revoking PUBLIC's CONNECT and
+// TEMPORARY, and PUBLIC's USAGE on schema `public`, are a database owner's
+// acts: a privilege PUBLIC holds cannot be revoked by a role that merely has
+// grants. One database is provisioned per file and each test still gets its
+// own throwaway schema inside it.
+
+let owned = null;
+
+/** The shared non-superuser owner role and its database, created on demand. */
+function provisionOwner() {
+  owned ??= (async () => {
+    const suffix = randomBytes(6).toString("hex");
+    const role = `finance_archive_owner_${suffix}`;
+    const password = testReaderPassword();
+    const database = `finance_archive_db_${suffix}`;
+    const admin = createArchiveClient(url, testSchemaName());
+    await admin.connect();
+    try {
+      await admin.query(
+        `CREATE ROLE ${role} WITH LOGIN CREATEROLE CREATEDB NOSUPERUSER
+           NOBYPASSRLS NOREPLICATION PASSWORD '${password}'`,
+      );
+      await admin.query(`CREATE DATABASE ${database} OWNER ${role}`);
+    } finally {
+      await admin.end();
+    }
+    const adminUrl = urlFor({ database });
+    // On Postgres 15 and later a new database's `public` schema is owned by
+    // `pg_database_owner`, of which the database owner is implicitly a
+    // member. Stating the ownership makes the same test meaningful on 14,
+    // where `public` is owned by the bootstrap superuser instead.
+    const inDatabase = createArchiveClient(adminUrl, testSchemaName());
+    await inDatabase.connect();
+    try {
+      await inDatabase.query(`ALTER SCHEMA public OWNER TO ${role}`);
+    } finally {
+      await inDatabase.end();
+    }
+    return {
+      role,
+      database,
+      adminUrl,
+      ownerUrl: urlFor({ user: role, password, database }),
+    };
+  })();
+  return owned;
+}
+
+after(async () => {
+  if (!owned) return;
+  const { role, database } = await owned;
+  const admin = createArchiveClient(url, testSchemaName());
+  await admin.connect();
+  try {
+    // FORCE, because a reader connection the suite failed to close would
+    // otherwise turn a cleanup into a hang.
+    await admin.query(`DROP DATABASE IF EXISTS ${database} WITH (FORCE)`);
+    await admin.query(`DROP ROLE IF EXISTS ${role}`);
+  } finally {
+    await admin.end();
+  }
+});
+
+/**
+ * The same as `archive`, except the client is connected as a non-superuser
+ * role with CREATEROLE and CREATEDB that owns its database: what the hosted
+ * archive owner is.
+ */
+export async function nonSuperuserArchive(t) {
+  const { ownerUrl, adminUrl } = await provisionOwner();
+  const name = testSchemaName();
+  const client = createArchiveClient(ownerUrl, name);
+  await client.connect();
+  await applyPgSchema(client);
+  client[SCHEMA] = name;
+  client[URLS] = { owner: ownerUrl, admin: adminUrl };
+  t.after(async () => {
+    await client.query(`DROP SCHEMA IF EXISTS ${name} CASCADE`);
+    await client.end();
+  });
+  return client;
+}
+
+/** A superuser connection onto an archive's database, for test setup. */
+export async function adminFor(t, client) {
+  const admin = createArchiveClient(client[URLS].admin, client[SCHEMA]);
+  await admin.connect();
+  t.after(() => admin.end());
+  return admin;
 }
 
 /**
@@ -70,7 +187,7 @@ export async function archive(t) {
  * observe from outside whether a publication is atomic.
  */
 export async function connect(t, client) {
-  const second = createArchiveClient(url, client[SCHEMA]);
+  const second = createArchiveClient(client[URLS].owner, client[SCHEMA]);
   await second.connect();
   t.after(() => second.end());
   return second;
@@ -111,11 +228,8 @@ export function testReaderPassword() {
 }
 
 /** The same connection string with the reader's own credentials. */
-export function readerUrlFor(role, password) {
-  const parsed = new URL(url);
-  parsed.username = role;
-  parsed.password = password;
-  return parsed.toString();
+export function readerUrlFor(role, password, base = url) {
+  return urlFor({ user: role, password }, base);
 }
 
 /**
@@ -125,7 +239,8 @@ export function readerUrlFor(role, password) {
 export async function reader(t, client, options = {}) {
   const password = testReaderPassword();
   const summary = await applyPgReaderRole(client, { password, ...options });
-  const readerUrl = readerUrlFor(summary.role, password);
+  const urls = client[URLS];
+  const readerUrl = readerUrlFor(summary.role, password, urls.owner);
   const connection = createArchiveClient(readerUrl, summary.schema);
   await connection.connect();
   // One self-contained hook, on its own short-lived admin connection. Hanging
@@ -134,7 +249,7 @@ export async function reader(t, client, options = {}) {
   // closed and the whole run hangs on an open handle rather than failing.
   t.after(async () => {
     await connection.end().catch(() => {});
-    const admin = createArchiveClient(url, summary.schema);
+    const admin = createArchiveClient(urls.admin, summary.schema);
     await admin.connect();
     try {
       // Same advisory lock the setup takes: dropping a role rewrites the same
