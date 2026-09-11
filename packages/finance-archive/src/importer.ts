@@ -197,6 +197,9 @@ export type ImportLiability = {
 export type ImportDocument = {
   /** sha256 of the raw file's bytes. The dedupe key for whole-document skip. */
   sha256: string;
+  /** Present when the adapter retained the bytes but could not parse them; the
+   * document is recorded as not parsed and a review item names why. */
+  parseNote?: string | null;
   /** Local path in the raw tree. Never a repository path. */
   filePath: string;
   institutionId: string;
@@ -875,6 +878,26 @@ export async function importBatch(
       // skip next time) if nothing in it was ever refused.
       const occurrences = new Map<string, number>();
       let documentRefused = false;
+      if (document.parseNote) {
+        // Retained but unparsed: keep it re-importable (parsed_ok stays
+        // FALSE below) and say so in the queue -- but only once. The same
+        // still-unparsed bytes produce the identical parseNote on every
+        // rerun until a real extractor replaces this one, so without this
+        // check a rerun reopens a duplicate document_unparsed row forever
+        // instead of being recognized as already flagged.
+        documentRefused = true;
+        const alreadyFlagged = await client.query(
+          "SELECT 1 FROM review_items WHERE kind = 'document_unparsed' AND source_document_id = $1",
+          [documentId],
+        );
+        if (alreadyFlagged.rowCount === 0) {
+          await client.query(
+            `INSERT INTO review_items (id, kind, account_id, source_document_id, source_locator, raw_value, reason)
+             VALUES ($1, 'document_unparsed', $2, $3, NULL, NULL, $4)`,
+            [randomUUID(), document.accountId, documentId, document.parseNote.slice(0, 500)],
+          );
+        }
+      }
       for (const row of document.rows) {
         const outcome = await importRow(row, documentId, occurrences);
         if (outcome === "inserted") rowsInserted += 1;

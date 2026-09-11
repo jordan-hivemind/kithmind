@@ -1209,3 +1209,100 @@ test(
     assert.equal(brokerageCount + trustCount, acquired.manifest.reportedRowCount);
   },
 );
+
+// F1-43. A real institution's PDF statements use compressed content streams
+// the adapter's dependency-free extractor cannot read; parse() then returns
+// a parseNote instead of throwing, and the retained bytes must still be
+// recorded rather than lost. No hand-built AdapterPull.acquired here either
+// -- the synthetic adapter's own pdf_statement acquisition supplies real
+// bytes, a real manifest and a real persisted capture; only `rows`/`parseNote`
+// stand in for what a not-yet-supported extractor's parse() would have
+// returned for them.
+async function acquireUnparseablePdfStatement(t, client) {
+  const session = createSyntheticSession();
+  const { documents: discovered } = await syntheticAdapter.discover(session);
+  const statement = discovered.items.find((doc) => doc.kind === "pdf_statement");
+  const acquired = await syntheticAdapter.acquire({
+    kind: "pdf_statement",
+    session,
+    externalId: statement.externalId,
+  });
+  const persisted = persist(t, acquired, "pdf_statement");
+  const pull = {
+    institutionId: INSTITUTION.id,
+    accountId: ACCOUNT.id,
+    acquired,
+    rows: [],
+    parseNote: "not parsed: extractor found no text",
+    docType: "pdf_statement",
+    docDate: statement.periodEnd,
+    persisted,
+  };
+  const documents = await adapterPullToImportDocuments(client, pull);
+  return { pull, documents };
+}
+
+test(
+  "a document the adapter retained but could not parse records one document with parsed_ok false and opens a document_unparsed review item",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedPg(client);
+
+    const { documents } = await acquireUnparseablePdfStatement(t, client);
+    assert.equal(documents.length, 1, "a rowless pull is still one document, not zero");
+    assert.equal(documents[0].parseNote, "not parsed: extractor found no text");
+    assert.equal(documents[0].rows.length, 0);
+
+    const summary = await importBatch(
+      client,
+      { source: INSTITUTION.slug, documents },
+      new Date("2025-05-01"),
+    );
+    assert.equal(summary.rowsInserted, 0);
+
+    assert.equal(await count(client, "documents"), 1);
+    const [document] = await all(client, "SELECT parsed_ok FROM documents");
+    assert.equal(document.parsed_ok, false);
+
+    const reviewItems = await all(
+      client,
+      "SELECT account_id, reason FROM review_items WHERE kind = $1",
+      ["document_unparsed"],
+    );
+    assert.equal(reviewItems.length, 1);
+    assert.equal(reviewItems[0].account_id, ACCOUNT.id);
+    assert.equal(reviewItems[0].reason, "not parsed: extractor found no text");
+  },
+);
+
+test(
+  "a rerun of the same unparsed pull is skipped as already imported: no second document row or duplicate review item",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedPg(client);
+
+    const { pull } = await acquireUnparseablePdfStatement(t, client);
+    await importBatch(
+      client,
+      { source: INSTITUTION.slug, documents: await adapterPullToImportDocuments(client, pull) },
+      new Date("2025-05-01"),
+    );
+    assert.equal(await count(client, "review_items", "WHERE kind = $1", ["document_unparsed"]), 1);
+
+    // The identical bytes, re-parsed by the same still-broken extractor,
+    // produce the identical parseNote -- exactly what a real rerun looks
+    // like before a real extractor replaces this one. Nothing here doubles:
+    // same one document row, same one review item.
+    const rerunDocuments = await adapterPullToImportDocuments(client, pull);
+    const second = await importBatch(
+      client,
+      { source: INSTITUTION.slug, documents: rerunDocuments },
+      new Date("2025-05-01"),
+    );
+    assert.equal(second.rowsInserted, 0);
+    assert.equal(await count(client, "documents"), 1);
+    assert.equal(await count(client, "review_items", "WHERE kind = $1", ["document_unparsed"]), 1);
+  },
+);

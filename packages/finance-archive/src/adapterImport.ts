@@ -83,6 +83,8 @@ export type AdapterPull = {
   readonly acquired: AcquiredDocument;
   readonly rows: readonly ParsedRow[];
   readonly holdings?: ParsedHoldings;
+  /** The adapter's parse note when the bytes were retained but not parsed. */
+  readonly parseNote?: string;
   readonly docType: string;
   readonly docDate: string | null;
   readonly persisted: PersistedAcquisition;
@@ -828,6 +830,11 @@ async function collectDocuments(
     ...balanceGroups.keys(),
     ...liabilityGroups.keys(),
   ]);
+  // A document-tier pull the adapter could not parse (or a genuinely empty
+  // one) has no rows to group by, but the retained file still has to be
+  // recorded: otherwise nothing marks it acquired, a rerun downloads it
+  // again, and the parse note has nowhere to live. One record, no rows.
+  if (sourceDocuments.size === 0) sourceDocuments.add("document");
   const single = sourceDocuments.size === 1;
 
   const documents: ImportDocument[] = [];
@@ -860,6 +867,7 @@ async function collectDocuments(
       mediaType: pull.acquired.manifest.mediaType,
       captureId: pull.persisted.captureId,
       textPath: pull.persisted.textPath,
+      parseNote: pull.parseNote ?? null,
       institutionId: pull.institutionId,
       accountId: pull.accountId,
       docType: pull.docType,

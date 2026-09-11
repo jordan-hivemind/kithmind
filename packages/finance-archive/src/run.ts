@@ -835,6 +835,7 @@ async function main(): Promise<void> {
           acquired,
           rows: parsed.activity,
           holdings: parsed.holdings,
+          parseNote: parsed.parseNote,
           docType: spec.docType,
           docDate: spec.docDate,
           persisted,
@@ -962,6 +963,17 @@ async function main(): Promise<void> {
             documentPullsFailed += 1;
             bumpDocKind(spec.selection.kind, "failed");
             reportFailure(spec, error);
+            // A lost browser session fails every remaining document the same
+            // way within milliseconds (20,757 of them on the first full pull).
+            // Stop instead: what was committed stays committed, and the rerun
+            // skips documents already imported.
+            const message = error instanceof Error ? error.message : String(error);
+            if (/SIGNED_OUT|no session headers captured yet|no Authorization bearer captured yet/.test(message)) {
+              throw new Error(
+                `run stopped: the browser session is gone (${message.slice(0, 120)}). ` +
+                  `${documentPullsAcquired} document pull(s) were committed before this; sign in again and rerun the same selection to continue.`,
+              );
+            }
             continue;
           }
           pendingDocBatch.push({ spec, acquired });

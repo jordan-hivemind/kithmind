@@ -309,6 +309,9 @@ const HEADER_HOOK = `(() => {
 export function pageFetchExpression(origin, { method, url, body, headers, needsAuthorization }) {
   return `(async () => {
     const slot = Object.fromEntries(Object.entries(globalThis[Symbol.for(${JSON.stringify(CAPTURED_HEADERS_SLOT)})] ?? {}).map(([k, v]) => [k.toLowerCase(), v]));
+    if (!location.href.startsWith(${JSON.stringify(origin)})) {
+      throw new Error("SIGNED_OUT: the tab left the app origin (a session timeout redirects to the login page); sign in again and retry");
+    }
     if (Object.keys(slot).length === 0) {
       throw new Error("no session headers captured yet: open the Activity tab in this Chrome window, then retry");
     }
@@ -426,5 +429,37 @@ export default async function createMorganStanleySession(options = {}) {
     return Uint8Array.from(Buffer.from(base64, "base64"));
   }
 
-  return { institutionSlug: "morgan-stanley", fetchText, fetchBytes };
+  const keepAlive = startKeepAlive(cdp, origin);
+
+  return { institutionSlug: "morgan-stanley", fetchText, fetchBytes, close: () => clearInterval(keepAlive) };
+}
+
+const KEEP_ALIVE_INTERVAL_MS = 4 * 60 * 1000;
+
+/**
+ * Keep-alive. A long import between two site calls (twenty minutes on the
+ * first full pull) let the app session idle out and every later document
+ * fetch failed on an empty header slot. The app itself extends its session
+ * with this call; doing the same every four minutes keeps it alive without
+ * touching any credential. `unref` so the timer never keeps the process up.
+ * Exported for test/bridge.test.mjs only (same convention as `evaluate`
+ * above): every other caller reaches it only through
+ * createMorganStanleySession, unchanged.
+ */
+export function startKeepAlive(cdp, origin) {
+  const keepAlive = setInterval(() => {
+    const { requestId, seqId } = randomUuidQueryIds();
+    evaluate(
+      cdp,
+      pageFetchExpression(origin, {
+        method: "GET",
+        url: `/shell/handler/proxy/sal/api/AzureSession/Extend?RequestID=${requestId}&SeqID=${seqId}`,
+        body: null,
+        headers: { Accept: "application/json" },
+        needsAuthorization: false,
+      }),
+    ).catch(() => {});
+  }, KEEP_ALIVE_INTERVAL_MS);
+  keepAlive.unref();
+  return keepAlive;
 }

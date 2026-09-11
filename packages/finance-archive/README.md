@@ -478,6 +478,18 @@ for the field in question) and flags it.
 This importer always writes `reconciliations_passed` and `reconciliations_failed`
 as 0; the reconciliation gate is a separate step run after import (see below).
 
+A document the adapter's `parse()` retained but could not parse at all --
+bytes acquired, zero rows, `AdapterPull.parseNote` set (F1-43; a real PDF
+whose extractor found no text is the case that motivated this) -- still
+becomes exactly one `ImportDocument`, with no rows, rather than vanishing:
+`collectDocuments` (`adapterImport.ts`) adds a single placeholder document
+identity when a pull's rows and holdings group into nothing, so the retained
+file is recorded and a rerun does not re-download it looking for something
+to import. The importer records it with `parsed_ok` false and opens one
+`document_unparsed` review item naming the note, so it stays visible until a
+real extractor revisits it; a rerun of the identical still-unparsed bytes
+does not reopen a second review item for the same document.
+
 ### Holdings (positions, balances, liabilities)
 
 `ImportDocument.positions`, `.balances` and `.liabilities` get the same
@@ -856,6 +868,19 @@ The summary additionally reports documents discovered by kind (from
 `discover()`, independent of any selection entry), and document-tier pulls
 acquired, skipped as already imported, and failed, both overall and broken
 down per kind -- counts only, no external ids.
+
+A failed document pull is ordinarily reported and skipped, and the run
+continues -- except when the failure is the browser session itself being
+gone (a `SIGNED_OUT` error, or the "no session headers"/"no Authorization
+bearer" errors a real adapter's bridge throws for the same reason; see
+`packages/adapter-morgan-stanley`'s "How the session works"). That class of
+failure fails every remaining document pull the same way within
+milliseconds, so the run stops instead of grinding through the rest --
+seen live once, at 20,757 failed pulls before the fix. Everything already
+committed (each `--commit-every` batch is its own transaction) stays
+committed; the error names how many document pulls that was, and signing in
+again and rerunning the same selection continues where it left off, since a
+document already imported is skipped either way.
 
 `institutionId` is no
 longer named here either (F1-19): before `discover`, `main()` calls

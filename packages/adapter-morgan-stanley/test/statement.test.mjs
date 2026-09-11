@@ -69,6 +69,31 @@ test("extractStatementText falls back to plain UTF-8 decoding for non-PDF bytes"
   assert.equal(extractStatementText(new TextEncoder().encode(text)), text);
 });
 
+// F1-43. A real statement's compressed content stream has no literal Tj
+// operator this dependency-free extractor can find; `buildMinimalPdf([])`
+// (a real PDF, zero text lines) is the smallest fixture that reproduces the
+// same "found a PDF but no Tj text operators in it" failure without needing
+// a real compressed stream. parse() must retain the bytes as a noted empty
+// pull, not throw and lose them.
+test("parse() retains the bytes and returns a noted empty pull when the PDF extractor finds no text", async () => {
+  const unreadablePdf = buildMinimalPdf([]);
+  assert.ok(Buffer.from(unreadablePdf).toString("latin1").startsWith("%PDF-"), "still a real PDF");
+  assert.throws(() => extractStatementText(unreadablePdf), /found a PDF but no Tj text operators/);
+
+  const parsed = await adapter.parse({ kind: "pdf_statement", bytes: unreadablePdf });
+  assert.deepEqual(parsed.activity, []);
+  assert.deepEqual(parsed.holdings, { positions: [], balances: [], liabilities: [] });
+  assert.match(parsed.parseNote, /^not parsed: .*found a PDF but no Tj text operators/);
+});
+
+test("parse() notes the same unreadable-PDF failure for a trade confirmation", async () => {
+  const unreadablePdf = buildMinimalPdf([]);
+  const parsed = await adapter.parse({ kind: "trade_confirmation", bytes: unreadablePdf });
+  assert.deepEqual(parsed.activity, []);
+  assert.deepEqual(parsed.holdings, { positions: [], balances: [], liabilities: [] });
+  assert.match(parsed.parseNote, /^not parsed: /);
+});
+
 test("acquire + parse round-trip a real PDF-shaped statement end to end", async () => {
   const session = createFixtureSession();
   const discovered = await adapter.discover(session);
