@@ -418,14 +418,55 @@ export default async function createMorganStanleySession(options = {}) {
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
 
+  // A bearer expires long before the site session does. The app refreshes
+  // its own from this endpoint; doing the same, page-side, keeps the value
+  // inside the page exactly like a captured header. Only the outcome is
+  // reported, never the token.
+  async function refreshBearer() {
+    const { requestId, seqId } = randomUuidQueryIds();
+    const ok = await evaluate(
+      cdp,
+      `(async () => {
+        const slotKey = Symbol.for(${JSON.stringify(CAPTURED_HEADERS_SLOT)});
+        const slot = globalThis[slotKey] ?? (globalThis[slotKey] = {});
+        const lower = Object.fromEntries(Object.entries(slot).map(([k, v]) => [k.toLowerCase(), v]));
+        const headers = { "Accept": "application/json", "Content-Type": "application/json" };
+        for (const k of ["x-xsrf-token", "x-device-footprint"]) if (lower[k]) headers[k] = lower[k];
+        const r = await fetch(${JSON.stringify(origin)} + "/shell/handler/restproxy/access/api/JWTToken/GetAccessToken?RequestID=${requestId}&SeqID=${seqId}", { method: "POST", headers, credentials: "include", body: "" });
+        if (!r.ok) return "status " + r.status;
+        const text = await r.text();
+        let token = null;
+        try { const j = JSON.parse(text); const pick = (o) => { if (!o || typeof o !== "object") return null; for (const [k, v] of Object.entries(o)) { if (typeof v === "string" && /token/i.test(k) && v.length > 40) return v; } for (const v of Object.values(o)) { const t = pick(v); if (t) return t; } return null; }; token = pick(j); } catch { token = text.length > 40 ? text.replace(/^"|"$/g, "") : null; }
+        if (!token) return "no token field";
+        for (const k of Object.keys(slot)) if (k.toLowerCase() === "authorization") delete slot[k];
+        slot["authorization"] = token.startsWith("Bearer ") ? token : "Bearer " + token;
+        return "refreshed";
+      })()`,
+    );
+    console.error(new Date().toISOString(), "[bridge] bearer refresh:", ok);
+    return ok === "refreshed";
+  }
+
+  async function withBearerRetry(request, run) {
+    try {
+      return await run();
+    } catch (error) {
+      const message = String(error?.message ?? error);
+      if (request.needsAuthorization && /request failed: 401\b/.test(message) && (await refreshBearer())) {
+        return run();
+      }
+      throw error;
+    }
+  }
+
   async function fetchText(path, query = {}) {
     const request = resolveEndpoint(path, query);
-    return evaluate(cdp, pageFetchExpression(origin, request));
+    return withBearerRetry(request, () => evaluate(cdp, pageFetchExpression(origin, request)));
   }
 
   async function fetchBytes(path, query = {}) {
     const request = resolveEndpoint(path, query);
-    const base64 = await evaluate(cdp, pageFetchBytesExpression(origin, request));
+    const base64 = await withBearerRetry(request, () => evaluate(cdp, pageFetchBytesExpression(origin, request)));
     return Uint8Array.from(Buffer.from(base64, "base64"));
   }
 
@@ -458,7 +499,9 @@ export function startKeepAlive(cdp, origin) {
         headers: { Accept: "application/json" },
         needsAuthorization: false,
       }),
-    ).catch(() => {});
+    )
+      .then(() => console.error(new Date().toISOString(), "[bridge] keep-alive ok"))
+      .catch((error) => console.error(new Date().toISOString(), "[bridge] keep-alive failed:", String(error?.message ?? error).slice(0, 120)));
   }, KEEP_ALIVE_INTERVAL_MS);
   keepAlive.unref();
   return keepAlive;
