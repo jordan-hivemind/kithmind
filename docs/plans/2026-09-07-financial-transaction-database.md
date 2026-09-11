@@ -98,14 +98,20 @@ institution and nothing about the store.
 
 ```
 discover(session)  -> inventory of available documents and export ranges,
-                      with the provider's own count where one is reported
+                      discovered accounts (F1-32), with the provider's own
+                      count where one is reported
 acquire(selection) -> raw bytes written to the raw tree, plus an acquisition
-                      manifest entry: period, capture time, content hash, gaps
-parse(raw_file)    -> normalized rows with per-field locators, amounts as
-                      strings, original currency preserved
+                      manifest entry: period, capture time, content hash,
+                      media type of the retained bytes, gaps
+parse(raw_file)    -> normalized rows with per-field locators, each
+                      optionally binding one field to its retained JSON or
+                      delimited bytes (F1-29), amounts as strings, original
+                      currency preserved
 capabilities()     -> which of {structured API, tabular export, PDF statement,
                       trade confirmation} this institution supports, retention
-                      window, and known quirks
+                      window, known quirks, and an activity taxonomy (F1-19)
+                      declaring per activity type whether it moves cash,
+                      moves quantity, and the required quantity sign
 ```
 
 Three capability tiers exist and an adapter declares which it implements. A
@@ -154,8 +160,8 @@ about storage:
 ```
 institutions(id, name, slug)
 
-accounts(id, institution_id, acct_last4, display_name, account_type,
-         program, registration, owner_entity_id, is_pledged,
+accounts(id, institution_id, external_key, acct_last4, display_name,
+         account_type, program, registration, owner_entity_id, is_pledged,
          base_currency, opened_date, closed_date, notes)
 
 instruments(id, symbol, cusip, isin, name, instrument_kind, asset_class,
@@ -183,7 +189,8 @@ commitments(id, account_id, instrument_id, committed, called, outstanding,
             fx_rate, status, as_of, source_document_id)
 
 documents(id, institution_id, account_id, doc_type, doc_date, file_path,
-          sha256, text_path, parsed_ok, notes)
+          sha256, text_path, parsed_ok, notes, retained_sha256,
+          retained_byte_length, media_type, capture_id)
 
 import_runs(id, started_at, finished_at, source, files_seen, rows_inserted,
             rows_skipped, reconciliations_passed, reconciliations_failed,
@@ -202,6 +209,20 @@ review_items(id, kind, account_id, source_document_id, source_locator,
 
 Only the last four digits of any account number are stored. Raw documents keep
 whatever they contain and are not redacted.
+
+`documents.retained_sha256`, `retained_byte_length`, `media_type` and
+`capture_id` (schema version 2) name the immutable retained bytes a row was
+parsed from, declared by the adapter rather than inferred from the capability
+tier. All four are nullable and all-or-nothing: a document imported before
+this migration keeps four nulls and produces no evidence (see "Access for
+assistants"). `accounts.external_key` (schema version 3) lets a selection
+name an account by the adapter's own discovered key instead of an
+already-provisioned `accounts.id`.
+
+On the raw tree, `institutions.id` is the opaque source identity: the capture
+path segment and every capture manifest's `sourceObject.sourceId` are the id,
+not the slug, so an id a read response returns is an id a later request can
+use. The slug stays in the manifest as metadata only.
 
 Types worth stating, because they are the money policy rather than a detail:
 every amount, quantity, price, rate and balance is `NUMERIC` with no declared
@@ -357,13 +378,18 @@ offering arbitrary SQL does not satisfy the rule it was retired for.
 | `get_evidence`      | For a record, the retained text span behind it.                                                                                      |
 | `get_coverage`      | Per source, record kind and period: what was acquired, what reconciled, what is under review, and what nothing vouches for.          |
 
-The three list operations withhold every row today and say so, because the
-archive cannot yet build the contract's `retained_text_span_v1` evidence: the
-parsers produce row and page indices rather than character offsets, and
-`documents` carries no byte length or media type. A fabricated citation on a
-financial figure is worse than a withheld row, so the record is withheld and
-the response carries `retained_evidence_unavailable`. `aggregate_money` and
-`get_coverage` are fully served.
+The three list operations no longer withhold every row. `structured_field_v1`
+(F1-29, [structured evidence](./2026-09-11-structured-evidence.md)) cites one
+scalar datum bound by exact token and SHA-256 to retained JSON or delimited
+bytes, so a JSON-tier or tabular-tier transaction, holding or balance is
+returned with one verified citation. PDF-tier rows -- `pdf_statement` and
+`trade_confirmation` -- have no evidence kind that fits them yet and stay
+withheld with `retained_evidence_unavailable`, pending a retained-text
+extractor task: character offsets over a hashed, version-pinned text
+artifact, its own task of comparable size. A fabricated citation on a
+financial figure is worse than a withheld row, so any record whose binding is
+missing, unusable, or disagrees with its stored value is withheld the same
+way. `aggregate_money` and `get_coverage` are fully served.
 
 Read-only is enforced by the database rather than by inspecting the SQL, but
 "a role with `SELECT` and nothing else" is a claim that has to be designed and
@@ -413,7 +439,11 @@ belongs in an agent's context, during development or afterwards.
   A response is never returned through an agent on its way to disk.
 - Parsing and import are scripts. An agent runs them and reads their summary:
   files seen, rows inserted, rows skipped, reconciliations passed and failed,
-  review items opened.
+  review items opened. The operator import command (F1-31, `run.ts`) composes
+  a full acquisition-to-verdict pass this way: it prints documents acquired,
+  bytes, the acquisition manifest's hash, rows parsed and inserted or
+  deduplicated, review items opened, and both gates' verdicts by currency,
+  account and period -- never a row or a description.
 - Verification uses aggregates. Counts, sums, hashes and reconciliation deltas
   answer whether an import is correct. A row dump does not.
 - The review queue is the exception and is bounded by design. Items surface
@@ -491,6 +521,21 @@ folder. A closed allowlisted projection of the business payload happens before
 hashing or writing, and a sanitized artifact records the transformation rather
 than claiming to be the untouched response.
 
+Eight more tasks landed the hosted archive to a usable v1: closing gaps the
+Postgres move and the first hosted acquisition exposed, most surfaced through
+the shared-boundary review on Issue 57.
+
+| Task  | Deliverable                                                      | Why it was missing                                                                                                                                                                                     |
+| ----- | ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| F1-13 | Per-fixture journal lock identity and test temp-dir cleanup in the pipeline test suite | Two agents running `pnpm test:once` in different worktrees at once collided on a fixed lock port and leaked stale temp directories, blocking concurrent work on this workstream and others.          |
+| F1-19 | Activity taxonomy on capabilities; institution provisioning on run | Both reconciliation gates summed every non-null amount or signed quantity on a convention no adapter contract stated, so a wrong sign or an in-kind transfer silently corrupted a gate. A first run against a fresh archive also had nowhere to provision its `institutions` row from. |
+| F1-29 | Structured field evidence: contract kind, archive provenance columns, parser bindings, read-surface assembly | The contract's only evidence kind was a character span, which the parsers could not produce, so every list row was withheld regardless of tier.                                                       |
+| F1-30 | Reader role provisioned on a non-superuser hosted owner            | `applyPgReaderRole`'s `ALTER ROLE` on `NOSUPERUSER`/`NOBYPASSRLS`/`NOREPLICATION` requires literal Postgres `SUPERUSER` even to set an attribute to its already-default value; the hosted owner has `CREATEROLE`/`CREATEDB` but not `SUPERUSER`, so the reader was never created. |
+| F1-31 | Operator import command (`run.ts`)                                 | No entry point composed discover, acquire, persist, parse, import and both gates into one pass; an operator had no way to run an acquisition-to-verdict cycle without reading rows.                    |
+| F1-32 | Discovered accounts on `DiscoverResult`                            | A selection file had to already know an `accounts.id`, so a first import against a fresh archive had no discovery-driven way to name an account.                                                       |
+| F1-33 | SQLite dropped from the raw tree writer                            | `persistAcquiredDocument` still took a `node:sqlite` handle to read the institution slug and account last4, and `text_path` updates went to that same file, even though the importer had moved to Postgres. |
+| F1-34 | Raw tree path, capture and manifest hardening; opaque source id    | Space-id confinement, capture-id uniqueness, manifest integrity and slug-vs-id confusion had never been checked against adversarial or malformed input.                                                 |
+
 v1 is done when a single query against the archive reproduces, with no browser:
 fees paid over a trailing twelve months by account and fee type; every purchase
 of a given instrument class with date, quantity, price and maturity; current
@@ -532,6 +577,11 @@ desk.
 | Raw document tree    | The always-on machine's filesystem, replicated off it              | Document bytes do not belong in a database. This is the half that cannot be rebuilt, so its durability is a first-class requirement, not a side effect. |
 | Acquisition, import  | The always-on machine                                              | A person authenticates a browser session there. Import is a script that writes to the hosted database.                                                 |
 | Read surface         | Wherever it is invoked, connecting to Neon as a read-only role     | The point of the workstream: an assistant with no browser and no logins can answer questions and cite them.                                             |
+
+The hosted archive is provisioned: `scripts/provision.mjs` applies the schema
+and the reader role to whatever database `FINANCE_ARCHIVE_DATABASE_URL`
+points at, idempotently, so re-running it after a migration adds a table is
+also how that table is exposed to the reader.
 
 Acquisition and import run on the always-on machine, but **single-writer by
 convention is not a publication boundary.** A laptop querying mid-import must
