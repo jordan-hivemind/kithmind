@@ -111,15 +111,22 @@ type WithholdReason =
 
 /** The four `documents` provenance columns, plus the joined identities, that
  * every citable row selects. Written for a query that aliases the document
- * `d` and the institution `i`. */
-const EVIDENCE_COLUMNS = `i.slug,
+ * `d` and the institution `i`.
+ *
+ * The source identity is `institutions.id` and not the slug (F1-34): the
+ * contract's `sourceId` is an opaque, stable id, and a slug is neither --
+ * it is finance-local, human-readable, and renameable, so citing it
+ * published who a source is and broke every stored citation the day someone
+ * renamed one. Every `sourceId` filter in this file matches the same column,
+ * so an id a response hands back is an id a later request can use. */
+const EVIDENCE_COLUMNS = `i.id AS source_id,
             d.id AS document_id, d.retained_sha256,
             d.retained_byte_length::text AS retained_byte_length,
             d.media_type, d.capture_id`;
 
 /** What `EVIDENCE_COLUMNS` and a record's own money columns select. */
 type EvidenceRow = {
-  slug: string;
+  source_id: string;
   money: string | null;
   currency: string | null;
   source_document_id: string | null;
@@ -170,7 +177,7 @@ function documentOf(row: EvidenceRow): RetainedSourceObject | null {
   if (!Number.isSafeInteger(retainedByteLength) || retainedByteLength < 1)
     return null;
   return {
-    sourceId: row.slug as FinanceSourceId,
+    sourceId: row.source_id as FinanceSourceId,
     documentId: row.document_id as FinanceDocumentId,
     revisionId: `sha256-${row.retained_sha256}` as FinanceRevisionId,
     captureId: row.capture_id as FinanceCaptureId,
@@ -738,7 +745,7 @@ async function listTransactions(
        JOIN accounts a ON a.id = t.account_id
        JOIN institutions i ON i.id = a.institution_id
        LEFT JOIN documents d ON d.id = t.source_document_id
-      WHERE ($1::text IS NULL OR i.slug = $1)
+      WHERE ($1::text IS NULL OR i.id = $1)
         AND ($2::text IS NULL OR t.account_id = $2)
         AND ($3::text IS NULL OR t.currency = $3)
         AND ($4::date IS NULL OR t.process_date >= $4::date)
@@ -791,7 +798,7 @@ async function listHoldings(
        JOIN accounts a ON a.id = p.account_id
        JOIN institutions i ON i.id = a.institution_id
        LEFT JOIN documents d ON d.id = p.source_document_id
-      WHERE ($1::text IS NULL OR i.slug = $1)
+      WHERE ($1::text IS NULL OR i.id = $1)
         AND ($2::text IS NULL OR p.account_id = $2)
         AND ($3::date IS NULL OR p.as_of <= $3::date)
         AND ($4::date IS NULL OR (p.as_of, p.id) > ($4::date, $5::text))
@@ -836,7 +843,7 @@ async function listBalances(
        JOIN accounts a ON a.id = b.account_id
        JOIN institutions i ON i.id = a.institution_id
        LEFT JOIN documents d ON d.id = b.source_document_id
-      WHERE ($1::text IS NULL OR i.slug = $1)
+      WHERE ($1::text IS NULL OR i.id = $1)
         AND ($2::text IS NULL OR b.account_id = $2)
         AND ($3::date IS NULL OR b.as_of >= $3::date)
         AND ($4::date IS NULL OR b.as_of < $4::date)
@@ -912,7 +919,7 @@ function aggregateSql(
               JOIN accounts a ON a.id = t.account_id
               JOIN institutions i ON i.id = a.institution_id
              WHERE t.amount IS NOT NULL
-               AND ($1::text IS NULL OR i.slug = $1)
+               AND ($1::text IS NULL OR i.id = $1)
                AND ($2::text IS NULL OR t.account_id = $2)
                AND ($3::date IS NULL OR t.process_date >= $3::date)
                AND ($4::date IS NULL OR t.process_date < $4::date)
@@ -935,11 +942,11 @@ function aggregateSql(
 
   return {
     sql: `WITH scoped AS (
-            SELECT s.*, a.id AS acct, i.slug AS slug
+            SELECT s.*, a.id AS acct, i.id AS source_id
               FROM ${table} s
               JOIN accounts a ON a.id = s.account_id
               JOIN institutions i ON i.id = a.institution_id
-             WHERE ($1::text IS NULL OR i.slug = $1)
+             WHERE ($1::text IS NULL OR i.id = $1)
                AND ($2::text IS NULL OR s.account_id = $2)
                AND ($3::date IS NULL OR s.${dateColumn} >= $3::date)
                AND ($4::date IS NULL OR s.${dateColumn} < $4::date)
@@ -1107,7 +1114,7 @@ async function getEvidence(
 type Gap = FinanceCoverageRecord["gaps"][number];
 
 type SourceRow = {
-  slug: string;
+  source_id: string;
   accounts: string;
   transactions: string;
   positions: string;
@@ -1122,14 +1129,14 @@ type SourceRow = {
 };
 
 type PeriodRow = {
-  slug: string;
+  source_id: string;
   period_start: string;
   period_end: string;
   status: "pass" | "fail" | "unverified";
 };
 
 type ReviewRow = {
-  slug: string;
+  source_id: string;
   open: string;
   first_date: string | null;
   last_date: string | null;
@@ -1249,7 +1256,7 @@ async function coverageRecords(
   const kinds = filters.kinds;
 
   const sources = await client.query<SourceRow>(
-    `SELECT i.slug,
+    `SELECT i.id AS source_id,
             (SELECT count(*)::text FROM accounts a WHERE a.institution_id = i.id) AS accounts,
             (SELECT count(*)::text FROM transactions t JOIN accounts a ON a.id = t.account_id
               WHERE a.institution_id = i.id) AS transactions,
@@ -1271,36 +1278,36 @@ async function coverageRecords(
             (SELECT max(b.as_of)::text FROM balances b JOIN accounts a ON a.id = b.account_id
               WHERE a.institution_id = i.id) AS bal_max
        FROM institutions i
-      WHERE ($1::text IS NULL OR i.slug = $1)
-      ORDER BY i.slug
+      WHERE ($1::text IS NULL OR i.id = $1)
+      ORDER BY i.id
       LIMIT $2`,
     [request.sourceId ?? null, MAX_SUPPORT_ROWS],
   );
 
   const cashPeriods = await client.query<PeriodRow>(
-    `SELECT i.slug, r.period_start::text, r.period_end::text, r.status
+    `SELECT i.id AS source_id, r.period_start::text, r.period_end::text, r.status
        FROM reconciliations r
        JOIN accounts a ON a.id = r.account_id
        JOIN institutions i ON i.id = a.institution_id
-      WHERE ($1::text IS NULL OR i.slug = $1)
-      ORDER BY i.slug, r.period_start
+      WHERE ($1::text IS NULL OR i.id = $1)
+      ORDER BY i.id, r.period_start
       LIMIT $2`,
     [request.sourceId ?? null, MAX_SUPPORT_ROWS],
   );
 
   const positionPeriods = await client.query<PeriodRow>(
-    `SELECT i.slug, pr.period_start::text, pr.period_end::text, pr.status
+    `SELECT i.id AS source_id, pr.period_start::text, pr.period_end::text, pr.status
        FROM position_reconciliations pr
        JOIN accounts a ON a.id = pr.account_id
        JOIN institutions i ON i.id = a.institution_id
-      WHERE ($1::text IS NULL OR i.slug = $1)
-      ORDER BY i.slug, pr.period_start
+      WHERE ($1::text IS NULL OR i.id = $1)
+      ORDER BY i.id, pr.period_start
       LIMIT $2`,
     [request.sourceId ?? null, MAX_SUPPORT_ROWS],
   );
 
   const reviews = await client.query<ReviewRow>(
-    `SELECT i.slug,
+    `SELECT i.id AS source_id,
             count(*)::text AS open,
             min(d.doc_date)::text AS first_date,
             max(d.doc_date)::text AS last_date,
@@ -1310,12 +1317,12 @@ async function coverageRecords(
        JOIN institutions i ON i.id = a.institution_id
        LEFT JOIN documents d ON d.id = ri.source_document_id
       WHERE ri.status = 'open'
-        AND ($1::text IS NULL OR i.slug = $1)
-      GROUP BY i.slug
+        AND ($1::text IS NULL OR i.id = $1)
+      GROUP BY i.id
       LIMIT $2`,
     [request.sourceId ?? null, MAX_SUPPORT_ROWS],
   );
-  const reviewBySlug = new Map(reviews.rows.map((row) => [row.slug, row]));
+  const reviewBySource = new Map(reviews.rows.map((row) => [row.source_id, row]));
 
   const records: FinanceCoverageRecord[] = [];
   for (const source of sources.rows) {
@@ -1325,7 +1332,7 @@ async function coverageRecords(
         kind,
         request,
         kind === "holding" ? positionPeriods.rows : cashPeriods.rows,
-        reviewBySlug.get(source.slug),
+        reviewBySource.get(source.source_id),
       );
       if (record) records.push(record);
     }
@@ -1395,7 +1402,7 @@ function coverageRecordFor(
   periods: readonly PeriodRow[],
   review: ReviewRow | undefined,
 ): FinanceCoverageRecord | null {
-  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(source.slug)) return null;
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(source.source_id)) return null;
 
   const [dataMin, dataMax] =
     kind === "transaction"
@@ -1422,7 +1429,7 @@ function coverageRecordFor(
     // period, and the only honest answer is that nothing is known here.
     gaps.push({ code: "source_gap", from, toExclusive });
   } else {
-    const mine = periods.filter((period) => period.slug === source.slug);
+    const mine = periods.filter((period) => period.source_id === source.source_id);
     for (const period of mine) {
       if (period.status === "pass") continue;
       const gap = clampGap(
@@ -1474,7 +1481,7 @@ function coverageRecordFor(
         : "partial";
 
   return {
-    sourceId: source.slug as FinanceSourceId,
+    sourceId: source.source_id as FinanceSourceId,
     recordKind: kind,
     from,
     toExclusive,

@@ -810,8 +810,33 @@ Layout is content-addressed:
 ```
 <root>/archive/v1/<spaceId>/documents/<sha[0:2]>/<sha[2:4]>/<sha256>
 <root>/archive/v1/<spaceId>/text/<sha[0:2]>/<sha[2:4]>/<sha256>.txt
-<root>/archive/v1/<spaceId>/captures/<institutionSlug>/<yyyy>/<mm>/<captureId>-<manifestSha256>.json
+<root>/archive/v1/<spaceId>/captures/<sourceId>/<yyyy>/<mm>/<captureId>-<manifestSha256>.json
+<root>/archive/v1/<spaceId>/captures/.by-id/<captureId>
 ```
+
+### Path segments are a closed grammar (F1-34)
+
+Every caller-supplied value that becomes a path segment -- the space id, a
+capture's source id, a capture id -- must match
+
+```
+^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$
+```
+
+(`ARCHIVE_SEGMENT`/`assertArchiveSegment`, `src/rawTree.ts`), and the
+configured managed root must be an absolute path that is already canonical
+(`path.resolve(root) === root`): a relative root, a trailing separator or a
+`.`/`..` segment is refused rather than normalized.
+
+The grammar admits no `.`, `/` or a backslash, so a segment that matches is always
+exactly one directory name under the root it is joined to: it cannot be
+`..`, cannot reach a parent directory and cannot open a second path
+component. Before this, any nonempty space id was joined as given, so
+`FINANCE_ARCHIVE_SPACE_ID=../../backups` wrote into a sibling subsystem's
+namespace under the shared managed root and `../../../outside` left the
+managed root altogether. Confinement is a property of the grammar, checked
+once at each entry point, rather than of every `join` call being read
+carefully.
 
 Everything below the `archive/v1/<spaceId>/` prefix is unchanged: the write
 functions (`writeRawDocument`, `writeRetainedText`, `writeCaptureManifest`)
@@ -857,8 +882,10 @@ supplied, its retained extracted text, and cross-checks the written sha256
 against the adapter's own `manifest.contentHash` -- an adapter that
 mis-hashed its own bytes is exactly the kind of bug provenance exists to
 catch. `descriptor` names the `institutionId`, `accountId` and `docType` a
-pull belongs to, plus `institutionSlug` and `accountLast4` for the capture
-manifest and an optional `captureId` (see below); its result is the _only_
+pull belongs to -- `institutionId` is itself the capture's opaque source id
+(see "Source identity is opaque" below) -- plus `institutionSlug` and
+`accountLast4` for the capture manifest and an optional `captureId` (see
+below); its result is the _only_
 way to obtain an `AdapterPull.persisted` -- `AdapterPull` has no free-form
 `filePath` field a caller could invent -- so `documents.file_path`
 (`importBatch`, `src/importer.ts`) ends up pointing at a file that actually
@@ -908,12 +935,12 @@ provenance was silently discarded.
 record instead, addressed by a capture id rather than by the document it
 references: `writeCaptureManifest` writes it, write-once and content-hashed
 by its own bytes, at
-`<root>/captures/<institutionSlug>/<yyyy>/<mm>/<captureId>-<manifestSha256>.json`,
-recording the referenced document's sha256, the institution's slug (not the
-database's internal row id, which means nothing once the database that
-minted it is gone), the account's last four digits, document type, statement
-period, capture time, capability tier, any acquisition gaps, the original
-file extension when the source gave one, and the `RetentionRecord`
+`<root>/captures/<sourceId>/<yyyy>/<mm>/<captureId>-<manifestSha256>.json`,
+recording the referenced document's sha256, the source id and the
+institution's slug (see "Source identity is opaque" below), the account's
+last four digits, document type, statement period, capture time, capability
+tier, any acquisition gaps, the original file extension when the source gave
+one, and the `RetentionRecord`
 describing the projection that produced the bytes (see "Retention
 projection"): its declaration and version, the projection algorithm version,
 and the source paths that were dropped. That last field is how a reader
@@ -941,6 +968,55 @@ by walking `<root>/captures/` -- no database required, the same
 module directly, and `test/rawTree.test.mjs` has a test that persists two
 captures of byte-identical content, discards the database entirely, and
 confirms both are still identifiable from the raw tree alone.
+
+#### The capture id index (F1-34)
+
+`<root>/captures/.by-id/<captureId>` is the index of every capture id in one
+space: a hard link to the manifest itself, claimed with `linkSync` before
+the partitioned record is written, so a second claim on an id fails with
+`EEXIST` and is compared by hash -- identical content is a retry, anything
+else is `CaptureConflictError`. One index, not one per partition, because
+capture identity is not partition-scoped: the old check scanned only the one
+source/year/month directory the new record was headed for, so the same
+capture id reused under a different source, or with a `capturedAt` in a
+different month, passed it and landed a second, disagreeing record under one
+id. Claiming the id atomically also closes the concurrent-writer race the
+scan-then-write had.
+
+The entry is a hard link rather than a copy or a pointer file, so it cannot
+dangle and cannot disagree with the record it indexes, and it costs no
+second copy of the bytes. The directory name is dot-prefixed, which the path
+grammar above forbids in a source id, so it can never collide with a
+source's own directory. A directory walk for `*.json` skips it: the index
+entries carry no extension.
+
+#### Source identity is opaque (F1-34)
+
+The capture path segment and the read contract's
+`sourceObject.sourceId`/`get_coverage` filter are `institutions.id`, the
+stable id the archive already mints, not the institution slug. A slug is
+finance-local, human-readable and renameable: partitioning on it published
+who a source is in the layout of the tree, and citing it meant a rename
+invalidated stored citations. The slug is still recorded inside each capture
+manifest as `institutionSlug`, so a rebuild that has lost the database can
+still read what a source was called; it is metadata, not identity, and never
+a path segment. `src/mcp/pgRead.ts` emits and filters on the same column, so
+a `sourceId` a response hands back is a `sourceId` a later request can use.
+
+#### Reading a capture back is verified (F1-34)
+
+A rebuild takes capture manifests as fact, so `readCaptureManifest` refuses
+any record it cannot vouch for, with a `CaptureIntegrityError.reason`
+separating the cases: `schema` (a closed, versioned record --
+`CAPTURE_MANIFEST_VERSION`, every field required and bounded, unknown fields
+rejected -- rather than an unbounded `JSON.parse` cast), `manifest_hash`
+(the file name states the record's own content hash, so a record edited in
+place no longer matches its path), `partition` (the source and capture month
+inside the record are the directory it sits in), and
+`missing_document`/`document_hash` (the retained object it cites is present
+under `documents/` and still hashes to the recorded value). Modified
+provenance is never accepted as fact, and a capture whose bytes are gone is
+reported as that rather than as a working citation.
 
 `ParsedPull.holdings` is mapped the same way, through the same
 `resolveInstrumentId` -- there is no second instrument-resolution mechanism

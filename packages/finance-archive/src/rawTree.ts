@@ -61,7 +61,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 
 import type { RetainedPayload } from "./retention.js";
 import { assertRetained } from "./retention.js";
@@ -79,12 +79,48 @@ const SPACE_ID_ENV = "FINANCE_ARCHIVE_SPACE_ID";
 export const ARCHIVE_LAYOUT_VERSION = "v1";
 
 /**
+ * The closed grammar every caller-supplied path segment this package writes
+ * must match: a space id (below), and a capture's source id and capture id
+ * (captures.ts). ASCII letters, digits, `_` and `-` only, first character
+ * alphanumeric, 1-128 characters. It admits no `.`, no `/` and no `\`, so a
+ * matching segment can never be `..`, can never reach a parent directory and
+ * can never open a second path component: a segment that matches is always
+ * exactly one directory name under the root it is joined to.
+ */
+export const ARCHIVE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+
+/**
+ * Rejects a path segment that does not match `ARCHIVE_SEGMENT`. Every
+ * caller-supplied value that becomes a directory or file name in the raw
+ * tree goes through this, so confinement to the managed root is a property
+ * of the grammar, checked once, rather than of every `join` call being read
+ * carefully.
+ */
+export function assertArchiveSegment(value: string, label: string): string {
+  if (!ARCHIVE_SEGMENT.test(value)) {
+    throw new Error(
+      `${label} ${JSON.stringify(value)} is not a usable raw-tree path segment; ` +
+        "use 1-128 ASCII letters, digits, underscores or hyphens, starting with a letter " +
+        "or digit -- a segment that could traverse out of the managed root is refused",
+    );
+  }
+  return value;
+}
+
+/**
  * Reads the space id from FINANCE_ARCHIVE_SPACE_ID and nowhere else, the
  * same pattern `resolveRawTreeRoot` uses for the configured root. The space
  * id is configuration, not a default: this package has no notion of a
  * current or implied space, so a missing setting is a hard error naming
  * exactly what is missing, never a guessed value. No real space id belongs
  * in this repository.
+ *
+ * The value becomes one path segment under the managed root, so it must
+ * match `ARCHIVE_SEGMENT`. Any nonempty string used to be accepted, which
+ * meant `../../backups` resolved into a sibling subsystem's namespace under
+ * the shared managed root and `../../../outside` left the managed root
+ * altogether -- one space writing into another space's tree is exactly the
+ * isolation failure this prefix exists to prevent.
  */
 export function resolveArchiveSpaceId(
   env: NodeJS.ProcessEnv = process.env,
@@ -96,7 +132,7 @@ export function resolveArchiveSpaceId(
         "that id is never committed and this package never defaults to one.",
     );
   }
-  return spaceId;
+  return assertArchiveSegment(spaceId, SPACE_ID_ENV);
 }
 
 /**
@@ -123,8 +159,22 @@ export function resolveRawTreeRoot(
         "never committed and this package never defaults to one.",
     );
   }
+  if (!isAbsolute(root) || resolve(root) !== root) {
+    throw new Error(
+      `${RAW_TREE_ROOT_ENV} ${JSON.stringify(root)} is not a usable managed root; ` +
+        "point it at an absolute, already-canonical directory (no relative path, no " +
+        "trailing separator, no `.` or `..` segment), so where a space namespace lands " +
+        "cannot depend on how the root itself is spelled.",
+    );
+  }
   const spaceId = resolveArchiveSpaceId(env);
   return join(root, "archive", ARCHIVE_LAYOUT_VERSION, spaceId);
+}
+
+/** Where `writeRawDocument` puts, and `readCaptureManifest` looks for, the
+ * retained bytes with this content hash. */
+export function rawDocumentPath(root: string, sha256: string): string {
+  return fanoutPath(root, "documents", sha256, "");
 }
 
 export function sha256HexOf(bytes: Uint8Array): string {

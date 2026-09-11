@@ -98,6 +98,35 @@ test("resolveArchiveSpaceId is a hard error naming what is missing when unset, a
   );
 });
 
+test("a space id that could leave its own namespace is refused, not joined (F1-34)", () => {
+  // Both of these used to be accepted: the first resolves into a sibling
+  // namespace under the shared managed root, the second leaves the managed
+  // root altogether.
+  for (const escape of ["../../backups", "../../../outside", "a/b", ".", "..", ""]) {
+    assert.throws(
+      () => resolveRawTreeRoot({
+        FINANCE_ARCHIVE_RAW_TREE_ROOT: "/synthetic/raw-tree",
+        FINANCE_ARCHIVE_SPACE_ID: escape,
+      }),
+      /not a usable raw-tree path segment|is not set/,
+      `space id ${JSON.stringify(escape)} must never become a path`,
+    );
+  }
+});
+
+test("a managed root that is not absolute and canonical is refused (F1-34)", () => {
+  for (const root of ["relative/root", "/synthetic/raw-tree/", "/synthetic/../raw-tree", "/synthetic/raw-tree/.."]) {
+    assert.throws(
+      () => resolveRawTreeRoot({
+        FINANCE_ARCHIVE_RAW_TREE_ROOT: root,
+        FINANCE_ARCHIVE_SPACE_ID: "space_synthetic",
+      }),
+      /is not a usable managed root/,
+      `managed root ${JSON.stringify(root)} must be absolute and already canonical`,
+    );
+  }
+});
+
 test("resolveRawTreeRoot is a hard error naming what is missing when either the root or the space id is unset, and otherwise composes the configured root with the archive/v1 prefix and the space id (F1-28)", () => {
   assert.throws(
     () => resolveRawTreeRoot({}),
@@ -207,6 +236,7 @@ test("persistAcquiredDocument writes bytes, retained text and a capture manifest
   const manifest = readCaptureManifest(persisted.capturePath);
   assert.equal(manifest.captureId, persisted.captureId);
   assert.equal(manifest.institutionSlug, INSTITUTION.slug);
+  assert.equal(manifest.sourceId, INSTITUTION.id);
   assert.equal(manifest.acctLast4, ACCOUNT.last4);
   assert.equal(manifest.originalExtension, ".pdf");
 
@@ -238,6 +268,30 @@ test("persistAcquiredDocument writes bytes, retained text and a capture manifest
   // other.
   assert.deepEqual(readCaptureManifest(persisted.capturePath).documentSha256, persisted.documentWrite.sha256);
   assert.deepEqual(readCaptureManifest(secondCapture.capturePath).documentSha256, persisted.documentWrite.sha256);
+});
+
+test("the capture path names the opaque source id; the slug is metadata inside the record (F1-34)", (t) => {
+  const root = rawTreeRoot(t);
+  const bytes = new TextEncoder().encode("synthetic bytes whose capture must not publish a slug");
+
+  const persisted = persistAcquiredDocument(root, {
+    institutionId: INSTITUTION.id,
+    accountId: ACCOUNT.id,
+    institutionSlug: INSTITUTION.slug,
+    accountLast4: ACCOUNT.last4,
+    docType: "pdf_statement",
+    acquired: acquiredFixture(bytes),
+  });
+
+  const partition = persisted.capturePath.slice(join(root, "captures").length);
+  assert.ok(partition.includes(INSTITUTION.id), "the path partitions by the institution row id");
+  assert.ok(
+    !partition.includes(INSTITUTION.slug),
+    "a human-readable slug is not what the layout publishes",
+  );
+  const manifest = readCaptureManifest(persisted.capturePath);
+  assert.equal(manifest.sourceId, INSTITUTION.id);
+  assert.equal(manifest.institutionSlug, INSTITUTION.slug, "the slug is still recorded, as metadata");
 });
 
 test("persistAcquiredDocument with no extracted text writes only the document and its capture manifest", (t) => {

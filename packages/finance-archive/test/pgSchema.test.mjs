@@ -75,6 +75,22 @@ async function insertAmount(client, accountId, amount, currency = "USD") {
 }
 
 test(
+  "pgSchemaVersion refuses a schema name it would otherwise interpolate into SQL (F1-34)",
+  { skip },
+  async () => {
+    await withArchive(async (client) => {
+      for (const name of ['public"; DROP TABLE documents; --', "has space", "1leading", ""]) {
+        await assert.rejects(
+          () => pgSchemaVersion(client, name),
+          /is not a usable archive schema name/,
+          `${JSON.stringify(name)} must never reach a query`,
+        );
+      }
+    });
+  },
+);
+
+test(
   "schema creation is repeatable and the applied version is recorded",
   { skip },
   async () => {
