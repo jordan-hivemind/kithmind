@@ -1132,6 +1132,25 @@ Every write is asserted refused twice: once under the role's read-only default
 the refusal has to come from `insufficient_privilege`. Testing only the first
 would test the softest layer and call it a boundary.
 
+## Provisioning a live database
+
+`scripts/provision.mjs` applies `applyPgSchema` and `applyPgReaderRole` (both
+idempotent) to whatever database `FINANCE_ARCHIVE_DATABASE_URL` points at.
+Run it against a throwaway database first, never a hosted one first:
+
+```
+FINANCE_ARCHIVE_DATABASE_URL=postgresql://<owner>@<host>/<db> \
+  node scripts/provision.mjs
+```
+
+It requires a build (`pnpm --filter @repo/finance-archive build`) first,
+since it imports `dist/`. It prints the schema name, the table count, the
+reader role name, whether the reader has `CREATE` on the schema (must be
+`false`) and `TEMPORARY` on the database (must be `false`), and the reader's
+connection string -- generated fresh on every run and printed exactly once,
+never written to a file by this script and never logged again. Store it
+yourself; re-running the script rotates the reader's password.
+
 ## Checks
 
 ```
