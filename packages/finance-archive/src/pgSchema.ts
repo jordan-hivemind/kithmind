@@ -665,6 +665,53 @@ CREATE TABLE retained_texts (
 );
 `;
 
+// F1-71. A document's identity within an institution is the provider's own
+// id for it, not the hash of the bytes a download happened to produce.
+//
+// The defect: Morgan Stanley renders a fresh PDF on every download, so the
+// same statement hashes differently every time it is pulled. `documents.sha256`
+// is the importer's whole-document dedupe key, so every pull round recorded
+// all 1,321 statements as new documents -- 6,461 rows for about 1,018
+// distinct account-months on the owner's archive. Nothing was wrong with the
+// bytes (they really are different bytes, and ground rule 1 keeps every one
+// of them); what was wrong is that byte identity was being asked to answer
+// "is this the same document," which it cannot for a source that re-renders.
+//
+// `provider_document_id` is that answer: the id the provider itself gives
+// the document (`DiscoveredDocument.providerDocumentId`, adapter.ts --
+// Morgan Stanley's `documentId`, defaulting to the opaque `externalId` for an
+// adapter that names nothing finer). `sha256` keeps its own job unchanged:
+// it is capture identity, "have these exact bytes been seen," which is what
+// makes a re-download a new capture rather than a new document.
+//
+// Unique per institution among non-superseded rows only, and nullable with
+// no backfill -- the same honest-null policy every migration above uses. A
+// document pulled before this migration has no recorded provider id, because
+// nothing ever recorded one; `scripts/collapseDuplicateDocuments.mjs` is what
+// collapses those existing duplicates, and it leaves the column NULL where
+// the id genuinely cannot be recovered rather than inventing one.
+//
+// `superseded_by` rather than deletion: the duplicate rows name real captures
+// whose bytes are on disk and stay there (ground rule 1), so a collapse
+// re-points what referenced them and marks them superseded. Readers that walk
+// documents for work -- `reparse`, the already-recorded check in run.ts --
+// filter on `superseded_by IS NULL`. `ON DELETE SET NULL`, so deleting a
+// canonical document does not wedge on its superseded copies; they become
+// ordinary rows again, which is the honest state once the row that superseded
+// them is gone.
+const DOCUMENT_PROVIDER_IDENTITY = `
+ALTER TABLE documents
+  ADD COLUMN provider_document_id TEXT,
+  ADD COLUMN superseded_by TEXT REFERENCES documents(id) ON DELETE SET NULL;
+
+CREATE UNIQUE INDEX documents_provider_document_id_key
+  ON documents (institution_id, provider_document_id)
+  WHERE provider_document_id IS NOT NULL AND superseded_by IS NULL;
+
+CREATE INDEX documents_superseded_by ON documents (superseded_by)
+  WHERE superseded_by IS NOT NULL;
+`;
+
 /** Every migration, in order. The last one's version is the current schema. */
 export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
   {
@@ -711,6 +758,11 @@ export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
     version: 9,
     name: "retained_texts: the retained text a text-span citation is verified against",
     sql: RETAINED_TEXTS,
+  },
+  {
+    version: 10,
+    name: "documents.provider_document_id: institution-scoped document identity, and superseded_by",
+    sql: DOCUMENT_PROVIDER_IDENTITY,
   },
 ]);
 

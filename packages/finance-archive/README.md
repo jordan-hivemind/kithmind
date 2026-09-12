@@ -215,6 +215,86 @@ row_hash count equals inserted row count" true by construction instead of a
 real invariant. See `src/importer.ts` for the full reasoning and worked
 examples.
 
+## Document identity: the provider's id, not the bytes (F1-71)
+
+A document's identity inside an institution is `documents.provider_document_id`
+— the provider's own id for it, which the adapter reports as
+`DiscoveredDocument.providerDocumentId` (Morgan Stanley's `documentId`) and
+which defaults to the opaque `externalId` for an adapter that names nothing
+finer. `documents.sha256` keeps its own, different job: it is capture
+identity, "have these exact bytes been seen."
+
+The two were one thing until F1-71, and a real provider broke that. Morgan
+Stanley renders a fresh PDF on every download, so the same statement hashes
+differently every time it is pulled. The whole-document dedupe key was
+`sha256`, so it never matched and every pull round recorded all 1,321
+statements as new documents: **6,461 `documents` rows for about 1,018 distinct
+account-months.** The F1-68 start-of-run line said `already recorded=1321
+selected=1321` — the count was right and nothing acted on it. Holdings
+survived (they dedupe on their own `row_hash`, which does not include the
+document), but reparse, both gates, retained texts and the review queue each
+walked every copy.
+
+Three things changed, one per stage:
+
+| Stage     | Rule                                                                                              |
+| --------- | ------------------------------------------------------------------------------------------------- |
+| Selection | `"expand": "discovered"` skips a listing item this archive already records. `--refetch` overrides. |
+| Importer  | A pull whose provider id is on file under different bytes is a new capture, not a second row.      |
+| Schema    | `provider_document_id`, unique per institution among non-superseded rows; `superseded_by`.          |
+
+Nothing here discards bytes. Ground rule 1 is unchanged: every capture is
+retained, and a re-rendered download still writes its bytes and its own
+capture manifest to the raw tree (`captures.ts`, which now records
+`providerDocumentId` too, so the tree keeps saying which document a capture is
+*of*). What F1-71 refuses is a second `documents` row and a second import of
+rows the archive already has.
+
+The start-of-run line reports the whole decision rather than only its first
+half:
+
+```
+document kind pdf_statement: listing total=1321 discovered=1321 already recorded=1321 (provider id=0, metadata=1321) skipped=1321 selected=0
+```
+
+`provider id` is an exact match. `metadata` is the fallback for a document
+recorded before this column existed — the same (doc_type, account, doc_date)
+proxy F1-68 counted by, with the same ceiling: two genuinely different
+documents of one kind, one account and one day look alike to it. `--refetch`
+is the way past that, and re-pulling is safe either way, since the importer
+refuses the second row regardless.
+
+### Collapsing an archive that already duplicated
+
+`scripts/collapseDuplicateDocuments.mjs` is for an archive that already has
+the duplicates — it is not part of the migration, which adds nullable columns
+and backfills nothing, the same policy every migration in `pgSchema.ts` uses.
+
+It groups non-superseded `documents` rows by provider document id (the column,
+then the capture manifest's), falling back to institution, account, doc_type,
+doc_date and the capture's own period for every row recorded before any
+provider id was. It keeps the earliest capture's row as canonical, repoints
+`positions`, `balances`, `liabilities`, `transactions`, `commitments` and
+`review_items` at it — deleting, rather than repointing, any row whose arrival
+would violate the target table's own unique constraint (`row_hash`,
+`review_items_dedupe_key`), and never deleting a canonical document's own row
+— and marks the rest `superseded_by` the canonical. Then it runs a
+whole-archive gate pass, which must say exactly what it said before: a collapse
+moves which document a row cites, and no gate reads that.
+
+Superseded rows are never deleted, and neither is anything in the raw tree.
+They keep their capture and their bytes; what they lose is being walked.
+`reparse` and the already-recorded check both skip them.
+
+Run it against a throwaway database first, then with `--dry-run` against the
+real one (a dry run does the real work in a transaction and rolls it back, so
+its counts are what would actually happen), then for real:
+
+```
+FINANCE_ARCHIVE_DATABASE_URL=... FINANCE_ARCHIVE_RAW_TREE_ROOT=... FINANCE_ARCHIVE_SPACE_ID=... \
+  node scripts/collapseDuplicateDocuments.mjs --dry-run
+```
+
 ## Publication
 
 The plan is explicit that hosting the ledger coordinates nothing by itself:
@@ -818,7 +898,8 @@ node dist/run.js \
   [--dry-run] \
   [--commit-every <N, default 1>] \
   [--acquire-only] \
-  [--concurrency <N, default 1, maximum 4>]
+  [--concurrency <N, default 1, maximum 4>] \
+  [--refetch]
 ```
 
 `--adapter` is a module with a default export, or a named `adapter` export,

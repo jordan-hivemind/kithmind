@@ -679,6 +679,92 @@ type PullSpec = {
   readonly docType: string;
   readonly docDate: string | null;
   readonly selection: AcquireSelectionInput;
+  /** F1-71. The provider's own id for this document
+   * (`DiscoveredDocument.providerDocumentId`, defaulting to the opaque
+   * `externalId`), carried to the capture manifest and to
+   * `documents.provider_document_id`. Null for an export-tier pull. */
+  readonly providerDocumentId: string | null;
+};
+
+/**
+ * F1-71. What this institution already has on file, for deciding whether a
+ * discovered listing item needs pulling at all.
+ *
+ * Two answers, because an archive holds both kinds of row. `providerIds` is
+ * the real identity (`documents.provider_document_id`): the provider's own id
+ * for the document, which is stable however many times the provider
+ * re-renders its bytes. `metadataKeys` is the fallback for every document
+ * recorded before that column existed, which on a live archive is most of
+ * them: the same (doc_type, account, doc_date) triple F1-68's start-of-run
+ * preview already counted by, and the same known ceiling -- two genuinely
+ * different documents of one kind, one account and one day look alike to it.
+ * `--refetch` is the override for exactly that case.
+ *
+ * Superseded rows are excluded from both: a row a collapse marked superseded
+ * is a duplicate capture of a document the canonical row already speaks for.
+ */
+type RecordedDocuments = {
+  readonly providerIds: ReadonlySet<string>;
+  readonly metadataKeys: ReadonlySet<string>;
+};
+
+/** The (doc_type, account, doc_date) key `RecordedDocuments.metadataKeys`
+ * holds, spelled once so the reader and the writer cannot drift apart. */
+function documentMetadataKey(
+  docType: string,
+  accountId: string | null,
+  docDate: string | null,
+): string {
+  // NUL-separated, the same spelling the F1-68 count this replaces used: a
+  // doc_type is free text and a separator it can contain is a key two
+  // different triples could share.
+  return [docType, accountId ?? "", docDate ?? ""].join(" ");
+}
+
+async function loadRecordedDocuments(
+  client: ArchiveClient,
+  institutionId: string,
+): Promise<RecordedDocuments> {
+  const existing = await client.query<{
+    doc_type: string;
+    account_id: string | null;
+    doc_date: string | null;
+    provider_document_id: string | null;
+  }>(
+    `SELECT doc_type, account_id, doc_date::text AS doc_date, provider_document_id
+       FROM documents
+      WHERE institution_id = $1 AND superseded_by IS NULL`,
+    [institutionId],
+  );
+  const providerIds = new Set<string>();
+  const metadataKeys = new Set<string>();
+  for (const row of existing.rows) {
+    if (row.provider_document_id !== null) providerIds.add(row.provider_document_id);
+    metadataKeys.add(documentMetadataKey(row.doc_type, row.account_id, row.doc_date));
+  }
+  return { providerIds, metadataKeys };
+}
+
+/** How a discovered document is already on file, or `null` when it is not. */
+function recordedAs(
+  recorded: RecordedDocuments,
+  spec: PullSpec,
+): "provider_id" | "metadata" | null {
+  if (spec.providerDocumentId !== null && recorded.providerIds.has(spec.providerDocumentId)) {
+    return "provider_id";
+  }
+  if (recorded.metadataKeys.has(documentMetadataKey(spec.docType, spec.accountId, spec.docDate))) {
+    return "metadata";
+  }
+  return null;
+}
+
+/** F1-71. Per document kind, what the expansion found and what it did about
+ * it -- printed by `printDocumentKindPreview` and nowhere else. */
+type RecordedCounts = {
+  byProviderId: number;
+  byMetadata: number;
+  skipped: number;
 };
 
 /**
@@ -723,8 +809,20 @@ function expandSelectionPulls(
   entries: readonly SelectionPull[],
   discovered: DiscoverResult,
   accountsByExternalKey: ReadonlyMap<string, string>,
-): PullSpec[] {
+  recorded: RecordedDocuments,
+  refetch: boolean,
+): { specs: PullSpec[]; recordedByKind: ReadonlyMap<string, RecordedCounts> } {
   const specs: PullSpec[] = [];
+  const recordedByKind = new Map<string, RecordedCounts>();
+  function noteRecorded(kind: string, field: keyof RecordedCounts): void {
+    const counts = recordedByKind.get(kind) ?? {
+      byProviderId: 0,
+      byMetadata: 0,
+      skipped: 0,
+    };
+    counts[field] += 1;
+    recordedByKind.set(kind, counts);
+  }
   for (const entry of entries) {
     if (entry.expand === "discovered") {
       if (entry.requireExhaustive && discovered.documents.status === "incomplete") {
@@ -736,7 +834,7 @@ function expandSelectionPulls(
       const wanted = new Set<string>(entry.kinds);
       for (const doc of discovered.documents.items) {
         if (!wanted.has(doc.kind)) continue;
-        specs.push({
+        const spec: PullSpec = {
           // F1-40. A statement or confirmation belongs to exactly one
           // account, and a real adapter's discover() already encodes which
           // one into accountExternalKey -- file the pull under it, same as
@@ -750,7 +848,30 @@ function expandSelectionPulls(
           docType: entry.docType,
           docDate: doc.periodEnd,
           selection: { kind: doc.kind, externalId: doc.externalId },
-        });
+          // F1-71: the adapter's own id when it has one finer than the
+          // opaque externalId it encodes; otherwise the externalId itself,
+          // which the interface already defines as this document's opaque,
+          // institution-defined identity.
+          providerDocumentId: doc.providerDocumentId ?? doc.externalId,
+        };
+        // F1-71. The defect this exists to fix: the preview line printed
+        // "already recorded=1321 selected=1321" and then downloaded all 1,321
+        // anyway, because nothing acted on what it had just counted. A
+        // document already on file is not pulled again unless --refetch says
+        // to; the counts go to the preview either way, so a run that skips
+        // everything says so rather than looking like it did nothing.
+        const already = recordedAs(recorded, spec);
+        if (already !== null) {
+          noteRecorded(
+            doc.kind,
+            already === "provider_id" ? "byProviderId" : "byMetadata",
+          );
+          if (!refetch) {
+            noteRecorded(doc.kind, "skipped");
+            continue;
+          }
+        }
+        specs.push(spec);
       }
       continue;
     }
@@ -765,6 +886,7 @@ function expandSelectionPulls(
             periodStart: range.periodStart,
             periodEnd: range.periodEnd,
           },
+          providerDocumentId: null,
         });
       }
       continue;
@@ -774,9 +896,15 @@ function expandSelectionPulls(
       docType: entry.docType,
       docDate: entry.docDate,
       selection: entry.selection,
+      // F1-71. A hand-written entry is never skipped as already recorded --
+      // an operator naming one document explicitly is asking for that pull --
+      // but it still records the identity it acquires, so the next
+      // `"expand": "discovered"` run knows about it.
+      providerDocumentId:
+        "externalId" in entry.selection ? entry.selection.externalId : null,
     });
   }
-  return specs;
+  return { specs, recordedByKind };
 }
 
 // --- reparse ---------------------------------------------------------------
@@ -884,7 +1012,11 @@ async function selectRetainedDocuments(
   client: ArchiveClient,
   filter: { onlyUnparsed?: boolean; institutionId?: string } = {},
 ): Promise<ReparseDocumentRow[]> {
-  const conditions = ["retained_sha256 IS NOT NULL"];
+  // F1-71: never a superseded row. It is a duplicate capture of a document
+  // the canonical row already speaks for, and reparsing it would re-derive
+  // that document's rows, gates and review items once per copy -- which is
+  // exactly the cost the collapse exists to remove.
+  const conditions = ["retained_sha256 IS NOT NULL", "superseded_by IS NULL"];
   const params: unknown[] = [];
   if (filter.onlyUnparsed === true) conditions.push("parsed_ok = FALSE");
   if (filter.institutionId !== undefined) {
@@ -1815,56 +1947,15 @@ async function runConcurrentPool(
 }
 
 /**
- * F1-68. Whether a document-tier pull is "already recorded" is, everywhere
- * else in this file, decided by content hash (`isDocumentAlreadyImported`) --
- * which only exists once the document has been downloaded. A start-of-run
- * preview needs an answer before that, so this asks the same question a
- * cheaper way: does a `documents` row already exist filed under the same
- * (doc_type, account, doc_date) this pull would file under? That triple is
- * exactly what persistAcquiredDocument/commitRetainedOnly file every document
- * under, so it is a good proxy, not the real thing.
- *
- * ponytail: metadata match, not content hash -- two distinct real documents
- * of the same kind, same account, same day would both count as "already
- * recorded" here. Upgrade to a real lookup if that shows up in practice; the
- * loop's own content-hash check still governs what actually imports either
- * way.
- */
-async function countAlreadyRecordedByKind(
-  client: ArchiveClient,
-  institutionId: string,
-  pullSpecs: readonly PullSpec[],
-): Promise<ReadonlyMap<string, number>> {
-  const byKind = new Map<string, number>();
-  const documentSpecs = pullSpecs.filter((spec) => isDocumentTierKind(spec.selection.kind));
-  if (documentSpecs.length === 0) return byKind;
-  const existing = await client.query<{
-    doc_type: string;
-    account_id: string | null;
-    doc_date: string | null;
-  }>(
-    "SELECT doc_type, account_id, doc_date::text AS doc_date FROM documents WHERE institution_id = $1",
-    [institutionId],
-  );
-  const recorded = new Set(
-    existing.rows.map((row) => `${row.doc_type} ${row.account_id ?? ""} ${row.doc_date ?? ""}`),
-  );
-  for (const spec of documentSpecs) {
-    const key = `${spec.docType} ${spec.accountId ?? ""} ${spec.docDate ?? ""}`;
-    if (!recorded.has(key)) continue;
-    byKind.set(spec.selection.kind, (byKind.get(spec.selection.kind) ?? 0) + 1);
-  }
-  return byKind;
-}
-
-/**
  * F1-68. One stderr line per document kind, printed once, before any
  * document is pulled: the provider's own listing total (when the adapter can
  * name one per kind -- `discovered.documentListingTotalsByKind`), how many
- * discover() actually enumerated, how many this run expects to already have
- * on file (countAlreadyRecordedByKind above), and how many the current
- * selection actually asks for. A second, indented line breaks the selected
- * count down by the listing's own sub-type/document-type label, only when
+ * discover() actually enumerated, how many of those this archive already has
+ * on file (F1-71: by provider document id, or by the older (doc_type,
+ * account, doc_date) metadata match for a document recorded before that
+ * column existed), how many of those were skipped rather than pulled again,
+ * and how many the run actually asks for. A second, indented line breaks the
+ * selected count down by the listing's own sub-type/document-type label, only when
  * the adapter names one (`DiscoveredDocument.subType`) -- that field is
  * documented to never carry a date or an account number, unlike `label`,
  * which is why this uses it instead.
@@ -1873,7 +1964,8 @@ function printDocumentKindPreview(
   discovered: DiscoverResult,
   pullSpecs: readonly PullSpec[],
   documentsDiscoveredByKind: Readonly<Record<string, number>>,
-  alreadyRecordedByKind: ReadonlyMap<string, number>,
+  recordedByKind: ReadonlyMap<string, RecordedCounts>,
+  refetch: boolean,
 ): void {
   const subTypeByExternalId = new Map<string, string>();
   for (const doc of discovered.documents.items) {
@@ -1886,10 +1978,17 @@ function printDocumentKindPreview(
   for (const kind of [...kinds].sort()) {
     const selected = pullSpecs.filter((spec) => spec.selection.kind === kind);
     const listingTotal = discovered.documentListingTotalsByKind?.[kind];
+    const recorded = recordedByKind.get(kind) ?? {
+      byProviderId: 0,
+      byMetadata: 0,
+      skipped: 0,
+    };
     console.error(
       `document kind ${kind}: listing total=${listingTotal ?? "unknown"} ` +
         `discovered=${documentsDiscoveredByKind[kind] ?? 0} ` +
-        `already recorded=${alreadyRecordedByKind.get(kind) ?? 0} ` +
+        `already recorded=${recorded.byProviderId + recorded.byMetadata} ` +
+        `(provider id=${recorded.byProviderId}, metadata=${recorded.byMetadata}) ` +
+        `skipped=${recorded.skipped}${refetch ? " (--refetch: pulling them anyway)" : ""} ` +
         `selected=${selected.length}`,
     );
     const bySubType = new Map<string, number>();
@@ -1933,6 +2032,7 @@ async function main(): Promise<void> {
       gates: { type: "string", default: "full" },
       "acquire-only": { type: "boolean", default: false },
       concurrency: { type: "string", default: "1" },
+      refetch: { type: "boolean", default: false },
     },
   });
 
@@ -1967,6 +2067,16 @@ async function main(): Promise<void> {
   // NOT NULL` walk) picks it up later. No gate ever runs in this mode -- see
   // runPulls and printSummary below.
   const acquireOnly = values["acquire-only"] === true;
+  // F1-71. Pull every discovered document again, even one this archive has
+  // already recorded. The override for the one case the already-recorded
+  // check gets wrong on its own: a document recorded before
+  // `provider_document_id` existed is matched by (doc_type, account,
+  // doc_date) alone, so a genuinely new document sharing that triple with an
+  // existing one looks recorded. Re-pulling is safe either way -- the bytes
+  // are retained as their own capture (ground rule 1), and the importer
+  // refuses to make a second `documents` row for a provider id it already
+  // has -- it is just work nobody asked for unless this flag is set.
+  const refetch = values.refetch === true;
   // F1-62. Bounded parallel document downloads against the one bridge
   // session -- the download itself is the slow, network-bound step; the
   // Postgres commit that follows each one stays strictly one at a time
@@ -2095,7 +2205,20 @@ async function main(): Promise<void> {
     // F1-39: expands "expand": "discovered" and "expand": "activity-ranges"
     // entries into concrete pulls; a plain entry passes through unchanged
     // (same resolveEntryAccountId call the loop below used to make itself).
-    const pullSpecs = expandSelectionPulls(selectionFile.pulls, discovered, accountsByExternalKey);
+    // F1-71. What this institution already has on file, read before the
+    // expansion rather than after it: the expansion is what acts on it now,
+    // skipping a discovered document this archive already recorded instead
+    // of counting it and downloading it anyway.
+    const recordedDocuments = await reconnect(() =>
+      loadRecordedDocuments(pgClient, institutionId),
+    );
+    const { specs: pullSpecs, recordedByKind } = expandSelectionPulls(
+      selectionFile.pulls,
+      discovered,
+      accountsByExternalKey,
+      recordedDocuments,
+      refetch,
+    );
 
     // F1-62. Acquire-only retains bytes for later `reparse`, which is scoped
     // to the two document tiers (REPARSEABLE_TIERS above) -- a
@@ -2135,13 +2258,17 @@ async function main(): Promise<void> {
     // F1-68. One line per document kind, to stderr, before anything is
     // pulled: what the provider's own listing reports, what discover()
     // actually enumerated, how many this run expects to already have on
-    // file, and how many the current selection actually asks for -- an
-    // operator staring down a selection that can take hours gets to see the
-    // shape of the run before it starts, not just its final summary.
-    const alreadyRecordedByKind = await reconnect(() =>
-      countAlreadyRecordedByKind(pgClient, institutionId, pullSpecs),
+    // file, how many of those it skipped for that reason (F1-71), and how
+    // many the selection is actually left asking for -- an operator staring
+    // down a selection that can take hours gets to see the shape of the run
+    // before it starts, not just its final summary.
+    printDocumentKindPreview(
+      discovered,
+      pullSpecs,
+      documentsDiscoveredByKind,
+      recordedByKind,
+      refetch,
     );
-    printDocumentKindPreview(discovered, pullSpecs, documentsDiscoveredByKind, alreadyRecordedByKind);
 
     // F1-62. `resolveAccountLast4` below is memoized per account id, but a
     // miss issues a plain `pgClient.query` outside any of runPulls' own
@@ -2252,6 +2379,7 @@ async function main(): Promise<void> {
           institutionSlug: capabilities.institutionSlug,
           accountLast4,
           docType: spec.docType,
+          providerDocumentId: spec.providerDocumentId,
           acquired,
         },
         // F1-44: retained whenever the adapter extracted any, parsed or not.
@@ -2284,6 +2412,7 @@ async function main(): Promise<void> {
           parseNote: parsed.parseNote,
           docType: spec.docType,
           docDate: spec.docDate,
+          providerDocumentId: spec.providerDocumentId,
           persisted,
           activityTaxonomy: capabilities.activityTaxonomy,
           // F1-35: lets adapterImport.ts resolve a row's own
@@ -2318,6 +2447,7 @@ async function main(): Promise<void> {
       readonly captureId: string;
       readonly byteLength: number;
       readonly mediaType: RetainedMediaType;
+      readonly providerDocumentId: string | null;
     };
 
     async function acquireAndRetainOnly(spec: PullSpec): Promise<AcquiredOnly> {
@@ -2335,6 +2465,7 @@ async function main(): Promise<void> {
           institutionSlug: capabilities.institutionSlug,
           accountLast4,
           docType: spec.docType,
+          providerDocumentId: spec.providerDocumentId,
           acquired,
         },
         // No parse call: nothing was extracted to retain a text artifact for.
@@ -2353,6 +2484,7 @@ async function main(): Promise<void> {
         captureId: persisted.captureId,
         byteLength: acquired.bytes.length,
         mediaType: acquired.manifest.mediaType,
+        providerDocumentId: spec.providerDocumentId,
       };
     }
 
@@ -2367,16 +2499,24 @@ async function main(): Promise<void> {
       item: AcquiredOnly,
     ): Promise<"retained" | "already_retained"> {
       return withArchiveTransaction(pgClient, async (tx) => {
+        // F1-71: the same two-part identity the importer uses -- these exact
+        // bytes, or this provider document under some other rendering of
+        // them. Either way the bytes and their capture are already in the raw
+        // tree; a second `documents` row is what this refuses.
         const existing = await tx.query<{ id: string }>(
-          "SELECT id FROM documents WHERE sha256 = $1",
-          [item.contentHash],
+          `SELECT id FROM documents
+            WHERE sha256 = $1
+               OR (institution_id = $2 AND provider_document_id = $3
+                   AND provider_document_id IS NOT NULL AND superseded_by IS NULL)`,
+          [item.contentHash, institutionId, item.providerDocumentId],
         );
         if (existing.rows[0]) return "already_retained";
         await tx.query(
           `INSERT INTO documents
              (id, institution_id, account_id, doc_type, doc_date, file_path, sha256, parsed_ok,
-              retained_sha256, retained_byte_length, media_type, capture_id, text_path)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE, $8, $9, $10, $11, NULL)`,
+              retained_sha256, retained_byte_length, media_type, capture_id, text_path,
+              provider_document_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE, $8, $9, $10, $11, NULL, $12)`,
           [
             randomUUID(),
             institutionId,
@@ -2392,6 +2532,7 @@ async function main(): Promise<void> {
             item.byteLength,
             item.mediaType,
             item.captureId,
+            item.providerDocumentId,
           ],
         );
         return "retained";
@@ -2403,12 +2544,27 @@ async function main(): Promise<void> {
      * ImportBatch, is what lets an already-imported document be reported as
      * "skipped" rather than folded into `rowsDeduplicated`, and lets a
      * commit-every batch leave it out of the transaction entirely. */
-    async function isDocumentAlreadyImported(sha256: string): Promise<boolean> {
-      const found = await pgClient.query<{ parsed_ok: boolean }>(
-        "SELECT parsed_ok FROM documents WHERE sha256 = $1",
-        [sha256],
+    async function isDocumentAlreadyImported(
+      sha256: string,
+      providerDocumentId: string | null,
+    ): Promise<boolean> {
+      // F1-71. Two ways to already have it. The first is unchanged: these
+      // exact bytes are on file and parsed. The second is the provider's own
+      // id on file under different bytes -- the site re-rendered a document
+      // this archive already holds, so the bytes just acquired are a new
+      // capture of it (retained in the raw tree by `persistAcquiredDocument`
+      // above, ground rule 1) and nothing about them belongs in the database.
+      // `importBatch` refuses the second case too; this check only lets the
+      // run report it as skipped and keep it out of the transaction.
+      const found = await pgClient.query<{ id: string }>(
+        `SELECT id FROM documents
+          WHERE (sha256 = $1 AND parsed_ok)
+             OR (institution_id = $2 AND provider_document_id = $3
+                 AND provider_document_id IS NOT NULL
+                 AND sha256 <> $1 AND superseded_by IS NULL)`,
+        [sha256, institutionId, providerDocumentId],
       );
-      return found.rows[0]?.parsed_ok === true;
+      return found.rows[0] !== undefined;
     }
 
     /** Converts and publishes `acquiredPulls` as one transaction. Called
@@ -2465,7 +2621,12 @@ async function main(): Promise<void> {
         // the dedupe check itself cannot fail here short of a database
         // outage -- which F1-69's `reconnect` now recovers from instead of
         // treating as fatal.
-        const already = await reconnect(() => isDocumentAlreadyImported(item.acquired.contentHash));
+        const already = await reconnect(() =>
+          isDocumentAlreadyImported(
+            item.acquired.contentHash,
+            item.spec.providerDocumentId,
+          ),
+        );
         if (already) {
           documentPullsSkipped += 1;
           bumpDocKind(item.acquired.kind, "skipped");

@@ -224,6 +224,33 @@ test("readCaptureManifest rejects a capture edited in place: the file name state
   );
 });
 
+test("F1-71: a capture may record the provider's own document id, and a capture written before that field existed still reads", (t) => {
+  const root = rawTreeRoot(t);
+
+  const withId = manifest({ captureId: "capture-pid", providerDocumentId: "MS-000123" });
+  const written = writeCaptureManifest(root, withId);
+  assert.deepEqual(readCaptureManifest(written.path), withId);
+
+  // The whole reason this field is optional rather than a version bump:
+  // every capture already on a live raw tree omits it, and refusing those
+  // would refuse the archive's entire acquisition history.
+  const without = manifest({ captureId: "capture-no-pid" });
+  assert.equal("providerDocumentId" in without, false);
+  const legacy = writeCaptureManifest(root, without);
+  assert.deepEqual(readCaptureManifest(legacy.path), without);
+
+  // Still closed: the field is bounded text, not anything at all.
+  const dir = join(root, "captures", SOURCE_ID, "2025", "02");
+  const record = { ...manifest({ captureId: "capture-bad-pid" }), providerDocumentId: 17 };
+  const bytes = Buffer.from(JSON.stringify(record, null, 2), "utf8");
+  const path = join(dir, `capture-bad-pid-${sha256HexOf(bytes)}.json`);
+  writeFileSync(path, bytes);
+  assert.throws(
+    () => readCaptureManifest(path),
+    (error) => error instanceof CaptureIntegrityError && error.reason === "schema",
+  );
+});
+
 test("readCaptureManifest rejects a record that is not this closed, versioned schema (F1-34)", (t) => {
   const root = rawTreeRoot(t);
   const dir = join(root, "captures", SOURCE_ID, "2025", "02");

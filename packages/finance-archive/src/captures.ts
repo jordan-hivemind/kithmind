@@ -114,6 +114,23 @@ export type CaptureManifest = {
    * account, and `"all"` says so rather than a guessed or borrowed last4. */
   readonly acctLast4: string | null;
   readonly docType: string;
+  /**
+   * F1-71. The provider's own id for the document this capture acquired
+   * (`DiscoveredDocument.providerDocumentId`, adapter.ts), recorded so the
+   * raw tree keeps saying which document a capture is *of* -- the thing a
+   * rebuild needs and that `documentSha256` cannot answer for a source that
+   * re-renders its bytes on every download.
+   *
+   * Absent, not null, on every record written before this field existed and
+   * on a capture whose adapter names no id: the reader below accepts a
+   * missing key here (and only here) rather than bumping
+   * `CAPTURE_MANIFEST_VERSION`, which would refuse every capture already on
+   * disk. Absent means "this capture does not say," the same honest-null
+   * policy the database columns use, and the writer omits the key entirely
+   * rather than writing a null, so a capture with nothing to record hashes
+   * exactly as it did before.
+   */
+  readonly providerDocumentId?: string;
   readonly periodStart: string;
   readonly periodEnd: string;
   readonly capturedAt: string;
@@ -358,6 +375,10 @@ const MANIFEST_FIELDS: Record<string, (value: unknown) => boolean> = {
     value === "all" ||
     (typeof value === "string" && /^[0-9]{4}$/.test(value)),
   docType: isText,
+  // F1-71: the one optional field. See CaptureManifest.providerDocumentId --
+  // absent on every capture written before it existed, which is most of a
+  // live raw tree, so requiring it would refuse them all.
+  providerDocumentId: (value) => value === undefined || isText(value),
   periodStart: isDate,
   periodEnd: isDate,
   capturedAt: (value) =>

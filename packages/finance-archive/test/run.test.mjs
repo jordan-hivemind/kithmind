@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -987,12 +987,13 @@ test(
     const stderr = result.stderr;
 
     // Start-of-run preview, one line per document kind, before any pull:
-    // the provider's own listing total, what discover() enumerated, how
-    // many this run expects to already have on file (a fresh schema: none),
-    // and how many the selection actually asks for.
+    // the provider's own listing total, what discover() enumerated, how many
+    // of those this archive already has on file (a fresh schema: none, by
+    // either identity -- F1-71), how many were therefore skipped, and how
+    // many the selection actually asks for.
     assert.match(
       stderr,
-      /^document kind pdf_statement: listing total=120 discovered=120 already recorded=0 selected=120$/m,
+      /^document kind pdf_statement: listing total=120 discovered=120 already recorded=0 \(provider id=0, metadata=0\) skipped=0 selected=120$/m,
     );
     // A masked breakdown of the selected items by the listing's own
     // sub-type label -- label text only, split 60/60 across the two
@@ -1008,6 +1009,221 @@ test(
       stderr.indexOf("document kind pdf_statement:") <
         stderr.indexOf("pulled 100 of 120"),
       "the start-of-run preview prints before any pull-progress line",
+    );
+  },
+);
+
+// --- F1-71: a document's identity is the provider's, not its bytes ---------
+
+/**
+ * F1-71. A session whose document downloads return different bytes every
+ * time, the way Morgan Stanley's site re-renders a statement PDF on every
+ * download: the same document, never the same content hash. The synthetic
+ * fixture's own bytes are text, so a trailing comment line is enough to move
+ * the hash without changing anything the parser reads.
+ */
+function writeRerenderingDocumentFixtures(t) {
+  const { fixturesDir, adapterModulePath } = writeAdapterFixtures(t);
+  const sessionModulePath = join(fixturesDir, "session-rerendering.mjs");
+  writeFileSync(
+    sessionModulePath,
+    `import { createSyntheticSession } from ${JSON.stringify(distIndexUrl)};\n` +
+      `export default function buildSession() {\n` +
+      `  const base = createSyntheticSession();\n` +
+      `  return {\n` +
+      `    ...base,\n` +
+      `    async fetchBytes(path, query) {\n` +
+      `      const bytes = await base.fetchBytes(path, query);\n` +
+      `      if (!path.startsWith("/documents/")) return bytes;\n` +
+      `      const rerendered =\n` +
+      `        new TextDecoder().decode(bytes) +\n` +
+      `        "\\n# rendered at " + Date.now() + "-" + Math.random() + "\\n";\n` +
+      `      return new TextEncoder().encode(rerendered);\n` +
+      `    },\n` +
+      `  };\n` +
+      `}\n`,
+  );
+  return { fixturesDir, adapterModulePath, sessionModulePath };
+}
+
+test(
+  'F1-71: "expand": "discovered" skips a document already recorded, and --refetch pulls it anyway',
+  { skip },
+  async (t) => {
+    const { schema, client } = await seededSchema(t, { seedAccount: false });
+
+    const rawDir = mkdtempSync(join(tmpdir(), "kith-finance-run-skip-raw-"));
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+
+    const { fixturesDir, adapterModulePath, sessionModulePath } =
+      writeAdapterFixtures(t);
+    const selectionPath = writeSelection(fixturesDir, [
+      {
+        expand: "discovered",
+        kinds: ["pdf_statement"],
+        docType: "statement",
+        requireExhaustive: true,
+      },
+    ]);
+    const run = (extraArgs = []) =>
+      spawnSync(
+        process.execPath,
+        [
+          runScript,
+          "--adapter",
+          adapterModulePath,
+          "--session",
+          sessionModulePath,
+          "--selection",
+          selectionPath,
+          "--now",
+          "2025-05-01T00:00:00.000Z",
+          ...extraArgs,
+        ],
+        {
+          env: {
+            ...process.env,
+            FINANCE_ARCHIVE_DATABASE_URL: url,
+            FINANCE_ARCHIVE_SCHEMA: schema,
+            FINANCE_ARCHIVE_RAW_TREE_ROOT: rawDir,
+            FINANCE_ARCHIVE_SPACE_ID: SPACE_ID,
+          },
+          encoding: "utf8",
+        },
+      );
+
+    // First pass: nothing on file, so both discovered statements are pulled.
+    // doc-stmt-2025-q1 imports (it names its own account); doc-stmt-2025-q2
+    // is keyless and fails to attribute, exactly as the F1-40 test above.
+    const first = run();
+    assert.equal(first.status, 0, first.stderr);
+    assert.match(
+      first.stderr,
+      /^document kind pdf_statement: listing total=unknown discovered=2 already recorded=0 \(provider id=0, metadata=0\) skipped=0 selected=2$/m,
+    );
+    assert.match(first.stdout, /documents acquired: 2/);
+    const documents = await all(
+      client,
+      "SELECT provider_document_id FROM documents WHERE institution_id = $1",
+      [INSTITUTION.id],
+    );
+    assert.deepEqual(
+      documents.map((document) => document.provider_document_id),
+      ["doc-stmt-2025-q1"],
+      "the imported document records the provider's own id for it",
+    );
+
+    // Second pass, same selection: the recorded statement is not downloaded
+    // again. The one that failed to import left no row, so it is not
+    // recorded and is pulled again -- the skip acts on what the archive
+    // actually has, not on what a previous run attempted.
+    const second = run();
+    assert.equal(second.status, 0, second.stderr);
+    assert.match(
+      second.stderr,
+      /^document kind pdf_statement: listing total=unknown discovered=2 already recorded=1 \(provider id=1, metadata=0\) skipped=1 selected=1$/m,
+    );
+    assert.match(second.stdout, /documents acquired: 1/);
+    assert.equal(
+      await count(client, "documents", "WHERE institution_id = $1", [
+        INSTITUTION.id,
+      ]),
+      1,
+      "a skipped document is not re-recorded",
+    );
+
+    // --refetch is the override: the same already-recorded document is
+    // pulled again (and, its bytes being identical here, changes nothing).
+    const refetched = run(["--refetch"]);
+    assert.equal(refetched.status, 0, refetched.stderr);
+    assert.match(
+      refetched.stderr,
+      /^document kind pdf_statement: listing total=unknown discovered=2 already recorded=1 \(provider id=1, metadata=0\) skipped=0 \(--refetch: pulling them anyway\) selected=2$/m,
+    );
+    assert.match(refetched.stdout, /documents acquired: 2/);
+    assert.equal(
+      await count(client, "documents", "WHERE institution_id = $1", [
+        INSTITUTION.id,
+      ]),
+      1,
+      "--refetch re-downloads, it does not re-record",
+    );
+  },
+);
+
+test(
+  "F1-71: a re-rendered document is a new capture of the document already on file, not a second document row",
+  { skip },
+  async (t) => {
+    const { schema, client } = await seededSchema(t, { seedAccount: false });
+
+    const rawDir = mkdtempSync(join(tmpdir(), "kith-finance-run-recapture-raw-"));
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+
+    const { fixturesDir, adapterModulePath, sessionModulePath } =
+      writeRerenderingDocumentFixtures(t);
+    const selectionPath = writeSelection(fixturesDir, [
+      {
+        expand: "discovered",
+        kinds: ["pdf_statement"],
+        docType: "statement",
+        requireExhaustive: true,
+      },
+    ]);
+    const runImport = makeRunner({
+      adapterModulePath,
+      sessionModulePath,
+      selectionPath,
+      schema,
+      rawDir,
+    });
+
+    runImport();
+    const afterFirst = await all(
+      client,
+      "SELECT id, sha256, provider_document_id FROM documents WHERE institution_id = $1",
+      [INSTITUTION.id],
+    );
+    assert.equal(afterFirst.length, 1);
+    const transactionsAfterFirst = await count(client, "transactions");
+    assert.ok(transactionsAfterFirst > 0);
+
+    // --refetch, so the skip does not hide what this test is about: the same
+    // provider document, downloaded again, arriving as genuinely different
+    // bytes. This is the defect that turned 1,321 statements into 6,461
+    // rows.
+    runImport(["--refetch"]);
+
+    const afterSecond = await all(
+      client,
+      "SELECT id, sha256, superseded_by FROM documents WHERE institution_id = $1",
+      [INSTITUTION.id],
+    );
+    assert.deepEqual(
+      afterSecond.map((document) => document.id),
+      [afterFirst[0].id],
+      "different bytes for a provider document already on file add no second documents row",
+    );
+    assert.equal(
+      afterSecond[0].sha256,
+      afterFirst[0].sha256,
+      "the row keeps naming the bytes its rows were parsed from",
+    );
+    assert.equal(
+      await count(client, "transactions"),
+      transactionsAfterFirst,
+      "and none of its rows are imported a second time",
+    );
+
+    // Ground rule 1 all the same: the new bytes and the capture that
+    // acquired them are retained, so the raw tree holds both captures of
+    // this document even though the archive holds one row for it.
+    const captureIds = readdirSync(
+      join(rawDir, "archive", "v1", SPACE_ID, "captures", ".by-id"),
+    );
+    assert.ok(
+      captureIds.length >= 2,
+      `every capture is retained, got ${captureIds.length}`,
     );
   },
 );

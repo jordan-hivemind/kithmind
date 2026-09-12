@@ -76,6 +76,64 @@ function document(sha256, rows, overrides = {}) {
 const NOW = new Date("2026-04-01T00:00:00.000Z");
 
 test(
+  "F1-71: different bytes carrying a provider document id already on file import as a new capture, not a second document",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+
+    const first = document("a".repeat(64), [row()], {
+      providerDocumentId: "MS-000123",
+    });
+    await importBatch(client, { source: "test", documents: [first] }, NOW);
+
+    // The same statement, downloaded again and rendered afresh: every byte
+    // different, so `sha256` matches nothing. Its bytes and its capture are
+    // already retained in the raw tree by the time this runs (ground rule 1);
+    // what the database does about it is the question here.
+    const rerendered = document("b".repeat(64), [row()], {
+      providerDocumentId: "MS-000123",
+    });
+    const summary = await importBatch(
+      client,
+      { source: "test", documents: [rerendered] },
+      NOW,
+    );
+
+    assert.equal(summary.filesSeen, 1, "the second pull is still a file seen");
+    assert.equal(summary.rowsInserted, 0);
+    const documents = await all(
+      client,
+      "SELECT sha256, provider_document_id FROM documents",
+    );
+    assert.deepEqual(documents, [
+      { sha256: "a".repeat(64), provider_document_id: "MS-000123" },
+    ]);
+    assert.equal(
+      await count(client, "transactions"),
+      1,
+      "the rows it restates are already imported under the row the archive has",
+    );
+
+    // A different provider document is still a different document, however
+    // similar its metadata.
+    await importBatch(
+      client,
+      {
+        source: "test",
+        documents: [
+          document("c".repeat(64), [row({ sourceLocator: "row:2" })], {
+            providerDocumentId: "MS-000999",
+          }),
+        ],
+      },
+      NOW,
+    );
+    assert.equal(await count(client, "documents"), 2);
+  },
+);
+
+test(
   "repeated import of the same raw tree inserts nothing new",
   { skip },
   async (t) => {
