@@ -74,7 +74,8 @@ import {
 import { fromNumericText } from "../pgNumeric.js";
 import { READER_STATEMENT_TIMEOUT_MS } from "../pgReaderRole.js";
 import { archiveSchemaOf } from "../pgStore.js";
-import { resolveRawTreeRoot, textRelativePath } from "../rawTree.js";
+import { resolveRawTreeRoot, sha256HexOf, textRelativePath } from "../rawTree.js";
+import { selectRetainedText } from "../retainedTexts.js";
 
 /** Ceiling on rows any one coverage-support query may return. */
 const MAX_SUPPORT_ROWS = 500;
@@ -448,42 +449,60 @@ function evidenceFor(
 }
 
 /**
- * The one place this read surface opens a file: whether a `retained_text_span_v1`
- * item's quote is actually present in the retained text on disk, not just
- * self-consistent in storage (F1-53's "retained_sha256 check"). Every other
- * evidence kind, and every list operation, trusts a binding's own internal
- * consistency instead -- this check is `get_evidence`-only, one record at a
- * time, precisely because it costs a disk read.
+ * Whether a `retained_text_span_v1` item's quote is actually present in the
+ * retained text it cites, not just self-consistent in storage (F1-53's
+ * "retained_sha256 check"). Every other evidence kind, and every list
+ * operation, trusts a binding's own internal consistency instead -- this
+ * check is `get_evidence`-only, one record at a time, precisely because it
+ * costs a fetch of the whole text.
  *
- * `relativePath` is derived from `textSha256` alone (`textRelativePath`), so
- * this needs no `documents` column to find the file: the same fanout
- * `writeRetainedText` wrote it under is reproduced here with the configured
- * raw tree root prepended. `rawTreeRoot` is null when the caller has none
- * configured (`serveFinanceRead`'s `resolveRawTreeRoot()` fallback threw),
- * which withholds every text-span item rather than throwing mid-response --
- * a read surface with no raw tree root cannot serve one, and every other
- * evidence kind is unaffected.
+ * F1-66: the archive itself is the first place the bytes are looked for
+ * (`retained_texts`, keyed on the same sha256 the raw tree content-addresses
+ * the file under). That is what makes this work from the gateway at all: the
+ * Vercel function serving `apps/web/src/lib/mcp/finance.ts` has a reader-role
+ * connection and no raw tree, so every text-span citation used to come back
+ * `retained_evidence_unavailable` there while `json_pointer_v1` evidence --
+ * whose bytes are the `source_locator` already in the database -- verified
+ * fine.
+ *
+ * The raw tree is the fallback, and only when the table has no row *and* a
+ * root is configured: an archive whose texts have not been backfilled yet
+ * still verifies on the machine that holds them. A row that is present but
+ * wrong is refused rather than fallen back from -- falling back would let a
+ * tampered row be papered over by a file that happens to be intact.
+ * `rawTreeRoot` is null when the caller has none configured
+ * (`serveFinanceRead`'s `resolveRawTreeRoot()` fallback threw), which is not
+ * an error: it withholds a text-span item that is nowhere to be found rather
+ * than throwing mid-response, and every other evidence kind is unaffected.
+ *
+ * The quote is recomputed from the retained text and compared, never read
+ * back out of the binding: `start` and `end` are unicode code point offsets
+ * (the contract's `offsetUnit`, and what `textSpanLocator` above validates
+ * `quote` against), so the slice is taken over code points rather than over
+ * UTF-16 units, which coincide only while the text stays inside the BMP.
  */
-function verifiedAgainstRetainedText(
+async function verifiedAgainstRetainedText(
+  client: pg.ClientBase,
   item: FinanceEvidence,
   rawTreeRoot: string | null,
-): boolean {
+): Promise<boolean> {
   if (item.kind !== "retained_text_span_v1") return true;
-  if (rawTreeRoot === null) return false;
-  let bytes: Buffer;
-  try {
-    bytes = readFileSync(join(rawTreeRoot, item.locator.relativePath));
-  } catch {
-    return false;
+  const { textSha256, textByteLength, textCodepointLength, start, end, quote } =
+    item.locator;
+  let bytes = await selectRetainedText(client, textSha256);
+  if (bytes === null) {
+    if (rawTreeRoot === null) return false;
+    try {
+      bytes = readFileSync(join(rawTreeRoot, item.locator.relativePath));
+    } catch {
+      return false;
+    }
   }
-  const actualSha256 = createHash("sha256").update(bytes).digest("hex");
-  if (
-    actualSha256 !== item.locator.textSha256 ||
-    bytes.byteLength !== item.locator.textByteLength
-  )
+  if (sha256HexOf(bytes) !== textSha256 || bytes.byteLength !== textByteLength)
     return false;
-  const text = bytes.toString("utf8");
-  return text.slice(item.locator.start, item.locator.end) === item.locator.quote;
+  const codepoints = Array.from(bytes.toString("utf8"));
+  if (codepoints.length !== textCodepointLength) return false;
+  return codepoints.slice(start, end).join("") === quote;
 }
 
 type ReadScope = {
@@ -1236,14 +1255,27 @@ async function getEvidence(
           documentOf(row),
         )
       : null;
-    // F1-53: get_evidence, unlike a list operation, opens the retained text a
-    // `retained_text_span_v1` item names and checks the quote against the
-    // actual bytes on disk (verifiedAgainstRetainedText's doc comment) --
-    // asked for one record at a time, it can afford the read a page of up to
-    // `MAX_FINANCE_PAGE_SIZE` rows cannot.
+    // F1-53: get_evidence, unlike a list operation, fetches the retained text
+    // a `retained_text_span_v1` item names and checks the quote against the
+    // actual bytes (verifiedAgainstRetainedText's doc comment) -- asked for
+    // one record at a time, it can afford the fetch a page of up to
+    // `MAX_FINANCE_PAGE_SIZE` rows cannot. An item survives that check only
+    // when the quote recomputed from those bytes is exactly the one in the
+    // locator, so the items returned below carry the verified quote rather
+    // than the binding's unverified claim about it.
+    //
+    // `Promise.all` over one client: node-postgres queues queries on a client
+    // and runs them in order, so these are serialized inside this
+    // transaction, not concurrent.
     if (
       evidence !== null &&
-      evidence.every((item) => verifiedAgainstRetainedText(item, rawTreeRoot))
+      (
+        await Promise.all(
+          evidence.map((item) =>
+            verifiedAgainstRetainedText(client, item, rawTreeRoot),
+          ),
+        )
+      ).every(Boolean)
     ) {
       items = evidence;
     } else {
@@ -1659,14 +1691,16 @@ export async function serveFinanceRead(
   request: FinanceReadRequest,
   spaceId: string,
   /**
-   * F1-53: the raw tree root `get_evidence` opens a `retained_text_span_v1`
-   * item's text under (`verifiedAgainstRetainedText`). Omitted in every real
-   * caller (`mcp/server.ts`), which falls back to the configured
+   * F1-53: the raw tree root `get_evidence` falls back to for a
+   * `retained_text_span_v1` item's text when the archive itself has no
+   * `retained_texts` row for it (`verifiedAgainstRetainedText`). Omitted in
+   * every real caller (`mcp/server.ts`), which falls back to the configured
    * `FINANCE_ARCHIVE_RAW_TREE_ROOT` (`resolveRawTreeRoot()`); a test supplies
-   * one explicitly instead of mutating that process-wide environment
+   * one explicitly, or `null` to pin "this caller has no raw tree" -- the
+   * gateway's case -- instead of mutating that process-wide environment
    * variable. Every other operation ignores this entirely.
    */
-  options: { rawTreeRoot?: string } = {},
+  options: { rawTreeRoot?: string | null } = {},
 ): Promise<FinanceReadResponse> {
   if (request.spaceId !== spaceId) {
     throw new FinanceContractError("not_authorized");

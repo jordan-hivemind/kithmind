@@ -600,6 +600,71 @@ CREATE UNIQUE INDEX review_items_weak_instrument_match_key
   WHERE kind = 'weak_instrument_match';
 `;
 
+// F1-66. The retained text a `retained_text_span_v1` citation quotes, in the
+// archive rather than only in the raw tree.
+//
+// The defect this fixes: `list_holdings` served PDF-tier rows whose evidence
+// is a retained-text span, and `get_evidence` on one of those rows answered
+// `retained_evidence_unavailable`, because the verification step read the
+// cited bytes from `FINANCE_ARCHIVE_RAW_TREE_ROOT` -- a directory that exists
+// on the owner's machine and nowhere near the Vercel function serving the
+// gateway. Transaction evidence (`json_pointer_v1`) verified fine, because
+// its bytes are the `source_locator` already in the database. A citation the
+// read surface can only check on one laptop is not a citation the read
+// surface can check.
+//
+// Keyed on the text's own sha256, the same identity `writeRetainedText`
+// content-addresses the file under (`textRelativePath`, rawTree.ts), so the
+// table and the raw tree name the same bytes by the same name and neither has
+// to know where the other lives. `content` is the whole retained text: a span
+// is verified by slicing it, and storing only the quoted span would verify
+// nothing, since the quote is exactly what a wrong or tampered binding would
+// have supplied.
+//
+// `bytea` and not a large object, and not `text`:
+//
+//   - Size. Statement text runs a few hundred KB per document and the owner's
+//     archive holds on the order of a thousand documents: roughly 300 MB of
+//     plain text. Measured on synthetic statement text under pglz, the whole
+//     relation (heap, TOAST and index) came to about a third of that, so the
+//     real cost is on the order of 100-150 MB. Every value is three orders of
+//     magnitude below TOAST's 1 GB per-value ceiling, and far above the ~2 KB
+//     threshold at which TOAST moves it out of line and compresses it --
+//     which is exactly the storage a large object would be chosen for.
+//   - The reader role. A large object lives in `pg_largeobject`, outside this
+//     schema, with its own per-object ACL: `GRANT SELECT ON ALL TABLES IN
+//     SCHEMA` (pgReaderRole.ts) would not reach it, no grant review would
+//     ever see it, and every `lo_*` function is already refused to the reader
+//     (test/pgReaderRole.test.mjs's `lo_create` case). The verifier that has
+//     to read these bytes is precisely the role that could not.
+//   - Cleanup. A large object survives `DROP TABLE` and `DROP SCHEMA
+//     CASCADE`, so every throwaway test schema would leak one per document.
+//   - `text` over `bytea` would add a UTF-8 validation and a NUL-byte
+//     rejection between the extractor and storage, on a column whose whole
+//     job is to hand back the exact bytes that hash to `sha256`.
+//
+// `byte_length` is checked against the stored bytes rather than trusted, so a
+// row cannot claim a length it does not have; `codepoint_length` cannot be
+// checked in SQL (Postgres has no code-point count for bytea) and is recorded
+// as the writer computed it. Neither is what verification trusts: the read
+// surface recomputes the sha256 of `content` and refuses a mismatch, so a
+// tampered row is refused rather than quoted.
+//
+// No backfill here, the same policy every additive migration above uses:
+// `scripts/backfillRetainedTexts.mjs` walks an existing raw tree's text
+// namespace and inserts the missing rows by sha.
+const RETAINED_TEXTS = `
+CREATE TABLE retained_texts (
+  sha256 TEXT PRIMARY KEY CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+  byte_length BIGINT NOT NULL CHECK (byte_length >= 0),
+  codepoint_length BIGINT NOT NULL CHECK (codepoint_length >= 0),
+  content BYTEA NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT retained_texts_byte_length_matches
+    CHECK (octet_length(content) = byte_length)
+);
+`;
+
 /** Every migration, in order. The last one's version is the current schema. */
 export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
   {
@@ -642,6 +707,11 @@ export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
     name: "weak_instrument_match becomes instrument-level: institution_id, matched_instrument_id, occurrence_count, last_seen_document_id",
     sql: WEAK_INSTRUMENT_MATCH_IDENTITY,
   },
+  {
+    version: 9,
+    name: "retained_texts: the retained text a text-span citation is verified against",
+    sql: RETAINED_TEXTS,
+  },
 ]);
 
 /** The version an archive reaches once every migration has been applied. */
@@ -664,6 +734,7 @@ export const PG_TABLES: readonly string[] = Object.freeze([
   "position_reconciliations",
   "review_items",
   "account_aliases",
+  "retained_texts",
 ]);
 
 /**

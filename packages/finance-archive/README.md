@@ -1822,6 +1822,72 @@ length and media type on `documents`, and capture and revision identity
 reachable from the database. `retainedTextSpanEvidence` in `src/mcp/pgRead.ts`
 is where they get assembled when they exist.
 
+### Verifying a retained-text citation (F1-66)
+
+`get_evidence`, unlike a list operation, checks a `retained_text_span_v1`
+item's quote against the retained text itself rather than against the
+binding's own internal consistency: it fetches the whole text, recomputes its
+sha256, reslices `[start, end)` over Unicode code points and compares the
+result to `quote`. An item that fails any of those is withheld with
+`retained_evidence_unavailable`.
+
+Those bytes come from the archive first and the raw tree second:
+
+| Where                                     | When                                                     |
+| ----------------------------------------- | -------------------------------------------------------- |
+| `retained_texts.content`, keyed on sha256 | Always tried first                                       |
+| `<raw tree root>/text/...`                | Only when the table has no row *and* a root is configured |
+
+The order is the fix, not a cache. Verification used to read the raw tree
+only, so a hosted read surface -- the gateway in `apps/web/src/lib/mcp/finance.ts`,
+a reader-role pool in a serverless function with no filesystem to speak of --
+served PDF-tier holdings from `list_holdings` and then answered
+`retained_evidence_unavailable` for every one of them from `get_evidence`,
+while transaction evidence (`json_pointer_v1`, whose bytes are the
+`source_locator` already in the database) verified fine. A row that is present
+but whose content no longer hashes to its key is refused rather than fallen
+back from: a tampered archive is not a cache miss.
+
+`retained_texts` (migration 9) is written by the same code path that writes
+the raw-tree text file -- the import and the reparse in `src/run.ts`, both
+through `storeRetainedText` -- and is idempotent on the sha, because two texts
+with the same hash are the same text. `content` is `bytea` and not a large
+object: every value sits far below TOAST's 1 GB per-value ceiling and far
+above the threshold where it is compressed and stored out of line, while a
+large object would live outside the schema with a per-object ACL that
+`GRANT SELECT ON ALL TABLES IN SCHEMA` never reaches, would survive
+`DROP SCHEMA CASCADE`, and is unreachable by the reader role in any case (every
+`lo_*` function is refused to it). Measured on synthetic statement text, the
+stored relation is about a third of the plain text size; on the order of a
+thousand statements of a few hundred KB each that is roughly 100-150 MB.
+
+`scripts/backfillRetainedTexts.mjs` puts an existing raw tree's retained texts
+into the archive. It walks `<raw tree root>/text/**/*.txt`, inserts the rows
+missing by sha, is idempotent, and skips (and names) any file whose bytes no
+longer hash to the name it sits under:
+
+```
+FINANCE_ARCHIVE_DATABASE_URL=postgresql://<owner>@<host>/<db> \
+FINANCE_ARCHIVE_RAW_TREE_ROOT=<managed root> \
+FINANCE_ARCHIVE_SPACE_ID=<space id> \
+  node scripts/backfillRetainedTexts.mjs --dry-run
+FINANCE_ARCHIVE_DATABASE_URL=postgresql://<owner>@<host>/<db> \
+FINANCE_ARCHIVE_RAW_TREE_ROOT=<managed root> \
+FINANCE_ARCHIVE_SPACE_ID=<space id> \
+  node scripts/backfillRetainedTexts.mjs
+```
+
+The reader needs `SELECT` on the new table. `applyPgReaderRole` grants it,
+but on a live archive whose reader already exists, migration 9 creates the
+table afterwards and it is born unreadable. Re-running `applyPgReaderRole` (or
+`scripts/provision.mjs`) would fix that *and rotate the reader's password*,
+which a live gateway is holding. So grant it directly instead, as the archive
+owner, which changes nothing else:
+
+```
+GRANT SELECT ON <schema>.retained_texts TO <schema>_reader;
+```
+
 ### Completeness, truncation and coverage
 
 Every response carries `datasetRevision` and an explicit `completeness`. All

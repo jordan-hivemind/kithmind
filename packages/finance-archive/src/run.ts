@@ -125,6 +125,7 @@ import {
   resolveRawTreeRoot,
   writeRetainedText,
 } from "./rawTree.js";
+import { storeRetainedText } from "./retainedTexts.js";
 
 // --- selection file ----------------------------------------------------
 
@@ -967,9 +968,17 @@ async function runReparse(args: readonly string[]): Promise<void> {
         }
         const { manifest, bytes } = opened;
         const parsed = await adapter.parse({ kind: manifest.capabilityTier, bytes });
-        const textPath = parsed.extractedText
-          ? writeRetainedText(rawTreeRoot, parsed.extractedText).path
-          : null;
+        // F1-66: the retained text lands in both places it has to be
+        // resolvable from -- the raw tree, which is the thing ground rule 1
+        // says can never be reconstructed, and the archive, which is the only
+        // one of the two a hosted read surface can reach. Both are keyed on
+        // the same content hash and both writes are idempotent, so a reparse
+        // of an already-reparsed document rewrites neither.
+        let textPath: string | null = null;
+        if (parsed.extractedText) {
+          textPath = writeRetainedText(rawTreeRoot, parsed.extractedText).path;
+          await storeRetainedText(tx, parsed.extractedText);
+        }
         const accountsByExternalKey = await loadAccountsByExternalKey(doc.institution_id);
 
         const pull: AdapterPull = {
@@ -1902,6 +1911,16 @@ async function main(): Promise<void> {
         // F1-44: retained whenever the adapter extracted any, parsed or not.
         parsed.extractedText ?? null,
       );
+      // F1-66, the same pair of writes the reparse above makes: the raw tree
+      // holds the text file and the archive holds its bytes, both addressed
+      // by the same sha, because a hosted read surface verifying a
+      // `retained_text_span_v1` citation can reach only the second. Written
+      // here beside the raw-tree write rather than inside the import
+      // transaction below, because acquisition and import are different
+      // facts (see this function's own doc comment).
+      if (parsed.extractedText) {
+        await storeRetainedText(pgClient, parsed.extractedText);
+      }
       bytesAcquired += acquired.bytes.length;
       manifestHashes.push(acquired.manifest.contentHash);
       documentsAcquiredCount += 1;

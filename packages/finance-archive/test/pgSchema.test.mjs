@@ -102,7 +102,7 @@ test(
         [[...PG_TABLES]],
       );
       assert.equal(Number(tables.rows[0].n), PG_TABLES.length);
-      assert.equal(PG_TABLES.length, 14);
+      assert.equal(PG_TABLES.length, 15);
 
       // Running it again is a no-op: one row per migration applied, no extra
       // row and no error.
@@ -752,12 +752,14 @@ test(
       // Every migration except the one under test (version 7): a live
       // archive the night before this ships, with a hosted reparse's worth
       // of duplicates already on file. Filtered by version rather than
-      // "all but the last" -- migration 8 (F1-58) now follows this one.
+      // "all but the last" -- later migrations (F1-58, F1-66) now follow it.
       const priorMigrations = PG_MIGRATIONS.filter((m) => m.version < 7);
-      assert.equal(
-        priorMigrations.length,
-        PG_MIGRATIONS.length - 2,
-        "expected exactly the dedupe migration and one migration after it",
+      assert.equal(priorMigrations.length, 6);
+      assert.ok(
+        PG_MIGRATIONS[priorMigrations.length].name.startsWith(
+          "review_items dedupe key",
+        ),
+        "the migration under test is still version 7",
       );
       await client.query(`CREATE SCHEMA ${schema}`);
       await client.query(

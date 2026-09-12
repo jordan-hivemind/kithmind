@@ -33,6 +33,7 @@ import {
   persistAcquiredDocument,
   resolveRawTreeRoot,
   serveFinanceRead,
+  storeRetainedText,
   syntheticAdapter,
   textRelativePath,
   writeRetainedText,
@@ -1010,6 +1011,75 @@ test(
       r,
       { operation: "get_evidence", recordId },
       { rawTreeRoot: emptyRoot },
+    );
+    assert.deepEqual(response.items, []);
+    assert.ok(response.coverage.reasons.includes("retained_evidence_unavailable"));
+  },
+);
+
+test(
+  "F1-66: get_evidence verifies a retained-text span against the archive's own copy, with no raw tree configured at all",
+  { skip },
+  async (t) => {
+    const { client, rawTreeRoot } = await importedPull(t);
+    const r = await reader(t, client);
+    const { recordId, text } = await bindPdfPositionToRetainedText(
+      client,
+      rawTreeRoot,
+    );
+    // The import path writes this row beside the raw-tree file (run.ts); this
+    // helper writes only the file, so the row is written here by the same
+    // function the import calls.
+    await storeRetainedText(client, text);
+
+    const listed = await serve(r, { operation: "list_holdings", limit: 100 });
+    const item = listed.items.find((row) => row.recordId === recordId);
+    assert.ok(item);
+
+    // `rawTreeRoot: null` is the gateway: a reader-role pool in a Vercel
+    // function, with no raw tree anywhere near it. Before F1-66 this answered
+    // `retained_evidence_unavailable` for every text-span citation the list
+    // operation had just served.
+    const response = await serve(
+      r,
+      { operation: "get_evidence", recordId },
+      { rawTreeRoot: null },
+    );
+    assert.deepEqual(response.items, item.evidence);
+    assert.ok(
+      !(response.coverage.reasons ?? []).includes("retained_evidence_unavailable"),
+      "nothing was withheld: the archive had the bytes",
+    );
+  },
+);
+
+test(
+  "F1-66: a retained_texts row whose content no longer hashes to its key is refused, and never falls back to an intact raw tree",
+  { skip },
+  async (t) => {
+    const { client, rawTreeRoot } = await importedPull(t);
+    const r = await reader(t, client);
+    const { recordId, text, binding } = await bindPdfPositionToRetainedText(
+      client,
+      rawTreeRoot,
+    );
+    await storeRetainedText(client, text);
+
+    // One byte, in place: the length still matches (the table's own CHECK
+    // sees nothing wrong) and the sha256 no longer does, which is the only
+    // thing verification actually trusts.
+    await client.query(
+      "UPDATE retained_texts SET content = overlay(content placing $2::bytea from 1 for 1) WHERE sha256 = $1",
+      [binding.textSha256, Buffer.from("X", "utf8")],
+    );
+
+    // The raw tree still holds the true bytes, and this still refuses: a row
+    // that is present but wrong is a tampered archive, not a cache miss, so
+    // the fallback is for an absent row only.
+    const response = await serve(
+      r,
+      { operation: "get_evidence", recordId },
+      { rawTreeRoot },
     );
     assert.deepEqual(response.items, []);
     assert.ok(response.coverage.reasons.includes("retained_evidence_unavailable"));

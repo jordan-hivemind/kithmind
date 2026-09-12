@@ -222,6 +222,24 @@ test("a table a later migration adds is not silently readable", { skip }, async 
   assert.equal(granted.s, false, "no default SELECT: exposure is a deliberate act");
   assert.equal(granted.p, false, "and PUBLIC gets nothing either");
   assert.ok(await refused(r.client, "SELECT * FROM later_migration"));
+
+  // The other half of the same policy, named rather than implied: a table the
+  // read surface genuinely needs is exposed by the setup having run over it.
+  // F1-66's `retained_texts` holds the retained text `get_evidence` reslices a
+  // `retained_text_span_v1` quote out of (mcp/pgRead.ts), so a reader that
+  // could not select it would answer `retained_evidence_unavailable` for every
+  // PDF-tier citation -- which is the defect that table exists to fix.
+  const retainedTexts = await one(
+    owner,
+    `SELECT has_table_privilege($1, $2 || '.retained_texts', 'SELECT') AS s,
+            has_table_privilege($1, $2 || '.retained_texts', 'INSERT') AS i,
+            has_table_privilege('public', $2 || '.retained_texts', 'SELECT') AS p`,
+    [r.summary.role, r.summary.schema],
+  );
+  assert.equal(retainedTexts.s, true, "the read surface's own table is readable");
+  assert.equal(retainedTexts.i, false, "read, and only read");
+  assert.equal(retainedTexts.p, false, "and PUBLIC still gets nothing");
+  assert.equal(await count(r.client, "retained_texts"), 0);
 });
 
 test("a function a later migration adds needs the setup re-run to be locked down", { skip }, async (t) => {
