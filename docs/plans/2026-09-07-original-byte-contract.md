@@ -313,6 +313,13 @@ addressable after correction. Cleanup must retain any immutable provenance
 reachable from an active or historical published document or record until the
 document's retention or forget policy authorizes deletion.
 
+Sealing freezes the retained text and its pages. It does not freeze the set of
+pointers into them: a later consumer may stage an additional evidence span over
+a sealed text version, under the same validation the parser's spans pass, and
+without writing a page or a text version. Card extraction is the first such
+consumer; see section 4.3 of
+[document cards](./2026-09-12-document-cards.md).
+
 ## Identity and correction rules
 
 | Change                                                        | Required result                                                                                                                                                                                                               |

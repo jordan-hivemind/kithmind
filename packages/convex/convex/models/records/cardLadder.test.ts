@@ -16,9 +16,7 @@ import {
 import {
   CARD_PLAYBOOK_VERSION,
   loadCardExtractionDocument,
-  resolveCardSpan,
   runCardLadder,
-  type CardExtractionDocument,
   type CardLadderOps,
 } from "./cardLadder";
 import { publishDocumentCard } from "./cards";
@@ -35,8 +33,11 @@ import type { CardRecordKind } from "./cardSchemas";
 // in this file calls a model, and no test reaches the network.
 
 const PAGE_ONE = "Mutual Non-Disclosure Agreement\nDated 2025-03-04.";
-const PAGE_TWO =
-  "Between Northwind Supply and Acme Research.\nSummary: both sides keep material confidential.";
+const PAGE_TWO = [
+  "Between Northwind Supply and Acme Research.",
+  "Summary: both sides keep material confidential.",
+  "The investor advances $250,000.00 under this instrument.",
+].join("\n");
 const TEXT = `${PAGE_ONE}\n${PAGE_TWO}`;
 
 const TITLE = "Mutual Non-Disclosure Agreement";
@@ -44,7 +45,16 @@ const DATE = "2025-03-04";
 const PARTY = "Northwind Supply";
 const SUMMARY = "both sides keep material confidential";
 
-/** Every quote a fixture may cite, staged as a span before the text seals. */
+/** An amount stated in prose. The parser staged no span over it. */
+const AMOUNT = "$250,000.00";
+/** Named in prose only. The parser staged no span over it either. */
+const INVESTOR = "Acme Research";
+
+/**
+ * The spans the parser staged before the text sealed. `AMOUNT` and `INVESTOR`
+ * are deliberately absent: a card that needs them must stage its own span
+ * over the sealed page, which is the rule settled on review 2026-09-12.
+ */
 const QUOTES: Array<{ page: 0 | 1; quote: string }> = [
   { page: 0, quote: TITLE },
   { page: 0, quote: DATE },
@@ -207,6 +217,32 @@ type Harness = Awaited<ReturnType<typeof seedDocument>>;
 
 function opsFor(harness: Harness): CardLadderOps {
   return {
+    stageEvidence: async (input) =>
+      await harness.t.mutation(
+        internal.models.records.cards.stageCardEvidence,
+        {
+          sourceItemId: harness.sourceItemId,
+          recordKind: input.recordKind,
+          fingerprint: { ...FINGERPRINT, tier: input.step },
+          refs: input.refs.map((ref) =>
+            "quote" in ref
+              ? { pageOrdinal: ref.pageOrdinal, quote: ref.quote }
+              : {
+                  pageOrdinal: ref.pageOrdinal,
+                  start: ref.start,
+                  end: ref.end,
+                },
+          ),
+        },
+      ),
+    sweepEvidence: async () => {
+      await harness.t.mutation(
+        internal.models.records.cards.sweepCardEvidence,
+        {
+          sourceItemId: harness.sourceItemId,
+        },
+      );
+    },
     publish: async (input) =>
       await harness.t.run((ctx) =>
         publishDocumentCard(ctx, {
@@ -508,38 +544,216 @@ describe("the extraction ladder", () => {
   });
 });
 
-describe("turning a cited location into evidence", () => {
-  test("resolves an exact quote and an exact range to the same span", async () => {
+async function evidenceSpans(
+  harness: Harness,
+): Promise<Doc<"evidenceSpans">[]> {
+  return await harness.t.run(
+    async (ctx) => await ctx.db.query("evidenceSpans").collect(),
+  );
+}
+
+function cardStaged(spans: Doc<"evidenceSpans">[]): Doc<"evidenceSpans">[] {
+  return spans.filter((row) => row.cardExtractionFingerprints !== undefined);
+}
+
+/** A SAFE card whose money and investor are stated in prose only. */
+function safeNote(
+  overrides: { amountSpan?: ReturnType<typeof span> } = {},
+): CardRunnerCandidate {
+  return {
+    anchor: [span(0, TITLE)],
+    fields: [
+      {
+        field: "company",
+        value: { type: "text", value: PARTY },
+        spans: [span(1, PARTY)],
+      },
+      {
+        field: "investor_entity",
+        value: { type: "text", value: INVESTOR },
+        spans: [span(1, INVESTOR)],
+      },
+      {
+        field: "instrument_date",
+        value: { type: "date", value: DATE },
+        spans: [span(0, DATE)],
+      },
+      {
+        field: "principal_amount",
+        value: { type: "money", amount: "250000.00", currency: "USD" },
+        spans: [overrides.amountSpan ?? span(1, AMOUNT)],
+      },
+    ],
+  };
+}
+
+describe("staging evidence over sealed retained text", () => {
+  test("a money field stated in prose publishes through a card-staged span", async () => {
     const harness = await seedDocument();
-    const byQuote = resolveCardSpan(span(1, PARTY), harness.document);
-    const start = PAGE_TWO.indexOf(PARTY);
-    const byRange = resolveCardSpan(
-      { pageOrdinal: 1, start, end: start + PARTY.length },
-      harness.document,
+    const before = await evidenceSpans(harness);
+    expect(cardStaged(before)).toEqual([]);
+
+    const result = await runCardLadder({
+      recordKind: "safe_note_card",
+      document: harness.document,
+      now: 7_000,
+      ops: opsFor(harness),
+      runners: ladder(
+        fixtureCardRunner({ step: "tier0", candidate: safeNote() }),
+        fixtureCardRunner({ step: "tier1", candidate: safeNote() }),
+      ),
+    });
+
+    expect(result.outcome).toBe("accepted");
+    expect(result.acceptedStep).toBe("tier0");
+    expect(result.storedFields.sort()).toEqual([
+      "company",
+      "instrument_date",
+      "investor_entity",
+      "principal_amount",
+    ]);
+
+    const after = await evidenceSpans(harness);
+    // Exactly the two prose citations became spans; the parser's four are
+    // untouched, and the page they point into was never rewritten.
+    const staged = cardStaged(after);
+    expect(staged.length).toBe(2);
+    expect(after.length - staged.length).toBe(QUOTES.length);
+    const amountStart = PAGE_TWO.indexOf(AMOUNT);
+    expect(
+      staged.some(
+        (row) =>
+          row.start === amountStart && row.end === amountStart + AMOUNT.length,
+      ),
+    ).toBe(true);
+    const pages = await harness.t.run(
+      async (ctx) => await ctx.db.query("sourcePages").collect(),
     );
-    expect(byQuote).toBeDefined();
-    expect(byRange).toBe(byQuote);
+    expect(pages.map((page) => page.text).sort()).toEqual(
+      [PAGE_ONE, PAGE_TWO].sort(),
+    );
   });
 
-  test("refuses a location no sealed span covers, and an ambiguous quote", async () => {
+  test("an existing parser span over the same range is reused, not duplicated", async () => {
     const harness = await seedDocument();
-    // Real text, but no evidence span was ever staged over it.
+    const before = await evidenceSpans(harness);
+    const start = PAGE_TWO.indexOf(PARTY);
+    const parser = before.find(
+      (row) => row.start === start && row.end === start + PARTY.length,
+    );
+    expect(parser).toBeDefined();
+
+    const staged = await harness.t.mutation(
+      internal.models.records.cards.stageCardEvidence,
+      {
+        sourceItemId: harness.sourceItemId,
+        recordKind: "safe_note_card",
+        fingerprint: { ...FINGERPRINT, tier: "tier0" as const },
+        refs: [
+          { pageOrdinal: 1, quote: PARTY },
+          { pageOrdinal: 1, start, end: start + PARTY.length },
+        ],
+      },
+    );
+    // The quote form and the range form name the one span that already exists.
+    expect(staged).toEqual([parser!._id, parser!._id]);
+    expect((await evidenceSpans(harness)).length).toBe(before.length);
+  });
+
+  test("a quote the page does not contain is refused", async () => {
+    const harness = await seedDocument();
+    const staged = await harness.t.mutation(
+      internal.models.records.cards.stageCardEvidence,
+      {
+        sourceItemId: harness.sourceItemId,
+        recordKind: "safe_note_card",
+        fingerprint: { ...FINGERPRINT, tier: "tier0" as const },
+        refs: [
+          { pageOrdinal: 1, quote: "$999,999.00" },
+          { pageOrdinal: 9, quote: PARTY },
+          { pageOrdinal: 1, start: 0, end: 1_000_000 },
+        ],
+      },
+    );
+    expect(staged).toEqual([null, null, null]);
+    expect(cardStaged(await evidenceSpans(harness))).toEqual([]);
+  });
+
+  test("an abandoned generation leaves no card-staged span", async () => {
+    const harness = await seedDocument();
+    // A required money field citing a quote that is not on the page. The gate
+    // refuses it at both steps, so no card generation is ever created.
+    const wrong = safeNote({ amountSpan: span(1, "$999,999.00") });
+    const result = await runCardLadder({
+      recordKind: "safe_note_card",
+      document: harness.document,
+      now: 8_000,
+      ops: opsFor(harness),
+      runners: ladder(
+        fixtureCardRunner({ step: "tier0", candidate: wrong }),
+        fixtureCardRunner({ step: "tier1", candidate: wrong }),
+      ),
+    });
+
+    expect(result.outcome).toBe("review");
+    const drops = await harness.t.run(
+      async (ctx) => await ctx.db.query("cardFieldDrops").collect(),
+    );
     expect(
-      resolveCardSpan(span(1, "Acme Research"), harness.document),
-    ).toBeUndefined();
-    // A quote that appears twice on its page proves nothing in particular.
-    const document: Pick<CardExtractionDocument, "pages" | "spans"> = {
-      pages: [{ ordinal: 0, text: "north north" }],
-      spans: [
-        {
-          spanId: "x" as Id<"evidenceSpans">,
-          pageOrdinal: 0,
-          start: 0,
-          end: 5,
-        },
-      ],
+      drops
+        .filter((row) => row.kind === "card_gate_failed")
+        .map((row) => [row.fieldKey, row.code]),
+    ).toEqual([["principal_amount", "evidence_missing"]]);
+    // The investor span the rejected steps did stage is swept: its extraction
+    // fingerprint names a card generation that was never created.
+    expect(cardStaged(await evidenceSpans(harness))).toEqual([]);
+  });
+
+  test("a span a rejected step staged survives when the accepted step reuses it", async () => {
+    const harness = await seedDocument();
+    const wrongInvestor: CardRunnerCandidate = {
+      ...safeNote(),
+      fields: safeNote().fields.map((field) =>
+        field.field === "investor_entity"
+          ? {
+              ...field,
+              value: { type: "text" as const, value: "Someone Else" },
+            }
+          : field,
+      ),
     };
-    expect(resolveCardSpan(span(0, "north"), document)).toBeUndefined();
+    const result = await runCardLadder({
+      recordKind: "safe_note_card",
+      document: harness.document,
+      now: 9_000,
+      ops: opsFor(harness),
+      runners: ladder(
+        fixtureCardRunner({ step: "tier0", candidate: wrongInvestor }),
+        fixtureCardRunner({ step: "tier1", candidate: safeNote() }),
+      ),
+    });
+
+    expect(result.outcome).toBe("accepted");
+    expect(result.acceptedStep).toBe("tier1");
+    const staged = cardStaged(await evidenceSpans(harness));
+    // Tier 0 created both rows and tier 1 reused them, so each row records
+    // both citations. The sweep must not delete a row the accepted step
+    // depends on merely because the step that first staged it was rejected.
+    expect(staged.length).toBe(2);
+    for (const row of staged) {
+      const cited = row.cardExtractionFingerprints ?? [];
+      expect(cited.length).toBe(2);
+      expect(cited[0]).toContain("tier:tier0");
+      expect(cited[1]).toContain("tier:tier1");
+    }
+    // Every stored field still resolves through the record store.
+    const observations = await harness.t.run(
+      async (ctx) => await ctx.db.query("observations").collect(),
+    );
+    const cited = new Set(
+      observations.flatMap((row) => row.valueEvidence ?? []),
+    );
+    for (const row of staged) expect(cited.has(row._id)).toBe(true);
   });
 
   test("an uncitable field drops with evidence_missing rather than vanishing", async () => {
@@ -548,7 +762,7 @@ describe("turning a cited location into evidence", () => {
     const result = await runCardLadder({
       recordKind: "document_card",
       document: harness.document,
-      now: 7_000,
+      now: 10_000,
       ops: opsFor(harness),
       runners: ladder(
         fixtureCardRunner({
@@ -560,8 +774,8 @@ describe("turning a cited location into evidence", () => {
               {
                 field: "card_party",
                 ordinal: 1,
-                value: { type: "text", value: "Acme Research" },
-                spans: [span(1, "Acme Research")],
+                value: { type: "text", value: "Nobody At All" },
+                spans: [span(1, "Nobody At All")],
               },
             ],
           },

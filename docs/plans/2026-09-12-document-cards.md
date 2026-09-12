@@ -228,6 +228,30 @@ contract spells `retained_text_span_v1`; the name is not shared, because the
 two stores are separate and the archive's kind names its own retained objects.
 Nothing in this plan introduces `retained_text_span_v1` into this repository.
 
+#### Card publication stages its own spans, settled on review 2026-09-12
+
+A card field usually cites text the parser never staged a span over: an amount
+in a sentence, a party named in prose. Card publication therefore stages the
+spans it needs over the sealed text version.
+
+Sealing protects the retained text and its pages, not pointers into them. The
+staging path writes `evidenceSpans` rows and nothing else. It never writes a
+page, never writes a text version, never clears `evidenceSealed`, and never
+widens a range it was given.
+
+| Rule                | Statement                                                                                                                               |
+| ------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| Same guarantee      | The page is in this text version, the range is inside it and on UTF-16 boundaries, and `quoteHash` is recomputed from that page's text. |
+| Quote form          | A cited quote must occur exactly once on its page and equal the slice character for character. Two occurrences prove nothing.           |
+| Unprovable citation | The ref resolves to no span. The field reaches the gate with no evidence and is refused as `evidence_missing`, which leaves a drop row. |
+| Reuse               | An existing span over exactly the same range is reused, whether the parser or an earlier card version staged it.                        |
+| Indistinguishable   | The gate and evidence hydration treat a card-staged span exactly as a parser span. Nothing downstream asks which staged it.             |
+| Reachability        | A card-staged span records every card extraction fingerprint that cited it, so a row an accepted step reused is never swept.            |
+| Sweep               | A card-staged span whose fingerprints name no surviving card generation is deleted. A retired generation keeps its row and its spans.   |
+
+Accumulation is bounded by reuse: re-extraction over unchanged text creates no
+rows and only adds a fingerprint to rows that exist.
+
 Spreadsheet cells reuse the existing `sheet` locator kind on the same evidence
 span, extended if needed with a zero-based row index, a zero-based column
 index and the header cell text. The span still points at the cell's text
@@ -375,11 +399,18 @@ A failed typed card does not suppress the generic card. A document whose
 
 ### 5.3 Prompt and tool boundary
 
-The extraction runner receives the retained text of one document and the card
-schema. It receives no credentials, no source access, no network tools and no
-other document. Document text is untrusted input: it cannot change the source
+The extraction runner receives the retained text of one document, page
+delimited, and the card schema with the gate's normalizer expectations. It
+receives no credentials, no source access, no network tools and no other
+document. Document text is untrusted input: it cannot change the source
 access, the tool set, the outbound destinations or the publication rules. This
 restates the existing playbook rule rather than adding a new one.
+
+The runner cites a location, never an evidence span id: it holds no ids, and a
+location is what a page of sealed text can be checked against. A location is a
+page ordinal plus either a UTF-16 range or a quote. The code turns it into a
+span under the rules of section 4.3 before the gate sees anything, reusing a
+span that already covers exactly that range and refusing one it cannot prove.
 
 Extraction agents read the owner's documents by design. They write only to the
 private store. They never write to this repository, and every fixture in this
@@ -390,15 +421,17 @@ repository is synthetic.
 `cardExtractionAttempts`, one row per attempt, retained for cost reporting and
 for evaluating a ladder change without rerunning it.
 
-| Field                                           | Meaning                               |
-| ----------------------------------------------- | ------------------------------------- |
-| `documentKey`, `recordKind`                     | What was attempted.                   |
-| `step`                                          | `local`, `tier0` or `tier1`.          |
-| `promptVersion`, `gateVersion`, `schemaVersion` | Reproducibility.                      |
-| `outcome`                                       | `accepted`, `escalated` or `review`.  |
-| `failedFields`                                  | The field names that failed the gate. |
-| `inputTokens`, `outputTokens`, `costUsd`        | Measured, not estimated.              |
-| `startedAt`, `finishedAt`                       | For the throughput report.            |
+| Field                                           | Meaning                                                                                                                                                                                                                                                              |
+| ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `documentKey`, `recordKind`                     | What was attempted.                                                                                                                                                                                                                                                  |
+| `step`                                          | `local`, `tier0` or `tier1`.                                                                                                                                                                                                                                         |
+| `promptVersion`, `gateVersion`, `schemaVersion` | Reproducibility.                                                                                                                                                                                                                                                     |
+| `outcome`                                       | `accepted`, `escalated`, `review` or `skipped`.                                                                                                                                                                                                                      |
+| `failedFields`                                  | The field names that failed the gate.                                                                                                                                                                                                                                |
+| `modelId`                                       | Which model ran, or the local stub.                                                                                                                                                                                                                                  |
+| `inputTokens`, `outputTokens`                   | Measured from the provider response.                                                                                                                                                                                                                                 |
+| `costUsd`                                       | Derived from the measured token counts and the versioned price table, in integer micro-USD so no cost crosses a float. The provider reports tokens, not dollars, so a card cost is always derived; the price table version on the row says which table was in force. |
+| `startedAt`, `finishedAt`                       | For the throughput report.                                                                                                                                                                                                                                           |
 
 ## 6. Queue, budget and resumption
 

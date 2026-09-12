@@ -6,6 +6,8 @@ import {
   type CardExtractionRequest,
 } from "../../lib/cardExtractionProvider";
 
+import type { CardEvidenceRef } from "../provenance/model";
+
 import {
   CARD_SCHEMAS,
   type CardNormalizerId,
@@ -100,13 +102,13 @@ export function cardAttemptCostMicroUsd(
 
 /**
  * Where a proposed value came from. Either an explicit page-relative UTF-16
- * range, or a quote the code locates in that page's text and turns into a
- * range before the gate sees it. A runner never names an evidence span id: it
- * has no ids, and the span it cites must already exist on the sealed text.
+ * range, or a quote the code locates in that page's text. A runner never
+ * names an evidence span id: it holds no ids, and a location is what a page
+ * of sealed text can actually be checked against. `stageCardEvidenceSpans`
+ * turns the location into a span, reusing one that already covers exactly
+ * that range, before the gate sees anything.
  */
-export type CardRunnerSpanRef =
-  | { pageOrdinal: number; start: number; end: number }
-  | { pageOrdinal: number; quote: string };
+export type CardRunnerSpanRef = CardEvidenceRef;
 
 export type CardRunnerFieldCandidate = {
   field: string;

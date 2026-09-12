@@ -77,19 +77,6 @@ export type CardExtractionDocument = {
   userId: Id<"users">;
   /** Page-delimited sealed retained text, so a value can cite where it is. */
   pages: Array<{ ordinal: number; text: string }>;
-  /**
-   * The evidence spans that already exist on this sealed text version. A card
-   * generation reuses the text generation's sealed text and creates no span of
-   * its own, so a location the runner cites is provable only when a span
-   * already covers it. One that is not covered is not evidence, and its field
-   * is refused rather than stored on an unprovable citation.
-   */
-  spans: Array<{
-    spanId: Id<"evidenceSpans">;
-    pageOrdinal: number;
-    start: number;
-    end: number;
-  }>;
   textBytes: number;
 };
 
@@ -143,15 +130,6 @@ export async function loadCardExtractionDocument(
     // contradicts it, which is worse than publishing no card at all.
     return { status: "refused", code: "document_too_large" };
   }
-  const pageOrdinalById = new Map(
-    pageRows.map((page) => [page._id, page.ordinal]),
-  );
-  const spanRows = await ctx.db
-    .query("evidenceSpans")
-    .withIndex("by_sourceTextVersionId", (q) =>
-      q.eq("sourceTextVersionId", textVersionId),
-    )
-    .take(MAX_EVIDENCE_SPANS);
   return {
     status: "ready",
     document: {
@@ -159,87 +137,61 @@ export async function loadCardExtractionDocument(
       sourceItemId: item._id,
       userId: account.createdBy,
       pages,
-      spans: spanRows.flatMap((span) => {
-        const pageOrdinal = pageOrdinalById.get(span.sourcePageId);
-        return pageOrdinal === undefined
-          ? []
-          : [
-              {
-                spanId: span._id,
-                pageOrdinal,
-                start: span.start,
-                end: span.end,
-              },
-            ];
-      }),
       textBytes,
     },
   };
 }
 
-// --- turning a cited location into an evidence span id --------------------
+// --- turning cited locations into evidence spans --------------------------
 
 /**
- * A runner names a page ordinal plus a range, or a quote the code locates in
- * that page. Either way the result must be an evidence span that already
- * exists on the sealed text, and it must cover exactly that range: a span that
- * merely overlaps proves a different piece of text than the one cited. A quote
- * that appears more than once on its page is ambiguous and resolves to
- * nothing, which fails closed the way an ambiguous date does.
+ * Flattens a candidate's cited locations into one staging batch and keeps the
+ * index of each, so one round trip stages every span of the card and the ids
+ * come back to the field that cited them.
  */
-export function resolveCardSpan(
-  ref: CardRunnerSpanRef,
-  document: Pick<CardExtractionDocument, "pages" | "spans">,
-): Id<"evidenceSpans"> | undefined {
-  const page = document.pages.find((row) => row.ordinal === ref.pageOrdinal);
-  if (!page) return undefined;
-  let start: number;
-  let end: number;
-  if ("quote" in ref) {
-    start = page.text.indexOf(ref.quote);
-    if (start < 0 || page.text.lastIndexOf(ref.quote) !== start) {
-      return undefined;
-    }
-    end = start + ref.quote.length;
-  } else {
-    start = ref.start;
-    end = ref.end;
-  }
-  return document.spans.find(
-    (span) =>
-      span.pageOrdinal === ref.pageOrdinal &&
-      span.start === start &&
-      span.end === end,
-  )?.spanId;
-}
-
-function resolveCardSpans(
-  refs: readonly CardRunnerSpanRef[],
-  document: Pick<CardExtractionDocument, "pages" | "spans">,
-): Id<"evidenceSpans">[] {
-  const ids = refs.flatMap((ref) => {
-    const id = resolveCardSpan(ref, document);
-    return id ? [id] : [];
-  });
-  return [...new Set(ids)];
-}
-
-/**
- * A field whose citation resolves to no span keeps its empty evidence list
- * rather than disappearing. The gate then refuses it as `evidence_missing`,
- * which leaves a drop row, so nothing is silently dropped.
- */
-export function resolveCardCandidate(
-  candidate: CardRunnerCandidate,
-  document: Pick<CardExtractionDocument, "pages" | "spans">,
-): { anchorEvidenceSpanIds: Id<"evidenceSpans">[]; fields: CardFieldInput[] } {
+export function flattenCardEvidenceRefs(candidate: CardRunnerCandidate): {
+  refs: CardRunnerSpanRef[];
+  anchor: number[];
+  fields: Array<{
+    field: string;
+    ordinal?: number;
+    value: CardRunnerCandidate["fields"][number]["value"];
+    at: number[];
+  }>;
+} {
+  const refs: CardRunnerSpanRef[] = [];
+  const take = (span: CardRunnerSpanRef): number => refs.push(span) - 1;
   return {
-    anchorEvidenceSpanIds: resolveCardSpans(candidate.anchor, document),
+    refs,
+    anchor: candidate.anchor.map(take),
     fields: candidate.fields.map((field) => ({
       field: field.field,
       ...(field.ordinal === undefined ? {} : { ordinal: field.ordinal }),
       value: field.value,
-      evidenceSpanIds: resolveCardSpans(field.spans, document),
+      at: field.spans.map(take),
+    })),
+  };
+}
+
+/**
+ * A field whose citations all failed staging keeps its empty evidence list
+ * rather than disappearing. The gate then refuses it as `evidence_missing`,
+ * which leaves a drop row, so nothing is silently dropped.
+ */
+export function bindStagedCardEvidence(
+  flattened: ReturnType<typeof flattenCardEvidenceRefs>,
+  staged: ReadonlyArray<Id<"evidenceSpans"> | null>,
+): { anchorEvidenceSpanIds: Id<"evidenceSpans">[]; fields: CardFieldInput[] } {
+  const pick = (at: readonly number[]): Id<"evidenceSpans">[] => [
+    ...new Set(at.flatMap((index) => staged[index] ?? [])),
+  ];
+  return {
+    anchorEvidenceSpanIds: pick(flattened.anchor),
+    fields: flattened.fields.map((field) => ({
+      field: field.field,
+      ...(field.ordinal === undefined ? {} : { ordinal: field.ordinal }),
+      value: field.value,
+      evidenceSpanIds: pick(field.at),
     })),
   };
 }
@@ -247,11 +199,27 @@ export function resolveCardCandidate(
 // --- the ladder -----------------------------------------------------------
 
 /**
- * The two writes the ladder performs, injected so the ladder can be driven by
- * a fixture runner in a test without an action, and by the queue of P2-70f or
+ * The writes the ladder performs, injected so the ladder can be driven by a
+ * fixture runner in a test without an action, and by the queue of P2-70f or
  * an operator command in production.
  */
 export type CardLadderOps = {
+  /**
+   * Turns the locations one step's candidate cited into evidence spans over
+   * the sealed retained text, one result per ref in order and `null` where
+   * the location could not be proved.
+   */
+  stageEvidence: (input: {
+    recordKind: CardRecordKind;
+    step: CardRunnerStep;
+    refs: CardRunnerSpanRef[];
+  }) => Promise<Array<Id<"evidenceSpans"> | null>>;
+  /**
+   * Deletes card-staged spans no surviving card generation can reach. Run at
+   * the end of every ladder run, so a step the gate rejected leaves no span
+   * behind and the rows cannot accumulate across re-extractions.
+   */
+  sweepEvidence: () => Promise<void>;
   publish: (input: {
     recordKind: CardRecordKind;
     step: CardRunnerStep;
@@ -282,8 +250,26 @@ export type CardLadderOps = {
  * attempt row; the next step runs from the same sealed text. At the top step a
  * required failure is `card_gate_failed` and a review item, and no typed card
  * publishes, which leaves any generic card already published untouched.
+ *
+ * Every run ends with an evidence sweep, so the spans a rejected step staged
+ * are gone by the time the run returns: their extraction fingerprint names a
+ * card generation that was never created.
  */
 export async function runCardLadder(input: {
+  recordKind: CardRecordKind;
+  document: CardExtractionDocument;
+  runners: readonly CardRunner[];
+  ops: CardLadderOps;
+  now: number;
+}): Promise<CardLadderResult> {
+  try {
+    return await climb(input);
+  } finally {
+    await input.ops.sweepEvidence();
+  }
+}
+
+async function climb(input: {
   recordKind: CardRecordKind;
   document: CardExtractionDocument;
   runners: readonly CardRunner[];
@@ -313,13 +299,19 @@ export async function runCardLadder(input: {
       });
       continue;
     }
-    const resolved = resolveCardCandidate(output.candidate, input.document);
+    const flattened = flattenCardEvidenceRefs(output.candidate);
+    const staged = await input.ops.stageEvidence({
+      recordKind: input.recordKind,
+      step: runner.step,
+      refs: flattened.refs,
+    });
+    const bound = bindStagedCardEvidence(flattened, staged);
     const published = await input.ops.publish({
       recordKind: input.recordKind,
       step: runner.step,
       now: input.now,
-      anchorEvidenceSpanIds: resolved.anchorEvidenceSpanIds,
-      fields: resolved.fields,
+      anchorEvidenceSpanIds: bound.anchorEvidenceSpanIds,
+      fields: bound.fields,
       runner: { modelId: runner.modelId, ...output.usage },
     });
     if (published.published || published.reason === "already_published") {
@@ -371,6 +363,18 @@ export async function runCardLadder(input: {
 const refusalCodeValidator = v.union(
   ...CARD_EXTRACTION_REFUSAL_CODES.map((code) => v.literal(code)),
 );
+
+/** The staging mutation takes one flat row; the union is a discriminant. */
+function toStagingRef(ref: CardRunnerSpanRef): {
+  pageOrdinal: number;
+  start?: number;
+  end?: number;
+  quote?: string;
+} {
+  return "quote" in ref
+    ? { pageOrdinal: ref.pageOrdinal, quote: ref.quote }
+    : { pageOrdinal: ref.pageOrdinal, start: ref.start, end: ref.end };
+}
 
 export const cardExtractionDocument = internalQuery({
   args: { sourceItemId: v.id("sourceItems") },
@@ -443,6 +447,22 @@ export const extractCard = internalAction({
       now,
       runners: [localCardRunner(), ...hostedCardRunners(process.env)],
       ops: {
+        stageEvidence: async (input) =>
+          await ctx.runMutation(
+            internal.models.records.cards.stageCardEvidence,
+            {
+              sourceItemId: document.sourceItemId,
+              recordKind: input.recordKind,
+              fingerprint: { ...fingerprint, tier: input.step },
+              refs: input.refs.map(toStagingRef),
+            },
+          ),
+        sweepEvidence: async () => {
+          await ctx.runMutation(
+            internal.models.records.cards.sweepCardEvidence,
+            { sourceItemId: document.sourceItemId },
+          );
+        },
         publish: async (input) =>
           await ctx.runMutation(internal.models.records.cards.publishCard, {
             spaceId: document.spaceId,
