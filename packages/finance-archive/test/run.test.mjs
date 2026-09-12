@@ -1058,6 +1058,74 @@ test(
 );
 
 test(
+  "F1-70: a pdf_statement-only selection passes only that kind into discover(), so a trade_confirmation listing that would otherwise be incomplete cannot refuse this run",
+  { skip },
+  async (t) => {
+    const { schema } = await seededSchema(t, { seedAccount: false });
+
+    const rawDir = mkdtempSync(
+      join(tmpdir(), "kith-finance-run-expand-kinds-raw-"),
+    );
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+
+    const { fixturesDir, sessionModulePath } = writeAdapterFixtures(t);
+    const kindsSeenPath = join(fixturesDir, "kinds-seen.json");
+    // Standing in for a real adapter that lists documents per kind (like
+    // adapter-morgan-stanley's discover(session, kinds)): reports
+    // trade_confirmation as incomplete whenever discover() is asked about it
+    // (no `kinds` argument, or one naming trade_confirmation), and records
+    // the exact `kinds` argument run.ts called it with -- proving both that
+    // run.ts passes only the kinds this selection asked for, and that
+    // scoping discover() to pdf_statement alone is what keeps a broken
+    // trade_confirmation listing from refusing this run.
+    const kindsAwareAdapterPath = join(fixturesDir, "adapter-kinds-aware.mjs");
+    writeFileSync(
+      kindsAwareAdapterPath,
+      `import { writeFileSync } from "node:fs";\n` +
+        `import { syntheticAdapter, incompleteListing } from ${JSON.stringify(distIndexUrl)};\n` +
+        `const kindsAwareAdapter = {\n` +
+        `  ...syntheticAdapter,\n` +
+        `  async discover(session, kinds) {\n` +
+        `    writeFileSync(${JSON.stringify(kindsSeenPath)}, JSON.stringify(kinds ?? null));\n` +
+        `    const real = await syntheticAdapter.discover(session);\n` +
+        `    if (!kinds || kinds.includes("trade_confirmation")) {\n` +
+        `      return {\n` +
+        `        ...real,\n` +
+        `        documents: incompleteListing(real.documents.items, null, "synthetic trade_confirmation outage"),\n` +
+        `      };\n` +
+        `    }\n` +
+        `    return real;\n` +
+        `  },\n` +
+        `};\n` +
+        `export default kindsAwareAdapter;\n`,
+    );
+
+    const selectionPath = writeSelection(fixturesDir, [
+      {
+        expand: "discovered",
+        kinds: ["pdf_statement"],
+        docType: "statement",
+        requireExhaustive: true,
+      },
+    ]);
+    const runImport = makeRunner({
+      adapterModulePath: kindsAwareAdapterPath,
+      sessionModulePath,
+      selectionPath,
+      schema,
+      rawDir,
+    });
+
+    // Does not throw: requireExhaustive judges only the pdf_statement
+    // listing, and the fake adapter reports that one exhaustive once it
+    // sees discover() was asked about pdf_statement alone.
+    runImport(["--dry-run"]);
+
+    assert.deepEqual(JSON.parse(readFileSync(kindsSeenPath, "utf8")), ["pdf_statement"]);
+  },
+);
+
+test(
   '"expand": "activity-ranges" splits a multi-year window into one institution-wide pull per calendar year',
   { skip },
   async (t) => {

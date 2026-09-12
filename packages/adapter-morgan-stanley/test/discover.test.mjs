@@ -276,3 +276,59 @@ test("a transient 400 Service Error that never clears exhausts the retry budget 
     assert.ok(attempts.every((c) => c.timeFrame === OLDEST_YEAR && c.page === "1"));
   }
 });
+
+// --- F1-70: kinds-scoped discover(), CDP -32000 retry ----------------------
+
+test("discover(session, kinds) lists only the docTypes those kinds map to, so a pdf_statement-only caller never sees a failing TradeConfirmations listing", async () => {
+  const session = createFixtureSession({ documentsFailDocType: "TradeConfirmations" });
+  const result = await adapter.discover(session, ["pdf_statement"]);
+
+  assert.equal(result.documents.status, "exhaustive");
+  assert.equal(result.documents.items.length, STATEMENT_DOCS.length);
+  assert.ok(result.documents.items.every((d) => d.kind === "pdf_statement"));
+  assert.deepEqual(result.documentListingTotalsByKind, { pdf_statement: STATEMENT_DOCS.length });
+});
+
+test("discover with no kinds argument is unaffected by F1-70 -- a failing docType still marks the combined listing incomplete", async () => {
+  const session = createFixtureSession({ documentsFailDocType: "TradeConfirmations" });
+  const result = await adapter.discover(session);
+
+  assert.equal(result.documents.status, "incomplete");
+  assert.match(result.documents.reason, /docType=TradeConfirmations failed/);
+});
+
+test('a CDP "target navigated or closed" error (code -32000) is retried once before a listing gives up', async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const documentsCallLog = [];
+  const session = createFixtureSession({ documentsCdpGoneCount: 1, documentsCallLog });
+
+  const resultPromise = adapter.discover(session);
+  await advanceTimersUntil(t, () => documentsCallLog.length >= 3);
+  const result = await resultPromise;
+
+  assert.equal(result.documents.status, "exhaustive");
+  // Exactly one retry, at the same first page of the first timeFrame queried
+  // -- every later timeFrame/docType call succeeds on its own first try, so
+  // only the leading two attempts are this retry, not the whole listing.
+  const first = documentsCallLog.slice(0, 2);
+  assert.equal(first.length, 2);
+  assert.ok(first.every((c) => c.docType === "ClientStatements" && c.timeFrame === OLDEST_YEAR && c.page === "1"));
+});
+
+test('a persistent CDP "target navigated or closed" error still marks the listing incomplete after the one retry', async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const documentsCallLog = [];
+  const session = createFixtureSession({ documentsCdpGoneCount: Infinity, documentsCallLog });
+
+  const resultPromise = adapter.discover(session);
+  await advanceTimersUntil(t, () => documentsCallLog.length >= 4);
+  const result = await resultPromise;
+
+  assert.equal(result.documents.status, "incomplete");
+  assert.match(result.documents.reason, /docType=ClientStatements failed/);
+  assert.match(result.documents.reason, /-32000/);
+
+  // The original attempt plus exactly one retry -- not retried forever.
+  const statementAttempts = documentsCallLog.filter((c) => c.docType === "ClientStatements");
+  assert.equal(statementAttempts.length, 2);
+});

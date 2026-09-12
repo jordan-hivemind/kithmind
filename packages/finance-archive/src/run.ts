@@ -2031,7 +2031,26 @@ async function main(): Promise<void> {
     }
 
     session = await buildSession();
-    const discovered = await adapter.discover(session);
+    // F1-70. Scope discover()'s document listing to the kinds the selection
+    // actually asks for (across every "expand": "discovered" entry) so a
+    // listing this run never needed -- and that a real provider can fail to
+    // pull for reasons that have nothing to do with the kinds requested --
+    // cannot mark the whole result incomplete and refuse a run that never
+    // wanted it. No such entry (or none naming a kind), no argument: an
+    // adapter that ignores `kinds` still lists everything, exactly as
+    // before this parameter existed.
+    const requestedDiscoveredKinds = new Set<string>();
+    for (const entry of selectionFile.pulls) {
+      if (entry.expand === "discovered") {
+        for (const kind of entry.kinds) requestedDiscoveredKinds.add(kind);
+      }
+    }
+    const discovered = await adapter.discover(
+      session,
+      requestedDiscoveredKinds.size > 0
+        ? ([...requestedDiscoveredKinds] as Extract<CapabilityTier, "pdf_statement" | "trade_confirmation">[])
+        : undefined,
+    );
     // F1-32: makes every account discover() reported resolvable by its own
     // external key, so a selection can name one without a separate
     // provisioning step. Keyed on the resolved institutionId, not
