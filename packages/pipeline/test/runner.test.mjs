@@ -799,11 +799,23 @@ test("a document-level parser failure is recorded against that document and the 
   });
   const journal = await openJournal(setup.journalDir, checkpoint);
   const recordedFailures = [];
+  const submittedFailures = [];
   try {
     const runner = new PipelineRunner(setup.config, journal, {
       async call(request) {
         if (request.operation === "source.status") {
           return { operation: "source.status", sourceAccountId: "source" };
+        }
+        if (request.operation === "discovery.failArchived") {
+          submittedFailures.push(request);
+          return {
+            operation: "discovery.failArchived",
+            sourceItemId: request.identity.sourceItemId,
+            workId: "work-1",
+            state: "failed",
+            retryable: true,
+            failureCode: request.failureCode,
+          };
         }
         throw new Error(`unexpected operation ${request.operation}`);
       },
@@ -859,6 +871,84 @@ test("a document-level parser failure is recorded against that document and the 
     assert.equal(journal.checkpoint.pdfIndex, 2);
     assert.equal(journal.checkpoint.step, "intent");
     assert.equal(journal.checkpoint.archivedPublished, 1);
+    // The failure is also reported to the server (discovery.failArchived),
+    // so the file's sourceInventory row can be marked parse_failed with the
+    // failure class: without this, list_review_queue would have no way to
+    // know why the file is not indexed.
+    assert.equal(submittedFailures.length, 1);
+    assert.equal(submittedFailures[0].failureCode, "conversion_failed");
+    assert.equal(
+      submittedFailures[0].identity.sourceItemId,
+      plans[1].sourceItemId,
+    );
+    assert.equal(
+      submittedFailures[0].identity.observationEpoch,
+      plans[1].observationEpoch,
+    );
+    assert.equal(
+      submittedFailures[0].identity.processingEpoch,
+      plans[1].processingEpoch,
+    );
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a lost discovery.failArchived report does not block the pass from continuing", async () => {
+  const setup = await fixture(0);
+  const plans = [0, 1].map((index) =>
+    pdfPlan({ relativePath: `document-${index}.pdf` }),
+  );
+  const checkpoint = archivedCheckpoint(plans[1], {
+    files: plans,
+    pdfIndex: 1,
+    step: "parse",
+    archivedPublished: 0,
+    preflightAction: undefined,
+  });
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  try {
+    const runner = new PipelineRunner(setup.config, journal, {
+      async call(request) {
+        if (request.operation === "source.status") {
+          return { operation: "source.status", sourceAccountId: "source" };
+        }
+        // The server-side inventory report is best-effort: losing it must
+        // not turn back into a run-fatal error.
+        throw new Error("network unreachable");
+      },
+    });
+    runner.archiveCatalog = {
+      listOriginals() {
+        return [
+          { originalCatalogId: checkpoint.originalCatalogId, rowRevision: 1 },
+        ];
+      },
+      listProcessings() {
+        return [
+          {
+            processingCatalogId: checkpoint.processingCatalogId,
+            originalCatalogId: checkpoint.originalCatalogId,
+            rowRevision: 1,
+          },
+        ];
+      },
+      async recordParseFailure() {
+        return {};
+      },
+    };
+    runner.driveCheckpoint = async () => {
+      if (journal.checkpoint.pdfIndex === 1) {
+        throw new ParserProcessError(
+          "page_limit_exceeded",
+          "too many pages",
+        );
+      }
+      return { state: "complete", scanned: 2, published: 1 };
+    };
+    const result = await runner.run();
+    assert.deepEqual(result, { state: "complete", scanned: 2, published: 1 });
   } finally {
     await journal.close();
     await rm(setup.base, { recursive: true, force: true });
