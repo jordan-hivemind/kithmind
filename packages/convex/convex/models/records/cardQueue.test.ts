@@ -9,7 +9,6 @@ import {
   createOrGetRevision,
   createOrGetSourceItem,
   createOrGetTextVersion,
-  stageEvidenceSpans,
   stagePages,
 } from "../provenance/model";
 
@@ -111,19 +110,13 @@ async function seedItem(
       extractionFingerprint: "plain:v1",
       text: title,
     });
-    const pages = await stagePages(ctx, {
+    await stagePages(ctx, {
       spaceId: input.spaceId,
       sourceTextVersionId: textVersion._id,
       pages: [{ ordinal: 0, start: 0, end: title.length, text: title }],
     });
-    await stageEvidenceSpans(ctx, {
-      spaceId: input.spaceId,
-      sourceRevisionId: revision._id,
-      sourceTextVersionId: textVersion._id,
-      spans: [
-        { sourcePageId: pages[0]!._id, ordinal: 0, start: 0, end: title.length },
-      ],
-    });
+    // Evidence spans are staged lazily by the ladder itself (P2-70e2), so
+    // none are pre-staged here.
     const processingGenerationId = await ctx.db.insert("processingGenerations", {
       spaceId: input.spaceId,
       sourceAccountId: input.sourceAccountId,
@@ -140,13 +133,13 @@ async function seedItem(
       desiredProcessingEpoch: 1,
       state: "ready",
       expectedPageCount: 1,
-      expectedEvidenceSpanCount: 1,
+      expectedEvidenceSpanCount: 0,
       expectedDocumentCount: 1,
       expectedChunkCount: 0,
       expectedEventCount: 0,
       expectedObservationCount: 0,
       actualPageCount: 1,
-      actualEvidenceSpanCount: 1,
+      actualEvidenceSpanCount: 0,
       actualDocumentCount: 1,
       actualChunkCount: 0,
       embeddingStatus: "unavailable",
@@ -242,6 +235,22 @@ function tickOps(input: {
         document,
         now,
         ops: {
+          stageEvidence: (ladderInput) =>
+            t.mutation(internal.models.records.cards.stageCardEvidence, {
+              sourceItemId,
+              recordKind: ladderInput.recordKind,
+              fingerprint: { ...FINGERPRINT, tier: ladderInput.step },
+              refs: ladderInput.refs.map((ref) =>
+                "quote" in ref
+                  ? { pageOrdinal: ref.pageOrdinal, quote: ref.quote }
+                  : { pageOrdinal: ref.pageOrdinal, start: ref.start, end: ref.end },
+              ),
+            }),
+          sweepEvidence: async () => {
+            await t.mutation(internal.models.records.cards.sweepCardEvidence, {
+              sourceItemId,
+            });
+          },
           publish: (ladderInput) =>
             t.run((ctx) =>
               publishDocumentCard(ctx, {
@@ -416,27 +425,37 @@ describe("the card extraction queue", () => {
 
     // Publish an accepted card for the first document out of band, as if it
     // had been extracted before this queue instance ever started.
-    await t.run(async (ctx) => {
-      const loaded = await loadCardExtractionDocument(ctx, first!);
-      if (loaded.status !== "ready") throw new Error("fixture not ready");
-      const title = loaded.document.pages[0]!.text;
-      await publishDocumentCard(ctx, {
+    const loadedFirst = await t.run((ctx) => loadCardExtractionDocument(ctx, first!));
+    if (loadedFirst.status !== "ready") throw new Error("fixture not ready");
+    const firstTitle = loadedFirst.document.pages[0]!.text;
+    const [firstSpanId] = await t.mutation(
+      internal.models.records.cards.stageCardEvidence,
+      {
+        sourceItemId: first!,
+        recordKind: "document_card",
+        fingerprint: { ...FINGERPRINT, tier: "tier0" },
+        refs: [{ pageOrdinal: 0, quote: firstTitle }],
+      },
+    );
+    if (!firstSpanId) throw new Error("fixture span did not stage");
+    await t.run((ctx) =>
+      publishDocumentCard(ctx, {
         spaceId,
         sourceItemId: first!,
         userId,
         recordKind: "document_card",
         now: 500,
         fingerprint: { ...FINGERPRINT, tier: "tier0" },
-        anchorEvidenceSpanIds: loaded.document.spans.map((span) => span.spanId),
+        anchorEvidenceSpanIds: [firstSpanId],
         fields: [
           {
             field: "card_title",
-            value: { type: "text", value: title },
-            evidenceSpanIds: loaded.document.spans.map((span) => span.spanId),
+            value: { type: "text", value: firstTitle },
+            evidenceSpanIds: [firstSpanId],
           },
         ],
-      });
-    });
+      }),
+    );
 
     await startQueue(t, { spaceId });
     const ladderCalls: Id<"sourceItems">[] = [];
