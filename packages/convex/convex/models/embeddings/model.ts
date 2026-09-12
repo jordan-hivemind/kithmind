@@ -9,21 +9,27 @@ import { sha256Hex, utf8ByteLength } from "../ingestion/hash";
 import { getAuthorizedReadSpaceIds, type PrincipalRef } from "../../lib/spaces";
 import {
   applyEligibilityTouch,
+  coveredCountsFor,
   embeddingVectorScopeV2,
+  findEmbeddingTarget,
   isCurrentThought,
   newChunkTargetCaches,
   recordVectorCoverageChange,
   resolveActiveChunkTarget,
+  seedTargetsFromManifest,
   usesTargetCounters,
+  ZERO_KIND_COUNTS,
   type EmbeddingEligibilityTouch,
 } from "./targets";
 
 /**
- * Legacy whole-space manifest bounds. P2-6c stopped these from running on an
- * ordinary eligibility write; the derive is still reachable from the profile
- * transition driver, from staging and activation, and from the audit, and it
- * still refuses to answer above 256 targets rather than exceeding the platform
- * read limit. P2-6d removes the derive and these four constants with it.
+ * Legacy whole-space manifest bounds. P2-6d removed the derive from the
+ * eligibility write path entirely, so no ordinary write pays a scan and no
+ * write can fail on these bounds. What is left is the profile-transition
+ * driver, which stages a *new* fingerprint in one transaction, and the
+ * baseline audit. Both still refuse to answer above 256 targets rather than
+ * exceeding the platform read limit. A new-fingerprint rebuild above that size
+ * needs the paged builder, which is later work.
  */
 export const MAX_EMBEDDING_MANIFEST_TARGETS = 256;
 export const MAX_EMBEDDING_MANIFEST_BYTES = 2 * 1024 * 1024;
@@ -91,9 +97,23 @@ export type ActiveEmbeddingTarget = {
   embeddingGenerationId: Id<"embeddingGenerations">;
   fingerprint: string;
   profile: EmbeddingProfile;
+  /** I9: strict. Narrative capture needs a complete thought index. */
   thoughtStatus: "ready" | "unavailable";
-  chunkStatus: "ready" | "unavailable";
+  /**
+   * D3 B and I10: chunk coverage is a reported ratio, never a reason to make
+   * semantic retrieval unavailable. A shortfall reaches the caller through the
+   * existing `partial` flag.
+   */
+  chunkCoverage: { eligible: number; covered: number };
 };
+
+/**
+ * A space whose counters the P2-6g backfill has not seeded has no source of
+ * truth for coverage now that the whole-space derive is gone. It fails closed
+ * with this error rather than reporting an empty index as a complete one.
+ */
+export const UNSEEDED_EMBEDDING_COUNTERS_ERROR =
+  "Embedding coverage counters are not seeded for this space; run the P2-6g target backfill (models/embeddings/migrations:startTargetBackfill) before semantic retrieval";
 
 function assertFiniteTime(value: number, label: string): void {
   if (!Number.isFinite(value) || value < 0) {
@@ -333,6 +353,7 @@ export async function createEmbeddingGeneration(
   },
 ): Promise<Doc<"embeddingGenerations">> {
   const state = await ensureSpaceEmbeddingState(ctx, input.spaceId);
+  assertStagingFingerprintIsNew(state, input.fingerprint);
   const profile = await ensureEmbeddingProfile(ctx, input);
   const manifest = await deriveEmbeddingManifest(ctx, input.spaceId);
   const unfinished = await ctx.db
@@ -667,6 +688,16 @@ export async function activateEmbeddingGeneration(
     activeFingerprint: generation.fingerprint,
     activatedAt: input.activatedAt,
   });
+  // The manifest above was validated target by target against its vectors, so
+  // it is a stronger seed than the paged backfill. Seeding here is what keeps
+  // a newly activated space out of the unseeded fail-closed path.
+  await seedTargetsFromManifest(
+    ctx,
+    state,
+    generation.fingerprint,
+    manifest.targets,
+    input.activatedAt,
+  );
 }
 
 export async function failEmbeddingGeneration(
@@ -722,39 +753,62 @@ export async function getActiveEmbeddingTarget(
     throw new Error("Active embedding generation pointer is invalid");
   }
   const profile = await requireGenerationProfile(ctx, generation);
+  // The counters are the only source of coverage truth now that the
+  // whole-space derive is gone (I4, I5). An unseeded space fails closed.
+  if (!usesTargetCounters(state)) {
+    throw new Error(UNSEEDED_EMBEDDING_COUNTERS_ERROR);
+  }
+  const eligible = state.eligibleCounts ?? ZERO_KIND_COUNTS;
+  const covered = coveredCountsFor(state, state.activeFingerprint);
   return {
     spaceId,
     embeddingGenerationId: generation._id,
     fingerprint: generation.fingerprint,
     profile: profileFromRow(profile),
+    // I9. The audit watermark of I5 gates activation, not retrieval: an
+    // eligibility write would otherwise disable capture until an audit ran.
     thoughtStatus:
-      generation.completedThoughtCount === generation.expectedThoughtCount &&
-      generation.coverageInvalid !== true &&
-      generation.thoughtCoverageInvalid !== true
+      state.counterDrift !== true && covered.thought === eligible.thought
         ? "ready"
         : "unavailable",
-    chunkStatus:
-      generation.completedChunkCount === generation.expectedChunkCount &&
-      generation.coverageInvalid !== true &&
-      generation.chunkCoverageInvalid !== true
-        ? "ready"
-        : "unavailable",
+    chunkCoverage: { eligible: eligible.chunk, covered: covered.chunk },
   };
+}
+
+/**
+ * Section 3.4 point 2 holds only for a *new* fingerprint: a staged generation
+ * is invisible to readers because no reader names its fingerprint. Under the
+ * active fingerprint there is no such window. I11 would make the driver's
+ * inserts delete and replace live rows before activation, and I3 means a
+ * second generation of the same fingerprint is the same row set anyway. The
+ * incremental fill (P2-6c) is the only writer under the active fingerprint.
+ */
+function assertStagingFingerprintIsNew(
+  state: Doc<"spaceEmbeddingStates">,
+  fingerprint: string,
+): void {
+  if (state.activeFingerprint === fingerprint) {
+    throw new Error(
+      "Staging a generation under the active fingerprint is retired; the incremental fill owns that index",
+    );
+  }
 }
 
 export async function requireActiveEmbeddingTarget(
   ctx: ReadCtx,
   input: {
     spaceId: Id<"spaces">;
-    embeddingGenerationId: Id<"embeddingGenerations">;
+    /** Write paths still pin the generation; readers pin the fingerprint. */
+    embeddingGenerationId?: Id<"embeddingGenerations">;
     fingerprint: string;
   },
 ): Promise<ActiveEmbeddingTarget> {
   const active = await getActiveEmbeddingTarget(ctx, input.spaceId);
   if (
     !active ||
-    active.embeddingGenerationId !== input.embeddingGenerationId ||
-    active.fingerprint !== input.fingerprint
+    active.fingerprint !== input.fingerprint ||
+    (input.embeddingGenerationId !== undefined &&
+      active.embeddingGenerationId !== input.embeddingGenerationId)
   ) {
     throw new Error("Embedding target is no longer active");
   }
@@ -762,26 +816,18 @@ export async function requireActiveEmbeddingTarget(
 }
 
 /**
- * I11. Re-embedding a target replaces its vector: every row this target holds
- * under the same fingerprint with any other `inputHash` is deleted in the same
- * transaction as the insert, so at most one row per `(spaceId, fingerprint,
- * targetKind, targetId)` survives a content change and a superseded vector can
- * never take a candidate slot. Rows under another fingerprint are untouched,
- * because a retired fingerprint is the rollback artifact. The covered counters
- * net to zero across the swap: this delete releases the marker and the insert
- * that follows sets it again.
+ * Every vector row a target holds, in any space, fingerprint or generation.
+ * Bounded: a target holds one row per fingerprint and a space keeps an active
+ * plus a retained one, so the spare slots only ever catch a bug.
  */
-async function deleteSupersededTargetVectors(
-  ctx: MutationCtx,
+async function targetVectorRows(
+  ctx: ReadCtx,
   input: {
-    spaceId: Id<"spaces">;
-    fingerprint: string;
     kind: TargetKind;
     thoughtId?: Id<"thoughts">;
     chunkId?: Id<"chunks">;
-    inputHash: string;
   },
-): Promise<number> {
+): Promise<Doc<"embeddingVectors">[]> {
   const rows =
     input.kind === "thought"
       ? await ctx.db
@@ -795,21 +841,7 @@ async function deleteSupersededTargetVectors(
   if (rows.length > MAX_TARGET_VECTOR_ROWS) {
     throw new Error("Embedding target exceeds its vector row budget");
   }
-  let deleted = 0;
-  for (const row of rows) {
-    if (
-      row.spaceId !== input.spaceId ||
-      row.embeddingFingerprint !== input.fingerprint ||
-      row.targetKind !== input.kind ||
-      row.inputHash === input.inputHash
-    ) {
-      continue;
-    }
-    await releaseVectorCoverage(ctx, row);
-    await ctx.db.delete(row._id);
-    deleted += 1;
-  }
-  return deleted;
+  return rows;
 }
 
 async function insertVector(
@@ -842,6 +874,10 @@ async function insertVector(
     throw new Error("Embedding vector generation is not writable");
   }
   await requireGenerationProfile(ctx, generation);
+  if (generation.state === "staging") {
+    const state = await uniqueSpaceState(ctx, input.spaceId);
+    if (state) assertStagingFingerprintIsNew(state, input.fingerprint);
+  }
   const activeTarget =
     generation.state === "active"
       ? await requireActiveEmbeddingTarget(ctx, {
@@ -852,62 +888,71 @@ async function insertVector(
       : null;
   const targetId = input.kind === "thought" ? input.thoughtId : input.chunkId;
   if (!targetId) throw new Error("Embedding vector target is missing");
-  const indexName =
-    input.kind === "thought"
-      ? "by_generation_and_thoughtId"
-      : "by_generation_and_chunkId";
-  const matches =
-    input.kind === "thought"
-      ? await ctx.db
-          .query("embeddingVectors")
-          .withIndex(indexName, (q) =>
-            q
-              .eq("embeddingGenerationId", generation._id)
-              .eq("thoughtId", input.thoughtId),
-          )
-          .take(2)
-      : await ctx.db
-          .query("embeddingVectors")
-          .withIndex(indexName, (q) =>
-            q
-              .eq("embeddingGenerationId", generation._id)
-              .eq("chunkId", input.chunkId),
-          )
-          .take(2);
-  if (matches.length > 1) throw new Error("Duplicate embedding vector target");
   const inputHash = await sha256Hex(input.inputText);
+  const scopeV2 = embeddingVectorScopeV2({
+    spaceId: input.spaceId,
+    fingerprint: input.fingerprint,
+    targetKind: input.kind,
+  });
+  // I11, in full. The exclusive slot is `(spaceId, fingerprint, targetKind,
+  // targetId)`, with no generation in it: a row staged by an older generation
+  // under this fingerprint occupies the same slot and the same `scopeV2`, so
+  // leaving it would put two rows of one target in the candidate set. At most
+  // one row survives this transaction, and it is the one whose `inputHash`
+  // matches the text being embedded. Rows under another fingerprint are
+  // untouched, because a retired fingerprint is the rollback artifact. The
+  // covered counters net to zero across a swap: the delete releases the marker
+  // and the insert below sets it again.
+  const siblings = (
+    await targetVectorRows(ctx, {
+      kind: input.kind,
+      thoughtId: input.thoughtId,
+      chunkId: input.chunkId,
+    })
+  ).filter(
+    (row) =>
+      row.spaceId === input.spaceId &&
+      row.embeddingFingerprint === input.fingerprint &&
+      row.targetKind === input.kind,
+  );
+  // I3: an unchanged target keeps its row across generations of one
+  // fingerprint. Prefer this generation's row so a replay is a plain no-op.
+  const existing =
+    siblings.find(
+      (row) =>
+        row.inputHash === inputHash &&
+        row.embeddingGenerationId === generation._id,
+    ) ?? siblings.find((row) => row.inputHash === inputHash);
+  for (const row of siblings) {
+    if (existing && row._id === existing._id) continue;
+    await releaseVectorCoverage(ctx, row);
+    await ctx.db.delete(row._id);
+  }
   const searchScope = embeddingVectorSearchScope({
     spaceId: input.spaceId,
     fingerprint: input.fingerprint,
     embeddingGenerationId: generation._id,
     targetKind: input.kind,
   });
-  // I11 runs before the reuse check: a row for this target under this
-  // fingerprint that carries any other inputHash is superseded by this insert,
-  // so it is deleted here rather than reported as an immutability conflict.
-  await deleteSupersededTargetVectors(ctx, {
-    spaceId: input.spaceId,
-    fingerprint: input.fingerprint,
-    kind: input.kind,
-    thoughtId: input.thoughtId,
-    chunkId: input.chunkId,
-    inputHash,
-  });
-  const candidate = matches[0];
-  const existing =
-    candidate && candidate.inputHash === inputHash ? candidate : undefined;
   if (existing) {
     if (
-      existing.spaceId !== input.spaceId ||
-      existing.embeddingFingerprint !== input.fingerprint ||
-      existing.targetKind !== input.kind ||
-      existing.inputHash !== inputHash ||
       existing.processingGenerationId !== input.processingGenerationId ||
-      existing.searchScope !== searchScope ||
+      existing.searchScope !==
+        embeddingVectorSearchScope({
+          spaceId: existing.spaceId,
+          fingerprint: existing.embeddingFingerprint,
+          embeddingGenerationId: existing.embeddingGenerationId,
+          targetKind: existing.targetKind,
+        }) ||
       existing.embedding.length !== input.vector.length ||
       existing.embedding.some((value, index) => value !== input.vector[index])
     ) {
       throw new Error("Conflicting immutable embedding vector");
+    }
+    // A row written before the scopeV2 backfill is invisible to the reader.
+    // Naming its own slot is derived identity, not content, so I1 holds.
+    if (existing.scopeV2 !== scopeV2) {
+      await ctx.db.patch(existing._id, { scopeV2 });
     }
     await recordVectorCoverageChange(ctx, {
       spaceId: input.spaceId,
@@ -931,11 +976,7 @@ async function insertVector(
     embeddingFingerprint: input.fingerprint,
     targetKind: input.kind,
     searchScope,
-    scopeV2: embeddingVectorScopeV2({
-      spaceId: input.spaceId,
-      fingerprint: input.fingerprint,
-      targetKind: input.kind,
-    }),
+    scopeV2,
     ...(input.thoughtId ? { thoughtId: input.thoughtId } : {}),
     ...(input.chunkId ? { chunkId: input.chunkId } : {}),
     ...(input.processingGenerationId
@@ -1019,18 +1060,6 @@ export async function bumpEmbeddingEligibilityEpoch(
   await ctx.db.patch(state._id, { eligibilityEpoch: nextEpoch });
   if (usesTargetCounters(state)) {
     await applyEligibilityTouch(ctx, state, touch ?? {}, Date.now());
-    if (state.activeEmbeddingGenerationId) {
-      const generation = await ctx.db.get(state.activeEmbeddingGenerationId);
-      if (
-        !generation ||
-        generation.state !== "active" ||
-        generation.spaceId !== spaceId
-      ) {
-        throw new Error("Active embedding generation pointer is invalid");
-      }
-      await ctx.db.patch(generation._id, { eligibilityEpoch: nextEpoch });
-    }
-    return nextEpoch;
   }
   if (state.activeEmbeddingGenerationId) {
     const generation = await ctx.db.get(state.activeEmbeddingGenerationId);
@@ -1041,32 +1070,7 @@ export async function bumpEmbeddingEligibilityEpoch(
     ) {
       throw new Error("Active embedding generation pointer is invalid");
     }
-    try {
-      const manifest = await deriveEmbeddingManifest(ctx, spaceId);
-      const completed = await validateManifestVectors(
-        ctx,
-        generation,
-        manifest,
-        false,
-      );
-      await ctx.db.patch(generation._id, {
-        eligibilityEpoch: nextEpoch,
-        manifestHash: manifest.hash,
-        expectedThoughtCount: manifest.thoughtCount,
-        expectedChunkCount: manifest.chunkCount,
-        completedThoughtCount: completed.thoughtCount,
-        completedChunkCount: completed.chunkCount,
-        coverageInvalid: false,
-        thoughtCoverageInvalid: completed.extraThoughtCount > 0,
-        chunkCoverageInvalid: completed.extraChunkCount > 0,
-      });
-    } catch (error) {
-      if (!(error instanceof EmbeddingManifestLimitError)) throw error;
-      await ctx.db.patch(generation._id, {
-        eligibilityEpoch: nextEpoch,
-        coverageInvalid: true,
-      });
-    }
+    await ctx.db.patch(generation._id, { eligibilityEpoch: nextEpoch });
   }
   return nextEpoch;
 }
@@ -1131,7 +1135,7 @@ export async function insertChunkEmbedding(
   if (
     (input.bumpEligibility ?? true) &&
     result.generationState === "active" &&
-    (result.inserted || result.activeTarget?.chunkStatus !== "ready")
+    result.inserted
   ) {
     await bumpEmbeddingEligibilityEpoch(ctx, input.spaceId);
   }
@@ -1252,9 +1256,11 @@ export async function resolveAuthorizedThoughtVectorCandidates(
   ctx: Pick<QueryCtx, "db">,
   input: {
     principal: PrincipalRef;
+    // The generation id may still ride along from the candidate scan; the
+    // hydration recheck does not use it (I2, I7).
     targets: Array<{
       spaceId: Id<"spaces">;
-      embeddingGenerationId: Id<"embeddingGenerations">;
+      embeddingGenerationId?: Id<"embeddingGenerations">;
       fingerprint: string;
     }>;
     embeddingVectorIds: Id<"embeddingVectors">[];
@@ -1276,33 +1282,41 @@ export async function resolveAuthorizedThoughtVectorCandidates(
   const activeTargets = new Map<string, ActiveEmbeddingTarget>();
   for (const target of input.targets) {
     if (!authorized.has(target.spaceId)) continue;
-    const active = await requireActiveEmbeddingTarget(ctx, target);
+    // I2: the fingerprint, not the generation, binds a row to the live index.
+    const active = await requireActiveEmbeddingTarget(ctx, {
+      spaceId: target.spaceId,
+      fingerprint: target.fingerprint,
+    });
     activeTargets.set(String(target.spaceId), active);
   }
   const rows = await Promise.all(
     input.embeddingVectorIds.map((id) => ctx.db.get(id)),
   );
   const results = [];
+  const accepted = new Set<string>();
   for (const row of rows) {
     if (!row || row.targetKind !== "thought" || !row.thoughtId) continue;
     const active = activeTargets.get(String(row.spaceId));
     if (
       !active ||
       active.thoughtStatus !== "ready" ||
-      active.embeddingGenerationId !== row.embeddingGenerationId ||
       active.fingerprint !== row.embeddingFingerprint ||
       row.chunkId !== undefined ||
       row.processingGenerationId !== undefined ||
-      row.searchScope !==
-        embeddingVectorSearchScope({
+      row.scopeV2 !==
+        embeddingVectorScopeV2({
           spaceId: row.spaceId,
           fingerprint: row.embeddingFingerprint,
-          embeddingGenerationId: row.embeddingGenerationId,
           targetKind: "thought",
         })
     ) {
       continue;
     }
+    // One candidate per target, whatever the index returned. Candidates arrive
+    // in score order, so the best surviving row is the one that is kept.
+    const targetKey = `${row.spaceId}:${row.thoughtId}`;
+    if (accepted.has(targetKey)) continue;
+    if (!(await targetIsEligibleFor(ctx, row, String(row.thoughtId)))) continue;
     const thought = await ctx.db.get(row.thoughtId);
     if (
       !thought ||
@@ -1312,6 +1326,7 @@ export async function resolveAuthorizedThoughtVectorCandidates(
     ) {
       continue;
     }
+    accepted.add(targetKey);
     results.push({
       embeddingVectorId: row._id,
       thoughtId: thought._id,
@@ -1321,13 +1336,38 @@ export async function resolveAuthorizedThoughtVectorCandidates(
   return results;
 }
 
+/**
+ * I7, eligibility half. The target table is the live eligibility record, so a
+ * row whose target has been retired or rewritten since the vector was written
+ * is dropped here even though the vector itself is still well formed.
+ */
+async function targetIsEligibleFor(
+  ctx: Pick<QueryCtx, "db">,
+  row: Doc<"embeddingVectors">,
+  targetId: string,
+): Promise<boolean> {
+  const target = await findEmbeddingTarget(
+    ctx,
+    row.spaceId,
+    row.targetKind,
+    targetId,
+  );
+  return (
+    target !== null &&
+    target.state === "eligible" &&
+    target.inputHash === row.inputHash
+  );
+}
+
 export async function resolveAuthorizedChunkVectorCandidates(
   ctx: Pick<QueryCtx, "db">,
   input: {
     principal: PrincipalRef;
+    // The generation id may still ride along from the candidate scan; the
+    // hydration recheck does not use it (I2, I7).
     targets: Array<{
       spaceId: Id<"spaces">;
-      embeddingGenerationId: Id<"embeddingGenerations">;
+      embeddingGenerationId?: Id<"embeddingGenerations">;
       fingerprint: string;
     }>;
     embeddingVectorIds: Id<"embeddingVectors">[];
@@ -1351,13 +1391,17 @@ export async function resolveAuthorizedChunkVectorCandidates(
     if (!authorized.has(target.spaceId)) continue;
     activeTargets.set(
       String(target.spaceId),
-      await requireActiveEmbeddingTarget(ctx, target),
+      await requireActiveEmbeddingTarget(ctx, {
+        spaceId: target.spaceId,
+        fingerprint: target.fingerprint,
+      }),
     );
   }
   const rows = await Promise.all(
     input.embeddingVectorIds.map((id) => ctx.db.get(id)),
   );
   const results = [];
+  const accepted = new Set<string>();
   for (const row of rows) {
     if (
       !row ||
@@ -1368,22 +1412,24 @@ export async function resolveAuthorizedChunkVectorCandidates(
       continue;
     }
     const active = activeTargets.get(String(row.spaceId));
+    // I10: an incomplete chunk index is reported by the caller, never a reason
+    // to drop a candidate whose own target is covered and eligible.
     if (
       !active ||
-      active.chunkStatus !== "ready" ||
-      active.embeddingGenerationId !== row.embeddingGenerationId ||
       active.fingerprint !== row.embeddingFingerprint ||
       row.thoughtId !== undefined ||
-      row.searchScope !==
-        embeddingVectorSearchScope({
+      row.scopeV2 !==
+        embeddingVectorScopeV2({
           spaceId: row.spaceId,
           fingerprint: row.embeddingFingerprint,
-          embeddingGenerationId: row.embeddingGenerationId,
           targetKind: "chunk",
         })
     ) {
       continue;
     }
+    const targetKey = `${row.spaceId}:${row.chunkId}`;
+    if (accepted.has(targetKey)) continue;
+    if (!(await targetIsEligibleFor(ctx, row, String(row.chunkId)))) continue;
     const chunk = await ctx.db.get(row.chunkId);
     if (
       !chunk ||
@@ -1411,6 +1457,7 @@ export async function resolveAuthorizedChunkVectorCandidates(
     ) {
       continue;
     }
+    accepted.add(targetKey);
     results.push({
       embeddingVectorId: row._id,
       chunkId: chunk._id,

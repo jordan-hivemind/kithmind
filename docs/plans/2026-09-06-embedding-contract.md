@@ -110,11 +110,26 @@ space set uses keyword retrieval for the whole request and returns
 `vectorStatus: "unavailable"`.
 
 When compatible, the system creates one query vector and searches only vectors
-filtered by a canonical `searchScope` encoding of space, fingerprint, generation,
-and target kind. Convex vector filters have no AND operator, so one equality
-comparison enforces the complete scope. It rechecks
-authorization and active-generation state while resolving results. This keeps
-incompatible fingerprints from mixing in a ranked result.
+filtered by a canonical `scopeV2` encoding of space, fingerprint and target
+kind. Convex vector filters have no AND operator, so one equality comparison
+enforces the complete scope. The generation id left that filter value in P2-6d
+so that an unchanged target keeps its vector across generations of one
+fingerprint at no cost. What the filter no longer enforces, invariants do: at
+most one vector row exists per space, fingerprint, kind and target (I11), and
+hydration rechecks authorization, the active fingerprint, the live target's
+content hash and the target's current eligibility, dropping any row that fails
+(I7). One candidate per target survives a request. This keeps incompatible
+fingerprints from mixing in a ranked result and keeps a superseded vector from
+taking a candidate slot.
+
+Coverage is reported per target kind rather than as one verdict. A space whose
+thought index is incomplete is not a valid capture target, because narrative
+capture uses that index for duplicate detection. A space whose chunk index is
+incomplete still serves semantic retrieval and reports the shortfall through
+the existing `partial` flag, because architecture section 5.1 requires labeled
+incomplete semantic results rather than hidden records. A space whose coverage
+counters have never been seeded fails closed with an error naming the target
+backfill; it never reports an unseeded index as a complete one.
 
 Document hybrid search uses bounded reciprocal-rank fusion with `k = 60`, a
 keyword weight of `1`, and a semantic weight of `1.25`. It retains 32 candidates
@@ -139,34 +154,34 @@ or vector-generation unavailability.
 
 There are two bounded paths, and they have different limits.
 
-| Path                                           | Bound                                                                                                       | Status                                                                                                                       |
-| ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| Whole-space manifest, staging and activation   | 256 eligible targets, 2 MiB of estimated input/vector bytes, 256 scanned thought rows, 256 read vector rows | Unchanged. It derives the whole space in one transaction, so its bound is a transaction bound.                               |
-| `embeddingTargets`, counters and paged builder | No constant below the 50,000-target design ceiling                                                          | Added by P2-6ab. Page sizes are 64 thought rows, 128 chunk rows and 128 target rows per transaction; the total is unbounded. |
+| Path                                               | Bound                                                                                                       | Status                                                                                                                                                                                                                                                                                                                                                                                      |
+| -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Whole-space manifest, profile transition and audit | 256 eligible targets, 2 MiB of estimated input/vector bytes, 256 scanned thought rows, 256 read vector rows | Narrowed by P2-6d. No ordinary write derives the manifest any more, so no capture or publication can fail on this bound. It is reached only by a profile transition staging a new fingerprint and by the baseline audit, both of which derive the whole space in one transaction, so the bound is a transaction bound. A new-fingerprint rebuild above 256 targets needs the paged builder. |
+| `embeddingTargets`, counters and paged builder     | No constant below the 50,000-target design ceiling                                                          | Added by P2-6ab. Page sizes are 64 thought rows, 128 chunk rows and 128 target rows per transaction; the total is unbounded.                                                                                                                                                                                                                                                                |
 
 The paragraph this replaces stated only the first row and said the first P2-6
 implementation PR would raise it. P2-6ab raised the capacity of the durable
 path instead of the transaction bound of the legacy one, because a whole-space
 derive that scanned 50,000 rows would exceed the platform read limit rather
-than fail safely. The legacy bound is removed by the reader cutover
-(P2-6d), not by a larger constant. Both are specified in the
+than fail safely. P2-6d then removed that derive from every write path rather
+than raising its constant. Both are specified in the
 [index capacity plan](./2026-09-12-index-capacity.md).
 
-The legacy bound is a conservative Phase 1 bound, not a bulk ingestion capacity
-claim. An overflow cannot activate a partial generation. Narrative capture requires a
-complete active thought index for admission and duplicate detection. A capture
-that would exceed the manifest bound rolls back with an explicit error. Source
-publication and legacy writes can continue while marking vector coverage
-unavailable; keyword retrieval remains available. Later bulk ingestion needs a
-resumable manifest builder.
+Narrative capture requires a complete active thought index for admission and
+duplicate detection, and a capture into an incomplete thought index rolls back
+with an explicit error. That completeness is now an O(1) counter comparison
+rather than a whole-space scan, so it no longer carries a target bound. Source
+publication and legacy writes continue and report the coverage shortfall they
+create; keyword retrieval remains available throughout.
 
-Source publication and forget operations update the embedding eligibility epoch
-in the same database transaction. Forget immediately hides evidence, then removes
+Source publication and forget operations name the targets they touched and
+update the embedding eligibility epoch and the coverage counters in the same
+database transaction. Forget immediately hides evidence, then removes
 vectors and provenance in batches of at most 25 rows. It also invalidates any
 staged embedding manifest. The active profile remains stored for audit. Source replacement removes obsolete
 chunk vectors from the active embedding generation. Forget completion reconciles
-coverage after deletion. Other stale extra vectors mark the affected target kind
-unavailable until cleanup and reconciliation or a complete rebuild. Narrative transitions remove the previous thought from the active
+coverage after deletion. Other stale extra vectors are dropped at hydration by the eligibility recheck
+and removed by cleanup; they no longer mark a target kind unavailable. Narrative transitions remove the previous thought from the active
 vector generation while retaining vectors in retired profile generations.
 
 Historical thoughts and source revisions remain available through explicit

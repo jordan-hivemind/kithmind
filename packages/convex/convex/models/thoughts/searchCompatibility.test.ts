@@ -6,8 +6,10 @@ import type { Id } from "../../_generated/dataModel";
 import { fingerprintEmbeddingConfig } from "../../lib/embeddingProvider";
 import schema from "../../schema";
 import { modules } from "../../test.setup";
+import { sha256Hex } from "../ingestion/hash";
 import { BASELINE_EMBEDDING_PROFILE } from "../embeddings/migrations";
 import { embeddingVectorSearchScope } from "../embeddings/model";
+import { embeddingVectorScopeV2 } from "../embeddings/targets";
 import { compatibleSearchFingerprint } from "./actions";
 
 const mcpIssuer = "https://brain.example.test";
@@ -140,17 +142,25 @@ describe("thought vector compatibility", () => {
           stagedAt: 2,
           activatedAt: 2,
         });
+        const previousContent = "The original synthetic project state";
+        const previousHash = await sha256Hex(previousContent);
         await ctx.db.insert("spaceEmbeddingStates", {
           spaceId,
           eligibilityEpoch: 0,
           activeEmbeddingGenerationId: activeGenerationId,
           activeFingerprint: fingerprint,
           activatedAt: 2,
+          eligibleCounts: { thought: 1, chunk: 0, card: 0 },
+          coveredCounts: [
+            { fingerprint, counts: { thought: 1, chunk: 0, card: 0 } },
+          ],
+          counterDrift: false,
+          lastAuditAt: 2,
         });
         const previousId = await ctx.db.insert("thoughts", {
           userId,
           spaceId,
-          content: "The original synthetic project state",
+          content: previousContent,
           embedding,
           metadata: {
             type: "reference",
@@ -160,6 +170,15 @@ describe("thought vector compatibility", () => {
             summary: "Original state",
           },
           memoryStatus: "current",
+        });
+        await ctx.db.insert("embeddingTargets", {
+          spaceId,
+          targetKind: "thought",
+          targetId: String(previousId),
+          inputHash: previousHash,
+          state: "eligible",
+          coveredFingerprint: fingerprint,
+          updatedAt: 2,
         });
         const insertStoredVector = async (
           embeddingGenerationId:
@@ -175,9 +194,14 @@ describe("thought vector compatibility", () => {
               fingerprint,
               targetKind: "thought",
             }),
+            scopeV2: embeddingVectorScopeV2({
+              spaceId,
+              fingerprint,
+              targetKind: "thought",
+            }),
             targetKind: "thought",
             thoughtId: previousId,
-            inputHash: "fixture-hash",
+            inputHash: previousHash,
             embedding,
           });
         const activeVectorId = await insertStoredVector(activeGenerationId);
@@ -233,11 +257,14 @@ describe("thought vector compatibility", () => {
         removedActiveVector: await ctx.db.get(seeded.activeVectorId),
       }));
       expect(stored.previous?.memoryStatus).toBe(previousStatus);
+      // The counters, not a whole-space derive, now carry the shortfall: a
+      // legacy write leaves an eligible thought target its fingerprint does
+      // not cover, and that is what the generation row mirrors.
       expect(stored.activeGeneration).toMatchObject({
         state: "active",
         expectedThoughtCount: 1,
         completedThoughtCount: compatible ? 1 : 0,
-        thoughtCoverageInvalid: compatible ? false : true,
+        thoughtCoverageInvalid: false,
       });
       expect(stored.activeVectors).toMatchObject(
         compatible
@@ -262,7 +289,7 @@ describe("thought vector compatibility", () => {
     },
   );
 
-  test("rolls back capture when the active manifest bound is exceeded", async () => {
+  test("rolls back capture when the active thought index is incomplete", async () => {
     const fingerprint = await fingerprintEmbeddingConfig(
       BASELINE_EMBEDDING_PROFILE,
     );
@@ -274,11 +301,7 @@ describe("thought vector compatibility", () => {
         name: "Bounded",
         createdBy: userId,
       });
-      await ctx.db.insert("spaceMembers", {
-        spaceId,
-        userId,
-        role: "owner",
-      });
+      await ctx.db.insert("spaceMembers", { spaceId, userId, role: "owner" });
       const profileId = await ctx.db.insert("embeddingProfiles", {
         fingerprint,
         ...BASELINE_EMBEDDING_PROFILE,
@@ -293,38 +316,52 @@ describe("thought vector compatibility", () => {
           state: "active",
           eligibilityEpoch: 0,
           manifestHash: "bounded-manifest",
-          expectedThoughtCount: 256,
+          expectedThoughtCount: 1,
           expectedChunkCount: 0,
-          completedThoughtCount: 256,
+          completedThoughtCount: 0,
           completedChunkCount: 0,
           createdAt: 1,
           stagedAt: 1,
           activatedAt: 1,
         },
       );
+      // One eligible thought target the active fingerprint does not cover.
+      // I9 keeps narrative capture strict about exactly this shortfall.
+      const uncoveredId = await ctx.db.insert("thoughts", {
+        userId,
+        spaceId,
+        content: "An existing memory with no vector",
+        embedding,
+        metadata: {
+          type: "reference",
+          topics: [],
+          people: [],
+          actionItems: [],
+          summary: "Uncovered",
+        },
+        memoryStatus: "current",
+      });
+      await ctx.db.insert("embeddingTargets", {
+        spaceId,
+        targetKind: "thought",
+        targetId: String(uncoveredId),
+        inputHash: await sha256Hex("An existing memory with no vector"),
+        state: "eligible",
+        updatedAt: 1,
+      });
       await ctx.db.insert("spaceEmbeddingStates", {
         spaceId,
         eligibilityEpoch: 0,
         activeEmbeddingGenerationId: embeddingGenerationId,
         activeFingerprint: fingerprint,
         activatedAt: 1,
+        eligibleCounts: { thought: 1, chunk: 0, card: 0 },
+        coveredCounts: [
+          { fingerprint, counts: { thought: 0, chunk: 0, card: 0 } },
+        ],
+        counterDrift: false,
+        lastAuditAt: 1,
       });
-      for (let index = 0; index < 256; index += 1) {
-        await ctx.db.insert("thoughts", {
-          userId,
-          spaceId,
-          content: `Existing bounded memory ${index}`,
-          embedding,
-          metadata: {
-            type: "reference",
-            topics: [],
-            people: [],
-            actionItems: [],
-            summary: `Existing bounded memory ${index}`,
-          },
-          memoryStatus: "current",
-        });
-      }
       return { userId, spaceId, embeddingGenerationId };
     });
 
@@ -332,7 +369,7 @@ describe("thought vector compatibility", () => {
       t.mutation(internal.models.thoughts.private.insertOneAuthorized, {
         principal: { userId: seeded.userId },
         spaceId: seeded.spaceId,
-        content: "The memory that exceeds the bounded active manifest",
+        content: "The memory that cannot be admitted yet",
         embedding,
         embeddingGenerationId: seeded.embeddingGenerationId,
         embeddingFingerprint: fingerprint,
@@ -341,10 +378,10 @@ describe("thought vector compatibility", () => {
           topics: [],
           people: [],
           actionItems: [],
-          summary: "Bounded overflow",
+          summary: "Incomplete index",
         },
       }),
-    ).rejects.toThrow("exceeds the active embedding manifest limit");
+    ).rejects.toThrow("requires a complete active thought embedding index");
     const after = await t.run(async (ctx) => ({
       thoughts: await ctx.db
         .query("thoughts")
@@ -356,23 +393,30 @@ describe("thought vector compatibility", () => {
           q.eq("embeddingGenerationId", seeded.embeddingGenerationId),
         )
         .collect(),
-      generation: await ctx.db.get(seeded.embeddingGenerationId),
+      targets: await ctx.db
+        .query("embeddingTargets")
+        .withIndex("by_space_and_state", (q) =>
+          q.eq("spaceId", seeded.spaceId).eq("state", "eligible"),
+        )
+        .collect(),
     }));
-    expect(after.thoughts).toHaveLength(256);
+    expect(after.thoughts).toHaveLength(1);
     expect(after.vectors).toHaveLength(0);
-    expect(after.generation?.coverageInvalid).not.toBe(true);
+    expect(after.targets).toHaveLength(1);
 
+    // A legacy write with no embedding identity still admits the memory and
+    // reports the widened shortfall through the counters.
     await t.mutation(internal.models.thoughts.private.insertOneAuthorized, {
       principal: { userId: seeded.userId },
       spaceId: seeded.spaceId,
-      content: "A trusted legacy write invalidates vector coverage",
+      content: "A trusted legacy write widens the coverage shortfall",
       embedding,
       metadata: {
         type: "reference",
         topics: [],
         people: [],
         actionItems: [],
-        summary: "Legacy coverage invalidation",
+        summary: "Legacy coverage shortfall",
       },
     });
     const invalidated = await t.run(async (ctx) => ({
@@ -382,8 +426,11 @@ describe("thought vector compatibility", () => {
         .collect(),
       generation: await ctx.db.get(seeded.embeddingGenerationId),
     }));
-    expect(invalidated.thoughts).toHaveLength(257);
-    expect(invalidated.generation?.coverageInvalid).toBe(true);
+    expect(invalidated.thoughts).toHaveLength(2);
+    expect(invalidated.generation).toMatchObject({
+      expectedThoughtCount: 2,
+      completedThoughtCount: 0,
+    });
   });
 });
 

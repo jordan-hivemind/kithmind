@@ -324,6 +324,60 @@ export async function upsertEligibleTarget(
   return wasRetired ? "created" : "changed";
 }
 
+/**
+ * Seeds the target table and the counters from a whole-space manifest that has
+ * just been validated in full, in the same transaction that activates it.
+ *
+ * It runs only for a space that has never been counted, which is exactly a
+ * space with no target rows, so it cannot double count. It is what lets an
+ * empty-space capture bootstrap and a profile transition leave behind a
+ * counted space without a separate backfill run; a space that was already
+ * active before P2-6ab still needs the P2-6g backfill.
+ */
+export async function seedTargetsFromManifest(
+  ctx: MutationCtx,
+  state: Doc<"spaceEmbeddingStates">,
+  fingerprint: string,
+  targets: ReadonlyArray<{
+    kind: "thought" | "chunk";
+    targetId: string;
+    inputHash: string;
+    processingGenerationId?: Id<"processingGenerations">;
+  }>,
+  now: number,
+): Promise<boolean> {
+  if (state.eligibleCounts !== undefined) return false;
+  const eligible = { ...ZERO_KIND_COUNTS };
+  for (const target of targets) {
+    await ctx.db.insert("embeddingTargets", {
+      spaceId: state.spaceId,
+      targetKind: target.kind,
+      targetId: target.targetId,
+      inputHash: target.inputHash,
+      ...(target.processingGenerationId
+        ? { processingGenerationId: target.processingGenerationId }
+        : {}),
+      state: "eligible",
+      coveredFingerprint: fingerprint,
+      updatedAt: now,
+    });
+    eligible[target.kind] += 1;
+  }
+  await ctx.db.patch(state._id, {
+    eligibleCounts: eligible,
+    coveredCounts: [
+      ...(state.coveredCounts ?? []).filter(
+        (entry) => entry.fingerprint !== fingerprint,
+      ),
+      { fingerprint, counts: { ...eligible } },
+    ],
+    counterDrift: false,
+    lastAuditAt: now,
+    lastEligibilityChangeAt: now,
+  });
+  return true;
+}
+
 export async function retireEmbeddingTarget(
   ctx: MutationCtx,
   row: Doc<"embeddingTargets">,
@@ -396,6 +450,18 @@ export async function recordVectorCoverageChange(
     .withIndex("by_spaceId", (q) => q.eq("spaceId", input.spaceId))
     .unique();
   if (!state) return;
+  // The marker is single valued, so only the active fingerprint may claim it.
+  // A generation staged under a new fingerprint would otherwise take the
+  // marker from the live index and report the active profile as uncovered,
+  // which section 3.4 point 2 says a staged build must never do. Its own
+  // coverage is established by a build job under that fingerprint.
+  if (
+    input.covered &&
+    state.activeFingerprint !== undefined &&
+    state.activeFingerprint !== input.fingerprint
+  ) {
+    return;
+  }
   const delta = emptyCounterDelta();
   await setTargetCoverage(
     ctx,

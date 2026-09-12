@@ -417,6 +417,16 @@ profile.
 Step 7 does no provider work for the existing 180 targets. Their `inputHash`
 values are unchanged and their fingerprint is the active one, so I3 applies.
 
+Amended by P2-6d: run step 3 before step 2. The reader switched to `scopeV2`
+unconditionally and reports an unseeded space as failed closed, so the window
+that matters is the one where a space is counted but its existing vector rows
+carry no `scopeV2`. Backfilling `scopeV2` first closes it, and the two steps
+are independent: step 3 writes only the `scopeV2` field on vector rows and step
+2 writes only target rows and counters. Every vector written after P2-6ab
+already carries `scopeV2`, so no new gap opens between them. The per-space
+`scopeVersion` switch of step 5 is not built; the fail-closed counter check is
+what gates a space instead, and it is reversible by clearing the counters.
+
 What the transition driver's artifacts no longer guarantee:
 
 | Artifact                                                     | What it guaranteed                                          | After this change                                                                                                                                            |

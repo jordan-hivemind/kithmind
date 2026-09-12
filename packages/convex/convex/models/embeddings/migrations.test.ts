@@ -347,8 +347,10 @@ describe("baseline embedding migration", () => {
         epochAfterRetry: stateAfterRetry!.eligibilityEpoch,
       };
     });
-    expect(result.pending?.chunkStatus).toBe("unavailable");
-    expect(result.ready?.chunkStatus).toBe("ready");
+    expect(result.pending?.chunkCoverage).toMatchObject({ covered: 0 });
+    expect(result.ready?.chunkCoverage.covered).toBe(
+      result.ready?.chunkCoverage.eligible,
+    );
     expect(result.reusedVectorId).toBe(result.vectorId);
     expect(result.epochAfterRetry).toBe(result.epochAfterInsert);
   });
