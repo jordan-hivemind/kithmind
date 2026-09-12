@@ -61,6 +61,29 @@ function pdfEntry(
   };
 }
 
+function permissionsRestrictedPdfEntry(
+  uri: string,
+  externalId: string,
+  sha256: string,
+  byteLength: number,
+  encryptionRevision: number,
+): FsDiscoveryEntry {
+  return {
+    externalId,
+    uri,
+    sourceModifiedAt: 100,
+    content: {
+      status: "ready_binary_v1",
+      sha256,
+      byteLength,
+      mediaType: "application/pdf",
+      ...PROFILE,
+      permissionsRestricted: true,
+      encryptionRevision,
+    },
+  };
+}
+
 function textEntry(
   uri: string,
   externalId: string,
@@ -883,5 +906,71 @@ describe("parse_failed exclusion (P2-70a2)", () => {
     const row = await f.t.run((ctx) => ctx.db.get(inventoryId));
     expect(row?.exclusionReason).toBeUndefined();
     expect(row?.exclusionDetail).toBeUndefined();
+  });
+});
+
+describe("permissionsRestricted (P2-77)", () => {
+  test("a permissions-only PDF is admitted (not excluded as encrypted) with the flag and revision detail set", async () => {
+    const f = await fixture();
+    const scan = await begin(f, "scan-1", 0, 1_000);
+    await appendAll(
+      f,
+      scan.scanId,
+      "scan-1-page",
+      [
+        permissionsRestrictedPdfEntry(
+          "fs://documents/reports/permissions-only.pdf",
+          uuid(1),
+          HASH_Q1,
+          2_048,
+          3,
+        ),
+      ],
+      1_100,
+    );
+
+    const rows = await f.t.run((ctx) =>
+      ctx.db
+        .query("sourceInventory")
+        .withIndex("by_sourceAccountId_and_identityKeyHash", (q) =>
+          q.eq("sourceAccountId", f.sourceAccountId),
+        )
+        .collect(),
+    );
+    expect(rows).toHaveLength(1);
+    const [row] = rows;
+    // Not excluded as encrypted: this is the same "not yet content indexed"
+    // pending state any freshly admitted PDF carries, per the
+    // "sourceInventory" describe block above.
+    expect(row?.exclusionReason).toBe("extraction_pending");
+    expect(row?.permissionsRestricted).toBe(true);
+    expect(row?.permissionsDetail).toBe(
+      "standard security handler revision 3 (empty user password)",
+    );
+  });
+
+  test("an ordinary admitted PDF leaves permissionsRestricted unset", async () => {
+    const f = await fixture();
+    const scan = await begin(f, "scan-1", 0, 1_000);
+    await appendAll(
+      f,
+      scan.scanId,
+      "scan-1-page",
+      [pdfEntry("fs://documents/reports/q1.pdf", uuid(1), HASH_Q1, 2_048)],
+      1_100,
+    );
+
+    const rows = await f.t.run((ctx) =>
+      ctx.db
+        .query("sourceInventory")
+        .withIndex("by_sourceAccountId_and_identityKeyHash", (q) =>
+          q.eq("sourceAccountId", f.sourceAccountId),
+        )
+        .collect(),
+    );
+    expect(rows).toHaveLength(1);
+    const [row] = rows;
+    expect(row?.permissionsRestricted).toBe(false);
+    expect(row?.permissionsDetail).toBeUndefined();
   });
 });

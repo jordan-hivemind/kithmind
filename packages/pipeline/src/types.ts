@@ -115,6 +115,13 @@ export type DiscoveryFile = {
  * that the configured parser profile has been prepared or is safe to use. */
 export type PdfDiscoveryFile = Omit<DiscoveryFile, "text"> & {
   mediaType: "application/pdf";
+  // P2-77: set when the file's only encryption is a permissions
+  // restriction whose empty user password validated against the standard
+  // security handler (owner decision 2026-09-12: admit these rather than
+  // exclude them). `encryptionRevision` is the handler revision (2-6) that
+  // validated. Absent for an unencrypted PDF.
+  permissionsRestricted?: boolean;
+  encryptionRevision?: number;
 };
 
 export type DiscoveryGap = Pick<

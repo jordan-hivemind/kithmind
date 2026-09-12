@@ -38,6 +38,10 @@ export type PdfFilePlan = PlanLocation & {
   observationEpoch?: number;
   processingEpoch?: number;
   discoveryState?: "queued" | "unchanged";
+  // P2-77: carried through from `PdfDiscoveryFile` so a resumed journal
+  // reproduces the same admitted-with-restriction plan a fresh scan would.
+  permissionsRestricted?: boolean;
+  encryptionRevision?: number;
 };
 
 export type GapFilePlan = PlanLocation & {
@@ -363,6 +367,8 @@ function files(value: unknown): FilePlan[] {
           "observationEpoch",
           "processingEpoch",
           "discoveryState",
+          "permissionsRestricted",
+          "encryptionRevision",
         ],
       );
     } else if (kind === "gap") {
@@ -421,6 +427,19 @@ function files(value: unknown): FilePlan[] {
         : row.discoveryState === "queued" || row.discoveryState === "unchanged"
           ? row.discoveryState
           : fail();
+    const encryptionRevision =
+      row.encryptionRevision === undefined
+        ? undefined
+        : integer(row.encryptionRevision, 2, 6);
+    const permissionsRestricted =
+      row.permissionsRestricted === undefined
+        ? undefined
+        : boolean(row.permissionsRestricted);
+    if (
+      (permissionsRestricted === undefined) !==
+      (encryptionRevision === undefined)
+    )
+      fail();
     if (
       (sourceItemId === undefined ||
         observationEpoch === undefined ||
@@ -451,6 +470,9 @@ function files(value: unknown): FilePlan[] {
         ? {}
         : { sourceItemId, observationEpoch, processingEpoch }),
       ...(discoveryState === undefined ? {} : { discoveryState }),
+      ...(permissionsRestricted === undefined
+        ? {}
+        : { permissionsRestricted, encryptionRevision }),
     };
   });
 }

@@ -115,6 +115,18 @@ export async function upsertSourceInventoryRow(
         ? "text/plain"
         : undefined;
 
+  // P2-77: a permissions-only encrypted PDF is admitted (no exclusion
+  // reason below), but the restriction is still worth surfacing on the row.
+  const encryptionRevision =
+    entry.content.status === "ready_binary_v1" &&
+    entry.content.permissionsRestricted === true
+      ? entry.content.encryptionRevision
+      : undefined;
+  const permissionsRestricted = encryptionRevision !== undefined;
+  const permissionsDetail = permissionsRestricted
+    ? `standard security handler revision ${encryptionRevision} (empty user password)`
+    : undefined;
+
   // Section 2.2: "True only when an active generation holds retained text."
   // This is the existing document pipeline's activation state, computed live
   // rather than cached, so it can lag between a scan and a later async parse
@@ -166,6 +178,8 @@ export async function upsertSourceInventoryRow(
     ...(groupId === undefined ? {} : { duplicateGroupId: groupId }),
     contentIndexed,
     exclusionReason,
+    permissionsRestricted,
+    permissionsDetail,
     lastSeenScanId: scanId,
     // Section 2.2: "clear it when the file reappears in a later scan". This
     // call is itself an observation of the file, so any prior "missing" mark
@@ -372,6 +386,8 @@ export function projectInventoryRow(row: Doc<"sourceInventory">) {
     contentIndexed: row.contentIndexed,
     exclusionReason: row.exclusionReason,
     exclusionDetail: row.exclusionDetail,
+    permissionsRestricted: row.permissionsRestricted,
+    permissionsDetail: row.permissionsDetail,
     duplicateGroupId: row.duplicateGroupId,
     missingSinceScanId: row.missingSinceScanId,
   };

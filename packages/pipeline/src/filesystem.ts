@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createCipheriv, createHash } from "node:crypto";
 import { constants, type Stats } from "node:fs";
 import { lstat, open, opendir, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
@@ -579,25 +579,27 @@ function pdfTrailerDictBefore(
 }
 
 /**
- * Detects a PDF's trailer `/Encrypt` entry from the raw bytes, before any
- * parser opens the file: locates the last trailer dictionary before the
- * file's final `%%EOF` (or, for a cross-reference stream, its `/Type /XRef`
- * stream dictionary), then any `/Prev` chain, checking only those bounded
+ * Locates a PDF's trailer `/Encrypt` entry from the raw bytes, before any
+ * parser opens the file: the last trailer dictionary before the file's
+ * final `%%EOF` (or, for a cross-reference stream, its `/Type /XRef` stream
+ * dictionary), then any `/Prev` chain, checking only those bounded
  * dictionary byte ranges for `/Encrypt` rather than the whole file, so an
  * unrelated `/Encrypt` literal inside a content stream cannot match. Never
  * decodes or logs the file's content; dependency-free and bounded (no
  * dictionary is scanned past `MAX_PDF_DICT_BYTES`, no more than
- * `MAX_PDF_TRAILER_HOPS` hops are walked). Fails open to "not encrypted" on
- * anything it cannot parse, leaving the parser to decide.
+ * `MAX_PDF_TRAILER_HOPS` hops are walked). Returns `undefined` ("not
+ * encrypted") on anything it cannot parse, leaving the parser to decide.
  */
-function isPdfEncrypted(bytes: Buffer): boolean {
+function findEncryptedTrailerDict(
+  bytes: Buffer,
+): { start: number; end: number } | undefined {
   const eofAt = bytes.lastIndexOf(PDF_EOF_MARKER);
   let boundary = eofAt < 0 ? bytes.length : eofAt;
   for (let hop = 0; hop < MAX_PDF_TRAILER_HOPS; hop += 1) {
     const dict = pdfTrailerDictBefore(bytes, boundary);
-    if (!dict) return false;
+    if (!dict) return undefined;
     const slice = bytes.subarray(dict.start, dict.end);
-    if (slice.includes(PDF_ENCRYPT_MARKER)) return true;
+    if (slice.includes(PDF_ENCRYPT_MARKER)) return dict;
     const prevMatch = PDF_PREV_PATTERN.exec(slice.toString("latin1"));
     const prevOffset = prevMatch ? Number(prevMatch[1]) : undefined;
     if (
@@ -606,11 +608,427 @@ function isPdfEncrypted(bytes: Buffer): boolean {
       prevOffset < 0 ||
       prevOffset >= dict.start
     ) {
-      return false;
+      return undefined;
     }
     boundary = prevOffset;
   }
-  return false;
+  return undefined;
+}
+
+// --- Standard security handler: empty user-password validation (P2-77) ---
+//
+// Owner decision 2026-09-12: a PDF whose only encryption is a permissions
+// restriction (an /Encrypt dictionary whose empty user password validates)
+// is admitted rather than excluded, since the standard security handler
+// itself lets any reader open it without a prompt. This validates the
+// dictionary the same way a reader must: it never decrypts or reads any
+// page content, only the /Encrypt dictionary, the /ID from the trailer, and
+// the fixed padding string every standard-handler PDF is built from.
+//
+// ponytail: RC4 and the R2-4 key derivation are implemented by hand (both a
+// handful of lines) rather than reached for from a package, since node:crypto
+// has no RC4 (OpenSSL 3 moved it to the legacy provider, not reliably
+// enabled) and no existing dependency implements PDF's standard security
+// handler. AES-128-CBC and the SHA-2 family (R5/R6) already exist in
+// node:crypto, so those are used directly.
+
+const PDF_PASSWORD_PAD = Buffer.from([
+  0x28, 0xbf, 0x4e, 0x5e, 0x4e, 0x75, 0x8a, 0x41, 0x64, 0x00, 0x4e, 0x56, 0xff,
+  0xfa, 0x01, 0x08, 0x2e, 0x2e, 0x00, 0xb6, 0xd0, 0x68, 0x3e, 0x80, 0x2f, 0x0c,
+  0xa9, 0xfe, 0x64, 0x53, 0x69, 0x7a,
+]);
+
+function rc4(key: Buffer, data: Buffer): Buffer {
+  const s = new Uint8Array(256);
+  for (let i = 0; i < 256; i += 1) s[i] = i;
+  let j = 0;
+  for (let i = 0; i < 256; i += 1) {
+    j = (j + s[i]! + key[i % key.length]!) & 0xff;
+    [s[i], s[j]] = [s[j]!, s[i]!];
+  }
+  const out = Buffer.alloc(data.length);
+  let i = 0;
+  j = 0;
+  for (let k = 0; k < data.length; k += 1) {
+    i = (i + 1) & 0xff;
+    j = (j + s[i]!) & 0xff;
+    [s[i], s[j]] = [s[j]!, s[i]!];
+    out[k] = data[k]! ^ s[(s[i]! + s[j]!) & 0xff]!;
+  }
+  return out;
+}
+
+function isPdfWhitespace(byte: number | undefined): boolean {
+  return (
+    byte === 0x20 ||
+    byte === 0x0a ||
+    byte === 0x0d ||
+    byte === 0x09 ||
+    byte === 0x0c ||
+    byte === 0x00
+  );
+}
+
+function isPdfNameContinuation(byte: number | undefined): boolean {
+  if (byte === undefined || byte <= 0x20) return false;
+  return !"()<>[]{}/%".includes(String.fromCharCode(byte));
+}
+
+/** Byte offset of `/key` in `dict`, skipping any occurrence that is really a
+ * longer name sharing the same prefix (e.g. `/U` inside `/UE`). */
+function findDictKey(dict: Buffer, key: string): number {
+  const marker = Buffer.from(`/${key}`);
+  let from = 0;
+  for (;;) {
+    const at = dict.indexOf(marker, from);
+    if (at < 0) return -1;
+    if (!isPdfNameContinuation(dict[at + marker.length])) return at;
+    from = at + 1;
+  }
+}
+
+function afterDictKey(dict: Buffer, key: string): number | undefined {
+  const at = findDictKey(dict, key);
+  if (at < 0) return undefined;
+  let i = at + 1 + key.length;
+  while (i < dict.length && isPdfWhitespace(dict[i])) i += 1;
+  return i;
+}
+
+function pdfDictNumber(dict: Buffer, key: string): number | undefined {
+  const at = afterDictKey(dict, key);
+  if (at === undefined) return undefined;
+  const match = /^-?\d+/.exec(
+    dict.toString("latin1", at, Math.min(dict.length, at + 32)),
+  );
+  return match ? Number(match[0]) : undefined;
+}
+
+function pdfDictName(dict: Buffer, key: string): string | undefined {
+  const at = afterDictKey(dict, key);
+  if (at === undefined || dict[at] !== 0x2f) return undefined;
+  const match = /^\/([^\s()<>[\]{}/%]+)/.exec(
+    dict.toString("latin1", at, Math.min(dict.length, at + 64)),
+  );
+  return match?.[1];
+}
+
+function pdfDictBoolean(dict: Buffer, key: string): boolean | undefined {
+  const at = afterDictKey(dict, key);
+  if (at === undefined) return undefined;
+  const text = dict.toString("latin1", at, Math.min(dict.length, at + 5));
+  if (text.startsWith("true")) return true;
+  if (text.startsWith("false")) return false;
+  return undefined;
+}
+
+function pdfIndirectRef(
+  dict: Buffer,
+  key: string,
+): { num: number; gen: number } | undefined {
+  const at = afterDictKey(dict, key);
+  if (at === undefined) return undefined;
+  const match = /^(\d+)\s+(\d+)\s+R\b/.exec(
+    dict.toString("latin1", at, Math.min(dict.length, at + 32)),
+  );
+  return match ? { num: Number(match[1]), gen: Number(match[2]) } : undefined;
+}
+
+/** Parses a PDF literal `(...)` or hex `<...>` string starting at `start`,
+ * decoding literal-string escapes (octal, the standard backslash escapes,
+ * and line-continuation) per PDF syntax. Bounded by the dictionary slice
+ * it is always called with (at most `MAX_PDF_DICT_BYTES`). */
+function pdfStringAt(
+  bytes: Buffer,
+  start: number,
+): { value: Buffer; end: number } | undefined {
+  if (bytes[start] === 0x28) {
+    let depth = 1;
+    let i = start + 1;
+    const out: number[] = [];
+    while (i < bytes.length && depth > 0) {
+      const c = bytes[i]!;
+      if (c === 0x5c) {
+        const e = bytes[i + 1];
+        if (e === undefined) return undefined;
+        if (e >= 0x30 && e <= 0x37) {
+          let oct = "";
+          let k = i + 1;
+          while (oct.length < 3 && bytes[k] !== undefined && bytes[k]! >= 0x30 && bytes[k]! <= 0x37) {
+            oct += String.fromCharCode(bytes[k]!);
+            k += 1;
+          }
+          out.push(parseInt(oct, 8) & 0xff);
+          i = k;
+          continue;
+        }
+        switch (e) {
+          case 0x6e: out.push(0x0a); break;
+          case 0x72: out.push(0x0d); break;
+          case 0x74: out.push(0x09); break;
+          case 0x62: out.push(0x08); break;
+          case 0x66: out.push(0x0c); break;
+          case 0x28: out.push(0x28); break;
+          case 0x29: out.push(0x29); break;
+          case 0x5c: out.push(0x5c); break;
+          case 0x0d:
+            i += bytes[i + 2] === 0x0a ? 1 : 0;
+            break;
+          case 0x0a:
+            break;
+          default:
+            out.push(e);
+        }
+        i += 2;
+        continue;
+      }
+      if (c === 0x28) {
+        depth += 1;
+        out.push(c);
+        i += 1;
+        continue;
+      }
+      if (c === 0x29) {
+        depth -= 1;
+        i += 1;
+        if (depth > 0) out.push(c);
+        continue;
+      }
+      out.push(c);
+      i += 1;
+    }
+    if (depth !== 0) return undefined;
+    return { value: Buffer.from(out), end: i };
+  }
+  if (bytes[start] === 0x3c && bytes[start + 1] !== 0x3c) {
+    let i = start + 1;
+    let hex = "";
+    while (i < bytes.length && bytes[i] !== 0x3e) {
+      const ch = bytes[i]!;
+      if (
+        (ch >= 0x30 && ch <= 0x39) ||
+        (ch >= 0x41 && ch <= 0x46) ||
+        (ch >= 0x61 && ch <= 0x66)
+      ) {
+        hex += String.fromCharCode(ch);
+      } else if (!isPdfWhitespace(ch)) {
+        return undefined;
+      }
+      i += 1;
+    }
+    if (bytes[i] !== 0x3e) return undefined;
+    if (hex.length % 2 === 1) hex += "0";
+    return { value: Buffer.from(hex, "hex"), end: i + 1 };
+  }
+  return undefined;
+}
+
+function pdfDictString(dict: Buffer, key: string): Buffer | undefined {
+  const at = afterDictKey(dict, key);
+  if (at === undefined) return undefined;
+  return pdfStringAt(dict, at)?.value;
+}
+
+/** The first element of the trailer's `/ID` array (used as-is; both array
+ * elements are always equal in a freshly created, unmodified file). */
+function pdfTrailerId(trailerDict: Buffer): Buffer | undefined {
+  const at = afterDictKey(trailerDict, "ID");
+  if (at === undefined || trailerDict[at] !== 0x5b) return undefined;
+  let i = at + 1;
+  while (i < trailerDict.length && isPdfWhitespace(trailerDict[i])) i += 1;
+  return pdfStringAt(trailerDict, i)?.value;
+}
+
+/** Finds `N G obj`'s dictionary within `MAX_PDF_DICT_BYTES` bytes of the
+ * keyword, bounded the same way every other dictionary lookup here is. */
+function locateIndirectObjectDict(
+  bytes: Buffer,
+  num: number,
+  gen: number,
+): { start: number; end: number } | undefined {
+  const text = bytes.toString("latin1");
+  const match = new RegExp(`(?:^|[^0-9])${num}\\s+${gen}\\s+obj\\b`).exec(
+    text,
+  );
+  if (!match) return undefined;
+  const searchFrom = match.index + match[0].length;
+  const searchLimit = Math.min(bytes.length, searchFrom + MAX_PDF_DICT_BYTES);
+  const dictStart = bytes.indexOf(PDF_DICT_OPEN, searchFrom);
+  if (dictStart < 0 || dictStart >= searchLimit) return undefined;
+  const end = pdfDictEnd(bytes, dictStart);
+  return end === undefined ? undefined : { start: dictStart, end };
+}
+
+/** Algorithm 2 (ISO 32000-1 7.6.3.3): the standard-handler encryption key
+ * for revisions 2-4, computed from the empty user password (the fixed
+ * padding string alone), `/O`, `/P`, the file `/ID`, and (R&gt;=4 with
+ * metadata unencrypted) the all-ones trailer. */
+function standardEncryptionKeyR234(
+  o: Buffer,
+  p: number,
+  id: Buffer,
+  revision: number,
+  keyLengthBytes: number,
+  encryptMetadata: boolean,
+): Buffer {
+  const pBytes = Buffer.alloc(4);
+  pBytes.writeInt32LE(p, 0);
+  const parts = [PDF_PASSWORD_PAD, o.subarray(0, 32), pBytes, id];
+  if (revision >= 4 && !encryptMetadata) {
+    parts.push(Buffer.from([0xff, 0xff, 0xff, 0xff]));
+  }
+  let digest: Buffer = createHash("md5").update(Buffer.concat(parts)).digest();
+  if (revision >= 3) {
+    for (let round = 0; round < 50; round += 1) {
+      digest = createHash("md5")
+        .update(digest.subarray(0, keyLengthBytes))
+        .digest();
+    }
+  }
+  return digest.subarray(0, keyLengthBytes);
+}
+
+/** Algorithm 3.4 (R2): RC4-encrypts the padding string with the file key. */
+function standardUserValueR2(key: Buffer): Buffer {
+  return rc4(key, PDF_PASSWORD_PAD);
+}
+
+/** Algorithm 3.5 (R3/R4): only the first 16 bytes are meaningful for
+ * validation; the spec calls the rest of `/U` "arbitrary padding". */
+function standardUserValueR3Plus(key: Buffer, id: Buffer): Buffer {
+  let value: Buffer = createHash("md5")
+    .update(Buffer.concat([PDF_PASSWORD_PAD, id]))
+    .digest();
+  value = rc4(key, value);
+  for (let round = 1; round <= 19; round += 1) {
+    const roundKey = Buffer.from(key.map((byte) => byte ^ round));
+    value = rc4(roundKey, value);
+  }
+  return value;
+}
+
+/** Algorithm 2.B (ISO 32000-2, revision 6's hardened hash). Revision 5 uses
+ * a single unhardened SHA-256 round instead (handled by the caller). */
+function hardenedHash(password: Buffer, salt: Buffer, extra: Buffer): Buffer {
+  let k: Buffer = createHash("sha256")
+    .update(Buffer.concat([password, salt, extra]))
+    .digest();
+  for (let round = 0; ; round += 1) {
+    const k1Block = Buffer.concat([password, k, extra]);
+    const k1 = Buffer.concat(Array<Buffer>(64).fill(k1Block));
+    const cipher = createCipheriv("aes-128-cbc", k.subarray(0, 16), k.subarray(16, 32));
+    cipher.setAutoPadding(false);
+    const e = Buffer.concat([cipher.update(k1), cipher.final()]);
+    let sum = 0;
+    for (let i = 0; i < 16; i += 1) sum += e[i]!;
+    const mod = sum % 3;
+    k =
+      mod === 0
+        ? createHash("sha256").update(e).digest()
+        : mod === 1
+          ? createHash("sha384").update(e).digest()
+          : createHash("sha512").update(e).digest();
+    if (round >= 63 && e[e.length - 1]! <= round - 31) break;
+  }
+  return k.subarray(0, 32);
+}
+
+export type PdfEncryptionClassification =
+  | { status: "clear" }
+  | { status: "permissions_only"; revision: number }
+  | { status: "password_required" };
+
+/**
+ * Classifies a PDF's `/Encrypt` dictionary (if any) against the empty user
+ * password, per the owner's 2026-09-12 decision: a PDF that validates is a
+ * permissions-only restriction (printing or editing may be restricted, but
+ * any reader opens it without a prompt) and is admitted; anything else -
+ * an unknown or non-Standard handler, an unparseable dictionary, a real
+ * user password, or a thrown error - is fail-closed to `password_required`.
+ * Reads only the trailer, the `/Encrypt` dictionary, and the trailer's
+ * `/ID`; never the page content.
+ */
+function classifyPdfEncryption(bytes: Buffer): PdfEncryptionClassification {
+  const trailerDict = findEncryptedTrailerDict(bytes);
+  if (!trailerDict) return { status: "clear" };
+  try {
+    const trailerSlice = bytes.subarray(trailerDict.start, trailerDict.end);
+    let encryptDict: Buffer;
+    const ref = pdfIndirectRef(trailerSlice, "Encrypt");
+    if (ref) {
+      const loc = locateIndirectObjectDict(bytes, ref.num, ref.gen);
+      if (!loc) return { status: "password_required" };
+      encryptDict = bytes.subarray(loc.start, loc.end);
+    } else {
+      const at = afterDictKey(trailerSlice, "Encrypt");
+      if (at === undefined) return { status: "password_required" };
+      const end = pdfDictEnd(trailerSlice, at);
+      if (end === undefined) return { status: "password_required" };
+      encryptDict = trailerSlice.subarray(at, end);
+    }
+    if (pdfDictName(encryptDict, "Filter") !== "Standard") {
+      return { status: "password_required" };
+    }
+    const revision = pdfDictNumber(encryptDict, "R");
+    const oValue = pdfDictString(encryptDict, "O");
+    const uValue = pdfDictString(encryptDict, "U");
+    const pValue = pdfDictNumber(encryptDict, "P");
+    if (
+      revision === undefined ||
+      oValue === undefined ||
+      uValue === undefined ||
+      pValue === undefined
+    ) {
+      return { status: "password_required" };
+    }
+    if (revision >= 2 && revision <= 4) {
+      const idValue = pdfTrailerId(trailerSlice);
+      const minULength = revision === 2 ? 32 : 16;
+      if (
+        idValue === undefined ||
+        oValue.length !== 32 ||
+        uValue.length < minULength
+      ) {
+        return { status: "password_required" };
+      }
+      const lengthBits = pdfDictNumber(encryptDict, "Length") ?? 40;
+      const keyLen = revision === 2 ? 5 : Math.trunc(lengthBits / 8);
+      if (!Number.isInteger(keyLen) || keyLen < 5 || keyLen > 16) {
+        return { status: "password_required" };
+      }
+      const encryptMetadata = pdfDictBoolean(encryptDict, "EncryptMetadata") ?? true;
+      const key = standardEncryptionKeyR234(
+        oValue,
+        pValue,
+        idValue,
+        revision,
+        keyLen,
+        encryptMetadata,
+      );
+      const valid =
+        revision === 2
+          ? standardUserValueR2(key).equals(uValue.subarray(0, 32))
+          : standardUserValueR3Plus(key, idValue).equals(uValue.subarray(0, 16));
+      return valid
+        ? { status: "permissions_only", revision }
+        : { status: "password_required" };
+    }
+    if (revision === 5 || revision === 6) {
+      if (uValue.length < 40) return { status: "password_required" };
+      const hash = uValue.subarray(0, 32);
+      const validationSalt = uValue.subarray(32, 40);
+      const computed =
+        revision === 5
+          ? createHash("sha256").update(validationSalt).digest()
+          : hardenedHash(Buffer.alloc(0), validationSalt, Buffer.alloc(0));
+      return computed.equals(hash)
+        ? { status: "permissions_only", revision }
+        : { status: "password_required" };
+    }
+    return { status: "password_required" };
+  } catch {
+    return { status: "password_required" };
+  }
 }
 
 function pdfDiscoveryFile(file: SafeFileBytes): PdfDiscoveryFile {
@@ -620,7 +1038,8 @@ function pdfDiscoveryFile(file: SafeFileBytes): PdfDiscoveryFile {
   if (!file.bytes.subarray(0, 5).equals(Buffer.from("%PDF-"))) {
     throw new FilesystemFailure("unsupported", "file is not a PDF");
   }
-  if (isPdfEncrypted(file.bytes)) {
+  const classification = classifyPdfEncryption(file.bytes);
+  if (classification.status === "password_required") {
     throw new FilesystemFailure("encrypted", "PDF requires a password");
   }
   const {
@@ -629,7 +1048,16 @@ function pdfDiscoveryFile(file: SafeFileBytes): PdfDiscoveryFile {
     linkCount: _linkCount,
     ...descriptor
   } = file;
-  return { ...descriptor, mediaType: "application/pdf" };
+  return {
+    ...descriptor,
+    mediaType: "application/pdf",
+    ...(classification.status === "permissions_only"
+      ? {
+          permissionsRestricted: true as const,
+          encryptionRevision: classification.revision,
+        }
+      : {}),
+  };
 }
 
 export async function readUtf8File(

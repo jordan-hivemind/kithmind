@@ -55,6 +55,16 @@ export const sourceInventoryFields = {
   // every other reason, and cleared back to undefined the moment a later
   // job for the same file succeeds.
   exclusionDetail: v.optional(v.string()),
+  // P2-77: true when the source PDF's only encryption is a permissions
+  // restriction whose empty user password validated against the standard
+  // security handler (owner decision 2026-09-12: admit these rather than
+  // exclude them, so `exclusionReason` is absent here). `permissionsDetail`
+  // names the handler revision that validated, e.g. "standard security
+  // handler revision 3 (empty user password)". Never document content, and
+  // kept separate from `exclusionDetail` (parse-failure class only) so a
+  // later parse failure or recovery cannot clobber it.
+  permissionsRestricted: v.optional(v.boolean()),
+  permissionsDetail: v.optional(v.string()),
   firstSeenScanId: v.id("workerSourceScans"),
   lastSeenScanId: v.id("workerSourceScans"),
   missingSinceScanId: v.optional(v.id("workerSourceScans")),
