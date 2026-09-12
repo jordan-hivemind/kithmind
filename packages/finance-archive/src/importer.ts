@@ -43,6 +43,7 @@ import {
   withArchiveTransaction,
 } from "./pgStore.js";
 import {
+  cashEffectiveDate,
   type CashGateScope,
   runReconciliationGate,
   type ReconciliationGateSummary,
@@ -1135,8 +1136,14 @@ export async function importBatch(
         source_document_id: documentId,
         source_locator: p.row.sourceLocator,
       });
+      // F1-8. The fourth segment is the row's cash-effective date, which the
+      // cash gate places it by; the third stays `process_date`, which the
+      // position gate places it by. One key, both gates, neither guessing at
+      // the other's window.
       changedTransactions.add(
-        `${p.row.accountId}\u0000${p.row.instrumentId ?? ""}\u0000${p.row.processDate}`,
+        `${p.row.accountId}\u0000${p.row.instrumentId ?? ""}\u0000` +
+          `${p.row.processDate}\u0000` +
+          `${cashEffectiveDate(p.row.processDate, p.row.settleDate)}`,
       );
       toInsert.push(p.values);
       for (const candidate of p.pending) {
@@ -1807,7 +1814,7 @@ export async function importBatch(
         cash: {
           snapshots: [...changedBalances].map(toCashChange),
           activity: [...changedTransactions].map((key) => {
-            const [accountId = "", , date = ""] = key.split("\u0000");
+            const [accountId = "", , , date = ""] = key.split("\u0000");
             return { accountId, date };
           }),
         },

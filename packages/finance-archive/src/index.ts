@@ -162,6 +162,7 @@ export {
   type PublishSummary,
 } from "./importer.js";
 export {
+  cashEffectiveDate,
   runReconciliationGate,
   type CashChange,
   type CashGateScope,

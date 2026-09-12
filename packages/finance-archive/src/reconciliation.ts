@@ -10,6 +10,23 @@
 // stated is the importer's job. It only reads what is already there, sums
 // `transactions` in the window, and writes `reconciliations`.
 //
+// F1-8 fixed two things about which rows land in that window, both measured
+// against the hosted archive before and after.
+//
+// The window is half-open: `(period_start, period_end]`. A stated balance is
+// the close of business on its own date, so the activity of `period_start`
+// is already inside the *previous* snapshot. Counting it again at the start
+// of the next period charged every boundary day's cash twice.
+//
+// The date a row is placed by is its cash-effective date --
+// `greatest(process_date, settle_date)` -- not `process_date` alone. A
+// statement's cash balance is settled cash: a trade executed and processed
+// before the close but settling after it has not moved the stated balance
+// yet, and posting a row before it settles does not release the money
+// either. `greatest` of the two is the first date on which both are true.
+// `settle_date` is nullable, and a row without one falls back to
+// `process_date` unchanged.
+//
 // The tolerance is an owner decision already made: exact zero. Any nonzero
 // delta fails the period. Under F1-22's move to NUMERIC that comparison is
 // the one place a float could creep back in, so it does not happen in
@@ -73,8 +90,11 @@ export type ReconciliationGateSummary = {
 
 /**
  * One (account, date) an import actually inserted a row at (F1-59). `date`
- * is `balances.as_of` for a stated snapshot and `transactions.process_date`
- * for activity.
+ * is `balances.as_of` for a stated snapshot and, for activity, the row's
+ * cash-effective date -- `cashEffectiveDate(processDate, settleDate)`, the
+ * same date `CASH_DATE` places the row on. Keying the scope by
+ * `process_date` while the window sums by settlement would let a scoped run
+ * miss the period a row actually moved.
  */
 export type CashChange = {
   accountId: string;
@@ -97,6 +117,28 @@ export type CashGateScope = {
 /** Canonical decimal text. The gate's tolerance policy: exact zero. */
 const TOLERANCE = "0";
 
+/**
+ * The date one transaction's cash lands on, as SQL over an aliased
+ * `transactions t`. See the header: a stated cash balance is settled cash,
+ * so a row counts in the period containing the later of the date it was
+ * processed and the date it settled. Exported as `cashEffectiveDate` for the
+ * importer, which has to key an incremental gate scope by the same date this
+ * expression puts the row on, or a scoped run could skip the period the row
+ * actually moved.
+ */
+const CASH_DATE =
+  "greatest(t.process_date, coalesce(t.settle_date, t.process_date))";
+
+/** The TypeScript twin of `CASH_DATE`; ISO dates compare lexicographically. */
+export function cashEffectiveDate(
+  processDate: string,
+  settleDate: string | null,
+): string {
+  return settleDate !== null && settleDate > processDate
+    ? settleDate
+    : processDate;
+}
+
 /** The column order the batched verdict INSERT binds its tuples in. */
 const VERDICT_COLUMNS = [
   "id",
@@ -117,9 +159,11 @@ type BalancePairRow = {
   as_of: string;
   cash: string | null;
   currency: string;
+  cash_contradicts: boolean;
   prev_as_of: string;
   prev_cash: string | null;
   prev_currency: string | null;
+  prev_cash_contradicts: boolean | null;
 };
 
 type PeriodResult = {
@@ -133,10 +177,11 @@ type PeriodResult = {
 /**
  * Runs the reconciliation gate over every account with two or more
  * `balances` snapshots, writing one `reconciliations` row per period
- * (period boundaries are consecutive snapshot dates for that account,
- * inclusive on both ends). Re-running the gate replaces any prior row for
- * the same account and period, so it is idempotent after a corrected
- * import.
+ * (period boundaries are consecutive snapshot dates for that account; the
+ * window between them is half-open, `(period_start, period_end]`, because
+ * `period_start`'s own activity is already inside the balance stated there).
+ * Re-running the gate replaces any prior row for the same account and
+ * period, so it is idempotent after a corrected import.
  *
  * The whole gate is one transaction, and it joins the caller's transaction
  * when there is one -- which is how `publishImport` gets new transactions and
@@ -265,6 +310,30 @@ function reconcilePeriod(
   pair: BalancePairRow,
   window: WindowSum,
 ): PeriodResult {
+  // F1-8. Two `balances` rows at one `as_of` stating different cash is the
+  // archive holding two contradictory statements of the same fact, not a
+  // period the transactions could ever explain. Diffing against either one
+  // would be picking a winner silently (ground rule 5), and which one the
+  // window function picked was not even deterministic before this. The
+  // period is unverified and says so; the contradiction is the thing to fix.
+  if (pair.cash_contradicts || pair.prev_cash_contradicts === true) {
+    const which =
+      pair.cash_contradicts && pair.prev_cash_contradicts === true
+        ? "both ends of"
+        : pair.cash_contradicts
+          ? "the end of"
+          : "the start of";
+    return {
+      status: "unverified",
+      expectedChange: null,
+      computedChange: null,
+      delta: null,
+      notes:
+        `the archive holds more than one stated cash balance, disagreeing, at ` +
+        `${which} this period; refusing to pick one`,
+    };
+  }
+
   if (pair.prev_currency !== null && pair.prev_currency !== pair.currency) {
     return {
       status: "unverified",
@@ -366,8 +435,8 @@ async function sumTransactionWindows(
          WITH ORDINALITY AS w(account_id, period_start, period_end, i)
        JOIN transactions t
          ON t.account_id = w.account_id
-        AND t.process_date >= w.period_start
-        AND t.process_date <= w.period_end
+        AND ${CASH_DATE} > w.period_start
+        AND ${CASH_DATE} <= w.period_end
         AND t.amount IS NOT NULL
        GROUP BY w.i, t.currency`,
       [
@@ -409,19 +478,40 @@ async function sumTransactionWindows(
  * immediately preceding snapshot via LAG. Each pair is one statement period.
  * An account with 0 or 1 balances rows yields no periods.
  *
+ * F1-8. `balances` rows are collapsed to one per (account, as_of) before
+ * pairing. Two rows at one date used to pair with each other and produce a
+ * zero-length "period" that blamed a day's transactions for the difference
+ * between two statements of the same balance, and left the real neighbouring
+ * periods anchored on whichever of the two LAG happened to order first.
+ * Collapsing first means one snapshot per date; `cash_contradicts` carries
+ * the disagreement to `reconcilePeriod` instead of hiding it in a verdict
+ * about transactions.
+ *
  * `accountPredicate` narrows which accounts are paired at all, and nothing
  * else: one template so the incremental form cannot drift from the
  * whole-archive one. It is this file's own literal, never caller input.
  */
 function pairSql(accountPredicate: string): string {
-  return `SELECT account_id, as_of, cash, currency, prev_as_of, prev_cash, prev_currency
+  return `SELECT account_id, as_of, cash, currency, cash_contradicts,
+            prev_as_of, prev_cash, prev_currency, prev_cash_contradicts
      FROM (
        SELECT
-         account_id, as_of, cash, currency,
-         LAG(as_of) OVER (PARTITION BY account_id ORDER BY as_of) AS prev_as_of,
-         LAG(cash) OVER (PARTITION BY account_id ORDER BY as_of) AS prev_cash,
-         LAG(currency) OVER (PARTITION BY account_id ORDER BY as_of) AS prev_currency
-       FROM balances${accountPredicate}
+         account_id, as_of, cash, currency, cash_contradicts,
+         LAG(as_of) OVER w AS prev_as_of,
+         LAG(cash) OVER w AS prev_cash,
+         LAG(currency) OVER w AS prev_currency,
+         LAG(cash_contradicts) OVER w AS prev_cash_contradicts
+       FROM (
+         SELECT
+           account_id,
+           as_of,
+           CASE WHEN count(DISTINCT cash) > 1 THEN NULL ELSE min(cash) END AS cash,
+           count(DISTINCT cash) > 1 AS cash_contradicts,
+           min(currency) AS currency
+         FROM balances${accountPredicate}
+         GROUP BY account_id, as_of
+       ) AS snapshot
+       WINDOW w AS (PARTITION BY account_id ORDER BY as_of)
      ) AS paired
      WHERE prev_as_of IS NOT NULL
      ORDER BY account_id, as_of`;
@@ -494,9 +584,8 @@ async function scopedPairs(
     if (changed?.has(pair.prev_as_of) === true) return true;
     const activity = activityDates.get(pair.account_id);
     if (
-      activity?.some(
-        (date) => date >= pair.prev_as_of && date <= pair.as_of,
-      ) === true
+      activity?.some((date) => date > pair.prev_as_of && date <= pair.as_of) ===
+      true
     ) {
       return true;
     }

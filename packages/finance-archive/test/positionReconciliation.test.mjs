@@ -811,3 +811,45 @@ test(
     assert.match(run.notes, /1 of 1 period\(s\)/);
   },
 );
+
+test(
+  "F1-8: the trades of period_start belong to the period that ended there, not the one starting there",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+    await seedAccount(client, "acct_boundary");
+    await insertPosition(client, {
+      accountId: "acct_boundary",
+      asOf: "2026-01-31",
+      quantity: "100",
+    });
+    await insertPosition(client, {
+      accountId: "acct_boundary",
+      asOf: "2026-02-28",
+      quantity: "110",
+    });
+    // Already inside the 100 shares stated on 2026-01-31.
+    await insertTransaction(client, {
+      accountId: "acct_boundary",
+      processDate: "2026-01-31",
+      quantity: "5",
+    });
+    await insertTransaction(client, {
+      accountId: "acct_boundary",
+      processDate: "2026-02-10",
+      quantity: "10",
+    });
+    // History reaches back before the period, so this is not a coverage gap.
+    await insertTransaction(client, {
+      accountId: "acct_boundary",
+      processDate: "2026-01-02",
+      quantity: "1",
+    });
+
+    const summary = await runPositionReconciliationGate(client);
+    assert.equal(summary.periodsChecked, 1);
+    assert.equal(summary.passed, 1);
+    assert.equal(summary.failed, 0);
+  },
+);

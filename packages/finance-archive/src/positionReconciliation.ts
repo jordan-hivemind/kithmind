@@ -152,7 +152,8 @@ type AccountHistory = {
  * Runs the position gate over every account and instrument with two or more
  * stated `positions` snapshots, writing one `position_reconciliations` row
  * per period (period boundaries are consecutive snapshot dates for that
- * account and instrument, inclusive on both ends, matching the cash gate).
+ * account and instrument; the window between them is half-open,
+ * `(period_start, period_end]`, matching the cash gate).
  * Re-running replaces any prior row for the same account, instrument and
  * period, so it is idempotent after a corrected import.
  *
@@ -429,9 +430,8 @@ async function scopedPairs(
     if (changed?.has(pair.prev_as_of) === true) return true;
     const activity = activityDates.get(key);
     if (
-      activity?.some(
-        (date) => date >= pair.prev_as_of && date <= pair.as_of,
-      ) === true
+      activity?.some((date) => date > pair.prev_as_of && date <= pair.as_of) ===
+      true
     ) {
       return true;
     }
@@ -588,11 +588,18 @@ function isCoverageGap(history: AccountHistory, periodStart: string): boolean {
 type WindowSum = { total: string } | { error: string };
 
 /**
- * Sums signed transaction quantities in [periodStart, periodEnd] for every
+ * Sums signed transaction quantities in (periodStart, periodEnd] for every
  * period at once (F1-59), one round trip instead of one per period. An empty
  * window is a valid 0: a period with no activity should show no stated
  * change. Summed by Postgres, where NUMERIC adds exactly, and read back as
  * decimal text.
+ *
+ * F1-8. The window is half-open for the same reason the cash gate's is: a
+ * stated position is the close of business on its own date, so
+ * `periodStart`'s own trades are already inside the position stated there
+ * and counting them again double-counted every boundary day. Unlike cash,
+ * quantity is placed by `process_date` alone: a stated share count moves
+ * when the trade posts, not when its money settles.
  *
  * An ambiguous quantity the importer already sent to review is excluded
  * rather than guessed. Excluding a real movement is exactly what should
@@ -615,7 +622,7 @@ async function sumQuantityWindows(
        LEFT JOIN transactions t
          ON t.account_id = w.account_id
         AND t.instrument_id = w.instrument_id
-        AND t.process_date >= w.period_start
+        AND t.process_date > w.period_start
         AND t.process_date <= w.period_end
         AND t.quantity IS NOT NULL
        GROUP BY w.i`,
