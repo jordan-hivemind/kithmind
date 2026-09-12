@@ -622,7 +622,18 @@ export type ParsedPull = {
 
 export type InstitutionAdapter = {
   readonly institutionSlug: string;
-  discover(session: AdapterSession): Promise<DiscoverResult>;
+  /**
+   * F1-70. `kinds`, when given, scopes the document listing to those kinds
+   * alone -- an adapter that lists documents per kind (e.g. one provider
+   * call per `DiscoveredDocument.kind`) skips the kinds not named, so a
+   * failure in a listing the caller never asked for cannot mark the whole
+   * result incomplete. Omitted, discover() lists every kind exactly as
+   * before this parameter existed.
+   */
+  discover(
+    session: AdapterSession,
+    kinds?: readonly Extract<CapabilityTier, "pdf_statement" | "trade_confirmation">[],
+  ): Promise<DiscoverResult>;
   acquire(selection: AcquireSelection): Promise<AcquiredDocument>;
   parse(rawFile: RawFile): Promise<ParsedPull>;
   capabilities(): InstitutionCapabilities;

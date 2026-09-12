@@ -473,6 +473,20 @@ async function fetchWithServiceErrorRetry(call, attempts = 8) {
   throw last;
 }
 
+// F1-70. The CDP call backing a page fetch can fail with "Inspected target
+// navigated or closed" (JSON-RPC code -32000, see bridge.mjs's connectCdp)
+// when the tab is mid-navigation the instant this page happens to be
+// requested -- transient noise, not a real gap in the listing. Retried once
+// after a short pause; a second failure (this one or any other shape) still
+// propagates, and fetchDocumentsForType's own catch is what turns that into
+// an incomplete listing.
+const CDP_TARGET_GONE_RETRY_DELAY_MS = 1000;
+
+function isCdpTargetGoneError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /"code":\s*-32000/.test(message);
+}
+
 async function fetchDocumentsPages(session, docType, kind) {
   const items = [];
   const seenIds = new Set();
@@ -482,9 +496,18 @@ async function fetchDocumentsPages(session, docType, kind) {
     let yearTotal = null;
     let yearCount = 0;
     for (;;) {
-      const pageText = await fetchWithServiceErrorRetry(() =>
-        session.fetchText("/documents", { docType, timeFrame, page: String(pageNumber) }),
-      );
+      const fetchPage = () =>
+        fetchWithServiceErrorRetry(() =>
+          session.fetchText("/documents", { docType, timeFrame, page: String(pageNumber) }),
+        );
+      let pageText;
+      try {
+        pageText = await fetchPage();
+      } catch (error) {
+        if (!isCdpTargetGoneError(error)) throw error;
+        await new Promise((resolve) => setTimeout(resolve, CDP_TARGET_GONE_RETRY_DELAY_MS));
+        pageText = await fetchPage();
+      }
       const page = JSON.parse(pageText);
       const pageItems = page?.[MS_DOCUMENTS_ITEMS_KEY];
       if (!Array.isArray(pageItems)) {
@@ -609,13 +632,19 @@ async function fetchAccounts(session) {
   }
 }
 
-async function discover(session) {
+async function discover(session, kinds) {
   // Sequential on purpose: the documents service answers a transient 400 to
   // a noticeable share of concurrent calls from one session (seen live
   // 2026-09-11), so the listings run one after another, accounts first.
   const accounts = await fetchAccounts(session);
+  // F1-70. `kinds`, when given, scopes the documents listing to the doc
+  // types those kinds map to -- a failure listing TradeConfirmations must
+  // not mark the combined result incomplete for a caller that only asked
+  // discover() about pdf_statement. Omitted (or every DOCUMENT_TYPES kind
+  // named), every doc type is still listed, unchanged.
+  const wantedTypes = kinds ? DOCUMENT_TYPES.filter((t) => kinds.includes(t.kind)) : DOCUMENT_TYPES;
   const results = [];
-  for (const { docType, kind } of DOCUMENT_TYPES) {
+  for (const { docType, kind } of wantedTypes) {
     results.push(await fetchDocumentsForType(session, docType, kind));
   }
   const allItems = results.flatMap((r) => r.items);
@@ -644,12 +673,14 @@ async function discover(session) {
   }
 
   // F1-68. Each docType's own providerTotal (sum of numFound across every
-  // time frame queried for it), keyed by kind, alongside DOCUMENT_TYPES's
-  // matching order -- documents above already merges every docType into one
-  // combined listing, which is what a run needs to acquire, but a run's
+  // time frame queried for it), keyed by kind, alongside wantedTypes' own
+  // matching order (F1-70: only the kinds actually listed, so a skipped
+  // kind is simply absent here rather than reporting a total for a listing
+  // that never ran) -- documents above already merges every docType into
+  // one combined listing, which is what a run needs to acquire, but a run's
   // start-of-pull preview wants the per-kind total this loses.
   const documentListingTotalsByKind = {};
-  DOCUMENT_TYPES.forEach(({ kind }, index) => {
+  wantedTypes.forEach(({ kind }, index) => {
     documentListingTotalsByKind[kind] = results[index].providerTotal;
   });
 

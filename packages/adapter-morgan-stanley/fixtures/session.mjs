@@ -31,11 +31,14 @@ import { buildMinimalPdf } from "./pdf.mjs";
  * @param {Promise<void>} [options.documentsGateFirstCall] awaited before answering the very first /documents call, so a test can observe what has (not) run while it is pending -- proves the two document types are pulled sequentially, not concurrently
  * @param {boolean} [options.documentDownloadHtml] serve an HTML login page instead of a PDF for a document download
  * @param {boolean} [options.documentsFail] make every /documents fetch throw (e.g. the missing Authorization bearer)
+ * @param {string} [options.documentsFailDocType] make every /documents fetch for this docType alone throw the same error as `documentsFail` -- the other docType is unaffected, for F1-70's "a failing listing this pull never asked for" case
+ * @param {number} [options.documentsCdpGoneCount] make this many leading /documents calls (any docType) throw the CDP "Inspected target navigated or closed" error (JSON-RPC code -32000, see bridge.mjs's connectCdp) that adapter.mjs's fetchDocumentsPages retries once; calls after the budget is spent succeed normally
  * @param {number} [options.accountsStatus] make /accounts throw a bridge-shaped "request failed: <status> ..." error
  */
 export function createFixtureSession(options = {}) {
   const documentsMode = options.documentsMode ?? "exhaustive";
   let serviceErrorsRemaining = options.documentsServiceErrorCount ?? 0;
+  let cdpGoneRemaining = options.documentsCdpGoneCount ?? 0;
   let gatedFirstCall = false;
 
   async function fetchText(path, query = {}) {
@@ -56,8 +59,12 @@ export function createFixtureSession(options = {}) {
       // call did or did not start concurrently with it.
       options.documentsCallLog?.push({ docType: query.docType, timeFrame: query.timeFrame, page: query.page });
       if (isFirstCall && options.documentsGateFirstCall) await options.documentsGateFirstCall;
-      if (options.documentsFail) {
+      if (options.documentsFail || query.docType === options.documentsFailDocType) {
         throw new Error("request failed: 401 missing Authorization bearer (synthetic)");
+      }
+      if (cdpGoneRemaining > 0) {
+        cdpGoneRemaining -= 1;
+        throw new Error('{"code":-32000,"message":"Inspected target navigated or closed (synthetic)"}');
       }
       if (serviceErrorsRemaining > 0) {
         serviceErrorsRemaining -= 1;
