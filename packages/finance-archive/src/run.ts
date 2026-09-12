@@ -22,6 +22,18 @@
 // (FINANCE_ARCHIVE_DATABASE_URL); the raw tree write is content-addressed
 // and idempotent, and happens either way because AdapterPull.persisted can
 // only be produced by actually persisting bytes (see adapterImport.ts).
+//
+// A second subcommand, `reparse` (below "--- reparse ---"), re-runs an
+// adapter's `parse()` over documents this or an earlier run already
+// acquired and retained, with no browser and no network at all:
+//
+//   node dist/run.js reparse --adapter <module path> [--only-unparsed] [--now <iso instant>]
+//
+// It exists for exactly one situation: the extractor a document was first
+// parsed with had a defect (F1-55's PDF routing bug is the first case), the
+// defect is fixed, and the already-acquired bytes -- never re-fetched,
+// ground rule 1 -- deserve a second parse under the fixed adapter without
+// re-running discovery or acquisition against a live session.
 
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -35,6 +47,7 @@ import {
   type CapabilityTier,
   type DiscoverResult,
   type InstitutionAdapter,
+  type RetainedMediaType,
 } from "./adapter.js";
 import {
   adapterPullToImportDocuments,
@@ -43,6 +56,7 @@ import {
   resolveInstitution,
   type AdapterPull,
 } from "./adapterImport.js";
+import { readCaptureManifestById } from "./captures.js";
 import {
   publishImport,
   type ImportBatch,
@@ -54,7 +68,12 @@ import {
   withArchiveTransaction,
   type ArchiveClient,
 } from "./pgStore.js";
-import { resolveRawTreeRoot } from "./rawTree.js";
+import {
+  rawDocumentPath,
+  readAndVerify,
+  resolveRawTreeRoot,
+  writeRetainedText,
+} from "./rawTree.js";
 
 // --- selection file ----------------------------------------------------
 
@@ -651,8 +670,252 @@ function expandSelectionPulls(
   return specs;
 }
 
-async function main(): Promise<void> {
+// --- reparse ---------------------------------------------------------------
+//
+// Re-runs an adapter's `parse()` over documents this space already
+// retained, with no `discover()`/`acquire()` call and therefore no browser
+// session and no network access at all. `rawTree.ts`/`captures.ts` already
+// record everything a live pull would have handed `adapterPullToImportDocuments`:
+// the retained bytes (by `documents.retained_sha256`), and the capture that
+// acquired them (by `documents.capture_id`, `captures.ts`'s manifest --
+// institution, account, period, capability tier, retention declaration,
+// gaps). This reads both back and builds the same `AdapterPull` shape a live
+// run builds, so the reparsed document goes through the identical
+// conversion and import path (`adapterPullToImportDocuments`, `publishImport`)
+// -- under F1-49's dedupe, reimporting a document that already landed
+// everything it has is a no-op, and a still-unparsed document changes
+// nothing.
+//
+// Scoped to the two document tiers (`pdf_statement`, `trade_confirmation`):
+// each is one immutable file, one `documents` row, one `parse()` call -- the
+// shape this reparse loop assumes. A `structured_api`/`tabular_export` pull
+// can split one retained file across several `documents` rows (one per
+// page, sharing one `retained_sha256`; see `ImportDocument.retainedSha256`'s
+// doc comment), so reparsing "one row" would silently reparse every sibling
+// page's rows too. Nothing about the defect this command exists for
+// (F1-55) touches those two tiers, so they are simply left alone here
+// rather than taught a paging model reparse does not need yet.
+
+const REPARSEABLE_TIERS = new Set<CapabilityTier>(["pdf_statement", "trade_confirmation"]);
+
+type ReparseDocumentRow = {
+  readonly id: string;
+  readonly institution_id: string;
+  readonly account_id: string | null;
+  readonly doc_type: string;
+  readonly doc_date: string | null;
+  readonly file_path: string;
+  readonly sha256: string;
+  readonly retained_sha256: string;
+  readonly media_type: string;
+  readonly capture_id: string;
+};
+
+type ReparseOutcome = {
+  documentsConsidered: number;
+  documentsSkippedTier: number;
+  documentsReparsed: number;
+  documentsNowParsed: number;
+  documentsStillUnparsed: number;
+  rowsInserted: number;
+  rowsDeduplicated: number;
+  rowsRefused: number;
+  reviewItemsOpened: number;
+  reviewItemsResolved: number;
+};
+
+/**
+ * `accounts.external_key -> accounts.id` for one institution, exactly the
+ * shape `resolveDiscoveredAccounts` produces from a live `discover()` call --
+ * except read back from rows a previous run already provisioned, since
+ * reparse never discovers anything new. Cached per institution id: every
+ * document in one reparse run usually belongs to the one institution its
+ * `--adapter` names, but nothing here assumes that.
+ */
+function accountsByExternalKeyLoader(
+  client: ArchiveClient,
+): (institutionId: string) => Promise<ReadonlyMap<string, string>> {
+  const cache = new Map<string, Promise<ReadonlyMap<string, string>>>();
+  return (institutionId: string) => {
+    let cached = cache.get(institutionId);
+    if (cached === undefined) {
+      cached = client
+        .query<{ external_key: string; id: string }>(
+          "SELECT external_key, id FROM accounts WHERE institution_id = $1 AND external_key IS NOT NULL",
+          [institutionId],
+        )
+        .then((result) => new Map(result.rows.map((row) => [row.external_key, row.id])));
+      cache.set(institutionId, cached);
+    }
+    return cached;
+  };
+}
+
+async function runReparse(args: readonly string[]): Promise<void> {
   const { values } = parseArgs({
+    args: [...args],
+    options: {
+      adapter: { type: "string" },
+      "only-unparsed": { type: "boolean", default: false },
+      now: { type: "string" },
+    },
+  });
+  if (!values.adapter) throw new Error("--adapter <module path> is required");
+  const now = values.now ? new Date(values.now) : new Date();
+  if (Number.isNaN(now.getTime())) {
+    throw new Error(`--now ${values.now} is not a valid date`);
+  }
+  const onlyUnparsed = values["only-unparsed"] === true;
+
+  const adapter = await loadAdapter(values.adapter);
+  // Hard errors when unset, same as the ordinary pass above.
+  const rawTreeRoot = resolveRawTreeRoot();
+  const pgClient = createArchiveClient();
+  await pgClient.connect();
+  const capabilities = adapter.capabilities();
+  const loadAccountsByExternalKey = accountsByExternalKeyLoader(pgClient);
+
+  const outcome: ReparseOutcome = {
+    documentsConsidered: 0,
+    documentsSkippedTier: 0,
+    documentsReparsed: 0,
+    documentsNowParsed: 0,
+    documentsStillUnparsed: 0,
+    rowsInserted: 0,
+    rowsDeduplicated: 0,
+    rowsRefused: 0,
+    reviewItemsOpened: 0,
+    reviewItemsResolved: 0,
+  };
+
+  try {
+    const { rows: documents } = await pgClient.query<ReparseDocumentRow>(
+      `SELECT id, institution_id, account_id, doc_type, doc_date, file_path, sha256,
+              retained_sha256, media_type, capture_id
+       FROM documents
+       WHERE retained_sha256 IS NOT NULL${onlyUnparsed ? " AND parsed_ok = FALSE" : ""}
+       ORDER BY id`,
+    );
+    outcome.documentsConsidered = documents.length;
+
+    for (const doc of documents) {
+      // One document, one transaction: a document this reparse cannot read
+      // or import never loses another document's already-committed work,
+      // the same isolation the ordinary pass gives each document-tier pull
+      // (see `flushDocBatch` above).
+      await withArchiveTransaction(pgClient, async (tx) => {
+        const capture = readCaptureManifestById(rawTreeRoot, doc.capture_id);
+        const manifest = capture.manifest;
+        if (!REPARSEABLE_TIERS.has(manifest.capabilityTier)) {
+          outcome.documentsSkippedTier += 1;
+          return;
+        }
+
+        const bytes = readAndVerify(
+          rawDocumentPath(rawTreeRoot, doc.retained_sha256),
+          doc.retained_sha256,
+        );
+        const parsed = await adapter.parse({ kind: manifest.capabilityTier, bytes });
+        const textPath = parsed.extractedText
+          ? writeRetainedText(rawTreeRoot, parsed.extractedText).path
+          : null;
+        const accountsByExternalKey = await loadAccountsByExternalKey(doc.institution_id);
+
+        const pull: AdapterPull = {
+          institutionId: doc.institution_id,
+          accountId: doc.account_id,
+          acquired: {
+            bytes,
+            retention: manifest.retention,
+            manifest: {
+              kind: manifest.capabilityTier,
+              periodStart: manifest.periodStart,
+              periodEnd: manifest.periodEnd,
+              capturedAt: manifest.capturedAt,
+              contentHash: doc.retained_sha256,
+              mediaType: doc.media_type as RetainedMediaType,
+              // Never applicable for a single-file document-tier pull
+              // (adapter.ts's `AcquisitionManifestEntry.reportedRowCount`
+              // doc comment); the original acquisition recorded the same.
+              reportedRowCount: null,
+              gaps: manifest.gaps,
+            },
+          },
+          rows: parsed.activity,
+          holdings: parsed.holdings,
+          parseNote: parsed.parseNote,
+          docType: doc.doc_type,
+          docDate: doc.doc_date,
+          persisted: {
+            filePath: doc.file_path,
+            textPath,
+            captureId: doc.capture_id,
+            // Nothing outside `persistAcquiredDocument` reads a
+            // `PersistedAcquisition`'s write-result fields
+            // (`documentWrite`/`textWrite`/`captureWrite`/`capturePath`), but
+            // reparse writes no new capture, so these name the real capture
+            // and document already on disk (both just verified above)
+            // rather than inventing one.
+            capturePath: capture.path,
+            documentWrite: {
+              path: rawDocumentPath(rawTreeRoot, doc.retained_sha256),
+              sha256: doc.retained_sha256,
+              status: "already_exists",
+            },
+            textWrite: null,
+            captureWrite: {
+              path: capture.path,
+              status: "already_exists",
+              manifestSha256: capture.manifestSha256,
+            },
+          },
+          activityTaxonomy: capabilities.activityTaxonomy,
+          accountsByExternalKey,
+        };
+
+        const importDocuments = await adapterPullToImportDocuments(tx, pull);
+        const batch: ImportBatch = { source: adapter.institutionSlug, documents: importDocuments };
+        const summary = await publishImport(tx, batch, now);
+
+        outcome.documentsReparsed += 1;
+        if (parsed.parseNote) outcome.documentsStillUnparsed += 1;
+        else outcome.documentsNowParsed += 1;
+        outcome.rowsInserted += summary.rowsInserted;
+        outcome.rowsDeduplicated += summary.rowsDeduplicated;
+        outcome.rowsRefused += summary.rowsRefused;
+        outcome.reviewItemsOpened += summary.reviewItemsOpened;
+        outcome.reviewItemsResolved += summary.reviewItemsResolved;
+      });
+    }
+
+    printReparseSummary(outcome, onlyUnparsed);
+  } finally {
+    await closeArchiveClient(pgClient);
+  }
+}
+
+function printReparseSummary(outcome: ReparseOutcome, onlyUnparsed: boolean): void {
+  console.log(`mode: reparse${onlyUnparsed ? " (--only-unparsed)" : ""}`);
+  console.log(`documents considered: ${outcome.documentsConsidered}`);
+  console.log(`documents skipped (not a document-tier capture): ${outcome.documentsSkippedTier}`);
+  console.log(`documents reparsed: ${outcome.documentsReparsed}`);
+  console.log(`documents now parsed: ${outcome.documentsNowParsed}`);
+  console.log(`documents still unparsed: ${outcome.documentsStillUnparsed}`);
+  console.log(`rows inserted: ${outcome.rowsInserted}`);
+  console.log(`rows deduplicated: ${outcome.rowsDeduplicated}`);
+  console.log(`rows refused: ${outcome.rowsRefused}`);
+  console.log(`review items opened: ${outcome.reviewItemsOpened}`);
+  console.log(`review items resolved: ${outcome.reviewItemsResolved}`);
+}
+
+async function main(): Promise<void> {
+  const argv = process.argv.slice(2);
+  if (argv[0] === "reparse") {
+    return runReparse(argv.slice(1));
+  }
+
+  const { values } = parseArgs({
+    args: argv,
     options: {
       adapter: { type: "string" },
       session: { type: "string" },

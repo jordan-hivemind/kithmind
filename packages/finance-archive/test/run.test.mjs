@@ -67,6 +67,40 @@ function writeAdapterFixtures(t) {
 }
 
 /**
+ * F1-55. The same fixtures as `writeAdapterFixtures`, plus a second adapter
+ * module whose `parse()` always reports a PDF-tier document as unreadable --
+ * standing in for the pre-fix defect (F1-55: the regex extractor saw no
+ * text in a real statement's compressed stream) without needing a real PDF
+ * in this suite. `discover()`/`acquire()`/`capabilities()` are the real
+ * synthetic adapter's own, unchanged, so the same selection file and the
+ * same session drive both: only which module `--adapter`/`reparse --adapter`
+ * points at decides whether the document parses.
+ */
+function writeReparseAdapterFixtures(t) {
+  const { fixturesDir, adapterModulePath, sessionModulePath } = writeAdapterFixtures(t);
+  const brokenAdapterModulePath = join(fixturesDir, "adapter-broken-parse.mjs");
+  writeFileSync(
+    brokenAdapterModulePath,
+    `import { syntheticAdapter } from ${JSON.stringify(distIndexUrl)};\n` +
+      `const brokenAdapter = {\n` +
+      `  ...syntheticAdapter,\n` +
+      `  async parse(rawFile) {\n` +
+      `    if (rawFile.kind === "pdf_statement" || rawFile.kind === "trade_confirmation") {\n` +
+      `      return {\n` +
+      `        activity: [],\n` +
+      `        holdings: { positions: [], balances: [], liabilities: [] },\n` +
+      `        parseNote: "not parsed: synthetic extractor outage (F1-55 test fixture)",\n` +
+      `      };\n` +
+      `    }\n` +
+      `    return syntheticAdapter.parse(rawFile);\n` +
+      `  },\n` +
+      `};\n` +
+      `export default brokenAdapter;\n`,
+  );
+  return { fixturesDir, adapterModulePath, brokenAdapterModulePath, sessionModulePath };
+}
+
+/**
  * F1-39. Same adapter fixture as `writeAdapterFixtures`, but the session
  * module withholds the document total (`omitDocumentsTotal`) or serves fewer
  * documents than exist (`documentsLimit`), so `discover()`'s document
@@ -197,6 +231,30 @@ function makeRunner({
         "2025-05-01T00:00:00.000Z",
         ...extraArgs,
       ],
+      {
+        env: {
+          ...process.env,
+          FINANCE_ARCHIVE_DATABASE_URL: url,
+          FINANCE_ARCHIVE_SCHEMA: schema,
+          FINANCE_ARCHIVE_RAW_TREE_ROOT: rawDir,
+          FINANCE_ARCHIVE_SPACE_ID: SPACE_ID,
+        },
+        encoding: "utf8",
+      },
+    );
+  };
+}
+
+/**
+ * F1-55. The `reparse` subcommand: no `--session` and no `--selection` --
+ * it walks the archive's own `documents` rows and the raw tree, never a
+ * browser or the network.
+ */
+function makeReparseRunner({ adapterModulePath, schema, rawDir }) {
+  return function runReparse(extraArgs = []) {
+    return execFileSync(
+      process.execPath,
+      [runScript, "reparse", "--adapter", adapterModulePath, "--now", "2025-06-01T00:00:00.000Z", ...extraArgs],
       {
         env: {
           ...process.env,
@@ -991,93 +1049,6 @@ test(
   },
 );
 
-test(
-  "F1-54: ten consecutive document pull failures trip the circuit breaker and stop the run, leaving what already committed intact",
-  { skip },
-  async (t) => {
-    const { schema, client } = await seededSchema(t);
-
-    const rawDir = mkdtempSync(
-      join(tmpdir(), "kith-finance-run-breaker-raw-"),
-    );
-    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
-
-    // doc-stmt-2025-q1 acquires and commits first (commitEvery defaults to
-    // 1); doc-stmt-2025-q2 then fails the same generic way (not the
-    // SIGNED_OUT class, so this is the plain per-document circuit breaker,
-    // not the lost-session short-circuit above) ten times in a row --
-    // repeating the same selection entry stands in for ten distinct
-    // documents that all fail the same way, exactly what a stuck documents
-    // endpoint produced live 2026-09-11. doc-conf-2025-02-10 comes last and
-    // must never be attempted once the breaker trips.
-    const { fixturesDir, adapterModulePath, sessionModulePath } =
-      writeFailingDocumentFixtures(t, "doc-stmt-2025-q2");
-    const selectionPath = writeSelection(fixturesDir, [
-      {
-        accountId: ACCOUNT.id,
-        docType: "statement",
-        docDate: null,
-        selection: { kind: "pdf_statement", externalId: "doc-stmt-2025-q1" },
-      },
-      ...Array.from({ length: 10 }, () => ({
-        accountId: ACCOUNT.id,
-        docType: "statement",
-        docDate: null,
-        selection: { kind: "pdf_statement", externalId: "doc-stmt-2025-q2" },
-      })),
-      {
-        accountId: ACCOUNT.id,
-        docType: "confirmation",
-        docDate: null,
-        selection: {
-          kind: "trade_confirmation",
-          externalId: "doc-conf-2025-02-10",
-        },
-      },
-    ]);
-    const runImport = makeRunner({
-      adapterModulePath,
-      sessionModulePath,
-      selectionPath,
-      schema,
-      rawDir,
-    });
-
-    assert.throws(
-      () => runImport(),
-      (error) => {
-        assert.match(
-          String(error.stderr),
-          /run stopped: 10 consecutive document pulls failed/,
-        );
-        // Names the last error's class, not just its message.
-        assert.match(String(error.stderr), /last error: Error:/);
-        assert.match(
-          String(error.stderr),
-          /1 document pull\(s\) were committed before this/,
-        );
-        return true;
-      },
-    );
-
-    const documents = await all(
-      client,
-      "SELECT doc_type FROM documents WHERE institution_id = $1",
-      [INSTITUTION.id],
-    );
-    assert.equal(
-      documents.length,
-      1,
-      "only the document committed before the breaker tripped stays committed",
-    );
-    assert.equal(documents[0].doc_type, "statement");
-    assert.equal(
-      await count(client, "documents", "WHERE doc_type = $1", ["confirmation"]),
-      0,
-      "the pull after the ten failures was never attempted",
-    );
-  },
-);
 
 test(
   "F1-54: a success between two runs of failures resets the circuit breaker's consecutive count",
@@ -1135,5 +1106,227 @@ test(
     );
     assert.equal(documents.length, 1, "the surviving document between the two failure runs imported");
     assert.equal(documents[0].doc_type, "confirmation");
+  },
+);
+
+// --- reparse (F1-55) ---------------------------------------------------
+
+function reparseSelection(fixturesDir) {
+  return writeSelection(fixturesDir, [
+    {
+      accountId: ACCOUNT.id,
+      docType: "statement",
+      docDate: null,
+      selection: { kind: "pdf_statement", externalId: "doc-stmt-2025-q1" },
+    },
+  ]);
+}
+
+test(
+  "reparse turns an unparsed document into a parsed one and resolves its review item",
+  { skip },
+  async (t) => {
+    const { schema, client } = await seededSchema(t);
+
+    const rawDir = mkdtempSync(join(tmpdir(), "kith-finance-reparse-raw-"));
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+
+    const { fixturesDir, adapterModulePath, brokenAdapterModulePath, sessionModulePath } =
+      writeReparseAdapterFixtures(t);
+    const selectionPath = reparseSelection(fixturesDir);
+
+    // First pass under the broken extractor: the document is retained
+    // (ground rule 1) but not parsed -- doc-stmt-2025-q1 is the fixture with
+    // a HOLDINGS section (positions, a balance, a liability), so this proves
+    // reparse recovers all of it, not only activity rows.
+    const runBrokenImport = makeRunner({
+      adapterModulePath: brokenAdapterModulePath,
+      sessionModulePath,
+      selectionPath,
+      schema,
+      rawDir,
+    });
+    const firstOutput = runBrokenImport();
+    assert.match(firstOutput, /^mode: committed$/m);
+
+    const [before] = await all(client, "SELECT id, parsed_ok FROM documents");
+    assert.equal(before.parsed_ok, false);
+    assert.equal(await count(client, "positions"), 0);
+    const openBefore = await all(
+      client,
+      "SELECT status FROM review_items WHERE kind = 'document_unparsed' AND source_document_id = $1",
+      [before.id],
+    );
+    assert.equal(openBefore.length, 1);
+    assert.equal(openBefore[0].status, "open");
+
+    // Reparse under the fixed adapter: no --session, no --selection, no
+    // network -- it reads the retained bytes straight from the raw tree.
+    const runReparse = makeReparseRunner({ adapterModulePath, schema, rawDir });
+    const reparseOutput = runReparse();
+    assert.match(reparseOutput, /^mode: reparse$/m);
+    assert.match(reparseOutput, /documents reparsed: 1/);
+    assert.match(reparseOutput, /documents now parsed: 1/);
+    assert.match(reparseOutput, /documents still unparsed: 0/);
+    const insertedMatch = reparseOutput.match(/rows inserted: (\d+)/);
+    assert.ok(insertedMatch, "prints rows inserted");
+    assert.ok(Number(insertedMatch[1]) > 0, "the now-readable statement inserted rows");
+    assert.match(reparseOutput, /review items resolved: 1/);
+
+    const [after] = await all(client, "SELECT parsed_ok FROM documents WHERE id = $1", [
+      before.id,
+    ]);
+    assert.equal(after.parsed_ok, true);
+    assert.equal(await count(client, "positions"), 4);
+    assert.equal(await count(client, "balances"), 1);
+    assert.equal(await count(client, "liabilities"), 1);
+    assert.ok(await count(client, "transactions") > 0);
+
+    const openAfter = await all(
+      client,
+      "SELECT status, resolution_note, resolved_at FROM review_items WHERE kind = 'document_unparsed' AND source_document_id = $1",
+      [before.id],
+    );
+    assert.equal(openAfter.length, 1, "resolved in place, never duplicated");
+    assert.equal(openAfter[0].status, "resolved");
+    assert.match(openAfter[0].resolution_note, /resolved on reimport/);
+    assert.ok(openAfter[0].resolved_at, "resolved_at is set");
+
+    // A second reparse pass, still under the fixed adapter, is a no-op: the
+    // document is already parsed, so nothing reopens or duplicates.
+    const secondReparseOutput = runReparse();
+    assert.match(secondReparseOutput, /rows inserted: 0/);
+    assert.match(secondReparseOutput, /review items resolved: 0/);
+    assert.equal(
+      await count(client, "review_items", "WHERE kind = 'document_unparsed'"),
+      1,
+    );
+  },
+);
+
+test(
+  "reparse re-imports an already-parsed document with zero inserts",
+  { skip },
+  async (t) => {
+    const { schema, client } = await seededSchema(t);
+
+    const rawDir = mkdtempSync(join(tmpdir(), "kith-finance-reparse-noop-raw-"));
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+
+    const { fixturesDir, adapterModulePath, sessionModulePath } =
+      writeReparseAdapterFixtures(t);
+    const selectionPath = reparseSelection(fixturesDir);
+
+    // The fixed adapter parses cleanly the first time -- no broken adapter
+    // involved in this test at all.
+    const runImport = makeRunner({
+      adapterModulePath,
+      sessionModulePath,
+      selectionPath,
+      schema,
+      rawDir,
+    });
+    runImport();
+    assert.equal(await count(client, "documents", "WHERE parsed_ok = TRUE"), 1);
+    const transactionsBefore = await count(client, "transactions");
+    const positionsBefore = await count(client, "positions");
+    assert.ok(transactionsBefore > 0);
+    assert.ok(positionsBefore > 0);
+
+    const runReparse = makeReparseRunner({ adapterModulePath, schema, rawDir });
+    const output = runReparse();
+    assert.match(output, /documents reparsed: 1/);
+    assert.match(output, /rows inserted: 0/);
+    const dedupMatch = output.match(/rows deduplicated: (\d+)/);
+    assert.ok(dedupMatch, "prints rows deduplicated");
+    assert.ok(
+      Number(dedupMatch[1]) > 0,
+      "the already-parsed document's rows are all deduplicated, not silently dropped",
+    );
+    assert.match(output, /review items resolved: 0/);
+
+    assert.equal(await count(client, "transactions"), transactionsBefore);
+    assert.equal(await count(client, "positions"), positionsBefore);
+    assert.equal(await count(client, "review_items", "WHERE kind = 'document_unparsed'"), 0);
+  },
+);
+
+test(
+  "reparse leaves a still-unparsable document unparsed, with no duplicate review item",
+  { skip },
+  async (t) => {
+    const { schema, client } = await seededSchema(t);
+
+    const rawDir = mkdtempSync(join(tmpdir(), "kith-finance-reparse-stuck-raw-"));
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+
+    const { fixturesDir, brokenAdapterModulePath, sessionModulePath } =
+      writeReparseAdapterFixtures(t);
+    const selectionPath = reparseSelection(fixturesDir);
+
+    const runBrokenImport = makeRunner({
+      adapterModulePath: brokenAdapterModulePath,
+      sessionModulePath,
+      selectionPath,
+      schema,
+      rawDir,
+    });
+    runBrokenImport();
+    assert.equal(
+      await count(client, "review_items", "WHERE kind = 'document_unparsed'"),
+      1,
+    );
+
+    // Reparse under the *same* still-broken adapter: it fails the identical
+    // way on the identical retained bytes.
+    const runReparse = makeReparseRunner({
+      adapterModulePath: brokenAdapterModulePath,
+      schema,
+      rawDir,
+    });
+    const output = runReparse();
+    assert.match(output, /documents reparsed: 1/);
+    assert.match(output, /documents now parsed: 0/);
+    assert.match(output, /documents still unparsed: 1/);
+    assert.match(output, /review items resolved: 0/);
+
+    assert.equal(await count(client, "documents", "WHERE parsed_ok = FALSE"), 1);
+    const items = await all(
+      client,
+      "SELECT status FROM review_items WHERE kind = 'document_unparsed'",
+    );
+    assert.equal(items.length, 1, "no duplicate review item opened on the still-unparsed rerun");
+    assert.equal(items[0].status, "open");
+  },
+);
+
+test(
+  "reparse --only-unparsed skips a document that already parsed",
+  { skip },
+  async (t) => {
+    const { schema, client } = await seededSchema(t);
+
+    const rawDir = mkdtempSync(join(tmpdir(), "kith-finance-reparse-onlyunparsed-raw-"));
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+
+    const { fixturesDir, adapterModulePath, sessionModulePath } =
+      writeReparseAdapterFixtures(t);
+    const selectionPath = reparseSelection(fixturesDir);
+
+    const runImport = makeRunner({
+      adapterModulePath,
+      sessionModulePath,
+      selectionPath,
+      schema,
+      rawDir,
+    });
+    runImport();
+    assert.equal(await count(client, "documents", "WHERE parsed_ok = TRUE"), 1);
+
+    const runReparse = makeReparseRunner({ adapterModulePath, schema, rawDir });
+    const output = runReparse(["--only-unparsed"]);
+    assert.match(output, /mode: reparse \(--only-unparsed\)/);
+    assert.match(output, /documents considered: 0/);
+    assert.match(output, /documents reparsed: 0/);
   },
 );

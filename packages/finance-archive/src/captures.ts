@@ -281,6 +281,51 @@ export function writeCaptureManifest(
   }
 }
 
+/** What `readCaptureManifestById` found: the verified manifest, the
+ * canonical partitioned path it lives at, and that file's own content hash
+ * (its manifest's `manifestSha256`, matching `CaptureWriteResult`) -- so a
+ * caller that goes on to build a synthetic `PersistedAcquisition` (the
+ * reparse operator command) can cite the real, already-written capture
+ * record rather than inventing one. */
+export type CaptureManifestLookup = {
+  readonly manifest: CaptureManifest;
+  readonly path: string;
+  readonly manifestSha256: string;
+};
+
+/**
+ * Reads a capture manifest knowing only its id (`documents.capture_id`),
+ * via the space-wide `.by-id` index (above): a hard link to the canonical
+ * partitioned file, so its bytes -- and therefore its hash and content --
+ * are identical. The canonical path itself is only knowable from the
+ * manifest's own `sourceId`/`capturedAt`, which is why this reads the index
+ * copy first rather than asking the caller to already know the partition.
+ * Delegates to `readCaptureManifest` for the full verification (schema,
+ * hash, partition, retained document) once that path is reconstructed, so a
+ * capture found this way is checked exactly as strictly as one found by
+ * walking the tree.
+ *
+ * The reparse operator command (run.ts) is the intended caller: it knows a
+ * document's `capture_id` from the archive database, not the source/month
+ * partition the capture was originally filed under.
+ */
+export function readCaptureManifestById(root: string, captureId: string): CaptureManifestLookup {
+  const indexPath = join(
+    root,
+    "captures",
+    CAPTURE_INDEX_DIR,
+    assertArchiveSegment(captureId, "capture id"),
+  );
+  const indexBytes = readFileSync(indexPath);
+  const parsed = parseManifest(indexPath, indexBytes);
+  const manifestSha256 = sha256HexOf(indexBytes);
+  const path = join(
+    captureDir(root, parsed.sourceId, parsed.capturedAt),
+    `${parsed.captureId}-${manifestSha256}.json`,
+  );
+  return { manifest: readCaptureManifest(path), path, manifestSha256 };
+}
+
 function isSegment(value: unknown): boolean {
   return typeof value === "string" && ARCHIVE_SEGMENT.test(value);
 }

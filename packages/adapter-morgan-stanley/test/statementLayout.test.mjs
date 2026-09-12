@@ -47,6 +47,15 @@ test("a compressed content stream reads only through pdfjs, which is the whole p
   assert.deepEqual(trimmed(await extractStatementText(compressed)), lines);
 });
 
+test("a TJ-array, compressed content stream extracts through pdfjs (F1-55)", async () => {
+  const lines = STATEMENT_LINES.split("\n");
+  const pdf = buildMinimalPdf(lines, { compress: true, useTJ: true });
+  // TJ (not Tj) with a kerning number between two string pieces is what a
+  // real generator emits; a plain Tj fixture never exercises this path.
+  assert.equal(extractWithTjScan(pdf), null);
+  assert.deepEqual(trimmed(await extractStatementText(pdf)), lines);
+});
+
 test("compressed and uncompressed bytes of the same content extract to the same text", async () => {
   const lines = STATEMENT_LINES.split("\n");
   const plain = await extractStatementText(buildMinimalPdf(lines));
