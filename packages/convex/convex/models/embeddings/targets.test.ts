@@ -207,6 +207,16 @@ async function recount(seeded: Seeded, fingerprint: string) {
   });
 }
 
+async function historicalCounts(seeded: Seeded) {
+  return await seeded.t.run(async (ctx) => {
+    const state = await ctx.db
+      .query("spaceEmbeddingStates")
+      .withIndex("by_spaceId", (q) => q.eq("spaceId", seeded.spaceId))
+      .unique();
+    return state?.historicalThoughtCounts;
+  });
+}
+
 async function storedCounters(seeded: Seeded, fingerprint: string) {
   return await seeded.t.run(async (ctx) => {
     const state = await ctx.db
@@ -1337,6 +1347,57 @@ describe("embedding target table and resumable builder", () => {
     expect((await storedCounters(seeded, fingerprint)).covered).toEqual({
       thought: 1,
       chunk: 4,
+      card: 0,
+    });
+  }, 60_000);
+
+  test("the scan seeds the historical thought counts and writes maintain them", async () => {
+    const seeded = await seedSpace();
+    const fingerprint = await baselineFingerprint();
+    const current = await addThought(seeded, "a current memory");
+    await addThought(seeded, "another current memory");
+    await seeded.t.run(async (ctx) => {
+      for (const status of ["superseded", "retracted"] as const) {
+        await ctx.db.insert("thoughts", {
+          userId: seeded.userId,
+          spaceId: seeded.spaceId,
+          content: `a ${status} memory`,
+          embedding: vector,
+          metadata,
+          memoryStatus: status,
+        });
+      }
+    });
+
+    const job = await seeded.t.mutation(
+      internal.models.embeddings.migrations.startTargetBackfill,
+      { spaceId: seeded.spaceId, fingerprint, now: 1 },
+    );
+    stubEmbeddingProvider();
+    await drive(seeded, job.jobId!, { batchSize: 8 });
+    expect(await historicalCounts(seeded)).toEqual({
+      superseded: 1,
+      retracted: 1,
+    });
+
+    await activateFingerprint(seeded, fingerprint);
+    await seeded.t.run(async (ctx) => {
+      await ctx.db.patch(current, { memoryStatus: "superseded" as const });
+      await bumpEmbeddingEligibilityEpoch(ctx, seeded.spaceId, {
+        thoughtIds: [current],
+      });
+      // Replaying the same eligibility write counts the transition once.
+      await bumpEmbeddingEligibilityEpoch(ctx, seeded.spaceId, {
+        thoughtIds: [current],
+      });
+    });
+    expect(await historicalCounts(seeded)).toEqual({
+      superseded: 2,
+      retracted: 1,
+    });
+    expect((await storedCounters(seeded, fingerprint)).eligible).toEqual({
+      thought: 1,
+      chunk: 0,
       card: 0,
     });
   }, 60_000);

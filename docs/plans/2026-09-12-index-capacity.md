@@ -463,6 +463,16 @@ concurrency retries appear in the growth test, split the counters into a small
 fixed number of shards summed on read. Sharding is not built before it is
 needed.
 
+As implemented in P2-6f:
+
+| Detail                  | Decision                                                                                                                                                                                                    |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Which counters          | The current total is `eligibleCounts.thought`, because a thought target is eligible exactly when its thought is lifecycle-current. Only the superseded and retracted buckets needed a counter of their own. |
+| Where they are seeded   | The scan phase, which already visits every thought in the space once. A space counted before P2-6f keeps the bounded scan until its next backfill scan seeds the historical buckets.                        |
+| What the total means    | Lifecycle-current memories. A counter cannot apply a business-time validity window, which no write touches, so a scheduled or lapsed memory now counts toward the total.                                    |
+| The remaining scan      | The digest only, bounded at 128 thought rows on a counted space, reported as `partial` when the bound binds rather than failing the read. P1-12 replaces it.                                                |
+| Convex has no row count | There is no index-only count and no projection: any read of a thought row loads its legacy vector. A counter is the only bounded means, so unseeded spaces keep the legacy bounded scan until P2-6g.        |
+
 ## 7. Test plan
 
 | Test                       | Setup                                                                  | Assertion                                                                                                                                                                                                                                                                                   |
