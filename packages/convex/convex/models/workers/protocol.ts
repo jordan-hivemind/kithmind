@@ -137,6 +137,12 @@ export type FsDiscoveryEntry = {
         normalizationFingerprint: string;
         chunkerFingerprint: string;
         correctionRevision: string;
+        // P2-77: set when the PDF's only encryption is a permissions
+        // restriction whose empty user password validated against the
+        // standard security handler. `encryptionRevision` is the handler
+        // revision (2-6) that validated. Absent for an unencrypted PDF.
+        permissionsRestricted?: boolean;
+        encryptionRevision?: number;
       };
 };
 
@@ -1039,6 +1045,11 @@ function optionalString(
   return value === undefined ? undefined : string(value, options);
 }
 
+function optionalBoolean(value: unknown): boolean {
+  if (typeof value !== "boolean") return invalid();
+  return value;
+}
+
 function integer(value: unknown, minimum: number, maximum: number): number {
   if (
     typeof value !== "number" ||
@@ -1172,23 +1183,41 @@ function discoveryEntry(value: unknown, mode: "normal" | "identity_recovery") {
       byteLength: integer(contentInput.byteLength, 1, 65_536),
     };
   } else if (contentInput.status === "ready_binary_v1") {
-    exactKeys(contentInput, [
-      "status",
-      "sha256",
-      "byteLength",
-      "mediaType",
-      "parserProfileId",
-      "parserFingerprint",
-      "extractionConfigurationFingerprint",
-      "extractorFingerprint",
-      "recordSchemaFingerprint",
-      "normalizationFingerprint",
-      "chunkerFingerprint",
-      "correctionRevision",
-    ]);
+    exactKeys(
+      contentInput,
+      [
+        "status",
+        "sha256",
+        "byteLength",
+        "mediaType",
+        "parserProfileId",
+        "parserFingerprint",
+        "extractionConfigurationFingerprint",
+        "extractorFingerprint",
+        "recordSchemaFingerprint",
+        "normalizationFingerprint",
+        "chunkerFingerprint",
+        "correctionRevision",
+      ],
+      ["permissionsRestricted", "encryptionRevision"],
+    );
     if (
       contentInput.mediaType !== "application/pdf" ||
       contentInput.parserProfileId !== "pdf_docqa_v1"
+    ) {
+      invalid();
+    }
+    const permissionsRestricted =
+      contentInput.permissionsRestricted === undefined
+        ? undefined
+        : optionalBoolean(contentInput.permissionsRestricted);
+    const encryptionRevision =
+      contentInput.encryptionRevision === undefined
+        ? undefined
+        : integer(contentInput.encryptionRevision, 2, 6);
+    if (
+      (permissionsRestricted === undefined) !==
+      (encryptionRevision === undefined)
     ) {
       invalid();
     }
@@ -1224,6 +1253,9 @@ function discoveryEntry(value: unknown, mode: "normal" | "identity_recovery") {
       correctionRevision: string(contentInput.correctionRevision, {
         maxUtf8: 1_024,
       }),
+      ...(permissionsRestricted === undefined
+        ? {}
+        : { permissionsRestricted, encryptionRevision }),
     };
   } else if (contentInput.status === "gap") {
     exactKeys(contentInput, ["status", "code"]);

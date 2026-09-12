@@ -555,6 +555,12 @@ function observationPlan(
     normalizationFingerprint: config.profile.normalizationFingerprint,
     chunkerFingerprint: config.profile.chunkerFingerprint,
     correctionRevision: config.profile.correctionRevision,
+    ...(observation.file.permissionsRestricted === undefined
+      ? {}
+      : {
+          permissionsRestricted: observation.file.permissionsRestricted,
+          encryptionRevision: observation.file.encryptionRevision,
+        }),
   };
 }
 
@@ -599,6 +605,12 @@ function scanEntry(
         normalizationFingerprint: plan.normalizationFingerprint,
         chunkerFingerprint: plan.chunkerFingerprint,
         correctionRevision: plan.correctionRevision,
+        ...(plan.permissionsRestricted === undefined
+          ? {}
+          : {
+              permissionsRestricted: plan.permissionsRestricted,
+              encryptionRevision: plan.encryptionRevision,
+            }),
       },
     };
   }
