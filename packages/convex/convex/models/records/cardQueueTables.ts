@@ -23,12 +23,18 @@ export const cardExtractionQueuePhaseValidator = v.union(
 /**
  * `manual` is an operator-initiated pause, only lifted by `resumeExtractionQueue`.
  * The three budget reasons self-clear the next time their window rolls over.
+ * `provider_error` does not self-clear either: it means the ladder itself
+ * threw (a runner or provider failure, not an ordinary gate rejection) on
+ * `MAX_CONSECUTIVE_TICK_FAILURES` documents in a row, so a systemic problem
+ * (a misconfigured request, an outage) does not silently burn through the
+ * rest of the backlog marking every remaining document failed.
  */
 export const cardExtractionQueuePauseReasonValidator = v.union(
   v.literal("manual"),
   v.literal("daily_document_budget"),
   v.literal("weekly_document_budget"),
   v.literal("weekly_cost_budget"),
+  v.literal("provider_error"),
 );
 
 export const cardExtractionQueueStateFields = {
@@ -59,6 +65,25 @@ export const cardExtractionQueueStateFields = {
   extractedCount: v.number(),
   gateFailedCount: v.number(),
   skippedCount: v.number(),
+  /**
+   * A ladder run that raised instead of returning an outcome: the runner or
+   * the provider it called failed outright (a non-2xx response, a timeout,
+   * a malformed reply), as opposed to `gateFailedCount`, which also counts a
+   * ladder run that returned normally but never produced a card. Optional
+   * because rows written before this counter existed have neither it nor a
+   * need for it: they predate a run that could ever raise this outcome.
+   */
+  providerFailedCount: v.optional(v.number()),
+  /**
+   * How many ticks in a row just raised, reset to 0 by any tick that
+   * completes without raising. Drives the `provider_error` pause at
+   * `MAX_CONSECUTIVE_TICK_FAILURES`. Optional for the same reason as
+   * `providerFailedCount`.
+   */
+  consecutiveFailures: v.optional(v.number()),
+  /** The most recent raised tick's sanitized error code, cleared (patched to
+   * `undefined`) the next time a tick completes without raising. */
+  lastErrorCode: v.optional(v.string()),
   pauseReason: v.optional(cardExtractionQueuePauseReasonValidator),
   resumeAt: v.optional(v.number()),
   startedAt: v.number(),

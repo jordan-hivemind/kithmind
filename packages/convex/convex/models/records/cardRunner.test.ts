@@ -8,6 +8,8 @@ import {
   CARD_EXTRACTION_ENDPOINT,
 } from "../../lib/cardExtractionProvider";
 
+import { CARD_RECORD_KINDS } from "./cardSchemas";
+
 import {
   CARD_EXTRACTION_TOOL_NAME,
   CARD_MODEL_PRICES,
@@ -18,6 +20,7 @@ import {
   CARD_UNTRUSTED_INPUT_STATEMENT,
   buildCardExtractionRequest,
   cardAttemptCostMicroUsd,
+  cardExtractionInputSchema,
   hostedCardRunner,
   hostedCardRunners,
   localCardRunner,
@@ -377,5 +380,123 @@ describe("vendor selection", () => {
       config: { endpoint: "https://api.anthropic.com/v1/messages" },
     });
     expect(runner.modelId).toBe(CARD_TIER0_MODEL);
+  });
+});
+
+/**
+ * Recursively checks every object node of a JSON Schema against OpenAI's
+ * strict structured-output rules: `additionalProperties: false` and every
+ * key of `properties` also present in `required`, at every level, since a
+ * strict violation anywhere (not just at the root) gets every OpenAI call
+ * rejected with a 400 before a token is billed.
+ */
+function assertStrictObjectSchema(schema: unknown, path: string): void {
+  if (Array.isArray(schema)) {
+    schema.forEach((entry, index) =>
+      assertStrictObjectSchema(entry, `${path}[${index}]`),
+    );
+    return;
+  }
+  if (!schema || typeof schema !== "object") return;
+  const node = schema as Record<string, unknown>;
+  if (node.properties && typeof node.properties === "object") {
+    const properties = node.properties as Record<string, unknown>;
+    const propertyKeys = Object.keys(properties);
+    expect(node.additionalProperties, `${path}.additionalProperties`).toBe(
+      false,
+    );
+    expect(Array.isArray(node.required), `${path}.required is an array`).toBe(
+      true,
+    );
+    const required = node.required as unknown[];
+    expect(required.sort(), `${path}.required lists every property`).toEqual(
+      [...propertyKeys].sort(),
+    );
+    for (const [key, value] of Object.entries(properties)) {
+      assertStrictObjectSchema(value, `${path}.properties.${key}`);
+    }
+  }
+  if (node.items !== undefined) {
+    assertStrictObjectSchema(node.items, `${path}.items`);
+  }
+}
+
+describe("the OpenAI strict-mode schema", () => {
+  test("every object node satisfies strict mode for every card kind", () => {
+    for (const kind of CARD_RECORD_KINDS) {
+      assertStrictObjectSchema(cardExtractionInputSchema(kind), kind);
+    }
+  });
+
+  test("an optional property is a required null union, not an omission", () => {
+    const schema = cardExtractionInputSchema("document_card") as {
+      properties: {
+        fields: {
+          items: {
+            required: string[];
+            properties: {
+              ordinal: { type: string[] };
+              value: {
+                required: string[];
+                properties: { amount: { type: string[] } };
+              };
+            };
+          };
+        };
+      };
+    };
+    const fieldItem = schema.properties.fields.items;
+    expect(fieldItem.required).toContain("ordinal");
+    expect(fieldItem.properties.ordinal.type).toEqual(["integer", "null"]);
+    expect(fieldItem.properties.value.required).toContain("amount");
+    expect(fieldItem.properties.value.properties.amount.type).toEqual([
+      "string",
+      "null",
+    ]);
+  });
+});
+
+describe("parsing treats an explicit null exactly like an absent property", () => {
+  test("null spans, ordinal and value fields are dropped, not kept as null", () => {
+    const withNulls = parseCardRunnerCandidate(
+      {
+        anchor: [{ pageOrdinal: 0, quote: "Mutual", start: null, end: null }],
+        fields: [
+          {
+            field: "card_title",
+            ordinal: null,
+            value: {
+              type: "text",
+              value: "Mutual",
+              booleanValue: null,
+              amount: null,
+              currency: null,
+              unitCode: null,
+            },
+            spans: [{ pageOrdinal: 0, quote: "Mutual", start: null, end: null }],
+          },
+        ],
+      },
+      "document_card",
+    );
+    const omitted = parseCardRunnerCandidate(
+      {
+        anchor: [{ pageOrdinal: 0, quote: "Mutual" }],
+        fields: [
+          {
+            field: "card_title",
+            value: { type: "text", value: "Mutual" },
+            spans: [{ pageOrdinal: 0, quote: "Mutual" }],
+          },
+        ],
+      },
+      "document_card",
+    );
+    expect(withNulls).toEqual(omitted);
+    expect(withNulls.fields[0]).toEqual({
+      field: "card_title",
+      value: { type: "text", value: "Mutual" },
+      spans: [{ pageOrdinal: 0, quote: "Mutual" }],
+    });
   });
 });

@@ -338,6 +338,22 @@ export function cardExtractionSystemPrompt(kind: CardRecordKind): string {
   ].join("\n");
 }
 
+/**
+ * OpenAI's strict structured-output mode (`strict: true` in
+ * `openAICardExtractionBody`) requires every key in an object's `properties`
+ * to also appear in its `required` array, recursively, at every level a
+ * schema nests to: there is no "optional property" in strict mode, only a
+ * required one whose type admits `null`. The model then sends an explicit
+ * `null` for what would otherwise have been an omitted key.
+ *
+ * `parseCardRunnerCandidate` below (via `parseSpans` and `parseValue`) never
+ * needs a separate branch for that: every check there narrows a specific JS
+ * type (`typeof x === "string"`, `typeof x === "number"`, and so on), and
+ * `null` satisfies none of them, so a `null` is already read exactly like an
+ * absent property. Anthropic's tool schema is unaffected by the same
+ * `required` list: an Anthropic runner still may simply omit an optional
+ * key, which those same `typeof` checks also accept.
+ */
 export function cardExtractionInputSchema(
   kind: CardRecordKind,
 ): Record<string, unknown> {
@@ -345,12 +361,12 @@ export function cardExtractionInputSchema(
   const spanSchema = {
     type: "object",
     additionalProperties: false,
-    required: ["pageOrdinal"],
+    required: ["pageOrdinal", "quote", "start", "end"],
     properties: {
       pageOrdinal: { type: "integer", minimum: 0 },
-      quote: { type: "string" },
-      start: { type: "integer", minimum: 0 },
-      end: { type: "integer", minimum: 1 },
+      quote: { type: ["string", "null"] },
+      start: { type: ["integer", "null"], minimum: 0 },
+      end: { type: ["integer", "null"], minimum: 1 },
     },
   };
   return {
@@ -364,14 +380,21 @@ export function cardExtractionInputSchema(
         items: {
           type: "object",
           additionalProperties: false,
-          required: ["field", "value", "spans"],
+          required: ["field", "ordinal", "value", "spans"],
           properties: {
             field: { type: "string", enum: specs.map((spec) => spec.field) },
-            ordinal: { type: "integer", minimum: 0 },
+            ordinal: { type: ["integer", "null"], minimum: 0 },
             value: {
               type: "object",
               additionalProperties: false,
-              required: ["type"],
+              required: [
+                "type",
+                "value",
+                "booleanValue",
+                "amount",
+                "currency",
+                "unitCode",
+              ],
               properties: {
                 type: {
                   type: "string",
@@ -387,12 +410,15 @@ export function cardExtractionInputSchema(
                 value: {
                   description:
                     "text, date, decimal and integer values, as a string; boolean values use booleanValue",
-                  type: "string",
+                  type: ["string", "null"],
                 },
-                booleanValue: { type: "boolean" },
-                amount: { type: "string" },
-                currency: { type: "string", enum: [...SUPPORTED_CURRENCIES] },
-                unitCode: { type: "string" },
+                booleanValue: { type: ["boolean", "null"] },
+                amount: { type: ["string", "null"] },
+                currency: {
+                  type: ["string", "null"],
+                  enum: [...SUPPORTED_CURRENCIES, null],
+                },
+                unitCode: { type: ["string", "null"] },
               },
             },
             spans: { type: "array", minItems: 1, items: spanSchema },

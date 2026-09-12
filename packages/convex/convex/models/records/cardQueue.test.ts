@@ -27,6 +27,7 @@ import {
 } from "./cardRunner";
 import {
   claimNextForExtraction,
+  classifyQueueTickFailure,
   recordExtractionOutcome,
   runCardExtractionQueueTick,
   type QueueTickOps,
@@ -574,5 +575,190 @@ describe("the card extraction queue", () => {
       ctx.db.query("cardExtractionQueueStates").collect(),
     );
     expect(rows).toEqual([]);
+  });
+});
+
+describe("classifying a raised tick", () => {
+  test("a hosted-provider message classifies as provider_failed", () => {
+    expect(
+      classifyQueueTickFailure(new Error("Card extraction request failed")),
+    ).toEqual({ outcome: "provider_failed", errorCode: "provider_error" });
+    expect(
+      classifyQueueTickFailure(
+        new Error(
+          "Card extraction request failed (status 400, code invalid_request_error)",
+        ),
+      ),
+    ).toEqual({ outcome: "provider_failed", errorCode: "provider_error" });
+    expect(
+      classifyQueueTickFailure(
+        new Error("Card extraction provider credentials are unavailable"),
+      ),
+    ).toEqual({ outcome: "provider_failed", errorCode: "provider_error" });
+  });
+
+  test("anything else classifies as an ordinary review, not a provider outage", () => {
+    expect(
+      classifyQueueTickFailure(new Error("stageEvidence wrote no rows")),
+    ).toEqual({ outcome: "review", errorCode: "gate_error" });
+    expect(classifyQueueTickFailure("not even an Error")).toEqual({
+      outcome: "review",
+      errorCode: "gate_error",
+    });
+  });
+});
+
+/**
+ * A tick whose ops are otherwise real (`claim`/`recordOutcome` back a real
+ * queue row), but whose `runLadder` always throws: simulates the runner or
+ * provider failing outright, which is exactly what escaped uncaught before
+ * this fix and left the queue running with nothing scheduled after it.
+ */
+function failingTickOps(base: QueueTickOps, message: string): QueueTickOps {
+  return {
+    ...base,
+    runLadder: async () => {
+      throw new Error(message);
+    },
+  };
+}
+
+describe("the tick never lets a runner or provider failure escape uncaught", () => {
+  test("a provider failure is recorded, counted, and the tick still resolves", async () => {
+    const t = convexTest(schema, modules);
+    const { userId, spaceId, sourceAccountId } = await seedSpace(t);
+    await seedItems(t, { spaceId, sourceAccountId, userId, count: 5 });
+    await startQueue(t, { spaceId });
+
+    const result = await runCardExtractionQueueTick(
+      failingTickOps(
+        tickOps({ t, spaceId, userId, now: MONDAY }),
+        "Card extraction request failed (status 400, code invalid_request_error)",
+      ),
+    );
+    // Never an uncaught rejection, and the tick still says whether to
+    // schedule a successor: this is the whole fix for the zombie queue.
+    expect(result).toEqual({ status: "claimed", continue: true });
+
+    const status = await t.query(
+      internal.models.records.cardQueue.cardExtractionQueueStatus,
+      { spaceId, kind: "document_card" },
+    );
+    expect(status).toMatchObject({
+      phase: "running",
+      providerFailed: 1,
+      gateFailed: 0,
+      consecutiveFailures: 1,
+      lastErrorCode: "provider_error",
+    });
+  });
+
+  test("an unexpected (non-provider) failure counts as gate-failed, not provider-failed", async () => {
+    const t = convexTest(schema, modules);
+    const { userId, spaceId, sourceAccountId } = await seedSpace(t);
+    await seedItems(t, { spaceId, sourceAccountId, userId, count: 5 });
+    await startQueue(t, { spaceId });
+
+    await runCardExtractionQueueTick(
+      failingTickOps(
+        tickOps({ t, spaceId, userId, now: MONDAY }),
+        "stageEvidence wrote no rows",
+      ),
+    );
+
+    const status = await t.query(
+      internal.models.records.cardQueue.cardExtractionQueueStatus,
+      { spaceId, kind: "document_card" },
+    );
+    expect(status).toMatchObject({
+      phase: "running",
+      providerFailed: 0,
+      gateFailed: 1,
+      consecutiveFailures: 1,
+      lastErrorCode: "gate_error",
+    });
+  });
+
+  test("pauses with provider_error after 3 consecutive failures, never a 4th attempt", async () => {
+    const t = convexTest(schema, modules);
+    const { userId, spaceId, sourceAccountId } = await seedSpace(t);
+    await seedItems(t, { spaceId, sourceAccountId, userId, count: 5 });
+    await startQueue(t, { spaceId });
+
+    const message = "Card extraction request failed (status 500, code unknown)";
+    const results: QueueTickResult[] = [];
+    for (let i = 0; i < 3; i += 1) {
+      results.push(
+        await runCardExtractionQueueTick(
+          failingTickOps(tickOps({ t, spaceId, userId, now: MONDAY }), message),
+        ),
+      );
+    }
+    expect(results[0]).toEqual({ status: "claimed", continue: true });
+    expect(results[1]).toEqual({ status: "claimed", continue: true });
+    expect(results[2]).toEqual({ status: "claimed", continue: false });
+
+    const status = await t.query(
+      internal.models.records.cardQueue.cardExtractionQueueStatus,
+      { spaceId, kind: "document_card" },
+    );
+    expect(status).toMatchObject({
+      phase: "paused",
+      pauseReason: "provider_error",
+      providerFailed: 3,
+      consecutiveFailures: 3,
+    });
+
+    // A 4th tick must never be attempted while paused: the claim itself
+    // reports "paused" without ever touching the ladder.
+    const calls: Id<"sourceItems">[] = [];
+    const fourth = await runCardExtractionQueueTick(
+      tickOps({
+        t,
+        spaceId,
+        userId,
+        now: MONDAY,
+        onLadderCall: (id) => calls.push(id),
+      }),
+    );
+    expect(fourth).toEqual({ status: "paused", continue: false });
+    expect(calls).toEqual([]);
+  });
+
+  test("a successful tick resets the failure streak and clears the last error", async () => {
+    const t = convexTest(schema, modules);
+    const { userId, spaceId, sourceAccountId } = await seedSpace(t);
+    await seedItems(t, { spaceId, sourceAccountId, userId, count: 5 });
+    await startQueue(t, { spaceId });
+
+    const message = "Card extraction request failed";
+    await runCardExtractionQueueTick(
+      failingTickOps(tickOps({ t, spaceId, userId, now: MONDAY }), message),
+    );
+    await runCardExtractionQueueTick(
+      failingTickOps(tickOps({ t, spaceId, userId, now: MONDAY }), message),
+    );
+    const midway = await t.query(
+      internal.models.records.cardQueue.cardExtractionQueueStatus,
+      { spaceId, kind: "document_card" },
+    );
+    expect(midway.consecutiveFailures).toBe(2);
+
+    // A normal, successful tick in between: the streak must not carry
+    // through to a 3rd failure later and pause on what is really only the
+    // first failure since the queue was last healthy.
+    await runCardExtractionQueueTick(tickOps({ t, spaceId, userId, now: MONDAY }));
+    const afterSuccess = await t.query(
+      internal.models.records.cardQueue.cardExtractionQueueStatus,
+      { spaceId, kind: "document_card" },
+    );
+    expect(afterSuccess.consecutiveFailures).toBe(0);
+    expect(afterSuccess.lastErrorCode).toBeUndefined();
+    expect(afterSuccess.phase).toBe("running");
+
+    const next = await runCardExtractionQueueTick(
+      failingTickOps(tickOps({ t, spaceId, userId, now: MONDAY }), message),
+    );
+    expect(next).toEqual({ status: "claimed", continue: true });
   });
 });
