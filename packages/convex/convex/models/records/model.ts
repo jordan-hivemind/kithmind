@@ -309,17 +309,39 @@ function sameStructuredValue(left: unknown, right: unknown): boolean {
   );
 }
 
+/**
+ * Rule 1 of section 5.2 in docs/plans/2026-09-12-document-cards.md has two
+ * distinguishable outcomes, and the card gate reports them under different
+ * closed codes. `requireEvidence` throws this so `probeFieldEvidence` can
+ * classify without reading an error message. Anything else it throws, a
+ * budget refusal included, is an unresolved span: failing closed is the
+ * default, not the exception.
+ */
+export class EvidenceFailure extends Error {
+  constructor(
+    message: string,
+    readonly code: "evidence_missing" | "quote_hash_mismatch",
+  ) {
+    super(message);
+    this.name = "EvidenceFailure";
+  }
+}
+
 function requireEvidenceIds(
   ids: readonly Id<"evidenceSpans">[],
   label: string,
 ): void {
   if (ids.length === 0 || ids.length > MAX_FIELD_EVIDENCE_SPANS) {
-    throw new Error(
+    throw new EvidenceFailure(
       `${label} must contain 1-${MAX_FIELD_EVIDENCE_SPANS} evidence spans`,
+      "evidence_missing",
     );
   }
   if (new Set(ids).size !== ids.length) {
-    throw new Error(`${label} contains duplicate evidence spans`);
+    throw new EvidenceFailure(
+      `${label} contains duplicate evidence spans`,
+      "evidence_missing",
+    );
   }
 }
 
@@ -541,7 +563,10 @@ async function requireEvidence(
     requireUtf16Range(page.text, span.start, span.end, label);
     const quote = page.text.slice(span.start, span.end);
     if ((await sha256Utf8(quote)) !== span.quoteHash) {
-      throw new Error(`${label} quote hash is invalid`);
+      throw new EvidenceFailure(
+        `${label} quote hash is invalid`,
+        "quote_hash_mismatch",
+      );
     }
     const quoteBytes = utf8Length(quote);
     reserveEvidenceQuoteBytes(cache.hydrationCache, quoteBytes);
@@ -785,6 +810,11 @@ function sameObservation(
  *
  * Failing closed is the point: any reason the evidence cannot be proved,
  * including a budget refusal, drops the field.
+ *
+ * `quotes` carries the sealed span text of every resolved field, which is
+ * what the card gate of section 5.2 runs through the field's normalizer. It
+ * is read from the same validation pass, so the text the gate judges is the
+ * text whose hash was just recomputed.
  */
 export async function probeFieldEvidence<Key extends string>(
   ctx: ReadCtx,
@@ -798,7 +828,12 @@ export async function probeFieldEvidence<Key extends string>(
   },
 ): Promise<{
   resolved: Set<Key>;
-  dropped: Array<{ key: Key; reason: string }>;
+  quotes: Map<Key, string[]>;
+  dropped: Array<{
+    key: Key;
+    reason: string;
+    code: "evidence_missing" | "quote_hash_mismatch" | "span_unresolved";
+  }>;
 }> {
   const chain = await requireGenerationChain(
     ctx,
@@ -807,7 +842,12 @@ export async function probeFieldEvidence<Key extends string>(
   );
   const cache = newEvidenceCache();
   const resolved = new Set<Key>();
-  const dropped: Array<{ key: Key; reason: string }> = [];
+  const quotes = new Map<Key, string[]>();
+  const dropped: Array<{
+    key: Key;
+    reason: string;
+    code: "evidence_missing" | "quote_hash_mismatch" | "span_unresolved";
+  }> = [];
   for (const field of input.fields) {
     try {
       await requireEvidence(
@@ -818,14 +858,26 @@ export async function probeFieldEvidence<Key extends string>(
         cache,
       );
       resolved.add(field.key);
+      quotes.set(
+        field.key,
+        field.evidenceSpanIds.map((id) => {
+          const quote = cache.quotes.get(id);
+          if (quote === undefined) {
+            throw new Error("Validated evidence has no recorded quote");
+          }
+          return quote;
+        }),
+      );
     } catch (error) {
       dropped.push({
         key: field.key,
         reason: error instanceof Error ? error.message : "unresolvable",
+        code:
+          error instanceof EvidenceFailure ? error.code : "span_unresolved",
       });
     }
   }
-  return { resolved, dropped };
+  return { resolved, quotes, dropped };
 }
 
 /**

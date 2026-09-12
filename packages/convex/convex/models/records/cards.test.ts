@@ -34,7 +34,6 @@ const FINGERPRINT = {
   cardSchemaVersion: 1,
   playbookVersion: "generic-1",
   promptVersion: "p1",
-  gateVersion: "g1",
   tier: "tier0" as const,
 };
 
@@ -283,6 +282,17 @@ function genericFields(
       evidenceSpanIds: [evidence[SUMMARY]!],
     },
   ];
+}
+
+/** Replaces one field's proposed value, leaving its cited span alone. */
+function withValue(
+  fields: CardFieldInput[],
+  name: string,
+  value: CardFieldInput["value"],
+): CardFieldInput[] {
+  return fields.map((field) =>
+    field.field === name ? { ...field, value } : field,
+  );
 }
 
 describe("document cards", () => {
@@ -712,25 +722,185 @@ describe("document cards", () => {
 
   test("refuses a field that is not in the card kind's schema", async () => {
     const seeded = await seedDocument({ withSubjectEntity: true });
-    await expect(
-      seeded.t.run((ctx) =>
-        publishDocumentCard(ctx, {
-          spaceId: seeded.spaceId,
-          sourceItemId: seeded.sourceItemId,
-          userId: seeded.userId,
-          recordKind: "document_card",
-          now: 1_000,
-          fingerprint: FINGERPRINT,
-          anchorEvidenceSpanIds: [seeded.evidence[TITLE]!],
-          fields: [
-            {
-              field: "principal_amount",
-              value: { type: "money", amount: "1.00", currency: "USD" },
-              evidenceSpanIds: [seeded.evidence[TITLE]!],
-            },
-          ],
+    // The gate now refuses this before staging can throw, which is the
+    // section 5.2 shape: a runner proposing a field the kind does not declare
+    // fails the gate with a closed code rather than crashing the publication.
+    const published = await seeded.t.run((ctx) =>
+      publishDocumentCard(ctx, {
+        spaceId: seeded.spaceId,
+        sourceItemId: seeded.sourceItemId,
+        userId: seeded.userId,
+        recordKind: "document_card",
+        now: 1_000,
+        fingerprint: FINGERPRINT,
+        anchorEvidenceSpanIds: [seeded.evidence[TITLE]!],
+        fields: [
+          {
+            field: "principal_amount",
+            value: { type: "money", amount: "1.00", currency: "USD" },
+            evidenceSpanIds: [seeded.evidence[TITLE]!],
+          },
+        ],
+      }),
+    );
+    expect(published.published).toBe(false);
+    expect(published.reason).toBe("gate_failed");
+    expect(published.gateFailures).toContainEqual({
+      key: "principal_amount",
+      code: "field_not_declared",
+    });
+  });
+
+  test("a required field the gate refuses stages nothing at that tier", async () => {
+    const seeded = await seedDocument({ withSubjectEntity: true });
+    const published = await seeded.t.run((ctx) =>
+      publishDocumentCard(ctx, {
+        spaceId: seeded.spaceId,
+        sourceItemId: seeded.sourceItemId,
+        userId: seeded.userId,
+        recordKind: "document_card",
+        now: 1_000,
+        fingerprint: FINGERPRINT,
+        anchorEvidenceSpanIds: [seeded.evidence[TITLE]!],
+        // The value is not what the cited span says. No model is consulted.
+        fields: withValue(genericFields(seeded.evidence), "card_title", {
+          type: "text",
+          value: "Master Services Agreement",
         }),
-      ),
-    ).rejects.toThrow("document_card has no field named principal_amount");
+      }),
+    );
+    expect(published.published).toBe(false);
+    expect(published.reason).toBe("gate_failed");
+    expect(published.requiredFieldFailed).toBe(true);
+    expect(published.gateFailures).toEqual([
+      { key: "card_title", code: "value_not_in_span" },
+    ]);
+
+    const state = await seeded.t.run(async (ctx) => ({
+      cardGenerations: (
+        await ctx.db.query("processingGenerations").collect()
+      ).filter((row) => row.cardGeneration === true),
+      observations: await ctx.db.query("observations").collect(),
+      events: await ctx.db.query("events").collect(),
+      drops: await ctx.db.query("cardFieldDrops").collect(),
+      attempts: await ctx.db.query("cardExtractionAttempts").collect(),
+      item: (await ctx.db.get(seeded.sourceItemId))!,
+    }));
+    // Nothing staged, nothing activated, and the document stays pending.
+    expect(state.cardGenerations).toEqual([]);
+    expect(state.observations).toEqual([]);
+    expect(state.events).toEqual([]);
+    expect(state.item.activeCardGenerationId).toBeUndefined();
+    // Below the top step the ladder escalates, so no review item is raised
+    // yet and the next attempt's row is the one that would carry it.
+    expect(state.drops).toEqual([]);
+    expect(state.attempts).toHaveLength(1);
+    expect(state.attempts[0]).toMatchObject({
+      step: "tier0",
+      outcome: "escalated",
+      passedFieldCount: 0,
+      droppedFieldCount: 0,
+      failedFieldCount: 1,
+      failureCodes: ["value_not_in_span"],
+    });
+  });
+
+  test("a required failure at the top step is a card_gate_failed review item", async () => {
+    const seeded = await seedDocument({ withSubjectEntity: true });
+    const published = await seeded.t.run((ctx) =>
+      publishDocumentCard(ctx, {
+        spaceId: seeded.spaceId,
+        sourceItemId: seeded.sourceItemId,
+        userId: seeded.userId,
+        recordKind: "document_card",
+        now: 1_000,
+        fingerprint: { ...FINGERPRINT, tier: "tier1" },
+        anchorEvidenceSpanIds: [seeded.evidence[TITLE]!],
+        fields: withValue(genericFields(seeded.evidence), "card_title", {
+          type: "text",
+          value: "Master Services Agreement",
+        }),
+      }),
+    );
+    expect(published.published).toBe(false);
+
+    const state = await seeded.t.run(async (ctx) => ({
+      drops: await ctx.db.query("cardFieldDrops").collect(),
+      attempts: await ctx.db.query("cardExtractionAttempts").collect(),
+    }));
+    expect(state.drops).toHaveLength(1);
+    expect(state.drops[0]).toMatchObject({
+      kind: "card_gate_failed",
+      fieldKey: "card_title",
+      code: "value_not_in_span",
+    });
+    expect(state.attempts[0]).toMatchObject({
+      step: "tier1",
+      outcome: "review",
+    });
+  });
+
+  test("an optional field the gate refuses drops alone and is counted", async () => {
+    const seeded = await seedDocument({ withSubjectEntity: true });
+    const published = await seeded.t.run((ctx) =>
+      publishDocumentCard(ctx, {
+        spaceId: seeded.spaceId,
+        sourceItemId: seeded.sourceItemId,
+        userId: seeded.userId,
+        recordKind: "document_card",
+        now: 1_000,
+        fingerprint: FINGERPRINT,
+        anchorEvidenceSpanIds: [seeded.evidence[TITLE]!],
+        fields: withValue(genericFields(seeded.evidence), "card_date", {
+          type: "date",
+          value: "2025-03-05",
+        }),
+      }),
+    );
+    expect(published.published).toBe(true);
+    expect(published.requiredFieldFailed).toBe(false);
+    expect(published.droppedFields).toEqual([
+      { key: "card_date", code: "value_not_in_span" },
+    ]);
+    expect(published.storedFields).not.toContain("card_date");
+
+    const state = await seeded.t.run(async (ctx) => ({
+      drops: await ctx.db.query("cardFieldDrops").collect(),
+      attempts: await ctx.db.query("cardExtractionAttempts").collect(),
+    }));
+    expect(state.drops).toHaveLength(1);
+    expect(state.drops[0]).toMatchObject({
+      kind: "field_dropped",
+      fieldKey: "card_date",
+      code: "value_not_in_span",
+    });
+    expect(state.attempts[0]).toMatchObject({
+      outcome: "accepted",
+      passedFieldCount: 5,
+      droppedFieldCount: 1,
+      failedFieldCount: 1,
+      failureCodes: ["value_not_in_span"],
+    });
+    // Section 5.4: counts and closed codes only. No value, no span text, no
+    // field text of any kind reaches the attempt row.
+    expect(Object.keys(state.attempts[0]!).sort()).toEqual([
+      "_creationTime",
+      "_id",
+      "cardSchemaVersion",
+      "createdAt",
+      "droppedFieldCount",
+      "failedFieldCount",
+      "failureCodes",
+      "gateVersion",
+      "outcome",
+      "passedFieldCount",
+      "playbookVersion",
+      "promptVersion",
+      "recordKind",
+      "sourceAccountId",
+      "sourceItemId",
+      "spaceId",
+      "step",
+    ]);
   });
 });
