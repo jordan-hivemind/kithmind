@@ -12,6 +12,16 @@
       "node": "./dist/index.js",
       "default": "./src/index.ts"
     },
+    "./read": {
+      "types": "./src/mcp/pgRead.ts",
+      "node": "./dist/mcp/pgRead.js",
+      "default": "./src/mcp/pgRead.ts"
+    },
+    "./store": {
+      "types": "./src/pgStore.ts",
+      "node": "./dist/pgStore.js",
+      "default": "./src/pgStore.ts"
+    },
     "./mcp": {
       "types": "./src/mcp/server.ts",
       "node": "./dist/mcp/server.js",

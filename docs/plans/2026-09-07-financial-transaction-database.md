@@ -40,16 +40,16 @@ records where adopted rather than re-extracting the same documents.
 
 ## Decisions
 
-| Question                 | Decision                                                                                                                                                                                                                                                                    |
-| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Storage engine           | Postgres, initially hosted on Neon. `NUMERIC` gives exact decimal arithmetic and exact aggregation, which is not the same as making money exact end to end: precision lost before insertion is stored faithfully, so validated input and tested serialization remain the guarantee. Roles and `GRANT` allow a genuinely separated reader, once designed rather than assumed. Hosted, so an always-on machine and a laptop share one archive.                                                                                                                                  |
-| Existing ledger software | Not adopted. Beancount, hledger, GnuCash and similar are double-entry spending ledgers. They have no first-class model for lot-level cost basis, per-field provenance, or reconciliation status as a gate. Reuse of their importers is not worth adopting their data model. |
-| Scope                    | Holdings as well as transactions. Positions, balances and liabilities are v1, not v2. Half the value of the archive is what is owned and what is owed.                                                                                                                      |
-| Access surface for v1    | An authenticated read-only MCP server for the owner's own use, connecting as a non-owner reader role whose privileges are designed and tested rather than assumed from a table grant. The Kith Mind boundary is separate and typed, and is not this surface.                                                                                                                                                          |
-| Query shape              | Read-only SQL plus a documented schema, exposed through the local server. Frequently used shapes are promoted into typed operations later, once real questions have shown which ones matter.                                                                                |
-| Where the code lives     | This repository, MIT, with synthetic fixtures.                                                                                                                                                                                                                              |
-| Where the data lives     | The archive database in Neon. The raw document tree on the always-on machine's filesystem, replicated off it. Never in git, and no connection string, credential or real path in this repository.                                                                                                                                                |
-| Standing CSV exports     | Not produced. A table mirror beside a live database is a second source of truth. Export is an on-demand script. **Both halves need their own recovery.** The raw tree cannot be rebuilt from anything, and the database is not merely derived either: review decisions, corrections and reconciliation verdicts are human judgments that no amount of re-parsing reconstructs. Provider durability is not a substitute for an encrypted, independently restorable export with a proven restore.                                                                                                                          |
+| Question                 | Decision                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Storage engine           | Postgres, initially hosted on Neon. `NUMERIC` gives exact decimal arithmetic and exact aggregation, which is not the same as making money exact end to end: precision lost before insertion is stored faithfully, so validated input and tested serialization remain the guarantee. Roles and `GRANT` allow a genuinely separated reader, once designed rather than assumed. Hosted, so an always-on machine and a laptop share one archive.                                                    |
+| Existing ledger software | Not adopted. Beancount, hledger, GnuCash and similar are double-entry spending ledgers. They have no first-class model for lot-level cost basis, per-field provenance, or reconciliation status as a gate. Reuse of their importers is not worth adopting their data model.                                                                                                                                                                                                                     |
+| Scope                    | Holdings as well as transactions. Positions, balances and liabilities are v1, not v2. Half the value of the archive is what is owned and what is owed.                                                                                                                                                                                                                                                                                                                                          |
+| Access surface for v1    | An authenticated read-only MCP server for the owner's own use, connecting as a non-owner reader role whose privileges are designed and tested rather than assumed from a table grant. The Kith Mind boundary is separate and typed, and is not this surface.                                                                                                                                                                                                                                    |
+| Query shape              | Read-only SQL plus a documented schema, exposed through the local server. Frequently used shapes are promoted into typed operations later, once real questions have shown which ones matter.                                                                                                                                                                                                                                                                                                    |
+| Where the code lives     | This repository, MIT, with synthetic fixtures.                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| Where the data lives     | The archive database in Neon. The raw document tree on the always-on machine's filesystem, replicated off it. Never in git, and no connection string, credential or real path in this repository.                                                                                                                                                                                                                                                                                               |
+| Standing CSV exports     | Not produced. A table mirror beside a live database is a second source of truth. Export is an on-demand script. **Both halves need their own recovery.** The raw tree cannot be rebuilt from anything, and the database is not merely derived either: review decisions, corrections and reconciliation verdicts are human judgments that no amount of re-parsing reconstructs. Provider durability is not a substitute for an encrypted, independently restorable export with a proven restore. |
 
 An earlier revision of this plan waived the record contract's
 typed-bounded-query rule on the grounds that the archive was single-user,
@@ -59,10 +59,10 @@ earlier draft of this section claimed the rule was satisfied while still
 offering arbitrary SQL. Those are two different surfaces and they get two
 different answers.
 
-| Surface                          | Shape                                                                                                                            |
-| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| The owner's own exploration       | Read-only SQL, authenticated, as a non-owner reader role, with server-enforced row, time and output limits. A separately authorized tool. |
-| The Kith Mind gateway boundary    | Versioned, validated, bounded typed operations for transactions, holdings and balances, aggregates, evidence and coverage. Never arbitrary SQL. |
+| Surface                        | Shape                                                                                                                                           |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| The owner's own exploration    | Read-only SQL, authenticated, as a non-owner reader role, with server-enforced row, time and output limits. A separately authorized tool.       |
+| The Kith Mind gateway boundary | Versioned, validated, bounded typed operations for transactions, holdings and balances, aggregates, evidence and coverage. Never arbitrary SQL. |
 
 The typed boundary is what the record contract requires, and it is not
 satisfied by pointing a scoped gateway at a SQL surface. The owner's SQL tool
@@ -231,7 +231,7 @@ scale, so nothing is silently truncated. Identifiers are `TEXT`. Dates are
 
 **`NUMERIC` does not replace the float check, and an earlier draft of this
 section wrongly said it did.** The SQLite `CHECK (typeof(...))` constraints
-caught a value that had *already become* a float before it reached the
+caught a value that had _already become_ a float before it reached the
 database. Postgres will accept that same value into `NUMERIC` and store it
 exactly, damage included: a JavaScript `0.1 + 0.2` arrives as
 `0.30000000000000004` and is faithfully preserved.
@@ -369,14 +369,14 @@ this section retired the typed-bounded-query waiver, and a scoped surface
 offering arbitrary SQL does not satisfy the rule it was retired for.
 `describe_schema` existed only to help a caller write that SQL.
 
-| Operation           | Behavior                                                                                                                             |
-| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `list_transactions` | Transactions by source, account, currency and date range, paged and cursored.                                                        |
-| `list_holdings`     | Stated positions by source and account as of a date, with valuation basis.                                                           |
-| `list_balances`     | Stated balances by source, account and date range.                                                                                   |
-| `aggregate_money`   | Exact `NUMERIC` totals of transaction amount, market value, cost basis or cash, always grouped by currency and never crossing one.    |
-| `get_evidence`      | For a record, the retained text span behind it.                                                                                      |
-| `get_coverage`      | Per source, record kind and period: what was acquired, what reconciled, what is under review, and what nothing vouches for.          |
+| Operation           | Behavior                                                                                                                           |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `list_transactions` | Transactions by source, account, currency and date range, paged and cursored.                                                      |
+| `list_holdings`     | Stated positions by source and account as of a date, with valuation basis.                                                         |
+| `list_balances`     | Stated balances by source, account and date range.                                                                                 |
+| `aggregate_money`   | Exact `NUMERIC` totals of transaction amount, market value, cost basis or cash, always grouped by currency and never crossing one. |
+| `get_evidence`      | For a record, the retained text span behind it.                                                                                    |
+| `get_coverage`      | Per source, record kind and period: what was acquired, what reconciled, what is under review, and what nothing vouches for.        |
 
 The three list operations no longer withhold every row. `structured_field_v1`
 (F1-29, [structured evidence](./2026-09-11-structured-evidence.md)) cites one
@@ -429,6 +429,17 @@ coverage means no indexed match, not proof that no event occurred.
 Coverage is reported at the same granularity as the record contract requires,
 so the later Kith Mind adapter wraps this surface rather than re-deriving it.
 
+F1-10 built that adapter, and it does wrap rather than re-derive. The Kith Mind
+gateway calls the same `serveFinanceRead` these six operations run through,
+over the same reader role, and returns the archive's response unchanged. The
+standalone stdio server above is unchanged and remains the local entry point;
+the gateway is the hosted one, so the owner asks one server rather than two.
+The gateway supplies its own trusted context: the principal is the
+authenticated API key's user and the authorized space set is Convex membership,
+read live on every call. The archive's space is pinned in the gateway's
+configuration, because this database has no space column and serving it under
+whichever space a caller named would relabel one space's ledger as another's.
+
 ## Working on the archive without reading it
 
 The archive is large. A single institution's activity history runs to tens of
@@ -473,10 +484,10 @@ that answers before it reconciles answers confidently and wrongly.
 Three tasks were added after the original sequence, because building F1-1
 through F1-7 in parallel left responsibilities that no single task owned.
 
-| Task  | Deliverable                           | Why it was missing                                                                                                                                                                                               |
-| ----- | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| F1-16 | Holdings extraction and import        | Holdings are v1, but F1-2 returned activity rows only, F1-3 imported only transactions, and F1-4 reads `balances` that nothing wrote. The gate had no input on real data.                                        |
-| F1-17 | Position quantity reconciliation gate | The validation half of holdings, described above.                                                                                                                                                                |
+| Task  | Deliverable                           | Why it was missing                                                                                                                                                                                                |
+| ----- | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| F1-16 | Holdings extraction and import        | Holdings are v1, but F1-2 returned activity rows only, F1-3 imported only transactions, and F1-4 reads `balances` that nothing wrote. The gate had no input on real data.                                         |
+| F1-17 | Position quantity reconciliation gate | The validation half of holdings, described above.                                                                                                                                                                 |
 | F1-18 | Raw tree writer                       | Provenance linkage was complete but nothing persisted acquired bytes, so `documents.file_path` recorded a path no code created and `text_path` was never populated. Evidence pointed at files that did not exist. |
 
 The pattern is worth recording rather than only fixing: each gap sat exactly
@@ -486,13 +497,13 @@ The move to hosted Postgres adds three more, and retires part of two finished
 tasks. It is sequenced before the first acquisition, because no real data
 exists yet and that is the only thing that makes it cheap.
 
-| Task  | Deliverable                                                                                                                        |
-| ----- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| Task  | Deliverable                                                                                                                                                 |
+| ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | F1-20 | Postgres store, schema and migrations. One initial schema, `NUMERIC` money, no storage-class checks to translate. Replaces F1-1's engine, keeps its policy. |
-| F1-21 | Read surface on a `SELECT`-only role, with authentication. Replaces F1-6's five in-process layers; its attack tests carry over as the specification.       |
-| F1-22 | Port the importer, both reconciliation gates and the raw-tree writer onto the new store. Not a driver swap: see below.                                    |
-| F1-23 | Credential-free projection of acquired payloads before they are hashed or written, with negative leak tests. Blocks any real acquisition.                  |
-| F1-24 | Separate byte identity from acquisition provenance in the raw tree, so two captures of identical bytes both keep their manifests.                          |
+| F1-21 | Read surface on a `SELECT`-only role, with authentication. Replaces F1-6's five in-process layers; its attack tests carry over as the specification.        |
+| F1-22 | Port the importer, both reconciliation gates and the raw-tree writer onto the new store. Not a driver swap: see below.                                      |
+| F1-23 | Credential-free projection of acquired payloads before they are hashed or written, with negative leak tests. Blocks any real acquisition.                   |
+| F1-24 | Separate byte identity from acquisition provenance in the raw tree, so two captures of identical bytes both keep their manifests.                           |
 
 F1-1 and F1-6 stay `done`: they were correct for the engine they targeted, and
 the reasoning in them, the money policy, the dedupe contract, the completeness
@@ -507,14 +518,14 @@ hashes the minor-unit integer. Under a decimal representation, `1`, `1.0` and
 `1.00` must not acquire three different identities, or deduplication silently
 stops working and the archive double-counts, which is the defect this
 workstream has already fixed once. So the stored denomination and the canonical
-hash and wire representation are decided and pinned *before* the engine
+hash and wire representation are decided and pinned _before_ the engine
 changes, with conversion tests that assert identity is preserved across the
 move.
 
 F1-23 is security work and is independent of the storage decision. An adapter
 returns whatever the provider sent, and a bank's JSON response may contain
 session tokens, authorization headers echoed back, or other credential
-material. Ground rule 4 forbids an adapter *storing* a credential, and the
+material. Ground rule 4 forbids an adapter _storing_ a credential, and the
 session type has no field for one, but nothing yet stops a credential arriving
 inside a response body and being written to the raw tree, which is a synced
 folder. A closed allowlisted projection of the business payload happens before
@@ -525,16 +536,16 @@ Eight more tasks landed the hosted archive to a usable v1: closing gaps the
 Postgres move and the first hosted acquisition exposed, most surfaced through
 the shared-boundary review on Issue 57.
 
-| Task  | Deliverable                                                      | Why it was missing                                                                                                                                                                                     |
-| ----- | ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| F1-13 | Per-fixture journal lock identity and test temp-dir cleanup in the pipeline test suite | Two agents running `pnpm test:once` in different worktrees at once collided on a fixed lock port and leaked stale temp directories, blocking concurrent work on this workstream and others.          |
-| F1-19 | Activity taxonomy on capabilities; institution provisioning on run | Both reconciliation gates summed every non-null amount or signed quantity on a convention no adapter contract stated, so a wrong sign or an in-kind transfer silently corrupted a gate. A first run against a fresh archive also had nowhere to provision its `institutions` row from. |
-| F1-29 | Structured field evidence: contract kind, archive provenance columns, parser bindings, read-surface assembly | The contract's only evidence kind was a character span, which the parsers could not produce, so every list row was withheld regardless of tier.                                                       |
-| F1-30 | Reader role provisioned on a non-superuser hosted owner            | `applyPgReaderRole`'s `ALTER ROLE` on `NOSUPERUSER`/`NOBYPASSRLS`/`NOREPLICATION` requires literal Postgres `SUPERUSER` even to set an attribute to its already-default value; the hosted owner has `CREATEROLE`/`CREATEDB` but not `SUPERUSER`, so the reader was never created. |
-| F1-31 | Operator import command (`run.ts`)                                 | No entry point composed discover, acquire, persist, parse, import and both gates into one pass; an operator had no way to run an acquisition-to-verdict cycle without reading rows.                    |
-| F1-32 | Discovered accounts on `DiscoverResult`                            | A selection file had to already know an `accounts.id`, so a first import against a fresh archive had no discovery-driven way to name an account.                                                       |
-| F1-33 | SQLite dropped from the raw tree writer                            | `persistAcquiredDocument` still took a `node:sqlite` handle to read the institution slug and account last4, and `text_path` updates went to that same file, even though the importer had moved to Postgres. |
-| F1-34 | Raw tree path, capture and manifest hardening; opaque source id    | Space-id confinement, capture-id uniqueness, manifest integrity and slug-vs-id confusion had never been checked against adversarial or malformed input.                                                 |
+| Task  | Deliverable                                                                                                  | Why it was missing                                                                                                                                                                                                                                                                     |
+| ----- | ------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| F1-13 | Per-fixture journal lock identity and test temp-dir cleanup in the pipeline test suite                       | Two agents running `pnpm test:once` in different worktrees at once collided on a fixed lock port and leaked stale temp directories, blocking concurrent work on this workstream and others.                                                                                            |
+| F1-19 | Activity taxonomy on capabilities; institution provisioning on run                                           | Both reconciliation gates summed every non-null amount or signed quantity on a convention no adapter contract stated, so a wrong sign or an in-kind transfer silently corrupted a gate. A first run against a fresh archive also had nowhere to provision its `institutions` row from. |
+| F1-29 | Structured field evidence: contract kind, archive provenance columns, parser bindings, read-surface assembly | The contract's only evidence kind was a character span, which the parsers could not produce, so every list row was withheld regardless of tier.                                                                                                                                        |
+| F1-30 | Reader role provisioned on a non-superuser hosted owner                                                      | `applyPgReaderRole`'s `ALTER ROLE` on `NOSUPERUSER`/`NOBYPASSRLS`/`NOREPLICATION` requires literal Postgres `SUPERUSER` even to set an attribute to its already-default value; the hosted owner has `CREATEROLE`/`CREATEDB` but not `SUPERUSER`, so the reader was never created.      |
+| F1-31 | Operator import command (`run.ts`)                                                                           | No entry point composed discover, acquire, persist, parse, import and both gates into one pass; an operator had no way to run an acquisition-to-verdict cycle without reading rows.                                                                                                    |
+| F1-32 | Discovered accounts on `DiscoverResult`                                                                      | A selection file had to already know an `accounts.id`, so a first import against a fresh archive had no discovery-driven way to name an account.                                                                                                                                       |
+| F1-33 | SQLite dropped from the raw tree writer                                                                      | `persistAcquiredDocument` still took a `node:sqlite` handle to read the institution slug and account last4, and `text_path` updates went to that same file, even though the importer had moved to Postgres.                                                                            |
+| F1-34 | Raw tree path, capture and manifest hardening; opaque source id                                              | Space-id confinement, capture-id uniqueness, manifest integrity and slug-vs-id confusion had never been checked against adversarial or malformed input.                                                                                                                                |
 
 v1 is done when a single query against the archive reproduces, with no browser:
 fees paid over a trailing twelve months by account and fee type; every purchase
@@ -546,12 +557,12 @@ explicitly flagged.
 
 **v2 is freshness and integration.**
 
-| Task  | Deliverable                                                                                                                                       |
-| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| F1-8  | Drop-folder top-up: a single entry point that scans an inbox, imports what is new, skips what is already hashed, runs the gate and writes a log.  |
-| F1-9  | Coverage and freshness reporting, including staleness per source and an actionable reminder for the human acquisition step.                       |
-| F1-10 | Kith Mind read adapter or deliberate read projection, using stable archive IDs, revision checkpoints, idempotent updates and deletion tombstones. |
-| F1-11 | Additional record kinds where a source introduces them, including commitment tracking from a maintained spreadsheet.                              |
+| Task  | Deliverable                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| F1-8  | Drop-folder top-up: a single entry point that scans an inbox, imports what is new, skips what is already hashed, runs the gate and writes a log.                                                                                                                                                                                                                                                                                                                         |
+| F1-9  | Coverage and freshness reporting, including staleness per source and an actionable reminder for the human acquisition step.                                                                                                                                                                                                                                                                                                                                              |
+| F1-10 | **Done.** A read adapter, not a projection. The Kith Mind gateway serves the archive as a second provider behind its existing `query_records` tool, in process, as the reader role. Nothing is copied into Kith Mind, so there are no revision checkpoints, idempotent updates or deletion tombstones to keep: the archive answers every read and stays the only ledger. See [the record-query contract](./2026-09-06-record-query-contract.md) update of the same date. |
+| F1-11 | Additional record kinds where a source introduces them, including commitment tracking from a maintained spreadsheet.                                                                                                                                                                                                                                                                                                                                                     |
 
 No scheduled scraper is built. If a scheduled agent participates at all, its
 job is running the import and reminding a person to do the acquisition.
@@ -566,17 +577,17 @@ a storage engine is before any real data exists.
 
 To be precise about what the requirement does and does not settle: several
 machines can also query one service in front of a local file, so multi-machine
-access *supports* this choice rather than compelling it. What tips it is the
+access _supports_ this choice rather than compelling it. What tips it is the
 combination of exact decimal arithmetic, real privilege separation for a
 network-reachable read surface, and durability that does not depend on one
 desk.
 
-| Piece                | Runs where                                                         | Why                                                                                                                                                    |
-| -------------------- | ------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Archive database     | Postgres, Neon as the initial host                                 | Exact decimal arithmetic, real privilege separation, host-managed durability, reachable from more than one machine. Neon is a deployment choice, not an architectural requirement; the schema is ordinary Postgres. |
-| Raw document tree    | The always-on machine's filesystem, replicated off it              | Document bytes do not belong in a database. This is the half that cannot be rebuilt, so its durability is a first-class requirement, not a side effect. |
-| Acquisition, import  | The always-on machine                                              | A person authenticates a browser session there. Import is a script that writes to the hosted database.                                                 |
-| Read surface         | Wherever it is invoked, connecting to Neon as a read-only role     | The point of the workstream: an assistant with no browser and no logins can answer questions and cite them.                                             |
+| Piece               | Runs where                                                     | Why                                                                                                                                                                                                                 |
+| ------------------- | -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Archive database    | Postgres, Neon as the initial host                             | Exact decimal arithmetic, real privilege separation, host-managed durability, reachable from more than one machine. Neon is a deployment choice, not an architectural requirement; the schema is ordinary Postgres. |
+| Raw document tree   | The always-on machine's filesystem, replicated off it          | Document bytes do not belong in a database. This is the half that cannot be rebuilt, so its durability is a first-class requirement, not a side effect.                                                             |
+| Acquisition, import | The always-on machine                                          | A person authenticates a browser session there. Import is a script that writes to the hosted database.                                                                                                              |
+| Read surface        | Wherever it is invoked, connecting to Neon as a read-only role | The point of the workstream: an assistant with no browser and no logins can answer questions and cite them.                                                                                                         |
 
 The hosted archive is provisioned: `scripts/provision.mjs` applies the schema
 and the reader role to whatever database `FINANCE_ARCHIVE_DATABASE_URL`
@@ -633,7 +644,7 @@ rather than discovered:
 - **The read-only enforcement built for SQLite is discarded.** Five in-process
   layers, a read-only file open, `query_only`, defensive mode, an authorizer by
   action code and single-statement parsing, all specific to an embedded engine
-  and to `node:sqlite`. Its *tests* survive as the specification: every attack
+  and to `node:sqlite`. Its _tests_ survive as the specification: every attack
   they covered is still something the new surface must refuse.
 - **Authentication on the read surface is new work.** It did not exist, because
   a local file did not need it.

@@ -1,5 +1,9 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  // The finance provider reads the archive through node-postgres. Leave it to
+  // Node rather than bundling it: `pg` loads optional native bindings the
+  // bundler cannot resolve.
+  serverExternalPackages: ["pg"],
   async rewrites() {
     return [
       {

@@ -42,20 +42,22 @@ tracked file. Use the provider dashboards or an interactive CLI prompt.
 
 ## Configuration map
 
-| Variable                   | Location          | Purpose                                                               |
-| -------------------------- | ----------------- | --------------------------------------------------------------------- |
-| `NEXT_PUBLIC_CONVEX_URL`   | Vercel/Next.js    | Public Convex client origin; intentionally browser-visible            |
-| `MCP_JWT_ISSUER`           | Vercel and Convex | Stable HTTPS origin of the Next.js gateway; values must match exactly |
-| `MCP_JWT_PRIVATE_JWK`      | Vercel only       | Signs 60-second Convex identity tokens; secret                        |
-| `MCP_JWT_PUBLIC_JWK`       | Vercel only       | Published through the MCP JWKS endpoint                               |
-| `MCP_JWT_KEY_ID`           | Vercel only       | Optional signing-key identifier; runtime defaults to `mcp-1`          |
-| `MCP_OAUTH_ENCRYPTION_KEY` | Vercel only       | Encrypts OAuth registrations and authorization codes; secret          |
-| `MCP_TOOL_PROFILE`         | Vercel only       | `full` by default; `memory` is an optional narrower runtime profile   |
-| `OPENAI_API_KEY`           | Convex only       | Creates embeddings; secret and billed to the self-host                |
-| `ANTHROPIC_API_KEY`        | Convex only       | Extracts and classifies memories; secret and billed to the self-host  |
-| `SITE_URL`                 | Convex only       | Stable HTTPS origin of the Next.js app used by Convex Auth            |
-| `JWT_PRIVATE_KEY`          | Convex only       | Signs Convex Auth session tokens; generated secret                    |
-| `JWKS`                     | Convex only       | Public key set used to verify Convex Auth session tokens              |
+| Variable                              | Location          | Purpose                                                               |
+| ------------------------------------- | ----------------- | --------------------------------------------------------------------- |
+| `NEXT_PUBLIC_CONVEX_URL`              | Vercel/Next.js    | Public Convex client origin; intentionally browser-visible            |
+| `MCP_JWT_ISSUER`                      | Vercel and Convex | Stable HTTPS origin of the Next.js gateway; values must match exactly |
+| `MCP_JWT_PRIVATE_JWK`                 | Vercel only       | Signs 60-second Convex identity tokens; secret                        |
+| `MCP_JWT_PUBLIC_JWK`                  | Vercel only       | Published through the MCP JWKS endpoint                               |
+| `MCP_JWT_KEY_ID`                      | Vercel only       | Optional signing-key identifier; runtime defaults to `mcp-1`          |
+| `MCP_OAUTH_ENCRYPTION_KEY`            | Vercel only       | Encrypts OAuth registrations and authorization codes; secret          |
+| `MCP_TOOL_PROFILE`                    | Vercel only       | `full` by default; `memory` is an optional narrower runtime profile   |
+| `FINANCE_ARCHIVE_READER_DATABASE_URL` | Vercel only       | Optional; the financial archive as its read-only reader role; secret  |
+| `FINANCE_ARCHIVE_SPACE_ID`            | Vercel only       | Optional; the one space that archive holds; required with the URL     |
+| `OPENAI_API_KEY`                      | Convex only       | Creates embeddings; secret and billed to the self-host                |
+| `ANTHROPIC_API_KEY`                   | Convex only       | Extracts and classifies memories; secret and billed to the self-host  |
+| `SITE_URL`                            | Convex only       | Stable HTTPS origin of the Next.js app used by Convex Auth            |
+| `JWT_PRIVATE_KEY`                     | Convex only       | Signs Convex Auth session tokens; generated secret                    |
+| `JWKS`                                | Convex only       | Public key set used to verify Convex Auth session tokens              |
 
 Bounded inline text capture, retained evidence, and keyword search work without
 provider calls. Anthropic is optional for narrative classification and metadata
@@ -175,6 +177,16 @@ values if preview deployments need a working OAuth flow:
 - `MCP_JWT_KEY_ID` (optional; defaults to `mcp-1`)
 - `MCP_OAUTH_ENCRYPTION_KEY`
 - `MCP_TOOL_PROFILE` (optional; defaults to `full`)
+- `FINANCE_ARCHIVE_READER_DATABASE_URL` (optional; see below)
+- `FINANCE_ARCHIVE_SPACE_ID` (optional; required together with the URL)
+
+The last two enable the financial archive as a provider behind `query_records`
+and `list_sources`. Set them only if you run the archive. Point the URL at the
+archive as the reader role created by `applyPgReaderRole`, never as its owner,
+and set the space id to the one space that archive holds. With either value
+missing the provider stays off and a finance query is refused explicitly rather
+than answered empty. The connection string is a secret and never enters the
+repository.
 
 Generate the signing pair and OAuth encryption key once on a trusted local
 machine. Prefer writing them directly to the ignored local environment file so
