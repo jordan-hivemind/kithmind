@@ -137,9 +137,14 @@ or vector-generation unavailability.
 
 ## Phase 1 bounds and maintenance
 
-A staged generation supports a manifest of at most 128 eligible targets and
-2 MiB of estimated input/vector bytes. The thought scan also stops after 128
+A staged generation supports a manifest of at most 256 eligible targets and
+2 MiB of estimated input/vector bytes. The thought scan also stops after 256
 rows, including history. Generation validation reads at most 256 vector rows.
+This paragraph previously said 128 for the first two bounds. The code has used
+256 since the pilot; the code is right and the stale number is corrected here.
+Raising these bounds is P2-6 work, specified in the
+[index capacity plan](./2026-09-12-index-capacity.md); its first
+implementation PR replaces this paragraph.
 These are conservative Phase 1 bounds, not a bulk ingestion capacity claim.
 An overflow cannot activate a partial generation. Narrative capture requires a
 complete active thought index for admission and duplicate detection. A capture
