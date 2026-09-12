@@ -1012,6 +1012,129 @@ selection naming its account by `accountId`, and again for one naming it by
 `resolveDiscoveredAccounts` upserts the same account row rather than minting
 a second one.
 
+## Account aliases: two key spaces for one account (F1-56)
+
+An institution can key one account two ways that no rule relates. Morgan
+Stanley's site keys listings and documents by a timestamp-like
+`keyAccountNo`, which is what `discover()` reports and what
+`accounts.external_key` holds; its statement PDFs print a different number
+entirely, which is what the layout parser attaches to each holdings section
+as `accountExternalKey`. `acct_last4` matches neither. So before this, every
+holding parsed out of a statement carried a key resolving to nothing, landed
+under whichever account the document happened to be pulled under, and left
+an `unknown_account_key` review item.
+
+`account_aliases` is the second key space: alternate external keys an
+account is also known by, `UNIQUE (institution_id, external_key)` like
+`accounts.external_key` itself, with a `kind` of `api_key` or
+`statement_number`. A row's `accountExternalKey` resolves against an
+account's own key first and an alias second (`accountIdsByExternalKey`,
+`src/adapterImport.ts`), so an alias is always a second chance and never an
+override.
+
+### Learning the mapping
+
+```
+node dist/run.js learn-account-aliases --adapter <module path> [--dry-run]
+```
+
+Walks the documents this archive already retained, through the adapter's own
+`parse()` -- the same walk `reparse` uses, so no browser, no network, no
+`discover()`/`acquire()` -- and collects, per document, the account it was
+pulled under and every account number its parse printed. The rule, whole:
+
+> A printed number is accepted for an account only if it appears on at least
+> one document that printed exactly one number, and every such document
+> agrees on the same account.
+
+A single-account statement's printed number and its document's account are
+the same account, which is the entire evidence. A consolidated statement is
+pulled under one account but prints several, so it is evidence for none of
+them. "Exactly one number" counts every number the document printed,
+including numbers that already resolve: a document printing one unknown
+number beside one known one covers two accounts and is not single-account
+either. A number two single-number documents attribute to different accounts
+is ambiguous and is never written -- there is no winner to pick, and a
+disagreement means the premise is wrong somewhere.
+
+The summary counts numbers seen, accepted, ambiguous and unmapped (seen only
+on consolidated documents, so never pinned to one account), and lists the
+ambiguous and unmapped ones by masked shape and a short digest
+(`###-######-### [a1b2c3d4]`) -- never the digits. `--dry-run` prints the
+same counts and writes nothing.
+
+### Re-attribution
+
+```
+node dist/run.js reattribute-accounts --adapter <module path> [--dry-run]
+```
+
+Moves the rows the old resolution misfiled: a holding filed under a
+document's pull account whose printed key now resolves to a different
+account. Nothing stored on such a row says which number it was printed
+under -- the `unknown_account_key` item holds it in `raw_value` but has no
+row pointer, and `source_locator` records the page and section a holding was
+printed at, not the account number above it -- so the attribution is
+re-derived by reading the document again through the same `parse()`, and the
+parsed holding is matched to the stored row by the pair recorded on both:
+`source_document_id` and `source_locator`. A locator two parsed holdings
+disagree about is left alone and counted.
+
+`row_hash` (F1-49) includes the account, so every moved row's hash is
+recomputed -- from the stored row, not from the parse, so nothing here
+reproduces the importer's canonicalization. Before a row moves, its hash is
+recomputed under its *current* account and checked against the stored one; a
+row that disagrees is left exactly where it is and counted, because rehashing
+it would paper over whatever the disagreement is. A row whose new hash is
+already taken at the target account is also left in place and counted, for a
+person to compare the two.
+
+Then every open `unknown_account_key` item whose key now resolves is closed
+with a resolution note (the reason those items state is no longer true), and
+both reconciliation gates run over exactly the periods the moves could have
+shifted, on both sides -- the account a snapshot left needs re-deriving as
+much as the one it joined. The summary prints rows moved per table, rows
+left and why, open `unknown_account_key` items before and after, and
+per-account holdings counts before and after. `--dry-run` does all the work
+in one transaction and rolls it back, so the "after" numbers are what a real
+run would produce.
+
+### The order matters
+
+Learn, then re-attribute, then (if you want) reparse. Once aliases exist, a
+reparse of a consolidated statement resolves its sections correctly and,
+because `row_hash` includes the account, inserts them as *new* rows beside
+the misfiled ones it cannot see -- two copies of one holding. Re-attributing
+first moves the existing rows, hash and all, after which that same reparse
+finds everything already stored and inserts nothing. Both commands are
+idempotent and both take `--dry-run`.
+
+### What is not re-attributed
+
+`transactions`. A transaction's `row_hash` includes a per-document
+occurrence ordinal counted over its content key, and moving one row to
+another account changes that content key for every sibling that shares it,
+so recomputing the ordinals correctly is real work with no caller: the real
+institution's statements carry no activity rows at all (`parseRealStatement`
+returns none), and its activity pulls carry the API's own keys, which already
+resolve. If a source ever misfiles activity the same way, this is the thing
+to build.
+
+`review_items.source_document_id` for items written before F1-56 also stays
+null. The seam that opened them ran before the `documents` row existed, so
+there was never a pointer to record; from F1-56 on, those items ride on the
+`ImportDocument` and `importBatch` writes them with the document id
+(`AdapterReviewItem`). That also means a document the whole-document skip
+passes over no longer reopens the same `weak_instrument_match` rows on every
+reparse.
+
+### The reader role
+
+`account_aliases` gets no `GRANT`. `applyPgReaderRole` grants `SELECT` at
+the time it runs, and its own suite asserts that a table a later migration
+adds is not silently readable; the read surface (`src/mcp/pgRead.ts`) does
+not read this table. Re-run `applyPgReaderRole` if that ever changes.
+
 ## Raw tree
 
 `acquire` (`src/adapter.ts`) returns bytes and a manifest; it does not write

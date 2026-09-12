@@ -37,6 +37,7 @@ import {
 } from "./captures.js";
 import { canonicalizeDecimal, compareDecimal } from "./decimal.js";
 import type {
+  AdapterReviewItem,
   ImportBalance,
   ImportDocument,
   ImportLiability,
@@ -120,31 +121,24 @@ export type AdapterPull = {
   readonly accountsByExternalKey?: ReadonlyMap<string, string>;
 };
 
-type ReviewItemFields = {
-  kind: string;
-  accountId: string | null;
-  rawValue: string | null;
-  reason: string;
-};
-
 /**
  * F1-51. Review items opened while mapping a pull are buffered in the order
  * they are opened and written with one multi-row INSERT at the end, rather
  * than one round trip each. Nothing here reads `review_items` back, so the
  * only thing that changes is how many messages carry them.
+ *
+ * F1-56: the buffer holds the fields rather than a bound tuple, because a
+ * row-level item no longer goes to the database from here at all. It is
+ * sliced off per document in `collectDocuments` and carried on the
+ * `ImportDocument`, so `importBatch` writes it with the document id it
+ * assigns (see `AdapterReviewItem`). Only the pull-level items -- opened
+ * before any document is built, and about the pull rather than one
+ * document's rows -- are still flushed here.
  */
-type ReviewBuffer = unknown[][];
+type ReviewBuffer = AdapterReviewItem[];
 
-function openReviewItem(reviews: ReviewBuffer, fields: ReviewItemFields): void {
-  reviews.push([
-    randomUUID(),
-    fields.kind,
-    fields.accountId,
-    null,
-    null,
-    fields.rawValue,
-    fields.reason,
-  ]);
+function openReviewItem(reviews: ReviewBuffer, fields: AdapterReviewItem): void {
+  reviews.push(fields);
 }
 
 /**
@@ -347,7 +341,24 @@ async function flushInstruments(
   reviews: ReviewBuffer,
 ): Promise<void> {
   await insertRows(client, "instruments", INSTRUMENT_COLUMNS, resolver.created);
-  await insertRows(client, "review_items", REVIEW_COLUMNS, reviews);
+  await insertRows(
+    client,
+    "review_items",
+    REVIEW_COLUMNS,
+    // Pull-level items only, by the time this runs: a null
+    // `source_document_id` is the honest answer for a pull whose retention
+    // declaration dropped a field, or whose pagination total the provider
+    // never stated, neither of which is about one document's rows.
+    reviews.map((item) => [
+      randomUUID(),
+      item.kind,
+      item.accountId,
+      null,
+      null,
+      item.rawValue,
+      item.reason,
+    ]),
+  );
 }
 
 /**
@@ -393,6 +404,40 @@ export async function resolveDiscoveredAccounts(
     );
     resolved.set(account.externalKey, result.rows[0]!.id);
   }
+  return resolved;
+}
+
+/**
+ * F1-56. Every key one institution's accounts answer to: `accounts
+ * .external_key` (what `discover()` reports) plus every `account_aliases
+ * .external_key` learned since (what a document prints). This is the map
+ * `AdapterPull.accountsByExternalKey` wants, so a holdings row carrying a
+ * statement's printed account number resolves to the same account a row
+ * carrying the API's key does.
+ *
+ * `external_key` wins a collision. The two key spaces are separate tables
+ * and Postgres has no cross-table unique constraint, so an alias naming a
+ * key that is already some other account's own key is possible to write by
+ * hand; consulting the account's own key first makes such an alias inert
+ * rather than an override (see the migration's comment). Loading the alias
+ * rows first and letting the account rows overwrite them is what spells
+ * that precedence.
+ */
+export async function accountIdsByExternalKey(
+  client: ArchiveClient,
+  institutionId: string,
+): Promise<ReadonlyMap<string, string>> {
+  const resolved = new Map<string, string>();
+  const aliases = await client.query<{ external_key: string; account_id: string }>(
+    "SELECT external_key, account_id FROM account_aliases WHERE institution_id = $1",
+    [institutionId],
+  );
+  for (const row of aliases.rows) resolved.set(row.external_key, row.account_id);
+  const accounts = await client.query<{ external_key: string; id: string }>(
+    "SELECT external_key, id FROM accounts WHERE institution_id = $1 AND external_key IS NOT NULL",
+    [institutionId],
+  );
+  for (const row of accounts.rows) resolved.set(row.external_key, row.id);
   return resolved;
 }
 
@@ -939,6 +984,45 @@ async function collectDocuments(
 
   const documents: ImportDocument[] = [];
   for (const sourceDocument of sourceDocuments) {
+    // F1-56. Where this document's own review items start in the shared
+    // buffer. Everything the four mappings below open belongs to this
+    // document, so it is sliced off after them and carried on the
+    // `ImportDocument` rather than written here with a null document
+    // pointer. The mappings stay in this order and are evaluated before the
+    // object literal is built, exactly as they were when they were inline
+    // property initializers: instrument resolution mints rows, and a later
+    // descriptor must see the row an earlier one minted rather than minting
+    // a second id for the same instrument.
+    const openedBefore = reviews.length;
+    const rows = (activityGroups.get(sourceDocument) ?? []).map((row) =>
+      parsedRowToImportRow(
+        reviews,
+        resolver,
+        resolveRowAccountId(reviews, pull, row),
+        pull.activityTaxonomy,
+        row,
+      ),
+    );
+    const positions = (positionGroups.get(sourceDocument) ?? []).map((position) =>
+      parsedPositionToImportPosition(
+        resolver,
+        position,
+        resolveRowAccountId(reviews, pull, position),
+      ),
+    );
+    const balances = (balanceGroups.get(sourceDocument) ?? []).map((balance) =>
+      parsedBalanceToImportBalance(
+        balance,
+        resolveRowAccountId(reviews, pull, balance),
+      ),
+    );
+    const liabilities = (liabilityGroups.get(sourceDocument) ?? []).map((liability) =>
+      parsedLiabilityToImportLiability(
+        liability,
+        resolveRowAccountId(reviews, pull, liability),
+      ),
+    );
+    const reviewItems = reviews.splice(openedBefore);
     documents.push({
       // For a single document this literally is the acquired file's own
       // content hash. A page split has no bytes of its own -- the whole
@@ -973,37 +1057,11 @@ async function collectDocuments(
       docType: pull.docType,
       docDate: pull.docDate,
       providerReportedCount: single ? reportedRowCount : null,
-      // One at a time and in row order on purpose: instrument resolution
-      // mints rows, and a later descriptor must see the row an earlier one
-      // minted rather than minting a second id for the same instrument.
-      rows: (activityGroups.get(sourceDocument) ?? []).map((row) =>
-        parsedRowToImportRow(
-          reviews,
-          resolver,
-          resolveRowAccountId(reviews, pull, row),
-          pull.activityTaxonomy,
-          row,
-        ),
-      ),
-      positions: (positionGroups.get(sourceDocument) ?? []).map((position) =>
-        parsedPositionToImportPosition(
-          resolver,
-          position,
-          resolveRowAccountId(reviews, pull, position),
-        ),
-      ),
-      balances: (balanceGroups.get(sourceDocument) ?? []).map((balance) =>
-        parsedBalanceToImportBalance(
-          balance,
-          resolveRowAccountId(reviews, pull, balance),
-        ),
-      ),
-      liabilities: (liabilityGroups.get(sourceDocument) ?? []).map((liability) =>
-        parsedLiabilityToImportLiability(
-          liability,
-          resolveRowAccountId(reviews, pull, liability),
-        ),
-      ),
+      rows,
+      reviewItems,
+      positions,
+      balances,
+      liabilities,
     });
   }
   await flushInstruments(client, resolver, reviews);

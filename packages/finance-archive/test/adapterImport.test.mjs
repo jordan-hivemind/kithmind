@@ -836,20 +836,36 @@ test(
       },
     });
 
+    // F1-56: the seam's own review items are carried on the ImportDocument
+    // and written by importBatch, which is the first thing that knows the
+    // document id, so none of them exists yet.
+    assert.equal(
+      (await all(client, "SELECT id FROM review_items")).length,
+      0,
+      "nothing is written until the document row exists",
+    );
+
+    await importBatch(
+      client,
+      { source: INSTITUTION.slug, documents },
+      new Date("2025-05-01"),
+    );
+
     const review = await all(
       client,
-      "SELECT kind, account_id, raw_value, reason FROM review_items WHERE kind = $1",
+      `SELECT r.kind, r.account_id, r.raw_value, r.reason, d.sha256
+         FROM review_items r JOIN documents d ON d.id = r.source_document_id
+        WHERE r.kind = $1`,
       ["undeclared_activity_type"],
     );
     assert.equal(review.length, 1);
     assert.equal(review[0].account_id, ACCOUNT.id);
     assert.equal(review[0].raw_value, "unknown_type");
     assert.match(review[0].reason, /not declared/);
-
-    await importBatch(
-      client,
-      { source: INSTITUTION.slug, documents },
-      new Date("2025-05-01"),
+    assert.equal(
+      review[0].sha256,
+      acquired.manifest.contentHash,
+      "F1-56: the item names the document its row came from",
     );
 
     // Conservative, not corrected: an undeclared type's amount is neither
@@ -904,20 +920,21 @@ test(
       },
     });
 
-    const review = await all(
-      client,
-      "SELECT kind, raw_value, reason FROM review_items WHERE kind = $1",
-      ["cash_on_noncash_activity"],
-    );
-    assert.equal(review.length, 1);
-    assert.equal(review[0].raw_value, "100.00");
-    assert.match(review[0].reason, /movesCash: false/);
-
     await importBatch(
       client,
       { source: INSTITUTION.slug, documents },
       new Date("2025-05-01"),
     );
+
+    const review = await all(
+      client,
+      "SELECT kind, raw_value, reason, source_document_id FROM review_items WHERE kind = $1",
+      ["cash_on_noncash_activity"],
+    );
+    assert.equal(review.length, 1);
+    assert.equal(review[0].raw_value, "100.00");
+    assert.match(review[0].reason, /movesCash: false/);
+    assert.notEqual(review[0].source_document_id, null);
 
     // Never silently corrected: the amount is nulled, not dropped or fixed
     // to whatever value would make the period balance.
@@ -977,20 +994,21 @@ test(
       },
     });
 
-    const review = await all(
-      client,
-      "SELECT kind, raw_value, reason FROM review_items WHERE kind = $1",
-      ["activity_sign_mismatch"],
-    );
-    assert.equal(review.length, 1);
-    assert.equal(review[0].raw_value, "5");
-    assert.match(review[0].reason, /quantitySign: negative/);
-
     await importBatch(
       client,
       { source: INSTITUTION.slug, documents },
       new Date("2025-05-01"),
     );
+
+    const review = await all(
+      client,
+      "SELECT kind, raw_value, reason, source_document_id FROM review_items WHERE kind = $1",
+      ["activity_sign_mismatch"],
+    );
+    assert.equal(review.length, 1);
+    assert.equal(review[0].raw_value, "5");
+    assert.match(review[0].reason, /quantitySign: negative/);
+    assert.notEqual(review[0].source_document_id, null);
 
     // Never silently corrected: the quantity is nulled, not flipped to
     // match the declared sign. The amount is untouched -- "sell" does move

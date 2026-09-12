@@ -44,6 +44,17 @@
 // defect is fixed, and the already-acquired bytes -- never re-fetched,
 // ground rule 1 -- deserve a second parse under the fixed adapter without
 // re-running discovery or acquisition against a live session.
+//
+// Two more (below "--- account aliases ---") walk the same retained
+// documents to repair account attribution, and run in this order:
+//
+//   node dist/run.js learn-account-aliases --adapter <module path> [--dry-run]
+//   node dist/run.js reattribute-accounts  --adapter <module path> [--dry-run]
+//
+// The first learns which printed account number belongs to which account and
+// writes `account_aliases`; the second moves the rows the pre-alias
+// resolution misfiled and closes their review items. See that section's own
+// header for why the order is not a preference.
 
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -60,13 +71,27 @@ import {
   type RetainedMediaType,
 } from "./adapter.js";
 import {
+  accountIdsByExternalKey,
   adapterPullToImportDocuments,
   persistAcquiredDocument,
   resolveDiscoveredAccounts,
   resolveInstitution,
   type AdapterPull,
 } from "./adapterImport.js";
-import { readCaptureManifestById } from "./captures.js";
+import {
+  closeResolvedAccountKeyItems,
+  countHoldingsByAccount,
+  countOpenReviewItems,
+  HOLDING_TABLES,
+  insertAccountAliases,
+  maskAccountKey,
+  moveHoldings,
+  planAccountAliases,
+  type AliasObservation,
+  type HoldingTable,
+  type MovedHolding,
+} from "./accountAliases.js";
+import { readCaptureManifestById, type CaptureManifest } from "./captures.js";
 import {
   publishImport,
   type ImportBatch,
@@ -789,16 +814,95 @@ function accountsByExternalKeyLoader(
   return (institutionId: string) => {
     let cached = cache.get(institutionId);
     if (cached === undefined) {
-      cached = client
-        .query<{ external_key: string; id: string }>(
-          "SELECT external_key, id FROM accounts WHERE institution_id = $1 AND external_key IS NOT NULL",
-          [institutionId],
-        )
-        .then((result) => new Map(result.rows.map((row) => [row.external_key, row.id])));
+      // F1-56: `accounts.external_key` plus every learned `account_aliases`
+      // key, so a holdings row carrying a statement's printed number
+      // resolves exactly as a row carrying the API's key does.
+      cached = accountIdsByExternalKey(client, institutionId);
       cache.set(institutionId, cached);
     }
     return cached;
   };
+}
+
+/**
+ * The documents a walk over retained bytes can read: everything with
+ * `retained_sha256`, optionally narrowed to one institution or to documents
+ * that never parsed. Shared by `reparse`, `learn-account-aliases` and
+ * `reattribute-accounts`, all three of which walk the same corpus and differ
+ * only in what they do with each parse.
+ */
+async function selectRetainedDocuments(
+  client: ArchiveClient,
+  filter: { onlyUnparsed?: boolean; institutionId?: string } = {},
+): Promise<ReparseDocumentRow[]> {
+  const conditions = ["retained_sha256 IS NOT NULL"];
+  const params: unknown[] = [];
+  if (filter.onlyUnparsed === true) conditions.push("parsed_ok = FALSE");
+  if (filter.institutionId !== undefined) {
+    params.push(filter.institutionId);
+    conditions.push(`institution_id = $${params.length}`);
+  }
+  const { rows } = await client.query<ReparseDocumentRow>(
+    `SELECT id, institution_id, account_id, doc_type, doc_date, file_path, sha256,
+            retained_sha256, media_type, capture_id
+     FROM documents
+     WHERE ${conditions.join(" AND ")}
+     ORDER BY id`,
+    params,
+  );
+  return rows;
+}
+
+type OpenedDocument = {
+  readonly manifest: CaptureManifest;
+  readonly capturePath: string;
+  readonly captureSha256: string;
+  readonly bytes: Uint8Array;
+};
+
+/**
+ * One retained document's capture manifest and its verified bytes, or null
+ * when the capture is not one of the two document tiers a single-file parse
+ * applies to (`REPARSEABLE_TIERS`). Reads the raw tree only: no browser, no
+ * network, no `discover()`/`acquire()`.
+ */
+function openRetainedDocument(
+  rawTreeRoot: string,
+  doc: ReparseDocumentRow,
+): OpenedDocument | null {
+  const capture = readCaptureManifestById(rawTreeRoot, doc.capture_id);
+  if (!REPARSEABLE_TIERS.has(capture.manifest.capabilityTier)) return null;
+  return {
+    manifest: capture.manifest,
+    capturePath: capture.path,
+    captureSha256: capture.manifestSha256,
+    bytes: readAndVerify(
+      rawDocumentPath(rawTreeRoot, doc.retained_sha256),
+      doc.retained_sha256,
+    ),
+  };
+}
+
+/** Every distinct `accountExternalKey` one parse printed, across activity and
+ * all three holdings kinds -- the account keys that document names. */
+function printedAccountKeys(parsed: {
+  activity: readonly { accountExternalKey?: string }[];
+  holdings: {
+    positions: readonly { accountExternalKey?: string }[];
+    balances: readonly { accountExternalKey?: string }[];
+    liabilities: readonly { accountExternalKey?: string }[];
+  };
+}): string[] {
+  const keys = new Set<string>();
+  for (const row of [
+    ...parsed.activity,
+    ...parsed.holdings.positions,
+    ...parsed.holdings.balances,
+    ...parsed.holdings.liabilities,
+  ]) {
+    if (row.accountExternalKey !== undefined) keys.add(row.accountExternalKey);
+  }
+  return [...keys];
 }
 
 async function runReparse(args: readonly string[]): Promise<void> {
@@ -839,13 +943,7 @@ async function runReparse(args: readonly string[]): Promise<void> {
   };
 
   try {
-    const { rows: documents } = await pgClient.query<ReparseDocumentRow>(
-      `SELECT id, institution_id, account_id, doc_type, doc_date, file_path, sha256,
-              retained_sha256, media_type, capture_id
-       FROM documents
-       WHERE retained_sha256 IS NOT NULL${onlyUnparsed ? " AND parsed_ok = FALSE" : ""}
-       ORDER BY id`,
-    );
+    const documents = await selectRetainedDocuments(pgClient, { onlyUnparsed });
     outcome.documentsConsidered = documents.length;
 
     for (const doc of documents) {
@@ -854,17 +952,12 @@ async function runReparse(args: readonly string[]): Promise<void> {
       // the same isolation the ordinary pass gives each document-tier pull
       // (see `flushDocBatch` above).
       await withArchiveTransaction(pgClient, async (tx) => {
-        const capture = readCaptureManifestById(rawTreeRoot, doc.capture_id);
-        const manifest = capture.manifest;
-        if (!REPARSEABLE_TIERS.has(manifest.capabilityTier)) {
+        const opened = openRetainedDocument(rawTreeRoot, doc);
+        if (opened === null) {
           outcome.documentsSkippedTier += 1;
           return;
         }
-
-        const bytes = readAndVerify(
-          rawDocumentPath(rawTreeRoot, doc.retained_sha256),
-          doc.retained_sha256,
-        );
+        const { manifest, bytes } = opened;
         const parsed = await adapter.parse({ kind: manifest.capabilityTier, bytes });
         const textPath = parsed.extractedText
           ? writeRetainedText(rawTreeRoot, parsed.extractedText).path
@@ -906,7 +999,7 @@ async function runReparse(args: readonly string[]): Promise<void> {
             // reparse writes no new capture, so these name the real capture
             // and document already on disk (both just verified above)
             // rather than inventing one.
-            capturePath: capture.path,
+            capturePath: opened.capturePath,
             documentWrite: {
               path: rawDocumentPath(rawTreeRoot, doc.retained_sha256),
               sha256: doc.retained_sha256,
@@ -914,9 +1007,9 @@ async function runReparse(args: readonly string[]): Promise<void> {
             },
             textWrite: null,
             captureWrite: {
-              path: capture.path,
+              path: opened.capturePath,
               status: "already_exists",
-              manifestSha256: capture.manifestSha256,
+              manifestSha256: opened.captureSha256,
             },
           },
           activityTaxonomy: capabilities.activityTaxonomy,
@@ -985,10 +1078,482 @@ function printReparseSummary(
   }
 }
 
+// --- account aliases (F1-56) ----------------------------------------------
+//
+// Two operator subcommands over the same walk `reparse` uses, and in this
+// order:
+//
+//   node dist/run.js learn-account-aliases --adapter <module path> [--dry-run]
+//   node dist/run.js reattribute-accounts  --adapter <module path> [--dry-run]
+//
+// The first learns which printed account number belongs to which account and
+// writes `account_aliases`; the second moves the rows the old resolution
+// misfiled and closes their review items.
+//
+// The order is not a preference. After aliases exist, a *reparse* of a
+// consolidated statement resolves its sections to the right accounts and,
+// because `row_hash` includes the account, inserts them as new rows next to
+// the misfiled ones it cannot see -- two copies of one holding. Re-attributing
+// first moves the existing rows (hash and all), after which that same reparse
+// finds every row already stored and inserts nothing. Both commands print
+// what they would do under `--dry-run` and write nothing.
+//
+// `--adapter` is required by both, including `reattribute-accounts`: nothing
+// stored on a misfiled row says which account number it was printed under
+// (see accountAliases.ts's "re-attribution" header), so the only way to know
+// is to read the document again through the same `parse()`.
+
+/** The institution one of these commands operates on, read-only: `run.ts`'s
+ * ordinary pass upserts this row from `capabilities()`, and a command that
+ * only walks documents already in the archive must not create one. */
+async function requireInstitutionId(
+  client: ArchiveClient,
+  slug: string,
+): Promise<string> {
+  const found = await client.query<{ id: string }>(
+    "SELECT id FROM institutions WHERE slug = $1",
+    [slug],
+  );
+  const id = found.rows[0]?.id;
+  if (id === undefined) {
+    throw new Error(
+      `no institutions row with slug ${JSON.stringify(slug)}; this archive has never ` +
+        "imported anything from this adapter, so there is nothing to learn from",
+    );
+  }
+  return id;
+}
+
+type AliasCommandArgs = {
+  readonly adapter: string;
+  readonly dryRun: boolean;
+  readonly now: Date;
+};
+
+function parseAliasCommandArgs(args: readonly string[]): AliasCommandArgs {
+  const { values } = parseArgs({
+    args: [...args],
+    options: {
+      adapter: { type: "string" },
+      "dry-run": { type: "boolean", default: false },
+      now: { type: "string" },
+    },
+  });
+  if (!values.adapter) throw new Error("--adapter <module path> is required");
+  const now = values.now ? new Date(values.now) : new Date();
+  if (Number.isNaN(now.getTime())) {
+    throw new Error(`--now ${values.now} is not a valid date`);
+  }
+  return { adapter: values.adapter, dryRun: values["dry-run"] === true, now };
+}
+
+type AliasWalkOutcome = {
+  considered: number;
+  skippedTier: number;
+  singleNumber: number;
+  multiNumber: number;
+};
+
+async function runLearnAccountAliases(args: readonly string[]): Promise<void> {
+  const { adapter: adapterPath, dryRun, now } = parseAliasCommandArgs(args);
+  const adapter = await loadAdapter(adapterPath);
+  const rawTreeRoot = resolveRawTreeRoot();
+  const pgClient = createArchiveClient();
+  await pgClient.connect();
+
+  const walk: AliasWalkOutcome = {
+    considered: 0,
+    skippedTier: 0,
+    singleNumber: 0,
+    multiNumber: 0,
+  };
+
+  try {
+    const institutionId = await requireInstitutionId(
+      pgClient,
+      adapter.institutionSlug,
+    );
+    const resolved = await accountIdsByExternalKey(pgClient, institutionId);
+
+    const documents = await selectRetainedDocuments(pgClient, { institutionId });
+    walk.considered = documents.length;
+
+    const observations: AliasObservation[] = [];
+    for (const doc of documents) {
+      const opened = openRetainedDocument(rawTreeRoot, doc);
+      if (opened === null) {
+        walk.skippedTier += 1;
+        continue;
+      }
+      const parsed = await adapter.parse({
+        kind: opened.manifest.capabilityTier,
+        bytes: opened.bytes,
+      });
+      const keys = printedAccountKeys(parsed);
+      if (keys.length === 0) continue;
+      if (keys.length === 1) walk.singleNumber += 1;
+      else walk.multiNumber += 1;
+      observations.push({ accountId: doc.account_id, keys });
+    }
+
+    const learning = planAccountAliases(observations, (key) => resolved.has(key));
+    const written = dryRun
+      ? 0
+      : await withArchiveTransaction(pgClient, (tx) =>
+          insertAccountAliases(
+            tx,
+            institutionId,
+            learning.accepted,
+            "statement_number",
+            `learned ${now.toISOString()} by learn-account-aliases: the number this account's ` +
+              "single-number documents printed, agreed across all of them",
+          ),
+        );
+
+    console.log(`mode: learn-account-aliases${dryRun ? " (dry run)" : ""}`);
+    console.log(`documents considered: ${walk.considered}`);
+    console.log(
+      `documents skipped (not a document-tier capture): ${walk.skippedTier}`,
+    );
+    console.log(`documents printing one account number: ${walk.singleNumber}`);
+    console.log(
+      `documents printing several account numbers: ${walk.multiNumber}`,
+    );
+    console.log(`account numbers seen: ${learning.seen}`);
+    console.log(`accepted: ${learning.accepted.size}`);
+    console.log(`ambiguous: ${learning.ambiguous.length}`);
+    console.log(`unmapped: ${learning.unmapped.length}`);
+    // Shape and a short digest, never the digits (see maskAccountKey).
+    for (const key of learning.ambiguous) {
+      console.log(`  ambiguous: ${maskAccountKey(key)}`);
+    }
+    for (const key of learning.unmapped) {
+      console.log(`  unmapped: ${maskAccountKey(key)}`);
+    }
+    console.log(`aliases written: ${written}`);
+    if (learning.accepted.size > 0) {
+      console.log(
+        "next: reattribute-accounts (--dry-run first), before any reparse of these documents",
+      );
+    }
+  } finally {
+    await closeArchiveClient(pgClient);
+  }
+}
+
+type ReattributionPlan = {
+  readonly doc: ReparseDocumentRow;
+  readonly fromAccountId: string;
+  readonly targets: Record<HoldingTable, Map<string, string>>;
+};
+
+type ReattributionOutcome = {
+  considered: number;
+  skippedTier: number;
+  documentsPlanned: number;
+  examined: number;
+  hashMismatch: number;
+  collision: number;
+  conflictingLocators: number;
+  moved: MovedHolding[];
+  reviewItemsClosed: number;
+};
+
+/**
+ * Which account each of this document's holdings should be under, keyed by
+ * the one thing recorded on both the parsed holding and the stored row:
+ * `source_locator`. Only locators whose target differs from the account the
+ * document was pulled under appear; a locator two parsed holdings disagree
+ * about is dropped rather than guessed at, and counted.
+ */
+function planDocumentTargets(
+  parsed: {
+    holdings: {
+      positions: readonly { accountExternalKey?: string; locators: unknown }[];
+      balances: readonly { accountExternalKey?: string; locators: unknown }[];
+      liabilities: readonly { accountExternalKey?: string; locators: unknown }[];
+    };
+  },
+  fromAccountId: string,
+  resolved: ReadonlyMap<string, string>,
+): { targets: Record<HoldingTable, Map<string, string>>; conflicts: number } {
+  const targets: Record<HoldingTable, Map<string, string>> = {
+    positions: new Map(),
+    balances: new Map(),
+    liabilities: new Map(),
+  };
+  let conflicts = 0;
+  const conflicted: Record<HoldingTable, Set<string>> = {
+    positions: new Set(),
+    balances: new Set(),
+    liabilities: new Set(),
+  };
+  const byTable: Record<HoldingTable, readonly { accountExternalKey?: string; locators: unknown }[]> = {
+    positions: parsed.holdings.positions,
+    balances: parsed.holdings.balances,
+    liabilities: parsed.holdings.liabilities,
+  };
+  for (const table of HOLDING_TABLES) {
+    for (const holding of byTable[table]) {
+      if (holding.accountExternalKey === undefined) continue;
+      const target = resolved.get(holding.accountExternalKey);
+      if (target === undefined || target === fromAccountId) continue;
+      // The stored column is exactly this, written by adapterImport.ts.
+      const locator = JSON.stringify(holding.locators);
+      if (conflicted[table].has(locator)) continue;
+      const existing = targets[table].get(locator);
+      if (existing !== undefined && existing !== target) {
+        targets[table].delete(locator);
+        conflicted[table].add(locator);
+        conflicts += 1;
+        continue;
+      }
+      targets[table].set(locator, target);
+    }
+  }
+  return { targets, conflicts };
+}
+
+async function runReattributeAccounts(args: readonly string[]): Promise<void> {
+  const { adapter: adapterPath, dryRun, now } = parseAliasCommandArgs(args);
+  const adapter = await loadAdapter(adapterPath);
+  const rawTreeRoot = resolveRawTreeRoot();
+  const pgClient = createArchiveClient();
+  await pgClient.connect();
+
+  const outcome: ReattributionOutcome = {
+    considered: 0,
+    skippedTier: 0,
+    documentsPlanned: 0,
+    examined: 0,
+    hashMismatch: 0,
+    collision: 0,
+    conflictingLocators: 0,
+    moved: [],
+    reviewItemsClosed: 0,
+  };
+
+  try {
+    const institutionId = await requireInstitutionId(
+      pgClient,
+      adapter.institutionSlug,
+    );
+    const resolved = await accountIdsByExternalKey(pgClient, institutionId);
+
+    // The whole walk runs before any write: parsing a few hundred statements
+    // is minutes of CPU, and holding one transaction open across it (on a
+    // hosted endpoint, no less) buys nothing -- the plan is a pure function
+    // of immutable retained bytes, so nothing it reads can change under it.
+    const documents = await selectRetainedDocuments(pgClient, { institutionId });
+    outcome.considered = documents.length;
+    const plans: ReattributionPlan[] = [];
+    for (const doc of documents) {
+      const opened = openRetainedDocument(rawTreeRoot, doc);
+      if (opened === null) {
+        outcome.skippedTier += 1;
+        continue;
+      }
+      // A document with no account of its own filed nothing under a pull
+      // account, so there is nothing here to move off one.
+      if (doc.account_id === null) continue;
+      const parsed = await adapter.parse({
+        kind: opened.manifest.capabilityTier,
+        bytes: opened.bytes,
+      });
+      const { targets, conflicts } = planDocumentTargets(
+        parsed,
+        doc.account_id,
+        resolved,
+      );
+      outcome.conflictingLocators += conflicts;
+      if (HOLDING_TABLES.every((table) => targets[table].size === 0)) continue;
+      plans.push({ doc, fromAccountId: doc.account_id, targets });
+    }
+    outcome.documentsPlanned = plans.length;
+
+    const touched = new Set<string>();
+    for (const plan of plans) {
+      touched.add(plan.fromAccountId);
+      for (const table of HOLDING_TABLES) {
+        for (const target of plan.targets[table].values()) touched.add(target);
+      }
+    }
+    const accountIds = [...touched];
+    const openBefore = await countOpenReviewItems(pgClient, "unknown_account_key");
+    const before = await holdingsSnapshot(pgClient, accountIds);
+
+    let openAfter = openBefore;
+    let after = before;
+    let gates: WholeArchiveGates | null = null;
+
+    try {
+      await withArchiveTransaction(pgClient, async (tx) => {
+        for (const plan of plans) {
+          for (const table of HOLDING_TABLES) {
+            const result = await moveHoldings(
+              tx,
+              table,
+              plan.doc.id,
+              plan.fromAccountId,
+              plan.targets[table],
+            );
+            outcome.examined += result.examined;
+            outcome.hashMismatch += result.hashMismatch;
+            outcome.collision += result.collision;
+            outcome.moved.push(...result.moved);
+          }
+        }
+
+        outcome.reviewItemsClosed = await closeResolvedAccountKeyItems(
+          tx,
+          [...resolved.keys()],
+          `resolved ${now.toISOString()} by reattribute-accounts: this account key now ` +
+            "resolves through accounts.external_key or account_aliases",
+          now,
+        );
+
+        // F1-59's incremental gates, scoped to exactly the periods these
+        // moves could have shifted -- on both sides: the account a snapshot
+        // left needs re-deriving as much as the one it joined.
+        gates = {
+          cash: await runReconciliationGate(tx, undefined, {
+            snapshots: outcome.moved
+              .filter((move) => move.table === "balances")
+              .flatMap((move) => [
+                { accountId: move.fromAccountId, date: move.asOf },
+                { accountId: move.toAccountId, date: move.asOf },
+              ]),
+            activity: [],
+          }),
+          positions: await runPositionReconciliationGate(tx, undefined, {
+            snapshots: outcome.moved
+              .filter(
+                (move) => move.table === "positions" && move.instrumentId !== null,
+              )
+              .flatMap((move) => [
+                {
+                  accountId: move.fromAccountId,
+                  instrumentId: move.instrumentId!,
+                  date: move.asOf,
+                },
+                {
+                  accountId: move.toAccountId,
+                  instrumentId: move.instrumentId!,
+                  date: move.asOf,
+                },
+              ]),
+            activity: [],
+          }),
+        };
+
+        openAfter = await countOpenReviewItems(tx, "unknown_account_key");
+        after = await holdingsSnapshot(tx, accountIds);
+        if (dryRun) throw new DryRunRollback();
+      });
+    } catch (error) {
+      if (!(error instanceof DryRunRollback)) throw error;
+    }
+
+    printReattributionSummary(outcome, dryRun, {
+      accountIds,
+      openBefore,
+      openAfter,
+      before,
+      after,
+      gates,
+    });
+  } finally {
+    await closeArchiveClient(pgClient);
+  }
+}
+
+/** Thrown to roll back a `--dry-run` through `withArchiveTransaction`'s own
+ * rollback-on-throw, exactly as `DryRunAbort` does for the ordinary pass. */
+class DryRunRollback extends Error {
+  constructor() {
+    super("dry run: rolled back, nothing committed");
+  }
+}
+
+type HoldingsSnapshot = Record<HoldingTable, Map<string, number>>;
+
+async function holdingsSnapshot(
+  client: ArchiveClient,
+  accountIds: readonly string[],
+): Promise<HoldingsSnapshot> {
+  return {
+    positions: await countHoldingsByAccount(client, "positions", accountIds),
+    balances: await countHoldingsByAccount(client, "balances", accountIds),
+    liabilities: await countHoldingsByAccount(client, "liabilities", accountIds),
+  };
+}
+
+function printReattributionSummary(
+  outcome: ReattributionOutcome,
+  dryRun: boolean,
+  counts: {
+    accountIds: readonly string[];
+    openBefore: number;
+    openAfter: number;
+    before: HoldingsSnapshot;
+    after: HoldingsSnapshot;
+    gates: WholeArchiveGates | null;
+  },
+): void {
+  console.log(`mode: reattribute-accounts${dryRun ? " (dry run)" : ""}`);
+  console.log(`documents considered: ${outcome.considered}`);
+  console.log(
+    `documents skipped (not a document-tier capture): ${outcome.skippedTier}`,
+  );
+  console.log(`documents with rows to move: ${outcome.documentsPlanned}`);
+  console.log(`rows examined: ${outcome.examined}`);
+  for (const table of HOLDING_TABLES) {
+    const moved = outcome.moved.filter((move) => move.table === table).length;
+    console.log(`${table} moved: ${moved}`);
+  }
+  console.log(`rows left (row hash mismatch): ${outcome.hashMismatch}`);
+  console.log(
+    `rows left (target account already holds this row): ${outcome.collision}`,
+  );
+  console.log(
+    `locators with conflicting target accounts: ${outcome.conflictingLocators}`,
+  );
+  console.log(
+    `open unknown_account_key items: ${counts.openBefore} -> ${counts.openAfter}`,
+  );
+  console.log(`review items closed: ${outcome.reviewItemsClosed}`);
+  for (const accountId of counts.accountIds) {
+    const parts = HOLDING_TABLES.map(
+      (table) =>
+        `${table} ${counts.before[table].get(accountId) ?? 0} -> ${counts.after[table].get(accountId) ?? 0}`,
+    );
+    console.log(`  account ${accountId}: ${parts.join(", ")}`);
+  }
+  if (counts.gates === null) {
+    console.log("gates: skipped (nothing moved)");
+  } else {
+    console.log(
+      `gates cash: checked=${counts.gates.cash.periodsChecked} pass=${counts.gates.cash.passed} ` +
+        `fail=${counts.gates.cash.failed} unverified=${counts.gates.cash.unverified}`,
+    );
+    console.log(
+      `gates positions: checked=${counts.gates.positions.periodsChecked} ` +
+        `pass=${counts.gates.positions.passed} fail=${counts.gates.positions.failed} ` +
+        `unverified=${counts.gates.positions.unverified}`,
+    );
+  }
+}
+
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   if (argv[0] === "reparse") {
     return runReparse(argv.slice(1));
+  }
+  if (argv[0] === "learn-account-aliases") {
+    return runLearnAccountAliases(argv.slice(1));
+  }
+  if (argv[0] === "reattribute-accounts") {
+    return runReattributeAccounts(argv.slice(1));
   }
 
   const { values } = parseArgs({
@@ -1073,6 +1638,13 @@ async function main(): Promise<void> {
       institutionId,
       discovered.accounts,
     );
+    // F1-56. What a *row* resolves its own `accountExternalKey` against:
+    // every account key this institution answers to, which is the map above
+    // plus every learned `account_aliases` key (a statement's printed
+    // number). The selection file still names accounts by discovered key
+    // alone -- an alias is a thing documents print, not a thing an operator
+    // writes in a selection -- so `accountsByExternalKey` keeps that job.
+    const rowAccountKeys = await accountIdsByExternalKey(pgClient, institutionId);
 
     const accountLast4Cache = new Map<string, string | null>();
 
@@ -1213,8 +1785,8 @@ async function main(): Promise<void> {
           // ParsedRow.accountExternalKey (an institution-wide pull's rows,
           // or any row an adapter attributes this way) against the accounts
           // this run already discovered, instead of always importing under
-          // `accountId` above.
-          accountsByExternalKey,
+          // `accountId` above. F1-56: and against every learned alias.
+          accountsByExternalKey: rowAccountKeys,
         },
         kind: spec.selection.kind,
         contentHash: acquired.manifest.contentHash,

@@ -157,6 +157,7 @@ export {
   type ImportPosition,
   type ImportChanges,
   type ImportRow,
+  type AdapterReviewItem,
   type ImportSummary,
   type PublishSummary,
 } from "./importer.js";
@@ -176,6 +177,15 @@ export {
   type PositionReconciliationGateSummary,
 } from "./positionReconciliation.js";
 export {
+  ACCOUNT_ALIAS_KINDS,
+  maskAccountKey,
+  planAccountAliases,
+  type AccountAliasKind,
+  type AliasLearning,
+  type AliasObservation,
+} from "./accountAliases.js";
+export {
+  accountIdsByExternalKey,
   adapterPullToImportDocuments,
   persistAcquiredDocument,
   resolveDiscoveredAccounts,

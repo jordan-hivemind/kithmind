@@ -262,10 +262,34 @@ export type ImportDocument = {
    */
   textPath?: string | null;
   rows: readonly ImportRow[];
+  /** F1-56. What the adapter seam flagged about this document's own rows,
+   * written here so it lands with a `source_document_id`. */
+  reviewItems?: readonly AdapterReviewItem[];
   /** Most documents (activity pulls) carry none of these. */
   positions?: readonly ImportPosition[];
   balances?: readonly ImportBalance[];
   liabilities?: readonly ImportLiability[];
+};
+
+/**
+ * F1-56. One review item an adapter pull opened while mapping this document
+ * (adapterImport.ts's `resolveRowAccountId`, `resolveInstrumentId`'s weak
+ * symbol match, `classifyActivity`'s taxonomy violations), carried on the
+ * document rather than written at the seam.
+ *
+ * The seam runs before any `documents` row exists, so every item it wrote
+ * itself carried a null `source_document_id` -- 116,828 of them on the
+ * owner's archive, none joinable back to the document whose content they are
+ * evidence about. `importBatch` knows the document id, so it writes them.
+ * That also means a document the whole-document skip passes over reopens
+ * none of them, instead of writing the same `weak_instrument_match` rows
+ * again on every reparse of an already-imported document.
+ */
+export type AdapterReviewItem = {
+  readonly kind: string;
+  readonly accountId: string | null;
+  readonly rawValue: string | null;
+  readonly reason: string;
 };
 
 export type ImportBatch = {
@@ -1228,6 +1252,24 @@ export async function importBatch(
           "UPDATE documents SET text_path = COALESCE(text_path, $2) WHERE id = $1",
           [documentId, document.textPath],
         );
+      }
+
+      // F1-56. The seam's own items for this document, now that there is a
+      // document id to point them at. Pushed straight onto the buffer rather
+      // than through `openReview`, whose `ReviewCandidate.rawValue` is
+      // non-null: `document_unparsed` and an unresolved-instrument match can
+      // both legitimately have none.
+      for (const item of document.reviewItems ?? []) {
+        reviews.push([
+          randomUUID(),
+          item.kind,
+          item.accountId,
+          documentId,
+          null,
+          item.rawValue,
+          item.reason,
+        ]);
+        reviewItemsOpened += 1;
       }
 
       // Fresh per document: the occurrence ordinal is scoped to one document

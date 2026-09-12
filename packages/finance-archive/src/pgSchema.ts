@@ -400,6 +400,66 @@ ALTER TABLE liabilities
   ADD CONSTRAINT liabilities_row_hash_unique UNIQUE (row_hash);
 `;
 
+
+// F1-56. One account is known by more than one key. Morgan Stanley's API
+// reports a `keyAccountNo` (the key `discover()` returns and
+// `accounts.external_key` holds), while the statement PDFs print a
+// different number entirely, and no digit rule turns one into the other.
+// A holdings row parsed out of a statement therefore carries a key that
+// resolves to nothing, and lands under whichever account the document was
+// pulled under (66,965 rows on the owner's archive, one
+// `unknown_account_key` review item each). This table is the second key
+// space: alternate external keys an account is *also* known by, learned
+// from the documents themselves (`run.ts learn-account-aliases`).
+//
+// `kind` names which key space a row belongs to, because the two are not
+// interchangeable: a `statement_number` is what a document prints, an
+// `api_key` is what the site's own listings use. Nothing branches on it
+// today -- resolution treats every alias the same -- but a key with no
+// recorded provenance is a key nobody can later audit.
+//
+// UNIQUE (institution_id, external_key) mirrors `accounts_external_key_unique`:
+// one key names at most one account within an institution, and two
+// institutions may reuse a spelling. The foreign key is composite against
+// `accounts (id, institution_id)` -- hence the UNIQUE added to `accounts`
+// first -- so an alias cannot be scoped to one institution while naming an
+// account in another, which would silently mis-scope that uniqueness.
+//
+// Deliberately *not* enforced here: that an alias key is not already some
+// other account's `accounts.external_key`. Postgres has no cross-table
+// unique constraint, and a trigger is a lot of machinery for a case
+// resolution already decides deterministically -- `external_key` is
+// consulted first and an alias can only ever be a second chance, never an
+// override (see `accountIdsByExternalKey` in adapterImport.ts). The
+// learning command refuses to write such a key in the first place.
+//
+// No grant: `pgReaderRole.ts` grants SELECT at the time it runs, and its
+// own suite asserts a table a later migration adds is *not* silently
+// readable. The read surface (`mcp/pgRead.ts`) does not read this table, so
+// nothing here needs one; re-run `applyPgReaderRole` if that ever changes.
+const ACCOUNT_ALIASES = `
+ALTER TABLE accounts
+  ADD CONSTRAINT accounts_id_institution_unique UNIQUE (id, institution_id);
+
+CREATE TABLE account_aliases (
+  id TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL,
+  institution_id TEXT NOT NULL,
+  external_key TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('api_key', 'statement_number')),
+  -- How this alias came to be believed: the learning rule and its evidence,
+  -- never the key itself in some other spelling.
+  learned_note TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT account_aliases_account_fkey
+    FOREIGN KEY (account_id, institution_id)
+    REFERENCES accounts (id, institution_id) ON DELETE CASCADE,
+  CONSTRAINT account_aliases_key_unique UNIQUE (institution_id, external_key)
+);
+
+CREATE INDEX account_aliases_account ON account_aliases (account_id);
+`;
+
 /** Every migration, in order. The last one's version is the current schema. */
 export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
   {
@@ -427,6 +487,11 @@ export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
     name: "positions, balances and liabilities gain a deduplication row_hash",
     sql: HOLDING_ROW_HASH,
   },
+  {
+    version: 6,
+    name: "account_aliases: alternate external keys per account",
+    sql: ACCOUNT_ALIASES,
+  },
 ]);
 
 /** The version an archive reaches once every migration has been applied. */
@@ -448,6 +513,7 @@ export const PG_TABLES: readonly string[] = Object.freeze([
   "reconciliations",
   "position_reconciliations",
   "review_items",
+  "account_aliases",
 ]);
 
 /**
