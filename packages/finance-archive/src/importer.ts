@@ -43,10 +43,12 @@ import {
   withArchiveTransaction,
 } from "./pgStore.js";
 import {
+  type CashGateScope,
   runReconciliationGate,
   type ReconciliationGateSummary,
 } from "./reconciliation.js";
 import {
+  type PositionGateScope,
   runPositionReconciliationGate,
   type PositionReconciliationGateSummary,
 } from "./positionReconciliation.js";
@@ -307,6 +309,20 @@ export type ImportSummary = {
   /** Always 0 here; `publishImport` reports what the gates found. */
   reconciliationsPassed: number;
   reconciliationsFailed: number;
+  /**
+   * F1-59. The rows this run actually inserted, as keys: what the two
+   * reconciliation gates need to check only the periods this import could
+   * have moved, instead of every period in the archive. Deduplicated and
+   * bounded by the run's own inserts -- a deduplicated or refused row
+   * changed nothing and appears here nowhere.
+   */
+  changed: ImportChanges;
+};
+
+/** Which periods `publishImport` hands each gate (F1-59). */
+export type ImportChanges = {
+  cash: CashGateScope;
+  positions: PositionGateScope;
 };
 
 /**
@@ -433,6 +449,12 @@ type PreparedHolding = {
   pending: ReviewCandidate[];
   accountId: string | null;
   sourceLocator: string;
+  /**
+   * F1-59. What this holding is called in its table's reconciliation scope,
+   * recorded only if it actually inserts. Null for a holding no gate checks:
+   * a liability, or a position with no instrument to pair snapshots on.
+   */
+  changedKey: string | null;
 };
 
 /** `transactions`' provider-id identity: per account, not global. */
@@ -466,10 +488,19 @@ export async function publishImport(
 ): Promise<PublishSummary> {
   return withArchiveTransaction(client, async (tx) => {
     const summary = await importBatch(tx, batch, now);
-    const cash = await runReconciliationGate(tx, summary.importRunId);
+    // F1-59: scoped to what this import inserted, so publishing a document
+    // costs a handful of round trips against the periods that document
+    // moved rather than a whole-archive pass. `run.ts` runs the
+    // whole-archive form once at the end of a run.
+    const cash = await runReconciliationGate(
+      tx,
+      summary.importRunId,
+      summary.changed.cash,
+    );
     const positions = await runPositionReconciliationGate(
       tx,
       summary.importRunId,
+      summary.changed.positions,
     );
     return {
       ...summary,
@@ -511,6 +542,14 @@ export async function importBatch(
   let rowsRefused = 0;
   let reviewItemsOpened = 0;
   let reviewItemsResolved = 0;
+
+  // F1-59. The keys of every row this run inserts, deduplicated as strings
+  // so a 20,000-row pull carries a few hundred of them rather than 20,000.
+  // Only inserts: a deduplicated row is content the archive already held and
+  // moves no verdict, and a refused one never landed at all.
+  const changedTransactions = new Set<string>();
+  const changedPositions = new Set<string>();
+  const changedBalances = new Set<string>();
 
   // F1-51. Review items are buffered in the order they are opened and
   // written with one multi-row INSERT per document (`flushReviews`), rather
@@ -808,6 +847,9 @@ export async function importBatch(
         source_document_id: documentId,
         source_locator: p.row.sourceLocator,
       });
+      changedTransactions.add(
+        `${p.row.accountId}\u0000${p.row.instrumentId ?? ""}\u0000${p.row.processDate}`,
+      );
       toInsert.push(p.values);
       for (const candidate of p.pending) {
         openReview(p.row.accountId, documentId, p.row.sourceLocator, candidate);
@@ -912,6 +954,10 @@ export async function importBatch(
       pending,
       accountId,
       sourceLocator: position.sourceLocator,
+      changedKey:
+        position.instrumentId === null
+          ? null
+          : `${accountId}\u0000${position.instrumentId}\u0000${position.asOf}`,
       values: [
         randomUUID(),
         accountId,
@@ -985,6 +1031,7 @@ export async function importBatch(
       pending,
       accountId,
       sourceLocator: balance.sourceLocator,
+      changedKey: `${accountId}\u0000${balance.asOf}`,
       values: [
         randomUUID(),
         accountId,
@@ -1042,6 +1089,7 @@ export async function importBatch(
       pending,
       accountId,
       sourceLocator: liability.sourceLocator,
+      changedKey: null,
       values: [
         randomUUID(),
         institutionId,
@@ -1073,6 +1121,7 @@ export async function importBatch(
     columns: readonly string[],
     prepared: readonly PreparedHolding[],
     documentId: string,
+    changed: Set<string> | null,
   ): Promise<boolean> {
     if (prepared.length === 0) return false;
     const found = await client.query<{ row_hash: string }>(
@@ -1090,6 +1139,7 @@ export async function importBatch(
         continue;
       }
       seen.add(p.hash);
+      if (changed !== null && p.changedKey !== null) changed.add(p.changedKey);
       toInsert.push(p.values);
       for (const candidate of p.pending) {
         openReview(p.accountId, documentId, p.sourceLocator, candidate);
@@ -1264,6 +1314,7 @@ export async function importBatch(
           POSITION_COLUMNS,
           preparedPositions,
           documentId,
+          changedPositions,
         )
       ) {
         anySuccess = true;
@@ -1288,6 +1339,7 @@ export async function importBatch(
           BALANCE_COLUMNS,
           preparedBalances,
           documentId,
+          changedBalances,
         )
       ) {
         anySuccess = true;
@@ -1310,6 +1362,7 @@ export async function importBatch(
           LIABILITY_COLUMNS,
           preparedLiabilities,
           documentId,
+          null,
         )
       ) {
         anySuccess = true;
@@ -1369,8 +1422,38 @@ export async function importBatch(
       reviewItemsResolved,
       reconciliationsPassed: 0,
       reconciliationsFailed: 0,
+      changed: {
+        cash: {
+          snapshots: [...changedBalances].map(toCashChange),
+          activity: [...changedTransactions].map((key) => {
+            const [accountId = "", , date = ""] = key.split("\u0000");
+            return { accountId, date };
+          }),
+        },
+        positions: {
+          snapshots: [...changedPositions].map(toPositionChange),
+          // A transaction with no instrument moves no position series.
+          activity: [...changedTransactions]
+            .filter((key) => key.split("\u0000")[1] !== "")
+            .map(toPositionChange),
+        },
+      },
     };
   });
+}
+
+function toCashChange(key: string): { accountId: string; date: string } {
+  const [accountId = "", date = ""] = key.split("\u0000");
+  return { accountId, date };
+}
+
+function toPositionChange(key: string): {
+  accountId: string;
+  instrumentId: string;
+  date: string;
+} {
+  const [accountId = "", instrumentId = "", date = ""] = key.split("\u0000");
+  return { accountId, instrumentId, date };
 }
 
 /**

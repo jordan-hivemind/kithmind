@@ -45,6 +45,7 @@ import { compareDecimal, subtractDecimal } from "./decimal.js";
 import { fromNumericText } from "./pgNumeric.js";
 import {
   type ArchiveClient,
+  insertRows,
   lockArchiveForWrite,
   withArchiveTransaction,
 } from "./pgStore.js";
@@ -82,8 +83,47 @@ export type PositionReconciliationGateSummary = {
   coverageGaps: readonly PositionCoverageGap[];
 };
 
+/**
+ * One (account, instrument, date) an import actually inserted a row at
+ * (F1-59). `date` is `positions.as_of` for a stated snapshot and
+ * `transactions.process_date` for activity.
+ */
+export type PositionChange = {
+  accountId: string;
+  instrumentId: string;
+  date: string;
+};
+
+/**
+ * What one import changed, as the importer itself observed it: the rows it
+ * inserted, never a table scan. Passing it runs the gate incrementally --
+ * only the periods that import could have moved -- instead of over the whole
+ * archive. See `runPositionReconciliationGate`.
+ */
+export type PositionGateScope = {
+  /** `positions` rows this import inserted. */
+  snapshots: readonly PositionChange[];
+  /** `transactions` rows this import inserted that name an instrument. */
+  activity: readonly PositionChange[];
+};
+
 /** Canonical decimal text. The gate's tolerance policy: exact zero. */
 const TOLERANCE = "0";
+
+/** The column order the batched verdict INSERT binds its tuples in. */
+const VERDICT_COLUMNS = [
+  "id",
+  "account_id",
+  "instrument_id",
+  "period_start",
+  "period_end",
+  "expected_change",
+  "computed_change",
+  "delta",
+  "tolerance",
+  "status",
+  "notes",
+] as const;
 
 type PositionPairRow = {
   account_id: string;
@@ -123,6 +163,13 @@ type AccountHistory = {
  * Like the cash gate, this is one transaction that joins the caller's when
  * there is one, so `publishImport` publishes rows and both verdicts together.
  *
+ * F1-59. With no `scope` this is the whole-archive pass, run once at the end
+ * of an operator run. With one it checks only the periods that import could
+ * have moved (see `scopedPairs`) and writes the same rows for them, which is
+ * what keeps a per-document gate proportional to the document rather than to
+ * the archive. Either way the work is batched: a pass costs a fixed handful
+ * of round trips instead of four per period.
+ *
  * When `importRunId` is given, that run's counters are incremented and a
  * note is appended. `unverified` counts toward `reconciliations_failed`, as
  * it does for cash: neither is a clean pass and `import_runs` has no third
@@ -132,30 +179,23 @@ type AccountHistory = {
 export async function runPositionReconciliationGate(
   client: ArchiveClient,
   importRunId?: string,
+  scope?: PositionGateScope,
 ): Promise<PositionReconciliationGateSummary> {
   return withArchiveTransaction(client, async () => {
     await lockArchiveForWrite(client);
 
-    // One row per account, instrument and snapshot after the first, paired
-    // with its immediately preceding snapshot. This is the anchor: the
-    // comparison is between two consecutive stated positions, never against
-    // zero. An account/instrument with 0 or 1 snapshots yields no period,
-    // which is not a failure -- there is simply nothing to check yet.
-    const pairs = await client.query<PositionPairRow>(
-      `SELECT account_id, instrument_id, as_of, quantity, prev_as_of, prev_quantity
-       FROM (
-         SELECT
-           account_id, instrument_id, as_of, quantity,
-           LAG(as_of) OVER (PARTITION BY account_id, instrument_id ORDER BY as_of) AS prev_as_of,
-           LAG(quantity) OVER (PARTITION BY account_id, instrument_id ORDER BY as_of) AS prev_quantity
-         FROM positions
-         WHERE instrument_id IS NOT NULL
-       ) AS paired
-       WHERE prev_as_of IS NOT NULL
-       ORDER BY account_id, instrument_id, as_of`,
-    );
+    const pairs =
+      scope === undefined
+        ? (await client.query<PositionPairRow>(pairSql(""))).rows
+        : await scopedPairs(client, scope);
 
-    const histories = new Map<string, AccountHistory>();
+    // F1-59. Everything the loop below needs is fetched before it, in a
+    // fixed number of round trips rather than four per period: the archive
+    // is hosted, so a gate's cost is messages, not rows. The verdict logic
+    // itself is unchanged -- same inputs, same comparisons, same notes.
+    const histories = await accountHistories(client, pairs);
+    const computed = await sumQuantityWindows(client, pairs);
+
     const gapPeriods = new Map<string, number>();
     const accounts = new Set<string>();
     const instruments = new Set<string>();
@@ -163,11 +203,20 @@ export async function runPositionReconciliationGate(
     let failed = 0;
     let unverified = 0;
 
-    for (const pair of pairs.rows) {
+    // Keyed, so two pairs that land on the same period (a series carrying
+    // two snapshots at one as_of) leave exactly one row, the later one --
+    // what a DELETE-then-INSERT per pair already did.
+    const verdicts = new Map<string, unknown[]>();
+
+    for (const [index, pair] of pairs.entries()) {
       const periodStart = pair.prev_as_of;
       const periodEnd = pair.as_of;
-      const history = await accountHistory(client, histories, pair.account_id);
-      const result = await reconcilePeriod(client, pair, history);
+      const history = histories.get(pair.account_id) ?? EMPTY_HISTORY;
+      const result = reconcilePeriod(
+        pair,
+        history,
+        computed[index] ?? { error: "the period was not summed" },
+      );
 
       if (result.status === "pass") passed += 1;
       else if (result.status === "fail") failed += 1;
@@ -182,16 +231,8 @@ export async function runPositionReconciliationGate(
         );
       }
 
-      await client.query(
-        `DELETE FROM position_reconciliations
-         WHERE account_id = $1 AND instrument_id = $2 AND period_start = $3 AND period_end = $4`,
-        [pair.account_id, pair.instrument_id, periodStart, periodEnd],
-      );
-      await client.query(
-        `INSERT INTO position_reconciliations
-           (id, account_id, instrument_id, period_start, period_end,
-            expected_change, computed_change, delta, tolerance, status, notes)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+      verdicts.set(
+        periodKey(pair.account_id, pair.instrument_id, periodStart, periodEnd),
         [
           randomUUID(),
           pair.account_id,
@@ -208,6 +249,17 @@ export async function runPositionReconciliationGate(
       );
     }
 
+    // A snapshot inserted between two existing ones ends the period that
+    // used to span it, so the verdict for that span is not stale, it is
+    // about a period that no longer exists. A whole-archive pass over the
+    // same rows would never produce it; deleting it is what keeps the two
+    // forms producing the same table.
+    if (scope !== undefined) await deleteSpannedVerdicts(client, scope);
+    await deleteVerdicts(client, [...verdicts.values()]);
+    await insertRows(client, "position_reconciliations", VERDICT_COLUMNS, [
+      ...verdicts.values(),
+    ]);
+
     const coverageGaps: PositionCoverageGap[] = [];
     for (const [accountId, periodsUnverified] of gapPeriods) {
       const history = histories.get(accountId);
@@ -222,7 +274,7 @@ export async function runPositionReconciliationGate(
 
     if (importRunId !== undefined) {
       await appendImportRunNote(client, importRunId, {
-        periodsChecked: pairs.rows.length,
+        periodsChecked: pairs.length,
         passed,
         failed,
         unverified,
@@ -232,7 +284,7 @@ export async function runPositionReconciliationGate(
     }
 
     return {
-      periodsChecked: pairs.rows.length,
+      periodsChecked: pairs.length,
       passed,
       failed,
       unverified,
@@ -244,34 +296,218 @@ export async function runPositionReconciliationGate(
 }
 
 /**
+ * One row per account, instrument and snapshot after the first, paired with
+ * its immediately preceding snapshot. This is the anchor: the comparison is
+ * between two consecutive stated positions, never against zero. An
+ * account/instrument with 0 or 1 snapshots yields no period, which is not a
+ * failure -- there is simply nothing to check yet.
+ *
+ * `seriesPredicate` narrows which series are paired at all, and nothing
+ * else: one template so the incremental form cannot drift from the
+ * whole-archive one. It is this file's own literal, never caller input.
+ */
+function pairSql(seriesPredicate: string): string {
+  return `SELECT account_id, instrument_id, as_of, quantity, prev_as_of, prev_quantity
+     FROM (
+       SELECT
+         account_id, instrument_id, as_of, quantity,
+         LAG(as_of) OVER (PARTITION BY account_id, instrument_id ORDER BY as_of) AS prev_as_of,
+         LAG(quantity) OVER (PARTITION BY account_id, instrument_id ORDER BY as_of) AS prev_quantity
+       FROM positions
+       WHERE instrument_id IS NOT NULL${seriesPredicate}
+     ) AS paired
+     WHERE prev_as_of IS NOT NULL
+     ORDER BY account_id, instrument_id, as_of`;
+}
+
+const SERIES_IN_SCOPE = `
+         AND (account_id, instrument_id) IN (
+           SELECT s.a, s.i FROM unnest($1::text[], $2::text[]) AS s(a, i)
+         )`;
+
+function seriesKey(accountId: string, instrumentId: string): string {
+  return `${accountId}\u0000${instrumentId}`;
+}
+
+function periodKey(
+  accountId: string,
+  instrumentId: string,
+  periodStart: string,
+  periodEnd: string,
+): string {
+  return `${accountId}\u0000${instrumentId}\u0000${periodStart}\u0000${periodEnd}`;
+}
+
+/**
+ * The periods one import could have moved, and no others (F1-59). Three
+ * things make a period's verdict different from the one already stored, and
+ * all three are derivable from what the import inserted:
+ *
+ *   1. A stated snapshot at one of the period's two ends changed, so the
+ *      expected change did.
+ *   2. A transaction landed inside the period's window, so the computed
+ *      change did.
+ *   3. The period's stored verdict is not a `pass`. A backdated transaction
+ *      moves an account's earliest acquired activity earlier, which can turn
+ *      an `unverified` coverage gap anywhere in that account into a real
+ *      verdict -- including for instruments this import never touched. Every
+ *      such period is already sitting in the table saying it did not pass,
+ *      so rechecking exactly those costs one query and is bounded by the
+ *      outstanding-not-passed count, not by the archive.
+ *
+ * A `pass` cannot go the other way: transactions are only ever inserted, so
+ * an account's earliest activity only ever moves earlier and coverage only
+ * ever improves.
+ */
+async function scopedPairs(
+  client: ArchiveClient,
+  scope: PositionGateScope,
+): Promise<PositionPairRow[]> {
+  const series = new Map<string, PositionChange>();
+  const changedDates = new Map<string, Set<string>>();
+  const activityDates = new Map<string, string[]>();
+  const accounts = new Set<string>();
+
+  for (const change of scope.snapshots) {
+    const key = seriesKey(change.accountId, change.instrumentId);
+    series.set(key, change);
+    accounts.add(change.accountId);
+    const dates = changedDates.get(key) ?? new Set<string>();
+    dates.add(change.date);
+    changedDates.set(key, dates);
+  }
+  for (const change of scope.activity) {
+    const key = seriesKey(change.accountId, change.instrumentId);
+    series.set(key, change);
+    accounts.add(change.accountId);
+    const dates = activityDates.get(key) ?? [];
+    dates.push(change.date);
+    activityDates.set(key, dates);
+  }
+
+  const recheck = new Set<string>();
+  if (accounts.size > 0) {
+    const stale = await client.query<{
+      account_id: string;
+      instrument_id: string;
+      period_start: string;
+      period_end: string;
+    }>(
+      `SELECT account_id, instrument_id, period_start, period_end
+       FROM position_reconciliations
+       WHERE account_id = ANY($1::text[]) AND status <> 'pass'`,
+      [[...accounts]],
+    );
+    for (const row of stale.rows) {
+      series.set(seriesKey(row.account_id, row.instrument_id), {
+        accountId: row.account_id,
+        instrumentId: row.instrument_id,
+        date: row.period_end,
+      });
+      recheck.add(
+        periodKey(
+          row.account_id,
+          row.instrument_id,
+          row.period_start,
+          row.period_end,
+        ),
+      );
+    }
+  }
+
+  if (series.size === 0) return [];
+  const inScope = [...series.values()];
+  const paired = await client.query<PositionPairRow>(pairSql(SERIES_IN_SCOPE), [
+    inScope.map((s) => s.accountId),
+    inScope.map((s) => s.instrumentId),
+  ]);
+
+  return paired.rows.filter((pair) => {
+    const key = seriesKey(pair.account_id, pair.instrument_id);
+    const changed = changedDates.get(key);
+    if (changed?.has(pair.as_of) === true) return true;
+    if (changed?.has(pair.prev_as_of) === true) return true;
+    const activity = activityDates.get(key);
+    if (
+      activity?.some(
+        (date) => date >= pair.prev_as_of && date <= pair.as_of,
+      ) === true
+    ) {
+      return true;
+    }
+    return recheck.has(
+      periodKey(
+        pair.account_id,
+        pair.instrument_id,
+        pair.prev_as_of,
+        pair.as_of,
+      ),
+    );
+  });
+}
+
+/** One statement for every period about to be rewritten. */
+async function deleteVerdicts(
+  client: ArchiveClient,
+  verdicts: readonly (readonly unknown[])[],
+): Promise<void> {
+  if (verdicts.length === 0) return;
+  await client.query(
+    `DELETE FROM position_reconciliations r
+     USING unnest($1::text[], $2::text[], $3::date[], $4::date[])
+       AS k(account_id, instrument_id, period_start, period_end)
+     WHERE r.account_id = k.account_id AND r.instrument_id = k.instrument_id
+       AND r.period_start = k.period_start AND r.period_end = k.period_end`,
+    [
+      verdicts.map((v) => v[1]),
+      verdicts.map((v) => v[2]),
+      verdicts.map((v) => v[3]),
+      verdicts.map((v) => v[4]),
+    ],
+  );
+}
+
+/** One statement for every period a newly stated snapshot cut in half. */
+async function deleteSpannedVerdicts(
+  client: ArchiveClient,
+  scope: PositionGateScope,
+): Promise<void> {
+  if (scope.snapshots.length === 0) return;
+  await client.query(
+    `DELETE FROM position_reconciliations r
+     USING unnest($1::text[], $2::text[], $3::date[])
+       AS c(account_id, instrument_id, as_of)
+     WHERE r.account_id = c.account_id AND r.instrument_id = c.instrument_id
+       AND r.period_start < c.as_of AND r.period_end > c.as_of`,
+    [
+      scope.snapshots.map((s) => s.accountId),
+      scope.snapshots.map((s) => s.instrumentId),
+      scope.snapshots.map((s) => s.date),
+    ],
+  );
+}
+
+/**
  * One period's verdict. Never throws: any problem that prevents a verdict is
  * `unverified` with a note, so one bad account, instrument or period never
  * blocks reconciling every other one.
  */
-async function reconcilePeriod(
-  client: ArchiveClient,
+function reconcilePeriod(
   pair: PositionPairRow,
   history: AccountHistory,
-): Promise<PeriodResult> {
+  window: WindowSum,
+): PeriodResult {
   const periodStart = pair.prev_as_of;
-  let computedChange: string;
-  try {
-    computedChange = await sumQuantityWindow(
-      client,
-      pair.account_id,
-      pair.instrument_id,
-      periodStart,
-      pair.as_of,
-    );
-  } catch (error) {
+  if ("error" in window) {
     return {
       status: "unverified",
       expectedChange: null,
       computedChange: null,
       delta: null,
-      notes: `could not sum transaction quantities for the period: ${messageOf(error)}`,
+      notes: `could not sum transaction quantities for the period: ${window.error}`,
     };
   }
+  const computedChange = window.total;
 
   // Ambiguous quantity (ground rule 5): a snapshot the importer already sent
   // to review with a null quantity cannot be diffed, and counting it as zero
@@ -348,60 +584,107 @@ function isCoverageGap(history: AccountHistory, periodStart: string): boolean {
   );
 }
 
+/** One period's summed transaction quantities, or why there is no sum. */
+type WindowSum = { total: string } | { error: string };
+
 /**
- * Sums signed transaction quantities in [periodStart, periodEnd] for one
- * account and instrument. An empty window is a valid 0: a period with no
- * activity should show no stated change. Summed by Postgres, where NUMERIC
- * adds exactly, and read back as decimal text.
+ * Sums signed transaction quantities in [periodStart, periodEnd] for every
+ * period at once (F1-59), one round trip instead of one per period. An empty
+ * window is a valid 0: a period with no activity should show no stated
+ * change. Summed by Postgres, where NUMERIC adds exactly, and read back as
+ * decimal text.
  *
  * An ambiguous quantity the importer already sent to review is excluded
  * rather than guessed. Excluding a real movement is exactly what should
  * surface as a nonzero delta instead of being masked.
+ *
+ * A failure is still per period rather than thrown: one window that cannot
+ * be decoded leaves that period unverified with the note it always had.
  */
-async function sumQuantityWindow(
+async function sumQuantityWindows(
   client: ArchiveClient,
-  accountId: string,
-  instrumentId: string,
-  periodStart: string,
-  periodEnd: string,
-): Promise<string> {
-  const result = await client.query<{ total: string | null }>(
-    `SELECT sum(quantity)::text AS total FROM transactions
-     WHERE account_id = $1 AND instrument_id = $2
-       AND process_date >= $3 AND process_date <= $4
-       AND quantity IS NOT NULL`,
-    [accountId, instrumentId, periodStart, periodEnd],
-  );
-  const total = result.rows[0]?.total;
-  return total === null || total === undefined ? "0" : fromNumericText(total);
+  pairs: readonly PositionPairRow[],
+): Promise<WindowSum[]> {
+  if (pairs.length === 0) return [];
+  let rows: readonly { i: number; total: string | null }[];
+  try {
+    const result = await client.query<{ i: number; total: string | null }>(
+      `SELECT w.i::int AS i, sum(t.quantity)::text AS total
+       FROM unnest($1::text[], $2::text[], $3::date[], $4::date[])
+         WITH ORDINALITY AS w(account_id, instrument_id, period_start, period_end, i)
+       LEFT JOIN transactions t
+         ON t.account_id = w.account_id
+        AND t.instrument_id = w.instrument_id
+        AND t.process_date >= w.period_start
+        AND t.process_date <= w.period_end
+        AND t.quantity IS NOT NULL
+       GROUP BY w.i`,
+      [
+        pairs.map((p) => p.account_id),
+        pairs.map((p) => p.instrument_id),
+        pairs.map((p) => p.prev_as_of),
+        pairs.map((p) => p.as_of),
+      ],
+    );
+    rows = result.rows;
+  } catch (error) {
+    return pairs.map(() => ({ error: messageOf(error) }));
+  }
+
+  const totals = new Map<number, string | null>();
+  for (const row of rows) totals.set(row.i, row.total);
+  return pairs.map((_, index) => {
+    const total = totals.get(index + 1);
+    try {
+      return {
+        total:
+          total === null || total === undefined ? "0" : fromNumericText(total),
+      };
+    } catch (error) {
+      return { error: messageOf(error) };
+    }
+  });
 }
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-async function accountHistory(
+/** An account with neither acquired activity nor a stated position. */
+const EMPTY_HISTORY: AccountHistory = Object.freeze({
+  earliestTransaction: null,
+  firstStatedPositionAsOf: null,
+});
+
+/**
+ * How far back activity and stated positions reach, for every account with a
+ * period to check, in one round trip (F1-59) rather than one per account.
+ */
+async function accountHistories(
   client: ArchiveClient,
-  cache: Map<string, AccountHistory>,
-  accountId: string,
-): Promise<AccountHistory> {
-  const cached = cache.get(accountId);
-  if (cached !== undefined) return cached;
-  const earliest = await client.query<{
+  pairs: readonly PositionPairRow[],
+): Promise<Map<string, AccountHistory>> {
+  const histories = new Map<string, AccountHistory>();
+  const accounts = [...new Set(pairs.map((pair) => pair.account_id))];
+  if (accounts.length === 0) return histories;
+  const result = await client.query<{
+    account_id: string;
     earliest_transaction: string | null;
     first_stated_position: string | null;
   }>(
-    `SELECT
-       (SELECT min(process_date) FROM transactions WHERE account_id = $1) AS earliest_transaction,
-       (SELECT min(as_of) FROM positions WHERE account_id = $1) AS first_stated_position`,
-    [accountId],
+    `SELECT a.account_id,
+       (SELECT min(process_date) FROM transactions WHERE account_id = a.account_id) AS earliest_transaction,
+       (SELECT min(as_of) FROM positions WHERE account_id = a.account_id) AS first_stated_position
+     FROM unnest($1::text[]) AS a(account_id)`,
+    [accounts],
   );
-  const history: AccountHistory = {
-    earliestTransaction: earliest.rows[0]?.earliest_transaction ?? null,
-    firstStatedPositionAsOf: earliest.rows[0]?.first_stated_position ?? null,
-  };
-  cache.set(accountId, history);
-  return history;
+  for (const row of result.rows) {
+    histories.set(row.account_id, {
+      earliestTransaction: row.earliest_transaction,
+      firstStatedPositionAsOf: row.first_stated_position,
+    });
+  }
+  return histories;
 }
 
 /**

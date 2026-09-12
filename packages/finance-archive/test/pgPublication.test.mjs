@@ -184,6 +184,30 @@ test(
     );
     assert.equal(first.cash.passed, 1);
 
+    // Both facts read in one statement, so each sample is one snapshot.
+    const observe = async () => {
+      const observed = await one(
+        observer,
+        `SELECT
+           (SELECT count(*)::text FROM transactions) AS transactions,
+           (SELECT status FROM reconciliations WHERE account_id = $1) AS status`,
+        [ACCOUNT.id],
+      );
+      return `${observed.transactions}/${observed.status}`;
+    };
+
+    // F1-59. Sampled on both sides of the publication as well as during it.
+    // What this test proves is that no instant exists in which a reader sees
+    // two transactions against the verdict that judged one -- a statement
+    // about every sample, not about how many the polling loop happened to
+    // catch. Sampling only *during* the publication was a race against the
+    // thing being observed: a publication is now a fixed handful of round
+    // trips rather than one per period in the archive, so on a fast enough
+    // database the loop legitimately catches one instant and proves nothing.
+    // That is exactly how this failed on Postgres 17 in CI, on the
+    // sample-count guard and never on the invariant itself.
+    const samples = [await observe()];
+
     // A second document adds activity inside the same period that the stated
     // balance change no longer explains. The verdict must flip in the same
     // instant the transaction appears.
@@ -205,26 +229,22 @@ test(
       NOW,
     );
 
-    // Both facts read in one statement, so each sample is one snapshot.
-    const samples = [];
     let finished = false;
     const publication = second.finally(() => {
       finished = true;
     });
     while (!finished) {
-      const observed = await one(
-        observer,
-        `SELECT
-           (SELECT count(*)::text FROM transactions) AS transactions,
-           (SELECT status FROM reconciliations WHERE account_id = $1) AS status`,
-        [ACCOUNT.id],
-      );
-      samples.push(`${observed.transactions}/${observed.status}`);
+      samples.push(await observe());
     }
     const summary = await publication;
+    samples.push(await observe());
 
     assert.equal(summary.cash.failed, 1);
-    assert.ok(samples.length >= 2);
+    // The two settled instants, pinned rather than raced for: before the
+    // publication one transaction stands against a passing verdict, after it
+    // two stand against a failing one. The flip happened.
+    assert.equal(samples[0], "1/pass");
+    assert.equal(samples.at(-1), "2/fail");
     // One transaction with a passing verdict, or two with a failing one.
     // Never two transactions still carrying the verdict that judged one.
     for (const sample of samples) {

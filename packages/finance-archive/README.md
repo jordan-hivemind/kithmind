@@ -565,7 +565,7 @@ tied to one account).
 
 ## Reconciliation gate
 
-`runReconciliationGate(client, importRunId?)` (`src/reconciliation.ts`) is ground
+`runReconciliationGate(client, importRunId?, scope?)` (`src/reconciliation.ts`) is ground
 rule 3 made concrete: reconciliation is a gate, not a report. For every
 account with two or more `balances` snapshots, it treats each consecutive
 pair of snapshots as one statement period, sums that account's transactions
@@ -573,6 +573,43 @@ over the period (inclusive of both boundary dates), and compares the sum
 against the snapshots' stated cash change. It writes one `reconciliations`
 row per period and returns the same information as counts and period-level
 facts, never a transaction row.
+
+### Incremental scope, and what a gate pass costs (F1-59)
+
+Both gates take an optional third argument, the scope of one import, and
+`publishImport` always passes it. Without it a pass is the whole archive.
+
+The archive is hosted, so a gate's cost is round trips, not rows, and both
+numbers here are from the owner's archive at a 63 ms round trip with 3,749
+positions (about 2,700 consecutive pairs):
+
+| Form                                    | Round trips             | Why                                                 |
+| --------------------------------------- | ----------------------- | --------------------------------------------------- |
+| Before: whole archive, one query per period | ~4 per pair (~10,800) | pair query, then per period a sum, a DELETE and an INSERT |
+| Whole archive, batched                  | a fixed handful (~9)    | one pair query, one histories query, one sum query, batched DELETE and INSERT |
+| One import's scope                       | a fixed handful         | the same, over only the periods that import could have moved |
+
+A scope is derived from the rows the import itself inserted -- never a table
+scan -- and a period is in it when any of three things is true: a stated
+snapshot at one of its ends was inserted, a transaction landed inside its
+window, or its stored verdict is not a `pass`. The third is not optional: a
+backdated transaction moves an account's earliest acquired activity earlier,
+which can turn a coverage-gap `unverified` into a real verdict for periods
+that import never otherwise touched. A `pass` cannot go the other way --
+transactions are only inserted, so coverage only improves.
+
+An incremental pass also deletes the verdict for a period a newly stated
+snapshot cut in half. That period no longer exists, so a whole-archive pass
+over the same rows would never produce it, and leaving it would be the one
+way the two forms could disagree.
+
+The operator command (`src/run.ts`) therefore gates each document as it
+lands and runs one whole-archive pass at the end of the run, which is what
+its summary's counts come from. `--gates incremental` skips that final pass
+for a run another will follow; the per-document gates run either way.
+`test/gateIncremental.test.mjs` asserts the two forms leave identical rows
+over a sequence of synthetic documents, including out-of-order and backdated
+ones.
 
 **The comparison is always cash, never total value.** Market movement makes
 an exact diff possible only for a cash-like balance: an unrealized gain or
@@ -603,7 +640,7 @@ added to.
 
 ## Position quantity gate
 
-`runPositionReconciliationGate(client, importRunId?)`
+`runPositionReconciliationGate(client, importRunId?, scope?)`
 (`src/positionReconciliation.ts`) is the validation half of holdings and the
 position-side analogue of the cash gate. `publishImport` runs it against the
 same `import_runs` row the cash gate used; run them by hand only when

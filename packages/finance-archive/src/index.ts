@@ -155,19 +155,24 @@ export {
   type ImportDocument,
   type ImportLiability,
   type ImportPosition,
+  type ImportChanges,
   type ImportRow,
   type ImportSummary,
   type PublishSummary,
 } from "./importer.js";
 export {
   runReconciliationGate,
+  type CashChange,
+  type CashGateScope,
   type ReconciliationGateSummary,
   type ReconciliationOutcome,
   type ReconciliationStatus,
 } from "./reconciliation.js";
 export {
   runPositionReconciliationGate,
+  type PositionChange,
   type PositionCoverageGap,
+  type PositionGateScope,
   type PositionReconciliationGateSummary,
 } from "./positionReconciliation.js";
 export {
