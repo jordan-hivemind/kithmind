@@ -1309,24 +1309,32 @@ component's `schema_version` could otherwise answer for the archive's, and
 database that does not have it. `pgSchemaVersion` reads a schema-qualified
 table for exactly that reason.
 
-Pinning the path is done twice, because once is not enough on the archive's
-default endpoint:
+The archive's production endpoint is a **pooled** one (PgBouncer, transaction
+mode). Such a pooler rejects a `search_path` startup parameter outright --
+"unsupported startup parameter in options: search_path" -- before a single
+query runs, and even a session-level `SET` issued outside a transaction is not
+reliable there, since the pooler can hand the next transaction a different
+backend and the path is gone. So the path is pinned differently depending on
+the connection:
 
-| Where                                        | Mechanism                                        |
-| -------------------------------------------- | ------------------------------------------------ |
-| `createArchiveClient` / `createArchivePool`  | `search_path` in the connection's startup packet |
-| `applyPgSchema` and `withArchiveTransaction` | `SET LOCAL search_path`, inside the transaction  |
+| Where                                                                                        | Mechanism                                                              |
+| --------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| `createArchiveClient`                                                                         | `search_path` in the connection's startup packet -- safe because this is always a direct, non-pooled connection |
+| `createArchivePool`                                                                            | no startup parameter at all; this is what makes it pooler-compatible    |
+| `applyPgSchema`, `withArchiveTransaction`, and the read surface's own read-only transaction    | `SET LOCAL search_path`, as the first statement inside the transaction  |
 
-The archive's default endpoint is a **pooled** one, where a session-level
-`SET` issued outside a transaction is unreliable: the pooler can hand the next
-transaction a different backend and the path is gone. `SET LOCAL` inside the
-transaction is the part a pooler cannot take away. Requiring a direct endpoint
-instead would be a workaround for a defect rather than a fix, so it is not the
-answer here. `test/pgSchema.test.mjs` proves both halves against a connection
-whose ambient path is a neighbour's schema: a foreign `schema_version` holding
-version 99 is not mistaken for the archive's, and a full write path lands in
-the archive's tables while a decoy `documents` table earlier on the path stays
-empty.
+`SET LOCAL` inside the transaction is the part a pooler cannot take away, and
+every pool-backed code path relies on it rather than on any connection-level
+setting. Requiring a direct endpoint for reads instead would be a workaround
+for a defect rather than a fix, so it is not the answer here. `test/pgSchema.test.mjs`
+proves the transaction-scoped pin against a connection whose ambient path is a
+neighbour's schema: a foreign `schema_version` holding version 99 is not
+mistaken for the archive's, and a full write path lands in the archive's
+tables while a decoy `documents` table earlier on the path stays empty.
+`test/pgStore.test.mjs` proves the pool itself carries no `options` startup
+parameter, and that a read served through the pool still resolves the
+archive's tables even when the connection's session `search_path` was reset to
+`public`.
 
 A schema name is interpolated into DDL and into `SET LOCAL search_path`, where
 a bind parameter is not allowed, so it is validated as a plain lowercase
