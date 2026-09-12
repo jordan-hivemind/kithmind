@@ -25,6 +25,7 @@ import {
 import { archive, count, one, reader, skip } from "./helpers/pgArchive.mjs";
 import {
   adapterPullToImportDocuments,
+  createArchivePool,
   createSyntheticSession,
   importBatch,
   persistAcquiredDocument,
@@ -253,6 +254,42 @@ test("every operation answers, and answers the contract", { skip }, async (t) =>
     assert.ok(["complete", "partial"].includes(response.completeness));
   }
 });
+
+test(
+  "a read served through a pooled connection resolves the archive schema even when the connection's session search_path was reset to public (F1-52)",
+  { skip },
+  async (t) => {
+    const { reader: r } = await fixture(t);
+    const pool = createArchivePool(r.url, r.summary.schema);
+    t.after(() => pool.end());
+    const poolClient = await pool.connect();
+    try {
+      // What a pooler can hand back for any given checkout: a backend whose
+      // ambient search_path is not the archive's. `serveFinanceRead` must
+      // still resolve archive tables through its own `SET LOCAL`, not
+      // through anything set on the session.
+      await poolClient.query("SET search_path TO public");
+      const parsed = parseFinanceReadRequest({
+        contractVersion: 1,
+        spaceId: SPACE,
+        limit: 10,
+        operation: "get_coverage",
+      });
+      const response = await serveFinanceRead(poolClient, parsed, SPACE);
+      const settledSource = response.items.find(
+        (item) => item.sourceId === sourceIdOf(SOURCES.settled),
+      );
+      assert.ok(
+        settledSource,
+        "expected the seeded institution to be visible through the pooled " +
+          "connection; a missing source here means the read landed against " +
+          "public rather than the archive schema",
+      );
+    } finally {
+      poolClient.release();
+    }
+  },
+);
 
 test("the dataset revision is stable, and moves when the archive does", { skip }, async (t) => {
   const { owner, reader: r, seeded } = await fixture(t);

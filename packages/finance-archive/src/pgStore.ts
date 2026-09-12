@@ -148,45 +148,60 @@ export function archiveDatabaseUrl(
 export type ArchiveClient = pg.ClientBase;
 
 /**
- * How every archive connection is opened: decoding pinned per connection, and
- * `search_path` set in the startup packet so even a statement issued outside a
- * transaction resolves archive objects in the archive schema.
- *
- * The startup packet is not the whole answer, because the archive's default
- * endpoint is a pooled one, where a `SET` outside a transaction may land on a
- * backend the next transaction never sees. `withArchiveTransaction` and
- * `applyPgSchema` therefore re-pin the path with `SET LOCAL` inside their own
- * transaction, which is the part a pooler cannot take away.
+ * What every archive connection shares: decoding pinned per connection.
+ * `search_path` is deliberately not set here -- see the two functions below.
  */
-function archiveConnectionConfig(url: string, schema: string): pg.ClientConfig {
+function archiveConnectionConfig(url: string): pg.ClientConfig {
   return {
     connectionString: url,
     types: ARCHIVE_TYPES,
-    options: `-c search_path=${schema}`,
   };
 }
 
-/** A single connection to the archive, decoding and schema both pinned. */
+/**
+ * A single direct connection to the archive, decoding and schema both
+ * pinned. Unlike `createArchivePool`, this puts `search_path` in the startup
+ * packet: a direct connection is never a pooled endpoint, so a session-level
+ * `SET` sticks for the connection's whole life, and provisioning scripts and
+ * tests rely on exactly that to issue unqualified queries outside any
+ * transaction.
+ */
 export function createArchiveClient(
   url: string = archiveDatabaseUrl(),
   schema: string = archiveSchemaName(),
 ): pg.Client {
   const name = assertSchemaName(schema);
-  const client = new pg.Client(archiveConnectionConfig(url, name));
+  const client = new pg.Client({
+    ...archiveConnectionConfig(url),
+    options: `-c search_path=${name}`,
+  });
   pinArchiveSchema(client, name);
   return client;
 }
 
-/** A pool against the archive, decoding and schema both pinned. */
+/**
+ * A pool against the archive, decoding and schema both pinned, for the
+ * archive's pooled endpoint (PgBouncer, transaction mode in production).
+ *
+ * No `options` startup parameter here: a transaction-pooled endpoint hands
+ * back "unsupported startup parameter in options: search_path" and refuses
+ * the connection outright, before a single query runs. `withArchiveTransaction`
+ * and the read surface's own read-only transaction instead pin the path with
+ * `SET LOCAL` as the first statement after `BEGIN`, which is scoped to one
+ * transaction and so survives a pooler handing out a different backend
+ * connection than the last transaction used.
+ */
 export function createArchivePool(
   url: string = archiveDatabaseUrl(),
   schema: string = archiveSchemaName(),
 ): pg.Pool {
   const name = assertSchemaName(schema);
-  const pool = new pg.Pool(archiveConnectionConfig(url, name));
+  const pool = new pg.Pool(archiveConnectionConfig(url));
   pinArchiveSchema(pool, name);
   // Each client the pool opens is a separate object, and it is the client
-  // `withArchiveTransaction` is handed, so the pin has to reach it too.
+  // `withArchiveTransaction` is handed, so the pin has to reach it too. This
+  // is bookkeeping only -- a WeakMap entry, not a SQL statement -- so it
+  // carries no session-level state a pooler could scramble.
   pool.on("connect", (client) => {
     pinArchiveSchema(client, name);
   });
@@ -237,10 +252,11 @@ export async function withArchiveTransaction<T>(
   openTransactions.add(client);
   await client.query("BEGIN");
   try {
-    // Re-pinned inside the transaction, so a pooler cannot hand the next
-    // statement a backend that never saw the startup packet's path. The
-    // schema name is a validated identifier, which is why it can be
-    // interpolated where a bind parameter is not allowed.
+    // Pinned inside the transaction rather than relying on a startup packet
+    // or a session-level `SET`, so a pooler handing this transaction a
+    // different backend than the last one still resolves archive objects
+    // correctly. The schema name is a validated identifier, which is why it
+    // can be interpolated where a bind parameter is not allowed.
     await client.query(`SET LOCAL search_path TO ${archiveSchemaOf(client)}`);
     const result = await body(client);
     await client.query("COMMIT");
