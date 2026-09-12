@@ -59,12 +59,32 @@ export const cardExtractionAttemptFields = {
     v.literal("accepted"),
     v.literal("escalated"),
     v.literal("review"),
+    /**
+     * Section 5.1: a ladder step that was not configured. It is recorded so
+     * the row exists and so a skipped step can never be read as a passed one.
+     */
+    v.literal("skipped"),
   ),
   passedFieldCount: v.number(),
   droppedFieldCount: v.number(),
   failedFieldCount: v.number(),
   /** The distinct closed codes raised, sorted. Counts, never values. */
   failureCodes: v.array(v.string()),
+  /**
+   * P2-70e metering. Optional only because rows written by P2-70c and P2-70d
+   * predate the runner; every row the ladder writes carries all of them.
+   * Counts and a price, never a value and never any document text.
+   */
+  modelId: v.optional(v.string()),
+  priceTableVersion: v.optional(v.string()),
+  inputTokens: v.optional(v.number()),
+  outputTokens: v.optional(v.number()),
+  /**
+   * Integer micro-USD from the declared price table. Money never crosses a
+   * JavaScript float in this repository, and an integer never rounds.
+   */
+  costMicroUsd: v.optional(v.number()),
+  wallTimeMs: v.optional(v.number()),
   createdAt: v.number(),
 };
 
