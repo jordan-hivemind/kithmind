@@ -339,6 +339,14 @@ export type ImportSummary = {
    * holds.
    */
   reviewItemsResolved: number;
+  /**
+   * F1-60. A `document_unparsed` item this run rewrote in place because the
+   * same document, reimported, now reports a different parse note. One item
+   * per document either way: this is the same finding restated, not a second
+   * one, and an item a reviewer has already dismissed or resolved is never
+   * touched.
+   */
+  reviewItemsUpdated: number;
   /** Always 0 here; `publishImport` reports what the gates found. */
   reconciliationsPassed: number;
   reconciliationsFailed: number;
@@ -575,6 +583,7 @@ export async function importBatch(
   let rowsRefused = 0;
   let reviewItemsOpened = 0;
   let reviewItemsResolved = 0;
+  let reviewItemsUpdated = 0;
 
   // F1-59. The keys of every row this run inserts, deduplicated as strings
   // so a 20,000-row pull carries a few hundred of them rather than 20,000.
@@ -1664,20 +1673,42 @@ export async function importBatch(
         // parseNote on every rerun until a real extractor replaces this one,
         // so without this check a rerun reopens a duplicate document_unparsed
         // row forever instead of being recognized as already flagged.
-        const alreadyFlagged = await client.query(
-          "SELECT 1 FROM review_items WHERE kind = 'document_unparsed' AND source_document_id = $1",
+        const reason = document.parseNote.slice(0, 500);
+        const alreadyFlagged = await client.query<{ id: string; reason: string }>(
+          `SELECT id, reason FROM review_items
+           WHERE kind = 'document_unparsed' AND source_document_id = $1
+           ORDER BY status = 'open' DESC
+           LIMIT 1`,
           [documentId],
         );
-        if (alreadyFlagged.rowCount === 0) {
+        const flagged = alreadyFlagged.rows[0];
+        if (flagged === undefined) {
           reviews.push([
             randomUUID(),
             "document_unparsed",
             document.accountId,
             documentId,
             null,
-            null,
-            document.parseNote.slice(0, 500),
+            reason,
+            reason,
           ]);
+        } else if (flagged.reason !== reason) {
+          // F1-60. A better extractor reading the same immutable bytes reads
+          // them differently: it gets further and says so, or it names the
+          // real obstacle where the old one guessed. That is a new reading of
+          // this document, not a new document and not a second finding, so
+          // the one item this document already has is updated in place --
+          // never a second row beside a stale one saying something the
+          // parser no longer says. Only an `open` item is touched: a reviewer
+          // who dismissed or resolved one is not overruled by a rerun, which
+          // is why the row above is picked open-first and why this write
+          // narrows to `open` again.
+          const updated = await client.query(
+            `UPDATE review_items SET reason = $2, raw_value = $2
+             WHERE id = $1 AND status = 'open'`,
+            [flagged.id, reason],
+          );
+          reviewItemsUpdated += updated.rowCount ?? 0;
         }
       } else {
         // F1-55. Ground rule 1: the bytes this document was reimported from
@@ -1769,6 +1800,7 @@ export async function importBatch(
       rowsRefused,
       reviewItemsOpened,
       reviewItemsResolved,
+      reviewItemsUpdated,
       reconciliationsPassed: 0,
       reconciliationsFailed: 0,
       changed: {

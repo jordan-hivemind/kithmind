@@ -26,13 +26,28 @@ const BASE_CURRENCY = "USD";
  * the same line; there it is simply constant throughout the document.
  */
 const BARE_ACCOUNT_LINE = /^\s*(\d{3}-\d{6}-\d{3})\s*$/;
-/** The one period spelling the corpus uses: "For the Period March 1-31, 2026". */
-const PERIOD_LINE =
-  /For the Period\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})-(\d{1,2}),\s*(\d{4})/;
 const MONTHS = [
   "January", "February", "March", "April", "May", "June",
   "July", "August", "September", "October", "November", "December",
 ];
+const MONTH_NAME = `(${MONTHS.join("|")})`;
+/**
+ * The two period spellings the corpus uses. The ordinary one names the month
+ * once -- "For the Period March 1-31, 2026". F1-61: a period that opens
+ * mid-month names it twice -- "For the Period November 26-December 31, 2021"
+ * -- which older statements and a newly opened account both print, and which
+ * the one-month spelling alone read as no period at all.
+ */
+const PERIOD_LINE = new RegExp(
+  `For the Period\\s+${MONTH_NAME}\\s+(\\d{1,2})\\s*-\\s*(?:${MONTH_NAME}\\s+)?(\\d{1,2}),\\s*(\\d{4})`,
+);
+/**
+ * F1-61. The cash activity summary this institution prints alongside the
+ * statements: an `Activity Date` table and nothing else -- no period line, no
+ * BALANCE SHEET and no holdings table. It is not a statement whose layout
+ * this parser failed to read, so it does not say that it is.
+ */
+const ACTIVITY_DATE_COLUMN = /^\s*Activity Date\b/;
 /** A cell boundary: the layout puts at least two spaces between columns. */
 const CELL_GAP = /\s{2,}/;
 /** How far a cell edge may sit from a header edge and still be that column. */
@@ -242,15 +257,23 @@ function accountKeyField(key) {
   return key === null ? {} : { accountExternalKey: key };
 }
 
-/** "December", "1", "31", "2025" -> ISO period bounds. */
+/**
+ * "December", "1", "31", "2025" -> ISO period bounds, or `null` when the
+ * document states no period this can read. A cross-month period states its
+ * year once, at the end, so one that runs backwards through a year boundary
+ * ("December 26-January 5, 2022") does not say which year it opened in; that
+ * is refused rather than assumed, the same way every other unstated fact is.
+ */
 function resolvePeriod(lines) {
   for (const { text } of lines) {
     const match = PERIOD_LINE.exec(text);
     if (match === null) continue;
-    const month = String(MONTHS.indexOf(match[1]) + 1).padStart(2, "0");
-    const first = match[2].padStart(2, "0");
-    const last = match[3].padStart(2, "0");
-    return { start: `${match[4]}-${month}-${first}`, end: `${match[4]}-${month}-${last}` };
+    const startMonth = MONTHS.indexOf(match[1]);
+    const endMonth = match[3] === undefined ? startMonth : MONTHS.indexOf(match[3]);
+    if (endMonth < startMonth) return null;
+    const iso = (month, day) =>
+      `${match[5]}-${String(month + 1).padStart(2, "0")}-${day.padStart(2, "0")}`;
+    return { start: iso(startMonth, match[2]), end: iso(endMonth, match[4]) };
   }
   return null;
 }
@@ -381,6 +404,68 @@ function parseBalanceSheet(lines, anchorIndex, kind, accountKey, markerLines, te
   return { balance, liabilities };
 }
 
+/**
+ * F1-61. The cover page's own statement of the account total: a banner
+ * reading `TOTAL VALUE OF <x> ACCOUNT` with the amount alone on one of the
+ * next two lines, above an `Includes Accrued Interest` note.
+ *
+ * It is read only when the document prints no `BALANCE SHEET` block at all,
+ * and only when it names one `ACCOUNT`: the plural `ACCOUNTS` banner on a
+ * consolidated statement's cover is the household total across accounts, not
+ * any one account's balance, and is never recorded as one.
+ */
+const TOTAL_VALUE_BANNER = /TOTAL VALUE OF\s+\S+\s+ACCOUNT\b/;
+
+/**
+ * `{ balance }` when the banner states an amount, `{ statedNone: true }` when
+ * it states the em dash this layout prints for "none" (an account holding
+ * nothing, which is a fact the statement states, not one it omits), and
+ * `null` when there is no banner or nothing readable under it.
+ */
+function parseTotalValueBanner(lines, kind, asOf, accountKeys, markerLines, textMeta) {
+  const anchor = lines.findIndex(({ text }) => TOTAL_VALUE_BANNER.test(text));
+  if (anchor === -1) return null;
+  for (const line of lines.slice(anchor + 1, anchor + 3)) {
+    const cells = splitCells(line.text);
+    if (cells.length !== 1) continue;
+    const cell = cells[0];
+    if (NO_VALUE.has(cell.text)) return { statedNone: true };
+    const { value } = resolveStatementMoney(cell.text);
+    if (value === null) continue;
+    const accountLocator = accountSpanLocator(lines, markerLines, anchor, kind, textMeta);
+    const amountLocator = spanLocator(
+      kind,
+      line.page,
+      "TOTAL VALUE OF ACCOUNT",
+      textMeta,
+      line.start + cell.start,
+      line.start + cell.end,
+      cell.text,
+    );
+    return {
+      balance: {
+        sourceDocument: "statement",
+        ...accountKeyField(accountKeys[anchor]),
+        asOf,
+        totalValue: value,
+        totalValueNote:
+          "from the cover page's TOTAL VALUE OF ACCOUNT banner: this statement prints no " +
+          "BALANCE SHEET block, so it states no cash, no liability and no opening value",
+        cash: null,
+        currency: BASE_CURRENCY,
+        periodStartValue: null,
+        periodEndValue: value,
+        locators: {
+          row: locator(kind, line.page, "TOTAL VALUE OF ACCOUNT"),
+          totalValue: amountLocator,
+          ...(accountLocator === null ? {} : { account: accountLocator }),
+        },
+      },
+    };
+  }
+  return null;
+}
+
 // --- HOLDINGS ---------------------------------------------------------------
 
 /**
@@ -408,6 +493,12 @@ const HOLDINGS_COLUMNS = new Map([
   ["Total Cost", "costBasis"],
   ["Adj Total Cost", "costBasis"],
   ["Market Value", "marketValue"],
+  // F1-61. The NAV-priced fund table heads its value column `Value`, not
+  // `Market Value` (README, "Statement layout"). Bound under its own name and
+  // resolved per table by `resolveValueColumn`, because the same bare label
+  // also heads the aggregate private-holdings table's `Value + Distributions`
+  // column, which is not this holding's value.
+  ["Value", "reportedValue"],
   ["Gain/(Loss)", "unrealized"],
 ]);
 /** A cell states a value only if it carries a digit. Sub-headers reprinted
@@ -424,6 +515,29 @@ const HOLDINGS_HEADER = /^\s*Security Description\b/;
 const TOTAL_ROW = /^Total\b/;
 /** Ends a holdings table. */
 const TABLE_END = /^(TOTAL|Total Value|HOLDINGS|CASH FLOW|ACTIVITY|Page \d)/;
+/**
+ * F1-61. The page footer, the one `TABLE_END` that does not end the table:
+ * a security's lots run past the bottom of a page and the rest of them,
+ * including the `Total` row that states the position, are printed on the next
+ * page under a reprint of the same header. `parseHoldings` carries the
+ * interrupted block across to that reprint instead of refusing it.
+ */
+const PAGE_FOOTER = /^Page\s+\d+\s+of\s+\d+$/;
+/**
+ * F1-61. The sub-header a table reprints above a section's own totals rows
+ * ("Percentage of Holdings", then the value columns again). Everything from
+ * it to the next security is that section's totals, which is not a holding
+ * and -- read as one -- made the security above it look like a block with
+ * several valued rows and no `Total`.
+ */
+const SECTION_SUMMARY = /^(Percentage\b|of Holdings\b)/;
+/**
+ * F1-61. A real trade date, which is how a security's own row is told from
+ * the section-total row printed under a `SECTION_SUMMARY` sub-header: that
+ * row states the section's name in the description column and its share of
+ * holdings ("4.2%") where a lot would state the date it was bought.
+ */
+const TRADE_DATE_CELL = /^\d{1,2}\/\d{1,2}\/\d{2,4}$/;
 /** "Asset Class: Equities", printed under each security block. */
 const ASSET_CLASS = /Asset Class:\s*(.+?)\s*$/;
 /** "3M COMPANY (MMM)" -> name and symbol; anything else stays a name. */
@@ -457,6 +571,22 @@ function headerColumns(line) {
     }
   }
   return columns;
+}
+
+/**
+ * F1-61. Resolves the bare `Value` column against the table it was printed
+ * in. It is the holding's value only where the table also prices in `NAV`
+ * (the NAV-priced fund table). The aggregate private-holdings table prints
+ * the same label as part of `Value + Distributions` -- a value with
+ * distributions added into it, which is not what this holding is worth -- so
+ * there the column is dropped rather than read as a market value.
+ */
+function resolveValueColumn(columns) {
+  const pricesInNav = columns.some((column) => column.text === "NAV");
+  return columns.flatMap((column) => {
+    if (column.name !== "reportedValue") return [column];
+    return pricesInNav ? [{ ...column, name: "marketValue" }] : [];
+  });
 }
 
 /** "CUSIP 00000WNF1" on a bond's detail line. */
@@ -533,11 +663,19 @@ function positionCells(block) {
 function positionFromBlock(block, columns, context) {
   const resolved = positionCells(block);
   if (resolved === null) {
+    // F1-61. Two different failures used to share one sentence. A table with
+    // no value column this parser reads (the aggregate private-holdings
+    // table, whose only value column is `Value + Distributions`) states no
+    // value for any of its securities, which is not the same as a block whose
+    // several valued lots disagree.
     return {
       position: null,
-      reason:
-        `security block over ${block.length} line(s) states neither a Total row nor a single ` +
-        "valued lot, so no one row is this security's position",
+      reason: columns.some((column) => column.name === "marketValue")
+        ? `security block over ${block.length} line(s) states neither a Total row nor a single ` +
+          "valued lot, so no one row is this security's position"
+        : `the ${context.section} holdings table states no Market Value or NAV column this ` +
+          `parser reads, so this security block over ${block.length} line(s) states no value ` +
+          "to record",
     };
   }
   const { row, merged } = resolved;
@@ -566,7 +704,10 @@ function positionFromBlock(block, columns, context) {
   const unrealized = unrealizedCell === null ? null : resolveStatementMoney(unrealizedCell.text);
   const rowLocator = locator(context.kind, row.page, `${context.section} / ${context.description ?? "holding"}`);
 
-  const hasMarketValueColumn = columns.some((column) => column.name === "marketValue");
+  // Keyed on the printed label, not the resolved column name: F1-61's
+  // NAV-priced fund table resolves its `Value` column to the market value
+  // field, and the basis that value is carried at is still the reported NAV.
+  const hasMarketValueColumn = columns.some((column) => column.text === "Market Value");
   const valuationBasis = hasMarketValueColumn
     ? "market_price"
     : columns.some((column) => column.text === "NAV")
@@ -621,13 +762,32 @@ function positionFromBlock(block, columns, context) {
 function parseHoldings(lines, kind, asOf, accountKeys, markerLines, textMeta) {
   const positions = [];
   const skipped = [];
+  const emit = (block, columns, context) => {
+    if (block.length === 0) return;
+    const { position, reason } = positionFromBlock(block, columns, context);
+    if (position === null) skipped.push(reason);
+    else positions.push(position);
+  };
+  // F1-61. A security block a page footer interrupted, waiting for the same
+  // table to be reprinted on the next page. Flushed as it always was the
+  // moment anything other than that reprint turns up, so a block that is
+  // never continued is still read exactly as before.
+  let carried = null;
+  const flushCarried = () => {
+    if (carried === null) return;
+    emit(carried.block, carried.columns, carried.context);
+    carried = null;
+  };
+
   for (let i = 0; i < lines.length; i += 1) {
     if (!HOLDINGS_HEADER.test(lines[i].text)) continue;
     if (REALIZED_TABLE.test(lines[i].text)) continue;
-    const columns = headerColumns(lines[i].text);
+    const columns = resolveValueColumn(headerColumns(lines[i].text));
     if (!columns.some((column) => column.name === "description")) continue;
-    // The section title is the nearest preceding all-caps line.
-    const section =
+    // The section title is the nearest preceding all-caps line -- or, for a
+    // block carried across a page break, the title the security was first
+    // printed under (F1-61).
+    let section =
       [...lines.slice(Math.max(0, i - 6), i)]
         .reverse()
         .map(({ text }) => text.trim())
@@ -637,29 +797,49 @@ function parseHoldings(lines, kind, asOf, accountKeys, markerLines, textMeta) {
     // header shares the same account-number line.
     const accountLocator = accountSpanLocator(lines, markerLines, i, kind, textMeta);
 
+    const headerText = lines[i].text;
     let block = [];
     let description = null;
+    // F1-61. This table reprints the header the page footer above cut a
+    // security off under, for the same account: the rows below continue that
+    // security's block rather than starting a new one. Anything else flushes
+    // the carried block first, unchanged.
+    if (
+      carried !== null &&
+      carried.headerText === headerText &&
+      carried.context.accountKey === accountKey
+    ) {
+      block = carried.block;
+      description = carried.description;
+      section = carried.context.section;
+      carried = null;
+    }
+    flushCarried();
+
+    const context = { kind, asOf, section, accountKey, accountLocator, textMeta };
     const flush = () => {
-      if (block.length === 0) return;
-      const { position, reason } = positionFromBlock(block, columns, {
-        kind,
-        asOf,
-        section,
-        description,
-        accountKey,
-        accountLocator,
-        textMeta,
-      });
-      if (position === null) skipped.push(reason);
-      else positions.push(position);
+      emit(block, columns, { ...context, section, description });
       block = [];
     };
 
+    // True while the rows being read are the section's own totals rather than
+    // a security's (F1-61, `SECTION_SUMMARY`).
+    let inSummary = false;
+    let interruptedByPageFooter = false;
     for (let j = i + 1; j < lines.length; j += 1) {
       const text = lines[j].text;
       const trimmed = text.trim();
-      if (TABLE_END.test(trimmed) || HOLDINGS_HEADER.test(text)) break;
+      if (TABLE_END.test(trimmed) || HOLDINGS_HEADER.test(text)) {
+        interruptedByPageFooter = PAGE_FOOTER.test(trimmed);
+        break;
+      }
       if (ASSET_CLASS.test(trimmed)) continue;
+      if (SECTION_SUMMARY.test(trimmed)) {
+        flush();
+        inSummary = true;
+        i = j;
+        continue;
+      }
       const { bound } = bindRow(text, columns);
       if (bound.size === 0) continue;
       // A line whose only cell is in the description column is an asset-class
@@ -669,15 +849,33 @@ function parseHoldings(lines, kind, asOf, accountKeys, markerLines, textMeta) {
       // together. A description alongside values but no trade date is the
       // detail line beneath the security it belongs to (coupon, maturity,
       // CUSIP) and continues the block it is under.
-      if (bound.has("description") && bound.has("tradeDate")) {
+      // Inside a section summary the bar is higher: the section-total row
+      // states the section's name and a percentage, which binds to the same
+      // two columns a security's first lot does. Only a real date starts a
+      // security there.
+      const startsSecurity =
+        bound.has("description") &&
+        bound.has("tradeDate") &&
+        (!inSummary || TRADE_DATE_CELL.test(bound.get("tradeDate").text));
+      if (inSummary && !startsSecurity) {
+        i = j;
+        continue;
+      }
+      if (startsSecurity) {
+        inSummary = false;
         flush();
         description = bound.get("description").text;
       }
       block.push({ bound, page: lines[j].page, start: lines[j].start });
       i = j;
     }
-    flush();
+    if (interruptedByPageFooter && block.length > 0) {
+      carried = { block, description, columns, context: { ...context, section }, headerText };
+    } else {
+      flush();
+    }
   }
+  flushCarried();
   return { positions, skipped };
 }
 
@@ -711,12 +909,23 @@ export function parseRealStatement(text, kind) {
 
   const period = resolvePeriod(lines);
   if (period === null) {
+    // F1-61. The cash activity summary is a different document, not a
+    // statement this failed to read, and saying so is what keeps the review
+    // queue about statements whose layout still needs work.
+    const activityOnly =
+      lines.some(({ text: line }) => ACTIVITY_DATE_COLUMN.test(line)) &&
+      !lines.some(({ text: line }) => HOLDINGS_HEADER.test(line)) &&
+      !lines.some(({ text: line }) => BALANCE_SHEET_ANCHOR.test(line));
     return {
       activity: [],
       holdings: EMPTY_HOLDINGS,
-      parseNote:
-        "not parsed: no 'For the Period <Month> D-DD, YYYY' line, so the statement's own " +
-        "period is unknown and every as-of date on it would be a guess",
+      parseNote: activityOnly
+        ? "not parsed: this document is a cash activity summary, not a holdings statement: " +
+          "it prints an Activity Date table and no period line, no BALANCE SHEET and no " +
+          "holdings table. This institution's activity is read from the structured_api tier, " +
+          "so there is nothing here for this parser to read"
+        : "not parsed: no 'For the Period <Month> D-DD, YYYY' line, so the statement's own " +
+          "period is unknown and every as-of date on it would be a guess",
     };
   }
 
@@ -746,11 +955,26 @@ export function parseRealStatement(text, kind) {
     textMeta,
   );
 
+  // F1-61. A statement with no BALANCE SHEET block still states its account
+  // total on the cover page. The banner is read only here, as the fallback:
+  // where a BALANCE SHEET exists it is the better source, stating the cash
+  // and the liability too.
+  const banner =
+    sheets.length === 0
+      ? parseTotalValueBanner(lines, kind, period.end, accountKeys, markerLines, textMeta)
+      : null;
+  if (banner?.balance !== undefined) sheets.push({ balance: banner.balance, liabilities: [] });
+
   const notes = [];
   if (sheets.length === 0) {
-    notes.push(
-      "no readable BALANCE SHEET block, so no account total, cash or liability was recorded",
-    );
+    // The cover page stating the em dash is the statement saying this account
+    // holds nothing, which -- with no holdings table either -- is a document
+    // read in full, not one with a balance missing from it.
+    if (!(banner?.statedNone === true && positions.length === 0)) {
+      notes.push(
+        "no readable BALANCE SHEET block, so no account total, cash or liability was recorded",
+      );
+    }
   }
   if (skipped.length > 0) {
     notes.push(`${skipped.length} holdings block(s) left unparsed: ${skipped[0]}`);
