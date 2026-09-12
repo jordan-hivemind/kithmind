@@ -935,6 +935,41 @@ test(
   },
 );
 
+// F1-49 review fix: positionHash originally hashed only account, instrument,
+// as_of, quantity, market value, cost basis and valuation basis. Two
+// unrelated lines a statement could not resolve to an instrument
+// (instrumentId null) are identical on every one of those fields whenever
+// their stated values happen to match too, so the second silently
+// deduplicated instead of inserting. positionHash now also hashes
+// sourceLocator when instrumentId is null, which is unique per line within
+// one document.
+test(
+  "two positions with no resolvable instrument, identical stated values but different locators, both insert",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+    const summary = await importBatch(
+      client,
+      {
+        source: "synthetic-pull",
+        documents: [
+          document("19".padEnd(64, "0"), [], {
+            positions: [
+              position({ instrumentId: null, sourceLocator: "holdings:1" }),
+              position({ instrumentId: null, sourceLocator: "holdings:2" }),
+            ],
+          }),
+        ],
+      },
+      NOW,
+    );
+    assert.equal(summary.rowsInserted, 2);
+    assert.equal(summary.rowsDeduplicated, 0);
+    assert.equal(await count(client, "positions"), 2);
+  },
+);
+
 test(
   "a document declaring a position or balance with no account_id fails loudly rather than writing an orphaned row",
   { skip },

@@ -39,8 +39,12 @@ import {
 const TABLES = [
   {
     table: "positions",
+    // source_locator is read even though most positions never hash it:
+    // positionHash only mixes it in when instrument_id is null, the same
+    // conditional rowHash.ts applies, so this must supply it every time
+    // rather than guess in advance which rows need it.
     columns:
-      "id, account_id, instrument_id, as_of, quantity, market_value, cost_basis, valuation_basis",
+      "id, account_id, instrument_id, as_of, quantity, market_value, cost_basis, valuation_basis, source_locator",
     hash: (row) =>
       positionHash({
         accountId: row.account_id,
@@ -50,6 +54,7 @@ const TABLES = [
         marketValue: row.market_value,
         costBasis: row.cost_basis,
         valuationBasis: row.valuation_basis,
+        sourceLocator: row.source_locator,
       }),
   },
   {

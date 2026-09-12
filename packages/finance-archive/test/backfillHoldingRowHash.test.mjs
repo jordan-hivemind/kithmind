@@ -40,8 +40,8 @@ test(
     await seed(client);
 
     await client.query(
-      `INSERT INTO positions (id, account_id, as_of, instrument_id, quantity, market_value, cost_basis, valuation_basis, currency)
-       VALUES ('pos-1', $1, DATE '2026-03-31', NULL, '10', '500', '400', 'market_price', 'USD')`,
+      `INSERT INTO positions (id, account_id, as_of, instrument_id, quantity, market_value, cost_basis, valuation_basis, currency, source_locator)
+       VALUES ('pos-1', $1, DATE '2026-03-31', NULL, '10', '500', '400', 'market_price', 'USD', 'holdings:1')`,
       [ACCOUNT_ID],
     );
     await client.query(
@@ -69,6 +69,7 @@ test(
       marketValue: "500",
       costBasis: "400",
       valuationBasis: "market_price",
+      sourceLocator: "holdings:1",
     });
     const expectedBalance = balanceHash({
       accountId: ACCOUNT_ID,

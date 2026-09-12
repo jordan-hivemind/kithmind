@@ -523,6 +523,14 @@ what makes a document reprocessed for a reason other than the whole-document
 skip (a parse note that never clears, a sibling row sent to review) safe:
 it matches what it already stored instead of duplicating it.
 
+A position with no resolvable instrument (`instrumentId` null) is the one
+exception to "no occurrence ordinal" above: two such lines can otherwise be
+identical in every other stated field, so `positionHash` also hashes the
+position's own `sourceLocator` in that case only -- unaffected, and never
+hashed, when the instrument did resolve. The locator is stable across a
+rerun of the same document, so rerun dedupe still holds; two genuinely
+distinct unresolved lines in one statement no longer collide.
+
 `positions.row_hash`/`balances.row_hash`/`liabilities.row_hash` are nullable
 (migration version 5, `pgSchema.ts`) and unset for anything imported before
 this fix. `scripts/backfillHoldingRowHash.mjs` computes and fills them in for

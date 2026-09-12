@@ -677,6 +677,7 @@ export async function importBatch(
       marketValue,
       costBasis,
       valuationBasis,
+      sourceLocator: position.sourceLocator,
     });
     const byHash = await client.query(
       "SELECT 1 FROM positions WHERE row_hash = $1",

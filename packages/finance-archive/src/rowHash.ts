@@ -196,8 +196,16 @@ export function rowHashV2(input: RowHashInputV2): string {
 //
 // Unlike a transaction, a holding has no occurrence ordinal: a statement
 // states one quantity for one instrument as of one date, not the same fact
-// twice, so there is no legitimate reason for two holdings in one document to
-// share every field below. And unlike a transaction, the field set is
+// twice, so two *resolved* holdings in one document never legitimately share
+// every field below. An unresolved instrument is the exception -- two
+// distinct lines a statement could not resolve to an instrument (both
+// `instrumentId: null`) can otherwise be identical in every stated field, and
+// an occurrence ordinal is the wrong fix (a rerun would still need to see the
+// same order to collapse correctly, which nothing here guarantees the way
+// `importRow`'s per-document loop does). `positionHash` instead falls back to
+// the position's own `sourceLocator` when `instrumentId` is null, which is
+// stable across a rerun of the same document and distinguishes two
+// unresolved lines within one. And unlike a transaction, the field set is
 // per-table, over exactly the columns that make a *stated* holding the same
 // holding -- not `price` or `unrealized`, which are derived from `quantity`
 // and `market_value`/`cost_basis` and would make a revalued but otherwise
@@ -222,12 +230,26 @@ export type PositionHashInput = {
   marketValue: string | null;
   costBasis: string | null;
   valuationBasis: string | null;
+  /**
+   * Only hashed when `instrumentId` is null (see this section's header
+   * comment): two lines a statement gave no resolvable instrument can
+   * otherwise be identical in every other field, and the locator -- stable
+   * across a rerun of the same document -- is what keeps them apart instead
+   * of silently collapsing the second into the first. Ignored, and never
+   * hashed, when `instrumentId` is not null, so a resolved position's hash is
+   * unaffected by this field entirely. Nullable because `positions
+   * .source_locator` itself is (a hand-provisioned or pre-F1-49 row may carry
+   * none); two such rows are then still ambiguous, honestly, the same as two
+   * rows that happen to share a real locator.
+   */
+  sourceLocator: string | null;
 };
 
 /** account, instrument (or null), as_of, quantity, market value, cost basis,
- * valuation basis: the fields that make a stated position the same position. */
+ * valuation basis: the fields that make a stated position the same position.
+ * `sourceLocator` joins that set only when `instrumentId` is null. */
 export function positionHash(input: PositionHashInput): string {
-  return digest(POSITION_HASH_DOMAIN, [
+  const parts = [
     field(input.accountId),
     field(input.instrumentId),
     field(input.asOf),
@@ -239,7 +261,11 @@ export function positionHash(input: PositionHashInput): string {
       input.costBasis === null ? null : canonicalizeDecimal(input.costBasis),
     ),
     field(input.valuationBasis),
-  ]);
+  ];
+  if (input.instrumentId === null) {
+    parts.push(field(input.sourceLocator));
+  }
+  return digest(POSITION_HASH_DOMAIN, parts);
 }
 
 export type BalanceHashInput = {
