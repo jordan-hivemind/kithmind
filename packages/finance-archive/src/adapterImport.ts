@@ -246,14 +246,28 @@ async function prefetchInstruments(
   const cusips = distinct(instruments.map((i) => i.cusip));
   const isins = distinct(instruments.map((i) => i.isin));
   const symbols = distinct(instruments.map((i) => i.symbol));
+  // F1-53. A holding this parser could name only by name -- no cusip, isin
+  // or symbol at all, the shape a private or unlisted position takes -- has
+  // nothing in the three lists above to prefetch by, so without this its own
+  // previously minted row is never a candidate `resolve` can find and every
+  // reparse of the same document mints it again, changing that position's
+  // `row_hash` (which carries `instrumentId`) and re-inserting it forever.
+  // Matched only against another row that is *also* bare of all three, so
+  // this never merges a real symbol/cusip holding into a name-only one.
+  const namesOnly = distinct(
+    instruments
+      .filter((i) => !i.cusip && !i.isin && !i.symbol)
+      .map((i) => i.name),
+  );
 
   const rows: InstrumentRow[] = [];
-  if (cusips.length + isins.length + symbols.length > 0) {
+  if (cusips.length + isins.length + symbols.length + namesOnly.length > 0) {
     const found = await client.query<InstrumentRow>(
       `SELECT id, symbol, cusip, isin, name FROM instruments
         WHERE cusip = ANY($1::text[]) OR isin = ANY($2::text[]) OR symbol = ANY($3::text[])
+           OR (cusip IS NULL AND isin IS NULL AND symbol IS NULL AND name = ANY($4::text[]))
         ORDER BY ctid`,
-      [cusips, isins, symbols],
+      [cusips, isins, symbols, namesOnly],
     );
     rows.push(...found.rows);
   }
@@ -323,6 +337,24 @@ async function prefetchInstruments(
           });
           return weak.id;
         }
+      }
+      // F1-53. No cusip, isin or symbol at all -- a private or unlisted
+      // holding named only by `name` (a synthetic fund, say). Matched
+      // against another row equally bare of all three identifiers: unlike
+      // the symbol-only match above this is not flagged for review, because
+      // two holdings that state no identifier at all beyond an identical
+      // name are the ordinary case this exists for (the same position
+      // restated on a later document or reparse), not the ambiguous one a
+      // reused ticker is.
+      if (!instrument.cusip && !instrument.isin && !instrument.symbol && instrument.name) {
+        const found = rows.find(
+          (row) =>
+            row.cusip === null &&
+            row.isin === null &&
+            row.symbol === null &&
+            row.name === instrument.name,
+        );
+        if (found) return found.id;
       }
       return mint(instrument);
     },

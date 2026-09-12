@@ -1228,11 +1228,11 @@ export async function importBatch(
     changed: Set<string> | null,
   ): Promise<boolean> {
     if (prepared.length === 0) return false;
-    const found = await client.query<{ row_hash: string }>(
-      `SELECT row_hash FROM ${table} WHERE row_hash = ANY($1::text[])`,
+    const found = await client.query<{ row_hash: string; source_locator: string | null }>(
+      `SELECT row_hash, source_locator FROM ${table} WHERE row_hash = ANY($1::text[])`,
       [prepared.map((p) => p.hash)],
     );
-    const seen = new Set(found.rows.map((r) => r.row_hash));
+    const seen = new Map(found.rows.map((r) => [r.row_hash, r.source_locator]));
 
     const toInsert: unknown[][] = [];
     let anySuccess = false;
@@ -1240,9 +1240,23 @@ export async function importBatch(
       if (seen.has(p.hash)) {
         rowsDeduplicated += 1;
         anySuccess = true;
+        // F1-53. `row_hash` does not cover `source_locator` (positionHash's
+        // own doc comment): a reparse that adds an evidence binding to an
+        // otherwise-identical holding matches this stored row instead of
+        // inserting a second one, which is correct, but must not leave the
+        // old, uncited locator sitting there forever. Refresh it in place
+        // rather than re-insert (row_hash is UNIQUE, so a second row with
+        // the same hash cannot exist anyway). A second reparse computes the
+        // same locator and this becomes a no-op update.
+        if (seen.get(p.hash) !== p.sourceLocator) {
+          await client.query(
+            `UPDATE ${table} SET source_locator = $2 WHERE row_hash = $1`,
+            [p.hash, p.sourceLocator],
+          );
+        }
         continue;
       }
-      seen.add(p.hash);
+      seen.set(p.hash, p.sourceLocator);
       if (changed !== null && p.changedKey !== null) changed.add(p.changedKey);
       toInsert.push(p.values);
       for (const candidate of p.pending) {
@@ -1252,6 +1266,98 @@ export async function importBatch(
       anySuccess = true;
     }
     await insertRows(client, table, columns, toInsert);
+    return anySuccess;
+  }
+
+  /**
+   * One document's positions, balances and liabilities: `preparePosition`/
+   * `prepareBalance`/`prepareLiability` plus their own `importHoldings` call,
+   * shared between an ordinary import and the already-`parsed_ok` reparse
+   * path below (F1-53) -- holdings carry their own `row_hash` dedupe (unlike
+   * `document.rows`, gated on the document as a whole), so re-examining them
+   * on every reparse, even of a document that changed nothing, costs one
+   * dedupe query per table and is what lets a locator refresh (above) reach
+   * an already-successful document at all.
+   */
+  async function processHoldings(
+    document: ImportDocument,
+    documentId: string,
+  ): Promise<boolean> {
+    let anySuccess = false;
+
+    const preparedPositions: PreparedHolding[] = [];
+    for (const position of document.positions ?? []) {
+      const accountId = position.accountId ?? document.accountId;
+      if (accountId === null) {
+        throw new Error(
+          `document ${document.sha256} carries a position with no account_id; ` +
+            "positions.account_id and balances.account_id are NOT NULL",
+        );
+      }
+      const ready = preparePosition(position, accountId, documentId);
+      if (ready === null) rowsRefused += 1;
+      else preparedPositions.push(ready);
+    }
+    if (
+      await importHoldings(
+        "positions",
+        POSITION_COLUMNS,
+        preparedPositions,
+        documentId,
+        changedPositions,
+      )
+    ) {
+      anySuccess = true;
+    }
+
+    const preparedBalances: PreparedHolding[] = [];
+    for (const balance of document.balances ?? []) {
+      const accountId = balance.accountId ?? document.accountId;
+      if (accountId === null) {
+        throw new Error(
+          `document ${document.sha256} carries a balance with no account_id; ` +
+            "positions.account_id and balances.account_id are NOT NULL",
+        );
+      }
+      const ready = prepareBalance(balance, accountId, documentId);
+      if (ready === null) rowsRefused += 1;
+      else preparedBalances.push(ready);
+    }
+    if (
+      await importHoldings(
+        "balances",
+        BALANCE_COLUMNS,
+        preparedBalances,
+        documentId,
+        changedBalances,
+      )
+    ) {
+      anySuccess = true;
+    }
+
+    const preparedLiabilities: PreparedHolding[] = [];
+    for (const liability of document.liabilities ?? []) {
+      const ready = prepareLiability(
+        liability,
+        document.institutionId,
+        liability.accountId ?? document.accountId,
+        documentId,
+      );
+      if (ready === null) rowsRefused += 1;
+      else preparedLiabilities.push(ready);
+    }
+    if (
+      await importHoldings(
+        "liabilities",
+        LIABILITY_COLUMNS,
+        preparedLiabilities,
+        documentId,
+        null,
+      )
+    ) {
+      anySuccess = true;
+    }
+
     return anySuccess;
   }
 
@@ -1277,24 +1383,26 @@ export async function importBatch(
         [document.sha256],
       );
       const existing = found.rows[0];
-      if (existing?.parsed_ok === true) {
+      if (existing !== undefined && existing.parsed_ok === true) {
         // Ground rule 1: raw files are immutable. Byte-identical bytes that
-        // already imported successfully contribute nothing new. F1-49:
-        // `parsed_ok` true means something in this document landed last time
-        // (a row, position, balance or liability was inserted or matched),
-        // not that every one of them did -- a document with a genuinely
-        // refused row alongside successful ones is eligible for this skip.
-        // That is safe because every holding now carries its own `row_hash`
-        // (mirroring transactions' `provider_txn_id`/`row_hash`), so a
-        // document reprocessed for some other reason -- a parse note, or
-        // nothing landing at all last time -- matches its own already-stored
-        // holdings instead of duplicating them.
-        const skipped =
-          document.rows.length +
-          (document.positions?.length ?? 0) +
-          (document.balances?.length ?? 0) +
-          (document.liabilities?.length ?? 0);
-        rowsDeduplicated += skipped;
+        // already imported successfully contribute nothing new to
+        // `transactions`: `document.rows`' own occurrence-ordinal dedupe
+        // (importRow) and this document's `document_unparsed` bookkeeping
+        // both assume a document is visited at most once, so neither runs
+        // again here. F1-49: `parsed_ok` true means something in this
+        // document landed last time, not that every one of them did.
+        //
+        // F1-53: holdings are not skipped the same way. `positions`,
+        // `balances` and `liabilities` dedupe by their own `row_hash`
+        // (matches its own already-stored rows regardless of how many times
+        // a document is visited), and that hash does not cover
+        // `source_locator` -- so a reparse that adds an evidence binding to
+        // an otherwise-unchanged holding needs to reach `importHoldings`'s
+        // locator refresh even on a document already `parsed_ok`. Without
+        // this, a binding added to the parser could never reach a holding
+        // this archive already has.
+        rowsDeduplicated += document.rows.length;
+        await processHoldings(document, existing.id);
         continue;
       }
 
@@ -1414,77 +1522,9 @@ export async function importBatch(
       // F1-46: each holding's own accountId (a consolidated statement's
       // per-section attribution) wins over the document's, which stays the
       // fallback for the ordinary one-document-one-account case -- see
-      // ImportPosition.accountId's doc comment.
-      const preparedPositions: PreparedHolding[] = [];
-      for (const position of document.positions ?? []) {
-        const accountId = position.accountId ?? document.accountId;
-        if (accountId === null) {
-          throw new Error(
-            `document ${document.sha256} carries a position with no account_id; ` +
-              "positions.account_id and balances.account_id are NOT NULL",
-          );
-        }
-        const ready = preparePosition(position, accountId, documentId);
-        if (ready === null) rowsRefused += 1;
-        else preparedPositions.push(ready);
-      }
-      if (
-        await importHoldings(
-          "positions",
-          POSITION_COLUMNS,
-          preparedPositions,
-          documentId,
-          changedPositions,
-        )
-      ) {
-        anySuccess = true;
-      }
-
-      const preparedBalances: PreparedHolding[] = [];
-      for (const balance of document.balances ?? []) {
-        const accountId = balance.accountId ?? document.accountId;
-        if (accountId === null) {
-          throw new Error(
-            `document ${document.sha256} carries a balance with no account_id; ` +
-              "positions.account_id and balances.account_id are NOT NULL",
-          );
-        }
-        const ready = prepareBalance(balance, accountId, documentId);
-        if (ready === null) rowsRefused += 1;
-        else preparedBalances.push(ready);
-      }
-      if (
-        await importHoldings(
-          "balances",
-          BALANCE_COLUMNS,
-          preparedBalances,
-          documentId,
-          changedBalances,
-        )
-      ) {
-        anySuccess = true;
-      }
-
-      const preparedLiabilities: PreparedHolding[] = [];
-      for (const liability of document.liabilities ?? []) {
-        const ready = prepareLiability(
-          liability,
-          document.institutionId,
-          liability.accountId ?? document.accountId,
-          documentId,
-        );
-        if (ready === null) rowsRefused += 1;
-        else preparedLiabilities.push(ready);
-      }
-      if (
-        await importHoldings(
-          "liabilities",
-          LIABILITY_COLUMNS,
-          preparedLiabilities,
-          documentId,
-          null,
-        )
-      ) {
+      // ImportPosition.accountId's doc comment. See `processHoldings` above,
+      // shared with the already-`parsed_ok` reparse path.
+      if (await processHoldings(document, documentId)) {
         anySuccess = true;
       }
 

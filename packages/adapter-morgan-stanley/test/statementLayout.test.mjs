@@ -6,6 +6,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import adapter, {
   extractStatementText,
   parseStatementLines,
@@ -268,6 +269,102 @@ test("an unreadable market value is null with a note and a marketValue locator",
   assert.equal(position.marketValue, null);
   assert.match(position.marketValueNote, /unparseable amount/);
   assert.equal(position.locators.marketValue.source, kind);
+});
+
+// --- evidence spans (F1-53) --------------------------------------------------
+
+/** Every `retained_text_span_v1` binding a `locators` map carries. */
+function bindings(locators) {
+  return Object.values(locators)
+    .map((locator) => locator.binding)
+    .filter((binding) => binding !== undefined);
+}
+
+test("every retained-text-span binding slices `text` to its own quote", () => {
+  const parsed = parseStatementLines(STATEMENT_LAYOUT_TEXT, kind);
+  const all = [
+    ...parsed.holdings.positions.flatMap((p) => bindings(p.locators)),
+    ...parsed.holdings.balances.flatMap((b) => bindings(b.locators)),
+  ];
+  assert.ok(all.length > 0, "at least one binding was produced");
+  for (const binding of all) {
+    assert.equal(binding.format, "retained_text_span_v1");
+    assert.equal(
+      STATEMENT_LAYOUT_TEXT.slice(binding.start, binding.end),
+      binding.quote,
+    );
+    assert.equal(Array.from(binding.quote).length, binding.end - binding.start);
+  }
+});
+
+test("every binding on one document shares that document's own text identity", () => {
+  const parsed = parseStatementLines(STATEMENT_LAYOUT_TEXT, kind);
+  const all = [
+    ...parsed.holdings.positions.flatMap((p) => bindings(p.locators)),
+    ...parsed.holdings.balances.flatMap((b) => bindings(b.locators)),
+  ];
+  const expectedSha256 = createHash("sha256")
+    .update(Buffer.from(STATEMENT_LAYOUT_TEXT, "utf8"))
+    .digest("hex");
+  const expectedByteLength = Buffer.byteLength(STATEMENT_LAYOUT_TEXT, "utf8");
+  const expectedCodepointLength = Array.from(STATEMENT_LAYOUT_TEXT).length;
+  for (const binding of all) {
+    assert.equal(binding.textSha256, expectedSha256);
+    assert.equal(binding.textByteLength, expectedByteLength);
+    assert.equal(binding.textCodepointLength, expectedCodepointLength);
+  }
+});
+
+test("a position's quantity, price, cost basis and market value each carry their own span", () => {
+  const parsed = parseStatementLines(STATEMENT_LAYOUT_TEXT, kind);
+  const equity = parsed.holdings.positions.find((p) => p.instrument?.symbol === "WNDF");
+  for (const field of ["quantity", "price", "costBasis", "marketValue"]) {
+    const locator = equity.locators[field];
+    assert.ok(locator, `locators.${field} is present`);
+    assert.equal(locator.binding.format, "retained_text_span_v1");
+    assert.equal(
+      STATEMENT_LAYOUT_TEXT.slice(locator.binding.start, locator.binding.end),
+      locator.binding.quote,
+    );
+  }
+});
+
+test("a balance's totalValue and cash each carry their own span", () => {
+  const parsed = parseStatementLines(STATEMENT_LAYOUT_TEXT, kind);
+  const [balance] = parsed.holdings.balances;
+  for (const field of ["totalValue", "cash"]) {
+    const locator = balance.locators[field];
+    assert.ok(locator, `locators.${field} is present`);
+    assert.equal(
+      STATEMENT_LAYOUT_TEXT.slice(locator.binding.start, locator.binding.end),
+      locator.binding.quote,
+    );
+  }
+});
+
+test("a consolidated statement's account-number line is its own citable span", () => {
+  const parsed = parseStatementLines(CONSOLIDATED_LAYOUT_TEXT, kind);
+  const [firstBalance, secondBalance] = parsed.holdings.balances;
+  assert.equal(
+    CONSOLIDATED_LAYOUT_TEXT.slice(
+      firstBalance.locators.account.binding.start,
+      firstBalance.locators.account.binding.end,
+    ),
+    CONSOLIDATED_ACCOUNT_ONE,
+  );
+  assert.equal(
+    CONSOLIDATED_LAYOUT_TEXT.slice(
+      secondBalance.locators.account.binding.start,
+      secondBalance.locators.account.binding.end,
+    ),
+    CONSOLIDATED_ACCOUNT_TWO,
+  );
+});
+
+test("a single-account statement never had a bare account-number line, so no account span", () => {
+  const parsed = parseStatementLines(STATEMENT_LAYOUT_TEXT, kind);
+  const [balance] = parsed.holdings.balances;
+  assert.equal(balance.locators.account, undefined);
 });
 
 // F1-46: a consolidated statement is parsed, not refused. Each account's own

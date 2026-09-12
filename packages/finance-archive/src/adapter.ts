@@ -329,10 +329,14 @@ export type RawFile = {
 
 /**
  * How a `FieldLocator`'s datum resolves inside the retained bytes it came
- * from. Mirrors `StructuredFieldLocator`
- * (docs/plans/2026-09-11-structured-evidence.md, section 1) minus
- * `rawValueSha256`, which is derived from `rawValue` at assembly time rather
- * than carried here as a second copy of one fact.
+ * from. Mirrors `StructuredFieldLocator` and `RetainedTextSpanEvidence`'s
+ * locator (docs/plans/2026-09-11-structured-evidence.md, section 1; F1-53)
+ * minus `rawValueSha256`/`quoteSha256`, both derived from the carried value
+ * at assembly time rather than stored here as a second copy of one fact, and
+ * minus `relativePath`, derived from `textSha256` alone
+ * (`textRelativePath` in rawTree.ts) so a parser that knows neither the raw
+ * tree root nor the eventual `documents.text_path` can still emit a complete
+ * binding.
  */
 export type FieldBinding =
   | {
@@ -351,6 +355,22 @@ export type FieldBinding =
       readonly columnIndex: number;
       readonly columnName: string;
       readonly rawValue: string;
+    }
+  | {
+      readonly format: "retained_text_span_v1";
+      /** sha256 of the retained text artifact this span is an offset into --
+       * the same hash `writeRetainedText` persists it under, so
+       * `textRelativePath(textSha256)` names the exact file a citation
+       * resolves from. */
+      readonly textSha256: string;
+      readonly textByteLength: number;
+      readonly textCodepointLength: number;
+      /** Unicode code point offsets into the retained text, per the
+       * contract's `offsetUnit`. */
+      readonly start: number;
+      readonly end: number;
+      /** The exact substring `retainedText.slice(start, end)` names. */
+      readonly quote: string;
     };
 
 export type FieldLocator = {

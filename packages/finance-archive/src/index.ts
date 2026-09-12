@@ -204,6 +204,7 @@ export {
   resolveArchiveSpaceId,
   resolveRawTreeRoot,
   sha256HexOf,
+  textRelativePath,
   writeRawDocument,
   writeRetainedText,
   type RawTreeWriteResult,
