@@ -18,6 +18,7 @@ import { entityFields, factFields } from "./models/facts/validators";
 import { sourceAccountTables } from "./models/sourceAccounts/tables";
 import { workerTables } from "./models/workers/tables";
 import { diagnosticsTables } from "./models/diagnostics/tables";
+import { inventoryTables } from "./models/documents/inventoryTables";
 import {
   spaceFields,
   spaceMemberFields,
@@ -29,6 +30,7 @@ export default defineSchema({
   ...sourceAccountTables,
   ...workerTables,
   ...diagnosticsTables,
+  ...inventoryTables,
   ...embeddingTables,
   ...coverageTables,
   ...ingestionTables,

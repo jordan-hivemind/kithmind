@@ -575,6 +575,7 @@ function rootFailureCode(error: unknown): RootsCheck["code"] {
       case "unreadable":
         return "root_unreadable";
       case "unsupported":
+      case "encrypted":
         return "root_unsupported";
       case "enumeration_interrupted":
         return "root_scan_interrupted";

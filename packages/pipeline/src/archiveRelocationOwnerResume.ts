@@ -201,7 +201,8 @@ function frozenBaseline(
       if (
         gap.code !== "empty" &&
         gap.code !== "oversized" &&
-        gap.code !== "unsupported"
+        gap.code !== "unsupported" &&
+        gap.code !== "encrypted"
       )
         fail("invalid_input");
     } else if (outer.kind === "utf8" || outer.kind === "pdf") {

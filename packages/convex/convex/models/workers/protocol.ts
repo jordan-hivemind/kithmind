@@ -92,7 +92,8 @@ export type FsDiscoveryGapCode =
   | "permission_denied"
   | "unreadable"
   | "unstable"
-  | "unsupported";
+  | "unsupported"
+  | "encrypted";
 
 export type WorkerJobFailureCode =
   | "worker_interrupted"
@@ -1079,6 +1080,7 @@ const GAP_CODES = new Set<FsDiscoveryGapCode>([
   "unreadable",
   "unstable",
   "unsupported",
+  "encrypted",
 ]);
 const JOB_FAILURE_CODES = new Set<WorkerJobFailureCode>([
   "worker_interrupted",

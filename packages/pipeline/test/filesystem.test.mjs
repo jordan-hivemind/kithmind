@@ -317,6 +317,63 @@ test("PDF descriptor scan rejects non-PDF, hard-linked, and oversized files", as
   );
 });
 
+test("encrypted PDFs are classified as a discovery gap before any parser opens them", async () => {
+  const { root, journal } = await setup();
+  const encryptedBytes = Buffer.concat([
+    Buffer.from("%PDF-1.7\n"),
+    Buffer.from("1 0 obj << /Type /Catalog >> endobj\n"),
+    Buffer.from("trailer << /Root 1 0 R /Encrypt 2 0 R /ID [<00><00>] >>\n"),
+  ]);
+  await writeFile(join(root, "secret.pdf"), encryptedBytes);
+  const localConfig = config(root, journal);
+  const [safeRoot] = await canonicalRoots(localConfig);
+  await assert.rejects(
+    () => readPdfFile(safeRoot, "secret.pdf"),
+    (error) =>
+      error instanceof FilesystemFailure && error.code === "encrypted",
+  );
+  const observations = await discoverSourceObservations(localConfig, [
+    safeRoot,
+  ]);
+  assert.equal(observations.length, 1);
+  const [observation] = observations;
+  assert.ok(observation.kind === "gap");
+  assert.equal(observation.gap.code, "encrypted");
+  assert.equal(observation.gap.uri, "fs://test/secret.pdf");
+});
+
+test("unsupported document types are gapped by content, not by extension", async () => {
+  const { root, journal } = await setup();
+  const binary = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]);
+  await writeFile(join(root, "sheet.xlsx"), binary);
+  await writeFile(join(root, "memo.docx"), binary);
+  await writeFile(join(root, "photo.jpg"), binary);
+  await writeFile(join(root, "mystery.unknownext"), binary);
+  const localConfig = config(root, journal);
+  const [safeRoot] = await canonicalRoots(localConfig);
+  const observations = await discoverSourceObservations(localConfig, [
+    safeRoot,
+  ]);
+  assert.equal(observations.length, 4);
+  for (const observation of observations) {
+    assert.ok(observation.kind === "gap");
+    assert.equal(observation.gap.code, "unsupported");
+  }
+});
+
+test("byte-identical files are discovered independently with matching content hashes", async () => {
+  const { root, journal } = await setup();
+  const bytes = Buffer.from("synthetic duplicate content");
+  await writeFile(join(root, "dup-a.txt"), bytes);
+  await writeFile(join(root, "dup-b.txt"), bytes);
+  const localConfig = config(root, journal);
+  const [safeRoot] = await canonicalRoots(localConfig);
+  const files = await discoverFiles(localConfig, [safeRoot]);
+  assert.equal(files.length, 2);
+  assert.equal(files[0].sha256, files[1].sha256);
+  assert.equal(files[0].byteLength, files[1].byteLength);
+});
+
 test("source observation gaps are leaf-only and do not hide unsafe entries", async () => {
   const { root, journal } = await setup();
   await writeFile(join(root, "invalid.bin"), Buffer.from([0xc3, 0x28]));
