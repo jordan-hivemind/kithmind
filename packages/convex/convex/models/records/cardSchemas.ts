@@ -35,7 +35,8 @@ export type CardNormalizerId =
   | "date_v1"
   | "rate_v1"
   | "integer_v1"
-  | "clause_boolean_v1";
+  | "clause_boolean_v1"
+  | "enum_v1";
 
 export type CardFieldSchema = {
   /** Value types the gate may store for this field. */
@@ -57,6 +58,14 @@ export type CardFieldSchema = {
    * clause. Declared only for boolean fields.
    */
   clauseTerms?: readonly string[];
+  /**
+   * `enum_v1` only: the closed set of literal strings the field may store.
+   * The value must be exactly one of these and the cited span must equal it,
+   * so the field stays extractive rather than a model's paraphrase.
+   */
+  enumValues?: readonly string[];
+  /** One line of what the field means, rendered into the runner prompt. */
+  description?: string;
 };
 
 type CardKindSchema = {
@@ -94,6 +103,14 @@ export const CARD_SCHEMAS: Readonly<Record<CardRecordKind, CardKindSchema>> = {
       card_summary: { valueTypes: ["text"], normalizer: "text_v1" },
     },
   },
+  // Section 4.5: a SAFE or convertible note's event entity is the investor,
+  // kind person or organization. Entity binding is P2-70l; until then, every
+  // caller of `publishDocumentCard` omits `entityId` for this kind, so the
+  // event attaches to the source account's `subjectEntityId` instead, and
+  // `investor_entity` stores the investor's literal name as evidenced text,
+  // not as the event's bound entity. `entityKinds` below still constrains
+  // whichever entity the event does attach to (the subject placeholder
+  // today, the resolved investor after P2-70l).
   safe_note_card: {
     entityKinds: ["person", "organization"],
     fields: {
@@ -101,35 +118,79 @@ export const CARD_SCHEMAS: Readonly<Record<CardRecordKind, CardKindSchema>> = {
         valueTypes: NAME_OR_ENTITY,
         normalizer: "name_v1",
         required: true,
+        description: "The company issuing the SAFE or convertible note.",
       },
       investor_entity: {
         valueTypes: NAME_OR_ENTITY,
         normalizer: "name_v1",
         required: true,
+        description:
+          "The investor's name exactly as written. Store the literal name; entity binding happens later and is not this field's job.",
       },
       instrument_date: {
         valueTypes: ["date"],
         normalizer: "date_v1",
         required: true,
+        description: "The date the instrument is dated or executed.",
       },
       principal_amount: {
         valueTypes: ["money"],
         normalizer: "money_v1",
         required: true,
+        description: "The amount the investor is putting in.",
       },
-      valuation_cap: { valueTypes: ["money"], normalizer: "money_v1" },
-      discount_rate: { valueTypes: ["decimal"], normalizer: "rate_v1" },
+      valuation_cap: {
+        valueTypes: ["money"],
+        normalizer: "money_v1",
+        description: "The valuation cap, when the instrument states one.",
+      },
+      discount_rate: {
+        valueTypes: ["decimal"],
+        normalizer: "rate_v1",
+        description:
+          "The discount rate applied against the next round's price, when the instrument states one.",
+      },
       mfn_clause: {
         valueTypes: ["boolean"],
         normalizer: "clause_boolean_v1",
         clauseTerms: ["most favored nation", "most favoured nation", "mfn"],
+        description:
+          "Whether the investor holds a most-favored-nation (MFN) right to the terms of a later, more favorable instrument.",
       },
       pro_rata_right: {
         valueTypes: ["boolean"],
         normalizer: "clause_boolean_v1",
         clauseTerms: ["pro rata", "pro-rata"],
+        description:
+          "Whether the investor holds a pro rata right to invest in a future priced round.",
       },
-      governing_law: { valueTypes: ["text"], normalizer: "text_v1" },
+      governing_law: {
+        valueTypes: ["text"],
+        normalizer: "text_v1",
+        description: "The jurisdiction whose law governs the instrument.",
+      },
+      instrument_form: {
+        valueTypes: ["text"],
+        normalizer: "enum_v1",
+        enumValues: ["post-money SAFE", "pre-money SAFE", "convertible note"],
+        description:
+          "Which of the three instrument forms this document is, exactly as the document names it.",
+      },
+      // The two fields below apply only to a convertible note; a SAFE simply
+      // never carries a span for them, and an optional field with no span is
+      // absent rather than a review item.
+      interest_rate: {
+        valueTypes: ["decimal"],
+        normalizer: "rate_v1",
+        description:
+          "A convertible note's stated interest rate. Not applicable to a SAFE.",
+      },
+      maturity_date: {
+        valueTypes: ["date"],
+        normalizer: "date_v1",
+        description:
+          "A convertible note's maturity date. Not applicable to a SAFE.",
+      },
     },
   },
   tax_return_card: {
