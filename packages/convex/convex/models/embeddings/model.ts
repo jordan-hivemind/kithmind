@@ -1002,8 +1002,15 @@ async function insertVector(
   };
 }
 
-/** I4, delete half: drops the coverage marker the deleted row was holding. */
-async function releaseVectorCoverage(
+/**
+ * I4, delete half: drops the coverage marker the deleted row was holding.
+ *
+ * It is a no-op unless the target's marker still names this row's fingerprint,
+ * so releasing twice for one target cannot drive a counter negative. Callers
+ * that delete a duplicate rather than the last row of a target must not call
+ * it at all; see the cleanup in `migrations.ts`.
+ */
+export async function releaseVectorCoverage(
   ctx: MutationCtx,
   row: Doc<"embeddingVectors">,
 ): Promise<void> {

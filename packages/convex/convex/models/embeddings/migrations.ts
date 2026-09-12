@@ -2,7 +2,7 @@ import { v } from "convex/values";
 
 import { internalMutation } from "../../_generated/server";
 import { internal } from "../../_generated/api";
-import type { Id } from "../../_generated/dataModel";
+import type { Doc, Id } from "../../_generated/dataModel";
 import {
   BASELINE_EMBEDDING_DIMENSIONS,
   BASELINE_EMBEDDING_MODEL,
@@ -23,6 +23,7 @@ import {
   embeddingVectorSearchScope,
   failEmbeddingGeneration,
   insertThoughtEmbedding,
+  releaseVectorCoverage,
   stageEmbeddingGeneration,
 } from "./model";
 import {
@@ -33,6 +34,7 @@ import {
 } from "./targets";
 import {
   embeddingBuildPhaseValidator,
+  embeddingGenerationStateValidator,
   embeddingKindCountsValidator,
 } from "./validators";
 
@@ -794,5 +796,242 @@ export const auditSpaceCoverage = internalMutation({
       now: args.now ?? Date.now(),
     });
     return { ...audit, fingerprint };
+  },
+});
+
+// ---------------------------------------------------------------------------
+// P2-6e (lite): retired same-fingerprint vectors
+// ---------------------------------------------------------------------------
+
+/**
+ * The plan's vector delete budget: 128 rows of about 12.5 KiB read and written.
+ * The sibling probe below adds one row read per deleted row, so a full page
+ * costs roughly 3.2 MiB of the 16 MiB transaction budget.
+ */
+const MAX_VECTOR_CLEANUP_PAGE = 128;
+
+/** A space keeps an active plus a retained generation, never a long history. */
+const MAX_CLEANUP_GENERATIONS = 64;
+
+const cleanupGenerationRow = v.object({
+  embeddingGenerationId: v.id("embeddingGenerations"),
+  fingerprint: v.string(),
+  state: embeddingGenerationStateValidator,
+  isActive: v.boolean(),
+  targeted: v.boolean(),
+  recordedThoughtCount: v.number(),
+  recordedChunkCount: v.number(),
+  pageRows: v.number(),
+  hasMoreRows: v.boolean(),
+});
+
+/**
+ * True when this target still holds a row in the *active* generation under the
+ * same fingerprint, which is what makes the row being deleted a duplicate
+ * rather than the target's only coverage.
+ *
+ * One indexed read of one row, so it stays inside the page budget. It reads the
+ * active generation rather than scanning every row the target holds, and the
+ * read happens before the delete, so read-your-writes cannot make an
+ * already-deleted row look like a survivor.
+ */
+async function hasActiveGenerationRow(
+  ctx: Parameters<typeof ensureEmbeddingProfile>[0],
+  row: Doc<"embeddingVectors">,
+  activeGenerationId: Id<"embeddingGenerations">,
+): Promise<boolean> {
+  const thoughtId = row.thoughtId;
+  const chunkId = row.chunkId;
+  if (row.targetKind === "thought") {
+    if (!thoughtId) return false;
+    const matches = await ctx.db
+      .query("embeddingVectors")
+      .withIndex("by_generation_and_thoughtId", (q) =>
+        q
+          .eq("embeddingGenerationId", activeGenerationId)
+          .eq("thoughtId", thoughtId),
+      )
+      .take(1);
+    return matches.length > 0;
+  }
+  if (!chunkId) return false;
+  const matches = await ctx.db
+    .query("embeddingVectors")
+    .withIndex("by_generation_and_chunkId", (q) =>
+      q.eq("embeddingGenerationId", activeGenerationId).eq("chunkId", chunkId),
+    )
+    .take(1);
+  return matches.length > 0;
+}
+
+/**
+ * Deletes the vector rows a fingerprint holds outside the space's active
+ * generation, one page per call.
+ *
+ * P2-6d removed the generation from the vector filter, so every row of a
+ * fingerprint shares one `scopeV2` value and all of them are searchable. I11
+ * keeps that to one row per target from the moment it landed, but it cannot
+ * reach rows an earlier generation already wrote: a space that was built twice
+ * under one fingerprint returns two rows per target, the fixed candidate budget
+ * yields half as many distinct targets after the reader's dedupe, and a
+ * retrievable result can fall out of top-k. This is the operator tool that
+ * removes them. Full retention and cleanup stay P2-6e.
+ *
+ * Safety, in the order the handler applies it:
+ *
+ * 1. I8. The active pointer is re-read from the space state inside this page's
+ *    own transaction and validated, so a stale or hostile argument cannot
+ *    authorize a delete. Every row is then checked against that pointer rather
+ *    than against anything the caller passed.
+ * 2. No row of the active generation is ever read for deletion: the page is
+ *    driven from `by_embeddingGenerationId` over the other generations only.
+ * 3. Counters. Deleting a duplicate must not decrement coverage for a target
+ *    that still has its active row, so the marker is released only when the
+ *    target holds no row in the active generation. A target whose only rows
+ *    live in non-active generations is released once and becomes owed again,
+ *    which the incremental fill re-embeds; `releaseVectorCoverage` ignores a
+ *    second release for the same target, so a repeat cannot go negative.
+ *
+ * Rerun until `remaining` is false. There is no cursor: a deleted row leaves
+ * the index, so every call makes progress from the front.
+ */
+export const deleteNonActiveGenerationVectors = internalMutation({
+  args: {
+    spaceId: v.id("spaces"),
+    fingerprint: v.optional(v.string()),
+    batchSize: v.optional(v.number()),
+    dryRun: v.optional(v.boolean()),
+  },
+  returns: v.object({
+    dryRun: v.boolean(),
+    fingerprint: v.string(),
+    activeEmbeddingGenerationId: v.id("embeddingGenerations"),
+    scanned: v.number(),
+    deleted: v.number(),
+    duplicates: v.number(),
+    soleRows: v.number(),
+    coverageReleased: v.number(),
+    remaining: v.boolean(),
+    generations: v.array(cleanupGenerationRow),
+  }),
+  handler: async (ctx, args) => {
+    const dryRun = args.dryRun ?? false;
+    const batchSize = Math.min(
+      Math.max(args.batchSize ?? MAX_VECTOR_CLEANUP_PAGE, 1),
+      MAX_VECTOR_CLEANUP_PAGE,
+    );
+    const state = await ctx.db
+      .query("spaceEmbeddingStates")
+      .withIndex("by_spaceId", (q) => q.eq("spaceId", args.spaceId))
+      .unique();
+    if (!state) throw new Error("Space embedding state not found");
+    // I8, step 1: the pointer this page trusts is read here, not passed in.
+    const activeGenerationId = state.activeEmbeddingGenerationId;
+    if (!activeGenerationId || !state.activeFingerprint) {
+      throw new Error(
+        "Space has no active embedding generation; refusing to delete vectors",
+      );
+    }
+    const activeGeneration = await ctx.db.get(activeGenerationId);
+    if (
+      !activeGeneration ||
+      activeGeneration.spaceId !== args.spaceId ||
+      activeGeneration.state !== "active" ||
+      activeGeneration.fingerprint !== state.activeFingerprint
+    ) {
+      throw new Error("Active embedding generation pointer is invalid");
+    }
+    const fingerprint = args.fingerprint ?? state.activeFingerprint;
+
+    const allGenerations = await ctx.db
+      .query("embeddingGenerations")
+      .withIndex("by_spaceId", (q) => q.eq("spaceId", args.spaceId))
+      .take(MAX_CLEANUP_GENERATIONS + 1);
+    if (allGenerations.length > MAX_CLEANUP_GENERATIONS) {
+      throw new Error("Space exceeds the vector cleanup generation bound");
+    }
+
+    let budget = batchSize;
+    let scanned = 0;
+    let deleted = 0;
+    let duplicates = 0;
+    let soleRows = 0;
+    let coverageReleased = 0;
+    let remaining = false;
+    const generations = [];
+
+    for (const generation of allGenerations) {
+      const isActive = generation._id === activeGenerationId;
+      const targeted = !isActive && generation.fingerprint === fingerprint;
+      let pageRows = 0;
+      let hasMoreRows = false;
+      if (targeted) {
+        const rows = await ctx.db
+          .query("embeddingVectors")
+          .withIndex("by_embeddingGenerationId", (q) =>
+            q.eq("embeddingGenerationId", generation._id),
+          )
+          .take(budget + 1);
+        hasMoreRows = rows.length > budget;
+        if (hasMoreRows) remaining = true;
+        for (const row of rows.slice(0, budget)) {
+          // I8, step 2: every assertion below reads the row and the pointer,
+          // never an argument, so the page refuses rather than over-deletes.
+          if (row.spaceId !== args.spaceId) {
+            throw new Error("Vector cleanup found a row in another space");
+          }
+          if (row.embeddingFingerprint !== fingerprint) {
+            throw new Error(
+              "Vector cleanup found a row of another fingerprint",
+            );
+          }
+          if (row.embeddingGenerationId === activeGenerationId) {
+            throw new Error("Vector cleanup reached the active generation");
+          }
+          scanned += 1;
+          pageRows += 1;
+          budget -= 1;
+          const duplicate = await hasActiveGenerationRow(
+            ctx,
+            row,
+            activeGenerationId,
+          );
+          if (duplicate) duplicates += 1;
+          else soleRows += 1;
+          if (dryRun) continue;
+          // I4, step 3: only the target's last row releases the marker.
+          if (!duplicate) {
+            await releaseVectorCoverage(ctx, row);
+            coverageReleased += 1;
+          }
+          await ctx.db.delete(row._id);
+          deleted += 1;
+        }
+      }
+      generations.push({
+        embeddingGenerationId: generation._id,
+        fingerprint: generation.fingerprint,
+        state: generation.state,
+        isActive,
+        targeted,
+        recordedThoughtCount: generation.completedThoughtCount,
+        recordedChunkCount: generation.completedChunkCount,
+        pageRows,
+        hasMoreRows,
+      });
+    }
+
+    return {
+      dryRun,
+      fingerprint,
+      activeEmbeddingGenerationId: activeGenerationId,
+      scanned,
+      deleted,
+      duplicates,
+      soleRows,
+      coverageReleased,
+      remaining,
+      generations,
+    };
   },
 });
