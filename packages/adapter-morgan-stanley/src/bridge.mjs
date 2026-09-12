@@ -465,6 +465,17 @@ export default async function createMorganStanleySession(options = {}) {
       if (!onApp) { if (Date.now() - announced > 60_000) { announced = Date.now(); console.error(new Date().toISOString(), "[bridge] still waiting for sign-in"); } continue; }
       const keys = (await slotKeys().catch(() => [])).map((k) => k.toLowerCase());
       if (keys.includes("x-xsrf-token")) {
+        // The home page's own calls carry a bearer for other services, and
+        // the documents API answers 409 to it (seen live 2026-09-11). Steer
+        // the tab to the Documents route so the app fetches the right one,
+        // then wait for it. In-app navigation only, never a login page.
+        await cdp.send("Page.navigate", { url: `${origin}/atrium/#/documents` }).catch(() => {});
+        await evaluate(cdp, `(() => { const s = globalThis[Symbol.for(${JSON.stringify(CAPTURED_HEADERS_SLOT)})]; if (s) for (const k of Object.keys(s)) if (k.toLowerCase() === "authorization") delete s[k]; return true; })()`).catch(() => {});
+        for (let i = 0; i < 40; i += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          const after = (await slotKeys().catch(() => [])).map((k) => k.toLowerCase());
+          if (after.includes(AUTHORIZATION_HEADER)) break;
+        }
         console.error(new Date().toISOString(), "[bridge] resumed: headers captured after sign-in");
         return true;
       }
@@ -478,7 +489,10 @@ export default async function createMorganStanleySession(options = {}) {
         return await run();
       } catch (error) {
         const message = String(error?.message ?? error);
-        if (request.needsAuthorization && /request failed: 401\b/.test(message) && (await refreshBearer())) {
+        // 401 is an expired bearer; 409 is a bearer minted for another
+        // service (the home page's calls). Both are cured by the app's own
+        // token endpoint.
+        if (request.needsAuthorization && /request failed: (401|409)\b/.test(message) && (await refreshBearer())) {
           continue;
         }
         if (/SIGNED_OUT|no session headers captured yet/.test(message) && attempt < 2 && (await waitForSignIn(message))) {
