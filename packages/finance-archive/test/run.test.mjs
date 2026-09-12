@@ -1175,6 +1175,97 @@ test(
   },
 );
 
+// F1-64. The synthetic session above has no live handle, so it already exits
+// promptly regardless of this fix -- it cannot reproduce the defect (a real
+// bridge session's CDP WebSocket and keep-alive interval, seen live to hang
+// the process 40+ minutes past a "session is gone" stop). This session
+// stands in for that: a ref'd interval it never clears on its own, only from
+// its own `close()`, exactly like adapter-morgan-stanley/src/bridge.mjs's.
+// Without run.ts calling `close()` on the stop path, this interval alone
+// keeps the process alive indefinitely.
+test(
+  "closes the session on the stop path so the process exits promptly instead of hanging on an open handle",
+  { skip },
+  async (t) => {
+    const { schema } = await seededSchema(t);
+
+    const rawDir = mkdtempSync(
+      join(tmpdir(), "kith-finance-run-close-session-raw-"),
+    );
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+
+    const { fixturesDir, adapterModulePath } = writeAdapterFixtures(t);
+    const sessionModulePath = join(fixturesDir, "session-lingering.mjs");
+    writeFileSync(
+      sessionModulePath,
+      `import { createSyntheticSession } from ${JSON.stringify(distIndexUrl)};\n` +
+        `export default function buildSession() {\n` +
+        `  const base = createSyntheticSession();\n` +
+        `  const handle = setInterval(() => {}, 60000);\n` +
+        `  return {\n` +
+        `    ...base,\n` +
+        `    async fetchBytes(path, query) {\n` +
+        `      if (path === ${JSON.stringify("/documents/doc-stmt-2025-q1")}) {\n` +
+        `        throw new Error(${JSON.stringify(
+          "SIGNED_OUT: the tab left the app origin (a session timeout redirects to the login page); sign in again and retry",
+        )});\n` +
+        `      }\n` +
+        `      return base.fetchBytes(path, query);\n` +
+        `    },\n` +
+        `    close() { clearInterval(handle); },\n` +
+        `  };\n` +
+        `}\n`,
+    );
+    const selectionPath = writeSelection(fixturesDir, [
+      {
+        accountId: ACCOUNT.id,
+        docType: "statement",
+        docDate: null,
+        selection: { kind: "pdf_statement", externalId: "doc-stmt-2025-q1" },
+      },
+    ]);
+
+    const start = Date.now();
+    assert.throws(
+      () =>
+        execFileSync(
+          process.execPath,
+          [
+            runScript,
+            "--adapter",
+            adapterModulePath,
+            "--session",
+            sessionModulePath,
+            "--selection",
+            selectionPath,
+            "--now",
+            "2025-05-01T00:00:00.000Z",
+          ],
+          {
+            env: {
+              ...process.env,
+              FINANCE_ARCHIVE_DATABASE_URL: url,
+              FINANCE_ARCHIVE_SCHEMA: schema,
+              FINANCE_ARCHIVE_RAW_TREE_ROOT: rawDir,
+              FINANCE_ARCHIVE_SPACE_ID: SPACE_ID,
+            },
+            encoding: "utf8",
+            // Only a guard against this test itself hanging if the fix
+            // regresses -- a passing run exits in well under this.
+            timeout: 5000,
+          },
+        ),
+      (error) => {
+        assert.match(String(error.stderr), /run stopped: the browser session is gone/);
+        return true;
+      },
+    );
+    assert.ok(
+      Date.now() - start < 5000,
+      "the process must exit on its own, closing the session's interval, not merely be killed by execFileSync's timeout",
+    );
+  },
+);
 
 test(
   "F1-54: a success between two runs of failures resets the circuit breaker's consecutive count",

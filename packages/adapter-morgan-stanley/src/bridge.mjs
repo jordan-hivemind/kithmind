@@ -566,7 +566,27 @@ export default async function createMorganStanleySession(options = {}) {
 
   const keepAlive = startKeepAlive(cdp, origin);
 
-  return { institutionSlug: "morgan-stanley", fetchText, fetchBytes, close: () => clearInterval(keepAlive) };
+  return {
+    institutionSlug: "morgan-stanley",
+    fetchText,
+    fetchBytes,
+    close: () => closeSession(cdp, keepAlive),
+  };
+}
+
+/**
+ * F1-64: closes both handles a session holds open -- the keep-alive interval
+ * (already unref'd, so it alone cannot keep the process up) and the CDP
+ * WebSocket itself, which is not unref'd and otherwise outlives a run that
+ * throws (a lost session, the consecutive-failure breaker) with no sign-in
+ * wait ever logged, refusing every later "a run is alive" check until killed
+ * by hand. Exported for test/bridge.test.mjs only (same convention as
+ * `evaluate`/`startKeepAlive` above); every other caller reaches it only
+ * through createMorganStanleySession's own `close`.
+ */
+export function closeSession(cdp, keepAlive) {
+  clearInterval(keepAlive);
+  cdp.close();
 }
 
 const KEEP_ALIVE_INTERVAL_MS = 4 * 60 * 1000;
