@@ -5,6 +5,10 @@ import {
   type CardExtractionFetch,
   type CardExtractionRequest,
 } from "../../lib/cardExtractionProvider";
+import {
+  loadOpenAICardExtractionConfig,
+  requestOpenAICardExtraction,
+} from "../../lib/openAICardExtractionProvider";
 
 import type { CardEvidenceRef } from "../provenance/model";
 
@@ -44,6 +48,40 @@ export const CARD_TIER0_MODEL = "claude-haiku-4-5";
 export const CARD_TIER1_MODEL = "claude-sonnet-5";
 
 /**
+ * AGENTS.md's model tiers table names "Luna" (tier 0) and "Terra" (tier 1)
+ * for OpenAI, but unlike the Anthropic column it gives no API model id in
+ * parentheses for either: they are tier aliases, not published API ids. The
+ * OpenAI runner defaults to the current cheapest and mid OpenAI text models
+ * instead, recorded here in one place.
+ */
+export const CARD_TIER0_MODEL_OPENAI = "gpt-5-nano";
+export const CARD_TIER1_MODEL_OPENAI = "gpt-5-mini";
+
+/** Which vendor answers a hosted ladder step. One vendor runs per ladder run. */
+export type CardRunnerVendor = "anthropic" | "openai";
+
+/**
+ * `BRAIN_CARD_VENDOR` picks the vendor for both hosted steps in one run, so
+ * an attempt row's `modelId` always names a model from one vendor and
+ * per-vendor escalation rates stay comparable. Default: anthropic when
+ * `BRAIN_CARD_API_KEY` (the explicit override credential) is set, openai
+ * when only `OPENAI_API_KEY` is present, anthropic otherwise.
+ */
+export function resolveCardRunnerVendor(
+  env: Readonly<Record<string, string | undefined>>,
+): CardRunnerVendor {
+  const configured = env.BRAIN_CARD_VENDOR?.trim().toLowerCase();
+  if (configured === "openai" || configured === "anthropic") {
+    return configured;
+  }
+  if (env.BRAIN_CARD_API_KEY?.trim()) return "anthropic";
+  if (!env.ANTHROPIC_API_KEY?.trim() && env.OPENAI_API_KEY?.trim()) {
+    return "openai";
+  }
+  return "anthropic";
+}
+
+/**
  * Document-first budgeting: a document whose retained text exceeds this is
  * refused with a closed code, never truncated. A silently shortened document
  * would produce a card that cites a real span and omits the field that
@@ -55,9 +93,18 @@ export const CARD_EXTRACTION_MAX_TEXT_BYTES = 128 * 1024;
  * The declared, versioned price table of section 5.4. Prices are integer
  * micro-USD per million tokens, so a cost never passes through a JavaScript
  * float. Rates are USD per million tokens at the table's date: Haiku 4.5
- * $1.00 in / $5.00 out, Sonnet 5 $2.00 in / $10.00 out.
+ * $1.00 in / $5.00 out, Sonnet 5 $2.00 in / $10.00 out, gpt-5-nano $0.05 in /
+ * $0.40 out, gpt-5-mini $0.25 in / $2.00 out. These are September 2026 list
+ * (synchronous) prices; OpenAI and Anthropic batch-API pricing is lower and
+ * is not applied here, since no runner in this file uses a batch endpoint.
+ *
+ * "Luna" and "Terra" (AGENTS.md's OpenAI tier aliases) are not added as
+ * table entries: they name no model id this codebase ever sends to an API,
+ * so a price keyed by that literal string could never be looked up by
+ * `cardAttemptCostMicroUsd`, which is keyed by the model id an attempt
+ * actually ran.
  */
-export const CARD_PRICE_TABLE_VERSION = "card-prices-2026-09-12";
+export const CARD_PRICE_TABLE_VERSION = "card-prices-2026-09-12-v2";
 
 export const CARD_MODEL_PRICES: Readonly<
   Record<
@@ -72,6 +119,14 @@ export const CARD_MODEL_PRICES: Readonly<
   [CARD_TIER1_MODEL]: {
     inputMicroUsdPerMillion: 2_000_000,
     outputMicroUsdPerMillion: 10_000_000,
+  },
+  [CARD_TIER0_MODEL_OPENAI]: {
+    inputMicroUsdPerMillion: 50_000,
+    outputMicroUsdPerMillion: 400_000,
+  },
+  [CARD_TIER1_MODEL_OPENAI]: {
+    inputMicroUsdPerMillion: 250_000,
+    outputMicroUsdPerMillion: 2_000_000,
   },
 };
 
@@ -493,12 +548,22 @@ export function localCardRunner(): CardRunner {
  */
 export function hostedCardRunner(options: {
   step: "tier0" | "tier1";
+  vendor?: CardRunnerVendor;
   config: CardExtractionConfig;
   fetchImpl?: CardExtractionFetch;
   now?: () => number;
 }): CardRunner {
+  const vendor = options.vendor ?? "anthropic";
   const modelId =
-    options.step === "tier0" ? CARD_TIER0_MODEL : CARD_TIER1_MODEL;
+    vendor === "openai"
+      ? options.step === "tier0"
+        ? CARD_TIER0_MODEL_OPENAI
+        : CARD_TIER1_MODEL_OPENAI
+      : options.step === "tier0"
+        ? CARD_TIER0_MODEL
+        : CARD_TIER1_MODEL;
+  const requestExtraction =
+    vendor === "openai" ? requestOpenAICardExtraction : requestCardExtraction;
   const clock = options.now ?? Date.now;
   return {
     step: options.step,
@@ -512,7 +577,7 @@ export function hostedCardRunner(options: {
       }
       const request = buildCardExtractionRequest(input, modelId);
       const startedAt = clock();
-      const response = await requestCardExtraction(
+      const response = await requestExtraction(
         request,
         options.config,
         options.fetchImpl,
@@ -535,14 +600,27 @@ export function hostedCardRunner(options: {
   };
 }
 
-/** Builds the hosted runners from the environment, or none when unconfigured. */
+/**
+ * Builds the hosted runners from the environment, or none when unconfigured.
+ * `resolveCardRunnerVendor` picks one vendor for both steps, so a run never
+ * mixes an Anthropic tier0 with an OpenAI tier1.
+ */
 export function hostedCardRunners(
   env: Readonly<Record<string, string | undefined>>,
   fetchImpl?: CardExtractionFetch,
 ): CardRunner[] {
-  const config = loadCardExtractionConfig(env);
+  const vendor = resolveCardRunnerVendor(env);
+  const config =
+    vendor === "openai"
+      ? loadOpenAICardExtractionConfig(env)
+      : loadCardExtractionConfig(env);
   return (["tier0", "tier1"] as const).map((step) =>
-    hostedCardRunner({ step, config, ...(fetchImpl ? { fetchImpl } : {}) }),
+    hostedCardRunner({
+      step,
+      vendor,
+      config,
+      ...(fetchImpl ? { fetchImpl } : {}),
+    }),
   );
 }
 
