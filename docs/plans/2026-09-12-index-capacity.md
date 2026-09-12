@@ -7,41 +7,59 @@ Parent: [Phase 2 document pipeline](./2026-09-07-phase2-document-pipeline.md).
 Related: [embedding contract](./2026-09-06-embedding-contract.md),
 [PDF document capacity](./2026-09-07-pdf-document-capacity.md),
 [pilot retrieval evaluation](./2026-09-08-pilot-retrieval-evaluation.md).
+The document-card backfill model is specified separately as P2-70; this plan
+covers index capacity only and does not restate it.
 
 ## Purpose
 
 The semantic index is bounded at 256 targets per space, built whole-space in a
 single transaction. A read-only preflight of a 108-file backfill sample
-projected about 700 new chunks. The owner corpus is one to two decades of
-documents. The realistic requirement is at least 50,000 targets per space, and
-admitting a batch must embed only the new chunks.
+projected about 700 new chunks under per-page chunk targets. The owner has
+since chosen the document-card model for backfill: one or two embedded targets
+per document, with cards carried as records and retained text still searchable
+by keyword.
 
-This is not a constant bump. At 50,000 targets the single-page manifest scan,
-the whole-space eligibility rebuild, the all-or-nothing coverage rule, the
-2 MiB manifest budget and the absence of cleanup all bind. This plan describes
-the design that removes each of them, the invariants that keep readers safe,
-and the reviewed order of implementation.
+That changes the required scale, not the shape of the problem.
+
+| Horizon                           | Targets per space | Basis                                            |
+| --------------------------------- | ----------------- | ------------------------------------------------ |
+| First backfill                    | Low thousands     | The first admitted batch under the card model    |
+| Whole owner corpus, card model    | 10,000 to 20,000  | About 10,000 files at one to two targets each    |
+| Design ceiling, must not preclude | 50,000            | Headroom for re-chunking or a second target kind |
+
+The first backfill is low thousands of targets. No constant, schema choice or
+page bound in this design may preclude 50,000. Every stated invariant holds at
+both ends of that range; only the page counts differ.
+
+This is still not a constant bump. Above a few thousand targets the single-page
+manifest scan, the whole-space eligibility rebuild, the all-or-nothing coverage
+rule and the 2 MiB manifest budget all bind. Section 8.1 records which budgets
+and which PRs get simpler at the card-model scale, and which do not.
 
 ## 1. Target scale and budgets
 
 ### 1.1 Scale targets
 
-| Quantity                        | Today              | Design target                        |
-| ------------------------------- | ------------------ | ------------------------------------ |
-| Eligible targets per space      | 256                | 50,000, no code constant below that  |
-| Manifest construction           | One transaction    | Paged, resumable, unbounded in total |
-| Vector rows read per generation | 256                | Paged, unbounded in total            |
-| Admitting a new batch           | Re-embed all       | Embed only new or changed targets    |
-| Manifest byte budget            | 2 MiB per space    | Per page, not per space              |
-| Retained vector generations     | All, never cleaned | Active plus one retired              |
-
-At the sample rate of about 6.5 chunks per file, 50,000 targets is roughly
-7,600 files. That is arithmetic from one sample, not a measured corpus size.
+| Quantity                        | Today              | Design target                                             |
+| ------------------------------- | ------------------ | --------------------------------------------------------- |
+| Eligible targets per space      | 256                | No code constant below 50,000                             |
+| Manifest construction           | One transaction    | Paged, resumable, unbounded in total                      |
+| Vector rows read per generation | 256                | Paged, unbounded in total                                 |
+| Admitting a new batch           | Re-embed all       | Embed only new or changed targets                         |
+| Manifest byte budget            | 2 MiB per space    | Per page, not per space                                   |
+| Retained vector generations     | All, never cleaned | Active plus one retired, cleanup after the first backfill |
 
 Storage arithmetic: one 1,536-dimension float64 vector is 12,288 bytes, about
-12.5 KiB per row with field overhead. 50,000 rows is about 610 MiB per
-fingerprint per space. Retaining two fingerprints is about 1.2 GiB. That number
-is the reason retention is bounded in section 4.
+12.5 KiB per row with field overhead.
+
+| Targets | Vectors per fingerprint | Two fingerprints | Provider requests for a full rebuild at 32 per request |
+| ------: | ----------------------: | ---------------: | -----------------------------------------------------: |
+|   2,000 |                 ~24 MiB |          ~49 MiB |                                                     63 |
+|  20,000 |                ~244 MiB |         ~488 MiB |                                                    625 |
+|  50,000 |                ~610 MiB |         ~1.2 GiB |                                                  1,563 |
+
+The card model moves the first backfill to the top row and the whole corpus to
+the middle row. The bottom row stays the design ceiling.
 
 ### 1.2 Convex per-request limits
 
@@ -98,6 +116,7 @@ Page sizes are chosen so each transaction stays far inside the 16 MiB and
 | Stage                 | Rows per page | Dominant row size       | Read per page | Write per page |
 | --------------------- | ------------: | ----------------------- | ------------: | -------------: |
 | Target scan, chunks   |           128 | 8 KiB text              |        ~1 MiB |              0 |
+| Target scan, cards    |           128 | ~2 KiB text             |      ~256 KiB |              0 |
 | Target scan, thoughts |            64 | ~12.5 KiB legacy vector |      ~800 KiB |              0 |
 | Target row upsert     |           128 | ~256 B                  |       ~32 KiB |        ~32 KiB |
 | Manifest input fetch  |            32 | 8 KiB text              |      ~256 KiB |              0 |
@@ -105,16 +124,21 @@ Page sizes are chosen so each transaction stays far inside the 16 MiB and
 | Vector audit read     |           128 | ~12.5 KiB               |      ~1.6 MiB |              0 |
 | Vector delete         |           128 | ~12.5 KiB               |      ~1.6 MiB |       ~1.6 MiB |
 
+Page sizes are set by the largest target kind a space can hold, not by the kind
+the current backfill produces. A space keeps its existing chunk targets after
+the card model lands, so the chunk row keeps the budget.
+
 The thought scan page is smaller because a thought row still carries the legacy
 `embedding` field. That field is retained audit data under the embedding
 contract; this plan does not delete it, and it is why a thought page costs more
 than a chunk page.
 
 Provider batching: 32 inputs per embeddings request, returning about 400 KiB,
-well inside the 16 MiB argument limit for the mutation that stages them. Filling
-50,000 targets is about 1,563 provider requests. Each scheduled action performs
-at most 8 requests and then schedules its successor, so no action approaches the
-10 minute Node limit and a crash loses at most 256 targets of in-flight work.
+well inside the 16 MiB argument limit for the mutation that stages them. A full
+rebuild is 63 requests at 2,000 targets and 1,563 at 50,000. Each scheduled
+action performs at most 8 requests and then schedules its successor, so no
+action approaches the 10 minute Node limit and a crash loses at most 256 targets
+of in-flight work.
 Elapsed provider time is not estimated here; the pilot recorded request counts
 and token counts, not a rate.
 
@@ -216,10 +240,12 @@ The vector search scope becomes:
 
 The generation id leaves the filter value. This is the change that makes reuse
 free. With the generation in the filter, reusing a vector means copying the row
-into the new generation: 50,000 rows and about 610 MiB of writes per generation,
-which is proportional to the space and not to the delta. With the generation
+into the new generation: about 244 MiB of writes at 20,000 targets and 610 MiB
+at 50,000, proportional to the space and not to the delta. With the generation
 out of the filter, an unchanged target simply keeps its row and the new
-generation inherits it at no cost.
+generation inherits it at no cost. The card model shrinks that copy cost without
+removing it; decision D1 in section 11 states the alternative and the
+recommendation.
 
 The new scope is a second filter field, `scopeV2`. The existing `searchScope`
 field is left in place and keeps working until every space has migrated, so the
@@ -386,10 +412,11 @@ needed.
 | Cleanup safety       | Three fingerprints: active, retained, old              | Active and retained row sets identical before and after. Covered counters unchanged. An active-fingerprint change mid-run aborts the job.  |
 | Retrieval gate       | Frozen scorer, same 180-target corpus, after migration | Score does not move from 17/18 and MRR 0.758. Any movement blocks the migration.                                                           |
 
-Public tests use synthetic fixtures only. The 5,000-target test demonstrates
-that the paged design completes at 5,000; extrapolation to 50,000 is arithmetic
-over constant page sizes, not a measured result. The growth test runs against a
-development deployment, never production.
+Public tests use synthetic fixtures only. The growth test stays at 5,000 targets
+even though the first backfill is smaller, because a test at the size of the
+first batch would prove nothing about headroom. Extrapolation from 5,000 to
+50,000 is arithmetic over constant page sizes, not a measured result. The growth
+test runs against a development deployment, never production.
 
 ## 8. Implementation split
 
@@ -397,19 +424,46 @@ Each row is one reviewed PR and one tier 2 task. `scopeV2` is a space-isolation
 boundary, so the schema and reader PRs require a second-model review before
 merge.
 
-| Order | PR                                          | Acceptance line                                                                                                                        |
-| ----- | ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| 1     | P2-6a Target table and counters             | Counters equal a recomputed scan on synthetic fixtures. `scopeV2` exists and is unused. No behavior change.                            |
-| 2     | P2-6b Resumable manifest builder            | A 5,000-target synthetic build completes across pages. Crash-resume and stale-cursor tests pass.                                       |
-| 3     | P2-6c Incremental admission                 | Publishing one document does work proportional to that document at 5,000 targets. No whole-space scan remains in an eligibility write. |
-| 4     | P2-6d Reader cutover and coverage semantics | Activation atomicity test passes. Frozen scorer unchanged on the 180-target corpus.                                                    |
-| 5     | P2-6e Retention and cleanup                 | Cleanup safety test passes. Generation and profile rows are never deleted.                                                             |
-| 6     | P2-6f Stats from counters                   | `get_stats` and `list_spaces` on a 5,000-target synthetic space read no vector row and no thought row for counting.                    |
-| 7     | P2-6g Production migration                  | Steps 1 to 7 of section 5 executed development-first. The 180-target audit passes and the frozen score does not move.                  |
+| Order | PR                                                  | Acceptance line                                                                                                                                                                          |
+| ----- | --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1     | P2-6ab Target table, counters and resumable builder | Counters equal a recomputed scan on synthetic fixtures. A 5,000-target synthetic build completes across pages. Crash-resume and stale-cursor tests pass. `scopeV2` exists and is unused. |
+| 2     | P2-6c Incremental admission                         | Publishing one document does work proportional to that document at 5,000 targets. No whole-space scan remains in an eligibility write.                                                   |
+| 3     | P2-6d Reader cutover and coverage semantics         | Activation atomicity test passes. Frozen scorer unchanged on the 180-target corpus.                                                                                                      |
+| 4     | P2-6f Stats from counters                           | `get_stats` and `list_spaces` on a 5,000-target synthetic space read no vector row and no thought row for counting.                                                                      |
+| 5     | P2-6g Production migration                          | Steps 1 to 7 of section 5 executed development-first. The 180-target audit passes and the frozen score does not move.                                                                    |
+| Later | P2-6e Retention and cleanup                         | Cleanup safety test passes. Generation and profile rows are never deleted.                                                                                                               |
 
-Order is strict. P2-6c depends on the counters from P2-6a and the builder from
-P2-6b. P2-6d must not land before P2-6c, or readers would see a coverage number
-that nothing maintains.
+Order is strict. P2-6c depends on the counters and the builder from P2-6ab.
+P2-6d must not land before P2-6c, or readers would see a coverage number that
+nothing maintains.
+
+### 8.1 What the card-model scale changes
+
+The first backfill is low thousands of targets rather than tens of thousands.
+That changes page counts and urgency. It does not change any invariant, because
+the design ceiling stays at 50,000.
+
+| Item                                          | At low thousands                                                                                                                                          | Verdict                           |
+| --------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------- |
+| Single-transaction manifest                   | 2,000 targets at ~2 KiB of text is ~4 MiB, inside the 16 MiB read budget, but the 256-target constant binds first and a chunk-bearing space is far larger | Still must be paged               |
+| Whole-space derive on every eligibility write | Runs on every publish and every capture, so it pays the full-space cost per write                                                                         | Still the first thing that breaks |
+| Vector audit                                  | 2,000 rows is 16 pages instead of 391                                                                                                                     | Simpler, same code                |
+| Storage                                       | ~49 MiB for two fingerprints instead of ~1.2 GiB                                                                                                          | Cleanup is not urgent             |
+| Full rebuild for a profile change             | 63 provider requests instead of 1,563                                                                                                                     | Rollback by rebuild is now cheap  |
+| Counter contention                            | Low thousands of writes over a backfill                                                                                                                   | Sharding stays unbuilt            |
+| Recall at a 32-candidate budget               | One or two targets per document rather than tens                                                                                                          | Better, still unmeasured          |
+
+Merged and deferred work:
+
+| Change                                      | Reason                                                                                                                                                                                                                                |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| P2-6a and P2-6b merge into P2-6ab           | The builder is a cursor and a page mutation over the table the same PR introduces. Splitting them means reviewing a table with no writer. Keep them split only if the merged diff stops being reviewable in one sitting.              |
+| P2-6e defers until after the first backfill | Two retained fingerprints cost about 49 MiB at this scale. Cleanup earns its review time only after a second profile transition or a measured storage concern. Until it lands, no cleanup path exists at all, which is the safe half. |
+| P2-6f shrinks                               | The counters arrive with P2-6ab. The remaining work is reporting them and not reading thought rows for counting. The `byType`, `topTopics` and `topPeople` digest defers to P1-12, where it belongs.                                  |
+| P2-6c, P2-6d, P2-6g unchanged               | The eligibility-write scan, the reader cutover and the migration are all required before any backfill of any size.                                                                                                                    |
+
+Nothing here is deleted from the design. Deferred work keeps its acceptance line
+and its row in the tracker.
 
 ### Migration commands
 
@@ -431,13 +485,13 @@ current value so a concurrent change cannot be overwritten.
 
 ## 9. Where the code and the plans disagree
 
-| Statement                                                                                                                                 | Which is right                                                                                                                                                   |
-| ----------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| The embedding contract says the manifest is bounded at 128 targets and the thought scan stops after 128 rows. The code uses 256 for both. | The code. The contract paragraph is stale; the pilot evaluation already records 256. P2-6a updates the contract.                                                 |
-| The contract says staging and activation recompute the manifest and compare its hash.                                                     | The contract is right today and wrong at the target scale. A hash over 50,000 targets cannot be computed in one transaction. I5 replaces it deliberately.        |
-| The contract says a space with incomplete chunk coverage reports semantic retrieval unavailable for the whole request.                    | The architecture is right. Section 5.1 already requires labeled incomplete semantic results rather than hidden records. Chunk coverage becomes a reported ratio. |
-| `bumpEmbeddingEligibilityEpoch` derives the whole-space manifest on every eligibility write.                                              | Correct today, unscalable. One publication would scan the space. P2-6c replaces it with per-target marking and counter deltas.                                   |
-| The capacity plan says resumable manifest construction and historical cleanup remain P2-6 work.                                           | Consistent. This plan is that work.                                                                                                                              |
+| Statement                                                                                                                                 | Which is right                                                                                                                                                                         |
+| ----------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The embedding contract said the manifest is bounded at 128 targets and the thought scan stops after 128 rows. The code uses 256 for both. | The code. The contract paragraph was stale and is corrected to 256 in this change; the pilot evaluation already recorded 256. P2-6ab replaces the paragraph when it raises the bounds. |
+| The contract says staging and activation recompute the manifest and compare its hash.                                                     | The contract is right today and wrong at the target scale. A hash over 50,000 targets cannot be computed in one transaction. I5 replaces it deliberately.                              |
+| The contract says a space with incomplete chunk coverage reports semantic retrieval unavailable for the whole request.                    | The architecture is right. Section 5.1 already requires labeled incomplete semantic results rather than hidden records. Chunk coverage becomes a reported ratio.                       |
+| `bumpEmbeddingEligibilityEpoch` derives the whole-space manifest on every eligibility write.                                              | Correct today, unscalable. One publication would scan the space. P2-6c replaces it with per-target marking and counter deltas.                                                         |
+| The capacity plan says resumable manifest construction and historical cleanup remain P2-6 work.                                           | Consistent. This plan is that work.                                                                                                                                                    |
 
 ## 10. Unconfirmed limits and open questions
 
@@ -448,6 +502,58 @@ current value so a concurrent change cannot be overwritten.
 | `.paginate()` inside a mutation                                           | Used in this repository already, not described in the pagination documentation. The compare-and-set cursor guard is required because of that.  |
 | Limit on pending scheduled functions                                      | Not documented. The design schedules one successor at a time, so at most one pending job per space.                                            |
 | Recall at 50,000 targets with a 32-candidate budget                       | Open. A capacity plan cannot answer it. It needs a new frozen evaluation after the corpus grows.                                               |
+
+## 11. Open decisions
+
+Three choices in this plan are judgment calls rather than consequences of a
+documented limit. Each is stated as alternatives with a recommendation. The
+card-model scale weakens the case for the first one and leaves the other two
+unchanged.
+
+### D1. Does the vector search filter keep the generation id?
+
+| Option                                        | Cost of a new generation                                                                                               | Reader guarantee                                                              |
+| --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| A. Keep the generation in the filter          | Copy every reused row: ~244 MiB at 20,000 targets, ~610 MiB at 50,000, and double storage while both generations exist | Filter-enforced. A reader physically cannot see two generations.              |
+| B. Drop it, content-address the row (planned) | Zero for unchanged targets                                                                                             | Invariant-enforced. Fingerprint in the filter, plus the I7 hydration recheck. |
+
+Recommendation: B. Cost proportional to the delta was the requirement that
+opened this task, and A does not meet it at any scale. The card model makes A
+survivable, not correct: A still pays 625 rows of copying to admit one new
+document. The honest cost of B is that atomicity moves from the storage engine
+into I2, I6 and I7, so those three invariants need the second-model review and a
+direct test, which section 7 specifies.
+
+### D2. Completeness by counters or by a recomputed manifest hash?
+
+| Option                                                   | Works at scale                                                                                                                  | Detects a bug in its own bookkeeping           |
+| -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------- |
+| A. Recompute and compare a hash                          | No. A hash over the whole space cannot be computed in one transaction above roughly 1,300 vector rows of the 16 MiB read budget | Yes, by construction                           |
+| B. Transactional counters plus a bounded audit (planned) | Yes                                                                                                                             | Only at audit time, and only if the audit runs |
+
+Recommendation: B, with the audit treated as a required part of the design
+rather than an operational nicety. A is strictly safer and simply cannot exist
+above a few thousand targets. The mitigation is that the audit is paged, runs on
+a schedule, and reports a drift flag that section 6 surfaces instead of hiding.
+If a reviewer wants A's guarantee back, the available middle is a per-page hash
+chain over the target table, which costs a rolling hash write per page and
+detects manifest tampering but still cannot validate vector presence in one
+transaction.
+
+### D3. Is incomplete chunk coverage fatal or reported?
+
+| Option                                          | Behavior when one target of many is unembedded                  | Risk                                                          |
+| ----------------------------------------------- | --------------------------------------------------------------- | ------------------------------------------------------------- |
+| A. Fatal, as the embedding contract says today  | Semantic retrieval unavailable for the whole space              | One new document silently disables semantic search            |
+| B. Reported, as the architecture says (planned) | Semantic retrieval continues, the response labels the shortfall | A caller that ignores the label over-trusts a partial ranking |
+
+Recommendation: B for chunk and card targets, A retained for thought targets.
+Architecture section 5.1 already requires labeled incomplete semantic results,
+and narrative capture depends on a complete thought index for duplicate
+detection, so the split follows what each consumer actually needs. The residual
+risk in B is a reader that ignores the label; the existing `vectorStatus` and
+`partial` fields already carry that contract, so no new reader concept is
+introduced.
 
 ## Verification
 
