@@ -24,12 +24,19 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  archiveSchemaOf,
   closeArchiveClient,
+  createArchiveClient,
   createArchivePool,
+  createReconnectBudget,
+  isConnectionLostError,
   withArchiveTransaction,
+  withReconnect,
 } from "../dist/index.js";
 
 import { archive, count, skip } from "./helpers/pgArchive.mjs";
+
+const url = process.env.FINANCE_ARCHIVE_DATABASE_URL;
 
 test("closeArchiveClient does not hang on a client whose end() never resolves", async () => {
   const fakeClient = {
@@ -108,5 +115,132 @@ test(
       "querying the unqualified table name must resolve inside the archive " +
         "schema, not fail with 'relation does not exist' against public",
     );
+  },
+);
+
+// --- F1-69: withReconnect ----------------------------------------------
+//
+// A connection the server (or the network) drops mid-run must not crash the
+// whole process (see createArchiveClient's own doc comment for the 'error'
+// listener that prevents that) and must not retry forever either. These two
+// tests exercise withReconnect's actual reconnect step against a real,
+// throwaway Postgres -- `attempt` itself is a fake that always reports the
+// connection as lost, so the reconnect count is exact and nothing races a
+// live subprocess.
+
+test("isConnectionLostError recognizes 57P01/57P02, class-08, and the two Node socket codes, and nothing else", () => {
+  for (const code of ["57P01", "57P02", "08000", "08003", "08006", "08001", "ECONNRESET", "EPIPE"]) {
+    assert.equal(
+      isConnectionLostError({ code }),
+      true,
+      `${code} must be treated as a connection-lost error`,
+    );
+  }
+  for (const code of ["23505", "42501", "22003", undefined]) {
+    assert.equal(
+      isConnectionLostError({ code }),
+      false,
+      `${code} must not be treated as a connection-lost error`,
+    );
+  }
+  assert.equal(isConnectionLostError(new Error("plain error, no code")), false);
+  assert.equal(isConnectionLostError("not even an object"), false);
+});
+
+/**
+ * A client `withReconnect` is free to end and replace, on the schema
+ * `archive(t)` already provisioned -- never `archive(t)`'s own client. That
+ * one is closed by `t.after` from inside `archive()` itself (and its
+ * `DROP SCHEMA` runs through it too), so a test that let `withReconnect` end
+ * it out from under that hook would leave the hook running `DROP SCHEMA`/
+ * `.end()` against an already-dead connection.
+ */
+async function reconnectableClient(t) {
+  const owner = await archive(t);
+  const client = createArchiveClient(url, archiveSchemaOf(owner));
+  await client.connect();
+  return client;
+}
+
+test(
+  "withReconnect reconnects on a fresh client and retries after a connection-lost failure",
+  { skip },
+  async (t) => {
+    let current = await reconnectableClient(t);
+    const opened = [current];
+    t.after(async () => {
+      for (const client of opened) await client.end().catch(() => {});
+    });
+    const budget = createReconnectBudget(3);
+    let attempts = 0;
+    const result = await withReconnect(
+      budget,
+      () => current,
+      (client) => {
+        current = client;
+        opened.push(client);
+      },
+      async () => {
+        attempts += 1;
+        if (attempts === 1) {
+          const error = new Error("terminating connection due to administrator command");
+          error.code = "57P01";
+          throw error;
+        }
+        // The retry runs against whatever `current` now is -- proof that a
+        // caller reading the client through the same closure `setClient`
+        // updates picks up the fresh connection automatically.
+        return count(current, "institutions");
+      },
+    );
+    assert.equal(result, 0, "the retried attempt actually ran (and against a live connection)");
+    assert.equal(attempts, 2, "exactly one retry for exactly one failure");
+    assert.equal(budget.remaining, 2, "exactly one reconnect spent from the budget");
+    assert.notEqual(current, opened[0], "the client in use changed to a new one");
+  },
+);
+
+test(
+  "withReconnect stops after its reconnect budget is spent, with a clear message, rather than retrying forever",
+  { skip },
+  async (t) => {
+    let current = await reconnectableClient(t);
+    const opened = [current];
+    t.after(async () => {
+      for (const client of opened) await client.end().catch(() => {});
+    });
+    const budget = createReconnectBudget(2);
+    let attempts = 0;
+    const alwaysConnectionLost = async () => {
+      attempts += 1;
+      const error = new Error("terminating connection due to administrator command");
+      error.code = "57P01";
+      throw error;
+    };
+    await assert.rejects(
+      () =>
+        withReconnect(
+          budget,
+          () => current,
+          (client) => {
+            current = client;
+            opened.push(client);
+          },
+          alwaysConnectionLost,
+        ),
+      (error) => {
+        assert.match(
+          String(error.message),
+          /archive connection lost and the reconnect budget \(2 per run\) is already spent/,
+        );
+        return true;
+      },
+    );
+    // The first attempt, plus one retry per reconnect the budget allowed.
+    assert.equal(attempts, 3);
+    assert.equal(budget.remaining, 0);
+    // Giving up leaves the caller with a live connection, not a dead one --
+    // the last reconnect succeeded, only the wrapped `attempt` kept failing.
+    await current.query("SELECT 1");
   },
 );

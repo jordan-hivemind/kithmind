@@ -129,8 +129,10 @@ import {
 import {
   closeArchiveClient,
   createArchiveClient,
+  createReconnectBudget,
   insertRows,
   withArchiveTransaction,
+  withReconnect,
   type ArchiveClient,
 } from "./pgStore.js";
 import {
@@ -840,9 +842,14 @@ type ReparseOutcome = {
  * reparse never discovers anything new. Cached per institution id: every
  * document in one reparse run usually belongs to the one institution its
  * `--adapter` names, but nothing here assumes that.
+ *
+ * Takes a client getter, not a client, so it still reads through the current
+ * connection after F1-69's `withReconnect` has swapped in a fresh one --
+ * a fixed client captured once, before any reconnect could happen, would
+ * keep querying a dead connection forever.
  */
 function accountsByExternalKeyLoader(
-  client: ArchiveClient,
+  getClient: () => ArchiveClient,
 ): (institutionId: string) => Promise<ReadonlyMap<string, string>> {
   const cache = new Map<string, Promise<ReadonlyMap<string, string>>>();
   return (institutionId: string) => {
@@ -851,7 +858,14 @@ function accountsByExternalKeyLoader(
       // F1-56: `accounts.external_key` plus every learned `account_aliases`
       // key, so a holdings row carrying a statement's printed number
       // resolves exactly as a row carrying the API's key does.
-      cached = accountIdsByExternalKey(client, institutionId);
+      cached = accountIdsByExternalKey(getClient(), institutionId).catch((error) => {
+        // F1-69: a failed lookup (the connection died mid-query) must not
+        // stay cached -- a caller retrying after `withReconnect` reconnected
+        // needs this to actually re-query the fresh client, not replay the
+        // same rejected promise forever.
+        cache.delete(institutionId);
+        throw error;
+      });
       cache.set(institutionId, cached);
     }
     return cached;
@@ -958,10 +972,22 @@ async function runReparse(args: readonly string[]): Promise<void> {
   const adapter = await loadAdapter(values.adapter);
   // Hard errors when unset, same as the ordinary pass above.
   const rawTreeRoot = resolveRawTreeRoot();
-  const pgClient = createArchiveClient();
+  // F1-69: reassigned by `reconnect` below when the connection dies mid-run,
+  // so every reference to `pgClient` in this function has to read it fresh
+  // (a closure, not a value captured once) rather than being handed the
+  // client as a parameter bound at some earlier point.
+  let pgClient = createArchiveClient();
   await pgClient.connect();
   const capabilities = adapter.capabilities();
-  const loadAccountsByExternalKey = accountsByExternalKeyLoader(pgClient);
+  const loadAccountsByExternalKey = accountsByExternalKeyLoader(() => pgClient);
+  // F1-69: bounded to 3 reconnects for this whole reparse run (see
+  // pgStore.ts's withReconnect doc comment for why retrying the wrapped
+  // `attempt` wholesale is safe -- reparse's own per-document import is
+  // idempotent by content hash / row hash).
+  const reconnectBudget = createReconnectBudget();
+  function reconnect<T>(attempt: () => Promise<T>): Promise<T> {
+    return withReconnect(reconnectBudget, () => pgClient, (client) => { pgClient = client; }, attempt);
+  }
 
   const outcome: ReparseOutcome = {
     documentsConsidered: 0,
@@ -985,8 +1011,11 @@ async function runReparse(args: readonly string[]): Promise<void> {
       // One document, one transaction: a document this reparse cannot read
       // or import never loses another document's already-committed work,
       // the same isolation the ordinary pass gives each document-tier pull
-      // (see `flushDocBatch` above).
-      await withArchiveTransaction(pgClient, async (tx) => {
+      // (see `flushDocBatch` above). F1-69: wrapped in `reconnect` so a
+      // connection dropped mid-document reopens on a fresh client and retries
+      // this same document's transaction from BEGIN, rather than losing it or
+      // crashing the process.
+      await reconnect(() => withArchiveTransaction(pgClient, async (tx) => {
         const opened = openRetainedDocument(rawTreeRoot, doc);
         if (opened === null) {
           outcome.documentsSkippedTier += 1;
@@ -1072,16 +1101,18 @@ async function runReparse(args: readonly string[]): Promise<void> {
         outcome.reviewItemsOpened += summary.reviewItemsOpened;
         outcome.reviewItemsResolved += summary.reviewItemsResolved;
         outcome.reviewItemsUpdated += summary.reviewItemsUpdated;
-      });
+      }));
     }
 
     // F1-59. Each document above gated only what it changed; this is the one
     // whole-archive pass, at the end, where a reparse that moved rows across
-    // many accounts settles every period from scratch.
+    // many accounts settles every period from scratch. F1-69: same reconnect
+    // treatment -- a dropped connection here reopens and re-derives from
+    // scratch, rather than losing the summary this run is about to print.
     const wholeArchive =
       outcome.documentsReparsed === 0
         ? null
-        : await runWholeArchiveGates(pgClient);
+        : await reconnect(() => runWholeArchiveGates(pgClient));
 
     printReparseSummary(outcome, onlyUnparsed, wholeArchive);
   } finally {
@@ -1955,8 +1986,22 @@ async function main(): Promise<void> {
   const rawTreeRoot = resolveRawTreeRoot();
 
   // Hard error when FINANCE_ARCHIVE_DATABASE_URL is unset.
-  const pgClient = createArchiveClient();
+  // F1-69: reassigned by `reconnect` below (defined after `dryRun` is in
+  // scope) when the connection dies mid-run -- every reference to `pgClient`
+  // in this function has to read it fresh rather than capture it once.
+  let pgClient = createArchiveClient();
   await pgClient.connect();
+  // F1-69. `--dry-run` runs the whole pass inside one Postgres transaction
+  // that must never partially commit, so a connection lost inside it just
+  // fails the dry run rather than reconnecting mid-transaction (see
+  // withReconnect's doc comment in pgStore.ts for why retrying wholesale is
+  // otherwise safe -- a dry run's own atomicity is the one thing that
+  // reconnecting here would break). A committed run reconnects.
+  const reconnectBudget = createReconnectBudget();
+  function reconnect<T>(attempt: () => Promise<T>): Promise<T> {
+    if (dryRun) return attempt();
+    return withReconnect(reconnectBudget, () => pgClient, (client) => { pgClient = client; }, attempt);
+  }
 
   // F1-64: closed in the outer `finally` below, on the stop path exactly like
   // normal completion -- a bridge session (adapter-morgan-stanley/src/
@@ -2382,8 +2427,9 @@ async function main(): Promise<void> {
         // ponytail: already acquired/persisted above (flushDocBatch only
         // ever receives entries acquireAndPersist already succeeded for);
         // the dedupe check itself cannot fail here short of a database
-        // outage, which is fatal regardless.
-        const already = await isDocumentAlreadyImported(item.acquired.contentHash);
+        // outage -- which F1-69's `reconnect` now recovers from instead of
+        // treating as fatal.
+        const already = await reconnect(() => isDocumentAlreadyImported(item.acquired.contentHash));
         if (already) {
           documentPullsSkipped += 1;
           bumpDocKind(item.acquired.kind, "skipped");
@@ -2394,7 +2440,11 @@ async function main(): Promise<void> {
       }
       if (toImport.length === 0) return;
       try {
-        await publishOne(toImport.map((item) => item.acquired));
+        // F1-69: retried on a fresh client if the connection died -- safe
+        // because publishImport (inside publishOne) dedupes by content hash
+        // and row hash, so replaying this same batch from BEGIN is a no-op
+        // for anything a first attempt already committed.
+        await reconnect(() => publishOne(toImport.map((item) => item.acquired)));
         documentPullsAcquired += toImport.length;
         for (const item of toImport) bumpDocKind(item.acquired.kind, "acquired");
       } catch (error) {
@@ -2491,7 +2541,10 @@ async function main(): Promise<void> {
             return;
           }
           consecutiveDocumentFailures = 0;
-          const result = await commitLock(() => commitRetainedOnly(acquired));
+          // F1-69: retries this one document's transaction on a fresh client
+          // if the connection died since acquisition -- safe because
+          // commitRetainedOnly checks `documents.sha256` before inserting.
+          const result = await commitLock(() => reconnect(() => commitRetainedOnly(acquired)));
           if (result === "already_retained") {
             documentPullsSkipped += 1;
             bumpDocKind(acquired.kind, "skipped");
@@ -2512,13 +2565,21 @@ async function main(): Promise<void> {
           return;
         }
         consecutiveDocumentFailures = 0;
+        // F1-69: a `const`, not `acquired.extractedText` re-read inside the
+        // retry closure below -- narrowing a `let`-bound `acquired` would not
+        // otherwise survive into the nested arrow function.
+        const extractedText = acquired.extractedText;
         await commitLock(async () => {
           // F1-62. Deferred from acquireAndPersist (see its own doc comment):
           // a bare `pgClient.query`, so it has to run under the same lock as
           // every other commit rather than during the concurrent acquisition
-          // phase.
-          if (acquired.extractedText) await storeRetainedText(pgClient, acquired.extractedText);
+          // phase. F1-69: retried on a fresh client if the connection died --
+          // idempotent by content hash (retainedTexts.ts's ON CONFLICT DO
+          // NOTHING).
+          if (extractedText) await reconnect(() => storeRetainedText(pgClient, extractedText));
           pendingDocBatch.push({ spec, acquired });
+          // F1-69: flushDocBatch reconnects internally around its own two
+          // queries (see its own doc comment), so no wrapping is needed here.
           if (pendingDocBatch.length >= commitEvery) await flushDocBatch();
         });
       }
@@ -2546,9 +2607,12 @@ async function main(): Promise<void> {
         }
         await commitLock(() => flushDocBatch());
         const acquired = await acquireAndPersist(spec);
+        const extractedText = acquired.extractedText;
         await commitLock(async () => {
-          if (acquired.extractedText) await storeRetainedText(pgClient, acquired.extractedText);
-          await publishOne([acquired]);
+          // F1-69: both retried on a fresh client if the connection died --
+          // idempotent (content-hash ON CONFLICT / row-hash dedupe).
+          if (extractedText) await reconnect(() => storeRetainedText(pgClient, extractedText));
+          await reconnect(() => publishOne([acquired]));
         });
       }
       if (group.length > 0) await runDocumentGroup(group);
@@ -2556,9 +2620,11 @@ async function main(): Promise<void> {
     }
 
     async function buildOutcome(): Promise<RunOutcome> {
-      const currencySums = await sumByCurrency(pgClient, allDocumentShas);
-      const cashVerdicts = await fetchCashVerdicts(pgClient, accountIds);
-      const positionVerdicts = await fetchPositionVerdicts(pgClient, accountIds);
+      // F1-69: reads, retried on a fresh client the same as every write above
+      // -- there is nothing for them to lose by retrying.
+      const currencySums = await reconnect(() => sumByCurrency(pgClient, allDocumentShas));
+      const cashVerdicts = await reconnect(() => fetchCashVerdicts(pgClient, accountIds));
+      const positionVerdicts = await reconnect(() => fetchPositionVerdicts(pgClient, accountIds));
       // One digest standing for this run's whole acquisition manifest: the
       // sha256 of every acquired document's own content hash, sorted so the
       // digest does not depend on acquisition order.
@@ -2607,7 +2673,11 @@ async function main(): Promise<void> {
      * allows, not paying for a pass that would find nothing changed. */
     async function finishGates(): Promise<void> {
       if (acquireOnly || gates !== "full") return;
-      wholeArchiveGates = await runWholeArchiveGates(pgClient);
+      // F1-69: reconnects and re-derives from scratch if the connection died
+      // during this pass -- `reconnect` is a no-op wrapper under `--dry-run`
+      // (see its own doc comment), where this call is already inside the one
+      // transaction that must not be interrupted.
+      wholeArchiveGates = await reconnect(() => runWholeArchiveGates(pgClient));
     }
 
     let outcome: RunOutcome;

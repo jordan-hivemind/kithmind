@@ -132,12 +132,17 @@ export {
   closeArchiveClient,
   createArchiveClient,
   createArchivePool,
+  createReconnectBudget,
   decodesAsText,
   DEFAULT_ARCHIVE_SCHEMA,
+  isArchiveClientDead,
+  isConnectionLostError,
   lockArchiveForWrite,
   PINNED_TEXT_OIDS,
   withArchiveTransaction,
+  withReconnect,
   type ArchiveClient,
+  type ReconnectBudget,
 } from "./pgStore.js";
 export {
   ARCHIVE_SCHEMA_VERSION,

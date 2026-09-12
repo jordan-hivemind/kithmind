@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -2076,5 +2077,199 @@ test(
     );
     assert.equal(rows.length, 1, "idempotent on sha: no second row, no error");
     assert.deepEqual(rows[0].created_at, stored.created_at);
+  },
+);
+
+// --- F1-69: reconnecting after a dropped archive connection -----------------
+//
+// Mid-run, the hosted archive (Neon) terminated the connection out from under
+// a real run (FATAL 57P01 admin_shutdown, a compute restart): the pg Client
+// emitted an 'error' event with no listener, and the uncaught exception took
+// the whole process down, losing the in-flight document and the bridge
+// session together. The fix is in pgStore.ts (the 'error' listener every
+// archive client now gets, and withReconnect) and wired through run.ts's
+// per-document loop and whole-archive gate pass; this test drops a real
+// run's own connection with `pg_terminate_backend` -- the same SQLSTATE the
+// incident named -- and proves the run reconnects and finishes rather than
+// crashing or losing what committed before the drop.
+
+/**
+ * The same fixtures as `writeAdapterFixtures`, except each document fetch
+ * sleeps `delayMs` first. Gives a concurrent watcher (below) a wide, reliable
+ * window to drop the run's connection mid-document rather than racing a
+ * synthetic adapter that would otherwise finish a whole selection in a few
+ * milliseconds.
+ */
+function writeSlowDocumentFixtures(t, delayMs) {
+  const { fixturesDir, adapterModulePath } = writeAdapterFixtures(t);
+  const sessionModulePath = join(fixturesDir, "session-slow.mjs");
+  writeFileSync(
+    sessionModulePath,
+    `import { createSyntheticSession } from ${JSON.stringify(distIndexUrl)};\n` +
+      `export default function buildSession() {\n` +
+      `  const base = createSyntheticSession();\n` +
+      `  return {\n` +
+      `    ...base,\n` +
+      `    async fetchBytes(path, query) {\n` +
+      `      if (path.startsWith("/documents/")) {\n` +
+      `        await new Promise((resolve) => setTimeout(resolve, ${JSON.stringify(delayMs)}));\n` +
+      `      }\n` +
+      `      return base.fetchBytes(path, query);\n` +
+      `    },\n` +
+      `  };\n` +
+      `}\n`,
+  );
+  return { fixturesDir, adapterModulePath, sessionModulePath };
+}
+
+/** Runs the operator command as a background subprocess (not `execFileSync`,
+ * which would block this test process and rule out watching it concurrently),
+ * collecting stdout/stderr and resolving once it exits. */
+function spawnImport({
+  adapterModulePath,
+  sessionModulePath,
+  selectionPath,
+  schema,
+  rawDir,
+  dbUrl,
+}) {
+  const child = spawn(
+    process.execPath,
+    [
+      runScript,
+      "--adapter",
+      adapterModulePath,
+      "--session",
+      sessionModulePath,
+      "--selection",
+      selectionPath,
+      "--now",
+      "2025-05-01T00:00:00.000Z",
+    ],
+    {
+      env: {
+        ...process.env,
+        FINANCE_ARCHIVE_DATABASE_URL: dbUrl,
+        FINANCE_ARCHIVE_SCHEMA: schema,
+        FINANCE_ARCHIVE_RAW_TREE_ROOT: rawDir,
+        FINANCE_ARCHIVE_SPACE_ID: SPACE_ID,
+      },
+    },
+  );
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk;
+  });
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  const exited = new Promise((resolve) => {
+    child.on("close", (code) => resolve({ code, stdout, stderr }));
+  });
+  return exited;
+}
+
+test(
+  "a dropped archive connection reconnects mid-run and the run finishes, rather than crashing or losing the session (F1-69)",
+  { skip },
+  async (t) => {
+    const { schema, client } = await seededSchema(t);
+
+    const rawDir = mkdtempSync(join(tmpdir(), "kith-finance-reconnect-raw-"));
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+
+    // All three of the fixture's real documents, so there are two whole
+    // documents' worth of run time after the first commits for the watcher
+    // below to land its drop in.
+    const { fixturesDir, adapterModulePath, sessionModulePath } =
+      writeSlowDocumentFixtures(t, 150);
+    const selectionPath = writeSelection(fixturesDir, [
+      {
+        accountId: ACCOUNT.id,
+        docType: "statement",
+        docDate: null,
+        selection: { kind: "pdf_statement", externalId: "doc-stmt-2025-q1" },
+      },
+      {
+        accountId: ACCOUNT.id,
+        docType: "statement",
+        docDate: null,
+        selection: { kind: "pdf_statement", externalId: "doc-stmt-2025-q2" },
+      },
+      {
+        accountId: ACCOUNT.id,
+        docType: "confirmation",
+        docDate: null,
+        selection: {
+          kind: "trade_confirmation",
+          externalId: "doc-conf-2025-02-10",
+        },
+      },
+    ]);
+
+    // A distinct application_name per test run, so the watcher below finds
+    // only this run's own connection in pg_stat_activity, never another
+    // test's or a leftover from an earlier one.
+    const applicationName = `kith_finance_reconnect_${randomBytes(6).toString("hex")}`;
+    const dbUrl = `${url}${url.includes("?") ? "&" : "?"}application_name=${applicationName}`;
+
+    const exited = spawnImport({
+      adapterModulePath,
+      sessionModulePath,
+      selectionPath,
+      schema,
+      rawDir,
+      dbUrl,
+    });
+
+    // A second, independent connection: watches for the run's own backend
+    // and terminates it once at least one document has committed but before
+    // every document has -- proof this is a genuine mid-run drop, not one
+    // before any work landed or after all of it already had.
+    const watcher = createArchiveClient(url, schema);
+    await watcher.connect();
+    t.after(() => watcher.end().catch(() => {}));
+
+    let terminated = false;
+    let done = false;
+    exited.then(() => {
+      done = true;
+    });
+    while (!terminated && !done) {
+      const documentCount = await count(watcher, "documents");
+      if (documentCount >= 1 && documentCount < 3) {
+        const found = await all(
+          watcher,
+          "SELECT pid FROM pg_stat_activity WHERE application_name = $1",
+          [applicationName],
+        );
+        if (found.length > 0) {
+          await watcher.query("SELECT pg_terminate_backend($1)", [found[0].pid]);
+          terminated = true;
+          break;
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 15));
+    }
+
+    const { code, stdout, stderr } = await exited;
+    assert.ok(
+      terminated,
+      "the watcher must actually have dropped the run's connection for this test to prove anything",
+    );
+    assert.equal(code, 0, `the run should recover and exit cleanly; stderr:\n${stderr}`);
+    assert.match(stdout, /^mode: committed$/m);
+    assert.match(stdout, /document pulls acquired: 3/);
+    assert.match(
+      stderr,
+      /archive connection lost; reconnected on a fresh client/,
+      "the run's own stderr should say it reconnected, not just that it happened to finish",
+    );
+    assert.equal(
+      await count(client, "documents"),
+      3,
+      "every document landed, including the one whose transaction the drop interrupted",
+    );
   },
 );

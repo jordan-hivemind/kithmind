@@ -176,6 +176,17 @@ export function createArchiveClient(
     options: `-c search_path=${name}`,
   });
   pinArchiveSchema(client, name);
+  // F1-69. node-postgres emits 'error' on a Client whose connection died out
+  // from under it (the server restarting, admin_shutdown, a dropped socket)
+  // -- and an 'error' event with no listener is Node's own uncaught
+  // exception, which crashes the whole process, not just this client. That
+  // took a real run down mid-import (57P01 admin_shutdown from a Neon
+  // compute restart), losing the in-flight document and the bridge session
+  // together. Attach one here, on every client this package hands out, so
+  // the failure is "this connection is dead" (markClientDead/isArchiveClientDead
+  // below) rather than a crash; withReconnect is what actually notices and
+  // reconnects.
+  client.on("error", () => markClientDead(client));
   return client;
 }
 
@@ -367,4 +378,121 @@ export async function closeArchiveClient(
         resolve();
       });
   });
+}
+
+// --- reconnecting after a dropped connection (F1-69) ------------------------
+//
+// A connection an operator run was mid-way through can die from under it:
+// the server restarts (Neon's admin_shutdown, 57P01/57P02), the network
+// drops (ECONNRESET/EPIPE), or any other class-08 connection exception. An
+// `'error'` event with no listener is what actually took a real run's whole
+// process down (see `createArchiveClient` above) -- that listener turns the
+// failure into "this client is dead" instead, and `withReconnect` below is
+// what a caller uses to notice that and recover: end the dead client, open a
+// fresh one on the same connection string and schema, and retry.
+
+/** Clients whose connection died out from under them -- marked by the
+ * `'error'` listener `createArchiveClient` attaches. Never removed: a dead
+ * client is never reused, only replaced. */
+const deadClients = new WeakSet<object>();
+
+function markClientDead(client: object): void {
+  deadClients.add(client);
+}
+
+/** True once `client`'s own `'error'` listener has fired. The primary signal
+ * `withReconnect` acts on -- set synchronously by the same event that also
+ * rejects whatever query was in flight, so it is already true by the time a
+ * caller's `await` throws, whatever shape that rejection's error takes. */
+export function isArchiveClientDead(client: object): boolean {
+  return deadClients.has(client);
+}
+
+/** SQLSTATE/Node error codes that mean "the connection itself is gone," not
+ * "this query was refused": 57P01/57P02 (server-initiated shutdown), the
+ * whole class-08 connection-exception family, and the two Node socket codes
+ * a dropped TCP connection surfaces as. A secondary signal to `isArchiveClientDead`
+ * above -- useful when an error reaches a caller with no chance for the
+ * client's own listener to have marked it dead first (a bare client object
+ * in a test, say). */
+export function isConnectionLostError(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null | undefined)?.code;
+  if (typeof code !== "string") return false;
+  return code === "57P01" || code === "57P02" || code === "ECONNRESET" || code === "EPIPE" ||
+    code.startsWith("08");
+}
+
+/** How many times `withReconnect` will still reconnect before giving up,
+ * shared across every call for one run (`createReconnectBudget`). */
+export type ReconnectBudget = { remaining: number; readonly max: number };
+
+/** A fresh reconnect budget: 3 reconnects per run by default, matching the
+ * bound F1-69 asks for -- past this many drops something structural is
+ * broken (the database itself is down), and retrying forever would just
+ * hang an operator run instead of stopping with a message they can act on. */
+export function createReconnectBudget(max = 3): ReconnectBudget {
+  return { remaining: max, max };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Runs `attempt()`. On a connection-lost failure (`isArchiveClientDead` on
+ * whatever `getClient()` currently returns, or `isConnectionLostError` on the
+ * thrown error itself), ends that dead client, opens a fresh one on the same
+ * connection string and schema (`createArchiveClient`/`connect`, the same
+ * pinning every archive client gets), hands it to `setClient`, and retries
+ * `attempt()` -- which the caller writes to read the client through whatever
+ * closure `setClient` updates, so the retry runs against the fresh
+ * connection automatically. Any other failure is rethrown as-is, not
+ * retried.
+ *
+ * Safe to retry `attempt()` wholesale only because every caller in this
+ * package wraps a single document's own import (or the whole-archive gate
+ * pass), and both are idempotent: importing an already-imported document (by
+ * content hash) or already-stored row (by row hash) is a no-op, and the gate
+ * pass just re-derives verdicts from what is actually in the archive.
+ *
+ * `budget` bounds the whole run, not this one call: past `budget.max`
+ * reconnects, this throws a clear error instead of trying forever against a
+ * connection that keeps dropping.
+ */
+export async function withReconnect<T>(
+  budget: ReconnectBudget,
+  getClient: () => pg.Client,
+  setClient: (client: pg.Client) => void,
+  attempt: () => Promise<T>,
+): Promise<T> {
+  for (;;) {
+    try {
+      return await attempt();
+    } catch (error) {
+      const client = getClient();
+      if (!isArchiveClientDead(client) && !isConnectionLostError(error)) throw error;
+      if (budget.remaining <= 0) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(
+          `archive connection lost and the reconnect budget (${budget.max} per run) is ` +
+            `already spent; giving up rather than reconnecting again. Last error: ${message}`,
+        );
+      }
+      budget.remaining -= 1;
+      await closeArchiveClient(client);
+      // A short, fixed backoff -- long enough that a server mid-restart has
+      // a moment to come back, short enough that three of them is still a
+      // matter of seconds, not minutes, against an operator run that can
+      // already take tens of minutes.
+      await sleep(250);
+      const fresh = createArchiveClient(archiveDatabaseUrl(), archiveSchemaOf(client));
+      await fresh.connect();
+      setClient(fresh);
+      const attemptNumber = budget.max - budget.remaining;
+      console.error(
+        `archive connection lost; reconnected on a fresh client (reconnect ${attemptNumber} of ` +
+          `${budget.max} for this run)`,
+      );
+    }
+  }
 }
