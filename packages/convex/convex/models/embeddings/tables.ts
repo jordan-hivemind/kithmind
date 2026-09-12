@@ -25,8 +25,10 @@ export const embeddingTables = {
   embeddingTargets: defineTable(embeddingTargetFields)
     .index("by_space_kind_target", ["spaceId", "targetKind", "targetId"])
     .index("by_space_and_state", ["spaceId", "state"])
-    .index("by_space_and_coveredFingerprint", ["spaceId", "coveredFingerprint"])
-    .index("by_space_and_updatedAt", ["spaceId", "updatedAt"]),
+    .index("by_space_and_coveredFingerprint", [
+      "spaceId",
+      "coveredFingerprint",
+    ]),
   embeddingBuildJobs: defineTable(embeddingBuildJobFields)
     .index("by_space_and_fingerprint", ["spaceId", "fingerprint"])
     .index("by_space_and_phase", ["spaceId", "phase"]),
