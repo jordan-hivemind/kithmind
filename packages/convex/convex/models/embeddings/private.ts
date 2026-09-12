@@ -16,7 +16,7 @@ const activeTargetValidator = v.object({
   fingerprint: v.string(),
   profile: embeddingProfileValidator,
   thoughtStatus: v.union(v.literal("ready"), v.literal("unavailable")),
-  chunkStatus: v.union(v.literal("ready"), v.literal("unavailable")),
+  chunkCoverage: v.object({ eligible: v.number(), covered: v.number() }),
 });
 
 const requestedTargetValidator = v.object({
@@ -42,8 +42,13 @@ export const getActiveTargets = internalQuery({
     );
     const results = [];
     for (const spaceId of authorizedSpaceIds) {
-      const target = await getActiveEmbeddingTarget(ctx, spaceId);
-      if (target) results.push(target);
+      try {
+        const target = await getActiveEmbeddingTarget(ctx, spaceId);
+        if (target) results.push(target);
+      } catch {
+        // An unmigrated or damaged space disables its vectors for this
+        // request; it never disables the other spaces or keyword retrieval.
+      }
     }
     return results;
   },

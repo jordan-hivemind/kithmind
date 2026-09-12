@@ -42,6 +42,8 @@ export const searchWithCandidates = internalQuery({
     const targetSpaces = new Set(args.targets.map((target) => target.spaceId));
     ready &&= targetSpaces.size === spaceIds.length;
     let chunkIds: Id<"chunks">[] = [];
+    // D3 B and I10: chunk coverage is a ratio the answer reports, not a gate.
+    let coverageIncomplete = false;
     try {
       if (ready) {
         for (const spaceId of spaceIds) {
@@ -52,13 +54,14 @@ export const searchWithCandidates = internalQuery({
           if (
             !requested ||
             !active ||
-            active.chunkStatus !== "ready" ||
             requested.fingerprint !== fingerprint ||
-            active.fingerprint !== fingerprint ||
-            active.embeddingGenerationId !== requested.embeddingGenerationId
+            active.fingerprint !== fingerprint
           ) {
             ready = false;
             break;
+          }
+          if (active.chunkCoverage.covered < active.chunkCoverage.eligible) {
+            coverageIncomplete = true;
           }
         }
       }
@@ -77,6 +80,7 @@ export const searchWithCandidates = internalQuery({
     return await searchDocuments(ctx, spaceIds, args, {
       chunkIds,
       vectorStatus: ready ? "ready" : "unavailable",
+      coverageIncomplete: ready && coverageIncomplete,
     });
   },
 });

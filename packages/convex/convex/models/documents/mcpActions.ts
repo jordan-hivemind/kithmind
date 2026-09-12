@@ -8,10 +8,8 @@ import {
 } from "../../lib/embeddingProvider";
 import { requireMcpPrincipal } from "../../lib/mcpAuth";
 import { principalRef } from "../../lib/spaces";
-import {
-  embeddingVectorSearchScope,
-  type ActiveEmbeddingTarget,
-} from "../embeddings/model";
+import type { ActiveEmbeddingTarget } from "../embeddings/model";
+import { embeddingVectorScopeV2 } from "../embeddings/targets";
 import { documentSearchArgs } from "./validators";
 
 // Explicit boundary avoids a generated action/query return inference cycle.
@@ -43,14 +41,12 @@ export const search = action({
           internal.models.embeddings.private.getActiveTargets,
           { principal, spaceIds },
         );
+        // D3 B: an incomplete chunk index no longer withholds the semantic
+        // leg. The shortfall is reported through `partial` by the query below.
         if (
           spaceIds.length > 0 &&
           active.length === spaceIds.length &&
-          active.every(
-            (target) =>
-              target.fingerprint === fingerprint &&
-              target.chunkStatus === "ready",
-          )
+          active.every((target) => target.fingerprint === fingerprint)
         ) {
           const embedding = await requestEmbedding(args.query, config);
           const hits: Array<{ _id: Id<"embeddingVectors">; _score: number }> =
@@ -70,11 +66,10 @@ export const search = action({
                 limit,
                 filter: (q) =>
                   q.eq(
-                    "searchScope",
-                    embeddingVectorSearchScope({
+                    "scopeV2",
+                    embeddingVectorScopeV2({
                       spaceId: target.spaceId,
                       fingerprint,
-                      embeddingGenerationId: target.embeddingGenerationId,
                       targetKind: "chunk",
                     }),
                   ),

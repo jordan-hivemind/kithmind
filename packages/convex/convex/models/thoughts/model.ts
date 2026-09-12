@@ -293,7 +293,7 @@ export async function _insertOne(
     });
     if (active.thoughtStatus !== "ready") {
       throw new Error(
-        "Thought capture exceeds the active embedding manifest limit",
+        "Thought capture requires a complete active thought embedding index",
       );
     }
   } else {
@@ -417,7 +417,7 @@ export async function _transitionMemory(
     });
     if (active.thoughtStatus !== "ready") {
       throw new Error(
-        "Thought transition exceeds the active embedding manifest limit",
+        "Thought transition requires a complete active thought embedding index",
       );
     }
   }

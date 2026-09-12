@@ -261,7 +261,11 @@ test("registered processing functions replace canonical vectors, preserve retire
     embeddingGenerationId: generations.oldGenerationId,
     chunkId: first.chunkId,
   });
-  expect(afterReplacement.activeTarget?.chunkStatus).toBe("unavailable");
+  // D3 B: the replacement chunk is eligible and not yet embedded, so the
+  // shortfall is reported as a ratio rather than as an unavailable index.
+  expect(afterReplacement.activeTarget!.chunkCoverage.covered).toBeLessThan(
+    afterReplacement.activeTarget!.chunkCoverage.eligible,
+  );
   expect(
     await session.query(api.models.documents.public.get, {
       documentId: first.documentId,
@@ -279,9 +283,12 @@ test("registered processing functions replace canonical vectors, preserve retire
       vector: embedding,
     });
   });
-  expect(
-    await t.run((ctx) => getActiveEmbeddingTarget(ctx, spaceId)),
-  ).toMatchObject({ chunkStatus: "ready" });
+  const afterReplace = await t.run((ctx) =>
+    getActiveEmbeddingTarget(ctx, spaceId),
+  );
+  expect(afterReplace!.chunkCoverage.covered).toBe(
+    afterReplace!.chunkCoverage.eligible,
+  );
 
   await t.mutation(pipeline.markUnavailable, {
     principal,
@@ -315,9 +322,8 @@ test("registered processing functions replace canonical vectors, preserve retire
     done = result.done;
   }
   expect(done).toBe(true);
-  expect(
-    await t.run((ctx) => getActiveEmbeddingTarget(ctx, spaceId)),
-  ).toMatchObject({ chunkStatus: "ready" });
+  const covered = await t.run((ctx) => getActiveEmbeddingTarget(ctx, spaceId));
+  expect(covered!.chunkCoverage.covered).toBe(covered!.chunkCoverage.eligible);
   expect(
     await t.run(async (ctx) => ({
       retiredVector: await ctx.db.get(generations.retiredVectorId),

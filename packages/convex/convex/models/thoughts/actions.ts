@@ -25,7 +25,7 @@ import {
 } from "./validators";
 import { memorySourceType } from "./validators";
 import { principalRefValidator } from "../apiKeys/validators";
-import { embeddingVectorSearchScope } from "../embeddings/model";
+import { embeddingVectorScopeV2 } from "../embeddings/targets";
 
 // Break circular type inference — actions.ts exports are part of `internal`'s type,
 // so referencing `internal` here creates a cycle. Runtime behavior is unchanged.
@@ -170,9 +170,10 @@ export const captureThought = internalAction({
         limit: 256,
         filter: (q) =>
           q.eq(
-            "searchScope",
-            embeddingVectorSearchScope({
-              ...embeddingTarget,
+            "scopeV2",
+            embeddingVectorScopeV2({
+              spaceId: embeddingTarget.spaceId,
+              fingerprint: embeddingTarget.fingerprint,
               targetKind: "thought",
             }),
           ),
@@ -689,9 +690,10 @@ async function runHybridSearch(
               limit: perSpaceLimit,
               filter: (q: { eq: (field: string, value: unknown) => unknown }) =>
                 q.eq(
-                  "searchScope",
-                  embeddingVectorSearchScope({
-                    ...target,
+                  "scopeV2",
+                  embeddingVectorScopeV2({
+                    spaceId: target.spaceId,
+                    fingerprint: target.fingerprint,
                     targetKind: "thought",
                   }),
                 ),

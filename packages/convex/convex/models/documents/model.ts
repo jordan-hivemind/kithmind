@@ -398,6 +398,8 @@ export async function searchDocuments(
   semantic?: {
     chunkIds: readonly Id<"chunks">[];
     vectorStatus: "ready" | "unavailable";
+    /** Chunk targets the active fingerprint still owes (D3 B). */
+    coverageIncomplete?: boolean;
   },
 ) {
   validateSpaces(spaceIds);
@@ -589,7 +591,10 @@ export async function searchDocuments(
   return {
     results: results.slice(0, limit),
     vectorStatus: semanticReady ? ("ready" as const) : ("unavailable" as const),
-    partial: candidateOverflow || citationPartial,
+    partial:
+      candidateOverflow ||
+      citationPartial ||
+      (semanticReady && semantic?.coverageIncomplete === true),
     truncated,
   };
 }

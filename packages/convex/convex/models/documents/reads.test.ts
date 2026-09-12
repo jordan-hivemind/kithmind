@@ -838,9 +838,13 @@ test("semantic document hydration preserves evidence and rechecks profile, sourc
     forgotten = batch.done;
   }
   expect(forgotten).toBe(true);
-  expect(
-    await t.run((ctx) => getActiveEmbeddingTarget(ctx, seeded.spaceId)),
-  ).toMatchObject({ chunkStatus: "ready" });
+  // Forget retires the targets it removed, so coverage is complete again.
+  const afterForget = await t.run((ctx) =>
+    getActiveEmbeddingTarget(ctx, seeded.spaceId),
+  );
+  expect(afterForget!.chunkCoverage.covered).toBe(
+    afterForget!.chunkCoverage.eligible,
+  );
   expect(await t.run((ctx) => ctx.db.get(canonical.vectorId))).toBeNull();
   await t.run((ctx) => ctx.db.delete(seeded.keyId));
   await expect(
