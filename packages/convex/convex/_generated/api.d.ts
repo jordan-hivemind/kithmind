@@ -15,6 +15,7 @@ import type * as legacySchema from "../legacySchema.js";
 import type * as lib_cardExtractionProvider from "../lib/cardExtractionProvider.js";
 import type * as lib_embeddingProvider from "../lib/embeddingProvider.js";
 import type * as lib_mcpAuth from "../lib/mcpAuth.js";
+import type * as lib_openAICardExtractionProvider from "../lib/openAICardExtractionProvider.js";
 import type * as lib_sourceAuth from "../lib/sourceAuth.js";
 import type * as lib_spaceReadErrors from "../lib/spaceReadErrors.js";
 import type * as lib_spaces from "../lib/spaces.js";
@@ -190,6 +191,7 @@ declare const fullApi: ApiFromModules<{
   "lib/cardExtractionProvider": typeof lib_cardExtractionProvider;
   "lib/embeddingProvider": typeof lib_embeddingProvider;
   "lib/mcpAuth": typeof lib_mcpAuth;
+  "lib/openAICardExtractionProvider": typeof lib_openAICardExtractionProvider;
   "lib/sourceAuth": typeof lib_sourceAuth;
   "lib/spaceReadErrors": typeof lib_spaceReadErrors;
   "lib/spaces": typeof lib_spaces;

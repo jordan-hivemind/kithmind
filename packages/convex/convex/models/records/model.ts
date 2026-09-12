@@ -2,8 +2,8 @@ import type { Doc, Id } from "../../_generated/dataModel";
 import type { MutationCtx, QueryCtx } from "../../_generated/server";
 import { sha256Utf8 } from "../provenance/model";
 import {
-  requireInlineSourceRevision,
-  requireInlineSourceTextVersion,
+  parseSourceRevisionRepresentation,
+  parseSourceTextRepresentation,
 } from "../provenance/representations";
 
 import {
@@ -49,8 +49,21 @@ type GenerationChain = {
   sourceItem: Doc<"sourceItems">;
   sourceRevision: Doc<"sourceRevisions">;
   sourceTextVersion: Doc<"sourceTextVersions">;
-  sourceRevisionText: string;
-  sourceText: string;
+  /**
+   * How this generation retains its source, resolved once so evidence
+   * validation knows which proof of a page it can perform.
+   *
+   * `inline_text_v1` retains the whole extracted string on the text version,
+   * so a page proves itself by slicing out of it. `parsed_pages_v1` is the
+   * PDF path of docs/plans/2026-09-07-original-byte-contract.md: the original
+   * bytes are archived, the worker's parse is sealed, and the retained text
+   * exists only as the sealed page rows. There is no whole-document string to
+   * slice, so the page proves itself by its own hash, exactly as
+   * `search_documents` and `get_document` already cite a PDF page.
+   */
+  representation: "inline_text_v1" | "parsed_pages_v1";
+  /** The whole retained text. Absent on a parsed chain, which retains none. */
+  sourceText?: string;
   generation: Doc<"processingGenerations">;
 };
 
@@ -406,6 +419,51 @@ function requireEventSchema(
   }
 }
 
+/**
+ * Resolves how a generation retains its source, for the two pairs the
+ * pipeline can produce. Anything else is a corrupt chain and throws.
+ *
+ * | Revision              | Text version      | Retained text        |
+ * | --------------------- | ----------------- | -------------------- |
+ * | `inline_utf8_v1`      | `inline_text_v1`  | the text version row |
+ * | `archived_binary_v1`  | `parsed_pages_v1` | the sealed pages     |
+ *
+ * The parsed pair is the PDF path: the original bytes are archived, the
+ * worker's parse is sealed, and the generation must name the same parser
+ * artifact the text version was parsed from. These are the same conditions
+ * `documents/model.ts` requires before it will cite a page of a PDF, so a
+ * card cites a PDF page on exactly the terms `get_document` already does.
+ */
+function requireChainRepresentation(
+  sourceRevision: Doc<"sourceRevisions">,
+  sourceTextVersion: Doc<"sourceTextVersions">,
+  generation: Doc<"processingGenerations">,
+): {
+  representation: "inline_text_v1" | "parsed_pages_v1";
+  revisionText?: string;
+  sourceText?: string;
+} {
+  const revision = parseSourceRevisionRepresentation(sourceRevision);
+  const text = parseSourceTextRepresentation(sourceTextVersion);
+  if (revision.kind === "inline_utf8_v1" && text.kind === "inline_text_v1") {
+    return {
+      representation: "inline_text_v1",
+      revisionText: revision.text,
+      sourceText: text.text,
+    };
+  }
+  if (
+    revision.kind === "archived_binary_v1" &&
+    text.kind === "parsed_pages_v1" &&
+    text.sealed &&
+    text.hashAuthority === "server_verified_retained_text" &&
+    generation.parserArtifactId === text.parserArtifactId
+  ) {
+    return { representation: "parsed_pages_v1" };
+  }
+  throw new Error("Generation source representation pair is invalid");
+}
+
 async function requireGenerationChain(
   ctx: ReadCtx,
   spaceId: Id<"spaces">,
@@ -461,11 +519,19 @@ async function requireGenerationChain(
   ) {
     throw new Error("Generation source text version parent chain is invalid");
   }
-  const sourceRevisionText = requireInlineSourceRevision(sourceRevision).text;
-  const sourceText = requireInlineSourceTextVersion(sourceTextVersion).text;
+  const resolved = requireChainRepresentation(
+    sourceRevision,
+    sourceTextVersion,
+    generation,
+  );
+  const { representation, sourceText } = resolved;
+  // An inline chain reads the revision text and the text version text out of
+  // their rows, so both are charged exactly as before. A parsed chain loads
+  // no whole-document string at all; its pages are charged one at a time in
+  // `requireEvidence` as they are read.
   reserveLoadedBytes(
     cache,
-    utf8Length(sourceRevisionText) + utf8Length(sourceText),
+    utf8Length(resolved.revisionText ?? "") + utf8Length(sourceText ?? ""),
   );
   const chain = {
     space,
@@ -473,8 +539,8 @@ async function requireGenerationChain(
     sourceItem,
     sourceRevision,
     sourceTextVersion,
-    sourceRevisionText,
-    sourceText,
+    representation,
+    ...(sourceText === undefined ? {} : { sourceText }),
     generation,
   };
   cache?.generationChains.set(processingGenerationId, chain);
@@ -544,16 +610,34 @@ async function requireEvidence(
       throw new Error(`${label} has an invalid source page parent`);
     }
     if (!cache.validatedPageIds.has(page._id)) {
-      requireUtf16Range(
-        chain.sourceText,
-        page.start,
-        page.end,
-        `${label} source page`,
-      );
-      if (chain.sourceText.slice(page.start, page.end) !== page.text) {
-        throw new Error(
-          `${label} source page text does not match its text version`,
+      if (chain.sourceText === undefined) {
+        // A parsed text version retains no whole-document string to slice, so
+        // the page's own range is checked for self-consistency and the hash
+        // below is what proves the text the span is cut from. The page's
+        // place in the document was already proved once, against the complete
+        // text, when the parse was sealed under its mapping manifest hash.
+        if (
+          !Number.isSafeInteger(page.start) ||
+          !Number.isSafeInteger(page.end) ||
+          page.start < 0 ||
+          page.end - page.start !== page.text.length
+        ) {
+          throw new Error(
+            `${label} source page range does not match its page text`,
+          );
+        }
+      } else {
+        requireUtf16Range(
+          chain.sourceText,
+          page.start,
+          page.end,
+          `${label} source page`,
         );
+        if (chain.sourceText.slice(page.start, page.end) !== page.text) {
+          throw new Error(
+            `${label} source page text does not match its text version`,
+          );
+        }
       }
       if ((await sha256Utf8(page.text)) !== page.textHash) {
         throw new Error(`${label} source page hash is invalid`);
