@@ -911,15 +911,23 @@ const cardFieldValidator = v.object({
 });
 
 /**
- * One cited location. Exactly one of `quote` or the `start`/`end` pair is
- * meaningful; a row carrying neither resolves to no span, which is the same
- * outcome as a location the page does not contain.
+ * One cited location. Exactly one of `cell`, `quote` or the `start`/`end`
+ * pair is meaningful; a row carrying none of them resolves to no span, which
+ * is the same outcome as a location the page does not contain.
  */
 const cardEvidenceRefValidator = v.object({
   pageOrdinal: v.number(),
   start: v.optional(v.number()),
   end: v.optional(v.number()),
   quote: v.optional(v.string()),
+  /** P2-70i: one cell of a spreadsheet's retained page, zero-based. */
+  cell: v.optional(
+    v.object({
+      sheet: v.string(),
+      row: v.number(),
+      column: v.number(),
+    }),
+  ),
 });
 
 function toCardEvidenceRef(ref: {
@@ -927,7 +935,11 @@ function toCardEvidenceRef(ref: {
   start?: number;
   end?: number;
   quote?: string;
+  cell?: { sheet: string; row: number; column: number };
 }): CardEvidenceRef {
+  if (ref.cell !== undefined) {
+    return { pageOrdinal: ref.pageOrdinal, cell: ref.cell };
+  }
   return ref.quote !== undefined
     ? { pageOrdinal: ref.pageOrdinal, quote: ref.quote }
     : {

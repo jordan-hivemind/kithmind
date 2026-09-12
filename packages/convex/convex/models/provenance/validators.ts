@@ -65,6 +65,21 @@ export const evidenceLocatorValidator = v.union(
     sheet: v.string(),
     range: v.string(),
   }),
+  /**
+   * P2-70i, section 4.3 of docs/plans/2026-09-12-document-cards.md. One cell
+   * of one sheet, zero-based and row-major, on a retained page rendered under
+   * `SHEET_PAGE_RENDERING_VERSION`. The locator never replaces the span: the
+   * span is still a UTF-16 range over sealed page text whose `quoteHash` the
+   * server recomputes, and this names the position that range was taken from.
+   * `sheet` is the name the page itself carries on its first line, so a cited
+   * cell proves its sheet from the sealed text rather than from a table.
+   */
+  v.object({
+    kind: v.literal("cell_v1"),
+    sheet: v.string(),
+    row: v.number(),
+    column: v.number(),
+  }),
   v.object({
     kind: v.literal("pdf"),
     pageNumber: v.number(),

@@ -34,7 +34,7 @@ import type { ObservationValue } from "./values";
  * extraction fingerprint, so a gate change is a new generation rather than a
  * silent revaluation of a stored card.
  */
-export const CARD_GATE_VERSION = "card-gate-v2";
+export const CARD_GATE_VERSION = "card-gate-v3";
 
 /** The declared, versioned format list of rule 4. */
 export const CARD_DATE_FORMAT_LIST_VERSION = "card-date-formats-v1";
@@ -377,6 +377,35 @@ function matchMoney(
 }
 
 /**
+ * Rule 5: a percentage or rate canonicalizes to a decimal carrying the unit
+ * the span states. `20%` proves `20` with unit `%` and never `0.2` with unit
+ * `1`: the registry declares no implicit conversions. Shared by `rate_v1` and
+ * by the decimal half of `money_or_number_v1`.
+ */
+function matchRate(
+  spanText: string,
+  value: ObservationValue,
+): NormalizerResult {
+  if (value.type !== "decimal") return "field_not_declared";
+  let text = collapse(spanText);
+  const percent = text.endsWith("%");
+  if (percent) text = text.slice(0, -1).trim();
+  const spanUnit = percent ? "%" : "1";
+  try {
+    validateUnitCode(value.unitCode);
+  } catch {
+    return "unit_code_invalid";
+  }
+  if (value.unitCode !== spanUnit) return "unit_code_invalid";
+  const spanValue = canonicalOrNull(stripGrouping(text));
+  const storedValue = canonicalOrNull(value.value);
+  if (spanValue === null || storedValue === null) {
+    return "value_not_normalizable";
+  }
+  return spanValue === storedValue ? null : "value_not_in_span";
+}
+
+/**
  * One normalizer per declared field type, each versioned in its own id so a
  * change to one is visible in the fingerprint through CARD_GATE_VERSION.
  * Every field of every card kind names exactly one of these in CARD_SCHEMAS.
@@ -416,8 +445,21 @@ export const CARD_NORMALIZERS = {
    * `currency_mismatch`; a span that does carry an indicator is held to it
    * exactly as `money_v1` holds it.
    */
-  money_usd_default_v1: (spanText, value) =>
-    matchMoney(spanText, value, "USD"),
+  money_usd_default_v1: (spanText, value) => matchMoney(spanText, value, "USD"),
+
+  /**
+   * P2-70i: a spreadsheet cell states a figure, and whether that figure is
+   * money depends on the cell, not on the field. A cell carrying a currency
+   * indicator proves a `money` value through `money_v1`'s rules exactly; a
+   * bare figure proves a `decimal` through `rate_v1`'s, which means unit code
+   * `1` for a plain number and `%` for one the cell ends with. Neither branch
+   * guesses: a bare figure never becomes money, and a currency indicator
+   * never becomes a bare number.
+   */
+  money_or_number_v1: (spanText, value) =>
+    value.type === "money"
+      ? matchMoney(spanText, value)
+      : matchRate(spanText, value),
 
   /**
    * Rule 4: every declared format is tried. Two formats that read the span as
@@ -442,25 +484,7 @@ export const CARD_NORMALIZERS = {
    * the span states. `20%` proves `20` with unit `%` and never `0.2` with
    * unit `1`: the registry declares no implicit conversions.
    */
-  rate_v1: (spanText, value) => {
-    if (value.type !== "decimal") return "field_not_declared";
-    let text = collapse(spanText);
-    const percent = text.endsWith("%");
-    if (percent) text = text.slice(0, -1).trim();
-    const spanUnit = percent ? "%" : "1";
-    try {
-      validateUnitCode(value.unitCode);
-    } catch {
-      return "unit_code_invalid";
-    }
-    if (value.unitCode !== spanUnit) return "unit_code_invalid";
-    const spanValue = canonicalOrNull(stripGrouping(text));
-    const storedValue = canonicalOrNull(value.value);
-    if (spanValue === null || storedValue === null) {
-      return "value_not_normalizable";
-    }
-    return spanValue === storedValue ? null : "value_not_in_span";
-  },
+  rate_v1: matchRate,
 
   /** Rule 2 for a whole number: grouping separators, then the same parser. */
   integer_v1: (spanText, value) => {

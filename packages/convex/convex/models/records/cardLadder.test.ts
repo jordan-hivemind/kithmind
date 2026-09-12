@@ -17,6 +17,7 @@ import {
   CARD_PLAYBOOK_VERSION,
   loadCardExtractionDocument,
   runCardLadder,
+  toStagingRef,
   type CardLadderOps,
 } from "./cardLadder";
 import { publishDocumentCard } from "./cards";
@@ -224,15 +225,7 @@ function opsFor(harness: Harness): CardLadderOps {
           sourceItemId: harness.sourceItemId,
           recordKind: input.recordKind,
           fingerprint: { ...FINGERPRINT, tier: input.step },
-          refs: input.refs.map((ref) =>
-            "quote" in ref
-              ? { pageOrdinal: ref.pageOrdinal, quote: ref.quote }
-              : {
-                  pageOrdinal: ref.pageOrdinal,
-                  start: ref.start,
-                  end: ref.end,
-                },
-          ),
+          refs: input.refs.map(toStagingRef),
         },
       ),
     sweepEvidence: async () => {

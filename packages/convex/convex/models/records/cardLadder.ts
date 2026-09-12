@@ -364,13 +364,19 @@ const refusalCodeValidator = v.union(
   ...CARD_EXTRACTION_REFUSAL_CODES.map((code) => v.literal(code)),
 );
 
-/** The staging mutation takes one flat row; the union is a discriminant. */
-function toStagingRef(ref: CardRunnerSpanRef): {
+/**
+ * The staging mutation takes one flat row; the union is a discriminant. Every
+ * caller that hands a cited location to `stageCardEvidence` goes through here,
+ * so a new location form is added in one place rather than in each caller.
+ */
+export function toStagingRef(ref: CardRunnerSpanRef): {
   pageOrdinal: number;
   start?: number;
   end?: number;
   quote?: string;
+  cell?: { sheet: string; row: number; column: number };
 } {
+  if ("cell" in ref) return { pageOrdinal: ref.pageOrdinal, cell: ref.cell };
   return "quote" in ref
     ? { pageOrdinal: ref.pageOrdinal, quote: ref.quote }
     : { pageOrdinal: ref.pageOrdinal, start: ref.start, end: ref.end };

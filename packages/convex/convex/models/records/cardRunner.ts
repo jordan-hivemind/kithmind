@@ -178,6 +178,8 @@ const NORMALIZER_EXPECTATIONS: Readonly<Record<CardNormalizerId, string>> = {
     "the cited span text must contain the literal name; cite the sentence that names it",
   money_v1:
     "cite a span holding only the amount and its currency indicator, for example $1,250.00 or 1250.00 USD; give amount as a plain decimal string and currency as an ISO 4217 code",
+  money_or_number_v1:
+    "cite the single cell holding the figure; if the cell carries a currency indicator give a money value with its ISO 4217 code, otherwise give a decimal with unitCode 1, or % when the cell ends in one",
   date_v1:
     "cite a span holding only the date; give value as YYYY-MM-DD; a span that reads as two different dates under the accepted formats is refused rather than guessed",
   rate_v1:

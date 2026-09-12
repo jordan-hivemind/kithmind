@@ -485,3 +485,106 @@ export type ParsedTextDeclaration = {
   expectedDocumentCount: number;
   expectedChunkCount: number;
 };
+
+// --- spreadsheet sheet pages and the cell locator -------------------------
+
+/**
+ * The rendering rule for a spreadsheet's retained page. It is stated here, in
+ * the protocol both sides already share, because two parties depend on it
+ * being the same rule: the worker that renders a sheet into a page, and the
+ * server that resolves a `cell_v1` locator back into a UTF-16 range of that
+ * sealed page. One page per sheet, and the page is self-describing:
+ *
+ * ```
+ * line 0      the sheet name
+ * line 1 + r  row r, its cells joined with a tab
+ * ```
+ *
+ * Row 0 is the sheet's first row, which for the workbooks this serves is the
+ * header row. Every row is padded to the sheet's column count, so a column
+ * index means the same thing on every row, and an empty cell stays empty
+ * rather than shifting its neighbours. A cell's own text can never contain a
+ * tab or a newline, because `sheetCellText` replaces each with one space, so
+ * splitting a page on "\n" and then on "\t" recovers exactly the grid that
+ * was rendered.
+ *
+ * Naming the sheet on line 0 is what lets a cited cell prove its sheet from
+ * the sealed text alone, with no page-to-sheet table to trust.
+ */
+export const SHEET_PAGE_RENDERING_VERSION = "sheet_page_v1";
+
+export const SHEET_ROW_SEPARATOR = "\n";
+export const SHEET_CELL_SEPARATOR = "\t";
+
+/** A row or column index past these is a corrupt reference, not a sheet. */
+export const MAX_SHEET_ROWS = 65_536;
+export const MAX_SHEET_COLUMNS = 4_096;
+
+/**
+ * The only transform applied to a cell's rendered value. A tab, carriage
+ * return or newline inside a cell would make the grid unrecoverable, so each
+ * becomes one space; NFC is what the parsed-page validator already requires.
+ */
+export function sheetCellText(value: string): string {
+  return value.replace(/[\t\r\n]/gu, " ").normalize("NFC");
+}
+
+export type SheetGrid = {
+  name: string;
+  /** Row-major. Short rows are padded to `columnCount` when rendered. */
+  rows: readonly (readonly string[])[];
+  columnCount: number;
+};
+
+export function renderSheetPage(sheet: SheetGrid): string {
+  const lines = [sheetCellText(sheet.name)];
+  for (const row of sheet.rows) {
+    const cells: string[] = [];
+    for (let column = 0; column < sheet.columnCount; column += 1) {
+      cells.push(sheetCellText(row[column] ?? ""));
+    }
+    lines.push(cells.join(SHEET_CELL_SEPARATOR));
+  }
+  return lines.join(SHEET_ROW_SEPARATOR);
+}
+
+/** Zero-based, and `sheet` is the name the page must carry on its line 0. */
+export type SheetCellRef = { sheet: string; row: number; column: number };
+
+/**
+ * Resolves a cell into the UTF-16 range of its page, or `null` when the page
+ * does not hold that cell: a different sheet, a row past the end, a column
+ * past the row's width, or a cell whose rendered text is empty. An empty cell
+ * resolves to a zero-length range, which is not a citation: it would hash to
+ * the empty string on every page of every document and prove nothing, so it
+ * is refused here rather than staged as a span.
+ */
+export function resolveSheetCell(
+  pageText: string,
+  cell: SheetCellRef,
+): { start: number; end: number } | null {
+  if (
+    !Number.isSafeInteger(cell.row) ||
+    !Number.isSafeInteger(cell.column) ||
+    cell.row < 0 ||
+    cell.column < 0
+  ) {
+    return null;
+  }
+  const lines = pageText.split(SHEET_ROW_SEPARATOR);
+  if (lines[0] !== cell.sheet) return null;
+  const line = lines[cell.row + 1];
+  if (line === undefined) return null;
+  let offset = 0;
+  for (let index = 0; index <= cell.row; index += 1) {
+    offset += lines[index]!.length + SHEET_ROW_SEPARATOR.length;
+  }
+  const cells = line.split(SHEET_CELL_SEPARATOR);
+  const value = cells[cell.column];
+  if (value === undefined || value.length === 0) return null;
+  let start = offset;
+  for (let index = 0; index < cell.column; index += 1) {
+    start += cells[index]!.length + SHEET_CELL_SEPARATOR.length;
+  }
+  return { start, end: start + value.length };
+}

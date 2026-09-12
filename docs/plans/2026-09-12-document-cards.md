@@ -218,7 +218,7 @@ payer in one call.
 | `tax_return_card`            | Individual return            | `tax_year`, `filing_status`, `adjusted_gross_income`, `taxable_income`, `total_tax`, `refund_or_amount_due`, plus repeated `w2_employer`, `k1_entity`, `form_1099_payer` |
 | `k1_card`                    | Partnership or S corp K-1    | `k1_entity`, `tax_year`, repeated `k1_income` by class, `capital_account_beginning`, `capital_account_ending`                                                            |
 | `brokerage_tax_package_card` | Annual brokerage tax package | `tax_year`, repeated `form_present`, repeated `form_total`                                                                                                               |
-| `spreadsheet_card`           | Spreadsheet                  | Repeated `sheet_name`, `column_header`, `row_count`, `sheet_total`                                                                                                       |
+| `spreadsheet_card`           | Spreadsheet                  | Repeated `sheet_name`, `column_header`, `row_count`, `sheet_total_label`, `sheet_total`                                                                                  |
 
 Value types follow the existing union. Money fields are `money`. Rates such as
 `discount_rate` are `decimal` with a unit code. `mfn_clause` and
@@ -272,11 +272,37 @@ widens a range it was given.
 Accumulation is bounded by reuse: re-extraction over unchanged text creates no
 rows and only adds a fingerprint to rows that exist.
 
-Spreadsheet cells reuse the existing `sheet` locator kind on the same evidence
-span, extended if needed with a zero-based row index, a zero-based column
-index and the header cell text. The span still points at the cell's text
-inside the retained page text and still hashes to `quoteHash`. A locator
-never replaces the span; it names the position the span was taken from.
+#### The cell locator, settled on review 2026-09-12 during P2-70i
+
+A spreadsheet cell is named by a `cell_v1` locator of `{sheet, row, column}`,
+zero-based and row-major, rather than by the existing `sheet` locator. The
+`sheet` kind carries an A1-style `range` string; overloading it with
+zero-based indices would have given one locator two coordinate systems and no
+way to tell which a stored row used. `sheet` is unchanged and still available.
+
+A cell is not a fourth kind of evidence. It resolves into a UTF-16 range of
+the sheet's retained page, and then it is an ordinary evidence span: the range
+is inside the sealed page and on UTF-16 boundaries, and `quoteHash` is
+recomputed from the cell's own text. A locator never replaces the span; it
+names the position the span was taken from, and the gate proves a spreadsheet
+field exactly as it proves any other.
+
+Resolution is exact because the rendering makes it exact. A spreadsheet's
+retained text is one page per sheet under `SHEET_PAGE_RENDERING_VERSION`,
+which the worker protocol states once and both sides read:
+
+| Line       | Content                                                          |
+| ---------- | ---------------------------------------------------------------- |
+| 0          | The sheet name.                                                  |
+| 1 plus `r` | Row `r`, its cells joined with a tab, padded to the sheet width. |
+
+A cell's own text can never contain a tab or a newline, so splitting a page on
+newlines and then on tabs recovers exactly the grid that was rendered. Naming
+the sheet on line 0 is what lets a cited cell prove its sheet from the sealed
+text alone, with no page-to-sheet table to trust. A ref whose sheet name does
+not match the page, whose row or column is past the end, or whose cell is
+empty resolves to no span: a zero-length range would hash to the empty string
+on every page of every document and prove nothing.
 
 Existing limits hold: at most 16 evidence spans per field, at most 64 spans
 and 16 KiB of quotes per hydrated record, at most 32 event versions and 128
@@ -789,6 +815,38 @@ current 256-target bound, per section 10.3, and the manifest fails whole rather
 than embedding a subset. P2-70l lands last on purpose: the literal name is
 stored with evidence from P2-70c onward, so every entity question answers
 before binding exists, and binding is additive.
+
+#### What P2-70i landed, and where spreadsheet admission stops
+
+P2-70i landed the extraction, the locator and the card: a dependency-free
+`.xlsx` reader in the worker that renders one page per sheet under
+`SHEET_PAGE_RENDERING_VERSION` and reports the page-to-sheet map, the
+`cell_v1` locator and its exact resolution over sealed page text, and the
+`spreadsheet_card` fields with their gate normalizer.
+
+It did not move `.xlsx` from `unsupported` to content indexed in the
+inventory, and that was not a decision this PR was free to make. Admitting a
+non-text original is the archived-binary path, and the
+[original-byte contract](./2026-09-07-original-byte-contract.md) states that
+"the first supported binary class is PDF. Other media types require their own
+measured parser acceptance and explicit bounds." The path is pinned to PDF at
+every step that matters: the worker protocol rejects any `ready_binary_v1`
+entry whose media type is not `application/pdf` or whose profile is not
+`pdf_docqa_v1`, the assessment digests hard-code the same pair, and a parsed
+generation requires a parser artifact and the original's archive receipt pair.
+The inline UTF-8 lane cannot serve instead: it admits text whose SHA-256 must
+equal the file's own bytes, and it yields exactly one page, which is the
+opposite of one page per sheet.
+
+Spreadsheet admission is therefore its own task, ordered after this one: a
+`spreadsheet_v1` parser profile and its measured acceptance, the protocol and
+assessment widening from one binary class to a set, and the archive receipts
+for the workbook's original bytes. The reader and the rendering rule this PR
+landed are what that task stages from, and `.xls` is out of scope for it: the
+pre-2007 binary container is not a ZIP, so none of this reader applies to it.
+
+`.docx` stays `unsupported` and is untouched by P2-70i. A document reader is a
+separate task and shares nothing with this one but the ZIP container.
 
 ### Migration commands
 

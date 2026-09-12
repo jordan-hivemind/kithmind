@@ -12,7 +12,12 @@ import {
   stagePages,
 } from "../provenance/model";
 
-import { CARD_PLAYBOOK_VERSION, loadCardExtractionDocument, runCardLadder } from "./cardLadder";
+import {
+  CARD_PLAYBOOK_VERSION,
+  loadCardExtractionDocument,
+  runCardLadder,
+  toStagingRef,
+} from "./cardLadder";
 import { publishDocumentCard } from "./cards";
 import {
   CARD_PROMPT_VERSION,
@@ -240,11 +245,7 @@ function tickOps(input: {
               sourceItemId,
               recordKind: ladderInput.recordKind,
               fingerprint: { ...FINGERPRINT, tier: ladderInput.step },
-              refs: ladderInput.refs.map((ref) =>
-                "quote" in ref
-                  ? { pageOrdinal: ref.pageOrdinal, quote: ref.quote }
-                  : { pageOrdinal: ref.pageOrdinal, start: ref.start, end: ref.end },
-              ),
+              refs: ladderInput.refs.map(toStagingRef),
             }),
           sweepEvidence: async () => {
             await t.mutation(internal.models.records.cards.sweepCardEvidence, {
