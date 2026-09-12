@@ -228,9 +228,17 @@ else.
 
 ### 3.2 Content-addressed vectors
 
-A vector row is identified by `(spaceId, embeddingFingerprint, targetKind,
-targetId, inputHash)` and is immutable. It is no longer identified by a
+A vector row is immutable: its content is fixed by `(spaceId,
+embeddingFingerprint, targetKind, targetId, inputHash)` and is never patched.
+Its place in the index is exclusive: at most one row exists per `(spaceId,
+embeddingFingerprint, targetKind, targetId)`, so a target has exactly one
+vector under a fingerprint at any time. A row is no longer identified by a
 generation.
+
+Immutability and exclusivity are different properties and both are needed.
+Immutability is what makes reuse safe. Exclusivity is what keeps a superseded
+vector out of the candidate set, and it is enforced by I11: re-embedding a
+target deletes its previous row in the same transaction.
 
 The vector search scope becomes:
 
@@ -258,18 +266,53 @@ hydration still rechecks authorization against the live space membership.
 
 ### 3.3 Invariants
 
-| Id  | Invariant                                                                                                                                                                                          |
-| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| I1  | A vector row is immutable and unique for `(spaceId, fingerprint, targetKind, targetId, inputHash)`.                                                                                                |
-| I2  | `scopeV2` is a pure function of `(spaceId, fingerprint, targetKind)` and contains no generation identity.                                                                                          |
-| I3  | A target whose `inputHash` is unchanged keeps its vector across generations of the same fingerprint. No copy, no re-embed.                                                                         |
-| I4  | Eligible counters change only in the transaction that changes eligibility. Covered counters change only in the transaction that inserts or deletes a vector.                                       |
-| I5  | A generation for fingerprint F is complete for a kind when `covered(F, kind) == eligible(kind)`, the drift flag is false, and the last audit watermark is at or after the last eligibility change. |
-| I6  | Activation sets `activeFingerprint` and `activeEmbeddingGenerationId` in one mutation, under compare-and-set on the expected previous generation, and only when I5 holds for thoughts.             |
-| I7  | Hydration rechecks the active fingerprint, the live target's content hash and the target's current eligibility. A row failing any check is dropped and never returned.                             |
-| I8  | Cleanup never deletes a row whose fingerprint equals the active or retained fingerprint, checked by re-reading the space state inside each delete page.                                            |
-| I9  | Narrative capture requires complete thought coverage. Chunk coverage never blocks capture.                                                                                                         |
-| I10 | Incomplete chunk coverage is reported to the reader, not converted into unavailable semantic retrieval.                                                                                            |
+| Id  | Invariant                                                                                                                                                                                                                                    |
+| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| I1  | A vector row is immutable. Its content is fixed by `(spaceId, fingerprint, targetKind, targetId, inputHash)` and is never patched.                                                                                                           |
+| I2  | `scopeV2` is a pure function of `(spaceId, fingerprint, targetKind)` and contains no generation identity.                                                                                                                                    |
+| I3  | A target whose `inputHash` is unchanged keeps its vector across generations of the same fingerprint. No copy, no re-embed.                                                                                                                   |
+| I4  | Eligible counters change only in the transaction that changes eligibility. Covered counters change only in the transaction that inserts or deletes a vector.                                                                                 |
+| I5  | A generation for fingerprint F is complete for a kind when `covered(F, kind) == eligible(kind)`, the drift flag is false, and the last audit watermark is at or after the last eligibility change.                                           |
+| I6  | Activation sets `activeFingerprint` and `activeEmbeddingGenerationId` in one mutation, under compare-and-set on the expected previous generation, and only when I5 holds for thoughts.                                                       |
+| I7  | Hydration rechecks the active fingerprint, the live target's content hash and the target's current eligibility. A row failing any check is dropped and never returned.                                                                       |
+| I8  | Cleanup never deletes a row whose fingerprint equals the active or retained fingerprint, checked by re-reading the space state inside each delete page.                                                                                      |
+| I9  | Narrative capture requires complete thought coverage. Chunk coverage never blocks capture.                                                                                                                                                   |
+| I10 | Incomplete chunk coverage is reported to the reader, not converted into unavailable semantic retrieval.                                                                                                                                      |
+| I11 | The transaction that inserts a vector for `(target, new inputHash)` deletes that target's rows under the same fingerprint with any other `inputHash`. At most one row per `(spaceId, fingerprint, targetKind, targetId)` exists at any time. |
+
+### 3.3.1 Why I11 is required, and what I7 still does
+
+Removing the generation id from the filter means a target's old and new vectors
+share one `scopeV2` value. Without I11 both rows are searchable. Hydration drops
+the stale one under I7, but the damage is already done: the stale row consumed a
+candidate slot in a fixed 32-candidate budget, so a real match can be pushed out
+of top-k and no recheck can recover it. Two rows for one target can also reach
+hydration together, which the candidate path should never have to reason about.
+
+I11 makes the exclusion structural rather than corrective. The insert path
+already looks the target up by index to detect a duplicate; that lookup becomes
+delete-then-insert in the same transaction, so the swap is atomic and no window
+exists where a target has two rows or none. A re-embed is therefore one delete
+plus one insert, and the covered counters net to zero across it. I4 still
+applies to each half.
+
+| Property                  | Enforced by | Failure it prevents                             |
+| ------------------------- | ----------- | ----------------------------------------------- |
+| One row per target        | I11         | A superseded vector taking a candidate slot     |
+| Row content never changes | I1          | A reused vector silently meaning something else |
+| Stale row never returned  | I7          | A row whose target changed since the last embed |
+
+I7 stays, and is not made redundant by I11. It covers the window between an
+eligibility change and its re-embed: a target whose text changes has a stale
+vector until the fill reaches it, and during that window I11 has nothing to
+delete because no new row exists yet. I7 drops that row from results while I5
+reports the space as incompletely covered. I11 governs the moment of re-embed;
+I7 governs everything before it.
+
+Where a content change produces a new target id, as chunk replacement does, the
+old target is retired by its eligibility write and its vector is removed by the
+existing per-target cleanup. I11 binds where a target id is stable across a
+content change, which is the normal case for thoughts and for document cards.
 
 ### 3.4 Why activation is still atomic for the reader
 
@@ -319,14 +362,14 @@ of reader-visible state.
 
 Retention rule:
 
-| Class                                                          | Retention                                                           |
-| -------------------------------------------------------------- | ------------------------------------------------------------------- |
-| Vectors of the active fingerprint                              | Kept.                                                               |
-| Vectors of the most recently retired fingerprint               | Kept as the rollback artifact until a newer retirement replaces it. |
-| Vectors of any older fingerprint                               | Deleted in pages.                                                   |
-| Vectors whose target row is `retired`                          | Deleted in pages, in any fingerprint.                               |
-| Vectors whose `inputHash` no longer matches an eligible target | Deleted in pages, in any fingerprint.                               |
-| `embeddingGenerations` and `embeddingProfiles` rows            | Never deleted.                                                      |
+| Class                                                          | Retention                                                                                                                                                                            |
+| -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Vectors of the active fingerprint                              | Kept.                                                                                                                                                                                |
+| Vectors of the most recently retired fingerprint               | Kept as the rollback artifact until a newer retirement replaces it.                                                                                                                  |
+| Vectors of any older fingerprint                               | Deleted in pages.                                                                                                                                                                    |
+| Vectors whose target row is `retired`                          | Deleted in pages, in any fingerprint.                                                                                                                                                |
+| Vectors whose `inputHash` no longer matches an eligible target | Deleted in pages, in any fingerprint. A backstop only: I11 removes these at re-embed time, so a row in this class means the bookkeeping failed and the audit should have flagged it. |
+| `embeddingGenerations` and `embeddingProfiles` rows            | Never deleted.                                                                                                                                                                       |
 
 Generation and profile rows stay forever. They are small, and the embedding
 contract requires that cleanup preserve profile-use evidence: the legacy
@@ -404,13 +447,14 @@ needed.
 
 ## 7. Test plan
 
-| Test                 | Setup                                                  | Assertion                                                                                                                                  |
-| -------------------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| Pilot growth         | Synthetic space grown 256, 1,000, 5,000 targets        | Every phase completes. No transaction exceeds its page bound. Counters equal a recomputed audit. Wall time and page count recorded.        |
-| Resume after crash   | Stop scheduling between pages at each phase boundary   | Rerun reaches the same final state. Replaying a page with a stale cursor writes nothing. Replaying with the current cursor changes no row. |
-| Activation atomicity | Reader loop during a profile flip                      | No result ever carries a fingerprint other than the one the reader read. No mixed result. Degradation to keyword is allowed.               |
-| Cleanup safety       | Three fingerprints: active, retained, old              | Active and retained row sets identical before and after. Covered counters unchanged. An active-fingerprint change mid-run aborts the job.  |
-| Retrieval gate       | Frozen scorer, same 180-target corpus, after migration | Score does not move from 17/18 and MRR 0.758. Any movement blocks the migration.                                                           |
+| Test                       | Setup                                                                  | Assertion                                                                                                                                                                                                                                                                                   |
+| -------------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Pilot growth               | Synthetic space grown 256, 1,000, 5,000 targets                        | Every phase completes. No transaction exceeds its page bound. Counters equal a recomputed audit. Wall time and page count recorded.                                                                                                                                                         |
+| Resume after crash         | Stop scheduling between pages at each phase boundary                   | Rerun reaches the same final state. Replaying a page with a stale cursor writes nothing. Replaying with the current cursor changes no row.                                                                                                                                                  |
+| Activation atomicity       | Reader loop during a profile flip                                      | No result ever carries a fingerprint other than the one the reader read. No mixed result. Degradation to keyword is allowed.                                                                                                                                                                |
+| Single row per target, I11 | A target re-embedded after its content changes, repeated several times | Exactly one row per `(space, fingerprint, kind, targetId)` after every re-embed. A vector search for the old text returns no stale row. Covered counters unchanged across the swap. Between the content change and the re-embed, I7 drops the stale row and coverage reports the shortfall. |
+| Cleanup safety             | Three fingerprints: active, retained, old                              | Active and retained row sets identical before and after. Covered counters unchanged. An active-fingerprint change mid-run aborts the job.                                                                                                                                                   |
+| Retrieval gate             | Frozen scorer, same 180-target corpus, after migration                 | Score does not move from 17/18 and MRR 0.758. Any movement blocks the migration.                                                                                                                                                                                                            |
 
 Public tests use synthetic fixtures only. The growth test stays at 5,000 targets
 even though the first backfill is smaller, because a test at the size of the
@@ -428,10 +472,14 @@ merge.
 | ----- | --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 1     | P2-6ab Target table, counters and resumable builder | Counters equal a recomputed scan on synthetic fixtures. A 5,000-target synthetic build completes across pages. Crash-resume and stale-cursor tests pass. `scopeV2` exists and is unused. |
 | 2     | P2-6c Incremental admission                         | Publishing one document does work proportional to that document at 5,000 targets. No whole-space scan remains in an eligibility write.                                                   |
-| 3     | P2-6d Reader cutover and coverage semantics         | Activation atomicity test passes. Frozen scorer unchanged on the 180-target corpus.                                                                                                      |
+| 3     | P2-6d Reader cutover and coverage semantics         | Activation atomicity test passes. The I11 single-row test passes. Frozen scorer unchanged on the 180-target corpus.                                                                      |
 | 4     | P2-6f Stats from counters                           | `get_stats` and `list_spaces` on a 5,000-target synthetic space read no vector row and no thought row for counting.                                                                      |
 | 5     | P2-6g Production migration                          | Steps 1 to 7 of section 5 executed development-first. The 180-target audit passes and the frozen score does not move.                                                                    |
 | Later | P2-6e Retention and cleanup                         | Cleanup safety test passes. Generation and profile rows are never deleted.                                                                                                               |
+
+I11 lands no later than P2-6d. It may land earlier with the insert path, but it
+must not land after the first reader reads `scopeV2`, or a superseded vector is
+searchable for the length of one PR.
 
 Order is strict. P2-6c depends on the counters and the builder from P2-6ab.
 P2-6d must not land before P2-6c, or readers would see a coverage number that
@@ -512,17 +560,19 @@ unchanged.
 
 ### D1. Does the vector search filter keep the generation id?
 
-| Option                                        | Cost of a new generation                                                                                               | Reader guarantee                                                              |
-| --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
-| A. Keep the generation in the filter          | Copy every reused row: ~244 MiB at 20,000 targets, ~610 MiB at 50,000, and double storage while both generations exist | Filter-enforced. A reader physically cannot see two generations.              |
-| B. Drop it, content-address the row (planned) | Zero for unchanged targets                                                                                             | Invariant-enforced. Fingerprint in the filter, plus the I7 hydration recheck. |
+| Option                                         | Cost of a new generation                                                                                               | Reader guarantee                                                                                            |
+| ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| A. Keep the generation in the filter           | Copy every reused row: ~244 MiB at 20,000 targets, ~610 MiB at 50,000, and double storage while both generations exist | Filter-enforced. A reader physically cannot see two generations.                                            |
+| B. Drop it, content-address the row (accepted) | Zero for unchanged targets                                                                                             | Invariant-enforced. Fingerprint in the filter, one row per target under I11, plus the I7 hydration recheck. |
 
-Recommendation: B. Cost proportional to the delta was the requirement that
-opened this task, and A does not meet it at any scale. The card model makes A
-survivable, not correct: A still pays 625 rows of copying to admit one new
-document. The honest cost of B is that atomicity moves from the storage engine
-into I2, I6 and I7, so those three invariants need the second-model review and a
-direct test, which section 7 specifies.
+Recommendation: B, accepted in review. Cost proportional to the delta was the
+requirement that opened this task, and A does not meet it at any scale. The card
+model makes A survivable, not correct: A still pays 625 rows of copying to admit
+one new document. The honest cost of B is that atomicity moves from the storage
+engine into I2, I6, I7 and I11, so those four invariants need the second-model
+review and a direct test, which section 7 specifies. Review added I11: without
+it, B keeps a superseded vector searchable until cleanup runs, and a dropped
+candidate cannot be recovered by a later recheck.
 
 ### D2. Completeness by counters or by a recomputed manifest hash?
 
@@ -531,14 +581,14 @@ direct test, which section 7 specifies.
 | A. Recompute and compare a hash                          | No. A hash over the whole space cannot be computed in one transaction above roughly 1,300 vector rows of the 16 MiB read budget | Yes, by construction                           |
 | B. Transactional counters plus a bounded audit (planned) | Yes                                                                                                                             | Only at audit time, and only if the audit runs |
 
-Recommendation: B, with the audit treated as a required part of the design
-rather than an operational nicety. A is strictly safer and simply cannot exist
-above a few thousand targets. The mitigation is that the audit is paged, runs on
-a schedule, and reports a drift flag that section 6 surfaces instead of hiding.
-If a reviewer wants A's guarantee back, the available middle is a per-page hash
-chain over the target table, which costs a rolling hash write per page and
-detects manifest tampering but still cannot validate vector presence in one
-transaction.
+Recommendation: B, accepted in review, with the audit treated as a required part
+of the design rather than an operational nicety. A is strictly safer and simply
+cannot exist above a few thousand targets. The mitigation is that the audit is
+paged, runs on a schedule, and reports a drift flag that section 6 surfaces
+instead of hiding. The named upgrade path, kept open by review, is a per-page
+hash chain over the target table: it costs a rolling hash write per page and
+detects manifest tampering, but still cannot validate vector presence in one
+transaction. Build it if the audit ever reports drift it cannot explain.
 
 ### D3. Is incomplete chunk coverage fatal or reported?
 
@@ -548,6 +598,7 @@ transaction.
 | B. Reported, as the architecture says (planned) | Semantic retrieval continues, the response labels the shortfall | A caller that ignores the label over-trusts a partial ranking |
 
 Recommendation: B for chunk and card targets, A retained for thought targets.
+Accepted in review on that split.
 Architecture section 5.1 already requires labeled incomplete semantic results,
 and narrative capture depends on a complete thought index for duplicate
 detection, so the split follows what each consumer actually needs. The residual
