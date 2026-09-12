@@ -578,6 +578,14 @@ export async function deleteVanishedPeriodVerdicts(
  * Written through `review_items` rather than a new table because that is
  * where this archive already records "something was decided about these rows
  * and here is why".
+ *
+ * F1-65. `source_locator` names the table and the target account
+ * (`${table}:${duplicateOfAccountId}`) rather than staying null: this is
+ * the one thing that tells two groups for the same document apart (a
+ * positions removal and a balances removal can share one document and the
+ * same count), and `review_items_dedupe_key` (pgSchema.ts) now covers a
+ * document-scoped item even with a null locator, so two such groups would
+ * otherwise collide on INSERT instead of each getting their own row.
  */
 export function duplicateRemovalReviewItems(
   removed: readonly RemovedHolding[],
@@ -595,7 +603,7 @@ export function duplicateRemovalReviewItems(
     "duplicate_holding_removed",
     row.accountId,
     row.documentId,
-    null,
+    `${row.table}:${row.duplicateOfAccountId}`,
     String(count),
     `${count} ${row.table} row(s) this document stated under account ${row.accountId} were ` +
       `removed on ${now.toISOString()}: the account their printed number names ` +

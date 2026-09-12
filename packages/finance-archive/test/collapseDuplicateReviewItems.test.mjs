@@ -1,9 +1,12 @@
 // F1-65. scripts/collapseDuplicateReviewItems.mjs against a real, throwaway
 // archive: it must find every group duplicated on (kind, source_document_id,
-// source_locator, raw_value), keep the right survivor, print counts per
-// kind, and leave alone everything the dedupe key does not cover (a null
-// document or a null locator). A dry run must report the same groups and
-// write nothing.
+// source_locator, raw_value) -- a null source_locator included, once a
+// document is set, since that is the shape every `AdapterReviewItem`
+// produces and most of the owner's 84,266 weak_instrument_match duplicates
+// were exactly that -- keep the right survivor, print counts per kind, and
+// leave alone only what the dedupe key itself does not cover: a null
+// source_document_id. A dry run must report the same groups and write
+// nothing.
 //
 // Built at schema version 6, one migration short of
 // `review_items_dedupe_key` (pgSchema.ts): that index is exactly what would
@@ -65,7 +68,7 @@ async function seed(client) {
 }
 
 test(
-  "collapseDuplicateReviewItems deletes every duplicate but the resolved survivor, and leaves null-pointer legacy items alone",
+  "collapseDuplicateReviewItems deletes every duplicate but the resolved survivor, including a null-locator document-scoped group, and leaves only null-document legacy items alone",
   { skip },
   async (t) => {
     const client = await archiveBeforeDedupeIndex(t);
@@ -94,7 +97,7 @@ test(
     );
 
     // Legacy, pre-PR137 shape: both source_document_id and source_locator
-    // null. Content-identical, but with no document or locator to say two
+    // null. Content-identical, but with no document at all to say two
     // occurrences are "the same one" -- the dedupe key does not cover these,
     // and neither does this script.
     await client.query(
@@ -104,9 +107,12 @@ test(
          ('legacy-2', 'weak_instrument_match', 'ZZZ', 'pre-PR137, no document')`,
     );
 
-    // A document-scoped item with no locator (every item
-    // `AdapterReviewItem` produces today -- adapterImport.ts never carries
-    // one). Same story: not covered by the dedupe key, not touched here.
+    // A third duplicate group, same document, but with a null locator --
+    // exactly what every `AdapterReviewItem`-produced kind writes
+    // (adapterImport.ts never carries a per-row locator for these). A
+    // document pointer is enough of an identity on its own; this group must
+    // collapse just like the two above, not be left alone with the legacy
+    // rows above just because its locator also happens to be null.
     await client.query(
       `INSERT INTO review_items (id, kind, source_document_id, raw_value, reason)
        VALUES
@@ -116,11 +122,11 @@ test(
 
     // A dry run reports the same groups and writes nothing.
     const dryRun = await collapseDuplicateReviewItems(client, { dryRun: true });
-    assert.equal(dryRun.groups, 2);
-    assert.equal(dryRun.deleted, 3);
+    assert.equal(dryRun.groups, 3);
+    assert.equal(dryRun.deleted, 4);
     assert.deepEqual(dryRun.deletedByKind, {
       weak_instrument_match: 2,
-      undeclared_activity_type: 1,
+      undeclared_activity_type: 2,
     });
     const beforeCount = await one(
       client,
@@ -129,11 +135,11 @@ test(
     assert.equal(beforeCount.n, "9", "dry run must not have deleted anything");
 
     const report = await collapseDuplicateReviewItems(client, { dryRun: false });
-    assert.equal(report.groups, 2);
-    assert.equal(report.deleted, 3);
+    assert.equal(report.groups, 3);
+    assert.equal(report.deleted, 4);
     assert.deepEqual(report.deletedByKind, {
       weak_instrument_match: 2,
-      undeclared_activity_type: 1,
+      undeclared_activity_type: 2,
     });
 
     const remaining = (await all(client, "SELECT id FROM review_items ORDER BY id")).map(
@@ -143,7 +149,6 @@ test(
       "legacy-1",
       "legacy-2",
       "nulllocator-1",
-      "nulllocator-2",
       "resolved-1",
       "undeclared-1",
     ].sort());
@@ -161,6 +166,35 @@ test(
     assert.equal(second.groups, 0);
     assert.equal(second.deleted, 0);
     assert.deepEqual(second.deletedByKind, {});
+  },
+);
+
+test(
+  "collapseDuplicateReviewItems collapses two identical locator-null items on one document down to one",
+  { skip },
+  async (t) => {
+    const client = await archiveBeforeDedupeIndex(t);
+    await seed(client);
+
+    // The exact shape most of the owner's hosted duplicates were: a document
+    // set, a locator null, the same kind and raw_value -- what every
+    // resolve() call against an already-minted weak instrument produces.
+    await client.query(
+      `INSERT INTO review_items (id, kind, source_document_id, raw_value, reason)
+       VALUES
+         ('weak-null-1', 'weak_instrument_match', 'doc-1', 'ZZZ', 'first'),
+         ('weak-null-2', 'weak_instrument_match', 'doc-1', 'ZZZ', 'second')`,
+    );
+
+    const report = await collapseDuplicateReviewItems(client, { dryRun: false });
+    assert.equal(report.groups, 1);
+    assert.equal(report.deleted, 1);
+    assert.deepEqual(report.deletedByKind, { weak_instrument_match: 1 });
+
+    const remaining = await all(client, "SELECT id, source_locator FROM review_items");
+    assert.equal(remaining.length, 1);
+    assert.equal(remaining[0].id, "weak-null-1");
+    assert.equal(remaining[0].source_locator, null);
   },
 );
 

@@ -831,14 +831,35 @@ test(
         /review_items_dedupe_key/,
       );
 
-      // Null locator or null document: never a candidate for this index, so
-      // never refused, exactly like every item written before PR137.
+      // A null locator is still a candidate for this index once the document
+      // is set: `AdapterReviewItem`-produced kinds always carry one, and
+      // most of the owner's 84,266 weak_instrument_match duplicates were
+      // exactly this shape. The expression coalesces it, so a second row
+      // sharing kind, document and raw_value collides even with both
+      // locators null.
+      await client.query(
+        `INSERT INTO review_items (id, kind, source_document_id, source_locator, raw_value, reason)
+         VALUES ('review-null-1', 'weak_instrument_match', 'doc-1', NULL, 'ZZZ', 'null locator, first')`,
+      );
+      await assert.rejects(
+        client.query(
+          `INSERT INTO review_items (id, kind, source_document_id, source_locator, raw_value, reason)
+           VALUES ('review-null-2', 'weak_instrument_match', 'doc-1', NULL, 'ZZZ', 'null locator, second')`,
+        ),
+        /review_items_dedupe_key/,
+        "a null locator does not exempt a document-scoped item from the index",
+      );
+
+      // Null document (with or without a null locator too): never a
+      // candidate for this index, so never refused -- exactly like every
+      // item written before PR137, and every pull-level item
+      // adapterImport.ts's flushInstruments still writes with a null
+      // document today.
       await client.query(
         `INSERT INTO review_items (id, kind, source_document_id, source_locator, raw_value, reason)
          VALUES
-           ('review-null-1', 'weak_instrument_match', 'doc-1', NULL, 'ZZZ', 'null locator, first'),
-           ('review-null-2', 'weak_instrument_match', 'doc-1', NULL, 'ZZZ', 'null locator, second'),
-           ('review-null-3', 'weak_instrument_match', NULL, NULL, 'ZZZ', 'null document and locator')`,
+           ('review-nulldoc-1', 'weak_instrument_match', NULL, NULL, 'ZZZ', 'null document and locator, first'),
+           ('review-nulldoc-2', 'weak_instrument_match', NULL, NULL, 'ZZZ', 'null document and locator, second')`,
       );
     } finally {
       await client.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);

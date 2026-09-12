@@ -14,13 +14,17 @@
 // REVIEW_ITEMS_DEDUPE_KEY's DO block in pgSchema.ts, which runs the identical
 // duplicate check this script does.
 //
-// Scope: only groups where both source_document_id and source_locator are
-// non-null, exactly what the partial index covers. An item with either null
-// -- every item from before PR137, and every pull-level item
-// adapterImport.ts's `flushInstruments` still writes today -- has no stable
-// identity across pulls to call two occurrences "the same one," and this
-// script does not touch them: collapsing them would be guessing, and ground
-// rule 5 is the rule against exactly that.
+// Scope: only groups with a non-null source_document_id, exactly what the
+// partial index covers -- a null source_locator groups together fine, the
+// same as every `AdapterReviewItem`-produced kind (weak_instrument_match,
+// undeclared_activity_type, unknown_account_key) writes it, and most of the
+// owner's 84,266 weak_instrument_match duplicates were exactly this shape:
+// a document set, a locator null. Only source_document_id IS NULL is left
+// alone: an item from before PR137 (both columns null), or a pull-level item
+// (adapterImport.ts's `flushInstruments`, still written with a null document
+// today), has no document to call two occurrences "the same one" against,
+// and collapsing them would be guessing -- ground rule 5 is the rule against
+// exactly that.
 //
 // Which row survives a group: whichever already carries a `resolved_at` (a
 // person's own review work), so collapsing never turns a resolved item back
@@ -71,8 +75,8 @@ export async function collapseDuplicateReviewItems(
       `SELECT kind,
               array_agg(id ORDER BY (resolved_at IS NULL), id) AS ids
          FROM review_items
-        WHERE source_document_id IS NOT NULL AND source_locator IS NOT NULL
-        GROUP BY kind, source_document_id, source_locator, raw_value
+        WHERE source_document_id IS NOT NULL
+        GROUP BY kind, source_document_id, COALESCE(source_locator, ''), raw_value
        HAVING count(*) > 1`,
     );
 

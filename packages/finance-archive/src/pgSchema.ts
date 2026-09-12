@@ -471,17 +471,24 @@ CREATE INDEX account_aliases_account ON account_aliases (account_id);
 // this index is the constraint backing that check, so a write path that
 // bypasses it still cannot duplicate a row-scoped item.
 //
-// Partial, not plain UNIQUE: `source_locator` is null for every item
-// `AdapterReviewItem` produces (weak_instrument_match, undeclared_activity_type,
-// unknown_account_key -- adapterImport.ts, none of which carry a per-row
-// locator), and an item from before PR137 has both source_document_id and
-// source_locator null. Postgres never treats two NULLs as equal in a UNIQUE
-// index, so a plain index on all four columns would not even see those rows
-// as candidates, but this index still says so explicitly with WHERE,
-// matching the same rule `flushReviews` applies in application code: only a
-// document-scoped, row-located item has an identity stable enough to call
-// two occurrences "the same one." Everything else keeps opening a fresh row
-// every time, exactly as before this migration.
+// Partial on `source_document_id IS NOT NULL` only, and `source_locator`
+// coalesced to `''` inside the indexed expression rather than required
+// non-null: every item `AdapterReviewItem` produces (weak_instrument_match,
+// undeclared_activity_type, unknown_account_key -- adapterImport.ts) carries
+// a null locator, and grouping the owner's hosted duplicates by these four
+// columns showed most of the 84,266 weak_instrument_match duplicates were
+// exactly this shape -- a document set, a locator null, from after PR137
+// gave these items a document id. A `UNIQUE` index does not behave like
+// `GROUP BY` here: Postgres never treats two `NULL`s as equal in an indexed
+// column, so an index that left `source_locator` as a plain column,
+// required non-null or not, would not see two same-document, null-locator
+// rows as candidates for the same slot at all -- coalescing the expression
+// is what makes the constraint see them. Only `source_document_id IS NULL`
+// stays untouched: an item from before PR137 (both columns null) has no
+// document to scope it, and neither does a pull-level item
+// (adapterImport.ts's `flushInstruments`, still written with a null
+// document today) -- for either, "the same one" cannot be defined, so this
+// index does not try.
 //
 // This migration comes after the collapse: CREATE UNIQUE INDEX fails outright
 // if the table already holds rows that would violate it, and failing on the
@@ -500,8 +507,8 @@ BEGIN
   SELECT count(*) INTO dup_groups FROM (
     SELECT 1
       FROM review_items
-     WHERE source_document_id IS NOT NULL AND source_locator IS NOT NULL
-     GROUP BY kind, source_document_id, source_locator, raw_value
+     WHERE source_document_id IS NOT NULL
+     GROUP BY kind, source_document_id, COALESCE(source_locator, ''), raw_value
     HAVING count(*) > 1
   ) AS duplicate_groups;
   IF dup_groups > 0 THEN
@@ -512,8 +519,8 @@ BEGIN
 END $$;
 
 CREATE UNIQUE INDEX review_items_dedupe_key
-  ON review_items (kind, source_document_id, source_locator, raw_value)
-  WHERE source_document_id IS NOT NULL AND source_locator IS NOT NULL;
+  ON review_items (kind, source_document_id, COALESCE(source_locator, ''), raw_value)
+  WHERE source_document_id IS NOT NULL;
 `;
 
 /** Every migration, in order. The last one's version is the current schema. */

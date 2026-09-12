@@ -621,13 +621,27 @@ export async function importBatch(
    */
   /** (kind, source_locator, raw_value) -- the nullable three of the four
    * `review_items_dedupe_key` columns (the fourth, `source_document_id`, is
-   * fixed per `flushReviews` call and left out of the key). */
+   * fixed per `flushReviews` call and left out of the key).
+   *
+   * `source_locator` is coalesced to `""` before it goes into the key, the
+   * same as `review_items_dedupe_key`'s indexed expression: every
+   * `AdapterReviewItem`-produced kind (`weak_instrument_match`,
+   * `undeclared_activity_type`, `unknown_account_key`) carries a null
+   * locator, and most of one hosted reparse's duplicates were exactly this
+   * shape -- a document set, a locator null. Two JS `null`s already compare
+   * equal, so this coalesce changes nothing about *this* function's own
+   * behavior; it exists so this key never disagrees with what the database
+   * will accept. A plain `UNIQUE` index does not coalesce on its own --
+   * unlike `GROUP BY`, it treats two `NULL`s in an indexed column as
+   * distinct -- so without the same coalesce on both sides, a candidate this
+   * function called new could still collide at `INSERT` time.
+   */
   function reviewDedupeKey(row: {
     kind: string;
     source_locator: string | null;
     raw_value: string | null;
   }): string {
-    return JSON.stringify([row.kind, row.source_locator, row.raw_value]);
+    return JSON.stringify([row.kind, row.source_locator ?? "", row.raw_value]);
   }
 
   /** A pending review candidate tuple's own dedupe key, read back out of the

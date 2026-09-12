@@ -1186,16 +1186,22 @@ reopening the identical `weak_instrument_match` or `undeclared_activity_type`
 row on every reparse, and from opening it more than once *within* a single
 reparse when several rows shared one weak instrument or one undeclared type.
 One hosted reparse of 854 already-imported statements opened 76,687 review
-items this way. F1-65 makes `(kind, source_document_id, source_locator,
-raw_value)` the identity: `flushReviews` (`importer.ts`) checks it before
-writing (deduping the batch against itself, then against whatever the
-document already has on file in any status, so a resolved item is never
-reopened), and `review_items_dedupe_key` (migration 7) is the same identity
-enforced by a partial unique index, for document- and locator-scoped items --
-`source_locator` is null for every `AdapterReviewItem`-produced kind, so
-those rely on `flushReviews`'s check alone, the same as every item from
-before F1-56 does. `scripts/collapseDuplicateReviewItems.mjs` collapses an
-existing archive's duplicates before migration 7's index can be created:
+items this way, 84,266 of them exact duplicates by
+`(kind, source_document_id, source_locator, raw_value)` -- most of them a
+document set and a locator null, since that is the shape every
+`AdapterReviewItem`-produced kind writes. F1-65 makes those four columns the
+identity, with a null `source_locator` coalesced to `''` rather than
+exempted: `flushReviews` (`importer.ts`) checks it before writing (deduping
+the batch against itself, then against whatever the document already has on
+file in any status, so a resolved item is never reopened), and
+`review_items_dedupe_key` (migration 7) enforces the same identity with a
+partial unique index, `WHERE source_document_id IS NOT NULL`. Only an item
+with no document at all -- every item from before PR137, and every
+pull-level item `adapterImport.ts`'s `flushInstruments` still writes with a
+null document today -- falls outside both: neither can say two such
+occurrences are "the same one." `scripts/collapseDuplicateReviewItems.mjs`
+collapses an existing archive's duplicates before migration 7's index can be
+created:
 
 ```
 FINANCE_ARCHIVE_DATABASE_URL=postgresql://<owner>@<host>/<db> \
@@ -1495,7 +1501,7 @@ one, in order, inside the same transaction and lock, and records each one.
 | 4 | review_items cascade on document delete | `review_items.source_document_id` gets `ON DELETE CASCADE`.                    |
 | 5 | holdings row_hash                      | `positions.row_hash`, `balances.row_hash`, `liabilities.row_hash` (nullable, unique per table). |
 | 6 | account_aliases                        | `accounts.id, institution_id` unique; `account_aliases` table (alternate external keys). |
-| 7 | review_items dedupe key                | Partial unique index on `(kind, source_document_id, source_locator, raw_value)` where document and locator are both non-null. |
+| 7 | review_items dedupe key                | Partial unique index on `(kind, source_document_id, COALESCE(source_locator, ''), raw_value)` where the document is non-null. |
 
 Migration 2 (F1-29,
 [`docs/plans/2026-09-11-structured-evidence.md`](../../docs/plans/2026-09-11-structured-evidence.md))
