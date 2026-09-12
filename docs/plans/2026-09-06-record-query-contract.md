@@ -58,10 +58,15 @@ payer in one call.
 
 A card version is a processing generation over the same source revision and
 the same sealed text version, taking a new record fingerprint built from the
-card schema, playbook, prompt and gate versions and the accepted tier. It
-activates atomically and carries the previous generation's document and chunk
-rows forward, so a re-extraction retires no retained text and old card
-versions stay addressable.
+card schema, playbook, prompt and gate versions and the accepted tier. It is a
+sibling of the text generation, not its successor: it carries no pages,
+evidence spans, documents or chunks, and it activates atomically into a second
+item pointer. A source item therefore has one active text generation and at
+most one active card generation, and both are current. A generation holds card
+records or pipeline records and never both, so one event can never have two
+current versions. Publishing a card creates and retires no chunk row, so no
+embedding target identity changes, and retiring a card version leaves its
+records snapshot readable.
 
 The 256-row scan, 25-row page, 96 KiB and 2 MiB limits are unchanged and still
 bind, so a year with many cards pages with a cursor.

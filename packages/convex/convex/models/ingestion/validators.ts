@@ -49,6 +49,12 @@ export const processingGenerationFields = {
   parserPrimaryReceiptId: v.optional(v.id("sourceArtifactArchiveReceipts")),
   parserBackupReceiptId: v.optional(v.id("sourceArtifactArchiveReceipts")),
   desiredProcessingEpoch: v.number(),
+  /**
+   * True only for a document-card generation. A generation holds card records
+   * or pipeline records, never both, so the two current generations of one
+   * item can never return two versions of one event.
+   */
+  cardGeneration: v.optional(v.boolean()),
   state: processingStateValidator,
   expectedPageCount: v.number(),
   expectedEvidenceSpanCount: v.number(),

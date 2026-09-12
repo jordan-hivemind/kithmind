@@ -39,6 +39,23 @@ const _cardKindsAreRecordEventTypes: readonly RecordEventType[] =
   CARD_RECORD_KINDS;
 void _cardKindsAreRecordEventTypes;
 
+/**
+ * Section 4.2 of docs/plans/2026-09-12-document-cards.md: card activation
+ * patches `documents.docType` of the active text generation in place, so
+ * document type filtering and the accepted card kind cannot disagree. The
+ * previous value is recorded on the card version, which is what a rollback
+ * restores from.
+ */
+export const cardDocTypePatchValidator = v.array(
+  v.object({
+    documentId: v.id("documents"),
+    previousDocType: v.optional(v.string()),
+    appliedDocType: v.string(),
+  }),
+);
+
+export type CardDocTypePatch = Infer<typeof cardDocTypePatchValidator>;
+
 export const recordFieldEvidenceValidator = v.object({
   occurrence: v.array(v.id("evidenceSpans")),
   entity: v.array(v.id("evidenceSpans")),
@@ -59,6 +76,7 @@ export const stagedEventRecordValidator = v.object({
   schemaVersion: v.number(),
   occurrence: occurrenceValidator,
   fieldEvidence: recordFieldEvidenceValidator,
+  docTypePatch: v.optional(cardDocTypePatchValidator),
   observations: v.array(stagedObservationValidator),
 });
 
@@ -100,6 +118,7 @@ export const eventVersionFields = {
   occurrenceInstant: v.optional(v.number()),
   occurrenceSortKey: v.optional(v.string()),
   fieldEvidence: recordFieldEvidenceValidator,
+  docTypePatch: v.optional(cardDocTypePatchValidator),
   userId: v.id("users"),
 };
 

@@ -13,6 +13,7 @@ import {
 } from "../provenance/model";
 
 import { publishDocumentCard, type CardFieldInput } from "./cards";
+import { stageRecordBatch } from "./model";
 import { executeRecordQuery } from "./query";
 
 // Synthetic fixture only. Nothing here describes a real document.
@@ -379,19 +380,27 @@ describe("document cards", () => {
     if (empty.operation !== "list_events") throw new Error("wrong operation");
     expect(empty.records).toHaveLength(0);
 
-    // Section 4.2: activation writes the accepted card kind into docType, so
-    // document type filtering and the card cannot disagree.
-    const document = await seeded.t.run(async (ctx) => {
-      const rows = await ctx.db
-        .query("documents")
-        .withIndex("by_processingGenerationId", (q) =>
-          q.eq("processingGenerationId", published.processingGenerationId!),
-        )
-        .collect();
-      return rows[0]!;
-    });
-    expect(document.docType).toBe(CARD_KIND);
-    expect(document.publicationState).toBe("active");
+    // Section 4.2: activation patches the active document row's docType in
+    // place, so type filtering and the accepted card kind cannot disagree,
+    // and the previous value is recorded on the card version.
+    const state = await seeded.t.run(async (ctx) => ({
+      document: (await ctx.db.get(seeded.documentId))!,
+      version: (
+        await ctx.db
+          .query("eventVersions")
+          .withIndex("by_eventId", (q) => q.eq("eventId", published.eventId!))
+          .collect()
+      )[0]!,
+    }));
+    expect(state.document.docType).toBe(CARD_KIND);
+    expect(state.document.publicationState).toBe("active");
+    expect(state.version.docTypePatch).toEqual([
+      {
+        documentId: seeded.documentId,
+        previousDocType: "note",
+        appliedDocType: CARD_KIND,
+      },
+    ]);
   });
 
   test("drops a field whose span does not resolve and records the drop", async () => {
@@ -571,27 +580,109 @@ describe("document cards", () => {
         .query("eventVersions")
         .withIndex("by_eventId", (q) => q.eq("eventId", first.eventId!))
         .collect();
-      const documents = await ctx.db
-        .query("documents")
-        .withIndex("by_processingGenerationId", (q) =>
-          q.eq("processingGenerationId", current._id),
-        )
-        .collect();
-      const retired = await ctx.db.get(seeded.documentId);
-      return { item, old, current, versions, documents, retired };
+      const document = (await ctx.db.get(seeded.documentId))!;
+      return { item, old, current, versions, document };
     });
-    expect(state.item.activeGenerationId).toBe(second.processingGenerationId);
+    // The text generation is still the active text generation, and the card
+    // generation is a sibling rather than its successor.
+    expect(state.item.activeGenerationId).toBe(seeded.processingGenerationId);
+    expect(state.item.activeCardGenerationId).toBe(
+      second.processingGenerationId,
+    );
     expect(state.old.state).toBe("ready");
     expect(state.old.deactivatedAt).toBeGreaterThan(state.old.activatedAt!);
     expect(state.current.deactivatedAt).toBeUndefined();
     // Old card versions stay addressable.
     expect(state.versions).toHaveLength(2);
-    // The document payload moves forward with the card, and the base
-    // generation's row is retired rather than orphaned.
-    expect(state.documents).toHaveLength(1);
-    expect(state.documents[0]!.publicationState).toBe("active");
-    expect(state.documents[0]!.documentKey).toBe("synthetic://card/one");
-    expect(state.retired!.publicationState).toBe("historical");
+    // The document row is patched in place, never retired or duplicated.
+    expect(state.document.publicationState).toBe("active");
+    expect(state.document.docType).toBe(CARD_KIND);
+  });
+
+  test("two card publications leave chunk ids and embedding targets untouched", async () => {
+    const seeded = await seedDocument({ withSubjectEntity: true });
+    const before = await seeded.t.run(async (ctx) => {
+      const chunks = await ctx.db.query("chunks").collect();
+      await ctx.db.insert("embeddingTargets", {
+        spaceId: seeded.spaceId,
+        targetKind: "chunk",
+        targetId: String(chunks[0]!._id),
+        inputHash: "synthetic-chunk-hash",
+        processingGenerationId: seeded.processingGenerationId,
+        state: "eligible",
+        updatedAt: 10,
+      });
+      return {
+        chunks: await ctx.db.query("chunks").collect(),
+        documents: await ctx.db.query("documents").collect(),
+        targets: await ctx.db.query("embeddingTargets").collect(),
+      };
+    });
+
+    for (const [index, tier] of (["tier0", "tier1"] as const).entries()) {
+      const published = await seeded.t.run((ctx) =>
+        publishDocumentCard(ctx, {
+          spaceId: seeded.spaceId,
+          sourceItemId: seeded.sourceItemId,
+          userId: seeded.userId,
+          recordKind: "document_card",
+          now: 1_000 + index,
+          fingerprint: { ...FINGERPRINT, tier },
+          anchorEvidenceSpanIds: [seeded.evidence[TITLE]!],
+          fields: genericFields(seeded.evidence),
+        }),
+      );
+      expect(published.published).toBe(true);
+    }
+
+    const after = await seeded.t.run(async (ctx) => ({
+      chunks: await ctx.db.query("chunks").collect(),
+      documents: await ctx.db.query("documents").collect(),
+      targets: await ctx.db.query("embeddingTargets").collect(),
+    }));
+    // I3 and I11 of the index capacity plan: unchanged content keeps its
+    // target identity, so a card publication forces no re-embed.
+    expect(after.chunks.map((row) => row._id)).toEqual(
+      before.chunks.map((row) => row._id),
+    );
+    expect(after.chunks.map((row) => row.publicationState)).toEqual(
+      before.chunks.map((row) => row.publicationState),
+    );
+    expect(after.documents.map((row) => row._id)).toEqual(
+      before.documents.map((row) => row._id),
+    );
+    expect(after.targets).toEqual(before.targets);
+  });
+
+  test("refuses a card record in a pipeline generation", async () => {
+    const seeded = await seedDocument({ withSubjectEntity: true });
+    await seeded.t.run((ctx) =>
+      ctx.db.patch(seeded.processingGenerationId, { state: "processing" }),
+    );
+    await expect(
+      seeded.t.run((ctx) =>
+        stageRecordBatch(ctx, {
+          spaceId: seeded.spaceId,
+          processingGenerationId: seeded.processingGenerationId,
+          userId: seeded.userId,
+          records: [
+            {
+              eventKey: "card:document_card",
+              entityId: seeded.entityId,
+              eventType: "document_card",
+              schemaVersion: 1,
+              occurrence: { precision: "unknown" },
+              fieldEvidence: {
+                occurrence: [seeded.evidence[TITLE]!],
+                entity: [seeded.evidence[TITLE]!],
+                eventType: [seeded.evidence[TITLE]!],
+              },
+              observations: [],
+            },
+          ],
+        }),
+      ),
+    ).rejects.toThrow("Card records require a card processing generation");
   });
 
   test("refuses a card for a document in another space", async () => {

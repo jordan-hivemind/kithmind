@@ -2,16 +2,8 @@ import { v } from "convex/values";
 
 import type { Doc, Id } from "../../_generated/dataModel";
 import { internalMutation, type MutationCtx } from "../../_generated/server";
-import { bumpEmbeddingEligibilityEpoch } from "../embeddings/model";
 import { digestProcessingConfiguration } from "../ingestion/hash";
-import {
-  boundedDocumentSize,
-  PayloadReadBudget,
-} from "../ingestion/payloadBudget";
-import {
-  activateSourceItemGeneration,
-  MAX_GENERATION_DOCUMENTS,
-} from "../provenance/model";
+import { MAX_GENERATION_DOCUMENTS } from "../provenance/model";
 
 import {
   cardEventKey,
@@ -24,13 +16,8 @@ import { probeFieldEvidence, stageRecordBatch } from "./model";
 import { nextRecordActivationTime } from "./querySessions";
 import { observationValueValidator } from "./valueValidators";
 import type { ObservationValue } from "./values";
-import type { StagedObservation } from "./validators";
+import type { CardDocTypePatch, StagedObservation } from "./validators";
 
-/**
- * A parsed generation admits up to 256 chunks; `activateSourceItemGeneration`
- * only allows that many when the caller hands it the rows it verified.
- */
-const MAX_CARRIED_CHUNKS = 256;
 const MAX_FINGERPRINT_PART_BYTES = 64;
 
 /**
@@ -365,13 +352,16 @@ export async function publishDocumentCard(
       ? {}
       : { parserBackupReceiptId: base.parserBackupReceiptId }),
     desiredProcessingEpoch: item.desiredProcessingEpoch,
+    cardGeneration: true,
     state: "processing",
-    expectedPageCount: base.actualPageCount ?? base.expectedPageCount,
-    expectedEvidenceSpanCount:
-      base.actualEvidenceSpanCount ?? base.expectedEvidenceSpanCount,
-    expectedDocumentCount:
-      base.actualDocumentCount ?? base.expectedDocumentCount,
-    expectedChunkCount: base.actualChunkCount ?? base.expectedChunkCount,
+    // A card generation is a sibling of the text generation, not a successor.
+    // It carries no pages, evidence spans, documents or chunks of its own and
+    // reads the text generation's sealed text version, so publishing a card
+    // never changes a chunk id and never retires an embedding target.
+    expectedPageCount: 0,
+    expectedEvidenceSpanCount: 0,
+    expectedDocumentCount: 0,
+    expectedChunkCount: 0,
     expectedEventCount: 1,
     expectedObservationCount: storable.length,
     embeddingStatus: "unavailable",
@@ -380,14 +370,14 @@ export async function publishDocumentCard(
   const cardKindField = storable.find(
     (field) => field.field === "card_kind" && field.value.type === "text",
   );
-  const carried = await carryPayloadForward(ctx, {
-    spaceId: input.spaceId,
-    base,
-    processingGenerationId: generationId,
-    ...(cardKindField && cardKindField.value.type === "text"
-      ? { docType: cardKindField.value.value }
-      : {}),
-  });
+  const docTypePatch =
+    cardKindField && cardKindField.value.type === "text"
+      ? await planDocTypePatch(ctx, {
+          spaceId: input.spaceId,
+          base,
+          appliedDocType: cardKindField.value.value,
+        })
+      : [];
 
   const observations: StagedObservation[] = storable.map((field) => ({
     observationKey: cardFieldKey(field),
@@ -413,17 +403,17 @@ export async function publishDocumentCard(
           entity: input.anchorEvidenceSpanIds,
           eventType: input.anchorEvidenceSpanIds,
         },
+        ...(docTypePatch.length === 0 ? {} : { docTypePatch }),
         observations,
       },
     ],
   });
 
   await ctx.db.patch(generationId, {
-    actualPageCount: base.actualPageCount ?? base.expectedPageCount,
-    actualEvidenceSpanCount:
-      base.actualEvidenceSpanCount ?? base.expectedEvidenceSpanCount,
-    actualDocumentCount: carried.documents.length,
-    actualChunkCount: carried.chunks.length,
+    actualPageCount: 0,
+    actualEvidenceSpanCount: 0,
+    actualDocumentCount: 0,
+    actualChunkCount: 0,
     actualEventCount: 1,
     actualObservationCount: observations.length,
     state: "staged",
@@ -432,10 +422,9 @@ export async function publishDocumentCard(
   await activateCardGeneration(ctx, {
     spaceId: input.spaceId,
     item,
-    base,
     processingGenerationId: generationId,
     now: input.now,
-    carried,
+    docTypePatch,
   });
 
   await recordDrops(ctx, {
@@ -487,122 +476,61 @@ async function recordDrops(
 }
 
 /**
- * A card version is a successor generation over the same revision, so it must
- * carry the document and chunk rows that made the previous one readable.
- * Pages and evidence spans belong to the shared sealed text version and are
- * not copied; only the per-generation rows are.
+ * Section 4.2: the accepted `card_kind` becomes `documents.docType` so type
+ * filtering and the card cannot disagree. A card generation carries no
+ * documents of its own, so the patch lands on the active text generation's
+ * rows in place. It is planned before staging and recorded on the card
+ * version, which is what a rollback restores from, and it is idempotent: a
+ * row already carrying the accepted value is left alone.
  */
-async function carryPayloadForward(
+async function planDocTypePatch(
   ctx: MutationCtx,
   input: {
     spaceId: Id<"spaces">;
     base: Doc<"processingGenerations">;
-    processingGenerationId: Id<"processingGenerations">;
-    docType?: string;
+    appliedDocType: string;
   },
-): Promise<{ documents: Doc<"documents">[]; chunks: Doc<"chunks">[] }> {
-  const baseDocuments = await ctx.db
+): Promise<CardDocTypePatch> {
+  const documents = await ctx.db
     .query("documents")
     .withIndex("by_processingGenerationId", (q) =>
       q.eq("processingGenerationId", input.base._id),
     )
     .take(MAX_GENERATION_DOCUMENTS + 1);
-  if (baseDocuments.length > MAX_GENERATION_DOCUMENTS) {
+  if (documents.length > MAX_GENERATION_DOCUMENTS) {
     throw new Error("Card document generation exceeds the document bound");
   }
-  const baseChunks = await ctx.db
-    .query("chunks")
-    .withIndex("by_processingGenerationId", (q) =>
-      q.eq("processingGenerationId", input.base._id),
+  return documents
+    .filter(
+      (row) =>
+        row.spaceId === input.spaceId &&
+        row.publicationState === "active" &&
+        row.docType !== input.appliedDocType,
     )
-    .take(MAX_CARRIED_CHUNKS + 1);
-  if (baseChunks.length > MAX_CARRIED_CHUNKS) {
-    throw new Error("Card document generation exceeds the chunk bound");
-  }
-
-  const documentIds = new Map<Id<"documents">, Id<"documents">>();
-  const documents: Doc<"documents">[] = [];
-  for (const row of baseDocuments) {
-    if (
-      row.spaceId !== input.spaceId ||
-      row.publicationState !== "active" ||
-      row.sourceTextVersionId !== input.base.sourceTextVersionId
-    ) {
-      throw new Error("Active document payload is invalid");
-    }
-    const { _id, _creationTime, ...fields } = row;
-    void _creationTime;
-    const id = await ctx.db.insert("documents", {
-      ...fields,
-      processingGenerationId: input.processingGenerationId,
-      // Section 4.2: activation writes the accepted card kind into
-      // `documents.docType` so type filtering and the card cannot disagree.
-      ...(input.docType === undefined ? {} : { docType: input.docType }),
-      publicationState: "staged",
-    });
-    documentIds.set(_id, id);
-    documents.push((await ctx.db.get(id))!);
-  }
-  const chunks: Doc<"chunks">[] = [];
-  for (const row of baseChunks) {
-    const documentId = documentIds.get(row.documentId);
-    if (row.spaceId !== input.spaceId || !documentId) {
-      throw new Error("Active chunk payload is invalid");
-    }
-    const { _id, _creationTime, ...fields } = row;
-    void _id;
-    void _creationTime;
-    const id = await ctx.db.insert("chunks", {
-      ...fields,
-      processingGenerationId: input.processingGenerationId,
-      documentId,
-      publicationState: "staged",
-    });
-    chunks.push((await ctx.db.get(id))!);
-  }
-  return { documents, chunks };
+    .map((row) => ({
+      documentId: row._id,
+      ...(row.docType === undefined ? {} : { previousDocType: row.docType }),
+      appliedDocType: input.appliedDocType,
+    }));
 }
 
 /**
- * The same atomic activation the ingestion pipeline performs, without a
- * worker lease: one mutation moves the item to the card generation, retires
- * the previous one, and advances the space activation clock so a reserved
- * query snapshot cannot straddle the change.
+ * Atomic activation without a worker lease. The item keeps its active text
+ * generation and gains an active card generation; the previous card
+ * generation is retired so its versions stay snapshot readable. No document
+ * row, chunk row, page or evidence span is created, moved or retired here,
+ * which is what keeps chunk target ids stable across card publications.
  */
 async function activateCardGeneration(
   ctx: MutationCtx,
   input: {
     spaceId: Id<"spaces">;
     item: Doc<"sourceItems">;
-    base: Doc<"processingGenerations">;
     processingGenerationId: Id<"processingGenerations">;
     now: number;
-    carried: { documents: Doc<"documents">[]; chunks: Doc<"chunks">[] };
+    docTypePatch: CardDocTypePatch;
   },
 ): Promise<number> {
-  const budget =
-    input.base.parserArtifactId === undefined
-      ? undefined
-      : new PayloadReadBudget(ctx);
-  await activateSourceItemGeneration(ctx, {
-    spaceId: input.spaceId,
-    sourceItemId: input.item._id,
-    sourceRevisionId: input.base.sourceRevisionId,
-    processingGenerationId: input.processingGenerationId,
-    expectedPreviousGenerationId: input.base._id,
-    expectedDesiredProcessingEpoch: input.item.desiredProcessingEpoch,
-    ...(budget
-      ? {
-          verifiedPayload: input.carried,
-          payloadReadBudget: {
-            measureRow: (row: Record<string, unknown>, maximumBytes: number) =>
-              boundedDocumentSize(row as never, maximumBytes),
-            finish: () => budget.finish(),
-          },
-        }
-      : {}),
-  });
-
   const states = await ctx.db
     .query("spaceProcessingState")
     .withIndex("by_spaceId", (q) => q.eq("spaceId", input.spaceId))
@@ -629,16 +557,42 @@ async function activateCardGeneration(
       activatedAt,
     });
   }
-  await ctx.db.patch(input.base._id, { deactivatedAt: activatedAt });
+  const previousCardGenerationId = input.item.activeCardGenerationId;
+  if (
+    previousCardGenerationId &&
+    previousCardGenerationId !== input.processingGenerationId
+  ) {
+    const previous = await ctx.db.get(previousCardGenerationId);
+    if (
+      !previous ||
+      previous.spaceId !== input.spaceId ||
+      previous.sourceItemId !== input.item._id ||
+      previous.cardGeneration !== true
+    ) {
+      throw new Error("Previous card generation is invalid");
+    }
+    await ctx.db.patch(previous._id, { deactivatedAt: activatedAt });
+  }
   await ctx.db.patch(input.processingGenerationId, {
     state: "ready",
     activatedAt,
   });
-  // Chunk vectors of the retired generation stay addressable but are excluded
-  // from reads, which already require the chunk's generation to be the item's
-  // active one. The eligibility epoch bump is what rebuilds them.
-  await bumpEmbeddingEligibilityEpoch(ctx, input.spaceId);
-  if (budget) await budget.finish();
+  for (const patch of input.docTypePatch) {
+    const document = await ctx.db.get(patch.documentId);
+    if (
+      !document ||
+      document.spaceId !== input.spaceId ||
+      document.publicationState !== "active"
+    ) {
+      throw new Error("Card docType target is no longer active");
+    }
+    await ctx.db.patch(patch.documentId, { docType: patch.appliedDocType });
+  }
+  // No embedding eligibility bump: the text generation, its documents and its
+  // chunks are untouched, so every chunk target id and vector stays valid.
+  await ctx.db.patch(input.item._id, {
+    activeCardGenerationId: input.processingGenerationId,
+  });
   return activatedAt;
 }
 

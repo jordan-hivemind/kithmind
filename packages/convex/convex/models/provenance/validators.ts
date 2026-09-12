@@ -125,6 +125,14 @@ export const sourceItemFields = {
   desiredProcessingEpoch: v.number(),
   activeRevisionId: v.optional(v.id("sourceRevisions")),
   activeGenerationId: v.optional(v.id("processingGenerations")),
+  /**
+   * Section 4.6 of docs/plans/2026-09-12-document-cards.md: an item has one
+   * active text generation and at most one active card generation. A card
+   * generation is a sibling, not a successor: it reuses this item's revision
+   * and sealed text version and carries no documents and no chunks, so
+   * publishing a card never changes a chunk id or an embedding target.
+   */
+  activeCardGenerationId: v.optional(v.id("processingGenerations")),
   lastFailure: v.optional(provenanceFailureValidator),
   forgottenAt: v.optional(v.number()),
   forgottenBy: v.optional(v.id("users")),

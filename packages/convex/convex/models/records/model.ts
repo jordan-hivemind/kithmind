@@ -742,6 +742,7 @@ function sameEventVersion(
     sameIds(row.fieldEvidence.occurrence, expected.fieldEvidence.occurrence) &&
     sameIds(row.fieldEvidence.entity, expected.fieldEvidence.entity) &&
     sameIds(row.fieldEvidence.eventType, expected.fieldEvidence.eventType) &&
+    sameStructuredValue(row.docTypePatch, expected.docTypePatch) &&
     row.userId === expected.userId
   );
 }
@@ -889,6 +890,19 @@ export async function stageRecordBatch(
     const occurrenceFields = canonicalOccurrenceFields(occurrence);
     const entity = await requireEntity(ctx, record.entityId, input.spaceId);
     requireEventSchema(record.eventType, record.schemaVersion, entity);
+    // A card generation holds card records and a pipeline generation holds
+    // pipeline records. Both are current for the same item, so mixing them
+    // would let one event have two current versions.
+    if (
+      isCardRecordKind(record.eventType) !==
+      (chain.generation.cardGeneration === true)
+    ) {
+      throw new Error(
+        isCardRecordKind(record.eventType)
+          ? "Card records require a card processing generation"
+          : "A card processing generation accepts only card records",
+      );
+    }
     await requireEvidence(
       ctx,
       chain,
@@ -965,6 +979,9 @@ export async function stageRecordBatch(
         `${event._id}|${chain.generation._id}`,
       ),
       fieldEvidence: record.fieldEvidence,
+      ...(record.docTypePatch === undefined
+        ? {}
+        : { docTypePatch: record.docTypePatch }),
       userId: eventVersion?.userId ?? input.userId,
     } satisfies Omit<Doc<"eventVersions">, "_id" | "_creationTime">;
     if (eventVersion) {
@@ -1356,8 +1373,7 @@ function requireReadableGeneration(
   }
   if (scope.snapshot === undefined) {
     if (
-      chain.sourceItem.activeGenerationId !== chain.generation._id ||
-      chain.sourceItem.activeRevisionId !== chain.generation.sourceRevisionId ||
+      !isCurrentGeneration(chain.sourceItem, chain.generation) ||
       deactivatedAt !== undefined
     ) {
       throw new Error("Record generation is not the valid current generation");
@@ -1375,11 +1391,27 @@ function requireReadableGeneration(
   }
   if (
     deactivatedAt === undefined &&
-    (chain.sourceItem.activeGenerationId !== chain.generation._id ||
-      chain.sourceItem.activeRevisionId !== chain.generation.sourceRevisionId)
+    !isCurrentGeneration(chain.sourceItem, chain.generation)
   ) {
     throw new Error("Open record generation is not the current source version");
   }
+}
+
+/**
+ * Section 4.6 of docs/plans/2026-09-12-document-cards.md: an item has one
+ * active text generation and at most one active card generation, and both are
+ * current. They can never return two versions of one event, because a
+ * generation holds card records or pipeline records and never both.
+ */
+function isCurrentGeneration(
+  item: Doc<"sourceItems">,
+  generation: Doc<"processingGenerations">,
+): boolean {
+  return (
+    (item.activeGenerationId === generation._id ||
+      item.activeCardGenerationId === generation._id) &&
+    item.activeRevisionId === generation.sourceRevisionId
+  );
 }
 
 export async function hydrateEventVersion(
