@@ -21,6 +21,7 @@ import {
   runReconciliationGate,
   writeCaptureManifest,
   writeRawDocument,
+  writeRetainedText,
 } from "../dist/index.js";
 
 import { collapseDuplicateDocuments } from "../scripts/collapseDuplicateDocuments.mjs";
@@ -58,16 +59,36 @@ async function seed(client) {
   );
 }
 
+/** The parsed text every synthetic capture retains by default: what a
+ * provider re-render keeps identical even though its PDF bytes differ. Tests
+ * that need genuinely different text, or a text file that cannot be read,
+ * override `text` or `textPath` below. */
+const DEFAULT_TEXT = "Collapse Trust statement, synthetic, 2026-03-31.";
+
 /**
  * One capture of one document: distinct bytes written to the raw tree, a
  * capture manifest recording when it was acquired, and the `documents` row
  * the importer would have written for it before F1-71 (no
  * `provider_document_id` unless the caller asks for one).
+ *
+ * `text` is the row's retained parsed text (F1-71b's grouping key on top of
+ * metadata), written to the raw tree's text namespace and pointed at by
+ * `documents.text_path` -- null skips writing a text artifact and leaves the
+ * column null. `textPath` overrides the column with a path this test never
+ * writes a file at, for a row whose text file is missing.
  */
 function writeCapture(
   client,
   root,
-  { id, rendering, capturedAt, providerDocumentId = null, columnProviderId = null },
+  {
+    id,
+    rendering,
+    capturedAt,
+    providerDocumentId = null,
+    columnProviderId = null,
+    text = DEFAULT_TEXT,
+    textPath = undefined,
+  },
 ) {
   const retained = retainPayload(
     RETENTION,
@@ -94,12 +115,15 @@ function writeCapture(
     originalExtension: ".pdf",
     retention: retained.record,
   });
+  const resolvedTextPath =
+    textPath !== undefined ? textPath : text === null ? null : writeRetainedText(root, text).path;
   return client.query(
     `INSERT INTO documents
        (id, institution_id, account_id, doc_type, doc_date, file_path, sha256, parsed_ok,
-        retained_sha256, retained_byte_length, media_type, capture_id, provider_document_id)
+        retained_sha256, retained_byte_length, media_type, capture_id, text_path,
+        provider_document_id)
      VALUES ($1, $2, $3, 'statement', DATE '2026-03-31', $4, $5, TRUE, $5, $6,
-             'text/plain; charset=utf-8', $1, $7)`,
+             'text/plain; charset=utf-8', $1, $7, $8)`,
     [
       id,
       INSTITUTION_ID,
@@ -107,6 +131,7 @@ function writeCapture(
       written.path,
       written.sha256,
       retained.bytes.byteLength,
+      resolvedTextPath,
       // Every row this defect produced has a NULL column: nothing recorded a
       // provider id before F1-71 existed. The manifest may still know one.
       columnProviderId,
@@ -164,21 +189,27 @@ test(
 
     // Three downloads of one statement, each producing different bytes --
     // the defect exactly. Written out of capture order, so "the earliest
-    // capture survives" cannot pass by accident of insertion order.
+    // capture survives" cannot pass by accident of insertion order. Each
+    // rendering's retained text differs only in whitespace -- exactly what a
+    // provider re-render does to the parsed text -- so the normalized hash
+    // still agrees across all three (F1-71b).
     await writeCapture(client, root, {
       id: "doc-b",
       rendering: "second",
       capturedAt: "2026-04-02T10:00:00.000Z",
+      text: "Collapse Trust statement,   synthetic,\n2026-03-31.",
     });
     await writeCapture(client, root, {
       id: "doc-a",
       rendering: "first",
       capturedAt: "2026-04-01T10:00:00.000Z",
+      text: DEFAULT_TEXT,
     });
     await writeCapture(client, root, {
       id: "doc-c",
       rendering: "third",
       capturedAt: "2026-04-03T10:00:00.000Z",
+      text: "  Collapse Trust statement, synthetic, 2026-03-31.  ",
     });
 
     // What the archive derived from them. The holdings row hash does not
@@ -224,6 +255,12 @@ test(
     assert.equal(dry.groupsBySource.metadata, 1, "no provider id anywhere: grouped on metadata");
     assert.equal(dry.capturesRead, 3);
     assert.equal(
+      dry.rowsWithoutUsableText,
+      0,
+      "every rendering retained readable text, so nothing fell back to a per-row key",
+    );
+    assert.equal(dry.canonicalRemaining, 1, "3 documents considered, 2 would be superseded");
+    assert.equal(
       await count(client, "documents", "WHERE superseded_by IS NOT NULL"),
       0,
       "a dry run writes nothing",
@@ -232,6 +269,7 @@ test(
     const report = await collapseDuplicateDocuments(client, { rawTreeRoot: root });
     assert.equal(report.groups, 1);
     assert.equal(report.superseded, 2);
+    assert.equal(report.canonicalRemaining, 1);
     assert.equal(report.repointed["positions.source_document_id"], 1, "pos-2 moves off doc-c");
     assert.equal(report.repointed["balances.source_document_id"], 2);
     assert.equal(
@@ -282,6 +320,7 @@ test(
     const again = await collapseDuplicateDocuments(client, { rawTreeRoot: root });
     assert.equal(again.groups, 0);
     assert.equal(again.superseded, 0);
+    assert.equal(again.canonicalRemaining, 1, "the one surviving canonical row, counted again");
     assert.deepEqual(
       await all(client, "SELECT id, superseded_by FROM documents ORDER BY id"),
       documents,
@@ -341,6 +380,90 @@ test(
         { id: "doc-z", provider_document_id: null, superseded_by: null },
       ],
       "the second capture of MS-000123 is superseded; a different document is left alone",
+    );
+  },
+);
+
+test(
+  "leaves two documents with identical metadata apart when their retained text differs",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    const root = rawTree(t);
+    await seed(client);
+
+    // Same institution, account, doc_type and doc_date -- the metadata
+    // fallback's whole key before F1-71b -- but genuinely different parsed
+    // text: two different statements a provider happened to render for the
+    // same account on the same day, not two renderings of one document.
+    await writeCapture(client, root, {
+      id: "doc-p",
+      rendering: "first",
+      capturedAt: "2026-04-01T10:00:00.000Z",
+      text: "Collapse Trust statement, synthetic, first document, 2026-03-31.",
+    });
+    await writeCapture(client, root, {
+      id: "doc-q",
+      rendering: "second",
+      capturedAt: "2026-04-02T10:00:00.000Z",
+      text: "Collapse Trust statement, synthetic, second document, 2026-03-31.",
+    });
+
+    const report = await collapseDuplicateDocuments(client, { rawTreeRoot: root });
+    assert.equal(report.groups, 0, "different text never merges, even with matching metadata");
+    assert.equal(report.superseded, 0);
+    assert.equal(report.rowsWithoutUsableText, 0, "both rows had readable text, just different");
+    assert.equal(report.canonicalRemaining, 2);
+    assert.deepEqual(
+      await all(client, "SELECT id, superseded_by FROM documents ORDER BY id"),
+      [
+        { id: "doc-p", superseded_by: null },
+        { id: "doc-q", superseded_by: null },
+      ],
+    );
+  },
+);
+
+test(
+  "leaves a document alone when its retained text file is missing, and counts the fallback",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    const root = rawTree(t);
+    await seed(client);
+
+    // Same metadata as a document that does have readable text -- the shape
+    // the old metadata-only key would have merged. text_path points at a
+    // file this test never writes: a raw tree missing a retained text
+    // artifact, or a document imported before retention existed.
+    await writeCapture(client, root, {
+      id: "doc-has-text",
+      rendering: "first",
+      capturedAt: "2026-04-01T10:00:00.000Z",
+      text: DEFAULT_TEXT,
+    });
+    await writeCapture(client, root, {
+      id: "doc-no-text",
+      rendering: "second",
+      capturedAt: "2026-04-02T10:00:00.000Z",
+      textPath: join(root, "text", "00", "00", "0000missing.txt"),
+    });
+
+    const report = await collapseDuplicateDocuments(client, { rawTreeRoot: root });
+    assert.equal(report.groups, 0, "a row with no usable text never merges with anything");
+    assert.equal(report.superseded, 0);
+    assert.equal(
+      report.rowsWithoutUsableText,
+      1,
+      "doc-no-text's missing file counted, doc-has-text's readable one did not",
+    );
+    assert.equal(report.canonicalRemaining, 2);
+    assert.deepEqual(
+      await all(client, "SELECT id, superseded_by FROM documents ORDER BY id"),
+      [
+        { id: "doc-has-text", superseded_by: null },
+        { id: "doc-no-text", superseded_by: null },
+      ],
     );
   },
 );

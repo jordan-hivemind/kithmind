@@ -718,7 +718,7 @@ function documentMetadataKey(
   // NUL-separated, the same spelling the F1-68 count this replaces used: a
   // doc_type is free text and a separator it can contain is a key two
   // different triples could share.
-  return [docType, accountId ?? "", docDate ?? ""].join(" ");
+  return [docType, accountId ?? "", docDate ?? ""].join("\0");
 }
 
 async function loadRecordedDocuments(
