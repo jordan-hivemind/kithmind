@@ -12,13 +12,17 @@ import {
   CARD_EXTRACTION_TOOL_NAME,
   CARD_MODEL_PRICES,
   CARD_TIER0_MODEL,
+  CARD_TIER0_MODEL_OPENAI,
   CARD_TIER1_MODEL,
+  CARD_TIER1_MODEL_OPENAI,
   CARD_UNTRUSTED_INPUT_STATEMENT,
   buildCardExtractionRequest,
   cardAttemptCostMicroUsd,
   hostedCardRunner,
+  hostedCardRunners,
   localCardRunner,
   parseCardRunnerCandidate,
+  resolveCardRunnerVendor,
 } from "./cardRunner";
 
 // Synthetic fixtures only. No test in this file reaches the network: every
@@ -278,6 +282,24 @@ describe("the declared price table", () => {
     });
   });
 
+  test("prices both OpenAI models in integer micro-USD", () => {
+    expect(CARD_MODEL_PRICES[CARD_TIER0_MODEL_OPENAI]).toEqual({
+      inputMicroUsdPerMillion: 50_000,
+      outputMicroUsdPerMillion: 400_000,
+    });
+    expect(CARD_MODEL_PRICES[CARD_TIER1_MODEL_OPENAI]).toEqual({
+      inputMicroUsdPerMillion: 250_000,
+      outputMicroUsdPerMillion: 2_000_000,
+    });
+  });
+
+  test("an OpenAI cost is an exact integer, never a float", () => {
+    const cost = cardAttemptCostMicroUsd(CARD_TIER0_MODEL_OPENAI, 15_000, 1_100);
+    // 15,000 tokens at $0.05/MTok plus 1,100 at $0.40/MTok.
+    expect(cost).toBe(750 + 440);
+    expect(Number.isSafeInteger(cost)).toBe(true);
+  });
+
   test("a cost is an exact integer, never a float", () => {
     const cost = cardAttemptCostMicroUsd(CARD_TIER1_MODEL, 15_000, 1_100);
     expect(cost).toBe(30_000 + 11_000);
@@ -286,5 +308,74 @@ describe("the declared price table", () => {
 
   test("an undeclared model costs zero rather than an invented number", () => {
     expect(cardAttemptCostMicroUsd("fixture:tier0", 1_000, 1_000)).toBe(0);
+  });
+});
+
+describe("vendor selection", () => {
+  test("an explicit BRAIN_CARD_VENDOR wins over any key present", () => {
+    expect(
+      resolveCardRunnerVendor({
+        BRAIN_CARD_VENDOR: "openai",
+        ANTHROPIC_API_KEY: "sk-ant-synthetic",
+      }),
+    ).toBe("openai");
+    expect(
+      resolveCardRunnerVendor({
+        BRAIN_CARD_VENDOR: "anthropic",
+        OPENAI_API_KEY: "sk-openai-synthetic",
+      }),
+    ).toBe("anthropic");
+  });
+
+  test("defaults to anthropic when BRAIN_CARD_API_KEY is set", () => {
+    expect(
+      resolveCardRunnerVendor({ BRAIN_CARD_API_KEY: "sk-synthetic" }),
+    ).toBe("anthropic");
+  });
+
+  test("defaults to openai when only the OpenAI key is present", () => {
+    expect(
+      resolveCardRunnerVendor({ OPENAI_API_KEY: "sk-openai-synthetic" }),
+    ).toBe("openai");
+  });
+
+  test("defaults to anthropic with no key configured at all", () => {
+    expect(resolveCardRunnerVendor({})).toBe("anthropic");
+  });
+
+  test("defaults to anthropic when both keys are present", () => {
+    expect(
+      resolveCardRunnerVendor({
+        ANTHROPIC_API_KEY: "sk-ant-synthetic",
+        OPENAI_API_KEY: "sk-openai-synthetic",
+      }),
+    ).toBe("anthropic");
+  });
+
+  test("hostedCardRunners builds both tiers from one vendor's model ids", () => {
+    const openaiRunners = hostedCardRunners({
+      BRAIN_CARD_VENDOR: "openai",
+      OPENAI_API_KEY: "sk-openai-synthetic",
+    });
+    expect(openaiRunners.map((runner) => runner.modelId)).toEqual([
+      CARD_TIER0_MODEL_OPENAI,
+      CARD_TIER1_MODEL_OPENAI,
+    ]);
+
+    const anthropicRunners = hostedCardRunners({
+      ANTHROPIC_API_KEY: "sk-ant-synthetic",
+    });
+    expect(anthropicRunners.map((runner) => runner.modelId)).toEqual([
+      CARD_TIER0_MODEL,
+      CARD_TIER1_MODEL,
+    ]);
+  });
+
+  test("hostedCardRunner defaults to the Anthropic model ids with no vendor given", () => {
+    const runner = hostedCardRunner({
+      step: "tier0",
+      config: { endpoint: "https://api.anthropic.com/v1/messages" },
+    });
+    expect(runner.modelId).toBe(CARD_TIER0_MODEL);
   });
 });

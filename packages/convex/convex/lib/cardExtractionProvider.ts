@@ -18,7 +18,8 @@ export const CARD_EXTRACTION_ENDPOINT = "https://api.anthropic.com/v1/messages";
 export const CARD_EXTRACTION_API_VERSION = "2023-06-01";
 
 const MAX_RESPONSE_BYTES = 1024 * 1024;
-const REQUEST_TIMEOUT_MS = 120_000;
+/** Shared with `openAICardExtractionProvider.ts`. */
+export const REQUEST_TIMEOUT_MS = 120_000;
 
 export type CardExtractionEnvironment = Readonly<
   Record<string, string | undefined>
@@ -54,7 +55,7 @@ export type CardExtractionResponse = Readonly<{
   outputTokens: number;
 }>;
 
-function optional(
+export function optional(
   env: CardExtractionEnvironment,
   name: string,
 ): string | undefined {
@@ -62,7 +63,10 @@ function optional(
   return value === "" ? undefined : value;
 }
 
-function parseEndpoint(value: string, environment: string | undefined): string {
+export function parseEndpoint(
+  value: string,
+  environment: string | undefined,
+): string {
   let endpoint: URL;
   try {
     endpoint = new URL(value);
@@ -137,7 +141,11 @@ export function cardExtractionBody(
   };
 }
 
-async function readBoundedResponse(response: Response): Promise<string> {
+/**
+ * Shared with `openAICardExtractionProvider.ts`: reads a response body up to
+ * `MAX_RESPONSE_BYTES`, the same bound both hosted providers apply.
+ */
+export async function readBoundedResponse(response: Response): Promise<string> {
   const contentLength = response.headers.get("content-length");
   if (contentLength && Number(contentLength) > MAX_RESPONSE_BYTES) {
     await response.body?.cancel();
@@ -170,7 +178,7 @@ async function readBoundedResponse(response: Response): Promise<string> {
   return new TextDecoder().decode(body);
 }
 
-function nonNegativeInteger(value: unknown): number {
+export function nonNegativeInteger(value: unknown): number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
     ? value
     : 0;

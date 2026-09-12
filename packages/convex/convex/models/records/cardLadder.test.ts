@@ -385,7 +385,7 @@ describe("the extraction ladder", () => {
     expect(tier0.inputTokens).toBe(1_000);
     expect(tier0.outputTokens).toBe(100);
     expect(tier0.wallTimeMs).toBe(5);
-    expect(tier0.priceTableVersion).toBe("card-prices-2026-09-12");
+    expect(tier0.priceTableVersion).toBe("card-prices-2026-09-12-v2");
     expect(tier0.modelId).toBe("fixture:tier0");
   });
 

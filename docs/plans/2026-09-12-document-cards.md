@@ -488,6 +488,15 @@ Extraction agents read the owner's documents by design. They write only to the
 private store. They never write to this repository, and every fixture in this
 repository is synthetic.
 
+Tier 0 and tier 1 are each backed by a hosted-model runner behind the same
+`CardRunner` interface: an Anthropic runner and an OpenAI runner, sharing the
+one prompt, schema rendering and boundary statement above. `BRAIN_CARD_VENDOR`
+picks one vendor for both tiers in a given run (default: anthropic when
+`BRAIN_CARD_API_KEY` is set, openai when only `OPENAI_API_KEY` is present,
+anthropic otherwise), so an attempt row's `modelId` never mixes vendors within
+one ladder run and per-vendor escalation rates stay comparable from the
+attempt rows alone.
+
 ### 5.4 Attempt records
 
 `cardExtractionAttempts`, one row per attempt, retained for cost reporting and
