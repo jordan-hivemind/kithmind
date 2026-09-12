@@ -8,6 +8,7 @@ import {
   refreshAvailableSourceItem,
   sha256Utf8,
 } from "../provenance/model";
+import { upsertSourceInventoryRow } from "../documents/inventory";
 import { workerProtocolError } from "./errors";
 import { FS_TEXT_PROFILE } from "./profile";
 import {
@@ -1754,6 +1755,16 @@ export async function appendWorkerScanPage(
     });
     persisted.push(result.row);
     manifestChanged ||= result.manifestChanged;
+    // Additive: one durable sourceInventory row per admitted file, keyed by
+    // identity rather than by scan. Never changes admission or which files
+    // are processed. See docs/plans/2026-09-12-document-cards.md section 2.
+    await upsertSourceInventoryRow(ctx, {
+      spaceId: source.spaceId,
+      sourceAccountId: source.account._id,
+      scanId: scan._id,
+      entry,
+      scanEntry: result.row,
+    });
   }
   const gapCount = persisted.filter((entry) => entry.state === "gap").length;
   const reviewCount = persisted.filter(

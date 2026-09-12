@@ -511,12 +511,29 @@ function utf8DiscoveryFile(
   return { ...descriptor, text };
 }
 
+const PDF_ENCRYPT_MARKER = Buffer.from("/Encrypt");
+
+/**
+ * Detects a PDF's trailer `/Encrypt` entry from the raw bytes, before any
+ * parser opens the file. This is a byte-marker heuristic, not a trailer
+ * parse: it never decodes or logs the file's content.
+ * ponytail: literal-marker heuristic, ceiling is a false positive if an
+ * unencrypted PDF's own (uncompressed) content stream contains this literal.
+ * Upgrade to a real trailer/xref parse if that is ever observed.
+ */
+function isPdfEncrypted(bytes: Buffer): boolean {
+  return bytes.includes(PDF_ENCRYPT_MARKER);
+}
+
 function pdfDiscoveryFile(file: SafeFileBytes): PdfDiscoveryFile {
   if (file.linkCount !== 1) {
     throw new FilesystemFailure("unstable", "PDF has multiple hard links");
   }
   if (!file.bytes.subarray(0, 5).equals(Buffer.from("%PDF-"))) {
     throw new FilesystemFailure("unsupported", "file is not a PDF");
+  }
+  if (isPdfEncrypted(file.bytes)) {
+    throw new FilesystemFailure("encrypted", "PDF requires a password");
   }
   const {
     kind: _kind,
@@ -573,7 +590,20 @@ async function readSourceObservation(
   if (result.kind === "gap") return result;
   const file = result;
   if (file.bytes.subarray(0, 5).equals(Buffer.from("%PDF-"))) {
-    return { kind: "pdf", file: pdfDiscoveryFile(file) };
+    try {
+      return { kind: "pdf", file: pdfDiscoveryFile(file) };
+    } catch (error) {
+      if (!(error instanceof FilesystemFailure) || error.code !== "encrypted") {
+        throw error;
+      }
+      const {
+        kind: _kind,
+        bytes: _bytes,
+        linkCount: _linkCount,
+        ...descriptor
+      } = file;
+      return { kind: "gap", gap: { ...descriptor, code: "encrypted" } };
+    }
   }
   try {
     return { kind: "utf8", file: utf8DiscoveryFile(file, maxTextBytes) };

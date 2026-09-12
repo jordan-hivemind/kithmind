@@ -458,6 +458,7 @@ function status(value: Record<string, unknown>): void {
         "unreadable",
         "unstable",
         "unsupported",
+        "encrypted",
       ] as const);
     }
   }

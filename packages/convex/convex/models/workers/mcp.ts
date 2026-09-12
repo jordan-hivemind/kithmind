@@ -129,6 +129,7 @@ const workerResultValidator = v.union(
             v.literal("unreadable"),
             v.literal("unstable"),
             v.literal("unsupported"),
+            v.literal("encrypted"),
           ),
         ),
       }),

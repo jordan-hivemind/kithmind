@@ -22,6 +22,7 @@ export const workerGapCodeValidator = v.union(
   v.literal("unreadable"),
   v.literal("unstable"),
   v.literal("unsupported"),
+  v.literal("encrypted"),
 );
 
 export const workerScanEntryStateValidator = v.union(

@@ -42,7 +42,7 @@ export type PdfFilePlan = PlanLocation & {
 
 export type GapFilePlan = PlanLocation & {
   kind: "gap";
-  code: "empty" | "oversized" | "unsupported";
+  code: "empty" | "oversized" | "unsupported" | "encrypted";
 };
 
 export type FilePlan = Utf8FilePlan | PdfFilePlan | GapFilePlan;
@@ -398,7 +398,8 @@ function files(value: unknown): FilePlan[] {
       if (
         row.code !== "empty" &&
         row.code !== "oversized" &&
-        row.code !== "unsupported"
+        row.code !== "unsupported" &&
+        row.code !== "encrypted"
       )
         fail();
       return { ...location, kind: "gap" as const, code: row.code };
