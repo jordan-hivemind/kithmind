@@ -471,3 +471,234 @@ test(
     assert.equal(summary.periodsChecked, 0);
   },
 );
+
+// --- F1-8: which rows land in a period's window -------------------------
+//
+// The three cases below are the ones the hosted archive's failing periods
+// actually cluster on. Every account, date and amount here is synthetic.
+
+/** A later `now` than the suite's NOW, so April and May rows are not future. */
+const LATER = new Date("2026-06-01T00:00:00.000Z");
+
+test(
+  "the activity of period_start belongs to the period that ended there, not the one starting there",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedInstitution(client);
+    await seedAccount(client, "acct_boundary", "0401");
+    await insertBalance(client, {
+      id: "bal_1",
+      accountId: "acct_boundary",
+      asOf: "2026-03-01",
+      cash: "1000",
+    });
+    await insertBalance(client, {
+      id: "bal_2",
+      accountId: "acct_boundary",
+      asOf: "2026-03-31",
+      cash: "1500",
+    });
+
+    await importBatch(
+      client,
+      {
+        source: "synthetic-pull",
+        documents: [
+          document("c".repeat(64), "acct_boundary", [
+            // Already inside the $1000 stated on 2026-03-01.
+            row("acct_boundary", {
+              providerTxnId: "ptx-1",
+              processDate: "2026-03-01",
+              amountText: "300.00",
+            }),
+            row("acct_boundary", {
+              providerTxnId: "ptx-2",
+              processDate: "2026-03-15",
+              amountText: "500.00",
+            }),
+          ]),
+        ],
+      },
+      NOW,
+    );
+
+    const summary = await runReconciliationGate(client);
+    assert.equal(summary.periodsChecked, 1);
+    const [outcome] = summary.outcomes;
+    assert.equal(outcome.status, "pass");
+    assert.equal(outcome.expectedChange, "500");
+    // 500, not 800: counting the boundary day again charged it twice.
+    assert.equal(outcome.computedChange, "500");
+  },
+);
+
+test(
+  "a row is placed by the later of its process and settle dates, not by either alone",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedInstitution(client);
+    await seedAccount(client, "acct_settle", "0402");
+    for (const [id, asOf, cash] of [
+      ["bal_1", "2026-03-31", "1000"],
+      ["bal_2", "2026-04-03", "1000"],
+      ["bal_3", "2026-04-30", "1100"],
+    ]) {
+      await insertBalance(client, {
+        id,
+        accountId: "acct_settle",
+        asOf,
+        cash,
+      });
+    }
+
+    await importBatch(
+      client,
+      {
+        source: "synthetic-pull",
+        documents: [
+          document("d".repeat(64), "acct_settle", [
+            // Settles before it posts: the money is not in the account until
+            // it posts, so this belongs to the April period, not the one
+            // ending 2026-04-03.
+            row("acct_settle", {
+              providerTxnId: "ptx-1",
+              processDate: "2026-04-05",
+              settleDate: "2026-04-01",
+              amountText: "100.00",
+            }),
+          ]),
+        ],
+      },
+      LATER,
+    );
+
+    const summary = await runReconciliationGate(client);
+    assert.equal(summary.periodsChecked, 2);
+    assert.equal(summary.passed, 2);
+    assert.equal(summary.failed, 0);
+  },
+);
+
+test(
+  "a trade that posts inside a period but settles after it counts in the period its cash lands in",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedInstitution(client);
+    await seedAccount(client, "acct_carry", "0403");
+    await insertBalance(client, {
+      id: "bal_1",
+      accountId: "acct_carry",
+      asOf: "2026-03-31",
+      cash: "1000",
+    });
+    await insertBalance(client, {
+      id: "bal_2",
+      accountId: "acct_carry",
+      asOf: "2026-04-30",
+      cash: "1200",
+    });
+
+    await importBatch(
+      client,
+      {
+        source: "synthetic-pull",
+        documents: [
+          document("e".repeat(64), "acct_carry", [
+            row("acct_carry", {
+              providerTxnId: "ptx-1",
+              processDate: "2026-03-30",
+              settleDate: "2026-04-02",
+              amountText: "200.00",
+            }),
+          ]),
+        ],
+      },
+      LATER,
+    );
+
+    const summary = await runReconciliationGate(client);
+    assert.equal(summary.periodsChecked, 1);
+    const [outcome] = summary.outcomes;
+    assert.equal(outcome.status, "pass");
+    assert.equal(outcome.computedChange, "200");
+  },
+);
+
+test(
+  "two stated cash balances disagreeing at one date leave both neighbouring periods unverified",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedInstitution(client);
+    await seedAccount(client, "acct_conflict", "0404");
+    for (const [id, asOf, cash] of [
+      ["bal_1", "2026-03-31", "1000"],
+      ["bal_2", "2026-04-30", "1500"],
+      ["bal_3", "2026-04-30", "1600"],
+      ["bal_4", "2026-05-31", "2000"],
+    ]) {
+      await insertBalance(client, {
+        id,
+        accountId: "acct_conflict",
+        asOf,
+        cash,
+      });
+    }
+
+    const summary = await runReconciliationGate(client);
+    // Two periods, not three: the two rows at 2026-04-30 are one snapshot,
+    // so there is no zero-length period between them.
+    assert.equal(summary.periodsChecked, 2);
+    assert.equal(summary.unverified, 2);
+    assert.equal(summary.failed, 0);
+    for (const outcome of summary.outcomes) {
+      assert.match(outcome.notes, /more than one stated cash balance/);
+      assert.equal(outcome.delta, null);
+    }
+    assert.equal(
+      await count(client, "reconciliations", "WHERE period_start = period_end"),
+      0,
+    );
+  },
+);
+
+test(
+  "two stated cash balances agreeing at one date collapse to one snapshot and still reconcile",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedInstitution(client);
+    await seedAccount(client, "acct_dup", "0405");
+    for (const [id, asOf, cash] of [
+      ["bal_1", "2026-03-31", "1000"],
+      ["bal_2", "2026-04-30", "1500"],
+      ["bal_3", "2026-04-30", "1500"],
+    ]) {
+      await insertBalance(client, { id, accountId: "acct_dup", asOf, cash });
+    }
+
+    await importBatch(
+      client,
+      {
+        source: "synthetic-pull",
+        documents: [
+          document("f".repeat(64), "acct_dup", [
+            row("acct_dup", {
+              providerTxnId: "ptx-1",
+              processDate: "2026-04-15",
+              amountText: "500.00",
+            }),
+          ]),
+        ],
+      },
+      LATER,
+    );
+
+    const summary = await runReconciliationGate(client);
+    assert.equal(summary.periodsChecked, 1);
+    assert.equal(summary.passed, 1);
+  },
+);
