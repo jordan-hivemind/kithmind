@@ -11,6 +11,7 @@ import {
   type CardGateFailureCode,
   type CardGateReport,
 } from "./cardGate";
+import { CARD_PRICE_TABLE_VERSION } from "./cardRunner";
 import {
   cardEventKey,
   cardObservationKey,
@@ -67,6 +68,20 @@ export type PublishCardInput = {
    */
   entityId?: Id<"entities">;
   fields: CardFieldInput[];
+  /**
+   * Section 5.4: what the runner that produced this candidate cost. Omitted
+   * by a caller that ran no runner, such as a trusted fixture publication.
+   */
+  runner?: CardRunnerMeasurement;
+};
+
+/** Counts, a model id and a price. Never a value and never document text. */
+export type CardRunnerMeasurement = {
+  modelId: string;
+  inputTokens: number;
+  outputTokens: number;
+  costMicroUsd: number;
+  wallTimeMs: number;
 };
 
 export type PublishCardResult = {
@@ -307,6 +322,7 @@ export async function publishDocumentCard(
       recordKind: input.recordKind,
       fingerprint: input.fingerprint,
       now: input.now,
+      ...(input.runner ? { runner: input.runner } : {}),
       outcome: topTier ? "review" : "escalated",
       passedFieldCount: 0,
       droppedFieldCount: 0,
@@ -363,6 +379,7 @@ export async function publishDocumentCard(
       recordKind: input.recordKind,
       fingerprint: input.fingerprint,
       now: input.now,
+      ...(input.runner ? { runner: input.runner } : {}),
       outcome: topTier ? "review" : "escalated",
       passedFieldCount: 0,
       droppedFieldCount: 0,
@@ -404,6 +421,7 @@ export async function publishDocumentCard(
       recordKind: input.recordKind,
       fingerprint: input.fingerprint,
       now: input.now,
+      ...(input.runner ? { runner: input.runner } : {}),
       outcome: topTier ? "review" : "escalated",
       passedFieldCount: 0,
       droppedFieldCount: 0,
@@ -567,6 +585,7 @@ export async function publishDocumentCard(
     recordKind: input.recordKind,
     fingerprint: input.fingerprint,
     now: input.now,
+    ...(input.runner ? { runner: input.runner } : {}),
     outcome: "accepted",
     passedFieldCount: observations.length,
     droppedFieldCount: droppedFields.length,
@@ -640,7 +659,8 @@ async function recordAttempt(
     recordKind: CardRecordKind;
     fingerprint: CardExtractionFingerprint;
     now: number;
-    outcome: "accepted" | "escalated" | "review";
+    runner?: CardRunnerMeasurement;
+    outcome: "accepted" | "escalated" | "review" | "skipped";
     passedFieldCount: number;
     droppedFieldCount: number;
     failures: ReadonlyArray<{ key: string; code: string }>;
@@ -663,9 +683,72 @@ async function recordAttempt(
     failureCodes: [
       ...new Set(input.failures.map((failure) => failure.code)),
     ].sort(),
+    ...(input.runner
+      ? {
+          modelId: input.runner.modelId,
+          priceTableVersion: CARD_PRICE_TABLE_VERSION,
+          inputTokens: input.runner.inputTokens,
+          outputTokens: input.runner.outputTokens,
+          costMicroUsd: input.runner.costMicroUsd,
+          wallTimeMs: input.runner.wallTimeMs,
+        }
+      : {}),
     createdAt: input.now,
   });
 }
+
+/**
+ * Section 5.1: a ladder step that could not run. The row exists so the step
+ * is visible in the cost and ladder report and so it is never mistaken for a
+ * step that ran and passed. It stages nothing and refuses nothing.
+ */
+export const recordSkippedCardAttempt = internalMutation({
+  args: {
+    sourceItemId: v.id("sourceItems"),
+    recordKind: v.string(),
+    step: v.union(v.literal("local"), v.literal("tier0"), v.literal("tier1")),
+    modelId: v.string(),
+    fingerprint: v.object({
+      cardSchemaVersion: v.number(),
+      playbookVersion: v.string(),
+      promptVersion: v.string(),
+      tier: v.union(v.literal("local"), v.literal("tier0"), v.literal("tier1")),
+    }),
+    now: v.number(),
+  },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    if (!isCardRecordKind(args.recordKind)) {
+      throw new Error("Unsupported card record kind");
+    }
+    const item = await ctx.db.get(args.sourceItemId);
+    if (!item) throw new Error("Card document does not exist");
+    await ctx.db.insert("cardExtractionAttempts", {
+      spaceId: item.spaceId,
+      sourceAccountId: item.sourceAccountId,
+      sourceItemId: item._id,
+      recordKind: args.recordKind,
+      step: args.step,
+      gateVersion: CARD_GATE_VERSION,
+      promptVersion: args.fingerprint.promptVersion,
+      playbookVersion: args.fingerprint.playbookVersion,
+      cardSchemaVersion: args.fingerprint.cardSchemaVersion,
+      outcome: "skipped",
+      passedFieldCount: 0,
+      droppedFieldCount: 0,
+      failedFieldCount: 0,
+      failureCodes: [],
+      modelId: args.modelId,
+      priceTableVersion: CARD_PRICE_TABLE_VERSION,
+      inputTokens: 0,
+      outputTokens: 0,
+      costMicroUsd: 0,
+      wallTimeMs: 0,
+      createdAt: args.now,
+    });
+    return null;
+  },
+});
 
 /**
  * Section 4.2: the accepted `card_kind` becomes `documents.docType` so type
@@ -846,16 +929,26 @@ export const publishCard = internalMutation({
     anchorEvidenceSpanIds: v.array(v.id("evidenceSpans")),
     entityId: v.optional(v.id("entities")),
     fields: v.array(cardFieldValidator),
+    runner: v.optional(
+      v.object({
+        modelId: v.string(),
+        inputTokens: v.number(),
+        outputTokens: v.number(),
+        costMicroUsd: v.number(),
+        wallTimeMs: v.number(),
+      }),
+    ),
   },
   handler: async (ctx, args) => {
     if (!isCardRecordKind(args.recordKind)) {
       throw new Error("Unsupported card record kind");
     }
-    const { recordKind, entityId, ...rest } = args;
+    const { recordKind, entityId, runner, ...rest } = args;
     return await publishDocumentCard(ctx, {
       ...rest,
       recordKind,
       ...(entityId === undefined ? {} : { entityId }),
+      ...(runner === undefined ? {} : { runner }),
     });
   },
 });
