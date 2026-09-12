@@ -405,6 +405,57 @@ Evidence that cleanup never touches the active generation:
 4. The cleanup safety test in section 7 seeds three fingerprints and asserts
    that the active and retained row sets are byte-identical before and after.
 
+### 4.1 As implemented, P2-6e
+
+`cleanupEmbeddingGenerations` is the operator page. Retention is decided per
+generation, not per fingerprint, and the space state is re-read inside every
+page (I8).
+
+| Role        | Generation                                                                       | Rows    |
+| ----------- | -------------------------------------------------------------------------------- | ------- |
+| `active`    | The one the space state names.                                                   | Kept    |
+| `retained`  | The most recently retired generation of a fingerprint other than the active one. | Kept    |
+| `in_flight` | Any `staging` or `staged` generation.                                            | Kept    |
+| `deletable` | Everything else, including the active fingerprint's own older generations.       | Deleted |
+
+Three notes on that table:
+
+1. I8 says fingerprint because it predates the row this section gained after
+   P2-6d. A space built twice under one fingerprint keeps two rows per target,
+   so the active fingerprint's older generations are deletable while the active
+   generation is not.
+2. A `staging` or `staged` generation still owns its rows: the operator
+   transition creates, fills, stages and activates across separate mutations,
+   and deleting a half-built generation's vectors would throw away provider
+   work and leave a generation that can never activate. An abandoned build is
+   failed first with `operator:failGeneration`, which makes it deletable.
+3. A retired generation whose rows are all gone is marked `retired_cleaned`. A
+   failed one keeps `failed`, because that state is the evidence of why it
+   failed. No generation or profile row is ever deleted.
+
+Coverage markers follow the lite tool: a marker is released only when the
+target holds no row in the active generation, so deleting a duplicate moves no
+counter. `dryRun` reports the role, state, recorded counts and page rows of
+every generation and deletes nothing. `autoRun` schedules one successor at a
+time and passes the active generation id forward, so a flip mid-run aborts the
+chain rather than deleting against a stale pointer.
+
+The audit counts targets holding more than one vector row under the audited
+fingerprint and sets `counterDrift` with a named reason
+(`duplicate_active_fingerprint_rows`, or `counter_recount_mismatch` for the
+counters themselves). That class is invisible to the reader, which dedupes by
+target, and invisible to the counters, which count one covered target either
+way, so counting it is the only report of it. The build job's audit phase pages
+over every target at 64 targets per page and is the whole-space guarantee;
+`auditSpaceCoverage` probes a bounded prefix and reports whether it covered
+every covered target.
+
+Retirement paths were fixed in the same change. P2-6h:
+`deleteActiveThoughtEmbeddingVectors` read only the active generation's index,
+so a row an older generation wrote under the active fingerprint survived a
+supersede or a retract. It now removes the target's rows under the active
+fingerprint in every generation.
+
 ## 5. Migration from the current state
 
 Production has one active generation of 180 targets: 17 thoughts and 163 chunks,
@@ -559,6 +610,8 @@ npx convex run models/embeddings/migrations:runTargetBackfillPage '{"jobId":"<JO
 npx convex run models/embeddings/migrations:backfillVectorScopeV2 '{"spaceId":"<SPACE_ID>","cursor":null,"batchSize":64}'
 npx convex run models/embeddings/migrations:auditSpaceCoverage '{"spaceId":"<SPACE_ID>"}'
 npx convex run models/embeddings/migrations:setSpaceScopeVersion '{"spaceId":"<SPACE_ID>","scopeVersion":2,"expectedScopeVersion":1}'
+npx convex run models/embeddings/migrations:cleanupEmbeddingGenerations '{"spaceId":"<SPACE_ID>","dryRun":true}'
+npx convex run models/embeddings/migrations:cleanupEmbeddingGenerations '{"spaceId":"<SPACE_ID>","batchSize":128}'
 ```
 
 Each page command returns the next cursor and is rerun until it reports done.

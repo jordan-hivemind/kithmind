@@ -1,6 +1,7 @@
 import { v } from "convex/values";
 
 import { internalMutation } from "../../_generated/server";
+import type { MutationCtx } from "../../_generated/server";
 import { internal } from "../../_generated/api";
 import type { Doc, Id } from "../../_generated/dataModel";
 import {
@@ -520,6 +521,7 @@ const buildPageResult = v.object({
   retired: v.number(),
   isDone: v.boolean(),
   counterDrift: v.boolean(),
+  duplicateTargets: v.number(),
   scheduled: v.boolean(),
 });
 
@@ -768,6 +770,8 @@ export const auditSpaceCoverage = internalMutation({
     spaceId: v.id("spaces"),
     fingerprint: v.optional(v.string()),
     maxRows: v.optional(v.number()),
+    /** Covered targets probed for a second row. See `probeDuplicateRows`. */
+    duplicateProbeLimit: v.optional(v.number()),
     repair: v.optional(v.boolean()),
     now: v.optional(v.number()),
   },
@@ -775,6 +779,11 @@ export const auditSpaceCoverage = internalMutation({
     complete: v.boolean(),
     scanned: v.number(),
     counterDrift: v.boolean(),
+    counterDriftReason: v.optional(v.string()),
+    duplicateTargets: v.number(),
+    duplicateProbeScanned: v.number(),
+    duplicateProbeSaturated: v.number(),
+    duplicateProbeComplete: v.boolean(),
     repaired: v.boolean(),
     fingerprint: v.string(),
     recountedEligible: embeddingKindCountsValidator,
@@ -794,6 +803,7 @@ export const auditSpaceCoverage = internalMutation({
       spaceId: args.spaceId,
       fingerprint,
       maxRows: args.maxRows,
+      duplicateProbeLimit: args.duplicateProbeLimit,
       repair: args.repair,
       now: args.now ?? Date.now(),
     });
@@ -844,6 +854,7 @@ async function hasActiveGenerationRow(
 ): Promise<boolean> {
   const thoughtId = row.thoughtId;
   const chunkId = row.chunkId;
+  const eventId = row.eventId;
   if (row.targetKind === "thought") {
     if (!thoughtId) return false;
     const matches = await ctx.db
@@ -856,6 +867,18 @@ async function hasActiveGenerationRow(
       .take(1);
     return matches.length > 0;
   }
+  if (row.targetKind === "card") {
+    if (!eventId) return false;
+    const matches = await ctx.db
+      .query("embeddingVectors")
+      .withIndex("by_generation_and_eventId", (q) =>
+        q
+          .eq("embeddingGenerationId", activeGenerationId)
+          .eq("eventId", eventId),
+      )
+      .take(1);
+    return matches.length > 0;
+  }
   if (!chunkId) return false;
   const matches = await ctx.db
     .query("embeddingVectors")
@@ -864,6 +887,85 @@ async function hasActiveGenerationRow(
     )
     .take(1);
   return matches.length > 0;
+}
+
+type GenerationVectorPage = {
+  pageRows: number;
+  hasMoreRows: boolean;
+  scanned: number;
+  deleted: number;
+  duplicates: number;
+  soleRows: number;
+  coverageReleased: number;
+  /** True when this call left the generation holding no vector row. */
+  emptied: boolean;
+};
+
+/**
+ * One generation's share of a delete page, with the per-row assertions both
+ * operator tools rely on. It never reads the active generation's rows: the
+ * page is driven from `by_embeddingGenerationId` over another generation, and
+ * every row is checked against the active pointer the caller re-read from the
+ * space state in this same transaction.
+ */
+async function deleteGenerationVectorPage(
+  ctx: MutationCtx,
+  input: {
+    spaceId: Id<"spaces">;
+    generation: Doc<"embeddingGenerations">;
+    activeGenerationId: Id<"embeddingGenerations">;
+    budget: number;
+    dryRun: boolean;
+  },
+): Promise<GenerationVectorPage> {
+  const rows = await ctx.db
+    .query("embeddingVectors")
+    .withIndex("by_embeddingGenerationId", (q) =>
+      q.eq("embeddingGenerationId", input.generation._id),
+    )
+    .take(input.budget + 1);
+  const page: GenerationVectorPage = {
+    pageRows: 0,
+    hasMoreRows: rows.length > input.budget,
+    scanned: 0,
+    deleted: 0,
+    duplicates: 0,
+    soleRows: 0,
+    coverageReleased: 0,
+    emptied: false,
+  };
+  for (const row of rows.slice(0, input.budget)) {
+    // I8, step 2: every assertion below reads the row and the pointer, never
+    // an argument, so the page refuses rather than over-deletes.
+    if (row.spaceId !== input.spaceId) {
+      throw new Error("Vector cleanup found a row in another space");
+    }
+    if (row.embeddingFingerprint !== input.generation.fingerprint) {
+      throw new Error("Vector cleanup found a row of another fingerprint");
+    }
+    if (row.embeddingGenerationId === input.activeGenerationId) {
+      throw new Error("Vector cleanup reached the active generation");
+    }
+    page.scanned += 1;
+    page.pageRows += 1;
+    const duplicate = await hasActiveGenerationRow(
+      ctx,
+      row,
+      input.activeGenerationId,
+    );
+    if (duplicate) page.duplicates += 1;
+    else page.soleRows += 1;
+    if (input.dryRun) continue;
+    // I4, step 3: only the target's last row releases the marker.
+    if (!duplicate) {
+      await releaseVectorCoverage(ctx, row);
+      page.coverageReleased += 1;
+    }
+    await ctx.db.delete(row._id);
+    page.deleted += 1;
+  }
+  page.emptied = !input.dryRun && !page.hasMoreRows;
+  return page;
 }
 
 /**
@@ -968,47 +1070,22 @@ export const deleteNonActiveGenerationVectors = internalMutation({
       let pageRows = 0;
       let hasMoreRows = false;
       if (targeted) {
-        const rows = await ctx.db
-          .query("embeddingVectors")
-          .withIndex("by_embeddingGenerationId", (q) =>
-            q.eq("embeddingGenerationId", generation._id),
-          )
-          .take(budget + 1);
-        hasMoreRows = rows.length > budget;
+        const page = await deleteGenerationVectorPage(ctx, {
+          spaceId: args.spaceId,
+          generation,
+          activeGenerationId,
+          budget,
+          dryRun,
+        });
+        budget -= page.scanned;
+        scanned += page.scanned;
+        deleted += page.deleted;
+        duplicates += page.duplicates;
+        soleRows += page.soleRows;
+        coverageReleased += page.coverageReleased;
+        pageRows = page.pageRows;
+        hasMoreRows = page.hasMoreRows;
         if (hasMoreRows) remaining = true;
-        for (const row of rows.slice(0, budget)) {
-          // I8, step 2: every assertion below reads the row and the pointer,
-          // never an argument, so the page refuses rather than over-deletes.
-          if (row.spaceId !== args.spaceId) {
-            throw new Error("Vector cleanup found a row in another space");
-          }
-          if (row.embeddingFingerprint !== fingerprint) {
-            throw new Error(
-              "Vector cleanup found a row of another fingerprint",
-            );
-          }
-          if (row.embeddingGenerationId === activeGenerationId) {
-            throw new Error("Vector cleanup reached the active generation");
-          }
-          scanned += 1;
-          pageRows += 1;
-          budget -= 1;
-          const duplicate = await hasActiveGenerationRow(
-            ctx,
-            row,
-            activeGenerationId,
-          );
-          if (duplicate) duplicates += 1;
-          else soleRows += 1;
-          if (dryRun) continue;
-          // I4, step 3: only the target's last row releases the marker.
-          if (!duplicate) {
-            await releaseVectorCoverage(ctx, row);
-            coverageReleased += 1;
-          }
-          await ctx.db.delete(row._id);
-          deleted += 1;
-        }
       }
       generations.push({
         embeddingGenerationId: generation._id,
@@ -1033,6 +1110,257 @@ export const deleteNonActiveGenerationVectors = internalMutation({
       soleRows,
       coverageReleased,
       remaining,
+      generations,
+    };
+  },
+});
+
+// ---------------------------------------------------------------------------
+// P2-6e: historical generation cleanup
+// ---------------------------------------------------------------------------
+
+/**
+ * Section 4 of the capacity plan, one generation at a time:
+ *
+ * | Role        | Rows                                                      |
+ * | ----------- | --------------------------------------------------------- |
+ * | `active`    | Kept. The space state names it, re-read every page (I8).  |
+ * | `retained`  | Kept. The most recently retired generation of a *different* fingerprint: the rollback artifact. |
+ * | `in_flight` | Kept. A `staging` or `staged` generation still owns its rows; an operator fails it first if it is abandoned. |
+ * | `deletable` | Everything else, including the active fingerprint's older generations, which is the P2-6h class. |
+ *
+ * Retention is by generation, not by fingerprint. The plan's I8 sentence says
+ * fingerprint because it predates the row section 4 gained after P2-6d: a
+ * space built twice under one fingerprint keeps two rows per target, so the
+ * active fingerprint's older generations have to go while the active one stays.
+ */
+type CleanupRole = "active" | "retained" | "in_flight" | "deletable";
+
+const cleanupRoleValidator = v.union(
+  v.literal("active"),
+  v.literal("retained"),
+  v.literal("in_flight"),
+  v.literal("deletable"),
+);
+
+const cleanupReportRow = v.object({
+  embeddingGenerationId: v.id("embeddingGenerations"),
+  fingerprint: v.string(),
+  state: embeddingGenerationStateValidator,
+  role: cleanupRoleValidator,
+  recordedThoughtCount: v.number(),
+  recordedChunkCount: v.number(),
+  pageRows: v.number(),
+  hasMoreRows: v.boolean(),
+  cleaned: v.boolean(),
+});
+
+/** Most recent first, by the clock each state actually sets. */
+function generationRecency(generation: Doc<"embeddingGenerations">): number {
+  return (
+    generation.deactivatedAt ??
+    generation.activatedAt ??
+    generation.stagedAt ??
+    generation.createdAt
+  );
+}
+
+function rollbackGeneration(
+  generations: Doc<"embeddingGenerations">[],
+  activeFingerprint: string,
+): Doc<"embeddingGenerations"> | undefined {
+  let best: Doc<"embeddingGenerations"> | undefined;
+  for (const generation of generations) {
+    if (generation.state !== "retired") continue;
+    if (generation.fingerprint === activeFingerprint) continue;
+    if (
+      !best ||
+      generationRecency(generation) > generationRecency(best) ||
+      (generationRecency(generation) === generationRecency(best) &&
+        generation._creationTime > best._creationTime)
+    ) {
+      best = generation;
+    }
+  }
+  return best;
+}
+
+function cleanupRole(
+  generation: Doc<"embeddingGenerations">,
+  activeGenerationId: Id<"embeddingGenerations">,
+  retainedId: Id<"embeddingGenerations"> | undefined,
+): CleanupRole {
+  if (generation._id === activeGenerationId) return "active";
+  if (retainedId && generation._id === retainedId) return "retained";
+  if (generation.state === "staging" || generation.state === "staged") {
+    return "in_flight";
+  }
+  return "deletable";
+}
+
+/**
+ * The P2-6e operator page. It deletes the vector rows of every generation the
+ * retention rule above does not keep, 128 rows per call, and marks a retired
+ * generation `retired_cleaned` once it holds none. Generation and profile rows
+ * are never deleted: the baseline legacy-copy guard reads that history.
+ *
+ * Safety is the lite tool's, per page and per row: the active pointer is
+ * re-read from the space state inside this transaction (I8), the active
+ * generation is never read for deletion, and a coverage marker is released
+ * only when the target holds no row in the active generation, so deleting a
+ * duplicate cannot decrement a counter.
+ *
+ * Rerun until `remaining` is false, or pass `autoRun` and it schedules one
+ * successor at a time. Passing `expectedActiveGenerationId` aborts the run if
+ * the space activated a different generation since the previous page.
+ */
+export const cleanupEmbeddingGenerations = internalMutation({
+  args: {
+    spaceId: v.id("spaces"),
+    dryRun: v.optional(v.boolean()),
+    batchSize: v.optional(v.number()),
+    expectedActiveGenerationId: v.optional(v.id("embeddingGenerations")),
+    autoRun: v.optional(v.boolean()),
+  },
+  returns: v.object({
+    dryRun: v.boolean(),
+    activeFingerprint: v.string(),
+    activeEmbeddingGenerationId: v.id("embeddingGenerations"),
+    retainedEmbeddingGenerationId: v.optional(v.id("embeddingGenerations")),
+    scanned: v.number(),
+    deleted: v.number(),
+    duplicates: v.number(),
+    soleRows: v.number(),
+    coverageReleased: v.number(),
+    cleanedGenerations: v.number(),
+    remaining: v.boolean(),
+    scheduled: v.boolean(),
+    generations: v.array(cleanupReportRow),
+  }),
+  handler: async (ctx, args) => {
+    const dryRun = args.dryRun ?? false;
+    const batchSize = Math.min(
+      Math.max(args.batchSize ?? MAX_VECTOR_CLEANUP_PAGE, 1),
+      MAX_VECTOR_CLEANUP_PAGE,
+    );
+    // I8, step 1: the pointer this page trusts is read here, not passed in.
+    const state = await ctx.db
+      .query("spaceEmbeddingStates")
+      .withIndex("by_spaceId", (q) => q.eq("spaceId", args.spaceId))
+      .unique();
+    if (!state) throw new Error("Space embedding state not found");
+    const activeGenerationId = state.activeEmbeddingGenerationId;
+    const activeFingerprint = state.activeFingerprint;
+    if (!activeGenerationId || !activeFingerprint) {
+      throw new Error(
+        "Space has no active embedding generation; refusing to delete vectors",
+      );
+    }
+    if (
+      args.expectedActiveGenerationId &&
+      args.expectedActiveGenerationId !== activeGenerationId
+    ) {
+      throw new Error("Active embedding generation changed during cleanup");
+    }
+    const activeGeneration = await ctx.db.get(activeGenerationId);
+    if (
+      !activeGeneration ||
+      activeGeneration.spaceId !== args.spaceId ||
+      activeGeneration.state !== "active" ||
+      activeGeneration.fingerprint !== activeFingerprint
+    ) {
+      throw new Error("Active embedding generation pointer is invalid");
+    }
+
+    const allGenerations = await ctx.db
+      .query("embeddingGenerations")
+      .withIndex("by_spaceId", (q) => q.eq("spaceId", args.spaceId))
+      .take(MAX_CLEANUP_GENERATIONS + 1);
+    if (allGenerations.length > MAX_CLEANUP_GENERATIONS) {
+      throw new Error("Space exceeds the vector cleanup generation bound");
+    }
+    const retained = rollbackGeneration(allGenerations, activeFingerprint);
+
+    let budget = batchSize;
+    let scanned = 0;
+    let deleted = 0;
+    let duplicates = 0;
+    let soleRows = 0;
+    let coverageReleased = 0;
+    let cleanedGenerations = 0;
+    let remaining = false;
+    const generations = [];
+
+    for (const generation of allGenerations) {
+      const role = cleanupRole(generation, activeGenerationId, retained?._id);
+      let pageRows = 0;
+      let hasMoreRows = false;
+      let cleaned = false;
+      if (role === "deletable") {
+        const page = await deleteGenerationVectorPage(ctx, {
+          spaceId: args.spaceId,
+          generation,
+          activeGenerationId,
+          budget,
+          dryRun,
+        });
+        budget -= page.scanned;
+        scanned += page.scanned;
+        deleted += page.deleted;
+        duplicates += page.duplicates;
+        soleRows += page.soleRows;
+        coverageReleased += page.coverageReleased;
+        pageRows = page.pageRows;
+        hasMoreRows = page.hasMoreRows;
+        if (hasMoreRows) remaining = true;
+        // A failed generation keeps its state, because that state is the
+        // evidence of why it failed; only a retired one is marked cleaned.
+        if (page.emptied && generation.state === "retired") {
+          await ctx.db.patch(generation._id, { state: "retired_cleaned" });
+          cleaned = true;
+          cleanedGenerations += 1;
+        }
+      }
+      generations.push({
+        embeddingGenerationId: generation._id,
+        fingerprint: generation.fingerprint,
+        state: cleaned ? ("retired_cleaned" as const) : generation.state,
+        role,
+        recordedThoughtCount: generation.completedThoughtCount,
+        recordedChunkCount: generation.completedChunkCount,
+        pageRows,
+        hasMoreRows,
+        cleaned,
+      });
+    }
+
+    const scheduled = Boolean(args.autoRun && !dryRun && remaining);
+    if (scheduled) {
+      await ctx.scheduler.runAfter(
+        0,
+        internal.models.embeddings.migrations.cleanupEmbeddingGenerations,
+        {
+          spaceId: args.spaceId,
+          batchSize: args.batchSize,
+          autoRun: true,
+          expectedActiveGenerationId: activeGenerationId,
+        },
+      );
+    }
+
+    return {
+      dryRun,
+      activeFingerprint,
+      activeEmbeddingGenerationId: activeGenerationId,
+      ...(retained ? { retainedEmbeddingGenerationId: retained._id } : {}),
+      scanned,
+      deleted,
+      duplicates,
+      soleRows,
+      coverageReleased,
+      cleanedGenerations,
+      remaining,
+      scheduled,
       generations,
     };
   },

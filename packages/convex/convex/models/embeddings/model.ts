@@ -7,10 +7,7 @@ import {
 } from "../../lib/embeddingProvider";
 import { sha256Hex, utf8ByteLength } from "../ingestion/hash";
 import { getAuthorizedReadSpaceIds, type PrincipalRef } from "../../lib/spaces";
-import {
-  composeCardTargetInput,
-  CARD_TARGET_EVENT_KEY,
-} from "./cardTargets";
+import { composeCardTargetInput, CARD_TARGET_EVENT_KEY } from "./cardTargets";
 import {
   applyEligibilityTouch,
   coveredCountsFor,
@@ -1271,7 +1268,18 @@ export async function deleteThoughtEmbeddingVectors(
   return { deleted: Math.min(rows.length, limit), done: rows.length <= limit };
 }
 
-/** Removes only stale targets from the current active generation. */
+/**
+ * Removes a no-longer-current thought's rows under the active fingerprint, in
+ * every generation.
+ *
+ * P2-6h. This used to read the active generation's index alone, so a row an
+ * earlier generation wrote under the same fingerprint outlived the transition.
+ * Since P2-6d took the generation out of the reader's filter those rows share
+ * one `scopeV2` with the active generation's, so leaving one behind leaves a
+ * superseded memory's vector in the candidate set until I7 drops it at
+ * hydration, after it has already spent a candidate slot. Rows of another
+ * fingerprint are left alone: the retired fingerprint is the rollback artifact.
+ */
 export async function deleteActiveThoughtEmbeddingVectors(
   ctx: MutationCtx,
   input: {
@@ -1297,38 +1305,34 @@ export async function deleteActiveThoughtEmbeddingVectors(
         "Active thought embedding cleanup target is still current",
       );
     }
-    const rows = await ctx.db
-      .query("embeddingVectors")
-      .withIndex("by_generation_and_thoughtId", (q) =>
-        q
-          .eq("embeddingGenerationId", input.embeddingGenerationId)
-          .eq("thoughtId", thoughtId),
-      )
-      .take(2);
-    if (rows.length > 1) {
-      throw new Error("Duplicate active thought embedding vector");
+    const rows = (
+      await targetVectorRows(ctx, { kind: "thought", thoughtId })
+    ).filter(
+      (row) =>
+        row.spaceId === input.spaceId &&
+        row.embeddingFingerprint === input.fingerprint,
+    );
+    for (const row of rows) {
+      if (
+        row.targetKind !== "thought" ||
+        row.chunkId !== undefined ||
+        row.processingGenerationId !== undefined ||
+        row.searchScope !==
+          embeddingVectorSearchScope({
+            spaceId: input.spaceId,
+            fingerprint: input.fingerprint,
+            // The row names its own generation, which is the point: a row of
+            // an older generation is exactly what this has to remove.
+            embeddingGenerationId: row.embeddingGenerationId,
+            targetKind: "thought",
+          })
+      ) {
+        throw new Error("Active thought embedding vector has invalid identity");
+      }
+      await releaseVectorCoverage(ctx, row);
+      await ctx.db.delete(row._id);
+      deleted += 1;
     }
-    const row = rows[0];
-    if (!row) continue;
-    if (
-      row.spaceId !== input.spaceId ||
-      row.embeddingFingerprint !== input.fingerprint ||
-      row.targetKind !== "thought" ||
-      row.chunkId !== undefined ||
-      row.processingGenerationId !== undefined ||
-      row.searchScope !==
-        embeddingVectorSearchScope({
-          spaceId: input.spaceId,
-          fingerprint: input.fingerprint,
-          embeddingGenerationId: input.embeddingGenerationId,
-          targetKind: "thought",
-        })
-    ) {
-      throw new Error("Active thought embedding vector has invalid identity");
-    }
-    await releaseVectorCoverage(ctx, row);
-    await ctx.db.delete(row._id);
-    deleted += 1;
   }
   return deleted;
 }
