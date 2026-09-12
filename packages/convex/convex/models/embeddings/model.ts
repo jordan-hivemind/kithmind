@@ -8,6 +8,10 @@ import {
 import { sha256Hex, utf8ByteLength } from "../ingestion/hash";
 import { getAuthorizedReadSpaceIds, type PrincipalRef } from "../../lib/spaces";
 import {
+  composeCardTargetInput,
+  CARD_TARGET_EVENT_KEY,
+} from "./cardTargets";
+import {
   applyEligibilityTouch,
   coveredCountsFor,
   embeddingVectorScopeV2,
@@ -44,7 +48,9 @@ const MAX_FAILURE_CODE_LENGTH = 100;
 const MAX_FAILURE_MESSAGE_LENGTH = 1_000;
 
 type ReadCtx = Pick<QueryCtx, "db"> | Pick<MutationCtx, "db">;
-type TargetKind = "thought" | "chunk";
+/** Every kind a vector row may carry. The legacy manifest holds the first two. */
+type TargetKind = "thought" | "chunk" | "card";
+type ManifestTargetKind = "thought" | "chunk";
 
 export function embeddingVectorSearchScope(input: {
   spaceId: Id<"spaces"> | string;
@@ -62,7 +68,7 @@ export function embeddingVectorSearchScope(input: {
 }
 
 export type ManifestTarget = {
-  kind: TargetKind;
+  kind: ManifestTargetKind;
   targetId: string;
   inputHash: string;
   processingGenerationId?: Id<"processingGenerations">;
@@ -826,6 +832,7 @@ async function targetVectorRows(
     kind: TargetKind;
     thoughtId?: Id<"thoughts">;
     chunkId?: Id<"chunks">;
+    eventId?: Id<"events">;
   },
 ): Promise<Doc<"embeddingVectors">[]> {
   const rows =
@@ -834,10 +841,15 @@ async function targetVectorRows(
           .query("embeddingVectors")
           .withIndex("by_thoughtId", (q) => q.eq("thoughtId", input.thoughtId))
           .take(MAX_TARGET_VECTOR_ROWS + 1)
-      : await ctx.db
-          .query("embeddingVectors")
-          .withIndex("by_chunkId", (q) => q.eq("chunkId", input.chunkId))
-          .take(MAX_TARGET_VECTOR_ROWS + 1);
+      : input.kind === "card"
+        ? await ctx.db
+            .query("embeddingVectors")
+            .withIndex("by_eventId", (q) => q.eq("eventId", input.eventId))
+            .take(MAX_TARGET_VECTOR_ROWS + 1)
+        : await ctx.db
+            .query("embeddingVectors")
+            .withIndex("by_chunkId", (q) => q.eq("chunkId", input.chunkId))
+            .take(MAX_TARGET_VECTOR_ROWS + 1);
   if (rows.length > MAX_TARGET_VECTOR_ROWS) {
     throw new Error("Embedding target exceeds its vector row budget");
   }
@@ -853,6 +865,7 @@ async function insertVector(
     kind: TargetKind;
     thoughtId?: Id<"thoughts">;
     chunkId?: Id<"chunks">;
+    eventId?: Id<"events">;
     processingGenerationId?: Id<"processingGenerations">;
     inputText: string;
     vector: number[];
@@ -886,7 +899,12 @@ async function insertVector(
           fingerprint: input.fingerprint,
         })
       : null;
-  const targetId = input.kind === "thought" ? input.thoughtId : input.chunkId;
+  const targetId =
+    input.kind === "thought"
+      ? input.thoughtId
+      : input.kind === "card"
+        ? input.eventId
+        : input.chunkId;
   if (!targetId) throw new Error("Embedding vector target is missing");
   const inputHash = await sha256Hex(input.inputText);
   const scopeV2 = embeddingVectorScopeV2({
@@ -908,6 +926,7 @@ async function insertVector(
       kind: input.kind,
       thoughtId: input.thoughtId,
       chunkId: input.chunkId,
+      eventId: input.eventId,
     })
   ).filter(
     (row) =>
@@ -979,6 +998,7 @@ async function insertVector(
     scopeV2,
     ...(input.thoughtId ? { thoughtId: input.thoughtId } : {}),
     ...(input.chunkId ? { chunkId: input.chunkId } : {}),
+    ...(input.eventId ? { eventId: input.eventId } : {}),
     ...(input.processingGenerationId
       ? { processingGenerationId: input.processingGenerationId }
       : {}),
@@ -1014,7 +1034,12 @@ export async function releaseVectorCoverage(
   ctx: MutationCtx,
   row: Doc<"embeddingVectors">,
 ): Promise<void> {
-  const targetId = row.targetKind === "thought" ? row.thoughtId : row.chunkId;
+  const targetId =
+    row.targetKind === "thought"
+      ? row.thoughtId
+      : row.targetKind === "card"
+        ? row.eventId
+        : row.chunkId;
   if (!targetId) return;
   await recordVectorCoverageChange(ctx, {
     spaceId: row.spaceId,
@@ -1138,6 +1163,55 @@ export async function insertChunkEmbedding(
     ...input,
     kind: "chunk",
     processingGenerationId: chunk.processingGenerationId,
+  });
+  if (
+    (input.bumpEligibility ?? true) &&
+    result.generationState === "active" &&
+    result.inserted
+  ) {
+    await bumpEmbeddingEligibilityEpoch(ctx, input.spaceId);
+  }
+  return result.id;
+}
+
+/**
+ * Section 8.1: one vector per accepted generic card. The card target's
+ * identity is its `events` row, so this insert never depends on which card
+ * generation published the text, and a re-extraction over unchanged fields
+ * finds its own vector already present (I3).
+ */
+export async function insertCardEmbedding(
+  ctx: MutationCtx,
+  input: {
+    spaceId: Id<"spaces">;
+    eventId: Id<"events">;
+    embeddingGenerationId: Id<"embeddingGenerations">;
+    fingerprint: string;
+    inputText: string;
+    vector: number[];
+    bumpEligibility?: boolean;
+  },
+): Promise<Id<"embeddingVectors">> {
+  const event = await ctx.db.get(input.eventId);
+  if (
+    !event ||
+    event.spaceId !== input.spaceId ||
+    event.eventKey !== CARD_TARGET_EVENT_KEY
+  ) {
+    throw new Error("Card embedding target is not a generic card event");
+  }
+  const composed = await composeCardTargetInput(
+    ctx,
+    input.spaceId,
+    event.sourceItemId,
+    event,
+  );
+  if (!composed || composed.text !== input.inputText) {
+    throw new Error("Card embedding target does not match its composed input");
+  }
+  const result = await insertVector(ctx, {
+    ...input,
+    kind: "card",
   });
   if (
     (input.bumpEligibility ?? true) &&
@@ -1469,6 +1543,119 @@ export async function resolveAuthorizedChunkVectorCandidates(
       embeddingVectorId: row._id,
       chunkId: chunk._id,
       spaceId: row.spaceId,
+    });
+  }
+  return results;
+}
+
+/**
+ * P2-70j: card candidates, resolved to document-level hits.
+ *
+ * A card hit answers "find the document" rather than "find the passage", so
+ * hydration returns the document the card describes, the card's extractive
+ * summary as the passage, the live card generation as the evidence pointer
+ * and the card's own evidence spans for citations.
+ *
+ * I7 in full: the active fingerprint, the target row's eligibility and hash,
+ * and the live card generation are all rechecked here. A vector written
+ * against a card generation that has since been superseded or abandoned
+ * recomposes to a different hash, or to nothing at all, and is dropped.
+ */
+export async function resolveAuthorizedCardVectorCandidates(
+  ctx: Pick<QueryCtx, "db">,
+  input: {
+    principal: PrincipalRef;
+    targets: Array<{
+      spaceId: Id<"spaces">;
+      embeddingGenerationId?: Id<"embeddingGenerations">;
+      fingerprint: string;
+    }>;
+    embeddingVectorIds: Id<"embeddingVectors">[];
+  },
+): Promise<
+  Array<{
+    embeddingVectorId: Id<"embeddingVectors">;
+    eventId: Id<"events">;
+    spaceId: Id<"spaces">;
+    documentIds: Id<"documents">[];
+    cardGenerationId: Id<"processingGenerations">;
+    summary: string;
+    evidenceSpanIds: Id<"evidenceSpans">[];
+  }>
+> {
+  if (input.embeddingVectorIds.length > 256 || input.targets.length > 32) {
+    throw new Error("Embedding candidate hydration exceeds its bound");
+  }
+  const requestedSpaces = input.targets.map((target) => target.spaceId);
+  const authorized = new Set(
+    await getAuthorizedReadSpaceIds(ctx, input.principal, requestedSpaces),
+  );
+  const activeTargets = new Map<string, ActiveEmbeddingTarget>();
+  for (const target of input.targets) {
+    if (!authorized.has(target.spaceId)) continue;
+    activeTargets.set(
+      String(target.spaceId),
+      await requireActiveEmbeddingTarget(ctx, {
+        spaceId: target.spaceId,
+        fingerprint: target.fingerprint,
+      }),
+    );
+  }
+  const rows = await Promise.all(
+    input.embeddingVectorIds.map((id) => ctx.db.get(id)),
+  );
+  const results = [];
+  const accepted = new Set<string>();
+  for (const row of rows) {
+    if (!row || row.targetKind !== "card" || !row.eventId) continue;
+    const active = activeTargets.get(String(row.spaceId));
+    if (
+      !active ||
+      active.fingerprint !== row.embeddingFingerprint ||
+      row.thoughtId !== undefined ||
+      row.chunkId !== undefined ||
+      row.scopeV2 !==
+        embeddingVectorScopeV2({
+          spaceId: row.spaceId,
+          fingerprint: row.embeddingFingerprint,
+          targetKind: "card",
+        })
+    ) {
+      continue;
+    }
+    const targetKey = `${row.spaceId}:${row.eventId}`;
+    if (accepted.has(targetKey)) continue;
+    if (!(await targetIsEligibleFor(ctx, row, String(row.eventId)))) continue;
+    const event = await ctx.db.get(row.eventId);
+    if (
+      !event ||
+      event.spaceId !== row.spaceId ||
+      event.eventKey !== CARD_TARGET_EVENT_KEY
+    ) {
+      continue;
+    }
+    const composed = await composeCardTargetInput(
+      ctx,
+      row.spaceId,
+      event.sourceItemId,
+      event,
+    );
+    if (
+      !composed ||
+      composed.documentIds.length === 0 ||
+      row.inputHash !== (await sha256Hex(composed.text))
+    ) {
+      continue;
+    }
+    accepted.add(targetKey);
+    results.push({
+      embeddingVectorId: row._id,
+      eventId: event._id,
+      spaceId: row.spaceId,
+      documentIds: composed.documentIds,
+      cardGenerationId: composed.cardGenerationId,
+      summary: composed.summary,
+      evidenceSpanIds: composed.evidenceSpanIds,
     });
   }
   return results;

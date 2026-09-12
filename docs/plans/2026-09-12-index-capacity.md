@@ -116,7 +116,7 @@ Page sizes are chosen so each transaction stays far inside the 16 MiB and
 | Stage                 | Rows per page | Dominant row size       | Read per page | Write per page |
 | --------------------- | ------------: | ----------------------- | ------------: | -------------: |
 | Target scan, chunks   |           128 | 8 KiB text              |        ~1 MiB |              0 |
-| Target scan, cards    |           128 | ~2 KiB text             |      ~256 KiB |              0 |
+| Target scan, cards    |           128 | ~2 KiB text             |      ~512 KiB |              0 |
 | Target scan, thoughts |            64 | ~12.5 KiB legacy vector |      ~800 KiB |              0 |
 | Target row upsert     |           128 | ~256 B                  |       ~32 KiB |        ~32 KiB |
 | Manifest input fetch  |            32 | 8 KiB text              |      ~256 KiB |              0 |
@@ -127,6 +127,12 @@ Page sizes are chosen so each transaction stays far inside the 16 MiB and
 Page sizes are set by the largest target kind a space can hold, not by the kind
 the current backfill produces. A space keeps its existing chunk targets after
 the card model lands, so the chunk row keeps the budget.
+
+The card scan row doubled when P2-70j implemented it. A card target is one
+`events` row, its `eventVersions` row for the active card generation and that
+version's observations, so composing one card's input reads about twice the
+~2 KiB the plan first assumed. 128 rows is still ~512 KiB, well inside the
+16 MiB read budget, so the page size is unchanged.
 
 The thought scan page is smaller because a thought row still carries the legacy
 `embedding` field. That field is retained audit data under the embedding

@@ -2,6 +2,7 @@ import { v } from "convex/values";
 
 import type { Doc, Id } from "../../_generated/dataModel";
 import { internalMutation, type MutationCtx } from "../../_generated/server";
+import { markEligibilityTargets } from "../embeddings/model";
 import { digestProcessingConfiguration } from "../ingestion/hash";
 import {
   MAX_GENERATION_DOCUMENTS,
@@ -868,10 +869,15 @@ async function activateCardGeneration(
     }
     await ctx.db.patch(patch.documentId, { docType: patch.appliedDocType });
   }
-  // No embedding eligibility bump: the text generation, its documents and its
-  // chunks are untouched, so every chunk target id and vector stays valid.
+  // The text generation, its documents and its chunks are untouched, so every
+  // chunk target id and vector stays valid. Only the item's own card target
+  // moves, and its identity is the card event, so an unchanged card keeps its
+  // vector across this supersession (section 8.1, I3).
   await ctx.db.patch(input.item._id, {
     activeCardGenerationId: input.processingGenerationId,
+  });
+  await markEligibilityTargets(ctx, input.spaceId, {
+    sourceItemIds: [input.item._id],
   });
   return activatedAt;
 }

@@ -141,7 +141,14 @@ async function seedSpace() {
       spaceId,
       eligibilityEpoch: 0,
     });
-    return { userId, spaceId, documentId, processingGenerationId };
+    return {
+      userId,
+      spaceId,
+      documentId,
+      processingGenerationId,
+      sourceItemId,
+      sourceAccountId,
+    };
   });
   return { t, ...ids };
 }
@@ -717,6 +724,115 @@ describe("embedding target table and resumable builder", () => {
     expect(
       await seeded.t.run((ctx) => ctx.db.query("embeddingBuildJobs").collect()),
     ).toHaveLength(1);
+  });
+
+  test("chunk targets need the full-chunk opt-in once the space policy flips", async () => {
+    const seeded = await seedSpace();
+    await addChunks(seeded, 4);
+    const fingerprint = await baselineFingerprint();
+
+    // Before the flip the policy is absent, which is `all_chunks`: deploying
+    // the card model must retire nothing on its own.
+    const first = await seeded.t.mutation(
+      internal.models.embeddings.migrations.startTargetBackfill,
+      { spaceId: seeded.spaceId, fingerprint, now: 1 },
+    );
+    await drive(seeded, first.jobId!, { now: 100 });
+    expect((await recount(seeded, fingerprint)).eligible.chunk).toBe(4);
+
+    const flipped = await seeded.t.mutation(
+      internal.models.embeddings.migrations.setSpaceTargetPolicy,
+      { spaceId: seeded.spaceId, policy: "cards_and_opted_in_chunks" },
+    );
+    expect(flipped).toMatchObject({
+      changed: true,
+      previousPolicy: "all_chunks",
+    });
+    // The expected-value guard refuses a second flip from the stale value.
+    await expect(
+      seeded.t.mutation(
+        internal.models.embeddings.migrations.setSpaceTargetPolicy,
+        {
+          spaceId: seeded.spaceId,
+          policy: "all_chunks",
+          expectedPolicy: "all_chunks",
+        },
+      ),
+    ).rejects.toThrow("not the expected");
+
+    // A document with no opt-in produces no chunk targets; the sweep retires
+    // the ones it had. The chunk rows themselves are untouched.
+    const second = await seeded.t.mutation(
+      internal.models.embeddings.migrations.startTargetBackfill,
+      { spaceId: seeded.spaceId, fingerprint, now: 4_000 },
+    );
+    await drive(seeded, second.jobId!, { now: 5_000 });
+    expect((await recount(seeded, fingerprint)).eligible.chunk).toBe(0);
+    expect(await storedCounters(seeded, fingerprint)).toMatchObject({
+      eligible: { thought: 0, chunk: 0, card: 0 },
+      counterDrift: false,
+    });
+    expect(
+      await seeded.t.run((ctx) => ctx.db.query("chunks").collect()),
+    ).toHaveLength(4);
+
+    // The grandfathering migration sets the opt-in by a field, never by an id
+    // list in code, and marks eligibility in the same transaction.
+    const optIn = await seeded.t.mutation(
+      internal.models.embeddings.migrations.setChunkEmbeddingOptIn,
+      {
+        spaceId: seeded.spaceId,
+        sourceItemIds: [seeded.sourceItemId],
+        embedFullChunks: true,
+      },
+    );
+    expect(optIn).toMatchObject({ requested: 1, changed: 1, skipped: 0 });
+    expect((await recount(seeded, fingerprint)).eligible.chunk).toBe(4);
+    expect(
+      (await storedCounters(seeded, fingerprint)).eligible.chunk,
+    ).toBe(4);
+
+    // A rerun of the same migration writes nothing twice.
+    expect(
+      await seeded.t.mutation(
+        internal.models.embeddings.migrations.setChunkEmbeddingOptIn,
+        {
+          spaceId: seeded.spaceId,
+          sourceItemIds: [seeded.sourceItemId],
+          embedFullChunks: true,
+        },
+      ),
+    ).toMatchObject({ changed: 0, unchanged: 1 });
+  });
+
+  test("the source account rule is the default for an item with no opt-in", async () => {
+    const seeded = await seedSpace();
+    await addChunks(seeded, 3);
+    const fingerprint = await baselineFingerprint();
+    await seeded.t.mutation(
+      internal.models.embeddings.migrations.setSpaceTargetPolicy,
+      { spaceId: seeded.spaceId, policy: "cards_and_opted_in_chunks" },
+    );
+    await seeded.t.run((ctx) =>
+      ctx.db.patch(seeded.sourceAccountId, { embedFullChunks: true }),
+    );
+    const job = await seeded.t.mutation(
+      internal.models.embeddings.migrations.startTargetBackfill,
+      { spaceId: seeded.spaceId, fingerprint, now: 1 },
+    );
+    await drive(seeded, job.jobId!, { now: 100 });
+    expect((await recount(seeded, fingerprint)).eligible.chunk).toBe(3);
+
+    // The item's own value overrides the source rule in both directions.
+    await seeded.t.run((ctx) =>
+      ctx.db.patch(seeded.sourceItemId, { embedFullChunks: false }),
+    );
+    const rerun = await seeded.t.mutation(
+      internal.models.embeddings.migrations.startTargetBackfill,
+      { spaceId: seeded.spaceId, fingerprint, now: 8_000 },
+    );
+    await drive(seeded, rerun.jobId!, { now: 9_000 });
+    expect((await recount(seeded, fingerprint)).eligible.chunk).toBe(0);
   });
 
   test("counters stay exact across interleaved eligibility writes", async () => {

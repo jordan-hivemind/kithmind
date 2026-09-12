@@ -45,6 +45,7 @@ export const embeddingTables = {
     .index("by_generation_and_chunkId", ["embeddingGenerationId", "chunkId"])
     .index("by_thoughtId", ["thoughtId"])
     .index("by_chunkId", ["chunkId"])
+    .index("by_eventId", ["eventId"])
     .index("by_space_and_scopeV2", ["spaceId", "scopeV2"])
     .vectorIndex("by_embedding_1536", {
       vectorField: "embedding",

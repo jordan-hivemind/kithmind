@@ -41,6 +41,7 @@ import type * as models_documents_model from "../models/documents/model.js";
 import type * as models_documents_private from "../models/documents/private.js";
 import type * as models_documents_public from "../models/documents/public.js";
 import type * as models_documents_validators from "../models/documents/validators.js";
+import type * as models_embeddings_cardTargets from "../models/embeddings/cardTargets.js";
 import type * as models_embeddings_fill from "../models/embeddings/fill.js";
 import type * as models_embeddings_migrations from "../models/embeddings/migrations.js";
 import type * as models_embeddings_model from "../models/embeddings/model.js";
@@ -214,6 +215,7 @@ declare const fullApi: ApiFromModules<{
   "models/documents/private": typeof models_documents_private;
   "models/documents/public": typeof models_documents_public;
   "models/documents/validators": typeof models_documents_validators;
+  "models/embeddings/cardTargets": typeof models_embeddings_cardTargets;
   "models/embeddings/fill": typeof models_embeddings_fill;
   "models/embeddings/migrations": typeof models_embeddings_migrations;
   "models/embeddings/model": typeof models_embeddings_model;

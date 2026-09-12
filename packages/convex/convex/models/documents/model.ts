@@ -30,6 +30,31 @@ const DOCUMENT_FUSION_SEMANTIC_WEIGHT = 1.25;
 
 type PublicationState = "staged" | "active" | "historical";
 
+/**
+ * P2-70j: one semantic candidate that is a document card rather than a
+ * chunk. It answers "find the document" rather than "find the passage", so it
+ * carries the card's extractive summary as its passage, the live card
+ * generation as its evidence pointer and the card's own evidence spans.
+ */
+export type CardSearchHit = {
+  eventId: Id<"events">;
+  spaceId: Id<"spaces">;
+  documentId: Id<"documents">;
+  cardGenerationId: Id<"processingGenerations">;
+  summary: string;
+  evidenceSpanIds: Id<"evidenceSpans">[];
+};
+
+/** Ranking treats both legs as one ordered list of candidates. */
+type SearchCandidate = {
+  publicationState: PublicationState;
+  rank: number;
+  /** Fusion identity: the chunk row, or the card event and its document. */
+  key: string;
+  chunk?: Doc<"chunks">;
+  card?: CardSearchHit;
+};
+
 type CitationOutput = {
   evidenceSpanId: Id<"evidenceSpans">;
   sourcePageId: Id<"sourcePages">;
@@ -397,6 +422,8 @@ export async function searchDocuments(
   },
   semantic?: {
     chunkIds: readonly Id<"chunks">[];
+    /** Card candidates, already rechecked against the live card generation. */
+    cardHits?: readonly CardSearchHit[];
     vectorStatus: "ready" | "unavailable";
     /** Chunk targets the active fingerprint still owes (D3 B). */
     coverageIncomplete?: boolean;
@@ -423,11 +450,7 @@ export async function searchDocuments(
     ? MAX_SEARCH_CANDIDATES / 2
     : MAX_SEARCH_CANDIDATES;
   let remainingCandidates = keywordBudget;
-  const candidates: Array<{
-    chunk: Doc<"chunks">;
-    publicationState: PublicationState;
-    rank: number;
-  }> = [];
+  const candidates: SearchCandidate[] = [];
   for (
     let partitionIndex = 0;
     partitionIndex < partitions.length;
@@ -453,6 +476,7 @@ export async function searchDocuments(
     candidates.push(
       ...accepted.map((chunk, rank) => ({
         chunk,
+        key: String(chunk._id),
         publicationState: partition.publicationState,
         rank: partitionIndex * MAX_SEARCH_CANDIDATES + rank,
       })),
@@ -460,20 +484,35 @@ export async function searchDocuments(
   }
   if (semanticReady) {
     const keywordCandidates = candidates.map((candidate) => ({
-      id: candidate.chunk._id,
+      id: candidate.key,
       rank: candidate.rank,
     }));
-    const seen = new Set(candidates.map((candidate) => candidate.chunk._id));
+    const seen = new Set(candidates.map((candidate) => candidate.key));
+    const cardHits = (semantic.cardHits ?? []).slice(0, keywordBudget);
     const ids = [...new Set(semantic.chunkIds)].slice(0, keywordBudget);
-    candidateOverflow ||= semantic.chunkIds.length > keywordBudget;
-    const semanticCandidates: Array<{ id: Id<"chunks">; rank: number }> = [];
-    for (const [rank, id] of ids.entries()) {
+    candidateOverflow ||=
+      semantic.chunkIds.length > keywordBudget ||
+      (semantic.cardHits?.length ?? 0) > keywordBudget;
+    // Both legs arrive in one score order, so their ranks share a scale: a
+    // card hit and a chunk hit compete on the same reciprocal-rank curve.
+    const semanticCandidates: Array<{ id: string; rank: number }> = [];
+    let rank = 0;
+    for (const id of ids) {
       const chunk = await ctx.db.get(id);
       if (!chunk || chunk.publicationState !== "active") continue;
-      semanticCandidates.push({ id, rank });
-      if (!seen.has(id)) {
-        candidates.push({ chunk, publicationState: "active", rank: 0 });
-        seen.add(id);
+      const key = String(id);
+      semanticCandidates.push({ id: key, rank: rank++ });
+      if (!seen.has(key)) {
+        candidates.push({ chunk, key, publicationState: "active", rank: 0 });
+        seen.add(key);
+      }
+    }
+    for (const card of cardHits) {
+      const key = `card:${card.eventId}:${card.documentId}`;
+      semanticCandidates.push({ id: key, rank: rank++ });
+      if (!seen.has(key)) {
+        candidates.push({ card, key, publicationState: "active", rank: 0 });
+        seen.add(key);
       }
     }
     const ranks = fuseDocumentCandidateRanks(
@@ -481,7 +520,7 @@ export async function searchDocuments(
       semanticCandidates,
     );
     for (const candidate of candidates) {
-      candidate.rank = -(ranks.get(candidate.chunk._id) ?? 0);
+      candidate.rank = -(ranks.get(candidate.key) ?? 0);
     }
   }
   candidates.sort(
@@ -492,7 +531,7 @@ export async function searchDocuments(
           ? -1
           : 1) ||
       left.rank - right.rank ||
-      left.chunk._id.localeCompare(right.chunk._id),
+      left.key.localeCompare(right.key),
   );
 
   const authorized = new Set(spaceIds);
@@ -512,14 +551,22 @@ export async function searchDocuments(
   for (const candidate of candidates) {
     if (results.length > limit) break;
     const chunk = candidate.chunk;
-    if (chunk.publicationState !== candidate.publicationState) continue;
-    const document = await ctx.db.get(chunk.documentId);
+    const card = candidate.card;
+    // A card hit is a document-level hit: its document is named directly and
+    // its passage is the card's summary, so there is no chunk to validate.
+    const document = chunk
+      ? await ctx.db.get(chunk.documentId)
+      : await ctx.db.get(card!.documentId);
     if (
       !document ||
-      chunk.spaceId !== document.spaceId ||
-      document.processingGenerationId !== chunk.processingGenerationId ||
-      document.publicationState !== chunk.publicationState ||
-      returnedChunks.has(chunk._id) ||
+      (chunk
+        ? chunk.publicationState !== candidate.publicationState ||
+          chunk.spaceId !== document.spaceId ||
+          document.processingGenerationId !== chunk.processingGenerationId ||
+          document.publicationState !== chunk.publicationState ||
+          returnedChunks.has(chunk._id)
+        : document.spaceId !== card!.spaceId ||
+          document.publicationState !== "active") ||
       (resultCountByDocument.get(document._id) ?? 0) >=
         MAX_RESULTS_PER_DOCUMENT ||
       (args.docType !== undefined && document.docType !== args.docType) ||
@@ -538,9 +585,11 @@ export async function searchDocuments(
       chainCache.set(document._id, chain);
     }
     if (!chain) continue;
+    // Citations for a card hit resolve to the card's own evidence spans,
+    // which were staged over this same sealed text version.
     const citationResult = await hydrateCitations(
       ctx,
-      chunk.evidenceSpanIds,
+      chunk ? chunk.evidenceSpanIds : card!.evidenceSpanIds,
       {
         spaceId: document.spaceId,
         sourceRevisionId: document.sourceRevisionId,
@@ -551,7 +600,7 @@ export async function searchDocuments(
     );
     citationPartial ||=
       citationResult.invalidCitations || citationResult.byteBudgetTruncated;
-    returnedChunks.add(chunk._id);
+    if (chunk) returnedChunks.add(chunk._id);
     resultCountByDocument.set(
       document._id,
       (resultCountByDocument.get(document._id) ?? 0) + 1,
@@ -565,11 +614,16 @@ export async function searchDocuments(
       sourceTextVersionId: chain.textVersion._id,
       processingGenerationId: chain.generation._id,
       documentId: document._id,
-      chunkId: chunk._id,
+      // Exactly one of these is set: a chunk hit names its passage row, a
+      // card hit names the card event and the card generation it came from,
+      // which is its evidence pointer.
+      chunkId: chunk?._id,
+      cardEventId: card?.eventId,
+      cardGenerationId: card?.cardGenerationId,
       title: document.title,
       docType: document.docType,
       capturedAt: document.capturedAt,
-      snippet: chunk.text,
+      snippet: chunk ? chunk.text : card!.summary,
       historical: document.publicationState === "historical",
       contentStatus: sourceStatus(
         chain.item,

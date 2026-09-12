@@ -23,17 +23,25 @@ export const embeddingGenerationStateValidator = v.union(
 export const embeddingTargetKindValidator = v.union(
   v.literal("thought"),
   v.literal("chunk"),
+  v.literal("card"),
 );
 
 /**
- * The index-capacity plan reserves a third embedded target kind for document
- * cards. Only `embeddingTargets` accepts it today: no vector row is written
- * with it until the card model lands, so the vector union stays unchanged.
+ * Target rows and vector rows now accept the same three kinds: P2-70j writes
+ * card vectors. The alias is kept because both names are referenced widely.
  */
-export const embeddingTargetRowKindValidator = v.union(
-  v.literal("thought"),
-  v.literal("chunk"),
-  v.literal("card"),
+export const embeddingTargetRowKindValidator = embeddingTargetKindValidator;
+
+/**
+ * Section 8.2 of the document-card plan, as a space-level switch so the code
+ * can deploy before the pilot corpus carries its opt-in. Absent means
+ * `all_chunks`, which is exactly the behaviour before this change; the
+ * operator flips a space to `cards_and_opted_in_chunks` only after the
+ * grandfathering migration has run and the frozen scorer has been rerun.
+ */
+export const embeddingTargetPolicyValidator = v.union(
+  v.literal("all_chunks"),
+  v.literal("cards_and_opted_in_chunks"),
 );
 
 export const embeddingTargetStateValidator = v.union(
@@ -107,6 +115,8 @@ export const spaceEmbeddingStateFields = {
       }),
     ),
   ),
+  // Section 8.2 of the document-card plan. Absent is `all_chunks`.
+  targetPolicy: v.optional(embeddingTargetPolicyValidator),
   counterDrift: v.optional(v.boolean()),
   // Absent until a scan phase counts them. Maintained by the same eligibility
   // write that retires the thought's target, so stats never scan thoughts.
@@ -175,6 +185,12 @@ export const embeddingVectorFields = {
   searchScope: v.string(),
   thoughtId: v.optional(v.id("thoughts")),
   chunkId: v.optional(v.id("chunks")),
+  /**
+   * The card target's identity. It is the `events` row id, not the card
+   * generation id, so re-extraction over unchanged text keeps the target and
+   * its vector (I3). The live card generation is resolved at read time.
+   */
+  eventId: v.optional(v.id("events")),
   processingGenerationId: v.optional(v.id("processingGenerations")),
   inputHash: v.string(),
   embedding: v.array(v.float64()),

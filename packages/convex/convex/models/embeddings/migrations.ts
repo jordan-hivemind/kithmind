@@ -23,6 +23,7 @@ import {
   embeddingVectorSearchScope,
   failEmbeddingGeneration,
   insertThoughtEmbedding,
+  markEligibilityTargets,
   releaseVectorCoverage,
   stageEmbeddingGeneration,
 } from "./model";
@@ -36,6 +37,7 @@ import {
   embeddingBuildPhaseValidator,
   embeddingGenerationStateValidator,
   embeddingKindCountsValidator,
+  embeddingTargetPolicyValidator,
 } from "./validators";
 
 export const BASELINE_EMBEDDING_PROFILE: EmbeddingProfile = {
@@ -1033,5 +1035,105 @@ export const deleteNonActiveGenerationVectors = internalMutation({
       remaining,
       generations,
     };
+  },
+});
+
+// ---------------------------------------------------------------------------
+// P2-70j: the full-chunk opt-in and the space target policy
+// ---------------------------------------------------------------------------
+
+/** One page of the grandfathering migration stays far inside the write budget. */
+const MAX_OPT_IN_ITEMS = 64;
+
+/**
+ * Section 8.2. Sets the full-chunk opt-in on named source items, which is how
+ * the nine pilot documents are grandfathered: the corpus is identified by the
+ * field this migration writes, never by an id list in code.
+ *
+ * Idempotent, and it reports what it changed rather than what it was asked
+ * for. It marks eligibility in the same transaction, so an item that gains
+ * the opt-in has its chunk targets back before the call returns.
+ */
+export const setChunkEmbeddingOptIn = internalMutation({
+  args: {
+    spaceId: v.id("spaces"),
+    sourceItemIds: v.array(v.id("sourceItems")),
+    embedFullChunks: v.boolean(),
+  },
+  returns: v.object({
+    requested: v.number(),
+    changed: v.number(),
+    unchanged: v.number(),
+    skipped: v.number(),
+  }),
+  handler: async (ctx, args) => {
+    if (args.sourceItemIds.length > MAX_OPT_IN_ITEMS) {
+      throw new Error("Chunk opt-in page exceeds its item bound");
+    }
+    let changed = 0;
+    let unchanged = 0;
+    let skipped = 0;
+    for (const sourceItemId of [...new Set(args.sourceItemIds)]) {
+      const item = await ctx.db.get(sourceItemId);
+      if (!item || item.spaceId !== args.spaceId) {
+        skipped += 1;
+        continue;
+      }
+      if (item.embedFullChunks === args.embedFullChunks) {
+        unchanged += 1;
+        continue;
+      }
+      await ctx.db.patch(item._id, { embedFullChunks: args.embedFullChunks });
+      changed += 1;
+      await markEligibilityTargets(ctx, args.spaceId, {
+        processingGenerationIds: item.activeGenerationId
+          ? [item.activeGenerationId]
+          : [],
+      });
+    }
+    return {
+      requested: args.sourceItemIds.length,
+      changed,
+      unchanged,
+      skipped,
+    };
+  },
+});
+
+/**
+ * Section 8.2. Flips a space from embedding every active chunk to embedding
+ * cards plus opted-in chunks.
+ *
+ * Absent is `all_chunks`, so deploying the card model changes no eligibility
+ * until an operator runs this. It takes the expected current value so a
+ * concurrent change cannot be overwritten, and it writes only the policy: the
+ * newly ineligible chunk targets are retired by the next build's scan and
+ * sweep, which is the paged path, not this one transaction.
+ */
+export const setSpaceTargetPolicy = internalMutation({
+  args: {
+    spaceId: v.id("spaces"),
+    policy: embeddingTargetPolicyValidator,
+    expectedPolicy: v.optional(embeddingTargetPolicyValidator),
+  },
+  returns: v.object({
+    changed: v.boolean(),
+    policy: embeddingTargetPolicyValidator,
+    previousPolicy: embeddingTargetPolicyValidator,
+  }),
+  handler: async (ctx, args) => {
+    const state = await ensureSpaceEmbeddingState(ctx, args.spaceId);
+    const previousPolicy = state.targetPolicy ?? "all_chunks";
+    const expected = args.expectedPolicy ?? "all_chunks";
+    if (previousPolicy !== expected) {
+      throw new Error(
+        `Space target policy is ${previousPolicy}, not the expected ${expected}`,
+      );
+    }
+    if (previousPolicy === args.policy) {
+      return { changed: false, policy: args.policy, previousPolicy };
+    }
+    await ctx.db.patch(state._id, { targetPolicy: args.policy });
+    return { changed: true, policy: args.policy, previousPolicy };
   },
 });
