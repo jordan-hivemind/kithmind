@@ -8,7 +8,28 @@
 //
 //   node dist/run.js --adapter <module path> --session <module path> \
 //     --selection <json file> [--now <iso instant>] [--dry-run] \
-//     [--commit-every <n>] [--gates full|incremental]
+//     [--commit-every <n>] [--gates full|incremental] \
+//     [--acquire-only] [--concurrency <n>]
+//
+// F1-62. `--acquire-only` downloads and retains every document-tier pull
+// (pdf_statement/trade_confirmation) -- document row, capture, sha, byte
+// length, media type -- with no parse and no rows, and no gate ever runs.
+// It exists for a pull that is download-bound (1.5-2s per document against a
+// real institution, inside a browser session that lasts 20-45 minutes) with
+// thousands of documents to acquire: retain them all now, at the fastest
+// rate the session allows, and `reparse` (above) reads them back later with
+// no browser and no network at all. Refuses a selection that also names a
+// structured_api/tabular_export pull -- reparse's own walk is scoped to the
+// two document tiers, so run those through a separate, ordinary pass.
+//
+// `--concurrency <n>` (default 1, maximum 4) runs that many document
+// downloads at once against the one bridge session -- the download is the
+// slow, network-bound step, and the session's one CDP connection can still
+// run several page-side fetches concurrently (adapter-morgan-stanley's
+// src/bridge.mjs). Every document still commits in its own transaction (or
+// batches under `--commit-every` exactly as at `--concurrency 1`); the
+// consecutive-failure breaker (F1-54) and a paused session's sign-in wait are
+// both shared across every lane, not tracked or waited on per lane.
 //
 // F1-59. Publishing a document gates that document: both gates check only
 // the periods its own inserted rows could have moved. `--gates full` (the
@@ -58,6 +79,7 @@
 // header for why the order is not a preference, and what
 // `--remove-duplicates` deletes.
 
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -1700,6 +1722,66 @@ function printGates(label: string, gates: WholeArchiveGates | null): void {
   );
 }
 
+// --- concurrency (F1-62) --------------------------------------------------
+//
+// `--concurrency N` bounds how many document-tier downloads (acquire, the
+// slow, network-bound step -- 1.5-2s each against the real institution) run
+// at once against the one bridge session (src/bridge.mjs: one CDP
+// connection, but the page can run several `fetch`es concurrently). Every
+// document still commits in its own Postgres transaction, one at a time:
+// `pgClient` (pgStore.ts's `createArchiveClient`) is a single connection, and
+// two overlapping `withArchiveTransaction` calls on it would interleave their
+// BEGIN/COMMIT on the wire rather than actually running concurrently, so
+// `commitLock` below serializes every commit while letting the acquisitions
+// that feed it race ahead.
+
+const MAX_CONCURRENCY = 4;
+
+/** A FIFO async mutex: `withLock` runs `fn` only once every earlier `fn`
+ * passed to this same mutex has settled, however many callers are waiting.
+ * Used to keep every Postgres commit strictly one at a time even while
+ * several document downloads race ahead of it. */
+function createMutex(): <T>(fn: () => Promise<T>) => Promise<T> {
+  let tail: Promise<void> = Promise.resolve();
+  return function withLock<T>(fn: () => Promise<T>): Promise<T> {
+    const runAfterPrevious = tail.then(fn, fn);
+    tail = runAfterPrevious.then(
+      () => undefined,
+      () => undefined,
+    );
+    return runAfterPrevious;
+  };
+}
+
+/**
+ * Runs `worker(spec)` for every entry in `specs`, at most `concurrency` in
+ * flight at once. `worker` is responsible for catching its own failures
+ * (every caller below does: a failed download is reported and counted, not
+ * thrown) -- this just bounds how many are outstanding together. `shouldStop`
+ * is checked before a lane starts its next spec, never mid-flight, so a stop
+ * (the breaker, or a lost session) stops new work while whatever is already
+ * in flight still finishes and is reported.
+ */
+async function runConcurrentPool(
+  specs: readonly PullSpec[],
+  concurrency: number,
+  worker: (spec: PullSpec) => Promise<void>,
+  shouldStop: () => boolean,
+): Promise<void> {
+  let nextIndex = 0;
+  async function runOneLane(): Promise<void> {
+    for (;;) {
+      if (shouldStop()) return;
+      const index = nextIndex;
+      if (index >= specs.length) return;
+      nextIndex += 1;
+      await worker(specs[index]!);
+    }
+  }
+  const lanes = Array.from({ length: Math.min(concurrency, specs.length) }, () => runOneLane());
+  await Promise.all(lanes);
+}
+
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   if (argv[0] === "reparse") {
@@ -1722,6 +1804,8 @@ async function main(): Promise<void> {
       "dry-run": { type: "boolean", default: false },
       "commit-every": { type: "string", default: "1" },
       gates: { type: "string", default: "full" },
+      "acquire-only": { type: "boolean", default: false },
+      concurrency: { type: "string", default: "1" },
     },
   });
 
@@ -1749,6 +1833,22 @@ async function main(): Promise<void> {
   const gates = values.gates;
   if (gates !== "full" && gates !== "incremental") {
     throw new Error(`--gates must be "full" or "incremental", got ${gates}`);
+  }
+  // F1-62. Downloads and retains each document-tier pull (document row,
+  // capture, sha, byte length, media type) with no parse and no rows,
+  // marking it `parsed_ok = FALSE` so `reparse` (its own `retained_sha256 IS
+  // NOT NULL` walk) picks it up later. No gate ever runs in this mode -- see
+  // runPulls and printSummary below.
+  const acquireOnly = values["acquire-only"] === true;
+  // F1-62. Bounded parallel document downloads against the one bridge
+  // session -- the download itself is the slow, network-bound step; the
+  // Postgres commit that follows each one stays strictly one at a time
+  // regardless (see runConcurrentPool/createMutex above).
+  const concurrency = Number(values.concurrency);
+  if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > MAX_CONCURRENCY) {
+    throw new Error(
+      `--concurrency must be an integer between 1 and ${MAX_CONCURRENCY}, got ${values.concurrency}`,
+    );
   }
 
   const adapter = await loadAdapter(values.adapter);
@@ -1823,6 +1923,27 @@ async function main(): Promise<void> {
     // (same resolveEntryAccountId call the loop below used to make itself).
     const pullSpecs = expandSelectionPulls(selectionFile.pulls, discovered, accountsByExternalKey);
 
+    // F1-62. Acquire-only retains bytes for later `reparse`, which is scoped
+    // to the two document tiers (REPARSEABLE_TIERS above) -- a
+    // structured_api/tabular_export selection has no "retained but unparsed"
+    // shape for reparse to pick up later, so refuse the mix up front rather
+    // than silently importing one tier and only retaining the other. Run
+    // those pulls through an ordinary (non-acquire-only) pass instead.
+    if (acquireOnly) {
+      const nonDocumentKinds = new Set(
+        pullSpecs
+          .map((spec) => spec.selection.kind)
+          .filter((kind) => !isDocumentTierKind(kind)),
+      );
+      if (nonDocumentKinds.size > 0) {
+        throw new Error(
+          `--acquire-only supports only pdf_statement/trade_confirmation selections; this ` +
+            `selection also has ${[...nonDocumentKinds].join(", ")} pull(s). Split them into a ` +
+            "separate selection file and run that one without --acquire-only.",
+        );
+      }
+    }
+
     // F1-40: how document-tier pulls were filed, independent of whether they
     // go on to be acquired, skipped or failed below.
     let documentsFiledByAccount = 0;
@@ -1831,6 +1952,20 @@ async function main(): Promise<void> {
       if (!isDocumentTierKind(spec.selection.kind)) continue;
       if (spec.accountId === null) documentsFiledInstitutionWide += 1;
       else documentsFiledByAccount += 1;
+    }
+
+    // F1-62. `resolveAccountLast4` below is memoized per account id, but a
+    // miss issues a plain `pgClient.query` outside any of runPulls' own
+    // commit locking -- with `--concurrency` > 1, two lanes acquiring for the
+    // same account at once could both miss the cache together and both call
+    // `pgClient.query` concurrently on the one connection. Warming every
+    // distinct account's entry here, sequentially, before any lane starts,
+    // means every lookup during the concurrent pool below is a cache hit (a
+    // synchronous Map read), never a query.
+    for (const accountId of new Set(
+      pullSpecs.map((spec) => spec.accountId).filter((id): id is string => id !== null),
+    )) {
+      await resolveAccountLast4(pgClient, accountId, accountLast4Cache);
     }
 
     // F1-35: an institution-wide pull's own accountId is null, and its rows
@@ -1893,6 +2028,9 @@ async function main(): Promise<void> {
       readonly kind: CapabilityTier;
       readonly contentHash: string;
       readonly parsedRowCount: number;
+      /** F1-62. Deferred, not written here: see this function's own doc
+       * comment below. */
+      readonly extractedText: string | null;
     };
 
     /** Acquires, parses and persists one pull -- the raw-tree write, and
@@ -1925,15 +2063,14 @@ async function main(): Promise<void> {
         parsed.extractedText ?? null,
       );
       // F1-66, the same pair of writes the reparse above makes: the raw tree
-      // holds the text file and the archive holds its bytes, both addressed
-      // by the same sha, because a hosted read surface verifying a
-      // `retained_text_span_v1` citation can reach only the second. Written
-      // here beside the raw-tree write rather than inside the import
-      // transaction below, because acquisition and import are different
-      // facts (see this function's own doc comment).
-      if (parsed.extractedText) {
-        await storeRetainedText(pgClient, parsed.extractedText);
-      }
+      // holds the text file (written just above, synchronously) and the
+      // archive holds its bytes, both addressed by the same sha, because a
+      // hosted read surface verifying a `retained_text_span_v1` citation can
+      // reach only the second. F1-62: the archive write itself is a bare
+      // `pgClient.query` outside any transaction, so with `--concurrency` > 1
+      // it cannot run here -- this function's own acquisition phase is the
+      // part several lanes run at once. The caller writes it from inside
+      // `commitLock`, alongside this same document's commit, instead.
       bytesAcquired += acquired.bytes.length;
       manifestHashes.push(acquired.manifest.contentHash);
       documentsAcquiredCount += 1;
@@ -1968,7 +2105,102 @@ async function main(): Promise<void> {
           parsed.holdings.positions.length +
           parsed.holdings.balances.length +
           parsed.holdings.liabilities.length,
+        extractedText: parsed.extractedText ?? null,
       };
+    }
+
+    /** F1-62. `--acquire-only`'s own acquisition step: downloads and persists
+     * the raw bytes exactly like `acquireAndPersist` above, but never calls
+     * `adapter.parse()` -- "no parse and no rows" is the point of this mode,
+     * not just a slower path to the same summary. */
+    type AcquiredOnly = {
+      readonly accountId: string | null;
+      readonly docType: string;
+      readonly docDate: string | null;
+      readonly kind: CapabilityTier;
+      readonly contentHash: string;
+      readonly filePath: string;
+      readonly captureId: string;
+      readonly byteLength: number;
+      readonly mediaType: RetainedMediaType;
+    };
+
+    async function acquireAndRetainOnly(spec: PullSpec): Promise<AcquiredOnly> {
+      const selection = { ...spec.selection, session } as AcquireSelection;
+      const acquired = await adapter.acquire(selection);
+      const accountLast4 =
+        spec.accountId === null
+          ? "all"
+          : await resolveAccountLast4(pgClient, spec.accountId, accountLast4Cache);
+      const persisted = persistAcquiredDocument(
+        rawTreeRoot,
+        {
+          institutionId,
+          accountId: spec.accountId,
+          institutionSlug: capabilities.institutionSlug,
+          accountLast4,
+          docType: spec.docType,
+          acquired,
+        },
+        // No parse call: nothing was extracted to retain a text artifact for.
+        null,
+      );
+      bytesAcquired += acquired.bytes.length;
+      manifestHashes.push(acquired.manifest.contentHash);
+      documentsAcquiredCount += 1;
+      return {
+        accountId: spec.accountId,
+        docType: spec.docType,
+        docDate: spec.docDate,
+        kind: spec.selection.kind,
+        contentHash: acquired.manifest.contentHash,
+        filePath: persisted.filePath,
+        captureId: persisted.captureId,
+        byteLength: acquired.bytes.length,
+        mediaType: acquired.manifest.mediaType,
+      };
+    }
+
+    /** F1-62. Writes just the `documents` row -- no `adapterPullToImportDocuments`,
+     * no `publishImport`, so no instrument resolution, no review item, and no
+     * gate ever runs for it (the point of `--acquire-only`). `parsed_ok`
+     * defaults FALSE and `retained_sha256` is set, exactly the shape
+     * `selectRetainedDocuments` (used by `reparse` above) already looks for --
+     * no new "pending" column or flag is needed for reparse to pick this up
+     * later. Its own transaction, same as every other document-tier pull. */
+    async function commitRetainedOnly(
+      item: AcquiredOnly,
+    ): Promise<"retained" | "already_retained"> {
+      return withArchiveTransaction(pgClient, async (tx) => {
+        const existing = await tx.query<{ id: string }>(
+          "SELECT id FROM documents WHERE sha256 = $1",
+          [item.contentHash],
+        );
+        if (existing.rows[0]) return "already_retained";
+        await tx.query(
+          `INSERT INTO documents
+             (id, institution_id, account_id, doc_type, doc_date, file_path, sha256, parsed_ok,
+              retained_sha256, retained_byte_length, media_type, capture_id, text_path)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE, $8, $9, $10, $11, NULL)`,
+          [
+            randomUUID(),
+            institutionId,
+            item.accountId,
+            item.docType,
+            item.docDate,
+            item.filePath,
+            item.contentHash,
+            // A single-file document-tier pull's retained_sha256 is its own
+            // content hash, exactly as adapterImport.ts's collectDocuments
+            // computes sha256/retainedSha256 for the "single" case.
+            item.contentHash,
+            item.byteLength,
+            item.mediaType,
+            item.captureId,
+          ],
+        );
+        return "retained";
+      });
     }
 
     /** `documents.sha256` is content-addressed and unique (importer.ts's
@@ -2061,63 +2293,144 @@ async function main(): Promise<void> {
     }
 
     /**
-     * F1-39. Processes every pull in order: document-tier pulls
-     * (`pdf_statement`/`trade_confirmation`) batch up to `commitEvery` at a
-     * time, each batch its own transaction, and a refused or failed one is
-     * reported and skipped rather than aborting the run.
-     * `structured_api`/`tabular_export` pulls are never batched -- each gets
-     * its own transaction, and a failure there still aborts the run exactly
-     * as it always has (no selection here names thousands of those the way
-     * a full document retention window does).
+     * F1-39/F1-62. Processes every pull in original order, with document-tier
+     * pulls (`pdf_statement`/`trade_confirmation`) running through
+     * `runConcurrentPool` at up to `--concurrency` lanes -- at `--concurrency
+     * 1` (the default) that pool degenerates to exactly the previous
+     * sequential loop, one spec at a time, in order. Every document still
+     * lands in its own commit: the ordinary path batches up to `commitEvery`
+     * of them per transaction exactly as before, and `--acquire-only` always
+     * commits one document per transaction (`commitRetainedOnly`). Every
+     * commit -- from whichever lane produced it -- runs through `commitLock`,
+     * so they never overlap on the one Postgres connection even though the
+     * downloads that feed them do. `structured_api`/`tabular_export` pulls
+     * are never batched or run concurrently -- each gets its own transaction,
+     * and a failure there still aborts the run exactly as it always has (no
+     * selection here names thousands of those the way a full document
+     * retention window does).
      */
     async function runPulls(): Promise<void> {
-      // F1-54 circuit breaker: counts document-pull failures in a row,
-      // across every document kind, and resets on any success. Tracked here
-      // (not as a module-level `let`) so it starts fresh every call.
+      // F1-54 circuit breaker: counts document-pull failures across every
+      // lane and every document kind, and resets on any success. Tracked
+      // here (not as a module-level `let`) so it starts fresh every call.
+      // Plain reads/writes are safe across concurrent lanes: JS never runs
+      // two lanes' synchronous code at the same time, only their network
+      // waits overlap.
       let consecutiveDocumentFailures = 0;
-      for (const spec of pullSpecs) {
-        if (isDocumentTierKind(spec.selection.kind)) {
-          let acquired: Acquired;
+      // F1-54/F1-62. Set once, by whichever lane hits it first, and checked
+      // by every lane (including the one that set it) before starting its
+      // next spec -- a stop mid-group drains whatever is already in flight
+      // (already-committed documents stay committed) rather than starting
+      // anything new.
+      let stopped: Error | null = null;
+      // F1-62. Every actual commit -- flushDocBatch, publishOne,
+      // commitRetainedOnly -- runs through this, in the order it is
+      // requested, however many lanes are racing to request one: see this
+      // function's own doc comment above for why that has to be true.
+      const commitLock = createMutex();
+
+      function noteFailure(error: unknown): void {
+        consecutiveDocumentFailures += 1;
+        const message = error instanceof Error ? error.message : String(error);
+        // A lost browser session fails every remaining document the same
+        // way within milliseconds (20,757 of them on the first full pull).
+        // Stop instead: what was committed stays committed, and the rerun
+        // skips documents already imported (or, under --acquire-only,
+        // already retained).
+        if (/SIGNED_OUT|no session headers captured yet|no Authorization bearer captured yet/.test(message)) {
+          stopped ??= new Error(
+            `run stopped: the browser session is gone (${message.slice(0, 120)}). ` +
+              `${documentPullsAcquired} document pull(s) were committed before this; sign in again and rerun the same selection to continue.`,
+          );
+          return;
+        }
+        if (consecutiveDocumentFailures >= CONSECUTIVE_DOCUMENT_FAILURE_LIMIT) {
+          const errorClass = error instanceof Error ? error.constructor.name : typeof error;
+          stopped ??= new Error(
+            `run stopped: ${consecutiveDocumentFailures} consecutive document pulls failed ` +
+              `(last error: ${errorClass}: ${message.slice(0, 200)}). ` +
+              `${documentPullsAcquired} document pull(s) were committed before this; each document ` +
+              "commits in its own transaction, so already-committed documents are untouched. " +
+              "Fix the underlying failure and rerun the same selection to continue.",
+          );
+        }
+      }
+
+      async function processDocumentSpec(spec: PullSpec): Promise<void> {
+        if (acquireOnly) {
+          let acquired: AcquiredOnly;
           try {
-            acquired = await acquireAndPersist(spec);
+            acquired = await acquireAndRetainOnly(spec);
           } catch (error) {
             documentPullsFailed += 1;
             bumpDocKind(spec.selection.kind, "failed");
             reportFailure(spec, error);
-            consecutiveDocumentFailures += 1;
-            // A lost browser session fails every remaining document the same
-            // way within milliseconds (20,757 of them on the first full pull).
-            // Stop instead: what was committed stays committed, and the rerun
-            // skips documents already imported.
-            const message = error instanceof Error ? error.message : String(error);
-            if (/SIGNED_OUT|no session headers captured yet|no Authorization bearer captured yet/.test(message)) {
-              throw new Error(
-                `run stopped: the browser session is gone (${message.slice(0, 120)}). ` +
-                  `${documentPullsAcquired} document pull(s) were committed before this; sign in again and rerun the same selection to continue.`,
-              );
-            }
-            if (consecutiveDocumentFailures >= CONSECUTIVE_DOCUMENT_FAILURE_LIMIT) {
-              const errorClass = error instanceof Error ? error.constructor.name : typeof error;
-              throw new Error(
-                `run stopped: ${consecutiveDocumentFailures} consecutive document pulls failed ` +
-                  `(last error: ${errorClass}: ${message.slice(0, 200)}). ` +
-                  `${documentPullsAcquired} document pull(s) were committed before this; each document ` +
-                  "commits in its own transaction, so already-committed documents are untouched. " +
-                  "Fix the underlying failure and rerun the same selection to continue.",
-              );
-            }
-            continue;
+            noteFailure(error);
+            return;
           }
           consecutiveDocumentFailures = 0;
+          const result = await commitLock(() => commitRetainedOnly(acquired));
+          if (result === "already_retained") {
+            documentPullsSkipped += 1;
+            bumpDocKind(acquired.kind, "skipped");
+          } else {
+            documentPullsAcquired += 1;
+            bumpDocKind(acquired.kind, "acquired");
+          }
+          return;
+        }
+        let acquired: Acquired;
+        try {
+          acquired = await acquireAndPersist(spec);
+        } catch (error) {
+          documentPullsFailed += 1;
+          bumpDocKind(spec.selection.kind, "failed");
+          reportFailure(spec, error);
+          noteFailure(error);
+          return;
+        }
+        consecutiveDocumentFailures = 0;
+        await commitLock(async () => {
+          // F1-62. Deferred from acquireAndPersist (see its own doc comment):
+          // a bare `pgClient.query`, so it has to run under the same lock as
+          // every other commit rather than during the concurrent acquisition
+          // phase.
+          if (acquired.extractedText) await storeRetainedText(pgClient, acquired.extractedText);
           pendingDocBatch.push({ spec, acquired });
           if (pendingDocBatch.length >= commitEvery) await flushDocBatch();
-        } else {
-          await flushDocBatch();
-          const acquired = await acquireAndPersist(spec);
-          await publishOne([acquired]);
-        }
+        });
       }
-      await flushDocBatch();
+
+      async function runDocumentGroup(group: readonly PullSpec[]): Promise<void> {
+        await runConcurrentPool(group, concurrency, processDocumentSpec, () => stopped !== null);
+        // Whatever this group's lanes queued but did not reach commitEvery
+        // for yet -- flushed before a following structured_api/tabular_export
+        // pull (which must never share a transaction with a document-tier
+        // one) and again at the very end below.
+        await commitLock(() => flushDocBatch());
+      }
+
+      let group: PullSpec[] = [];
+      for (const spec of pullSpecs) {
+        if (stopped) break;
+        if (isDocumentTierKind(spec.selection.kind)) {
+          group.push(spec);
+          continue;
+        }
+        if (group.length > 0) {
+          await runDocumentGroup(group);
+          group = [];
+          if (stopped) break;
+        }
+        await commitLock(() => flushDocBatch());
+        const acquired = await acquireAndPersist(spec);
+        await commitLock(async () => {
+          if (acquired.extractedText) await storeRetainedText(pgClient, acquired.extractedText);
+          await publishOne([acquired]);
+        });
+      }
+      if (group.length > 0) await runDocumentGroup(group);
+      if (stopped) throw stopped;
     }
 
     async function buildOutcome(): Promise<RunOutcome> {
@@ -2149,7 +2462,12 @@ async function main(): Promise<void> {
         documentPullsAcquired,
         documentPullsSkipped,
         documentPullsFailed,
-        documentPullsByKind: Object.fromEntries(documentPullsByKind),
+        // F1-62. Sorted by kind name: with `--concurrency` > 1, which kind's
+        // first pull is bumped first depends on completion order, not spec
+        // order, and the printed summary must not depend on that.
+        documentPullsByKind: Object.fromEntries(
+          [...documentPullsByKind.entries()].sort(([a], [b]) => a.localeCompare(b)),
+        ),
         documentsFiledByAccount,
         documentsFiledInstitutionWide,
         incrementalPeriodsChecked: {
@@ -2160,9 +2478,13 @@ async function main(): Promise<void> {
       };
     }
 
-    /** F1-59. One whole-archive pass at the end of the run, by default. */
+    /** F1-59/F1-62. One whole-archive pass at the end of the run, by default
+     * -- except under `--acquire-only`, which never runs a gate at all: no
+     * row was ever inserted for a gate to check, and the whole point of this
+     * mode is downloading thousands of documents as fast as the bridge
+     * allows, not paying for a pass that would find nothing changed. */
     async function finishGates(): Promise<void> {
-      if (gates !== "full") return;
+      if (acquireOnly || gates !== "full") return;
       wholeArchiveGates = await runWholeArchiveGates(pgClient);
     }
 
@@ -2191,7 +2513,7 @@ async function main(): Promise<void> {
       outcome = await buildOutcome();
     }
 
-    printSummary(outcome, { dryRun, committed: !dryRun });
+    printSummary(outcome, { dryRun, committed: !dryRun, acquireOnly });
   } finally {
     // F1-64: on every exit from the try above -- normal completion or a
     // thrown stop (SIGNED_OUT, the consecutive-failure breaker, anything
@@ -2217,10 +2539,11 @@ async function main(): Promise<void> {
  */
 function printSummary(
   outcome: RunOutcome,
-  meta: { readonly dryRun: boolean; readonly committed: boolean },
+  meta: { readonly dryRun: boolean; readonly committed: boolean; readonly acquireOnly: boolean },
 ): void {
   console.log(
-    `mode: ${meta.dryRun ? "dry-run (rolled back, nothing committed)" : "committed"}`,
+    `mode: ${meta.dryRun ? "dry-run (rolled back, nothing committed)" : "committed"}` +
+      (meta.acquireOnly ? " (--acquire-only: no parse, no rows, no gate)" : ""),
   );
   console.log(
     `discover: ${outcome.discoverStatus} (${outcome.discoverDocuments} document(s), ${outcome.discoverExportRanges} export range(s))`,
@@ -2231,8 +2554,15 @@ function printSummary(
     console.log(`  ${kind}: ${n}`);
   }
   if (Object.keys(outcome.documentsDiscoveredByKind).length === 0) console.log("  (none)");
-  console.log(`document pulls acquired: ${outcome.documentPullsAcquired}`);
-  console.log(`document pulls skipped (already imported): ${outcome.documentPullsSkipped}`);
+  // F1-62. Under --acquire-only these count documents retained (a document
+  // row with retained bytes and no parse), not documents imported.
+  console.log(
+    `document pulls ${meta.acquireOnly ? "retained" : "acquired"}: ${outcome.documentPullsAcquired}`,
+  );
+  console.log(
+    `document pulls skipped (${meta.acquireOnly ? "already retained" : "already imported"}): ` +
+      `${outcome.documentPullsSkipped}`,
+  );
   console.log(`document pulls failed: ${outcome.documentPullsFailed}`);
   console.log("document pulls by kind:");
   for (const [kind, counts] of Object.entries(outcome.documentPullsByKind)) {
@@ -2256,7 +2586,9 @@ function printSummary(
     `incremental gate periods checked: cash=${outcome.incrementalPeriodsChecked.cash} ` +
       `positions=${outcome.incrementalPeriodsChecked.positions}`,
   );
-  if (outcome.wholeArchiveGates === null) {
+  if (meta.acquireOnly) {
+    console.log("whole-archive gate pass: skipped (--acquire-only: no gate runs in acquire-only mode)");
+  } else if (outcome.wholeArchiveGates === null) {
     console.log("whole-archive gate pass: skipped (--gates incremental)");
   } else {
     const { cash, positions } = outcome.wholeArchiveGates;

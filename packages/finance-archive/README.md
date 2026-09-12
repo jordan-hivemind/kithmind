@@ -816,7 +816,9 @@ node dist/run.js \
   --selection <path to a JSON selection file> \
   [--now <ISO instant, for a reproducible run>] \
   [--dry-run] \
-  [--commit-every <N, default 1>]
+  [--commit-every <N, default 1>] \
+  [--acquire-only] \
+  [--concurrency <N, default 1, maximum 4>]
 ```
 
 `--adapter` is a module with a default export, or a named `adapter` export,
@@ -975,6 +977,47 @@ committed (each `--commit-every` batch is its own transaction) stays
 committed; the error names how many document pulls that was, and signing in
 again and rerunning the same selection continues where it left off, since a
 document already imported is skipped either way.
+
+### `--acquire-only` and `--concurrency` (F1-62)
+
+A real document-tier pull is download-bound -- roughly 1.5-2s per statement
+or confirmation against the institution -- and sequential, inside a browser
+session that lasts 20-45 minutes; a full retention window's trade
+confirmations can number in the thousands, far more than one session can get
+through. `--acquire-only` downloads and retains each document-tier pull
+(document row, capture, sha, byte length, media type) with **no** parse and
+**no** rows, and no gate ever runs -- it exists to spend the session's whole
+lifetime acquiring bytes as fast as the institution allows, nothing else.
+Every document still lands in its own transaction, `parsed_ok` stays
+`FALSE`, and `reparse` (above) picks it up later from exactly this state --
+no new column or flag, just the same `retained_sha256 IS NOT NULL` walk
+`reparse`/`learn-account-aliases`/`reattribute-accounts` already share. Use
+it for the bulk of a large pull -- the trade confirmations and statements
+that dominate the count -- and reparse them afterwards, with no browser and
+no network at all; run structured_api/tabular_export pulls (which
+`--acquire-only` refuses to mix into the same selection, since `reparse`'s
+own walk is scoped to the two document tiers) through an ordinary pass. The
+summary reports documents retained and skipped (already retained), in place
+of acquired and skipped (already imported).
+
+`--concurrency N` (default 1, maximum 4) runs that many document downloads
+at once against the one bridge session: the download itself is the slow,
+network-bound step, and a session's one CDP connection can still run
+several page-side fetches concurrently (`adapter-morgan-stanley/src/
+bridge.mjs`). Every document still commits in its own transaction (or
+batches under `--commit-every` exactly as at `--concurrency 1`) -- the
+downloads race ahead in parallel, but every actual Postgres write is
+serialized behind the others, one at a time, regardless of how many lanes
+are running. The consecutive-failure breaker (F1-54) and a paused session's
+sign-in wait (`adapter-morgan-stanley/src/bridge.mjs`'s `sharedOnce`) are
+both shared across every lane rather than tracked or waited on per lane, so
+a lost session pauses the whole pool once and every lane resumes together,
+and ten failures spread across lanes trip the breaker exactly as ten in a
+row would. Trial it cautiously: start at `--concurrency 2` and watch stderr
+for "Service Error" or other transient-looking failures (the documents
+service is known to answer a transient 400 to a noticeable share of
+concurrent calls from one session) before going higher; `--acquire-only
+--concurrency 2` together is the combination this mode exists for.
 
 `institutionId` is no
 longer named here either (F1-19): before `discover`, `main()` calls

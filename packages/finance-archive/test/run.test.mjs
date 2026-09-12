@@ -223,6 +223,46 @@ function writeFailingDocumentFixtures(
   return { fixturesDir, adapterModulePath, sessionModulePath };
 }
 
+/**
+ * F1-62. A session whose document downloads (`/documents/...`) delay a fixed
+ * number of milliseconds and, before delaying, record how many are in flight
+ * together into `hwmFilePath` -- the only channel back to this test process,
+ * since `run.ts` runs as its own subprocess (execFileSync below). Proves
+ * `--concurrency` actually overlaps downloads rather than only accepting the
+ * flag: at `--concurrency 1` the high-water mark this file ends up holding is
+ * 1; with real overlap it is greater than 1.
+ */
+function writeOverlappingDownloadFixtures(t, { delayMs, hwmFilePath }) {
+  const { fixturesDir, adapterModulePath } = writeAdapterFixtures(t);
+  const sessionModulePath = join(fixturesDir, "session-overlap.mjs");
+  writeFileSync(
+    sessionModulePath,
+    `import { writeFileSync } from "node:fs";\n` +
+      `import { createSyntheticSession } from ${JSON.stringify(distIndexUrl)};\n` +
+      `export default function buildSession() {\n` +
+      `  const base = createSyntheticSession();\n` +
+      `  let inFlight = 0;\n` +
+      `  let maxInFlight = 0;\n` +
+      `  return {\n` +
+      `    ...base,\n` +
+      `    async fetchBytes(path, query) {\n` +
+      `      if (!path.startsWith("/documents/")) return base.fetchBytes(path, query);\n` +
+      `      inFlight += 1;\n` +
+      `      maxInFlight = Math.max(maxInFlight, inFlight);\n` +
+      `      writeFileSync(${JSON.stringify(hwmFilePath)}, String(maxInFlight));\n` +
+      `      try {\n` +
+      `        await new Promise((resolve) => setTimeout(resolve, ${JSON.stringify(delayMs)}));\n` +
+      `        return await base.fetchBytes(path, query);\n` +
+      `      } finally {\n` +
+      `        inFlight -= 1;\n` +
+      `      }\n` +
+      `    },\n` +
+      `  };\n` +
+      `}\n`,
+  );
+  return { fixturesDir, adapterModulePath, sessionModulePath };
+}
+
 /** A throwaway Postgres schema with the institution provisioned and,
  * unless the caller opts out, the account too. Opting out is how the
  * external-key test below proves an account needs no separate provisioning
@@ -1323,6 +1363,220 @@ test(
     );
     assert.equal(documents.length, 1, "the surviving document between the two failure runs imported");
     assert.equal(documents[0].doc_type, "confirmation");
+  },
+);
+
+// --- F1-62: --acquire-only, --concurrency ---------------------------------
+
+function documentTierSelection(fixturesDir) {
+  return writeSelection(fixturesDir, [
+    {
+      accountId: ACCOUNT.id,
+      docType: "statement",
+      docDate: null,
+      selection: { kind: "pdf_statement", externalId: "doc-stmt-2025-q1" },
+    },
+    {
+      accountId: ACCOUNT.id,
+      docType: "confirmation",
+      docDate: null,
+      selection: { kind: "trade_confirmation", externalId: "doc-conf-2025-02-10" },
+    },
+  ]);
+}
+
+test(
+  "--acquire-only retains documents with no parse and no rows and no gate, and a later reparse parses them",
+  { skip },
+  async (t) => {
+    const { schema, client } = await seededSchema(t);
+    const rawDir = mkdtempSync(join(tmpdir(), "kith-finance-acquire-only-raw-"));
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+
+    const { fixturesDir, adapterModulePath, sessionModulePath } = writeAdapterFixtures(t);
+    const selectionPath = documentTierSelection(fixturesDir);
+    const runImport = makeRunner({ adapterModulePath, sessionModulePath, selectionPath, schema, rawDir });
+
+    const output = runImport(["--acquire-only"]);
+    assert.match(output, /^mode: committed \(--acquire-only: no parse, no rows, no gate\)$/m);
+    assert.match(output, /document pulls retained: 2/);
+    assert.match(output, /document pulls skipped \(already retained\): 0/);
+    assert.match(output, /rows inserted: 0/);
+    assert.match(
+      output,
+      /whole-archive gate pass: skipped \(--acquire-only: no gate runs in acquire-only mode\)/,
+    );
+
+    const documents = await all(
+      client,
+      "SELECT doc_type, parsed_ok, retained_sha256, retained_byte_length, media_type FROM documents " +
+        "WHERE institution_id = $1 ORDER BY doc_type",
+      [INSTITUTION.id],
+    );
+    assert.equal(documents.length, 2, "both documents were retained");
+    for (const doc of documents) {
+      assert.equal(doc.parsed_ok, false, "acquire-only never parses");
+      assert.ok(doc.retained_sha256, "retained bytes are recorded");
+      assert.ok(doc.retained_byte_length > 0);
+      assert.ok(doc.media_type);
+    }
+    assert.equal(await count(client, "transactions"), 0, "no rows: acquire-only never converts or imports");
+    assert.equal(await count(client, "positions"), 0);
+    assert.equal(await count(client, "review_items"), 0, "no review item either -- nothing was ever parsed");
+
+    // A second acquire-only pass over the same selection is a no-op against
+    // the already-retained documents, reported as skipped rather than
+    // silently reinserting.
+    const second = runImport(["--acquire-only"]);
+    assert.match(second, /document pulls retained: 0/);
+    assert.match(second, /document pulls skipped \(already retained\): 2/);
+    assert.equal(await count(client, "documents"), 2);
+
+    // reparse (F1-55): no browser, no network -- it reads the retained bytes
+    // straight from the raw tree and, under the real (unbroken) adapter,
+    // parses both this time.
+    const runReparse = makeReparseRunner({ adapterModulePath, schema, rawDir });
+    const reparseOutput = runReparse();
+    assert.match(reparseOutput, /^mode: reparse$/m);
+    assert.match(reparseOutput, /documents reparsed: 2/);
+    assert.match(reparseOutput, /documents now parsed: 2/);
+    assert.match(reparseOutput, /documents still unparsed: 0/);
+
+    const parsedNow = await all(
+      client,
+      "SELECT parsed_ok FROM documents WHERE institution_id = $1",
+      [INSTITUTION.id],
+    );
+    assert.ok(parsedNow.every((row) => row.parsed_ok === true));
+    assert.ok(await count(client, "transactions") > 0, "reparse actually imported activity rows");
+    assert.ok(await count(client, "positions") > 0, "doc-stmt-2025-q1 carries a HOLDINGS section too");
+  },
+);
+
+test(
+  "--acquire-only refuses a selection that also names a structured_api/tabular_export pull",
+  { skip },
+  async (t) => {
+    const { schema } = await seededSchema(t);
+    const rawDir = mkdtempSync(join(tmpdir(), "kith-finance-acquire-only-mixed-raw-"));
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+
+    const { fixturesDir, adapterModulePath, sessionModulePath } = writeAdapterFixtures(t);
+    const selectionPath = writeSelection(fixturesDir, [
+      {
+        accountId: ACCOUNT.id,
+        docType: "statement",
+        docDate: null,
+        selection: { kind: "pdf_statement", externalId: "doc-stmt-2025-q1" },
+      },
+      {
+        accountId: ACCOUNT.id,
+        docType: "activity_pull",
+        docDate: null,
+        selection: { kind: "structured_api", periodStart: "2025-01-01", periodEnd: "2025-04-01" },
+      },
+    ]);
+    const runImport = makeRunner({ adapterModulePath, sessionModulePath, selectionPath, schema, rawDir });
+
+    assert.throws(
+      () => runImport(["--acquire-only"]),
+      (error) => {
+        assert.match(String(error.stderr), /--acquire-only supports only pdf_statement\/trade_confirmation/);
+        assert.match(String(error.stderr), /structured_api/);
+        return true;
+      },
+    );
+  },
+);
+
+test(
+  "--concurrency 3 overlaps document downloads and still commits each document exactly once",
+  { skip },
+  async (t) => {
+    const { schema, client } = await seededSchema(t);
+    const rawDir = mkdtempSync(join(tmpdir(), "kith-finance-concurrency-raw-"));
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+
+    const hwmDir = mkdtempSync(join(tmpdir(), "kith-finance-concurrency-hwm-"));
+    t.after(() => rmSync(hwmDir, { recursive: true, force: true }));
+    const hwmFilePath = join(hwmDir, "high-water-mark.txt");
+
+    const { fixturesDir, adapterModulePath, sessionModulePath } = writeOverlappingDownloadFixtures(t, {
+      delayMs: 150,
+      hwmFilePath,
+    });
+    // The fixture only has three documents; each is named twice (six pulls)
+    // so a pool of three lanes has real work to overlap on, and the repeat
+    // proves a document downloaded more than once is still committed once.
+    const entries = [
+      { docType: "statement", kind: "pdf_statement", externalId: "doc-stmt-2025-q1" },
+      { docType: "statement", kind: "pdf_statement", externalId: "doc-stmt-2025-q2" },
+      { docType: "confirmation", kind: "trade_confirmation", externalId: "doc-conf-2025-02-10" },
+    ];
+    const selectionPath = writeSelection(fixturesDir, [
+      ...entries,
+      ...entries,
+    ].map(({ docType, kind, externalId }) => ({
+      accountId: ACCOUNT.id,
+      docType,
+      docDate: null,
+      selection: { kind, externalId },
+    })));
+    const runImport = makeRunner({ adapterModulePath, sessionModulePath, selectionPath, schema, rawDir });
+
+    const output = runImport(["--concurrency", "3"]);
+    assert.match(output, /^mode: committed$/m);
+    assert.match(output, /document pulls acquired: 3/, "one commit per distinct document");
+    assert.match(output, /document pulls skipped \(already imported\): 3/, "the repeat of each document dedupes");
+    assert.match(output, /document pulls failed: 0/);
+
+    const highWaterMark = Number(readFileSync(hwmFilePath, "utf8"));
+    assert.ok(
+      highWaterMark >= 2,
+      `expected more than one download in flight at once under --concurrency 3, saw a high-water mark of ${highWaterMark}`,
+    );
+
+    assert.equal(await count(client, "documents"), 3, "three distinct documents, however many times each was downloaded");
+    assert.ok(await count(client, "transactions") > 0);
+  },
+);
+
+test(
+  "the consecutive-failure breaker trips across concurrent streams (--concurrency 3)",
+  { skip },
+  async (t) => {
+    const { schema, client } = await seededSchema(t);
+    const rawDir = mkdtempSync(join(tmpdir(), "kith-finance-breaker-concurrency-raw-"));
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+
+    const { fixturesDir, adapterModulePath, sessionModulePath } = writeAdapterFixtures(t);
+    // A document id the fixture has never heard of fails synchronously
+    // (syntheticTrust's acquireDocument: "unknown document ..."), the same
+    // as any other acquisition failure from the breaker's point of view.
+    const failingEntry = {
+      accountId: ACCOUNT.id,
+      docType: "statement",
+      docDate: null,
+      selection: { kind: "pdf_statement", externalId: "doc-bogus-does-not-exist" },
+    };
+    const selectionPath = writeSelection(
+      fixturesDir,
+      Array.from({ length: 12 }, () => failingEntry),
+    );
+    const runImport = makeRunner({ adapterModulePath, sessionModulePath, selectionPath, schema, rawDir });
+
+    assert.throws(
+      () => runImport(["--concurrency", "3"]),
+      (error) => {
+        assert.match(
+          String(error.stderr),
+          /run stopped: 10 consecutive document pulls failed/,
+          "the breaker's shared count -- across every lane, not per lane -- is what trips it",
+        );
+        return true;
+      },
+    );
+    assert.equal(await count(client, "documents"), 0, "nothing ever acquired, so nothing was ever committed");
   },
 );
 

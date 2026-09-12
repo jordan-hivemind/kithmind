@@ -481,6 +481,41 @@ export async function waitForSignIn(cdp, origin, cdpHttpBase, reason, options = 
 }
 
 /**
+ * F1-62. `--concurrency` runs several fetchText/fetchBytes calls at once
+ * against one session. If more than one hits a SIGNED_OUT (or an
+ * expired/wrong-service bearer) around the same time, only the first should
+ * actually drive the recovery -- a second `waitForSignIn` racing the first
+ * would navigate and clear the header slot again mid-wait, and a second
+ * concurrent bearer refresh mints a token the first call's retry never sees.
+ *
+ * `sharedOnce(state, start)` runs `start()` at most once while a caller is
+ * already waiting on it: the first caller to reach an empty `state` starts it
+ * and every other concurrent caller just awaits that same promise. Once it
+ * settles (however it settles), `state.pending` clears itself, so the *next*
+ * pause -- a later, unrelated sign-out -- gets its own fresh call rather than
+ * replaying a stale result. `state` is one `{ pending }` box per gate (a
+ * session opens two: one for sign-in, one for the bearer), created fresh per
+ * session so two sessions never share a gate.
+ *
+ * Exported for test/bridge.test.mjs only (same convention as `evaluate`/
+ * `waitForSignIn` above); every other caller reaches it only through
+ * `createMorganStanleySession`'s own `withBearerRetry`.
+ */
+export function sharedOnce(state, start) {
+  if (state.pending === null) {
+    state.pending = start().finally(() => {
+      state.pending = null;
+    });
+  }
+  return state.pending;
+}
+
+/** A fresh, empty `sharedOnce` gate. */
+export function createSharedGate() {
+  return { pending: null };
+}
+
+/**
  * Builds the `AdapterSession` the README describes. Options (all from the
  * environment when omitted, matching run.ts's own no-default convention):
  *   - `cdpHttpBase`: e.g. "http://127.0.0.1:9222" (MS_CDP_HTTP_BASE)
@@ -532,6 +567,10 @@ export default async function createMorganStanleySession(options = {}) {
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
 
+  // F1-62. One gate per session -- see sharedOnce's doc comment above.
+  const signInGate = createSharedGate();
+  const bearerRefreshGate = createSharedGate();
+
   async function withBearerRetry(request, run) {
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
@@ -541,10 +580,18 @@ export default async function createMorganStanleySession(options = {}) {
         // 401 is an expired bearer; 409 is a bearer minted for another
         // service (the home page's calls). Both are cured by the app's own
         // token endpoint.
-        if (request.needsAuthorization && /request failed: (401|409)\b/.test(message) && (await refreshBearer(cdp, origin))) {
+        if (
+          request.needsAuthorization &&
+          /request failed: (401|409)\b/.test(message) &&
+          (await sharedOnce(bearerRefreshGate, () => refreshBearer(cdp, origin)))
+        ) {
           continue;
         }
-        if (/SIGNED_OUT|no session headers captured yet/.test(message) && attempt < 2 && (await waitForSignIn(cdp, origin, cdpHttpBase, message))) {
+        if (
+          /SIGNED_OUT|no session headers captured yet/.test(message) &&
+          attempt < 2 &&
+          (await sharedOnce(signInGate, () => waitForSignIn(cdp, origin, cdpHttpBase, message)))
+        ) {
           continue;
         }
         throw error;
