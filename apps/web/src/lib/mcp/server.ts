@@ -85,6 +85,7 @@ const reviewQueueClassSchema = z.enum([
   "field_dropped",
   "card_gate_failed",
   "duplicate_group",
+  "entity_binding_needed",
   "queue_status",
 ]);
 const writeSpaceSchema = spaceIdSchema
@@ -663,7 +664,7 @@ export function createMcpServer(
 
   const listReviewQueueTool = server.tool(
     MCP_TOOL_NAMES.listReviewQueue,
-    "Read the review queue for one source account: counts of skipped files by exclusion reason, dropped card fields by gate failure code, gate-failed cards by card kind, duplicate file groups, and the P2-70f extraction queue's status per card kind. Every skipped file, dropped field and duplicate group is reachable from these counts, even when a detail page is truncated. Name one class (skipped_by_type, field_dropped, card_gate_failed, duplicate_group or queue_status) to page its rows; drop rows carry a document reference, the field name and the closed gate failure code, never the field's value.",
+    "Read the review queue for one source account: counts of skipped files by exclusion reason, dropped card fields by gate failure code, gate-failed cards by card kind, duplicate file groups, card fields whose entity name needs a person to bind it, and the P2-70f extraction queue's status per card kind. Every skipped file, dropped field, duplicate group and unbound name is reachable from these counts, even when a detail page is truncated. Name one class (skipped_by_type, field_dropped, card_gate_failed, duplicate_group, entity_binding_needed or queue_status) to page its rows; drop rows carry a document reference, the field name and the closed gate failure code, never the field's value, and entity_binding_needed rows carry the literal name the document used and how many entities it matched.",
     {
       sourceAccountId: spaceIdSchema,
       spaceIds: readSpacesSchema,

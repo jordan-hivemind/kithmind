@@ -66,11 +66,19 @@ export type QueueStatusSummary = {
   resumeAt: number | undefined;
 };
 
+/** P2-70l, section 4.4: split by why the name did not bind, which is the
+ * only thing that changes what a person has to do about it. */
+type EntityBindingNeededCounts = BoundedCounts & {
+  unresolved: number;
+  ambiguous: number;
+};
+
 export type ReviewQueueCounts = {
   skippedByType: SkippedByTypeCounts;
   fieldDropped: FieldDroppedCounts;
   cardGateFailed: CardGateFailedCounts;
   duplicateGroup: BoundedCounts;
+  entityBindingNeeded: EntityBindingNeededCounts;
   queueStatus: QueueStatusSummary[];
 };
 
@@ -80,7 +88,66 @@ function emptyCounts(): ReviewQueueCounts {
     fieldDropped: { total: 0, byCode: {}, truncated: false },
     cardGateFailed: { total: 0, byRecordKind: {}, truncated: false },
     duplicateGroup: { total: 0, truncated: false },
+    entityBindingNeeded: {
+      total: 0,
+      unresolved: 0,
+      ambiguous: 0,
+      truncated: false,
+    },
     queueStatus: [],
+  };
+}
+
+/** Pending `cardEntityBindings` rows for one account: an accepted card field
+ * whose literal name matched zero, or two or more, entities. A resolved row
+ * is an audit note, not queued work, so it is never counted here. */
+function pendingBindingQuery(
+  ctx: Pick<QueryCtx, "db">,
+  spaceId: Id<"spaces">,
+  sourceAccountId: Id<"sourceAccounts">,
+) {
+  return ctx.db
+    .query("cardEntityBindings")
+    .withIndex("by_space_account_status", (q) =>
+      q
+        .eq("spaceId", spaceId)
+        .eq("sourceAccountId", sourceAccountId)
+        .eq("status", "pending"),
+    );
+}
+
+async function entityBindingCounts(
+  ctx: Pick<QueryCtx, "db">,
+  spaceId: Id<"spaces">,
+  sourceAccountId: Id<"sourceAccounts">,
+): Promise<EntityBindingNeededCounts> {
+  const rows = await pendingBindingQuery(ctx, spaceId, sourceAccountId).take(
+    MAX_REVIEW_COUNT_ROWS + 1,
+  );
+  const truncated = rows.length > MAX_REVIEW_COUNT_ROWS;
+  const counted = rows.slice(0, MAX_REVIEW_COUNT_ROWS);
+  let unresolved = 0;
+  let ambiguous = 0;
+  for (const row of counted) {
+    if (row.candidateCount === 0) unresolved += 1;
+    else ambiguous += 1;
+  }
+  return { total: counted.length, unresolved, ambiguous, truncated };
+}
+
+/** The literal name, the candidate count and the card reference: what a
+ * person needs to decide, and no other value from the document. */
+function projectBindingRow(row: Doc<"cardEntityBindings">) {
+  return {
+    bindingId: row._id,
+    sourceItemId: row.sourceItemId,
+    eventId: row.eventId,
+    observationId: row.observationId,
+    recordKind: row.recordKind,
+    fieldKey: row.fieldKey,
+    literalName: row.literalName,
+    candidateCount: row.candidateCount,
+    createdAt: row.createdAt,
   };
 }
 
@@ -317,6 +384,18 @@ async function detailPage(
         isDone: page.isDone,
       };
     }
+    case "entity_binding_needed": {
+      const page = await pendingBindingQuery(
+        ctx,
+        spaceId,
+        sourceAccountId,
+      ).paginate({ cursor: cursor ?? null, numItems: limit });
+      return {
+        rows: page.page.map(projectBindingRow),
+        cursor: page.isDone ? undefined : page.continueCursor,
+        isDone: page.isDone,
+      };
+    }
     case "queue_status": {
       // No per-file rows: the full (small) summary is always one page.
       return {
@@ -353,10 +432,17 @@ export async function listReviewQueue(
     };
   }
 
-  const [skippedByType, drops, duplicateGroupResult, queueStatus] = await Promise.all([
+  const [
+    skippedByType,
+    drops,
+    duplicateGroupResult,
+    entityBindingNeeded,
+    queueStatus,
+  ] = await Promise.all([
     skippedByTypeCounts(ctx, account.spaceId, account._id),
     dropCounts(ctx, account.spaceId, account._id),
     duplicateGroups(ctx, account.spaceId, account._id),
+    entityBindingCounts(ctx, account.spaceId, account._id),
     queueStatusSummary(ctx, account.spaceId),
   ]);
   const counts: ReviewQueueCounts = {
@@ -367,6 +453,7 @@ export async function listReviewQueue(
       total: duplicateGroupResult.groupCount,
       truncated: duplicateGroupResult.truncated,
     },
+    entityBindingNeeded,
     queueStatus,
   };
 

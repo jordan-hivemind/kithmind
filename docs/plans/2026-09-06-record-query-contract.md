@@ -52,7 +52,8 @@ payer in one call.
 | Event kinds | Six added. Nothing is removed.                                                                                                                                                   |
 | Entity kind | `safe_note_card` is a person or organization. `tax_return_card`, `k1_card` and `brokerage_tax_package_card` are a person.                                                        |
 | Entity      | `document_card` and `spreadsheet_card` belong to the source account's configured `subjectEntityId`.                                                                              |
-| Value types | Money fields are `money`, rates are `decimal` with a unit code, clause flags are `boolean`, `tax_year` is `integer`, name fields are `entity` when resolved and `text` when not. |
+| Value types | Money fields are `money`, rates are `decimal` with a unit code, clause flags are `boolean`, `tax_year` is `integer`, and a name field is always the literal `text` the document wrote. |
+| Bound entity | A resolved name sets `observations.boundEntityId` beside that literal value, never in place of it, so the evidenced name survives the binding (P2-70l, document cards section 4.4). |
 | Fields      | A field outside the kind's declared list is refused, as is a value of the wrong type.                                                                                            |
 | Evidence    | Every stored field binds to `evidenceSpans` rows. A field whose span does not resolve, or whose `quoteHash` does not match, is not stored at all, and the drop is recorded.      |
 

@@ -735,3 +735,129 @@ describe("the SAFE and convertible note card", () => {
     expect(tier0!.failureCodes).toContain("required_field_absent");
   });
 });
+
+/**
+ * P2-70l, sections 4.4 and 4.5. `investor_entity` is this card kind's event
+ * entity, so binding the investor's literal name is what makes an
+ * entity-filtered `list_events` return the card. Until then the card is
+ * findable by its literal name, which is stored with its span from P2-70c on.
+ */
+describe("entity binding for the SAFE card", () => {
+  test("the ladder creates no entity, and the bound investor answers list_events", async () => {
+    const harness = await seedCorpus();
+    const before = await harness.t.run(async (ctx) =>
+      (
+        await ctx.db
+          .query("entities")
+          .withIndex("by_spaceId", (q) => q.eq("spaceId", harness.spaceId))
+          .collect()
+      ).map((row) => row._id),
+    );
+
+    await publishFixture(harness, harness.anchorId, ANCHOR_ROBOTICS, 1_000);
+    await publishFixture(harness, harness.brightlineId, BRIGHTLINE_FOODS, 1_001);
+
+    // A full ladder run over two documents that name four distinct parties
+    // inserts no entity at all. Section 4.4: extraction never creates one.
+    const after = await harness.t.run(async (ctx) =>
+      (
+        await ctx.db
+          .query("entities")
+          .withIndex("by_spaceId", (q) => q.eq("spaceId", harness.spaceId))
+          .collect()
+      ).map((row) => row._id),
+    );
+    expect(after).toEqual(before);
+
+    // Every unbound name is a review item, and the card still answers by the
+    // literal name it stored.
+    const pending = await harness.t.run((ctx) =>
+      ctx.db
+        .query("cardEntityBindings")
+        .withIndex("by_space_status_name", (q) =>
+          q.eq("spaceId", harness.spaceId).eq("status", "pending"),
+        )
+        .collect(),
+    );
+    expect(pending.map((row) => row.literalName)).toContain(
+      ANCHOR_ROBOTICS.investor,
+    );
+    expect(pending.every((row) => row.candidateCount === 0)).toBe(true);
+
+    const investorRow = pending.find(
+      (row) =>
+        row.observationType === "investor_entity" &&
+        row.sourceItemId === harness.anchorId,
+    )!;
+
+    // A person mints the investor from the literal name. That is the only
+    // way an entity appears from a card.
+    const created = await harness.t.mutation(
+      internal.models.records.cardEntityBinding.createEntityFromCard,
+      {
+        observationId: investorRow.observationId,
+        kind: "organization",
+        actorUserId: harness.userId,
+        now: 1_500,
+      },
+    );
+
+    // Section 4.5: the card event now belongs to the investor, so the entity
+    // filter finds it, and the rollback value is recorded.
+    const bindingRow = await harness.t.run((ctx) =>
+      ctx.db.get(created.bindingId),
+    );
+    expect(bindingRow!.resolution?.previousEventEntityId).toBe(
+      harness.entityId,
+    );
+
+    const byInvestor = await harness.t.run((ctx) =>
+      executeRecordQuery(ctx, {
+        principal: webPrincipal(harness.userId),
+        now: 2_000,
+        query: {
+          operation: "list_events",
+          spaceId: harness.spaceId,
+          entityId: created.entityId,
+          eventType: "safe_note_card",
+          from: Date.parse("2020-01-01T00:00:00Z"),
+          to: Date.parse("2021-01-01T00:00:00Z"),
+          order: "asc",
+        },
+      }),
+    );
+    if (byInvestor.operation !== "list_events") {
+      throw new Error("wrong operation");
+    }
+    expect(byInvestor.records.map((record) => record.sourceItemId)).toEqual([
+      harness.anchorId,
+    ]);
+
+    // The alias the decision wrote makes the second document's identical
+    // investor name bind with no person in the loop.
+    const rebound = await harness.t.mutation(
+      internal.models.records.cardEntityBinding.rebindPendingCardEntities,
+      { spaceId: harness.spaceId, now: 1_600 },
+    );
+    expect(rebound.bound).toBe(1);
+    const both = await harness.t.run((ctx) =>
+      executeRecordQuery(ctx, {
+        principal: webPrincipal(harness.userId),
+        now: 2_100,
+        query: {
+          operation: "list_events",
+          spaceId: harness.spaceId,
+          entityId: created.entityId,
+          eventType: "safe_note_card",
+          from: Date.parse("2020-01-01T00:00:00Z"),
+          to: Date.parse("2021-01-01T00:00:00Z"),
+          order: "asc",
+        },
+      }),
+    );
+    if (both.operation !== "list_events") throw new Error("wrong operation");
+    expect(both.records.map((record) => record.sourceItemId).sort()).toEqual(
+      [harness.anchorId, harness.brightlineId].sort(),
+    );
+  });
+});
