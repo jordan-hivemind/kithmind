@@ -2,6 +2,7 @@ import { query } from "../../_generated/server";
 
 import { requireMcpPrincipal } from "../../lib/mcpAuth";
 import { getAuthorizedReadSpaceIds } from "../../lib/spaces";
+import { listInventory as listInventoryRows } from "./inventory";
 import {
   getDocument,
   listSources as listSourceRecords,
@@ -10,6 +11,7 @@ import {
 import {
   documentGetArgs,
   documentSearchArgs,
+  inventoryListArgs,
   sourceListArgs,
 } from "./validators";
 
@@ -54,5 +56,19 @@ export const listSources = query({
       args.spaceIds,
     );
     return await listSourceRecords(ctx, spaceIds, args);
+  },
+});
+
+export const listInventory = query({
+  args: inventoryListArgs,
+  handler: async (ctx, args) => {
+    const { spaceIds: requestedSpaceIds, ...rest } = args;
+    const principal = await requireMcpPrincipal(ctx);
+    const spaceIds = await getAuthorizedReadSpaceIds(
+      ctx,
+      principal,
+      requestedSpaceIds,
+    );
+    return await listInventoryRows(ctx, spaceIds, rest);
   },
 });

@@ -3,6 +3,7 @@ import { describe, expect, test } from "vitest";
 
 import schema from "../../schema";
 import { modules } from "../../test.setup";
+import { listInventory } from "./inventory";
 import { appendWorkerScanPage, beginWorkerScan } from "../workers/model";
 import { parseWorkerRequest, type FsDiscoveryEntry } from "../workers/protocol";
 
@@ -126,7 +127,39 @@ async function fixture() {
       spaceIds: [spaceId],
       sourceAccountIds: [sourceAccountId],
     });
-    return { userId, spaceId, sourceAccountId, credentialId };
+    // A second space and account this fixture's reader does not belong to,
+    // for the "non-member space refused" read test.
+    const otherUserId = await ctx.db.insert("users", {
+      name: "Other space owner",
+    });
+    const otherSpaceId = await ctx.db.insert("spaces", {
+      kind: "personal",
+      name: "Other synthetic space",
+      createdBy: otherUserId,
+    });
+    await ctx.db.insert("spaceMembers", {
+      spaceId: otherSpaceId,
+      userId: otherUserId,
+      role: "owner",
+    });
+    const otherSourceAccountId = await ctx.db.insert("sourceAccounts", {
+      spaceId: otherSpaceId,
+      connector: "fs",
+      accountId: "other-fs",
+      name: "Other filesystem",
+      enabled: true,
+      cursorVersion: 0,
+      freshnessMs: 60_000,
+      createdBy: otherUserId,
+    });
+    return {
+      userId,
+      spaceId,
+      sourceAccountId,
+      credentialId,
+      otherSpaceId,
+      otherSourceAccountId,
+    };
   });
   return {
     t,
@@ -283,5 +316,139 @@ describe("sourceInventory", () => {
       expect(row.firstSeenScanId).toBe(firstSeen.get(row.fileName));
       expect(row.lastSeenScanId).toBe(scanB.scanId);
     }
+  });
+});
+
+describe("listInventory", () => {
+  async function seededInventory() {
+    const f = await fixture();
+    const scan = await begin(f, "scan-1", 0, 1_000);
+    await appendAll(f, scan.scanId, "scan-1-page", SYNTHETIC_TREE, 1_100);
+    return f;
+  }
+
+  test("finds a present file by exact name, never content indexed", async () => {
+    const f = await seededInventory();
+    const result = await f.t.run((ctx) =>
+      listInventory(ctx, [f.spaceId], {
+        sourceAccountId: f.sourceAccountId,
+        fileName: "q1.pdf",
+      }),
+    );
+    expect(result.rows).toHaveLength(1);
+    expect(result.rows[0]).toMatchObject({
+      fileName: "q1.pdf",
+      folderPath: "reports",
+      contentIndexed: false,
+      exclusionReason: "extraction_pending",
+    });
+    expect(result.isDone).toBe(true);
+    expect(result.counts).toMatchObject({ total: 1, truncated: false });
+  });
+
+  test("lists a folder paged with counts that survive truncation", async () => {
+    const f = await seededInventory();
+    const firstPage = await f.t.run((ctx) =>
+      listInventory(ctx, [f.spaceId], {
+        sourceAccountId: f.sourceAccountId,
+        folderPath: "reports",
+        limit: 5,
+      }),
+    );
+    expect(firstPage.rows).toHaveLength(5);
+    expect(firstPage.isDone).toBe(false);
+    expect(firstPage.cursor).toBeDefined();
+    // The folder holds all 10 synthetic files; counts report the whole
+    // folder even though this page only carries 5 rows, so a truncated page
+    // is never mistaken for a complete folder.
+    expect(firstPage.counts.total).toBe(SYNTHETIC_TREE.length);
+    expect(firstPage.counts.truncated).toBe(false);
+    const reasonTotal = Object.values(firstPage.counts.byExclusionReason).reduce(
+      (sum, count) => sum + count,
+      0,
+    );
+    expect(reasonTotal + firstPage.counts.contentIndexed).toBe(
+      SYNTHETIC_TREE.length,
+    );
+    expect(firstPage.counts.byExclusionReason.unsupported).toBe(4);
+
+    const secondPage = await f.t.run((ctx) =>
+      listInventory(ctx, [f.spaceId], {
+        sourceAccountId: f.sourceAccountId,
+        folderPath: "reports",
+        limit: 5,
+        cursor: firstPage.cursor,
+      }),
+    );
+    expect(secondPage.rows).toHaveLength(5);
+    expect(secondPage.isDone).toBe(true);
+    expect(secondPage.cursor).toBeUndefined();
+    const allFileNames = new Set(
+      [...firstPage.rows, ...secondPage.rows].map((row) => row.fileName),
+    );
+    expect(allFileNames.size).toBe(SYNTHETIC_TREE.length);
+  });
+
+  test("filters to one exclusion reason", async () => {
+    const f = await seededInventory();
+    const result = await f.t.run((ctx) =>
+      listInventory(ctx, [f.spaceId], {
+        sourceAccountId: f.sourceAccountId,
+        exclusionReason: "unsupported",
+      }),
+    );
+    expect(result.rows).toHaveLength(4);
+    expect(
+      result.rows.every((row) => row.exclusionReason === "unsupported"),
+    ).toBe(true);
+    expect(result.counts.total).toBe(4);
+    expect(result.counts.byExclusionReason).toEqual({ unsupported: 4 });
+  });
+
+  test("lists a duplicate group by the group id of one of its members", async () => {
+    const f = await seededInventory();
+    const named = await f.t.run((ctx) =>
+      listInventory(ctx, [f.spaceId], {
+        sourceAccountId: f.sourceAccountId,
+        fileName: "dup-a.txt",
+      }),
+    );
+    const groupId = named.rows[0]!.duplicateGroupId!;
+    expect(groupId).toBeDefined();
+
+    const group = await f.t.run((ctx) =>
+      listInventory(ctx, [f.spaceId], {
+        sourceAccountId: f.sourceAccountId,
+        duplicateGroupId: groupId,
+      }),
+    );
+    expect(group.rows.map((row) => row.fileName).sort()).toEqual([
+      "dup-a.txt",
+      "dup-b.txt",
+    ]);
+    const reasons = group.rows.map((row) => row.exclusionReason).sort();
+    expect(reasons).toEqual(["duplicate_of", "extraction_pending"]);
+    expect(group.counts.total).toBe(2);
+  });
+
+  test("refuses a source account outside the caller's authorized spaces", async () => {
+    const f = await seededInventory();
+    // The caller is only authorized for f.spaceId; f.otherSourceAccountId
+    // belongs to f.otherSpaceId, so this must read as empty rather than
+    // trusting the caller-supplied sourceAccountId on its own.
+    const result = await f.t.run((ctx) =>
+      listInventory(ctx, [f.spaceId], {
+        sourceAccountId: f.otherSourceAccountId,
+        folderPath: "reports",
+      }),
+    );
+    expect(result.rows).toEqual([]);
+    expect(result.isDone).toBe(true);
+    expect(result.counts).toEqual({
+      total: 0,
+      contentIndexed: 0,
+      byExclusionReason: {},
+      truncated: false,
+    });
   });
 });

@@ -1,8 +1,15 @@
 import type { Doc, Id } from "../../_generated/dataModel";
-import type { MutationCtx } from "../../_generated/server";
+import type { MutationCtx, QueryCtx } from "../../_generated/server";
+import { boundedLimit, validateSpaces } from "./model";
 import { sha256Utf8 } from "../provenance/model";
 import type { FsDiscoveryEntry } from "../workers/protocol";
 import type { SourceInventoryExclusionReason } from "./inventoryTables";
+
+// Bounded scan for the exclusion-reason breakdown (section 2.6: "The response
+// always carries counts ... for the selected scope, so a truncated page never
+// reads as a complete folder"). Matches the MAX_QUERY_SCAN_ROWS bound records
+// reads already use for this shape of honest, bounded aggregate.
+const MAX_INVENTORY_COUNT_ROWS = 256;
 
 /**
  * `entry.uri` is already validated by `parseWorkerRequest`'s `canonicalFsUri`
@@ -174,4 +181,203 @@ export async function upsertSourceInventoryRow(
   if (groupId !== undefined) {
     await reconcileDuplicateGroup(ctx, spaceId, groupId);
   }
+}
+
+/**
+ * Section 2.6 read surface. Exactly one of `fileName`, `folderPath`,
+ * `exclusionReason` or `duplicateGroupId` may be given, each answering one of
+ * the four question shapes in section 1: is this file present, what is in
+ * this folder, what was excluded and why, and which files are duplicates.
+ * Every existing index requires `sourceAccountId`, which `duplicateGroupId`
+ * already embeds (see `duplicateGroupId()` above), so this read takes it as a
+ * required scope rather than fanning a filter out across every account in a
+ * space.
+ */
+export type InventoryListArgs = {
+  sourceAccountId: Id<"sourceAccounts">;
+  fileName?: string;
+  folderPath?: string;
+  exclusionReason?: SourceInventoryExclusionReason;
+  duplicateGroupId?: string;
+  cursor?: string;
+  limit?: number;
+};
+
+type InventoryScopeFilter = Pick<
+  InventoryListArgs,
+  "fileName" | "folderPath" | "exclusionReason" | "duplicateGroupId"
+>;
+
+function scopedInventoryQuery(
+  ctx: Pick<QueryCtx, "db">,
+  spaceId: Id<"spaces">,
+  sourceAccountId: Id<"sourceAccounts">,
+  filter: InventoryScopeFilter,
+) {
+  if (filter.duplicateGroupId !== undefined) {
+    return ctx.db
+      .query("sourceInventory")
+      .withIndex("by_space_duplicateGroup", (q) =>
+        q
+          .eq("spaceId", spaceId)
+          .eq("duplicateGroupId", filter.duplicateGroupId!),
+      );
+  }
+  if (filter.fileName !== undefined) {
+    return ctx.db
+      .query("sourceInventory")
+      .withIndex("by_space_account_fileName", (q) =>
+        q
+          .eq("spaceId", spaceId)
+          .eq("sourceAccountId", sourceAccountId)
+          .eq("fileName", filter.fileName!),
+      );
+  }
+  if (filter.exclusionReason !== undefined) {
+    return ctx.db
+      .query("sourceInventory")
+      .withIndex("by_space_account_exclusionReason", (q) =>
+        q
+          .eq("spaceId", spaceId)
+          .eq("sourceAccountId", sourceAccountId)
+          .eq("exclusionReason", filter.exclusionReason!),
+      );
+  }
+  if (filter.folderPath !== undefined) {
+    return ctx.db
+      .query("sourceInventory")
+      .withIndex("by_space_account_folder", (q) =>
+        q
+          .eq("spaceId", spaceId)
+          .eq("sourceAccountId", sourceAccountId)
+          .eq("folderPath", filter.folderPath!),
+      );
+  }
+  return ctx.db
+    .query("sourceInventory")
+    .withIndex("by_space_account_folder", (q) =>
+      q.eq("spaceId", spaceId).eq("sourceAccountId", sourceAccountId),
+    );
+}
+
+function projectInventoryRow(row: Doc<"sourceInventory">) {
+  return {
+    inventoryId: row._id,
+    sourceAccountId: row.sourceAccountId,
+    fileName: row.fileName,
+    relativePath: row.relativePath,
+    folderPath: row.folderPath,
+    byteLength: row.byteLength,
+    contentHash: row.contentHash,
+    mediaType: row.mediaType,
+    modifiedAt: row.modifiedAt,
+    contentIndexed: row.contentIndexed,
+    exclusionReason: row.exclusionReason,
+    duplicateGroupId: row.duplicateGroupId,
+  };
+}
+
+type InventoryCounts = {
+  total: number;
+  contentIndexed: number;
+  byExclusionReason: Partial<Record<SourceInventoryExclusionReason, number>>;
+  truncated: boolean;
+};
+
+function emptyCounts(): InventoryCounts {
+  return {
+    total: 0,
+    contentIndexed: 0,
+    byExclusionReason: {},
+    truncated: false,
+  };
+}
+
+async function inventoryScopeCounts(
+  ctx: Pick<QueryCtx, "db">,
+  spaceId: Id<"spaces">,
+  sourceAccountId: Id<"sourceAccounts">,
+  filter: InventoryScopeFilter,
+): Promise<InventoryCounts> {
+  const rows = (
+    await scopedInventoryQuery(ctx, spaceId, sourceAccountId, filter).take(
+      MAX_INVENTORY_COUNT_ROWS + 1,
+    )
+  ).filter((row) => row.sourceAccountId === sourceAccountId);
+  const truncated = rows.length > MAX_INVENTORY_COUNT_ROWS;
+  const counted = rows.slice(0, MAX_INVENTORY_COUNT_ROWS);
+  const byExclusionReason: Partial<Record<SourceInventoryExclusionReason, number>> =
+    {};
+  let contentIndexed = 0;
+  for (const row of counted) {
+    if (row.exclusionReason === undefined) {
+      contentIndexed += 1;
+    } else {
+      byExclusionReason[row.exclusionReason] =
+        (byExclusionReason[row.exclusionReason] ?? 0) + 1;
+    }
+  }
+  return { total: counted.length, contentIndexed, byExclusionReason, truncated };
+}
+
+/**
+ * Space-scoped inventory read. `spaceIds` must already be the caller's
+ * membership-checked authorized set (from `getAuthorizedReadSpaceIds`), the
+ * same convention every other document read in this module family uses;
+ * this function never trusts a caller-supplied space on its own. An
+ * unauthorized or unknown `sourceAccountId` reads as empty, the same
+ * non-enumerating behavior `listSources` uses for the same input shape.
+ */
+export async function listInventory(
+  ctx: Pick<QueryCtx, "db">,
+  spaceIds: readonly Id<"spaces">[],
+  args: InventoryListArgs,
+) {
+  validateSpaces(spaceIds);
+  const limit = boundedLimit(args.limit);
+  const filterCount = [
+    args.fileName,
+    args.folderPath,
+    args.exclusionReason,
+    args.duplicateGroupId,
+  ].filter((value) => value !== undefined).length;
+  if (filterCount > 1) {
+    throw new Error(
+      "Inventory reads accept at most one of fileName, folderPath, exclusionReason, duplicateGroupId",
+    );
+  }
+
+  const authorized = new Set(spaceIds);
+  const account = await ctx.db.get(args.sourceAccountId);
+  if (!account || !authorized.has(account.spaceId)) {
+    return {
+      rows: [],
+      cursor: undefined,
+      isDone: true,
+      counts: emptyCounts(),
+    };
+  }
+
+  const page = await scopedInventoryQuery(
+    ctx,
+    account.spaceId,
+    account._id,
+    args,
+  ).paginate({ cursor: args.cursor ?? null, numItems: limit });
+  const rows = page.page
+    .filter((row) => row.sourceAccountId === account._id)
+    .map(projectInventoryRow);
+  const counts = await inventoryScopeCounts(
+    ctx,
+    account.spaceId,
+    account._id,
+    args,
+  );
+
+  return {
+    rows,
+    cursor: page.isDone ? undefined : page.continueCursor,
+    isDone: page.isDone,
+    counts,
+  };
 }
