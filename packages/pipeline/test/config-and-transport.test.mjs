@@ -609,6 +609,37 @@ test("transport response parser rejects extra and malformed success fields", () 
   );
 });
 
+test("scan append accepts optional epochs on needs_review and ignored_forgotten entries", () => {
+  const page = {
+    operation: "scan.appendPage",
+    scanId: "scan",
+    ordinal: 0,
+    reused: false,
+    entries: [
+      {
+        state: "needs_review",
+        sourceItemId: "review-item",
+        observationEpoch: 2,
+        processingEpoch: 3,
+      },
+      { state: "ignored_forgotten", sourceItemId: "forgotten-item" },
+    ],
+  };
+  assert.equal(
+    parseWorkerResponse(JSON.stringify(page), "scan.appendPage").operation,
+    "scan.appendPage",
+  );
+  assert.throws(() =>
+    parseWorkerResponse(
+      JSON.stringify({
+        ...page,
+        entries: [{ ...page.entries[0], observationEpoch: 1.5 }],
+      }),
+      "scan.appendPage",
+    ),
+  );
+});
+
 test("strict response parsing rejects malformed status, assessment, and lease targets", () => {
   const baseStatus = {
     operation: "source.status",
