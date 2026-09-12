@@ -26,10 +26,29 @@ test("config accepts only bounded absolute worker config", () => {
     journalDir: "/tmp/journal",
   });
   assert.equal(config.maxFiles, 256);
+  assert.equal(config.assessmentPacingMs, undefined);
   assert.throws(() => validateEndpoint("http://example.test/api/worker"));
   assert.throws(() =>
     parseConfig({ ...config, roots: [{ alias: "notes", path: "relative" }] }),
   );
+});
+
+test("config accepts a bounded assessment pacing delay", () => {
+  const base = {
+    protocolVersion: 1,
+    endpoint: "http://127.0.0.1:3100/api/worker",
+    spaceId: "space_1",
+    sourceAccountId: "source_1",
+    credentialEnv: "PIPELINE_TOKEN",
+    roots: [{ alias: "notes", path: "/tmp/notes" }],
+    journalDir: "/tmp/journal",
+  };
+  assert.equal(
+    parseConfig({ ...base, assessmentPacingMs: 250 }).assessmentPacingMs,
+    250,
+  );
+  assert.throws(() => parseConfig({ ...base, assessmentPacingMs: -1 }));
+  assert.throws(() => parseConfig({ ...base, assessmentPacingMs: 300_001 }));
 });
 
 test("config accepts only bounded normalized exact-file roots", () => {

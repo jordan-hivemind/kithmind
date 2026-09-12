@@ -204,7 +204,10 @@ function recipient(value: unknown, label: string): string {
 
 function remoteRootPath(
   value: unknown,
-  { minSegments = 2, label = "rclone repository rootPath" }: {
+  {
+    minSegments = 2,
+    label = "rclone repository rootPath",
+  }: {
     minSegments?: 1 | 2;
     label?: string;
   } = {},
@@ -216,10 +219,15 @@ function remoteRootPath(
     segments.length < minSegments ||
     !/^[A-Za-z0-9 _.-]+(?:\/[A-Za-z0-9 _.-]+)*$/.test(path) ||
     /[:\\]/.test(path) ||
-    segments.some((segment) =>
-      !segment || segment === "." || segment === ".." || segment.trim() !== segment
+    segments.some(
+      (segment) =>
+        !segment ||
+        segment === "." ||
+        segment === ".." ||
+        segment.trim() !== segment,
     )
-  ) fail(`${label} is invalid`);
+  )
+    fail(`${label} is invalid`);
   return path;
 }
 
@@ -299,7 +307,14 @@ function pdfDocQa(value: unknown, roots: RootConfig[], journalDir: string) {
   const input = object(value, "pdfDocQa");
   exact(
     input,
-    ["captureDirectory", "parserOutputRoot", "spoolDirectory", "parser", "profile", "archive"],
+    [
+      "captureDirectory",
+      "parserOutputRoot",
+      "spoolDirectory",
+      "parser",
+      "profile",
+      "archive",
+    ],
     ["providerOriginal"],
   );
   const captureDirectory = absolutePath(
@@ -486,26 +501,64 @@ function pdfDocQa(value: unknown, roots: RootConfig[], journalDir: string) {
     "storageFailureDomainFingerprint",
   ] as const;
   const remoteInput = Object.hasOwn(backupInput, "repository")
-    ? object(backupInput.repository, "pdfDocQa.archive.independentBackup.repository")
+    ? object(
+        backupInput.repository,
+        "pdfDocQa.archive.independentBackup.repository",
+      )
     : undefined;
-  exact(backupInput, [...commonBackupFields, remoteInput ? "repository" : "repositoryPath"]);
+  exact(backupInput, [
+    ...commonBackupFields,
+    remoteInput ? "repository" : "repositoryPath",
+  ]);
   const repository = remoteInput
     ? (() => {
-        exact(remoteInput, ["kind", "remoteName", "rootPath", "rcloneBinary", "configPath", "configIdentityFingerprint", "expectedRootDirectoryIdHash"]);
-        if (remoteInput.kind !== "rclone_dropbox_v1") fail("rclone repository kind is invalid");
-        const remoteName = profileText(remoteInput.remoteName, "rclone repository remoteName");
-        if (!RCLONE_REMOTE.test(remoteName)) fail("rclone remoteName is invalid");
-        return { repository: {
-          kind: "rclone_dropbox_v1" as const,
-          remoteName,
-          rootPath: remoteRootPath(remoteInput.rootPath),
-          rcloneBinary: absolutePath(remoteInput.rcloneBinary, "rclone repository rcloneBinary"),
-          configPath: absolutePath(remoteInput.configPath, "rclone repository configPath"),
-          configIdentityFingerprint: sha256(remoteInput.configIdentityFingerprint, "rclone repository configIdentityFingerprint"),
-          expectedRootDirectoryIdHash: sha256(remoteInput.expectedRootDirectoryIdHash, "rclone repository expectedRootDirectoryIdHash"),
-        }};
+        exact(remoteInput, [
+          "kind",
+          "remoteName",
+          "rootPath",
+          "rcloneBinary",
+          "configPath",
+          "configIdentityFingerprint",
+          "expectedRootDirectoryIdHash",
+        ]);
+        if (remoteInput.kind !== "rclone_dropbox_v1")
+          fail("rclone repository kind is invalid");
+        const remoteName = profileText(
+          remoteInput.remoteName,
+          "rclone repository remoteName",
+        );
+        if (!RCLONE_REMOTE.test(remoteName))
+          fail("rclone remoteName is invalid");
+        return {
+          repository: {
+            kind: "rclone_dropbox_v1" as const,
+            remoteName,
+            rootPath: remoteRootPath(remoteInput.rootPath),
+            rcloneBinary: absolutePath(
+              remoteInput.rcloneBinary,
+              "rclone repository rcloneBinary",
+            ),
+            configPath: absolutePath(
+              remoteInput.configPath,
+              "rclone repository configPath",
+            ),
+            configIdentityFingerprint: sha256(
+              remoteInput.configIdentityFingerprint,
+              "rclone repository configIdentityFingerprint",
+            ),
+            expectedRootDirectoryIdHash: sha256(
+              remoteInput.expectedRootDirectoryIdHash,
+              "rclone repository expectedRootDirectoryIdHash",
+            ),
+          },
+        };
       })()
-    : { repositoryPath: absolutePath(backupInput.repositoryPath, "pdfDocQa.archive.independentBackup.repositoryPath") };
+    : {
+        repositoryPath: absolutePath(
+          backupInput.repositoryPath,
+          "pdfDocQa.archive.independentBackup.repositoryPath",
+        ),
+      };
   const independentBackup = {
     directory: absolutePath(
       backupInput.directory,
@@ -547,38 +600,75 @@ function pdfDocQa(value: unknown, roots: RootConfig[], journalDir: string) {
   if (primary.recipient === independentBackup.recipient) {
     fail("pdfDocQa archive recipients must differ");
   }
-  const providerOriginal = input.providerOriginal === undefined
-    ? undefined
-    : (() => {
-        const provider = object(input.providerOriginal, "pdfDocQa.providerOriginal");
-        exact(provider, ["rootAlias", "providerRootDirectoryId", "providerAccountIdHash", "providerRootDirectoryIdHash", "refreshPath", "registryDirectory"]);
-        const rootAlias = string(provider.rootAlias, "pdfDocQa.providerOriginal.rootAlias");
-        if (!ROOT_ALIAS.test(rootAlias) || !roots.some((root) => root.alias === rootAlias)) fail("pdfDocQa provider rootAlias is invalid");
-        const rootId = string(provider.providerRootDirectoryId, "pdfDocQa.providerOriginal.providerRootDirectoryId");
-        if (!/^id:[A-Za-z0-9_-]{1,256}$/.test(rootId)) fail("pdfDocQa provider root ID is invalid");
-        const rootHash = sha256(provider.providerRootDirectoryIdHash, "pdfDocQa.providerOriginal.providerRootDirectoryIdHash");
-        if (createHash("sha256").update(rootId).digest("hex") !== rootHash) fail("pdfDocQa provider root identity mismatch");
-        return {
-          rootAlias,
-          providerRootDirectoryId: rootId,
-          providerAccountIdHash: sha256(provider.providerAccountIdHash, "pdfDocQa.providerOriginal.providerAccountIdHash"),
-          providerRootDirectoryIdHash: rootHash,
-          refreshPath: remoteRootPath(provider.refreshPath, {
-            minSegments: 1,
-            label: "pdfDocQa.providerOriginal.refreshPath",
-          }),
-          registryDirectory: absolutePath(provider.registryDirectory, "pdfDocQa.providerOriginal.registryDirectory"),
-        };
-      })();
-  if (providerOriginal !== undefined && !("repository" in independentBackup)) fail("pdfDocQa provider original requires remote independent backup");
+  const providerOriginal =
+    input.providerOriginal === undefined
+      ? undefined
+      : (() => {
+          const provider = object(
+            input.providerOriginal,
+            "pdfDocQa.providerOriginal",
+          );
+          exact(provider, [
+            "rootAlias",
+            "providerRootDirectoryId",
+            "providerAccountIdHash",
+            "providerRootDirectoryIdHash",
+            "refreshPath",
+            "registryDirectory",
+          ]);
+          const rootAlias = string(
+            provider.rootAlias,
+            "pdfDocQa.providerOriginal.rootAlias",
+          );
+          if (
+            !ROOT_ALIAS.test(rootAlias) ||
+            !roots.some((root) => root.alias === rootAlias)
+          )
+            fail("pdfDocQa provider rootAlias is invalid");
+          const rootId = string(
+            provider.providerRootDirectoryId,
+            "pdfDocQa.providerOriginal.providerRootDirectoryId",
+          );
+          if (!/^id:[A-Za-z0-9_-]{1,256}$/.test(rootId))
+            fail("pdfDocQa provider root ID is invalid");
+          const rootHash = sha256(
+            provider.providerRootDirectoryIdHash,
+            "pdfDocQa.providerOriginal.providerRootDirectoryIdHash",
+          );
+          if (createHash("sha256").update(rootId).digest("hex") !== rootHash)
+            fail("pdfDocQa provider root identity mismatch");
+          return {
+            rootAlias,
+            providerRootDirectoryId: rootId,
+            providerAccountIdHash: sha256(
+              provider.providerAccountIdHash,
+              "pdfDocQa.providerOriginal.providerAccountIdHash",
+            ),
+            providerRootDirectoryIdHash: rootHash,
+            refreshPath: remoteRootPath(provider.refreshPath, {
+              minSegments: 1,
+              label: "pdfDocQa.providerOriginal.refreshPath",
+            }),
+            registryDirectory: absolutePath(
+              provider.registryDirectory,
+              "pdfDocQa.providerOriginal.registryDirectory",
+            ),
+          };
+        })();
+  if (providerOriginal !== undefined && !("repository" in independentBackup))
+    fail("pdfDocQa provider original requires remote independent backup");
   const privatePaths = [
     captureDirectory,
     parserOutputRoot,
     spoolDirectory,
     primary.directory,
     independentBackup.directory,
-    ...("repositoryPath" in independentBackup ? [independentBackup.repositoryPath] : []),
-    ...(providerOriginal === undefined ? [] : [providerOriginal.registryDirectory]),
+    ...("repositoryPath" in independentBackup
+      ? [independentBackup.repositoryPath]
+      : []),
+    ...(providerOriginal === undefined
+      ? []
+      : [providerOriginal.registryDirectory]),
   ];
   for (let left = 0; left < privatePaths.length; left += 1) {
     for (let right = left + 1; right < privatePaths.length; right += 1) {
@@ -610,7 +700,9 @@ function pdfDocQa(value: unknown, roots: RootConfig[], journalDir: string) {
     absolutePath(archiveInput.ageBinary, "pdfDocQa.archive.ageBinary"),
     independentBackup.resticBinary,
     independentBackup.passwordCommand.executable,
-    ...("repository" in independentBackup ? [independentBackup.repository.rcloneBinary] : []),
+    ...("repository" in independentBackup
+      ? [independentBackup.repository.rcloneBinary]
+      : []),
   ];
   for (const path of executablePaths) {
     if (
@@ -624,9 +716,14 @@ function pdfDocQa(value: unknown, roots: RootConfig[], journalDir: string) {
   if (
     "repository" in independentBackup &&
     (containsPath(journalDir, independentBackup.repository.configPath) ||
-      roots.some((root) => containsPath(root.path, independentBackup.repository.configPath)) ||
-      privatePaths.some((path) => containsPath(path, independentBackup.repository.configPath)))
-  ) fail("pdfDocQa credential config path must not be in writable roots");
+      roots.some((root) =>
+        containsPath(root.path, independentBackup.repository.configPath),
+      ) ||
+      privatePaths.some((path) =>
+        containsPath(path, independentBackup.repository.configPath),
+      ))
+  )
+    fail("pdfDocQa credential config path must not be in writable roots");
   return {
     captureDirectory,
     parserOutputRoot,
@@ -681,6 +778,7 @@ export function parseConfig(value: unknown): PipelineConfig {
     "maxFiles",
     "maxDepth",
     "maxFileBytes",
+    "assessmentPacingMs",
     "pdfDocQa",
   ]);
   for (const key of Object.keys(source))
@@ -771,6 +869,16 @@ export function parseConfig(value: unknown): PipelineConfig {
       1,
       65_536,
     ),
+    ...(source.assessmentPacingMs === undefined
+      ? {}
+      : {
+          assessmentPacingMs: integer(
+            source.assessmentPacingMs,
+            "assessmentPacingMs",
+            0,
+            300_000,
+          ),
+        }),
     ...(pdf === undefined ? {} : { pdfDocQa: pdf }),
   };
 }

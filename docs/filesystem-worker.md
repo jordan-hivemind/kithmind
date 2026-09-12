@@ -130,16 +130,32 @@ The initial default waits five minutes between completed passes. Set
 `watchIntervalMs` in local configuration to change that interval. Passes do not
 overlap; this is a configurable starting point, not a measured latency target.
 
-| Setting           | Default | Allowed range                   |
-| ----------------- | ------- | ------------------------------- |
-| `watchIntervalMs` | 300,000 | 1,000 to 3,600,000 milliseconds |
-| `maxFiles`        | 256     | 1 to 256 files per pass         |
-| `maxDepth`        | 16      | 1 to 64 directory levels        |
-| `maxFileBytes`    | 65,536  | 1 to 65,536 bytes per file      |
+| Setting              | Default | Allowed range                   |
+| -------------------- | ------- | ------------------------------- |
+| `watchIntervalMs`    | 300,000 | 1,000 to 3,600,000 milliseconds |
+| `maxFiles`           | 256     | 1 to 256 files per pass         |
+| `maxDepth`           | 16      | 1 to 64 directory levels        |
+| `maxFileBytes`       | 65,536  | 1 to 65,536 bytes per file      |
+| `assessmentPacingMs` | unset   | 0 to 300,000 milliseconds       |
 
 Traversal also stops after 4,096 visited filesystem entries. This initial
 worker does not split an oversized folder into multiple scans. Journal and
 request byte limits can stop a pass independently of the file-count limit.
+
+### Server mutation rate limits
+
+The server bounds how many mutations a worker credential can send per
+rolling window. If a mutation comes back `rate_limited`, the worker waits
+with bounded exponential backoff (spanning the window, up to 8 attempts) and
+retries automatically before giving up; the run then fails cleanly and the
+next invocation resumes with a fresh pass. No configuration is needed for
+this retry.
+
+A bounded backfill that assesses many pages in a burst can still bounce off
+the limit faster than backoff alone smooths out. Set `assessmentPacingMs` to
+add a minimum delay between consecutive `processing.assessPage` requests
+within a pass, trading wall-clock time for staying under the limit instead
+of retrying into it.
 
 ## Identity and recovery
 

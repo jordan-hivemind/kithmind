@@ -134,6 +134,37 @@ const MAX_ASSESSMENT_PAGES = 4_096;
 const LEASE_SAFETY_MARGIN_MS = 30_000;
 const MAX_ARCHIVED_RESERVATION_ROUNDS = 64;
 
+/**
+ * Mirrors `WORKER_MUTATION_RATE_WINDOW_MS` in
+ * packages/convex/convex/models/workers/rateLimit.ts. The worker protocol
+ * error carries only a `code` today, not a retry-after hint, so a
+ * rate-limited mutation always backs off against this fixed window.
+ *
+ * ponytail: if the server ever starts returning a retry hint on
+ * `rate_limited`, prefer it over this constant in `rateLimitBackoffMs`.
+ */
+const WORKER_MUTATION_RATE_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX_ATTEMPTS = 8;
+
+type RateLimitBackoff = { windowMs: number; maxAttempts: number };
+const DEFAULT_RATE_LIMIT_BACKOFF: RateLimitBackoff = {
+  windowMs: WORKER_MUTATION_RATE_WINDOW_MS,
+  maxAttempts: RATE_LIMIT_MAX_ATTEMPTS,
+};
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Exponential backoff whose `maxAttempts` waits sum to ~`windowMs`. */
+function rateLimitBackoffMs(
+  attempt: number,
+  { windowMs, maxAttempts }: RateLimitBackoff,
+): number {
+  const shares = 2 ** maxAttempts - 1;
+  return Math.max(1, Math.round((windowMs * 2 ** (attempt - 1)) / shares));
+}
+
 const SAFE_PARSER_FAILURE_CODES = new Set([
   "unsupported_platform",
   "invalid_input",
@@ -847,7 +878,42 @@ export class PipelineRunner {
     private readonly config: PipelineConfig,
     private readonly journal: Journal<RunnerCheckpoint, JsonValue>,
     private readonly transport: WorkerTransport,
+    private readonly rateLimitBackoff: RateLimitBackoff = DEFAULT_RATE_LIMIT_BACKOFF,
   ) {}
+
+  /**
+   * Sends a worker mutation and, on a `rate_limited` response, waits with
+   * bounded exponential backoff (spanning the server's mutation rate-limit
+   * window) and retries before giving the caller a final answer. This is
+   * the single place that handles `rate_limited`; every driver phase below
+   * just treats a `rate_limited` response the same as any other terminal
+   * error code, because by the time one reaches them, retries here are
+   * already exhausted.
+   */
+  private async callWithRateLimitBackoff(
+    body: Record<string, unknown>,
+  ): Promise<WorkerResponse> {
+    let response = await this.transport.call(body);
+    for (
+      let attempt = 1;
+      errorCode(response) === "rate_limited" &&
+      attempt < this.rateLimitBackoff.maxAttempts;
+      attempt += 1
+    ) {
+      const waitMs = rateLimitBackoffMs(attempt, this.rateLimitBackoff);
+      console.warn(
+        `[pipeline] worker mutation rate limited (attempt ${attempt}/${this.rateLimitBackoff.maxAttempts}); retrying in ${waitMs}ms`,
+      );
+      await sleep(waitMs);
+      response = await this.transport.call(body);
+    }
+    if (errorCode(response) === "rate_limited") {
+      console.warn(
+        `[pipeline] worker mutation still rate limited after ${this.rateLimitBackoff.maxAttempts} attempts; failing this run. The journal records a terminal outcome, and the next invocation resumes the pass normally.`,
+      );
+    }
+    return response;
+  }
 
   private requirePdfConfig(): NonNullable<PipelineConfig["pdfDocQa"]> {
     if (!this.config.pdfDocQa) {
@@ -1731,7 +1797,7 @@ export class PipelineRunner {
       }
       const parsed = JSON.parse(requestBody) as Record<string, unknown>;
       await this.validatePendingBody(exactOperation, parsed);
-      return await this.transport.call(parsed);
+      return await this.callWithRateLimitBackoff(parsed);
     };
     const nextCheckpoint = async ({
       checkpoint,
@@ -1849,9 +1915,7 @@ export class PipelineRunner {
         const value = success(response);
         if (!value) {
           const code = errorCode(response)!;
-          return code === "rate_limited"
-            ? current
-            : plannedTerminal(current, code);
+          return plannedTerminal(current, code);
         }
         const scanId = text(value.scanId, "scan_id");
         if (value.state !== "open") {
@@ -1924,9 +1988,7 @@ export class PipelineRunner {
         const value = success(response);
         if (!value) {
           const code = errorCode(response)!;
-          return code === "rate_limited"
-            ? current
-            : scanTerminal(current, "failed", code, true);
+          return scanTerminal(current, "failed", code, true);
         }
         const page = records(value.page, "inventory_page");
         const nextPageCount = current.pageCount + 1;
@@ -2036,9 +2098,7 @@ export class PipelineRunner {
         const value = success(response);
         if (!value) {
           const code = errorCode(response)!;
-          return code === "rate_limited"
-            ? current
-            : scanTerminal(current, "failed", code, true);
+          return scanTerminal(current, "failed", code, true);
         }
         if (
           value.scanId !== current.scanId ||
@@ -2186,9 +2246,7 @@ export class PipelineRunner {
         const value = success(response);
         if (!value) {
           const code = errorCode(response)!;
-          return code === "rate_limited"
-            ? current
-            : scanTerminal(current, "failed", code, true);
+          return scanTerminal(current, "failed", code, true);
         }
         if (value.scanId !== current.scanId) {
           throw new PipelineWorkerError("scan_seal_parent_conflict");
@@ -2243,9 +2301,7 @@ export class PipelineRunner {
         const value = success(response);
         if (!value) {
           const code = errorCode(response)!;
-          return code === "rate_limited"
-            ? current
-            : scanTerminal(current, "failed", code, true);
+          return scanTerminal(current, "failed", code, true);
         }
         if (value.scanId !== current.scanId) {
           throw new PipelineWorkerError("reconcile_parent_conflict");
@@ -2316,9 +2372,7 @@ export class PipelineRunner {
         const value = success(response);
         if (!value) {
           const code = errorCode(response)!;
-          return code === "rate_limited"
-            ? current
-            : scanTerminal(current, "failed", code, true);
+          return scanTerminal(current, "failed", code, true);
         }
         const targets = records(
           value.targets,
@@ -2457,9 +2511,7 @@ export class PipelineRunner {
           ) {
             return scanTerminal(current, "failed", code, true);
           }
-          return code === "rate_limited"
-            ? current
-            : scanTerminal(current, "failed", code, true);
+          return scanTerminal(current, "failed", code, true);
         }
         const activeTarget = current.targets[current.index];
         if (
@@ -2826,14 +2878,11 @@ export class PipelineRunner {
       const fresh = asWorkerResponse(
         parseDurableResult(
           "discovery.preflightArchived",
-          await this.transport.call(parsedBody),
+          await this.callWithRateLimitBackoff(parsedBody),
         ),
       );
       const freshError = errorCode(fresh);
       if (freshError) {
-        if (freshError === "rate_limited") {
-          throw new PipelineWorkerError(freshError);
-        }
         await this.journal.commitResult({
           checkpoint: scanTerminal(checkpoint, "failed", freshError, true),
           credentialSessionActive: true,
@@ -2864,9 +2913,7 @@ export class PipelineRunner {
         }
         const code = errorCode(response);
         if (code) {
-          return code === "rate_limited"
-            ? current
-            : scanTerminal(current, "failed", code, true);
+          return scanTerminal(current, "failed", code, true);
         }
         const value = object(response, "discovery.preflightArchived");
         const plan = this.archivedPlan(current);
@@ -3153,8 +3200,7 @@ export class PipelineRunner {
         catalogId: original.originalCatalogId,
         expectedRevision: original.rowRevision,
         verified: {
-          providerAccountIdHash:
-            loaded.verified.metadata.providerAccountIdHash,
+          providerAccountIdHash: loaded.verified.metadata.providerAccountIdHash,
           providerRootDirectoryIdHash:
             loaded.verified.metadata.providerRootDirectoryIdHash,
           providerFileIdHash: loaded.verified.metadata.providerFileIdHash,
@@ -3364,9 +3410,7 @@ export class PipelineRunner {
         }
         const code = errorCode(response);
         if (code) {
-          return code === "rate_limited"
-            ? current
-            : scanTerminal(current, "failed", code, true);
+          return scanTerminal(current, "failed", code, true);
         }
         const value = object(response, "discovery.lookupArchivedAdmission");
         if (value.mode !== "original") {
@@ -3751,9 +3795,7 @@ export class PipelineRunner {
         }
         const code = errorCode(response);
         if (code) {
-          return code === "rate_limited"
-            ? current
-            : scanTerminal(current, "failed", code, true);
+          return scanTerminal(current, "failed", code, true);
         }
         const value = object(response, "discovery.lookupArchivedAdmission");
         if (value.mode !== "processing") {
@@ -3915,9 +3957,7 @@ export class PipelineRunner {
         }
         const code = errorCode(response);
         if (code) {
-          return code === "rate_limited"
-            ? current
-            : scanTerminal(current, "failed", code, true);
+          return scanTerminal(current, "failed", code, true);
         }
         const value = object(response, "discovery.reserveArchived");
         if (
@@ -4032,9 +4072,7 @@ export class PipelineRunner {
           });
         }
         if (code) {
-          return code === "rate_limited"
-            ? current
-            : scanTerminal(current, "failed", code, true);
+          return scanTerminal(current, "failed", code, true);
         }
         const value = object(response, "discovery.admitArchived");
         if (
@@ -4186,9 +4224,7 @@ export class PipelineRunner {
         }
         const code = errorCode(response);
         if (code) {
-          return code === "rate_limited"
-            ? current
-            : scanTerminal(current, "failed", code, true);
+          return scanTerminal(current, "failed", code, true);
         }
         const value = object(response, "jobs.reserveParsed");
         const targets = records(
@@ -4227,10 +4263,7 @@ export class PipelineRunner {
       this.journal.checkpoint.phase === "archived" &&
       this.journal.checkpoint.step === "parsed_reserve"
     ) {
-      const code = errorCode(result)!;
-      throw code === "rate_limited"
-        ? new PipelineRetryableError(code)
-        : new PipelineWorkerError(code);
+      throw new PipelineWorkerError(errorCode(result)!);
     }
     if (
       this.journal.checkpoint.phase === "archived" &&
@@ -4311,9 +4344,7 @@ export class PipelineRunner {
           return this.parsedLeaseRecovery(current);
         }
         if (code) {
-          return code === "rate_limited"
-            ? current
-            : scanTerminal(current, "failed", code, true);
+          return scanTerminal(current, "failed", code, true);
         }
         const value = object(response, "jobs.renewParsed");
         if (value.jobId !== current.jobLease.jobId) {
@@ -4374,9 +4405,7 @@ export class PipelineRunner {
           return this.parsedLeaseRecovery(current);
         }
         if (code) {
-          return code === "rate_limited"
-            ? current
-            : scanTerminal(current, "failed", code, true);
+          return scanTerminal(current, "failed", code, true);
         }
         const value = object(response, "jobs.stageParsedBegin");
         if (value.jobId !== lease.jobId) {
@@ -4491,9 +4520,7 @@ export class PipelineRunner {
           return this.parsedLeaseRecovery(current);
         }
         if (code) {
-          return code === "rate_limited"
-            ? current
-            : scanTerminal(current, "failed", code, true);
+          return scanTerminal(current, "failed", code, true);
         }
         const value = object(response, "jobs.stageParsedBatch");
         if (
@@ -4550,9 +4577,7 @@ export class PipelineRunner {
           return this.parsedLeaseRecovery(current);
         }
         if (code) {
-          return code === "rate_limited"
-            ? current
-            : scanTerminal(current, "failed", code, true);
+          return scanTerminal(current, "failed", code, true);
         }
         const value = object(response, "jobs.stageParsedSeal");
         if (
@@ -4617,9 +4642,7 @@ export class PipelineRunner {
           return this.parsedLeaseRecovery(current);
         }
         if (code) {
-          return code === "rate_limited"
-            ? current
-            : scanTerminal(current, "failed", code, true);
+          return scanTerminal(current, "failed", code, true);
         }
         const value = object(response, "jobs.activateParsed");
         const { processing } = this.archivedRows(current);
@@ -4854,9 +4877,7 @@ export class PipelineRunner {
         const value = success(response);
         if (!value) {
           const code = errorCode(response)!;
-          return code === "rate_limited"
-            ? current
-            : processingTerminal(current, "failed", code, undefined, true);
+          return processingTerminal(current, "failed", code, undefined, true);
         }
         const jobs = records(
           value.targets,
@@ -4918,9 +4939,7 @@ export class PipelineRunner {
           const code = errorCode(response)!;
           return code === "lease_conflict" || code === "reservation_expired"
             ? afterJob(current, current.published)
-            : code === "rate_limited"
-              ? current
-              : processingTerminal(current, "failed", code, undefined, true);
+            : processingTerminal(current, "failed", code, undefined, true);
         }
         if (value.jobId !== active.jobId) {
           throw new PipelineWorkerError("job_parent_conflict");
@@ -4999,9 +5018,7 @@ export class PipelineRunner {
               failureCode: "staging_invalid",
             };
           }
-          return code === "rate_limited"
-            ? current
-            : processingTerminal(current, "failed", code, undefined, true);
+          return processingTerminal(current, "failed", code, undefined, true);
         }
         if (value.jobId !== active.jobId || value.state !== "staged") {
           throw new PipelineWorkerError("job_stage_conflict");
@@ -5063,9 +5080,7 @@ export class PipelineRunner {
               failureCode: "staging_invalid",
             };
           }
-          return code === "rate_limited"
-            ? current
-            : processingTerminal(current, "failed", code, undefined, true);
+          return processingTerminal(current, "failed", code, undefined, true);
         }
         if (value.jobId !== active.jobId || value.state !== "ready") {
           throw new PipelineWorkerError("job_activation_conflict");
@@ -5117,9 +5132,7 @@ export class PipelineRunner {
           const code = errorCode(response)!;
           return code === "lease_conflict" || code === "reservation_expired"
             ? afterJob(current, current.published)
-            : code === "rate_limited"
-              ? current
-              : processingTerminal(current, "failed", code, undefined, true);
+            : processingTerminal(current, "failed", code, undefined, true);
         }
         if (value.jobId !== active.jobId) {
           throw new PipelineWorkerError("job_failure_parent_conflict");
@@ -5195,9 +5208,7 @@ export class PipelineRunner {
         const value = success(response);
         if (!value) {
           const code = errorCode(response)!;
-          return code === "rate_limited"
-            ? current
-            : processingTerminal(current, "failed", code, undefined, true);
+          return processingTerminal(current, "failed", code, undefined, true);
         }
         if (
           value.scanId !== current.scanId ||
@@ -5243,6 +5254,9 @@ export class PipelineRunner {
     if (checkpoint.phase !== "assess_page") {
       throw new PipelineWorkerError("journal_phase_conflict");
     }
+    if (checkpoint.pageCount > 0 && this.config.assessmentPacingMs) {
+      await sleep(this.config.assessmentPacingMs);
+    }
     const result = await this.mutation(
       "processing.assessPage",
       () =>
@@ -5259,15 +5273,13 @@ export class PipelineRunner {
         const value = success(response);
         if (!value) {
           const code = errorCode(response)!;
-          return code === "rate_limited"
-            ? current
-            : processingTerminal(
-                current,
-                "incomplete",
-                code,
-                current.assessmentId,
-                true,
-              );
+          return processingTerminal(
+            current,
+            "incomplete",
+            code,
+            current.assessmentId,
+            true,
+          );
         }
         if (
           value.assessmentId !== current.assessmentId ||

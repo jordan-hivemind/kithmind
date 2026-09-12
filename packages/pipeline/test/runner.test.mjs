@@ -343,8 +343,13 @@ test("append serializes PDF and safe leaf gaps without changing UTF-8 entries", 
       },
     ],
   });
-  const { base, root, journalDir, config: localConfig, journal } =
-    await fixtureWithJournal(1, checkpoint);
+  const {
+    base,
+    root,
+    journalDir,
+    config: localConfig,
+    journal,
+  } = await fixtureWithJournal(1, checkpoint);
   const calls = [];
   const transport = {
     async call(request) {
@@ -357,9 +362,12 @@ test("append serializes PDF and safe leaf gaps without changing UTF-8 entries", 
     },
   };
   try {
-    await assert.rejects(() =>
-      new PipelineRunner(localConfig, journal, transport).run(),
-    );
+    const result = await new PipelineRunner(localConfig, journal, transport, {
+      windowMs: 10,
+      maxAttempts: 2,
+    }).run();
+    assert.equal(result.state, "failed");
+    assert.equal(result.code, "rate_limited");
     const append = calls.find((call) => call.operation === "scan.appendPage");
     assert.deepEqual(
       append.entries.map((entry) => entry.content.status),
@@ -527,6 +535,38 @@ function assessmentCounts(ready) {
       ignoredForgotten: 0,
     },
     unresolvedEntries: { needsReview: 0, ignoredForgotten: 0 },
+  };
+}
+
+function assessPageCheckpoint(overrides = {}) {
+  return parseRunnerCheckpoint({
+    version: 1,
+    phase: "assess_page",
+    scanId: "scan_1",
+    scanned: 1,
+    published: 1,
+    bindings: [],
+    assessmentId: "assessment_1",
+    ordinal: 0,
+    pageCount: 0,
+    ...overrides,
+  });
+}
+
+function assessPageResponse(ordinal, state = "running") {
+  const complete = state === "complete";
+  return {
+    operation: "processing.assessPage",
+    assessmentId: "assessment_1",
+    state,
+    phase: complete ? "done" : "items",
+    ordinal,
+    inspected: 1,
+    nextOrdinal: ordinal + 1,
+    reused: false,
+    ...(complete
+      ? { counts: assessmentCounts(1), completedAt: Date.now() }
+      : {}),
   };
 }
 
@@ -859,10 +899,7 @@ test("a document-level parser failure is recorded against that document and the 
     assert.equal(calls, 2);
     assert.equal(recordedFailures.length, 1);
     assert.equal(recordedFailures[0].code, "conversion_failed");
-    assert.equal(
-      recordedFailures[0].catalogId,
-      checkpoint.processingCatalogId,
-    );
+    assert.equal(recordedFailures[0].catalogId, checkpoint.processingCatalogId);
     assert.deepEqual(result, { state: "complete", scanned: 3, published: 2 });
     // The failed document (index 1) is skipped, not retried in this pass;
     // the run moves on to the next one (index 2) and nothing extra is
@@ -940,10 +977,7 @@ test("a lost discovery.failArchived report does not block the pass from continui
     };
     runner.driveCheckpoint = async () => {
       if (journal.checkpoint.pdfIndex === 1) {
-        throw new ParserProcessError(
-          "page_limit_exceeded",
-          "too many pages",
-        );
+        throw new ParserProcessError("page_limit_exceeded", "too many pages");
       }
       return { state: "complete", scanned: 2, published: 1 };
     };
@@ -1064,6 +1098,120 @@ test("publishes a bounded multi-page scan and stores only metadata after complet
       cloud.operations.filter((operation) => operation === "jobs.activate")
         .length,
       9,
+    );
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("an assess_page rate limit retries with backoff and completes", async () => {
+  const setup = await fixture(0);
+  const checkpoint = assessPageCheckpoint();
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  let assessPageCalls = 0;
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.join(" "));
+  try {
+    const runner = new PipelineRunner(
+      setup.config,
+      journal,
+      {
+        async call(request) {
+          if (request.operation === "source.status") {
+            return { operation: "source.status", sourceAccountId: "source" };
+          }
+          assert.equal(request.operation, "processing.assessPage");
+          assessPageCalls += 1;
+          if (assessPageCalls <= 2) {
+            return { error: { code: "rate_limited" } };
+          }
+          return assessPageResponse(request.ordinal, "complete");
+        },
+      },
+      { windowMs: 30, maxAttempts: 8 },
+    );
+    const result = await runner.run();
+    assert.equal(result.state, "complete");
+    assert.equal(assessPageCalls, 3);
+    assert.equal(journal.pending, undefined);
+    assert.equal(
+      warnings.filter((line) => line.includes("retrying in")).length,
+      2,
+    );
+  } finally {
+    console.warn = originalWarn;
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("an assess_page rate limit that never clears fails cleanly and leaves the journal safe to resume", async () => {
+  const setup = await fixture(0);
+  const checkpoint = assessPageCheckpoint();
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  let assessPageCalls = 0;
+  const originalWarn = console.warn;
+  console.warn = () => {};
+  try {
+    const runner = new PipelineRunner(
+      setup.config,
+      journal,
+      {
+        async call(request) {
+          if (request.operation === "source.status") {
+            return { operation: "source.status", sourceAccountId: "source" };
+          }
+          assert.equal(request.operation, "processing.assessPage");
+          assessPageCalls += 1;
+          return { error: { code: "rate_limited" } };
+        },
+      },
+      { windowMs: 20, maxAttempts: 4 },
+    );
+    const result = await runner.runSafely();
+    assert.deepEqual(result, { state: "failed", code: "rate_limited" });
+    assert.equal(assessPageCalls, 4);
+    assert.equal(journal.pending, undefined);
+    assert.equal(journal.checkpoint.phase, "terminal");
+    assert.equal(journal.checkpoint.code, "rate_limited");
+  } finally {
+    console.warn = originalWarn;
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("assessmentPacingMs paces consecutive assess_page mutations", async () => {
+  const setup = await fixture(0);
+  const checkpoint = assessPageCheckpoint();
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  const callTimes = [];
+  try {
+    const runner = new PipelineRunner(
+      { ...setup.config, assessmentPacingMs: 150 },
+      journal,
+      {
+        async call(request) {
+          if (request.operation === "source.status") {
+            return { operation: "source.status", sourceAccountId: "source" };
+          }
+          assert.equal(request.operation, "processing.assessPage");
+          callTimes.push(Date.now());
+          return assessPageResponse(
+            request.ordinal,
+            request.ordinal >= 1 ? "complete" : "running",
+          );
+        },
+      },
+    );
+    const result = await runner.run();
+    assert.equal(result.state, "complete");
+    assert.equal(callTimes.length, 2);
+    assert.ok(
+      callTimes[1] - callTimes[0] >= 140,
+      `expected consecutive assess_page calls to be paced by ~150ms, got ${callTimes[1] - callTimes[0]}ms`,
     );
   } finally {
     await journal.close();
@@ -1636,11 +1784,10 @@ test("backup replay accepts a changed remote root only for the cataloged artifac
     );
     await assert.rejects(
       () =>
-        runner.recordArchiveAction(
-          checkpoint,
-          "original_backup_snapshot",
-          { ...recovered, boundary: undefined },
-        ),
+        runner.recordArchiveAction(checkpoint, "original_backup_snapshot", {
+          ...recovered,
+          boundary: undefined,
+        }),
       (error) => error.code === "archive_backup_recovery_conflict",
       "a remote historical receipt cannot replay without a remote boundary",
     );
