@@ -328,6 +328,11 @@ describe("card evidence gate", () => {
       recordKind: "tax_return_card",
       fields: [
         field("tax_year", { type: "integer", value: "2024" }, "2024"),
+        field(
+          "adjusted_gross_income",
+          { type: "money", amount: "62000", currency: "USD" },
+          "62,000.00",
+        ),
         {
           field: "w2_employer",
           ordinal: 0,
@@ -405,5 +410,53 @@ describe("card evidence gate", () => {
       ],
     });
     expect(codeOf(report, "card_party")).toBe("field_not_declared");
+  });
+
+  test("a bare amount defaults to USD on a tax return but not on a generic card", () => {
+    const bare = { type: "money", amount: "50000", currency: "USD" } as const;
+    const taxReturn = gateCard({
+      recordKind: "tax_return_card",
+      fields: [
+        field("tax_year", { type: "integer", value: "2021" }, "2021"),
+        field("adjusted_gross_income", bare, "50,000.00"),
+      ],
+    });
+    expect(codeOf(taxReturn, "adjusted_gross_income")).toBe("pass");
+
+    const generic = gateCard({
+      recordKind: "safe_note_card",
+      fields: [...safeNoteBase(), field("valuation_cap", bare, "50,000.00")],
+    });
+    expect(codeOf(generic, "valuation_cap")).toBe("currency_mismatch");
+  });
+
+  test("account_identifier_last_four refuses a value longer than four characters", () => {
+    const tooLong = gateCard({
+      recordKind: "brokerage_tax_package_card",
+      fields: [
+        field("tax_year", { type: "integer", value: "2024" }, "2024"),
+        field(
+          "account_identifier_last_four",
+          { type: "text", value: "12345678" },
+          "12345678",
+        ),
+      ],
+    });
+    expect(codeOf(tooLong, "account_identifier_last_four")).toBe(
+      "value_too_long",
+    );
+
+    const lastFour = gateCard({
+      recordKind: "brokerage_tax_package_card",
+      fields: [
+        field("tax_year", { type: "integer", value: "2024" }, "2024"),
+        field(
+          "account_identifier_last_four",
+          { type: "text", value: "6789" },
+          "6789",
+        ),
+      ],
+    });
+    expect(codeOf(lastFour, "account_identifier_last_four")).toBe("pass");
   });
 });

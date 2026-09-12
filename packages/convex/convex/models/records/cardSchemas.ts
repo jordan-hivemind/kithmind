@@ -36,7 +36,8 @@ export type CardNormalizerId =
   | "rate_v1"
   | "integer_v1"
   | "clause_boolean_v1"
-  | "enum_v1";
+  | "enum_v1"
+  | "money_usd_default_v1";
 
 export type CardFieldSchema = {
   /** Value types the gate may store for this field. */
@@ -66,6 +67,13 @@ export type CardFieldSchema = {
   enumValues?: readonly string[];
   /** One line of what the field means, rendered into the runner prompt. */
   description?: string;
+  /**
+   * A `text` field whose value must be no longer than this many characters.
+   * Declared for `account_identifier_last_four`, section 4.2: the gate
+   * refuses a value that reads as a full account number rather than the
+   * last four characters, independent of whether the span matches it.
+   */
+  maxChars?: number;
 };
 
 type CardKindSchema = {
@@ -200,29 +208,81 @@ export const CARD_SCHEMAS: Readonly<Record<CardRecordKind, CardKindSchema>> = {
         valueTypes: ["integer"],
         normalizer: "integer_v1",
         required: true,
+        description: "The tax year this return covers.",
       },
-      filing_status: { valueTypes: ["text"], normalizer: "text_v1" },
+      // No field on the return itself is a calendar date; this is the one
+      // date the card can cite, for example "for the year ended December
+      // 31, 2021", and it is what places the return in time for a query
+      // ranged by year. Optional: a return with no such span is undated.
+      tax_period_end: {
+        valueTypes: ["date"],
+        normalizer: "date_v1",
+        description:
+          "The date the return's tax year ends, for example December 31 of tax_year for a calendar-year filer.",
+      },
+      form_type: {
+        valueTypes: ["text"],
+        normalizer: "enum_v1",
+        enumValues: ["1040", "1040-SR", "1040-NR", "1040-X"],
+        description: "Which variant of Form 1040 this return is.",
+      },
+      filing_status: {
+        valueTypes: ["text"],
+        normalizer: "enum_v1",
+        enumValues: [
+          "single",
+          "married filing jointly",
+          "married filing separately",
+          "head of household",
+          "qualifying surviving spouse",
+        ],
+        description: "The filing status box checked on the return.",
+      },
       adjusted_gross_income: {
         valueTypes: ["money"],
-        normalizer: "money_v1",
+        normalizer: "money_usd_default_v1",
+        required: true,
+        description: "Adjusted gross income (Form 1040 AGI line).",
       },
-      taxable_income: { valueTypes: ["money"], normalizer: "money_v1" },
-      total_tax: { valueTypes: ["money"], normalizer: "money_v1" },
-      refund_or_amount_due: { valueTypes: ["money"], normalizer: "money_v1" },
+      taxable_income: {
+        valueTypes: ["money"],
+        normalizer: "money_usd_default_v1",
+      },
+      total_tax: {
+        valueTypes: ["money"],
+        normalizer: "money_usd_default_v1",
+      },
+      refund_or_amount_due: {
+        valueTypes: ["money"],
+        normalizer: "money_usd_default_v1",
+        description:
+          "The refund or amount-due figure, as an unsigned magnitude. Never encode direction as a minus sign or parentheses; use refund_or_amount_due_direction for that.",
+      },
+      refund_or_amount_due_direction: {
+        valueTypes: ["text"],
+        normalizer: "enum_v1",
+        enumValues: ["refund", "amount due"],
+        description:
+          "Whether refund_or_amount_due is a refund to the filer or an amount the filer owes, quoted from wording such as \"refund\" or \"amount due\" rather than inferred from a sign.",
+      },
       w2_employer: {
         valueTypes: NAME_OR_ENTITY,
         repeated: true,
         normalizer: "name_v1",
+        description: "One Form W-2 employer's name. One entry per employer.",
       },
       k1_entity: {
         valueTypes: NAME_OR_ENTITY,
         repeated: true,
         normalizer: "name_v1",
+        description:
+          "One Schedule K-1 entity's name reported on this return. One entry per entity.",
       },
       form_1099_payer: {
         valueTypes: NAME_OR_ENTITY,
         repeated: true,
         normalizer: "name_v1",
+        description: "One Form 1099 payer's name. One entry per payer.",
       },
     },
   },
@@ -233,22 +293,58 @@ export const CARD_SCHEMAS: Readonly<Record<CardRecordKind, CardKindSchema>> = {
         valueTypes: NAME_OR_ENTITY,
         normalizer: "name_v1",
         required: true,
+        description: "The partnership, S corporation, or trust that issued this K-1.",
       },
       tax_year: {
         valueTypes: ["integer"],
         normalizer: "integer_v1",
         required: true,
       },
+      entity_type: {
+        valueTypes: ["text"],
+        normalizer: "enum_v1",
+        enumValues: ["partnership", "S corporation", "trust"],
+        description: "Which kind of entity issued this K-1.",
+      },
+      // Paired repeated fields, section 4.2: entry i of k1_income_class
+      // names the box the amount at entry i of k1_income came from. Give
+      // both fields the same ordinal for one income line.
+      k1_income_class: {
+        valueTypes: ["text"],
+        repeated: true,
+        normalizer: "enum_v1",
+        enumValues: [
+          "ordinary business income",
+          "net rental real estate income",
+          "interest income",
+          "ordinary dividends",
+          "net short-term capital gain",
+          "net long-term capital gain",
+          "guaranteed payments",
+        ],
+        description:
+          "The K-1 box label for one income line. Use the same ordinal as the matching amount in k1_income.",
+      },
       k1_income: {
         valueTypes: ["money"],
         repeated: true,
-        normalizer: "money_v1",
+        normalizer: "money_usd_default_v1",
+        description:
+          "The amount for one income line. Use the same ordinal as the matching class in k1_income_class.",
       },
       capital_account_beginning: {
         valueTypes: ["money"],
-        normalizer: "money_v1",
+        normalizer: "money_usd_default_v1",
       },
-      capital_account_ending: { valueTypes: ["money"], normalizer: "money_v1" },
+      capital_account_ending: {
+        valueTypes: ["money"],
+        normalizer: "money_usd_default_v1",
+      },
+      partner_share_percent: {
+        valueTypes: ["decimal"],
+        normalizer: "rate_v1",
+        description: "The partner's or shareholder's ownership share percentage.",
+      },
     },
   },
   brokerage_tax_package_card: {
@@ -259,15 +355,56 @@ export const CARD_SCHEMAS: Readonly<Record<CardRecordKind, CardKindSchema>> = {
         normalizer: "integer_v1",
         required: true,
       },
+      institution_name: {
+        valueTypes: NAME_OR_ENTITY,
+        normalizer: "name_v1",
+        description: "The brokerage or custodian that issued this tax package.",
+      },
+      account_identifier_last_four: {
+        valueTypes: ["text"],
+        normalizer: "text_v1",
+        maxChars: 4,
+        description:
+          "The last four characters of the account number only. Never the full account number.",
+      },
       form_present: {
         valueTypes: ["text"],
         repeated: true,
-        normalizer: "text_v1",
+        normalizer: "enum_v1",
+        enumValues: [
+          "1099-B",
+          "1099-DIV",
+          "1099-INT",
+          "1099-MISC",
+          "1099-OID",
+          "1099-R",
+        ],
+        description: "One form included in this tax package. One entry per form.",
+      },
+      // Paired repeated fields, same convention as k1_card's income class
+      // and amount: entry i of form_total_form names the form that entry i
+      // of form_total totals.
+      form_total_form: {
+        valueTypes: ["text"],
+        repeated: true,
+        normalizer: "enum_v1",
+        enumValues: [
+          "1099-B",
+          "1099-DIV",
+          "1099-INT",
+          "1099-MISC",
+          "1099-OID",
+          "1099-R",
+        ],
+        description:
+          "The form one total is for. Use the same ordinal as the matching amount in form_total.",
       },
       form_total: {
         valueTypes: ["money"],
         repeated: true,
-        normalizer: "money_v1",
+        normalizer: "money_usd_default_v1",
+        description:
+          "The total amount for one form. Use the same ordinal as the matching form in form_total_form.",
       },
     },
   },

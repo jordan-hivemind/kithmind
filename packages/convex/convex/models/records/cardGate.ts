@@ -34,7 +34,7 @@ import type { ObservationValue } from "./values";
  * extraction fingerprint, so a gate change is a new generation rather than a
  * silent revaluation of a stored card.
  */
-export const CARD_GATE_VERSION = "card-gate-v1";
+export const CARD_GATE_VERSION = "card-gate-v2";
 
 /** The declared, versioned format list of rule 4. */
 export const CARD_DATE_FORMAT_LIST_VERSION = "card-date-formats-v1";
@@ -71,6 +71,8 @@ export const CARD_GATE_FAILURE_CODES = [
   "required_field_absent",
   /** An `entity` value: binding is P2-70l, the gate proves literal names. */
   "entity_value_unsupported",
+  /** A declared `maxChars` field's value is longer than the limit allows. */
+  "value_too_long",
 ] as const;
 
 export type CardGateFailureCode = (typeof CARD_GATE_FAILURE_CODES)[number];
@@ -319,6 +321,62 @@ type Normalizer = (
 ) => NormalizerResult;
 
 /**
+ * Shared by `money_v1` and `money_usd_default_v1`. `defaultCurrency` is
+ * consulted only when the span carries no indicator at all; a span that does
+ * carry one is held to it exactly the same way for both normalizers.
+ */
+function matchMoney(
+  spanText: string,
+  value: ObservationValue,
+  defaultCurrency?: string,
+): NormalizerResult {
+  if (value.type !== "money") return "field_not_declared";
+  try {
+    validateCurrencyCode(value.currency);
+  } catch {
+    return "currency_mismatch";
+  }
+  // The sign, the accounting parentheses and the currency indicator can
+  // wrap each other in either order: `($1,250.00)` and `$(1,250.00)` are
+  // the same amount. Peel one layer at a time rather than guessing.
+  let numeral = collapse(spanText);
+  let negative = false;
+  let allowed: readonly string[] | undefined;
+  for (let layer = 0; layer < 3; layer += 1) {
+    const parenthesized = /^\((.*)\)$/u.exec(numeral);
+    if (parenthesized) {
+      negative = !negative;
+      numeral = parenthesized[1]!.trim();
+      continue;
+    }
+    if (numeral.startsWith("-")) {
+      negative = !negative;
+      numeral = numeral.slice(1).trim();
+      continue;
+    }
+    if (!allowed) {
+      const split = splitCurrency(numeral);
+      if (split.allowed) {
+        allowed = split.allowed;
+        numeral = split.rest;
+        continue;
+      }
+    }
+    break;
+  }
+  if (!allowed && defaultCurrency) allowed = [defaultCurrency];
+  if (!allowed || !allowed.includes(value.currency)) {
+    return "currency_mismatch";
+  }
+  numeral = stripGrouping(numeral);
+  const spanAmount = canonicalOrNull(`${negative ? "-" : ""}${numeral}`);
+  const storedAmount = canonicalOrNull(value.amount);
+  if (spanAmount === null) return "value_not_normalizable";
+  if (storedAmount === null) return "value_not_normalizable";
+  return spanAmount === storedAmount ? null : "value_not_in_span";
+}
+
+/**
  * One normalizer per declared field type, each versioned in its own id so a
  * change to one is visible in the fingerprint through CARD_GATE_VERSION.
  * Every field of every card kind names exactly one of these in CARD_SCHEMAS.
@@ -346,51 +404,20 @@ export const CARD_NORMALIZERS = {
    * remainder canonicalizes through `canonicalizeDecimal`, and the currency
    * validates and agrees with the indicator the span actually carries.
    */
-  money_v1: (spanText, value) => {
-    if (value.type !== "money") return "field_not_declared";
-    try {
-      validateCurrencyCode(value.currency);
-    } catch {
-      return "currency_mismatch";
-    }
-    // The sign, the accounting parentheses and the currency indicator can
-    // wrap each other in either order: `($1,250.00)` and `$(1,250.00)` are
-    // the same amount. Peel one layer at a time rather than guessing.
-    let numeral = collapse(spanText);
-    let negative = false;
-    let allowed: readonly string[] | undefined;
-    for (let layer = 0; layer < 3; layer += 1) {
-      const parenthesized = /^\((.*)\)$/u.exec(numeral);
-      if (parenthesized) {
-        negative = !negative;
-        numeral = parenthesized[1]!.trim();
-        continue;
-      }
-      if (numeral.startsWith("-")) {
-        negative = !negative;
-        numeral = numeral.slice(1).trim();
-        continue;
-      }
-      if (!allowed) {
-        const split = splitCurrency(numeral);
-        if (split.allowed) {
-          allowed = split.allowed;
-          numeral = split.rest;
-          continue;
-        }
-      }
-      break;
-    }
-    if (!allowed || !allowed.includes(value.currency)) {
-      return "currency_mismatch";
-    }
-    numeral = stripGrouping(numeral);
-    const spanAmount = canonicalOrNull(`${negative ? "-" : ""}${numeral}`);
-    const storedAmount = canonicalOrNull(value.amount);
-    if (spanAmount === null) return "value_not_normalizable";
-    if (storedAmount === null) return "value_not_normalizable";
-    return spanAmount === storedAmount ? null : "value_not_in_span";
-  },
+  money_v1: (spanText, value) => matchMoney(spanText, value),
+
+  /**
+   * Section 5.2's per-kind default currency: US tax forms print a bare
+   * amount with no currency symbol or code at all. Declared only for money
+   * fields of `tax_return_card`, `k1_card` and `brokerage_tax_package_card`,
+   * so the default applies only to those kinds' cards; every other kind
+   * still requires an indicator through `money_v1`. Identical to `money_v1`
+   * except that a span with no indicator is read as USD instead of failing
+   * `currency_mismatch`; a span that does carry an indicator is held to it
+   * exactly as `money_v1` holds it.
+   */
+  money_usd_default_v1: (spanText, value) =>
+    matchMoney(spanText, value, "USD"),
 
   /**
    * Rule 4: every declared format is tried. Two formats that read the span as
@@ -495,6 +522,13 @@ function gateOneField(
   }
   if ((candidate.ordinal === undefined) === Boolean(field.repeated)) {
     return "field_not_declared";
+  }
+  if (
+    field.maxChars !== undefined &&
+    candidate.value.type === "text" &&
+    candidate.value.value.length > field.maxChars
+  ) {
+    return "value_too_long";
   }
   if (candidate.spanTexts.length === 0) return "evidence_missing";
   const normalizer = CARD_NORMALIZERS[field.normalizer];

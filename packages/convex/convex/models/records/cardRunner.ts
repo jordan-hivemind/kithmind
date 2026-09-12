@@ -33,7 +33,7 @@ import { SUPPORTED_CURRENCIES, type ObservationValue } from "./values";
 
 /** Bumped when the boundary statement, the schema rendering or the tool
  * contract changes. Section 4.6 puts it in the card extraction fingerprint. */
-export const CARD_PROMPT_VERSION = "card-prompt-v2";
+export const CARD_PROMPT_VERSION = "card-prompt-v3";
 
 /** Section 5.1: the ladder's steps, in order. `local` is optional. */
 export const CARD_LADDER_STEPS = ["local", "tier0", "tier1"] as const;
@@ -188,6 +188,8 @@ const NORMALIZER_EXPECTATIONS: Readonly<Record<CardNormalizerId, string>> = {
     "cite the span that asserts or explicitly negates the clause; if the document never mentions the clause, omit the field entirely rather than returning false",
   enum_v1:
     "cite a span that names the value exactly; the value must be one of the declared choices, quoted verbatim rather than paraphrased",
+  money_usd_default_v1:
+    "cite a span holding only the amount; give amount as a plain decimal string; when the span carries no currency symbol or code give currency as USD, otherwise give the currency the span states",
 };
 
 export type CardRunnerFieldSpec = {
