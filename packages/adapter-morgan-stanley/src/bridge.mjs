@@ -375,16 +375,83 @@ function currentSlotKeys(cdp) {
   return evaluate(cdp, slotKeysExpression());
 }
 
-/** Deletes every header the hook has captured so far, page-side. Used on
- * resume (see waitForSignIn) so a session pause that never destroyed the
- * page's JS context -- an inline re-auth screen, or a same-origin redirect --
- * cannot leave the *previous* session's headers sitting in the slot,
- * unnoticed, once fresh ones are expected. */
-async function clearCapturedHeaders(cdp) {
-  await evaluate(
-    cdp,
-    `(() => { const s = globalThis[Symbol.for(${JSON.stringify(CAPTURED_HEADERS_SLOT)})]; if (s) for (const k of Object.keys(s)) delete s[k]; return true; })()`,
-  ).catch(() => {});
+// Diagnostics only -- names and value *lengths*, never a value, so a real run
+// can be compared against this one after the fact (F1-54b: the 2026-09-11
+// incident had no way to tell what the resumed session actually captured).
+function slotDiagnosticsExpression() {
+  return `Object.fromEntries(Object.entries(globalThis[Symbol.for(${JSON.stringify(CAPTURED_HEADERS_SLOT)})] ?? {}).map(([k, v]) => [k, typeof v === "string" ? v.length : null]))`;
+}
+
+async function logSlotDiagnostics(cdp, step) {
+  const diagnostics = await evaluate(cdp, slotDiagnosticsExpression()).catch((error) => ({ error: String(error?.message ?? error) }));
+  console.error(new Date().toISOString(), "[bridge] diagnostics:", step, JSON.stringify(diagnostics));
+}
+
+/** Connect, enable the domains the hook and reload wait need, and install the
+ * header hook fresh on this connection -- the first three steps of the
+ * cold-start sequence (createMorganStanleySession) and, since F1-54b, also
+ * the first three steps a resume runs after tearing its old connection down
+ * (see waitForSignIn). Exported for test/bridge.test.mjs only (same
+ * convention as `evaluate`/`startKeepAlive` above); every other caller
+ * reaches it only through createMorganStanleySession or waitForSignIn. */
+export async function connectAndInstallHook(cdpHttpBase, origin) {
+  const target = await findPageTarget(cdpHttpBase, origin);
+  const cdp = await connectCdp(target.webSocketDebuggerUrl);
+  await cdp.send("Page.enable");
+  await cdp.send("Runtime.enable");
+  await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source: HEADER_HOOK });
+  return cdp;
+}
+
+/** Forces a real reload and waits for the *new* document to have captured at
+ * least one header, marked by the disappearance of a sentinel set on the old
+ * one (reading the old document's slot right after Page.reload returns stale
+ * keys). This is what makes the app re-derive everything it only computes
+ * once per page load -- including its device-footprint -- rather than
+ * carrying a stale value forward. Exported for test/bridge.test.mjs only
+ * (same convention as `evaluate` above); every other caller reaches it only
+ * through createMorganStanleySession or waitForSignIn. */
+export async function reloadAndCaptureHeaders(cdp) {
+  await evaluate(cdp, "globalThis.__kithmindReloadSentinel = true; true");
+  await cdp.send("Page.reload");
+  let fresh = false;
+  for (let attempt = 0; attempt < 300; attempt += 1) {
+    if (!fresh) {
+      fresh = await evaluate(cdp, "globalThis.__kithmindReloadSentinel === undefined").catch(() => false);
+    }
+    if (fresh && (await currentSlotKeys(cdp).catch(() => [])).length > 0) return;
+    if (attempt === 299) {
+      throw new Error("no session headers captured after reload: open the Activity tab and retry");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+/** Polls the slot for the documents bearer alone, up to `attempts *
+ * intervalMs` -- the cold-start tolerance: a session that never sees it still
+ * works for the activity tier, and the documents tier then fails by name.
+ * Exported for test/bridge.test.mjs only. */
+export async function waitForAuthorizationHeader(cdp, attempts = 40, intervalMs = 500) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const keys = (await currentSlotKeys(cdp).catch(() => [])).map((k) => k.toLowerCase());
+    if (keys.includes(AUTHORIZATION_HEADER)) return true;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return false;
+}
+
+/** Polls the slot until every WANTED_HEADERS entry is present (or the
+ * deadline passes) -- used after a resume's Documents navigation, since that
+ * is what lands a documents-scoped bearer alongside the just-reloaded xsrf
+ * token and device footprint. Exported for test/bridge.test.mjs only. */
+export async function waitForAllHeaders(cdp, timeoutMs, intervalMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    const keys = (await currentSlotKeys(cdp).catch(() => [])).map((k) => k.toLowerCase());
+    if (WANTED_HEADERS.every((h) => keys.includes(h))) return true;
+  }
+  return false;
 }
 
 // A bearer expires long before the site session does. The app refreshes its
@@ -429,25 +496,40 @@ const RESUME_HEADER_WAIT_MS = 20_000;
 
 /**
  * Waits out a session pause (README, "sign in again") and, once the tab is
- * back on the app, clears *every* captured header -- not just the bearer --
- * before trusting anything recaptured after it. A same-origin resume (an
- * inline re-auth screen, or an in-app redirect that never leaves this
- * origin) never destroys the page's JS context, so the header slot is not
- * reset for free the way a real cross-origin login/logout round trip would
- * reset it: without this clear, a post-resume request keeps carrying the
- * *previous* session's xsrf token and device footprint alongside a freshly
- * minted bearer -- a mismatched combination the documents endpoint answers
- * with an HTTP 400 "Service Error" (seen live 2026-09-11: every one of 1,296
- * remaining downloads failed this way after a resume). Exported for
+ * back on the app, treats the resume exactly like a cold start rather than
+ * reusing the paused connection in place: closes the old CDP socket and its
+ * keep-alive timer, reconnects, reinstalls the header hook fresh, and forces
+ * the same reload cold start uses (reloadAndCaptureHeaders) before trusting
+ * anything captured. F1-54: a same-origin resume (an inline re-auth screen,
+ * or an in-app redirect that never leaves this origin) never destroys the
+ * page's JS context, so the header slot is not reset for free the way a real
+ * cross-origin login/logout round trip would reset it -- but the original
+ * fix here (clearing the slot in place, then only navigating within the app)
+ * was not enough either: an in-app hash navigation alone never makes the app
+ * re-derive everything it only computes once per real page load, including
+ * its device-footprint, so a post-resume request paired a freshly minted
+ * bearer with a *stale* device-footprint and the documents endpoint answered
+ * every one of them with an HTTP 400 "Service Error" (seen live 2026-09-11
+ * and again 2026-09-12: seven downloads in a row, while a brand-new process
+ * -- which always cold-starts, and so always reloads -- downloaded normally
+ * right after the same sign-in). Forcing the same reload cold start does is
+ * the fix: it is what makes the app re-issue its device-footprint request
+ * alongside the fresh xsrf token, so the two are never a mismatched pair.
+ * `options.reconnect` and `options.keepAlive` exist for
  * test/bridge.test.mjs's fake-cdp tests only (same convention as
- * `evaluate`/`startKeepAlive` above); every other caller reaches it only
- * through createMorganStanleySession.
+ * `evaluate`/`startKeepAlive` above); every other caller reaches this only
+ * through createMorganStanleySession, which passes its real keep-alive
+ * handle and relies on the default reconnect (connectAndInstallHook).
+ * Resolves to `false` on give-up, or `{ cdp, keepAlive }` -- a *new*
+ * connection and keep-alive timer the caller must start using in place of
+ * the old ones -- on a successful resume.
  */
 export async function waitForSignIn(cdp, origin, cdpHttpBase, reason, options = {}) {
   const signInWaitMs = options.signInWaitMs ?? SIGN_IN_WAIT_MS;
   const headerWaitMs = options.headerWaitMs ?? RESUME_HEADER_WAIT_MS;
   const pollIntervalMs = options.pollIntervalMs ?? 5000;
   const headerPollIntervalMs = options.headerPollIntervalMs ?? 500;
+  const reconnect = options.reconnect ?? (() => connectAndInstallHook(cdpHttpBase, origin));
   console.error(new Date().toISOString(), "[bridge] paused: signed out; sign in again in the dedicated Chrome window to resume", "(" + reason.slice(0, 80) + ")");
   const deadline = Date.now() + signInWaitMs;
   let announced = 0;
@@ -458,24 +540,35 @@ export async function waitForSignIn(cdp, origin, cdpHttpBase, reason, options = 
     if (!onApp) { if (Date.now() - announced > 60_000) { announced = Date.now(); console.error(new Date().toISOString(), "[bridge] still waiting for sign-in"); } continue; }
     const keys = (await currentSlotKeys(cdp).catch(() => [])).map((k) => k.toLowerCase());
     if (keys.includes("x-xsrf-token")) {
-      await clearCapturedHeaders(cdp);
+      console.error(new Date().toISOString(), "[bridge] sign-in detected: tearing down the paused session and restarting the cold-start sequence");
+      if (options.keepAlive) clearInterval(options.keepAlive);
+      try {
+        cdp.close();
+      } catch {
+        // The old connection may already be gone; a resume must not fail
+        // just because tearing it down did.
+      }
+      const fresh = await reconnect();
+      await logSlotDiagnostics(fresh, "resume: reconnected, slot is a fresh page-side object");
+      // The same forced reload cold start uses -- see reloadAndCaptureHeaders's
+      // doc comment for why this, not an in-place clear, is the fix.
+      await reloadAndCaptureHeaders(fresh);
+      await logSlotDiagnostics(fresh, "resume: reloaded");
       // Land on Documents so the app's own calls repopulate every wanted
       // header, including a documents-scoped bearer. In-app navigation
       // only, never a login page.
-      await cdp.send("Page.navigate", { url: `${origin}/atrium/#/documents` }).catch(() => {});
-      const start = Date.now();
-      while (Date.now() - start < headerWaitMs) {
-        await new Promise((resolve) => setTimeout(resolve, headerPollIntervalMs));
-        const after = (await currentSlotKeys(cdp).catch(() => [])).map((k) => k.toLowerCase());
-        if (WANTED_HEADERS.every((h) => after.includes(h))) break;
-      }
+      await fresh.send("Page.navigate", { url: `${origin}/atrium/#/documents` }).catch(() => {});
+      await waitForAllHeaders(fresh, headerWaitMs, headerPollIntervalMs);
+      await logSlotDiagnostics(fresh, "resume: after Documents navigation");
       // The home page's own calls carry a bearer for other services, and
       // the documents API answers 409 to it (seen live 2026-09-11); mint a
       // documents-scoped one explicitly rather than hoping the wait above
       // captured the right one.
-      await refreshBearer(cdp, origin);
+      await refreshBearer(fresh, origin);
+      await logSlotDiagnostics(fresh, "resume: bearer refreshed");
+      const keepAlive = startKeepAlive(fresh, origin);
       console.error(new Date().toISOString(), "[bridge] resumed: headers captured after sign-in");
-      return true;
+      return { cdp: fresh, keepAlive };
     }
   }
   return false;
@@ -531,60 +624,58 @@ export default async function createMorganStanleySession(options = {}) {
   const cdpHttpBase = options.cdpHttpBase ?? requiredEnv("MS_CDP_HTTP_BASE");
   const origin = options.origin ?? requiredEnv("MS_ORIGIN");
 
-  const target = await findPageTarget(cdpHttpBase, origin);
-  const cdp = await connectCdp(target.webSocketDebuggerUrl);
-  await cdp.send("Page.enable");
-  await cdp.send("Runtime.enable");
-  await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source: HEADER_HOOK });
+  // `cdp` and `keepAlive` are reassigned on resume (see waitForSignIn's doc
+  // comment: F1-54b makes resume tear both down and reconnect, rather than
+  // reusing the paused connection in place), so fetchText/fetchBytes/close
+  // below must read them from this closure at call time, not capture them
+  // once as constants.
+  let cdp = await connectAndInstallHook(cdpHttpBase, origin);
+  await logSlotDiagnostics(cdp, "cold start: connected");
 
   // A document that already carries captured headers (a hook installed by an
   // earlier session in this tab) is usable as is; reloading it would only
-  // race the app's on-load request. Otherwise reload and wait for the *new*
-  // document, marked by the disappearance of a sentinel set on the old one,
-  // before trusting the slot: reading the old document's slot right after
-  // Page.reload returns stale keys and the fetch that follows finds nothing.
+  // race the app's on-load request.
   if ((await currentSlotKeys(cdp)).length === 0) {
-    await evaluate(cdp, "globalThis.__kithmindReloadSentinel = true; true");
-    await cdp.send("Page.reload");
-    let fresh = false;
-    for (let attempt = 0; attempt < 300; attempt += 1) {
-      if (!fresh) {
-        fresh = await evaluate(cdp, "globalThis.__kithmindReloadSentinel === undefined").catch(() => false);
-      }
-      if (fresh && (await currentSlotKeys(cdp).catch(() => [])).length > 0) break;
-      if (attempt === 299) {
-        throw new Error("no session headers captured after reload: open the Activity tab and retry");
-      }
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
+    await reloadAndCaptureHeaders(cdp);
   }
+  await logSlotDiagnostics(cdp, "cold start: headers captured");
 
   // The documents bearer rides on the app's own Documents call, which lands
   // a little after the first XHR headers. Give it up to twenty seconds; a
   // session that never sees it still works for the activity tier, and the
   // documents tier then fails by name as before.
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    const keys = (await currentSlotKeys(cdp).catch(() => [])).map((k) => k.toLowerCase());
-    if (keys.includes(AUTHORIZATION_HEADER)) break;
-    await new Promise((resolve) => setTimeout(resolve, 500));
-  }
+  await waitForAuthorizationHeader(cdp);
 
   // F1-62. One gate per session -- see sharedOnce's doc comment above.
   const signInGate = createSharedGate();
   const bearerRefreshGate = createSharedGate();
 
-  // F1-63. True only while a sign-in pause is in flight. The inactivity
-  // watch reads it so it never clicks in a tab the owner is signing into.
+  // F1-63. True only while a sign-in pause -- including F1-54b's teardown
+  // and reconnect below -- is in flight. The inactivity watch reads it so it
+  // never clicks in a tab that is mid-reconnect or that the owner is signing
+  // into.
   let paused = false;
-  const pauseForSignIn = (reason) =>
-    sharedOnce(signInGate, async () => {
-      paused = true;
-      try {
-        return await waitForSignIn(cdp, origin, cdpHttpBase, reason);
-      } finally {
-        paused = false;
-      }
-    });
+
+  // F1-54b: a resume tears the paused connection and its timers down and
+  // reconnects (see waitForSignIn's doc comment for why an in-place clear
+  // was not enough), so this -- not waitForSignIn directly -- is what the
+  // shared sign-in gate below runs: it is what swaps cdp/keepAlive/
+  // inactivityWatch to the new connection once waitForSignIn resolves.
+  async function resumeSession(message) {
+    paused = true;
+    try {
+      const result = await waitForSignIn(cdp, origin, cdpHttpBase, message, { keepAlive });
+      if (!result) return false;
+      clearInterval(inactivityWatch);
+      cdp = result.cdp;
+      keepAlive = result.keepAlive;
+      inactivityWatch = startInactivityWatch(cdp, () => paused);
+      return true;
+    } finally {
+      paused = false;
+    }
+  }
+  const pauseForSignIn = (reason) => sharedOnce(signInGate, () => resumeSession(reason));
 
   async function withBearerRetry(request, run) {
     for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -626,8 +717,8 @@ export default async function createMorganStanleySession(options = {}) {
     return Uint8Array.from(Buffer.from(base64, "base64"));
   }
 
-  const keepAlive = startKeepAlive(cdp, origin);
-  const inactivityWatch = startInactivityWatch(cdp, () => paused);
+  let keepAlive = startKeepAlive(cdp, origin);
+  let inactivityWatch = startInactivityWatch(cdp, () => paused);
 
   return {
     institutionSlug: "morgan-stanley",
