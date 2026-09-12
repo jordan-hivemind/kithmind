@@ -144,6 +144,58 @@ export function coveredCountsFor(
   return row ? { ...row.counts } : { ...ZERO_KIND_COUNTS };
 }
 
+/**
+ * True once a space's counters have been seeded by a target backfill and one
+ * full audit has confirmed them, which is I5's watermark. Until then an
+ * eligibility write keeps the legacy whole-space derive, so a space that has
+ * never run the backfill behaves exactly as it did before P2-6c. P2-6g runs
+ * the backfill everywhere and P2-6d deletes the legacy branch.
+ */
+export function usesTargetCounters(
+  state: Doc<"spaceEmbeddingStates">,
+): boolean {
+  return state.eligibleCounts !== undefined && state.lastAuditAt !== undefined;
+}
+
+/**
+ * Mirrors the counters onto the active generation row. This is the O(1)
+ * replacement for the whole-space derive that used to refresh those counts on
+ * every eligibility write: the reader still reads the generation row until the
+ * P2-6d cutover, so the row has to stay accurate, but it no longer costs a
+ * scan. `manifestHash` is deliberately left alone; section 5 of the plan
+ * records that it stops being recomputable once the single-transaction scan is
+ * gone and becomes audit evidence only.
+ */
+async function refreshActiveGenerationCounts(
+  ctx: MutationCtx,
+  stateId: Id<"spaceEmbeddingStates">,
+): Promise<void> {
+  const state = await ctx.db.get(stateId);
+  if (!state || !usesTargetCounters(state)) return;
+  const generationId = state.activeEmbeddingGenerationId;
+  if (!generationId || !state.activeFingerprint) return;
+  const generation = await ctx.db.get(generationId);
+  if (
+    !generation ||
+    generation.spaceId !== state.spaceId ||
+    generation.state !== "active" ||
+    generation.fingerprint !== state.activeFingerprint
+  ) {
+    return;
+  }
+  const eligible = state.eligibleCounts ?? ZERO_KIND_COUNTS;
+  const covered = coveredCountsFor(state, state.activeFingerprint);
+  await ctx.db.patch(generation._id, {
+    expectedThoughtCount: eligible.thought,
+    expectedChunkCount: eligible.chunk,
+    completedThoughtCount: covered.thought,
+    completedChunkCount: covered.chunk,
+    coverageInvalid: false,
+    thoughtCoverageInvalid: false,
+    chunkCoverageInvalid: false,
+  });
+}
+
 /** Writes an accumulated delta onto the space state in one patch. */
 export async function commitCounterDelta(
   ctx: MutationCtx,
@@ -184,6 +236,7 @@ export async function commitCounterDelta(
     }));
   }
   await ctx.db.patch(state._id, patch);
+  await refreshActiveGenerationCounts(ctx, state._id);
 }
 
 // ---------------------------------------------------------------------------
@@ -352,6 +405,186 @@ export async function recordVectorCoverageChange(
     delta,
   );
   await commitCounterDelta(ctx, state, delta, input.now);
+}
+
+// ---------------------------------------------------------------------------
+// P2-6c: per-target eligibility writes
+// ---------------------------------------------------------------------------
+
+/**
+ * The targets one eligibility write touched. A caller names what it changed,
+ * never the space: a thought by id, and a set of chunks by the processing
+ * generation that owns them, which is the unit a document publish or retire
+ * moves. Eligibility itself is re-read from the live rows rather than asserted
+ * by the caller, so a replay of the same write is a no-op and a caller cannot
+ * mislabel a target.
+ */
+export type EmbeddingEligibilityTouch = {
+  thoughtIds?: Id<"thoughts">[];
+  processingGenerationIds?: Id<"processingGenerations">[];
+};
+
+/** A supersede transition carries at most one new and ten previous memories. */
+const MAX_TOUCHED_THOUGHTS = 32;
+/** A publish touches the new generation and the one it replaces. */
+const MAX_TOUCHED_GENERATIONS = 4;
+/** Matches the activation chunk bound in the provenance model. */
+const MAX_TOUCHED_GENERATION_CHUNKS = 256;
+
+/** Rows the provider fill still owes under a fingerprint, one page at a time. */
+export const EMBEDDING_FILL_PAGE = 32;
+
+async function markThoughtTarget(
+  ctx: MutationCtx,
+  spaceId: Id<"spaces">,
+  thoughtId: Id<"thoughts">,
+  now: number,
+  delta: EmbeddingCounterDelta,
+): Promise<void> {
+  const thought = await ctx.db.get(thoughtId);
+  const eligible =
+    thought !== null &&
+    thought.spaceId === spaceId &&
+    isCurrentThought(thought);
+  if (eligible) {
+    await upsertEligibleTarget(
+      ctx,
+      {
+        spaceId,
+        targetKind: "thought",
+        targetId: String(thoughtId),
+        inputHash: await sha256Hex(thought.content),
+        now,
+      },
+      delta,
+    );
+    return;
+  }
+  const row = await findEmbeddingTarget(
+    ctx,
+    spaceId,
+    "thought",
+    String(thoughtId),
+  );
+  if (row) await retireEmbeddingTarget(ctx, row, now, delta);
+}
+
+async function markGenerationChunkTargets(
+  ctx: MutationCtx,
+  spaceId: Id<"spaces">,
+  processingGenerationId: Id<"processingGenerations">,
+  now: number,
+  delta: EmbeddingCounterDelta,
+): Promise<void> {
+  const generation = await ctx.db.get(processingGenerationId);
+  if (!generation || generation.spaceId !== spaceId) return;
+  const item = await ctx.db.get(generation.sourceItemId);
+  // The same chain `resolveActiveChunkTarget` validates, read once for the
+  // whole generation instead of once per chunk, and without its assertions:
+  // a generation this write just deactivated is expected to fail these.
+  const generationIsLive =
+    generation.state === "ready" &&
+    item !== null &&
+    item.spaceId === spaceId &&
+    item.lifecycle !== "forgetting" &&
+    item.lifecycle !== "forgotten" &&
+    item.activeGenerationId === generation._id;
+  const chunks = await ctx.db
+    .query("chunks")
+    .withIndex("by_processingGenerationId", (q) =>
+      q.eq("processingGenerationId", processingGenerationId),
+    )
+    .take(MAX_TOUCHED_GENERATION_CHUNKS + 1);
+  if (chunks.length > MAX_TOUCHED_GENERATION_CHUNKS) {
+    throw new Error("Touched processing generation exceeds its chunk bound");
+  }
+  for (const chunk of chunks) {
+    if (chunk.spaceId !== spaceId) {
+      throw new Error("Touched chunk belongs to another space");
+    }
+    if (generationIsLive && chunk.publicationState === "active") {
+      await upsertEligibleTarget(
+        ctx,
+        {
+          spaceId,
+          targetKind: "chunk",
+          targetId: String(chunk._id),
+          inputHash: await sha256Hex(chunk.text),
+          processingGenerationId,
+          now,
+        },
+        delta,
+      );
+      continue;
+    }
+    const row = await findEmbeddingTarget(
+      ctx,
+      spaceId,
+      "chunk",
+      String(chunk._id),
+    );
+    if (row) await retireEmbeddingTarget(ctx, row, now, delta);
+  }
+}
+
+/**
+ * I3 and I4 for an ordinary write: the targets this transaction touched are
+ * upserted or retired and their counter deltas are committed here, in the same
+ * transaction. Nothing reads the rest of the space.
+ */
+export async function applyEligibilityTouch(
+  ctx: MutationCtx,
+  state: Doc<"spaceEmbeddingStates">,
+  touch: EmbeddingEligibilityTouch,
+  now: number,
+): Promise<void> {
+  const thoughtIds = [...new Set(touch.thoughtIds ?? [])];
+  const generationIds = [...new Set(touch.processingGenerationIds ?? [])];
+  if (thoughtIds.length > MAX_TOUCHED_THOUGHTS) {
+    throw new Error("Eligibility write touches too many thoughts");
+  }
+  if (generationIds.length > MAX_TOUCHED_GENERATIONS) {
+    throw new Error(
+      "Eligibility write touches too many processing generations",
+    );
+  }
+  if (thoughtIds.length === 0 && generationIds.length === 0) return;
+  const delta = emptyCounterDelta();
+  for (const thoughtId of thoughtIds) {
+    await markThoughtTarget(ctx, state.spaceId, thoughtId, now, delta);
+  }
+  for (const generationId of generationIds) {
+    await markGenerationChunkTargets(
+      ctx,
+      state.spaceId,
+      generationId,
+      now,
+      delta,
+    );
+  }
+  await commitCounterDelta(ctx, state, delta, now);
+}
+
+/**
+ * One page of the targets a fingerprint still owes. An eligible row with no
+ * coverage marker is exactly an owed target, so this index page is the whole
+ * query: covering a target removes it from the page, which is why the provider
+ * fill in `fill.ts` needs no cursor and why replaying it writes nothing twice.
+ */
+export async function owedTargetsPage(
+  ctx: ReadCtx,
+  spaceId: Id<"spaces">,
+  limit: number = EMBEDDING_FILL_PAGE,
+): Promise<Doc<"embeddingTargets">[]> {
+  return await ctx.db
+    .query("embeddingTargets")
+    .withIndex("by_space_state_and_coveredFingerprint", (q) =>
+      q
+        .eq("spaceId", spaceId)
+        .eq("state", "eligible")
+        .eq("coveredFingerprint", undefined),
+    )
+    .take(Math.min(Math.max(limit, 1), EMBEDDING_FILL_PAGE));
 }
 
 // ---------------------------------------------------------------------------
@@ -544,6 +777,12 @@ async function runScanPage(
   now: number,
 ): Promise<{ cursor: string | null; scanned: number; retired: number }> {
   const state = await requireSpaceState(ctx, job.spaceId);
+  if (state.eligibleCounts === undefined) {
+    // Seeding the counters at zero is what marks the space as counted. An
+    // empty space would otherwise finish a build with absent counters and
+    // keep taking the legacy derive forever.
+    await ctx.db.patch(state._id, { eligibleCounts: { ...ZERO_KIND_COUNTS } });
+  }
   const delta = emptyCounterDelta();
   const position = decodeScanCursor(job.cursor);
   let scanned = 0;
@@ -707,7 +946,15 @@ async function runFillPage(
       fingerprint: job.fingerprint,
       row,
     });
-    if (!vector) continue;
+    if (!vector) {
+      // A marker naming another fingerprint is not coverage of this build.
+      // Clearing it is what puts the row back on the owed index, so the
+      // provider fill can find it without scanning the space.
+      if (row.coveredFingerprint !== undefined) {
+        await setTargetCoverage(ctx, row, undefined, now, delta);
+      }
+      continue;
+    }
     await setTargetCoverage(ctx, row, job.fingerprint, now, delta);
     filled += 1;
   }

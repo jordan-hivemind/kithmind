@@ -7,6 +7,7 @@ import {
   bumpEmbeddingEligibilityEpoch,
   deleteActiveThoughtEmbeddingVectors,
   insertThoughtEmbedding,
+  markEligibilityTargets,
   requireActiveEmbeddingTarget,
 } from "../embeddings/model";
 import {
@@ -270,6 +271,12 @@ export async function _insertOne(
     ...thoughtFields,
     memoryStatus: "current",
   });
+  // The eligibility mark comes first so the vector insert below finds a target
+  // row to mark covered. The epoch bump still follows the insert, inside
+  // `insertThoughtEmbedding`.
+  await markEligibilityTargets(ctx, fields.spaceId, {
+    thoughtIds: [thoughtId],
+  });
   if (embeddingGenerationId && embeddingFingerprint) {
     await insertThoughtEmbedding(ctx, {
       spaceId: fields.spaceId,
@@ -290,7 +297,9 @@ export async function _insertOne(
       );
     }
   } else {
-    await bumpEmbeddingEligibilityEpoch(ctx, fields.spaceId);
+    await bumpEmbeddingEligibilityEpoch(ctx, fields.spaceId, {
+      thoughtIds: [thoughtId],
+    });
   }
   return thoughtId;
 }
@@ -357,6 +366,7 @@ export async function _transitionMemory(
     memoryStatus: "current",
     supersedes: uniquePreviousIds,
   });
+  await markEligibilityTargets(ctx, fields.spaceId, { thoughtIds: [newId] });
   if (embeddingGenerationId && embeddingFingerprint) {
     await insertThoughtEmbedding(ctx, {
       spaceId: fields.spaceId,
@@ -393,7 +403,13 @@ export async function _transitionMemory(
       fingerprint: embeddingFingerprint,
       thoughtIds: uniquePreviousIds,
     });
-    await bumpEmbeddingEligibilityEpoch(ctx, fields.spaceId);
+  }
+  // Supersede and retract retire exactly the memories they transitioned, and
+  // the new memory above is marked in the same transaction.
+  await bumpEmbeddingEligibilityEpoch(ctx, fields.spaceId, {
+    thoughtIds: [newId, ...uniquePreviousIds],
+  });
+  if (embeddingGenerationId && embeddingFingerprint) {
     const active = await requireActiveEmbeddingTarget(ctx, {
       spaceId: fields.spaceId,
       embeddingGenerationId,
@@ -404,8 +420,6 @@ export async function _transitionMemory(
         "Thought transition exceeds the active embedding manifest limit",
       );
     }
-  } else {
-    await bumpEmbeddingEligibilityEpoch(ctx, fields.spaceId);
   }
 
   return newId;

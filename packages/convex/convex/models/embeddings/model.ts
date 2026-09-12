@@ -8,17 +8,30 @@ import {
 import { sha256Hex, utf8ByteLength } from "../ingestion/hash";
 import { getAuthorizedReadSpaceIds, type PrincipalRef } from "../../lib/spaces";
 import {
+  applyEligibilityTouch,
   embeddingVectorScopeV2,
   isCurrentThought,
   newChunkTargetCaches,
   recordVectorCoverageChange,
   resolveActiveChunkTarget,
+  usesTargetCounters,
+  type EmbeddingEligibilityTouch,
 } from "./targets";
 
+/**
+ * Legacy whole-space manifest bounds. P2-6c stopped these from running on an
+ * ordinary eligibility write; the derive is still reachable from the profile
+ * transition driver, from staging and activation, and from the audit, and it
+ * still refuses to answer above 256 targets rather than exceeding the platform
+ * read limit. P2-6d removes the derive and these four constants with it.
+ */
 export const MAX_EMBEDDING_MANIFEST_TARGETS = 256;
 export const MAX_EMBEDDING_MANIFEST_BYTES = 2 * 1024 * 1024;
 export const MAX_EMBEDDING_VECTOR_ROWS = 256;
 export const MAX_EMBEDDING_MANIFEST_SCAN_ROWS = 256;
+
+/** A target holds one vector per fingerprint; the spare slots catch a bug. */
+const MAX_TARGET_VECTOR_ROWS = 16;
 
 const MAX_PROFILE_VALUE_LENGTH = 200;
 const MAX_FAILURE_CODE_LENGTH = 100;
@@ -748,6 +761,57 @@ export async function requireActiveEmbeddingTarget(
   return active;
 }
 
+/**
+ * I11. Re-embedding a target replaces its vector: every row this target holds
+ * under the same fingerprint with any other `inputHash` is deleted in the same
+ * transaction as the insert, so at most one row per `(spaceId, fingerprint,
+ * targetKind, targetId)` survives a content change and a superseded vector can
+ * never take a candidate slot. Rows under another fingerprint are untouched,
+ * because a retired fingerprint is the rollback artifact. The covered counters
+ * net to zero across the swap: this delete releases the marker and the insert
+ * that follows sets it again.
+ */
+async function deleteSupersededTargetVectors(
+  ctx: MutationCtx,
+  input: {
+    spaceId: Id<"spaces">;
+    fingerprint: string;
+    kind: TargetKind;
+    thoughtId?: Id<"thoughts">;
+    chunkId?: Id<"chunks">;
+    inputHash: string;
+  },
+): Promise<number> {
+  const rows =
+    input.kind === "thought"
+      ? await ctx.db
+          .query("embeddingVectors")
+          .withIndex("by_thoughtId", (q) => q.eq("thoughtId", input.thoughtId))
+          .take(MAX_TARGET_VECTOR_ROWS + 1)
+      : await ctx.db
+          .query("embeddingVectors")
+          .withIndex("by_chunkId", (q) => q.eq("chunkId", input.chunkId))
+          .take(MAX_TARGET_VECTOR_ROWS + 1);
+  if (rows.length > MAX_TARGET_VECTOR_ROWS) {
+    throw new Error("Embedding target exceeds its vector row budget");
+  }
+  let deleted = 0;
+  for (const row of rows) {
+    if (
+      row.spaceId !== input.spaceId ||
+      row.embeddingFingerprint !== input.fingerprint ||
+      row.targetKind !== input.kind ||
+      row.inputHash === input.inputHash
+    ) {
+      continue;
+    }
+    await releaseVectorCoverage(ctx, row);
+    await ctx.db.delete(row._id);
+    deleted += 1;
+  }
+  return deleted;
+}
+
 async function insertVector(
   ctx: MutationCtx,
   input: {
@@ -818,7 +882,20 @@ async function insertVector(
     embeddingGenerationId: generation._id,
     targetKind: input.kind,
   });
-  const existing = matches[0];
+  // I11 runs before the reuse check: a row for this target under this
+  // fingerprint that carries any other inputHash is superseded by this insert,
+  // so it is deleted here rather than reported as an immutability conflict.
+  await deleteSupersededTargetVectors(ctx, {
+    spaceId: input.spaceId,
+    fingerprint: input.fingerprint,
+    kind: input.kind,
+    thoughtId: input.thoughtId,
+    chunkId: input.chunkId,
+    inputHash,
+  });
+  const candidate = matches[0];
+  const existing =
+    candidate && candidate.inputHash === inputHash ? candidate : undefined;
   if (existing) {
     if (
       existing.spaceId !== input.spaceId ||
@@ -902,10 +979,37 @@ async function releaseVectorCoverage(
   });
 }
 
-/** Call after an eligibility-changing write, in the same mutation. */
+/**
+ * Marks the targets a write touched without bumping the epoch. Use it when the
+ * transaction has to mark a target eligible *before* inserting its vector, so
+ * the insert finds a row to mark covered; the epoch bump then follows the
+ * insert as it always has. A space still on the legacy derive is untouched.
+ */
+export async function markEligibilityTargets(
+  ctx: MutationCtx,
+  spaceId: Id<"spaces">,
+  touch: EmbeddingEligibilityTouch,
+): Promise<boolean> {
+  const state = await ensureSpaceEmbeddingState(ctx, spaceId);
+  if (!usesTargetCounters(state)) return false;
+  await applyEligibilityTouch(ctx, state, touch, Date.now());
+  return true;
+}
+
+/**
+ * Call after an eligibility-changing write, in the same mutation, naming the
+ * targets the write touched.
+ *
+ * On a counted space (P2-6c) this upserts or retires exactly those targets,
+ * applies their counter deltas and mirrors the counters onto the active
+ * generation row. It reads the touched targets and one state row, never the
+ * space. The legacy whole-space derive below runs only for a space whose
+ * counters have not been seeded and audited yet; P2-6d removes it.
+ */
 export async function bumpEmbeddingEligibilityEpoch(
   ctx: MutationCtx,
   spaceId: Id<"spaces">,
+  touch?: EmbeddingEligibilityTouch,
 ): Promise<number> {
   const state = await ensureSpaceEmbeddingState(ctx, spaceId);
   const nextEpoch = state.eligibilityEpoch + 1;
@@ -913,6 +1017,21 @@ export async function bumpEmbeddingEligibilityEpoch(
     throw new Error("Embedding eligibility epoch is exhausted");
   }
   await ctx.db.patch(state._id, { eligibilityEpoch: nextEpoch });
+  if (usesTargetCounters(state)) {
+    await applyEligibilityTouch(ctx, state, touch ?? {}, Date.now());
+    if (state.activeEmbeddingGenerationId) {
+      const generation = await ctx.db.get(state.activeEmbeddingGenerationId);
+      if (
+        !generation ||
+        generation.state !== "active" ||
+        generation.spaceId !== spaceId
+      ) {
+        throw new Error("Active embedding generation pointer is invalid");
+      }
+      await ctx.db.patch(generation._id, { eligibilityEpoch: nextEpoch });
+    }
+    return nextEpoch;
+  }
   if (state.activeEmbeddingGenerationId) {
     const generation = await ctx.db.get(state.activeEmbeddingGenerationId);
     if (
@@ -990,6 +1109,7 @@ export async function insertChunkEmbedding(
     fingerprint: string;
     inputText: string;
     vector: number[];
+    bumpEligibility?: boolean;
   },
 ): Promise<Id<"embeddingVectors">> {
   const chunk = await ctx.db.get(input.chunkId);
@@ -1009,6 +1129,7 @@ export async function insertChunkEmbedding(
     processingGenerationId: chunk.processingGenerationId,
   });
   if (
+    (input.bumpEligibility ?? true) &&
     result.generationState === "active" &&
     (result.inserted || result.activeTarget?.chunkStatus !== "ready")
   ) {

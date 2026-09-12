@@ -1545,7 +1545,15 @@ export async function activateGeneration(
   await ctx.db.patch(account._id, {
     lastProcessedAt: Math.max(account.lastProcessedAt ?? 0, activatedAt),
   });
-  await bumpEmbeddingEligibilityEpoch(ctx, loaded.job.spaceId);
+  // Per-target marking, not a space scan: the chunks that just became active
+  // and the ones the replaced generation owned are the only eligibility this
+  // activation changed.
+  await bumpEmbeddingEligibilityEpoch(ctx, loaded.job.spaceId, {
+    processingGenerationIds:
+      previousGenerationId && previousGenerationId !== loaded.generation._id
+        ? [loaded.generation._id, previousGenerationId]
+        : [loaded.generation._id],
+  });
   if (parsedBudget) await parsedBudget.finish();
   return {
     state: "ready" as const,
@@ -1634,7 +1642,13 @@ export async function beginForgetFromWeb(
       : {}),
   });
   await advanceSourceAssessmentEpoch(ctx, account._id);
-  await bumpEmbeddingEligibilityEpoch(ctx, item.spaceId);
+  // Forgetting makes the item's active generation ineligible at once; its
+  // vectors are removed later by the paged purge.
+  await bumpEmbeddingEligibilityEpoch(ctx, item.spaceId, {
+    processingGenerationIds: item.activeGenerationId
+      ? [item.activeGenerationId]
+      : [],
+  });
   return { lifecycle: "forgetting" as const, desiredProcessingEpoch };
 }
 
@@ -2048,6 +2062,8 @@ export async function continueForgetFromWeb(
     spaceId: item.spaceId,
     sourceItemId: item._id,
   });
+  // Nothing to mark: the item's targets were retired when it entered
+  // forgetting, and its chunks are gone by the time the tombstone is written.
   await bumpEmbeddingEligibilityEpoch(ctx, item.spaceId);
   return { phase: "complete", deleted: 0, done: true };
 }
