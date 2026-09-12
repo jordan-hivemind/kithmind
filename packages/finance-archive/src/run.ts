@@ -524,6 +524,19 @@ function resolveEntryAccountId(
 
 const DOCUMENT_TIER_KINDS = new Set<CapabilityTier>(["pdf_statement", "trade_confirmation"]);
 
+/**
+ * F1-54. A signed-out session (or a documents endpoint stuck answering 400)
+ * fails every remaining document pull the same way, one after another --
+ * 1,296 of them over nine minutes before an operator finally killed the run
+ * by hand (seen live 2026-09-11). Stop long before that: this many
+ * *consecutive* document-pull failures in a row is past "this one document
+ * has a bad history" and into "something structural broke," so runPulls
+ * below stops issuing new pulls rather than burning through the rest of the
+ * selection one avoidable failure at a time. Its own named constant so the
+ * threshold has one place to change.
+ */
+const CONSECUTIVE_DOCUMENT_FAILURE_LIMIT = 10;
+
 function isDocumentTierKind(
   kind: CapabilityTier,
 ): kind is Extract<CapabilityTier, "pdf_statement" | "trade_confirmation"> {
@@ -959,6 +972,10 @@ async function main(): Promise<void> {
      * a full document retention window does).
      */
     async function runPulls(): Promise<void> {
+      // F1-54 circuit breaker: counts document-pull failures in a row,
+      // across every document kind, and resets on any success. Tracked here
+      // (not as a module-level `let`) so it starts fresh every call.
+      let consecutiveDocumentFailures = 0;
       for (const spec of pullSpecs) {
         if (isDocumentTierKind(spec.selection.kind)) {
           let acquired: Acquired;
@@ -968,6 +985,7 @@ async function main(): Promise<void> {
             documentPullsFailed += 1;
             bumpDocKind(spec.selection.kind, "failed");
             reportFailure(spec, error);
+            consecutiveDocumentFailures += 1;
             // A lost browser session fails every remaining document the same
             // way within milliseconds (20,757 of them on the first full pull).
             // Stop instead: what was committed stays committed, and the rerun
@@ -979,8 +997,19 @@ async function main(): Promise<void> {
                   `${documentPullsAcquired} document pull(s) were committed before this; sign in again and rerun the same selection to continue.`,
               );
             }
+            if (consecutiveDocumentFailures >= CONSECUTIVE_DOCUMENT_FAILURE_LIMIT) {
+              const errorClass = error instanceof Error ? error.constructor.name : typeof error;
+              throw new Error(
+                `run stopped: ${consecutiveDocumentFailures} consecutive document pulls failed ` +
+                  `(last error: ${errorClass}: ${message.slice(0, 200)}). ` +
+                  `${documentPullsAcquired} document pull(s) were committed before this; each document ` +
+                  "commits in its own transaction, so already-committed documents are untouched. " +
+                  "Fix the underlying failure and rerun the same selection to continue.",
+              );
+            }
             continue;
           }
+          consecutiveDocumentFailures = 0;
           pendingDocBatch.push({ spec, acquired });
           if (pendingDocBatch.length >= commitEvery) await flushDocBatch();
         } else {
