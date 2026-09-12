@@ -43,9 +43,14 @@ import type {
   ImportPosition,
   ImportRow,
 } from "./importer.js";
+import { REVIEW_COLUMNS } from "./importer.js";
 import { toMinorUnits } from "./money.js";
 import { toNumericText } from "./pgNumeric.js";
-import { type ArchiveClient, withArchiveTransaction } from "./pgStore.js";
+import {
+  type ArchiveClient,
+  insertRows,
+  withArchiveTransaction,
+} from "./pgStore.js";
 import {
   type RawTreeWriteResult,
   writeRawDocument,
@@ -122,21 +127,24 @@ type ReviewItemFields = {
   reason: string;
 };
 
-async function openReviewItem(
-  client: ArchiveClient,
-  fields: ReviewItemFields,
-): Promise<void> {
-  await client.query(
-    `INSERT INTO review_items (id, kind, account_id, source_document_id, source_locator, raw_value, reason)
-     VALUES ($1, $2, $3, NULL, NULL, $4, $5)`,
-    [
-      randomUUID(),
-      fields.kind,
-      fields.accountId,
-      fields.rawValue,
-      fields.reason,
-    ],
-  );
+/**
+ * F1-51. Review items opened while mapping a pull are buffered in the order
+ * they are opened and written with one multi-row INSERT at the end, rather
+ * than one round trip each. Nothing here reads `review_items` back, so the
+ * only thing that changes is how many messages carry them.
+ */
+type ReviewBuffer = unknown[][];
+
+function openReviewItem(reviews: ReviewBuffer, fields: ReviewItemFields): void {
+  reviews.push([
+    randomUUID(),
+    fields.kind,
+    fields.accountId,
+    null,
+    null,
+    fields.rawValue,
+    fields.reason,
+  ]);
 }
 
 /**
@@ -196,87 +204,150 @@ export async function resolveInstrumentId(
   client: ArchiveClient,
   instrument: ParsedInstrument,
 ): Promise<string> {
-  if (instrument.cusip) {
-    return findOrCreateInstrument(
-      client,
-      "cusip",
-      instrument.cusip,
-      instrument,
-    );
-  }
-  if (instrument.isin) {
-    return findOrCreateInstrument(client, "isin", instrument.isin, instrument);
-  }
-  if (instrument.symbol && instrument.name) {
-    const found = await client.query<{ id: string }>(
-      "SELECT id FROM instruments WHERE symbol = $1 AND name = $2",
-      [instrument.symbol, instrument.name],
-    );
-    const existing = found.rows[0];
-    if (existing) return existing.id;
-  }
-  if (instrument.symbol) {
-    // ponytail: ctid orders by physical position, which for this
-    // insert-only table is insertion order, so this is the first instrument
-    // row created for this symbol. A rewrite (VACUUM FULL, a future UPDATE)
-    // could reorder it; add an inserted_at column if that ever matters.
-    // Either way it is a naive heuristic -- there is no way to know if it is
-    // the *right* row without a stronger identifier -- which is exactly why
-    // the match is flagged for review rather than trusted silently.
-    const found = await client.query<{
-      id: string;
-      cusip: string | null;
-      isin: string | null;
-      name: string | null;
-    }>(
-      "SELECT id, cusip, isin, name FROM instruments WHERE symbol = $1 ORDER BY ctid LIMIT 1",
-      [instrument.symbol],
-    );
-    const weak = found.rows[0];
-    if (weak) {
-      await openReviewItem(client, {
-        kind: "weak_instrument_match",
-        accountId: null,
-        rawValue: JSON.stringify(instrument),
-        reason:
-          `resolved by symbol "${instrument.symbol}" alone (no cusip, isin, or matching name) ` +
-          `to existing instrument ${weak.id} (cusip=${weak.cusip ?? "null"}, isin=${weak.isin ?? "null"}, ` +
-          `name=${JSON.stringify(weak.name)}); two different instruments sharing this symbol ` +
-          "would incorrectly merge here -- confirm or correct this match",
-      });
-      return weak.id;
-    }
-  }
-  return insertInstrument(client, instrument);
-}
-
-async function findOrCreateInstrument(
-  client: ArchiveClient,
-  column: "cusip" | "isin",
-  value: string,
-  instrument: ParsedInstrument,
-): Promise<string> {
-  // The column name is one of two literals chosen by this file, never caller
-  // input, so it is safe to interpolate where a placeholder cannot go.
-  const found = await client.query<{ id: string }>(
-    `SELECT id FROM instruments WHERE ${column} = $1`,
-    [value],
-  );
-  const existing = found.rows[0];
-  if (existing) return existing.id;
-  return insertInstrument(client, instrument);
-}
-
-async function insertInstrument(
-  client: ArchiveClient,
-  instrument: ParsedInstrument,
-): Promise<string> {
-  const id = randomUUID();
-  await client.query(
-    "INSERT INTO instruments (id, symbol, cusip, isin, name) VALUES ($1, $2, $3, $4, $5)",
-    [id, instrument.symbol, instrument.cusip, instrument.isin, instrument.name],
-  );
+  const reviews: ReviewBuffer = [];
+  const resolver = await prefetchInstruments(client, [instrument], reviews);
+  const id = resolver.resolve(instrument);
+  await flushInstruments(client, resolver, reviews);
   return id;
+}
+
+const INSTRUMENT_COLUMNS = ["id", "symbol", "cusip", "isin", "name"] as const;
+
+type InstrumentRow = {
+  id: string;
+  symbol: string | null;
+  cusip: string | null;
+  isin: string | null;
+  name: string | null;
+};
+
+type InstrumentResolver = {
+  /** The rules above, against rows already in memory. */
+  resolve(instrument: ParsedInstrument): string;
+  /** Rows `resolve` minted, in the order it minted them. */
+  readonly created: unknown[][];
+};
+
+/**
+ * F1-51. One query for every instrument a whole document mentions, instead of
+ * one or two per row.
+ *
+ * The candidates are every `instruments` row that could match any of this
+ * pull's cusips, isins or symbols, in `ctid` order -- the same physical order
+ * the per-row queries read, which is what the symbol-only fallback's
+ * `ORDER BY ctid LIMIT 1` meant. Resolution then runs entirely in memory, in
+ * the same row order as before, and a row minted for one descriptor is
+ * appended to the candidate list so a later descriptor matches it exactly as
+ * it would have matched it through the database. Nothing between the prefetch
+ * and `flushInstruments` reads `instruments`.
+ */
+async function prefetchInstruments(
+  client: ArchiveClient,
+  instruments: readonly ParsedInstrument[],
+  reviews: ReviewBuffer,
+): Promise<InstrumentResolver> {
+  const distinct = (values: readonly (string | null)[]): string[] => [
+    ...new Set(values.filter((value): value is string => Boolean(value))),
+  ];
+  const cusips = distinct(instruments.map((i) => i.cusip));
+  const isins = distinct(instruments.map((i) => i.isin));
+  const symbols = distinct(instruments.map((i) => i.symbol));
+
+  const rows: InstrumentRow[] = [];
+  if (cusips.length + isins.length + symbols.length > 0) {
+    const found = await client.query<InstrumentRow>(
+      `SELECT id, symbol, cusip, isin, name FROM instruments
+        WHERE cusip = ANY($1::text[]) OR isin = ANY($2::text[]) OR symbol = ANY($3::text[])
+        ORDER BY ctid`,
+      [cusips, isins, symbols],
+    );
+    rows.push(...found.rows);
+  }
+
+  // ponytail: `resolve` scans the candidate list linearly, so a document is
+  // O(holdings * distinct instruments) in memory -- 200 holdings is 40k string
+  // comparisons, far below the one round trip it replaces. Index by cusip,
+  // isin and symbol if a document ever carries thousands.
+  const created: unknown[][] = [];
+  function mint(instrument: ParsedInstrument): string {
+    const id = randomUUID();
+    rows.push({
+      id,
+      symbol: instrument.symbol,
+      cusip: instrument.cusip,
+      isin: instrument.isin,
+      name: instrument.name,
+    });
+    created.push([
+      id,
+      instrument.symbol,
+      instrument.cusip,
+      instrument.isin,
+      instrument.name,
+    ]);
+    return id;
+  }
+
+  return {
+    created,
+    resolve(instrument) {
+      if (instrument.cusip) {
+        const found = rows.find((row) => row.cusip === instrument.cusip);
+        return found ? found.id : mint(instrument);
+      }
+      if (instrument.isin) {
+        const found = rows.find((row) => row.isin === instrument.isin);
+        return found ? found.id : mint(instrument);
+      }
+      if (instrument.symbol && instrument.name) {
+        const found = rows.find(
+          (row) =>
+            row.symbol === instrument.symbol && row.name === instrument.name,
+        );
+        if (found) return found.id;
+      }
+      if (instrument.symbol) {
+        // ponytail: ctid orders by physical position, which for this
+        // insert-only table is insertion order, so this is the first
+        // instrument row created for this symbol. A rewrite (VACUUM FULL, a
+        // future UPDATE) could reorder it; add an inserted_at column if that
+        // ever matters. Either way it is a naive heuristic -- there is no way
+        // to know if it is the *right* row without a stronger identifier --
+        // which is exactly why the match is flagged for review rather than
+        // trusted silently.
+        const weak = rows.find((row) => row.symbol === instrument.symbol);
+        if (weak) {
+          openReviewItem(reviews, {
+            kind: "weak_instrument_match",
+            accountId: null,
+            rawValue: JSON.stringify(instrument),
+            reason:
+              `resolved by symbol "${instrument.symbol}" alone (no cusip, isin, or matching name) ` +
+              `to existing instrument ${weak.id} (cusip=${weak.cusip ?? "null"}, isin=${weak.isin ?? "null"}, ` +
+              `name=${JSON.stringify(weak.name)}); two different instruments sharing this symbol ` +
+              "would incorrectly merge here -- confirm or correct this match",
+          });
+          return weak.id;
+        }
+      }
+      return mint(instrument);
+    },
+  };
+}
+
+/**
+ * Writes what resolution produced: new `instruments` rows first, then the
+ * review items, both as one multi-row INSERT each. Instruments go first
+ * because `transactions.instrument_id` and `positions.instrument_id`
+ * reference them, and `importBatch` runs next.
+ */
+async function flushInstruments(
+  client: ArchiveClient,
+  resolver: InstrumentResolver,
+  reviews: ReviewBuffer,
+): Promise<void> {
+  await insertRows(client, "instruments", INSTRUMENT_COLUMNS, resolver.created);
+  await insertRows(client, "review_items", REVIEW_COLUMNS, reviews);
 }
 
 /**
@@ -371,11 +442,11 @@ function lookupRowAccountId(pull: AdapterPull, row: AccountAttributable): string
  * the throw stays reachable only for the institution-wide activity case
  * F1-35 already covered.
  */
-async function resolveRowAccountId(
-  client: ArchiveClient,
+function resolveRowAccountId(
+  reviews: ReviewBuffer,
   pull: AdapterPull,
   row: AccountAttributable,
-): Promise<string> {
+): string {
   const resolved = lookupRowAccountId(pull, row);
   const unresolvedKey =
     row.accountExternalKey !== undefined &&
@@ -384,7 +455,7 @@ async function resolveRowAccountId(
       ? row.accountExternalKey
       : null;
   if (unresolvedKey !== null) {
-    await openReviewItem(client, {
+    openReviewItem(reviews, {
       kind: "unknown_account_key",
       accountId: pull.accountId,
       rawValue: unresolvedKey,
@@ -531,15 +602,16 @@ function classifyActivity(
   return { quantity, amount, violations };
 }
 
-async function parsedRowToImportRow(
-  client: ArchiveClient,
+function parsedRowToImportRow(
+  reviews: ReviewBuffer,
+  resolver: InstrumentResolver,
   accountId: string,
   taxonomy: ActivityTaxonomy | undefined,
   row: ParsedRow,
-): Promise<ImportRow> {
+): ImportRow {
   const classified = classifyActivity(taxonomy, row);
   for (const violation of classified.violations) {
-    await openReviewItem(client, {
+    openReviewItem(reviews, {
       kind: violation.kind,
       accountId,
       rawValue: violation.rawValue,
@@ -555,9 +627,7 @@ async function parsedRowToImportRow(
     activityType: row.activityType,
     description: row.description,
     instrumentId:
-      row.instrument === null
-        ? null
-        : await resolveInstrumentId(client, row.instrument),
+      row.instrument === null ? null : resolver.resolve(row.instrument),
     quantity: classified.quantity,
     price: row.price,
     amountText: classified.amount,
@@ -584,18 +654,18 @@ async function parsedRowToImportRow(
  * document's -- a consolidated statement's positions span several accounts,
  * one per section.
  */
-async function parsedPositionToImportPosition(
-  client: ArchiveClient,
+function parsedPositionToImportPosition(
+  resolver: InstrumentResolver,
   position: ParsedPosition,
   accountId: string,
-): Promise<ImportPosition> {
+): ImportPosition {
   return {
     accountId,
     asOf: position.asOf,
     instrumentId:
       position.instrument === null
         ? null
-        : await resolveInstrumentId(client, position.instrument),
+        : resolver.resolve(position.instrument),
     quantity: position.quantity,
     price: position.price,
     marketValueText: position.marketValue,
@@ -660,16 +730,6 @@ function groupBySourceDocument<T extends { readonly sourceDocument: string }>(
     else groups.set(row.sourceDocument, [row]);
   }
   return groups;
-}
-
-/** `Array.map` for an async mapper, one at a time and in order. */
-async function mapSeries<T, R>(
-  items: readonly T[],
-  map: (item: T) => Promise<R>,
-): Promise<R[]> {
-  const out: R[] = [];
-  for (const item of items) out.push(await map(item));
-  return out;
 }
 
 /**
@@ -809,6 +869,18 @@ async function collectDocuments(
   const liabilityGroups = groupBySourceDocument(holdings.liabilities);
   const reportedRowCount = pull.acquired.manifest.reportedRowCount;
 
+  const reviews: ReviewBuffer = [];
+  // F1-51: one query for every symbol, cusip and isin this pull mentions,
+  // before any row is mapped. Resolution itself is unchanged and still runs
+  // one descriptor at a time in row order -- see `prefetchInstruments`.
+  const resolver = await prefetchInstruments(
+    client,
+    [...pull.rows, ...holdings.positions]
+      .map((row) => row.instrument)
+      .filter((instrument): instrument is ParsedInstrument => instrument !== null),
+    reviews,
+  );
+
   // F1-23, moved here from persistAcquiredDocument (F1-33): a provider field
   // the adapter's retention declaration does not name is dropped, which is
   // the safe outcome, but it is never a *silent* one. Opened once per pull,
@@ -816,7 +888,7 @@ async function collectDocuments(
   // provenance file no reader of the archive ever consulted. Paths only,
   // never values -- a leak report that quotes the leak is not a fix.
   if (pull.acquired.retention.droppedPaths.length > 0) {
-    await openReviewItem(client, {
+    openReviewItem(reviews, {
       kind: "retention_dropped_fields",
       accountId: pull.accountId,
       rawValue: pull.acquired.retention.droppedPaths.join(" "),
@@ -830,7 +902,7 @@ async function collectDocuments(
 
   if (activityGroups.size > 1) {
     if (reportedRowCount === null) {
-      await openReviewItem(client, {
+      openReviewItem(reviews, {
         kind: "unverified_pagination_total",
         accountId: pull.accountId,
         rawValue: pull.acquired.manifest.contentHash,
@@ -901,40 +973,40 @@ async function collectDocuments(
       docType: pull.docType,
       docDate: pull.docDate,
       providerReportedCount: single ? reportedRowCount : null,
-      // Sequential rather than concurrent on purpose: instrument resolution
-      // creates rows, and two rows for the same new instrument resolved in
-      // parallel would each fail to find it and mint a second id.
-      rows: await mapSeries(activityGroups.get(sourceDocument) ?? [], async (row) => {
-        const accountId = await resolveRowAccountId(client, pull, row);
-        return parsedRowToImportRow(client, accountId, pull.activityTaxonomy, row);
-      }),
-      positions: await mapSeries(
-        positionGroups.get(sourceDocument) ?? [],
-        async (position) =>
-          parsedPositionToImportPosition(
-            client,
-            position,
-            await resolveRowAccountId(client, pull, position),
-          ),
+      // One at a time and in row order on purpose: instrument resolution
+      // mints rows, and a later descriptor must see the row an earlier one
+      // minted rather than minting a second id for the same instrument.
+      rows: (activityGroups.get(sourceDocument) ?? []).map((row) =>
+        parsedRowToImportRow(
+          reviews,
+          resolver,
+          resolveRowAccountId(reviews, pull, row),
+          pull.activityTaxonomy,
+          row,
+        ),
       ),
-      balances: await mapSeries(
-        balanceGroups.get(sourceDocument) ?? [],
-        async (balance) =>
-          parsedBalanceToImportBalance(
-            balance,
-            await resolveRowAccountId(client, pull, balance),
-          ),
+      positions: (positionGroups.get(sourceDocument) ?? []).map((position) =>
+        parsedPositionToImportPosition(
+          resolver,
+          position,
+          resolveRowAccountId(reviews, pull, position),
+        ),
       ),
-      liabilities: await mapSeries(
-        liabilityGroups.get(sourceDocument) ?? [],
-        async (liability) =>
-          parsedLiabilityToImportLiability(
-            liability,
-            await resolveRowAccountId(client, pull, liability),
-          ),
+      balances: (balanceGroups.get(sourceDocument) ?? []).map((balance) =>
+        parsedBalanceToImportBalance(
+          balance,
+          resolveRowAccountId(reviews, pull, balance),
+        ),
+      ),
+      liabilities: (liabilityGroups.get(sourceDocument) ?? []).map((liability) =>
+        parsedLiabilityToImportLiability(
+          liability,
+          resolveRowAccountId(reviews, pull, liability),
+        ),
       ),
     });
   }
+  await flushInstruments(client, resolver, reviews);
   return documents;
 }
 

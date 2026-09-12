@@ -1223,3 +1223,120 @@ test(
     assert.equal(await count(client, "transactions"), 2);
   },
 );
+
+// --- F1-51: round trips must not scale with rows ----------------------------
+//
+// The archive is hosted, so an import's cost is the number of round trips,
+// not the number of rows: at a ~50-100 ms round trip, a statement carrying
+// two hundred holdings spent about ninety seconds almost entirely waiting.
+// Every other test in this file is the oracle for *what* the importer writes
+// and is unchanged; this one is the oracle for how many messages it takes to
+// write it, which is the thing a later edit can silently undo by putting one
+// more lookup back inside a per-row loop.
+//
+// The assertion is a comparison, not a magic number: a ten-row document and a
+// two-hundred-row document must cost the same number of queries. A per-row
+// query would make the second cost hundreds more.
+
+/** Counts the queries `body` issues on `client`, and restores it after. */
+async function countQueries(client, body) {
+  const real = client.query.bind(client);
+  let queries = 0;
+  client.query = (...args) => {
+    queries += 1;
+    return real(...args);
+  };
+  try {
+    const result = await body();
+    return { queries, result };
+  } finally {
+    client.query = real;
+  }
+}
+
+/**
+ * A statement of `n` holdings and `n` transactions, every one distinct --
+ * including across two statements of different sizes, so the comparison below
+ * measures batching rather than one statement deduplicating against the
+ * other.
+ */
+function statement(sha256, n) {
+  const rows = [];
+  const positions = [];
+  const balances = [];
+  const liabilities = [];
+  for (let i = 0; i < n; i += 1) {
+    const k = n * 10_000 + i;
+    rows.push(
+      row({
+        sourceLocator: `row:${k}`,
+        description: `Synthetic purchase ${k}`,
+        amountText: `-${k + 1}.00`,
+      }),
+    );
+    positions.push(
+      position({ sourceLocator: `holdings:${k}`, quantity: `${k + 1}` }),
+    );
+    balances.push({
+      asOf: "2026-03-31",
+      totalValueText: `${1000 + k}`,
+      totalValueNote: null,
+      cash: `${k}`,
+      currency: "USD",
+      periodStartValue: null,
+      periodEndValue: null,
+      sourceLocator: `summary:${k}`,
+    });
+    liabilities.push({
+      kind: "margin",
+      displayName: `Synthetic margin ${k}`,
+      balanceText: `${100 + k}`,
+      balanceNote: null,
+      currency: "USD",
+      rate: "0.05",
+      asOf: "2026-03-31",
+      collateralNote: null,
+      sourceLocator: `liability:${k}`,
+    });
+  }
+  return document(sha256, rows, { positions, balances, liabilities });
+}
+
+test(
+  "a document's round trips do not scale with its rows: ten holdings and two hundred cost the same number of queries",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+
+    const small = await countQueries(client, () =>
+      importBatch(
+        client,
+        { source: "synthetic-pull", documents: [statement("c".repeat(64), 10)] },
+        NOW,
+      ),
+    );
+    const large = await countQueries(client, () =>
+      importBatch(
+        client,
+        { source: "synthetic-pull", documents: [statement("d".repeat(64), 200)] },
+        NOW,
+      ),
+    );
+
+    assert.equal(small.result.rowsInserted, 40);
+    assert.equal(large.result.rowsInserted, 800);
+    assert.equal(
+      large.queries,
+      small.queries,
+      `importing 200 holdings took ${large.queries} queries where 10 took ${small.queries}; ` +
+        "a lookup or an insert has gone back inside a per-row loop",
+    );
+    // A floor as well as a ceiling: a suspiciously small count would mean the
+    // import stopped doing the work rather than stopped waiting on it.
+    assert.ok(
+      large.queries > 5 && large.queries < 30,
+      `expected a bounded per-document round trip count, got ${large.queries}`,
+    );
+  },
+);
