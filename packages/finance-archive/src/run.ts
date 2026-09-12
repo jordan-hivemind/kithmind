@@ -131,6 +131,7 @@ import {
   createArchiveClient,
   createReconnectBudget,
   insertRows,
+  startKeepalive,
   withArchiveTransaction,
   withReconnect,
   type ArchiveClient,
@@ -2002,6 +2003,16 @@ async function main(): Promise<void> {
     if (dryRun) return attempt();
     return withReconnect(reconnectBudget, () => pgClient, (client) => { pgClient = client; }, attempt);
   }
+  // F1-69b. `session = await buildSession()` and `adapter.discover()` below
+  // are both browser work with no query on `pgClient` at all -- a real
+  // discover() can run for several minutes that way -- and the hosted proxy
+  // in front of the archive closes a connection it sees no traffic on for a
+  // while. Left alone, the *first* query after discover() (resolving the
+  // accounts it found) is what discovers the connection is already dead,
+  // outside any per-document retry. A keepalive covers exactly that gap:
+  // stopped right before the per-document loop starts, where ordinary query
+  // traffic resumes on its own.
+  const stopKeepalive = startKeepalive(() => pgClient);
 
   // F1-64: closed in the outer `finally` below, on the stop path exactly like
   // normal completion -- a bridge session (adapter-morgan-stanley/src/
@@ -2055,10 +2066,12 @@ async function main(): Promise<void> {
     // external key, so a selection can name one without a separate
     // provisioning step. Keyed on the resolved institutionId, not
     // selectionFile.institutionId, which the file no longer has to name.
-    const accountsByExternalKey = await resolveDiscoveredAccounts(
-      pgClient,
-      institutionId,
-      discovered.accounts,
+    // F1-69b: this is the first query after `discover()`'s long
+    // no-database phase, so it is exactly the one that used to find the
+    // connection already closed. Wrapped in `reconnect` like every other
+    // archive call in the per-document loop below.
+    const accountsByExternalKey = await reconnect(() =>
+      resolveDiscoveredAccounts(pgClient, institutionId, discovered.accounts),
     );
     // F1-56. What a *row* resolves its own `accountExternalKey` against:
     // every account key this institution answers to, which is the map above
@@ -2066,7 +2079,9 @@ async function main(): Promise<void> {
     // number). The selection file still names accounts by discovered key
     // alone -- an alias is a thing documents print, not a thing an operator
     // writes in a selection -- so `accountsByExternalKey` keeps that job.
-    const rowAccountKeys = await accountIdsByExternalKey(pgClient, institutionId);
+    const rowAccountKeys = await reconnect(() =>
+      accountIdsByExternalKey(pgClient, institutionId),
+    );
 
     const accountLast4Cache = new Map<string, string | null>();
 
@@ -2123,7 +2138,9 @@ async function main(): Promise<void> {
     // file, and how many the current selection actually asks for -- an
     // operator staring down a selection that can take hours gets to see the
     // shape of the run before it starts, not just its final summary.
-    const alreadyRecordedByKind = await countAlreadyRecordedByKind(pgClient, institutionId, pullSpecs);
+    const alreadyRecordedByKind = await reconnect(() =>
+      countAlreadyRecordedByKind(pgClient, institutionId, pullSpecs),
+    );
     printDocumentKindPreview(discovered, pullSpecs, documentsDiscoveredByKind, alreadyRecordedByKind);
 
     // F1-62. `resolveAccountLast4` below is memoized per account id, but a
@@ -2137,7 +2154,7 @@ async function main(): Promise<void> {
     for (const accountId of new Set(
       pullSpecs.map((spec) => spec.accountId).filter((id): id is string => id !== null),
     )) {
-      await resolveAccountLast4(pgClient, accountId, accountLast4Cache);
+      await reconnect(() => resolveAccountLast4(pgClient, accountId, accountLast4Cache));
     }
 
     // F1-35: an institution-wide pull's own accountId is null, and its rows
@@ -2699,6 +2716,11 @@ async function main(): Promise<void> {
       wholeArchiveGates = await reconnect(() => runWholeArchiveGates(pgClient));
     }
 
+    // F1-69b: ordinary query traffic resumes here (each document-tier pull
+    // and the gates/verdicts after it are already wrapped in `reconnect`),
+    // so the keepalive's job is done.
+    stopKeepalive();
+
     let outcome: RunOutcome;
     if (dryRun) {
       // Runs the identical pass inside one Postgres transaction and always
@@ -2733,6 +2755,11 @@ async function main(): Promise<void> {
     // session with no such handles (the synthetic adapter's) simply has no
     // `close` and this is a no-op.
     await session?.close?.();
+    // F1-69b: a no-op if the loop was reached (stopped above already), and
+    // otherwise cleans up an interval left running by a throw before then
+    // (`clearInterval` on an already-cleared timer is a no-op, so calling
+    // this twice is safe).
+    stopKeepalive();
     // F1-36: never `pgClient.end()` directly here. A connection already
     // torn down (by the server, or by the transaction error this `finally`
     // exists to let through) can leave `end()` waiting on an event that
