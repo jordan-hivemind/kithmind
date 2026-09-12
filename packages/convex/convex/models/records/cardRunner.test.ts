@@ -13,6 +13,7 @@ import { CARD_RECORD_KINDS } from "./cardSchemas";
 import {
   CARD_EXTRACTION_TOOL_NAME,
   CARD_MODEL_PRICES,
+  CARD_PROMPT_VERSION,
   CARD_TIER0_MODEL,
   CARD_TIER0_MODEL_OPENAI,
   CARD_TIER1_MODEL,
@@ -21,6 +22,7 @@ import {
   buildCardExtractionRequest,
   cardAttemptCostMicroUsd,
   cardExtractionInputSchema,
+  cardExtractionSystemPrompt,
   hostedCardRunner,
   hostedCardRunners,
   localCardRunner,
@@ -297,7 +299,11 @@ describe("the declared price table", () => {
   });
 
   test("an OpenAI cost is an exact integer, never a float", () => {
-    const cost = cardAttemptCostMicroUsd(CARD_TIER0_MODEL_OPENAI, 15_000, 1_100);
+    const cost = cardAttemptCostMicroUsd(
+      CARD_TIER0_MODEL_OPENAI,
+      15_000,
+      1_100,
+    );
     // 15,000 tokens at $0.05/MTok plus 1,100 at $0.40/MTok.
     expect(cost).toBe(750 + 440);
     expect(Number.isSafeInteger(cost)).toBe(true);
@@ -473,7 +479,9 @@ describe("parsing treats an explicit null exactly like an absent property", () =
               currency: null,
               unitCode: null,
             },
-            spans: [{ pageOrdinal: 0, quote: "Mutual", start: null, end: null }],
+            spans: [
+              { pageOrdinal: 0, quote: "Mutual", start: null, end: null },
+            ],
           },
         ],
       },
@@ -498,5 +506,128 @@ describe("parsing treats an explicit null exactly like an absent property", () =
       value: { type: "text", value: "Mutual" },
       spans: [{ pageOrdinal: 0, quote: "Mutual" }],
     });
+  });
+});
+
+// P2-81. The runner's answer is untrusted, so only its shape is repaired
+// here: ordinals are bookkeeping the gate refuses outright, and a value the
+// field does not declare is dropped rather than carried to the gate. No
+// proposed value and no cited span is ever changed.
+describe("repairing the shape of a runner's answer", () => {
+  const spans = [{ pageOrdinal: 0, quote: "Northwind Supply" }];
+
+  test("numbers a repeated field the model left without an ordinal", () => {
+    const candidate = parseCardRunnerCandidate(
+      {
+        fields: [
+          {
+            field: "card_party",
+            value: { type: "text", value: "Northwind Supply" },
+            spans,
+          },
+          {
+            field: "card_party",
+            value: { type: "text", value: "Acme Research" },
+            spans,
+          },
+        ],
+      },
+      "document_card",
+    );
+    expect(candidate.fields.map((field) => field.ordinal)).toEqual([0, 1]);
+  });
+
+  test("keeps an ordinal the model did state and counts on past it", () => {
+    const candidate = parseCardRunnerCandidate(
+      {
+        fields: [
+          {
+            field: "card_party",
+            ordinal: 3,
+            value: { type: "text", value: "Northwind Supply" },
+            spans,
+          },
+          {
+            field: "card_party",
+            value: { type: "text", value: "Acme Research" },
+            spans,
+          },
+        ],
+      },
+      "document_card",
+    );
+    expect(candidate.fields.map((field) => field.ordinal)).toEqual([3, 4]);
+  });
+
+  test("drops an ordinal the model put on a single-valued field", () => {
+    const candidate = parseCardRunnerCandidate(
+      {
+        fields: [
+          {
+            field: "card_title",
+            ordinal: 0,
+            value: { type: "text", value: "Supply Agreement" },
+            spans,
+          },
+        ],
+      },
+      "document_card",
+    );
+    expect(candidate.fields).toEqual([
+      {
+        field: "card_title",
+        value: { type: "text", value: "Supply Agreement" },
+        spans,
+      },
+    ]);
+  });
+
+  test("drops a value whose type the field does not declare", () => {
+    const candidate = parseCardRunnerCandidate(
+      {
+        fields: [
+          {
+            field: "card_date",
+            value: { type: "text", value: "2025-04-02" },
+            spans,
+          },
+          {
+            field: "card_date",
+            value: { type: "date", value: "2025-04-02" },
+            spans,
+          },
+        ],
+      },
+      "document_card",
+    );
+    expect(candidate.fields).toEqual([
+      {
+        field: "card_date",
+        value: { type: "date", value: "2025-04-02" },
+        spans,
+      },
+    ]);
+  });
+});
+
+describe("the tightened extraction prompt", () => {
+  const prompt = cardExtractionSystemPrompt("document_card");
+
+  test("keeps the untrusted-input boundary intact", () => {
+    expect(prompt).toContain(CARD_UNTRUSTED_INPUT_STATEMENT);
+  });
+
+  test("states the exhaustive field list, the quote rules and the ordinal rules", () => {
+    expect(prompt).toContain("This field list is exhaustive");
+    expect(prompt).toContain("Copy a quote verbatim from the text of one page");
+    expect(prompt).toContain("may not run from one page into the next");
+    expect(prompt).toContain("lengthen it until it appears exactly once");
+    expect(prompt).toContain("its span holds only the date");
+    expect(prompt).toContain("counting 0, 1, 2 from the first occurrence");
+    expect(prompt).toContain("give it no ordinal at all");
+  });
+
+  test("names the prompt version the fingerprint records", () => {
+    expect(CARD_PROMPT_VERSION).toBe("card-prompt-v4");
   });
 });

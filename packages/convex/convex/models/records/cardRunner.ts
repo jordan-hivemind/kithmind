@@ -37,7 +37,7 @@ import { SUPPORTED_CURRENCIES, type ObservationValue } from "./values";
 
 /** Bumped when the boundary statement, the schema rendering or the tool
  * contract changes. Section 4.6 puts it in the card extraction fingerprint. */
-export const CARD_PROMPT_VERSION = "card-prompt-v3";
+export const CARD_PROMPT_VERSION = "card-prompt-v4";
 
 /** Section 5.1: the ladder's steps, in order. `local` is optional. */
 export const CARD_LADDER_STEPS = ["local", "tier0", "tier1"] as const;
@@ -297,7 +297,9 @@ function clauseVocabulary(spec: CardRunnerFieldSpec): string {
 function renderFieldSpec(spec: CardRunnerFieldSpec): string {
   const flags = [
     spec.required ? "required" : "optional",
-    spec.repeated ? "repeated, give each occurrence its own ordinal" : "single",
+    spec.repeated
+      ? "repeated: give each occurrence its own entry with its own ordinal, counting 0, 1, 2 from the first occurrence of this field"
+      : "single: return at most one entry and give it no ordinal at all",
   ].join(", ");
   const meaning = spec.description ? ` ${spec.description}` : "";
   const enumNote = spec.enumValues
@@ -326,11 +328,14 @@ export function cardExtractionSystemPrompt(kind: CardRecordKind): string {
     `Fields of ${kind}:`,
     ...cardRunnerFieldSpecs(kind).map(renderFieldSpec),
     "",
+    "This field list is exhaustive. A field that is not on it is ignored, and so is a value whose type the field above does not declare.",
+    "",
     "Citation rules:",
     "- Every field carries at least one span. A field you cannot cite is omitted, not guessed.",
     "- A span is a page ordinal plus either an exact quote from that page or a UTF-16 start and end offset into that page.",
-    "- Quote the page text exactly, including its punctuation and casing.",
-    "- Cite the tightest span that proves the value, not the paragraph around it.",
+    "- Copy a quote verbatim from the text of one page, character for character, including its punctuation and casing. A quote may not run from one page into the next; cite each page separately.",
+    "- Cite the tightest span that still proves the value, not the paragraph around it. If that span appears more than once on its page, lengthen it until it appears exactly once: a quote that matches two places on a page proves neither.",
+    "- A date value is YYYY-MM-DD and its span holds only the date, with nothing else inside the quote.",
     "- anchor is the span that identifies the document as this card kind.",
     `- Currencies accepted: ${SUPPORTED_CURRENCIES.join(", ")}.`,
     "",
@@ -450,31 +455,51 @@ export function buildCardExtractionRequest(
  * Model output is untrusted in exactly the way document text is. Anything
  * that is not the declared shape is discarded here rather than handed to the
  * gate, so a malformed answer is an empty candidate, never a thrown stack.
+ *
+ * P2-81 repairs the *shape* of an otherwise usable answer, and only the
+ * shape: a repeated field the model gave no `ordinal` is numbered by order of
+ * appearance, and an `ordinal` on a single-valued field is dropped. Both are
+ * bookkeeping the gate's `field_not_declared` rule refuses outright, and
+ * neither changes a proposed value or which span proves it. A value whose
+ * type the field does not declare is dropped here too; the gate keeps the
+ * same rule, so nothing rests on this pass having run.
  */
 export function parseCardRunnerCandidate(
   output: unknown,
   kind: CardRecordKind,
 ): CardRunnerCandidate {
-  const declared = new Set(
-    cardRunnerFieldSpecs(kind).map((spec) => spec.field),
+  const declared = new Map(
+    cardRunnerFieldSpecs(kind).map((spec) => [spec.field, spec] as const),
   );
+  const nextOrdinal = new Map<string, number>();
   const root = asObject(output);
   return {
     anchor: parseSpans(root?.anchor),
     fields: asArray(root?.fields).flatMap((entry) => {
       const row = asObject(entry);
       const field = typeof row?.field === "string" ? row.field : undefined;
-      if (!field || !declared.has(field)) return [];
+      const spec = field === undefined ? undefined : declared.get(field);
+      if (field === undefined || !spec) return [];
       const value = parseValue(row?.value);
       const spans = parseSpans(row?.spans);
-      if (!value) return [];
-      const ordinal = row?.ordinal;
+      if (!value || !spec.valueTypes.includes(value.type)) return [];
+      const given = row?.ordinal;
+      const stated =
+        typeof given === "number" && Number.isSafeInteger(given) && given >= 0
+          ? given
+          : undefined;
+      let ordinal: number | undefined;
+      if (spec.repeated) {
+        ordinal = stated ?? nextOrdinal.get(field) ?? 0;
+        nextOrdinal.set(
+          field,
+          Math.max(nextOrdinal.get(field) ?? 0, ordinal + 1),
+        );
+      }
       return [
         {
           field,
-          ...(typeof ordinal === "number" && Number.isSafeInteger(ordinal)
-            ? { ordinal }
-            : {}),
+          ...(ordinal === undefined ? {} : { ordinal }),
           value,
           spans,
         },

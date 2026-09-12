@@ -933,6 +933,141 @@ export type CardEvidenceRef =
    */
   | { pageOrdinal: number; cell: SheetCellRef };
 
+/**
+ * P2-81. The shape differences between a page of parsed PDF text and the
+ * quote a runner copies out of it that mean nothing: a line break or a run of
+ * spaces the page layout produced, a non-breaking or thin space, a curly
+ * quote or apostrophe, a dash variant. `indexOf` refuses every one of them,
+ * and the field then reaches the gate with no evidence at all.
+ *
+ * Folding is deliberately narrow. It touches whitespace shape, quote shape,
+ * dash shape and (only as a last fallback) case. It never removes a
+ * character, never reorders one and never touches a letter, a digit or a
+ * currency mark, so a folded match still proves the same text.
+ */
+const CARD_QUOTE_FOLD: Readonly<Record<string, string>> = {
+  "‘": "'",
+  "’": "'",
+  "‚": "'",
+  "‛": "'",
+  "′": "'",
+  "´": "'",
+  "“": '"',
+  "”": '"',
+  "„": '"',
+  "‟": '"',
+  "″": '"',
+  "‐": "-",
+  "‑": "-",
+  "‒": "-",
+  "–": "-",
+  "—": "-",
+  "―": "-",
+  "−": "-",
+};
+
+/**
+ * Every whitespace code unit a page can carry. JavaScript's `\s` already
+ * includes the non-breaking space, the thin and hair spaces, the line and
+ * paragraph separators and the ideographic space, which is the whole set a
+ * PDF parser emits between words.
+ */
+const CARD_QUOTE_SPACE = /\s/;
+
+/**
+ * The folded text, plus where each folded code unit came from in the
+ * original. Every entry of `text` is exactly one code unit, so a folded
+ * offset indexes `starts` and `ends` directly and a match maps back to the
+ * original range it was produced from.
+ */
+type FoldedText = { text: string; starts: number[]; ends: number[] };
+
+function foldCardQuoteText(text: string): FoldedText {
+  const units: string[] = [];
+  const starts: number[] = [];
+  const ends: number[] = [];
+  let at = 0;
+  while (at < text.length) {
+    const unit = text[at]!;
+    if (CARD_QUOTE_SPACE.test(unit)) {
+      let run = at;
+      while (run < text.length && CARD_QUOTE_SPACE.test(text[run]!)) run += 1;
+      units.push(" ");
+      starts.push(at);
+      ends.push(run);
+      at = run;
+      continue;
+    }
+    units.push(CARD_QUOTE_FOLD[unit] ?? unit);
+    starts.push(at);
+    ends.push(at + 1);
+    at += 1;
+  }
+  return { text: units.join(""), starts, ends };
+}
+
+/**
+ * Lowercases code unit by code unit, keeping any unit whose lowercase is not
+ * a single unit as it was, so the result stays the same length as its input
+ * and a folded offset keeps pointing at the character it pointed at.
+ */
+function lowerCardQuoteText(text: string): string {
+  let out = "";
+  for (const unit of text) {
+    const lower = unit.toLowerCase();
+    out += lower.length === unit.length ? lower : unit;
+  }
+  return out;
+}
+
+/** The folded, trimmed form of a quote, for comparing two quotes. */
+function foldedQuote(quote: string): string {
+  return lowerCardQuoteText(foldCardQuoteText(quote).text.trim());
+}
+
+function locateUnique(
+  haystack: string,
+  page: FoldedText,
+  needle: string,
+): { start: number; end: number } | null {
+  if (!needle) return null;
+  const at = haystack.indexOf(needle);
+  // A quote that appears twice on its page proves nothing in particular.
+  if (at < 0 || haystack.lastIndexOf(needle) !== at) return null;
+  return { start: page.starts[at]!, end: page.ends[at + needle.length - 1]! };
+}
+
+/**
+ * Where a cited quote is on its page, as a range into the *original* page
+ * text, so the stored span stays an exact slice of sealed text and
+ * `quoteHash` is computed from the page exactly as before.
+ *
+ * Exact first. Only when an exact match fails or is ambiguous does the folded
+ * search run, and only when the folded search fails does case fall away. The
+ * returned `mode` is what makes the three outcomes observable: an exact
+ * match, a match that needed folding, and `null`, which stays the refusal it
+ * has always been and still reaches the gate as `evidence_missing`.
+ */
+export function locateCardQuote(
+  pageText: string,
+  quote: string,
+): { start: number; end: number; mode: "exact" | "normalized" } | null {
+  const exact = pageText.indexOf(quote);
+  if (quote.length > 0 && exact >= 0 && pageText.lastIndexOf(quote) === exact) {
+    return { start: exact, end: exact + quote.length, mode: "exact" };
+  }
+  const page = foldCardQuoteText(pageText);
+  const needle = foldCardQuoteText(quote).text.trim();
+  const folded =
+    locateUnique(page.text, page, needle) ??
+    locateUnique(
+      lowerCardQuoteText(page.text),
+      page,
+      lowerCardQuoteText(needle),
+    );
+  return folded ? { ...folded, mode: "normalized" } : null;
+}
+
 /** How many card extraction fingerprints one reused span records. */
 export const MAX_CARD_EVIDENCE_CITATIONS = 16;
 
@@ -954,7 +1089,12 @@ export const MAX_SWEEP_GENERATIONS = 256;
  * 2. The range lies inside that page, on UTF-16 boundaries, and is non-empty.
  * 3. `quoteHash` is recomputed from that page's own text.
  * 4. A quote form must occur exactly once on the page, and the slice the
- *    range produces must equal the quote character for character.
+ *    range produces must reproduce the quote. P2-81: the quote is located
+ *    exactly first, and only when that fails under a folding of whitespace
+ *    runs, quote and dash shape and finally case, which is what a page of
+ *    parsed PDF text and a model's transcription of it routinely differ by.
+ *    The stored range is always into the original page text, so the span is
+ *    still a byte-exact slice of sealed text and `quoteHash` is unchanged.
  *
  * A ref that fails any of these resolves to `null` rather than throwing. The
  * runner that produced it is untrusted, so a bad citation is an ordinary
@@ -1030,13 +1170,13 @@ export async function stageCardEvidenceSpans(
     let end: number;
     let locator: NonNullable<Doc<"evidenceSpans">["locator"]> | undefined;
     if ("quote" in ref) {
-      start = page.text.indexOf(ref.quote);
-      // A quote that appears twice on its page proves nothing in particular.
-      if (start < 0 || page.text.lastIndexOf(ref.quote) !== start) {
+      const located = locateCardQuote(page.text, ref.quote);
+      if (!located) {
         results.push(null);
         continue;
       }
-      end = start + ref.quote.length;
+      start = located.start;
+      end = located.end;
     } else if ("cell" in ref) {
       // The rendering rule is the whole of the resolution: the page names its
       // sheet on line 0 and separates rows and cells unambiguously, so a cell
@@ -1084,7 +1224,7 @@ export async function stageCardEvidenceSpans(
       continue;
     }
     const quote = page.text.slice(start, end);
-    if ("quote" in ref && quote !== ref.quote) {
+    if ("quote" in ref && foldedQuote(quote) !== foldedQuote(ref.quote)) {
       results.push(null);
       continue;
     }
