@@ -26,6 +26,41 @@ export const EMBEDDING_CHUNK_SCAN_PAGE = 128;
 export const EMBEDDING_CARD_SCAN_PAGE = 128;
 export const EMBEDDING_TARGET_PAGE = 128;
 
+/**
+ * P2-6e. The audit phase reads vector rows, so it pages smaller than the other
+ * target stages: 64 targets at up to four ~12.5 KiB rows each is about 3.2 MiB
+ * of the 16 MiB read budget.
+ */
+export const EMBEDDING_AUDIT_PAGE = 64;
+
+/**
+ * Rows one target may hold before the duplicate probe stops reading. Two would
+ * be enough in a space with no rollback artifact, but the retained fingerprint
+ * keeps one row per target, so a `take(2)` would be spent before it reached the
+ * duplicate it is looking for. A saturated probe is reported, never counted as
+ * clean.
+ */
+const MAX_TARGET_ROW_PROBE = 4;
+
+/** The one-shot audit probes this many targets unless the caller asks for more. */
+export const DEFAULT_DUPLICATE_PROBE = EMBEDDING_AUDIT_PAGE;
+const MAX_DUPLICATE_PROBE = 128;
+
+/** Named drift causes, so an operator reads a reason rather than a boolean. */
+export const COUNTER_DRIFT_RECOUNT = "counter_recount_mismatch";
+export const COUNTER_DRIFT_DUPLICATE_ROWS = "duplicate_active_fingerprint_rows";
+
+export function counterDriftReason(input: {
+  recountMismatch: boolean;
+  duplicateTargets: number;
+}): string | undefined {
+  const reasons = [
+    ...(input.recountMismatch ? [COUNTER_DRIFT_RECOUNT] : []),
+    ...(input.duplicateTargets > 0 ? [COUNTER_DRIFT_DUPLICATE_ROWS] : []),
+  ];
+  return reasons.length > 0 ? reasons.join(",") : undefined;
+}
+
 /** A space row stays small: active plus retired fingerprints, never a history. */
 const MAX_COVERED_FINGERPRINTS = 16;
 
@@ -731,7 +766,12 @@ async function markCardTarget(
     )
     .unique();
   if (!event || event.spaceId !== spaceId) return;
-  const row = await findEmbeddingTarget(ctx, spaceId, "card", String(event._id));
+  const row = await findEmbeddingTarget(
+    ctx,
+    spaceId,
+    "card",
+    String(event._id),
+  );
   if (row) await retireEmbeddingTarget(ctx, row, now, delta);
 }
 
@@ -993,6 +1033,84 @@ export async function resolveActiveChunkTarget(
 }
 
 // ---------------------------------------------------------------------------
+// P2-6e: duplicate rows under one fingerprint
+// ---------------------------------------------------------------------------
+
+/** Up to `MAX_TARGET_ROW_PROBE` of a target's vector rows, any fingerprint. */
+async function targetVectorRowProbe(
+  ctx: ReadCtx,
+  row: Doc<"embeddingTargets">,
+): Promise<Doc<"embeddingVectors">[]> {
+  if (row.targetKind === "thought") {
+    const thoughtId = ctx.db.normalizeId("thoughts", row.targetId);
+    if (!thoughtId) return [];
+    return await ctx.db
+      .query("embeddingVectors")
+      .withIndex("by_thoughtId", (q) => q.eq("thoughtId", thoughtId))
+      .take(MAX_TARGET_ROW_PROBE);
+  }
+  if (row.targetKind === "chunk") {
+    const chunkId = ctx.db.normalizeId("chunks", row.targetId);
+    if (!chunkId) return [];
+    return await ctx.db
+      .query("embeddingVectors")
+      .withIndex("by_chunkId", (q) => q.eq("chunkId", chunkId))
+      .take(MAX_TARGET_ROW_PROBE);
+  }
+  const eventId = ctx.db.normalizeId("events", row.targetId);
+  if (!eventId) return [];
+  return await ctx.db
+    .query("embeddingVectors")
+    .withIndex("by_eventId", (q) => q.eq("eventId", eventId))
+    .take(MAX_TARGET_ROW_PROBE);
+}
+
+export type DuplicateRowProbe = {
+  /** Targets holding more than one row under this fingerprint. */
+  duplicates: number;
+  /** Targets whose probe filled up, so a further row cannot be ruled out. */
+  saturated: number;
+  scanned: number;
+};
+
+/**
+ * I11, as an audit. A target with two rows under the active fingerprint is
+ * invisible to the reader, which dedupes by target, but both rows take a slot
+ * of the fixed candidate budget, so a retrievable target can fall out of top-k.
+ * Counting them is the only way that state is reported.
+ *
+ * Only targets this fingerprint covers are probed, which bounds the reads and
+ * leaves an uncovered target, whose rows are cleanup's business, out of it.
+ */
+export async function probeDuplicateRows(
+  ctx: ReadCtx,
+  input: {
+    spaceId: Id<"spaces">;
+    fingerprint: string;
+    rows: readonly Doc<"embeddingTargets">[];
+  },
+): Promise<DuplicateRowProbe> {
+  let duplicates = 0;
+  let saturated = 0;
+  let scanned = 0;
+  for (const row of input.rows) {
+    if (row.state !== "eligible") continue;
+    if (row.coveredFingerprint !== input.fingerprint) continue;
+    const probe = await targetVectorRowProbe(ctx, row);
+    scanned += 1;
+    if (probe.length >= MAX_TARGET_ROW_PROBE) saturated += 1;
+    const mine = probe.filter(
+      (vector) =>
+        vector.spaceId === input.spaceId &&
+        vector.embeddingFingerprint === input.fingerprint &&
+        vector.targetKind === row.targetKind,
+    ).length;
+    if (mine > 1) duplicates += 1;
+  }
+  return { duplicates, saturated, scanned };
+}
+
+// ---------------------------------------------------------------------------
 // Paged build
 // ---------------------------------------------------------------------------
 
@@ -1034,6 +1152,8 @@ export type BuildPageResult = {
   retired: number;
   isDone: boolean;
   counterDrift: boolean;
+  /** P2-6e: targets holding more than one row under the build fingerprint. */
+  duplicateTargets: number;
 };
 
 function pageResult(
@@ -1050,6 +1170,7 @@ function pageResult(
     retired: 0,
     isDone: job.phase === "done" || job.phase === "abandoned",
     counterDrift: false,
+    duplicateTargets: 0,
     ...overrides,
   };
 }
@@ -1327,13 +1448,15 @@ async function runAuditPage(
   scanned: number;
   eligible: EmbeddingKindCounts;
   covered: EmbeddingKindCounts;
+  duplicates: number;
+  saturated: number;
 }> {
   const page = await ctx.db
     .query("embeddingTargets")
     .withIndex("by_space_kind_target", (q) => q.eq("spaceId", job.spaceId))
     .paginate({
       cursor: job.cursor,
-      numItems: Math.min(batchSize, EMBEDDING_TARGET_PAGE),
+      numItems: Math.min(batchSize, EMBEDDING_AUDIT_PAGE),
     });
   const eligible = { ...ZERO_KIND_COUNTS };
   const covered = { ...ZERO_KIND_COUNTS };
@@ -1344,11 +1467,20 @@ async function runAuditPage(
       covered[row.targetKind] += 1;
     }
   }
+  // The whole-space duplicate guarantee is this paged probe: the one-shot
+  // audit below reads a bounded prefix, but every target passes through here.
+  const probe = await probeDuplicateRows(ctx, {
+    spaceId: job.spaceId,
+    fingerprint: job.fingerprint,
+    rows: page.page,
+  });
   return {
     cursor: page.isDone ? null : page.continueCursor,
     scanned: page.page.length,
     eligible,
     covered,
+    duplicates: probe.duplicates,
+    saturated: probe.saturated,
   };
 }
 
@@ -1423,6 +1555,7 @@ export async function runEmbeddingBuildPage(
         ? {
             auditEligibleCounts: { ...ZERO_KIND_COUNTS },
             auditCoveredCounts: { ...ZERO_KIND_COUNTS },
+            auditDuplicateTargets: 0,
           }
         : {}),
       updatedAt: input.now,
@@ -1445,15 +1578,23 @@ export async function runEmbeddingBuildPage(
     job.auditCoveredCounts ?? ZERO_KIND_COUNTS,
     result.covered,
   );
+  const duplicateTargets = (job.auditDuplicateTargets ?? 0) + result.duplicates;
   const done = result.cursor === null;
   let drift = false;
   if (done) {
     const state = await requireSpaceState(ctx, job.spaceId);
-    drift =
+    const recountMismatch =
       !sameCounts(state.eligibleCounts ?? ZERO_KIND_COUNTS, eligible) ||
       !sameCounts(coveredCountsFor(state, job.fingerprint), covered);
+    // A target with two rows under one fingerprint is drift the counters
+    // cannot show: both rows mark the same target covered exactly once.
+    drift = recountMismatch || duplicateTargets > 0;
     await ctx.db.patch(state._id, {
       counterDrift: drift,
+      counterDriftReason: counterDriftReason({
+        recountMismatch,
+        duplicateTargets,
+      }),
       lastAuditAt: input.now,
     });
   }
@@ -1463,6 +1604,7 @@ export async function runEmbeddingBuildPage(
     pageIndex: job.pageIndex + 1,
     auditEligibleCounts: eligible,
     auditCoveredCounts: covered,
+    auditDuplicateTargets: duplicateTargets,
     updatedAt: input.now,
   });
   return pageResult(job, {
@@ -1472,6 +1614,7 @@ export async function runEmbeddingBuildPage(
     scanned: result.scanned,
     isDone: done,
     counterDrift: drift,
+    duplicateTargets,
   });
 }
 
@@ -1486,6 +1629,7 @@ export async function auditEmbeddingCounters(
     spaceId: Id<"spaces">;
     fingerprint: string;
     maxRows?: number;
+    duplicateProbeLimit?: number;
     repair?: boolean;
     now: number;
   },
@@ -1493,6 +1637,11 @@ export async function auditEmbeddingCounters(
   complete: boolean;
   scanned: number;
   counterDrift: boolean;
+  counterDriftReason?: string;
+  duplicateTargets: number;
+  duplicateProbeScanned: number;
+  duplicateProbeSaturated: number;
+  duplicateProbeComplete: boolean;
   recountedEligible: EmbeddingKindCounts;
   recountedCovered: EmbeddingKindCounts;
   storedEligible: EmbeddingKindCounts;
@@ -1517,17 +1666,43 @@ export async function auditEmbeddingCounters(
   }
   const storedEligible = state.eligibleCounts ?? { ...ZERO_KIND_COUNTS };
   const storedCovered = coveredCountsFor(state, input.fingerprint);
-  const drift =
+  const recountMismatch =
     complete &&
     (!sameCounts(storedEligible, eligible) ||
       !sameCounts(storedCovered, covered));
+  // Vector rows are ~12.5 KiB, so the probe is a bounded prefix of the covered
+  // targets rather than the whole table. The build job's audit phase pages
+  // over every target and is the whole-space guarantee.
+  const probeLimit = Math.min(
+    Math.max(input.duplicateProbeLimit ?? DEFAULT_DUPLICATE_PROBE, 0),
+    MAX_DUPLICATE_PROBE,
+  );
+  const coveredRows = rows
+    .slice(0, maxRows)
+    .filter(
+      (row) =>
+        row.state === "eligible" &&
+        row.coveredFingerprint === input.fingerprint,
+    );
+  const probe = await probeDuplicateRows(ctx, {
+    spaceId: input.spaceId,
+    fingerprint: input.fingerprint,
+    rows: coveredRows.slice(0, probeLimit),
+  });
+  const duplicateProbeComplete = complete && coveredRows.length <= probeLimit;
+  const drift = recountMismatch || probe.duplicates > 0;
+  const reason = counterDriftReason({
+    recountMismatch,
+    duplicateTargets: probe.duplicates,
+  });
   let repaired = false;
   if (complete) {
     const patch: Partial<Doc<"spaceEmbeddingStates">> = {
       counterDrift: drift,
+      counterDriftReason: reason,
       lastAuditAt: input.now,
     };
-    if (drift && input.repair) {
+    if (recountMismatch && input.repair) {
       const others = (state.coveredCounts ?? []).filter(
         (entry) => entry.fingerprint !== input.fingerprint,
       );
@@ -1536,7 +1711,13 @@ export async function auditEmbeddingCounters(
         ...others,
         { fingerprint: input.fingerprint, counts: covered },
       ];
-      patch.counterDrift = false;
+      // A recount repairs counters, never duplicate rows: only the cleanup
+      // removes those, so their flag survives the repair.
+      patch.counterDrift = probe.duplicates > 0;
+      patch.counterDriftReason = counterDriftReason({
+        recountMismatch: false,
+        duplicateTargets: probe.duplicates,
+      });
       repaired = true;
     }
     await ctx.db.patch(state._id, patch);
@@ -1545,6 +1726,11 @@ export async function auditEmbeddingCounters(
     complete,
     scanned: Math.min(rows.length, maxRows),
     counterDrift: drift,
+    ...(reason === undefined ? {} : { counterDriftReason: reason }),
+    duplicateTargets: probe.duplicates,
+    duplicateProbeScanned: probe.scanned,
+    duplicateProbeSaturated: probe.saturated,
+    duplicateProbeComplete,
     recountedEligible: eligible,
     recountedCovered: covered,
     storedEligible,

@@ -43,6 +43,7 @@ export const embeddingTables = {
       "thoughtId",
     ])
     .index("by_generation_and_chunkId", ["embeddingGenerationId", "chunkId"])
+    .index("by_generation_and_eventId", ["embeddingGenerationId", "eventId"])
     .index("by_thoughtId", ["thoughtId"])
     .index("by_chunkId", ["chunkId"])
     .index("by_eventId", ["eventId"])

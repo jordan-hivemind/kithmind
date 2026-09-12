@@ -788,9 +788,7 @@ describe("embedding target table and resumable builder", () => {
     );
     expect(optIn).toMatchObject({ requested: 1, changed: 1, skipped: 0 });
     expect((await recount(seeded, fingerprint)).eligible.chunk).toBe(4);
-    expect(
-      (await storedCounters(seeded, fingerprint)).eligible.chunk,
-    ).toBe(4);
+    expect((await storedCounters(seeded, fingerprint)).eligible.chunk).toBe(4);
 
     // A rerun of the same migration writes nothing twice.
     expect(
@@ -1517,6 +1515,118 @@ describe("embedding target table and resumable builder", () => {
       card: 0,
     });
   }, 60_000);
+
+  test("the audit phase flags a target holding two rows under one fingerprint", async () => {
+    const seeded = await seedSpace();
+    const fingerprint = await baselineFingerprint();
+    const chunkIds = await addChunks(seeded, 2);
+    const activeGenerationId = await activateFingerprint(seeded, fingerprint);
+    const first = await seeded.t.mutation(
+      internal.models.embeddings.migrations.startTargetBackfill,
+      { spaceId: seeded.spaceId, fingerprint, now: 1 },
+    );
+    await drive(seeded, first.jobId!, { batchSize: 8 });
+    await seeded.t.run(async (ctx) => {
+      for (const chunkId of chunkIds) {
+        const chunk = (await ctx.db.get(chunkId))!;
+        await insertChunkEmbedding(ctx, {
+          spaceId: seeded.spaceId,
+          chunkId,
+          embeddingGenerationId: activeGenerationId,
+          fingerprint,
+          inputText: chunk.text,
+          vector,
+        });
+      }
+    });
+    expect((await storedCounters(seeded, fingerprint)).covered).toEqual({
+      thought: 0,
+      chunk: 2,
+      card: 0,
+    });
+
+    // A row an earlier generation wrote under the same fingerprint. It covers
+    // nothing new, so no counter moves, and the reader dedupes it away: the
+    // audit is the only thing that can report it.
+    await seeded.t.run(async (ctx) => {
+      const profile = await ctx.db
+        .query("embeddingProfiles")
+        .withIndex("by_fingerprint", (q) => q.eq("fingerprint", fingerprint))
+        .unique();
+      const olderGenerationId = await ctx.db.insert("embeddingGenerations", {
+        spaceId: seeded.spaceId,
+        embeddingProfileId: profile!._id,
+        fingerprint,
+        state: "retired" as const,
+        eligibilityEpoch: 0,
+        manifestHash: "synthetic",
+        expectedThoughtCount: 0,
+        expectedChunkCount: 2,
+        completedThoughtCount: 0,
+        completedChunkCount: 2,
+        createdAt: 1,
+        stagedAt: 1,
+        activatedAt: 1,
+        deactivatedAt: 2,
+      });
+      const chunk = (await ctx.db.get(chunkIds[0]!))!;
+      await ctx.db.insert("embeddingVectors", {
+        spaceId: seeded.spaceId,
+        embeddingGenerationId: olderGenerationId,
+        embeddingFingerprint: fingerprint,
+        targetKind: "chunk" as const,
+        searchScope: "legacy-scope",
+        scopeV2: embeddingVectorScopeV2({
+          spaceId: seeded.spaceId,
+          fingerprint,
+          targetKind: "chunk",
+        }),
+        chunkId: chunk._id,
+        inputHash: await sha256Hex(chunk.text),
+        embedding: vector,
+      });
+    });
+
+    const second = await seeded.t.mutation(
+      internal.models.embeddings.migrations.startTargetBackfill,
+      { spaceId: seeded.spaceId, fingerprint, now: 2_000 },
+    );
+    const driven = await drive(seeded, second.jobId!, {
+      batchSize: 8,
+      now: 2_000,
+    });
+    expect(driven.counterDrift).toBe(true);
+    const state = await seeded.t.run((ctx) =>
+      ctx.db
+        .query("spaceEmbeddingStates")
+        .withIndex("by_spaceId", (q) => q.eq("spaceId", seeded.spaceId))
+        .unique(),
+    );
+    expect(state).toMatchObject({
+      counterDrift: true,
+      counterDriftReason: "duplicate_active_fingerprint_rows",
+    });
+    // The counters are exact throughout: the extra row covers nothing.
+    expect((await storedCounters(seeded, fingerprint)).covered).toEqual({
+      thought: 0,
+      chunk: 2,
+      card: 0,
+    });
+
+    await seeded.t.mutation(
+      internal.models.embeddings.migrations.cleanupEmbeddingGenerations,
+      { spaceId: seeded.spaceId },
+    );
+    const third = await seeded.t.mutation(
+      internal.models.embeddings.migrations.startTargetBackfill,
+      { spaceId: seeded.spaceId, fingerprint, now: 3_000 },
+    );
+    const clean = await drive(seeded, third.jobId!, {
+      batchSize: 8,
+      now: 3_000,
+    });
+    expect(clean.counterDrift).toBe(false);
+  });
 
   test("auto-run schedules one successor at a time until the build is done", async () => {
     const seeded = await seedSpace();

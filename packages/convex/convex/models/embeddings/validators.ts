@@ -18,6 +18,11 @@ export const embeddingGenerationStateValidator = v.union(
   v.literal("active"),
   v.literal("failed"),
   v.literal("retired"),
+  // P2-6e. A retired generation whose vectors the cleanup has removed. The
+  // generation row itself is never deleted, because the baseline legacy-copy
+  // guard reads the fingerprint history, so the state is how an operator and
+  // a rerun tell an emptied generation from one still holding rows.
+  v.literal("retired_cleaned"),
 );
 
 export const embeddingTargetKindValidator = v.union(
@@ -118,6 +123,8 @@ export const spaceEmbeddingStateFields = {
   // Section 8.2 of the document-card plan. Absent is `all_chunks`.
   targetPolicy: v.optional(embeddingTargetPolicyValidator),
   counterDrift: v.optional(v.boolean()),
+  // Why the last audit set the flag. Absent when there is no drift.
+  counterDriftReason: v.optional(v.string()),
   // Absent until a scan phase counts them. Maintained by the same eligibility
   // write that retires the thought's target, so stats never scan thoughts.
   historicalThoughtCounts: v.optional(historicalThoughtCountsValidator),
@@ -148,6 +155,9 @@ export const embeddingBuildJobFields = {
   retiredCount: v.number(),
   auditEligibleCounts: v.optional(embeddingKindCountsValidator),
   auditCoveredCounts: v.optional(embeddingKindCountsValidator),
+  // P2-6e: targets the audit phase found holding more than one vector row
+  // under the build fingerprint, accumulated across the audit pages.
+  auditDuplicateTargets: v.optional(v.number()),
   startedAt: v.number(),
   updatedAt: v.number(),
   failureCode: v.optional(v.string()),

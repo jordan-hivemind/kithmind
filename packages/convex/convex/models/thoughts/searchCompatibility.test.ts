@@ -282,10 +282,12 @@ describe("thought vector compatibility", () => {
             ],
       );
       expect(stored.removedActiveVector === null).toBe(compatible);
-      expect(stored.retiredVector).toMatchObject({
-        thoughtId: seeded.previousId,
-        embeddingGenerationId: seeded.retiredGenerationId,
-      });
+      // P2-6h: a row an older generation wrote under the *active* fingerprint
+      // shares one `scopeV2` with the active generation's rows since P2-6d, so
+      // a transition that leaves it behind leaves a superseded memory in the
+      // candidate set. It goes with the active one. A legacy write that names
+      // no generation removes neither and leaves the shortfall to the counters.
+      expect(stored.retiredVector === null).toBe(compatible);
     },
   );
 

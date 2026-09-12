@@ -12,6 +12,7 @@ import {
   activateEmbeddingGeneration,
   bumpEmbeddingEligibilityEpoch,
   createEmbeddingGeneration,
+  deleteActiveThoughtEmbeddingVectors,
   deleteThoughtEmbeddingVectors,
   deriveEmbeddingManifest,
   embeddingVectorSearchScope,
@@ -1008,6 +1009,438 @@ describe("reader cutover", () => {
       await expect(cleanup(seeded)).rejects.toThrow(
         "no active embedding generation",
       );
+    });
+  });
+
+  /**
+   * P2-6e proper. Section 4 of the capacity plan: the active generation and
+   * the most recently retired generation of another fingerprint stay, every
+   * other generation's vectors go, and the generation rows themselves are
+   * never deleted.
+   */
+  describe("historical generation cleanup", () => {
+    async function cleanupGenerations(
+      seeded: Awaited<ReturnType<typeof seed>>,
+      args: {
+        dryRun?: boolean;
+        batchSize?: number;
+        expectedActiveGenerationId?: Id<"embeddingGenerations">;
+      } = {},
+    ) {
+      return await seeded.t.mutation(
+        internal.models.embeddings.migrations.cleanupEmbeddingGenerations,
+        { spaceId: seeded.spaceId, ...args },
+      );
+    }
+
+    async function auditSpace(
+      seeded: Awaited<ReturnType<typeof seed>>,
+      fingerprint: string,
+      now = 1_000,
+    ) {
+      return await seeded.t.mutation(
+        internal.models.embeddings.migrations.auditSpaceCoverage,
+        { spaceId: seeded.spaceId, fingerprint, now },
+      );
+    }
+
+    async function vectorRows(seeded: Awaited<ReturnType<typeof seed>>) {
+      return await seeded.t.run((ctx) =>
+        ctx.db.query("embeddingVectors").collect(),
+      );
+    }
+
+    async function generationStates(seeded: Awaited<ReturnType<typeof seed>>) {
+      const rows = await seeded.t.run((ctx) =>
+        ctx.db.query("embeddingGenerations").collect(),
+      );
+      return new Map(rows.map((row) => [row._id, row.state]));
+    }
+
+    async function counters(seeded: Awaited<ReturnType<typeof seed>>) {
+      const state = await spaceState(seeded);
+      return {
+        eligibleCounts: state.eligibleCounts,
+        coveredCounts: state.coveredCounts,
+        counterDrift: state.counterDrift,
+      };
+    }
+
+    /** The production shape: five generations across two fingerprints. */
+    async function seedFiveGenerations() {
+      const seeded = await seed();
+      const active = await activateWithThoughtVector(seeded);
+      const content = (await seeded.t.run((ctx) =>
+        ctx.db.get(seeded.thoughtId),
+      ))!.content;
+      const inputHash = await sha256Hex(content);
+      const otherFingerprint = await fingerprintEmbeddingConfig(otherProfile);
+      // An older generation of the *active* fingerprint: the P2-6h class.
+      const staleActive = await insertRawVector(seeded, {
+        fingerprint: active.fingerprint,
+        inputHash,
+        profile: baselineProfile,
+      });
+      const oldRollback = await insertRawVector(seeded, {
+        fingerprint: otherFingerprint,
+        inputHash,
+        profile: otherProfile,
+      });
+      const newestRollback = await insertRawVector(seeded, {
+        fingerprint: otherFingerprint,
+        inputHash,
+        profile: otherProfile,
+      });
+      const failed = await insertRawVector(seeded, {
+        fingerprint: otherFingerprint,
+        inputHash,
+        profile: otherProfile,
+      });
+      await seeded.t.run(async (ctx) => {
+        await ctx.db.patch(staleActive.generationId, {
+          state: "retired",
+          activatedAt: 5,
+          deactivatedAt: 6,
+        });
+        await ctx.db.patch(oldRollback.generationId, {
+          state: "retired",
+          activatedAt: 5,
+          deactivatedAt: 7,
+        });
+        await ctx.db.patch(newestRollback.generationId, {
+          state: "retired",
+          activatedAt: 7,
+          deactivatedAt: 8,
+        });
+        await ctx.db.patch(failed.generationId, {
+          state: "failed",
+          failureCode: "synthetic",
+          failureMessage: "abandoned build",
+          failedAt: 9,
+        });
+      });
+      return {
+        seeded,
+        active,
+        otherFingerprint,
+        staleActive,
+        oldRollback,
+        newestRollback,
+        failed,
+      };
+    }
+
+    test("keeps the active generation and the newest retired fingerprint", async () => {
+      const fixture = await seedFiveGenerations();
+      const { seeded, active } = fixture;
+      const before = await counters(seeded);
+
+      const dry = await cleanupGenerations(seeded, { dryRun: true });
+      expect(dry).toMatchObject({
+        dryRun: true,
+        activeFingerprint: active.fingerprint,
+        activeEmbeddingGenerationId: active.generationId,
+        retainedEmbeddingGenerationId: fixture.newestRollback.generationId,
+        scanned: 3,
+        deleted: 0,
+        // Every row here belongs to a target that still holds its active row,
+        // so none of them is anyone's only coverage.
+        duplicates: 3,
+        soleRows: 0,
+        coverageReleased: 0,
+        cleanedGenerations: 0,
+        remaining: false,
+      });
+      const roles = new Map(
+        dry.generations.map((row) => [row.embeddingGenerationId, row]),
+      );
+      expect(roles.get(active.generationId)).toMatchObject({
+        role: "active",
+        pageRows: 0,
+      });
+      expect(roles.get(fixture.newestRollback.generationId)).toMatchObject({
+        role: "retained",
+        state: "retired",
+        pageRows: 0,
+      });
+      expect(roles.get(fixture.staleActive.generationId)).toMatchObject({
+        role: "deletable",
+        fingerprint: active.fingerprint,
+        pageRows: 1,
+        hasMoreRows: false,
+        cleaned: false,
+      });
+      expect(roles.get(fixture.failed.generationId)).toMatchObject({
+        role: "deletable",
+        state: "failed",
+        pageRows: 1,
+      });
+      // A dry run writes nothing.
+      expect(await vectorRows(seeded)).toHaveLength(5);
+      expect(await counters(seeded)).toEqual(before);
+
+      const run = await cleanupGenerations(seeded);
+      expect(run).toMatchObject({
+        dryRun: false,
+        scanned: 3,
+        deleted: 3,
+        duplicates: 3,
+        soleRows: 0,
+        coverageReleased: 0,
+        // The failed generation keeps its state; only a retired one is marked.
+        cleanedGenerations: 2,
+        remaining: false,
+      });
+
+      const remaining = await vectorRows(seeded);
+      expect(remaining.map((row) => row._id).sort()).toEqual(
+        [active.vectorId, fixture.newestRollback.vectorId].sort(),
+      );
+      expect(await counters(seeded)).toEqual(before);
+      const states = await generationStates(seeded);
+      expect(states.size).toBe(5);
+      expect(states.get(active.generationId)).toBe("active");
+      expect(states.get(fixture.newestRollback.generationId)).toBe("retired");
+      expect(states.get(fixture.staleActive.generationId)).toBe(
+        "retired_cleaned",
+      );
+      expect(states.get(fixture.oldRollback.generationId)).toBe(
+        "retired_cleaned",
+      );
+      expect(states.get(fixture.failed.generationId)).toBe("failed");
+
+      // Rerunning finds nothing and changes nothing.
+      expect(await cleanupGenerations(seeded)).toMatchObject({
+        scanned: 0,
+        deleted: 0,
+        cleanedGenerations: 0,
+        remaining: false,
+      });
+      expect(await counters(seeded)).toEqual(before);
+    });
+
+    test("pages without touching the active generation under interleaved writes", async () => {
+      const seeded = await seed();
+      const active = await activateWithThoughtVector(seeded);
+      const content = (await seeded.t.run((ctx) =>
+        ctx.db.get(seeded.thoughtId),
+      ))!.content;
+      const inputHash = await sha256Hex(content);
+      const first = await insertRawVector(seeded, {
+        fingerprint: active.fingerprint,
+        inputHash,
+        profile: baselineProfile,
+      });
+      const second = await insertRawVector(seeded, {
+        fingerprint: active.fingerprint,
+        inputHash,
+        profile: baselineProfile,
+      });
+      await seeded.t.run(async (ctx) => {
+        for (const generationId of [first.generationId, second.generationId]) {
+          await ctx.db.patch(generationId, {
+            state: "retired",
+            activatedAt: 5,
+            deactivatedAt: 6,
+          });
+        }
+      });
+      const activeRowsBefore = await seeded.t.run((ctx) =>
+        ctx.db
+          .query("embeddingVectors")
+          .withIndex("by_embeddingGenerationId", (q) =>
+            q.eq("embeddingGenerationId", active.generationId),
+          )
+          .collect(),
+      );
+
+      const page = await cleanupGenerations(seeded, { batchSize: 1 });
+      expect(page).toMatchObject({ deleted: 1, remaining: true });
+
+      // A capture lands in the active generation between the pages.
+      const interleavedId = await seeded.t.run(async (ctx) => {
+        const thoughtId = await ctx.db.insert("thoughts", {
+          userId: seeded.userId,
+          spaceId: seeded.spaceId,
+          content: "A memory captured between cleanup pages",
+          embedding: Array.from(
+            { length: BASELINE_EMBEDDING_DIMENSIONS },
+            (_, index) => (index % 5) + 1,
+          ),
+          metadata,
+          memoryStatus: "current",
+        });
+        await markEligibilityTargets(ctx, seeded.spaceId, {
+          thoughtIds: [thoughtId],
+        });
+        const thought = (await ctx.db.get(thoughtId))!;
+        return await insertThoughtEmbedding(ctx, {
+          spaceId: seeded.spaceId,
+          thoughtId,
+          embeddingGenerationId: active.generationId,
+          fingerprint: active.fingerprint,
+          inputText: thought.content,
+          vector: thought.embedding,
+          bumpEligibility: false,
+        });
+      });
+
+      const last = await cleanupGenerations(seeded, {
+        batchSize: 1,
+        expectedActiveGenerationId: active.generationId,
+      });
+      expect(last).toMatchObject({ deleted: 1, remaining: false });
+
+      const activeRowsAfter = await seeded.t.run((ctx) =>
+        ctx.db
+          .query("embeddingVectors")
+          .withIndex("by_embeddingGenerationId", (q) =>
+            q.eq("embeddingGenerationId", active.generationId),
+          )
+          .collect(),
+      );
+      expect(activeRowsAfter.map((row) => row._id).sort()).toEqual(
+        [...activeRowsBefore.map((row) => row._id), interleavedId].sort(),
+      );
+      // Byte-identical, not merely present.
+      for (const before of activeRowsBefore) {
+        expect(activeRowsAfter.find((row) => row._id === before._id)).toEqual(
+          before,
+        );
+      }
+
+      // A caller that names a stale active pointer is refused outright.
+      await expect(
+        cleanupGenerations(seeded, {
+          expectedActiveGenerationId: first.generationId,
+        }),
+      ).rejects.toThrow("Active embedding generation changed");
+    });
+
+    test("the audit flags a duplicate row and clears after the cleanup", async () => {
+      const seeded = await seed();
+      const active = await activateWithThoughtVector(seeded);
+      const content = (await seeded.t.run((ctx) =>
+        ctx.db.get(seeded.thoughtId),
+      ))!.content;
+      const inputHash = await sha256Hex(content);
+
+      const clean = await auditSpace(seeded, active.fingerprint);
+      expect(clean).toMatchObject({
+        complete: true,
+        counterDrift: false,
+        duplicateTargets: 0,
+        duplicateProbeScanned: 1,
+        duplicateProbeComplete: true,
+      });
+      expect(clean.counterDriftReason).toBeUndefined();
+
+      // The bug the reader cannot see: a second row for one target under the
+      // active fingerprint, hidden from results by the per-target dedupe.
+      const duplicate = await insertRawVector(seeded, {
+        fingerprint: active.fingerprint,
+        inputHash,
+        profile: baselineProfile,
+      });
+      await seeded.t.run((ctx) =>
+        ctx.db.patch(duplicate.generationId, {
+          state: "retired",
+          activatedAt: 5,
+          deactivatedAt: 6,
+        }),
+      );
+      const readerBefore = await hydrate(seeded, active.fingerprint, [
+        duplicate.vectorId,
+        active.vectorId,
+      ]);
+      expect(readerBefore).toHaveLength(1);
+
+      const flagged = await auditSpace(seeded, active.fingerprint, 1_100);
+      expect(flagged).toMatchObject({
+        complete: true,
+        counterDrift: true,
+        counterDriftReason: "duplicate_active_fingerprint_rows",
+        duplicateTargets: 1,
+        duplicateProbeComplete: true,
+      });
+      // The counters themselves are exact: both rows cover one target once.
+      expect(flagged.recountedEligible).toEqual(flagged.storedEligible);
+      expect(flagged.recountedCovered).toEqual(flagged.storedCovered);
+      expect((await spaceState(seeded)).counterDrift).toBe(true);
+
+      const cleanup = await cleanupGenerations(seeded);
+      expect(cleanup).toMatchObject({ deleted: 1, coverageReleased: 0 });
+
+      const cleared = await auditSpace(seeded, active.fingerprint, 1_200);
+      expect(cleared).toMatchObject({
+        counterDrift: false,
+        duplicateTargets: 0,
+      });
+      expect(cleared.counterDriftReason).toBeUndefined();
+      expect((await spaceState(seeded)).counterDrift).toBe(false);
+
+      // The reader returns the same memory before and after the cleanup.
+      const readerAfter = await hydrate(seeded, active.fingerprint, [
+        duplicate.vectorId,
+        active.vectorId,
+      ]);
+      expect(readerAfter.map((row) => row.thoughtId)).toEqual(
+        readerBefore.map((row) => row.thoughtId),
+      );
+      expect(readerAfter).toMatchObject([
+        { embeddingVectorId: active.vectorId },
+      ]);
+    });
+
+    test("a retirement removes the thought's rows in every generation, P2-6h", async () => {
+      const seeded = await seed();
+      const active = await activateWithThoughtVector(seeded);
+      const content = (await seeded.t.run((ctx) =>
+        ctx.db.get(seeded.thoughtId),
+      ))!.content;
+      const inputHash = await sha256Hex(content);
+      const stale = await insertRawVector(seeded, {
+        fingerprint: active.fingerprint,
+        inputHash,
+        profile: baselineProfile,
+      });
+      const otherFingerprint = await fingerprintEmbeddingConfig(otherProfile);
+      const rollback = await insertRawVector(seeded, {
+        fingerprint: otherFingerprint,
+        inputHash,
+        profile: otherProfile,
+      });
+      await seeded.t.run((ctx) =>
+        ctx.db.patch(stale.generationId, {
+          state: "retired",
+          activatedAt: 5,
+          deactivatedAt: 6,
+        }),
+      );
+
+      await seeded.t.run((ctx) =>
+        ctx.db.patch(seeded.thoughtId, { memoryStatus: "retracted" }),
+      );
+      const deleted = await seeded.t.run((ctx) =>
+        deleteActiveThoughtEmbeddingVectors(ctx, {
+          spaceId: seeded.spaceId,
+          embeddingGenerationId: active.generationId,
+          fingerprint: active.fingerprint,
+          thoughtIds: [seeded.thoughtId],
+        }),
+      );
+      // Both rows of the active fingerprint, not only the active generation's.
+      expect(deleted).toBe(2);
+      expect((await vectorRows(seeded)).map((row) => row._id)).toEqual([
+        rollback.vectorId,
+      ]);
+      // One marker, one release: the counter cannot go negative.
+      expect((await counters(seeded)).coveredCounts).toEqual([
+        {
+          fingerprint: active.fingerprint,
+          counts: { thought: 0, chunk: 0, card: 0 },
+        },
+      ]);
     });
   });
 });
