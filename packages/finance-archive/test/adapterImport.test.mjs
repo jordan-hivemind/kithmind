@@ -1455,3 +1455,86 @@ test(
     assert.equal(await count(client, "review_items", "WHERE kind = $1", ["document_unparsed"]), 1);
   },
 );
+
+// --- F1-51: instrument resolution is one query per document -----------------
+//
+// The other half of a statement's round trips lived here: every holding
+// resolved its own instrument with its own query (and its own insert when it
+// was new). Against a hosted archive that is what turned two hundred holdings
+// into minutes. The rules themselves are unchanged and tested above; this
+// asserts the cost, which is the part a later edit can silently undo.
+
+test(
+  "resolving a statement's instruments costs the same number of queries for ten holdings and two hundred",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedPg(client);
+    const acquired = await acquirePdfStatementForHoldings();
+    const persisted = persist(t, acquired, "pdf_statement");
+
+    /** `n` holdings, each naming a distinct instrument by cusip. */
+    const pullOf = (n) => ({
+      institutionId: INSTITUTION.id,
+      accountId: ACCOUNT.id,
+      acquired,
+      rows: [],
+      holdings: {
+        positions: Array.from({ length: n }, (_, i) => ({
+          sourceDocument: "statement",
+          asOf: "2026-03-31",
+          instrument: {
+            symbol: `SYN${n}${i}`,
+            cusip: `${n}`.padStart(3, "0") + `${i}`.padStart(6, "0"),
+            isin: null,
+            name: `Synthetic holding ${n}-${i}`,
+          },
+          quantity: `${i + 1}`,
+          price: "50",
+          marketValue: `${(i + 1) * 50}`,
+          marketValueNote: null,
+          costBasis: "400",
+          unrealized: "100",
+          currency: "USD",
+          valuationBasis: "market_price",
+          valuationNote: "Synthetic delayed market feed.",
+          locators: { row: { source: "pdf_statement", index: i } },
+        })),
+        balances: [],
+        liabilities: [],
+      },
+      docType: "pdf_statement",
+      docDate: "2026-03-31",
+      persisted,
+    });
+
+    const measure = async (n) => {
+      const real = client.query.bind(client);
+      let queries = 0;
+      client.query = (...args) => {
+        queries += 1;
+        return real(...args);
+      };
+      try {
+        const documents = await adapterPullToImportDocuments(client, pullOf(n));
+        return { queries, documents };
+      } finally {
+        client.query = real;
+      }
+    };
+
+    const small = await measure(10);
+    const large = await measure(200);
+
+    assert.equal(small.documents[0].positions.length, 10);
+    assert.equal(large.documents[0].positions.length, 200);
+    assert.equal(
+      large.queries,
+      small.queries,
+      `resolving 200 instruments took ${large.queries} queries where 10 took ${small.queries}; ` +
+        "instrument resolution has gone back inside a per-holding loop",
+    );
+    // Every instrument really was resolved to its own row, not collapsed.
+    assert.equal(await count(client, "instruments"), 210);
+  },
+);

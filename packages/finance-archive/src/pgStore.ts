@@ -229,6 +229,57 @@ export async function lockArchiveForWrite(
   ]);
 }
 
+/**
+ * Postgres' hard limit on bind parameters in one extended-query message. A
+ * multi-row INSERT past it is refused by the server ("extended query has too
+ * many parameters"), so every batched insert in this package chunks against
+ * it rather than assuming a document is small.
+ */
+const MAX_BIND_PARAMETERS = 65_535;
+
+/**
+ * One multi-row `INSERT` per chunk instead of one statement per row (F1-51).
+ *
+ * The archive is hosted, and against a ~50-100 ms round trip the cost of an
+ * import is the number of round trips, not the number of rows: a statement
+ * carrying two hundred holdings spent about ninety seconds almost entirely
+ * waiting. Nothing about the rows changes here -- the caller still builds
+ * every tuple itself, in the same order, with the same values -- only how
+ * many messages carry them.
+ *
+ * `table` and `columns` are this package's own literals, never caller input,
+ * so they are interpolated where a bind parameter is not allowed.
+ */
+export async function insertRows(
+  client: ArchiveClient,
+  table: string,
+  columns: readonly string[],
+  rows: readonly (readonly unknown[])[],
+): Promise<void> {
+  if (rows.length === 0) return;
+  const perChunk = Math.max(
+    1,
+    Math.floor(MAX_BIND_PARAMETERS / columns.length),
+  );
+  for (let start = 0; start < rows.length; start += perChunk) {
+    const chunk = rows.slice(start, start + perChunk);
+    const values: unknown[] = [];
+    const tuples = chunk.map(
+      (row) =>
+        `(${row
+          .map((value) => {
+            values.push(value);
+            return `$${values.length}`;
+          })
+          .join(", ")})`,
+    );
+    await client.query(
+      `INSERT INTO ${table} (${columns.join(", ")}) VALUES ${tuples.join(", ")}`,
+      values,
+    );
+  }
+}
+
 /** Clients currently inside a `withArchiveTransaction` block. */
 const openTransactions = new WeakSet<object>();
 

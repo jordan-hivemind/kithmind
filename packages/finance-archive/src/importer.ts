@@ -38,6 +38,7 @@ import { toMinorUnits } from "./money.js";
 import { toNumericText } from "./pgNumeric.js";
 import {
   type ArchiveClient,
+  insertRows,
   lockArchiveForWrite,
   withArchiveTransaction,
 } from "./pgStore.js";
@@ -93,7 +94,7 @@ import {
  *   identity and should be supplied whenever an adapter's source offers one,
  *   including every paginated activity API. Without one, the importer falls
  *   back to content hashing scoped by document and row order (see
- *   `rowHashV2`'s `occurrence` field and `importRow` in this file), which
+ *   `rowHashV2`'s `occurrence` field and `importRows` in this file), which
  *   correctly collapses the same transaction reappearing on an overlapping
  *   page while still preserving two genuinely distinct rows that happen to
  *   share the same date, amount and description.
@@ -334,6 +335,111 @@ type ReviewCandidate = {
   reason: string;
 };
 
+// F1-51. The column order every batched INSERT below binds its tuples in.
+// One list per table rather than a literal repeated in two places, because
+// a column list and a values list that drift apart is a silent column swap,
+// not a syntax error.
+const TRANSACTION_COLUMNS = [
+  "id",
+  "account_id",
+  "trade_date",
+  "process_date",
+  "settle_date",
+  "date_precision",
+  "activity_type",
+  "description",
+  "instrument_id",
+  "quantity",
+  "price",
+  "amount",
+  "currency",
+  "running_balance",
+  "source_document_id",
+  "source_locator",
+  "row_hash",
+  "provider_txn_id",
+  "status",
+  "imported_at",
+] as const;
+
+const POSITION_COLUMNS = [
+  "id",
+  "account_id",
+  "as_of",
+  "instrument_id",
+  "quantity",
+  "price",
+  "market_value",
+  "cost_basis",
+  "unrealized",
+  "currency",
+  "valuation_basis",
+  "valuation_note",
+  "source_document_id",
+  "source_locator",
+  "row_hash",
+] as const;
+
+const BALANCE_COLUMNS = [
+  "id",
+  "account_id",
+  "as_of",
+  "total_value",
+  "cash",
+  "currency",
+  "period_start_value",
+  "period_end_value",
+  "source_document_id",
+  "source_locator",
+  "row_hash",
+] as const;
+
+const LIABILITY_COLUMNS = [
+  "id",
+  "institution_id",
+  "account_id",
+  "kind",
+  "display_name",
+  "balance",
+  "currency",
+  "rate",
+  "as_of",
+  "collateral_note",
+  "source_document_id",
+  "source_locator",
+  "row_hash",
+] as const;
+
+/** Shared with `adapterImport.ts`, which buffers its own review items. */
+export const REVIEW_COLUMNS = [
+  "id",
+  "kind",
+  "account_id",
+  "source_document_id",
+  "source_locator",
+  "raw_value",
+  "reason",
+] as const;
+
+/**
+ * One holding (a position, balance or liability) ready to insert: the values
+ * its columns take, its own `row_hash` (F1-49), and the review items it
+ * earned. All three tables dedupe by `row_hash` and differ only in their
+ * columns, so one shape and one batching function serve all three.
+ */
+type PreparedHolding = {
+  hash: string;
+  values: unknown[];
+  pending: ReviewCandidate[];
+  accountId: string | null;
+  sourceLocator: string;
+};
+
+/** `transactions`' provider-id identity: per account, not global. */
+function providerKey(accountId: string, providerTxnId: string): string {
+  return `${accountId}\u0000${providerTxnId}`;
+}
+
 /**
  * Imports one batch and immediately reconciles what it imported, as one
  * atomic publication.
@@ -406,41 +512,64 @@ export async function importBatch(
   let reviewItemsOpened = 0;
   let reviewItemsResolved = 0;
 
-  async function openReview(
+  // F1-51. Review items are buffered in the order they are opened and
+  // written with one multi-row INSERT per document (`flushReviews`), rather
+  // than one round trip each. The order they are opened in is unchanged, and
+  // nothing between here and the flush reads `review_items` back except the
+  // `document_unparsed` check, which is scoped to a kind this loop only ever
+  // appends (never queries).
+  let reviews: unknown[][] = [];
+
+  function openReview(
     accountId: string | null,
     documentId: string | null,
     sourceLocator: string | null,
     candidate: ReviewCandidate,
-  ): Promise<void> {
-    await client.query(
-      `INSERT INTO review_items
-         (id, kind, account_id, source_document_id, source_locator, raw_value, reason)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [
-        randomUUID(),
-        candidate.kind,
-        accountId,
-        documentId,
-        sourceLocator,
-        candidate.rawValue,
-        candidate.reason,
-      ],
-    );
+  ): void {
+    reviews.push([
+      randomUUID(),
+      candidate.kind,
+      accountId,
+      documentId,
+      sourceLocator,
+      candidate.rawValue,
+      candidate.reason,
+    ]);
     reviewItemsOpened += 1;
   }
 
-  async function importRow(
+  async function flushReviews(): Promise<void> {
+    const pending = reviews;
+    reviews = [];
+    await insertRows(client, "review_items", REVIEW_COLUMNS, pending);
+  }
+
+  /**
+   * Everything one transaction row needs, computed without touching the
+   * database: the canonicalized values that go into the columns, the review
+   * items they earned, and the row hash. Splitting this out is what lets a
+   * whole document's rows be deduplicated in one query each and inserted in
+   * one statement (F1-51) while the per-row rules stay exactly as they were.
+   */
+  type PreparedTransaction = {
+    row: ImportRow;
+    hash: string;
+    values: unknown[];
+    pending: ReviewCandidate[];
+  };
+
+  function prepareRow(
     row: ImportRow,
     documentId: string,
     occurrences: Map<string, number>,
-  ): Promise<"inserted" | "deduplicated" | "refused"> {
+  ): PreparedTransaction | null {
     if (!ISO_DATE.test(row.processDate)) {
-      await openReview(row.accountId, documentId, row.sourceLocator, {
+      openReview(row.accountId, documentId, row.sourceLocator, {
         kind: "unparseable_process_date",
         rawValue: row.processDate,
         reason: "process date is not a valid ISO YYYY-MM-DD date",
       });
-      return "refused";
+      return null;
     }
 
     const pending: ReviewCandidate[] = [];
@@ -519,62 +648,11 @@ export async function importBatch(
 
     const hash = rowHashV2({ ...content, occurrence });
 
-    if (row.providerTxnId) {
-      const byProviderId = await client.query(
-        "SELECT 1 FROM transactions WHERE account_id = $1 AND provider_txn_id = $2",
-        [row.accountId, row.providerTxnId],
-      );
-      if ((byProviderId.rowCount ?? 0) > 0) {
-        // Same account, same stable id: a re-encounter of an already-imported
-        // row, most often from an overlapping page in a paginated pull. This
-        // is an authoritative identity match, not evidence, so no review item.
-        return "deduplicated";
-      }
-      // ponytail: two distinct provider ids landing on the same content and
-      // the same per-document occurrence ordinal, in two unrelated
-      // documents, would hit the row_hash UNIQUE constraint here and abort
-      // the batch loudly rather than silently merge or drop either row.
-      // Real enough only if genuinely identical transactions happen on the
-      // same account, day and ordinal position across separate pulls; widen
-      // the hash to include provider_txn_id if that ever fires.
-    } else {
-      const byHash = await client.query<{
-        id: string;
-        source_document_id: string | null;
-        source_locator: string | null;
-      }>(
-        "SELECT id, source_document_id, source_locator FROM transactions WHERE row_hash = $1",
-        [hash],
-      );
-      const existing = byHash.rows[0];
-      if (existing) {
-        // No stable id, so this collapse rests on content evidence rather
-        // than a stable identifier. Within one document that never happens
-        // (each occurrence in a document gets its own ordinal); across two
-        // documents it is exactly the overlapping-page case, or, rarely, a
-        // genuine coincidence. Either way, make the collapse visible.
-        if (existing.source_document_id !== documentId) {
-          await openReview(row.accountId, documentId, row.sourceLocator, {
-            kind: "cross_document_duplicate",
-            rawValue: existing.id,
-            reason:
-              `matches an existing transaction from document ${existing.source_document_id} ` +
-              `at ${existing.source_locator}; collapsed on content evidence, not a stable id`,
-          });
-        }
-        return "deduplicated";
-      }
-    }
-
-    await client.query(
-      `INSERT INTO transactions
-         (id, account_id, trade_date, process_date, settle_date, date_precision,
-          activity_type, description, instrument_id, quantity, price, amount,
-          currency, running_balance, source_document_id, source_locator,
-          row_hash, provider_txn_id, status, imported_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-               $16, $17, $18, $19, $20)`,
-      [
+    return {
+      row,
+      hash,
+      pending,
+      values: [
         randomUUID(),
         row.accountId,
         tradeDate,
@@ -596,11 +674,150 @@ export async function importBatch(
         pending.length > 0 ? "review" : "imported",
         startedAt,
       ],
-    );
-    for (const candidate of pending) {
-      await openReview(row.accountId, documentId, row.sourceLocator, candidate);
+    };
+  }
+
+  /**
+   * One document's transaction rows: two dedupe lookups for the whole
+   * document instead of one per row, then one multi-row INSERT (F1-51).
+   *
+   * The in-memory `seenProvider`/`seenByHash` indexes are not a cache. They
+   * are what makes a row see the rows *earlier in this same document* exactly
+   * as it saw them when each insert was its own statement: a second row
+   * carrying an already-inserted provider id still deduplicates, and a row
+   * whose hash an earlier row in this document already inserted still
+   * collapses with no review item (same document, so no cross-document
+   * evidence to record). Rows from earlier documents are already committed
+   * to this transaction by the time the next document's lookups run, so they
+   * come back from the database as before.
+   */
+  async function importRows(
+    rows: readonly ImportRow[],
+    documentId: string,
+    occurrences: Map<string, number>,
+  ): Promise<boolean> {
+    const prepared: PreparedTransaction[] = [];
+    for (const row of rows) {
+      const ready = prepareRow(row, documentId, occurrences);
+      if (ready === null) rowsRefused += 1;
+      else prepared.push(ready);
     }
-    return "inserted";
+    if (prepared.length === 0) return false;
+
+    const withProviderId = prepared.filter((p) => p.row.providerTxnId);
+    const seenProvider = new Set<string>();
+    if (withProviderId.length > 0) {
+      // Both columns, not just the provider id: `transactions_provider_txn_id`
+      // leads on `account_id`, and an index the leading column is missing from
+      // is an index the planner cannot use. The pair set is the cross product
+      // of this document's accounts and provider ids, which is wider than the
+      // pairs actually asked about, so the exact pairs are matched below.
+      const found = await client.query<{
+        account_id: string;
+        provider_txn_id: string;
+      }>(
+        `SELECT account_id, provider_txn_id FROM transactions
+          WHERE account_id = ANY($1::text[]) AND provider_txn_id = ANY($2::text[])`,
+        [
+          [...new Set(withProviderId.map((p) => p.row.accountId))],
+          [...new Set(withProviderId.map((p) => p.row.providerTxnId))],
+        ],
+      );
+      for (const existing of found.rows) {
+        seenProvider.add(
+          providerKey(existing.account_id, existing.provider_txn_id),
+        );
+      }
+    }
+
+    const hashes = prepared
+      .filter((p) => !p.row.providerTxnId)
+      .map((p) => p.hash);
+    const seenByHash = new Map<
+      string,
+      {
+        id: string;
+        source_document_id: string | null;
+        source_locator: string | null;
+      }
+    >();
+    if (hashes.length > 0) {
+      const found = await client.query<{
+        id: string;
+        source_document_id: string | null;
+        source_locator: string | null;
+        row_hash: string;
+      }>(
+        "SELECT id, source_document_id, source_locator, row_hash FROM transactions WHERE row_hash = ANY($1::text[])",
+        [hashes],
+      );
+      // row_hash is UNIQUE, so this is one row per hash, exactly what the
+      // per-row `rows[0]` lookup returned.
+      for (const existing of found.rows) {
+        seenByHash.set(existing.row_hash, existing);
+      }
+    }
+
+    const toInsert: unknown[][] = [];
+    let anySuccess = false;
+    for (const p of prepared) {
+      if (p.row.providerTxnId) {
+        const key = providerKey(p.row.accountId, p.row.providerTxnId);
+        if (seenProvider.has(key)) {
+          // Same account, same stable id: a re-encounter of an
+          // already-imported row, most often from an overlapping page in a
+          // paginated pull. This is an authoritative identity match, not
+          // evidence, so no review item.
+          rowsDeduplicated += 1;
+          anySuccess = true;
+          continue;
+        }
+        seenProvider.add(key);
+        // ponytail: two distinct provider ids landing on the same content and
+        // the same per-document occurrence ordinal, in two unrelated
+        // documents, would hit the row_hash UNIQUE constraint here and abort
+        // the batch loudly rather than silently merge or drop either row.
+        // Real enough only if genuinely identical transactions happen on the
+        // same account, day and ordinal position across separate pulls; widen
+        // the hash to include provider_txn_id if that ever fires.
+      } else {
+        const existing = seenByHash.get(p.hash);
+        if (existing) {
+          // No stable id, so this collapse rests on content evidence rather
+          // than a stable identifier. Within one document that never happens
+          // (each occurrence in a document gets its own ordinal); across two
+          // documents it is exactly the overlapping-page case, or, rarely, a
+          // genuine coincidence. Either way, make the collapse visible.
+          if (existing.source_document_id !== documentId) {
+            openReview(p.row.accountId, documentId, p.row.sourceLocator, {
+              kind: "cross_document_duplicate",
+              rawValue: existing.id,
+              reason:
+                `matches an existing transaction from document ${existing.source_document_id} ` +
+                `at ${existing.source_locator}; collapsed on content evidence, not a stable id`,
+            });
+          }
+          rowsDeduplicated += 1;
+          anySuccess = true;
+          continue;
+        }
+      }
+
+      seenByHash.set(p.hash, {
+        id: p.values[0] as string,
+        source_document_id: documentId,
+        source_locator: p.row.sourceLocator,
+      });
+      toInsert.push(p.values);
+      for (const candidate of p.pending) {
+        openReview(p.row.accountId, documentId, p.row.sourceLocator, candidate);
+      }
+      rowsInserted += 1;
+      anySuccess = true;
+    }
+
+    await insertRows(client, "transactions", TRANSACTION_COLUMNS, toInsert);
+    return anySuccess;
   }
 
   /**
@@ -615,18 +832,18 @@ export async function importBatch(
    * store, the same reasoning as `transactions.process_date`. Every other
    * malformed or missing field stores NULL and opens a review item instead.
    */
-  async function importPosition(
+  function preparePosition(
     position: ImportPosition,
     accountId: string,
     documentId: string,
-  ): Promise<"inserted" | "deduplicated" | "refused"> {
+  ): PreparedHolding | null {
     if (!ISO_DATE.test(position.asOf)) {
-      await openReview(accountId, documentId, position.sourceLocator, {
+      openReview(accountId, documentId, position.sourceLocator, {
         kind: "unparseable_as_of",
         rawValue: position.asOf,
         reason: "as_of is not a valid ISO YYYY-MM-DD date",
       });
-      return "refused";
+      return null;
     }
 
     const pending: ReviewCandidate[] = [];
@@ -689,21 +906,13 @@ export async function importBatch(
       valuationBasis,
       sourceLocator: position.sourceLocator,
     });
-    const byHash = await client.query(
-      "SELECT 1 FROM positions WHERE row_hash = $1",
-      [hash],
-    );
-    if ((byHash.rowCount ?? 0) > 0) {
-      return "deduplicated";
-    }
 
-    await client.query(
-      `INSERT INTO positions
-         (id, account_id, as_of, instrument_id, quantity, price, market_value,
-          cost_basis, unrealized, currency, valuation_basis, valuation_note,
-          source_document_id, source_locator, row_hash)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
-      [
+    return {
+      hash,
+      pending,
+      accountId,
+      sourceLocator: position.sourceLocator,
+      values: [
         randomUUID(),
         accountId,
         position.asOf,
@@ -720,30 +929,21 @@ export async function importBatch(
         position.sourceLocator,
         hash,
       ],
-    );
-    for (const candidate of pending) {
-      await openReview(
-        accountId,
-        documentId,
-        position.sourceLocator,
-        candidate,
-      );
-    }
-    return "inserted";
+    };
   }
 
-  async function importBalance(
+  function prepareBalance(
     balance: ImportBalance,
     accountId: string,
     documentId: string,
-  ): Promise<"inserted" | "deduplicated" | "refused"> {
+  ): PreparedHolding | null {
     if (!ISO_DATE.test(balance.asOf)) {
-      await openReview(accountId, documentId, balance.sourceLocator, {
+      openReview(accountId, documentId, balance.sourceLocator, {
         kind: "unparseable_as_of",
         rawValue: balance.asOf,
         reason: "as_of is not a valid ISO YYYY-MM-DD date",
       });
-      return "refused";
+      return null;
     }
 
     const pending: ReviewCandidate[] = [];
@@ -779,21 +979,13 @@ export async function importBatch(
       totalValue,
       cash,
     });
-    const byHash = await client.query(
-      "SELECT 1 FROM balances WHERE row_hash = $1",
-      [hash],
-    );
-    if ((byHash.rowCount ?? 0) > 0) {
-      return "deduplicated";
-    }
 
-    await client.query(
-      `INSERT INTO balances
-         (id, account_id, as_of, total_value, cash, currency,
-          period_start_value, period_end_value, source_document_id, source_locator,
-          row_hash)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-      [
+    return {
+      hash,
+      pending,
+      accountId,
+      sourceLocator: balance.sourceLocator,
+      values: [
         randomUUID(),
         accountId,
         balance.asOf,
@@ -806,26 +998,22 @@ export async function importBatch(
         balance.sourceLocator,
         hash,
       ],
-    );
-    for (const candidate of pending) {
-      await openReview(accountId, documentId, balance.sourceLocator, candidate);
-    }
-    return "inserted";
+    };
   }
 
-  async function importLiability(
+  function prepareLiability(
     liability: ImportLiability,
     institutionId: string | null,
     accountId: string | null,
     documentId: string,
-  ): Promise<"inserted" | "deduplicated" | "refused"> {
+  ): PreparedHolding | null {
     if (!ISO_DATE.test(liability.asOf)) {
-      await openReview(accountId, documentId, liability.sourceLocator, {
+      openReview(accountId, documentId, liability.sourceLocator, {
         kind: "unparseable_as_of",
         rawValue: liability.asOf,
         reason: "as_of is not a valid ISO YYYY-MM-DD date",
       });
-      return "refused";
+      return null;
     }
 
     const pending: ReviewCandidate[] = [];
@@ -848,20 +1036,13 @@ export async function importBatch(
       asOf: liability.asOf,
       balance: balanceAmount,
     });
-    const byHash = await client.query(
-      "SELECT 1 FROM liabilities WHERE row_hash = $1",
-      [hash],
-    );
-    if ((byHash.rowCount ?? 0) > 0) {
-      return "deduplicated";
-    }
 
-    await client.query(
-      `INSERT INTO liabilities
-         (id, institution_id, account_id, kind, display_name, balance, currency,
-          rate, as_of, collateral_note, source_document_id, source_locator, row_hash)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
-      [
+    return {
+      hash,
+      pending,
+      accountId,
+      sourceLocator: liability.sourceLocator,
+      values: [
         randomUUID(),
         institutionId,
         accountId,
@@ -876,16 +1057,48 @@ export async function importBatch(
         liability.sourceLocator,
         hash,
       ],
+    };
+  }
+
+  /**
+   * One document's positions, balances or liabilities: one `row_hash` lookup
+   * for the whole table and one multi-row INSERT, in place of two round trips
+   * per holding (F1-51). `seen` starts as what the database already has and
+   * grows as rows are accepted, so two identical holdings inside one document
+   * still collapse exactly as they did when each insert was its own
+   * statement.
+   */
+  async function importHoldings(
+    table: string,
+    columns: readonly string[],
+    prepared: readonly PreparedHolding[],
+    documentId: string,
+  ): Promise<boolean> {
+    if (prepared.length === 0) return false;
+    const found = await client.query<{ row_hash: string }>(
+      `SELECT row_hash FROM ${table} WHERE row_hash = ANY($1::text[])`,
+      [prepared.map((p) => p.hash)],
     );
-    for (const candidate of pending) {
-      await openReview(
-        accountId,
-        documentId,
-        liability.sourceLocator,
-        candidate,
-      );
+    const seen = new Set(found.rows.map((r) => r.row_hash));
+
+    const toInsert: unknown[][] = [];
+    let anySuccess = false;
+    for (const p of prepared) {
+      if (seen.has(p.hash)) {
+        rowsDeduplicated += 1;
+        anySuccess = true;
+        continue;
+      }
+      seen.add(p.hash);
+      toInsert.push(p.values);
+      for (const candidate of p.pending) {
+        openReview(p.accountId, documentId, p.sourceLocator, candidate);
+      }
+      rowsInserted += 1;
+      anySuccess = true;
     }
-    return "inserted";
+    await insertRows(client, table, columns, toInsert);
+    return anySuccess;
   }
 
   return withArchiveTransaction(client, async () => {
@@ -989,11 +1202,15 @@ export async function importBatch(
           [documentId],
         );
         if (alreadyFlagged.rowCount === 0) {
-          await client.query(
-            `INSERT INTO review_items (id, kind, account_id, source_document_id, source_locator, raw_value, reason)
-             VALUES ($1, 'document_unparsed', $2, $3, NULL, NULL, $4)`,
-            [randomUUID(), document.accountId, documentId, document.parseNote.slice(0, 500)],
-          );
+          reviews.push([
+            randomUUID(),
+            "document_unparsed",
+            document.accountId,
+            documentId,
+            null,
+            null,
+            document.parseNote.slice(0, 500),
+          ]);
           reviewItemsOpened += 1;
         }
       } else {
@@ -1020,26 +1237,16 @@ export async function importBatch(
         );
         reviewItemsResolved += resolved.rowCount ?? 0;
       }
-      for (const row of document.rows) {
-        const outcome = await importRow(row, documentId, occurrences);
-        if (outcome === "inserted") {
-          rowsInserted += 1;
-          anySuccess = true;
-        } else if (outcome === "deduplicated") {
-          rowsDeduplicated += 1;
-          anySuccess = true;
-        } else {
-          rowsRefused += 1;
-        }
+      if (await importRows(document.rows, documentId, occurrences)) {
+        anySuccess = true;
       }
 
-      const positions = document.positions ?? [];
-      const balances = document.balances ?? [];
       // F1-46: each holding's own accountId (a consolidated statement's
       // per-section attribution) wins over the document's, which stays the
       // fallback for the ordinary one-document-one-account case -- see
       // ImportPosition.accountId's doc comment.
-      for (const position of positions) {
+      const preparedPositions: PreparedHolding[] = [];
+      for (const position of document.positions ?? []) {
         const accountId = position.accountId ?? document.accountId;
         if (accountId === null) {
           throw new Error(
@@ -1047,18 +1254,23 @@ export async function importBatch(
               "positions.account_id and balances.account_id are NOT NULL",
           );
         }
-        const outcome = await importPosition(position, accountId, documentId);
-        if (outcome === "inserted") {
-          rowsInserted += 1;
-          anySuccess = true;
-        } else if (outcome === "deduplicated") {
-          rowsDeduplicated += 1;
-          anySuccess = true;
-        } else {
-          rowsRefused += 1;
-        }
+        const ready = preparePosition(position, accountId, documentId);
+        if (ready === null) rowsRefused += 1;
+        else preparedPositions.push(ready);
       }
-      for (const balance of balances) {
+      if (
+        await importHoldings(
+          "positions",
+          POSITION_COLUMNS,
+          preparedPositions,
+          documentId,
+        )
+      ) {
+        anySuccess = true;
+      }
+
+      const preparedBalances: PreparedHolding[] = [];
+      for (const balance of document.balances ?? []) {
         const accountId = balance.accountId ?? document.accountId;
         if (accountId === null) {
           throw new Error(
@@ -1066,34 +1278,44 @@ export async function importBatch(
               "positions.account_id and balances.account_id are NOT NULL",
           );
         }
-        const outcome = await importBalance(balance, accountId, documentId);
-        if (outcome === "inserted") {
-          rowsInserted += 1;
-          anySuccess = true;
-        } else if (outcome === "deduplicated") {
-          rowsDeduplicated += 1;
-          anySuccess = true;
-        } else {
-          rowsRefused += 1;
-        }
+        const ready = prepareBalance(balance, accountId, documentId);
+        if (ready === null) rowsRefused += 1;
+        else preparedBalances.push(ready);
       }
+      if (
+        await importHoldings(
+          "balances",
+          BALANCE_COLUMNS,
+          preparedBalances,
+          documentId,
+        )
+      ) {
+        anySuccess = true;
+      }
+
+      const preparedLiabilities: PreparedHolding[] = [];
       for (const liability of document.liabilities ?? []) {
-        const outcome = await importLiability(
+        const ready = prepareLiability(
           liability,
           document.institutionId,
           liability.accountId ?? document.accountId,
           documentId,
         );
-        if (outcome === "inserted") {
-          rowsInserted += 1;
-          anySuccess = true;
-        } else if (outcome === "deduplicated") {
-          rowsDeduplicated += 1;
-          anySuccess = true;
-        } else {
-          rowsRefused += 1;
-        }
+        if (ready === null) rowsRefused += 1;
+        else preparedLiabilities.push(ready);
       }
+      if (
+        await importHoldings(
+          "liabilities",
+          LIABILITY_COLUMNS,
+          preparedLiabilities,
+          documentId,
+        )
+      ) {
+        anySuccess = true;
+      }
+
+      await flushReviews();
 
       // F1-49. `parsed_ok` used to be `!documentRefused`: any single
       // refusal anywhere in the document (even alongside 1000 clean rows)
@@ -1283,6 +1505,12 @@ function checkedMoney(text: string, currency: string): string {
  * inserted row count (the UNIQUE constraint already guarantees this; this is
  * a defensive re-check against the aggregate, not trust in the schema alone),
  * and that every transaction resolves to an account.
+ *
+ * ponytail: both of these aggregate over the whole `transactions` table on
+ * every batch, which with `--commit-every 1` means once per document. That is
+ * a scan, not a round trip, so it is not what F1-51 was about; scope it to the
+ * run's own rows (or drop it for the UNIQUE constraint it re-checks) if a
+ * large archive ever makes it the next bottleneck.
  */
 async function assertInvariants(client: ArchiveClient): Promise<void> {
   const counts = await client.query<{ total: string; distinct_hashes: string }>(
