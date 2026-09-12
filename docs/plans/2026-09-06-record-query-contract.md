@@ -35,6 +35,37 @@ zero, preserving existing text-only receipts. Staging and activation check
 actual counts even when the expected count is zero. No old free-text
 `sourceRef` is promoted into typed evidence automatically.
 
+### Update 2026-09-12: document cards (P2-70c)
+
+Six document-card kinds join the event kinds:
+[`document_card`, `safe_note_card`, `tax_return_card`, `k1_card`,
+`brokerage_tax_package_card` and `spreadsheet_card`](./2026-09-12-document-cards.md).
+A card is a record, not a second store: one card is one event with identity
+`(sourceItemId, "card:<recordKind>")`, one card version is one event version
+per processing generation, and one card field is one observation. A repeated
+field uses `<observationType>:<ordinal>` observation keys under one
+observation type, so `observation_history` lists every party, employer or
+payer in one call.
+
+| Constraint  | Cards                                                                                                                                                                            |
+| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Event kinds | Six added. Nothing is removed.                                                                                                                                                   |
+| Entity kind | `safe_note_card` is a person or organization. `tax_return_card`, `k1_card` and `brokerage_tax_package_card` are a person.                                                        |
+| Entity      | `document_card` and `spreadsheet_card` belong to the source account's configured `subjectEntityId`.                                                                              |
+| Value types | Money fields are `money`, rates are `decimal` with a unit code, clause flags are `boolean`, `tax_year` is `integer`, name fields are `entity` when resolved and `text` when not. |
+| Fields      | A field outside the kind's declared list is refused, as is a value of the wrong type.                                                                                            |
+| Evidence    | Every stored field binds to `evidenceSpans` rows. A field whose span does not resolve, or whose `quoteHash` does not match, is not stored at all, and the drop is recorded.      |
+
+A card version is a processing generation over the same source revision and
+the same sealed text version, taking a new record fingerprint built from the
+card schema, playbook, prompt and gate versions and the accepted tier. It
+activates atomically and carries the previous generation's document and chunk
+rows forward, so a re-extraction retires no retained text and old card
+versions stay addressable.
+
+The 256-row scan, 25-row page, 96 KiB and 2 MiB limits are unchanged and still
+bind, so a year with many cards pages with a cursor.
+
 ## Values and dates
 
 Values are a discriminated union of decimal, money, integer, text, boolean,

@@ -1,15 +1,43 @@
 import { v, type Infer } from "convex/values";
 
+import { CARD_RECORD_KINDS } from "./cardSchemas";
 import {
   observationValueValidator,
   occurrenceValidator,
 } from "./valueValidators";
 
+/**
+ * Version 1 kinds, plus the six document-card kinds of section 4.2 of
+ * docs/plans/2026-09-12-document-cards.md. Cards are records: a card kind is
+ * an event kind and a card field is an observation type, so nothing new is
+ * stored for them.
+ */
 export const recordEventTypeValidator = v.union(
   v.literal("lab_panel"),
   v.literal("vehicle_service"),
   v.literal("financial_transaction"),
+  v.literal("document_card"),
+  v.literal("safe_note_card"),
+  v.literal("tax_return_card"),
+  v.literal("k1_card"),
+  v.literal("brokerage_tax_package_card"),
+  v.literal("spreadsheet_card"),
 );
+
+export type RecordEventType = Infer<typeof recordEventTypeValidator>;
+
+const RECORD_EVENT_TYPES = new Set<string>(
+  recordEventTypeValidator.members.map((member) => member.value),
+);
+
+export function isRecordEventType(value: string): value is RecordEventType {
+  return RECORD_EVENT_TYPES.has(value);
+}
+
+/** Compile-time proof that every card kind is also a record event kind. */
+const _cardKindsAreRecordEventTypes: readonly RecordEventType[] =
+  CARD_RECORD_KINDS;
+void _cardKindsAreRecordEventTypes;
 
 export const recordFieldEvidenceValidator = v.object({
   occurrence: v.array(v.id("evidenceSpans")),
@@ -41,7 +69,6 @@ export const stageRecordBatchInputValidator = v.object({
   records: v.array(stagedEventRecordValidator),
 });
 
-export type RecordEventType = Infer<typeof recordEventTypeValidator>;
 export type RecordFieldEvidence = Infer<typeof recordFieldEvidenceValidator>;
 export type StagedObservation = Infer<typeof stagedObservationValidator>;
 export type StagedEventRecord = Infer<typeof stagedEventRecordValidator>;

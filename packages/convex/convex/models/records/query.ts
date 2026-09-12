@@ -38,7 +38,7 @@ import {
   validateQueryType,
   validateSourceAccountCount,
 } from "./queryValidators";
-import type { RecordEventType } from "./validators";
+import { isRecordEventType, type RecordEventType } from "./validators";
 import {
   addDecimals,
   canonicalizeDecimal,
@@ -212,11 +212,7 @@ function asPrincipalRef(principal: Principal | PrincipalRef): PrincipalRef {
 
 function eventType(value: string): RecordEventType {
   const normalized = validateQueryType(value, "eventType");
-  if (
-    normalized !== "lab_panel" &&
-    normalized !== "vehicle_service" &&
-    normalized !== "financial_transaction"
-  ) {
+  if (!isRecordEventType(normalized)) {
     throw new Error("Unsupported eventType");
   }
   return normalized;

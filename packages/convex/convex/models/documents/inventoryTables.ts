@@ -60,6 +60,7 @@ export const inventoryTables = {
       "sourceAccountId",
       "identityKeyHash",
     ])
+    .index("by_sourceItemId", ["sourceItemId"])
     .index("by_space_account_folder", [
       "spaceId",
       "sourceAccountId",
