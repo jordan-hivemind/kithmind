@@ -210,6 +210,12 @@ export {
   type RawTreeWriteResult,
 } from "./rawTree.js";
 export {
+  selectRetainedText,
+  storeRetainedText,
+  storeRetainedTextBytes,
+  type RetainedTextWrite,
+} from "./retainedTexts.js";
+export {
   CAPTURE_MANIFEST_VERSION,
   CaptureConflictError,
   CaptureIntegrityError,

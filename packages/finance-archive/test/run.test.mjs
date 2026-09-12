@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -9,8 +9,10 @@ import test from "node:test";
 import {
   applyPgSchema,
   createArchiveClient,
+  sha256HexOf,
   SYNTHETIC_INSTITUTION_NAME,
   SYNTHETIC_INSTITUTION_SLUG,
+  textRelativePath,
 } from "../dist/index.js";
 import { all, count, skip, testSchemaName } from "./helpers/pgArchive.mjs";
 
@@ -98,6 +100,44 @@ function writeReparseAdapterFixtures(t) {
       `export default brokenAdapter;\n`,
   );
   return { fixturesDir, adapterModulePath, brokenAdapterModulePath, sessionModulePath };
+}
+
+/**
+ * F1-66. The same fixtures again, plus an adapter whose PDF-tier `parse()`
+ * reports an `extractedText` -- the retained text layer. The real synthetic
+ * adapter extracts none, so without this no run in this suite ever exercises
+ * `writeRetainedText` or the `retained_texts` row written beside it. The text
+ * is a fixed synthetic string, so the sha both writes land under is the same
+ * on every pass and a second pass is a real idempotence check.
+ */
+const EXTRACTED_TEXT =
+  "HOLDINGS\nSynthetic Neutral Fund   10.000   $1,000.00   Cost 900.00\n";
+
+function writeExtractedTextAdapterFixtures(t) {
+  const { fixturesDir, adapterModulePath, sessionModulePath } =
+    writeAdapterFixtures(t);
+  const textAdapterModulePath = join(fixturesDir, "adapter-extracted-text.mjs");
+  writeFileSync(
+    textAdapterModulePath,
+    `import { syntheticAdapter } from ${JSON.stringify(distIndexUrl)};\n` +
+      `const textAdapter = {\n` +
+      `  ...syntheticAdapter,\n` +
+      `  async parse(rawFile) {\n` +
+      `    const parsed = await syntheticAdapter.parse(rawFile);\n` +
+      `    if (rawFile.kind === "pdf_statement" || rawFile.kind === "trade_confirmation") {\n` +
+      `      return { ...parsed, extractedText: ${JSON.stringify(EXTRACTED_TEXT)} };\n` +
+      `    }\n` +
+      `    return parsed;\n` +
+      `  },\n` +
+      `};\n` +
+      `export default textAdapter;\n`,
+  );
+  return {
+    fixturesDir,
+    adapterModulePath,
+    textAdapterModulePath,
+    sessionModulePath,
+  };
 }
 
 /**
@@ -1386,5 +1426,70 @@ test(
     assert.match(output, /mode: reparse \(--only-unparsed\)/);
     assert.match(output, /documents considered: 0/);
     assert.match(output, /documents reparsed: 0/);
+  },
+);
+
+test(
+  "F1-66: an import stores the retained text in the archive beside the raw tree file, and a reparse of the same document rewrites neither",
+  { skip },
+  async (t) => {
+    const { schema, client } = await seededSchema(t);
+
+    const rawDir = mkdtempSync(join(tmpdir(), "kith-finance-retained-text-raw-"));
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+
+    const { fixturesDir, textAdapterModulePath, sessionModulePath } =
+      writeExtractedTextAdapterFixtures(t);
+    const selectionPath = reparseSelection(fixturesDir);
+
+    const runImport = makeRunner({
+      adapterModulePath: textAdapterModulePath,
+      sessionModulePath,
+      selectionPath,
+      schema,
+      rawDir,
+    });
+    assert.match(runImport(), /^mode: committed$/m);
+
+    // The row is keyed on the text's own sha, which is exactly the hash the
+    // raw tree file is content-addressed under: one identity, two places.
+    const sha256 = sha256HexOf(Buffer.from(EXTRACTED_TEXT, "utf8"));
+    const [stored] = await all(
+      client,
+      "SELECT sha256, byte_length::text AS byte_length, codepoint_length::text AS codepoint_length, content, created_at FROM retained_texts",
+    );
+    assert.ok(stored, "the import wrote the retained text into the archive");
+    assert.equal(stored.sha256, sha256);
+    assert.equal(
+      Number(stored.byte_length),
+      Buffer.byteLength(EXTRACTED_TEXT, "utf8"),
+    );
+    assert.equal(
+      Number(stored.codepoint_length),
+      Array.from(EXTRACTED_TEXT).length,
+    );
+    assert.equal(stored.content.toString("utf8"), EXTRACTED_TEXT);
+
+    // The same bytes really are on disk under the path the sha names, which
+    // is what the raw-tree fallback and the backfill both resolve.
+    assert.equal(
+      readFileSync(join(rawDir, "archive", "v1", SPACE_ID, textRelativePath(sha256)), "utf8"),
+      EXTRACTED_TEXT,
+    );
+
+    // Reparse re-extracts the identical text. Content addressing makes that a
+    // no-op rather than a conflict: still one row, still the original one.
+    const runReparse = makeReparseRunner({
+      adapterModulePath: textAdapterModulePath,
+      schema,
+      rawDir,
+    });
+    assert.match(runReparse(), /documents reparsed: 1/);
+    const rows = await all(
+      client,
+      "SELECT sha256, created_at FROM retained_texts",
+    );
+    assert.equal(rows.length, 1, "idempotent on sha: no second row, no error");
+    assert.deepEqual(rows[0].created_at, stored.created_at);
   },
 );

@@ -285,6 +285,20 @@ async function applyPrivileges(
   await client.query(
     `REVOKE ALL ON ALL TABLES IN SCHEMA ${schema} FROM PUBLIC, ${role}`,
   );
+  // Every table that exists right now, `retained_texts` (F1-66) included: the
+  // read surface verifies a `retained_text_span_v1` citation by fetching that
+  // text and reslicing the quote out of it (`verifiedAgainstRetainedText`,
+  // mcp/pgRead.ts), so the reader that has to do the verifying must be able
+  // to SELECT it. `test/pgReaderRole.test.mjs` asserts that grant by name,
+  // beside the assertion that a table this function has *not* been re-run
+  // over stays unreadable -- the two together are the whole exposure policy.
+  //
+  // On a live archive that already has a reader, migration 9 creates the
+  // table after this last ran, so it is born unreadable (NO_DEFAULT_SELECT).
+  // Re-running this function is one way to fix that and rotates the
+  // password, which a live gateway is holding; a single
+  // `GRANT SELECT ON <schema>.retained_texts TO <schema>_reader` as the
+  // archive owner is the other, and is what the F1-66 rollout used.
   await client.query(`GRANT SELECT ON ALL TABLES IN SCHEMA ${schema} TO ${role}`);
   await client.query(
     `REVOKE ALL ON ALL SEQUENCES IN SCHEMA ${schema} FROM PUBLIC, ${role}`,
