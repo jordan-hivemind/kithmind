@@ -812,6 +812,67 @@ test("retains processing capture identity across journal restart", async () => {
   }
 });
 
+test("bounds document-level parse failures and persists them across a restart", async () => {
+  const f = await setup();
+  let journal = f.journal;
+  try {
+    const originalRow = await f.catalog.createOriginalIntent(original());
+    let processingRow = await f.catalog.createProcessingIntent(
+      processing(originalRow.originalCatalogId),
+    );
+    processingRow = await f.catalog.recordParseFailure({
+      catalogId: processingRow.processingCatalogId,
+      expectedRevision: processingRow.rowRevision,
+      code: "conversion_failed",
+      now: 100,
+    });
+    assert.deepEqual(processingRow.parseFailure, {
+      code: "conversion_failed",
+      attempts: 1,
+      failedAt: 100,
+    });
+    processingRow = await f.catalog.recordParseFailure({
+      catalogId: processingRow.processingCatalogId,
+      expectedRevision: processingRow.rowRevision,
+      code: "page_limit_exceeded",
+      now: 200,
+    });
+    assert.deepEqual(processingRow.parseFailure, {
+      code: "page_limit_exceeded",
+      attempts: 2,
+      failedAt: 200,
+    });
+    // Bounded: a third failure does not push attempts past MAX_PARSE_ATTEMPTS.
+    processingRow = await f.catalog.recordParseFailure({
+      catalogId: processingRow.processingCatalogId,
+      expectedRevision: processingRow.rowRevision,
+      code: "bundle_too_large",
+      now: 300,
+    });
+    assert.deepEqual(processingRow.parseFailure, {
+      code: "bundle_too_large",
+      attempts: 2,
+      failedAt: 300,
+    });
+    await journal.close();
+    journal = await Journal.open({
+      directory: f.directory,
+      binding: f.authority,
+      credential: "km_synthetic_high_entropy_credential",
+      initialCheckpoint: { version: 1, phase: "idle" },
+      codec,
+    });
+    const reopened = await openArchiveCatalog({ journal });
+    assert.deepEqual(
+      reopened.listProcessings()[0].parseFailure,
+      processingRow.parseFailure,
+    );
+  } finally {
+    await journal.close();
+    await rm(f.directory, { recursive: true, force: true });
+  }
+});
+
 test("persists and replays an initial provider binding epoch of zero", async () => {
   const f = await setup();
   try {

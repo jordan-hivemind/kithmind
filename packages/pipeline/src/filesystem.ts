@@ -512,17 +512,105 @@ function utf8DiscoveryFile(
 }
 
 const PDF_ENCRYPT_MARKER = Buffer.from("/Encrypt");
+const PDF_EOF_MARKER = Buffer.from("%%EOF");
+const PDF_TRAILER_MARKER = Buffer.from("trailer");
+// Cross-reference streams (PDF 1.5+) carry no literal "trailer" keyword;
+// their own stream dictionary declares `/Type /XRef` instead, so that
+// substring anchors the dictionary the same way "trailer" does for a
+// classic table.
+const PDF_XREF_TYPE_MARKER = Buffer.from("/XRef");
+const PDF_DICT_OPEN = Buffer.from("<<");
+const PDF_PREV_PATTERN = /\/Prev\s+(\d+)/;
+// ponytail: each hop re-scans textually for the nearest trailer/xref-type
+// dictionary before a boundary, rather than resolving `/Prev` as a precise
+// object offset. That is exact for the current (last) revision, which is
+// all real encryption detection needs (a reader must find /Encrypt in the
+// trailer it reads first, always the last one) - bounded and cheap for the
+// rest. Upgrade to real offset resolution if an encrypted file is ever
+// found where only an older revision's dictionary carries /Encrypt.
+const MAX_PDF_TRAILER_HOPS = 8;
+// A trailer or xref-stream dictionary is a handful of short keys; anything
+// past this many bytes without a closing `>>` is treated as unparseable.
+const MAX_PDF_DICT_BYTES = 65_536;
+
+function pdfDictEnd(bytes: Buffer, openAt: number): number | undefined {
+  if (bytes[openAt] !== 0x3c || bytes[openAt + 1] !== 0x3c) return undefined;
+  let depth = 0;
+  const limit = Math.min(bytes.length - 1, openAt + MAX_PDF_DICT_BYTES);
+  for (let index = openAt; index < limit; index += 1) {
+    if (bytes[index] === 0x3c && bytes[index + 1] === 0x3c) {
+      depth += 1;
+      index += 1;
+    } else if (bytes[index] === 0x3e && bytes[index + 1] === 0x3e) {
+      depth -= 1;
+      index += 1;
+      if (depth === 0) return index + 1;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The nearest trailer dictionary (or, for a cross-reference stream, its own
+ * `/Type /XRef` stream dictionary) positioned at or before `boundary`.
+ */
+function pdfTrailerDictBefore(
+  bytes: Buffer,
+  boundary: number,
+): { start: number; end: number } | undefined {
+  const trailerAt = bytes.lastIndexOf(PDF_TRAILER_MARKER, boundary);
+  if (trailerAt >= 0) {
+    const openAt = bytes.indexOf(
+      PDF_DICT_OPEN,
+      trailerAt + PDF_TRAILER_MARKER.length,
+    );
+    const end = openAt < 0 ? undefined : pdfDictEnd(bytes, openAt);
+    if (end !== undefined) return { start: openAt, end };
+  }
+  const xrefAt = bytes.lastIndexOf(PDF_XREF_TYPE_MARKER, boundary);
+  if (xrefAt < 0) return undefined;
+  const dictStart = bytes.lastIndexOf(PDF_DICT_OPEN, xrefAt);
+  if (dictStart < 0) return undefined;
+  const end = pdfDictEnd(bytes, dictStart);
+  // The anchor must actually fall inside the dictionary found; otherwise
+  // this "<<" belongs to something earlier and unrelated.
+  if (end === undefined || end <= xrefAt) return undefined;
+  return { start: dictStart, end };
+}
 
 /**
  * Detects a PDF's trailer `/Encrypt` entry from the raw bytes, before any
- * parser opens the file. This is a byte-marker heuristic, not a trailer
- * parse: it never decodes or logs the file's content.
- * ponytail: literal-marker heuristic, ceiling is a false positive if an
- * unencrypted PDF's own (uncompressed) content stream contains this literal.
- * Upgrade to a real trailer/xref parse if that is ever observed.
+ * parser opens the file: locates the last trailer dictionary before the
+ * file's final `%%EOF` (or, for a cross-reference stream, its `/Type /XRef`
+ * stream dictionary), then any `/Prev` chain, checking only those bounded
+ * dictionary byte ranges for `/Encrypt` rather than the whole file, so an
+ * unrelated `/Encrypt` literal inside a content stream cannot match. Never
+ * decodes or logs the file's content; dependency-free and bounded (no
+ * dictionary is scanned past `MAX_PDF_DICT_BYTES`, no more than
+ * `MAX_PDF_TRAILER_HOPS` hops are walked). Fails open to "not encrypted" on
+ * anything it cannot parse, leaving the parser to decide.
  */
 function isPdfEncrypted(bytes: Buffer): boolean {
-  return bytes.includes(PDF_ENCRYPT_MARKER);
+  const eofAt = bytes.lastIndexOf(PDF_EOF_MARKER);
+  let boundary = eofAt < 0 ? bytes.length : eofAt;
+  for (let hop = 0; hop < MAX_PDF_TRAILER_HOPS; hop += 1) {
+    const dict = pdfTrailerDictBefore(bytes, boundary);
+    if (!dict) return false;
+    const slice = bytes.subarray(dict.start, dict.end);
+    if (slice.includes(PDF_ENCRYPT_MARKER)) return true;
+    const prevMatch = PDF_PREV_PATTERN.exec(slice.toString("latin1"));
+    const prevOffset = prevMatch ? Number(prevMatch[1]) : undefined;
+    if (
+      prevOffset === undefined ||
+      !Number.isSafeInteger(prevOffset) ||
+      prevOffset < 0 ||
+      prevOffset >= dict.start
+    ) {
+      return false;
+    }
+    boundary = prevOffset;
+  }
+  return false;
 }
 
 function pdfDiscoveryFile(file: SafeFileBytes): PdfDiscoveryFile {

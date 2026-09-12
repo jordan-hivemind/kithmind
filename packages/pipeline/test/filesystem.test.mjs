@@ -342,6 +342,94 @@ test("encrypted PDFs are classified as a discovery gap before any parser opens t
   assert.equal(observation.gap.uri, "fs://test/secret.pdf");
 });
 
+test("a real trailer /Encrypt entry is detected and an unrelated content-stream literal is not", async () => {
+  const { root, journal } = await setup();
+  const normalBytes = Buffer.concat([
+    Buffer.from("%PDF-1.4\n"),
+    Buffer.from("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"),
+    Buffer.from("2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n"),
+    Buffer.from("xref\n0 3\n0000000000 65535 f \n"),
+    Buffer.from("trailer\n<< /Size 3 /Root 1 0 R >>\n"),
+    Buffer.from("startxref\n9\n%%EOF\n"),
+  ]);
+  // The literal "/Encrypt" appears only inside a content stream, never in
+  // the trailer dictionary: the whole-file substring search this replaces
+  // would misclassify this as encrypted.
+  const literalInStreamBytes = Buffer.concat([
+    Buffer.from("%PDF-1.4\n"),
+    Buffer.from("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"),
+    Buffer.from("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"),
+    Buffer.from(
+      "3 0 obj\n<< /Length 32 >>\nstream\n(Look: /Encrypt fake)\nendstream\nendobj\n",
+    ),
+    Buffer.from("xref\n0 4\n0000000000 65535 f \n"),
+    Buffer.from("trailer\n<< /Size 4 /Root 1 0 R >>\n"),
+    Buffer.from("startxref\n9\n%%EOF\n"),
+  ]);
+  const realEncryptBytes = Buffer.concat([
+    Buffer.from("%PDF-1.4\n"),
+    Buffer.from("1 0 obj\n<< /Type /Catalog >>\nendobj\n"),
+    Buffer.from("xref\n0 2\n0000000000 65535 f \n"),
+    Buffer.from(
+      "trailer\n<< /Size 2 /Root 1 0 R /Encrypt 3 0 R /ID [<0000><0000>] >>\n",
+    ),
+    Buffer.from("startxref\n9\n%%EOF\n"),
+  ]);
+  await writeFile(join(root, "normal.pdf"), normalBytes);
+  await writeFile(join(root, "literal-in-stream.pdf"), literalInStreamBytes);
+  await writeFile(join(root, "real-encrypt.pdf"), realEncryptBytes);
+  const [safeRoot] = await canonicalRoots(config(root, journal));
+  await readPdfFile(safeRoot, "normal.pdf");
+  await readPdfFile(safeRoot, "literal-in-stream.pdf");
+  await assert.rejects(
+    () => readPdfFile(safeRoot, "real-encrypt.pdf"),
+    (error) => error instanceof FilesystemFailure && error.code === "encrypted",
+  );
+});
+
+test("an xref-stream document's /Type /XRef dictionary is checked for /Encrypt", async () => {
+  const { root, journal } = await setup();
+  const xrefStreamEncrypted = Buffer.concat([
+    Buffer.from("%PDF-1.5\n"),
+    Buffer.from("1 0 obj\n<< /Type /Catalog >>\nendobj\n"),
+    Buffer.from(
+      "2 0 obj\n<< /Type /XRef /Size 2 /W [1 1 1] /Root 1 0 R /Encrypt 3 0 R /Filter /ASCIIHexDecode /Length 12 >>\nstream\n00 00 00 00 >\nendstream\nendobj\n",
+    ),
+    Buffer.from("startxref\n9\n%%EOF\n"),
+  ]);
+  const xrefStreamPlain = Buffer.concat([
+    Buffer.from("%PDF-1.5\n"),
+    Buffer.from("1 0 obj\n<< /Type /Catalog >>\nendobj\n"),
+    Buffer.from(
+      "2 0 obj\n<< /Type /XRef /Size 2 /W [1 1 1] /Root 1 0 R /Filter /ASCIIHexDecode /Length 12 >>\nstream\n00 00 00 00 >\nendstream\nendobj\n",
+    ),
+    Buffer.from("startxref\n9\n%%EOF\n"),
+  ]);
+  await writeFile(join(root, "xref-encrypted.pdf"), xrefStreamEncrypted);
+  await writeFile(join(root, "xref-plain.pdf"), xrefStreamPlain);
+  const [safeRoot] = await canonicalRoots(config(root, journal));
+  await assert.rejects(
+    () => readPdfFile(safeRoot, "xref-encrypted.pdf"),
+    (error) => error instanceof FilesystemFailure && error.code === "encrypted",
+  );
+  await readPdfFile(safeRoot, "xref-plain.pdf");
+});
+
+test("a malformed (unclosed) trailer dictionary fails open to not encrypted", async () => {
+  const { root, journal } = await setup();
+  const malformedBytes = Buffer.concat([
+    Buffer.from("%PDF-1.4\n"),
+    Buffer.from("1 0 obj\n<< /Type /Catalog >>\nendobj\n"),
+    Buffer.from("xref\n0 2\n0000000000 65535 f \n"),
+    // The trailer dictionary opens but never closes with `>>`.
+    Buffer.from("trailer\n<< /Size 2 /Root 1 0 R /Encrypt 3 0 R\n"),
+    Buffer.from("startxref\n9\n%%EOF\n"),
+  ]);
+  await writeFile(join(root, "malformed.pdf"), malformedBytes);
+  const [safeRoot] = await canonicalRoots(config(root, journal));
+  await readPdfFile(safeRoot, "malformed.pdf");
+});
+
 test("unsupported document types are gapped by content, not by extension", async () => {
   const { root, journal } = await setup();
   const binary = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]);

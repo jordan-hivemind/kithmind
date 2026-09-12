@@ -211,6 +211,17 @@ export type ProcessingCatalogRow = Omit<ProcessingCatalogIdentity, "copies"> & {
   parserOutput?: DurableParserOutput;
   spoolPrepared?: LocalFileIdentity;
   spool?: LocalFileIdentity;
+  /**
+   * A bounded count of local parser failures for this exact row (content +
+   * parser fingerprints), recorded when `runCapturedPdfParser` raises a
+   * document-level failure (conversion_failed, page_limit_exceeded,
+   * bundle_too_large, conversion_output_invalid) instead of an
+   * infrastructure one. `pdfNeedsArchivedWork` stops retrying once
+   * `attempts` reaches the bound; a parser version bump changes
+   * `fingerprints.parserFingerprint`, which yields a fresh row (and a fresh
+   * count) automatically.
+   */
+  parseFailure?: { code: string; attempts: number; failedAt: number };
   cloud?: {
     sourceItemId: string;
     sourceRevisionId: string;

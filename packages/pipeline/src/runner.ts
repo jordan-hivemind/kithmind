@@ -27,7 +27,11 @@ import type {
   RecoveredResticBackup,
   ResticBackupResult,
 } from "./archiveTypes.js";
-import { openArchiveCatalog, type ArchiveCatalog } from "./archiveCatalog.js";
+import {
+  MAX_PARSE_ATTEMPTS,
+  openArchiveCatalog,
+  type ArchiveCatalog,
+} from "./archiveCatalog.js";
 import type {
   ArchiveCopyIntent,
   ArchiveCopyRole,
@@ -158,6 +162,21 @@ const SAFE_PARSER_FAILURE_CODES = new Set([
   "lossless_output_too_large",
   "bundle_too_large",
 ] as const);
+
+/**
+ * The subset of `SAFE_PARSER_FAILURE_CODES` that describes a property of
+ * the document being parsed rather than the parser's execution environment.
+ * `driveArchivedParse` catches these and records a bounded per-document
+ * failure (see `recordArchivedParseFailure`) instead of ending the run; the
+ * remaining `SAFE_PARSER_FAILURE_CODES` (sandbox, resource, and executable
+ * problems) stay run-fatal because they are not specific to one file.
+ */
+const DOCUMENT_PARSER_FAILURE_CODES = new Set<string>([
+  "conversion_failed",
+  "conversion_output_invalid",
+  "page_limit_exceeded",
+  "bundle_too_large",
+]);
 
 type ArchivedCheckpoint = Extract<RunnerCheckpoint, { phase: "archived" }>;
 
@@ -992,6 +1011,14 @@ export class PipelineRunner {
     }
     if (matches[0]?.activation) {
       return await this.processingArtifactsPresent(matches[0]);
+    }
+    // A document that has already exhausted its bounded local parser
+    // attempts (see `recordArchivedParseFailure`) stays `parse_failed`
+    // rather than being retried on every future pass; a parser version
+    // bump changes `fingerprints.parserFingerprint`, which lands on a fresh
+    // row (no `parseFailure`) and lifts this gate automatically.
+    if ((matches[0]?.parseFailure?.attempts ?? 0) >= MAX_PARSE_ATTEMPTS) {
+      return false;
     }
     return true;
   }
@@ -4699,6 +4726,59 @@ export class PipelineRunner {
     });
   }
 
+  /**
+   * A document-level parser failure (see `DOCUMENT_PARSER_FAILURE_CODES`)
+   * raised while parsing this PDF: unlike an infrastructure failure, it does
+   * not end the run. Records a bounded attempt against the local processing
+   * catalog row (`ArchiveCatalog.recordParseFailure`) and moves on to the
+   * next PDF exactly as `driveArchivedCleanup` does after a successful one,
+   * except nothing was published, so `archivedPublished` is unchanged.
+   */
+  private async recordArchivedParseFailure(
+    checkpoint: ArchivedCheckpoint,
+    code: string,
+  ): Promise<void> {
+    if (checkpoint.phase !== "archived" || checkpoint.step !== "parse") {
+      throw new PipelineWorkerError("journal_phase_conflict");
+    }
+    const { processing } = this.archivedRows(checkpoint);
+    await this.requireCatalog().recordParseFailure({
+      catalogId: processing.processingCatalogId,
+      expectedRevision: processing.rowRevision,
+      code,
+      now: Date.now(),
+    });
+    const nextPdf = await this.nextPdfWorkIndex(
+      checkpoint.files,
+      checkpoint.pdfIndex + 1,
+    );
+    if (nextPdf >= 0) {
+      await this.journal.transitionCheckpoint({
+        checkpoint: {
+          version: 1,
+          phase: "archived",
+          ...activeScanBase(checkpoint),
+          pdfIndex: nextPdf,
+          step: "intent",
+          reservationRound: 0,
+          archivedPublished: checkpoint.archivedPublished,
+        },
+        credentialSessionActive: true,
+      });
+      return;
+    }
+    await this.journal.transitionCheckpoint({
+      checkpoint: {
+        version: 1,
+        phase: "discovery_reserve",
+        ...activeScanBase(checkpoint),
+        round: 0,
+        archivedPublished: checkpoint.archivedPublished,
+      },
+      credentialSessionActive: true,
+    });
+  }
+
   private async driveJobsReserve(): Promise<void> {
     const checkpoint = this.journal.checkpoint;
     if (checkpoint.phase !== "jobs_reserve") {
@@ -5328,7 +5408,22 @@ export class PipelineRunner {
     }
 
     for (let steps = 0; steps < 10_000; steps += 1) {
-      const result = await this.driveCheckpoint();
+      let result: PipelineRunResult | undefined;
+      try {
+        result = await this.driveCheckpoint();
+      } catch (error) {
+        const checkpoint = this.journal.checkpoint;
+        if (
+          error instanceof ParserProcessError &&
+          DOCUMENT_PARSER_FAILURE_CODES.has(error.code) &&
+          checkpoint.phase === "archived" &&
+          checkpoint.step === "parse"
+        ) {
+          await this.recordArchivedParseFailure(checkpoint, error.code);
+          continue;
+        }
+        throw error;
+      }
       if (result) return result;
     }
     throw new PipelineWorkerError("worker_step_limit");
