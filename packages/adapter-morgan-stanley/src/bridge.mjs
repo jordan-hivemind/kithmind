@@ -252,15 +252,18 @@ export async function evaluate(cdp, expression) {
   // Runtime.evaluate, and without a deadline the operator command waits
   // forever with nothing in flight (seen live 2026-09-11). Fail by name
   // instead so the run counts the document as failed and moves on.
+  let deadline;
   const { result, exceptionDetails } = await Promise.race([
     cdp.send("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true }),
-    new Promise((_, reject) =>
-      setTimeout(
+    new Promise((_, reject) => {
+      // unref: a reply that lands first must not leave this timer holding the
+      // process (or a test's event loop) open for the rest of the 90 seconds.
+      deadline = setTimeout(
         () => reject(new Error(`page evaluation timed out after ${EVALUATE_TIMEOUT_MS}ms: the tab may have navigated or the request never answered`)),
         EVALUATE_TIMEOUT_MS,
-      ),
-    ),
-  ]);
+      ).unref();
+    }),
+  ]).finally(() => clearTimeout(deadline));
   if (exceptionDetails) {
     throw new Error(exceptionDetails.text + " " + (result?.description ?? ""));
   }
@@ -363,6 +366,120 @@ async function findPageTarget(cdpHttpBase, originPrefix) {
   return target;
 }
 
+function slotKeysExpression() {
+  return `Object.keys(globalThis[Symbol.for(${JSON.stringify(CAPTURED_HEADERS_SLOT)})] ?? {})`;
+}
+
+function currentSlotKeys(cdp) {
+  return evaluate(cdp, slotKeysExpression());
+}
+
+/** Deletes every header the hook has captured so far, page-side. Used on
+ * resume (see waitForSignIn) so a session pause that never destroyed the
+ * page's JS context -- an inline re-auth screen, or a same-origin redirect --
+ * cannot leave the *previous* session's headers sitting in the slot,
+ * unnoticed, once fresh ones are expected. */
+async function clearCapturedHeaders(cdp) {
+  await evaluate(
+    cdp,
+    `(() => { const s = globalThis[Symbol.for(${JSON.stringify(CAPTURED_HEADERS_SLOT)})]; if (s) for (const k of Object.keys(s)) delete s[k]; return true; })()`,
+  ).catch(() => {});
+}
+
+// A bearer expires long before the site session does. The app refreshes its
+// own from this endpoint; doing the same, page-side, keeps the value inside
+// the page exactly like a captured header. Only the outcome is reported,
+// never the token. Exported for test/bridge.test.mjs's fake-cdp tests only
+// (same convention as `evaluate`/`startKeepAlive` above); every other caller
+// reaches it only through createMorganStanleySession or waitForSignIn below.
+export async function refreshBearer(cdp, origin) {
+  const { requestId, seqId } = randomUuidQueryIds();
+  const ok = await evaluate(
+    cdp,
+    `(async () => {
+      const slotKey = Symbol.for(${JSON.stringify(CAPTURED_HEADERS_SLOT)});
+      const slot = globalThis[slotKey] ?? (globalThis[slotKey] = {});
+      const lower = Object.fromEntries(Object.entries(slot).map(([k, v]) => [k.toLowerCase(), v]));
+      const headers = { "Accept": "application/json", "Content-Type": "application/json" };
+      for (const k of ["x-xsrf-token", "x-device-footprint"]) if (lower[k]) headers[k] = lower[k];
+      const r = await fetch(${JSON.stringify(origin)} + "/shell/handler/restproxy/access/api/JWTToken/GetAccessToken?RequestID=${requestId}&SeqID=${seqId}", { method: "POST", headers, credentials: "include", body: "" });
+      if (!r.ok) return "status " + r.status;
+      const text = await r.text();
+      let token = null;
+      try { const j = JSON.parse(text); const pick = (o) => { if (!o || typeof o !== "object") return null; for (const [k, v] of Object.entries(o)) { if (typeof v === "string" && /token/i.test(k) && v.length > 40) return v; } for (const v of Object.values(o)) { const t = pick(v); if (t) return t; } return null; }; token = pick(j); } catch { token = text.length > 40 ? text.replace(/^"|"$/g, "") : null; }
+      if (!token) return "no token field";
+      for (const k of Object.keys(slot)) if (k.toLowerCase() === "authorization") delete slot[k];
+      slot["authorization"] = token.startsWith("Bearer ") ? token : "Bearer " + token;
+      return "refreshed";
+    })()`,
+  );
+  console.error(new Date().toISOString(), "[bridge] bearer refresh:", ok);
+  return ok === "refreshed";
+}
+
+// The site ends a session about forty-five minutes after sign-in no matter
+// how active it is (seen live 2026-09-11 with keep-alive acknowledged to the
+// end).
+const SIGN_IN_WAIT_MS = Number(process.env.MS_SIGN_IN_WAIT_MS ?? 45 * 60 * 1000);
+// How long a resume waits for every WANTED_HEADERS entry to be recaptured
+// fresh before giving up and proceeding anyway (the retry loop in
+// withBearerRetry still catches a bad outcome from here, by status code).
+const RESUME_HEADER_WAIT_MS = 20_000;
+
+/**
+ * Waits out a session pause (README, "sign in again") and, once the tab is
+ * back on the app, clears *every* captured header -- not just the bearer --
+ * before trusting anything recaptured after it. A same-origin resume (an
+ * inline re-auth screen, or an in-app redirect that never leaves this
+ * origin) never destroys the page's JS context, so the header slot is not
+ * reset for free the way a real cross-origin login/logout round trip would
+ * reset it: without this clear, a post-resume request keeps carrying the
+ * *previous* session's xsrf token and device footprint alongside a freshly
+ * minted bearer -- a mismatched combination the documents endpoint answers
+ * with an HTTP 400 "Service Error" (seen live 2026-09-11: every one of 1,296
+ * remaining downloads failed this way after a resume). Exported for
+ * test/bridge.test.mjs's fake-cdp tests only (same convention as
+ * `evaluate`/`startKeepAlive` above); every other caller reaches it only
+ * through createMorganStanleySession.
+ */
+export async function waitForSignIn(cdp, origin, cdpHttpBase, reason, options = {}) {
+  const signInWaitMs = options.signInWaitMs ?? SIGN_IN_WAIT_MS;
+  const headerWaitMs = options.headerWaitMs ?? RESUME_HEADER_WAIT_MS;
+  const pollIntervalMs = options.pollIntervalMs ?? 5000;
+  const headerPollIntervalMs = options.headerPollIntervalMs ?? 500;
+  console.error(new Date().toISOString(), "[bridge] paused: signed out; sign in again in the dedicated Chrome window to resume", "(" + reason.slice(0, 80) + ")");
+  const deadline = Date.now() + signInWaitMs;
+  let announced = 0;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    const targets = await (await fetch(`${cdpHttpBase}/json/list`)).json().catch(() => []);
+    const onApp = targets.find((t) => t.type === "page" && t.url.startsWith(origin));
+    if (!onApp) { if (Date.now() - announced > 60_000) { announced = Date.now(); console.error(new Date().toISOString(), "[bridge] still waiting for sign-in"); } continue; }
+    const keys = (await currentSlotKeys(cdp).catch(() => [])).map((k) => k.toLowerCase());
+    if (keys.includes("x-xsrf-token")) {
+      await clearCapturedHeaders(cdp);
+      // Land on Documents so the app's own calls repopulate every wanted
+      // header, including a documents-scoped bearer. In-app navigation
+      // only, never a login page.
+      await cdp.send("Page.navigate", { url: `${origin}/atrium/#/documents` }).catch(() => {});
+      const start = Date.now();
+      while (Date.now() - start < headerWaitMs) {
+        await new Promise((resolve) => setTimeout(resolve, headerPollIntervalMs));
+        const after = (await currentSlotKeys(cdp).catch(() => [])).map((k) => k.toLowerCase());
+        if (WANTED_HEADERS.every((h) => after.includes(h))) break;
+      }
+      // The home page's own calls carry a bearer for other services, and
+      // the documents API answers 409 to it (seen live 2026-09-11); mint a
+      // documents-scoped one explicitly rather than hoping the wait above
+      // captured the right one.
+      await refreshBearer(cdp, origin);
+      console.error(new Date().toISOString(), "[bridge] resumed: headers captured after sign-in");
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Builds the `AdapterSession` the README describes. Options (all from the
  * environment when omitted, matching run.ts's own no-default convention):
@@ -383,16 +500,13 @@ export default async function createMorganStanleySession(options = {}) {
   await cdp.send("Runtime.enable");
   await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source: HEADER_HOOK });
 
-  const slotKeys = () =>
-    evaluate(cdp, `Object.keys(globalThis[Symbol.for(${JSON.stringify(CAPTURED_HEADERS_SLOT)})] ?? {})`);
-
   // A document that already carries captured headers (a hook installed by an
   // earlier session in this tab) is usable as is; reloading it would only
   // race the app's on-load request. Otherwise reload and wait for the *new*
   // document, marked by the disappearance of a sentinel set on the old one,
   // before trusting the slot: reading the old document's slot right after
   // Page.reload returns stale keys and the fetch that follows finds nothing.
-  if ((await slotKeys()).length === 0) {
+  if ((await currentSlotKeys(cdp)).length === 0) {
     await evaluate(cdp, "globalThis.__kithmindReloadSentinel = true; true");
     await cdp.send("Page.reload");
     let fresh = false;
@@ -400,7 +514,7 @@ export default async function createMorganStanleySession(options = {}) {
       if (!fresh) {
         fresh = await evaluate(cdp, "globalThis.__kithmindReloadSentinel === undefined").catch(() => false);
       }
-      if (fresh && (await slotKeys().catch(() => [])).length > 0) break;
+      if (fresh && (await currentSlotKeys(cdp).catch(() => [])).length > 0) break;
       if (attempt === 299) {
         throw new Error("no session headers captured after reload: open the Activity tab and retry");
       }
@@ -413,74 +527,9 @@ export default async function createMorganStanleySession(options = {}) {
   // session that never sees it still works for the activity tier, and the
   // documents tier then fails by name as before.
   for (let attempt = 0; attempt < 40; attempt += 1) {
-    const keys = (await slotKeys().catch(() => [])).map((k) => k.toLowerCase());
+    const keys = (await currentSlotKeys(cdp).catch(() => [])).map((k) => k.toLowerCase());
     if (keys.includes(AUTHORIZATION_HEADER)) break;
     await new Promise((resolve) => setTimeout(resolve, 500));
-  }
-
-  // A bearer expires long before the site session does. The app refreshes
-  // its own from this endpoint; doing the same, page-side, keeps the value
-  // inside the page exactly like a captured header. Only the outcome is
-  // reported, never the token.
-  async function refreshBearer() {
-    const { requestId, seqId } = randomUuidQueryIds();
-    const ok = await evaluate(
-      cdp,
-      `(async () => {
-        const slotKey = Symbol.for(${JSON.stringify(CAPTURED_HEADERS_SLOT)});
-        const slot = globalThis[slotKey] ?? (globalThis[slotKey] = {});
-        const lower = Object.fromEntries(Object.entries(slot).map(([k, v]) => [k.toLowerCase(), v]));
-        const headers = { "Accept": "application/json", "Content-Type": "application/json" };
-        for (const k of ["x-xsrf-token", "x-device-footprint"]) if (lower[k]) headers[k] = lower[k];
-        const r = await fetch(${JSON.stringify(origin)} + "/shell/handler/restproxy/access/api/JWTToken/GetAccessToken?RequestID=${requestId}&SeqID=${seqId}", { method: "POST", headers, credentials: "include", body: "" });
-        if (!r.ok) return "status " + r.status;
-        const text = await r.text();
-        let token = null;
-        try { const j = JSON.parse(text); const pick = (o) => { if (!o || typeof o !== "object") return null; for (const [k, v] of Object.entries(o)) { if (typeof v === "string" && /token/i.test(k) && v.length > 40) return v; } for (const v of Object.values(o)) { const t = pick(v); if (t) return t; } return null; }; token = pick(j); } catch { token = text.length > 40 ? text.replace(/^"|"$/g, "") : null; }
-        if (!token) return "no token field";
-        for (const k of Object.keys(slot)) if (k.toLowerCase() === "authorization") delete slot[k];
-        slot["authorization"] = token.startsWith("Bearer ") ? token : "Bearer " + token;
-        return "refreshed";
-      })()`,
-    );
-    console.error(new Date().toISOString(), "[bridge] bearer refresh:", ok);
-    return ok === "refreshed";
-  }
-
-  // The site ends a session about forty-five minutes after sign-in no
-  // matter how active it is (seen live 2026-09-11 with keep-alive
-  // acknowledged to the end). A signed-out tab is therefore a pause, not a
-  // failure: wait for the owner to sign in again in this same window, let
-  // the reloaded document repopulate the header slot through the hook, and
-  // resume. Progress is reported to stderr; nothing signs in on its own.
-  const SIGN_IN_WAIT_MS = Number(process.env.MS_SIGN_IN_WAIT_MS ?? 45 * 60 * 1000);
-  async function waitForSignIn(reason) {
-    console.error(new Date().toISOString(), "[bridge] paused: signed out; sign in again in the dedicated Chrome window to resume", "(" + reason.slice(0, 80) + ")");
-    const deadline = Date.now() + SIGN_IN_WAIT_MS;
-    let announced = 0;
-    while (Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 5000));
-      const targets = await (await fetch(`${cdpHttpBase}/json/list`)).json().catch(() => []);
-      const onApp = targets.find((t) => t.type === "page" && t.url.startsWith(origin));
-      if (!onApp) { if (Date.now() - announced > 60_000) { announced = Date.now(); console.error(new Date().toISOString(), "[bridge] still waiting for sign-in"); } continue; }
-      const keys = (await slotKeys().catch(() => [])).map((k) => k.toLowerCase());
-      if (keys.includes("x-xsrf-token")) {
-        // The home page's own calls carry a bearer for other services, and
-        // the documents API answers 409 to it (seen live 2026-09-11). Steer
-        // the tab to the Documents route so the app fetches the right one,
-        // then wait for it. In-app navigation only, never a login page.
-        await cdp.send("Page.navigate", { url: `${origin}/atrium/#/documents` }).catch(() => {});
-        await evaluate(cdp, `(() => { const s = globalThis[Symbol.for(${JSON.stringify(CAPTURED_HEADERS_SLOT)})]; if (s) for (const k of Object.keys(s)) if (k.toLowerCase() === "authorization") delete s[k]; return true; })()`).catch(() => {});
-        for (let i = 0; i < 40; i += 1) {
-          await new Promise((resolve) => setTimeout(resolve, 500));
-          const after = (await slotKeys().catch(() => [])).map((k) => k.toLowerCase());
-          if (after.includes(AUTHORIZATION_HEADER)) break;
-        }
-        console.error(new Date().toISOString(), "[bridge] resumed: headers captured after sign-in");
-        return true;
-      }
-    }
-    return false;
   }
 
   async function withBearerRetry(request, run) {
@@ -492,10 +541,10 @@ export default async function createMorganStanleySession(options = {}) {
         // 401 is an expired bearer; 409 is a bearer minted for another
         // service (the home page's calls). Both are cured by the app's own
         // token endpoint.
-        if (request.needsAuthorization && /request failed: (401|409)\b/.test(message) && (await refreshBearer())) {
+        if (request.needsAuthorization && /request failed: (401|409)\b/.test(message) && (await refreshBearer(cdp, origin))) {
           continue;
         }
-        if (/SIGNED_OUT|no session headers captured yet/.test(message) && attempt < 2 && (await waitForSignIn(message))) {
+        if (/SIGNED_OUT|no session headers captured yet/.test(message) && attempt < 2 && (await waitForSignIn(cdp, origin, cdpHttpBase, message))) {
           continue;
         }
         throw error;

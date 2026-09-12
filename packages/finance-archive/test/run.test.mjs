@@ -990,3 +990,150 @@ test(
     );
   },
 );
+
+test(
+  "F1-54: ten consecutive document pull failures trip the circuit breaker and stop the run, leaving what already committed intact",
+  { skip },
+  async (t) => {
+    const { schema, client } = await seededSchema(t);
+
+    const rawDir = mkdtempSync(
+      join(tmpdir(), "kith-finance-run-breaker-raw-"),
+    );
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+
+    // doc-stmt-2025-q1 acquires and commits first (commitEvery defaults to
+    // 1); doc-stmt-2025-q2 then fails the same generic way (not the
+    // SIGNED_OUT class, so this is the plain per-document circuit breaker,
+    // not the lost-session short-circuit above) ten times in a row --
+    // repeating the same selection entry stands in for ten distinct
+    // documents that all fail the same way, exactly what a stuck documents
+    // endpoint produced live 2026-09-11. doc-conf-2025-02-10 comes last and
+    // must never be attempted once the breaker trips.
+    const { fixturesDir, adapterModulePath, sessionModulePath } =
+      writeFailingDocumentFixtures(t, "doc-stmt-2025-q2");
+    const selectionPath = writeSelection(fixturesDir, [
+      {
+        accountId: ACCOUNT.id,
+        docType: "statement",
+        docDate: null,
+        selection: { kind: "pdf_statement", externalId: "doc-stmt-2025-q1" },
+      },
+      ...Array.from({ length: 10 }, () => ({
+        accountId: ACCOUNT.id,
+        docType: "statement",
+        docDate: null,
+        selection: { kind: "pdf_statement", externalId: "doc-stmt-2025-q2" },
+      })),
+      {
+        accountId: ACCOUNT.id,
+        docType: "confirmation",
+        docDate: null,
+        selection: {
+          kind: "trade_confirmation",
+          externalId: "doc-conf-2025-02-10",
+        },
+      },
+    ]);
+    const runImport = makeRunner({
+      adapterModulePath,
+      sessionModulePath,
+      selectionPath,
+      schema,
+      rawDir,
+    });
+
+    assert.throws(
+      () => runImport(),
+      (error) => {
+        assert.match(
+          String(error.stderr),
+          /run stopped: 10 consecutive document pulls failed/,
+        );
+        // Names the last error's class, not just its message.
+        assert.match(String(error.stderr), /last error: Error:/);
+        assert.match(
+          String(error.stderr),
+          /1 document pull\(s\) were committed before this/,
+        );
+        return true;
+      },
+    );
+
+    const documents = await all(
+      client,
+      "SELECT doc_type FROM documents WHERE institution_id = $1",
+      [INSTITUTION.id],
+    );
+    assert.equal(
+      documents.length,
+      1,
+      "only the document committed before the breaker tripped stays committed",
+    );
+    assert.equal(documents[0].doc_type, "statement");
+    assert.equal(
+      await count(client, "documents", "WHERE doc_type = $1", ["confirmation"]),
+      0,
+      "the pull after the ten failures was never attempted",
+    );
+  },
+);
+
+test(
+  "F1-54: a success between two runs of failures resets the circuit breaker's consecutive count",
+  { skip },
+  async (t) => {
+    const { schema, client } = await seededSchema(t);
+
+    const rawDir = mkdtempSync(
+      join(tmpdir(), "kith-finance-run-breaker-reset-raw-"),
+    );
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+
+    // Nine failures, then a success (a different document), then nine more
+    // failures: eighteen failures total but never ten *in a row*, so the
+    // breaker must not trip and the run must reach the end normally.
+    const { fixturesDir, adapterModulePath, sessionModulePath } =
+      writeFailingDocumentFixtures(t, "doc-stmt-2025-q2");
+    const failingEntry = {
+      accountId: ACCOUNT.id,
+      docType: "statement",
+      docDate: null,
+      selection: { kind: "pdf_statement", externalId: "doc-stmt-2025-q2" },
+    };
+    const selectionPath = writeSelection(fixturesDir, [
+      ...Array.from({ length: 9 }, () => failingEntry),
+      {
+        accountId: ACCOUNT.id,
+        docType: "confirmation",
+        docDate: null,
+        selection: {
+          kind: "trade_confirmation",
+          externalId: "doc-conf-2025-02-10",
+        },
+      },
+      ...Array.from({ length: 9 }, () => failingEntry),
+    ]);
+    const runImport = makeRunner({
+      adapterModulePath,
+      sessionModulePath,
+      selectionPath,
+      schema,
+      rawDir,
+    });
+
+    // Does not throw: the breaker never sees ten consecutive failures.
+    const output = runImport();
+    assert.match(output, /^mode: committed$/m);
+    assert.match(output, /document pulls acquired: 1/);
+    assert.match(output, /document pulls failed: 18/);
+
+    const documents = await all(
+      client,
+      "SELECT doc_type FROM documents WHERE institution_id = $1",
+      [INSTITUTION.id],
+    );
+    assert.equal(documents.length, 1, "the surviving document between the two failure runs imported");
+    assert.equal(documents[0].doc_type, "confirmation");
+  },
+);

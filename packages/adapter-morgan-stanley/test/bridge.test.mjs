@@ -14,7 +14,51 @@ import {
   resolveEndpoint,
   evaluate,
   startKeepAlive,
+  waitForSignIn,
 } from "../src/bridge.mjs";
+
+// A fake cdp for the resume tests below: `Runtime.evaluate` is answered by
+// pattern-matching the expression text (the same three shapes bridge.mjs
+// ever sends: read the slot's keys, clear the slot, or the bearer-refresh
+// call), and every other method call (Page.navigate) is just recorded. This
+// is the same "fake cdp" shape startKeepAlive's own tests already use below,
+// extended to script a sequence of slot-key readings.
+function makeFakeCdp(slotKeysSequence) {
+  const calls = [];
+  let slotReadIndex = 0;
+  const cdp = {
+    send: async (method, params) => {
+      calls.push({ method, params });
+      if (method === "Runtime.evaluate") {
+        const expression = params.expression;
+        if (/delete s\[k\]/.test(expression) && /Object\.keys\(s\)\) delete/.test(expression)) {
+          return { result: { value: true } }; // clearCapturedHeaders
+        }
+        if (/GetAccessToken/.test(expression)) {
+          return { result: { value: "refreshed" } }; // refreshBearer
+        }
+        if (/Object\.keys\(globalThis\[Symbol\.for/.test(expression)) {
+          const value = slotKeysSequence[Math.min(slotReadIndex, slotKeysSequence.length - 1)];
+          slotReadIndex += 1;
+          return { result: { value } };
+        }
+        return { result: { value: null } };
+      }
+      return { result: { value: null } };
+    },
+  };
+  return { cdp, calls };
+}
+
+function withFakeFetch(targetUrl, run) {
+  const original = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    json: async () => [{ type: "page", url: targetUrl, webSocketDebuggerUrl: "ws://fake" }],
+  });
+  return run().finally(() => {
+    globalThis.fetch = original;
+  });
+}
 
 test("buildActivityRequestBody follows the captured request template exactly", () => {
   const body = JSON.parse(
@@ -250,4 +294,69 @@ test("startKeepAlive extends the app session every four minutes through the page
 
   t.mock.timers.tick(4 * 60 * 1000);
   assert.equal(calls.length, 2, "fires again every four minutes, not just once");
+});
+
+// F1-54: a same-origin resume (an inline re-auth screen, or an in-app
+// redirect) never destroys the page's JS context, so the header slot can
+// otherwise still hold the *previous* session's xsrf token and device
+// footprint straight through the pause -- not just its stale bearer -- and
+// every post-resume documents call 400'd carrying them (seen live
+// 2026-09-11). waitForSignIn must clear every captured header before
+// trusting anything recaptured after resume.
+test("waitForSignIn clears every captured header before re-navigating, not just the bearer", async () => {
+  // First read (the trigger check): stale headers already present, exactly
+  // as they would be if the JS context never reset across the pause. Second
+  // read (inside the post-clear wait loop): all three fresh again, as if the
+  // app's own Documents-route calls repopulated them.
+  const { cdp, calls } = makeFakeCdp([
+    ["x-xsrf-token", "x-device-footprint", "authorization"],
+    ["x-xsrf-token", "x-device-footprint", "authorization"],
+  ]);
+
+  const resumed = await withFakeFetch("https://app.example.invalid/atrium/#/documents", () =>
+    waitForSignIn(cdp, "https://app.example.invalid", "http://cdp.invalid", "SIGNED_OUT: test", {
+      signInWaitMs: 5000,
+      pollIntervalMs: 1,
+      headerWaitMs: 50,
+      headerPollIntervalMs: 1,
+    }),
+  );
+
+  assert.equal(resumed, true);
+
+  const clearIndex = calls.findIndex(
+    (c) => c.method === "Runtime.evaluate" && /Object\.keys\(s\)\) delete s\[k\]/.test(c.params.expression),
+  );
+  assert.notEqual(clearIndex, -1, "clears the whole slot, not just authorization");
+  // The clear expression deletes every key unconditionally -- it never singles
+  // out "authorization" the way the pre-fix code did.
+  assert.equal(/===\s*"authorization"/.test(calls[clearIndex].params.expression), false);
+
+  const navigateIndex = calls.findIndex((c) => c.method === "Page.navigate");
+  assert.notEqual(navigateIndex, -1);
+  assert.match(calls[navigateIndex].params.url, /#\/documents$/);
+  // The clear happens before the navigation that is meant to repopulate the
+  // slot -- clearing after would just delete what was just recaptured.
+  assert.ok(clearIndex < navigateIndex, "clears before navigating, not after");
+
+  const bearerIndex = calls.findIndex((c) => c.method === "Runtime.evaluate" && /GetAccessToken/.test(c.params.expression));
+  assert.notEqual(bearerIndex, -1, "explicitly refreshes the bearer after resume, rather than hoping navigation alone captured the right one");
+  assert.ok(navigateIndex < bearerIndex, "refreshes the bearer only after giving navigation a chance to repopulate the slot");
+});
+
+test("waitForSignIn gives up and returns false if the tab never returns to the app origin", async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = async () => ({ json: async () => [] }); // no matching tab, ever
+  try {
+    const resumed = await waitForSignIn(
+      { send: async () => ({ result: { value: [] } }) },
+      "https://app.example.invalid",
+      "http://cdp.invalid",
+      "SIGNED_OUT: test",
+      { signInWaitMs: 20, pollIntervalMs: 5 },
+    );
+    assert.equal(resumed, false);
+  } finally {
+    globalThis.fetch = original;
+  }
 });
