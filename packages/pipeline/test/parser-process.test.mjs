@@ -547,7 +547,7 @@ test("raw locator resolution requires the complete exact cross-page slice invent
   );
 });
 
-test("v2 inventories traversed body slices while legacy gaps and furniture remain inspectable", () => {
+test("v2 and v3 inventory traversed body slices while legacy gaps and furniture remain inspectable", () => {
   const current = crossPageSliceFixture();
   current.raw.texts.push({
     ...structuredClone(current.raw.texts[0]),
@@ -564,7 +564,7 @@ test("v2 inventories traversed body slices while legacy gaps and furniture remai
   const legacyGap = structuredClone(current);
   for (const page of legacyGap.bundle.pages) page.segments = [];
   legacyGap.bundle.mappingGaps = [
-    { kind: "ambiguous_text_provenance", item: 0 },
+    { kind: "ambiguous_text_provenance", item: 0, itemRef: "#/texts/0" },
   ];
   assert.deepEqual(
     Object.keys(resolveRawLocators(legacyGap.raw, legacyGap.bundle)),
@@ -598,6 +598,8 @@ test("v2 inventories traversed body slices while legacy gaps and furniture remai
     ),
   );
 
+  // v3 traverses every picture child, so a non-caption sibling that the
+  // bundle never retained as a segment is now a required-but-missing ref.
   const pictureCaption = structuredClone(current);
   pictureCaption.raw.body = { children: [{ $ref: "#/pictures/0" }] };
   pictureCaption.raw.pictures = [
@@ -606,11 +608,65 @@ test("v2 inventories traversed body slices while legacy gaps and furniture remai
       captions: [{ $ref: "#/texts/0" }],
     },
   ];
+  assert.throws(() =>
+    resolveRawLocators(
+      pictureCaption.raw,
+      pictureCaption.bundle,
+      "docling_utf16_pages_v3",
+    ),
+  );
+
+  // A bundle already stored under v2 keeps the caption-only rule: the same
+  // raw/bundle pair still validates when read back as v2.
   assert.doesNotThrow(() =>
     resolveRawLocators(
       pictureCaption.raw,
       pictureCaption.bundle,
       "docling_utf16_pages_v2",
+    ),
+  );
+
+  const excludedPictureChild = structuredClone(pictureCaption);
+  excludedPictureChild.raw.texts[1].content_layer = "furniture";
+  assert.doesNotThrow(() =>
+    resolveRawLocators(
+      excludedPictureChild.raw,
+      excludedPictureChild.bundle,
+      "docling_utf16_pages_v3",
+    ),
+  );
+
+  const duplicatePictureChild = structuredClone(pictureCaption);
+  duplicatePictureChild.raw.pictures[0].children.push({
+    $ref: "#/texts/0",
+  });
+  assert.throws(() =>
+    resolveRawLocators(
+      duplicatePictureChild.raw,
+      duplicatePictureChild.bundle,
+      "docling_utf16_pages_v3",
+    ),
+  );
+
+  const cyclicPicture = structuredClone(pictureCaption);
+  cyclicPicture.raw.pictures[0].children = [{ $ref: "#/pictures/0" }];
+  assert.throws(() =>
+    resolveRawLocators(
+      cyclicPicture.raw,
+      cyclicPicture.bundle,
+      "docling_utf16_pages_v3",
+    ),
+  );
+
+  // Duplicate refs inside `captions` itself must be rejected directly, not
+  // merely caught by the cycle check that a duplicate child ref hits above.
+  const duplicateCaptionRef = structuredClone(pictureCaption);
+  duplicateCaptionRef.raw.pictures[0].captions.push({ $ref: "#/texts/0" });
+  assert.throws(() =>
+    resolveRawLocators(
+      duplicateCaptionRef.raw,
+      duplicateCaptionRef.bundle,
+      "docling_utf16_pages_v3",
     ),
   );
 });

@@ -274,24 +274,21 @@ def _body_text_refs(lossless: dict[str, Any]) -> set[str]:
         children = node.get("children")
         if not isinstance(children, list):
             raise ProductionFailure("conversion_output_invalid")
-        allowed_picture_refs = None
         if node_ref is not None and node_ref.startswith("#/pictures/"):
             captions = node.get("captions")
             if not isinstance(captions, list):
                 raise ProductionFailure("conversion_output_invalid")
-            allowed_picture_refs = {
+            caption_refs = {
                 caption.get("$ref")
                 for caption in captions
                 if isinstance(caption, dict) and isinstance(caption.get("$ref"), str)
             }
-            if len(allowed_picture_refs) != len(captions):
+            if len(caption_refs) != len(captions):
                 raise ProductionFailure("conversion_output_invalid")
         for child in reversed(children):
             if not isinstance(child, dict) or not isinstance(child.get("$ref"), str):
                 raise ProductionFailure("conversion_output_invalid")
             child_ref = child["$ref"]
-            if allowed_picture_refs is not None and child_ref not in allowed_picture_refs:
-                continue
             match = re.fullmatch(
                 r"#/([a-z_]+)/(0|[1-9][0-9]{0,6})", child_ref
             )
@@ -720,7 +717,7 @@ def _extraction_configuration(parser: dict[str, Any]) -> dict[str, Any]:
         "parserFingerprint": parser["fingerprint"],
         "implementationSha256": _implementation_sha256(),
         "configuration": {
-            "mappingFormat": "docling_utf16_pages_v2",
+            "mappingFormat": "docling_utf16_pages_v3",
             "maxPages": MAX_PAGES,
             "maxRetainedUtf8Bytes": MAX_RETAINED_UTF8_BYTES,
             "maxBundleBytes": MAX_SERIALIZED_BUNDLE_BYTES,

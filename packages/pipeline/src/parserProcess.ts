@@ -238,6 +238,7 @@ export type ValidatedNormalizedBundle = {
   mappingGaps: Array<{
     kind: "ambiguous_text_provenance" | "ambiguous_table_provenance";
     item: number;
+    itemRef: string;
   }>;
 };
 
@@ -1516,7 +1517,9 @@ function validateParserFingerprint(
 }
 
 type ExtractionMappingFormat =
-  "docling_utf16_pages_v1" | "docling_utf16_pages_v2";
+  | "docling_utf16_pages_v1"
+  | "docling_utf16_pages_v2"
+  | "docling_utf16_pages_v3";
 
 type ExtractionConfiguration = {
   fingerprint: string;
@@ -1566,12 +1569,19 @@ function validateExtractionConfigurationFingerprint(
     config.maxPages === 32 &&
     config.maxRetainedUtf8Bytes === 256 * 1024 &&
     config.maxBundleBytes === 4 * 1024 * 1024;
-  const current =
+  // v2 is no longer produced, but a bundle stored under it must keep
+  // validating: its picture children were traversed caption-only.
+  const v2 =
     config.mappingFormat === "docling_utf16_pages_v2" &&
     config.maxPages === 64 &&
     config.maxRetainedUtf8Bytes === 1024 * 1024 &&
     config.maxBundleBytes === 4 * 1024 * 1024;
-  if (!legacy && !current)
+  const current =
+    config.mappingFormat === "docling_utf16_pages_v3" &&
+    config.maxPages === 64 &&
+    config.maxRetainedUtf8Bytes === 1024 * 1024 &&
+    config.maxBundleBytes === 4 * 1024 * 1024;
+  if (!legacy && !v2 && !current)
     fail("output_invalid", "extraction configuration is invalid");
   return {
     fingerprint: fingerprint(descriptor),
@@ -1814,11 +1824,13 @@ function validateBundle(
       fail("output_invalid", "mapping gap is invalid");
     const record = gap as Record<string, unknown>;
     if (
-      !exactKeys(record, ["kind", "item"]) ||
+      !exactKeys(record, ["kind", "item", "itemRef"]) ||
       !["ambiguous_text_provenance", "ambiguous_table_provenance"].includes(
         String(record.kind),
       ) ||
-      !integer(record.item, 0, 1_000_000)
+      !integer(record.item, 0, 1_000_000) ||
+      typeof record.itemRef !== "string" ||
+      !/^#\/[a-z_]+\/(?:0|[1-9][0-9]{0,6})$/.test(record.itemRef)
     )
       fail("output_invalid", "mapping gap is invalid");
   }
@@ -1846,7 +1858,10 @@ function canonicalIdentity(value: unknown): string {
   return canonicalJson(value).toString("base64");
 }
 
-function bodyTextRefs(raw: Record<string, unknown>): Set<string> {
+function bodyTextRefs(
+  raw: Record<string, unknown>,
+  mappingFormat: ExtractionMappingFormat,
+): Set<string> {
   const refs = new Set<string>();
   if (!raw.body || typeof raw.body !== "object" || Array.isArray(raw.body))
     fail("output_invalid", "raw body traversal is invalid");
@@ -1888,7 +1903,7 @@ function bodyTextRefs(raw: Record<string, unknown>): Set<string> {
     if (current.ref?.startsWith("#/pictures/")) {
       if (!Array.isArray(node.captions))
         fail("output_invalid", "raw picture traversal is invalid");
-      allowedPictureRefs = new Set<string>();
+      const captionRefs = new Set<string>();
       for (const caption of node.captions) {
         if (
           !caption ||
@@ -1897,10 +1912,17 @@ function bodyTextRefs(raw: Record<string, unknown>): Set<string> {
           typeof (caption as Record<string, unknown>).$ref !== "string"
         )
           fail("output_invalid", "raw picture traversal is invalid");
-        allowedPictureRefs.add(
+        captionRefs.add(
           (caption as Record<string, unknown>).$ref as string,
         );
       }
+      if (captionRefs.size !== node.captions.length)
+        fail("output_invalid", "raw picture traversal is invalid");
+      // A v2 bundle was produced when picture children were traversed
+      // caption-only; that rule must keep applying so an already-stored
+      // v2 bundle still validates. v3 traverses every picture child.
+      if (mappingFormat === "docling_utf16_pages_v2")
+        allowedPictureRefs = captionRefs;
     }
     for (let index = node.children.length - 1; index >= 0; index -= 1) {
       const child = node.children[index];
@@ -2135,8 +2157,9 @@ export function resolveRawLocators(
   }
   const expectedSlices = new Map<string, RawItemSlice[]>();
   const requiredRefs =
-    mappingFormat === "docling_utf16_pages_v2"
-      ? bodyTextRefs(raw)
+    mappingFormat === "docling_utf16_pages_v2" ||
+    mappingFormat === "docling_utf16_pages_v3"
+      ? bodyTextRefs(raw, mappingFormat)
       : new Set<string>();
   for (const ref of actualSlices.keys()) requiredRefs.add(ref);
   for (const item of raw.texts) {
