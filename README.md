@@ -1,112 +1,158 @@
 # Kith Mind
 
-Kith Mind is a personal knowledge system built on the upstream
-[ai-brain](https://github.com/flippyhead/ai-brain) foundation. Kith Mind
-contributions are intended to be MIT-licensed, with upstream attribution
-preserved in the local LICENSE. See [provenance](docs/upstream-provenance.md).
-It stores structured facts, narrative thoughts, and indexed source documents,
-and makes them available to compatible clients through MCP. Bounded text capture is supported; automated connectors and typed extraction
-are still being implemented. The public architecture and staged plan are in
-[`docs/plans/2026-09-06-architecture.md`](./docs/plans/2026-09-06-architecture.md).
+Kith Mind is a personal knowledge base that an AI assistant can read and write.
+You tell Claude or ChatGPT something once. It is still there next week, in a new
+conversation, in the other assistant.
 
-## Available today
+It stores three kinds of knowledge:
 
-- Typed entities and facts, including current, superseded, and retracted
-  records.
-- Narrative thoughts with hybrid retrieval, grounded recall, and citations.
-- Space-scoped authorization, capability-scoped API keys, and an OAuth-capable
-  MCP gateway that exchanges credentials for short-lived Convex identities.
-- Source revisions, immutable evidence, processing leases, and atomic publication
-  primitives. Indexed read tools are `search_documents`, `get_document`, and
-  `list_sources`. See the [processing contract](docs/plans/2026-09-06-source-processing-contract.md).
-- Versioned embedding profiles and generations, compatible semantic document
-  search, and explicit keyword fallback. See the
-  [embedding contract](docs/plans/2026-09-06-embedding-contract.md).
-- Versioned lab, vehicle-service and financial records with exact decimal
-  queries, retained evidence and coverage-aware pagination through `query_records`.
-  See the [typed-record contract](docs/plans/2026-09-06-record-query-contract.md).
-- Desktop family spaces with Personal/shared separation, invitation approval,
-  roles, explicit person links, default write destinations, source identities,
-  and scoped API keys. See the [family spaces guide](docs/family-spaces.md).
-- Authenticated text capture with durable processing and retry-safe request IDs,
-  plus an explicitly unfetched URL queue. See the
-  [capture contract](docs/plans/2026-09-06-inline-ingestion-contract.md).
-- A source-scoped remote worker gateway for filesystem discovery, scan retries,
-  identity recovery, tombstones, and verified text admission with resumable
-  reservations, leased processing, and bounded processing assessments. Processing
-  status distinguishes ready documents from pending work and gaps; it does not
-  establish record or date coverage. See the [worker protocol](docs/plans/2026-09-07-worker-protocol.md).
-- A bounded filesystem text worker with local restart state, foreground polling,
-  cloud identity recovery, and retained-text publication. Start with the
-  [synthetic worker recipe](docs/filesystem-worker.md),
-  [read-only diagnostics](docs/worker-doctor.md), and
-  [optional user-service installation](docs/worker-service.md). Parser support,
-  cloud monitoring, and owner-document ingestion gates remain separate work.
-- A Next.js web application, Convex backend, and a Claude Code plugin source.
+| Kind      | Example                                              |
+| --------- | ---------------------------------------------------- |
+| Facts     | A provider name, a school, a policy number, a date   |
+| Thoughts  | A decision and why you made it, a project's state    |
+| Documents | A statement or note you captured, with the text kept |
 
-For local development, run `npx convex dev --once` from `packages/convex`,
-configure Convex Auth with
-`pnpm --filter @repo/db exec auth --web-server-url http://localhost:3000`,
-then copy `apps/web/.env.example` to the ignored `apps/web/.env.local`, set the
-development Convex URL, and run `pnpm dev`. The provider-free synthetic smoke
-test is `pnpm demo:brain`; see [self-hosting](docs/self-hosting.md) for its
-four environment inputs, authentication setup, and the family-space acceptance
-flow.
+You host it yourself. The data sits in your own Convex deployment, not in a
+shared service. Assistants reach it over MCP, so no browser extension or
+copy-paste is involved.
 
-Prerequisites: Node.js 22 or newer and pnpm 10.20. Public-clone setup does not
-require private files or owner credentials.
+## Use it with Claude or ChatGPT
 
-Captures are client-mediated: an MCP server cannot observe a conversation
-unless a connected client calls a capture tool. See
-[`docs/self-hosting.md`](./docs/self-hosting.md) for the current deployment
-requirements and optional server-side OpenAI and Anthropic API credentials.
+Steps 1 through 3 happen once. Step 4 is the daily part.
 
-## Planned work
+### Step 1. Deploy your own instance
 
-The following are architecture commitments, not current product features:
+Fork the repository, then follow
+[`docs/self-hosting.md`](./docs/self-hosting.md). It walks through one Convex
+project, one Vercel project, and the environment variables that connect them.
+Node.js 22 or newer and pnpm 10.20 are the only prerequisites.
 
-- Extraction of typed records from real sources.
-- Additional connectors, extraction playbooks, cloud monitoring, and
-  verified operational recovery.
-- Desktop is the primary workflow. P2 mobile access is through hosted MCP for
-  supported native clients; where a client lacks remote MCP support, a thin
-  authenticated API adapter is an option to validate. An iOS Shortcut is an
-  optional capture surface only, not a query client. A native mobile app is
-  not planned.
+You finish this step with an HTTPS address such as
+`https://your-project.vercel.app`. Your MCP endpoint is that address plus
+`/api/mcp`.
 
-The phase table in the architecture document is the source of truth for scope
-and ordering. The [Phase 2 document-pipeline plan](docs/plans/2026-09-07-phase2-document-pipeline.md)
-breaks the worker, parser, financial playbooks, monitoring, and restore work into
-verified steps before owner-document ingestion and bulk backfill. The
-[synthetic parser evaluation](docs/parser-evaluation.md) records a reproducible
-Docling/native-text comparison; real-document ingestion remains gated.
+Expect a small monthly bill at most. Convex and Vercel free tiers cover light
+personal use. Semantic search and narrative analysis call OpenAI and Anthropic
+and are metered, but both are optional. Keyword search and capture work without
+either key.
 
-## Claude Code plugin
+### Step 2. Create your account
 
-[`plugins/ai-brain/`](./plugins/ai-brain/) contains the upstream AI Brain
-plugin source and its skills. Its checked-in
-[`.mcp.json`](./plugins/ai-brain/.mcp.json) points to the upstream hosted AI
-Brain service. It is not a Kith Mind marketplace install, and it does not add
-planned document or family-space capabilities.
+Open the deployed web app and sign up. This account owns your Personal space.
+Everything you capture goes there unless you later create a shared space.
 
-For local development against a Kith Mind deployment, make a copy of the
-plugin source and change the copy's `.mcp.json` URL to that deployment's
-`/api/mcp` endpoint. The copied plugin directory has no standalone marketplace
-manifest, so this repository does not yet provide a verified Kith Mind plugin
-installation command. The deployment must already have its MCP authentication
-configured as described in the self-hosting runbook. A renamed Kith Mind plugin
-and public marketplace distribution are future work.
+### Step 3. Connect your assistant
 
-## Development
+In **Claude**, open Settings, then Connectors, then add a custom connector
+pointing at `https://your-project.vercel.app/api/mcp`. Sign in through the
+OAuth prompt using the account from step 2, then approve the permissions.
 
-Install dependencies with `pnpm install`, then run:
+In **ChatGPT**, add the same URL as a custom MCP connector. Custom connectors
+require a paid plan.
 
+In **Claude Code**, skip the browser:
+
+```sh
+claude mcp add --transport http kithmind https://your-project.vercel.app/api/mcp
 ```
+
+Grant read permission on your Personal space first. Add write and ingest
+permissions when you actually need them.
+
+### Step 4. Talk normally
+
+There is no special syntax. Say durable things and the assistant stores them.
+
+> Our new pediatrician is Dr. Reyes at Lakeside Family Health.
+
+> We decided to keep the 2019 Outback instead of trading it in, mostly because
+> the quote on the replacement was 9k over what we wanted to spend.
+
+Ask about them later, in any connected assistant, in a fresh conversation:
+
+> Who is the kids' pediatrician?
+
+> Why did we keep the Outback?
+
+The assistant decides when to call the tools. Kith Mind describes very clearly
+when each tool should be used, but it cannot see your conversation unless the
+client calls a tool. If an assistant is quiet about it, say "remember this" or
+"check my knowledge base" and it will.
+
+### Step 5. Confirm it actually stuck
+
+Worth doing once, with a fact you do not mind being wrong:
+
+1. State a fact, then ask for it back using different words.
+2. Change the fact. Confirm you get the new value, and that asking what it used
+   to be returns the old one as superseded.
+3. Correct a fact you got wrong. It is retracted, not recorded as once true.
+4. Repeat a fact. It does not duplicate.
+
+### Step 6. Add family, optionally
+
+Use **Spaces** in the web app to create a shared space and invite someone. They
+accept an invite link, you approve them, and you both get shared access with
+Personal spaces still private. Roles, person links, and scoped API keys are in
+the [family spaces guide](docs/family-spaces.md).
+
+## What the assistant gets
+
+| Tool                                                   | Purpose                               |
+| ------------------------------------------------------ | ------------------------------------- |
+| `remember_fact`, `search_facts`                        | Precise facts, with history           |
+| `capture_thought`, `search_thoughts`, `recall_context` | Narrative memory and grounded recall  |
+| `search_documents`, `get_document`, `list_sources`     | Captured documents and retained text  |
+| `query_records`                                        | Typed lab, vehicle, and money records |
+| `create_list`, `get_open_items`, and the list tools    | Simple shared lists                   |
+
+Set `MCP_TOOL_PROFILE=memory` to expose the memory and document tools only.
+The default is the full set.
+
+## Where it stands
+
+Working today: typed facts with supersession and retraction, narrative thoughts
+with hybrid retrieval and citations, authenticated text capture, document
+search with semantic and keyword modes, family spaces with invitations and
+roles, capability-scoped API keys, and an OAuth MCP gateway. A bounded
+filesystem worker can admit local text files.
+
+Not yet: automated connectors, typed extraction from real documents, cloud
+monitoring, and bulk backfill of your own archives. The
+[architecture document](./docs/plans/2026-09-06-architecture.md) holds the phase
+table, and it is the source of truth for what is planned.
+
+Mobile is deliberately thin. Desktop is the primary workflow, and hosted MCP
+covers mobile clients that support it. There is no native app planned.
+
+## Running it locally
+
+```sh
+pnpm install
+cd packages/convex && npx convex dev --once && cd ../..
+pnpm --filter @repo/db exec auth --web-server-url http://localhost:3000
+cp apps/web/.env.example apps/web/.env.local   # then set the dev Convex URL
+pnpm dev
+```
+
+`pnpm demo:brain` runs a synthetic end-to-end check that calls no AI provider.
+Its four environment inputs are documented in
+[`docs/self-hosting.md`](./docs/self-hosting.md).
+
+Before opening a pull request:
+
+```sh
 pnpm lint
 pnpm check-types
 pnpm test:once
 pnpm build
 ```
 
-Read [CONTRIBUTING.md](./CONTRIBUTING.md) for the public contribution workflow
-and [AGENTS.md](./AGENTS.md) for agent guidance.
+[CONTRIBUTING.md](./CONTRIBUTING.md) covers the contribution workflow and
+[AGENTS.md](./AGENTS.md) covers agent guidance.
+
+## License
+
+Kith Mind contributions are intended to be MIT-licensed. The repository derives
+from earlier work whose attribution is preserved in [LICENSE](./LICENSE) and
+explained in [provenance](docs/upstream-provenance.md).
