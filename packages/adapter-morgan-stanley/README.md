@@ -69,7 +69,15 @@ Header capture, in order:
    three header names -- `X-XSRF-TOKEN`, `X-DEVICE-FOOTPRINT` and
    `Authorization` -- and writes their values into a page-side slot at
    `globalThis[Symbol.for("kithmind.capturedHeaders")]`, under canonical
-   lowercase names so one header is never sent twice.
+   lowercase names so one header is never sent twice. Alongside each value it
+   records the header's provenance in a second slot,
+   `globalThis[Symbol.for("kithmind.captureMeta")]`: whether the request that
+   carried it was one the app made itself (`app`) or one this bridge issued
+   (`bridge`), and how long after the document loaded. The bridge spreads the
+   captured slot into its own requests, so without that mark a bridge call
+   re-captures the values it just read and "the header is in the slot" proves
+   nothing. Provenance is a source word and a millisecond count; no value is
+   recorded in it.
 3. Reload the tab once. The reload does not re-authenticate, and it makes
    capture deterministic instead of depending on a click that happens to fire
    an XHR.
@@ -125,6 +133,31 @@ lost session fails every remaining document pull the same way within
 milliseconds, so it stops the run instead of grinding through thousands of
 guaranteed failures. What already committed stays committed; sign in again
 and rerun the same selection to pick up where it left off.
+
+A pull that is still running when the session ends pauses instead, waits for
+the owner to sign in again, and then rebuilds itself into the state a fresh
+process would find rather than reusing the paused one. It closes the old CDP
+socket and its timers, reconnects, reinstalls the hook, loads the app's own
+landing route for real -- the navigation the app itself performs after a
+sign-in, not a reload of whatever page the login flow left behind and not a
+hash change, which would never re-bootstrap the app shell -- and then waits
+for the app to issue an `X-XSRF-TOKEN` and an `X-DEVICE-FOOTPRINT` of its own
+before it trusts anything. A footprint that only one of the bridge's own
+requests ever carried does not count.
+
+That last wait is the point. Twice, a resume that proceeded as soon as
+*something* was in the slot paired a freshly minted bearer with a footprint
+the server had not issued, and every document download came back HTTP 400
+"Service Error" until the consecutive-failure breaker stopped the run, while a
+brand-new process started after the same sign-in downloaded normally. The
+difference was never the reload: it was that the resume treated the app's
+first request as proof the sign-in had finished, and a fresh process instead
+finds a slot the app filled itself. If the app never issues a footprint of its
+own within ninety seconds of the landing route loading, the resume fails by
+name and says to open the app's Activity or Documents tab and rerun, rather
+than spending the rest of the queue on a value the server will reject. Every
+step logs the provenance and lengths of what is in the slot, so a log line
+says which request a header actually came from.
 
 ## Activity pagination
 
