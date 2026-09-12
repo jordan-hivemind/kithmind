@@ -72,6 +72,7 @@ import {
   inspectCapturedPdfParserOutput,
   inspectParserOutputIntent,
   preparePdfDocQaProfile,
+  reclaimStaleParserOutputDirectory,
   removeParserProfileWorkDirectoryExact,
   removeParserOutputExact,
   runCapturedPdfParser,
@@ -3580,6 +3581,20 @@ export class PipelineRunner {
       );
       if (outputPresence[0] !== outputPresence[1]) {
         throw new PipelineWorkerError("parser_output_incomplete");
+      }
+      if (!outputPresence[0]) {
+        // A run interrupted after the work directory was reserved but
+        // before the parser wrote its evidence leaves only empty
+        // `.home-<id>` / `.tmp-<id>` scaffolding behind. The work ID is
+        // deterministic, so a resumed run re-targets that same directory;
+        // clear the leftover scaffolding so `runCapturedPdfParser`'s
+        // require-empty precondition holds. Evidence, and anything that
+        // isn't empty known scaffolding, is left alone and still surfaces
+        // as `destination_exists`.
+        await reclaimStaleParserOutputDirectory({
+          outputRoot: pdf.parserOutputRoot,
+          outputIntent: intent,
+        });
       }
       const output = outputPresence[0]
         ? await inspectCapturedPdfParserOutput(
