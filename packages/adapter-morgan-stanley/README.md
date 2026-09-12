@@ -333,8 +333,27 @@ maintain the parser without a statement in front of them. Labels only: every
 value in this repository's fixtures is invented.
 
 **Document and period.** Every page carries `CLIENT STATEMENT   For the
-Period <Month> D-DD, YYYY`, and that is the only period spelling the corpus
-uses. The account number prints as `NNN-NNNNNN-NNN`.
+Period <Month> D-DD, YYYY`. A period that opens mid-month names its month
+twice -- `For the Period November 26-December 31, 2021` -- and both spellings
+are read. A period stated backwards across a year boundary (`December
+26-January 5, 2022`) names only one year, so the month it opened in belongs to
+no stated year and the statement is refused rather than dated by assumption.
+The account number prints as `NNN-NNNNNN-NNN`.
+
+Two other document families print no period line and no `BALANCE SHEET`:
+
+| Family | How it is told | What is recorded |
+| --- | --- | --- |
+| Cash activity summary | An `Activity Date` table, no period line, no `BALANCE SHEET`, no holdings table | Nothing: this institution's activity is read from the `structured_api` tier. The parse note names the family rather than blaming the period line |
+| Account holding nothing | A cover-page `TOTAL VALUE OF <x> ACCOUNT` banner stating `—`, no `BALANCE SHEET`, no holdings table | Nothing, and no parse note: the statement states its total, and `—` is not zero |
+
+**Cover page.** The first page carries `TOTAL VALUE OF <x> ACCOUNT` with the
+amount alone on the following line, above `Includes Accrued Interest`. It is
+read only when the document prints no `BALANCE SHEET` block at all, and only
+when it names one `ACCOUNT`: the plural `ACCOUNTS` banner on a consolidated
+statement's cover is the household total, not any one account's balance. The
+balance it yields states the total value and nothing else -- no cash, no
+opening value, no liability -- and its `totalValueNote` says so.
 
 **`BALANCE SHEET`**, left half of the page, two columns headed `Last Period`
 and `This Period`, each with an `(as of MM/DD/YY)` line beneath it. Row
@@ -375,7 +394,22 @@ arrive as a single cell, so each header cell is scanned for the labels inside
 it. `Unit Cost` / `Adj Unit Cost` are bound and then ignored:
 `ParsedPosition.price` is the market price, not what the lot cost.
 
-Two security-block shapes occur, and both are read:
+A bare `Value` column is that holding's value only in the NAV-priced fund
+table, which is told by the `NAV` column beside it; there the position is
+carried at `reported_nav`. The aggregate private-holdings table prints the
+same label as part of `Value + Distributions`, which is a value with
+distributions added into it and is never read as what the holding is worth --
+that table's securities are reported with no value and a note saying the table
+states none.
+
+A table reprints a sub-header (`Percentage` / `of Holdings`, then the value
+columns again) above each section's own totals. Everything from that reprint
+to the next security is the section's totals, not a holding -- including the
+totals row that repeats the section's name in the description column and its
+share of holdings where a lot would print its trade date. Only a row stating a
+real date starts a security there.
+
+Four security-block shapes occur, and all four are read:
 
 - An equity or fund prints one row per tax lot and a `Total` row carrying the
   aggregate, followed by `Next Dividend Payable MM/YYYY; Asset Class: <class>`.
@@ -387,6 +421,14 @@ Two security-block shapes occur, and both are read:
   beneath it (`Coupon Rate x%; Matures MM/DD/YYYY; CUSIP nnnnnnnnn`), with no
   `Total` row. The block's rows are merged under the same agree-or-leave-null
   rule, and the CUSIP is read off the detail line.
+- A security with more lots than fit on a page runs past the page footer
+  (`Page N of M`) and continues on the next page under a reprint of the
+  identical table header, with the `Total` row among the continued rows. The
+  interrupted block is carried across to that reprint -- same header text,
+  same account -- rather than refused as a block with no `Total`. A block
+  nothing continues is flushed and read exactly as it was before.
+- A NAV-priced fund prints one row under a `Value` column instead of a
+  `Market Value` one.
 
 Values are right-aligned under right-aligned headers and descriptions are
 left-aligned under left-aligned ones, so a cell binds to the column whose
@@ -400,7 +442,7 @@ two-letter footnote reference, and `—` for "none".
 
 | Field | Source | Notes |
 | --- | --- | --- |
-| Period start, period end | `For the Period` line | Absent -> whole document refused |
+| Period start, period end | `For the Period` line, one month or two | Absent, or stated backwards over a year boundary -> whole document refused |
 | `ParsedBalance.totalValue`, `.periodEndValue` | `TOTAL VALUE` / `This Period` | |
 | `ParsedBalance.periodStartValue` | `TOTAL VALUE` / `Last Period` | |
 | `ParsedBalance.cash` | `Cash, BDP, MMFs` / `This Period` | |
@@ -416,10 +458,14 @@ Ambiguity is always a null with a note and a locator, never a guess:
 - An amount that will not canonicalize -> null, `amountNote`/`marketValueNote`/
   `totalValueNote`, and a field locator naming the cell.
 - A security block with several valued lots and no `Total` row -> no position,
-  and a `parseNote` counting the blocks and naming the first reason. Across the
-  live corpus this is about 5% of blocks.
-- A statement with no readable `BALANCE SHEET` -> holdings still reported, and
-  a `parseNote` saying no balance was.
+  and a `parseNote` counting the blocks and naming the first reason. Once the
+  page-split and section-totals shapes above are read, this is about 0.6% of
+  blocks across the live corpus.
+- A holdings table with no value column this parser reads -> no position, and a
+  `parseNote` saying the table states no value, which is a different failure
+  from a block whose valued lots disagree.
+- A statement with no readable `BALANCE SHEET` and no cover-page banner ->
+  holdings still reported, and a `parseNote` saying no balance was.
 
 ### Consolidated statements
 

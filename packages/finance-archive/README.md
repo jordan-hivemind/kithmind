@@ -490,6 +490,18 @@ to import. The importer records it with `parsed_ok` false and opens one
 real extractor revisits it; a rerun of the identical still-unparsed bytes
 does not reopen a second review item for the same document.
 
+**A changed parse note (F1-60):** a better extractor reading the same
+immutable bytes may still not parse them, but say something different about
+why -- it got further, or it named the real obstacle where the older one
+guessed. That is a new reading of one document, not a second finding, so the
+one `document_unparsed` item that document already has is rewritten in place:
+its `reason` and `raw_value` become the new note, it stays `open`, and no
+second row is opened beside it saying something the parser no longer says.
+Only an `open` item is rewritten -- an item a reviewer dismissed or resolved
+is never reopened or edited by a rerun -- and the import summary counts the
+rewrites as `reviewItemsUpdated`, which `reparse` prints as `review items
+updated`.
+
 **`parsed_ok` (F1-49):** a document is recorded as parsed as soon as
 something in it -- a row, position, balance or liability -- was actually
 inserted or deduplicated, even when something else in the same document was
