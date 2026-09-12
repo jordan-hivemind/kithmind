@@ -447,16 +447,47 @@ export default async function createMorganStanleySession(options = {}) {
     return ok === "refreshed";
   }
 
-  async function withBearerRetry(request, run) {
-    try {
-      return await run();
-    } catch (error) {
-      const message = String(error?.message ?? error);
-      if (request.needsAuthorization && /request failed: 401\b/.test(message) && (await refreshBearer())) {
-        return run();
+  // The site ends a session about forty-five minutes after sign-in no
+  // matter how active it is (seen live 2026-09-11 with keep-alive
+  // acknowledged to the end). A signed-out tab is therefore a pause, not a
+  // failure: wait for the owner to sign in again in this same window, let
+  // the reloaded document repopulate the header slot through the hook, and
+  // resume. Progress is reported to stderr; nothing signs in on its own.
+  const SIGN_IN_WAIT_MS = Number(process.env.MS_SIGN_IN_WAIT_MS ?? 45 * 60 * 1000);
+  async function waitForSignIn(reason) {
+    console.error(new Date().toISOString(), "[bridge] paused: signed out; sign in again in the dedicated Chrome window to resume", "(" + reason.slice(0, 80) + ")");
+    const deadline = Date.now() + SIGN_IN_WAIT_MS;
+    let announced = 0;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+      const targets = await (await fetch(`${cdpHttpBase}/json/list`)).json().catch(() => []);
+      const onApp = targets.find((t) => t.type === "page" && t.url.startsWith(origin));
+      if (!onApp) { if (Date.now() - announced > 60_000) { announced = Date.now(); console.error(new Date().toISOString(), "[bridge] still waiting for sign-in"); } continue; }
+      const keys = (await slotKeys().catch(() => [])).map((k) => k.toLowerCase());
+      if (keys.includes("x-xsrf-token")) {
+        console.error(new Date().toISOString(), "[bridge] resumed: headers captured after sign-in");
+        return true;
       }
-      throw error;
     }
+    return false;
+  }
+
+  async function withBearerRetry(request, run) {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        return await run();
+      } catch (error) {
+        const message = String(error?.message ?? error);
+        if (request.needsAuthorization && /request failed: 401\b/.test(message) && (await refreshBearer())) {
+          continue;
+        }
+        if (/SIGNED_OUT|no session headers captured yet/.test(message) && attempt < 2 && (await waitForSignIn(message))) {
+          continue;
+        }
+        throw error;
+      }
+    }
+    throw new Error("request retried too many times");
   }
 
   async function fetchText(path, query = {}) {
