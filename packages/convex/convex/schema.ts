@@ -1,5 +1,6 @@
 import { recordTables } from "./models/records/tables";
 import { cardTables } from "./models/records/cardTables";
+import { cardQueueTables } from "./models/records/cardQueueTables";
 import { recordQueryTables } from "./models/records/queryTables";
 import { embeddingTables } from "./models/embeddings/tables";
 import { coverageTables } from "./models/coverage/tables";
@@ -41,6 +42,7 @@ export default defineSchema({
   ...familyTables,
   ...recordTables,
   ...cardTables,
+  ...cardQueueTables,
   ...recordQueryTables,
   thoughts: defineTable(thoughtFields)
     .index("by_userId", ["userId"])
