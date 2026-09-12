@@ -190,7 +190,8 @@ commitments(id, account_id, instrument_id, committed, called, outstanding,
 
 documents(id, institution_id, account_id, doc_type, doc_date, file_path,
           sha256, text_path, parsed_ok, notes, retained_sha256,
-          retained_byte_length, media_type, capture_id)
+          retained_byte_length, media_type, capture_id,
+          provider_document_id, superseded_by)
 
 import_runs(id, started_at, finished_at, source, files_seen, rows_inserted,
             rows_skipped, reconciliations_passed, reconciliations_failed,
@@ -209,6 +210,16 @@ review_items(id, kind, account_id, source_document_id, source_locator,
 
 Only the last four digits of any account number are stored. Raw documents keep
 whatever they contain and are not redacted.
+
+`documents.provider_document_id` (schema version 10) is a document's identity
+inside its institution: the provider's own id for it, unique per institution
+among rows that are not superseded. `sha256` stays capture identity -- "have
+these exact bytes been seen" -- because the two are not the same question for
+a provider that renders a fresh file on every download, and treating them as
+one recorded 1,321 statements as 6,461 documents. A re-download of a document
+already on file is retained as its own capture and adds no second row;
+`superseded_by` marks a duplicate row that a collapse pointed at its canonical
+one, since the capture it names is real and stays on disk.
 
 `documents.retained_sha256`, `retained_byte_length`, `media_type` and
 `capture_id` (schema version 2) name the immutable retained bytes a row was

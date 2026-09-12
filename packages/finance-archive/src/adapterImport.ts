@@ -93,6 +93,15 @@ export type AdapterPull = {
   readonly parseNote?: string;
   readonly docType: string;
   readonly docDate: string | null;
+  /**
+   * F1-71. The provider's own id for the document this pull acquired
+   * (`DiscoveredDocument.providerDocumentId`), which is this document's
+   * identity inside the institution -- `documents.provider_document_id`.
+   * Null for an export-tier pull: a paginated activity feed names no single
+   * provider document, and the page rows it splits into are this archive's
+   * own derived identities, not the provider's.
+   */
+  readonly providerDocumentId?: string | null;
   readonly persisted: PersistedAcquisition;
   /**
    * F1-19. The institution's declared `ActivityTaxonomy` (adapter.ts),
@@ -1101,6 +1110,12 @@ async function collectDocuments(
       accountId: pull.accountId,
       docType: pull.docType,
       docDate: pull.docDate,
+      // F1-71. Only the single-document case: a paginated pull split into
+      // page rows is one provider document that became several `documents`
+      // rows, and they cannot all claim one institution-scoped identity
+      // (`documents_provider_document_id_key` would refuse the second). Page
+      // rows keep the derived `sha256` identity above and nothing else.
+      providerDocumentId: single ? (pull.providerDocumentId ?? null) : null,
       providerReportedCount: single ? reportedRowCount : null,
       rows,
       reviewItems,
@@ -1164,6 +1179,11 @@ export type AcquisitionDescriptor = {
    * no single account (F1-35). Same reasoning as `institutionSlug`. */
   readonly accountLast4: string | null;
   readonly docType: string;
+  /** F1-71. The provider's own id for this document
+   * (`DiscoveredDocument.providerDocumentId`), recorded on the capture
+   * manifest so the raw tree says which document a capture is of. Null for
+   * an export-tier pull, which names no single document. */
+  readonly providerDocumentId?: string | null;
   readonly acquired: AcquiredDocument;
   /** Dot-prefixed (".pdf", ".csv"), when the source gave one. Recorded on
    * the capture manifest only; the raw bytes stay content-addressed and
@@ -1242,6 +1262,7 @@ export function persistAcquiredDocument(
     institutionSlug,
     accountLast4,
     docType,
+    providerDocumentId = null,
     acquired,
     originalExtension = null,
     captureId = randomUUID(),
@@ -1292,6 +1313,9 @@ export function persistAcquiredDocument(
     institutionSlug,
     acctLast4: accountLast4,
     docType,
+    // F1-71: the key is omitted, never written as null, when the adapter
+    // names no provider id -- see CaptureManifest.providerDocumentId.
+    ...(providerDocumentId === null ? {} : { providerDocumentId }),
     periodStart: acquired.manifest.periodStart,
     periodEnd: acquired.manifest.periodEnd,
     capturedAt: acquired.manifest.capturedAt,

@@ -529,6 +529,12 @@ async function fetchDocumentsPages(session, docType, kind) {
         const subType = String(raw.documentTypeName ?? docType);
         items.push({
           externalId: encodeDocumentExternalId(raw.documentId, keyAccount, periodStart, periodEnd),
+          // F1-71. This document's identity inside the institution, apart
+          // from the externalId that also carries the account key and period
+          // acquireDocument needs. The site renders a fresh PDF on every
+          // download, so content hash cannot answer "is this the same
+          // document" and this is what does.
+          providerDocumentId: String(raw.documentId),
           kind,
           periodStart,
           periodEnd,

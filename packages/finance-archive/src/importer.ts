@@ -231,6 +231,19 @@ export type ImportDocument = {
   docType: string;
   docDate: string | null;
   /**
+   * F1-71. This document's identity inside its institution: the provider's
+   * own id for it (`DiscoveredDocument.providerDocumentId`, adapter.ts).
+   * `sha256` above answers "have these exact bytes been seen"; this answers
+   * "is this the same document," which byte identity cannot for a provider
+   * that renders a fresh file on every download. A pull carrying an id
+   * already recorded for this institution is a *new capture* of a document
+   * the archive already has: its bytes and its capture record are retained
+   * (ground rule 1, written before `importBatch` ever runs), and no second
+   * `documents` row and no re-import of its rows follow. Null or omitted for
+   * an export-tier pull, which names no single provider document.
+   */
+  providerDocumentId?: string | null;
+  /**
    * The provider's own reported row/transaction count for this document's
    * pull, when the source reports one. Ground rule 7: a mismatch between
    * this and `rows.length` fails the whole import loudly rather than being
@@ -1597,13 +1610,38 @@ export async function importBatch(
         continue;
       }
 
+      // F1-71. Different bytes, but a provider document id this institution
+      // already has on file: the provider re-rendered a document the archive
+      // already holds (Morgan Stanley does this on every download, which is
+      // how 1,321 statements became 6,461 `documents` rows). The new bytes
+      // and their capture manifest are already in the raw tree -- ground rule
+      // 1 retains every capture, and the raw tree is where captures live --
+      // so what is left to decide here is only what the *database* does, and
+      // the answer is nothing: no second document row for one document, and
+      // no re-import of rows that are already imported under the row the
+      // archive has. A pull whose bytes are unchanged never reaches this
+      // check; it matches on `sha256` above and stays the no-op it was.
+      if (existing === undefined && document.providerDocumentId) {
+        const prior = await client.query<{ id: string }>(
+          `SELECT id FROM documents
+            WHERE institution_id = $1 AND provider_document_id = $2
+              AND superseded_by IS NULL`,
+          [document.institutionId, document.providerDocumentId],
+        );
+        if (prior.rows[0] !== undefined) {
+          rowsDeduplicated += document.rows.length;
+          continue;
+        }
+      }
+
       const documentId = existing?.id ?? randomUUID();
       if (!existing) {
         await client.query(
           `INSERT INTO documents
              (id, institution_id, account_id, doc_type, doc_date, file_path, sha256, parsed_ok,
-              retained_sha256, retained_byte_length, media_type, capture_id, text_path)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE, $8, $9, $10, $11, $12)`,
+              retained_sha256, retained_byte_length, media_type, capture_id, text_path,
+              provider_document_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE, $8, $9, $10, $11, $12, $13)`,
           [
             documentId,
             document.institutionId,
@@ -1617,6 +1655,7 @@ export async function importBatch(
             document.mediaType ?? null,
             document.captureId ?? null,
             document.textPath ?? null,
+            document.providerDocumentId ?? null,
           ],
         );
       } else if (document.textPath !== null && document.textPath !== undefined) {

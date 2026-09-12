@@ -197,6 +197,21 @@ export type DiscoveredDocument = {
    * terminal. Omitted when the adapter has nothing finer-grained than `kind`.
    */
   readonly subType?: string;
+  /**
+   * F1-71. The provider's own id for this document, when the adapter has one
+   * apart from the opaque `externalId` it encodes (Morgan Stanley's
+   * `documentId`, which its `externalId` folds together with the account key
+   * and period). This is the document's identity inside the institution --
+   * `documents.provider_document_id` -- and is what decides whether a listing
+   * item has already been recorded, so it must name the same document every
+   * time the provider lists it, whatever bytes a download produces.
+   *
+   * Omitted when the adapter has nothing finer than `externalId`, in which
+   * case `externalId` is the identity: opaque and institution-defined is
+   * exactly what this column wants, and an adapter whose `externalId` is
+   * already the document id needs to say nothing extra.
+   */
+  readonly providerDocumentId?: string;
 };
 
 export type DiscoveredExportRange = {
