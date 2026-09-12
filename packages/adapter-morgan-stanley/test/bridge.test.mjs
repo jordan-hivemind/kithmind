@@ -19,22 +19,54 @@ import {
   waitForSignIn,
   reloadAndCaptureHeaders,
   waitForAllHeaders,
+  waitForAppFootprint,
+  HEADER_HOOK,
   closeSession,
   sharedOnce,
   createSharedGate,
 } from "../src/bridge.mjs";
 
+// Provenance as the page-side hook records it (src/bridge.mjs,
+// captureMetaExpression): per header a length, where the first (or first
+// app-initiated) capture came from, and how long after the document loaded.
+// Lengths are the ones the owner's real 2026-09-12 runs reported.
+const APP_ISSUED_META = {
+  headers: {
+    "x-xsrf-token": { length: 488, source: "app", afterLoadMs: 180 },
+    "x-device-footprint": { length: 690, source: "app", afterLoadMs: 940 },
+  },
+  documentAgeMs: 1200,
+};
+// The failing shape: the app has started and sent its xsrf token, but the
+// only request that ever carried a footprint was one the bridge itself
+// issued -- which just echoes the slot back, so it proves nothing.
+const BRIDGE_ECHO_META = {
+  headers: {
+    "x-xsrf-token": { length: 488, source: "app", afterLoadMs: 180 },
+    "x-device-footprint": { length: 690, source: "bridge", afterLoadMs: 4200 },
+  },
+  documentAgeMs: 5000,
+};
+// The app has started but has not got as far as a footprint yet.
+const XSRF_ONLY_META = {
+  headers: { "x-xsrf-token": { length: 488, source: "app", afterLoadMs: 180 } },
+  documentAgeMs: 300,
+};
+
 // A fake cdp for the resume tests below: `Runtime.evaluate` is answered by
 // pattern-matching the expression text (the shapes bridge.mjs ever sends:
-// read the slot's keys, read its diagnostics, set/check the reload sentinel,
-// or the bearer-refresh call), and every other method call (Page.enable,
-// Page.reload, Page.navigate, Page.addScriptToEvaluateOnNewDocument) is just
-// recorded. This is the same "fake cdp" shape startKeepAlive's own tests
-// already use below, extended to script a sequence of slot-key readings and
-// to record whether `close()` was called.
-function makeFakeCdp(slotKeysSequence) {
+// read the slot's keys, read the capture diagnostics, set/check the reload
+// sentinel, or the bearer-refresh call), and every other method call
+// (Page.enable, Page.reload, Page.navigate,
+// Page.addScriptToEvaluateOnNewDocument) is just recorded. This is the same
+// "fake cdp" shape startKeepAlive's own tests already use below, extended to
+// script a sequence of slot-key readings, a sequence of capture-provenance
+// readings, and to record whether `close()` was called. Either sequence
+// repeats its last entry once exhausted.
+function makeFakeCdp(slotKeysSequence, metaSequence = [APP_ISSUED_META]) {
   const calls = [];
   let slotReadIndex = 0;
+  let metaReadIndex = 0;
   let closed = false;
   const cdp = {
     send: async (method, params) => {
@@ -50,8 +82,12 @@ function makeFakeCdp(slotKeysSequence) {
         if (/__kithmindReloadSentinel === undefined/.test(expression)) {
           return { result: { value: true } }; // reloadAndCaptureHeaders: sentinel check -- "fresh" immediately
         }
-        if (/Object\.fromEntries\(Object\.entries\(globalThis\[Symbol\.for/.test(expression)) {
-          return { result: { value: {} } }; // diagnostics (names + lengths only) -- not asserted on here
+        if (/kithmind:capture-meta/.test(expression)) {
+          // Capture provenance -- read both by logSlotDiagnostics and by
+          // waitForAppFootprint, so one sequence answers both.
+          const value = metaSequence[Math.min(metaReadIndex, metaSequence.length - 1)];
+          metaReadIndex += 1;
+          return { result: { value } };
         }
         if (/Object\.keys\(globalThis\[Symbol\.for/.test(expression)) {
           const value = slotKeysSequence[Math.min(slotReadIndex, slotKeysSequence.length - 1)];
@@ -66,7 +102,7 @@ function makeFakeCdp(slotKeysSequence) {
       closed = true;
     },
   };
-  return { cdp, calls, isClosed: () => closed };
+  return { cdp, calls, isClosed: () => closed, metaReads: () => metaReadIndex };
 }
 
 function withFakeFetch(targetUrl, run) {
@@ -271,6 +307,75 @@ test("the page fetch expression does not confuse a same-origin tab for a signed-
     vm.runInContext(expression, sandbox),
     /^Error: no session headers captured yet/,
   );
+});
+
+// F1-54c. The capture hook is plain, self-invoking JS, so its provenance
+// rules can be proven against a stub page in a vm context -- the same way
+// INACTIVITY_DIALOG_EXPRESSION is tested below -- with no browser, no
+// credential and no real site. This is the rule the whole resume fix rests
+// on: a header the bridge's own request carried is marked `bridge`, because
+// the bridge spreads the captured slot into its own headers and would
+// otherwise re-capture the values it just read and call that evidence.
+function runHeaderHook() {
+  const requests = [];
+  const sandbox = {
+    Headers,
+    Date,
+    Object,
+    String,
+    Symbol,
+    fetch(url, init) {
+      requests.push({ url, init });
+      return Promise.resolve({ ok: true, status: 200, text: async () => "body" });
+    },
+    location: { href: "https://app.example.invalid/atrium/" },
+    XMLHttpRequest: function XMLHttpRequest() {},
+  };
+  sandbox.XMLHttpRequest.prototype = { setRequestHeader() {} };
+  vm.createContext(sandbox);
+  vm.runInContext(HEADER_HOOK, sandbox);
+  const read = (slot) => vm.runInContext(`globalThis[Symbol.for(${JSON.stringify(slot)})]`, sandbox);
+  return {
+    sandbox,
+    requests,
+    appRequest(name, value) {
+      const xhr = new sandbox.XMLHttpRequest();
+      xhr.setRequestHeader(name, value);
+    },
+    slot: () => read("kithmind.capturedHeaders"),
+    meta: () => read("kithmind.captureMeta"),
+  };
+}
+
+test("the capture hook marks a header the app sent itself as app-issued, with how long after the document loaded", () => {
+  const page = runHeaderHook();
+  page.appRequest("X-XSRF-TOKEN", "x".repeat(488));
+  page.appRequest("X-DEVICE-FOOTPRINT", "f".repeat(690));
+
+  assert.deepEqual(Object.keys(page.slot()), ["x-xsrf-token", "x-device-footprint"]);
+  assert.equal(page.meta().headers["x-device-footprint"].source, "app");
+  assert.ok(page.meta().headers["x-device-footprint"].afterLoadMs >= 0);
+  // Provenance carries no value anywhere: only a source and a timing.
+  assert.deepEqual(Object.keys(page.meta().headers["x-device-footprint"]).sort(), ["afterLoadMs", "source"]);
+});
+
+test("the capture hook marks a header only the bridge's own request carried as bridge-issued, and an app request later upgrades it", async () => {
+  const page = runHeaderHook();
+  page.appRequest("X-XSRF-TOKEN", "x".repeat(488));
+  // The bridge's own page fetch, which spreads the slot into its headers.
+  page.slot()["x-device-footprint"] = "f".repeat(690);
+  await vm.runInContext(
+    pageFetchExpression("https://app.example.invalid", { method: "POST", url: "/x", body: "{}" }),
+    page.sandbox,
+  );
+
+  assert.equal(page.meta().headers["x-device-footprint"].source, "bridge", "the bridge's echo of the slot is not evidence");
+  assert.equal(page.meta().headers["x-xsrf-token"].source, "app", "an app record is never downgraded by a later bridge call");
+  assert.equal(page.meta().bridgeDepth, 0, "the bridge mark is released once the request is issued");
+  assert.ok(page.requests[0].init.headers["x-device-footprint"], "the captured slot still rides along on the request");
+
+  page.appRequest("X-DEVICE-FOOTPRINT", "f".repeat(690));
+  assert.equal(page.meta().headers["x-device-footprint"].source, "app", "the app issuing it for real upgrades the record");
 });
 
 test("startKeepAlive returns an interval that is unref'd -- it must never be the reason the process stays up", (t) => {
@@ -599,15 +704,18 @@ test("the page-side check reports a matching dialog with no matching button inst
 // F1-54b: clearing the slot in place (the original F1-54 fix) and then only
 // navigating within the app was not enough -- an in-app hash navigation
 // alone never makes the app re-derive its device-footprint, which it only
-// computes once per real page load, so a post-resume request still paired a
-// freshly minted bearer with a *stale* device-footprint and the documents
-// endpoint 400'd every one of them (seen live 2026-09-11 and again
-// 2026-09-12). The fix is to make resume indistinguishable from a cold
-// start: tear the paused connection down and reconnect, so the page-side
-// slot is a brand new object the reload (not a clear) recreates -- the same
-// reload cold start uses, which is what makes the app re-issue its
-// device-footprint request.
-test("waitForSignIn tears the paused connection down and reconnects, running the same reload cold start uses, rather than clearing the slot in place", async () => {
+// computes once per real page load. So resume tears the paused connection
+// down, reconnects, and forces a real load.
+//
+// F1-54c: that still 400'd after a real sign-out and re-login (2026-09-12,
+// 17:07Z), because the resume decided the sign-in was finished as soon as the
+// app's *first* request carried an xsrf token, reloaded on top of a
+// half-bootstrapped app, and then took whatever footprint appeared. So the
+// load now lands on the app's own landing route -- the navigation the app
+// performs after a sign-in -- and the resume holds until the capture hook has
+// recorded a footprint the *app* issued, not one the bridge's own request
+// echoed back out of the slot.
+test("waitForSignIn tears the paused connection down, reconnects, and loads the app's own landing route for real rather than clearing the slot in place", async () => {
   // The old, paused connection: read once (the trigger check) and found to
   // still carry the previous session's headers -- exactly as it would if the
   // JS context never reset across the pause.
@@ -660,24 +768,38 @@ test("waitForSignIn tears the paused connection down and reconnects, running the
     "never clears the old slot in place",
   );
 
-  // The reconnected cdp runs the exact same steps a cold start does --
-  // reloadAndCaptureHeaders below is the same function createMorganStanleySession
-  // calls -- before anything resume-specific (Documents navigation, bearer
-  // refresh) happens.
+  // The reconnected cdp runs the same reload cold start does --
+  // reloadAndCaptureHeaders below is the same function
+  // createMorganStanleySession calls -- pointed at the app's landing route,
+  // before anything resume-specific (Documents navigation, bearer refresh)
+  // happens.
   // (One Runtime.evaluate between the hook install and the sentinel set is
-  // this module's own diagnostics read -- names and lengths only, see
+  // this module's own diagnostics read -- lengths and provenance only, see
   // logSlotDiagnostics -- not a slot mutation.)
   const methodSequence = newCalls.map((c) => c.method);
   assert.deepEqual(
-    methodSequence.slice(0, 6),
-    ["Page.enable", "Runtime.enable", "Page.addScriptToEvaluateOnNewDocument", "Runtime.evaluate", "Runtime.evaluate", "Page.reload"],
-    "reconnect, then the same sentinel-reload cold start uses",
+    methodSequence.slice(0, 7),
+    [
+      "Page.enable",
+      "Runtime.enable",
+      "Page.addScriptToEvaluateOnNewDocument",
+      "Runtime.evaluate",
+      "Runtime.evaluate",
+      "Page.navigate",
+      "Page.reload",
+    ],
+    "reconnect, then the same sentinel-reload cold start uses, aimed at the landing route",
+  );
+  assert.equal(
+    newCalls[methodSequence.indexOf("Page.navigate")].params.url,
+    "https://app.example.invalid/atrium/",
+    "the first navigation is a real load of the app's own landing route, not a hash change",
   );
 
-  const navigateIndex = newCalls.findIndex((c) => c.method === "Page.navigate");
-  assert.notEqual(navigateIndex, -1);
-  assert.match(newCalls[navigateIndex].params.url, /#\/documents$/);
-  assert.ok(navigateIndex > methodSequence.indexOf("Page.reload"), "navigates to Documents only after the reload, not instead of it");
+  const documentsIndex = newCalls.findIndex((c) => c.method === "Page.navigate" && /#\/documents$/.test(c.params.url));
+  assert.notEqual(documentsIndex, -1);
+  assert.ok(documentsIndex > methodSequence.indexOf("Page.reload"), "navigates to Documents only after the reload, not instead of it");
+  const navigateIndex = documentsIndex;
 
   const bearerIndex = newCalls.findIndex((c) => c.method === "Runtime.evaluate" && /GetAccessToken/.test(c.params.expression));
   assert.notEqual(bearerIndex, -1, "explicitly refreshes the bearer after resume, rather than hoping navigation alone captured the right one");
@@ -696,6 +818,21 @@ test("reloadAndCaptureHeaders -- the shared reload cold start and resume both ru
   assert.deepEqual(methodSequence, ["Runtime.evaluate", "Page.reload", "Runtime.evaluate", "Runtime.evaluate"]);
   assert.match(calls[0].params.expression, /__kithmindReloadSentinel = true/);
   assert.match(calls[2].params.expression, /__kithmindReloadSentinel === undefined/);
+});
+
+// F1-54c. A resume passes the landing route. `Page.navigate` on its own
+// would be a same-document fragment change whenever the tab already sits
+// under `/atrium/`, which never re-bootstraps the app shell, so the reload is
+// what makes the load real -- and it has to come after the navigate, or it
+// would reload the page the session paused on instead.
+test("reloadAndCaptureHeaders, given a url, navigates there and then reloads so the load is never just a fragment change", async () => {
+  const { cdp, calls } = makeFakeCdp([["x-xsrf-token"]]);
+  await reloadAndCaptureHeaders(cdp, "https://app.example.invalid/atrium/");
+  assert.deepEqual(
+    calls.map((c) => c.method),
+    ["Runtime.evaluate", "Page.navigate", "Page.reload", "Runtime.evaluate", "Runtime.evaluate"],
+  );
+  assert.equal(calls[1].params.url, "https://app.example.invalid/atrium/");
 });
 
 test("waitForAllHeaders polls until every WANTED_HEADERS entry is present", async () => {
@@ -747,6 +884,85 @@ test("lanes sharing the sign-in gate all resume onto the same reconnected sessio
     assert.equal(result.cdp, newCdp, "every lane proceeds on the same reconnected session");
     clearInterval(result.keepAlive);
   }
+});
+
+// F1-54c, the difference between the resume that failed and the fresh
+// process that worked. A fresh process finds a slot the *app* filled while
+// the owner was clicking around; the failing resume took the first footprint
+// that turned up after its own reload. These three tests pin the new gate:
+// it waits for an app-issued footprint, it refuses a bridge-issued one, and
+// the plain give-up path (below) is untouched.
+test("a resume waits for a footprint the app issued itself before it proceeds", async () => {
+  const { cdp: oldCdp } = makeFakeCdp([["x-xsrf-token"]]);
+  // The app has started and sent its xsrf token, but has not got as far as a
+  // footprint for the first two reads; only then does it issue one.
+  const { cdp: newCdp, calls: newCalls } = makeFakeCdp(
+    [[], ["x-xsrf-token", "x-device-footprint", "authorization"]],
+    [XSRF_ONLY_META, XSRF_ONLY_META, XSRF_ONLY_META, APP_ISSUED_META],
+  );
+
+  const result = await withFakeFetch("https://app.example.invalid/atrium/#/documents", () =>
+    waitForSignIn(oldCdp, "https://app.example.invalid", "http://cdp.invalid", "SIGNED_OUT: test", {
+      signInWaitMs: 5000,
+      pollIntervalMs: 1,
+      headerWaitMs: 20,
+      headerPollIntervalMs: 1,
+      footprintWaitMs: 1000,
+      reconnect: async () => newCdp,
+    }),
+  );
+
+  assert.ok(result, "resumes once the app has issued a footprint of its own");
+  clearInterval(result.keepAlive);
+  const bearerIndex = newCalls.findIndex((c) => c.method === "Runtime.evaluate" && /GetAccessToken/.test(c.params.expression));
+  const metaReadsBeforeBearer = newCalls
+    .slice(0, bearerIndex)
+    .filter((c) => c.method === "Runtime.evaluate" && /kithmind:capture-meta/.test(c.params.expression)).length;
+  assert.ok(metaReadsBeforeBearer > 2, "polls the capture provenance until the app's own footprint lands, rather than proceeding on the first read");
+});
+
+test("a resume whose footprint only ever rode on the bridge's own request keeps waiting and then fails by name, instead of proceeding on it", async () => {
+  const { cdp: oldCdp } = makeFakeCdp([["x-xsrf-token"]]);
+  // The slot fills -- so every pre-F1-54c check passes -- but the provenance
+  // says the footprint came from a request the bridge issued, which is just
+  // the bridge reading back its own echo of a dead session's value.
+  const { cdp: newCdp, calls: newCalls, isClosed } = makeFakeCdp(
+    [["x-xsrf-token", "x-device-footprint", "authorization"]],
+    [BRIDGE_ECHO_META],
+  );
+
+  await assert.rejects(
+    withFakeFetch("https://app.example.invalid/atrium/#/documents", () =>
+      waitForSignIn(oldCdp, "https://app.example.invalid", "http://cdp.invalid", "SIGNED_OUT: test", {
+        signInWaitMs: 5000,
+        pollIntervalMs: 1,
+        headerWaitMs: 20,
+        headerPollIntervalMs: 1,
+        footprintWaitMs: 20,
+        reconnect: async () => newCdp,
+      }),
+    ),
+    /never issued its own X-DEVICE-FOOTPRINT.*Refusing to resume on it/s,
+  );
+
+  assert.equal(
+    newCalls.some((c) => c.method === "Runtime.evaluate" && /GetAccessToken/.test(c.params.expression)),
+    false,
+    "never mints a bearer to pair with a footprint it does not trust",
+  );
+  assert.equal(
+    newCalls.some((c) => c.method === "Page.navigate" && /#\/documents$/.test(c.params.url)),
+    false,
+    "never reaches the Documents navigation",
+  );
+  assert.equal(isClosed(), true, "closes the connection it opened rather than leaking the socket");
+});
+
+test("waitForAppFootprint returns null once the deadline passes with only a bridge-issued footprint", async () => {
+  const { cdp } = makeFakeCdp([[]], [BRIDGE_ECHO_META]);
+  assert.equal(await waitForAppFootprint(cdp, 5, 1), null);
+  const { cdp: good } = makeFakeCdp([[]], [XSRF_ONLY_META, APP_ISSUED_META]);
+  assert.deepEqual(await waitForAppFootprint(good, 1000, 1), APP_ISSUED_META);
 });
 
 test("waitForSignIn gives up and returns false if the tab never returns to the app origin", async () => {

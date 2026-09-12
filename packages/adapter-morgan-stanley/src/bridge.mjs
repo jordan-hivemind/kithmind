@@ -22,6 +22,10 @@
 // their own fixture-only tests in test/bridge.test.mjs.
 
 const CAPTURED_HEADERS_SLOT = "kithmind.capturedHeaders";
+// F1-54c. A second page-side slot holding *provenance* for the first one:
+// which kind of request each header was first captured from, and how long
+// after the document loaded. Names and timings only -- never a value.
+const CAPTURE_META_SLOT = "kithmind.captureMeta";
 /** The only header names that are ever captured, and the only ones this
  * module ever names. `authorization` is the bearer the app obtains for its
  * own documents calls; it is captured, stored and re-applied entirely inside
@@ -279,13 +283,31 @@ export async function evaluate(cdp, expression) {
  * sets these headers with are wrapped: XMLHttpRequest, which carries them
  * today, and fetch, in case the documents calls use it, so the bearer is
  * captured either way. A captured value is written to the slot and nowhere
- * else: not returned, not logged, not sent over the debugging connection. */
-const HEADER_HOOK = `(() => {
+ * else: not returned, not logged, not sent over the debugging connection.
+ *
+ * F1-54c: alongside the value it also records the header's *provenance* --
+ * whether the request that carried it was one the app made itself or one this
+ * bridge issued, and how many milliseconds after this document loaded. The
+ * bridge spreads the slot into its own requests, so without this mark every
+ * bridge call re-captures the values it just read and "the footprint is in the
+ * slot" proves nothing about whether the app still agrees with the server
+ * about it. A later app-initiated capture upgrades a `bridge` record to `app`;
+ * nothing ever downgrades one. Timings and the words "app"/"bridge" only.
+ * Exported for test/bridge.test.mjs, which runs it against a stub page in a vm
+ * context exactly as INACTIVITY_DIALOG_EXPRESSION is tested. */
+export const HEADER_HOOK = `(() => {
   const WANTED = ${JSON.stringify(WANTED_HEADERS)};
   const slot = (globalThis[Symbol.for(${JSON.stringify(CAPTURED_HEADERS_SLOT)})] ??= {});
+  const meta = (globalThis[Symbol.for(${JSON.stringify(CAPTURE_META_SLOT)})] ??= { loadedAt: Date.now(), bridgeDepth: 0, headers: {} });
   const capture = (name, value) => {
     const canonical = String(name).toLowerCase();
-    if (value && WANTED.includes(canonical)) slot[canonical] = value;
+    if (!value || !WANTED.includes(canonical)) return;
+    const source = meta.bridgeDepth > 0 ? "bridge" : "app";
+    const prior = meta.headers[canonical];
+    if (!prior || (prior.source === "bridge" && source === "app")) {
+      meta.headers[canonical] = { source, afterLoadMs: Date.now() - meta.loadedAt };
+    }
+    slot[canonical] = value;
   };
   const originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
   XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
@@ -302,6 +324,21 @@ const HEADER_HOOK = `(() => {
   };
 })()`;
 
+/** Page-side helper every fetch this bridge issues goes through, so the
+ * capture hook above can tell those apart from the app's own requests
+ * (F1-54c). It is deliberately synchronous around the `fetch` call itself --
+ * the hook reads the headers before `fetch` returns its promise -- so an app
+ * request that happens to be in flight is never mislabelled. */
+const BRIDGE_FETCH = `const __kithmindFetch = (url, init) => {
+      const meta = globalThis[Symbol.for(${JSON.stringify(CAPTURE_META_SLOT)})];
+      if (meta) meta.bridgeDepth += 1;
+      try {
+        return fetch(url, init);
+      } finally {
+        if (meta) meta.bridgeDepth -= 1;
+      }
+    };`;
+
 /** A fetch expression evaluated *inside* the page: it reads the captured
  * headers out of the page-side slot and spreads them into the request, so
  * only the response body -- never a header value -- crosses the CDP
@@ -312,6 +349,7 @@ const HEADER_HOOK = `(() => {
  * value. Exported for tests. */
 export function pageFetchExpression(origin, { method, url, body, headers, needsAuthorization }) {
   return `(async () => {
+    ${BRIDGE_FETCH}
     const slot = Object.fromEntries(Object.entries(globalThis[Symbol.for(${JSON.stringify(CAPTURED_HEADERS_SLOT)})] ?? {}).map(([k, v]) => [k.toLowerCase(), v]));
     if (!location.href.startsWith(${JSON.stringify(origin)})) {
       throw new Error("SIGNED_OUT: the tab left the app origin (a session timeout redirects to the login page); sign in again and retry");
@@ -326,7 +364,7 @@ export function pageFetchExpression(origin, { method, url, body, headers, needsA
     }`
         : ""
     }
-    const response = await fetch(${JSON.stringify(origin)} + ${JSON.stringify(url)}, {
+    const response = await __kithmindFetch(${JSON.stringify(origin)} + ${JSON.stringify(url)}, {
       method: ${JSON.stringify(method)},
       // The documents service refuses a request without an explicit JSON
       // Accept (confirmed live 2026-09-11); the app sends it on every call.
@@ -375,15 +413,41 @@ function currentSlotKeys(cdp) {
   return evaluate(cdp, slotKeysExpression());
 }
 
-// Diagnostics only -- names and value *lengths*, never a value, so a real run
-// can be compared against this one after the fact (F1-54b: the 2026-09-11
-// incident had no way to tell what the resumed session actually captured).
-function slotDiagnosticsExpression() {
-  return `Object.fromEntries(Object.entries(globalThis[Symbol.for(${JSON.stringify(CAPTURED_HEADERS_SLOT)})] ?? {}).map(([k, v]) => [k, typeof v === "string" ? v.length : null]))`;
+// Diagnostics only -- per header a value *length*, never a value, plus the
+// provenance the hook recorded: `source` is "app" when the first (or first
+// app-initiated) request carrying it was one the app made itself and "bridge"
+// when only this bridge's own request ever carried it, and `afterLoadMs` is
+// how long after the document loaded that was. `documentAgeMs` dates the
+// document itself, so a log line says whether a header arrived on the app's
+// own bootstrap or long after. F1-54b gave a real run no way to tell what a
+// resumed session actually captured; F1-54c adds where it came from, which is
+// what separates a live footprint from the bridge's own echo of a dead one.
+// The leading marker is what test/bridge.test.mjs's fake cdp matches on.
+function captureMetaExpression() {
+  return `/* kithmind:capture-meta */ (() => {
+    const slot = globalThis[Symbol.for(${JSON.stringify(CAPTURED_HEADERS_SLOT)})] ?? {};
+    const meta = globalThis[Symbol.for(${JSON.stringify(CAPTURE_META_SLOT)})];
+    const headers = {};
+    for (const [name, value] of Object.entries(slot)) {
+      const record = meta && meta.headers[name.toLowerCase()];
+      headers[name.toLowerCase()] = {
+        length: typeof value === "string" ? value.length : null,
+        source: record ? record.source : "unknown",
+        afterLoadMs: record ? record.afterLoadMs : null,
+      };
+    }
+    return { headers, documentAgeMs: meta ? Date.now() - meta.loadedAt : null };
+  })()`;
+}
+
+/** Reads the diagnostics object above. Exported for test/bridge.test.mjs only
+ * (same convention as `evaluate` above). */
+export function readCaptureMeta(cdp) {
+  return evaluate(cdp, captureMetaExpression());
 }
 
 async function logSlotDiagnostics(cdp, step) {
-  const diagnostics = await evaluate(cdp, slotDiagnosticsExpression()).catch((error) => ({ error: String(error?.message ?? error) }));
+  const diagnostics = await readCaptureMeta(cdp).catch((error) => ({ error: String(error?.message ?? error) }));
   console.error(new Date().toISOString(), "[bridge] diagnostics:", step, JSON.stringify(diagnostics));
 }
 
@@ -408,11 +472,21 @@ export async function connectAndInstallHook(cdpHttpBase, origin) {
  * one (reading the old document's slot right after Page.reload returns stale
  * keys). This is what makes the app re-derive everything it only computes
  * once per page load -- including its device-footprint -- rather than
- * carrying a stale value forward. Exported for test/bridge.test.mjs only
- * (same convention as `evaluate` above); every other caller reaches it only
- * through createMorganStanleySession or waitForSignIn. */
-export async function reloadAndCaptureHeaders(cdp) {
+ * carrying a stale value forward.
+ *
+ * With a `url` (F1-54c: a resume passes the app's own landing route) the load
+ * lands there instead of on whatever the tab happened to be showing when the
+ * session paused. `Page.navigate` alone is not enough: navigating from
+ * `/atrium/#/documents` to `/atrium/` differs only in the fragment, which is a
+ * same-document navigation that never re-bootstraps the app shell, so the
+ * reload below is what makes the load real either way.
+ *
+ * Exported for test/bridge.test.mjs only (same convention as `evaluate`
+ * above); every other caller reaches it only through
+ * createMorganStanleySession or waitForSignIn. */
+export async function reloadAndCaptureHeaders(cdp, url) {
   await evaluate(cdp, "globalThis.__kithmindReloadSentinel = true; true");
+  if (url) await cdp.send("Page.navigate", { url });
   await cdp.send("Page.reload");
   let fresh = false;
   for (let attempt = 0; attempt < 300; attempt += 1) {
@@ -440,6 +514,40 @@ export async function waitForAuthorizationHeader(cdp, attempts = 40, intervalMs 
   return false;
 }
 
+/** The headers the *app* must be seen issuing itself before a resumed
+ * session is trusted. The bearer is not one of them: the bridge mints a
+ * documents-scoped one explicitly (refreshBearer), and the app only ever
+ * sends one once its own Documents page has been opened. */
+const APP_ISSUED_HEADERS = ["x-xsrf-token", "x-device-footprint"];
+
+/**
+ * F1-54c. Polls the capture provenance (see captureMetaExpression) until the
+ * app itself has been seen sending both an xsrf token and a device footprint
+ * on this document -- the exact state a fresh process finds when the owner has
+ * been clicking around after signing in, and the state in which downloads have
+ * always worked.
+ *
+ * A header the bridge's own request carried does not count. The bridge spreads
+ * the captured slot into every request it makes, so its own calls re-capture
+ * whatever is already there: "the footprint is in the slot" is true the moment
+ * the bridge asks for anything, and says nothing about whether the server
+ * still accepts that footprint. Waiting for an app-issued one is what tells a
+ * live footprint apart from the bridge's echo of a dead one.
+ *
+ * Resolves to the diagnostics object on success and `null` on timeout.
+ * Exported for test/bridge.test.mjs only.
+ */
+export async function waitForAppFootprint(cdp, timeoutMs, intervalMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const meta = await readCaptureMeta(cdp).catch(() => null);
+    const headers = meta?.headers ?? {};
+    if (APP_ISSUED_HEADERS.every((name) => headers[name]?.source === "app")) return meta;
+    if (Date.now() >= deadline) return null;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+}
+
 /** Polls the slot until every WANTED_HEADERS entry is present (or the
  * deadline passes) -- used after a resume's Documents navigation, since that
  * is what lands a documents-scoped bearer alongside the just-reloaded xsrf
@@ -465,12 +573,13 @@ export async function refreshBearer(cdp, origin) {
   const ok = await evaluate(
     cdp,
     `(async () => {
+      ${BRIDGE_FETCH}
       const slotKey = Symbol.for(${JSON.stringify(CAPTURED_HEADERS_SLOT)});
       const slot = globalThis[slotKey] ?? (globalThis[slotKey] = {});
       const lower = Object.fromEntries(Object.entries(slot).map(([k, v]) => [k.toLowerCase(), v]));
       const headers = { "Accept": "application/json", "Content-Type": "application/json" };
       for (const k of ["x-xsrf-token", "x-device-footprint"]) if (lower[k]) headers[k] = lower[k];
-      const r = await fetch(${JSON.stringify(origin)} + "/shell/handler/restproxy/access/api/JWTToken/GetAccessToken?RequestID=${requestId}&SeqID=${seqId}", { method: "POST", headers, credentials: "include", body: "" });
+      const r = await __kithmindFetch(${JSON.stringify(origin)} + "/shell/handler/restproxy/access/api/JWTToken/GetAccessToken?RequestID=${requestId}&SeqID=${seqId}", { method: "POST", headers, credentials: "include", body: "" });
       if (!r.ok) return "status " + r.status;
       const text = await r.text();
       let token = null;
@@ -493,40 +602,76 @@ const SIGN_IN_WAIT_MS = Number(process.env.MS_SIGN_IN_WAIT_MS ?? 45 * 60 * 1000)
 // fresh before giving up and proceeding anyway (the retry loop in
 // withBearerRetry still catches a bad outcome from here, by status code).
 const RESUME_HEADER_WAIT_MS = 20_000;
+// How long a resume waits for the *app* to issue a device footprint of its own
+// after the landing route has loaded (F1-54c). Unlike the wait above this one
+// is not best effort: a resume that never sees it fails by name rather than
+// proceeding on a footprint the server would reject. Ninety seconds is far
+// more than the app's own bootstrap has ever taken; the app makes these calls
+// on load, so nobody has to click anything for this to pass.
+const RESUME_FOOTPRINT_WAIT_MS = 90_000;
+// The app's own shell and its Documents route. The landing route is loaded for
+// real on resume so the app bootstraps exactly as it does after a sign-in;
+// the Documents route is an in-app hash navigation, never a login page.
+const APP_LANDING_PATH = "/atrium/";
+const APP_DOCUMENTS_PATH = "/atrium/#/documents";
 
 /**
  * Waits out a session pause (README, "sign in again") and, once the tab is
- * back on the app, treats the resume exactly like a cold start rather than
- * reusing the paused connection in place: closes the old CDP socket and its
- * keep-alive timer, reconnects, reinstalls the header hook fresh, and forces
- * the same reload cold start uses (reloadAndCaptureHeaders) before trusting
- * anything captured. F1-54: a same-origin resume (an inline re-auth screen,
- * or an in-app redirect that never leaves this origin) never destroys the
- * page's JS context, so the header slot is not reset for free the way a real
- * cross-origin login/logout round trip would reset it -- but the original
- * fix here (clearing the slot in place, then only navigating within the app)
- * was not enough either: an in-app hash navigation alone never makes the app
- * re-derive everything it only computes once per real page load, including
- * its device-footprint, so a post-resume request paired a freshly minted
- * bearer with a *stale* device-footprint and the documents endpoint answered
- * every one of them with an HTTP 400 "Service Error" (seen live 2026-09-11
- * and again 2026-09-12: seven downloads in a row, while a brand-new process
- * -- which always cold-starts, and so always reloads -- downloaded normally
- * right after the same sign-in). Forcing the same reload cold start does is
- * the fix: it is what makes the app re-issue its device-footprint request
- * alongside the fresh xsrf token, so the two are never a mismatched pair.
+ * back on the app, rebuilds the session into the same state a fresh process
+ * finds: it closes the old CDP socket and its keep-alive timer, reconnects,
+ * reinstalls the header hook fresh, loads the app's own landing route for
+ * real, and then waits for the *app* to issue an xsrf token and a device
+ * footprint of its own before trusting anything.
+ *
+ * The history, because each step here is a fix for a specific live failure:
+ *
+ * F1-54: a same-origin resume (an inline re-auth screen, or an in-app
+ * redirect that never leaves this origin) never destroys the page's JS
+ * context, so the header slot is not reset for free the way a real
+ * cross-origin login/logout round trip would reset it. Clearing the slot in
+ * place and navigating within the app was not enough: an in-app hash
+ * navigation never makes the app re-derive what it computes once per real
+ * page load, so a post-resume request paired a freshly minted bearer with a
+ * *stale* device-footprint and the documents endpoint answered HTTP 400
+ * "Service Error".
+ *
+ * F1-54b therefore forced a reload. That still 400'd after a real sign-out
+ * and re-login (seen live 2026-09-12, 17:07Z: every download failed until the
+ * breaker tripped at ten), while a fresh process started after the same
+ * sign-in downloaded normally. F1-54c is what that difference turned out to
+ * be, and it is not the reload: it is *when* the resume decided the sign-in
+ * was finished. The trigger below fires on the first xsrf token the app
+ * sends, which is the first request of its post-login bootstrap; the resume
+ * then tore the connection down and reloaded on top of a half-bootstrapped
+ * app, and afterwards took the first footprint that appeared -- which the
+ * server rejected. A fresh process never does any of that: it finds a slot
+ * the app filled itself, while the owner was clicking around, and (see
+ * createMorganStanleySession) deliberately does not reload it.
+ *
+ * So the resume now waits for that same evidence rather than for a token that
+ * only proves the app has started: it loads the landing route for real, which
+ * is what the app itself does after a sign-in, and holds until the capture
+ * hook has recorded an app-issued footprint (waitForAppFootprint). A
+ * footprint that only the bridge's own request ever carried does not count --
+ * the bridge spreads the slot into its own headers, so its calls re-capture
+ * whatever is already there and prove nothing. If that evidence never
+ * arrives, the resume fails by name instead of proceeding on a suspect value
+ * and burning every remaining document on an HTTP 400.
+ *
  * `options.reconnect` and `options.keepAlive` exist for
  * test/bridge.test.mjs's fake-cdp tests only (same convention as
  * `evaluate`/`startKeepAlive` above); every other caller reaches this only
  * through createMorganStanleySession, which passes its real keep-alive
  * handle and relies on the default reconnect (connectAndInstallHook).
- * Resolves to `false` on give-up, or `{ cdp, keepAlive }` -- a *new*
- * connection and keep-alive timer the caller must start using in place of
- * the old ones -- on a successful resume.
+ * Resolves to `false` on give-up (the owner never signed back in), throws
+ * when the app came back but never issued a footprint of its own, or resolves
+ * to `{ cdp, keepAlive }` -- a *new* connection and keep-alive timer the
+ * caller must start using in place of the old ones -- on a successful resume.
  */
 export async function waitForSignIn(cdp, origin, cdpHttpBase, reason, options = {}) {
   const signInWaitMs = options.signInWaitMs ?? SIGN_IN_WAIT_MS;
   const headerWaitMs = options.headerWaitMs ?? RESUME_HEADER_WAIT_MS;
+  const footprintWaitMs = options.footprintWaitMs ?? RESUME_FOOTPRINT_WAIT_MS;
   const pollIntervalMs = options.pollIntervalMs ?? 5000;
   const headerPollIntervalMs = options.headerPollIntervalMs ?? 500;
   const reconnect = options.reconnect ?? (() => connectAndInstallHook(cdpHttpBase, origin));
@@ -550,14 +695,38 @@ export async function waitForSignIn(cdp, origin, cdpHttpBase, reason, options = 
       }
       const fresh = await reconnect();
       await logSlotDiagnostics(fresh, "resume: reconnected, slot is a fresh page-side object");
-      // The same forced reload cold start uses -- see reloadAndCaptureHeaders's
-      // doc comment for why this, not an in-place clear, is the fix.
-      await reloadAndCaptureHeaders(fresh);
-      await logSlotDiagnostics(fresh, "resume: reloaded");
+      // A real load of the app's own landing route, not a reload of whatever
+      // the login flow left the tab on and not a hash change: this is the
+      // navigation the app itself performs after a sign-in, so it bootstraps
+      // the same way and issues the same first authenticated requests.
+      await reloadAndCaptureHeaders(fresh, `${origin}${APP_LANDING_PATH}`);
+      await logSlotDiagnostics(fresh, "resume: landing route loaded");
+      // Then wait for the app to have sent a footprint of its own. This is
+      // the whole fix (F1-54c): everything before this point proves only that
+      // the app started, and a footprint captured off the bridge's own
+      // request is the bridge reading back its own echo.
+      const captured = await waitForAppFootprint(fresh, footprintWaitMs, headerPollIntervalMs);
+      await logSlotDiagnostics(fresh, "resume: waited for the app's own device footprint");
+      if (!captured) {
+        try {
+          fresh.close();
+        } catch {
+          // Nothing to clean up if the socket is already gone.
+        }
+        throw new Error(
+          "resume: the app never issued its own X-DEVICE-FOOTPRINT within " +
+            footprintWaitMs +
+            "ms of loading its landing route, so the only footprint available would be one this bridge echoed back. " +
+            "Refusing to resume on it: the documents endpoint answers HTTP 400 to a footprint it did not issue. " +
+            "Open the app's Activity or Documents tab in the dedicated Chrome window and rerun the same selection.",
+        );
+      }
       // Land on Documents so the app's own calls repopulate every wanted
       // header, including a documents-scoped bearer. In-app navigation
-      // only, never a login page.
-      await fresh.send("Page.navigate", { url: `${origin}/atrium/#/documents` }).catch(() => {});
+      // only, never a login page, and only now that the footprint above is
+      // known good -- a hash change keeps the same document, so it cannot
+      // undo it.
+      await fresh.send("Page.navigate", { url: `${origin}${APP_DOCUMENTS_PATH}` }).catch(() => {});
       await waitForAllHeaders(fresh, headerWaitMs, headerPollIntervalMs);
       await logSlotDiagnostics(fresh, "resume: after Documents navigation");
       // The home page's own calls carry a bearer for other services, and
@@ -567,7 +736,7 @@ export async function waitForSignIn(cdp, origin, cdpHttpBase, reason, options = 
       await refreshBearer(fresh, origin);
       await logSlotDiagnostics(fresh, "resume: bearer refreshed");
       const keepAlive = startKeepAlive(fresh, origin);
-      console.error(new Date().toISOString(), "[bridge] resumed: headers captured after sign-in");
+      console.error(new Date().toISOString(), "[bridge] resumed: the app issued its own headers after sign-in");
       return { cdp: fresh, keepAlive };
     }
   }
