@@ -523,6 +523,83 @@ CREATE UNIQUE INDEX review_items_dedupe_key
   WHERE source_document_id IS NOT NULL;
 `;
 
+// F1-58. review_items_dedupe_key (migration 7) governs one row per
+// (document, descriptor): correct for every kind it was designed around, but
+// wrong for `weak_instrument_match` specifically. What that item asks a
+// person to decide -- "this descriptor matched an instrument weakly, confirm
+// or correct the mapping" -- is a fact about the (institution, descriptor,
+// matched instrument) triple, not about which statement happened to restate
+// it. A statement re-lists its holdings every month, so the same weak match
+// reopened a fresh row every month too: 73,247 open items on the owner's
+// archive, one per holding per statement.
+//
+// `institution_id` and `matched_instrument_id` are new because neither was
+// ever a queryable column: `weak_instrument_match`'s own `account_id` is
+// always NULL (adapterImport.ts resolves an instrument before a row's
+// account is known, so there is no account to scope it by -- institution is
+// the only stable identity available), and the instrument a descriptor
+// matched has only ever been readable out of the free-text `reason`
+// ("...to existing instrument <id>..."). `occurrence_count` and
+// `last_seen_document_id` carry what the row-per-statement shape used to
+// convey implicitly (how many statements, and how recently): the existing
+// `source_document_id` keeps its meaning as the first sighting,
+// `last_seen_document_id` is the most recent, and `occurrence_count` is how
+// many sightings landed on the same descriptor/instrument pair. All four are
+// nullable and nothing here backfills them, the same policy every additive
+// migration before it uses (HOLDING_ROW_HASH's `row_hash`, this file's own
+// precedent): a NULL never collides with another NULL under a unique index,
+// so the guarded index below can be created immediately even though every
+// existing row starts out reading NULL in both new key columns.
+// `scripts/collapseWeakInstrumentMatches.mjs`, run after this migration
+// (the same order `scripts/backfillHoldingRowHash.mjs` follows
+// HOLDING_ROW_HASH), is what actually collapses the 73,247 existing rows
+// into this shape and populates these four columns for them.
+const WEAK_INSTRUMENT_MATCH_IDENTITY = `
+ALTER TABLE review_items
+  ADD COLUMN institution_id TEXT REFERENCES institutions(id),
+  ADD COLUMN matched_instrument_id TEXT REFERENCES instruments(id),
+  ADD COLUMN occurrence_count INT CHECK (occurrence_count IS NULL OR occurrence_count > 0),
+  ADD COLUMN last_seen_document_id TEXT REFERENCES documents(id) ON DELETE CASCADE;
+
+-- Additive to review_items_dedupe_key, not a replacement: that index still
+-- governs every other kind exactly as migration 7 left it. This one applies
+-- only to weak_instrument_match, where the identity is the descriptor match
+-- itself rather than which document restated it.
+--
+-- Guarded the same way migration 7 is: CREATE UNIQUE INDEX fails outright,
+-- mid-build, if data already violates it, and that is a worse failure mode
+-- than refusing up front with a message that names the fix. In practice this
+-- can only fire if something wrote both new columns non-NULL and duplicated
+-- before this index existed -- a fresh run of this migration never can,
+-- since the ALTER TABLE just above leaves every row NULL in both -- but the
+-- guard costs nothing and keeps the same shape as every other guarded index
+-- in this file, rather than being the one CREATE UNIQUE INDEX that trusts
+-- its data by exception.
+DO $$
+DECLARE
+  dup_groups BIGINT;
+BEGIN
+  SELECT count(*) INTO dup_groups FROM (
+    SELECT 1
+      FROM review_items
+     WHERE kind = 'weak_instrument_match'
+       AND institution_id IS NOT NULL
+       AND matched_instrument_id IS NOT NULL
+     GROUP BY institution_id, raw_value, matched_instrument_id
+    HAVING count(*) > 1
+  ) AS duplicate_groups;
+  IF dup_groups > 0 THEN
+    RAISE EXCEPTION
+      'review_items has % duplicate weak_instrument_match group(s) on (institution_id, raw_value, matched_instrument_id); run scripts/collapseWeakInstrumentMatches.mjs against this archive to collapse them',
+      dup_groups;
+  END IF;
+END $$;
+
+CREATE UNIQUE INDEX review_items_weak_instrument_match_key
+  ON review_items (kind, institution_id, raw_value, matched_instrument_id)
+  WHERE kind = 'weak_instrument_match';
+`;
+
 /** Every migration, in order. The last one's version is the current schema. */
 export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
   {
@@ -559,6 +636,11 @@ export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
     version: 7,
     name: "review_items dedupe key on (kind, source_document_id, source_locator, raw_value)",
     sql: REVIEW_ITEMS_DEDUPE_KEY,
+  },
+  {
+    version: 8,
+    name: "weak_instrument_match becomes instrument-level: institution_id, matched_instrument_id, occurrence_count, last_seen_document_id",
+    sql: WEAK_INSTRUMENT_MATCH_IDENTITY,
   },
 ]);
 

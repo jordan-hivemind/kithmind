@@ -290,6 +290,15 @@ export type AdapterReviewItem = {
   readonly accountId: string | null;
   readonly rawValue: string | null;
   readonly reason: string;
+  /**
+   * F1-58: for `weak_instrument_match` only -- the institution and the
+   * instrument this descriptor was weakly matched to, so `importer.ts` can
+   * fold every sighting of the same (institution, descriptor, matched
+   * instrument) into one instrument-level item instead of one row per
+   * document. Null (and ignored) for every other kind.
+   */
+  readonly institutionId?: string | null;
+  readonly matchedInstrumentId?: string | null;
 };
 
 export type ImportBatch = {
@@ -583,6 +592,14 @@ export async function importBatch(
   // appends (never queries), and `flushReviews`' own dedupe check below.
   let reviews: unknown[][] = [];
 
+  // F1-58. `weak_instrument_match` items are buffered separately from
+  // `reviews` above and flushed through `flushWeakInstrumentMatches`
+  // instead of the generic `insertRows` path: this kind's identity is
+  // (institution, descriptor, matched instrument), not (document, locator,
+  // raw_value), so writing it needs an upsert that folds a later document's
+  // sighting into the same row rather than a plain insert.
+  let weakInstrumentReviews: WeakInstrumentCandidate[] = [];
+
   function openReview(
     accountId: string | null,
     documentId: string | null,
@@ -685,6 +702,164 @@ export async function importBatch(
 
     reviewItemsOpened += toInsert.length;
     await insertRows(client, "review_items", REVIEW_COLUMNS, toInsert);
+  }
+
+  /** One `weak_instrument_match` sighting, not yet written: the descriptor
+   * (`rawValue`), the matched instrument and institution it names, and the
+   * `reason` the first sighting of this triple would open with. */
+  type WeakInstrumentCandidate = {
+    rawValue: string | null;
+    reason: string;
+    institutionId: string | null;
+    matchedInstrumentId: string | null;
+  };
+
+  /** This kind's identity (F1-58): (institution, descriptor, matched
+   * instrument), never the document. Shared between a pending candidate and
+   * a row already on file so both sides compare the same way. */
+  function weakInstrumentKey(
+    institutionId: string | null,
+    rawValue: string | null,
+    matchedInstrumentId: string | null,
+  ): string {
+    return JSON.stringify([institutionId, rawValue, matchedInstrumentId]);
+  }
+
+  /**
+   * F1-58. Folds every sighting of the same (institution, descriptor,
+   * matched instrument) into one row instead of one per document: two
+   * statements that both weakly match "ZEPHYR CORP" to the same instrument
+   * open one item with `occurrence_count = 2`, not two items.
+   *
+   * `INSERT ... ON CONFLICT ... DO UPDATE` against
+   * `review_items_weak_instrument_match_key` (pgSchema.ts migration 8) does
+   * the fold: a first sighting inserts with `occurrence_count = 1`; a later
+   * one increments it and moves `last_seen_document_id` forward, in the same
+   * statement, so two documents in one batch see each other's writes without
+   * either round-tripping to check first. The `DO UPDATE ... WHERE
+   * review_items.status = 'open'` clause is what "resolving the item
+   * records the mapping decision once for every row that shares the
+   * descriptor" (README) actually enforces: once a person resolves or
+   * dismisses one, a later document repeating the same descriptor finds the
+   * conflict, the WHERE clause is false, and Postgres leaves the row
+   * untouched -- no new row, no reopened count, no error.
+   *
+   * `RETURNING occurrence_count` distinguishes a genuinely new item from an
+   * existing one that just had its count bumped: a fresh insert always
+   * writes `1`, and an increment always writes something greater, so
+   * `reviewItemsOpened` keeps counting items opened rather than sightings
+   * recorded -- an increment is not a new item. (`xmax = 0` looks like the
+   * obvious way to tell an INSERT and an UPDATE apart in one RETURNING, but
+   * does not actually work here: `DO UPDATE` also produces a new tuple
+   * version with `xmax = 0`, so it reads as "inserted" either way.)
+   *
+   * The idempotency guard below (`already`) is what a document-level insert
+   * gets for free from `flushReviews`' own per-document check but this
+   * upsert does not: a document not yet `parsed_ok` can be reimported more
+   * than once before it succeeds (see `importBatch`'s whole-document skip,
+   * which only ever short-circuits an already-`parsed_ok` document), and
+   * without this check a retried document would increment the same item
+   * again for a sighting it already recorded, either as the row's own first
+   * sighting (`source_document_id`) or as whichever sighting most recently
+   * moved `last_seen_document_id`.
+   *
+   * ponytail: a document reprocessed a third time, after a *different*,
+   * newer document already moved `last_seen_document_id` past it, would not
+   * match either half of this guard and would increment again. A document
+   * not yet `parsed_ok` retried out of chronological order after a later one
+   * already landed is not a shape this importer produces today (`run.ts`
+   * always feeds it in pull order); track document ids visited by review
+   * item on a real occurrence table if that ever changes.
+   */
+  async function flushWeakInstrumentMatches(
+    documentId: string | null,
+  ): Promise<void> {
+    const pending = weakInstrumentReviews;
+    weakInstrumentReviews = [];
+    if (pending.length === 0) return;
+
+    const seen = new Set<string>();
+    const deduped = pending.filter((candidate) => {
+      const key = weakInstrumentKey(
+        candidate.institutionId,
+        candidate.rawValue,
+        candidate.matchedInstrumentId,
+      );
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+    let toUpsert = deduped;
+    if (documentId !== null) {
+      const already = await client.query<{
+        institution_id: string | null;
+        raw_value: string | null;
+        matched_instrument_id: string | null;
+      }>(
+        `SELECT institution_id, raw_value, matched_instrument_id FROM review_items
+          WHERE kind = 'weak_instrument_match'
+            AND (source_document_id = $1 OR last_seen_document_id = $1)`,
+        [documentId],
+      );
+      const attributed = new Set(
+        already.rows.map((row) =>
+          weakInstrumentKey(
+            row.institution_id,
+            row.raw_value,
+            row.matched_instrument_id,
+          ),
+        ),
+      );
+      toUpsert = deduped.filter(
+        (candidate) =>
+          !attributed.has(
+            weakInstrumentKey(
+              candidate.institutionId,
+              candidate.rawValue,
+              candidate.matchedInstrumentId,
+            ),
+          ),
+      );
+    }
+    if (toUpsert.length === 0) return;
+
+    // ponytail: one statement, unchunked -- a document's own distinct weakly
+    // matched instruments are at most a few hundred, far under
+    // insertRows/MAX_BIND_PARAMETERS' chunking threshold. Chunk if a single
+    // document's holdings ever approach that.
+    const values: unknown[] = [];
+    const tuples = toUpsert.map((candidate) => {
+      const id = `$${values.push(randomUUID())}`;
+      const doc = `$${values.push(documentId)}`;
+      const rawValue = `$${values.push(candidate.rawValue)}`;
+      const reason = `$${values.push(candidate.reason)}`;
+      const institutionId = `$${values.push(candidate.institutionId)}`;
+      const matchedInstrumentId = `$${values.push(candidate.matchedInstrumentId)}`;
+      // account_id and source_locator: always NULL for this kind, same as
+      // the generic path. source_document_id (first-seen) and
+      // last_seen_document_id both start at this document on first insert;
+      // only the DO UPDATE branch moves last_seen_document_id forward.
+      return `(${id}, 'weak_instrument_match', NULL, ${doc}, NULL, ${rawValue}, ${reason}, ${institutionId}, ${matchedInstrumentId}, 1, ${doc})`;
+    });
+
+    const result = await client.query<{ occurrence_count: number }>(
+      `INSERT INTO review_items
+         (id, kind, account_id, source_document_id, source_locator, raw_value, reason,
+          institution_id, matched_instrument_id, occurrence_count, last_seen_document_id)
+       VALUES ${tuples.join(", ")}
+       ON CONFLICT (kind, institution_id, raw_value, matched_instrument_id)
+         WHERE kind = 'weak_instrument_match'
+       DO UPDATE SET
+         occurrence_count = review_items.occurrence_count + 1,
+         last_seen_document_id = EXCLUDED.last_seen_document_id
+         WHERE review_items.status = 'open'
+       RETURNING occurrence_count`,
+      values,
+    );
+    reviewItemsOpened += result.rows.filter(
+      (row) => row.occurrence_count === 1,
+    ).length;
   }
 
   /**
@@ -1447,7 +1622,20 @@ export async function importBatch(
       // than through `openReview`, whose `ReviewCandidate.rawValue` is
       // non-null: `document_unparsed` and an unresolved-instrument match can
       // both legitimately have none.
+      //
+      // F1-58: `weak_instrument_match` goes to its own buffer instead, since
+      // its identity and write path (`flushWeakInstrumentMatches`) are both
+      // different from every other kind here.
       for (const item of document.reviewItems ?? []) {
+        if (item.kind === "weak_instrument_match") {
+          weakInstrumentReviews.push({
+            rawValue: item.rawValue,
+            reason: item.reason,
+            institutionId: item.institutionId ?? null,
+            matchedInstrumentId: item.matchedInstrumentId ?? null,
+          });
+          continue;
+        }
         reviews.push([
           randomUUID(),
           item.kind,
@@ -1529,6 +1717,7 @@ export async function importBatch(
       }
 
       await flushReviews(documentId);
+      await flushWeakInstrumentMatches(documentId);
 
       // F1-49. `parsed_ok` used to be `!documentRefused`: any single
       // refusal anywhere in the document (even alongside 1000 clean rows)

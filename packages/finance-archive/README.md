@@ -746,7 +746,10 @@ caller cannot do by combining the other two files alone:
   merge would -- and every such weak match opens a `review_items` entry
   (`kind = 'weak_instrument_match'`) naming the symbol and which row it
   matched, the same way a cross-document `row_hash` collapse is made
-  visible instead of happening quietly.
+  visible instead of happening quietly. One item per (institution,
+  descriptor, matched instrument), not one per document that restates it --
+  see "weak_instrument_match is instrument-level, not row-level (F1-58)"
+  under Account aliases below.
 - **Document splitting.** `ParsedRow.sourceDocument` tells the wiring layer
   which underlying document (a page of a paginated pull, or the one file for
   a statement, confirmation or tabular export) each row belongs to. A pull
@@ -1208,6 +1211,81 @@ FINANCE_ARCHIVE_DATABASE_URL=postgresql://<owner>@<host>/<db> \
   node scripts/collapseDuplicateReviewItems.mjs --dry-run
 FINANCE_ARCHIVE_DATABASE_URL=postgresql://<owner>@<host>/<db> \
   node scripts/collapseDuplicateReviewItems.mjs
+```
+
+### weak_instrument_match is instrument-level, not row-level (F1-58)
+
+Migration 7's dedupe key (above) collapses a duplicate down to one row per
+document. For `weak_instrument_match` specifically that is still the wrong
+row count: what the item asks a person to decide -- "this descriptor matched
+an instrument weakly, confirm or correct the mapping" -- is a fact about the
+(institution, descriptor, matched instrument) triple, not about which
+statement happened to restate it. A brokerage statement re-lists its
+holdings every month, so the same weak match reopened a fresh row every
+month too: 73,247 open items on the owner's archive, one per holding per
+statement, all asking the identical question.
+
+`review_items_weak_instrument_match_key` (migration 8) is a second partial
+unique index, additive to migration 7's: `(kind, institution_id, raw_value,
+matched_instrument_id) WHERE kind = 'weak_instrument_match'`. Migration 7's
+key still governs every other kind exactly as before. Four columns make the
+new key possible: `institution_id` and `matched_instrument_id` were never
+queryable before this (`weak_instrument_match`'s own `account_id` is always
+NULL -- `adapterImport.ts` resolves an instrument before a row's account is
+known -- and the matched instrument was only ever readable out of the
+free-text `reason`), and `occurrence_count`/`last_seen_document_id` replace
+what the row-per-statement shape used to convey implicitly: `source_document_id`
+keeps its existing meaning as the first sighting, `last_seen_document_id` is
+the most recent, and `occurrence_count` is how many sightings share the
+same descriptor and matched instrument. `raw_value` keeps carrying the
+descriptor exactly as before (`JSON.stringify` of the `ParsedInstrument`
+adapterImport.ts resolved).
+
+`importer.ts`'s `flushWeakInstrumentMatches` is a separate write path from
+the generic `flushReviews` above, because this kind's identity does not fit
+"one buffered INSERT, deduped against the document." It is one
+`INSERT ... ON CONFLICT (kind, institution_id, raw_value, matched_instrument_id)
+WHERE kind = 'weak_instrument_match' DO UPDATE ... WHERE review_items.status = 'open'`:
+a first sighting inserts with `occurrence_count = 1`; a later one increments
+it and moves `last_seen_document_id` forward, in the same round trip, so two
+documents in one import batch see each other's writes without either one
+querying first. The `WHERE review_items.status = 'open'` on the `DO UPDATE`
+is the resolution semantics stated plainly: **resolving the item records the
+mapping decision once for every row that shares the descriptor, never
+per-row.** Once a person resolves or dismisses one, a later statement
+restating the identical descriptor finds the conflict, the `DO UPDATE`'s own
+`WHERE` is false, and Postgres leaves the row untouched -- no reopened item,
+no recount, no error. A document not yet `parsed_ok` can still be reimported
+more than once before it succeeds (the whole-document skip only ever
+short-circuits an already-`parsed_ok` document); `flushWeakInstrumentMatches`
+guards against that document's own retry incrementing its already-recorded
+sighting a second time, the same idempotence guarantee `flushReviews` gets
+for free from being scoped to one document already.
+
+`scripts/collapseWeakInstrumentMatches.mjs` is what actually collapses an
+existing archive's 73,247 rows into this shape. Unlike
+`collapseDuplicateReviewItems.mjs`, it runs *after* migration 8, not before:
+the four new columns start every existing row at NULL, and a NULL never
+collides with another NULL under a unique index, so the migration applies
+cleanly with nothing backfilled yet (the same "no backfill in the migration
+itself" policy every additive migration in this file uses, from
+`HOLDING_ROW_HASH` on). The script derives what a legacy row does not yet
+carry as a real column -- institution via the row's own document, matched
+instrument by parsing it back out of `reason` -- groups every open row by
+that identity, and folds each group down to one survivor carrying the summed
+occurrence count and the earliest/latest document (by document date where
+one exists, by document id otherwise). A row whose `reason` cannot be parsed
+back to a matched instrument is left alone and reported separately rather
+than guessed at (ground rule 5). Resolved and dismissed items are never
+read, grouped, or touched. Idempotent: a second run finds every remaining
+group already of size one, already carrying real columns, and changes
+nothing.
+
+```
+FINANCE_ARCHIVE_DATABASE_URL=postgresql://<owner>@<host>/<db> \
+  node scripts/collapseWeakInstrumentMatches.mjs --dry-run
+FINANCE_ARCHIVE_DATABASE_URL=postgresql://<owner>@<host>/<db> \
+  node scripts/collapseWeakInstrumentMatches.mjs
 ```
 
 ### The reader role
