@@ -206,6 +206,19 @@ def _docling_normalized(
     ):
         provenance = list(getattr(item, "prov", []) or [])
         if isinstance(item, TableItem):
+            parent_ref = getattr(getattr(item, "parent", None), "cref", None)
+            if isinstance(parent_ref, str) and parent_ref.startswith("#/pictures/"):
+                # A table reached only because traversal now enters pictures.
+                # Its provenance is not citable body-table geometry, so record
+                # a gap instead of assigning it a page-table ordinal.
+                gaps.append(
+                    {
+                        "kind": "ambiguous_table_provenance",
+                        "item": item_index,
+                        "itemRef": str(getattr(item, "self_ref", "")),
+                    }
+                )
+                continue
             page_numbers = {getattr(prov, "page_no", None) for prov in provenance}
             citable = (
                 len(provenance) == 1
@@ -213,7 +226,13 @@ def _docling_normalized(
                 and next(iter(page_numbers), None) in pages
             )
             if not citable:
-                gaps.append({"kind": "ambiguous_table_provenance", "item": item_index})
+                gaps.append(
+                    {
+                        "kind": "ambiguous_table_provenance",
+                        "item": item_index,
+                        "itemRef": str(getattr(item, "self_ref", "")),
+                    }
+                )
                 continue
             page_number = next(iter(page_numbers))
             table_ordinal = table_ordinal_by_page.get(page_number, 0)
@@ -305,7 +324,13 @@ def _docling_normalized(
                 continue
             slices = _cross_page_text_slices(provenance, item.text, pages)
             if slices is None:
-                gaps.append({"kind": "ambiguous_text_provenance", "item": item_index})
+                gaps.append(
+                    {
+                        "kind": "ambiguous_text_provenance",
+                        "item": item_index,
+                        "itemRef": str(getattr(item, "self_ref", "")),
+                    }
+                )
                 continue
             raw_provenance = [_locator(prov) for prov in provenance]
             for slice_ordinal, (

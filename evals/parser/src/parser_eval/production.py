@@ -717,7 +717,7 @@ def _extraction_configuration(parser: dict[str, Any]) -> dict[str, Any]:
         "parserFingerprint": parser["fingerprint"],
         "implementationSha256": _implementation_sha256(),
         "configuration": {
-            "mappingFormat": "docling_utf16_pages_v2",
+            "mappingFormat": "docling_utf16_pages_v3",
             "maxPages": MAX_PAGES,
             "maxRetainedUtf8Bytes": MAX_RETAINED_UTF8_BYTES,
             "maxBundleBytes": MAX_SERIALIZED_BUNDLE_BYTES,
