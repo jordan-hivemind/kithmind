@@ -12,6 +12,7 @@ import {
   deleteSourceItemProvenanceBatch,
   finalizeSourceItemTombstone,
   inspectGenerationPayload,
+  locateCardQuote,
   markSourceItemUnavailable,
   refreshAvailableSourceItem,
   setDesiredSourceRevision,
@@ -628,5 +629,58 @@ describe("immutable provenance", () => {
         }),
       ),
     ).rejects.toThrow("262144 chunk text bytes");
+  });
+});
+
+// P2-81. Synthetic pages only. `locateCardQuote` is the whole of the tolerant
+// quote location `stageCardEvidenceSpans` runs, so its outcomes are asserted
+// here directly: exact, folded, and the refusal that reaches the gate as
+// `evidence_missing`. Every accepted match is checked by slicing the ORIGINAL
+// page with the returned range, which is what keeps a stored span an exact
+// slice of sealed text and `quoteHash` unchanged.
+describe("locating a cited quote on a page", () => {
+  test("takes an exact match as it stands", () => {
+    const page = "Invoice 41 dated 2025-04-02.";
+    const at = locateCardQuote(page, "2025-04-02");
+    expect(at).toEqual({ start: 17, end: 27, mode: "exact" });
+    expect(page.slice(at!.start, at!.end)).toBe("2025-04-02");
+  });
+
+  test("folds a whitespace run and a line break, storing the original slice", () => {
+    const page = "Payable to\n  Northwind   Supply Co.";
+    const at = locateCardQuote(page, "Payable to Northwind Supply Co.");
+    expect(at?.mode).toBe("normalized");
+    expect(page.slice(at!.start, at!.end)).toBe(
+      "Payable to\n  Northwind   Supply Co.",
+    );
+  });
+
+  test("folds curly quotes, an apostrophe, a dash variant and a non-breaking space", () => {
+    const page = "The “Buyer’s Agent” — term 2025–2026.";
+    const at = locateCardQuote(page, '"Buyer\'s Agent" - term 2025-2026.');
+    expect(at?.mode).toBe("normalized");
+    expect(page.slice(at!.start, at!.end)).toBe(
+      "“Buyer’s Agent” — term 2025–2026.",
+    );
+  });
+
+  test("falls back to case only after the folded match fails", () => {
+    const page = "TOTAL AMOUNT DUE";
+    const at = locateCardQuote(page, "Total Amount Due");
+    expect(at?.mode).toBe("normalized");
+    expect(page.slice(at!.start, at!.end)).toBe("TOTAL AMOUNT DUE");
+  });
+
+  test("refuses a quote that is still ambiguous after folding", () => {
+    // Folding only ever widens what a quote matches, so a quote that is
+    // ambiguous exactly is ambiguous folded too, and stays refused.
+    const page = "Acme Research\nsigned by Acme Research";
+    expect(locateCardQuote(page, "Acme Research")).toBeNull();
+    expect(locateCardQuote(page, "Acme  Research")).toBeNull();
+  });
+
+  test("refuses a quote the page does not contain, and an empty one", () => {
+    expect(locateCardQuote("Invoice 41", "Invoice 42")).toBeNull();
+    expect(locateCardQuote("Invoice 41", "   ")).toBeNull();
   });
 });
