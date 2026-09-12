@@ -490,16 +490,50 @@ to import. The importer records it with `parsed_ok` false and opens one
 real extractor revisits it; a rerun of the identical still-unparsed bytes
 does not reopen a second review item for the same document.
 
+**`parsed_ok` (F1-49):** a document is recorded as parsed as soon as
+something in it -- a row, position, balance or liability -- was actually
+inserted or deduplicated, even when something else in the same document was
+sent to review. It stays `parsed_ok` false only when the document carries a
+parse note (the case above -- retained but never parsed at all) or when
+literally nothing in it landed. A `parsed_ok` false document is always
+eligible for the whole-document reimport path on the next run, and that is
+safe: every row and holding it already stored matches its own dedupe key
+(`row_hash`/`provider_txn_id` for transactions, `row_hash` for holdings)
+rather than being inserted a second time. A `parsed_ok` true document takes
+the whole-document skip below.
+
 ### Holdings (positions, balances, liabilities)
 
 `ImportDocument.positions`, `.balances` and `.liabilities` get the same
-provenance and review-queue treatment as `.rows`, with one difference:
-`positions`, `balances` and `liabilities` have no per-row dedupe key of their
-own (no `providerTxnId`, no `row_hash`), so they dedupe at the whole-document
-level instead, the same immutable-raw-file check that already skips a
-byte-identical document's transactions (`documents.sha256`, checked before
-any row is inserted). Re-importing the same document is a no-op for holdings
-exactly as it is for transactions.
+provenance and review-queue treatment as `.rows`. They dedupe at the
+whole-document level first, the same immutable-raw-file check that already
+skips a byte-identical document's transactions (`documents.sha256`, checked
+before any row is inserted, gated on `parsed_ok` per the fix above) -- and
+(F1-49) each also carries its own `row_hash`
+(`positionHash`/`balanceHash`/`liabilityHash` in `rowHash.ts`), computed from
+the fields that make a *stated* holding identical: account, instrument (or
+null), `as_of`, quantity, market value, cost basis and valuation basis for a
+position; account, `as_of`, total value and cash for a balance; account,
+kind, `as_of` and balance for a liability. Not price or unrealized, which are
+derived rather than stated, and (unlike a transaction) no occurrence
+ordinal: a statement states one quantity for one instrument as of one date,
+not the same fact twice. A holding whose hash already exists in its table is
+deduplicated -- counted, not inserted -- the same as a transaction, which is
+what makes a document reprocessed for a reason other than the whole-document
+skip (a parse note that never clears, a sibling row sent to review) safe:
+it matches what it already stored instead of duplicating it.
+
+`positions.row_hash`/`balances.row_hash`/`liabilities.row_hash` are nullable
+(migration version 5, `pgSchema.ts`) and unset for anything imported before
+this fix. `scripts/backfillHoldingRowHash.mjs` computes and fills them in for
+an existing archive, refusing -- per table, reporting the colliding rows
+rather than choosing between them -- if two already-stored rows would
+collide once hashed:
+
+```
+FINANCE_ARCHIVE_DATABASE_URL=postgresql://<owner>@<host>/<db> \
+  node scripts/backfillHoldingRowHash.mjs
+```
 
 Only `as_of` unparseable to ISO blocks a holdings row from being inserted at
 all, the same reasoning as `process_date`: the column is `NOT NULL` with no
@@ -1214,6 +1248,8 @@ one, in order, inside the same transaction and lock, and records each one.
 | 1 | initial postgres archive schema        | Every table, domain and index below.                                           |
 | 2 | documents retained byte provenance     | `documents.retained_sha256`, `retained_byte_length`, `media_type`, `capture_id`. |
 | 3 | accounts external key                  | `accounts.external_key` (unique per institution), and `base_currency` becomes nullable. |
+| 4 | review_items cascade on document delete | `review_items.source_document_id` gets `ON DELETE CASCADE`.                    |
+| 5 | holdings row_hash                      | `positions.row_hash`, `balances.row_hash`, `liabilities.row_hash` (nullable, unique per table). |
 
 Migration 2 (F1-29,
 [`docs/plans/2026-09-11-structured-evidence.md`](../../docs/plans/2026-09-11-structured-evidence.md))
@@ -1245,6 +1281,15 @@ exactly the invented fact ground rule 5 forbids, so a newly discovered
 account is honestly of unknown base currency until an operator sets one; the
 only column that reads `base_currency`, `transactions.amount_base`, is
 already unpopulated in v1.
+
+Migration 5 (F1-49) gives `positions`, `balances` and `liabilities` a
+`row_hash` each, the same content identity `transactions.row_hash` already
+has, computed by `rowHash.ts`'s `positionHash`/`balanceHash`/`liabilityHash`.
+No backfill: an existing row keeps a `NULL` row_hash, and a plain (not
+partial) `UNIQUE` constraint is enough to make that safe, because Postgres
+never treats two `NULL`s as equal. `scripts/backfillHoldingRowHash.mjs`
+brings a live archive's existing rows under the constraint afterwards; see
+"Holdings" below for why this table needed one and what it dedupes on.
 
 ### Which schema, and why it is not `search_path`
 

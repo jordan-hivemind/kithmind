@@ -186,3 +186,98 @@ export function rowHashV2(input: RowHashInputV2): string {
     field(String(input.occurrence)),
   ]);
 }
+
+// ---------------------------------------------------------------------------
+// F1-49: positions, balances and liabilities. Each stated holding gets its own
+// content identity, the same reason a transaction does -- a rerun of the same
+// statement pull, or a document reprocessed for some other reason (a parse
+// note that never clears, or a sibling row sent to review), must match its
+// own already-stored holdings instead of inserting a second copy.
+//
+// Unlike a transaction, a holding has no occurrence ordinal: a statement
+// states one quantity for one instrument as of one date, not the same fact
+// twice, so there is no legitimate reason for two holdings in one document to
+// share every field below. And unlike a transaction, the field set is
+// per-table, over exactly the columns that make a *stated* holding the same
+// holding -- not `price` or `unrealized`, which are derived from `quantity`
+// and `market_value`/`cost_basis` and would make a revalued but otherwise
+// identical holding register as two facts instead of one holding whose
+// valuation was corrected.
+//
+// Each domain is versioned the same way `ROW_HASH_DOMAIN`/`_V2` are, so a
+// later change to a preimage is a new domain, never a silent reinterpretation
+// of hashes already stored.
+// ---------------------------------------------------------------------------
+
+export const POSITION_HASH_DOMAIN = "kith-finance-position:v1\0";
+export const BALANCE_HASH_DOMAIN = "kith-finance-balance:v1\0";
+export const LIABILITY_HASH_DOMAIN = "kith-finance-liability:v1\0";
+
+export type PositionHashInput = {
+  accountId: string;
+  instrumentId: string | null;
+  /** ISO YYYY-MM-DD. */
+  asOf: string;
+  quantity: string | null;
+  marketValue: string | null;
+  costBasis: string | null;
+  valuationBasis: string | null;
+};
+
+/** account, instrument (or null), as_of, quantity, market value, cost basis,
+ * valuation basis: the fields that make a stated position the same position. */
+export function positionHash(input: PositionHashInput): string {
+  return digest(POSITION_HASH_DOMAIN, [
+    field(input.accountId),
+    field(input.instrumentId),
+    field(input.asOf),
+    field(input.quantity === null ? null : canonicalizeDecimal(input.quantity)),
+    field(
+      input.marketValue === null ? null : canonicalizeDecimal(input.marketValue),
+    ),
+    field(
+      input.costBasis === null ? null : canonicalizeDecimal(input.costBasis),
+    ),
+    field(input.valuationBasis),
+  ]);
+}
+
+export type BalanceHashInput = {
+  accountId: string;
+  /** ISO YYYY-MM-DD. */
+  asOf: string;
+  totalValue: string | null;
+  cash: string | null;
+};
+
+/** account, as_of, total value, cash: the fields that make a stated balance
+ * snapshot the same snapshot. */
+export function balanceHash(input: BalanceHashInput): string {
+  return digest(BALANCE_HASH_DOMAIN, [
+    field(input.accountId),
+    field(input.asOf),
+    field(
+      input.totalValue === null ? null : canonicalizeDecimal(input.totalValue),
+    ),
+    field(input.cash === null ? null : canonicalizeDecimal(input.cash)),
+  ]);
+}
+
+export type LiabilityHashInput = {
+  accountId: string | null;
+  kind: string;
+  /** ISO YYYY-MM-DD. */
+  asOf: string;
+  balance: string | null;
+};
+
+/** account, kind, as_of, balance: the fields that make a stated liability the
+ * same liability. */
+export function liabilityHash(input: LiabilityHashInput): string {
+  return digest(LIABILITY_HASH_DOMAIN, [
+    field(input.accountId),
+    field(normalizeText(input.kind).toLowerCase()),
+    field(input.asOf),
+    field(input.balance === null ? null : canonicalizeDecimal(input.balance)),
+  ]);
+}
