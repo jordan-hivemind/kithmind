@@ -580,7 +580,7 @@ export async function importBatch(
   // than one round trip each. The order they are opened in is unchanged, and
   // nothing between here and the flush reads `review_items` back except the
   // `document_unparsed` check, which is scoped to a kind this loop only ever
-  // appends (never queries).
+  // appends (never queries), and `flushReviews`' own dedupe check below.
   let reviews: unknown[][] = [];
 
   function openReview(
@@ -598,13 +598,79 @@ export async function importBatch(
       candidate.rawValue,
       candidate.reason,
     ]);
-    reviewItemsOpened += 1;
   }
 
-  async function flushReviews(): Promise<void> {
+  /**
+   * F1-65. A reparse re-derives the identical review item every time it
+   * re-encounters the same evidence: the same weak instrument match on every
+   * row that references it, the same undeclared activity type on every row
+   * of that type. Before this, `flushReviews` wrote whatever `reviews` held
+   * with no check at all, so those duplicates piled up both within one
+   * document's own batch (the actual majority of one hosted reparse's
+   * 76,687 opened items) and across every reparse of a document that never
+   * reached `parsed_ok`. This is the identity `review_items_dedupe_key`
+   * (pgSchema.ts) enforces at the row level; this is where it is enforced
+   * for the buffered path, one query and one INSERT per document.
+   *
+   * Only for `documentId !== null`: an item with no document to scope it
+   * (adapterImport.ts's pull-level `flushInstruments`, and every item from
+   * before PR137) has no stable identity across pulls to dedupe against, and
+   * keeps opening a fresh row every time exactly as it always has -- see
+   * `review_items_dedupe_key`'s own comment for why the same distinction is
+   * drawn at the database level.
+   */
+  /** (kind, source_locator, raw_value) -- the nullable three of the four
+   * `review_items_dedupe_key` columns (the fourth, `source_document_id`, is
+   * fixed per `flushReviews` call and left out of the key). */
+  function reviewDedupeKey(row: {
+    kind: string;
+    source_locator: string | null;
+    raw_value: string | null;
+  }): string {
+    return JSON.stringify([row.kind, row.source_locator, row.raw_value]);
+  }
+
+  /** A pending review candidate tuple's own dedupe key, read back out of the
+   * positions `REVIEW_COLUMNS` binds it at. */
+  function candidateKey(candidate: readonly unknown[]): string {
+    return reviewDedupeKey({
+      kind: candidate[1] as string,
+      source_locator: candidate[4] as string | null,
+      raw_value: candidate[5] as string | null,
+    });
+  }
+
+  async function flushReviews(documentId: string | null): Promise<void> {
     const pending = reviews;
     reviews = [];
-    await insertRows(client, "review_items", REVIEW_COLUMNS, pending);
+    if (pending.length === 0) return;
+
+    let toInsert = pending;
+    if (documentId !== null) {
+      const seen = new Set<string>();
+      const deduped = pending.filter((candidate) => {
+        const key = candidateKey(candidate);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+
+      const existing = await client.query<{
+        kind: string;
+        source_locator: string | null;
+        raw_value: string | null;
+      }>(
+        "SELECT kind, source_locator, raw_value FROM review_items WHERE source_document_id = $1",
+        [documentId],
+      );
+      const alreadyOpen = new Set(existing.rows.map(reviewDedupeKey));
+      toInsert = deduped.filter(
+        (candidate) => !alreadyOpen.has(candidateKey(candidate)),
+      );
+    }
+
+    reviewItemsOpened += toInsert.length;
+    await insertRows(client, "review_items", REVIEW_COLUMNS, toInsert);
   }
 
   /**
@@ -1269,7 +1335,6 @@ export async function importBatch(
           item.rawValue,
           item.reason,
         ]);
-        reviewItemsOpened += 1;
       }
 
       // Fresh per document: the occurrence ordinal is scoped to one document
@@ -1303,7 +1368,6 @@ export async function importBatch(
             null,
             document.parseNote.slice(0, 500),
           ]);
-          reviewItemsOpened += 1;
         }
       } else {
         // F1-55. Ground rule 1: the bytes this document was reimported from
@@ -1410,7 +1474,7 @@ export async function importBatch(
         anySuccess = true;
       }
 
-      await flushReviews();
+      await flushReviews(documentId);
 
       // F1-49. `parsed_ok` used to be `!documentRefused`: any single
       // refusal anywhere in the document (even alongside 1000 clean rows)

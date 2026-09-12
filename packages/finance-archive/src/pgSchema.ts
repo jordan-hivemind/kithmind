@@ -460,6 +460,62 @@ CREATE TABLE account_aliases (
 CREATE INDEX account_aliases_account ON account_aliases (account_id);
 `;
 
+// F1-65. A reparse re-derives the identical review item every time it
+// re-encounters the same evidence -- the same weak instrument match on every
+// row that references it, the same undeclared activity type on every row of
+// that type -- and nothing before this stopped it from writing that
+// duplicate again. One hosted reparse of 854 already-imported statements
+// opened 76,687 review items this way, 84,266 of them exact duplicates by
+// (kind, source_document_id, source_locator, raw_value). `importer.ts`'s
+// buffered insert now checks this key before writing (see `flushReviews`);
+// this index is the constraint backing that check, so a write path that
+// bypasses it still cannot duplicate a row-scoped item.
+//
+// Partial, not plain UNIQUE: `source_locator` is null for every item
+// `AdapterReviewItem` produces (weak_instrument_match, undeclared_activity_type,
+// unknown_account_key -- adapterImport.ts, none of which carry a per-row
+// locator), and an item from before PR137 has both source_document_id and
+// source_locator null. Postgres never treats two NULLs as equal in a UNIQUE
+// index, so a plain index on all four columns would not even see those rows
+// as candidates, but this index still says so explicitly with WHERE,
+// matching the same rule `flushReviews` applies in application code: only a
+// document-scoped, row-located item has an identity stable enough to call
+// two occurrences "the same one." Everything else keeps opening a fresh row
+// every time, exactly as before this migration.
+//
+// This migration comes after the collapse: CREATE UNIQUE INDEX fails outright
+// if the table already holds rows that would violate it, and failing on the
+// index build itself (potentially after scanning the whole table) is a worse
+// failure mode than refusing up front. The DO block below runs that same
+// duplicate check first and raises a clear, actionable error instead --
+// scripts/collapseDuplicateReviewItems.mjs is what an operator runs first on
+// a live archive that already has duplicates (F1-56 shipped before this
+// migration did); a fresh archive, or one already deduplicated, has nothing
+// for the check to find and the index creates immediately.
+const REVIEW_ITEMS_DEDUPE_KEY = `
+DO $$
+DECLARE
+  dup_groups BIGINT;
+BEGIN
+  SELECT count(*) INTO dup_groups FROM (
+    SELECT 1
+      FROM review_items
+     WHERE source_document_id IS NOT NULL AND source_locator IS NOT NULL
+     GROUP BY kind, source_document_id, source_locator, raw_value
+    HAVING count(*) > 1
+  ) AS duplicate_groups;
+  IF dup_groups > 0 THEN
+    RAISE EXCEPTION
+      'review_items has % duplicate group(s) on (kind, source_document_id, source_locator, raw_value); run scripts/collapseDuplicateReviewItems.mjs against this archive before applying this migration',
+      dup_groups;
+  END IF;
+END $$;
+
+CREATE UNIQUE INDEX review_items_dedupe_key
+  ON review_items (kind, source_document_id, source_locator, raw_value)
+  WHERE source_document_id IS NOT NULL AND source_locator IS NOT NULL;
+`;
+
 /** Every migration, in order. The last one's version is the current schema. */
 export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
   {
@@ -491,6 +547,11 @@ export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
     version: 6,
     name: "account_aliases: alternate external keys per account",
     sql: ACCOUNT_ALIASES,
+  },
+  {
+    version: 7,
+    name: "review_items dedupe key on (kind, source_document_id, source_locator, raw_value)",
+    sql: REVIEW_ITEMS_DEDUPE_KEY,
   },
 ]);
 

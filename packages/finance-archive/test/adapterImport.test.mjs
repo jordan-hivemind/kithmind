@@ -891,6 +891,203 @@ test(
   },
 );
 
+// F1-65. A hosted reparse of 854 already-imported statements opened 76,687
+// review items, 84,266 of them exact duplicates by (kind, source_document_id,
+// source_locator, raw_value): the same weak instrument match and the same
+// undeclared activity type, reopened on every row that carried them and
+// again on every reparse. Three rows share one weak instrument (the
+// resolver mints on the first, then flags every later row against it, so
+// three rows produce two identical warnings before this fix) and one
+// undeclared activity type (flagged fresh every row, no caching at all, so
+// three rows produce three identical warnings before this fix). All three
+// also carry an unparseable process date, so nothing in this document ever
+// inserts and `parsed_ok` never becomes true -- exactly the "reparse of a
+// document that never fully lands" case the defect was measured against,
+// not the ordinary whole-document skip.
+const TAXONOMY_WITHOUT_UNKNOWN_TYPE = {
+  fee: { movesCash: true, movesQuantity: false, quantitySign: "none" },
+};
+
+function weakInstrumentUndeclaredRows() {
+  const instrument = { symbol: "ZZZ", cusip: null, isin: null, name: null };
+  return [0, 1, 2].map((index) =>
+    activityRow({
+      processDate: "not-a-real-date",
+      activityType: "unknown_type",
+      instrument,
+      locators: { row: { source: "tabular_export", index } },
+    }),
+  );
+}
+
+test(
+  "F1-65: reimporting a document twice opens each review item once, including one row's worth of duplicates within a single import",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedPg(client);
+
+    const acquired = buildTabularPull("f1-65 reimport idempotence");
+    const persisted = persist(t, acquired, "tabular_export");
+    const buildDocuments = () =>
+      adapterPullToImportDocuments(client, {
+        institutionId: INSTITUTION.id,
+        accountId: ACCOUNT.id,
+        acquired,
+        rows: weakInstrumentUndeclaredRows(),
+        docType: "tabular_export",
+        docDate: "2025-02-01",
+        persisted,
+        activityTaxonomy: TAXONOMY_WITHOUT_UNKNOWN_TYPE,
+      });
+
+    const first = await importBatch(
+      client,
+      { source: INSTITUTION.slug, documents: await buildDocuments() },
+      new Date("2025-05-01"),
+    );
+
+    // Nothing landed: all three rows carry an unparseable process date, so
+    // `parsed_ok` stays false and a reimport reprocesses the document in
+    // full rather than taking the whole-document skip.
+    assert.equal(first.rowsInserted, 0);
+    assert.equal(
+      (await one(client, "SELECT parsed_ok FROM documents")).parsed_ok,
+      false,
+    );
+
+    // One item each, not three: the resolver mints on the first row and
+    // flags the other two against it (two identical warnings), and
+    // classifyActivity flags all three rows identically (three identical
+    // warnings) -- the buffered insert must collapse both down to one
+    // within this single import, not merely across separate runs.
+    assert.equal(
+      await count(client, "review_items", "WHERE kind = $1", [
+        "weak_instrument_match",
+      ]),
+      1,
+    );
+    assert.equal(
+      await count(client, "review_items", "WHERE kind = $1", [
+        "undeclared_activity_type",
+      ]),
+      1,
+    );
+    // The unparseable date is a genuine per-row fact at three different
+    // locators, so it is not a duplicate and every row keeps its own item.
+    assert.equal(
+      await count(client, "review_items", "WHERE kind = $1", [
+        "unparseable_process_date",
+      ]),
+      3,
+    );
+    const totalAfterFirst = await count(client, "review_items");
+    assert.equal(totalAfterFirst, 5);
+    assert.equal(first.reviewItemsOpened, 5);
+
+    const second = await importBatch(
+      client,
+      { source: INSTITUTION.slug, documents: await buildDocuments() },
+      new Date("2025-05-01"),
+    );
+
+    // The reparse re-derives the identical five candidates; every one of
+    // them already exists on file, so this run opens none.
+    assert.equal(second.reviewItemsOpened, 0);
+    assert.equal(await count(client, "review_items"), totalAfterFirst);
+    assert.equal(
+      await count(client, "review_items", "WHERE kind = $1", [
+        "weak_instrument_match",
+      ]),
+      1,
+    );
+    assert.equal(
+      await count(client, "review_items", "WHERE kind = $1", [
+        "undeclared_activity_type",
+      ]),
+      1,
+    );
+    assert.equal(
+      await count(client, "review_items", "WHERE kind = $1", [
+        "unparseable_process_date",
+      ]),
+      3,
+    );
+  },
+);
+
+test(
+  "F1-65: a resolved review item is never reopened by a reimport",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedPg(client);
+
+    const acquired = buildTabularPull("f1-65 resolved item stays resolved");
+    const persisted = persist(t, acquired, "tabular_export");
+    const buildDocuments = () =>
+      adapterPullToImportDocuments(client, {
+        institutionId: INSTITUTION.id,
+        accountId: ACCOUNT.id,
+        acquired,
+        rows: weakInstrumentUndeclaredRows(),
+        docType: "tabular_export",
+        docDate: "2025-02-01",
+        persisted,
+        activityTaxonomy: TAXONOMY_WITHOUT_UNKNOWN_TYPE,
+      });
+
+    await importBatch(
+      client,
+      { source: INSTITUTION.slug, documents: await buildDocuments() },
+      new Date("2025-05-01"),
+    );
+
+    const resolvedAt = "2025-06-01T00:00:00.000Z";
+    await client.query(
+      `UPDATE review_items
+         SET status = 'resolved', resolved_at = $1, resolution_note = 'confirmed correct by a person'
+       WHERE kind = 'weak_instrument_match'`,
+      [resolvedAt],
+    );
+    const beforeReimport = await one(
+      client,
+      "SELECT id, status, resolved_at, resolution_note FROM review_items WHERE kind = 'weak_instrument_match'",
+    );
+    assert.equal(beforeReimport.status, "resolved");
+
+    const second = await importBatch(
+      client,
+      { source: INSTITUTION.slug, documents: await buildDocuments() },
+      new Date("2025-05-01"),
+    );
+
+    // Still exactly one weak_instrument_match item -- the reimport neither
+    // reopened the resolved one nor opened a fresh duplicate next to it.
+    assert.equal(
+      await count(client, "review_items", "WHERE kind = $1", [
+        "weak_instrument_match",
+      ]),
+      1,
+    );
+    const afterReimport = await one(
+      client,
+      "SELECT id, status, resolved_at, resolution_note FROM review_items WHERE kind = 'weak_instrument_match'",
+    );
+    assert.equal(afterReimport.id, beforeReimport.id);
+    assert.equal(afterReimport.status, "resolved");
+    assert.equal(
+      afterReimport.resolution_note,
+      "confirmed correct by a person",
+    );
+    assert.equal(
+      second.reviewItemsOpened,
+      0,
+      "the reimport must not count the untouched resolved item as newly opened",
+    );
+  },
+);
+
 test(
   "F1-19: an amount on a type declared movesCash: false is nulled, reviewed, and excluded from the cash gate",
   { skip },

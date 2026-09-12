@@ -735,3 +735,114 @@ test(
     });
   },
 );
+
+// F1-65. review_items_dedupe_key (migration version 7) must not be the thing
+// that discovers a live archive's existing duplicates: CREATE UNIQUE INDEX
+// would fail mid-build, after whatever work Postgres already did scanning
+// the table. The DO block ahead of it is supposed to catch that first, with
+// a message that sends an operator to the collapse script instead.
+test(
+  "the review_items dedupe migration refuses with duplicates on file, and succeeds once they are collapsed",
+  { skip },
+  async () => {
+    const schema = testSchemaName();
+    const client = createArchiveClient(url, schema);
+    await client.connect();
+    try {
+      // Every migration except the one under test: a live archive the night
+      // before this ships, with a hosted reparse's worth of duplicates
+      // already on file.
+      const priorMigrations = PG_MIGRATIONS.slice(0, -1);
+      assert.equal(
+        priorMigrations.length,
+        PG_MIGRATIONS.length - 1,
+        "the dedupe migration is expected to be the last one",
+      );
+      await client.query(`CREATE SCHEMA ${schema}`);
+      await client.query(
+        `CREATE TABLE ${schema}.schema_version (
+           version INTEGER PRIMARY KEY, name TEXT NOT NULL,
+           applied_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
+      );
+      for (const migration of priorMigrations) {
+        await client.query(migration.sql);
+        await client.query(
+          `INSERT INTO ${schema}.schema_version (version, name) VALUES ($1, $2)`,
+          [migration.version, migration.name],
+        );
+      }
+      assert.equal(
+        await pgSchemaVersion(client, schema),
+        priorMigrations[priorMigrations.length - 1].version,
+      );
+
+      await client.query(
+        "INSERT INTO institutions (id, name, slug) VALUES ('inst-1', 'Thistlebrook Trust', 'thistlebrook')",
+      );
+      await client.query(
+        `INSERT INTO documents (id, institution_id, doc_type, doc_date, file_path, sha256)
+         VALUES ('doc-1', 'inst-1', 'activity_pull', DATE '2026-03-04', '/raw/doc-1', $1)`,
+        ["b".repeat(64)],
+      );
+      // Two rows, identical on the dedupe key: exactly what a reparse before
+      // F1-65 produced.
+      await client.query(
+        `INSERT INTO review_items (id, kind, source_document_id, source_locator, raw_value, reason)
+         VALUES
+           ('review-dupe-1', 'weak_instrument_match', 'doc-1', 'row:1', 'ZZZ', 'first'),
+           ('review-dupe-2', 'weak_instrument_match', 'doc-1', 'row:1', 'ZZZ', 'second')`,
+      );
+
+      await assert.rejects(
+        applyPgSchema(client, schema),
+        /collapseDuplicateReviewItems\.mjs/,
+        "the migration should name the collapse script rather than fail on the index build itself",
+      );
+      // Refused, not partially applied: still at the prior version.
+      assert.equal(
+        await pgSchemaVersion(client, schema),
+        priorMigrations[priorMigrations.length - 1].version,
+      );
+
+      // An operator running the collapse script (or, here, doing exactly
+      // what it does) clears the duplicate before retrying.
+      await client.query(
+        "DELETE FROM review_items WHERE id = 'review-dupe-2'",
+      );
+
+      assert.equal(
+        await applyPgSchema(client, schema),
+        PG_SCHEMA_VERSION,
+      );
+      const survivor = await client.query(
+        "SELECT id FROM review_items ORDER BY id",
+      );
+      assert.deepEqual(
+        survivor.rows.map((r) => r.id),
+        ["review-dupe-1"],
+      );
+
+      // The index is real: a fresh attempt at the same key is refused too.
+      await assert.rejects(
+        client.query(
+          `INSERT INTO review_items (id, kind, source_document_id, source_locator, raw_value, reason)
+           VALUES ('review-dupe-3', 'weak_instrument_match', 'doc-1', 'row:1', 'ZZZ', 'third')`,
+        ),
+        /review_items_dedupe_key/,
+      );
+
+      // Null locator or null document: never a candidate for this index, so
+      // never refused, exactly like every item written before PR137.
+      await client.query(
+        `INSERT INTO review_items (id, kind, source_document_id, source_locator, raw_value, reason)
+         VALUES
+           ('review-null-1', 'weak_instrument_match', 'doc-1', NULL, 'ZZZ', 'null locator, first'),
+           ('review-null-2', 'weak_instrument_match', 'doc-1', NULL, 'ZZZ', 'null locator, second'),
+           ('review-null-3', 'weak_instrument_match', NULL, NULL, 'ZZZ', 'null document and locator')`,
+      );
+    } finally {
+      await client.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+      await client.end();
+    }
+  },
+);
