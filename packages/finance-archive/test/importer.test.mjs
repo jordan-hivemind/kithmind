@@ -848,6 +848,128 @@ test(
   },
 );
 
+// F1-49. A parse-noted document is never eligible for the whole-document
+// skip (see the parsed_ok test above and importBatch's parseNote branch), so
+// every rerun reprocesses it in full -- which, before row_hash existed on
+// these three tables, blindly re-inserted every holding it had already
+// stored. positions.row_hash/balances.row_hash/liabilities.row_hash (pgSchema.ts
+// version 5) are what make that rerun a no-op instead.
+test(
+  "a parse-noted document never duplicates its own holdings on rerun, even though it is reprocessed every time",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+    const balance = {
+      asOf: "2026-03-31",
+      totalValueText: "10000",
+      totalValueNote: null,
+      cash: "500",
+      currency: "USD",
+      periodStartValue: "9500",
+      periodEndValue: "10000",
+      sourceLocator: "holdings:balance",
+    };
+    const liability = {
+      kind: "margin_loan",
+      displayName: "Synthetic margin balance",
+      balanceText: "2000",
+      balanceNote: null,
+      currency: "USD",
+      rate: "4.5",
+      asOf: "2026-03-31",
+      collateralNote: "Synthetic collateral note.",
+      sourceLocator: "holdings:liability",
+    };
+    const doc = document(
+      "17".padEnd(64, "0"),
+      [row({ sourceLocator: "row:1", providerTxnId: "ptx-parsenote" })],
+      {
+        parseNote: "extractor found no text for the remainder of this statement",
+        positions: [position()],
+        balances: [balance],
+        liabilities: [liability],
+      },
+    );
+
+    const first = await importBatch(
+      client,
+      { source: "synthetic-pull", documents: [doc] },
+      NOW,
+    );
+    // The one row, plus one position, one balance and one liability.
+    assert.equal(first.rowsInserted, 4);
+    assert.equal(await count(client, "positions"), 1);
+    assert.equal(await count(client, "balances"), 1);
+    assert.equal(await count(client, "liabilities"), 1);
+
+    const afterFirst = await one(
+      client,
+      "SELECT parsed_ok FROM documents WHERE sha256 = $1",
+      [doc.sha256],
+    );
+    assert.equal(
+      afterFirst.parsed_ok,
+      false,
+      "a parse note keeps the document unparsed no matter what else landed",
+    );
+
+    const second = await importBatch(
+      client,
+      { source: "synthetic-pull", documents: [doc] },
+      NOW,
+    );
+    assert.equal(second.rowsInserted, 0);
+    assert.equal(second.rowsDeduplicated, 4);
+    assert.equal(await count(client, "transactions"), 1);
+    assert.equal(await count(client, "positions"), 1);
+    assert.equal(await count(client, "balances"), 1);
+    assert.equal(await count(client, "liabilities"), 1);
+
+    const afterSecond = await one(
+      client,
+      "SELECT parsed_ok FROM documents WHERE sha256 = $1",
+      [doc.sha256],
+    );
+    assert.equal(afterSecond.parsed_ok, false);
+  },
+);
+
+// F1-49 review fix: positionHash originally hashed only account, instrument,
+// as_of, quantity, market value, cost basis and valuation basis. Two
+// unrelated lines a statement could not resolve to an instrument
+// (instrumentId null) are identical on every one of those fields whenever
+// their stated values happen to match too, so the second silently
+// deduplicated instead of inserting. positionHash now also hashes
+// sourceLocator when instrumentId is null, which is unique per line within
+// one document.
+test(
+  "two positions with no resolvable instrument, identical stated values but different locators, both insert",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+    const summary = await importBatch(
+      client,
+      {
+        source: "synthetic-pull",
+        documents: [
+          document("19".padEnd(64, "0"), [], {
+            positions: [
+              position({ instrumentId: null, sourceLocator: "holdings:1" }),
+              position({ instrumentId: null, sourceLocator: "holdings:2" }),
+            ],
+          }),
+        ],
+      },
+      NOW,
+    );
+    assert.equal(summary.rowsInserted, 2);
+    assert.equal(summary.rowsDeduplicated, 0);
+    assert.equal(await count(client, "positions"), 2);
+  },
+);
+
 test(
   "a document declaring a position or balance with no account_id fails loudly rather than writing an orphaned row",
   { skip },
@@ -956,15 +1078,58 @@ test(
     assert.equal(first.rowsRefused, 2);
     assert.equal(first.rowsSkipped, 2);
 
-    // A second pass over the identical batch: the two good rows are now
-    // duplicates (matched by provider id), the two bad rows are refused
-    // again (still unparseable) -- neither count should collapse into the
-    // other, and rowsInserted must stay 0 either way.
+    // F1-49: two rows landed, so the document is parsed_ok true even though
+    // two others were sent to review -- and a second pass over the identical
+    // batch is therefore the ordinary whole-document skip, not a reprocess.
+    // Every row that document carried, refused ones included, counts as
+    // deduplicated by that skip; the two bad rows are not refused a second
+    // time because they are never looked at again.
     const second = await importBatch(client, batch, NOW);
     assert.equal(second.rowsInserted, 0);
-    assert.equal(second.rowsDeduplicated, 2);
-    assert.equal(second.rowsRefused, 2);
+    assert.equal(second.rowsDeduplicated, 4);
+    assert.equal(second.rowsRefused, 0);
     assert.equal(second.rowsSkipped, 4);
+  },
+);
+
+// F1-49. `parsed_ok` no longer means "nothing in this document was ever
+// refused" -- it means something in it landed. A document that inserts some
+// rows and sends others to review is exactly the case F1-36 kept
+// permanently reprocessing; that reprocessing is what made rerunning a
+// document with already-successful holdings unsafe, and row_hash on
+// positions/balances/liabilities (below) is what makes it safe again, so
+// this policy can go back to answering its own question.
+test(
+  "a document with one inserted row and one reviewed row is recorded as parsed (F1-49)",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+    const sha = "b2".padEnd(64, "0");
+    const rows = [
+      row({ sourceLocator: "row:1", providerTxnId: "ptx-1" }),
+      row({ sourceLocator: "row:2", processDate: "not-a-date" }),
+    ];
+
+    const summary = await importBatch(
+      client,
+      { source: "synthetic-pull", documents: [document(sha, rows)] },
+      NOW,
+    );
+    assert.equal(summary.rowsInserted, 1);
+    assert.equal(summary.rowsRefused, 1);
+
+    const stored = await one(
+      client,
+      "SELECT parsed_ok FROM documents WHERE sha256 = $1",
+      [sha],
+    );
+    assert.equal(
+      stored.parsed_ok,
+      true,
+      "one inserted row is enough to record the document as parsed, even " +
+        "though another row in the same document was sent to review",
+    );
   },
 );
 

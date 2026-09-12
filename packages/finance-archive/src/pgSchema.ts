@@ -373,6 +373,33 @@ ALTER TABLE review_items
     FOREIGN KEY (source_document_id) REFERENCES documents(id) ON DELETE CASCADE;
 `;
 
+// F1-49. positions, balances and liabilities had no row-level dedupe: the
+// only key they ever had was "which document stated this," checked once at
+// the whole-document skip. A document reprocessed for any other reason --
+// one row sent to review, a parse note that never clears -- re-inserted
+// every holding it carried, every time. row_hash (importer.ts computes it
+// via rowHash.ts's positionHash/balanceHash/liabilityHash) gives each table
+// the same content identity transactions already have.
+//
+// Nullable, with a plain UNIQUE constraint rather than a partial index:
+// Postgres never treats two NULLs as equal in a UNIQUE constraint, so a
+// nullable column already behaves as "unique where not null" with no extra
+// syntax. Existing rows keep a NULL row_hash -- there is no backfill in this
+// migration, the same policy every additive migration before it uses --
+// see `scripts/backfillHoldingRowHash.mjs` for bringing a live archive's
+// existing rows under the constraint after review.
+const HOLDING_ROW_HASH = `
+ALTER TABLE positions
+  ADD COLUMN row_hash TEXT,
+  ADD CONSTRAINT positions_row_hash_unique UNIQUE (row_hash);
+ALTER TABLE balances
+  ADD COLUMN row_hash TEXT,
+  ADD CONSTRAINT balances_row_hash_unique UNIQUE (row_hash);
+ALTER TABLE liabilities
+  ADD COLUMN row_hash TEXT,
+  ADD CONSTRAINT liabilities_row_hash_unique UNIQUE (row_hash);
+`;
+
 /** Every migration, in order. The last one's version is the current schema. */
 export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
   {
@@ -394,6 +421,11 @@ export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
     version: 4,
     name: "review_items.source_document_id cascades on document delete",
     sql: REVIEW_ITEMS_CASCADE,
+  },
+  {
+    version: 5,
+    name: "positions, balances and liabilities gain a deduplication row_hash",
+    sql: HOLDING_ROW_HASH,
   },
 ]);
 

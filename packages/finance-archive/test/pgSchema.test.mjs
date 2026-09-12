@@ -628,6 +628,82 @@ test(
 // blocked outright. The version-4 migration adds ON DELETE CASCADE; this
 // proves that against a real archive rather than trusting the DDL to have
 // parsed the way it reads.
+// F1-49. positions, balances and liabilities had no row-level dedupe of
+// their own; the version-5 migration gives each a nullable row_hash. Nullable
+// is the point: Postgres never treats two NULLs as equal in a UNIQUE
+// constraint, so existing rows (which this migration does not backfill --
+// see scripts/backfillHoldingRowHash.mjs) coexist with each other, while two
+// rows that do carry the same hash still collide.
+test(
+  "positions, balances and liabilities gain a nullable, uniquely-constrained row_hash (F1-49)",
+  { skip },
+  async () => {
+    await withArchive(async (client) => {
+      const account = await seedAccount(client);
+
+      // Multiple NULLs coexist -- no backfill happened, and none is required
+      // for the column to be usable going forward.
+      await client.query(
+        "INSERT INTO positions (id, account_id, as_of, currency) VALUES ('pos-null-1', $1, DATE '2026-03-04', 'USD')",
+        [account],
+      );
+      await client.query(
+        "INSERT INTO positions (id, account_id, as_of, currency) VALUES ('pos-null-2', $1, DATE '2026-03-04', 'USD')",
+        [account],
+      );
+      await client.query(
+        "INSERT INTO balances (id, account_id, as_of, currency) VALUES ('bal-null-1', $1, DATE '2026-03-04', 'USD')",
+        [account],
+      );
+      await client.query(
+        "INSERT INTO balances (id, account_id, as_of, currency) VALUES ('bal-null-2', $1, DATE '2026-03-04', 'USD')",
+        [account],
+      );
+      await client.query(
+        "INSERT INTO liabilities (id, kind, as_of, currency) VALUES ('liab-null-1', 'margin_loan', DATE '2026-03-04', 'USD')",
+      );
+      await client.query(
+        "INSERT INTO liabilities (id, kind, as_of, currency) VALUES ('liab-null-2', 'margin_loan', DATE '2026-03-04', 'USD')",
+      );
+
+      // A real hash is unique per table.
+      await client.query(
+        "INSERT INTO positions (id, account_id, as_of, currency, row_hash) VALUES ('pos-hashed-1', $1, DATE '2026-03-04', 'USD', 'hash-pos-1')",
+        [account],
+      );
+      await assert.rejects(
+        client.query(
+          "INSERT INTO positions (id, account_id, as_of, currency, row_hash) VALUES ('pos-hashed-2', $1, DATE '2026-03-05', 'USD', 'hash-pos-1')",
+          [account],
+        ),
+        /positions_row_hash_unique/,
+      );
+
+      await client.query(
+        "INSERT INTO balances (id, account_id, as_of, currency, row_hash) VALUES ('bal-hashed-1', $1, DATE '2026-03-04', 'USD', 'hash-bal-1')",
+        [account],
+      );
+      await assert.rejects(
+        client.query(
+          "INSERT INTO balances (id, account_id, as_of, currency, row_hash) VALUES ('bal-hashed-2', $1, DATE '2026-03-05', 'USD', 'hash-bal-1')",
+          [account],
+        ),
+        /balances_row_hash_unique/,
+      );
+
+      await client.query(
+        "INSERT INTO liabilities (id, kind, as_of, currency, row_hash) VALUES ('liab-hashed-1', 'margin_loan', DATE '2026-03-04', 'USD', 'hash-liab-1')",
+      );
+      await assert.rejects(
+        client.query(
+          "INSERT INTO liabilities (id, kind, as_of, currency, row_hash) VALUES ('liab-hashed-2', 'margin_loan', DATE '2026-03-05', 'USD', 'hash-liab-1')",
+        ),
+        /liabilities_row_hash_unique/,
+      );
+    });
+  },
+);
+
 test(
   "review_items.source_document_id cascades when its document is deleted (F1-36)",
   { skip },

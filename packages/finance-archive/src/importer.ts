@@ -49,7 +49,13 @@ import {
   runPositionReconciliationGate,
   type PositionReconciliationGateSummary,
 } from "./positionReconciliation.js";
-import { contentKeyV2, rowHashV2 } from "./rowHash.js";
+import {
+  balanceHash,
+  contentKeyV2,
+  liabilityHash,
+  positionHash,
+  rowHashV2,
+} from "./rowHash.js";
 
 /**
  * One transaction as a source hands it to the importer, already normalized to
@@ -201,10 +207,12 @@ export type ImportLiability = {
  * One acquired file (a raw statement, or one page of a paginated pull) and
  * the rows parsed from it. Rows are attributed to `documents` by content
  * hash, so importing the same bytes twice is a no-op (ground rule 1).
- * `positions`, `balances` and `liabilities` follow the same rule: a document
- * already imported successfully contributes nothing new on a second import,
- * holdings included, since there is no dedupe key on those tables other than
- * "which document stated this."
+ * `positions`, `balances` and `liabilities` follow the same rule at the
+ * whole-document level, and (F1-49) each also carries its own `row_hash`
+ * (`rowHash.ts`'s `positionHash`/`balanceHash`/`liabilityHash`), so a document
+ * reprocessed for some other reason -- a sibling row sent to review, a parse
+ * note that never clears -- matches its own already-stored holdings instead
+ * of inserting a second copy.
  */
 export type ImportDocument = {
   /** sha256 of the raw file's bytes. The dedupe key for whole-document skip. */
@@ -587,10 +595,12 @@ export async function importBatch(
 
   /**
    * `positions`, `balances` and `liabilities` dedupe at the whole-document
-   * level (see `ImportDocument`'s doc comment) rather than by their own
-   * content hash, so unlike `importRow` these three never look up an
-   * existing row: the caller only reaches them for a document being
-   * imported for the first time. Only `as_of` unparseable to ISO blocks the
+   * level (see `ImportDocument`'s doc comment) the same immutable-raw-file
+   * check transactions get, and (F1-49) also look up their own content hash
+   * before inserting, the same way `importRow` looks up `rowHashV2`: a
+   * document reprocessed for some other reason -- one row sent to review, a
+   * parse note that never clears -- matches a holding it already stored
+   * instead of inserting it again. Only `as_of` unparseable to ISO blocks the
    * insert outright -- the column is NOT NULL with no other spelling to
    * store, the same reasoning as `transactions.process_date`. Every other
    * malformed or missing field stores NULL and opens a review item instead.
@@ -599,7 +609,7 @@ export async function importBatch(
     position: ImportPosition,
     accountId: string,
     documentId: string,
-  ): Promise<"inserted" | "refused"> {
+  ): Promise<"inserted" | "deduplicated" | "refused"> {
     if (!ISO_DATE.test(position.asOf)) {
       await openReview(accountId, documentId, position.sourceLocator, {
         kind: "unparseable_as_of",
@@ -659,12 +669,30 @@ export async function importBatch(
       });
     }
 
+    const hash = positionHash({
+      accountId,
+      instrumentId: position.instrumentId,
+      asOf: position.asOf,
+      quantity,
+      marketValue,
+      costBasis,
+      valuationBasis,
+      sourceLocator: position.sourceLocator,
+    });
+    const byHash = await client.query(
+      "SELECT 1 FROM positions WHERE row_hash = $1",
+      [hash],
+    );
+    if ((byHash.rowCount ?? 0) > 0) {
+      return "deduplicated";
+    }
+
     await client.query(
       `INSERT INTO positions
          (id, account_id, as_of, instrument_id, quantity, price, market_value,
           cost_basis, unrealized, currency, valuation_basis, valuation_note,
-          source_document_id, source_locator)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+          source_document_id, source_locator, row_hash)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
       [
         randomUUID(),
         accountId,
@@ -680,6 +708,7 @@ export async function importBatch(
         position.valuationNote,
         documentId,
         position.sourceLocator,
+        hash,
       ],
     );
     for (const candidate of pending) {
@@ -697,7 +726,7 @@ export async function importBatch(
     balance: ImportBalance,
     accountId: string,
     documentId: string,
-  ): Promise<"inserted" | "refused"> {
+  ): Promise<"inserted" | "deduplicated" | "refused"> {
     if (!ISO_DATE.test(balance.asOf)) {
       await openReview(accountId, documentId, balance.sourceLocator, {
         kind: "unparseable_as_of",
@@ -734,11 +763,26 @@ export async function importBatch(
       pending,
     );
 
+    const hash = balanceHash({
+      accountId,
+      asOf: balance.asOf,
+      totalValue,
+      cash,
+    });
+    const byHash = await client.query(
+      "SELECT 1 FROM balances WHERE row_hash = $1",
+      [hash],
+    );
+    if ((byHash.rowCount ?? 0) > 0) {
+      return "deduplicated";
+    }
+
     await client.query(
       `INSERT INTO balances
          (id, account_id, as_of, total_value, cash, currency,
-          period_start_value, period_end_value, source_document_id, source_locator)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+          period_start_value, period_end_value, source_document_id, source_locator,
+          row_hash)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
       [
         randomUUID(),
         accountId,
@@ -750,6 +794,7 @@ export async function importBatch(
         periodEndValue,
         documentId,
         balance.sourceLocator,
+        hash,
       ],
     );
     for (const candidate of pending) {
@@ -763,7 +808,7 @@ export async function importBatch(
     institutionId: string | null,
     accountId: string | null,
     documentId: string,
-  ): Promise<"inserted" | "refused"> {
+  ): Promise<"inserted" | "deduplicated" | "refused"> {
     if (!ISO_DATE.test(liability.asOf)) {
       await openReview(accountId, documentId, liability.sourceLocator, {
         kind: "unparseable_as_of",
@@ -787,11 +832,25 @@ export async function importBatch(
       pending,
     );
 
+    const hash = liabilityHash({
+      accountId,
+      kind: liability.kind,
+      asOf: liability.asOf,
+      balance: balanceAmount,
+    });
+    const byHash = await client.query(
+      "SELECT 1 FROM liabilities WHERE row_hash = $1",
+      [hash],
+    );
+    if ((byHash.rowCount ?? 0) > 0) {
+      return "deduplicated";
+    }
+
     await client.query(
       `INSERT INTO liabilities
          (id, institution_id, account_id, kind, display_name, balance, currency,
-          rate, as_of, collateral_note, source_document_id, source_locator)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+          rate, as_of, collateral_note, source_document_id, source_locator, row_hash)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
       [
         randomUUID(),
         institutionId,
@@ -805,6 +864,7 @@ export async function importBatch(
         liability.collateralNote,
         documentId,
         liability.sourceLocator,
+        hash,
       ],
     );
     for (const candidate of pending) {
@@ -842,13 +902,16 @@ export async function importBatch(
       const existing = found.rows[0];
       if (existing?.parsed_ok === true) {
         // Ground rule 1: raw files are immutable. Byte-identical bytes that
-        // already imported successfully contribute nothing new. Holdings
-        // dedupe the same way (see ImportDocument's doc comment): there is
-        // no per-row key for them, only "which document stated this." A
-        // whole-document skip is a dedupe, not a refusal -- F1-36's
-        // `parsed_ok` fix below is what keeps this branch honest: it only
-        // ever fires for a document every one of whose rows actually
-        // imported or matched last time, never one this importer refused.
+        // already imported successfully contribute nothing new. F1-49:
+        // `parsed_ok` true means something in this document landed last time
+        // (a row, position, balance or liability was inserted or matched),
+        // not that every one of them did -- a document with a genuinely
+        // refused row alongside successful ones is eligible for this skip.
+        // That is safe because every holding now carries its own `row_hash`
+        // (mirroring transactions' `provider_txn_id`/`row_hash`), so a
+        // document reprocessed for some other reason -- a parse note, or
+        // nothing landing at all last time -- matches its own already-stored
+        // holdings instead of duplicating them.
         const skipped =
           document.rows.length +
           (document.positions?.length ?? 0) +
@@ -895,21 +958,22 @@ export async function importBatch(
       }
 
       // Fresh per document: the occurrence ordinal is scoped to one document
-      // in its own row order (see importRow). F1-36: `documentRefused`
-      // tracks whether anything in this document was refused rather than
-      // inserted or deduplicated, which decides `parsed_ok` below -- a
-      // document is only "already fully imported" (safe to whole-document
-      // skip next time) if nothing in it was ever refused.
+      // in its own row order (see importRow). F1-49: `anySuccess` tracks
+      // whether anything in this document -- a row, position, balance or
+      // liability -- actually landed (inserted or deduplicated), which is
+      // what decides `parsed_ok` below now: a document is "parsed" as soon
+      // as something in it landed, even if something else was sent to
+      // review, and stays unparsed only when it carries a parse note or when
+      // literally nothing in it could be inserted or matched.
       const occurrences = new Map<string, number>();
-      let documentRefused = false;
+      let anySuccess = false;
       if (document.parseNote) {
         // Retained but unparsed: keep it re-importable (parsed_ok stays
-        // FALSE below) and say so in the queue -- but only once. The same
-        // still-unparsed bytes produce the identical parseNote on every
-        // rerun until a real extractor replaces this one, so without this
-        // check a rerun reopens a duplicate document_unparsed row forever
-        // instead of being recognized as already flagged.
-        documentRefused = true;
+        // FALSE below regardless of anySuccess) and say so in the queue --
+        // but only once. The same still-unparsed bytes produce the identical
+        // parseNote on every rerun until a real extractor replaces this one,
+        // so without this check a rerun reopens a duplicate document_unparsed
+        // row forever instead of being recognized as already flagged.
         const alreadyFlagged = await client.query(
           "SELECT 1 FROM review_items WHERE kind = 'document_unparsed' AND source_document_id = $1",
           [documentId],
@@ -924,24 +988,17 @@ export async function importBatch(
       }
       for (const row of document.rows) {
         const outcome = await importRow(row, documentId, occurrences);
-        if (outcome === "inserted") rowsInserted += 1;
-        else if (outcome === "deduplicated") rowsDeduplicated += 1;
-        else {
+        if (outcome === "inserted") {
+          rowsInserted += 1;
+          anySuccess = true;
+        } else if (outcome === "deduplicated") {
+          rowsDeduplicated += 1;
+          anySuccess = true;
+        } else {
           rowsRefused += 1;
-          documentRefused = true;
         }
       }
 
-      // ponytail: a retried document (parsed_ok false, existing above) that
-      // mixes activity rows with holdings, and whose holdings already
-      // inserted cleanly on an earlier attempt that only a row refusal
-      // reopened, re-inserts those holdings here -- positions, balances and
-      // liabilities have no per-row identity to dedupe on (see
-      // ImportDocument's doc comment), only the whole-document skip this
-      // very fix had to stop trusting blindly. Narrow: it needs one document
-      // to carry both a refused activity row and already-successful
-      // holdings. Give holdings their own content hash (mirroring row_hash)
-      // if a real pull ever mixes the two this way.
       const positions = document.positions ?? [];
       const balances = document.balances ?? [];
       // F1-46: each holding's own accountId (a consolidated statement's
@@ -957,10 +1014,14 @@ export async function importBatch(
           );
         }
         const outcome = await importPosition(position, accountId, documentId);
-        if (outcome === "inserted") rowsInserted += 1;
-        else {
+        if (outcome === "inserted") {
+          rowsInserted += 1;
+          anySuccess = true;
+        } else if (outcome === "deduplicated") {
+          rowsDeduplicated += 1;
+          anySuccess = true;
+        } else {
           rowsRefused += 1;
-          documentRefused = true;
         }
       }
       for (const balance of balances) {
@@ -972,10 +1033,14 @@ export async function importBatch(
           );
         }
         const outcome = await importBalance(balance, accountId, documentId);
-        if (outcome === "inserted") rowsInserted += 1;
-        else {
+        if (outcome === "inserted") {
+          rowsInserted += 1;
+          anySuccess = true;
+        } else if (outcome === "deduplicated") {
+          rowsDeduplicated += 1;
+          anySuccess = true;
+        } else {
           rowsRefused += 1;
-          documentRefused = true;
         }
       }
       for (const liability of document.liabilities ?? []) {
@@ -985,28 +1050,35 @@ export async function importBatch(
           liability.accountId ?? document.accountId,
           documentId,
         );
-        if (outcome === "inserted") rowsInserted += 1;
-        else {
+        if (outcome === "inserted") {
+          rowsInserted += 1;
+          anySuccess = true;
+        } else if (outcome === "deduplicated") {
+          rowsDeduplicated += 1;
+          anySuccess = true;
+        } else {
           rowsRefused += 1;
-          documentRefused = true;
         }
       }
 
-      // F1-36. Previously always TRUE, which is what let a document every
-      // one of whose rows was refused (a bad date format on 1602 rows, say)
-      // get recorded as fully, successfully imported. The next run's
-      // whole-document skip above then trusted that lie and never looked at
-      // this document's rows again -- not even after the parser that
-      // produced them was fixed, because the document's sha256 (the raw
-      // file's bytes) does not change when only its parsing does. `FALSE`
-      // here leaves the document eligible for the whole-document skip only
-      // once nothing in it needs a second look; until then every rerun
-      // reprocesses it, and every row and holding in it is idempotent on
-      // its own (row_hash/provider_txn_id for rows; the skip itself for
-      // holdings, which only applies once this flips TRUE).
+      // F1-49. `parsed_ok` used to be `!documentRefused`: any single
+      // refusal anywhere in the document (even alongside 1000 clean rows)
+      // kept it FALSE forever, which was the only thing making a rerun safe
+      // when holdings had no dedupe of their own. Now that positions,
+      // balances and liabilities carry their own `row_hash` (this
+      // migration), that safety net is unconditional -- a reprocessed
+      // document matches whatever it already stored instead of duplicating
+      // it -- so `parsed_ok` can go back to answering its own question:
+      // did this document contribute anything. FALSE only when it carries a
+      // parse note (retained but never parsed at all) or when nothing in it
+      // -- no row, position, balance or liability -- was ever inserted or
+      // matched; a document that landed some things and sent others to
+      // review is TRUE, and the whole-document skip above is safe to take
+      // next time (see that branch's comment).
+      const parsedOk = !document.parseNote && anySuccess;
       await client.query("UPDATE documents SET parsed_ok = $2 WHERE id = $1", [
         documentId,
-        !documentRefused,
+        parsedOk,
       ]);
     }
 
