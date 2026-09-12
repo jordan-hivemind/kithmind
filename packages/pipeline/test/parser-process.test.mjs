@@ -5,6 +5,7 @@ import {
   cp,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   realpath,
   rm,
@@ -27,6 +28,7 @@ import {
   parseBoundedParserJson,
   ParserProcessError,
   preparePdfDocQaProfile,
+  reclaimStaleParserOutputDirectory,
   removeParserProfileWorkDirectoryExact,
   removeParserOutputExact,
   resolveRawLocators,
@@ -1716,6 +1718,118 @@ for (const stream of ["stdout", "stderr"]) {
     },
   );
 }
+
+async function reclaimFixture() {
+  const base = await realpath(await mkdtemp(join(tmpdir(), "parser-reclaim-")));
+  const outputRoot = join(base, "outputs");
+  await mkdir(outputRoot, { mode: 0o700 });
+  await chmod(outputRoot, 0o700);
+  return { base, outputRoot };
+}
+
+// These exercise `reclaimStaleParserOutputDirectory` directly: it does not
+// invoke the docling/python parser at all, so unlike the tests above it
+// needs no evals/parser runtime, only the macOS directory-trust boundary
+// (`requiredPlatform`).
+test(
+  "reclaims a parser work directory an interrupted run left with only empty scaffolding",
+  { skip: process.platform !== "darwin" },
+  async () => {
+    const f = await reclaimFixture();
+    try {
+      const outputId = randomUUID();
+      const output = await outputDirectory(f, outputId);
+      // Mirrors the defect: a run interrupted after the parser created its
+      // private home/temp directories but before it wrote any evidence.
+      await mkdir(join(output, `.home-${outputId}`), { mode: 0o700 });
+      await mkdir(join(output, `.tmp-${outputId}`), { mode: 0o700 });
+      const intent = await inspectParserOutputIntent({
+        outputRoot: f.outputRoot,
+        outputId,
+        requireEmpty: false,
+      });
+      assert.deepEqual(
+        await reclaimStaleParserOutputDirectory({
+          outputRoot: f.outputRoot,
+          outputIntent: intent,
+        }),
+        { state: "reclaimed" },
+      );
+      // Empty enough for `runCapturedPdfParser`'s require-empty precondition
+      // on the resumed attempt.
+      assert.deepEqual(await readdir(output), []);
+    } finally {
+      await rm(f.base, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "leaves a parser output directory with recorded evidence untouched",
+  { skip: process.platform !== "darwin" },
+  async () => {
+    const f = await reclaimFixture();
+    try {
+      const outputId = randomUUID();
+      const output = await outputDirectory(f, outputId);
+      await writeFile(join(output, "lossless.json"), "{}", { mode: 0o600 });
+      await writeFile(join(output, "bundle.json"), "{}", { mode: 0o600 });
+      const intent = await inspectParserOutputIntent({
+        outputRoot: f.outputRoot,
+        outputId,
+        requireEmpty: false,
+      });
+      assert.deepEqual(
+        await reclaimStaleParserOutputDirectory({
+          outputRoot: f.outputRoot,
+          outputIntent: intent,
+        }),
+        { state: "has_evidence" },
+      );
+      assert.deepEqual((await readdir(output)).sort(), [
+        "bundle.json",
+        "lossless.json",
+      ]);
+    } finally {
+      await rm(f.base, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "keeps destination_exists fatal for a work directory that holds more than empty scaffolding",
+  { skip: process.platform !== "darwin" },
+  async () => {
+    const f = await reclaimFixture();
+    try {
+      const outputId = randomUUID();
+      const output = await outputDirectory(f, outputId);
+      const home = join(output, `.home-${outputId}`);
+      await mkdir(home, { mode: 0o700 });
+      // Not the ordinary interrupted-run shape: the scaffolding is not
+      // empty. This must be surfaced, not silently cleared and retried.
+      await writeFile(join(home, "leftover"), "x", { mode: 0o600 });
+      const intent = await inspectParserOutputIntent({
+        outputRoot: f.outputRoot,
+        outputId,
+        requireEmpty: false,
+      });
+      await assert.rejects(
+        () =>
+          reclaimStaleParserOutputDirectory({
+            outputRoot: f.outputRoot,
+            outputIntent: intent,
+          }),
+        (error) =>
+          error instanceof ParserProcessError &&
+          error.code === "destination_exists",
+      );
+      assert.deepEqual(await readdir(home), ["leftover"]);
+    } finally {
+      await rm(f.base, { recursive: true, force: true });
+    }
+  },
+);
 
 test("fails closed on unsupported operating systems", async (context) => {
   if (process.platform === "darwin") {

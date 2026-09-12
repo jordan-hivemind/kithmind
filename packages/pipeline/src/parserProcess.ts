@@ -2506,6 +2506,104 @@ export async function inspectParserOutputIntent(input: {
   };
 }
 
+async function emptyAuxiliaryDirectory(path: string): Promise<boolean> {
+  const entry = await lstat(path).catch(() => null);
+  if (
+    entry === null ||
+    entry.isSymbolicLink() ||
+    !entry.isDirectory() ||
+    entry.uid !== uid() ||
+    (entry.mode & 0o777) !== 0o700
+  )
+    return false;
+  const directory = await opendir(path).catch(() =>
+    fail("output_invalid", "parser auxiliary output cannot be inspected"),
+  );
+  try {
+    return (await directory.read()) === null;
+  } finally {
+    await directory.close().catch(() => undefined);
+  }
+}
+
+/**
+ * A run interrupted between reserving a document's parser work directory
+ * and writing its evidence (`lossless.json` / `bundle.json`) leaves behind
+ * only the parser's empty private scaffolding (`.home-<id>` / `.tmp-<id>`).
+ * The work ID is deterministic, so a resumed run re-targets the same
+ * directory, and `runCapturedPdfParser` requires it to be entirely empty.
+ * Clear that leftover scaffolding so the resume can proceed. Anything else
+ * -- real evidence, or entries that are not empty known scaffolding -- is
+ * left untouched so `destination_exists` still surfaces genuinely
+ * unexpected state instead of this silently deleting it.
+ */
+export async function reclaimStaleParserOutputDirectory(input: {
+  outputRoot: string;
+  outputIntent: ParserOutputIntent;
+}): Promise<{ state: "reclaimed" | "has_evidence" }> {
+  requiredPlatform();
+  if (
+    !OPAQUE_ID.test(input.outputIntent.outputId) ||
+    !exactKeys(input.outputIntent.outputRoot, ["device", "inode"]) ||
+    !exactKeys(input.outputIntent.outputDirectory, ["device", "inode"])
+  )
+    fail("invalid_input", "parser output reclaim identity is invalid");
+  const root = await trustedDirectory(input.outputRoot, "parser output root", {
+    private: true,
+    rejectBroad: true,
+  });
+  if (
+    root.device !== input.outputIntent.outputRoot.device ||
+    root.inode !== input.outputIntent.outputRoot.inode
+  )
+    fail("unsafe_path", "parser output root changed");
+  const directory = await trustedDirectory(
+    join(root.path, input.outputIntent.outputId),
+    "parser output directory",
+    { private: true, rejectBroad: true },
+  );
+  if (
+    directory.device !== input.outputIntent.outputDirectory.device ||
+    directory.inode !== input.outputIntent.outputDirectory.inode ||
+    dirname(directory.path) !== root.path
+  )
+    fail("unsafe_path", "parser output directory changed");
+
+  const outputId = input.outputIntent.outputId;
+  const auxiliary = new Set([`.home-${outputId}`, `.tmp-${outputId}`]);
+  const entries = await opendir(directory.path).catch(() =>
+    fail("output_invalid", "parser output directory cannot be inspected"),
+  );
+  const names: string[] = [];
+  try {
+    for await (const entry of entries) {
+      names.push(entry.name);
+      if (names.length > 4)
+        fail("output_invalid", "parser output directory has extra entries");
+    }
+  } finally {
+    await entries.close().catch(() => undefined);
+  }
+  if (names.length === 0) return { state: "reclaimed" };
+  if (names.includes("lossless.json") || names.includes("bundle.json"))
+    return { state: "has_evidence" };
+  for (const name of names) {
+    if (
+      !auxiliary.has(name) ||
+      !(await emptyAuxiliaryDirectory(join(directory.path, name)))
+    )
+      fail("destination_exists", "parser output directory is not empty");
+  }
+  await recheckDirectory(directory, "parser output directory");
+  for (const name of names) {
+    await rmdir(join(directory.path, name)).catch(() =>
+      fail("unsafe_path", "parser auxiliary output could not be removed"),
+    );
+  }
+  await recheckDirectory(directory, "parser output directory");
+  return { state: "reclaimed" };
+}
+
 export async function inspectCapturedPdfParserOutput(input: {
   capture: CapturedPdf;
   outputRoot: string;
