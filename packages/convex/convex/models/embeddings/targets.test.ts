@@ -1,5 +1,5 @@
 import { convexTest } from "convex-test";
-import { describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { internal } from "../../_generated/api";
 import type { Id } from "../../_generated/dataModel";
@@ -10,7 +10,11 @@ import {
   fingerprintEmbeddingConfig,
 } from "../../lib/embeddingProvider";
 import { sha256Hex } from "../ingestion/hash";
-import { insertChunkEmbedding, deleteChunkEmbeddingVectors } from "./model";
+import {
+  bumpEmbeddingEligibilityEpoch,
+  insertChunkEmbedding,
+  deleteChunkEmbeddingVectors,
+} from "./model";
 import { BASELINE_EMBEDDING_PROFILE } from "./migrations";
 import { embeddingVectorScopeV2, ZERO_KIND_COUNTS } from "./targets";
 
@@ -249,7 +253,274 @@ async function baselineFingerprint() {
   return await fingerprintEmbeddingConfig(BASELINE_EMBEDDING_PROFILE);
 }
 
+/**
+ * A second source item with its own revision, text version, processing
+ * generation, document and chunks. A publish touches one processing
+ * generation, so a delta-sized admission needs its own chain rather than more
+ * chunks under the fixture's original one.
+ */
+async function addPublishedGeneration(
+  seeded: Seeded,
+  tag: string,
+  chunkCount: number,
+) {
+  return await seeded.t.run(async (ctx) => {
+    const sourceAccountId = await ctx.db.insert("sourceAccounts", {
+      spaceId: seeded.spaceId,
+      connector: "synthetic",
+      accountId: `capacity-${tag}`,
+      name: `Synthetic source ${tag}`,
+      enabled: true,
+      cursorVersion: 0,
+      freshnessMs: 60_000,
+      createdBy: seeded.userId,
+    });
+    const sourceItemId = await ctx.db.insert("sourceItems", {
+      spaceId: seeded.spaceId,
+      sourceAccountId,
+      externalIdHash: `external-hash-${tag}`,
+      externalId: `external-id-${tag}`,
+      lifecycle: "available",
+      originalLinkAvailable: false,
+      desiredProcessingEpoch: 1,
+    });
+    const sourceRevisionId = await ctx.db.insert("sourceRevisions", {
+      spaceId: seeded.spaceId,
+      sourceItemId,
+      contentHash: `content-hash-${tag}`,
+      byteLength: 12,
+      mediaType: "text/plain",
+      inlineText: "chunk source",
+      capturedAt: 1,
+      userId: seeded.userId,
+    });
+    const sourceTextVersionId = await ctx.db.insert("sourceTextVersions", {
+      spaceId: seeded.spaceId,
+      sourceRevisionId,
+      extractionFingerprint: "extract-v1",
+      text: "chunk source",
+      textHash: `text-hash-${tag}`,
+      byteLength: 12,
+      evidenceSealed: true,
+    });
+    const processingGenerationId = await ctx.db.insert(
+      "processingGenerations",
+      {
+        spaceId: seeded.spaceId,
+        sourceAccountId,
+        sourceItemId,
+        sourceRevisionId,
+        sourceTextVersionId,
+        processingFingerprint: "processing-v1",
+        extractionFingerprint: "extract-v1",
+        extractorFingerprint: "extractor-v1",
+        recordSchemaFingerprint: "schema-v1",
+        normalizationFingerprint: "normalization-v1",
+        chunkerFingerprint: "chunker-v1",
+        correctionRevision: "0",
+        desiredProcessingEpoch: 1,
+        state: "ready",
+        expectedPageCount: 1,
+        expectedEvidenceSpanCount: 0,
+        expectedDocumentCount: 1,
+        expectedChunkCount: chunkCount,
+        actualPageCount: 1,
+        actualEvidenceSpanCount: 0,
+        actualDocumentCount: 1,
+        actualChunkCount: chunkCount,
+        embeddingStatus: "unavailable",
+        activatedAt: 2,
+      },
+    );
+    const documentId = await ctx.db.insert("documents", {
+      spaceId: seeded.spaceId,
+      processingGenerationId,
+      sourceItemId,
+      sourceRevisionId,
+      sourceTextVersionId,
+      documentKey: "main",
+      title: `Synthetic document ${tag}`,
+      docType: "note",
+      capturedAt: 1,
+      evidenceSpanIds: [],
+      publicationState: "active",
+    });
+    await ctx.db.patch(sourceItemId, {
+      desiredRevisionId: sourceRevisionId,
+      activeRevisionId: sourceRevisionId,
+      activeGenerationId: processingGenerationId,
+    });
+    const chunkIds: Id<"chunks">[] = [];
+    for (let index = 0; index < chunkCount; index += 1) {
+      chunkIds.push(
+        await ctx.db.insert("chunks", {
+          spaceId: seeded.spaceId,
+          processingGenerationId,
+          documentId,
+          ordinal: index,
+          text: `${tag} chunk ${index}`,
+          evidenceSpanIds: [],
+          publicationState: "active",
+        }),
+      );
+    }
+    return { sourceItemId, processingGenerationId, documentId, chunkIds };
+  });
+}
+
+/** Puts the space on an active generation so vectors have somewhere to land. */
+async function activateFingerprint(seeded: Seeded, fingerprint: string) {
+  return await seeded.t.run(async (ctx) => {
+    const existing = await ctx.db
+      .query("embeddingProfiles")
+      .withIndex("by_fingerprint", (q) => q.eq("fingerprint", fingerprint))
+      .unique();
+    const profileId =
+      existing?._id ??
+      (await ctx.db.insert("embeddingProfiles", {
+        fingerprint,
+        ...BASELINE_EMBEDDING_PROFILE,
+        createdAt: 1,
+      }));
+    const generationId = await ctx.db.insert("embeddingGenerations", {
+      spaceId: seeded.spaceId,
+      embeddingProfileId: profileId,
+      fingerprint,
+      state: "active" as const,
+      eligibilityEpoch: 0,
+      manifestHash: "synthetic",
+      expectedThoughtCount: 0,
+      expectedChunkCount: 0,
+      completedThoughtCount: 0,
+      completedChunkCount: 0,
+      createdAt: 1,
+      stagedAt: 2,
+      activatedAt: 3,
+    });
+    const state = await ctx.db
+      .query("spaceEmbeddingStates")
+      .withIndex("by_spaceId", (q) => q.eq("spaceId", seeded.spaceId))
+      .unique();
+    await ctx.db.patch(state!._id, {
+      activeEmbeddingGenerationId: generationId,
+      activeFingerprint: fingerprint,
+      activatedAt: 3,
+    });
+    return generationId;
+  });
+}
+
+/** Counts the requests the provider action actually makes. */
+function stubEmbeddingProvider() {
+  const calls = { count: 0, texts: [] as string[] };
+  process.env.OPENAI_API_KEY = "synthetic-openai-key";
+  vi.stubGlobal("fetch", async (input: string | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (!url.includes("/embeddings")) {
+      throw new Error(`Unexpected request to ${url}`);
+    }
+    calls.count += 1;
+    const body: { input?: string } = JSON.parse(String(init?.body ?? "{}"));
+    calls.texts.push(String(body.input ?? ""));
+    return new Response(
+      JSON.stringify({
+        model: BASELINE_EMBEDDING_PROFILE.model,
+        data: [{ embedding: vector }],
+      }),
+      { status: 200 },
+    );
+  });
+  return calls;
+}
+
+/** Marks every eligible target as already covered, as a finished build would. */
+async function markAllCovered(seeded: Seeded, fingerprint: string) {
+  let cursor: string | null = null;
+  const counts = { ...ZERO_KIND_COUNTS };
+  for (;;) {
+    const page: {
+      marked: typeof ZERO_KIND_COUNTS;
+      cursor: string;
+      isDone: boolean;
+    } = await seeded.t.run(async (ctx) => {
+      const result = await ctx.db
+        .query("embeddingTargets")
+        .withIndex("by_space_and_state", (q) =>
+          q.eq("spaceId", seeded.spaceId).eq("state", "eligible"),
+        )
+        .paginate({ cursor, numItems: 1_000 });
+      const marked = { ...ZERO_KIND_COUNTS };
+      for (const row of result.page) {
+        if (row.coveredFingerprint === fingerprint) continue;
+        await ctx.db.patch(row._id, { coveredFingerprint: fingerprint });
+        marked[row.targetKind] += 1;
+      }
+      return { marked, cursor: result.continueCursor, isDone: result.isDone };
+    });
+    counts.thought += page.marked.thought;
+    counts.chunk += page.marked.chunk;
+    counts.card += page.marked.card;
+    cursor = page.cursor;
+    if (page.isDone) break;
+  }
+  await seeded.t.run(async (ctx) => {
+    const state = await ctx.db
+      .query("spaceEmbeddingStates")
+      .withIndex("by_spaceId", (q) => q.eq("spaceId", seeded.spaceId))
+      .unique();
+    await ctx.db.patch(state!._id, {
+      coveredCounts: [{ fingerprint, counts }],
+    });
+  });
+  return counts;
+}
+
+type FillResult = {
+  requested: number;
+  embedded: number;
+  skipped: number;
+  remaining: boolean;
+  scheduled: boolean;
+};
+
+async function runFillPage(seeded: Seeded): Promise<FillResult> {
+  return await seeded.t.action(
+    internal.models.embeddings.fill.runEmbeddingFill,
+    { spaceId: seeded.spaceId },
+  );
+}
+
+/** Runs the provider fill until it owes nothing. */
+async function drainFill(seeded: Seeded, maxPages = 60) {
+  let pages = 0;
+  let embedded = 0;
+  for (;;) {
+    const result = await runFillPage(seeded);
+    if (result.requested === 0) return { pages, embedded };
+    pages += 1;
+    embedded += result.embedded;
+    expect(pages).toBeLessThan(maxPages);
+  }
+}
+
+async function vectorsForChunk(seeded: Seeded, chunkId: Id<"chunks">) {
+  return await seeded.t.run((ctx) =>
+    ctx.db
+      .query("embeddingVectors")
+      .withIndex("by_chunkId", (q) => q.eq("chunkId", chunkId))
+      .collect(),
+  );
+}
+
 describe("embedding target table and resumable builder", () => {
+  const originalOpenAiKey = process.env.OPENAI_API_KEY;
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    if (originalOpenAiKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = originalOpenAiKey;
+  });
+
   test("grows to 5,000 synthetic targets inside per-page budgets", async () => {
     const seeded = await seedSpace();
     const fingerprint = await baselineFingerprint();
@@ -294,7 +565,39 @@ describe("embedding target table and resumable builder", () => {
       { spaceId: seeded.spaceId, fingerprint, maxRows: 1_000, now: 9 },
     );
     expect(bounded.complete).toBe(false);
-  }, 120_000);
+
+    // P2-6c: admitting a document into a covered 5,000-target space costs the
+    // document, not the space. The build above left the counters audited, so
+    // the space is on the per-target write path from here.
+    await markAllCovered(seeded, fingerprint);
+    await activateFingerprint(seeded, fingerprint);
+    const admitted = await addPublishedGeneration(seeded, "delta", 200);
+    const calls = stubEmbeddingProvider();
+    await seeded.t.run(async (ctx) => {
+      await bumpEmbeddingEligibilityEpoch(ctx, seeded.spaceId, {
+        processingGenerationIds: [admitted.processingGenerationId],
+      });
+    });
+    // The eligibility write itself embeds nothing and scans no other target.
+    expect(calls.count).toBe(0);
+    expect((await storedCounters(seeded, fingerprint)).eligible).toEqual({
+      thought: 0,
+      chunk: 5_200,
+      card: 0,
+    });
+
+    const grown = await drainFill(seeded, 20);
+    expect(grown.embedded).toBe(200);
+    expect(calls.count).toBe(200);
+    expect(new Set(calls.texts).size).toBe(200);
+
+    const after = await storedCounters(seeded, fingerprint);
+    const afterRecount = await recount(seeded, fingerprint);
+    expect(after.eligible).toEqual({ thought: 0, chunk: 5_200, card: 0 });
+    expect(after.covered).toEqual({ thought: 0, chunk: 5_200, card: 0 });
+    expect(after.eligible).toEqual(afterRecount.eligible);
+    expect(after.covered).toEqual(afterRecount.covered);
+  }, 180_000);
 
   test("resumes at every page boundary and refuses a stale cursor", async () => {
     const seeded = await seedSpace();
@@ -780,6 +1083,263 @@ describe("embedding target table and resumable builder", () => {
       card: 0,
     });
   });
+
+  test("re-embedding a changed target leaves exactly one vector row (I11)", async () => {
+    const seeded = await seedSpace();
+    const fingerprint = await baselineFingerprint();
+    const published = await addPublishedGeneration(seeded, "i11", 2);
+    const job = await seeded.t.mutation(
+      internal.models.embeddings.migrations.startTargetBackfill,
+      { spaceId: seeded.spaceId, fingerprint, now: 1 },
+    );
+    await drive(seeded, job.jobId!, { batchSize: 8 });
+    await activateFingerprint(seeded, fingerprint);
+
+    const calls = stubEmbeddingProvider();
+    expect((await drainFill(seeded)).embedded).toBe(2);
+    const covered = { thought: 0, chunk: 2, card: 0 };
+    expect((await storedCounters(seeded, fingerprint)).covered).toEqual(
+      covered,
+    );
+
+    const target = published.chunkIds[0]!;
+    for (const revision of [1, 2, 3]) {
+      const text = `i11 chunk 0 revision ${revision}`;
+      await seeded.t.run(async (ctx) => {
+        await ctx.db.patch(target, { text });
+        await bumpEmbeddingEligibilityEpoch(ctx, seeded.spaceId, {
+          processingGenerationIds: [published.processingGenerationId],
+        });
+      });
+      // I7's window: the content changed, the vector has not been replaced yet
+      // and the shortfall is reported rather than hidden.
+      expect((await storedCounters(seeded, fingerprint)).covered).toEqual({
+        thought: 0,
+        chunk: 1,
+        card: 0,
+      });
+
+      await drainFill(seeded);
+      const rows = await vectorsForChunk(seeded, target);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.inputHash).toBe(await sha256Hex(text));
+      expect(rows[0]!.embeddingFingerprint).toBe(fingerprint);
+      // The covered counters net to zero across the delete and the insert.
+      expect((await storedCounters(seeded, fingerprint)).covered).toEqual(
+        covered,
+      );
+    }
+
+    // Two initial targets plus one re-embed per revision, and nothing else.
+    expect(calls.count).toBe(5);
+    expect(
+      await seeded.t.run((ctx) => ctx.db.query("embeddingVectors").collect()),
+    ).toHaveLength(2);
+    expect(
+      await seeded.t.mutation(
+        internal.models.embeddings.migrations.auditSpaceCoverage,
+        { spaceId: seeded.spaceId, fingerprint, now: 5_000 },
+      ),
+    ).toMatchObject({ complete: true, counterDrift: false });
+  }, 60_000);
+
+  test("retiring a document decrements the counters and removes coverage", async () => {
+    const seeded = await seedSpace();
+    const fingerprint = await baselineFingerprint();
+    const published = await addPublishedGeneration(seeded, "retire", 3);
+    const job = await seeded.t.mutation(
+      internal.models.embeddings.migrations.startTargetBackfill,
+      { spaceId: seeded.spaceId, fingerprint, now: 1 },
+    );
+    await drive(seeded, job.jobId!, { batchSize: 8 });
+    await activateFingerprint(seeded, fingerprint);
+    stubEmbeddingProvider();
+    expect((await drainFill(seeded)).embedded).toBe(3);
+    expect(await storedCounters(seeded, fingerprint)).toMatchObject({
+      eligible: { thought: 0, chunk: 3, card: 0 },
+      covered: { thought: 0, chunk: 3, card: 0 },
+    });
+
+    await seeded.t.run(async (ctx) => {
+      await ctx.db.patch(published.sourceItemId, { lifecycle: "forgetting" });
+      await bumpEmbeddingEligibilityEpoch(ctx, seeded.spaceId, {
+        processingGenerationIds: [published.processingGenerationId],
+      });
+    });
+
+    const after = await storedCounters(seeded, fingerprint);
+    expect(after.eligible).toEqual({ thought: 0, chunk: 0, card: 0 });
+    expect(after.covered).toEqual({ thought: 0, chunk: 0, card: 0 });
+    expect(after.eligible).toEqual(
+      (await recount(seeded, fingerprint)).eligible,
+    );
+    expect(
+      await seeded.t.run(async (ctx) =>
+        (
+          await ctx.db
+            .query("embeddingTargets")
+            .withIndex("by_space_kind_target", (q) =>
+              q.eq("spaceId", seeded.spaceId),
+            )
+            .collect()
+        ).map((row) => ({
+          state: row.state,
+          covered: row.coveredFingerprint ?? null,
+        })),
+      ),
+    ).toEqual([
+      { state: "retired", covered: null },
+      { state: "retired", covered: null },
+      { state: "retired", covered: null },
+    ]);
+    // A retired target is owed nothing, so the fill has no work left.
+    expect(await runFillPage(seeded)).toMatchObject({
+      requested: 0,
+      remaining: false,
+    });
+    expect(
+      await seeded.t.mutation(
+        internal.models.embeddings.migrations.auditSpaceCoverage,
+        { spaceId: seeded.spaceId, fingerprint, now: 5_000 },
+      ),
+    ).toMatchObject({ complete: true, counterDrift: false });
+  }, 60_000);
+
+  test("the fill resumes after a lost page and ignores a replayed commit", async () => {
+    const seeded = await seedSpace();
+    const fingerprint = await baselineFingerprint();
+    await addPublishedGeneration(seeded, "resume", 40);
+    const job = await seeded.t.mutation(
+      internal.models.embeddings.migrations.startTargetBackfill,
+      { spaceId: seeded.spaceId, fingerprint, now: 1 },
+    );
+    await drive(seeded, job.jobId!, { batchSize: 16 });
+    await activateFingerprint(seeded, fingerprint);
+    const calls = stubEmbeddingProvider();
+
+    // A page claimed by an action that never committed leaves every target
+    // owed, so the next claim returns the same page.
+    const claimed = await seeded.t.query(
+      internal.models.embeddings.fill.nextEmbeddingFillPage,
+      { spaceId: seeded.spaceId },
+    );
+    expect(claimed.targets).toHaveLength(32);
+    const reclaimed = await seeded.t.query(
+      internal.models.embeddings.fill.nextEmbeddingFillPage,
+      { spaceId: seeded.spaceId },
+    );
+    expect(reclaimed.targets.map((row) => row.targetId)).toEqual(
+      claimed.targets.map((row) => row.targetId),
+    );
+    expect(calls.count).toBe(0);
+
+    const first = await runFillPage(seeded);
+    expect(first).toMatchObject({
+      requested: 32,
+      embedded: 32,
+      skipped: 0,
+      remaining: true,
+    });
+
+    // Replaying that page's commit writes nothing: every target it names is
+    // already covered under this fingerprint.
+    const replay = await seeded.t.mutation(
+      internal.models.embeddings.fill.commitEmbeddingFillPage,
+      {
+        spaceId: seeded.spaceId,
+        fingerprint: claimed.fingerprint!,
+        vectors: claimed.targets.map((row) => ({
+          targetKind: row.targetKind,
+          targetId: row.targetId,
+          inputHash: row.inputHash,
+          vector,
+        })),
+      },
+    );
+    expect(replay).toMatchObject({ embedded: 0, skipped: 32 });
+    expect(
+      await seeded.t.run((ctx) => ctx.db.query("embeddingVectors").collect()),
+    ).toHaveLength(32);
+
+    await drainFill(seeded);
+    expect(calls.count).toBe(40);
+    expect(await storedCounters(seeded, fingerprint)).toMatchObject({
+      eligible: { thought: 0, chunk: 40, card: 0 },
+      covered: { thought: 0, chunk: 40, card: 0 },
+      counterDrift: false,
+    });
+    expect(
+      await seeded.t.mutation(
+        internal.models.embeddings.migrations.auditSpaceCoverage,
+        { spaceId: seeded.spaceId, fingerprint, now: 5_000 },
+      ),
+    ).toMatchObject({ complete: true, counterDrift: false });
+  }, 60_000);
+
+  test("counters stay exact across interleaved thought and chunk writes", async () => {
+    const seeded = await seedSpace();
+    const fingerprint = await baselineFingerprint();
+    const first = await addPublishedGeneration(seeded, "audit-a", 5);
+    const job = await seeded.t.mutation(
+      internal.models.embeddings.migrations.startTargetBackfill,
+      { spaceId: seeded.spaceId, fingerprint, now: 1 },
+    );
+    await drive(seeded, job.jobId!, { batchSize: 8 });
+    await activateFingerprint(seeded, fingerprint);
+
+    const kept = await addThought(seeded, "a counted thought that stays");
+    const retracted = await addThought(seeded, "a counted thought that goes");
+    const second = await addPublishedGeneration(seeded, "audit-b", 4);
+    await seeded.t.run(async (ctx) => {
+      await bumpEmbeddingEligibilityEpoch(ctx, seeded.spaceId, {
+        thoughtIds: [kept],
+      });
+      await bumpEmbeddingEligibilityEpoch(ctx, seeded.spaceId, {
+        processingGenerationIds: [second.processingGenerationId],
+      });
+      await bumpEmbeddingEligibilityEpoch(ctx, seeded.spaceId, {
+        thoughtIds: [retracted],
+      });
+    });
+    expect((await storedCounters(seeded, fingerprint)).eligible).toEqual({
+      thought: 2,
+      chunk: 9,
+      card: 0,
+    });
+
+    await seeded.t.run(async (ctx) => {
+      await ctx.db.patch(retracted, { memoryStatus: "retracted" as const });
+      await bumpEmbeddingEligibilityEpoch(ctx, seeded.spaceId, {
+        thoughtIds: [retracted],
+      });
+      await ctx.db.patch(first.sourceItemId, { lifecycle: "forgetting" });
+      await bumpEmbeddingEligibilityEpoch(ctx, seeded.spaceId, {
+        processingGenerationIds: [first.processingGenerationId],
+      });
+    });
+
+    const stored = await storedCounters(seeded, fingerprint);
+    const recounted = await recount(seeded, fingerprint);
+    expect(stored.eligible).toEqual({ thought: 1, chunk: 4, card: 0 });
+    expect(stored.eligible).toEqual(recounted.eligible);
+    expect(stored.counterDrift).toBe(false);
+    expect(
+      await seeded.t.mutation(
+        internal.models.embeddings.migrations.auditSpaceCoverage,
+        { spaceId: seeded.spaceId, fingerprint, now: 5_000 },
+      ),
+    ).toMatchObject({ complete: true, counterDrift: false });
+
+    // Only the five surviving targets are owed, so only five are embedded.
+    const calls = stubEmbeddingProvider();
+    expect((await drainFill(seeded)).embedded).toBe(5);
+    expect(calls.count).toBe(5);
+    expect((await storedCounters(seeded, fingerprint)).covered).toEqual({
+      thought: 1,
+      chunk: 4,
+      card: 0,
+    });
+  }, 60_000);
 
   test("auto-run schedules one successor at a time until the build is done", async () => {
     const seeded = await seedSpace();

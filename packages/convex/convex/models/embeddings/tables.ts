@@ -25,8 +25,12 @@ export const embeddingTables = {
   embeddingTargets: defineTable(embeddingTargetFields)
     .index("by_space_kind_target", ["spaceId", "targetKind", "targetId"])
     .index("by_space_and_state", ["spaceId", "state"])
-    .index("by_space_and_coveredFingerprint", [
+    // P2-6c pages the owed set from this index: eligible rows with no
+    // coverage marker are exactly the targets the provider fill still owes,
+    // so the fill needs no cursor of its own.
+    .index("by_space_state_and_coveredFingerprint", [
       "spaceId",
+      "state",
       "coveredFingerprint",
     ]),
   embeddingBuildJobs: defineTable(embeddingBuildJobFields)
