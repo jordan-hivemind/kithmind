@@ -1442,16 +1442,28 @@ export class HttpWorkerTransport implements WorkerTransport {
     signal?.addEventListener("abort", abort, { once: true });
     const timeout = setTimeout(abort, this.timeoutMs);
     try {
-      const response = await fetch(this.config.endpoint, {
-        method: "POST",
-        redirect: "error",
-        signal: controller.signal,
-        headers: {
-          "content-type": "application/json",
-          authorization: `Bearer ${this.credential}`,
-        },
-        body: JSON.stringify(request),
-      });
+      // Only a genuine network-layer failure (DNS, connection reset, abort,
+      // timeout) is generic and safe to report as "could not be completed".
+      // Everything after a response arrives has its own specific `failure()`
+      // call below; letting those propagate as-is (instead of funneling them
+      // through the same catch-all) is what makes a shape mismatch or a
+      // parse error diagnosable instead of indistinguishable from a dropped
+      // connection.
+      let response: Response;
+      try {
+        response = await fetch(this.config.endpoint, {
+          method: "POST",
+          redirect: "error",
+          signal: controller.signal,
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${this.credential}`,
+          },
+          body: JSON.stringify(request),
+        });
+      } catch {
+        failure("request could not be completed");
+      }
       const mediaType = response.headers
         .get("content-type")
         ?.split(";", 1)[0]
@@ -1477,12 +1489,9 @@ export class HttpWorkerTransport implements WorkerTransport {
         failure("non-success response omitted a safe error");
       }
       return parsed;
-    } catch {
-      failure("request could not be completed");
     } finally {
       clearTimeout(timeout);
       signal?.removeEventListener("abort", abort);
     }
-    throw new Error("unreachable");
   }
 }
