@@ -1,6 +1,12 @@
 import type { Doc, Id } from "../../_generated/dataModel";
 import type { MutationCtx, QueryCtx } from "../../_generated/server";
 import { sha256Hex } from "../ingestion/hash";
+import {
+  CARD_TARGET_EVENT_KEY,
+  chunkTargetsOptedIn,
+  composeCardTargetInput,
+  spaceEmbedsAllChunks,
+} from "./cardTargets";
 
 /**
  * Durable, resumable target bookkeeping for the embedding index.
@@ -16,6 +22,8 @@ export const EMBEDDING_TARGET_CAPACITY_CEILING = 50_000;
 /** Per-stage page bounds, sized from the plan's read and write budgets. */
 export const EMBEDDING_THOUGHT_SCAN_PAGE = 64;
 export const EMBEDDING_CHUNK_SCAN_PAGE = 128;
+/** Plan section 1.4: a card row is ~2 KiB of text, so 128 per page. */
+export const EMBEDDING_CARD_SCAN_PAGE = 128;
 export const EMBEDDING_TARGET_PAGE = 128;
 
 /** A space row stays small: active plus retired fingerprints, never a history. */
@@ -618,12 +626,16 @@ export async function recordVectorCoverageChange(
 export type EmbeddingEligibilityTouch = {
   thoughtIds?: Id<"thoughts">[];
   processingGenerationIds?: Id<"processingGenerations">[];
+  /** P2-70j: the items whose generic card target this write changed. */
+  sourceItemIds?: Id<"sourceItems">[];
 };
 
 /** A supersede transition carries at most one new and ten previous memories. */
 const MAX_TOUCHED_THOUGHTS = 32;
 /** A publish touches the new generation and the one it replaces. */
 const MAX_TOUCHED_GENERATIONS = 4;
+/** A card publication or a forget touches exactly one item. */
+const MAX_TOUCHED_SOURCE_ITEMS = 4;
 /** Matches the activation chunk bound in the provenance model. */
 const MAX_TOUCHED_GENERATION_CHUNKS = 256;
 
@@ -680,9 +692,53 @@ async function markThoughtTarget(
   await retireEmbeddingTarget(ctx, row, now, delta);
 }
 
+/**
+ * P2-70j: the generic card target of one source item. Its identity is the
+ * card `events` row, which survives re-extraction, so an unchanged card keeps
+ * its vector across card generations (I3). The row carries no
+ * `processingGenerationId` for exactly that reason: a new card generation
+ * over unchanged text must not drop coverage.
+ */
+async function markCardTarget(
+  ctx: MutationCtx,
+  spaceId: Id<"spaces">,
+  sourceItemId: Id<"sourceItems">,
+  now: number,
+  delta: EmbeddingCounterDelta,
+): Promise<void> {
+  const composed = await composeCardTargetInput(ctx, spaceId, sourceItemId);
+  if (composed) {
+    await upsertEligibleTarget(
+      ctx,
+      {
+        spaceId,
+        targetKind: "card",
+        targetId: String(composed.eventId),
+        inputHash: await sha256Hex(composed.text),
+        now,
+      },
+      delta,
+    );
+    return;
+  }
+  // Abandoned, superseded by a generation that is no longer active, or
+  // forgotten. The event id is still the target id, so the row is found
+  // without the card generation that wrote it.
+  const event = await ctx.db
+    .query("events")
+    .withIndex("by_sourceItemId_and_eventKey", (q) =>
+      q.eq("sourceItemId", sourceItemId).eq("eventKey", CARD_TARGET_EVENT_KEY),
+    )
+    .unique();
+  if (!event || event.spaceId !== spaceId) return;
+  const row = await findEmbeddingTarget(ctx, spaceId, "card", String(event._id));
+  if (row) await retireEmbeddingTarget(ctx, row, now, delta);
+}
+
 async function markGenerationChunkTargets(
   ctx: MutationCtx,
   spaceId: Id<"spaces">,
+  state: Doc<"spaceEmbeddingStates">,
   processingGenerationId: Id<"processingGenerations">,
   now: number,
   delta: EmbeddingCounterDelta,
@@ -690,10 +746,17 @@ async function markGenerationChunkTargets(
   const generation = await ctx.db.get(processingGenerationId);
   if (!generation || generation.spaceId !== spaceId) return;
   const item = await ctx.db.get(generation.sourceItemId);
+  // Section 8.2: a chunk is an embedding target only under the opt-in. The
+  // chunk row itself is untouched and stays keyword-indexed either way.
+  const account = item ? await ctx.db.get(item.sourceAccountId) : null;
+  const chunksEligible =
+    spaceEmbedsAllChunks(state) ||
+    (item !== null && chunkTargetsOptedIn(item, account));
   // The same chain `resolveActiveChunkTarget` validates, read once for the
   // whole generation instead of once per chunk, and without its assertions:
   // a generation this write just deactivated is expected to fail these.
   const generationIsLive =
+    chunksEligible &&
     generation.state === "ready" &&
     item !== null &&
     item.spaceId === spaceId &&
@@ -751,6 +814,7 @@ export async function applyEligibilityTouch(
 ): Promise<void> {
   const thoughtIds = [...new Set(touch.thoughtIds ?? [])];
   const generationIds = [...new Set(touch.processingGenerationIds ?? [])];
+  const sourceItemIds = [...new Set(touch.sourceItemIds ?? [])];
   if (thoughtIds.length > MAX_TOUCHED_THOUGHTS) {
     throw new Error("Eligibility write touches too many thoughts");
   }
@@ -759,7 +823,16 @@ export async function applyEligibilityTouch(
       "Eligibility write touches too many processing generations",
     );
   }
-  if (thoughtIds.length === 0 && generationIds.length === 0) return;
+  if (sourceItemIds.length > MAX_TOUCHED_SOURCE_ITEMS) {
+    throw new Error("Eligibility write touches too many source items");
+  }
+  if (
+    thoughtIds.length === 0 &&
+    generationIds.length === 0 &&
+    sourceItemIds.length === 0
+  ) {
+    return;
+  }
   const delta = emptyCounterDelta();
   for (const thoughtId of thoughtIds) {
     await markThoughtTarget(ctx, state.spaceId, thoughtId, now, delta);
@@ -768,10 +841,14 @@ export async function applyEligibilityTouch(
     await markGenerationChunkTargets(
       ctx,
       state.spaceId,
+      state,
       generationId,
       now,
       delta,
     );
+  }
+  for (const sourceItemId of sourceItemIds) {
+    await markCardTarget(ctx, state.spaceId, sourceItemId, now, delta);
   }
   await commitCounterDelta(ctx, state, delta, now);
 }
@@ -831,7 +908,11 @@ export async function resolveActiveChunkTarget(
   spaceId: Id<"spaces">,
   chunk: Doc<"chunks">,
   caches: ChunkTargetCaches,
-): Promise<{ processingGenerationId: Id<"processingGenerations"> } | null> {
+): Promise<{
+  processingGenerationId: Id<"processingGenerations">;
+  /** Section 8.2: whether this chunk's item carries the full-chunk opt-in. */
+  optedIn: boolean;
+} | null> {
   let document = caches.documents.get(chunk.documentId);
   if (document === undefined) {
     document = await ctx.db.get(chunk.documentId);
@@ -905,14 +986,17 @@ export async function resolveActiveChunkTarget(
   if (item.activeRevisionId !== revision._id) {
     throw new Error("Active chunk is not in its source item's active revision");
   }
-  return { processingGenerationId: generation._id };
+  return {
+    processingGenerationId: generation._id,
+    optedIn: chunkTargetsOptedIn(item, account),
+  };
 }
 
 // ---------------------------------------------------------------------------
 // Paged build
 // ---------------------------------------------------------------------------
 
-type ScanStage = "thoughts" | "chunks" | "sweep";
+type ScanStage = "thoughts" | "chunks" | "cards" | "sweep";
 
 type ScanCursor = { stage: ScanStage; cursor: string | null };
 
@@ -928,6 +1012,7 @@ function decodeScanCursor(value: string | null): ScanCursor {
     parsed.length !== 2 ||
     (parsed[0] !== "thoughts" &&
       parsed[0] !== "chunks" &&
+      parsed[0] !== "cards" &&
       parsed[0] !== "sweep")
   ) {
     throw new Error("Embedding build cursor is malformed");
@@ -1057,6 +1142,7 @@ async function runScanPage(
         numItems: Math.min(batchSize, EMBEDDING_CHUNK_SCAN_PAGE),
       });
     const caches = newChunkTargetCaches();
+    const embedsAllChunks = spaceEmbedsAllChunks(state);
     for (const chunk of page.page) {
       const resolved = await resolveActiveChunkTarget(
         ctx,
@@ -1065,6 +1151,10 @@ async function runScanPage(
         caches,
       );
       if (!resolved) continue;
+      // Section 8.2. An ineligible chunk is simply not upserted; the sweep
+      // stage retires whatever row it used to have, so a policy flip
+      // converges in one rerun of the same build.
+      if (!embedsAllChunks && !resolved.optedIn) continue;
       scanned += 1;
       await upsertEligibleTarget(
         ctx,
@@ -1080,8 +1170,43 @@ async function runScanPage(
       );
     }
     next = page.isDone
-      ? { stage: "sweep", cursor: null }
+      ? { stage: "cards", cursor: null }
       : { stage: "chunks", cursor: page.continueCursor };
+  } else if (position.stage === "cards") {
+    // One target per generic card event. The event is the stable identity, so
+    // this page never depends on which card generation published it.
+    const page = await ctx.db
+      .query("events")
+      .withIndex("by_spaceId", (q) => q.eq("spaceId", job.spaceId))
+      .paginate({
+        cursor: position.cursor,
+        numItems: Math.min(batchSize, EMBEDDING_CARD_SCAN_PAGE),
+      });
+    for (const event of page.page) {
+      if (event.eventKey !== CARD_TARGET_EVENT_KEY) continue;
+      const composed = await composeCardTargetInput(
+        ctx,
+        job.spaceId,
+        event.sourceItemId,
+        event,
+      );
+      if (!composed) continue;
+      scanned += 1;
+      await upsertEligibleTarget(
+        ctx,
+        {
+          spaceId: job.spaceId,
+          targetKind: "card",
+          targetId: String(event._id),
+          inputHash: await sha256Hex(composed.text),
+          now,
+        },
+        delta,
+      );
+    }
+    next = page.isDone
+      ? { stage: "sweep", cursor: null }
+      : { stage: "cards", cursor: page.continueCursor };
   } else {
     // Anything still eligible that this run never touched is gone from the
     // live set; retiring it is what makes a rerun converge.

@@ -30,6 +30,11 @@ export const sourceAccountFields = {
    * architecture forbids.
    */
   subjectEntityId: v.optional(v.id("entities")),
+  /**
+   * Section 8.2: the per-source full-chunk rule. It is the default for every
+   * item of this account; an item's own `embedFullChunks` overrides it.
+   */
+  embedFullChunks: v.optional(v.boolean()),
   createdBy: v.id("users"),
 };
 

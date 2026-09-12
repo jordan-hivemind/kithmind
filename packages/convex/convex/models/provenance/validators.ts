@@ -133,6 +133,15 @@ export const sourceItemFields = {
    * publishing a card never changes a chunk id or an embedding target.
    */
   activeCardGenerationId: v.optional(v.id("processingGenerations")),
+  /**
+   * Section 8.2 of the document-card plan: the full-chunk opt-in. Absent
+   * falls back to the source account's rule, and absent there is off, so a
+   * document admitted without an opt-in produces card targets only. It lives
+   * on the item rather than on `documents` because a document row is
+   * recreated by every processing generation and the opt-in must survive
+   * re-extraction.
+   */
+  embedFullChunks: v.optional(v.boolean()),
   lastFailure: v.optional(provenanceFailureValidator),
   forgottenAt: v.optional(v.number()),
   forgottenBy: v.optional(v.id("users")),

@@ -501,15 +501,30 @@ its own subject, and it is optional so a flat document costs one target.
 
 ### 8.2 Full-chunk opt-in
 
-`documents.embedFullChunks`, a boolean set at admission from a per-source
-configuration rule and overridable per document by an authorized operator.
-Prose documents that reward passage retrieval set it. Forms, statements and
-tables do not.
+A boolean set from a per-source configuration rule and overridable per
+document by an authorized operator. Prose documents that reward passage
+retrieval set it. Forms, statements and tables do not.
 
 The 9 documents in the frozen retrieval pilot corpus are grandfathered with
 the opt-in set, so their 163 chunk vectors remain eligible and the frozen
 scorer's corpus is unchanged. This is required, not a convenience: see
 section 9.
+
+#### As implemented in P2-70j
+
+| Item                | Plan said              | Implementation                                                                                                        |
+| ------------------- | ---------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| Where the flag lives | `documents`           | `sourceItems.embedFullChunks`, with `sourceAccounts.embedFullChunks` as the per-source rule the item overrides.       |
+| Why                 | -                      | A `documents` row is recreated by every processing generation, so an opt-in stored there would be lost on re-extraction. |
+| Deploy safety       | Not stated             | `spaceEmbeddingStates.targetPolicy`, absent meaning `all_chunks`. Eligibility is unchanged until an operator flips it. |
+| Card target id      | Not stated             | The generic card's `events` row, not the card generation, so re-extraction over unchanged fields reuses the vector.   |
+| Heading digest      | One target per document with two or more headings | Not implemented. No stage of the pipeline extracts section headings today, so there is nothing to compose a digest from. It stays a plan item. |
+
+The grandfathering migration is
+`models/embeddings/migrations:setChunkEmbeddingOptIn`, which names source items
+and writes the field. The pilot corpus is identified by that field afterwards,
+never by an id list in code. `setSpaceTargetPolicy` is the flip, and it runs
+only after the frozen scorer has been rerun on the grandfathered corpus.
 
 ### 8.3 Why this improves retrieval, not only capacity
 
@@ -670,6 +685,23 @@ runner that returns a canned payload. No test calls a model.
 | Target count               | Publish a synthetic document with 12 chunks                                                                                                                | One or two targets appear. With the opt-in set, 13 or 14 appear.                                                                  |
 | Frozen scorer              | The pilot corpus with its opt-in grandfathered                                                                                                             | The score does not move.                                                                                                          |
 | Card recall                | A synthetic card corpus of at least 200 documents with distinct summaries, queried by a paraphrase of each summary that shares no distinctive term with it | The card's own document appears in the top five for at least 80% of the queries. The rate is recorded, not only the pass.         |
+
+P2-70j implemented the card recall test as `scripts/measure-card-recall.mjs`
+with `scripts/measure-card-recall.test.mjs`. One generated corpus of 200
+documents and one scorer serve two embedders:
+
+| Embedder             | What it measures                                                                  | Recorded rate at five |
+| -------------------- | --------------------------------------------------------------------------------- | --------------------- |
+| Deterministic (unit test) | The ranking path: one target per document, a contested top five, containment  | 0.92, MRR 0.728       |
+| `--embedder=openai`  | Meaning. The number this plan's question actually asks for.                        | Unmeasured            |
+
+The deterministic embedder reads each document's identity and its subject,
+never its words, because a paraphrase that shares no distinctive term with its
+summary is exactly what a term-based embedder cannot resolve. It is calibrated
+so a broken ranking path fails it rather than passing by construction. The
+meaning number requires a provider key and
+`node scripts/measure-card-recall.mjs --embedder=openai`; until that has run,
+no claim about recall on meaning is made.
 
 Acceptance for the plan as a whole: the four question shapes in the Purpose
 section are answered from synthetic cards, with citations, while the worker and

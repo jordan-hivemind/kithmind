@@ -1643,11 +1643,14 @@ export async function beginForgetFromWeb(
   });
   await advanceSourceAssessmentEpoch(ctx, account._id);
   // Forgetting makes the item's active generation ineligible at once; its
-  // vectors are removed later by the paged purge.
+  // vectors are removed later by the paged purge. The card target is retired
+  // by the same write: forgetting clears `activeCardGenerationId`, so the
+  // item's card recomposes to nothing.
   await bumpEmbeddingEligibilityEpoch(ctx, item.spaceId, {
     processingGenerationIds: item.activeGenerationId
       ? [item.activeGenerationId]
       : [],
+    sourceItemIds: [item._id],
   });
   return { lifecycle: "forgetting" as const, desiredProcessingEpoch };
 }

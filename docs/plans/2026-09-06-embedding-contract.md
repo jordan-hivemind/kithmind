@@ -186,8 +186,29 @@ vector generation while retaining vectors in retired profile generations.
 
 Historical thoughts and source revisions remain available through explicit
 historical keyword reads. The canonical semantic manifest includes current
-thoughts and active source chunks. Semantic availability is not a claim that
-historical records were searched by vectors or that event coverage is complete.
+thoughts, accepted document cards, and the chunks of documents that carry the
+full-chunk opt-in. Semantic availability is not a claim that historical records
+were searched by vectors or that event coverage is complete.
+
+P2-70j changed that paragraph. A chunk is no longer an embedding target
+because it exists; it is one only when its source item carries
+`embedFullChunks`, or its source account sets the rule and the item does not
+override it, and only in a space whose `targetPolicy` is
+`cards_and_opted_in_chunks`. Absent, the policy is `all_chunks` and every
+active chunk is eligible as before, which is what lets the code deploy ahead of
+the grandfathering migration. Retention is unchanged: a chunk stays retained
+and keyword-indexed whatever its embedding eligibility, so the opt-in narrows
+the vector index and never the evidence.
+
+A card target is one per document. Its identity is the generic card's `events`
+row, not the card generation that published it, so re-extraction over unchanged
+accepted fields keeps the target and its vector. Its embedded text is the
+composition of section 8.1 of the
+[document-card plan](./2026-09-12-document-cards.md): `card_kind`,
+`card_title`, `card_date`, the `card_party` values and `card_summary`, in that
+order. A card whose generation is abandoned or superseded without a live
+replacement retires its target, and hydration recomposes the card and compares
+the hash before returning a candidate.
 
 Operator-only Convex functions live under `models/embeddings/operator`:
 

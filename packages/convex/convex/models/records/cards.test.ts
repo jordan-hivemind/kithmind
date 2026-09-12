@@ -12,7 +12,19 @@ import {
   stagePages,
 } from "../provenance/model";
 
+import { sha256Hex } from "../ingestion/hash";
+import { composeCardTargetInput } from "../embeddings/cardTargets";
 import { publishDocumentCard, type CardFieldInput } from "./cards";
+import {
+  insertCardEmbedding,
+  markEligibilityTargets,
+  resolveAuthorizedCardVectorCandidates,
+} from "../embeddings/model";
+import {
+  BASELINE_EMBEDDING_DIMENSIONS,
+  fingerprintEmbeddingConfig,
+} from "../../lib/embeddingProvider";
+import { BASELINE_EMBEDDING_PROFILE } from "../embeddings/migrations";
 import { stageRecordBatch } from "./model";
 import { executeRecordQuery } from "./query";
 
@@ -902,5 +914,435 @@ describe("document cards", () => {
       "spaceId",
       "step",
     ]);
+  });
+});
+
+/**
+ * P2-6ab seeds the counters; a space that has never run the backfill keeps
+ * the legacy derive, so a card target only appears on a counted space.
+ */
+async function enableTargetCounters(seeded: Awaited<ReturnType<typeof seedDocument>>) {
+  await seeded.t.run(async (ctx) => {
+    const existing = await ctx.db
+      .query("spaceEmbeddingStates")
+      .withIndex("by_spaceId", (q) => q.eq("spaceId", seeded.spaceId))
+      .unique();
+    const fields = {
+      eligibleCounts: { thought: 0, chunk: 0, card: 0 },
+      counterDrift: false,
+      lastAuditAt: 1,
+      targetPolicy: "cards_and_opted_in_chunks" as const,
+    };
+    if (existing) {
+      await ctx.db.patch(existing._id, fields);
+      return;
+    }
+    await ctx.db.insert("spaceEmbeddingStates", {
+      spaceId: seeded.spaceId,
+      eligibilityEpoch: 1,
+      ...fields,
+    });
+  });
+}
+
+async function cardTargets(seeded: Awaited<ReturnType<typeof seedDocument>>) {
+  return await seeded.t.run(async (ctx) => {
+    const rows = await ctx.db
+      .query("embeddingTargets")
+      .withIndex("by_space_kind_target", (q) =>
+        q.eq("spaceId", seeded.spaceId).eq("targetKind", "card"),
+      )
+      .collect();
+    const state = await ctx.db
+      .query("spaceEmbeddingStates")
+      .withIndex("by_spaceId", (q) => q.eq("spaceId", seeded.spaceId))
+      .unique();
+    return { rows, eligibleCounts: state?.eligibleCounts };
+  });
+}
+
+describe("card embedding targets", () => {
+  test("activation creates one card target and a supersession keeps its vector", async () => {
+    const seeded = await seedDocument({ withSubjectEntity: true });
+    await enableTargetCounters(seeded);
+
+    const first = await seeded.t.run((ctx) =>
+      publishDocumentCard(ctx, {
+        spaceId: seeded.spaceId,
+        sourceItemId: seeded.sourceItemId,
+        userId: seeded.userId,
+        recordKind: "document_card",
+        now: 1_000,
+        fingerprint: FINGERPRINT,
+        anchorEvidenceSpanIds: [seeded.evidence[TITLE]!],
+        fields: genericFields(seeded.evidence),
+      }),
+    );
+    expect(first.published).toBe(true);
+
+    const afterFirst = await cardTargets(seeded);
+    // Exactly one target per document, keyed by the card event.
+    expect(afterFirst.rows).toHaveLength(1);
+    expect(afterFirst.rows[0]!.targetId).toBe(String(first.eventId));
+    expect(afterFirst.rows[0]!.state).toBe("eligible");
+    // The row carries no processing generation: that is what lets a new card
+    // generation over unchanged text keep the vector (I3).
+    expect(afterFirst.rows[0]!.processingGenerationId).toBeUndefined();
+    expect(afterFirst.eligibleCounts).toEqual({
+      thought: 0,
+      chunk: 0,
+      card: 1,
+    });
+    // The composed input is the plan's section 8.1 field list, in order.
+    const composed = await seeded.t.run((ctx) =>
+      composeCardTargetInput(ctx, seeded.spaceId, seeded.sourceItemId),
+    );
+    expect(composed!.text).toBe(
+      [
+        `Kind: ${CARD_KIND}`,
+        `Title: ${TITLE}`,
+        `Date: ${DATE}`,
+        `Parties: ${PARTY_ONE}, ${PARTY_TWO}`,
+        `Summary: ${SUMMARY}`,
+      ].join("\n"),
+    );
+    expect(composed!.summary).toBe(SUMMARY);
+    expect(afterFirst.rows[0]!.inputHash).toBe(await sha256Hex(composed!.text));
+
+    // A tier change supersedes the card generation. Same text, same card
+    // event, so the same target row with the same hash survives.
+    const second = await seeded.t.run((ctx) =>
+      publishDocumentCard(ctx, {
+        spaceId: seeded.spaceId,
+        sourceItemId: seeded.sourceItemId,
+        userId: seeded.userId,
+        recordKind: "document_card",
+        now: 1_200,
+        fingerprint: { ...FINGERPRINT, tier: "tier1" },
+        anchorEvidenceSpanIds: [seeded.evidence[TITLE]!],
+        fields: genericFields(seeded.evidence),
+      }),
+    );
+    expect(second.published).toBe(true);
+    const afterSecond = await cardTargets(seeded);
+    expect(afterSecond.rows).toHaveLength(1);
+    expect(afterSecond.rows[0]!._id).toBe(afterFirst.rows[0]!._id);
+    expect(afterSecond.rows[0]!.inputHash).toBe(afterFirst.rows[0]!.inputHash);
+    expect(afterSecond.eligibleCounts).toEqual({
+      thought: 0,
+      chunk: 0,
+      card: 1,
+    });
+  });
+
+  test("a changed summary moves the hash and drops the coverage marker", async () => {
+    const seeded = await seedDocument({ withSubjectEntity: true });
+    await enableTargetCounters(seeded);
+    await seeded.t.run((ctx) =>
+      publishDocumentCard(ctx, {
+        spaceId: seeded.spaceId,
+        sourceItemId: seeded.sourceItemId,
+        userId: seeded.userId,
+        recordKind: "document_card",
+        now: 1_000,
+        fingerprint: FINGERPRINT,
+        anchorEvidenceSpanIds: [seeded.evidence[TITLE]!],
+        fields: genericFields(seeded.evidence),
+      }),
+    );
+    const before = await cardTargets(seeded);
+    await seeded.t.run((ctx) =>
+      ctx.db.patch(before.rows[0]!._id, {
+        coveredFingerprint: "synthetic-fingerprint",
+      }),
+    );
+    await seeded.t.run(async (ctx) => {
+      const state = await ctx.db
+        .query("spaceEmbeddingStates")
+        .withIndex("by_spaceId", (q) => q.eq("spaceId", seeded.spaceId))
+        .unique();
+      await ctx.db.patch(state!._id, {
+        coveredCounts: [
+          {
+            fingerprint: "synthetic-fingerprint",
+            counts: { thought: 0, chunk: 0, card: 1 },
+          },
+        ],
+      });
+    });
+
+    // Republishing without the summary changes the composed input.
+    const changed = await seeded.t.run((ctx) =>
+      publishDocumentCard(ctx, {
+        spaceId: seeded.spaceId,
+        sourceItemId: seeded.sourceItemId,
+        userId: seeded.userId,
+        recordKind: "document_card",
+        now: 1_400,
+        fingerprint: { ...FINGERPRINT, tier: "tier1" },
+        anchorEvidenceSpanIds: [seeded.evidence[TITLE]!],
+        fields: genericFields(seeded.evidence).filter(
+          (field) => field.field !== "card_summary",
+        ),
+      }),
+    );
+    expect(changed.published).toBe(true);
+    const after = await cardTargets(seeded);
+    expect(after.rows).toHaveLength(1);
+    expect(after.rows[0]!.inputHash).not.toBe(before.rows[0]!.inputHash);
+    expect(after.rows[0]!.coveredFingerprint).toBeUndefined();
+    expect(after.eligibleCounts).toEqual({ thought: 0, chunk: 0, card: 1 });
+  });
+
+  test("hydration drops a card vector whose card generation has moved on (I7)", async () => {
+    const seeded = await seedDocument({ withSubjectEntity: true });
+    await enableTargetCounters(seeded);
+    const published = await seeded.t.run((ctx) =>
+      publishDocumentCard(ctx, {
+        spaceId: seeded.spaceId,
+        sourceItemId: seeded.sourceItemId,
+        userId: seeded.userId,
+        recordKind: "document_card",
+        now: 1_000,
+        fingerprint: FINGERPRINT,
+        anchorEvidenceSpanIds: [seeded.evidence[TITLE]!],
+        fields: genericFields(seeded.evidence),
+      }),
+    );
+    const fingerprint = await fingerprintEmbeddingConfig(
+      BASELINE_EMBEDDING_PROFILE,
+    );
+    const vector = Array.from(
+      { length: BASELINE_EMBEDDING_DIMENSIONS },
+      (_, index) => (index % 5) + 1,
+    );
+    const { vectorId, principal } = await seeded.t.run(async (ctx) => {
+      const profileId = await ctx.db.insert("embeddingProfiles", {
+        fingerprint,
+        ...BASELINE_EMBEDDING_PROFILE,
+        createdAt: 1,
+      });
+      const generationId = await ctx.db.insert("embeddingGenerations", {
+        spaceId: seeded.spaceId,
+        embeddingProfileId: profileId,
+        fingerprint,
+        state: "active",
+        eligibilityEpoch: 1,
+        manifestHash: "synthetic-manifest",
+        expectedThoughtCount: 0,
+        expectedChunkCount: 0,
+        completedThoughtCount: 0,
+        completedChunkCount: 0,
+        createdAt: 1,
+        activatedAt: 2,
+      });
+      const state = await ctx.db
+        .query("spaceEmbeddingStates")
+        .withIndex("by_spaceId", (q) => q.eq("spaceId", seeded.spaceId))
+        .unique();
+      await ctx.db.patch(state!._id, {
+        activeEmbeddingGenerationId: generationId,
+        activeFingerprint: fingerprint,
+        activatedAt: 2,
+      });
+      const composed = await composeCardTargetInput(
+        ctx,
+        seeded.spaceId,
+        seeded.sourceItemId,
+      );
+      const id = await insertCardEmbedding(ctx, {
+        spaceId: seeded.spaceId,
+        eventId: published.eventId!,
+        embeddingGenerationId: generationId,
+        fingerprint,
+        inputText: composed!.text,
+        vector,
+        bumpEligibility: false,
+      });
+      return {
+        vectorId: id,
+        principal: { userId: seeded.userId },
+      };
+    });
+
+    const hits = await seeded.t.run((ctx) =>
+      resolveAuthorizedCardVectorCandidates(ctx, {
+        principal,
+        targets: [{ spaceId: seeded.spaceId, fingerprint }],
+        embeddingVectorIds: [vectorId],
+      }),
+    );
+    expect(hits).toHaveLength(1);
+    expect(hits[0]).toMatchObject({
+      eventId: published.eventId,
+      spaceId: seeded.spaceId,
+      summary: SUMMARY,
+      documentIds: [seeded.documentId],
+    });
+
+    // A new card generation with a different summary moves the composed hash.
+    // The stored vector now describes text the card no longer has, so I7
+    // drops it rather than returning it.
+    const restated = await seeded.t.run((ctx) =>
+      publishDocumentCard(ctx, {
+        spaceId: seeded.spaceId,
+        sourceItemId: seeded.sourceItemId,
+        userId: seeded.userId,
+        recordKind: "document_card",
+        now: 1_500,
+        fingerprint: { ...FINGERPRINT, tier: "tier1" },
+        anchorEvidenceSpanIds: [seeded.evidence[TITLE]!],
+        fields: genericFields(seeded.evidence).filter(
+          (field) => field.field !== "card_summary",
+        ),
+      }),
+    );
+    expect(restated.published).toBe(true);
+    expect(
+      await seeded.t.run((ctx) =>
+        resolveAuthorizedCardVectorCandidates(ctx, {
+          principal,
+          targets: [{ spaceId: seeded.spaceId, fingerprint }],
+          embeddingVectorIds: [vectorId],
+        }),
+      ),
+    ).toHaveLength(0);
+  });
+
+  test("a card candidate from an unauthorized space is never returned", async () => {
+    const seeded = await seedDocument({ withSubjectEntity: true });
+    await enableTargetCounters(seeded);
+    const published = await seeded.t.run((ctx) =>
+      publishDocumentCard(ctx, {
+        spaceId: seeded.spaceId,
+        sourceItemId: seeded.sourceItemId,
+        userId: seeded.userId,
+        recordKind: "document_card",
+        now: 1_000,
+        fingerprint: FINGERPRINT,
+        anchorEvidenceSpanIds: [seeded.evidence[TITLE]!],
+        fields: genericFields(seeded.evidence),
+      }),
+    );
+    const fingerprint = await fingerprintEmbeddingConfig(
+      BASELINE_EMBEDDING_PROFILE,
+    );
+    const vector = Array.from(
+      { length: BASELINE_EMBEDDING_DIMENSIONS },
+      (_, index) => (index % 5) + 1,
+    );
+    const { vectorId, outsiderId } = await seeded.t.run(async (ctx) => {
+      const profileId = await ctx.db.insert("embeddingProfiles", {
+        fingerprint,
+        ...BASELINE_EMBEDDING_PROFILE,
+        createdAt: 1,
+      });
+      const generationId = await ctx.db.insert("embeddingGenerations", {
+        spaceId: seeded.spaceId,
+        embeddingProfileId: profileId,
+        fingerprint,
+        state: "active",
+        eligibilityEpoch: 1,
+        manifestHash: "synthetic-manifest",
+        expectedThoughtCount: 0,
+        expectedChunkCount: 0,
+        completedThoughtCount: 0,
+        completedChunkCount: 0,
+        createdAt: 1,
+        activatedAt: 2,
+      });
+      const state = await ctx.db
+        .query("spaceEmbeddingStates")
+        .withIndex("by_spaceId", (q) => q.eq("spaceId", seeded.spaceId))
+        .unique();
+      await ctx.db.patch(state!._id, {
+        activeEmbeddingGenerationId: generationId,
+        activeFingerprint: fingerprint,
+        activatedAt: 2,
+      });
+      const composed = await composeCardTargetInput(
+        ctx,
+        seeded.spaceId,
+        seeded.sourceItemId,
+      );
+      const id = await insertCardEmbedding(ctx, {
+        spaceId: seeded.spaceId,
+        eventId: published.eventId!,
+        embeddingGenerationId: generationId,
+        fingerprint,
+        inputText: composed!.text,
+        vector,
+        bumpEligibility: false,
+      });
+      const outsider = await ctx.db.insert("users", { name: "Outsider" });
+      return { vectorId: id, outsiderId: outsider };
+    });
+
+    // Space isolation fails closed: an unauthorized principal never reaches
+    // the card row, and the read is refused rather than silently emptied.
+    await expect(
+      seeded.t.run((ctx) =>
+        resolveAuthorizedCardVectorCandidates(ctx, {
+          principal: { userId: outsiderId },
+          targets: [{ spaceId: seeded.spaceId, fingerprint }],
+          embeddingVectorIds: [vectorId],
+        }),
+      ),
+    ).rejects.toThrow();
+
+    // And a card row that does reach hydration under a principal with no
+    // authorized target is dropped, not returned.
+    expect(
+      await seeded.t.run((ctx) =>
+        resolveAuthorizedCardVectorCandidates(ctx, {
+          principal: { userId: outsiderId },
+          targets: [],
+          embeddingVectorIds: [vectorId],
+        }),
+      ),
+    ).toHaveLength(0);
+  });
+
+  test("abandoning the card generation retires the card target", async () => {
+    const seeded = await seedDocument({ withSubjectEntity: true });
+    await enableTargetCounters(seeded);
+    const published = await seeded.t.run((ctx) =>
+      publishDocumentCard(ctx, {
+        spaceId: seeded.spaceId,
+        sourceItemId: seeded.sourceItemId,
+        userId: seeded.userId,
+        recordKind: "document_card",
+        now: 1_000,
+        fingerprint: FINGERPRINT,
+        anchorEvidenceSpanIds: [seeded.evidence[TITLE]!],
+        fields: genericFields(seeded.evidence),
+      }),
+    );
+    expect(published.published).toBe(true);
+    expect((await cardTargets(seeded)).eligibleCounts).toEqual({
+      thought: 0,
+      chunk: 0,
+      card: 1,
+    });
+
+    // An operator or a failure abandons the generation. The next eligibility
+    // write finds no live card and retires the target.
+    await seeded.t.run(async (ctx) => {
+      await ctx.db.patch(seeded.sourceItemId, {
+        activeCardGenerationId: undefined,
+      });
+      await markEligibilityTargets(ctx, seeded.spaceId, {
+        sourceItemIds: [seeded.sourceItemId],
+      });
+    });
+    const after = await cardTargets(seeded);
+    expect(after.rows).toHaveLength(1);
+    expect(after.rows[0]!.state).toBe("retired");
+    expect(after.eligibleCounts).toEqual({ thought: 0, chunk: 0, card: 0 });
+    expect(
+      await seeded.t.run((ctx) =>
+        composeCardTargetInput(ctx, seeded.spaceId, seeded.sourceItemId),
+      ),
+    ).toBeNull();
   });
 });

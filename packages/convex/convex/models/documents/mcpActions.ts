@@ -12,6 +12,9 @@ import type { ActiveEmbeddingTarget } from "../embeddings/model";
 import { embeddingVectorScopeV2 } from "../embeddings/targets";
 import { documentSearchArgs } from "./validators";
 
+/** The plan's fixed candidate budget, split across spaces and target kinds. */
+const MAX_SEMANTIC_CANDIDATES = 32;
+
 // Explicit boundary avoids a generated action/query return inference cycle.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const internal = _internal as any;
@@ -56,31 +59,39 @@ export const search = action({
           );
           for (const [index, target] of ordered.entries()) {
             const limit =
-              Math.floor(32 / ordered.length) +
-              (index < 32 % ordered.length ? 1 : 0);
-            const rows = await ctx.vectorSearch(
-              "embeddingVectors",
-              "by_embedding_1536",
-              {
-                vector: embedding.vector,
-                limit,
-                filter: (q) =>
-                  q.eq(
-                    "scopeV2",
-                    embeddingVectorScopeV2({
-                      spaceId: target.spaceId,
-                      fingerprint,
-                      targetKind: "chunk",
-                    }),
-                  ),
-              },
-            );
-            hits.push(...rows);
+              Math.floor(MAX_SEMANTIC_CANDIDATES / ordered.length) +
+              (index < MAX_SEMANTIC_CANDIDATES % ordered.length ? 1 : 0);
+            // P2-70j: card targets are candidates alongside chunk targets
+            // under the same scopeV2 scheme. Each kind asks for the space's
+            // full share and the merge below keeps the global top 32, so a
+            // space with no card targets loses none of its chunk budget.
+            for (const targetKind of ["chunk", "card"] as const) {
+              const rows = await ctx.vectorSearch(
+                "embeddingVectors",
+                "by_embedding_1536",
+                {
+                  vector: embedding.vector,
+                  limit,
+                  filter: (q) =>
+                    q.eq(
+                      "scopeV2",
+                      embeddingVectorScopeV2({
+                        spaceId: target.spaceId,
+                        fingerprint,
+                        targetKind,
+                      }),
+                    ),
+                },
+              );
+              hits.push(...rows);
+            }
           }
           hits.sort(
             (a, b) => b._score - a._score || a._id.localeCompare(b._id),
           );
-          embeddingVectorIds = hits.map((hit) => hit._id);
+          embeddingVectorIds = hits
+            .slice(0, MAX_SEMANTIC_CANDIDATES)
+            .map((hit) => hit._id);
           targets = active;
         }
       } catch {

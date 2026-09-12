@@ -6,9 +6,10 @@ import { getAuthorizedReadSpaceIds } from "../../lib/spaces";
 import { principalRefValidator } from "../apiKeys/validators";
 import {
   getActiveEmbeddingTarget,
+  resolveAuthorizedCardVectorCandidates,
   resolveAuthorizedChunkVectorCandidates,
 } from "../embeddings/model";
-import { searchDocuments } from "./model";
+import { searchDocuments, type CardSearchHit } from "./model";
 import { documentSearchArgs } from "./validators";
 
 export const searchWithCandidates = internalQuery({
@@ -42,6 +43,7 @@ export const searchWithCandidates = internalQuery({
     const targetSpaces = new Set(args.targets.map((target) => target.spaceId));
     ready &&= targetSpaces.size === spaceIds.length;
     let chunkIds: Id<"chunks">[] = [];
+    let cardHits: CardSearchHit[] = [];
     // D3 B and I10: chunk coverage is a ratio the answer reports, not a gate.
     let coverageIncomplete = false;
     try {
@@ -73,12 +75,33 @@ export const searchWithCandidates = internalQuery({
           })
         : [];
       chunkIds = candidates.map((candidate) => candidate.chunkId);
+      // P2-70j: a card candidate is a document-level hit. Hydration rechecks
+      // it against the live card generation (I7) before it reaches ranking.
+      cardHits = ready
+        ? (
+            await resolveAuthorizedCardVectorCandidates(ctx, {
+              principal: args.principal,
+              targets: args.targets,
+              embeddingVectorIds: args.embeddingVectorIds,
+            })
+          ).flatMap((candidate) =>
+            candidate.documentIds.map((documentId) => ({
+              eventId: candidate.eventId,
+              spaceId: candidate.spaceId,
+              documentId,
+              cardGenerationId: candidate.cardGenerationId,
+              summary: candidate.summary,
+              evidenceSpanIds: candidate.evidenceSpanIds,
+            })),
+          )
+        : [];
     } catch {
       // A corrupt or changed vector profile does not hide keyword evidence.
       ready = false;
     }
     return await searchDocuments(ctx, spaceIds, args, {
       chunkIds,
+      cardHits,
       vectorStatus: ready ? "ready" : "unavailable",
       coverageIncomplete: ready && coverageIncomplete,
     });

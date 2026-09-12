@@ -464,6 +464,138 @@ describe("document reads", () => {
     ]);
   });
 
+  test("a card candidate is a document-level hit carrying the card's summary and citations", async () => {
+    const t = convexTest(schema, modules);
+    const seeded = await seedIdentity(t);
+    const source = {
+      spaceId: seeded.spaceId,
+      sourceAccountId: seeded.sourceAccountId,
+      userId: seeded.userId,
+    };
+    const keywordHit = await seedDocument(t, {
+      ...source,
+      suffix: "keyword",
+      text: "needle supporting evidence",
+    });
+    // The card's document shares no keyword with the query, which is the
+    // fifth question shape: find the document without recalling its words.
+    const carded = await seedDocument(t, {
+      ...source,
+      suffix: "carded",
+      text: "unrelated retained prose",
+    });
+    const cardGenerationId = await t.run((ctx) =>
+      ctx.db.insert("processingGenerations", {
+        spaceId: seeded.spaceId,
+        sourceAccountId: seeded.sourceAccountId,
+        sourceItemId: carded.itemId,
+        sourceRevisionId: carded.revisionId,
+        sourceTextVersionId: carded.textVersionId,
+        processingFingerprint: "card-processing",
+        extractionFingerprint: "extract-carded",
+        extractorFingerprint: "extractor-1",
+        recordSchemaFingerprint: "card-records-1",
+        normalizationFingerprint: "normalize-1",
+        chunkerFingerprint: "chunker-1",
+        correctionRevision: "0",
+        desiredProcessingEpoch: 1,
+        cardGeneration: true,
+        state: "ready",
+        expectedPageCount: 0,
+        expectedEvidenceSpanCount: 0,
+        expectedDocumentCount: 0,
+        expectedChunkCount: 0,
+        expectedEventCount: 1,
+        expectedObservationCount: 1,
+        embeddingStatus: "unavailable",
+        activatedAt: 1_700_000_000_400,
+      }),
+    );
+    const args = { query: "needle" };
+    const cardHit = {
+      eventId: "synthetic" as unknown as Id<"events">,
+      spaceId: seeded.spaceId,
+      documentId: carded.documentId,
+      cardGenerationId,
+      summary: "a composed card summary for the carded document",
+      evidenceSpanIds: carded.evidenceSpanIds,
+    };
+
+    const keywordOnly = await t.run((ctx) =>
+      searchDocuments(ctx, [seeded.spaceId], args),
+    );
+    expect(keywordOnly.results.map((result) => result.documentId)).toEqual([
+      keywordHit.documentId,
+    ]);
+
+    const hybrid = await t.run((ctx) =>
+      searchDocuments(ctx, [seeded.spaceId], args, {
+        chunkIds: [],
+        cardHits: [cardHit],
+        vectorStatus: "ready",
+      }),
+    );
+    // The weighted fusion of PR89 puts a top semantic candidate above a
+    // keyword-only one, and a card hit competes on that same curve.
+    expect(hybrid.results.map((result) => result.documentId)).toEqual([
+      carded.documentId,
+      keywordHit.documentId,
+    ]);
+    const card = hybrid.results[0]!;
+    // Document-level: no chunk row, the card summary as the passage, the card
+    // generation as the evidence pointer.
+    expect(card.chunkId).toBeUndefined();
+    expect(card.snippet).toBe(cardHit.summary);
+    expect(card.cardGenerationId).toBe(cardGenerationId);
+    expect(card.cardEventId).toBe(cardHit.eventId);
+    // Its citations resolve to the card's own evidence spans, over the same
+    // sealed text version as the document.
+    expect(card.citations.map((citation) => citation.evidenceSpanId)).toEqual(
+      carded.evidenceSpanIds,
+    );
+    // The text generation still names the citation chain.
+    expect(card.processingGenerationId).toBe(carded.generationId);
+    expect(hybrid.vectorStatus).toBe("ready");
+  });
+
+  test("a card hit for a retired document is dropped rather than ranked", async () => {
+    const t = convexTest(schema, modules);
+    const seeded = await seedIdentity(t);
+    const source = {
+      spaceId: seeded.spaceId,
+      sourceAccountId: seeded.sourceAccountId,
+      userId: seeded.userId,
+    };
+    const historical = await seedDocument(t, {
+      ...source,
+      suffix: "historical",
+      text: "unrelated retained prose",
+      publicationState: "historical",
+    });
+    const result = await t.run((ctx) =>
+      searchDocuments(
+        ctx,
+        [seeded.spaceId],
+        { query: "needle" },
+        {
+          chunkIds: [],
+          cardHits: [
+            {
+              eventId: "synthetic" as unknown as Id<"events">,
+              spaceId: seeded.spaceId,
+              documentId: historical.documentId,
+              cardGenerationId: historical.generationId,
+              summary: "a card summary for a superseded document",
+              evidenceSpanIds: historical.evidenceSpanIds,
+            },
+          ],
+          vectorStatus: "ready",
+        },
+      ),
+    );
+    expect(result.results).toHaveLength(0);
+  });
+
   test("does not let stale semantic IDs boost historical keyword candidates", async () => {
     const t = convexTest(schema, modules);
     const seeded = await seedIdentity(t);
@@ -489,7 +621,7 @@ describe("document reads", () => {
       searchDocuments(ctx, [seeded.spaceId], args),
     );
     expect(keyword.results).toHaveLength(2);
-    const staleSemanticId = keyword.results[1]!.chunkId;
+    const staleSemanticId = keyword.results[1]!.chunkId!;
 
     const hybrid = await t.run((ctx) =>
       searchDocuments(ctx, [seeded.spaceId], args, {

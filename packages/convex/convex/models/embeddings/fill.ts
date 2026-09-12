@@ -9,7 +9,12 @@ import {
 } from "../../_generated/server";
 import type { QueryCtx } from "../../_generated/server";
 import { sha256Hex } from "../ingestion/hash";
-import { insertChunkEmbedding, insertThoughtEmbedding } from "./model";
+import { composeCardTargetInput } from "./cardTargets";
+import {
+  insertCardEmbedding,
+  insertChunkEmbedding,
+  insertThoughtEmbedding,
+} from "./model";
 import {
   EMBEDDING_FILL_PAGE,
   findEmbeddingTarget,
@@ -70,8 +75,16 @@ async function liveTargetText(
     const chunk = chunkId ? await ctx.db.get(chunkId) : null;
     return chunk && chunk.spaceId === spaceId ? chunk.text : null;
   }
-  // The card kind is reserved by the plan and owns no embeddable row yet.
-  return null;
+  const eventId = ctx.db.normalizeId("events", row.targetId);
+  const event = eventId ? await ctx.db.get(eventId) : null;
+  if (!event || event.spaceId !== spaceId) return null;
+  const composed = await composeCardTargetInput(
+    ctx,
+    spaceId,
+    event.sourceItemId,
+    event,
+  );
+  return composed?.text ?? null;
 }
 
 /** The next page of targets the active fingerprint owes, with their inputs. */
@@ -211,8 +224,29 @@ export const commitEmbeddingFillPage = internalMutation({
           bumpEligibility: false,
         });
       } else {
-        skipped += 1;
-        continue;
+        const eventId = ctx.db.normalizeId("events", supplied.targetId);
+        const event = eventId ? await ctx.db.get(eventId) : null;
+        const composed = event
+          ? await composeCardTargetInput(
+              ctx,
+              args.spaceId,
+              event.sourceItemId,
+              event,
+            )
+          : null;
+        if (!composed || (await sha256Hex(composed.text)) !== row.inputHash) {
+          skipped += 1;
+          continue;
+        }
+        await insertCardEmbedding(ctx, {
+          spaceId: args.spaceId,
+          eventId: event!._id,
+          embeddingGenerationId: generationId,
+          fingerprint: args.fingerprint,
+          inputText: composed.text,
+          vector: supplied.vector,
+          bumpEligibility: false,
+        });
       }
       embedded += 1;
     }
