@@ -202,17 +202,24 @@ function recipient(value: unknown, label: string): string {
   return parsed;
 }
 
-function remoteRootPath(value: unknown): string {
-  const path = string(value, "rclone repository rootPath");
+function remoteRootPath(
+  value: unknown,
+  { minSegments = 2, label = "rclone repository rootPath" }: {
+    minSegments?: 1 | 2;
+    label?: string;
+  } = {},
+): string {
+  const path = string(value, label);
   const segments = path.split("/");
   if (
     path.length > 512 ||
-    !/^[A-Za-z0-9 _.-]+(?:\/[A-Za-z0-9 _.-]+)+$/.test(path) ||
+    segments.length < minSegments ||
+    !/^[A-Za-z0-9 _.-]+(?:\/[A-Za-z0-9 _.-]+)*$/.test(path) ||
     /[:\\]/.test(path) ||
     segments.some((segment) =>
       !segment || segment === "." || segment === ".." || segment.trim() !== segment
     )
-  ) fail("rclone repository rootPath is invalid");
+  ) fail(`${label} is invalid`);
   return path;
 }
 
@@ -556,7 +563,10 @@ function pdfDocQa(value: unknown, roots: RootConfig[], journalDir: string) {
           providerRootDirectoryId: rootId,
           providerAccountIdHash: sha256(provider.providerAccountIdHash, "pdfDocQa.providerOriginal.providerAccountIdHash"),
           providerRootDirectoryIdHash: rootHash,
-          refreshPath: remoteRootPath(provider.refreshPath),
+          refreshPath: remoteRootPath(provider.refreshPath, {
+            minSegments: 1,
+            label: "pdfDocQa.providerOriginal.refreshPath",
+          }),
           registryDirectory: absolutePath(provider.registryDirectory, "pdfDocQa.providerOriginal.registryDirectory"),
         };
       })();
