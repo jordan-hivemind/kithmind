@@ -588,6 +588,7 @@ test(
       "reconciliationsFailed",
       "reconciliationsPassed",
       "reviewItemsOpened",
+      "reviewItemsResolved",
       "rowsDeduplicated",
       "rowsInserted",
       "rowsRefused",

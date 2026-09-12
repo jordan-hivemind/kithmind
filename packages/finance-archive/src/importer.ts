@@ -294,6 +294,15 @@ export type ImportSummary = {
    * unparseable process date or `as_of`, not a duplicate. */
   rowsRefused: number;
   reviewItemsOpened: number;
+  /**
+   * F1-55. A `document_unparsed` item this run closed because the same
+   * document, reimported, no longer carries a parse note (see the
+   * `parseNote`-less branch below). Never a count of items dismissed or
+   * resolved by a person -- this importer only ever resolves the one kind it
+   * itself opens, and only when its own reason for opening it no longer
+   * holds.
+   */
+  reviewItemsResolved: number;
   /** Always 0 here; `publishImport` reports what the gates found. */
   reconciliationsPassed: number;
   reconciliationsFailed: number;
@@ -395,6 +404,7 @@ export async function importBatch(
   let rowsDeduplicated = 0;
   let rowsRefused = 0;
   let reviewItemsOpened = 0;
+  let reviewItemsResolved = 0;
 
   async function openReview(
     accountId: string | null,
@@ -984,7 +994,31 @@ export async function importBatch(
              VALUES ($1, 'document_unparsed', $2, $3, NULL, NULL, $4)`,
             [randomUUID(), document.accountId, documentId, document.parseNote.slice(0, 500)],
           );
+          reviewItemsOpened += 1;
         }
+      } else {
+        // F1-55. Ground rule 1: the bytes this document was reimported from
+        // are the same immutable bytes as last time (`documents.sha256` is
+        // this document's identity, and the whole-document skip above never
+        // reaches here for a document already `parsed_ok`), so a reimport
+        // that now parses -- typically a fixed extractor rereading a
+        // document an older one could not -- is the same content read
+        // better, not new evidence. Close whatever `document_unparsed` item
+        // that earlier failure opened rather than leaving it open forever or
+        // opening a second one next to it; the resolution note names the
+        // import run that cleared it, and only an `open` item is touched, so
+        // a reviewer's own dismissal is never silently reopened or relitigated.
+        const resolved = await client.query(
+          `UPDATE review_items
+             SET status = 'resolved', resolved_at = $2, resolution_note = $3
+           WHERE kind = 'document_unparsed' AND source_document_id = $1 AND status = 'open'`,
+          [
+            documentId,
+            now.toISOString(),
+            `resolved on reimport: this document now parses without a parse note (import_runs.id=${importRunId})`,
+          ],
+        );
+        reviewItemsResolved += resolved.rowCount ?? 0;
       }
       for (const row of document.rows) {
         const outcome = await importRow(row, documentId, occurrences);
@@ -1110,6 +1144,7 @@ export async function importBatch(
       rowsDeduplicated,
       rowsRefused,
       reviewItemsOpened,
+      reviewItemsResolved,
       reconciliationsPassed: 0,
       reconciliationsFailed: 0,
     };

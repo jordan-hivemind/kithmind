@@ -26,12 +26,24 @@ const POINTS_PER_COLUMN = 4.5;
  * rather than padded with space glyphs: a proportional font makes a
  * space-padded line look aligned by character count and ragged by geometry,
  * and geometry is what any reader (this one included) sees.
+ *
+ * `useTJ`: emit the array form (`[(a) k (b)] TJ`) instead of a plain
+ * `(text) Tj`, splitting each run in two with a kerning number between the
+ * halves. Real statement generators use TJ, not Tj, to place inter-glyph
+ * kerning; a plain Tj fixture can never exercise pdfjs's array-with-numbers
+ * parsing, only this can.
  */
-function lineOperators(line, y) {
+function lineOperators(line, y, { useTJ = false } = {}) {
   const operators = [];
   for (const match of line.matchAll(/\S+(?: \S+)*?(?=\s{2,}|$)/g)) {
     const x = MARGIN + match.index * POINTS_PER_COLUMN;
-    operators.push(`1 0 0 1 ${x.toFixed(2)} ${y.toFixed(2)} Tm (${escapePdfString(match[0])}) Tj`);
+    const text = escapePdfString(match[0]);
+    const show = (() => {
+      if (!useTJ) return `(${text}) Tj`;
+      const mid = Math.max(1, Math.floor(text.length / 2));
+      return `[(${text.slice(0, mid)}) -20 (${text.slice(mid)})] TJ`;
+    })();
+    operators.push(`1 0 0 1 ${x.toFixed(2)} ${y.toFixed(2)} Tm ${show}`);
   }
   return operators;
 }
@@ -49,7 +61,7 @@ function lineOperators(line, y) {
  * line wider than the page would lose its tail and the test would assert
  * against text no reader can see.
  */
-export function buildMinimalPdf(pages, { compress = false } = {}) {
+export function buildMinimalPdf(pages, { compress = false, useTJ = false } = {}) {
   const sheets = Array.isArray(pages[0]) ? pages : [pages];
   const longest = sheets.flat().reduce((max, line) => Math.max(max, line.length), 0);
   const tallest = sheets.reduce((max, lines) => Math.max(max, lines.length), 0);
@@ -79,7 +91,7 @@ export function buildMinimalPdf(pages, { compress = false } = {}) {
     const content =
       `BT /F1 ${FONT_SIZE} Tf\n` +
       lines
-        .flatMap((line, row) => lineOperators(line, height - MARGIN - row * LEADING))
+        .flatMap((line, row) => lineOperators(line, height - MARGIN - row * LEADING, { useTJ }))
         .join("\n") +
       "\nET";
     const raw = Buffer.from(content, "latin1");
