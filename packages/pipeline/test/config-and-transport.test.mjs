@@ -327,6 +327,27 @@ test("PDF document-Q&A config is closed, bound, and keeps legacy bindings stable
   const invalidProvider = structuredClone(providerPdf);
   invalidProvider.providerOriginal.providerRootDirectoryIdHash = "f".repeat(64);
   assert.throws(() => parseConfig({ ...base, pdfDocQa: invalidProvider }));
+  const singleSegmentRefreshPath = structuredClone(providerPdf);
+  singleSegmentRefreshPath.providerOriginal.refreshPath = "Inbox";
+  assert.equal(
+    parseConfig({ ...base, pdfDocQa: singleSegmentRefreshPath }).pdfDocQa
+      .providerOriginal.refreshPath,
+    "Inbox",
+  );
+  for (const refreshPath of [
+    "",
+    "/Inbox",
+    "Inbox/",
+    "Inbox/..",
+    "..",
+    "Inbox ",
+    "Inbox\u0000",
+    "a".repeat(513),
+  ]) {
+    const invalidRefreshPath = structuredClone(providerPdf);
+    invalidRefreshPath.providerOriginal.refreshPath = refreshPath;
+    assert.throws(() => parseConfig({ ...base, pdfDocQa: invalidRefreshPath }));
+  }
   const invalidRemote = structuredClone(remotePdf);
   invalidRemote.archive.independentBackup.repository.rootPath =
     "Kith Mind Backups/../Processing";
