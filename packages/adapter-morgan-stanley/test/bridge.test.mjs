@@ -17,30 +17,41 @@ import {
   startInactivityWatch,
   INACTIVITY_DIALOG_EXPRESSION,
   waitForSignIn,
+  reloadAndCaptureHeaders,
+  waitForAllHeaders,
   closeSession,
   sharedOnce,
   createSharedGate,
 } from "../src/bridge.mjs";
 
 // A fake cdp for the resume tests below: `Runtime.evaluate` is answered by
-// pattern-matching the expression text (the same three shapes bridge.mjs
-// ever sends: read the slot's keys, clear the slot, or the bearer-refresh
-// call), and every other method call (Page.navigate) is just recorded. This
-// is the same "fake cdp" shape startKeepAlive's own tests already use below,
-// extended to script a sequence of slot-key readings.
+// pattern-matching the expression text (the shapes bridge.mjs ever sends:
+// read the slot's keys, read its diagnostics, set/check the reload sentinel,
+// or the bearer-refresh call), and every other method call (Page.enable,
+// Page.reload, Page.navigate, Page.addScriptToEvaluateOnNewDocument) is just
+// recorded. This is the same "fake cdp" shape startKeepAlive's own tests
+// already use below, extended to script a sequence of slot-key readings and
+// to record whether `close()` was called.
 function makeFakeCdp(slotKeysSequence) {
   const calls = [];
   let slotReadIndex = 0;
+  let closed = false;
   const cdp = {
     send: async (method, params) => {
       calls.push({ method, params });
       if (method === "Runtime.evaluate") {
         const expression = params.expression;
-        if (/delete s\[k\]/.test(expression) && /Object\.keys\(s\)\) delete/.test(expression)) {
-          return { result: { value: true } }; // clearCapturedHeaders
-        }
         if (/GetAccessToken/.test(expression)) {
           return { result: { value: "refreshed" } }; // refreshBearer
+        }
+        if (/__kithmindReloadSentinel = true/.test(expression)) {
+          return { result: { value: true } }; // reloadAndCaptureHeaders: set sentinel
+        }
+        if (/__kithmindReloadSentinel === undefined/.test(expression)) {
+          return { result: { value: true } }; // reloadAndCaptureHeaders: sentinel check -- "fresh" immediately
+        }
+        if (/Object\.fromEntries\(Object\.entries\(globalThis\[Symbol\.for/.test(expression)) {
+          return { result: { value: {} } }; // diagnostics (names + lengths only) -- not asserted on here
         }
         if (/Object\.keys\(globalThis\[Symbol\.for/.test(expression)) {
           const value = slotKeysSequence[Math.min(slotReadIndex, slotKeysSequence.length - 1)];
@@ -51,8 +62,11 @@ function makeFakeCdp(slotKeysSequence) {
       }
       return { result: { value: null } };
     },
+    close: () => {
+      closed = true;
+    },
   };
-  return { cdp, calls };
+  return { cdp, calls, isClosed: () => closed };
 }
 
 function withFakeFetch(targetUrl, run) {
@@ -580,49 +594,159 @@ test("the page-side check reports a matching dialog with no matching button inst
 // F1-54: a same-origin resume (an inline re-auth screen, or an in-app
 // redirect) never destroys the page's JS context, so the header slot can
 // otherwise still hold the *previous* session's xsrf token and device
-// footprint straight through the pause -- not just its stale bearer -- and
-// every post-resume documents call 400'd carrying them (seen live
-// 2026-09-11). waitForSignIn must clear every captured header before
-// trusting anything recaptured after resume.
-test("waitForSignIn clears every captured header before re-navigating, not just the bearer", async () => {
-  // First read (the trigger check): stale headers already present, exactly
-  // as they would be if the JS context never reset across the pause. Second
-  // read (inside the post-clear wait loop): all three fresh again, as if the
-  // app's own Documents-route calls repopulated them.
-  const { cdp, calls } = makeFakeCdp([
-    ["x-xsrf-token", "x-device-footprint", "authorization"],
+// footprint straight through the pause -- not just its stale bearer.
+//
+// F1-54b: clearing the slot in place (the original F1-54 fix) and then only
+// navigating within the app was not enough -- an in-app hash navigation
+// alone never makes the app re-derive its device-footprint, which it only
+// computes once per real page load, so a post-resume request still paired a
+// freshly minted bearer with a *stale* device-footprint and the documents
+// endpoint 400'd every one of them (seen live 2026-09-11 and again
+// 2026-09-12). The fix is to make resume indistinguishable from a cold
+// start: tear the paused connection down and reconnect, so the page-side
+// slot is a brand new object the reload (not a clear) recreates -- the same
+// reload cold start uses, which is what makes the app re-issue its
+// device-footprint request.
+test("waitForSignIn tears the paused connection down and reconnects, running the same reload cold start uses, rather than clearing the slot in place", async () => {
+  // The old, paused connection: read once (the trigger check) and found to
+  // still carry the previous session's headers -- exactly as it would if the
+  // JS context never reset across the pause.
+  const { cdp: oldCdp, calls: oldCalls, isClosed: oldClosed } = makeFakeCdp([
     ["x-xsrf-token", "x-device-footprint", "authorization"],
   ]);
+  // The reconnected connection: empty right after the forced reload, then
+  // all three fresh once the Documents navigation lands.
+  const { cdp: newCdp, calls: newCalls } = makeFakeCdp([
+    [],
+    ["x-xsrf-token", "x-device-footprint", "authorization"],
+  ]);
+  let oldKeepAliveTicks = 0;
+  const oldKeepAlive = setInterval(() => {
+    oldKeepAliveTicks += 1;
+  }, 2);
 
-  const resumed = await withFakeFetch("https://app.example.invalid/atrium/#/documents", () =>
-    waitForSignIn(cdp, "https://app.example.invalid", "http://cdp.invalid", "SIGNED_OUT: test", {
+  const result = await withFakeFetch("https://app.example.invalid/atrium/#/documents", () =>
+    waitForSignIn(oldCdp, "https://app.example.invalid", "http://cdp.invalid", "SIGNED_OUT: test", {
       signInWaitMs: 5000,
       pollIntervalMs: 1,
       headerWaitMs: 50,
       headerPollIntervalMs: 1,
+      keepAlive: oldKeepAlive,
+      // Stands in for the real connectAndInstallHook (connect + Page.enable +
+      // Runtime.enable + reinstall the hook): recorded on newCdp exactly as
+      // the real one would be, so the assertions below can tell a cold
+      // start's own sequence apart from what came after it.
+      reconnect: async () => {
+        await newCdp.send("Page.enable");
+        await newCdp.send("Runtime.enable");
+        await newCdp.send("Page.addScriptToEvaluateOnNewDocument", { source: "(hook)" });
+        return newCdp;
+      },
     }),
   );
 
-  assert.equal(resumed, true);
+  assert.ok(result, "resumes");
+  assert.equal(result.cdp, newCdp, "the slot is recreated on a new connection, not mutated in place");
+  assert.notEqual(result.keepAlive, oldKeepAlive, "a fresh keep-alive replaces the old one");
+  clearInterval(result.keepAlive);
 
-  const clearIndex = calls.findIndex(
-    (c) => c.method === "Runtime.evaluate" && /Object\.keys\(s\)\) delete s\[k\]/.test(c.params.expression),
+  assert.equal(oldClosed(), true, "the paused CDP connection is closed");
+  const ticksAtResume = oldKeepAliveTicks;
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(oldKeepAliveTicks, ticksAtResume, "the old keep-alive interval is cleared, not left running against a closed socket");
+  assert.equal(
+    oldCalls.some((c) => c.method === "Runtime.evaluate" && /delete/.test(c.params.expression)),
+    false,
+    "never clears the old slot in place",
   );
-  assert.notEqual(clearIndex, -1, "clears the whole slot, not just authorization");
-  // The clear expression deletes every key unconditionally -- it never singles
-  // out "authorization" the way the pre-fix code did.
-  assert.equal(/===\s*"authorization"/.test(calls[clearIndex].params.expression), false);
 
-  const navigateIndex = calls.findIndex((c) => c.method === "Page.navigate");
+  // The reconnected cdp runs the exact same steps a cold start does --
+  // reloadAndCaptureHeaders below is the same function createMorganStanleySession
+  // calls -- before anything resume-specific (Documents navigation, bearer
+  // refresh) happens.
+  // (One Runtime.evaluate between the hook install and the sentinel set is
+  // this module's own diagnostics read -- names and lengths only, see
+  // logSlotDiagnostics -- not a slot mutation.)
+  const methodSequence = newCalls.map((c) => c.method);
+  assert.deepEqual(
+    methodSequence.slice(0, 6),
+    ["Page.enable", "Runtime.enable", "Page.addScriptToEvaluateOnNewDocument", "Runtime.evaluate", "Runtime.evaluate", "Page.reload"],
+    "reconnect, then the same sentinel-reload cold start uses",
+  );
+
+  const navigateIndex = newCalls.findIndex((c) => c.method === "Page.navigate");
   assert.notEqual(navigateIndex, -1);
-  assert.match(calls[navigateIndex].params.url, /#\/documents$/);
-  // The clear happens before the navigation that is meant to repopulate the
-  // slot -- clearing after would just delete what was just recaptured.
-  assert.ok(clearIndex < navigateIndex, "clears before navigating, not after");
+  assert.match(newCalls[navigateIndex].params.url, /#\/documents$/);
+  assert.ok(navigateIndex > methodSequence.indexOf("Page.reload"), "navigates to Documents only after the reload, not instead of it");
 
-  const bearerIndex = calls.findIndex((c) => c.method === "Runtime.evaluate" && /GetAccessToken/.test(c.params.expression));
+  const bearerIndex = newCalls.findIndex((c) => c.method === "Runtime.evaluate" && /GetAccessToken/.test(c.params.expression));
   assert.notEqual(bearerIndex, -1, "explicitly refreshes the bearer after resume, rather than hoping navigation alone captured the right one");
   assert.ok(navigateIndex < bearerIndex, "refreshes the bearer only after giving navigation a chance to repopulate the slot");
+});
+
+// The reconnect sequence above (Page.enable, Runtime.enable, install hook,
+// sentinel set, Page.reload, sentinel check, slot read) is not a resume-only
+// invention -- it is reloadAndCaptureHeaders, the exact same exported
+// function createMorganStanleySession's cold start calls. This proves that
+// function's own shape directly.
+test("reloadAndCaptureHeaders -- the shared reload cold start and resume both run -- sets a sentinel, reloads, and waits for the fresh document's slot", async () => {
+  const { cdp, calls } = makeFakeCdp([["x-xsrf-token"]]);
+  await reloadAndCaptureHeaders(cdp);
+  const methodSequence = calls.map((c) => c.method);
+  assert.deepEqual(methodSequence, ["Runtime.evaluate", "Page.reload", "Runtime.evaluate", "Runtime.evaluate"]);
+  assert.match(calls[0].params.expression, /__kithmindReloadSentinel = true/);
+  assert.match(calls[2].params.expression, /__kithmindReloadSentinel === undefined/);
+});
+
+test("waitForAllHeaders polls until every WANTED_HEADERS entry is present", async () => {
+  const { cdp, calls } = makeFakeCdp([["x-xsrf-token"], ["x-xsrf-token", "x-device-footprint", "authorization"]]);
+  const ok = await waitForAllHeaders(cdp, 1000, 1);
+  assert.equal(ok, true);
+  assert.equal(calls.filter((c) => c.method === "Runtime.evaluate").length, 2);
+});
+
+test("waitForAllHeaders gives up and returns false once the deadline passes", async () => {
+  const { cdp } = makeFakeCdp([["x-xsrf-token"]]);
+  const ok = await waitForAllHeaders(cdp, 5, 1);
+  assert.equal(ok, false);
+});
+
+// F1-62's `sharedOnce` gate (tested directly below) is what keeps concurrent
+// fetchText/fetchBytes lanes from each driving their own reconnect when they
+// all hit a sign-out together; this proves that guarantee still holds for
+// the new tear-down-and-reconnect resume specifically -- one lane reconnects,
+// every lane resumes onto the same new connection.
+test("lanes sharing the sign-in gate all resume onto the same reconnected session after just one reconnect", async () => {
+  const { cdp: oldCdp } = makeFakeCdp([["x-xsrf-token", "x-device-footprint", "authorization"]]);
+  const { cdp: newCdp } = makeFakeCdp([[], ["x-xsrf-token", "x-device-footprint", "authorization"]]);
+  const gate = createSharedGate();
+  let reconnectCalls = 0;
+
+  const startResume = () =>
+    withFakeFetch("https://app.example.invalid/atrium/#/documents", () =>
+      waitForSignIn(oldCdp, "https://app.example.invalid", "http://cdp.invalid", "SIGNED_OUT: test", {
+        signInWaitMs: 5000,
+        pollIntervalMs: 1,
+        headerWaitMs: 50,
+        headerPollIntervalMs: 1,
+        reconnect: async () => {
+          reconnectCalls += 1;
+          await newCdp.send("Page.enable");
+          await newCdp.send("Runtime.enable");
+          await newCdp.send("Page.addScriptToEvaluateOnNewDocument", { source: "(hook)" });
+          return newCdp;
+        },
+      }),
+    );
+
+  // Three concurrent lanes all hit the same sign-out at once.
+  const results = await Promise.all([sharedOnce(gate, startResume), sharedOnce(gate, startResume), sharedOnce(gate, startResume)]);
+
+  assert.equal(reconnectCalls, 1, "only the first lane actually drives the reconnect");
+  for (const result of results) {
+    assert.equal(result.cdp, newCdp, "every lane proceeds on the same reconnected session");
+    clearInterval(result.keepAlive);
+  }
 });
 
 test("waitForSignIn gives up and returns false if the tab never returns to the app origin", async () => {
