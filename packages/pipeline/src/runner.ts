@@ -4748,6 +4748,7 @@ export class PipelineRunner {
       code,
       now: Date.now(),
     });
+    await this.submitArchivedParseFailure(checkpoint, code);
     const nextPdf = await this.nextPdfWorkIndex(
       checkpoint.files,
       checkpoint.pdfIndex + 1,
@@ -4777,6 +4778,46 @@ export class PipelineRunner {
       },
       credentialSessionActive: true,
     });
+  }
+
+  /**
+   * Reports a document-level parse failure to the server so the file's
+   * `sourceInventory` row is marked `parse_failed` with the failure class
+   * (`discovery.failArchived`, the archived-flow counterpart of the
+   * `jobs.fail` / `jobs.failParsed` path `failJob` already wires this for:
+   * there is no ingestJobs row yet at this point, since admission happens
+   * after a successful parse).
+   *
+   * ponytail: best-effort, not a correctness path. This does not go through
+   * `this.mutation()`'s pending/replay durability, so a crash or transport
+   * failure here can lose the report (or, rarely, double it on a later
+   * retry) without affecting the run: the bounded local attempt count in
+   * the archive catalog is what actually stops the pass from retrying this
+   * document forever, and a lost report just leaves the inventory stale
+   * until a later scan or a successful parse corrects it. Upgrade to a
+   * durable replayed call if silent loss becomes a real problem.
+   */
+  private async submitArchivedParseFailure(
+    checkpoint: ArchivedCheckpoint,
+    code: string,
+  ): Promise<void> {
+    const identity = archivedIdentity(
+      checkpoint,
+      this.archivedPlan(checkpoint),
+    );
+    try {
+      await this.transport.call({
+        protocolVersion: 1,
+        operation: "discovery.failArchived",
+        spaceId: this.config.spaceId,
+        sourceAccountId: this.config.sourceAccountId,
+        requestId: randomUUID(),
+        identity,
+        failureCode: code,
+      });
+    } catch {
+      // Swallowed: see the ponytail note above.
+    }
   }
 
   private async driveJobsReserve(): Promise<void> {

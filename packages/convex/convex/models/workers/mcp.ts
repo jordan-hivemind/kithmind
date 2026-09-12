@@ -345,6 +345,14 @@ const workerResultValidator = v.union(
     archiveIntentDigest: v.string(),
   }),
   v.object({
+    operation: v.literal("discovery.failArchived"),
+    sourceItemId: v.string(),
+    workId: v.string(),
+    state: v.literal("failed"),
+    retryable: v.boolean(),
+    failureCode: v.string(),
+  }),
+  v.object({
     operation: v.literal("discovery.reserveArchived"),
     workId: v.string(),
     sourceItemId: v.string(),
@@ -709,6 +717,11 @@ export const dispatch = action({
         case "discovery.preflightArchived":
           return await ctx.runMutation(
             internal.models.workers.private.discoveryPreflightArchived,
+            { principal, request },
+          );
+        case "discovery.failArchived":
+          return await ctx.runMutation(
+            internal.models.workers.private.discoveryFailArchived,
             { principal, request },
           );
         case "discovery.reserveArchived":

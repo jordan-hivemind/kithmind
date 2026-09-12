@@ -283,6 +283,12 @@ export type WorkerRequest =
       archiveIntentDigest: string;
     })
   | (WorkerSourceRequest & {
+      operation: "discovery.failArchived";
+      requestId: string;
+      identity: ArchivedWorkIdentity;
+      failureCode: string;
+    })
+  | (WorkerSourceRequest & {
       operation: "discovery.reserveArchived";
       requestId: string;
       identity: ArchivedWorkIdentity;
@@ -617,6 +623,15 @@ export type WorkerArchivedPreflightResult = {
   archiveIntentDigest: string;
 };
 
+export type WorkerArchivedFailResult = {
+  operation: "discovery.failArchived";
+  sourceItemId: string;
+  workId: string;
+  state: "failed";
+  retryable: boolean;
+  failureCode: string;
+};
+
 export type WorkerArchivedReserveResult = {
   operation: "discovery.reserveArchived";
   workId: string;
@@ -939,6 +954,7 @@ export type WorkerResult =
   | WorkerDiscoveryReserveResult
   | WorkerDiscoveryAdmitResult
   | WorkerArchivedPreflightResult
+  | WorkerArchivedFailResult
   | WorkerArchivedReserveResult
   | WorkerArchivedLookupResult
   | WorkerArchivedAdmitResult
@@ -1070,6 +1086,10 @@ function paginationOptions(value: unknown): WorkerPaginationOptions {
 const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
+// The pipeline's local ParserProcessFailureCode identifiers, e.g.
+// "conversion_failed"; a plain bounded shape since convex does not need to
+// know the exact set (it only records the class, never document text).
+const PARSER_FAILURE_CODE = /^[a-z_]{1,64}$/;
 const PROVIDER_REVISION = /^[\x20-\x7e]{1,128}$/;
 const PROVIDER_OBJECT_NAME = /^(?!\.{1,2}$)[A-Za-z0-9._-]{1,128}$/;
 const GAP_CODES = new Set<FsDiscoveryGapCode>([
@@ -1935,6 +1955,23 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
         archiveIntentDigest: string(input.archiveIntentDigest, {
           maxUtf16: 64,
           pattern: SHA256,
+        }),
+      };
+    case "discovery.failArchived":
+      exactKeys(input, [
+        ...baseKeys,
+        "requestId",
+        "identity",
+        "failureCode",
+      ]);
+      return {
+        ...base,
+        operation: "discovery.failArchived",
+        requestId: requestId(input.requestId),
+        identity: archivedWorkIdentity(input.identity),
+        failureCode: string(input.failureCode, {
+          maxUtf16: 64,
+          pattern: PARSER_FAILURE_CODE,
         }),
       };
     case "discovery.reserveArchived":

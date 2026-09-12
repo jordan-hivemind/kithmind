@@ -13,6 +13,7 @@ import {
 import { admitDiscoveryUtf8, reserveDiscoveryWork } from "./discovery";
 import {
   admitArchivedDiscovery,
+  failArchivedDiscovery,
   lookupArchivedAdmission,
   preflightArchivedDiscovery,
   reserveArchivedDiscovery,
@@ -231,6 +232,17 @@ export const discoveryPreflightArchived = internalMutation({
       ctx,
       args.principal,
       operation(args.request, "discovery.preflightArchived"),
+      Date.now(),
+    ),
+});
+
+export const discoveryFailArchived = internalMutation({
+  args: { principal: principalRefValidator, request: v.any() },
+  handler: async (ctx, args) =>
+    await failArchivedDiscovery(
+      ctx,
+      args.principal,
+      operation(args.request, "discovery.failArchived"),
       Date.now(),
     ),
 });

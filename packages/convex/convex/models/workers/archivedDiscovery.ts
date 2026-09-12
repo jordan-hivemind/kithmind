@@ -23,8 +23,10 @@ import {
   loadProviderOriginalReference,
 } from "../provenance/providerOriginals";
 import { parseSourceTextRepresentation } from "../provenance/representations";
+import { markInventoryParseFailed } from "../documents/inventory";
 import { requireWorkerSourceAccount } from "./auth";
 import {
+  MAX_WORKER_DISCOVERY_ATTEMPTS,
   requireCurrentDiscovery,
   WORKER_DISCOVERY_LEASE_MS,
   WORKER_OPERATION_RECEIPT_MS,
@@ -36,6 +38,7 @@ import type {
   ArchivedWorkIdentity,
   ParsedTextDeclaration,
   WorkerArchivedAdmitResult,
+  WorkerArchivedFailResult,
   WorkerArchivedLookupResult,
   WorkerArchivedPreflightResult,
   WorkerArchivedReserveResult,
@@ -505,6 +508,65 @@ export async function preflightArchivedDiscovery(
     workId: current.work._id,
     expectedDesiredProcessingEpoch: current.work.expectedDesiredProcessingEpoch,
     archiveIntentDigest: request.archiveIntentDigest,
+  };
+}
+
+/**
+ * A document-level parser failure (conversion_failed, page_limit_exceeded,
+ * bundle_too_large, conversion_output_invalid): the worker never got far
+ * enough to admit this file, so there is no ingestJobs row for jobs.fail /
+ * jobs.failParsed to act on yet. This records the failure directly against
+ * the file's `workerDiscoveryWork` row (the same lease/attempt record
+ * `discovery.reserveArchived` already claims, and which already permits
+ * reclaiming a `failed` row while `retryable`) and, like `failJob`, marks
+ * the file's `sourceInventory` row `parse_failed` with the failure class so
+ * `list_review_queue` can count and explain it. Unlike `failJob`, this marks
+ * the row on every reported failure rather than only the final one: a
+ * manual backfill pass may not retry for a long time, and the mark is
+ * purely additive (self-healing back to `extraction_pending` the moment a
+ * later attempt activates, via the existing `activateGeneration` ->
+ * `clearInventoryParseFailed` path).
+ *
+ * ponytail: no request-id receipt here (unlike reserveArchivedDiscovery),
+ * so a retried report after a lost response can double-count `attempts`.
+ * Acceptable for a best-effort visibility signal bounded by
+ * MAX_WORKER_DISCOVERY_ATTEMPTS; the pipeline's own local catalog is what
+ * actually stops it from retrying forever. Add a receipt if double-counting
+ * ever causes a real problem.
+ */
+export async function failArchivedDiscovery(
+  ctx: MutationCtx,
+  principal: PrincipalRef,
+  request: Extract<WorkerRequest, { operation: "discovery.failArchived" }>,
+  now: number,
+): Promise<WorkerArchivedFailResult> {
+  const source = await requireWorkerSourceAccount(ctx, principal, request);
+  requireBinaryGate(source);
+  const current = await resolveCurrentArchivedWork(ctx, source, request.identity);
+  await consumeWorkerMutationRateLimit(ctx, source, now);
+  const attempts = safeAdd(current.work.attempts, 1);
+  const retryable = attempts < MAX_WORKER_DISCOVERY_ATTEMPTS;
+  await ctx.db.patch(current.work._id, {
+    state: "failed",
+    attempts,
+    failureCode: request.failureCode,
+    retryable,
+    leaseToken: undefined,
+    leaseOwnerCredentialId: undefined,
+    leaseExpiresAt: undefined,
+    nextAttemptAt: undefined,
+  });
+  await markInventoryParseFailed(ctx, {
+    sourceItemId: current.item._id,
+    failureClass: request.failureCode,
+  });
+  return {
+    operation: "discovery.failArchived",
+    sourceItemId: current.item._id,
+    workId: current.work._id,
+    state: "failed",
+    retryable,
+    failureCode: request.failureCode,
   };
 }
 

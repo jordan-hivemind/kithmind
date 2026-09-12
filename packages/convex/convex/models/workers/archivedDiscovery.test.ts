@@ -6,6 +6,7 @@ import { modules } from "../../test.setup";
 import {
   admitArchivedDiscovery,
   artifactBoundExtractionFingerprint,
+  failArchivedDiscovery,
   lookupArchivedAdmission,
   preflightArchivedDiscovery,
   reserveArchivedDiscovery,
@@ -1902,5 +1903,127 @@ describe("archived discovery admission", () => {
         ctx.db.query("sourceArtifactArchiveReceipts").collect(),
       ),
     ).toEqual([]);
+  });
+
+  async function seedInventoryRow(f: Awaited<ReturnType<typeof fixture>>) {
+    return await f.t.run((ctx) =>
+      ctx.db.insert("sourceInventory", {
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        sourceItemId: f.sourceItemId,
+        identityKeyHash: "archived-fixture-identity",
+        relativePath: "synthetic.pdf",
+        folderPath: "",
+        fileName: "synthetic.pdf",
+        modifiedAt: 20,
+        contentIndexed: false,
+        exclusionReason: "extraction_pending" as const,
+        firstSeenScanId: f.scanId,
+        lastSeenScanId: f.scanId,
+      }),
+    );
+  }
+
+  test("a document-level parser failure marks the file parse_failed with its failure class (P2-75b)", async () => {
+    const f = await fixture();
+    const inventoryId = await seedInventoryRow(f);
+    const request = parseWorkerRequest({
+      ...base(f),
+      operation: "discovery.failArchived",
+      requestId: "fail-1",
+      identity: identity(f),
+      failureCode: "conversion_failed",
+    });
+    if (request.operation !== "discovery.failArchived") {
+      throw new Error("bad fail request");
+    }
+    const result = await f.t.run((ctx) =>
+      failArchivedDiscovery(ctx, f.principal, request, 100),
+    );
+    expect(result).toMatchObject({
+      sourceItemId: f.sourceItemId,
+      workId: f.workId,
+      state: "failed",
+      retryable: true,
+      failureCode: "conversion_failed",
+    });
+    // The pipeline never got far enough to admit this file, so there is no
+    // ingestJobs row for jobs.fail / jobs.failParsed to have marked this
+    // through; discovery.failArchived is the only path that can.
+    expect(
+      await f.t.run((ctx) => ctx.db.get(inventoryId)),
+    ).toMatchObject({
+      exclusionReason: "parse_failed",
+      exclusionDetail: "conversion_failed",
+    });
+    const work = await f.t.run((ctx) => ctx.db.get(f.workId));
+    expect(work).toMatchObject({
+      state: "failed",
+      attempts: 1,
+      failureCode: "conversion_failed",
+      retryable: true,
+    });
+    expect(work?.leaseToken).toBeUndefined();
+    // A failed-but-retryable row is exactly what discovery.reserveArchived
+    // already accepts reclaiming, so a later scan's retry is not blocked.
+    const reserve = parseWorkerRequest({
+      ...base(f),
+      operation: "discovery.reserveArchived",
+      requestId: "reserve-after-fail",
+      identity: identity(f),
+    });
+    if (reserve.operation !== "discovery.reserveArchived") {
+      throw new Error("bad reserve request");
+    }
+    await expect(
+      f.t.run((ctx) =>
+        reserveArchivedDiscovery(ctx, f.principal, reserve, "f".repeat(64), 101),
+      ),
+    ).resolves.toMatchObject({ workId: f.workId, reused: false });
+  });
+
+  test("reaching the discovery attempt bound stops offering the work as retryable", async () => {
+    const f = await fixture();
+    await seedInventoryRow(f);
+    await f.t.run((ctx) =>
+      ctx.db.patch(f.workId, {
+        attempts: 7,
+        nextAttemptAt: undefined,
+      }),
+    );
+    const request = parseWorkerRequest({
+      ...base(f),
+      operation: "discovery.failArchived",
+      requestId: "fail-final",
+      identity: identity(f),
+      failureCode: "bundle_too_large",
+    });
+    if (request.operation !== "discovery.failArchived") {
+      throw new Error("bad fail request");
+    }
+    const result = await f.t.run((ctx) =>
+      failArchivedDiscovery(ctx, f.principal, request, 100),
+    );
+    expect(result.retryable).toBe(false);
+    const reserve = parseWorkerRequest({
+      ...base(f),
+      operation: "discovery.reserveArchived",
+      requestId: "reserve-after-bound",
+      identity: identity(f),
+    });
+    if (reserve.operation !== "discovery.reserveArchived") {
+      throw new Error("bad reserve request");
+    }
+    await expect(
+      f.t.run((ctx) =>
+        reserveArchivedDiscovery(
+          ctx,
+          f.principal,
+          reserve,
+          "g".repeat(64),
+          101,
+        ),
+      ),
+    ).rejects.toThrow();
   });
 });
