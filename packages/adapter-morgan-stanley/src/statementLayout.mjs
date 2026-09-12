@@ -9,7 +9,12 @@
 // and routes to review. It never rounds, never infers a column from the
 // neighbour that happened to parse, and never reads a number as a float.
 
-import { canonicalizeDecimal, negateDecimal, EMPTY_HOLDINGS } from "@repo/finance-archive";
+import {
+  canonicalizeDecimal,
+  negateDecimal,
+  EMPTY_HOLDINGS,
+  sha256HexOf,
+} from "@repo/finance-archive";
 import { PAGE_SEPARATOR } from "./pdfText.mjs";
 
 const BASE_CURRENCY = "USD";
@@ -39,15 +44,24 @@ const FOOTNOTE_SUFFIX = /\s+[A-Za-z]{1,2}$/;
 
 // --- cells and columns ------------------------------------------------------
 
-/** One line's cells, each with the character offsets it occupies. */
+/**
+ * One line's cells, each with the character offsets it occupies. The
+ * offsets bound exactly `cell.text` (the trimmed content) so that
+ * `line.slice(cell.start, cell.end) === cell.text` always -- F1-53 turns
+ * these into evidence spans, and a span that included a cell's un-trimmed
+ * padding would not slice to its own quote.
+ */
 function splitCells(text) {
   const cells = [];
   let offset = 0;
   for (const part of text.split(CELL_GAP)) {
-    const start = text.indexOf(part, offset);
     if (part.trim() === "") continue;
-    cells.push({ text: part.trim(), start, end: start + part.length });
-    offset = start + part.length;
+    const rawStart = text.indexOf(part, offset);
+    const leading = part.length - part.trimStart().length;
+    const start = rawStart + leading;
+    const trimmed = part.trim();
+    cells.push({ text: trimmed, start, end: start + trimmed.length });
+    offset = rawStart + part.length;
   }
   return cells;
 }
@@ -107,19 +121,71 @@ export function resolveStatementMoney(raw) {
 
 // --- document shape ---------------------------------------------------------
 
-/** Lines with the page they came from, 1-based, as FieldLocator.index wants. */
+/**
+ * Lines with the page they came from, 1-based, as FieldLocator.index wants,
+ * and each line's own start offset in `text` -- a single pass over the whole
+ * string rather than a split-and-rejoin, so the offset is exact and the page
+ * separator (`\f`, joined as `"\n" + PAGE_SEPARATOR + "\n"`, see pdfText.mjs)
+ * always lands as its own clean line between two real ones. F1-53: this is
+ * what lets every locator below carry an evidence span into `text` itself,
+ * the exact string the archive retains at `documents.text_path`.
+ */
 function pagedLines(text) {
   const out = [];
-  text.split(PAGE_SEPARATOR).forEach((page, pageIndex) => {
-    page.split("\n").forEach((line) => {
-      if (line.trim() !== "") out.push({ page: pageIndex + 1, text: line });
-    });
-  });
+  let page = 1;
+  let offset = 0;
+  for (const raw of text.split("\n")) {
+    if (raw === PAGE_SEPARATOR) {
+      page += 1;
+    } else if (raw.trim() !== "") {
+      out.push({ page, text: raw, start: offset });
+    }
+    offset += raw.length + 1;
+  }
   return out;
 }
 
 function locator(kind, page, field) {
   return { source: kind, index: page, field };
+}
+
+/**
+ * `textMeta` is the retained text's own identity, computed once per
+ * document and carried onto every span this parser emits: `sha256HexOf`
+ * matches exactly what `writeRetainedText` hashes the same string to, so
+ * `textRelativePath(textSha256)` (rawTree.ts) names the real file a
+ * consumer resolves the span from without either side knowing the raw tree
+ * root.
+ */
+function textMetaOf(text) {
+  return {
+    sha256: sha256HexOf(Buffer.from(text, "utf8")),
+    byteLength: Buffer.byteLength(text, "utf8"),
+    codepointLength: Array.from(text).length,
+  };
+}
+
+/**
+ * A `FieldLocator` bound to an exact retained-text span: `start`/`end` are
+ * unicode code point offsets into the retained text and `quote` is the exact
+ * substring they name (`text.slice(start, end) === quote`, code points and
+ * JS string indices coinciding here because statement text is ASCII).
+ */
+function spanLocator(kind, page, field, textMeta, start, end, quote) {
+  return {
+    source: kind,
+    index: page,
+    field,
+    binding: {
+      format: "retained_text_span_v1",
+      textSha256: textMeta.sha256,
+      textByteLength: textMeta.byteLength,
+      textCodepointLength: textMeta.codepointLength,
+      start,
+      end,
+      quote,
+    },
+  };
 }
 
 /**
@@ -133,13 +199,38 @@ function locator(kind, page, field) {
  */
 function accountKeysByLine(lines) {
   const keys = new Array(lines.length).fill(null);
+  // F1-53: which line (an index into `lines`) stated the account number a
+  // given line's key was forward-filled from, so a holding or balance can
+  // also cite the exact account-number line its section came from, not just
+  // carry the key as a string.
+  const markerLines = new Array(lines.length).fill(null);
   let current = null;
+  let currentMarkerLine = null;
   lines.forEach(({ text }, i) => {
     const match = BARE_ACCOUNT_LINE.exec(text);
-    if (match !== null) current = match[1];
+    if (match !== null) {
+      current = match[1];
+      currentMarkerLine = i;
+    }
     keys[i] = current;
+    markerLines[i] = currentMarkerLine;
   });
-  return keys;
+  return { keys, markerLines };
+}
+
+/** The evidence span over the account-number line a section's `accountKey`
+ * was forward-filled from, or null before the first such marker (see
+ * `accountKeysByLine`). */
+function accountSpanLocator(lines, markerLines, lineIndex, kind, textMeta) {
+  const markerLine = markerLines[lineIndex];
+  if (markerLine === null) return null;
+  const line = lines[markerLine];
+  const match = BARE_ACCOUNT_LINE.exec(line.text);
+  if (match === null) return null;
+  const matchStart = line.text.indexOf(match[1]);
+  const start = line.start + matchStart;
+  const end = start + match[1].length;
+  return spanLocator(kind, line.page, "account number", textMeta, start, end, match[1]);
 }
 
 /** `{ accountExternalKey: key }` when non-null, else `{}` -- spread onto a
@@ -195,7 +286,7 @@ const BALANCE_BLOCK_LINES = 40;
  * `accountKeysByLine` -- the account whose `BALANCE SHEET` this is, which a
  * consolidated statement prints once per account.
  */
-function parseBalanceSheet(lines, anchorIndex, kind, accountKey) {
+function parseBalanceSheet(lines, anchorIndex, kind, accountKey, markerLines, textMeta) {
   const block = lines.slice(anchorIndex, anchorIndex + BALANCE_BLOCK_LINES);
   const headerLine = block.find(({ text }) => (text.match(AS_OF_HEADER) ?? []).length > 0);
   if (headerLine === undefined) return null;
@@ -208,26 +299,40 @@ function parseBalanceSheet(lines, anchorIndex, kind, accountKey) {
   ];
   const page = headerLine.page;
   const rows = {};
-  for (const { text } of block) {
+  for (const { text, start: lineStart } of block) {
     for (const [name, pattern] of Object.entries(BALANCE_ROWS)) {
       if (rows[name] !== undefined) continue;
       const trimmed = text.trim();
       if (!pattern.test(trimmed)) continue;
-      rows[name] = bindRow(text, columns).bound;
+      rows[name] = { bound: bindRow(text, columns).bound, lineStart };
     }
   }
   if (rows.totalValue === undefined) return null;
 
-  const read = (row, column) =>
-    row === undefined || !row.has(column)
-      ? { value: null, note: "row or column not printed on this statement" }
-      : resolveStatementMoney(row.get(column).text);
+  // F1-53. `span` is null exactly when there is no cell to cite (row or
+  // column not printed); `resolveStatementMoney` failing to read a cell that
+  // *is* printed still carries a span, over the unparseable text, so a
+  // review item and an evidence-yielding parse are not mutually exclusive.
+  const read = (row, column, fieldLabel) => {
+    if (row === undefined || !row.bound.has(column)) {
+      return { value: null, note: "row or column not printed on this statement", locator: null };
+    }
+    const cell = row.bound.get(column);
+    const resolved = resolveStatementMoney(cell.text);
+    const start = row.lineStart + cell.start;
+    const end = row.lineStart + cell.end;
+    return {
+      ...resolved,
+      locator: spanLocator(kind, page, fieldLabel, textMeta, start, end, cell.text),
+    };
+  };
 
-  const total = read(rows.totalValue, "thisPeriod");
-  const opening = read(rows.totalValue, "lastPeriod");
-  const cash = read(rows.cash, "thisPeriod");
+  const total = read(rows.totalValue, "thisPeriod", "BALANCE SHEET / TOTAL VALUE");
+  const opening = read(rows.totalValue, "lastPeriod", "BALANCE SHEET / TOTAL VALUE (last period)");
+  const cash = read(rows.cash, "thisPeriod", "BALANCE SHEET / Cash");
   const asOf = resolveAsOf(columns[1].text);
   const rowLocator = locator(kind, page, "BALANCE SHEET / TOTAL VALUE");
+  const accountLocator = accountSpanLocator(lines, markerLines, anchorIndex, kind, textMeta);
 
   const balance = {
     sourceDocument: "statement",
@@ -239,14 +344,16 @@ function parseBalanceSheet(lines, anchorIndex, kind, accountKey) {
     currency: BASE_CURRENCY,
     periodStartValue: opening.value,
     periodEndValue: total.value,
-    locators:
-      total.value === null
-        ? { row: rowLocator, totalValue: rowLocator }
-        : { row: rowLocator },
+    locators: {
+      row: rowLocator,
+      totalValue: total.value === null ? rowLocator : total.locator,
+      ...(cash.value === null ? {} : { cash: cash.locator }),
+      ...(accountLocator === null ? {} : { account: accountLocator }),
+    },
   };
 
   const liabilities = [];
-  const liability = read(rows.liabilities, "thisPeriod");
+  const liability = read(rows.liabilities, "thisPeriod", "BALANCE SHEET / Total Liabilities");
   // The em dash means "no liability on this statement", which is a different
   // fact from a zero balance and is not recorded as one.
   if (liability.value !== null) {
@@ -264,7 +371,11 @@ function parseBalanceSheet(lines, anchorIndex, kind, accountKey) {
       collateralNote:
         "the balance sheet states one combined liability total; the statement does not " +
         "break it into per-facility collateral on this line",
-      locators: { row: liabilityLocator },
+      locators: {
+        row: liabilityLocator,
+        balance: liability.locator,
+        ...(accountLocator === null ? {} : { account: accountLocator }),
+      },
     });
   }
   return { balance, liabilities };
@@ -391,10 +502,16 @@ function positionCells(block) {
   const valueRows = block.filter(({ bound }) => statesValue(bound.get("marketValue")));
   const row = totalRow ?? (valueRows.length === 1 ? valueRows[0] : null);
   if (row === null) return null;
+  // F1-53: every merged cell carries the line it actually came from
+  // (`lineStart`/`page`), row or another line in the block, so a value this
+  // position took from elsewhere still cites the line that stated it.
+  const withLine = (cell, source) => ({ ...cell, lineStart: source.start, page: source.page });
   // Fill only from rows that agree: a column several rows state differently
   // (a per-lot cost, say) stays unfilled rather than taking one lot's number
   // as the whole position's.
-  const merged = new Map(row.bound);
+  const merged = new Map(
+    [...row.bound].map(([name, cell]) => [name, withLine(cell, row)]),
+  );
   for (const name of ["quantity", "price", "costBasis", "unrealized", "marketValue"]) {
     if (statesValue(merged.get(name))) continue;
     const stated = new Map();
@@ -405,9 +522,9 @@ function positionCells(block) {
       // Compared as numbers, not as text: the same price is printed "$318.400"
       // on a security's first lot and "318.400" on the rest.
       const { value } = resolveStatementMoney(cell.text);
-      if (value !== null) stated.set(value, cell.text);
+      if (value !== null) stated.set(value, withLine(cell, other));
     }
-    if (stated.size === 1) merged.set(name, { text: [...stated.values()][0] });
+    if (stated.size === 1) merged.set(name, [...stated.values()][0]);
     else merged.delete(name);
   }
   return { row, merged };
@@ -424,12 +541,29 @@ function positionFromBlock(block, columns, context) {
     };
   }
   const { row, merged } = resolved;
-  const cell = (name) => (statesValue(merged.get(name)) ? merged.get(name).text : null);
-  const marketValue = resolveStatementMoney(merged.get("marketValue")?.text ?? "");
-  const quantity = cell("quantity") === null ? null : resolveStatementMoney(cell("quantity"));
-  const price = cell("price") === null ? null : resolveStatementMoney(cell("price"));
-  const costBasis = cell("costBasis") === null ? null : resolveStatementMoney(cell("costBasis"));
-  const unrealized = cell("unrealized") === null ? null : resolveStatementMoney(cell("unrealized"));
+  const boundCell = (name) => (statesValue(merged.get(name)) ? merged.get(name) : null);
+  const span = (name, fieldLabel) => {
+    const c = boundCell(name);
+    if (c === null) return null;
+    return spanLocator(
+      context.kind,
+      c.page,
+      fieldLabel,
+      context.textMeta,
+      c.lineStart + c.start,
+      c.lineStart + c.end,
+      c.text,
+    );
+  };
+  const marketValue = resolveStatementMoney(boundCell("marketValue")?.text ?? "");
+  const quantityCell = boundCell("quantity");
+  const quantity = quantityCell === null ? null : resolveStatementMoney(quantityCell.text);
+  const priceCell = boundCell("price");
+  const price = priceCell === null ? null : resolveStatementMoney(priceCell.text);
+  const costBasisCell = boundCell("costBasis");
+  const costBasis = costBasisCell === null ? null : resolveStatementMoney(costBasisCell.text);
+  const unrealizedCell = boundCell("unrealized");
+  const unrealized = unrealizedCell === null ? null : resolveStatementMoney(unrealizedCell.text);
   const rowLocator = locator(context.kind, row.page, `${context.section} / ${context.description ?? "holding"}`);
 
   const hasMarketValueColumn = columns.some((column) => column.name === "marketValue");
@@ -465,10 +599,16 @@ function positionFromBlock(block, columns, context) {
       currency: BASE_CURRENCY,
       valuationBasis,
       valuationNote,
-      locators:
-        marketValue.value === null
-          ? { row: rowLocator, marketValue: rowLocator }
-          : { row: rowLocator },
+      locators: {
+        row: rowLocator,
+        marketValue: marketValue.value === null ? rowLocator : span("marketValue", `${context.section} / Market Value`),
+        ...(quantity?.value == null ? {} : { quantity: span("quantity", `${context.section} / Quantity`) }),
+        ...(price?.value == null ? {} : { price: span("price", `${context.section} / Price`) }),
+        ...(costBasis?.value == null ? {} : { costBasis: span("costBasis", `${context.section} / Cost Basis`) }),
+        ...(context.accountLocator === null || context.accountLocator === undefined
+          ? {}
+          : { account: context.accountLocator }),
+      },
     },
     reason: null,
   };
@@ -478,7 +618,7 @@ function positionFromBlock(block, columns, context) {
  * could not be read, counted for the parse note. `accountKeys` (F1-46) is
  * `accountKeysByLine`'s per-line array, so each table's positions are
  * attributed to the account whose pages that table was printed on. */
-function parseHoldings(lines, kind, asOf, accountKeys) {
+function parseHoldings(lines, kind, asOf, accountKeys, markerLines, textMeta) {
   const positions = [];
   const skipped = [];
   for (let i = 0; i < lines.length; i += 1) {
@@ -493,6 +633,9 @@ function parseHoldings(lines, kind, asOf, accountKeys) {
         .map(({ text }) => text.trim())
         .find((text) => /^[A-Z][A-Z0-9 ,&%'/()+^-]{3,}$/.test(text)) ?? "HOLDINGS";
     const accountKey = accountKeys[i];
+    // F1-53. One per table, not per position: every position under this
+    // header shares the same account-number line.
+    const accountLocator = accountSpanLocator(lines, markerLines, i, kind, textMeta);
 
     let block = [];
     let description = null;
@@ -504,6 +647,8 @@ function parseHoldings(lines, kind, asOf, accountKeys) {
         section,
         description,
         accountKey,
+        accountLocator,
+        textMeta,
       });
       if (position === null) skipped.push(reason);
       else positions.push(position);
@@ -528,7 +673,7 @@ function parseHoldings(lines, kind, asOf, accountKeys) {
         flush();
         description = bound.get("description").text;
       }
-      block.push({ bound, page: lines[j].page });
+      block.push({ bound, page: lines[j].page, start: lines[j].start });
       i = j;
     }
     flush();
@@ -558,7 +703,11 @@ export function isRealStatementLayout(text) {
  */
 export function parseRealStatement(text, kind) {
   const lines = pagedLines(text);
-  const accountKeys = accountKeysByLine(lines);
+  const { keys: accountKeys, markerLines } = accountKeysByLine(lines);
+  // F1-53. The retained text's own identity, computed once from the exact
+  // string the archive retains at `documents.text_path`, and carried onto
+  // every evidence span this parse produces.
+  const textMeta = textMetaOf(text);
 
   const period = resolvePeriod(lines);
   if (period === null) {
@@ -578,10 +727,24 @@ export function parseRealStatement(text, kind) {
   const sheets = [];
   lines.forEach(({ text: line }, anchorIndex) => {
     if (!BALANCE_SHEET_ANCHOR.test(line)) return;
-    const sheet = parseBalanceSheet(lines, anchorIndex, kind, accountKeys[anchorIndex]);
+    const sheet = parseBalanceSheet(
+      lines,
+      anchorIndex,
+      kind,
+      accountKeys[anchorIndex],
+      markerLines,
+      textMeta,
+    );
     if (sheet !== null) sheets.push(sheet);
   });
-  const { positions, skipped } = parseHoldings(lines, kind, period.end, accountKeys);
+  const { positions, skipped } = parseHoldings(
+    lines,
+    kind,
+    period.end,
+    accountKeys,
+    markerLines,
+    textMeta,
+  );
 
   const notes = [];
   if (sheets.length === 0) {

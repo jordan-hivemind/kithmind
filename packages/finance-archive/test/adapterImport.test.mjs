@@ -1574,6 +1574,98 @@ test(
   },
 );
 
+test(
+  "a retained_text_span_v1 binding on a position's locators reaches source_locator unchanged (F1-53)",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedPg(client);
+
+    const acquired = await acquirePdfStatementForHoldings();
+    const persisted = persist(t, acquired, "pdf_statement");
+
+    // A binding shaped exactly the way statementLayout.mjs (adapter-morgan-
+    // stanley) emits one: no `relativePath` and no `quoteSha256`, both
+    // derived at read time (pgRead.ts) from `textSha256` and `quote`.
+    const binding = {
+      format: "retained_text_span_v1",
+      textSha256: "a".repeat(64),
+      textByteLength: 500,
+      textCodepointLength: 500,
+      start: 120,
+      end: 129,
+      quote: "$1,234.56",
+    };
+    const marketValueLocator = {
+      source: "pdf_statement",
+      index: 2,
+      field: "HOLDINGS / Market Value",
+      binding,
+    };
+
+    const pull = {
+      institutionId: INSTITUTION.id,
+      accountId: ACCOUNT.id,
+      acquired,
+      rows: [],
+      holdings: {
+        positions: [
+          {
+            sourceDocument: "statement",
+            asOf: "2026-03-31",
+            instrument: {
+              symbol: "WNDF",
+              cusip: null,
+              isin: null,
+              name: "WIDGET NEUTRAL FUND",
+            },
+            quantity: "10",
+            price: "318.4",
+            marketValue: "1234.56",
+            marketValueNote: null,
+            costBasis: "3000",
+            unrealized: "184",
+            currency: "USD",
+            valuationBasis: "market_price",
+            valuationNote: "Market Value column of the HOLDINGS table",
+            locators: {
+              row: { source: "pdf_statement", index: 2 },
+              marketValue: marketValueLocator,
+            },
+          },
+        ],
+        balances: [],
+        liabilities: [],
+      },
+      docType: "pdf_statement",
+      docDate: "2026-03-31",
+      persisted,
+    };
+
+    const documents = await adapterPullToImportDocuments(client, pull);
+    await importBatch(
+      client,
+      { source: INSTITUTION.slug, documents },
+      new Date("2026-04-01"),
+    );
+
+    const [row] = await all(
+      client,
+      "SELECT source_locator FROM positions WHERE account_id = $1",
+      [ACCOUNT.id],
+    );
+    assert.ok(row, "the position landed");
+    const locators = JSON.parse(row.source_locator);
+    assert.deepEqual(
+      locators.marketValue.binding,
+      binding,
+      "the binding adapterImport.ts stores is exactly the one the parser emitted",
+    );
+    assert.equal(locators.marketValue.field, "HOLDINGS / Market Value");
+    assert.equal(locators.marketValue.source, "pdf_statement");
+  },
+);
+
 // F1-43. A real institution's PDF statements use compressed content streams
 // the adapter's dependency-free extractor cannot read; parse() then returns
 // a parseNote instead of throwing, and the retained bytes must still be

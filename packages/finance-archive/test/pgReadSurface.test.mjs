@@ -18,6 +18,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
+  canonicalizeFinanceDecimal,
   parseAuthorizedFinanceReadExchange,
   parseFinanceReadRequest,
 } from "@repo/finance-contract";
@@ -27,11 +28,14 @@ import {
   adapterPullToImportDocuments,
   createArchivePool,
   createSyntheticSession,
+  fromNumericText,
   importBatch,
   persistAcquiredDocument,
   resolveRawTreeRoot,
   serveFinanceRead,
   syntheticAdapter,
+  textRelativePath,
+  writeRetainedText,
 } from "../dist/index.js";
 
 const SPACE = "space-synthetic-f121";
@@ -221,14 +225,14 @@ async function fixture(t) {
 
 
 /** Serves one request and checks the whole exchange against the contract. */
-async function serve(r, request) {
+async function serve(r, request, options) {
   const parsed = parseFinanceReadRequest({
     contractVersion: 1,
     spaceId: SPACE,
     limit: 10,
     ...request,
   });
-  const response = await serveFinanceRead(r.client, parsed, SPACE);
+  const response = await serveFinanceRead(r.client, parsed, SPACE, options);
   const exchange = parseAuthorizedFinanceReadExchange({
     request: parsed,
     response,
@@ -753,7 +757,7 @@ async function importedPull(t) {
       [account.id, `posrec_${account.id}`],
     );
   }
-  return { client, retainedPaths };
+  return { client, retainedPaths, rawTreeRoot };
 }
 
 /** The retained bytes a citation names, checked against the citation's own
@@ -899,6 +903,118 @@ test("PDF-tier holdings and balances stay withheld", { skip }, async (t) => {
     );
   }
 });
+
+/**
+ * Rewrites one positions row's `source_locator`, adding a `marketValue` key
+ * whose binding is a `retained_text_span_v1` span into a text file this
+ * helper actually writes under `rawTreeRoot` (F1-53). `quote` is
+ * `"$" + money`, which `textSpanQuoteAgrees` (pgRead.ts) reads back to the
+ * same canonical decimal after stripping the currency symbol.
+ */
+async function bindPdfPositionToRetainedText(client, rawTreeRoot) {
+  const row = await one(
+    client,
+    `SELECT p.id, p.market_value, p.currency
+       FROM positions p JOIN documents d ON d.id = p.source_document_id
+      WHERE d.media_type = $1
+      LIMIT 1`,
+    [PDF_TIER],
+  );
+  const money = canonicalizeFinanceDecimal(fromNumericText(row.market_value));
+  const quote = `$${money}`;
+  const text = `HOLDINGS\nSynthetic Neutral Fund   10.000   ${quote}   Cost 3,000.00\n`;
+  const start = text.indexOf(quote);
+  const written = writeRetainedText(rawTreeRoot, text);
+  const binding = {
+    format: "retained_text_span_v1",
+    textSha256: written.sha256,
+    textByteLength: Buffer.byteLength(text, "utf8"),
+    textCodepointLength: Array.from(text).length,
+    start,
+    end: start + quote.length,
+    quote,
+  };
+  await client.query(
+    `UPDATE positions SET source_locator = $2 WHERE id = $1`,
+    [
+      row.id,
+      JSON.stringify({
+        row: { source: "pdf_statement", index: 1 },
+        marketValue: {
+          source: "pdf_statement",
+          index: 1,
+          field: "HOLDINGS / Market Value",
+          binding,
+        },
+      }),
+    ],
+  );
+  return { recordId: `pos:${row.id}`, text, binding };
+}
+
+test(
+  "a PDF-tier position with a retained-text-span binding is served, and get_evidence verifies it against the retained text on disk",
+  { skip },
+  async (t) => {
+    const { client, rawTreeRoot } = await importedPull(t);
+    const r = await reader(t, client);
+    const { recordId, binding } = await bindPdfPositionToRetainedText(
+      client,
+      rawTreeRoot,
+    );
+
+    const response = await serve(r, { operation: "list_holdings", limit: 100 });
+    const item = response.items.find((row) => row.recordId === recordId);
+    assert.ok(item, "the bound position is served, not withheld");
+    assert.equal(item.evidence.length, 1);
+    const [evidence] = item.evidence;
+    assert.equal(evidence.kind, "retained_text_span_v1");
+    assert.equal(evidence.locator.quote, binding.quote);
+    assert.equal(evidence.locator.textSha256, binding.textSha256);
+    assert.equal(evidence.locator.relativePath, textRelativePath(binding.textSha256));
+    assert.equal(
+      evidence.locator.quoteSha256,
+      createHash("sha256").update(evidence.locator.quote, "utf8").digest("hex"),
+    );
+
+    // get_evidence, unlike list_holdings, opens the file and checks the
+    // quote against the actual bytes -- the "retained_sha256 check".
+    const getEvidenceResponse = await serve(
+      r,
+      { operation: "get_evidence", recordId },
+      { rawTreeRoot },
+    );
+    assert.deepEqual(getEvidenceResponse.items, item.evidence);
+  },
+);
+
+test(
+  "get_evidence withholds a retained-text-span citation it cannot verify on disk, even though list_holdings already served it",
+  { skip },
+  async (t) => {
+    const { client, rawTreeRoot } = await importedPull(t);
+    const r = await reader(t, client);
+    const { recordId } = await bindPdfPositionToRetainedText(client, rawTreeRoot);
+
+    const listed = await serve(r, { operation: "list_holdings", limit: 100 });
+    assert.ok(
+      listed.items.some((row) => row.recordId === recordId),
+      "list_holdings trusts the binding's own internal consistency",
+    );
+
+    // A raw tree root with no such file at all -- the disk check cannot even
+    // open the retained text, let alone verify the quote against it.
+    const emptyRoot = mkdtempSync(join(tmpdir(), "kith-finance-no-such-root-"));
+    t.after(() => rmSync(emptyRoot, { recursive: true, force: true }));
+    const response = await serve(
+      r,
+      { operation: "get_evidence", recordId },
+      { rawTreeRoot: emptyRoot },
+    );
+    assert.deepEqual(response.items, []);
+    assert.ok(response.coverage.reasons.includes("retained_evidence_unavailable"));
+  },
+);
 
 test("a document whose retained bytes were never recorded cites nothing", { skip }, async (t) => {
   const { client } = await importedPull(t);

@@ -27,6 +27,8 @@
 // (docs/plans/2026-09-11-structured-evidence.md, section 4).
 
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 import type pg from "pg";
 
@@ -64,6 +66,7 @@ import {
   parseFinanceCurrency,
   parseFinanceReadResponseShape,
   type RetainedSourceObject,
+  type RetainedTextSpanEvidence,
   type StructuredFieldLocator,
   SUPPORTED_FINANCE_CURRENCIES,
 } from "@repo/finance-contract";
@@ -71,6 +74,7 @@ import {
 import { fromNumericText } from "../pgNumeric.js";
 import { READER_STATEMENT_TIMEOUT_MS } from "../pgReaderRole.js";
 import { archiveSchemaOf } from "../pgStore.js";
+import { resolveRawTreeRoot, textRelativePath } from "../rawTree.js";
 
 /** Ceiling on rows any one coverage-support query may return. */
 const MAX_SUPPORT_ROWS = 500;
@@ -314,13 +318,94 @@ function bindingAgrees(
 }
 
 /**
+ * A stored `retained_text_span_v1` `FieldBinding` (adapter.ts) as the
+ * contract's locator, or null when it is not one. `quoteSha256` is derived
+ * from `quote` rather than trusted from storage, the same way
+ * `structuredLocator` derives `rawValueSha256`; `relativePath` is derived
+ * from `textSha256` (`textRelativePath`, rawTree.ts) rather than stored at
+ * all -- the parser that wrote this binding knows neither the raw tree root
+ * nor `documents.text_path`, and does not need to.
+ */
+function textSpanLocator(
+  value: unknown,
+): RetainedTextSpanEvidence["locator"] | null {
+  if (value === null || typeof value !== "object") return null;
+  const binding = value as Record<string, unknown>;
+  const { textSha256, textByteLength, textCodepointLength, start, end, quote } = binding;
+  if (
+    typeof textSha256 !== "string" ||
+    !/^[a-f0-9]{64}$/.test(textSha256) ||
+    typeof textByteLength !== "number" ||
+    !Number.isSafeInteger(textByteLength) ||
+    textByteLength < 1 ||
+    typeof textCodepointLength !== "number" ||
+    !Number.isSafeInteger(textCodepointLength) ||
+    textCodepointLength < 1 ||
+    typeof start !== "number" ||
+    !Number.isSafeInteger(start) ||
+    start < 0 ||
+    typeof end !== "number" ||
+    !Number.isSafeInteger(end) ||
+    end <= start ||
+    end > textCodepointLength ||
+    typeof quote !== "string" ||
+    quote.length === 0 ||
+    Array.from(quote).length !== end - start
+  )
+    return null;
+  return {
+    relativePath: textRelativePath(textSha256),
+    textSha256,
+    textByteLength,
+    textCodepointLength,
+    offsetUnit: "unicode_code_points",
+    start,
+    end,
+    quote,
+    quoteSha256: createHash("sha256").update(quote, "utf8").digest("hex"),
+  };
+}
+
+/** A one- or two-letter footnote reference printed after a statement value
+ * (statementLayout.mjs's own `FOOTNOTE_SUFFIX`) -- common enough across
+ * financial-statement formatting that stripping it here, generically, does
+ * not tie this read surface to one adapter's layout. */
+const TEXT_SPAN_FOOTNOTE_SUFFIX = /\s+[A-Za-z]{1,2}$/;
+
+/**
+ * Whether a `retained_text_span_v1` quote and the stored money value are the
+ * same number, under the small set of formatting conventions common to a
+ * printed financial statement: a leading currency symbol, thousands commas,
+ * parentheses for negative, and a trailing footnote letter. Never adapter
+ * specific beyond that -- see `bindingAgrees` for the structured-field twin.
+ */
+function textSpanQuoteAgrees(
+  quote: string,
+  money: CanonicalFinanceDecimal,
+): boolean {
+  const withoutFootnote = quote.trim().replace(TEXT_SPAN_FOOTNOTE_SUFFIX, "").trim();
+  const negative = /^\(.*\)$/.test(withoutFootnote);
+  const digits = withoutFootnote.replace(/^\(|\)$/g, "").replace(/[$,\s]/g, "");
+  if (digits.length === 0) return false;
+  try {
+    return canonicalizeFinanceDecimal(negative ? `-${digits}` : digits) === money;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * One record's evidence, or null when the archive cannot cite it.
  *
  * Null -- and a row withheld with `retained_evidence_unavailable` -- whenever
  * any of these is missing or unusable: the source document, any of its four
  * retained-provenance columns, a parsable `source_locator`, a binding on the
  * record's load-bearing money field, a usable money value and currency for
- * that field, or agreement between the two.
+ * that field, or agreement between the two. F1-53: the binding may be either
+ * `structured_field_v1` (F1-29, the JSON/tabular tiers) or
+ * `retained_text_span_v1` (the PDF tier) -- which one decides the evidence
+ * kind returned, and each kind's own agreement check decides whether the row
+ * is servable at all.
  */
 function evidenceFor(
   record: {
@@ -334,9 +419,22 @@ function evidenceFor(
 ): FinanceEvidence[] | null {
   if (document === null || record.money === null || record.currency === null)
     return null;
-  const locator = structuredLocator(
-    bindingOf(record.sourceLocator, record.field),
-  );
+  const binding = bindingOf(record.sourceLocator, record.field);
+  if (binding === null || typeof binding !== "object") return null;
+  if ((binding as { format?: unknown }).format === "retained_text_span_v1") {
+    const locator = textSpanLocator(binding);
+    if (locator === null || !textSpanQuoteAgrees(locator.quote, record.money))
+      return null;
+    return [
+      {
+        kind: "retained_text_span_v1",
+        evidenceId: `ev:${record.recordId}:${record.field}` as FinanceEvidenceId,
+        sourceObject: document,
+        locator,
+      },
+    ];
+  }
+  const locator = structuredLocator(binding);
   if (locator === null || !bindingAgrees(locator.rawValue, record.money))
     return null;
   return [
@@ -347,6 +445,45 @@ function evidenceFor(
       locator,
     },
   ];
+}
+
+/**
+ * The one place this read surface opens a file: whether a `retained_text_span_v1`
+ * item's quote is actually present in the retained text on disk, not just
+ * self-consistent in storage (F1-53's "retained_sha256 check"). Every other
+ * evidence kind, and every list operation, trusts a binding's own internal
+ * consistency instead -- this check is `get_evidence`-only, one record at a
+ * time, precisely because it costs a disk read.
+ *
+ * `relativePath` is derived from `textSha256` alone (`textRelativePath`), so
+ * this needs no `documents` column to find the file: the same fanout
+ * `writeRetainedText` wrote it under is reproduced here with the configured
+ * raw tree root prepended. `rawTreeRoot` is null when the caller has none
+ * configured (`serveFinanceRead`'s `resolveRawTreeRoot()` fallback threw),
+ * which withholds every text-span item rather than throwing mid-response --
+ * a read surface with no raw tree root cannot serve one, and every other
+ * evidence kind is unaffected.
+ */
+function verifiedAgainstRetainedText(
+  item: FinanceEvidence,
+  rawTreeRoot: string | null,
+): boolean {
+  if (item.kind !== "retained_text_span_v1") return true;
+  if (rawTreeRoot === null) return false;
+  let bytes: Buffer;
+  try {
+    bytes = readFileSync(join(rawTreeRoot, item.locator.relativePath));
+  } catch {
+    return false;
+  }
+  const actualSha256 = createHash("sha256").update(bytes).digest("hex");
+  if (
+    actualSha256 !== item.locator.textSha256 ||
+    bytes.byteLength !== item.locator.textByteLength
+  )
+    return false;
+  const text = bytes.toString("utf8");
+  return text.slice(item.locator.start, item.locator.end) === item.locator.quote;
 }
 
 type ReadScope = {
@@ -1064,6 +1201,7 @@ async function getEvidence(
   client: pg.ClientBase,
   scope: ReadScope,
   request: GetEvidenceRequest,
+  rawTreeRoot: string | null,
 ): Promise<FinanceReadResponse> {
   const separator = request.recordId.indexOf(":");
   const record = RECORD_TABLES[request.recordId.slice(0, separator)];
@@ -1098,8 +1236,19 @@ async function getEvidence(
           documentOf(row),
         )
       : null;
-    if (evidence !== null) items = evidence;
-    else scope.withheld.add(row ? "retained_evidence_unavailable" : "source_gap");
+    // F1-53: get_evidence, unlike a list operation, opens the retained text a
+    // `retained_text_span_v1` item names and checks the quote against the
+    // actual bytes on disk (verifiedAgainstRetainedText's doc comment) --
+    // asked for one record at a time, it can afford the read a page of up to
+    // `MAX_FINANCE_PAGE_SIZE` rows cannot.
+    if (
+      evidence !== null &&
+      evidence.every((item) => verifiedAgainstRetainedText(item, rawTreeRoot))
+    ) {
+      items = evidence;
+    } else {
+      scope.withheld.add(row ? "retained_evidence_unavailable" : "source_gap");
+    }
   }
   return {
     ...envelope(scope, "get_evidence", false, undefined),
@@ -1509,6 +1658,15 @@ export async function serveFinanceRead(
   client: pg.ClientBase,
   request: FinanceReadRequest,
   spaceId: string,
+  /**
+   * F1-53: the raw tree root `get_evidence` opens a `retained_text_span_v1`
+   * item's text under (`verifiedAgainstRetainedText`). Omitted in every real
+   * caller (`mcp/server.ts`), which falls back to the configured
+   * `FINANCE_ARCHIVE_RAW_TREE_ROOT` (`resolveRawTreeRoot()`); a test supplies
+   * one explicitly instead of mutating that process-wide environment
+   * variable. Every other operation ignores this entirely.
+   */
+  options: { rawTreeRoot?: string } = {},
 ): Promise<FinanceReadResponse> {
   if (request.spaceId !== spaceId) {
     throw new FinanceContractError("not_authorized");
@@ -1528,8 +1686,19 @@ export async function serveFinanceRead(
         return listBalances(client, scope, request);
       case "aggregate_money":
         return aggregateMoney(client, scope, request);
-      case "get_evidence":
-        return getEvidence(client, scope, request);
+      case "get_evidence": {
+        let rawTreeRoot: string | null;
+        if (options.rawTreeRoot !== undefined) {
+          rawTreeRoot = options.rawTreeRoot;
+        } else {
+          try {
+            rawTreeRoot = resolveRawTreeRoot();
+          } catch {
+            rawTreeRoot = null;
+          }
+        }
+        return getEvidence(client, scope, request, rawTreeRoot);
+      }
       case "get_coverage":
         return getCoverage(client, scope, request);
     }

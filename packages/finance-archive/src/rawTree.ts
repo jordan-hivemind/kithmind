@@ -181,6 +181,19 @@ export function sha256HexOf(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+/**
+ * The `text` namespace's fanout path for a retained text artifact, relative
+ * to the raw tree root, computed from its own content hash alone -- no root,
+ * no disk access. `writeRetainedText` writes exactly here (it calls the same
+ * fanout scheme with `root` prepended), so a parser building a
+ * `retained_text_span_v1` `FieldBinding` (adapter.ts) and a read surface
+ * resolving one (`pgRead.ts`) always agree on the same spelling without
+ * either one knowing where the root actually is. F1-53.
+ */
+export function textRelativePath(sha256: string): string {
+  return `text/${sha256.slice(0, 2)}/${sha256.slice(2, 4)}/${sha256}.txt`;
+}
+
 function fanoutPath(
   root: string,
   namespace: string,
