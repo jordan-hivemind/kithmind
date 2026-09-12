@@ -497,6 +497,15 @@ anthropic otherwise), so an attempt row's `modelId` never mixes vendors within
 one ladder run and per-vendor escalation rates stay comparable from the
 attempt rows alone.
 
+The one schema in section 5.3 is rendered to fit both providers' tool-call
+contracts, not just Anthropic's looser one: OpenAI's strict structured-output
+mode requires every property of every object, at every nesting level, to
+appear in `required`, so an optional property is a required `null` union
+rather than an omitted key (P2-78). The runner-facing parsing already reads
+that `null` exactly like an absent property, since it narrows a specific JS
+type at every check; nothing downstream of the schema needed to change for
+this.
+
 ### 5.4 Attempt records
 
 `cardExtractionAttempts`, one row per attempt, retained for cost reporting and
@@ -539,6 +548,35 @@ A paused backfill is a visible state in source status, not a silent stop and
 not an error. Because the queue row is the durable state, a restart resumes
 from it, a killed runner loses at most one in-flight document, and an accepted
 card is never re-extracted merely because the process died.
+
+#### As implemented in P2-70f and hardened in P2-78
+
+The implemented queue is `cardExtractionQueueStates`, one row per
+`(spaceId, kind)`, with a `phase` of `running`, `paused` or `idle` rather than
+a per-document `state`; a document is claimed and resolved one at a time by
+`claimNextForExtraction` and `recordExtractionOutcome`, per the ladder's own
+budgets (daily and weekly document counts, a weekly cost cap), not the
+per-hour/day/week USD table above.
+
+A ladder run that raises (the runner or the provider it called failed
+outright, rather than returning a normal `accepted`/`review`/`refused`
+outcome) is caught by the tick, never left to escape uncaught: it is counted
+as `provider_failed` when the raised error is one of the two hosted
+providers' own (a transport failure, a non-2xx response, missing credentials
+or empty input), or folded into `gateFailedCount` (an ordinary `review`)
+otherwise, since neither is a normal gate rejection but a caught provider
+failure is closer to "this document needs a human" than to "the ladder
+disagreed with itself." Either way the tick still resolves the claimed
+document and reports whether to schedule a successor, so a caller can never
+be left holding an uncaught rejection with nothing scheduled after it and the
+queue still reporting `running`.
+
+Three consecutive raised ticks (`consecutiveFailures`, reset by any tick that
+completes without raising) pause the queue with `pauseReason` `provider_error`
+rather than a fourth attempt, so a systemic problem (a misconfigured request,
+an outage) does not silently burn through the rest of the backlog marking
+every remaining document failed. `provider_error` does not self-clear:
+`resumeExtractionQueue` lifts it, the same as a `manual` pause.
 
 ## 7. Review queue
 

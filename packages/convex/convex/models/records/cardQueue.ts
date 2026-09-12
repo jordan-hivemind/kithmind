@@ -30,6 +30,13 @@ import { cardEventKey, isCardRecordKind, type CardRecordKind } from "./cardSchem
 const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEK_MS = 7 * DAY_MS;
 
+/**
+ * After this many consecutive ticks raise instead of returning an outcome,
+ * the queue pauses with `provider_error` rather than trying a fourth
+ * document. Any tick that completes without raising resets the streak.
+ */
+const MAX_CONSECUTIVE_TICK_FAILURES = 3;
+
 export const DEFAULT_DAILY_DOCUMENT_BUDGET = 10;
 export const DEFAULT_WEEKLY_DOCUMENT_BUDGET = 50;
 /** Section 6 of the plan states the weekly cap as 50 USD. */
@@ -311,6 +318,15 @@ export async function claimNextForExtraction(
  * it. This is the only place a document becomes resolved after a claim, so a
  * kill before this runs leaves it unresolved and it is reconsidered, safely,
  * on the next claim.
+ *
+ * `errorCode` is set only when the tick caught the ladder raising (see
+ * `runCardExtractionQueueTick`): it drives `consecutiveFailures` and the
+ * eventual `provider_error` pause, and is cleared (patched to `undefined`)
+ * by the very next tick that resolves normally, raised or not, so a stale
+ * error never lingers once the queue is healthy again. An ordinary `review`
+ * outcome the ladder itself returned (no exception) never sets it, and so
+ * never counts toward the failure streak: a normal gate rejection is not a
+ * production defect.
  */
 export async function recordExtractionOutcome(
   ctx: MutationCtx,
@@ -319,7 +335,8 @@ export async function recordExtractionOutcome(
     kind: CardRecordKind;
     sourceItemId: Id<"sourceItems">;
     itemCreationTime: number;
-    outcome: "accepted" | "review" | "refused";
+    outcome: "accepted" | "review" | "refused" | "provider_failed";
+    errorCode?: string;
     now: number;
   },
 ): Promise<{ phase: Doc<"cardExtractionQueueStates">["phase"] }> {
@@ -335,6 +352,10 @@ export async function recordExtractionOutcome(
     )
     .reduce((total, attempt) => total + (attempt.costMicroUsd ?? 0), 0);
 
+  const raised = input.errorCode !== undefined;
+  const consecutiveFailures = raised ? (state.consecutiveFailures ?? 0) + 1 : 0;
+  const pause = raised && consecutiveFailures >= MAX_CONSECUTIVE_TICK_FAILURES;
+
   await ctx.db.patch(state._id, {
     cursor: input.itemCreationTime,
     documentsProcessedToday: state.documentsProcessedToday + 1,
@@ -344,10 +365,21 @@ export async function recordExtractionOutcome(
       ? { extractedCount: state.extractedCount + 1 }
       : input.outcome === "review"
         ? { gateFailedCount: state.gateFailedCount + 1 }
-        : { skippedCount: state.skippedCount + 1 }),
+        : input.outcome === "provider_failed"
+          ? { providerFailedCount: (state.providerFailedCount ?? 0) + 1 }
+          : { skippedCount: state.skippedCount + 1 }),
+    consecutiveFailures,
+    lastErrorCode: input.errorCode,
+    ...(pause
+      ? {
+          phase: "paused" as const,
+          pauseReason: "provider_error" as const,
+          resumeAt: undefined,
+        }
+      : {}),
     updatedAt: input.now,
   });
-  return { phase: state.phase };
+  return { phase: pause ? "paused" : state.phase };
 }
 
 // --- the plain, injectable tick, mirroring cardLadder's `CardLadderOps` ---
@@ -360,7 +392,8 @@ export type QueueTickOps = {
   recordOutcome: (input: {
     sourceItemId: Id<"sourceItems">;
     itemCreationTime: number;
-    outcome: "accepted" | "review" | "refused";
+    outcome: "accepted" | "review" | "refused" | "provider_failed";
+    errorCode?: string;
   }) => Promise<{ phase: Doc<"cardExtractionQueueStates">["phase"] }>;
 };
 
@@ -370,6 +403,44 @@ export type QueueTickResult = {
   continue: boolean;
 };
 
+/**
+ * Both the hosted providers' own errors (`cardExtractionProvider.ts` and
+ * `openAICardExtractionProvider.ts`) start with this: a transport failure,
+ * a non-2xx response, missing credentials or empty input. Anything else
+ * that reaches this catch is an unexpected failure elsewhere in the ladder
+ * (staging, gating, publishing), which is closer in kind to an ordinary
+ * gate rejection than to a provider outage, so it is counted the same way
+ * a `review` outcome is.
+ */
+const PROVIDER_ERROR_MESSAGE_PREFIX = "Card extraction";
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Classifies a raised ladder call into the bucket `recordExtractionOutcome`
+ * counts it under and a small, fixed error code — never the raised error's
+ * full message, which (for anything other than the two hosted providers'
+ * own bounded errors) is not guaranteed to be free of document content.
+ */
+export function classifyQueueTickFailure(error: unknown): {
+  outcome: "review" | "provider_failed";
+  errorCode: string;
+} {
+  return errorMessage(error).startsWith(PROVIDER_ERROR_MESSAGE_PREFIX)
+    ? { outcome: "provider_failed", errorCode: "provider_error" }
+    : { outcome: "review", errorCode: "gate_error" };
+}
+
+/**
+ * Runs at most one step. A step that claims a document always resolves it,
+ * one way or another: the ladder's own outcome, or, if `runLadder` (a
+ * runner or provider failure) or `recordOutcome` itself raises, a caught
+ * failure recorded and counted instead. Never a caller left to discover an
+ * uncaught rejection with the document still claimed and nothing scheduled
+ * after it, which is what a raise here used to do.
+ */
 export async function runCardExtractionQueueTick(
   ops: QueueTickOps,
 ): Promise<QueueTickResult> {
@@ -380,13 +451,32 @@ export async function runCardExtractionQueueTick(
   if (claim.status === "advanced") {
     return { status: "advanced", continue: true };
   }
-  const ladder = await ops.runLadder(claim.sourceItemId);
-  const recorded = await ops.recordOutcome({
-    sourceItemId: claim.sourceItemId,
-    itemCreationTime: claim.itemCreationTime,
-    outcome: ladder.outcome,
-  });
-  return { status: "claimed", continue: recorded.phase === "running" };
+  try {
+    const ladder = await ops.runLadder(claim.sourceItemId);
+    const recorded = await ops.recordOutcome({
+      sourceItemId: claim.sourceItemId,
+      itemCreationTime: claim.itemCreationTime,
+      outcome: ladder.outcome,
+    });
+    return { status: "claimed", continue: recorded.phase === "running" };
+  } catch (error) {
+    const failure = classifyQueueTickFailure(error);
+    try {
+      const recorded = await ops.recordOutcome({
+        sourceItemId: claim.sourceItemId,
+        itemCreationTime: claim.itemCreationTime,
+        outcome: failure.outcome,
+        errorCode: failure.errorCode,
+      });
+      return { status: "claimed", continue: recorded.phase === "running" };
+    } catch {
+      // Recording the failure itself failed (for example, a transient
+      // database error). Stop rather than risk the same document being
+      // claimed forever with no record of why: the same zombie state this
+      // catch exists to prevent, one level down.
+      return { status: "claimed", continue: false };
+    }
+  }
 }
 
 // --- operator entry points -------------------------------------------------
@@ -456,6 +546,8 @@ export const startExtractionQueue = internalMutation({
         extractedCount: 0,
         gateFailedCount: 0,
         skippedCount: 0,
+        providerFailedCount: 0,
+        consecutiveFailures: 0,
         startedAt: now,
         updatedAt: now,
       });
@@ -570,6 +662,9 @@ export const cardExtractionQueueStatus = internalQuery({
       extracted: state.extractedCount,
       gateFailed: state.gateFailedCount,
       skipped: state.skippedCount,
+      providerFailed: state.providerFailedCount ?? 0,
+      consecutiveFailures: state.consecutiveFailures ?? 0,
+      lastErrorCode: state.lastErrorCode,
       documentsProcessedToday: state.documentsProcessedToday,
       dailyDocumentBudget: state.dailyDocumentBudget,
       documentsProcessedThisWeek: state.documentsProcessedThisWeek,
@@ -663,7 +758,9 @@ export const recordTick = internalMutation({
       v.literal("accepted"),
       v.literal("review"),
       v.literal("refused"),
+      v.literal("provider_failed"),
     ),
+    errorCode: v.optional(v.string()),
     now: v.number(),
   },
   handler: async (ctx, args) =>
@@ -673,6 +770,7 @@ export const recordTick = internalMutation({
       sourceItemId: args.sourceItemId,
       itemCreationTime: args.itemCreationTime,
       outcome: args.outcome,
+      errorCode: args.errorCode,
       now: args.now,
     }),
 });

@@ -1,11 +1,13 @@
 import { describe, expect, test } from "vitest";
 
 import {
+  CardExtractionHttpError,
   loadOpenAICardExtractionConfig,
   openAICardExtractionBody,
   OPENAI_CARD_EXTRACTION_ENDPOINT,
   parseOpenAICardExtractionResponse,
   requestOpenAICardExtraction,
+  sanitizedOpenAIErrorCode,
 } from "./openAICardExtractionProvider";
 
 import {
@@ -193,5 +195,102 @@ describe("parsing an OpenAI response", () => {
         ),
       ),
     ).toThrow("Card extraction request failed");
+  });
+});
+
+describe("sanitizing an OpenAI error code", () => {
+  test("reads error.code when present", () => {
+    expect(
+      sanitizedOpenAIErrorCode({ error: { code: "invalid_request_error" } }),
+    ).toBe("invalid_request_error");
+  });
+
+  test("falls back to error.type when code is absent", () => {
+    expect(
+      sanitizedOpenAIErrorCode({ error: { type: "invalid_request_error" } }),
+    ).toBe("invalid_request_error");
+  });
+
+  test("falls back to unknown for a shape it does not recognize", () => {
+    expect(sanitizedOpenAIErrorCode({ error: {} })).toBe("unknown");
+    expect(sanitizedOpenAIErrorCode(null)).toBe("unknown");
+    expect(sanitizedOpenAIErrorCode("not an object")).toBe("unknown");
+  });
+
+  test("refuses a code that is unreasonably long or contains free text", () => {
+    expect(
+      sanitizedOpenAIErrorCode({ error: { code: "x".repeat(65) } }),
+    ).toBe("unknown");
+    expect(
+      sanitizedOpenAIErrorCode({ error: { code: "has a space" } }),
+    ).toBe("unknown");
+  });
+});
+
+describe("a non-2xx OpenAI response", () => {
+  test("carries the HTTP status and a sanitized code, never the body or the key", async () => {
+    const request = buildCardExtractionRequest(
+      { recordKind: "document_card", pages: PAGES },
+      CARD_TIER0_MODEL_OPENAI,
+    );
+    const config = loadOpenAICardExtractionConfig({ OPENAI_API_KEY: SECRET });
+    let thrown: unknown;
+    try {
+      await requestOpenAICardExtraction(request, config, async () =>
+        new Response(
+          JSON.stringify({
+            error: {
+              code: "invalid_request_error",
+              message: `rejected, key ${SECRET} was used`,
+            },
+          }),
+          { status: 400, headers: { "content-type": "application/json" } },
+        ),
+      );
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(CardExtractionHttpError);
+    const error = thrown as CardExtractionHttpError;
+    expect(error.status).toBe(400);
+    expect(error.message).toContain("Card extraction request failed");
+    expect(error.message).toContain("400");
+    expect(error.message).toContain("invalid_request_error");
+    expect(error.message).not.toContain(SECRET);
+    expect(error.message).not.toContain("rejected, key");
+  });
+
+  test("still carries the status when the error body is not JSON", async () => {
+    const request = buildCardExtractionRequest(
+      { recordKind: "document_card", pages: PAGES },
+      CARD_TIER0_MODEL_OPENAI,
+    );
+    const config = loadOpenAICardExtractionConfig({ OPENAI_API_KEY: SECRET });
+    await expect(
+      requestOpenAICardExtraction(
+        request,
+        config,
+        async () => new Response("<html>not json</html>", { status: 503 }),
+      ),
+    ).rejects.toMatchObject({ status: 503, message: expect.stringContaining("unknown") });
+  });
+
+  test("a subsequent thrown parse failure still collapses to the generic message", async () => {
+    const request = buildCardExtractionRequest(
+      { recordKind: "document_card", pages: PAGES },
+      CARD_TIER0_MODEL_OPENAI,
+    );
+    const config = loadOpenAICardExtractionConfig({ OPENAI_API_KEY: SECRET });
+    await expect(
+      requestOpenAICardExtraction(
+        request,
+        config,
+        async () =>
+          new Response("not json at all", {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+      ),
+    ).rejects.toThrow("Card extraction request failed");
   });
 });

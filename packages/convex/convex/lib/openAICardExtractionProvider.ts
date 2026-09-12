@@ -2,8 +2,10 @@
  * The hosted OpenAI card-extraction provider. Same secret-handling and
  * bounded-response pattern as `cardExtractionProvider.ts`: the key is read
  * from the environment at the call site, it never enters a log, an error
- * message, a fingerprint or the repository, and every failure collapses to
- * one generic message.
+ * message, a fingerprint or the repository. A non-2xx response's error
+ * carries the HTTP status and a sanitized code (`CardExtractionHttpError`,
+ * never the response body or the key); every other failure collapses to one
+ * generic message.
  *
  * Uses Chat Completions with a forced function call for structured JSON
  * output: the OpenAI equivalent of the Anthropic runner's forced
@@ -136,10 +138,53 @@ export function parseOpenAICardExtractionResponse(
 }
 
 /**
+ * Thrown only for a non-2xx OpenAI response. Its message carries the HTTP
+ * status and a sanitized error code so an operator can tell "misconfigured
+ * request" (400, `invalid_request_error`) from "no budget" (429) from "the
+ * service is down" (5xx) without a network trace — never the response body
+ * or the key. `requestOpenAICardExtraction`'s catch-all only widens this to
+ * the fully generic message for errors it does not itself throw, so this
+ * detail survives instead of being discarded there.
+ */
+export class CardExtractionHttpError extends Error {
+  readonly status: number;
+  constructor(status: number, code: string) {
+    super(`Card extraction request failed (status ${status}, code ${code})`);
+    this.name = "CardExtractionHttpError";
+    this.status = status;
+  }
+}
+
+/** Only `[a-z0-9_.-]`, at most 64 characters: OpenAI's own error vocabulary,
+ * never free text, so nothing reflected from the response body can pass
+ * through unbounded. */
+const ERROR_CODE_PATTERN = /^[a-z0-9_.-]{1,64}$/i;
+
+/** Reads `error.code` or `error.type` out of an OpenAI error body, if present
+ * and shaped like OpenAI's own short error codes. Anything else, including a
+ * body that fails to parse at all, becomes "unknown" rather than being
+ * surfaced verbatim. */
+export function sanitizedOpenAIErrorCode(payload: unknown): string {
+  const errorObject =
+    payload && typeof payload === "object"
+      ? (payload as { error?: unknown }).error
+      : undefined;
+  const candidate =
+    errorObject && typeof errorObject === "object"
+      ? ((errorObject as { code?: unknown }).code ??
+        (errorObject as { type?: unknown }).type)
+      : undefined;
+  return typeof candidate === "string" && ERROR_CODE_PATTERN.test(candidate)
+    ? candidate
+    : "unknown";
+}
+
+/**
  * Makes one bounded structured-extraction request against OpenAI. The key is
  * sent on this one request and is never returned, logged or attached to an
- * error: every failure below is the same generic message the Anthropic
- * runner raises.
+ * error. A non-2xx response raises `CardExtractionHttpError` with the status
+ * and a sanitized code; every other failure below collapses to the same
+ * generic message the Anthropic runner raises.
  */
 export async function requestOpenAICardExtraction(
   request: CardExtractionRequest,
@@ -166,8 +211,16 @@ export async function requestOpenAICardExtraction(
       redirect: "error",
     });
     if (!response.ok) {
-      await response.body?.cancel();
-      throw new Error("Card extraction request failed");
+      let code = "unknown";
+      try {
+        code = sanitizedOpenAIErrorCode(
+          JSON.parse(await readBoundedResponse(response)),
+        );
+      } catch {
+        // Body unreadable or not JSON: the status alone still tells the
+        // operator most of what they need, so fall through with it.
+      }
+      throw new CardExtractionHttpError(response.status, code);
     }
     return parseOpenAICardExtractionResponse(
       await readBoundedResponse(response),
@@ -175,10 +228,11 @@ export async function requestOpenAICardExtraction(
     );
   } catch (error) {
     if (
-      error instanceof Error &&
-      (error.message === "Card extraction input must not be empty" ||
-        error.message ===
-          "Card extraction provider credentials are unavailable")
+      error instanceof CardExtractionHttpError ||
+      (error instanceof Error &&
+        (error.message === "Card extraction input must not be empty" ||
+          error.message ===
+            "Card extraction provider credentials are unavailable"))
     ) {
       throw error;
     }
