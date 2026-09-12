@@ -49,6 +49,10 @@
     "@repo/finance-contract#test:once": {
       "cache": false,
       "dependsOn": ["build"]
+    },
+    "@repo/web#test:once": {
+      "cache": false,
+      "dependsOn": ["^build"]
     }
   },
   "globalPassThroughEnv": ["PORT", "WEB_PORT"],
@@ -62,6 +66,8 @@
     "MCP_JWT_PUBLIC_JWK",
     "MCP_JWT_KEY_ID",
     "MCP_OAUTH_ENCRYPTION_KEY",
-    "MCP_TOOL_PROFILE"
+    "MCP_TOOL_PROFILE",
+    "FINANCE_ARCHIVE_READER_DATABASE_URL",
+    "FINANCE_ARCHIVE_SPACE_ID"
   ]
 }

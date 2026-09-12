@@ -39,7 +39,7 @@ describe("MCP memory quality contract", () => {
   });
 
   test("tells capable clients to recall verbatim and capture only grounded facts", async () => {
-    const server = createMcpServer("test-convex-auth-token");
+    const server = createMcpServer("test-convex-auth-token", "user-test");
     const client = new Client({ name: "memory-quality-test", version: "1" });
     const [clientTransport, serverTransport] =
       InMemoryTransport.createLinkedPair();
@@ -119,7 +119,7 @@ describe("MCP memory quality contract", () => {
 
   test("narrows to the memory surface only when explicitly opted in", async () => {
     process.env.MCP_TOOL_PROFILE = "memory";
-    const server = createMcpServer("test-convex-auth-token");
+    const server = createMcpServer("test-convex-auth-token", "user-test");
     const client = new Client({ name: "memory-profile-test", version: "1" });
     const [clientTransport, serverTransport] =
       InMemoryTransport.createLinkedPair();
@@ -283,7 +283,7 @@ describe("MCP memory quality contract", () => {
         },
       ]);
 
-    const server = createMcpServer("test-convex-auth-token");
+    const server = createMcpServer("test-convex-auth-token", "user-test");
     const client = new Client({ name: "memory-quality-test", version: "1" });
     const [clientTransport, serverTransport] =
       InMemoryTransport.createLinkedPair();
@@ -347,7 +347,7 @@ describe("MCP memory quality contract", () => {
       results: [],
       vectorStatus: "unavailable",
     });
-    const server = createMcpServer("test-convex-auth-token");
+    const server = createMcpServer("test-convex-auth-token", "user-test");
     const client = new Client({ name: "memory-quality-test", version: "1" });
     const [clientTransport, serverTransport] =
       InMemoryTransport.createLinkedPair();
@@ -392,7 +392,7 @@ describe("MCP memory quality contract", () => {
         summary: "Atlas Memory release",
       },
     });
-    const server = createMcpServer("test-convex-auth-token");
+    const server = createMcpServer("test-convex-auth-token", "user-test");
     const client = new Client({ name: "memory-quality-test", version: "1" });
     const [clientTransport, serverTransport] =
       InMemoryTransport.createLinkedPair();
@@ -436,7 +436,7 @@ describe("MCP memory quality contract", () => {
       statement: "Alex — primary care provider: Dr. Rivera.",
       operation: "stored",
     });
-    const server = createMcpServer("test-convex-auth-token");
+    const server = createMcpServer("test-convex-auth-token", "user-test");
     const client = new Client({ name: "memory-quality-test", version: "1" });
     const [clientTransport, serverTransport] =
       InMemoryTransport.createLinkedPair();

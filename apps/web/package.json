@@ -16,6 +16,8 @@
     "@convex-dev/auth": "^0.0.94",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@repo/db": "workspace:*",
+    "@repo/finance-archive": "workspace:*",
+    "@repo/finance-contract": "workspace:*",
     "convex": "^1.43.0",
     "jose": "^6.2.8",
     "next": "^15.5.25",

@@ -19,7 +19,7 @@ vi.mock("convex/browser", () => ({
 import { createMcpServer } from "./server";
 
 async function call(name: string, args: Record<string, unknown>) {
-  const server = createMcpServer("signed-test-token");
+  const server = createMcpServer("signed-test-token", "user-test");
   const client = new Client({ name: "space-contract", version: "1" });
   const [clientTransport, serverTransport] =
     InMemoryTransport.createLinkedPair();

@@ -35,6 +35,12 @@ importers:
       '@repo/db':
         specifier: workspace:*
         version: link:../../packages/convex
+      '@repo/finance-archive':
+        specifier: workspace:*
+        version: link:../../packages/finance-archive
+      '@repo/finance-contract':
+        specifier: workspace:*
+        version: link:../../packages/finance-contract
       convex:
         specifier: ^1.43.0
         version: 1.43.0(react@19.2.8)

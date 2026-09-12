@@ -77,6 +77,41 @@ person linking and conversational `me` resolution are separate work.
 | `list_events`         | Entity, event type, `[from,to)`, order and optional cursor                |
 | `sum_money`           | Entity or source account, line-item type, `[from,to)` and optional cursor |
 
+### Update 2026-09-11: a second provider behind `query_records` (F1-10)
+
+`query_records` now answers from two providers and never combines them. A
+query with no `provider` is the Kith Mind record store above, unchanged. A
+query of the form `{ provider: "finance_archive", request }` reads the
+[financial archive](./2026-09-07-financial-transaction-database.md) instead,
+where `request` is a
+[finance read contract](./2026-09-08-finance-read-contract.md) request and the
+archive's own response is returned unchanged.
+
+| Decision                    | Why                                                                                                                                                                                                                                                              |
+| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Pass through, not translate | The archive owns canonical transaction, holding and balance identity. Reshaping its rows into events and observations would invent the dates, entity identities and currency groups it is authoritative for, which is the competing ledger the boundary forbids. |
+| One tool, two providers     | The owner asks one server. A second MCP tool for the same question is a second thing to discover and to keep in sync.                                                                                                                                            |
+| Results never merged        | Each call answers from one provider. No row from one appears in the other's result, and neither total absorbs the other's.                                                                                                                                       |
+
+The archive's own operations are the six the finance contract defines, not the
+five above. Its completeness, truncation, coverage reasons, issues and evidence
+cross the gateway untouched, so a partial archive response is a partial
+`query_records` response. Money stays a decimal string end to end: the reader
+connection decodes `NUMERIC` as text and the contract's response parser rejects
+a value that is not canonical.
+
+`list_sources` reports the archive's own inventory in a separate
+`financeArchive` block, which is the archive's `get_coverage` response at the
+coverage granularity this contract requires. It is never merged into `sources`.
+A configured archive that cannot be reached is reported as unavailable rather
+than omitted, because an omitted block reads as a complete inventory with no
+financial sources in it.
+
+An unconfigured archive is an explicit refusal, not an empty page. A principal
+who is not a current member of the archive's space, or a request naming any
+other space, is `not_authorized` rather than empty, so a denial can never be
+read as an absence.
+
 An optional source-account subset narrows the selected inventory. Current
 membership, read capability, and credential space scopes are rechecked for
 every page. Credential source-account grants authorize ingestion; they do not
