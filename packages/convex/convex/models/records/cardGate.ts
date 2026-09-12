@@ -118,7 +118,7 @@ function fold(value: string): string {
 /** Grouping separators. The full stop is deliberately absent: it is a radix
  * point in the formats this registry accepts, and guessing between the two is
  * exactly the ambiguity rule 4 refuses elsewhere. */
-const GROUPING_SEPARATORS = /[,    _]/gu;
+const GROUPING_SEPARATORS = /[,\s_]/gu;
 
 function stripGrouping(value: string): string {
   return value.replace(GROUPING_SEPARATORS, "");
@@ -268,11 +268,11 @@ function splitCurrency(text: string): {
   rest: string;
   allowed: readonly string[] | undefined;
 } {
-  const trailing = /^(.*?)[\s ]*([A-Za-z]{3})$/u.exec(text);
+  const trailing = /^(.*?)\s*([A-Za-z]{3})$/u.exec(text);
   if (trailing && isIsoCode(trailing[2]!)) {
     return { rest: trailing[1]!.trim(), allowed: [trailing[2]!] };
   }
-  const leading = /^([A-Za-z]{3})[\s ]*(.*)$/u.exec(text);
+  const leading = /^([A-Za-z]{3})\s*(.*)$/u.exec(text);
   if (leading && isIsoCode(leading[1]!)) {
     return { rest: leading[2]!.trim(), allowed: [leading[1]!] };
   }
