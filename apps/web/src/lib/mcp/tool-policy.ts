@@ -78,6 +78,7 @@ export const MCP_MEMORY_TOOL_NAMES = [
   MCP_TOOL_NAMES.getDocument,
   MCP_TOOL_NAMES.listSources,
   MCP_TOOL_NAMES.listInventory,
+  MCP_TOOL_NAMES.listReviewQueue,
   MCP_TOOL_NAMES.listSpaces,
   MCP_TOOL_NAMES.searchFacts,
   MCP_TOOL_NAMES.rememberFact,
