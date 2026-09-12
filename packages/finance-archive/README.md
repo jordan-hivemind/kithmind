@@ -271,9 +271,24 @@ the duplicates — it is not part of the migration, which adds nullable columns
 and backfills nothing, the same policy every migration in `pgSchema.ts` uses.
 
 It groups non-superseded `documents` rows by provider document id (the column,
-then the capture manifest's), falling back to institution, account, doc_type,
-doc_date and the capture's own period for every row recorded before any
-provider id was. It keeps the earliest capture's row as canonical, repoints
+then the capture manifest's), falling back for every row recorded before any
+provider id was to institution, account, doc_type, doc_date, the capture's own
+period, and the normalized hash of the row's own retained text (F1-71b):
+`documents.text_path`, read and resolved against the raw tree root, whitespace
+runs collapsed to one space, sha256. Measured on the owner's archive, metadata
+alone formed 1,018 groups against a provider listing of 1,321 statements, with
+about 100 of those groups holding 2-4 genuinely different documents — same
+account, same statement date, same ~28-day period, so the period changed
+nothing. The text hash is what separates them: a provider re-render produces
+different PDF bytes but identical parsed text, while two different documents
+never share text, so adding it to the key can only fail to merge a group
+(leaving a duplicate row standing), never merge two different documents. A row
+with no `text_path`, or whose text file is missing or unreadable, keeps a key
+unique to itself and is never merged with anything; the run counts and prints
+how many rows fell back this way, alongside the number of canonical rows that
+would remain (documents considered minus rows marked superseded), to compare
+against a provider listing count. It keeps the earliest capture's row as
+canonical, repoints
 `positions`, `balances`, `liabilities`, `transactions`, `commitments` and
 `review_items` at it — deleting, rather than repointing, any row whose arrival
 would violate the target table's own unique constraint (`row_hash`,
