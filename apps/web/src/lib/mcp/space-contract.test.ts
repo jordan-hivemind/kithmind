@@ -90,6 +90,7 @@ describe("MCP space routing", () => {
     ["search_documents", { query: "clinic" }],
     ["get_document", { documentId: "document" }],
     ["list_sources", {}],
+    ["list_inventory", { sourceAccountId: "account" }],
     ["search_thoughts", { query: "decision" }],
     ["recall_context", { query: "What did we decide?" }],
     ["browse_recent", { type: "decision", topic: "home" }],
@@ -116,6 +117,28 @@ describe("MCP space routing", () => {
     expect(mocks.action).toHaveBeenCalledWith(expect.anything(), {
       query: "clinic",
       searchMode: "keyword",
+    });
+  });
+
+  test("forwards inventory filters and the source account id unchanged", async () => {
+    mocks.query.mockResolvedValue({
+      rows: [],
+      cursor: undefined,
+      isDone: true,
+      counts: { total: 0, contentIndexed: 0, byExclusionReason: {}, truncated: false },
+    });
+    const result = await call("list_inventory", {
+      sourceAccountId: "account-1",
+      folderPath: "reports",
+      limit: 5,
+      cursor: "opaque-cursor",
+    });
+    expect(result.isError).not.toBe(true);
+    expect(mocks.query).toHaveBeenCalledWith(expect.anything(), {
+      sourceAccountId: "account-1",
+      folderPath: "reports",
+      limit: 5,
+      cursor: "opaque-cursor",
     });
   });
 

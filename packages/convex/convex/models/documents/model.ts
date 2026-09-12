@@ -78,7 +78,7 @@ export function fuseDocumentCandidateRanks(
   return scores;
 }
 
-function boundedLimit(value: number | undefined) {
+export function boundedLimit(value: number | undefined) {
   if (value === undefined) return DEFAULT_LIMIT;
   if (!Number.isSafeInteger(value) || value < 1 || value > MAX_LIMIT) {
     throw new Error(`limit must be an integer from 1 to ${MAX_LIMIT}`);
@@ -86,7 +86,7 @@ function boundedLimit(value: number | undefined) {
   return value;
 }
 
-function validateSpaces(spaceIds: readonly Id<"spaces">[]) {
+export function validateSpaces(spaceIds: readonly Id<"spaces">[]) {
   if (spaceIds.length > MAX_READ_SPACES) {
     throw new Error(`Document reads support at most ${MAX_READ_SPACES} spaces`);
   }
