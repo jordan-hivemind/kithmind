@@ -73,10 +73,31 @@ export function isCurrentThought(thought: Doc<"thoughts">): boolean {
 export type EmbeddingCounterDelta = {
   eligible: EmbeddingKindCounts;
   covered: Map<string, EmbeddingKindCounts>;
+  /** P2-6f: thoughts that left the current bucket in this transaction. */
+  history: HistoricalThoughtCounts;
+};
+
+export type HistoricalThoughtCounts = { superseded: number; retracted: number };
+
+export const ZERO_HISTORICAL_COUNTS: HistoricalThoughtCounts = {
+  superseded: 0,
+  retracted: 0,
 };
 
 export function emptyCounterDelta(): EmbeddingCounterDelta {
-  return { eligible: { ...ZERO_KIND_COUNTS }, covered: new Map() };
+  return {
+    eligible: { ...ZERO_KIND_COUNTS },
+    covered: new Map(),
+    history: { ...ZERO_HISTORICAL_COUNTS },
+  };
+}
+
+export function addHistoryDelta(
+  delta: EmbeddingCounterDelta,
+  bucket: keyof HistoricalThoughtCounts,
+  amount: number,
+): void {
+  delta.history[bucket] += amount;
 }
 
 export function addEligibleDelta(
@@ -103,6 +124,9 @@ function counterDeltaIsEmpty(delta: EmbeddingCounterDelta): boolean {
     (value) => value !== 0,
   );
   if (eligibleChanged) return false;
+  if (delta.history.superseded !== 0 || delta.history.retracted !== 0) {
+    return false;
+  }
   for (const counts of delta.covered.values()) {
     if ((Object.values(counts) as number[]).some((value) => value !== 0)) {
       return false;
@@ -134,6 +158,22 @@ function addKindCounts(
   return sum;
 }
 
+function addHistoricalCounts(
+  base: HistoricalThoughtCounts,
+  addend: HistoricalThoughtCounts,
+): HistoricalThoughtCounts {
+  const sum = {
+    superseded: base.superseded + addend.superseded,
+    retracted: base.retracted + addend.retracted,
+  };
+  for (const [bucket, value] of Object.entries(sum)) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error(`Historical ${bucket} thought counter went out of range`);
+    }
+  }
+  return sum;
+}
+
 export function coveredCountsFor(
   state: Doc<"spaceEmbeddingStates">,
   fingerprint: string,
@@ -155,6 +195,84 @@ export function usesTargetCounters(
   state: Doc<"spaceEmbeddingStates">,
 ): boolean {
   return state.eligibleCounts !== undefined && state.lastAuditAt !== undefined;
+}
+
+export type SpaceEmbeddingCoverage = {
+  spaceId: Id<"spaces">;
+  status: "unknown" | "complete" | "incomplete";
+  fingerprint?: string;
+  eligible?: EmbeddingKindCounts;
+  covered?: EmbeddingKindCounts;
+  drift: boolean;
+  lastAuditAt?: number;
+};
+
+export type SpaceCounterReport = {
+  coverage: SpaceEmbeddingCoverage;
+  /**
+   * Lifecycle counts, or null for a space whose counters were never seeded.
+   * `current` is the eligible thought counter: a thought target is eligible
+   * exactly when its thought is lifecycle-current.
+   */
+  thoughtCounts: {
+    current: number;
+    superseded: number;
+    retracted: number;
+  } | null;
+};
+
+/**
+ * P2-6f: everything the stats surfaces report about a space, from one row.
+ * No thought row, no target row and no vector row is read here.
+ */
+export async function readSpaceCounters(
+  ctx: ReadCtx,
+  spaceId: Id<"spaces">,
+): Promise<SpaceCounterReport> {
+  const state = await ctx.db
+    .query("spaceEmbeddingStates")
+    .withIndex("by_spaceId", (q) => q.eq("spaceId", spaceId))
+    .unique();
+  const drift = state?.counterDrift === true;
+  if (!state || !usesTargetCounters(state)) {
+    return {
+      coverage: { spaceId, status: "unknown", drift },
+      thoughtCounts: null,
+    };
+  }
+  const eligible = state.eligibleCounts ?? { ...ZERO_KIND_COUNTS };
+  const fingerprint = state.activeFingerprint;
+  const covered = fingerprint
+    ? coveredCountsFor(state, fingerprint)
+    : { ...ZERO_KIND_COUNTS };
+  // Card targets carry no vector until the card model lands, so they are not
+  // part of the completeness test yet.
+  const complete =
+    fingerprint !== undefined &&
+    !drift &&
+    covered.thought === eligible.thought &&
+    covered.chunk === eligible.chunk;
+  const history = state.historicalThoughtCounts;
+  return {
+    coverage: {
+      spaceId,
+      status: complete ? "complete" : "incomplete",
+      ...(fingerprint === undefined ? {} : { fingerprint }),
+      eligible,
+      covered,
+      drift,
+      ...(state.lastAuditAt === undefined
+        ? {}
+        : { lastAuditAt: state.lastAuditAt }),
+    },
+    thoughtCounts: history
+      ? {
+          current: eligible.thought,
+          superseded: history.superseded,
+          retracted: history.retracted,
+        }
+      : null,
+  };
 }
 
 /**
@@ -234,6 +352,18 @@ export async function commitCounterDelta(
       fingerprint,
       counts,
     }));
+  }
+  // Only a counted space carries history counts. A space that has never run a
+  // scan keeps them absent, and `get_stats` falls back to its bounded scan
+  // there rather than reporting a counter that started life at zero.
+  if (
+    state.historicalThoughtCounts !== undefined &&
+    (delta.history.superseded !== 0 || delta.history.retracted !== 0)
+  ) {
+    patch.historicalThoughtCounts = addHistoricalCounts(
+      state.historicalThoughtCounts,
+      delta.history,
+    );
   }
   await ctx.db.patch(state._id, patch);
   await refreshActiveGenerationCounts(ctx, state._id);
@@ -532,7 +662,22 @@ async function markThoughtTarget(
     "thought",
     String(thoughtId),
   );
-  if (row) await retireEmbeddingTarget(ctx, row, now, delta);
+  if (!row) return;
+  // I4 for the stats counters (P2-6f): a thought leaves the current bucket
+  // exactly when its eligible target is retired for a non-current status, and
+  // that transition is one-way, so this is the only increment the counts need.
+  // ponytail: a revive would double count. No path returns a superseded or
+  // retracted memory to current; add a decrement here if one ever does.
+  if (
+    row.state === "eligible" &&
+    thought !== null &&
+    thought.spaceId === spaceId &&
+    (thought.memoryStatus === "superseded" ||
+      thought.memoryStatus === "retracted")
+  ) {
+    addHistoryDelta(delta, thought.memoryStatus, 1);
+  }
+  await retireEmbeddingTarget(ctx, row, now, delta);
 }
 
 async function markGenerationChunkTargets(
@@ -842,7 +987,7 @@ async function runScanPage(
   batchSize: number,
   now: number,
 ): Promise<{ cursor: string | null; scanned: number; retired: number }> {
-  const state = await requireSpaceState(ctx, job.spaceId);
+  let state = await requireSpaceState(ctx, job.spaceId);
   if (state.eligibleCounts === undefined) {
     // Seeding the counters at zero is what marks the space as counted. An
     // empty space would otherwise finish a build with absent counters and
@@ -856,6 +1001,18 @@ async function runScanPage(
   let next: ScanCursor;
 
   if (position.stage === "thoughts") {
+    if (position.cursor === null) {
+      // The thought stage visits every thought in the space exactly once, so
+      // it is the one place that can count the historical buckets. Restarting
+      // the stage restarts the count.
+      state = {
+        ...state,
+        historicalThoughtCounts: { ...ZERO_HISTORICAL_COUNTS },
+      };
+      await ctx.db.patch(state._id, {
+        historicalThoughtCounts: { ...ZERO_HISTORICAL_COUNTS },
+      });
+    }
     const page = await ctx.db
       .query("thoughts")
       .withIndex("by_spaceId", (q) => q.eq("spaceId", job.spaceId))
@@ -864,7 +1021,15 @@ async function runScanPage(
         numItems: Math.min(batchSize, EMBEDDING_THOUGHT_SCAN_PAGE),
       });
     for (const thought of page.page) {
-      if (!isCurrentThought(thought)) continue;
+      if (!isCurrentThought(thought)) {
+        if (
+          thought.memoryStatus === "superseded" ||
+          thought.memoryStatus === "retracted"
+        ) {
+          addHistoryDelta(delta, thought.memoryStatus, 1);
+        }
+        continue;
+      }
       scanned += 1;
       await upsertEligibleTarget(
         ctx,

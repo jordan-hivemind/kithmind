@@ -3,13 +3,8 @@ import { v } from "convex/values";
 
 import { requireMcpPrincipal } from "../../lib/mcpAuth";
 import { getAuthorizedReadSpaceIds } from "../../lib/spaces";
-import { isFactActive } from "../facts/model";
-import { isMemoryActive } from "./memoryLifecycle";
-import {
-  _listBySpaces,
-  _listCoreBySpaces,
-  _loadBoundedThoughtStatsRows,
-} from "./model";
+import { spaceEmbeddingCoverageValidator } from "../embeddings/validators";
+import { _computeSpaceStats, _listBySpaces, _listCoreBySpaces } from "./model";
 import {
   thoughtLifecycleFields,
   thoughtMetadata,
@@ -94,6 +89,8 @@ export const getStats = query({
     byType: v.array(v.object({ type: v.string(), count: v.number() })),
     topTopics: v.array(v.object({ topic: v.string(), count: v.number() })),
     topPeople: v.array(v.object({ person: v.string(), count: v.number() })),
+    partial: v.boolean(),
+    coverage: v.array(spaceEmbeddingCoverageValidator),
   }),
   handler: async (ctx, args) => {
     const principal = await requireMcpPrincipal(ctx);
@@ -102,52 +99,10 @@ export const getStats = query({
       principal,
       args.spaceIds,
     );
-    const { thoughts: allThoughts, facts: allFacts } =
-      await _loadBoundedThoughtStatsRows(ctx, spaceIds);
-    const activeAt = Date.now();
-    const currentThoughts = allThoughts.filter((thought) =>
-      isMemoryActive(thought, activeAt),
+    const { dateRange: _dateRange, ...stats } = await _computeSpaceStats(
+      ctx,
+      spaceIds,
     );
-    const typeCounts = new Map<string, number>();
-    const topicCounts = new Map<string, number>();
-    const peopleCounts = new Map<string, number>();
-    for (const thought of currentThoughts) {
-      typeCounts.set(
-        thought.metadata.type,
-        (typeCounts.get(thought.metadata.type) ?? 0) + 1,
-      );
-      for (const topic of thought.metadata.topics) {
-        topicCounts.set(topic, (topicCounts.get(topic) ?? 0) + 1);
-      }
-      for (const person of thought.metadata.people) {
-        peopleCounts.set(person, (peopleCounts.get(person) ?? 0) + 1);
-      }
-    }
-    return {
-      totalThoughts: currentThoughts.length,
-      totalFacts: allFacts.filter((fact) => isFactActive(fact, activeAt))
-        .length,
-      historicalThoughts: allThoughts.filter(
-        (thought) => thought.memoryStatus === "superseded",
-      ).length,
-      historicalFacts: allFacts.filter((fact) => fact.status === "superseded")
-        .length,
-      retractedThoughts: allThoughts.filter(
-        (thought) => thought.memoryStatus === "retracted",
-      ).length,
-      retractedFacts: allFacts.filter((fact) => fact.status === "retracted")
-        .length,
-      byType: [...typeCounts.entries()]
-        .map(([type, count]) => ({ type, count }))
-        .sort((a, b) => b.count - a.count || a.type.localeCompare(b.type)),
-      topTopics: [...topicCounts.entries()]
-        .map(([topic, count]) => ({ topic, count }))
-        .sort((a, b) => b.count - a.count || a.topic.localeCompare(b.topic))
-        .slice(0, 10),
-      topPeople: [...peopleCounts.entries()]
-        .map(([person, count]) => ({ person, count }))
-        .sort((a, b) => b.count - a.count || a.person.localeCompare(b.person))
-        .slice(0, 10),
-    };
+    return stats;
   },
 });

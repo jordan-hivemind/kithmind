@@ -47,6 +47,33 @@ export const embeddingKindCountsValidator = v.object({
   card: v.number(),
 });
 
+/**
+ * P2-6f: the two lifecycle buckets no target row can distinguish. Current
+ * memories need no counter of their own, because a thought target is eligible
+ * exactly when its thought is lifecycle-current, so `eligibleCounts.thought`
+ * already counts them.
+ */
+export const historicalThoughtCountsValidator = v.object({
+  superseded: v.number(),
+  retracted: v.number(),
+});
+
+/** One space's index coverage, read from the counters and nothing else. */
+export const spaceEmbeddingCoverageValidator = v.object({
+  spaceId: v.id("spaces"),
+  // `unknown` is a space whose counters have never been seeded and audited.
+  status: v.union(
+    v.literal("unknown"),
+    v.literal("complete"),
+    v.literal("incomplete"),
+  ),
+  fingerprint: v.optional(v.string()),
+  eligible: v.optional(embeddingKindCountsValidator),
+  covered: v.optional(embeddingKindCountsValidator),
+  drift: v.boolean(),
+  lastAuditAt: v.optional(v.number()),
+});
+
 export const embeddingBuildPhaseValidator = v.union(
   v.literal("scan"),
   v.literal("fill"),
@@ -81,6 +108,9 @@ export const spaceEmbeddingStateFields = {
     ),
   ),
   counterDrift: v.optional(v.boolean()),
+  // Absent until a scan phase counts them. Maintained by the same eligibility
+  // write that retires the thought's target, so stats never scan thoughts.
+  historicalThoughtCounts: v.optional(historicalThoughtCountsValidator),
   lastAuditAt: v.optional(v.number()),
   lastEligibilityChangeAt: v.optional(v.number()),
 };

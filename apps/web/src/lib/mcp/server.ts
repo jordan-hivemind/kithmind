@@ -394,7 +394,7 @@ export function createMcpServer(
 
   const listSpacesTool = server.tool(
     MCP_TOOL_NAMES.listSpaces,
-    "List the spaces this credential can currently read, with IDs, names and membership roles. Use these IDs to select a destination or narrow a search.",
+    "List the spaces this credential can currently read, with IDs, names, membership roles and embedding index coverage. Coverage is reported from the space counters: status unknown means the space has never been counted, not that it is empty. Use these IDs to select a destination or narrow a search.",
     {},
     MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.listSpaces],
     async () => {
@@ -1527,7 +1527,7 @@ export function createMcpServer(
 
   const getStatsTool = server.tool(
     MCP_TOOL_NAMES.getStats,
-    "Get overview statistics of what's stored in your brain",
+    "Get overview statistics of what's stored in your brain. Counts and per-space embedding coverage come from the space counters; totals count lifecycle-current memories. partial true means the byType, topTopics and topPeople digest, or an uncounted space's totals, hit a scan bound and are a sample.",
     { spaceIds: readSpacesSchema },
     MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.getStats],
     async ({ spaceIds }) => {

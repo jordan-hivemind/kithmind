@@ -11,8 +11,14 @@ import {
   requireActiveEmbeddingTarget,
 } from "../embeddings/model";
 import {
+  readSpaceCounters,
+  type SpaceEmbeddingCoverage,
+} from "../embeddings/targets";
+import { isFactActive } from "../facts/model";
+import {
   assertValidMemoryValidity,
   isCurrentMemory,
+  isMemoryActive,
   safeSupersededValidTo,
   type MemoryStatus,
   type MemoryValidity,
@@ -210,39 +216,199 @@ export async function _listCoreBySpaces(
   return rows.flat().sort(compareNewestFirst).slice(0, limit);
 }
 
-/** Loads complete stats inputs under one global row budget per table. */
-export async function _loadBoundedThoughtStatsRows(
+/**
+ * Rows the `byType`, `topTopics` and `topPeople` digest may scan on a counted
+ * space. A thought row still carries the legacy 1,536-float vector, so this
+ * bound is a read-budget bound, not a row-count preference. P1-12 replaces the
+ * scan with a stored digest and this constant goes with it.
+ */
+export const MAX_STATS_DIGEST_ROWS = 128;
+/** Fact rows carry no vector, so the fact scan keeps a far larger bound. */
+export const MAX_STATS_FACT_ROWS = 4_096;
+
+export type SpaceStats = {
+  totalThoughts: number;
+  totalFacts: number;
+  historicalThoughts: number;
+  historicalFacts: number;
+  retractedThoughts: number;
+  retractedFacts: number;
+  byType: Array<{ type: string; count: number }>;
+  topTopics: Array<{ topic: string; count: number }>;
+  topPeople: Array<{ person: string; count: number }>;
+  /** True when a bound bound: the digest, and any uncounted space's counts. */
+  partial: boolean;
+  coverage: SpaceEmbeddingCoverage[];
+  dateRange?: { earliest: number; latest: number };
+};
+
+function boundedStatsLimit(value: number, name: string): number {
+  if (!Number.isInteger(value) || value < 1) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  return value;
+}
+
+/**
+ * Statistics for a set of spaces the caller may already read.
+ *
+ * Counts come from the space counters (P2-6f): a counted space contributes no
+ * thought row to any total, and its index coverage is one row read. A space
+ * whose counters were never seeded keeps the legacy bounded scan until the
+ * P2-6g backfill reaches it. The digest is the one remaining scan, bounded
+ * here and reported as partial when the bound binds.
+ */
+export async function _computeSpaceStats(
   ctx: QueryCtx,
   spaceIds: readonly Id<"spaces">[],
-  maxRows: number = MAX_THOUGHT_STATS_ROWS,
-) {
-  if (!Number.isInteger(maxRows) || maxRows < 1) {
-    throw new Error("Thought statistics limit must be a positive integer");
+  options: {
+    maxDigestRows?: number;
+    maxScanRows?: number;
+    maxFactRows?: number;
+    now?: number;
+  } = {},
+): Promise<SpaceStats> {
+  const digestLimit = boundedStatsLimit(
+    options.maxDigestRows ?? MAX_STATS_DIGEST_ROWS,
+    "Thought digest limit",
+  );
+  const scanLimit = boundedStatsLimit(
+    options.maxScanRows ?? MAX_THOUGHT_STATS_ROWS,
+    "Thought statistics limit",
+  );
+  const factLimit = boundedStatsLimit(
+    options.maxFactRows ?? MAX_STATS_FACT_ROWS,
+    "Fact statistics limit",
+  );
+  const activeAt = options.now ?? Date.now();
+
+  const counters = await Promise.all(
+    spaceIds.map((spaceId) => readSpaceCounters(ctx, spaceId)),
+  );
+  const uncounted = new Set(
+    spaceIds
+      .filter((_, index) => counters[index]!.thoughtCounts === null)
+      .map(String),
+  );
+
+  let partial = false;
+  let totalThoughts = 0;
+  let historicalThoughts = 0;
+  let retractedThoughts = 0;
+  for (const report of counters) {
+    const counts = report.thoughtCounts;
+    if (!counts) continue;
+    totalThoughts += counts.current;
+    historicalThoughts += counts.superseded;
+    retractedThoughts += counts.retracted;
   }
+
+  // One scan serves the digest and, until the backfill lands, the counts of an
+  // uncounted space. It is the only place stats touch a thought row.
+  const thoughtBudget = uncounted.size > 0 ? scanLimit : digestLimit;
   const thoughts: Array<Doc<"thoughts">> = [];
-  for (const spaceId of spaceIds) {
+  // Uncounted spaces first: if the budget binds, a count degrades to a sample
+  // only after every space that still needs the scan has been read.
+  const scanOrder = [...spaceIds].sort(
+    (left, right) =>
+      Number(uncounted.has(String(right))) -
+      Number(uncounted.has(String(left))),
+  );
+  for (const spaceId of scanOrder) {
+    if (thoughts.length >= thoughtBudget) {
+      partial = true;
+      break;
+    }
     const rows = await ctx.db
       .query("thoughts")
       .withIndex("by_spaceId", (q) => q.eq("spaceId", spaceId))
-      .take(maxRows + 1 - thoughts.length);
+      .take(thoughtBudget + 1 - thoughts.length);
     thoughts.push(...rows);
-    if (thoughts.length > maxRows) {
-      throw new Error("Thought statistics exceed the bounded scope");
+    if (thoughts.length > thoughtBudget) {
+      thoughts.length = thoughtBudget;
+      partial = true;
+      break;
     }
+  }
+
+  for (const thought of thoughts) {
+    if (!uncounted.has(String(thought.spaceId))) continue;
+    if (isMemoryActive(thought, activeAt)) totalThoughts += 1;
+    else if (thought.memoryStatus === "superseded") historicalThoughts += 1;
+    else if (thought.memoryStatus === "retracted") retractedThoughts += 1;
   }
 
   const facts: Array<Doc<"facts">> = [];
   for (const spaceId of spaceIds) {
+    if (facts.length >= factLimit) {
+      partial = true;
+      break;
+    }
     const rows = await ctx.db
       .query("facts")
       .withIndex("by_spaceId", (q) => q.eq("spaceId", spaceId))
-      .take(maxRows + 1 - facts.length);
+      .take(factLimit + 1 - facts.length);
     facts.push(...rows);
-    if (facts.length > maxRows) {
-      throw new Error("Thought statistics exceed the bounded scope");
+    if (facts.length > factLimit) {
+      facts.length = factLimit;
+      partial = true;
+      break;
     }
   }
-  return { thoughts, facts };
+
+  const currentThoughts = thoughts.filter((thought) =>
+    isMemoryActive(thought, activeAt),
+  );
+  const typeCounts = new Map<string, number>();
+  const topicCounts = new Map<string, number>();
+  const peopleCounts = new Map<string, number>();
+  for (const thought of currentThoughts) {
+    typeCounts.set(
+      thought.metadata.type,
+      (typeCounts.get(thought.metadata.type) ?? 0) + 1,
+    );
+    for (const topic of thought.metadata.topics) {
+      topicCounts.set(topic, (topicCounts.get(topic) ?? 0) + 1);
+    }
+    for (const person of thought.metadata.people) {
+      peopleCounts.set(person, (peopleCounts.get(person) ?? 0) + 1);
+    }
+  }
+
+  return {
+    totalThoughts,
+    totalFacts: facts.filter((fact) => isFactActive(fact, activeAt)).length,
+    historicalThoughts,
+    historicalFacts: facts.filter((fact) => fact.status === "superseded")
+      .length,
+    retractedThoughts,
+    retractedFacts: facts.filter((fact) => fact.status === "retracted").length,
+    byType: [...typeCounts.entries()]
+      .map(([type, count]) => ({ type, count }))
+      .sort((a, b) => b.count - a.count || a.type.localeCompare(b.type)),
+    topTopics: [...topicCounts.entries()]
+      .map(([topic, count]) => ({ topic, count }))
+      .sort((a, b) => b.count - a.count || a.topic.localeCompare(b.topic))
+      .slice(0, 10),
+    topPeople: [...peopleCounts.entries()]
+      .map(([person, count]) => ({ person, count }))
+      .sort((a, b) => b.count - a.count || a.person.localeCompare(b.person))
+      .slice(0, 10),
+    partial,
+    coverage: counters.map((report) => report.coverage),
+    ...(currentThoughts.length > 0
+      ? {
+          dateRange: {
+            earliest: Math.min(
+              ...currentThoughts.map((thought) => thought._creationTime),
+            ),
+            latest: Math.max(
+              ...currentThoughts.map((thought) => thought._creationTime),
+            ),
+          },
+        }
+      : {}),
+  };
 }
 
 export async function _insertOne(

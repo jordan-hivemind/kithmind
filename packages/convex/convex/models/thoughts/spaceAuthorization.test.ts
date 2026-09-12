@@ -4,7 +4,7 @@ import { convexTest } from "convex-test";
 import { api, internal } from "../../_generated/api";
 import schema from "../../schema";
 import { modules } from "../../test.setup";
-import { _loadBoundedThoughtStatsRows } from "./model";
+import { _computeSpaceStats } from "./model";
 
 const mcpIssuer = "https://brain.example.test";
 const sessionIssuer = "https://brain.example.test/convex";
@@ -143,15 +143,18 @@ describe("thought space authorization", () => {
     ).rejects.toThrow("Space not found");
     const stats = await member.query(api.models.thoughts.public.getStats, {});
     expect(stats.totalThoughts).toBe(4);
-    await expect(
-      t.run((ctx) =>
-        _loadBoundedThoughtStatsRows(
-          ctx,
-          [seeded.memberPersonal, seeded.sharedSpaceId],
-          3,
-        ),
-      ),
-    ).rejects.toThrow("Thought statistics exceed the bounded scope");
+    // The scan bound now labels the result partial instead of failing the
+    // read, and it still never leaves the authorized spaces.
+    const bounded = await t.run((ctx) =>
+      _computeSpaceStats(ctx, [seeded.memberPersonal, seeded.sharedSpaceId], {
+        maxScanRows: 3,
+      }),
+    );
+    expect(bounded.partial).toBe(true);
+    expect(bounded.coverage.map((row) => row.spaceId)).toEqual([
+      seeded.memberPersonal,
+      seeded.sharedSpaceId,
+    ]);
   });
 
   test("direct ID and timeline hydration obey live key space scopes", async () => {

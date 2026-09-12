@@ -3,6 +3,8 @@ import { v } from "convex/values";
 import { query } from "../../_generated/server";
 import { requireMcpPrincipal } from "../../lib/mcpAuth";
 import { getAuthorizedReadSpaceIds } from "../../lib/spaces";
+import { readSpaceCounters } from "../embeddings/targets";
+import { spaceEmbeddingCoverageValidator } from "../embeddings/validators";
 import { spaceKind, spaceRole } from "./validators";
 
 export const list = query({
@@ -13,6 +15,8 @@ export const list = query({
       name: v.string(),
       kind: spaceKind,
       role: spaceRole,
+      // P2-6f: one space-state row per space. No thought row and no vector row.
+      coverage: spaceEmbeddingCoverageValidator,
     }),
   ),
   handler: async (ctx) => {
@@ -27,15 +31,17 @@ export const list = query({
             q.eq("spaceId", spaceId).eq("userId", principal.userId),
           )
           .take(2),
+        counters: await readSpaceCounters(ctx, spaceId),
       })),
     );
     return rows
       .filter((row) => row.space !== null && row.memberships.length === 1)
-      .map(({ space, memberships }) => ({
+      .map(({ space, memberships, counters }) => ({
         spaceId: space!._id,
         name: space!.name,
         kind: space!.kind,
         role: memberships[0]!.role,
+        coverage: counters.coverage,
       }))
       .sort(
         (left, right) =>
