@@ -10,8 +10,9 @@
 // No login, no navigation to a login form, no credential anywhere in this
 // file: the captured header *values* never cross the CDP boundary (see
 // fetchInPage below). If the capture slot is empty, every call throws and
-// tells the operator to open the Activity tab -- it never synthesizes a header
-// or drives the site's UI. The documents endpoints additionally need the
+// tells the operator to open the Activity tab -- it never synthesizes a header.
+// The one part of the site's UI it ever drives is the inactivity dialog (F1-63,
+// startInactivityWatch below). The documents endpoints additionally need the
 // bearer the app sets only once its own Documents page has loaded, so they
 // throw their own named error naming that header, never its value.
 //
@@ -523,7 +524,8 @@ export function createSharedGate() {
  * Connects to the existing tab, installs the header hook, reloads once, and
  * returns fetchText/fetchBytes that translate this adapter's logical paths
  * (see resolveEndpoint) into page-context fetches. Never navigates to a
- * login page and never touches the tab's DOM.
+ * login page. The only DOM it ever touches is the site's own inactivity
+ * dialog (F1-63, startInactivityWatch below).
  */
 export default async function createMorganStanleySession(options = {}) {
   const cdpHttpBase = options.cdpHttpBase ?? requiredEnv("MS_CDP_HTTP_BASE");
@@ -571,6 +573,19 @@ export default async function createMorganStanleySession(options = {}) {
   const signInGate = createSharedGate();
   const bearerRefreshGate = createSharedGate();
 
+  // F1-63. True only while a sign-in pause is in flight. The inactivity
+  // watch reads it so it never clicks in a tab the owner is signing into.
+  let paused = false;
+  const pauseForSignIn = (reason) =>
+    sharedOnce(signInGate, async () => {
+      paused = true;
+      try {
+        return await waitForSignIn(cdp, origin, cdpHttpBase, reason);
+      } finally {
+        paused = false;
+      }
+    });
+
   async function withBearerRetry(request, run) {
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
@@ -590,7 +605,7 @@ export default async function createMorganStanleySession(options = {}) {
         if (
           /SIGNED_OUT|no session headers captured yet/.test(message) &&
           attempt < 2 &&
-          (await sharedOnce(signInGate, () => waitForSignIn(cdp, origin, cdpHttpBase, message)))
+          (await pauseForSignIn(message))
         ) {
           continue;
         }
@@ -612,18 +627,20 @@ export default async function createMorganStanleySession(options = {}) {
   }
 
   const keepAlive = startKeepAlive(cdp, origin);
+  const inactivityWatch = startInactivityWatch(cdp, () => paused);
 
   return {
     institutionSlug: "morgan-stanley",
     fetchText,
     fetchBytes,
-    close: () => closeSession(cdp, keepAlive),
+    close: () => closeSession(cdp, keepAlive, inactivityWatch),
   };
 }
 
 /**
- * F1-64: closes both handles a session holds open -- the keep-alive interval
- * (already unref'd, so it alone cannot keep the process up) and the CDP
+ * F1-64: closes every handle a session holds open -- its interval timers
+ * (the keep-alive and the inactivity watch; both already unref'd, so neither
+ * alone can keep the process up) and the CDP
  * WebSocket itself, which is not unref'd and otherwise outlives a run that
  * throws (a lost session, the consecutive-failure breaker) with no sign-in
  * wait ever logged, refusing every later "a run is alive" check until killed
@@ -631,8 +648,8 @@ export default async function createMorganStanleySession(options = {}) {
  * `evaluate`/`startKeepAlive` above); every other caller reaches it only
  * through createMorganStanleySession's own `close`.
  */
-export function closeSession(cdp, keepAlive) {
-  clearInterval(keepAlive);
+export function closeSession(cdp, ...timers) {
+  for (const timer of timers) clearInterval(timer);
   cdp.close();
 }
 
@@ -666,4 +683,107 @@ export function startKeepAlive(cdp, origin) {
   }, KEEP_ALIVE_INTERVAL_MS);
   keepAlive.unref();
   return keepAlive;
+}
+
+// --- inactivity dialog watch (F1-63) ---------------------------------------
+
+// The session-extend call above keeps the *server* session alive, but the
+// page runs a second, independent idle timer that counts user input events
+// and ignores the app's own requests. During a continuous pull -- the owner's
+// own documents, in a session the owner signed into by hand -- that timer
+// reached zero 20 to 45 minutes in and put up an "about to be signed out due
+// to inactivity" dialog, and then signed the session out while documents were
+// still downloading.
+//
+// Two ways to answer that were authorized by the account owner in writing on
+// 2026-09-12. The first -- dispatching synthetic mouse and key events through
+// the CDP Input domain so the page's idle timer sees input that no person
+// produced -- is deliberately not implemented here: that timer exists to
+// detect whether a person is present, and manufacturing input events to tell
+// it "yes" forges the one signal it is built to read. The second is
+// implemented below, and is the narrower answer: the bridge does not touch
+// the idle timer at all, and acts only when the site itself stops and asks
+// whether the session is still wanted. It is, by the owner's own instruction
+// and demonstrably so -- a document is downloading as the dialog appears --
+// so answering the site's question truthfully keeps the pull going without
+// fabricating anything. This is the same posture as the keep-alive above:
+// use the mechanism the site offers, do not defeat the one it enforces.
+const INACTIVITY_POLL_INTERVAL_MS = 60 * 1000;
+
+/**
+ * Page-side check, evaluated once a minute. Returns `null` when no inactivity
+ * dialog is up, `{ button: "<text>" }` when one was found and its
+ * continue-style button clicked, and `{ button: null }` when one was found
+ * with no button matching. It deliberately returns *only* the button's text:
+ * the dialog's own contents are read in the page, matched in the page and
+ * left there, so nothing the institution renders is carried into a log line.
+ * Exported for test/bridge.test.mjs, which runs it against a stub DOM in a vm
+ * context exactly as the page-fetch expression is tested.
+ */
+export const INACTIVITY_DIALOG_EXPRESSION = `(() => {
+  const visible = (el) => {
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0 && getComputedStyle(el).visibility !== "hidden";
+  };
+  const containers = document.querySelectorAll(
+    '[role="dialog"],[role="alertdialog"],dialog[open],.modal,[class*="modal"],[class*="dialog"]'
+  );
+  for (const container of containers) {
+    if (!visible(container)) continue;
+    if (!/inactiv|signed out|session.*(expir|time)|stay signed in/i.test(container.innerText || "")) continue;
+    const buttons = container.querySelectorAll('button,[role="button"],input[type="button"],input[type="submit"],a');
+    for (const button of buttons) {
+      const text = String(button.innerText || button.value || "").trim();
+      if (!visible(button) || !/stay|continue|keep|extend|yes/i.test(text)) continue;
+      button.click();
+      return { button: text.slice(0, 60) };
+    }
+    return { button: null };
+  }
+  return null;
+})()`;
+
+/**
+ * F1-63. Polls for the site's own inactivity dialog once a minute and answers
+ * it (see INACTIVITY_DIALOG_EXPRESSION above for what it does and does not
+ * do). `isPaused` is the session's sign-in pause: while the owner is signing
+ * in again, the tab is not the app's and nothing here should be clicking, so
+ * every tick is skipped until the pause lifts -- the interval itself keeps
+ * running, so a resume needs no restart. Best effort throughout: an evaluate
+ * failure is swallowed and logged once, never thrown into the pull. `unref`'d
+ * like the keep-alive, so it never keeps the process up on its own. Exported
+ * for test/bridge.test.mjs only (same convention as `startKeepAlive` above);
+ * every other caller reaches it through createMorganStanleySession.
+ */
+export function startInactivityWatch(cdp, isPaused = () => false) {
+  // One log line per *occurrence*, not per poll: an unanswerable dialog sits
+  // there until a person deals with it, and would otherwise log every minute.
+  let unanswered = false;
+  let loggedFailure = false;
+  const watch = setInterval(() => {
+    if (isPaused()) return;
+    evaluate(cdp, INACTIVITY_DIALOG_EXPRESSION)
+      .then((found) => {
+        if (!found) {
+          unanswered = false;
+          return;
+        }
+        if (found.button) {
+          unanswered = false;
+          console.error(new Date().toISOString(), `[bridge] inactivity dialog answered: ${found.button}`);
+          return;
+        }
+        if (!unanswered) {
+          unanswered = true;
+          console.error(new Date().toISOString(), "[bridge] inactivity dialog seen, no button matched");
+        }
+      })
+      .catch((error) => {
+        if (loggedFailure) return;
+        loggedFailure = true;
+        console.error(new Date().toISOString(), "[bridge] inactivity watch failed:", String(error?.message ?? error).slice(0, 120));
+      });
+  }, INACTIVITY_POLL_INTERVAL_MS);
+  watch.unref();
+  return watch;
 }
