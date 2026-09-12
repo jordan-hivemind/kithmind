@@ -372,7 +372,10 @@ For each extracted field, all of the following must hold:
    stored value exactly.
 3. Money normalizes through `canonicalizeDecimal` and `validateCurrencyCode`
    after stripping grouping separators and a currency symbol. No value passes
-   through a JavaScript number at any point.
+   through a JavaScript number at any point. `tax_return_card`, `k1_card` and
+   `brokerage_tax_package_card` declare their money fields under
+   `money_usd_default_v1`, which reads a bare amount with no currency
+   indicator as USD instead of failing; every other kind still requires one.
 4. Dates normalize under a declared, versioned format list. A span that is
    ambiguous across two formats in that list fails. It does not pick one.
 5. Percentages and rates normalize to a canonical decimal with an explicit
