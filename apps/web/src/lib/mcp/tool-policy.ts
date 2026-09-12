@@ -47,6 +47,7 @@ export const MCP_TOOL_ANNOTATIONS = {
   [MCP_TOOL_NAMES.getDocument]: readOnly,
   [MCP_TOOL_NAMES.listSources]: readOnly,
   [MCP_TOOL_NAMES.listInventory]: readOnly,
+  [MCP_TOOL_NAMES.listReviewQueue]: readOnly,
   [MCP_TOOL_NAMES.listSpaces]: readOnly,
   [MCP_TOOL_NAMES.searchFacts]: readOnly,
   [MCP_TOOL_NAMES.rememberFact]: idempotentAdditive,

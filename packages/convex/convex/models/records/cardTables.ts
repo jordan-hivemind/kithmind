@@ -92,7 +92,13 @@ export const cardTables = {
   cardFieldDrops: defineTable(cardFieldDropFields)
     .index("by_spaceId", ["spaceId"])
     .index("by_sourceItemId", ["sourceItemId"])
-    .index("by_processingGenerationId", ["processingGenerationId"]),
+    .index("by_processingGenerationId", ["processingGenerationId"])
+    // P2-70k: the review queue counts and pages dropped fields and gate
+    // failures for one source account. Neither existing index scopes to an
+    // account, so a review would otherwise have to filter a space-wide,
+    // bounded scan in application code and risk another account's rows
+    // crowding a smaller account out of the bound.
+    .index("by_space_account", ["spaceId", "sourceAccountId"]),
   cardExtractionAttempts: defineTable(cardExtractionAttemptFields)
     .index("by_spaceId", ["spaceId"])
     .index("by_sourceItemId", ["sourceItemId"]),
