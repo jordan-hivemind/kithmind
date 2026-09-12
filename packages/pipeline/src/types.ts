@@ -68,20 +68,20 @@ export type PdfDocQaConfig = {
       passwordCommand: { executable: string; publicArgs?: string[] };
       host: string;
     } & (
-      | { repositoryPath: string; repository?: never }
-      | {
-          repositoryPath?: never;
-          repository: {
-            kind: "rclone_dropbox_v1";
-            remoteName: string;
-            rootPath: string;
-            rcloneBinary: string;
-            configPath: string;
-            configIdentityFingerprint: string;
-            expectedRootDirectoryIdHash: string;
-          };
-        }
-    );
+        | { repositoryPath: string; repository?: never }
+        | {
+            repositoryPath?: never;
+            repository: {
+              kind: "rclone_dropbox_v1";
+              remoteName: string;
+              rootPath: string;
+              rcloneBinary: string;
+              configPath: string;
+              configIdentityFingerprint: string;
+              expectedRootDirectoryIdHash: string;
+            };
+          }
+      );
   };
 };
 
@@ -98,6 +98,10 @@ export type PipelineConfig = {
   maxFiles: number;
   maxDepth: number;
   maxFileBytes: number;
+  /** Minimum delay, in ms, between consecutive `processing.assessPage`
+   * mutations. Lets a bounded backfill pace itself under the server's
+   * per-worker mutation rate limit instead of bouncing off it. */
+  assessmentPacingMs?: number;
   pdfDocQa?: PdfDocQaConfig;
 };
 
