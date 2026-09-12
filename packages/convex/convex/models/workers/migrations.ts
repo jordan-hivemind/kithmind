@@ -2,7 +2,11 @@ import { v } from "convex/values";
 import type { Id } from "../../_generated/dataModel";
 import { internalMutation, type MutationCtx } from "../../_generated/server";
 import { requireWorkerSourceAccount } from "./auth";
-import { requireCurrentDiscovery, validateAdmittedChain } from "./discovery";
+import {
+  MAX_WORKER_DISCOVERY_ATTEMPTS,
+  requireCurrentDiscovery,
+  validateAdmittedChain,
+} from "./discovery";
 
 const FORGOTTEN_REPAIR_LIMIT = 25;
 
@@ -208,5 +212,82 @@ export const backfillManagedJobs = internalMutation({
       cursor: args.cursor,
       maxItems: args.maxItems ?? 10,
       dryRun: args.dryRun ?? true,
+    }),
+});
+
+const REQUEUE_DEFAULT_LIMIT = 50;
+const REQUEUE_MAX_LIMIT = 500;
+
+// A transport defect (fixed in PR179/PR182) left some workerDiscoveryWork
+// rows stranded in "failed"/"needs_review": failArchivedDiscovery always
+// clears nextAttemptAt, so dueDiscoveryCandidates never re-offers them, and
+// the scan entryState rule (model.ts) re-derives "needs_review" forever once
+// priorWork is in either state, so no later scan admits a replacement. This
+// patches the row directly back to "queued" so the next scan's entryState
+// rule sees a non-failed priorWork and re-admits the item normally. It never
+// touches sourceItems, scans, or scan entries.
+export async function requeueFailedDiscoveryWorkPage(
+  ctx: MutationCtx,
+  args: {
+    sourceAccountId: Id<"sourceAccounts">;
+    dryRun: boolean;
+    limit: number;
+    now: number;
+  },
+) {
+  if (
+    !Number.isInteger(args.limit) ||
+    args.limit < 1 ||
+    args.limit > REQUEUE_MAX_LIMIT
+  )
+    throw new Error("Invalid requeue page bounds");
+  const byPriorState = { failed: 0, needs_review: 0 };
+  let examined = 0;
+  let requeued = 0;
+  let skippedAttemptLimit = 0;
+  for (const state of ["failed", "needs_review"] as const) {
+    if (examined >= args.limit) break;
+    const rows = await ctx.db
+      .query("workerDiscoveryWork")
+      .withIndex("by_sourceAccountId_and_state_and_nextAttemptAt", (q) =>
+        q.eq("sourceAccountId", args.sourceAccountId).eq("state", state),
+      )
+      .take(args.limit - examined);
+    for (const row of rows) {
+      examined += 1;
+      byPriorState[state] += 1;
+      if (row.attempts >= MAX_WORKER_DISCOVERY_ATTEMPTS) {
+        skippedAttemptLimit += 1;
+        continue;
+      }
+      requeued += 1;
+      if (!args.dryRun) {
+        await ctx.db.patch(row._id, {
+          state: "queued",
+          nextAttemptAt: args.now,
+          leaseToken: undefined,
+          leaseOwnerCredentialId: undefined,
+          leaseExpiresAt: undefined,
+          retryable: undefined,
+          failureCode: undefined,
+        });
+      }
+    }
+  }
+  return { examined, requeued, skippedAttemptLimit, byPriorState };
+}
+
+export const requeueFailedDiscoveryWork = internalMutation({
+  args: {
+    sourceAccountId: v.id("sourceAccounts"),
+    dryRun: v.optional(v.boolean()),
+    limit: v.optional(v.number()),
+  },
+  handler: (ctx, args) =>
+    requeueFailedDiscoveryWorkPage(ctx, {
+      sourceAccountId: args.sourceAccountId,
+      dryRun: args.dryRun ?? true,
+      limit: args.limit ?? REQUEUE_DEFAULT_LIMIT,
+      now: Date.now(),
     }),
 });
