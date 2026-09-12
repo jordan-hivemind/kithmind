@@ -41,6 +41,11 @@ export type AdapterSession = {
     path: string,
     query?: Readonly<Record<string, string>>,
   ): Promise<Uint8Array>;
+  // F1-64: optional because a session with no live handle (the synthetic
+  // adapter's) needs none. A real bridge session (a CDP WebSocket, a
+  // keep-alive interval) declares one, and run.ts calls it on every exit --
+  // normal completion or a thrown stop -- so the process never outlives it.
+  close?(): void | Promise<void>;
 };
 
 /**

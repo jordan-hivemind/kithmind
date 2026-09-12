@@ -15,6 +15,7 @@ import {
   evaluate,
   startKeepAlive,
   waitForSignIn,
+  closeSession,
 } from "../src/bridge.mjs";
 
 // A fake cdp for the resume tests below: `Runtime.evaluate` is answered by
@@ -294,6 +295,34 @@ test("startKeepAlive extends the app session every four minutes through the page
 
   t.mock.timers.tick(4 * 60 * 1000);
   assert.equal(calls.length, 2, "fires again every four minutes, not just once");
+});
+
+// F1-64: a run that stops on a lost session (or completes normally) must
+// close everything a bridge session holds open, or the node process outlives
+// the run itself -- seen live as a 40+ minute hang with no sign-in wait ever
+// logged, refusing a later run ("a run is alive") until killed by hand.
+test("closeSession closes the CDP WebSocket and stops the keep-alive from ever firing again", (t) => {
+  t.mock.timers.enable({ apis: ["setInterval", "setTimeout"] });
+  const calls = [];
+  let closed = false;
+  const cdp = {
+    send: (method, params) => {
+      calls.push({ method, params });
+      return Promise.resolve({ result: { value: "{}" } });
+    },
+    close: () => {
+      closed = true;
+    },
+  };
+  const keepAlive = startKeepAlive(cdp, "https://app.example.invalid");
+
+  closeSession(cdp, keepAlive);
+  assert.equal(closed, true, "closes the CDP WebSocket");
+
+  // Ten more minutes would fire the keep-alive twice (every four) if the
+  // interval were merely unref'd rather than actually cleared.
+  t.mock.timers.tick(10 * 60 * 1000);
+  assert.equal(calls.length, 0, "no timer remains -- the keep-alive never fires after close");
 });
 
 // F1-54: a same-origin resume (an inline re-auth screen, or an in-app

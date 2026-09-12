@@ -1763,6 +1763,13 @@ async function main(): Promise<void> {
   const pgClient = createArchiveClient();
   await pgClient.connect();
 
+  // F1-64: closed in the outer `finally` below, on the stop path exactly like
+  // normal completion -- a bridge session (adapter-morgan-stanley/src/
+  // bridge.mjs) holds a CDP WebSocket and a keep-alive interval that outlive
+  // the throw otherwise, which is what left a "session is gone" run's process
+  // alive for 40+ minutes with no sign-in wait ever logged.
+  let session: AdapterSession | undefined;
+
   try {
     // F1-19 operator gap: upserts the institutions row from the adapter's
     // own capabilities() before discover, so the selection file no longer
@@ -1783,7 +1790,7 @@ async function main(): Promise<void> {
       );
     }
 
-    const session = await buildSession();
+    session = await buildSession();
     const discovered = await adapter.discover(session);
     // F1-32: makes every account discover() reported resolvable by its own
     // external key, so a selection can name one without a separate
@@ -2186,6 +2193,13 @@ async function main(): Promise<void> {
 
     printSummary(outcome, { dryRun, committed: !dryRun });
   } finally {
+    // F1-64: on every exit from the try above -- normal completion or a
+    // thrown stop (SIGNED_OUT, the consecutive-failure breaker, anything
+    // else) -- close the session first. A bridge session's own `close()` is
+    // what clears its keep-alive interval and closes its CDP WebSocket; a
+    // session with no such handles (the synthetic adapter's) simply has no
+    // `close` and this is a no-op.
+    await session?.close?.();
     // F1-36: never `pgClient.end()` directly here. A connection already
     // torn down (by the server, or by the transaction error this `finally`
     // exists to let through) can leave `end()` waiting on an event that
