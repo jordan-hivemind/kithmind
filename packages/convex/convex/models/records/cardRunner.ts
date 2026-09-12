@@ -8,6 +8,7 @@ import {
 
 import type { CardEvidenceRef } from "../provenance/model";
 
+import { CARD_NEGATION_MARKERS } from "./cardGate";
 import {
   CARD_SCHEMAS,
   type CardNormalizerId,
@@ -32,7 +33,7 @@ import { SUPPORTED_CURRENCIES, type ObservationValue } from "./values";
 
 /** Bumped when the boundary statement, the schema rendering or the tool
  * contract changes. Section 4.6 puts it in the card extraction fingerprint. */
-export const CARD_PROMPT_VERSION = "card-prompt-v1";
+export const CARD_PROMPT_VERSION = "card-prompt-v2";
 
 /** Section 5.1: the ladder's steps, in order. `local` is optional. */
 export const CARD_LADDER_STEPS = ["local", "tier0", "tier1"] as const;
@@ -185,6 +186,8 @@ const NORMALIZER_EXPECTATIONS: Readonly<Record<CardNormalizerId, string>> = {
     "cite a span holding only the whole number; give value as a plain digit string",
   clause_boolean_v1:
     "cite the span that asserts or explicitly negates the clause; if the document never mentions the clause, omit the field entirely rather than returning false",
+  enum_v1:
+    "cite a span that names the value exactly; the value must be one of the declared choices, quoted verbatim rather than paraphrased",
 };
 
 export type CardRunnerFieldSpec = {
@@ -195,6 +198,8 @@ export type CardRunnerFieldSpec = {
   normalizer: CardNormalizerId;
   expectation: string;
   clauseTerms?: readonly string[];
+  enumValues?: readonly string[];
+  description?: string;
 };
 
 /** The card schema plus the gate's normalizer expectations, as data. */
@@ -210,7 +215,24 @@ export function cardRunnerFieldSpecs(
     normalizer: schema.normalizer,
     expectation: NORMALIZER_EXPECTATIONS[schema.normalizer],
     ...(schema.clauseTerms ? { clauseTerms: schema.clauseTerms } : {}),
+    ...(schema.enumValues ? { enumValues: schema.enumValues } : {}),
+    ...(schema.description ? { description: schema.description } : {}),
   }));
+}
+
+/**
+ * Rule 7's vocabulary, stated to the runner for the two clause booleans:
+ * the terms that assert a clause and the terms that negate one, so the model
+ * knows what "explicitly negates" means before it ever cites a span. The
+ * negation list is the gate's own `CARD_NEGATION_MARKERS`, so the prompt can
+ * never drift from what `clause_boolean_v1` actually accepts.
+ */
+function clauseVocabulary(spec: CardRunnerFieldSpec): string {
+  if (!spec.clauseTerms) return "";
+  const negations = CARD_NEGATION_MARKERS.map((marker) => marker.trim()).join(
+    ", ",
+  );
+  return ` Asserted by wording such as: ${spec.clauseTerms.join(", ")}. Negated by wording such as: ${negations}. A document that never mentions this clause omits the field; it is not false.`;
 }
 
 function renderFieldSpec(spec: CardRunnerFieldSpec): string {
@@ -218,7 +240,11 @@ function renderFieldSpec(spec: CardRunnerFieldSpec): string {
     spec.required ? "required" : "optional",
     spec.repeated ? "repeated, give each occurrence its own ordinal" : "single",
   ].join(", ");
-  return `- ${spec.field}: value type ${spec.valueTypes.join(" or ")}; ${flags}; ${spec.expectation}`;
+  const meaning = spec.description ? ` ${spec.description}` : "";
+  const enumNote = spec.enumValues
+    ? ` One of: ${spec.enumValues.join(", ")}.`
+    : "";
+  return `- ${spec.field}:${meaning} value type ${spec.valueTypes.join(" or ")}; ${flags}; ${spec.expectation}.${enumNote}${clauseVocabulary(spec)}`;
 }
 
 export const CARD_EXTRACTION_TOOL_NAME = "record_card_candidate";

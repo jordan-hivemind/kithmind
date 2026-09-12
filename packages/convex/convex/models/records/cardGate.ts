@@ -449,6 +449,21 @@ export const CARD_NORMALIZERS = {
   },
 
   /**
+   * A closed-set text field, extractive rather than free text: the value must
+   * be one of the field's declared `enumValues`, and the cited span must
+   * equal it verbatim, exactly as `text_v1` requires for any other span.
+   */
+  enum_v1: (spanText, value, field) => {
+    if (value.type !== "text") return "field_not_declared";
+    if (!(field.enumValues ?? []).includes(value.value)) {
+      return "value_not_normalizable";
+    }
+    return collapse(spanText) === collapse(value.value)
+      ? null
+      : "value_not_in_span";
+  },
+
+  /**
    * Rule 7: true only from a span asserting the clause, false only from a
    * span explicitly negating it. A span that does neither stores nothing, and
    * a field with no span at all never reaches a normalizer, so absence stays
