@@ -1,11 +1,30 @@
 import { convexTest } from "convex-test";
 import { describe, expect, test } from "vitest";
 
+import type { Id } from "../../_generated/dataModel";
 import schema from "../../schema";
 import { modules } from "../../test.setup";
 import { listInventory } from "./inventory";
-import { appendWorkerScanPage, beginWorkerScan } from "../workers/model";
+import {
+  appendWorkerScanPage,
+  beginWorkerScan,
+  reconcileWorkerScan,
+  sealWorkerScan,
+} from "../workers/model";
 import { parseWorkerRequest, type FsDiscoveryEntry } from "../workers/protocol";
+import {
+  activateGeneration,
+  admitSourceRevision,
+  claimJob,
+  createGenerationTextVersion,
+  failJob,
+  requeueJob,
+  stageGeneration,
+  stageGenerationChunks,
+  stageGenerationDocuments,
+  stageGenerationEvidenceSpans,
+  stageGenerationPages,
+} from "../ingestion/model";
 
 const PROFILE = {
   parserProfileId: "pdf_docqa_v1" as const,
@@ -218,6 +237,75 @@ async function appendAll(
     }
     await f.t.run((ctx) => appendWorkerScanPage(ctx, f.principal, request, now));
   }
+}
+
+async function sealHealthy(
+  f: Awaited<ReturnType<typeof fixture>>,
+  scanId: string,
+  requestId: string,
+  expectedPageCount: number,
+  now: number,
+) {
+  const request = parseWorkerRequest({
+    ...source(f),
+    operation: "scan.seal",
+    scanId,
+    requestId,
+    expectedPageCount,
+    health: { status: "healthy" as const },
+  });
+  if (request.operation !== "scan.seal") throw new Error("bad test request");
+  return await f.t.run((ctx) => sealWorkerScan(ctx, f.principal, request, now));
+}
+
+async function reconcileToCompletion(
+  f: Awaited<ReturnType<typeof fixture>>,
+  scanId: string,
+  requestId: string,
+  expectedInventoryEpoch: number,
+  now: number,
+) {
+  const request = parseWorkerRequest({
+    ...source(f),
+    operation: "scan.reconcile",
+    scanId,
+    requestId,
+    expectedInventoryEpoch,
+    ordinal: 0,
+    maxItems: 50,
+  });
+  if (request.operation !== "scan.reconcile") {
+    throw new Error("bad test request");
+  }
+  const result = await f.t.run((ctx) =>
+    reconcileWorkerScan(ctx, f.principal, request, now),
+  );
+  if (!result.done) throw new Error("expected reconcile to finish in one call");
+  return result;
+}
+
+/** Scans the whole SYNTHETIC_TREE (or a subset) through seal and a completed,
+ * healthy reconcile, the only path that may set `missingSinceScanId`. */
+async function completeScan(
+  f: Awaited<ReturnType<typeof fixture>>,
+  label: string,
+  expectedInventoryEpoch: number,
+  entries: FsDiscoveryEntry[],
+  now: number,
+) {
+  const scan = await begin(f, `${label}-begin`, expectedInventoryEpoch, now);
+  await appendAll(f, scan.scanId, `${label}-page`, entries, now + 10);
+  const pageCount = Math.ceil(entries.length / 4);
+  await sealHealthy(f, scan.scanId, `${label}-seal`, pageCount, now + 20);
+  const result = await reconcileToCompletion(
+    f,
+    scan.scanId,
+    `${label}-reconcile`,
+    scan.inventoryEpoch,
+    now + 30,
+  );
+  expect(result.state).toBe("enumerated");
+  return scan;
 }
 
 describe("sourceInventory", () => {
@@ -450,5 +538,350 @@ describe("listInventory", () => {
       byExclusionReason: {},
       truncated: false,
     });
+  });
+});
+
+describe("duplicate canonicality (P2-70a2)", () => {
+  test("the canonical label is deterministic: the lowest identityKeyHash in the group", async () => {
+    const f = await fixture();
+    const scan = await begin(f, "scan-1", 0, 1_000);
+    await appendAll(f, scan.scanId, "scan-1-page", SYNTHETIC_TREE, 1_100);
+
+    const rows = await f.t.run((ctx) =>
+      ctx.db.query("sourceInventory").collect(),
+    );
+    const byFileName = new Map(rows.map((row) => [row.fileName, row]));
+    const dupA = byFileName.get("dup-a.txt")!;
+    const dupB = byFileName.get("dup-b.txt")!;
+    const canonical =
+      dupA.identityKeyHash < dupB.identityKeyHash ? dupA : dupB;
+    const other = canonical === dupA ? dupB : dupA;
+    expect(canonical.exclusionReason).toBe("extraction_pending");
+    expect(other.exclusionReason).toBe("duplicate_of");
+  });
+});
+
+describe("missingSinceScanId (P2-70a2)", () => {
+  test("a complete scan missing one file marks it, a later scan clears it", async () => {
+    const f = await fixture();
+    await completeScan(f, "full", 0, SYNTHETIC_TREE, 1_000);
+
+    const afterFirstScan = await f.t.run((ctx) =>
+      ctx.db.query("sourceInventory").collect(),
+    );
+    expect(
+      afterFirstScan.every((row) => row.missingSinceScanId === undefined),
+    ).toBe(true);
+
+    // q2.pdf is left out of the second scan entirely.
+    const withoutQ2 = SYNTHETIC_TREE.filter(
+      (entry) => !entry.uri.endsWith("q2.pdf"),
+    );
+    const secondScan = await completeScan(f, "missing-one", 1, withoutQ2, 2_000);
+
+    const afterSecondScan = await f.t.run((ctx) =>
+      ctx.db.query("sourceInventory").collect(),
+    );
+    const byFileName = new Map(
+      afterSecondScan.map((row) => [row.fileName, row]),
+    );
+    expect(byFileName.get("q2.pdf")!.missingSinceScanId).toBe(
+      secondScan.scanId,
+    );
+    // Leaves everything else on the row: still present and excluded for the
+    // same reason it always was, not silently dropped.
+    expect(byFileName.get("q2.pdf")!.exclusionReason).toBe(
+      "extraction_pending",
+    );
+    for (const [fileName, row] of byFileName) {
+      if (fileName !== "q2.pdf") {
+        expect(row.missingSinceScanId).toBeUndefined();
+      }
+    }
+
+    // q2.pdf reappears in a third, complete scan: the mark clears.
+    await completeScan(f, "reappears", 2, SYNTHETIC_TREE, 3_000);
+    const afterThirdScan = await f.t.run((ctx) =>
+      ctx.db.query("sourceInventory").collect(),
+    );
+    const q2AfterThird = afterThirdScan.find(
+      (row) => row.fileName === "q2.pdf",
+    )!;
+    expect(q2AfterThird.missingSinceScanId).toBeUndefined();
+    expect(q2AfterThird.lastSeenScanId).not.toBe(secondScan.scanId);
+  });
+});
+
+describe("parse_failed exclusion (P2-70a2)", () => {
+  const PROCESSING = {
+    extractionFingerprint: "text/plain:v1",
+    extractorFingerprint: "none:v1",
+    recordSchemaFingerprint: "documents:v1",
+    normalizationFingerprint: "none:v1",
+    chunkerFingerprint: "whole:v1",
+    correctionRevision: "0",
+    expectedPageCount: 1,
+    expectedEvidenceSpanCount: 1,
+    expectedDocumentCount: 1,
+    expectedChunkCount: 1,
+  };
+
+  function admissionInput(
+    f: Awaited<ReturnType<typeof fixture>>,
+    requestId: string,
+  ) {
+    return {
+      principal: f.principal,
+      sourceAccountId: f.sourceAccountId,
+      requestId,
+      expectedDesiredProcessingEpoch: 0,
+      source: {
+        externalId: "job-fixture-1",
+        title: "Synthetic parse-failed source",
+        docType: "note",
+        uri: "synthetic://job-fixture-1",
+        capturedAt: 1_000,
+        mediaType: "text/plain",
+        inlineText: "alpha beta",
+      },
+      processing: PROCESSING,
+    };
+  }
+
+  async function stageAndActivate(
+    f: Awaited<ReturnType<typeof fixture>>,
+    admitted: Awaited<ReturnType<typeof admitSourceRevision>>,
+    token: string,
+    now: number,
+  ) {
+    const lease = await f.t.run((ctx) =>
+      claimJob(ctx, {
+        principal: f.principal,
+        jobId: admitted.ingestJobId,
+        leaseToken: token,
+        leaseDurationMs: 50,
+        now,
+      }),
+    );
+    if (!("leaseEpoch" in lease)) throw new Error("expected lease");
+    const leaseArgs = {
+      principal: f.principal,
+      jobId: admitted.ingestJobId,
+      leaseEpoch: lease.leaseEpoch,
+      leaseToken: token,
+      now: now + 1,
+    };
+    await f.t.run((ctx) =>
+      createGenerationTextVersion(ctx, { ...leaseArgs, text: "alpha beta" }),
+    );
+    const pages = await f.t.run((ctx) =>
+      stageGenerationPages(ctx, {
+        ...leaseArgs,
+        pages: [{ ordinal: 0, start: 0, end: 10, text: "alpha beta" }],
+      }),
+    );
+    if (!("ids" in pages)) throw new Error("expected pages");
+    const spans = await f.t.run((ctx) =>
+      stageGenerationEvidenceSpans(ctx, {
+        ...leaseArgs,
+        spans: [
+          {
+            sourcePageId: pages.ids[0]!._id,
+            ordinal: 0,
+            start: 0,
+            end: 5,
+            locator: { kind: "page" as const, label: "1" },
+          },
+        ],
+      }),
+    );
+    if (!("ids" in spans)) throw new Error("expected spans");
+    const documents = await f.t.run((ctx) =>
+      stageGenerationDocuments(ctx, {
+        ...leaseArgs,
+        documents: [
+          {
+            documentKey: "document-0",
+            title: "Synthetic document",
+            docType: "note",
+            capturedAt: 1_000,
+            evidenceSpanIds: [spans.ids[0]!._id],
+          },
+        ],
+      }),
+    );
+    if (!("ids" in documents)) throw new Error("expected documents");
+    await f.t.run((ctx) =>
+      stageGenerationChunks(ctx, {
+        ...leaseArgs,
+        chunks: [
+          {
+            documentId: documents.ids[0]!._id,
+            ordinal: 0,
+            text: "alpha beta",
+            evidenceSpanIds: [spans.ids[0]!._id],
+          },
+        ],
+      }),
+    );
+    await f.t.run((ctx) => stageGeneration(ctx, leaseArgs));
+    // The first lease (50ms, from `now`) has expired by `now + 101`, so this
+    // reclaims the staged job the same way a restarted worker would.
+    const staged = await f.t.run((ctx) =>
+      claimJob(ctx, {
+        principal: f.principal,
+        jobId: admitted.ingestJobId,
+        leaseToken: `${token}-activate`,
+        leaseDurationMs: 1_000,
+        now: now + 101,
+      }),
+    );
+    if (!("leaseEpoch" in staged)) throw new Error("expected staged lease");
+    await f.t.run((ctx) =>
+      activateGeneration(ctx, {
+        principal: f.principal,
+        jobId: admitted.ingestJobId,
+        leaseEpoch: staged.leaseEpoch,
+        leaseToken: `${token}-activate`,
+        now: now + 102,
+      }),
+    );
+  }
+
+  test("a non-retryable job failure marks parse_failed with its failure class; a later success clears it", async () => {
+    const f = await fixture();
+    const admitted = await f.t.run((ctx) =>
+      admitSourceRevision(ctx, admissionInput(f, "request-1")),
+    );
+    // The row an earlier fs scan would already have created for this same
+    // file, tied to the job's sourceItemId.
+    const scan = await begin(f, "scan-1", 0, 900);
+    const inventoryId = await f.t.run((ctx) =>
+      ctx.db.insert("sourceInventory", {
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        sourceItemId: admitted.sourceItemId,
+        identityKeyHash: "job-fixture-identity",
+        relativePath: "job-fixture.txt",
+        folderPath: "",
+        fileName: "job-fixture.txt",
+        modifiedAt: 900,
+        contentIndexed: false,
+        exclusionReason: "extraction_pending" as const,
+        firstSeenScanId: scan.scanId as Id<"workerSourceScans">,
+        lastSeenScanId: scan.scanId as Id<"workerSourceScans">,
+      }),
+    );
+
+    const lease = await f.t.run((ctx) =>
+      claimJob(ctx, {
+        principal: f.principal,
+        jobId: admitted.ingestJobId,
+        leaseToken: "lease-1",
+        leaseDurationMs: 1_000,
+        now: 1_000,
+      }),
+    );
+    if (!("leaseEpoch" in lease)) throw new Error("expected lease");
+    const failed = await f.t.run((ctx) =>
+      failJob(ctx, {
+        principal: f.principal,
+        jobId: admitted.ingestJobId,
+        leaseEpoch: lease.leaseEpoch,
+        leaseToken: "lease-1",
+        now: 1_001,
+        code: "source_bytes_invalid",
+        message: "The retained source bytes no longer match their manifest",
+        retryable: false,
+      }),
+    );
+    expect(failed.retryable).toBe(false);
+
+    const afterFailure = await f.t.run((ctx) => ctx.db.get(inventoryId));
+    expect(afterFailure?.exclusionReason).toBe("parse_failed");
+    expect(afterFailure?.exclusionDetail).toBe("source_bytes_invalid");
+
+    const queueAfterFailure = await f.t.run((ctx) =>
+      listInventory(ctx, [f.spaceId], {
+        sourceAccountId: f.sourceAccountId,
+        exclusionReason: "parse_failed",
+      }),
+    );
+    expect(queueAfterFailure.counts.byExclusionReason.parse_failed).toBe(1);
+    expect(queueAfterFailure.rows[0]?.fileName).toBe("job-fixture.txt");
+
+    // A later job for the same file succeeds.
+    await f.t.run((ctx) =>
+      requeueJob(ctx, {
+        principal: f.principal,
+        jobId: admitted.ingestJobId,
+        now: 1_100,
+      }),
+    );
+    await stageAndActivate(f, admitted, "lease-2", 1_200);
+
+    const afterSuccess = await f.t.run((ctx) => ctx.db.get(inventoryId));
+    expect(afterSuccess?.exclusionReason).toBe("extraction_pending");
+    expect(afterSuccess?.exclusionDetail).toBeUndefined();
+
+    const queueAfterSuccess = await f.t.run((ctx) =>
+      listInventory(ctx, [f.spaceId], {
+        sourceAccountId: f.sourceAccountId,
+        exclusionReason: "parse_failed",
+      }),
+    );
+    expect(
+      queueAfterSuccess.counts.byExclusionReason.parse_failed,
+    ).toBeUndefined();
+  });
+
+  test("a failed job never excludes a file whose row is already content indexed", async () => {
+    const f = await fixture();
+    const admitted = await f.t.run((ctx) =>
+      admitSourceRevision(ctx, admissionInput(f, "request-1")),
+    );
+    const scan = await begin(f, "scan-1", 0, 900);
+    const inventoryId = await f.t.run((ctx) =>
+      ctx.db.insert("sourceInventory", {
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        sourceItemId: admitted.sourceItemId,
+        identityKeyHash: "job-fixture-identity",
+        relativePath: "job-fixture.txt",
+        folderPath: "",
+        fileName: "job-fixture.txt",
+        modifiedAt: 900,
+        contentIndexed: true,
+        firstSeenScanId: scan.scanId as Id<"workerSourceScans">,
+        lastSeenScanId: scan.scanId as Id<"workerSourceScans">,
+      }),
+    );
+
+    const lease = await f.t.run((ctx) =>
+      claimJob(ctx, {
+        principal: f.principal,
+        jobId: admitted.ingestJobId,
+        leaseToken: "lease-1",
+        leaseDurationMs: 1_000,
+        now: 1_000,
+      }),
+    );
+    if (!("leaseEpoch" in lease)) throw new Error("expected lease");
+    await f.t.run((ctx) =>
+      failJob(ctx, {
+        principal: f.principal,
+        jobId: admitted.ingestJobId,
+        leaseEpoch: lease.leaseEpoch,
+        leaseToken: "lease-1",
+        now: 1_001,
+        code: "source_bytes_invalid",
+        message: "The retained source bytes no longer match their manifest",
+        retryable: false,
+      }),
+    );
+
+    const row = await f.t.run((ctx) => ctx.db.get(inventoryId));
+    expect(row?.exclusionReason).toBeUndefined();
+    expect(row?.exclusionDetail).toBeUndefined();
   });
 });

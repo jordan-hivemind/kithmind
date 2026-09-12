@@ -167,6 +167,12 @@ export async function upsertSourceInventoryRow(
     contentIndexed,
     exclusionReason,
     lastSeenScanId: scanId,
+    // Section 2.2: "clear it when the file reappears in a later scan". This
+    // call is itself an observation of the file, so any prior "missing" mark
+    // no longer holds.
+    ...(existing?.missingSinceScanId === undefined
+      ? {}
+      : { missingSinceScanId: undefined }),
   };
 
   if (existing) {
@@ -180,6 +186,96 @@ export async function upsertSourceInventoryRow(
 
   if (groupId !== undefined) {
     await reconcileDuplicateGroup(ctx, spaceId, groupId);
+  }
+}
+
+/**
+ * Section 2.2/2.3 (P2-70a2): a document job's failure path calls this with
+ * the job's `sourceItemId` and its failure class (an `ingestJobs.error.code`,
+ * already bounded and never document text) once the job has given up
+ * retrying. Only files that reached item admission can have a job at all, so
+ * the `by_sourceItemId` index (already defined for this table) is enough to
+ * find the row; a row that is already content indexed is left alone, since a
+ * job failure after an earlier success does not retroactively exclude a
+ * file whose active generation still holds retained text.
+ */
+export async function markInventoryParseFailed(
+  ctx: MutationCtx,
+  args: { sourceItemId: Id<"sourceItems">; failureClass: string },
+): Promise<void> {
+  const existing = (
+    await ctx.db
+      .query("sourceInventory")
+      .withIndex("by_sourceItemId", (q) =>
+        q.eq("sourceItemId", args.sourceItemId),
+      )
+      .take(1)
+  )[0];
+  if (!existing || existing.contentIndexed) return;
+  await ctx.db.patch(existing._id, {
+    exclusionReason: "parse_failed",
+    exclusionDetail: args.failureClass,
+  });
+}
+
+/**
+ * Section 2.2/2.3 (P2-70a2): the counterpart to `markInventoryParseFailed`,
+ * called once a later job for the same file activates successfully. This
+ * only reverts a `parse_failed` row back to `extraction_pending` (the same
+ * value a fresh scan would assign a not-yet-indexed file): `contentIndexed`
+ * itself is scan-computed only, per the existing note on that field above,
+ * so the next scan is what promotes the row the rest of the way.
+ */
+export async function clearInventoryParseFailed(
+  ctx: MutationCtx,
+  args: { sourceItemId: Id<"sourceItems"> },
+): Promise<void> {
+  const existing = (
+    await ctx.db
+      .query("sourceInventory")
+      .withIndex("by_sourceItemId", (q) =>
+        q.eq("sourceItemId", args.sourceItemId),
+      )
+      .take(1)
+  )[0];
+  if (!existing || existing.exclusionReason !== "parse_failed") return;
+  await ctx.db.patch(existing._id, {
+    exclusionReason: "extraction_pending",
+    exclusionDetail: undefined,
+  });
+}
+
+/**
+ * Section 2.4 (P2-70a2): called only from the reconcile-completion path,
+ * only for a healthy completed reconciliation (`done && !needsReview`), the
+ * same gate the plan requires for `missingSinceScanId`. Every row this scan
+ * did not touch (`lastSeenScanId !== scanId`) was present at some point and
+ * is now inventoried as missing rather than silently dropped; a row already
+ * marked missing keeps its earlier scan id, so `missingSinceScanId` names
+ * the start of the gap rather than the latest scan that failed to find it.
+ *
+ * ponytail: one full per-account sweep inside this mutation, matching this
+ * table's existing `reconcileDuplicateGroup` sweep. Fine at personal-archive
+ * scale; move to a paginated multi-call sweep (mirroring the sourceItems
+ * reconcile loop above) if a source account's file count grows enough to
+ * threaten a single mutation's read/write bounds.
+ */
+export async function markMissingInventoryRows(
+  ctx: MutationCtx,
+  args: {
+    spaceId: Id<"spaces">;
+    sourceAccountId: Id<"sourceAccounts">;
+    scanId: Id<"workerSourceScans">;
+  },
+): Promise<void> {
+  for await (const row of ctx.db
+    .query("sourceInventory")
+    .withIndex("by_space_account_folder", (q) =>
+      q.eq("spaceId", args.spaceId).eq("sourceAccountId", args.sourceAccountId),
+    )) {
+    if (row.lastSeenScanId !== args.scanId && row.missingSinceScanId === undefined) {
+      await ctx.db.patch(row._id, { missingSinceScanId: args.scanId });
+    }
   }
 }
 
@@ -275,7 +371,9 @@ export function projectInventoryRow(row: Doc<"sourceInventory">) {
     modifiedAt: row.modifiedAt,
     contentIndexed: row.contentIndexed,
     exclusionReason: row.exclusionReason,
+    exclusionDetail: row.exclusionDetail,
     duplicateGroupId: row.duplicateGroupId,
+    missingSinceScanId: row.missingSinceScanId,
   };
 }
 
