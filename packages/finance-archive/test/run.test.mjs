@@ -99,7 +99,35 @@ function writeReparseAdapterFixtures(t) {
       `};\n` +
       `export default brokenAdapter;\n`,
   );
-  return { fixturesDir, adapterModulePath, brokenAdapterModulePath, sessionModulePath };
+  // F1-60. A second extractor that also fails, but for a different stated
+  // reason: what a reparse under a better parser looks like when it gets no
+  // further but does name the obstacle differently.
+  const rebrokenAdapterModulePath = join(fixturesDir, "adapter-broken-parse-2.mjs");
+  writeFileSync(
+    rebrokenAdapterModulePath,
+    `import { syntheticAdapter } from ${JSON.stringify(distIndexUrl)};\n` +
+      `const rebrokenAdapter = {\n` +
+      `  ...syntheticAdapter,\n` +
+      `  async parse(rawFile) {\n` +
+      `    if (rawFile.kind === "pdf_statement" || rawFile.kind === "trade_confirmation") {\n` +
+      `      return {\n` +
+      `        activity: [],\n` +
+      `        holdings: { positions: [], balances: [], liabilities: [] },\n` +
+      `        parseNote: "partially parsed: 2 holdings block(s) left unparsed (F1-60 test fixture)",\n` +
+      `      };\n` +
+      `    }\n` +
+      `    return syntheticAdapter.parse(rawFile);\n` +
+      `  },\n` +
+      `};\n` +
+      `export default rebrokenAdapter;\n`,
+  );
+  return {
+    fixturesDir,
+    adapterModulePath,
+    brokenAdapterModulePath,
+    rebrokenAdapterModulePath,
+    sessionModulePath,
+  };
 }
 
 /**
@@ -1395,6 +1423,107 @@ test(
     );
     assert.equal(items.length, 1, "no duplicate review item opened on the still-unparsed rerun");
     assert.equal(items[0].status, "open");
+  },
+);
+
+test(
+  "F1-60: a reparse that reports a different parse note rewrites the one item in place",
+  { skip },
+  async (t) => {
+    const { schema, client } = await seededSchema(t);
+
+    const rawDir = mkdtempSync(join(tmpdir(), "kith-finance-reparse-renote-raw-"));
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+
+    const { fixturesDir, brokenAdapterModulePath, rebrokenAdapterModulePath, sessionModulePath } =
+      writeReparseAdapterFixtures(t);
+    const selectionPath = reparseSelection(fixturesDir);
+
+    makeRunner({
+      adapterModulePath: brokenAdapterModulePath,
+      sessionModulePath,
+      selectionPath,
+      schema,
+      rawDir,
+    })();
+    const [before] = await all(
+      client,
+      "SELECT id, reason, raw_value FROM review_items WHERE kind = 'document_unparsed'",
+    );
+    assert.match(before.reason, /synthetic extractor outage/);
+
+    // The same immutable bytes, read by an extractor that gets no further but
+    // says something different about why.
+    const output = makeReparseRunner({
+      adapterModulePath: rebrokenAdapterModulePath,
+      schema,
+      rawDir,
+    })();
+    assert.match(output, /documents still unparsed: 1/);
+    assert.match(output, /review items updated: 1/);
+    assert.match(output, /review items resolved: 0/);
+    assert.match(output, /review items opened: 0/);
+
+    const after = await all(
+      client,
+      "SELECT id, status, reason, raw_value FROM review_items WHERE kind = 'document_unparsed'",
+    );
+    assert.equal(after.length, 1, "one item per document: rewritten, never duplicated");
+    assert.equal(after[0].id, before.id, "the same row, not a replacement");
+    assert.equal(after[0].status, "open");
+    assert.match(after[0].reason, /2 holdings block\(s\) left unparsed/);
+    assert.equal(after[0].raw_value, after[0].reason, "raw_value carries the note it was opened on");
+
+    // A rerun under that same second extractor changes nothing again: the
+    // note it reports is now the note the item already carries.
+    const again = makeReparseRunner({
+      adapterModulePath: rebrokenAdapterModulePath,
+      schema,
+      rawDir,
+    })();
+    assert.match(again, /review items updated: 0/);
+    assert.equal(await count(client, "review_items", "WHERE kind = 'document_unparsed'"), 1);
+  },
+);
+
+test(
+  "F1-60: a note change never reopens or overwrites an item a reviewer already closed",
+  { skip },
+  async (t) => {
+    const { schema, client } = await seededSchema(t);
+
+    const rawDir = mkdtempSync(join(tmpdir(), "kith-finance-reparse-dismissed-raw-"));
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+
+    const { fixturesDir, brokenAdapterModulePath, rebrokenAdapterModulePath, sessionModulePath } =
+      writeReparseAdapterFixtures(t);
+    const selectionPath = reparseSelection(fixturesDir);
+
+    makeRunner({
+      adapterModulePath: brokenAdapterModulePath,
+      sessionModulePath,
+      selectionPath,
+      schema,
+      rawDir,
+    })();
+    await client.query(
+      "UPDATE review_items SET status = 'dismissed' WHERE kind = 'document_unparsed'",
+    );
+
+    const output = makeReparseRunner({
+      adapterModulePath: rebrokenAdapterModulePath,
+      schema,
+      rawDir,
+    })();
+    assert.match(output, /review items updated: 0/);
+
+    const items = await all(
+      client,
+      "SELECT status, reason FROM review_items WHERE kind = 'document_unparsed'",
+    );
+    assert.equal(items.length, 1, "a dismissal is not a reason to open a second item");
+    assert.equal(items[0].status, "dismissed");
+    assert.match(items[0].reason, /synthetic extractor outage/, "the reviewer's row is untouched");
   },
 );
 

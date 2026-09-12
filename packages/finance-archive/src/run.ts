@@ -806,6 +806,9 @@ type ReparseOutcome = {
   rowsRefused: number;
   reviewItemsOpened: number;
   reviewItemsResolved: number;
+  /** F1-60: items whose reason this reparse rewrote in place, because the
+   * same document now reports a different parse note. */
+  reviewItemsUpdated: number;
 };
 
 /**
@@ -949,6 +952,7 @@ async function runReparse(args: readonly string[]): Promise<void> {
     rowsRefused: 0,
     reviewItemsOpened: 0,
     reviewItemsResolved: 0,
+    reviewItemsUpdated: 0,
   };
 
   try {
@@ -1045,6 +1049,7 @@ async function runReparse(args: readonly string[]): Promise<void> {
         outcome.rowsRefused += summary.rowsRefused;
         outcome.reviewItemsOpened += summary.reviewItemsOpened;
         outcome.reviewItemsResolved += summary.reviewItemsResolved;
+        outcome.reviewItemsUpdated += summary.reviewItemsUpdated;
       });
     }
 
@@ -1078,6 +1083,7 @@ function printReparseSummary(
   console.log(`rows refused: ${outcome.rowsRefused}`);
   console.log(`review items opened: ${outcome.reviewItemsOpened}`);
   console.log(`review items resolved: ${outcome.reviewItemsResolved}`);
+  console.log(`review items updated: ${outcome.reviewItemsUpdated}`);
   if (wholeArchive === null) {
     console.log("whole-archive gate pass: skipped (nothing reparsed)");
   } else {

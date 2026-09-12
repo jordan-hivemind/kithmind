@@ -17,15 +17,24 @@ import { resolveStatementMoney } from "../src/statementLayout.mjs";
 import { buildMinimalPdf } from "../fixtures/pdf.mjs";
 import { STATEMENT_LINES } from "../fixtures/statementLines.mjs";
 import {
+  ACTIVITY_SUMMARY_TEXT,
   ambiguousBlockLines,
   balanceSheetLines,
   bondBlockLines,
   CONSOLIDATED_ACCOUNT_ONE,
   CONSOLIDATED_ACCOUNT_TWO,
   CONSOLIDATED_LAYOUT_TEXT,
+  COVER_TOTAL_LAYOUT_TEXT,
+  CROSS_MONTH_LAYOUT_TEXT,
+  EMPTY_ACCOUNT_LAYOUT_TEXT,
   equityBlockLines,
+  navFundBlockLines,
+  pageSplitEquityPages,
+  privateHoldingsBlockLines,
+  sectionSummaryLines,
   STATEMENT_LAYOUT_TEXT,
   statementPages,
+  YEAR_ROLLOVER_LAYOUT_TEXT,
 } from "../fixtures/statementLayout.mjs";
 
 const kind = "pdf_statement";
@@ -429,6 +438,150 @@ test("a statement with no readable balance sheet still reports its holdings and 
   assert.equal(parsed.holdings.positions.length, 1);
   assert.deepEqual(parsed.holdings.balances, []);
   assert.match(parsed.parseNote, /no readable BALANCE SHEET block/);
+});
+
+// --- F1-61: layouts the first pass over the corpus did not cover -----------
+
+test("a security the page break cut in half is one position, not two blocks refused", () => {
+  const text = pageSplitEquityPages()
+    .map((page) => page.join("\n"))
+    .join(`\n${PAGE_SEPARATOR}\n`);
+  const parsed = parseStatementLines(text, kind);
+  assert.doesNotMatch(parsed.parseNote ?? "", /holdings block\(s\) left unparsed/);
+  assert.equal(parsed.holdings.positions.length, 1, "the two halves are one security");
+  const [position] = parsed.holdings.positions;
+  // The Total row on the second page states the position; the description
+  // came from the first page, so the security is still named.
+  assert.equal(position.instrument.symbol, "WNDF");
+  assert.equal(position.quantity, "15");
+  assert.equal(position.marketValue, "4776");
+  // The price is per-lot and every lot agrees on it, so it still fills in --
+  // across the page break as well as within one page.
+  assert.equal(position.price, "318.4");
+});
+
+test("a block the page break cut and nothing continued is refused exactly as before", () => {
+  const [firstPage] = pageSplitEquityPages();
+  const parsed = parseStatementLines(firstPage.join("\n"), kind);
+  assert.deepEqual(parsed.holdings.positions, []);
+  assert.match(parsed.parseNote, /1 holdings block\(s\) left unparsed/);
+});
+
+test("a section's own totals row is not read as a security", () => {
+  for (const named of [false, true]) {
+    const text = [
+      "        Page 1 of 1",
+      "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+      "        Synthetic Active Assets Account    123-456789-012",
+      ...balanceSheetLines(),
+      "        HOLDINGS",
+      ...equityBlockLines(),
+      ...sectionSummaryLines({ named }),
+    ].join("\n");
+    const parsed = parseStatementLines(text, kind);
+    assert.equal(parsed.parseNote, undefined, `totals row (named: ${named}) left a note`);
+    assert.equal(parsed.holdings.positions.length, 1, "only the security is a position");
+    assert.equal(parsed.holdings.positions[0].marketValue, "3184");
+  }
+});
+
+test("a security printed after a section summary still starts its own block", () => {
+  const text = [
+    "        Page 1 of 1",
+    "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+    "        Synthetic Active Assets Account    123-456789-012",
+    "        HOLDINGS",
+    ...equityBlockLines(),
+    ...sectionSummaryLines({ named: true }),
+    ...bondBlockLines().slice(2),
+  ].join("\n");
+  const parsed = parseStatementLines(text, kind);
+  assert.equal(parsed.holdings.positions.length, 2);
+  assert.equal(parsed.holdings.positions[1].instrument.cusip, "00000WNF1");
+});
+
+test("the NAV-priced fund table's `Value` column is that holding's value, at NAV", () => {
+  const text = [
+    "        Page 1 of 1",
+    "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+    "        Synthetic Active Assets Account    123-456789-012",
+    ...balanceSheetLines(),
+    "        HOLDINGS",
+    ...navFundBlockLines(),
+  ].join("\n");
+  const parsed = parseStatementLines(text, kind);
+  assert.equal(parsed.parseNote, undefined);
+  const [position] = parsed.holdings.positions;
+  assert.equal(position.marketValue, "29625");
+  assert.equal(position.price, "118.5");
+  // The basis is what the column says it is: this value is a reported NAV,
+  // not a market price, and the note says which column it came from.
+  assert.equal(position.valuationBasis, "reported_nav");
+  assert.match(position.valuationNote, /NAV column/);
+});
+
+test("`Value + Distributions` is never read as a holding's value", () => {
+  const text = [
+    "        Page 1 of 1",
+    "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+    "        Synthetic Active Assets Account    123-456789-012",
+    "        HOLDINGS",
+    ...privateHoldingsBlockLines(),
+  ].join("\n");
+  const parsed = parseStatementLines(text, kind);
+  assert.deepEqual(parsed.holdings.positions, [], "a value with distributions in it is not a value");
+  assert.match(parsed.parseNote, /states no Market Value or NAV column/);
+});
+
+test("a period that opens mid-month names its month twice and still resolves", () => {
+  const parsed = parseStatementLines(CROSS_MONTH_LAYOUT_TEXT, kind);
+  assert.equal(parsed.parseNote, undefined);
+  const [balance] = parsed.holdings.balances;
+  assert.equal(balance.totalValue, "1302775.5");
+  // The as-of rule is unchanged: the period's own end date, never today.
+  assert.equal(balance.asOf, "2026-03-31");
+});
+
+test("a period running backwards over a year boundary is refused, not assumed", () => {
+  const parsed = parseStatementLines(YEAR_ROLLOVER_LAYOUT_TEXT, kind);
+  assert.deepEqual(parsed.holdings.balances, []);
+  assert.match(parsed.parseNote, /period is unknown/);
+});
+
+test("the cover page's account total is read when there is no BALANCE SHEET block", () => {
+  const parsed = parseStatementLines(COVER_TOTAL_LAYOUT_TEXT, kind);
+  assert.equal(parsed.parseNote, undefined);
+  const [balance] = parsed.holdings.balances;
+  assert.equal(balance.totalValue, "74310.25");
+  assert.equal(balance.periodEndValue, "74310.25");
+  assert.equal(balance.asOf, "2026-03-31");
+  // The banner states one number: no cash, no opening value, no liability,
+  // and the note says so rather than leaving a reader to assume zero.
+  assert.equal(balance.cash, null);
+  assert.equal(balance.periodStartValue, null);
+  assert.deepEqual(parsed.holdings.liabilities, []);
+  assert.match(balance.totalValueNote, /prints no BALANCE SHEET block/);
+});
+
+test("an account holding nothing says so, and is not a statement left unparsed", () => {
+  const parsed = parseStatementLines(EMPTY_ACCOUNT_LAYOUT_TEXT, kind);
+  assert.equal(parsed.parseNote, undefined, "the statement states its total: none");
+  // "none" is not zero and is never recorded as one.
+  assert.deepEqual(parsed.holdings, { positions: [], balances: [], liabilities: [] });
+});
+
+test("a cover page stating none, over holdings, still reports the missing balance sheet", () => {
+  const text = [EMPTY_ACCOUNT_LAYOUT_TEXT, "        HOLDINGS", ...equityBlockLines()].join("\n");
+  const parsed = parseStatementLines(text, kind);
+  assert.equal(parsed.holdings.positions.length, 1);
+  assert.match(parsed.parseNote, /no readable BALANCE SHEET block/);
+});
+
+test("the cash activity summary is named for what it is, not blamed on the period line", () => {
+  const parsed = parseStatementLines(ACTIVITY_SUMMARY_TEXT, kind);
+  assert.deepEqual(parsed.holdings, { positions: [], balances: [], liabilities: [] });
+  assert.match(parsed.parseNote, /cash activity summary, not a holdings statement/);
+  assert.doesNotMatch(parsed.parseNote, /period is unknown/);
 });
 
 test("text in neither grammar routes to review instead of reaching a parser blind", () => {
