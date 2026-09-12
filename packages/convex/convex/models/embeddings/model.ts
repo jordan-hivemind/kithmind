@@ -7,6 +7,13 @@ import {
 } from "../../lib/embeddingProvider";
 import { sha256Hex, utf8ByteLength } from "../ingestion/hash";
 import { getAuthorizedReadSpaceIds, type PrincipalRef } from "../../lib/spaces";
+import {
+  embeddingVectorScopeV2,
+  isCurrentThought,
+  newChunkTargetCaches,
+  recordVectorCoverageChange,
+  resolveActiveChunkTarget,
+} from "./targets";
 
 export const MAX_EMBEDDING_MANIFEST_TARGETS = 256;
 export const MAX_EMBEDDING_MANIFEST_BYTES = 2 * 1024 * 1024;
@@ -204,12 +211,6 @@ export async function ensureEmbeddingProfile(
   return (await ctx.db.get(id))!;
 }
 
-function isCurrentThought(thought: Doc<"thoughts">): boolean {
-  return (
-    thought.memoryStatus === undefined || thought.memoryStatus === "current"
-  );
-}
-
 function targetKey(target: ManifestTarget): string {
   return `${target.kind}:${target.targetId}`;
 }
@@ -264,97 +265,21 @@ export async function deriveEmbeddingManifest(
     );
   }
 
-  const documentCache = new Map<string, Doc<"documents"> | null>();
-  const generationCache = new Map<
-    string,
-    Doc<"processingGenerations"> | null
-  >();
-  const itemCache = new Map<string, Doc<"sourceItems"> | null>();
-  const accountCache = new Map<string, Doc<"sourceAccounts"> | null>();
-  const revisionCache = new Map<string, Doc<"sourceRevisions"> | null>();
-  const textVersionCache = new Map<string, Doc<"sourceTextVersions"> | null>();
+  const caches = newChunkTargetCaches();
   for (const chunk of chunks) {
     estimatedBytes += utf8ByteLength(chunk.text);
-    let document = documentCache.get(chunk.documentId);
-    if (document === undefined) {
-      document = await ctx.db.get(chunk.documentId);
-      documentCache.set(chunk.documentId, document);
-    }
-    let generation = generationCache.get(chunk.processingGenerationId);
-    if (generation === undefined) {
-      generation = await ctx.db.get(chunk.processingGenerationId);
-      generationCache.set(chunk.processingGenerationId, generation);
-    }
-    const itemId = generation?.sourceItemId;
-    let item = itemId ? itemCache.get(itemId) : null;
-    if (itemId && item === undefined) {
-      item = await ctx.db.get(itemId);
-      itemCache.set(itemId, item);
-    }
-    const accountId = generation?.sourceAccountId;
-    let account = accountId ? accountCache.get(accountId) : null;
-    if (accountId && account === undefined) {
-      account = await ctx.db.get(accountId);
-      accountCache.set(accountId, account);
-    }
-    const revisionId = generation?.sourceRevisionId;
-    let revision = revisionId ? revisionCache.get(revisionId) : null;
-    if (revisionId && revision === undefined) {
-      revision = await ctx.db.get(revisionId);
-      revisionCache.set(revisionId, revision);
-    }
-    const textVersionId = generation?.sourceTextVersionId;
-    let textVersion = textVersionId
-      ? textVersionCache.get(textVersionId)
-      : null;
-    if (textVersionId && textVersion === undefined) {
-      textVersion = await ctx.db.get(textVersionId);
-      textVersionCache.set(textVersionId, textVersion);
-    }
-    if (
-      !document ||
-      !generation ||
-      !item ||
-      !account ||
-      !revision ||
-      !textVersion ||
-      document.spaceId !== spaceId ||
-      document.processingGenerationId !== generation._id ||
-      document.sourceItemId !== item._id ||
-      document.sourceRevisionId !== generation.sourceRevisionId ||
-      document.sourceTextVersionId !== generation.sourceTextVersionId ||
-      document.publicationState !== "active" ||
-      generation.spaceId !== spaceId ||
-      generation.state !== "ready" ||
-      generation.sourceAccountId !== item.sourceAccountId ||
-      account.spaceId !== spaceId ||
-      revision.spaceId !== spaceId ||
-      revision.sourceItemId !== item._id ||
-      textVersion.spaceId !== spaceId ||
-      textVersion.sourceRevisionId !== revision._id ||
-      !textVersion.evidenceSealed ||
-      item.spaceId !== spaceId
-    ) {
-      throw new Error("Active chunk has an invalid processing parent chain");
-    }
-    if (item.lifecycle === "forgetting" || item.lifecycle === "forgotten") {
-      continue;
-    }
-    if (item.activeGenerationId !== generation._id) {
-      throw new Error(
-        "Active chunk is not in its source item's active generation",
-      );
-    }
-    if (item.activeRevisionId !== revision._id) {
-      throw new Error(
-        "Active chunk is not in its source item's active revision",
-      );
-    }
+    const resolved = await resolveActiveChunkTarget(
+      ctx,
+      spaceId,
+      chunk,
+      caches,
+    );
+    if (!resolved) continue;
     targets.push({
       kind: "chunk",
       targetId: String(chunk._id),
       inputHash: await sha256Hex(chunk.text),
-      processingGenerationId: generation._id,
+      processingGenerationId: resolved.processingGenerationId,
     });
   }
   if (estimatedBytes > MAX_EMBEDDING_MANIFEST_BYTES) {
@@ -907,6 +832,15 @@ async function insertVector(
     ) {
       throw new Error("Conflicting immutable embedding vector");
     }
+    await recordVectorCoverageChange(ctx, {
+      spaceId: input.spaceId,
+      targetKind: input.kind,
+      targetId: String(targetId),
+      fingerprint: input.fingerprint,
+      inputHash,
+      covered: true,
+      now: Date.now(),
+    });
     return {
       id: existing._id,
       inserted: false,
@@ -920,6 +854,11 @@ async function insertVector(
     embeddingFingerprint: input.fingerprint,
     targetKind: input.kind,
     searchScope,
+    scopeV2: embeddingVectorScopeV2({
+      spaceId: input.spaceId,
+      fingerprint: input.fingerprint,
+      targetKind: input.kind,
+    }),
     ...(input.thoughtId ? { thoughtId: input.thoughtId } : {}),
     ...(input.chunkId ? { chunkId: input.chunkId } : {}),
     ...(input.processingGenerationId
@@ -928,12 +867,39 @@ async function insertVector(
     inputHash,
     embedding: input.vector,
   });
+  await recordVectorCoverageChange(ctx, {
+    spaceId: input.spaceId,
+    targetKind: input.kind,
+    targetId: String(targetId),
+    fingerprint: input.fingerprint,
+    inputHash,
+    covered: true,
+    now: Date.now(),
+  });
   return {
     id,
     inserted: true,
     generationState: generation.state,
     activeTarget,
   };
+}
+
+/** I4, delete half: drops the coverage marker the deleted row was holding. */
+async function releaseVectorCoverage(
+  ctx: MutationCtx,
+  row: Doc<"embeddingVectors">,
+): Promise<void> {
+  const targetId = row.targetKind === "thought" ? row.thoughtId : row.chunkId;
+  if (!targetId) return;
+  await recordVectorCoverageChange(ctx, {
+    spaceId: row.spaceId,
+    targetKind: row.targetKind,
+    targetId: String(targetId),
+    fingerprint: row.embeddingFingerprint,
+    inputHash: row.inputHash,
+    covered: false,
+    now: Date.now(),
+  });
 }
 
 /** Call after an eligibility-changing write, in the same mutation. */
@@ -1068,6 +1034,7 @@ export async function deleteChunkEmbeddingVectors(
     if (row.spaceId !== input.spaceId || row.targetKind !== "chunk") {
       throw new Error("Chunk embedding cleanup found an invalid vector parent");
     }
+    await releaseVectorCoverage(ctx, row);
     await ctx.db.delete(row._id);
   }
   return { deleted: Math.min(rows.length, limit), done: rows.length <= limit };
@@ -1092,6 +1059,7 @@ export async function deleteThoughtEmbeddingVectors(
         "Thought embedding cleanup found an invalid vector parent",
       );
     }
+    await releaseVectorCoverage(ctx, row);
     await ctx.db.delete(row._id);
   }
   return { deleted: Math.min(rows.length, limit), done: rows.length <= limit };
@@ -1152,6 +1120,7 @@ export async function deleteActiveThoughtEmbeddingVectors(
     ) {
       throw new Error("Active thought embedding vector has invalid identity");
     }
+    await releaseVectorCoverage(ctx, row);
     await ctx.db.delete(row._id);
     deleted += 1;
   }

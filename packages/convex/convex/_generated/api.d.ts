@@ -43,6 +43,7 @@ import type * as models_embeddings_model from "../models/embeddings/model.js";
 import type * as models_embeddings_operator from "../models/embeddings/operator.js";
 import type * as models_embeddings_private from "../models/embeddings/private.js";
 import type * as models_embeddings_tables from "../models/embeddings/tables.js";
+import type * as models_embeddings_targets from "../models/embeddings/targets.js";
 import type * as models_embeddings_validators from "../models/embeddings/validators.js";
 import type * as models_facts_mcpActions from "../models/facts/mcpActions.js";
 import type * as models_facts_mcpQueries from "../models/facts/mcpQueries.js";
@@ -201,6 +202,7 @@ declare const fullApi: ApiFromModules<{
   "models/embeddings/operator": typeof models_embeddings_operator;
   "models/embeddings/private": typeof models_embeddings_private;
   "models/embeddings/tables": typeof models_embeddings_tables;
+  "models/embeddings/targets": typeof models_embeddings_targets;
   "models/embeddings/validators": typeof models_embeddings_validators;
   "models/facts/mcpActions": typeof models_facts_mcpActions;
   "models/facts/mcpQueries": typeof models_facts_mcpQueries;
