@@ -8,7 +8,10 @@ import {
   refreshAvailableSourceItem,
   sha256Utf8,
 } from "../provenance/model";
-import { upsertSourceInventoryRow } from "../documents/inventory";
+import {
+  markMissingInventoryRows,
+  upsertSourceInventoryRow,
+} from "../documents/inventory";
 import { workerProtocolError } from "./errors";
 import { FS_TEXT_PROFILE } from "./profile";
 import {
@@ -2025,6 +2028,15 @@ export async function reconcileWorkerScan(
         activeWorkerScanId: undefined,
         completedInventoryEpoch: scan.inventoryEpoch,
         lastEnumeratedAt: now,
+      });
+      // Section 2.2/2.4 (P2-70a2): only a healthy completed reconciliation
+      // (reached only in this branch) may mark rows missing. Every
+      // sourceInventory row this scan did not touch was present at some
+      // point and stays inventoried, now as missing rather than dropped.
+      await markMissingInventoryRows(ctx, {
+        spaceId: source.spaceId,
+        sourceAccountId: source.account._id,
+        scanId: scan._id,
       });
     }
   }

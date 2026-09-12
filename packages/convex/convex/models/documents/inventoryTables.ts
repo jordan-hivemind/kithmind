@@ -49,6 +49,12 @@ export const sourceInventoryFields = {
   duplicateGroupId: v.optional(v.string()),
   contentIndexed: v.boolean(),
   exclusionReason: v.optional(sourceInventoryExclusionReasonValidator),
+  // P2-70a2: the machine-readable failure class (an `ingestJobs.error.code`,
+  // already bounded to MAX_ERROR_CODE_LENGTH and never document text) that
+  // most recently drove `exclusionReason` to `parse_failed`. Absent for
+  // every other reason, and cleared back to undefined the moment a later
+  // job for the same file succeeds.
+  exclusionDetail: v.optional(v.string()),
   firstSeenScanId: v.id("workerSourceScans"),
   lastSeenScanId: v.id("workerSourceScans"),
   missingSinceScanId: v.optional(v.id("workerSourceScans")),

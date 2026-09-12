@@ -13,6 +13,10 @@ import {
 import type { Doc, Id } from "../../_generated/dataModel";
 import type { MutationCtx } from "../../_generated/server";
 import { requireSourceAccountAccess } from "../../lib/sourceAuth";
+import {
+  clearInventoryParseFailed,
+  markInventoryParseFailed,
+} from "../documents/inventory";
 import type { PrincipalRef } from "../../lib/spaces";
 import {
   bumpEmbeddingEligibilityEpoch,
@@ -1219,6 +1223,16 @@ export async function failJob(
     message: args.message,
     at: args.now,
   });
+  // Section 2.2/2.3 (P2-70a2): a job that will not retry on its own leaves
+  // the file's row `parse_failed`, with the failure class (never document
+  // text) in `exclusionDetail`, until a later job for the same file
+  // succeeds or a scan re-observes the file directly.
+  if (!retryable) {
+    await markInventoryParseFailed(ctx, {
+      sourceItemId: job.sourceItemId,
+      failureClass: args.code,
+    });
+  }
   return { state, retryable };
 }
 
@@ -1537,6 +1551,11 @@ export async function activateGeneration(
     workerLeaseOwnerCredentialId: undefined,
     nextAttemptAt: undefined,
     error: undefined,
+  });
+  // Section 2.2/2.3 (P2-70a2): a later job for the same file succeeded, so
+  // any `parse_failed` mark left by an earlier failure no longer applies.
+  await clearInventoryParseFailed(ctx, {
+    sourceItemId: loaded.job.sourceItemId,
   });
   const account = await ctx.db.get(loaded.job.sourceAccountId);
   if (!account || account.spaceId !== loaded.job.spaceId) {

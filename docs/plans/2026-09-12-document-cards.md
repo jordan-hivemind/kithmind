@@ -81,6 +81,7 @@ the architecture's coverage rules already require the system to keep apart.
 | `duplicateGroupId`   | Hash of `(contentHash, byteLength)` when a group has two or more members. |
 | `contentIndexed`     | Boolean. True only when an active generation holds retained text.         |
 | `exclusionReason`    | Absent when `contentIndexed` is true. Otherwise one closed value.         |
+| `exclusionDetail`    | The failure class for `parse_failed`. Absent for every other reason.     |
 | `firstSeenScanId`    | The committed scan that first observed the file.                          |
 | `lastSeenScanId`     | The last committed scan that observed it.                                 |
 | `missingSinceScanId` | Set only by a healthy completed reconciliation.                           |
@@ -124,6 +125,18 @@ inventory question. `sourceInventory` is upserted from the same
 scan, and is not retention bounded. No second identity authority is created:
 the identity manifest remains the authority and inventory carries its UUID.
 
+`parse_failed` is set and cleared outside a scan: the shared document job
+failure path marks a file's row `parse_failed` (with its failure class in
+`exclusionDetail`) the moment a job gives up retrying, and a later job
+activating successfully for the same file clears it back to
+`extraction_pending`, rather than waiting on the next scan to notice either
+change. `missingSinceScanId` is set only in `scan.reconcile`'s completion
+branch, and only for a healthy completed reconciliation
+(`done && !needsReview`): every row this scan did not touch keeps the scan id
+of the reconciliation that first found it missing, and a later scan that
+observes the file again clears the field on the same upsert that already
+refreshes `lastSeenScanId`.
+
 ### 2.5 Duplicate groups
 
 Group members are files whose `(contentHash, byteLength)` match within one
@@ -131,6 +144,13 @@ source account. Exactly one member is content indexed. The others carry
 `duplicate_of` and are reachable from the group. The group is a label over
 distinct identities, never a merge. The existing rule that separate equal
 content files receive separate identities is unchanged.
+
+Canonicality is a label, not an admission gate: among the members not yet
+content indexed, the one with the lowest `identityKeyHash` is canonical, a
+deterministic tie-break that does not depend on scan or arrival order, and
+nothing about being labeled `duplicate_of` blocks a file from being read,
+scanned or (if the canonical member is later forgotten) becoming canonical
+itself. Inbox admission behavior is unchanged.
 
 ### 2.6 Read surface
 
