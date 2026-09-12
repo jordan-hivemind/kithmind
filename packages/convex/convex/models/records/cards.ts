@@ -6,6 +6,12 @@ import { digestProcessingConfiguration } from "../ingestion/hash";
 import { MAX_GENERATION_DOCUMENTS } from "../provenance/model";
 
 import {
+  CARD_GATE_VERSION,
+  gateCard,
+  type CardGateFailureCode,
+  type CardGateReport,
+} from "./cardGate";
+import {
   cardEventKey,
   cardObservationKey,
   isCardRecordKind,
@@ -29,7 +35,6 @@ export type CardExtractionFingerprint = {
   cardSchemaVersion: number;
   playbookVersion: string;
   promptVersion: string;
-  gateVersion: string;
   tier: "local" | "tier0" | "tier1";
 };
 
@@ -70,11 +75,21 @@ export type PublishCardResult = {
     | "no_subject_entity"
     | "unresolvable_anchor"
     | "already_published"
+    | "gate_failed"
     | "no_storable_field";
   processingGenerationId?: Id<"processingGenerations">;
   eventId?: Id<"events">;
   storedFields: string[];
-  droppedFields: Array<{ key: string; reason: string }>;
+  /** Optional fields the gate refused. The card published without them. */
+  droppedFields: Array<{ key: string; code: CardGateFailureCode }>;
+  /**
+   * Every gate failure, required ones included. Section 5.2 leaves the
+   * escalation decision to the ladder of P2-70e, so the failure is returned
+   * rather than retried here.
+   */
+  gateFailures: Array<{ key: string; code: CardGateFailureCode }>;
+  /** True when a required field failed, so nothing was staged at this tier. */
+  requiredFieldFailed: boolean;
 };
 
 function boundedPart(value: string, label: string): string {
@@ -104,7 +119,10 @@ export function cardExtractionFingerprint(
     `schema:${fingerprint.cardSchemaVersion}`,
     `playbook:${boundedPart(fingerprint.playbookVersion, "Playbook version")}`,
     `prompt:${boundedPart(fingerprint.promptVersion, "Prompt version")}`,
-    `gate:${boundedPart(fingerprint.gateVersion, "Gate version")}`,
+    // The gate version is not the caller's to assert. It is the version of
+    // the code that just proved the card, so a normalizer change is a new
+    // generation rather than a silent revaluation of a stored one.
+    `gate:${CARD_GATE_VERSION}`,
     `tier:${fingerprint.tier}`,
   ].join("|");
 }
@@ -144,9 +162,12 @@ function cardFieldKey(field: CardFieldInput): string {
  * atomically. See sections 4.1, 4.3, 4.5 and 4.6 of
  * docs/plans/2026-09-12-document-cards.md.
  *
- * No model runs here. The caller supplies an already-extracted card whose
- * fields cite spans; P2-70d supplies the gate that produces them and P2-70e
- * the ladder that runs it.
+ * No model runs here, and none is consulted about whether the card is right.
+ * The caller supplies an already-extracted card whose fields cite spans, and
+ * the mechanical gate of section 5.2 runs before anything is staged: a
+ * required-field failure stages nothing at this tier and is returned to the
+ * caller, and an optional-field failure drops that field alone. The ladder
+ * that reads the returned failure and decides to escalate is P2-70e.
  */
 export async function publishDocumentCard(
   ctx: MutationCtx,
@@ -196,6 +217,8 @@ export async function publishDocumentCard(
       reason: "no_subject_entity",
       storedFields: [],
       droppedFields: [],
+      gateFailures: [],
+      requiredFieldFailed: false,
     };
   }
   const entity = await ctx.db.get(entityId);
@@ -236,12 +259,16 @@ export async function publishDocumentCard(
       processingGenerationId: existing[0]._id,
       storedFields: [],
       droppedFields: [],
+      gateFailures: [],
+      requiredFieldFailed: false,
     };
   }
 
-  // Section 4.3: the evidence check is `requireEvidence`, reported per field.
-  // Both the anchor and every field are proved against the sealed retained
-  // text of the generation that holds it, before anything is written.
+  // Rule 1 of section 5.2, which is also the section 4.3 evidence check:
+  // every cited span must resolve in the sealed retained text of the
+  // generation that holds it and recompute to its stored `quoteHash`. The
+  // anchor and every field are proved before anything is written, and the
+  // proved span text is what the normalizers then read.
   const probe = await probeFieldEvidence(ctx, {
     spaceId: input.spaceId,
     processingGenerationId: base._id,
@@ -253,8 +280,38 @@ export async function publishDocumentCard(
       })),
     ],
   });
-  const droppedFields = probe.dropped.filter((drop) => drop.key !== "");
+  const evidenceCodes = new Map(
+    probe.dropped.map((drop) => [drop.key, drop.code]),
+  );
+  const evidenceReasons = new Map(
+    probe.dropped.map((drop) => [drop.key, drop.reason]),
+  );
+  const topTier = input.fingerprint.tier === "tier1";
+  const drop = (key: string, code: CardGateFailureCode) => ({
+    key,
+    code,
+    reason: evidenceReasons.get(key) ?? code,
+  });
+
   if (!probe.resolved.has("")) {
+    // The event's own evidence is required by nature: an event whose anchor
+    // cannot be proved publishes nothing at all.
+    const failures = probe.dropped.map((entry) => ({
+      key: entry.key === "" ? "card_anchor" : entry.key,
+      code: entry.code as CardGateFailureCode,
+    }));
+    await recordAttempt(ctx, {
+      spaceId: input.spaceId,
+      sourceAccountId: account._id,
+      sourceItemId: item._id,
+      recordKind: input.recordKind,
+      fingerprint: input.fingerprint,
+      now: input.now,
+      outcome: topTier ? "review" : "escalated",
+      passedFieldCount: 0,
+      droppedFieldCount: 0,
+      failures,
+    });
     await recordDrops(ctx, {
       spaceId: input.spaceId,
       sourceAccountId: account._id,
@@ -262,23 +319,96 @@ export async function publishDocumentCard(
       processingGenerationId: base._id,
       recordKind: input.recordKind,
       now: input.now,
-      drops: probe.dropped.map((drop) => ({
-        key: drop.key === "" ? "card_anchor" : drop.key,
-        reason: drop.reason,
-      })),
+      kind: topTier ? "card_gate_failed" : "field_dropped",
+      drops: probe.dropped.map((entry) =>
+        drop(entry.key === "" ? "card_anchor" : entry.key, entry.code),
+      ),
     });
     await setInventoryExclusionReason(ctx, item._id, "extraction_pending");
     return {
       published: false,
       reason: "unresolvable_anchor",
       storedFields: [],
-      droppedFields,
+      droppedFields: [],
+      gateFailures: failures,
+      requiredFieldFailed: true,
     };
   }
+
+  // Rules 2 to 7, in pure code with no model in the loop.
+  const gate: CardGateReport = gateCard({
+    recordKind: input.recordKind,
+    fields: input.fields.map((field) => {
+      const key = cardFieldKey(field);
+      const evidenceFailure = evidenceCodes.get(key);
+      return {
+        field: field.field,
+        ...(field.ordinal === undefined ? {} : { ordinal: field.ordinal }),
+        value: field.value,
+        spanTexts: probe.quotes.get(key) ?? [],
+        ...(evidenceFailure === undefined ? {} : { evidenceFailure }),
+      };
+    }),
+  });
+
+  if (gate.requiredFailed) {
+    // Section 5.2 outcomes: nothing is staged from this tier, and the failure
+    // goes back to the caller. At the top automatic step it is also a
+    // `card_gate_failed` review item; below it the ladder escalates and a
+    // drop row here would only duplicate the next attempt's.
+    await recordAttempt(ctx, {
+      spaceId: input.spaceId,
+      sourceAccountId: account._id,
+      sourceItemId: item._id,
+      recordKind: input.recordKind,
+      fingerprint: input.fingerprint,
+      now: input.now,
+      outcome: topTier ? "review" : "escalated",
+      passedFieldCount: 0,
+      droppedFieldCount: 0,
+      failures: gate.failed,
+    });
+    if (topTier) {
+      await recordDrops(ctx, {
+        spaceId: input.spaceId,
+        sourceAccountId: account._id,
+        sourceItemId: item._id,
+        processingGenerationId: base._id,
+        recordKind: input.recordKind,
+        now: input.now,
+        kind: "card_gate_failed",
+        drops: gate.failed.map((failure) => drop(failure.key, failure.code)),
+      });
+    }
+    await setInventoryExclusionReason(ctx, item._id, "extraction_pending");
+    return {
+      published: false,
+      reason: "gate_failed",
+      storedFields: [],
+      droppedFields: [],
+      gateFailures: gate.failed,
+      requiredFieldFailed: true,
+    };
+  }
+
+  const droppedFields = gate.dropped;
+  const passedKeys = new Set(gate.passedKeys);
   const storable = input.fields.filter((field) =>
-    probe.resolved.has(cardFieldKey(field)),
+    passedKeys.has(cardFieldKey(field)),
   );
   if (storable.length === 0) {
+    await recordAttempt(ctx, {
+      spaceId: input.spaceId,
+      sourceAccountId: account._id,
+      sourceItemId: item._id,
+      recordKind: input.recordKind,
+      fingerprint: input.fingerprint,
+      now: input.now,
+      outcome: topTier ? "review" : "escalated",
+      passedFieldCount: 0,
+      droppedFieldCount: 0,
+      failures: gate.failed,
+    });
     await recordDrops(ctx, {
       spaceId: input.spaceId,
       sourceAccountId: account._id,
@@ -286,7 +416,8 @@ export async function publishDocumentCard(
       processingGenerationId: base._id,
       recordKind: input.recordKind,
       now: input.now,
-      drops: droppedFields,
+      kind: topTier ? "card_gate_failed" : "field_dropped",
+      drops: droppedFields.map((failure) => drop(failure.key, failure.code)),
     });
     await setInventoryExclusionReason(ctx, item._id, "extraction_pending");
     return {
@@ -294,6 +425,8 @@ export async function publishDocumentCard(
       reason: "no_storable_field",
       storedFields: [],
       droppedFields,
+      gateFailures: gate.failed,
+      requiredFieldFailed: false,
     };
   }
 
@@ -427,6 +560,18 @@ export async function publishDocumentCard(
     docTypePatch,
   });
 
+  await recordAttempt(ctx, {
+    spaceId: input.spaceId,
+    sourceAccountId: account._id,
+    sourceItemId: item._id,
+    recordKind: input.recordKind,
+    fingerprint: input.fingerprint,
+    now: input.now,
+    outcome: "accepted",
+    passedFieldCount: observations.length,
+    droppedFieldCount: droppedFields.length,
+    failures: gate.failed,
+  });
   await recordDrops(ctx, {
     spaceId: input.spaceId,
     sourceAccountId: account._id,
@@ -434,7 +579,8 @@ export async function publishDocumentCard(
     processingGenerationId: generationId,
     recordKind: input.recordKind,
     now: input.now,
-    drops: droppedFields,
+    kind: "field_dropped",
+    drops: droppedFields.map((failure) => drop(failure.key, failure.code)),
   });
   // Section 2.3: `extraction_pending` is the only reason expected to clear on
   // its own, and an accepted card is what clears it.
@@ -446,6 +592,8 @@ export async function publishDocumentCard(
     eventId: staged.eventIds[0]!,
     storedFields: observations.map((observation) => observation.observationKey),
     droppedFields,
+    gateFailures: gate.failed,
+    requiredFieldFailed: false,
   };
 }
 
@@ -458,21 +606,65 @@ async function recordDrops(
     processingGenerationId: Id<"processingGenerations">;
     recordKind: CardRecordKind;
     now: number;
-    drops: ReadonlyArray<{ key: string; reason: string }>;
+    kind: "field_dropped" | "card_gate_failed";
+    drops: ReadonlyArray<{ key: string; code: string; reason: string }>;
   },
 ): Promise<void> {
-  for (const drop of input.drops) {
+  for (const dropped of input.drops) {
     await ctx.db.insert("cardFieldDrops", {
       spaceId: input.spaceId,
       sourceAccountId: input.sourceAccountId,
       sourceItemId: input.sourceItemId,
       processingGenerationId: input.processingGenerationId,
       recordKind: input.recordKind,
-      fieldKey: drop.key.slice(0, 200),
-      reason: drop.reason.slice(0, 500),
+      kind: input.kind,
+      fieldKey: dropped.key.slice(0, 200),
+      code: dropped.code.slice(0, 64),
+      reason: dropped.reason.slice(0, 500),
       createdAt: input.now,
     });
   }
+}
+
+/**
+ * Section 5.4: one row per gate run, per document and tier. Counts and closed
+ * codes only. No field value and no span text is written here, so the cost
+ * and ladder report can never become a second copy of the document.
+ */
+async function recordAttempt(
+  ctx: MutationCtx,
+  input: {
+    spaceId: Id<"spaces">;
+    sourceAccountId: Id<"sourceAccounts">;
+    sourceItemId: Id<"sourceItems">;
+    recordKind: CardRecordKind;
+    fingerprint: CardExtractionFingerprint;
+    now: number;
+    outcome: "accepted" | "escalated" | "review";
+    passedFieldCount: number;
+    droppedFieldCount: number;
+    failures: ReadonlyArray<{ key: string; code: string }>;
+  },
+): Promise<void> {
+  await ctx.db.insert("cardExtractionAttempts", {
+    spaceId: input.spaceId,
+    sourceAccountId: input.sourceAccountId,
+    sourceItemId: input.sourceItemId,
+    recordKind: input.recordKind,
+    step: input.fingerprint.tier,
+    gateVersion: CARD_GATE_VERSION,
+    promptVersion: input.fingerprint.promptVersion,
+    playbookVersion: input.fingerprint.playbookVersion,
+    cardSchemaVersion: input.fingerprint.cardSchemaVersion,
+    outcome: input.outcome,
+    passedFieldCount: input.passedFieldCount,
+    droppedFieldCount: input.droppedFieldCount,
+    failedFieldCount: input.failures.length,
+    failureCodes: [
+      ...new Set(input.failures.map((failure) => failure.code)),
+    ].sort(),
+    createdAt: input.now,
+  });
 }
 
 /**
@@ -649,7 +841,6 @@ export const publishCard = internalMutation({
       cardSchemaVersion: v.number(),
       playbookVersion: v.string(),
       promptVersion: v.string(),
-      gateVersion: v.string(),
       tier: v.union(v.literal("local"), v.literal("tier0"), v.literal("tier1")),
     }),
     anchorEvidenceSpanIds: v.array(v.id("evidenceSpans")),

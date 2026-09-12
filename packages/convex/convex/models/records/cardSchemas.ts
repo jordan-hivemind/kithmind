@@ -22,11 +22,41 @@ export type CardRecordKind = (typeof CARD_RECORD_KINDS)[number];
 
 type ValueType = ObservationValue["type"];
 
-type CardFieldSchema = {
+/**
+ * Section 5.2: one normalizer per declared field type. The implementations
+ * live in `cardGate.ts`; the id is declared here so a field and its
+ * normalizer stay in one table and the two files never import each other's
+ * values.
+ */
+export type CardNormalizerId =
+  | "text_v1"
+  | "name_v1"
+  | "money_v1"
+  | "date_v1"
+  | "rate_v1"
+  | "integer_v1"
+  | "clause_boolean_v1";
+
+export type CardFieldSchema = {
   /** Value types the gate may store for this field. */
   valueTypes: readonly ValueType[];
   /** A repeated field uses `<observationType>:<ordinal>` observation keys. */
   repeated?: true;
+  /** The normalizer rule 2 runs the cited span text through. */
+  normalizer: CardNormalizerId;
+  /**
+   * Section 5.2 outcomes: a required field that fails the gate stages nothing
+   * from that tier, and one that is absent altogether fails the same way.
+   * Every other field is dropped with its failure code. No boolean is
+   * required, which is what keeps rule 7's absence from reading as a
+   * card-level failure.
+   */
+  required?: true;
+  /**
+   * Rule 7: the casefolded terms whose presence in a span asserts this
+   * clause. Declared only for boolean fields.
+   */
+  clauseTerms?: readonly string[];
 };
 
 type CardKindSchema = {
@@ -49,65 +79,160 @@ const NAME_OR_ENTITY = ["entity", "text"] as const;
 export const CARD_SCHEMAS: Readonly<Record<CardRecordKind, CardKindSchema>> = {
   document_card: {
     fields: {
-      card_kind: { valueTypes: ["text"] },
-      card_title: { valueTypes: ["text"] },
-      card_date: { valueTypes: ["date"] },
-      card_party: { valueTypes: NAME_OR_ENTITY, repeated: true },
-      card_summary: { valueTypes: ["text"] },
+      card_kind: { valueTypes: ["text"], normalizer: "text_v1" },
+      card_title: {
+        valueTypes: ["text"],
+        normalizer: "text_v1",
+        required: true,
+      },
+      card_date: { valueTypes: ["date"], normalizer: "date_v1" },
+      card_party: {
+        valueTypes: NAME_OR_ENTITY,
+        repeated: true,
+        normalizer: "name_v1",
+      },
+      card_summary: { valueTypes: ["text"], normalizer: "text_v1" },
     },
   },
   safe_note_card: {
     entityKinds: ["person", "organization"],
     fields: {
-      company: { valueTypes: NAME_OR_ENTITY },
-      investor_entity: { valueTypes: NAME_OR_ENTITY },
-      instrument_date: { valueTypes: ["date"] },
-      principal_amount: { valueTypes: ["money"] },
-      valuation_cap: { valueTypes: ["money"] },
-      discount_rate: { valueTypes: ["decimal"] },
-      mfn_clause: { valueTypes: ["boolean"] },
-      pro_rata_right: { valueTypes: ["boolean"] },
-      governing_law: { valueTypes: ["text"] },
+      company: {
+        valueTypes: NAME_OR_ENTITY,
+        normalizer: "name_v1",
+        required: true,
+      },
+      investor_entity: {
+        valueTypes: NAME_OR_ENTITY,
+        normalizer: "name_v1",
+        required: true,
+      },
+      instrument_date: {
+        valueTypes: ["date"],
+        normalizer: "date_v1",
+        required: true,
+      },
+      principal_amount: {
+        valueTypes: ["money"],
+        normalizer: "money_v1",
+        required: true,
+      },
+      valuation_cap: { valueTypes: ["money"], normalizer: "money_v1" },
+      discount_rate: { valueTypes: ["decimal"], normalizer: "rate_v1" },
+      mfn_clause: {
+        valueTypes: ["boolean"],
+        normalizer: "clause_boolean_v1",
+        clauseTerms: ["most favored nation", "most favoured nation", "mfn"],
+      },
+      pro_rata_right: {
+        valueTypes: ["boolean"],
+        normalizer: "clause_boolean_v1",
+        clauseTerms: ["pro rata", "pro-rata"],
+      },
+      governing_law: { valueTypes: ["text"], normalizer: "text_v1" },
     },
   },
   tax_return_card: {
     entityKinds: ["person"],
     fields: {
-      tax_year: { valueTypes: ["integer"] },
-      filing_status: { valueTypes: ["text"] },
-      adjusted_gross_income: { valueTypes: ["money"] },
-      taxable_income: { valueTypes: ["money"] },
-      total_tax: { valueTypes: ["money"] },
-      refund_or_amount_due: { valueTypes: ["money"] },
-      w2_employer: { valueTypes: NAME_OR_ENTITY, repeated: true },
-      k1_entity: { valueTypes: NAME_OR_ENTITY, repeated: true },
-      form_1099_payer: { valueTypes: NAME_OR_ENTITY, repeated: true },
+      tax_year: {
+        valueTypes: ["integer"],
+        normalizer: "integer_v1",
+        required: true,
+      },
+      filing_status: { valueTypes: ["text"], normalizer: "text_v1" },
+      adjusted_gross_income: {
+        valueTypes: ["money"],
+        normalizer: "money_v1",
+      },
+      taxable_income: { valueTypes: ["money"], normalizer: "money_v1" },
+      total_tax: { valueTypes: ["money"], normalizer: "money_v1" },
+      refund_or_amount_due: { valueTypes: ["money"], normalizer: "money_v1" },
+      w2_employer: {
+        valueTypes: NAME_OR_ENTITY,
+        repeated: true,
+        normalizer: "name_v1",
+      },
+      k1_entity: {
+        valueTypes: NAME_OR_ENTITY,
+        repeated: true,
+        normalizer: "name_v1",
+      },
+      form_1099_payer: {
+        valueTypes: NAME_OR_ENTITY,
+        repeated: true,
+        normalizer: "name_v1",
+      },
     },
   },
   k1_card: {
     entityKinds: ["person"],
     fields: {
-      k1_entity: { valueTypes: NAME_OR_ENTITY },
-      tax_year: { valueTypes: ["integer"] },
-      k1_income: { valueTypes: ["money"], repeated: true },
-      capital_account_beginning: { valueTypes: ["money"] },
-      capital_account_ending: { valueTypes: ["money"] },
+      k1_entity: {
+        valueTypes: NAME_OR_ENTITY,
+        normalizer: "name_v1",
+        required: true,
+      },
+      tax_year: {
+        valueTypes: ["integer"],
+        normalizer: "integer_v1",
+        required: true,
+      },
+      k1_income: {
+        valueTypes: ["money"],
+        repeated: true,
+        normalizer: "money_v1",
+      },
+      capital_account_beginning: {
+        valueTypes: ["money"],
+        normalizer: "money_v1",
+      },
+      capital_account_ending: { valueTypes: ["money"], normalizer: "money_v1" },
     },
   },
   brokerage_tax_package_card: {
     entityKinds: ["person"],
     fields: {
-      tax_year: { valueTypes: ["integer"] },
-      form_present: { valueTypes: ["text"], repeated: true },
-      form_total: { valueTypes: ["money"], repeated: true },
+      tax_year: {
+        valueTypes: ["integer"],
+        normalizer: "integer_v1",
+        required: true,
+      },
+      form_present: {
+        valueTypes: ["text"],
+        repeated: true,
+        normalizer: "text_v1",
+      },
+      form_total: {
+        valueTypes: ["money"],
+        repeated: true,
+        normalizer: "money_v1",
+      },
     },
   },
   spreadsheet_card: {
     fields: {
-      sheet_name: { valueTypes: ["text"], repeated: true },
-      column_header: { valueTypes: ["text"], repeated: true },
-      row_count: { valueTypes: ["integer"], repeated: true },
-      sheet_total: { valueTypes: ["money"], repeated: true },
+      sheet_name: {
+        valueTypes: ["text"],
+        repeated: true,
+        normalizer: "text_v1",
+        required: true,
+      },
+      column_header: {
+        valueTypes: ["text"],
+        repeated: true,
+        normalizer: "text_v1",
+      },
+      row_count: {
+        valueTypes: ["integer"],
+        repeated: true,
+        normalizer: "integer_v1",
+      },
+      sheet_total: {
+        valueTypes: ["money"],
+        repeated: true,
+        normalizer: "money_v1",
+      },
     },
   },
 };
