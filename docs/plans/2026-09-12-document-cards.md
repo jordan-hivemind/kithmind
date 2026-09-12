@@ -291,6 +291,32 @@ version, the prompt version, the gate version and the tier that produced the
 accepted output. A tier change therefore produces a new generation, which is
 the correct audit result.
 
+#### The sibling rule, settled on review 2026-09-12 during P2-70c
+
+A card generation is a sibling of the text generation, not its successor. The
+item invariant becomes **one active text generation plus at most one active
+card generation**, and both are current.
+
+| Rule               | Statement                                                                                                                                  |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| Payload            | A card generation carries no pages, evidence spans, documents or chunks. It reuses the text generation's revision and sealed text version. |
+| Record exclusivity | A generation holds card records or pipeline records, never both, so one event can never have two current versions.                         |
+| Chunk identity     | Card publication creates and retires no chunk row, so no chunk embedding target id changes and no re-embed is forced.                      |
+| Text generation    | Unchanged by a card publication. It stays the item's active text generation and its documents stay `active`.                               |
+| Card retirement    | Publishing a new card version retires the previous card generation only, which keeps its versions snapshot readable.                       |
+
+A successor generation was the first implementation and was wrong. Copying the
+document and chunk rows forward gave every chunk a new row id, and chunk
+embedding targets are keyed by that id, so each card publication would have
+retired and recreated every chunk target for the document and forced a re-embed
+of content that never changed. Section 9.2 and invariants I3 and I11 of the
+index capacity plan forbid exactly that.
+
+Because a card generation has no documents of its own, the `documents.docType`
+rule of section 4.2 is an in-place patch of the active text generation's rows
+at card activation. It is idempotent, and the previous value of each patched
+row is recorded on the card version so a rollback restores it.
+
 Rejected lower-tier attempts never become generations. Only the accepted
 tier's output is staged. Attempts are recorded separately, per section 5.4.
 

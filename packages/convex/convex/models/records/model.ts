@@ -6,6 +6,11 @@ import {
   requireInlineSourceTextVersion,
 } from "../provenance/representations";
 
+import {
+  isCardRecordKind,
+  requireCardEventSchema,
+  requireCardObservationSchema,
+} from "./cardSchemas";
 import type { ObservationValue, Occurrence } from "./values";
 import {
   canonicalizeObservationValue,
@@ -333,9 +338,19 @@ function requireSupportedSchemaVersion(value: number): void {
 function requireObservationSchema(
   eventType: RecordEventType,
   observationType: string,
+  observationKey: string,
   value: ObservationValue,
 ): void {
   requireObservationType(observationType);
+  if (isCardRecordKind(eventType)) {
+    requireCardObservationSchema(
+      eventType,
+      observationType,
+      observationKey,
+      value,
+    );
+    return;
+  }
   if (eventType === "financial_transaction" && value.type !== "money") {
     throw new Error("Financial transaction line items must use money values");
   }
@@ -355,6 +370,10 @@ function requireEventSchema(
   entity: Doc<"entities">,
 ): void {
   requireSupportedSchemaVersion(schemaVersion);
+  if (isCardRecordKind(eventType)) {
+    requireCardEventSchema(eventType, entity);
+    return;
+  }
   if (eventType === "lab_panel" && entity.kind !== "person") {
     throw new Error("Lab panels must belong to a person entity");
   }
@@ -723,6 +742,7 @@ function sameEventVersion(
     sameIds(row.fieldEvidence.occurrence, expected.fieldEvidence.occurrence) &&
     sameIds(row.fieldEvidence.entity, expected.fieldEvidence.entity) &&
     sameIds(row.fieldEvidence.eventType, expected.fieldEvidence.eventType) &&
+    sameStructuredValue(row.docTypePatch, expected.docTypePatch) &&
     row.userId === expected.userId
   );
 }
@@ -753,6 +773,59 @@ function sameObservation(
     sameIds(row.valueEvidence, expected.valueEvidence) &&
     row.userId === expected.userId
   );
+}
+
+/**
+ * Section 4.3 of docs/plans/2026-09-12-document-cards.md: a card field with
+ * no resolvable evidence is not stored at all. This is the same check
+ * `stageRecordBatch` applies through `requireEvidence` (span parent chain,
+ * page parent, page hash, page-relative UTF-16 range and recomputed
+ * `quoteHash`), reported per field instead of thrown, so the caller can drop
+ * exactly the unresolvable fields and stage the rest.
+ *
+ * Failing closed is the point: any reason the evidence cannot be proved,
+ * including a budget refusal, drops the field.
+ */
+export async function probeFieldEvidence<Key extends string>(
+  ctx: ReadCtx,
+  input: {
+    spaceId: Id<"spaces">;
+    processingGenerationId: Id<"processingGenerations">;
+    fields: ReadonlyArray<{
+      key: Key;
+      evidenceSpanIds: readonly Id<"evidenceSpans">[];
+    }>;
+  },
+): Promise<{
+  resolved: Set<Key>;
+  dropped: Array<{ key: Key; reason: string }>;
+}> {
+  const chain = await requireGenerationChain(
+    ctx,
+    input.spaceId,
+    input.processingGenerationId,
+  );
+  const cache = newEvidenceCache();
+  const resolved = new Set<Key>();
+  const dropped: Array<{ key: Key; reason: string }> = [];
+  for (const field of input.fields) {
+    try {
+      await requireEvidence(
+        ctx,
+        chain,
+        field.evidenceSpanIds,
+        `Card field ${field.key} evidence`,
+        cache,
+      );
+      resolved.add(field.key);
+    } catch (error) {
+      dropped.push({
+        key: field.key,
+        reason: error instanceof Error ? error.message : "unresolvable",
+      });
+    }
+  }
+  return { resolved, dropped };
 }
 
 /**
@@ -817,6 +890,19 @@ export async function stageRecordBatch(
     const occurrenceFields = canonicalOccurrenceFields(occurrence);
     const entity = await requireEntity(ctx, record.entityId, input.spaceId);
     requireEventSchema(record.eventType, record.schemaVersion, entity);
+    // A card generation holds card records and a pipeline generation holds
+    // pipeline records. Both are current for the same item, so mixing them
+    // would let one event have two current versions.
+    if (
+      isCardRecordKind(record.eventType) !==
+      (chain.generation.cardGeneration === true)
+    ) {
+      throw new Error(
+        isCardRecordKind(record.eventType)
+          ? "Card records require a card processing generation"
+          : "A card processing generation accepts only card records",
+      );
+    }
     await requireEvidence(
       ctx,
       chain,
@@ -893,6 +979,9 @@ export async function stageRecordBatch(
         `${event._id}|${chain.generation._id}`,
       ),
       fieldEvidence: record.fieldEvidence,
+      ...(record.docTypePatch === undefined
+        ? {}
+        : { docTypePatch: record.docTypePatch }),
       userId: eventVersion?.userId ?? input.userId,
     } satisfies Omit<Doc<"eventVersions">, "_id" | "_creationTime">;
     if (eventVersion) {
@@ -918,6 +1007,7 @@ export async function stageRecordBatch(
       requireObservationSchema(
         record.eventType,
         inputObservation.observationType,
+        inputObservation.observationKey,
         value,
       );
       if (value.type === "entity") {
@@ -1114,7 +1204,12 @@ async function validateStoredObservation(
   if (!sameStructuredValue(value, row.value)) {
     throw new Error("Observation value is not canonical");
   }
-  requireObservationSchema(row.eventType, row.observationType, value);
+  requireObservationSchema(
+    row.eventType,
+    row.observationType,
+    row.observationKey,
+    value,
+  );
   if (value.type === "entity") {
     await requireEntity(ctx, value.entityId, chain.space._id);
   }
@@ -1278,8 +1373,7 @@ function requireReadableGeneration(
   }
   if (scope.snapshot === undefined) {
     if (
-      chain.sourceItem.activeGenerationId !== chain.generation._id ||
-      chain.sourceItem.activeRevisionId !== chain.generation.sourceRevisionId ||
+      !isCurrentGeneration(chain.sourceItem, chain.generation) ||
       deactivatedAt !== undefined
     ) {
       throw new Error("Record generation is not the valid current generation");
@@ -1297,11 +1391,27 @@ function requireReadableGeneration(
   }
   if (
     deactivatedAt === undefined &&
-    (chain.sourceItem.activeGenerationId !== chain.generation._id ||
-      chain.sourceItem.activeRevisionId !== chain.generation.sourceRevisionId)
+    !isCurrentGeneration(chain.sourceItem, chain.generation)
   ) {
     throw new Error("Open record generation is not the current source version");
   }
+}
+
+/**
+ * Section 4.6 of docs/plans/2026-09-12-document-cards.md: an item has one
+ * active text generation and at most one active card generation, and both are
+ * current. They can never return two versions of one event, because a
+ * generation holds card records or pipeline records and never both.
+ */
+function isCurrentGeneration(
+  item: Doc<"sourceItems">,
+  generation: Doc<"processingGenerations">,
+): boolean {
+  return (
+    (item.activeGenerationId === generation._id ||
+      item.activeCardGenerationId === generation._id) &&
+    item.activeRevisionId === generation.sourceRevisionId
+  );
 }
 
 export async function hydrateEventVersion(

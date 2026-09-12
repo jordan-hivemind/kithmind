@@ -240,6 +240,13 @@ Immutability is what makes reuse safe. Exclusivity is what keeps a superseded
 vector out of the candidate set, and it is enforced by I11: re-embedding a
 target deletes its previous row in the same transaction.
 
+A chunk target's `targetId` is its chunk row id, so anything that gives
+unchanged content a new chunk row id retires and recreates its target and
+forces a re-embed. Publishing a document card never does: a card generation is
+a sibling of the text generation and creates no chunk row, per section 4.6 of
+the [document-card plan](./2026-09-12-document-cards.md). This is what keeps
+I3 and I11 satisfied while cards are published over an indexed corpus.
+
 The vector search scope becomes:
 
 ```

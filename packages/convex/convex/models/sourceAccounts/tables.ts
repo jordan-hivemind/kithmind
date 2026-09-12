@@ -23,6 +23,13 @@ export const sourceAccountFields = {
   binaryProfileId: v.optional(v.literal("pdf_docqa_v1")),
   binaryProfileAuditDigest: v.optional(v.string()),
   binaryProfileEnabledAt: v.optional(v.number()),
+  /**
+   * Section 4.5 of docs/plans/2026-09-12-document-cards.md. The entity a
+   * generic document card belongs to. A source with none publishes no generic
+   * card; guessing the subject from the uploader is the inference the
+   * architecture forbids.
+   */
+  subjectEntityId: v.optional(v.id("entities")),
   createdBy: v.id("users"),
 };
 
