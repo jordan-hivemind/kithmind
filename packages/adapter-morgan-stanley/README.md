@@ -48,8 +48,8 @@ site's own script, so it should come from a browser the institution has already
 seen, not from an automation build with `navigator.webdriver` set. Sign-in
 should use the person's ordinary password manager, passkey and hardware-key
 paths. And attaching to an existing tab means no code path can navigate to a
-login form. The bridge touches no selector and no DOM, so a site redesign costs
-nothing above the fetch layer.
+login form. Apart from the inactivity dialog below, the bridge touches no
+selector and no DOM, so a site redesign costs nothing above the fetch layer.
 
 One constraint: Chrome 136 and later refuse `--remote-debugging-port` on the
 default profile directory. A dedicated, persistent Chrome profile is therefore
@@ -95,6 +95,27 @@ bridge keeps it alive on its own: every four minutes it calls the app's own
 session-extend endpoint through the same page-side fetch, needing no
 authorization and touching no credential. The timer is `unref`'d, so it never
 keeps the process running on its own.
+
+The session-extend call keeps the *server* session alive, but the page runs a
+second, independent idle timer that counts user input events and ignores the
+app's own requests. During a continuous pull it reached zero 20 to 45 minutes
+after sign-in, put up an "about to be signed out due to inactivity" dialog and
+then ended the session mid-download. The bridge does not touch that timer and
+does not simulate input to defeat it. Instead, once a minute, it asks the page
+whether a visible dialog or modal is up whose text matches
+`/inactiv|signed out|session.*(expir|time)|stay signed in/i`, and if one is, it
+clicks the first button inside it whose text matches
+`/stay|continue|keep|extend|yes/i` -- the site's own "keep this session" answer,
+which is true: a document of the owner's is downloading as the dialog appears.
+Only the button's text comes back to Node, so a log line can never carry the
+dialog's contents; a dialog with no matching button is logged once and left for
+a person. The check is skipped while a session is paused for sign-in, is
+`unref`'d like the keep-alive, is cleared on close, and swallows its own errors
+-- it can never fail a pull. This is the one DOM interaction in the adapter, and
+it requires the account owner's explicit authorization: it may only be run
+against the owner's own account, in a session the owner established by hand,
+and the owner accepts the terms-of-use exposure that automating this answer
+carries. Do not enable it for anyone else's account.
 
 If the tab has navigated away from the app origin -- a session timeout
 redirects to the login page -- every fetch throws a distinct `SIGNED_OUT`

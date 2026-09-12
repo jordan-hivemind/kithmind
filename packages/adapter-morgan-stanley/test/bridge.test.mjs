@@ -14,6 +14,8 @@ import {
   resolveEndpoint,
   evaluate,
   startKeepAlive,
+  startInactivityWatch,
+  INACTIVITY_DIALOG_EXPRESSION,
   waitForSignIn,
   closeSession,
   sharedOnce,
@@ -325,6 +327,254 @@ test("closeSession closes the CDP WebSocket and stops the keep-alive from ever f
   // interval were merely unref'd rather than actually cleared.
   t.mock.timers.tick(10 * 60 * 1000);
   assert.equal(calls.length, 0, "no timer remains -- the keep-alive never fires after close");
+});
+
+// --- F1-63: the inactivity dialog watch -------------------------------------
+//
+// The site's page-side idle timer counts user input, not the adapter's
+// requests, so the server-side keep-alive above does not stop it: 20 to 45
+// minutes into a continuous pull the page puts up an inactivity dialog and
+// then signs the session out. The bridge answers that dialog and does not
+// touch the idle timer (src/bridge.mjs, startInactivityWatch). These tests
+// drive it with the fake cdp and fake timers; nothing here opens a browser.
+
+/** A fake cdp whose Runtime.evaluate answers the inactivity check with a
+ * scripted sequence of page-side return values (or throws, for the failure
+ * test), and records every expression it was sent. */
+function makeInactivityCdp(results) {
+  const expressions = [];
+  let index = 0;
+  const cdp = {
+    send: (method, params) => {
+      if (method !== "Runtime.evaluate") return Promise.resolve({ result: { value: null } });
+      expressions.push(params.expression);
+      const next = results[Math.min(index, results.length - 1)];
+      index += 1;
+      if (next instanceof Error) return Promise.reject(next);
+      return Promise.resolve({ result: { value: next } });
+    },
+    close: () => {},
+  };
+  return { cdp, expressions };
+}
+
+/** Captures console.error for the duration of the test, restoring it after. */
+function captureLogs(t) {
+  const lines = [];
+  const original = console.error;
+  console.error = (...args) => lines.push(args.join(" "));
+  t.after(() => {
+    console.error = original;
+  });
+  return lines;
+}
+
+/** Lets the fake cdp's already-resolved promises settle between fake ticks.
+ * setImmediate, not a chain of microtasks: evaluate()'s Promise.race and its
+ * finally() take more turns than a fixed chain reliably covers, and setTimeout
+ * is mocked here. */
+function flush() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+test("startInactivityWatch returns an interval that is unref'd -- it must never be the reason the process stays up", (t) => {
+  // Real timers, for the same reason startKeepAlive's unref test uses them.
+  const { cdp } = makeInactivityCdp([null]);
+  const watch = startInactivityWatch(cdp);
+  t.after(() => clearInterval(watch));
+  assert.equal(watch.hasRef(), false);
+});
+
+test("startInactivityWatch checks the page for an inactivity dialog once a minute", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval", "setTimeout"] });
+  captureLogs(t);
+  const { cdp, expressions } = makeInactivityCdp([null]);
+  const watch = startInactivityWatch(cdp);
+  t.after(() => clearInterval(watch));
+
+  assert.equal(expressions.length, 0, "no check before the first minute elapses");
+  t.mock.timers.tick(60_000);
+  await flush();
+  assert.equal(expressions.length, 1);
+  // The check matches on the dialog's own role and text, in the page.
+  assert.match(expressions[0], /role="alertdialog"/);
+  assert.match(expressions[0], /inactiv\|signed out\|session\.\*\(expir\|time\)\|stay signed in/);
+  assert.match(expressions[0], /stay\|continue\|keep\|extend\|yes/);
+
+  t.mock.timers.tick(60_000);
+  await flush();
+  assert.equal(expressions.length, 2, "polls every minute, not just once");
+});
+
+test("startInactivityWatch answers a matching dialog and logs the button text and nothing else from it", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval", "setTimeout"] });
+  const lines = captureLogs(t);
+  // What the page-side check returns after it clicked: the button's text and
+  // no other dialog content -- the dialog body never leaves the page
+  // (src/bridge.mjs, INACTIVITY_DIALOG_EXPRESSION).
+  const { cdp } = makeInactivityCdp([{ button: "Stay Signed In" }, null]);
+  const watch = startInactivityWatch(cdp);
+  t.after(() => clearInterval(watch));
+
+  t.mock.timers.tick(60_000);
+  await flush();
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /\[bridge\] inactivity dialog answered: Stay Signed In$/);
+
+  // Nothing further is logged once the dialog is gone.
+  t.mock.timers.tick(60_000);
+  await flush();
+  assert.equal(lines.length, 1);
+});
+
+test("startInactivityWatch logs an unanswerable dialog once per occurrence, not once per minute", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval", "setTimeout"] });
+  const lines = captureLogs(t);
+  // Dialog up with no matching button for three polls, then gone, then back.
+  const { cdp } = makeInactivityCdp([{ button: null }, { button: null }, { button: null }, null, { button: null }]);
+  const watch = startInactivityWatch(cdp);
+  t.after(() => clearInterval(watch));
+
+  for (let i = 0; i < 3; i += 1) {
+    t.mock.timers.tick(60_000);
+    await flush();
+  }
+  assert.deepEqual(
+    lines.map((line) => line.replace(/^\S+ /, "")),
+    ["[bridge] inactivity dialog seen, no button matched"],
+    "one line for the occurrence, not one per poll",
+  );
+
+  t.mock.timers.tick(60_000); // dialog gone
+  await flush();
+  t.mock.timers.tick(60_000); // a new occurrence
+  await flush();
+  assert.equal(lines.length, 2, "a later, separate occurrence logs again");
+});
+
+test("startInactivityWatch swallows an evaluate failure, logs it once, and keeps polling", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval", "setTimeout"] });
+  const lines = captureLogs(t);
+  const { cdp, expressions } = makeInactivityCdp([new Error("page evaluation timed out")]);
+  const watch = startInactivityWatch(cdp);
+  t.after(() => clearInterval(watch));
+
+  for (let i = 0; i < 3; i += 1) {
+    t.mock.timers.tick(60_000);
+    await flush();
+  }
+  // Nothing thrown into the pull; one line, not three.
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /\[bridge\] inactivity watch failed:/);
+  assert.equal(expressions.length, 3, "a failed check does not stop the watch");
+});
+
+test("startInactivityWatch skips every tick while the session is paused for sign-in, and resumes after", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval", "setTimeout"] });
+  captureLogs(t);
+  const { cdp, expressions } = makeInactivityCdp([null]);
+  let paused = true;
+  const watch = startInactivityWatch(cdp, () => paused);
+  t.after(() => clearInterval(watch));
+
+  t.mock.timers.tick(5 * 60_000);
+  await flush();
+  assert.equal(expressions.length, 0, "no clicking in a tab the owner is signing into");
+
+  paused = false;
+  t.mock.timers.tick(60_000);
+  await flush();
+  assert.equal(expressions.length, 1, "resumes on its own once the pause lifts");
+});
+
+test("closeSession stops the inactivity watch as well as the keep-alive", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval", "setTimeout"] });
+  captureLogs(t);
+  const calls = [];
+  let closed = false;
+  const cdp = {
+    send: (method, params) => {
+      calls.push({ method, params });
+      return Promise.resolve({ result: { value: null } });
+    },
+    close: () => {
+      closed = true;
+    },
+  };
+  const keepAlive = startKeepAlive(cdp, "https://app.example.invalid");
+  const watch = startInactivityWatch(cdp);
+
+  closeSession(cdp, keepAlive, watch);
+  assert.equal(closed, true);
+
+  t.mock.timers.tick(10 * 60 * 1000);
+  await flush();
+  assert.equal(calls.length, 0, "neither timer remains after close");
+});
+
+// The page-side half of the watch, run against a stub DOM in a vm context --
+// the same technique the page-fetch expression's tests above use. Without
+// this, a broken selector or a click that never fires would still satisfy the
+// Node-side tests, which only ever see the value the page returns.
+function fakeElement({ text = "", visible = true, children = [], value = "" } = {}) {
+  const element = {
+    innerText: text,
+    value,
+    clicked: 0,
+    getBoundingClientRect: () => (visible ? { width: 400, height: 200 } : { width: 0, height: 0 }),
+    querySelectorAll: () => children,
+    click() {
+      element.clicked += 1;
+    },
+  };
+  return element;
+}
+
+function runDialogCheck(containers) {
+  const sandbox = vm.createContext({
+    document: { querySelectorAll: () => containers },
+    getComputedStyle: () => ({ visibility: "visible" }),
+  });
+  // JSON round trip: the vm returns a cross-realm object, and in production
+  // this value crosses the CDP boundary as JSON anyway.
+  return JSON.parse(JSON.stringify(vm.runInContext(INACTIVITY_DIALOG_EXPRESSION, sandbox) ?? null));
+}
+
+test("the page-side check clicks the stay-signed-in button of a visible inactivity dialog and returns only its text", () => {
+  const stay = fakeElement({ text: "Stay Signed In" });
+  const signOut = fakeElement({ text: "Sign Out" });
+  const dialog = fakeElement({
+    // A real dialog names the account and the timeout; none of this may be
+    // returned to Node.
+    text: "You are about to be signed out due to inactivity. Account ...1234.",
+    children: [signOut, stay],
+  });
+
+  assert.deepEqual(runDialogCheck([dialog]), { button: "Stay Signed In" });
+  assert.equal(stay.clicked, 1);
+  assert.equal(signOut.clicked, 0, "never clicks the sign-out button");
+});
+
+test("the page-side check ignores a hidden dialog and a dialog whose text is about something else", () => {
+  const hidden = fakeElement({
+    text: "Your session is about to expire",
+    visible: false,
+    children: [fakeElement({ text: "Continue" })],
+  });
+  assert.equal(runDialogCheck([hidden]), null);
+
+  const unrelated = fakeElement({
+    text: "Confirm this trade",
+    children: [fakeElement({ text: "Continue" })],
+  });
+  assert.equal(runDialogCheck([unrelated]), null);
+});
+
+test("the page-side check reports a matching dialog with no matching button instead of clicking something else", () => {
+  const close = fakeElement({ text: "Close" });
+  const dialog = fakeElement({ text: "Session timed out", children: [close] });
+  assert.deepEqual(runDialogCheck([dialog]), { button: null });
+  assert.equal(close.clicked, 0);
 });
 
 // F1-54: a same-origin resume (an inline re-auth screen, or an in-app
