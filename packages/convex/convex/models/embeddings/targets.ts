@@ -653,20 +653,24 @@ async function findCoveringVector(
 ): Promise<Doc<"embeddingVectors"> | null> {
   const { row } = input;
   if (row.targetKind === "card") return null;
-  const candidates =
+  const thoughtId =
     row.targetKind === "thought"
-      ? await ctx.db
-          .query("embeddingVectors")
-          .withIndex("by_thoughtId", (q) =>
-            q.eq("thoughtId", ctx.db.normalizeId("thoughts", row.targetId)!),
-          )
-          .take(8)
-      : await ctx.db
-          .query("embeddingVectors")
-          .withIndex("by_chunkId", (q) =>
-            q.eq("chunkId", ctx.db.normalizeId("chunks", row.targetId)!),
-          )
-          .take(8);
+      ? ctx.db.normalizeId("thoughts", row.targetId)
+      : null;
+  const chunkId =
+    row.targetKind === "chunk"
+      ? ctx.db.normalizeId("chunks", row.targetId)
+      : null;
+  if (!thoughtId && !chunkId) return null;
+  const candidates = thoughtId
+    ? await ctx.db
+        .query("embeddingVectors")
+        .withIndex("by_thoughtId", (q) => q.eq("thoughtId", thoughtId))
+        .take(8)
+    : await ctx.db
+        .query("embeddingVectors")
+        .withIndex("by_chunkId", (q) => q.eq("chunkId", chunkId!))
+        .take(8);
   return (
     candidates.find(
       (candidate) =>
