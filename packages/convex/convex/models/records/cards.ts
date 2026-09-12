@@ -3,7 +3,12 @@ import { v } from "convex/values";
 import type { Doc, Id } from "../../_generated/dataModel";
 import { internalMutation, type MutationCtx } from "../../_generated/server";
 import { digestProcessingConfiguration } from "../ingestion/hash";
-import { MAX_GENERATION_DOCUMENTS } from "../provenance/model";
+import {
+  MAX_GENERATION_DOCUMENTS,
+  stageCardEvidenceSpans,
+  sweepCardEvidenceSpans,
+  type CardEvidenceRef,
+} from "../provenance/model";
 
 import {
   CARD_GATE_VERSION,
@@ -876,6 +881,134 @@ const cardFieldValidator = v.object({
   ordinal: v.optional(v.number()),
   value: observationValueValidator,
   evidenceSpanIds: v.array(v.id("evidenceSpans")),
+});
+
+/**
+ * One cited location. Exactly one of `quote` or the `start`/`end` pair is
+ * meaningful; a row carrying neither resolves to no span, which is the same
+ * outcome as a location the page does not contain.
+ */
+const cardEvidenceRefValidator = v.object({
+  pageOrdinal: v.number(),
+  start: v.optional(v.number()),
+  end: v.optional(v.number()),
+  quote: v.optional(v.string()),
+});
+
+function toCardEvidenceRef(ref: {
+  pageOrdinal: number;
+  start?: number;
+  end?: number;
+  quote?: string;
+}): CardEvidenceRef {
+  return ref.quote !== undefined
+    ? { pageOrdinal: ref.pageOrdinal, quote: ref.quote }
+    : {
+        pageOrdinal: ref.pageOrdinal,
+        start: ref.start ?? -1,
+        end: ref.end ?? -1,
+      };
+}
+
+/**
+ * Loads the sealed text chain a card cites into, from the item's active text
+ * generation. A card generation reuses that chain and never makes one.
+ */
+async function requireCardTextChain(
+  ctx: MutationCtx,
+  sourceItemId: Id<"sourceItems">,
+): Promise<{
+  item: Doc<"sourceItems">;
+  sourceRevisionId: Id<"sourceRevisions">;
+  sourceTextVersionId: Id<"sourceTextVersions">;
+}> {
+  const item = await ctx.db.get(sourceItemId);
+  if (!item) throw new Error("Card document does not exist");
+  if (!item.activeGenerationId) {
+    throw new Error("Card document has no active generation");
+  }
+  const base = await ctx.db.get(item.activeGenerationId);
+  if (
+    !base ||
+    base.sourceItemId !== item._id ||
+    base.state !== "ready" ||
+    base.deactivatedAt !== undefined ||
+    !base.sourceTextVersionId
+  ) {
+    throw new Error("Card document has no readable retained text");
+  }
+  return {
+    item,
+    sourceRevisionId: base.sourceRevisionId,
+    sourceTextVersionId: base.sourceTextVersionId,
+  };
+}
+
+/**
+ * Turns the locations a runner cited into evidence spans over the sealed
+ * retained text, one result per input in order, `null` where the location
+ * could not be proved.
+ *
+ * Settled on review 2026-09-12: sealing protects the text and its pages, not
+ * pointers into them, so a card generation may stage a span the parser never
+ * made. Nothing here writes a page or a text version, and every span is
+ * validated against the sealed page before it exists: the page is in this
+ * text version, the range is inside it and on UTF-16 boundaries, the quote
+ * hash is recomputed from that page's text, and a cited quote must occur
+ * exactly once and match the slice character for character. A span that
+ * already covers the same range, parser-staged or card-staged, is reused.
+ */
+export const stageCardEvidence = internalMutation({
+  args: {
+    sourceItemId: v.id("sourceItems"),
+    recordKind: v.string(),
+    fingerprint: v.object({
+      cardSchemaVersion: v.number(),
+      playbookVersion: v.string(),
+      promptVersion: v.string(),
+      tier: v.union(v.literal("local"), v.literal("tier0"), v.literal("tier1")),
+    }),
+    refs: v.array(cardEvidenceRefValidator),
+  },
+  returns: v.array(v.union(v.id("evidenceSpans"), v.null())),
+  handler: async (ctx, args) => {
+    if (!isCardRecordKind(args.recordKind)) {
+      throw new Error("Unsupported card record kind");
+    }
+    const chain = await requireCardTextChain(ctx, args.sourceItemId);
+    return await stageCardEvidenceSpans(ctx, {
+      spaceId: chain.item.spaceId,
+      sourceRevisionId: chain.sourceRevisionId,
+      sourceTextVersionId: chain.sourceTextVersionId,
+      cardExtractionFingerprint: cardExtractionFingerprint(
+        args.recordKind,
+        args.fingerprint,
+      ),
+      refs: args.refs.map(toCardEvidenceRef),
+    });
+  },
+});
+
+/**
+ * Deletes the card-staged spans of one document that no surviving card
+ * generation can reach: an abandoned staging attempt, or a generation that
+ * was deleted. A retired card generation keeps its row and therefore its
+ * spans, so its versions stay snapshot readable per section 4.6. Parser spans
+ * carry no fingerprint and are never touched.
+ */
+export const sweepCardEvidence = internalMutation({
+  args: { sourceItemId: v.id("sourceItems") },
+  returns: v.object({ deleted: v.number() }),
+  handler: async (ctx, args) => {
+    const chain = await requireCardTextChain(ctx, args.sourceItemId);
+    return {
+      deleted: await sweepCardEvidenceSpans(ctx, {
+        spaceId: chain.item.spaceId,
+        sourceItemId: chain.item._id,
+        sourceTextVersionId: chain.sourceTextVersionId,
+      }),
+    };
+  },
 });
 
 /**

@@ -893,6 +893,267 @@ export async function stageEvidenceSpans(
   return results;
 }
 
+/**
+ * Where a card field says its value came from. The runner names a location,
+ * never a span id: it holds no ids, and a location is what a page of sealed
+ * text can actually be checked against.
+ */
+export type CardEvidenceRef =
+  | { pageOrdinal: number; start: number; end: number }
+  | { pageOrdinal: number; quote: string };
+
+/** How many card extraction fingerprints one reused span records. */
+export const MAX_CARD_EVIDENCE_CITATIONS = 16;
+
+/** Generations one sweep reads before it refuses to judge reachability. */
+export const MAX_SWEEP_GENERATIONS = 256;
+
+/**
+ * Stages the evidence spans a card generation cites, over a sealed text
+ * version.
+ *
+ * Settled on review 2026-09-12: sealing protects the retained text and its
+ * pages, not pointers into them. This function creates spans and nothing
+ * else. It never writes a page, never writes a text version, never clears
+ * `evidenceSealed`, and never widens a range it was given. Every span it
+ * returns carries the same guarantee a parser span does, proved here rather
+ * than assumed:
+ *
+ * 1. The page exists in this sealed text version.
+ * 2. The range lies inside that page, on UTF-16 boundaries, and is non-empty.
+ * 3. `quoteHash` is recomputed from that page's own text.
+ * 4. A quote form must occur exactly once on the page, and the slice the
+ *    range produces must equal the quote character for character.
+ *
+ * A ref that fails any of these resolves to `null` rather than throwing. The
+ * runner that produced it is untrusted, so a bad citation is an ordinary
+ * outcome: the field reaches the gate with no evidence and is refused as
+ * `evidence_missing`, which leaves a drop row. Nothing is silently dropped
+ * and nothing unproved is stored.
+ *
+ * An existing span covering exactly the same range is reused, whether the
+ * parser staged it or an earlier card version did, so re-extraction over
+ * unchanged text creates no rows at all.
+ */
+export async function stageCardEvidenceSpans(
+  ctx: MutationCtx,
+  input: {
+    spaceId: Id<"spaces">;
+    sourceRevisionId: Id<"sourceRevisions">;
+    sourceTextVersionId: Id<"sourceTextVersions">;
+    /** Section 4.6's fingerprint, so the sweep can find unreachable spans. */
+    cardExtractionFingerprint: string;
+    refs: readonly CardEvidenceRef[];
+  },
+): Promise<Array<Id<"evidenceSpans"> | null>> {
+  if (input.refs.length > MAX_EVIDENCE_SPANS) {
+    throw new Error(`Card evidence exceeds ${MAX_EVIDENCE_SPANS} spans`);
+  }
+  if (!input.cardExtractionFingerprint.trim()) {
+    throw new Error("Card evidence requires an extraction fingerprint");
+  }
+  const [revision, textVersion] = await Promise.all([
+    requireSourceRevision(ctx, input.sourceRevisionId, input.spaceId),
+    requireTextVersion(ctx, input.sourceTextVersionId, input.spaceId),
+  ]);
+  if (textVersion.sourceRevisionId !== revision._id) {
+    throw new Error(
+      "Source text version does not belong to the source revision",
+    );
+  }
+  const existing = await ctx.db
+    .query("evidenceSpans")
+    .withIndex("by_sourceTextVersionId", (q) =>
+      q.eq("sourceTextVersionId", input.sourceTextVersionId),
+    )
+    .take(MAX_EVIDENCE_SPANS + 1);
+  if (existing.length > MAX_EVIDENCE_SPANS) {
+    throw new Error(
+      `Source text version exceeds ${MAX_EVIDENCE_SPANS} evidence spans`,
+    );
+  }
+  const spans = [...existing];
+  const pages = new Map<number, Doc<"sourcePages">>();
+  const results: Array<Id<"evidenceSpans"> | null> = [];
+
+  for (const ref of input.refs) {
+    let page = pages.get(ref.pageOrdinal);
+    if (!page) {
+      const found = await ctx.db
+        .query("sourcePages")
+        .withIndex("by_sourceTextVersionId_and_ordinal", (q) =>
+          q
+            .eq("sourceTextVersionId", input.sourceTextVersionId)
+            .eq("ordinal", ref.pageOrdinal),
+        )
+        .take(2);
+      if (found.length > 1) throw new Error("Source page identity is unclear");
+      page = found[0];
+      if (page) pages.set(ref.pageOrdinal, page);
+    }
+    if (!page || page.spaceId !== input.spaceId) {
+      results.push(null);
+      continue;
+    }
+    let start: number;
+    let end: number;
+    if ("quote" in ref) {
+      start = page.text.indexOf(ref.quote);
+      // A quote that appears twice on its page proves nothing in particular.
+      if (start < 0 || page.text.lastIndexOf(ref.quote) !== start) {
+        results.push(null);
+        continue;
+      }
+      end = start + ref.quote.length;
+    } else {
+      start = ref.start;
+      end = ref.end;
+    }
+    if (
+      !Number.isSafeInteger(start) ||
+      !Number.isSafeInteger(end) ||
+      start < 0 ||
+      end <= start ||
+      end > page.text.length
+    ) {
+      results.push(null);
+      continue;
+    }
+    try {
+      requireUtf16Boundary(page.text, start, "Card evidence span start");
+      requireUtf16Boundary(page.text, end, "Card evidence span end");
+    } catch {
+      results.push(null);
+      continue;
+    }
+    const quote = page.text.slice(start, end);
+    if ("quote" in ref && quote !== ref.quote) {
+      results.push(null);
+      continue;
+    }
+    const reused = spans.find(
+      (span) =>
+        span.sourcePageId === page._id &&
+        span.start === start &&
+        span.end === end,
+    );
+    if (reused) {
+      // A parser span keeps no fingerprint list and is never swept. A
+      // card-staged one records that this version cites it too, so the sweep
+      // cannot delete a row an accepted step reused from a rejected one.
+      const cited = reused.cardExtractionFingerprints;
+      if (
+        cited &&
+        cited.length < MAX_CARD_EVIDENCE_CITATIONS &&
+        !cited.includes(input.cardExtractionFingerprint)
+      ) {
+        const next = [...cited, input.cardExtractionFingerprint];
+        await ctx.db.patch(reused._id, {
+          cardExtractionFingerprints: next,
+        });
+        reused.cardExtractionFingerprints = next;
+      }
+      results.push(reused._id);
+      continue;
+    }
+    if (spans.length >= MAX_EVIDENCE_SPANS) {
+      // Section 4.3: a card that would exceed the bound is a review item, not
+      // a raised limit. The field drops rather than the publication failing.
+      results.push(null);
+      continue;
+    }
+    const pageOrdinals = new Set(
+      spans
+        .filter((span) => span.sourcePageId === page._id)
+        .map((span) => span.ordinal),
+    );
+    let ordinal = 0;
+    while (pageOrdinals.has(ordinal)) ordinal += 1;
+    if (ordinal >= MAX_EVIDENCE_SPANS) {
+      results.push(null);
+      continue;
+    }
+    const id = await ctx.db.insert("evidenceSpans", {
+      spaceId: input.spaceId,
+      sourceRevisionId: revision._id,
+      sourceTextVersionId: textVersion._id,
+      sourcePageId: page._id,
+      ordinal,
+      start,
+      end,
+      quoteHash: await sha256Utf8(quote),
+      cardExtractionFingerprints: [input.cardExtractionFingerprint],
+    });
+    spans.push((await ctx.db.get(id))!);
+    results.push(id);
+  }
+  return results;
+}
+
+/**
+ * Deletes the card-staged spans of one document that no surviving card
+ * generation can reach. A span is unreachable exactly when none of the
+ * extraction fingerprints that cited it names a card generation of the item:
+ * an abandoned staging attempt, or a generation that was deleted outright.
+ *
+ * A retired card generation still has its row, so its spans survive and its
+ * versions stay snapshot readable, which is the correction rule of section
+ * 4.6. Accumulation is bounded by reuse: a re-extraction that cites the same
+ * ranges creates nothing and only adds a fingerprint to a row that exists.
+ *
+ * Parser spans carry no fingerprint list and are never considered here.
+ */
+export async function sweepCardEvidenceSpans(
+  ctx: MutationCtx,
+  input: {
+    spaceId: Id<"spaces">;
+    sourceItemId: Id<"sourceItems">;
+    sourceTextVersionId: Id<"sourceTextVersions">;
+  },
+): Promise<number> {
+  const generations = await ctx.db
+    .query("processingGenerations")
+    .withIndex("by_sourceItemId", (q) =>
+      q.eq("sourceItemId", input.sourceItemId),
+    )
+    .take(MAX_SWEEP_GENERATIONS + 1);
+  if (generations.length > MAX_SWEEP_GENERATIONS) {
+    // The reachable set would be truncated, and a truncated set makes a live
+    // span look unreachable. Sweeping nothing is the only safe answer: a span
+    // kept too long costs a row, a span deleted too early costs the evidence
+    // a published card cites.
+    return 0;
+  }
+  const reachable = new Set(
+    generations
+      .filter((row) => row.cardGeneration === true)
+      .map((row) => row.recordSchemaFingerprint),
+  );
+  const spans = await ctx.db
+    .query("evidenceSpans")
+    .withIndex("by_sourceTextVersionId", (q) =>
+      q.eq("sourceTextVersionId", input.sourceTextVersionId),
+    )
+    .take(MAX_EVIDENCE_SPANS + 1);
+  let deleted = 0;
+  for (const span of spans) {
+    const cited = span.cardExtractionFingerprints;
+    if (cited === undefined) continue;
+    if (span.spaceId !== input.spaceId) continue;
+    // ponytail: a citation list that reached its cap is treated as pinned and
+    // is never swept. The cap is far above the number of card versions a
+    // document has, and erring toward keeping a row is the safe direction:
+    // the other way deletes evidence a published card still cites. Upgrade
+    // path is pruning dead fingerprints on append, which needs the generation
+    // set inside the staging call.
+    if (cited.length >= MAX_CARD_EVIDENCE_CITATIONS) continue;
+    if (cited.some((fingerprint) => reachable.has(fingerprint))) continue;
+    await ctx.db.delete(span._id);
+    deleted += 1;
+  }
+  return deleted;
+}
+
 export async function stageDocuments(
   ctx: MutationCtx,
   input: {

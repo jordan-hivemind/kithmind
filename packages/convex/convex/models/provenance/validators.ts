@@ -400,6 +400,23 @@ export const evidenceSpanFields = {
   end: v.number(),
   quoteHash: v.string(),
   locator: v.optional(evidenceLocatorValidator),
+  /**
+   * Present only on a span staged by card extraction rather than by the
+   * parser. It lists every card extraction fingerprint that has cited this
+   * range, because one row is reused across steps and versions rather than
+   * duplicated. `sweepCardEvidenceSpans` reads it: a card-staged span is
+   * deleted only when none of its fingerprints names a surviving card
+   * generation, so a row an accepted step reused is never deleted because the
+   * step that first staged it was rejected. A parser span never carries this
+   * field and is never swept.
+   *
+   * Settled on review 2026-09-12: sealing a text version protects its text
+   * and its pages, not pointers into them, so a card generation may stage a
+   * new span over sealed text. Nothing about the span's guarantee changes:
+   * the range is validated against the sealed page and the quote hash is
+   * recomputed from that page's text, exactly as for a parser span.
+   */
+  cardExtractionFingerprints: v.optional(v.array(v.string())),
 };
 
 export const documentFields = {
