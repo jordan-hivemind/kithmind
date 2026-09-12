@@ -50,11 +50,13 @@
 //
 //   node dist/run.js learn-account-aliases --adapter <module path> [--dry-run]
 //   node dist/run.js reattribute-accounts  --adapter <module path> [--dry-run]
+//                                          [--remove-duplicates]
 //
 // The first learns which printed account number belongs to which account and
 // writes `account_aliases`; the second moves the rows the pre-alias
 // resolution misfiled and closes their review items. See that section's own
-// header for why the order is not a preference.
+// header for why the order is not a preference, and what
+// `--remove-duplicates` deletes.
 
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -82,6 +84,9 @@ import {
   closeResolvedAccountKeyItems,
   countHoldingsByAccount,
   countOpenReviewItems,
+  deleteVanishedPeriodVerdicts,
+  departedSnapshots,
+  duplicateRemovalReviewItems,
   HOLDING_TABLES,
   insertAccountAliases,
   maskAccountKey,
@@ -90,16 +95,19 @@ import {
   type AliasObservation,
   type HoldingTable,
   type MovedHolding,
+  type RemovedHolding,
 } from "./accountAliases.js";
 import { readCaptureManifestById, type CaptureManifest } from "./captures.js";
 import {
   publishImport,
+  REVIEW_COLUMNS,
   type ImportBatch,
   type ImportDocument,
 } from "./importer.js";
 import {
   closeArchiveClient,
   createArchiveClient,
+  insertRows,
   withArchiveTransaction,
   type ArchiveClient,
 } from "./pgStore.js";
@@ -1102,6 +1110,17 @@ function printReparseSummary(
 // stored on a misfiled row says which account number it was printed under
 // (see accountAliases.ts's "re-attribution" header), so the only way to know
 // is to read the document again through the same `parse()`.
+//
+// F1-56b. A misfiled row often cannot move, because the account its printed
+// number names already holds the identical stated fact: a household covered
+// by both a consolidated statement and each account's own statement states
+// every holding twice, and only one of the two copies was ever misfiled.
+// On the owner's archive that is 24,811 of 26,069 examined rows. Left alone
+// they are a second copy of one holding under the wrong account, which
+// double-counts that account and fails its gates, so `--remove-duplicates`
+// deletes the misfiled copy where the surviving one is confirmed to be at
+// the target account. Off by default: it is the only thing in this file that
+// deletes a row, and `--dry-run` prints exactly what it would delete.
 
 /** The institution one of these commands operates on, read-only: `run.ts`'s
  * ordinary pass upserts this row from `capabilities()`, and a command that
@@ -1127,6 +1146,7 @@ async function requireInstitutionId(
 type AliasCommandArgs = {
   readonly adapter: string;
   readonly dryRun: boolean;
+  readonly removeDuplicates: boolean;
   readonly now: Date;
 };
 
@@ -1136,6 +1156,7 @@ function parseAliasCommandArgs(args: readonly string[]): AliasCommandArgs {
     options: {
       adapter: { type: "string" },
       "dry-run": { type: "boolean", default: false },
+      "remove-duplicates": { type: "boolean", default: false },
       now: { type: "string" },
     },
   });
@@ -1144,7 +1165,12 @@ function parseAliasCommandArgs(args: readonly string[]): AliasCommandArgs {
   if (Number.isNaN(now.getTime())) {
     throw new Error(`--now ${values.now} is not a valid date`);
   }
-  return { adapter: values.adapter, dryRun: values["dry-run"] === true, now };
+  return {
+    adapter: values.adapter,
+    dryRun: values["dry-run"] === true,
+    removeDuplicates: values["remove-duplicates"] === true,
+    now,
+  };
 }
 
 type AliasWalkOutcome = {
@@ -1155,7 +1181,20 @@ type AliasWalkOutcome = {
 };
 
 async function runLearnAccountAliases(args: readonly string[]): Promise<void> {
-  const { adapter: adapterPath, dryRun, now } = parseAliasCommandArgs(args);
+  const {
+    adapter: adapterPath,
+    dryRun,
+    removeDuplicates,
+    now,
+  } = parseAliasCommandArgs(args);
+  // Refused rather than ignored: it is a destructive flag, and silently
+  // accepting it here would let an operator believe rows were deleted.
+  if (removeDuplicates) {
+    throw new Error(
+      "--remove-duplicates belongs to reattribute-accounts; learn-account-aliases " +
+        "never deletes a row",
+    );
+  }
   const adapter = await loadAdapter(adapterPath);
   const rawTreeRoot = resolveRawTreeRoot();
   const pgClient = createArchiveClient();
@@ -1256,7 +1295,11 @@ type ReattributionOutcome = {
   collision: number;
   conflictingLocators: number;
   moved: MovedHolding[];
+  removed: RemovedHolding[];
   reviewItemsClosed: number;
+  /** F1-56b. Verdicts deleted because the period they judge no longer
+   * exists: a snapshot that bounded it left the account. */
+  verdictsVanished: { cash: number; positions: number };
 };
 
 /**
@@ -1315,7 +1358,12 @@ function planDocumentTargets(
 }
 
 async function runReattributeAccounts(args: readonly string[]): Promise<void> {
-  const { adapter: adapterPath, dryRun, now } = parseAliasCommandArgs(args);
+  const {
+    adapter: adapterPath,
+    dryRun,
+    removeDuplicates,
+    now,
+  } = parseAliasCommandArgs(args);
   const adapter = await loadAdapter(adapterPath);
   const rawTreeRoot = resolveRawTreeRoot();
   const pgClient = createArchiveClient();
@@ -1330,7 +1378,9 @@ async function runReattributeAccounts(args: readonly string[]): Promise<void> {
     collision: 0,
     conflictingLocators: 0,
     moved: [],
+    removed: [],
     reviewItemsClosed: 0,
+    verdictsVanished: { cash: 0, positions: 0 },
   };
 
   try {
@@ -1385,6 +1435,7 @@ async function runReattributeAccounts(args: readonly string[]): Promise<void> {
     let openAfter = openBefore;
     let after = before;
     let gates: WholeArchiveGates | null = null;
+    let wholeArchive: WholeArchiveGates | null = null;
 
     try {
       await withArchiveTransaction(pgClient, async (tx) => {
@@ -1396,13 +1447,35 @@ async function runReattributeAccounts(args: readonly string[]): Promise<void> {
               plan.doc.id,
               plan.fromAccountId,
               plan.targets[table],
+              removeDuplicates,
             );
             outcome.examined += result.examined;
             outcome.hashMismatch += result.hashMismatch;
             outcome.collision += result.collision;
             outcome.moved.push(...result.moved);
+            outcome.removed.push(...result.removed);
           }
         }
+
+        // F1-56b. A durable record of every deletion, one item per document
+        // and table rather than per row, before the gates run.
+        await insertRows(
+          tx,
+          "review_items",
+          REVIEW_COLUMNS,
+          duplicateRemovalReviewItems(outcome.removed, now),
+        );
+
+        // F1-56b. A snapshot that left an account -- moved out or deleted --
+        // was a period boundary, and the two periods it bounded no longer
+        // exist. Neither gate removes such a verdict on its own (each only
+        // rewrites periods that do exist), so they are deleted here, before
+        // the whole-archive pass below writes the merged period that
+        // replaced them.
+        outcome.verdictsVanished = await deleteVanishedPeriodVerdicts(
+          tx,
+          departedSnapshots(outcome.moved, outcome.removed),
+        );
 
         outcome.reviewItemsClosed = await closeResolvedAccountKeyItems(
           tx,
@@ -1417,50 +1490,79 @@ async function runReattributeAccounts(args: readonly string[]): Promise<void> {
         // left needs re-deriving as much as the one it joined.
         gates = {
           cash: await runReconciliationGate(tx, undefined, {
-            snapshots: outcome.moved
-              .filter((move) => move.table === "balances")
-              .flatMap((move) => [
-                { accountId: move.fromAccountId, date: move.asOf },
-                { accountId: move.toAccountId, date: move.asOf },
-              ]),
+            snapshots: [
+              ...outcome.moved
+                .filter((move) => move.table === "balances")
+                .flatMap((move) => [
+                  { accountId: move.fromAccountId, date: move.asOf },
+                  { accountId: move.toAccountId, date: move.asOf },
+                ]),
+              // A deleted duplicate changes only the account it left: the
+              // surviving row was already where it is.
+              ...outcome.removed
+                .filter((row) => row.table === "balances")
+                .map((row) => ({ accountId: row.accountId, date: row.asOf })),
+            ],
             activity: [],
           }),
           positions: await runPositionReconciliationGate(tx, undefined, {
-            snapshots: outcome.moved
-              .filter(
-                (move) => move.table === "positions" && move.instrumentId !== null,
-              )
-              .flatMap((move) => [
-                {
-                  accountId: move.fromAccountId,
-                  instrumentId: move.instrumentId!,
-                  date: move.asOf,
-                },
-                {
-                  accountId: move.toAccountId,
-                  instrumentId: move.instrumentId!,
-                  date: move.asOf,
-                },
-              ]),
+            snapshots: [
+              ...outcome.moved
+                .filter(
+                  (move) => move.table === "positions" && move.instrumentId !== null,
+                )
+                .flatMap((move) => [
+                  {
+                    accountId: move.fromAccountId,
+                    instrumentId: move.instrumentId!,
+                    date: move.asOf,
+                  },
+                  {
+                    accountId: move.toAccountId,
+                    instrumentId: move.instrumentId!,
+                    date: move.asOf,
+                  },
+                ]),
+              ...outcome.removed
+                .filter(
+                  (row) => row.table === "positions" && row.instrumentId !== null,
+                )
+                .map((row) => ({
+                  accountId: row.accountId,
+                  instrumentId: row.instrumentId!,
+                  date: row.asOf,
+                })),
+            ],
             activity: [],
           }),
         };
 
         openAfter = await countOpenReviewItems(tx, "unknown_account_key");
         after = await holdingsSnapshot(tx, accountIds);
+
+        // F1-56b. The one whole-archive pass, last and inside the same
+        // transaction, exactly as `reparse` ends with one: a run that moved
+        // and deleted snapshots across many accounts re-derives every period
+        // from scratch rather than leaving the archive judged by a scope
+        // that only covered what this run touched. Inside the transaction so
+        // a dry run rolls its verdicts back with everything else.
+        if (outcome.moved.length > 0 || outcome.removed.length > 0) {
+          wholeArchive = await runWholeArchiveGates(tx);
+        }
         if (dryRun) throw new DryRunRollback();
       });
     } catch (error) {
       if (!(error instanceof DryRunRollback)) throw error;
     }
 
-    printReattributionSummary(outcome, dryRun, {
+    printReattributionSummary(outcome, dryRun, removeDuplicates, {
       accountIds,
       openBefore,
       openAfter,
       before,
       after,
       gates,
+      wholeArchive,
     });
   } finally {
     await closeArchiveClient(pgClient);
@@ -1491,6 +1593,7 @@ async function holdingsSnapshot(
 function printReattributionSummary(
   outcome: ReattributionOutcome,
   dryRun: boolean,
+  removeDuplicates: boolean,
   counts: {
     accountIds: readonly string[];
     openBefore: number;
@@ -1498,9 +1601,13 @@ function printReattributionSummary(
     before: HoldingsSnapshot;
     after: HoldingsSnapshot;
     gates: WholeArchiveGates | null;
+    wholeArchive: WholeArchiveGates | null;
   },
 ): void {
-  console.log(`mode: reattribute-accounts${dryRun ? " (dry run)" : ""}`);
+  console.log(
+    `mode: reattribute-accounts${removeDuplicates ? " (--remove-duplicates)" : ""}` +
+      `${dryRun ? " (dry run)" : ""}`,
+  );
   console.log(`documents considered: ${outcome.considered}`);
   console.log(
     `documents skipped (not a document-tier capture): ${outcome.skippedTier}`,
@@ -1511,10 +1618,20 @@ function printReattributionSummary(
     const moved = outcome.moved.filter((move) => move.table === table).length;
     console.log(`${table} moved: ${moved}`);
   }
+  for (const table of HOLDING_TABLES) {
+    const removed = outcome.removed.filter((row) => row.table === table).length;
+    console.log(`${table} removed as duplicates: ${removed}`);
+  }
   console.log(`rows left (row hash mismatch): ${outcome.hashMismatch}`);
   console.log(
     `rows left (target account already holds this row): ${outcome.collision}`,
   );
+  if (!removeDuplicates && outcome.collision > 0) {
+    console.log(
+      "  those rows are duplicates of a row already at the target account; " +
+        "re-run with --remove-duplicates to delete them",
+    );
+  }
   console.log(
     `locators with conflicting target accounts: ${outcome.conflictingLocators}`,
   );
@@ -1522,26 +1639,50 @@ function printReattributionSummary(
     `open unknown_account_key items: ${counts.openBefore} -> ${counts.openAfter}`,
   );
   console.log(`review items closed: ${outcome.reviewItemsClosed}`);
+  console.log(
+    `verdicts deleted for periods that no longer exist: cash ${outcome.verdictsVanished.cash} ` +
+      `positions ${outcome.verdictsVanished.positions}`,
+  );
+  // Per account, both directions: what it held before and after, and how
+  // many of its rows were deleted as duplicates of another account's.
+  const removedByAccount = new Map<string, Map<HoldingTable, number>>();
+  for (const row of outcome.removed) {
+    const tables = removedByAccount.get(row.accountId) ?? new Map();
+    tables.set(row.table, (tables.get(row.table) ?? 0) + 1);
+    removedByAccount.set(row.accountId, tables);
+  }
   for (const accountId of counts.accountIds) {
     const parts = HOLDING_TABLES.map(
       (table) =>
         `${table} ${counts.before[table].get(accountId) ?? 0} -> ${counts.after[table].get(accountId) ?? 0}`,
     );
-    console.log(`  account ${accountId}: ${parts.join(", ")}`);
+    const removed = removedByAccount.get(accountId);
+    const removedPart =
+      removed === undefined
+        ? ""
+        : `, removed as duplicates: ${HOLDING_TABLES.map(
+            (table) => `${table} ${removed.get(table) ?? 0}`,
+          ).join(" ")}`;
+    console.log(`  account ${accountId}: ${parts.join(", ")}${removedPart}`);
   }
-  if (counts.gates === null) {
-    console.log("gates: skipped (nothing moved)");
-  } else {
-    console.log(
-      `gates cash: checked=${counts.gates.cash.periodsChecked} pass=${counts.gates.cash.passed} ` +
-        `fail=${counts.gates.cash.failed} unverified=${counts.gates.cash.unverified}`,
-    );
-    console.log(
-      `gates positions: checked=${counts.gates.positions.periodsChecked} ` +
-        `pass=${counts.gates.positions.passed} fail=${counts.gates.positions.failed} ` +
-        `unverified=${counts.gates.positions.unverified}`,
-    );
+  printGates("gates (touched scope)", counts.gates);
+  printGates("whole-archive gate pass", counts.wholeArchive);
+}
+
+function printGates(label: string, gates: WholeArchiveGates | null): void {
+  if (gates === null) {
+    console.log(`${label}: skipped (nothing moved or removed)`);
+    return;
   }
+  console.log(
+    `${label} cash: checked=${gates.cash.periodsChecked} pass=${gates.cash.passed} ` +
+      `fail=${gates.cash.failed} unverified=${gates.cash.unverified}`,
+  );
+  console.log(
+    `${label} positions: checked=${gates.positions.periodsChecked} ` +
+      `pass=${gates.positions.passed} fail=${gates.positions.failed} ` +
+      `unverified=${gates.positions.unverified}`,
+  );
 }
 
 async function main(): Promise<void> {

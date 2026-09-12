@@ -276,9 +276,29 @@ export type MovedHolding = {
   readonly asOf: string;
 };
 
+/**
+ * F1-56b. One misfiled row this run deleted because the account its printed
+ * key names already holds the identical stated fact -- the consolidated
+ * statement's copy of a holding that account's own statement already stated.
+ * `duplicateOfAccountId` is where the surviving row lives, which is also the
+ * account the deleted row should have been under all along.
+ */
+export type RemovedHolding = {
+  readonly table: HoldingTable;
+  readonly documentId: string;
+  /** The account the row was wrongly filed under, and left. */
+  readonly accountId: string;
+  readonly duplicateOfAccountId: string;
+  readonly instrumentId: string | null;
+  readonly asOf: string;
+};
+
 export type MoveOutcome = {
   readonly examined: number;
   readonly moved: readonly MovedHolding[];
+  /** F1-56b. Deleted as duplicates of a row already at the target account,
+   * and only when `removeDuplicates` asked for it. */
+  readonly removed: readonly RemovedHolding[];
   /** The stored `row_hash` disagreed with the one recomputed from the stored
    * row under its current account: something about this row's hashed content
    * is not what `importer.ts` wrote. Never moved -- rehashing it would paper
@@ -286,7 +306,10 @@ export type MoveOutcome = {
   readonly hashMismatch: number;
   /** The target account already holds a row with the same content identity,
    * so moving this one would collide on `row_hash`. Left exactly where it
-   * is, for a person to compare the two and delete one. */
+   * is: without `removeDuplicates` this is a thing for a person to look at,
+   * and even with it, a blocking row that is not actually *at* the target
+   * account stays here rather than being deduplicated against something
+   * whose location this code could not confirm. */
   readonly collision: number;
 };
 
@@ -299,6 +322,30 @@ export type MoveOutcome = {
  * reparse: only locators whose target differs from `fromAccountId` belong in
  * it. Idempotent -- a row already at its target is not selected at all, since
  * the WHERE clause pins `account_id = fromAccountId`.
+ *
+ * F1-56b. `removeDuplicates` decides what happens to a row that cannot move
+ * because the target already holds its content. On the owner's archive that
+ * is 24,811 of 26,069 examined rows, and it is not an anomaly: a household
+ * is covered twice over, once by each account's own statement and once by a
+ * consolidated statement, so the consolidated copy of a holding is the same
+ * stated fact the account's own statement already contributed. Left in
+ * place, it is a second copy of one holding under the wrong account, which
+ * double-counts that account's holdings and fails its gates.
+ *
+ * Deleting it is safe in the way that matters for this archive: the raw tree
+ * is the source of truth and the database is derived (ground rule 1), the
+ * surviving row states the identical fact, and a later reparse of the
+ * consolidated statement resolves that holding to the target account, where
+ * `row_hash` finds the survivor and deduplicates -- so the deletion stays
+ * deleted rather than being undone by the next run. What is lost is the
+ * second citation, the consolidated statement's own `source_document_id`
+ * and `source_locator` for a fact that keeps a citation either way; that is
+ * the trade, and it is recorded (see `duplicateRemovalReviewItems`).
+ *
+ * The blocking row's `account_id` is read and checked against the target
+ * rather than inferred from its hash. A hash says where a row *should* be;
+ * only the column says where it is, and a DELETE is not the place to trust
+ * the first over the second.
  */
 export async function moveHoldings(
   client: ArchiveClient,
@@ -306,10 +353,12 @@ export async function moveHoldings(
   documentId: string,
   fromAccountId: string,
   targetByLocator: ReadonlyMap<string, string>,
+  removeDuplicates = false,
 ): Promise<MoveOutcome> {
   const moved: MovedHolding[] = [];
+  const removed: RemovedHolding[] = [];
   if (targetByLocator.size === 0) {
-    return { examined: 0, moved, hashMismatch: 0, collision: 0 };
+    return { examined: 0, moved, removed, hashMismatch: 0, collision: 0 };
   }
   const found = await client.query<HoldingRow>(
     `SELECT ${HASH_SELECT[table]} FROM ${table}
@@ -340,26 +389,61 @@ export async function moveHoldings(
     });
   }
   if (planned.length === 0) {
-    return { examined: found.rows.length, moved, hashMismatch, collision: 0 };
+    return {
+      examined: found.rows.length,
+      moved,
+      removed,
+      hashMismatch,
+      collision: 0,
+    };
   }
 
   // Checked rather than caught: a UNIQUE violation inside a transaction
   // aborts it, and this runs inside the caller's one alongside every other
-  // document's work.
-  const taken = await client.query<{ row_hash: string }>(
-    `SELECT row_hash FROM ${table} WHERE row_hash = ANY($1::text[])`,
+  // document's work. `account_id` comes back too, so the duplicate branch
+  // below can confirm the blocking row is where its hash claims.
+  const taken = await client.query<{ row_hash: string; account_id: string | null }>(
+    `SELECT row_hash, account_id FROM ${table} WHERE row_hash = ANY($1::text[])`,
     [planned.map((p) => p.hash)],
   );
-  const blocked = new Set(taken.rows.map((r) => r.row_hash));
+  const blockedBy = new Map(
+    taken.rows.map((r) => [r.row_hash, r.account_id] as const),
+  );
+  // Hashes claimed by a row this same call is about to write. Distinct from
+  // `blockedBy`, whose rows exist and can be checked; nothing is ever
+  // deleted against one of these.
+  const claimed = new Set<string>();
   const updates: typeof planned = [];
+  const deletions: typeof planned = [];
   let collision = 0;
   for (const plan of planned) {
-    if (blocked.has(plan.hash)) {
-      collision += 1;
+    const blockingAccount = blockedBy.get(plan.hash);
+    if (blockingAccount !== undefined || claimed.has(plan.hash)) {
+      if (removeDuplicates && blockingAccount === plan.accountId) {
+        deletions.push(plan);
+      } else {
+        collision += 1;
+      }
       continue;
     }
-    blocked.add(plan.hash);
+    claimed.add(plan.hash);
     updates.push(plan);
+  }
+
+  if (deletions.length > 0) {
+    await client.query(`DELETE FROM ${table} WHERE id = ANY($1::text[])`, [
+      deletions.map((d) => d.id),
+    ]);
+    for (const deletion of deletions) {
+      removed.push({
+        table,
+        documentId,
+        accountId: fromAccountId,
+        duplicateOfAccountId: deletion.accountId,
+        instrumentId: deletion.row.instrument_id ?? null,
+        asOf: deletion.row.as_of,
+      });
+    }
   }
 
   if (updates.length > 0) {
@@ -383,8 +467,144 @@ export async function moveHoldings(
       });
     }
   }
-  return { examined: found.rows.length, moved, hashMismatch, collision };
+  return { examined: found.rows.length, moved, removed, hashMismatch, collision };
 }
+
+/**
+ * F1-56b. A snapshot date that left one account, whether it moved to another
+ * or was deleted as a duplicate. `instrumentId` is null for a balance, whose
+ * gate has no instrument dimension.
+ */
+export type DepartedSnapshot = {
+  readonly table: HoldingTable;
+  readonly accountId: string;
+  readonly instrumentId: string | null;
+  readonly asOf: string;
+};
+
+/** Every snapshot that left an account this run: the `from` side of each
+ * move and the account each deleted duplicate was removed from. */
+export function departedSnapshots(
+  moved: readonly MovedHolding[],
+  removed: readonly RemovedHolding[],
+): DepartedSnapshot[] {
+  return [
+    ...moved.map((move) => ({
+      table: move.table,
+      accountId: move.fromAccountId,
+      instrumentId: move.instrumentId,
+      asOf: move.asOf,
+    })),
+    ...removed.map((row) => ({
+      table: row.table,
+      accountId: row.accountId,
+      instrumentId: row.instrumentId,
+      asOf: row.asOf,
+    })),
+  ];
+}
+
+/**
+ * F1-56b. Deletes the verdicts for periods that no longer exist.
+ *
+ * A stated snapshot is a period boundary: a series with snapshots at d1, d2
+ * and d3 has the periods [d1, d2] and [d2, d3]. When d2 leaves the account,
+ * the real series is [d1, d3] and both stored verdicts are about periods
+ * that are gone. Neither gate removes them on its own -- each deletes only
+ * the periods it is about to rewrite, and a period that no longer exists is
+ * never rewritten, so even a whole-archive pass leaves both behind. The
+ * merged [d1, d3] period is then written by that whole-archive pass, which
+ * is why this runs before it and not instead of it.
+ *
+ * Guarded by `NOT EXISTS`: a date is only a departed boundary if *no* row
+ * remains at it for that series. Two documents can state the same account,
+ * instrument and date, and moving one of them out leaves the boundary
+ * standing.
+ */
+export async function deleteVanishedPeriodVerdicts(
+  client: ArchiveClient,
+  departed: readonly DepartedSnapshot[],
+): Promise<{ cash: number; positions: number }> {
+  const positions = departed.filter(
+    (row) => row.table === "positions" && row.instrumentId !== null,
+  );
+  const balances = departed.filter((row) => row.table === "balances");
+
+  let positionsDeleted = 0;
+  if (positions.length > 0) {
+    const result = await client.query(
+      `DELETE FROM position_reconciliations r
+        USING unnest($1::text[], $2::text[], $3::date[]) AS d(account_id, instrument_id, as_of)
+        WHERE r.account_id = d.account_id AND r.instrument_id = d.instrument_id
+          AND (r.period_start = d.as_of OR r.period_end = d.as_of)
+          AND NOT EXISTS (
+            SELECT 1 FROM positions p
+             WHERE p.account_id = d.account_id AND p.instrument_id = d.instrument_id
+               AND p.as_of = d.as_of)`,
+      [
+        positions.map((row) => row.accountId),
+        positions.map((row) => row.instrumentId),
+        positions.map((row) => row.asOf),
+      ],
+    );
+    positionsDeleted = result.rowCount ?? 0;
+  }
+
+  let cashDeleted = 0;
+  if (balances.length > 0) {
+    const result = await client.query(
+      `DELETE FROM reconciliations r
+        USING unnest($1::text[], $2::date[]) AS d(account_id, as_of)
+        WHERE r.account_id = d.account_id
+          AND (r.period_start = d.as_of OR r.period_end = d.as_of)
+          AND NOT EXISTS (
+            SELECT 1 FROM balances b
+             WHERE b.account_id = d.account_id AND b.as_of = d.as_of)`,
+      [balances.map((row) => row.accountId), balances.map((row) => row.asOf)],
+    );
+    cashDeleted = result.rowCount ?? 0;
+  }
+  return { cash: cashDeleted, positions: positionsDeleted };
+}
+
+/**
+ * F1-56b. One `duplicate_holding_removed` item per document and table, so a
+ * deletion leaves a durable, joinable record in the archive rather than only
+ * a number on an operator's terminal. Summarized rather than one item per
+ * row: 24,811 items would bury every other open item in the queue, and the
+ * fact worth recording is "this document's copy of N holdings was removed in
+ * favour of account X's own statement", which is per document.
+ *
+ * Written through `review_items` rather than a new table because that is
+ * where this archive already records "something was decided about these rows
+ * and here is why".
+ */
+export function duplicateRemovalReviewItems(
+  removed: readonly RemovedHolding[],
+  now: Date,
+): unknown[][] {
+  const groups = new Map<string, { row: RemovedHolding; count: number }>();
+  for (const row of removed) {
+    const key = `${row.documentId}\u0000${row.table}\u0000${row.duplicateOfAccountId}`;
+    const group = groups.get(key);
+    if (group) group.count += 1;
+    else groups.set(key, { row, count: 1 });
+  }
+  return [...groups.values()].map(({ row, count }) => [
+    randomUUID(),
+    "duplicate_holding_removed",
+    row.accountId,
+    row.documentId,
+    null,
+    String(count),
+    `${count} ${row.table} row(s) this document stated under account ${row.accountId} were ` +
+      `removed on ${now.toISOString()}: the account their printed number names ` +
+      `(${row.duplicateOfAccountId}) already held a row with the identical stated content, ` +
+      "so this consolidated copy was a second copy of one holding filed under the wrong " +
+      "account. The surviving row keeps its own document citation; this one's is gone",
+  ]);
+}
+
 
 /**
  * Closes every open `unknown_account_key` item whose key now resolves. The

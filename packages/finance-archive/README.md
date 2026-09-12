@@ -1067,6 +1067,7 @@ same counts and writes nothing.
 
 ```
 node dist/run.js reattribute-accounts --adapter <module path> [--dry-run]
+                                      [--remove-duplicates]
 ```
 
 Moves the rows the old resolution misfiled: a holding filed under a
@@ -1093,15 +1094,66 @@ Then every open `unknown_account_key` item whose key now resolves is closed
 with a resolution note (the reason those items state is no longer true), and
 both reconciliation gates run over exactly the periods the moves could have
 shifted, on both sides -- the account a snapshot left needs re-deriving as
-much as the one it joined. The summary prints rows moved per table, rows
-left and why, open `unknown_account_key` items before and after, and
-per-account holdings counts before and after. `--dry-run` does all the work
-in one transaction and rolls it back, so the "after" numbers are what a real
-run would produce.
+much as the one it joined -- followed by one whole-archive pass, so the
+archive is judged as a whole rather than only where this run reached. The
+summary prints rows moved and removed per table, rows left and why, open
+`unknown_account_key` items before and after, and per-account holdings
+counts before and after. `--dry-run` does all the work in one transaction
+and rolls it back, so the "after" numbers are what a real run would produce.
+
+### The duplicate a move cannot displace (F1-56b)
+
+Most misfiled rows on the owner's archive could not move at all: 24,811 of
+26,069 examined. That is not an anomaly, it is what double coverage looks
+like. A household covered by both a consolidated statement and each
+account's own statement states every holding twice, and only the
+consolidated copy was ever misfiled -- so the account the printed number
+names already holds a row with the identical content, and the move would
+collide on `row_hash`.
+
+Left in place, that row is a second copy of one holding filed under the
+wrong account: it double-counts that account's holdings and fails its gates.
+`--remove-duplicates` deletes the misfiled copy. It is off by default, it is
+the only thing in this package that deletes a holding, and `--dry-run`
+prints exactly what it would delete.
+
+Deleting is safe in the way that matters here. The raw tree is the source of
+truth and the database is derived (ground rule 1); the surviving row states
+the identical fact; and a later reparse of the consolidated statement
+resolves that holding to the target account, where `row_hash` finds the
+survivor and deduplicates -- so the deletion stays deleted rather than being
+undone by the next run. What is lost is the second citation: the
+consolidated statement's own `source_document_id` and `source_locator` for a
+fact that keeps a citation either way. That trade is recorded as one
+`duplicate_holding_removed` review item per document and table, naming the
+document, the count, and the account the surviving row is under. Per row
+would be 24,811 items and would bury the queue; per document is the fact
+worth keeping.
+
+The blocking row's `account_id` is read and compared against the target
+rather than inferred from its hash. A hash says where a row should be; only
+the column says where it is, and a `DELETE` is not the place to prefer the
+first. A row blocked by anything this check cannot confirm stays where it is
+and is counted.
+
+### Verdicts for periods that no longer exist
+
+A stated snapshot is a period boundary. A series with snapshots at d1, d2
+and d3 has the periods `[d1, d2]` and `[d2, d3]`; when d2 leaves the account
+-- moved to another or deleted as a duplicate -- the real series is
+`[d1, d3]` and both stored verdicts judge periods that are gone. Neither
+gate removes them on its own: each deletes only the periods it is about to
+rewrite, and a period that no longer exists is never rewritten, so even a
+whole-archive pass leaves both behind. `reattribute-accounts` deletes them
+explicitly, guarded by `NOT EXISTS` so a boundary another document still
+states is not disturbed, and then the whole-archive pass writes the merged
+period that replaced them.
 
 ### The order matters
 
-Learn, then re-attribute, then (if you want) reparse. Once aliases exist, a
+Learn, then re-attribute (dry run, then for real, then again with
+`--remove-duplicates` once the reported collisions are understood), then (if
+you want) reparse. Once aliases exist, a
 reparse of a consolidated statement resolves its sections correctly and,
 because `row_hash` includes the account, inserts them as *new* rows beside
 the misfiled ones it cannot see -- two copies of one holding. Re-attributing

@@ -101,19 +101,68 @@ async function seededSchema(t) {
  * consolidated one, and the holdings are dealt between them -- positions
  * alternating, the balance taking the *second* number so the balances path
  * is exercised as well as the positions one, the liability the first.
+ *
+ * F1-56b. `holdingsByMarker` optionally *replaces* a document's parsed
+ * holdings with an explicit list, each entry naming the number it is printed
+ * under. That is what lets two documents state the identical holding -- a
+ * consolidated statement and the account's own statement, the shape that
+ * produces a misfiled row the target account already holds. Every hashed
+ * field is spelled out here, because "identical" has to mean identical to
+ * `positionHash`/`balanceHash`, not merely similar.
  */
-function writeStampingAdapter(dir, numbersByMarker, name = "adapter-stamped.mjs") {
+function writeStampingAdapter(
+  dir,
+  numbersByMarker,
+  { holdingsByMarker = {}, name = "adapter-stamped.mjs" } = {},
+) {
   const path = join(dir, name);
   writeFileSync(
     path,
     `import { syntheticAdapter } from ${JSON.stringify(distIndexUrl)};\n` +
       `const NUMBERS = ${JSON.stringify(numbersByMarker)};\n` +
+      `const HOLDINGS = ${JSON.stringify(holdingsByMarker)};\n` +
       `const pick = (numbers, i) => numbers[i % numbers.length];\n` +
-      `function stamp(parsed, numbers) {\n` +
+      `function locator(kind, i) {\n` +
+      `  return { row: { source: kind, index: 1, field: "explicit holding " + i } };\n` +
+      `}\n` +
+      `function explicitHoldings(spec, kind) {\n` +
+      `  return {\n` +
+      `    positions: (spec.positions ?? []).map((p, i) => ({\n` +
+      `      sourceDocument: kind,\n` +
+      `      accountExternalKey: p.key,\n` +
+      `      asOf: p.asOf,\n` +
+      `      instrument: { symbol: p.symbol, cusip: p.cusip, isin: null, name: p.name },\n` +
+      `      quantity: p.quantity,\n` +
+      `      price: null,\n` +
+      `      marketValue: p.marketValue,\n` +
+      `      marketValueNote: null,\n` +
+      `      costBasis: p.costBasis,\n` +
+      `      unrealized: null,\n` +
+      `      currency: "USD",\n` +
+      `      valuationBasis: "market_price",\n` +
+      `      valuationNote: "synthetic explicit holding",\n` +
+      `      locators: locator(kind, "p" + i),\n` +
+      `    })),\n` +
+      `    balances: (spec.balances ?? []).map((b, i) => ({\n` +
+      `      sourceDocument: kind,\n` +
+      `      accountExternalKey: b.key,\n` +
+      `      asOf: b.asOf,\n` +
+      `      totalValue: b.totalValue,\n` +
+      `      totalValueNote: null,\n` +
+      `      cash: b.cash,\n` +
+      `      currency: "USD",\n` +
+      `      periodStartValue: null,\n` +
+      `      periodEndValue: null,\n` +
+      `      locators: locator(kind, "b" + i),\n` +
+      `    })),\n` +
+      `    liabilities: [],\n` +
+      `  };\n` +
+      `}\n` +
+      `function stamp(parsed, numbers, spec, kind) {\n` +
       `  return {\n` +
       `    ...parsed,\n` +
       `    activity: parsed.activity.map((row) => ({ ...row, accountExternalKey: numbers[0] })),\n` +
-      `    holdings: {\n` +
+      `    holdings: spec !== undefined ? explicitHoldings(spec, kind) : {\n` +
       `      positions: parsed.holdings.positions.map((p, i) => ({ ...p, accountExternalKey: pick(numbers, i) })),\n` +
       `      balances: parsed.holdings.balances.map((b, i) => ({ ...b, accountExternalKey: pick(numbers, i + 1) })),\n` +
       `      liabilities: parsed.holdings.liabilities.map((l, i) => ({ ...l, accountExternalKey: pick(numbers, i) })),\n` +
@@ -126,7 +175,7 @@ function writeStampingAdapter(dir, numbersByMarker, name = "adapter-stamped.mjs"
       `    const parsed = await syntheticAdapter.parse(rawFile);\n` +
       `    const text = new TextDecoder().decode(rawFile.bytes);\n` +
       `    for (const [marker, numbers] of Object.entries(NUMBERS)) {\n` +
-      `      if (text.includes(marker)) return stamp(parsed, numbers);\n` +
+      `      if (text.includes(marker)) return stamp(parsed, numbers, HOLDINGS[marker], rawFile.kind);\n` +
       `    }\n` +
       `    return parsed;\n` +
       `  },\n` +
@@ -146,30 +195,38 @@ function writeSessionFixture(dir) {
 }
 
 /**
- * One statement under account A, one under account A, one confirmation under
- * account B: the corpus every test here imports. Which numbers each document
- * prints is the stamping adapter's business, not the selection's.
+ * Which account each document is pulled under. The default -- February and
+ * March statements under A, the confirmation under B -- is the corpus most
+ * tests here use; the duplicate-removal test files the March statement under
+ * B instead, so that account has a statement of its own stating holdings the
+ * consolidated February statement also states.
  */
-function writeSelection(dir) {
+const DEFAULT_PULL_ACCOUNTS = {
+  february: ACCOUNT_A.externalKey,
+  march: ACCOUNT_A.externalKey,
+  confirmation: ACCOUNT_B.externalKey,
+};
+
+function writeSelection(dir, pullAccounts = DEFAULT_PULL_ACCOUNTS) {
   const path = join(dir, "selection.json");
   writeFileSync(
     path,
     JSON.stringify({
       pulls: [
         {
-          accountExternalKey: ACCOUNT_A.externalKey,
+          accountExternalKey: pullAccounts.february,
           docType: "statement",
           docDate: "2025-02-28",
           selection: { kind: "pdf_statement", externalId: "doc-stmt-2025-q1" },
         },
         {
-          accountExternalKey: ACCOUNT_A.externalKey,
+          accountExternalKey: pullAccounts.march,
           docType: "statement",
           docDate: "2025-03-31",
           selection: { kind: "pdf_statement", externalId: "doc-stmt-2025-q2" },
         },
         {
-          accountExternalKey: ACCOUNT_B.externalKey,
+          accountExternalKey: pullAccounts.confirmation,
           docType: "confirmation",
           docDate: "2025-02-10",
           selection: {
@@ -205,16 +262,18 @@ function runCommand(env, args) {
  * the numbers this test wants printed, and the corpus already imported once
  * under the pre-alias resolution.
  */
-async function importedArchive(t, numbersByMarker) {
+async function importedArchive(t, numbersByMarker, options = {}) {
   const { schema, client } = await seededSchema(t);
   const rawDir = mkdtempSync(join(tmpdir(), "kith-alias-raw-"));
   t.after(() => rmSync(rawDir, { recursive: true, force: true }));
   const fixturesDir = mkdtempSync(join(tmpdir(), "kith-alias-fixtures-"));
   t.after(() => rmSync(fixturesDir, { recursive: true, force: true }));
 
-  const adapterPath = writeStampingAdapter(fixturesDir, numbersByMarker);
+  const adapterPath = writeStampingAdapter(fixturesDir, numbersByMarker, {
+    holdingsByMarker: options.holdingsByMarker,
+  });
   const sessionPath = writeSessionFixture(fixturesDir);
-  const selectionPath = writeSelection(fixturesDir);
+  const selectionPath = writeSelection(fixturesDir, options.pullAccounts);
   const env = makeEnv(schema, rawDir);
 
   runCommand(env, [
@@ -497,6 +556,7 @@ test(
       [MARCH_STATEMENT]: [NUMBER_A],
       [CONFIRMATION]: [NUMBER_B],
     });
+
     runCommand(makeEnv(schema, rawDir), [
       "--adapter",
       adapterPath,
@@ -554,3 +614,290 @@ test(
     );
   },
 );
+
+// --- F1-56b: the duplicate a move cannot displace --------------------------
+//
+// A household covered twice over: one consolidated statement filed under
+// account A that states both accounts' holdings, and account B's own
+// statement that states B's holdings again. Only the consolidated copy was
+// ever misfiled, so when re-attribution tries to move it to B, B already
+// holds a row with the identical content and the move is blocked. Left
+// there, it is a second copy of one holding under the wrong account.
+
+/** A holding both statements state, to the letter of positionHash. */
+const SHARED_POSITION = {
+  key: NUMBER_B,
+  symbol: "FKE",
+  cusip: "000000FK1",
+  name: "Fictional Kelp ETF",
+  asOf: "2025-02-28",
+  quantity: "40",
+  marketValue: "4212.00",
+  costBasis: "3900.00",
+};
+/** One B holds only via the consolidated statement: it can actually move. */
+const MOVABLE_POSITION = {
+  key: NUMBER_B,
+  symbol: "SGH",
+  cusip: "000000SG2",
+  name: "Synthetic Glacier Holdings",
+  asOf: "2025-02-28",
+  quantity: "25",
+  marketValue: "1203.45",
+  costBasis: "1200.00",
+};
+/** One that is A's own and must not be touched at all. */
+const A_POSITION = {
+  key: NUMBER_A,
+  symbol: "FKE",
+  cusip: "000000FK1",
+  name: "Fictional Kelp ETF",
+  asOf: "2025-02-28",
+  quantity: "11",
+  marketValue: "1158.30",
+  costBasis: "1000.00",
+};
+const SHARED_BALANCE = {
+  key: NUMBER_B,
+  asOf: "2025-02-28",
+  totalValue: "18150.45",
+  cash: "420.10",
+};
+
+/**
+ * February is the consolidated statement (pulled under A, printing both
+ * numbers); March is account B's own statement (pulled under B, printing
+ * only B's number) and states the shared holding and balance a second time.
+ * The confirmation is A's, so learning has one single-number document per
+ * account.
+ */
+function duplicateCorpus() {
+  return {
+    numbers: {
+      [FEBRUARY_STATEMENT]: [NUMBER_A, NUMBER_B],
+      [MARCH_STATEMENT]: [NUMBER_B],
+      [CONFIRMATION]: [NUMBER_A],
+    },
+    options: {
+      pullAccounts: {
+        february: ACCOUNT_A.externalKey,
+        march: ACCOUNT_B.externalKey,
+        confirmation: ACCOUNT_A.externalKey,
+      },
+      holdingsByMarker: {
+        [FEBRUARY_STATEMENT]: {
+          positions: [A_POSITION, MOVABLE_POSITION, SHARED_POSITION],
+          balances: [SHARED_BALANCE],
+        },
+        [MARCH_STATEMENT]: {
+          positions: [SHARED_POSITION],
+          balances: [SHARED_BALANCE],
+        },
+      },
+    },
+  };
+}
+
+test(
+  "a misfiled row the target account already holds is reported, then deleted only when --remove-duplicates asks",
+  { skip },
+  async (t) => {
+    const { numbers, options } = duplicateCorpus();
+    const { client, env, adapterPath } = await importedArchive(t, numbers, options);
+
+    // The consolidated statement filed all three of its positions under A;
+    // B holds only the one its own statement stated.
+    assert.equal(await count(client, "positions", "WHERE account_id = $1", [ACCOUNT_A.id]), 3);
+    assert.equal(await count(client, "positions", "WHERE account_id = $1", [ACCOUNT_B.id]), 1);
+
+    const learn = runCommand(env, ["learn-account-aliases", "--adapter", adapterPath]);
+    assert.equal(summaryValue(learn, "accepted"), 2);
+    assert.equal(summaryValue(learn, "aliases written"), 2);
+
+    // Without the flag: one position moves, and the shared position and
+    // balance are reported as already held at the target, untouched.
+    const reported = runCommand(env, [
+      "reattribute-accounts",
+      "--adapter",
+      adapterPath,
+      "--dry-run",
+    ]);
+    assert.equal(summaryValue(reported, "positions moved"), 1);
+    assert.equal(summaryValue(reported, "positions removed as duplicates"), 0);
+    assert.equal(summaryValue(reported, "balances removed as duplicates"), 0);
+    assert.equal(
+      summaryValue(reported, "rows left (target account already holds this row)"),
+      2,
+    );
+    assert.match(reported, /re-run with --remove-duplicates/);
+
+    // With the flag, still a dry run: the same counts, nothing written.
+    const dry = runCommand(env, [
+      "reattribute-accounts",
+      "--adapter",
+      adapterPath,
+      "--remove-duplicates",
+      "--dry-run",
+      "--now",
+      "2025-06-01T00:00:00.000Z",
+    ]);
+    assert.match(dry, /^mode: reattribute-accounts \(--remove-duplicates\) \(dry run\)$/m);
+    assert.equal(summaryValue(dry, "positions moved"), 1);
+    assert.equal(summaryValue(dry, "positions removed as duplicates"), 1);
+    assert.equal(summaryValue(dry, "balances removed as duplicates"), 1);
+    assert.equal(
+      summaryValue(dry, "rows left (target account already holds this row)"),
+      0,
+    );
+    assert.equal(await count(client, "positions", "WHERE account_id = $1", [ACCOUNT_A.id]), 3);
+    assert.equal(
+      await count(client, "review_items", "WHERE kind = 'duplicate_holding_removed'"),
+      0,
+      "a dry run deletes nothing and records nothing",
+    );
+
+    const real = runCommand(env, [
+      "reattribute-accounts",
+      "--adapter",
+      adapterPath,
+      "--remove-duplicates",
+      "--now",
+      "2025-06-01T00:00:00.000Z",
+    ]);
+    assert.equal(summaryValue(real, "positions moved"), 1);
+    assert.equal(summaryValue(real, "positions removed as duplicates"), 1);
+    assert.equal(summaryValue(real, "balances removed as duplicates"), 1);
+
+    // A keeps only its own holding; B has its own plus the one that moved,
+    // and exactly one copy of the shared one.
+    assert.equal(await count(client, "positions", "WHERE account_id = $1", [ACCOUNT_A.id]), 1);
+    assert.equal(await count(client, "positions", "WHERE account_id = $1", [ACCOUNT_B.id]), 2);
+    assert.equal(await count(client, "balances", "WHERE account_id = $1", [ACCOUNT_A.id]), 0);
+    assert.equal(await count(client, "balances", "WHERE account_id = $1", [ACCOUNT_B.id]), 1);
+
+    // The deletion left a durable, joinable record naming the document whose
+    // copy went and how many rows it was.
+    const recorded = await all(
+      client,
+      `SELECT r.account_id, r.raw_value, r.reason, d.doc_type
+         FROM review_items r JOIN documents d ON d.id = r.source_document_id
+        WHERE r.kind = 'duplicate_holding_removed'
+        ORDER BY r.raw_value`,
+    );
+    assert.equal(recorded.length, 2, "one item per document and table");
+    for (const item of recorded) {
+      assert.equal(item.account_id, ACCOUNT_A.id);
+      assert.equal(item.raw_value, "1");
+      assert.match(item.reason, /removed on 2025-06-01T00:00:00\.000Z/);
+      assert.match(item.reason, new RegExp(ACCOUNT_B.id));
+    }
+
+    // Stable under re-import: the consolidated statement now resolves the
+    // shared holding to B, where row_hash finds the survivor, so nothing
+    // comes back.
+    const reparse = runCommand(env, [
+      "reparse",
+      "--adapter",
+      adapterPath,
+      "--now",
+      "2025-06-02T00:00:00.000Z",
+    ]);
+    assert.equal(summaryValue(reparse, "rows inserted"), 0);
+    assert.equal(await count(client, "positions", "WHERE account_id = $1", [ACCOUNT_A.id]), 1);
+    assert.equal(await count(client, "positions", "WHERE account_id = $1", [ACCOUNT_B.id]), 2);
+
+    // Idempotent: a second run has nothing left to move or remove.
+    const again = runCommand(env, [
+      "reattribute-accounts",
+      "--adapter",
+      adapterPath,
+      "--remove-duplicates",
+    ]);
+    assert.equal(summaryValue(again, "positions moved"), 0);
+    assert.equal(summaryValue(again, "positions removed as duplicates"), 0);
+    assert.equal(summaryValue(again, "balances removed as duplicates"), 0);
+  },
+);
+
+test(
+  "verdicts for periods a departing snapshot bounded are deleted; a period still bounded by a row that stayed is not",
+  { skip },
+  async (t) => {
+    const { numbers, options } = duplicateCorpus();
+    const { client, env, adapterPath } = await importedArchive(t, numbers, options);
+    runCommand(env, ["learn-account-aliases", "--adapter", adapterPath]);
+
+    const instrument = async (symbol) =>
+      (await one(client, "SELECT id FROM instruments WHERE symbol = $1", [symbol])).id;
+    const sgh = await instrument("SGH"); // moves out of A
+    const fke = await instrument("FKE"); // A keeps its own FKE position
+
+    // Two verdicts anchored on the departing SGH snapshot's own date -- the
+    // periods that end and begin at it -- plus one anchored on the same date
+    // for FKE, which A still holds a position at. Only the first two name
+    // periods that will cease to exist.
+    const verdicts = [
+      ["v_end_sgh", sgh, "2025-01-31", "2025-02-28"],
+      ["v_start_sgh", sgh, "2025-02-28", "2025-03-31"],
+      ["v_keep_fke", fke, "2025-01-31", "2025-02-28"],
+    ];
+    for (const [id, instrumentId, start, end] of verdicts) {
+      await client.query(
+        `INSERT INTO position_reconciliations
+           (id, account_id, instrument_id, period_start, period_end, tolerance, status)
+         VALUES ($1, $2, $3, $4, $5, 0, 'fail')`,
+        [id, ACCOUNT_A.id, instrumentId, start, end],
+      );
+    }
+    // And one cash verdict anchored on the balance that leaves A.
+    await client.query(
+      `INSERT INTO reconciliations
+         (id, account_id, period_start, period_end, currency, tolerance, status)
+       VALUES ('v_cash', $1, '2025-01-31', '2025-02-28', 'USD', 0, 'fail')`,
+      [ACCOUNT_A.id],
+    );
+
+    const real = runCommand(env, [
+      "reattribute-accounts",
+      "--adapter",
+      adapterPath,
+      "--remove-duplicates",
+    ]);
+    assert.match(
+      real,
+      /^verdicts deleted for periods that no longer exist: cash \d+ positions \d+$/m,
+    );
+
+    const surviving = await all(
+      client,
+      "SELECT id FROM position_reconciliations WHERE id = ANY($1::text[]) ORDER BY id",
+      [verdicts.map(([id]) => id)],
+    );
+    assert.deepEqual(
+      surviving.map((row) => row.id),
+      ["v_keep_fke"],
+      "only the periods bounded by a snapshot that actually left are deleted",
+    );
+    assert.equal(
+      await count(client, "reconciliations", "WHERE id = $1", ["v_cash"]),
+      0,
+      "the balance left A, so the period it bounded is gone too",
+    );
+
+    // The command ends with a whole-archive pass, so the archive is judged
+    // as a whole rather than only where this run reached.
+    assert.match(real, /^whole-archive gate pass positions: checked=\d+/m);
+  },
+);
+
+test("learn-account-aliases refuses the destructive flag rather than ignoring it", () => {
+  assert.throws(
+    () =>
+      execFileSync(
+        process.execPath,
+        [runScript, "learn-account-aliases", "--adapter", "x", "--remove-duplicates"],
+        { encoding: "utf8", stdio: "pipe" },
+      ),
+    /--remove-duplicates belongs to reattribute-accounts/,
+  );
+});
