@@ -260,7 +260,9 @@ function scopedInventoryQuery(
     );
 }
 
-function projectInventoryRow(row: Doc<"sourceInventory">) {
+/** Exported so P2-70k's review queue can reuse the same row shape for the
+ * inventory-backed classes (skipped files, duplicate group members). */
+export function projectInventoryRow(row: Doc<"sourceInventory">) {
   return {
     inventoryId: row._id,
     sourceAccountId: row.sourceAccountId,

@@ -91,6 +91,7 @@ describe("MCP space routing", () => {
     ["get_document", { documentId: "document" }],
     ["list_sources", {}],
     ["list_inventory", { sourceAccountId: "account" }],
+    ["list_review_queue", { sourceAccountId: "account" }],
     ["search_thoughts", { query: "decision" }],
     ["recall_context", { query: "What did we decide?" }],
     ["browse_recent", { type: "decision", topic: "home" }],
@@ -137,6 +138,34 @@ describe("MCP space routing", () => {
     expect(mocks.query).toHaveBeenCalledWith(expect.anything(), {
       sourceAccountId: "account-1",
       folderPath: "reports",
+      limit: 5,
+      cursor: "opaque-cursor",
+    });
+  });
+
+  test("forwards the review queue class and the source account id unchanged", async () => {
+    mocks.query.mockResolvedValue({
+      rows: [],
+      cursor: undefined,
+      isDone: true,
+      counts: {
+        skippedByType: { total: 0, byExclusionReason: {}, truncated: false },
+        fieldDropped: { total: 0, byCode: {}, truncated: false },
+        cardGateFailed: { total: 0, byRecordKind: {}, truncated: false },
+        duplicateGroup: { total: 0, truncated: false },
+        queueStatus: [],
+      },
+    });
+    const result = await call("list_review_queue", {
+      sourceAccountId: "account-1",
+      class: "field_dropped",
+      limit: 5,
+      cursor: "opaque-cursor",
+    });
+    expect(result.isError).not.toBe(true);
+    expect(mocks.query).toHaveBeenCalledWith(expect.anything(), {
+      sourceAccountId: "account-1",
+      class: "field_dropped",
       limit: 5,
       cursor: "opaque-cursor",
     });

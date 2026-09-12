@@ -5,6 +5,7 @@ export const MCP_TOOL_NAMES = {
   getDocument: "get_document",
   listSources: "list_sources",
   listInventory: "list_inventory",
+  listReviewQueue: "list_review_queue",
   listSpaces: "list_spaces",
   searchFacts: "search_facts",
   rememberFact: "remember_fact",

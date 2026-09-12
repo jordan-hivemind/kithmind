@@ -122,6 +122,33 @@ export const eventVersionFields = {
   userId: v.id("users"),
 };
 
+/**
+ * P2-70k, section 7 of docs/plans/2026-09-12-document-cards.md. The review
+ * queue counts and, when one is named, pages one class of review item.
+ * `skipped_by_type` and `duplicate_group` are the inventory-backed classes;
+ * `field_dropped` and `card_gate_failed` are the two `cardFieldDrops.kind`
+ * values; `queue_status` is the P2-70f extraction queue state, which has no
+ * per-file rows to page and always returns its full (small, one-per-kind)
+ * summary.
+ */
+export const reviewQueueClassValidator = v.union(
+  v.literal("skipped_by_type"),
+  v.literal("field_dropped"),
+  v.literal("card_gate_failed"),
+  v.literal("duplicate_group"),
+  v.literal("queue_status"),
+);
+
+export type ReviewQueueClass = Infer<typeof reviewQueueClassValidator>;
+
+export const reviewQueueListArgs = {
+  spaceIds: v.optional(v.array(v.id("spaces"))),
+  sourceAccountId: v.id("sourceAccounts"),
+  class: v.optional(reviewQueueClassValidator),
+  cursor: v.optional(v.string()),
+  limit: v.optional(v.number()),
+};
+
 export const observationFields = {
   spaceId: v.id("spaces"),
   sourceAccountId: v.id("sourceAccounts"),
