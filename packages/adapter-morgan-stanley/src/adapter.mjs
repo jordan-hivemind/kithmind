@@ -787,7 +787,16 @@ function assertPdfBytes(bytes, docId) {
 
 async function acquireDocument(selection) {
   const { docId, keyAccount, periodStart, periodEnd } = decodeDocumentExternalId(selection.externalId);
-  const bytes = await selection.session.fetchBytes(`/documents/${docId}::${keyAccount}`);
+  // F1-62. The same transient 400 "Service Error" fetchDocumentsPages
+  // already retries (discover()'s own comment: "the documents service
+  // answers a transient 400 to a noticeable share of concurrent calls from
+  // one session") lands on the per-document download too, and `--concurrency`
+  // makes several of these calls concurrent by design -- so retry it here the
+  // same way, rather than counting a transient service hiccup as a failed
+  // document pull against the operator loop's consecutive-failure breaker.
+  const bytes = await fetchWithServiceErrorRetry(() =>
+    selection.session.fetchBytes(`/documents/${docId}::${keyAccount}`),
+  );
   assertPdfBytes(bytes, docId);
   const retained = retainPayload(DOCUMENT_RETENTION, bytes, selection.kind);
   return {

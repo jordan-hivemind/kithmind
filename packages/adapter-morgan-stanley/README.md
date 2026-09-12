@@ -564,7 +564,11 @@ Also returned by `capabilities().quirks`.
     `documentId`, no separate lookup) returns the PDF bytes directly. No
     environment variable names this path any more; it is hardcoded in
     `src/bridge.mjs`'s `resolveEndpoint` alongside the accounts and
-    documents-list paths.
+    documents-list paths. F1-62: `acquireDocument` retries the same
+    transient 400 "Service Error" the documents listing already retries (see
+    "TimeFrame and the current year" above) -- the finance-archive operator
+    loop's `--concurrency` flag issues several of these downloads at once,
+    which is exactly the condition that error shows up under.
 - **The documents tier needs a bearer, captured page-side on one extra
   click, plus a short wait after reload.** The documents endpoints require an
   `Authorization` header in addition to the XSRF and footprint headers.

@@ -16,6 +16,8 @@ import {
   startKeepAlive,
   waitForSignIn,
   closeSession,
+  sharedOnce,
+  createSharedGate,
 } from "../src/bridge.mjs";
 
 // A fake cdp for the resume tests below: `Runtime.evaluate` is answered by
@@ -388,4 +390,65 @@ test("waitForSignIn gives up and returns false if the tab never returns to the a
   } finally {
     globalThis.fetch = original;
   }
+});
+
+// F1-62. `--concurrency` runs several fetchText/fetchBytes calls at once
+// against one session; `sharedOnce` is what keeps a session pause (a lost
+// sign-in, a bearer refresh) from being driven more than once at a time when
+// several concurrent callers hit it together. These tests exercise that gate
+// directly -- no CDP, no WebSocket, no real session -- the same way the tests
+// above exercise waitForSignIn/refreshBearer/startKeepAlive directly.
+
+test("sharedOnce pauses every concurrent stream on the same wait and resolves them all together", async () => {
+  const gate = createSharedGate();
+  let starts = 0;
+  let releaseStart;
+  const started = new Promise((resolve) => { releaseStart = resolve; });
+  function start() {
+    starts += 1;
+    return new Promise((resolve) => {
+      releaseStart();
+      setTimeout(() => resolve("resumed"), 20);
+    });
+  }
+
+  // Three "streams" all hit the pause at once, before it resolves.
+  const callers = [sharedOnce(gate, start), sharedOnce(gate, start), sharedOnce(gate, start)];
+  await started;
+  // A fourth stream joins a little later, still before the first wait settles.
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  callers.push(sharedOnce(gate, start));
+
+  const results = await Promise.all(callers);
+  assert.equal(starts, 1, "only the first caller actually starts the wait");
+  assert.deepEqual(results, ["resumed", "resumed", "resumed", "resumed"], "every caller resolves to the same outcome");
+});
+
+test("sharedOnce clears its gate once the wait settles, so a later pause gets its own fresh wait", async () => {
+  const gate = createSharedGate();
+  let starts = 0;
+  const start = () => {
+    starts += 1;
+    return Promise.resolve("resumed");
+  };
+
+  await sharedOnce(gate, start);
+  assert.equal(gate.pending, null, "the gate is empty again once the wait settles");
+  await sharedOnce(gate, start);
+  assert.equal(starts, 2, "a later, unrelated pause starts its own wait rather than replaying the first one's result");
+});
+
+test("sharedOnce clears its gate even when the wait itself fails, so a failed resume never wedges later streams", async () => {
+  const gate = createSharedGate();
+  const failingStart = () => Promise.reject(new Error("sign-in wait failed"));
+
+  await assert.rejects(() => sharedOnce(gate, failingStart), /sign-in wait failed/);
+  assert.equal(gate.pending, null, "a rejected wait still clears the gate");
+
+  let secondStarted = false;
+  await sharedOnce(gate, () => {
+    secondStarted = true;
+    return Promise.resolve("resumed");
+  });
+  assert.equal(secondStarted, true, "a later stream is not stuck behind the earlier failure");
 });
