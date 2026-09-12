@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -896,6 +896,117 @@ test(
     assert.ok(
       (await count(client, "transactions", "WHERE account_id = $1", [brokerage.id])) > 0,
       "activity rows landed on the resolved account",
+    );
+  },
+);
+
+test(
+  "F1-68: prints a start-of-run stderr line per document kind (with a masked sub-type breakdown) and a periodic pull-progress line",
+  { skip },
+  async (t) => {
+    const { schema } = await seededSchema(t, { seedAccount: false });
+
+    const rawDir = mkdtempSync(join(tmpdir(), "kith-finance-run-preview-raw-"));
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+
+    const { fixturesDir, sessionModulePath } = writeAdapterFixtures(t);
+    // A fake discover() standing in for a real institution's paginated
+    // listing: 120 items (enough to cross the every-100 progress threshold),
+    // reusing the fixture's own two real pdf_statement externalIds
+    // (doc-stmt-2025-q1/doc-stmt-2025-q2, fixtures.ts's DOCUMENTS) so
+    // acquire()/parse() below is the real synthetic adapter's own, unchanged
+    // -- only discover() is overridden, to prove the preview line against a
+    // listing shape no real institution would send at this volume without
+    // this test needing 120 distinct document fixtures of its own.
+    const TOTAL_DOCUMENTS = 120;
+    const manyDocumentsAdapterPath = join(fixturesDir, "adapter-many-documents.mjs");
+    writeFileSync(
+      manyDocumentsAdapterPath,
+      `import { syntheticAdapter, exhaustiveListing } from ${JSON.stringify(distIndexUrl)};\n` +
+        `const TOTAL = ${TOTAL_DOCUMENTS};\n` +
+        `const manyDocumentsAdapter = {\n` +
+        `  ...syntheticAdapter,\n` +
+        `  async discover(session) {\n` +
+        `    const real = await syntheticAdapter.discover(session);\n` +
+        `    const items = Array.from({ length: TOTAL }, (_, i) => {\n` +
+        `      const even = i % 2 === 0;\n` +
+        `      return {\n` +
+        `        externalId: even ? "doc-stmt-2025-q1" : "doc-stmt-2025-q2",\n` +
+        `        kind: "pdf_statement",\n` +
+        `        periodStart: "2025-02-01",\n` +
+        `        periodEnd: "2025-02-28",\n` +
+        `        label: even ? "February 2025 statement" : "March 2025 statement",\n` +
+        `        subType: even ? "Monthly Statement" : "Quarterly Statement",\n` +
+        `      };\n` +
+        `    });\n` +
+        `    return {\n` +
+        `      ...real,\n` +
+        `      documents: exhaustiveListing(items, items.length),\n` +
+        `      documentListingTotalsByKind: { pdf_statement: TOTAL },\n` +
+        `    };\n` +
+        `  },\n` +
+        `};\n` +
+        `export default manyDocumentsAdapter;\n`,
+    );
+
+    const selectionPath = writeSelection(fixturesDir, [
+      {
+        expand: "discovered",
+        kinds: ["pdf_statement"],
+        docType: "statement",
+        requireExhaustive: true,
+      },
+    ]);
+
+    const result = spawnSync(
+      process.execPath,
+      [
+        runScript,
+        "--adapter",
+        manyDocumentsAdapterPath,
+        "--session",
+        sessionModulePath,
+        "--selection",
+        selectionPath,
+        "--now",
+        "2025-05-01T00:00:00.000Z",
+      ],
+      {
+        env: {
+          ...process.env,
+          FINANCE_ARCHIVE_DATABASE_URL: url,
+          FINANCE_ARCHIVE_SCHEMA: schema,
+          FINANCE_ARCHIVE_RAW_TREE_ROOT: rawDir,
+          FINANCE_ARCHIVE_SPACE_ID: SPACE_ID,
+        },
+        encoding: "utf8",
+      },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    const stderr = result.stderr;
+
+    // Start-of-run preview, one line per document kind, before any pull:
+    // the provider's own listing total, what discover() enumerated, how
+    // many this run expects to already have on file (a fresh schema: none),
+    // and how many the selection actually asks for.
+    assert.match(
+      stderr,
+      /^document kind pdf_statement: listing total=120 discovered=120 already recorded=0 selected=120$/m,
+    );
+    // A masked breakdown of the selected items by the listing's own
+    // sub-type label -- label text only, split 60/60 across the two
+    // synthetic sub-types.
+    assert.match(
+      stderr,
+      /^ {2}pdf_statement selected by type: Monthly Statement=60, Quarterly Statement=60$/m,
+    );
+    // Progress, every 100 documents pulled.
+    assert.match(stderr, /^pulled 100 of 120$/m);
+    // The preview prints before the loop's first progress line.
+    assert.ok(
+      stderr.indexOf("document kind pdf_statement:") <
+        stderr.indexOf("pulled 100 of 120"),
+      "the start-of-run preview prints before any pull-progress line",
     );
   },
 );
