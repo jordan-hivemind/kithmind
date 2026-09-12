@@ -129,13 +129,15 @@ export const eventVersionFields = {
  * `field_dropped` and `card_gate_failed` are the two `cardFieldDrops.kind`
  * values; `queue_status` is the P2-70f extraction queue state, which has no
  * per-file rows to page and always returns its full (small, one-per-kind)
- * summary.
+ * summary. `entity_binding_needed` is P2-70l's own class: an accepted card
+ * field whose literal name matched zero, or two or more, entities.
  */
 export const reviewQueueClassValidator = v.union(
   v.literal("skipped_by_type"),
   v.literal("field_dropped"),
   v.literal("card_gate_failed"),
   v.literal("duplicate_group"),
+  v.literal("entity_binding_needed"),
   v.literal("queue_status"),
 );
 
@@ -169,5 +171,14 @@ export const observationFields = {
   schemaVersion: v.number(),
   value: observationValueValidator,
   valueEvidence: v.array(v.id("evidenceSpans")),
+  /**
+   * Section 4.4, P2-70l. The entity this field's literal name resolved to.
+   * It is stored beside `value` and `valueEvidence`, never in place of them:
+   * the literal name and the span that proves it are the answer to "which
+   * companies over a year", and a binding is an annotation on that answer,
+   * not a replacement for it. Absent means unbound, which is the normal
+   * state for a name no entity carries yet.
+   */
+  boundEntityId: v.optional(v.id("entities")),
   userId: v.id("users"),
 };

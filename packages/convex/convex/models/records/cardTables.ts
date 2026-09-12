@@ -88,7 +88,72 @@ export const cardExtractionAttemptFields = {
   createdAt: v.number(),
 };
 
+/**
+ * Section 4.4 and section 7, P2-70l. One row per accepted card field that
+ * names an entity and could not be bound automatically: zero candidates or
+ * two or more. It carries the literal name the document actually used, the
+ * candidate count and the card reference, which is everything a person needs
+ * to decide, and no other value from the document.
+ *
+ * The same row becomes the audit note when the decision is made, so a
+ * binding and the actor that made it are one record rather than two that can
+ * disagree.
+ */
+export const cardEntityBindingFields = {
+  spaceId: v.id("spaces"),
+  sourceAccountId: v.id("sourceAccounts"),
+  sourceItemId: v.id("sourceItems"),
+  processingGenerationId: v.id("processingGenerations"),
+  eventId: v.id("events"),
+  observationId: v.id("observations"),
+  recordKind: recordEventTypeValidator,
+  /** The observation key: `<field>` or `<field>:<ordinal>`. */
+  fieldKey: v.string(),
+  observationType: v.string(),
+  /** The name as the document wrote it, already stored on the observation. */
+  literalName: v.string(),
+  normalizedName: v.string(),
+  /** How many entities the normalized name matched. Never exactly one. */
+  candidateCount: v.number(),
+  status: v.union(v.literal("pending"), v.literal("resolved")),
+  createdAt: v.number(),
+  /** The audit note. Written once, when the binding is actually made. */
+  resolution: v.optional(
+    v.object({
+      action: v.union(
+        /** A person bound an existing entity. */
+        v.literal("bound"),
+        /** A person minted an entity from the literal name. */
+        v.literal("created"),
+        /** An alias made the name resolve; the rebind job bound it. */
+        v.literal("rebound"),
+      ),
+      entityId: v.id("entities"),
+      /**
+       * Set only when this field is its card kind's event entity (section
+       * 4.5) and the event was repointed. The previous value is what a
+       * rollback restores, the same rule `docTypePatch` follows.
+       */
+      previousEventEntityId: v.optional(v.id("entities")),
+      /** Absent for the automatic rebind job, which is not a person. */
+      actorUserId: v.optional(v.id("users")),
+      decidedAt: v.number(),
+      note: v.optional(v.string()),
+    }),
+  ),
+};
+
 export const cardTables = {
+  cardEntityBindings: defineTable(cardEntityBindingFields)
+    .index("by_observationId", ["observationId"])
+    // The rebind job pages one space's pending rows on the (spaceId, status)
+    // prefix; the normalized name is last so one name can also be looked up
+    // directly.
+    .index("by_space_status_name", ["spaceId", "status", "normalizedName"])
+    // The review queue counts and pages one source account's pending rows.
+    .index("by_space_account_status", ["spaceId", "sourceAccountId", "status"])
+    // Re-extraction drops the previous generation's still-pending rows.
+    .index("by_sourceItemId", ["sourceItemId"]),
   cardFieldDrops: defineTable(cardFieldDropFields)
     .index("by_spaceId", ["spaceId"])
     .index("by_sourceItemId", ["sourceItemId"])

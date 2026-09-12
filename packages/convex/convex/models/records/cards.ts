@@ -17,6 +17,7 @@ import {
   type CardGateFailureCode,
   type CardGateReport,
 } from "./cardGate";
+import { bindCardObservations } from "./cardEntityBinding";
 import { CARD_PRICE_TABLE_VERSION } from "./cardRunner";
 import {
   cardEventKey,
@@ -111,6 +112,10 @@ export type PublishCardResult = {
   gateFailures: Array<{ key: string; code: CardGateFailureCode }>;
   /** True when a required field failed, so nothing was staged at this tier. */
   requiredFieldFailed: boolean;
+  /** P2-70l: accepted name fields bound to exactly one entity. */
+  boundEntityCount?: number;
+  /** P2-70l: accepted name fields left literal-only, each with a review item. */
+  entityBindingReviewCount?: number;
 };
 
 function boundedPart(value: string, label: string): string {
@@ -584,6 +589,20 @@ export async function publishDocumentCard(
     docTypePatch,
   });
 
+  // Section 4.4, P2-70l. Binding runs after the card is accepted and active,
+  // never as part of extraction: it cannot change whether a card published,
+  // it creates no entity, and a name it cannot resolve leaves the field
+  // literal-only with a review item.
+  const binding = await bindCardObservations(ctx, {
+    spaceId: input.spaceId,
+    sourceAccountId: account._id,
+    sourceItemId: item._id,
+    processingGenerationId: generationId,
+    recordKind: input.recordKind,
+    observationIds: staged.observationIds,
+    now: input.now,
+  });
+
   await recordAttempt(ctx, {
     spaceId: input.spaceId,
     sourceAccountId: account._id,
@@ -619,6 +638,8 @@ export async function publishDocumentCard(
     droppedFields,
     gateFailures: gate.failed,
     requiredFieldFailed: false,
+    boundEntityCount: binding.bound,
+    entityBindingReviewCount: binding.review,
   };
 }
 

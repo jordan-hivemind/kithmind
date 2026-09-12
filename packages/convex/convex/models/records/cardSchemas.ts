@@ -83,16 +83,49 @@ type CardKindSchema = {
    * own.
    */
   entityKinds?: readonly Doc<"entities">["kind"][];
+  /**
+   * Section 4.5, P2-70l. The field whose literal name names the event's own
+   * entity. When that name binds to exactly one entity of an allowed kind,
+   * the card's event moves from the source account's subject placeholder to
+   * that entity, which is what makes an entity-filtered `list_events` return
+   * the card. Declared only for the kinds whose event entity is a name the
+   * document actually writes; the rest keep the subject entity.
+   */
+  eventEntityField?: string;
   fields: Readonly<Record<string, CardFieldSchema>>;
 };
 
 const NAME_OR_ENTITY = ["entity", "text"] as const;
 
 /**
- * Section 4.4: extraction always stores the literal name it read. Binding it
- * to an entity is P2-70l, so every name field accepts `text` today and
- * `entity` once binding exists.
+ * Section 4.4: extraction always stores the literal name it read, and the
+ * gate only ever proves a literal name against its span. P2-70l binds that
+ * name to an entity afterwards, recording the entity id in the observation's
+ * `boundEntityId` beside the literal value rather than replacing the value,
+ * so the evidence of what the document said survives the binding.
  */
+export function isEntityCapableField(field: CardFieldSchema): boolean {
+  return (field.valueTypes as readonly string[]).includes("entity");
+}
+
+/**
+ * Section 4.5. The observation type whose bound entity becomes the card
+ * event's entity, or `undefined` when this kind's event belongs to the
+ * source account's subject entity.
+ */
+export function cardEventEntityField(
+  kind: CardRecordKind,
+): string | undefined {
+  return CARD_SCHEMAS[kind].eventEntityField;
+}
+
+export function cardEntityKinds(
+  kind: CardRecordKind,
+): readonly Doc<"entities">["kind"][] | undefined {
+  return CARD_SCHEMAS[kind].entityKinds;
+}
+
+/** Section 4.2: every card kind, its fields and their value constraints. */
 export const CARD_SCHEMAS: Readonly<Record<CardRecordKind, CardKindSchema>> = {
   document_card: {
     fields: {
@@ -112,15 +145,15 @@ export const CARD_SCHEMAS: Readonly<Record<CardRecordKind, CardKindSchema>> = {
     },
   },
   // Section 4.5: a SAFE or convertible note's event entity is the investor,
-  // kind person or organization. Entity binding is P2-70l; until then, every
-  // caller of `publishDocumentCard` omits `entityId` for this kind, so the
-  // event attaches to the source account's `subjectEntityId` instead, and
-  // `investor_entity` stores the investor's literal name as evidenced text,
-  // not as the event's bound entity. `entityKinds` below still constrains
-  // whichever entity the event does attach to (the subject placeholder
-  // today, the resolved investor after P2-70l).
+  // kind person or organization. `investor_entity` always stores the
+  // investor's literal name as evidenced text; when P2-70l resolves that
+  // name to exactly one person or organization, the binding step repoints
+  // the event from the source account's `subjectEntityId` placeholder to
+  // that investor. `entityKinds` constrains whichever entity the event
+  // attaches to, placeholder or investor.
   safe_note_card: {
     entityKinds: ["person", "organization"],
+    eventEntityField: "investor_entity",
     fields: {
       company: {
         valueTypes: NAME_OR_ENTITY,

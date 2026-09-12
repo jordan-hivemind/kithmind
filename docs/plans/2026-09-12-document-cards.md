@@ -268,18 +268,31 @@ item, not a raised limit.
 Extraction always stores the literal name it read, bound to its span. Binding
 that name to an entity is a separate, deterministic step.
 
-| Match count after normalization | Result                                                                 |
-| ------------------------------- | ---------------------------------------------------------------------- |
-| Exactly one                     | Store an `entity` value. The literal name stays as the evidence quote. |
-| Zero                            | Store a `text` value. Raise an `entity_unresolved` review item.        |
-| Two or more                     | Store a `text` value. Raise an `entity_ambiguous` review item.         |
+| Match count after normalization | Result                                                                       |
+| ------------------------------- | ---------------------------------------------------------------------------- |
+| Exactly one                     | Set `observations.boundEntityId`. The `text` value and its span are unchanged. |
+| Zero                            | Leave the field literal-only. Raise an `entity_binding_needed` review item.   |
+| Two or more                     | Leave the field literal-only. Raise an `entity_binding_needed` review item.   |
 
-Normalization casefolds, strips punctuation and strips a versioned list of
-legal suffixes before comparing against `entities.normalizedName` and
-`normalizedAliases` through the existing `by_spaceId_kind_normalizedName`
-index. Extraction never creates an entity and never merges one. The owner
-resolving a review item creates the entity or adds the alias, which is the
-existing explicit merge rule.
+#### Three points settled on implementation, 2026-09-12 during P2-70l
+
+| Point                 | Implemented                                                                                                                                                                                                                                                                                                                                                    |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Where the id is kept  | Beside the literal value, in `observations.boundEntityId`, not as an `entity` value in its place. Replacing the value would delete the literal name from the record and leave only the span quote, and the gate proves a value against its span, so an `entity` value could never pass rule 6. The gate keeps refusing `entity` values with `entity_value_unsupported`. |
+| One review kind       | `entity_binding_needed`, with the candidate count on the row, rather than `entity_unresolved` and `entity_ambiguous`. Zero and two-or-more take the same action from the same surface, and the count already says which happened.                                                                                                                              |
+| Normalization         | `normalizeEntityName`, the same function that wrote `entities.normalizedName`, so a lookup can never disagree with what was stored. It casefolds and collapses separators; it strips no punctuation and no legal suffix. Adding either would mean rewriting every stored `normalizedName` in the same change, so it is deferred to its own task.                 |
+
+Matching compares against `entities.normalizedName` and
+`normalizedAliases` over one bounded scan of the space's entities, because
+Convex indexes an array field by its whole value and an alias is therefore
+not reachable through `by_spaceId_kind_normalizedName`. A space past the
+scan bound never auto-binds, so the failure is a review item rather than a
+wrong binding. Extraction never creates an entity and never merges one. The
+owner resolving a review item creates the entity (`createEntityFromCard`) or
+binds an existing one and gains the alias (`bindCardEntity`), which is the
+existing explicit merge rule. An entity that gains an alias makes some
+pending names resolvable, and the paged `rebindPendingCardEntities` job binds
+every pending row that then matches exactly one entity.
 
 This matters for correctness of the date and entity questions: because the
 literal name is always stored with evidence, "which companies over a year"
@@ -301,6 +314,16 @@ enabled for that source. A source with none does not publish generic cards,
 and its documents remain retained text with an `extraction_pending` inventory
 reason. This is deliberate: guessing the subject from the uploader is exactly
 the inference the architecture forbids.
+
+A kind whose event entity is a name the document itself writes declares that
+field as its `eventEntityField`; `safe_note_card` declares `investor_entity`.
+The card publishes on the subject entity, and when P2-70l binds that field's
+literal name to exactly one entity of an allowed kind the binding step moves
+the event version and its observations to that entity, which is what makes an
+entity-filtered `list_events` return the card. The previous entity id is
+recorded on the binding row, so a rollback restores it exactly as
+`docTypePatch` does for `documents.docType`. Every other kind keeps the
+subject entity, and binding only annotates the observation.
 
 ### 4.6 Versioning on re-extraction
 
@@ -470,8 +493,7 @@ card is never re-extracted merely because the process died.
 | `card_gate_failed`  | A required field failed at the top automatic step           | Correct the field, or accept the card without it        |
 | `field_dropped`     | An optional field failed the gate                           | Correct or accept                                       |
 | `duplicate_group`   | Two or more files share content                             | Choose the canonical member, or accept the group        |
-| `entity_unresolved` | A name matched no entity                                    | Create the entity or add an alias                       |
-| `entity_ambiguous`  | A name matched two or more entities                         | Bind explicitly                                         |
+| `entity_binding_needed` | A name matched zero, or two or more, entities           | `createEntityFromCard`, or `bindCardEntity` explicitly  |
 
 Review items reuse the existing review-candidate rules. They are inert, they
 are excluded from active records and exact queries, they block the relevant
@@ -762,6 +784,9 @@ npx convex run models/records/cards:setSourceSubjectEntity '{"sourceAccountId":"
 npx convex run models/records/cards:startExtractionBackfill '{"spaceId":"<SPACE_ID>","sourceAccountId":"<SOURCE_ACCOUNT_ID>","dailyBudgetUsd":10,"weeklyCapUsd":50,"dryRun":true}'
 npx convex run models/records/cards:auditCardEvidence '{"spaceId":"<SPACE_ID>","cursor":null,"batchSize":64}'
 npx convex run models/embeddings/migrations:setChunkEmbeddingOptIn '{"spaceId":"<SPACE_ID>","documentKeys":["<DOCUMENT_KEY>"],"embedFullChunks":true}'
+npx convex run models/records/cardEntityBinding:bindCardEntity '{"observationId":"<OBSERVATION_ID>","entityId":"<ENTITY_ID>","actorUserId":"<USER_ID>","note":"<WHY>"}'
+npx convex run models/records/cardEntityBinding:createEntityFromCard '{"observationId":"<OBSERVATION_ID>","kind":"organization","actorUserId":"<USER_ID>","note":"<WHY>"}'
+npx convex run models/records/cardEntityBinding:rebindPendingCardEntities '{"spaceId":"<SPACE_ID>","cursor":null,"batchSize":64}'
 npx convex run models/embeddings/migrations:setSpaceTargetPolicy '{"spaceId":"<SPACE_ID>","policy":"cards_and_opted_in_chunks","expectedPolicy":"all_chunks"}'
 npx convex run models/embeddings/migrations:runTargetRetirePage '{"jobId":"<JOB_ID>","cursor":null,"batchSize":128}'
 ```

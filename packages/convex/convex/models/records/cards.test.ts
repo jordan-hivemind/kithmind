@@ -14,6 +14,9 @@ import {
 
 import { sha256Hex } from "../ingestion/hash";
 import { composeCardTargetInput } from "../embeddings/cardTargets";
+import { internal } from "../../_generated/api";
+import { normalizeLiteralName } from "./cardEntityBinding";
+import { listReviewQueue } from "./reviewQueue";
 import { publishDocumentCard, type CardFieldInput } from "./cards";
 import {
   insertCardEmbedding,
@@ -1344,5 +1347,392 @@ describe("card embedding targets", () => {
         composeCardTargetInput(ctx, seeded.spaceId, seeded.sourceItemId),
       ),
     ).toBeNull();
+  });
+});
+
+// --- P2-70l: entity resolution and binding review ---------------------------
+//
+// Section 4.4 of docs/plans/2026-09-12-document-cards.md. The generic card's
+// `card_party` is a declared entity-capable field, so the fixture above is
+// already the shape this needs: two literal party names, each carrying its
+// own evidence span.
+
+type Seeded = Awaited<ReturnType<typeof seedDocument>>;
+
+async function addEntity(
+  seeded: Seeded,
+  input: {
+    key: string;
+    kind: "person" | "organization";
+    canonicalName: string;
+    aliases?: string[];
+  },
+): Promise<Id<"entities">> {
+  return await seeded.t.run((ctx) =>
+    ctx.db.insert("entities", {
+      userId: seeded.userId,
+      spaceId: seeded.spaceId,
+      key: input.key,
+      kind: input.kind,
+      canonicalName: input.canonicalName,
+      normalizedName: normalizeLiteralName(input.canonicalName),
+      aliases: input.aliases ?? [],
+      normalizedAliases: (input.aliases ?? []).map(normalizeLiteralName),
+    }),
+  );
+}
+
+async function publishGenericCard(seeded: Seeded, now: number, tier?: "tier1") {
+  return await seeded.t.run((ctx) =>
+    publishDocumentCard(ctx, {
+      spaceId: seeded.spaceId,
+      sourceItemId: seeded.sourceItemId,
+      userId: seeded.userId,
+      recordKind: "document_card",
+      now,
+      fingerprint: tier ? { ...FINGERPRINT, tier } : FINGERPRINT,
+      anchorEvidenceSpanIds: [seeded.evidence[TITLE]!],
+      fields: genericFields(seeded.evidence),
+    }),
+  );
+}
+
+function observationsOf(seeded: Seeded, eventId: Id<"events">) {
+  return seeded.t.run((ctx) =>
+    ctx.db
+      .query("observations")
+      .withIndex("by_eventId", (q) => q.eq("eventId", eventId))
+      .collect(),
+  );
+}
+
+function pendingBindings(seeded: Seeded) {
+  return seeded.t.run((ctx) =>
+    ctx.db
+      .query("cardEntityBindings")
+      .withIndex("by_space_account_status", (q) =>
+        q
+          .eq("spaceId", seeded.spaceId)
+          .eq("sourceAccountId", seeded.sourceAccountId)
+          .eq("status", "pending"),
+      )
+      .collect(),
+  );
+}
+
+function entityCount(seeded: Seeded) {
+  return seeded.t.run(async (ctx) =>
+    (
+      await ctx.db
+        .query("entities")
+        .withIndex("by_spaceId", (q) => q.eq("spaceId", seeded.spaceId))
+        .collect()
+    ).length,
+  );
+}
+
+describe("card entity binding", () => {
+  test("exactly one match binds beside the literal name and its evidence", async () => {
+    const seeded = await seedDocument({ withSubjectEntity: true });
+    const northwind = await addEntity(seeded, {
+      key: "organization:northwind-supply",
+      kind: "organization",
+      canonicalName: PARTY_ONE,
+    });
+    const before = await entityCount(seeded);
+
+    const published = await publishGenericCard(seeded, 1_000);
+    expect(published.published).toBe(true);
+    expect(published.boundEntityCount).toBe(1);
+    expect(published.entityBindingReviewCount).toBe(1);
+
+    // Extraction and binding together create no entity, ever.
+    expect(await entityCount(seeded)).toBe(before);
+
+    const observations = await observationsOf(seeded, published.eventId!);
+    const bound = observations.find(
+      (row) => row.observationKey === "card_party:0",
+    )!;
+    expect(bound.boundEntityId).toBe(northwind);
+    // The literal name and the span that proves it are untouched.
+    expect(bound.value).toEqual({ type: "text", value: PARTY_ONE });
+    expect(bound.valueEvidence.length).toBeGreaterThan(0);
+
+    const unbound = observations.find(
+      (row) => row.observationKey === "card_party:1",
+    )!;
+    expect(unbound.boundEntityId).toBeUndefined();
+    expect(unbound.value).toEqual({ type: "text", value: PARTY_TWO });
+  });
+
+  test("zero matches raise one review item carrying only the literal name", async () => {
+    const seeded = await seedDocument({ withSubjectEntity: true });
+    const published = await publishGenericCard(seeded, 1_000);
+    expect(published.boundEntityCount).toBe(0);
+    expect(published.entityBindingReviewCount).toBe(2);
+
+    const pending = await pendingBindings(seeded);
+    expect(pending.map((row) => row.literalName).sort()).toEqual(
+      [PARTY_ONE, PARTY_TWO].sort(),
+    );
+    expect(pending.every((row) => row.candidateCount === 0)).toBe(true);
+    expect(pending.every((row) => row.recordKind === "document_card")).toBe(
+      true,
+    );
+    // The card reference is the document, the event and the observation, and
+    // the row carries no other value the document happened to state.
+    expect(
+      pending.every((row) => row.sourceItemId === seeded.sourceItemId),
+    ).toBe(true);
+    const serialized = JSON.stringify(pending);
+    expect(serialized).not.toContain(SUMMARY);
+    expect(serialized).not.toContain(DATE);
+  });
+
+  test("two matches raise a review item and leave the field literal-only", async () => {
+    const seeded = await seedDocument({ withSubjectEntity: true });
+    await addEntity(seeded, {
+      key: "organization:northwind-supply",
+      kind: "organization",
+      canonicalName: PARTY_ONE,
+    });
+    await addEntity(seeded, {
+      key: "person:northwind-supply",
+      kind: "person",
+      canonicalName: PARTY_ONE,
+    });
+    const before = await entityCount(seeded);
+
+    const published = await publishGenericCard(seeded, 1_000);
+    expect(published.boundEntityCount).toBe(0);
+    expect(await entityCount(seeded)).toBe(before);
+
+    const pending = await pendingBindings(seeded);
+    const ambiguous = pending.find((row) => row.literalName === PARTY_ONE)!;
+    expect(ambiguous.candidateCount).toBe(2);
+
+    const observations = await observationsOf(seeded, published.eventId!);
+    expect(
+      observations.find((row) => row.observationKey === "card_party:0")!
+        .boundEntityId,
+    ).toBeUndefined();
+  });
+
+  test("bindCardEntity records the decision and the next card binds by itself", async () => {
+    const seeded = await seedDocument({ withSubjectEntity: true });
+    const first = await publishGenericCard(seeded, 1_000);
+    const holdings = await addEntity(seeded, {
+      key: "organization:northwind-holdings",
+      kind: "organization",
+      canonicalName: "Northwind Holdings",
+    });
+    const observationId = (await observationsOf(seeded, first.eventId!)).find(
+      (row) => row.observationKey === "card_party:0",
+    )!._id;
+
+    await seeded.t.mutation(
+      internal.models.records.cardEntityBinding.bindCardEntity,
+      {
+        observationId,
+        entityId: holdings,
+        actorUserId: seeded.userId,
+        note: "Trading name of the same supplier.",
+        now: 1_500,
+      },
+    );
+
+    const state = await seeded.t.run(async (ctx) => ({
+      observation: (await ctx.db.get(observationId))!,
+      entity: (await ctx.db.get(holdings))!,
+      row: (
+        await ctx.db
+          .query("cardEntityBindings")
+          .withIndex("by_observationId", (q) =>
+            q.eq("observationId", observationId),
+          )
+          .collect()
+      )[0]!,
+    }));
+    expect(state.observation.boundEntityId).toBe(holdings);
+    expect(state.row.status).toBe("resolved");
+    expect(state.row.resolution).toMatchObject({
+      action: "bound",
+      entityId: holdings,
+      actorUserId: seeded.userId,
+      decidedAt: 1_500,
+      note: "Trading name of the same supplier.",
+    });
+    // The alias is what makes the next card bind without a person.
+    expect(state.entity.normalizedAliases).toContain(
+      normalizeLiteralName(PARTY_ONE),
+    );
+
+    const second = await publishGenericCard(seeded, 2_000, "tier1");
+    expect(second.published).toBe(true);
+    expect(second.boundEntityCount).toBe(1);
+    const rebound = (await observationsOf(seeded, second.eventId!)).find(
+      (row) =>
+        row.observationKey === "card_party:0" &&
+        row.processingGenerationId === second.processingGenerationId,
+    )!;
+    expect(rebound.boundEntityId).toBe(holdings);
+  });
+
+  test("createEntityFromCard is the only way a card mints an entity", async () => {
+    const seeded = await seedDocument({ withSubjectEntity: true });
+    const published = await publishGenericCard(seeded, 1_000);
+    const before = await entityCount(seeded);
+    const observationId = (
+      await observationsOf(seeded, published.eventId!)
+    ).find((row) => row.observationKey === "card_party:1")!._id;
+
+    const created = await seeded.t.mutation(
+      internal.models.records.cardEntityBinding.createEntityFromCard,
+      {
+        observationId,
+        kind: "organization",
+        actorUserId: seeded.userId,
+        note: "New counterparty.",
+        now: 1_600,
+      },
+    );
+
+    expect(await entityCount(seeded)).toBe(before + 1);
+    const state = await seeded.t.run(async (ctx) => ({
+      observation: (await ctx.db.get(observationId))!,
+      entity: (await ctx.db.get(created.entityId))!,
+      row: (await ctx.db.get(created.bindingId))!,
+    }));
+    expect(state.entity.canonicalName).toBe(PARTY_TWO);
+    expect(state.entity.kind).toBe("organization");
+    expect(state.observation.boundEntityId).toBe(created.entityId);
+    expect(state.row.status).toBe("resolved");
+    expect(state.row.resolution).toMatchObject({
+      action: "created",
+      actorUserId: seeded.userId,
+    });
+  });
+
+  test("rebindPendingCardEntities binds a name an alias made resolvable", async () => {
+    const seeded = await seedDocument({ withSubjectEntity: true });
+    await publishGenericCard(seeded, 1_000);
+    expect(await pendingBindings(seeded)).toHaveLength(2);
+
+    const group = await addEntity(seeded, {
+      key: "organization:acme-research-group",
+      kind: "organization",
+      canonicalName: "Acme Research Group",
+      aliases: [PARTY_TWO],
+    });
+
+    const first = await seeded.t.mutation(
+      internal.models.records.cardEntityBinding.rebindPendingCardEntities,
+      { spaceId: seeded.spaceId, now: 1_700 },
+    );
+    expect(first).toMatchObject({ bound: 1, stillPending: 1, isDone: true });
+
+    const pending = await pendingBindings(seeded);
+    expect(pending).toHaveLength(1);
+    expect(pending[0]!.literalName).toBe(PARTY_ONE);
+
+    const resolved = await seeded.t.run(
+      async (ctx) =>
+        (
+          await ctx.db
+            .query("cardEntityBindings")
+            .withIndex("by_space_status_name", (q) =>
+              q.eq("spaceId", seeded.spaceId).eq("status", "resolved"),
+            )
+            .collect()
+        )[0]!,
+    );
+    expect(resolved.resolution).toMatchObject({
+      action: "rebound",
+      entityId: group,
+      decidedAt: 1_700,
+    });
+    expect(resolved.resolution?.actorUserId).toBeUndefined();
+
+    // Idempotent: a second run finds nothing new to do.
+    const second = await seeded.t.mutation(
+      internal.models.records.cardEntityBinding.rebindPendingCardEntities,
+      { spaceId: seeded.spaceId, now: 1_800 },
+    );
+    expect(second).toMatchObject({ bound: 0, stillPending: 1, isDone: true });
+  });
+
+  test("an entity from another space is never bound to this space's card", async () => {
+    const seeded = await seedDocument({ withSubjectEntity: true });
+    const published = await publishGenericCard(seeded, 1_000);
+    const observationId = (
+      await observationsOf(seeded, published.eventId!)
+    ).find((row) => row.observationKey === "card_party:0")!._id;
+    const stranger = await seeded.t.run(async (ctx) => {
+      const userId = await ctx.db.insert("users", { name: "Other owner" });
+      const spaceId = await ctx.db.insert("spaces", {
+        kind: "personal",
+        name: "Other space",
+        createdBy: userId,
+      });
+      return await ctx.db.insert("entities", {
+        userId,
+        spaceId,
+        key: "organization:northwind-supply",
+        kind: "organization",
+        canonicalName: PARTY_ONE,
+        normalizedName: normalizeLiteralName(PARTY_ONE),
+        aliases: [],
+        normalizedAliases: [],
+      });
+    });
+
+    await expect(
+      seeded.t.mutation(
+        internal.models.records.cardEntityBinding.bindCardEntity,
+        {
+          observationId,
+          entityId: stranger,
+          actorUserId: seeded.userId,
+          now: 1_500,
+        },
+      ),
+    ).rejects.toThrow(/another space/);
+
+    const observation = await seeded.t.run((ctx) => ctx.db.get(observationId));
+    expect(observation!.boundEntityId).toBeUndefined();
+  });
+
+  test("the review queue counts entity_binding_needed as its own class", async () => {
+    const seeded = await seedDocument({ withSubjectEntity: true });
+    await addEntity(seeded, {
+      key: "organization:northwind-supply-a",
+      kind: "organization",
+      canonicalName: PARTY_ONE,
+    });
+    await addEntity(seeded, {
+      key: "organization:northwind-supply-b",
+      kind: "organization",
+      canonicalName: "Northwind Supply Co.",
+      aliases: [PARTY_ONE],
+    });
+    await publishGenericCard(seeded, 1_000);
+
+    const queue = await seeded.t.run((ctx) =>
+      listReviewQueue(ctx, [seeded.spaceId], {
+        sourceAccountId: seeded.sourceAccountId,
+        class: "entity_binding_needed",
+      }),
+    );
+    expect(queue.counts.entityBindingNeeded).toEqual({
+      total: 2,
+      unresolved: 1,
+      ambiguous: 1,
+      truncated: false,
+    });
+    expect(queue.rows).toHaveLength(2);
+    const row = (
+      queue.rows as Array<{ literalName: string; candidateCount: number }>
+    ).find((entry) => entry.literalName === PARTY_ONE)!;
+    expect(row.candidateCount).toBe(2);
   });
 });

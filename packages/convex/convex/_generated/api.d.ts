@@ -102,6 +102,7 @@ import type * as models_provenance_representations from "../models/provenance/re
 import type * as models_provenance_tables from "../models/provenance/tables.js";
 import type * as models_provenance_validators from "../models/provenance/validators.js";
 import type * as models_recallBlend from "../models/recallBlend.js";
+import type * as models_records_cardEntityBinding from "../models/records/cardEntityBinding.js";
 import type * as models_records_cardGate from "../models/records/cardGate.js";
 import type * as models_records_cardLadder from "../models/records/cardLadder.js";
 import type * as models_records_cardQueue from "../models/records/cardQueue.js";
@@ -276,6 +277,7 @@ declare const fullApi: ApiFromModules<{
   "models/provenance/tables": typeof models_provenance_tables;
   "models/provenance/validators": typeof models_provenance_validators;
   "models/recallBlend": typeof models_recallBlend;
+  "models/records/cardEntityBinding": typeof models_records_cardEntityBinding;
   "models/records/cardGate": typeof models_records_cardGate;
   "models/records/cardLadder": typeof models_records_cardLadder;
   "models/records/cardQueue": typeof models_records_cardQueue;

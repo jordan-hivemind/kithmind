@@ -546,6 +546,12 @@ describe("listReviewQueue", () => {
       fieldDropped: { total: 0, byCode: {}, truncated: false },
       cardGateFailed: { total: 0, byRecordKind: {}, truncated: false },
       duplicateGroup: { total: 0, truncated: false },
+      entityBindingNeeded: {
+        total: 0,
+        unresolved: 0,
+        ambiguous: 0,
+        truncated: false,
+      },
       queueStatus: [],
     });
   });
