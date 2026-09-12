@@ -135,18 +135,25 @@ development-first verification, a complete staged generation, and a reviewed
 atomic activation. Exact and keyword search remain the fallback during provider
 or vector-generation unavailability.
 
-## Phase 1 bounds and maintenance
+## Index bounds and maintenance
 
-A staged generation supports a manifest of at most 256 eligible targets and
-2 MiB of estimated input/vector bytes. The thought scan also stops after 256
-rows, including history. Generation validation reads at most 256 vector rows.
-This paragraph previously said 128 for the first two bounds. The code has used
-256 since the pilot; the code is right and the stale number is corrected here.
-Raising these bounds is P2-6 work, specified in the
-[index capacity plan](./2026-09-12-index-capacity.md); its first
-implementation PR replaces this paragraph.
-These are conservative Phase 1 bounds, not a bulk ingestion capacity claim.
-An overflow cannot activate a partial generation. Narrative capture requires a
+There are two bounded paths, and they have different limits.
+
+| Path                                           | Bound                                                                                                       | Status                                                                                                                       |
+| ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| Whole-space manifest, staging and activation   | 256 eligible targets, 2 MiB of estimated input/vector bytes, 256 scanned thought rows, 256 read vector rows | Unchanged. It derives the whole space in one transaction, so its bound is a transaction bound.                               |
+| `embeddingTargets`, counters and paged builder | No constant below the 50,000-target design ceiling                                                          | Added by P2-6ab. Page sizes are 64 thought rows, 128 chunk rows and 128 target rows per transaction; the total is unbounded. |
+
+The paragraph this replaces stated only the first row and said the first P2-6
+implementation PR would raise it. P2-6ab raised the capacity of the durable
+path instead of the transaction bound of the legacy one, because a whole-space
+derive that scanned 50,000 rows would exceed the platform read limit rather
+than fail safely. The legacy bound is removed by the reader cutover
+(P2-6d), not by a larger constant. Both are specified in the
+[index capacity plan](./2026-09-12-index-capacity.md).
+
+The legacy bound is a conservative Phase 1 bound, not a bulk ingestion capacity
+claim. An overflow cannot activate a partial generation. Narrative capture requires a
 complete active thought index for admission and duplicate detection. A capture
 that would exceed the manifest bound rolls back with an explicit error. Source
 publication and legacy writes can continue while marking vector coverage
@@ -180,6 +187,18 @@ Operator-only Convex functions live under `models/embeddings/operator`:
 These are trusted operator functions, not public MCP tools. Their input text is
 private data and must not be saved in public logs. Provider metadata remains
 separate from credentials. A long-running automatic rebuild worker is later work.
+
+`models/embeddings/migrations` also carries the index-capacity operator
+functions. `startTargetBackfill` opens the one build job for a space and
+fingerprint and supports dry runs. `runTargetBackfillPage` runs one page under
+compare-and-set on the stored cursor and moves the job through `scan`, `fill`,
+`audit` and `done`. `abandonTargetBackfill` stops a build without deleting a
+vector. `backfillVectorScopeV2` populates the generation-free filter field on
+existing vectors; no reader consumes it before the cutover.
+`auditSpaceCoverage` recounts the target table, compares it with the stored
+counters and records a drift flag. The counters are one unsharded row per
+space, written only in the transaction that changes eligibility or that
+inserts or deletes a vector.
 
 The legacy baseline uses `models/embeddings/migrations`:
 `prepareBaselineGeneration` supports dry runs; `backfillBaselineThoughtVectors`

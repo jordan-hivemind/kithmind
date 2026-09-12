@@ -1,6 +1,7 @@
 import { v } from "convex/values";
 
 import { internalMutation } from "../../_generated/server";
+import { internal } from "../../_generated/api";
 import type { Id } from "../../_generated/dataModel";
 import {
   BASELINE_EMBEDDING_DIMENSIONS,
@@ -20,9 +21,20 @@ import {
   ensureEmbeddingProfile,
   ensureSpaceEmbeddingState,
   embeddingVectorSearchScope,
+  failEmbeddingGeneration,
   insertThoughtEmbedding,
   stageEmbeddingGeneration,
 } from "./model";
+import {
+  auditEmbeddingCounters,
+  EMBEDDING_TARGET_CAPACITY_CEILING,
+  embeddingVectorScopeV2,
+  runEmbeddingBuildPage,
+} from "./targets";
+import {
+  embeddingBuildPhaseValidator,
+  embeddingKindCountsValidator,
+} from "./validators";
 
 export const BASELINE_EMBEDDING_PROFILE: EmbeddingProfile = {
   protocol: EMBEDDING_PROTOCOL,
@@ -489,3 +501,298 @@ export async function ensureBaselineProfileAndState(
     createdAt: now,
   });
 }
+
+// ---------------------------------------------------------------------------
+// P2-6ab: target table, counters and resumable builder
+// ---------------------------------------------------------------------------
+
+const buildPageResult = v.object({
+  accepted: v.boolean(),
+  phase: embeddingBuildPhaseValidator,
+  cursor: v.union(v.string(), v.null()),
+  pageIndex: v.number(),
+  scanned: v.number(),
+  filled: v.number(),
+  retired: v.number(),
+  isDone: v.boolean(),
+  counterDrift: v.boolean(),
+  scheduled: v.boolean(),
+});
+
+/**
+ * Creates or reuses the one non-terminal build job for a space and
+ * fingerprint. Rerunning it is a no-op that returns the job to resume.
+ */
+export const startTargetBackfill = internalMutation({
+  args: {
+    spaceId: v.id("spaces"),
+    fingerprint: v.optional(v.string()),
+    dryRun: v.optional(v.boolean()),
+    autoRun: v.optional(v.boolean()),
+    now: v.optional(v.number()),
+  },
+  returns: v.object({
+    dryRun: v.boolean(),
+    reused: v.boolean(),
+    fingerprint: v.string(),
+    jobId: v.optional(v.id("embeddingBuildJobs")),
+    phase: v.optional(embeddingBuildPhaseValidator),
+    cursor: v.optional(v.union(v.string(), v.null())),
+    existingTargetRows: v.number(),
+  }),
+  handler: async (ctx, args) => {
+    const now = args.now ?? Date.now();
+    const dryRun = args.dryRun ?? false;
+    const state = await ensureSpaceEmbeddingState(ctx, args.spaceId);
+    const fingerprint = args.fingerprint ?? state.activeFingerprint;
+    if (!fingerprint) {
+      throw new Error(
+        "Space has no active embedding fingerprint; pass one explicitly",
+      );
+    }
+    const existingTargetRows = (
+      await ctx.db
+        .query("embeddingTargets")
+        .withIndex("by_space_kind_target", (q) => q.eq("spaceId", args.spaceId))
+        .take(EMBEDDING_TARGET_CAPACITY_CEILING)
+    ).length;
+    const jobs = await ctx.db
+      .query("embeddingBuildJobs")
+      .withIndex("by_space_and_fingerprint", (q) =>
+        q.eq("spaceId", args.spaceId).eq("fingerprint", fingerprint),
+      )
+      .collect();
+    const open = jobs.filter(
+      (job) => job.phase !== "done" && job.phase !== "abandoned",
+    );
+    if (open.length > 1) {
+      throw new Error("Space has more than one open embedding build job");
+    }
+    const reusable = open[0];
+    if (reusable) {
+      return {
+        dryRun,
+        reused: true,
+        fingerprint,
+        jobId: reusable._id,
+        phase: reusable.phase,
+        cursor: reusable.cursor,
+        existingTargetRows,
+      };
+    }
+    if (dryRun) {
+      return { dryRun: true, reused: false, fingerprint, existingTargetRows };
+    }
+    const jobId = await ctx.db.insert("embeddingBuildJobs", {
+      spaceId: args.spaceId,
+      fingerprint,
+      ...(state.activeEmbeddingGenerationId &&
+      state.activeFingerprint === fingerprint
+        ? { embeddingGenerationId: state.activeEmbeddingGenerationId }
+        : {}),
+      phase: "scan",
+      cursor: null,
+      pageIndex: 0,
+      scannedCount: 0,
+      filledCount: 0,
+      retiredCount: 0,
+      startedAt: now,
+      updatedAt: now,
+    });
+    if (args.autoRun) {
+      await ctx.scheduler.runAfter(
+        0,
+        internal.models.embeddings.migrations.runTargetBackfillPage,
+        { jobId, cursor: null, autoRun: true },
+      );
+    }
+    return {
+      dryRun: false,
+      reused: false,
+      fingerprint,
+      jobId,
+      phase: "scan" as const,
+      cursor: null,
+      existingTargetRows,
+    };
+  },
+});
+
+/**
+ * Runs one page. The caller must pass the cursor it last received; anything
+ * else is refused with the stored cursor so a replay writes nothing twice.
+ * At most one successor is scheduled, and only when this page was accepted.
+ */
+export const runTargetBackfillPage = internalMutation({
+  args: {
+    jobId: v.id("embeddingBuildJobs"),
+    cursor: v.optional(v.union(v.string(), v.null())),
+    batchSize: v.optional(v.number()),
+    autoRun: v.optional(v.boolean()),
+    now: v.optional(v.number()),
+  },
+  returns: buildPageResult,
+  handler: async (ctx, args) => {
+    const result = await runEmbeddingBuildPage(ctx, {
+      jobId: args.jobId,
+      cursor: args.cursor ?? null,
+      batchSize: args.batchSize,
+      now: args.now ?? Date.now(),
+    });
+    const scheduled = Boolean(
+      args.autoRun && result.accepted && !result.isDone,
+    );
+    if (scheduled) {
+      await ctx.scheduler.runAfter(
+        0,
+        internal.models.embeddings.migrations.runTargetBackfillPage,
+        {
+          jobId: args.jobId,
+          cursor: result.cursor,
+          batchSize: args.batchSize,
+          autoRun: true,
+        },
+      );
+    }
+    return { ...result, scheduled };
+  },
+});
+
+/**
+ * Section 3.5. A build under a fingerprint that is not the active one fails
+ * its generation; a build under the active fingerprint deletes no vector,
+ * because everything it inserted is valid coverage of the active index.
+ */
+export const abandonTargetBackfill = internalMutation({
+  args: {
+    jobId: v.id("embeddingBuildJobs"),
+    code: v.string(),
+    message: v.string(),
+    now: v.optional(v.number()),
+  },
+  returns: v.object({
+    phase: embeddingBuildPhaseValidator,
+    generationFailed: v.boolean(),
+  }),
+  handler: async (ctx, args) => {
+    const now = args.now ?? Date.now();
+    const job = await ctx.db.get(args.jobId);
+    if (!job) throw new Error("Embedding build job not found");
+    if (job.phase === "abandoned") {
+      return { phase: job.phase, generationFailed: false };
+    }
+    const state = await ctx.db
+      .query("spaceEmbeddingStates")
+      .withIndex("by_spaceId", (q) => q.eq("spaceId", job.spaceId))
+      .unique();
+    const underActiveFingerprint = state?.activeFingerprint === job.fingerprint;
+    let generationFailed = false;
+    if (job.embeddingGenerationId && !underActiveFingerprint) {
+      const generation = await ctx.db.get(job.embeddingGenerationId);
+      if (
+        generation &&
+        (generation.state === "staging" || generation.state === "staged")
+      ) {
+        await failEmbeddingGeneration(ctx, {
+          embeddingGenerationId: generation._id,
+          code: args.code,
+          message: args.message,
+          failedAt: now,
+        });
+        generationFailed = true;
+      }
+    }
+    await ctx.db.patch(job._id, {
+      phase: "abandoned",
+      failureCode: args.code,
+      failureMessage: args.message,
+      updatedAt: now,
+    });
+    return { phase: "abandoned" as const, generationFailed };
+  },
+});
+
+/** Populates `scopeV2` on existing vectors. No reader consumes it yet. */
+export const backfillVectorScopeV2 = internalMutation({
+  args: {
+    spaceId: v.id("spaces"),
+    cursor: v.optional(v.union(v.string(), v.null())),
+    batchSize: v.optional(v.number()),
+    dryRun: v.optional(v.boolean()),
+  },
+  returns: v.object({
+    scanned: v.number(),
+    updated: v.number(),
+    alreadySet: v.number(),
+    isDone: v.boolean(),
+    cursor: v.union(v.string(), v.null()),
+  }),
+  handler: async (ctx, args) => {
+    const batchSize = Math.min(Math.max(args.batchSize ?? 64, 1), 128);
+    const page = await ctx.db
+      .query("embeddingVectors")
+      .withIndex("by_space_and_scopeV2", (q) => q.eq("spaceId", args.spaceId))
+      .paginate({ cursor: args.cursor ?? null, numItems: batchSize });
+    let updated = 0;
+    let alreadySet = 0;
+    for (const row of page.page) {
+      const scopeV2 = embeddingVectorScopeV2({
+        spaceId: row.spaceId,
+        fingerprint: row.embeddingFingerprint,
+        targetKind: row.targetKind,
+      });
+      if (row.scopeV2 === scopeV2) {
+        alreadySet += 1;
+        continue;
+      }
+      if (!args.dryRun) await ctx.db.patch(row._id, { scopeV2 });
+      updated += 1;
+    }
+    return {
+      scanned: page.page.length,
+      updated,
+      alreadySet,
+      isDone: page.isDone,
+      cursor: page.isDone ? null : page.continueCursor,
+    };
+  },
+});
+
+/** Compares the stored counters with a full recount of the target table. */
+export const auditSpaceCoverage = internalMutation({
+  args: {
+    spaceId: v.id("spaces"),
+    fingerprint: v.optional(v.string()),
+    maxRows: v.optional(v.number()),
+    repair: v.optional(v.boolean()),
+    now: v.optional(v.number()),
+  },
+  returns: v.object({
+    complete: v.boolean(),
+    scanned: v.number(),
+    counterDrift: v.boolean(),
+    repaired: v.boolean(),
+    fingerprint: v.string(),
+    recountedEligible: embeddingKindCountsValidator,
+    recountedCovered: embeddingKindCountsValidator,
+    storedEligible: embeddingKindCountsValidator,
+    storedCovered: embeddingKindCountsValidator,
+  }),
+  handler: async (ctx, args) => {
+    const state = await ensureSpaceEmbeddingState(ctx, args.spaceId);
+    const fingerprint = args.fingerprint ?? state.activeFingerprint;
+    if (!fingerprint) {
+      throw new Error(
+        "Space has no active embedding fingerprint; pass one explicitly",
+      );
+    }
+    const audit = await auditEmbeddingCounters(ctx, {
+      spaceId: args.spaceId,
+      fingerprint,
+      maxRows: args.maxRows,
+      repair: args.repair,
+      now: args.now ?? Date.now(),
+    });
+    return { ...audit, fingerprint };
+  },
+});
