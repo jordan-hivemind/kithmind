@@ -32,6 +32,8 @@ import type * as models_diagnostics_private from "../models/diagnostics/private.
 import type * as models_diagnostics_public from "../models/diagnostics/public.js";
 import type * as models_diagnostics_tables from "../models/diagnostics/tables.js";
 import type * as models_diagnostics_validators from "../models/diagnostics/validators.js";
+import type * as models_documents_inventory from "../models/documents/inventory.js";
+import type * as models_documents_inventoryTables from "../models/documents/inventoryTables.js";
 import type * as models_documents_mcpActions from "../models/documents/mcpActions.js";
 import type * as models_documents_mcpQueries from "../models/documents/mcpQueries.js";
 import type * as models_documents_model from "../models/documents/model.js";
@@ -191,6 +193,8 @@ declare const fullApi: ApiFromModules<{
   "models/diagnostics/public": typeof models_diagnostics_public;
   "models/diagnostics/tables": typeof models_diagnostics_tables;
   "models/diagnostics/validators": typeof models_diagnostics_validators;
+  "models/documents/inventory": typeof models_documents_inventory;
+  "models/documents/inventoryTables": typeof models_documents_inventoryTables;
   "models/documents/mcpActions": typeof models_documents_mcpActions;
   "models/documents/mcpQueries": typeof models_documents_mcpQueries;
   "models/documents/model": typeof models_documents_model;
