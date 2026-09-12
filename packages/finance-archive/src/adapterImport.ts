@@ -197,9 +197,15 @@ export async function resolveInstitution(
 export async function resolveInstrumentId(
   client: ArchiveClient,
   instrument: ParsedInstrument,
+  institutionId: string | null = null,
 ): Promise<string> {
   const reviews: ReviewBuffer = [];
-  const resolver = await prefetchInstruments(client, [instrument], reviews);
+  const resolver = await prefetchInstruments(
+    client,
+    [instrument],
+    reviews,
+    institutionId,
+  );
   const id = resolver.resolve(instrument);
   await flushInstruments(client, resolver, reviews);
   return id;
@@ -239,6 +245,7 @@ async function prefetchInstruments(
   client: ArchiveClient,
   instruments: readonly ParsedInstrument[],
   reviews: ReviewBuffer,
+  institutionId: string | null = null,
 ): Promise<InstrumentResolver> {
   const distinct = (values: readonly (string | null)[]): string[] => [
     ...new Set(values.filter((value): value is string => Boolean(value))),
@@ -328,6 +335,11 @@ async function prefetchInstruments(
           openReviewItem(reviews, {
             kind: "weak_instrument_match",
             accountId: null,
+            // F1-58: the fields importer.ts folds every sighting of this
+            // same (institution, descriptor, matched instrument) into one
+            // instrument-level item on, instead of one row per document.
+            institutionId,
+            matchedInstrumentId: weak.id,
             rawValue: JSON.stringify(instrument),
             reason:
               `resolved by symbol "${instrument.symbol}" alone (no cusip, isin, or matching name) ` +
@@ -956,6 +968,7 @@ async function collectDocuments(
       .map((row) => row.instrument)
       .filter((instrument): instrument is ParsedInstrument => instrument !== null),
     reviews,
+    pull.institutionId,
   );
 
   // F1-23, moved here from persistAcquiredDocument (F1-33): a provider field

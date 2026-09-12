@@ -749,14 +749,15 @@ test(
     const client = createArchiveClient(url, schema);
     await client.connect();
     try {
-      // Every migration except the one under test: a live archive the night
-      // before this ships, with a hosted reparse's worth of duplicates
-      // already on file.
-      const priorMigrations = PG_MIGRATIONS.slice(0, -1);
+      // Every migration except the one under test (version 7): a live
+      // archive the night before this ships, with a hosted reparse's worth
+      // of duplicates already on file. Filtered by version rather than
+      // "all but the last" -- migration 8 (F1-58) now follows this one.
+      const priorMigrations = PG_MIGRATIONS.filter((m) => m.version < 7);
       assert.equal(
         priorMigrations.length,
-        PG_MIGRATIONS.length - 1,
-        "the dedupe migration is expected to be the last one",
+        PG_MIGRATIONS.length - 2,
+        "expected exactly the dedupe migration and one migration after it",
       );
       await client.query(`CREATE SCHEMA ${schema}`);
       await client.query(
@@ -865,5 +866,88 @@ test(
       await client.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
       await client.end();
     }
+  },
+);
+
+// F1-58. review_items_weak_instrument_match_key (migration version 8) is
+// additive to migration 7's dedupe key: this identity is
+// (kind, institution_id, raw_value, matched_instrument_id), never the
+// document, because a weak instrument match is a fact about the descriptor
+// and what it matched, not about which statement happened to restate it.
+// Unlike migration 7, this one applies cleanly on a fresh archive with no
+// collapse required first: the four columns it adds start every existing
+// row at NULL, and a NULL never conflicts with another NULL under a unique
+// index.
+test(
+  "the weak instrument match unique index applies cleanly against existing rows, and enforces its own key going forward",
+  { skip },
+  async () => {
+    await withArchive(async (client) => {
+      await client.query(
+        "INSERT INTO institutions (id, name, slug) VALUES ('inst-1', 'Thistlebrook Trust', 'thistlebrook')",
+      );
+      await client.query(
+        `INSERT INTO documents (id, institution_id, doc_type, doc_date, file_path, sha256)
+         VALUES ('doc-1', 'inst-1', 'activity_pull', DATE '2026-03-04', '/raw/doc-1', $1)`,
+        ["d".repeat(64)],
+      );
+      // A second document, same institution: migration 7's dedupe key is
+      // keyed on the document, so every row below that is meant to collide
+      // only under the *new* index uses this one instead of doc-1, keeping
+      // the two identities cleanly separated in this test.
+      await client.query(
+        `INSERT INTO documents (id, institution_id, doc_type, doc_date, file_path, sha256)
+         VALUES ('doc-2', 'inst-1', 'activity_pull', DATE '2026-04-04', '/raw/doc-2', $1)`,
+        ["e".repeat(64)],
+      );
+      await client.query(
+        "INSERT INTO instruments (id, symbol) VALUES ('instr-1', 'ZEPHYR')",
+      );
+
+      // A row from before this migration: no institution_id or
+      // matched_instrument_id at all. Nothing here should ever have been
+      // refused by a guard that only ever finds NULLs to compare.
+      await client.query(
+        `INSERT INTO review_items (id, kind, source_document_id, raw_value, reason)
+         VALUES ('legacy-1', 'weak_instrument_match', 'doc-1', 'ZZZ', 'pre-migration, no columns yet')`,
+      );
+
+      await client.query(
+        `INSERT INTO review_items
+           (id, kind, source_document_id, raw_value, reason, institution_id, matched_instrument_id, occurrence_count, last_seen_document_id)
+         VALUES ('weak-1', 'weak_instrument_match', 'doc-1', 'ZEPHYR-descriptor', 'first sighting', 'inst-1', 'instr-1', 1, 'doc-1')`,
+      );
+
+      // Same (institution, descriptor, matched instrument), a different
+      // document: refused by the new key even though migration 7's key
+      // (scoped by document) would have allowed this row through.
+      await assert.rejects(
+        client.query(
+          `INSERT INTO review_items
+             (id, kind, source_document_id, raw_value, reason, institution_id, matched_instrument_id, occurrence_count, last_seen_document_id)
+           VALUES ('weak-2', 'weak_instrument_match', 'doc-2', 'ZEPHYR-descriptor', 'second sighting', 'inst-1', 'instr-1', 1, 'doc-2')`,
+        ),
+        /review_items_weak_instrument_match_key/,
+      );
+
+      // A different matched instrument: not a conflict, this is a distinct
+      // descriptor/instrument pair even though the raw descriptor matches.
+      await client.query(
+        "INSERT INTO instruments (id, symbol) VALUES ('instr-2', 'ZEPHYR')",
+      );
+      await client.query(
+        `INSERT INTO review_items
+           (id, kind, source_document_id, raw_value, reason, institution_id, matched_instrument_id, occurrence_count, last_seen_document_id)
+         VALUES ('weak-3', 'weak_instrument_match', 'doc-2', 'ZEPHYR-descriptor', 'matched a different row', 'inst-1', 'instr-2', 1, 'doc-2')`,
+      );
+
+      // A different kind entirely, sharing every other column: the index is
+      // scoped to kind = 'weak_instrument_match' and does not apply.
+      await client.query(
+        `INSERT INTO review_items
+           (id, kind, source_document_id, raw_value, reason, institution_id, matched_instrument_id, occurrence_count, last_seen_document_id)
+         VALUES ('other-kind-1', 'undeclared_activity_type', 'doc-1', 'ZEPHYR-descriptor', 'unrelated kind', 'inst-1', 'instr-1', 1, 'doc-1')`,
+      );
+    });
   },
 );

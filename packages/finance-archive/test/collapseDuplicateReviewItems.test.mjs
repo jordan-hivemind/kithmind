@@ -30,8 +30,11 @@ import { all, one, skip, testSchemaName } from "./helpers/pgArchive.mjs";
 
 const url = process.env.FINANCE_ARCHIVE_DATABASE_URL;
 
-/** Every migration except `review_items_dedupe_key`, applied one at a time
- * against a fresh schema: a live archive the night before F1-65 ships. */
+/** Every migration before `review_items_dedupe_key` (version 7), applied one
+ * at a time against a fresh schema: a live archive the night before F1-65
+ * ships. Filtered by version rather than "all but the last" -- migration 8
+ * (F1-58) now follows it, and this suite must still stop short of the
+ * dedupe key itself, not of whatever the last migration happens to be. */
 async function archiveBeforeDedupeIndex(t) {
   const schema = testSchemaName();
   const client = createArchiveClient(url, schema);
@@ -42,7 +45,7 @@ async function archiveBeforeDedupeIndex(t) {
        version INTEGER PRIMARY KEY, name TEXT NOT NULL,
        applied_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
   );
-  for (const migration of PG_MIGRATIONS.slice(0, -1)) {
+  for (const migration of PG_MIGRATIONS.filter((m) => m.version < 7)) {
     await client.query(migration.sql);
     await client.query(
       `INSERT INTO ${schema}.schema_version (version, name) VALUES ($1, $2)`,

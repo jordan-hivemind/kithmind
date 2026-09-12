@@ -1088,6 +1088,250 @@ test(
   },
 );
 
+// F1-58. weak_instrument_match moves from one row per document to one row
+// per (institution, descriptor, matched instrument): the decision the item
+// asks for -- "confirm or correct this match" -- is about the descriptor,
+// not about which statement happened to restate it. A statement restates
+// its holdings every month, so under the old shape the same weak match
+// opened a fresh row every month too.
+test(
+  "F1-58: two statements restating the same weakly matched instrument open one item with occurrence_count 2, and a third publish increments it to 3",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedPg(client);
+
+    // Already on file, so every row below resolves to it by symbol alone --
+    // a weak match from its first sighting, not a fresh mint.
+    await client.query(
+      "INSERT INTO instruments (id, symbol) VALUES ('instr_zephyr', 'ZEPHYR')",
+    );
+    const instrument = { symbol: "ZEPHYR", cusip: null, isin: null, name: null };
+
+    async function publishStatement(label, docDate) {
+      const acquired = buildTabularPull(label);
+      const documents = await adapterPullToImportDocuments(client, {
+        institutionId: INSTITUTION.id,
+        accountId: ACCOUNT.id,
+        acquired,
+        // A distinct processDate (and so a distinct row_hash) per statement:
+        // otherwise the second statement's single row would be recognized
+        // as a genuine cross_document_duplicate of the first (same content,
+        // different document), which is a real and unrelated feature this
+        // test does not mean to exercise.
+        rows: [activityRow({ instrument, processDate: docDate })],
+        docType: "tabular_export",
+        docDate,
+        persisted: persist(t, acquired, "tabular_export"),
+      });
+      return importBatch(
+        client,
+        { source: INSTITUTION.slug, documents },
+        new Date("2025-05-01"),
+      );
+    }
+
+    const weakMatchRow = () =>
+      one(
+        client,
+        "SELECT occurrence_count, source_document_id, last_seen_document_id " +
+          "FROM review_items WHERE kind = 'weak_instrument_match'",
+      );
+
+    const first = await publishStatement("f1-58 january statement", "2025-01-31");
+    assert.equal(
+      await count(client, "review_items", "WHERE kind = $1", [
+        "weak_instrument_match",
+      ]),
+      1,
+    );
+    const afterFirst = await weakMatchRow();
+    assert.equal(afterFirst.occurrence_count, 1);
+    assert.equal(afterFirst.last_seen_document_id, afterFirst.source_document_id);
+    assert.equal(first.reviewItemsOpened, 1);
+    const firstDocId = afterFirst.source_document_id;
+
+    const second = await publishStatement("f1-58 february statement", "2025-02-28");
+    assert.equal(
+      await count(client, "review_items", "WHERE kind = $1", [
+        "weak_instrument_match",
+      ]),
+      1,
+      "the same descriptor restated on a second statement folds into the same item, not a second one",
+    );
+    const afterSecond = await weakMatchRow();
+    assert.equal(afterSecond.occurrence_count, 2);
+    assert.equal(
+      afterSecond.source_document_id,
+      firstDocId,
+      "the first sighting is unchanged",
+    );
+    assert.notEqual(afterSecond.last_seen_document_id, firstDocId);
+    // An increment to an existing item is not a newly opened one.
+    assert.equal(second.reviewItemsOpened, 0);
+    const secondDocId = afterSecond.last_seen_document_id;
+
+    const third = await publishStatement("f1-58 march statement", "2025-03-31");
+    assert.equal(
+      await count(client, "review_items", "WHERE kind = $1", [
+        "weak_instrument_match",
+      ]),
+      1,
+    );
+    const afterThird = await weakMatchRow();
+    assert.equal(afterThird.occurrence_count, 3);
+    assert.equal(afterThird.source_document_id, firstDocId);
+    assert.notEqual(afterThird.last_seen_document_id, secondDocId);
+    assert.equal(third.reviewItemsOpened, 0);
+  },
+);
+
+test(
+  "F1-58: a resolved instrument-level match is never reopened or recounted by a later statement restating the same descriptor",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedPg(client);
+    await client.query(
+      "INSERT INTO instruments (id, symbol) VALUES ('instr_zephyr', 'ZEPHYR')",
+    );
+    const instrument = { symbol: "ZEPHYR", cusip: null, isin: null, name: null };
+
+    async function publishStatement(label, docDate) {
+      const acquired = buildTabularPull(label);
+      const documents = await adapterPullToImportDocuments(client, {
+        institutionId: INSTITUTION.id,
+        accountId: ACCOUNT.id,
+        acquired,
+        // A distinct processDate (and so a distinct row_hash) per statement:
+        // otherwise the second statement's single row would be recognized
+        // as a genuine cross_document_duplicate of the first (same content,
+        // different document), which is a real and unrelated feature this
+        // test does not mean to exercise.
+        rows: [activityRow({ instrument, processDate: docDate })],
+        docType: "tabular_export",
+        docDate,
+        persisted: persist(t, acquired, "tabular_export"),
+      });
+      return importBatch(
+        client,
+        { source: INSTITUTION.slug, documents },
+        new Date("2025-05-01"),
+      );
+    }
+
+    await publishStatement("f1-58 resolved january", "2025-01-31");
+    await client.query(
+      `UPDATE review_items
+         SET status = 'resolved', resolved_at = '2025-06-01T00:00:00Z',
+             resolution_note = 'confirmed correct for every statement restating this descriptor'
+       WHERE kind = 'weak_instrument_match'`,
+    );
+    const beforeSecond = await one(
+      client,
+      "SELECT occurrence_count, status FROM review_items WHERE kind = 'weak_instrument_match'",
+    );
+    assert.equal(beforeSecond.status, "resolved");
+    assert.equal(beforeSecond.occurrence_count, 1);
+
+    const second = await publishStatement("f1-58 resolved february", "2025-02-28");
+
+    // Still exactly one item, still resolved, still counting its original
+    // sighting: resolving the mapping decides it for every row that shares
+    // the descriptor, so a later restatement is neither a new item nor a
+    // reason to reopen or recount the resolved one.
+    assert.equal(
+      await count(client, "review_items", "WHERE kind = $1", [
+        "weak_instrument_match",
+      ]),
+      1,
+    );
+    const afterSecond = await one(
+      client,
+      "SELECT occurrence_count, status, resolution_note FROM review_items WHERE kind = 'weak_instrument_match'",
+    );
+    assert.equal(afterSecond.status, "resolved");
+    assert.equal(afterSecond.occurrence_count, 1);
+    assert.equal(
+      afterSecond.resolution_note,
+      "confirmed correct for every statement restating this descriptor",
+    );
+    assert.equal(second.reviewItemsOpened, 0);
+  },
+);
+
+test(
+  "F1-58: a document retried before it reaches parsed_ok does not double-count its own sighting of a weak match",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedPg(client);
+    await client.query(
+      "INSERT INTO instruments (id, symbol) VALUES ('instr_zephyr', 'ZEPHYR')",
+    );
+
+    const acquired = buildTabularPull("f1-58 retried document");
+    const persisted = persist(t, acquired, "tabular_export");
+    const instrument = { symbol: "ZEPHYR", cusip: null, isin: null, name: null };
+    const buildDocuments = () =>
+      adapterPullToImportDocuments(client, {
+        institutionId: INSTITUTION.id,
+        accountId: ACCOUNT.id,
+        acquired,
+        // An unparseable process date alongside the weak match: this
+        // document never reaches parsed_ok, so a rerun reprocesses it in
+        // full rather than taking the whole-document skip -- the same setup
+        // F1-65's own reimport-idempotence test above uses.
+        rows: [
+          activityRow({ instrument, processDate: "not-a-real-date" }),
+        ],
+        docType: "tabular_export",
+        docDate: "2025-02-01",
+        persisted,
+      });
+
+    const first = await importBatch(
+      client,
+      { source: INSTITUTION.slug, documents: await buildDocuments() },
+      new Date("2025-05-01"),
+    );
+    assert.equal(
+      (await one(client, "SELECT parsed_ok FROM documents")).parsed_ok,
+      false,
+    );
+    const afterFirst = await one(
+      client,
+      "SELECT occurrence_count FROM review_items WHERE kind = 'weak_instrument_match'",
+    );
+    assert.equal(afterFirst.occurrence_count, 1);
+    // The weak match plus the unparseable process date: two items opened,
+    // not one.
+    assert.equal(first.reviewItemsOpened, 2);
+
+    const second = await importBatch(
+      client,
+      { source: INSTITUTION.slug, documents: await buildDocuments() },
+      new Date("2025-05-01"),
+    );
+    assert.equal(
+      await count(client, "review_items", "WHERE kind = $1", [
+        "weak_instrument_match",
+      ]),
+      1,
+    );
+    const afterSecond = await one(
+      client,
+      "SELECT occurrence_count FROM review_items WHERE kind = 'weak_instrument_match'",
+    );
+    assert.equal(
+      afterSecond.occurrence_count,
+      1,
+      "the same document's own sighting must not be recorded twice",
+    );
+    assert.equal(second.reviewItemsOpened, 0);
+  },
+);
+
 test(
   "F1-19: an amount on a type declared movesCash: false is nulled, reviewed, and excluded from the cash gate",
   { skip },
