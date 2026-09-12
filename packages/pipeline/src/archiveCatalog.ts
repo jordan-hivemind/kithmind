@@ -52,6 +52,9 @@ const MAX_ORIGINALS = 256;
 const MAX_PROCESSINGS = 512;
 const MAX_BOUNDARY_RELOCATIONS = 16;
 const MAX_DIRECTORY_ENTRIES = 64;
+/** Bounded per-document parser attempt count; see `parseFailure` on `ProcessingCatalogRow`. */
+export const MAX_PARSE_ATTEMPTS = 2;
+const PARSER_FAILURE_CODE = /^[a-z_]{1,64}$/;
 const TEMP_FILE = /^\.archive-catalog\.json\.[0-9a-f-]{36}\.tmp$/;
 const SHA256 = /^[a-f0-9]{64}$/;
 const UUID =
@@ -906,6 +909,7 @@ function processingRow(value: unknown): ProcessingCatalogRow {
       "spool",
       "cloud",
       "activation",
+      "parseFailure",
     ],
   );
   const current = object(row.currentObservation);
@@ -1048,6 +1052,15 @@ function processingRow(value: unknown): ProcessingCatalogRow {
       ...(activation.previousGenerationId === undefined
         ? {}
         : { previousGenerationId: id(activation.previousGenerationId) }),
+    };
+  }
+  if (row.parseFailure !== undefined) {
+    const parseFailure = object(row.parseFailure);
+    exact(parseFailure, ["code", "attempts", "failedAt"]);
+    result.parseFailure = {
+      code: string(parseFailure.code, 64, PARSER_FAILURE_CODE),
+      attempts: integer(parseFailure.attempts, 1, MAX_PARSE_ATTEMPTS),
+      failedAt: integer(parseFailure.failedAt),
     };
   }
   return result;
@@ -2142,6 +2155,38 @@ export class ArchiveCatalog {
         if (row.parserOutput && !equal(row.parserOutput, output))
           fail("catalog_conflict");
         row.parserOutput = output;
+      },
+    )) as ProcessingCatalogRow;
+  }
+
+  /**
+   * Records one document-level parser failure (conversion_failed,
+   * page_limit_exceeded, bundle_too_large, conversion_output_invalid)
+   * against this row, bounded at `MAX_PARSE_ATTEMPTS`. `pdfNeedsArchivedWork`
+   * reads `attempts` back to stop retrying a document that has already hit
+   * the bound; a parser version bump changes `fingerprints.parserFingerprint`
+   * and therefore lands on a fresh row with no prior `parseFailure`.
+   */
+  async recordParseFailure(args: {
+    catalogId: string;
+    expectedRevision: number;
+    code: string;
+    now: number;
+  }): Promise<ProcessingCatalogRow> {
+    return (await this.updateRow(
+      "parser_output",
+      args.catalogId,
+      args.expectedRevision,
+      (value) => {
+        const row = value as ProcessingCatalogRow;
+        row.parseFailure = {
+          code: args.code,
+          attempts: Math.min(
+            (row.parseFailure?.attempts ?? 0) + 1,
+            MAX_PARSE_ATTEMPTS,
+          ),
+          failedAt: integer(args.now),
+        };
       },
     )) as ProcessingCatalogRow;
   }

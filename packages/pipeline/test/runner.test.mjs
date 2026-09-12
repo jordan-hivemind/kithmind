@@ -785,6 +785,171 @@ test("preserves an allowlisted parser failure through the safe runner boundary",
   }
 });
 
+test("a document-level parser failure is recorded against that document and the pass continues", async () => {
+  const setup = await fixture(0);
+  const plans = [0, 1, 2].map((index) =>
+    pdfPlan({ relativePath: `document-${index}.pdf` }),
+  );
+  const checkpoint = archivedCheckpoint(plans[1], {
+    files: plans,
+    pdfIndex: 1,
+    step: "parse",
+    archivedPublished: 1,
+    preflightAction: undefined,
+  });
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  const recordedFailures = [];
+  try {
+    const runner = new PipelineRunner(setup.config, journal, {
+      async call(request) {
+        if (request.operation === "source.status") {
+          return { operation: "source.status", sourceAccountId: "source" };
+        }
+        throw new Error(`unexpected operation ${request.operation}`);
+      },
+    });
+    runner.archiveCatalog = {
+      listOriginals() {
+        return [
+          { originalCatalogId: checkpoint.originalCatalogId, rowRevision: 1 },
+        ];
+      },
+      listProcessings() {
+        return [
+          {
+            processingCatalogId: checkpoint.processingCatalogId,
+            originalCatalogId: checkpoint.originalCatalogId,
+            rowRevision: 1,
+          },
+        ];
+      },
+      async recordParseFailure(args) {
+        recordedFailures.push(args);
+        return {};
+      },
+    };
+    let calls = 0;
+    runner.driveCheckpoint = async () => {
+      calls += 1;
+      // Stand in for the second of three documents: the first call is where
+      // `driveArchivedParse` would have raised a document-level failure
+      // (conversion_failed) while converting document-1; the run's own loop
+      // must catch it, record it, and keep going rather than end the pass.
+      if (calls === 1) {
+        throw new ParserProcessError(
+          "conversion_failed",
+          "docling could not convert page 1",
+        );
+      }
+      return { state: "complete", scanned: 3, published: 2 };
+    };
+    const result = await runner.run();
+    assert.equal(calls, 2);
+    assert.equal(recordedFailures.length, 1);
+    assert.equal(recordedFailures[0].code, "conversion_failed");
+    assert.equal(
+      recordedFailures[0].catalogId,
+      checkpoint.processingCatalogId,
+    );
+    assert.deepEqual(result, { state: "complete", scanned: 3, published: 2 });
+    // The failed document (index 1) is skipped, not retried in this pass;
+    // the run moves on to the next one (index 2) and nothing extra is
+    // counted as published for the failure.
+    assert.equal(journal.checkpoint.phase, "archived");
+    assert.equal(journal.checkpoint.pdfIndex, 2);
+    assert.equal(journal.checkpoint.step, "intent");
+    assert.equal(journal.checkpoint.archivedPublished, 1);
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a document stops being selected for archived work once its local parse attempts are exhausted", async () => {
+  async function reconcile(processingRows) {
+    const setup = await fixture(0);
+    const plan = pdfPlan({ discoveryState: "unchanged" });
+    const checkpoint = parseRunnerCheckpoint({
+      version: 1,
+      phase: "reconcile",
+      mode: "normal",
+      scanId: `scan-${randomUUID()}`,
+      inventoryEpoch: 1,
+      manifestVersion: 1,
+      missingBindings: [],
+      files: [plan],
+      ordinal: 0,
+      reviewSeen: false,
+    });
+    const journal = await openJournal(setup.journalDir, checkpoint);
+    const original = { originalCatalogId: randomUUID() };
+    const runner = new PipelineRunner(setup.config, journal, {
+      async call() {
+        return {
+          operation: "scan.reconcile",
+          scanId: checkpoint.scanId,
+          done: true,
+          state: "enumerated",
+          inspected: 0,
+          unavailable: 0,
+          reused: false,
+        };
+      },
+    });
+    const fingerprints = runner.processingFingerprints(plan);
+    runner.archiveCatalog = {
+      findOriginalExact() {
+        return original;
+      },
+      listProcessings() {
+        return processingRows.map((row) => ({
+          originalCatalogId: original.originalCatalogId,
+          currentObservation: {
+            scanId: "prior-scan",
+            observationEpoch: plan.observationEpoch,
+            processingEpoch: plan.processingEpoch,
+          },
+          fingerprints,
+          ...row,
+        }));
+      },
+    };
+    try {
+      await runner.driveReconcile();
+      return journal.checkpoint;
+    } finally {
+      await journal.close();
+      await rm(setup.base, { recursive: true, force: true });
+    }
+  }
+
+  // One prior failure: still below the bound, a rerun tries again.
+  assert.equal(
+    (
+      await reconcile([
+        {
+          activation: undefined,
+          parseFailure: { code: "conversion_failed", attempts: 1, failedAt: 1 },
+        },
+      ])
+    ).phase,
+    "archived",
+  );
+  // Two prior failures (the bound): a rerun leaves it `parse_failed` and
+  // moves straight past the archived phase without retrying it.
+  assert.equal(
+    (
+      await reconcile([
+        {
+          activation: undefined,
+          parseFailure: { code: "conversion_failed", attempts: 2, failedAt: 1 },
+        },
+      ])
+    ).phase,
+    "discovery_reserve",
+  );
+});
+
 test("publishes a bounded multi-page scan and stores only metadata after completion", async () => {
   const setup = await fixture(9);
   const cloud = new CompleteCloud();
