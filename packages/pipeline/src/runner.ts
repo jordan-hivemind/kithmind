@@ -372,6 +372,59 @@ class PipelineWorkerError extends Error {
 
 class PipelineRetryableError extends PipelineWorkerError {}
 
+const ENTRY_INDEX = Symbol("entryIndex");
+
+/** Tags a thrown value with the page-relative entry index that produced it,
+ * so an unclassified `runSafely` failure can name which entry broke instead
+ * of just the phase. Best-effort: non-object throws (a string, for example)
+ * are returned unchanged. */
+function tagEntryIndex(error: unknown, index: number): unknown {
+  if (error && typeof error === "object") {
+    (error as Record<PropertyKey, unknown>)[ENTRY_INDEX] = index;
+  }
+  return error;
+}
+
+function entryIndexOf(error: unknown): number | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const value = (error as Record<PropertyKey, unknown>)[ENTRY_INDEX];
+  return typeof value === "number" ? value : undefined;
+}
+
+const MAX_FAILURE_MESSAGE_CHARS = 300;
+
+/** Replaces any absolute-path-looking token with just its final path
+ * segment, so a failure message never carries more of the filesystem layout
+ * than the relative path already implies. */
+function redactAbsolutePaths(message: string): string {
+  return message.replace(/\/[^\s"'()]+/g, (match) => {
+    const base = match.slice(match.lastIndexOf("/") + 1);
+    return base.length > 0 ? `<path:${base}>` : "<path>";
+  });
+}
+
+/** Sanitized, bounded description of a `runSafely` failure: never document
+ * text (errors here never carry file contents, only shapes and codes), and
+ * no path detail beyond a relative path's final segment. */
+function describeUnsafeFailure(
+  error: unknown,
+  phase: string,
+): { phase: string; entryIndex?: number; name: string; message: string } {
+  const entryIndex = entryIndexOf(error);
+  const name = error instanceof Error ? error.name : typeof error;
+  const rawMessage = error instanceof Error ? error.message : String(error);
+  const message = redactAbsolutePaths(rawMessage).slice(
+    0,
+    MAX_FAILURE_MESSAGE_CHARS,
+  );
+  return {
+    phase,
+    ...(entryIndex === undefined ? {} : { entryIndex }),
+    name,
+    message,
+  };
+}
+
 function json(value: unknown): JsonValue {
   return JSON.parse(JSON.stringify(value)) as JsonValue;
 }
@@ -2101,7 +2154,13 @@ export class PipelineRunner {
           scanId: checkpoint.scanId,
           requestId: randomUUID(),
           ordinal: checkpoint.nextOrdinal,
-          entries: pagePlans.map((plan) => scanEntry(plan, checkpoint.mode)),
+          entries: pagePlans.map((plan, pageOffset) => {
+            try {
+              return scanEntry(plan, checkpoint.mode);
+            } catch (error) {
+              throw tagEntryIndex(error, offset + pageOffset);
+            }
+          }),
         }),
       (current, response) => {
         if (current.phase !== "append") {
@@ -5513,17 +5572,33 @@ export class PipelineRunner {
     try {
       return await this.run();
     } catch (error) {
+      const code =
+        error instanceof FilesystemFailure ||
+        error instanceof PipelineWorkerError
+          ? error.code
+          : error instanceof ParserProcessError &&
+              SAFE_PARSER_FAILURE_CODES.has(error.code)
+            ? error.code
+            : "worker_failed";
+      // `worker_failed` is the unclassified bucket: every other branch above
+      // already carries a code that names what went wrong. Never leave this
+      // one silent - report the error's name, a sanitized message, and where
+      // it happened (phase, and entry index when the failure came from
+      // building one page's entries) to stderr and the journal's failure
+      // record, so a deterministic failure like this is diagnosable instead
+      // of an empty `{"state":"failed","code":"worker_failed"}`.
+      if (code === "worker_failed") {
+        const detail = describeUnsafeFailure(
+          error,
+          this.journal.checkpoint.phase,
+        );
+        process.stderr.write(`${JSON.stringify(detail)}\n`);
+        await this.journal.recordFailure(detail);
+      }
       return {
         state:
           error instanceof PipelineRetryableError ? "incomplete" : "failed",
-        code:
-          error instanceof FilesystemFailure ||
-          error instanceof PipelineWorkerError
-            ? error.code
-            : error instanceof ParserProcessError &&
-                SAFE_PARSER_FAILURE_CODES.has(error.code)
-              ? error.code
-              : "worker_failed",
+        code,
       };
     }
   }

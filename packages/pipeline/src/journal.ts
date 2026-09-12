@@ -14,6 +14,7 @@ import {
   realpath,
   rename,
   unlink,
+  writeFile,
 } from "node:fs/promises";
 import { createServer, type Server } from "node:net";
 import { dirname, join, resolve } from "node:path";
@@ -33,6 +34,8 @@ import {
 import { validateArchiveRelocationConfig } from "./archiveRelocationConfig.js";
 
 const STATE_FILE = "state.json";
+const FAILURE_FILE = "failure.json";
+const MAX_FAILURE_RECORD_BYTES = 4 * 1024;
 const FILE_MODE = 0o600;
 const DIRECTORY_MODE = 0o700;
 const MAX_REQUEST_BODY_BYTES = 512 * 1024;
@@ -1514,6 +1517,27 @@ export class Journal<C extends JsonValue, R extends JsonValue> {
     await this.persistCandidate(next);
     this.state = next;
     this.candidateCredentialFingerprint = undefined;
+  }
+  /**
+   * Best-effort diagnostic breadcrumb for an unclassified `runSafely`
+   * failure, written next to `state.json` as `failure.json`. Never part of
+   * the checkpoint/replay state machine: a write failure here is swallowed
+   * rather than poisoning the journal or masking the original error, and a
+   * later successful pass simply leaves the stale file in place (it is a
+   * "last failure seen" breadcrumb, not a cleared alert).
+   */
+  async recordFailure(detail: Record<string, JsonValue>): Promise<void> {
+    try {
+      const body = JSON.stringify({
+        ...detail,
+        recordedAt: Date.now(),
+      }).slice(0, MAX_FAILURE_RECORD_BYTES);
+      await writeFile(join(this.directory, FAILURE_FILE), body, {
+        mode: FILE_MODE,
+      });
+    } catch {
+      // Diagnostics only; never let this failure compound the original one.
+    }
   }
   async close(): Promise<void> {
     if (this.closed) return;
