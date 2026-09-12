@@ -496,3 +496,54 @@ export async function withReconnect<T>(
     }
   }
 }
+
+// --- keepalive during long non-database phases (F1-69b) ---------------------
+//
+// F1-69 reconnects once a query notices the connection is gone, but a phase
+// with no query at all -- `discover()` walking a listing page by page for
+// several minutes, all browser work, no SQL -- never gives it the chance:
+// the hosted proxy in front of the archive closes a connection it has seen
+// no traffic on for a while, and nothing on this side finds out until the
+// next query lands on a socket that is already dead. A keepalive is the
+// fix at the source: touch the connection often enough that the proxy never
+// considers it idle, so there is no dead connection for the first
+// post-discovery query to discover the hard way.
+
+const KEEPALIVE_INTERVAL_MS = 60_000;
+
+/**
+ * The keepalive cadence: `FINANCE_ARCHIVE_KEEPALIVE_INTERVAL_MS` when set to
+ * a positive number, 60s otherwise. Exists so a test can shrink the interval
+ * to something it can actually wait out instead of proving the mechanism
+ * against a real 60-second tick; nothing in this package reads it besides
+ * `startKeepalive`'s own default below.
+ */
+function keepaliveIntervalFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number(env.FINANCE_ARCHIVE_KEEPALIVE_INTERVAL_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : KEEPALIVE_INTERVAL_MS;
+}
+
+/**
+ * Pings `SELECT 1` on whatever client `getClient()` currently returns, every
+ * `intervalMs` (default 60s, see `keepaliveIntervalFromEnv`), until the
+ * returned stop function is called. The timer is `unref`'d so it never by
+ * itself keeps the process alive, and a failed ping is swallowed: the
+ * keepalive's only job is to generate traffic, not to detect or recover a
+ * dead connection -- `withReconnect` already owns that, against whatever
+ * real query runs next. Read `getClient()` fresh on every tick (not a client
+ * captured once) so a reconnect mid-phase keeps the new client alive too.
+ */
+export function startKeepalive(
+  getClient: () => pg.Client,
+  intervalMs = keepaliveIntervalFromEnv(),
+): () => void {
+  const timer = setInterval(() => {
+    const client = getClient();
+    if (isArchiveClientDead(client)) return;
+    client.query("SELECT 1").catch(() => {
+      // Swallowed: see doc comment above.
+    });
+  }, intervalMs);
+  timer.unref();
+  return () => clearInterval(timer);
+}

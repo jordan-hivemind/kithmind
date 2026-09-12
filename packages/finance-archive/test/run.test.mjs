@@ -2341,3 +2341,156 @@ test(
     );
   },
 );
+
+// --- F1-69b: reconnecting after discover()'s own long non-database phase ---
+//
+// F1-69 above wraps every per-document query in `reconnect`, but a real
+// discover() can spend several minutes doing nothing but browser work --
+// no query at all -- before the run's *first* post-discovery query
+// (resolving the accounts discover() found). Left unwrapped, that query is
+// what used to find the connection already closed by the hosted proxy in
+// front of the archive: the run exited with "Client has encountered a
+// connection error and is not queryable" before pulling anything. The fix
+// is twofold: that query (and the others between session open and the
+// per-document loop) is now wrapped in the same `reconnect`, and a keepalive
+// (pgStore.ts's `startKeepalive`) pings the connection every interval so a
+// long discover() does not go idle long enough for the proxy to drop it in
+// the first place. This drops the run's connection *during* a slowed-down
+// discover(), before any selection work, and proves both halves: the
+// keepalive's own "SELECT 1" shows up as the connection's last query while
+// discover() is still running, and the run still reconnects and completes.
+
+/** The same fixture adapter as `writeAdapterFixtures`, except `discover()`
+ * sleeps `delayMs` before delegating to the real synthetic adapter's own --
+ * long enough for the watcher below to observe a keepalive ping and then
+ * drop the connection while discover() is still "running", with no
+ * selection work anywhere near the window being tested. */
+function writeSlowDiscoverFixtures(t, delayMs) {
+  const { fixturesDir, sessionModulePath } = writeAdapterFixtures(t);
+  const adapterModulePath = join(fixturesDir, "adapter-slow-discover.mjs");
+  writeFileSync(
+    adapterModulePath,
+    `import { syntheticAdapter } from ${JSON.stringify(distIndexUrl)};\n` +
+      `const slowDiscoverAdapter = {\n` +
+      `  ...syntheticAdapter,\n` +
+      `  async discover(session, kinds) {\n` +
+      `    await new Promise((resolve) => setTimeout(resolve, ${JSON.stringify(delayMs)}));\n` +
+      `    return syntheticAdapter.discover(session, kinds);\n` +
+      `  },\n` +
+      `};\n` +
+      `export default slowDiscoverAdapter;\n`,
+  );
+  return { fixturesDir, adapterModulePath, sessionModulePath };
+}
+
+test(
+  "a connection dropped during discover()'s long non-database phase reconnects before the run's next query, and a keepalive ping is observed while the run waits (F1-69b)",
+  { skip },
+  async (t) => {
+    const { schema, client } = await seededSchema(t);
+
+    const rawDir = mkdtempSync(
+      join(tmpdir(), "kith-finance-keepalive-raw-"),
+    );
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+
+    // Long enough for a 50ms keepalive (below) to tick several times before
+    // discover() resolves, short enough this test does not sit around.
+    const { fixturesDir, adapterModulePath, sessionModulePath } =
+      writeSlowDiscoverFixtures(t, 500);
+    const selectionPath = writeSelection(fixturesDir, [
+      {
+        accountId: ACCOUNT.id,
+        docType: "statement",
+        docDate: null,
+        selection: { kind: "pdf_statement", externalId: "doc-stmt-2025-q1" },
+      },
+    ]);
+
+    // A distinct application_name per test run, same reason as the F1-69
+    // test above: the watcher must find only this run's own connection.
+    const applicationName = `kith_finance_keepalive_${randomBytes(6).toString("hex")}`;
+    const dbUrl = `${url}${url.includes("?") ? "&" : "?"}application_name=${applicationName}`;
+
+    // Shrinks the keepalive's own 60s default so this test can actually
+    // observe a tick -- see pgStore.ts's `keepaliveIntervalFromEnv`. Set
+    // before `spawnImport` so its `...process.env` spread (below) carries it
+    // into the child's environment.
+    const previousInterval = process.env.FINANCE_ARCHIVE_KEEPALIVE_INTERVAL_MS;
+    process.env.FINANCE_ARCHIVE_KEEPALIVE_INTERVAL_MS = "50";
+    t.after(() => {
+      if (previousInterval === undefined) {
+        delete process.env.FINANCE_ARCHIVE_KEEPALIVE_INTERVAL_MS;
+      } else {
+        process.env.FINANCE_ARCHIVE_KEEPALIVE_INTERVAL_MS = previousInterval;
+      }
+    });
+
+    const exited = spawnImport({
+      adapterModulePath,
+      sessionModulePath,
+      selectionPath,
+      schema,
+      rawDir,
+      dbUrl,
+    });
+
+    const watcher = createArchiveClient(url, schema);
+    await watcher.connect();
+    t.after(() => watcher.end().catch(() => {}));
+
+    let done = false;
+    exited.then(() => {
+      done = true;
+    });
+
+    // First, find the run's own backend pid; then wait until pg_stat_activity
+    // reports that backend's own last query as the keepalive's "SELECT 1" --
+    // proof the keepalive actually fired during discover()'s sleep, not just
+    // that this test raced a drop into that window -- before terminating it.
+    let pid = null;
+    let keepaliveObserved = false;
+    while (!keepaliveObserved && !done) {
+      if (pid === null) {
+        const found = await all(
+          watcher,
+          "SELECT pid FROM pg_stat_activity WHERE application_name = $1",
+          [applicationName],
+        );
+        if (found.length > 0) pid = found[0].pid;
+      } else {
+        const found = await all(
+          watcher,
+          "SELECT query FROM pg_stat_activity WHERE pid = $1",
+          [pid],
+        );
+        if (found.length > 0 && /select 1/i.test(found[0].query ?? "")) {
+          keepaliveObserved = true;
+          break;
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(
+      keepaliveObserved,
+      "the keepalive's own SELECT 1 should show up as the run's last query while discover() is still sleeping",
+    );
+    assert.ok(pid, "must have found the run's own backend to terminate it");
+    await watcher.query("SELECT pg_terminate_backend($1)", [pid]);
+
+    const { code, stdout, stderr } = await exited;
+    assert.equal(code, 0, `the run should recover and exit cleanly; stderr:\n${stderr}`);
+    assert.match(stdout, /^mode: committed$/m);
+    assert.match(stdout, /document pulls acquired: 1/);
+    assert.match(
+      stderr,
+      /archive connection lost; reconnected on a fresh client/,
+      "the run's first post-discovery query must have hit the dropped connection and reconnected",
+    );
+    assert.equal(
+      await count(client, "documents"),
+      1,
+      "the one selected document still landed after reconnecting",
+    );
+  },
+);
