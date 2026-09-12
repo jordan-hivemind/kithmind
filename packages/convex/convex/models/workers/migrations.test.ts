@@ -1,15 +1,23 @@
 import { convexTest } from "convex-test";
 import { describe, expect, it } from "vitest";
+import type { Id } from "../../_generated/dataModel";
 import schema from "../../schema";
 import { modules } from "../../test.setup";
-import { admitDiscoveryUtf8, reserveDiscoveryWork } from "./discovery";
+import {
+  admitDiscoveryUtf8,
+  MAX_WORKER_DISCOVERY_ATTEMPTS,
+  reserveDiscoveryWork,
+} from "./discovery";
 import {
   appendWorkerScanPage,
   beginWorkerScan,
   reconcileWorkerScan,
   sealWorkerScan,
 } from "./model";
-import { backfillManagedJobsPage } from "./migrations";
+import {
+  backfillManagedJobsPage,
+  requeueFailedDiscoveryWorkPage,
+} from "./migrations";
 
 async function legacyAdmission() {
   const t = convexTest(schema, modules);
@@ -276,5 +284,276 @@ describe("B1 worker job upgrade", () => {
         }),
       ),
     ).rejects.toThrow("Invalid migration page bounds");
+  });
+});
+
+async function requeueFixture() {
+  const t = convexTest(schema, modules);
+  const ids = await t.run(async (ctx) => {
+    const userId = await ctx.db.insert("users", {
+      name: "Requeue owner",
+    });
+    const spaceId = await ctx.db.insert("spaces", {
+      kind: "personal",
+      name: "Requeue",
+      createdBy: userId,
+    });
+    await ctx.db.insert("spaceMembers", { spaceId, userId, role: "owner" });
+    const credentialId = await ctx.db.insert("apiKeys", {
+      userId,
+      keyHash: "a".repeat(64),
+      keyPrefix: "requeue",
+      name: "Requeue worker",
+      capabilities: ["ingest"],
+      spaceIds: [spaceId],
+      sourceAccountIds: [],
+    });
+
+    const makeAccount = async (accountId: string) =>
+      ctx.db.insert("sourceAccounts", {
+        spaceId,
+        connector: "fs",
+        accountId,
+        name: accountId,
+        enabled: true,
+        cursorVersion: 0,
+        freshnessMs: 60_000,
+        createdBy: userId,
+      });
+    const sourceAccountId = await makeAccount("requeue-target");
+    const otherSourceAccountId = await makeAccount("requeue-other");
+
+    const makeWork = async (
+      accountId: Id<"sourceAccounts">,
+      options: { state: "failed" | "needs_review"; attempts: number },
+    ) => {
+      const sourceItemId = await ctx.db.insert("sourceItems", {
+        spaceId,
+        sourceAccountId: accountId,
+        externalIdHash: crypto.randomUUID(),
+        lifecycle: "available",
+        originalLinkAvailable: true,
+        desiredProcessingEpoch: 1,
+      });
+      const scanId = await ctx.db.insert("workerSourceScans", {
+        spaceId,
+        sourceAccountId: accountId,
+        requestId: crypto.randomUUID(),
+        requestDigest: "c".repeat(64),
+        watcherId: "requeue",
+        connectorVersion: "v1",
+        mode: "normal",
+        inventoryEpoch: 0,
+        manifestVersionAtBegin: 0,
+        actorUserId: userId,
+        actorCredentialId: credentialId,
+        state: "enumerated",
+        nextPageOrdinal: 0,
+        nextReconcileOrdinal: 0,
+        inventoryDone: true,
+        pageCount: 0,
+        entryCount: 0,
+        changedCount: 0,
+        gapCount: 0,
+        reviewCount: 0,
+        startedAt: 0,
+        completedAt: 0,
+        expiresAt: 0,
+        retireAt: 0,
+      });
+      const pageId = await ctx.db.insert("workerScanPages", {
+        spaceId,
+        sourceAccountId: accountId,
+        scanId,
+        ordinal: 0,
+        requestId: crypto.randomUUID(),
+        requestDigest: "d".repeat(64),
+        entryCount: 1,
+        createdAt: 0,
+        retireAt: 0,
+      });
+      const entryId = await ctx.db.insert("workerScanEntries", {
+        spaceId,
+        sourceAccountId: accountId,
+        scanId,
+        scanPageId: pageId,
+        sourceItemId,
+        identityKeyHash: crypto.randomUUID(),
+        uriDigest: "f".repeat(64),
+        inventoryMetadataDigest: "1".repeat(64),
+        sourceModifiedAt: 0,
+        state: "needs_review",
+        observedAt: 0,
+        retireAt: 0,
+      });
+      return ctx.db.insert("workerDiscoveryWork", {
+        spaceId,
+        sourceAccountId: accountId,
+        sourceItemId,
+        scanId,
+        scanEntryId: entryId,
+        observationEpoch: 1,
+        processingEpoch: 1,
+        state: options.state,
+        contentHash: "2".repeat(64),
+        byteLength: 1,
+        capturedAt: 0,
+        sourceModifiedAt: 0,
+        mediaType: "application/pdf",
+        profileId: "pdf_docqa_v1",
+        contentRepresentation: "archived_binary_v1",
+        extractionFingerprint: "3".repeat(64),
+        extractorFingerprint: "4".repeat(64),
+        recordSchemaFingerprint: "5".repeat(64),
+        normalizationFingerprint: "6".repeat(64),
+        chunkerFingerprint: "7".repeat(64),
+        uri: "fs://requeue.pdf",
+        actorUserId: userId,
+        actorCredentialId: credentialId,
+        attempts: options.attempts,
+        leaseEpoch: 1,
+        ...(options.state === "failed"
+          ? { failureCode: "conversion_failed", retryable: false }
+          : {}),
+        createdAt: 0,
+        retireAt: 2_000_000,
+      });
+    };
+
+    const belowLimitFailed = await makeWork(sourceAccountId, {
+      state: "failed",
+      attempts: MAX_WORKER_DISCOVERY_ATTEMPTS - 1,
+    });
+    const belowLimitNeedsReview = await makeWork(sourceAccountId, {
+      state: "needs_review",
+      attempts: 1,
+    });
+    const atLimitFailed = await makeWork(sourceAccountId, {
+      state: "failed",
+      attempts: MAX_WORKER_DISCOVERY_ATTEMPTS,
+    });
+    const otherAccountFailed = await makeWork(otherSourceAccountId, {
+      state: "failed",
+      attempts: 0,
+    });
+
+    return {
+      sourceAccountId,
+      otherSourceAccountId,
+      belowLimitFailed,
+      belowLimitNeedsReview,
+      atLimitFailed,
+      otherAccountFailed,
+    };
+  });
+  return { t, ...ids };
+}
+
+describe("requeueFailedDiscoveryWork", () => {
+  it("requeues failed/needs_review rows under the attempt limit, skips rows at the limit, and never crosses source accounts", async () => {
+    const {
+      t,
+      sourceAccountId,
+      belowLimitFailed,
+      belowLimitNeedsReview,
+      atLimitFailed,
+      otherAccountFailed,
+    } = await requeueFixture();
+
+    const dry = await t.run((ctx) =>
+      requeueFailedDiscoveryWorkPage(ctx, {
+        sourceAccountId,
+        dryRun: true,
+        limit: 50,
+        now: 500,
+      }),
+    );
+    expect(dry).toEqual({
+      examined: 3,
+      requeued: 2,
+      skippedAttemptLimit: 1,
+      byPriorState: { failed: 2, needs_review: 1 },
+    });
+    // Dry run changes nothing.
+    for (const id of [belowLimitFailed, belowLimitNeedsReview, atLimitFailed]) {
+      const row = await t.run((ctx) => ctx.db.get(id));
+      expect(row?.state).not.toBe("queued");
+    }
+
+    const result = await t.run((ctx) =>
+      requeueFailedDiscoveryWorkPage(ctx, {
+        sourceAccountId,
+        dryRun: false,
+        limit: 50,
+        now: 500,
+      }),
+    );
+    expect(result).toEqual({
+      examined: 3,
+      requeued: 2,
+      skippedAttemptLimit: 1,
+      byPriorState: { failed: 2, needs_review: 1 },
+    });
+
+    const requeuedFailed = await t.run((ctx) => ctx.db.get(belowLimitFailed));
+    expect(requeuedFailed).toMatchObject({
+      state: "queued",
+      nextAttemptAt: 500,
+      attempts: MAX_WORKER_DISCOVERY_ATTEMPTS - 1,
+    });
+    expect(requeuedFailed?.leaseToken).toBeUndefined();
+    expect(requeuedFailed?.leaseOwnerCredentialId).toBeUndefined();
+    expect(requeuedFailed?.leaseExpiresAt).toBeUndefined();
+    expect(requeuedFailed?.retryable).toBeUndefined();
+    expect(requeuedFailed?.failureCode).toBeUndefined();
+
+    const requeuedNeedsReview = await t.run((ctx) =>
+      ctx.db.get(belowLimitNeedsReview),
+    );
+    expect(requeuedNeedsReview).toMatchObject({
+      state: "queued",
+      nextAttemptAt: 500,
+    });
+
+    // At the attempt limit: left alone.
+    const stillFailed = await t.run((ctx) => ctx.db.get(atLimitFailed));
+    expect(stillFailed).toMatchObject({
+      state: "failed",
+      attempts: MAX_WORKER_DISCOVERY_ATTEMPTS,
+    });
+
+    // Another source account's failed row is untouched.
+    const otherRow = await t.run((ctx) => ctx.db.get(otherAccountFailed));
+    expect(otherRow).toMatchObject({ state: "failed", attempts: 0 });
+
+    // Idempotent: nothing left to requeue for this source account now.
+    const rerun = await t.run((ctx) =>
+      requeueFailedDiscoveryWorkPage(ctx, {
+        sourceAccountId,
+        dryRun: false,
+        limit: 50,
+        now: 600,
+      }),
+    );
+    expect(rerun).toEqual({
+      examined: 1,
+      requeued: 0,
+      skippedAttemptLimit: 1,
+      byPriorState: { failed: 1, needs_review: 0 },
+    });
+  });
+
+  it("rejects an out-of-range limit", async () => {
+    const { t, sourceAccountId } = await requeueFixture();
+    await expect(
+      t.run((ctx) =>
+        requeueFailedDiscoveryWorkPage(ctx, {
+          sourceAccountId,
+          dryRun: true,
+          limit: 501,
+          now: 0,
+        }),
+      ),
+    ).rejects.toThrow("Invalid requeue page bounds");
   });
 });
