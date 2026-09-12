@@ -1,3 +1,10 @@
+import {
+  MAX_SHEET_COLUMNS,
+  MAX_SHEET_ROWS,
+  resolveSheetCell,
+  type SheetCellRef,
+} from "@repo/worker-protocol";
+
 import { deleteGenerationRecordsBatch } from "../records/model";
 import { invalidateRecordQueriesForForget } from "../records/querySessions";
 import type { Doc, Id } from "../../_generated/dataModel";
@@ -305,6 +312,21 @@ function requireLocator(locator: EvidenceLocator): void {
       MAX_LOCATOR_TEXT_CHARS,
     );
     requireBoundedString(locator.range, "Sheet locator range", 128);
+    return;
+  }
+  if (locator.kind === "cell_v1") {
+    requireBoundedString(
+      locator.sheet,
+      "Cell locator sheet name",
+      MAX_LOCATOR_TEXT_CHARS,
+    );
+    requireIntegerInRange(locator.row, "Cell locator row", 0, MAX_SHEET_ROWS);
+    requireIntegerInRange(
+      locator.column,
+      "Cell locator column",
+      0,
+      MAX_SHEET_COLUMNS,
+    );
     return;
   }
   if (locator.kind === "parser_item_v1") {
@@ -900,7 +922,16 @@ export async function stageEvidenceSpans(
  */
 export type CardEvidenceRef =
   | { pageOrdinal: number; start: number; end: number }
-  | { pageOrdinal: number; quote: string };
+  | { pageOrdinal: number; quote: string }
+  /**
+   * P2-70i. A cell of a spreadsheet's retained page. It is not a fourth kind
+   * of evidence: the cell is resolved into the page's UTF-16 range by the
+   * shared rendering rule and then becomes an ordinary span, so the gate
+   * proves a spreadsheet field exactly as it proves any other. What the cell
+   * form adds is that the resulting span carries a `cell_v1` locator naming
+   * the sheet, row and column it came from.
+   */
+  | { pageOrdinal: number; cell: SheetCellRef };
 
 /** How many card extraction fingerprints one reused span records. */
 export const MAX_CARD_EVIDENCE_CITATIONS = 16;
@@ -997,6 +1028,7 @@ export async function stageCardEvidenceSpans(
     }
     let start: number;
     let end: number;
+    let locator: NonNullable<Doc<"evidenceSpans">["locator"]> | undefined;
     if ("quote" in ref) {
       start = page.text.indexOf(ref.quote);
       // A quote that appears twice on its page proves nothing in particular.
@@ -1005,6 +1037,31 @@ export async function stageCardEvidenceSpans(
         continue;
       }
       end = start + ref.quote.length;
+    } else if ("cell" in ref) {
+      // The rendering rule is the whole of the resolution: the page names its
+      // sheet on line 0 and separates rows and cells unambiguously, so a cell
+      // that is on this page has exactly one range and a cell that is not
+      // resolves to nothing. A wrong sheet, a row or column past the end, and
+      // an empty cell all land here rather than being stored unproved.
+      const range = resolveSheetCell(page.text, ref.cell);
+      if (!range) {
+        results.push(null);
+        continue;
+      }
+      start = range.start;
+      end = range.end;
+      locator = {
+        kind: "cell_v1",
+        sheet: ref.cell.sheet,
+        row: ref.cell.row,
+        column: ref.cell.column,
+      };
+      try {
+        requireLocator(locator);
+      } catch {
+        results.push(null);
+        continue;
+      }
     } else {
       start = ref.start;
       end = ref.end;
@@ -1082,6 +1139,7 @@ export async function stageCardEvidenceSpans(
       start,
       end,
       quoteHash: await sha256Utf8(quote),
+      ...(locator === undefined ? {} : { locator }),
       cardExtractionFingerprints: [input.cardExtractionFingerprint],
     });
     spans.push((await ctx.db.get(id))!);

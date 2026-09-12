@@ -32,6 +32,7 @@ export type CardNormalizerId =
   | "text_v1"
   | "name_v1"
   | "money_v1"
+  | "money_or_number_v1"
   | "date_v1"
   | "rate_v1"
   | "integer_v1"
@@ -441,6 +442,12 @@ export const CARD_SCHEMAS: Readonly<Record<CardRecordKind, CardKindSchema>> = {
       },
     },
   },
+  // P2-70i. A spreadsheet's retained text is one page per sheet, rendered
+  // under `SHEET_PAGE_RENDERING_VERSION`: the sheet name on the page's first
+  // line, then one line per row with the cells separated by tabs. Every field
+  // below therefore cites either that first line or one cell, through the
+  // `cell_v1` locator, and the gate proves it exactly as it proves a field of
+  // any other kind.
   spreadsheet_card: {
     fields: {
       sheet_name: {
@@ -448,21 +455,42 @@ export const CARD_SCHEMAS: Readonly<Record<CardRecordKind, CardKindSchema>> = {
         repeated: true,
         normalizer: "text_v1",
         required: true,
+        description:
+          "One sheet's name, exactly as the page's first line states it. Use one ordinal per sheet, in page order.",
       },
       column_header: {
         valueTypes: ["text"],
         repeated: true,
         normalizer: "text_v1",
+        description:
+          "One column heading, cited by the cell it occupies in the sheet's first row.",
       },
+      // Section 4.3: a field with no resolvable evidence is not stored. A
+      // sheet's row count is structure rather than text, so this field
+      // publishes only for a sheet that states a count in a cell of its own,
+      // and is absent otherwise. The same is true of a column count, which is
+      // why no `column_count` field is declared: it could never carry
+      // evidence, and a field that can never be proved is not a field.
       row_count: {
         valueTypes: ["integer"],
         repeated: true,
         normalizer: "integer_v1",
+        description:
+          "A row count the sheet itself states in a cell. Do not count the rows yourself; omit the field when no cell states it.",
+      },
+      sheet_total_label: {
+        valueTypes: ["text"],
+        repeated: true,
+        normalizer: "text_v1",
+        description:
+          "What one key total is called, cited by the label cell of its own row. Use the same ordinal as the matching sheet_total.",
       },
       sheet_total: {
-        valueTypes: ["money"],
+        valueTypes: ["money", "decimal"],
         repeated: true,
-        normalizer: "money_v1",
+        normalizer: "money_or_number_v1",
+        description:
+          "One key total, cited by the cell holding it. A cell that carries a currency indicator is money; a bare figure is a decimal with unit code 1. Use the same ordinal as the matching sheet_total_label.",
       },
     },
   },
