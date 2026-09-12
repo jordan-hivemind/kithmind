@@ -189,6 +189,14 @@ export type DiscoveredDocument = {
    * institution-wide exactly as it was before this field existed.
    */
   readonly accountExternalKey?: string;
+  /**
+   * F1-68. The provider's own document-type/sub-type name (e.g. "Monthly
+   * Statement"), when the adapter can name one apart from `label` -- unlike
+   * `label`, this never has a date or any other value folded into it, so a
+   * run's start-of-pull preview can print it straight to an operator's
+   * terminal. Omitted when the adapter has nothing finer-grained than `kind`.
+   */
+  readonly subType?: string;
 };
 
 export type DiscoveredExportRange = {
@@ -224,6 +232,15 @@ export type DiscoverResult = {
   readonly documents: Listing<DiscoveredDocument>;
   readonly exportRanges: readonly DiscoveredExportRange[];
   readonly accounts: readonly DiscoveredAccount[];
+  /**
+   * F1-68. The provider's own reported document total per kind (e.g. the sum
+   * of a paginated listing's `numFound` across every time frame queried),
+   * when the adapter tracks totals per kind rather than only one combined
+   * total for `documents` as a whole. `null` for a kind the adapter could not
+   * get a total for. Omitted entirely by an adapter that only ever produces
+   * one combined listing (e.g. the synthetic reference adapter).
+   */
+  readonly documentListingTotalsByKind?: Readonly<Record<string, number | null>>;
 };
 
 // --- acquire --------------------------------------------------------------

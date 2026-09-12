@@ -1782,6 +1782,101 @@ async function runConcurrentPool(
   await Promise.all(lanes);
 }
 
+/**
+ * F1-68. Whether a document-tier pull is "already recorded" is, everywhere
+ * else in this file, decided by content hash (`isDocumentAlreadyImported`) --
+ * which only exists once the document has been downloaded. A start-of-run
+ * preview needs an answer before that, so this asks the same question a
+ * cheaper way: does a `documents` row already exist filed under the same
+ * (doc_type, account, doc_date) this pull would file under? That triple is
+ * exactly what persistAcquiredDocument/commitRetainedOnly file every document
+ * under, so it is a good proxy, not the real thing.
+ *
+ * ponytail: metadata match, not content hash -- two distinct real documents
+ * of the same kind, same account, same day would both count as "already
+ * recorded" here. Upgrade to a real lookup if that shows up in practice; the
+ * loop's own content-hash check still governs what actually imports either
+ * way.
+ */
+async function countAlreadyRecordedByKind(
+  client: ArchiveClient,
+  institutionId: string,
+  pullSpecs: readonly PullSpec[],
+): Promise<ReadonlyMap<string, number>> {
+  const byKind = new Map<string, number>();
+  const documentSpecs = pullSpecs.filter((spec) => isDocumentTierKind(spec.selection.kind));
+  if (documentSpecs.length === 0) return byKind;
+  const existing = await client.query<{
+    doc_type: string;
+    account_id: string | null;
+    doc_date: string | null;
+  }>(
+    "SELECT doc_type, account_id, doc_date::text AS doc_date FROM documents WHERE institution_id = $1",
+    [institutionId],
+  );
+  const recorded = new Set(
+    existing.rows.map((row) => `${row.doc_type} ${row.account_id ?? ""} ${row.doc_date ?? ""}`),
+  );
+  for (const spec of documentSpecs) {
+    const key = `${spec.docType} ${spec.accountId ?? ""} ${spec.docDate ?? ""}`;
+    if (!recorded.has(key)) continue;
+    byKind.set(spec.selection.kind, (byKind.get(spec.selection.kind) ?? 0) + 1);
+  }
+  return byKind;
+}
+
+/**
+ * F1-68. One stderr line per document kind, printed once, before any
+ * document is pulled: the provider's own listing total (when the adapter can
+ * name one per kind -- `discovered.documentListingTotalsByKind`), how many
+ * discover() actually enumerated, how many this run expects to already have
+ * on file (countAlreadyRecordedByKind above), and how many the current
+ * selection actually asks for. A second, indented line breaks the selected
+ * count down by the listing's own sub-type/document-type label, only when
+ * the adapter names one (`DiscoveredDocument.subType`) -- that field is
+ * documented to never carry a date or an account number, unlike `label`,
+ * which is why this uses it instead.
+ */
+function printDocumentKindPreview(
+  discovered: DiscoverResult,
+  pullSpecs: readonly PullSpec[],
+  documentsDiscoveredByKind: Readonly<Record<string, number>>,
+  alreadyRecordedByKind: ReadonlyMap<string, number>,
+): void {
+  const subTypeByExternalId = new Map<string, string>();
+  for (const doc of discovered.documents.items) {
+    if (doc.subType !== undefined) subTypeByExternalId.set(doc.externalId, doc.subType);
+  }
+  const kinds = new Set<string>(Object.keys(documentsDiscoveredByKind));
+  for (const spec of pullSpecs) {
+    if (isDocumentTierKind(spec.selection.kind)) kinds.add(spec.selection.kind);
+  }
+  for (const kind of [...kinds].sort()) {
+    const selected = pullSpecs.filter((spec) => spec.selection.kind === kind);
+    const listingTotal = discovered.documentListingTotalsByKind?.[kind];
+    console.error(
+      `document kind ${kind}: listing total=${listingTotal ?? "unknown"} ` +
+        `discovered=${documentsDiscoveredByKind[kind] ?? 0} ` +
+        `already recorded=${alreadyRecordedByKind.get(kind) ?? 0} ` +
+        `selected=${selected.length}`,
+    );
+    const bySubType = new Map<string, number>();
+    for (const spec of selected) {
+      if (!("externalId" in spec.selection)) continue;
+      const subType = subTypeByExternalId.get(spec.selection.externalId);
+      if (subType === undefined) continue;
+      bySubType.set(subType, (bySubType.get(subType) ?? 0) + 1);
+    }
+    if (bySubType.size > 0) {
+      const breakdown = [...bySubType.entries()]
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([subType, n]) => `${subType}=${n}`)
+        .join(", ");
+      console.error(`  ${kind} selected by type: ${breakdown}`);
+    }
+  }
+}
+
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   if (argv[0] === "reparse") {
@@ -1953,6 +2048,19 @@ async function main(): Promise<void> {
       if (spec.accountId === null) documentsFiledInstitutionWide += 1;
       else documentsFiledByAccount += 1;
     }
+    // F1-68. Total document-tier pulls this run's loop will process, for the
+    // "pulled N of M" progress line below -- every document-tier pull is
+    // filed one way or the other above, so their sum is the whole count.
+    const totalDocumentPulls = documentsFiledByAccount + documentsFiledInstitutionWide;
+
+    // F1-68. One line per document kind, to stderr, before anything is
+    // pulled: what the provider's own listing reports, what discover()
+    // actually enumerated, how many this run expects to already have on
+    // file, and how many the current selection actually asks for -- an
+    // operator staring down a selection that can take hours gets to see the
+    // shape of the run before it starts, not just its final summary.
+    const alreadyRecordedByKind = await countAlreadyRecordedByKind(pgClient, institutionId, pullSpecs);
+    printDocumentKindPreview(discovered, pullSpecs, documentsDiscoveredByKind, alreadyRecordedByKind);
 
     // F1-62. `resolveAccountLast4` below is memoized per account id, but a
     // miss issues a plain `pgClient.query` outside any of runPulls' own
@@ -2002,6 +2110,12 @@ async function main(): Promise<void> {
     let documentPullsSkipped = 0;
     let documentPullsFailed = 0;
     const documentPullsByKind = new Map<string, DocKindCounts>();
+    // F1-68. Every document-tier pull this run's loop has attempted so far
+    // (whichever lane got to it, acquired/skipped/failed alike) -- a plain
+    // counter is safe here for the same reason `consecutiveDocumentFailures`
+    // is (see runPulls's own doc comment): JS never runs two lanes'
+    // synchronous code at the same time.
+    let documentsPulled = 0;
 
     function bumpDocKind(kind: string, field: keyof DocKindCounts): void {
       const existing = documentPullsByKind.get(kind) ?? {
@@ -2357,6 +2471,14 @@ async function main(): Promise<void> {
       }
 
       async function processDocumentSpec(spec: PullSpec): Promise<void> {
+        // F1-68. Reported as this document is picked up, not once it
+        // finishes -- with `--concurrency` > 1 several lanes are always
+        // mid-flight, so "pulled" here means "started", the same way the
+        // final summary's own counts only settle once every lane is done.
+        documentsPulled += 1;
+        if (documentsPulled % 100 === 0) {
+          console.error(`pulled ${documentsPulled} of ${totalDocumentPulls}`);
+        }
         if (acquireOnly) {
           let acquired: AcquiredOnly;
           try {

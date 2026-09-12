@@ -501,13 +501,17 @@ async function fetchDocumentsPages(session, docType, kind) {
         seenIds.add(raw.documentId);
         const { periodStart, periodEnd } = documentPeriod(kind, raw.documentDate);
         const keyAccount = typeof raw.keyAccountNo === "string" ? raw.keyAccountNo : "";
+        // F1-68. Same text `label` folds in below, just without the date --
+        // safe for a run's start-of-pull preview to print on its own.
+        const subType = String(raw.documentTypeName ?? docType);
         items.push({
           externalId: encodeDocumentExternalId(raw.documentId, keyAccount, periodStart, periodEnd),
           kind,
           periodStart,
           periodEnd,
-          label: `${raw.documentTypeName ?? docType} ${periodEnd}`,
+          label: `${subType} ${periodEnd}`,
           accountExternalKey: rowAccountExternalKey(keyAccount),
+          subType,
         });
       }
       if (yearTotal !== null && yearCount >= yearTotal) break;
@@ -639,9 +643,20 @@ async function discover(session) {
           );
   }
 
+  // F1-68. Each docType's own providerTotal (sum of numFound across every
+  // time frame queried for it), keyed by kind, alongside DOCUMENT_TYPES's
+  // matching order -- documents above already merges every docType into one
+  // combined listing, which is what a run needs to acquire, but a run's
+  // start-of-pull preview wants the per-kind total this loses.
+  const documentListingTotalsByKind = {};
+  DOCUMENT_TYPES.forEach(({ kind }, index) => {
+    documentListingTotalsByKind[kind] = results[index].providerTotal;
+  });
+
   const { earliest, latest } = approximateActivityRange();
   return {
     documents,
+    documentListingTotalsByKind,
     exportRanges: [
       // Documented quirk: neither tier states an upfront row count ahead of a
       // specific pull (structured_api reports postedActivityCount only once
