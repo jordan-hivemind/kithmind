@@ -3,15 +3,21 @@ import { describe, expect, test } from "vitest";
 
 import { internal } from "../../_generated/api";
 import type { Doc, Id } from "../../_generated/dataModel";
+import type { MutationCtx } from "../../_generated/server";
 import schema from "../../schema";
 import { modules } from "../../test.setup";
+import { utf8ByteLength } from "../ingestion/hash";
 import {
   createOrGetRevision,
   createOrGetSourceItem,
   createOrGetTextVersion,
+  sha256Utf8,
   stageEvidenceSpans,
   stagePages,
 } from "../provenance/model";
+import { digestParsedMappingManifest } from "../workers/parsedProtocol";
+
+import { hydrateObservation } from "./model";
 
 import {
   CARD_PLAYBOOK_VERSION,
@@ -69,7 +75,243 @@ const FINGERPRINT = {
   promptVersion: CARD_PROMPT_VERSION,
 };
 
-async function seedDocument() {
+const CAPTURED_AT = 1_700_000_000_000;
+const EXTRACTION_FINGERPRINT = "plain:v1";
+const PARSER_FINGERPRINT = "pdf_docqa_v1";
+
+/**
+ * The two chains a generation can have. Every test in this file runs against
+ * one of them, and the ladder tests run against both: the card evidence gate
+ * has to prove a page either way. See `requireChainRepresentation` in
+ * `records/model.ts`.
+ */
+type ChainRepresentation = "inline_text_v1" | "parsed_pages_v1";
+
+type SeededChain = {
+  sourceRevisionId: Id<"sourceRevisions">;
+  sourceTextVersionId: Id<"sourceTextVersions">;
+  parserArtifactId?: Id<"sourceParserArtifacts">;
+};
+
+/** Inline pages index into `TEXT`, so page two starts after the joining \n. */
+const INLINE_PAGES = [
+  { ordinal: 0, start: 0, end: PAGE_ONE.length, text: PAGE_ONE },
+  {
+    ordinal: 1,
+    start: PAGE_ONE.length + 1,
+    end: TEXT.length,
+    text: PAGE_TWO,
+  },
+];
+
+/**
+ * Parsed pages are contiguous over the parser's complete text, the way the
+ * parsed pipeline requires. Both page sets carry the same page text, so a
+ * quote sits at the same page-relative offset in either fixture.
+ */
+const PARSED_PAGES = [
+  { ordinal: 0, start: 0, end: PAGE_ONE.length, text: PAGE_ONE },
+  {
+    ordinal: 1,
+    start: PAGE_ONE.length,
+    end: PAGE_ONE.length + PAGE_TWO.length,
+    text: PAGE_TWO,
+  },
+];
+
+function quoteStart(entry: { page: 0 | 1; quote: string }): number {
+  const start = [PAGE_ONE, PAGE_TWO][entry.page]!.indexOf(entry.quote);
+  if (start < 0) throw new Error(`fixture quote missing: ${entry.quote}`);
+  return start;
+}
+
+/**
+ * The inline path: the revision holds the document's UTF-8 bytes and the text
+ * version retains the whole extracted string, so a page proves itself by
+ * slicing out of that string.
+ */
+async function seedInlineChain(
+  ctx: MutationCtx,
+  seed: {
+    spaceId: Id<"spaces">;
+    userId: Id<"users">;
+    sourceItemId: Id<"sourceItems">;
+  },
+): Promise<SeededChain> {
+  const revision = await createOrGetRevision(ctx, {
+    spaceId: seed.spaceId,
+    sourceItemId: seed.sourceItemId,
+    mediaType: "text/plain",
+    inlineText: TEXT,
+    capturedAt: CAPTURED_AT,
+    userId: seed.userId,
+  });
+  const textVersion = await createOrGetTextVersion(ctx, {
+    spaceId: seed.spaceId,
+    sourceRevisionId: revision._id,
+    extractionFingerprint: EXTRACTION_FINGERPRINT,
+    text: TEXT,
+  });
+  const pages = await stagePages(ctx, {
+    spaceId: seed.spaceId,
+    sourceTextVersionId: textVersion._id,
+    pages: INLINE_PAGES,
+  });
+  await stageEvidenceSpans(ctx, {
+    spaceId: seed.spaceId,
+    sourceRevisionId: revision._id,
+    sourceTextVersionId: textVersion._id,
+    spans: QUOTES.map((entry, ordinal) => {
+      const start = quoteStart(entry);
+      return {
+        sourcePageId: pages[entry.page]!._id,
+        ordinal,
+        start,
+        end: start + entry.quote.length,
+      };
+    }),
+  });
+  await ctx.db.patch(textVersion._id, { evidenceSealed: true });
+  return {
+    sourceRevisionId: revision._id,
+    sourceTextVersionId: textVersion._id,
+  };
+}
+
+/**
+ * The PDF path of docs/plans/2026-09-07-original-byte-contract.md, built the
+ * way the parsed pipeline builds one. The original bytes are archived rather
+ * than inlined, a parser artifact records the parse, and the sealed
+ * `parsed_pages_v1` text version retains no whole-document string at all: its
+ * retained text exists only as the page rows, which is why the card evidence
+ * chain has to prove a page from the page itself.
+ *
+ * Synthetic throughout. No real document and no real parser output.
+ */
+async function seedParsedChain(
+  ctx: MutationCtx,
+  seed: {
+    spaceId: Id<"spaces">;
+    userId: Id<"users">;
+    sourceAccountId: Id<"sourceAccounts">;
+    sourceItemId: Id<"sourceItems">;
+  },
+): Promise<SeededChain> {
+  const originalBytes = "%PDF-1.7 synthetic ladder fixture";
+  const sourceRevisionId = await ctx.db.insert("sourceRevisions", {
+    spaceId: seed.spaceId,
+    sourceItemId: seed.sourceItemId,
+    contentHash: await sha256Utf8(originalBytes),
+    byteLength: utf8ByteLength(originalBytes),
+    mediaType: "application/pdf",
+    representation: "archived_binary_v1",
+    contentHashAuthority: "worker_asserted",
+    capturedAt: CAPTURED_AT,
+    userId: seed.userId,
+  });
+  const actorCredentialId = await ctx.db.insert("apiKeys", {
+    userId: seed.userId,
+    keyHash: "synthetic-ladder-key-hash",
+    keyPrefix: "km_synthetic",
+    name: "Synthetic parser worker",
+    capabilities: ["ingest"],
+    spaceIds: [seed.spaceId],
+  });
+  const parserArtifactId = await ctx.db.insert("sourceParserArtifacts", {
+    spaceId: seed.spaceId,
+    sourceAccountId: seed.sourceAccountId,
+    sourceItemId: seed.sourceItemId,
+    sourceRevisionId,
+    clientArtifactId: "synthetic-ladder-artifact",
+    parserFingerprint: PARSER_FINGERPRINT,
+    outputHash: await sha256Utf8("synthetic parser output"),
+    outputByteLength: 64,
+    outputMediaType: "application/json",
+    hashAuthority: "worker_asserted",
+    userId: seed.userId,
+    actorCredentialId,
+    createdAt: CAPTURED_AT,
+  });
+
+  // The parser's own mapping manifest, over the same rows a worker would have
+  // sent, so the sealed text version carries a real manifest hash.
+  const pageInputs = await Promise.all(
+    PARSED_PAGES.map(async (page) => ({
+      ordinal: page.ordinal,
+      start: page.start,
+      end: page.end,
+      text: page.text,
+      textHash: await sha256Utf8(page.text),
+    })),
+  );
+  const evidenceInputs = await Promise.all(
+    QUOTES.map(async (entry, ordinal) => {
+      const start = quoteStart(entry);
+      return {
+        ordinal,
+        pageOrdinal: entry.page,
+        start,
+        end: start + entry.quote.length,
+        quoteHash: await sha256Utf8(entry.quote),
+        locator: {
+          kind: "parser_page_v1" as const,
+          pageNumber: entry.page + 1,
+          pageTextHash: pageInputs[entry.page]!.textHash,
+        },
+      };
+    }),
+  );
+  const completeText = PARSED_PAGES.map((page) => page.text).join("");
+  const sourceTextVersionId = await ctx.db.insert("sourceTextVersions", {
+    spaceId: seed.spaceId,
+    sourceRevisionId,
+    extractionFingerprint: EXTRACTION_FINGERPRINT,
+    representation: "parsed_pages_v1",
+    textHash: await sha256Utf8(completeText),
+    textHashAuthority: "server_verified_retained_text",
+    byteLength: utf8ByteLength(completeText),
+    utf16Length: completeText.length,
+    pageCount: PARSED_PAGES.length,
+    mappingManifestHash: await digestParsedMappingManifest(
+      pageInputs,
+      evidenceInputs,
+    ),
+    parserArtifactId,
+    evidenceSealed: true,
+  });
+  const pageIds: Array<Id<"sourcePages">> = [];
+  for (const page of pageInputs) {
+    pageIds.push(
+      await ctx.db.insert("sourcePages", {
+        spaceId: seed.spaceId,
+        sourceTextVersionId,
+        ordinal: page.ordinal,
+        start: page.start,
+        end: page.end,
+        text: page.text,
+        textHash: page.textHash,
+      }),
+    );
+  }
+  for (const span of evidenceInputs) {
+    await ctx.db.insert("evidenceSpans", {
+      spaceId: seed.spaceId,
+      sourceRevisionId,
+      sourceTextVersionId,
+      sourcePageId: pageIds[span.pageOrdinal]!,
+      ordinal: span.ordinal,
+      start: span.start,
+      end: span.end,
+      quoteHash: span.quoteHash,
+      locator: { ...span.locator, parserArtifactId },
+    });
+  }
+  return { sourceRevisionId, sourceTextVersionId, parserArtifactId };
+}
+
+async function seedDocument(
+  representation: ChainRepresentation = "inline_text_v1",
+) {
   const t = convexTest(schema, modules);
   const seeded = await t.run(async (ctx) => {
     const userId = await ctx.db.insert("users", { name: "Synthetic owner" });
@@ -105,64 +347,37 @@ async function seedDocument() {
       sourceAccountId,
       externalId: "synthetic://ladder/one",
     });
-    const revision = await createOrGetRevision(ctx, {
-      spaceId,
-      sourceItemId: sourceItem._id,
-      mediaType: "text/plain",
-      inlineText: TEXT,
-      capturedAt: 1_700_000_000_000,
-      userId,
-    });
-    const textVersion = await createOrGetTextVersion(ctx, {
-      spaceId,
-      sourceRevisionId: revision._id,
-      extractionFingerprint: "plain:v1",
-      text: TEXT,
-    });
-    const pages = await stagePages(ctx, {
-      spaceId,
-      sourceTextVersionId: textVersion._id,
-      pages: [
-        { ordinal: 0, start: 0, end: PAGE_ONE.length, text: PAGE_ONE },
-        {
-          ordinal: 1,
-          start: PAGE_ONE.length + 1,
-          end: TEXT.length,
-          text: PAGE_TWO,
-        },
-      ],
-    });
-    const pageText = [PAGE_ONE, PAGE_TWO];
-    await stageEvidenceSpans(ctx, {
-      spaceId,
-      sourceRevisionId: revision._id,
-      sourceTextVersionId: textVersion._id,
-      spans: QUOTES.map((entry, ordinal) => {
-        const start = pageText[entry.page]!.indexOf(entry.quote);
-        if (start < 0) throw new Error(`fixture quote missing: ${entry.quote}`);
-        return {
-          sourcePageId: pages[entry.page]!._id,
-          ordinal,
-          start,
-          end: start + entry.quote.length,
-        };
-      }),
-    });
+    const chain =
+      representation === "parsed_pages_v1"
+        ? await seedParsedChain(ctx, {
+            spaceId,
+            userId,
+            sourceAccountId,
+            sourceItemId: sourceItem._id,
+          })
+        : await seedInlineChain(ctx, {
+            spaceId,
+            userId,
+            sourceItemId: sourceItem._id,
+          });
     const processingGenerationId = await ctx.db.insert(
       "processingGenerations",
       {
         spaceId,
         sourceAccountId,
         sourceItemId: sourceItem._id,
-        sourceRevisionId: revision._id,
-        sourceTextVersionId: textVersion._id,
+        sourceRevisionId: chain.sourceRevisionId,
+        sourceTextVersionId: chain.sourceTextVersionId,
         processingFingerprint: "ladder-base:v1",
-        extractionFingerprint: "plain:v1",
+        extractionFingerprint: EXTRACTION_FINGERPRINT,
         extractorFingerprint: "synthetic:v1",
         recordSchemaFingerprint: "records:v1",
         normalizationFingerprint: "exact:v1",
         chunkerFingerprint: "none:v1",
         correctionRevision: "one",
+        ...(chain.parserArtifactId === undefined
+          ? {}
+          : { parserArtifactId: chain.parserArtifactId }),
         desiredProcessingEpoch: 1,
         state: "ready",
         expectedPageCount: 2,
@@ -183,19 +398,18 @@ async function seedDocument() {
       spaceId,
       processingGenerationId,
       sourceItemId: sourceItem._id,
-      sourceRevisionId: revision._id,
-      sourceTextVersionId: textVersion._id,
+      sourceRevisionId: chain.sourceRevisionId,
+      sourceTextVersionId: chain.sourceTextVersionId,
       documentKey: "synthetic://ladder/one",
       title: "Worker supplied title",
       docType: "note",
-      capturedAt: 1_700_000_000_000,
+      capturedAt: CAPTURED_AT,
       evidenceSpanIds: [],
       publicationState: "active",
     });
-    await ctx.db.patch(textVersion._id, { evidenceSealed: true });
     await ctx.db.patch(sourceItem._id, {
-      desiredRevisionId: revision._id,
-      activeRevisionId: revision._id,
+      desiredRevisionId: chain.sourceRevisionId,
+      activeRevisionId: chain.sourceRevisionId,
       activeGenerationId: processingGenerationId,
     });
     await ctx.db.insert("spaceProcessingState", {
@@ -841,5 +1055,170 @@ describe("the extractCard entry point", () => {
       "claude-sonnet-5",
       "local:none",
     ]);
+  });
+});
+
+/**
+ * P2-79. Every document in the owner's first real extraction run is
+ * PDF-derived: the original bytes are archived and the worker's parse is
+ * sealed as `parsed_pages_v1`, whose retained text exists only as page rows.
+ * The card evidence chain was built and tested against inline text alone, so
+ * `requireGenerationChain` refused every one of them and no card could
+ * publish at all. These run the same ladder over the parsed fixture.
+ */
+describe("the extraction ladder over a PDF-derived document", () => {
+  test("step 0 passes over sealed parsed pages, exactly as over inline text", async () => {
+    const harness = await seedDocument("parsed_pages_v1");
+    const result = await runCardLadder({
+      recordKind: "document_card",
+      document: harness.document,
+      now: 11_000,
+      ops: opsFor(harness),
+      runners: ladder(
+        fixtureCardRunner({ step: "tier0", candidate: goodGeneric() }),
+        fixtureCardRunner({ step: "tier1", candidate: goodGeneric() }),
+      ),
+    });
+
+    expect(result.outcome).toBe("accepted");
+    expect(result.acceptedStep).toBe("tier0");
+    expect(result.storedFields.sort()).toEqual([
+      "card_date",
+      "card_party:0",
+      "card_summary",
+      "card_title",
+    ]);
+    const generations = await cardGenerations(harness, "document_card");
+    expect(generations.length).toBe(1);
+    // The card generation reads the parsed text version and names the same
+    // parser artifact, which is what lets its chain resolve.
+    expect(generations[0]!.parserArtifactId).toBeDefined();
+    expect(result.steps).toEqual([
+      { step: "local", modelId: "local:none", outcome: "skipped" },
+      { step: "tier0", modelId: "fixture:tier0", outcome: "accepted" },
+    ]);
+
+    // The read side resolves the parsed chain too: a stored observation
+    // hydrates with the quote cut from the sealed page.
+    const hydrated = await harness.t.run(async (ctx) => {
+      const observation = (await ctx.db.query("observations").collect()).find(
+        (row) => row.observationType === "card_title",
+      )!;
+      return await hydrateObservation(ctx, {
+        spaceId: harness.spaceId,
+        observationId: observation._id,
+      });
+    });
+    // Every quote is cut from a sealed page and rehashed, with no retained
+    // whole-document string anywhere in the chain.
+    expect(hydrated.evidence.map((item) => item.quote).sort()).toEqual(
+      [DATE, TITLE].sort(),
+    );
+    expect(hydrated.sourceText).toBeUndefined();
+    expect(hydrated.representation).toBe("parsed_pages_v1");
+  });
+
+  test("a card-staged span over a sealed parsed page publishes a prose field", async () => {
+    const harness = await seedDocument("parsed_pages_v1");
+    expect(cardStaged(await evidenceSpans(harness))).toEqual([]);
+
+    const result = await runCardLadder({
+      recordKind: "safe_note_card",
+      document: harness.document,
+      now: 12_000,
+      ops: opsFor(harness),
+      runners: ladder(
+        fixtureCardRunner({ step: "tier0", candidate: safeNote() }),
+        fixtureCardRunner({ step: "tier1", candidate: safeNote() }),
+      ),
+    });
+
+    expect(result.outcome).toBe("accepted");
+    expect(result.storedFields.sort()).toEqual([
+      "company",
+      "instrument_date",
+      "investor_entity",
+      "principal_amount",
+    ]);
+    const staged = cardStaged(await evidenceSpans(harness));
+    expect(staged.length).toBe(2);
+    const amountStart = PAGE_TWO.indexOf(AMOUNT);
+    expect(
+      staged.some(
+        (row) =>
+          row.start === amountStart && row.end === amountStart + AMOUNT.length,
+      ),
+    ).toBe(true);
+  });
+
+  test("a quote the sealed parsed page does not contain publishes nothing", async () => {
+    const harness = await seedDocument("parsed_pages_v1");
+    const result = await runCardLadder({
+      recordKind: "safe_note_card",
+      document: harness.document,
+      now: 13_000,
+      ops: opsFor(harness),
+      runners: ladder(
+        fixtureCardRunner({
+          step: "tier0",
+          candidate: safeNote({ amountSpan: span(1, "$999,999.00") }),
+        }),
+        fixtureCardRunner({
+          step: "tier1",
+          candidate: safeNote({ amountSpan: span(1, "$999,999.00") }),
+        }),
+      ),
+    });
+
+    expect(result.outcome).toBe("review");
+    expect(await cardGenerations(harness, "safe_note_card")).toEqual([]);
+    // Nothing unproved was stored, and the rejected steps left no span.
+    expect(cardStaged(await evidenceSpans(harness))).toEqual([]);
+  });
+
+  test("a value the cited parsed page does not reproduce is refused by the gate", async () => {
+    const harness = await seedDocument("parsed_pages_v1");
+    const result = await runCardLadder({
+      recordKind: "document_card",
+      document: harness.document,
+      now: 14_000,
+      ops: opsFor(harness),
+      runners: ladder(
+        fixtureCardRunner({ step: "tier0", candidate: wrongGeneric() }),
+        fixtureCardRunner({ step: "tier1", candidate: goodGeneric() }),
+      ),
+    });
+
+    // The gate reads the quote out of the parsed page and refuses the wrong
+    // title, then the correct step publishes. One generation, at tier 1.
+    expect(result.outcome).toBe("accepted");
+    expect(result.acceptedStep).toBe("tier1");
+    const generations = await cardGenerations(harness, "document_card");
+    expect(generations.length).toBe(1);
+    expect(generations[0]!.recordSchemaFingerprint).toContain("tier:tier1");
+  });
+
+  test("a page whose stored text no longer hashes to its row refuses the card", async () => {
+    const harness = await seedDocument("parsed_pages_v1");
+    await harness.t.run(async (ctx) => {
+      const page = (await ctx.db.query("sourcePages").collect()).find(
+        (row) => row.ordinal === 0,
+      )!;
+      // The hash is what proves a parsed page, because there is no retained
+      // whole-document string to slice it out of.
+      await ctx.db.patch(page._id, { textHash: "0".repeat(64) });
+    });
+    const result = await runCardLadder({
+      recordKind: "document_card",
+      document: harness.document,
+      now: 15_000,
+      ops: opsFor(harness),
+      runners: ladder(
+        fixtureCardRunner({ step: "tier0", candidate: goodGeneric() }),
+        fixtureCardRunner({ step: "tier1", candidate: goodGeneric() }),
+      ),
+    });
+    expect(result.outcome).toBe("review");
+    expect(await cardGenerations(harness, "document_card")).toEqual([]);
   });
 });
