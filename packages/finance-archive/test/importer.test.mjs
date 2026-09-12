@@ -583,6 +583,7 @@ test(
       NOW,
     );
     assert.deepEqual(Object.keys(summary).sort(), [
+      "changed",
       "filesSeen",
       "importRunId",
       "reconciliationsFailed",
@@ -594,6 +595,19 @@ test(
       "rowsRefused",
       "rowsSkipped",
     ]);
+    // F1-59. `changed` is what the gates need to check only the periods this
+    // import moved, and it is still not row content: opaque ids and dates
+    // the summary's own verdict lines already print, never a description, an
+    // amount, a locator or a hash.
+    assert.deepEqual(summary.changed.cash, {
+      snapshots: [],
+      activity: [{ accountId: ACCOUNT.id, date: "2026-03-15" }],
+    });
+    // The row names no instrument, so it moves no position series at all.
+    assert.deepEqual(summary.changed.positions, {
+      snapshots: [],
+      activity: [],
+    });
     const runRow = await one(
       client,
       "SELECT files_seen, rows_inserted, rows_skipped FROM import_runs",

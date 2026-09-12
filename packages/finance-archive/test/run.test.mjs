@@ -355,6 +355,64 @@ test(
 );
 
 test(
+  "--gates: every document is gated incrementally, and the whole-archive pass runs once at the end unless it is turned off",
+  { skip },
+  async (t) => {
+    const { schema } = await seededSchema(t);
+
+    const rawDir = mkdtempSync(join(tmpdir(), "kith-finance-run-gates-raw-"));
+    t.after(() => rmSync(rawDir, { recursive: true, force: true }));
+
+    const { fixturesDir, adapterModulePath, sessionModulePath } =
+      writeAdapterFixtures(t);
+    const selectionPath = writeSelection(fixturesDir, [
+      {
+        accountId: ACCOUNT.id,
+        docType: "activity_pull",
+        docDate: null,
+        selection: {
+          kind: "structured_api",
+          periodStart: "2025-01-01",
+          periodEnd: "2025-04-01",
+        },
+      },
+    ]);
+    const runImport = makeRunner({
+      adapterModulePath,
+      sessionModulePath,
+      selectionPath,
+      schema,
+      rawDir,
+    });
+
+    // F1-59. The default: publication gates what each document changed, and
+    // one whole-archive pass at the end reports the archive-wide counts.
+    const output = runImport();
+    assert.match(output, /^mode: committed$/m);
+    assert.match(output, /incremental gate periods checked: cash=\d+ positions=\d+/);
+    assert.match(output, /^whole-archive gate pass:$/m);
+    assert.match(output, /cash: checked=\d+ pass=\d+ fail=\d+ unverified=\d+/);
+    assert.match(
+      output,
+      /positions: checked=\d+ pass=\d+ fail=\d+ unverified=\d+ coverage gaps=\d+/,
+    );
+
+    // Turned off, the per-document gates still ran; only the final pass did not.
+    const skippedPass = runImport(["--gates", "incremental"]);
+    assert.match(
+      skippedPass,
+      /whole-archive gate pass: skipped \(--gates incremental\)/,
+    );
+    assert.match(skippedPass, /incremental gate periods checked: /);
+
+    assert.throws(
+      () => runImport(["--gates", "sometimes"]),
+      /--gates must be "full" or "incremental"/,
+    );
+  },
+);
+
+test(
   "a selection file's institutionId, when present, must agree with what the adapter's capabilities() resolve to",
   { skip },
   async (t) => {

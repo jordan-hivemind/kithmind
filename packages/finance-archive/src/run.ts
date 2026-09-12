@@ -7,7 +7,17 @@
 // a build:
 //
 //   node dist/run.js --adapter <module path> --session <module path> \
-//     --selection <json file> [--now <iso instant>] [--dry-run]
+//     --selection <json file> [--now <iso instant>] [--dry-run] \
+//     [--commit-every <n>] [--gates full|incremental]
+//
+// F1-59. Publishing a document gates that document: both gates check only
+// the periods its own inserted rows could have moved. `--gates full` (the
+// default) then runs one whole-archive pass at the end of the run, which
+// re-derives every period from scratch and is what the summary's counts
+// come from; `--gates incremental` skips that pass for a run that will be
+// followed by another. The whole-archive form used to run after every
+// document, which on the owner's archive was about four round trips per
+// period per document -- roughly ten minutes of waiting per statement.
 //
 // It composes existing pieces exactly as their own tests do -- see
 // test/adapterImport.test.mjs and test/syntheticAdapter.test.mjs -- and adds
@@ -68,6 +78,14 @@ import {
   withArchiveTransaction,
   type ArchiveClient,
 } from "./pgStore.js";
+import {
+  runPositionReconciliationGate,
+  type PositionReconciliationGateSummary,
+} from "./positionReconciliation.js";
+import {
+  runReconciliationGate,
+  type ReconciliationGateSummary,
+} from "./reconciliation.js";
 import {
   rawDocumentPath,
   readAndVerify,
@@ -477,7 +495,39 @@ type RunOutcome = {
    * pull went on to be acquired, skipped or failed. */
   readonly documentsFiledByAccount: number;
   readonly documentsFiledInstitutionWide: number;
+  /** F1-59. Periods the per-document (incremental) gates actually checked. */
+  readonly incrementalPeriodsChecked: GatePeriods;
+  /** F1-59. The one whole-archive pass at the end, or null under
+   * `--gates incremental`. */
+  readonly wholeArchiveGates: WholeArchiveGates | null;
 };
+
+type GatePeriods = { readonly cash: number; readonly positions: number };
+
+type WholeArchiveGates = {
+  readonly cash: ReconciliationGateSummary;
+  readonly positions: PositionReconciliationGateSummary;
+};
+
+/**
+ * F1-59. One whole-archive pass of both gates, as the last thing a run does.
+ *
+ * Every document's publication already gated the periods that document
+ * moved. This re-derives every period in the archive from scratch, which is
+ * what catches a verdict no single import could see it had to revisit, and
+ * it costs a fixed handful of round trips now that both gates batch. Run
+ * once per run, not once per document: per document it was about four round
+ * trips per period in the whole archive, which on the owner's archive was
+ * roughly ten minutes each.
+ */
+async function runWholeArchiveGates(
+  client: ArchiveClient,
+): Promise<WholeArchiveGates> {
+  return withArchiveTransaction(client, async (tx) => ({
+    cash: await runReconciliationGate(tx),
+    positions: await runPositionReconciliationGate(tx),
+  }));
+}
 
 type DocKindCounts = {
   readonly acquired: number;
@@ -888,13 +938,25 @@ async function runReparse(args: readonly string[]): Promise<void> {
       });
     }
 
-    printReparseSummary(outcome, onlyUnparsed);
+    // F1-59. Each document above gated only what it changed; this is the one
+    // whole-archive pass, at the end, where a reparse that moved rows across
+    // many accounts settles every period from scratch.
+    const wholeArchive =
+      outcome.documentsReparsed === 0
+        ? null
+        : await runWholeArchiveGates(pgClient);
+
+    printReparseSummary(outcome, onlyUnparsed, wholeArchive);
   } finally {
     await closeArchiveClient(pgClient);
   }
 }
 
-function printReparseSummary(outcome: ReparseOutcome, onlyUnparsed: boolean): void {
+function printReparseSummary(
+  outcome: ReparseOutcome,
+  onlyUnparsed: boolean,
+  wholeArchive: WholeArchiveGates | null,
+): void {
   console.log(`mode: reparse${onlyUnparsed ? " (--only-unparsed)" : ""}`);
   console.log(`documents considered: ${outcome.documentsConsidered}`);
   console.log(`documents skipped (not a document-tier capture): ${outcome.documentsSkippedTier}`);
@@ -906,6 +968,21 @@ function printReparseSummary(outcome: ReparseOutcome, onlyUnparsed: boolean): vo
   console.log(`rows refused: ${outcome.rowsRefused}`);
   console.log(`review items opened: ${outcome.reviewItemsOpened}`);
   console.log(`review items resolved: ${outcome.reviewItemsResolved}`);
+  if (wholeArchive === null) {
+    console.log("whole-archive gate pass: skipped (nothing reparsed)");
+  } else {
+    console.log("whole-archive gate pass:");
+    console.log(
+      `  cash: checked=${wholeArchive.cash.periodsChecked} pass=${wholeArchive.cash.passed} ` +
+        `fail=${wholeArchive.cash.failed} unverified=${wholeArchive.cash.unverified}`,
+    );
+    console.log(
+      `  positions: checked=${wholeArchive.positions.periodsChecked} ` +
+        `pass=${wholeArchive.positions.passed} fail=${wholeArchive.positions.failed} ` +
+        `unverified=${wholeArchive.positions.unverified} ` +
+        `coverage gaps=${wholeArchive.positions.coverageGaps.length}`,
+    );
+  }
 }
 
 async function main(): Promise<void> {
@@ -923,6 +1000,7 @@ async function main(): Promise<void> {
       now: { type: "string" },
       "dry-run": { type: "boolean", default: false },
       "commit-every": { type: "string", default: "1" },
+      gates: { type: "string", default: "full" },
     },
   });
 
@@ -943,6 +1021,13 @@ async function main(): Promise<void> {
   const commitEvery = Number(values["commit-every"]);
   if (!Number.isInteger(commitEvery) || commitEvery < 1) {
     throw new Error(`--commit-every must be a positive integer, got ${values["commit-every"]}`);
+  }
+  // F1-59. Every document's publication gates incrementally either way (see
+  // publishImport). This decides only whether the run ends with one
+  // whole-archive pass, which is the default because it is now cheap.
+  const gates = values.gates;
+  if (gates !== "full" && gates !== "incremental") {
+    throw new Error(`--gates must be "full" or "incremental", got ${gates}`);
   }
 
   const adapter = await loadAdapter(values.adapter);
@@ -1038,6 +1123,9 @@ async function main(): Promise<void> {
     let rowsDeduplicated = 0;
     let rowsRefused = 0;
     let reviewItemsOpened = 0;
+    let incrementalCashPeriods = 0;
+    let incrementalPositionPeriods = 0;
+    let wholeArchiveGates: WholeArchiveGates | null = null;
     const allDocumentShas: string[] = [];
 
     let documentPullsAcquired = 0;
@@ -1185,6 +1273,9 @@ async function main(): Promise<void> {
         rowsDeduplicated += publishSummary.rowsDeduplicated;
         rowsRefused += publishSummary.rowsRefused;
         reviewItemsOpened += conversionReviewItemsOpened + publishSummary.reviewItemsOpened;
+        // F1-59: what the incremental gates checked for this publication.
+        incrementalCashPeriods += publishSummary.cash.periodsChecked;
+        incrementalPositionPeriods += publishSummary.positions.periodsChecked;
         allDocumentShas.push(...documents.map((document) => document.sha256));
       });
     }
@@ -1316,7 +1407,18 @@ async function main(): Promise<void> {
         documentPullsByKind: Object.fromEntries(documentPullsByKind),
         documentsFiledByAccount,
         documentsFiledInstitutionWide,
+        incrementalPeriodsChecked: {
+          cash: incrementalCashPeriods,
+          positions: incrementalPositionPeriods,
+        },
+        wholeArchiveGates,
       };
+    }
+
+    /** F1-59. One whole-archive pass at the end of the run, by default. */
+    async function finishGates(): Promise<void> {
+      if (gates !== "full") return;
+      wholeArchiveGates = await runWholeArchiveGates(pgClient);
     }
 
     let outcome: RunOutcome;
@@ -1330,6 +1432,7 @@ async function main(): Promise<void> {
       try {
         await withArchiveTransaction(pgClient, async () => {
           await runPulls();
+          await finishGates();
           throw new DryRunAbort(await buildOutcome());
         });
         throw new Error("unreachable: dry run always throws DryRunAbort");
@@ -1339,6 +1442,7 @@ async function main(): Promise<void> {
       }
     } else {
       await runPulls();
+      await finishGates();
       outcome = await buildOutcome();
     }
 
@@ -1396,6 +1500,25 @@ function printSummary(
   console.log(`rows deduplicated: ${outcome.rowsDeduplicated}`);
   console.log(`rows refused: ${outcome.rowsRefused}`);
   console.log(`review items opened: ${outcome.reviewItemsOpened}`);
+  console.log(
+    `incremental gate periods checked: cash=${outcome.incrementalPeriodsChecked.cash} ` +
+      `positions=${outcome.incrementalPeriodsChecked.positions}`,
+  );
+  if (outcome.wholeArchiveGates === null) {
+    console.log("whole-archive gate pass: skipped (--gates incremental)");
+  } else {
+    const { cash, positions } = outcome.wholeArchiveGates;
+    console.log("whole-archive gate pass:");
+    console.log(
+      `  cash: checked=${cash.periodsChecked} pass=${cash.passed} ` +
+        `fail=${cash.failed} unverified=${cash.unverified}`,
+    );
+    console.log(
+      `  positions: checked=${positions.periodsChecked} pass=${positions.passed} ` +
+        `fail=${positions.failed} unverified=${positions.unverified} ` +
+        `coverage gaps=${positions.coverageGaps.length}`,
+    );
+  }
   console.log("money by currency:");
   for (const sum of outcome.currencySums) {
     console.log(`  ${sum.currency}: ${sum.total}`);
