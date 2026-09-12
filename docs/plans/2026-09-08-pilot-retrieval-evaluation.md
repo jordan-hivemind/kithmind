@@ -42,9 +42,9 @@ Authorization and citation-chain failures block release regardless of scores.
 
 The current index audit found 17 thought vectors and 163 chunk vectors: all
 180 active targets are present, with no missing, extra, duplicate or invalid
-rows. After the candidate trial below, the active profile is restored to small.
-This audit establishes index shape, not
-retrieval quality or a model comparison.
+rows. After the weighted large-profile trial below, the active profile is
+large. This audit establishes index shape, not retrieval quality or a model
+comparison.
 
 Current manifest limits are 256 eligible targets, 256 vector rows per
 generation, a 256-row thought scan and a 2 MiB estimated manifest budget.
@@ -91,19 +91,21 @@ pilot, not a held-out estimate of quality across the owner's filing system.
 The frozen labels were also scored offline against immutable retained chunks
 and evidence IDs. This records local cosine ranking, not hosted request
 latency or a deployed model change. The missing document-vector repair is
-complete and the active small profile remains in place. The large profile was subsequently evaluated in production and was not adopted
-after the hosted gate failed.
+complete. The large profile was evaluated in production twice: an
+equal-weight fusion trial was not adopted after the hosted gate failed, and
+the weighted-fusion retrial below passed the gate and is now the active
+profile.
 
-| Candidate                                                   | Answerable success at five |          Evidence MRR at five | Status                                              |
-| ----------------------------------------------------------- | -------------------------: | ----------------------------: | --------------------------------------------------- |
-| Existing 163 chunks, small 1,536 dimensions, raw chunk rank |                      13/18 |                       0.62037 | Diagnostic baseline                                 |
-| Existing 163 chunks, large 1,536 dimensions, raw chunk rank |                      17/18 |                       0.76389 | Evaluated; not adopted after hosted gate failure    |
-| Existing chunks, small, one result per document             |                      12/18 |       Not a deployment target | Superseded selection policy                         |
-| Existing chunks, large, one result per document             |                      13/18 |       Not a deployment target | Superseded selection policy                         |
-| Existing chunks, small, up to three passages per document   |                      13/18 | Not a model comparison change | Current passage-selection policy                    |
-| Existing chunks, large, up to three passages per document   |                      16/18 |       Not a deployment target | Current passage policy; evaluated model not adopted |
-| Page split near 1,200 characters with 180 overlap           |  11/18 parent-page success |               Diagnostic only | 475 chunks, exceeds current target bound            |
-| Page split near 2,400 characters with 300 overlap           |  13/18 parent-page success |               Diagnostic only | 263 chunks, exceeds current target bound            |
+| Candidate                                                   | Answerable success at five |          Evidence MRR at five | Status                                                                   |
+| ----------------------------------------------------------- | -------------------------: | ----------------------------: | ------------------------------------------------------------------------ |
+| Existing 163 chunks, small 1,536 dimensions, raw chunk rank |                      13/18 |                       0.62037 | Diagnostic baseline                                                      |
+| Existing 163 chunks, large 1,536 dimensions, raw chunk rank |                      17/18 |                       0.76389 | Corroborated by the weighted large-profile trial below; model now active |
+| Existing chunks, small, one result per document             |                      12/18 |       Not a deployment target | Superseded selection policy                                              |
+| Existing chunks, large, one result per document             |                      13/18 |       Not a deployment target | Superseded selection policy                                              |
+| Existing chunks, small, up to three passages per document   |                      13/18 | Not a model comparison change | Current passage-selection policy                                         |
+| Existing chunks, large, up to three passages per document   |                      16/18 |       Not a deployment target | Current passage policy; model now active after the weighted retrial      |
+| Page split near 1,200 characters with 180 overlap           |  11/18 parent-page success |               Diagnostic only | 475 chunks, exceeds current target bound                                 |
+| Page split near 2,400 characters with 300 overlap           |  13/18 parent-page success |               Diagnostic only | 263 chunks, exceeds current target bound                                 |
 
 The offline run made 55 provider requests with zero retries and reported
 511,224 input tokens. It does not infer cost. A split chunk inherits no proof
@@ -119,7 +121,8 @@ for both models. Small had MRR 0.8 and large had MRR 1.0; paired ordering was
 reported 5,356 input tokens, and had zero retries. Its historical and
 lifecycle filtering was offline evaluation logic, not a production security
 proof. The trial below completes the shared-profile safety check for this
-candidate, but its hosted document score does not meet the gate.
+candidate. Its first hosted document score did not meet the gate; the
+weighted-fusion retrial in the section after it did.
 
 ## Shared-profile trial and rollback
 
@@ -161,6 +164,58 @@ restored the original model configuration. Its 180-vector audit passed and the
 pinned watcher resumed with a complete pass. The candidate is not adopted.
 The next retrieval step is to diagnose fusion and passage-ranking misses while
 preserving the frozen labels and reporting any tuning as pilot diagnostics.
+
+## Weighted large-profile trial and adoption
+
+Date 2026-09-12. PR #89 gave semantic document ranks a bounded weight in
+reciprocal-rank fusion (k 60, keyword weight 1, semantic weight 1.25) instead
+of the prior equal weighting. Before changing the active model, a hosted
+validation of this weighting alone against the unchanged small profile
+confirmed no regression: 14/18, diagnostic only, not adopted. The candidate
+for this trial is `text-embedding-3-large` at 1,536 dimensions, revision
+`comparison-openai-large-1536-v1`, combined with the PR #89 weighted fusion.
+The corpus is unchanged at 180 active targets: 17 current thoughts, 163
+chunks and 9 documents.
+
+The same frozen 21 questions produced the following hosted results:
+
+| Measure                          | Keyword       | Weighted large hybrid |
+| -------------------------------- | ------------- | --------------------- |
+| Supporting evidence in top five  | 13/18 (72.2%) | 17/18 (94.4%)         |
+| Evidence MRR at five             | 0.648         | 0.758                 |
+| All-gold evidence recall at five | Not measured  | 0.833                 |
+| Request p95                      | 711.5 ms      | 1.4237 s              |
+| Semantic candidates available    | Not requested | 21/21                 |
+
+All 734 returned citations validated, with zero request, citation or
+authorization errors. The keyword result is unchanged from every prior run.
+Four frozen current-only production thought queries passed under the
+weighted large profile (4/4).
+
+The frozen gate (16/18 or better, MRR at five of at least 0.65, hosted p95
+below five seconds, semantic candidates for 21/21 requests, zero errors, and
+a passing thought smoke check) passed. The candidate is accepted and is now
+the active production profile: the model and revision overrides are set to
+the large profile rather than left absent. The small profile remains staged
+as the rollback artifact and would be regenerated fresh if ever needed; it is
+not left partially active alongside the large profile.
+
+| Run                                | Supporting evidence in top five | Status                             |
+| ---------------------------------- | ------------------------------: | ---------------------------------- |
+| Baseline                           |                           11/18 | Diagnostic baseline                |
+| Combined repair                    |                           14/18 | Passage-retention fix, not adopted |
+| First large, equal-weight fusion   |                           15/18 | Rejected; below the frozen gate    |
+| Small profile, weighted fusion     |                           14/18 | Diagnostic only, not adopted       |
+| Weighted large fusion (this trial) |                           17/18 | Accepted; now active               |
+
+The earlier offline sensitivity projection for the large model (17/18, see
+the offline comparison table above) is corroborated, not replaced, by this
+hosted run: the offline score anticipated the hosted outcome once fusion
+weighting was corrected, rather than substituting for it.
+
+This satisfies the retrieval-quality gate that bulk document backfill has
+been waiting on. The remaining bulk-backfill gates are parser/provenance and
+capacity (P1-12 and P2-6 growth tests), and both remain open.
 
 ## Controlled expansion
 
