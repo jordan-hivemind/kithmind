@@ -624,8 +624,14 @@ function scanAppend(value: Record<string, unknown>): void {
       integer(item.observationEpoch, "observationEpoch");
       integer(item.processingEpoch, "processingEpoch");
     } else {
-      exact(item, ["state"], ["sourceItemId"]);
+      exact(
+        item,
+        ["state"],
+        ["sourceItemId", "observationEpoch", "processingEpoch"],
+      );
       optionalId(item.sourceItemId, "sourceItemId");
+      optionalInteger(item.observationEpoch, "observationEpoch");
+      optionalInteger(item.processingEpoch, "processingEpoch");
     }
   }
 }
