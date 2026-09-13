@@ -302,7 +302,7 @@ test(
     await archive.connect();
     assert.equal(await applyPgSchema(archive, "finance"), PG_SCHEMA_VERSION);
     // The extraction of the shared helpers must not move the archive's schema on.
-    assert.equal(PG_SCHEMA_VERSION, 10);
+    assert.equal(PG_SCHEMA_VERSION, 11);
 
     const financeShape = () =>
       all(

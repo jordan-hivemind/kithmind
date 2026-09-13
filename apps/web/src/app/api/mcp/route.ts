@@ -37,9 +37,13 @@ export async function POST(req: Request) {
   // Bind the validated API key to a short-lived Convex identity. Convex
   // functions derive ownership from this token, never from caller input.
   const convexAuthToken = await createConvexMcpToken(auth);
-  // The finance provider's principal is the authenticated user, from the
-  // validated API key. It is never taken from the request body.
-  const server = createMcpServer(convexAuthToken, auth.userId);
+  // Finance continuations belong to this authenticated user and credential.
+  // Another key for the same user cannot replay them. Neither ID is supplied
+  // by the caller, and authentication runs again on every request.
+  const server = createMcpServer(
+    convexAuthToken,
+    `${auth.userId}:${auth.keyId}`,
+  );
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true,

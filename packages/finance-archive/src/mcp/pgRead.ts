@@ -1,4 +1,4 @@
-// The archive's read surface on Postgres (F1-21), serving the six operations
+// The archive's read surface on Postgres (F1-21), serving the eight operations
 // `@repo/finance-contract` defines. This replaces the SQLite `run_query`
 // surface entirely: there is no caller-supplied SQL here at all, which is the
 // typed-bounded-query rule the plan stopped waiving.
@@ -37,6 +37,7 @@ import {
   type CanonicalFinanceDecimal,
   canonicalizeFinanceDecimal,
   type FinanceAccountId,
+  type FinanceAccountDescriptor,
   type FinanceAggregateRecord,
   type FinanceBalanceRecord,
   type FinanceCaptureId,
@@ -48,21 +49,30 @@ import {
   type FinanceEvidence,
   type FinanceEvidenceId,
   type FinanceHoldingRecord,
+  type FinanceHoldingsSnapshotPosition,
+  type FinanceHoldingsSnapshotSelector,
   type FinanceInstrumentId,
   type FinanceReadRequest,
+  type FinancePrincipalId,
   type FinanceReadResponse,
   type FinanceRecordId,
   type FinanceRecordKind,
   type FinanceRevisionId,
   type FinanceSourceId,
   type FinanceSpaceId,
+  type FinanceSnapshotMetricSummary,
   type FinanceTransactionRecord,
   FinanceContractError,
   type GetCoverageRequest,
   type GetEvidenceRequest,
   type ListBalancesRequest,
+  type ListAccountsRequest,
+  type GetHoldingsSnapshotRequest,
   type ListHoldingsRequest,
   type ListTransactionsRequest,
+  MAX_FINANCE_RESPONSE_BYTES,
+  MAX_FINANCE_SNAPSHOT_SUMMARY_EVIDENCE_BYTES,
+  MAX_FINANCE_SNAPSHOT_SUMMARY_POSITIONS,
   parseFinanceCurrency,
   parseFinanceReadResponseShape,
   type RetainedSourceObject,
@@ -71,11 +81,18 @@ import {
   SUPPORTED_FINANCE_CURRENCIES,
 } from "@repo/finance-contract";
 
+import { addDecimal, subtractDecimal } from "../decimal.js";
 import { fromNumericText } from "../pgNumeric.js";
 import { READER_STATEMENT_TIMEOUT_MS } from "../pgReaderRole.js";
 import { archiveSchemaOf } from "../pgStore.js";
-import { resolveRawTreeRoot, sha256HexOf, textRelativePath } from "../rawTree.js";
+import {
+  resolveRawTreeRoot,
+  sha256HexOf,
+  textRelativePath,
+} from "../rawTree.js";
 import { selectRetainedText } from "../retainedTexts.js";
+import { issueFinanceCursor, verifyFinanceCursor } from "./financeCursor.js";
+import { financeDatasetRevision } from "./financeRevision.js";
 
 /** Ceiling on rows any one coverage-support query may return. */
 const MAX_SUPPORT_ROWS = 500;
@@ -85,6 +102,10 @@ const MAX_COVERAGE_GAPS = 32;
 const MAX_CONTRIBUTORS = 25;
 /** Floor for a coverage range when the archive has no dates to bound it. */
 const MIN_PLAUSIBLE_DATE = "1900-01-01";
+/** Prevent one untrusted provenance JSON value from dominating a page. */
+const MAX_SOURCE_LOCATOR_BYTES = 32 * 1024;
+/** Leave room for the envelope and summary under the 512 KiB wire ceiling. */
+const MAX_SNAPSHOT_PAGE_ITEM_BYTES = MAX_FINANCE_RESPONSE_BYTES - 128 * 1024;
 
 const supportedCurrencies = new Set<string>(SUPPORTED_FINANCE_CURRENCIES);
 
@@ -96,6 +117,10 @@ const supportedCurrencies = new Set<string>(SUPPORTED_FINANCE_CURRENCIES);
 type WithholdReason =
   | "unsupported_value"
   | "retained_evidence_unavailable"
+  | "unresolved_identity"
+  | "missing_value"
+  | "snapshot_summary_limit"
+  | "snapshot_summary_evidence_limit"
   | "source_gap"
   | "pending_import"
   | "failed_import"
@@ -332,7 +357,8 @@ function textSpanLocator(
 ): RetainedTextSpanEvidence["locator"] | null {
   if (value === null || typeof value !== "object") return null;
   const binding = value as Record<string, unknown>;
-  const { textSha256, textByteLength, textCodepointLength, start, end, quote } = binding;
+  const { textSha256, textByteLength, textCodepointLength, start, end, quote } =
+    binding;
   if (
     typeof textSha256 !== "string" ||
     !/^[a-f0-9]{64}$/.test(textSha256) ||
@@ -384,12 +410,17 @@ function textSpanQuoteAgrees(
   quote: string,
   money: CanonicalFinanceDecimal,
 ): boolean {
-  const withoutFootnote = quote.trim().replace(TEXT_SPAN_FOOTNOTE_SUFFIX, "").trim();
+  const withoutFootnote = quote
+    .trim()
+    .replace(TEXT_SPAN_FOOTNOTE_SUFFIX, "")
+    .trim();
   const negative = /^\(.*\)$/.test(withoutFootnote);
   const digits = withoutFootnote.replace(/^\(|\)$/g, "").replace(/[$,\s]/g, "");
   if (digits.length === 0) return false;
   try {
-    return canonicalizeFinanceDecimal(negative ? `-${digits}` : digits) === money;
+    return (
+      canonicalizeFinanceDecimal(negative ? `-${digits}` : digits) === money
+    );
   } catch {
     return false;
   }
@@ -429,7 +460,8 @@ function evidenceFor(
     return [
       {
         kind: "retained_text_span_v1",
-        evidenceId: `ev:${record.recordId}:${record.field}` as FinanceEvidenceId,
+        evidenceId:
+          `ev:${record.recordId}:${record.field}` as FinanceEvidenceId,
         sourceObject: document,
         locator,
       },
@@ -511,6 +543,13 @@ type ReadScope = {
   withheld: Set<WithholdReason>;
 };
 
+export type FinanceReadOptions = {
+  principalId: FinancePrincipalId;
+  cursorSigningSecret: string | Uint8Array;
+  rawTreeRoot?: string | null;
+  now?: () => number;
+};
+
 function addDays(date: string, days: number): string {
   const [year, month, day] = date.split("-").map(Number) as [
     number,
@@ -521,30 +560,55 @@ function addDays(date: string, days: number): string {
   return shifted.toISOString().slice(0, 10);
 }
 
-function encodeCursor(payload: unknown): string {
-  return Buffer.from(JSON.stringify({ v: 1, k: payload }), "utf8").toString(
-    "base64url",
-  );
+function cursorContext(scope: ReadScope, options: FinanceReadOptions) {
+  return {
+    principalId: options.principalId,
+    spaceId: scope.spaceId,
+    cursorSigningSecret: options.cursorSigningSecret,
+    now: options.now,
+  };
 }
 
-function decodeCursor(cursor: string | undefined): unknown {
-  if (cursor === undefined) return undefined;
-  try {
-    const parsed: unknown = JSON.parse(
-      Buffer.from(cursor, "base64url").toString("utf8"),
-    );
-    if (
-      parsed &&
-      typeof parsed === "object" &&
-      (parsed as { v?: unknown }).v === 1
-    ) {
-      return (parsed as { k: unknown }).k;
-    }
-  } catch {
-    // A cursor this surface did not mint is an invalid request, not a reason
-    // to silently serve page one, which would loop a caller forever.
-  }
-  throw new FinanceContractError("invalid_request");
+function cursorBinding(
+  scope: ReadScope,
+  request: FinanceReadRequest,
+  selectedSnapshotAsOf?: string,
+) {
+  return {
+    operation: request.operation,
+    normalizedRequest: request,
+    datasetRevision: scope.datasetRevision,
+    ...(selectedSnapshotAsOf === undefined ? {} : { selectedSnapshotAsOf }),
+  };
+}
+
+function readCursorKey(
+  scope: ReadScope,
+  request: FinanceReadRequest,
+  options: FinanceReadOptions,
+  selectedSnapshotAsOf?: string,
+): readonly string[] | undefined {
+  return request.cursor === undefined
+    ? undefined
+    : verifyFinanceCursor(
+        cursorContext(scope, options),
+        cursorBinding(scope, request, selectedSnapshotAsOf),
+        request.cursor,
+      );
+}
+
+function writeCursor(
+  scope: ReadScope,
+  request: FinanceReadRequest,
+  options: FinanceReadOptions,
+  key: readonly string[],
+  selectedSnapshotAsOf?: string,
+): string {
+  return issueFinanceCursor(
+    cursorContext(scope, options),
+    cursorBinding(scope, request, selectedSnapshotAsOf),
+    key,
+  );
 }
 
 /** A NUMERIC column as a contract decimal, or null when it cannot be one. */
@@ -603,52 +667,10 @@ async function withReadSnapshot<T>(
   }
 }
 
-/**
- * A token that changes exactly when the archive's content changes and is
- * stable across repeated reads of an unchanged archive, so a caller can pin
- * one with `expectedDatasetRevision`.
- *
- * Derived from the archive's own content rather than from a transaction id:
- * `pg_snapshot_xmin` advances with unrelated activity anywhere in the
- * cluster, which would make two identical reads report two revisions and
- * break exactly the pinning the field exists for.
- *
- * ponytail: counts and maxima over every table, which is a scan per table.
- * Fine for an archive of tens of thousands of rows queried occasionally.
- * Upgrade path if it stops being fine: a revision row written by
- * `publishImport`, which is the real publication boundary.
- */
-const REVISION_TABLES = [
-  "institutions",
-  "accounts",
-  "instruments",
-  "documents",
-  "transactions",
-  "positions",
-  "balances",
-  "liabilities",
-  "commitments",
-  "import_runs",
-  "reconciliations",
-  "position_reconciliations",
-  "review_items",
-] as const;
-
-async function datasetRevision(
-  client: pg.ClientBase,
-): Promise<FinanceDatasetRevision> {
-  const parts = REVISION_TABLES.map(
-    (table) =>
-      `(SELECT coalesce(count(*)::text || ':' || coalesce(max(id), ''), '') FROM ${table})`,
-  ).join(" || '|' || ");
-  const result = await client.query<{ revision: string }>(
-    `SELECT md5(${parts}) AS revision`,
-  );
-  return `rev-${result.rows[0]!.revision}` as FinanceDatasetRevision;
-}
-
+/** Summarizes every conservative disclosure accumulated while serving a read. */
 function coverageSummaryOf(scope: ReadScope): FinanceCoverageSummary {
-  if (scope.withheld.size === 0) return { status: "complete", asOf: Date.now() };
+  if (scope.withheld.size === 0)
+    return { status: "complete", asOf: Date.now() };
   const reasons = [...scope.withheld];
   // `source_gap` means something the archive has no record of at all, which
   // is the difference between "partial" and "unknown": a caller must not read
@@ -701,6 +723,8 @@ async function listPage<Row extends ListRow, Item>(
   values: unknown[],
   limit: number,
   itemOf: (row: Row, scope: ReadScope) => Item | null,
+  request: FinanceReadRequest,
+  options: FinanceReadOptions,
 ): Promise<{
   items: Item[];
   truncated: boolean;
@@ -720,7 +744,9 @@ async function listPage<Row extends ListRow, Item>(
     items,
     truncated,
     nextCursor:
-      truncated && last ? encodeCursor([last.ordinal, last.id]) : undefined,
+      truncated && last
+        ? writeCursor(scope, request, options, [last.ordinal, last.id])
+        : undefined,
   };
 }
 
@@ -870,8 +896,12 @@ function balanceItem(
   };
 }
 
-function cursorBounds(cursor: string | undefined): [string | null, string | null] {
-  const decoded = decodeCursor(cursor);
+function cursorBounds(
+  scope: ReadScope,
+  request: FinanceReadRequest,
+  options: FinanceReadOptions,
+): [string | null, string | null] {
+  const decoded = readCursorKey(scope, request, options);
   if (decoded === undefined) return [null, null];
   if (
     !Array.isArray(decoded) ||
@@ -884,12 +914,130 @@ function cursorBounds(cursor: string | undefined): [string | null, string | null
   return [decoded[0], decoded[1]];
 }
 
+type AccountDescriptorRow = {
+  account_id: string;
+  source_id: string;
+  institution_name: string;
+  acct_last4: string | null;
+  display_name: string | null;
+  account_type: string | null;
+  base_currency: string;
+};
+
+function accountDescriptorOf(
+  row: AccountDescriptorRow,
+): FinanceAccountDescriptor | null {
+  const baseCurrency = currencyOrNull(row.base_currency, {
+    withheld: new Set(),
+    spaceId: "" as FinanceSpaceId,
+    datasetRevision: "" as FinanceDatasetRevision,
+  });
+  if (baseCurrency === null) return null;
+  return {
+    accountId: row.account_id as FinanceAccountId,
+    sourceId: row.source_id as FinanceSourceId,
+    institutionName: row.institution_name,
+    ...(row.acct_last4 === null ? {} : { accountLast4: row.acct_last4 }),
+    ...(row.display_name === null ? {} : { displayLabel: row.display_name }),
+    ...(row.account_type === null ? {} : { accountType: row.account_type }),
+    baseCurrency,
+  };
+}
+
+async function listAccounts(
+  client: pg.ClientBase,
+  scope: ReadScope,
+  request: ListAccountsRequest,
+  options: FinanceReadOptions,
+): Promise<FinanceReadResponse> {
+  // Fetch one extra row so ambiguity is explicit, not an accidental byproduct
+  // of whichever account happens to sort first.
+  const cursorKey =
+    request.cursor === undefined
+      ? null
+      : verifyFinanceCursor(
+          {
+            principalId: options.principalId,
+            spaceId: scope.spaceId,
+            cursorSigningSecret: options.cursorSigningSecret,
+            now: options.now,
+          },
+          {
+            operation: request.operation,
+            normalizedRequest: request,
+            datasetRevision: scope.datasetRevision,
+          },
+          request.cursor,
+        );
+  const afterId = cursorKey === null ? null : cursorKey[0];
+  const result = await client.query<AccountDescriptorRow>(
+    `SELECT a.id AS account_id, i.id AS source_id, i.name AS institution_name,
+            a.acct_last4, a.display_name, a.account_type, a.base_currency
+       FROM accounts a JOIN institutions i ON i.id = a.institution_id
+      WHERE ($1::text IS NULL OR lower(regexp_replace(btrim(i.name), '\\s+', ' ', 'g')) = $1)
+        AND ($2::text IS NULL OR a.acct_last4 = $2)
+        AND ($3::text IS NULL OR lower(regexp_replace(btrim(a.display_name), '\\s+', ' ', 'g')) = $3)
+        AND ($4::text IS NULL OR a.id > $4)
+      ORDER BY a.id
+      LIMIT $5`,
+    [
+      request.institutionName ?? null,
+      request.accountLast4 ?? null,
+      request.displayLabel ?? null,
+      afterId,
+      request.limit + 1,
+    ],
+  );
+  const total = await client.query<{ count: string }>(
+    `SELECT count(*)::text AS count FROM accounts a JOIN institutions i ON i.id = a.institution_id
+      WHERE ($1::text IS NULL OR lower(regexp_replace(btrim(i.name), '\\s+', ' ', 'g')) = $1)
+        AND ($2::text IS NULL OR a.acct_last4 = $2)
+        AND ($3::text IS NULL OR lower(regexp_replace(btrim(a.display_name), '\\s+', ' ', 'g')) = $3)`,
+    [
+      request.institutionName ?? null,
+      request.accountLast4 ?? null,
+      request.displayLabel ?? null,
+    ],
+  );
+  const totalMatches = Number(total.rows[0]!.count);
+  const items = result.rows
+    .slice(0, request.limit)
+    .map(accountDescriptorOf)
+    .filter((item): item is FinanceAccountDescriptor => item !== null);
+  const truncated = result.rows.length > request.limit;
+  const nextCursor = truncated
+    ? issueFinanceCursor(
+        {
+          principalId: options.principalId,
+          spaceId: scope.spaceId,
+          cursorSigningSecret: options.cursorSigningSecret,
+          now: options.now,
+        },
+        {
+          operation: request.operation,
+          normalizedRequest: request,
+          datasetRevision: scope.datasetRevision,
+        },
+        [result.rows[request.limit - 1]!.account_id],
+      )
+    : undefined;
+  return {
+    ...envelope(scope, "list_accounts", truncated, nextCursor),
+    operation: "list_accounts",
+    matchStatus:
+      totalMatches === 0 ? "none" : totalMatches === 1 ? "unique" : "ambiguous",
+    totalMatches,
+    items,
+  } as FinanceReadResponse;
+}
+
 async function listTransactions(
   client: pg.ClientBase,
   scope: ReadScope,
   request: ListTransactionsRequest,
+  options: FinanceReadOptions,
 ): Promise<FinanceReadResponse> {
-  const [afterDate, afterId] = cursorBounds(request.cursor);
+  const [afterDate, afterId] = cursorBounds(scope, request, options);
   const page = await listPage(
     client,
     scope,
@@ -920,6 +1068,8 @@ async function listTransactions(
     ],
     request.limit,
     transactionItem,
+    request,
+    options,
   );
   await foldScopeCoverage(client, scope, {
     ...(request.sourceId === undefined ? {} : { sourceId: request.sourceId }),
@@ -940,8 +1090,9 @@ async function listHoldings(
   client: pg.ClientBase,
   scope: ReadScope,
   request: ListHoldingsRequest,
+  options: FinanceReadOptions,
 ): Promise<FinanceReadResponse> {
-  const [afterDate, afterId] = cursorBounds(request.cursor);
+  const [afterDate, afterId] = cursorBounds(scope, request, options);
   const page = await listPage(
     client,
     scope,
@@ -969,10 +1120,14 @@ async function listHoldings(
     ],
     request.limit,
     holdingItem,
+    request,
+    options,
   );
   await foldScopeCoverage(client, scope, {
     ...(request.sourceId === undefined ? {} : { sourceId: request.sourceId }),
-    ...(request.asOf === undefined ? {} : { toExclusive: addDays(request.asOf, 1) }),
+    ...(request.asOf === undefined
+      ? {}
+      : { toExclusive: addDays(request.asOf, 1) }),
     kinds: ["holding"],
   });
   return {
@@ -982,12 +1137,577 @@ async function listHoldings(
   } as FinanceReadResponse;
 }
 
+type SnapshotRow = EvidenceRow & {
+  id: string;
+  account_id: string;
+  as_of: string;
+  instrument_id: string | null;
+  instrument_name: string | null;
+  instrument_symbol: string | null;
+  quantity: string | null;
+  price: string | null;
+  cost_basis: string | null;
+  unrealized: string | null;
+  valuation_basis: string | null;
+  weak_match_open: boolean;
+  source_locator_oversized: boolean;
+};
+
+const SNAPSHOT_COLUMNS = `p.id, p.account_id, p.as_of::text,
+            p.instrument_id, p.quantity, p.price,
+            p.market_value AS money, p.cost_basis, p.unrealized, p.currency,
+            p.valuation_basis, p.source_document_id,
+            CASE WHEN octet_length(p.source_locator) <= ${MAX_SOURCE_LOCATOR_BYTES}
+                 THEN p.source_locator ELSE NULL END AS source_locator,
+            coalesce(octet_length(p.source_locator) > ${MAX_SOURCE_LOCATOR_BYTES}, FALSE)
+              AS source_locator_oversized,
+            ins.name AS instrument_name, ins.symbol AS instrument_symbol,
+            EXISTS (
+              SELECT 1 FROM review_items ri
+               WHERE ri.kind = 'weak_instrument_match'
+                 AND ri.status = 'open'
+                 AND ri.matched_instrument_id = p.instrument_id
+                 AND ri.institution_id = a.institution_id
+            ) AS weak_match_open,
+            ${EVIDENCE_COLUMNS}`;
+
+function snapshotPosition(
+  row: SnapshotRow,
+  scope: ReadScope,
+): FinanceHoldingsSnapshotPosition {
+  const recordId = `pos:${row.id}` as FinanceRecordId;
+  const currency = currencyOrNull(row.currency, scope);
+  if (currency === null) throw new FinanceContractError("invalid_response");
+  const result: FinanceHoldingsSnapshotPosition = {
+    recordId,
+    accountId: row.account_id as FinanceAccountId,
+    asOf: row.as_of,
+    currency,
+    instrument:
+      row.instrument_id === null
+        ? { status: "missing" }
+        : {
+            status: row.weak_match_open ? "ambiguous" : "resolved",
+            instrumentId: row.instrument_id as FinanceInstrumentId,
+            ...(row.instrument_name === null || row.instrument_name.length > 512
+              ? {}
+              : { name: row.instrument_name }),
+            ...(row.instrument_symbol === null ||
+            row.instrument_symbol.length > 128
+              ? {}
+              : { symbol: row.instrument_symbol }),
+          },
+    fieldEvidence: [],
+    disclosures: [],
+  };
+  if (
+    row.valuation_basis !== null &&
+    VALUATION_BASES.has(row.valuation_basis)
+  ) {
+    result.valuationBasis =
+      row.valuation_basis as FinanceHoldingsSnapshotPosition["valuationBasis"];
+  } else {
+    scope.withheld.add("unsupported_value");
+  }
+  if (
+    (row.instrument_name !== null && row.instrument_name.length > 512) ||
+    (row.instrument_symbol !== null && row.instrument_symbol.length > 128)
+  )
+    scope.withheld.add("unsupported_value");
+
+  const fields = [
+    ["quantity", row.quantity, "quantity"],
+    ["price", row.price, "price"],
+    ["marketValue", row.money, "marketValue"],
+    ["costBasis", row.cost_basis, "costBasis"],
+    ["storedUnrealizedGainLoss", row.unrealized, "unrealized"],
+  ] as const;
+  const citedValues = new Map<string, CanonicalFinanceDecimal>();
+  for (const [field, raw, locatorField] of fields) {
+    const decimal = decimalOrNull(raw, scope);
+    const evidence =
+      decimal === null || row.source_locator_oversized
+        ? null
+        : evidenceFor(
+            {
+              recordId,
+              field: locatorField,
+              money: decimal,
+              currency,
+              sourceLocator: row.source_locator,
+            },
+            documentOf(row),
+          );
+    if (decimal === null) {
+      if (raw === null) scope.withheld.add("missing_value");
+      result.disclosures.push({
+        field,
+        reason: raw === null ? "not_reported" : "unsupported_value",
+      });
+      continue;
+    }
+    if (evidence === null) {
+      scope.withheld.add("retained_evidence_unavailable");
+      result.disclosures.push({
+        field,
+        reason: "retained_evidence_unavailable",
+      });
+      continue;
+    }
+    result.fieldEvidence.push({ field, evidence });
+    citedValues.set(field, decimal);
+    if (field === "quantity") result.quantity = decimal;
+    else if (field === "price") result.price = { decimal, currency };
+    else if (field === "marketValue")
+      result.marketValue = { decimal, currency };
+    else if (field === "costBasis") result.costBasis = { decimal, currency };
+    else result.storedUnrealizedGainLoss = { decimal, currency };
+  }
+  const marketValue = citedValues.get("marketValue");
+  const costBasis = citedValues.get("costBasis");
+  if (marketValue !== undefined && costBasis !== undefined) {
+    try {
+      result.derivedUnrealizedGainLoss = {
+        amount: {
+          decimal: canonicalizeFinanceDecimal(
+            subtractDecimal(marketValue, costBasis),
+          ),
+          currency,
+        },
+        formula: "market_value_minus_cost_basis",
+      };
+    } catch {
+      scope.withheld.add("unsupported_value");
+      result.disclosures.push({
+        field: "derivedUnrealizedGainLoss",
+        reason: "precision_overflow",
+      });
+    }
+  }
+  if (row.instrument_id === null || row.weak_match_open)
+    scope.withheld.add("unresolved_identity");
+  return result;
+}
+
+function summaryMetric(
+  items: FinanceHoldingsSnapshotPosition[],
+  field:
+    | "marketValue"
+    | "costBasis"
+    | "storedUnrealizedGainLoss"
+    | "derivedUnrealizedGainLoss",
+  currency: FinanceCurrency,
+): FinanceSnapshotMetricSummary {
+  const values = items.flatMap((item) => {
+    if (field === "derivedUnrealizedGainLoss") {
+      return item.derivedUnrealizedGainLoss === undefined
+        ? []
+        : [item.derivedUnrealizedGainLoss.amount.decimal];
+    }
+    const value = item[field];
+    return value === undefined ? [] : [value.decimal];
+  });
+  const derivedOverflowCount =
+    field === "derivedUnrealizedGainLoss"
+      ? items.filter((item) =>
+          item.disclosures.some(
+            (disclosure) =>
+              disclosure.field === "derivedUnrealizedGainLoss" &&
+              disclosure.reason === "precision_overflow",
+          ),
+        ).length
+      : 0;
+  if (derivedOverflowCount > 0) {
+    return {
+      contributingPositionCount: values.length + derivedOverflowCount,
+      missingPositionCount: items.length - values.length - derivedOverflowCount,
+      issue: "precision_overflow",
+    };
+  }
+  try {
+    return {
+      ...(values.length === 0
+        ? {}
+        : {
+            amount: {
+              decimal: canonicalizeFinanceDecimal(
+                values.reduce(addDecimal, "0"),
+              ),
+              currency,
+            },
+          }),
+      contributingPositionCount: values.length,
+      missingPositionCount: items.length - values.length,
+    };
+  } catch {
+    return {
+      contributingPositionCount: values.length,
+      missingPositionCount: items.length - values.length,
+      issue: "precision_overflow" as const,
+    };
+  }
+}
+
+async function getHoldingsSnapshot(
+  client: pg.ClientBase,
+  scope: ReadScope,
+  request: GetHoldingsSnapshotRequest,
+  options: FinanceReadOptions,
+): Promise<FinanceReadResponse> {
+  const accountResult = await client.query<AccountDescriptorRow>(
+    `SELECT a.id AS account_id, i.id AS source_id, i.name AS institution_name,
+            a.acct_last4, a.display_name, a.account_type, a.base_currency
+       FROM accounts a JOIN institutions i ON i.id = a.institution_id
+      WHERE a.id = $1`,
+    [request.accountId],
+  );
+  const account =
+    accountResult.rows[0] && accountDescriptorOf(accountResult.rows[0]);
+  if (!account) throw new FinanceContractError("not_authorized");
+
+  const selected = await client.query<{ as_of: string | null }>(
+    `SELECT max(as_of)::text AS as_of FROM positions
+      WHERE account_id = $1
+        AND ($2::date IS NULL OR as_of = $2::date)
+        AND ($3::date IS NULL OR as_of <= $3::date)`,
+    [
+      request.accountId,
+      request.snapshot.mode === "exact" ? request.snapshot.asOf : null,
+      request.snapshot.mode === "latest"
+        ? (request.snapshot.onOrBefore ?? null)
+        : null,
+    ],
+  );
+  const asOf = selected.rows[0]!.as_of;
+  if (asOf === null) {
+    await foldScopeCoverage(client, scope, {
+      sourceId: account.sourceId,
+      ...(request.snapshot.mode === "exact"
+        ? {
+            from: request.snapshot.asOf,
+            toExclusive: addDays(request.snapshot.asOf, 1),
+          }
+        : {}),
+      kinds: ["holding", "balance"],
+    });
+    if (request.cursor !== undefined)
+      throw new FinanceContractError("invalid_request");
+    return {
+      ...envelope(scope, "get_holdings_snapshot", false, undefined),
+      operation: "get_holdings_snapshot",
+      requestedSnapshot: request.snapshot,
+      selectedSnapshot: { status: "not_found" },
+      account,
+      summary: {
+        status: "complete",
+        positionCount: 0,
+        resolvedInstrumentCount: 0,
+        unresolvedInstrumentCount: 0,
+        quantityCoverage: {
+          availablePositionCount: 0,
+          missingPositionCount: 0,
+        },
+        currencies: [],
+      },
+      items: [],
+    };
+  }
+
+  await foldScopeCoverage(client, scope, {
+    sourceId: account.sourceId,
+    from: asOf,
+    toExclusive: addDays(asOf, 1),
+    kinds: ["holding", "balance"],
+  });
+  const cursorKey =
+    request.cursor === undefined
+      ? null
+      : verifyFinanceCursor(
+          cursorContext(scope, options),
+          cursorBinding(scope, request, asOf),
+          request.cursor,
+        );
+  if (cursorKey !== null && cursorKey.length !== 1)
+    throw new FinanceContractError("invalid_request");
+  const afterId = cursorKey?.[0] ?? null;
+
+  const resource = await client.query<{
+    position_count: string;
+    source_locator_bytes: string;
+  }>(
+    `SELECT count(*)::text AS position_count,
+            coalesce(sum(octet_length(source_locator)), 0)::text
+              AS source_locator_bytes
+       FROM positions WHERE account_id = $1 AND as_of = $2::date`,
+    [request.accountId, asOf],
+  );
+  const positionCount = Number(resource.rows[0]!.position_count);
+  const sourceLocatorBytes = Number(resource.rows[0]!.source_locator_bytes);
+  if (
+    !Number.isSafeInteger(positionCount) ||
+    !Number.isSafeInteger(sourceLocatorBytes)
+  )
+    throw new FinanceContractError("invalid_response");
+  const positionLimitExceeded =
+    positionCount > MAX_FINANCE_SNAPSHOT_SUMMARY_POSITIONS;
+  const evidenceLimitExceeded =
+    sourceLocatorBytes > MAX_FINANCE_SNAPSHOT_SUMMARY_EVIDENCE_BYTES;
+
+  const paged = await client.query<SnapshotRow>(
+    `SELECT ${SNAPSHOT_COLUMNS}
+       FROM positions p
+       JOIN accounts a ON a.id = p.account_id
+       JOIN institutions i ON i.id = a.institution_id
+       LEFT JOIN instruments ins ON ins.id = p.instrument_id
+       LEFT JOIN documents d ON d.id = p.source_document_id
+      WHERE p.account_id = $1 AND p.as_of = $2::date
+        AND ($3::text IS NULL OR p.id > $3)
+      ORDER BY p.id LIMIT $4`,
+    [request.accountId, asOf, afterId, request.limit + 1],
+  );
+  const pageScope: ReadScope = { ...scope, withheld: new Set() };
+  const items: FinanceHoldingsSnapshotPosition[] = [];
+  let itemBytes = 2;
+  let consumedRows = 0;
+  for (const row of paged.rows.slice(0, request.limit)) {
+    const item = snapshotPosition(row, pageScope);
+    const nextBytes = Buffer.byteLength(JSON.stringify(item), "utf8") + 1;
+    if (
+      items.length > 0 &&
+      itemBytes + nextBytes > MAX_SNAPSHOT_PAGE_ITEM_BYTES
+    )
+      break;
+    items.push(item);
+    itemBytes += nextBytes;
+    consumedRows += 1;
+  }
+  for (const reason of pageScope.withheld) scope.withheld.add(reason);
+  const truncated = consumedRows < paged.rows.length;
+  const lastConsumed = paged.rows[consumedRows - 1];
+  const nextCursor =
+    truncated && lastConsumed !== undefined
+      ? issueFinanceCursor(
+          cursorContext(scope, options),
+          cursorBinding(scope, request, asOf),
+          [lastConsumed.id],
+        )
+      : undefined;
+
+  const issues: FinanceReadResponse["issues"] = [];
+  let summary: Extract<
+    FinanceReadResponse,
+    { operation: "get_holdings_snapshot" }
+  >["summary"];
+  if (positionLimitExceeded || evidenceLimitExceeded) {
+    if (positionLimitExceeded) {
+      scope.withheld.add("snapshot_summary_limit");
+      issues.push({
+        code: "snapshot_summary_limit",
+        positionCount,
+        limit: MAX_FINANCE_SNAPSHOT_SUMMARY_POSITIONS,
+      });
+    } else {
+      scope.withheld.add("snapshot_summary_evidence_limit");
+      issues.push({
+        code: "snapshot_summary_evidence_limit",
+        sourceLocatorBytes,
+        limit: MAX_FINANCE_SNAPSHOT_SUMMARY_EVIDENCE_BYTES,
+      });
+    }
+    summary = {
+      status: "unavailable",
+      reason: positionLimitExceeded ? "position_limit" : "evidence_bytes_limit",
+      positionCount,
+      currencies: [],
+    };
+  } else {
+    const all = await client.query<SnapshotRow>(
+      `SELECT ${SNAPSHOT_COLUMNS}
+         FROM positions p
+         JOIN accounts a ON a.id = p.account_id
+         JOIN institutions i ON i.id = a.institution_id
+         LEFT JOIN instruments ins ON ins.id = p.instrument_id
+         LEFT JOIN documents d ON d.id = p.source_document_id
+        WHERE p.account_id = $1 AND p.as_of = $2::date
+        ORDER BY p.id`,
+      [request.accountId, asOf],
+    );
+    const summaryScope: ReadScope = { ...scope, withheld: new Set() };
+    const allItems = all.rows.map((row) => snapshotPosition(row, summaryScope));
+    for (const reason of summaryScope.withheld) scope.withheld.add(reason);
+
+    const balances = await client.query<
+      BalanceRow & { currency_record_count: string }
+    >(
+      `WITH ranked_balances AS (
+         SELECT b.*,
+                count(*) OVER (PARTITION BY b.currency)::text
+                  AS currency_record_count,
+                row_number() OVER (PARTITION BY b.currency ORDER BY b.id)
+                  AS currency_record_rank
+           FROM balances b
+          WHERE b.account_id = $1 AND b.as_of = $2::date
+       )
+       SELECT b.id, b.account_id, b.as_of::text AS ordinal,
+              b.total_value AS money, b.cash, b.currency,
+              b.currency_record_count,
+              b.source_document_id,
+              CASE WHEN octet_length(b.source_locator) <= ${MAX_SOURCE_LOCATOR_BYTES}
+                   THEN b.source_locator ELSE NULL END AS source_locator,
+              ${EVIDENCE_COLUMNS}
+         FROM ranked_balances b
+         JOIN accounts a ON a.id = b.account_id
+         JOIN institutions i ON i.id = a.institution_id
+         LEFT JOIN documents d ON d.id = b.source_document_id
+        WHERE b.currency_record_rank <= 2
+        ORDER BY b.currency, b.id`,
+      [request.accountId, asOf],
+    );
+    const balanceByCurrency = new Map<
+      FinanceCurrency,
+      FinanceBalanceRecord[]
+    >();
+    for (const row of balances.rows) {
+      const value = balanceItem(row, scope);
+      if (value === null) continue;
+      const values = balanceByCurrency.get(value.totalValue.currency) ?? [];
+      values.push(value);
+      balanceByCurrency.set(value.totalValue.currency, values);
+    }
+    const currencySet = new Set<FinanceCurrency>(
+      allItems.map((item) => item.currency),
+    );
+    for (const row of balances.rows) {
+      if (supportedCurrencies.has(row.currency ?? ""))
+        currencySet.add(row.currency as FinanceCurrency);
+      else scope.withheld.add("unsupported_value");
+    }
+    const currencies = [...currencySet].sort().map((currency) => {
+      const inCurrency = allItems.filter((item) => item.currency === currency);
+      const marketValue = summaryMetric(inCurrency, "marketValue", currency);
+      const costBasis = summaryMetric(inCurrency, "costBasis", currency);
+      const storedUnrealizedGainLoss = summaryMetric(
+        inCurrency,
+        "storedUnrealizedGainLoss",
+        currency,
+      );
+      const derivedUnrealizedGainLoss = summaryMetric(
+        inCurrency,
+        "derivedUnrealizedGainLoss",
+        currency,
+      );
+      const rawStated = balances.rows.filter(
+        (row) => row.currency === currency,
+      );
+      const rawStatedCount = Number(rawStated[0]?.currency_record_count ?? 0);
+      if (!Number.isSafeInteger(rawStatedCount))
+        throw new FinanceContractError("invalid_response");
+      const citedStated = balanceByCurrency.get(currency) ?? [];
+      const statedAccountTotal =
+        rawStatedCount > 1
+          ? ({ status: "ambiguous" } as const)
+          : rawStatedCount === 0
+            ? ({ status: "not_reported" } as const)
+            : citedStated.length === 1
+              ? ({
+                  status: "available",
+                  amount: citedStated[0]!.totalValue,
+                  balanceRecordId: citedStated[0]!.recordId,
+                  evidence: citedStated[0]!.evidence,
+                } as const)
+              : ({ status: "retained_evidence_unavailable" } as const);
+      const reconciliation =
+        marketValue.amount === undefined ||
+        marketValue.missingPositionCount !== 0
+          ? ({ status: "incomplete" } as const)
+          : statedAccountTotal.status !== "available"
+            ? ({
+                status:
+                  statedAccountTotal.status === "ambiguous"
+                    ? "ambiguous"
+                    : "not_available",
+              } as const)
+            : (() => {
+                try {
+                  const difference = canonicalizeFinanceDecimal(
+                    subtractDecimal(
+                      statedAccountTotal.amount.decimal,
+                      marketValue.amount!.decimal,
+                    ),
+                  );
+                  return {
+                    status: difference === "0" ? "match" : "difference",
+                    difference: { decimal: difference, currency },
+                    formula:
+                      "stated_account_total_minus_position_market_value" as const,
+                  } as const;
+                } catch {
+                  scope.withheld.add("unsupported_value");
+                  return { status: "precision_overflow" } as const;
+                }
+              })();
+      return {
+        currency,
+        positionCount: inCurrency.length,
+        marketValue,
+        costBasis,
+        storedUnrealizedGainLoss,
+        derivedUnrealizedGainLoss,
+        statedAccountTotal,
+        reconciliation,
+      };
+    });
+    const resolvedInstrumentCount = allItems.filter(
+      (item) => item.instrument.status === "resolved",
+    ).length;
+    const availableQuantityCount = allItems.filter(
+      (item) => item.quantity !== undefined,
+    ).length;
+    const fullyUsable =
+      resolvedInstrumentCount === allItems.length &&
+      availableQuantityCount === allItems.length &&
+      currencies.every(
+        (item) =>
+          item.marketValue.missingPositionCount === 0 &&
+          item.marketValue.issue === undefined &&
+          item.costBasis.missingPositionCount === 0 &&
+          item.costBasis.issue === undefined &&
+          item.derivedUnrealizedGainLoss.missingPositionCount === 0 &&
+          item.derivedUnrealizedGainLoss.issue === undefined &&
+          (item.reconciliation.status === "match" ||
+            item.reconciliation.status === "difference"),
+      );
+    summary = {
+      status: fullyUsable ? "complete" : "partial",
+      positionCount: allItems.length,
+      resolvedInstrumentCount,
+      unresolvedInstrumentCount: allItems.length - resolvedInstrumentCount,
+      quantityCoverage: {
+        availablePositionCount: availableQuantityCount,
+        missingPositionCount: allItems.length - availableQuantityCount,
+      },
+      currencies,
+    };
+  }
+  return {
+    ...envelope(scope, "get_holdings_snapshot", truncated, nextCursor),
+    operation: "get_holdings_snapshot",
+    requestedSnapshot: request.snapshot,
+    selectedSnapshot: { status: "found", asOf },
+    account,
+    summary,
+    issues,
+    items,
+  };
+}
+
 async function listBalances(
   client: pg.ClientBase,
   scope: ReadScope,
   request: ListBalancesRequest,
+  options: FinanceReadOptions,
 ): Promise<FinanceReadResponse> {
-  const [afterDate, afterId] = cursorBounds(request.cursor);
+  const [afterDate, afterId] = cursorBounds(scope, request, options);
   const page = await listPage(
     client,
     scope,
@@ -1016,6 +1736,8 @@ async function listBalances(
     ],
     request.limit,
     balanceItem,
+    request,
+    options,
   );
   await foldScopeCoverage(client, scope, {
     ...(request.sourceId === undefined ? {} : { sourceId: request.sourceId }),
@@ -1056,8 +1778,12 @@ type AggregateRow = {
 function aggregateSql(
   request: AggregateMoneyRequest,
   groupsByAccount: boolean,
+  afterCurrency: string | null,
+  afterAccountId: string | null,
 ): { sql: string; values: unknown[] } {
-  const account = groupsByAccount ? ", a.id AS account_id" : ", NULL AS account_id";
+  const account = groupsByAccount
+    ? ", a.id AS account_id"
+    : ", NULL AS account_id";
   const group = groupsByAccount ? ", a.id" : "";
   const shared = [
     request.sourceId ?? null,
@@ -1068,22 +1794,32 @@ function aggregateSql(
 
   if (request.metric === "transaction_amount") {
     return {
-      sql: `SELECT t.currency${account}, sum(t.amount) AS total,
-                   count(*)::text AS contributors,
-                   (array_agg('txn:' || t.id ORDER BY t.process_date, t.id))[1:${MAX_CONTRIBUTORS}] AS ids
-              FROM transactions t
-              JOIN accounts a ON a.id = t.account_id
-              JOIN institutions i ON i.id = a.institution_id
-             WHERE t.amount IS NOT NULL
-               AND ($1::text IS NULL OR i.id = $1)
-               AND ($2::text IS NULL OR t.account_id = $2)
-               AND ($3::date IS NULL OR t.process_date >= $3::date)
-               AND ($4::date IS NULL OR t.process_date < $4::date)
-               AND ($5::text IS NULL OR t.currency = $5)
-             GROUP BY t.currency${group}
-             ORDER BY t.currency${group}
-             LIMIT $6`,
-      values: [...shared, request.currency ?? null],
+      sql: `WITH grouped AS (
+              SELECT t.currency${account}, sum(t.amount) AS total,
+                     count(*)::text AS contributors,
+                     (array_agg('txn:' || t.id ORDER BY t.process_date, t.id))[1:${MAX_CONTRIBUTORS}] AS ids
+                FROM transactions t
+                JOIN accounts a ON a.id = t.account_id
+                JOIN institutions i ON i.id = a.institution_id
+               WHERE t.amount IS NOT NULL
+                 AND ($1::text IS NULL OR i.id = $1)
+                 AND ($2::text IS NULL OR t.account_id = $2)
+                 AND ($3::date IS NULL OR t.process_date >= $3::date)
+                 AND ($4::date IS NULL OR t.process_date < $4::date)
+                 AND ($5::text IS NULL OR t.currency = $5)
+               GROUP BY t.currency${group}
+            )
+            SELECT * FROM grouped
+             WHERE ($6::text IS NULL OR
+                    (currency, coalesce(account_id, '')) > ($6, $7::text))
+             ORDER BY currency, coalesce(account_id, '')
+             LIMIT $8`,
+      values: [
+        ...shared,
+        request.currency ?? null,
+        afterCurrency,
+        afterAccountId,
+      ],
     };
   }
 
@@ -1109,19 +1845,29 @@ function aggregateSql(
           ),
           latest AS (
             SELECT acct, max(${dateColumn}) AS ${dateColumn} FROM scoped GROUP BY acct
+          ),
+          grouped AS (
+            SELECT s.currency${groupsByAccount ? ", s.acct AS account_id" : ", NULL AS account_id"},
+                   sum(s.${column}) AS total,
+                   count(*)::text AS contributors,
+                   (array_agg('${table === "balances" ? "bal" : "pos"}:' || s.id ORDER BY s.id))[1:${MAX_CONTRIBUTORS}] AS ids
+              FROM scoped s
+              JOIN latest l ON l.acct = s.acct AND l.${dateColumn} = s.${dateColumn}
+             WHERE s.${column} IS NOT NULL
+               AND ($5::text IS NULL OR s.currency = $5)
+             GROUP BY s.currency${groupsByAccount ? ", s.acct" : ""}
           )
-          SELECT s.currency${groupsByAccount ? ", s.acct AS account_id" : ", NULL AS account_id"},
-                 sum(s.${column}) AS total,
-                 count(*)::text AS contributors,
-                 (array_agg('${table === "balances" ? "bal" : "pos"}:' || s.id ORDER BY s.id))[1:${MAX_CONTRIBUTORS}] AS ids
-            FROM scoped s
-            JOIN latest l ON l.acct = s.acct AND l.${dateColumn} = s.${dateColumn}
-           WHERE s.${column} IS NOT NULL
-             AND ($5::text IS NULL OR s.currency = $5)
-           GROUP BY s.currency${groupsByAccount ? ", s.acct" : ""}
-           ORDER BY s.currency${groupsByAccount ? ", s.acct" : ""}
-           LIMIT $6`,
-    values: [...shared, request.currency ?? null],
+          SELECT * FROM grouped
+           WHERE ($6::text IS NULL OR
+                  (currency, coalesce(account_id, '')) > ($6, $7::text))
+           ORDER BY currency, coalesce(account_id, '')
+           LIMIT $8`,
+    values: [
+      ...shared,
+      request.currency ?? null,
+      afterCurrency,
+      afterAccountId,
+    ],
   };
 }
 
@@ -1129,9 +1875,23 @@ async function aggregateMoney(
   client: pg.ClientBase,
   scope: ReadScope,
   request: AggregateMoneyRequest,
+  options: FinanceReadOptions,
 ): Promise<FinanceReadResponse> {
   const groupsByAccount = request.groupBy === "account_currency";
-  const { sql, values } = aggregateSql(request, groupsByAccount);
+  const cursorKey = readCursorKey(scope, request, options);
+  if (
+    cursorKey !== undefined &&
+    (cursorKey.length !== 2 ||
+      typeof cursorKey[0] !== "string" ||
+      typeof cursorKey[1] !== "string")
+  )
+    throw new FinanceContractError("invalid_request");
+  const { sql, values } = aggregateSql(
+    request,
+    groupsByAccount,
+    cursorKey?.[0] ?? null,
+    cursorKey?.[1] ?? null,
+  );
   const result = await client.query<AggregateRow>(sql, [
     ...values,
     request.limit + 1,
@@ -1161,11 +1921,12 @@ async function aggregateMoney(
       ...(needsBreakdown
         ? {
             breakdown: {
-              queryReference: `aggregate_money.${request.metric}.${currency}`,
-              cursor: encodeCursor([
-                request.metric,
+              queryReference: `aggregate_money.${request.metric}.${currency}.${row.account_id ?? "all"}`,
+              cursor: writeCursor(scope, request, options, [
+                "breakdown",
                 currency,
                 row.account_id ?? "",
+                "0",
               ]),
             },
           }
@@ -1195,7 +1956,10 @@ async function aggregateMoney(
       "aggregate_money",
       truncated,
       truncated && last
-        ? encodeCursor([last.currency, last.account_id ?? ""])
+        ? writeCursor(scope, request, options, [
+            last.currency,
+            last.account_id ?? "",
+          ])
         : undefined,
     ),
     operation: "aggregate_money",
@@ -1221,6 +1985,7 @@ async function getEvidence(
   scope: ReadScope,
   request: GetEvidenceRequest,
   rawTreeRoot: string | null,
+  options: FinanceReadOptions,
 ): Promise<FinanceReadResponse> {
   const separator = request.recordId.indexOf(":");
   const record = RECORD_TABLES[request.recordId.slice(0, separator)];
@@ -1231,8 +1996,16 @@ async function getEvidence(
     // archive has never heard of is a coverage gap, not a citation-free row.
     scope.withheld.add("source_gap");
   } else {
-    const found = await client.query<EvidenceRow>(
+    const found = await client.query<
+      EvidenceRow & {
+        quantity?: string | null;
+        price?: string | null;
+        cost_basis?: string | null;
+        unrealized?: string | null;
+      }
+    >(
       `SELECT r.${record.money} AS money, r.currency,
+              ${record.table === "positions" ? "r.quantity, r.price, r.cost_basis, r.unrealized," : ""}
               r.source_document_id, r.source_locator,
               ${EVIDENCE_COLUMNS}
          FROM ${record.table} r
@@ -1243,16 +2016,29 @@ async function getEvidence(
       [id],
     );
     const row = found.rows[0];
+    const fields =
+      record.table === "positions"
+        ? ([
+            ["quantity", row?.quantity],
+            ["price", row?.price],
+            ["marketValue", row?.money],
+            ["costBasis", row?.cost_basis],
+            ["unrealized", row?.unrealized],
+          ] as const)
+        : ([[record.field, row?.money]] as const);
     const evidence = row
-      ? evidenceFor(
-          {
-            recordId: request.recordId,
-            field: record.field,
-            money: decimalOrNull(row.money, scope),
-            currency: currencyOrNull(row.currency, scope),
-            sourceLocator: row.source_locator,
-          },
-          documentOf(row),
+      ? fields.flatMap(
+          ([field, money]) =>
+            evidenceFor(
+              {
+                recordId: request.recordId,
+                field,
+                money: decimalOrNull(money, scope),
+                currency: currencyOrNull(row.currency, scope),
+                sourceLocator: row.source_locator,
+              },
+              documentOf(row),
+            ) ?? [],
         )
       : null;
     // F1-53: get_evidence, unlike a list operation, fetches the retained text
@@ -1269,6 +2055,7 @@ async function getEvidence(
     // transaction, not concurrent.
     if (
       evidence !== null &&
+      evidence.length > 0 &&
       (
         await Promise.all(
           evidence.map((item) =>
@@ -1282,11 +2069,29 @@ async function getEvidence(
       scope.withheld.add(row ? "retained_evidence_unavailable" : "source_gap");
     }
   }
+  const cursorKey = readCursorKey(scope, request, options);
+  if (
+    cursorKey !== undefined &&
+    (cursorKey.length !== 1 ||
+      !/^\d+$/.test(cursorKey[0]!) ||
+      !Number.isSafeInteger(Number(cursorKey[0])))
+  )
+    throw new FinanceContractError("invalid_request");
+  const offset = cursorKey === undefined ? 0 : Number(cursorKey[0]);
+  const page = items.slice(offset, offset + request.limit);
+  const truncated = items.length > offset + page.length;
   return {
-    ...envelope(scope, "get_evidence", false, undefined),
+    ...envelope(
+      scope,
+      "get_evidence",
+      truncated,
+      truncated
+        ? writeCursor(scope, request, options, [String(offset + page.length)])
+        : undefined,
+    ),
     operation: "get_evidence",
     recordId: request.recordId,
-    items,
+    items: page,
   } as FinanceReadResponse;
 }
 
@@ -1327,14 +2132,23 @@ type ReviewRow = {
 /** Merges overlapping and touching gaps of the same code, keeping order. */
 function mergeGaps(gaps: Gap[]): Gap[] {
   const sorted = [...gaps].sort(
-    (left, right) => left.from.localeCompare(right.from) || left.code.localeCompare(right.code),
+    (left, right) =>
+      left.from.localeCompare(right.from) ||
+      left.code.localeCompare(right.code),
   );
   const merged: Gap[] = [];
   for (const gap of sorted) {
     const previous = merged[merged.length - 1];
-    if (previous && previous.code === gap.code && gap.from <= previous.toExclusive) {
+    if (
+      previous &&
+      previous.code === gap.code &&
+      gap.from <= previous.toExclusive
+    ) {
       if (gap.toExclusive > previous.toExclusive) {
-        merged[merged.length - 1] = { ...previous, toExclusive: gap.toExclusive };
+        merged[merged.length - 1] = {
+          ...previous,
+          toExclusive: gap.toExclusive,
+        };
       }
       continue;
     }
@@ -1503,7 +2317,9 @@ async function coverageRecords(
       LIMIT $2`,
     [request.sourceId ?? null, MAX_SUPPORT_ROWS],
   );
-  const reviewBySource = new Map(reviews.rows.map((row) => [row.source_id, row]));
+  const reviewBySource = new Map(
+    reviews.rows.map((row) => [row.source_id, row]),
+  );
 
   const records: FinanceCoverageRecord[] = [];
   for (const source of sources.rows) {
@@ -1525,6 +2341,7 @@ async function getCoverage(
   client: pg.ClientBase,
   scope: ReadScope,
   request: GetCoverageRequest,
+  options: FinanceReadOptions,
 ): Promise<FinanceReadResponse> {
   const records = await coverageRecords(client, {
     ...(request.sourceId === undefined ? {} : { sourceId: request.sourceId }),
@@ -1535,7 +2352,7 @@ async function getCoverage(
     kinds: request.recordKinds ?? ["transaction", "holding", "balance"],
   });
 
-  const offset = coverageOffset(request.cursor);
+  const offset = coverageOffset(scope, request, options);
   const page = records.slice(offset, offset + request.limit);
   const truncated = records.length > offset + page.length;
   for (const record of page) {
@@ -1546,20 +2363,30 @@ async function getCoverage(
       scope,
       "get_coverage",
       truncated,
-      truncated ? encodeCursor(offset + page.length) : undefined,
+      truncated
+        ? writeCursor(scope, request, options, [String(offset + page.length)])
+        : undefined,
     ),
     operation: "get_coverage",
     items: page,
   } as FinanceReadResponse;
 }
 
-function coverageOffset(cursor: string | undefined): number {
-  const decoded = decodeCursor(cursor);
+function coverageOffset(
+  scope: ReadScope,
+  request: GetCoverageRequest,
+  options: FinanceReadOptions,
+): number {
+  const decoded = readCursorKey(scope, request, options);
   if (decoded === undefined) return 0;
-  if (typeof decoded !== "number" || !Number.isSafeInteger(decoded) || decoded < 0) {
+  if (
+    decoded.length !== 1 ||
+    !/^\d+$/.test(decoded[0]!) ||
+    !Number.isSafeInteger(Number(decoded[0]))
+  ) {
     throw new FinanceContractError("invalid_request");
   }
-  return decoded;
+  return Number(decoded[0]);
 }
 
 /**
@@ -1583,7 +2410,8 @@ function coverageRecordFor(
   periods: readonly PeriodRow[],
   review: ReviewRow | undefined,
 ): FinanceCoverageRecord | null {
-  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(source.source_id)) return null;
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(source.source_id))
+    return null;
 
   const [dataMin, dataMax] =
     kind === "transaction"
@@ -1610,7 +2438,9 @@ function coverageRecordFor(
     // period, and the only honest answer is that nothing is known here.
     gaps.push({ code: "source_gap", from, toExclusive });
   } else {
-    const mine = periods.filter((period) => period.source_id === source.source_id);
+    const mine = periods.filter(
+      (period) => period.source_id === source.source_id,
+    );
     for (const period of mine) {
       if (period.status === "pass") continue;
       const gap = clampGap(
@@ -1700,7 +2530,7 @@ export async function serveFinanceRead(
    * gateway's case -- instead of mutating that process-wide environment
    * variable. Every other operation ignores this entirely.
    */
-  options: { rawTreeRoot?: string | null } = {},
+  options: FinanceReadOptions,
 ): Promise<FinanceReadResponse> {
   if (request.spaceId !== spaceId) {
     throw new FinanceContractError("not_authorized");
@@ -1708,18 +2538,28 @@ export async function serveFinanceRead(
   const response = await withReadSnapshot(client, async () => {
     const scope: ReadScope = {
       spaceId: request.spaceId,
-      datasetRevision: await datasetRevision(client),
+      datasetRevision: await financeDatasetRevision(client),
       withheld: new Set<WithholdReason>(),
     };
+    if (
+      request.expectedDatasetRevision !== undefined &&
+      request.expectedDatasetRevision !== scope.datasetRevision
+    ) {
+      throw new FinanceContractError("revision_changed");
+    }
     switch (request.operation) {
+      case "list_accounts":
+        return listAccounts(client, scope, request, options);
+      case "get_holdings_snapshot":
+        return getHoldingsSnapshot(client, scope, request, options);
       case "list_transactions":
-        return listTransactions(client, scope, request);
+        return listTransactions(client, scope, request, options);
       case "list_holdings":
-        return listHoldings(client, scope, request);
+        return listHoldings(client, scope, request, options);
       case "list_balances":
-        return listBalances(client, scope, request);
+        return listBalances(client, scope, request, options);
       case "aggregate_money":
-        return aggregateMoney(client, scope, request);
+        return aggregateMoney(client, scope, request, options);
       case "get_evidence": {
         let rawTreeRoot: string | null;
         if (options.rawTreeRoot !== undefined) {
@@ -1731,10 +2571,10 @@ export async function serveFinanceRead(
             rawTreeRoot = null;
           }
         }
-        return getEvidence(client, scope, request, rawTreeRoot);
+        return getEvidence(client, scope, request, rawTreeRoot, options);
       }
       case "get_coverage":
-        return getCoverage(client, scope, request);
+        return getCoverage(client, scope, request, options);
     }
   });
   return parseFinanceReadResponseShape(response);

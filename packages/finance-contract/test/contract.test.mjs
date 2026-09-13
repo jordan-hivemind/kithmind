@@ -3,11 +3,13 @@ import { describe, it } from "node:test";
 
 import {
   FinanceContractError,
+  MAX_FINANCE_SNAPSHOT_SUMMARY_EVIDENCE_BYTES,
   MAX_FINANCE_DECIMAL_DIGITS,
   MAX_FINANCE_DECIMAL_SCALE,
   assertCompatibleFinanceCurrencies,
   authorizeFinanceReadRequest,
   canonicalizeFinanceDecimal,
+  normalizeFinanceLookupText,
   parseAuthorizedFinanceReadExchange,
   parseCanonicalFinanceDecimal,
   parseFinanceCurrency,
@@ -82,7 +84,7 @@ describe("canonical finance decimals and currencies", () => {
 
 describe("closed requests and trusted authorization", () => {
   it("accepts every operation fixture through the paired gateway validator", () => {
-    assert.equal(syntheticFinanceReadExchanges.length, 6);
+    assert.equal(syntheticFinanceReadExchanges.length, 8);
     for (const exchange of syntheticFinanceReadExchanges) {
       const parsed = parseExchange(exchange, {
         expectedDatasetRevision: "dataset-revision-synthetic-001",
@@ -90,6 +92,52 @@ describe("closed requests and trusted authorization", () => {
       assert.equal(parsed.response.operation, exchange.request.operation);
       assert.equal(parsed.authorization.principalId, "principal-synthetic-001");
     }
+  });
+
+  it("normalizes bounded account lookup text and rejects account-number-shaped input", () => {
+    assert.equal(
+      normalizeFinanceLookupText("  Example   Broker  "),
+      "example broker",
+    );
+    const request = clone(syntheticFinanceReadExchanges[6].request);
+    request.institutionName = "  Example   Broker ";
+    request.displayLabel = " INCOME ";
+    const parsed = parseFinanceReadRequest(request);
+    assert.equal(parsed.institutionName, "example broker");
+    assert.equal(parsed.displayLabel, "income");
+    request.accountLast4 = "12345";
+    rejects("invalid_request", () => parseFinanceReadRequest(request));
+  });
+
+  it("requires account disambiguation and exact snapshot selection truth", () => {
+    const accounts = clone(syntheticFinanceReadExchanges[6]);
+    accounts.response.matchStatus = "ambiguous";
+    accounts.response.totalMatches = 2;
+    accounts.response.items.push({
+      ...clone(accounts.response.items[0]),
+      accountId: "account-synthetic-002",
+      displayLabel: "Income",
+    });
+    assert.equal(parseExchange(accounts).response.matchStatus, "ambiguous");
+    accounts.response.matchStatus = "unique";
+    rejects("invalid_response", () => parseExchange(accounts));
+
+    const terminalPage = clone(syntheticFinanceReadExchanges[6]);
+    terminalPage.request.cursor = "abcdefghijklmnop";
+    terminalPage.response.matchStatus = "ambiguous";
+    terminalPage.response.totalMatches = 2;
+    assert.equal(parseExchange(terminalPage).response.items.length, 1);
+
+    const snapshot = clone(syntheticFinanceReadExchanges[7]);
+    snapshot.response.selectedSnapshot.asOf = "2026-07-30";
+    snapshot.response.items[0].asOf = "2026-07-30";
+    rejects("invalid_response", () => parseExchange(snapshot));
+  });
+
+  it("pins a request to its expected dataset revision", () => {
+    const exchange = clone(syntheticFinanceReadExchanges[7]);
+    exchange.request.expectedDatasetRevision = "dataset-revision-other";
+    rejects("revision_changed", () => parseExchange(exchange));
   });
 
   it("rejects client identity claims, malformed bounds, and sparse arrays", () => {
@@ -255,6 +303,83 @@ describe("response truth and evidence", () => {
   it("rejects mismatched aggregate currencies", () => {
     const exchange = clone(syntheticFinanceReadExchanges[3]);
     exchange.response.items[0].total.currency = "EUR";
+    rejects("invalid_response", () => parseExchange(exchange));
+  });
+
+  it("requires every snapshot value to be cited or explicitly withheld", () => {
+    const exchange = clone(syntheticFinanceReadExchanges[7]);
+    exchange.response.items[0].disclosures =
+      exchange.response.items[0].disclosures.filter(
+        (item) => item.field !== "price",
+      );
+    rejects("invalid_response", () => parseExchange(exchange));
+
+    const wrongDerivation = clone(syntheticFinanceReadExchanges[7]);
+    wrongDerivation.response.items[0].derivedUnrealizedGainLoss.amount.decimal =
+      "59";
+    rejects("invalid_response", () => parseExchange(wrongDerivation));
+
+    const forgedReconciliation = clone(syntheticFinanceReadExchanges[7]);
+    forgedReconciliation.response.summary.currencies[0].reconciliation.status =
+      "difference";
+    forgedReconciliation.response.summary.currencies[0].reconciliation.difference.decimal =
+      "1";
+    rejects("invalid_response", () => parseExchange(forgedReconciliation));
+
+    const falseComplete = clone(syntheticFinanceReadExchanges[7]);
+    const cost = falseComplete.response.summary.currencies[0].costBasis;
+    delete cost.amount;
+    cost.contributingPositionCount = 0;
+    cost.missingPositionCount = 1;
+    rejects("invalid_response", () => parseExchange(falseComplete));
+
+    const hiddenAmbiguity = clone(syntheticFinanceReadExchanges[7]);
+    hiddenAmbiguity.response.items[0].instrument.status = "ambiguous";
+    rejects("invalid_response", () => parseExchange(hiddenAmbiguity));
+
+    const falseDerivedOverflow = clone(syntheticFinanceReadExchanges[7]);
+    delete falseDerivedOverflow.response.items[0].derivedUnrealizedGainLoss;
+    falseDerivedOverflow.response.items[0].disclosures.push({
+      field: "derivedUnrealizedGainLoss",
+      reason: "precision_overflow",
+    });
+    rejects("invalid_response", () => parseExchange(falseDerivedOverflow));
+
+    const falseReconciliationOverflow = clone(syntheticFinanceReadExchanges[7]);
+    falseReconciliationOverflow.response.summary.currencies[0].reconciliation =
+      {
+        status: "precision_overflow",
+      };
+    rejects("invalid_response", () =>
+      parseExchange(falseReconciliationOverflow),
+    );
+  });
+
+  it("discloses an evidence-memory bound when a snapshot summary is unavailable", () => {
+    const exchange = clone(syntheticFinanceReadExchanges[7]);
+    exchange.response.summary = {
+      status: "unavailable",
+      reason: "evidence_bytes_limit",
+      positionCount: 1,
+      currencies: [],
+    };
+    exchange.response.coverage = {
+      status: "partial",
+      reasons: ["snapshot_summary_evidence_limit"],
+    };
+    exchange.response.completeness = "partial";
+    exchange.response.issues = [
+      {
+        code: "snapshot_summary_evidence_limit",
+        sourceLocatorBytes: MAX_FINANCE_SNAPSHOT_SUMMARY_EVIDENCE_BYTES + 1,
+        limit: MAX_FINANCE_SNAPSHOT_SUMMARY_EVIDENCE_BYTES,
+      },
+    ];
+    assert.equal(
+      parseExchange(exchange).response.summary.status,
+      "unavailable",
+    );
+    exchange.response.issues = [];
     rejects("invalid_response", () => parseExchange(exchange));
   });
 

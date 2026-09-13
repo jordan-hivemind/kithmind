@@ -1,3 +1,4 @@
+import { FINANCE_READ_REQUEST_DESCRIPTION } from "@repo/finance-contract";
 import { z } from "zod";
 
 const id = z.string().trim().min(1).max(128);
@@ -87,14 +88,7 @@ const kithRecordQuerySchema = z.discriminatedUnion("operation", [
 const financeArchiveQuerySchema = z
   .object({
     provider: z.literal("finance_archive"),
-    request: z
-      .record(z.unknown())
-      .describe(
-        "A finance read contract request: contractVersion 1, spaceId, limit, " +
-          "an operation of list_transactions, list_holdings, list_balances, " +
-          "aggregate_money, get_evidence or get_coverage, and that " +
-          "operation's own filters.",
-      ),
+    request: z.record(z.unknown()).describe(FINANCE_READ_REQUEST_DESCRIPTION),
   })
   .strict();
 

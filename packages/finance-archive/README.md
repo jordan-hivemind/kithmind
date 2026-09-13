@@ -237,17 +237,17 @@ walked every copy.
 
 Three things changed, one per stage:
 
-| Stage     | Rule                                                                                              |
-| --------- | ------------------------------------------------------------------------------------------------- |
+| Stage     | Rule                                                                                               |
+| --------- | -------------------------------------------------------------------------------------------------- |
 | Selection | `"expand": "discovered"` skips a listing item this archive already records. `--refetch` overrides. |
 | Importer  | A pull whose provider id is on file under different bytes is a new capture, not a second row.      |
-| Schema    | `provider_document_id`, unique per institution among non-superseded rows; `superseded_by`.          |
+| Schema    | `provider_document_id`, unique per institution among non-superseded rows; `superseded_by`.         |
 
 Nothing here discards bytes. Ground rule 1 is unchanged: every capture is
 retained, and a re-rendered download still writes its bytes and its own
 capture manifest to the raw tree (`captures.ts`, which now records
 `providerDocumentId` too, so the tree keeps saying which document a capture is
-*of*). What F1-71 refuses is a second `documents` row and a second import of
+_of_). What F1-71 refuses is a second `documents` row and a second import of
 rows the archive already has.
 
 The start-of-run line reports the whole decision rather than only its first
@@ -618,7 +618,7 @@ skips a byte-identical document's transactions (`documents.sha256`, checked
 before any row is inserted, gated on `parsed_ok` per the fix above) -- and
 (F1-49) each also carries its own `row_hash`
 (`positionHash`/`balanceHash`/`liabilityHash` in `rowHash.ts`), computed from
-the fields that make a *stated* holding identical: account, instrument (or
+the fields that make a _stated_ holding identical: account, instrument (or
 null), `as_of`, quantity, market value, cost basis and valuation basis for a
 position; account, `as_of`, total value and cash for a balance; account,
 kind, `as_of` and balance for a liability. Not price or unrealized, which are
@@ -689,7 +689,7 @@ fallback above. The adapter refuses that section now (see
 [`packages/adapter-morgan-stanley`](../adapter-morgan-stanley), "Consolidated
 statements"), and this refuses the second row for any layout that ever does
 the same thing again. `balance_cash_conflict` (F1-8a) stays what it was: two
-*different* documents disagreeing, where both rows are kept because either
+_different_ documents disagreeing, where both rows are kept because either
 could be the right one.
 
 ## Reconciliation gate
@@ -713,11 +713,11 @@ The archive is hosted, so a gate's cost is round trips, not rows, and both
 numbers here are from the owner's archive at a 63 ms round trip with 3,749
 positions (about 2,700 consecutive pairs):
 
-| Form                                    | Round trips             | Why                                                 |
-| --------------------------------------- | ----------------------- | --------------------------------------------------- |
-| Before: whole archive, one query per period | ~4 per pair (~10,800) | pair query, then per period a sum, a DELETE and an INSERT |
-| Whole archive, batched                  | a fixed handful (~9)    | one pair query, one histories query, one sum query, batched DELETE and INSERT |
-| One import's scope                       | a fixed handful         | the same, over only the periods that import could have moved |
+| Form                                        | Round trips           | Why                                                                           |
+| ------------------------------------------- | --------------------- | ----------------------------------------------------------------------------- |
+| Before: whole archive, one query per period | ~4 per pair (~10,800) | pair query, then per period a sum, a DELETE and an INSERT                     |
+| Whole archive, batched                      | a fixed handful (~9)  | one pair query, one histories query, one sum query, batched DELETE and INSERT |
+| One import's scope                          | a fixed handful       | the same, over only the periods that import could have moved                  |
 
 A scope is derived from the rows the import itself inserted -- never a table
 scan -- and a period is in it when any of three things is true: a stated
@@ -771,15 +771,15 @@ added to.
 ### Applying a taxonomy change to rows already stored (F1-8d)
 
 An adapter's `activityTaxonomy` is read at import time, so declaring an
-activity type `movesCash: false` changes what the importer *stores* and nothing
+activity type `movesCash: false` changes what the importer _stores_ and nothing
 about what is already stored. Three paths look as though they would carry the
 change onto existing rows, and none of them does:
 
-| Path | What actually happens |
-| --- | --- |
+| Path                                | What actually happens                                                                                                                                                                                                                                                                                                               |
+| ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `run.js reparse --adapter <module>` | `REPARSEABLE_TIERS` is `pdf_statement` and `trade_confirmation` only. A structured activity pull can split one retained file across several `documents` rows sharing one `retained_sha256`, so `openRetainedDocument` returns null for it and the walk counts it in `documentsSkippedTier`. Activity-pull rows are never re-parsed. |
-| a fresh pull and import | An activity row carries `provider_txn_id`, and `importRows` treats a provider-id match as an authoritative identity match: `rowsDeduplicated += 1; continue`. A skip, not a rewrite. Nothing in `src/` issues an `UPDATE transactions` at all. |
-| falling back to `row_hash` | `amount` is in `rowHash`'s preimage, so a row whose amount the new declaration nulls hashes differently and would insert a *second* row rather than deduplicate. Worse than the skip, and avoided here only because every row in scope carries a provider id. |
+| a fresh pull and import             | An activity row carries `provider_txn_id`, and `importRows` treats a provider-id match as an authoritative identity match: `rowsDeduplicated += 1; continue`. A skip, not a rewrite. Nothing in `src/` issues an `UPDATE transactions` at all.                                                                                      |
+| falling back to `row_hash`          | `amount` is in `rowHash`'s preimage, so a row whose amount the new declaration nulls hashes differently and would insert a _second_ row rather than deduplicate. Worse than the skip, and avoided here only because every row in scope carries a provider id.                                                                       |
 
 `scripts/nullNonCashAmounts.mjs` is what applies it. It reads the taxonomy off
 the adapter rather than naming activity types, so it cannot drift from the
@@ -824,11 +824,11 @@ and mapped to no column. **Measured against the owner's archive, neither is a
 posting date, so no column was added and the cash-effective date rule is
 unchanged.**
 
-| Fact | Count |
-| --- | --- |
-| retained activity rows carrying a `payDate` key | 50,700 |
-| of those, rows stating a `payDate` value | **0** |
-| retained rows stating an `activityDate` | 50,700 of 50,700 |
+| Fact                                                          | Count            |
+| ------------------------------------------------------------- | ---------------- |
+| retained activity rows carrying a `payDate` key               | 50,700           |
+| of those, rows stating a `payDate` value                      | **0**            |
+| retained rows stating an `activityDate`                       | 50,700 of 50,700 |
 | `transactions` matched to a retained row by `provider_txn_id` | 50,865 of 50,865 |
 
 `payDate` is not a missing mapping, it is a field the provider sends empty. The
@@ -838,18 +838,18 @@ the provider's own `null`, not something the projection dropped.
 
 `activityDate` is stated everywhere and still cannot help. Against the current
 cash-effective date it is the same day on 27,973 rows, earlier on 22,829, and
-later on only 63, and the misplaced rows need a date that is *later*.
+later on only 63, and the misplaced rows need a date that is _later_.
 
 Every way of preferring it was run over all 929 periods, against the gate's own
 arithmetic and validated by reproducing the 639 / 15 / 275 verdicts the archive
 holds today:
 
-| Cash-effective date | pass | fail | unverified | Periods it moves |
-| --- | --- | --- | --- | --- |
-| `greatest(process, settle)` (today) | 639 | 15 | 275 | -- |
-| `activityDate` outright | 343 | 311 | 275 | 296 pass to fail, **0 fail to pass** |
-| `activityDate` inside the `greatest()` | 631 | 23 | 275 | 8 pass to fail, **0 fail to pass** |
-| `activityDate` inside a `least()` | 344 | 310 | 275 | 295 pass to fail, **0 fail to pass** |
+| Cash-effective date                    | pass | fail | unverified | Periods it moves                     |
+| -------------------------------------- | ---- | ---- | ---------- | ------------------------------------ |
+| `greatest(process, settle)` (today)    | 639  | 15   | 275        | --                                   |
+| `activityDate` outright                | 343  | 311  | 275        | 296 pass to fail, **0 fail to pass** |
+| `activityDate` inside the `greatest()` | 631  | 23   | 275        | 8 pass to fail, **0 fail to pass**   |
+| `activityDate` inside a `least()`      | 344  | 310  | 275        | 295 pass to fail, **0 fail to pass** |
 
 No candidate fixes one failing period, and each breaks passing ones. That is
 the whole decision: a date semantics change that helps nothing and costs
@@ -859,7 +859,7 @@ hundreds of passes is not a fix.
 failures are each explained by exactly one row (6 are the coverage-gap account,
 which sums no candidate row at all, and 1 has two). Of the 8, three rows sit
 exactly on a snapshot date and four sit exactly one day before one, and in all
-seven the statement books the row in the period *after* that snapshot. All four
+seven the statement books the row in the period _after_ that snapshot. All four
 one-day cases share one shape: the snapshot is a Saturday and the row is the
 preceding Friday. That points at the boundary, not the row -- but not at a
 global boundary rule either, because flipping the window to `[period_start,
@@ -1361,7 +1361,7 @@ disagree about is left alone and counted.
 `row_hash` (F1-49) includes the account, so every moved row's hash is
 recomputed -- from the stored row, not from the parse, so nothing here
 reproduces the importer's canonicalization. Before a row moves, its hash is
-recomputed under its *current* account and checked against the stored one; a
+recomputed under its _current_ account and checked against the stored one; a
 row that disagrees is left exactly where it is and counted, because rehashing
 it would paper over whatever the disagreement is. A row whose new hash is
 already taken at the target account is also left in place and counted, for a
@@ -1432,7 +1432,7 @@ Learn, then re-attribute (dry run, then for real, then again with
 `--remove-duplicates` once the reported collisions are understood), then (if
 you want) reparse. Once aliases exist, a
 reparse of a consolidated statement resolves its sections correctly and,
-because `row_hash` includes the account, inserts them as *new* rows beside
+because `row_hash` includes the account, inserts them as _new_ rows beside
 the misfiled ones it cannot see -- two copies of one holding. Re-attributing
 first moves the existing rows, hash and all, after which that same reparse
 finds everything already stored and inserts nothing. Both commands are
@@ -1460,7 +1460,7 @@ whole-document skip passes over (`parsed_ok = true`) never reopens anything,
 but nothing before F1-65 stopped a document that keeps reprocessing --
 one that carries a parse note, or one where nothing ever fully lands -- from
 reopening the identical `weak_instrument_match` or `undeclared_activity_type`
-row on every reparse, and from opening it more than once *within* a single
+row on every reparse, and from opening it more than once _within_ a single
 reparse when several rows shared one weak instrument or one undeclared type.
 One hosted reparse of 854 already-imported statements opened 76,687 review
 items this way, 84,266 of them exact duplicates by
@@ -1538,7 +1538,7 @@ for free from being scoped to one document already.
 
 `scripts/collapseWeakInstrumentMatches.mjs` is what actually collapses an
 existing archive's 73,247 rows into this shape. Unlike
-`collapseDuplicateReviewItems.mjs`, it runs *after* migration 8, not before:
+`collapseDuplicateReviewItems.mjs`, it runs _after_ migration 8, not before:
 the four new columns start every existing row at NULL, and a NULL never
 collides with another NULL under a unique index, so the migration applies
 cleanly with nothing backfilled yet (the same "no backfill in the migration
@@ -1845,15 +1845,15 @@ exists, the version table is the only thing that says what it already has.
 `applyPgSchema` applies every migration whose version is above the recorded
 one, in order, inside the same transaction and lock, and records each one.
 
-| # | Migration                              | What it adds                                                                 |
-| - | -------------------------------------- | ----------------------------------------------------------------------------- |
-| 1 | initial postgres archive schema        | Every table, domain and index below.                                           |
-| 2 | documents retained byte provenance     | `documents.retained_sha256`, `retained_byte_length`, `media_type`, `capture_id`. |
-| 3 | accounts external key                  | `accounts.external_key` (unique per institution), and `base_currency` becomes nullable. |
-| 4 | review_items cascade on document delete | `review_items.source_document_id` gets `ON DELETE CASCADE`.                    |
-| 5 | holdings row_hash                      | `positions.row_hash`, `balances.row_hash`, `liabilities.row_hash` (nullable, unique per table). |
-| 6 | account_aliases                        | `accounts.id, institution_id` unique; `account_aliases` table (alternate external keys). |
-| 7 | review_items dedupe key                | Partial unique index on `(kind, source_document_id, COALESCE(source_locator, ''), raw_value)` where the document is non-null. |
+| #   | Migration                               | What it adds                                                                                                                  |
+| --- | --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| 1   | initial postgres archive schema         | Every table, domain and index below.                                                                                          |
+| 2   | documents retained byte provenance      | `documents.retained_sha256`, `retained_byte_length`, `media_type`, `capture_id`.                                              |
+| 3   | accounts external key                   | `accounts.external_key` (unique per institution), and `base_currency` becomes nullable.                                       |
+| 4   | review_items cascade on document delete | `review_items.source_document_id` gets `ON DELETE CASCADE`.                                                                   |
+| 5   | holdings row_hash                       | `positions.row_hash`, `balances.row_hash`, `liabilities.row_hash` (nullable, unique per table).                               |
+| 6   | account_aliases                         | `accounts.id, institution_id` unique; `account_aliases` table (alternate external keys).                                      |
+| 7   | review_items dedupe key                 | Partial unique index on `(kind, source_document_id, COALESCE(source_locator, ''), raw_value)` where the document is non-null. |
 
 Migration 2 (F1-29,
 [`docs/plans/2026-09-11-structured-evidence.md`](../../docs/plans/2026-09-11-structured-evidence.md))
@@ -1913,11 +1913,11 @@ reliable there, since the pooler can hand the next transaction a different
 backend and the path is gone. So the path is pinned differently depending on
 the connection:
 
-| Where                                                                                        | Mechanism                                                              |
-| --------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
-| `createArchiveClient`                                                                         | `search_path` in the connection's startup packet -- safe because this is always a direct, non-pooled connection |
-| `createArchivePool`                                                                            | no startup parameter at all; this is what makes it pooler-compatible    |
-| `applyPgSchema`, `withArchiveTransaction`, and the read surface's own read-only transaction    | `SET LOCAL search_path`, as the first statement inside the transaction  |
+| Where                                                                                       | Mechanism                                                                                                       |
+| ------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `createArchiveClient`                                                                       | `search_path` in the connection's startup packet -- safe because this is always a direct, non-pooled connection |
+| `createArchivePool`                                                                         | no startup parameter at all; this is what makes it pooler-compatible                                            |
+| `applyPgSchema`, `withArchiveTransaction`, and the read surface's own read-only transaction | `SET LOCAL search_path`, as the first statement inside the transaction                                          |
 
 `SET LOCAL` inside the transaction is the part a pooler cannot take away, and
 every pool-backed code path relies on it rather than on any connection-level
@@ -2043,24 +2043,25 @@ Only the last four digits of an account number are stored, in
 
 ## Read surface (F1-21)
 
-`src/mcp` is the v1 assistant access surface: the six operations
+`src/mcp` is the v1 assistant access surface: the eight operations
 [`@repo/finance-contract`](../finance-contract) defines, served over
 [MCP](https://modelcontextprotocol.io) against the hosted archive, connecting
 as a non-owner reader role. Run it with
 `pnpm --filter @repo/finance-archive mcp` after a build.
 
-`FINANCE_ARCHIVE_READER_DATABASE_URL`, `FINANCE_ARCHIVE_PRINCIPAL_ID` and
-`FINANCE_ARCHIVE_SPACE_ID` are read from the environment and nowhere else,
+`FINANCE_ARCHIVE_READER_DATABASE_URL`, `FINANCE_ARCHIVE_PRINCIPAL_ID`,
+`FINANCE_ARCHIVE_SPACE_ID`, and `FINANCE_ARCHIVE_CURSOR_SECRET` are
+read from the environment and nowhere else,
 with no default for any of them. The reader's connection string is
 deliberately a different variable from the importer's
 `FINANCE_ARCHIVE_DATABASE_URL`: one is the owner's credential and one is the
 reader's, and the whole point of this task is that they are not the same.
 
-`serveFinanceRead(client, request, spaceId)` is the archive side on its own,
-without MCP. It takes a parsed contract request, returns a contract response,
-and runs that response back through the contract's own parser before returning
-it. The gateway that authenticates a caller belongs to the other workstream;
-this is what it calls.
+`serveFinanceRead(client, request, spaceId, options)` is the archive side on its
+own, without MCP. `options` carries the trusted principal and stable cursor
+signing secret; neither comes from the finance request. It returns a contract
+response and runs that response back through the contract's own parser before
+returning it. The gateway authenticates the caller and supplies that context.
 
 There is no `run_query` and no `describe_schema`. The plan's
 typed-bounded-query waiver was retired, and a scoped gateway pointed at a SQL
@@ -2107,10 +2108,10 @@ result to `quote`. An item that fails any of those is withheld with
 
 Those bytes come from the archive first and the raw tree second:
 
-| Where                                     | When                                                     |
-| ----------------------------------------- | -------------------------------------------------------- |
-| `retained_texts.content`, keyed on sha256 | Always tried first                                       |
-| `<raw tree root>/text/...`                | Only when the table has no row *and* a root is configured |
+| Where                                     | When                                                      |
+| ----------------------------------------- | --------------------------------------------------------- |
+| `retained_texts.content`, keyed on sha256 | Always tried first                                        |
+| `<raw tree root>/text/...`                | Only when the table has no row _and_ a root is configured |
 
 The order is the fix, not a cache. Verification used to read the raw tree
 only, so a hosted read surface -- the gateway in `apps/web/src/lib/mcp/finance.ts`,
@@ -2154,7 +2155,7 @@ FINANCE_ARCHIVE_SPACE_ID=<space id> \
 The reader needs `SELECT` on the new table. `applyPgReaderRole` grants it,
 but on a live archive whose reader already exists, migration 9 creates the
 table afterwards and it is born unreadable. Re-running `applyPgReaderRole` (or
-`scripts/provision.mjs`) would fix that *and rotate the reader's password*,
+`scripts/provision.mjs`) would fix that _and rotate the reader's password_,
 which a live gateway is holding. So grant it directly instead, as the archive
 owner, which changes nothing else:
 
@@ -2168,9 +2169,12 @@ Every response carries `datasetRevision` and an explicit `completeness`. All
 of one response's queries run inside one `REPEATABLE READ`, `READ ONLY`
 transaction, so the revision is the snapshot every number in it was computed
 from: a laptop querying mid-import sees one settled dataset, never half a
-ledger. The revision is derived from the archive's own content, so two reads
-of an unchanged archive report the same one and `expectedDatasetRevision`
-pinning works.
+ledger. Migration 11 maintains the revision as a transactional epoch and
+counter. Every statement that can change reader-visible finance data increments
+it through a `BEFORE STATEMENT` trigger. A rollback restores the prior counter,
+while an in-place correction changes it. Reading the singleton is O(1), so two
+reads of an unchanged archive report the same revision and
+`expectedDatasetRevision` pinning works within the reader statement timeout.
 
 A truncated page is marked `truncated` and carries a `nextCursor`. It is never
 silently short.
@@ -2213,20 +2217,20 @@ a later table is born with. So:
 
 | Concern             | What the setup does                                                                              |
 | ------------------- | ------------------------------------------------------------------------------------------------ |
-| Ownership           | A non-owner role that owns nothing, so it cannot alter what it reads                              |
-| Attributes          | `NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS`                         |
-| Membership          | Asserted empty; `NOINHERIT` does not stop `SET ROLE`, so a membership is an error, not a warning  |
-| Database            | `REVOKE ALL ... FROM PUBLIC`, then `GRANT CONNECT` only. `TEMPORARY` is never granted back        |
-| Schema `public`     | `REVOKE ALL ... FROM PUBLIC`, so the reader cannot reach a co-located component's tables          |
-| Archive schema      | `USAGE` only, never `CREATE`                                                                      |
-| Tables              | `REVOKE ALL` from `PUBLIC` and from the reader, then `GRANT SELECT`                               |
-| Sequences, routines | `REVOKE ALL` from `PUBLIC` and from the reader                                                    |
-| Domains             | `REVOKE ALL` from `PUBLIC`, then `GRANT USAGE` to the reader, which needs it to read the columns  |
-| Default privileges  | Revocations only. **No** default `SELECT` grant, so a later table is not silently readable        |
-| Statement time      | `statement_timeout`, `lock_timeout` and `idle_in_transaction_session_timeout` on the role         |
-| Transaction mode    | `default_transaction_read_only = on`, plus an explicit `READ ONLY` transaction per response       |
-| Rows                | Every generated statement carries its own `LIMIT`; the contract caps a page at 100                |
-| Concurrency         | `CONNECTION LIMIT`, enforced at connection time and not settable from inside a session            |
+| Ownership           | A non-owner role that owns nothing, so it cannot alter what it reads                             |
+| Attributes          | `NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS`                        |
+| Membership          | Asserted empty; `NOINHERIT` does not stop `SET ROLE`, so a membership is an error, not a warning |
+| Database            | `REVOKE ALL ... FROM PUBLIC`, then `GRANT CONNECT` only. `TEMPORARY` is never granted back       |
+| Schema `public`     | `REVOKE ALL ... FROM PUBLIC`, so the reader cannot reach a co-located component's tables         |
+| Archive schema      | `USAGE` only, never `CREATE`                                                                     |
+| Tables              | `REVOKE ALL` from `PUBLIC` and from the reader, then `GRANT SELECT`                              |
+| Sequences, routines | `REVOKE ALL` from `PUBLIC` and from the reader                                                   |
+| Domains             | `REVOKE ALL` from `PUBLIC`, then `GRANT USAGE` to the reader, which needs it to read the columns |
+| Default privileges  | Revocations only. **No** default `SELECT` grant, so a later table is not silently readable       |
+| Statement time      | `statement_timeout`, `lock_timeout` and `idle_in_transaction_session_timeout` on the role        |
+| Transaction mode    | `default_transaction_read_only = on`, plus an explicit `READ ONLY` transaction per response      |
+| Rows                | Every generated statement carries its own `LIMIT`; the contract caps a page at 100               |
+| Concurrency         | `CONNECTION LIMIT`, enforced at connection time and not settable from inside a session           |
 
 `SUPERUSER`, `BYPASSRLS` and `REPLICATION` are stated once, in `CREATE ROLE`.
 Postgres lets a non-superuser mention them there -- only setting them true is

@@ -17,8 +17,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+
 import {
   canonicalizeFinanceDecimal,
+  FINANCE_READ_REQUEST_DESCRIPTION,
   parseAuthorizedFinanceReadExchange,
   parseFinanceReadRequest,
 } from "@repo/finance-contract";
@@ -38,6 +42,7 @@ import {
   textRelativePath,
   writeRetainedText,
 } from "../dist/index.js";
+import { createFinanceArchiveMcpServer } from "../dist/mcp/server.js";
 
 const SPACE = "space-synthetic-f121";
 const TRUSTED = {
@@ -105,7 +110,14 @@ async function document(client, institutionId, accountId, docDate) {
   return id;
 }
 
-async function transaction(client, accountId, documentId, date, amount, currency = "USD") {
+async function transaction(
+  client,
+  accountId,
+  documentId,
+  date,
+  amount,
+  currency = "USD",
+) {
   documentCounter += 1;
   await client.query(
     `INSERT INTO transactions
@@ -124,6 +136,113 @@ async function transaction(client, accountId, documentId, date, amount, currency
     ],
   );
   return `txn_${documentCounter}`;
+}
+
+function structuredBindings(values) {
+  return JSON.stringify(
+    Object.fromEntries(
+      Object.entries(values).map(([field, value]) => [
+        field,
+        {
+          binding: {
+            format: "json_pointer_v1",
+            pointer: `/synthetic/${field}`,
+            rawValue: String(value),
+          },
+        },
+      ]),
+    ),
+  );
+}
+
+async function makeDocumentCitable(client, documentId) {
+  const retainedSha256 = createHash("sha256")
+    .update(`synthetic retained ${documentId}`)
+    .digest("hex");
+  await client.query(
+    `UPDATE documents
+        SET retained_sha256 = $2, retained_byte_length = 128,
+            media_type = 'application/json', capture_id = $3
+      WHERE id = $1`,
+    [documentId, retainedSha256, `capture-${documentId}`],
+  );
+}
+
+async function citedSnapshot(client, seeded, asOf = "2026-02-28") {
+  const accountId = seeded.settled.accountIds[0];
+  const documentId = await document(client, seeded.settled.id, accountId, asOf);
+  await makeDocumentCitable(client, documentId);
+  await client.query(
+    `INSERT INTO instruments (id, symbol, name) VALUES
+       ('instrument-usd', 'SUSD', 'Synthetic USD Fund'),
+       ('instrument-usd-2', 'SUS2', 'Synthetic USD Bond'),
+       ('instrument-eur', 'SEUR', 'Synthetic EUR Fund')`,
+  );
+  const positions = [
+    ["cited-usd", "instrument-usd", "2", "60", "120", "100", null, "USD"],
+    ["cited-usd-2", "instrument-usd-2", "4", "20", "80", "70", null, "USD"],
+    ["cited-eur", "instrument-eur", "3", "50", "150", "135", "14", "EUR"],
+  ];
+  for (const [
+    id,
+    instrumentId,
+    quantity,
+    price,
+    marketValue,
+    costBasis,
+    unrealized,
+    currency,
+  ] of positions) {
+    await client.query(
+      `INSERT INTO positions
+         (id, account_id, as_of, instrument_id, quantity, price, market_value,
+          cost_basis, unrealized, currency, valuation_basis,
+          source_document_id, source_locator)
+       VALUES ($1, $2, $3::date, $4, $5::numeric, $6::numeric, $7::numeric,
+               $8::numeric, $9::numeric, $10, 'market_price', $11, $12)`,
+      [
+        id,
+        accountId,
+        asOf,
+        instrumentId,
+        quantity,
+        price,
+        marketValue,
+        costBasis,
+        unrealized,
+        currency,
+        documentId,
+        structuredBindings({
+          quantity,
+          price,
+          marketValue,
+          costBasis,
+          ...(unrealized === null ? {} : { unrealized }),
+        }),
+      ],
+    );
+  }
+  for (const [id, totalValue, currency] of [
+    ["balance-usd", "205", "USD"],
+    ["balance-eur", "150", "EUR"],
+  ]) {
+    await client.query(
+      `INSERT INTO balances
+         (id, account_id, as_of, total_value, currency,
+          source_document_id, source_locator)
+       VALUES ($1, $2, $3::date, $4::numeric, $5, $6, $7)`,
+      [
+        id,
+        accountId,
+        asOf,
+        totalValue,
+        currency,
+        documentId,
+        structuredBindings({ totalValue }),
+      ],
+    );
+  }
+  return { accountId, documentId, asOf };
 }
 
 async function reconciliation(client, accountId, start, end, status) {
@@ -152,12 +271,32 @@ async function seed(client) {
     "2026-01-10",
     "-12.34",
   );
-  await transaction(client, settled.accountIds[0], settledDoc, "2026-01-20", "-7.66");
+  await transaction(
+    client,
+    settled.accountIds[0],
+    settledDoc,
+    "2026-01-20",
+    "-7.66",
+  );
   // A second currency, so a cross-currency total would be visible if one
   // could ever happen.
-  await transaction(client, settled.accountIds[0], settledDoc, "2026-01-21", "-5.00", "EUR");
+  await transaction(
+    client,
+    settled.accountIds[0],
+    settledDoc,
+    "2026-01-21",
+    "-5.00",
+    "EUR",
+  );
   // A currency the contract's closed registry does not carry.
-  await transaction(client, settled.accountIds[0], settledDoc, "2026-01-22", "-1.00", "XTS");
+  await transaction(
+    client,
+    settled.accountIds[0],
+    settledDoc,
+    "2026-01-22",
+    "-1.00",
+    "XTS",
+  );
   // Past the contract's 38 significant digits: an explicit out-of-range
   // outcome, never a rounding and never a silent omission.
   await transaction(
@@ -168,7 +307,13 @@ async function seed(client) {
     "1234567890123456789012345678901234567890",
     "JPY",
   );
-  await reconciliation(client, settled.accountIds[0], "2026-01-01", "2026-01-31", "pass");
+  await reconciliation(
+    client,
+    settled.accountIds[0],
+    "2026-01-01",
+    "2026-01-31",
+    "pass",
+  );
 
   const unreconciled = await institution(client, SOURCES.unreconciled);
   const unreconciledDoc = await document(
@@ -199,7 +344,13 @@ async function seed(client) {
     underReview.accountIds[0],
     "2026-01-31",
   );
-  await transaction(client, underReview.accountIds[0], reviewDoc, "2026-01-15", "-9.00");
+  await transaction(
+    client,
+    underReview.accountIds[0],
+    reviewDoc,
+    "2026-01-15",
+    "-9.00",
+  );
   await reconciliation(
     client,
     underReview.accountIds[0],
@@ -224,7 +375,6 @@ async function fixture(t) {
   return { owner, reader: r, seeded };
 }
 
-
 /** Serves one request and checks the whole exchange against the contract. */
 async function serve(r, request, options) {
   const parsed = parseFinanceReadRequest({
@@ -233,7 +383,11 @@ async function serve(r, request, options) {
     limit: 10,
     ...request,
   });
-  const response = await serveFinanceRead(r.client, parsed, SPACE, options);
+  const response = await serveFinanceRead(r.client, parsed, SPACE, {
+    principalId: TRUSTED.principalId,
+    cursorSigningSecret: "synthetic-finance-cursor-secret-at-least-32-bytes",
+    ...options,
+  });
   const exchange = parseAuthorizedFinanceReadExchange({
     request: parsed,
     response,
@@ -242,14 +396,24 @@ async function serve(r, request, options) {
   return exchange.response;
 }
 
-test("every operation answers, and answers the contract", { skip }, async (t) => {
+test(
+  "every operation answers, and answers the contract",
+  { skip },
+  async (t) => {
   const { reader: r, seeded } = await fixture(t);
   const operations = [
     { operation: "list_transactions" },
     { operation: "list_holdings" },
     { operation: "list_balances" },
-    { operation: "aggregate_money", metric: "transaction_amount", groupBy: "currency" },
-    { operation: "get_evidence", recordId: `txn:${seeded.citedTransactionId}` },
+      {
+        operation: "aggregate_money",
+        metric: "transaction_amount",
+        groupBy: "currency",
+      },
+      {
+        operation: "get_evidence",
+        recordId: `txn:${seeded.citedTransactionId}`,
+      },
     { operation: "get_coverage" },
   ];
   for (const request of operations) {
@@ -258,7 +422,8 @@ test("every operation answers, and answers the contract", { skip }, async (t) =>
     assert.ok(response.datasetRevision.startsWith("rev-"));
     assert.ok(["complete", "partial"].includes(response.completeness));
   }
-});
+  },
+);
 
 test(
   "a read served through a pooled connection resolves the archive schema even when the connection's session search_path was reset to public (F1-52)",
@@ -280,7 +445,11 @@ test(
         limit: 10,
         operation: "get_coverage",
       });
-      const response = await serveFinanceRead(poolClient, parsed, SPACE);
+      const response = await serveFinanceRead(poolClient, parsed, SPACE, {
+        principalId: TRUSTED.principalId,
+        cursorSigningSecret:
+          "synthetic-finance-cursor-secret-at-least-32-bytes",
+      });
       const settledSource = response.items.find(
         (item) => item.sourceId === sourceIdOf(SOURCES.settled),
       );
@@ -296,7 +465,10 @@ test(
   },
 );
 
-test("the dataset revision is stable, and moves when the archive does", { skip }, async (t) => {
+test(
+  "the dataset revision is stable, and moves when the archive does",
+  { skip },
+  async (t) => {
   const { owner, reader: r, seeded } = await fixture(t);
   const request = { operation: "get_coverage" };
   const first = await serve(r, request);
@@ -307,11 +479,33 @@ test("the dataset revision is stable, and moves when the archive does", { skip }
     "two reads of an unchanged archive must report one revision, or pinning is useless",
   );
 
-  const doc = await document(owner, seeded.settled.id, seeded.settled.accountIds[0], "2026-02-28");
-  await transaction(owner, seeded.settled.accountIds[0], doc, "2026-02-10", "-1.00");
+    const doc = await document(
+      owner,
+      seeded.settled.id,
+      seeded.settled.accountIds[0],
+      "2026-02-28",
+    );
+    await transaction(
+      owner,
+      seeded.settled.accountIds[0],
+      doc,
+      "2026-02-10",
+      "-1.00",
+    );
   const third = await serve(r, request);
   assert.notEqual(third.datasetRevision, first.datasetRevision);
-});
+    await owner.query(
+      "UPDATE accounts SET display_name = 'Changed synthetic label' WHERE id = $1",
+      [seeded.settled.accountIds[0]],
+    );
+    const fourth = await serve(r, request);
+    assert.notEqual(
+      fourth.datasetRevision,
+      third.datasetRevision,
+      "a same-id content update must invalidate a continuation revision",
+    );
+  },
+);
 
 test("a request for another space is not authorized", { skip }, async (t) => {
   const { reader: r } = await fixture(t);
@@ -327,7 +521,10 @@ test("a request for another space is not authorized", { skip }, async (t) => {
   );
 });
 
-test("money crosses the wire as decimal strings and never crosses currencies", { skip }, async (t) => {
+test(
+  "money crosses the wire as decimal strings and never crosses currencies",
+  { skip },
+  async (t) => {
   const { reader: r } = await fixture(t);
   const response = await serve(r, {
     operation: "aggregate_money",
@@ -342,7 +539,9 @@ test("money crosses the wire as decimal strings and never crosses currencies", {
     assert.equal(typeof item.total.decimal, "string");
     assert.equal(item.total.currency, item.currency);
   }
-  const byCurrency = new Map(response.items.map((item) => [item.currency, item]));
+    const byCurrency = new Map(
+      response.items.map((item) => [item.currency, item]),
+    );
   // Two USD fees, summed exactly by the database, never by JavaScript.
   assert.equal(byCurrency.get("USD").total.decimal, "-20");
   assert.equal(byCurrency.get("USD").contributingRecordCount, 2);
@@ -354,9 +553,13 @@ test("money crosses the wire as decimal strings and never crosses currencies", {
     response.items.length,
     "one total per currency",
   );
-});
+  },
+);
 
-test("a currency outside the contract's registry is withheld, not coerced", { skip }, async (t) => {
+test(
+  "a currency outside the contract's registry is withheld, not coerced",
+  { skip },
+  async (t) => {
   const { reader: r } = await fixture(t);
   const response = await serve(r, {
     operation: "aggregate_money",
@@ -369,9 +572,13 @@ test("a currency outside the contract's registry is withheld, not coerced", { sk
   );
   assert.equal(response.completeness, "partial");
   assert.ok(response.coverage.reasons.includes("unsupported_value"));
-});
+  },
+);
 
-test("a value past the 38 and 18 boundary is an explicit out-of-range outcome", { skip }, async (t) => {
+test(
+  "a value past the 38 and 18 boundary is an explicit out-of-range outcome",
+  { skip },
+  async (t) => {
   const { reader: r } = await fixture(t);
   const response = await serve(r, {
     operation: "aggregate_money",
@@ -385,11 +592,18 @@ test("a value past the 38 and 18 boundary is an explicit out-of-range outcome", 
   assert.equal(response.items.length, 0);
   assert.equal(response.completeness, "partial");
   assert.ok(response.coverage.reasons.includes("unsupported_value"));
-});
+  },
+);
 
-test("a truncated page is marked truncated and carries a cursor", { skip }, async (t) => {
+test(
+  "a truncated page is marked truncated and carries a cursor",
+  { skip },
+  async (t) => {
   const { reader: r } = await fixture(t);
-  const response = await serve(r, { operation: "list_transactions", limit: 1 });
+    const response = await serve(r, {
+      operation: "list_transactions",
+      limit: 1,
+    });
   assert.equal(response.truncated, true);
   assert.ok(response.nextCursor, "a truncated page is never silently short");
   assert.equal(response.completeness, "partial");
@@ -400,9 +614,13 @@ test("a truncated page is marked truncated and carries a cursor", { skip }, asyn
     cursor: response.nextCursor,
   });
   assert.equal(next.operation, "list_transactions");
-});
+  },
+);
 
-test("a cursor this surface did not mint is an invalid request", { skip }, async (t) => {
+test(
+  "a cursor this surface did not mint is an invalid request",
+  { skip },
+  async (t) => {
   const { reader: r } = await fixture(t);
   await assert.rejects(
     () =>
@@ -446,6 +664,532 @@ test("zero rows never claims absence", { skip }, async (t) => {
     assert.ok(item.gaps.some((gap) => gap.code === "source_gap"));
   }
 });
+
+test(
+  "signed cursors are bound to principal, filters, limit, and revision",
+  { skip },
+  async (t) => {
+    const { owner, reader: r, seeded } = await fixture(t);
+    const first = await serve(r, { operation: "list_transactions", limit: 1 });
+    assert.ok(first.nextCursor);
+    const attempts = [
+      () =>
+        serve(
+          r,
+          {
+            operation: "list_transactions",
+            limit: 1,
+            cursor: first.nextCursor,
+          },
+          { principalId: "principal-other-key" },
+        ),
+      () =>
+        serve(r, {
+          operation: "list_transactions",
+          limit: 2,
+          cursor: first.nextCursor,
+        }),
+      () =>
+        serve(r, {
+          operation: "list_transactions",
+          limit: 1,
+          sourceId: seeded.settled.id,
+          cursor: first.nextCursor,
+        }),
+    ];
+    for (const attempt of attempts)
+      await assert.rejects(
+        attempt,
+        (error) => error.code === "invalid_request",
+      );
+
+    await owner.query(
+      "UPDATE accounts SET display_name = 'Revision moved' WHERE id = $1",
+      [seeded.settled.accountIds[0]],
+    );
+    await assert.rejects(
+      () =>
+        serve(r, {
+          operation: "list_transactions",
+          limit: 1,
+          cursor: first.nextCursor,
+        }),
+      (error) => error.code === "revision_changed",
+    );
+  },
+);
+
+test(
+  "account discovery reports ambiguity and a truthful terminal page",
+  { skip },
+  async (t) => {
+    const { reader: r } = await fixture(t);
+    const first = await serve(r, { operation: "list_accounts", limit: 2 });
+    assert.equal(first.matchStatus, "ambiguous");
+    assert.ok(first.totalMatches > first.items.length);
+    assert.equal(first.truncated, true);
+    const terminal = await serve(r, {
+      operation: "list_accounts",
+      limit: 2,
+      cursor: first.nextCursor,
+      expectedDatasetRevision: first.datasetRevision,
+  });
+    assert.equal(terminal.matchStatus, "ambiguous");
+    assert.equal(terminal.totalMatches, first.totalMatches);
+    assert.ok(terminal.items.length <= terminal.totalMatches);
+
+    const ambiguousLastFour = await serve(r, {
+      operation: "list_accounts",
+      accountLast4: "1000",
+    });
+    assert.equal(ambiguousLastFour.matchStatus, "ambiguous");
+    const unique = await serve(r, {
+      operation: "list_accounts",
+      institutionName: "  Synthetic   river-oak ",
+      accountLast4: "1000",
+    });
+    assert.equal(unique.matchStatus, "unique");
+    const none = await serve(r, {
+      operation: "list_accounts",
+      accountLast4: "9999",
+    });
+    assert.deepEqual(
+      { status: none.matchStatus, count: none.totalMatches, items: none.items },
+      { status: "none", count: 0, items: [] },
+    );
+  },
+);
+
+test(
+  "cited multi-currency snapshot totals and field evidence are exact",
+  { skip },
+  async (t) => {
+    const { owner, reader: r, seeded } = await fixture(t);
+    const snapshot = await citedSnapshot(owner, seeded);
+    const response = await serve(r, {
+      operation: "get_holdings_snapshot",
+      accountId: snapshot.accountId,
+      snapshot: { mode: "exact", asOf: snapshot.asOf },
+    });
+    assert.equal(response.summary.status, "complete");
+    assert.equal(response.summary.positionCount, 3);
+    assert.equal(response.summary.resolvedInstrumentCount, 3);
+    const byCurrency = new Map(
+      response.summary.currencies.map((item) => [item.currency, item]),
+    );
+    assert.deepEqual(
+      {
+        market: byCurrency.get("USD").marketValue.amount.decimal,
+        basis: byCurrency.get("USD").costBasis.amount.decimal,
+        derived: byCurrency.get("USD").derivedUnrealizedGainLoss.amount.decimal,
+        stored: byCurrency.get("USD").storedUnrealizedGainLoss,
+        reconciliation: byCurrency.get("USD").reconciliation,
+      },
+      {
+        market: "200",
+        basis: "170",
+        derived: "30",
+        stored: { contributingPositionCount: 0, missingPositionCount: 2 },
+        reconciliation: {
+          status: "difference",
+          difference: { decimal: "5", currency: "USD" },
+          formula: "stated_account_total_minus_position_market_value",
+        },
+      },
+    );
+    assert.equal(byCurrency.get("EUR").reconciliation.status, "match");
+    const usd = response.items.find((item) => item.currency === "USD");
+    assert.equal(usd.instrument.name, "Synthetic USD Fund");
+    assert.equal(usd.derivedUnrealizedGainLoss.amount.decimal, "20");
+    assert.ok(
+      ["quantity", "price", "marketValue", "costBasis"].every((field) =>
+        usd.fieldEvidence.some((item) => item.field === field),
+      ),
+    );
+
+    const evidence = await serve(r, {
+      operation: "get_evidence",
+      recordId: usd.recordId,
+    });
+    assert.deepEqual(
+      new Set(evidence.items.map((item) => item.evidenceId.split(":").at(-1))),
+      new Set(["quantity", "price", "marketValue", "costBasis"]),
+    );
+
+    const aggregate = await serve(r, {
+      operation: "aggregate_money",
+      metric: "market_value",
+      groupBy: "currency",
+      accountId: snapshot.accountId,
+      from: snapshot.asOf,
+      toExclusive: "2026-03-01",
+    });
+    assert.equal(
+      aggregate.items.find((item) => item.currency === "USD").total.decimal,
+      "200",
+    );
+  },
+);
+
+test(
+  "the standalone MCP advertises and serves account discovery through a cited snapshot",
+  { skip },
+  async (t) => {
+    const { owner, reader: r, seeded } = await fixture(t);
+    const snapshot = await citedSnapshot(owner, seeded);
+    const { server } = createFinanceArchiveMcpServer(
+      r.client,
+      SPACE,
+      TRUSTED,
+      "synthetic-finance-cursor-secret-at-least-32-bytes",
+    );
+    const client = new Client({ name: "fresh-finance-client", version: "1" });
+    const [clientTransport, serverTransport] =
+      InMemoryTransport.createLinkedPair();
+    try {
+      await Promise.all([
+        server.connect(serverTransport),
+        client.connect(clientTransport),
+      ]);
+      const tools = await client.listTools();
+      const financeRead = tools.tools.find(
+        (tool) => tool.name === "finance_read",
+      );
+      const advertised = JSON.stringify(financeRead);
+      for (const term of [
+        "contractVersion",
+        "list_accounts",
+        "get_holdings_snapshot",
+        "accountLast4",
+        "expectedDatasetRevision",
+      ])
+        assert.ok(advertised.includes(term), term);
+      assert.ok(
+        advertised.includes(FINANCE_READ_REQUEST_DESCRIPTION.slice(0, 80)),
+      );
+
+      const discovered = await client.callTool({
+        name: "finance_read",
+        arguments: {
+          request: {
+            contractVersion: 1,
+            spaceId: SPACE,
+            operation: "list_accounts",
+            institutionName: "Synthetic river-oak",
+            accountLast4: "1000",
+            limit: 10,
+          },
+        },
+      });
+      assert.notEqual(discovered.isError, true);
+      const accountResponse = JSON.parse(discovered.content[0].text);
+      assert.equal(accountResponse.matchStatus, "unique");
+      assert.equal(accountResponse.items[0].accountId, snapshot.accountId);
+
+      const holdings = await client.callTool({
+        name: "finance_read",
+        arguments: {
+          request: {
+            contractVersion: 1,
+            spaceId: SPACE,
+            operation: "get_holdings_snapshot",
+            accountId: accountResponse.items[0].accountId,
+            snapshot: { mode: "exact", asOf: snapshot.asOf },
+            limit: 100,
+          },
+        },
+      });
+      assert.notEqual(holdings.isError, true);
+      const snapshotResponse = JSON.parse(holdings.content[0].text);
+      assert.equal(snapshotResponse.selectedSnapshot.asOf, snapshot.asOf);
+      assert.equal(snapshotResponse.summary.positionCount, 3);
+      assert.ok(snapshotResponse.items.every((item) => item.instrument.name));
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  },
+);
+
+test(
+  "snapshot totals stay conservative for missing values and ambiguous balances",
+  { skip },
+  async (t) => {
+    const { owner, reader: r, seeded } = await fixture(t);
+    const snapshot = await citedSnapshot(owner, seeded);
+    await owner.query(
+      "UPDATE positions SET market_value = NULL WHERE id = 'cited-usd'",
+    );
+    await owner.query(
+      `INSERT INTO balances
+       (id, account_id, as_of, total_value, currency)
+     VALUES ('balance-usd-uncited', $1, $2::date, '125', 'USD')`,
+      [snapshot.accountId, snapshot.asOf],
+    );
+    const response = await serve(r, {
+      operation: "get_holdings_snapshot",
+      accountId: snapshot.accountId,
+      snapshot: { mode: "exact", asOf: snapshot.asOf },
+    });
+    assert.equal(response.summary.status, "partial");
+    const usd = response.summary.currencies.find(
+      (item) => item.currency === "USD",
+    );
+    assert.deepEqual(usd.marketValue.amount, { decimal: "80", currency: "USD" });
+    assert.equal(usd.marketValue.contributingPositionCount, 1);
+    assert.equal(usd.marketValue.missingPositionCount, 1);
+    assert.equal(usd.statedAccountTotal.status, "ambiguous");
+    assert.equal(usd.reconciliation.status, "incomplete");
+    const position = response.items.find((item) => item.currency === "USD");
+    assert.ok(
+      position.disclosures.some(
+        (item) =>
+          item.field === "marketValue" && item.reason === "not_reported",
+      ),
+    );
+  },
+);
+
+test(
+  "derived and reconciliation overflow are disclosed instead of aborting the snapshot",
+  { skip },
+  async (t) => {
+    const { owner, reader: r, seeded } = await fixture(t);
+    const snapshot = await citedSnapshot(owner, seeded);
+    const maximum = "99999999999999999999999999999999999999";
+    await owner.query(
+      `UPDATE positions
+        SET market_value = $1::numeric, cost_basis = (-$1::numeric),
+            source_locator = $2
+      WHERE id = 'cited-usd'`,
+      [
+        maximum,
+        structuredBindings({
+          quantity: "2",
+          price: "60",
+          marketValue: maximum,
+          costBasis: `-${maximum}`,
+        }),
+      ],
+    );
+    let response = await serve(r, {
+      operation: "get_holdings_snapshot",
+      accountId: snapshot.accountId,
+      snapshot: { mode: "exact", asOf: snapshot.asOf },
+    });
+    let usd = response.items.find((item) => item.currency === "USD");
+    assert.equal(usd.derivedUnrealizedGainLoss, undefined);
+    assert.ok(
+      usd.disclosures.some(
+        (item) =>
+          item.field === "derivedUnrealizedGainLoss" &&
+          item.reason === "precision_overflow",
+      ),
+    );
+    assert.equal(
+      response.summary.currencies.find((item) => item.currency === "USD")
+        .derivedUnrealizedGainLoss.issue,
+      "precision_overflow",
+    );
+
+    await owner.query(
+      `UPDATE positions
+        SET market_value = (-$1::numeric), cost_basis = (-$1::numeric),
+            source_locator = $2
+      WHERE id = 'cited-usd'`,
+      [
+        maximum,
+        structuredBindings({
+          quantity: "2",
+          price: "60",
+          marketValue: `-${maximum}`,
+          costBasis: `-${maximum}`,
+        }),
+      ],
+    );
+    await owner.query(
+      `UPDATE balances SET total_value = $1::numeric, source_locator = $2
+      WHERE id = 'balance-usd'`,
+      [maximum, structuredBindings({ totalValue: maximum })],
+    );
+    response = await serve(r, {
+      operation: "get_holdings_snapshot",
+      accountId: snapshot.accountId,
+      snapshot: { mode: "exact", asOf: snapshot.asOf },
+    });
+    usd = response.summary.currencies.find((item) => item.currency === "USD");
+    assert.equal(usd.reconciliation.status, "precision_overflow");
+    assert.equal(response.summary.status, "partial");
+  },
+);
+
+test(
+  "snapshot keyset pagination traverses beyond the whole-summary ceiling",
+  { skip },
+  async (t) => {
+    const { owner, reader: r, seeded } = await fixture(t);
+    const accountId = seeded.settled.accountIds[0];
+    await owner.query(
+      `INSERT INTO positions (id, account_id, as_of, currency)
+     SELECT 'bulk-' || lpad(n::text, 5, '0'), $1, DATE '2026-03-31', 'USD'
+       FROM generate_series(1, 10002) AS n`,
+      [accountId],
+    );
+    const first = await serve(r, {
+      operation: "get_holdings_snapshot",
+      accountId,
+      snapshot: { mode: "exact", asOf: "2026-03-31" },
+      limit: 100,
+    });
+    assert.deepEqual(first.summary, {
+      status: "unavailable",
+      reason: "position_limit",
+      positionCount: 10002,
+      currencies: [],
+    });
+    assert.equal(first.issues[0].code, "snapshot_summary_limit");
+    const seen = new Set(first.items.map((item) => item.recordId));
+    let page = first;
+    while (page.nextCursor !== undefined) {
+      page = await serve(r, {
+        operation: "get_holdings_snapshot",
+        accountId,
+        snapshot: { mode: "exact", asOf: "2026-03-31" },
+        limit: 100,
+        expectedDatasetRevision: first.datasetRevision,
+        cursor: page.nextCursor,
+      });
+      for (const item of page.items) {
+        assert.equal(seen.has(item.recordId), false, item.recordId);
+        seen.add(item.recordId);
+      }
+    }
+    assert.equal(seen.size, 10002);
+    assert.ok(seen.has("pos:bulk-10002"));
+  },
+);
+
+test(
+  "aggregate group cursors advance instead of repeating the first group",
+  { skip },
+  async (t) => {
+    const { reader: r } = await fixture(t);
+    const first = await serve(r, {
+      operation: "aggregate_money",
+      metric: "transaction_amount",
+      groupBy: "currency",
+      limit: 1,
+    });
+    assert.equal(first.items.length, 1);
+    assert.ok(first.nextCursor);
+    const seen = new Set(first.items.map((item) => item.currency));
+    let page = first;
+    while (page.nextCursor !== undefined) {
+      page = await serve(r, {
+        operation: "aggregate_money",
+        metric: "transaction_amount",
+        groupBy: "currency",
+        limit: 1,
+        expectedDatasetRevision: first.datasetRevision,
+        cursor: page.nextCursor,
+      });
+      for (const item of page.items) {
+        assert.equal(seen.has(item.currency), false);
+        seen.add(item.currency);
+      }
+    }
+    assert.deepEqual(seen, new Set(["EUR", "USD"]));
+  },
+);
+
+test(
+  "snapshot selection is exact, latest is fixed, and signed pages do not duplicate rows",
+  { skip },
+  async (t) => {
+    const { owner, reader: r, seeded } = await fixture(t);
+    for (const [id, date] of [
+      ["snap_old", "2026-01-31"],
+      ["snap_a", "2026-02-28"],
+      ["snap_b", "2026-02-28"],
+    ]) {
+      await owner.query(
+        `INSERT INTO positions (id, account_id, as_of, quantity, market_value, currency, valuation_basis)
+       VALUES ($1, $2, $3::date, '1', '10', 'USD', 'market_price')`,
+        [id, seeded.settled.accountIds[0], date],
+      );
+    }
+    const exact = await serve(r, {
+      operation: "get_holdings_snapshot",
+      accountId: seeded.settled.accountIds[0],
+      snapshot: { mode: "exact", asOf: "2026-02-28" },
+      limit: 1,
+    });
+    assert.equal(exact.selectedSnapshot.asOf, "2026-02-28");
+    assert.equal(exact.items.length, 1);
+    assert.ok(exact.nextCursor);
+    const next = await serve(r, {
+      operation: "get_holdings_snapshot",
+      accountId: seeded.settled.accountIds[0],
+      snapshot: { mode: "exact", asOf: "2026-02-28" },
+      limit: 1,
+      expectedDatasetRevision: exact.datasetRevision,
+      cursor: exact.nextCursor,
+    });
+    assert.equal(next.selectedSnapshot.asOf, "2026-02-28");
+    assert.equal(next.items.length, 1);
+    assert.notEqual(next.items[0].recordId, exact.items[0].recordId);
+    await assert.rejects(
+      () =>
+        serve(r, {
+          operation: "get_holdings_snapshot",
+          accountId: seeded.settled.accountIds[0],
+          snapshot: { mode: "exact", asOf: "2026-01-31" },
+          limit: 1,
+          cursor: exact.nextCursor,
+        }),
+      (error) => error.code === "invalid_request",
+      "a cursor is bound to the selected snapshot, not merely its shape",
+    );
+    await assert.rejects(
+      () =>
+        serve(r, {
+          operation: "get_holdings_snapshot",
+          accountId: seeded.settled.accountIds[0],
+          snapshot: { mode: "exact", asOf: "2026-02-28" },
+          limit: 1,
+          expectedDatasetRevision: "rev-not-the-snapshot",
+        }),
+      (error) => error.code === "revision_changed",
+      "a caller cannot silently continue after its pinned dataset moved",
+    );
+    const latest = await serve(r, {
+      operation: "get_holdings_snapshot",
+      accountId: seeded.settled.accountIds[0],
+      snapshot: { mode: "latest", onOrBefore: "2026-02-28" },
+      limit: 10,
+    });
+    assert.equal(latest.selectedSnapshot.asOf, "2026-02-28");
+    const absent = await serve(r, {
+      operation: "get_holdings_snapshot",
+      accountId: seeded.settled.accountIds[0],
+      snapshot: { mode: "exact", asOf: "2026-02-27" },
+      limit: 10,
+    });
+    assert.deepEqual(absent.selectedSnapshot, { status: "not_found" });
+    await assert.rejects(
+      () =>
+        serve(r, {
+          operation: "get_holdings_snapshot",
+          accountId: seeded.settled.accountIds[0],
+          snapshot: { mode: "exact", asOf: "2026-02-27" },
+          limit: 1,
+          cursor: exact.nextCursor,
+        }),
+      (error) => error.code === "invalid_request",
+      "a continuation cannot turn into an absent selection",
+    );
+  },
+);
 
 test("get_coverage keeps the three states apart", { skip }, async (t) => {
   const { reader: r } = await fixture(t);
@@ -498,7 +1242,10 @@ test("get_coverage keeps the three states apart", { skip }, async (t) => {
   );
 });
 
-test("get_evidence reports why it has no citation rather than inventing one", { skip }, async (t) => {
+test(
+  "get_evidence reports why it has no citation rather than inventing one",
+  { skip },
+  async (t) => {
   const { reader: r, seeded } = await fixture(t);
   // A record that exists. The archive holds a source document for it but no
   // character span, so there is no contract evidence to return, and saying so
@@ -520,9 +1267,13 @@ test("get_evidence reports why it has no citation rather than inventing one", { 
   assert.equal(unknown.items.length, 0);
   assert.ok(unknown.coverage.reasons.includes("source_gap"));
   assert.equal(unknown.coverage.status, "unknown");
-});
+  },
+);
 
-test("list operations withhold rows they cannot cite, and say so", { skip }, async (t) => {
+test(
+  "list operations withhold rows they cannot cite, and say so",
+  { skip },
+  async (t) => {
   const { reader: r } = await fixture(t);
   for (const operation of [
     "list_transactions",
@@ -541,17 +1292,25 @@ test("list operations withhold rows they cannot cite, and say so", { skip }, asy
       );
     }
   }
-});
+  },
+);
 
-test("the surface reads through the reader role, not the owner", { skip }, async (t) => {
+test(
+  "the surface reads through the reader role, not the owner",
+  { skip },
+  async (t) => {
   const { reader: r } = await fixture(t);
   const who = await one(r.client, "SELECT current_user AS name");
   assert.equal(who.name, r.summary.role);
   // And the read it just did is still a read: the reader cannot write.
   await assert.rejects(() => r.client.query("DELETE FROM transactions"));
-});
+  },
+);
 
-test("a holdings aggregate sums the latest snapshot, not every snapshot", { skip }, async (t) => {
+test(
+  "a holdings aggregate sums the latest snapshot, not every snapshot",
+  { skip },
+  async (t) => {
   const owner = await archive(t);
   const seeded = await seed(owner);
   const account = seeded.settled.accountIds[0];
@@ -576,17 +1335,33 @@ test("a holdings aggregate sums the latest snapshot, not every snapshot", { skip
   assert.equal(response.items[0].total.decimal, "55");
   assert.equal(response.items[0].contributingRecordCount, 1);
   assert.equal(response.items[0].accountId, account);
-});
+  },
+);
 
-test("an aggregate over more contributors than the contract carries offers a breakdown", { skip }, async (t) => {
+test(
+  "an aggregate over more contributors than the contract carries offers a breakdown",
+  { skip },
+  async (t) => {
   const owner = await archive(t);
   const seeded = await seed(owner);
-  const doc = await document(owner, seeded.settled.id, seeded.settled.accountIds[0], "2026-03-31");
+    const doc = await document(
+      owner,
+      seeded.settled.id,
+      seeded.settled.accountIds[0],
+      "2026-03-31",
+    );
   // The contract carries at most 25 contributor ids inline; past that it
   // requires a breakdown reference rather than a shortened list presented as
   // the whole one.
   for (let index = 0; index < 30; index += 1) {
-    await transaction(owner, seeded.settled.accountIds[0], doc, "2026-03-10", "-1.00", "CAD");
+      await transaction(
+        owner,
+        seeded.settled.accountIds[0],
+        doc,
+        "2026-03-10",
+        "-1.00",
+        "CAD",
+      );
   }
   const r = await reader(t, owner);
   const response = await serve(r, {
@@ -599,9 +1374,13 @@ test("an aggregate over more contributors than the contract carries offers a bre
   const item = response.items[0];
   assert.equal(item.contributingRecordCount, 30);
   assert.equal(item.contributorRecordIds.length, 25);
-  assert.ok(item.breakdown, "a shortened contributor list must carry a breakdown");
+    assert.ok(
+      item.breakdown,
+      "a shortened contributor list must carry a breakdown",
+    );
   assert.equal(item.total.decimal, "-30");
-});
+  },
+);
 
 // --- F1-29: structured field evidence ---------------------------------------
 //
@@ -653,7 +1432,11 @@ async function importedPull(t) {
   const client = await archive(t);
   await client.query(
     "INSERT INTO institutions (id, name, slug) VALUES ($1, $2, $3)",
-    [ADAPTER.institution.id, ADAPTER.institution.name, ADAPTER.institution.slug],
+    [
+      ADAPTER.institution.id,
+      ADAPTER.institution.name,
+      ADAPTER.institution.slug,
+    ],
   );
   for (const account of ADAPTER.accounts) {
     await client.query(
@@ -665,7 +1448,12 @@ async function importedPull(t) {
 
   const session = createSyntheticSession();
   const retainedPaths = new Map();
-  async function pull(selection, docType, docDate, accountId = ADAPTER.accounts[0].id) {
+  async function pull(
+    selection,
+    docType,
+    docDate,
+    accountId = ADAPTER.accounts[0].id,
+  ) {
     const acquired = await syntheticAdapter.acquire({ session, ...selection });
     const { activity: rows, holdings } = await syntheticAdapter.parse({
       kind: selection.kind,
@@ -679,7 +1467,8 @@ async function importedPull(t) {
       accountId,
       institutionSlug: ADAPTER.institution.slug,
       accountLast4:
-        ADAPTER.accounts.find((account) => account.id === accountId)?.last4 ?? null,
+        ADAPTER.accounts.find((account) => account.id === accountId)?.last4 ??
+        null,
       docType,
       acquired,
     });
@@ -830,10 +1619,16 @@ function assertCitationResolves(retainedPaths, item) {
   );
 }
 
-test("a cited record resolves in the retained bytes it names", { skip }, async (t) => {
+test(
+  "a cited record resolves in the retained bytes it names",
+  { skip },
+  async (t) => {
   const { client, retainedPaths } = await importedPull(t);
   const r = await reader(t, client);
-  const response = await serve(r, { operation: "list_transactions", limit: 100 });
+    const response = await serve(r, {
+      operation: "list_transactions",
+      limit: 100,
+    });
 
   // Exactly the rows whose tier can bind a datum, cited once each.
   const citable = await count(
@@ -874,7 +1669,9 @@ test("a cited record resolves in the retained bytes it names", { skip }, async (
     "the PDF tier binds nothing, so it is never cited",
   );
   assert.equal(response.completeness, "partial");
-  assert.ok(response.coverage.reasons.includes("retained_evidence_unavailable"));
+    assert.ok(
+      response.coverage.reasons.includes("retained_evidence_unavailable"),
+    );
 
   // `get_evidence` for a returned record answers with that same item.
   const [first] = response.items;
@@ -883,7 +1680,8 @@ test("a cited record resolves in the retained bytes it names", { skip }, async (
     recordId: first.recordId,
   });
   assert.deepEqual(evidence.items, first.evidence);
-});
+  },
+);
 
 test("PDF-tier holdings and balances stay withheld", { skip }, async (t) => {
   const { client } = await importedPull(t);
@@ -915,7 +1713,7 @@ test("PDF-tier holdings and balances stay withheld", { skip }, async (t) => {
 async function bindPdfPositionToRetainedText(client, rawTreeRoot) {
   const row = await one(
     client,
-    `SELECT p.id, p.market_value, p.currency
+    `SELECT p.id, p.market_value, p.quantity, p.currency
        FROM positions p JOIN documents d ON d.id = p.source_document_id
       WHERE d.media_type = $1
       LIMIT 1`,
@@ -935,8 +1733,18 @@ async function bindPdfPositionToRetainedText(client, rawTreeRoot) {
     end: start + quote.length,
     quote,
   };
+  const quantityQuote = canonicalizeFinanceDecimal(
+    fromNumericText(row.quantity),
+  );
+  const quantityStart = text.indexOf("10.000");
+  const quantityBinding = {
+    ...binding,
+    start: quantityStart,
+    end: quantityStart + "10.000".length,
+    quote: "10.000",
+  };
   await client.query(
-    `UPDATE positions SET source_locator = $2 WHERE id = $1`,
+    `UPDATE positions SET quantity = '10', source_locator = $2 WHERE id = $1`,
     [
       row.id,
       JSON.stringify({
@@ -947,10 +1755,22 @@ async function bindPdfPositionToRetainedText(client, rawTreeRoot) {
           field: "HOLDINGS / Market Value",
           binding,
         },
+        quantity: {
+          source: "pdf_statement",
+          index: 1,
+          field: "HOLDINGS / Quantity",
+          binding: quantityBinding,
+        },
       }),
     ],
   );
-  return { recordId: `pos:${row.id}`, text, binding };
+  return {
+    recordId: `pos:${row.id}`,
+    text,
+    binding,
+    quantityBinding,
+    quantityQuote,
+  };
 }
 
 test(
@@ -959,10 +1779,8 @@ test(
   async (t) => {
     const { client, rawTreeRoot } = await importedPull(t);
     const r = await reader(t, client);
-    const { recordId, binding } = await bindPdfPositionToRetainedText(
-      client,
-      rawTreeRoot,
-    );
+    const { recordId, binding, quantityBinding } =
+      await bindPdfPositionToRetainedText(client, rawTreeRoot);
 
     const response = await serve(r, { operation: "list_holdings", limit: 100 });
     const item = response.items.find((row) => row.recordId === recordId);
@@ -972,7 +1790,10 @@ test(
     assert.equal(evidence.kind, "retained_text_span_v1");
     assert.equal(evidence.locator.quote, binding.quote);
     assert.equal(evidence.locator.textSha256, binding.textSha256);
-    assert.equal(evidence.locator.relativePath, textRelativePath(binding.textSha256));
+    assert.equal(
+      evidence.locator.relativePath,
+      textRelativePath(binding.textSha256),
+    );
     assert.equal(
       evidence.locator.quoteSha256,
       createHash("sha256").update(evidence.locator.quote, "utf8").digest("hex"),
@@ -985,7 +1806,18 @@ test(
       { operation: "get_evidence", recordId },
       { rawTreeRoot },
     );
-    assert.deepEqual(getEvidenceResponse.items, item.evidence);
+    assert.ok(
+      item.evidence.every((expected) =>
+        getEvidenceResponse.items.some(
+          (actual) => actual.evidenceId === expected.evidenceId,
+        ),
+      ),
+    );
+    assert.ok(
+      getEvidenceResponse.items.some((evidence) =>
+        evidence.evidenceId.endsWith(":quantity"),
+      ),
+    );
   },
 );
 
@@ -995,7 +1827,10 @@ test(
   async (t) => {
     const { client, rawTreeRoot } = await importedPull(t);
     const r = await reader(t, client);
-    const { recordId } = await bindPdfPositionToRetainedText(client, rawTreeRoot);
+    const { recordId } = await bindPdfPositionToRetainedText(
+      client,
+      rawTreeRoot,
+    );
 
     const listed = await serve(r, { operation: "list_holdings", limit: 100 });
     assert.ok(
@@ -1013,7 +1848,9 @@ test(
       { rawTreeRoot: emptyRoot },
     );
     assert.deepEqual(response.items, []);
-    assert.ok(response.coverage.reasons.includes("retained_evidence_unavailable"));
+    assert.ok(
+      response.coverage.reasons.includes("retained_evidence_unavailable"),
+    );
   },
 );
 
@@ -1045,9 +1882,18 @@ test(
       { operation: "get_evidence", recordId },
       { rawTreeRoot: null },
     );
-    assert.deepEqual(response.items, item.evidence);
     assert.ok(
-      !(response.coverage.reasons ?? []).includes("retained_evidence_unavailable"),
+      item.evidence.every((expected) =>
+        response.items.some((actual) => actual.evidenceId === expected.evidenceId),
+      ),
+    );
+    assert.ok(
+      response.items.some((evidence) => evidence.evidenceId.endsWith(":quantity")),
+    );
+    assert.ok(
+      !(response.coverage.reasons ?? []).includes(
+        "retained_evidence_unavailable",
+      ),
       "nothing was withheld: the archive had the bytes",
     );
   },
@@ -1082,14 +1928,22 @@ test(
       { rawTreeRoot },
     );
     assert.deepEqual(response.items, []);
-    assert.ok(response.coverage.reasons.includes("retained_evidence_unavailable"));
+    assert.ok(
+      response.coverage.reasons.includes("retained_evidence_unavailable"),
+    );
   },
 );
 
-test("a document whose retained bytes were never recorded cites nothing", { skip }, async (t) => {
+test(
+  "a document whose retained bytes were never recorded cites nothing",
+  { skip },
+  async (t) => {
   const { client } = await importedPull(t);
   const r = await reader(t, client);
-  const before = await serve(r, { operation: "list_transactions", limit: 100 });
+    const before = await serve(r, {
+      operation: "list_transactions",
+      limit: 100,
+    });
   // What a document imported before F1-29 looks like: four nulls, all or
   // nothing, which is what the `documents` CHECK enforces.
   await client.query(
@@ -1099,7 +1953,10 @@ test("a document whose retained bytes were never recorded cites nothing", { skip
       WHERE media_type = $1`,
     [TABULAR_TIER],
   );
-  const after = await serve(r, { operation: "list_transactions", limit: 100 });
+    const after = await serve(r, {
+      operation: "list_transactions",
+      limit: 100,
+    });
   assert.ok(after.items.length < before.items.length);
   assert.ok(
     after.items.every(
@@ -1108,12 +1965,19 @@ test("a document whose retained bytes were never recorded cites nothing", { skip
     "a row whose document names no bytes is withheld, never cited to nothing",
   );
   assert.ok(after.coverage.reasons.includes("retained_evidence_unavailable"));
-});
+  },
+);
 
-test("a binding that disagrees with the stored amount withholds its row", { skip }, async (t) => {
+test(
+  "a binding that disagrees with the stored amount withholds its row",
+  { skip },
+  async (t) => {
   const { client } = await importedPull(t);
   const r = await reader(t, client);
-  const before = await serve(r, { operation: "list_transactions", limit: 100 });
+    const before = await serve(r, {
+      operation: "list_transactions",
+      limit: 100,
+    });
   const [target] = before.items;
   // The stored value moves and the binding does not. The citation would still
   // resolve in the retained bytes; it would just cite a different number than
@@ -1123,11 +1987,15 @@ test("a binding that disagrees with the stored amount withholds its row", { skip
     "UPDATE transactions SET amount = amount + 1 WHERE id = $1",
     [target.recordId.slice("txn:".length)],
   );
-  const after = await serve(r, { operation: "list_transactions", limit: 100 });
+    const after = await serve(r, {
+      operation: "list_transactions",
+      limit: 100,
+    });
   assert.equal(after.items.length, before.items.length - 1);
   assert.ok(!after.items.some((item) => item.recordId === target.recordId));
   assert.ok(after.coverage.reasons.includes("retained_evidence_unavailable"));
-});
+  },
+);
 
 /**
  * Rewrites one transaction's `source_locator`, keeping the binding the
@@ -1165,7 +2033,10 @@ async function boundTransaction(t) {
   return { client, reader: r, before, target };
 }
 
-test("two bindings on one record are told apart by name, not by key order", { skip }, async (t) => {
+test(
+  "two bindings on one record are told apart by name, not by key order",
+  { skip },
+  async (t) => {
   const { client, reader: r, target } = await boundTransaction(t);
   const cited = target.evidence[0].locator.pointer;
   // Two bound locators whose rawValues are identical -- a price that happens
@@ -1181,7 +2052,10 @@ test("two bindings on one record are told apart by name, not by key order", { sk
     amount: { source: "structured_api", index: 0, field: "amount", binding },
   }));
 
-  const after = await serve(r, { operation: "list_transactions", limit: 100 });
+    const after = await serve(r, {
+      operation: "list_transactions",
+      limit: 100,
+    });
   const item = after.items.find((row) => row.recordId === target.recordId);
   assert.ok(item, "a record whose amount is bound is still citable");
   assert.equal(
@@ -1189,9 +2063,13 @@ test("two bindings on one record are told apart by name, not by key order", { sk
     cited,
     "the binding named for the load-bearing field is the cited one",
   );
-});
+  },
+);
 
-test("several bindings and none for the money field withholds the row", { skip }, async (t) => {
+test(
+  "several bindings and none for the money field withholds the row",
+  { skip },
+  async (t) => {
   const { client, reader: r, before, target } = await boundTransaction(t);
   const cited = target.evidence[0].locator.pointer;
   // Neither key names the record's load-bearing field, so which binding the
@@ -1206,8 +2084,12 @@ test("several bindings and none for the money field withholds the row", { skip }
     },
   }));
 
-  const after = await serve(r, { operation: "list_transactions", limit: 100 });
+    const after = await serve(r, {
+      operation: "list_transactions",
+      limit: 100,
+    });
   assert.equal(after.items.length, before.items.length - 1);
   assert.ok(!after.items.some((row) => row.recordId === target.recordId));
   assert.ok(after.coverage.reasons.includes("retained_evidence_unavailable"));
-});
+  },
+);

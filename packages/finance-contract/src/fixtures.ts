@@ -78,6 +78,37 @@ const delimitedFieldEvidence = {
   },
 } as const;
 
+function syntheticJsonFieldEvidence(
+  evidenceId: string,
+  pointer: string,
+  rawValue: string,
+  rawValueSha256: string,
+) {
+  return {
+    ...jsonFieldEvidence,
+    evidenceId,
+    locator: {
+      ...jsonFieldEvidence.locator,
+      pointer,
+      rawValue,
+      rawValueSha256,
+    },
+  } as const;
+}
+
+const quantityEvidence = syntheticJsonFieldEvidence(
+  "evidence-synthetic-quantity-001",
+  "/pages/0/items/0/quantity",
+  "10.5",
+  "80b8062fef2cf5ac9caf4e26bb153218a1c9e27f2200942d1f0a91a9354034d3",
+);
+const costBasisEvidence = syntheticJsonFieldEvidence(
+  "evidence-synthetic-cost-basis-001",
+  "/pages/0/items/0/costBasis",
+  "150",
+  "9ae2bdd7beedc2e766c6b76585530e16925115707dc7a06ab5ee4aa2776b2c7b",
+);
+
 const requestBase = {
   contractVersion: 1,
   spaceId: "space-synthetic-001",
@@ -225,6 +256,135 @@ export const syntheticFinanceReadExchanges = [
           status: "complete",
           lastVerifiedAt: 1_788_800_000_000,
           gaps: [],
+        },
+      ],
+    },
+  },
+  {
+    request: {
+      ...requestBase,
+      operation: "list_accounts",
+      institutionName: "example broker",
+      accountLast4: "1234",
+      displayLabel: "income",
+    },
+    response: {
+      ...responseBase,
+      operation: "list_accounts",
+      matchStatus: "unique",
+      totalMatches: 1,
+      items: [
+        {
+          accountId: "account-synthetic-001",
+          sourceId: "source-synthetic-001",
+          institutionName: "Example Broker",
+          accountLast4: "1234",
+          displayLabel: "Income",
+          accountType: "brokerage",
+          baseCurrency: "USD",
+        },
+      ],
+    },
+  },
+  {
+    request: {
+      ...requestBase,
+      operation: "get_holdings_snapshot",
+      accountId: "account-synthetic-001",
+      snapshot: { mode: "exact", asOf: "2026-07-31" },
+    },
+    response: {
+      ...responseBase,
+      operation: "get_holdings_snapshot",
+      requestedSnapshot: { mode: "exact", asOf: "2026-07-31" },
+      selectedSnapshot: { status: "found", asOf: "2026-07-31" },
+      account: {
+        accountId: "account-synthetic-001",
+        sourceId: "source-synthetic-001",
+        institutionName: "Example Broker",
+        accountLast4: "1234",
+        displayLabel: "Income",
+        accountType: "brokerage",
+        baseCurrency: "USD",
+      },
+      summary: {
+        status: "complete",
+        positionCount: 1,
+        resolvedInstrumentCount: 1,
+        unresolvedInstrumentCount: 0,
+        quantityCoverage: {
+          availablePositionCount: 1,
+          missingPositionCount: 0,
+        },
+        currencies: [
+          {
+            currency: "USD",
+            positionCount: 1,
+            marketValue: {
+              amount: { decimal: "210", currency: "USD" },
+              contributingPositionCount: 1,
+              missingPositionCount: 0,
+            },
+            costBasis: {
+              amount: { decimal: "150", currency: "USD" },
+              contributingPositionCount: 1,
+              missingPositionCount: 0,
+            },
+            storedUnrealizedGainLoss: {
+              contributingPositionCount: 0,
+              missingPositionCount: 1,
+            },
+            derivedUnrealizedGainLoss: {
+              amount: { decimal: "60", currency: "USD" },
+              contributingPositionCount: 1,
+              missingPositionCount: 0,
+            },
+            statedAccountTotal: {
+              status: "available",
+              amount: { decimal: "210", currency: "USD" },
+              balanceRecordId: "record-balance-synthetic-001",
+              evidence: [jsonFieldEvidence],
+            },
+            reconciliation: {
+              status: "match",
+              difference: { decimal: "0", currency: "USD" },
+              formula: "stated_account_total_minus_position_market_value",
+            },
+          },
+        ],
+      },
+      items: [
+        {
+          recordId: "record-holding-snapshot-001",
+          accountId: "account-synthetic-001",
+          asOf: "2026-07-31",
+          currency: "USD",
+          instrument: {
+            status: "resolved",
+            instrumentId: "instrument-synthetic-001",
+            name: "Synthetic Income Fund",
+            symbol: "SIF",
+          },
+          valuationBasis: "market_price",
+          quantity: "10.5",
+          marketValue: { decimal: "210", currency: "USD" },
+          costBasis: { decimal: "150", currency: "USD" },
+          derivedUnrealizedGainLoss: {
+            amount: { decimal: "60", currency: "USD" },
+            formula: "market_value_minus_cost_basis",
+          },
+          fieldEvidence: [
+            { field: "quantity", evidence: [quantityEvidence] },
+            { field: "marketValue", evidence: [jsonFieldEvidence] },
+            { field: "costBasis", evidence: [costBasisEvidence] },
+          ],
+          disclosures: [
+            { field: "price", reason: "not_reported" },
+            {
+              field: "storedUnrealizedGainLoss",
+              reason: "not_reported",
+            },
+          ],
         },
       ],
     },
