@@ -103,11 +103,41 @@ async function seedApiKey(client) {
   return id;
 }
 
-async function seedWorkerScan(client, spaceId) {
+async function seedWorkerScan(client, spaceId, sourceAccountId) {
   const id = opaqueId();
+  const actorUserId = await seedUser(client);
+  const actorCredentialId = opaqueId();
   await client.query(
-    "INSERT INTO kith.worker_source_scans (id, space_id, created_at) VALUES ($1,$2,transaction_timestamp())",
-    [id, spaceId],
+    `INSERT INTO kith.api_keys
+       (id, created_at, user_id, key_hash, key_prefix, name)
+     VALUES ($1, transaction_timestamp(), $2, $3, 'ob_scan', 'scan fixture')`,
+    [
+      actorCredentialId,
+      actorUserId,
+      createHash("sha256").update(actorCredentialId).digest("hex"),
+    ],
+  );
+  await client.query(
+    `INSERT INTO kith.worker_source_scans
+       (id, space_id, source_account_id, request_id, request_digest,
+        watcher_id, connector_version, mode, inventory_epoch,
+        manifest_version_at_begin, actor_user_id, actor_credential_id, state,
+        next_page_ordinal, inventory_done, page_count, entry_count,
+        changed_count, gap_count, review_count, next_reconcile_ordinal,
+        started_at, expires_at, retire_at)
+     VALUES ($1,$2,$3,$4,$5,'fixture-watcher','fixture-v1','normal',0,0,$6,$7,
+             'open',0,false,0,0,0,0,0,0,transaction_timestamp(),
+             transaction_timestamp() + interval '30 minutes',
+             transaction_timestamp() + interval '90 days')`,
+    [
+      id,
+      spaceId,
+      sourceAccountId,
+      `fixture-scan-${id}`,
+      `fixture-digest-${id}`,
+      actorUserId,
+      actorCredentialId,
+    ],
   );
   return id;
 }
@@ -556,7 +586,7 @@ test(
     await applyKithSchema(client);
     const spaceId = seedSpace();
     const sourceAccountId = await seedSourceAccount(client, spaceId);
-    const scanId = await seedWorkerScan(client, spaceId);
+    const scanId = await seedWorkerScan(client, spaceId, sourceAccountId);
     const contentHash = await sha256Utf8("bytes-v1");
 
     await documents.upsertSourceInventoryRow(client, {
@@ -589,7 +619,7 @@ test(
     );
 
     // A rescan of the SAME bytes must not clear the settled parse_failed.
-    const scanId2 = await seedWorkerScan(client, spaceId);
+    const scanId2 = await seedWorkerScan(client, spaceId, sourceAccountId);
     await documents.upsertSourceInventoryRow(client, {
       spaceId,
       sourceAccountId,
@@ -609,7 +639,7 @@ test(
     assert.equal(settled.exclusion_reason, "parse_failed");
 
     // New bytes (a different content hash) reset it: that is a fresh attempt.
-    const scanId3 = await seedWorkerScan(client, spaceId);
+    const scanId3 = await seedWorkerScan(client, spaceId, sourceAccountId);
     await documents.upsertSourceInventoryRow(client, {
       spaceId,
       sourceAccountId,

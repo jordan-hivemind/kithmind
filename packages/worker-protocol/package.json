@@ -8,6 +8,11 @@
       "types": "./src/index.ts",
       "node": "./dist/index.js",
       "default": "./src/index.ts"
+    },
+    "./request": {
+      "types": "./src/request.ts",
+      "node": "./dist/request.js",
+      "default": "./src/request.ts"
     }
   },
   "scripts": {

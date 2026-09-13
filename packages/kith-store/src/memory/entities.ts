@@ -1,0 +1,365 @@
+// Ported from packages/convex/convex/models/facts/model.ts (the entity half)
+// and models/records/cardEntityBinding.ts (`loadSpaceEntityIndex`,
+// `normalizeLiteralName`, `resolveLiteralName` -- the P2-70l bounded alias
+// scan).
+//
+// `normalizeEntityName` is kept exactly as P2-70l2 asked: one function, used
+// unchanged by every caller that needs to turn a display name into the string
+// `entities.normalized_name` and `entities.normalized_aliases` actually store.
+// P2-70l2 exists because that agreement broke once already in the Convex tree
+// (a second, slightly different normalizer would have accepted a name the
+// stored one would reject); this module is the one place it is defined so a
+// later port (P2-39f's card entity binding, when it moves here) imports it
+// rather than writing its own.
+//
+// Every function below takes an `IdentityCtx` (client plus a fixed `now`) and
+// an already-authorized `spaceId`. Space authorization is the caller's job
+// (section 2.5): `rememberFact` in `facts.ts` checks it once before calling
+// `resolveEntity`.
+
+import { row, rows, exec, ms, type IdentityCtx } from "../identity/db.js";
+import { assertKithId, newKithId } from "../ids.js";
+
+export type EntityKind = "person" | "organization" | "project" | "place" | "other";
+
+const ENTITY_KINDS = new Set<string>([
+  "person",
+  "organization",
+  "project",
+  "place",
+  "other",
+]);
+
+export type EntitySelector = {
+  key?: string;
+  kind: EntityKind;
+  name: string;
+  aliases?: readonly string[];
+};
+
+export type Entity = {
+  id: string;
+  spaceId: string;
+  userId: string;
+  key: string;
+  kind: EntityKind;
+  canonicalName: string;
+  normalizedName: string;
+  aliases: readonly string[];
+  normalizedAliases: readonly string[];
+  createdAt: number;
+  updatedAt: number | null;
+};
+
+type EntityRow = {
+  id: string;
+  space_id: string;
+  user_id: string;
+  key: string;
+  kind: string;
+  canonical_name: string;
+  normalized_name: string;
+  aliases: unknown;
+  normalized_aliases: unknown;
+  created_at: Date;
+  updated_at: Date | null;
+};
+
+const ENTITY_NAME_MAX_CHARS = 200;
+const ENTITY_KEY_MAX_CHARS = 160;
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : [];
+}
+
+function toEntity(record: EntityRow): Entity {
+  if (!ENTITY_KINDS.has(record.kind)) {
+    throw new Error("Entity has an unrecognized kind");
+  }
+  return {
+    id: record.id,
+    spaceId: record.space_id,
+    userId: record.user_id,
+    key: record.key,
+    kind: record.kind as EntityKind,
+    canonicalName: record.canonical_name,
+    normalizedName: record.normalized_name,
+    aliases: stringArray(record.aliases),
+    normalizedAliases: stringArray(record.normalized_aliases),
+    createdAt: ms(record.created_at)!,
+    updatedAt: ms(record.updated_at),
+  };
+}
+
+function boundedText(value: string, label: string, maxChars: number): string {
+  const normalized = value.trim();
+  if (!normalized || Array.from(normalized).length > maxChars) {
+    throw new Error(`${label} must contain 1-${maxChars} characters`);
+  }
+  return normalized;
+}
+
+/** The one normalizer for a display name. Keep this the only copy (P2-70l2). */
+export function normalizeEntityName(name: string): string {
+  return boundedText(name, "Entity name", ENTITY_NAME_MAX_CHARS)
+    .normalize("NFKC")
+    .toLocaleLowerCase("en-US")
+    .replace(/[\s_-]+/g, " ")
+    .trim();
+}
+
+function slugifyEntityName(name: string): string {
+  return normalizeEntityName(name)
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 120);
+}
+
+export function normalizeEntityKey(
+  key: string | undefined,
+  kind: EntityKind,
+  name: string,
+): string {
+  const normalized = (key ?? `${kind}:${slugifyEntityName(name)}`)
+    .trim()
+    .normalize("NFKC")
+    .toLocaleLowerCase("en-US");
+  if (
+    !normalized ||
+    normalized.length > ENTITY_KEY_MAX_CHARS ||
+    !/^[a-z][a-z0-9_-]*:[a-z0-9][a-z0-9._-]*$/.test(normalized)
+  ) {
+    throw new Error("Entity key must look like person:rowan or organization:openai");
+  }
+  // A generated key always carries its kind. A supplied one has to agree, or
+  // the entity is stored under an identity that contradicts its own kind and
+  // every later lookup for that key resolves confusingly.
+  if (!normalized.startsWith(`${kind}:`)) {
+    throw new Error(`Entity key must begin with its kind, like ${kind}:name`);
+  }
+  return normalized;
+}
+
+function normalizeAliases(
+  aliases: readonly string[] | undefined,
+  canonicalName: string,
+): { aliases: string[]; normalizedAliases: string[] } {
+  const byNormalized = new Map<string, string>();
+  const canonicalNormalized = normalizeEntityName(canonicalName);
+  for (const alias of aliases ?? []) {
+    const cleaned = boundedText(alias, "Entity alias", ENTITY_NAME_MAX_CHARS);
+    const normalized = normalizeEntityName(cleaned);
+    if (normalized !== canonicalNormalized) byNormalized.set(normalized, cleaned);
+  }
+  return {
+    aliases: [...byNormalized.values()].slice(0, 20),
+    normalizedAliases: [...byNormalized.keys()].slice(0, 20),
+  };
+}
+
+/** One entity row by id, unchecked against any space. Callers space-check. */
+export async function getEntity(ctx: IdentityCtx, id: string): Promise<Entity | null> {
+  const record = await row<EntityRow>(
+    ctx,
+    `SELECT id, space_id, user_id, key, kind, canonical_name, normalized_name,
+            aliases, normalized_aliases, created_at, updated_at
+       FROM kith.entities WHERE id = $1`,
+    [assertKithId(id, "invalid_entity_id")],
+  );
+  return record ? toEntity(record) : null;
+}
+
+/**
+ * Resolves a subject or object entity selector to a stored entity row,
+ * creating or updating it as needed. Ported from `resolveEntity`.
+ *
+ * `key: "me"` (or `"person:me"`, or an unqualified name that normalizes to
+ * "me") resolves through the caller's own space membership rather than
+ * through the entities table: "me" is the authenticated caller's explicit
+ * person link, never a name lookup, so it cannot be spoofed by writing an
+ * entity whose name happens to be "me".
+ */
+export async function resolveEntity(
+  ctx: IdentityCtx,
+  userId: string,
+  spaceId: string,
+  selector: EntitySelector,
+): Promise<Entity> {
+  const canonicalName = boundedText(selector.name, "Entity name", ENTITY_NAME_MAX_CHARS);
+  const normalizedName = normalizeEntityName(canonicalName);
+  const requestedKey = selector.key?.trim().normalize("NFKC").toLocaleLowerCase("en-US");
+  const selectsMe =
+    selector.kind === "person" &&
+    (requestedKey === "me" ||
+      requestedKey === "person:me" ||
+      (requestedKey === undefined && normalizedName === "me"));
+  if (selectsMe) {
+    const memberships = await rows<{ person_entity_id: string | null }>(
+      ctx,
+      `SELECT person_entity_id FROM kith.space_members WHERE space_id = $1 AND user_id = $2 LIMIT 2`,
+      [spaceId, userId],
+    );
+    if (memberships.length !== 1 || !memberships[0]!.person_entity_id) {
+      throw new Error("Me is not linked to a person in this space");
+    }
+    const person = await getEntity(ctx, memberships[0]!.person_entity_id);
+    if (!person || person.kind !== "person" || person.spaceId !== spaceId) {
+      throw new Error("Me is not linked to a person in this space");
+    }
+    return person;
+  }
+
+  const key = normalizeEntityKey(selector.key, selector.kind, canonicalName);
+  const incomingAliases = normalizeAliases(selector.aliases, canonicalName);
+  const existing = await row<EntityRow>(
+    ctx,
+    `SELECT id, space_id, user_id, key, kind, canonical_name, normalized_name,
+            aliases, normalized_aliases, created_at, updated_at
+       FROM kith.entities WHERE space_id = $1 AND key = $2`,
+    [spaceId, key],
+  );
+
+  if (existing) {
+    const entity = toEntity(existing);
+    if (entity.kind !== selector.kind) {
+      throw new Error("Entity key is already assigned to a different kind");
+    }
+    const aliasMap = new Map<string, string>();
+    entity.normalizedAliases.forEach((alias, index) =>
+      aliasMap.set(alias, entity.aliases[index] ?? alias),
+    );
+    incomingAliases.normalizedAliases.forEach((alias, index) =>
+      aliasMap.set(alias, incomingAliases.aliases[index] ?? alias),
+    );
+    if (entity.normalizedName !== normalizedName) {
+      aliasMap.set(normalizedName, canonicalName);
+    }
+    const mergedAliases = [...aliasMap.values()].slice(0, 20);
+    const mergedNormalizedAliases = [...aliasMap.keys()].slice(0, 20);
+    await exec(
+      ctx,
+      `UPDATE kith.entities
+          SET aliases = $2::jsonb, normalized_aliases = $3::jsonb, updated_at = $4
+        WHERE id = $1`,
+      [
+        entity.id,
+        JSON.stringify(mergedAliases),
+        JSON.stringify(mergedNormalizedAliases),
+        new Date(ctx.now),
+      ],
+    );
+    return (await getEntity(ctx, entity.id))!;
+  }
+
+  const id = newKithId();
+  await exec(
+    ctx,
+    `INSERT INTO kith.entities
+       (id, space_id, user_id, key, kind, canonical_name, normalized_name,
+        aliases, normalized_aliases)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb)`,
+    [
+      id,
+      spaceId,
+      userId,
+      key,
+      selector.kind,
+      canonicalName,
+      normalizedName,
+      JSON.stringify(incomingAliases.aliases),
+      JSON.stringify(incomingAliases.normalizedAliases),
+    ],
+  );
+  return (await getEntity(ctx, id))!;
+}
+
+// ---------------------------------------------------------------------------
+// The P2-70l bounded alias scan, ported from `models/records/cardEntityBinding.ts`
+// so a later domain (card entity binding) that needs "does this literal name
+// resolve to exactly one entity in this space" can call one implementation
+// instead of re-deriving it against this schema.
+// ---------------------------------------------------------------------------
+
+/**
+ * ponytail: one bounded scan of the space's entities, and an in-memory match
+ * on `normalizedName` and `normalizedAliases`. Upgrade path if a space ever
+ * passes the bound: a one-row-per-alias index table, written where aliases
+ * are written. Until then a space past the bound never auto-resolves by name,
+ * so the failure is a reported truncation, never a wrong match.
+ */
+export const MAX_ENTITY_SCAN_ROWS = 1_024;
+
+export type EntityIndex = {
+  byNormalizedName: ReadonlyMap<string, readonly Entity[]>;
+  /** True when the space holds more entities than one pass may read. */
+  truncated: boolean;
+};
+
+export async function loadSpaceEntityIndex(
+  ctx: IdentityCtx,
+  spaceId: string,
+): Promise<EntityIndex> {
+  const records = await rows<EntityRow>(
+    ctx,
+    `SELECT id, space_id, user_id, key, kind, canonical_name, normalized_name,
+            aliases, normalized_aliases, created_at, updated_at
+       FROM kith.entities WHERE space_id = $1 LIMIT $2`,
+    [assertKithId(spaceId, "invalid_space_id"), MAX_ENTITY_SCAN_ROWS + 1],
+  );
+  const truncated = records.length > MAX_ENTITY_SCAN_ROWS;
+  const byNormalizedName = new Map<string, Entity[]>();
+  const add = (name: string, entity: Entity) => {
+    const list = byNormalizedName.get(name);
+    if (!list) {
+      byNormalizedName.set(name, [entity]);
+    } else if (!list.some((candidate) => candidate.id === entity.id)) {
+      // A name that is both an entity's canonical name and one of its own
+      // aliases is still one candidate, not two.
+      list.push(entity);
+    }
+  };
+  for (const record of records.slice(0, MAX_ENTITY_SCAN_ROWS).map(toEntity)) {
+    add(record.normalizedName, record);
+    for (const alias of record.normalizedAliases) add(alias, record);
+  }
+  return { byNormalizedName, truncated };
+}
+
+/**
+ * Normalizes with the same function that wrote `entities.normalized_name`, so
+ * a lookup can never disagree with what was stored. An unusable name (empty,
+ * or longer than an entity name may be) matches nothing.
+ */
+export function normalizeLiteralName(literalName: string): string {
+  try {
+    return normalizeEntityName(literalName);
+  } catch {
+    return "";
+  }
+}
+
+export type NameResolution = {
+  normalizedName: string;
+  candidateCount: number;
+  /** Set only when exactly one candidate was found in a complete scan. */
+  entity?: Entity;
+};
+
+export function resolveLiteralName(
+  index: EntityIndex,
+  literalName: string,
+  allowedKinds?: readonly EntityKind[],
+): NameResolution {
+  const normalizedName = normalizeLiteralName(literalName);
+  if (!normalizedName) return { normalizedName: "", candidateCount: 0 };
+  const matched = index.byNormalizedName.get(normalizedName) ?? [];
+  const candidates = allowedKinds
+    ? matched.filter((entity) => allowedKinds.includes(entity.kind))
+    : matched;
+  // A truncated scan may have missed a second match, so it never resolves.
+  // The count is still reported honestly.
+  if (candidates.length === 1 && !index.truncated) {
+    return { normalizedName, candidateCount: 1, entity: candidates[0]! };
+  }
+  return { normalizedName, candidateCount: candidates.length };
+}
