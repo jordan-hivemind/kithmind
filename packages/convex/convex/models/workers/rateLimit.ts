@@ -1,4 +1,8 @@
 import type { MutationCtx } from "../../_generated/server";
+import {
+  WORKER_MUTATION_RATE_LIMIT,
+  WORKER_MUTATION_RATE_WINDOW_MS,
+} from "@repo/worker-protocol";
 import type { requireWorkerSourceAccount } from "./auth";
 import { workerProtocolError } from "./errors";
 
@@ -31,8 +35,7 @@ import { workerProtocolError } from "./errors";
  * packages/pipeline/src/runner.ts) so the largest phase doesn't depend on
  * the budget alone.
  */
-export const WORKER_MUTATION_RATE_LIMIT = 8_000;
-export const WORKER_MUTATION_RATE_WINDOW_MS = 60_000;
+export { WORKER_MUTATION_RATE_LIMIT, WORKER_MUTATION_RATE_WINDOW_MS };
 
 type LoadedWorkerSource = Awaited<
   ReturnType<typeof requireWorkerSourceAccount>

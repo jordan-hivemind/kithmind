@@ -18,6 +18,10 @@
 // this operation is supposed to give.
 
 import { newKithId } from "../ids.js";
+import {
+  WORKER_MUTATION_RATE_LIMIT,
+  WORKER_MUTATION_RATE_WINDOW_MS,
+} from "@repo/worker-protocol";
 import { at, exec, numOr0, row, type WorkerCtx } from "./db.js";
 import { workerProtocolError } from "./errors.js";
 
@@ -27,14 +31,11 @@ import { workerProtocolError } from "./errors.js";
  */
 export const WORKER_MUTATION_RATE_BUDGET = {
   /** Mutations allowed per credential per source account per window. */
-  limit: 8_000,
+  limit: WORKER_MUTATION_RATE_LIMIT,
   /** The window length in milliseconds. */
-  windowMs: 60_000,
+  windowMs: WORKER_MUTATION_RATE_WINDOW_MS,
 } as const;
 
-export const WORKER_MUTATION_RATE_LIMIT = WORKER_MUTATION_RATE_BUDGET.limit;
-export const WORKER_MUTATION_RATE_WINDOW_MS =
-  WORKER_MUTATION_RATE_BUDGET.windowMs;
 
 type RateRow = { window_started_at: Date; count: string };
 
