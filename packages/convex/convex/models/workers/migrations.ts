@@ -235,8 +235,10 @@ export async function requeueFailedDiscoveryWorkPage(
     dryRun: boolean;
     limit: number;
     now: number;
+    resetAttempts?: boolean;
   },
 ) {
+  const resetAttempts = args.resetAttempts ?? false;
   if (
     !Number.isInteger(args.limit) ||
     args.limit < 1 ||
@@ -247,6 +249,7 @@ export async function requeueFailedDiscoveryWorkPage(
   let examined = 0;
   let requeued = 0;
   let skippedAttemptLimit = 0;
+  let resetAtLimit = 0;
   for (const state of ["failed", "needs_review"] as const) {
     if (examined >= args.limit) break;
     const rows = await ctx.db
@@ -258,11 +261,13 @@ export async function requeueFailedDiscoveryWorkPage(
     for (const row of rows) {
       examined += 1;
       byPriorState[state] += 1;
-      if (row.attempts >= MAX_WORKER_DISCOVERY_ATTEMPTS) {
+      const atLimit = row.attempts >= MAX_WORKER_DISCOVERY_ATTEMPTS;
+      if (atLimit && !resetAttempts) {
         skippedAttemptLimit += 1;
         continue;
       }
       requeued += 1;
+      if (atLimit) resetAtLimit += 1;
       if (!args.dryRun) {
         await ctx.db.patch(row._id, {
           state: "queued",
@@ -270,13 +275,20 @@ export async function requeueFailedDiscoveryWorkPage(
           leaseToken: undefined,
           leaseOwnerCredentialId: undefined,
           leaseExpiresAt: undefined,
-          retryable: undefined,
+          retryable: atLimit ? true : undefined,
           failureCode: undefined,
+          ...(atLimit ? { attempts: 0 } : {}),
         });
       }
     }
   }
-  return { examined, requeued, skippedAttemptLimit, byPriorState };
+  return {
+    examined,
+    requeued,
+    skippedAttemptLimit,
+    resetAtLimit,
+    byPriorState,
+  };
 }
 
 export const requeueFailedDiscoveryWork = internalMutation({
@@ -284,6 +296,7 @@ export const requeueFailedDiscoveryWork = internalMutation({
     sourceAccountId: v.id("sourceAccounts"),
     dryRun: v.optional(v.boolean()),
     limit: v.optional(v.number()),
+    resetAttempts: v.optional(v.boolean()),
   },
   handler: (ctx, args) =>
     requeueFailedDiscoveryWorkPage(ctx, {
@@ -291,6 +304,7 @@ export const requeueFailedDiscoveryWork = internalMutation({
       dryRun: args.dryRun ?? true,
       limit: args.limit ?? REQUEUE_DEFAULT_LIMIT,
       now: Date.now(),
+      resetAttempts: args.resetAttempts ?? false,
     }),
 });
 
