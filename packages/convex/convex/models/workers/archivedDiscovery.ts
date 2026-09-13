@@ -24,7 +24,13 @@ import {
 } from "../provenance/providerOriginals";
 import { parseSourceTextRepresentation } from "../provenance/representations";
 import { markInventoryParseFailed } from "../documents/inventory";
+import {
+  BINARY_CLASSES,
+  isBinaryClass,
+  type BinaryParserProfileId,
+} from "@repo/worker-protocol";
 import { requireWorkerSourceAccount } from "./auth";
+import { accountBinaryClasses } from "./profile";
 import {
   MAX_WORKER_DISCOVERY_ATTEMPTS,
   requireCurrentDiscovery,
@@ -63,9 +69,14 @@ async function digest(domain: string, value: unknown): Promise<string> {
   return sha256Utf8(`${domain}\0${JSON.stringify(value)}`);
 }
 
+/**
+ * The lane gate: the archived-binary path is enabled and audited for at least
+ * one class. Which class a particular file may use is checked where the class
+ * is known, against the scan entry and the discovery work.
+ */
 export function requireBinaryGate(source: LoadedWorkerSource): void {
   if (
-    source.account.binaryProfileId !== "pdf_docqa_v1" ||
+    accountBinaryClasses(source.account).length === 0 ||
     source.account.binaryProfileEnabledAt === undefined ||
     !Number.isSafeInteger(source.account.binaryProfileEnabledAt) ||
     source.account.binaryProfileEnabledAt < 0 ||
@@ -74,6 +85,20 @@ export function requireBinaryGate(source: LoadedWorkerSource): void {
   ) {
     throw workerProtocolError("source_unavailable");
   }
+}
+
+/**
+ * The class of one discovery work row. The row stores its media type and
+ * profile as plain strings, so this is where a stored pair becomes a class
+ * again; a pair outside the closed set is a stale observation, not a default.
+ */
+export function requireWorkBinaryClass(
+  work: Doc<"workerDiscoveryWork">,
+): (typeof BINARY_CLASSES)[BinaryParserProfileId] {
+  if (!isBinaryClass(work.profileId, work.mediaType)) {
+    throw workerProtocolError("stale_observation");
+  }
+  return BINARY_CLASSES[work.profileId];
 }
 
 export function requireStoredBinaryWork(
@@ -93,12 +118,11 @@ export function requireStoredBinaryWork(
     work.contentRepresentation !== "archived_binary_v1" ||
     item._id !== work.sourceItemId ||
     scan._id !== work.scanId ||
-    work.mediaType !== "application/pdf" ||
-    work.profileId !== "pdf_docqa_v1" ||
+    !isBinaryClass(work.profileId, work.mediaType) ||
     work.extractionFingerprint !== "artifact-bound-extraction:v1" ||
     entry.contentRepresentation !== "archived_binary_v1" ||
-    entry.binaryMediaType !== "application/pdf" ||
-    entry.binaryParserProfileId !== "pdf_docqa_v1" ||
+    !isBinaryClass(entry.binaryParserProfileId, entry.binaryMediaType) ||
+    entry.binaryParserProfileId !== work.profileId ||
     !/^[0-9a-f]{64}$/.test(work.contentHash) ||
     !/^[0-9a-f]{64}$/.test(work.parserFingerprint ?? "") ||
     !/^[0-9a-f]{64}$/.test(work.extractionConfigurationFingerprint ?? "") ||
@@ -542,10 +566,22 @@ export async function failArchivedDiscovery(
 ): Promise<WorkerArchivedFailResult> {
   const source = await requireWorkerSourceAccount(ctx, principal, request);
   requireBinaryGate(source);
-  const current = await resolveCurrentArchivedWork(ctx, source, request.identity);
+  const current = await resolveCurrentArchivedWork(
+    ctx,
+    source,
+    request.identity,
+  );
   await consumeWorkerMutationRateLimit(ctx, source, now);
   const attempts = safeAdd(current.work.attempts, 1);
-  const retryable = attempts < MAX_WORKER_DISCOVERY_ATTEMPTS;
+  // P2-80g: two caps used to disagree. The client stops parsing a document
+  // after its own `MAX_PARSE_ATTEMPTS` (2) and says so with `exhausted`, but
+  // the row stayed `retryable` until the server's `MAX_WORKER_DISCOVERY_ATTEMPTS`
+  // (8), so a deterministic document-level failure was re-queued for six more
+  // passes that nobody would ever act on. The client's budget is the authority
+  // on whether this document will be tried again, so an exhausted report is
+  // terminal regardless of the server count.
+  const retryable =
+    request.exhausted !== true && attempts < MAX_WORKER_DISCOVERY_ATTEMPTS;
   await ctx.db.patch(current.work._id, {
     state: "failed",
     attempts,
@@ -554,7 +590,12 @@ export async function failArchivedDiscovery(
     leaseToken: undefined,
     leaseOwnerCredentialId: undefined,
     leaseExpiresAt: undefined,
-    nextAttemptAt: undefined,
+    // A retryable row carries the instant it is next eligible, the same
+    // invariant `jobs.fail` keeps and the one `validDiscoveryWorkRuntimeState`
+    // (assessment.ts) enforces. Clearing it on a retryable failure made the
+    // row invalid, which failed the whole processing assessment closed as
+    // `detail_unavailable`, and hid the row from `dueDiscoveryCandidates`.
+    nextAttemptAt: retryable ? now : undefined,
   });
   await markInventoryParseFailed(ctx, {
     sourceItemId: current.item._id,
@@ -1096,7 +1137,15 @@ async function resolveParserArtifact(
   revision: Doc<"sourceRevisions">,
   request: ArchivedRequest,
 ): Promise<Doc<"sourceParserArtifacts">> {
+  // The parser output media type belongs to the class, so a docling artifact
+  // can never stand in for a workbook's rendered grid, or the other way round.
+  const expectedOutputMediaType = requireWorkBinaryClass(
+    current.work,
+  ).parserOutputMediaType;
   if (request.parserArtifact.kind === "create") {
+    if (request.parserArtifact.outputMediaType !== expectedOutputMediaType) {
+      throw workerProtocolError("stale_observation");
+    }
     return createOrGetParserArtifact(ctx, {
       spaceId: source.spaceId,
       sourceAccountId: source.account._id,
@@ -1123,7 +1172,8 @@ async function resolveParserArtifact(
     artifact.sourceAccountId !== source.account._id ||
     artifact.sourceItemId !== current.item._id ||
     artifact.sourceRevisionId !== revision._id ||
-    artifact.parserFingerprint !== current.work.parserFingerprint
+    artifact.parserFingerprint !== current.work.parserFingerprint ||
+    artifact.outputMediaType !== expectedOutputMediaType
   ) {
     throw workerProtocolError("stale_observation");
   }
@@ -1353,7 +1403,7 @@ export async function admitArchivedDiscovery(
       sourceItemId: current.item._id,
       contentHash: current.work.contentHash,
       byteLength: current.work.byteLength,
-      mediaType: "application/pdf",
+      mediaType: requireWorkBinaryClass(current.work).mediaType,
       capturedAt: current.work.capturedAt,
       userId: current.work.actorUserId,
     });

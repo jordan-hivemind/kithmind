@@ -1,13 +1,14 @@
 ---
 name: weekly-review
-description: Weekly synthesis of your brain thoughts, workflow insights, and goals. Surfaces gaps, open loops, and recommendations. Every claim is cited back to its source.
+description: Weekly synthesis of your brain thoughts and facts. Surfaces themes, open loops, and recommendations. Every claim is cited back to its source.
 ---
 
 # Weekly Review
 
-A weekly synthesis that cross-references your brain thoughts, workflow insights, and goals to surface what you'd miss looking at any one source alone.
+A weekly synthesis that cross-references the week's thoughts against what your
+brain already holds, to surface what you'd miss reading either one alone.
 
-Every claim in the output must be grounded in a source — cite structured facts as `fact:<id>`, thoughts as `thought:<id>`, insights as `insight:<id>`, lists as `list:<id>`.
+Every claim in the output must be grounded in a source — cite structured facts as `fact:<id>` and thoughts as `thought:<id>`.
 
 ## Workflow
 
@@ -32,26 +33,15 @@ This returns up to 50 compact index rows in chronological order for thoughts cap
 
 If the array is empty, tell the user: "Your brain has no thoughts captured this week. Try capturing some thoughts, or run `/brain-init` if your brain is empty." Then stop.
 
-### Step 3: Pull Insights and Goals
-
-**Workflow insights:**
-Call `mcp__ai-brain__get_insights` with `status: "new"`, then again with `status: "noted"`. If the tool is unavailable (server doesn't expose insights for this user), note this and skip insight-dependent sections.
-
-**Goals and priorities:**
-Call `mcp__ai-brain__get_lists` with `pinned: true` to get the user's stated goals and priorities.
-
-**Open items:**
-Call `mcp__ai-brain__get_open_items` to get unfinished tracked items across all lists.
-
-### Step 4: Hydrate Noteworthy Thoughts
+### Step 3: Hydrate Noteworthy Thoughts
 
 From the week's timeline (Step 2), select up to 10 thoughts that look most substantive (by `summary` + `snippet` + `topics`) — the ones you'll want to cite in the synthesis.
 
 Call `mcp__ai-brain__get_thoughts` with `ids: [<up to 10 ids>]`. Only these hydrated results can be quoted or paraphrased in the synthesis. The rest of the timeline is still referenceable by `thought:<id>` + summary.
 
-### Step 5: Produce the Review
+### Step 4: Produce the Review
 
-Generate a report with these 5 sections. Each section should be concise — the entire review should be scannable in 2 minutes. **Every factual claim must cite its source.**
+Generate a report with these 4 sections. Each section should be concise — the entire review should be scannable in 2 minutes. **Every factual claim must cite its source.**
 
 ---
 
@@ -63,29 +53,12 @@ Cite 2-3 anchor thoughts: `thought:<id>`.
 
 ---
 
-**Attention vs. Intention**
-
-Compare workflow insights (what you actually did) against pinned goals (what you intended to do).
-
-Flag:
-
-- Goals with no corresponding session activity — "You said [goal] is a priority but had no sessions related to it" — cite the goal as `list:<id>`.
-- Heavy activity on topics not in your goals — "[Topic] consumed [X]% of sessions but isn't in your goals" — cite `insight:<id>`.
-- Momentum shifts — "[Topic] went from [X]% to [Y]% of sessions week over week" — cite `insight:<id>`.
-
-If no workflow insights are available, display instead:
-
-> "Install the `radar` plugin (`/plugin install radar@flippyhead/radar`) for time allocation analysis."
-
----
-
 **Knowledge Captured**
 
 Review the themes from saved thoughts this week. Cite each theme to an anchor thought.
 
 Highlight:
 
-- Topics with workflow insights but no saved thoughts — "You worked on [topic] but didn't save any knowledge about it — is there something worth persisting?" — cite `insight:<id>`.
 - Repeated thought topics — building momentum on a theme — cite 2-3 `thought:<id>` examples.
 - Cross-domain connections — thoughts from different contexts that might be related — cite the connected thoughts.
 
@@ -93,11 +66,10 @@ Highlight:
 
 **Open Loops**
 
-Aggregate unfinished threads from all sources:
+Aggregate unfinished threads from the week's thoughts:
 
-- Open items from pinned lists — cite each `list:<id>` with item counts.
-- Workflow insights still marked "new" — cite each `insight:<id>`.
 - Decisions mentioned in thoughts that lack clear resolution — cite the `thought:<id>` where the decision was raised.
+- Commitments captured without a recorded outcome — cite the `thought:<id>`.
 
 ---
 
@@ -107,13 +79,13 @@ Aggregate unfinished threads from all sources:
 
 ---
 
-### Step 6: Offer to Save
+### Step 5: Offer to Save
 
 After presenting the review, ask:
 "Want me to save a summary of this review to your brain? This helps track trends across weeks."
 
 If yes, save a condensed version via `mcp__ai-brain__capture_thought` with format:
-"Weekly review (week of [ISO date]): [2-3 sentence summary of key themes, attention vs. intention highlights, and top recommendation]. Grounded in: thought:<id1>, thought:<id2>, insight:<id1>."
+"Weekly review (week of [ISO date]): [2-3 sentence summary of key themes and the top recommendation]. Grounded in: thought:<id1>, thought:<id2>."
 
 Pass `sourceType: user_confirmed`. Keep the review to one coherent weekly retrospective rather than adding unrelated personal facts.
 

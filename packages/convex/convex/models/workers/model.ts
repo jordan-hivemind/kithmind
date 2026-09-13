@@ -13,7 +13,7 @@ import {
   upsertSourceInventoryRow,
 } from "../documents/inventory";
 import { workerProtocolError } from "./errors";
-import { FS_TEXT_PROFILE } from "./profile";
+import { accountAdmitsBinaryClass, FS_TEXT_PROFILE } from "./profile";
 import {
   type FsDiscoveryEntry,
   type WorkerInventoryPageResult,
@@ -1328,15 +1328,31 @@ async function persistResolvedEntry(
     activeGeneration.normalizationFingerprint ===
       profile?.normalizationFingerprint &&
     activeGeneration.chunkerFingerprint === profile?.chunkerFingerprint;
+  // P2-80f: a scan entry `needs_review` means identity review only, which is
+  // what the pipeline's `identity_review_required` code and its
+  // `identity_recovery` mode exist for. A processing failure is not an
+  // identity question, so it never produces one: a still-retryable failure
+  // re-queues (`reserveArchivedDiscovery` already reclaims a `failed` row
+  // while `retryable`), and an exhausted one settles as `unchanged` with its
+  // `failed` work row left in place as the record of the failure. Reporting a
+  // settled failure as `needs_review` instead put the source in a permanent
+  // loop: every normal pass sealed `needs_review`, the next pass ran in
+  // `identity_recovery`, requeued the same deterministic failures, and the
+  // pass after that repeated it. `requeueFailedDiscoveryWork` remains the way
+  // to re-attempt an exhausted row.
+  const settledFailure =
+    !alreadyReady &&
+    !inventoryChanged &&
+    priorWork !== undefined &&
+    priorWork.state === "failed" &&
+    priorWork.retryable !== true;
   const entryState =
     args.entry.content.status === "gap"
       ? "gap"
-      : alreadyReady
+      : alreadyReady || settledFailure
         ? "unchanged"
-        : !inventoryChanged && priorWork
-          ? priorWork.state === "needs_review" || priorWork.state === "failed"
-            ? "needs_review"
-            : "queued"
+        : !inventoryChanged && priorWork && priorWork.state === "needs_review"
+          ? "needs_review"
           : "queued";
   const id = await ctx.db.insert("workerScanEntries", {
     spaceId: args.source.spaceId,
@@ -1408,7 +1424,10 @@ async function persistResolvedEntry(
       now: args.now,
     });
     if (!work) await ctx.db.patch(id, { state: "unchanged" });
-  } else if (priorWork && entryState === "queued") {
+  } else if (priorWork && (entryState === "queued" || settledFailure)) {
+    // A settled failure keeps its `failed` work row and rebinds it to this
+    // scan, so the entry still points at the failure and the row's retention
+    // window is refreshed rather than leaving a stale chain behind.
     if (priorWork.scanId !== args.scan._id || priorWork.scanEntryId !== id) {
       await ctx.db.patch(priorWork._id, {
         scanId: args.scan._id,
@@ -1422,7 +1441,7 @@ async function persistResolvedEntry(
       work = priorWork;
     }
   }
-  if (priorWork && entryState === "unchanged") {
+  if (priorWork && entryState === "unchanged" && !settledFailure) {
     await obsoletePriorWork(ctx, priorWork, false, args.now);
   } else if (inventoryChanged && priorWork && entryState !== "queued") {
     await obsoletePriorWork(
@@ -1649,16 +1668,23 @@ export async function appendWorkerScanPage(
   now: number,
 ): Promise<WorkerScanAppendResult> {
   const source = await requireWorkerSourceAccount(ctx, principal, request);
+  // P2-70i2: the gate is per class. Every binary entry in this page must name
+  // a class this account is audited for, so enabling workbooks is an explicit
+  // owner decision and not a side effect of the PDF lane being open.
   if (
     request.entries.some(
-      (entry) => entry.content.status === "ready_binary_v1",
-    ) &&
-    (source.account.binaryProfileId !== "pdf_docqa_v1" ||
-      source.account.binaryProfileEnabledAt === undefined ||
-      !Number.isSafeInteger(source.account.binaryProfileEnabledAt) ||
-      source.account.binaryProfileEnabledAt < 0 ||
-      source.account.binaryProfileAuditDigest === undefined ||
-      !/^[0-9a-f]{64}$/.test(source.account.binaryProfileAuditDigest))
+      (entry) =>
+        entry.content.status === "ready_binary_v1" &&
+        (!accountAdmitsBinaryClass(
+          source.account,
+          entry.content.parserProfileId,
+        ) ||
+          source.account.binaryProfileEnabledAt === undefined ||
+          !Number.isSafeInteger(source.account.binaryProfileEnabledAt) ||
+          source.account.binaryProfileEnabledAt < 0 ||
+          source.account.binaryProfileAuditDigest === undefined ||
+          !/^[0-9a-f]{64}$/.test(source.account.binaryProfileAuditDigest)),
+    )
   ) {
     throw workerProtocolError("source_unavailable");
   }

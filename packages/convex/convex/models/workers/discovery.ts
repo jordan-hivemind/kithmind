@@ -1,5 +1,6 @@
 import type { Doc, Id } from "../../_generated/dataModel";
 import type { MutationCtx } from "../../_generated/server";
+import { isBinaryClass } from "@repo/worker-protocol";
 import { requireSourceAccountAccess } from "../../lib/sourceAuth";
 import type { PrincipalRef } from "../../lib/spaces";
 import { planInlineText } from "../ingestion/inlineText";
@@ -8,7 +9,7 @@ import { sha256Utf8 } from "../provenance/model";
 import { requireInlineSourceRevision } from "../provenance/representations";
 import { requireWorkerSourceAccount } from "./auth";
 import { workerProtocolError, workerProtocolErrorCode } from "./errors";
-import { FS_TEXT_PROFILE } from "./profile";
+import { accountAdmitsBinaryClass, FS_TEXT_PROFILE } from "./profile";
 import { consumeWorkerMutationRateLimit } from "./rateLimit";
 import type {
   WorkerDiscoveryAdmitResult,
@@ -118,15 +119,16 @@ async function requireCurrentDiscoveryState(
   await requireOriginalActor(ctx, source, scan);
   const binary = work.contentRepresentation === "archived_binary_v1";
   const profileValid = binary
-    ? source.account.binaryProfileId === "pdf_docqa_v1" &&
+    ? accountAdmitsBinaryClass(source.account, entry.binaryParserProfileId) &&
       source.account.binaryProfileEnabledAt !== undefined &&
       Number.isSafeInteger(source.account.binaryProfileEnabledAt) &&
       source.account.binaryProfileEnabledAt >= 0 &&
       source.account.binaryProfileAuditDigest !== undefined &&
       /^[0-9a-f]{64}$/.test(source.account.binaryProfileAuditDigest) &&
       entry.contentRepresentation === "archived_binary_v1" &&
-      entry.binaryParserProfileId === "pdf_docqa_v1" &&
-      entry.binaryMediaType === "application/pdf" &&
+      isBinaryClass(entry.binaryParserProfileId, entry.binaryMediaType) &&
+      entry.binaryParserProfileId === work.profileId &&
+      entry.binaryMediaType === work.mediaType &&
       entry.parserFingerprint === work.parserFingerprint &&
       entry.extractionConfigurationFingerprint ===
         work.extractionConfigurationFingerprint &&
@@ -135,8 +137,7 @@ async function requireCurrentDiscoveryState(
       entry.normalizationFingerprint === work.normalizationFingerprint &&
       entry.chunkerFingerprint === work.chunkerFingerprint &&
       entry.correctionRevision === work.correctionRevision &&
-      work.mediaType === "application/pdf" &&
-      work.profileId === "pdf_docqa_v1" &&
+      isBinaryClass(work.profileId, work.mediaType) &&
       typeof work.parserFingerprint === "string" &&
       typeof work.extractionConfigurationFingerprint === "string" &&
       typeof work.correctionRevision === "string"

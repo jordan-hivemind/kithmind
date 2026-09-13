@@ -123,11 +123,16 @@ async function collectIndexedRows<
   maximumCount: number,
   maximumRowBytes: number,
   query: AsyncIterable<T>,
+  keep?: (row: T) => boolean,
 ): Promise<T[]> {
   const rows: T[] = [];
   await budget.finish();
   for await (const row of query) {
     storedRowSize(row as Record<string, unknown>, maximumRowBytes);
+    if (keep && !keep(row)) {
+      await budget.finish();
+      continue;
+    }
     rows.push(row);
     if (rows.length > maximumCount) throw workerProtocolError("scan_conflict");
     await budget.finish();
@@ -184,6 +189,16 @@ async function collectPayloadRows(
       .withIndex("by_sourceTextVersionId", (q) =>
         q.eq("sourceTextVersionId", sourceTextVersionId),
       ),
+    // P2-80g2: the parsed payload is the parser's own spans. A card-staged
+    // span (the only kind that carries `cardExtractionFingerprints`) is
+    // allowed to be added over sealed text, by the adopted rule recorded on
+    // `evidenceSpanFields`: sealing protects the text and its pages, not
+    // pointers into them. Counting those rows as payload made every
+    // re-verification of a document that had been through card extraction
+    // fail `scan_conflict`, which in turn made `terminalParsedReady` false
+    // and failed the whole worker processing assessment closed as
+    // `detail_unavailable`.
+    (row) => row.cardExtractionFingerprints === undefined,
   );
   const documents = await collectIndexedRows(
     budget,

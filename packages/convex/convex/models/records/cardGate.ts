@@ -34,10 +34,10 @@ import type { ObservationValue } from "./values";
  * extraction fingerprint, so a gate change is a new generation rather than a
  * silent revaluation of a stored card.
  */
-export const CARD_GATE_VERSION = "card-gate-v3";
+export const CARD_GATE_VERSION = "card-gate-v4";
 
 /** The declared, versioned format list of rule 4. */
-export const CARD_DATE_FORMAT_LIST_VERSION = "card-date-formats-v1";
+export const CARD_DATE_FORMAT_LIST_VERSION = "card-date-formats-v2";
 
 /** The declared, versioned marker list of rule 7. */
 export const CARD_NEGATION_MARKER_LIST_VERSION = "card-negations-v1";
@@ -168,6 +168,19 @@ function pad(value: string): string {
   return value.padStart(2, "0");
 }
 
+/**
+ * A bare two-digit year is unambiguous only relative to a fixed pivot, never
+ * the clock: reading it against today's date would make the same span parse
+ * to a different year depending on when the gate happens to run, which is
+ * exactly the kind of impurity this file's rules forbid. `strptime`'s own
+ * `%y` convention is the fixed pivot used here: 00-68 is 2000-2068, 69-99 is
+ * 1969-1999.
+ */
+function expandTwoDigitYear(twoDigits: string): string {
+  const year = Number(twoDigits);
+  return String(year <= 68 ? 2000 + year : 1900 + year);
+}
+
 type CardDateFormat = {
   id: string;
   parse: (text: string) => string | null;
@@ -217,6 +230,44 @@ export const CARD_DATE_FORMATS: readonly CardDateFormat[] = [
       if (!match) return null;
       const month = monthNumber(match[2]!);
       return month ? `${match[3]}-${month}-${pad(match[1]!)}` : null;
+    },
+  },
+  /**
+   * P2-82: an ISO date with a trailing time and, optionally, a timezone
+   * offset. Only the date portion is read; the time is not a second
+   * candidate, since rule 4 is about which calendar date a span states, not
+   * about the time of day.
+   */
+  {
+    id: "iso_ymd_datetime",
+    parse: (text) => {
+      const match = /^(\d{4})-(\d{1,2})-(\d{1,2})T.+$/u.exec(text);
+      return match ? `${match[1]}-${pad(match[2]!)}-${pad(match[3]!)}` : null;
+    },
+  },
+  /**
+   * P2-82: a two-digit year, expanded through `expandTwoDigitYear`'s fixed
+   * pivot. Declared as a slash pair exactly like `mdy_slash`/`dmy_slash`, so
+   * the same ambiguity Set that already refuses `03/04/2025` also refuses a
+   * two-digit-year span that reads as two different real calendar dates,
+   * rather than a special case picking one.
+   */
+  {
+    id: "mdy_slash_2digit",
+    parse: (text) => {
+      const match = /^(\d{1,2})\/(\d{1,2})\/(\d{2})$/u.exec(text);
+      if (!match) return null;
+      const year = expandTwoDigitYear(match[3]!);
+      return `${year}-${pad(match[1]!)}-${pad(match[2]!)}`;
+    },
+  },
+  {
+    id: "dmy_slash_2digit",
+    parse: (text) => {
+      const match = /^(\d{1,2})\/(\d{1,2})\/(\d{2})$/u.exec(text);
+      if (!match) return null;
+      const year = expandTwoDigitYear(match[3]!);
+      return `${year}-${pad(match[2]!)}-${pad(match[1]!)}`;
     },
   },
 ];
@@ -532,6 +583,20 @@ export const CARD_NORMALIZERS = {
     );
     return value.value === !negated ? null : "value_not_in_span";
   },
+
+  /**
+   * Section 4.2, decision 1 (P2-82): `card_kind` is a classification proven
+   * by the card's own anchor, never by a span of its own. `gateOneField`
+   * dispatches this field to a closed-set check before it ever looks at
+   * `spanTexts`, so this function is never actually called; it exists only
+   * to satisfy the registry's one-normalizer-per-id contract.
+   */
+  anchor_enum_v1: (_spanText, value, field) => {
+    if (value.type !== "text") return "field_not_declared";
+    return (field.enumValues ?? []).includes(value.value)
+      ? null
+      : "value_not_normalizable";
+  },
 } satisfies Record<CardNormalizerId, Normalizer>;
 
 // --- the gate -------------------------------------------------------------
@@ -553,6 +618,17 @@ function gateOneField(
     candidate.value.value.length > field.maxChars
   ) {
     return "value_too_long";
+  }
+  if (field.normalizer === "anchor_enum_v1") {
+    // Decision 1 of P2-82: proven by the card's own anchor, which has
+    // already resolved by the time this candidate reaches the gate (an
+    // unresolved anchor refuses the whole card before any field is gated).
+    // No span is required or read for this field.
+    return candidate.value.type !== "text"
+      ? "field_not_declared"
+      : (field.enumValues ?? []).includes(candidate.value.value)
+        ? null
+        : "value_not_normalizable";
   }
   if (candidate.spanTexts.length === 0) return "evidence_missing";
   const normalizer = CARD_NORMALIZERS[field.normalizer];

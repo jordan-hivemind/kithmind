@@ -43,7 +43,10 @@ const DATE = "2025-03-04";
 const PARTY_ONE = "Northwind Supply";
 const PARTY_TWO = "Acme Research";
 const SUMMARY = "both sides keep the other side's material confidential";
-const CARD_KIND = "Non-Disclosure Agreement";
+// One of DOCUMENT_CARD_KINDS. Decision 1 of P2-82: card_kind is proven by
+// the card's own anchor, never by a span of its own, so this value is never
+// looked up in TEXT the way the other fixture quotes are.
+const CARD_KIND = "contract";
 
 const FINGERPRINT = {
   cardSchemaVersion: 1,
@@ -113,7 +116,8 @@ async function seedDocument(options: { withSubjectEntity: boolean }) {
       sourceTextVersionId: textVersion._id,
       pages: [{ ordinal: 0, start: 0, end: TEXT.length, text: TEXT }],
     });
-    const quotes = [TITLE, DATE, PARTY_ONE, PARTY_TWO, SUMMARY, CARD_KIND];
+    // CARD_KIND is not a quote: decision 1 of P2-82 proves it by the anchor.
+    const quotes = [TITLE, DATE, PARTY_ONE, PARTY_TWO, SUMMARY];
     const spans = await stageEvidenceSpans(ctx, {
       spaceId,
       sourceRevisionId: revision._id,
@@ -267,7 +271,10 @@ function genericFields(
     {
       field: "card_kind",
       value: { type: "text", value: CARD_KIND },
-      evidenceSpanIds: [evidence[CARD_KIND]!],
+      // Decision 1 of P2-82: no evidence span is required or read for this
+      // field. It is proven by the anchor resolving and the value being one
+      // of DOCUMENT_CARD_KINDS.
+      evidenceSpanIds: [],
     },
     {
       field: "card_title",
@@ -313,6 +320,9 @@ function withValue(
 describe("document cards", () => {
   test("publishes a generic card that query_records answers by date and entity", async () => {
     const seeded = await seedDocument({ withSubjectEntity: true });
+    const sealedDocumentBefore = await seeded.t.run(
+      async (ctx) => (await ctx.db.get(seeded.documentId))!,
+    );
     const published = await seeded.t.run((ctx) =>
       publishDocumentCard(ctx, {
         spaceId: seeded.spaceId,
@@ -405,27 +415,20 @@ describe("document cards", () => {
     if (empty.operation !== "list_events") throw new Error("wrong operation");
     expect(empty.records).toHaveLength(0);
 
-    // Section 4.2: activation patches the active document row's docType in
-    // place, so type filtering and the accepted card kind cannot disagree,
-    // and the previous value is recorded on the card version.
+    // Section 4.2 and P2-80i: activation records the accepted card kind on the
+    // item, which every document read overlays, and leaves the document row
+    // exactly as the parser staged it. That row is part of the sealed parsed
+    // payload and its `docType` is inside `manifest.documentDigest`, so
+    // patching it in place made `verifySealedParsedPayload` fail for every
+    // document a card had refined.
     const state = await seeded.t.run(async (ctx) => ({
       document: (await ctx.db.get(seeded.documentId))!,
-      version: (
-        await ctx.db
-          .query("eventVersions")
-          .withIndex("by_eventId", (q) => q.eq("eventId", published.eventId!))
-          .collect()
-      )[0]!,
+      item: (await ctx.db.get(seeded.sourceItemId))!,
     }));
-    expect(state.document.docType).toBe(CARD_KIND);
+    expect(state.document).toEqual(sealedDocumentBefore);
+    expect(state.document.docType).toBe("note");
     expect(state.document.publicationState).toBe("active");
-    expect(state.version.docTypePatch).toEqual([
-      {
-        documentId: seeded.documentId,
-        previousDocType: "note",
-        appliedDocType: CARD_KIND,
-      },
-    ]);
+    expect(state.item.cardDocType).toBe(CARD_KIND);
   });
 
   test("drops a field whose span does not resolve and records the drop", async () => {
@@ -619,9 +622,10 @@ describe("document cards", () => {
     expect(state.current.deactivatedAt).toBeUndefined();
     // Old card versions stay addressable.
     expect(state.versions).toHaveLength(2);
-    // The document row is patched in place, never retired or duplicated.
+    // The document row is left alone, never patched, retired or duplicated.
     expect(state.document.publicationState).toBe("active");
-    expect(state.document.docType).toBe(CARD_KIND);
+    expect(state.document.docType).toBe("note");
+    expect(state.item.cardDocType).toBe(CARD_KIND);
   });
 
   test("two card publications leave chunk ids and embedding targets untouched", async () => {
@@ -917,6 +921,87 @@ describe("document cards", () => {
       "spaceId",
       "step",
     ]);
+  });
+
+  test("P2-82: card_kind publishes with no evidence span and drops alone when not a declared kind", async () => {
+    const seeded = await seedDocument({ withSubjectEntity: true });
+    // The base fixture's card_kind already carries no evidenceSpanIds
+    // (decision 1: proven by the anchor, never by a span of its own), so a
+    // correct value here is already exercised by the very first test in this
+    // file. This test is the other branch: a value the closed enum refuses.
+    const published = await seeded.t.run((ctx) =>
+      publishDocumentCard(ctx, {
+        spaceId: seeded.spaceId,
+        sourceItemId: seeded.sourceItemId,
+        userId: seeded.userId,
+        recordKind: "document_card",
+        now: 1_000,
+        fingerprint: FINGERPRINT,
+        anchorEvidenceSpanIds: [seeded.evidence[TITLE]!],
+        fields: withValue(genericFields(seeded.evidence), "card_kind", {
+          type: "text",
+          value: "not a real kind",
+        }),
+      }),
+    );
+    expect(published.published).toBe(true);
+    expect(published.requiredFieldFailed).toBe(false);
+    expect(published.droppedFields).toEqual([
+      { key: "card_kind", code: "value_not_normalizable" },
+    ]);
+    expect(published.storedFields).not.toContain("card_kind");
+  });
+
+  test("P2-89: a realistic publish never persists field_not_declared or a :0 key for a non-repeated field", async () => {
+    const seeded = await seedDocument({ withSubjectEntity: true });
+    // Three non-repeated fields fail for ordinary reasons (a wrong span, a
+    // value the enum refuses), never for the retired shape artifacts a
+    // pre-PR180 candidate could have produced.
+    let fields = withValue(genericFields(seeded.evidence), "card_date", {
+      type: "date",
+      value: "2025-03-05",
+    });
+    fields = withValue(fields, "card_summary", {
+      type: "text",
+      value: "a summary the cited span does not contain",
+    });
+    fields = withValue(fields, "card_kind", {
+      type: "text",
+      value: "not a real kind",
+    });
+    const published = await seeded.t.run((ctx) =>
+      publishDocumentCard(ctx, {
+        spaceId: seeded.spaceId,
+        sourceItemId: seeded.sourceItemId,
+        userId: seeded.userId,
+        recordKind: "document_card",
+        now: 1_000,
+        fingerprint: FINGERPRINT,
+        anchorEvidenceSpanIds: [seeded.evidence[TITLE]!],
+        fields,
+      }),
+    );
+    expect(published.published).toBe(true);
+    expect(published.droppedFields.length).toBe(3);
+
+    const drops = await seeded.t.run(
+      async (ctx) => await ctx.db.query("cardFieldDrops").collect(),
+    );
+    expect(drops.length).toBe(3);
+    expect(drops.some((row) => row.code === "field_not_declared")).toBe(
+      false,
+    );
+    const nonRepeatedFields = [
+      "card_kind",
+      "card_title",
+      "card_date",
+      "card_summary",
+    ];
+    expect(
+      drops.some((row) =>
+        nonRepeatedFields.some((name) => row.fieldKey === `${name}:0`),
+      ),
+    ).toBe(false);
   });
 });
 

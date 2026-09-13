@@ -676,10 +676,11 @@ tied to one account).
 rule 3 made concrete: reconciliation is a gate, not a report. For every
 account with two or more `balances` snapshots, it treats each consecutive
 pair of snapshots as one statement period, sums that account's transactions
-over the period (inclusive of both boundary dates), and compares the sum
-against the snapshots' stated cash change. It writes one `reconciliations`
-row per period and returns the same information as counts and period-level
-facts, never a transaction row.
+over a half-open window (exclusive of period_start, inclusive of period_end), and
+compares the sum against the snapshots' stated cash change. Each transaction
+is placed by its cash-effective date, the later of process date and settle date.
+It writes one `reconciliations` row per period and returns the same information
+as counts and period-level facts, never a transaction row.
 
 ### Incremental scope, and what a gate pass costs (F1-59)
 
@@ -744,6 +745,106 @@ This gate does not populate `balances`; writing what a statement stated is a
 separate concern from checking it. Re-running after a corrected import is
 idempotent: any prior row for the same account and period is replaced, not
 added to.
+
+### Applying a taxonomy change to rows already stored (F1-8d)
+
+An adapter's `activityTaxonomy` is read at import time, so declaring an
+activity type `movesCash: false` changes what the importer *stores* and nothing
+about what is already stored. Three paths look as though they would carry the
+change onto existing rows, and none of them does:
+
+| Path | What actually happens |
+| --- | --- |
+| `run.js reparse --adapter <module>` | `REPARSEABLE_TIERS` is `pdf_statement` and `trade_confirmation` only. A structured activity pull can split one retained file across several `documents` rows sharing one `retained_sha256`, so `openRetainedDocument` returns null for it and the walk counts it in `documentsSkippedTier`. Activity-pull rows are never re-parsed. |
+| a fresh pull and import | An activity row carries `provider_txn_id`, and `importRows` treats a provider-id match as an authoritative identity match: `rowsDeduplicated += 1; continue`. A skip, not a rewrite. Nothing in `src/` issues an `UPDATE transactions` at all. |
+| falling back to `row_hash` | `amount` is in `rowHash`'s preimage, so a row whose amount the new declaration nulls hashes differently and would insert a *second* row rather than deduplicate. Worse than the skip, and avoided here only because every row in scope carries a provider id. |
+
+`scripts/nullNonCashAmounts.mjs` is what applies it. It reads the taxonomy off
+the adapter rather than naming activity types, so it cannot drift from the
+declaration it is applying and it serves the next declaration too. For every
+stored transaction of that institution whose type is now `movesCash: false` and
+whose `amount` is still set, it nulls the amount and opens the same
+`cash_on_noncash_activity` item with the same `raw_value` and wording
+`classifyActivity` would have opened -- deduplicated against
+`review_items_dedupe_key` exactly as `flushReviews` does, so a second run
+opens nothing. It ends with a cash-gate pass scoped to the rows it changed, so
+those periods' verdicts are rewritten in the same transaction and no others
+are touched.
+
+Development-first, and `--dry-run` reports every count and writes nothing:
+
+```
+FINANCE_ARCHIVE_DATABASE_URL=postgresql://<owner>@<host>/<db> \
+  node scripts/nullNonCashAmounts.mjs \
+  --adapter ../adapter-morgan-stanley/src/adapter.mjs --dry-run
+FINANCE_ARCHIVE_DATABASE_URL=postgresql://<owner>@<host>/<db> \
+  node scripts/nullNonCashAmounts.mjs \
+  --adapter ../adapter-morgan-stanley/src/adapter.mjs
+```
+
+It leaves `row_hash` alone: recomputing it would have to re-derive every row's
+per-document occurrence ordinal (two rows differing only in their amounts
+collapse to one content key once both are null), and getting that wrong breaks
+the `row_hash` UNIQUE invariant rather than a dedupe fallback that no row in
+scope uses. The script reports the count of in-scope rows carrying no
+`provider_txn_id` so an archive where that is not zero is visible rather than
+assumed. It also leaves stored quantities alone: nulling those moves the
+position gate, which is a separate gate needing its own evidence.
+
+### No posting date to import (F1-8i)
+
+A residual set of cash periods fails on a single row each whose cash-effective
+date lands one statement period away from where the statement's own cash
+balance moved. The proposed fix was to import the provider's cash-posting date
+and prefer it: Morgan Stanley states two dates the archive does not hold,
+`activityDate` and `payDate`, both retained in the raw bytes (`ms-activity-3`)
+and mapped to no column. **Measured against the owner's archive, neither is a
+posting date, so no column was added and the cash-effective date rule is
+unchanged.**
+
+| Fact | Count |
+| --- | --- |
+| retained activity rows carrying a `payDate` key | 50,700 |
+| of those, rows stating a `payDate` value | **0** |
+| retained rows stating an `activityDate` | 50,700 of 50,700 |
+| `transactions` matched to a retained row by `provider_txn_id` | 50,865 of 50,865 |
+
+`payDate` is not a missing mapping, it is a field the provider sends empty. The
+retention projection is built out of the declaration by walking the source, so
+it writes a key only when the source carries one: a key present and `null` is
+the provider's own `null`, not something the projection dropped.
+
+`activityDate` is stated everywhere and still cannot help. Against the current
+cash-effective date it is the same day on 27,973 rows, earlier on 22,829, and
+later on only 63, and the misplaced rows need a date that is *later*.
+
+Every way of preferring it was run over all 929 periods, against the gate's own
+arithmetic and validated by reproducing the 639 / 15 / 275 verdicts the archive
+holds today:
+
+| Cash-effective date | pass | fail | unverified | Periods it moves |
+| --- | --- | --- | --- | --- |
+| `greatest(process, settle)` (today) | 639 | 15 | 275 | -- |
+| `activityDate` outright | 343 | 311 | 275 | 296 pass to fail, **0 fail to pass** |
+| `activityDate` inside the `greatest()` | 631 | 23 | 275 | 8 pass to fail, **0 fail to pass** |
+| `activityDate` inside a `least()` | 344 | 310 | 275 | 295 pass to fail, **0 fail to pass** |
+
+No candidate fixes one failing period, and each breaks passing ones. That is
+the whole decision: a date semantics change that helps nothing and costs
+hundreds of passes is not a fix.
+
+**What the residual is instead, and what to measure next.** 8 of the 15
+failures are each explained by exactly one row (6 are the coverage-gap account,
+which sums no candidate row at all, and 1 has two). Of the 8, three rows sit
+exactly on a snapshot date and four sit exactly one day before one, and in all
+seven the statement books the row in the period *after* that snapshot. All four
+one-day cases share one shape: the snapshot is a Saturday and the row is the
+preceding Friday. That points at the boundary, not the row -- but not at a
+global boundary rule either, because flipping the window to `[period_start,
+period_end)` breaks 559 passing periods and rolling both boundaries back to the
+previous weekday changes no verdict at all. The next study is therefore what
+`balances.as_of` means per statement, against the statement's own stated cash
+period, rather than another date column.
 
 ## Position quantity gate
 

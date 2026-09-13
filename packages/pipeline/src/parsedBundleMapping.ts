@@ -44,6 +44,26 @@ export const PDF_DOCQA_CHUNKING_FINGERPRINT = sha256(
   ]),
 );
 
+/**
+ * P2-70i2. The `spreadsheet_v1` chunking policy. It is the same page-local
+ * policy as `PDF_DOCQA_CHUNKING_FINGERPRINT` above, over sheet pages instead
+ * of PDF pages, and it is a separate fingerprint because a fingerprint names
+ * the policy and its input, not the policy alone.
+ */
+export const SPREADSHEET_CHUNKING_FINGERPRINT = sha256(
+  JSON.stringify([
+    "spreadsheet_sheet_page_chunks_v1",
+    CHUNK_TARGET_BYTES,
+    "page_local_nonoverlapping_unicode_scalars",
+    "one_parser_page_evidence_per_chunk",
+    64,
+    MAX_TEXT_BYTES,
+    256,
+  ]),
+);
+
+const SPREADSHEET_DOCUMENT_KEY = "spreadsheet:primary";
+
 export class ParsedBundleMappingError extends Error {
   constructor(
     readonly code: "invalid_mapping" | "mapping_gap" | "mapping_limit",
@@ -307,6 +327,129 @@ function legacyPageChunks(
 }
 
 /**
+ * The v2 policy: one evidence span per chunk, over the page it came from. Used
+ * by both binary classes, so a sheet page and a PDF page chunk the same way.
+ */
+function pageChunksAndEvidence(
+  pages: readonly ParsedPageInput[],
+  documentKey: string,
+): { evidence: ParsedEvidenceInput[]; chunks: ParsedChunkInput[] } {
+  const evidence: ParsedEvidenceInput[] = [];
+  const chunks: ParsedChunkInput[] = [];
+  for (const page of pages) {
+    for (const range of pageChunkRanges(page)) {
+      const chunkText = page.text.slice(range.start, range.end);
+      const evidenceOrdinal = evidence.length;
+      evidence.push(
+        parseParsedEvidenceInput({
+          ordinal: evidenceOrdinal,
+          pageOrdinal: page.ordinal,
+          start: range.start,
+          end: range.end,
+          quoteHash: sha256(chunkText),
+          locator: {
+            kind: "parser_page_v1",
+            pageNumber: page.ordinal + 1,
+            pageTextHash: page.textHash,
+          },
+        }),
+      );
+      chunks.push(
+        parseParsedChunkInput({
+          documentKey,
+          ordinal: chunks.length,
+          start: page.start + range.start,
+          end: page.start + range.end,
+          text: chunkText,
+          evidence: [{ pageOrdinal: page.ordinal, evidenceOrdinal }],
+        }),
+      );
+    }
+  }
+  return { evidence, chunks };
+}
+
+/**
+ * P2-70i2: the `spreadsheet_v1` mapping. One retained page per sheet, already
+ * rendered under `SHEET_PAGE_RENDERING_VERSION`, so there is nothing to
+ * reconcile between a layout document and a page: the page text *is* the grid.
+ *
+ * No `cell_v1` span is staged here. Under section 4.3 of the document-cards
+ * plan a card stages the spans it cites over the sealed page, so the parser's
+ * job ends at pages, chunks and their page evidence.
+ */
+export async function mapSpreadsheetWorkbook(input: {
+  pages: readonly { text: string }[];
+  title: string;
+  capturedAt: number;
+  chunkingFingerprint: string;
+}) {
+  try {
+    if (input.chunkingFingerprint !== SPREADSHEET_CHUNKING_FINGERPRINT) fail();
+    if (!input.pages.length || input.pages.length > 64) fail("mapping_limit");
+    const pages: ParsedPageInput[] = [];
+    let completeText = "";
+    let textBytes = 0;
+    for (const value of input.pages) {
+      const pageText = text(value.text);
+      if (!pageText) fail();
+      textBytes += Buffer.byteLength(pageText, "utf8");
+      if (
+        textBytes > MAX_TEXT_BYTES ||
+        Buffer.byteLength(pageText, "utf8") > 65_536
+      )
+        fail("mapping_limit");
+      pages.push(
+        parseParsedPageInput({
+          ordinal: pages.length,
+          start: completeText.length,
+          end: completeText.length + pageText.length,
+          text: pageText,
+          textHash: sha256(pageText),
+        }),
+      );
+      completeText += pageText;
+    }
+    const { evidence, chunks } = pageChunksAndEvidence(
+      pages,
+      SPREADSHEET_DOCUMENT_KEY,
+    );
+    if (
+      !chunks.length ||
+      chunks.length > 256 ||
+      !evidence.length ||
+      evidence.length > 256
+    )
+      fail("mapping_limit");
+    return {
+      pages,
+      evidence,
+      documents: [
+        parseParsedDocumentInput({
+          documentKey: SPREADSHEET_DOCUMENT_KEY,
+          title: input.title,
+          docType: "spreadsheet",
+          capturedAt: input.capturedAt,
+          evidence: evidence.map((span) => ({
+            pageOrdinal: span.pageOrdinal,
+            evidenceOrdinal: span.ordinal,
+          })),
+        }),
+      ],
+      chunks,
+      mappingManifestHash: await digestParsedMappingManifest(pages, evidence),
+      textHash: sha256(completeText),
+      textUtf8Length: textBytes,
+      textUtf16Length: completeText.length,
+      chunkingFingerprint: input.chunkingFingerprint,
+    };
+  } catch (error) {
+    if (error instanceof ParsedBundleMappingError) throw error;
+    throw new ParsedBundleMappingError("invalid_mapping");
+  }
+}
+
+/**
  * Consume the parser/spool inspector's raw-artifact-validated bundle and refs.
  * This pure mapper does not attest a file digest or validate parser runtime
  * fingerprints. Callers must retain that preceding validation on every reopen.
@@ -415,40 +558,9 @@ export async function mapParsedBundle(input: {
         .flatMap((page) => legacyPageChunks(page, evidence))
         .map((chunk, ordinal) => parseParsedChunkInput({ ...chunk, ordinal }));
     } else {
-      const pendingChunks: ParsedChunkInput[] = [];
-      for (const page of pages) {
-        for (const range of pageChunkRanges(page)) {
-          const chunkText = page.text.slice(range.start, range.end);
-          const evidenceOrdinal = evidence.length;
-          evidence.push(
-            parseParsedEvidenceInput({
-              ordinal: evidenceOrdinal,
-              pageOrdinal: page.ordinal,
-              start: range.start,
-              end: range.end,
-              quoteHash: sha256(chunkText),
-              locator: {
-                kind: "parser_page_v1",
-                pageNumber: page.ordinal + 1,
-                pageTextHash: page.textHash,
-              },
-            }),
-          );
-          pendingChunks.push(
-            parseParsedChunkInput({
-              documentKey: DOCUMENT_KEY,
-              ordinal: pendingChunks.length,
-              start: page.start + range.start,
-              end: page.start + range.end,
-              text: chunkText,
-              evidence: [
-                { pageOrdinal: page.ordinal, evidenceOrdinal },
-              ],
-            }),
-          );
-        }
-      }
-      chunks = pendingChunks;
+      const mapped = pageChunksAndEvidence(pages, DOCUMENT_KEY);
+      evidence.push(...mapped.evidence);
+      chunks = mapped.chunks;
     }
     const countLimit = legacy ? 128 : 256;
     if (

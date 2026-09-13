@@ -4,7 +4,7 @@ import { describe, expect, test } from "vitest";
 import type { Id } from "../../_generated/dataModel";
 import schema from "../../schema";
 import { modules } from "../../test.setup";
-import { listInventory } from "./inventory";
+import { listInventory, markInventoryParseFailed } from "./inventory";
 import {
   appendWorkerScanPage,
   beginWorkerScan,
@@ -906,6 +906,64 @@ describe("parse_failed exclusion (P2-70a2)", () => {
     const row = await f.t.run((ctx) => ctx.db.get(inventoryId));
     expect(row?.exclusionReason).toBeUndefined();
     expect(row?.exclusionDetail).toBeUndefined();
+  });
+
+  // P2-80f: `parse_failed` is set and cleared outside a scan. A scan that
+  // observes the same bytes again is not news about the parse, so it must not
+  // relabel a settled failure `extraction_pending` and drop the file out of
+  // the review queue on every pass.
+  test("a rescan of the same bytes keeps parse_failed; new bytes reset it", async () => {
+    const f = await fixture();
+    const failing = pdfEntry(
+      "fs://documents/reports/q1.pdf",
+      uuid(1),
+      HASH_Q1,
+      2_048,
+    );
+    const scanA = await begin(f, "pf-rescan-1", 0, 1_000);
+    await appendAll(f, scanA.scanId, "pf-rescan-1-page", [failing], 1_100);
+    const rowId = await f.t.run(async (ctx) => {
+      const existing = await ctx.db.query("sourceInventory").unique();
+      if (!existing?.sourceItemId) throw new Error("missing inventory row");
+      await markInventoryParseFailed(ctx, {
+        sourceItemId: existing.sourceItemId,
+        failureClass: "page_limit_exceeded",
+      });
+      return existing._id;
+    });
+
+    const restartedAt = 1_100 + 31 * 60 * 1_000;
+    const scanB = await begin(f, "pf-rescan-2", 1, restartedAt);
+    await appendAll(
+      f,
+      scanB.scanId,
+      "pf-rescan-2-page",
+      [failing],
+      restartedAt + 100,
+    );
+    const afterRescan = await f.t.run((ctx) => ctx.db.get(rowId));
+    expect(afterRescan?.exclusionReason).toBe("parse_failed");
+    expect(afterRescan?.exclusionDetail).toBe("page_limit_exceeded");
+
+    // Different bytes are a fresh attempt, not the settled failure.
+    const replaced = pdfEntry(
+      "fs://documents/reports/q1.pdf",
+      uuid(1),
+      HASH_Q2,
+      4_096,
+    );
+    const replacedAt = restartedAt + 31 * 60 * 1_000;
+    const scanC = await begin(f, "pf-rescan-3", 2, replacedAt);
+    await appendAll(
+      f,
+      scanC.scanId,
+      "pf-rescan-3-page",
+      [replaced],
+      replacedAt + 100,
+    );
+    expect((await f.t.run((ctx) => ctx.db.get(rowId)))?.exclusionReason).toBe(
+      "extraction_pending",
+    );
   });
 });
 

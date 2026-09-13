@@ -28,13 +28,6 @@ const idempotentAdditive = {
   idempotentHint: true,
 } as const satisfies McpToolAnnotations;
 
-const destructive = {
-  readOnlyHint: false,
-  destructiveHint: true,
-  idempotentHint: true,
-  openWorldHint: false,
-} as const satisfies McpToolAnnotations;
-
 /**
  * MCP annotations are risk hints for the host, not permission grants. Keep this
  * map exhaustive so new tools cannot silently inherit the protocol's
@@ -58,17 +51,6 @@ export const MCP_TOOL_ANNOTATIONS = {
   [MCP_TOOL_NAMES.timelineThoughts]: readOnly,
   [MCP_TOOL_NAMES.getStats]: readOnly,
   [MCP_TOOL_NAMES.captureThought]: idempotentAdditive,
-  [MCP_TOOL_NAMES.createReport]: additive,
-  [MCP_TOOL_NAMES.getInsights]: readOnly,
-  [MCP_TOOL_NAMES.deleteInsight]: destructive,
-  [MCP_TOOL_NAMES.createList]: additive,
-  [MCP_TOOL_NAMES.updateList]: destructive,
-  [MCP_TOOL_NAMES.getLists]: readOnly,
-  [MCP_TOOL_NAMES.getList]: readOnly,
-  [MCP_TOOL_NAMES.archiveList]: destructive,
-  [MCP_TOOL_NAMES.createListItem]: additive,
-  [MCP_TOOL_NAMES.updateListItem]: destructive,
-  [MCP_TOOL_NAMES.getOpenItems]: readOnly,
 } as const satisfies Record<McpToolName, McpToolAnnotations>;
 
 export const MCP_MEMORY_TOOL_NAMES = [
@@ -94,9 +76,12 @@ export const MCP_MEMORY_TOOL_NAMES = [
 export type McpToolProfile = "memory" | "full";
 
 /**
- * Default to the complete surface. Narrowing to the memory profile removes
- * tools that connected clients and the bundled plugin skills already call, so
- * it has to be an explicit opt-in rather than an upgrade-time surprise.
+ * Default to the complete surface. Narrowing has to stay an explicit opt-in
+ * rather than an upgrade-time surprise, because it can remove tools that
+ * connected clients and the bundled plugin skills already call. Since the
+ * lists and insights tools were retired (P2-39l) the memory profile happens to
+ * cover every registered tool, and narrowing is a no-op until a tool outside
+ * memory and documents is added.
  */
 export function resolveMcpToolProfile(
   value = process.env.MCP_TOOL_PROFILE,

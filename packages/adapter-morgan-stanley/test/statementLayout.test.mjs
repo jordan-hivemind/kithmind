@@ -32,6 +32,7 @@ import {
   pageSplitEquityPages,
   privateHoldingsBlockLines,
   sectionSummaryLines,
+  SHORT_CASH_LAYOUT_TEXT,
   STATEMENT_LAYOUT_TEXT,
   statementPages,
   YEAR_ROLLOVER_LAYOUT_TEXT,
@@ -147,6 +148,22 @@ test("TOTAL VALUE fills the period's opening and closing value from its own two 
   assert.equal(balance.locators.row.source, kind);
   assert.equal(balance.locators.row.index, 1);
   assert.match(balance.locators.row.field, /BALANCE SHEET/);
+});
+
+// F1-8c. Measured against the hosted archive: a real BALANCE SHEET whose
+// Cash, BDP, MMFs figure is short enough (a small cash balance under a
+// header as wide as "(as of 03/31/26)") that neither of its two edges lands
+// within the ordinary column tolerance, while TOTAL VALUE's larger figure on
+// the same block still binds fine. `BALANCE_SHEET_EDGE_TOLERANCE` widens
+// binding for this block's two money columns only; holdings tables keep the
+// tighter default (unchanged by every other test in this file).
+test("a short cash figure a few characters shy of the column edge still binds, not just a long one", () => {
+  const parsed = parseStatementLines(SHORT_CASH_LAYOUT_TEXT, kind);
+  assert.equal(parsed.holdings.balances.length, 1);
+  const [balance] = parsed.holdings.balances;
+  assert.equal(balance.totalValue, "1302775.5");
+  assert.equal(balance.cash, "500");
+  assert.equal(balance.periodStartValue, "1250400");
 });
 
 test("the CASH FLOW table printed beside the balance sheet never bleeds into it", () => {

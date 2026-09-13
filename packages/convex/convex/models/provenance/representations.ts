@@ -1,3 +1,8 @@
+import {
+  BINARY_CLASSES,
+  BINARY_PARSER_PROFILE_IDS,
+} from "@repo/worker-protocol";
+
 export const MAX_ARCHIVED_BINARY_BYTES = 16 * 1_024 * 1_024;
 export const MAX_PARSER_ARTIFACT_BYTES = 64 * 1_024 * 1_024;
 export const MAX_PARSED_TEXT_UTF8_BYTES = 1_024 * 1_024;
@@ -204,11 +209,16 @@ export function parseSourceRevisionRepresentation(
     throw new Error("Unknown source revision representation");
   }
 
+  // P2-70i2: one of the closed set of binary class media types, each with its
+  // own measured byte bound.
+  const binaryClass = BINARY_PARSER_PROFILE_IDS.map(
+    (profileId) => BINARY_CLASSES[profileId],
+  ).find((entry) => entry.mediaType === value.mediaType);
   if (
     value.contentHashAuthority !== "worker_asserted" ||
     value.inlineText !== undefined ||
     value.archiveRef !== undefined ||
-    value.mediaType !== "application/pdf"
+    !binaryClass
   ) {
     throw new Error("Archived binary source revision fields are invalid");
   }
@@ -216,7 +226,7 @@ export function parseSourceRevisionRepresentation(
     value.byteLength,
     "Archived binary byte length",
     1,
-    MAX_ARCHIVED_BINARY_BYTES,
+    Math.min(binaryClass.maxOriginalBytes, MAX_ARCHIVED_BINARY_BYTES),
   );
   return {
     kind: "archived_binary_v1",

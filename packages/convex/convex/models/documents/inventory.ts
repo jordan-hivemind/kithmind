@@ -76,6 +76,15 @@ async function reconcileDuplicateGroup(
   for (const member of pending) {
     const nextReason: SourceInventoryExclusionReason =
       member._id === canonical._id ? "extraction_pending" : "duplicate_of";
+    // Same rule as the upsert above: a settled `parse_failed` outranks
+    // `extraction_pending` (P2-80f). `duplicate_of` still wins, since another
+    // member of the group carries the content.
+    if (
+      nextReason === "extraction_pending" &&
+      member.exclusionReason === "parse_failed"
+    ) {
+      continue;
+    }
     if (member.exclusionReason !== nextReason) {
       await ctx.db.patch(member._id, { exclusionReason: nextReason });
     }
@@ -144,12 +153,6 @@ export async function upsertSourceInventoryRow(
       ? await duplicateGroupId(sourceAccountId, contentHash, byteLength)
       : undefined;
 
-  // `extraction_pending` is provisional here: reconcileDuplicateGroup below
-  // may immediately override it to `duplicate_of` for every group member
-  // except the deterministic canonical.
-  const exclusionReason: SourceInventoryExclusionReason | undefined =
-    gapCode ?? (contentIndexed ? undefined : "extraction_pending");
-
   const existing = (
     await ctx.db
       .query("sourceInventory")
@@ -160,6 +163,25 @@ export async function upsertSourceInventoryRow(
       )
       .take(1)
   )[0];
+
+  // Section 2.4: `parse_failed` is set and cleared outside a scan. Rescanning
+  // the same bytes is not news about the parse, so it must not relabel a
+  // settled failure back to `extraction_pending` and drop the file out of the
+  // review queue (P2-80f). New bytes do reset it: that is a fresh attempt.
+  const settledParseFailure =
+    existing?.exclusionReason === "parse_failed" &&
+    existing.contentHash === contentHash;
+
+  // `extraction_pending` is provisional here: reconcileDuplicateGroup below
+  // may immediately override it to `duplicate_of` for every group member
+  // except the deterministic canonical.
+  const exclusionReason: SourceInventoryExclusionReason | undefined =
+    gapCode ??
+    (contentIndexed
+      ? undefined
+      : settledParseFailure
+        ? "parse_failed"
+        : "extraction_pending");
 
   const fields = {
     spaceId,

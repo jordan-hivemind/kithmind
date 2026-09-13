@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 
+import { isBinaryMediaType } from "@repo/worker-protocol";
+
 import { openArchiveCatalog, type ArchiveCatalog } from "./archiveCatalog.js";
 import {
   parseOwnerArchiveRelocationRecipe,
@@ -237,7 +239,8 @@ function frozenBaseline(
           Buffer.byteLength(file.text, "utf8") > config.maxFileBytes
         )
           fail("invalid_input");
-      } else if (file.mediaType !== "application/pdf") {
+        // P2-70i3: a binary observation carries the media type of its class.
+      } else if (!isBinaryMediaType(file.mediaType)) {
         fail("invalid_input");
       }
     } else {
@@ -361,12 +364,14 @@ function doctorCheck(result: DoctorResult): void {
     ...Object.values(counts.items),
     ...Object.values(counts.unresolvedEntries),
   ];
+  // P2-80h: nothing may still be moving or unprovable before a relocation.
+  // A settled outcome is fine: a parked parse failure and an explicit gap are
+  // recorded and will not change while the root moves.
   if (
     numericCounts.some((count) => !Number.isSafeInteger(count) || count < 0) ||
     counts.items.pending !== 0 ||
     counts.items.failed !== 0 ||
     counts.items.needsReview !== 0 ||
-    counts.items.explicitGap !== 0 ||
     counts.items.unavailable !== 0 ||
     counts.unresolvedEntries.needsReview !== 0
   )

@@ -18,8 +18,12 @@ inline UTF-8 path exactly. It reuses source revisions, source text versions,
 pages, evidence spans, processing generations, documents, and chunks. It does
 not add a second authoritative records store.
 
-The first supported binary class is PDF. Other media types require their own
-measured parser acceptance and explicit bounds. The proposed first archive
+Binary classes are a closed set. The first was PDF (`pdf_docqa_v1`); P2-70i2
+added `spreadsheet_v1` for `.xlsx` workbooks with its own measured bounds. Each
+class pairs one parser profile with one media type, one parser output media
+type and one original-byte bound, and an account admits only the classes it has
+been audited for. Any further media type requires its own measured parser
+acceptance and explicit bounds in the same way. The proposed first archive
 adapter encrypts primary and backup roles separately to two native age
 post-quantum public recipients. Restic snapshots only the backup-role
 ciphertext into a separately keyed repository. The selected tools are
@@ -424,8 +428,9 @@ complete.
 The existing ready filesystem discovery entry remains the legacy UTF-8
 variant with its current 65,536-byte limit and validation. A new
 `ready_binary_v1` variant carries the SHA-256 digest, byte length, media type,
-and selected binary parser profile. It carries no text and initially accepts
-only PDF bytes up to 16 MiB.
+and selected binary parser profile. It carries no text, and the media type must
+be the one its profile's class declares: PDF bytes up to 16 MiB under
+`pdf_docqa_v1`, or `.xlsx` workbook bytes up to 8 MiB under `spreadsheet_v1`.
 
 The binary profile includes the pre-parse configuration fingerprint described
 above. It does not carry a final extraction fingerprint that depends on parser

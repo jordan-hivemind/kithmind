@@ -1228,6 +1228,35 @@ describe("archived discovery admission", () => {
         publicationState: "historical",
       });
     });
+    // P2-80g2: card extraction may stage its own evidence span over sealed
+    // text (see `evidenceSpanFields`: sealing protects the text and its pages,
+    // not pointers into them). Such a row is not part of the parsed payload,
+    // so re-verifying the payload must ignore it. Counting it made every
+    // re-verification of a document that had been through card extraction
+    // throw, which turned `terminalParsedReady` false and failed the worker
+    // processing assessment closed as `detail_unavailable` on that document.
+    const cardSpanId = await f.t.run((ctx) =>
+      ctx.db.insert("evidenceSpans", {
+        spaceId: stagedGraph.span.spaceId,
+        sourceRevisionId: stagedGraph.span.sourceRevisionId,
+        sourceTextVersionId: stagedGraph.span.sourceTextVersionId,
+        sourcePageId: stagedGraph.span.sourcePageId,
+        ordinal: stagedGraph.span.ordinal,
+        start: stagedGraph.span.start,
+        end: stagedGraph.span.end,
+        quoteHash: stagedGraph.span.quoteHash,
+        cardExtractionFingerprints: ["c".repeat(64)],
+      }),
+    );
+    await expect(
+      f.t.run(async (ctx) =>
+        verifySealedParsedPayload(
+          ctx,
+          (await ctx.db.get(stagedGraph.generation._id))!,
+        ),
+      ),
+    ).resolves.toMatchObject({ actualDocumentCount: 1, actualChunkCount: 1 });
+    await f.t.run((ctx) => ctx.db.delete(cardSpanId));
     await expect(
       f.t.run(async (ctx) =>
         verifySealedParsedPayload(
@@ -1964,6 +1993,11 @@ describe("archived discovery admission", () => {
       retryable: true,
     });
     expect(work?.leaseToken).toBeUndefined();
+    // P2-80g: a retryable row names the instant it is next eligible. Clearing
+    // it left a row that `validDiscoveryWorkRuntimeState` rejects, which made
+    // every later processing assessment stale (`detail_unavailable`), and hid
+    // the row from `dueDiscoveryCandidates`.
+    expect(work?.nextAttemptAt).toBe(100);
     // A failed-but-retryable row is exactly what discovery.reserveArchived
     // already accepts reclaiming, so a later scan's retry is not blocked.
     const reserve = parseWorkerRequest({
@@ -2021,6 +2055,55 @@ describe("archived discovery admission", () => {
           f.principal,
           reserve,
           "g".repeat(64),
+          101,
+        ),
+      ),
+    ).rejects.toThrow();
+  });
+
+  // P2-80g: the client's parse budget (MAX_PARSE_ATTEMPTS, 2) is smaller than
+  // the server's attempt bound (8). Without this the two caps disagreed: a
+  // document the client had already given up on stayed `retryable` for six
+  // more passes, each one re-queueing it, reporting the same deterministic
+  // failure, and bumping `attempts` by one.
+  test("an exhausted client report settles the work row on the first pass", async () => {
+    const f = await fixture();
+    await seedInventoryRow(f);
+    const request = parseWorkerRequest({
+      ...base(f),
+      operation: "discovery.failArchived",
+      requestId: "fail-exhausted",
+      identity: identity(f),
+      failureCode: "conversion_failed",
+      exhausted: true,
+    });
+    if (request.operation !== "discovery.failArchived") {
+      throw new Error("bad fail request");
+    }
+    const result = await f.t.run((ctx) =>
+      failArchivedDiscovery(ctx, f.principal, request, 100),
+    );
+    expect(result.retryable).toBe(false);
+    const work = await f.t.run((ctx) => ctx.db.get(f.workId));
+    expect(work).toMatchObject({ state: "failed", attempts: 1 });
+    expect(work?.retryable).toBe(false);
+    expect(work?.nextAttemptAt).toBeUndefined();
+    const reserve = parseWorkerRequest({
+      ...base(f),
+      operation: "discovery.reserveArchived",
+      requestId: "reserve-after-exhausted",
+      identity: identity(f),
+    });
+    if (reserve.operation !== "discovery.reserveArchived") {
+      throw new Error("bad reserve request");
+    }
+    await expect(
+      f.t.run((ctx) =>
+        reserveArchivedDiscovery(
+          ctx,
+          f.principal,
+          reserve,
+          "h".repeat(64),
           101,
         ),
       ),

@@ -37,7 +37,10 @@ that, and what does.
 
 ## 1. Inventory of the Convex surface
 
-Counted from the code at `ac3bac0`, not estimated.
+Counted from the code at `ac3bac0`, not estimated. The counts predate P2-39l,
+which retired `lists`, `listItems`, `reports` and `insights` on the owner's
+answer to question 1. Subtract 4 tables, 7 secondary indexes, 42 exported
+functions, 11 MCP tools and 1 web page from this table for the current tree.
 
 | Surface                        | Count | Where                                                                                       |
 | ------------------------------ | ----: | ------------------------------------------------------------------------------------------- |
@@ -180,7 +183,7 @@ worker has no in-flight work to preserve.
 | `models/diagnostics`             |         3 | Heartbeat, incident and watcher-reset service.                                                               |
 | `models/sourceAccounts`          |         3 | Source account service.                                                                                      |
 | `models/provenance`              |         2 | Internal provenance reads, folded into the document service. Coverage tables have no functions of their own. |
-| `models/lists`, `models/reports` |        42 | Recommended retired, section 5.1.                                                                            |
+| `models/lists`, `models/reports` |        42 | Retired by P2-39l, section 5.1. Not present in the current tree.                                             |
 
 The 128 `internalMutation` functions are the largest group and the cheapest to
 port conceptually: each one is already a single atomic step with validated
@@ -221,7 +224,8 @@ Recommendation: a second schema named `kith`, beside `finance`, in the same
 database. Not one merged schema.
 
 `kith` is the name the merged prototype already creates in
-`packages/postgres-proof/migrations/001_init.sql`. Reusing it avoids a rename.
+`packages/kith-store/migrations/001_init.sql` (`packages/postgres-proof` when
+this plan was written). Reusing it avoids a rename.
 
 | Option                    | Cost                                                                                                                                                                                                                                                              |
 | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -337,6 +341,9 @@ detection. It stops being a job. Staleness becomes a read-time predicate over
 asks, so a host that is down reports itself stale without needing to be up.
 A single daily Vercel cron, which Hobby does allow, writes the durable incident
 row for alerting. That is the whole cloud-side dependency.
+
+The Hobby plan is confirmed, so the daemon is the scheduler and cloud cron is
+limited to one daily run for missing-worker detection.
 
 ### 2.7 Vector search: pgvector at 1536 dimensions
 
@@ -542,7 +549,7 @@ vendor relationship.
 
 ## 4. Proof gates before any cutover
 
-The prototype in `packages/postgres-proof` already closes part of this. The
+The prototype in `packages/kith-store` already closes part of this. The
 column below records what it proved on 2026-09-08 against two real PostgreSQL 18
 servers, and what P2-39 still owes.
 
@@ -622,7 +629,7 @@ Docker and is already wired into CI by the prototype's job.
 
 | Item                                                            | Size                                                                     | Recommendation                                                                                                                                                                                                                                                                                           |
 | --------------------------------------------------------------- | ------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `lists`, `listItems`, `reports`, `insights`                     | 4 tables, 7 indexes, 42 of 287 functions, 1,605 lines of source, 0 tests | Export to JSONL, retire the 11 MCP tools, delete. These are upstream features, user-scoped rather than space-scoped, and the architecture already says user-private lists and reports can stay private for now. Retiring them removes 15% of the function count for none of the value. Owner question 1. |
+| `lists`, `listItems`, `reports`, `insights`                     | 4 tables, 7 indexes, 42 of 287 functions, 1,605 lines of source, 0 tests | Done in P2-39l. Exported to JSONL, the 11 MCP tools removed, the tables and modules deleted. These were upstream features, user-scoped rather than space-scoped, and the architecture already says user-private lists and reports can stay private for now. Owner question 1, answered retire. |
 | `embeddingVectors` row contents                                 | 180 rows today                                                           | Do not migrate vectors. They are derived and content-addressed by `inputHash`. Re-embed after cutover. 180 targets is a few cents and it avoids a float64 to float32 conversion argument entirely.                                                                                                       |
 | `thoughts.embedding` legacy field                               | 17 rows                                                                  | Export to a cold JSONL audit file. Do not create a column for retained audit data that nothing queries.                                                                                                                                                                                                  |
 | Queue and scan state                                            | 6 tables                                                                 | Drain to empty before cutover. A quiesced worker has nothing in flight, and re-enumeration is cheap and idempotent.                                                                                                                                                                                      |
@@ -666,9 +673,11 @@ measurement. The line counts it is applied to are counted.
 | P2-39i    | Web and MCP surface. 12 route handlers, 28 tools, 10 pages, 14 files off Convex React hooks, server components plus a poll for the two live surfaces.                                                                                                                              | 1    |      30 | c to h     |
 | P2-39j    | Deferred work, sweeps and diagnostics. `kith.deferred_work`, the daemon command, the launchd job, read-time worker staleness, incidents and watcher resets, one daily durable incident record. 787 lines.                                                                          | 1    |      14 | e, f, g    |
 | P2-39k    | Backups and restore for both schemas, replacing the native Convex export in the dated-backup recipe. The tracker's P2-27.                                                                                                                                                          | 1    |      16 | b, d       |
-| P2-39l    | Retire `lists`, `listItems`, `reports`, `insights`. Export to JSONL, remove 11 MCP tools, delete 1,605 lines. Subject to owner question 1.                                                                                                                                         | 0    |       8 | none       |
+| P2-39l    | Retire `lists`, `listItems`, `reports`, `insights`. Export to JSONL, remove 11 MCP tools, delete 1,605 lines. Owner question 1 answered retire.                                                                                                                                    | 0    |       8 | none       |
 | P2-39m    | Parity run, independent security review, cutover, teardown and the cost line closed out.                                                                                                                                                                                           | 2    |      22 | all        |
 | **Total** |                                                                                                                                                                                                                                                                                    |      | **402** |            |
+
+Rows a, b and l started on 2026-09-13.
 
 Sequencing notes for the orchestrator. Rows a, b and l can start immediately and
 in parallel. Row e is the critical path and is more than a quarter of the work;
@@ -712,6 +721,9 @@ review. Vectors add little: at 180 targets the pgvector column is about 1 MiB, a
 at 20,000 card-model targets about 120 MiB, because originals stay in the archive
 and never enter a row.
 
+The Hobby plan is confirmed, so the saving at cutover is 0.00 USD until the
+backfill, and the daemon is the scheduler.
+
 Two costs are outside this plan and should not be confused with it. The card
 extraction backfill is 285.60 USD one-time for the 10,000-file corpus under the
 document-cards sizing. Re-embedding the current 180 targets after cutover is
@@ -724,6 +736,8 @@ Only these five change the work materially.
 1. Retire `lists`, `listItems`, `reports` and `insights`, or port them? Retiring
    removes 42 of 287 functions, 11 MCP tools and 1,605 lines that have no tests.
    Porting costs about 10 agent hours and keeps the tools.
+   **Answered 2026-09-13: retire.** Implemented by P2-39l, which exports the four
+   tables to JSONL before dropping them.
 2. Which plan is each vendor on today, and is Vercel on Hobby or Pro? This
    decides whether section 7's saving is 0.00 USD or 25 USD per month, and
    whether cloud scheduling is available at all.
@@ -735,3 +749,13 @@ Only these five change the work materially.
 5. Accept deferring row level security, with the closed typed service surface as
    the only tenant boundary until a second person holds a database credential?
    Adding RLS now across the space-scoped tables is roughly 40 more agent hours.
+
+### Decisions, 2026-09-13
+
+| Question | Decision |
+| -------- | -------- |
+| 1. Retire `lists`, `listItems`, `reports` and `insights` | Retire with a JSONL export kept in the dated backup |
+| 2. Which plan is each vendor on today | Hobby plan is confirmed, so cloud cron is once a day and is not used |
+| 3. Accept one maintenance window | One maintenance window with a single re-login, no dual write, no shadow period |
+| 4. Accept the always-on Mac host as scheduler | The always-on worker host daemon runs sweeps and deferred work |
+| 5. Accept deferring row level security | Row level security deferred until a second person holds a database credential |

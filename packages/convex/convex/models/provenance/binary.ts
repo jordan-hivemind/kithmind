@@ -1,3 +1,5 @@
+import type { BinaryMediaType } from "@repo/worker-protocol";
+
 import type { Doc, Id } from "../../_generated/dataModel";
 import type { MutationCtx } from "../../_generated/server";
 import {
@@ -12,7 +14,7 @@ export async function createOrGetArchivedRevision(
     sourceItemId: Id<"sourceItems">;
     contentHash: string;
     byteLength: number;
-    mediaType: "application/pdf";
+    mediaType: BinaryMediaType;
     capturedAt: number;
     userId: Id<"users">;
   },

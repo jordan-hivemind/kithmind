@@ -54,6 +54,7 @@ function counts() {
       ready: 1,
       pending: 0,
       failed: 0,
+      parked: 0,
       needsReview: 0,
       explicitGap: 0,
       unavailable: 0,
@@ -373,6 +374,25 @@ test("current complete and incomplete assessments retain validated snapshot coun
   );
   assert.equal(ignoredResult.source.processing, "complete");
   assert.deepEqual(ignoredResult.source.counts, ignored);
+
+  // P2-80h: parked parse failures and explicit gaps are settled outcomes, so a
+  // complete snapshot may carry them and doctor must report the counts rather
+  // than rejecting the status.
+  const settled = counts();
+  settled.items.parked = 7;
+  settled.items.explicitGap = 24;
+  const settledResult = await doctor(
+    config(files.root, files.journal),
+    transport(
+      terminalSource("complete", {
+        processing: { ...terminalSource().processing, counts: settled },
+      }),
+    ),
+    "synthetic-token",
+    isolated,
+  );
+  assert.equal(settledResult.source.processing, "complete");
+  assert.deepEqual(settledResult.source.counts, settled);
 });
 
 test("every stale terminal assessment becomes count-free incomplete", async (context) => {

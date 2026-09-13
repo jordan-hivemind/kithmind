@@ -10,7 +10,10 @@ import {
   type QueryCtx,
 } from "../../_generated/server";
 
+import { CARD_PLAYBOOK_VERSION, CARD_SCHEMA_VERSION } from "./cardLadder";
+import { CARD_PROMPT_VERSION } from "./cardRunner";
 import { cardEventKey, isCardRecordKind, type CardRecordKind } from "./cardSchemas";
+import { recordCardExtractionError } from "./cards";
 
 /**
  * P2-70f, section 6 of docs/plans/2026-09-12-document-cards.md: a per-space,
@@ -71,7 +74,8 @@ function weekWindowStart(now: number): number {
 }
 
 async function requireQueueState(
-  ctx: MutationCtx,
+  // A read, so a query can reconcile the same state a mutation patches.
+  ctx: QueryCtx,
   spaceId: Id<"spaces">,
   kind: CardRecordKind,
 ): Promise<Doc<"cardExtractionQueueStates">> {
@@ -278,6 +282,22 @@ export async function claimNextForExtraction(
     .take(1);
   const item = next[0];
   if (!item) {
+    // P2-85: the cursor only moves forward, so a document that had no
+    // retained text yet (or was skipped for a then-true reason) when the
+    // cursor passed it was stranded forever. A sweep that reaches the end
+    // with nothing claimable rewinds the cursor once and sweeps again;
+    // `cursorRewoundAt` is cleared only by an outcome that changed something
+    // (see `recordExtractionOutcome`), so a rewound sweep that also finds
+    // nothing goes idle rather than spinning, and every rewind is paid for by
+    // a document that left the eligible set.
+    if (effective.cursor !== null && effective.cursorRewoundAt === undefined) {
+      await ctx.db.patch(state._id, {
+        cursor: null,
+        cursorRewoundAt: input.now,
+        updatedAt: input.now,
+      });
+      return { status: "advanced" };
+    }
     await ctx.db.patch(state._id, { phase: "idle", updatedAt: input.now });
     return { status: "idle" };
   }
@@ -337,10 +357,34 @@ export async function recordExtractionOutcome(
     itemCreationTime: number;
     outcome: "accepted" | "review" | "refused" | "provider_failed";
     errorCode?: string;
+    errorName?: string;
     now: number;
   },
 ): Promise<{ phase: Doc<"cardExtractionQueueStates">["phase"] }> {
   const state = await requireQueueState(ctx, input.spaceId, input.kind);
+  if (input.errorCode !== undefined) {
+    // P2-86: the run raised, so it wrote no attempt and no drop row of its
+    // own. Write them before the counters move, so a counted failure and a
+    // visible review item are the same event rather than two that can
+    // disagree.
+    await recordCardExtractionError(ctx, {
+      sourceItemId: input.sourceItemId,
+      recordKind: input.kind,
+      fingerprint: {
+        cardSchemaVersion: CARD_SCHEMA_VERSION,
+        playbookVersion: CARD_PLAYBOOK_VERSION,
+        promptVersion: CARD_PROMPT_VERSION,
+        // The raise can come from any step, or from before the first one, so
+        // the row is filed at the top step: it ends the climb exactly as a
+        // top-step failure does, and its `failureCodes` say it produced no
+        // candidate at all, which no real tier1 attempt row does.
+        tier: "tier1",
+      },
+      errorCode: input.errorCode,
+      ...(input.errorName === undefined ? {} : { errorName: input.errorName }),
+      now: input.now,
+    });
+  }
   const attempts = await ctx.db
     .query("cardExtractionAttempts")
     .withIndex("by_sourceItemId", (q) => q.eq("sourceItemId", input.sourceItemId))
@@ -368,6 +412,12 @@ export async function recordExtractionOutcome(
         : input.outcome === "provider_failed"
           ? { providerFailedCount: (state.providerFailedCount ?? 0) + 1 }
           : { skippedCount: state.skippedCount + 1 }),
+    // P2-85: this document left the eligible set (a card, a review item, or a
+    // recorded failure), so the next end-of-sweep may rewind once more. A
+    // `refused` document changed nothing and would only be refused again, so
+    // it must not authorize a rewind of its own; that is what bounds the
+    // rewinds by the number of documents rather than by nothing.
+    ...(input.outcome === "refused" ? {} : { cursorRewoundAt: undefined }),
     consecutiveFailures,
     lastErrorCode: input.errorCode,
     ...(pause
@@ -394,6 +444,7 @@ export type QueueTickOps = {
     itemCreationTime: number;
     outcome: "accepted" | "review" | "refused" | "provider_failed";
     errorCode?: string;
+    errorName?: string;
   }) => Promise<{ phase: Doc<"cardExtractionQueueStates">["phase"] }>;
 };
 
@@ -427,10 +478,14 @@ function errorMessage(error: unknown): string {
 export function classifyQueueTickFailure(error: unknown): {
   outcome: "review" | "provider_failed";
   errorCode: string;
+  /** The raised error's constructor name, or the primitive's type. Bounded,
+   * and, unlike a message, not a place document content can appear. */
+  errorName: string;
 } {
+  const errorName = error instanceof Error ? error.name : typeof error;
   return errorMessage(error).startsWith(PROVIDER_ERROR_MESSAGE_PREFIX)
-    ? { outcome: "provider_failed", errorCode: "provider_error" }
-    : { outcome: "review", errorCode: "gate_error" };
+    ? { outcome: "provider_failed", errorCode: "provider_error", errorName }
+    : { outcome: "review", errorCode: "gate_error", errorName };
 }
 
 /**
@@ -467,6 +522,7 @@ export async function runCardExtractionQueueTick(
         itemCreationTime: claim.itemCreationTime,
         outcome: failure.outcome,
         errorCode: failure.errorCode,
+        errorName: failure.errorName,
       });
       return { status: "claimed", continue: recorded.phase === "running" };
     } catch {
@@ -595,6 +651,9 @@ export const resumeExtractionQueue = internalMutation({
       phase: "running",
       pauseReason: undefined,
       resumeAt: undefined,
+      // A resume starts a fresh cycle, so P2-85's one rewind is available
+      // again: the operator is saying to look at the backlog once more.
+      cursorRewoundAt: undefined,
       updatedAt: now,
     });
     if (args.autoRun) {
@@ -605,6 +664,336 @@ export const resumeExtractionQueue = internalMutation({
       );
     }
     return null;
+  },
+});
+
+/** Same bound `reviewQueue.ts` uses for its own `cardFieldDrops` scans:
+ * neither table caps a source account's or a space's drop rows on its own. */
+const MAX_RERUN_SCAN_ROWS = 256;
+
+/**
+ * `npx convex run models/records/cardQueue:rerunGateFailed`. Section 7: a
+ * `card_gate_failed` drop is what `hasReviewItem` checks forever, so once one
+ * exists for a document the queue's forward-only cursor never reconsiders it
+ * even after the underlying problem (a prompt version, a gate fix) is
+ * resolved. This deletes this kind's `card_gate_failed` drops for a space, or
+ * for one source account within it, and rewinds the cursor so the next tick's
+ * scan starts over and reoffers every document that was only being skipped
+ * for those drops. Counts only: no field value or document text is read or
+ * returned.
+ */
+export const rerunGateFailed = internalMutation({
+  args: {
+    spaceId: v.id("spaces"),
+    kind: kindArg,
+    sourceAccountId: v.optional(v.id("sourceAccounts")),
+    now: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const kind = requireKind(args.kind);
+    const state = await requireQueueState(ctx, args.spaceId, kind);
+    const sourceAccountId = args.sourceAccountId;
+    const rows = sourceAccountId
+      ? await ctx.db
+          .query("cardFieldDrops")
+          .withIndex("by_space_account", (q) =>
+            q.eq("spaceId", args.spaceId).eq("sourceAccountId", sourceAccountId),
+          )
+          .take(MAX_RERUN_SCAN_ROWS + 1)
+      : await ctx.db
+          .query("cardFieldDrops")
+          .withIndex("by_spaceId", (q) => q.eq("spaceId", args.spaceId))
+          .take(MAX_RERUN_SCAN_ROWS + 1);
+    const truncated = rows.length > MAX_RERUN_SCAN_ROWS;
+    const matching = rows
+      .slice(0, MAX_RERUN_SCAN_ROWS)
+      .filter((row) => row.kind === "card_gate_failed" && row.recordKind === kind);
+    for (const row of matching) {
+      await ctx.db.delete(row._id);
+    }
+    if (matching.length > 0) {
+      await ctx.db.patch(state._id, {
+        cursor: null,
+        // It just rewound the cursor deliberately; P2-85's automatic rewind is
+        // a separate budget and starts unspent.
+        cursorRewoundAt: undefined,
+        // `claimNextForExtraction` returns "idle" on phase alone, before it
+        // ever looks at the cursor: an idle queue reached the end of the
+        // space's documents on its last scan, and rewinding the cursor with
+        // no phase change would leave it declaring itself idle forever. A
+        // paused queue is left exactly as paused; only
+        // `resumeExtractionQueue` lifts a pause.
+        ...(state.phase === "idle" ? { phase: "running" as const } : {}),
+        updatedAt: args.now ?? Date.now(),
+      });
+    }
+    return { clearedCount: matching.length, truncated };
+  },
+});
+
+// --- P2-91: counters versus ground truth -----------------------------------
+
+/**
+ * Bound for the two reconciliation operators below. Neither reports nor writes
+ * a recomputed counter from a truncated scan: a wrong number an operator
+ * trusts is worse than a refusal that says which bound was hit.
+ */
+const MAX_RECONCILE_SCAN_ROWS = 4096;
+
+/**
+ * The `code` a `card_gate_failed` drop carries when it records a ladder run
+ * that raised (P2-86, `classifyQueueTickFailure`) rather than a field the gate
+ * refused. Closed, and disjoint from every `CardGateFailureCode`.
+ */
+const EXTRACTION_ERROR_DROP_CODES = new Set(["gate_error", "provider_error"]);
+
+type ExtractionRowTally = {
+  /** Documents with any attempt row of this kind. */
+  attempted: Set<string>;
+  /** Documents with an attempt row for a step that actually ran. */
+  ran: Set<string>;
+  accepted: Set<string>;
+  /** A required field the gate refused at the top step. */
+  gateFailed: Set<string>;
+  /** P2-86: a run that raised, by the two closed codes it is classified under. */
+  gateError: Set<string>;
+  providerError: Set<string>;
+  truncated: boolean;
+};
+
+function unionSize(left: Set<string>, right: Set<string>): number {
+  return new Set([...left, ...right]).size;
+}
+
+/**
+ * Counts distinct documents per bucket from this space's attempt and drop rows
+ * alone, which is the only ground truth the queue's own counters can be
+ * checked against: the counters are incremented per resolution and never
+ * reconciled, so a document resolved twice, or a resolution that wrote no row
+ * at all (the P2-86 defect), moves a counter with nothing behind it.
+ */
+async function tallyExtractionRows(
+  ctx: QueryCtx,
+  input: { spaceId: Id<"spaces">; kind: CardRecordKind },
+): Promise<ExtractionRowTally> {
+  const attemptRows = await ctx.db
+    .query("cardExtractionAttempts")
+    .withIndex("by_spaceId", (q) => q.eq("spaceId", input.spaceId))
+    .take(MAX_RECONCILE_SCAN_ROWS + 1);
+  const dropRows = await ctx.db
+    .query("cardFieldDrops")
+    .withIndex("by_spaceId", (q) => q.eq("spaceId", input.spaceId))
+    .take(MAX_RECONCILE_SCAN_ROWS + 1);
+  const tally: ExtractionRowTally = {
+    attempted: new Set(),
+    ran: new Set(),
+    accepted: new Set(),
+    gateFailed: new Set(),
+    gateError: new Set(),
+    providerError: new Set(),
+    truncated:
+      attemptRows.length > MAX_RECONCILE_SCAN_ROWS ||
+      dropRows.length > MAX_RECONCILE_SCAN_ROWS,
+  };
+  for (const row of attemptRows.slice(0, MAX_RECONCILE_SCAN_ROWS)) {
+    if (row.recordKind !== input.kind) continue;
+    tally.attempted.add(row.sourceItemId);
+    if (row.outcome !== "skipped") tally.ran.add(row.sourceItemId);
+    if (row.outcome === "accepted") tally.accepted.add(row.sourceItemId);
+  }
+  for (const row of dropRows.slice(0, MAX_RECONCILE_SCAN_ROWS)) {
+    if (row.recordKind !== input.kind || row.kind !== "card_gate_failed") {
+      continue;
+    }
+    if (!EXTRACTION_ERROR_DROP_CODES.has(row.code)) {
+      tally.gateFailed.add(row.sourceItemId);
+    } else if (row.code === "provider_error") {
+      tally.providerError.add(row.sourceItemId);
+    } else {
+      tally.gateError.add(row.sourceItemId);
+    }
+  }
+  return tally;
+}
+
+/**
+ * The four lifetime counters as the rows justify them, in the same buckets
+ * `recordExtractionOutcome` increments: a raised run classified `gate_error`
+ * counts as gate-failed and one classified `provider_error` as provider-failed,
+ * exactly as the live counters do.
+ *
+ * `skippedCount` is the one bucket the rows cannot fully account for: a
+ * document skipped at claim time (a forbidding inventory reason) or refused
+ * before a runner ran (no retained text, no subject entity, too large) writes
+ * no row at all, so this counts only the documents whose every attempt row is
+ * a `skipped` step. A stored counter far above it is the drift P2-84 measured,
+ * not a second kind of skip.
+ */
+function recomputedCounters(tally: ExtractionRowTally): {
+  extractedCount: number;
+  gateFailedCount: number;
+  skippedCount: number;
+  providerFailedCount: number;
+} {
+  let skippedCount = 0;
+  for (const id of tally.attempted) {
+    if (!tally.ran.has(id)) skippedCount += 1;
+  }
+  return {
+    extractedCount: tally.accepted.size,
+    gateFailedCount: unionSize(tally.gateFailed, tally.gateError),
+    skippedCount,
+    providerFailedCount: tally.providerError.size,
+  };
+}
+
+/**
+ * `npx convex run models/records/cardQueue:reconcileExtractionQueueCounts`.
+ * P2-91: the stored counters against the rows and the documents, so a queue
+ * that reports 27 gate failures over 3 drop rows says so instead of being
+ * believed. Counts only: no document text, field name or value is returned.
+ */
+export const reconcileExtractionQueueCounts = internalQuery({
+  args: { spaceId: v.id("spaces"), kind: kindArg },
+  handler: async (ctx, args) => {
+    const kind = requireKind(args.kind);
+    const state = await requireQueueState(ctx, args.spaceId, kind);
+    const tally = await tallyExtractionRows(ctx, { spaceId: args.spaceId, kind });
+    const items = await ctx.db
+      .query("sourceItems")
+      .withIndex("by_spaceId", (q) => q.eq("spaceId", args.spaceId))
+      .order("asc")
+      .take(MAX_RECONCILE_SCAN_ROWS + 1);
+    const scanned = items.slice(0, MAX_RECONCILE_SCAN_ROWS);
+    let withRetainedText = 0;
+    let withAcceptedCard = 0;
+    let neverAttempted = 0;
+    for (const item of scanned) {
+      if (!(await hasRetainedText(ctx, item))) continue;
+      withRetainedText += 1;
+      if (await hasAcceptedCard(ctx, item._id, kind)) withAcceptedCard += 1;
+      if (!tally.attempted.has(item._id)) neverAttempted += 1;
+    }
+    const counters = {
+      extractedCount: state.extractedCount,
+      gateFailedCount: state.gateFailedCount,
+      skippedCount: state.skippedCount,
+      providerFailedCount: state.providerFailedCount ?? 0,
+    };
+    const recomputed = recomputedCounters(tally);
+    return {
+      phase: state.phase,
+      documentsScanned: scanned.length,
+      withRetainedText,
+      withAcceptedCard,
+      withGateFailedDrop: tally.gateFailed.size,
+      withExtractionErrorDrop: unionSize(tally.gateError, tally.providerError),
+      neverAttempted,
+      counters,
+      recomputed,
+      /** Stored minus recomputed. Every zero means the counters are honest. */
+      drift: {
+        extractedCount: counters.extractedCount - recomputed.extractedCount,
+        gateFailedCount: counters.gateFailedCount - recomputed.gateFailedCount,
+        skippedCount: counters.skippedCount - recomputed.skippedCount,
+        providerFailedCount:
+          counters.providerFailedCount - recomputed.providerFailedCount,
+      },
+      truncated: tally.truncated || items.length > MAX_RECONCILE_SCAN_ROWS,
+    };
+  },
+});
+
+/**
+ * `npx convex run models/records/cardQueue:resetExtractionQueueCounters`.
+ * P2-91: writes the recomputed counters over the stored ones, so the numbers
+ * an operator reads are the ones the rows can prove. Idempotent (a second run
+ * recomputes the same values and patches the same fields), counts only in its
+ * result, and it touches no budget window, no cursor and no phase: it corrects
+ * the ledger, it does not restart or throttle the queue.
+ */
+export const resetExtractionQueueCounters = internalMutation({
+  args: { spaceId: v.id("spaces"), kind: kindArg, now: v.optional(v.number()) },
+  handler: async (ctx, args) => {
+    const kind = requireKind(args.kind);
+    const state = await requireQueueState(ctx, args.spaceId, kind);
+    const tally = await tallyExtractionRows(ctx, { spaceId: args.spaceId, kind });
+    const before = {
+      extractedCount: state.extractedCount,
+      gateFailedCount: state.gateFailedCount,
+      skippedCount: state.skippedCount,
+      providerFailedCount: state.providerFailedCount ?? 0,
+    };
+    if (tally.truncated) {
+      // A partial scan would write four confidently wrong numbers.
+      return { patched: false as const, before, truncated: true as const };
+    }
+    const after = recomputedCounters(tally);
+    await ctx.db.patch(state._id, {
+      ...after,
+      updatedAt: args.now ?? Date.now(),
+    });
+    return { patched: true as const, before, after, truncated: false as const };
+  },
+});
+
+/** `npx convex run models/records/cardQueue:setExtractionQueueBudgets`. Sets one or more budgets on an existing queue, returning the three budgets after the patch. Does not change phase, cursor, counters, or windows: if paused on a budget, resumeExtractionQueue lifts the pause separately. */
+export const setExtractionQueueBudgets = internalMutation({
+  args: {
+    spaceId: v.id("spaces"),
+    kind: kindArg,
+    dailyDocumentBudget: v.optional(v.number()),
+    weeklyDocumentBudget: v.optional(v.number()),
+    weeklyCostBudgetMicroUsd: v.optional(v.number()),
+    now: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const kind = requireKind(args.kind);
+    const state = await requireQueueState(ctx, args.spaceId, kind);
+    const now = args.now ?? Date.now();
+
+    const budgets = [
+      { name: "dailyDocumentBudget" as const, value: args.dailyDocumentBudget },
+      { name: "weeklyDocumentBudget" as const, value: args.weeklyDocumentBudget },
+      {
+        name: "weeklyCostBudgetMicroUsd" as const,
+        value: args.weeklyCostBudgetMicroUsd,
+      },
+    ];
+
+    const patch: Partial<Doc<"cardExtractionQueueStates">> = {};
+    for (const budget of budgets) {
+      if (budget.value !== undefined) {
+        if (
+          !Number.isInteger(budget.value) ||
+          budget.value <= 0
+        ) {
+          throw new Error(
+            `${budget.name} must be a positive integer`,
+          );
+        }
+        patch[budget.name] = budget.value;
+      }
+    }
+
+    if (Object.keys(patch).length === 0) {
+      // No budgets to update; return current state
+      return {
+        dailyDocumentBudget: state.dailyDocumentBudget,
+        weeklyDocumentBudget: state.weeklyDocumentBudget,
+        weeklyCostBudgetMicroUsd: state.weeklyCostBudgetMicroUsd,
+      };
+    }
+
+    patch.updatedAt = now;
+    await ctx.db.patch(state._id, patch);
+
+    const updated = { ...state, ...patch };
+    return {
+      dailyDocumentBudget: updated.dailyDocumentBudget,
+      weeklyDocumentBudget: updated.weeklyDocumentBudget,
+      weeklyCostBudgetMicroUsd: updated.weeklyCostBudgetMicroUsd,
+    };
   },
 });
 
@@ -761,6 +1150,7 @@ export const recordTick = internalMutation({
       v.literal("provider_failed"),
     ),
     errorCode: v.optional(v.string()),
+    errorName: v.optional(v.string()),
     now: v.number(),
   },
   handler: async (ctx, args) =>
@@ -771,6 +1161,7 @@ export const recordTick = internalMutation({
       itemCreationTime: args.itemCreationTime,
       outcome: args.outcome,
       errorCode: args.errorCode,
+      errorName: args.errorName,
       now: args.now,
     }),
 });

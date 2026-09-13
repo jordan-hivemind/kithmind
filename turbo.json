@@ -46,6 +46,18 @@
         "FINANCE_ARCHIVE_SPACE_ID"
       ]
     },
+    "@repo/pg#test:once": {
+      "cache": false,
+      "dependsOn": ["build"]
+    },
+    "@repo/kith-store#test:once": {
+      "cache": false,
+      "dependsOn": ["build"],
+      "passThroughEnv": [
+        "KITH_STORE_DATABASE_URL",
+        "KITH_STORE_REQUIRE_DATABASE"
+      ]
+    },
     "@repo/finance-contract#test:once": {
       "cache": false,
       "dependsOn": ["build"]

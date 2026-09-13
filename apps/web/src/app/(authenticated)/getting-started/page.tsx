@@ -48,29 +48,7 @@ const SETUP_STEPS = [
     skills: [
       "/brain-init \u2014 Discover sources, exclude noise, and preview up to 15 facts/memories for approval",
       "/brain-sync \u2014 Sync a project's context (README, git state, docs) into your brain",
-      "/weekly-review \u2014 Weekly synthesis of thoughts, workflow insights, and goals",
-    ],
-  },
-  {
-    step: 3,
-    title: "Add Workflow Insights (optional)",
-    description:
-      "Analyze your Claude Code and Cowork sessions for actionable insights. This is a separate plugin that enhances Open Brain with session-level analysis.",
-    instructions: [
-      {
-        platform: "Install",
-        steps: [
-          "Run: /plugin install workflow-analyst@claude-workflow-analyst",
-          "Then run: /workflow-analyst",
-          "Or for a longer period: /workflow-analyst --days 14",
-        ],
-      },
-    ],
-    insights: [
-      "Root Cause Diagnosis \u2014 Diagnoses why tools fail and tells you how to fix them",
-      "Direct Automation \u2014 Detects repeated patterns and generates skills or config to automate them",
-      "Decision Support \u2014 Compares your time allocation against your stated goals",
-      "Knowledge Nudges \u2014 Finds topics you keep re-asking about and suggests saving them",
+      "/weekly-review \u2014 Weekly synthesis of the week's thoughts, with citations",
     ],
   },
 ];
@@ -383,24 +361,6 @@ function SetupSection() {
                   }}
                 >
                   {skill}
-                </li>
-              ))}
-            </ul>
-          )}
-
-          {step.insights && (
-            <ul
-              style={{
-                marginTop: 16,
-                paddingLeft: 20,
-                display: "flex",
-                flexDirection: "column",
-                gap: 4,
-              }}
-            >
-              {step.insights.map((insight, i) => (
-                <li key={i} style={{ fontSize: "0.9rem", lineHeight: 1.5 }}>
-                  {insight}
                 </li>
               ))}
             </ul>

@@ -81,7 +81,7 @@ the architecture's coverage rules already require the system to keep apart.
 | `duplicateGroupId`   | Hash of `(contentHash, byteLength)` when a group has two or more members. |
 | `contentIndexed`     | Boolean. True only when an active generation holds retained text.         |
 | `exclusionReason`    | Absent when `contentIndexed` is true. Otherwise one closed value.         |
-| `exclusionDetail`    | The failure class for `parse_failed`. Absent for every other reason.     |
+| `exclusionDetail`    | The failure class for `parse_failed`. Absent for every other reason.      |
 | `firstSeenScanId`    | The committed scan that first observed the file.                          |
 | `lastSeenScanId`     | The last committed scan that observed it.                                 |
 | `missingSinceScanId` | Set only by a healthy completed reconciliation.                           |
@@ -231,9 +231,35 @@ is published on top of it when the classifier and the gate both accept one.
 A document with no recognized type keeps only its generic card.
 
 `documents.title` and `documents.docType` stay what they are today, worker
-supplied display metadata with no evidence. Activation writes the card's
-accepted `card_kind` into `documents.docType` so `search_documents` type
-filtering and the card classification cannot disagree.
+supplied display metadata with no evidence. Activation records the card's
+accepted `card_kind` on the item, and every document read overlays it on
+`documents.docType`, so `search_documents` type filtering and the card
+classification cannot disagree.
+
+#### The type is overlaid, not patched, settled on implementation 2026-09-12 during P2-80i
+
+Activation first wrote the accepted `card_kind` into `documents.docType` in
+place. That was wrong, for the same reason PR199 was wrong about card-staged
+evidence spans: the card lane mutated a row the sealed-payload proof treats as
+immutable. `documents.docType` is inside `manifest.documentDigest`, so every
+patched document failed `verifySealedParsedPayload`, the worker processing
+assessment counted it `unavailable`, and a re-stage of the same generation
+reported a conflicting immutable document.
+
+| Rule               | Statement                                                                                                                                                                          |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Where kept         | `sourceItems.cardDocType`, beside `embedFullChunks` and for the same reason: a document row belongs to one generation, the card's kind does not.                                   |
+| Read               | `effectiveDocType` returns the item's `cardDocType` for an active document and the parser's `documents.docType` otherwise.                                                         |
+| Reads that overlay | `get_document` and `search_documents`, including its `docType` filter, which compares the overlaid type. `list_sources` keeps reporting the connector's own `sourceItems.docType`. |
+| Historical         | A historical document keeps the type its own generation parsed. The patch never reached those rows either.                                                                         |
+| Sealed row         | Card activation writes no `documents` row at all, so the document digest of every sealed payload keeps verifying.                                                                  |
+
+Recovery for rows the patch already overwrote is
+`models/workers/migrations:restoreSealedDocTypes`, which restores
+`documents.docType` from the `docTypePatch` the card version recorded and moves
+the accepted kind to `sourceItems.cardDocType`. Nothing writes `docTypePatch`
+any more; the field stays on `eventVersions` because activated card versions
+carry it and it is what the recovery reads.
 
 ### 4.3 Every field carries evidence
 
@@ -314,19 +340,19 @@ item, not a raised limit.
 Extraction always stores the literal name it read, bound to its span. Binding
 that name to an entity is a separate, deterministic step.
 
-| Match count after normalization | Result                                                                       |
-| ------------------------------- | ---------------------------------------------------------------------------- |
+| Match count after normalization | Result                                                                         |
+| ------------------------------- | ------------------------------------------------------------------------------ |
 | Exactly one                     | Set `observations.boundEntityId`. The `text` value and its span are unchanged. |
-| Zero                            | Leave the field literal-only. Raise an `entity_binding_needed` review item.   |
-| Two or more                     | Leave the field literal-only. Raise an `entity_binding_needed` review item.   |
+| Zero                            | Leave the field literal-only. Raise an `entity_binding_needed` review item.    |
+| Two or more                     | Leave the field literal-only. Raise an `entity_binding_needed` review item.    |
 
 #### Three points settled on implementation, 2026-09-12 during P2-70l
 
-| Point                 | Implemented                                                                                                                                                                                                                                                                                                                                                    |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Where the id is kept  | Beside the literal value, in `observations.boundEntityId`, not as an `entity` value in its place. Replacing the value would delete the literal name from the record and leave only the span quote, and the gate proves a value against its span, so an `entity` value could never pass rule 6. The gate keeps refusing `entity` values with `entity_value_unsupported`. |
-| One review kind       | `entity_binding_needed`, with the candidate count on the row, rather than `entity_unresolved` and `entity_ambiguous`. Zero and two-or-more take the same action from the same surface, and the count already says which happened.                                                                                                                              |
-| Normalization         | `normalizeEntityName`, the same function that wrote `entities.normalizedName`, so a lookup can never disagree with what was stored. It casefolds and collapses separators; it strips no punctuation and no legal suffix. Adding either would mean rewriting every stored `normalizedName` in the same change, so it is deferred to its own task.                 |
+| Point                | Implemented                                                                                                                                                                                                                                                                                                                                                             |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Where the id is kept | Beside the literal value, in `observations.boundEntityId`, not as an `entity` value in its place. Replacing the value would delete the literal name from the record and leave only the span quote, and the gate proves a value against its span, so an `entity` value could never pass rule 6. The gate keeps refusing `entity` values with `entity_value_unsupported`. |
+| One review kind      | `entity_binding_needed`, with the candidate count on the row, rather than `entity_unresolved` and `entity_ambiguous`. Zero and two-or-more take the same action from the same surface, and the count already says which happened.                                                                                                                                       |
+| Normalization        | `normalizeEntityName`, the same function that wrote `entities.normalizedName`, so a lookup can never disagree with what was stored. It casefolds and collapses separators; it strips no punctuation and no legal suffix. Adding either would mean rewriting every stored `normalizedName` in the same change, so it is deferred to its own task.                        |
 
 Matching compares against `entities.normalizedName` and
 `normalizedAliases` over one bounded scan of the space's entities, because
@@ -367,8 +393,7 @@ The card publishes on the subject entity, and when P2-70l binds that field's
 literal name to exactly one entity of an allowed kind the binding step moves
 the event version and its observations to that entity, which is what makes an
 entity-filtered `list_events` return the card. The previous entity id is
-recorded on the binding row, so a rollback restores it exactly as
-`docTypePatch` does for `documents.docType`. Every other kind keeps the
+recorded on the binding row, so a rollback restores it. Every other kind keeps the
 subject entity, and binding only annotates the observation.
 
 ### 4.6 Versioning on re-extraction
@@ -406,9 +431,10 @@ of content that never changed. Section 9.2 and invariants I3 and I11 of the
 index capacity plan forbid exactly that.
 
 Because a card generation has no documents of its own, the `documents.docType`
-rule of section 4.2 is an in-place patch of the active text generation's rows
-at card activation. It is idempotent, and the previous value of each patched
-row is recorded on the card version so a rollback restores it.
+rule of section 4.2 is a read-time overlay of the accepted `card_kind` recorded
+on the item at card activation, not a patch of the text generation's rows. A
+card publication writes no `documents` row, which is what keeps the sealed
+parsed payload of that generation verifiable.
 
 Rejected lower-tier attempts never become generations. Only the accepted
 tier's output is staged. Attempts are recorded separately, per section 5.4.
@@ -578,15 +604,44 @@ an outage) does not silently burn through the rest of the backlog marking
 every remaining document failed. `provider_error` does not self-clear:
 `resumeExtractionQueue` lifts it, the same as a `manual` pause.
 
+#### Corrected in P2-85, P2-86 and P2-91
+
+The cursor is forward-only, which stranded any document whose retained text was
+not ready yet (or which was skipped for a then-true reason) when the cursor
+passed it. A sweep that reaches the end of the space's documents with nothing
+claimable now rewinds the cursor to null once and sweeps again, and only a
+rewound sweep that also finds nothing goes idle. One rewind is available per
+sweep that resolved something (`cursorRewoundAt`, cleared by every recorded
+outcome other than `refused`), so the rewinds are bounded by the number of
+documents and an idle queue cannot spin.
+
+A ladder run that ends by raising now writes the same two rows every other
+non-publishing outcome writes: a `cardExtractionAttempts` row whose
+`failureCodes` carry the closed error code, and a `card_gate_failed`
+`cardFieldDrops` row whose `code` is that same code and whose `reason` is the
+raised error's constructor name, never its message. Before this, a raised run
+moved a counter and left no row, so the document was invisible to
+`list_review_queue` and `rerunGateFailed` could never re-offer it.
+
+The lifetime counters are incremented per resolution and were never
+reconcilable against the rows. `reconcileExtractionQueueCounts` reports the
+documents (retained text, accepted card, gate-failed drop, extraction-error
+drop, never attempted), the stored counters, the counters the rows justify and
+the drift between them; `resetExtractionQueueCounters` writes the recomputed
+counters over the stored ones. Both return counts only. A document skipped at
+claim time, or refused before a runner ran, still writes no row, so a stored
+`skippedCount` above the recomputed one is expected rather than a second kind
+of skip.
+
 ## 7. Review queue
 
-| Item kind           | Raised when                                                 | Resolution                                              |
-| ------------------- | ----------------------------------------------------------- | ------------------------------------------------------- |
-| `skipped_by_type`   | Inventory carries `unsupported`, `encrypted` or `oversized` | Accept as skipped, convert the file, or raise the limit |
-| `card_gate_failed`  | A required field failed at the top automatic step           | Correct the field, or accept the card without it        |
-| `field_dropped`     | An optional field failed the gate                           | Correct or accept                                       |
-| `duplicate_group`   | Two or more files share content                             | Choose the canonical member, or accept the group        |
-| `entity_binding_needed` | A name matched zero, or two or more, entities           | `createEntityFromCard`, or `bindCardEntity` explicitly  |
+| Item kind               | Raised when                                                 | Resolution                                              |
+| ----------------------- | ----------------------------------------------------------- | ------------------------------------------------------- |
+| `skipped_by_type`       | Inventory carries `unsupported`, `encrypted` or `oversized` | Accept as skipped, convert the file, or raise the limit |
+| `card_gate_failed`      | A required field failed at the top automatic step           | Correct the field, or accept the card without it        |
+| `field_dropped`         | An optional field failed the gate                           | Correct or accept                                       |
+| `duplicate_group`       | Two or more files share content                             | Choose the canonical member, or accept the group        |
+| `entity_binding_needed` | A name matched zero, or two or more, entities               | `createEntityFromCard`, or `bindCardEntity` explicitly  |
 
 Review items reuse the existing review-candidate rules. They are inert, they
 are excluded from active records and exact queries, they block the relevant
@@ -596,6 +651,14 @@ records the actor, and a worker cannot approve its own item by resubmitting it.
 Nothing is silently dropped. Every inventory row with an exclusion reason and
 every dropped field is reachable from a count in the review surface, and the
 counts are what the owner sees first.
+
+P2-86: a ladder run that raised is also a `card_gate_failed` item, carrying one
+of the queue's two closed error codes (`gate_error`, `provider_error`) as its
+`code` and the field key `card_extraction`, since the run failed as a whole
+rather than at one field. It is not a separate item kind: the review surface
+pages a class by the drop `kind` against a closed class set and already reports
+each row's `code`, so the existing kind makes the document visible and
+`rerunGateFailed` re-offers it with no new class, validator or MCP surface.
 
 ## 8. Embedding targets
 
@@ -630,13 +693,13 @@ section 9.
 
 #### As implemented in P2-70j
 
-| Item                | Plan said              | Implementation                                                                                                        |
-| ------------------- | ---------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| Where the flag lives | `documents`           | `sourceItems.embedFullChunks`, with `sourceAccounts.embedFullChunks` as the per-source rule the item overrides.       |
-| Why                 | -                      | A `documents` row is recreated by every processing generation, so an opt-in stored there would be lost on re-extraction. |
-| Deploy safety       | Not stated             | `spaceEmbeddingStates.targetPolicy`, absent meaning `all_chunks`. Eligibility is unchanged until an operator flips it. |
-| Card target id      | Not stated             | The generic card's `events` row, not the card generation, so re-extraction over unchanged fields reuses the vector.   |
-| Heading digest      | One target per document with two or more headings | Not implemented. No stage of the pipeline extracts section headings today, so there is nothing to compose a digest from. It stays a plan item. |
+| Item                 | Plan said                                         | Implementation                                                                                                                                 |
+| -------------------- | ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| Where the flag lives | `documents`                                       | `sourceItems.embedFullChunks`, with `sourceAccounts.embedFullChunks` as the per-source rule the item overrides.                                |
+| Why                  | -                                                 | A `documents` row is recreated by every processing generation, so an opt-in stored there would be lost on re-extraction.                       |
+| Deploy safety        | Not stated                                        | `spaceEmbeddingStates.targetPolicy`, absent meaning `all_chunks`. Eligibility is unchanged until an operator flips it.                         |
+| Card target id       | Not stated                                        | The generic card's `events` row, not the card generation, so re-extraction over unchanged fields reuses the vector.                            |
+| Heading digest       | One target per document with two or more headings | Not implemented. No stage of the pipeline extracts section headings today, so there is nothing to compose a digest from. It stays a plan item. |
 
 The grandfathering migration is
 `models/embeddings/migrations:setChunkEmbeddingOptIn`, which names source items
@@ -808,10 +871,10 @@ P2-70j implemented the card recall test as `scripts/measure-card-recall.mjs`
 with `scripts/measure-card-recall.test.mjs`. One generated corpus of 200
 documents and one scorer serve two embedders:
 
-| Embedder             | What it measures                                                                  | Recorded rate at five |
-| -------------------- | --------------------------------------------------------------------------------- | --------------------- |
-| Deterministic (unit test) | The ranking path: one target per document, a contested top five, containment  | 0.92, MRR 0.728       |
-| `--embedder=openai`  | Meaning. The number this plan's question actually asks for.                        | Unmeasured            |
+| Embedder                  | What it measures                                                             | Recorded rate at five |
+| ------------------------- | ---------------------------------------------------------------------------- | --------------------- |
+| Deterministic (unit test) | The ranking path: one target per document, a contested top five, containment | 0.92, MRR 0.728       |
+| `--embedder=openai`       | Meaning. The number this plan's question actually asks for.                  | Unmeasured            |
 
 The deterministic embedder reads each document's identity and its subject,
 never its words, because a paraphrase that shares no distinctive term with its
@@ -892,8 +955,97 @@ for the workbook's original bytes. The reader and the rendering rule this PR
 landed are what that task stages from, and `.xls` is out of scope for it: the
 pre-2007 binary container is not a ZIP, so none of this reader applies to it.
 
+#### What P2-70i2 landed: the binary class set
+
+P2-70i2 replaced "the binary class is PDF" with a closed set of binary
+classes, stated once in `@repo/worker-protocol` and read by both sides.
+
+| Class            | Media type                                           | Parser output                             | Original bytes |
+| ---------------- | ---------------------------------------------------- | ----------------------------------------- | -------------- |
+| `pdf_docqa_v1`   | `application/pdf`                                    | `application/vnd.docling+json`            | 16 MiB         |
+| `spreadsheet_v1` | `…openxmlformats-officedocument.spreadsheetml.sheet` | `application/vnd.kithmind.sheetgrid+json` | 8 MiB          |
+
+Every gate that used to compare two literals now compares a profile against
+its own class's media type, so a PDF receipt cannot satisfy a workbook and a
+workbook receipt cannot satisfy a PDF. Both digests a scan entry commits, the
+processing identity digest and the inventory metadata digest, carry the class;
+for a PDF entry they carry the same two values they always carried, so no
+existing digest moved. The account gate became per class: `binaryProfileIds`
+is the closed set of classes an account is audited for, `binaryProfileId`
+remains the one class an account named before the set existed, and a class the
+owner has not listed is refused with `source_unavailable`. The PDF path is
+unchanged in behaviour; no existing test needed an edit.
+
+`spreadsheet_v1`'s bounds are measured from the reader, not chosen: 64 sheets,
+65,536 characters per sheet page, 65,536 rows and 4,096 columns per sheet,
+8 MiB of workbook bytes, and 1 MiB of total rendered text. The last of these
+was a real gap: the reader accepted a 64-sheet workbook rendering 3.98 MiB of
+text, which no parsed text version can hold, so it now refuses the workbook as
+`oversized` rather than rendering text that fails to seal later. Chunking is
+the same page-local policy the PDF path uses, over sheet pages, under its own
+`spreadsheet_v1` fingerprint, and the parser stages no `cell_v1` span: under
+section 4.3 a card stages the spans it cites.
+
+What P2-70i2 did **not** land, and what remains before an `.xlsx` is content
+indexed, is the worker's own local workbook parse: capturing the workbook
+bytes, rendering the artifact pair, spooling it, and committing the archive
+receipt pair for the original and the parser output. That machinery is built
+around the sandboxed docling process, its model manifest and its
+table-structure bypass policy, none of which a dependency-free in-process
+reader has, so the workbook lane needs its own sibling of it rather than a
+flag on it. Until that lands the worker still reports `.xlsx` as an
+`unsupported` discovery gap, which is the honest answer: a file admitted
+without a parse would sit at `extraction_pending` forever, and that is a worse
+inventory answer than `unsupported`. `.docx` stays `unsupported` either way;
+it is a ZIP, and the workbook reader refuses it as `not_a_workbook`.
+
 `.docx` stays `unsupported` and is untouched by P2-70i. A document reader is a
 separate task and shares nothing with this one but the ZIP container.
+
+#### What P2-70i3 landed: the workbook parse lane
+
+P2-70i3 landed the worker side the previous row named as missing, as a sibling
+of the docling lane rather than a mode of it. The PDF lane keeps its sandboxed
+process, its pinned Python runtime and its model manifest; nothing in it
+changed behaviour.
+
+| Step             | What the workbook lane does                                                                                                                                                                                              |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Scan             | A ZIP container is offered to the reader and is `spreadsheet_v1` only when the reader accepts it. Everything it refuses keeps the gap its refusal names.                                                                 |
+| Capture          | The same protected capture directory, named `<captureId>.xlsx`, with the workbook's own magic bytes verified while the bytes are copied.                                                                                 |
+| Parse            | The in-process reader, writing the same durable `lossless.json` + `bundle.json` pair into the same trusted output directory.                                                                                             |
+| Validate         | A class-specific bundle validator proves the rendering rule from the page text: line 0 is the sheet name, every row carries the sheet's column count, and the page text is the raw sheet's text character for character. |
+| Spool and stage  | The same spool, the same page-local chunk policy over sheet pages, one page per sheet, one primary `spreadsheet` document.                                                                                               |
+| Archive receipts | Unchanged: the encrypted primary plus independent-backup pair over the original workbook bytes and over the raw artifact.                                                                                                |
+
+Two identities have no model manifest to come from, so they come from the
+reader: `SPREADSHEET_PARSER_FINGERPRINT` is the digest of the reader's version
+constant, the rendering version and the class's bounds, and the parser output's
+`modelManifestSha256` slot carries the digest of that version constant. Bumping
+the reader version therefore makes every affected document a new processing
+generation instead of a silent reinterpretation of an old one.
+
+The bounds of P2-70i2 are enforced twice, and the first one is before any bytes
+are archived: discovery refuses a workbook past a bound as the `oversized`,
+`encrypted` or `unsupported` inventory gap, and a capture that stops matching
+what discovery observed fails the parse with `workbook_oversized`,
+`workbook_encrypted`, `workbook_unsupported` or `workbook_invalid`. All four are
+per-document failures, so one refused workbook is a `parse_failed` inventory row
+rather than a failed pass.
+
+Two deliberate compromises, both for journal compatibility. The binary lane's
+plan keeps `kind: "pdf"` and the checkpoint keeps `pdfIndex`: the class is
+`parserProfileId` beside them, and renaming either would make an interrupted
+journal unreadable for no behaviour gain. An encrypted workbook stays
+`unsupported` rather than `encrypted` unless its name ends in `.xlsx`, because
+an encrypted workbook is an OLE container that magic bytes alone cannot tell
+apart from a `.xls` or a `.doc`.
+
+What this does not include is the owner-side enablement: a source account is
+audited per class, so `spreadsheet_v1` has to be listed in its
+`binaryProfileIds` before a workbook is admitted, and a scan otherwise refuses
+the entry with `source_unavailable`. The end-to-end pass over the owner's four
+sample workbooks is that separate step.
 
 ### Migration commands
 
@@ -914,6 +1066,7 @@ npx convex run models/records/cardEntityBinding:createEntityFromCard '{"observat
 npx convex run models/records/cardEntityBinding:rebindPendingCardEntities '{"spaceId":"<SPACE_ID>","cursor":null,"batchSize":64}'
 npx convex run models/embeddings/migrations:setSpaceTargetPolicy '{"spaceId":"<SPACE_ID>","policy":"cards_and_opted_in_chunks","expectedPolicy":"all_chunks"}'
 npx convex run models/embeddings/migrations:runTargetRetirePage '{"jobId":"<JOB_ID>","cursor":null,"batchSize":128}'
+npx convex run models/workers/migrations:restoreSealedDocTypes '{"cursor":null,"maxItems":25,"dryRun":true}'
 ```
 
 Each page command returns the next cursor and is rerun until it reports done.

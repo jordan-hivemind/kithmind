@@ -1115,9 +1115,6 @@ export async function stageRecordBatch(
         `${event._id}|${chain.generation._id}`,
       ),
       fieldEvidence: record.fieldEvidence,
-      ...(record.docTypePatch === undefined
-        ? {}
-        : { docTypePatch: record.docTypePatch }),
       userId: eventVersion?.userId ?? input.userId,
     } satisfies Omit<Doc<"eventVersions">, "_id" | "_creationTime">;
     if (eventVersion) {

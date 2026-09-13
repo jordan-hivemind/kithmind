@@ -523,16 +523,18 @@ test("PDF seal recheck ignores server identity and disposition fields", async ()
   }
 });
 
-function assessmentCounts(ready) {
+function assessmentCounts(ready, overrides = {}) {
   return {
     items: {
       ready,
       pending: 0,
       failed: 0,
+      parked: 0,
       needsReview: 0,
       explicitGap: 0,
       unavailable: 0,
       ignoredForgotten: 0,
+      ...overrides,
     },
     unresolvedEntries: { needsReview: 0, ignoredForgotten: 0 },
   };
@@ -553,7 +555,7 @@ function assessPageCheckpoint(overrides = {}) {
   });
 }
 
-function assessPageResponse(ordinal, state = "running") {
+function assessPageResponse(ordinal, state = "running", countsOverrides) {
   const complete = state === "complete";
   return {
     operation: "processing.assessPage",
@@ -565,7 +567,10 @@ function assessPageResponse(ordinal, state = "running") {
     nextOrdinal: ordinal + 1,
     reused: false,
     ...(complete
-      ? { counts: assessmentCounts(1), completedAt: Date.now() }
+      ? {
+          counts: assessmentCounts(1, countsOverrides),
+          completedAt: Date.now(),
+        }
       : {}),
   };
 }
@@ -574,6 +579,8 @@ class CompleteCloud {
   constructor(options = {}) {
     this.failFirstStage = options.failFirstStage ?? false;
     this.stageFailed = false;
+    this.failAppendOnce = options.failAppendOnce ?? false;
+    this.appendAttempts = 0;
     this.scanId = "scan_1";
     this.inventoryEpoch = 0;
     this.manifestVersion = 0;
@@ -619,6 +626,15 @@ class CompleteCloud {
           reused: false,
         };
       case "scan.appendPage": {
+        if (this.failAppendOnce) {
+          this.appendAttempts += 1;
+          if (this.appendAttempts === 1) {
+            throw new Error("lost response after remote append commit");
+          }
+          if (this.appendAttempts === 2) {
+            return { error: { code: "scan_not_ready" } };
+          }
+        }
         const entries = request.entries.map((entry, index) => {
           assert.match(entry.externalId, /^[0-9a-f-]{36}$/);
           const item = `item_${request.ordinal}_${index}`;
@@ -861,6 +877,9 @@ test("a document-level parser failure is recorded against that document and the 
       },
     });
     runner.archiveCatalog = {
+      findOriginalExact() {
+        return undefined;
+      },
       listOriginals() {
         return [
           { originalCatalogId: checkpoint.originalCatalogId, rowRevision: 1 },
@@ -877,7 +896,7 @@ test("a document-level parser failure is recorded against that document and the 
       },
       async recordParseFailure(args) {
         recordedFailures.push(args);
-        return {};
+        return { parseFailure: { code: args.code, attempts: 1, failedAt: 1 } };
       },
     };
     let calls = 0;
@@ -926,6 +945,9 @@ test("a document-level parser failure is recorded against that document and the 
       submittedFailures[0].identity.processingEpoch,
       plans[1].processingEpoch,
     );
+    // The local budget is not spent yet (attempt 1 of MAX_PARSE_ATTEMPTS), so
+    // the report leaves the server free to keep the work retryable.
+    assert.equal(submittedFailures[0].exhausted, undefined);
   } finally {
     await journal.close();
     await rm(setup.base, { recursive: true, force: true });
@@ -957,6 +979,9 @@ test("a lost discovery.failArchived report does not block the pass from continui
       },
     });
     runner.archiveCatalog = {
+      findOriginalExact() {
+        return undefined;
+      },
       listOriginals() {
         return [
           { originalCatalogId: checkpoint.originalCatalogId, rowRevision: 1 },
@@ -987,6 +1012,120 @@ test("a lost discovery.failArchived report does not block the pass from continui
     await journal.close();
     await rm(setup.base, { recursive: true, force: true });
   }
+});
+
+// P2-80g2: the server's attempt bound (8) is larger than the client's parse
+// budget (MAX_PARSE_ATTEMPTS, 2), so the client tells the server when its own
+// budget is spent. The budget belongs to the document, not to one catalog row:
+// each pass probes `findProcessingExact` with its own scanId and a re-queued
+// document lands on a brand new row, so a per-row count stayed at 1 forever,
+// `exhausted` was never sent, and the same PDFs were re-parsed every pass.
+test("the same document failing in two passes reports the second as exhausted", async () => {
+  const plan = pdfPlan({ relativePath: "document-0.pdf" });
+  const original = { originalCatalogId: randomUUID(), rowRevision: 1 };
+  // One durable catalog across both passes. Every pass records its failure
+  // against a fresh processing row for the same document identity, which is
+  // exactly what `createArchivedIntents` does for a re-queued entry.
+  const rows = [];
+  // A fresh journal per pass, as a real pass has: only the durable archive
+  // catalog carries over.
+  async function pass(processingCatalogId) {
+    const setup = await fixture(0);
+    const checkpoint = archivedCheckpoint(plan, {
+      files: [plan],
+      pdfIndex: 0,
+      step: "parse",
+      archivedPublished: 0,
+      preflightAction: undefined,
+      originalCatalogId: original.originalCatalogId,
+      processingCatalogId,
+    });
+    const journal = await openJournal(setup.journalDir, checkpoint);
+    const submitted = [];
+    try {
+      const runner = new PipelineRunner(setup.config, journal, {
+        async call(request) {
+          if (request.operation === "source.status") {
+            return { operation: "source.status", sourceAccountId: "source" };
+          }
+          if (request.operation === "discovery.failArchived") {
+            submitted.push(request);
+            return {
+              operation: "discovery.failArchived",
+              sourceItemId: request.identity.sourceItemId,
+              workId: "work-1",
+              state: "failed",
+              retryable: request.exhausted !== true,
+              failureCode: request.failureCode,
+            };
+          }
+          throw new Error(`unexpected operation ${request.operation}`);
+        },
+      });
+      const fingerprints = runner.processingFingerprints(plan);
+      rows.push({
+        processingCatalogId,
+        originalCatalogId: original.originalCatalogId,
+        rowRevision: 1,
+        currentObservation: {
+          scanId: `scan-${processingCatalogId}`,
+          observationEpoch: plan.observationEpoch,
+          processingEpoch: plan.processingEpoch,
+        },
+        fingerprints,
+      });
+      runner.archiveCatalog = {
+        findOriginalExact() {
+          return original;
+        },
+        listOriginals() {
+          return [original];
+        },
+        listProcessings() {
+          return rows;
+        },
+        async recordParseFailure(args) {
+          const row = rows.find(
+            (candidate) => candidate.processingCatalogId === args.catalogId,
+          );
+          row.parseFailure = {
+            code: args.code,
+            attempts: Math.min((row.parseFailure?.attempts ?? 0) + 1, 2),
+            failedAt: args.now,
+          };
+          return row;
+        },
+      };
+      let calls = 0;
+      runner.driveCheckpoint = async () => {
+        calls += 1;
+        // Stands in for `driveArchivedParse` raising a document-level failure
+        // while converting this PDF; the run's own loop records it and moves on.
+        if (calls === 1) {
+          throw new ParserProcessError("conversion_failed", "cannot convert");
+        }
+        return { state: "complete", scanned: 1, published: 0 };
+      };
+      assert.deepEqual(await runner.run(), {
+        state: "complete",
+        scanned: 1,
+        published: 0,
+      });
+      return submitted;
+    } finally {
+      await journal.close();
+      await rm(setup.base, { recursive: true, force: true });
+    }
+  }
+  const first = await pass("11111111-1111-4111-8111-111111111111");
+  assert.equal(first.length, 1);
+  assert.equal(first[0].exhausted, undefined);
+  const second = await pass("22222222-2222-4222-8222-222222222222");
+  assert.equal(second.length, 1);
+  assert.equal(second[0].failureCode, "conversion_failed");
+  // Two rows, one attempt each: the document has spent its budget even though
+  // no single row ever reached it.
+  assert.equal(second[0].exhausted, true);
 });
 
 test("a document stops being selected for archived work once its local parse attempts are exhausted", async () => {
@@ -1099,6 +1238,36 @@ test("publishes a bounded multi-page scan and stores only metadata after complet
         .length,
       9,
     );
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+// P2-80h: a settled parse failure is parked, not a reason to keep reporting
+// `incomplete`. The pass ends `complete` with no code, so a scheduled watcher
+// stops rerunning the same documents. `PipelineRunResult` carries no counts, so
+// the parked count is read from the assessment result and `doctor`, not here.
+test("a complete assessment with parked documents ends the pass complete", async () => {
+  const setup = await fixture(0);
+  const journal = await openJournal(setup.journalDir, assessPageCheckpoint());
+  try {
+    const runner = new PipelineRunner(setup.config, journal, {
+      async call(request) {
+        if (request.operation === "source.status") {
+          return { operation: "source.status", sourceAccountId: "source" };
+        }
+        assert.equal(request.operation, "processing.assessPage");
+        return assessPageResponse(request.ordinal, "complete", {
+          parked: 7,
+          explicitGap: 24,
+        });
+      },
+    });
+    const result = await runner.run();
+    assert.equal(result.state, "complete");
+    assert.equal(result.code, undefined);
+    assert.equal(journal.pending, undefined);
   } finally {
     await journal.close();
     await rm(setup.base, { recursive: true, force: true });
@@ -1247,6 +1416,36 @@ test("replays an exact lost stage response and finishes while the root is offlin
       cloud.operations.filter((operation) => operation === "jobs.activate")
         .length,
       1,
+    );
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("abandons a scan_not_ready replay and starts a fresh scan in the same run", async () => {
+  const setup = await fixture(1);
+  const cloud = new CompleteCloud({ failAppendOnce: true });
+  let journal = await openJournal(setup.journalDir);
+  const first = await new PipelineRunner(
+    setup.config,
+    journal,
+    cloud,
+  ).runSafely();
+  assert.equal(first.state, "failed");
+  assert.equal(journal.pending?.operation, "scan.appendPage");
+  await journal.close();
+
+  journal = await openJournal(setup.journalDir);
+  try {
+    const second = await new PipelineRunner(setup.config, journal, cloud).run();
+    assert.equal(second.state, "complete");
+    assert.equal(second.published, 1);
+    assert.equal(journal.pending, undefined);
+    assert.equal(
+      cloud.operations.filter((operation) => operation === "scan.begin")
+        .length,
+      2,
     );
   } finally {
     await journal.close();
@@ -2168,7 +2367,11 @@ test("provider admission sends three recovery selections and persists the provid
     },
     parserIntent: { parserArtifactClientId: randomUUID() },
     parserOutput: {
-      rawArtifact: { sha256: HASH, byteLength: 100 },
+      rawArtifact: {
+        sha256: HASH,
+        byteLength: 100,
+        mediaType: "application/vnd.docling+json",
+      },
       extractionFingerprint: HASH,
     },
   };

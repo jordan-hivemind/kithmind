@@ -1,6 +1,7 @@
 import type { Doc, Id } from "../../_generated/dataModel";
 import type { MutationCtx, QueryCtx } from "../../_generated/server";
 import { getConvexSize } from "convex/values";
+import { isBinaryClass } from "@repo/worker-protocol";
 import { requireSourceAccountAccess } from "../../lib/sourceAuth";
 import type { PrincipalRef } from "../../lib/spaces";
 import { digestProcessingConfiguration } from "../ingestion/hash";
@@ -15,7 +16,7 @@ import {
 import { verifySealedParsedPayload } from "../provenance/parsedStaging";
 import { artifactBoundExtractionFingerprint } from "./archivedDiscovery";
 import { requireWorkerSourceAccount, type WorkerPrincipal } from "./auth";
-import { workerProtocolError } from "./errors";
+import { workerProtocolError, workerProtocolErrorCode } from "./errors";
 import { consumeWorkerMutationRateLimit } from "./rateLimit";
 import { FS_TEXT_PROFILE } from "./profile";
 import type {
@@ -45,6 +46,7 @@ type LoadedWorkerSource = Awaited<
 type Assessment = Doc<"workerProcessingAssessments">;
 type AssessmentState = Assessment["state"];
 type StaleReason = NonNullable<Assessment["staleReason"]>;
+type StoredCounts = Assessment["counts"];
 type DbCtx = Pick<QueryCtx, "db"> | Pick<MutationCtx, "db">;
 
 function safeInteger(value: unknown, minimum = 0): value is number {
@@ -192,6 +194,7 @@ function emptyCounts(): ProcessingAssessmentCounts {
       ready: 0,
       pending: 0,
       failed: 0,
+      parked: 0,
       needsReview: 0,
       explicitGap: 0,
       unavailable: 0,
@@ -201,11 +204,25 @@ function emptyCounts(): ProcessingAssessmentCounts {
   };
 }
 
-function countsAreValid(counts: ProcessingAssessmentCounts): boolean {
+/**
+ * P2-80h: the stored shape leaves `parked` optional so an assessment written
+ * before the bucket existed still validates. Every reader goes through here,
+ * so a missing bucket reads as 0 and what leaves the server always carries it.
+ */
+function readCounts(counts: StoredCounts): ProcessingAssessmentCounts {
+  return {
+    items: { ...counts.items, parked: counts.items.parked ?? 0 },
+    unresolvedEntries: { ...counts.unresolvedEntries },
+  };
+}
+
+function countsAreValid(stored: StoredCounts): boolean {
+  const counts = readCounts(stored);
   return [
     counts.items.ready,
     counts.items.pending,
     counts.items.failed,
+    counts.items.parked,
     counts.items.needsReview,
     counts.items.explicitGap,
     counts.items.unavailable,
@@ -216,13 +233,16 @@ function countsAreValid(counts: ProcessingAssessmentCounts): boolean {
 }
 
 function countsEqual(
-  left: ProcessingAssessmentCounts,
-  right: ProcessingAssessmentCounts,
+  storedLeft: StoredCounts,
+  storedRight: StoredCounts,
 ): boolean {
+  const left = readCounts(storedLeft);
+  const right = readCounts(storedRight);
   return (
     left.items.ready === right.items.ready &&
     left.items.pending === right.items.pending &&
     left.items.failed === right.items.failed &&
+    left.items.parked === right.items.parked &&
     left.items.needsReview === right.items.needsReview &&
     left.items.explicitGap === right.items.explicitGap &&
     left.items.unavailable === right.items.unavailable &&
@@ -433,7 +453,10 @@ function beginResult(
     state: assessment.state,
     nextOrdinal: assessment.nextOrdinal,
     ...(assessment.state === "complete" || assessment.state === "incomplete"
-      ? { counts: assessment.counts, completedAt: assessment.completedAt }
+      ? {
+          counts: readCounts(assessment.counts),
+          completedAt: assessment.completedAt,
+        }
       : {}),
     ...(assessment.state === "stale"
       ? { staleReason: assessment.staleReason }
@@ -447,10 +470,12 @@ function pageResult(
   result: NonNullable<Assessment["lastPageResult"]>,
   reused: boolean,
 ): WorkerAssessmentPageResult {
+  const { counts, ...rest } = result;
   return {
     operation: "processing.assessPage",
     assessmentId,
-    ...result,
+    ...rest,
+    ...(counts === undefined ? {} : { counts: readCounts(counts) }),
     reused,
   };
 }
@@ -771,6 +796,70 @@ type ItemClassification = {
   proof?: ScanProofBucket;
 };
 
+/**
+ * The scan entry a classification still has to account for, read from the
+ * entry's own state. `classifyItem` derives the same proof from the same
+ * states; this is the part of it that survives a failed classification.
+ */
+function proofForEntryState(
+  state: Doc<"workerScanEntries">["state"],
+): ScanProofBucket {
+  return state === "gap"
+    ? "gapScanEntries"
+    : state === "needs_review"
+      ? "reviewScanEntries"
+      : state === "ignored_forgotten"
+        ? "ignoredScanEntries"
+        : state === "queued"
+          ? "queuedScanEntries"
+          : "unchangedScanEntries";
+}
+
+/**
+ * P2-80h: an item the server cannot prove is an unavailable item, not a stale
+ * source. `classifyItem` raises a protocol error whenever an item's chain does
+ * not hold together, and the page loop turned any throw into
+ * `staleReason: detail_unavailable` for the whole assessment: one document
+ * blocked the source forever, which is how three separate defects each ended
+ * as a permanently stale assessment. Such an item is now counted in
+ * `counts.items.unavailable` with its reason logged, the pass keeps accounting
+ * for its scan entry, and the assessment completes. Coverage stays honest
+ * because `terminalState` already refuses `complete` while any item is
+ * unavailable, exactly as it does for needs-review.
+ *
+ * Only a source-level fault still stales the assessment: the fence, the
+ * epochs, the scan counters (`currentFenceReason`), and a fault that stops the
+ * pass from attributing an entry at all, which would break the accounting
+ * proof rather than degrade one item.
+ */
+async function classifyItemOrUnavailable(
+  ctx: MutationCtx,
+  source: LoadedWorkerSource,
+  assessment: Assessment,
+  item: Doc<"sourceItems">,
+): Promise<ItemClassification> {
+  try {
+    return await classifyItem(ctx, source, assessment, item);
+  } catch (error) {
+    const reason = workerProtocolErrorCode(error);
+    if (reason === undefined) throw error;
+    const entry = await exactEntryForItem(ctx, assessment, item);
+    console.warn(
+      JSON.stringify({
+        event: "worker_assessment_item_unavailable",
+        sourceItemId: item._id,
+        scanId: assessment.scanId,
+        reason,
+        ...(entry ? { entryState: entry.state } : {}),
+      }),
+    );
+    return {
+      bucket: "unavailable",
+      ...(entry ? { proof: proofForEntryState(entry.state) } : {}),
+    };
+  }
+}
+
 function validDiscoveryWorkRuntimeState(
   work: Doc<"workerDiscoveryWork">,
 ): boolean {
@@ -916,7 +1005,12 @@ async function binaryItemDigests(
   item: Doc<"sourceItems">,
   entry: Doc<"workerScanEntries">,
 ) {
+  // P2-70i2: the class is part of both digests, so a PDF receipt can never
+  // satisfy a workbook and a workbook receipt can never satisfy a PDF. For a
+  // PDF entry these are the same two literals the digest carried before, so
+  // every existing digest is unchanged byte for byte.
   if (
+    !isBinaryClass(entry.binaryParserProfileId, entry.binaryMediaType) ||
     !item.externalId ||
     !item.uri ||
     !entry.contentHash ||
@@ -941,8 +1035,8 @@ async function binaryItemDigests(
       "worker-fs-binary-processing-identity:v1",
       [
         entry.contentHash,
-        "application/pdf",
-        "pdf_docqa_v1",
+        entry.binaryMediaType,
+        entry.binaryParserProfileId,
         entry.parserFingerprint,
         entry.extractionConfigurationFingerprint,
         entry.extractorFingerprint,
@@ -963,7 +1057,7 @@ async function binaryItemDigests(
         "ready_binary_v1",
         entry.contentHash,
         entry.byteLength,
-        "pdf_docqa_v1",
+        entry.binaryParserProfileId,
       ],
     ),
   };
@@ -978,15 +1072,14 @@ async function terminalParsedReady(
 ): Promise<boolean> {
   if (
     entry.contentRepresentation !== "archived_binary_v1" ||
-    entry.binaryMediaType !== "application/pdf" ||
-    entry.binaryParserProfileId !== "pdf_docqa_v1" ||
+    !isBinaryClass(entry.binaryParserProfileId, entry.binaryMediaType) ||
     item.lifecycle !== "available" ||
     item.lastFailure !== undefined ||
     item.workerLastSeenInventoryEpoch !== assessment.inventoryEpoch ||
     item.workerObservationEpoch !== entry.observationEpoch ||
     item.workerProcessingEpoch !== entry.processingEpoch ||
     item.workerContentHash !== entry.contentHash ||
-    item.workerProfileId !== "pdf_docqa_v1" ||
+    item.workerProfileId !== entry.binaryParserProfileId ||
     item.workerSourceModifiedAt !== entry.sourceModifiedAt ||
     !item.desiredRevisionId ||
     item.activeRevisionId !== item.desiredRevisionId ||
@@ -1023,7 +1116,7 @@ async function terminalParsedReady(
     revision.contentHashAuthority !== "worker_asserted" ||
     revision.contentHash !== entry.contentHash ||
     revision.byteLength !== entry.byteLength ||
-    revision.mediaType !== "application/pdf" ||
+    revision.mediaType !== entry.binaryMediaType ||
     generation.spaceId !== source.spaceId ||
     generation.sourceAccountId !== source.account._id ||
     generation.sourceItemId !== item._id ||
@@ -1403,7 +1496,11 @@ async function classifyWork(
     if (work.retryable === undefined || !work.failureCode) {
       throw workerProtocolError("scan_conflict");
     }
-    return work.retryable ? "failed" : "needsReview";
+    // P2-80h: a non-retryable failure is settled. Nothing will retry it, so
+    // reporting it as review kept the source `incomplete` on every later pass
+    // forever; it is parked instead, and `requeueFailedDiscoveryWork` is the
+    // operator route that reopens it.
+    return work.retryable ? "failed" : "parked";
   }
   if (work.state === "needs_review" || work.state === "obsolete")
     return "needsReview";
@@ -1470,7 +1567,10 @@ async function classifyWork(
     return "pending";
   if (job.state === "failed") {
     if (!job.error) throw workerProtocolError("scan_conflict");
-    return job.error.retryable ? "failed" : "needsReview";
+    // Same rule one step further down the chain: `failJob` already marks the
+    // file `parse_failed` when a job will not retry itself, so a settled job
+    // failure is parked too rather than blocking the source forever.
+    return job.error.retryable ? "failed" : "parked";
   }
   return "needsReview";
 }
@@ -1519,6 +1619,16 @@ async function classifyItem(
         entry.state === "queued" ? "queuedScanEntries" : "unchangedScanEntries",
     };
   }
+  // P2-80f: an `unchanged` entry that still carries a discovery work row is a
+  // settled processing failure (see the entry state rule in model.ts). It is
+  // not terminally ready and never will be without an operator requeue, so
+  // classify it from its work row (needs review) instead of failing closed.
+  if (entry.state === "unchanged" && entry.discoveryWorkId !== undefined) {
+    return {
+      bucket: await classifyWork(ctx, source, item, entry),
+      proof: "unchangedScanEntries",
+    };
+  }
   if (entry.state !== "queued") throw workerProtocolError("scan_conflict");
   return {
     bucket: await classifyWork(ctx, source, item, entry),
@@ -1526,15 +1636,25 @@ async function classifyItem(
   };
 }
 
+/**
+ * P2-80h: `complete` means this pass has nothing left to do, not that every
+ * document parsed. Unfinished or unprovable work still blocks it: pending and
+ * retryable-failed work is still moving, an unavailable item has no chain the
+ * server can trust, and a needs-review item or entry is an open identity
+ * question. Settled outcomes do not: a parked parse failure and an explicit
+ * gap are both recorded, counted, and listed in the review queue, and neither
+ * changes on its own, so blocking on them left a scheduled watcher rerunning
+ * the same pass forever with the source never reporting complete.
+ */
 function terminalState(
-  counts: ProcessingAssessmentCounts,
+  stored: StoredCounts,
   scanState: Assessment["scanStateAtStart"],
 ): "complete" | "incomplete" {
+  const counts = readCounts(stored);
   return scanState === "enumerated" &&
     counts.items.pending === 0 &&
     counts.items.failed === 0 &&
     counts.items.needsReview === 0 &&
-    counts.items.explicitGap === 0 &&
     counts.items.unavailable === 0 &&
     counts.unresolvedEntries.needsReview === 0
     ? "complete"
@@ -1655,7 +1775,7 @@ export async function advanceProcessingAssessment(
   }
   await consumeWorkerMutationRateLimit(ctx, source, now);
 
-  let counts = assessment.counts;
+  let counts = readCounts(assessment.counts);
   let accounted = assessment.accountedScanEntries;
   let queued = assessment.queuedScanEntries;
   let gap = assessment.gapScanEntries;
@@ -1710,7 +1830,12 @@ export async function advanceProcessingAssessment(
       );
       for (const item of page.page) {
         if (!detailRowsAreBounded(item)) throw new Error("oversized_detail");
-        const classified = await classifyItem(ctx, source, assessment, item);
+        const classified = await classifyItemOrUnavailable(
+          ctx,
+          source,
+          assessment,
+          item,
+        );
         counts = incrementCount(counts, classified.bucket);
         if (classified.proof === "queuedScanEntries") queued += 1;
         else if (classified.proof === "gapScanEntries") gap += 1;
@@ -1954,6 +2079,6 @@ export async function getProcessingAssessmentStatus(
     inventoryEpoch: latest.inventoryEpoch,
     manifestVersion: latest.manifestVersion,
     completedAt: latest.completedAt!,
-    counts: latest.counts,
+    counts: readCounts(latest.counts),
   };
 }

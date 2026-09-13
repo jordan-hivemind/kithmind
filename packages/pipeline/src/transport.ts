@@ -391,6 +391,7 @@ function counts(value: unknown): void {
     "ready",
     "pending",
     "failed",
+    "parked",
     "needsReview",
     "explicitGap",
     "unavailable",

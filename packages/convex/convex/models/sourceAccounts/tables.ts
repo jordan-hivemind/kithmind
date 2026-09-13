@@ -1,6 +1,8 @@
 import { defineTable } from "convex/server";
 import { v } from "convex/values";
 
+import { binaryParserProfileIdValidator } from "../workers/validators";
+
 export const sourceAccountFields = {
   spaceId: v.id("spaces"),
   connector: v.string(),
@@ -20,7 +22,18 @@ export const sourceAccountFields = {
   workerAssessmentEpoch: v.optional(v.number()),
   activeWorkerAssessmentId: v.optional(v.id("workerProcessingAssessments")),
   latestWorkerAssessmentId: v.optional(v.id("workerProcessingAssessments")),
-  binaryProfileId: v.optional(v.literal("pdf_docqa_v1")),
+  /**
+   * The one binary class an account was audited for before P2-70i2. Kept for
+   * accounts that predate `binaryProfileIds`; read only through
+   * `accountBinaryClasses`.
+   */
+  binaryProfileId: v.optional(binaryParserProfileIdValidator),
+  /**
+   * P2-70i2: the closed set of binary classes this account is audited for.
+   * Authoritative when present. Per class, because the measured parser
+   * acceptance that enables one class says nothing about another.
+   */
+  binaryProfileIds: v.optional(v.array(binaryParserProfileIdValidator)),
   binaryProfileAuditDigest: v.optional(v.string()),
   binaryProfileEnabledAt: v.optional(v.number()),
   /**

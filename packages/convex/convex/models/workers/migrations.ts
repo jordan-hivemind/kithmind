@@ -219,13 +219,15 @@ const REQUEUE_DEFAULT_LIMIT = 50;
 const REQUEUE_MAX_LIMIT = 500;
 
 // A transport defect (fixed in PR179/PR182) left some workerDiscoveryWork
-// rows stranded in "failed"/"needs_review": failArchivedDiscovery always
-// clears nextAttemptAt, so dueDiscoveryCandidates never re-offers them, and
-// the scan entryState rule (model.ts) re-derives "needs_review" forever once
-// priorWork is in either state, so no later scan admits a replacement. This
-// patches the row directly back to "queued" so the next scan's entryState
-// rule sees a non-failed priorWork and re-admits the item normally. It never
-// touches sourceItems, scans, or scan entries.
+// rows stranded in "failed"/"needs_review": failArchivedDiscovery used to
+// clear nextAttemptAt even on a retryable failure (fixed in P2-80g), so
+// dueDiscoveryCandidates never re-offered them. Since
+// P2-80f the scan entryState rule (model.ts) re-queues a still-retryable
+// failure on its own and settles an exhausted one as "unchanged", so this op
+// is the operator route for re-attempting an exhausted or review-held row
+// rather than the only escape from a permanent loop. It patches the row
+// directly back to "queued" and never touches sourceItems, scans, or scan
+// entries.
 export async function requeueFailedDiscoveryWorkPage(
   ctx: MutationCtx,
   args: {
@@ -233,8 +235,10 @@ export async function requeueFailedDiscoveryWorkPage(
     dryRun: boolean;
     limit: number;
     now: number;
+    resetAttempts?: boolean;
   },
 ) {
+  const resetAttempts = args.resetAttempts ?? false;
   if (
     !Number.isInteger(args.limit) ||
     args.limit < 1 ||
@@ -245,6 +249,7 @@ export async function requeueFailedDiscoveryWorkPage(
   let examined = 0;
   let requeued = 0;
   let skippedAttemptLimit = 0;
+  let resetAtLimit = 0;
   for (const state of ["failed", "needs_review"] as const) {
     if (examined >= args.limit) break;
     const rows = await ctx.db
@@ -256,11 +261,13 @@ export async function requeueFailedDiscoveryWorkPage(
     for (const row of rows) {
       examined += 1;
       byPriorState[state] += 1;
-      if (row.attempts >= MAX_WORKER_DISCOVERY_ATTEMPTS) {
+      const atLimit = row.attempts >= MAX_WORKER_DISCOVERY_ATTEMPTS;
+      if (atLimit && !resetAttempts) {
         skippedAttemptLimit += 1;
         continue;
       }
       requeued += 1;
+      if (atLimit) resetAtLimit += 1;
       if (!args.dryRun) {
         await ctx.db.patch(row._id, {
           state: "queued",
@@ -268,13 +275,20 @@ export async function requeueFailedDiscoveryWorkPage(
           leaseToken: undefined,
           leaseOwnerCredentialId: undefined,
           leaseExpiresAt: undefined,
-          retryable: undefined,
+          retryable: atLimit ? true : undefined,
           failureCode: undefined,
+          ...(atLimit ? { attempts: 0 } : {}),
         });
       }
     }
   }
-  return { examined, requeued, skippedAttemptLimit, byPriorState };
+  return {
+    examined,
+    requeued,
+    skippedAttemptLimit,
+    resetAtLimit,
+    byPriorState,
+  };
 }
 
 export const requeueFailedDiscoveryWork = internalMutation({
@@ -282,6 +296,7 @@ export const requeueFailedDiscoveryWork = internalMutation({
     sourceAccountId: v.id("sourceAccounts"),
     dryRun: v.optional(v.boolean()),
     limit: v.optional(v.number()),
+    resetAttempts: v.optional(v.boolean()),
   },
   handler: (ctx, args) =>
     requeueFailedDiscoveryWorkPage(ctx, {
@@ -289,5 +304,104 @@ export const requeueFailedDiscoveryWork = internalMutation({
       dryRun: args.dryRun ?? true,
       limit: args.limit ?? REQUEUE_DEFAULT_LIMIT,
       now: Date.now(),
+      resetAttempts: args.resetAttempts ?? false,
+    }),
+});
+
+const RESTORE_DOC_TYPE_MAX_ITEMS = 25;
+
+/**
+ * P2-80i recovery. Card activation used to patch `documents.docType` of the
+ * active text generation in place. That row is part of the sealed parsed
+ * payload and its `docType` is inside `manifest.documentDigest`, so every
+ * patched document failed `verifySealedParsedPayload` and the worker
+ * processing assessment counted it unavailable.
+ *
+ * This restores the sealed value from the `docTypePatch` the card version
+ * recorded, and moves the accepted `card_kind` to `sourceItems.cardDocType`,
+ * which is where document reads now overlay it. A patch counts as still in
+ * effect only while the document still carries its `appliedDocType`, so the job
+ * is idempotent: a second run finds the parser's value back on the row and
+ * restores nothing. Paged over `eventVersions`; only card versions carry a
+ * `docTypePatch`.
+ */
+export async function restoreSealedDocTypesPage(
+  ctx: MutationCtx,
+  args: { cursor: string | null; maxItems: number; dryRun: boolean },
+) {
+  if (
+    !Number.isInteger(args.maxItems) ||
+    args.maxItems < 1 ||
+    args.maxItems > RESTORE_DOC_TYPE_MAX_ITEMS ||
+    (args.cursor !== null && args.cursor.length > 8192)
+  )
+    throw new Error("Invalid migration page bounds");
+  const page = await ctx.db.query("eventVersions").paginate({
+    cursor: args.cursor,
+    numItems: args.maxItems,
+  });
+  let patchedVersions = 0;
+  let documentsRestored = 0;
+  let itemsOverlaid = 0;
+  let skippedNotInEffect = 0;
+  for (const version of page.page) {
+    const docTypePatch = version.docTypePatch;
+    if (docTypePatch === undefined || docTypePatch.length === 0) continue;
+    patchedVersions += 1;
+    const item = await ctx.db.get(version.sourceItemId);
+    if (!item || item.spaceId !== version.spaceId) {
+      skippedNotInEffect += docTypePatch.length;
+      continue;
+    }
+    let appliedInEffect: string | undefined;
+    for (const entry of docTypePatch) {
+      const document = await ctx.db.get(entry.documentId);
+      if (
+        !document ||
+        document.spaceId !== version.spaceId ||
+        document.sourceItemId !== item._id ||
+        document.docType !== entry.appliedDocType
+      ) {
+        skippedNotInEffect += 1;
+        continue;
+      }
+      if (!args.dryRun) {
+        await ctx.db.patch(document._id, { docType: entry.previousDocType });
+      }
+      appliedInEffect = entry.appliedDocType;
+      documentsRestored += 1;
+    }
+    // The card kind those documents were actually carrying is the one the read
+    // overlay has to serve from now on.
+    if (appliedInEffect !== undefined && item.cardDocType !== appliedInEffect) {
+      if (!args.dryRun) {
+        await ctx.db.patch(item._id, { cardDocType: appliedInEffect });
+      }
+      itemsOverlaid += 1;
+    }
+  }
+  return {
+    dryRun: args.dryRun,
+    inspected: page.page.length,
+    patchedVersions,
+    documentsRestored,
+    itemsOverlaid,
+    skippedNotInEffect,
+    isDone: page.isDone,
+    continueCursor: page.continueCursor,
+  };
+}
+
+export const restoreSealedDocTypes = internalMutation({
+  args: {
+    cursor: v.union(v.string(), v.null()),
+    maxItems: v.optional(v.number()),
+    dryRun: v.optional(v.boolean()),
+  },
+  handler: (ctx, args) =>
+    restoreSealedDocTypesPage(ctx, {
+      cursor: args.cursor,
+      maxItems: args.maxItems ?? RESTORE_DOC_TYPE_MAX_ITEMS,
+      dryRun: args.dryRun ?? true,
     }),
 });

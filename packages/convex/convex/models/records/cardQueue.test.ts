@@ -28,11 +28,13 @@ import {
 import {
   claimNextForExtraction,
   classifyQueueTickFailure,
+  DEFAULT_WEEKLY_COST_BUDGET_MICRO_USD,
   recordExtractionOutcome,
   runCardExtractionQueueTick,
   type QueueTickOps,
   type QueueTickResult,
 } from "./cardQueue";
+import { listReviewQueue } from "./reviewQueue";
 
 // Synthetic fixture only. Every document is a one-page, one-sentence note
 // carrying nothing but its own title. No test in this file calls a model or
@@ -465,7 +467,18 @@ describe("the card extraction queue", () => {
       tickOps({ t, spaceId, userId, now: MONDAY, onLadderCall: (id) => ladderCalls.push(id) }),
     );
     expect(ladderCalls).toEqual([second]);
-    expect(results.map((r) => r.status)).toEqual(["advanced", "claimed", "idle"]);
+    // P2-85: the first sweep advances past the already-accepted document and
+    // claims the other, then the end of the sweep rewinds the cursor once and
+    // sweeps again. The second sweep advances past both (both now accepted)
+    // and only then goes idle, having called the ladder for neither.
+    expect(results.map((r) => r.status)).toEqual([
+      "advanced",
+      "claimed",
+      "advanced",
+      "advanced",
+      "advanced",
+      "idle",
+    ]);
   });
 
   test("a gate-failed document is not retried by the queue", async () => {
@@ -499,6 +512,65 @@ describe("the card extraction queue", () => {
 
     const drops = await t.run((ctx) => ctx.db.query("cardFieldDrops").collect());
     expect(drops.filter((d) => d.kind === "card_gate_failed").length).toBe(1);
+  });
+
+  test("rerunGateFailed clears the drop and lets the queue reconsider the document", async () => {
+    const t = convexTest(schema, modules);
+    const { userId, spaceId, sourceAccountId } = await seedSpace(t);
+    const [gateFailed, healthy] = await seedItems(t, {
+      spaceId,
+      sourceAccountId,
+      userId,
+      count: 2,
+    });
+    await startQueue(t, { spaceId });
+
+    // Reproduces the previous test's setup: the first document fails the
+    // gate and is never retried, then the queue drains the rest and goes
+    // idle.
+    await runCardExtractionQueueTick(
+      tickOps({ t, spaceId, userId, now: MONDAY, wrong: true }),
+    );
+    await runUntilStopped(() => tickOps({ t, spaceId, userId, now: MONDAY }));
+    const before = await t.run((ctx) => ctx.db.query("cardFieldDrops").collect());
+    expect(before.filter((d) => d.kind === "card_gate_failed")).toHaveLength(1);
+    const idleStatus = await t.query(
+      internal.models.records.cardQueue.cardExtractionQueueStatus,
+      { spaceId, kind: "document_card" },
+    );
+    expect(idleStatus.phase).toBe("idle");
+
+    const result = await t.mutation(internal.models.records.cardQueue.rerunGateFailed, {
+      spaceId,
+      kind: "document_card",
+    });
+    expect(result).toEqual({ clearedCount: 1, truncated: false });
+
+    const after = await t.run((ctx) => ctx.db.query("cardFieldDrops").collect());
+    expect(after.filter((d) => d.kind === "card_gate_failed")).toHaveLength(0);
+
+    const ladderCalls: Id<"sourceItems">[] = [];
+    const rerun = await runUntilStopped(() =>
+      tickOps({ t, spaceId, userId, now: MONDAY, onLadderCall: (id) => ladderCalls.push(id) }),
+    );
+    // The previously gate-failed document is claimed and (this time, with a
+    // correct candidate) accepted; the already-accepted document is only
+    // advanced past, never re-run through the ladder.
+    expect(ladderCalls).toEqual([gateFailed]);
+    expect(ladderCalls).not.toContain(healthy);
+    expect(rerun.filter((r) => r.status === "claimed").length).toBe(1);
+    expect(await acceptedCardCount(t, spaceId)).toBe(2);
+  });
+
+  test("rerunGateFailed is a no-op count when there is nothing to clear", async () => {
+    const t = convexTest(schema, modules);
+    const { spaceId } = await seedSpace(t);
+    await startQueue(t, { spaceId });
+    const result = await t.mutation(internal.models.records.cardQueue.rerunGateFailed, {
+      spaceId,
+      kind: "document_card",
+    });
+    expect(result).toEqual({ clearedCount: 0, truncated: false });
   });
 
   test("the weekly cost budget pauses once it is reached", async () => {
@@ -576,34 +648,138 @@ describe("the card extraction queue", () => {
     );
     expect(rows).toEqual([]);
   });
+
+  test("setExtractionQueueBudgets raises weekly document budget on paused state, leaving phase and counters untouched", async () => {
+    const t = convexTest(schema, modules);
+    const { userId, spaceId, sourceAccountId } = await seedSpace(t);
+    await seedItems(t, { spaceId, sourceAccountId, userId, count: 3 });
+    await startQueue(t, {
+      spaceId,
+      dailyDocumentBudget: 1,
+      weeklyDocumentBudget: 5,
+    });
+
+    // Pause the queue by exceeding the daily budget.
+    await runUntilStopped(() =>
+      tickOps({ t, spaceId, userId, now: MONDAY }),
+    );
+    const pausedStatus = await t.query(
+      internal.models.records.cardQueue.cardExtractionQueueStatus,
+      { spaceId, kind: "document_card" },
+    );
+    expect(pausedStatus.phase).toBe("paused");
+    expect(pausedStatus.pauseReason).toBe("daily_document_budget");
+    const originalExtracted = pausedStatus.extracted;
+    const originalDocumentsProcessedThisWeek = pausedStatus.documentsProcessedThisWeek;
+
+    // Raise the weekly document budget.
+    const result = await t.mutation(
+      internal.models.records.cardQueue.setExtractionQueueBudgets,
+      {
+        spaceId,
+        kind: "document_card",
+        weeklyDocumentBudget: 100,
+        now: MONDAY,
+      },
+    );
+    expect(result).toEqual({
+      dailyDocumentBudget: 1,
+      weeklyDocumentBudget: 100,
+      weeklyCostBudgetMicroUsd: DEFAULT_WEEKLY_COST_BUDGET_MICRO_USD,
+    });
+
+    // Verify phase, counters, and windows remain unchanged.
+    const afterBudgetUpdate = await t.query(
+      internal.models.records.cardQueue.cardExtractionQueueStatus,
+      { spaceId, kind: "document_card" },
+    );
+    expect(afterBudgetUpdate.phase).toBe("paused");
+    expect(afterBudgetUpdate.pauseReason).toBe("daily_document_budget");
+    expect(afterBudgetUpdate.extracted).toBe(originalExtracted);
+    expect(afterBudgetUpdate.documentsProcessedThisWeek).toBe(
+      originalDocumentsProcessedThisWeek,
+    );
+  });
+
+  test("setExtractionQueueBudgets rejects non-positive budgets", async () => {
+    const t = convexTest(schema, modules);
+    const { spaceId } = await seedSpace(t);
+    await startQueue(t, { spaceId });
+
+    await expect(
+      t.mutation(internal.models.records.cardQueue.setExtractionQueueBudgets, {
+        spaceId,
+        kind: "document_card",
+        dailyDocumentBudget: 0,
+        now: MONDAY,
+      }),
+    ).rejects.toThrow("dailyDocumentBudget must be a positive integer");
+
+    await expect(
+      t.mutation(internal.models.records.cardQueue.setExtractionQueueBudgets, {
+        spaceId,
+        kind: "document_card",
+        weeklyDocumentBudget: -5,
+        now: MONDAY,
+      }),
+    ).rejects.toThrow("weeklyDocumentBudget must be a positive integer");
+
+    await expect(
+      t.mutation(internal.models.records.cardQueue.setExtractionQueueBudgets, {
+        spaceId,
+        kind: "document_card",
+        weeklyCostBudgetMicroUsd: 3.5,
+        now: MONDAY,
+      }),
+    ).rejects.toThrow("weeklyCostBudgetMicroUsd must be a positive integer");
+  });
 });
 
 describe("classifying a raised tick", () => {
   test("a hosted-provider message classifies as provider_failed", () => {
     expect(
       classifyQueueTickFailure(new Error("Card extraction request failed")),
-    ).toEqual({ outcome: "provider_failed", errorCode: "provider_error" });
+    ).toEqual({
+      outcome: "provider_failed",
+      errorCode: "provider_error",
+      errorName: "Error",
+    });
     expect(
       classifyQueueTickFailure(
         new Error(
           "Card extraction request failed (status 400, code invalid_request_error)",
         ),
       ),
-    ).toEqual({ outcome: "provider_failed", errorCode: "provider_error" });
+    ).toEqual({
+      outcome: "provider_failed",
+      errorCode: "provider_error",
+      errorName: "Error",
+    });
     expect(
       classifyQueueTickFailure(
         new Error("Card extraction provider credentials are unavailable"),
       ),
-    ).toEqual({ outcome: "provider_failed", errorCode: "provider_error" });
+    ).toEqual({
+      outcome: "provider_failed",
+      errorCode: "provider_error",
+      errorName: "Error",
+    });
   });
 
   test("anything else classifies as an ordinary review, not a provider outage", () => {
     expect(
       classifyQueueTickFailure(new Error("stageEvidence wrote no rows")),
-    ).toEqual({ outcome: "review", errorCode: "gate_error" });
+    ).toEqual({
+      outcome: "review",
+      errorCode: "gate_error",
+      errorName: "Error",
+    });
+    // A raised non-Error carries no name of its own; its type is bounded and,
+    // unlike a message, cannot carry document content.
     expect(classifyQueueTickFailure("not even an Error")).toEqual({
       outcome: "review",
       errorCode: "gate_error",
+      errorName: "string",
     });
   });
 });
@@ -760,5 +936,346 @@ describe("the tick never lets a runner or provider failure escape uncaught", () 
       failingTickOps(tickOps({ t, spaceId, userId, now: MONDAY }), message),
     );
     expect(next).toEqual({ status: "claimed", continue: true });
+  });
+});
+
+/**
+ * Flips one document's retained text between ready and not ready, which is the
+ * P2-85 condition: the queue's cursor passes a document whose text is still
+ * landing, and the forward-only cursor then never looks at it again.
+ */
+async function setRetainedTextReady(
+  t: T,
+  sourceItemId: Id<"sourceItems">,
+  ready: boolean,
+): Promise<void> {
+  await t.run(async (ctx) => {
+    const item = await ctx.db.get(sourceItemId);
+    const generationId = item?.activeGenerationId;
+    if (!generationId) throw new Error("fixture item has no generation");
+    await ctx.db.patch(generationId, { state: ready ? "ready" : "staged" });
+  });
+}
+
+describe("P2-85: a sweep that ends with nothing claimable rewinds once", () => {
+  test("a document that becomes ready after the cursor passed it is claimed on the next sweep", async () => {
+    const t = convexTest(schema, modules);
+    const { userId, spaceId, sourceAccountId } = await seedSpace(t);
+    const [late, healthy] = await seedItems(t, {
+      spaceId,
+      sourceAccountId,
+      userId,
+      count: 2,
+    });
+    await setRetainedTextReady(t, late!, false);
+    await startQueue(t, { spaceId });
+
+    const calls: Id<"sourceItems">[] = [];
+    const tick = () =>
+      runCardExtractionQueueTick(
+        tickOps({
+          t,
+          spaceId,
+          userId,
+          now: MONDAY,
+          onLadderCall: (id) => calls.push(id),
+        }),
+      );
+
+    // The cursor passes the not-yet-ready document, then extracts the other.
+    expect(await tick()).toEqual({ status: "advanced", continue: true });
+    expect(await tick()).toEqual({ status: "claimed", continue: true });
+    expect(calls).toEqual([healthy]);
+
+    // Its text lands after the cursor is already past it.
+    await setRetainedTextReady(t, late!, true);
+
+    // The sweep reaches the end with nothing claimable and rewinds instead of
+    // going idle, so the next sweep reoffers the document it stranded.
+    expect(await tick()).toEqual({ status: "advanced", continue: true });
+    expect(await tick()).toEqual({ status: "claimed", continue: true });
+    expect(calls).toEqual([healthy, late]);
+
+    // And the rewound sweep that finds nothing does go idle: one rewind per
+    // sweep that resolved something, never a spinning queue.
+    const rest = await runUntilStopped(() =>
+      tickOps({ t, spaceId, userId, now: MONDAY }),
+    );
+    expect(rest.at(-1)).toEqual({ status: "idle", continue: false });
+    expect(await acceptedCardCount(t, spaceId)).toBe(2);
+  });
+
+  test("an idle queue with nothing to do does not spin", async () => {
+    const t = convexTest(schema, modules);
+    const { userId, spaceId, sourceAccountId } = await seedSpace(t);
+    await seedItems(t, { spaceId, sourceAccountId, userId, count: 3 });
+    await startQueue(t, { spaceId });
+
+    const first = await runUntilStopped(() =>
+      tickOps({ t, spaceId, userId, now: MONDAY }),
+    );
+    expect(first.at(-1)).toEqual({ status: "idle", continue: false });
+    // Three claims, one rewind, three advances past the now-accepted cards,
+    // one idle. Bounded, not a loop.
+    expect(first).toHaveLength(8);
+
+    // Resuming the idle queue spends its one fresh rewind and stops again.
+    await t.mutation(internal.models.records.cardQueue.resumeExtractionQueue, {
+      spaceId,
+      kind: "document_card",
+      now: MONDAY,
+    });
+    const second = await runUntilStopped(() =>
+      tickOps({ t, spaceId, userId, now: MONDAY }),
+    );
+    expect(second.filter((r) => r.status === "claimed")).toHaveLength(0);
+    expect(second.at(-1)).toEqual({ status: "idle", continue: false });
+  });
+});
+
+describe("P2-86: a ladder run that raises leaves a row behind", () => {
+  test("a runner that throws mid-ladder writes the attempt and the drop the counters claim", async () => {
+    const t = convexTest(schema, modules);
+    const { userId, spaceId, sourceAccountId } = await seedSpace(t);
+    const [failing] = await seedItems(t, {
+      spaceId,
+      sourceAccountId,
+      userId,
+      count: 2,
+    });
+    await startQueue(t, { spaceId });
+
+    await runCardExtractionQueueTick(
+      failingTickOps(
+        tickOps({ t, spaceId, userId, now: MONDAY }),
+        "Card extraction request failed (status 500, code unknown)",
+      ),
+    );
+
+    const attempts = await t.run((ctx) =>
+      ctx.db.query("cardExtractionAttempts").collect(),
+    );
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0]).toMatchObject({
+      sourceItemId: failing,
+      recordKind: "document_card",
+      outcome: "review",
+      step: "tier1",
+      passedFieldCount: 0,
+      droppedFieldCount: 0,
+      failedFieldCount: 1,
+      failureCodes: ["provider_error"],
+    });
+
+    const drops = await t.run((ctx) => ctx.db.query("cardFieldDrops").collect());
+    expect(drops).toHaveLength(1);
+    expect(drops[0]).toMatchObject({
+      sourceItemId: failing,
+      kind: "card_gate_failed",
+      recordKind: "document_card",
+      fieldKey: "card_extraction",
+      code: "provider_error",
+      // The error's name, never its message: a message can carry text from
+      // the document.
+      reason: "Error",
+    });
+
+    // The counters and the rows now agree, which is the whole point: one
+    // provider failure counted, one review item to show for it.
+    const status = await t.query(
+      internal.models.records.cardQueue.cardExtractionQueueStatus,
+      { spaceId, kind: "document_card" },
+    );
+    expect(status).toMatchObject({ providerFailed: 1, gateFailed: 0 });
+
+    // And the document is reachable from the review surface instead of being
+    // silently dropped.
+    const review = await t.run((ctx) =>
+      listReviewQueue(ctx, [spaceId], {
+        sourceAccountId,
+        class: "card_gate_failed",
+      }),
+    );
+    expect(review.counts.cardGateFailed.total).toBe(1);
+    expect(review.rows).toHaveLength(1);
+    expect(review.rows[0]).toMatchObject({
+      sourceItemId: failing,
+      code: "provider_error",
+    });
+  });
+
+  test("rerunGateFailed reoffers a document whose run raised", async () => {
+    const t = convexTest(schema, modules);
+    const { userId, spaceId, sourceAccountId } = await seedSpace(t);
+    const [failing] = await seedItems(t, {
+      spaceId,
+      sourceAccountId,
+      userId,
+      count: 1,
+    });
+    await startQueue(t, { spaceId });
+
+    await runCardExtractionQueueTick(
+      failingTickOps(
+        tickOps({ t, spaceId, userId, now: MONDAY }),
+        "stageEvidence wrote no rows",
+      ),
+    );
+    // Until the drop is cleared the document is a review item, so the queue
+    // leaves it alone.
+    const drained = await runUntilStopped(() =>
+      tickOps({ t, spaceId, userId, now: MONDAY }),
+    );
+    expect(drained.filter((r) => r.status === "claimed")).toHaveLength(0);
+
+    const cleared = await t.mutation(
+      internal.models.records.cardQueue.rerunGateFailed,
+      { spaceId, kind: "document_card" },
+    );
+    expect(cleared).toEqual({ clearedCount: 1, truncated: false });
+
+    const calls: Id<"sourceItems">[] = [];
+    await runUntilStopped(() =>
+      tickOps({
+        t,
+        spaceId,
+        userId,
+        now: MONDAY,
+        onLadderCall: (id) => calls.push(id),
+      }),
+    );
+    expect(calls).toEqual([failing]);
+    expect(await acceptedCardCount(t, spaceId)).toBe(1);
+  });
+});
+
+describe("P2-91: the counters against the rows", () => {
+  test("reconcile reports the drift and reset removes it, idempotently", async () => {
+    const t = convexTest(schema, modules);
+    const { userId, spaceId, sourceAccountId } = await seedSpace(t);
+    await seedItems(t, { spaceId, sourceAccountId, userId, count: 3 });
+    await startQueue(t, { spaceId });
+
+    // One accepted card, one gate failure, one raised run: one document per
+    // bucket the counters claim to count.
+    await runCardExtractionQueueTick(tickOps({ t, spaceId, userId, now: MONDAY }));
+    await runCardExtractionQueueTick(
+      tickOps({ t, spaceId, userId, now: MONDAY, wrong: true }),
+    );
+    await runCardExtractionQueueTick(
+      failingTickOps(
+        tickOps({ t, spaceId, userId, now: MONDAY }),
+        "Card extraction request failed (status 500, code unknown)",
+      ),
+    );
+
+    const honest = await t.query(
+      internal.models.records.cardQueue.reconcileExtractionQueueCounts,
+      { spaceId, kind: "document_card" },
+    );
+    expect(honest).toMatchObject({
+      documentsScanned: 3,
+      withRetainedText: 3,
+      withAcceptedCard: 1,
+      withGateFailedDrop: 1,
+      withExtractionErrorDrop: 1,
+      neverAttempted: 0,
+      counters: {
+        extractedCount: 1,
+        gateFailedCount: 1,
+        skippedCount: 0,
+        providerFailedCount: 1,
+      },
+      drift: {
+        extractedCount: 0,
+        gateFailedCount: 0,
+        skippedCount: 0,
+        providerFailedCount: 0,
+      },
+      truncated: false,
+    });
+
+    // Now the production shape P2-84 measured: counters far above anything the
+    // rows can account for.
+    await t.run(async (ctx) => {
+      const state = await ctx.db
+        .query("cardExtractionQueueStates")
+        .withIndex("by_space_and_kind", (q) => q.eq("spaceId", spaceId))
+        .unique();
+      await ctx.db.patch(state!._id, { gateFailedCount: 27, skippedCount: 30 });
+    });
+    const drifted = await t.query(
+      internal.models.records.cardQueue.reconcileExtractionQueueCounts,
+      { spaceId, kind: "document_card" },
+    );
+    expect(drifted.counters).toMatchObject({
+      gateFailedCount: 27,
+      skippedCount: 30,
+    });
+    expect(drifted.drift).toEqual({
+      extractedCount: 0,
+      gateFailedCount: 26,
+      skippedCount: 30,
+      providerFailedCount: 0,
+    });
+
+    const reset = await t.mutation(
+      internal.models.records.cardQueue.resetExtractionQueueCounters,
+      { spaceId, kind: "document_card", now: MONDAY },
+    );
+    expect(reset).toEqual({
+      patched: true,
+      truncated: false,
+      before: {
+        extractedCount: 1,
+        gateFailedCount: 27,
+        skippedCount: 30,
+        providerFailedCount: 1,
+      },
+      after: {
+        extractedCount: 1,
+        gateFailedCount: 1,
+        skippedCount: 0,
+        providerFailedCount: 1,
+      },
+    });
+
+    const afterReset = await t.query(
+      internal.models.records.cardQueue.reconcileExtractionQueueCounts,
+      { spaceId, kind: "document_card" },
+    );
+    expect(afterReset.drift).toEqual({
+      extractedCount: 0,
+      gateFailedCount: 0,
+      skippedCount: 0,
+      providerFailedCount: 0,
+    });
+
+    // Idempotent: a second run writes the same values it just wrote.
+    const again = await t.mutation(
+      internal.models.records.cardQueue.resetExtractionQueueCounters,
+      { spaceId, kind: "document_card", now: MONDAY },
+    );
+    expect(again).toMatchObject({ patched: true, after: reset.after });
+  });
+
+  test("a never-attempted document with retained text is counted as such", async () => {
+    const t = convexTest(schema, modules);
+    const { userId, spaceId, sourceAccountId } = await seedSpace(t);
+    await seedItems(t, { spaceId, sourceAccountId, userId, count: 4 });
+    await startQueue(t, { spaceId, dailyDocumentBudget: 1 });
+
+    await runUntilStopped(() => tickOps({ t, spaceId, userId, now: MONDAY }));
+    const counts = await t.query(
+      internal.models.records.cardQueue.reconcileExtractionQueueCounts,
+      { spaceId, kind: "document_card" },
+    );
+    expect(counts).toMatchObject({
+      withRetainedText: 4,
+      withAcceptedCard: 1,
+      neverAttempted: 3,
+      counters: { extractedCount: 1 },
+      drift: { extractedCount: 0 },
+    });
   });
 });

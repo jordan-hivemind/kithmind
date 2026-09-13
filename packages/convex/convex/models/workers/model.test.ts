@@ -1424,6 +1424,108 @@ describe("filesystem discovery reservation and admission", () => {
     );
   });
 
+  // P2-80f: `needs_review` on a scan entry means identity review, the state
+  // the pipeline's `identity_recovery` mode answers. A processing failure is
+  // not an identity question and must never produce one, or every normal pass
+  // seals `needs_review` and the source loops forever without completing.
+  async function rescanUnchangedAfterPriorWork(
+    f: Awaited<ReturnType<typeof fixture>>,
+    patch: {
+      state: "failed" | "needs_review";
+      attempts?: number;
+      retryable?: boolean;
+      failureCode?: string;
+      nextAttemptAt?: number;
+    },
+  ) {
+    await completeInitialScan(f);
+    const workId = await f.t.run(async (ctx) => {
+      const work = await ctx.db.query("workerDiscoveryWork").unique();
+      if (!work) throw new Error("missing discovery work");
+      await ctx.db.patch(work._id, patch);
+      return work._id;
+    });
+    const scan = await begin(f, "begin-rescan", 1, "normal", 2_000);
+    const page = await append(
+      f,
+      scan.scanId,
+      "page-rescan",
+      [readyEntry()],
+      2_100,
+    );
+    const sealed = await seal(
+      f,
+      scan.scanId,
+      "seal-rescan",
+      1,
+      { status: "healthy" },
+      2_200,
+    );
+    const [work, entry] = await f.t.run(async (ctx) => {
+      const scanId = ctx.db.normalizeId("workerSourceScans", scan.scanId);
+      if (!scanId) throw new Error("invalid scan result");
+      return await Promise.all([
+        ctx.db.get(workId),
+        ctx.db
+          .query("workerScanEntries")
+          .withIndex("by_scanId", (q) => q.eq("scanId", scanId))
+          .unique(),
+      ]);
+    });
+    return { entry, sealed, work, workId };
+  }
+
+  test("retries a retryable discovery failure on the next scan", async () => {
+    const f = await fixture();
+    const { entry, sealed, work, workId } = await rescanUnchangedAfterPriorWork(
+      f,
+      {
+        state: "failed",
+        attempts: 2,
+        retryable: true,
+        failureCode: "conversion_failed",
+        nextAttemptAt: 1_500,
+      },
+    );
+    expect(entry?.state).toBe("queued");
+    expect(entry?.discoveryWorkId).toBe(workId);
+    expect(sealed.state).toBe("sealed");
+    expect(work?.state).toBe("failed");
+    expect(work?.attempts).toBe(2);
+  });
+
+  test("settles an exhausted discovery failure as unchanged", async () => {
+    const f = await fixture();
+    const { entry, sealed, work, workId } = await rescanUnchangedAfterPriorWork(
+      f,
+      {
+        state: "failed",
+        attempts: 8,
+        retryable: false,
+        failureCode: "page_limit_exceeded",
+      },
+    );
+    expect(entry?.state).toBe("unchanged");
+    expect(entry?.observationEpoch).toBe(1);
+    expect(entry?.processingEpoch).toBe(1);
+    expect(entry?.discoveryWorkId).toBe(workId);
+    expect(sealed.state).toBe("sealed");
+    // The failure record survives: it is what `requeueFailedDiscoveryWork`
+    // acts on and what the assessment reports as needing review.
+    expect(work?.state).toBe("failed");
+    expect(work?.failureCode).toBe("page_limit_exceeded");
+    expect(work?.scanEntryId).toBe(entry?._id);
+  });
+
+  test("keeps asking for identity review while prior work needs review", async () => {
+    const f = await fixture();
+    const { entry, sealed } = await rescanUnchangedAfterPriorWork(f, {
+      state: "needs_review",
+    });
+    expect(entry?.state).toBe("needs_review");
+    expect(sealed.state).toBe("needs_review");
+  });
+
   test("forget scrubs admitted operation receipts and immutable history", async () => {
     const f = await fixture();
     await completeReservableScan(f);

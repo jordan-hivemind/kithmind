@@ -1,11 +1,11 @@
+import { createHash } from "node:crypto";
 import { inflateRawSync } from "node:zlib";
 
 import {
-  MAX_SHEET_COLUMNS,
-  MAX_SHEET_ROWS,
   renderSheetPage,
   sheetCellText,
   SHEET_PAGE_RENDERING_VERSION,
+  SPREADSHEET_V1_BOUNDS,
 } from "@repo/worker-protocol";
 
 /**
@@ -37,7 +37,11 @@ export type SpreadsheetErrorCode =
   | "encrypted"
   /** A shape this reader does not decode: ZIP64, an unknown compression. */
   | "unsupported"
-  /** Past a declared bound: too many sheets, columns, or page characters. */
+  /**
+   * Past a declared `spreadsheet_v1` bound: the workbook's own bytes, its
+   * sheet count, a row or column index, one sheet's page characters, or the
+   * total rendered text a parsed text version could hold.
+   */
   | "oversized";
 
 export class SpreadsheetError extends Error {
@@ -51,14 +55,70 @@ function fail(code: SpreadsheetErrorCode): never {
   throw new SpreadsheetError(code);
 }
 
-/** A parsed text version holds at most 64 pages, so at most 64 sheets. */
-export const MAX_SHEETS = 64;
-
-/** The parsed-page validator's own text bound. */
-export const MAX_SHEET_PAGE_CHARS = 65_536;
+/**
+ * The `spreadsheet_v1` class's measured bounds, stated once in the protocol
+ * both sides read. `MAX_SHEETS` equals the parsed text version's page ceiling
+ * and `MAX_SHEET_PAGE_CHARS` the parsed-page validator's own text bound.
+ */
+export const {
+  maxSheets: MAX_SHEETS,
+  maxSheetPageChars: MAX_SHEET_PAGE_CHARS,
+  maxWorkbookBytes: MAX_WORKBOOK_BYTES,
+  maxRenderedBytes: MAX_RENDERED_BYTES,
+  maxRowsPerSheet: MAX_SHEET_ROWS,
+  maxColumnsPerSheet: MAX_SHEET_COLUMNS,
+} = SPREADSHEET_V1_BOUNDS;
 
 /** Per XML part, inflated. A workbook part past this is refused, not grown. */
 const MAX_PART_BYTES = 8 * 1_024 * 1_024;
+
+/**
+ * P2-70i3: the reader's version constant, and the parser identity derived
+ * from it.
+ *
+ * The PDF class takes its parser fingerprint from a pinned Python runtime and
+ * a hashed model manifest. This reader has neither: it is this file, running
+ * in the worker's own process. What can change what it produces from the same
+ * bytes is this version string, the rendering rule it renders under, and the
+ * bounds it refuses past, so those three are what the fingerprint covers.
+ * Bump `SPREADSHEET_READER_VERSION` whenever the rendering changes, which
+ * changes the fingerprint, which makes every affected document a new
+ * processing generation rather than a silent reinterpretation of an old one.
+ */
+export const SPREADSHEET_READER_VERSION = "kithmind_xlsx_reader_v1";
+
+function readerDigest(domain: string, value: unknown): string {
+  return createHash("sha256")
+    .update(`${domain}\0`, "utf8")
+    .update(JSON.stringify(value), "utf8")
+    .digest("hex");
+}
+
+export const SPREADSHEET_PARSER_FINGERPRINT = readerDigest(
+  "kith-spreadsheet-parser:v1",
+  [
+    "spreadsheet_v1",
+    SPREADSHEET_READER_VERSION,
+    SHEET_PAGE_RENDERING_VERSION,
+    SPREADSHEET_V1_BOUNDS,
+  ],
+);
+
+export const SPREADSHEET_EXTRACTION_CONFIGURATION_FINGERPRINT = readerDigest(
+  "kith-spreadsheet-extraction-config:v1",
+  [SPREADSHEET_PARSER_FINGERPRINT, SHEET_PAGE_RENDERING_VERSION],
+);
+
+/**
+ * The archived-binary lane records a `modelManifestSha256` for every parser
+ * output. A lane with no model assets still has to fill it, so it carries the
+ * digest of the reader's version constant: the thing that plays the manifest's
+ * role here, which is naming what produced the bytes.
+ */
+export const SPREADSHEET_READER_MANIFEST_SHA256 = readerDigest(
+  "kith-spreadsheet-reader-manifest:v1",
+  SPREADSHEET_READER_VERSION,
+);
 
 const LOCAL_HEADER_SIGNATURE = 0x04034b50;
 const CENTRAL_HEADER_SIGNATURE = 0x02014b50;
@@ -323,6 +383,7 @@ function sheetTargets(
  * style, or the order a map was built in.
  */
 export function readWorkbook(bytes: Buffer): Workbook {
+  if (bytes.length > MAX_WORKBOOK_BYTES) fail("oversized");
   const entries = indexZip(bytes);
   const workbookXml = readPart(bytes, entries, "xl/workbook.xml");
   const relsXml = readPart(bytes, entries, "xl/_rels/workbook.xml.rels");
@@ -339,6 +400,7 @@ export function readWorkbook(bytes: Buffer): Workbook {
   if (sheets.length > MAX_SHEETS) fail("oversized");
 
   const pages: SpreadsheetPage[] = [];
+  let renderedBytes = 0;
   for (const [ordinal, sheet] of sheets.entries()) {
     const sheetXml = readPart(bytes, entries, sheet.part);
     if (sheetXml === undefined) fail("not_a_workbook");
@@ -367,6 +429,11 @@ export function readWorkbook(bytes: Buffer): Workbook {
     }
     const text = renderSheetPage({ name: sheet.name, rows, columnCount });
     if (text.length > MAX_SHEET_PAGE_CHARS) fail("oversized");
+    // A workbook whose sheets each fit but whose total does not cannot be
+    // sealed as one parsed text version, so it is refused here rather than
+    // rendered and then rejected by the seal.
+    renderedBytes += Buffer.byteLength(text, "utf8");
+    if (renderedBytes > MAX_RENDERED_BYTES) fail("oversized");
     pages.push({
       ordinal,
       sheetName: sheetCellText(sheet.name),

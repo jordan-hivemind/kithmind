@@ -264,6 +264,31 @@ posted-activity count, the row-level dates, `keyAccount`, `activity`,
 `fxLocalAmount`, `fxMarketRate`, `fxType`) are retained for evidence and later
 use -- `parse()` does not read them yet.
 
+F1-8i measured what two of those retained dates are actually worth as a cash
+posting date, because the cash gate's residual failures looked like a posting
+date the archive does not hold. Neither is one, so neither is mapped:
+
+| Fact | Count |
+| --- | --- |
+| retained activity rows carrying a `payDate` key | 50,700 |
+| of those, rows stating a `payDate` value | **0** |
+| retained rows stating an `activityDate` | 50,700 of 50,700 |
+| `activityDate` later than the row's cash-effective date | 63 |
+| `activityDate` on the same day | 27,973 |
+| `activityDate` earlier | 22,829 |
+
+`payDate` is a field this provider sends empty on every row captured so far,
+not a field the allowlist forgot: the projection writes a key only when the
+response carries one, so a key present and `null` came that way. `activityDate`
+is stated on every row and points the wrong way -- the misplaced rows need a
+*later* date. Preferring it in the gate flips 0 failing periods to a pass and
+breaks between 8 and 296 passing ones depending on how it is combined. The
+evidence and the next study are in `@repo/finance-archive`'s README, under
+"No posting date to import".
+
+Keep both declared. Retaining a field the provider leaves empty costs nothing
+and the day it starts arriving populated, the bytes will already have it.
+
 `runningBalances` is confirmed as a scalar (a JSON number), so it is retained
 directly rather than guessed at as a nested object.
 
@@ -707,6 +732,8 @@ cash at all, not which way.
 | Redemption                 | yes  | yes | negative | A maturing or called instrument pays out and retires the position. |
 | Exchange Deliver Out       | no   | yes | negative | In-kind delivery out; the position leaves, no cash crosses.       |
 | Exchange Received In       | no   | yes | positive | In-kind receipt; the position arrives, no cash crosses.           |
+| Transfer out of Account    | no   | yes | negative | The same in-kind journal, the site's other wording; delivery side (F1-8d). |
+| Transfer into Account      | no   | yes | positive | The same in-kind journal, the site's other wording; receipt side (F1-8d).  |
 | Option Expired             | no   | yes | negative | An expiring contract leaves the position with no settlement.      |
 | Dividend Stock             | no   | yes | positive | The dividend is paid in shares, so quantity moves and cash does not. |
 | Dividend                   | yes  | no  | none     | An income credit against a holding; no quantity changes.          |
@@ -722,6 +749,20 @@ cash at all, not which way.
 | Withdrawal                 | yes  | no  | none     | Cash leaving the account.                                         |
 | Contribution               | yes  | no  | none     | Cash entering the account.                                        |
 | Automated Payment          | yes  | no  | none     | A scheduled cash debit to a payee.                                |
+
+`Transfer out of Account`/`Transfer into Account` were reviewed from the
+owner's archive in F1-8d, in counts only. Every `Transfer out of Account` row
+pairs with a `Transfer into Account` row on a *different* account at the same
+date, instrument and magnitude, and none pairs within one account, so the two
+labels are the delivery and receipt sides of one in-kind journal between two
+accounts -- the same event `Exchange Deliver Out`/`Exchange Received In` spell
+the other way. The site states no quantity and no price on these rows, only the
+value journalled, and it was that value the cash gate was summing as cash: the
+delta of 17 failing periods equalled exactly the window's sum of these two
+types, and no passing period contained a non-zero sum of them. Declaring them
+`movesCash: false` nulls that value with a `cash_on_noncash_activity` review
+item per row rather than dropping it silently, which is the point: the amount
+is real, it is just not cash.
 
 Load-bearing assumption for `Dividend Reinvestment`: the site is assumed to
 book a reinvested dividend as two rows -- the credit under `Dividend` or

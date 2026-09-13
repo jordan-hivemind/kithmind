@@ -922,6 +922,138 @@ test(
   },
 );
 
+// F1-8a. The hosted archive holds 49 (account, as_of) dates with two
+// `balances` rows stating different cash: a per-period statement and,
+// separately, a document that bundles many periods (an incidental second
+// capture of the same date, e.g. a combined historical export) each state
+// their own cash for the same day, and disagree. `row_hash` includes `cash`
+// (balanceHash), so the two rows never collide there and both insert; ground
+// rule 5 forbids the importer or the gate from silently picking one
+// (reconciliation.ts's `reconcilePeriod` already refuses to reconcile a
+// contradicted period). This test is the "record both, with a note" half of
+// that decision: the second document's disagreement is named in a review
+// item at import time, naming the earlier document and its cash, without
+// changing which rows land in `balances` or how the gate reconciles them.
+test(
+  "two documents stating different cash at the same account and date both insert, and the second opens a review item naming the first",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+
+    const first = document("16".padEnd(64, "0"), [], {
+      balances: [
+        {
+          asOf: "2026-03-31",
+          totalValueText: "10000",
+          totalValueNote: null,
+          cash: "500",
+          currency: "USD",
+          periodStartValue: null,
+          periodEndValue: "10000",
+          sourceLocator: "holdings:balance-a",
+        },
+      ],
+    });
+    const second = document("17".padEnd(64, "0"), [], {
+      balances: [
+        {
+          asOf: "2026-03-31",
+          totalValueText: "10250",
+          totalValueNote: null,
+          cash: "725",
+          currency: "USD",
+          periodStartValue: null,
+          periodEndValue: "10250",
+          sourceLocator: "holdings:balance-b",
+        },
+      ],
+    });
+
+    await importBatch(
+      client,
+      { source: "synthetic-pull", documents: [first] },
+      NOW,
+    );
+    const summary = await importBatch(
+      client,
+      { source: "synthetic-pull", documents: [second] },
+      NOW,
+    );
+
+    assert.equal(summary.rowsInserted, 1);
+    assert.equal(summary.reviewItemsOpened, 1);
+    assert.equal(await count(client, "balances"), 2);
+
+    const review = await one(
+      client,
+      "SELECT reason, raw_value FROM review_items WHERE kind = 'balance_cash_conflict'",
+    );
+    assert.match(review.reason, /disagrees with 500/);
+    assert.match(review.reason, /neither is picked/);
+    assert.equal(review.raw_value, "725");
+  },
+);
+
+test(
+  "two documents stating the same cash at the same account and date open no conflict review item",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+
+    const first = document("18".padEnd(64, "0"), [], {
+      balances: [
+        {
+          asOf: "2026-03-31",
+          totalValueText: "10000",
+          totalValueNote: null,
+          cash: "500",
+          currency: "USD",
+          periodStartValue: null,
+          periodEndValue: "10000",
+          sourceLocator: "holdings:balance-a",
+        },
+      ],
+    });
+    // Same cash, different total_value: a different row_hash (so it still
+    // inserts as its own row), but not a cash disagreement.
+    const second = document("19".padEnd(64, "0"), [], {
+      balances: [
+        {
+          asOf: "2026-03-31",
+          totalValueText: "10001",
+          totalValueNote: null,
+          cash: "500",
+          currency: "USD",
+          periodStartValue: null,
+          periodEndValue: "10001",
+          sourceLocator: "holdings:balance-b",
+        },
+      ],
+    });
+
+    await importBatch(
+      client,
+      { source: "synthetic-pull", documents: [first] },
+      NOW,
+    );
+    const summary = await importBatch(
+      client,
+      { source: "synthetic-pull", documents: [second] },
+      NOW,
+    );
+
+    assert.equal(summary.rowsInserted, 1);
+    assert.equal(summary.reviewItemsOpened, 0);
+    assert.equal(await count(client, "balances"), 2);
+    assert.equal(
+      await count(client, "review_items", "WHERE kind = 'balance_cash_conflict'"),
+      0,
+    );
+  },
+);
+
 // F1-49. A parse-noted document is never eligible for the whole-document
 // skip (see the parsed_ok test above and importBatch's parseNote branch), so
 // every rerun reprocesses it in full -- which, before row_hash existed on
@@ -1331,9 +1463,14 @@ async function countQueries(client, body) {
  * A statement of `n` holdings and `n` transactions, every one distinct --
  * including across two statements of different sizes, so the comparison below
  * measures batching rather than one statement deduplicating against the
- * other.
+ * other. `asOf` differs between the two call sites for the same reason
+ * (F1-8a): the importer now checks a new balance's (account, as_of) against
+ * what is already on file, and two synthetic statements sharing both the
+ * account and the date would otherwise flag each other's distinct cash as a
+ * cross-document conflict and open review items, which is real behavior but
+ * not what this test measures.
  */
-function statement(sha256, n) {
+function statement(sha256, n, asOf = "2026-03-31") {
   const rows = [];
   const positions = [];
   const balances = [];
@@ -1351,7 +1488,7 @@ function statement(sha256, n) {
       position({ sourceLocator: `holdings:${k}`, quantity: `${k + 1}` }),
     );
     balances.push({
-      asOf: "2026-03-31",
+      asOf,
       totalValueText: `${1000 + k}`,
       totalValueNote: null,
       cash: `${k}`,
@@ -1385,14 +1522,14 @@ test(
     const small = await countQueries(client, () =>
       importBatch(
         client,
-        { source: "synthetic-pull", documents: [statement("c".repeat(64), 10)] },
+        { source: "synthetic-pull", documents: [statement("c".repeat(64), 10, "2026-03-31")] },
         NOW,
       ),
     );
     const large = await countQueries(client, () =>
       importBatch(
         client,
-        { source: "synthetic-pull", documents: [statement("d".repeat(64), 200)] },
+        { source: "synthetic-pull", documents: [statement("d".repeat(64), 200, "2026-06-30")] },
         NOW,
       ),
     );
@@ -1411,5 +1548,128 @@ test(
       large.queries > 5 && large.queries < 30,
       `expected a bounded per-document round trip count, got ${large.queries}`,
     );
+  },
+);
+
+// --- F1-8b: amount_base/fx_rate/amount_base_rounding ------------------------
+//
+// ACCOUNT's base_currency is USD (seed()). A foreign-currency row's own
+// amount stays in its own currency; amount_base is what the cash gate can
+// sum across accounts/periods once it is populated here at import.
+
+test(
+  "F1-8b: a stated base-currency amount is used verbatim, never rounded",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+
+    await importBatch(
+      client,
+      {
+        source: "synthetic-pull",
+        documents: [
+          document("a".repeat(64), [
+            row({
+              providerTxnId: "ptx-1",
+              currency: "EUR",
+              amountText: "-100.00",
+              // The statement itself states the USD-equivalent amount.
+              amountBaseText: "-108.35",
+              fxRateText: "1.0835",
+            }),
+          ]),
+        ],
+      },
+      NOW,
+    );
+
+    const stored = await one(
+      client,
+      `SELECT amount::text AS amount, currency, amount_base::text AS amount_base,
+              fx_rate::text AS fx_rate, amount_base_rounding
+         FROM transactions WHERE provider_txn_id = 'ptx-1'`,
+    );
+    assert.equal(stored.amount, "-100");
+    assert.equal(stored.currency, "EUR");
+    // Verbatim: not re-derived from amount * fx_rate (which would also be
+    // -108.35 here, so a rate-derivation bug rounding it differently would
+    // not be caught by this assertion alone; the next test exercises that).
+    assert.equal(stored.amount_base, "-108.35");
+    assert.equal(stored.fx_rate, "1.0835");
+    assert.equal(stored.amount_base_rounding, "none");
+  },
+);
+
+test(
+  "F1-8b: an amount and a stated FX rate derive amount_base, rounded half_even",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+
+    // -100 * 1.08345 = -108.345 exactly: a genuine tie at the second decimal
+    // place. Round-half-up would give -108.35; half_even rounds to the even
+    // neighbor, -108.34, which is the assertion below -- proof this is
+    // actually half_even and not some other rule that happens to agree with
+    // it on non-tied inputs.
+    await importBatch(
+      client,
+      {
+        source: "synthetic-pull",
+        documents: [
+          document("b".repeat(64), [
+            row({
+              providerTxnId: "ptx-1",
+              currency: "EUR",
+              amountText: "-100",
+              fxRateText: "1.08345",
+            }),
+          ]),
+        ],
+      },
+      NOW,
+    );
+
+    const stored = await one(
+      client,
+      `SELECT amount_base::text AS amount_base, fx_rate::text AS fx_rate,
+              amount_base_rounding
+         FROM transactions WHERE provider_txn_id = 'ptx-1'`,
+    );
+    assert.equal(stored.amount_base, "-108.34");
+    assert.equal(stored.fx_rate, "1.08345");
+    assert.equal(stored.amount_base_rounding, "half_even");
+  },
+);
+
+test(
+  "F1-8b: a foreign-currency row with neither a stated base amount nor a rate leaves amount_base null",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+
+    await importBatch(
+      client,
+      {
+        source: "synthetic-pull",
+        documents: [
+          document("c".repeat(64), [
+            row({ providerTxnId: "ptx-1", currency: "EUR", amountText: "-100.00" }),
+          ]),
+        ],
+      },
+      NOW,
+    );
+
+    const stored = await one(
+      client,
+      `SELECT amount_base, fx_rate, amount_base_rounding
+         FROM transactions WHERE provider_txn_id = 'ptx-1'`,
+    );
+    assert.equal(stored.amount_base, null);
+    assert.equal(stored.fx_rate, null);
+    assert.equal(stored.amount_base_rounding, null);
   },
 );

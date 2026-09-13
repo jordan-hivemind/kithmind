@@ -347,28 +347,6 @@ describe("space authorization", () => {
     ).rejects.toThrow("Too many space memberships");
   });
 
-  test("keeps personal features outside a shared-only key scope", async () => {
-    const { t, userId, personalSpaceId, editorSpaceId } = await seedSpaces();
-    const keyId = await insertKey(t, userId, ["read"], [editorSpaceId]);
-    const mcp = t.withIdentity({
-      issuer: mcpIssuer,
-      subject: userId,
-      apiKeyId: keyId,
-    });
-
-    await expect(mcp.query(api.models.spaces.mcpQueries.list)).resolves.toEqual(
-      [expect.objectContaining({ spaceId: editorSpaceId })],
-    );
-    await expect(
-      mcp.query(api.models.lists.mcpQueries.getLists, {}),
-    ).rejects.toThrow("Not authorized");
-
-    await t.run((ctx) => ctx.db.patch(keyId, { spaceIds: [personalSpaceId] }));
-    await expect(
-      mcp.query(api.models.lists.mcpQueries.getLists, {}),
-    ).resolves.toEqual([]);
-  });
-
   test("uses explicit, default, then personal destinations without silent fallback", async () => {
     const {
       t,

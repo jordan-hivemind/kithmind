@@ -136,6 +136,8 @@ export type ProcessingCounts = {
     ready: number;
     pending: number;
     failed: number;
+    /** P2-80h: settled parse failures. Counted, never blocking `complete`. */
+    parked: number;
     needsReview: number;
     explicitGap: number;
     unavailable: number;
@@ -362,7 +364,6 @@ function strictStatus(value: WorkerResponse): SourceStatus {
       items.pending !== 0 ||
       items.failed !== 0 ||
       items.needsReview !== 0 ||
-      items.explicitGap !== 0 ||
       items.unavailable !== 0 ||
       unresolvedEntries.needsReview !== 0
     ) {

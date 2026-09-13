@@ -101,6 +101,9 @@ const ACTIVITY_SIGN_TABLE = new Map([
   // In-kind movement between accounts, one direction each.
   ["Exchange Deliver Out", -1],
   ["Exchange Received In", 1],
+  // The same in-kind journal under the site's other wording (F1-8d).
+  ["Transfer out of Account", -1],
+  ["Transfer into Account", 1],
   // An expiring contract leaves the position.
   ["Option Expired", -1],
   // Shares paid as the dividend itself.
@@ -135,6 +138,15 @@ const ACTIVITY_TAXONOMY = {
   // In-kind: the position moves, no cash crosses the account boundary.
   "Exchange Deliver Out": { movesCash: false, movesQuantity: true, quantitySign: "negative" },
   "Exchange Received In": { movesCash: false, movesQuantity: true, quantitySign: "positive" },
+  // F1-8d. The same in-kind journal, spelled the site's other way. Every one
+  // of these rows the owner's archive holds pairs with a row of the opposite
+  // wording on a *different* account at the same date, instrument and
+  // magnitude, and none pairs within one account: the position crosses an
+  // account boundary and no cash crosses anything. The stated `amount` is the
+  // value journalled, not a cash movement, which is why counting it as cash
+  // was the whole of 17 failing cash-gate periods.
+  "Transfer out of Account": { movesCash: false, movesQuantity: true, quantitySign: "negative" },
+  "Transfer into Account": { movesCash: false, movesQuantity: true, quantitySign: "positive" },
   "Option Expired": { movesCash: false, movesQuantity: true, quantitySign: "negative" },
   "Dividend Stock": { movesCash: false, movesQuantity: true, quantitySign: "positive" },
 
@@ -274,6 +286,36 @@ export function resolveRowCurrency(rawCcy) {
     currency: BASE_CURRENCY,
     currencyProblem: `missing or non-three-letter CCY: ${JSON.stringify(rawCcy)}`,
   };
+}
+
+/**
+ * F1-8b/F1-38. This row's FX rate, when the activity API states one that
+ * actually applies to it -- decimal text for `ParsedRow.fxRate`, which the
+ * generic importer (`resolveAmountBase`, `@repo/finance-archive`'s
+ * importer.ts) multiplies against the already-signed `amount` to derive
+ * `amount_base`, rounded half_even and recorded as such.
+ *
+ * Deliberately never `ParsedRow.amountBase` directly, even though the API
+ * also retains `fxSourceAmount` (README, "Retention"): that field is an
+ * *unsigned* magnitude ("108.35", never "-108.35"), and the account's
+ * base-currency equivalent of a disbursement needs the disbursement's own
+ * sign, which nothing in `fxSourceAmount` states. `fxMarketRate` has no such
+ * gap -- it is a ratio, not a signed amount, so multiplying it by the
+ * already-correctly-signed `amount` this row already resolved carries the
+ * sign through correctly with no separate assumption. `fxLocalCurrency` is
+ * checked against this row's own resolved `currency` first: a rate stated
+ * for a currency this row is not even denominated in is not this row's rate,
+ * and amount_base stays honestly unpopulated rather than applying it anyway.
+ */
+export function resolveFxRate(item, currency) {
+  if (currency === BASE_CURRENCY) return null;
+  if (item.fxLocalCurrency !== currency) return null;
+  if (item.fxMarketRate === null || item.fxMarketRate === undefined) return null;
+  try {
+    return canonicalizeDecimal(String(item.fxMarketRate));
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -961,6 +1003,10 @@ function parseStructuredApi(bytes) {
         quantity: resolveSignedQuantity(item.activity, item.quantity ?? null),
         price: item.price === null || item.price === undefined ? null : canonicalizeDecimal(String(item.price)),
         currency,
+        // F1-8b/F1-38. See resolveFxRate: recorded whenever it applies to
+        // this row, so the archive's cash gate can convert this row into
+        // the account's base currency instead of refusing to sum it.
+        fxRate: resolveFxRate(item, currency),
         // runningBalances is retained in the raw bytes (ACTIVITY_RETENTION)
         // now that it is confirmed a scalar, but not yet surfaced as
         // ParsedRow.runningBalance in v1 -- deferred, not blocked.

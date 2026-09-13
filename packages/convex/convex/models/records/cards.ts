@@ -5,7 +5,6 @@ import { internalMutation, type MutationCtx } from "../../_generated/server";
 import { markEligibilityTargets } from "../embeddings/model";
 import { digestProcessingConfiguration } from "../ingestion/hash";
 import {
-  MAX_GENERATION_DOCUMENTS,
   stageCardEvidenceSpans,
   sweepCardEvidenceSpans,
   type CardEvidenceRef,
@@ -22,6 +21,7 @@ import { CARD_PRICE_TABLE_VERSION } from "./cardRunner";
 import {
   cardEventKey,
   cardObservationKey,
+  isAnchorProvenField,
   isCardRecordKind,
   requireCardEventSchema,
   type CardRecordKind,
@@ -30,7 +30,7 @@ import { probeFieldEvidence, stageRecordBatch } from "./model";
 import { nextRecordActivationTime } from "./querySessions";
 import { observationValueValidator } from "./valueValidators";
 import type { ObservationValue } from "./values";
-import type { CardDocTypePatch, StagedObservation } from "./validators";
+import type { StagedObservation } from "./validators";
 
 const MAX_FINGERPRINT_PART_BYTES = 64;
 
@@ -294,16 +294,21 @@ export async function publishDocumentCard(
   // every cited span must resolve in the sealed retained text of the
   // generation that holds it and recompute to its stored `quoteHash`. The
   // anchor and every field are proved before anything is written, and the
-  // proved span text is what the normalizers then read.
+  // proved span text is what the normalizers then read. Decision 1 of P2-82:
+  // an anchor-proven field (`card_kind`) is excluded here, since its
+  // evidence is the anchor's, already checked below, and no span of its own
+  // is required or read.
   const probe = await probeFieldEvidence(ctx, {
     spaceId: input.spaceId,
     processingGenerationId: base._id,
     fields: [
       { key: "", evidenceSpanIds: input.anchorEvidenceSpanIds },
-      ...input.fields.map((field) => ({
-        key: cardFieldKey(field),
-        evidenceSpanIds: field.evidenceSpanIds,
-      })),
+      ...input.fields
+        .filter((field) => !isAnchorProvenField(input.recordKind, field.field))
+        .map((field) => ({
+          key: cardFieldKey(field),
+          evidenceSpanIds: field.evidenceSpanIds,
+        })),
     ],
   });
   const evidenceCodes = new Map(
@@ -532,20 +537,24 @@ export async function publishDocumentCard(
   const cardKindField = storable.find(
     (field) => field.field === "card_kind" && field.value.type === "text",
   );
-  const docTypePatch =
+  const cardDocType =
     cardKindField && cardKindField.value.type === "text"
-      ? await planDocTypePatch(ctx, {
-          spaceId: input.spaceId,
-          base,
-          appliedDocType: cardKindField.value.value,
-        })
-      : [];
+      ? cardKindField.value.value
+      : undefined;
 
+  // Decision 1 of P2-82: an anchor-proven field's own `evidenceSpanIds` is
+  // never read (it may well be empty), but every stored observation still
+  // requires non-empty evidence at the record store's own boundary
+  // (`assertEventInputShape`), so its evidence is the anchor's: already
+  // resolved above, and the literal citation of what proves the card is this
+  // kind at all.
   const observations: StagedObservation[] = storable.map((field) => ({
     observationKey: cardFieldKey(field),
     observationType: field.field,
     value: field.value,
-    valueEvidence: field.evidenceSpanIds,
+    valueEvidence: isAnchorProvenField(input.recordKind, field.field)
+      ? input.anchorEvidenceSpanIds
+      : field.evidenceSpanIds,
   }));
   const staged = await stageRecordBatch(ctx, {
     spaceId: input.spaceId,
@@ -565,7 +574,6 @@ export async function publishDocumentCard(
           entity: input.anchorEvidenceSpanIds,
           eventType: input.anchorEvidenceSpanIds,
         },
-        ...(docTypePatch.length === 0 ? {} : { docTypePatch }),
         observations,
       },
     ],
@@ -586,7 +594,7 @@ export async function publishDocumentCard(
     item,
     processingGenerationId: generationId,
     now: input.now,
-    docTypePatch,
+    ...(cardDocType === undefined ? {} : { cardDocType }),
   });
 
   // Section 4.4, P2-70l. Binding runs after the card is accepted and active,
@@ -778,42 +786,77 @@ export const recordSkippedCardAttempt = internalMutation({
 });
 
 /**
- * Section 4.2: the accepted `card_kind` becomes `documents.docType` so type
- * filtering and the card cannot disagree. A card generation carries no
- * documents of its own, so the patch lands on the active text generation's
- * rows in place. It is planned before staging and recorded on the card
- * version, which is what a rollback restores from, and it is idempotent: a
- * row already carrying the accepted value is left alone.
+ * The run failed as a whole, so the row names the run rather than one of the
+ * card's fields. Not a declared card field, so it can never be mistaken for
+ * one in a per-field report.
  */
-async function planDocTypePatch(
+export const CARD_EXTRACTION_ERROR_FIELD_KEY = "card_extraction";
+
+/**
+ * P2-86. A ladder run that ended by raising instead of returning an outcome
+ * used to leave no row at all: the queue counted it and moved on, so the
+ * document was invisible to `list_review_queue` and `rerunGateFailed` could
+ * never re-offer it. This writes the two rows every other non-publishing
+ * outcome writes, so a raised run is exactly as visible as a gate rejection.
+ *
+ * The drop is an ordinary `card_gate_failed` row rather than a new drop kind:
+ * the review surface pages a drop class by `kind` against the closed
+ * `ReviewQueueClass` set and already reports each row's `code`, so a new kind
+ * would need a validator, a class and an MCP surface change to be visible at
+ * all, while `code` (one of `classifyQueueTickFailure`'s two closed codes)
+ * distinguishes it with none. `hasReviewItem` and `rerunGateFailed` then treat
+ * it correctly with no change either.
+ *
+ * `errorName` is the raised error's constructor name, never its message: a
+ * message is not guaranteed to be free of document content.
+ */
+export async function recordCardExtractionError(
   ctx: MutationCtx,
   input: {
-    spaceId: Id<"spaces">;
-    base: Doc<"processingGenerations">;
-    appliedDocType: string;
+    sourceItemId: Id<"sourceItems">;
+    recordKind: CardRecordKind;
+    fingerprint: CardExtractionFingerprint;
+    errorCode: string;
+    errorName?: string;
+    now: number;
   },
-): Promise<CardDocTypePatch> {
-  const documents = await ctx.db
-    .query("documents")
-    .withIndex("by_processingGenerationId", (q) =>
-      q.eq("processingGenerationId", input.base._id),
-    )
-    .take(MAX_GENERATION_DOCUMENTS + 1);
-  if (documents.length > MAX_GENERATION_DOCUMENTS) {
-    throw new Error("Card document generation exceeds the document bound");
-  }
-  return documents
-    .filter(
-      (row) =>
-        row.spaceId === input.spaceId &&
-        row.publicationState === "active" &&
-        row.docType !== input.appliedDocType,
-    )
-    .map((row) => ({
-      documentId: row._id,
-      ...(row.docType === undefined ? {} : { previousDocType: row.docType }),
-      appliedDocType: input.appliedDocType,
-    }));
+): Promise<{ recorded: boolean }> {
+  const item = await ctx.db.get(input.sourceItemId);
+  // Never raises: this runs inside the queue's own failure path, where a
+  // second raise would abandon the claimed document all over again.
+  if (!item || !item.activeGenerationId) return { recorded: false };
+  await recordAttempt(ctx, {
+    spaceId: item.spaceId,
+    sourceAccountId: item.sourceAccountId,
+    sourceItemId: item._id,
+    recordKind: input.recordKind,
+    fingerprint: input.fingerprint,
+    now: input.now,
+    // The run produced no candidate, so no field passed, dropped or failed
+    // the gate; `failureCodes` carries the closed error code instead, which
+    // is what tells this row apart from a real gate rejection at this step.
+    outcome: "review",
+    passedFieldCount: 0,
+    droppedFieldCount: 0,
+    failures: [{ key: CARD_EXTRACTION_ERROR_FIELD_KEY, code: input.errorCode }],
+  });
+  await recordDrops(ctx, {
+    spaceId: item.spaceId,
+    sourceAccountId: item.sourceAccountId,
+    sourceItemId: item._id,
+    processingGenerationId: item.activeGenerationId,
+    recordKind: input.recordKind,
+    now: input.now,
+    kind: "card_gate_failed",
+    drops: [
+      {
+        key: CARD_EXTRACTION_ERROR_FIELD_KEY,
+        code: input.errorCode,
+        reason: input.errorName ?? input.errorCode,
+      },
+    ],
+  });
+  return { recorded: true };
 }
 
 /**
@@ -830,7 +873,8 @@ async function activateCardGeneration(
     item: Doc<"sourceItems">;
     processingGenerationId: Id<"processingGenerations">;
     now: number;
-    docTypePatch: CardDocTypePatch;
+    /** Section 4.2: the accepted `card_kind`, absent when the card has none. */
+    cardDocType?: string;
   },
 ): Promise<number> {
   const states = await ctx.db
@@ -879,23 +923,23 @@ async function activateCardGeneration(
     state: "ready",
     activatedAt,
   });
-  for (const patch of input.docTypePatch) {
-    const document = await ctx.db.get(patch.documentId);
-    if (
-      !document ||
-      document.spaceId !== input.spaceId ||
-      document.publicationState !== "active"
-    ) {
-      throw new Error("Card docType target is no longer active");
-    }
-    await ctx.db.patch(patch.documentId, { docType: patch.appliedDocType });
-  }
   // The text generation, its documents and its chunks are untouched, so every
   // chunk target id and vector stays valid. Only the item's own card target
   // moves, and its identity is the card event, so an unchanged card keeps its
   // vector across this supersession (section 8.1, I3).
+  //
+  // Section 4.2, P2-80i: the accepted `card_kind` is recorded here, on the
+  // item, and every document read overlays it. An earlier implementation
+  // patched `documents.docType` of the active text generation in place, but
+  // that row is part of the sealed parsed payload and its `docType` is inside
+  // `manifest.documentDigest`, so the patch made `verifySealedParsedPayload`
+  // fail (and `stageDocuments` report a conflicting immutable document) for
+  // every document a card had refined.
   await ctx.db.patch(input.item._id, {
     activeCardGenerationId: input.processingGenerationId,
+    ...(input.cardDocType === undefined
+      ? {}
+      : { cardDocType: input.cardDocType }),
   });
   await markEligibilityTargets(ctx, input.spaceId, {
     sourceItemIds: [input.item._id],

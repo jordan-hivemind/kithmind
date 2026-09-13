@@ -820,7 +820,20 @@ test(
     await seedPg(client);
 
     const acquired = buildTabularPull("f1-19 undeclared activity type");
-    const rows = [activityRow({ activityType: "unknown_type", amount: "-50.00" })];
+    const rows = [
+      // F1-8e. Dated on (never after) the balance below it anchors, so this
+      // fixture's own acquired history reaches back far enough that the
+      // coverage-gap rule does not turn the period this test checks into an
+      // unverified one instead of the pass it is testing for. A declared
+      // type with a zero amount: no review item of its own, no effect on
+      // the cash sum either way.
+      activityRow({
+        processDate: "2025-01-01",
+        activityType: "fee",
+        amount: "0",
+      }),
+      activityRow({ activityType: "unknown_type", amount: "-50.00" }),
+    ];
 
     const documents = await adapterPullToImportDocuments(client, {
       institutionId: INSTITUTION.id,
@@ -873,8 +886,8 @@ test(
     // as it always did.
     const stored = await one(
       client,
-      "SELECT amount::text AS amount FROM transactions WHERE account_id = $1",
-      [ACCOUNT.id],
+      "SELECT amount::text AS amount FROM transactions WHERE account_id = $1 AND activity_type = $2",
+      [ACCOUNT.id, "unknown_type"],
     );
     // Canonical decimal form drops trailing fraction zeros (decimal.ts).
     assert.equal(stored.amount, "-50");
@@ -1341,6 +1354,15 @@ test(
 
     const acquired = buildTabularPull("f1-19 cash on noncash activity");
     const rows = [
+      // F1-8e. Dated on (never after) the balance below it anchors, so this
+      // fixture's own acquired history reaches back far enough that the
+      // coverage-gap rule does not turn the period this test checks into an
+      // unverified one instead of the pass it is testing for.
+      activityRow({
+        processDate: "2025-01-01",
+        activityType: "fee",
+        amount: "0",
+      }),
       activityRow({ activityType: "transfer_in_kind", amount: "100.00" }),
     ];
 
@@ -1353,6 +1375,7 @@ test(
       docDate: "2025-02-01",
       persisted: persist(t, acquired, "tabular_export"),
       activityTaxonomy: {
+        fee: { movesCash: true, movesQuantity: false, quantitySign: "none" },
         transfer_in_kind: {
           movesCash: false,
           movesQuantity: false,
@@ -1381,8 +1404,8 @@ test(
     // to whatever value would make the period balance.
     const stored = await one(
       client,
-      "SELECT amount FROM transactions WHERE account_id = $1",
-      [ACCOUNT.id],
+      "SELECT amount FROM transactions WHERE account_id = $1 AND activity_type = $2",
+      [ACCOUNT.id, "transfer_in_kind"],
     );
     assert.equal(stored.amount, null);
 

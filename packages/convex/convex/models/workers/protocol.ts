@@ -1,4 +1,13 @@
 import {
+  BINARY_CLASSES,
+  isBinaryClass,
+  isBinaryParserOutputMediaType,
+  type BinaryMediaType,
+  type BinaryParserOutputMediaType,
+  type BinaryParserProfileId,
+} from "@repo/worker-protocol";
+
+import {
   assertParsedRequestSize,
   MAX_PARSED_PAGE_BATCH,
   MAX_PARSED_ROW_BATCH,
@@ -128,8 +137,8 @@ export type FsDiscoveryEntry = {
         status: "ready_binary_v1";
         sha256: string;
         byteLength: number;
-        mediaType: "application/pdf";
-        parserProfileId: "pdf_docqa_v1";
+        mediaType: BinaryMediaType;
+        parserProfileId: BinaryParserProfileId;
         parserFingerprint: string;
         extractionConfigurationFingerprint: string;
         extractorFingerprint: string;
@@ -293,6 +302,14 @@ export type WorkerRequest =
       requestId: string;
       identity: ArchivedWorkIdentity;
       failureCode: string;
+      /**
+       * P2-80g: the client has spent its own bounded parse budget on this
+       * document (`MAX_PARSE_ATTEMPTS` in the pipeline's archive catalog) and
+       * will not offer it again. The server's larger attempt bound then stops
+       * mattering: the failure is terminal because nobody is going to retry
+       * it. Absent means "the client may try again".
+       */
+      exhausted?: boolean;
     })
   | (WorkerSourceRequest & {
       operation: "discovery.reserveArchived";
@@ -310,7 +327,7 @@ export type WorkerRequest =
             clientArtifactId: string;
             parserOutputHash: string;
             parserOutputByteLength: number;
-            parserOutputMediaType: "application/vnd.docling+json";
+            parserOutputMediaType: BinaryParserOutputMediaType;
             parsedText: ParsedTextDeclaration;
           };
     })
@@ -445,6 +462,15 @@ export type ProcessingAssessmentCounts = {
     ready: number;
     pending: number;
     failed: number;
+    /**
+     * P2-80h: a document whose processing failed for good (a work row or job
+     * failed with `retryable: false`). It is parked, not in review: nothing
+     * retries it, its `sourceInventory` row stays `parse_failed`, and
+     * `list_review_queue` lists it. A parked document does not keep the source
+     * `incomplete`, so this count is how a reader sees that `complete` does
+     * not mean everything parsed.
+     */
+    parked: number;
     needsReview: number;
     explicitGap: number;
     unavailable: number;
@@ -1201,9 +1227,19 @@ function discoveryEntry(value: unknown, mode: "normal" | "identity_recovery") {
       ],
       ["permissionsRestricted", "encryptionRevision"],
     );
+    // P2-70i2: one of the closed binary classes, and the media type must be
+    // that class's own. A PDF declared as a workbook, or a workbook declared
+    // as a PDF, is refused here rather than admitted and mis-parsed later.
+    if (!isBinaryClass(contentInput.parserProfileId, contentInput.mediaType)) {
+      invalid();
+    }
+    const parserProfileId: BinaryParserProfileId = contentInput.parserProfileId;
+    // P2-77's permissions-restriction fields describe the PDF security
+    // handler and mean nothing for any other class.
     if (
-      contentInput.mediaType !== "application/pdf" ||
-      contentInput.parserProfileId !== "pdf_docqa_v1"
+      parserProfileId !== "pdf_docqa_v1" &&
+      (contentInput.permissionsRestricted !== undefined ||
+        contentInput.encryptionRevision !== undefined)
     ) {
       invalid();
     }
@@ -1224,9 +1260,13 @@ function discoveryEntry(value: unknown, mode: "normal" | "identity_recovery") {
     content = {
       status: "ready_binary_v1",
       sha256: string(contentInput.sha256, { maxUtf16: 64, pattern: SHA256 }),
-      byteLength: integer(contentInput.byteLength, 1, 16 * 1_024 * 1_024),
-      mediaType: "application/pdf",
-      parserProfileId: "pdf_docqa_v1",
+      byteLength: integer(
+        contentInput.byteLength,
+        1,
+        BINARY_CLASSES[parserProfileId].maxOriginalBytes,
+      ),
+      mediaType: BINARY_CLASSES[parserProfileId].mediaType,
+      parserProfileId,
       parserFingerprint: string(contentInput.parserFingerprint, {
         maxUtf16: 64,
         pattern: SHA256,
@@ -1301,21 +1341,23 @@ function archivedWorkIdentity(value: unknown): ArchivedWorkIdentity {
     "chunkerFingerprint",
     "correctionRevision",
   ]);
-  if (
-    input.mediaType !== "application/pdf" ||
-    input.parserProfileId !== "pdf_docqa_v1"
-  ) {
+  if (!isBinaryClass(input.parserProfileId, input.mediaType)) {
     return invalid();
   }
+  const parserProfileId: BinaryParserProfileId = input.parserProfileId;
   return {
     sourceItemId: string(input.sourceItemId, { maxUtf16: 256 }),
     scanId: scanId(input.scanId),
     observationEpoch: epoch(input.observationEpoch),
     processingEpoch: epoch(input.processingEpoch),
     contentHash: string(input.contentHash, { maxUtf16: 64, pattern: SHA256 }),
-    byteLength: integer(input.byteLength, 1, 16 * 1_024 * 1_024),
-    mediaType: "application/pdf",
-    parserProfileId: "pdf_docqa_v1",
+    byteLength: integer(
+      input.byteLength,
+      1,
+      BINARY_CLASSES[parserProfileId].maxOriginalBytes,
+    ),
+    mediaType: BINARY_CLASSES[parserProfileId].mediaType,
+    parserProfileId,
     parserFingerprint: string(input.parserFingerprint, {
       maxUtf16: 64,
       pattern: SHA256,
@@ -1359,7 +1401,11 @@ function parserArtifactSelection(value: unknown): ParserArtifactSelection {
     "outputMediaType",
     "createdAt",
   ]);
-  if (input.outputMediaType !== "application/vnd.docling+json") invalid();
+  // One of the closed set. Which one this work may use is checked against the
+  // discovery work's own class in `resolveParserArtifact`, where the class is
+  // known; this request carries a work id, not a profile.
+  if (!isBinaryParserOutputMediaType(input.outputMediaType)) invalid();
+  const outputMediaType: BinaryParserOutputMediaType = input.outputMediaType;
   return {
     kind: "create",
     clientArtifactId: string(input.clientArtifactId, {
@@ -1368,7 +1414,7 @@ function parserArtifactSelection(value: unknown): ParserArtifactSelection {
     }),
     outputHash: string(input.outputHash, { maxUtf16: 64, pattern: SHA256 }),
     outputByteLength: integer(input.outputByteLength, 1, 64 * 1_024 * 1_024),
-    outputMediaType: "application/vnd.docling+json",
+    outputMediaType,
     createdAt: epoch(input.createdAt),
   };
 }
@@ -1990,12 +2036,11 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
         }),
       };
     case "discovery.failArchived":
-      exactKeys(input, [
-        ...baseKeys,
-        "requestId",
-        "identity",
-        "failureCode",
-      ]);
+      exactKeys(
+        input,
+        [...baseKeys, "requestId", "identity", "failureCode"],
+        ["exhausted"],
+      );
       return {
         ...base,
         operation: "discovery.failArchived",
@@ -2005,6 +2050,9 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
           maxUtf16: 64,
           pattern: PARSER_FAILURE_CODE,
         }),
+        ...(input.exhausted === undefined
+          ? {}
+          : { exhausted: optionalBoolean(input.exhausted) }),
       };
     case "discovery.reserveArchived":
       exactKeys(input, [...baseKeys, "requestId", "identity"]);
@@ -2036,9 +2084,15 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
         "parserOutputMediaType",
         "parsedText",
       ]);
-      if (lookup.parserOutputMediaType !== "application/vnd.docling+json") {
+      // P2-70i3: one of the closed set. Which one this work may use is not
+      // decided here: the lookup compares the type against the artifact the
+      // class already accepted, so a workbook lookup cannot match a docling
+      // artifact and the reverse cannot either.
+      if (!isBinaryParserOutputMediaType(lookup.parserOutputMediaType)) {
         invalid();
       }
+      const lookupOutputMediaType: BinaryParserOutputMediaType =
+        lookup.parserOutputMediaType;
       return {
         ...base,
         operation: "discovery.lookupArchivedAdmission",
@@ -2059,7 +2113,7 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
             1,
             64 * 1_024 * 1_024,
           ),
-          parserOutputMediaType: "application/vnd.docling+json",
+          parserOutputMediaType: lookupOutputMediaType,
           parsedText: parsedTextDeclaration(lookup.parsedText),
         },
       };

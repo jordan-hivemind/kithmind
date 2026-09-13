@@ -65,6 +65,23 @@ function row(accountId, overrides = {}) {
   };
 }
 
+/**
+ * F1-8e. A transaction dated on (never after) an account's first stated
+ * balance, so a fixture's own acquired history reaches back far enough that
+ * the coverage-gap rule does not flag its first period as unverified. Every
+ * window is half-open on its start, so a row dated exactly on the first
+ * balance's `as_of` still contributes nothing to any period's sum: this
+ * anchor is here purely to satisfy coverage, not to move a total.
+ */
+function anchorRow(accountId, asOf, providerTxnId) {
+  return row(accountId, {
+    providerTxnId,
+    sourceLocator: "row:anchor",
+    processDate: asOf,
+    amountText: "0",
+  });
+}
+
 function document(sha256, accountId, rows, overrides = {}) {
   return {
     sha256,
@@ -109,6 +126,7 @@ test(
         source: "synthetic-pull",
         documents: [
           document("a".repeat(64), "acct_gamma", [
+            anchorRow("acct_gamma", "2026-03-01", "ptx-anchor"),
             row("acct_gamma", { providerTxnId: "ptx-1", amountText: "400.00" }),
           ]),
         ],
@@ -169,6 +187,7 @@ test(
         source: "synthetic-pull",
         documents: [
           document("b".repeat(64), "acct_delta", [
+            anchorRow("acct_delta", "2026-03-01", "ptx-anchor"),
             row("acct_delta", { providerTxnId: "ptx-1", amountText: "500.00" }),
           ]),
         ],
@@ -223,6 +242,7 @@ test(
         source: "synthetic-pull",
         documents: [
           document("c".repeat(64), "acct_zeta", [
+            anchorRow("acct_zeta", "2026-03-01", "ptx-anchor"),
             row("acct_zeta", {
               providerTxnId: "ptx-1",
               processDate: "2026-03-05",
@@ -294,6 +314,7 @@ test(
         source: "synthetic-pull",
         documents: [
           document("d".repeat(64), "acct_theta", [
+            anchorRow("acct_theta", "2026-06-01", "ptx-anchor"),
             row("acct_theta", {
               providerTxnId: "ptx-1",
               activityType: "dividend",
@@ -416,6 +437,7 @@ test(
         source: "synthetic-pull",
         documents: [
           document("e".repeat(64), "acct_kappa", [
+            anchorRow("acct_kappa", "2026-03-01", "ptx-anchor"),
             row("acct_kappa", { providerTxnId: "ptx-1", amountText: "400.00" }),
           ]),
         ],
@@ -559,6 +581,7 @@ test(
         source: "synthetic-pull",
         documents: [
           document("d".repeat(64), "acct_settle", [
+            anchorRow("acct_settle", "2026-03-31", "ptx-anchor"),
             // Settles before it posts: the money is not in the account until
             // it posts, so this belongs to the April period, not the one
             // ending 2026-04-03.
@@ -686,6 +709,7 @@ test(
         source: "synthetic-pull",
         documents: [
           document("f".repeat(64), "acct_dup", [
+            anchorRow("acct_dup", "2026-03-31", "ptx-anchor"),
             row("acct_dup", {
               providerTxnId: "ptx-1",
               processDate: "2026-04-15",
@@ -739,6 +763,16 @@ test(
       `INSERT INTO reconciliations
          (id, account_id, period_start, period_end, currency, tolerance, status)
        VALUES ('v_vanished', 'acct_vanish', '2025-11-30', '2025-12-31', 'USD', 0, 'fail')`,
+    );
+
+    // F1-8e. On (never after) the first balance's own date, so this
+    // fixture's acquired history reaches back far enough that the new
+    // coverage-gap rule does not turn the period this test actually checks
+    // into an unverified one instead of the pass it is testing for.
+    await client.query(
+      `INSERT INTO transactions
+         (id, account_id, process_date, activity_type, description, amount, currency, row_hash, imported_at)
+       VALUES ('txn_vanish_anchor', 'acct_vanish', '2026-01-31', 'credit', 'Synthetic anchor', 0, 'USD', 'hash_vanish_anchor', now())`,
     );
 
     const summary = await runReconciliationGate(client);
@@ -815,5 +849,203 @@ test(
       1,
       "B's stale row survives: B was never in this run's scope",
     );
+  },
+);
+
+// --- F1-8b: the cash gate sums amount_base for a foreign-currency row ------
+//
+// Every account here is USD-based (seedAccount's own default). A row in the
+// account's own currency sums its `amount` unchanged; a row in any other
+// currency needs `amount_base` -- populated at import (importer.ts's
+// resolveAmountBase) -- to be counted at all.
+
+test(
+  "F1-8b: a foreign-currency row's amount_base is summed alongside same-currency rows, not its own-currency amount",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedInstitution(client);
+    await seedAccount(client, "acct_fx_pass", "0501");
+    await insertBalance(client, {
+      id: "bal_1",
+      accountId: "acct_fx_pass",
+      asOf: "2026-03-01",
+      cash: "1000",
+    });
+    await insertBalance(client, {
+      id: "bal_2",
+      accountId: "acct_fx_pass",
+      asOf: "2026-03-31",
+      cash: "1500",
+    });
+
+    await importBatch(
+      client,
+      {
+        source: "synthetic-pull",
+        documents: [
+          document("a".repeat(64), "acct_fx_pass", [
+            anchorRow("acct_fx_pass", "2026-03-01", "ptx-anchor"),
+            row("acct_fx_pass", {
+              providerTxnId: "ptx-1",
+              amountText: "300.00",
+            }),
+            // The EUR amount itself (182.00) is never summed directly; only
+            // its stated USD equivalent is. If the gate summed 182 instead of
+            // 200 here, this period would fail (300 + 182 = 482 != 500).
+            row("acct_fx_pass", {
+              providerTxnId: "ptx-2",
+              sourceLocator: "row:2",
+              currency: "EUR",
+              amountText: "182.00",
+              amountBaseText: "200.00",
+            }),
+          ]),
+        ],
+      },
+      NOW,
+    );
+
+    const summary = await runReconciliationGate(client);
+    assert.equal(summary.periodsChecked, 1);
+    assert.equal(summary.passed, 1);
+    assert.equal(summary.failed, 0);
+    assert.equal(summary.unverified, 0);
+    assert.equal(summary.outcomes[0].expectedChange, "500");
+    assert.equal(summary.outcomes[0].computedChange, "500");
+  },
+);
+
+test(
+  "F1-8b: a foreign-currency row with no amount_base leaves its period unverified, not failed",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedInstitution(client);
+    await seedAccount(client, "acct_fx_gap", "0502");
+    await insertBalance(client, {
+      id: "bal_1",
+      accountId: "acct_fx_gap",
+      asOf: "2026-03-01",
+      cash: "1000",
+    });
+    await insertBalance(client, {
+      id: "bal_2",
+      accountId: "acct_fx_gap",
+      asOf: "2026-03-31",
+      cash: "1500",
+    });
+
+    await importBatch(
+      client,
+      {
+        source: "synthetic-pull",
+        documents: [
+          document("b".repeat(64), "acct_fx_gap", [
+            anchorRow("acct_fx_gap", "2026-03-01", "ptx-anchor"),
+            row("acct_fx_gap", {
+              providerTxnId: "ptx-1",
+              amountText: "300.00",
+            }),
+            // No amountBaseText and no fxRateText: nothing to convert this
+            // row into the account's USD, so the period stays unverified
+            // rather than either guessing at a rate or silently excluding
+            // real money from the sum.
+            row("acct_fx_gap", {
+              providerTxnId: "ptx-2",
+              sourceLocator: "row:2",
+              currency: "EUR",
+              amountText: "182.00",
+            }),
+          ]),
+        ],
+      },
+      NOW,
+    );
+
+    const summary = await runReconciliationGate(client);
+    assert.equal(summary.periodsChecked, 1);
+    assert.equal(summary.passed, 0);
+    assert.equal(summary.failed, 0);
+    assert.equal(summary.unverified, 1);
+    assert.match(summary.outcomes[0].notes, /EUR/);
+    assert.match(summary.outcomes[0].notes, /amount_base/);
+  },
+);
+
+// --- F1-8e: coverage gap -----------------------------------------------
+//
+// The cash twin of the position gate's own coverage-gap rule: a period whose
+// stated balances reach further back than the account's acquired activity is
+// unverified, not failed. Zero occurrences on the hosted archive today, so
+// every other test in this file is unaffected -- each one's fixture already
+// anchors its account's history at or before the first period it checks
+// (see `anchorRow`); this is the one case that deliberately does not.
+
+test(
+  "F1-8e: a period whose stated balances reach further back than acquired activity is unverified, not failed",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedInstitution(client);
+    await seedAccount(client, "acct_history_gap", "0503");
+    await insertBalance(client, {
+      id: "bal_1",
+      accountId: "acct_history_gap",
+      asOf: "2020-01-31",
+      cash: "1000",
+    });
+    await insertBalance(client, {
+      id: "bal_2",
+      accountId: "acct_history_gap",
+      asOf: "2020-02-29",
+      cash: "1200",
+    });
+
+    // The only activity ever acquired for this account starts years after
+    // the period above: acquired history does not reach the account's
+    // stated balances, which is the gap this rule measures. Under the old
+    // rule (no coverage check) this period would fail (expected 200, summed
+    // 0); the point of this test is that it does not.
+    await importBatch(
+      client,
+      {
+        source: "synthetic-pull",
+        documents: [
+          document("c".repeat(64), "acct_history_gap", [
+            row("acct_history_gap", {
+              providerTxnId: "ptx-1",
+              processDate: "2024-06-01",
+              amountText: "50.00",
+            }),
+          ]),
+        ],
+      },
+      new Date("2024-06-02T00:00:00.000Z"),
+    );
+
+    const summary = await runReconciliationGate(client);
+    assert.equal(summary.periodsChecked, 1);
+    assert.equal(summary.passed, 0);
+    assert.equal(summary.failed, 0);
+    assert.equal(summary.unverified, 1);
+    assert.equal(summary.coverageGaps.length, 1);
+    assert.equal(summary.coverageGaps[0].accountId, "acct_history_gap");
+    assert.equal(summary.coverageGaps[0].firstStatedBalanceAsOf, "2020-01-31");
+    assert.equal(
+      summary.coverageGaps[0].transactionHistoryStartsAt,
+      "2024-06-01",
+    );
+    assert.equal(summary.coverageGaps[0].periodsUnverified, 1);
+    // expectedChange is still reported -- the coverage gap is about whether
+    // the derived change can explain it, not about hiding the stated one.
+    assert.equal(summary.outcomes[0].expectedChange, "200");
+    assert.match(summary.outcomes[0].notes, /acquired transaction history begins 2024-06-01/);
+
+    const stored = await one(
+      client,
+      "SELECT status FROM reconciliations WHERE account_id = 'acct_history_gap'",
+    );
+    assert.equal(stored.status, "unverified");
   },
 );

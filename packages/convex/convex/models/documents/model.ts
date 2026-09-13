@@ -241,6 +241,29 @@ async function loadReadableDocument(
   return { item, revision, textVersion, generation, account };
 }
 
+/**
+ * Section 4.2 of docs/plans/2026-09-12-document-cards.md: a document's type is
+ * the accepted `card_kind` of the item's live card when there is one, and the
+ * parser's own `documents.docType` otherwise, so type filtering and the card
+ * cannot disagree.
+ *
+ * P2-80i: the card kind is read from the item here rather than written onto the
+ * document row. `documents` is part of the sealed parsed payload and its
+ * `docType` is inside `manifest.documentDigest`, so patching the row in place
+ * made `verifySealedParsedPayload` fail for every document a card had refined.
+ * Only an active document takes the overlay; a historical row keeps the type
+ * its own generation parsed, which is what the card patch did too.
+ */
+export function effectiveDocType(
+  document: Doc<"documents">,
+  item: Doc<"sourceItems">,
+): string | undefined {
+  return document.publicationState === "active" &&
+    item.cardDocType !== undefined
+    ? item.cardDocType
+    : document.docType;
+}
+
 async function originalRecoveryStatus(
   ctx: Pick<QueryCtx, "db">,
   generation: Doc<"processingGenerations">,
@@ -569,7 +592,6 @@ export async function searchDocuments(
           document.publicationState !== "active") ||
       (resultCountByDocument.get(document._id) ?? 0) >=
         MAX_RESULTS_PER_DOCUMENT ||
-      (args.docType !== undefined && document.docType !== args.docType) ||
       !inTimeRange(document.capturedAt, args.from, args.to)
     ) {
       continue;
@@ -585,6 +607,10 @@ export async function searchDocuments(
       chainCache.set(document._id, chain);
     }
     if (!chain) continue;
+    // The type filter compares the effective type, which the card overlays, so
+    // it needs the chain's item and runs after the chain loads.
+    const docType = effectiveDocType(document, chain.item);
+    if (args.docType !== undefined && docType !== args.docType) continue;
     // Citations for a card hit resolve to the card's own evidence spans,
     // which were staged over this same sealed text version.
     const citationResult = await hydrateCitations(
@@ -621,7 +647,7 @@ export async function searchDocuments(
       cardEventId: card?.eventId,
       cardGenerationId: card?.cardGenerationId,
       title: document.title,
-      docType: document.docType,
+      docType,
       capturedAt: document.capturedAt,
       snippet: chunk ? chunk.text : card!.summary,
       historical: document.publicationState === "historical",
@@ -754,7 +780,7 @@ export async function getDocument(
     processingGenerationId: chain.generation._id,
     documentId: document._id,
     title: document.title,
-    docType: document.docType,
+    docType: effectiveDocType(document, chain.item),
     capturedAt: document.capturedAt,
     historical: document.publicationState === "historical",
     contentStatus: sourceStatus(

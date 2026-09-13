@@ -93,6 +93,34 @@ describe("card evidence gate", () => {
     expect(report.gateVersion).toBe(CARD_GATE_VERSION);
   });
 
+  test("card_kind passes with no span at all, proven by the anchor rather than a quote", () => {
+    const report = gateCard({
+      recordKind: "document_card",
+      fields: [
+        {
+          field: "card_kind",
+          value: { type: "text", value: "contract" },
+          spanTexts: [],
+        },
+      ],
+    });
+    expect(codeOf(report, "card_kind")).toBe("pass");
+  });
+
+  test("card_kind fails when the value is not one of the declared choices", () => {
+    const report = gateCard({
+      recordKind: "document_card",
+      fields: [
+        {
+          field: "card_kind",
+          value: { type: "text", value: "not a real kind" },
+          spanTexts: [],
+        },
+      ],
+    });
+    expect(codeOf(report, "card_kind")).toBe("value_not_normalizable");
+  });
+
   test("a wrong value on a correct span fails", () => {
     const report = gateCard({
       recordKind: "document_card",
@@ -183,6 +211,52 @@ describe("card evidence gate", () => {
       ],
     });
     expect(codeOf(written, "instrument_date")).toBe("pass");
+  });
+
+  test("P2-82: the added common date renderings all normalize", () => {
+    const parses = (spanText: string, value: string): string =>
+      codeOf(
+        gateCard({
+          recordKind: "safe_note_card",
+          fields: [
+            ...safeNoteBase().filter(
+              (entry) => entry.field !== "instrument_date",
+            ),
+            field("instrument_date", { type: "date", value }, spanText),
+          ],
+        }),
+        "instrument_date",
+      );
+
+    // Long month name, with and without a comma (already covered by
+    // month_name_mdy, asserted here so the coverage is not accidental).
+    expect(parses("March 4, 2025", "2025-03-04")).toBe("pass");
+    expect(parses("March 4 2025", "2025-03-04")).toBe("pass");
+    // Abbreviated month name.
+    expect(parses("Mar 4, 2025", "2025-03-04")).toBe("pass");
+    // Day-first with a month name.
+    expect(parses("4 March 2025", "2025-03-04")).toBe("pass");
+    // ISO with a time, and with a timezone offset, both trimmed to the date.
+    expect(parses("2025-03-04T10:30:00Z", "2025-03-04")).toBe("pass");
+    expect(parses("2025-03-04T00:00:00-05:00", "2025-03-04")).toBe("pass");
+    // A two-digit year, unambiguous because only one reading (13 as the day)
+    // is a real calendar date; 13 can never be a month.
+    expect(parses("13/04/25", "2025-04-13")).toBe("pass");
+  });
+
+  test("P2-82: a two-digit year is ambiguous exactly like a four-digit one", () => {
+    const report = gateCard({
+      recordKind: "safe_note_card",
+      fields: [
+        ...safeNoteBase().filter((entry) => entry.field !== "instrument_date"),
+        field(
+          "instrument_date",
+          { type: "date", value: "2020-01-02" },
+          "01/02/20",
+        ),
+      ],
+    });
+    expect(codeOf(report, "instrument_date")).toBe("date_ambiguous");
   });
 
   test("money with grouping separators and a symbol normalizes and matches", () => {
@@ -458,5 +532,73 @@ describe("card evidence gate", () => {
       ],
     });
     expect(codeOf(lastFour, "account_identifier_last_four")).toBe("pass");
+  });
+
+  // P2-89. Historical cardFieldDrops rows carry `field_not_declared` and a
+  // `:0` key on a non-repeated field, both retired by PR180's shape repair
+  // in `parseCardRunnerCandidate`: an undeclared field or value type is
+  // dropped before the gate ever sees it, and a non-repeated field never
+  // carries an ordinal. These fixtures pin that a correctly shaped candidate
+  // never resurfaces either artifact at the gate.
+  describe("P2-89: retired drop artifacts do not resurface", () => {
+    test("a correctly shaped document_card candidate never fails field_not_declared", () => {
+      const report = gateCard({
+        recordKind: "document_card",
+        fields: [
+          field("card_kind", { type: "text", value: "contract" }, "n/a"),
+          field("card_title", { type: "text", value: "A Title" }, "A Title"),
+          field(
+            "card_date",
+            { type: "date", value: "2025-03-04" },
+            "2025-03-04",
+          ),
+          field(
+            "card_summary",
+            { type: "text", value: "A summary" },
+            "A summary",
+          ),
+          field(
+            "card_party",
+            { type: "text", value: "Northwind Supply" },
+            "Northwind Supply",
+            { ordinal: 0 },
+          ),
+        ],
+      });
+      expect(
+        report.results.some(
+          (result) =>
+            result.status === "fail" && result.code === "field_not_declared",
+        ),
+      ).toBe(false);
+    });
+
+    test("document_card's non-repeated fields never carry a :0 ordinal artifact in their key", () => {
+      const report = gateCard({
+        recordKind: "document_card",
+        fields: [
+          field("card_kind", { type: "text", value: "contract" }, "n/a"),
+          field("card_title", { type: "text", value: "A Title" }, "A Title"),
+          field(
+            "card_date",
+            { type: "date", value: "2025-03-04" },
+            "2025-03-04",
+          ),
+          field(
+            "card_summary",
+            { type: "text", value: "A summary" },
+            "A summary",
+          ),
+        ],
+      });
+      const keys = report.results.map((result) => result.key);
+      expect(keys).toEqual([
+        "card_kind",
+        "card_title",
+        "card_date",
+        "card_summary",
+      ]);
+      expect(keys.some((key) => key.endsWith(":0"))).toBe(false);
+    });
   });
 });
