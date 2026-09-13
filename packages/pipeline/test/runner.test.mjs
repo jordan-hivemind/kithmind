@@ -574,6 +574,8 @@ class CompleteCloud {
   constructor(options = {}) {
     this.failFirstStage = options.failFirstStage ?? false;
     this.stageFailed = false;
+    this.failAppendOnce = options.failAppendOnce ?? false;
+    this.appendAttempts = 0;
     this.scanId = "scan_1";
     this.inventoryEpoch = 0;
     this.manifestVersion = 0;
@@ -619,6 +621,15 @@ class CompleteCloud {
           reused: false,
         };
       case "scan.appendPage": {
+        if (this.failAppendOnce) {
+          this.appendAttempts += 1;
+          if (this.appendAttempts === 1) {
+            throw new Error("lost response after remote append commit");
+          }
+          if (this.appendAttempts === 2) {
+            return { error: { code: "scan_not_ready" } };
+          }
+        }
         const entries = request.entries.map((entry, index) => {
           assert.match(entry.externalId, /^[0-9a-f-]{36}$/);
           const item = `item_${request.ordinal}_${index}`;
@@ -1247,6 +1258,36 @@ test("replays an exact lost stage response and finishes while the root is offlin
       cloud.operations.filter((operation) => operation === "jobs.activate")
         .length,
       1,
+    );
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("abandons a scan_not_ready replay and starts a fresh scan in the same run", async () => {
+  const setup = await fixture(1);
+  const cloud = new CompleteCloud({ failAppendOnce: true });
+  let journal = await openJournal(setup.journalDir);
+  const first = await new PipelineRunner(
+    setup.config,
+    journal,
+    cloud,
+  ).runSafely();
+  assert.equal(first.state, "failed");
+  assert.equal(journal.pending?.operation, "scan.appendPage");
+  await journal.close();
+
+  journal = await openJournal(setup.journalDir);
+  try {
+    const second = await new PipelineRunner(setup.config, journal, cloud).run();
+    assert.equal(second.state, "complete");
+    assert.equal(second.published, 1);
+    assert.equal(journal.pending, undefined);
+    assert.equal(
+      cloud.operations.filter((operation) => operation === "scan.begin")
+        .length,
+      2,
     );
   } finally {
     await journal.close();
