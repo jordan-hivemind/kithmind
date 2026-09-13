@@ -39,6 +39,7 @@
     "test": "node --test test/*.test.mjs",
     "test:once": "node --test test/*.test.mjs",
     "mcp": "node dist/mcp/run.js",
+    "migrate": "node scripts/migrate.mjs",
     "import": "node dist/run.js"
   },
   "dependencies": {

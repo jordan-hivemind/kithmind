@@ -1,7 +1,7 @@
 # Shared finance read contract
 
-Status: implemented as a shared proof contract, tracked as P2-39. Gateway and
-storage adapter integration remain separate work.
+Status: implemented in the shared contract, PostgreSQL reader, and scoped web
+gateway. Deployment verification remains the F1-73 acceptance checkpoint.
 
 Finance needs one read boundary that can be implemented against either the
 current store or a relational proof without changing the meaning of amounts,
@@ -19,7 +19,8 @@ Owner priority, 2026-09-13. Financial-services queries are the first user use
 case. Deliver this finance-archive capability before advancing to the remaining
 general PostgreSQL feature milestones. Preserve in-flight query and coverage
 work, but its completion alone does not satisfy this first-use-case acceptance.
-This is planned work, not a claim about the deployed read surface.
+This section defines the deployed-read acceptance, not a claim that deployment
+verification has already passed.
 
 A fresh agent must be able to resolve an account by institution, last four digits
 and display label, then retrieve one dated holdings snapshot with meaningful
@@ -68,17 +69,20 @@ PostgreSQL consolidation alone must not be recorded as closing this usability ga
 
 ## Operations
 
-| Operation           | Result                                                     |
-| ------------------- | ---------------------------------------------------------- |
-| `list_transactions` | Transaction records with money and retained evidence       |
-| `list_holdings`     | Positions at a date with quantity and optional valuations  |
-| `list_balances`     | Account totals and optional cash balances                  |
-| `aggregate_money`   | Currency-safe totals with auditable contributors           |
-| `get_evidence`      | Retained source and indexed text references for one record |
-| `get_coverage`      | Explicit source, record-kind, and date coverage            |
+| Operation               | Result                                                     |
+| ----------------------- | ---------------------------------------------------------- |
+| `list_accounts`         | Authorized account discovery and disambiguation            |
+| `get_holdings_snapshot` | One exact or latest eligible named holdings snapshot       |
+| `list_transactions`     | Transaction records with money and retained evidence       |
+| `list_holdings`         | Positions at a date with quantity and optional valuations  |
+| `list_balances`         | Account totals and optional cash balances                  |
+| `aggregate_money`       | Currency-safe totals with auditable contributors           |
+| `get_evidence`          | Retained source and indexed text references for one record |
+| `get_coverage`          | Explicit source, record-kind, and date coverage            |
 
 Every request has contract version 1, a space ID, a limit from 1 through 100,
-and an optional opaque cursor. Operation-specific filters are closed. Unknown
+an optional opaque cursor, and an optional expected dataset revision.
+Operation-specific filters are closed. Unknown
 fields, sparse arrays, invalid dates, unsupported currencies, and malformed
 cursors fail validation.
 
@@ -176,7 +180,7 @@ server is responsible for choosing the latest eligible stored observation.
 - Canonical decimal normalization matches the archive's 38-digit and 18-scale
   policy. Noncanonical wire values, numeric inputs, exponents, and unsupported
   currencies fail closed.
-- Synthetic exchanges cover all six operations through the authorized paired
+- Synthetic exchanges cover all eight operations through the authorized paired
   validator.
 - Tests cover closed requests, trusted space authorization, pagination and
   revision binding, completeness invariants, evidence path and quote integrity,
@@ -197,3 +201,93 @@ and the `get_evidence` response is now `FinanceEvidence[]`, so a consumer must
 discriminate on `kind` before reading a locator. See
 [`2026-09-11-structured-evidence.md`](2026-09-11-structured-evidence.md) for
 the type, the format rules, and the validator table.
+
+## Update 2026-09-13: usable holdings snapshots
+
+F1-73 adds two operations to contract version 1. This is an additive extension.
+The original six operations retain their request and response meanings. In
+particular, `list_holdings.asOf` remains an upper bound over historical rows and
+does not become an exact-date selector. Existing unsigned cursors are invalidated
+as a security correction.
+
+`list_accounts` accepts normalized exact-match filters for institution name,
+account last four, and display label. It returns opaque account and source IDs,
+institution name, optional display label and account type, last four digits, and
+base currency. Its response reports `none`, `unique`, or `ambiguous` against the
+whole authorized match set. An ambiguous response is a prompt for
+disambiguation, not permission to select the first row. Full account numbers are
+never stored or returned.
+
+`get_holdings_snapshot` requires an account ID and one closed selector:
+
+- `{ "mode": "exact", "asOf": "YYYY-MM-DD" }` selects only that date.
+- `{ "mode": "latest", "onOrBefore": "YYYY-MM-DD" }` selects the greatest
+  eligible date. `onOrBefore` is optional.
+
+The response echoes the requested selector and reports either the one selected
+date or `not_found`. Every page is constrained to that selected date. Positions
+carry stable record and account IDs, supported currency, and an instrument
+identity state. A resolved or ambiguous instrument retains its opaque ID and
+available name and symbol. A missing identity has no invented ID. Open weak
+instrument-match review items produce `ambiguous`, not `resolved`.
+
+Each stored quantity or money field is either returned with evidence scoped to
+that field, or omitted with `not_reported`, `unsupported_value`, or
+`retained_evidence_unavailable`. An uncited financial value is never returned as
+usable data. Derived unrealized gain or loss is separately labeled with the
+formula `market_value_minus_cost_basis`; the validator recomputes it exactly.
+Stored unrealized gain or loss remains distinct when the source reports it.
+
+The whole-snapshot summary is bounded to 10,000 positions and 8 MiB of stored
+source-locator JSON. A page remains available when either summary bound is
+exceeded, and the response reports which bound prevented the whole-snapshot
+summary. Each page also reserves envelope space under the 512 KiB response
+ceiling. The summary reports instrument
+and quantity coverage and keeps market value, cost basis, stored unrealized, and
+derived unrealized subtotals separate by currency. Every metric includes
+contributing and missing counts. Aggregate precision overflow omits the amount
+and reports the issue instead of rounding. Stated account totals cite their
+balance record and evidence. Reconciliation uses the explicit formula
+`stated_account_total_minus_position_market_value`, which the validator checks
+with canonical decimal arithmetic. Missing or ambiguous totals and incomplete
+position coverage cannot produce a final reconciliation.
+
+All continuations are stateless HMAC-SHA256 tokens using a stable deployment
+secret of at least 32 bytes. The signed binding covers the authenticated
+principal, space, operation, normalized request and limit, dataset revision,
+selected snapshot date, sort key, and expiry. The optional
+`expectedDatasetRevision` may be added after page one without changing the query
+binding. A changed revision fails with `revision_changed`; a malformed, expired,
+replayed under another principal, or differently filtered cursor fails as an
+invalid request. A client must discard accumulated pages and restart after
+either failure.
+
+Migration 11 adds a singleton revision epoch and monotonic counter. Triggers run
+`BEFORE STATEMENT` for inserts, updates, deletes, and truncates on
+every table used by the read surface, including retained evidence. The counter
+update is transactional, so rollback restores the prior revision. Taking its row
+lock before table row locks also gives concurrent writers one lock order. A
+missing singleton fails the write rather than permitting an unrevisioned change.
+The reader fetches the epoch and counter in O(1) inside the same repeatable-read
+transaction as the response.
+
+Apply the migration with the owner connection in development first, then in the
+approved target:
+
+```
+pnpm --filter @repo/finance-archive build
+FINANCE_ARCHIVE_DATABASE_URL=postgresql://<owner>@<host>/<db> pnpm --filter @repo/finance-archive migrate
+```
+
+An existing reader role does not automatically gain access to a table created by
+a later migration. Grant only the new read needed by the revision query and keep
+the trigger function unavailable to `PUBLIC`:
+
+```
+GRANT SELECT ON <schema>.finance_read_revision TO <schema>_reader;
+REVOKE ALL ON FUNCTION <schema>.bump_finance_read_revision() FROM PUBLIC;
+```
+
+Do not rerun `scripts/provision.mjs` for this grant. That script calls
+`applyPgReaderRole` with a newly generated password and rotates the credential
+held by the gateway.

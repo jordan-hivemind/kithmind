@@ -11,11 +11,12 @@
 // is what keeps that last part true at the driver, before any of this code
 // sees a value.
 //
-// Two values configure the provider, and both must be present before a single
+// Three values configure the provider and must be present before a single
 // row is served:
 //
 //   FINANCE_ARCHIVE_READER_DATABASE_URL  the hosted archive, as the reader role
 //   FINANCE_ARCHIVE_SPACE_ID             the one space that archive holds
+//   FINANCE_ARCHIVE_CURSOR_SECRET        stable signing key for continuations
 //
 // The space id is not redundant configuration. The archive database has no
 // space column at all: it holds exactly one space's data and names that space
@@ -31,6 +32,8 @@ import { createArchivePool } from "@repo/finance-archive/store";
 import {
   authorizeFinanceReadRequest,
   FinanceContractError,
+  parseAuthorizedFinanceReadExchange,
+  type FinancePrincipalId,
   type FinanceReadRequest,
   type FinanceReadResponse,
 } from "@repo/finance-contract";
@@ -44,7 +47,10 @@ import {
  */
 export type FinanceArchiveAccess = {
   spaceId: string;
-  read(request: FinanceReadRequest): Promise<FinanceReadResponse>;
+  read(
+    request: FinanceReadRequest,
+    trusted: { principalId: FinancePrincipalId },
+  ): Promise<FinanceReadResponse>;
 };
 
 /**
@@ -66,13 +72,19 @@ async function readThroughReaderRole(
   url: string,
   spaceId: string,
   request: FinanceReadRequest,
+  principalId: FinancePrincipalId,
+  cursorSecret: string,
 ): Promise<FinanceReadResponse> {
   pool ??= createArchivePool(url);
   // `serveFinanceRead` runs its whole answer inside one REPEATABLE READ, READ
   // ONLY transaction, so it needs a client of its own rather than `pool.query`.
   const client = await pool.connect();
   try {
-    return await serveFinanceRead(client, request, spaceId);
+    return await serveFinanceRead(client, request, spaceId, {
+      principalId,
+      cursorSigningSecret: cursorSecret,
+      rawTreeRoot: null,
+    });
   } finally {
     client.release();
   }
@@ -90,9 +102,22 @@ export function resolveFinanceArchive(
   const url = env.FINANCE_ARCHIVE_READER_DATABASE_URL;
   const spaceId = env.FINANCE_ARCHIVE_SPACE_ID;
   if (!url || !spaceId) return null;
+  const cursorSecret = env.FINANCE_ARCHIVE_CURSOR_SECRET;
+  if (!cursorSecret || Buffer.byteLength(cursorSecret, "utf8") < 32) {
+    throw new Error(
+      "FINANCE_ARCHIVE_CURSOR_SECRET must contain at least 32 bytes",
+    );
+  }
   return {
     spaceId,
-    read: (request) => readThroughReaderRole(url, spaceId, request),
+    read: (request, trusted) =>
+      readThroughReaderRole(
+        url,
+        spaceId,
+        request,
+        trusted.principalId,
+        cursorSecret,
+      ),
   };
 }
 
@@ -133,5 +158,15 @@ export async function readFinanceArchive(
     principalId: trusted.principalId,
     authorizedSpaceIds: [archive.spaceId],
   });
-  return archive.read(authorized.request);
+  const response = await archive.read(authorized.request, {
+    principalId: authorized.principalId,
+  });
+  return parseAuthorizedFinanceReadExchange({
+    request: authorized.request,
+    response,
+    trustedContext: {
+      principalId: trusted.principalId,
+      authorizedSpaceIds: [archive.spaceId],
+    },
+  }).response;
 }

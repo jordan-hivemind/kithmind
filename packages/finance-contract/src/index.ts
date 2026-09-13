@@ -9,6 +9,29 @@ export const MAX_FINANCE_AGGREGATE_CONTRIBUTORS = 25;
 export const MAX_FINANCE_EVIDENCE_QUOTE_BYTES = 4096;
 export const MAX_FINANCE_REQUEST_BYTES = 16 * 1024;
 export const MAX_FINANCE_RESPONSE_BYTES = 512 * 1024;
+export const MAX_FINANCE_SNAPSHOT_SUMMARY_POSITIONS = 10_000;
+export const MAX_FINANCE_SNAPSHOT_SUMMARY_EVIDENCE_BYTES = 8 * 1024 * 1024;
+
+export const FINANCE_READ_REQUEST_DESCRIPTION =
+  "A closed finance read request. Every request requires contractVersion: 1, " +
+  "spaceId, operation, and limit from 1 through 100. Resolve an account before " +
+  "requesting holdings. Example: " +
+  '{"contractVersion":1,"spaceId":"space-synthetic-001","operation":"list_accounts","limit":10,"institutionName":"Example Broker","accountLast4":"1234","displayLabel":"Income"}. ' +
+  "Never guess an accountId. If matchStatus is ambiguous, show the candidates " +
+  "and require disambiguation. For one exact snapshot use: " +
+  '{"contractVersion":1,"spaceId":"space-synthetic-001","operation":"get_holdings_snapshot","limit":100,"accountId":"account-synthetic-001","snapshot":{"mode":"exact","asOf":"2026-07-31"}}. ' +
+  "For the latest eligible snapshot, use snapshot mode latest with optional " +
+  "onOrBefore. Exact mode never substitutes another date. To continue a page, " +
+  "send the same operation, filters, selector, and limit, add nextCursor as " +
+  "cursor, and add the response datasetRevision as expectedDatasetRevision. " +
+  "If the cursor is invalid or the revision changed, restart from page one.";
+
+export const FINANCE_READ_TOOL_DESCRIPTION =
+  "Read authorized finance data through bounded typed operations: " +
+  "list_accounts, get_holdings_snapshot, list_transactions, list_holdings, " +
+  "list_balances, aggregate_money, get_evidence, and get_coverage. " +
+  "The legacy list_holdings asOf field is an upper bound over historical rows; " +
+  "use get_holdings_snapshot for exact-date or latest-snapshot selection.";
 
 export const FINANCE_CURRENCY_REGISTRY_VERSION =
   "iso-4217-six-list-one-2026-01-p1" as const;
@@ -33,7 +56,7 @@ export const SUPPORTED_FINANCE_CURRENCIES = [
 const encoder = new TextEncoder();
 const SHA256 = /^[a-f0-9]{64}$/;
 const OPAQUE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
-const CURSOR = /^[A-Za-z0-9_-]{16,2048}$/;
+const CURSOR = /^[A-Za-z0-9._-]{16,2048}$/;
 const RELATIVE_SEGMENT = /^[^/\\\u0000-\u001f\u007f]{1,128}$/u;
 const MEDIA_TYPE =
   /^(?:application\/pdf|application\/json|text\/csv; charset=utf-8|text\/plain; charset=utf-8)$/;
@@ -44,7 +67,10 @@ const DECIMAL_INPUT = /^(-?)(\d+)(?:\.(\d+))?$/;
 const supportedCurrencies = new Set<string>(SUPPORTED_FINANCE_CURRENCIES);
 
 export type FinanceContractErrorCode =
-  "invalid_request" | "invalid_response" | "not_authorized";
+  | "invalid_request"
+  | "invalid_response"
+  | "not_authorized"
+  | "revision_changed";
 
 export class FinanceContractError extends Error {
   constructor(readonly code: FinanceContractErrorCode) {
@@ -198,6 +224,130 @@ export type FinanceBalanceRecord = {
   evidence: FinanceEvidence[];
 };
 
+export type FinanceAccountDescriptor = {
+  accountId: FinanceAccountId;
+  sourceId: FinanceSourceId;
+  institutionName: string;
+  accountLast4?: string;
+  displayLabel?: string;
+  accountType?: string;
+  baseCurrency: FinanceCurrency;
+};
+
+export type FinanceHoldingsSnapshotSelector =
+  { mode: "exact"; asOf: string } | { mode: "latest"; onOrBefore?: string };
+
+export type FinanceSnapshotValueField =
+  | "quantity"
+  | "price"
+  | "marketValue"
+  | "costBasis"
+  | "storedUnrealizedGainLoss";
+
+export type FinanceSnapshotFieldEvidence = {
+  field: FinanceSnapshotValueField;
+  evidence: FinanceEvidence[];
+};
+
+export type FinanceSnapshotFieldDisclosure = {
+  field: FinanceSnapshotValueField | "derivedUnrealizedGainLoss";
+  reason:
+    | "not_reported"
+    | "unsupported_value"
+    | "retained_evidence_unavailable"
+    | "precision_overflow";
+};
+
+export type FinanceSnapshotInstrument =
+  | {
+      status: "resolved" | "ambiguous";
+      instrumentId: FinanceInstrumentId;
+      name?: string;
+      symbol?: string;
+    }
+  | { status: "missing" };
+
+export type FinanceDerivedUnrealizedGainLoss = {
+  amount: FinanceMoney;
+  formula: "market_value_minus_cost_basis";
+};
+
+export type FinanceHoldingsSnapshotPosition = {
+  recordId: FinanceRecordId;
+  accountId: FinanceAccountId;
+  asOf: string;
+  currency: FinanceCurrency;
+  instrument: FinanceSnapshotInstrument;
+  valuationBasis?: FinanceHoldingRecord["valuationBasis"];
+  quantity?: CanonicalFinanceDecimal;
+  price?: FinanceMoney;
+  marketValue?: FinanceMoney;
+  costBasis?: FinanceMoney;
+  storedUnrealizedGainLoss?: FinanceMoney;
+  derivedUnrealizedGainLoss?: FinanceDerivedUnrealizedGainLoss;
+  fieldEvidence: FinanceSnapshotFieldEvidence[];
+  disclosures: FinanceSnapshotFieldDisclosure[];
+};
+
+export type FinanceSnapshotMetricSummary = {
+  amount?: FinanceMoney;
+  contributingPositionCount: number;
+  missingPositionCount: number;
+  issue?: "precision_overflow";
+};
+
+export type FinanceSnapshotStatedAccountTotal =
+  | {
+      status: "available";
+      amount: FinanceMoney;
+      balanceRecordId: FinanceRecordId;
+      evidence: FinanceEvidence[];
+    }
+  | {
+      status: "not_reported" | "retained_evidence_unavailable" | "ambiguous";
+    };
+
+export type FinanceSnapshotReconciliation =
+  | {
+      status: "match" | "difference";
+      difference: FinanceMoney;
+      formula: "stated_account_total_minus_position_market_value";
+    }
+  | {
+      status:
+        "incomplete" | "not_available" | "ambiguous" | "precision_overflow";
+    };
+
+export type FinanceSnapshotCurrencySummary = {
+  currency: FinanceCurrency;
+  positionCount: number;
+  marketValue: FinanceSnapshotMetricSummary;
+  costBasis: FinanceSnapshotMetricSummary;
+  storedUnrealizedGainLoss: FinanceSnapshotMetricSummary;
+  derivedUnrealizedGainLoss: FinanceSnapshotMetricSummary;
+  statedAccountTotal: FinanceSnapshotStatedAccountTotal;
+  reconciliation: FinanceSnapshotReconciliation;
+};
+
+export type FinanceHoldingsSnapshotSummary =
+  | {
+      status: "complete" | "partial";
+      positionCount: number;
+      resolvedInstrumentCount: number;
+      unresolvedInstrumentCount: number;
+      quantityCoverage: {
+        availablePositionCount: number;
+        missingPositionCount: number;
+      };
+      currencies: FinanceSnapshotCurrencySummary[];
+    }
+  | {
+      status: "unavailable";
+      reason: "position_limit" | "evidence_bytes_limit";
+      positionCount: number;
+      currencies: [];
+    };
+
 export type FinanceAggregateRecord = {
   currency: FinanceCurrency;
   accountId?: FinanceAccountId;
@@ -235,6 +385,10 @@ export type FinanceCoverageSummary =
         | "failed_import"
         | "unsupported_value"
         | "retained_evidence_unavailable"
+        | "missing_value"
+        | "unresolved_identity"
+        | "snapshot_summary_limit"
+        | "snapshot_summary_evidence_limit"
         | "stale_source"
       >;
     };
@@ -253,6 +407,16 @@ export type FinanceOutputIssue =
       code: "retained_evidence_unavailable";
       recordId: FinanceRecordId;
       evidence: FinanceEvidence[];
+    }
+  | {
+      code: "snapshot_summary_limit";
+      positionCount: number;
+      limit: typeof MAX_FINANCE_SNAPSHOT_SUMMARY_POSITIONS;
+    }
+  | {
+      code: "snapshot_summary_evidence_limit";
+      sourceLocatorBytes: number;
+      limit: typeof MAX_FINANCE_SNAPSHOT_SUMMARY_EVIDENCE_BYTES;
     };
 
 type PageRequest = {
@@ -260,6 +424,7 @@ type PageRequest = {
   spaceId: FinanceSpaceId;
   limit: number;
   cursor?: string;
+  expectedDatasetRevision?: FinanceDatasetRevision;
 };
 
 type DateFilters = {
@@ -280,6 +445,19 @@ export type ListHoldingsRequest = PageRequest & {
   sourceId?: FinanceSourceId;
   accountId?: FinanceAccountId;
   asOf?: string;
+};
+
+export type ListAccountsRequest = PageRequest & {
+  operation: "list_accounts";
+  institutionName?: string;
+  accountLast4?: string;
+  displayLabel?: string;
+};
+
+export type GetHoldingsSnapshotRequest = PageRequest & {
+  operation: "get_holdings_snapshot";
+  accountId: FinanceAccountId;
+  snapshot: FinanceHoldingsSnapshotSelector;
 };
 
 export type ListBalancesRequest = PageRequest &
@@ -312,6 +490,8 @@ export type GetCoverageRequest = PageRequest &
   };
 
 export type FinanceReadRequest =
+  | ListAccountsRequest
+  | GetHoldingsSnapshotRequest
   | ListTransactionsRequest
   | ListHoldingsRequest
   | ListBalancesRequest
@@ -340,6 +520,20 @@ export type ListTransactionsResponse =
 export type ListHoldingsResponse = FinanceReadResponseBase<"list_holdings"> & {
   items: FinanceHoldingRecord[];
 };
+export type ListAccountsResponse = FinanceReadResponseBase<"list_accounts"> & {
+  matchStatus: "none" | "unique" | "ambiguous";
+  totalMatches: number;
+  items: FinanceAccountDescriptor[];
+};
+export type GetHoldingsSnapshotResponse =
+  FinanceReadResponseBase<"get_holdings_snapshot"> & {
+    requestedSnapshot: FinanceHoldingsSnapshotSelector;
+    selectedSnapshot:
+      { status: "found"; asOf: string } | { status: "not_found" };
+    account: FinanceAccountDescriptor;
+    summary: FinanceHoldingsSnapshotSummary;
+    items: FinanceHoldingsSnapshotPosition[];
+  };
 export type ListBalancesResponse = FinanceReadResponseBase<"list_balances"> & {
   items: FinanceBalanceRecord[];
 };
@@ -356,6 +550,8 @@ export type GetCoverageResponse = FinanceReadResponseBase<"get_coverage"> & {
 };
 
 export type FinanceReadResponse =
+  | ListAccountsResponse
+  | GetHoldingsSnapshotResponse
   | ListTransactionsResponse
   | ListHoldingsResponse
   | ListBalancesResponse
@@ -522,6 +718,35 @@ function isoDate(value: unknown, code: FinanceContractErrorCode): string {
     31,
   ];
   if (month < 1 || month > 12 || day < 1 || day > days[month - 1]!) fail(code);
+  return result;
+}
+
+function normalizedLookupText(
+  value: unknown,
+  code: FinanceContractErrorCode,
+): string {
+  if (typeof value !== "string") fail(code);
+  const normalized = value
+    .normalize("NFKC")
+    .trim()
+    .replace(/\s+/gu, " ")
+    .toLocaleLowerCase("en-US");
+  if (
+    normalized.length === 0 ||
+    encoder.encode(normalized).byteLength > 256 ||
+    /[\u0000-\u001f\u007f]/u.test(normalized)
+  )
+    fail(code);
+  return normalized;
+}
+
+export function normalizeFinanceLookupText(value: unknown): string {
+  return normalizedLookupText(value, "invalid_request");
+}
+
+function accountLast4(value: unknown, code: FinanceContractErrorCode): string {
+  const result = text(value, 4, code);
+  if (!/^\d{4}$/.test(result)) fail(code);
   return result;
 }
 
@@ -906,6 +1131,14 @@ function requestBase(input: Record<string, unknown>): PageRequest {
     ...(input.cursor === undefined
       ? {}
       : { cursor: cursor(input.cursor, "invalid_request")! }),
+    ...(input.expectedDatasetRevision === undefined
+      ? {}
+      : {
+          expectedDatasetRevision: opaqueId<"dataset_revision">(
+            input.expectedDatasetRevision,
+            "invalid_request",
+          ),
+        }),
   };
 }
 
@@ -913,7 +1146,66 @@ function parseFinanceReadRequestShape(value: unknown): FinanceReadRequest {
   const input = object(value, "invalid_request");
   const base = requestBase(input);
   const shared = ["contractVersion", "operation", "spaceId", "limit"];
-  const pageOptional = ["cursor"];
+  const pageOptional = ["cursor", "expectedDatasetRevision"];
+  if (input.operation === "list_accounts") {
+    exact(
+      input,
+      shared,
+      [...pageOptional, "institutionName", "accountLast4", "displayLabel"],
+      "invalid_request",
+    );
+    return {
+      ...base,
+      operation: "list_accounts",
+      ...(input.institutionName === undefined
+        ? {}
+        : {
+            institutionName: normalizeFinanceLookupText(input.institutionName),
+          }),
+      ...(input.accountLast4 === undefined
+        ? {}
+        : {
+            accountLast4: accountLast4(input.accountLast4, "invalid_request"),
+          }),
+      ...(input.displayLabel === undefined
+        ? {}
+        : { displayLabel: normalizeFinanceLookupText(input.displayLabel) }),
+    };
+  }
+  if (input.operation === "get_holdings_snapshot") {
+    exact(
+      input,
+      [...shared, "accountId", "snapshot"],
+      pageOptional,
+      "invalid_request",
+    );
+    const snapshotInput = object(input.snapshot, "invalid_request");
+    let snapshot: FinanceHoldingsSnapshotSelector;
+    if (snapshotInput.mode === "exact") {
+      exact(snapshotInput, ["mode", "asOf"], [], "invalid_request");
+      snapshot = {
+        mode: "exact",
+        asOf: isoDate(snapshotInput.asOf, "invalid_request"),
+      };
+    } else {
+      exact(snapshotInput, ["mode"], ["onOrBefore"], "invalid_request");
+      if (snapshotInput.mode !== "latest") fail("invalid_request");
+      snapshot = {
+        mode: "latest",
+        ...(snapshotInput.onOrBefore === undefined
+          ? {}
+          : {
+              onOrBefore: isoDate(snapshotInput.onOrBefore, "invalid_request"),
+            }),
+      };
+    }
+    return {
+      ...base,
+      operation: "get_holdings_snapshot",
+      accountId: opaqueId<"account">(input.accountId, "invalid_request"),
+      snapshot,
+    };
+  }
   if (input.operation === "list_transactions") {
     exact(
       input,
@@ -1209,6 +1501,658 @@ function balance(value: unknown): FinanceBalanceRecord {
   };
 }
 
+function accountDescriptor(value: unknown): FinanceAccountDescriptor {
+  const input = object(value, "invalid_response");
+  exact(
+    input,
+    ["accountId", "sourceId", "institutionName", "baseCurrency"],
+    ["accountLast4", "displayLabel", "accountType"],
+    "invalid_response",
+  );
+  return {
+    accountId: opaqueId<"account">(input.accountId, "invalid_response"),
+    sourceId: opaqueId<"source">(input.sourceId, "invalid_response"),
+    institutionName: text(input.institutionName, 256, "invalid_response"),
+    baseCurrency: parseFinanceCurrency(input.baseCurrency, "invalid_response"),
+    ...(input.accountLast4 === undefined
+      ? {}
+      : { accountLast4: accountLast4(input.accountLast4, "invalid_response") }),
+    ...(input.displayLabel === undefined
+      ? {}
+      : { displayLabel: text(input.displayLabel, 256, "invalid_response") }),
+    ...(input.accountType === undefined
+      ? {}
+      : { accountType: text(input.accountType, 128, "invalid_response") }),
+  };
+}
+
+function snapshotSelector(
+  value: unknown,
+  code: FinanceContractErrorCode,
+): FinanceHoldingsSnapshotSelector {
+  const input = object(value, code);
+  if (input.mode === "exact") {
+    exact(input, ["mode", "asOf"], [], code);
+    return { mode: "exact", asOf: isoDate(input.asOf, code) };
+  }
+  exact(input, ["mode"], ["onOrBefore"], code);
+  if (input.mode !== "latest") fail(code);
+  return {
+    mode: "latest",
+    ...(input.onOrBefore === undefined
+      ? {}
+      : { onOrBefore: isoDate(input.onOrBefore, code) }),
+  };
+}
+
+const SNAPSHOT_VALUE_FIELDS = [
+  "quantity",
+  "price",
+  "marketValue",
+  "costBasis",
+  "storedUnrealizedGainLoss",
+] as const;
+const SNAPSHOT_DISCLOSURE_FIELDS = [
+  ...SNAPSHOT_VALUE_FIELDS,
+  "derivedUnrealizedGainLoss",
+] as const;
+
+function snapshotInstrument(value: unknown): FinanceSnapshotInstrument {
+  const input = object(value, "invalid_response");
+  if (input.status === "missing") {
+    exact(input, ["status"], [], "invalid_response");
+    return { status: "missing" };
+  }
+  exact(
+    input,
+    ["status", "instrumentId"],
+    ["name", "symbol"],
+    "invalid_response",
+  );
+  const status = oneOf(
+    input.status,
+    ["resolved", "ambiguous"] as const,
+    "invalid_response",
+  );
+  return {
+    status,
+    instrumentId: opaqueId<"instrument">(
+      input.instrumentId,
+      "invalid_response",
+    ),
+    ...(input.name === undefined
+      ? {}
+      : { name: text(input.name, 512, "invalid_response") }),
+    ...(input.symbol === undefined
+      ? {}
+      : { symbol: text(input.symbol, 128, "invalid_response") }),
+  };
+}
+
+function subtractCanonicalDecimals(
+  left: CanonicalFinanceDecimal,
+  right: CanonicalFinanceDecimal,
+): CanonicalFinanceDecimal {
+  const parts = (value: string) => {
+    const negative = value.startsWith("-");
+    const unsigned = negative ? value.slice(1) : value;
+    const [integerPart, fraction = ""] = unsigned.split(".");
+    return { negative, integerPart: integerPart!, fraction };
+  };
+  const l = parts(left);
+  const r = parts(right);
+  const scale = Math.max(l.fraction.length, r.fraction.length);
+  const scaled = (part: ReturnType<typeof parts>) => {
+    const digits = `${part.integerPart}${part.fraction.padEnd(scale, "0")}`;
+    const value = BigInt(digits);
+    return part.negative ? -value : value;
+  };
+  const difference = scaled(l) - scaled(r);
+  const negative = difference < 0n;
+  const digits = (negative ? -difference : difference)
+    .toString()
+    .padStart(scale + 1, "0");
+  const integerPart = scale === 0 ? digits : digits.slice(0, -scale);
+  const fraction = scale === 0 ? "" : digits.slice(-scale).replace(/0+$/, "");
+  return `${negative && difference !== 0n ? "-" : ""}${integerPart}${
+    fraction ? `.${fraction}` : ""
+  }` as CanonicalFinanceDecimal;
+}
+
+function snapshotPosition(value: unknown): FinanceHoldingsSnapshotPosition {
+  const input = object(value, "invalid_response");
+  exact(
+    input,
+    [
+      "recordId",
+      "accountId",
+      "asOf",
+      "currency",
+      "instrument",
+      "fieldEvidence",
+      "disclosures",
+    ],
+    [
+      "valuationBasis",
+      "quantity",
+      "price",
+      "marketValue",
+      "costBasis",
+      "storedUnrealizedGainLoss",
+      "derivedUnrealizedGainLoss",
+    ],
+    "invalid_response",
+  );
+  const fieldEvidence = denseArray(
+    input.fieldEvidence,
+    0,
+    SNAPSHOT_VALUE_FIELDS.length,
+    "invalid_response",
+  ).map((value): FinanceSnapshotFieldEvidence => {
+    const item = object(value, "invalid_response");
+    exact(item, ["field", "evidence"], [], "invalid_response");
+    return {
+      field: oneOf(item.field, SNAPSHOT_VALUE_FIELDS, "invalid_response"),
+      evidence: evidenceList(item.evidence, "invalid_response"),
+    };
+  });
+  const disclosures = denseArray(
+    input.disclosures,
+    0,
+    SNAPSHOT_DISCLOSURE_FIELDS.length,
+    "invalid_response",
+  ).map((value): FinanceSnapshotFieldDisclosure => {
+    const item = object(value, "invalid_response");
+    exact(item, ["field", "reason"], [], "invalid_response");
+    return {
+      field: oneOf(item.field, SNAPSHOT_DISCLOSURE_FIELDS, "invalid_response"),
+      reason: oneOf(
+        item.reason,
+        [
+          "not_reported",
+          "unsupported_value",
+          "retained_evidence_unavailable",
+          "precision_overflow",
+        ] as const,
+        "invalid_response",
+      ),
+    };
+  });
+  const evidenceFields = new Set(fieldEvidence.map((item) => item.field));
+  const disclosureFields = new Set(disclosures.map((item) => item.field));
+  if (
+    evidenceFields.size !== fieldEvidence.length ||
+    disclosureFields.size !== disclosures.length
+  )
+    fail("invalid_response");
+  for (const field of SNAPSHOT_VALUE_FIELDS) {
+    const present = input[field] !== undefined;
+    if (
+      present !== evidenceFields.has(field) ||
+      present === disclosureFields.has(field)
+    )
+      fail("invalid_response");
+  }
+  const derivedDisclosure = disclosures.find(
+    (item) => item.field === "derivedUnrealizedGainLoss",
+  );
+  if (
+    derivedDisclosure !== undefined &&
+    (derivedDisclosure.reason !== "precision_overflow" ||
+      input.derivedUnrealizedGainLoss !== undefined)
+  )
+    fail("invalid_response");
+  if (
+    disclosures.some(
+      (item) =>
+        item.field !== "derivedUnrealizedGainLoss" &&
+        item.reason === "precision_overflow",
+    )
+  )
+    fail("invalid_response");
+  const currency = parseFinanceCurrency(input.currency, "invalid_response");
+  const marketValue =
+    input.marketValue === undefined
+      ? undefined
+      : money(input.marketValue, "invalid_response");
+  const costBasis =
+    input.costBasis === undefined
+      ? undefined
+      : money(input.costBasis, "invalid_response");
+  if (derivedDisclosure !== undefined) {
+    if (marketValue === undefined || costBasis === undefined)
+      fail("invalid_response");
+    let overflowed = false;
+    try {
+      canonicalizeFinanceDecimal(
+        subtractCanonicalDecimals(marketValue.decimal, costBasis.decimal),
+      );
+    } catch {
+      overflowed = true;
+    }
+    if (!overflowed) fail("invalid_response");
+  }
+  if (
+    [
+      input.price,
+      input.marketValue,
+      input.costBasis,
+      input.storedUnrealizedGainLoss,
+    ]
+      .filter((item) => item !== undefined)
+      .some((item) => money(item, "invalid_response").currency !== currency)
+  )
+    fail("invalid_response");
+  let derivedUnrealizedGainLoss: FinanceDerivedUnrealizedGainLoss | undefined;
+  if (input.derivedUnrealizedGainLoss !== undefined) {
+    const derived = object(input.derivedUnrealizedGainLoss, "invalid_response");
+    exact(derived, ["amount", "formula"], [], "invalid_response");
+    if (
+      derived.formula !== "market_value_minus_cost_basis" ||
+      marketValue === undefined ||
+      costBasis === undefined ||
+      marketValue.currency !== costBasis.currency
+    )
+      fail("invalid_response");
+    const amount = money(derived.amount, "invalid_response");
+    if (
+      amount.currency !== currency ||
+      amount.decimal !==
+        subtractCanonicalDecimals(marketValue.decimal, costBasis.decimal)
+    )
+      fail("invalid_response");
+    derivedUnrealizedGainLoss = {
+      amount,
+      formula: "market_value_minus_cost_basis",
+    };
+  }
+  return {
+    recordId: opaqueId<"record">(input.recordId, "invalid_response"),
+    accountId: opaqueId<"account">(input.accountId, "invalid_response"),
+    asOf: isoDate(input.asOf, "invalid_response"),
+    currency,
+    instrument: snapshotInstrument(input.instrument),
+    ...(input.valuationBasis === undefined
+      ? {}
+      : {
+          valuationBasis: oneOf(
+            input.valuationBasis,
+            ["market_price", "last_round", "cost", "reported_nav"] as const,
+            "invalid_response",
+          ),
+        }),
+    ...(input.quantity === undefined
+      ? {}
+      : {
+          quantity: parseCanonicalFinanceDecimal(
+            input.quantity,
+            "invalid_response",
+          ),
+        }),
+    ...(input.price === undefined
+      ? {}
+      : { price: money(input.price, "invalid_response") }),
+    ...(marketValue === undefined ? {} : { marketValue }),
+    ...(costBasis === undefined ? {} : { costBasis }),
+    ...(input.storedUnrealizedGainLoss === undefined
+      ? {}
+      : {
+          storedUnrealizedGainLoss: money(
+            input.storedUnrealizedGainLoss,
+            "invalid_response",
+          ),
+        }),
+    ...(derivedUnrealizedGainLoss === undefined
+      ? {}
+      : { derivedUnrealizedGainLoss }),
+    fieldEvidence,
+    disclosures,
+  };
+}
+
+function snapshotMetric(
+  value: unknown,
+  currency: FinanceCurrency,
+  positionCount: number,
+): FinanceSnapshotMetricSummary {
+  const input = object(value, "invalid_response");
+  exact(
+    input,
+    ["contributingPositionCount", "missingPositionCount"],
+    ["amount", "issue"],
+    "invalid_response",
+  );
+  const contributingPositionCount = integer(
+    input.contributingPositionCount,
+    0,
+    positionCount,
+    "invalid_response",
+  );
+  const missingPositionCount = integer(
+    input.missingPositionCount,
+    0,
+    positionCount,
+    "invalid_response",
+  );
+  if (contributingPositionCount + missingPositionCount !== positionCount)
+    fail("invalid_response");
+  const amount =
+    input.amount === undefined
+      ? undefined
+      : money(input.amount, "invalid_response");
+  const issue =
+    input.issue === undefined
+      ? undefined
+      : oneOf(input.issue, ["precision_overflow"] as const, "invalid_response");
+  if (
+    contributingPositionCount > 0 !==
+      (amount !== undefined || issue !== undefined) ||
+    (amount !== undefined && issue !== undefined) ||
+    (amount !== undefined && amount.currency !== currency)
+  )
+    fail("invalid_response");
+  return {
+    ...(amount === undefined ? {} : { amount }),
+    ...(issue === undefined ? {} : { issue }),
+    contributingPositionCount,
+    missingPositionCount,
+  };
+}
+
+function snapshotCurrencySummary(
+  value: unknown,
+): FinanceSnapshotCurrencySummary {
+  const input = object(value, "invalid_response");
+  exact(
+    input,
+    [
+      "currency",
+      "positionCount",
+      "marketValue",
+      "costBasis",
+      "storedUnrealizedGainLoss",
+      "derivedUnrealizedGainLoss",
+      "statedAccountTotal",
+      "reconciliation",
+    ],
+    [],
+    "invalid_response",
+  );
+  const currency = parseFinanceCurrency(input.currency, "invalid_response");
+  const positionCount = integer(
+    input.positionCount,
+    0,
+    MAX_FINANCE_SNAPSHOT_SUMMARY_POSITIONS,
+    "invalid_response",
+  );
+  const marketValue = snapshotMetric(
+    input.marketValue,
+    currency,
+    positionCount,
+  );
+  const costBasis = snapshotMetric(input.costBasis, currency, positionCount);
+  const storedUnrealizedGainLoss = snapshotMetric(
+    input.storedUnrealizedGainLoss,
+    currency,
+    positionCount,
+  );
+  const derivedUnrealizedGainLoss = snapshotMetric(
+    input.derivedUnrealizedGainLoss,
+    currency,
+    positionCount,
+  );
+  const statedInput = object(input.statedAccountTotal, "invalid_response");
+  let statedAccountTotal: FinanceSnapshotStatedAccountTotal;
+  if (statedInput.status === "available") {
+    exact(
+      statedInput,
+      ["status", "amount", "balanceRecordId", "evidence"],
+      [],
+      "invalid_response",
+    );
+    const amount = money(statedInput.amount, "invalid_response");
+    if (amount.currency !== currency) fail("invalid_response");
+    statedAccountTotal = {
+      status: "available",
+      amount,
+      balanceRecordId: opaqueId<"record">(
+        statedInput.balanceRecordId,
+        "invalid_response",
+      ),
+      evidence: evidenceList(statedInput.evidence, "invalid_response"),
+    };
+  } else {
+    exact(statedInput, ["status"], [], "invalid_response");
+    statedAccountTotal = {
+      status: oneOf(
+        statedInput.status,
+        ["not_reported", "retained_evidence_unavailable", "ambiguous"] as const,
+        "invalid_response",
+      ),
+    };
+  }
+  const reconciliationInput = object(input.reconciliation, "invalid_response");
+  let reconciliation: FinanceSnapshotReconciliation;
+  if (
+    reconciliationInput.status === "match" ||
+    reconciliationInput.status === "difference"
+  ) {
+    exact(
+      reconciliationInput,
+      ["status", "difference", "formula"],
+      [],
+      "invalid_response",
+    );
+    const difference = money(
+      reconciliationInput.difference,
+      "invalid_response",
+    );
+    if (
+      reconciliationInput.formula !==
+        "stated_account_total_minus_position_market_value" ||
+      difference.currency !== currency ||
+      (reconciliationInput.status === "match") !==
+        (difference.decimal === "0") ||
+      statedAccountTotal.status !== "available" ||
+      marketValue.missingPositionCount !== 0 ||
+      marketValue.amount === undefined ||
+      difference.decimal !==
+        subtractCanonicalDecimals(
+          statedAccountTotal.amount.decimal,
+          marketValue.amount.decimal,
+        )
+    )
+      fail("invalid_response");
+    reconciliation = {
+      status: reconciliationInput.status,
+      difference,
+      formula: "stated_account_total_minus_position_market_value",
+    };
+  } else {
+    exact(reconciliationInput, ["status"], [], "invalid_response");
+    const status = oneOf(
+      reconciliationInput.status,
+      [
+        "incomplete",
+        "not_available",
+        "ambiguous",
+        "precision_overflow",
+      ] as const,
+      "invalid_response",
+    );
+    if (
+      (status === "incomplete" &&
+        marketValue.missingPositionCount === 0 &&
+        marketValue.amount !== undefined) ||
+      (status === "ambiguous" && statedAccountTotal.status !== "ambiguous") ||
+      (status === "not_available" &&
+        !["not_reported", "retained_evidence_unavailable"].includes(
+          statedAccountTotal.status,
+        )) ||
+      (status === "precision_overflow" &&
+        (statedAccountTotal.status !== "available" ||
+          marketValue.amount === undefined ||
+          marketValue.missingPositionCount !== 0))
+    )
+      fail("invalid_response");
+    if (status === "precision_overflow") {
+      let overflowed = false;
+      try {
+        canonicalizeFinanceDecimal(
+          subtractCanonicalDecimals(
+            statedAccountTotal.status === "available"
+              ? statedAccountTotal.amount.decimal
+              : ("0" as CanonicalFinanceDecimal),
+            marketValue.amount?.decimal ?? ("0" as CanonicalFinanceDecimal),
+          ),
+        );
+      } catch {
+        overflowed = true;
+      }
+      if (!overflowed) fail("invalid_response");
+    }
+    reconciliation = { status };
+  }
+  return {
+    currency,
+    positionCount,
+    marketValue,
+    costBasis,
+    storedUnrealizedGainLoss,
+    derivedUnrealizedGainLoss,
+    statedAccountTotal,
+    reconciliation,
+  };
+}
+
+function snapshotSummary(value: unknown): FinanceHoldingsSnapshotSummary {
+  const input = object(value, "invalid_response");
+  const status = oneOf(
+    input.status,
+    ["complete", "partial", "unavailable"] as const,
+    "invalid_response",
+  );
+  const positionCount = integer(
+    input.positionCount,
+    0,
+    Number.MAX_SAFE_INTEGER,
+    "invalid_response",
+  );
+  if (status === "unavailable") {
+    exact(
+      input,
+      ["status", "reason", "positionCount", "currencies"],
+      [],
+      "invalid_response",
+    );
+    const currencies = denseArray(
+      input.currencies,
+      0,
+      0,
+      "invalid_response",
+    ) as [];
+    const reason = oneOf(
+      input.reason,
+      ["position_limit", "evidence_bytes_limit"] as const,
+      "invalid_response",
+    );
+    if (
+      reason === "position_limit" &&
+      positionCount <= MAX_FINANCE_SNAPSHOT_SUMMARY_POSITIONS
+    )
+      fail("invalid_response");
+    return { status, reason, positionCount, currencies };
+  }
+  exact(
+    input,
+    [
+      "status",
+      "positionCount",
+      "resolvedInstrumentCount",
+      "unresolvedInstrumentCount",
+      "quantityCoverage",
+      "currencies",
+    ],
+    [],
+    "invalid_response",
+  );
+  if (positionCount > MAX_FINANCE_SNAPSHOT_SUMMARY_POSITIONS)
+    fail("invalid_response");
+  const resolvedInstrumentCount = integer(
+    input.resolvedInstrumentCount,
+    0,
+    positionCount,
+    "invalid_response",
+  );
+  const unresolvedInstrumentCount = integer(
+    input.unresolvedInstrumentCount,
+    0,
+    positionCount,
+    "invalid_response",
+  );
+  if (resolvedInstrumentCount + unresolvedInstrumentCount !== positionCount)
+    fail("invalid_response");
+  const quantityInput = object(input.quantityCoverage, "invalid_response");
+  exact(
+    quantityInput,
+    ["availablePositionCount", "missingPositionCount"],
+    [],
+    "invalid_response",
+  );
+  const availablePositionCount = integer(
+    quantityInput.availablePositionCount,
+    0,
+    positionCount,
+    "invalid_response",
+  );
+  const missingPositionCount = integer(
+    quantityInput.missingPositionCount,
+    0,
+    positionCount,
+    "invalid_response",
+  );
+  if (availablePositionCount + missingPositionCount !== positionCount)
+    fail("invalid_response");
+  const currencies = denseArray(
+    input.currencies,
+    0,
+    32,
+    "invalid_response",
+  ).map(snapshotCurrencySummary);
+  if (
+    new Set(currencies.map((item) => item.currency)).size !== currencies.length
+  )
+    fail("invalid_response");
+  if (
+    currencies.reduce((sum, item) => sum + item.positionCount, 0) !==
+    positionCount
+  )
+    fail("invalid_response");
+  const fullyUsable =
+    unresolvedInstrumentCount === 0 &&
+    missingPositionCount === 0 &&
+    currencies.every(
+      (item) =>
+        item.marketValue.missingPositionCount === 0 &&
+        item.marketValue.issue === undefined &&
+        item.costBasis.missingPositionCount === 0 &&
+        item.costBasis.issue === undefined &&
+        item.derivedUnrealizedGainLoss.missingPositionCount === 0 &&
+        item.derivedUnrealizedGainLoss.issue === undefined &&
+        (item.reconciliation.status === "match" ||
+          item.reconciliation.status === "difference"),
+    );
+  if ((status === "complete") !== fullyUsable) fail("invalid_response");
+  return {
+    status,
+    positionCount,
+    resolvedInstrumentCount,
+    unresolvedInstrumentCount,
+    quantityCoverage: { availablePositionCount, missingPositionCount },
+    currencies,
+  };
+}
+
 function aggregate(value: unknown): FinanceAggregateRecord {
   const input = object(value, "invalid_response");
   exact(
@@ -1360,6 +2304,10 @@ function coverageSummary(value: unknown): FinanceCoverageSummary {
           "failed_import",
           "unsupported_value",
           "retained_evidence_unavailable",
+          "missing_value",
+          "unresolved_identity",
+          "snapshot_summary_limit",
+          "snapshot_summary_evidence_limit",
           "stale_source",
         ] as const,
         "invalid_response",
@@ -1431,6 +2379,43 @@ function issue(value: unknown): FinanceOutputIssue {
       evidence: evidenceList(input.evidence, "invalid_response"),
     };
   }
+  if (input.code === "snapshot_summary_limit") {
+    exact(input, ["code", "positionCount", "limit"], [], "invalid_response");
+    const positionCount = integer(
+      input.positionCount,
+      MAX_FINANCE_SNAPSHOT_SUMMARY_POSITIONS + 1,
+      Number.MAX_SAFE_INTEGER,
+      "invalid_response",
+    );
+    if (input.limit !== MAX_FINANCE_SNAPSHOT_SUMMARY_POSITIONS)
+      fail("invalid_response");
+    return {
+      code: "snapshot_summary_limit",
+      positionCount,
+      limit: MAX_FINANCE_SNAPSHOT_SUMMARY_POSITIONS,
+    };
+  }
+  if (input.code === "snapshot_summary_evidence_limit") {
+    exact(
+      input,
+      ["code", "sourceLocatorBytes", "limit"],
+      [],
+      "invalid_response",
+    );
+    const sourceLocatorBytes = integer(
+      input.sourceLocatorBytes,
+      MAX_FINANCE_SNAPSHOT_SUMMARY_EVIDENCE_BYTES + 1,
+      Number.MAX_SAFE_INTEGER,
+      "invalid_response",
+    );
+    if (input.limit !== MAX_FINANCE_SNAPSHOT_SUMMARY_EVIDENCE_BYTES)
+      fail("invalid_response");
+    return {
+      code: "snapshot_summary_evidence_limit",
+      sourceLocatorBytes,
+      limit: MAX_FINANCE_SNAPSHOT_SUMMARY_EVIDENCE_BYTES,
+    };
+  }
   if (input.code !== "retained_evidence_unavailable") fail("invalid_response");
   exact(input, ["code", "recordId", "evidence"], [], "invalid_response");
   return {
@@ -1455,7 +2440,21 @@ export function parseFinanceReadResponseShape(
     "issues",
     "items",
   ];
-  exact(input, required, ["nextCursor", "recordId"], "invalid_response");
+  exact(
+    input,
+    required,
+    [
+      "nextCursor",
+      "recordId",
+      "matchStatus",
+      "totalMatches",
+      "requestedSnapshot",
+      "selectedSnapshot",
+      "account",
+      "summary",
+    ],
+    "invalid_response",
+  );
   if (input.contractVersion !== FINANCE_READ_CONTRACT_VERSION)
     fail("invalid_response");
   const operation = oneOf(
@@ -1463,6 +2462,8 @@ export function parseFinanceReadResponseShape(
     [
       "list_transactions",
       "list_holdings",
+      "list_accounts",
+      "get_holdings_snapshot",
       "list_balances",
       "aggregate_money",
       "get_evidence",
@@ -1470,11 +2471,25 @@ export function parseFinanceReadResponseShape(
     ] as const,
     "invalid_response",
   );
+  const accountFields = ["matchStatus", "totalMatches"];
+  const snapshotFields = [
+    "requestedSnapshot",
+    "selectedSnapshot",
+    "account",
+    "summary",
+  ];
   if (operation === "get_evidence") {
     if (!own(input, "recordId")) fail("invalid_response");
   } else if (own(input, "recordId")) {
     fail("invalid_response");
   }
+  if (
+    accountFields.some((key) => own(input, key)) !==
+      (operation === "list_accounts") ||
+    snapshotFields.some((key) => own(input, key)) !==
+      (operation === "get_holdings_snapshot")
+  )
+    fail("invalid_response");
   const coverage = coverageSummary(input.coverage);
   const completeness = oneOf(
     input.completeness,
@@ -1521,6 +2536,103 @@ export function parseFinanceReadResponseShape(
     MAX_FINANCE_PAGE_SIZE,
     "invalid_response",
   );
+  if (operation === "list_accounts") {
+    const matchStatus = oneOf(
+      input.matchStatus,
+      ["none", "unique", "ambiguous"] as const,
+      "invalid_response",
+    );
+    const totalMatches = integer(
+      input.totalMatches,
+      0,
+      Number.MAX_SAFE_INTEGER,
+      "invalid_response",
+    );
+    if (
+      (matchStatus === "none" && totalMatches !== 0) ||
+      (matchStatus === "unique" && totalMatches !== 1) ||
+      (matchStatus === "ambiguous" && totalMatches < 2) ||
+      (matchStatus === "none" && items.length !== 0) ||
+      (matchStatus === "unique" && (items.length !== 1 || input.truncated)) ||
+      items.length > totalMatches
+    )
+      fail("invalid_response");
+    return boundedNormalizedSize(
+      {
+        ...common,
+        operation,
+        matchStatus,
+        totalMatches,
+        items: items.map(accountDescriptor),
+      },
+      MAX_FINANCE_RESPONSE_BYTES,
+      "invalid_response",
+    );
+  }
+  if (operation === "get_holdings_snapshot") {
+    const requestedSnapshot = snapshotSelector(
+      input.requestedSnapshot,
+      "invalid_response",
+    );
+    const selectedInput = object(input.selectedSnapshot, "invalid_response");
+    let selectedSnapshot: GetHoldingsSnapshotResponse["selectedSnapshot"];
+    if (selectedInput.status === "found") {
+      exact(selectedInput, ["status", "asOf"], [], "invalid_response");
+      selectedSnapshot = {
+        status: "found",
+        asOf: isoDate(selectedInput.asOf, "invalid_response"),
+      };
+    } else {
+      exact(selectedInput, ["status"], [], "invalid_response");
+      if (selectedInput.status !== "not_found") fail("invalid_response");
+      selectedSnapshot = { status: "not_found" };
+    }
+    const account = accountDescriptor(input.account);
+    const summary = snapshotSummary(input.summary);
+    const parsedItems = items.map(snapshotPosition);
+    const expectedSummaryIssue =
+      summary.status !== "unavailable"
+        ? undefined
+        : summary.reason === "position_limit"
+          ? "snapshot_summary_limit"
+          : "snapshot_summary_evidence_limit";
+    if (
+      (selectedSnapshot.status === "not_found" &&
+        (parsedItems.length !== 0 || summary.positionCount !== 0)) ||
+      (selectedSnapshot.status === "found" &&
+        parsedItems.some(
+          (item) =>
+            item.accountId !== account.accountId ||
+            item.asOf !== selectedSnapshot.asOf,
+        )) ||
+      (summary.status !== "complete" && completeness === "complete") ||
+      (summary.status === "complete" &&
+        parsedItems.some(
+          (item) =>
+            item.instrument.status !== "resolved" ||
+            item.quantity === undefined ||
+            item.marketValue === undefined ||
+            item.costBasis === undefined ||
+            item.derivedUnrealizedGainLoss === undefined,
+        )) ||
+      (expectedSummaryIssue !== undefined &&
+        !issues.some((item) => item.code === expectedSummaryIssue))
+    )
+      fail("invalid_response");
+    return boundedNormalizedSize(
+      {
+        ...common,
+        operation,
+        requestedSnapshot,
+        selectedSnapshot,
+        account,
+        summary,
+        items: parsedItems,
+      },
+      MAX_FINANCE_RESPONSE_BYTES,
+      "invalid_response",
+    );
+  }
   if (operation === "list_transactions")
     return boundedNormalizedSize(
       { ...common, operation, items: items.map(transaction) },
@@ -1592,6 +2704,51 @@ function responseMatchesRequest(
   response: FinanceReadResponse,
 ): void {
   if (response.operation !== request.operation) fail("invalid_response");
+  if (request.operation === "list_accounts") {
+    if (response.operation !== "list_accounts") fail("invalid_response");
+    if (
+      response.items.some(
+        (item) =>
+          (request.institutionName !== undefined &&
+            normalizedLookupText(item.institutionName, "invalid_response") !==
+              request.institutionName) ||
+          (request.accountLast4 !== undefined &&
+            item.accountLast4 !== request.accountLast4) ||
+          (request.displayLabel !== undefined &&
+            (item.displayLabel === undefined ||
+              normalizedLookupText(item.displayLabel, "invalid_response") !==
+                request.displayLabel)),
+      )
+    )
+      fail("invalid_response");
+    return;
+  }
+  if (request.operation === "get_holdings_snapshot") {
+    if (response.operation !== "get_holdings_snapshot")
+      fail("invalid_response");
+    if (
+      response.account.accountId !== request.accountId ||
+      JSON.stringify(response.requestedSnapshot) !==
+        JSON.stringify(request.snapshot)
+    )
+      fail("invalid_response");
+    if (response.selectedSnapshot.status === "found") {
+      const selectedAsOf = response.selectedSnapshot.asOf;
+      if (
+        (request.snapshot.mode === "exact" &&
+          selectedAsOf !== request.snapshot.asOf) ||
+        (request.snapshot.mode === "latest" &&
+          request.snapshot.onOrBefore !== undefined &&
+          selectedAsOf > request.snapshot.onOrBefore) ||
+        response.items.some(
+          (item) =>
+            item.accountId !== request.accountId || item.asOf !== selectedAsOf,
+        )
+      )
+        fail("invalid_response");
+    }
+    return;
+  }
   if (request.operation === "list_transactions") {
     if (response.operation !== "list_transactions") fail("invalid_response");
     if (
@@ -1700,6 +2857,11 @@ export function parseAuthorizedFinanceReadExchange(value: unknown): {
   )
     fail("invalid_response");
   responseMatchesRequest(authorization.request, response);
+  if (
+    authorization.request.expectedDatasetRevision !== undefined &&
+    response.datasetRevision !== authorization.request.expectedDatasetRevision
+  )
+    fail("revision_changed");
   if (input.expectedDatasetRevision !== undefined) {
     const expectedDatasetRevision = opaqueId<"dataset_revision">(
       input.expectedDatasetRevision,

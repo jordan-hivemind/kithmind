@@ -79,7 +79,12 @@ test(
   { skip },
   async () => {
     await withArchive(async (client) => {
-      for (const name of ['public"; DROP TABLE documents; --', "has space", "1leading", ""]) {
+      for (const name of [
+        'public"; DROP TABLE documents; --',
+        "has space",
+        "1leading",
+        "",
+      ]) {
         await assert.rejects(
           () => pgSchemaVersion(client, name),
           /is not a usable archive schema name/,
@@ -102,7 +107,7 @@ test(
         [[...PG_TABLES]],
       );
       assert.equal(Number(tables.rows[0].n), PG_TABLES.length);
-      assert.equal(PG_TABLES.length, 15);
+      assert.equal(PG_TABLES.length, 16);
 
       // Running it again is a no-op: one row per migration applied, no extra
       // row and no error.
@@ -114,6 +119,109 @@ test(
     });
   },
 );
+
+test(
+  "finance read revision advances for every write event and rolls back atomically",
+  { skip },
+  async () => {
+    await withArchive(async (client) => {
+      const initial = await oneRevision(client);
+      assert.match(initial.epoch, /^[0-9a-f-]{36}$/);
+      assert.equal(initial.revision, "0");
+
+      await client.query(
+        "INSERT INTO institutions (id, name, slug) VALUES ('revision-inst', 'Revision Institution', 'revision-institution')",
+      );
+      await client.query(
+        "UPDATE institutions SET name = 'Corrected Institution' WHERE id = 'revision-inst'",
+      );
+      await client.query("DELETE FROM institutions WHERE id = 'revision-inst'");
+      await client.query("TRUNCATE retained_texts");
+      assert.deepEqual(await oneRevision(client), {
+        epoch: initial.epoch,
+        revision: "4",
+      });
+
+      await client.query("BEGIN");
+      await client.query(
+        "INSERT INTO institutions (id, name, slug) VALUES ('rolled-back', 'Rolled Back', 'rolled-back')",
+      );
+      assert.equal((await oneRevision(client)).revision, "5");
+      await client.query("ROLLBACK");
+      assert.equal((await oneRevision(client)).revision, "4");
+    });
+  },
+);
+
+test(
+  "tracked writes fail closed when the revision singleton is missing",
+  { skip },
+  async () => {
+    await withArchive(async (client) => {
+      await client.query("DELETE FROM finance_read_revision WHERE singleton");
+      await assert.rejects(
+        client.query(
+          "INSERT INTO instruments (id, symbol) VALUES ('unrevisioned', 'BAD')",
+        ),
+        /finance read revision singleton missing/,
+      );
+      const instruments = await client.query(
+        "SELECT count(*)::text AS n FROM instruments",
+      );
+      assert.equal(instruments.rows[0].n, "0");
+    });
+  },
+);
+
+test(
+  "finance read revision serializes writers before they take disjoint table locks",
+  { skip },
+  async () => {
+    const schema = testSchemaName();
+    const first = createArchiveClient(url, schema);
+    const second = createArchiveClient(url, schema);
+    await Promise.all([first.connect(), second.connect()]);
+    try {
+      await applyPgSchema(first);
+      await applyPgSchema(second);
+      await first.query("BEGIN");
+      await second.query("BEGIN");
+      await first.query(
+        "INSERT INTO instruments (id, symbol) VALUES ('revision-a', 'REVA')",
+      );
+      const secondFirstWrite = second.query(
+        "INSERT INTO retained_texts (sha256, byte_length, codepoint_length, content) VALUES ($1, 1, 1, $2)",
+        ["a".repeat(64), Buffer.from("a")],
+      );
+      await first.query(
+        "INSERT INTO retained_texts (sha256, byte_length, codepoint_length, content) VALUES ($1, 1, 1, $2)",
+        ["b".repeat(64), Buffer.from("b")],
+      );
+      await first.query("COMMIT");
+      await secondFirstWrite;
+      await second.query(
+        "INSERT INTO instruments (id, symbol) VALUES ('revision-b', 'REVB')",
+      );
+      await second.query("COMMIT");
+      assert.equal((await oneRevision(first)).revision, "4");
+    } finally {
+      await Promise.allSettled([
+        first.query("ROLLBACK"),
+        second.query("ROLLBACK"),
+      ]);
+      await first.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+      await Promise.all([first.end(), second.end()]);
+    }
+  },
+);
+
+async function oneRevision(client) {
+  const result = await client.query(
+    "SELECT epoch::text, revision::text FROM finance_read_revision WHERE singleton",
+  );
+  assert.equal(result.rows.length, 1);
+  return result.rows[0];
+}
 
 test(
   "NUMERIC arrives as decimal text, never as a float",
@@ -809,14 +917,9 @@ test(
 
       // An operator running the collapse script (or, here, doing exactly
       // what it does) clears the duplicate before retrying.
-      await client.query(
-        "DELETE FROM review_items WHERE id = 'review-dupe-2'",
-      );
+      await client.query("DELETE FROM review_items WHERE id = 'review-dupe-2'");
 
-      assert.equal(
-        await applyPgSchema(client, schema),
-        PG_SCHEMA_VERSION,
-      );
+      assert.equal(await applyPgSchema(client, schema), PG_SCHEMA_VERSION);
       const survivor = await client.query(
         "SELECT id FROM review_items ORDER BY id",
       );

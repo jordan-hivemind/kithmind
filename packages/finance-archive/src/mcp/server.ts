@@ -1,4 +1,4 @@
-// The archive's assistant access surface (F1-21): six typed operations from
+// The archive's assistant access surface (F1-21): eight typed operations from
 // `@repo/finance-contract`, served over MCP, against Postgres, as a non-owner
 // reader role.
 //
@@ -23,6 +23,8 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   authorizeFinanceReadRequest,
+  FINANCE_READ_REQUEST_DESCRIPTION,
+  FINANCE_READ_TOOL_DESCRIPTION,
   FinanceContractError,
   type FinanceTrustedContext,
 } from "@repo/finance-contract";
@@ -45,8 +47,8 @@ const ABSENCE_NOTE =
   "absence would. Call get_coverage before treating any empty result as absence.";
 
 const SERVER_INSTRUCTIONS =
-  "Read-only access to one person's financial archive over six typed " +
-  "operations: list_transactions, list_holdings, list_balances, " +
+  "Read-only access to one person's financial archive over eight typed " +
+  "operations: list_accounts, get_holdings_snapshot, list_transactions, list_holdings, list_balances, " +
   "aggregate_money, get_evidence and get_coverage. There is no SQL surface. " +
   "Money crosses this boundary as decimal strings, never as numbers, and a " +
   "total never crosses currencies. Every response carries the dataset " +
@@ -60,12 +62,7 @@ const SERVER_INSTRUCTIONS =
  * which belongs in a duplicate schema here that could drift from it.
  */
 const REQUEST_SHAPE = {
-  request: z
-    .record(z.unknown())
-    .describe(
-      "A finance read contract request: contractVersion 1, spaceId, limit, " +
-        "operation, and that operation's own fields.",
-    ),
+  request: z.record(z.unknown()).describe(FINANCE_READ_REQUEST_DESCRIPTION),
 };
 
 function textResult(payload: unknown) {
@@ -105,6 +102,7 @@ export function createFinanceArchiveMcpServer(
   client: pg.ClientBase,
   spaceId: string,
   trustedContext: FinanceTrustedContext,
+  cursorSigningSecret: string | Uint8Array,
 ): FinanceArchiveMcpServer {
   const server = new McpServer(
     { name: "kith-finance-archive", version: "2.0.0" },
@@ -113,8 +111,7 @@ export function createFinanceArchiveMcpServer(
 
   server.tool(
     "finance_read",
-    "One finance read contract operation: list_transactions, list_holdings, " +
-      "list_balances, aggregate_money, get_evidence or get_coverage. " +
+    `${FINANCE_READ_TOOL_DESCRIPTION} ` +
       `Bounded by the contract's page size and by the reader role's server-side limits. ${ABSENCE_NOTE}`,
     REQUEST_SHAPE,
     READ_ONLY,
@@ -122,7 +119,10 @@ export function createFinanceArchiveMcpServer(
       try {
         const authorized = authorizeFinanceReadRequest(request, trustedContext);
         return textResult(
-          await serveFinanceRead(client, authorized.request, spaceId),
+          await serveFinanceRead(client, authorized.request, spaceId, {
+            principalId: trustedContext.principalId,
+            cursorSigningSecret,
+          }),
         );
       } catch (error) {
         return errorResult(error);

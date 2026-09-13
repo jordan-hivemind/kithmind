@@ -15,7 +15,10 @@
 // exported the wrong one, and nothing downstream would notice.
 
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import type { FinancePrincipalId, FinanceSpaceId } from "@repo/finance-contract";
+import type {
+  FinancePrincipalId,
+  FinanceSpaceId,
+} from "@repo/finance-contract";
 
 import { resolveArchiveSpaceId } from "../rawTree.js";
 import { archiveSchemaName, createArchiveClient } from "../pgStore.js";
@@ -39,6 +42,10 @@ const principalId = required(
   "FINANCE_ARCHIVE_PRINCIPAL_ID",
   "Name the principal this server answers for; there is no anonymous caller.",
 );
+const cursorSigningSecret = required(
+  "FINANCE_ARCHIVE_CURSOR_SECRET",
+  "Set a dedicated 32-byte-or-longer cursor signing secret; continuations are bound to this principal and archive snapshot.",
+);
 const spaceId = resolveArchiveSpaceId();
 
 const client = createArchiveClient(url, archiveSchemaName());
@@ -51,6 +58,7 @@ const { server } = createFinanceArchiveMcpServer(
     principalId: principalId as FinancePrincipalId,
     authorizedSpaceIds: [spaceId as FinanceSpaceId],
   },
+  cursorSigningSecret,
 );
 const transport = new StdioServerTransport();
 await server.connect(transport);

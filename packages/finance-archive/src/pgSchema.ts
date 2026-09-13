@@ -400,7 +400,6 @@ ALTER TABLE liabilities
   ADD CONSTRAINT liabilities_row_hash_unique UNIQUE (row_hash);
 `;
 
-
 // F1-56. One account is known by more than one key. Morgan Stanley's API
 // reports a `keyAccountNo` (the key `discover()` returns and
 // `accounts.external_key` holds), while the statement PDFs print a
@@ -712,6 +711,95 @@ CREATE INDEX documents_superseded_by ON documents (superseded_by)
   WHERE superseded_by IS NOT NULL;
 `;
 
+// F1-73. A response revision must change for every committed write that can
+// change a finance read, including an in-place correction whose row count and
+// id stay the same. Computing that from all row content exceeded the reader's
+// statement timeout on the hosted archive. This transaction-local counter is
+// exact and O(1) to read. The epoch distinguishes a newly created archive from
+// another namespace that happens to have the same counter value.
+//
+// One statement increments once per affected table. A BEFORE STATEMENT trigger
+// takes the shared revision-row lock before a statement can take table row
+// locks. This preserves one lock order across disjoint-table writers instead
+// of introducing a revision-row deadlock after their table locks diverge. The
+// update is part of the
+// writer's transaction, so rollback also rolls it back. Archive publication is
+// already serialized; other concurrent writers serialize on this single row.
+// SECURITY DEFINER lets existing least-privilege writers fire the trigger
+// without UPDATE on the counter itself. TG_TABLE_SCHEMA comes from Postgres,
+// and format(%I) safely pins the update to the triggering archive schema while
+// the function search_path contains only pg_catalog.
+const FINANCE_READ_REVISION = `
+CREATE TABLE finance_read_revision (
+  singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+  epoch UUID NOT NULL,
+  revision BIGINT NOT NULL DEFAULT 0 CHECK (revision >= 0)
+);
+
+INSERT INTO finance_read_revision (singleton, epoch, revision)
+VALUES (
+  TRUE,
+  md5(random()::text || clock_timestamp()::text || pg_backend_pid()::text)::uuid,
+  0
+);
+
+REVOKE ALL ON finance_read_revision FROM PUBLIC;
+
+CREATE FUNCTION bump_finance_read_revision()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+DECLARE
+  affected_rows BIGINT;
+BEGIN
+  EXECUTE format(
+    'UPDATE %I.finance_read_revision SET revision = revision + 1 WHERE singleton',
+    TG_TABLE_SCHEMA
+  );
+  GET DIAGNOSTICS affected_rows = ROW_COUNT;
+  IF affected_rows <> 1 THEN
+    RAISE EXCEPTION 'finance read revision singleton missing in schema %',
+      TG_TABLE_SCHEMA;
+  END IF;
+  RETURN NULL;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION bump_finance_read_revision() FROM PUBLIC;
+
+DO $$
+DECLARE
+  tracked_table TEXT;
+BEGIN
+  FOREACH tracked_table IN ARRAY ARRAY[
+    'institutions',
+    'accounts',
+    'instruments',
+    'documents',
+    'transactions',
+    'positions',
+    'balances',
+    'reconciliations',
+    'position_reconciliations',
+    'review_items',
+    'retained_texts'
+  ]
+  LOOP
+    EXECUTE format(
+      'CREATE TRIGGER finance_read_revision_bump
+         BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON %I.%I
+         FOR EACH STATEMENT EXECUTE FUNCTION %I.bump_finance_read_revision()',
+      current_schema(),
+      tracked_table,
+      current_schema()
+    );
+  END LOOP;
+END;
+$$;
+`;
+
 /** Every migration, in order. The last one's version is the current schema. */
 export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
   {
@@ -764,6 +852,11 @@ export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
     name: "documents.provider_document_id: institution-scoped document identity, and superseded_by",
     sql: DOCUMENT_PROVIDER_IDENTITY,
   },
+  {
+    version: 11,
+    name: "finance read revision epoch, counter and write triggers",
+    sql: FINANCE_READ_REVISION,
+  },
 ]);
 
 /** The version an archive reaches once every migration has been applied. */
@@ -787,6 +880,7 @@ export const PG_TABLES: readonly string[] = Object.freeze([
   "review_items",
   "account_aliases",
   "retained_texts",
+  "finance_read_revision",
 ]);
 
 /**

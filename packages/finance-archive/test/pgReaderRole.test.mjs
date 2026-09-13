@@ -240,6 +240,22 @@ test("a table a later migration adds is not silently readable", { skip }, async 
   assert.equal(retainedTexts.i, false, "read, and only read");
   assert.equal(retainedTexts.p, false, "and PUBLIC still gets nothing");
   assert.equal(await count(r.client, "retained_texts"), 0);
+
+  const revisionPrivilege = await one(
+    owner,
+    `SELECT has_table_privilege($1, $2 || '.finance_read_revision', 'SELECT') AS s,
+            has_table_privilege($1, $2 || '.finance_read_revision', 'UPDATE') AS u,
+            has_table_privilege('public', $2 || '.finance_read_revision', 'SELECT') AS p,
+            has_function_privilege('public', $2 || '.bump_finance_read_revision()', 'EXECUTE') AS x`,
+    [r.summary.role, r.summary.schema],
+  );
+  assert.deepEqual(revisionPrivilege, {
+    s: true,
+    u: false,
+    p: false,
+    x: false,
+  });
+  assert.equal(await count(r.client, "finance_read_revision"), 1);
 });
 
 test("a function a later migration adds needs the setup re-run to be locked down", { skip }, async (t) => {

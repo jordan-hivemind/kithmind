@@ -100,7 +100,7 @@ describe("finance provider authorization", () => {
         }).response,
       ).toEqual(exchange.response);
     }
-    expect(syntheticFinanceReadExchanges).toHaveLength(6);
+    expect(syntheticFinanceReadExchanges).toHaveLength(8);
   });
 
   test("money crosses the provider as decimal strings", async () => {
@@ -146,7 +146,7 @@ describe("finance provider authorization", () => {
     expect(archive.requests).toEqual([]);
   });
 
-  test("the archive is configured only when both values are present", () => {
+  test("configured archives require a stable signing secret", () => {
     expect(resolveFinanceArchive({})).toBeNull();
     expect(
       resolveFinanceArchive({
@@ -162,8 +162,54 @@ describe("finance provider authorization", () => {
         FINANCE_ARCHIVE_READER_DATABASE_URL:
           "postgres://reader@example/archive",
         FINANCE_ARCHIVE_SPACE_ID: ARCHIVE_SPACE,
+        FINANCE_ARCHIVE_CURSOR_SECRET: "synthetic-cursor-secret-with-32-bytes",
       })?.spaceId,
     ).toBe(ARCHIVE_SPACE);
+    for (const secret of [undefined, "too-short"]) {
+      expect(() =>
+        resolveFinanceArchive({
+          FINANCE_ARCHIVE_READER_DATABASE_URL:
+            "postgres://reader@example/archive",
+          FINANCE_ARCHIVE_SPACE_ID: ARCHIVE_SPACE,
+          FINANCE_ARCHIVE_CURSOR_SECRET: secret,
+        }),
+      ).toThrow("FINANCE_ARCHIVE_CURSOR_SECRET");
+    }
+  });
+
+  test("the backend receives only the authenticated principal", async () => {
+    const exchange = exchangeFor("list_transactions");
+    const read = vi.fn().mockResolvedValue(exchange.response);
+    await readFinanceArchive(
+      { spaceId: ARCHIVE_SPACE, read },
+      exchange.request,
+      {
+        principalId: "synthetic-user:synthetic-key",
+        authorizedSpaceIds: [ARCHIVE_SPACE, OTHER_SPACE],
+      },
+    );
+    expect(read).toHaveBeenCalledWith(exchange.request, {
+      principalId: "synthetic-user:synthetic-key",
+    });
+  });
+
+  test("backend responses cannot change the authorized space or operation", async () => {
+    const exchange = exchangeFor("list_transactions");
+    for (const response of [
+      { ...exchange.response, spaceId: OTHER_SPACE },
+      exchangeFor("list_holdings").response,
+    ]) {
+      await expect(
+        readFinanceArchive(
+          fakeArchive(() => response),
+          exchange.request,
+          {
+            principalId: PRINCIPAL,
+            authorizedSpaceIds: [ARCHIVE_SPACE, OTHER_SPACE],
+          },
+        ),
+      ).rejects.toThrow(FinanceContractError);
+    }
   });
 });
 
@@ -207,6 +253,68 @@ describe("query_records finance provider", () => {
     mocks.mutation.mockResolvedValue({ items: [] });
   });
   afterEach(() => vi.unstubAllEnvs());
+
+  test("new finance capabilities cross the advertised gateway unchanged", async () => {
+    const server = createMcpServer(
+      "signed-test-token",
+      PRINCIPAL,
+      fakeArchive((request) => exchangeFor(request.operation).response),
+    );
+    const client = new Client({ name: "fresh-finance-client", version: "1" });
+    const [clientTransport, serverTransport] =
+      InMemoryTransport.createLinkedPair();
+    try {
+      await Promise.all([
+        server.connect(serverTransport),
+        client.connect(clientTransport),
+      ]);
+      const tools = await client.listTools();
+      const advertised = tools.tools.find(
+        (tool) => tool.name === "query_records",
+      );
+      const schema = JSON.stringify(advertised?.inputSchema);
+      for (const term of [
+        "contractVersion",
+        "list_accounts",
+        "get_holdings_snapshot",
+        "accountLast4",
+        "expectedDatasetRevision",
+      ]) {
+        expect(schema).toContain(term);
+      }
+      for (const operation of ["list_accounts", "get_holdings_snapshot"]) {
+        const exchange = exchangeFor(operation);
+        const result = await client.callTool({
+          name: "query_records",
+          arguments: {
+            query: { provider: "finance_archive", request: exchange.request },
+          },
+        });
+        expect(result.isError).not.toBe(true);
+        expect(
+          JSON.parse((result.content as { text: string }[])[0]!.text),
+        ).toEqual(exchange.response);
+      }
+      // A later call in the same MCP session must reload live membership.
+      mocks.query.mockResolvedValue([]);
+      const denied = await client.callTool({
+        name: "query_records",
+        arguments: {
+          query: {
+            provider: "finance_archive",
+            request: exchangeFor("list_accounts").request,
+          },
+        },
+      });
+      expect(denied.isError).toBe(true);
+      expect((denied.content as { text: string }[])[0]!.text).toBe(
+        "not_authorized",
+      );
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
 
   test("the archive response is returned unchanged", async () => {
     const exchange = exchangeFor("list_holdings");
