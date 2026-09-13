@@ -333,6 +333,17 @@ scan is required. Source changes and expiry have separate bounded stale reasons.
 A running assessment expires after thirty minutes without a new page. Cleanup
 retains its required scan detail while it is active and unexpired.
 
+Adopted 2026-09-13 (P2-80h): a fault the server can attribute to one item
+degrades that item, not the source. An item whose own chain does not hold
+together is counted `unavailable` with its reason logged, its scan entry is
+still accounted for, and the assessment completes. Only a source-level fault
+stales the whole assessment: the fence, the epochs, the scan counters, and a
+fault that leaves an entry unattributable and so breaks the accounting proof.
+This does not soften the coverage claim, because a terminal result is never
+`complete` while any item is `unavailable`. Before this, one unprovable document
+stalled every later assessment of the source, so a single file could stop the
+source from ever completing a pass.
+
 The item counts are `ready`, `pending`, `failed`, `needsReview`, `explicitGap`,
 `unavailable`, and `ignoredForgotten`. Unresolved entries separately count
 `needsReview` and `ignoredForgotten`. Each item or unresolved entry contributes

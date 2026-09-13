@@ -16,7 +16,7 @@ import {
 import { verifySealedParsedPayload } from "../provenance/parsedStaging";
 import { artifactBoundExtractionFingerprint } from "./archivedDiscovery";
 import { requireWorkerSourceAccount, type WorkerPrincipal } from "./auth";
-import { workerProtocolError } from "./errors";
+import { workerProtocolError, workerProtocolErrorCode } from "./errors";
 import { consumeWorkerMutationRateLimit } from "./rateLimit";
 import { FS_TEXT_PROFILE } from "./profile";
 import type {
@@ -771,6 +771,70 @@ type ItemClassification = {
   bucket: keyof ProcessingAssessmentCounts["items"];
   proof?: ScanProofBucket;
 };
+
+/**
+ * The scan entry a classification still has to account for, read from the
+ * entry's own state. `classifyItem` derives the same proof from the same
+ * states; this is the part of it that survives a failed classification.
+ */
+function proofForEntryState(
+  state: Doc<"workerScanEntries">["state"],
+): ScanProofBucket {
+  return state === "gap"
+    ? "gapScanEntries"
+    : state === "needs_review"
+      ? "reviewScanEntries"
+      : state === "ignored_forgotten"
+        ? "ignoredScanEntries"
+        : state === "queued"
+          ? "queuedScanEntries"
+          : "unchangedScanEntries";
+}
+
+/**
+ * P2-80h: an item the server cannot prove is an unavailable item, not a stale
+ * source. `classifyItem` raises a protocol error whenever an item's chain does
+ * not hold together, and the page loop turned any throw into
+ * `staleReason: detail_unavailable` for the whole assessment: one document
+ * blocked the source forever, which is how three separate defects each ended
+ * as a permanently stale assessment. Such an item is now counted in
+ * `counts.items.unavailable` with its reason logged, the pass keeps accounting
+ * for its scan entry, and the assessment completes. Coverage stays honest
+ * because `terminalState` already refuses `complete` while any item is
+ * unavailable, exactly as it does for needs-review.
+ *
+ * Only a source-level fault still stales the assessment: the fence, the
+ * epochs, the scan counters (`currentFenceReason`), and a fault that stops the
+ * pass from attributing an entry at all, which would break the accounting
+ * proof rather than degrade one item.
+ */
+async function classifyItemOrUnavailable(
+  ctx: MutationCtx,
+  source: LoadedWorkerSource,
+  assessment: Assessment,
+  item: Doc<"sourceItems">,
+): Promise<ItemClassification> {
+  try {
+    return await classifyItem(ctx, source, assessment, item);
+  } catch (error) {
+    const reason = workerProtocolErrorCode(error);
+    if (reason === undefined) throw error;
+    const entry = await exactEntryForItem(ctx, assessment, item);
+    console.warn(
+      JSON.stringify({
+        event: "worker_assessment_item_unavailable",
+        sourceItemId: item._id,
+        scanId: assessment.scanId,
+        reason,
+        ...(entry ? { entryState: entry.state } : {}),
+      }),
+    );
+    return {
+      bucket: "unavailable",
+      ...(entry ? { proof: proofForEntryState(entry.state) } : {}),
+    };
+  }
+}
 
 function validDiscoveryWorkRuntimeState(
   work: Doc<"workerDiscoveryWork">,
@@ -1725,7 +1789,12 @@ export async function advanceProcessingAssessment(
       );
       for (const item of page.page) {
         if (!detailRowsAreBounded(item)) throw new Error("oversized_detail");
-        const classified = await classifyItem(ctx, source, assessment, item);
+        const classified = await classifyItemOrUnavailable(
+          ctx,
+          source,
+          assessment,
+          item,
+        );
         counts = incrementCount(counts, classified.bucket);
         if (classified.proof === "queuedScanEntries") queued += 1;
         else if (classified.proof === "gapScanEntries") gap += 1;
