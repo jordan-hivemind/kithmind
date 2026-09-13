@@ -79,6 +79,14 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
     name: "provenance and documents: retire the synthetic proof tables, free documents/source_revisions/chunks (P2-39d)",
     url: new URL("../migrations/005_provenance_documents.sql", import.meta.url),
   },
+  {
+    version: 6,
+    name: "source_items.card_doc_type and chunks.text_search: two columns kith-migrate's snapshot lacked (P2-39d2). Filed as 006 rather than the task brief's 007: no migration 006 existed on origin/main at rebase time, and the runner below refuses a version gap, so this is the next free number -- whichever of this row or the parallel P2-39c identity port (which AGENTS.md reserves 006 for) merges second must renumber its own migration to stay gapless.",
+    url: new URL(
+      "../migrations/006_parsed_staging_documents.sql",
+      import.meta.url,
+    ),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */

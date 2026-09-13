@@ -485,7 +485,7 @@ test(
     );
     assert.deepEqual(
       upgradedVersions.rows.map((row) => row.version),
-      [1, 2, 3, 4, 5],
+      [1, 2, 3, 4, 5, 6],
     );
     // A gap rather than a rollback: version 1 missing while 2 and 3 are
     // recorded is a history no build can migrate from, and guessing is how a
