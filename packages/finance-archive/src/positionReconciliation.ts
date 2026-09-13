@@ -685,8 +685,17 @@ function reconcilePeriod(
  * this period. `min(process_date)` is the archive's only record of how far
  * back activity was acquired; an account whose earliest transaction post-dates
  * a stated position genuinely has unverifiable periods before that point.
+ *
+ * Exported for the cash gate (F1-8e), which has the same shape of gap --
+ * stated balances reaching further back than acquired activity -- and takes
+ * only the one field this actually reads rather than the position gate's
+ * full `AccountHistory` (which also carries `firstStatedPositionAsOf`,
+ * meaningless for a balance).
  */
-function isCoverageGap(history: AccountHistory, periodStart: string): boolean {
+export function isCoverageGap(
+  history: { earliestTransaction: string | null },
+  periodStart: string,
+): boolean {
   return (
     history.earliestTransaction === null ||
     periodStart < history.earliestTransaction

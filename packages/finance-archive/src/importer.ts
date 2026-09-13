@@ -34,7 +34,14 @@
 
 import { randomUUID } from "node:crypto";
 
-import { toMinorUnits } from "./money.js";
+import { multiplyDecimal } from "./decimal.js";
+import {
+  DERIVED_ROUNDING_RULE,
+  fromMinorUnits,
+  type RoundingRule,
+  roundToMinorUnits,
+  toMinorUnits,
+} from "./money.js";
 import { toNumericText } from "./pgNumeric.js";
 import {
   type ArchiveClient,
@@ -129,6 +136,24 @@ export type ImportRow = {
   sourceLocator: string;
   /** Stable per-account transaction id from the source, when one exists. */
   providerTxnId: string | null;
+  /**
+   * F1-8b. `amount` converted into the account's `base_currency`, when the
+   * source itself states that converted amount (e.g. a "USD equivalent"
+   * column) -- decimal text, used verbatim and never rounded. Omitted or
+   * null when the source states no base-currency amount for this row; the
+   * importer then tries `fxRateText` instead of leaving amount_base
+   * unpopulated for a row this institution's own statement in fact converts.
+   */
+  amountBaseText?: string | null;
+  /**
+   * F1-8b. The FX rate the source states for this row, decimal text.
+   * Recorded on `fx_rate` whenever it is known, and -- only when
+   * `amountBaseText` is absent -- multiplied against `amount` to derive
+   * `amount_base`, rounded `half_even` to the base currency's minor unit
+   * (money.ts) and recorded as such. A stated amount never rounds; a
+   * derived one does, and says so in `amount_base_rounding`.
+   */
+  fxRateText?: string | null;
 };
 
 /**
@@ -424,6 +449,9 @@ const TRANSACTION_COLUMNS = [
   "price",
   "amount",
   "currency",
+  "amount_base",
+  "fx_rate",
+  "amount_base_rounding",
   "running_balance",
   "source_document_id",
   "source_locator",
@@ -598,6 +626,15 @@ export async function importBatch(
   let reviewItemsOpened = 0;
   let reviewItemsResolved = 0;
   let reviewItemsUpdated = 0;
+
+  // F1-8b. Every row's account, resolved to `accounts.base_currency` once
+  // for the whole batch rather than once per row: `prepareRow` is otherwise
+  // pure (no database access), and this is the one fact about an account it
+  // needs to derive `amount_base` from a stated FX rate. Populated below,
+  // before `prepareRow` is ever called; a `Map` a closure captures by
+  // reference sees the values as of when it is read, not when it was
+  // declared.
+  const baseCurrencyByAccount = new Map<string, string | null>();
 
   // F1-59. The keys of every row this run inserts, deduplicated as strings
   // so a 20,000-row pull carries a few hundred of them rather than 20,000.
@@ -961,6 +998,15 @@ export async function importBatch(
       pending,
     );
 
+    // F1-8b. amount_base/fx_rate/amount_base_rounding: see resolveAmountBase.
+    const { amountBase, fxRate, amountBaseRounding } = resolveAmountBase(
+      row.amountBaseText ?? null,
+      row.fxRateText ?? null,
+      amount,
+      baseCurrencyByAccount.get(row.accountId) ?? null,
+      pending,
+    );
+
     // The occurrence ordinal is a hashed input, not a suffix appended after
     // the fact: the same real transaction reappearing on an overlapping page
     // gets the same ordinal (first time this content is seen in this
@@ -1007,6 +1053,9 @@ export async function importBatch(
         price,
         amount,
         row.currency,
+        amountBase,
+        fxRate,
+        amountBaseRounding,
         runningBalance,
         documentId,
         row.sourceLocator,
@@ -1623,6 +1672,25 @@ export async function importBatch(
   return withArchiveTransaction(client, async () => {
     await lockArchiveForWrite(client);
 
+    // F1-8b. One batched lookup for every account this batch's rows name,
+    // ahead of the document loop so every row sees it regardless of which
+    // document it lands on.
+    const batchAccountIds = new Set<string>();
+    for (const document of batch.documents) {
+      for (const row of document.rows) batchAccountIds.add(row.accountId);
+    }
+    if (batchAccountIds.size > 0) {
+      const found = await client.query<{
+        id: string;
+        base_currency: string | null;
+      }>("SELECT id, base_currency FROM accounts WHERE id = ANY($1::text[])", [
+        [...batchAccountIds],
+      ]);
+      for (const row of found.rows) {
+        baseCurrencyByAccount.set(row.id, row.base_currency);
+      }
+    }
+
     for (const document of batch.documents) {
       filesSeen += 1;
 
@@ -1980,6 +2048,92 @@ function canonicalizeAmbiguous(
       reason: error instanceof Error ? error.message : String(error),
     });
     return null;
+  }
+}
+
+/**
+ * F1-8b. `transactions.amount_base`/`fx_rate`/`amount_base_rounding`: the
+ * cash gate (reconciliation.ts) refuses to sum a foreign-currency row
+ * without a base-currency equivalent, so this is what populates one at
+ * import when the source gives us anything to compute it from.
+ *
+ * Precedence, per the plan's "a stated amount never rounds; a derived one
+ * uses half_even and records it":
+ *
+ *   1. `amountBaseText` -- the source's own stated base-currency amount --
+ *      is used verbatim. It goes through the same currency-precision
+ *      ambiguity check `amount` itself does (ground rule 5): more digits
+ *      than `baseCurrency` allows is ambiguous money, not a value to round
+ *      away. `amount_base_rounding` records `none`.
+ *   2. Otherwise, a stated `fxRateText` multiplied against the already
+ *      -resolved `amount` (exact product, `multiplyDecimal`) and rounded
+ *      `half_even` to `baseCurrency`'s minor unit (`money.ts`'s
+ *      `roundToMinorUnits`/`fromMinorUnits`, the same helpers the SQLite
+ *      engine used for exactly this derivation, wired up here for the first
+ *      time). `amount_base_rounding` records `half_even`.
+ *   3. Neither resolves, or `baseCurrency` is not yet known for this account
+ *      (nullable since F1-32) -- `amount_base` stays null, honestly
+ *      unpopulated rather than guessed. This is the case the cash gate's
+ *      coverage rule treats as unverified, not failed.
+ *
+ * `fxRate` is recorded whenever it validates, independent of which branch
+ * populated `amount_base`: a statement can state both its own converted
+ * amount and the rate it used, and losing the rate because the amount made
+ * it unnecessary would drop evidence for no reason.
+ */
+function resolveAmountBase(
+  amountBaseText: string | null,
+  fxRateText: string | null,
+  amount: string | null,
+  baseCurrency: string | null,
+  pending: ReviewCandidate[],
+): {
+  amountBase: string | null;
+  fxRate: string | null;
+  amountBaseRounding: RoundingRule | null;
+} {
+  const fxRate = canonicalizeAmbiguous(fxRateText, "ambiguous_fx_rate", pending);
+
+  if (amountBaseText !== null) {
+    let amountBase: string | null;
+    try {
+      amountBase =
+        baseCurrency === null
+          ? toNumericText(amountBaseText)
+          : checkedMoney(amountBaseText, baseCurrency);
+    } catch (error) {
+      pending.push({
+        kind: "ambiguous_amount_base",
+        rawValue: amountBaseText,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+      amountBase = null;
+    }
+    return {
+      amountBase,
+      fxRate,
+      amountBaseRounding: amountBase === null ? null : "none",
+    };
+  }
+
+  if (fxRate === null || amount === null || baseCurrency === null) {
+    return { amountBase: null, fxRate, amountBaseRounding: null };
+  }
+
+  try {
+    const product = multiplyDecimal(amount, fxRate);
+    const amountBase = fromMinorUnits(
+      roundToMinorUnits(product, baseCurrency, DERIVED_ROUNDING_RULE),
+      baseCurrency,
+    );
+    return { amountBase, fxRate, amountBaseRounding: DERIVED_ROUNDING_RULE };
+  } catch (error) {
+    pending.push({
+      kind: "ambiguous_amount_base",
+      rawValue: `${amount} * ${fxRate}`,
+      reason: `could not derive a base-currency amount: ${error instanceof Error ? error.message : String(error)}`,
+    });
+    return { amountBase: null, fxRate, amountBaseRounding: null };
   }
 }
 

@@ -58,6 +58,12 @@ import {
   lockArchiveForWrite,
   withArchiveTransaction,
 } from "./pgStore.js";
+// F1-8e. The position gate's coverage-gap check -- a stated snapshot
+// reaching further back than acquired activity is unverified, not failed --
+// applies unchanged to cash: only the field it reads (`earliestTransaction`)
+// is shared, so it is reused rather than reimplemented (see isCoverageGap's
+// own doc comment in positionReconciliation.ts).
+import { isCoverageGap } from "./positionReconciliation.js";
 
 export type ReconciliationStatus = "pass" | "fail" | "unverified";
 
@@ -80,12 +86,31 @@ export type ReconciliationOutcome = {
   notes: string | null;
 };
 
+/**
+ * F1-8e. How much history is missing for one account, measured rather than
+ * tolerated: the account has a stated balance dated before the earliest
+ * transaction the archive holds, so the periods before that point cannot be
+ * checked at all. The cash twin of `PositionCoverageGap`
+ * (positionReconciliation.ts): same shape, no `instrumentId` because a cash
+ * balance is not per instrument.
+ */
+export type CashCoverageGap = {
+  accountId: string;
+  /** as_of of the earliest stated balance for the account. */
+  firstStatedBalanceAsOf: string;
+  /** Earliest acquired transaction, or null when none was acquired at all. */
+  transactionHistoryStartsAt: string | null;
+  /** Periods this gap left unverified. */
+  periodsUnverified: number;
+};
+
 export type ReconciliationGateSummary = {
   periodsChecked: number;
   passed: number;
   failed: number;
   unverified: number;
   outcomes: readonly ReconciliationOutcome[];
+  coverageGaps: readonly CashCoverageGap[];
 };
 
 /**
@@ -175,6 +200,17 @@ type PeriodResult = {
 };
 
 /**
+ * F1-8e. What the archive holds for one account, read once and reused per
+ * period -- the cash twin of positionReconciliation.ts's `AccountHistory`,
+ * minus `firstStatedPositionAsOf` (that file's own name for the same idea,
+ * `firstStatedBalanceAsOf` here).
+ */
+type CashAccountHistory = {
+  earliestTransaction: string | null;
+  firstStatedBalanceAsOf: string | null;
+};
+
+/**
  * Runs the reconciliation gate over every account with two or more
  * `balances` snapshots, writing one `reconciliations` row per period
  * (period boundaries are consecutive snapshot dates for that account; the
@@ -225,8 +261,13 @@ export async function runReconciliationGate(
     // rather than one per period: the archive is hosted, so a gate's cost is
     // messages, not rows. The verdict logic itself is unchanged.
     const computed = await sumTransactionWindows(client, pairs);
+    // F1-8e. Same shape as the position gate's own accountHistories: how far
+    // back activity was acquired for every account this pass touches, fetched
+    // once rather than once per period.
+    const histories = await cashAccountHistories(client, pairs);
 
     const outcomes: ReconciliationOutcome[] = [];
+    const gapPeriods = new Map<string, number>();
     let passed = 0;
     let failed = 0;
     let unverified = 0;
@@ -239,14 +280,23 @@ export async function runReconciliationGate(
     for (const [index, pair] of pairs.entries()) {
       const periodStart = pair.prev_as_of;
       const periodEnd = pair.as_of;
+      const history = histories.get(pair.account_id) ?? EMPTY_CASH_HISTORY;
       const result = reconcilePeriod(
         pair,
+        history,
         computed[index] ?? { error: "the period was not summed" },
       );
 
       if (result.status === "pass") passed += 1;
       else if (result.status === "fail") failed += 1;
       else unverified += 1;
+
+      if (isCoverageGap(history, periodStart)) {
+        gapPeriods.set(
+          pair.account_id,
+          (gapPeriods.get(pair.account_id) ?? 0) + 1,
+        );
+      }
 
       outcomes.push({
         accountId: pair.account_id,
@@ -304,6 +354,22 @@ export async function runReconciliationGate(
       ...verdicts.values(),
     ]);
 
+    // F1-8e. Same fold the position gate uses for its own coverageGaps: only
+    // an account whose gap periods trace back to a known first stated
+    // balance is reported (EMPTY_CASH_HISTORY -- no balance, no transaction --
+    // has nothing to name).
+    const coverageGaps: CashCoverageGap[] = [];
+    for (const [accountId, periodsUnverified] of gapPeriods) {
+      const history = histories.get(accountId);
+      if (history?.firstStatedBalanceAsOf == null) continue;
+      coverageGaps.push({
+        accountId,
+        firstStatedBalanceAsOf: history.firstStatedBalanceAsOf,
+        transactionHistoryStartsAt: history.earliestTransaction,
+        periodsUnverified,
+      });
+    }
+
     if (importRunId !== undefined) {
       await updateImportRun(
         client,
@@ -320,6 +386,7 @@ export async function runReconciliationGate(
       failed,
       unverified,
       outcomes,
+      coverageGaps,
     };
   });
 }
@@ -332,6 +399,7 @@ export async function runReconciliationGate(
  */
 function reconcilePeriod(
   pair: BalancePairRow,
+  history: CashAccountHistory,
   window: WindowSum,
 ): PeriodResult {
   // F1-8. Two `balances` rows at one `as_of` stating different cash is the
@@ -409,6 +477,28 @@ function reconcilePeriod(
     };
   }
 
+  // F1-8e. Coverage, not tolerance -- the cash twin of the position gate's
+  // own check. When acquired transaction history does not reach back to the
+  // start of this period, the derived change cannot explain the stated
+  // change no matter what it sums to, so the period is unverified and the
+  // missing history is measured in the summary rather than silently
+  // tolerated (or, worse, failed on a window this gate was never able to
+  // fill in the first place).
+  const periodStart = pair.prev_as_of;
+  if (isCoverageGap(history, periodStart)) {
+    return {
+      status: "unverified",
+      expectedChange,
+      computedChange,
+      delta: null,
+      notes:
+        history.earliestTransaction === null
+          ? "no transaction history has been acquired for this account, so this period cannot be checked"
+          : `acquired transaction history begins ${history.earliestTransaction}, ` +
+            `after this period's start ${periodStart}; the period cannot be checked`,
+    };
+  }
+
   const delta = subtractDecimal(computedChange, expectedChange);
   const reconciled = compareDecimal(delta, TOLERANCE) === 0;
 
@@ -430,43 +520,56 @@ type WindowSum = { total: string } | { error: string };
  * Sums cash transactions in [periodStart, periodEnd] for every period at
  * once (F1-59), one round trip instead of one per period. Empty is a valid 0.
  *
- * Summed by Postgres, where NUMERIC adds exactly, and grouped by currency so
- * the currency-mixing guard is the query's own shape rather than a loop that
- * could be edited out: more than one group in one period's window means the
- * window is not in one currency, which is not a total this gate is allowed to
- * take. Rows whose amount is NULL -- ambiguous money the importer already
- * sent to review -- are excluded rather than guessed; excluding real money is
- * exactly what should surface as a nonzero delta instead of being masked.
- *
- * Grouping by period as well as currency keeps that guard per period: a
- * foreign-currency transaction leaves its own period unverified with the
- * note it always had and every other period untouched.
+ * Summed by Postgres, where NUMERIC adds exactly. F1-8b: a row in the
+ * period's own currency (the account's stated `pair.currency`) sums its
+ * `amount` unchanged; a row in any other currency sums its `amount_base`
+ * instead -- `amount` converted into that same base currency, populated at
+ * import (importer.ts's `resolveAmountBase`) when the source stated it or an
+ * FX rate to derive it from. A foreign-currency row with no `amount_base` is
+ * exactly the case ground rule 5 refuses to guess at: `missing_amount_base`
+ * flags any such row so its whole period comes back `unverified` rather than
+ * silently summing every *other* currency's rows and calling that a total.
+ * Rows whose amount is NULL -- ambiguous money the importer already sent to
+ * review -- are excluded rather than guessed either way; excluding real
+ * money is exactly what should surface as a nonzero delta instead of being
+ * masked.
  */
 async function sumTransactionWindows(
   client: ArchiveClient,
   pairs: readonly BalancePairRow[],
 ): Promise<WindowSum[]> {
   if (pairs.length === 0) return [];
-  let rows: readonly { i: number; currency: string; total: string }[];
+  let rows: readonly {
+    i: number;
+    total: string | null;
+    missing_amount_base: boolean;
+    missing_currency: string | null;
+  }[];
   try {
     const result = await client.query<{
       i: number;
-      currency: string;
-      total: string;
+      total: string | null;
+      missing_amount_base: boolean;
+      missing_currency: string | null;
     }>(
-      `SELECT w.i::int AS i, t.currency, sum(t.amount)::text AS total
-       FROM unnest($1::text[], $2::date[], $3::date[])
-         WITH ORDINALITY AS w(account_id, period_start, period_end, i)
+      `SELECT w.i::int AS i,
+              sum(CASE WHEN t.currency = w.currency THEN t.amount ELSE t.amount_base END)::text AS total,
+              bool_or(t.currency <> w.currency AND t.amount_base IS NULL) AS missing_amount_base,
+              (array_agg(t.currency)
+                FILTER (WHERE t.currency <> w.currency AND t.amount_base IS NULL))[1] AS missing_currency
+       FROM unnest($1::text[], $2::date[], $3::date[], $4::text[])
+         WITH ORDINALITY AS w(account_id, period_start, period_end, currency, i)
        JOIN transactions t
          ON t.account_id = w.account_id
         AND ${CASH_DATE} > w.period_start
         AND ${CASH_DATE} <= w.period_end
         AND t.amount IS NOT NULL
-       GROUP BY w.i, t.currency`,
+       GROUP BY w.i`,
       [
         pairs.map((p) => p.account_id),
         pairs.map((p) => p.prev_as_of),
         pairs.map((p) => p.as_of),
+        pairs.map((p) => p.currency),
       ],
     );
     rows = result.rows;
@@ -474,23 +577,21 @@ async function sumTransactionWindows(
     return pairs.map(() => ({ error: messageOf(error) }));
   }
 
-  const byPeriod = new Map<number, { currency: string; total: string }[]>();
-  for (const row of rows) {
-    const groups = byPeriod.get(row.i) ?? [];
-    groups.push(row);
-    byPeriod.set(row.i, groups);
-  }
+  const byPeriod = new Map<number, (typeof rows)[number]>();
+  for (const row of rows) byPeriod.set(row.i, row);
+
   return pairs.map((pair, index) => {
-    const groups = byPeriod.get(index + 1) ?? [];
-    if (groups.length === 0) return { total: "0" };
-    const foreign = groups.find((group) => group.currency !== pair.currency);
-    if (foreign) {
+    const row = byPeriod.get(index + 1);
+    if (row === undefined) return { total: "0" };
+    if (row.missing_amount_base) {
       return {
-        error: `a transaction in this window is in ${foreign.currency}, not the period's ${pair.currency}`,
+        error:
+          `a transaction in this window is in ${row.missing_currency}, not the period's ` +
+          `${pair.currency}, and has no amount_base to convert it; refusing to guess`,
       };
     }
     try {
-      return { total: fromNumericText(groups[0]?.total ?? "0") };
+      return { total: fromNumericText(row.total ?? "0") };
     } catch (error) {
       return { error: messageOf(error) };
     }
@@ -729,6 +830,45 @@ async function deleteSpannedVerdicts(
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** An account with neither acquired activity nor a stated balance. */
+const EMPTY_CASH_HISTORY: CashAccountHistory = Object.freeze({
+  earliestTransaction: null,
+  firstStatedBalanceAsOf: null,
+});
+
+/**
+ * F1-8e. How far back activity and stated balances reach, for every account
+ * with a period to check, in one round trip (F1-59) rather than one per
+ * account -- the cash twin of positionReconciliation.ts's
+ * `accountHistories`, reading `balances` where that one reads `positions`.
+ */
+async function cashAccountHistories(
+  client: ArchiveClient,
+  pairs: readonly BalancePairRow[],
+): Promise<Map<string, CashAccountHistory>> {
+  const histories = new Map<string, CashAccountHistory>();
+  const accounts = [...new Set(pairs.map((pair) => pair.account_id))];
+  if (accounts.length === 0) return histories;
+  const result = await client.query<{
+    account_id: string;
+    earliest_transaction: string | null;
+    first_stated_balance: string | null;
+  }>(
+    `SELECT a.account_id,
+       (SELECT min(process_date) FROM transactions WHERE account_id = a.account_id) AS earliest_transaction,
+       (SELECT min(as_of) FROM balances WHERE account_id = a.account_id) AS first_stated_balance
+     FROM unnest($1::text[]) AS a(account_id)`,
+    [accounts],
+  );
+  for (const row of result.rows) {
+    histories.set(row.account_id, {
+      earliestTransaction: row.earliest_transaction,
+      firstStatedBalanceAsOf: row.first_stated_balance,
+    });
+  }
+  return histories;
 }
 
 async function updateImportRun(

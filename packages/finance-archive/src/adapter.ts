@@ -505,6 +505,20 @@ export type ParsedRow = ParsedAmount & {
     readonly quantity: string | null;
     readonly price: string | null;
     readonly currency: string;
+    /**
+     * F1-8b/F1-38. `amount` converted into the account's base currency, when
+     * the source itself states that converted amount -- decimal text, used
+     * verbatim and never rounded (importer.ts's `resolveAmountBase`).
+     * Omitted or null when the source states no such figure for this row.
+     */
+    readonly amountBase?: string | null;
+    /**
+     * F1-8b/F1-38. The FX rate the source states for this row, decimal
+     * text. Recorded on `fx_rate` whenever it is known, and -- only when
+     * `amountBase` is absent -- multiplied against `amount` to derive
+     * `amount_base`, rounded half_even (importer.ts's `resolveAmountBase`).
+     */
+    readonly fxRate?: string | null;
     readonly runningBalance: string | null;
     readonly locators: Readonly<Record<string, FieldLocator>>;
   };

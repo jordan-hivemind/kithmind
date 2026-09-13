@@ -89,7 +89,14 @@ async function seed(client) {
         description, instrument_id, amount, currency, source_document_id,
         source_locator, row_hash, provider_txn_id, imported_at)
      VALUES
-       ('txn-out', 'acct-out', DATE '2025-04-18', DATE '2025-04-18', 'day',
+       -- F1-8e. Processed on (never after) bal-mar's own date, settled on
+       -- the date it actually posted: this fixture's own acquired history
+       -- then reaches back far enough that the cash gate's coverage-gap
+       -- rule does not turn the period this test checks into an unverified
+       -- one instead of the pass it is testing for, while the row's
+       -- cash-effective date (the later of the two, unchanged) still lands
+       -- inside the window exactly as before.
+       ('txn-out', 'acct-out', DATE '2025-03-31', DATE '2025-04-18', 'day',
         'Transfer out of Account', 'JOURNAL OUT', 'instr-rwngx', -41250.75, 'USD',
         'doc-pull', 'structured_api:0', 'hash:txn:out', 'ACT-ROWAN-000001', now()),
        ('txn-in', 'acct-in', DATE '2025-04-18', DATE '2025-04-18', 'day',

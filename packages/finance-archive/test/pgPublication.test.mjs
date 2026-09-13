@@ -177,7 +177,18 @@ test(
       {
         source: "synthetic-pull",
         documents: [
-          document("a".repeat(64), [row({ providerTxnId: "ptx-1" })]),
+          document("a".repeat(64), [
+            // F1-8e. Processed on (never after) the period's own start, so
+            // this fixture's own acquired history reaches back far enough
+            // that the coverage-gap rule leaves this period alone; settled
+            // two weeks later so the row still lands inside the window the
+            // cash gate sums (CASH_DATE is the later of the two dates).
+            row({
+              providerTxnId: "ptx-1",
+              processDate: "2026-03-01",
+              settleDate: "2026-03-15",
+            }),
+          ]),
         ],
       },
       NOW,
@@ -451,7 +462,15 @@ test(
       {
         source: "synthetic-pull",
         documents: [
-          document("a".repeat(64), [row({ providerTxnId: "ptx-1" })]),
+          document("a".repeat(64), [
+            // F1-8e. See the coverage-gap comment above: processed on the
+            // period's own start, settled two weeks later.
+            row({
+              providerTxnId: "ptx-1",
+              processDate: "2026-03-01",
+              settleDate: "2026-03-15",
+            }),
+          ]),
         ],
       },
       NOW,

@@ -1550,3 +1550,126 @@ test(
     );
   },
 );
+
+// --- F1-8b: amount_base/fx_rate/amount_base_rounding ------------------------
+//
+// ACCOUNT's base_currency is USD (seed()). A foreign-currency row's own
+// amount stays in its own currency; amount_base is what the cash gate can
+// sum across accounts/periods once it is populated here at import.
+
+test(
+  "F1-8b: a stated base-currency amount is used verbatim, never rounded",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+
+    await importBatch(
+      client,
+      {
+        source: "synthetic-pull",
+        documents: [
+          document("a".repeat(64), [
+            row({
+              providerTxnId: "ptx-1",
+              currency: "EUR",
+              amountText: "-100.00",
+              // The statement itself states the USD-equivalent amount.
+              amountBaseText: "-108.35",
+              fxRateText: "1.0835",
+            }),
+          ]),
+        ],
+      },
+      NOW,
+    );
+
+    const stored = await one(
+      client,
+      `SELECT amount::text AS amount, currency, amount_base::text AS amount_base,
+              fx_rate::text AS fx_rate, amount_base_rounding
+         FROM transactions WHERE provider_txn_id = 'ptx-1'`,
+    );
+    assert.equal(stored.amount, "-100");
+    assert.equal(stored.currency, "EUR");
+    // Verbatim: not re-derived from amount * fx_rate (which would also be
+    // -108.35 here, so a rate-derivation bug rounding it differently would
+    // not be caught by this assertion alone; the next test exercises that).
+    assert.equal(stored.amount_base, "-108.35");
+    assert.equal(stored.fx_rate, "1.0835");
+    assert.equal(stored.amount_base_rounding, "none");
+  },
+);
+
+test(
+  "F1-8b: an amount and a stated FX rate derive amount_base, rounded half_even",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+
+    // -100 * 1.08345 = -108.345 exactly: a genuine tie at the second decimal
+    // place. Round-half-up would give -108.35; half_even rounds to the even
+    // neighbor, -108.34, which is the assertion below -- proof this is
+    // actually half_even and not some other rule that happens to agree with
+    // it on non-tied inputs.
+    await importBatch(
+      client,
+      {
+        source: "synthetic-pull",
+        documents: [
+          document("b".repeat(64), [
+            row({
+              providerTxnId: "ptx-1",
+              currency: "EUR",
+              amountText: "-100",
+              fxRateText: "1.08345",
+            }),
+          ]),
+        ],
+      },
+      NOW,
+    );
+
+    const stored = await one(
+      client,
+      `SELECT amount_base::text AS amount_base, fx_rate::text AS fx_rate,
+              amount_base_rounding
+         FROM transactions WHERE provider_txn_id = 'ptx-1'`,
+    );
+    assert.equal(stored.amount_base, "-108.34");
+    assert.equal(stored.fx_rate, "1.08345");
+    assert.equal(stored.amount_base_rounding, "half_even");
+  },
+);
+
+test(
+  "F1-8b: a foreign-currency row with neither a stated base amount nor a rate leaves amount_base null",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+
+    await importBatch(
+      client,
+      {
+        source: "synthetic-pull",
+        documents: [
+          document("c".repeat(64), [
+            row({ providerTxnId: "ptx-1", currency: "EUR", amountText: "-100.00" }),
+          ]),
+        ],
+      },
+      NOW,
+    );
+
+    const stored = await one(
+      client,
+      `SELECT amount_base, fx_rate, amount_base_rounding
+         FROM transactions WHERE provider_txn_id = 'ptx-1'`,
+    );
+    assert.equal(stored.amount_base, null);
+    assert.equal(stored.fx_rate, null);
+    assert.equal(stored.amount_base_rounding, null);
+  },
+);

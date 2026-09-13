@@ -289,6 +289,36 @@ export function resolveRowCurrency(rawCcy) {
 }
 
 /**
+ * F1-8b/F1-38. This row's FX rate, when the activity API states one that
+ * actually applies to it -- decimal text for `ParsedRow.fxRate`, which the
+ * generic importer (`resolveAmountBase`, `@repo/finance-archive`'s
+ * importer.ts) multiplies against the already-signed `amount` to derive
+ * `amount_base`, rounded half_even and recorded as such.
+ *
+ * Deliberately never `ParsedRow.amountBase` directly, even though the API
+ * also retains `fxSourceAmount` (README, "Retention"): that field is an
+ * *unsigned* magnitude ("108.35", never "-108.35"), and the account's
+ * base-currency equivalent of a disbursement needs the disbursement's own
+ * sign, which nothing in `fxSourceAmount` states. `fxMarketRate` has no such
+ * gap -- it is a ratio, not a signed amount, so multiplying it by the
+ * already-correctly-signed `amount` this row already resolved carries the
+ * sign through correctly with no separate assumption. `fxLocalCurrency` is
+ * checked against this row's own resolved `currency` first: a rate stated
+ * for a currency this row is not even denominated in is not this row's rate,
+ * and amount_base stays honestly unpopulated rather than applying it anyway.
+ */
+export function resolveFxRate(item, currency) {
+  if (currency === BASE_CURRENCY) return null;
+  if (item.fxLocalCurrency !== currency) return null;
+  if (item.fxMarketRate === null || item.fxMarketRate === undefined) return null;
+  try {
+    return canonicalizeDecimal(String(item.fxMarketRate));
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Signed, positive for an acquisition and negative for a disposal
  * (ParsedRow.quantity's contract). `rawQuantity` is this institution's
  * unsigned magnitude; `activityType` selects the sign from
@@ -973,6 +1003,10 @@ function parseStructuredApi(bytes) {
         quantity: resolveSignedQuantity(item.activity, item.quantity ?? null),
         price: item.price === null || item.price === undefined ? null : canonicalizeDecimal(String(item.price)),
         currency,
+        // F1-8b/F1-38. See resolveFxRate: recorded whenever it applies to
+        // this row, so the archive's cash gate can convert this row into
+        // the account's base currency instead of refusing to sum it.
+        fxRate: resolveFxRate(item, currency),
         // runningBalances is retained in the raw bytes (ACTIVITY_RETENTION)
         // now that it is confirmed a scalar, but not yet surfaced as
         // ParsedRow.runningBalance in v1 -- deferred, not blocked.
