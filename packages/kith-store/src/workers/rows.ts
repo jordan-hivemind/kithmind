@@ -362,6 +362,18 @@ export type WorkerOperationReceiptRow = {
   processingGenerationId: string | null;
   ingestJobId: string | null;
   desiredProcessingEpoch: number | null;
+  resultState: string | null;
+  resultLeaseExpiresAt: Date | null;
+  resultActivatedAt: Date | null;
+  resultPreviousGenerationId: string | null;
+  resultActualPageCount: number | null;
+  resultActualEvidenceSpanCount: number | null;
+  resultActualDocumentCount: number | null;
+  resultActualChunkCount: number | null;
+  resultRetryable: boolean | null;
+  resultNextAttemptAt: Date | null;
+  resultFailureCode: string | null;
+  resultFailureAt: Date | null;
   createdAtField: Date;
   retireAt: Date;
 };
@@ -372,6 +384,10 @@ export function camelizeOperationReceipt(
   return camelize<WorkerOperationReceiptRow>(raw, [
     "leaseEpoch",
     "desiredProcessingEpoch",
+    "resultActualPageCount",
+    "resultActualEvidenceSpanCount",
+    "resultActualDocumentCount",
+    "resultActualChunkCount",
   ]);
 }
 

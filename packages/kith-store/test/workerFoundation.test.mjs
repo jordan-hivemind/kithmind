@@ -10,6 +10,7 @@ import {
 import {
   END_CURSOR,
   WorkerProtocolError,
+  activateProcessingJob,
   appendWorkerScanPage,
   admitDiscoveryUtf8,
   beginWorkerScan,
@@ -20,9 +21,12 @@ import {
   keysetTail,
   requireWorkerSourceAccount,
   reconcileWorkerScan,
+  renewProcessingJob,
   reserveDiscoveryWork,
+  reserveProcessingJobs,
   resolveAndPersistEntry,
   sealWorkerScan,
+  stageProcessingUtf8,
   withWorkerTransaction,
   workerCtx,
 } from "../dist/workers/index.js";
@@ -49,8 +53,7 @@ test("worker cursors preserve PostgreSQL microseconds in the ordering key", () =
   assert.deepEqual(decodeCursor(encoded), { createdAt, id });
   assert.deepEqual(keysetTail(decodeCursor(encoded), 4), {
     sql:
-      "AND (created_at, id) > ($4, $5) " +
-      "ORDER BY created_at, id LIMIT $6",
+      "AND (created_at, id) > ($4, $5) " + "ORDER BY created_at, id LIMIT $6",
     values: [createdAt, id],
   });
   assert.equal(decodeCursor(END_CURSOR), null);
@@ -116,7 +119,15 @@ async function fixture(t) {
     principal,
     { spaceId, sourceAccountId },
   );
-  return { ...database, userId, spaceId, sourceAccountId, credential, principal, source };
+  return {
+    ...database,
+    userId,
+    spaceId,
+    sourceAccountId,
+    credential,
+    principal,
+    source,
+  };
 }
 
 async function makeScan(f, inventoryEpoch = 1) {
@@ -313,10 +324,10 @@ test(
           NOW,
         ),
       ]);
-      assert.deepEqual(
-        raced.map(({ status }) => status).sort(),
-        ["fulfilled", "rejected"],
-      );
+      assert.deepEqual(raced.map(({ status }) => status).sort(), [
+        "fulfilled",
+        "rejected",
+      ]);
       const rejected = raced.find(({ status }) => status === "rejected");
       assert.ok(
         rejected.status === "rejected" &&
@@ -727,6 +738,168 @@ test(
         ).rows[0].count,
         1,
       );
+
+      const jobReserveRequest = {
+        protocolVersion: 1,
+        operation: "jobs.reserve",
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        requestId: "job-reserve-1",
+        maxItems: 1,
+      };
+      const jobToken = "3".repeat(64);
+      const jobReservation = await call((ctx) =>
+        reserveProcessingJobs(ctx, f.principal, jobReserveRequest, [jobToken]),
+      );
+      assert.equal(jobReservation.targets.length, 1);
+      assert.equal(jobReservation.targets[0].jobId, admitted.ingestJobId);
+      assert.deepEqual(
+        await call((ctx) =>
+          reserveProcessingJobs(ctx, f.principal, jobReserveRequest, [
+            jobToken,
+          ]),
+        ),
+        { ...jobReservation, reused: true },
+      );
+      const renewed = await call(
+        (ctx) =>
+          renewProcessingJob(ctx, f.principal, {
+            protocolVersion: 1,
+            operation: "jobs.renew",
+            spaceId: f.spaceId,
+            sourceAccountId: f.sourceAccountId,
+            requestId: "job-renew-1",
+            jobId: admitted.ingestJobId,
+            leaseEpoch: 1,
+            leaseToken: jobToken,
+          }),
+        NOW + 100,
+      );
+      assert.equal(renewed.leaseExpiresAt, NOW + 100 + 5 * 60 * 1_000);
+      await assert.rejects(
+        call(
+          (ctx) =>
+            stageProcessingUtf8(ctx, f.principal, {
+              protocolVersion: 1,
+              operation: "jobs.stageUtf8",
+              spaceId: f.spaceId,
+              sourceAccountId: f.sourceAccountId,
+              requestId: "job-stage-expired",
+              jobId: admitted.ingestJobId,
+              leaseEpoch: 1,
+              leaseToken: jobToken,
+            }),
+          renewed.leaseExpiresAt + 1,
+        ),
+        expectProtocolCode("lease_conflict"),
+      );
+      const reclaimedAt = renewed.leaseExpiresAt + 1;
+      const replacementToken = "4".repeat(64);
+      const reclaimed = await call(
+        (ctx) =>
+          reserveProcessingJobs(
+            ctx,
+            f.principal,
+            { ...jobReserveRequest, requestId: "job-reserve-2" },
+            [replacementToken],
+          ),
+        reclaimedAt,
+      );
+      assert.equal(reclaimed.targets[0].leaseEpoch, 2);
+
+      await f.client
+        .query(`CREATE FUNCTION kith.reject_worker_document() RETURNS trigger
+        LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic document refusal'; END $$`);
+      await f.client
+        .query(`CREATE TRIGGER reject_worker_document BEFORE INSERT ON kith.documents
+        FOR EACH ROW EXECUTE FUNCTION kith.reject_worker_document()`);
+      const stageRequest = {
+        protocolVersion: 1,
+        operation: "jobs.stageUtf8",
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        requestId: "job-stage-1",
+        jobId: admitted.ingestJobId,
+        leaseEpoch: 2,
+        leaseToken: replacementToken,
+      };
+      await assert.rejects(
+        call(
+          (ctx) => stageProcessingUtf8(ctx, f.principal, stageRequest),
+          reclaimedAt,
+        ),
+        expectProtocolCode("scan_conflict"),
+      );
+      assert.deepEqual(
+        (
+          await f.client.query(
+            `SELECT
+               (SELECT count(*)::int FROM kith.source_text_versions WHERE source_revision_id = $1) AS texts,
+               (SELECT count(*)::int FROM kith.source_pages) AS pages,
+               (SELECT count(*)::int FROM kith.evidence_spans) AS spans,
+               (SELECT count(*)::int FROM kith.documents) AS documents`,
+            [admitted.sourceRevisionId],
+          )
+        ).rows[0],
+        { texts: 0, pages: 0, spans: 0, documents: 0 },
+      );
+      await f.client.query(
+        "DROP TRIGGER reject_worker_document ON kith.documents",
+      );
+      await f.client.query("DROP FUNCTION kith.reject_worker_document() ");
+      const staged = await call(
+        (ctx) => stageProcessingUtf8(ctx, f.principal, stageRequest),
+        reclaimedAt,
+      );
+      assert.equal(staged.state, "staged");
+      assert.equal(staged.reused, false);
+      assert.equal(
+        (
+          await f.client.query(
+            "SELECT publication_state FROM kith.documents WHERE processing_generation_id = $1",
+            [admitted.processingGenerationId],
+          )
+        ).rows[0].publication_state,
+        "staged",
+      );
+      const activateRequest = {
+        protocolVersion: 1,
+        operation: "jobs.activate",
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        requestId: "job-activate-1",
+        jobId: admitted.ingestJobId,
+        leaseEpoch: 2,
+        leaseToken: replacementToken,
+      };
+      const activated = await call(
+        (ctx) => activateProcessingJob(ctx, f.principal, activateRequest),
+        reclaimedAt,
+      );
+      assert.equal(activated.state, "ready");
+      assert.equal(activated.reused, false);
+      assert.equal(
+        (
+          await call(
+            (ctx) => activateProcessingJob(ctx, f.principal, activateRequest),
+            reclaimedAt,
+          )
+        ).reused,
+        true,
+      );
+      const published = (
+        await f.client.query(
+          `SELECT i.active_generation_id, d.publication_state
+             FROM kith.source_items i
+             JOIN kith.documents d ON d.processing_generation_id = i.active_generation_id
+            WHERE i.id = $1`,
+          [admitted.sourceItemId],
+        )
+      ).rows[0];
+      assert.deepEqual(published, {
+        active_generation_id: admitted.processingGenerationId,
+        publication_state: "active",
+      });
     } finally {
       await pool.end();
     }

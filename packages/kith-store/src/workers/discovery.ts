@@ -372,7 +372,7 @@ async function loadJob(ctx: WorkerCtx, id: string): Promise<IngestJobRow | null>
   return found ? camelizeIngestJob(found) : null;
 }
 
-async function validateAdmittedChain(
+export async function validateAdmittedChain(
   ctx: WorkerCtx,
   current: CurrentDiscovery,
   ids: { sourceRevisionId: string; processingGenerationId: string; ingestJobId: string; desiredProcessingEpoch: number },
@@ -564,7 +564,7 @@ async function createOrReuseInlineAdmission(
      actor_user_id, actor_credential_id, desired_processing_epoch, state, attempts,
      lease_epoch, worker_managed, next_attempt_at, worker_discovery_work_id,
      worker_observation_epoch, worker_processing_mode)
-    VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6,$7,$8,$7,$8,$9,'queued',0,0,true,$10,$11,$12,'inline_utf8_v1')`,
+    VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6,$7,$8,$7,$8,$9,'queued',0,0,true,$10,$11,$12,NULL)`,
     [ingestJobId, current.source.spaceId, current.source.account.id, current.item.id, revision.id, processingGenerationId, work.actorUserId, work.actorCredentialId, desiredProcessingEpoch, at(ctx.now), work.id, work.observationEpoch]);
   await exec(ctx, `INSERT INTO kith.ingest_requests
     (id, space_id, created_at, source_account_id, request_id, request_digest, source_item_id,

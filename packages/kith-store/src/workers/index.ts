@@ -10,6 +10,7 @@ export * from "./digests.js";
 export * from "./discovery.js";
 export * from "./entries.js";
 export * from "./errors.js";
+export * from "./jobs.js";
 export * from "./profile.js";
 export * from "./rateLimit.js";
 export * from "./rows.js";
