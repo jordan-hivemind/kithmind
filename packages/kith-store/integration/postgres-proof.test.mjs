@@ -639,19 +639,23 @@ test(
     await restoredOwner.query(
       "ALTER TABLE kith.api_keys DROP CONSTRAINT api_keys_id_space_unique",
     );
+    await restoredOwner.query("DROP DOMAIN kith.kith_id");
     await restoredOwner.query(
-      "DELETE FROM kith.schema_migrations WHERE version=2",
+      "DELETE FROM kith.schema_version WHERE version > 1",
     );
     await applyProofMigration(restoredOwner, restoredRole.role);
     const upgradedVersions = await restoredOwner.query(
-      "SELECT version::int AS version FROM kith.schema_migrations ORDER BY version",
+      "SELECT version::int AS version FROM kith.schema_version ORDER BY version",
     );
     assert.deepEqual(
       upgradedVersions.rows.map((row) => row.version),
-      [1, 2],
+      [1, 2, 3],
     );
+    // A gap rather than a rollback: version 1 missing while 2 and 3 are
+    // recorded is a history no build can migrate from, and guessing is how a
+    // schema gets half-applied twice.
     await restoredOwner.query(
-      "DELETE FROM kith.schema_migrations WHERE version=1",
+      "DELETE FROM kith.schema_version WHERE version=1",
     );
     await assert.rejects(
       applyProofMigration(restoredOwner, restoredRole.role),

@@ -1,6 +1,4 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
-import { fileURLToPath } from "node:url";
 
 import type { Pool, PoolClient, QueryResultRow } from "pg";
 import {
@@ -9,16 +7,43 @@ import {
   parseFinanceCurrency,
 } from "@repo/finance-contract";
 
+import { ProofError } from "./errors.js";
+import {
+  applyKithSchema,
+  KITH_DOMAINS,
+  KITH_SCHEMA,
+  withKithTransaction,
+} from "./schema.js";
+
+export { ProofError } from "./errors.js";
+export {
+  assertKithId,
+  GENERATED_KITH_ID_LENGTH,
+  KITH_ID,
+  newKithId,
+} from "./ids.js";
+export { spacePredicate, type SpacePredicate } from "./spaces.js";
+export {
+  applyKithReaderRole,
+  applyKithSchema,
+  createKithPool,
+  KITH_DOMAINS,
+  KITH_IDLE_TRANSACTION_TIMEOUT_MS,
+  KITH_LOCK_TIMEOUT_MS,
+  KITH_MIGRATIONS,
+  KITH_SCHEMA,
+  KITH_SCHEMA_LOCK_KEY,
+  KITH_SCHEMA_VERSION,
+  KITH_SERIALIZATION_ATTEMPTS,
+  KITH_STATEMENT_TIMEOUT_MS,
+  kithSchemaVersion,
+  withKithTransaction,
+  type KithMigration,
+} from "./schema.js";
+
 const SHA256 = /^[0-9a-f]{64}$/;
 const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-
-export class ProofError extends Error {
-  constructor(public readonly code: string) {
-    super(code);
-    this.name = "ProofError";
-  }
-}
 
 export type PageInput = { pageNumber: number; text: string; textHash: string };
 export type EvidenceInput = {
@@ -365,15 +390,12 @@ export function validateStageGenerationInput(
   }
 }
 
-const migrations = [
-  { version: 1, url: new URL("../migrations/001_init.sql", import.meta.url) },
-  {
-    version: 2,
-    url: new URL("../migrations/002_worker_jobs.sql", import.meta.url),
-  },
-] as const;
-const MIGRATION_LOCK_KEY = 4_119_239_002;
-
+/**
+ * The proof surface's entry point: apply the schema, then grant the app role
+ * what it needs. The schema half is `applyKithSchema` (schema.ts), which every
+ * caller in the port shares; this keeps the grant beside it so a caller cannot
+ * end up with tables no role can write.
+ */
 export async function applyProofMigration(
   owner: Pool,
   appRole: string,
@@ -382,53 +404,7 @@ export async function applyProofMigration(
     throw new ProofError("invalid_app_role");
   const client = await owner.connect();
   try {
-    await client.query("BEGIN");
-    await client.query("SELECT pg_advisory_xact_lock($1)", [
-      MIGRATION_LOCK_KEY,
-    ]);
-    const present = await client.query<{ present: boolean }>(
-      "SELECT to_regclass('kith.schema_migrations') IS NOT NULL AS present",
-    );
-    let current = 0;
-    if (present.rows[0]?.present) {
-      const result = await client.query<{ version: number }>(
-        "SELECT version::int AS version FROM kith.schema_migrations ORDER BY version",
-      );
-      const versions = result.rows.map((row) => row.version);
-      if (
-        versions.length === 0 ||
-        versions.some((version, index) => version !== index + 1)
-      ) {
-        throw new ProofError("schema_history_invalid");
-      }
-      current = versions.at(-1)!;
-    }
-    if (current > migrations.length) throw new ProofError("schema_too_new");
-    for (const migration of migrations) {
-      if (migration.version <= current) continue;
-      if (migration.version !== current + 1)
-        throw new ProofError("schema_version_gap");
-      const sql = await readFile(fileURLToPath(migration.url), "utf8");
-      await client.query(sql);
-      await client.query(
-        "INSERT INTO kith.schema_migrations(version) VALUES ($1)",
-        [migration.version],
-      );
-      current = migration.version;
-    }
-    const verified = await client.query<{ version: number }>(
-      "SELECT version::int AS version FROM kith.schema_migrations ORDER BY version",
-    );
-    if (
-      current !== migrations.length ||
-      verified.rows.length !== migrations.length ||
-      verified.rows.some((row, index) => row.version !== index + 1)
-    )
-      throw new ProofError("schema_version_incomplete");
-    await client.query("COMMIT");
-  } catch (error) {
-    await client.query("ROLLBACK");
-    throw error;
+    await applyKithSchema(client);
   } finally {
     client.release();
   }
@@ -451,6 +427,13 @@ export async function grantProofAppRole(
     kith.documents, kith.source_revisions, kith.generations, kith.pages,
     kith.evidence, kith.chunks, kith.synthetic_financial_attachments,
     kith.idempotency_receipts, kith.worker_jobs TO "${appRole}"`);
+  // USAGE on a domain is granted to PUBLIC by default and revoked from PUBLIC
+  // when the reader role is applied, so the writer is granted it by name.
+  for (const domain of KITH_DOMAINS) {
+    await owner.query(
+      `GRANT USAGE ON DOMAIN ${KITH_SCHEMA}.${domain} TO "${appRole}"`,
+    );
+  }
 }
 
 export async function seedSyntheticSpace(
@@ -515,15 +498,6 @@ type ProofOptions = {
 
 type AuthContext = { spaceId: string; apiKeyId: string };
 
-function isSerializationFailure(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    error.code === "40001"
-  );
-}
-
 export class PostgresProof {
   constructor(
     private readonly pool: Pool,
@@ -542,31 +516,22 @@ export class PostgresProof {
     return { spaceId: result.rows[0]!.space_id, apiKeyId: result.rows[0]!.id };
   }
 
+  /**
+   * One mutation, one `SERIALIZABLE` transaction, bounded retry: all of it
+   * `withKithTransaction` (schema.ts), which the whole port shares.
+   *
+   * The credential is re-read *inside* the transaction, in the same snapshot as
+   * the work, so a revocation that commits mid-request is seen by this request
+   * rather than by the next one.
+   */
   private async transaction<T>(
     work: (client: PoolClient, spaceId: string, apiKeyId: string) => Promise<T>,
     apiKey: string,
   ): Promise<T> {
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
-      const client = await this.pool.connect();
-      try {
-        await client.query("BEGIN ISOLATION LEVEL SERIALIZABLE");
-        await client.query("SET LOCAL statement_timeout = '5s'");
-        await client.query("SET LOCAL lock_timeout = '2s'");
-        await client.query(
-          "SET LOCAL idle_in_transaction_session_timeout = '5s'",
-        );
-        const auth = await this.authenticate(client, apiKey);
-        const result = await work(client, auth.spaceId, auth.apiKeyId);
-        await client.query("COMMIT");
-        return result;
-      } catch (error) {
-        await client.query("ROLLBACK");
-        if (!isSerializationFailure(error) || attempt === 3) throw error;
-      } finally {
-        client.release();
-      }
-    }
-    throw new ProofError("transaction_retry_exhausted");
+    return withKithTransaction(this.pool, async (client) => {
+      const auth = await this.authenticate(client, apiKey);
+      return work(client, auth.spaceId, auth.apiKeyId);
+    });
   }
 
   private async idempotent<T extends object>(

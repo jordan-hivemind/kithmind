@@ -3,9 +3,17 @@
 Status: isolated prototype. This package does not replace the deployed backend
 or the finance archive.
 
+The package it lives in is now `@repo/kith-store`, renamed from
+`@repo/postgres-proof` by P2-39a, which grew it into the foundation the
+[consolidation plan](plans/2026-09-12-postgres-consolidation.md) ports onto: the
+`kith` schema bootstrap and migration runner over `kith.schema_version`, the id
+convention, the pool, the transaction helper and the space predicate. The
+lifecycle proof described below is unchanged. The CI job that runs it is still
+named `postgres-proof`.
+
 ## Scope
 
-`@repo/postgres-proof` exercises one bounded document lifecycle against a real
+`@repo/kith-store` exercises one bounded document lifecycle against a real
 PostgreSQL 18 server. It demonstrates:
 
 - opaque API-key authentication by a stored SHA-256 digest and an immediate
@@ -34,9 +42,9 @@ financial importer, reconciliation model, or proof of financial query coverage.
 ## Boundaries
 
 The durable schema starts in
-[`001_init.sql`](../packages/postgres-proof/migrations/001_init.sql), with worker
+[`001_init.sql`](../packages/kith-store/migrations/001_init.sql), with worker
 state added by
-[`002_worker_jobs.sql`](../packages/postgres-proof/migrations/002_worker_jobs.sql).
+[`002_worker_jobs.sql`](../packages/kith-store/migrations/002_worker_jobs.sql).
 The database owner applies migrations and manages spaces and API-key lifecycle.
 The application role is a non-owner without role or database creation
 privileges. It receives read access plus write access only to document content,
@@ -117,14 +125,20 @@ deliberate remaining integration gates.
 The default repository test remains independent of Docker:
 
 ```sh
-pnpm --filter @repo/postgres-proof test:once
+pnpm --filter @repo/kith-store test:once
 ```
+
+P2-39a added a schema suite to it that does need a server. It skips cleanly when
+`KITH_STORE_DATABASE_URL` is unset, creates and drops its own throwaway database
+when it is set, and fails to load rather than skipping when
+`KITH_STORE_REQUIRE_DATABASE=1` says a server was supposed to be there. CI sets
+both on the `verify` job, beside the archive's own pair.
 
 The explicit integration command requires Docker and fails if Docker or the
 pinned image is unavailable:
 
 ```sh
-pnpm --filter @repo/postgres-proof test:integration
+pnpm --filter @repo/kith-store test:integration
 ```
 
 The harness ignores ambient database URLs. It starts only randomly named,
@@ -141,11 +155,11 @@ archive design.
 
 Focused verification on 2026-09-08:
 
-| Command                                               | Result                                                                                  |
-| ----------------------------------------------------- | --------------------------------------------------------------------------------------- |
-| `pnpm --filter @repo/postgres-proof check-types`      | Passed                                                                                  |
-| `pnpm --filter @repo/postgres-proof test:once`        | 3 passed                                                                                |
-| `pnpm --filter @repo/postgres-proof test:integration` | 1 passed against two real isolated PostgreSQL 18 servers, including subprocess recovery |
+| Command                                           | Result                                                                                  |
+| ------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| `pnpm --filter @repo/kith-store check-types`      | Passed                                                                                  |
+| `pnpm --filter @repo/kith-store test:once`        | 3 passed                                                                                |
+| `pnpm --filter @repo/kith-store test:integration` | 1 passed against two real isolated PostgreSQL 18 servers, including subprocess recovery |
 
 ## Remaining parity work
 

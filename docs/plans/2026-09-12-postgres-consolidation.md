@@ -224,7 +224,8 @@ Recommendation: a second schema named `kith`, beside `finance`, in the same
 database. Not one merged schema.
 
 `kith` is the name the merged prototype already creates in
-`packages/postgres-proof/migrations/001_init.sql`. Reusing it avoids a rename.
+`packages/kith-store/migrations/001_init.sql` (`packages/postgres-proof` when
+this plan was written). Reusing it avoids a rename.
 
 | Option                    | Cost                                                                                                                                                                                                                                                              |
 | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -548,7 +549,7 @@ vendor relationship.
 
 ## 4. Proof gates before any cutover
 
-The prototype in `packages/postgres-proof` already closes part of this. The
+The prototype in `packages/kith-store` already closes part of this. The
 column below records what it proved on 2026-09-08 against two real PostgreSQL 18
 servers, and what P2-39 still owes.
 

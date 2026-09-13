@@ -35,6 +35,12 @@
 // `schema_version` can never answer for the archive's. See `pgSchema.ts`.
 
 import pg from "pg";
+import {
+  assertPgSchemaName,
+  pinSchema,
+  pinnedSchemaOf,
+  withSchemaTransaction,
+} from "@repo/pg";
 
 /** Type OIDs whose decoding this package refuses to leave to a default. */
 export const PINNED_TEXT_OIDS: readonly number[] = Object.freeze([
@@ -74,14 +80,6 @@ export function decodesAsText(oid: number): boolean {
 export const DEFAULT_ARCHIVE_SCHEMA = "finance";
 
 /**
- * Schema names are interpolated into DDL and into `SET LOCAL search_path`,
- * where a bind parameter is not allowed, so the name is validated to a plain
- * lowercase identifier rather than quoted. Anything else is a configuration
- * error, not something to escape and hope about.
- */
-const SCHEMA_NAME = /^[a-z_][a-z0-9_]{0,62}$/;
-
-/**
  * The archive schema, from the environment. `FINANCE_ARCHIVE_SCHEMA` exists
  * so one database can host more than one archive (a throwaway per test, say),
  * not so the archive can be pointed at a shared `public`.
@@ -92,29 +90,25 @@ export function archiveSchemaName(
   return assertSchemaName(env.FINANCE_ARCHIVE_SCHEMA ?? DEFAULT_ARCHIVE_SCHEMA);
 }
 
+/**
+ * Schema names are interpolated into DDL and into `SET LOCAL search_path`,
+ * where a bind parameter is not allowed, so the name is validated to a plain
+ * lowercase identifier rather than quoted. Anything else is a configuration
+ * error, not something to escape and hope about. Shared with the brain schema
+ * through `@repo/pg`; the label only names the archive in the message.
+ */
 export function assertSchemaName(name: string): string {
-  if (!SCHEMA_NAME.test(name)) {
-    throw new Error(
-      `${JSON.stringify(name)} is not a usable archive schema name; ` +
-        "use lowercase letters, digits and underscores, starting with a letter or underscore",
-    );
-  }
-  return name;
+  return assertPgSchemaName(name, "archive");
 }
-
-/** The schema each connection was opened against. */
-const pinnedSchemas = new WeakMap<object, string>();
 
 /** Records the schema a connection resolves archive objects in. */
 export function pinArchiveSchema(client: object, schema: string): string {
-  const name = assertSchemaName(schema);
-  pinnedSchemas.set(client, name);
-  return name;
+  return pinSchema(client, schema, "archive");
 }
 
 /** The schema a connection resolves archive objects in. */
 export function archiveSchemaOf(client: object): string {
-  return pinnedSchemas.get(client) ?? archiveSchemaName();
+  return pinnedSchemaOf(client) ?? archiveSchemaName();
 }
 
 /**
@@ -291,9 +285,6 @@ export async function insertRows(
   }
 }
 
-/** Clients currently inside a `withArchiveTransaction` block. */
-const openTransactions = new WeakSet<object>();
-
 /**
  * Runs `body` inside one archive transaction, and nests: an inner call on a
  * client already inside one joins it rather than opening a second.
@@ -305,30 +296,18 @@ const openTransactions = new WeakSet<object>();
  * verdict, which is exactly the confidently-wrong answer the gates exist to
  * prevent. Nesting gives both from one BEGIN, with no caller left to remember
  * a rule.
+ *
+ * The mechanism itself -- BEGIN, the `SET LOCAL search_path` pin inside the
+ * transaction rather than in a startup packet, the nesting, COMMIT or ROLLBACK
+ * -- is `@repo/pg`'s `withSchemaTransaction` (P2-39a). All this adds is the
+ * archive's schema. No isolation level or timeout is passed, so the statements
+ * issued are exactly the two this function has always issued.
  */
 export async function withArchiveTransaction<T>(
   client: ArchiveClient,
   body: (client: ArchiveClient) => Promise<T>,
 ): Promise<T> {
-  if (openTransactions.has(client)) return body(client);
-  openTransactions.add(client);
-  await client.query("BEGIN");
-  try {
-    // Pinned inside the transaction rather than relying on a startup packet
-    // or a session-level `SET`, so a pooler handing this transaction a
-    // different backend than the last one still resolves archive objects
-    // correctly. The schema name is a validated identifier, which is why it
-    // can be interpolated where a bind parameter is not allowed.
-    await client.query(`SET LOCAL search_path TO ${archiveSchemaOf(client)}`);
-    const result = await body(client);
-    await client.query("COMMIT");
-    return result;
-  } catch (error) {
-    await client.query("ROLLBACK");
-    throw error;
-  } finally {
-    openTransactions.delete(client);
-  }
+  return withSchemaTransaction(client, archiveSchemaOf(client), body);
 }
 
 /**

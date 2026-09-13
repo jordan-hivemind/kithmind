@@ -46,6 +46,11 @@ jobs:
       # skip would mean the database never reached the task, which looks
       # exactly like a green run.
       FINANCE_ARCHIVE_REQUIRE_DATABASE: "1"
+      # The brain schema's own suite, against the same server. It creates a
+      # throwaway database per file and drops it, so `kith` and `finance` are
+      # applied side by side for real rather than in a renamed schema.
+      KITH_STORE_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      KITH_STORE_REQUIRE_DATABASE: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -66,6 +71,9 @@ jobs:
       - run: pnpm test:once
       - run: pnpm build
 
+  # Named for the prototype this package grew out of and kept that way on
+  # purpose: branch protection gates merges on this job name. The package it
+  # runs is @repo/kith-store (P2-39a).
   postgres-proof:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -79,4 +87,4 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm --filter @repo/postgres-proof test:integration
+      - run: pnpm --filter @repo/kith-store test:integration
