@@ -12,8 +12,12 @@ function constraintName(name: string): string {
   return `${name.slice(0, 54)}_${hash}`;
 }
 
+// Every id, space_id and reference column uses `@repo/kith-store`'s
+// `kith.kith_id` domain (migration 003) rather than a bare `text`: the same
+// preserved-text convention, its length and character-class CHECK, and its
+// generator (`newKithId`) all come from that package now, not restated here.
 const PG_KIND: Record<string, string> = {
-  ref: "text",
+  ref: "kith.kith_id",
   text: "text",
   number: "numeric",
   boolean: "boolean",
@@ -32,30 +36,48 @@ function spaceScopedByPgName(): Map<string, boolean> {
 }
 
 /**
- * Generates the `kith` schema migration SQL from `TABLES`, the same
+ * Generates the table-and-foreign-key SQL body for `TABLES`, the same
  * declarative mapping `transform.ts` reads, so the DDL and the transform
  * cannot drift (this row's acceptance requirement, plan section 3 step 3).
+ *
+ * This is table content only: no `CREATE SCHEMA`, no version-tracking table,
+ * and no recorded-version insert. `@repo/kith-store`'s `applyKithSchema`
+ * already creates the `kith` schema and `kith.schema_version`, runs each
+ * migration file (this one included, registered as
+ * `packages/kith-store/migrations/004_kith_migrate_tables.sql`) inside its
+ * own transaction, and records the version itself — restating any of that
+ * here would be two places for the schema bootstrap to drift.
  *
  * Tables are created first with only their own columns, primary key, and
  * (for space-scoped tables) `UNIQUE (id, space_id)`; every foreign key is
  * added afterward as `DEFERRABLE INITIALLY DEFERRED`, in a second pass, so
  * forward references, self-references, and load-time deferred-constraint
  * checking (plan section 3 step 4) all work without topological sorting.
+ *
+ * Five names collide with tables `packages/kith-store/migrations/001_init.sql`
+ * and `002_worker_jobs.sql` already created for its own synthetic proof
+ * harness (`spaces`, `api_keys`, `documents`, `source_revisions`, `chunks`):
+ * those prototype tables are `uuid`-keyed and are exercised by kith-store's
+ * own passing test suite (`validation.test.mjs`, the `postgres-proof`
+ * integration test) using real hyphenated `randomUUID()` values, which the
+ * `kith.kith_id` domain's character class refuses outright. Retyping them
+ * would be real, invasive surgery on another row's already-merged, tested
+ * schema, and the plan already assigns the real port of these five domains
+ * to P2-39c (`spaces`, `api_keys`) and P2-39d (`documents`, `source_revisions`,
+ * `chunks`) as part of their much larger scoped work. The prototype's bare
+ * names win for now; this row's Convex-mapped versions of the same five
+ * domains land under a `brain_` prefix (`kith.brain_spaces`, and so on) so
+ * the full 70-table pipeline still proves out end-to-end without touching or
+ * risking kith-store's tested schema. P2-39c/P2-39d should absorb or rename
+ * these into the final `kith.<name>` when they land.
  */
-export function generateMigrationSql(): string {
+export function generateKithMigrateTablesSql(): string {
   const scoped = spaceScopedByPgName();
-  const statements: string[] = [
-    "CREATE SCHEMA IF NOT EXISTS kith;",
-    "",
-    "CREATE TABLE kith.schema_migrations (",
-    "  version integer PRIMARY KEY,",
-    "  applied_at timestamptz NOT NULL DEFAULT transaction_timestamp()",
-    ");",
-  ];
+  const statements: string[] = [];
 
   for (const t of TABLES) {
-    const lines: string[] = [`  ${q("id")} text PRIMARY KEY`];
-    if (t.spaceScoped) lines.push(`  ${q("space_id")} text NOT NULL`);
+    const lines: string[] = [`  ${q("id")} kith.kith_id PRIMARY KEY`];
+    if (t.spaceScoped) lines.push(`  ${q("space_id")} kith.kith_id NOT NULL`);
     lines.push(`  ${q("created_at")} timestamptz NOT NULL`);
     for (const c of t.columns) {
       lines.push(`  ${q(c.pg)} ${PG_KIND[c.kind]}`);
@@ -75,9 +97,9 @@ export function generateMigrationSql(): string {
         "",
         `CREATE TABLE kith.${q(child.pg)} (`,
         [
-          `  ${q("id")} text PRIMARY KEY`,
-          `  ${q(child.parentColumn)} text NOT NULL`,
-          `  ${q(child.valueColumn)} text NOT NULL`,
+          `  ${q("id")} kith.kith_id PRIMARY KEY`,
+          `  ${q(child.parentColumn)} kith.kith_id NOT NULL`,
+          `  ${q(child.valueColumn)} kith.kith_id NOT NULL`,
           `  UNIQUE (${q(child.parentColumn)}, ${q(child.valueColumn)})`,
         ].join(",\n"),
         ");",
@@ -122,11 +144,7 @@ export function generateMigrationSql(): string {
     }
   }
 
-  statements.push(
-    "",
-    "INSERT INTO kith.schema_migrations(version) VALUES (1);",
-    "",
-  );
+  statements.push("");
   return statements.join("\n");
 }
 

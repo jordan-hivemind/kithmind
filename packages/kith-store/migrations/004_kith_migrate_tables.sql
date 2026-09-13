@@ -1,12 +1,6 @@
-CREATE SCHEMA IF NOT EXISTS kith;
-
-CREATE TABLE kith.schema_migrations (
-  version integer PRIMARY KEY,
-  applied_at timestamptz NOT NULL DEFAULT transaction_timestamp()
-);
 
 CREATE TABLE kith."users" (
-  "id" text PRIMARY KEY,
+  "id" kith.kith_id PRIMARY KEY,
   "created_at" timestamptz NOT NULL,
   "name" text,
   "email" text,
@@ -18,9 +12,9 @@ CREATE TABLE kith."users" (
 );
 
 CREATE TABLE kith."auth_accounts" (
-  "id" text PRIMARY KEY,
+  "id" kith.kith_id PRIMARY KEY,
   "created_at" timestamptz NOT NULL,
-  "user_id" text,
+  "user_id" kith.kith_id,
   "type" text,
   "provider" text,
   "provider_account_id" text,
@@ -30,10 +24,10 @@ CREATE TABLE kith."auth_accounts" (
 );
 
 CREATE TABLE kith."consumed_oauth_codes" (
-  "id" text PRIMARY KEY,
+  "id" kith.kith_id PRIMARY KEY,
   "created_at" timestamptz NOT NULL,
-  "user_id" text,
-  "api_key_id" text,
+  "user_id" kith.kith_id,
+  "api_key_id" kith.kith_id,
   "request_hash" text,
   "code_hash" text,
   "binding_hash" text,
@@ -41,36 +35,36 @@ CREATE TABLE kith."consumed_oauth_codes" (
   "expires_at" timestamptz
 );
 
-CREATE TABLE kith."spaces" (
-  "id" text PRIMARY KEY,
+CREATE TABLE kith."brain_spaces" (
+  "id" kith.kith_id PRIMARY KEY,
   "created_at" timestamptz NOT NULL,
   "kind" text,
   "name" text,
-  "created_by" text
+  "created_by" kith.kith_id
 );
 
 CREATE TABLE kith."space_members" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "user_id" text,
+  "user_id" kith.kith_id,
   "role" text,
-  "person_entity_id" text,
+  "person_entity_id" kith.kith_id,
   UNIQUE ("id", "space_id")
 );
 
 CREATE TABLE kith."user_space_settings" (
-  "id" text PRIMARY KEY,
+  "id" kith.kith_id PRIMARY KEY,
   "created_at" timestamptz NOT NULL,
-  "user_id" text,
-  "personal_space_id" text,
-  "default_write_space_id" text
+  "user_id" kith.kith_id,
+  "personal_space_id" kith.kith_id,
+  "default_write_space_id" kith.kith_id
 );
 
-CREATE TABLE kith."api_keys" (
-  "id" text PRIMARY KEY,
+CREATE TABLE kith."brain_api_keys" (
+  "id" kith.kith_id PRIMARY KEY,
   "created_at" timestamptz NOT NULL,
-  "user_id" text,
+  "user_id" kith.kith_id,
   "key_hash" text,
   "key_prefix" text,
   "name" text,
@@ -88,43 +82,43 @@ CREATE TABLE kith."api_keys" (
 );
 
 CREATE TABLE kith."api_key_spaces" (
-  "id" text PRIMARY KEY,
-  "api_key_id" text NOT NULL,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "api_key_id" kith.kith_id NOT NULL,
+  "space_id" kith.kith_id NOT NULL,
   UNIQUE ("api_key_id", "space_id")
 );
 
 CREATE TABLE kith."api_key_source_accounts" (
-  "id" text PRIMARY KEY,
-  "api_key_id" text NOT NULL,
-  "source_account_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "api_key_id" kith.kith_id NOT NULL,
+  "source_account_id" kith.kith_id NOT NULL,
   UNIQUE ("api_key_id", "source_account_id")
 );
 
 CREATE TABLE kith."family_invitations" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
   "email_normalized" text,
   "token_hash" text,
   "role" text,
   "status" text,
-  "created_by" text,
+  "created_by" kith.kith_id,
   "created_at_field" timestamptz,
   "expires_at" timestamptz,
-  "accepted_by" text,
+  "accepted_by" kith.kith_id,
   "accepted_at" timestamptz,
-  "approved_by" text,
+  "approved_by" kith.kith_id,
   "approved_at" timestamptz,
-  "membership_id" text,
-  "revoked_by" text,
+  "membership_id" kith.kith_id,
+  "revoked_by" kith.kith_id,
   "revoked_at" timestamptz,
   UNIQUE ("id", "space_id")
 );
 
 CREATE TABLE kith."source_accounts" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
   "connector" text,
   "account_id" text,
@@ -139,25 +133,25 @@ CREATE TABLE kith."source_accounts" (
   "inventory_epoch" numeric,
   "completed_inventory_epoch" numeric,
   "manifest_version" numeric,
-  "active_worker_scan_id" text,
+  "active_worker_scan_id" kith.kith_id,
   "worker_assessment_epoch" numeric,
-  "active_worker_assessment_id" text,
-  "latest_worker_assessment_id" text,
+  "active_worker_assessment_id" kith.kith_id,
+  "latest_worker_assessment_id" kith.kith_id,
   "binary_profile_id" text,
   "binary_profile_ids" jsonb,
   "binary_profile_audit_digest" text,
   "binary_profile_enabled_at" timestamptz,
-  "subject_entity_id" text,
+  "subject_entity_id" kith.kith_id,
   "embed_full_chunks" boolean,
-  "created_by" text,
+  "created_by" kith.kith_id,
   UNIQUE ("id", "space_id")
 );
 
 CREATE TABLE kith."source_items" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
+  "source_account_id" kith.kith_id,
   "external_id_hash" text,
   "external_id" text,
   "title" text,
@@ -165,15 +159,15 @@ CREATE TABLE kith."source_items" (
   "uri" text,
   "lifecycle" text,
   "original_link_available" boolean,
-  "desired_revision_id" text,
+  "desired_revision_id" kith.kith_id,
   "desired_processing_epoch" numeric,
-  "active_revision_id" text,
-  "active_generation_id" text,
-  "active_card_generation_id" text,
+  "active_revision_id" kith.kith_id,
+  "active_generation_id" kith.kith_id,
+  "active_card_generation_id" kith.kith_id,
   "embed_full_chunks" boolean,
   "last_failure" jsonb,
   "forgotten_at" timestamptz,
-  "forgotten_by" text,
+  "forgotten_by" kith.kith_id,
   "archive_deletion_forget_epoch" numeric,
   "archive_deletion_receipt_count" numeric,
   "archive_deletion_completed_at" timestamptz,
@@ -188,11 +182,11 @@ CREATE TABLE kith."source_items" (
   UNIQUE ("id", "space_id")
 );
 
-CREATE TABLE kith."source_revisions" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+CREATE TABLE kith."brain_source_revisions" (
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_item_id" text,
+  "source_item_id" kith.kith_id,
   "content_hash" text,
   "byte_length" numeric,
   "media_type" text,
@@ -200,38 +194,38 @@ CREATE TABLE kith."source_revisions" (
   "content_hash_authority" text,
   "inline_text" text,
   "captured_at" timestamptz,
-  "user_id" text,
+  "user_id" kith.kith_id,
   "archive_ref" text,
   UNIQUE ("id", "space_id")
 );
 
 CREATE TABLE kith."source_parser_artifacts" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
-  "source_item_id" text,
-  "source_revision_id" text,
+  "source_account_id" kith.kith_id,
+  "source_item_id" kith.kith_id,
+  "source_revision_id" kith.kith_id,
   "client_artifact_id" text,
   "parser_fingerprint" text,
   "output_hash" text,
   "output_byte_length" numeric,
   "output_media_type" text,
   "hash_authority" text,
-  "user_id" text,
-  "actor_credential_id" text,
+  "user_id" kith.kith_id,
+  "actor_credential_id" kith.kith_id,
   "created_at_field" timestamptz,
   UNIQUE ("id", "space_id")
 );
 
 CREATE TABLE kith."source_artifact_archive_receipts" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
-  "source_item_id" text,
-  "source_revision_id" text,
-  "parser_artifact_id" text,
+  "source_account_id" kith.kith_id,
+  "source_item_id" kith.kith_id,
+  "source_revision_id" kith.kith_id,
+  "parser_artifact_id" kith.kith_id,
   "subject_kind" text,
   "copy_role" text,
   "client_receipt_id" text,
@@ -252,39 +246,39 @@ CREATE TABLE kith."source_artifact_archive_receipts" (
   "ciphertext_byte_length" numeric,
   "verification_kind" text,
   "readback_verified_at" timestamptz,
-  "user_id" text,
-  "actor_credential_id" text,
+  "user_id" kith.kith_id,
+  "actor_credential_id" kith.kith_id,
   "created_at_field" timestamptz,
   UNIQUE ("id", "space_id")
 );
 
 CREATE TABLE kith."source_artifact_archive_bindings" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
-  "source_item_id" text,
-  "source_revision_id" text,
-  "parser_artifact_id" text,
+  "source_account_id" kith.kith_id,
+  "source_item_id" kith.kith_id,
+  "source_revision_id" kith.kith_id,
+  "parser_artifact_id" kith.kith_id,
   "subject_kind" text,
   "subject_key" text,
   "copy_role" text,
-  "receipt_id" text,
+  "receipt_id" kith.kith_id,
   "archive_identity_fingerprint" text,
   "binding_epoch" numeric,
   "updated_at" timestamptz,
-  "user_id" text,
-  "actor_credential_id" text,
+  "user_id" kith.kith_id,
+  "actor_credential_id" kith.kith_id,
   UNIQUE ("id", "space_id")
 );
 
 CREATE TABLE kith."source_artifact_deletion_acks" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
-  "source_item_id" text,
-  "receipt_id" text,
+  "source_account_id" kith.kith_id,
+  "source_item_id" kith.kith_id,
+  "receipt_id" kith.kith_id,
   "forget_epoch" numeric,
   "deletion_id" text,
   "request_id" text,
@@ -294,8 +288,8 @@ CREATE TABLE kith."source_artifact_deletion_acks" (
   "retention_disclosure" text,
   "client_receipt_id" text,
   "receipt_request_digest" text,
-  "source_revision_id" text,
-  "parser_artifact_id" text,
+  "source_revision_id" kith.kith_id,
+  "parser_artifact_id" kith.kith_id,
   "subject_kind" text,
   "copy_role" text,
   "receipt_version" text,
@@ -314,24 +308,24 @@ CREATE TABLE kith."source_artifact_deletion_acks" (
   "ciphertext_byte_length" numeric,
   "verification_kind" text,
   "readback_verified_at" timestamptz,
-  "receipt_user_id" text,
-  "receipt_actor_credential_id" text,
+  "receipt_user_id" kith.kith_id,
+  "receipt_actor_credential_id" kith.kith_id,
   "receipt_created_at" timestamptz,
   "object_outcome" text,
   "backup_outcome" text,
-  "actor_user_id" text,
-  "actor_credential_id" text,
+  "actor_user_id" kith.kith_id,
+  "actor_credential_id" kith.kith_id,
   "completed_at" timestamptz,
   UNIQUE ("id", "space_id")
 );
 
 CREATE TABLE kith."source_provider_original_references" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
-  "source_item_id" text,
-  "source_revision_id" text,
+  "source_account_id" kith.kith_id,
+  "source_item_id" kith.kith_id,
+  "source_revision_id" kith.kith_id,
   "client_reference_id" text,
   "request_digest" text,
   "reference_version" text,
@@ -356,37 +350,37 @@ CREATE TABLE kith."source_provider_original_references" (
   "locator_ciphertext_byte_length" numeric,
   "locator_readback_verified_at" timestamptz,
   "verification_authority" text,
-  "user_id" text,
-  "actor_credential_id" text,
+  "user_id" kith.kith_id,
+  "actor_credential_id" kith.kith_id,
   "created_at_field" timestamptz,
   UNIQUE ("id", "space_id")
 );
 
 CREATE TABLE kith."source_provider_original_bindings" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
-  "source_item_id" text,
-  "source_revision_id" text,
-  "reference_id" text,
+  "source_account_id" kith.kith_id,
+  "source_item_id" kith.kith_id,
+  "source_revision_id" kith.kith_id,
+  "reference_id" kith.kith_id,
   "binding_epoch" numeric,
   "verified_at" timestamptz,
-  "user_id" text,
-  "actor_credential_id" text,
+  "user_id" kith.kith_id,
+  "actor_credential_id" kith.kith_id,
   "updated_at" timestamptz,
   UNIQUE ("id", "space_id")
 );
 
 CREATE TABLE kith."source_provider_original_detach_acks" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
   "ack_version" text,
-  "source_account_id" text,
-  "source_item_id" text,
-  "source_revision_id" text,
-  "reference_id" text,
+  "source_account_id" kith.kith_id,
+  "source_item_id" kith.kith_id,
+  "source_revision_id" kith.kith_id,
+  "reference_id" kith.kith_id,
   "forget_epoch" numeric,
   "detach_id" text,
   "request_id" text,
@@ -401,17 +395,17 @@ CREATE TABLE kith."source_provider_original_detach_acks" (
   "locator_absence_authority" text,
   "retention_disclosure" text,
   "provider_source_outcome" text,
-  "actor_user_id" text,
-  "actor_credential_id" text,
+  "actor_user_id" kith.kith_id,
+  "actor_credential_id" kith.kith_id,
   "completed_at" timestamptz,
   UNIQUE ("id", "space_id")
 );
 
 CREATE TABLE kith."source_text_versions" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_revision_id" text,
+  "source_revision_id" kith.kith_id,
   "extraction_fingerprint" text,
   "representation" text,
   "text" text,
@@ -421,16 +415,16 @@ CREATE TABLE kith."source_text_versions" (
   "utf16_length" numeric,
   "page_count" numeric,
   "mapping_manifest_hash" text,
-  "parser_artifact_id" text,
+  "parser_artifact_id" kith.kith_id,
   "evidence_sealed" boolean,
   UNIQUE ("id", "space_id")
 );
 
 CREATE TABLE kith."source_pages" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_text_version_id" text,
+  "source_text_version_id" kith.kith_id,
   "ordinal" numeric,
   "start" numeric,
   "end" numeric,
@@ -440,12 +434,12 @@ CREATE TABLE kith."source_pages" (
 );
 
 CREATE TABLE kith."evidence_spans" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_revision_id" text,
-  "source_text_version_id" text,
-  "source_page_id" text,
+  "source_revision_id" kith.kith_id,
+  "source_text_version_id" kith.kith_id,
+  "source_page_id" kith.kith_id,
   "ordinal" numeric,
   "start" numeric,
   "end" numeric,
@@ -455,14 +449,14 @@ CREATE TABLE kith."evidence_spans" (
   UNIQUE ("id", "space_id")
 );
 
-CREATE TABLE kith."documents" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+CREATE TABLE kith."brain_documents" (
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "processing_generation_id" text,
-  "source_item_id" text,
-  "source_revision_id" text,
-  "source_text_version_id" text,
+  "processing_generation_id" kith.kith_id,
+  "source_item_id" kith.kith_id,
+  "source_revision_id" kith.kith_id,
+  "source_text_version_id" kith.kith_id,
   "document_key" text,
   "title" text,
   "doc_type" text,
@@ -472,14 +466,14 @@ CREATE TABLE kith."documents" (
   UNIQUE ("id", "space_id")
 );
 
-CREATE TABLE kith."chunks" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+CREATE TABLE kith."brain_chunks" (
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "processing_generation_id" text,
-  "document_id" text,
+  "processing_generation_id" kith.kith_id,
+  "document_id" kith.kith_id,
   "ordinal" numeric,
-  "source_text_version_id" text,
+  "source_text_version_id" kith.kith_id,
   "start" numeric,
   "end" numeric,
   "text" text,
@@ -489,13 +483,13 @@ CREATE TABLE kith."chunks" (
 );
 
 CREATE TABLE kith."processing_generations" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
-  "source_item_id" text,
-  "source_revision_id" text,
-  "source_text_version_id" text,
+  "source_account_id" kith.kith_id,
+  "source_item_id" kith.kith_id,
+  "source_revision_id" kith.kith_id,
+  "source_text_version_id" kith.kith_id,
   "processing_fingerprint" text,
   "extraction_fingerprint" text,
   "extractor_fingerprint" text,
@@ -503,15 +497,15 @@ CREATE TABLE kith."processing_generations" (
   "normalization_fingerprint" text,
   "chunker_fingerprint" text,
   "correction_revision" text,
-  "parser_artifact_id" text,
+  "parser_artifact_id" kith.kith_id,
   "archive_set_digest" text,
   "normalized_bundle_digest" text,
-  "original_primary_receipt_id" text,
-  "original_backup_receipt_id" text,
-  "original_provider_reference_id" text,
+  "original_primary_receipt_id" kith.kith_id,
+  "original_backup_receipt_id" kith.kith_id,
+  "original_provider_reference_id" kith.kith_id,
   "original_provider_binding_epoch" numeric,
-  "parser_primary_receipt_id" text,
-  "parser_backup_receipt_id" text,
+  "parser_primary_receipt_id" kith.kith_id,
+  "parser_backup_receipt_id" kith.kith_id,
   "desired_processing_epoch" numeric,
   "card_generation" boolean,
   "state" text,
@@ -527,7 +521,7 @@ CREATE TABLE kith."processing_generations" (
   "actual_chunk_count" numeric,
   "actual_event_count" numeric,
   "actual_observation_count" numeric,
-  "payload_manifest_id" text,
+  "payload_manifest_id" kith.kith_id,
   "embedding_status" text,
   "activated_at" timestamptz,
   "deactivated_at" timestamptz,
@@ -535,15 +529,15 @@ CREATE TABLE kith."processing_generations" (
 );
 
 CREATE TABLE kith."processing_generation_payload_manifests" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
-  "source_item_id" text,
-  "source_revision_id" text,
-  "source_text_version_id" text,
-  "parser_artifact_id" text,
-  "processing_generation_id" text,
+  "source_account_id" kith.kith_id,
+  "source_item_id" kith.kith_id,
+  "source_revision_id" kith.kith_id,
+  "source_text_version_id" kith.kith_id,
+  "parser_artifact_id" kith.kith_id,
+  "processing_generation_id" kith.kith_id,
   "archive_set_digest" text,
   "normalized_bundle_digest" text,
   "mapping_manifest_hash" text,
@@ -572,35 +566,35 @@ CREATE TABLE kith."processing_generation_payload_manifests" (
 );
 
 CREATE TABLE kith."ingest_requests" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
+  "source_account_id" kith.kith_id,
   "request_id" text,
   "request_digest" text,
-  "source_item_id" text,
-  "source_revision_id" text,
-  "processing_generation_id" text,
-  "ingest_job_id" text,
-  "actor_user_id" text,
-  "actor_credential_id" text,
+  "source_item_id" kith.kith_id,
+  "source_revision_id" kith.kith_id,
+  "processing_generation_id" kith.kith_id,
+  "ingest_job_id" kith.kith_id,
+  "actor_user_id" kith.kith_id,
+  "actor_credential_id" kith.kith_id,
   UNIQUE ("id", "space_id")
 );
 
 CREATE TABLE kith."ingest_jobs" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
-  "source_item_id" text,
-  "source_revision_id" text,
-  "processing_generation_id" text,
-  "admitted_by_user_id" text,
-  "admitted_by_credential_id" text,
-  "actor_user_id" text,
-  "actor_credential_id" text,
+  "source_account_id" kith.kith_id,
+  "source_item_id" kith.kith_id,
+  "source_revision_id" kith.kith_id,
+  "processing_generation_id" kith.kith_id,
+  "admitted_by_user_id" kith.kith_id,
+  "admitted_by_credential_id" kith.kith_id,
+  "actor_user_id" kith.kith_id,
+  "actor_credential_id" kith.kith_id,
   "actor_replaced_at" timestamptz,
-  "actor_replaced_by" text,
+  "actor_replaced_by" kith.kith_id,
   "desired_processing_epoch" numeric,
   "state" text,
   "attempts" numeric,
@@ -608,26 +602,26 @@ CREATE TABLE kith."ingest_jobs" (
   "lease_token" text,
   "lease_expires_at" timestamptz,
   "worker_managed" boolean,
-  "worker_lease_owner_credential_id" text,
+  "worker_lease_owner_credential_id" kith.kith_id,
   "next_attempt_at" timestamptz,
   "error" jsonb,
-  "worker_discovery_work_id" text,
+  "worker_discovery_work_id" kith.kith_id,
   "worker_observation_epoch" numeric,
   "worker_processing_mode" text,
   UNIQUE ("id", "space_id")
 );
 
 CREATE TABLE kith."inline_work" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
-  "source_item_id" text,
-  "source_revision_id" text,
-  "processing_generation_id" text,
-  "ingest_job_id" text,
-  "actor_user_id" text,
-  "actor_credential_id" text,
+  "source_account_id" kith.kith_id,
+  "source_item_id" kith.kith_id,
+  "source_revision_id" kith.kith_id,
+  "processing_generation_id" kith.kith_id,
+  "ingest_job_id" kith.kith_id,
+  "actor_user_id" kith.kith_id,
+  "actor_credential_id" kith.kith_id,
   "state" text,
   "attempts" numeric,
   "next_attempt_at" timestamptz,
@@ -638,21 +632,21 @@ CREATE TABLE kith."inline_work" (
 );
 
 CREATE TABLE kith."ingest_rate_limits" (
-  "id" text PRIMARY KEY,
+  "id" kith.kith_id PRIMARY KEY,
   "created_at" timestamptz NOT NULL,
-  "credential_id" text,
+  "credential_id" kith.kith_id,
   "window_started_at" timestamptz,
   "count" numeric
 );
 
 CREATE TABLE kith."source_fetch_requests" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
-  "source_item_id" text,
-  "actor_user_id" text,
-  "actor_credential_id" text,
+  "source_account_id" kith.kith_id,
+  "source_item_id" kith.kith_id,
+  "actor_user_id" kith.kith_id,
+  "actor_credential_id" kith.kith_id,
   "request_id" text,
   "request_digest" text,
   "url" text,
@@ -663,8 +657,8 @@ CREATE TABLE kith."source_fetch_requests" (
 );
 
 CREATE TABLE kith."space_processing_state" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
   "activation_epoch" numeric,
   "activated_at" timestamptz,
@@ -672,27 +666,27 @@ CREATE TABLE kith."space_processing_state" (
 );
 
 CREATE TABLE kith."events" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
-  "source_item_id" text,
+  "source_account_id" kith.kith_id,
+  "source_item_id" kith.kith_id,
   "event_key" text,
-  "created_by" text,
+  "created_by" kith.kith_id,
   UNIQUE ("id", "space_id")
 );
 
 CREATE TABLE kith."event_versions" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
-  "source_item_id" text,
-  "source_revision_id" text,
-  "source_text_version_id" text,
-  "processing_generation_id" text,
-  "event_id" text,
-  "entity_id" text,
+  "source_account_id" kith.kith_id,
+  "source_item_id" kith.kith_id,
+  "source_revision_id" kith.kith_id,
+  "source_text_version_id" kith.kith_id,
+  "processing_generation_id" kith.kith_id,
+  "event_id" kith.kith_id,
+  "entity_id" kith.kith_id,
   "event_type" text,
   "schema_version" numeric,
   "occurrence" jsonb,
@@ -701,22 +695,22 @@ CREATE TABLE kith."event_versions" (
   "occurrence_sort_key" text,
   "field_evidence" jsonb,
   "doc_type_patch" jsonb,
-  "user_id" text,
+  "user_id" kith.kith_id,
   UNIQUE ("id", "space_id")
 );
 
 CREATE TABLE kith."observations" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
-  "source_item_id" text,
-  "source_revision_id" text,
-  "source_text_version_id" text,
-  "processing_generation_id" text,
-  "event_id" text,
-  "event_version_id" text,
-  "entity_id" text,
+  "source_account_id" kith.kith_id,
+  "source_item_id" kith.kith_id,
+  "source_revision_id" kith.kith_id,
+  "source_text_version_id" kith.kith_id,
+  "processing_generation_id" kith.kith_id,
+  "event_id" kith.kith_id,
+  "event_version_id" kith.kith_id,
+  "entity_id" kith.kith_id,
   "event_type" text,
   "occurrence" jsonb,
   "occurrence_date" text,
@@ -727,20 +721,20 @@ CREATE TABLE kith."observations" (
   "schema_version" numeric,
   "value" jsonb,
   "value_evidence" jsonb,
-  "bound_entity_id" text,
-  "user_id" text,
+  "bound_entity_id" kith.kith_id,
+  "user_id" kith.kith_id,
   UNIQUE ("id", "space_id")
 );
 
 CREATE TABLE kith."card_entity_bindings" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
-  "source_item_id" text,
-  "processing_generation_id" text,
-  "event_id" text,
-  "observation_id" text,
+  "source_account_id" kith.kith_id,
+  "source_item_id" kith.kith_id,
+  "processing_generation_id" kith.kith_id,
+  "event_id" kith.kith_id,
+  "observation_id" kith.kith_id,
   "record_kind" text,
   "field_key" text,
   "observation_type" text,
@@ -754,12 +748,12 @@ CREATE TABLE kith."card_entity_bindings" (
 );
 
 CREATE TABLE kith."card_field_drops" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
-  "source_item_id" text,
-  "processing_generation_id" text,
+  "source_account_id" kith.kith_id,
+  "source_item_id" kith.kith_id,
+  "processing_generation_id" kith.kith_id,
   "record_kind" text,
   "kind" text,
   "field_key" text,
@@ -770,11 +764,11 @@ CREATE TABLE kith."card_field_drops" (
 );
 
 CREATE TABLE kith."card_extraction_attempts" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
-  "source_item_id" text,
+  "source_account_id" kith.kith_id,
+  "source_item_id" kith.kith_id,
   "record_kind" text,
   "step" text,
   "gate_version" text,
@@ -797,8 +791,8 @@ CREATE TABLE kith."card_extraction_attempts" (
 );
 
 CREATE TABLE kith."card_extraction_queue_states" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
   "kind" text,
   "phase" text,
@@ -825,12 +819,12 @@ CREATE TABLE kith."card_extraction_queue_states" (
 );
 
 CREATE TABLE kith."record_query_sessions" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "user_id" text,
-  "credential_id" text,
-  "membership_id" text,
+  "user_id" kith.kith_id,
+  "credential_id" kith.kith_id,
+  "membership_id" kith.kith_id,
   "authorization_signature" text,
   "operation" text,
   "consistency" text,
@@ -857,8 +851,8 @@ CREATE TABLE kith."record_query_sessions" (
 );
 
 CREATE TABLE kith."record_query_space_state" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
   "visibility_epoch" numeric,
   "snapshot_clock" numeric,
@@ -867,12 +861,12 @@ CREATE TABLE kith."record_query_space_state" (
 );
 
 CREATE TABLE kith."coverage_windows" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
+  "source_account_id" kith.kith_id,
   "record_type" text,
-  "entity_id" text,
+  "entity_id" kith.kith_id,
   "from" timestamptz,
   "to" timestamptz,
   "state" text,
@@ -885,12 +879,12 @@ CREATE TABLE kith."coverage_windows" (
 );
 
 CREATE TABLE kith."coverage_gaps" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
+  "source_account_id" kith.kith_id,
   "record_type" text,
-  "entity_id" text,
+  "entity_id" kith.kith_id,
   "from" timestamptz,
   "to" timestamptz,
   "reason" text,
@@ -901,11 +895,11 @@ CREATE TABLE kith."coverage_gaps" (
 );
 
 CREATE TABLE kith."source_inventory" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
-  "source_item_id" text,
+  "source_account_id" kith.kith_id,
+  "source_item_id" kith.kith_id,
   "identity_key_hash" text,
   "relative_path" text,
   "folder_path" text,
@@ -920,14 +914,14 @@ CREATE TABLE kith."source_inventory" (
   "exclusion_detail" text,
   "permissions_restricted" boolean,
   "permissions_detail" text,
-  "first_seen_scan_id" text,
-  "last_seen_scan_id" text,
-  "missing_since_scan_id" text,
+  "first_seen_scan_id" kith.kith_id,
+  "last_seen_scan_id" kith.kith_id,
+  "missing_since_scan_id" kith.kith_id,
   UNIQUE ("id", "space_id")
 );
 
 CREATE TABLE kith."embedding_profiles" (
-  "id" text PRIMARY KEY,
+  "id" kith.kith_id PRIMARY KEY,
   "created_at" timestamptz NOT NULL,
   "fingerprint" text,
   "protocol" text,
@@ -941,11 +935,11 @@ CREATE TABLE kith."embedding_profiles" (
 );
 
 CREATE TABLE kith."space_embedding_states" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
   "eligibility_epoch" numeric,
-  "active_embedding_generation_id" text,
+  "active_embedding_generation_id" kith.kith_id,
   "active_fingerprint" text,
   "activated_at" timestamptz,
   "eligible_counts" jsonb,
@@ -960,10 +954,10 @@ CREATE TABLE kith."space_embedding_states" (
 );
 
 CREATE TABLE kith."embedding_generations" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "embedding_profile_id" text,
+  "embedding_profile_id" kith.kith_id,
   "fingerprint" text,
   "state" text,
   "eligibility_epoch" numeric,
@@ -986,13 +980,13 @@ CREATE TABLE kith."embedding_generations" (
 );
 
 CREATE TABLE kith."embedding_targets" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
   "target_kind" text,
   "target_id" text,
   "input_hash" text,
-  "processing_generation_id" text,
+  "processing_generation_id" kith.kith_id,
   "state" text,
   "covered_fingerprint" text,
   "updated_at" timestamptz,
@@ -1000,11 +994,11 @@ CREATE TABLE kith."embedding_targets" (
 );
 
 CREATE TABLE kith."embedding_build_jobs" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
   "fingerprint" text,
-  "embedding_generation_id" text,
+  "embedding_generation_id" kith.kith_id,
   "phase" text,
   "cursor" text,
   "page_index" numeric,
@@ -1022,17 +1016,17 @@ CREATE TABLE kith."embedding_build_jobs" (
 );
 
 CREATE TABLE kith."embedding_vectors" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "embedding_generation_id" text,
+  "embedding_generation_id" kith.kith_id,
   "embedding_fingerprint" text,
   "target_kind" text,
   "search_scope" text,
-  "thought_id" text,
-  "chunk_id" text,
-  "event_id" text,
-  "processing_generation_id" text,
+  "thought_id" kith.kith_id,
+  "chunk_id" kith.kith_id,
+  "event_id" kith.kith_id,
+  "processing_generation_id" kith.kith_id,
   "input_hash" text,
   "embedding" jsonb,
   "scope_v2" text,
@@ -1040,19 +1034,19 @@ CREATE TABLE kith."embedding_vectors" (
 );
 
 CREATE TABLE kith."thoughts" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
   "content" text,
   "metadata" jsonb,
-  "user_id" text,
+  "user_id" kith.kith_id,
   "updated_at" timestamptz,
   "is_core" boolean,
   "valid_from" timestamptz,
   "valid_to" timestamptz,
   "memory_status" text,
   "superseded_at" timestamptz,
-  "superseded_by" text,
+  "superseded_by" kith.kith_id,
   "supersedes" jsonb,
   "change_reason" text,
   "source_type" text,
@@ -1064,11 +1058,11 @@ CREATE TABLE kith."thoughts" (
 );
 
 CREATE TABLE kith."facts" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "user_id" text,
-  "subject_entity_id" text,
+  "user_id" kith.kith_id,
+  "subject_entity_id" kith.kith_id,
   "predicate" text,
   "value" jsonb,
   "statement" text,
@@ -1083,7 +1077,7 @@ CREATE TABLE kith."facts" (
   "valid_to" timestamptz,
   "status" text,
   "superseded_at" timestamptz,
-  "superseded_by" text,
+  "superseded_by" kith.kith_id,
   "supersedes" jsonb,
   "change_reason" text,
   "updated_at" timestamptz,
@@ -1091,10 +1085,10 @@ CREATE TABLE kith."facts" (
 );
 
 CREATE TABLE kith."entities" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "user_id" text,
+  "user_id" kith.kith_id,
   "key" text,
   "kind" text,
   "canonical_name" text,
@@ -1106,7 +1100,7 @@ CREATE TABLE kith."entities" (
 );
 
 CREATE TABLE kith."worker_cleanup_state" (
-  "id" text PRIMARY KEY,
+  "id" kith.kith_id PRIMARY KEY,
   "created_at" timestamptz NOT NULL,
   "key" text,
   "next_phase" numeric,
@@ -1114,10 +1108,10 @@ CREATE TABLE kith."worker_cleanup_state" (
 );
 
 CREATE TABLE kith."worker_source_scans" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
+  "source_account_id" kith.kith_id,
   "request_id" text,
   "request_digest" text,
   "watcher_id" text,
@@ -1126,8 +1120,8 @@ CREATE TABLE kith."worker_source_scans" (
   "mode" text,
   "inventory_epoch" numeric,
   "manifest_version_at_begin" numeric,
-  "actor_user_id" text,
-  "actor_credential_id" text,
+  "actor_user_id" kith.kith_id,
+  "actor_credential_id" kith.kith_id,
   "state" text,
   "next_page_ordinal" numeric,
   "inventory_cursor" text,
@@ -1162,11 +1156,11 @@ CREATE TABLE kith."worker_source_scans" (
 );
 
 CREATE TABLE kith."worker_scan_pages" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
-  "scan_id" text,
+  "source_account_id" kith.kith_id,
+  "scan_id" kith.kith_id,
   "ordinal" numeric,
   "request_id" text,
   "request_digest" text,
@@ -1178,14 +1172,14 @@ CREATE TABLE kith."worker_scan_pages" (
 );
 
 CREATE TABLE kith."worker_scan_entries" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
-  "scan_id" text,
-  "scan_page_id" text,
-  "source_item_id" text,
-  "discovery_work_id" text,
+  "source_account_id" kith.kith_id,
+  "scan_id" kith.kith_id,
+  "scan_page_id" kith.kith_id,
+  "source_item_id" kith.kith_id,
+  "discovery_work_id" kith.kith_id,
   "identity_key_hash" text,
   "external_id_hash" text,
   "uri_digest" text,
@@ -1218,13 +1212,13 @@ CREATE TABLE kith."worker_scan_entries" (
 );
 
 CREATE TABLE kith."worker_discovery_work" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
-  "source_item_id" text,
-  "scan_id" text,
-  "scan_entry_id" text,
+  "source_account_id" kith.kith_id,
+  "source_item_id" kith.kith_id,
+  "scan_id" kith.kith_id,
+  "scan_entry_id" kith.kith_id,
   "observation_epoch" numeric,
   "processing_epoch" numeric,
   "expected_desired_processing_epoch" numeric,
@@ -1247,31 +1241,31 @@ CREATE TABLE kith."worker_discovery_work" (
   "title" text,
   "doc_type" text,
   "uri" text,
-  "actor_user_id" text,
-  "actor_credential_id" text,
+  "actor_user_id" kith.kith_id,
+  "actor_credential_id" kith.kith_id,
   "attempts" numeric,
   "lease_epoch" numeric,
   "lease_token" text,
-  "lease_owner_credential_id" text,
+  "lease_owner_credential_id" kith.kith_id,
   "lease_expires_at" timestamptz,
   "next_attempt_at" timestamptz,
   "failure_code" text,
   "retryable" boolean,
   "ingest_request_id" text,
-  "ingest_job_id" text,
-  "source_revision_id" text,
-  "processing_generation_id" text,
+  "ingest_job_id" kith.kith_id,
+  "source_revision_id" kith.kith_id,
+  "processing_generation_id" kith.kith_id,
   "created_at_field" timestamptz,
   "retire_at" timestamptz,
   UNIQUE ("id", "space_id")
 );
 
 CREATE TABLE kith."source_alias_digests" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
-  "source_item_id" text,
+  "source_account_id" kith.kith_id,
+  "source_item_id" kith.kith_id,
   "kind" text,
   "digest" text,
   "first_seen_at" timestamptz,
@@ -1280,24 +1274,24 @@ CREATE TABLE kith."source_alias_digests" (
 );
 
 CREATE TABLE kith."worker_protocol_rate_limits" (
-  "id" text PRIMARY KEY,
+  "id" kith.kith_id PRIMARY KEY,
   "created_at" timestamptz NOT NULL,
-  "credential_id" text,
-  "source_account_id" text,
+  "credential_id" kith.kith_id,
+  "source_account_id" kith.kith_id,
   "window_started_at" timestamptz,
   "count" numeric
 );
 
 CREATE TABLE kith."worker_reservation_receipts" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
+  "source_account_id" kith.kith_id,
   "kind" text,
   "request_id" text,
   "request_digest" text,
-  "actor_user_id" text,
-  "actor_credential_id" text,
+  "actor_user_id" kith.kith_id,
+  "actor_credential_id" kith.kith_id,
   "target_count" numeric,
   "created_at_field" timestamptz,
   "expires_at" timestamptz,
@@ -1307,15 +1301,15 @@ CREATE TABLE kith."worker_reservation_receipts" (
 );
 
 CREATE TABLE kith."worker_reservation_targets" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
-  "source_item_id" text,
-  "receipt_id" text,
+  "source_account_id" kith.kith_id,
+  "source_item_id" kith.kith_id,
+  "receipt_id" kith.kith_id,
   "ordinal" numeric,
-  "discovery_work_id" text,
-  "ingest_job_id" text,
+  "discovery_work_id" kith.kith_id,
+  "ingest_job_id" kith.kith_id,
   "lease_epoch" numeric,
   "lease_token" text,
   "lease_expires_at" timestamptz,
@@ -1323,28 +1317,28 @@ CREATE TABLE kith."worker_reservation_targets" (
 );
 
 CREATE TABLE kith."worker_operation_receipts" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
-  "source_item_id" text,
-  "discovery_work_id" text,
+  "source_account_id" kith.kith_id,
+  "source_item_id" kith.kith_id,
+  "discovery_work_id" kith.kith_id,
   "operation" text,
   "phase" text,
   "request_id" text,
   "request_digest" text,
-  "actor_user_id" text,
-  "actor_credential_id" text,
+  "actor_user_id" kith.kith_id,
+  "actor_credential_id" kith.kith_id,
   "lease_epoch" numeric,
   "lease_token_hash" text,
-  "source_revision_id" text,
-  "processing_generation_id" text,
-  "ingest_job_id" text,
+  "source_revision_id" kith.kith_id,
+  "processing_generation_id" kith.kith_id,
+  "ingest_job_id" kith.kith_id,
   "desired_processing_epoch" numeric,
   "result_state" text,
   "result_lease_expires_at" timestamptz,
   "result_activated_at" timestamptz,
-  "result_previous_generation_id" text,
+  "result_previous_generation_id" kith.kith_id,
   "result_actual_page_count" numeric,
   "result_actual_evidence_span_count" numeric,
   "result_actual_document_count" numeric,
@@ -1359,31 +1353,31 @@ CREATE TABLE kith."worker_operation_receipts" (
 );
 
 CREATE TABLE kith."worker_binary_operation_receipts" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
-  "source_item_id" text,
-  "discovery_work_id" text,
+  "source_account_id" kith.kith_id,
+  "source_item_id" kith.kith_id,
+  "discovery_work_id" kith.kith_id,
   "operation" text,
   "phase" text,
   "request_id" text,
   "request_digest" text,
-  "actor_user_id" text,
-  "actor_credential_id" text,
+  "actor_user_id" kith.kith_id,
+  "actor_credential_id" kith.kith_id,
   "lease_epoch" numeric,
   "lease_token_hash" text,
   "lease_expires_at_at_request" timestamptz,
-  "source_revision_id" text,
-  "parser_artifact_id" text,
-  "source_text_version_id" text,
-  "processing_generation_id" text,
-  "ingest_job_id" text,
+  "source_revision_id" kith.kith_id,
+  "parser_artifact_id" kith.kith_id,
+  "source_text_version_id" kith.kith_id,
+  "processing_generation_id" kith.kith_id,
+  "ingest_job_id" kith.kith_id,
   "desired_processing_epoch" numeric,
   "archive_set_digest" text,
-  "original_provider_reference_id" text,
+  "original_provider_reference_id" kith.kith_id,
   "original_provider_binding_epoch" numeric,
-  "stage_id" text,
+  "stage_id" kith.kith_id,
   "stage_phase" text,
   "stage_ordinal" numeric,
   "stage_accepted_count" numeric,
@@ -1395,23 +1389,23 @@ CREATE TABLE kith."worker_binary_operation_receipts" (
   "result_failure_at" timestamptz,
   "result_stage_phase" text,
   "result_activated_at" timestamptz,
-  "result_previous_generation_id" text,
-  "payload_manifest_id" text,
+  "result_previous_generation_id" kith.kith_id,
+  "payload_manifest_id" kith.kith_id,
   "created_at_field" timestamptz,
   "retire_at" timestamptz,
   UNIQUE ("id", "space_id")
 );
 
 CREATE TABLE kith."worker_processing_assessments" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
-  "scan_id" text,
+  "source_account_id" kith.kith_id,
+  "scan_id" kith.kith_id,
   "request_id" text,
   "request_digest" text,
-  "actor_user_id" text,
-  "actor_credential_id" text,
+  "actor_user_id" kith.kith_id,
+  "actor_credential_id" kith.kith_id,
   "inventory_epoch" numeric,
   "completed_inventory_epoch" numeric,
   "manifest_version" numeric,
@@ -1452,15 +1446,15 @@ CREATE TABLE kith."worker_processing_assessments" (
 );
 
 CREATE TABLE kith."worker_watcher_states" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
+  "source_account_id" kith.kith_id,
   "watcher_id" text,
   "state" text,
   "connector_version" text,
-  "actor_user_id" text,
-  "actor_credential_id" text,
+  "actor_user_id" kith.kith_id,
+  "actor_credential_id" kith.kith_id,
   "last_seen_at" timestamptz,
   "next_expected_at" timestamptz,
   "sweep_after" timestamptz,
@@ -1470,10 +1464,10 @@ CREATE TABLE kith."worker_watcher_states" (
 );
 
 CREATE TABLE kith."worker_operational_incidents" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
+  "source_account_id" kith.kith_id,
   "watcher_id" text,
   "kind" text,
   "state" text,
@@ -1484,31 +1478,31 @@ CREATE TABLE kith."worker_operational_incidents" (
 );
 
 CREATE TABLE kith."worker_watcher_reset_receipts" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
+  "source_account_id" kith.kith_id,
   "request_id" text,
   "request_digest" text,
   "expected_watcher_id" text,
   "next_watcher_id" text,
-  "actor_user_id" text,
+  "actor_user_id" kith.kith_id,
   "changed_at" timestamptz,
   UNIQUE ("id", "space_id")
 );
 
 CREATE TABLE kith."worker_parsed_stages" (
-  "id" text PRIMARY KEY,
-  "space_id" text NOT NULL,
+  "id" kith.kith_id PRIMARY KEY,
+  "space_id" kith.kith_id NOT NULL,
   "created_at" timestamptz NOT NULL,
-  "source_account_id" text,
-  "source_item_id" text,
-  "discovery_work_id" text,
-  "ingest_job_id" text,
-  "processing_generation_id" text,
-  "source_revision_id" text,
-  "source_text_version_id" text,
-  "parser_artifact_id" text,
+  "source_account_id" kith.kith_id,
+  "source_item_id" kith.kith_id,
+  "discovery_work_id" kith.kith_id,
+  "ingest_job_id" kith.kith_id,
+  "processing_generation_id" kith.kith_id,
+  "source_revision_id" kith.kith_id,
+  "source_text_version_id" kith.kith_id,
+  "parser_artifact_id" kith.kith_id,
   "archive_set_digest" text,
   "normalized_bundle_digest" text,
   "mapping_manifest_hash" text,
@@ -1530,7 +1524,7 @@ CREATE TABLE kith."worker_parsed_stages" (
   "evidence_bytes" numeric,
   "document_bytes" numeric,
   "chunk_bytes" numeric,
-  "payload_manifest_id" text,
+  "payload_manifest_id" kith.kith_id,
   "created_at_field" timestamptz,
   "updated_at" timestamptz,
   "retire_at" timestamptz,
@@ -1546,10 +1540,10 @@ ALTER TABLE kith."consumed_oauth_codes" ADD CONSTRAINT "consumed_oauth_codes_use
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."consumed_oauth_codes" ADD CONSTRAINT "consumed_oauth_codes_api_key_id_fkey"
-  FOREIGN KEY ("api_key_id") REFERENCES kith."api_keys" ("id")
+  FOREIGN KEY ("api_key_id") REFERENCES kith."brain_api_keys" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
-ALTER TABLE kith."spaces" ADD CONSTRAINT "spaces_created_by_fkey"
+ALTER TABLE kith."brain_spaces" ADD CONSTRAINT "brain_spaces_created_by_fkey"
   FOREIGN KEY ("created_by") REFERENCES kith."users" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
@@ -1566,27 +1560,27 @@ ALTER TABLE kith."user_space_settings" ADD CONSTRAINT "user_space_settings_user_
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."user_space_settings" ADD CONSTRAINT "user_space_settings_personal_space_id_fkey"
-  FOREIGN KEY ("personal_space_id") REFERENCES kith."spaces" ("id")
+  FOREIGN KEY ("personal_space_id") REFERENCES kith."brain_spaces" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."user_space_settings" ADD CONSTRAINT "user_space_settings_default_write_space_id_fkey"
-  FOREIGN KEY ("default_write_space_id") REFERENCES kith."spaces" ("id")
+  FOREIGN KEY ("default_write_space_id") REFERENCES kith."brain_spaces" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
-ALTER TABLE kith."api_keys" ADD CONSTRAINT "api_keys_user_id_fkey"
+ALTER TABLE kith."brain_api_keys" ADD CONSTRAINT "brain_api_keys_user_id_fkey"
   FOREIGN KEY ("user_id") REFERENCES kith."users" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."api_key_spaces" ADD CONSTRAINT "api_key_spaces_parent_fkey"
-  FOREIGN KEY ("api_key_id") REFERENCES kith."api_keys" ("id")
+  FOREIGN KEY ("api_key_id") REFERENCES kith."brain_api_keys" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."api_key_spaces" ADD CONSTRAINT "api_key_spaces_value_fkey"
-  FOREIGN KEY ("space_id") REFERENCES kith."spaces" ("id")
+  FOREIGN KEY ("space_id") REFERENCES kith."brain_spaces" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."api_key_source_accounts" ADD CONSTRAINT "api_key_source_accounts_parent_fkey"
-  FOREIGN KEY ("api_key_id") REFERENCES kith."api_keys" ("id")
+  FOREIGN KEY ("api_key_id") REFERENCES kith."brain_api_keys" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."api_key_source_accounts" ADD CONSTRAINT "api_key_source_accounts_value_fkey"
@@ -1638,11 +1632,11 @@ ALTER TABLE kith."source_items" ADD CONSTRAINT "source_items_source_account_id_f
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_items" ADD CONSTRAINT "source_items_desired_revision_id_fkey"
-  FOREIGN KEY ("desired_revision_id", "space_id") REFERENCES kith."source_revisions" ("id", "space_id")
+  FOREIGN KEY ("desired_revision_id", "space_id") REFERENCES kith."brain_source_revisions" ("id", "space_id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_items" ADD CONSTRAINT "source_items_active_revision_id_fkey"
-  FOREIGN KEY ("active_revision_id", "space_id") REFERENCES kith."source_revisions" ("id", "space_id")
+  FOREIGN KEY ("active_revision_id", "space_id") REFERENCES kith."brain_source_revisions" ("id", "space_id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_items" ADD CONSTRAINT "source_items_active_generation_id_fkey"
@@ -1657,11 +1651,11 @@ ALTER TABLE kith."source_items" ADD CONSTRAINT "source_items_forgotten_by_fkey"
   FOREIGN KEY ("forgotten_by") REFERENCES kith."users" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
-ALTER TABLE kith."source_revisions" ADD CONSTRAINT "source_revisions_source_item_id_fkey"
+ALTER TABLE kith."brain_source_revisions" ADD CONSTRAINT "brain_source_revisions_source_item_id_fkey"
   FOREIGN KEY ("source_item_id", "space_id") REFERENCES kith."source_items" ("id", "space_id")
   DEFERRABLE INITIALLY DEFERRED;
 
-ALTER TABLE kith."source_revisions" ADD CONSTRAINT "source_revisions_user_id_fkey"
+ALTER TABLE kith."brain_source_revisions" ADD CONSTRAINT "brain_source_revisions_user_id_fkey"
   FOREIGN KEY ("user_id") REFERENCES kith."users" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
@@ -1674,7 +1668,7 @@ ALTER TABLE kith."source_parser_artifacts" ADD CONSTRAINT "source_parser_artifac
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_parser_artifacts" ADD CONSTRAINT "source_parser_artifacts_source_revision_id_fkey"
-  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."source_revisions" ("id", "space_id")
+  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."brain_source_revisions" ("id", "space_id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_parser_artifacts" ADD CONSTRAINT "source_parser_artifacts_user_id_fkey"
@@ -1682,7 +1676,7 @@ ALTER TABLE kith."source_parser_artifacts" ADD CONSTRAINT "source_parser_artifac
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_parser_artifacts" ADD CONSTRAINT "source_parser_artifacts_actor_credential_id_fkey"
-  FOREIGN KEY ("actor_credential_id") REFERENCES kith."api_keys" ("id")
+  FOREIGN KEY ("actor_credential_id") REFERENCES kith."brain_api_keys" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_artifact_archive_receipts" ADD CONSTRAINT "source_artifact_archive_receipts_source_account_id_fkey"
@@ -1694,7 +1688,7 @@ ALTER TABLE kith."source_artifact_archive_receipts" ADD CONSTRAINT "source_artif
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_artifact_archive_receipts" ADD CONSTRAINT "source_artifact_archive_receipts_source_revision_id_fkey"
-  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."source_revisions" ("id", "space_id")
+  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."brain_source_revisions" ("id", "space_id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_artifact_archive_receipts" ADD CONSTRAINT "source_artifact_archive_receipts_parser_artifact_id_fkey"
@@ -1706,7 +1700,7 @@ ALTER TABLE kith."source_artifact_archive_receipts" ADD CONSTRAINT "source_artif
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_artifact_archive_receipts" ADD CONSTRAINT "source_artifact_archive_receipts_actor_credential_id_fkey"
-  FOREIGN KEY ("actor_credential_id") REFERENCES kith."api_keys" ("id")
+  FOREIGN KEY ("actor_credential_id") REFERENCES kith."brain_api_keys" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_artifact_archive_bindings" ADD CONSTRAINT "source_artifact_archive_bindings_source_account_id_fkey"
@@ -1718,7 +1712,7 @@ ALTER TABLE kith."source_artifact_archive_bindings" ADD CONSTRAINT "source_artif
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_artifact_archive_bindings" ADD CONSTRAINT "source_artifact_archive_bindings_source_revision_id_fkey"
-  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."source_revisions" ("id", "space_id")
+  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."brain_source_revisions" ("id", "space_id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_artifact_archive_bindings" ADD CONSTRAINT "source_artifact_archive_bindings_parser_artifact_id_fkey"
@@ -1734,7 +1728,7 @@ ALTER TABLE kith."source_artifact_archive_bindings" ADD CONSTRAINT "source_artif
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_artifact_archive_bindings" ADD CONSTRAINT "source_artifact_archive_bindings_actor_credential_id_fkey"
-  FOREIGN KEY ("actor_credential_id") REFERENCES kith."api_keys" ("id")
+  FOREIGN KEY ("actor_credential_id") REFERENCES kith."brain_api_keys" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_artifact_deletion_acks" ADD CONSTRAINT "source_artifact_deletion_acks_source_account_id_fkey"
@@ -1750,7 +1744,7 @@ ALTER TABLE kith."source_artifact_deletion_acks" ADD CONSTRAINT "source_artifact
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_artifact_deletion_acks" ADD CONSTRAINT "source_artifact_deletion_acks_source_revision_id_fkey"
-  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."source_revisions" ("id", "space_id")
+  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."brain_source_revisions" ("id", "space_id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_artifact_deletion_acks" ADD CONSTRAINT "source_artifact_deletion_acks_parser_artifact_id_fkey"
@@ -1762,7 +1756,7 @@ ALTER TABLE kith."source_artifact_deletion_acks" ADD CONSTRAINT "source_artifact
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_artifact_deletion_acks" ADD CONSTRAINT "source_artifact_deletion_acks_receipt_actor_credential_id_fkey"
-  FOREIGN KEY ("receipt_actor_credential_id") REFERENCES kith."api_keys" ("id")
+  FOREIGN KEY ("receipt_actor_credential_id") REFERENCES kith."brain_api_keys" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_artifact_deletion_acks" ADD CONSTRAINT "source_artifact_deletion_acks_actor_user_id_fkey"
@@ -1770,7 +1764,7 @@ ALTER TABLE kith."source_artifact_deletion_acks" ADD CONSTRAINT "source_artifact
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_artifact_deletion_acks" ADD CONSTRAINT "source_artifact_deletion_acks_actor_credential_id_fkey"
-  FOREIGN KEY ("actor_credential_id") REFERENCES kith."api_keys" ("id")
+  FOREIGN KEY ("actor_credential_id") REFERENCES kith."brain_api_keys" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_provider_original_references" ADD CONSTRAINT "source_provider_original_references_source_account_id_fkey"
@@ -1782,7 +1776,7 @@ ALTER TABLE kith."source_provider_original_references" ADD CONSTRAINT "source_pr
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_provider_original_references" ADD CONSTRAINT "source_provider_original_references_source_revision_id_fkey"
-  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."source_revisions" ("id", "space_id")
+  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."brain_source_revisions" ("id", "space_id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_provider_original_references" ADD CONSTRAINT "source_provider_original_references_user_id_fkey"
@@ -1790,7 +1784,7 @@ ALTER TABLE kith."source_provider_original_references" ADD CONSTRAINT "source_pr
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_provider_original_references" ADD CONSTRAINT "source_provider_original_references_actor_credential_id_fkey"
-  FOREIGN KEY ("actor_credential_id") REFERENCES kith."api_keys" ("id")
+  FOREIGN KEY ("actor_credential_id") REFERENCES kith."brain_api_keys" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_provider_original_bindings" ADD CONSTRAINT "source_provider_original_bindings_source_account_id_fkey"
@@ -1802,7 +1796,7 @@ ALTER TABLE kith."source_provider_original_bindings" ADD CONSTRAINT "source_prov
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_provider_original_bindings" ADD CONSTRAINT "source_provider_original_bindings_source_revision_id_fkey"
-  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."source_revisions" ("id", "space_id")
+  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."brain_source_revisions" ("id", "space_id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_provider_original_bindings" ADD CONSTRAINT "source_provider_original_bindings_reference_id_fkey"
@@ -1814,7 +1808,7 @@ ALTER TABLE kith."source_provider_original_bindings" ADD CONSTRAINT "source_prov
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_provider_original_bindings" ADD CONSTRAINT "source_provider_original_bindings_actor_credential_id_fkey"
-  FOREIGN KEY ("actor_credential_id") REFERENCES kith."api_keys" ("id")
+  FOREIGN KEY ("actor_credential_id") REFERENCES kith."brain_api_keys" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_provider_original_detach_acks" ADD CONSTRAINT "source_provider_original_detach_acks_source_account_id_fkey"
@@ -1826,7 +1820,7 @@ ALTER TABLE kith."source_provider_original_detach_acks" ADD CONSTRAINT "source_p
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_provider_original_detach_acks" ADD CONSTRAINT "source_provider_original_detach_acks_source_revision_id_fkey"
-  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."source_revisions" ("id", "space_id")
+  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."brain_source_revisions" ("id", "space_id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_provider_original_detach_acks" ADD CONSTRAINT "source_provider_original_detach_acks_reference_id_fkey"
@@ -1838,11 +1832,11 @@ ALTER TABLE kith."source_provider_original_detach_acks" ADD CONSTRAINT "source_p
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_provider_original_detach_acks" ADD CONSTRAINT "source_provider_original_detach_acks_actor_credential_id_fkey"
-  FOREIGN KEY ("actor_credential_id") REFERENCES kith."api_keys" ("id")
+  FOREIGN KEY ("actor_credential_id") REFERENCES kith."brain_api_keys" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_text_versions" ADD CONSTRAINT "source_text_versions_source_revision_id_fkey"
-  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."source_revisions" ("id", "space_id")
+  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."brain_source_revisions" ("id", "space_id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_text_versions" ADD CONSTRAINT "source_text_versions_parser_artifact_id_fkey"
@@ -1854,7 +1848,7 @@ ALTER TABLE kith."source_pages" ADD CONSTRAINT "source_pages_source_text_version
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."evidence_spans" ADD CONSTRAINT "evidence_spans_source_revision_id_fkey"
-  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."source_revisions" ("id", "space_id")
+  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."brain_source_revisions" ("id", "space_id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."evidence_spans" ADD CONSTRAINT "evidence_spans_source_text_version_id_fkey"
@@ -1865,31 +1859,31 @@ ALTER TABLE kith."evidence_spans" ADD CONSTRAINT "evidence_spans_source_page_id_
   FOREIGN KEY ("source_page_id", "space_id") REFERENCES kith."source_pages" ("id", "space_id")
   DEFERRABLE INITIALLY DEFERRED;
 
-ALTER TABLE kith."documents" ADD CONSTRAINT "documents_processing_generation_id_fkey"
+ALTER TABLE kith."brain_documents" ADD CONSTRAINT "brain_documents_processing_generation_id_fkey"
   FOREIGN KEY ("processing_generation_id", "space_id") REFERENCES kith."processing_generations" ("id", "space_id")
   DEFERRABLE INITIALLY DEFERRED;
 
-ALTER TABLE kith."documents" ADD CONSTRAINT "documents_source_item_id_fkey"
+ALTER TABLE kith."brain_documents" ADD CONSTRAINT "brain_documents_source_item_id_fkey"
   FOREIGN KEY ("source_item_id", "space_id") REFERENCES kith."source_items" ("id", "space_id")
   DEFERRABLE INITIALLY DEFERRED;
 
-ALTER TABLE kith."documents" ADD CONSTRAINT "documents_source_revision_id_fkey"
-  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."source_revisions" ("id", "space_id")
+ALTER TABLE kith."brain_documents" ADD CONSTRAINT "brain_documents_source_revision_id_fkey"
+  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."brain_source_revisions" ("id", "space_id")
   DEFERRABLE INITIALLY DEFERRED;
 
-ALTER TABLE kith."documents" ADD CONSTRAINT "documents_source_text_version_id_fkey"
+ALTER TABLE kith."brain_documents" ADD CONSTRAINT "brain_documents_source_text_version_id_fkey"
   FOREIGN KEY ("source_text_version_id", "space_id") REFERENCES kith."source_text_versions" ("id", "space_id")
   DEFERRABLE INITIALLY DEFERRED;
 
-ALTER TABLE kith."chunks" ADD CONSTRAINT "chunks_processing_generation_id_fkey"
+ALTER TABLE kith."brain_chunks" ADD CONSTRAINT "brain_chunks_processing_generation_id_fkey"
   FOREIGN KEY ("processing_generation_id", "space_id") REFERENCES kith."processing_generations" ("id", "space_id")
   DEFERRABLE INITIALLY DEFERRED;
 
-ALTER TABLE kith."chunks" ADD CONSTRAINT "chunks_document_id_fkey"
-  FOREIGN KEY ("document_id", "space_id") REFERENCES kith."documents" ("id", "space_id")
+ALTER TABLE kith."brain_chunks" ADD CONSTRAINT "brain_chunks_document_id_fkey"
+  FOREIGN KEY ("document_id", "space_id") REFERENCES kith."brain_documents" ("id", "space_id")
   DEFERRABLE INITIALLY DEFERRED;
 
-ALTER TABLE kith."chunks" ADD CONSTRAINT "chunks_source_text_version_id_fkey"
+ALTER TABLE kith."brain_chunks" ADD CONSTRAINT "brain_chunks_source_text_version_id_fkey"
   FOREIGN KEY ("source_text_version_id", "space_id") REFERENCES kith."source_text_versions" ("id", "space_id")
   DEFERRABLE INITIALLY DEFERRED;
 
@@ -1902,7 +1896,7 @@ ALTER TABLE kith."processing_generations" ADD CONSTRAINT "processing_generations
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."processing_generations" ADD CONSTRAINT "processing_generations_source_revision_id_fkey"
-  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."source_revisions" ("id", "space_id")
+  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."brain_source_revisions" ("id", "space_id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."processing_generations" ADD CONSTRAINT "processing_generations_source_text_version_id_fkey"
@@ -1946,7 +1940,7 @@ ALTER TABLE kith."processing_generation_payload_manifests" ADD CONSTRAINT "proce
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."processing_generation_payload_manifests" ADD CONSTRAINT "processing_generation_payload_manifests_source_revision_id_fkey"
-  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."source_revisions" ("id", "space_id")
+  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."brain_source_revisions" ("id", "space_id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."processing_generation_payload_manifests" ADD CONSTRAINT "processing_generation_payload_manifests_source_text_ve_3f5677f7"
@@ -1970,7 +1964,7 @@ ALTER TABLE kith."ingest_requests" ADD CONSTRAINT "ingest_requests_source_item_i
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."ingest_requests" ADD CONSTRAINT "ingest_requests_source_revision_id_fkey"
-  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."source_revisions" ("id", "space_id")
+  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."brain_source_revisions" ("id", "space_id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."ingest_requests" ADD CONSTRAINT "ingest_requests_processing_generation_id_fkey"
@@ -1986,7 +1980,7 @@ ALTER TABLE kith."ingest_requests" ADD CONSTRAINT "ingest_requests_actor_user_id
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."ingest_requests" ADD CONSTRAINT "ingest_requests_actor_credential_id_fkey"
-  FOREIGN KEY ("actor_credential_id") REFERENCES kith."api_keys" ("id")
+  FOREIGN KEY ("actor_credential_id") REFERENCES kith."brain_api_keys" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."ingest_jobs" ADD CONSTRAINT "ingest_jobs_source_account_id_fkey"
@@ -1998,7 +1992,7 @@ ALTER TABLE kith."ingest_jobs" ADD CONSTRAINT "ingest_jobs_source_item_id_fkey"
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."ingest_jobs" ADD CONSTRAINT "ingest_jobs_source_revision_id_fkey"
-  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."source_revisions" ("id", "space_id")
+  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."brain_source_revisions" ("id", "space_id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."ingest_jobs" ADD CONSTRAINT "ingest_jobs_processing_generation_id_fkey"
@@ -2010,7 +2004,7 @@ ALTER TABLE kith."ingest_jobs" ADD CONSTRAINT "ingest_jobs_admitted_by_user_id_f
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."ingest_jobs" ADD CONSTRAINT "ingest_jobs_admitted_by_credential_id_fkey"
-  FOREIGN KEY ("admitted_by_credential_id") REFERENCES kith."api_keys" ("id")
+  FOREIGN KEY ("admitted_by_credential_id") REFERENCES kith."brain_api_keys" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."ingest_jobs" ADD CONSTRAINT "ingest_jobs_actor_user_id_fkey"
@@ -2018,7 +2012,7 @@ ALTER TABLE kith."ingest_jobs" ADD CONSTRAINT "ingest_jobs_actor_user_id_fkey"
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."ingest_jobs" ADD CONSTRAINT "ingest_jobs_actor_credential_id_fkey"
-  FOREIGN KEY ("actor_credential_id") REFERENCES kith."api_keys" ("id")
+  FOREIGN KEY ("actor_credential_id") REFERENCES kith."brain_api_keys" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."ingest_jobs" ADD CONSTRAINT "ingest_jobs_actor_replaced_by_fkey"
@@ -2026,7 +2020,7 @@ ALTER TABLE kith."ingest_jobs" ADD CONSTRAINT "ingest_jobs_actor_replaced_by_fke
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."ingest_jobs" ADD CONSTRAINT "ingest_jobs_worker_lease_owner_credential_id_fkey"
-  FOREIGN KEY ("worker_lease_owner_credential_id") REFERENCES kith."api_keys" ("id")
+  FOREIGN KEY ("worker_lease_owner_credential_id") REFERENCES kith."brain_api_keys" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."ingest_jobs" ADD CONSTRAINT "ingest_jobs_worker_discovery_work_id_fkey"
@@ -2042,7 +2036,7 @@ ALTER TABLE kith."inline_work" ADD CONSTRAINT "inline_work_source_item_id_fkey"
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."inline_work" ADD CONSTRAINT "inline_work_source_revision_id_fkey"
-  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."source_revisions" ("id", "space_id")
+  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."brain_source_revisions" ("id", "space_id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."inline_work" ADD CONSTRAINT "inline_work_processing_generation_id_fkey"
@@ -2058,11 +2052,11 @@ ALTER TABLE kith."inline_work" ADD CONSTRAINT "inline_work_actor_user_id_fkey"
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."inline_work" ADD CONSTRAINT "inline_work_actor_credential_id_fkey"
-  FOREIGN KEY ("actor_credential_id") REFERENCES kith."api_keys" ("id")
+  FOREIGN KEY ("actor_credential_id") REFERENCES kith."brain_api_keys" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."ingest_rate_limits" ADD CONSTRAINT "ingest_rate_limits_credential_id_fkey"
-  FOREIGN KEY ("credential_id") REFERENCES kith."api_keys" ("id")
+  FOREIGN KEY ("credential_id") REFERENCES kith."brain_api_keys" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_fetch_requests" ADD CONSTRAINT "source_fetch_requests_source_account_id_fkey"
@@ -2078,7 +2072,7 @@ ALTER TABLE kith."source_fetch_requests" ADD CONSTRAINT "source_fetch_requests_a
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."source_fetch_requests" ADD CONSTRAINT "source_fetch_requests_actor_credential_id_fkey"
-  FOREIGN KEY ("actor_credential_id") REFERENCES kith."api_keys" ("id")
+  FOREIGN KEY ("actor_credential_id") REFERENCES kith."brain_api_keys" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."events" ADD CONSTRAINT "events_source_account_id_fkey"
@@ -2102,7 +2096,7 @@ ALTER TABLE kith."event_versions" ADD CONSTRAINT "event_versions_source_item_id_
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."event_versions" ADD CONSTRAINT "event_versions_source_revision_id_fkey"
-  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."source_revisions" ("id", "space_id")
+  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."brain_source_revisions" ("id", "space_id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."event_versions" ADD CONSTRAINT "event_versions_source_text_version_id_fkey"
@@ -2134,7 +2128,7 @@ ALTER TABLE kith."observations" ADD CONSTRAINT "observations_source_item_id_fkey
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."observations" ADD CONSTRAINT "observations_source_revision_id_fkey"
-  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."source_revisions" ("id", "space_id")
+  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."brain_source_revisions" ("id", "space_id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."observations" ADD CONSTRAINT "observations_source_text_version_id_fkey"
@@ -2210,7 +2204,7 @@ ALTER TABLE kith."record_query_sessions" ADD CONSTRAINT "record_query_sessions_u
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."record_query_sessions" ADD CONSTRAINT "record_query_sessions_credential_id_fkey"
-  FOREIGN KEY ("credential_id") REFERENCES kith."api_keys" ("id")
+  FOREIGN KEY ("credential_id") REFERENCES kith."brain_api_keys" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."record_query_sessions" ADD CONSTRAINT "record_query_sessions_membership_id_fkey"
@@ -2278,7 +2272,7 @@ ALTER TABLE kith."embedding_vectors" ADD CONSTRAINT "embedding_vectors_thought_i
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."embedding_vectors" ADD CONSTRAINT "embedding_vectors_chunk_id_fkey"
-  FOREIGN KEY ("chunk_id", "space_id") REFERENCES kith."chunks" ("id", "space_id")
+  FOREIGN KEY ("chunk_id", "space_id") REFERENCES kith."brain_chunks" ("id", "space_id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."embedding_vectors" ADD CONSTRAINT "embedding_vectors_event_id_fkey"
@@ -2322,7 +2316,7 @@ ALTER TABLE kith."worker_source_scans" ADD CONSTRAINT "worker_source_scans_actor
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."worker_source_scans" ADD CONSTRAINT "worker_source_scans_actor_credential_id_fkey"
-  FOREIGN KEY ("actor_credential_id") REFERENCES kith."api_keys" ("id")
+  FOREIGN KEY ("actor_credential_id") REFERENCES kith."brain_api_keys" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."worker_scan_pages" ADD CONSTRAINT "worker_scan_pages_source_account_id_fkey"
@@ -2374,11 +2368,11 @@ ALTER TABLE kith."worker_discovery_work" ADD CONSTRAINT "worker_discovery_work_a
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."worker_discovery_work" ADD CONSTRAINT "worker_discovery_work_actor_credential_id_fkey"
-  FOREIGN KEY ("actor_credential_id") REFERENCES kith."api_keys" ("id")
+  FOREIGN KEY ("actor_credential_id") REFERENCES kith."brain_api_keys" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."worker_discovery_work" ADD CONSTRAINT "worker_discovery_work_lease_owner_credential_id_fkey"
-  FOREIGN KEY ("lease_owner_credential_id") REFERENCES kith."api_keys" ("id")
+  FOREIGN KEY ("lease_owner_credential_id") REFERENCES kith."brain_api_keys" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."worker_discovery_work" ADD CONSTRAINT "worker_discovery_work_ingest_job_id_fkey"
@@ -2386,7 +2380,7 @@ ALTER TABLE kith."worker_discovery_work" ADD CONSTRAINT "worker_discovery_work_i
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."worker_discovery_work" ADD CONSTRAINT "worker_discovery_work_source_revision_id_fkey"
-  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."source_revisions" ("id", "space_id")
+  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."brain_source_revisions" ("id", "space_id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."worker_discovery_work" ADD CONSTRAINT "worker_discovery_work_processing_generation_id_fkey"
@@ -2402,7 +2396,7 @@ ALTER TABLE kith."source_alias_digests" ADD CONSTRAINT "source_alias_digests_sou
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."worker_protocol_rate_limits" ADD CONSTRAINT "worker_protocol_rate_limits_credential_id_fkey"
-  FOREIGN KEY ("credential_id") REFERENCES kith."api_keys" ("id")
+  FOREIGN KEY ("credential_id") REFERENCES kith."brain_api_keys" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."worker_protocol_rate_limits" ADD CONSTRAINT "worker_protocol_rate_limits_source_account_id_fkey"
@@ -2418,7 +2412,7 @@ ALTER TABLE kith."worker_reservation_receipts" ADD CONSTRAINT "worker_reservatio
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."worker_reservation_receipts" ADD CONSTRAINT "worker_reservation_receipts_actor_credential_id_fkey"
-  FOREIGN KEY ("actor_credential_id") REFERENCES kith."api_keys" ("id")
+  FOREIGN KEY ("actor_credential_id") REFERENCES kith."brain_api_keys" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."worker_reservation_targets" ADD CONSTRAINT "worker_reservation_targets_source_account_id_fkey"
@@ -2458,11 +2452,11 @@ ALTER TABLE kith."worker_operation_receipts" ADD CONSTRAINT "worker_operation_re
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."worker_operation_receipts" ADD CONSTRAINT "worker_operation_receipts_actor_credential_id_fkey"
-  FOREIGN KEY ("actor_credential_id") REFERENCES kith."api_keys" ("id")
+  FOREIGN KEY ("actor_credential_id") REFERENCES kith."brain_api_keys" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."worker_operation_receipts" ADD CONSTRAINT "worker_operation_receipts_source_revision_id_fkey"
-  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."source_revisions" ("id", "space_id")
+  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."brain_source_revisions" ("id", "space_id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."worker_operation_receipts" ADD CONSTRAINT "worker_operation_receipts_processing_generation_id_fkey"
@@ -2494,11 +2488,11 @@ ALTER TABLE kith."worker_binary_operation_receipts" ADD CONSTRAINT "worker_binar
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."worker_binary_operation_receipts" ADD CONSTRAINT "worker_binary_operation_receipts_actor_credential_id_fkey"
-  FOREIGN KEY ("actor_credential_id") REFERENCES kith."api_keys" ("id")
+  FOREIGN KEY ("actor_credential_id") REFERENCES kith."brain_api_keys" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."worker_binary_operation_receipts" ADD CONSTRAINT "worker_binary_operation_receipts_source_revision_id_fkey"
-  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."source_revisions" ("id", "space_id")
+  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."brain_source_revisions" ("id", "space_id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."worker_binary_operation_receipts" ADD CONSTRAINT "worker_binary_operation_receipts_parser_artifact_id_fkey"
@@ -2546,7 +2540,7 @@ ALTER TABLE kith."worker_processing_assessments" ADD CONSTRAINT "worker_processi
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."worker_processing_assessments" ADD CONSTRAINT "worker_processing_assessments_actor_credential_id_fkey"
-  FOREIGN KEY ("actor_credential_id") REFERENCES kith."api_keys" ("id")
+  FOREIGN KEY ("actor_credential_id") REFERENCES kith."brain_api_keys" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."worker_watcher_states" ADD CONSTRAINT "worker_watcher_states_source_account_id_fkey"
@@ -2558,7 +2552,7 @@ ALTER TABLE kith."worker_watcher_states" ADD CONSTRAINT "worker_watcher_states_a
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."worker_watcher_states" ADD CONSTRAINT "worker_watcher_states_actor_credential_id_fkey"
-  FOREIGN KEY ("actor_credential_id") REFERENCES kith."api_keys" ("id")
+  FOREIGN KEY ("actor_credential_id") REFERENCES kith."brain_api_keys" ("id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."worker_operational_incidents" ADD CONSTRAINT "worker_operational_incidents_source_account_id_fkey"
@@ -2594,7 +2588,7 @@ ALTER TABLE kith."worker_parsed_stages" ADD CONSTRAINT "worker_parsed_stages_pro
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."worker_parsed_stages" ADD CONSTRAINT "worker_parsed_stages_source_revision_id_fkey"
-  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."source_revisions" ("id", "space_id")
+  FOREIGN KEY ("source_revision_id", "space_id") REFERENCES kith."brain_source_revisions" ("id", "space_id")
   DEFERRABLE INITIALLY DEFERRED;
 
 ALTER TABLE kith."worker_parsed_stages" ADD CONSTRAINT "worker_parsed_stages_source_text_version_id_fkey"
@@ -2608,5 +2602,3 @@ ALTER TABLE kith."worker_parsed_stages" ADD CONSTRAINT "worker_parsed_stages_par
 ALTER TABLE kith."worker_parsed_stages" ADD CONSTRAINT "worker_parsed_stages_payload_manifest_id_fkey"
   FOREIGN KEY ("payload_manifest_id", "space_id") REFERENCES kith."processing_generation_payload_manifests" ("id", "space_id")
   DEFERRABLE INITIALLY DEFERRED;
-
-INSERT INTO kith.schema_migrations(version) VALUES (1);

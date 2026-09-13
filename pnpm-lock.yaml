@@ -208,6 +208,31 @@ importers:
         specifier: ^5.7.0
         version: 5.9.3
 
+  packages/kith-migrate:
+    dependencies:
+      '@repo/kith-store':
+        specifier: workspace:*
+        version: link:../kith-store
+      '@repo/pg':
+        specifier: workspace:*
+        version: link:../pg
+      pg:
+        specifier: ^8.16.3
+        version: 8.23.0
+    devDependencies:
+      '@repo/typescript-config':
+        specifier: workspace:*
+        version: link:../typescript-config
+      '@types/node':
+        specifier: 25.3.3
+        version: 25.3.3
+      '@types/pg':
+        specifier: ^8.15.5
+        version: 8.23.1
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
+
   packages/kith-store:
     dependencies:
       '@repo/finance-contract':

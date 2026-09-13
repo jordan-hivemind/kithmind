@@ -2,7 +2,7 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { parseArgs } from "node:util";
 
-import { generateMigrationSql } from "./ddl.js";
+import { generateKithMigrateTablesSql } from "./ddl.js";
 import { exportConvexData, verifyManifest, type ExportManifest } from "./export.js";
 import { loadCsvDirectory } from "./load.js";
 import { runParityChecks } from "./parity.js";
@@ -37,8 +37,8 @@ async function main(): Promise<void> {
 
   switch (command) {
     case "ddl:generate": {
-      const out = values.out ?? "migrations/0001_kith_schema.sql";
-      await writeFile(out, generateMigrationSql());
+      const out = values.out ?? "../kith-store/migrations/004_kith_migrate_tables.sql";
+      await writeFile(out, generateKithMigrateTablesSql());
       process.stdout.write(`wrote ${out}\n`);
       return;
     }

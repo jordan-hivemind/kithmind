@@ -12,7 +12,10 @@ import {
   runParityChecks,
   transformExport,
 } from "../dist/index.js";
-import { writeConvexExportDir } from "../test/fixtures/buildFixture.mjs";
+import {
+  syntheticConvexTables,
+  writeConvexExportDir,
+} from "../test/fixtures/buildFixture.mjs";
 import { resolveTestDatabase } from "./resolveTestDatabase.mjs";
 
 test("export, transform, COPY-load and the parity harness round-trip on a throwaway Postgres 17", async (t) => {
@@ -91,10 +94,13 @@ test("a row that would cross a space boundary is refused at load, not silently a
 
     // Corrupt one row after the transform: point Rowan's document at Sage's
     // source item, a cross-space reference the composite foreign key
-    // (plan section 2.2/2.5) should make unrepresentable.
-    const documentsPath = join(csvDir, "documents.csv");
+    // (plan section 2.2/2.5) should make unrepresentable. `brain_documents`:
+    // the plan's real `documents` shape lands under this name for now, see
+    // src/ddl.ts's module comment for why.
+    const { ids } = syntheticConvexTables();
+    const documentsPath = join(csvDir, "brain_documents.csv");
     const original = await readFile(documentsPath, "utf8");
-    const corrupted = original.replace("itm_rowan_invoice", "itm_sage_note");
+    const corrupted = original.replace(ids.sourceItemRowan, ids.sourceItemSage);
     assert.notEqual(corrupted, original, "fixture row to corrupt was not found");
     const { writeFile } = await import("node:fs/promises");
     await writeFile(documentsPath, corrupted);
@@ -106,10 +112,12 @@ test("a row that would cross a space boundary is refused at load, not silently a
     const pool = new pg.Pool({ connectionString: database.connectionString, max: 1 });
     try {
       const result = await pool.query(
-        "SELECT to_regclass('kith.documents') IS NOT NULL AS present",
+        "SELECT to_regclass('kith.brain_documents') IS NOT NULL AS present",
       );
       if (result.rows[0]?.present) {
-        const count = await pool.query("SELECT count(*)::int AS n FROM kith.documents");
+        const count = await pool.query(
+          "SELECT count(*)::int AS n FROM kith.brain_documents",
+        );
         assert.equal(count.rows[0].n, 0, "the whole load must roll back, not partially apply");
       }
     } finally {

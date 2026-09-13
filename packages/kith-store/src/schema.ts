@@ -66,6 +66,14 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
     name: "kith_id: the preserved-text primary key convention",
     url: new URL("../migrations/003_kith_id.sql", import.meta.url),
   },
+  {
+    version: 4,
+    name: "@repo/kith-migrate's Convex-mapped tables (P2-39b)",
+    url: new URL(
+      "../migrations/004_kith_migrate_tables.sql",
+      import.meta.url,
+    ),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */

@@ -9,15 +9,17 @@
  * Design, see docs/plans/2026-09-12-postgres-consolidation.md section 1.2 and
  * 2.2 for the decisions this file encodes mechanically:
  *
- * - Every row's Convex `_id` becomes the Postgres `id text primary key`,
- *   verbatim (2.2). `_creationTime` becomes `created_at timestamptz`.
- * - A space-scoped table also carries `space_id text` and a
+ * - Every row's Convex `_id` becomes the Postgres primary key `id`, verbatim
+ *   (2.2), typed to `@repo/kith-store`'s `kith.kith_id` domain rather than a
+ *   bare `text` (see `ddl.ts`). `_creationTime` becomes `created_at
+ *   timestamptz`.
+ * - A space-scoped table also carries `space_id kith.kith_id` and a
  *   `UNIQUE (id, space_id)`, and every reference to another space-scoped
  *   table is a composite foreign key `(col, space_id) REFERENCES
  *   target(id, space_id)` so a cross-space reference is unrepresentable.
- * - Every `v.id("X")` field becomes its own typed `text` reference column
- *   (never jsonb), so the provenance-chain and space-isolation parity
- *   checks can walk and verify real foreign keys.
+ * - Every `v.id("X")` field becomes its own typed `kith.kith_id` reference
+ *   column (never jsonb), so the provenance-chain and space-isolation
+ *   parity checks can walk and verify real foreign keys.
  * - Every scalar field (string, number, boolean, or a literal/union of
  *   literals) becomes its own nullable typed column.
  * - Every array or nested-object field becomes a `jsonb` column, unless the
@@ -27,6 +29,14 @@
  * - `thoughts.embedding` is the one field the plan (5.1) says to drop
  *   rather than store: it is declared in `excludedFields` so the transform's
  *   unmapped-field check treats it as a deliberate exclusion, not a bug.
+ *
+ * Five names (`spaces`, `apiKeys`, `documents`, `sourceRevisions`, `chunks`)
+ * collide with tables `@repo/kith-store`'s own prototype migrations already
+ * created for its synthetic proof harness; those tables are `uuid`-keyed and
+ * actively exercised by that package's own tests, so this file's versions of
+ * the same five domains land under a `brain_` pg name instead
+ * (`brain_spaces`, and so on). See `ddl.ts`'s module comment for the full
+ * reasoning.
  *
  * ponytail: every non-structural column is nullable in the generated DDL.
  * Convex's required/optional split, CHECK constraints, and the tsvector/
@@ -146,7 +156,7 @@ export const TABLES: TableSpec[] = [
   ]),
   table("consumedOAuthCodes", "consumed_oauth_codes", false, false, [
     ref("userId", "users"),
-    ref("apiKeyId", "api_keys"),
+    ref("apiKeyId", "brain_api_keys"),
     text("requestHash"),
     text("codeHash"),
     text("bindingHash"),
@@ -155,7 +165,7 @@ export const TABLES: TableSpec[] = [
   ]),
 
   // --- Spaces and membership
-  table("spaces", "spaces", false, true, [
+  table("spaces", "brain_spaces", false, true, [
     text("kind"),
     text("name"),
     ref("createdBy", "users"),
@@ -167,12 +177,12 @@ export const TABLES: TableSpec[] = [
   ]),
   table("userSpaceSettings", "user_space_settings", false, true, [
     ref("userId", "users"),
-    ref("personalSpaceId", "spaces"),
-    ref("defaultWriteSpaceId", "spaces"),
+    ref("personalSpaceId", "brain_spaces"),
+    ref("defaultWriteSpaceId", "brain_spaces"),
   ]),
   table(
     "apiKeys",
-    "api_keys",
+    "brain_api_keys",
     false,
     true,
     [
@@ -199,7 +209,7 @@ export const TABLES: TableSpec[] = [
           pg: "api_key_spaces",
           parentColumn: "api_key_id",
           valueColumn: "space_id",
-          valueRefTable: "spaces",
+          valueRefTable: "brain_spaces",
         },
         {
           convexField: "sourceAccountIds",
@@ -264,9 +274,9 @@ export const TABLES: TableSpec[] = [
     text("uri"),
     text("lifecycle"),
     bool("originalLinkAvailable"),
-    ref("desiredRevisionId", "source_revisions"),
+    ref("desiredRevisionId", "brain_source_revisions"),
     num("desiredProcessingEpoch"),
-    ref("activeRevisionId", "source_revisions"),
+    ref("activeRevisionId", "brain_source_revisions"),
     ref("activeGenerationId", "processing_generations"),
     ref("activeCardGenerationId", "processing_generations"),
     bool("embedFullChunks"),
@@ -285,7 +295,7 @@ export const TABLES: TableSpec[] = [
     text("workerProfileId"),
     num("workerLastSeenInventoryEpoch"),
   ]),
-  table("sourceRevisions", "source_revisions", true, true, [
+  table("sourceRevisions", "brain_source_revisions", true, true, [
     ref("sourceItemId", "source_items"),
     text("contentHash"),
     num("byteLength"),
@@ -300,7 +310,7 @@ export const TABLES: TableSpec[] = [
   table("sourceParserArtifacts", "source_parser_artifacts", true, true, [
     ref("sourceAccountId", "source_accounts"),
     ref("sourceItemId", "source_items"),
-    ref("sourceRevisionId", "source_revisions"),
+    ref("sourceRevisionId", "brain_source_revisions"),
     text("clientArtifactId"),
     text("parserFingerprint"),
     text("outputHash"),
@@ -308,7 +318,7 @@ export const TABLES: TableSpec[] = [
     text("outputMediaType"),
     text("hashAuthority"),
     ref("userId", "users"),
-    ref("actorCredentialId", "api_keys"),
+    ref("actorCredentialId", "brain_api_keys"),
     ts("createdAt"),
   ]),
   table(
@@ -319,7 +329,7 @@ export const TABLES: TableSpec[] = [
     [
       ref("sourceAccountId", "source_accounts"),
       ref("sourceItemId", "source_items"),
-      ref("sourceRevisionId", "source_revisions"),
+      ref("sourceRevisionId", "brain_source_revisions"),
       ref("parserArtifactId", "source_parser_artifacts"),
       text("subjectKind"),
       text("copyRole"),
@@ -342,7 +352,7 @@ export const TABLES: TableSpec[] = [
       text("verificationKind"),
       ts("readbackVerifiedAt"),
       ref("userId", "users"),
-      ref("actorCredentialId", "api_keys"),
+      ref("actorCredentialId", "brain_api_keys"),
       ts("createdAt"),
     ],
   ),
@@ -354,7 +364,7 @@ export const TABLES: TableSpec[] = [
     [
       ref("sourceAccountId", "source_accounts"),
       ref("sourceItemId", "source_items"),
-      ref("sourceRevisionId", "source_revisions"),
+      ref("sourceRevisionId", "brain_source_revisions"),
       ref("parserArtifactId", "source_parser_artifacts"),
       text("subjectKind"),
       text("subjectKey"),
@@ -364,7 +374,7 @@ export const TABLES: TableSpec[] = [
       num("bindingEpoch"),
       ts("updatedAt"),
       ref("userId", "users"),
-      ref("actorCredentialId", "api_keys"),
+      ref("actorCredentialId", "brain_api_keys"),
     ],
   ),
   table(
@@ -385,7 +395,7 @@ export const TABLES: TableSpec[] = [
       text("retentionDisclosure"),
       text("clientReceiptId"),
       text("receiptRequestDigest"),
-      ref("sourceRevisionId", "source_revisions"),
+      ref("sourceRevisionId", "brain_source_revisions"),
       ref("parserArtifactId", "source_parser_artifacts"),
       text("subjectKind"),
       text("copyRole"),
@@ -406,12 +416,12 @@ export const TABLES: TableSpec[] = [
       text("verificationKind"),
       ts("readbackVerifiedAt"),
       ref("receiptUserId", "users"),
-      ref("receiptActorCredentialId", "api_keys"),
+      ref("receiptActorCredentialId", "brain_api_keys"),
       ts("receiptCreatedAt"),
       text("objectOutcome"),
       text("backupOutcome"),
       ref("actorUserId", "users"),
-      ref("actorCredentialId", "api_keys"),
+      ref("actorCredentialId", "brain_api_keys"),
       ts("completedAt"),
     ],
   ),
@@ -423,7 +433,7 @@ export const TABLES: TableSpec[] = [
     [
       ref("sourceAccountId", "source_accounts"),
       ref("sourceItemId", "source_items"),
-      ref("sourceRevisionId", "source_revisions"),
+      ref("sourceRevisionId", "brain_source_revisions"),
       text("clientReferenceId"),
       text("requestDigest"),
       text("referenceVersion"),
@@ -449,7 +459,7 @@ export const TABLES: TableSpec[] = [
       ts("locatorReadbackVerifiedAt"),
       text("verificationAuthority"),
       ref("userId", "users"),
-      ref("actorCredentialId", "api_keys"),
+      ref("actorCredentialId", "brain_api_keys"),
       ts("createdAt"),
     ],
   ),
@@ -461,12 +471,12 @@ export const TABLES: TableSpec[] = [
     [
       ref("sourceAccountId", "source_accounts"),
       ref("sourceItemId", "source_items"),
-      ref("sourceRevisionId", "source_revisions"),
+      ref("sourceRevisionId", "brain_source_revisions"),
       ref("referenceId", "source_provider_original_references"),
       num("bindingEpoch"),
       ts("verifiedAt"),
       ref("userId", "users"),
-      ref("actorCredentialId", "api_keys"),
+      ref("actorCredentialId", "brain_api_keys"),
       ts("updatedAt"),
     ],
   ),
@@ -479,7 +489,7 @@ export const TABLES: TableSpec[] = [
       text("ackVersion"),
       ref("sourceAccountId", "source_accounts"),
       ref("sourceItemId", "source_items"),
-      ref("sourceRevisionId", "source_revisions"),
+      ref("sourceRevisionId", "brain_source_revisions"),
       ref("referenceId", "source_provider_original_references"),
       num("forgetEpoch"),
       text("detachId"),
@@ -496,12 +506,12 @@ export const TABLES: TableSpec[] = [
       text("retentionDisclosure"),
       text("providerSourceOutcome"),
       ref("actorUserId", "users"),
-      ref("actorCredentialId", "api_keys"),
+      ref("actorCredentialId", "brain_api_keys"),
       ts("completedAt"),
     ],
   ),
   table("sourceTextVersions", "source_text_versions", true, true, [
-    ref("sourceRevisionId", "source_revisions"),
+    ref("sourceRevisionId", "brain_source_revisions"),
     text("extractionFingerprint"),
     text("representation"),
     text("text"),
@@ -523,7 +533,7 @@ export const TABLES: TableSpec[] = [
     text("textHash"),
   ]),
   table("evidenceSpans", "evidence_spans", true, true, [
-    ref("sourceRevisionId", "source_revisions"),
+    ref("sourceRevisionId", "brain_source_revisions"),
     ref("sourceTextVersionId", "source_text_versions"),
     ref("sourcePageId", "source_pages"),
     num("ordinal"),
@@ -533,10 +543,10 @@ export const TABLES: TableSpec[] = [
     json("locator"),
     json("cardExtractionFingerprints"),
   ]),
-  table("documents", "documents", true, true, [
+  table("documents", "brain_documents", true, true, [
     ref("processingGenerationId", "processing_generations"),
     ref("sourceItemId", "source_items"),
-    ref("sourceRevisionId", "source_revisions"),
+    ref("sourceRevisionId", "brain_source_revisions"),
     ref("sourceTextVersionId", "source_text_versions"),
     text("documentKey"),
     text("title"),
@@ -545,9 +555,9 @@ export const TABLES: TableSpec[] = [
     json("evidenceSpanIds"),
     text("publicationState"),
   ]),
-  table("chunks", "chunks", true, true, [
+  table("chunks", "brain_chunks", true, true, [
     ref("processingGenerationId", "processing_generations"),
-    ref("documentId", "documents"),
+    ref("documentId", "brain_documents"),
     num("ordinal"),
     ref("sourceTextVersionId", "source_text_versions"),
     num("start"),
@@ -559,7 +569,7 @@ export const TABLES: TableSpec[] = [
   table("processingGenerations", "processing_generations", true, true, [
     ref("sourceAccountId", "source_accounts"),
     ref("sourceItemId", "source_items"),
-    ref("sourceRevisionId", "source_revisions"),
+    ref("sourceRevisionId", "brain_source_revisions"),
     ref("sourceTextVersionId", "source_text_versions"),
     text("processingFingerprint"),
     text("extractionFingerprint"),
@@ -605,7 +615,7 @@ export const TABLES: TableSpec[] = [
     [
       ref("sourceAccountId", "source_accounts"),
       ref("sourceItemId", "source_items"),
-      ref("sourceRevisionId", "source_revisions"),
+      ref("sourceRevisionId", "brain_source_revisions"),
       ref("sourceTextVersionId", "source_text_versions"),
       ref("parserArtifactId", "source_parser_artifacts"),
       ref("processingGenerationId", "processing_generations"),
@@ -640,21 +650,21 @@ export const TABLES: TableSpec[] = [
     text("requestId"),
     text("requestDigest"),
     ref("sourceItemId", "source_items"),
-    ref("sourceRevisionId", "source_revisions"),
+    ref("sourceRevisionId", "brain_source_revisions"),
     ref("processingGenerationId", "processing_generations"),
     ref("ingestJobId", "ingest_jobs"),
     ref("actorUserId", "users"),
-    ref("actorCredentialId", "api_keys"),
+    ref("actorCredentialId", "brain_api_keys"),
   ]),
   table("ingestJobs", "ingest_jobs", true, true, [
     ref("sourceAccountId", "source_accounts"),
     ref("sourceItemId", "source_items"),
-    ref("sourceRevisionId", "source_revisions"),
+    ref("sourceRevisionId", "brain_source_revisions"),
     ref("processingGenerationId", "processing_generations"),
     ref("admittedByUserId", "users"),
-    ref("admittedByCredentialId", "api_keys"),
+    ref("admittedByCredentialId", "brain_api_keys"),
     ref("actorUserId", "users"),
-    ref("actorCredentialId", "api_keys"),
+    ref("actorCredentialId", "brain_api_keys"),
     ts("actorReplacedAt"),
     ref("actorReplacedBy", "users"),
     num("desiredProcessingEpoch"),
@@ -664,7 +674,7 @@ export const TABLES: TableSpec[] = [
     text("leaseToken"),
     ts("leaseExpiresAt"),
     bool("workerManaged"),
-    ref("workerLeaseOwnerCredentialId", "api_keys"),
+    ref("workerLeaseOwnerCredentialId", "brain_api_keys"),
     ts("nextAttemptAt"),
     json("error"),
     ref("workerDiscoveryWorkId", "worker_discovery_work"),
@@ -674,11 +684,11 @@ export const TABLES: TableSpec[] = [
   table("inlineWork", "inline_work", true, false, [
     ref("sourceAccountId", "source_accounts"),
     ref("sourceItemId", "source_items"),
-    ref("sourceRevisionId", "source_revisions"),
+    ref("sourceRevisionId", "brain_source_revisions"),
     ref("processingGenerationId", "processing_generations"),
     ref("ingestJobId", "ingest_jobs"),
     ref("actorUserId", "users"),
-    ref("actorCredentialId", "api_keys"),
+    ref("actorCredentialId", "brain_api_keys"),
     text("state"),
     num("attempts"),
     ts("nextAttemptAt"),
@@ -687,7 +697,7 @@ export const TABLES: TableSpec[] = [
     ts("updatedAt"),
   ]),
   table("ingestRateLimits", "ingest_rate_limits", false, false, [
-    ref("credentialId", "api_keys"),
+    ref("credentialId", "brain_api_keys"),
     ts("windowStartedAt"),
     num("count"),
   ]),
@@ -695,7 +705,7 @@ export const TABLES: TableSpec[] = [
     ref("sourceAccountId", "source_accounts"),
     ref("sourceItemId", "source_items"),
     ref("actorUserId", "users"),
-    ref("actorCredentialId", "api_keys"),
+    ref("actorCredentialId", "brain_api_keys"),
     text("requestId"),
     text("requestDigest"),
     text("url"),
@@ -718,7 +728,7 @@ export const TABLES: TableSpec[] = [
   table("eventVersions", "event_versions", true, true, [
     ref("sourceAccountId", "source_accounts"),
     ref("sourceItemId", "source_items"),
-    ref("sourceRevisionId", "source_revisions"),
+    ref("sourceRevisionId", "brain_source_revisions"),
     ref("sourceTextVersionId", "source_text_versions"),
     ref("processingGenerationId", "processing_generations"),
     ref("eventId", "events"),
@@ -736,7 +746,7 @@ export const TABLES: TableSpec[] = [
   table("observations", "observations", true, true, [
     ref("sourceAccountId", "source_accounts"),
     ref("sourceItemId", "source_items"),
-    ref("sourceRevisionId", "source_revisions"),
+    ref("sourceRevisionId", "brain_source_revisions"),
     ref("sourceTextVersionId", "source_text_versions"),
     ref("processingGenerationId", "processing_generations"),
     ref("eventId", "events"),
@@ -840,7 +850,7 @@ export const TABLES: TableSpec[] = [
   // --- Query sessions
   table("recordQuerySessions", "record_query_sessions", true, false, [
     ref("userId", "users"),
-    ref("credentialId", "api_keys"),
+    ref("credentialId", "brain_api_keys"),
     ref("membershipId", "space_members"),
     text("authorizationSignature"),
     text("operation"),
@@ -999,7 +1009,7 @@ export const TABLES: TableSpec[] = [
     text("targetKind"),
     text("searchScope"),
     ref("thoughtId", "thoughts"),
-    ref("chunkId", "chunks"),
+    ref("chunkId", "brain_chunks"),
     ref("eventId", "events"),
     ref("processingGenerationId", "processing_generations"),
     text("inputHash"),
@@ -1087,7 +1097,7 @@ export const TABLES: TableSpec[] = [
     num("inventoryEpoch"),
     num("manifestVersionAtBegin"),
     ref("actorUserId", "users"),
-    ref("actorCredentialId", "api_keys"),
+    ref("actorCredentialId", "brain_api_keys"),
     text("state"),
     num("nextPageOrdinal"),
     text("inventoryCursor"),
@@ -1193,18 +1203,18 @@ export const TABLES: TableSpec[] = [
     text("docType"),
     text("uri"),
     ref("actorUserId", "users"),
-    ref("actorCredentialId", "api_keys"),
+    ref("actorCredentialId", "brain_api_keys"),
     num("attempts"),
     num("leaseEpoch"),
     text("leaseToken"),
-    ref("leaseOwnerCredentialId", "api_keys"),
+    ref("leaseOwnerCredentialId", "brain_api_keys"),
     ts("leaseExpiresAt"),
     ts("nextAttemptAt"),
     text("failureCode"),
     bool("retryable"),
     text("ingestRequestId"),
     ref("ingestJobId", "ingest_jobs"),
-    ref("sourceRevisionId", "source_revisions"),
+    ref("sourceRevisionId", "brain_source_revisions"),
     ref("processingGenerationId", "processing_generations"),
     ts("createdAt"),
     ts("retireAt"),
@@ -1223,7 +1233,7 @@ export const TABLES: TableSpec[] = [
     false,
     false,
     [
-      ref("credentialId", "api_keys"),
+      ref("credentialId", "brain_api_keys"),
       ref("sourceAccountId", "source_accounts"),
       ts("windowStartedAt"),
       num("count"),
@@ -1235,7 +1245,7 @@ export const TABLES: TableSpec[] = [
     text("requestId"),
     text("requestDigest"),
     ref("actorUserId", "users"),
-    ref("actorCredentialId", "api_keys"),
+    ref("actorCredentialId", "brain_api_keys"),
     num("targetCount"),
     ts("createdAt"),
     ts("expiresAt"),
@@ -1262,10 +1272,10 @@ export const TABLES: TableSpec[] = [
     text("requestId"),
     text("requestDigest"),
     ref("actorUserId", "users"),
-    ref("actorCredentialId", "api_keys"),
+    ref("actorCredentialId", "brain_api_keys"),
     num("leaseEpoch"),
     text("leaseTokenHash"),
-    ref("sourceRevisionId", "source_revisions"),
+    ref("sourceRevisionId", "brain_source_revisions"),
     ref("processingGenerationId", "processing_generations"),
     ref("ingestJobId", "ingest_jobs"),
     num("desiredProcessingEpoch"),
@@ -1298,11 +1308,11 @@ export const TABLES: TableSpec[] = [
       text("requestId"),
       text("requestDigest"),
       ref("actorUserId", "users"),
-      ref("actorCredentialId", "api_keys"),
+      ref("actorCredentialId", "brain_api_keys"),
       num("leaseEpoch"),
       text("leaseTokenHash"),
       ts("leaseExpiresAtAtRequest"),
-      ref("sourceRevisionId", "source_revisions"),
+      ref("sourceRevisionId", "brain_source_revisions"),
       ref("parserArtifactId", "source_parser_artifacts"),
       ref("sourceTextVersionId", "source_text_versions"),
       ref("processingGenerationId", "processing_generations"),
@@ -1343,7 +1353,7 @@ export const TABLES: TableSpec[] = [
       text("requestId"),
       text("requestDigest"),
       ref("actorUserId", "users"),
-      ref("actorCredentialId", "api_keys"),
+      ref("actorCredentialId", "brain_api_keys"),
       num("inventoryEpoch"),
       num("completedInventoryEpoch"),
       num("manifestVersion"),
@@ -1388,7 +1398,7 @@ export const TABLES: TableSpec[] = [
     text("state"),
     text("connectorVersion"),
     ref("actorUserId", "users"),
-    ref("actorCredentialId", "api_keys"),
+    ref("actorCredentialId", "brain_api_keys"),
     ts("lastSeenAt"),
     ts("nextExpectedAt"),
     ts("sweepAfter"),
@@ -1431,7 +1441,7 @@ export const TABLES: TableSpec[] = [
     ref("discoveryWorkId", "worker_discovery_work"),
     ref("ingestJobId", "ingest_jobs"),
     ref("processingGenerationId", "processing_generations"),
-    ref("sourceRevisionId", "source_revisions"),
+    ref("sourceRevisionId", "brain_source_revisions"),
     ref("sourceTextVersionId", "source_text_versions"),
     ref("parserArtifactId", "source_parser_artifacts"),
     text("archiveSetDigest"),

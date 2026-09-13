@@ -37,8 +37,10 @@ test("row counts match the export for migrated tables and are zero for drained t
   const report = await transformExport(exportDir, outDir);
 
   assert.equal(report.rowCounts.users, fixture.tableCounts.users);
-  assert.equal(report.rowCounts.documents, fixture.tableCounts.documents);
-  assert.equal(report.rowCounts.chunks, fixture.tableCounts.chunks);
+  // brain_documents/brain_chunks: the plan's real `documents`/`chunks` shape
+  // lands under this name for now, see src/ddl.ts's module comment for why.
+  assert.equal(report.rowCounts.brain_documents, fixture.tableCounts.documents);
+  assert.equal(report.rowCounts.brain_chunks, fixture.tableCounts.chunks);
   assert.equal(report.rowCounts.family_invitations, fixture.tableCounts.familyInvitations);
   assert.equal(report.rowCounts.coverage_windows, fixture.tableCounts.coverageWindows);
 
@@ -61,7 +63,7 @@ test("retired tables are never read and never reported unmapped", async () => {
 });
 
 test("thoughts.embedding is excluded from the row and written to a cold audit file", async () => {
-  const { exportDir } = await buildExport();
+  const { exportDir, fixture } = await buildExport();
   const outDir = await mkdtemp(join(tmpdir(), "kith-transform-"));
   await transformExport(exportDir, outDir);
 
@@ -70,7 +72,10 @@ test("thoughts.embedding is excluded from the row and written to a cold audit fi
 
   const audit = await readFile(join(outDir, "_excluded", "thoughts.embedding.jsonl"), "utf8");
   const parsed = JSON.parse(audit.trim());
-  assert.deepEqual(parsed, { id: "tht_rowan_1", embedding: [0.1, 0.2, 0.3] });
+  assert.deepEqual(parsed, {
+    id: fixture.ids.thoughtRowan,
+    embedding: [0.1, 0.2, 0.3],
+  });
 });
 
 test("retained text hashes are recorded for source_pages and chunks", async () => {
@@ -88,7 +93,7 @@ test("retained text hashes are recorded for source_pages and chunks", async () =
     [sha256(fixture.text.rowan), sha256(fixture.text.sage)].sort(),
   );
   assert.deepEqual(
-    byTable("chunks"),
+    byTable("brain_chunks"),
     [sha256(fixture.text.rowan), sha256(fixture.text.sage)].sort(),
   );
 });

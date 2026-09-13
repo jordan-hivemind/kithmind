@@ -17,14 +17,16 @@
     "kith-migrate": "./dist/cli.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "check-types": "tsc -p tsconfig.json --noEmit",
+    "build": "pnpm --filter @repo/kith-store build && tsc -p tsconfig.json",
+    "check-types": "pnpm --filter @repo/kith-store check-types && tsc -p tsconfig.json --noEmit",
     "test": "pnpm run build && node --test test/*.test.mjs",
     "test:once": "pnpm run build && node --test test/*.test.mjs",
     "test:integration": "pnpm run build && node --test integration/*.test.mjs",
-    "generate:migration": "pnpm run build && node dist/cli.js ddl:generate --out migrations/0001_kith_schema.sql"
+    "generate:migration": "pnpm run build && node dist/cli.js ddl:generate --out ../kith-store/migrations/004_kith_migrate_tables.sql"
   },
   "dependencies": {
+    "@repo/kith-store": "workspace:*",
+    "@repo/pg": "workspace:*",
     "pg": "^8.16.3"
   },
   "devDependencies": {

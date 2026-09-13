@@ -4,10 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
-import pg from "pg";
+import { applyKithSchema, createKithPool } from "@repo/kith-store";
 
 import { childColumnOrder, columnOrder } from "./columns.js";
-import { generateMigrationSql } from "./ddl.js";
 import { TABLES } from "./schema.js";
 
 const execFileAsync = promisify(execFile);
@@ -18,23 +17,20 @@ export type DestinationConfig = {
   connectionString: string;
 };
 
-/** Applies the generated `kith` schema migration if it has not already run.
- * Plain `pg` queries: only the bulk row load needs to shell out (below). */
+/**
+ * Applies every `kith` migration through `@repo/kith-store`'s own runner
+ * (`applyKithSchema`), which now includes this row's tables as migration 4
+ * (`packages/kith-store/migrations/004_kith_migrate_tables.sql`, generated
+ * from `src/ddl.ts`). The schema bootstrap, the version table and the id
+ * domain all live in that package; this function only opens the pool and the
+ * one client the runner needs.
+ */
 export async function applyMigration(config: DestinationConfig): Promise<void> {
-  const pool = new pg.Pool({ connectionString: config.connectionString, max: 1 });
+  const pool = createKithPool(config.connectionString, 1);
   try {
     const client = await pool.connect();
     try {
-      const present = await client.query<{ present: boolean }>(
-        "SELECT to_regclass('kith.schema_migrations') IS NOT NULL AS present",
-      );
-      if (present.rows[0]?.present) return;
-      await client.query("BEGIN");
-      await client.query(generateMigrationSql());
-      await client.query("COMMIT");
-    } catch (error) {
-      await client.query("ROLLBACK").catch(() => {});
-      throw error;
+      await applyKithSchema(client);
     } finally {
       client.release();
     }
@@ -80,8 +76,11 @@ export function buildCopyScript(csvDir: string, presentFiles: Set<string>): stri
  * with a `psql \copy`-driven script (plan section 3 step 4). `psql` runs the
  * COPY protocol `pg` cannot speak without the `pg-copy-streams` dependency
  * this row does not add; it is native to any Postgres toolchain, the same
- * way `packages/postgres-proof/integration/docker-postgres.mjs` already
- * shells out to `pg_dump`/`pg_restore`.
+ * way `packages/kith-store/integration/docker-postgres.mjs` already shells
+ * out to `pg_dump`/`pg_restore`. This is the one step that cannot go through
+ * `@repo/kith-store`'s pool: COPY is a different wire protocol than the
+ * simple/extended query protocol `pg` speaks, and a `psql` subprocess opens
+ * its own connection to run it.
  */
 export async function loadCsvDirectory(
   config: DestinationConfig,

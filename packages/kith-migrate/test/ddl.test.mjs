@@ -3,18 +3,39 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { TABLES, generateMigrationSql, allPhysicalTables } from "../dist/index.js";
+import { KITH_MIGRATIONS } from "@repo/kith-store";
 
-test("the checked-in migration file matches the generator (DDL cannot drift from the mapping)", async () => {
+import {
+  TABLES,
+  generateKithMigrateTablesSql,
+  allPhysicalTables,
+} from "../dist/index.js";
+
+test("the migration file registered with kith-store's runner matches the generator (DDL cannot drift from the mapping)", async () => {
   const checkedIn = await readFile(
-    fileURLToPath(new URL("../migrations/0001_kith_schema.sql", import.meta.url)),
+    fileURLToPath(
+      new URL(
+        "../../kith-store/migrations/004_kith_migrate_tables.sql",
+        import.meta.url,
+      ),
+    ),
     "utf8",
   );
-  assert.equal(checkedIn, generateMigrationSql());
+  assert.equal(checkedIn, generateKithMigrateTablesSql());
+});
+
+test("kith-store's runner has this migration registered, numbered after its existing ones", () => {
+  const last = KITH_MIGRATIONS.at(-1);
+  assert.equal(last.version, 4);
+  assert.ok(last.url.pathname.endsWith("004_kith_migrate_tables.sql"));
+  assert.deepEqual(
+    KITH_MIGRATIONS.map((m) => m.version),
+    [1, 2, 3, 4],
+  );
 });
 
 test("every table's DDL column list matches id, [space_id], created_at, then the declared columns in order", () => {
-  const sql = generateMigrationSql();
+  const sql = generateKithMigrateTablesSql();
   for (const t of TABLES) {
     const match = sql.match(
       new RegExp(`CREATE TABLE kith\\."${t.pg}" \\(\\n([\\s\\S]*?)\\n\\);`),

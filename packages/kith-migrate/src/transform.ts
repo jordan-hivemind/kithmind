@@ -33,7 +33,9 @@ export type TransformReport = {
 
 const RETAINED_TEXT_COLUMNS: Record<string, string> = {
   source_pages: "text",
-  chunks: "text",
+  // brain_chunks: the plan's real `chunks` shape lands under this name for
+  // now; see src/ddl.ts's module comment for why.
+  brain_chunks: "text",
 };
 
 function allowedConvexFields(t: (typeof TABLES)[number]): Set<string> {

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
-import pg from "pg";
+import { createKithPool, withKithTransaction } from "@repo/kith-store";
+import type pg from "pg";
 
 import { readTableRows, type ExportManifest } from "./export.js";
 import { TABLES } from "./schema.js";
@@ -22,18 +23,20 @@ export type ParityReport = {
   ok: boolean;
 };
 
+/**
+ * Every parity check is read-only, but it still opens through
+ * `@repo/kith-store`'s own pool and transaction helper rather than a bare
+ * `pg.Pool`, so a check runs under the same `search_path` pin, statement
+ * timeout and `SERIALIZABLE`-with-retry the rest of the port uses — one
+ * connection story, not two.
+ */
 async function withClient<T>(
   connectionString: string,
   run: (client: pg.PoolClient) => Promise<T>,
 ): Promise<T> {
-  const pool = new pg.Pool({ connectionString, max: 1 });
+  const pool = createKithPool(connectionString, 1);
   try {
-    const client = await pool.connect();
-    try {
-      return await run(client);
-    } finally {
-      client.release();
-    }
+    return await withKithTransaction(pool, run);
   } finally {
     await pool.end();
   }
@@ -121,15 +124,15 @@ async function checkProvenanceChains(
   const details: string[] = [];
   await withClient(connectionString, async (client) => {
     const documents = await client.query<{ id: string }>(
-      `SELECT id FROM kith.documents ORDER BY id LIMIT $1`,
+      `SELECT id FROM kith.brain_documents ORDER BY id LIMIT $1`,
       [sampleSize],
     );
     for (const { id } of documents.rows) {
       const chain = await client.query(
         `SELECT d.id AS document_id, r.id AS revision_id, g.id AS generation_id,
                 p.id AS page_id, e.id AS span_id
-           FROM kith.documents d
-           JOIN kith.source_revisions r
+           FROM kith.brain_documents d
+           JOIN kith.brain_source_revisions r
              ON r.id = d.source_revision_id AND r.space_id = d.space_id
            JOIN kith.processing_generations g
              ON g.id = d.processing_generation_id AND g.space_id = d.space_id
