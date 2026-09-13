@@ -106,7 +106,7 @@ function reviewDedupeKey(kind, sourceDocumentId, sourceLocator, rawValue) {
  */
 export async function nullNonCashAmounts(
   client,
-  { slug, activityTaxonomy },
+  { institutionSlug, activityTaxonomy },
   { dryRun = false } = {},
 ) {
   const nonCashTypes = Object.entries(activityTaxonomy ?? {})
@@ -136,7 +136,7 @@ export async function nullNonCashAmounts(
     // institution can spell the same activity value and mean something else.
     const institution = await tx.query(
       "SELECT id FROM institutions WHERE slug = $1",
-      [slug],
+      [institutionSlug],
     );
     const institutionId = institution.rows[0]?.id;
     if (institutionId === undefined) return empty;
@@ -302,7 +302,7 @@ async function main() {
   try {
     const report = await nullNonCashAmounts(client, capabilities, { dryRun });
     console.log(`mode: nullNonCashAmounts${dryRun ? " (dry run)" : ""}`);
-    console.log(`institution: ${capabilities.slug}`);
+    console.log(`institution: ${capabilities.institutionSlug}`);
     console.log(`activity types declared movesCash: false: ${report.nonCashTypes}`);
     console.log(
       `rows ${dryRun ? "that would have their amount nulled" : "with amount nulled"}: ${report.rows}`,

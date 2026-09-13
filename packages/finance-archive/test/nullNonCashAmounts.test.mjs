@@ -30,7 +30,7 @@ const url = process.env.FINANCE_ARCHIVE_DATABASE_URL;
 // The adapter capabilities the script reads, reduced to what it uses. The two
 // journal types are non-cash; `Service Fee` is cash-moving and must survive.
 const CAPABILITIES = {
-  slug: "rowan-trust",
+  institutionSlug: "rowan-trust",
   activityTaxonomy: {
     "Transfer out of Account": { movesCash: false, movesQuantity: true, quantitySign: "negative" },
     "Transfer into Account": { movesCash: false, movesQuantity: true, quantitySign: "positive" },
