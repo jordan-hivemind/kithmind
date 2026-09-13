@@ -3,6 +3,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { Pool, PoolClient, QueryResultRow } from "pg";
 
 import { ProofError } from "./errors.js";
+import { sha256 } from "./hash.js";
 import {
   applyKithSchema,
   KITH_DOMAINS,
@@ -11,6 +12,7 @@ import {
 } from "./schema.js";
 
 export { ProofError } from "./errors.js";
+export { sha256 } from "./hash.js";
 export {
   assertKithId,
   GENERATED_KITH_ID_LENGTH,
@@ -82,10 +84,6 @@ export type CompleteWorkerJobResult = WorkerJob & {
   completedAt: string;
   reused: boolean;
 };
-
-export function sha256(value: string | Uint8Array): string {
-  return createHash("sha256").update(value).digest("hex");
-}
 
 export function newSyntheticApiKey(): string {
   return `km_proof_${randomBytes(32).toString("base64url")}`;
@@ -235,11 +233,11 @@ export async function seedSyntheticSpace(
   try {
     await client.query("BEGIN");
     await client.query(
-      "INSERT INTO kith.spaces(id, opaque_name) VALUES ($1, $2)",
+      "INSERT INTO kith.proof_spaces(id, opaque_name) VALUES ($1, $2)",
       [spaceId, opaqueName],
     );
     await client.query(
-      "INSERT INTO kith.api_keys(id, space_id, key_hash) VALUES ($1, $2, $3)",
+      "INSERT INTO kith.proof_api_keys(id, space_id, key_hash) VALUES ($1, $2, $3)",
       [apiKeyId, spaceId, keyHash(apiKey)],
     );
     await client.query("COMMIT");
@@ -260,7 +258,7 @@ export async function addSyntheticApiKey(
   expectUuid(spaceId, "invalid_space_id");
   const apiKeyId = randomUUID();
   const result = await owner.query(
-    "INSERT INTO kith.api_keys(id, space_id, key_hash) SELECT $1, id, $2 FROM kith.spaces WHERE id=$3 RETURNING id",
+    "INSERT INTO kith.proof_api_keys(id, space_id, key_hash) SELECT $1, id, $2 FROM kith.proof_spaces WHERE id=$3 RETURNING id",
     [apiKeyId, keyHash(apiKey), spaceId],
   );
   if (result.rowCount !== 1) throw new ProofError("space_not_found");
@@ -273,7 +271,7 @@ export async function revokeSyntheticApiKey(
 ): Promise<void> {
   expectUuid(apiKeyId, "invalid_api_key_id");
   const result = await owner.query(
-    "UPDATE kith.api_keys SET revoked_at = transaction_timestamp() WHERE id = $1 AND revoked_at IS NULL",
+    "UPDATE kith.proof_api_keys SET revoked_at = transaction_timestamp() WHERE id = $1 AND revoked_at IS NULL",
     [apiKeyId],
   );
   if (result.rowCount !== 1) throw new ProofError("api_key_not_current");
@@ -301,7 +299,7 @@ export class PostgresProof {
     apiKey: string,
   ): Promise<AuthContext> {
     const result = await client.query<{ id: string; space_id: string }>(
-      "SELECT id, space_id FROM kith.api_keys WHERE key_hash = $1 AND revoked_at IS NULL",
+      "SELECT id, space_id FROM kith.proof_api_keys WHERE key_hash = $1 AND revoked_at IS NULL",
       [keyHash(apiKey)],
     );
     if (result.rowCount !== 1) throw new ProofError("unauthorized");
