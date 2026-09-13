@@ -523,16 +523,18 @@ test("PDF seal recheck ignores server identity and disposition fields", async ()
   }
 });
 
-function assessmentCounts(ready) {
+function assessmentCounts(ready, overrides = {}) {
   return {
     items: {
       ready,
       pending: 0,
       failed: 0,
+      parked: 0,
       needsReview: 0,
       explicitGap: 0,
       unavailable: 0,
       ignoredForgotten: 0,
+      ...overrides,
     },
     unresolvedEntries: { needsReview: 0, ignoredForgotten: 0 },
   };
@@ -553,7 +555,7 @@ function assessPageCheckpoint(overrides = {}) {
   });
 }
 
-function assessPageResponse(ordinal, state = "running") {
+function assessPageResponse(ordinal, state = "running", countsOverrides) {
   const complete = state === "complete";
   return {
     operation: "processing.assessPage",
@@ -565,7 +567,10 @@ function assessPageResponse(ordinal, state = "running") {
     nextOrdinal: ordinal + 1,
     reused: false,
     ...(complete
-      ? { counts: assessmentCounts(1), completedAt: Date.now() }
+      ? {
+          counts: assessmentCounts(1, countsOverrides),
+          completedAt: Date.now(),
+        }
       : {}),
   };
 }
@@ -1233,6 +1238,36 @@ test("publishes a bounded multi-page scan and stores only metadata after complet
         .length,
       9,
     );
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+// P2-80h: a settled parse failure is parked, not a reason to keep reporting
+// `incomplete`. The pass ends `complete` with no code, so a scheduled watcher
+// stops rerunning the same documents. `PipelineRunResult` carries no counts, so
+// the parked count is read from the assessment result and `doctor`, not here.
+test("a complete assessment with parked documents ends the pass complete", async () => {
+  const setup = await fixture(0);
+  const journal = await openJournal(setup.journalDir, assessPageCheckpoint());
+  try {
+    const runner = new PipelineRunner(setup.config, journal, {
+      async call(request) {
+        if (request.operation === "source.status") {
+          return { operation: "source.status", sourceAccountId: "source" };
+        }
+        assert.equal(request.operation, "processing.assessPage");
+        return assessPageResponse(request.ordinal, "complete", {
+          parked: 7,
+          explicitGap: 24,
+        });
+      },
+    });
+    const result = await runner.run();
+    assert.equal(result.state, "complete");
+    assert.equal(result.code, undefined);
+    assert.equal(journal.pending, undefined);
   } finally {
     await journal.close();
     await rm(setup.base, { recursive: true, force: true });

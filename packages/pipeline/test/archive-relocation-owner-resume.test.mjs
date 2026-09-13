@@ -64,6 +64,7 @@ function doctorResult() {
           ready: 1,
           pending: 0,
           failed: 0,
+          parked: 0,
           needsReview: 0,
           explicitGap: 0,
           unavailable: 0,

@@ -83,6 +83,10 @@ export const workerAssessmentCountsValidator = v.object({
     ready: v.number(),
     pending: v.number(),
     failed: v.number(),
+    // Assessment rows written before P2-80h have no `parked` bucket. Readers
+    // (see `readCounts` in assessment.ts) treat a missing value as 0 rather
+    // than failing an old snapshot closed.
+    parked: v.optional(v.number()),
     needsReview: v.number(),
     explicitGap: v.number(),
     unavailable: v.number(),

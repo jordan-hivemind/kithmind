@@ -344,12 +344,30 @@ This does not soften the coverage claim, because a terminal result is never
 stalled every later assessment of the source, so a single file could stop the
 source from ever completing a pass.
 
-The item counts are `ready`, `pending`, `failed`, `needsReview`, `explicitGap`,
-`unavailable`, and `ignoredForgotten`. Unresolved entries separately count
-`needsReview` and `ignoredForgotten`. Each item or unresolved entry contributes
-once. A terminal result is `complete` only when no pending, failed, review, gap,
-or unavailable category remains. A terminal scan needing review always yields
-`incomplete`. Empty sources and valid forgotten tombstones do not block completion.
+The item counts are `ready`, `pending`, `failed`, `parked`, `needsReview`,
+`explicitGap`, `unavailable`, and `ignoredForgotten`. Unresolved entries
+separately count `needsReview` and `ignoredForgotten`. Each item or unresolved
+entry contributes once. A terminal result is `complete` only when no pending,
+failed, review, or unavailable category remains. A terminal scan needing review
+always yields `incomplete`. Empty sources and valid forgotten tombstones do not
+block completion.
+
+Adopted 2026-09-13 (P2-80h): a settled parse failure is a parked document, not
+a review of the source. A work row or job that failed with `retryable: false`
+is counted `parked`, its `sourceInventory` row stays `parse_failed`, and
+`list_review_queue` keeps listing it with its exclusion reason. A parked
+document and an explicit gap are both settled: they are recorded and will not
+change on their own, so neither keeps the source `incomplete`. Unfinished or
+unprovable work still does: `pending`, retryable `failed`, `unavailable`, and
+`needsReview` items or entries. Before this, seven deterministic parse failures
+kept a source `incomplete` on every pass forever, so a scheduled watcher reran
+the same pass endlessly and the source could never report `complete`.
+`complete` therefore means this pass has nothing left to do, never that every
+document parsed: read the `parked` and `explicitGap` counts, which every
+counts surface reports, together with the state.
+`requeueFailedDiscoveryWork` remains the operator route that reopens a parked
+row, after which its next scan entry is `queued` again and the source reports
+`incomplete` until that work finishes.
 
 Ready means the item's exact desired revision and generation have been
 published. Historical failed jobs do not block a newer ready generation.

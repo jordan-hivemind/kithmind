@@ -462,6 +462,15 @@ export type ProcessingAssessmentCounts = {
     ready: number;
     pending: number;
     failed: number;
+    /**
+     * P2-80h: a document whose processing failed for good (a work row or job
+     * failed with `retryable: false`). It is parked, not in review: nothing
+     * retries it, its `sourceInventory` row stays `parse_failed`, and
+     * `list_review_queue` lists it. A parked document does not keep the source
+     * `incomplete`, so this count is how a reader sees that `complete` does
+     * not mean everything parsed.
+     */
+    parked: number;
     needsReview: number;
     explicitGap: number;
     unavailable: number;

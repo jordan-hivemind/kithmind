@@ -449,8 +449,12 @@ async function requeueFixture() {
   return { t, ...ids };
 }
 
+// The `failed` rows here are parked rows (P2-80h): `retryable: false`, so the
+// assessment counts them `parked` and the source can report `complete`. This
+// operation stays the operator route that reopens one, which is why a requeued
+// row must come back as plain `queued` work with no failure left on it.
 describe("requeueFailedDiscoveryWork", () => {
-  it("requeues failed/needs_review rows under the attempt limit, skips rows at the limit, and never crosses source accounts", async () => {
+  it("requeues parked/needs_review rows under the attempt limit, skips rows at the limit, and never crosses source accounts", async () => {
     const {
       t,
       sourceAccountId,
