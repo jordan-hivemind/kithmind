@@ -1,13 +1,9 @@
 // The per-source mutation rate limit.
 //
-// Ported from `models/workers/rateLimit.ts` with the numbers unchanged: 60
-// mutations per credential per source account per 60 seconds. They are unchanged
-// deliberately and they are also known to be tight. Tracker row P2-80k records
-// the measurement: a 108-file pass spends most of that budget, leaving about one
-// retry before the limit refuses a pass that was otherwise healthy. Raising it is
-// P2-80k's decision with P2-80k's evidence, not a side effect of a platform port,
-// so this row's job is to keep the semantics identical and make the numbers one
-// named constant instead of two literals scattered through a file.
+// Kept in lockstep with `models/workers/rateLimit.ts`: 8,000 mutations per
+// credential/source in a 60-second fixed window. A 1,000-file pipeline pass
+// has a measured upper bound of 2,543 worker calls, leaving the adopted 3x
+// margin while retaining the same fixed-window policy and eight client retries.
 //
 // The window is fixed rather than sliding, which is what the original does: a
 // window older than 60 seconds is replaced wholesale rather than decayed. That
@@ -31,7 +27,7 @@ import { workerProtocolError } from "./errors.js";
  */
 export const WORKER_MUTATION_RATE_BUDGET = {
   /** Mutations allowed per credential per source account per window. */
-  limit: 60,
+  limit: 8_000,
   /** The window length in milliseconds. */
   windowMs: 60_000,
 } as const;
