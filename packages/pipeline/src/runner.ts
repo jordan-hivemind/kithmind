@@ -1244,6 +1244,32 @@ export class PipelineRunner {
     return parseAttemptsSpent(this.matchingProcessingRows(plan));
   }
 
+  /**
+   * Select the sole authoritative row from an otherwise ambiguous history.
+   * Callers supply only rows already matched on original, epochs and the full
+   * processing fingerprint tuple; this is not a general latest-row selector.
+   */
+  private reusableProcessingRow(
+    rows: readonly ProcessingCatalogRow[],
+  ): ProcessingCatalogRow | undefined {
+    if (rows.length <= 1) return rows[0];
+    const activated = rows.filter((row) => row.activation !== undefined);
+    if (activated.length !== 1) {
+      throw new PipelineWorkerError("archive_catalog_revision_conflict");
+    }
+    const [selected] = activated;
+    const activation = selected?.activation;
+    if (
+      !selected?.cloud ||
+      !activation ||
+      activation.jobId !== selected.cloud.ingestJobId ||
+      activation.processingGenerationId !== selected.cloud.processingGenerationId
+    ) {
+      throw new PipelineWorkerError("archive_catalog_revision_conflict");
+    }
+    return selected;
+  }
+
   private async pdfNeedsArchivedWork(plan: PdfFilePlan): Promise<boolean> {
     // A `queued` entry is the server saying it has not settled this failure
     // yet, and the only thing that settles it is one more report carrying
@@ -1262,12 +1288,10 @@ export class PipelineRunner {
     // catalogs and an exhausted document must stay skipped rather than fail
     // the pass over them.
     if (parseAttemptsSpent(matches) >= MAX_PARSE_ATTEMPTS) return false;
-    if (matches.length > 1) {
-      throw new PipelineWorkerError("archive_catalog_revision_conflict");
-    }
-    if (matches[0]?.activation) {
+    const reusable = this.reusableProcessingRow(matches);
+    if (reusable?.activation) {
       return await this.processingArtifactsPresent(
-        matches[0],
+        reusable,
         planMediaType(plan),
       );
     }
@@ -1374,10 +1398,7 @@ export class PipelineRunner {
     let processing = catalog.findProcessingExact(processingProbe);
     if (!processing && plan.discoveryState === "unchanged") {
       const prior = this.matchingProcessingRows(plan);
-      if (prior.length > 1) {
-        throw new PipelineWorkerError("archive_catalog_revision_conflict");
-      }
-      processing = prior[0];
+      processing = this.reusableProcessingRow(prior);
     }
     if (!processing) {
       const processingId = stableUuid(

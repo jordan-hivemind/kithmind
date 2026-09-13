@@ -27,6 +27,24 @@
 // `settle_date` is nullable, and a row without one falls back to
 // `process_date` unchanged.
 //
+// F1-8i asked whether the provider states a better date than either of those,
+// and measured that it does not. Morgan Stanley's activity response carries
+// two further dates, `activityDate` and `payDate`; the adapter retains both in
+// the raw bytes (`ms-activity-3`) and maps neither to a column. Over the
+// owner's archive, all 50,700 retained activity rows carry a `payDate` key and
+// **none** states a value, so there is nothing to import: the retention
+// projection copies only keys the source itself carries, so a present key
+// holding `null` is the provider's own null. `activityDate` is stated on all
+// 50,700, but against the cash-effective date above it is the same day on
+// 27,973 rows, earlier on 22,829 and later on only 63, so it almost never
+// moves a row later, which is the direction the misplaced rows need.
+// Preferring it -- outright, inside the `greatest()`, or inside a `least()` --
+// flipped 0 of the 15 failing periods to a pass and broke 296, 8 and 295
+// passing periods respectively. So neither date is the posting date, and this
+// rule is unchanged. The residual is a one-day boundary question, not a
+// posting-date one: see the README's "No posting date to import" for what it
+// looks like and what to measure next.
+//
 // The tolerance is an owner decision already made: exact zero. Any nonzero
 // delta fails the period. Under F1-22's move to NUMERIC that comparison is
 // the one place a float could creep back in, so it does not happen in
