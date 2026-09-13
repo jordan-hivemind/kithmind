@@ -991,8 +991,18 @@ function classifyPdfEncryption(bytes: Buffer): PdfEncryptionClassification {
       ) {
         return { status: "password_required" };
       }
-      const lengthBits = pdfDictNumber(encryptDict, "Length") ?? 40;
-      const keyLen = revision === 2 ? 5 : Math.trunc(lengthBits / 8);
+      // `/Length` is specified in bits (40 to 128), but some writers emit the
+      // crypt filter's byte count there instead (`/Length 16` for AES-128).
+      // No legal bit length is 16 or less, so a small value is unambiguously
+      // a byte count. A wrong guess cannot admit a file: the key it derives
+      // simply fails the `/U` comparison below.
+      const declaredLength = pdfDictNumber(encryptDict, "Length") ?? 40;
+      const keyLen =
+        revision === 2
+          ? 5
+          : declaredLength <= 16
+            ? declaredLength
+            : Math.trunc(declaredLength / 8);
       if (!Number.isInteger(keyLen) || keyLen < 5 || keyLen > 16) {
         return { status: "password_required" };
       }

@@ -478,6 +478,38 @@ test("a permissions-only PDF (empty user password validates) is admitted with th
   assert.equal(observations[0].file.encryptionRevision, 3);
 });
 
+test("a /Length in bytes rather than bits still validates the empty user password", async () => {
+  const { root, journal } = await setup();
+  // P2-80e: owner samples written as /V 4 /R 4 AESV2 whose /Length carries
+  // the crypt filter's byte count (16), not the spec's bit count (128).
+  // Poppler opens them with an empty user password; the classifier derived a
+  // 2-byte key from 16/8 and refused them.
+  const byteLengthOptions = {
+    version: 4,
+    revision: 4,
+    keyLengthBytes: 16,
+    declaredLength: 16,
+    encryptMetadata: false,
+    cryptFilterMethod: "AESV2",
+  };
+  await writeFile(
+    join(root, "byte-length.pdf"),
+    standardEncryptedPdf({ userPassword: "", ...byteLengthOptions }),
+  );
+  await writeFile(
+    join(root, "byte-length-password.pdf"),
+    standardEncryptedPdf({ userPassword: "secret", ...byteLengthOptions }),
+  );
+  const [safeRoot] = await canonicalRoots(config(root, journal));
+  const file = await readPdfFile(safeRoot, "byte-length.pdf");
+  assert.equal(file.permissionsRestricted, true);
+  assert.equal(file.encryptionRevision, 4);
+  await assert.rejects(
+    () => readPdfFile(safeRoot, "byte-length-password.pdf"),
+    (error) => error instanceof FilesystemFailure && error.code === "encrypted",
+  );
+});
+
 test("a PDF that requires a real (non-empty) user password stays excluded", async () => {
   const { root, journal } = await setup();
   await writeFile(

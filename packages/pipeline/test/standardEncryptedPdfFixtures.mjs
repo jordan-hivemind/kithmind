@@ -41,12 +41,22 @@ function paddedPassword(password) {
   return Buffer.concat([pw, PDF_PAD.subarray(0, 32 - pw.length)]);
 }
 
-function standardKeyR3(paddedPw, o, p, id, keyLenBytes) {
+function standardKeyR3(
+  paddedPw,
+  o,
+  p,
+  id,
+  keyLenBytes,
+  revision = 3,
+  encryptMetadata = true,
+) {
   const pBytes = Buffer.alloc(4);
   pBytes.writeInt32LE(p, 0);
-  let digest = createHash("md5")
-    .update(Buffer.concat([paddedPw, o, pBytes, id]))
-    .digest();
+  const parts = [paddedPw, o, pBytes, id];
+  if (revision >= 4 && !encryptMetadata) {
+    parts.push(Buffer.from([0xff, 0xff, 0xff, 0xff]));
+  }
+  let digest = createHash("md5").update(Buffer.concat(parts)).digest();
   for (let round = 0; round < 50; round += 1) {
     digest = createHash("md5").update(digest.subarray(0, keyLenBytes)).digest();
   }
@@ -66,19 +76,54 @@ function userValueR3(key, id) {
 }
 
 /** A revision-3, 40-bit standard-handler PDF whose `/O` and `/U` validate
- * `userPassword` (an empty string producing a permissions-only file). */
+ * `userPassword` (an empty string producing a permissions-only file).
+ *
+ * `keyLengthBytes` is the real key length used to compute `/U`, while
+ * `declaredLength` is whatever the `/Length` entry claims: P2-80e's owner
+ * samples are `/V 4 /R 4` AESV2 files whose `/Length` is the crypt filter's
+ * byte count (16) rather than the spec's bit count (128). */
 export function standardEncryptedPdf({
   userPassword,
   filter = "Standard",
   revision = 3,
   permissions = -44,
+  version = 2,
+  keyLengthBytes = 5,
+  declaredLength,
+  encryptMetadata = true,
+  cryptFilterMethod,
 }) {
   const id = Buffer.from("0123456789abcdef0123456789abcdef", "hex");
   const owner = Buffer.alloc(32, 0x41);
-  const key = standardKeyR3(paddedPassword(userPassword), owner, permissions, id, 5);
+  const key = standardKeyR3(
+    paddedPassword(userPassword),
+    owner,
+    permissions,
+    id,
+    keyLengthBytes,
+    revision,
+    encryptMetadata,
+  );
   const uValue = userValueR3(key, id);
   const idHex = id.toString("hex");
-  const encryptObj = `2 0 obj\n<< /Filter /${filter} /V 2 /R ${revision} /O <${owner.toString("hex")}> /U <${uValue.toString("hex")}> /P ${permissions} >>\nendobj\n`;
+  const entries = [
+    `/Filter /${filter}`,
+    `/V ${version}`,
+    `/R ${revision}`,
+    `/O <${owner.toString("hex")}>`,
+    `/U <${uValue.toString("hex")}>`,
+    `/P ${permissions}`,
+    ...(declaredLength === undefined ? [] : [`/Length ${declaredLength}`]),
+    ...(encryptMetadata ? [] : ["/EncryptMetadata false"]),
+    ...(cryptFilterMethod === undefined
+      ? []
+      : [
+          `/CF << /StdCF << /CFM /${cryptFilterMethod} /AuthEvent /DocOpen /Length ${keyLengthBytes} >> >>`,
+          "/StmF /StdCF",
+          "/StrF /StdCF",
+        ]),
+  ];
+  const encryptObj = `2 0 obj\n<< ${entries.join(" ")} >>\nendobj\n`;
   return Buffer.concat([
     Buffer.from("%PDF-1.4\n"),
     Buffer.from("1 0 obj\n<< /Type /Catalog >>\nendobj\n"),
