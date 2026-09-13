@@ -210,6 +210,13 @@ const DOCUMENT_PARSER_FAILURE_CODES = new Set<string>([
   "bundle_too_large",
 ]);
 
+function parseAttemptsSpent(rows: readonly ProcessingCatalogRow[]): number {
+  return rows.reduce(
+    (total, row) => total + (row.parseFailure?.attempts ?? 0),
+    0,
+  );
+}
+
 type ArchivedCheckpoint = Extract<RunnerCheckpoint, { phase: "archived" }>;
 
 function stableUuid(...parts: readonly unknown[]): string {
@@ -1134,23 +1141,48 @@ export class PipelineRunner {
     return false;
   }
 
+  /**
+   * Local parse attempts already spent on this document: the sum over every
+   * processing catalog row that describes the same bytes under the same parser
+   * fingerprints.
+   *
+   * P2-80g2: the budget belongs to the document, not to one catalog row.
+   * `createArchivedIntents` probes `findProcessingExact` with the current
+   * `scanId`, and only reuses a prior row for an `unchanged` entry, so a
+   * document re-queued after a failure lands on a brand new row every pass.
+   * Counting one row therefore saw `attempts: 1` forever: the client never
+   * judged itself exhausted, re-parsed the same PDFs on every pass, and never
+   * told the server the failure was terminal. A parser version bump still
+   * resets the budget, because it changes `fingerprints.parserFingerprint` and
+   * no prior row matches.
+   */
+  private documentParseAttempts(plan: PdfFilePlan): number {
+    return parseAttemptsSpent(this.matchingProcessingRows(plan));
+  }
+
   private async pdfNeedsArchivedWork(plan: PdfFilePlan): Promise<boolean> {
+    // A `queued` entry is the server saying it has not settled this failure
+    // yet, and the only thing that settles it is one more report carrying
+    // `exhausted`, so going quiet here would strand the work row as retryable
+    // forever. One more parse settles it; every pass after that arrives here
+    // as `unchanged` and is skipped by the bound below.
     if (plan.discoveryState === "queued") return true;
     if (plan.discoveryState !== "unchanged") return false;
     const matches = this.matchingProcessingRows(plan);
+    // A document that has already exhausted its bounded local parser attempts
+    // (see `recordArchivedParseFailure`) stays `parse_failed` rather than being
+    // retried on every future pass; a parser version bump lands on a fresh row
+    // with no `parseFailure` and lifts this gate automatically. Checked before
+    // the revision-conflict guard below, because the per-row judgment this
+    // replaces left several rows per failed document behind in existing
+    // catalogs and an exhausted document must stay skipped rather than fail
+    // the pass over them.
+    if (parseAttemptsSpent(matches) >= MAX_PARSE_ATTEMPTS) return false;
     if (matches.length > 1) {
       throw new PipelineWorkerError("archive_catalog_revision_conflict");
     }
     if (matches[0]?.activation) {
       return await this.processingArtifactsPresent(matches[0]);
-    }
-    // A document that has already exhausted its bounded local parser
-    // attempts (see `recordArchivedParseFailure`) stays `parse_failed`
-    // rather than being retried on every future pass; a parser version
-    // bump changes `fingerprints.parserFingerprint`, which lands on a fresh
-    // row (no `parseFailure`) and lifts this gate automatically.
-    if ((matches[0]?.parseFailure?.attempts ?? 0) >= MAX_PARSE_ATTEMPTS) {
-      return false;
     }
     return true;
   }
@@ -4851,7 +4883,7 @@ export class PipelineRunner {
       throw new PipelineWorkerError("journal_phase_conflict");
     }
     const { processing } = this.archivedRows(checkpoint);
-    const recorded = await this.requireCatalog().recordParseFailure({
+    await this.requireCatalog().recordParseFailure({
       catalogId: processing.processingCatalogId,
       expectedRevision: processing.rowRevision,
       code,
@@ -4860,11 +4892,13 @@ export class PipelineRunner {
     // P2-80g: `pdfNeedsArchivedWork` will not offer this document again once
     // its local attempts reach the bound, so the server is told the failure is
     // terminal instead of letting its own larger attempt bound keep the row
-    // retryable for passes that will never happen.
+    // retryable for passes that will never happen. P2-80g2: counted per
+    // document across passes, not per catalog row.
     await this.submitArchivedParseFailure(
       checkpoint,
       code,
-      (recorded.parseFailure?.attempts ?? 0) >= MAX_PARSE_ATTEMPTS,
+      this.documentParseAttempts(this.archivedPlan(checkpoint)) >=
+        MAX_PARSE_ATTEMPTS,
     );
     const nextPdf = await this.nextPdfWorkIndex(
       checkpoint.files,

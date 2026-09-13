@@ -1228,6 +1228,35 @@ describe("archived discovery admission", () => {
         publicationState: "historical",
       });
     });
+    // P2-80g2: card extraction may stage its own evidence span over sealed
+    // text (see `evidenceSpanFields`: sealing protects the text and its pages,
+    // not pointers into them). Such a row is not part of the parsed payload,
+    // so re-verifying the payload must ignore it. Counting it made every
+    // re-verification of a document that had been through card extraction
+    // throw, which turned `terminalParsedReady` false and failed the worker
+    // processing assessment closed as `detail_unavailable` on that document.
+    const cardSpanId = await f.t.run((ctx) =>
+      ctx.db.insert("evidenceSpans", {
+        spaceId: stagedGraph.span.spaceId,
+        sourceRevisionId: stagedGraph.span.sourceRevisionId,
+        sourceTextVersionId: stagedGraph.span.sourceTextVersionId,
+        sourcePageId: stagedGraph.span.sourcePageId,
+        ordinal: stagedGraph.span.ordinal,
+        start: stagedGraph.span.start,
+        end: stagedGraph.span.end,
+        quoteHash: stagedGraph.span.quoteHash,
+        cardExtractionFingerprints: ["c".repeat(64)],
+      }),
+    );
+    await expect(
+      f.t.run(async (ctx) =>
+        verifySealedParsedPayload(
+          ctx,
+          (await ctx.db.get(stagedGraph.generation._id))!,
+        ),
+      ),
+    ).resolves.toMatchObject({ actualDocumentCount: 1, actualChunkCount: 1 });
+    await f.t.run((ctx) => ctx.db.delete(cardSpanId));
     await expect(
       f.t.run(async (ctx) =>
         verifySealedParsedPayload(
