@@ -101,6 +101,9 @@ const ACTIVITY_SIGN_TABLE = new Map([
   // In-kind movement between accounts, one direction each.
   ["Exchange Deliver Out", -1],
   ["Exchange Received In", 1],
+  // The same in-kind journal under the site's other wording (F1-8d).
+  ["Transfer out of Account", -1],
+  ["Transfer into Account", 1],
   // An expiring contract leaves the position.
   ["Option Expired", -1],
   // Shares paid as the dividend itself.
@@ -135,6 +138,15 @@ const ACTIVITY_TAXONOMY = {
   // In-kind: the position moves, no cash crosses the account boundary.
   "Exchange Deliver Out": { movesCash: false, movesQuantity: true, quantitySign: "negative" },
   "Exchange Received In": { movesCash: false, movesQuantity: true, quantitySign: "positive" },
+  // F1-8d. The same in-kind journal, spelled the site's other way. Every one
+  // of these rows the owner's archive holds pairs with a row of the opposite
+  // wording on a *different* account at the same date, instrument and
+  // magnitude, and none pairs within one account: the position crosses an
+  // account boundary and no cash crosses anything. The stated `amount` is the
+  // value journalled, not a cash movement, which is why counting it as cash
+  // was the whole of 17 failing cash-gate periods.
+  "Transfer out of Account": { movesCash: false, movesQuantity: true, quantitySign: "negative" },
+  "Transfer into Account": { movesCash: false, movesQuantity: true, quantitySign: "positive" },
   "Option Expired": { movesCash: false, movesQuantity: true, quantitySign: "negative" },
   "Dividend Stock": { movesCash: false, movesQuantity: true, quantitySign: "positive" },
 
