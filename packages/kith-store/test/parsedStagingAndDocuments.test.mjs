@@ -67,8 +67,9 @@ async function seedGeneration(client, input) {
     `INSERT INTO kith.processing_generations
        (id, space_id, created_at, source_account_id, source_item_id, source_revision_id, source_text_version_id,
         parser_artifact_id, desired_processing_epoch, card_generation, state,
-        expected_page_count, expected_evidence_span_count, expected_document_count, expected_chunk_count)
-     VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6,$7,$8,false,'queued',$9,$10,$11,$12)`,
+        archive_set_digest, normalized_bundle_digest, expected_page_count,
+        expected_evidence_span_count, expected_document_count, expected_chunk_count)
+     VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6,$7,$8,false,'queued',$9,$10,$11,$12,$13,$14)`,
     [
       id,
       input.spaceId,
@@ -78,6 +79,8 @@ async function seedGeneration(client, input) {
       input.sourceTextVersionId,
       input.parserArtifactId,
       input.desiredProcessingEpoch,
+      "b".repeat(64),
+      "c".repeat(64),
       input.expectedPageCount,
       input.expectedEvidenceSpanCount,
       input.expectedDocumentCount,
@@ -101,6 +104,63 @@ async function seedIngestJob(client, spaceId, sourceAccountId, sourceItemId, sou
   return id;
 }
 
+async function seedDiscoveryWork(client, input) {
+  const scanId = opaqueId();
+  const pageId = opaqueId();
+  const entryId = opaqueId();
+  const workId = opaqueId();
+  const now = new Date();
+  const retireAt = new Date(now.getTime() + 60_000);
+  await client.query(
+    `INSERT INTO kith.worker_source_scans
+     (id, space_id, created_at, source_account_id, request_id, request_digest,
+      watcher_id, connector_version, mode, inventory_epoch, manifest_version_at_begin,
+      actor_user_id, actor_credential_id, state, next_page_ordinal,
+      next_reconcile_ordinal, inventory_done, page_count, entry_count, changed_count,
+      gap_count, review_count, started_at, expires_at, retire_at)
+     VALUES ($1,$2,transaction_timestamp(),$3,'fixture-scan','fixture-digest',
+      'fixture-watcher','fixture-connector','normal',0,0,$4,$5,'enumerated',
+      1,1,true,1,1,1,0,0,$6,$7,$7)`,
+    [scanId, input.spaceId, input.sourceAccountId, input.userId, input.credentialId, now, retireAt],
+  );
+  await client.query(
+    `INSERT INTO kith.worker_scan_pages
+     (id, space_id, created_at, source_account_id, scan_id, ordinal,
+      request_id, entry_count, created_at_field, retire_at)
+     VALUES ($1,$2,transaction_timestamp(),$3,$4,0,'fixture-page',1,$5,$6)`,
+    [pageId, input.spaceId, input.sourceAccountId, scanId, now, retireAt],
+  );
+  await client.query(
+    `INSERT INTO kith.worker_scan_entries
+     (id, space_id, created_at, source_account_id, scan_id, scan_page_id,
+      source_item_id, identity_key_hash, uri_digest, inventory_metadata_digest,
+      source_modified_at, state, observed_at, retire_at)
+     VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6,'fixture-identity',
+      'fixture-uri','fixture-metadata',$7,'queued',$7,$8)`,
+    [entryId, input.spaceId, input.sourceAccountId, scanId, pageId, input.sourceItemId, now, retireAt],
+  );
+  await client.query(
+    `INSERT INTO kith.worker_discovery_work
+     (id, space_id, created_at, source_account_id, source_item_id, scan_id,
+      scan_entry_id, observation_epoch, processing_epoch, state, content_hash,
+      byte_length, captured_at, source_modified_at, media_type, profile_id,
+      extraction_fingerprint, extractor_fingerprint, record_schema_fingerprint,
+      normalization_fingerprint, chunker_fingerprint, uri, actor_user_id,
+      actor_credential_id, attempts, lease_epoch, created_at_field, retire_at)
+     VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6,1,1,'admitted',$7,
+      1,$8,$8,'application/pdf','fixture-profile','fixture-extraction',
+      'fixture-extractor','fixture-records','fixture-normalization',
+      'fixture-chunker','fixture://parsed',$9,$10,1,1,$8,$11)`,
+    [workId, input.spaceId, input.sourceAccountId, input.sourceItemId, scanId, entryId,
+      "a".repeat(64), now, input.userId, input.credentialId, retireAt],
+  );
+  await client.query(
+    "UPDATE kith.worker_scan_entries SET discovery_work_id = $1 WHERE id = $2",
+    [workId, entryId],
+  );
+  return workId;
+}
+
 /** worker_parsed_stages: row e's own table (see its module header in
  * migration 004). Seeded with the fields parsedStaging.ts's functions
  * actually read; every other column stays NULL, which the table permits. */
@@ -108,26 +168,35 @@ async function seedWorkerParsedStage(client, input) {
   const id = opaqueId();
   await client.query(
     `INSERT INTO kith.worker_parsed_stages
-       (id, space_id, created_at, source_account_id, source_item_id, ingest_job_id, processing_generation_id,
-        source_revision_id, source_text_version_id, parser_artifact_id, mapping_manifest_hash,
+       (id, space_id, created_at, source_account_id, source_item_id, discovery_work_id, ingest_job_id,
+        processing_generation_id, source_revision_id, source_text_version_id, parser_artifact_id,
+        archive_set_digest, normalized_bundle_digest, mapping_manifest_hash, phase, next_ordinal,
         expected_page_count, expected_evidence_span_count, expected_document_count, expected_chunk_count,
-        page_ids, evidence_span_ids, document_ids, chunk_ids, page_bytes, evidence_bytes, document_bytes, chunk_bytes)
-     VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'[]','[]','[]','[]',0,0,0,0)`,
+        accepted_page_count, accepted_evidence_span_count, accepted_document_count, accepted_chunk_count,
+        page_ids, evidence_span_ids, document_ids, chunk_ids, page_bytes, evidence_bytes, document_bytes,
+        chunk_bytes, created_at_field, updated_at, retire_at)
+     VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'pages',0,
+      $14,$15,$16,$17,0,0,0,0,'[]','[]','[]','[]',0,0,0,0,$18,$18,$19)`,
     [
       id,
       input.spaceId,
       input.sourceAccountId,
       input.sourceItemId,
+      input.discoveryWorkId,
       input.ingestJobId,
       input.processingGenerationId,
       input.sourceRevisionId,
       input.sourceTextVersionId,
       input.parserArtifactId,
+      "b".repeat(64),
+      "c".repeat(64),
       input.mappingManifestHash,
       input.expectedPageCount,
       input.expectedEvidenceSpanCount,
       input.expectedDocumentCount,
       input.expectedChunkCount,
+      new Date(),
+      new Date(Date.now() + 60_000),
     ],
   );
   return {
@@ -140,11 +209,20 @@ async function seedWorkerParsedStage(client, input) {
     sourceRevisionId: input.sourceRevisionId,
     sourceTextVersionId: input.sourceTextVersionId,
     parserArtifactId: input.parserArtifactId,
+    discoveryWorkId: input.discoveryWorkId,
+    archiveSetDigest: "b".repeat(64),
+    normalizedBundleDigest: "c".repeat(64),
     mappingManifestHash: input.mappingManifestHash,
+    phase: "pages",
+    nextOrdinal: 0,
     expectedPageCount: input.expectedPageCount,
     expectedEvidenceSpanCount: input.expectedEvidenceSpanCount,
     expectedDocumentCount: input.expectedDocumentCount,
     expectedChunkCount: input.expectedChunkCount,
+    acceptedPageCount: 0,
+    acceptedEvidenceSpanCount: 0,
+    acceptedDocumentCount: 0,
+    acceptedChunkCount: 0,
     pageIds: [],
     evidenceSpanIds: [],
     documentIds: [],
@@ -252,10 +330,18 @@ test(
       expectedChunkCount: 2,
     });
     const ingestJobId = await seedIngestJob(client, spaceId, sourceAccountId, item.id, archivedRevision.id, generationId);
+    const discoveryWorkId = await seedDiscoveryWork(client, {
+      spaceId,
+      sourceAccountId,
+      sourceItemId: item.id,
+      userId,
+      credentialId: actorCredentialId,
+    });
     const stage = await seedWorkerParsedStage(client, {
       spaceId,
       sourceAccountId,
       sourceItemId: item.id,
+      discoveryWorkId,
       ingestJobId,
       processingGenerationId: generationId,
       sourceRevisionId: archivedRevision.id,

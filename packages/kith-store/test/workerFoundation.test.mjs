@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { digestParsedMappingManifest } from "@repo/worker-protocol";
 import { createKithPool, newKithId, provenance } from "../dist/index.js";
 import { listSources } from "../dist/documents/index.js";
 import {
@@ -12,15 +13,18 @@ import {
   END_CURSOR,
   WorkerProtocolError,
   activateProcessingJob,
+  activateParsedJob,
   admitArchivedDiscovery,
   appendWorkerScanPage,
   artifactBoundExtractionFingerprint,
   admitDiscoveryUtf8,
   beginWorkerScan,
+  beginParsedStage,
   camelizeScan,
   consumeWorkerMutationRateLimit,
   decodeCursor,
   encodeCursor,
+  failParsedJob,
   failArchivedDiscovery,
   lookupArchivedAdmission,
   preflightArchivedDiscovery,
@@ -31,12 +35,16 @@ import {
   requireWorkerSourceAccount,
   reconcileWorkerScan,
   renewProcessingJob,
+  renewParsedJob,
   reserveArchivedDiscovery,
   reserveDiscoveryWork,
   reserveProcessingJobs,
+  reserveParsedJobs,
   resolveAndPersistEntry,
   sealWorkerScan,
   stageProcessingUtf8,
+  stageParsedBatch,
+  sealParsedStage,
   withWorkerTransaction,
   workerCtx,
 } from "../dist/workers/index.js";
@@ -1257,8 +1265,27 @@ test(
     const parserFingerprint = "1".repeat(64);
     const extractionConfigurationFingerprint = "3".repeat(64);
     const outputHash = "b".repeat(64);
-    const parsedTextHash = "c".repeat(64);
-    const mappingHash = "d".repeat(64);
+    const parsedTextHash = await sha256Hex("abcdefgh");
+    const page = {
+      ordinal: 0,
+      start: 0,
+      end: 8,
+      text: "abcdefgh",
+      textHash: parsedTextHash,
+    };
+    const evidence = {
+      ordinal: 0,
+      pageOrdinal: 0,
+      start: 0,
+      end: 8,
+      quoteHash: parsedTextHash,
+      locator: {
+        kind: "parser_page_v1",
+        pageNumber: 1,
+        pageTextHash: parsedTextHash,
+      },
+    };
+    const mappingHash = await digestParsedMappingManifest([page], [evidence]);
     const bundleHash = "e".repeat(64);
     const receipt = (subjectKind, copyRole, offset) => {
       const digit = ((offset % 14) + 1).toString(16);
@@ -1525,6 +1552,365 @@ test(
         ).rows[0].count,
         1,
       );
+
+      const reserved = await call((ctx) =>
+        reserveParsedJobs(
+          ctx,
+          f.principal,
+          {
+            ...common,
+            operation: "jobs.reserveParsed",
+            requestId: "parsed-reserve",
+            maxItems: 1,
+            jobId: admitted.ingestJobId,
+          },
+          ["9".repeat(64)],
+        ),
+      );
+      assert.equal(reserved.targets.length, 1);
+      assert.equal(reserved.targets[0].jobId, admitted.ingestJobId);
+      assert.equal(
+        (
+          await call((ctx) =>
+            reserveParsedJobs(
+              ctx,
+              f.principal,
+              {
+                ...common,
+                operation: "jobs.reserveParsed",
+                requestId: "parsed-reserve",
+                maxItems: 1,
+                jobId: admitted.ingestJobId,
+              },
+              ["9".repeat(64)],
+            ),
+          )
+        ).reused,
+        true,
+      );
+      const initialLease = reserved.targets[0];
+      const renewed = await call((ctx) =>
+        renewParsedJob(ctx, f.principal, {
+          ...common,
+          operation: "jobs.renewParsed",
+          requestId: "parsed-renew",
+          jobId: initialLease.jobId,
+          leaseEpoch: initialLease.leaseEpoch,
+          leaseToken: initialLease.leaseToken,
+        }),
+      );
+      assert.equal(renewed.reused, false);
+      assert.equal(
+        (
+          await call((ctx) =>
+            renewParsedJob(ctx, f.principal, {
+              ...common,
+              operation: "jobs.renewParsed",
+              requestId: "parsed-renew",
+              jobId: initialLease.jobId,
+              leaseEpoch: initialLease.leaseEpoch,
+              leaseToken: initialLease.leaseToken,
+            }),
+          )
+        ).reused,
+        true,
+      );
+      const failRequest = {
+        ...common,
+        operation: "jobs.failParsed",
+        requestId: "parsed-fail",
+        jobId: initialLease.jobId,
+        leaseEpoch: initialLease.leaseEpoch,
+        leaseToken: initialLease.leaseToken,
+        failureCode: "worker_interrupted",
+      };
+      const failed = await call((ctx) =>
+        failParsedJob(ctx, f.principal, failRequest),
+      );
+      assert.equal(failed.state, "failed");
+      assert.equal(failed.retryable, true);
+      assert.equal(
+        (await call((ctx) => failParsedJob(ctx, f.principal, failRequest)))
+          .reused,
+        true,
+      );
+      const parsedNow = failed.nextAttemptAt;
+      const replacement = await call(
+        (ctx) =>
+          reserveParsedJobs(
+            ctx,
+            f.principal,
+            {
+              ...common,
+              operation: "jobs.reserveParsed",
+              requestId: "parsed-reserve-after-fail",
+              maxItems: 1,
+              jobId: admitted.ingestJobId,
+            },
+            ["a".repeat(64)],
+          ),
+        parsedNow,
+      );
+      assert.equal(
+        replacement.targets[0].leaseEpoch,
+        initialLease.leaseEpoch + 1,
+      );
+      const lease = replacement.targets[0];
+      const parsedCall = (work) => call(work, parsedNow);
+      const leaseRequest = {
+        ...common,
+        jobId: lease.jobId,
+        leaseEpoch: lease.leaseEpoch,
+        leaseToken: lease.leaseToken,
+      };
+      const beginRequest = {
+        ...leaseRequest,
+        operation: "jobs.stageParsedBegin",
+        requestId: "parsed-begin",
+        extractionFingerprint,
+        mappingManifestHash: mappingHash,
+        normalizedBundleDigest: bundleHash,
+        expectedPageCount: 1,
+        expectedEvidenceSpanCount: 1,
+        expectedDocumentCount: 1,
+        expectedChunkCount: 1,
+      };
+      const stage = await parsedCall((ctx) =>
+        beginParsedStage(ctx, f.principal, beginRequest),
+      );
+      assert.equal(stage.phase, "pages");
+      assert.equal(
+        (
+          await parsedCall((ctx) =>
+            beginParsedStage(ctx, f.principal, beginRequest),
+          )
+        ).reused,
+        true,
+      );
+
+      await f.client.query(
+        "UPDATE kith.ingest_jobs SET lease_expires_at = $1 WHERE id = $2",
+        [new Date(NOW - 1), lease.jobId],
+      );
+      await assert.rejects(
+        parsedCall((ctx) =>
+          stageParsedBatch(ctx, f.principal, {
+            ...leaseRequest,
+            operation: "jobs.stageParsedBatch",
+            requestId: "parsed-pages-expired",
+            stageId: stage.stageId,
+            phase: "pages",
+            ordinal: 0,
+            rows: [page],
+          }),
+        ),
+        expectProtocolCode("lease_conflict"),
+      );
+      await f.client.query(
+        `UPDATE kith.ingest_jobs SET lease_expires_at = $1,
+         worker_lease_owner_credential_id = NULL WHERE id = $2`,
+        [new Date(lease.leaseExpiresAt), lease.jobId],
+      );
+      await assert.rejects(
+        parsedCall((ctx) =>
+          stageParsedBatch(ctx, f.principal, {
+            ...leaseRequest,
+            operation: "jobs.stageParsedBatch",
+            requestId: "parsed-pages-revoked",
+            stageId: stage.stageId,
+            phase: "pages",
+            ordinal: 0,
+            rows: [page],
+          }),
+        ),
+        expectProtocolCode("lease_conflict"),
+      );
+      await f.client.query(
+        `UPDATE kith.ingest_jobs SET worker_lease_owner_credential_id = $1
+         WHERE id = $2`,
+        [f.principal.credentialId, lease.jobId],
+      );
+
+      await f.client.query(
+        "CREATE SEQUENCE kith.test_parsed_stage_retry_sequence",
+      );
+      await f.client.query(`CREATE FUNCTION kith.test_parsed_stage_retry()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          IF nextval('kith.test_parsed_stage_retry_sequence') = 1 THEN
+            RAISE EXCEPTION 'synthetic serialization failure' USING ERRCODE = '40001';
+          END IF;
+          RETURN NEW;
+        END $$`);
+      await f.client.query(`CREATE TRIGGER test_parsed_stage_retry
+        AFTER INSERT ON kith.source_pages FOR EACH ROW
+        EXECUTE FUNCTION kith.test_parsed_stage_retry()`);
+      const pagesRequest = {
+        ...leaseRequest,
+        operation: "jobs.stageParsedBatch",
+        requestId: "parsed-pages",
+        stageId: stage.stageId,
+        phase: "pages",
+        ordinal: 0,
+        rows: [page],
+      };
+      const pages = await parsedCall((ctx) =>
+        stageParsedBatch(ctx, f.principal, pagesRequest),
+      );
+      assert.equal(pages.phase, "evidence");
+      assert.equal(
+        (
+          await f.client.query(
+            "SELECT count(*)::int AS count FROM kith.source_pages WHERE source_text_version_id = $1",
+            [admitted.sourceTextVersionId],
+          )
+        ).rows[0].count,
+        1,
+      );
+      assert.equal(
+        Number(
+          (
+            await f.client.query(
+              "SELECT last_value FROM kith.test_parsed_stage_retry_sequence",
+            )
+          ).rows[0].last_value,
+        ),
+        2,
+      );
+      assert.equal(
+        (
+          await f.client.query(
+            `SELECT count(*)::int AS count
+             FROM kith.worker_binary_operation_receipts
+             WHERE request_id = 'parsed-pages'`,
+          )
+        ).rows[0].count,
+        1,
+      );
+      assert.equal(
+        (
+          await parsedCall((ctx) =>
+            stageParsedBatch(ctx, f.principal, pagesRequest),
+          )
+        ).reused,
+        true,
+      );
+      await f.client.query(
+        "DROP TRIGGER test_parsed_stage_retry ON kith.source_pages",
+      );
+      await f.client.query("DROP FUNCTION kith.test_parsed_stage_retry()");
+      await f.client.query(
+        "DROP SEQUENCE kith.test_parsed_stage_retry_sequence",
+      );
+
+      const batch = (requestId, phase, rows) =>
+        parsedCall((ctx) =>
+          stageParsedBatch(ctx, f.principal, {
+            ...leaseRequest,
+            operation: "jobs.stageParsedBatch",
+            requestId,
+            stageId: stage.stageId,
+            phase,
+            ordinal: 0,
+            rows,
+          }),
+        );
+      assert.equal(
+        (await batch("parsed-evidence", "evidence", [evidence])).phase,
+        "documents",
+      );
+      assert.equal(
+        (
+          await batch("parsed-documents", "documents", [
+            {
+              documentKey: "document-1",
+              title: "Synthetic document",
+              docType: "pdf",
+              capturedAt: NOW,
+              evidence: [{ pageOrdinal: 0, evidenceOrdinal: 0 }],
+            },
+          ])
+        ).phase,
+        "chunks",
+      );
+      assert.equal(
+        (
+          await batch("parsed-chunks", "chunks", [
+            {
+              documentKey: "document-1",
+              ordinal: 0,
+              start: 0,
+              end: 8,
+              text: "abcdefgh",
+              evidence: [{ pageOrdinal: 0, evidenceOrdinal: 0 }],
+            },
+          ])
+        ).phase,
+        "seal",
+      );
+      const sealRequest = {
+        ...leaseRequest,
+        operation: "jobs.stageParsedSeal",
+        requestId: "parsed-seal",
+        stageId: stage.stageId,
+        normalizedBundleDigest: bundleHash,
+      };
+      const sealed = await parsedCall((ctx) =>
+        sealParsedStage(ctx, f.principal, sealRequest),
+      );
+      assert.equal(sealed.state, "staged");
+      assert.equal(
+        (
+          await parsedCall((ctx) =>
+            sealParsedStage(ctx, f.principal, sealRequest),
+          )
+        ).reused,
+        true,
+      );
+      const snapshotClock = parsedNow + 500;
+      await f.client.query(
+        `INSERT INTO kith.record_query_space_state
+         (id, space_id, created_at, visibility_epoch, snapshot_clock, updated_at)
+         VALUES ($1,$2,$3,1,$4,$3)`,
+        [newKithId(), f.spaceId, new Date(parsedNow), snapshotClock],
+      );
+      const activateRequest = {
+        ...leaseRequest,
+        operation: "jobs.activateParsed",
+        requestId: "parsed-activate",
+      };
+      const activated = await parsedCall((ctx) =>
+        activateParsedJob(ctx, f.principal, activateRequest),
+      );
+      assert.equal(activated.state, "ready");
+      assert.equal(activated.activatedAt, snapshotClock + 1);
+      assert.equal(
+        (
+          await parsedCall((ctx) =>
+            activateParsedJob(ctx, f.principal, activateRequest),
+          )
+        ).reused,
+        true,
+      );
+      const published = (
+        await f.client.query(
+          `SELECT d.publication_state AS document_state,
+                  c.publication_state AS chunk_state, j.state AS job_state,
+                  j.lease_token, s.activation_epoch, s.activated_at
+           FROM kith.documents d
+           JOIN kith.chunks c ON c.document_id = d.id
+           JOIN kith.ingest_jobs j ON j.id = $1
+           JOIN kith.space_processing_state s ON s.space_id = d.space_id
+           WHERE d.processing_generation_id = $2`,
+          [lease.jobId, admitted.processingGenerationId],
+        )
+      ).rows[0];
+      assert.equal(published.document_state, "active");
+      assert.equal(published.chunk_state, "active");
+      assert.equal(published.job_state, "ready");
+      assert.equal(published.lease_token, null);
+      assert.equal(Number(published.activation_epoch), 1);
+      assert.equal(published.activated_at.getTime(), snapshotClock + 1);
     } finally {
       await pool.end();
     }
