@@ -37,7 +37,7 @@ import { SUPPORTED_CURRENCIES, type ObservationValue } from "./values";
 
 /** Bumped when the boundary statement, the schema rendering or the tool
  * contract changes. Section 4.6 puts it in the card extraction fingerprint. */
-export const CARD_PROMPT_VERSION = "card-prompt-v5";
+export const CARD_PROMPT_VERSION = "card-prompt-v6";
 
 /** Section 5.1: the ladder's steps, in order. `local` is optional. */
 export const CARD_LADDER_STEPS = ["local", "tier0", "tier1"] as const;
@@ -338,7 +338,8 @@ export function cardExtractionSystemPrompt(kind: CardRecordKind): string {
     "- Copy a quote verbatim from the text of one page, character for character, including its punctuation and casing. A quote may not run from one page into the next; cite each page separately.",
     "- Cite the tightest span that still proves the value, not the paragraph around it. If that span appears more than once on its page, lengthen it until it appears exactly once: a quote that matches two places on a page proves neither.",
     "- A date value is YYYY-MM-DD and its span holds only the date, with nothing else inside the quote.",
-    "- anchor must quote the document's own title or heading line verbatim: not a paraphrase, and not a sentence from the body.",
+    "- card_title must quote one contiguous run from a single line of the page, exactly as printed: never add or drop punctuation. If the document's heading runs onto a second line, quote only its first line as card_title and put the rest of the heading in card_summary instead. Prefer the shortest run of the heading that still appears exactly once on its page.",
+    "- anchor must quote the same heading line as card_title, or, when the document has no heading, its own identifying first line: verbatim, never a paraphrase, and never a sentence from the body.",
     `- Currencies accepted: ${SUPPORTED_CURRENCIES.join(", ")}.`,
     "",
     `Call ${CARD_EXTRACTION_TOOL_NAME} exactly once. It is the only tool, it writes nothing, and it is the only way to return a result.`,
