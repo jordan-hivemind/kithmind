@@ -26,6 +26,11 @@
       "types": "./src/workers/index.ts",
       "node": "./dist/workers/index.js",
       "default": "./src/workers/index.ts"
+    },
+    "./records": {
+      "types": "./src/records/index.ts",
+      "node": "./dist/records/index.js",
+      "default": "./src/records/index.ts"
     }
   },
   "scripts": {
