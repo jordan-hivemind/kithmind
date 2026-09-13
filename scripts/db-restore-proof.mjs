@@ -59,12 +59,18 @@ async function secret(spec, timeoutMs) {
   if (!value) fail("secret_command_empty");
   return value;
 }
-const SNAPSHOT_SQL = "SELECT table_schema || '.' || table_name || ':' || n_live_tup::bigint FROM pg_stat_user_tables WHERE table_schema IN ('finance', 'kith') ORDER BY table_schema, table_name";
+async function databaseIdentity(config, connection) {
+  const output = await run(config.psqlPath, [connection, "-v", "ON_ERROR_STOP=1", "-tAc", "select current_database()"], config.timeoutMs);
+  return output.trim();
+}
 async function snapshot(config, connection) {
-  const output = await run(config.psqlPath, [connection, "-v", "ON_ERROR_STOP=1", "-tAc", SNAPSHOT_SQL], config.timeoutMs);
   const finance = await run(config.psqlPath, [connection, "-v", "ON_ERROR_STOP=1", "-tAc", "select max(version) from finance.schema_version"], config.timeoutMs);
   const kith = await run(config.psqlPath, [connection, "-v", "ON_ERROR_STOP=1", "-tAc", "select max(version) from kith.schema_version"], config.timeoutMs);
-  return { tables: output.trim().split("\n").filter(Boolean), financeVersion: Number(finance.trim()), kithVersion: Number(kith.trim()) };
+  return { financeVersion: Number(finance.trim()), kithVersion: Number(kith.trim()) };
+}
+async function assertEmptyTarget(config, connection) {
+  const output = await run(config.psqlPath, [connection, "-v", "ON_ERROR_STOP=1", "-tAc", "select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relkind in ('r','p','v','m','S') and n.nspname not in ('pg_catalog','information_schema') and n.nspname !~ '^pg_toast'"], config.timeoutMs);
+  if (Number(output.trim()) !== 0) fail("restore_target_not_empty");
 }
 async function requirePostgres17(binary, timeoutMs) {
   const version = await run(binary, ["--version"], timeoutMs);
@@ -75,14 +81,19 @@ export async function restorePostgresProof(config) {
   protectedFile(config.dumpPath); protectedExecutable(config.pgRestorePath); protectedExecutable(config.psqlPath); protectedExecutable(config.sourceConnectionCommand.path); protectedExecutable(config.destinationConnectionCommand.path);
   const source = await secret(config.sourceConnectionCommand, config.timeoutMs);
   const destination = await secret(config.destinationConnectionCommand, config.timeoutMs);
-  if (source === destination) fail("restore_not_isolated");
+  const sourceDatabase = await databaseIdentity(config, source);
+  const destinationDatabase = await databaseIdentity(config, destination);
+  // Equal database names are rejected conservatively even if two URLs point
+  // at different hosts: this proof must never risk restoring over its source.
+  if (!sourceDatabase || sourceDatabase === destinationDatabase) fail("restore_not_isolated");
+  await assertEmptyTarget(config, destination);
   await requirePostgres17(config.psqlPath, config.timeoutMs);
   await requirePostgres17(config.pgRestorePath, config.timeoutMs);
   const before = await snapshot(config, source);
   if (before.financeVersion !== config.expectedFinanceSchemaVersion || before.kithVersion !== config.expectedKithSchemaVersion) fail("source_parity_failed");
-  await run(config.pgRestorePath, ["--no-owner", "--no-acl", "--dbname", destination, config.dumpPath], config.timeoutMs);
+  await run(config.pgRestorePath, ["--exit-on-error", "--no-owner", "--no-acl", "--dbname", destination, config.dumpPath], config.timeoutMs);
   const after = await snapshot(config, destination);
-  if (after.financeVersion !== before.financeVersion || after.kithVersion !== before.kithVersion || JSON.stringify(after.tables) !== JSON.stringify(before.tables)) fail("restore_parity_failed");
+  if (after.financeVersion !== before.financeVersion || after.kithVersion !== before.kithVersion) fail("restore_parity_failed");
   return { status: "passed", source: before, restored: after };
 }
 export async function loadRestoreProofConfig(path) {

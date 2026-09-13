@@ -685,6 +685,10 @@ export async function runPostgresDatabaseBackup(config) {
       "kithmind.dump.age": dumpCiphertext,
       "manifest.json.age": manifestCiphertext,
     },
+    plaintexts: {
+      "kithmind.dump.age": dumpDigest,
+      "manifest.json.age": await requireBoundedFile(manifestPath),
+    },
   };
 }
 
@@ -745,7 +749,15 @@ async function runVerifyWorker(payload) {
         ["--decrypt", "-i", config.ageIdentityPath, "-o", plainPath, cipherPath],
         { timeoutMs: config.timeoutMs },
       );
-      await hashFile(plainPath);
+      const plainDigest = await hashFile(plainPath);
+      const expectedPlain = backupResult.plaintexts?.[objectName];
+      if (
+        !expectedPlain ||
+        plainDigest.sha256 !== expectedPlain.sha256 ||
+        plainDigest.byteLength !== expectedPlain.byteLength
+      ) {
+        mismatches.push(`${objectName}: plaintext byte mismatch`);
+      }
     }
     return { status: mismatches.length ? "failed" : "passed", repositoryId, mismatches };
   } finally {
