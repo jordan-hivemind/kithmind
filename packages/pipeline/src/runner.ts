@@ -197,6 +197,21 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Default `assessmentPacingMs` applied when a config omits the field
+ * (P2-80k). `processing.assessPage` sends one worker mutation per file
+ * (`maxItems: 1`); an unpaced assessment phase for an N-file pass fires N of
+ * those mutations back to back, which is by far the largest unpaced burst in
+ * a pass (see the `WORKER_MUTATION_RATE_LIMIT` arithmetic in
+ * packages/convex/convex/models/workers/rateLimit.ts) and the one most
+ * likely to trip the server's per-source rate limit on its own. 200ms keeps
+ * that phase's sustained rate (5/s) well under the raised budget without
+ * meaningfully slowing a normal backfill, so a burst never starts the
+ * backoff in the first place. An explicit `assessmentPacingMs` (including
+ * `0`, to disable pacing) always overrides this default.
+ */
+export const DEFAULT_ASSESSMENT_PACING_MS = 200;
+
 /** Exponential backoff whose `maxAttempts` waits sum to ~`windowMs`. */
 function rateLimitBackoffMs(
   attempt: number,
@@ -5484,8 +5499,10 @@ export class PipelineRunner {
     if (checkpoint.phase !== "assess_page") {
       throw new PipelineWorkerError("journal_phase_conflict");
     }
-    if (checkpoint.pageCount > 0 && this.config.assessmentPacingMs) {
-      await sleep(this.config.assessmentPacingMs);
+    const pacingMs =
+      this.config.assessmentPacingMs ?? DEFAULT_ASSESSMENT_PACING_MS;
+    if (checkpoint.pageCount > 0 && pacingMs) {
+      await sleep(pacingMs);
     }
     const result = await this.mutation(
       "processing.assessPage",
