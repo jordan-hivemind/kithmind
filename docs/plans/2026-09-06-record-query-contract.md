@@ -4,6 +4,17 @@ P1-7 extends the [source-processing contract](./2026-09-06-source-processing-con
 Records use the same worker lease, immutable evidence, processing generation,
 and atomic publication boundary as documents. They do not depend on embeddings.
 
+### PostgreSQL read foundation (P2-39f1)
+
+`@repo/kith-store/records` exports platform-neutral exact value helpers and
+bounded event/observation hydration. Hydration validates the full persisted
+space, source, revision, text, entity and evidence chain, including UTF-16
+bounds and hashes, and accepts current text or card generations. Its cache is
+explicitly bound to one PostgreSQL request transaction and must not be reused
+after that transaction, after a visibility change, or for another request.
+Staging, publication, cards, query sessions and the query engine remain
+separate work.
+
 ## Storage and publication
 
 | Record        | Identity and behavior                                                                |
