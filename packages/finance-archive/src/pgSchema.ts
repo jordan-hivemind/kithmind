@@ -800,6 +800,30 @@ END;
 $$;
 `;
 
+// F1-73e. Account discovery now reads evidence-learned statement-number
+// aliases to derive a real last four instead of treating an opaque API key's
+// numeric suffix as an account number. Alias writes must therefore invalidate
+// read cursors just like writes to accounts. The one migration-time increment
+// invalidates every cursor issued before aliases became a read dependency.
+const ACCOUNT_ALIAS_READ_REVISION = `
+CREATE TRIGGER finance_read_revision_bump
+  BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON account_aliases
+  FOR EACH STATEMENT EXECUTE FUNCTION bump_finance_read_revision();
+
+DO $$
+DECLARE
+  affected_rows BIGINT;
+BEGIN
+  UPDATE finance_read_revision SET revision = revision + 1 WHERE singleton;
+  GET DIAGNOSTICS affected_rows = ROW_COUNT;
+  IF affected_rows <> 1 THEN
+    RAISE EXCEPTION 'finance read revision singleton missing in schema %',
+      current_schema();
+  END IF;
+END;
+$$;
+`;
+
 /** Every migration, in order. The last one's version is the current schema. */
 export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
   {
@@ -856,6 +880,11 @@ export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
     version: 11,
     name: "finance read revision epoch, counter and write triggers",
     sql: FINANCE_READ_REVISION,
+  },
+  {
+    version: 12,
+    name: "account aliases invalidate finance reads",
+    sql: ACCOUNT_ALIAS_READ_REVISION,
   },
 ]);
 

@@ -229,13 +229,20 @@ export type FinanceAccountDescriptor = {
   sourceId: FinanceSourceId;
   institutionName: string;
   accountLast4?: string;
+  matchedAccountLast4?: string;
   displayLabel?: string;
   accountType?: string;
   baseCurrency?: FinanceCurrency;
-  disclosures: Array<{
-    field: "baseCurrency";
-    reason: "not_reported" | "unsupported_value";
-  }>;
+  disclosures: Array<
+    | {
+        field: "baseCurrency";
+        reason: "not_reported" | "unsupported_value";
+      }
+    | {
+        field: "accountLast4";
+        reason: "not_reported" | "unsupported_value" | "ambiguous_aliases";
+      }
+  >;
 };
 
 export type FinanceHoldingsSnapshotSelector =
@@ -1512,6 +1519,7 @@ function accountDescriptor(value: unknown): FinanceAccountDescriptor {
     ["accountId", "sourceId", "institutionName"],
     [
       "accountLast4",
+      "matchedAccountLast4",
       "displayLabel",
       "accountType",
       "baseCurrency",
@@ -1522,22 +1530,61 @@ function accountDescriptor(value: unknown): FinanceAccountDescriptor {
   const disclosures = denseArray(
     input.disclosures === undefined ? [] : input.disclosures,
     0,
-    1,
+    2,
     "invalid_response",
   ).map((value) => {
     const disclosure = object(value, "invalid_response");
     exact(disclosure, ["field", "reason"], [], "invalid_response");
-    if (disclosure.field !== "baseCurrency") fail("invalid_response");
-    return {
-      field: "baseCurrency" as const,
-      reason: oneOf(
-        disclosure.reason,
-        ["not_reported", "unsupported_value"] as const,
-        "invalid_response",
-      ),
-    };
+    if (disclosure.field === "baseCurrency")
+      return {
+        field: "baseCurrency" as const,
+        reason: oneOf(
+          disclosure.reason,
+          ["not_reported", "unsupported_value"] as const,
+          "invalid_response",
+        ),
+      };
+    if (disclosure.field === "accountLast4")
+      return {
+        field: "accountLast4" as const,
+        reason: oneOf(
+          disclosure.reason,
+          ["not_reported", "unsupported_value", "ambiguous_aliases"] as const,
+          "invalid_response",
+        ),
+      };
+    fail("invalid_response");
   });
-  if ((input.baseCurrency === undefined) === (disclosures.length === 0))
+  if (
+    new Set(disclosures.map((item) => item.field)).size !== disclosures.length
+  )
+    fail("invalid_response");
+  const baseCurrencyDisclosure = disclosures.find(
+    (item) => item.field === "baseCurrency",
+  );
+  const accountLast4Disclosure = disclosures.find(
+    (item) => item.field === "accountLast4",
+  );
+  if (
+    (input.baseCurrency === undefined) ===
+    (baseCurrencyDisclosure === undefined)
+  )
+    fail("invalid_response");
+  const parsedAccountLast4 =
+    input.accountLast4 === undefined
+      ? undefined
+      : accountLast4(input.accountLast4, "invalid_response");
+  const matchedAccountLast4 =
+    input.matchedAccountLast4 === undefined
+      ? undefined
+      : accountLast4(input.matchedAccountLast4, "invalid_response");
+  if (
+    (parsedAccountLast4 !== undefined &&
+      accountLast4Disclosure !== undefined) ||
+    (matchedAccountLast4 !== undefined &&
+      (parsedAccountLast4 !== undefined ||
+        accountLast4Disclosure?.reason !== "ambiguous_aliases"))
+  )
     fail("invalid_response");
   return {
     accountId: opaqueId<"account">(input.accountId, "invalid_response"),
@@ -1552,9 +1599,10 @@ function accountDescriptor(value: unknown): FinanceAccountDescriptor {
           ),
         }),
     disclosures,
-    ...(input.accountLast4 === undefined
+    ...(parsedAccountLast4 === undefined
       ? {}
-      : { accountLast4: accountLast4(input.accountLast4, "invalid_response") }),
+      : { accountLast4: parsedAccountLast4 }),
+    ...(matchedAccountLast4 === undefined ? {} : { matchedAccountLast4 }),
     ...(input.displayLabel === undefined
       ? {}
       : { displayLabel: text(input.displayLabel, 256, "invalid_response") }),
@@ -2751,7 +2799,10 @@ function responseMatchesRequest(
             normalizedLookupText(item.institutionName, "invalid_response") !==
               request.institutionName) ||
           (request.accountLast4 !== undefined &&
-            item.accountLast4 !== request.accountLast4) ||
+            item.accountLast4 !== request.accountLast4 &&
+            item.matchedAccountLast4 !== request.accountLast4) ||
+          (request.accountLast4 === undefined &&
+            item.matchedAccountLast4 !== undefined) ||
           (request.displayLabel !== undefined &&
             (item.displayLabel === undefined ||
               normalizedLookupText(item.displayLabel, "invalid_response") !==
@@ -2766,6 +2817,7 @@ function responseMatchesRequest(
       fail("invalid_response");
     if (
       response.account.accountId !== request.accountId ||
+      response.account.matchedAccountLast4 !== undefined ||
       JSON.stringify(response.requestedSnapshot) !==
         JSON.stringify(request.snapshot)
     )

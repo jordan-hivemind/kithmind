@@ -919,6 +919,8 @@ type AccountDescriptorRow = {
   source_id: string;
   institution_name: string;
   acct_last4: string | null;
+  account_last4_disclosure:
+    "not_reported" | "unsupported_value" | "ambiguous_aliases" | null;
   display_name: string | null;
   account_type: string | null;
   base_currency: string | null;
@@ -927,7 +929,22 @@ type AccountDescriptorRow = {
 function accountDescriptorOf(
   row: AccountDescriptorRow,
   scope: ReadScope,
+  matchedAccountLast4?: string,
 ): FinanceAccountDescriptor {
+  const disclosures: FinanceAccountDescriptor["disclosures"] = [];
+  if (row.account_last4_disclosure !== null) {
+    disclosures.push({
+      field: "accountLast4",
+      reason: row.account_last4_disclosure,
+    });
+    scope.withheld.add(
+      row.account_last4_disclosure === "ambiguous_aliases"
+        ? "unresolved_identity"
+        : row.account_last4_disclosure === "not_reported"
+          ? "missing_value"
+          : "unsupported_value",
+    );
+  }
   const baseCurrency =
     row.base_currency !== null && supportedCurrencies.has(row.base_currency)
       ? parseFinanceCurrency(row.base_currency)
@@ -936,28 +953,75 @@ function accountDescriptorOf(
     scope.withheld.add(
       row.base_currency === null ? "missing_value" : "unsupported_value",
     );
+  if (baseCurrency === null)
+    disclosures.push({
+      field: "baseCurrency",
+      reason: row.base_currency === null ? "not_reported" : "unsupported_value",
+    });
   return {
     accountId: row.account_id as FinanceAccountId,
     sourceId: row.source_id as FinanceSourceId,
     institutionName: row.institution_name,
     ...(row.acct_last4 === null ? {} : { accountLast4: row.acct_last4 }),
+    ...(matchedAccountLast4 === undefined ? {} : { matchedAccountLast4 }),
     ...(row.display_name === null ? {} : { displayLabel: row.display_name }),
     ...(row.account_type === null ? {} : { accountType: row.account_type }),
     ...(baseCurrency === null ? {} : { baseCurrency }),
-    disclosures:
-      baseCurrency === null
-        ? [
-            {
-              field: "baseCurrency",
-              reason:
-                row.base_currency === null
-                  ? ("not_reported" as const)
-                  : ("unsupported_value" as const),
-            },
-          ]
-        : [],
+    disclosures,
   };
 }
+
+// A statement number is evidence for an account's displayed last four only
+// when it has the closed format the statement parser recognizes. The API key
+// format is deliberately recognized only so its numeric suffix can be
+// suppressed: no digit rule relates that opaque key to the account number.
+const ACCOUNT_DESCRIPTOR_CTES = `
+WITH statement_alias_facts AS (
+  SELECT aa.account_id,
+         count(*)::integer AS alias_count,
+         (count(*) FILTER (
+           WHERE aa.external_key ~ '^[0-9]{3}-[0-9]{6}-[0-9]{3}$'
+         ))::integer AS valid_alias_count,
+         (count(DISTINCT right(split_part(aa.external_key, '-', 2), 4)) FILTER (
+           WHERE aa.external_key ~ '^[0-9]{3}-[0-9]{6}-[0-9]{3}$'
+         ))::integer AS distinct_last4_count,
+         min(right(split_part(aa.external_key, '-', 2), 4)) FILTER (
+           WHERE aa.external_key ~ '^[0-9]{3}-[0-9]{6}-[0-9]{3}$'
+         ) AS alias_last4
+    FROM account_aliases aa
+   WHERE aa.kind = 'statement_number'
+   GROUP BY aa.account_id
+),
+account_descriptors AS (
+  SELECT a.id AS account_id, i.id AS source_id,
+         i.name AS institution_name, a.display_name, a.account_type,
+         a.base_currency,
+         CASE
+           WHEN f.alias_count > 0
+            AND f.valid_alias_count = f.alias_count
+            AND f.distinct_last4_count = 1
+             THEN f.alias_last4
+           WHEN f.account_id IS NULL
+            AND coalesce(a.external_key, '') !~
+                '^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{2}[.][0-9]{2}[.][0-9]{2}[.][0-9]{6}$'
+             THEN a.acct_last4
+           ELSE NULL
+         END AS acct_last4,
+         CASE
+           WHEN f.alias_count > f.valid_alias_count THEN 'unsupported_value'
+           WHEN f.distinct_last4_count > 1 THEN 'ambiguous_aliases'
+           WHEN f.account_id IS NULL
+            AND coalesce(a.external_key, '') ~
+                '^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{2}[.][0-9]{2}[.][0-9]{2}[.][0-9]{6}$'
+             THEN 'not_reported'
+           WHEN f.account_id IS NULL AND a.acct_last4 IS NULL
+             THEN 'not_reported'
+           ELSE NULL
+         END AS account_last4_disclosure
+    FROM accounts a
+    JOIN institutions i ON i.id = a.institution_id
+    LEFT JOIN statement_alias_facts f ON f.account_id = a.id
+)`;
 
 async function listAccounts(
   client: pg.ClientBase,
@@ -986,14 +1050,22 @@ async function listAccounts(
         );
   const afterId = cursorKey === null ? null : cursorKey[0];
   const result = await client.query<AccountDescriptorRow>(
-    `SELECT a.id AS account_id, i.id AS source_id, i.name AS institution_name,
-            a.acct_last4, a.display_name, a.account_type, a.base_currency
-       FROM accounts a JOIN institutions i ON i.id = a.institution_id
-      WHERE ($1::text IS NULL OR lower(regexp_replace(btrim(i.name), '\\s+', ' ', 'g')) = $1)
-        AND ($2::text IS NULL OR a.acct_last4 = $2)
-        AND ($3::text IS NULL OR lower(regexp_replace(btrim(a.display_name), '\\s+', ' ', 'g')) = $3)
-        AND ($4::text IS NULL OR a.id > $4)
-      ORDER BY a.id
+    `${ACCOUNT_DESCRIPTOR_CTES}
+     SELECT d.* FROM account_descriptors d
+      WHERE ($1::text IS NULL OR lower(regexp_replace(btrim(d.institution_name), '\\s+', ' ', 'g')) = $1)
+        AND ($2::text IS NULL OR d.acct_last4 = $2 OR (
+          d.account_last4_disclosure = 'ambiguous_aliases'
+          AND EXISTS (
+            SELECT 1 FROM account_aliases matched
+             WHERE matched.account_id = d.account_id
+               AND matched.kind = 'statement_number'
+               AND matched.external_key ~ '^[0-9]{3}-[0-9]{6}-[0-9]{3}$'
+               AND right(split_part(matched.external_key, '-', 2), 4) = $2
+          )
+        ))
+        AND ($3::text IS NULL OR lower(regexp_replace(btrim(d.display_name), '\\s+', ' ', 'g')) = $3)
+        AND ($4::text IS NULL OR d.account_id > $4)
+      ORDER BY d.account_id
       LIMIT $5`,
     [
       request.institutionName ?? null,
@@ -1004,10 +1076,20 @@ async function listAccounts(
     ],
   );
   const total = await client.query<{ count: string }>(
-    `SELECT count(*)::text AS count FROM accounts a JOIN institutions i ON i.id = a.institution_id
-      WHERE ($1::text IS NULL OR lower(regexp_replace(btrim(i.name), '\\s+', ' ', 'g')) = $1)
-        AND ($2::text IS NULL OR a.acct_last4 = $2)
-        AND ($3::text IS NULL OR lower(regexp_replace(btrim(a.display_name), '\\s+', ' ', 'g')) = $3)`,
+    `${ACCOUNT_DESCRIPTOR_CTES}
+     SELECT count(*)::text AS count FROM account_descriptors d
+      WHERE ($1::text IS NULL OR lower(regexp_replace(btrim(d.institution_name), '\\s+', ' ', 'g')) = $1)
+        AND ($2::text IS NULL OR d.acct_last4 = $2 OR (
+          d.account_last4_disclosure = 'ambiguous_aliases'
+          AND EXISTS (
+            SELECT 1 FROM account_aliases matched
+             WHERE matched.account_id = d.account_id
+               AND matched.kind = 'statement_number'
+               AND matched.external_key ~ '^[0-9]{3}-[0-9]{6}-[0-9]{3}$'
+               AND right(split_part(matched.external_key, '-', 2), 4) = $2
+          )
+        ))
+        AND ($3::text IS NULL OR lower(regexp_replace(btrim(d.display_name), '\\s+', ' ', 'g')) = $3)`,
     [
       request.institutionName ?? null,
       request.accountLast4 ?? null,
@@ -1017,7 +1099,16 @@ async function listAccounts(
   const totalMatches = Number(total.rows[0]!.count);
   const items = result.rows
     .slice(0, request.limit)
-    .map((row) => accountDescriptorOf(row, scope));
+    .map((row) =>
+      accountDescriptorOf(
+        row,
+        scope,
+        request.accountLast4 !== undefined &&
+          row.account_last4_disclosure === "ambiguous_aliases"
+          ? request.accountLast4
+          : undefined,
+      ),
+    );
   const truncated = result.rows.length > request.limit;
   const nextCursor = truncated
     ? issueFinanceCursor(
@@ -1369,10 +1460,8 @@ async function getHoldingsSnapshot(
   options: FinanceReadOptions,
 ): Promise<FinanceReadResponse> {
   const accountResult = await client.query<AccountDescriptorRow>(
-    `SELECT a.id AS account_id, i.id AS source_id, i.name AS institution_name,
-            a.acct_last4, a.display_name, a.account_type, a.base_currency
-       FROM accounts a JOIN institutions i ON i.id = a.institution_id
-      WHERE a.id = $1`,
+    `${ACCOUNT_DESCRIPTOR_CTES}
+     SELECT * FROM account_descriptors WHERE account_id = $1`,
     [request.accountId],
   );
   const accountRow = accountResult.rows[0];

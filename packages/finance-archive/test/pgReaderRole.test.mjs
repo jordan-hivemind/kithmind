@@ -241,6 +241,16 @@ test("a table a later migration adds is not silently readable", { skip }, async 
   assert.equal(retainedTexts.p, false, "and PUBLIC still gets nothing");
   assert.equal(await count(r.client, "retained_texts"), 0);
 
+  const accountAliases = await one(
+    owner,
+    `SELECT has_table_privilege($1, $2 || '.account_aliases', 'SELECT') AS s,
+            has_table_privilege($1, $2 || '.account_aliases', 'INSERT') AS i,
+            has_table_privilege('public', $2 || '.account_aliases', 'SELECT') AS p`,
+    [r.summary.role, r.summary.schema],
+  );
+  assert.deepEqual(accountAliases, { s: true, i: false, p: false });
+  assert.equal(await count(r.client, "account_aliases"), 0);
+
   const revisionPrivilege = await one(
     owner,
     `SELECT has_table_privilege($1, $2 || '.finance_read_revision', 'SELECT') AS s,
