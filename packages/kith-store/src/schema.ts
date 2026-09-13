@@ -102,6 +102,11 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
     name: "memory: entities, facts and thoughts domain constraints and indexes (P2-39h)",
     url: new URL("../migrations/009_memory.sql", import.meta.url),
   },
+  {
+    version: 10,
+    name: "worker processing: parsed staging constraints and lease claim indexes (P2-39e)",
+    url: new URL("../migrations/010_worker_processing.sql", import.meta.url),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */
