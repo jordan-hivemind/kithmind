@@ -213,10 +213,13 @@ as a security correction.
 `list_accounts` accepts normalized exact-match filters for institution name,
 account last four, and display label. It returns opaque account and source IDs,
 institution name, optional display label and account type, last four digits, and
-base currency. Its response reports `none`, `unique`, or `ambiguous` against the
-whole authorized match set. An ambiguous response is a prompt for
-disambiguation, not permission to select the first row. Full account numbers are
-never stored or returned.
+base currency when the archive reports a supported currency. An account with a
+missing or unsupported base currency remains discoverable by its opaque identity
+and carries an explicit `not_reported` or `unsupported_value` disclosure. A
+consumer must not guess a default currency. Its response reports `none`,
+`unique`, or `ambiguous` against the whole authorized match set. An ambiguous
+response is a prompt for disambiguation, not permission to select the first row.
+Full account numbers are never stored or returned.
 
 `get_holdings_snapshot` requires an account ID and one closed selector:
 

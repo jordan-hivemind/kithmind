@@ -282,6 +282,7 @@ export const syntheticFinanceReadExchanges = [
           displayLabel: "Income",
           accountType: "brokerage",
           baseCurrency: "USD",
+          disclosures: [],
         },
       ],
     },
@@ -306,6 +307,7 @@ export const syntheticFinanceReadExchanges = [
         displayLabel: "Income",
         accountType: "brokerage",
         baseCurrency: "USD",
+        disclosures: [],
       },
       summary: {
         status: "complete",

@@ -761,6 +761,76 @@ test(
 );
 
 test(
+  "accounts with missing or unsupported base currency remain discoverable and snapshot-readable",
+  { skip },
+  async (t) => {
+    const { owner, reader: r, seeded } = await fixture(t);
+    const cases = [
+      {
+        accountId: seeded.settled.accountIds[0],
+        baseCurrency: null,
+        institutionName: "Synthetic river-oak",
+        reason: "not_reported",
+        coverageReason: "missing_value",
+        positionId: "unknown-base-null",
+      },
+      {
+        accountId: seeded.unreconciled.accountIds[0],
+        baseCurrency: "XTS",
+        institutionName: "Synthetic cedar-ridge",
+        reason: "unsupported_value",
+        coverageReason: "unsupported_value",
+        positionId: "unknown-base-unsupported",
+      },
+    ];
+
+    for (const item of cases) {
+      await owner.query(
+        "UPDATE accounts SET base_currency = $2 WHERE id = $1",
+        [item.accountId, item.baseCurrency],
+      );
+      await owner.query(
+        `INSERT INTO positions (id, account_id, as_of, currency)
+         VALUES ($1, $2, DATE '2026-04-30', 'USD')`,
+        [item.positionId, item.accountId],
+      );
+
+      const discovered = await serve(r, {
+        operation: "list_accounts",
+        institutionName: item.institutionName,
+      });
+      assert.equal(discovered.matchStatus, "unique");
+      assert.equal(discovered.items.length, 1);
+      assert.equal(discovered.items[0].accountId, item.accountId);
+      assert.equal(discovered.items[0].baseCurrency, undefined);
+      assert.deepEqual(discovered.items[0].disclosures, [
+        { field: "baseCurrency", reason: item.reason },
+      ]);
+      assert.equal(discovered.completeness, "partial");
+      assert.ok(discovered.coverage.reasons.includes(item.coverageReason));
+
+      const snapshot = await serve(r, {
+        operation: "get_holdings_snapshot",
+        accountId: item.accountId,
+        snapshot: { mode: "exact", asOf: "2026-04-30" },
+      });
+      assert.deepEqual(snapshot.selectedSnapshot, {
+        status: "found",
+        asOf: "2026-04-30",
+      });
+      assert.equal(snapshot.account.accountId, item.accountId);
+      assert.equal(snapshot.account.baseCurrency, undefined);
+      assert.deepEqual(snapshot.account.disclosures, [
+        { field: "baseCurrency", reason: item.reason },
+      ]);
+      assert.equal(snapshot.items[0].currency, "USD");
+      assert.equal(snapshot.completeness, "partial");
+      assert.ok(snapshot.coverage.reasons.includes(item.coverageReason));
+    }
+  },
+);
+
+test(
   "cited multi-currency snapshot totals and field evidence are exact",
   { skip },
   async (t) => {
