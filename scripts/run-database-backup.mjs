@@ -13,7 +13,7 @@ const MAX_STDOUT = 4_096;
 const MAX_STDERR = 65_536;
 const KILL_GRACE = 250;
 const states = new Set(["running", "succeeded", "failed"]);
-const stages = new Set(["export", "backup", "complete"]);
+const stages = new Set(["export", "backup", "verify", "complete"]);
 
 export class DatabaseBackupRunnerError extends Error {
   constructor(code) {
@@ -25,7 +25,7 @@ export class DatabaseBackupRunnerError extends Error {
 const fail = (code) => {
   throw new DatabaseBackupRunnerError(code);
 };
-function exact(value, keys, code = "config_invalid") {
+export function exact(value, keys, code = "config_invalid") {
   if (
     !value ||
     typeof value !== "object" ||
@@ -36,7 +36,7 @@ function exact(value, keys, code = "config_invalid") {
     fail(code);
   return value;
 }
-function text(value, max = 4_096) {
+export function text(value, max = 4_096) {
   if (
     typeof value !== "string" ||
     !value.length ||
@@ -46,12 +46,12 @@ function text(value, max = 4_096) {
     fail("config_invalid");
   return value;
 }
-function absolute(value) {
+export function absolute(value) {
   const path = text(value);
   if (!isAbsolute(path) || resolve(path) !== path) fail("config_invalid");
   return path;
 }
-async function protectedDirectory(path, ownerOnly = false) {
+export async function protectedDirectory(path, ownerOnly = false) {
   if (realpathSync(path) !== path) fail("path_not_canonical");
   let current = path;
   while (true) {
@@ -81,7 +81,7 @@ async function protectedDirectory(path, ownerOnly = false) {
     current = parent;
   }
 }
-async function protectedExecutable(path) {
+export async function protectedExecutable(path) {
   await protectedDirectory(dirname(path));
   if (realpathSync(path) !== path) fail("command_not_canonical");
   const stat = await lstat(path);
@@ -93,7 +93,7 @@ async function protectedExecutable(path) {
   )
     fail("command_not_protected");
 }
-async function readProtected(path, maximum) {
+export async function readProtected(path, maximum) {
   if (realpathSync(path) !== path) fail("file_not_protected");
   await protectedDirectory(dirname(path));
   const handle = await open(
@@ -201,7 +201,7 @@ export async function loadDatabaseBackupConfig(path) {
   await validateConfigPaths(config);
   return config;
 }
-async function fsyncDirectory(path) {
+export async function fsyncDirectory(path) {
   const handle = await open(path, constants.O_RDONLY | constants.O_DIRECTORY);
   try {
     await handle.sync();
@@ -209,7 +209,7 @@ async function fsyncDirectory(path) {
     await handle.close();
   }
 }
-async function writeAll(handle, bytes) {
+export async function writeAll(handle, bytes) {
   let offset = 0;
   while (offset < bytes.length) {
     const { bytesWritten } = await handle.write(
@@ -436,6 +436,60 @@ function status({
     ...(failureCode ? { failureCode } : {}),
   };
 }
+
+/** Shared lock and durable status journal for engine-specific backup work. */
+export async function runWithDatabaseBackupState(config, operation, options = {}) {
+  await protectedDirectory(config.stateDirectory, true);
+  const clock = options.clock ?? Date.now;
+  const runId = randomUUID();
+  const startedAt = clock();
+  const lockPath = join(config.stateDirectory, "database-backup.lock");
+  const statusPath = join(config.stateDirectory, "database-backup-status.json");
+  const lock = await acquireLock(lockPath, runId, startedAt);
+  let mayRelease = false;
+  let stage = "export";
+  let prior = null;
+  let runningRecorded = false;
+  const record = async () => atomicStatus(statusPath, status({
+    state: "running", stage, runId, startedAt, updatedAt: clock(), lastSuccessAt: prior,
+  }), runId);
+  try {
+    prior = await lastSuccess(statusPath);
+    await record();
+    runningRecorded = true;
+    const result = await operation({
+      runId,
+      startedAt,
+      setStage: async (nextStage) => { stage = text(nextStage, 64); await record(); },
+    });
+    const finishedAt = clock();
+    await atomicStatus(statusPath, status({
+      state: "succeeded", stage: "complete", runId, startedAt,
+      updatedAt: finishedAt, lastSuccessAt: finishedAt,
+    }), runId);
+    mayRelease = true;
+    return { ...result, runId, startedAt, finishedAt };
+  } catch (error) {
+    const failureCode =
+      typeof error?.code === "string" && error.code.length <= 64
+        ? error.code
+        : "runner_failed";
+    try {
+      if (!runningRecorded) throw new DatabaseBackupRunnerError("status_unusable");
+      await atomicStatus(statusPath, status({
+        state: "failed", stage, runId, startedAt, updatedAt: clock(),
+        lastSuccessAt: prior, failureCode,
+      }), runId);
+      mayRelease = true;
+    } catch {
+      mayRelease = false;
+    }
+    throw new DatabaseBackupRunnerError(failureCode);
+  } finally {
+    if (mayRelease) await releaseLock(lockPath, lock);
+  }
+}
+
 export async function runDatabaseBackup(config, options = {}) {
   config = parseConfig(config);
   await validateConfigPaths(config);

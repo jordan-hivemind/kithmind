@@ -412,13 +412,17 @@ export function readWorkbook(bytes: Buffer): Workbook {
       if (reference === undefined) fail("not_a_workbook");
       const row = rowIndex(reference);
       const column = columnIndex(reference);
-      if (row >= MAX_SHEET_ROWS || column >= MAX_SHEET_COLUMNS) {
-        fail("oversized");
-      }
       const text = sheetCellText(cellText(cell, shared));
       const formula = elements(cell, "f")[0];
-      if (formula && !formula.endsWith("/>")) {
-        formulas.push({ row, column, formula: innerText(formula, "f") });
+      const hasFormula = Boolean(formula && !formula.endsWith("/>"));
+      const formulaText = hasFormula ? innerText(formula!, "f") : "";
+      // Spreadsheet applications routinely emit formatted, empty cells at
+      // XFD and the final row. They contribute no page text or formula, so
+      // ignore them before grid bounds; values and formulas remain bounded.
+      if (text.length === 0 && !hasFormula) continue;
+      if (row >= MAX_SHEET_ROWS || column >= MAX_SHEET_COLUMNS) fail("oversized");
+      if (hasFormula) {
+        formulas.push({ row, column, formula: formulaText });
       }
       if (text.length === 0) continue;
       while (rows.length <= row) rows.push([]);

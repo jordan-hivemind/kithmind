@@ -15,7 +15,7 @@
 // needs no index, only `status`/`is_core`/`created_at` -- is fully ported.
 
 import { row, rows, exec, at, ms, type IdentityCtx } from "../identity/db.js";
-import { assertKithId, newKithId } from "../ids.js";
+import { assertKithId, KITH_ID, newKithId } from "../ids.js";
 import { getEntity, resolveEntity, type Entity, type EntitySelector } from "./entities.js";
 import { assertValidMemoryValidity, isMemoryRetrievable } from "./lifecycle.js";
 
@@ -81,7 +81,7 @@ type FactRow = {
   status: FactStatus;
   superseded_at: Date | null;
   superseded_by: string | null;
-  supersedes: string[] | null;
+  supersedes: unknown;
   change_reason: string | null;
   updated_at: Date | null;
 };
@@ -423,11 +423,24 @@ type StoredFact = {
   supersededAt: number | undefined;
   supersededBy: string | null;
   supersedes: readonly string[];
+  historyValid: boolean;
   changeReason: string | null;
   updatedAt: number | undefined;
 };
 
 function toStoredFact(record: FactRow): StoredFact {
+  const rawSupersedes = record.supersedes ?? [];
+  const supersedes =
+    Array.isArray(rawSupersedes) &&
+    rawSupersedes.every(
+      (id): id is string => typeof id === "string" && KITH_ID.test(id),
+    ) &&
+    new Set(rawSupersedes).size === rawSupersedes.length
+      ? rawSupersedes
+      : [];
+  const historyValid =
+    supersedes === rawSupersedes &&
+    (record.superseded_by === null || KITH_ID.test(record.superseded_by));
   return {
     id: record.id,
     spaceId: record.space_id,
@@ -449,7 +462,8 @@ function toStoredFact(record: FactRow): StoredFact {
     status: record.status,
     supersededAt: ms(record.superseded_at) ?? undefined,
     supersededBy: record.superseded_by,
-    supersedes: record.supersedes ?? [],
+    supersedes,
+    historyValid,
     changeReason: record.change_reason,
     updatedAt: ms(record.updated_at) ?? undefined,
   };
@@ -503,6 +517,7 @@ export async function hydrateFact(
   authorizedSpaceIds: ReadonlySet<string>,
 ): Promise<HydratedFact | null> {
   if (!authorizedSpaceIds.has(fact.spaceId)) return null;
+  if (!fact.historyValid) return null;
   const historyIds = [...(fact.supersededBy ? [fact.supersededBy] : []), ...fact.supersedes];
   if (historyIds.length > MAX_FACT_HISTORY_LINKS_PER_FACT) return null;
 
