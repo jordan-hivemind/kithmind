@@ -1222,3 +1222,223 @@ describe("the extraction ladder over a PDF-derived document", () => {
     expect(await cardGenerations(harness, "document_card")).toEqual([]);
   });
 });
+
+// P2-88: the prompt now tells the runner to quote only a heading's first
+// line as card_title when the heading spans two lines. This fixture proves
+// the rest of the pipeline honors that: a title span cited on the first
+// line only stages and publishes without ever pulling the split second
+// line into the same evidence.
+describe("P2-88: a heading split across two lines", () => {
+  const SPLIT_LINE_ONE = "Mutual Non-Disclosure";
+  const SPLIT_LINE_TWO = "Agreement";
+  const SPLIT_PAGE_ONE = `${SPLIT_LINE_ONE}\n${SPLIT_LINE_TWO}\nDated 2025-03-04.`;
+  const SPLIT_PAGE_TWO = [
+    "Between Northwind Supply and Acme Research.",
+    "Summary: both sides keep material confidential.",
+  ].join("\n");
+  const SPLIT_TEXT = `${SPLIT_PAGE_ONE}\n${SPLIT_PAGE_TWO}`;
+  const SPLIT_INLINE_PAGES = [
+    { ordinal: 0, start: 0, end: SPLIT_PAGE_ONE.length, text: SPLIT_PAGE_ONE },
+    {
+      ordinal: 1,
+      start: SPLIT_PAGE_ONE.length + 1,
+      end: SPLIT_TEXT.length,
+      text: SPLIT_PAGE_TWO,
+    },
+  ];
+
+  async function seedSplitHeadingDocument() {
+    const t = convexTest(schema, modules);
+    const seeded = await t.run(async (ctx) => {
+      const userId = await ctx.db.insert("users", { name: "Synthetic owner" });
+      const spaceId = await ctx.db.insert("spaces", {
+        kind: "personal",
+        name: "Synthetic split heading",
+        createdBy: userId,
+      });
+      await ctx.db.insert("spaceMembers", { spaceId, userId, role: "owner" });
+      const entityId = await ctx.db.insert("entities", {
+        userId,
+        spaceId,
+        key: "person:split-heading-subject",
+        kind: "person",
+        canonicalName: "Synthetic Subject",
+        normalizedName: "synthetic subject",
+        aliases: [],
+        normalizedAliases: [],
+      });
+      const sourceAccountId = await ctx.db.insert("sourceAccounts", {
+        spaceId,
+        connector: "synthetic",
+        accountId: "synthetic-split-heading",
+        name: "Synthetic split heading",
+        enabled: true,
+        cursorVersion: 0,
+        freshnessMs: 1_000_000,
+        createdBy: userId,
+        subjectEntityId: entityId,
+      });
+      const sourceItem = await createOrGetSourceItem(ctx, {
+        spaceId,
+        sourceAccountId,
+        externalId: "synthetic://split-heading/one",
+      });
+      const revision = await createOrGetRevision(ctx, {
+        spaceId,
+        sourceItemId: sourceItem._id,
+        mediaType: "text/plain",
+        inlineText: SPLIT_TEXT,
+        capturedAt: CAPTURED_AT,
+        userId,
+      });
+      const textVersion = await createOrGetTextVersion(ctx, {
+        spaceId,
+        sourceRevisionId: revision._id,
+        extractionFingerprint: EXTRACTION_FINGERPRINT,
+        text: SPLIT_TEXT,
+      });
+      await stagePages(ctx, {
+        spaceId,
+        sourceTextVersionId: textVersion._id,
+        pages: SPLIT_INLINE_PAGES,
+      });
+      await ctx.db.patch(textVersion._id, { evidenceSealed: true });
+      const processingGenerationId = await ctx.db.insert(
+        "processingGenerations",
+        {
+          spaceId,
+          sourceAccountId,
+          sourceItemId: sourceItem._id,
+          sourceRevisionId: revision._id,
+          sourceTextVersionId: textVersion._id,
+          processingFingerprint: "split-heading-base:v1",
+          extractionFingerprint: EXTRACTION_FINGERPRINT,
+          extractorFingerprint: "synthetic:v1",
+          recordSchemaFingerprint: "records:v1",
+          normalizationFingerprint: "exact:v1",
+          chunkerFingerprint: "none:v1",
+          correctionRevision: "one",
+          desiredProcessingEpoch: 1,
+          state: "ready",
+          expectedPageCount: 2,
+          expectedEvidenceSpanCount: 0,
+          expectedDocumentCount: 1,
+          expectedChunkCount: 0,
+          expectedEventCount: 0,
+          expectedObservationCount: 0,
+          actualPageCount: 2,
+          actualEvidenceSpanCount: 0,
+          actualDocumentCount: 1,
+          actualChunkCount: 0,
+          embeddingStatus: "unavailable",
+          activatedAt: 100,
+        },
+      );
+      await ctx.db.insert("documents", {
+        spaceId,
+        processingGenerationId,
+        sourceItemId: sourceItem._id,
+        sourceRevisionId: revision._id,
+        sourceTextVersionId: textVersion._id,
+        documentKey: "synthetic://split-heading/one",
+        title: "Worker supplied title",
+        docType: "note",
+        capturedAt: CAPTURED_AT,
+        evidenceSpanIds: [],
+        publicationState: "active",
+      });
+      await ctx.db.patch(sourceItem._id, {
+        desiredRevisionId: revision._id,
+        activeRevisionId: revision._id,
+        activeGenerationId: processingGenerationId,
+      });
+      await ctx.db.insert("spaceProcessingState", {
+        spaceId,
+        activationEpoch: 1,
+        activatedAt: 100,
+      });
+      return { userId, spaceId, sourceItemId: sourceItem._id };
+    });
+    const loaded = await t.run((ctx) =>
+      loadCardExtractionDocument(ctx, seeded.sourceItemId),
+    );
+    if (loaded.status !== "ready") {
+      throw new Error(`fixture did not load: ${loaded.code}`);
+    }
+    return { t, ...seeded, document: loaded.document };
+  }
+
+  /** The runner follows the tightened rule: card_title quotes only the
+   * heading's first line. The second line is never cited by any field. */
+  function splitHeadingCandidate(): CardRunnerCandidate {
+    return {
+      anchor: [{ pageOrdinal: 0, quote: SPLIT_LINE_ONE }],
+      fields: [
+        {
+          field: "card_title",
+          value: { type: "text", value: SPLIT_LINE_ONE },
+          spans: [{ pageOrdinal: 0, quote: SPLIT_LINE_ONE }],
+        },
+        {
+          field: "card_date",
+          value: { type: "date", value: "2025-03-04" },
+          spans: [{ pageOrdinal: 0, quote: "2025-03-04" }],
+        },
+        {
+          field: "card_summary",
+          value: {
+            type: "text",
+            value: "both sides keep material confidential",
+          },
+          spans: [
+            {
+              pageOrdinal: 1,
+              quote: "both sides keep material confidential",
+            },
+          ],
+        },
+      ],
+    };
+  }
+
+  test("publishes with the title span located on the first line, never the split second line", async () => {
+    const harness = await seedSplitHeadingDocument();
+    const result = await runCardLadder({
+      recordKind: "document_card",
+      document: harness.document,
+      now: 20_000,
+      ops: opsFor(harness),
+      runners: ladder(
+        fixtureCardRunner({
+          step: "tier0",
+          candidate: splitHeadingCandidate(),
+        }),
+        fixtureCardRunner({
+          step: "tier1",
+          candidate: splitHeadingCandidate(),
+        }),
+      ),
+    });
+
+    expect(result.outcome).toBe("accepted");
+    expect(result.storedFields).toContain("card_title");
+
+    const hydrated = await harness.t.run(async (ctx) => {
+      const observation = (await ctx.db.query("observations").collect()).find(
+        (row) => row.observationType === "card_title",
+      )!;
+      return await hydrateObservation(ctx, {
+        spaceId: harness.spaceId,
+        observationId: observation._id,
+      });
+    });
+    // The evidence proves the value from the first line alone: the second
+    // line of the heading never enters the title's own evidence.
+    expect(hydrated.evidence.map((item) => item.quote)).toContain(
+      SPLIT_LINE_ONE,
+    );
+    expect(
+      hydrated.evidence.some((item) => item.quote.includes(SPLIT_LINE_TWO)),
+    ).toBe(false);
+  });
+});
