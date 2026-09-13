@@ -149,6 +149,17 @@ export const sourceItemFields = {
    */
   activeCardGenerationId: v.optional(v.id("processingGenerations")),
   /**
+   * Section 4.2 of docs/plans/2026-09-12-document-cards.md: the accepted
+   * `card_kind` of the item's live card, which every document read overlays on
+   * the parser's `documents.docType` so type filtering and the card cannot
+   * disagree. P2-80i: it lives on the item, not on the document row, for the
+   * same reason `embedFullChunks` does and one more. `documents` is part of
+   * the sealed parsed payload and its `docType` is inside
+   * `manifest.documentDigest`, so patching the row in place made
+   * `verifySealedParsedPayload` fail for every document a card had refined.
+   */
+  cardDocType: v.optional(v.string()),
+  /**
    * Section 8.2 of the document-card plan: the full-chunk opt-in. Absent
    * falls back to the source account's rule, and absent there is off, so a
    * document admitted without an opt-in produces card targets only. It lives

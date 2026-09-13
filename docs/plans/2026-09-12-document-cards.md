@@ -231,9 +231,35 @@ is published on top of it when the classifier and the gate both accept one.
 A document with no recognized type keeps only its generic card.
 
 `documents.title` and `documents.docType` stay what they are today, worker
-supplied display metadata with no evidence. Activation writes the card's
-accepted `card_kind` into `documents.docType` so `search_documents` type
-filtering and the card classification cannot disagree.
+supplied display metadata with no evidence. Activation records the card's
+accepted `card_kind` on the item, and every document read overlays it on
+`documents.docType`, so `search_documents` type filtering and the card
+classification cannot disagree.
+
+#### The type is overlaid, not patched, settled on implementation 2026-09-12 during P2-80i
+
+Activation first wrote the accepted `card_kind` into `documents.docType` in
+place. That was wrong, for the same reason PR199 was wrong about card-staged
+evidence spans: the card lane mutated a row the sealed-payload proof treats as
+immutable. `documents.docType` is inside `manifest.documentDigest`, so every
+patched document failed `verifySealedParsedPayload`, the worker processing
+assessment counted it `unavailable`, and a re-stage of the same generation
+reported a conflicting immutable document.
+
+| Rule       | Statement                                                                                                                             |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| Where kept | `sourceItems.cardDocType`, beside `embedFullChunks` and for the same reason: a document row belongs to one generation, the card's kind does not. |
+| Read       | `effectiveDocType` returns the item's `cardDocType` for an active document and the parser's `documents.docType` otherwise.             |
+| Reads that overlay | `get_document` and `search_documents`, including its `docType` filter, which compares the overlaid type. `list_sources` keeps reporting the connector's own `sourceItems.docType`. |
+| Historical | A historical document keeps the type its own generation parsed. The patch never reached those rows either.                             |
+| Sealed row | Card activation writes no `documents` row at all, so the document digest of every sealed payload keeps verifying.                      |
+
+Recovery for rows the patch already overwrote is
+`models/workers/migrations:restoreSealedDocTypes`, which restores
+`documents.docType` from the `docTypePatch` the card version recorded and moves
+the accepted kind to `sourceItems.cardDocType`. Nothing writes `docTypePatch`
+any more; the field stays on `eventVersions` because activated card versions
+carry it and it is what the recovery reads.
 
 ### 4.3 Every field carries evidence
 
@@ -367,8 +393,7 @@ The card publishes on the subject entity, and when P2-70l binds that field's
 literal name to exactly one entity of an allowed kind the binding step moves
 the event version and its observations to that entity, which is what makes an
 entity-filtered `list_events` return the card. The previous entity id is
-recorded on the binding row, so a rollback restores it exactly as
-`docTypePatch` does for `documents.docType`. Every other kind keeps the
+recorded on the binding row, so a rollback restores it. Every other kind keeps the
 subject entity, and binding only annotates the observation.
 
 ### 4.6 Versioning on re-extraction
@@ -406,9 +431,10 @@ of content that never changed. Section 9.2 and invariants I3 and I11 of the
 index capacity plan forbid exactly that.
 
 Because a card generation has no documents of its own, the `documents.docType`
-rule of section 4.2 is an in-place patch of the active text generation's rows
-at card activation. It is idempotent, and the previous value of each patched
-row is recorded on the card version so a rollback restores it.
+rule of section 4.2 is a read-time overlay of the accepted `card_kind` recorded
+on the item at card activation, not a patch of the text generation's rows. A
+card publication writes no `documents` row, which is what keeps the sealed
+parsed payload of that generation verifiable.
 
 Rejected lower-tier attempts never become generations. Only the accepted
 tier's output is staged. Attempts are recorded separately, per section 5.4.
@@ -958,6 +984,7 @@ npx convex run models/records/cardEntityBinding:createEntityFromCard '{"observat
 npx convex run models/records/cardEntityBinding:rebindPendingCardEntities '{"spaceId":"<SPACE_ID>","cursor":null,"batchSize":64}'
 npx convex run models/embeddings/migrations:setSpaceTargetPolicy '{"spaceId":"<SPACE_ID>","policy":"cards_and_opted_in_chunks","expectedPolicy":"all_chunks"}'
 npx convex run models/embeddings/migrations:runTargetRetirePage '{"jobId":"<JOB_ID>","cursor":null,"batchSize":128}'
+npx convex run models/workers/migrations:restoreSealedDocTypes '{"cursor":null,"maxItems":25,"dryRun":true}'
 ```
 
 Each page command returns the next cursor and is rerun until it reports done.

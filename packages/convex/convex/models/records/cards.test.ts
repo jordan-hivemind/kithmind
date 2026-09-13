@@ -320,6 +320,9 @@ function withValue(
 describe("document cards", () => {
   test("publishes a generic card that query_records answers by date and entity", async () => {
     const seeded = await seedDocument({ withSubjectEntity: true });
+    const sealedDocumentBefore = await seeded.t.run(
+      async (ctx) => (await ctx.db.get(seeded.documentId))!,
+    );
     const published = await seeded.t.run((ctx) =>
       publishDocumentCard(ctx, {
         spaceId: seeded.spaceId,
@@ -412,27 +415,20 @@ describe("document cards", () => {
     if (empty.operation !== "list_events") throw new Error("wrong operation");
     expect(empty.records).toHaveLength(0);
 
-    // Section 4.2: activation patches the active document row's docType in
-    // place, so type filtering and the accepted card kind cannot disagree,
-    // and the previous value is recorded on the card version.
+    // Section 4.2 and P2-80i: activation records the accepted card kind on the
+    // item, which every document read overlays, and leaves the document row
+    // exactly as the parser staged it. That row is part of the sealed parsed
+    // payload and its `docType` is inside `manifest.documentDigest`, so
+    // patching it in place made `verifySealedParsedPayload` fail for every
+    // document a card had refined.
     const state = await seeded.t.run(async (ctx) => ({
       document: (await ctx.db.get(seeded.documentId))!,
-      version: (
-        await ctx.db
-          .query("eventVersions")
-          .withIndex("by_eventId", (q) => q.eq("eventId", published.eventId!))
-          .collect()
-      )[0]!,
+      item: (await ctx.db.get(seeded.sourceItemId))!,
     }));
-    expect(state.document.docType).toBe(CARD_KIND);
+    expect(state.document).toEqual(sealedDocumentBefore);
+    expect(state.document.docType).toBe("note");
     expect(state.document.publicationState).toBe("active");
-    expect(state.version.docTypePatch).toEqual([
-      {
-        documentId: seeded.documentId,
-        previousDocType: "note",
-        appliedDocType: CARD_KIND,
-      },
-    ]);
+    expect(state.item.cardDocType).toBe(CARD_KIND);
   });
 
   test("drops a field whose span does not resolve and records the drop", async () => {
@@ -626,9 +622,10 @@ describe("document cards", () => {
     expect(state.current.deactivatedAt).toBeUndefined();
     // Old card versions stay addressable.
     expect(state.versions).toHaveLength(2);
-    // The document row is patched in place, never retired or duplicated.
+    // The document row is left alone, never patched, retired or duplicated.
     expect(state.document.publicationState).toBe("active");
-    expect(state.document.docType).toBe(CARD_KIND);
+    expect(state.document.docType).toBe("note");
+    expect(state.item.cardDocType).toBe(CARD_KIND);
   });
 
   test("two card publications leave chunk ids and embedding targets untouched", async () => {

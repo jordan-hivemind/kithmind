@@ -293,3 +293,101 @@ export const requeueFailedDiscoveryWork = internalMutation({
       now: Date.now(),
     }),
 });
+
+const RESTORE_DOC_TYPE_MAX_ITEMS = 25;
+
+/**
+ * P2-80i recovery. Card activation used to patch `documents.docType` of the
+ * active text generation in place. That row is part of the sealed parsed
+ * payload and its `docType` is inside `manifest.documentDigest`, so every
+ * patched document failed `verifySealedParsedPayload` and the worker
+ * processing assessment counted it unavailable.
+ *
+ * This restores the sealed value from the `docTypePatch` the card version
+ * recorded, and moves the accepted `card_kind` to `sourceItems.cardDocType`,
+ * which is where document reads now overlay it. A patch counts as still in
+ * effect only while the document still carries its `appliedDocType`, so the job
+ * is idempotent: a second run finds the parser's value back on the row and
+ * restores nothing. Paged over `eventVersions`; only card versions carry a
+ * `docTypePatch`.
+ */
+export async function restoreSealedDocTypesPage(
+  ctx: MutationCtx,
+  args: { cursor: string | null; maxItems: number; dryRun: boolean },
+) {
+  if (
+    !Number.isInteger(args.maxItems) ||
+    args.maxItems < 1 ||
+    args.maxItems > RESTORE_DOC_TYPE_MAX_ITEMS ||
+    (args.cursor !== null && args.cursor.length > 8192)
+  )
+    throw new Error("Invalid migration page bounds");
+  const page = await ctx.db.query("eventVersions").paginate({
+    cursor: args.cursor,
+    numItems: args.maxItems,
+  });
+  let patchedVersions = 0;
+  let documentsRestored = 0;
+  let itemsOverlaid = 0;
+  let skippedNotInEffect = 0;
+  for (const version of page.page) {
+    const docTypePatch = version.docTypePatch;
+    if (docTypePatch === undefined || docTypePatch.length === 0) continue;
+    patchedVersions += 1;
+    const item = await ctx.db.get(version.sourceItemId);
+    if (!item || item.spaceId !== version.spaceId) {
+      skippedNotInEffect += docTypePatch.length;
+      continue;
+    }
+    let appliedInEffect: string | undefined;
+    for (const entry of docTypePatch) {
+      const document = await ctx.db.get(entry.documentId);
+      if (
+        !document ||
+        document.spaceId !== version.spaceId ||
+        document.sourceItemId !== item._id ||
+        document.docType !== entry.appliedDocType
+      ) {
+        skippedNotInEffect += 1;
+        continue;
+      }
+      if (!args.dryRun) {
+        await ctx.db.patch(document._id, { docType: entry.previousDocType });
+      }
+      appliedInEffect = entry.appliedDocType;
+      documentsRestored += 1;
+    }
+    // The card kind those documents were actually carrying is the one the read
+    // overlay has to serve from now on.
+    if (appliedInEffect !== undefined && item.cardDocType !== appliedInEffect) {
+      if (!args.dryRun) {
+        await ctx.db.patch(item._id, { cardDocType: appliedInEffect });
+      }
+      itemsOverlaid += 1;
+    }
+  }
+  return {
+    dryRun: args.dryRun,
+    inspected: page.page.length,
+    patchedVersions,
+    documentsRestored,
+    itemsOverlaid,
+    skippedNotInEffect,
+    isDone: page.isDone,
+    continueCursor: page.continueCursor,
+  };
+}
+
+export const restoreSealedDocTypes = internalMutation({
+  args: {
+    cursor: v.union(v.string(), v.null()),
+    maxItems: v.optional(v.number()),
+    dryRun: v.optional(v.boolean()),
+  },
+  handler: (ctx, args) =>
+    restoreSealedDocTypesPage(ctx, {
+      cursor: args.cursor,
+      maxItems: args.maxItems ?? RESTORE_DOC_TYPE_MAX_ITEMS,
+      dryRun: args.dryRun ?? true,
+    }),
+});

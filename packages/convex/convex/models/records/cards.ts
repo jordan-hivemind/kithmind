@@ -5,7 +5,6 @@ import { internalMutation, type MutationCtx } from "../../_generated/server";
 import { markEligibilityTargets } from "../embeddings/model";
 import { digestProcessingConfiguration } from "../ingestion/hash";
 import {
-  MAX_GENERATION_DOCUMENTS,
   stageCardEvidenceSpans,
   sweepCardEvidenceSpans,
   type CardEvidenceRef,
@@ -31,7 +30,7 @@ import { probeFieldEvidence, stageRecordBatch } from "./model";
 import { nextRecordActivationTime } from "./querySessions";
 import { observationValueValidator } from "./valueValidators";
 import type { ObservationValue } from "./values";
-import type { CardDocTypePatch, StagedObservation } from "./validators";
+import type { StagedObservation } from "./validators";
 
 const MAX_FINGERPRINT_PART_BYTES = 64;
 
@@ -538,14 +537,10 @@ export async function publishDocumentCard(
   const cardKindField = storable.find(
     (field) => field.field === "card_kind" && field.value.type === "text",
   );
-  const docTypePatch =
+  const cardDocType =
     cardKindField && cardKindField.value.type === "text"
-      ? await planDocTypePatch(ctx, {
-          spaceId: input.spaceId,
-          base,
-          appliedDocType: cardKindField.value.value,
-        })
-      : [];
+      ? cardKindField.value.value
+      : undefined;
 
   // Decision 1 of P2-82: an anchor-proven field's own `evidenceSpanIds` is
   // never read (it may well be empty), but every stored observation still
@@ -579,7 +574,6 @@ export async function publishDocumentCard(
           entity: input.anchorEvidenceSpanIds,
           eventType: input.anchorEvidenceSpanIds,
         },
-        ...(docTypePatch.length === 0 ? {} : { docTypePatch }),
         observations,
       },
     ],
@@ -600,7 +594,7 @@ export async function publishDocumentCard(
     item,
     processingGenerationId: generationId,
     now: input.now,
-    docTypePatch,
+    ...(cardDocType === undefined ? {} : { cardDocType }),
   });
 
   // Section 4.4, P2-70l. Binding runs after the card is accepted and active,
@@ -792,45 +786,6 @@ export const recordSkippedCardAttempt = internalMutation({
 });
 
 /**
- * Section 4.2: the accepted `card_kind` becomes `documents.docType` so type
- * filtering and the card cannot disagree. A card generation carries no
- * documents of its own, so the patch lands on the active text generation's
- * rows in place. It is planned before staging and recorded on the card
- * version, which is what a rollback restores from, and it is idempotent: a
- * row already carrying the accepted value is left alone.
- */
-async function planDocTypePatch(
-  ctx: MutationCtx,
-  input: {
-    spaceId: Id<"spaces">;
-    base: Doc<"processingGenerations">;
-    appliedDocType: string;
-  },
-): Promise<CardDocTypePatch> {
-  const documents = await ctx.db
-    .query("documents")
-    .withIndex("by_processingGenerationId", (q) =>
-      q.eq("processingGenerationId", input.base._id),
-    )
-    .take(MAX_GENERATION_DOCUMENTS + 1);
-  if (documents.length > MAX_GENERATION_DOCUMENTS) {
-    throw new Error("Card document generation exceeds the document bound");
-  }
-  return documents
-    .filter(
-      (row) =>
-        row.spaceId === input.spaceId &&
-        row.publicationState === "active" &&
-        row.docType !== input.appliedDocType,
-    )
-    .map((row) => ({
-      documentId: row._id,
-      ...(row.docType === undefined ? {} : { previousDocType: row.docType }),
-      appliedDocType: input.appliedDocType,
-    }));
-}
-
-/**
  * Atomic activation without a worker lease. The item keeps its active text
  * generation and gains an active card generation; the previous card
  * generation is retired so its versions stay snapshot readable. No document
@@ -844,7 +799,8 @@ async function activateCardGeneration(
     item: Doc<"sourceItems">;
     processingGenerationId: Id<"processingGenerations">;
     now: number;
-    docTypePatch: CardDocTypePatch;
+    /** Section 4.2: the accepted `card_kind`, absent when the card has none. */
+    cardDocType?: string;
   },
 ): Promise<number> {
   const states = await ctx.db
@@ -893,23 +849,23 @@ async function activateCardGeneration(
     state: "ready",
     activatedAt,
   });
-  for (const patch of input.docTypePatch) {
-    const document = await ctx.db.get(patch.documentId);
-    if (
-      !document ||
-      document.spaceId !== input.spaceId ||
-      document.publicationState !== "active"
-    ) {
-      throw new Error("Card docType target is no longer active");
-    }
-    await ctx.db.patch(patch.documentId, { docType: patch.appliedDocType });
-  }
   // The text generation, its documents and its chunks are untouched, so every
   // chunk target id and vector stays valid. Only the item's own card target
   // moves, and its identity is the card event, so an unchanged card keeps its
   // vector across this supersession (section 8.1, I3).
+  //
+  // Section 4.2, P2-80i: the accepted `card_kind` is recorded here, on the
+  // item, and every document read overlays it. An earlier implementation
+  // patched `documents.docType` of the active text generation in place, but
+  // that row is part of the sealed parsed payload and its `docType` is inside
+  // `manifest.documentDigest`, so the patch made `verifySealedParsedPayload`
+  // fail (and `stageDocuments` report a conflicting immutable document) for
+  // every document a card had refined.
   await ctx.db.patch(input.item._id, {
     activeCardGenerationId: input.processingGenerationId,
+    ...(input.cardDocType === undefined
+      ? {}
+      : { cardDocType: input.cardDocType }),
   });
   await markEligibilityTargets(ctx, input.spaceId, {
     sourceItemIds: [input.item._id],

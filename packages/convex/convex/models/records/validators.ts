@@ -40,11 +40,15 @@ const _cardKindsAreRecordEventTypes: readonly RecordEventType[] =
 void _cardKindsAreRecordEventTypes;
 
 /**
- * Section 4.2 of docs/plans/2026-09-12-document-cards.md: card activation
- * patches `documents.docType` of the active text generation in place, so
- * document type filtering and the accepted card kind cannot disagree. The
- * previous value is recorded on the card version, which is what a rollback
- * restores from.
+ * Retired by P2-80i. Card activation used to patch `documents.docType` of the
+ * active text generation in place and record the previous value here, but that
+ * row is part of the sealed parsed payload and its `docType` is inside
+ * `manifest.documentDigest`, so the patch broke the proof. The accepted
+ * `card_kind` now lives on `sourceItems.cardDocType` and document reads overlay
+ * it; nothing writes this field any more. It stays on `eventVersions` because
+ * activated card versions carry it, and it is what
+ * `models/workers/migrations:restoreSealedDocTypes` restores the sealed
+ * `documents.docType` from.
  */
 export const cardDocTypePatchValidator = v.array(
   v.object({
@@ -76,7 +80,6 @@ export const stagedEventRecordValidator = v.object({
   schemaVersion: v.number(),
   occurrence: occurrenceValidator,
   fieldEvidence: recordFieldEvidenceValidator,
-  docTypePatch: v.optional(cardDocTypePatchValidator),
   observations: v.array(stagedObservationValidator),
 });
 

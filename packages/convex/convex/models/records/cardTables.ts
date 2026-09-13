@@ -132,7 +132,7 @@ export const cardEntityBindingFields = {
       /**
        * Set only when this field is its card kind's event entity (section
        * 4.5) and the event was repointed. The previous value is what a
-       * rollback restores, the same rule `docTypePatch` follows.
+       * rollback restores.
        */
       previousEventEntityId: v.optional(v.id("entities")),
       /** Absent for the automatic rebind job, which is not a person. */
