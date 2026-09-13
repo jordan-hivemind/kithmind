@@ -25,6 +25,8 @@ import {
 import { at, exec, numOr0, row, type WorkerCtx } from "./db.js";
 import { workerProtocolError } from "./errors.js";
 
+export { WORKER_MUTATION_RATE_LIMIT, WORKER_MUTATION_RATE_WINDOW_MS };
+
 /**
  * The budget, as one named constant pair. P2-80k owns changing these; nothing
  * else in the package may inline either number.
