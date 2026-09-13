@@ -1519,6 +1519,16 @@ async function classifyItem(
         entry.state === "queued" ? "queuedScanEntries" : "unchangedScanEntries",
     };
   }
+  // P2-80f: an `unchanged` entry that still carries a discovery work row is a
+  // settled processing failure (see the entry state rule in model.ts). It is
+  // not terminally ready and never will be without an operator requeue, so
+  // classify it from its work row (needs review) instead of failing closed.
+  if (entry.state === "unchanged" && entry.discoveryWorkId !== undefined) {
+    return {
+      bucket: await classifyWork(ctx, source, item, entry),
+      proof: "unchangedScanEntries",
+    };
+  }
   if (entry.state !== "queued") throw workerProtocolError("scan_conflict");
   return {
     bucket: await classifyWork(ctx, source, item, entry),
