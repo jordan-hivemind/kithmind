@@ -752,10 +752,41 @@ test("getDocument and searchDocuments overlay the item's live card doc type onto
   const filteredOut = await documents.searchDocuments(client, [spaceId], { query: "quarterly", docType: "statement" });
   assert.equal(filteredOut.results.length, 0);
 
-  // A forged evidence pointer cannot become a citation: it is not in this
-  // document's revision/text chain, so the read reports partial content and
-  // withholds the pointer rather than returning a cross-chain quote.
-  await client.query("UPDATE kith.documents SET evidence_span_ids = $1::jsonb WHERE id = $2", [JSON.stringify([opaqueId()]), document.id]);
+  // A real, stored span from a different revision cannot become a citation:
+  // it is not in this document's revision/text chain, so the read reports
+  // partial content and withholds the pointer rather than returning a
+  // cross-chain quote.
+  const foreignItem = await provenance.createOrGetSourceItem(client, {
+    spaceId,
+    sourceAccountId,
+    externalId: "fixture/foreign-citation.txt",
+  });
+  const foreignRevision = await provenance.createOrGetRevision(client, {
+    spaceId,
+    sourceItemId: foreignItem.id,
+    mediaType: "text/plain",
+    inlineText: "Foreign citation text.",
+    capturedAt: new Date("2026-02-02T00:00:00Z"),
+    userId,
+  });
+  const foreignText = await provenance.createOrGetTextVersion(client, {
+    spaceId,
+    sourceRevisionId: foreignRevision.id,
+    extractionFingerprint: "foreign-extract-v1",
+    text: "Foreign citation text.",
+  });
+  const [foreignPage] = await provenance.stagePages(client, {
+    spaceId,
+    sourceTextVersionId: foreignText.id,
+    pages: [{ ordinal: 0, start: 0, end: foreignText.text.length, text: foreignText.text }],
+  });
+  const [foreignSpan] = await provenance.stageEvidenceSpans(client, {
+    spaceId,
+    sourceRevisionId: foreignRevision.id,
+    sourceTextVersionId: foreignText.id,
+    spans: [{ sourcePageId: foreignPage.id, ordinal: 0, start: 0, end: 7 }],
+  });
+  await client.query("UPDATE kith.documents SET evidence_span_ids = $1::jsonb WHERE id = $2", [JSON.stringify([foreignSpan.id]), document.id]);
   const forgedCitation = await documents.getDocument(client, [spaceId], document.id);
   assert.ok(forgedCitation);
   assert.deepEqual(forgedCitation.evidenceSpanIds, []);
