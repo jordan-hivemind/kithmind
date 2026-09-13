@@ -19,6 +19,8 @@ import {
   consumeWorkerMutationRateLimit,
   decodeCursor,
   encodeCursor,
+  failArchivedDiscovery,
+  preflightArchivedDiscovery,
   keysetTail,
   getWorkerDiagnosticsStatus,
   getWorkerSourceStatus,
@@ -26,6 +28,7 @@ import {
   requireWorkerSourceAccount,
   reconcileWorkerScan,
   renewProcessingJob,
+  reserveArchivedDiscovery,
   reserveDiscoveryWork,
   reserveProcessingJobs,
   resolveAndPersistEntry,
@@ -1051,6 +1054,195 @@ test(
           NOW + 5_000,
         ),
         expectProtocolCode("identity_review_required"),
+      );
+    } finally {
+      await pool.end();
+    }
+  },
+);
+
+test(
+  "archived discovery preflight, failure, and reservation preserve lease fences",
+  { skip },
+  async (t) => {
+    const f = await fixture(t);
+    const pool = createKithPool(f.databaseUrl, 2);
+    const call = (work, now = NOW) => withWorkerTransaction(pool, work, now);
+    const fingerprint = "b".repeat(64);
+    try {
+      await f.client.query(
+        `UPDATE kith.source_accounts SET binary_profile_ids = $1, binary_profile_audit_digest = $2,
+        binary_profile_enabled_at = $3 WHERE id = $4`,
+        [
+          JSON.stringify(["pdf_docqa_v1"]),
+          fingerprint,
+          new Date(NOW),
+          f.sourceAccountId,
+        ],
+      );
+      const begun = await call((ctx) =>
+        beginWorkerScan(ctx, f.principal, {
+          protocolVersion: 1,
+          operation: "scan.begin",
+          spaceId: f.spaceId,
+          sourceAccountId: f.sourceAccountId,
+          requestId: "binary-begin",
+          watcherId: "watcher-1",
+          connectorVersion: "fs-v1",
+          mode: "normal",
+          expectedInventoryEpoch: 0,
+        }),
+      );
+      await call((ctx) =>
+        appendWorkerScanPage(ctx, f.principal, {
+          protocolVersion: 1,
+          operation: "scan.appendPage",
+          spaceId: f.spaceId,
+          sourceAccountId: f.sourceAccountId,
+          scanId: begun.scanId,
+          requestId: "binary-page",
+          ordinal: 0,
+          entries: [
+            {
+              ...readyEntry(),
+              uri: "fs://synthetic/a.pdf",
+              docType: "pdf",
+              content: {
+                status: "ready_binary_v1",
+                sha256: HASH_A,
+                byteLength: 10,
+                mediaType: "application/pdf",
+                parserProfileId: "pdf_docqa_v1",
+                parserFingerprint: fingerprint,
+                extractionConfigurationFingerprint: "c".repeat(64),
+                extractorFingerprint: "extractor-v1",
+                recordSchemaFingerprint: "schema-v1",
+                normalizationFingerprint: "normalization-v1",
+                chunkerFingerprint: "chunker-v1",
+                correctionRevision: "correction-v1",
+              },
+            },
+          ],
+        }),
+      );
+      await call((ctx) =>
+        sealWorkerScan(ctx, f.principal, {
+          protocolVersion: 1,
+          operation: "scan.seal",
+          spaceId: f.spaceId,
+          sourceAccountId: f.sourceAccountId,
+          scanId: begun.scanId,
+          requestId: "binary-seal",
+          expectedPageCount: 1,
+          health: { status: "healthy" },
+        }),
+      );
+      await call((ctx) =>
+        reconcileWorkerScan(ctx, f.principal, {
+          protocolVersion: 1,
+          operation: "scan.reconcile",
+          spaceId: f.spaceId,
+          sourceAccountId: f.sourceAccountId,
+          scanId: begun.scanId,
+          requestId: "binary-reconcile",
+          expectedInventoryEpoch: 1,
+          ordinal: 0,
+          maxItems: 10,
+        }),
+      );
+      const work = (
+        await f.client.query(
+          "SELECT * FROM kith.worker_discovery_work WHERE source_account_id = $1",
+          [f.sourceAccountId],
+        )
+      ).rows[0];
+      const identity = {
+        sourceItemId: work.source_item_id,
+        scanId: begun.scanId,
+        observationEpoch: Number(work.observation_epoch),
+        processingEpoch: Number(work.processing_epoch),
+        contentHash: HASH_A,
+        byteLength: 10,
+        mediaType: "application/pdf",
+        parserProfileId: "pdf_docqa_v1",
+        parserFingerprint: fingerprint,
+        extractionConfigurationFingerprint: "c".repeat(64),
+        extractorFingerprint: "extractor-v1",
+        recordSchemaFingerprint: "schema-v1",
+        normalizationFingerprint: "normalization-v1",
+        chunkerFingerprint: "chunker-v1",
+        correctionRevision: "correction-v1",
+      };
+      const common = {
+        protocolVersion: 1,
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        identity,
+      };
+      const preflight = await call((ctx) =>
+        preflightArchivedDiscovery(ctx, f.principal, {
+          ...common,
+          operation: "discovery.preflightArchived",
+          requestId: "binary-preflight",
+          archiveIntentDigest: "d".repeat(64),
+        }),
+      );
+      assert.equal(preflight.workId, work.id);
+      const reserveRequest = {
+        ...common,
+        operation: "discovery.reserveArchived",
+        requestId: "binary-reserve-1",
+      };
+      const token = "5".repeat(64);
+      const reserved = await call((ctx) =>
+        reserveArchivedDiscovery(ctx, f.principal, reserveRequest, token),
+      );
+      assert.equal(reserved.leaseEpoch, 1);
+      assert.deepEqual(
+        await call((ctx) =>
+          reserveArchivedDiscovery(ctx, f.principal, reserveRequest, token),
+        ),
+        {
+          ...reserved,
+          reused: true,
+        },
+      );
+      const failed = await call((ctx) =>
+        failArchivedDiscovery(ctx, f.principal, {
+          ...common,
+          operation: "discovery.failArchived",
+          requestId: "binary-fail-1",
+          failureCode: "conversion_failed",
+        }),
+      );
+      assert.equal(failed.retryable, true);
+      const replacement = await call((ctx) =>
+        reserveArchivedDiscovery(
+          ctx,
+          f.principal,
+          { ...reserveRequest, requestId: "binary-reserve-2" },
+          "6".repeat(64),
+        ),
+      );
+      assert.equal(replacement.leaseEpoch, 2);
+      const terminal = await call((ctx) =>
+        failArchivedDiscovery(ctx, f.principal, {
+          ...common,
+          operation: "discovery.failArchived",
+          requestId: "binary-fail-2",
+          failureCode: "conversion_failed",
+          exhausted: true,
+        }),
+      );
+      assert.equal(terminal.retryable, false);
+      assert.equal(
+        (
+          await f.client.query(
+            "SELECT exclusion_reason FROM kith.source_inventory WHERE source_item_id = $1",
+            [work.source_item_id],
+          )
+        ).rows[0].exclusion_reason,
+        "parse_failed",
       );
     } finally {
       await pool.end();

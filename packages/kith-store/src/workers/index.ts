@@ -4,6 +4,7 @@ import { withKithTransaction } from "../schema.js";
 import { workerCtx, type WorkerCtx } from "./db.js";
 
 export * from "./auth.js";
+export * from "./archivedDiscovery.js";
 export * from "./cursor.js";
 export * from "./db.js";
 export * from "./digests.js";
