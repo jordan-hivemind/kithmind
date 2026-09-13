@@ -39,6 +39,9 @@ export {
 } from "./schema.js";
 export * as provenance from "./provenance/index.js";
 export * as documents from "./documents/index.js";
+export * as memory from "./memory/index.js";
+export * as ingestion from "./ingestion/index.js";
+export * as workers from "./workers/index.js";
 
 const SHA256 = /^[0-9a-f]{64}$/;
 const UUID =
@@ -196,13 +199,10 @@ export async function grantProofAppRole(
   await owner.query(
     `GRANT SELECT ON ALL TABLES IN SCHEMA kith TO "${appRole}"`,
   );
-  // P2-39d: the write grant covers every table this package's ported
-  // surfaces write to -- the worker-job demo (worker_jobs) and the
-  // provenance/documents port migration 004/005 created (documents,
-  // chunks and the other twelve tables `src/provenance` and
-  // `src/documents` write to). Every other table in the schema (spaces,
-  // api_keys, identity's and ingestion's tables) is read-only to this
-  // role until the row that owns it grants its own write access here.
+  // The write grant covers every table the currently exported service
+  // surfaces write. P2-39e's first slice adds only the entry-resolution
+  // foundation; scan, reservation, receipt and assessment tables stay
+  // read-only until the operations that write them land.
   await owner.query(`GRANT INSERT, UPDATE, DELETE ON
     kith.worker_jobs, kith.source_items, kith.source_revisions,
     kith.source_parser_artifacts, kith.source_artifact_archive_receipts,
@@ -211,7 +211,9 @@ export async function grantProofAppRole(
     kith.source_provider_original_detach_acks, kith.source_text_versions,
     kith.source_pages, kith.evidence_spans, kith.documents, kith.chunks,
     kith.processing_generations, kith.processing_generation_payload_manifests,
-    kith.source_inventory TO "${appRole}"`);
+    kith.source_inventory, kith.source_alias_digests,
+    kith.worker_scan_entries, kith.worker_discovery_work,
+    kith.worker_protocol_rate_limits, kith.ingest_jobs TO "${appRole}"`);
   // USAGE on a domain is granted to PUBLIC by default and revoked from PUBLIC
   // when the reader role is applied, so the writer is granted it by name.
   for (const domain of KITH_DOMAINS) {
