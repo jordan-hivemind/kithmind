@@ -951,6 +951,58 @@ describe("document cards", () => {
     ]);
     expect(published.storedFields).not.toContain("card_kind");
   });
+
+  test("P2-89: a realistic publish never persists field_not_declared or a :0 key for a non-repeated field", async () => {
+    const seeded = await seedDocument({ withSubjectEntity: true });
+    // Three non-repeated fields fail for ordinary reasons (a wrong span, a
+    // value the enum refuses), never for the retired shape artifacts a
+    // pre-PR180 candidate could have produced.
+    let fields = withValue(genericFields(seeded.evidence), "card_date", {
+      type: "date",
+      value: "2025-03-05",
+    });
+    fields = withValue(fields, "card_summary", {
+      type: "text",
+      value: "a summary the cited span does not contain",
+    });
+    fields = withValue(fields, "card_kind", {
+      type: "text",
+      value: "not a real kind",
+    });
+    const published = await seeded.t.run((ctx) =>
+      publishDocumentCard(ctx, {
+        spaceId: seeded.spaceId,
+        sourceItemId: seeded.sourceItemId,
+        userId: seeded.userId,
+        recordKind: "document_card",
+        now: 1_000,
+        fingerprint: FINGERPRINT,
+        anchorEvidenceSpanIds: [seeded.evidence[TITLE]!],
+        fields,
+      }),
+    );
+    expect(published.published).toBe(true);
+    expect(published.droppedFields.length).toBe(3);
+
+    const drops = await seeded.t.run(
+      async (ctx) => await ctx.db.query("cardFieldDrops").collect(),
+    );
+    expect(drops.length).toBe(3);
+    expect(drops.some((row) => row.code === "field_not_declared")).toBe(
+      false,
+    );
+    const nonRepeatedFields = [
+      "card_kind",
+      "card_title",
+      "card_date",
+      "card_summary",
+    ];
+    expect(
+      drops.some((row) =>
+        nonRepeatedFields.some((name) => row.fieldKey === `${name}:0`),
+      ),
+    ).toBe(false);
+  });
 });
 
 /**
