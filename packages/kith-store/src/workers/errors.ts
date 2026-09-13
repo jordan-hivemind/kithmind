@@ -29,7 +29,10 @@ export type { WorkerProtocolErrorCode };
  * never part of the contract.
  */
 export class WorkerProtocolError extends Error {
-  readonly data: { type: "worker_protocol_error"; code: WorkerProtocolErrorCode };
+  readonly data: {
+    type: "worker_protocol_error";
+    code: WorkerProtocolErrorCode;
+  };
 
   constructor(readonly code: WorkerProtocolErrorCode) {
     super(`worker_protocol_error:${code}`);
@@ -80,4 +83,14 @@ export function rethrowWorkerProtocolError(error: unknown): never {
   const code = workerProtocolErrorCode(error);
   if (code) throw new WorkerProtocolError(code);
   throw error;
+}
+
+/** Keep database aborts visible to the transaction boundary. */
+export function isWorkerTransactionAbort(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error.code === "40001" || error.code === "40P01")
+  );
 }

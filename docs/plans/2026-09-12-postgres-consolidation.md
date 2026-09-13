@@ -185,6 +185,16 @@ worker has no in-flight work to preserve.
 | `models/provenance`              |         2 | Internal provenance reads, folded into the document service. Coverage tables have no functions of their own. |
 | `models/lists`, `models/reports` |        42 | Retired by P2-39l, section 5.1. Not present in the current tree.                                             |
 
+The worker PostgreSQL component implements all 33 wire operations and a local
+adapter for the unchanged contract. Its focused tests cover every service
+operation and representative inline and parsed publication through real HTTP;
+the production route switch remains a cutover step. Worker activation owns the
+processing clock, target eligibility counters and retirement of obsolete
+vectors in the active embedding generation. The embedding workstream still
+owns profile management, build and fill, vector search and production indexes.
+Begin and final source forgetting are outside the 33-operation worker wire
+surface; their owning service must apply the same target and epoch maintenance.
+
 The 128 `internalMutation` functions are the largest group and the cheapest to
 port conceptually: each one is already a single atomic step with validated
 arguments, which is exactly one SQL transaction. The expensive part is that

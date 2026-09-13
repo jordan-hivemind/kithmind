@@ -4,14 +4,27 @@ import { withKithTransaction } from "../schema.js";
 import { workerCtx, type WorkerCtx } from "./db.js";
 
 export * from "./auth.js";
+export * from "./archivedDiscovery.js";
+export * from "./archiveForget.js";
+export * from "./assessment.js";
 export * from "./cursor.js";
 export * from "./db.js";
 export * from "./digests.js";
+export * from "./diagnostics.js";
+export * from "./dispatch.js";
+export * from "./discovery.js";
 export * from "./entries.js";
 export * from "./errors.js";
+export * from "./http.js";
+export * from "./jobs.js";
+export * from "./parsedJobs.js";
 export * from "./profile.js";
+export * from "./publication.js";
+export * from "./providerOriginalForget.js";
 export * from "./rateLimit.js";
 export * from "./rows.js";
+export * from "./scans.js";
+export * from "./status.js";
 
 /**
  * Runs one worker operation with Convex-equivalent atomicity.

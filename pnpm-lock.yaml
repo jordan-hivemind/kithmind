@@ -251,6 +251,9 @@ importers:
       '@repo/finance-archive':
         specifier: workspace:*
         version: link:../finance-archive
+      '@repo/pipeline':
+        specifier: workspace:*
+        version: link:../pipeline
       '@repo/typescript-config':
         specifier: workspace:*
         version: link:../typescript-config
