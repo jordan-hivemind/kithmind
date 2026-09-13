@@ -1438,9 +1438,64 @@ export async function importBatch(
     );
     const seen = new Map(found.rows.map((r) => [r.row_hash, r.source_locator]));
 
+    // F1-8a. `row_hash` includes `cash` (balanceHash), so two documents
+    // stating different cash at the same (account_id, as_of) never collide
+    // here -- both insert as separate rows, and the reconciliation gate
+    // later marks that period unverified rather than picking one (ground
+    // rule 5, reconciliation.ts's `reconcilePeriod`). That leaves the
+    // conflict discoverable only by re-deriving it from every `balances`
+    // row, which is exactly the report the gate already refuses to compute
+    // per-period. A review item names the other document at import time
+    // instead, without changing which cash the gate reconciles against.
+    const cashConflicts =
+      table === "balances"
+        ? new Map(
+            (
+              await client.query<{
+                account_id: string;
+                as_of: string;
+                cash: string | null;
+                source_document_id: string | null;
+              }>(
+                `SELECT b.account_id, b.as_of::text AS as_of, b.cash, b.source_document_id
+                   FROM balances b
+                   JOIN (SELECT unnest($1::text[]) AS account_id,
+                                unnest($2::date[]) AS as_of) pairs
+                     ON pairs.account_id = b.account_id AND pairs.as_of = b.as_of`,
+                [
+                  prepared.map((p) => p.accountId),
+                  prepared.map((p) => p.values[2] as string),
+                ],
+              )
+            ).rows.map((r) => [`${r.account_id} ${r.as_of}`, r]),
+          )
+        : null;
+
     const toInsert: unknown[][] = [];
     let anySuccess = false;
     for (const p of prepared) {
+      if (cashConflicts !== null) {
+        const asOf = p.values[2] as string;
+        const cash = p.values[4] as string | null;
+        const existing = cashConflicts.get(`${p.accountId} ${asOf}`);
+        if (
+          existing !== undefined &&
+          existing.source_document_id !== documentId &&
+          existing.cash !== null &&
+          cash !== null &&
+          existing.cash !== cash
+        ) {
+          openReview(p.accountId, documentId, p.sourceLocator, {
+            kind: "balance_cash_conflict",
+            rawValue: cash,
+            reason:
+              `this document states cash ${cash} for ${p.accountId} as of ${asOf}, ` +
+              `which disagrees with ${existing.cash} already on file from document ` +
+              `${existing.source_document_id}; both are kept, neither is picked ` +
+              "(ground rule 5) -- see reconciliation.ts's cash_contradicts",
+          });
+        }
+      }
       if (seen.has(p.hash)) {
         rowsDeduplicated += 1;
         anySuccess = true;

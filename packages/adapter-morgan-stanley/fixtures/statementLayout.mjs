@@ -99,6 +99,48 @@ export function balanceSheetLines({
   ];
 }
 
+/**
+ * F1-8c. The same block, but the Cash, BDP, MMFs row's own two amounts print
+ * a few characters short of where the "(as of ...)" header cells end --
+ * real enough on the hosted archive that a short cash figure under a header
+ * as wide as "(as of 03/31/26)" lands there while TOTAL VALUE, printing a
+ * larger figure, still ends flush with the header. Before
+ * `BALANCE_SHEET_EDGE_TOLERANCE` this cash cell bound to neither column and
+ * read as "row or column not printed on this statement" for a figure the
+ * statement did print.
+ */
+export function balanceSheetLinesShortCash({
+  totalValueLast = "$1,250,400.00",
+  totalValueThis = "$1,302,775.50",
+  cashThis = "$500.00",
+} = {}) {
+  const SHORT_LAST = LAST_PERIOD - 5;
+  const SHORT_THIS = THIS_PERIOD - 5;
+  return [
+    place([
+      { text: "BALANCE SHEET  (^ Includes accrued interest)", start: LABEL },
+    ]),
+    place([
+      { text: "Last Period", end: LAST_PERIOD },
+      { text: "This Period", end: THIS_PERIOD },
+    ]),
+    place([
+      { text: "(as of 02/28/26)", end: LAST_PERIOD },
+      { text: "(as of 03/31/26)", end: THIS_PERIOD },
+    ]),
+    place([
+      { text: "Cash, BDP, MMFs", start: LABEL },
+      { text: "$490.00", end: SHORT_LAST },
+      { text: cashThis, end: SHORT_THIS },
+    ]),
+    place([
+      { text: "TOTAL VALUE", start: LABEL },
+      { text: totalValueLast, end: LAST_PERIOD },
+      { text: totalValueThis, end: THIS_PERIOD },
+    ]),
+  ];
+}
+
 // --- holdings ---------------------------------------------------------------
 
 const EQUITY_COLUMNS = {
@@ -441,6 +483,17 @@ const ACCOUNT_HEADER = [
   "        CLIENT STATEMENT   For the Period March 1-31, 2026",
   "        Synthetic Active Assets Account    123-456789-012",
 ];
+
+/**
+ * F1-8c. A single-account statement whose BALANCE SHEET prints Cash, BDP,
+ * MMFs a few characters short of the header's own right edge (see
+ * `balanceSheetLinesShortCash`), so this is what the archive holds for a
+ * real snapshot the fix (`BALANCE_SHEET_EDGE_TOLERANCE`) is meant to read.
+ */
+export const SHORT_CASH_LAYOUT_TEXT = [
+  ...ACCOUNT_HEADER,
+  ...balanceSheetLinesShortCash(),
+].join("\n");
 
 /** One single-account statement: header, balance sheet, holdings. */
 export function statementPages(options = {}) {
