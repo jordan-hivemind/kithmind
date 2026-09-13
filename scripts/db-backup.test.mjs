@@ -39,6 +39,13 @@ test("parseDbBackupArgs rejects --verify with the convex engine", () => {
   );
 });
 
+test("parseDbBackupArgs requires a separate protected verify config", () => {
+  assert.throws(
+    () => parseDbBackupArgs(["--engine", "postgres", "--config", "/x", "--verify"]),
+    (error) => error.code === "verify_config_required",
+  );
+});
+
 test("parseDbBackupArgs rejects unknown arguments", () => {
   assert.throws(
     () =>
@@ -49,8 +56,8 @@ test("parseDbBackupArgs rejects unknown arguments", () => {
 
 test("parseDbBackupArgs accepts a valid postgres --verify invocation", () => {
   assert.deepEqual(
-    parseDbBackupArgs(["--engine", "postgres", "--config", "/x", "--verify"]),
-    { engine: "postgres", config: "/x", verify: true },
+    parseDbBackupArgs(["--engine", "postgres", "--config", "/x", "--verify", "--verify-config", "/verify.json"]),
+    { engine: "postgres", config: "/x", verify: true, verifyConfig: "/verify.json" },
   );
 });
 
@@ -93,6 +100,10 @@ test("runDbBackup routes --engine postgres to the postgres adapter only, and --v
       calls.push(["load", path]);
       return { fake: "pg-config" };
     },
+    loadPostgresVerifyConfig: async (path) => {
+      calls.push(["verify_load", path]);
+      return { fake: "verify-config" };
+    },
     runPostgresDatabaseBackup: async (config) => {
       calls.push(["run", config]);
       return { status: "passed", snapshotId: "s1" };
@@ -103,13 +114,14 @@ test("runDbBackup routes --engine postgres to the postgres adapter only, and --v
     },
   };
   const output = await runDbBackup(
-    ["--engine", "postgres", "--config", "/abs/pg.json", "--verify"],
+    ["--engine", "postgres", "--config", "/abs/pg.json", "--verify", "--verify-config", "/abs/verify.json"],
     { convexModule, postgresModule },
   );
   assert.deepEqual(calls, [
     ["load", "/abs/pg.json"],
     ["run", { fake: "pg-config" }],
-    ["verify", { fake: "pg-config" }, { status: "passed", snapshotId: "s1" }],
+    ["verify_load", "/abs/verify.json"],
+    ["verify", { fake: "verify-config" }, { status: "passed", snapshotId: "s1" }],
   ]);
   assert.deepEqual(output, {
     engine: "postgres",

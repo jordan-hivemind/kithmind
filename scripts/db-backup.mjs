@@ -30,12 +30,14 @@ const ENGINES = new Set(["convex", "postgres"]);
 export function parseDbBackupArgs(argv) {
   let engine;
   let config;
+  let verifyConfig;
   let verify = false;
   const rest = [];
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--engine") engine = argv[(i += 1)];
     else if (arg === "--config") config = argv[(i += 1)];
+    else if (arg === "--verify-config") verifyConfig = argv[(i += 1)];
     else if (arg === "--verify") verify = true;
     else rest.push(arg);
   }
@@ -45,7 +47,10 @@ export function parseDbBackupArgs(argv) {
   if (typeof config !== "string" || config.length === 0)
     fail("config_required");
   if (verify && engine !== "postgres") fail("verify_requires_postgres_engine");
-  return { engine, config, verify };
+  if (verify && (typeof verifyConfig !== "string" || verifyConfig.length === 0))
+    fail("verify_config_required");
+  if (!verify && verifyConfig !== undefined) fail("verify_config_without_verify");
+  return { engine, config, verify, verifyConfig };
 }
 
 /**
@@ -54,7 +59,7 @@ export function parseDbBackupArgs(argv) {
  * pass it; the dynamic imports below are the real, unchanged modules.
  */
 export async function runDbBackup(argv, deps = {}) {
-  const { engine, config, verify } = parseDbBackupArgs(argv);
+  const { engine, config, verify, verifyConfig } = parseDbBackupArgs(argv);
   if (engine === "convex") {
     const convex =
       deps.convexModule ?? (await import("./run-database-backup.mjs"));
@@ -68,7 +73,10 @@ export async function runDbBackup(argv, deps = {}) {
   const loaded = await postgres.loadPostgresBackupConfig(config);
   const result = await postgres.runPostgresDatabaseBackup(loaded);
   if (!verify) return { engine, result };
-  const verification = await postgres.verifyPostgresBackup(loaded, result);
+  const verification = await postgres.verifyPostgresBackup(
+    await postgres.loadPostgresVerifyConfig(verifyConfig),
+    result,
+  );
   return { engine, result, verification };
 }
 
