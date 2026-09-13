@@ -35,6 +35,7 @@ export async function identityDatabase(t) {
   await client.query("SET search_path TO kith, public");
   return {
     client,
+    databaseUrl: database.url,
     ctx: (now) => identityCtx(client, now),
     /**
      * One unit of work, always rolled back.
