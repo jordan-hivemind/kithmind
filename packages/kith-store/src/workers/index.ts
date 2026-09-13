@@ -7,6 +7,7 @@ export * from "./auth.js";
 export * from "./cursor.js";
 export * from "./db.js";
 export * from "./digests.js";
+export * from "./discovery.js";
 export * from "./entries.js";
 export * from "./errors.js";
 export * from "./profile.js";

@@ -11,6 +11,7 @@ import {
   END_CURSOR,
   WorkerProtocolError,
   appendWorkerScanPage,
+  admitDiscoveryUtf8,
   beginWorkerScan,
   camelizeScan,
   consumeWorkerMutationRateLimit,
@@ -19,6 +20,7 @@ import {
   keysetTail,
   requireWorkerSourceAccount,
   reconcileWorkerScan,
+  reserveDiscoveryWork,
   resolveAndPersistEntry,
   sealWorkerScan,
   withWorkerTransaction,
@@ -575,6 +577,152 @@ test(
             `SELECT count::int AS count FROM kith.worker_protocol_rate_limits
               WHERE credential_id = $1 AND source_account_id = $2`,
             [f.credential.id, f.sourceAccountId],
+          )
+        ).rows[0].count,
+        1,
+      );
+    } finally {
+      await pool.end();
+    }
+  },
+);
+
+test(
+  "discovery reservations fence leases and admit inline text exactly once",
+  { skip },
+  async (t) => {
+    const f = await fixture(t);
+    const pool = createKithPool(f.databaseUrl, 2);
+    const call = (work, now = NOW) => withWorkerTransaction(pool, work, now);
+    const text = "synthetic worker text";
+    const contentHash = await sha256Hex(text);
+    try {
+      const begun = await call((ctx) =>
+        beginWorkerScan(ctx, f.principal, {
+          protocolVersion: 1,
+          operation: "scan.begin",
+          spaceId: f.spaceId,
+          sourceAccountId: f.sourceAccountId,
+          requestId: "discovery-begin",
+          watcherId: "watcher-1",
+          connectorVersion: "fs-v1",
+          mode: "normal",
+          expectedInventoryEpoch: 0,
+        }),
+      );
+      await call((ctx) =>
+        appendWorkerScanPage(ctx, f.principal, {
+          protocolVersion: 1,
+          operation: "scan.appendPage",
+          spaceId: f.spaceId,
+          sourceAccountId: f.sourceAccountId,
+          scanId: begun.scanId,
+          requestId: "discovery-page",
+          ordinal: 0,
+          entries: [
+            readyEntry({
+              content: {
+                status: "ready",
+                sha256: contentHash,
+                byteLength: Buffer.byteLength(text, "utf8"),
+              },
+            }),
+          ],
+        }),
+      );
+      await call((ctx) =>
+        sealWorkerScan(ctx, f.principal, {
+          protocolVersion: 1,
+          operation: "scan.seal",
+          spaceId: f.spaceId,
+          sourceAccountId: f.sourceAccountId,
+          scanId: begun.scanId,
+          requestId: "discovery-seal",
+          expectedPageCount: 1,
+          health: { status: "healthy" },
+        }),
+      );
+      await call((ctx) =>
+        reconcileWorkerScan(ctx, f.principal, {
+          protocolVersion: 1,
+          operation: "scan.reconcile",
+          spaceId: f.spaceId,
+          sourceAccountId: f.sourceAccountId,
+          scanId: begun.scanId,
+          requestId: "discovery-reconcile",
+          expectedInventoryEpoch: 1,
+          ordinal: 0,
+          maxItems: 10,
+        }),
+      );
+
+      const reserveRequest = {
+        protocolVersion: 1,
+        operation: "discovery.reserve",
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        requestId: "discovery-reserve",
+        maxItems: 1,
+      };
+      const token = "1".repeat(64);
+      const reserved = await call((ctx) =>
+        reserveDiscoveryWork(ctx, f.principal, reserveRequest, [token]),
+      );
+      assert.equal(reserved.reused, false);
+      assert.equal(reserved.targets.length, 1);
+      assert.equal(reserved.targets[0].leaseEpoch, 1);
+      assert.equal(reserved.targets[0].leaseToken, token);
+      assert.deepEqual(
+        await call((ctx) =>
+          reserveDiscoveryWork(ctx, f.principal, reserveRequest, [token]),
+        ),
+        { ...reserved, reused: true },
+      );
+      await assert.rejects(
+        call((ctx) =>
+          admitDiscoveryUtf8(ctx, f.principal, {
+            protocolVersion: 1,
+            operation: "discovery.admitUtf8",
+            spaceId: f.spaceId,
+            sourceAccountId: f.sourceAccountId,
+            requestId: "discovery-admit-wrong",
+            workId: reserved.targets[0].workId,
+            leaseEpoch: 1,
+            leaseToken: "2".repeat(64),
+            text,
+          }),
+        ),
+        expectProtocolCode("lease_conflict"),
+      );
+      const admitRequest = {
+        protocolVersion: 1,
+        operation: "discovery.admitUtf8",
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        requestId: "discovery-admit",
+        workId: reserved.targets[0].workId,
+        leaseEpoch: 1,
+        leaseToken: token,
+        text,
+      };
+      const admitted = await call((ctx) =>
+        admitDiscoveryUtf8(ctx, f.principal, admitRequest),
+      );
+      assert.equal(admitted.state, "admitted");
+      assert.equal(admitted.reused, false);
+      assert.equal(
+        (
+          await call((ctx) =>
+            admitDiscoveryUtf8(ctx, f.principal, admitRequest),
+          )
+        ).reused,
+        true,
+      );
+      assert.equal(
+        (
+          await f.client.query(
+            "SELECT count(*)::int AS count FROM kith.ingest_jobs WHERE id = $1",
+            [admitted.ingestJobId],
           )
         ).rows[0].count,
         1,
