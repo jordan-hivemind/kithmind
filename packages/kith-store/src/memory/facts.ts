@@ -572,7 +572,7 @@ function assertBoundedHistoryHydration(facts: readonly StoredFact[]): void {
 }
 
 function compareNewestFirst(left: { createdAt: number; id: string }, right: { createdAt: number; id: string }) {
-  return right.createdAt - left.createdAt || left.id.localeCompare(right.id);
+  return right.createdAt - left.createdAt || right.id.localeCompare(left.id);
 }
 
 export type ListFactsOptions = {
