@@ -676,10 +676,11 @@ tied to one account).
 rule 3 made concrete: reconciliation is a gate, not a report. For every
 account with two or more `balances` snapshots, it treats each consecutive
 pair of snapshots as one statement period, sums that account's transactions
-over the period (inclusive of both boundary dates), and compares the sum
-against the snapshots' stated cash change. It writes one `reconciliations`
-row per period and returns the same information as counts and period-level
-facts, never a transaction row.
+over a half-open window (exclusive of period_start, inclusive of period_end), and
+compares the sum against the snapshots' stated cash change. Each transaction
+is placed by its cash-effective date, the later of process date and settle date.
+It writes one `reconciliations` row per period and returns the same information
+as counts and period-level facts, never a transaction row.
 
 ### Incremental scope, and what a gate pass costs (F1-59)
 
