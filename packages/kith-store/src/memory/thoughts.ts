@@ -186,8 +186,8 @@ export async function listBySpaces(
   const activeAt = new Date(ctx.now);
   const scanLimit = filters?.topic ? MAX_FILTER_SCAN + 1 : limit;
 
-  const bySpace = await Promise.all(
-    spaceIds.map(async (spaceId) => {
+  const bySpace = [];
+  for (const spaceId of spaceIds) {
       const values: unknown[] = [spaceId];
       let where = "space_id = $1";
       if (filters?.type) {
@@ -207,11 +207,12 @@ export async function listBySpaces(
       if (candidates.length > MAX_FILTER_SCAN) {
         throw new Error("Thought topic filter exceeds the bounded scan");
       }
-      return filters?.topic
+    bySpace.push(
+      filters?.topic
         ? candidates.filter((thought) => thought.metadata.topics.includes(filters.topic!))
-        : candidates;
-    }),
-  );
+        : candidates,
+    );
+  }
   return bySpace.flat().sort(compareNewestFirst).slice(0, limit);
 }
 
@@ -227,9 +228,10 @@ export async function listCoreBySpaces(
   }
   const limit = Math.min(rawLimit, MAX_CORE_MEMORY_LIMIT);
   const activeAt = new Date(ctx.now);
-  const bySpace = await Promise.all(
-    spaceIds.map((spaceId) =>
-      rows<ThoughtRow>(
+  const bySpace = [];
+  for (const spaceId of spaceIds) {
+    bySpace.push(
+      (await rows<ThoughtRow>(
         ctx,
         `SELECT ${THOUGHT_COLUMNS} FROM kith.thoughts
           WHERE space_id = $1 AND is_core IS TRUE
@@ -238,9 +240,9 @@ export async function listCoreBySpaces(
             AND (valid_to IS NULL OR $2 < valid_to)
           ORDER BY created_at DESC, id DESC LIMIT $3`,
         [spaceId, activeAt, limit],
-      ).then((records) => records.map(toThought)),
-    ),
-  );
+      )).map(toThought),
+    );
+  }
   return bySpace.flat().sort(compareNewestFirst).slice(0, limit);
 }
 
@@ -321,7 +323,8 @@ export async function transitionMemory(
     throw new Error("Invalid memory transition metadata");
   }
 
-  const previousMemories = await Promise.all(uniquePreviousIds.map((id) => getThoughtById(ctx, id)));
+  const previousMemories = [];
+  for (const id of uniquePreviousIds) previousMemories.push(await getThoughtById(ctx, id));
   for (const previous of previousMemories) {
     if (!previous || previous.spaceId !== spaceId || !isCurrentMemory(previous.memoryStatus)) {
       throw new Error("Previous memory is unavailable");

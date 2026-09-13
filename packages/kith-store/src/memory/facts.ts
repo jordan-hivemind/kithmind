@@ -506,11 +506,10 @@ export async function hydrateFact(
   const historyIds = [...(fact.supersededBy ? [fact.supersededBy] : []), ...fact.supersedes];
   if (historyIds.length > MAX_FACT_HISTORY_LINKS_PER_FACT) return null;
 
-  const [subject, objectEntity, history] = await Promise.all([
-    getEntity(ctx, fact.subjectEntityId),
-    fact.value.type === "entity" ? getEntity(ctx, fact.value.entityId) : Promise.resolve(null),
-    Promise.all(historyIds.map((factId) => getStoredFact(ctx, factId))),
-  ]);
+  const subject = await getEntity(ctx, fact.subjectEntityId);
+  const objectEntity = fact.value.type === "entity" ? await getEntity(ctx, fact.value.entityId) : null;
+  const history = [];
+  for (const factId of historyIds) history.push(await getStoredFact(ctx, factId));
   if (
     !subject ||
     subject.spaceId !== fact.spaceId ||
@@ -601,8 +600,8 @@ export async function listFacts(
   const uniqueSpaceIds = [...new Set(spaceIds)];
   assertBoundedFactRead(uniqueSpaceIds.length, limit);
 
-  const bySpace = await Promise.all(
-    uniqueSpaceIds.map(async (spaceId) => {
+  const bySpace = [];
+  for (const spaceId of uniqueSpaceIds) {
       let sql: string;
       const values: unknown[] = [spaceId];
       if (options.includeHistorical) {
@@ -628,16 +627,16 @@ export async function listFacts(
       }
       values.push(limit);
       if (!options.includeHistorical) values.push(activeAt);
-      return (await rows<FactRow>(ctx, sql, values)).map(toStoredFact);
-    }),
-  );
+    bySpace.push((await rows<FactRow>(ctx, sql, values)).map(toStoredFact));
+  }
   const selected = bySpace
     .flat()
     .sort(compareNewestFirst)
     .slice(0, limit);
   assertBoundedHistoryHydration(selected);
   const authorized = new Set(uniqueSpaceIds);
-  const hydrated = await Promise.all(selected.map((fact) => hydrateFact(ctx, fact, authorized)));
+  const hydrated = [];
+  for (const fact of selected) hydrated.push(await hydrateFact(ctx, fact, authorized));
   return hydrated.filter((fact): fact is HydratedFact => fact !== null);
 }
 
@@ -685,6 +684,7 @@ export async function getFactsByIds(
     .filter((fact): fact is StoredFact => fact !== undefined)
     .filter((fact) => isFactRetrievable(fact, options.includeHistorical, activeAt));
   assertBoundedHistoryHydration(ordered);
-  const hydrated = await Promise.all(ordered.map((fact) => hydrateFact(ctx, fact, authorized)));
+  const hydrated = [];
+  for (const fact of ordered) hydrated.push(await hydrateFact(ctx, fact, authorized));
   return hydrated.filter((fact): fact is HydratedFact => fact !== null);
 }

@@ -35,6 +35,7 @@
 -- ---------------------------------------------------------------------------
 
 ALTER TABLE kith.entities
+  ALTER COLUMN created_at SET DEFAULT transaction_timestamp(),
   ALTER COLUMN user_id SET NOT NULL,
   ALTER COLUMN key SET NOT NULL,
   ALTER COLUMN kind SET NOT NULL,

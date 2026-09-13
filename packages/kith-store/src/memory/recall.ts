@@ -151,16 +151,17 @@ export async function recallContext(
   const limit = boundedRecallLimit(options.limit);
   const coreLimit = coreLimitFor(limit);
 
-  const [coreFacts, coreThoughts, relevantFacts, relevantThoughts] = await Promise.all([
-    listFacts(ctx, spaceIds, { limit: coreLimit, coreOnly: true }),
-    listCoreBySpaces(ctx, spaceIds, coreLimit),
-    getFactsByIds(ctx, spaceIds, candidates.factIds, {
-      includeHistorical: options.includeHistorical,
-    }),
-    getThoughtsByIds(ctx, spaceIds, candidates.thoughtIds, {
-      includeHistorical: options.includeHistorical,
-    }),
-  ]);
+  // `IdentityCtx` holds one checked-out pg client. Parallel calls only queue
+  // queries on that connection and pg 9 rejects concurrent `query()` calls,
+  // so keep the read sequence explicit.
+  const coreFacts = await listFacts(ctx, spaceIds, { limit: coreLimit, coreOnly: true });
+  const coreThoughts = await listCoreBySpaces(ctx, spaceIds, coreLimit);
+  const relevantFacts = await getFactsByIds(ctx, spaceIds, candidates.factIds, {
+    includeHistorical: options.includeHistorical,
+  });
+  const relevantThoughts = await getThoughtsByIds(ctx, spaceIds, candidates.thoughtIds, {
+    includeHistorical: options.includeHistorical,
+  });
 
   return blendRecallContext({
     coreFacts,
