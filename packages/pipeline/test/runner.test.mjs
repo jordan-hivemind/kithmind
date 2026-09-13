@@ -1388,6 +1388,39 @@ test("assessmentPacingMs paces consecutive assess_page mutations", async () => {
   }
 });
 
+test("a config that omits assessmentPacingMs still paces consecutive assess_page mutations by default (P2-80k)", async () => {
+  const setup = await fixture(0);
+  const checkpoint = assessPageCheckpoint();
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  const callTimes = [];
+  try {
+    assert.equal(setup.config.assessmentPacingMs, undefined);
+    const runner = new PipelineRunner(setup.config, journal, {
+      async call(request) {
+        if (request.operation === "source.status") {
+          return { operation: "source.status", sourceAccountId: "source" };
+        }
+        assert.equal(request.operation, "processing.assessPage");
+        callTimes.push(Date.now());
+        return assessPageResponse(
+          request.ordinal,
+          request.ordinal >= 1 ? "complete" : "running",
+        );
+      },
+    });
+    const result = await runner.run();
+    assert.equal(result.state, "complete");
+    assert.equal(callTimes.length, 2);
+    assert.ok(
+      callTimes[1] - callTimes[0] >= 190,
+      `expected the default assessment pacing (~200ms) to apply when the config omits assessmentPacingMs, got ${callTimes[1] - callTimes[0]}ms`,
+    );
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
 test("replays an exact lost stage response and finishes while the root is offline", async () => {
   const setup = await fixture();
   const cloud = new CompleteCloud({ failFirstStage: true });

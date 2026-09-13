@@ -24,6 +24,7 @@ import {
   CONSOLIDATED_ACCOUNT_ONE,
   CONSOLIDATED_ACCOUNT_TWO,
   CONSOLIDATED_LAYOUT_TEXT,
+  CONSOLIDATED_ROLLUP_LAYOUT_TEXT,
   COVER_TOTAL_LAYOUT_TEXT,
   CROSS_MONTH_LAYOUT_TEXT,
   EMPTY_ACCOUNT_LAYOUT_TEXT,
@@ -421,6 +422,28 @@ test("a consolidated statement attributes a liability to its own account, not th
   const [liability] = parsed.holdings.liabilities;
   assert.equal(liability.accountExternalKey, CONSOLIDATED_ACCOUNT_TWO);
   assert.equal(liability.balance, "1500");
+});
+
+// F1-8l: the household roll-up section is the one BALANCE SHEET on a
+// consolidated statement that belongs to no single account.
+test("a consolidated statement's roll-up BALANCE SHEET is recorded against no account at all", () => {
+  const parsed = parseStatementLines(CONSOLIDATED_ROLLUP_LAYOUT_TEXT, kind);
+  assert.equal(parsed.holdings.balances.length, 2);
+  assert.deepEqual(
+    parsed.holdings.balances.map((balance) => balance.accountExternalKey),
+    [CONSOLIDATED_ACCOUNT_ONE, CONSOLIDATED_ACCOUNT_TWO],
+  );
+  // The roll-up's own figures appear nowhere: recording them with no account
+  // key is what let the importer attribute them to the pull's own account.
+  for (const balance of parsed.holdings.balances) {
+    assert.notEqual(balance.totalValue, "1815115.5");
+    assert.notEqual(balance.cash, "50318.25");
+    assert.notEqual(balance.accountExternalKey, undefined);
+  }
+  assert.equal(parsed.holdings.liabilities.length, 1);
+  assert.equal(parsed.holdings.liabilities[0].accountExternalKey, CONSOLIDATED_ACCOUNT_TWO);
+  assert.match(parsed.parseNote, /^partially parsed: 1 BALANCE SHEET section\(s\) printed /);
+  assert.match(parsed.parseNote, /Consolidated Summary/);
 });
 
 test("a single-account statement still omits accountExternalKey: this pull's own account, unchanged", () => {

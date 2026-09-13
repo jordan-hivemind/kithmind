@@ -634,3 +634,31 @@ export const CONSOLIDATED_LAYOUT_TEXT = [
     ...bondBlockLines(),
   ].join("\n"),
 ].join("\n\f\n");
+
+/**
+ * F1-8l. The page a consolidated statement prints *before* its first account
+ * header: a `Consolidated Summary` BALANCE SHEET whose figures are the
+ * household roll-up across every account in the PDF. It carries no account
+ * number of its own, so `accountKeysByLine` attributes it to no account, and
+ * `parseRealStatement` refuses it rather than letting the importer fall back
+ * on whichever account the pull named. Every name and amount is invented; the
+ * roll-up totals are the two per-account sections' figures added up, which is
+ * what makes a roll-up recorded as one account's balance look like the
+ * household's own total sitting on one account.
+ */
+export const CONSOLIDATED_ROLLUP_LAYOUT_TEXT = [
+  [
+    "        Page 1 of 3",
+    "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+    "        TOTAL FOR ALL ACCOUNTS",
+    "        Rowan Household Accounts",
+    "        Consolidated Summary",
+    ...balanceSheetLines({
+      totalValueLast: "$1,750,400.00",
+      totalValueThis: "$1,815,115.50",
+      cashThis: "$50,318.25",
+      liabilityThis: "$1,500.00",
+    }),
+  ].join("\n"),
+  ...CONSOLIDATED_LAYOUT_TEXT.split("\n\f\n"),
+].join("\n\f\n");

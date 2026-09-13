@@ -3,6 +3,10 @@ export const MAX_PARSED_REQUEST_BYTES = 128 * 1024;
 export const MAX_PARSED_PAGE_BATCH = 8;
 export const MAX_PARSED_ROW_BATCH = 25;
 
+/** One fixed-window source mutation policy consumed by both storage engines. */
+export const WORKER_MUTATION_RATE_LIMIT = 8_000;
+export const WORKER_MUTATION_RATE_WINDOW_MS = 60_000;
+
 export type ParsedBox = [number, number, number, number];
 
 export type ParserItemLocator = {
