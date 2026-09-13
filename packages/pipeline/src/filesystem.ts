@@ -3,6 +3,11 @@ import { constants, type Stats } from "node:fs";
 import { lstat, open, opendir, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 
+import {
+  readWorkbook,
+  SpreadsheetError,
+  XLSX_MEDIA_TYPE,
+} from "./spreadsheet.js";
 import type {
   DiscoveryFile,
   DiscoveryGap,
@@ -1100,6 +1105,74 @@ export async function readPdfFile(
   return pdfDiscoveryFile(result);
 }
 
+const ZIP_LOCAL_HEADER = Buffer.from([0x50, 0x4b, 0x03, 0x04]);
+const OLE_HEADER = Buffer.from([0xd0, 0xcf, 0x11, 0xe0]);
+
+function isZipContainer(bytes: Buffer): boolean {
+  return bytes.subarray(0, 4).equals(ZIP_LOCAL_HEADER);
+}
+
+/**
+ * An encrypted `.xlsx` is an OLE compound file, which by magic bytes alone is
+ * indistinguishable from a `.xls` or a `.doc`. Calling every OLE file an
+ * encrypted workbook would mislabel those, so the extension is the tiebreak
+ * here and nowhere else: an OLE container whose name says `.xlsx` is an
+ * encrypted workbook, and any other OLE container stays `unsupported`.
+ */
+function looksLikeEncryptedWorkbook(file: SafeFileBytes): boolean {
+  return (
+    file.bytes.subarray(0, 4).equals(OLE_HEADER) &&
+    file.relativePath.toLowerCase().endsWith(".xlsx")
+  );
+}
+
+/**
+ * P2-70i3: a ZIP container is offered to the workbook reader, and is a
+ * `spreadsheet_v1` observation only when the reader accepts it. Everything the
+ * reader refuses becomes the gap its refusal names, so a `.docx` (a ZIP with
+ * no `xl/workbook.xml`) stays `unsupported` exactly as it is today, and a
+ * workbook past a declared bound is `oversized` rather than admitted bytes
+ * that could never seal.
+ *
+ * The reader runs on every ZIP found, which is the cost of classifying by
+ * magic bytes rather than by extension. It is bounded by the class's own
+ * limits: nothing above 8 MiB is decoded and no part above 8 MiB is inflated.
+ */
+function workbookObservation(file: SafeFileBytes): SourceObservation {
+  const {
+    kind: _kind,
+    bytes: _bytes,
+    linkCount: _linkCount,
+    ...descriptor
+  } = file;
+  try {
+    if (file.linkCount !== 1) {
+      throw new FilesystemFailure("unstable", "workbook has multiple links");
+    }
+    readWorkbook(file.bytes);
+  } catch (error) {
+    if (error instanceof SpreadsheetError) {
+      return {
+        kind: "gap",
+        gap: {
+          ...descriptor,
+          code:
+            error.code === "oversized"
+              ? "oversized"
+              : error.code === "encrypted"
+                ? "encrypted"
+                : "unsupported",
+        },
+      };
+    }
+    throw error;
+  }
+  return {
+    kind: "pdf",
+    file: { ...descriptor, mediaType: XLSX_MEDIA_TYPE },
+  };
+}
+
 async function readSourceObservation(
   root: SafeRoot,
   relativePath: string,
@@ -1130,6 +1203,9 @@ async function readSourceObservation(
       } = file;
       return { kind: "gap", gap: { ...descriptor, code: "encrypted" } };
     }
+  }
+  if (isZipContainer(file.bytes) || looksLikeEncryptedWorkbook(file)) {
+    return workbookObservation(file);
   }
   try {
     return { kind: "utf8", file: utf8DiscoveryFile(file, maxTextBytes) };

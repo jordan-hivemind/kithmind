@@ -1,3 +1,5 @@
+import type { BinaryMediaType } from "@repo/worker-protocol";
+
 export type GapCode =
   | "empty"
   | "enumeration_interrupted"
@@ -116,9 +118,15 @@ export type DiscoveryFile = {
 };
 
 /** A binary source observation is only a local descriptor. It carries no proof
- * that the configured parser profile has been prepared or is safe to use. */
+ * that the configured parser profile has been prepared or is safe to use.
+ *
+ * P2-70i3: the descriptor covers every class in `BINARY_CLASSES`, not only
+ * PDF. `mediaType` is the class: media types are one to one with classes, so
+ * no second field can disagree with it. The observation kind stays `pdf`
+ * because it is the binary lane's tag in a durable resume recipe, and renaming
+ * it would reject recipes that are already written. */
 export type PdfDiscoveryFile = Omit<DiscoveryFile, "text"> & {
-  mediaType: "application/pdf";
+  mediaType: BinaryMediaType;
   // P2-77: set when the file's only encryption is a permissions
   // restriction whose empty user password validated against the standard
   // security handler (owner decision 2026-09-12: admit these rather than

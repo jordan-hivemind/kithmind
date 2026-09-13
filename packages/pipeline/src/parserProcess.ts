@@ -17,7 +17,26 @@ import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { spawn, type ChildProcess } from "node:child_process";
 
+import {
+  BINARY_CLASSES,
+  SHEET_PAGE_RENDERING_VERSION,
+  SPREADSHEET_V1_BOUNDS,
+  type BinaryParserOutputMediaType,
+  type BinaryParserProfileId,
+} from "@repo/worker-protocol";
+
 import { inspectCapturedPdf, type CapturedPdf } from "./captureStore.js";
+import {
+  readWorkbook,
+  SpreadsheetError,
+  SPREADSHEET_EXTRACTION_CONFIGURATION_FINGERPRINT,
+  SPREADSHEET_PARSER_FINGERPRINT,
+  SPREADSHEET_READER_MANIFEST_SHA256,
+  SPREADSHEET_READER_VERSION,
+  XLSX_MEDIA_TYPE,
+  type SpreadsheetErrorCode,
+  type Workbook,
+} from "./spreadsheet.js";
 import type { PdfDocQaConfig } from "./types.js";
 
 const execFileAsync = promisify(execFile);
@@ -80,7 +99,14 @@ export type ParserProcessFailureCode =
   | "page_limit_exceeded"
   | "retained_text_too_large"
   | "lossless_output_too_large"
-  | "bundle_too_large";
+  | "bundle_too_large"
+  // P2-70i3: the workbook lane's own refusals, named after what the reader
+  // found rather than folded into `conversion_failed`, because each one is a
+  // different answer for the document's inventory row.
+  | "workbook_invalid"
+  | "workbook_encrypted"
+  | "workbook_unsupported"
+  | "workbook_oversized";
 
 const LAUNCHER_FAILURE_CODES = [
   "execution_prerequisite_missing",
@@ -188,8 +214,15 @@ export type ParsedArtifactIdentity = {
   inode: number;
   sha256: string;
   byteLength: number;
-  mediaType: "application/vnd.docling+json" | "application/json";
+  /** The raw artifact carries its class's parser output type. */
+  mediaType: BinaryParserOutputMediaType | "application/json";
 };
+
+/** The raw artifact is always its class's parser output, never plain JSON. */
+export type RawParserArtifactIdentity = Omit<
+  ParsedArtifactIdentity,
+  "mediaType"
+> & { mediaType: BinaryParserOutputMediaType };
 
 export type ParserOutputIntent = {
   outputId: string;
@@ -248,7 +281,8 @@ export type ResolvedParserLocator = {
 };
 
 export type ValidatedNormalizedBundleResult = {
-  bundle: ValidatedNormalizedBundle;
+  bundle: ValidatedNormalizedBundle | ValidatedSheetgridBundle;
+  /** Empty for `spreadsheet_v1`: a sheet page needs no locator to resolve. */
   resolvedLocators: Record<string, ResolvedParserLocator>;
 };
 
@@ -257,7 +291,7 @@ export type DurableParserOutputArtifacts = {
   outputRoot: { device: number; inode: number };
   outputDirectory: { device: number; inode: number };
   sourceSha256: string;
-  rawArtifact: ParsedArtifactIdentity;
+  rawArtifact: RawParserArtifactIdentity;
   normalizedBundle: ParsedArtifactIdentity;
   parserFingerprint: string;
   extractionConfigurationFingerprint: string;
@@ -277,7 +311,7 @@ export type CapturedPdfParserResult = {
   state: "complete";
   outputId: string;
   sourceSha256: string;
-  rawArtifact: ParsedArtifactIdentity;
+  rawArtifact: RawParserArtifactIdentity;
   normalizedBundle: ParsedArtifactIdentity;
   parserFingerprint: string;
   extractionConfigurationFingerprint: string;
@@ -2604,15 +2638,31 @@ export async function reclaimStaleParserOutputDirectory(input: {
   return { state: "reclaimed" };
 }
 
-export async function inspectCapturedPdfParserOutput(input: {
+export type ParserOutputRecoveryInput = {
   capture: CapturedPdf;
   outputRoot: string;
   outputIntent: ParserOutputIntent;
   expectedParserFingerprint: string;
   expectedExtractionConfigurationFingerprint: string;
+  /**
+   * The PDF class's hashed model manifest. The workbook class has no model
+   * assets, so it passes `SPREADSHEET_READER_MANIFEST_SHA256`, the digest of
+   * the reader version that produced the bytes.
+   */
   expectedModelManifestSha256: string;
   limits?: ParserProcessLimits;
-}): Promise<RecoveredParserOutput> {
+};
+
+/**
+ * Reopens a durable artifact pair and revalidates it from the captured bytes
+ * up. Every class shares this: the trusted-directory checks, the capture
+ * identity recheck, the bounded reads and the artifact identities are the same
+ * work. Only the bundle validator and the raw artifact's media type belong to
+ * the class, which is what `profileId` selects.
+ */
+export async function inspectCapturedParserOutput(
+  input: ParserOutputRecoveryInput & { profileId: BinaryParserProfileId },
+): Promise<RecoveredParserOutput> {
   requiredPlatform();
   const limits = validateLimits(input.limits);
   if (
@@ -2654,6 +2704,7 @@ export async function inspectCapturedPdfParserOutput(input: {
       sourceModifiedAt: input.capture.sourceModifiedAt,
     },
     expectedDirectory: input.capture.captureDirectory,
+    mediaType: BINARY_CLASSES[input.profileId].mediaType,
   });
   if (
     capture.device !== input.capture.device ||
@@ -2671,13 +2722,21 @@ export async function inspectCapturedPdfParserOutput(input: {
   );
   const rawSha256 = digest(raw.bytes);
   const bundleSha256 = digest(bundle.bytes);
-  const validated = validateBundleAndRaw(
-    parseBoundedParserJson(raw.bytes, limits.maxRawBytes),
-    parseBoundedParserJson(bundle.bytes, limits.maxBundleBytes),
-    capture,
-    input.expectedModelManifestSha256,
-    rawSha256,
-  );
+  const validated =
+    input.profileId === "spreadsheet_v1"
+      ? validateSheetgridBundleAndRaw(
+          parseBoundedParserJson(raw.bytes, limits.maxRawBytes),
+          parseBoundedParserJson(bundle.bytes, limits.maxBundleBytes),
+          capture,
+          rawSha256,
+        )
+      : validateBundleAndRaw(
+          parseBoundedParserJson(raw.bytes, limits.maxRawBytes),
+          parseBoundedParserJson(bundle.bytes, limits.maxBundleBytes),
+          capture,
+          input.expectedModelManifestSha256,
+          rawSha256,
+        );
   if (
     validated.parserFingerprint !== input.expectedParserFingerprint ||
     validated.extractionConfigurationFingerprint !==
@@ -2697,7 +2756,7 @@ export async function inspectCapturedPdfParserOutput(input: {
       inode: raw.identity.inode,
       sha256: rawSha256,
       byteLength: raw.bytes.length,
-      mediaType: "application/vnd.docling+json",
+      mediaType: BINARY_CLASSES[input.profileId].parserOutputMediaType,
     },
     normalizedBundle: {
       path: bundlePath,
@@ -2723,6 +2782,35 @@ export async function inspectCapturedPdfParserOutput(input: {
       resolvedLocators: validated.resolvedLocators,
     },
   };
+}
+
+/** The docling lane's recovery. Unchanged in behaviour. */
+export async function inspectCapturedPdfParserOutput(
+  input: ParserOutputRecoveryInput,
+): Promise<RecoveredParserOutput> {
+  return await inspectCapturedParserOutput({
+    ...input,
+    profileId: "pdf_docqa_v1",
+  });
+}
+
+/** The workbook lane's recovery, over the same durable artifact pair. */
+export async function inspectCapturedWorkbookParserOutput(
+  input: Omit<
+    ParserOutputRecoveryInput,
+    | "expectedParserFingerprint"
+    | "expectedExtractionConfigurationFingerprint"
+    | "expectedModelManifestSha256"
+  >,
+): Promise<RecoveredParserOutput> {
+  return await inspectCapturedParserOutput({
+    ...input,
+    expectedParserFingerprint: SPREADSHEET_PARSER_FINGERPRINT,
+    expectedExtractionConfigurationFingerprint:
+      SPREADSHEET_EXTRACTION_CONFIGURATION_FINGERPRINT,
+    expectedModelManifestSha256: SPREADSHEET_READER_MANIFEST_SHA256,
+    profileId: "spreadsheet_v1",
+  });
 }
 
 export async function removeParserOutputExact(input: {
@@ -3615,7 +3703,7 @@ export async function runCapturedPdfParser(
         "launcher result does not match normalized output",
       );
     await recheckDirectory(outputDirectory, "parser output directory");
-    const rawArtifact: ParsedArtifactIdentity = {
+    const rawArtifact: RawParserArtifactIdentity = {
       path: rawPath,
       device: rawIdentity.device,
       inode: rawIdentity.inode,
@@ -3684,5 +3772,525 @@ export async function runCapturedPdfParser(
     await removeExact(rawPath, rawIdentity, outputDirectory);
     await removeExact(bundlePath, bundleIdentity, outputDirectory);
     safeRethrow(error, "conversion_failed", "parser conversion failed");
+  }
+}
+
+// --- the workbook lane: a sibling of the docling process -------------------
+
+/**
+ * P2-70i3. `spreadsheet_v1`'s "process" is the dependency-free reader in
+ * `spreadsheet.ts`, running in the worker's own process. It is a sibling of
+ * `runCapturedPdfParser`, not a mode of it: there is no Python runtime to
+ * verify, no model manifest to hash, and nothing to sandbox, because nothing
+ * outside this repository reads the bytes.
+ *
+ * Everything around the process is deliberately the same, because that is what
+ * makes a workbook an ordinary archived document: the same capture, the same
+ * durable `lossless.json` + `bundle.json` pair in the same trusted output
+ * directory, the same bounded reads, the same recovery path, and the same
+ * archive receipt pair over the raw artifact.
+ */
+export const SHEETGRID_CANDIDATE = "kithmind-sheetgrid";
+
+export type ValidatedSheetgridBundle = {
+  schemaVersion: 1;
+  candidate: typeof SHEETGRID_CANDIDATE;
+  sourceSha256: string;
+  renderingVersion: typeof SHEET_PAGE_RENDERING_VERSION;
+  parserFingerprint: string;
+  extractionFingerprint: Record<string, unknown>;
+  pages: Array<{
+    page: number;
+    sheetName: string;
+    text: string;
+    textHash: string;
+  }>;
+};
+
+const WORKBOOK_FAILURE_CODES: Record<
+  SpreadsheetErrorCode,
+  ParserProcessFailureCode
+> = {
+  not_a_workbook: "workbook_invalid",
+  encrypted: "workbook_encrypted",
+  unsupported: "workbook_unsupported",
+  oversized: "workbook_oversized",
+};
+
+function sheetTextHash(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+/** No lone surrogate: the same rule the parsed-page validator applies. */
+function wellFormedUtf16(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const unit = value.charCodeAt(index);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+      index += 1;
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) return false;
+  }
+  return true;
+}
+
+function boundExtractionFingerprint(
+  parserFingerprint: string,
+  rawSha256: string,
+  extractionConfigurationFingerprint: string,
+): string {
+  return createHash("sha256")
+    .update(Buffer.from("kith-parsed-extraction:v1\0", "utf8"))
+    .update(
+      canonicalJson([
+        parserFingerprint,
+        rawSha256,
+        extractionConfigurationFingerprint,
+      ]),
+    )
+    .digest("hex");
+}
+
+/**
+ * The `spreadsheet_v1` bundle validator: the class-specific half of
+ * `validateBundle`, checked against the immutable raw artifact exactly as the
+ * PDF class checks its normalized segments against docling's own output.
+ *
+ * What it proves is the rendering rule the server depends on when it resolves
+ * a `cell_v1` locator over sealed text: line 0 is the sheet name, every row
+ * has the sheet's column count, and the page text is the raw sheet's text
+ * character for character. A page that fails any of those never reaches a text
+ * version, so a stored locator can never point into a grid that was rendered
+ * under a different rule.
+ */
+function validateSheetgridBundle(
+  rawValue: unknown,
+  bundleValue: unknown,
+  capture: CapturedPdf,
+  rawSha256: string,
+): {
+  parserFingerprint: string;
+  tableStructure: ParserTableStructure;
+  tableStructureBypassPages: number[];
+  extractionConfigurationFingerprint: string;
+  extractionFingerprint: string;
+  pageCount: number;
+  bundle: ValidatedSheetgridBundle;
+} {
+  if (!rawValue || typeof rawValue !== "object" || Array.isArray(rawValue))
+    fail("output_invalid", "sheetgrid artifact is invalid");
+  const raw = rawValue as Record<string, unknown>;
+  if (
+    !exactKeys(raw, [
+      "schemaVersion",
+      "readerVersion",
+      "renderingVersion",
+      "sourceSha256",
+      "sheets",
+    ]) ||
+    raw.schemaVersion !== 1 ||
+    raw.readerVersion !== SPREADSHEET_READER_VERSION ||
+    raw.renderingVersion !== SHEET_PAGE_RENDERING_VERSION ||
+    raw.sourceSha256 !== capture.sha256 ||
+    !Array.isArray(raw.sheets)
+  )
+    fail("output_invalid", "sheetgrid artifact identity is invalid");
+
+  if (
+    !bundleValue ||
+    typeof bundleValue !== "object" ||
+    Array.isArray(bundleValue)
+  )
+    fail("output_invalid", "sheetgrid bundle is invalid");
+  const bundle = bundleValue as Record<string, unknown>;
+  if (
+    !exactKeys(bundle, [
+      "schemaVersion",
+      "candidate",
+      "sourceSha256",
+      "renderingVersion",
+      "parserFingerprint",
+      "extractionFingerprint",
+      "pages",
+    ]) ||
+    bundle.schemaVersion !== 1 ||
+    bundle.candidate !== SHEETGRID_CANDIDATE ||
+    bundle.sourceSha256 !== capture.sha256 ||
+    bundle.renderingVersion !== SHEET_PAGE_RENDERING_VERSION ||
+    bundle.parserFingerprint !== SPREADSHEET_PARSER_FINGERPRINT ||
+    !Array.isArray(bundle.pages)
+  )
+    fail("output_invalid", "sheetgrid bundle identity is invalid");
+
+  const extraction = bundle.extractionFingerprint;
+  if (
+    !extraction ||
+    typeof extraction !== "object" ||
+    Array.isArray(extraction)
+  )
+    fail("output_invalid", "extraction fingerprint is invalid");
+  const extractionRecord = extraction as Record<string, unknown>;
+  const expectedExtraction = boundExtractionFingerprint(
+    SPREADSHEET_PARSER_FINGERPRINT,
+    rawSha256,
+    SPREADSHEET_EXTRACTION_CONFIGURATION_FINGERPRINT,
+  );
+  if (
+    !exactKeys(extractionRecord, [
+      "schemaVersion",
+      "parserFingerprint",
+      "parserArtifactSha256",
+      "extractionConfigurationFingerprint",
+      "fingerprint",
+    ]) ||
+    extractionRecord.schemaVersion !== 2 ||
+    extractionRecord.parserFingerprint !== SPREADSHEET_PARSER_FINGERPRINT ||
+    extractionRecord.parserArtifactSha256 !== rawSha256 ||
+    extractionRecord.extractionConfigurationFingerprint !==
+      SPREADSHEET_EXTRACTION_CONFIGURATION_FINGERPRINT ||
+    extractionRecord.fingerprint !== expectedExtraction
+  )
+    fail(
+      "output_invalid",
+      "extraction fingerprint is not bound to the raw artifact",
+    );
+
+  if (
+    bundle.pages.length === 0 ||
+    bundle.pages.length > SPREADSHEET_V1_BOUNDS.maxSheets ||
+    bundle.pages.length !== raw.sheets.length
+  )
+    fail("output_invalid", "sheetgrid page count is invalid");
+
+  let renderedBytes = 0;
+  const pages: ValidatedSheetgridBundle["pages"] = [];
+  for (const [index, value] of bundle.pages.entries()) {
+    if (!value || typeof value !== "object" || Array.isArray(value))
+      fail("output_invalid", "sheetgrid page is invalid");
+    const page = value as Record<string, unknown>;
+    if (
+      !exactKeys(page, ["page", "sheetName", "text", "textHash"]) ||
+      page.page !== index + 1 ||
+      typeof page.sheetName !== "string" ||
+      typeof page.text !== "string" ||
+      page.text.length === 0 ||
+      page.text.normalize("NFC") !== page.text ||
+      !wellFormedUtf16(page.text) ||
+      page.textHash !== sheetTextHash(page.text)
+    )
+      fail("output_invalid", "sheetgrid page is invalid");
+    if (page.text.length > SPREADSHEET_V1_BOUNDS.maxSheetPageChars)
+      fail("workbook_oversized", "sheet page exceeds its character bound");
+    renderedBytes += Buffer.byteLength(page.text, "utf8");
+    if (renderedBytes > SPREADSHEET_V1_BOUNDS.maxRenderedBytes)
+      fail("workbook_oversized", "workbook exceeds its rendered text bound");
+
+    const sheetValue = raw.sheets[index];
+    if (
+      !sheetValue ||
+      typeof sheetValue !== "object" ||
+      Array.isArray(sheetValue)
+    )
+      fail("output_invalid", "sheetgrid sheet is invalid");
+    const sheet = sheetValue as Record<string, unknown>;
+    if (
+      !exactKeys(sheet, [
+        "ordinal",
+        "sheetName",
+        "rowCount",
+        "columnCount",
+        "headers",
+        "text",
+        "formulas",
+      ]) ||
+      sheet.ordinal !== index ||
+      sheet.sheetName !== page.sheetName ||
+      sheet.text !== page.text ||
+      !integer(sheet.rowCount, 0, SPREADSHEET_V1_BOUNDS.maxRowsPerSheet) ||
+      !integer(
+        sheet.columnCount,
+        0,
+        SPREADSHEET_V1_BOUNDS.maxColumnsPerSheet,
+      ) ||
+      !Array.isArray(sheet.headers) ||
+      !Array.isArray(sheet.formulas)
+    )
+      fail("output_invalid", "sheetgrid sheet does not match its page");
+
+    // The rendering rule, proved from the page text alone: the sheet names
+    // itself on line 0, and every row carries the sheet's column count, so a
+    // column index means the same thing on every row of the page.
+    const lines = page.text.split("\n");
+    if (lines[0] !== page.sheetName || lines.length !== sheet.rowCount + 1)
+      fail("output_invalid", "sheet page does not carry its own name");
+    for (const line of lines.slice(1)) {
+      if (line.split("\t").length !== sheet.columnCount)
+        fail("output_invalid", "sheet page row is not padded to its width");
+    }
+    pages.push({
+      page: index + 1,
+      sheetName: page.sheetName,
+      text: page.text,
+      textHash: page.textHash,
+    });
+  }
+
+  return {
+    parserFingerprint: SPREADSHEET_PARSER_FINGERPRINT,
+    // The workbook lane runs no table-structure model. It reports the mode the
+    // PDF lane spells "no table model ran", which is the truth here.
+    tableStructure: "off",
+    tableStructureBypassPages: [],
+    extractionConfigurationFingerprint:
+      SPREADSHEET_EXTRACTION_CONFIGURATION_FINGERPRINT,
+    extractionFingerprint: expectedExtraction,
+    pageCount: pages.length,
+    bundle: {
+      schemaVersion: 1,
+      candidate: SHEETGRID_CANDIDATE,
+      sourceSha256: capture.sha256,
+      renderingVersion: SHEET_PAGE_RENDERING_VERSION,
+      parserFingerprint: SPREADSHEET_PARSER_FINGERPRINT,
+      extractionFingerprint: extractionRecord,
+      pages,
+    },
+  };
+}
+
+function validateSheetgridBundleAndRaw(
+  rawValue: unknown,
+  bundleValue: unknown,
+  capture: CapturedPdf,
+  rawSha256: string,
+) {
+  return {
+    ...validateSheetgridBundle(rawValue, bundleValue, capture, rawSha256),
+    // A sheet page needs no locator: a cell resolves into the page by its own
+    // coordinates, which is what a `cell_v1` locator carries.
+    resolvedLocators: {} as Record<string, ResolvedParserLocator>,
+  };
+}
+
+/** Deterministic: the same workbook bytes always produce these same bytes. */
+function sheetgridArtifactBytes(
+  capture: CapturedPdf,
+  workbook: Workbook,
+): { raw: Buffer; bundle: Buffer } {
+  const raw = canonicalJson({
+    schemaVersion: 1,
+    readerVersion: SPREADSHEET_READER_VERSION,
+    renderingVersion: workbook.renderingVersion,
+    sourceSha256: capture.sha256,
+    sheets: workbook.pages.map((page) => ({
+      ordinal: page.ordinal,
+      sheetName: page.sheetName,
+      rowCount: page.rowCount,
+      columnCount: page.columnCount,
+      headers: page.headers,
+      text: page.text,
+      formulas: page.formulas,
+    })),
+  });
+  const rawSha256 = digest(raw);
+  const bundle = canonicalJson({
+    schemaVersion: 1,
+    candidate: SHEETGRID_CANDIDATE,
+    sourceSha256: capture.sha256,
+    renderingVersion: workbook.renderingVersion,
+    parserFingerprint: SPREADSHEET_PARSER_FINGERPRINT,
+    extractionFingerprint: {
+      schemaVersion: 2,
+      parserFingerprint: SPREADSHEET_PARSER_FINGERPRINT,
+      parserArtifactSha256: rawSha256,
+      extractionConfigurationFingerprint:
+        SPREADSHEET_EXTRACTION_CONFIGURATION_FINGERPRINT,
+      fingerprint: boundExtractionFingerprint(
+        SPREADSHEET_PARSER_FINGERPRINT,
+        rawSha256,
+        SPREADSHEET_EXTRACTION_CONFIGURATION_FINGERPRINT,
+      ),
+    },
+    pages: workbook.pages.map((page) => ({
+      page: page.ordinal + 1,
+      sheetName: page.sheetName,
+      text: page.text,
+      textHash: sheetTextHash(page.text),
+    })),
+  });
+  return { raw, bundle };
+}
+
+async function writeParserOutputFile(
+  path: string,
+  directory: DirectoryIdentity,
+  bytes: Buffer,
+): Promise<void> {
+  await recheckDirectory(directory, "parser output directory");
+  const handle = await open(
+    path,
+    constants.O_WRONLY |
+      constants.O_CREAT |
+      constants.O_EXCL |
+      constants.O_NOFOLLOW,
+    0o600,
+  ).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST")
+      fail("destination_exists", "parser destination already exists");
+    return safeRethrow(error, "unsafe_path", "parser output cannot be created");
+  });
+  try {
+    const created = await handle.stat();
+    if (
+      !created.isFile() ||
+      created.uid !== uid() ||
+      (created.mode & 0o077) !== 0 ||
+      created.nlink !== 1
+    )
+      fail("unsafe_path", "parser output is not protected");
+    let written = 0;
+    while (written < bytes.length) {
+      const result = await handle.write(
+        bytes,
+        written,
+        bytes.length - written,
+        written,
+      );
+      if (result.bytesWritten === 0)
+        fail("output_invalid", "parser output could not be written");
+      written += result.bytesWritten;
+    }
+    await handle.sync();
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+/**
+ * Parses a captured workbook into the same durable artifact pair the docling
+ * lane produces, then revalidates it through the shared recovery path, so the
+ * bytes this wrote and the bytes a resumed run reopens are proved by the same
+ * validator rather than by two implementations that could drift.
+ */
+export async function runCapturedWorkbookParser(input: {
+  capture: CapturedPdf;
+  outputDirectory: string;
+  outputId: string;
+  limits?: ParserProcessLimits;
+}): Promise<RecoveredParserOutput> {
+  requiredPlatform();
+  const limits = validateLimits(input.limits);
+  if (!OPAQUE_ID.test(input.outputId))
+    fail("invalid_input", "parser identity input is invalid");
+  const outputDirectory = await trustedDirectory(
+    input.outputDirectory,
+    "parser output directory",
+    { private: true, rejectBroad: true },
+  );
+  const outputRoot = await trustedDirectory(
+    dirname(outputDirectory.path),
+    "parser output root",
+    { private: true, rejectBroad: true },
+  );
+  if (dirname(outputDirectory.path) !== outputRoot.path)
+    fail("unsafe_path", "parser output root is inconsistent");
+  if (basename(outputDirectory.path) !== input.outputId)
+    fail(
+      "unsafe_path",
+      "parser output directory is not dedicated to its output ID",
+    );
+  const outputEntries = await opendir(outputDirectory.path).catch(() =>
+    fail("unsafe_path", "parser output directory cannot be inspected"),
+  );
+  try {
+    if ((await outputEntries.read()) !== null)
+      fail("destination_exists", "parser output directory is not empty");
+  } finally {
+    await outputEntries.close().catch(() => undefined);
+  }
+  await recheckDirectory(outputDirectory, "parser output directory");
+  const capture = await inspectCapturedPdf({
+    captureDirectory: dirname(input.capture.path),
+    captureId: input.capture.captureId,
+    expected: {
+      sha256: input.capture.sha256,
+      byteLength: input.capture.byteLength,
+      sourceModifiedAt: input.capture.sourceModifiedAt,
+    },
+    expectedDirectory: input.capture.captureDirectory,
+    mediaType: XLSX_MEDIA_TYPE,
+  });
+  if (
+    capture.device !== input.capture.device ||
+    capture.inode !== input.capture.inode ||
+    capture.path !== input.capture.path
+  )
+    fail("unsafe_path", "captured workbook identity changed");
+  if (
+    contains(outputDirectory.path, capture.path) ||
+    contains(dirname(capture.path), outputDirectory.path)
+  )
+    fail("unsafe_path", "parser output and capture roots overlap");
+
+  const workbookFile = await boundedFile(
+    capture.path,
+    "captured workbook",
+    SPREADSHEET_V1_BOUNDS.maxWorkbookBytes,
+  );
+  if (digest(workbookFile.bytes) !== capture.sha256)
+    fail("input_digest_mismatch", "captured workbook bytes changed");
+  let workbook: Workbook;
+  try {
+    workbook = readWorkbook(workbookFile.bytes);
+  } catch (error) {
+    if (error instanceof SpreadsheetError)
+      fail(
+        WORKBOOK_FAILURE_CODES[error.code],
+        `workbook reader refused the capture: ${error.code}`,
+      );
+    throw error;
+  }
+  const bytes = sheetgridArtifactBytes(capture, workbook);
+  if (bytes.raw.length > limits.maxRawBytes)
+    fail("lossless_output_too_large", "sheetgrid artifact is too large");
+  if (bytes.bundle.length > limits.maxBundleBytes)
+    fail("bundle_too_large", "sheetgrid bundle is too large");
+
+  const rawPath = join(outputDirectory.path, "lossless.json");
+  const bundlePath = join(outputDirectory.path, "bundle.json");
+  try {
+    await writeParserOutputFile(rawPath, outputDirectory, bytes.raw);
+    await writeParserOutputFile(bundlePath, outputDirectory, bytes.bundle);
+    return await inspectCapturedWorkbookParserOutput({
+      capture,
+      outputRoot: outputRoot.path,
+      outputIntent: {
+        outputId: input.outputId,
+        outputRoot: { device: outputRoot.device, inode: outputRoot.inode },
+        outputDirectory: {
+          device: outputDirectory.device,
+          inode: outputDirectory.inode,
+        },
+      },
+      limits,
+    });
+  } catch (error) {
+    for (const path of [rawPath, bundlePath]) {
+      const entry = await lstat(path).catch(() => null);
+      if (entry?.isFile()) {
+        await removeExact(
+          path,
+          {
+            path,
+            device: entry.dev,
+            inode: entry.ino,
+            size: entry.size,
+            mtimeMs: entry.mtimeMs,
+            ctimeMs: entry.ctimeMs,
+          },
+          outputDirectory,
+        );
+      }
+    }
+    safeRethrow(error, "conversion_failed", "workbook conversion failed");
   }
 }

@@ -246,13 +246,13 @@ patched document failed `verifySealedParsedPayload`, the worker processing
 assessment counted it `unavailable`, and a re-stage of the same generation
 reported a conflicting immutable document.
 
-| Rule       | Statement                                                                                                                             |
-| ---------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| Where kept | `sourceItems.cardDocType`, beside `embedFullChunks` and for the same reason: a document row belongs to one generation, the card's kind does not. |
-| Read       | `effectiveDocType` returns the item's `cardDocType` for an active document and the parser's `documents.docType` otherwise.             |
+| Rule               | Statement                                                                                                                                                                          |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Where kept         | `sourceItems.cardDocType`, beside `embedFullChunks` and for the same reason: a document row belongs to one generation, the card's kind does not.                                   |
+| Read               | `effectiveDocType` returns the item's `cardDocType` for an active document and the parser's `documents.docType` otherwise.                                                         |
 | Reads that overlay | `get_document` and `search_documents`, including its `docType` filter, which compares the overlaid type. `list_sources` keeps reporting the connector's own `sourceItems.docType`. |
-| Historical | A historical document keeps the type its own generation parsed. The patch never reached those rows either.                             |
-| Sealed row | Card activation writes no `documents` row at all, so the document digest of every sealed payload keeps verifying.                      |
+| Historical         | A historical document keeps the type its own generation parsed. The patch never reached those rows either.                                                                         |
+| Sealed row         | Card activation writes no `documents` row at all, so the document digest of every sealed payload keeps verifying.                                                                  |
 
 Recovery for rows the patch already overwrote is
 `models/workers/migrations:restoreSealedDocTypes`, which restores
@@ -964,6 +964,51 @@ it is a ZIP, and the workbook reader refuses it as `not_a_workbook`.
 
 `.docx` stays `unsupported` and is untouched by P2-70i. A document reader is a
 separate task and shares nothing with this one but the ZIP container.
+
+#### What P2-70i3 landed: the workbook parse lane
+
+P2-70i3 landed the worker side the previous row named as missing, as a sibling
+of the docling lane rather than a mode of it. The PDF lane keeps its sandboxed
+process, its pinned Python runtime and its model manifest; nothing in it
+changed behaviour.
+
+| Step             | What the workbook lane does                                                                                                                                                                                              |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Scan             | A ZIP container is offered to the reader and is `spreadsheet_v1` only when the reader accepts it. Everything it refuses keeps the gap its refusal names.                                                                 |
+| Capture          | The same protected capture directory, named `<captureId>.xlsx`, with the workbook's own magic bytes verified while the bytes are copied.                                                                                 |
+| Parse            | The in-process reader, writing the same durable `lossless.json` + `bundle.json` pair into the same trusted output directory.                                                                                             |
+| Validate         | A class-specific bundle validator proves the rendering rule from the page text: line 0 is the sheet name, every row carries the sheet's column count, and the page text is the raw sheet's text character for character. |
+| Spool and stage  | The same spool, the same page-local chunk policy over sheet pages, one page per sheet, one primary `spreadsheet` document.                                                                                               |
+| Archive receipts | Unchanged: the encrypted primary plus independent-backup pair over the original workbook bytes and over the raw artifact.                                                                                                |
+
+Two identities have no model manifest to come from, so they come from the
+reader: `SPREADSHEET_PARSER_FINGERPRINT` is the digest of the reader's version
+constant, the rendering version and the class's bounds, and the parser output's
+`modelManifestSha256` slot carries the digest of that version constant. Bumping
+the reader version therefore makes every affected document a new processing
+generation instead of a silent reinterpretation of an old one.
+
+The bounds of P2-70i2 are enforced twice, and the first one is before any bytes
+are archived: discovery refuses a workbook past a bound as the `oversized`,
+`encrypted` or `unsupported` inventory gap, and a capture that stops matching
+what discovery observed fails the parse with `workbook_oversized`,
+`workbook_encrypted`, `workbook_unsupported` or `workbook_invalid`. All four are
+per-document failures, so one refused workbook is a `parse_failed` inventory row
+rather than a failed pass.
+
+Two deliberate compromises, both for journal compatibility. The binary lane's
+plan keeps `kind: "pdf"` and the checkpoint keeps `pdfIndex`: the class is
+`parserProfileId` beside them, and renaming either would make an interrupted
+journal unreadable for no behaviour gain. An encrypted workbook stays
+`unsupported` rather than `encrypted` unless its name ends in `.xlsx`, because
+an encrypted workbook is an OLE container that magic bytes alone cannot tell
+apart from a `.xls` or a `.doc`.
+
+What this does not include is the owner-side enablement: a source account is
+audited per class, so `spreadsheet_v1` has to be listed in its
+`binaryProfileIds` before a workbook is admitted, and a scan otherwise refuses
+the entry with `source_unavailable`. The end-to-end pass over the owner's four
+sample workbooks is that separate step.
 
 ### Migration commands
 

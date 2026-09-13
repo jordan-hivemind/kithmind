@@ -1,4 +1,9 @@
 import type {
+  BinaryMediaType,
+  BinaryParserOutputMediaType,
+} from "@repo/worker-protocol";
+
+import type {
   PreparedAgeObject,
   PublishedAgeObject,
   RecoveredResticBackup,
@@ -89,7 +94,8 @@ export type OriginalCatalogIdentity = {
     observationEpoch: number;
     sha256: string;
     byteLength: number;
-    mediaType: "application/pdf";
+    /** P2-70i3: the binary class of the original bytes. */
+    mediaType: BinaryMediaType;
   };
   copies:
     | { primary: ArchiveCopyIntent; independent_backup: ArchiveCopyIntent }
@@ -146,7 +152,7 @@ export type OriginalReuseIdentity = {
   sourceExternalId: string;
   sha256: string;
   byteLength: number;
-  mediaType: "application/pdf";
+  mediaType: BinaryMediaType;
 };
 
 export type ProcessingCatalogIdentity = {
@@ -191,7 +197,8 @@ export type DurableParserOutput = {
   outputDirectory: LocalDirectoryIdentity;
   sourceSha256: string;
   rawArtifact: LocalFileIdentity & {
-    mediaType: "application/vnd.docling+json";
+    /** The parser output media type of the class that produced it. */
+    mediaType: BinaryParserOutputMediaType;
   };
   normalizedBundle: LocalFileIdentity & { mediaType: "application/json" };
   parserFingerprint: string;
