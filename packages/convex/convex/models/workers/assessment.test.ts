@@ -1250,6 +1250,49 @@ describe("worker processing assessments", () => {
     });
   });
 
+  // P2-80f: a settled processing failure now leaves an `unchanged` entry that
+  // still points at its `failed` work row. It is not terminally ready, so the
+  // assessment must report it as needing review rather than failing closed and
+  // marking every later assessment stale.
+  test("reports a settled discovery failure behind an unchanged entry for review", async () => {
+    const f = await fixture();
+    const pending = await seedPendingCurrent(f);
+    await f.t.run(async (ctx) => {
+      const [entry, work] = await Promise.all([
+        ctx.db
+          .query("workerScanEntries")
+          .withIndex("by_scanId", (q) => q.eq("scanId", pending.scanId))
+          .unique(),
+        ctx.db
+          .query("workerDiscoveryWork")
+          .withIndex("by_sourceItemId", (q) =>
+            q.eq("sourceItemId", pending.itemId),
+          )
+          .unique(),
+      ]);
+      if (!entry || !work) throw new Error("missing chain");
+      await ctx.db.patch(entry._id, { state: "unchanged" });
+      await ctx.db.patch(work._id, {
+        state: "failed",
+        attempts: 8,
+        retryable: false,
+        failureCode: "page_limit_exceeded",
+        nextAttemptAt: undefined,
+      });
+      await ctx.db.patch(pending.scanId, { changedCount: 0 });
+    });
+    const { result } = await completeAssessment(
+      f,
+      pending.scanId,
+      f.principal,
+      "settled-failure-assessment",
+    );
+    expect(result).toMatchObject({
+      state: "incomplete",
+      counts: { items: { needsReview: 1, pending: 0, ready: 0 } },
+    });
+  });
+
   test("classifies a revoked unfinished actor for review while retaining ready publication", async () => {
     const pendingFixture = await fixture();
     const pending = await seedPendingCurrent(pendingFixture);

@@ -220,12 +220,13 @@ const REQUEUE_MAX_LIMIT = 500;
 
 // A transport defect (fixed in PR179/PR182) left some workerDiscoveryWork
 // rows stranded in "failed"/"needs_review": failArchivedDiscovery always
-// clears nextAttemptAt, so dueDiscoveryCandidates never re-offers them, and
-// the scan entryState rule (model.ts) re-derives "needs_review" forever once
-// priorWork is in either state, so no later scan admits a replacement. This
-// patches the row directly back to "queued" so the next scan's entryState
-// rule sees a non-failed priorWork and re-admits the item normally. It never
-// touches sourceItems, scans, or scan entries.
+// clears nextAttemptAt, so dueDiscoveryCandidates never re-offers them. Since
+// P2-80f the scan entryState rule (model.ts) re-queues a still-retryable
+// failure on its own and settles an exhausted one as "unchanged", so this op
+// is the operator route for re-attempting an exhausted or review-held row
+// rather than the only escape from a permanent loop. It patches the row
+// directly back to "queued" and never touches sourceItems, scans, or scan
+// entries.
 export async function requeueFailedDiscoveryWorkPage(
   ctx: MutationCtx,
   args: {
