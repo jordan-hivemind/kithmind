@@ -17,6 +17,7 @@ import {
 import {
   backfillManagedJobsPage,
   requeueFailedDiscoveryWorkPage,
+  restoreSealedDocTypesPage,
 } from "./migrations";
 
 async function legacyAdmission() {
@@ -555,5 +556,236 @@ describe("requeueFailedDiscoveryWork", () => {
         }),
       ),
     ).rejects.toThrow("Invalid requeue page bounds");
+  });
+});
+
+/**
+ * The pre-P2-80i state of one card document: the sealed document row carries
+ * the accepted `card_kind` the card lane patched onto it, and the card version
+ * still records the parser's own type.
+ */
+async function patchedDocTypeFixture() {
+  const t = convexTest(schema, modules);
+  const ids = await t.run(async (ctx) => {
+    const userId = await ctx.db.insert("users", { name: "Card owner" });
+    const spaceId = await ctx.db.insert("spaces", {
+      kind: "personal",
+      name: "Cards",
+      createdBy: userId,
+    });
+    await ctx.db.insert("spaceMembers", { spaceId, userId, role: "owner" });
+    const entityId = await ctx.db.insert("entities", {
+      userId,
+      spaceId,
+      key: "person:card-subject",
+      kind: "person",
+      canonicalName: "Synthetic Subject",
+      normalizedName: "synthetic subject",
+      aliases: [],
+      normalizedAliases: [],
+    });
+    const sourceAccountId = await ctx.db.insert("sourceAccounts", {
+      spaceId,
+      connector: "fs",
+      accountId: "cards",
+      name: "cards",
+      enabled: true,
+      cursorVersion: 0,
+      freshnessMs: 60_000,
+      createdBy: userId,
+      subjectEntityId: entityId,
+    });
+    const sourceItemId = await ctx.db.insert("sourceItems", {
+      spaceId,
+      sourceAccountId,
+      externalIdHash: "a".repeat(64),
+      docType: "pdf",
+      lifecycle: "available",
+      originalLinkAvailable: true,
+      desiredProcessingEpoch: 1,
+    });
+    const sourceRevisionId = await ctx.db.insert("sourceRevisions", {
+      spaceId,
+      sourceItemId,
+      contentHash: "b".repeat(64),
+      byteLength: 4,
+      mediaType: "text/plain",
+      inlineText: "text",
+      capturedAt: 1_700_000_000_000,
+      userId,
+    });
+    const sourceTextVersionId = await ctx.db.insert("sourceTextVersions", {
+      spaceId,
+      sourceRevisionId,
+      extractionFingerprint: "plain:v1",
+      text: "text",
+      textHash: "c".repeat(64),
+      byteLength: 4,
+      evidenceSealed: true,
+    });
+    const generation = {
+      spaceId,
+      sourceAccountId,
+      sourceItemId,
+      sourceRevisionId,
+      sourceTextVersionId,
+      extractionFingerprint: "plain:v1",
+      extractorFingerprint: "synthetic:v1",
+      recordSchemaFingerprint: "records:v1",
+      normalizationFingerprint: "exact:v1",
+      chunkerFingerprint: "none:v1",
+      correctionRevision: "one",
+      desiredProcessingEpoch: 1,
+      state: "ready" as const,
+      expectedPageCount: 0,
+      expectedEvidenceSpanCount: 0,
+      expectedDocumentCount: 1,
+      expectedChunkCount: 0,
+      expectedEventCount: 0,
+      expectedObservationCount: 0,
+      embeddingStatus: "unavailable" as const,
+      activatedAt: 100,
+    };
+    const textGenerationId = await ctx.db.insert("processingGenerations", {
+      ...generation,
+      processingFingerprint: "text:v1",
+    });
+    const cardGenerationId = await ctx.db.insert("processingGenerations", {
+      ...generation,
+      processingFingerprint: "card:v1",
+      cardGeneration: true,
+      expectedDocumentCount: 0,
+      expectedEventCount: 1,
+    });
+    // The defect: the sealed row carries the card kind, not the parser's type.
+    const documentId = await ctx.db.insert("documents", {
+      spaceId,
+      processingGenerationId: textGenerationId,
+      sourceItemId,
+      sourceRevisionId,
+      sourceTextVersionId,
+      documentKey: "main",
+      title: "Synthetic document",
+      docType: "contract",
+      capturedAt: 1_700_000_000_000,
+      evidenceSpanIds: [],
+      publicationState: "active",
+    });
+    const eventId = await ctx.db.insert("events", {
+      spaceId,
+      sourceAccountId,
+      sourceItemId,
+      eventKey: "card:document_card",
+      createdBy: userId,
+    });
+    const eventVersionId = await ctx.db.insert("eventVersions", {
+      spaceId,
+      sourceAccountId,
+      sourceItemId,
+      sourceRevisionId,
+      sourceTextVersionId,
+      processingGenerationId: cardGenerationId,
+      eventId,
+      entityId,
+      eventType: "document_card",
+      schemaVersion: 1,
+      occurrence: { precision: "unknown" },
+      fieldEvidence: { occurrence: [], entity: [], eventType: [] },
+      docTypePatch: [
+        {
+          documentId,
+          previousDocType: "pdf",
+          appliedDocType: "contract",
+        },
+      ],
+      userId,
+    });
+    await ctx.db.patch(sourceItemId, {
+      desiredRevisionId: sourceRevisionId,
+      activeRevisionId: sourceRevisionId,
+      activeGenerationId: textGenerationId,
+      activeCardGenerationId: cardGenerationId,
+    });
+    return { documentId, sourceItemId, eventVersionId };
+  });
+  return { t, ids };
+}
+
+describe("restoreSealedDocTypes", () => {
+  it("restores the sealed document type, moves the card kind to the item and is idempotent", async () => {
+    const { t, ids } = await patchedDocTypeFixture();
+    const dry = await t.run((ctx) =>
+      restoreSealedDocTypesPage(ctx, {
+        cursor: null,
+        maxItems: 25,
+        dryRun: true,
+      }),
+    );
+    expect(dry).toMatchObject({
+      dryRun: true,
+      patchedVersions: 1,
+      documentsRestored: 1,
+      itemsOverlaid: 1,
+      skippedNotInEffect: 0,
+      isDone: true,
+    });
+    await expect(
+      t.run(async (ctx) => (await ctx.db.get(ids.documentId))!.docType),
+    ).resolves.toBe("contract");
+
+    const applied = await t.run((ctx) =>
+      restoreSealedDocTypesPage(ctx, {
+        cursor: null,
+        maxItems: 25,
+        dryRun: false,
+      }),
+    );
+    expect(applied).toMatchObject({
+      dryRun: false,
+      patchedVersions: 1,
+      documentsRestored: 1,
+      itemsOverlaid: 1,
+      skippedNotInEffect: 0,
+      isDone: true,
+    });
+    const state = await t.run(async (ctx) => ({
+      document: (await ctx.db.get(ids.documentId))!,
+      item: (await ctx.db.get(ids.sourceItemId))!,
+    }));
+    // The parser's type is back on the row the payload manifest digested, and
+    // the card kind now reaches reads through the item overlay.
+    expect(state.document.docType).toBe("pdf");
+    expect(state.item.cardDocType).toBe("contract");
+
+    const again = await t.run((ctx) =>
+      restoreSealedDocTypesPage(ctx, {
+        cursor: null,
+        maxItems: 25,
+        dryRun: false,
+      }),
+    );
+    expect(again).toMatchObject({
+      patchedVersions: 1,
+      documentsRestored: 0,
+      itemsOverlaid: 0,
+      skippedNotInEffect: 1,
+      isDone: true,
+    });
+    await expect(
+      t.run(async (ctx) => (await ctx.db.get(ids.documentId))!.docType),
+    ).resolves.toBe("pdf");
+  });
+
+  it("rejects page bounds it cannot page with", async () => {
+    const { t } = await patchedDocTypeFixture();
+    await expect(
+      t.run((ctx) =>
+        restoreSealedDocTypesPage(ctx, {
+          cursor: null,
+          maxItems: 0,
+          dryRun: true,
+        }),
+      ),
+    ).rejects.toThrow("Invalid migration page bounds");
   });
 });

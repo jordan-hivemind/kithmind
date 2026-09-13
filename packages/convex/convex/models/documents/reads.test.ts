@@ -17,7 +17,11 @@ import {
   stageEmbeddingGeneration,
 } from "../embeddings/model";
 import { inspectGenerationPayload } from "../provenance/model";
-import { fuseDocumentCandidateRanks, searchDocuments } from "./model";
+import {
+  fuseDocumentCandidateRanks,
+  getDocument,
+  searchDocuments,
+} from "./model";
 import type { Id } from "../../_generated/dataModel";
 import schema from "../../legacySchema";
 import { modules } from "../../test.setup";
@@ -384,6 +388,55 @@ describe("document reads", () => {
       query: "needle",
     });
     expect(result.results).toEqual([]);
+  });
+
+  test("reads overlay the card's kind on the sealed document type", async () => {
+    const t = convexTest(schema, modules);
+    const seeded = await seedIdentity(t);
+    const carded = await seedDocument(t, {
+      spaceId: seeded.spaceId,
+      sourceAccountId: seeded.sourceAccountId,
+      userId: seeded.userId,
+      suffix: "carded",
+    });
+    // Section 4.2, P2-80i: card activation records the accepted `card_kind`
+    // here, on the item, because `documents.docType` is inside the sealed
+    // parsed payload's `documentDigest`. Reads overlay it so type filtering
+    // and the card cannot disagree.
+    await t.run((ctx) =>
+      ctx.db.patch(carded.itemId, { cardDocType: "contract" }),
+    );
+    await expect(
+      t.run((ctx) => getDocument(ctx, [seeded.spaceId], carded.documentId)),
+    ).resolves.toMatchObject({ docType: "contract" });
+    await expect(
+      t.run((ctx) =>
+        searchDocuments(ctx, [seeded.spaceId], {
+          query: "needle",
+          docType: "contract",
+        }),
+      ),
+    ).resolves.toMatchObject({
+      results: [
+        expect.objectContaining({
+          documentId: carded.documentId,
+          docType: "contract",
+        }),
+      ],
+    });
+    // The parser's own type is no longer what the filter matches, and the row
+    // the proof digests still carries it.
+    await expect(
+      t.run((ctx) =>
+        searchDocuments(ctx, [seeded.spaceId], {
+          query: "needle",
+          docType: "note",
+        }),
+      ),
+    ).resolves.toMatchObject({ results: [] });
+    await expect(
+      t.run(async (ctx) => (await ctx.db.get(carded.documentId))!.docType),
+    ).resolves.toBe("note");
   });
 
   test("requires explicit historical access and labels same-revision reprocessing stale", async () => {
