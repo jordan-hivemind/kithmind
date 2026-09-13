@@ -4851,13 +4851,21 @@ export class PipelineRunner {
       throw new PipelineWorkerError("journal_phase_conflict");
     }
     const { processing } = this.archivedRows(checkpoint);
-    await this.requireCatalog().recordParseFailure({
+    const recorded = await this.requireCatalog().recordParseFailure({
       catalogId: processing.processingCatalogId,
       expectedRevision: processing.rowRevision,
       code,
       now: Date.now(),
     });
-    await this.submitArchivedParseFailure(checkpoint, code);
+    // P2-80g: `pdfNeedsArchivedWork` will not offer this document again once
+    // its local attempts reach the bound, so the server is told the failure is
+    // terminal instead of letting its own larger attempt bound keep the row
+    // retryable for passes that will never happen.
+    await this.submitArchivedParseFailure(
+      checkpoint,
+      code,
+      (recorded.parseFailure?.attempts ?? 0) >= MAX_PARSE_ATTEMPTS,
+    );
     const nextPdf = await this.nextPdfWorkIndex(
       checkpoint.files,
       checkpoint.pdfIndex + 1,
@@ -4909,6 +4917,7 @@ export class PipelineRunner {
   private async submitArchivedParseFailure(
     checkpoint: ArchivedCheckpoint,
     code: string,
+    exhausted: boolean,
   ): Promise<void> {
     const identity = archivedIdentity(
       checkpoint,
@@ -4923,6 +4932,7 @@ export class PipelineRunner {
         requestId: randomUUID(),
         identity,
         failureCode: code,
+        ...(exhausted ? { exhausted: true } : {}),
       });
     } catch {
       // Swallowed: see the ponytail note above.

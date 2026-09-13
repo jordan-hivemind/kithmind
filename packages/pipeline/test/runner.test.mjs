@@ -17,7 +17,10 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { Journal, JournalLockedError } from "../dist/journal.js";
-import { openArchiveCatalog } from "../dist/archiveCatalog.js";
+import {
+  MAX_PARSE_ATTEMPTS,
+  openArchiveCatalog,
+} from "../dist/archiveCatalog.js";
 import { digestArchiveIntent } from "../dist/archivedRequestMapping.js";
 import {
   initialCheckpoint,
@@ -888,7 +891,7 @@ test("a document-level parser failure is recorded against that document and the 
       },
       async recordParseFailure(args) {
         recordedFailures.push(args);
-        return {};
+        return { parseFailure: { code: args.code, attempts: 1, failedAt: 1 } };
       },
     };
     let calls = 0;
@@ -937,6 +940,9 @@ test("a document-level parser failure is recorded against that document and the 
       submittedFailures[0].identity.processingEpoch,
       plans[1].processingEpoch,
     );
+    // The local budget is not spent yet (attempt 1 of MAX_PARSE_ATTEMPTS), so
+    // the report leaves the server free to keep the work retryable.
+    assert.equal(submittedFailures[0].exhausted, undefined);
   } finally {
     await journal.close();
     await rm(setup.base, { recursive: true, force: true });
@@ -994,6 +1000,89 @@ test("a lost discovery.failArchived report does not block the pass from continui
     };
     const result = await runner.run();
     assert.deepEqual(result, { state: "complete", scanned: 2, published: 1 });
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+// P2-80g: the server's attempt bound (8) is larger than the client's parse
+// budget (MAX_PARSE_ATTEMPTS, 2). The last local attempt says so, so the
+// server can settle the work row instead of keeping a deterministic
+// document-level failure retryable for passes that will never happen.
+test("the last local parse attempt is reported to the server as exhausted", async () => {
+  const setup = await fixture(0);
+  const plans = [0, 1].map((index) =>
+    pdfPlan({ relativePath: `document-${index}.pdf` }),
+  );
+  const checkpoint = archivedCheckpoint(plans[1], {
+    files: plans,
+    pdfIndex: 1,
+    step: "parse",
+    archivedPublished: 0,
+    preflightAction: undefined,
+  });
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  const submittedFailures = [];
+  try {
+    const runner = new PipelineRunner(setup.config, journal, {
+      async call(request) {
+        if (request.operation === "source.status") {
+          return { operation: "source.status", sourceAccountId: "source" };
+        }
+        if (request.operation === "discovery.failArchived") {
+          submittedFailures.push(request);
+          return {
+            operation: "discovery.failArchived",
+            sourceItemId: request.identity.sourceItemId,
+            workId: "work-1",
+            state: "failed",
+            retryable: false,
+            failureCode: request.failureCode,
+          };
+        }
+        throw new Error(`unexpected operation ${request.operation}`);
+      },
+    });
+    runner.archiveCatalog = {
+      listOriginals() {
+        return [
+          { originalCatalogId: checkpoint.originalCatalogId, rowRevision: 1 },
+        ];
+      },
+      listProcessings() {
+        return [
+          {
+            processingCatalogId: checkpoint.processingCatalogId,
+            originalCatalogId: checkpoint.originalCatalogId,
+            rowRevision: 1,
+          },
+        ];
+      },
+      async recordParseFailure(args) {
+        return {
+          parseFailure: {
+            code: args.code,
+            attempts: MAX_PARSE_ATTEMPTS,
+            failedAt: 1,
+          },
+        };
+      },
+    };
+    runner.driveCheckpoint = async () => {
+      if (journal.checkpoint.pdfIndex === 1) {
+        throw new ParserProcessError("page_limit_exceeded", "too many pages");
+      }
+      return { state: "complete", scanned: 2, published: 1 };
+    };
+    assert.deepEqual(await runner.run(), {
+      state: "complete",
+      scanned: 2,
+      published: 1,
+    });
+    assert.equal(submittedFailures.length, 1);
+    assert.equal(submittedFailures[0].failureCode, "page_limit_exceeded");
+    assert.equal(submittedFailures[0].exhausted, true);
   } finally {
     await journal.close();
     await rm(setup.base, { recursive: true, force: true });

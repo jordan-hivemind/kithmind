@@ -1964,6 +1964,11 @@ describe("archived discovery admission", () => {
       retryable: true,
     });
     expect(work?.leaseToken).toBeUndefined();
+    // P2-80g: a retryable row names the instant it is next eligible. Clearing
+    // it left a row that `validDiscoveryWorkRuntimeState` rejects, which made
+    // every later processing assessment stale (`detail_unavailable`), and hid
+    // the row from `dueDiscoveryCandidates`.
+    expect(work?.nextAttemptAt).toBe(100);
     // A failed-but-retryable row is exactly what discovery.reserveArchived
     // already accepts reclaiming, so a later scan's retry is not blocked.
     const reserve = parseWorkerRequest({
@@ -2021,6 +2026,55 @@ describe("archived discovery admission", () => {
           f.principal,
           reserve,
           "g".repeat(64),
+          101,
+        ),
+      ),
+    ).rejects.toThrow();
+  });
+
+  // P2-80g: the client's parse budget (MAX_PARSE_ATTEMPTS, 2) is smaller than
+  // the server's attempt bound (8). Without this the two caps disagreed: a
+  // document the client had already given up on stayed `retryable` for six
+  // more passes, each one re-queueing it, reporting the same deterministic
+  // failure, and bumping `attempts` by one.
+  test("an exhausted client report settles the work row on the first pass", async () => {
+    const f = await fixture();
+    await seedInventoryRow(f);
+    const request = parseWorkerRequest({
+      ...base(f),
+      operation: "discovery.failArchived",
+      requestId: "fail-exhausted",
+      identity: identity(f),
+      failureCode: "conversion_failed",
+      exhausted: true,
+    });
+    if (request.operation !== "discovery.failArchived") {
+      throw new Error("bad fail request");
+    }
+    const result = await f.t.run((ctx) =>
+      failArchivedDiscovery(ctx, f.principal, request, 100),
+    );
+    expect(result.retryable).toBe(false);
+    const work = await f.t.run((ctx) => ctx.db.get(f.workId));
+    expect(work).toMatchObject({ state: "failed", attempts: 1 });
+    expect(work?.retryable).toBe(false);
+    expect(work?.nextAttemptAt).toBeUndefined();
+    const reserve = parseWorkerRequest({
+      ...base(f),
+      operation: "discovery.reserveArchived",
+      requestId: "reserve-after-exhausted",
+      identity: identity(f),
+    });
+    if (reserve.operation !== "discovery.reserveArchived") {
+      throw new Error("bad reserve request");
+    }
+    await expect(
+      f.t.run((ctx) =>
+        reserveArchivedDiscovery(
+          ctx,
+          f.principal,
+          reserve,
+          "h".repeat(64),
           101,
         ),
       ),

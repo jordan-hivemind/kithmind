@@ -219,8 +219,9 @@ const REQUEUE_DEFAULT_LIMIT = 50;
 const REQUEUE_MAX_LIMIT = 500;
 
 // A transport defect (fixed in PR179/PR182) left some workerDiscoveryWork
-// rows stranded in "failed"/"needs_review": failArchivedDiscovery always
-// clears nextAttemptAt, so dueDiscoveryCandidates never re-offers them. Since
+// rows stranded in "failed"/"needs_review": failArchivedDiscovery used to
+// clear nextAttemptAt even on a retryable failure (fixed in P2-80g), so
+// dueDiscoveryCandidates never re-offered them. Since
 // P2-80f the scan entryState rule (model.ts) re-queues a still-retryable
 // failure on its own and settles an exhausted one as "unchanged", so this op
 // is the operator route for re-attempting an exhausted or review-held row

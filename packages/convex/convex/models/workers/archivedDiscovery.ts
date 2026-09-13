@@ -573,7 +573,15 @@ export async function failArchivedDiscovery(
   );
   await consumeWorkerMutationRateLimit(ctx, source, now);
   const attempts = safeAdd(current.work.attempts, 1);
-  const retryable = attempts < MAX_WORKER_DISCOVERY_ATTEMPTS;
+  // P2-80g: two caps used to disagree. The client stops parsing a document
+  // after its own `MAX_PARSE_ATTEMPTS` (2) and says so with `exhausted`, but
+  // the row stayed `retryable` until the server's `MAX_WORKER_DISCOVERY_ATTEMPTS`
+  // (8), so a deterministic document-level failure was re-queued for six more
+  // passes that nobody would ever act on. The client's budget is the authority
+  // on whether this document will be tried again, so an exhausted report is
+  // terminal regardless of the server count.
+  const retryable =
+    request.exhausted !== true && attempts < MAX_WORKER_DISCOVERY_ATTEMPTS;
   await ctx.db.patch(current.work._id, {
     state: "failed",
     attempts,
@@ -582,7 +590,12 @@ export async function failArchivedDiscovery(
     leaseToken: undefined,
     leaseOwnerCredentialId: undefined,
     leaseExpiresAt: undefined,
-    nextAttemptAt: undefined,
+    // A retryable row carries the instant it is next eligible, the same
+    // invariant `jobs.fail` keeps and the one `validDiscoveryWorkRuntimeState`
+    // (assessment.ts) enforces. Clearing it on a retryable failure made the
+    // row invalid, which failed the whole processing assessment closed as
+    // `detail_unavailable`, and hid the row from `dueDiscoveryCandidates`.
+    nextAttemptAt: retryable ? now : undefined,
   });
   await markInventoryParseFailed(ctx, {
     sourceItemId: current.item._id,
