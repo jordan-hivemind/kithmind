@@ -37,7 +37,10 @@ that, and what does.
 
 ## 1. Inventory of the Convex surface
 
-Counted from the code at `ac3bac0`, not estimated.
+Counted from the code at `ac3bac0`, not estimated. The counts predate P2-39l,
+which retired `lists`, `listItems`, `reports` and `insights` on the owner's
+answer to question 1. Subtract 4 tables, 7 secondary indexes, 42 exported
+functions, 11 MCP tools and 1 web page from this table for the current tree.
 
 | Surface                        | Count | Where                                                                                       |
 | ------------------------------ | ----: | ------------------------------------------------------------------------------------------- |
@@ -180,7 +183,7 @@ worker has no in-flight work to preserve.
 | `models/diagnostics`             |         3 | Heartbeat, incident and watcher-reset service.                                                               |
 | `models/sourceAccounts`          |         3 | Source account service.                                                                                      |
 | `models/provenance`              |         2 | Internal provenance reads, folded into the document service. Coverage tables have no functions of their own. |
-| `models/lists`, `models/reports` |        42 | Recommended retired, section 5.1.                                                                            |
+| `models/lists`, `models/reports` |        42 | Retired by P2-39l, section 5.1. Not present in the current tree.                                             |
 
 The 128 `internalMutation` functions are the largest group and the cheapest to
 port conceptually: each one is already a single atomic step with validated
@@ -625,7 +628,7 @@ Docker and is already wired into CI by the prototype's job.
 
 | Item                                                            | Size                                                                     | Recommendation                                                                                                                                                                                                                                                                                           |
 | --------------------------------------------------------------- | ------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `lists`, `listItems`, `reports`, `insights`                     | 4 tables, 7 indexes, 42 of 287 functions, 1,605 lines of source, 0 tests | Export to JSONL, retire the 11 MCP tools, delete. These are upstream features, user-scoped rather than space-scoped, and the architecture already says user-private lists and reports can stay private for now. Retiring them removes 15% of the function count for none of the value. Owner question 1. |
+| `lists`, `listItems`, `reports`, `insights`                     | 4 tables, 7 indexes, 42 of 287 functions, 1,605 lines of source, 0 tests | Done in P2-39l. Exported to JSONL, the 11 MCP tools removed, the tables and modules deleted. These were upstream features, user-scoped rather than space-scoped, and the architecture already says user-private lists and reports can stay private for now. Owner question 1, answered retire. |
 | `embeddingVectors` row contents                                 | 180 rows today                                                           | Do not migrate vectors. They are derived and content-addressed by `inputHash`. Re-embed after cutover. 180 targets is a few cents and it avoids a float64 to float32 conversion argument entirely.                                                                                                       |
 | `thoughts.embedding` legacy field                               | 17 rows                                                                  | Export to a cold JSONL audit file. Do not create a column for retained audit data that nothing queries.                                                                                                                                                                                                  |
 | Queue and scan state                                            | 6 tables                                                                 | Drain to empty before cutover. A quiesced worker has nothing in flight, and re-enumeration is cheap and idempotent.                                                                                                                                                                                      |
@@ -669,7 +672,7 @@ measurement. The line counts it is applied to are counted.
 | P2-39i    | Web and MCP surface. 12 route handlers, 28 tools, 10 pages, 14 files off Convex React hooks, server components plus a poll for the two live surfaces.                                                                                                                              | 1    |      30 | c to h     |
 | P2-39j    | Deferred work, sweeps and diagnostics. `kith.deferred_work`, the daemon command, the launchd job, read-time worker staleness, incidents and watcher resets, one daily durable incident record. 787 lines.                                                                          | 1    |      14 | e, f, g    |
 | P2-39k    | Backups and restore for both schemas, replacing the native Convex export in the dated-backup recipe. The tracker's P2-27.                                                                                                                                                          | 1    |      16 | b, d       |
-| P2-39l    | Retire `lists`, `listItems`, `reports`, `insights`. Export to JSONL, remove 11 MCP tools, delete 1,605 lines. Subject to owner question 1.                                                                                                                                         | 0    |       8 | none       |
+| P2-39l    | Retire `lists`, `listItems`, `reports`, `insights`. Export to JSONL, remove 11 MCP tools, delete 1,605 lines. Owner question 1 answered retire.                                                                                                                                    | 0    |       8 | none       |
 | P2-39m    | Parity run, independent security review, cutover, teardown and the cost line closed out.                                                                                                                                                                                           | 2    |      22 | all        |
 | **Total** |                                                                                                                                                                                                                                                                                    |      | **402** |            |
 
@@ -732,6 +735,8 @@ Only these five change the work materially.
 1. Retire `lists`, `listItems`, `reports` and `insights`, or port them? Retiring
    removes 42 of 287 functions, 11 MCP tools and 1,605 lines that have no tests.
    Porting costs about 10 agent hours and keeps the tools.
+   **Answered 2026-09-13: retire.** Implemented by P2-39l, which exports the four
+   tables to JSONL before dropping them.
 2. Which plan is each vendor on today, and is Vercel on Hobby or Pro? This
    decides whether section 7's saving is 0.00 USD or 25 USD per month, and
    whether cloud scheduling is available at all.
