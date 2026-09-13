@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import test from "node:test";
 
 import { digestParsedMappingManifest } from "@repo/worker-protocol";
+import { HttpWorkerTransport } from "../../pipeline/dist/transport.js";
 import { createKithPool, newKithId, provenance } from "../dist/index.js";
 import { listSources } from "../dist/documents/index.js";
 import {
@@ -14,7 +15,6 @@ import {
   END_CURSOR,
   WorkerProtocolError,
   activateProcessingJob,
-  activateParsedJob,
   acknowledgeArchiveDeletion,
   acknowledgeProviderOriginalDetach,
   admitArchivedDiscovery,
@@ -22,7 +22,6 @@ import {
   artifactBoundExtractionFingerprint,
   admitDiscoveryUtf8,
   beginWorkerScan,
-  beginParsedStage,
   beginProcessingAssessment,
   camelizeScan,
   consumeWorkerMutationRateLimit,
@@ -51,7 +50,6 @@ import {
   sealWorkerScan,
   stageProcessingUtf8,
   stageParsedBatch,
-  sealParsedStage,
   withWorkerTransaction,
   workerCtx,
 } from "../dist/workers/index.js";
@@ -62,6 +60,7 @@ import {
   makeUser,
   skip,
 } from "./helpers/identityFixture.mjs";
+import { listenWorker } from "./helpers/workerHttpServer.mjs";
 
 const NOW = Date.parse("2026-09-13T12:00:00Z");
 const HASH_A = "a".repeat(64);
@@ -1263,7 +1262,7 @@ test(
 );
 
 test(
-  "archived admission publishes one replayable archive chain behind its lease",
+  "provider-original archived admission publishes and assesses through HTTP",
   { skip },
   async (t) => {
     const f = await fixture(t);
@@ -1478,10 +1477,35 @@ test(
         },
         archives: [
           receipt("original_bytes", "primary", 1),
-          receipt("original_bytes", "independent_backup", 2),
           receipt("parser_output", "primary", 3),
           receipt("parser_output", "independent_backup", 4),
         ],
+        providerOriginal: {
+          referenceVersion: "provider_original_v1",
+          providerKind: "dropbox_v1",
+          clientReferenceId: "01890a5d-ac96-7cc4-bb7e-6f4f5ca5c149",
+          sourceContentHash: HASH_A,
+          sourceByteLength: 10,
+          providerAccountIdHash: "4".repeat(64),
+          providerRootDirectoryIdHash: "5".repeat(64),
+          providerFileIdHash: "6".repeat(64),
+          providerRevision: "rev-synthetic-provider",
+          providerContentHash: "7".repeat(64),
+          verifiedAt: NOW,
+          locatorBundle: {
+            bindingId: "01890a5d-ac96-7cc4-bb7e-6f4f5ca5c148",
+            manifestFingerprint: "8".repeat(64),
+            recipientFingerprint: "9".repeat(64),
+            repositoryKeyDomainFingerprint: "a".repeat(64),
+            repositoryId: "b".repeat(64),
+            snapshotId: "c".repeat(64),
+            objectName: "provider-locator.json.age",
+            ciphertextHash: "d".repeat(64),
+            ciphertextByteLength: 512,
+            readbackVerifiedAt: NOW,
+          },
+          createdAt: NOW,
+        },
         parsedText: {
           extractionFingerprint,
           textHash: parsedTextHash,
@@ -1664,6 +1688,12 @@ test(
       );
       const lease = replacement.targets[0];
       const parsedCall = (work) => call(work, parsedNow);
+      const parsedEndpoint = await listenWorker(t, pool, parsedNow);
+      const parsedTransport = new HttpWorkerTransport(
+        { endpoint: parsedEndpoint },
+        f.credential.rawKey,
+      );
+      const httpCall = (request) => parsedTransport.call(request);
       const leaseRequest = {
         ...common,
         jobId: lease.jobId,
@@ -1682,18 +1712,9 @@ test(
         expectedDocumentCount: 1,
         expectedChunkCount: 1,
       };
-      const stage = await parsedCall((ctx) =>
-        beginParsedStage(ctx, f.principal, beginRequest),
-      );
+      const stage = await httpCall(beginRequest);
       assert.equal(stage.phase, "pages");
-      assert.equal(
-        (
-          await parsedCall((ctx) =>
-            beginParsedStage(ctx, f.principal, beginRequest),
-          )
-        ).reused,
-        true,
-      );
+      assert.equal((await httpCall(beginRequest)).reused, true);
 
       await f.client.query(
         "UPDATE kith.ingest_jobs SET lease_expires_at = $1 WHERE id = $2",
@@ -1761,9 +1782,7 @@ test(
         ordinal: 0,
         rows: [page],
       };
-      const pages = await parsedCall((ctx) =>
-        stageParsedBatch(ctx, f.principal, pagesRequest),
-      );
+      const pages = await httpCall(pagesRequest);
       assert.equal(pages.phase, "evidence");
       assert.equal(
         (
@@ -1794,14 +1813,7 @@ test(
         ).rows[0].count,
         1,
       );
-      assert.equal(
-        (
-          await parsedCall((ctx) =>
-            stageParsedBatch(ctx, f.principal, pagesRequest),
-          )
-        ).reused,
-        true,
-      );
+      assert.equal((await httpCall(pagesRequest)).reused, true);
       await f.client.query(
         "DROP TRIGGER test_parsed_stage_retry ON kith.source_pages",
       );
@@ -1811,17 +1823,15 @@ test(
       );
 
       const batch = (requestId, phase, rows) =>
-        parsedCall((ctx) =>
-          stageParsedBatch(ctx, f.principal, {
-            ...leaseRequest,
-            operation: "jobs.stageParsedBatch",
-            requestId,
-            stageId: stage.stageId,
-            phase,
-            ordinal: 0,
-            rows,
-          }),
-        );
+        httpCall({
+          ...leaseRequest,
+          operation: "jobs.stageParsedBatch",
+          requestId,
+          stageId: stage.stageId,
+          phase,
+          ordinal: 0,
+          rows,
+        });
       assert.equal(
         (await batch("parsed-evidence", "evidence", [evidence])).phase,
         "documents",
@@ -1862,18 +1872,9 @@ test(
         stageId: stage.stageId,
         normalizedBundleDigest: bundleHash,
       };
-      const sealed = await parsedCall((ctx) =>
-        sealParsedStage(ctx, f.principal, sealRequest),
-      );
+      const sealed = await httpCall(sealRequest);
       assert.equal(sealed.state, "staged");
-      assert.equal(
-        (
-          await parsedCall((ctx) =>
-            sealParsedStage(ctx, f.principal, sealRequest),
-          )
-        ).reused,
-        true,
-      );
+      assert.equal((await httpCall(sealRequest)).reused, true);
       const snapshotClock = parsedNow + 500;
       await f.client.query(
         `INSERT INTO kith.record_query_space_state
@@ -1886,19 +1887,10 @@ test(
         operation: "jobs.activateParsed",
         requestId: "parsed-activate",
       };
-      const activated = await parsedCall((ctx) =>
-        activateParsedJob(ctx, f.principal, activateRequest),
-      );
+      const activated = await httpCall(activateRequest);
       assert.equal(activated.state, "ready");
       assert.equal(activated.activatedAt, snapshotClock + 1);
-      assert.equal(
-        (
-          await parsedCall((ctx) =>
-            activateParsedJob(ctx, f.principal, activateRequest),
-          )
-        ).reused,
-        true,
-      );
+      assert.equal((await httpCall(activateRequest)).reused, true);
       const published = (
         await f.client.query(
           `SELECT d.publication_state AS document_state,
@@ -1926,36 +1918,30 @@ test(
         )
       ).rows[0];
       async function assessBinary(requestSuffix) {
-        const assessment = await parsedCall((ctx) =>
-          beginProcessingAssessment(ctx, f.principal, {
-            ...common,
-            operation: "processing.assessBegin",
-            requestId: `parsed-assess-${requestSuffix}`,
-            scanId: begun.scanId,
-            expectedInventoryEpoch: Number(accountSnapshot.inventory_epoch),
-            expectedManifestVersion: Number(accountSnapshot.manifest_version),
-          }),
-        );
-        await parsedCall((ctx) =>
-          advanceProcessingAssessment(ctx, f.principal, {
-            ...common,
-            operation: "processing.assessPage",
-            requestId: `parsed-assess-${requestSuffix}-items`,
-            assessmentId: assessment.assessmentId,
-            ordinal: 0,
-            maxItems: 10,
-          }),
-        );
-        return parsedCall((ctx) =>
-          advanceProcessingAssessment(ctx, f.principal, {
-            ...common,
-            operation: "processing.assessPage",
-            requestId: `parsed-assess-${requestSuffix}-unresolved`,
-            assessmentId: assessment.assessmentId,
-            ordinal: 1,
-            maxItems: 10,
-          }),
-        );
+        const assessment = await httpCall({
+          ...common,
+          operation: "processing.assessBegin",
+          requestId: `parsed-assess-${requestSuffix}`,
+          scanId: begun.scanId,
+          expectedInventoryEpoch: Number(accountSnapshot.inventory_epoch),
+          expectedManifestVersion: Number(accountSnapshot.manifest_version),
+        });
+        await httpCall({
+          ...common,
+          operation: "processing.assessPage",
+          requestId: `parsed-assess-${requestSuffix}-items`,
+          assessmentId: assessment.assessmentId,
+          ordinal: 0,
+          maxItems: 1,
+        });
+        return httpCall({
+          ...common,
+          operation: "processing.assessPage",
+          requestId: `parsed-assess-${requestSuffix}-unresolved`,
+          assessmentId: assessment.assessmentId,
+          ordinal: 1,
+          maxItems: 1,
+        });
       }
       const validAssessment = await assessBinary("valid");
       assert.equal(validAssessment.state, "complete");
