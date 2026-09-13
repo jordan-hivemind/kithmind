@@ -1,10 +1,3 @@
-CREATE SCHEMA IF NOT EXISTS kith;
-
-CREATE TABLE kith.schema_migrations (
-  version integer PRIMARY KEY,
-  applied_at timestamptz NOT NULL DEFAULT transaction_timestamp()
-);
-
 CREATE TABLE kith.spaces (
   id uuid PRIMARY KEY,
   opaque_name text NOT NULL UNIQUE CHECK (char_length(opaque_name) BETWEEN 1 AND 128),
