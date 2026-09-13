@@ -16,6 +16,16 @@
       "types": "./src/identity/index.ts",
       "node": "./dist/identity/index.js",
       "default": "./src/identity/index.ts"
+    },
+    "./ingestion": {
+      "types": "./src/ingestion/index.ts",
+      "node": "./dist/ingestion/index.js",
+      "default": "./src/ingestion/index.ts"
+    },
+    "./workers": {
+      "types": "./src/workers/index.ts",
+      "node": "./dist/workers/index.js",
+      "default": "./src/workers/index.ts"
     }
   },
   "scripts": {

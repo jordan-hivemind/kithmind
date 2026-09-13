@@ -84,17 +84,12 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
     name: "identity: plain spaces and api_keys names, domain constraints, sessions (P2-39c)",
     url: new URL("../migrations/006_identity.sql", import.meta.url),
   },
-  // P2-39e was allocated 008 on the assumption that P2-39d2 had already taken
-  // 007. It has not: no 007 exists on main or on any pushed branch, and
-  // `applyKithSchema` refuses a gap on purpose ("a half-rolled-back schema is
-  // refused loudly instead of being migrated from a version it is not actually
-  // at"), which is not a guard to weaken for a reservation. So this row takes
-  // the next free number, 007, and whichever of the two rows merges second
-  // renumbers on rebase. 009 stays reserved for P2-39h either way.
+  // P2-39d2 owns migration 007. This branch must merge that migration before
+  // this entry can be applied, keeping the schema history contiguous.
   {
-    version: 7,
+    version: 8,
     name: "worker protocol: scan, discovery and receipt constraints and indexes (P2-39e)",
-    url: new URL("../migrations/007_worker_protocol.sql", import.meta.url),
+    url: new URL("../migrations/008_worker_protocol.sql", import.meta.url),
   },
 ]);
 

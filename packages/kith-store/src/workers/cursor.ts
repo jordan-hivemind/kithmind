@@ -29,12 +29,38 @@ import { workerProtocolError } from "./errors.js";
 /** The cursor a completed walk returns. Non-empty, by contract. */
 export const END_CURSOR = "END";
 
-export type KeysetPosition = { createdAt: Date; id: string };
+/**
+ * PostgreSQL timestamp text as returned by `created_at::text`.
+ *
+ * node-postgres parses `timestamptz` into `Date`, which truncates the
+ * database's microseconds to milliseconds. A keyset cursor must preserve the
+ * exact ordering key, so callers select the text form for cursor positions.
+ */
+export type KeysetPosition = { createdAt: string; id: string };
+
+const POSTGRES_TIMESTAMP =
+  /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}(?::?\d{2})?)$/;
+
+function requireTimestamp(value: string): string {
+  if (
+    value.length > 64 ||
+    !POSTGRES_TIMESTAMP.test(value) ||
+    Number.isNaN(Date.parse(value))
+  ) {
+    workerProtocolError("scan_conflict");
+  }
+  return value;
+}
 
 /** Encodes one position. Base64url so the cursor is safe in a JSON string. */
 export function encodeCursor(position: KeysetPosition): string {
   return Buffer.from(
-    JSON.stringify([position.createdAt.toISOString(), position.id]),
+    JSON.stringify([
+      requireTimestamp(position.createdAt),
+      KITH_ID.test(position.id)
+        ? position.id
+        : workerProtocolError("scan_conflict"),
+    ]),
     "utf8",
   ).toString("base64url");
 }
@@ -64,9 +90,10 @@ export function decodeCursor(cursor: string | null): KeysetPosition | null {
   ) {
     workerProtocolError("scan_conflict");
   }
-  const createdAt = new Date(parsed[0] as string);
-  if (Number.isNaN(createdAt.getTime())) workerProtocolError("scan_conflict");
-  return { createdAt, id: parsed[1] as string };
+  return {
+    createdAt: requireTimestamp(parsed[0] as string),
+    id: parsed[1] as string,
+  };
 }
 
 export type KeysetPage<T> = {

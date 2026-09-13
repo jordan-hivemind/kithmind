@@ -18,7 +18,7 @@
 //
 //   * Convex `ctx.db.patch(id, { field: undefined })` clears a field. Postgres
 //     needs the column named, so a clear is an explicit `= NULL`. The lease
-//     triple in particular is always cleared together, which migration 007
+//     triple in particular is always cleared together, which migration 008
 //     enforces with a CHECK so a half-cleared lease is not representable.
 //   * Convex reads a row back after a patch to return it. Here the `UPDATE` uses
 //     `RETURNING *`, so there is one statement instead of two and no window in
@@ -322,6 +322,9 @@ async function insertEntry(
     : undefined;
   const binary = ready && args.entry.content.status === "ready_binary_v1";
   const content = args.entry.content;
+  const readyContent = content.status === "gap" ? undefined : content;
+  const binaryContent =
+    content.status === "ready_binary_v1" ? content : undefined;
   const inserted = await row<Record<string, unknown>>(
     ctx,
     `INSERT INTO kith.worker_scan_entries
@@ -352,18 +355,18 @@ async function insertEntry(
       args.digests.uriDigest,
       args.digests.inventoryMetadataDigest,
       args.digests.processingIdentityDigest ?? null,
-      ready ? content.sha256 : null,
-      ready ? content.byteLength : null,
+      readyContent?.sha256 ?? null,
+      readyContent?.byteLength ?? null,
       profile?.representation ?? null,
-      binary ? content.parserProfileId : null,
-      binary ? content.mediaType : null,
-      binary ? content.parserFingerprint : null,
-      binary ? content.extractionConfigurationFingerprint : null,
-      binary ? content.extractorFingerprint : null,
-      binary ? content.recordSchemaFingerprint : null,
-      binary ? content.normalizationFingerprint : null,
-      binary ? content.chunkerFingerprint : null,
-      binary ? content.correctionRevision : null,
+      binary ? binaryContent!.parserProfileId : null,
+      binary ? binaryContent!.mediaType : null,
+      binary ? binaryContent!.parserFingerprint : null,
+      binary ? binaryContent!.extractionConfigurationFingerprint : null,
+      binary ? binaryContent!.extractorFingerprint : null,
+      binary ? binaryContent!.recordSchemaFingerprint : null,
+      binary ? binaryContent!.normalizationFingerprint : null,
+      binary ? binaryContent!.chunkerFingerprint : null,
+      binary ? binaryContent!.correctionRevision : null,
       at(args.entry.sourceModifiedAt),
       args.observationEpoch ?? null,
       args.processingEpoch ?? null,
@@ -895,6 +898,8 @@ async function persistResolvedEntry(
   const profile = ready
     ? processingProfile(args.entry as FsReadyDiscoveryEntry)
     : undefined;
+  const readyContent =
+    args.entry.content.status === "gap" ? undefined : args.entry.content;
   await exec(
     ctx,
     `UPDATE kith.source_items
@@ -913,7 +918,7 @@ async function persistResolvedEntry(
       processingEpoch,
       args.digests.inventoryMetadataDigest,
       ready ? (args.digests.processingIdentityDigest ?? null) : null,
-      ready ? args.entry.content.sha256 : null,
+      readyContent?.sha256 ?? null,
       ready ? profile!.profileId : null,
       at(args.entry.sourceModifiedAt),
       args.scan.inventoryEpoch,
@@ -941,8 +946,8 @@ async function persistResolvedEntry(
     activeGeneration.source_revision_id === args.item.desiredRevisionId &&
     numOr0(activeGeneration.desired_processing_epoch) ===
       args.item.desiredProcessingEpoch &&
-    activeRevision.content_hash === args.entry.content.sha256 &&
-    numOr0(activeRevision.byte_length) === args.entry.content.byteLength &&
+    activeRevision.content_hash === readyContent!.sha256 &&
+    numOr0(activeRevision.byte_length) === readyContent!.byteLength &&
     activeRevision.media_type === profile?.mediaType &&
     activeExtractionMatches &&
     activeGeneration.extractor_fingerprint === profile?.extractorFingerprint &&

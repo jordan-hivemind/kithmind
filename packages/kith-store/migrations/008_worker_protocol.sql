@@ -170,9 +170,10 @@ ALTER TABLE kith.worker_scan_entries
 
 CREATE INDEX IF NOT EXISTS worker_scan_entries_page_idx
   ON kith.worker_scan_entries (scan_page_id, created_at, id);
--- One entry per identity per scan. The duplicate is what
--- `duplicate_scan_identity` reports, and the check that finds it reads this.
-CREATE UNIQUE INDEX IF NOT EXISTS worker_scan_entries_identity_idx
+-- The duplicate is deliberately retained as a `needs_review` entry with the
+-- `duplicate_scan_identity` issue code, so this cannot be unique. The lookup
+-- still needs an index because every appended entry performs it.
+CREATE INDEX IF NOT EXISTS worker_scan_entries_identity_idx
   ON kith.worker_scan_entries (scan_id, identity_key_hash);
 CREATE INDEX IF NOT EXISTS worker_scan_entries_retire_idx
   ON kith.worker_scan_entries (retire_at);

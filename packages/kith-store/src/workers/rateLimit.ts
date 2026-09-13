@@ -15,7 +15,7 @@
 // existing behaviour the pipeline's pacing was measured against.
 //
 // One statement rather than a read, a branch and a write. `ON CONFLICT` over the
-// `(credential_id, source_account_id)` unique index migration 007 adds makes the
+// `(credential_id, source_account_id)` unique index migration 008 adds makes the
 // whole decision atomic in the database: read-then-write under SERIALIZABLE would
 // be correct too, but it would abort one of two concurrent workers on the same
 // source instead of rate-limiting it, and a serialization abort is not the answer
