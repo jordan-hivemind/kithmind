@@ -23,7 +23,9 @@ async function fixture(t) {
   await mkdir(stagingRoot, { mode: 0o700 });
   const tool = join(root, "tool.sh");
   await writeFile(tool, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
-  return { root, stateDirectory, stagingRoot, tool };
+  const restoreProofConfigPath = join(root, "restore.json");
+  await writeFile(restoreProofConfigPath, "{}", { mode: 0o600 });
+  return { root, stateDirectory, stagingRoot, tool, restoreProofConfigPath };
 }
 
 function backupConfig({ stateDirectory, stagingRoot, tool }, overrides = {}) {
@@ -45,6 +47,7 @@ function backupConfig({ stateDirectory, stagingRoot, tool }, overrides = {}) {
     expectedDatabaseName: "kithmind",
     expectedFinanceSchemaVersion: 3,
     expectedKithSchemaVersion: 6,
+    gitRevision: "b".repeat(40),
     timeoutMs: 60_000,
     ...overrides,
   };
@@ -58,6 +61,12 @@ test("buildManifest is a pure record of the export date, versions, files and has
     database: "kithmind",
     financeSchemaVersion: 3,
     kithSchemaVersion: 6,
+    gitRevision: "b".repeat(40),
+    parity: {
+      version: 1,
+      tables: [],
+      invalidConstraints: 0,
+    },
     files: [{ name: "kithmind.dump", sha256: "deadbeef", byteLength: 1024 }],
   });
   assert.deepEqual(manifest, {
@@ -69,6 +78,12 @@ test("buildManifest is a pure record of the export date, versions, files and has
     database: "kithmind",
     financeSchemaVersion: 3,
     kithSchemaVersion: 6,
+    gitRevision: "b".repeat(40),
+    parity: {
+      version: 1,
+      tables: [],
+      invalidConstraints: 0,
+    },
     files: [{ name: "kithmind.dump", sha256: "deadbeef", byteLength: 1024 }],
   });
 });
@@ -136,11 +151,12 @@ test("loadPostgresBackupConfig rejects a world- or group-writable staging root",
   await assert.rejects(loadPostgresBackupConfig(configPath));
 });
 
-function verifyConfig({ tool }, overrides = {}) {
+function verifyConfig({ tool, restoreProofConfigPath }, overrides = {}) {
   return {
     version: 1,
     ageBinary: tool,
     ageIdentityPath: tool,
+    restoreProofConfigPath,
     resticBinary: tool,
     resticRepositoryPath: "/abs/repo",
     resticPasswordCommand: { path: tool, args: [] },

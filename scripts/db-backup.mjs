@@ -11,6 +11,7 @@
 // plan's 14-day read-only window.
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { runWithDatabaseBackupState } from "./run-database-backup.mjs";
 
 export class DbBackupCliError extends Error {
   constructor(code) {
@@ -49,6 +50,7 @@ export function parseDbBackupArgs(argv) {
   if (verify && engine !== "postgres") fail("verify_requires_postgres_engine");
   if (verify && (typeof verifyConfig !== "string" || verifyConfig.length === 0))
     fail("verify_config_required");
+  if (engine === "postgres" && !verify) fail("postgres_requires_verify");
   if (!verify && verifyConfig !== undefined) fail("verify_config_without_verify");
   return { engine, config, verify, verifyConfig };
 }
@@ -71,13 +73,14 @@ export async function runDbBackup(argv, deps = {}) {
   const postgres =
     deps.postgresModule ?? (await import("./db-backup-postgres.mjs"));
   const loaded = await postgres.loadPostgresBackupConfig(config);
-  const result = await postgres.runPostgresDatabaseBackup(loaded);
-  if (!verify) return { engine, result };
-  const verification = await postgres.verifyPostgresBackup(
-    await postgres.loadPostgresVerifyConfig(verifyConfig),
-    result,
-  );
-  return { engine, result, verification };
+  const loadedVerify = await postgres.loadPostgresVerifyConfig(verifyConfig);
+  const stateRunner = deps.stateRunner ?? runWithDatabaseBackupState;
+  return stateRunner(loaded, async ({ setStage }) => {
+    const result = await postgres.runPostgresDatabaseBackup(loaded);
+    await setStage("verify");
+    const verification = await postgres.verifyPostgresBackup(loadedVerify, result);
+    return { engine, result, verification };
+  });
 }
 
 function isMain() {

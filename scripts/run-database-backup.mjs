@@ -13,7 +13,7 @@ const MAX_STDOUT = 4_096;
 const MAX_STDERR = 65_536;
 const KILL_GRACE = 250;
 const states = new Set(["running", "succeeded", "failed"]);
-const stages = new Set(["export", "backup", "complete"]);
+const stages = new Set(["export", "backup", "verify", "complete"]);
 
 export class DatabaseBackupRunnerError extends Error {
   constructor(code) {
@@ -436,6 +436,60 @@ function status({
     ...(failureCode ? { failureCode } : {}),
   };
 }
+
+/** Shared lock and durable status journal for engine-specific backup work. */
+export async function runWithDatabaseBackupState(config, operation, options = {}) {
+  await protectedDirectory(config.stateDirectory, true);
+  const clock = options.clock ?? Date.now;
+  const runId = randomUUID();
+  const startedAt = clock();
+  const lockPath = join(config.stateDirectory, "database-backup.lock");
+  const statusPath = join(config.stateDirectory, "database-backup-status.json");
+  const lock = await acquireLock(lockPath, runId, startedAt);
+  let mayRelease = false;
+  let stage = "export";
+  let prior = null;
+  let runningRecorded = false;
+  const record = async () => atomicStatus(statusPath, status({
+    state: "running", stage, runId, startedAt, updatedAt: clock(), lastSuccessAt: prior,
+  }), runId);
+  try {
+    prior = await lastSuccess(statusPath);
+    await record();
+    runningRecorded = true;
+    const result = await operation({
+      runId,
+      startedAt,
+      setStage: async (nextStage) => { stage = text(nextStage, 64); await record(); },
+    });
+    const finishedAt = clock();
+    await atomicStatus(statusPath, status({
+      state: "succeeded", stage: "complete", runId, startedAt,
+      updatedAt: finishedAt, lastSuccessAt: finishedAt,
+    }), runId);
+    mayRelease = true;
+    return { ...result, runId, startedAt, finishedAt };
+  } catch (error) {
+    const failureCode =
+      typeof error?.code === "string" && error.code.length <= 64
+        ? error.code
+        : "runner_failed";
+    try {
+      if (!runningRecorded) throw new DatabaseBackupRunnerError("status_unusable");
+      await atomicStatus(statusPath, status({
+        state: "failed", stage, runId, startedAt, updatedAt: clock(),
+        lastSuccessAt: prior, failureCode,
+      }), runId);
+      mayRelease = true;
+    } catch {
+      mayRelease = false;
+    }
+    throw new DatabaseBackupRunnerError(failureCode);
+  } finally {
+    if (mayRelease) await releaseLock(lockPath, lock);
+  }
+}
+
 export async function runDatabaseBackup(config, options = {}) {
   config = parseConfig(config);
   await validateConfigPaths(config);

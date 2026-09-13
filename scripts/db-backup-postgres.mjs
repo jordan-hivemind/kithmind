@@ -4,26 +4,30 @@
 // docs/plans/2026-09-12-postgres-consolidation.md, tracker row P2-39k).
 //
 // Replaces the native Convex export with `pg_dump` of both schemas
-// (`finance` and `kith`) from one database. Keeps every safeguard the Convex
-// recipe already has: an explicit preflight, a protected staging directory,
-// a manifest with sizes and hashes, encryption, a restic repository identity
-// check before publication, and a separate-process byte-equality
-// verification. Secrets (the connection string, the restic password, the age
+// (`finance` and `kith`) from one database. This component supplies the
+// database preflight, protected staging, content manifest, encryption, restic
+// repository identity, separate-process byte equality, and isolated restore.
+// Secrets (the connection string, the restic password, the age
 // private identity) are never embedded in configuration; each is read from a
 // protected command or file the owner already has, exactly as the existing
 // Convex recipe's adapters do.
+// This is the engine component. Owner orchestration still proves the external
+// storage-folder identity, quiesces writers, and records the operational run.
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   constants,
   createReadStream,
+  createWriteStream,
   lstatSync,
   realpathSync,
 } from "node:fs";
-import { mkdir, mkdtemp, open, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 
 import {
   DatabaseBackupRunnerError,
@@ -36,6 +40,7 @@ import {
   text as sharedText,
   writeAll,
 } from "./run-database-backup.mjs";
+import { capturePostgresParity } from "./db-postgres-parity.mjs";
 
 process.umask(0o077);
 
@@ -129,6 +134,7 @@ function parseBackupConfig(value) {
     "expectedDatabaseName",
     "expectedFinanceSchemaVersion",
     "expectedKithSchemaVersion",
+    "gitRevision",
     "timeoutMs",
   ]);
   if (row.version !== 1) fail("config_invalid");
@@ -140,6 +146,8 @@ function parseBackupConfig(value) {
     fail("config_invalid");
   if (!HEX_64.test(row.expectedResticRepositoryId)) fail("config_invalid");
   if (!OPAQUE_ID.test(row.host) || !OPAQUE_ID.test(row.operationId))
+    fail("config_invalid");
+  if (typeof row.gitRevision !== "string" || !/^[a-f0-9]{40}$/.test(row.gitRevision))
     fail("config_invalid");
   if (
     !Number.isSafeInteger(row.expectedFinanceSchemaVersion) ||
@@ -166,6 +174,7 @@ function parseBackupConfig(value) {
     expectedDatabaseName: text(row.expectedDatabaseName, 200),
     expectedFinanceSchemaVersion: row.expectedFinanceSchemaVersion,
     expectedKithSchemaVersion: row.expectedKithSchemaVersion,
+    gitRevision: row.gitRevision,
     timeoutMs: row.timeoutMs,
   };
 }
@@ -208,6 +217,7 @@ function parseVerifyConfig(value) {
     "version",
     "ageBinary",
     "ageIdentityPath",
+    "restoreProofConfigPath",
     "resticBinary",
     "resticRepositoryPath",
     "resticPasswordCommand",
@@ -230,6 +240,7 @@ function parseVerifyConfig(value) {
     version: 1,
     ageBinary: absolute(row.ageBinary),
     ageIdentityPath: absolute(row.ageIdentityPath),
+    restoreProofConfigPath: absolute(row.restoreProofConfigPath),
     resticBinary: absolute(row.resticBinary),
     resticRepositoryPath: absolute(row.resticRepositoryPath),
     resticPasswordCommand: parseSecretCommand(row.resticPasswordCommand),
@@ -267,6 +278,7 @@ export async function loadPostgresVerifyConfig(path) {
   const config = parseVerifyConfig(value);
   await protectedDirectory(dirname(config.ageIdentityPath));
   protectedFile(config.ageIdentityPath);
+  protectedFile(config.restoreProofConfigPath);
   await protectedExecutable(config.ageBinary);
   await protectedExecutable(config.resticBinary);
   await protectedExecutable(config.resticPasswordCommand.path);
@@ -344,6 +356,53 @@ function runCapture(command, args, options = {}) {
     if (options.input !== undefined) child.stdin.end(options.input);
     else child.stdin.end();
   });
+}
+
+async function runToProtectedFile(command, args, path, options = {}) {
+  const child = spawn(command, args, {
+    cwd: options.cwd,
+    env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const errors = [];
+  let errorBytes = 0;
+  child.stderr.on("data", (chunk) => {
+    errorBytes += chunk.length;
+    if (errorBytes <= MAX_COMMAND_OUTPUT_BYTES) errors.push(chunk);
+  });
+  let bytes = 0;
+  const limiter = new Transform({
+    transform(chunk, _encoding, callback) {
+      bytes += chunk.length;
+      if (bytes > options.maxOutputBytes) callback(new PostgresBackupError("command_output_too_large"));
+      else callback(undefined, chunk);
+    },
+  });
+  const timer = setTimeout(() => child.kill("SIGKILL"), options.timeoutMs);
+  const exited = new Promise((resolvePromise, rejectPromise) => {
+    child.once("error", () => rejectPromise(new PostgresBackupError("command_spawn_failed")));
+    child.once("close", (code, signal) => {
+      clearTimeout(timer);
+      if (signal) rejectPromise(new PostgresBackupError(signal === "SIGKILL" ? "command_timeout" : "command_failed"));
+      else if (code !== 0) rejectPromise(new PostgresBackupError("command_failed"));
+      else resolvePromise();
+    });
+  });
+  try {
+    await Promise.all([
+      exited,
+      pipeline(
+        child.stdout,
+        limiter,
+        createWriteStream(path, { flags: "wx", mode: 0o600 }),
+      ),
+    ]);
+  } catch (error) {
+    child.kill("SIGKILL");
+    await rm(path, { force: true });
+    if (error instanceof PostgresBackupError) throw error;
+    fail("command_failed");
+  }
 }
 
 async function secret(command, timeoutMs) {
@@ -479,6 +538,8 @@ export function buildManifest({
   database,
   financeSchemaVersion,
   kithSchemaVersion,
+  gitRevision,
+  parity,
   files,
 }) {
   return {
@@ -490,6 +551,8 @@ export function buildManifest({
     database,
     financeSchemaVersion,
     kithSchemaVersion,
+    gitRevision,
+    parity,
     files,
   };
 }
@@ -613,6 +676,16 @@ export async function runPostgresDatabaseBackup(config) {
     config.timeoutMs,
   );
   const identity = await preflight(config, connectionString);
+  // The cutover recipe quiesces every writer before this proof. These
+  // separately streamed table reads and pg_dump must observe that same stable
+  // source; without quiescence, no collection of independent SQL sessions can
+  // honestly claim one exported snapshot.
+  const parity = await capturePostgresParity(
+    config.psqlPath,
+    connectionString,
+    config.timeoutMs,
+  );
+  if (parity.invalidConstraints !== 0) fail("preflight_constraints_invalid");
   const passwordCommandArgument_ = await passwordCommandArgument(
     config.resticPasswordCommand,
   );
@@ -640,6 +713,8 @@ export async function runPostgresDatabaseBackup(config) {
     database: identity.database,
     financeSchemaVersion: identity.financeVersion,
     kithSchemaVersion: identity.kithVersion,
+    gitRevision: config.gitRevision,
+    parity,
     files: [
       {
         name: "kithmind.dump",
@@ -702,10 +777,21 @@ export async function runPostgresDatabaseBackup(config) {
 // backup config) prove the *published* ciphertext independently.
 
 async function runVerifyWorker(payload) {
-  const { config, backupResult } = payload;
+  const envelope = exact(payload, ["config", "backupResult"]);
+  const config = parseVerifyConfig(envelope.config);
+  const { backupResult } = envelope;
+  await protectedDirectory(dirname(config.ageIdentityPath));
+  protectedFile(config.ageIdentityPath);
+  protectedFile(config.restoreProofConfigPath);
   const names = ["kithmind.dump.age", "manifest.json.age"];
   if (
     !backupResult ||
+    JSON.stringify(Object.keys(backupResult).sort()) !==
+      JSON.stringify(["status", "stagingDirectory", "snapshotId", "repositoryId", "manifest", "ciphertexts", "plaintexts"].sort()) ||
+    backupResult.status !== "passed" ||
+    backupResult.repositoryId !== config.expectedResticRepositoryId ||
+    typeof backupResult.stagingDirectory !== "string" ||
+    !backupResult.manifest ||
     typeof backupResult.snapshotId !== "string" ||
     !/^[a-f0-9]{8,64}$/.test(backupResult.snapshotId) ||
     !backupResult.ciphertexts || !backupResult.plaintexts ||
@@ -733,14 +819,16 @@ async function runVerifyWorker(payload) {
     config.expectedResticRepositoryId,
     config.timeoutMs,
   );
-  const workDirectory = await mkdtemp(join(tmpdir(), "kith-db-verify-"));
+  const workDirectory = await mkdtemp(
+    join(realpathSync(tmpdir()), "kith-db-verify-"),
+  );
   try {
     const mismatches = [];
     for (const [objectName, expected] of Object.entries(
       backupResult.ciphertexts,
     )) {
       const cipherPath = join(workDirectory, objectName);
-      const dumped = await runCapture(
+      await runToProtectedFile(
         config.resticBinary,
         [
           ...resticBaseArgs(config.resticRepositoryPath, passwordCommandArgument_),
@@ -748,9 +836,9 @@ async function runVerifyWorker(payload) {
           backupResult.snapshotId,
           `/${objectName}`,
         ],
+        cipherPath,
         { timeoutMs: config.timeoutMs, maxOutputBytes: MAX_DUMP_BYTES },
       );
-      await writeFile(cipherPath, dumped.stdout, { mode: 0o600, flag: "wx" });
       const cipherDigest = await hashFile(cipherPath);
       if (
         cipherDigest.sha256 !== expected.sha256 ||
@@ -775,7 +863,62 @@ async function runVerifyWorker(payload) {
         mismatches.push(`${objectName}: plaintext byte mismatch`);
       }
     }
-    return { status: mismatches.length ? "failed" : "passed", repositoryId, mismatches };
+    if (mismatches.length) return { status: "failed", repositoryId, mismatches };
+    let publishedManifest;
+    try {
+      publishedManifest = JSON.parse(
+        await readFile(join(workDirectory, "manifest.json.age.plain"), "utf8"),
+      );
+    } catch {
+      fail("published_manifest_invalid");
+    }
+    const dumpFile = publishedManifest?.files?.find(
+      (entry) => entry?.name === "kithmind.dump",
+    );
+    if (
+      JSON.stringify(publishedManifest) !== JSON.stringify(backupResult.manifest) ||
+      publishedManifest.host !== config.host ||
+      publishedManifest.operationId !== config.operationId ||
+      !dumpFile ||
+      dumpFile.sha256 !== backupResult.plaintexts["kithmind.dump.age"].sha256 ||
+      dumpFile.byteLength !== backupResult.plaintexts["kithmind.dump.age"].byteLength
+    ) fail("published_manifest_invalid");
+    const restoreResult = await runCapture(
+      process.execPath,
+      [
+        fileURLToPath(new URL("./db-restore-proof.mjs", import.meta.url)),
+        "--isolated",
+        "--config",
+        config.restoreProofConfigPath,
+        "--dump",
+        join(workDirectory, "kithmind.dump.age.plain"),
+        "--manifest",
+        join(workDirectory, "manifest.json.age.plain"),
+      ],
+      { timeoutMs: config.timeoutMs, maxOutputBytes: MAX_COMMAND_OUTPUT_BYTES },
+    );
+    let restore;
+    try {
+      restore = JSON.parse(restoreResult.stdout.toString("utf8"));
+    } catch {
+      fail("restore_worker_output_invalid");
+    }
+    if (
+      !restore ||
+      Object.keys(restore).sort().join() !==
+        ["status", "source", "restored", "tablesVerified"].sort().join() ||
+      restore.status !== "passed" ||
+      !Number.isSafeInteger(restore.tablesVerified) ||
+      restore.tablesVerified < 2 ||
+      JSON.stringify(Object.keys(restore.source ?? {}).sort()) !==
+        JSON.stringify(["financeVersion", "kithVersion"]) ||
+      JSON.stringify(Object.keys(restore.restored ?? {}).sort()) !==
+        JSON.stringify(["financeVersion", "kithVersion"]) ||
+      restore.source.financeVersion !== publishedManifest.financeSchemaVersion ||
+      restore.source.kithVersion !== publishedManifest.kithSchemaVersion ||
+      JSON.stringify(restore.source) !== JSON.stringify(restore.restored)
+    ) fail("restore_worker_output_invalid");
+    return { status: "passed", repositoryId, mismatches: [], restore };
   } finally {
     await rm(workDirectory, { recursive: true, force: true });
   }
@@ -788,6 +931,7 @@ export async function verifyPostgresBackup(verifyConfig, backupResult) {
   const config = parseVerifyConfig(verifyConfig);
   await protectedDirectory(dirname(config.ageIdentityPath));
   protectedFile(config.ageIdentityPath);
+  protectedFile(config.restoreProofConfigPath);
   const workerPath = fileURLToPath(import.meta.url);
   const payload = Buffer.from(
     JSON.stringify({ config, backupResult }),
@@ -808,7 +952,16 @@ export async function verifyPostgresBackup(verifyConfig, backupResult) {
   } catch {
     fail("verify_worker_output_invalid");
   }
-  if (parsed.status !== "passed") fail("verify_failed");
+  if (
+    !parsed ||
+    Object.keys(parsed).sort().join() !==
+      ["status", "repositoryId", "mismatches", "restore"].sort().join() ||
+    parsed.status !== "passed" ||
+    parsed.repositoryId !== config.expectedResticRepositoryId ||
+    !Array.isArray(parsed.mismatches) ||
+    parsed.mismatches.length !== 0 ||
+    parsed.restore?.status !== "passed"
+  ) fail("verify_worker_output_invalid");
   return parsed;
 }
 

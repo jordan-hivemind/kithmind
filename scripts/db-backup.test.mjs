@@ -115,12 +115,18 @@ test("runDbBackup routes --engine postgres to the postgres adapter only, and --v
   };
   const output = await runDbBackup(
     ["--engine", "postgres", "--config", "/abs/pg.json", "--verify", "--verify-config", "/abs/verify.json"],
-    { convexModule, postgresModule },
+    {
+      convexModule,
+      postgresModule,
+      stateRunner: async (_config, operation) =>
+        operation({ setStage: async (stage) => calls.push(["stage", stage]) }),
+    },
   );
   assert.deepEqual(calls, [
     ["load", "/abs/pg.json"],
-    ["run", { fake: "pg-config" }],
     ["verify_load", "/abs/verify.json"],
+    ["run", { fake: "pg-config" }],
+    ["stage", "verify"],
     ["verify", { fake: "verify-config" }, { status: "passed", snapshotId: "s1" }],
   ]);
   assert.deepEqual(output, {
@@ -130,20 +136,9 @@ test("runDbBackup routes --engine postgres to the postgres adapter only, and --v
   });
 });
 
-test("runDbBackup does not verify when --verify is absent", async () => {
-  const postgresModule = {
-    loadPostgresBackupConfig: async () => ({}),
-    runPostgresDatabaseBackup: async () => ({ status: "passed" }),
-    verifyPostgresBackup: async () => {
-      throw new Error("must not be called");
-    },
-  };
-  const output = await runDbBackup(
-    ["--engine", "postgres", "--config", "/abs/pg.json"],
-    { convexModule: {}, postgresModule },
+test("postgres CLI cannot report success without restore verification", () => {
+  assert.throws(
+    () => parseDbBackupArgs(["--engine", "postgres", "--config", "/abs/pg.json"]),
+    (error) => error.code === "postgres_requires_verify",
   );
-  assert.deepEqual(output, {
-    engine: "postgres",
-    result: { status: "passed" },
-  });
 });
