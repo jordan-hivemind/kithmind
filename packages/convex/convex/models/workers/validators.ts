@@ -1,5 +1,22 @@
 import { v } from "convex/values";
 
+/**
+ * P2-70i2: the closed set of binary classes, mirroring `BINARY_CLASSES` in
+ * `@repo/worker-protocol`. A class added there and not here stops compiling
+ * where `accountBinaryClasses` reads a stored value back as a class.
+ */
+export const binaryParserProfileIdValidator = v.union(
+  v.literal("pdf_docqa_v1"),
+  v.literal("spreadsheet_v1"),
+);
+
+export const binaryMediaTypeValidator = v.union(
+  v.literal("application/pdf"),
+  v.literal(
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ),
+);
+
 export const workerScanModeValidator = v.union(
   v.literal("normal"),
   v.literal("identity_recovery"),
@@ -220,8 +237,8 @@ export const workerScanEntryFields = {
   contentRepresentation: v.optional(
     v.union(v.literal("inline_utf8_v1"), v.literal("archived_binary_v1")),
   ),
-  binaryParserProfileId: v.optional(v.literal("pdf_docqa_v1")),
-  binaryMediaType: v.optional(v.literal("application/pdf")),
+  binaryParserProfileId: v.optional(binaryParserProfileIdValidator),
+  binaryMediaType: v.optional(binaryMediaTypeValidator),
   parserFingerprint: v.optional(v.string()),
   extractionConfigurationFingerprint: v.optional(v.string()),
   extractorFingerprint: v.optional(v.string()),

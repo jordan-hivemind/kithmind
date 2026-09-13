@@ -38,9 +38,7 @@ export type ParserPageLocator = {
 };
 
 export type ParsedLocator =
-  | ParserItemLocator
-  | ParserTableRowLocator
-  | ParserPageLocator;
+  ParserItemLocator | ParserTableRowLocator | ParserPageLocator;
 
 export type ParsedPageInput = {
   ordinal: number;
@@ -318,28 +316,28 @@ export function canonicalParsedLocator(locator: ParsedLocator): unknown[] {
   return parsed.kind === "parser_page_v1"
     ? [parsed.kind, parsed.pageNumber, parsed.pageTextHash]
     : parsed.kind === "parser_item_v1"
-    ? [
-        parsed.kind,
-        parsed.pageNumber,
-        parsed.itemRef,
-        parsed.sourceCharStart,
-        parsed.sourceCharEnd,
-        canonicalBox(parsed.bbox),
-      ]
-    : [
-        parsed.kind,
-        parsed.pageNumber,
-        parsed.tableRef,
-        parsed.sourceRowOffset,
-        canonicalBox(parsed.bbox),
-        parsed.cells.map((cell) => [
-          cell.column,
-          cell.rowSpan,
-          cell.columnSpan,
-          cell.textHash,
-          canonicalBox(cell.bbox),
-        ]),
-      ];
+      ? [
+          parsed.kind,
+          parsed.pageNumber,
+          parsed.itemRef,
+          parsed.sourceCharStart,
+          parsed.sourceCharEnd,
+          canonicalBox(parsed.bbox),
+        ]
+      : [
+          parsed.kind,
+          parsed.pageNumber,
+          parsed.tableRef,
+          parsed.sourceRowOffset,
+          canonicalBox(parsed.bbox),
+          parsed.cells.map((cell) => [
+            cell.column,
+            cell.rowSpan,
+            cell.columnSpan,
+            cell.textHash,
+            canonicalBox(cell.bbox),
+          ]),
+        ];
 }
 
 export function canonicalParsedMappingManifestInput(
@@ -392,6 +390,86 @@ export function assertParsedRequestSize(value: unknown): void {
     invalid();
 }
 
+// --- the closed set of binary classes -------------------------------------
+
+/**
+ * P2-70i2. The archived-binary lane used to be "the binary class is PDF": the
+ * media type, the parser profile and the parser's output media type were three
+ * literals repeated at every gate. They are now one closed set, stated once
+ * here because both sides read it: the worker that admits bytes, and the
+ * server that refuses a receipt whose class does not match its work.
+ *
+ * A class is not a feature flag. Adding one means measuring a parser's actual
+ * behaviour and writing its bounds down, which is what the
+ * [original-byte contract](../../../docs/plans/2026-09-07-original-byte-contract.md)
+ * requires of any media type after PDF.
+ */
+export const BINARY_CLASSES = {
+  pdf_docqa_v1: {
+    mediaType: "application/pdf",
+    parserOutputMediaType: "application/vnd.docling+json",
+    /** Unchanged from the original-byte contract's first binary class. */
+    maxOriginalBytes: 16 * 1_024 * 1_024,
+  },
+  spreadsheet_v1: {
+    mediaType:
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    parserOutputMediaType: "application/vnd.kithmind.sheetgrid+json",
+    /** Measured; see `SPREADSHEET_V1_BOUNDS` below for why 8 MiB. */
+    maxOriginalBytes: 8 * 1_024 * 1_024,
+  },
+} as const;
+
+export type BinaryParserProfileId = keyof typeof BINARY_CLASSES;
+
+export type BinaryMediaType =
+  (typeof BINARY_CLASSES)[BinaryParserProfileId]["mediaType"];
+
+export type BinaryParserOutputMediaType =
+  (typeof BINARY_CLASSES)[BinaryParserProfileId]["parserOutputMediaType"];
+
+export const BINARY_PARSER_PROFILE_IDS = Object.keys(
+  BINARY_CLASSES,
+) as readonly BinaryParserProfileId[];
+
+export function isBinaryParserProfileId(
+  value: unknown,
+): value is BinaryParserProfileId {
+  return (
+    typeof value === "string" && Object.hasOwn(BINARY_CLASSES, value)
+    // `Object.hasOwn` over a literal object is enough: the set is closed and
+    // has no inherited keys to confuse it.
+  );
+}
+
+/**
+ * True only when `mediaType` is exactly the media type of `profileId`'s class.
+ * Every gate that used to compare two literals compares through this, so a
+ * PDF receipt can never satisfy a workbook and a workbook receipt can never
+ * satisfy a PDF.
+ */
+export function isBinaryClass(
+  profileId: unknown,
+  mediaType: unknown,
+): profileId is BinaryParserProfileId {
+  return (
+    isBinaryParserProfileId(profileId) &&
+    BINARY_CLASSES[profileId].mediaType === mediaType
+  );
+}
+
+export function binaryMediaType(profileId: BinaryParserProfileId): string {
+  return BINARY_CLASSES[profileId].mediaType;
+}
+
+export function isBinaryParserOutputMediaType(
+  value: unknown,
+): value is BinaryParserOutputMediaType {
+  return BINARY_PARSER_PROFILE_IDS.some(
+    (profileId) => BINARY_CLASSES[profileId].parserOutputMediaType === value,
+  );
+}
+
 export type ArchivedWorkIdentity = {
   sourceItemId: string;
   scanId: string;
@@ -399,8 +477,8 @@ export type ArchivedWorkIdentity = {
   processingEpoch: number;
   contentHash: string;
   byteLength: number;
-  mediaType: "application/pdf";
-  parserProfileId: "pdf_docqa_v1";
+  mediaType: BinaryMediaType;
+  parserProfileId: BinaryParserProfileId;
   parserFingerprint: string;
   extractionConfigurationFingerprint: string;
   extractorFingerprint: string;
@@ -416,7 +494,7 @@ export type ParserArtifactSelection =
       clientArtifactId: string;
       outputHash: string;
       outputByteLength: number;
-      outputMediaType: "application/vnd.docling+json";
+      outputMediaType: BinaryParserOutputMediaType;
       createdAt: number;
     }
   | { kind: "existing"; parserArtifactId: string };
@@ -519,6 +597,40 @@ export const SHEET_CELL_SEPARATOR = "\t";
 /** A row or column index past these is a corrupt reference, not a sheet. */
 export const MAX_SHEET_ROWS = 65_536;
 export const MAX_SHEET_COLUMNS = 4_096;
+
+/**
+ * P2-70i2: the measured acceptance bounds of the `spreadsheet_v1` class. Every
+ * number below is what the reader in `@repo/pipeline`'s `spreadsheet.ts`
+ * actually does, measured on 2026-09-12 against workbooks generated at and
+ * past each bound, not a number picked to look round:
+ *
+ * | Bound              | Measured                                                                  |
+ * | ------------------ | ------------------------------------------------------------------------- |
+ * | `maxSheets`        | 64 sheets read; 65 refused. Equals the parsed text version's page ceiling. |
+ * | `maxSheetPageChars`| a 100x16 sheet (14 KiB) read; a 460x16 sheet (71 KiB) refused.             |
+ * | `maxRowsPerSheet`  | a row index of 65,536 or past it refused as a corrupt reference.           |
+ * | `maxColumnsPerSheet`| a column index of 4,096 or past it refused.                              |
+ * | `maxRenderedBytes` | 64 sheets summing to 909 KiB read in 152 ms; 3.98 MiB read in 615 ms and  |
+ * |                    | then failed to seal, because a parsed text version holds 1 MiB. The       |
+ * |                    | reader now refuses the workbook instead of the seal refusing it later.    |
+ * | `maxWorkbookBytes` | 8 MiB. The reader holds the whole file and inflates one XML part at a     |
+ * |                    | time under an 8 MiB cap, so no part above this is decodable at all, and   |
+ * |                    | a larger workbook under the rendered-text bound is almost entirely parts  |
+ * |                    | this profile does not read (media, styles). Half the 16 MiB archived      |
+ * |                    | binary ceiling.                                                          |
+ *
+ * Past any of them the reader fails with the named code `oversized`, which the
+ * client reports as the `oversized` discovery gap rather than admitting bytes
+ * it cannot seal.
+ */
+export const SPREADSHEET_V1_BOUNDS = {
+  maxWorkbookBytes: BINARY_CLASSES.spreadsheet_v1.maxOriginalBytes,
+  maxSheets: 64,
+  maxRowsPerSheet: MAX_SHEET_ROWS,
+  maxColumnsPerSheet: MAX_SHEET_COLUMNS,
+  maxSheetPageChars: 65_536,
+  maxRenderedBytes: 1_024 * 1_024,
+} as const;
 
 /**
  * The only transform applied to a cell's rendered value. A tab, carriage

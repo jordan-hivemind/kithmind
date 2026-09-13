@@ -1,6 +1,7 @@
 import type { Doc, Id } from "../../_generated/dataModel";
 import type { MutationCtx, QueryCtx } from "../../_generated/server";
 import { getConvexSize } from "convex/values";
+import { isBinaryClass } from "@repo/worker-protocol";
 import { requireSourceAccountAccess } from "../../lib/sourceAuth";
 import type { PrincipalRef } from "../../lib/spaces";
 import { digestProcessingConfiguration } from "../ingestion/hash";
@@ -916,7 +917,12 @@ async function binaryItemDigests(
   item: Doc<"sourceItems">,
   entry: Doc<"workerScanEntries">,
 ) {
+  // P2-70i2: the class is part of both digests, so a PDF receipt can never
+  // satisfy a workbook and a workbook receipt can never satisfy a PDF. For a
+  // PDF entry these are the same two literals the digest carried before, so
+  // every existing digest is unchanged byte for byte.
   if (
+    !isBinaryClass(entry.binaryParserProfileId, entry.binaryMediaType) ||
     !item.externalId ||
     !item.uri ||
     !entry.contentHash ||
@@ -941,8 +947,8 @@ async function binaryItemDigests(
       "worker-fs-binary-processing-identity:v1",
       [
         entry.contentHash,
-        "application/pdf",
-        "pdf_docqa_v1",
+        entry.binaryMediaType,
+        entry.binaryParserProfileId,
         entry.parserFingerprint,
         entry.extractionConfigurationFingerprint,
         entry.extractorFingerprint,
@@ -963,7 +969,7 @@ async function binaryItemDigests(
         "ready_binary_v1",
         entry.contentHash,
         entry.byteLength,
-        "pdf_docqa_v1",
+        entry.binaryParserProfileId,
       ],
     ),
   };
@@ -978,15 +984,14 @@ async function terminalParsedReady(
 ): Promise<boolean> {
   if (
     entry.contentRepresentation !== "archived_binary_v1" ||
-    entry.binaryMediaType !== "application/pdf" ||
-    entry.binaryParserProfileId !== "pdf_docqa_v1" ||
+    !isBinaryClass(entry.binaryParserProfileId, entry.binaryMediaType) ||
     item.lifecycle !== "available" ||
     item.lastFailure !== undefined ||
     item.workerLastSeenInventoryEpoch !== assessment.inventoryEpoch ||
     item.workerObservationEpoch !== entry.observationEpoch ||
     item.workerProcessingEpoch !== entry.processingEpoch ||
     item.workerContentHash !== entry.contentHash ||
-    item.workerProfileId !== "pdf_docqa_v1" ||
+    item.workerProfileId !== entry.binaryParserProfileId ||
     item.workerSourceModifiedAt !== entry.sourceModifiedAt ||
     !item.desiredRevisionId ||
     item.activeRevisionId !== item.desiredRevisionId ||
@@ -1023,7 +1028,7 @@ async function terminalParsedReady(
     revision.contentHashAuthority !== "worker_asserted" ||
     revision.contentHash !== entry.contentHash ||
     revision.byteLength !== entry.byteLength ||
-    revision.mediaType !== "application/pdf" ||
+    revision.mediaType !== entry.binaryMediaType ||
     generation.spaceId !== source.spaceId ||
     generation.sourceAccountId !== source.account._id ||
     generation.sourceItemId !== item._id ||

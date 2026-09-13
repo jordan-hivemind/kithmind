@@ -81,7 +81,7 @@ the architecture's coverage rules already require the system to keep apart.
 | `duplicateGroupId`   | Hash of `(contentHash, byteLength)` when a group has two or more members. |
 | `contentIndexed`     | Boolean. True only when an active generation holds retained text.         |
 | `exclusionReason`    | Absent when `contentIndexed` is true. Otherwise one closed value.         |
-| `exclusionDetail`    | The failure class for `parse_failed`. Absent for every other reason.     |
+| `exclusionDetail`    | The failure class for `parse_failed`. Absent for every other reason.      |
 | `firstSeenScanId`    | The committed scan that first observed the file.                          |
 | `lastSeenScanId`     | The last committed scan that observed it.                                 |
 | `missingSinceScanId` | Set only by a healthy completed reconciliation.                           |
@@ -314,19 +314,19 @@ item, not a raised limit.
 Extraction always stores the literal name it read, bound to its span. Binding
 that name to an entity is a separate, deterministic step.
 
-| Match count after normalization | Result                                                                       |
-| ------------------------------- | ---------------------------------------------------------------------------- |
+| Match count after normalization | Result                                                                         |
+| ------------------------------- | ------------------------------------------------------------------------------ |
 | Exactly one                     | Set `observations.boundEntityId`. The `text` value and its span are unchanged. |
-| Zero                            | Leave the field literal-only. Raise an `entity_binding_needed` review item.   |
-| Two or more                     | Leave the field literal-only. Raise an `entity_binding_needed` review item.   |
+| Zero                            | Leave the field literal-only. Raise an `entity_binding_needed` review item.    |
+| Two or more                     | Leave the field literal-only. Raise an `entity_binding_needed` review item.    |
 
 #### Three points settled on implementation, 2026-09-12 during P2-70l
 
-| Point                 | Implemented                                                                                                                                                                                                                                                                                                                                                    |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Where the id is kept  | Beside the literal value, in `observations.boundEntityId`, not as an `entity` value in its place. Replacing the value would delete the literal name from the record and leave only the span quote, and the gate proves a value against its span, so an `entity` value could never pass rule 6. The gate keeps refusing `entity` values with `entity_value_unsupported`. |
-| One review kind       | `entity_binding_needed`, with the candidate count on the row, rather than `entity_unresolved` and `entity_ambiguous`. Zero and two-or-more take the same action from the same surface, and the count already says which happened.                                                                                                                              |
-| Normalization         | `normalizeEntityName`, the same function that wrote `entities.normalizedName`, so a lookup can never disagree with what was stored. It casefolds and collapses separators; it strips no punctuation and no legal suffix. Adding either would mean rewriting every stored `normalizedName` in the same change, so it is deferred to its own task.                 |
+| Point                | Implemented                                                                                                                                                                                                                                                                                                                                                             |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Where the id is kept | Beside the literal value, in `observations.boundEntityId`, not as an `entity` value in its place. Replacing the value would delete the literal name from the record and leave only the span quote, and the gate proves a value against its span, so an `entity` value could never pass rule 6. The gate keeps refusing `entity` values with `entity_value_unsupported`. |
+| One review kind      | `entity_binding_needed`, with the candidate count on the row, rather than `entity_unresolved` and `entity_ambiguous`. Zero and two-or-more take the same action from the same surface, and the count already says which happened.                                                                                                                                       |
+| Normalization        | `normalizeEntityName`, the same function that wrote `entities.normalizedName`, so a lookup can never disagree with what was stored. It casefolds and collapses separators; it strips no punctuation and no legal suffix. Adding either would mean rewriting every stored `normalizedName` in the same change, so it is deferred to its own task.                        |
 
 Matching compares against `entities.normalizedName` and
 `normalizedAliases` over one bounded scan of the space's entities, because
@@ -580,13 +580,13 @@ every remaining document failed. `provider_error` does not self-clear:
 
 ## 7. Review queue
 
-| Item kind           | Raised when                                                 | Resolution                                              |
-| ------------------- | ----------------------------------------------------------- | ------------------------------------------------------- |
-| `skipped_by_type`   | Inventory carries `unsupported`, `encrypted` or `oversized` | Accept as skipped, convert the file, or raise the limit |
-| `card_gate_failed`  | A required field failed at the top automatic step           | Correct the field, or accept the card without it        |
-| `field_dropped`     | An optional field failed the gate                           | Correct or accept                                       |
-| `duplicate_group`   | Two or more files share content                             | Choose the canonical member, or accept the group        |
-| `entity_binding_needed` | A name matched zero, or two or more, entities           | `createEntityFromCard`, or `bindCardEntity` explicitly  |
+| Item kind               | Raised when                                                 | Resolution                                              |
+| ----------------------- | ----------------------------------------------------------- | ------------------------------------------------------- |
+| `skipped_by_type`       | Inventory carries `unsupported`, `encrypted` or `oversized` | Accept as skipped, convert the file, or raise the limit |
+| `card_gate_failed`      | A required field failed at the top automatic step           | Correct the field, or accept the card without it        |
+| `field_dropped`         | An optional field failed the gate                           | Correct or accept                                       |
+| `duplicate_group`       | Two or more files share content                             | Choose the canonical member, or accept the group        |
+| `entity_binding_needed` | A name matched zero, or two or more, entities               | `createEntityFromCard`, or `bindCardEntity` explicitly  |
 
 Review items reuse the existing review-candidate rules. They are inert, they
 are excluded from active records and exact queries, they block the relevant
@@ -630,13 +630,13 @@ section 9.
 
 #### As implemented in P2-70j
 
-| Item                | Plan said              | Implementation                                                                                                        |
-| ------------------- | ---------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| Where the flag lives | `documents`           | `sourceItems.embedFullChunks`, with `sourceAccounts.embedFullChunks` as the per-source rule the item overrides.       |
-| Why                 | -                      | A `documents` row is recreated by every processing generation, so an opt-in stored there would be lost on re-extraction. |
-| Deploy safety       | Not stated             | `spaceEmbeddingStates.targetPolicy`, absent meaning `all_chunks`. Eligibility is unchanged until an operator flips it. |
-| Card target id      | Not stated             | The generic card's `events` row, not the card generation, so re-extraction over unchanged fields reuses the vector.   |
-| Heading digest      | One target per document with two or more headings | Not implemented. No stage of the pipeline extracts section headings today, so there is nothing to compose a digest from. It stays a plan item. |
+| Item                 | Plan said                                         | Implementation                                                                                                                                 |
+| -------------------- | ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| Where the flag lives | `documents`                                       | `sourceItems.embedFullChunks`, with `sourceAccounts.embedFullChunks` as the per-source rule the item overrides.                                |
+| Why                  | -                                                 | A `documents` row is recreated by every processing generation, so an opt-in stored there would be lost on re-extraction.                       |
+| Deploy safety        | Not stated                                        | `spaceEmbeddingStates.targetPolicy`, absent meaning `all_chunks`. Eligibility is unchanged until an operator flips it.                         |
+| Card target id       | Not stated                                        | The generic card's `events` row, not the card generation, so re-extraction over unchanged fields reuses the vector.                            |
+| Heading digest       | One target per document with two or more headings | Not implemented. No stage of the pipeline extracts section headings today, so there is nothing to compose a digest from. It stays a plan item. |
 
 The grandfathering migration is
 `models/embeddings/migrations:setChunkEmbeddingOptIn`, which names source items
@@ -808,10 +808,10 @@ P2-70j implemented the card recall test as `scripts/measure-card-recall.mjs`
 with `scripts/measure-card-recall.test.mjs`. One generated corpus of 200
 documents and one scorer serve two embedders:
 
-| Embedder             | What it measures                                                                  | Recorded rate at five |
-| -------------------- | --------------------------------------------------------------------------------- | --------------------- |
-| Deterministic (unit test) | The ranking path: one target per document, a contested top five, containment  | 0.92, MRR 0.728       |
-| `--embedder=openai`  | Meaning. The number this plan's question actually asks for.                        | Unmeasured            |
+| Embedder                  | What it measures                                                             | Recorded rate at five |
+| ------------------------- | ---------------------------------------------------------------------------- | --------------------- |
+| Deterministic (unit test) | The ranking path: one target per document, a contested top five, containment | 0.92, MRR 0.728       |
+| `--embedder=openai`       | Meaning. The number this plan's question actually asks for.                  | Unmeasured            |
 
 The deterministic embedder reads each document's identity and its subject,
 never its words, because a paraphrase that shares no distinctive term with its
@@ -891,6 +891,50 @@ assessment widening from one binary class to a set, and the archive receipts
 for the workbook's original bytes. The reader and the rendering rule this PR
 landed are what that task stages from, and `.xls` is out of scope for it: the
 pre-2007 binary container is not a ZIP, so none of this reader applies to it.
+
+#### What P2-70i2 landed: the binary class set
+
+P2-70i2 replaced "the binary class is PDF" with a closed set of binary
+classes, stated once in `@repo/worker-protocol` and read by both sides.
+
+| Class            | Media type                                           | Parser output                             | Original bytes |
+| ---------------- | ---------------------------------------------------- | ----------------------------------------- | -------------- |
+| `pdf_docqa_v1`   | `application/pdf`                                    | `application/vnd.docling+json`            | 16 MiB         |
+| `spreadsheet_v1` | `…openxmlformats-officedocument.spreadsheetml.sheet` | `application/vnd.kithmind.sheetgrid+json` | 8 MiB          |
+
+Every gate that used to compare two literals now compares a profile against
+its own class's media type, so a PDF receipt cannot satisfy a workbook and a
+workbook receipt cannot satisfy a PDF. Both digests a scan entry commits, the
+processing identity digest and the inventory metadata digest, carry the class;
+for a PDF entry they carry the same two values they always carried, so no
+existing digest moved. The account gate became per class: `binaryProfileIds`
+is the closed set of classes an account is audited for, `binaryProfileId`
+remains the one class an account named before the set existed, and a class the
+owner has not listed is refused with `source_unavailable`. The PDF path is
+unchanged in behaviour; no existing test needed an edit.
+
+`spreadsheet_v1`'s bounds are measured from the reader, not chosen: 64 sheets,
+65,536 characters per sheet page, 65,536 rows and 4,096 columns per sheet,
+8 MiB of workbook bytes, and 1 MiB of total rendered text. The last of these
+was a real gap: the reader accepted a 64-sheet workbook rendering 3.98 MiB of
+text, which no parsed text version can hold, so it now refuses the workbook as
+`oversized` rather than rendering text that fails to seal later. Chunking is
+the same page-local policy the PDF path uses, over sheet pages, under its own
+`spreadsheet_v1` fingerprint, and the parser stages no `cell_v1` span: under
+section 4.3 a card stages the spans it cites.
+
+What P2-70i2 did **not** land, and what remains before an `.xlsx` is content
+indexed, is the worker's own local workbook parse: capturing the workbook
+bytes, rendering the artifact pair, spooling it, and committing the archive
+receipt pair for the original and the parser output. That machinery is built
+around the sandboxed docling process, its model manifest and its
+table-structure bypass policy, none of which a dependency-free in-process
+reader has, so the workbook lane needs its own sibling of it rather than a
+flag on it. Until that lands the worker still reports `.xlsx` as an
+`unsupported` discovery gap, which is the honest answer: a file admitted
+without a parse would sit at `extraction_pending` forever, and that is a worse
+inventory answer than `unsupported`. `.docx` stays `unsupported` either way;
+it is a ZIP, and the workbook reader refuses it as `not_a_workbook`.
 
 `.docx` stays `unsupported` and is untouched by P2-70i. A document reader is a
 separate task and shares nothing with this one but the ZIP container.
