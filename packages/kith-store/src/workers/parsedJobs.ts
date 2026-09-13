@@ -52,6 +52,11 @@ import { workerProtocolError, workerProtocolErrorCode } from "./errors.js";
 import { MAX_WORKER_JOB_ATTEMPTS, WORKER_JOB_LEASE_MS } from "./jobs.js";
 import { consumeWorkerMutationRateLimit } from "./rateLimit.js";
 import {
+  nextWorkerActivation,
+  recordWorkerActivation,
+  touchWorkerPublicationEmbedding,
+} from "./publication.js";
+import {
   camelizeIngestJob,
   camelizeReservationReceipt,
   camelizeReservationTarget,
@@ -1523,156 +1528,6 @@ export async function sealParsedStage(
   };
 }
 
-async function nextActivationTime(
-  ctx: WorkerCtx,
-  spaceId: string,
-): Promise<{ activatedAt: number; priorId?: string; activationEpoch: number }> {
-  const processingRows = await rows<Record<string, unknown>>(
-    ctx,
-    `SELECT * FROM kith.space_processing_state WHERE space_id = $1
-     ORDER BY created_at, id LIMIT 2 FOR UPDATE`,
-    [spaceId],
-  );
-  if (processingRows.length > 1) workerProtocolError("scan_conflict");
-  const queryRows = await rows<Record<string, unknown>>(
-    ctx,
-    `SELECT * FROM kith.record_query_space_state WHERE space_id = $1
-     ORDER BY created_at, id LIMIT 2 FOR UPDATE`,
-    [spaceId],
-  );
-  if (queryRows.length > 1) workerProtocolError("scan_conflict");
-  const prior = processingRows[0];
-  const priorActivated =
-    prior?.activated_at instanceof Date
-      ? prior.activated_at.getTime()
-      : ctx.now - 1;
-  const snapshot =
-    queryRows[0]?.snapshot_clock === null ||
-    queryRows[0]?.snapshot_clock === undefined
-      ? ctx.now - 1
-      : Number(queryRows[0].snapshot_clock);
-  if (
-    !Number.isSafeInteger(ctx.now) ||
-    ctx.now < 0 ||
-    (prior !== undefined &&
-      (!Number.isSafeInteger(priorActivated) || priorActivated < 0)) ||
-    (queryRows[0] !== undefined &&
-      (!Number.isSafeInteger(snapshot) || snapshot < 0))
-  )
-    workerProtocolError("scan_conflict");
-  if (
-    prior &&
-    (!(prior.activated_at instanceof Date) ||
-      prior.activation_epoch === null ||
-      !Number.isSafeInteger(Number(prior.activation_epoch)) ||
-      Number(prior.activation_epoch) < 0)
-  )
-    workerProtocolError("scan_conflict");
-  const activationEpoch = prior ? Number(prior.activation_epoch) + 1 : 1;
-  const activatedAt = Math.max(ctx.now, priorActivated + 1, snapshot + 1);
-  if (
-    !Number.isSafeInteger(activationEpoch) ||
-    activationEpoch < 1 ||
-    !Number.isSafeInteger(activatedAt) ||
-    activatedAt < 0
-  )
-    workerProtocolError("scan_conflict");
-  return {
-    activatedAt,
-    activationEpoch,
-    ...(prior ? { priorId: String(prior.id) } : {}),
-  };
-}
-
-async function recordActivation(
-  ctx: WorkerCtx,
-  spaceId: string,
-  activation: Awaited<ReturnType<typeof nextActivationTime>>,
-): Promise<void> {
-  if (activation.priorId) {
-    await exec(
-      ctx,
-      `UPDATE kith.space_processing_state SET activation_epoch = $1,
-       activated_at = $2 WHERE id = $3`,
-      [
-        activation.activationEpoch,
-        at(activation.activatedAt),
-        activation.priorId,
-      ],
-    );
-  } else {
-    await exec(
-      ctx,
-      `INSERT INTO kith.space_processing_state
-       (id, space_id, created_at, activation_epoch, activated_at)
-       VALUES ($1,$2,transaction_timestamp(),$3,$4)`,
-      [
-        newKithId(),
-        spaceId,
-        activation.activationEpoch,
-        at(activation.activatedAt),
-      ],
-    );
-  }
-}
-
-async function bumpEmbeddingEligibility(
-  ctx: WorkerCtx,
-  spaceId: string,
-): Promise<void> {
-  const stateRows = await rows<Record<string, unknown>>(
-    ctx,
-    `SELECT * FROM kith.space_embedding_states WHERE space_id = $1
-     ORDER BY created_at, id LIMIT 2 FOR UPDATE`,
-    [spaceId],
-  );
-  if (stateRows.length > 1) workerProtocolError("scan_conflict");
-  const state = stateRows[0];
-  if (
-    state &&
-    (state.eligibility_epoch === null ||
-      !Number.isSafeInteger(Number(state.eligibility_epoch)) ||
-      Number(state.eligibility_epoch) < 0)
-  )
-    workerProtocolError("scan_conflict");
-  const eligibilityEpoch = state ? Number(state.eligibility_epoch) + 1 : 1;
-  if (!Number.isSafeInteger(eligibilityEpoch) || eligibilityEpoch < 1)
-    workerProtocolError("scan_conflict");
-  if (!state) {
-    await exec(
-      ctx,
-      `INSERT INTO kith.space_embedding_states
-       (id, space_id, created_at, eligibility_epoch)
-       VALUES ($1,$2,transaction_timestamp(),$3)`,
-      [newKithId(), spaceId, eligibilityEpoch],
-    );
-    return;
-  }
-  await exec(
-    ctx,
-    "UPDATE kith.space_embedding_states SET eligibility_epoch = $1 WHERE id = $2",
-    [eligibilityEpoch, state.id],
-  );
-  if (!state.active_embedding_generation_id) return;
-  const generationRows = await rows<Record<string, unknown>>(
-    ctx,
-    `SELECT * FROM kith.embedding_generations WHERE id = $1
-     ORDER BY created_at, id LIMIT 2 FOR UPDATE`,
-    [state.active_embedding_generation_id],
-  );
-  if (
-    generationRows.length !== 1 ||
-    generationRows[0]!.space_id !== spaceId ||
-    generationRows[0]!.state !== "active"
-  )
-    workerProtocolError("scan_conflict");
-  await exec(
-    ctx,
-    "UPDATE kith.embedding_generations SET eligibility_epoch = $1 WHERE id = $2",
-    [eligibilityEpoch, state.active_embedding_generation_id],
-  );
-}
-
 export async function activateParsedJob(
   ctx: WorkerCtx,
   principal: PrincipalRef,
@@ -1770,8 +1625,8 @@ export async function activateParsedJob(
     if (isTransactionAbort(error)) throw error;
     workerProtocolError("scan_conflict");
   }
-  const activation = await nextActivationTime(ctx, source.spaceId);
-  await recordActivation(ctx, source.spaceId, activation);
+  const activation = await nextWorkerActivation(ctx, source.spaceId);
+  await recordWorkerActivation(ctx, source.spaceId, activation);
   if (previousGenerationId && previousGenerationId !== loaded.generation.id)
     await exec(
       ctx,
@@ -1807,7 +1662,13 @@ export async function activateParsedJob(
      GREATEST(COALESCE(last_processed_at, $1), $1) WHERE id = $2`,
     [at(activation.activatedAt), source.account.id],
   );
-  await bumpEmbeddingEligibility(ctx, source.spaceId);
+  await touchWorkerPublicationEmbedding(ctx, {
+    spaceId: source.spaceId,
+    sourceItemId: loaded.current.item.id,
+    sourceAccountId: source.account.id,
+    processingGenerationId: loaded.generation.id,
+    ...(previousGenerationId ? { previousGenerationId } : {}),
+  });
   await exec(
     ctx,
     `UPDATE kith.worker_binary_operation_receipts SET phase = 'completed',

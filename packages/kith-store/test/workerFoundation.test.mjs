@@ -28,6 +28,7 @@ import {
   decodeCursor,
   encodeCursor,
   failParsedJob,
+  failProcessingJob,
   failArchivedDiscovery,
   lookupArchivedAdmission,
   preflightArchivedDiscovery,
@@ -35,6 +36,7 @@ import {
   getWorkerDiagnosticsStatus,
   getArchiveForgetTargets,
   getProviderOriginalForgetTargets,
+  getWorkerInventoryPage,
   getWorkerSourceStatus,
   recordWorkerHeartbeat,
   advanceProcessingAssessment,
@@ -50,6 +52,7 @@ import {
   sealWorkerScan,
   stageProcessingUtf8,
   stageParsedBatch,
+  touchWorkerPublicationEmbedding,
   withWorkerTransaction,
   workerCtx,
 } from "../dist/workers/index.js";
@@ -111,6 +114,103 @@ test("inline planning keeps UTF-8 boundaries and the migrated digest", async () 
     "1a989ea86150171c687b0727f218eedbb94c4665a7da9b0add1bf5de607f2bf1",
   );
 });
+
+test(
+  "worker publication preserves legacy embedding counters and rejects contradictory active fingerprints",
+  { skip },
+  async (t) => {
+    const f = await fixture(t);
+    const pool = createKithPool(f.databaseUrl, 2);
+    const profileId = newKithId();
+    const embeddingGenerationId = newKithId();
+    const fingerprint = "c".repeat(64);
+    try {
+      await f.client.query(
+        `INSERT INTO kith.embedding_profiles (id,created_at,fingerprint)
+         VALUES ($1,$2,$3)`,
+        [profileId, new Date(NOW), fingerprint],
+      );
+      await f.client.query(
+        `INSERT INTO kith.embedding_generations
+         (id,space_id,created_at,embedding_profile_id,fingerprint,state,
+          eligibility_epoch)
+         VALUES ($1,$2,$3,$4,$5,'active',1)`,
+        [
+          embeddingGenerationId,
+          f.spaceId,
+          new Date(NOW),
+          profileId,
+          fingerprint,
+        ],
+      );
+      await f.client.query(
+        `INSERT INTO kith.space_embedding_states
+         (id,space_id,created_at,eligibility_epoch,
+          active_embedding_generation_id,active_fingerprint)
+         VALUES ($1,$2,$3,1,$4,$5)`,
+        [
+          newKithId(),
+          f.spaceId,
+          new Date(NOW),
+          embeddingGenerationId,
+          fingerprint,
+        ],
+      );
+      const publication = {
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        sourceItemId: newKithId(),
+        processingGenerationId: newKithId(),
+      };
+      await withWorkerTransaction(
+        pool,
+        (ctx) => touchWorkerPublicationEmbedding(ctx, publication),
+        NOW + 1,
+      );
+      const preserved = (
+        await f.client.query(
+          `SELECT s.eligibility_epoch,s.eligible_counts,s.covered_counts,
+                  g.eligibility_epoch AS generation_epoch
+           FROM kith.space_embedding_states s
+           JOIN kith.embedding_generations g
+             ON g.id=s.active_embedding_generation_id
+           WHERE s.space_id=$1`,
+          [f.spaceId],
+        )
+      ).rows[0];
+      assert.equal(Number(preserved.eligibility_epoch), 2);
+      assert.equal(preserved.eligible_counts, null);
+      assert.equal(preserved.covered_counts, null);
+      assert.equal(Number(preserved.generation_epoch), 2);
+
+      await f.client.query(
+        "UPDATE kith.space_embedding_states SET active_fingerprint=$1 WHERE space_id=$2",
+        ["d".repeat(64), f.spaceId],
+      );
+      await assert.rejects(
+        withWorkerTransaction(
+          pool,
+          (ctx) => touchWorkerPublicationEmbedding(ctx, publication),
+          NOW + 2,
+        ),
+        expectProtocolCode("scan_conflict"),
+      );
+      assert.equal(
+        Number(
+          (
+            await f.client.query(
+              "SELECT eligibility_epoch FROM kith.space_embedding_states WHERE space_id=$1",
+              [f.spaceId],
+            )
+          ).rows[0].eligibility_epoch,
+        ),
+        2,
+      );
+    } finally {
+      await pool.end();
+    }
+  },
+);
 
 async function fixture(t) {
   const database = await identityDatabase(t);
@@ -794,6 +894,32 @@ test(
         NOW + 100,
       );
       assert.equal(renewed.leaseExpiresAt, NOW + 100 + 5 * 60 * 1_000);
+      const failRequest = {
+        protocolVersion: 1,
+        operation: "jobs.fail",
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        requestId: "job-fail-1",
+        jobId: admitted.ingestJobId,
+        leaseEpoch: 1,
+        leaseToken: jobToken,
+        failureCode: "worker_interrupted",
+      };
+      const failed = await call(
+        (ctx) => failProcessingJob(ctx, f.principal, failRequest),
+        NOW + 200,
+      );
+      assert.equal(failed.state, "failed");
+      assert.equal(failed.retryable, true);
+      assert.equal(
+        (
+          await call(
+            (ctx) => failProcessingJob(ctx, f.principal, failRequest),
+            NOW + 200,
+          )
+        ).reused,
+        true,
+      );
       await assert.rejects(
         call(
           (ctx) =>
@@ -802,16 +928,16 @@ test(
               operation: "jobs.stageUtf8",
               spaceId: f.spaceId,
               sourceAccountId: f.sourceAccountId,
-              requestId: "job-stage-expired",
+              requestId: "job-stage-revoked",
               jobId: admitted.ingestJobId,
               leaseEpoch: 1,
               leaseToken: jobToken,
             }),
-          renewed.leaseExpiresAt + 1,
+          failed.nextAttemptAt,
         ),
         expectProtocolCode("lease_conflict"),
       );
-      const reclaimedAt = renewed.leaseExpiresAt + 1;
+      const reclaimedAt = failed.nextAttemptAt;
       const replacementToken = "4".repeat(64);
       const reclaimed = await call(
         (ctx) =>
@@ -905,6 +1031,195 @@ test(
         ).rows[0].publication_state,
         "staged",
       );
+      const nextPayload = (
+        await f.client.query(
+          `SELECT d.id AS document_id, c.id AS chunk_id, c.text,
+                  g.source_text_version_id
+           FROM kith.processing_generations g
+           JOIN kith.documents d ON d.processing_generation_id = g.id
+           JOIN kith.chunks c ON c.document_id = d.id
+           WHERE g.id = $1`,
+          [admitted.processingGenerationId],
+        )
+      ).rows[0];
+      const previousGenerationId = newKithId();
+      const previousDocumentId = newKithId();
+      const previousChunkId = newKithId();
+      await f.client.query(
+        `INSERT INTO kith.processing_generations
+         (id,space_id,created_at,source_account_id,source_item_id,
+          source_revision_id,source_text_version_id,processing_fingerprint,
+          extraction_fingerprint,extractor_fingerprint,
+          record_schema_fingerprint,normalization_fingerprint,
+          chunker_fingerprint,correction_revision,desired_processing_epoch,
+          card_generation,state,expected_page_count,
+          expected_evidence_span_count,expected_document_count,
+          expected_chunk_count,expected_event_count,
+          expected_observation_count,actual_page_count,
+          actual_evidence_span_count,actual_document_count,
+          actual_chunk_count,actual_event_count,actual_observation_count,
+          embedding_status,activated_at)
+         SELECT $1,space_id,$2,source_account_id,source_item_id,
+          source_revision_id,source_text_version_id,processing_fingerprint,
+          extraction_fingerprint,extractor_fingerprint,
+          record_schema_fingerprint,normalization_fingerprint,
+          chunker_fingerprint,correction_revision,desired_processing_epoch,
+          card_generation,'ready',expected_page_count,
+          expected_evidence_span_count,expected_document_count,
+          expected_chunk_count,expected_event_count,
+          expected_observation_count,actual_page_count,
+          actual_evidence_span_count,actual_document_count,
+          actual_chunk_count,actual_event_count,actual_observation_count,
+          embedding_status,$2
+         FROM kith.processing_generations WHERE id=$3`,
+        [
+          previousGenerationId,
+          new Date(reclaimedAt - 100),
+          admitted.processingGenerationId,
+        ],
+      );
+      await f.client.query(
+        `INSERT INTO kith.documents
+         (id,space_id,created_at,processing_generation_id,source_item_id,
+          source_revision_id,source_text_version_id,document_key,title,
+          doc_type,captured_at,evidence_span_ids,publication_state)
+         SELECT $1,space_id,$2,$3,source_item_id,source_revision_id,
+          source_text_version_id,document_key,title,doc_type,captured_at,
+          evidence_span_ids,'active' FROM kith.documents WHERE id=$4`,
+        [
+          previousDocumentId,
+          new Date(reclaimedAt - 100),
+          previousGenerationId,
+          nextPayload.document_id,
+        ],
+      );
+      await f.client.query(
+        `INSERT INTO kith.chunks
+         (id,space_id,created_at,processing_generation_id,document_id,
+          ordinal,source_text_version_id,"start","end",text,
+          evidence_span_ids,publication_state)
+         SELECT $1,space_id,$2,$3,$4,ordinal,source_text_version_id,
+          "start","end",text,evidence_span_ids,'active'
+         FROM kith.chunks WHERE id=$5`,
+        [
+          previousChunkId,
+          new Date(reclaimedAt - 100),
+          previousGenerationId,
+          previousDocumentId,
+          nextPayload.chunk_id,
+        ],
+      );
+      await f.client.query(
+        `UPDATE kith.source_items SET active_generation_id=$1,
+         active_revision_id=desired_revision_id WHERE id=$2`,
+        [previousGenerationId, admitted.sourceItemId],
+      );
+      await f.client.query(
+        "UPDATE kith.source_accounts SET embed_full_chunks=true WHERE id=$1",
+        [f.sourceAccountId],
+      );
+      const embeddingFingerprint = "e".repeat(64);
+      const profileId = newKithId();
+      const activeEmbeddingGenerationId = newKithId();
+      const retiredEmbeddingGenerationId = newKithId();
+      const stagedEmbeddingGenerationId = newKithId();
+      await f.client.query(
+        `INSERT INTO kith.embedding_profiles (id,created_at,fingerprint)
+         VALUES ($1,$2,$3)`,
+        [profileId, new Date(reclaimedAt - 100), embeddingFingerprint],
+      );
+      for (const [id, state] of [
+        [activeEmbeddingGenerationId, "active"],
+        [retiredEmbeddingGenerationId, "retired"],
+        [stagedEmbeddingGenerationId, "staged"],
+      ]) {
+        await f.client.query(
+          `INSERT INTO kith.embedding_generations
+           (id,space_id,created_at,embedding_profile_id,fingerprint,state,
+            eligibility_epoch,expected_thought_count,expected_chunk_count,
+            completed_thought_count,completed_chunk_count,deactivated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,1,0,1,0,1,$7)`,
+          [
+            id,
+            f.spaceId,
+            new Date(reclaimedAt - 100),
+            profileId,
+            embeddingFingerprint,
+            state,
+            state === "retired" ? new Date(reclaimedAt - 50) : null,
+          ],
+        );
+      }
+      await f.client.query(
+        `INSERT INTO kith.space_embedding_states
+         (id,space_id,created_at,eligibility_epoch,
+          active_embedding_generation_id,active_fingerprint,target_policy,
+          eligible_counts,covered_counts,last_audit_at)
+         VALUES ($1,$2,$3,1,$4,$5,'cards_and_opted_in_chunks',$6,$7,$8)`,
+        [
+          newKithId(),
+          f.spaceId,
+          new Date(reclaimedAt - 50),
+          activeEmbeddingGenerationId,
+          embeddingFingerprint,
+          JSON.stringify({ thought: 0, chunk: 1, card: 0 }),
+          JSON.stringify([
+            {
+              fingerprint: embeddingFingerprint,
+              counts: { thought: 0, chunk: 1, card: 0 },
+            },
+          ]),
+          new Date(reclaimedAt - 50),
+        ],
+      );
+      const previousInputHash = await sha256Hex(nextPayload.text);
+      await f.client.query(
+        `INSERT INTO kith.embedding_targets
+         (id,space_id,created_at,target_kind,target_id,input_hash,
+          processing_generation_id,state,covered_fingerprint,updated_at)
+         VALUES ($1,$2,$3,'chunk',$4,$5,$6,'eligible',$7,$3)`,
+        [
+          newKithId(),
+          f.spaceId,
+          new Date(reclaimedAt - 50),
+          previousChunkId,
+          previousInputHash,
+          previousGenerationId,
+          embeddingFingerprint,
+        ],
+      );
+      const activeVectorId = newKithId();
+      const retiredVectorId = newKithId();
+      for (const [id, embeddingGenerationId] of [
+        [activeVectorId, activeEmbeddingGenerationId],
+        [retiredVectorId, retiredEmbeddingGenerationId],
+      ]) {
+        await f.client.query(
+          `INSERT INTO kith.embedding_vectors
+           (id,space_id,created_at,embedding_generation_id,
+            embedding_fingerprint,target_kind,search_scope,chunk_id,
+            processing_generation_id,input_hash,embedding)
+           VALUES ($1,$2,$3,$4,$5,'chunk','documents',$6,$7,$8,$9)`,
+          [
+            id,
+            f.spaceId,
+            new Date(reclaimedAt - 50),
+            embeddingGenerationId,
+            embeddingFingerprint,
+            previousChunkId,
+            previousGenerationId,
+            previousInputHash,
+            JSON.stringify([0.5]),
+          ],
+        );
+      }
+      const snapshotClock = reclaimedAt + 500;
+      await f.client.query(
+        `INSERT INTO kith.record_query_space_state
+         (id,space_id,created_at,visibility_epoch,snapshot_clock,updated_at)
+         VALUES ($1,$2,$3,1,$4,$3)`,
+        [newKithId(), f.spaceId, new Date(reclaimedAt), snapshotClock],
+      );
       const activateRequest = {
         protocolVersion: 1,
         operation: "jobs.activate",
@@ -915,12 +1230,58 @@ test(
         leaseEpoch: 2,
         leaseToken: replacementToken,
       };
+      await f.client.query(
+        `UPDATE kith.space_embedding_states SET eligible_counts=$1
+         WHERE space_id=$2`,
+        [JSON.stringify({ thought: 0, chunk: 1 }), f.spaceId],
+      );
+      await assert.rejects(
+        call(
+          (ctx) => activateProcessingJob(ctx, f.principal, activateRequest),
+          reclaimedAt,
+        ),
+        expectProtocolCode("scan_conflict"),
+      );
+      const rolledBack = (
+        await f.client.query(
+          `SELECT i.active_generation_id,j.state,
+                  (SELECT publication_state FROM kith.documents
+                   WHERE processing_generation_id=$1) AS next_state,
+                  (SELECT publication_state FROM kith.documents
+                   WHERE processing_generation_id=$2) AS previous_state,
+                  (SELECT count(*)::int FROM kith.embedding_vectors
+                   WHERE id=$3) AS active_vectors
+           FROM kith.source_items i JOIN kith.ingest_jobs j ON j.id=$4
+           WHERE i.id=$5`,
+          [
+            admitted.processingGenerationId,
+            previousGenerationId,
+            activeVectorId,
+            admitted.ingestJobId,
+            admitted.sourceItemId,
+          ],
+        )
+      ).rows[0];
+      assert.deepEqual(rolledBack, {
+        active_generation_id: previousGenerationId,
+        state: "staged",
+        next_state: "staged",
+        previous_state: "active",
+        active_vectors: 1,
+      });
+      await f.client.query(
+        `UPDATE kith.space_embedding_states SET eligible_counts=$1
+         WHERE space_id=$2`,
+        [JSON.stringify({ thought: 0, chunk: 1, card: 0 }), f.spaceId],
+      );
       const activated = await call(
         (ctx) => activateProcessingJob(ctx, f.principal, activateRequest),
         reclaimedAt,
       );
       assert.equal(activated.state, "ready");
       assert.equal(activated.reused, false);
+      assert.equal(activated.activatedAt, snapshotClock + 1);
+      assert.equal(activated.previousGenerationId, previousGenerationId);
       assert.equal(
         (
           await call(
@@ -943,6 +1304,61 @@ test(
         active_generation_id: admitted.processingGenerationId,
         publication_state: "active",
       });
+      const embeddingAfter = (
+        await f.client.query(
+          `SELECT s.eligibility_epoch,s.eligible_counts,s.covered_counts,
+                  a.eligibility_epoch AS active_epoch,
+                  a.expected_chunk_count,a.completed_chunk_count,
+                  staged.eligibility_epoch AS staged_epoch,
+                  old_target.state AS old_target_state,
+                  old_target.covered_fingerprint AS old_covered,
+                  new_target.state AS new_target_state,
+                  new_target.processing_generation_id AS new_parent,
+                  (SELECT count(*)::int FROM kith.embedding_vectors
+                   WHERE id=$1) AS active_vectors,
+                  (SELECT count(*)::int FROM kith.embedding_vectors
+                   WHERE id=$2) AS retired_vectors
+           FROM kith.space_embedding_states s
+           JOIN kith.embedding_generations a
+             ON a.id=s.active_embedding_generation_id
+           JOIN kith.embedding_generations staged ON staged.id=$3
+           JOIN kith.embedding_targets old_target
+             ON old_target.target_id=$4
+           JOIN kith.embedding_targets new_target
+             ON new_target.target_id=$5
+           WHERE s.space_id=$6`,
+          [
+            activeVectorId,
+            retiredVectorId,
+            stagedEmbeddingGenerationId,
+            previousChunkId,
+            nextPayload.chunk_id,
+            f.spaceId,
+          ],
+        )
+      ).rows[0];
+      assert.equal(Number(embeddingAfter.eligibility_epoch), 2);
+      assert.deepEqual(embeddingAfter.eligible_counts, {
+        thought: 0,
+        chunk: 1,
+        card: 0,
+      });
+      assert.deepEqual(embeddingAfter.covered_counts, [
+        {
+          fingerprint: embeddingFingerprint,
+          counts: { thought: 0, chunk: 0, card: 0 },
+        },
+      ]);
+      assert.equal(Number(embeddingAfter.active_epoch), 2);
+      assert.equal(Number(embeddingAfter.expected_chunk_count), 1);
+      assert.equal(Number(embeddingAfter.completed_chunk_count), 0);
+      assert.equal(Number(embeddingAfter.staged_epoch), 1);
+      assert.equal(embeddingAfter.old_target_state, "retired");
+      assert.equal(embeddingAfter.old_covered, null);
+      assert.equal(embeddingAfter.new_target_state, "eligible");
+      assert.equal(embeddingAfter.new_parent, admitted.processingGenerationId);
+      assert.equal(embeddingAfter.active_vectors, 0);
+      assert.equal(embeddingAfter.retired_vectors, 1);
       const sources = await listSources(f.client, [f.spaceId], {
         sourceAccountId: f.sourceAccountId,
       });
@@ -958,6 +1374,42 @@ test(
           sourceAccountId: newKithId(),
         }),
         { sources: [], partial: false, truncated: false },
+      );
+      const recovery = await call((ctx) =>
+        beginWorkerScan(ctx, f.principal, {
+          protocolVersion: 1,
+          operation: "scan.begin",
+          spaceId: f.spaceId,
+          sourceAccountId: f.sourceAccountId,
+          requestId: "identity-recovery-begin",
+          watcherId: "watcher-1",
+          connectorVersion: "fs-v1",
+          mode: "identity_recovery",
+          expectedInventoryEpoch: 1,
+        }),
+      );
+      const inventoryRequest = {
+        protocolVersion: 1,
+        operation: "source.inventoryPage",
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        scanId: recovery.scanId,
+        requestId: "identity-recovery-page",
+        expectedInventoryEpoch: recovery.inventoryEpoch,
+        expectedManifestVersion: recovery.manifestVersion,
+        paginationOpts: { cursor: null, numItems: 10 },
+      };
+      const inventory = await call((ctx) =>
+        getWorkerInventoryPage(ctx, f.principal, inventoryRequest),
+      );
+      assert.equal(inventory.page.length, 1);
+      assert.equal(inventory.page[0].sourceItemId, admitted.sourceItemId);
+      assert.equal(inventory.isDone, true);
+      assert.deepEqual(
+        await call((ctx) =>
+          getWorkerInventoryPage(ctx, f.principal, inventoryRequest),
+        ),
+        inventory,
       );
     } finally {
       await pool.end();
@@ -1875,6 +2327,27 @@ test(
       const sealed = await httpCall(sealRequest);
       assert.equal(sealed.state, "staged");
       assert.equal((await httpCall(sealRequest)).reused, true);
+      await f.client.query(
+        "UPDATE kith.source_accounts SET embed_full_chunks=false WHERE id=$1",
+        [f.sourceAccountId],
+      );
+      await f.client.query(
+        "UPDATE kith.source_items SET embed_full_chunks=true WHERE id=$1",
+        [admitted.sourceItemId],
+      );
+      await f.client.query(
+        `INSERT INTO kith.space_embedding_states
+         (id,space_id,created_at,eligibility_epoch,target_policy,
+          eligible_counts,covered_counts,last_audit_at)
+         VALUES ($1,$2,$3,0,'cards_and_opted_in_chunks',$4,$5,$3)`,
+        [
+          newKithId(),
+          f.spaceId,
+          new Date(parsedNow),
+          JSON.stringify({ thought: 0, chunk: 0, card: 0 }),
+          JSON.stringify([]),
+        ],
+      );
       const snapshotClock = parsedNow + 500;
       await f.client.query(
         `INSERT INTO kith.record_query_space_state
@@ -1910,6 +2383,27 @@ test(
       assert.equal(published.lease_token, null);
       assert.equal(Number(published.activation_epoch), 1);
       assert.equal(published.activated_at.getTime(), snapshotClock + 1);
+      const parsedEmbedding = (
+        await f.client.query(
+          `SELECT s.eligibility_epoch,s.eligible_counts,t.state,
+                  t.processing_generation_id
+           FROM kith.space_embedding_states s
+           JOIN kith.embedding_targets t ON t.space_id=s.space_id
+           WHERE s.space_id=$1 AND t.target_kind='chunk'`,
+          [f.spaceId],
+        )
+      ).rows[0];
+      assert.equal(Number(parsedEmbedding.eligibility_epoch), 1);
+      assert.deepEqual(parsedEmbedding.eligible_counts, {
+        thought: 0,
+        chunk: 1,
+        card: 0,
+      });
+      assert.equal(parsedEmbedding.state, "eligible");
+      assert.equal(
+        parsedEmbedding.processing_generation_id,
+        admitted.processingGenerationId,
+      );
 
       const accountSnapshot = (
         await f.client.query(

@@ -45,6 +45,11 @@ import {
   type CurrentDiscovery,
 } from "./discovery.js";
 import { workerProtocolError, workerProtocolErrorCode } from "./errors.js";
+import {
+  nextWorkerActivation,
+  recordWorkerActivation,
+  touchWorkerPublicationEmbedding,
+} from "./publication.js";
 import { consumeWorkerMutationRateLimit } from "./rateLimit.js";
 import {
   camelizeIngestJob,
@@ -1066,7 +1071,9 @@ export async function activateProcessingJob(
     if (isTransactionAbort(error)) throw error;
     workerProtocolError("scan_conflict");
   }
-  const activatedAt = ctx.now;
+  const activation = await nextWorkerActivation(ctx, source.spaceId);
+  await recordWorkerActivation(ctx, source.spaceId, activation);
+  const activatedAt = activation.activatedAt;
   if (previousGenerationId && previousGenerationId !== current.generation.id)
     await exec(
       ctx,
@@ -1097,6 +1104,13 @@ export async function activateProcessingJob(
     "UPDATE kith.source_accounts SET last_processed_at = GREATEST(COALESCE(last_processed_at, $1), $1) WHERE id = $2",
     [at(activatedAt), source.account.id],
   );
+  await touchWorkerPublicationEmbedding(ctx, {
+    spaceId: source.spaceId,
+    sourceItemId: current.item.id,
+    sourceAccountId: source.account.id,
+    processingGenerationId: current.generation.id,
+    ...(previousGenerationId ? { previousGenerationId } : {}),
+  });
   const receipt = await insertReceipt(ctx, source, current, identity, request, {
     state: "ready",
     activatedAt,
