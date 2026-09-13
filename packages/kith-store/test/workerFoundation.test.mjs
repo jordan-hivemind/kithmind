@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { newKithId } from "../dist/index.js";
+import { createKithPool, newKithId } from "../dist/index.js";
 import {
   MAX_INLINE_TEXT_CHUNK_UTF8_BYTES,
   planInlineText,
@@ -17,6 +17,7 @@ import {
   keysetTail,
   requireWorkerSourceAccount,
   resolveAndPersistEntry,
+  withWorkerTransaction,
   workerCtx,
 } from "../dist/workers/index.js";
 import {
@@ -196,10 +197,9 @@ test(
       }),
       expectProtocolCode("not_found"),
     );
-    await f.client.query(
-      "UPDATE kith.api_keys SET revoked_at = $1 WHERE id = $2",
-      [new Date(NOW), f.credential.id],
-    );
+    await f.client.query("DELETE FROM kith.api_keys WHERE id = $1", [
+      f.credential.id,
+    ]);
     await assert.rejects(
       requireWorkerSourceAccount(ctx, f.principal, {
         spaceId: f.spaceId,
@@ -271,27 +271,75 @@ test(
   { skip },
   async (t) => {
     const f = await fixture(t);
-    for (let count = 0; count < 60; count += 1) {
-      await consumeWorkerMutationRateLimit(
-        workerCtx(f.client, NOW),
-        f.credential.id,
-        f.sourceAccountId,
+    const pool = createKithPool(f.databaseUrl, 2);
+    try {
+      for (let count = 0; count < 59; count += 1) {
+        await withWorkerTransaction(
+          pool,
+          (ctx) =>
+            consumeWorkerMutationRateLimit(
+              ctx,
+              f.credential.id,
+              f.sourceAccountId,
+            ),
+          NOW,
+        );
+      }
+      const raced = await Promise.allSettled([
+        withWorkerTransaction(
+          pool,
+          (ctx) =>
+            consumeWorkerMutationRateLimit(
+              ctx,
+              f.credential.id,
+              f.sourceAccountId,
+            ),
+          NOW,
+        ),
+        withWorkerTransaction(
+          pool,
+          (ctx) =>
+            consumeWorkerMutationRateLimit(
+              ctx,
+              f.credential.id,
+              f.sourceAccountId,
+            ),
+          NOW,
+        ),
+      ]);
+      assert.deepEqual(
+        raced.map(({ status }) => status).sort(),
+        ["fulfilled", "rejected"],
       );
+      const rejected = raced.find(({ status }) => status === "rejected");
+      assert.ok(
+        rejected.status === "rejected" &&
+          expectProtocolCode("rate_limited")(rejected.reason),
+      );
+      assert.equal(
+        (
+          await f.client.query(
+            `SELECT count::int AS count FROM kith.worker_protocol_rate_limits
+              WHERE credential_id = $1 AND source_account_id = $2`,
+            [f.credential.id, f.sourceAccountId],
+          )
+        ).rows[0].count,
+        60,
+      );
+      await assert.doesNotReject(
+        withWorkerTransaction(
+          pool,
+          (ctx) =>
+            consumeWorkerMutationRateLimit(
+              ctx,
+              f.credential.id,
+              f.sourceAccountId,
+            ),
+          NOW + 60_001,
+        ),
+      );
+    } finally {
+      await pool.end();
     }
-    await assert.rejects(
-      consumeWorkerMutationRateLimit(
-        workerCtx(f.client, NOW),
-        f.credential.id,
-        f.sourceAccountId,
-      ),
-      expectProtocolCode("rate_limited"),
-    );
-    await assert.doesNotReject(
-      consumeWorkerMutationRateLimit(
-        workerCtx(f.client, NOW + 60_001),
-        f.credential.id,
-        f.sourceAccountId,
-      ),
-    );
   },
 );
