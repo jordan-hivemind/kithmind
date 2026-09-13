@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   chmod,
   link,
@@ -16,6 +16,11 @@ import { promisify } from "node:util";
 import test from "node:test";
 
 import {
+  BINARY_CLASSES,
+  SPREADSHEET_V1_BOUNDS,
+} from "@repo/worker-protocol";
+
+import {
   canonicalRoots,
   discoverFiles,
   discoverSourceObservations,
@@ -28,6 +33,7 @@ import {
   standardEncryptedPdf,
   standardEncryptedPdfR6,
 } from "./standardEncryptedPdfFixtures.mjs";
+import { workbookBytes, zip } from "./syntheticWorkbook.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -291,6 +297,96 @@ test("PDF observations use a bounded binary descriptor without text admission", 
   assert.ok(oversized && oversized.kind === "gap");
   assert.deepEqual(oversized.gap.code, "oversized");
   assert.equal(oversized.gap.uri, "fs://test/large-not-pdf.bin");
+});
+
+test("workbook discovery uses the spreadsheet class bound beyond the text limit", async () => {
+  const { root, journal } = await setup();
+  const bytes = workbookBytes([
+    ["xl/media/synthetic.bin", randomBytes(70 * 1024)],
+  ]);
+  assert.ok(bytes.length > 65_536);
+  assert.ok(bytes.length <= SPREADSHEET_V1_BOUNDS.maxWorkbookBytes);
+  await writeFile(join(root, "large.xlsx"), bytes);
+  const localConfig = config(root, journal);
+  const [safeRoot] = await canonicalRoots(localConfig);
+  const [observation] = await discoverSourceObservations(localConfig, [
+    safeRoot,
+  ]);
+  assert.equal(observation.kind, "pdf");
+  assert.equal(
+    observation.file.mediaType,
+    BINARY_CLASSES.spreadsheet_v1.mediaType,
+  );
+  assert.equal(observation.file.byteLength, bytes.length);
+});
+
+test("workbook discovery refuses bytes above the spreadsheet class bound", async () => {
+  const { root, journal } = await setup();
+  const bytes = workbookBytes([
+    [
+      "xl/media/synthetic.bin",
+      randomBytes(SPREADSHEET_V1_BOUNDS.maxWorkbookBytes + 64 * 1024),
+    ],
+  ]);
+  assert.ok(bytes.length > SPREADSHEET_V1_BOUNDS.maxWorkbookBytes);
+  await writeFile(join(root, "oversized.xlsx"), bytes);
+  const localConfig = config(root, journal);
+  const [safeRoot] = await canonicalRoots(localConfig);
+  const [observation] = await discoverSourceObservations(localConfig, [
+    safeRoot,
+  ]);
+  assert.equal(observation.kind, "gap");
+  assert.equal(observation.gap.code, "oversized");
+});
+
+test("provisional workbook reads preserve text and non-workbook bounds", async () => {
+  const { root, journal } = await setup();
+  const nonWorkbook = zip([
+    ["mimetype", "application/epub+zip"],
+    ["synthetic.bin", randomBytes(70 * 1024)],
+  ]);
+  await writeFile(join(root, "large.txt"), "x".repeat(70 * 1024));
+  await writeFile(join(root, "large.zip"), nonWorkbook);
+  const localConfig = config(root, journal);
+  const [safeRoot] = await canonicalRoots(localConfig);
+  const observations = await discoverSourceObservations(localConfig, [
+    safeRoot,
+  ]);
+  assert.deepEqual(
+    observations.map((observation) =>
+      observation.kind === "gap" ? observation.gap.code : observation.kind,
+    ),
+    ["oversized", "oversized"],
+  );
+});
+
+test("encrypted workbook classification survives the text-size boundary", async () => {
+  const { root, journal } = await setup();
+  const bytes = Buffer.alloc(70 * 1024);
+  Buffer.from([0xd0, 0xcf, 0x11, 0xe0]).copy(bytes);
+  await writeFile(join(root, "encrypted.xlsx"), bytes);
+  const localConfig = config(root, journal);
+  const [safeRoot] = await canonicalRoots(localConfig);
+  const [observation] = await discoverSourceObservations(localConfig, [
+    safeRoot,
+  ]);
+  assert.equal(observation.kind, "gap");
+  assert.equal(observation.gap.code, "encrypted");
+});
+
+test("a hard-linked workbook remains unsafe above the text-size boundary", async () => {
+  const { root, journal } = await setup();
+  const bytes = workbookBytes([
+    ["xl/media/synthetic.bin", randomBytes(70 * 1024)],
+  ]);
+  await writeFile(join(root, "original.xlsx"), bytes);
+  await link(join(root, "original.xlsx"), join(root, "linked.xlsx"));
+  const localConfig = config(root, journal);
+  const [safeRoot] = await canonicalRoots(localConfig);
+  await assert.rejects(
+    () => discoverSourceObservations(localConfig, [safeRoot]),
+    (error) => error instanceof FilesystemFailure && error.code === "unstable",
+  );
 });
 
 test("PDF descriptor scan rejects non-PDF, hard-linked, and oversized files", async () => {
