@@ -31,6 +31,11 @@
       "types": "./src/records/index.ts",
       "node": "./dist/records/index.js",
       "default": "./src/records/index.ts"
+    },
+    "./coverage": {
+      "types": "./src/coverage/index.ts",
+      "node": "./dist/coverage/index.js",
+      "default": "./src/coverage/index.ts"
     }
   },
   "scripts": {

@@ -576,3 +576,5 @@ function workerJobFromRow(row: WorkerJobRow): WorkerJob {
     ...(row.failure_code === null ? {} : { failureCode: row.failure_code }),
   };
 }
+
+export * as coverage from "./coverage/index.js";

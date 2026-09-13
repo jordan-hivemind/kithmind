@@ -117,6 +117,17 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
       import.meta.url,
     ),
   },
+  {
+    version: 13,
+    name: "record coverage: validated windows, gaps and bounded lookup indexes (P2-39f5)",
+    url: new URL("../migrations/013_record_coverage.sql", import.meta.url),
+  },
+
+  {
+    version: 14,
+    name: "record queries: bounded candidate scan indexes (P2-39f5)",
+    url: new URL("../migrations/014_record_queries.sql", import.meta.url),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */
