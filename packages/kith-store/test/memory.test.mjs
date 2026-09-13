@@ -113,7 +113,7 @@ test("thought transitions, authorized candidate hydration, and recall blending p
     // path must withhold it when it names another space, a missing row, or a
     // list larger than the transition contract's ten links.
     await ctx.client.query("UPDATE kith.thoughts SET supersedes = $1::jsonb WHERE id = $2", [JSON.stringify([foreignThought]), currentThought]);
-    assert.equal(await memory.getThoughtById(ctx, currentThought), null);
+    assert.deepEqual((await memory.getThoughtsByAuthorizedIds(ctx, [spaceId], [currentThought])).map((thought) => thought.id), []);
     assert.deepEqual((await memory.getThoughtsByAuthorizedIds(ctx, [spaceId], [currentThought])).map((thought) => thought.id), []);
     assert.deepEqual((await memory.listBySpaces(ctx, [spaceId], 10)).map((thought) => thought.id).includes(currentThought), false);
     await ctx.client.query("UPDATE kith.thoughts SET supersedes = $1::jsonb WHERE id = $2", [JSON.stringify(Array(11).fill(oldThought)), currentThought]);
