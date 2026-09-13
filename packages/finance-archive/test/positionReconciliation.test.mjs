@@ -853,3 +853,122 @@ test(
     assert.equal(summary.failed, 0);
   },
 );
+
+// --- F1-72: a stale verdict outside the evaluated window set is deleted ----
+//
+// Same defect as the cash gate's, measured on the same archive: a document
+// collapse or account re-attribution changes which (account, instrument,
+// period) triples currently exist, and `position_reconciliations` kept the
+// old ones. A whole-archive pass must delete anything outside the windows
+// it just evaluated; an incremental pass must do the same, but only inside
+// the series its own scope touched.
+
+test(
+  "a whole-archive pass deletes a stale verdict for a window that no longer exists, and keeps the one it evaluated",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+    await seedAccount(client, "acct_vanish");
+    await insertPosition(client, {
+      accountId: "acct_vanish",
+      asOf: "2026-01-31",
+      quantity: "10",
+    });
+    await insertPosition(client, {
+      accountId: "acct_vanish",
+      asOf: "2026-02-28",
+      quantity: "10",
+    });
+    await insertTransaction(client, {
+      accountId: "acct_vanish",
+      processDate: "2026-01-02",
+      quantity: "0",
+    });
+
+    // A row for a period this account/instrument's current positions can no
+    // longer pair -- exactly what a document collapse or an account
+    // re-attribution leaves behind, reproduced directly rather than through
+    // either flow.
+    await client.query(
+      `INSERT INTO position_reconciliations
+         (id, account_id, instrument_id, period_start, period_end, tolerance, status)
+       VALUES ('v_vanished', 'acct_vanish', $1, '2025-11-30', '2025-12-31', 0, 'fail')`,
+      [INSTRUMENT.id],
+    );
+
+    const summary = await runPositionReconciliationGate(client);
+    assert.equal(summary.periodsChecked, 1);
+    assert.equal(summary.passed, 1);
+
+    assert.equal(
+      await count(client, "position_reconciliations", "WHERE id = $1", [
+        "v_vanished",
+      ]),
+      0,
+      "a window outside the evaluated set is deleted",
+    );
+    assert.equal(
+      await count(
+        client,
+        "position_reconciliations",
+        "WHERE account_id = $1 AND instrument_id = $2 AND period_start = $3 AND period_end = $4",
+        ["acct_vanish", INSTRUMENT.id, "2026-01-31", "2026-02-28"],
+      ),
+      1,
+      "the window the gate actually evaluated is kept",
+    );
+  },
+);
+
+test(
+  "an incremental pass scoped to one account deletes its own stale verdict and leaves another account's alone",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+    await seedAccount(client, "acct_a");
+    await seedAccount(client, "acct_b");
+    for (const accountId of ["acct_a", "acct_b"]) {
+      await insertPosition(client, { accountId, asOf: "2026-01-31", quantity: "10" });
+      await insertPosition(client, { accountId, asOf: "2026-02-28", quantity: "10" });
+      await insertTransaction(client, {
+        accountId,
+        processDate: "2026-01-02",
+        quantity: "0",
+      });
+      // Each account gets a row for a window neither currently pairs --
+      // account A's is in scope this run, account B's is not.
+      await client.query(
+        `INSERT INTO position_reconciliations
+           (id, account_id, instrument_id, period_start, period_end, tolerance, status)
+         VALUES ($1, $2, $3, '2025-11-30', '2025-12-31', 0, 'fail')`,
+        [`v_vanished_${accountId}`, accountId, INSTRUMENT.id],
+      );
+    }
+
+    // Only A's Feb snapshot is in this run's scope, as an importer scoping a
+    // per-document gate to the account it just touched would report it.
+    await runPositionReconciliationGate(client, undefined, {
+      snapshots: [
+        { accountId: "acct_a", instrumentId: INSTRUMENT.id, date: "2026-02-28" },
+      ],
+      activity: [],
+    });
+
+    assert.equal(
+      await count(client, "position_reconciliations", "WHERE id = $1", [
+        "v_vanished_acct_a",
+      ]),
+      0,
+      "A's own stale row is gone: A was in this run's scope",
+    );
+    assert.equal(
+      await count(client, "position_reconciliations", "WHERE id = $1", [
+        "v_vanished_acct_b",
+      ]),
+      1,
+      "B's stale row survives: B was never in this run's scope",
+    );
+  },
+);

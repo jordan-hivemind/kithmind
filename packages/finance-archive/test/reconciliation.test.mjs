@@ -702,3 +702,118 @@ test(
     assert.equal(summary.passed, 1);
   },
 );
+
+// --- F1-72: a stale verdict outside the evaluated window set is deleted ----
+//
+// The archive measured this on the owner's data: after a document collapse
+// changed which windows exist, `reconciliations` still held rows for
+// periods the gate no longer evaluates at all, inflating every reader's
+// failure count. A whole-archive pass must delete anything outside the
+// windows it just evaluated; an incremental pass must do the same, but only
+// inside the accounts its own scope touched.
+
+test(
+  "a whole-archive pass deletes a stale verdict for a window that no longer exists, and keeps the one it evaluated",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedInstitution(client);
+    await seedAccount(client, "acct_vanish", "0406");
+    await insertBalance(client, {
+      id: "bal_1",
+      accountId: "acct_vanish",
+      asOf: "2026-01-31",
+      cash: "1000",
+    });
+    await insertBalance(client, {
+      id: "bal_2",
+      accountId: "acct_vanish",
+      asOf: "2026-02-28",
+      cash: "1000",
+    });
+
+    // A row for a period this account's current balances can no longer
+    // pair -- exactly what a document collapse or an account re-attribution
+    // leaves behind, reproduced directly rather than through either flow.
+    await client.query(
+      `INSERT INTO reconciliations
+         (id, account_id, period_start, period_end, currency, tolerance, status)
+       VALUES ('v_vanished', 'acct_vanish', '2025-11-30', '2025-12-31', 'USD', 0, 'fail')`,
+    );
+
+    const summary = await runReconciliationGate(client);
+    assert.equal(summary.periodsChecked, 1);
+    assert.equal(summary.passed, 1);
+
+    assert.equal(
+      await count(client, "reconciliations", "WHERE id = $1", ["v_vanished"]),
+      0,
+      "a period outside the evaluated set is deleted",
+    );
+    assert.equal(
+      await count(
+        client,
+        "reconciliations",
+        "WHERE account_id = $1 AND period_start = $2 AND period_end = $3",
+        ["acct_vanish", "2026-01-31", "2026-02-28"],
+      ),
+      1,
+      "the period the gate actually evaluated is kept",
+    );
+  },
+);
+
+test(
+  "an incremental pass scoped to one account deletes its own stale verdict and leaves another account's alone",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedInstitution(client);
+    await seedAccount(client, "acct_a", "0407");
+    await seedAccount(client, "acct_b", "0408");
+    for (const accountId of ["acct_a", "acct_b"]) {
+      await insertBalance(client, {
+        id: `bal_${accountId}_1`,
+        accountId,
+        asOf: "2026-01-31",
+        cash: "1000",
+      });
+      await insertBalance(client, {
+        id: `bal_${accountId}_2`,
+        accountId,
+        asOf: "2026-02-28",
+        cash: "1000",
+      });
+      // Each account gets a row for a period neither currently pairs --
+      // account A's is in scope this run, account B's is not.
+      await client.query(
+        `INSERT INTO reconciliations
+           (id, account_id, period_start, period_end, currency, tolerance, status)
+         VALUES ($1, $2, '2025-11-30', '2025-12-31', 'USD', 0, 'fail')`,
+        [`v_vanished_${accountId}`, accountId],
+      );
+    }
+
+    // Only A's Feb snapshot is in this run's scope, as an importer scoping a
+    // per-document gate to the account it just touched would report it.
+    await runReconciliationGate(client, undefined, {
+      snapshots: [{ accountId: "acct_a", date: "2026-02-28" }],
+      activity: [],
+    });
+
+    assert.equal(
+      await count(client, "reconciliations", "WHERE id = $1", [
+        "v_vanished_acct_a",
+      ]),
+      0,
+      "A's own stale row is gone: A was in this run's scope",
+    );
+    assert.equal(
+      await count(client, "reconciliations", "WHERE id = $1", [
+        "v_vanished_acct_b",
+      ]),
+      1,
+      "B's stale row survives: B was never in this run's scope",
+    );
+  },
+);
