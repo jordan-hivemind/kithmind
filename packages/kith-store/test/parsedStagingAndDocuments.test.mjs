@@ -713,6 +713,16 @@ test("getDocument and searchDocuments overlay the item's live card doc type onto
   assert.equal(before.title, "Quarterly statement");
   assert.equal(before.contentStatus, "ready");
 
+  // Direct-ID reads and keyword discovery both honor the caller-derived
+  // authorized space list. The low-level surface cannot authorize itself,
+  // but it must never make a forged broader list unnecessary.
+  const foreignSpaceId = seedSpace();
+  assert.equal(await documents.getDocument(client, [foreignSpaceId], document.id), null);
+  assert.deepEqual(
+    (await documents.searchDocuments(client, [foreignSpaceId], { query: "quarterly" })).results,
+    [],
+  );
+
   const searchBefore = await documents.searchDocuments(client, [spaceId], { query: "quarterly" });
   assert.equal(searchBefore.results.length, 1);
   assert.equal(searchBefore.results[0].docType, "statement");
@@ -741,4 +751,25 @@ test("getDocument and searchDocuments overlay the item's live card doc type onto
 
   const filteredOut = await documents.searchDocuments(client, [spaceId], { query: "quarterly", docType: "statement" });
   assert.equal(filteredOut.results.length, 0);
+
+  // A forged evidence pointer cannot become a citation: it is not in this
+  // document's revision/text chain, so the read reports partial content and
+  // withholds the pointer rather than returning a cross-chain quote.
+  await client.query("UPDATE kith.documents SET evidence_span_ids = $1::jsonb WHERE id = $2", [JSON.stringify([opaqueId()]), document.id]);
+  const forgedCitation = await documents.getDocument(client, [spaceId], document.id);
+  assert.ok(forgedCitation);
+  assert.deepEqual(forgedCitation.evidenceSpanIds, []);
+  assert.equal(forgedCitation.partial, true);
+
+  // An active document disappears from ordinary reads when its generation is
+  // superseded, while an explicit historical read remains available and says
+  // so. This is the source/document lifecycle boundary the read API exposes.
+  await client.query("UPDATE kith.documents SET publication_state = 'historical' WHERE id = $1", [document.id]);
+  await client.query("UPDATE kith.chunks SET publication_state = 'historical' WHERE document_id = $1", [document.id]);
+  await client.query("UPDATE kith.processing_generations SET deactivated_at = transaction_timestamp() WHERE id = $1", [generationId]);
+  assert.equal(await documents.getDocument(client, [spaceId], document.id), null);
+  const historical = await documents.getDocument(client, [spaceId], document.id, true);
+  assert.ok(historical);
+  assert.equal(historical.historical, true);
+  assert.equal(historical.contentStatus, "historical");
 });
