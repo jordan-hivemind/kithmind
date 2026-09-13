@@ -608,6 +608,67 @@ export const resumeExtractionQueue = internalMutation({
   },
 });
 
+/** Same bound `reviewQueue.ts` uses for its own `cardFieldDrops` scans:
+ * neither table caps a source account's or a space's drop rows on its own. */
+const MAX_RERUN_SCAN_ROWS = 256;
+
+/**
+ * `npx convex run models/records/cardQueue:rerunGateFailed`. Section 7: a
+ * `card_gate_failed` drop is what `hasReviewItem` checks forever, so once one
+ * exists for a document the queue's forward-only cursor never reconsiders it
+ * even after the underlying problem (a prompt version, a gate fix) is
+ * resolved. This deletes this kind's `card_gate_failed` drops for a space, or
+ * for one source account within it, and rewinds the cursor so the next tick's
+ * scan starts over and reoffers every document that was only being skipped
+ * for those drops. Counts only: no field value or document text is read or
+ * returned.
+ */
+export const rerunGateFailed = internalMutation({
+  args: {
+    spaceId: v.id("spaces"),
+    kind: kindArg,
+    sourceAccountId: v.optional(v.id("sourceAccounts")),
+    now: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const kind = requireKind(args.kind);
+    const state = await requireQueueState(ctx, args.spaceId, kind);
+    const sourceAccountId = args.sourceAccountId;
+    const rows = sourceAccountId
+      ? await ctx.db
+          .query("cardFieldDrops")
+          .withIndex("by_space_account", (q) =>
+            q.eq("spaceId", args.spaceId).eq("sourceAccountId", sourceAccountId),
+          )
+          .take(MAX_RERUN_SCAN_ROWS + 1)
+      : await ctx.db
+          .query("cardFieldDrops")
+          .withIndex("by_spaceId", (q) => q.eq("spaceId", args.spaceId))
+          .take(MAX_RERUN_SCAN_ROWS + 1);
+    const truncated = rows.length > MAX_RERUN_SCAN_ROWS;
+    const matching = rows
+      .slice(0, MAX_RERUN_SCAN_ROWS)
+      .filter((row) => row.kind === "card_gate_failed" && row.recordKind === kind);
+    for (const row of matching) {
+      await ctx.db.delete(row._id);
+    }
+    if (matching.length > 0) {
+      await ctx.db.patch(state._id, {
+        cursor: null,
+        // `claimNextForExtraction` returns "idle" on phase alone, before it
+        // ever looks at the cursor: an idle queue reached the end of the
+        // space's documents on its last scan, and rewinding the cursor with
+        // no phase change would leave it declaring itself idle forever. A
+        // paused queue is left exactly as paused; only
+        // `resumeExtractionQueue` lifts a pause.
+        ...(state.phase === "idle" ? { phase: "running" as const } : {}),
+        updatedAt: args.now ?? Date.now(),
+      });
+    }
+    return { clearedCount: matching.length, truncated };
+  },
+});
+
 async function estimateQueueCounts(
   ctx: QueryCtx,
   input: { spaceId: Id<"spaces">; kind: CardRecordKind },

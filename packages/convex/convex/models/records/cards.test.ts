@@ -43,7 +43,10 @@ const DATE = "2025-03-04";
 const PARTY_ONE = "Northwind Supply";
 const PARTY_TWO = "Acme Research";
 const SUMMARY = "both sides keep the other side's material confidential";
-const CARD_KIND = "Non-Disclosure Agreement";
+// One of DOCUMENT_CARD_KINDS. Decision 1 of P2-82: card_kind is proven by
+// the card's own anchor, never by a span of its own, so this value is never
+// looked up in TEXT the way the other fixture quotes are.
+const CARD_KIND = "contract";
 
 const FINGERPRINT = {
   cardSchemaVersion: 1,
@@ -113,7 +116,8 @@ async function seedDocument(options: { withSubjectEntity: boolean }) {
       sourceTextVersionId: textVersion._id,
       pages: [{ ordinal: 0, start: 0, end: TEXT.length, text: TEXT }],
     });
-    const quotes = [TITLE, DATE, PARTY_ONE, PARTY_TWO, SUMMARY, CARD_KIND];
+    // CARD_KIND is not a quote: decision 1 of P2-82 proves it by the anchor.
+    const quotes = [TITLE, DATE, PARTY_ONE, PARTY_TWO, SUMMARY];
     const spans = await stageEvidenceSpans(ctx, {
       spaceId,
       sourceRevisionId: revision._id,
@@ -267,7 +271,10 @@ function genericFields(
     {
       field: "card_kind",
       value: { type: "text", value: CARD_KIND },
-      evidenceSpanIds: [evidence[CARD_KIND]!],
+      // Decision 1 of P2-82: no evidence span is required or read for this
+      // field. It is proven by the anchor resolving and the value being one
+      // of DOCUMENT_CARD_KINDS.
+      evidenceSpanIds: [],
     },
     {
       field: "card_title",
@@ -917,6 +924,35 @@ describe("document cards", () => {
       "spaceId",
       "step",
     ]);
+  });
+
+  test("P2-82: card_kind publishes with no evidence span and drops alone when not a declared kind", async () => {
+    const seeded = await seedDocument({ withSubjectEntity: true });
+    // The base fixture's card_kind already carries no evidenceSpanIds
+    // (decision 1: proven by the anchor, never by a span of its own), so a
+    // correct value here is already exercised by the very first test in this
+    // file. This test is the other branch: a value the closed enum refuses.
+    const published = await seeded.t.run((ctx) =>
+      publishDocumentCard(ctx, {
+        spaceId: seeded.spaceId,
+        sourceItemId: seeded.sourceItemId,
+        userId: seeded.userId,
+        recordKind: "document_card",
+        now: 1_000,
+        fingerprint: FINGERPRINT,
+        anchorEvidenceSpanIds: [seeded.evidence[TITLE]!],
+        fields: withValue(genericFields(seeded.evidence), "card_kind", {
+          type: "text",
+          value: "not a real kind",
+        }),
+      }),
+    );
+    expect(published.published).toBe(true);
+    expect(published.requiredFieldFailed).toBe(false);
+    expect(published.droppedFields).toEqual([
+      { key: "card_kind", code: "value_not_normalizable" },
+    ]);
+    expect(published.storedFields).not.toContain("card_kind");
   });
 });
 

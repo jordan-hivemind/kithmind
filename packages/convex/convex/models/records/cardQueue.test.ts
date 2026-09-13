@@ -501,6 +501,65 @@ describe("the card extraction queue", () => {
     expect(drops.filter((d) => d.kind === "card_gate_failed").length).toBe(1);
   });
 
+  test("rerunGateFailed clears the drop and lets the queue reconsider the document", async () => {
+    const t = convexTest(schema, modules);
+    const { userId, spaceId, sourceAccountId } = await seedSpace(t);
+    const [gateFailed, healthy] = await seedItems(t, {
+      spaceId,
+      sourceAccountId,
+      userId,
+      count: 2,
+    });
+    await startQueue(t, { spaceId });
+
+    // Reproduces the previous test's setup: the first document fails the
+    // gate and is never retried, then the queue drains the rest and goes
+    // idle.
+    await runCardExtractionQueueTick(
+      tickOps({ t, spaceId, userId, now: MONDAY, wrong: true }),
+    );
+    await runUntilStopped(() => tickOps({ t, spaceId, userId, now: MONDAY }));
+    const before = await t.run((ctx) => ctx.db.query("cardFieldDrops").collect());
+    expect(before.filter((d) => d.kind === "card_gate_failed")).toHaveLength(1);
+    const idleStatus = await t.query(
+      internal.models.records.cardQueue.cardExtractionQueueStatus,
+      { spaceId, kind: "document_card" },
+    );
+    expect(idleStatus.phase).toBe("idle");
+
+    const result = await t.mutation(internal.models.records.cardQueue.rerunGateFailed, {
+      spaceId,
+      kind: "document_card",
+    });
+    expect(result).toEqual({ clearedCount: 1, truncated: false });
+
+    const after = await t.run((ctx) => ctx.db.query("cardFieldDrops").collect());
+    expect(after.filter((d) => d.kind === "card_gate_failed")).toHaveLength(0);
+
+    const ladderCalls: Id<"sourceItems">[] = [];
+    const rerun = await runUntilStopped(() =>
+      tickOps({ t, spaceId, userId, now: MONDAY, onLadderCall: (id) => ladderCalls.push(id) }),
+    );
+    // The previously gate-failed document is claimed and (this time, with a
+    // correct candidate) accepted; the already-accepted document is only
+    // advanced past, never re-run through the ladder.
+    expect(ladderCalls).toEqual([gateFailed]);
+    expect(ladderCalls).not.toContain(healthy);
+    expect(rerun.filter((r) => r.status === "claimed").length).toBe(1);
+    expect(await acceptedCardCount(t, spaceId)).toBe(2);
+  });
+
+  test("rerunGateFailed is a no-op count when there is nothing to clear", async () => {
+    const t = convexTest(schema, modules);
+    const { spaceId } = await seedSpace(t);
+    await startQueue(t, { spaceId });
+    const result = await t.mutation(internal.models.records.cardQueue.rerunGateFailed, {
+      spaceId,
+      kind: "document_card",
+    });
+    expect(result).toEqual({ clearedCount: 0, truncated: false });
+  });
+
   test("the weekly cost budget pauses once it is reached", async () => {
     const t = convexTest(schema, modules);
     const { userId, spaceId, sourceAccountId } = await seedSpace(t);

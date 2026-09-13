@@ -22,6 +22,7 @@ import { CARD_PRICE_TABLE_VERSION } from "./cardRunner";
 import {
   cardEventKey,
   cardObservationKey,
+  isAnchorProvenField,
   isCardRecordKind,
   requireCardEventSchema,
   type CardRecordKind,
@@ -294,16 +295,21 @@ export async function publishDocumentCard(
   // every cited span must resolve in the sealed retained text of the
   // generation that holds it and recompute to its stored `quoteHash`. The
   // anchor and every field are proved before anything is written, and the
-  // proved span text is what the normalizers then read.
+  // proved span text is what the normalizers then read. Decision 1 of P2-82:
+  // an anchor-proven field (`card_kind`) is excluded here, since its
+  // evidence is the anchor's, already checked below, and no span of its own
+  // is required or read.
   const probe = await probeFieldEvidence(ctx, {
     spaceId: input.spaceId,
     processingGenerationId: base._id,
     fields: [
       { key: "", evidenceSpanIds: input.anchorEvidenceSpanIds },
-      ...input.fields.map((field) => ({
-        key: cardFieldKey(field),
-        evidenceSpanIds: field.evidenceSpanIds,
-      })),
+      ...input.fields
+        .filter((field) => !isAnchorProvenField(input.recordKind, field.field))
+        .map((field) => ({
+          key: cardFieldKey(field),
+          evidenceSpanIds: field.evidenceSpanIds,
+        })),
     ],
   });
   const evidenceCodes = new Map(
@@ -541,11 +547,19 @@ export async function publishDocumentCard(
         })
       : [];
 
+  // Decision 1 of P2-82: an anchor-proven field's own `evidenceSpanIds` is
+  // never read (it may well be empty), but every stored observation still
+  // requires non-empty evidence at the record store's own boundary
+  // (`assertEventInputShape`), so its evidence is the anchor's: already
+  // resolved above, and the literal citation of what proves the card is this
+  // kind at all.
   const observations: StagedObservation[] = storable.map((field) => ({
     observationKey: cardFieldKey(field),
     observationType: field.field,
     value: field.value,
-    valueEvidence: field.evidenceSpanIds,
+    valueEvidence: isAnchorProvenField(input.recordKind, field.field)
+      ? input.anchorEvidenceSpanIds
+      : field.evidenceSpanIds,
   }));
   const staged = await stageRecordBatch(ctx, {
     spaceId: input.spaceId,
