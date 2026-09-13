@@ -17,7 +17,7 @@ import {
 } from "./rows.js";
 
 function sameDate(left: Date | null, right: Date | null): boolean {
-  return left?.getTime() === right?.getTime();
+  return (left?.getTime() ?? 0) === (right?.getTime() ?? 0);
 }
 
 function snapshotCurrent(

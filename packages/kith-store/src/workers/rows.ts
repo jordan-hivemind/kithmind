@@ -62,12 +62,7 @@ export function camelizeSourceAccount(
 }
 
 export type WorkerScanState =
-  | "open"
-  | "sealed"
-  | "reconciling"
-  | "enumerated"
-  | "needs_review"
-  | "failed";
+  "open" | "sealed" | "reconciling" | "enumerated" | "needs_review" | "failed";
 
 export type WorkerScanFailureCode =
   | "empty"
@@ -147,7 +142,9 @@ const SCAN_NUMERIC = [
   "nextReconcileOrdinal",
 ] as const;
 
-export function camelizeScan(raw: Record<string, unknown>): WorkerSourceScanRow {
+export function camelizeScan(
+  raw: Record<string, unknown>,
+): WorkerSourceScanRow {
   return camelize<WorkerSourceScanRow>(raw, SCAN_NUMERIC);
 }
 
@@ -173,11 +170,7 @@ export function camelizeScanPage(
 }
 
 export type WorkerScanEntryState =
-  | "unchanged"
-  | "queued"
-  | "gap"
-  | "ignored_forgotten"
-  | "needs_review";
+  "unchanged" | "queued" | "gap" | "ignored_forgotten" | "needs_review";
 
 export type WorkerScanEntryRow = {
   id: string;
@@ -229,12 +222,7 @@ export function camelizeScanEntry(
 }
 
 export type WorkerDiscoveryWorkState =
-  | "queued"
-  | "leased"
-  | "admitted"
-  | "failed"
-  | "needs_review"
-  | "obsolete";
+  "queued" | "leased" | "admitted" | "failed" | "needs_review" | "obsolete";
 
 export type WorkerDiscoveryWorkRow = {
   id: string;
@@ -397,6 +385,10 @@ export type WorkerProcessingAssessmentRow = {
   createdAt: Date;
   sourceAccountId: string;
   scanId: string;
+  requestId: string;
+  requestDigest: string;
+  actorUserId: string;
+  actorCredentialId: string;
   inventoryEpoch: number;
   completedInventoryEpoch: number;
   manifestVersion: number;
@@ -412,7 +404,8 @@ export type WorkerProcessingAssessmentRow = {
   scanReviewCount: number;
   state: "running" | "complete" | "incomplete" | "stale";
   staleReason: string | null;
-  phase: string | null;
+  phase: "items" | "unresolved_entries" | "done";
+  cursor: string | null;
   nextOrdinal: number;
   counts: Record<string, unknown> | null;
   accountedScanEntries: number;
@@ -421,6 +414,11 @@ export type WorkerProcessingAssessmentRow = {
   reviewScanEntries: number;
   ignoredScanEntries: number;
   unchangedScanEntries: number;
+  lastPageRequestId: string | null;
+  lastPageRequestDigest: string | null;
+  lastPageInputPhase: "items" | "unresolved_entries" | null;
+  lastPageOrdinal: number | null;
+  lastPageResult: Record<string, unknown> | null;
   startedAt: Date;
   updatedAt: Date;
   expiresAt: Date;
@@ -448,6 +446,7 @@ export function camelizeAssessment(
     "reviewScanEntries",
     "ignoredScanEntries",
     "unchangedScanEntries",
+    "lastPageOrdinal",
   ]);
 }
 

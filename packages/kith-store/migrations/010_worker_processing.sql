@@ -183,3 +183,20 @@ CREATE INDEX worker_processing_assessments_scan_expiry_idx
   ON kith.worker_processing_assessments (scan_id, state, expires_at);
 CREATE INDEX worker_processing_assessments_retire_idx
   ON kith.worker_processing_assessments (retire_at);
+
+CREATE INDEX worker_archive_receipts_item_keyset_idx
+  ON kith.source_artifact_archive_receipts (source_item_id, created_at, id);
+CREATE INDEX worker_archive_deletion_account_deletion_idx
+  ON kith.source_artifact_deletion_acks (source_account_id, deletion_id);
+CREATE INDEX worker_archive_deletion_account_request_idx
+  ON kith.source_artifact_deletion_acks (source_account_id, request_id);
+CREATE INDEX worker_archive_deletion_receipt_epoch_idx
+  ON kith.source_artifact_deletion_acks (receipt_id, forget_epoch);
+CREATE INDEX worker_provider_original_item_keyset_idx
+  ON kith.source_provider_original_references (source_item_id, created_at, id);
+CREATE INDEX worker_provider_detach_account_detach_idx
+  ON kith.source_provider_original_detach_acks (source_account_id, detach_id);
+CREATE INDEX worker_provider_detach_account_request_idx
+  ON kith.source_provider_original_detach_acks (source_account_id, request_id);
+CREATE INDEX worker_provider_detach_reference_epoch_idx
+  ON kith.source_provider_original_detach_acks (reference_id, forget_epoch);

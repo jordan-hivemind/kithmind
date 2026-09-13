@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import test from "node:test";
 
 import { digestParsedMappingManifest } from "@repo/worker-protocol";
@@ -14,12 +15,15 @@ import {
   WorkerProtocolError,
   activateProcessingJob,
   activateParsedJob,
+  acknowledgeArchiveDeletion,
+  acknowledgeProviderOriginalDetach,
   admitArchivedDiscovery,
   appendWorkerScanPage,
   artifactBoundExtractionFingerprint,
   admitDiscoveryUtf8,
   beginWorkerScan,
   beginParsedStage,
+  beginProcessingAssessment,
   camelizeScan,
   consumeWorkerMutationRateLimit,
   decodeCursor,
@@ -30,8 +34,11 @@ import {
   preflightArchivedDiscovery,
   keysetTail,
   getWorkerDiagnosticsStatus,
+  getArchiveForgetTargets,
+  getProviderOriginalForgetTargets,
   getWorkerSourceStatus,
   recordWorkerHeartbeat,
+  advanceProcessingAssessment,
   requireWorkerSourceAccount,
   reconcileWorkerScan,
   renewProcessingJob,
@@ -1911,6 +1918,523 @@ test(
       assert.equal(published.lease_token, null);
       assert.equal(Number(published.activation_epoch), 1);
       assert.equal(published.activated_at.getTime(), snapshotClock + 1);
+    } finally {
+      await pool.end();
+    }
+  },
+);
+
+test(
+  "forget operations fence, replay, preserve malformed-history denial, and retry atomically",
+  { skip },
+  async (t) => {
+    const f = await fixture(t);
+    const pool = createKithPool(f.databaseUrl, 2);
+    const contentHash = await sha256Hex("synthetic original bytes");
+    const revision = await provenance.createOrGetArchivedRevision(f.client, {
+      spaceId: f.spaceId,
+      sourceItemId: (
+        await provenance.createOrGetSourceItem(f.client, {
+          spaceId: f.spaceId,
+          sourceAccountId: f.sourceAccountId,
+          externalId: "fixture/forget.pdf",
+        })
+      ).id,
+      contentHash,
+      byteLength: 24,
+      mediaType: "application/pdf",
+      capturedAt: new Date(NOW),
+      userId: f.userId,
+    });
+    const itemId = revision.sourceItemId;
+    const receipt = await provenance.createOrGetArchiveReceipt(f.client, {
+      spaceId: f.spaceId,
+      sourceAccountId: f.sourceAccountId,
+      sourceItemId: itemId,
+      sourceRevisionId: revision.id,
+      subjectKind: "original_bytes",
+      copyRole: "primary",
+      clientReceiptId: randomUUID(),
+      requestDigest: await sha256Hex("archive request"),
+      archiveProfileFingerprint: "1".repeat(64),
+      archiveIdentityFingerprint: "2".repeat(64),
+      recipientFingerprint: "3".repeat(64),
+      repositoryKeyDomainFingerprint: "4".repeat(64),
+      storageFailureDomainFingerprint: "5".repeat(64),
+      archiveObjectId: randomUUID(),
+      plaintextHash: contentHash,
+      plaintextByteLength: 24,
+      plaintextMediaType: "application/pdf",
+      ciphertextHash: "6".repeat(64),
+      ciphertextByteLength: 48,
+      readbackVerifiedAt: new Date(NOW),
+      userId: f.userId,
+      actorCredentialId: f.credential.id,
+      createdAt: new Date(NOW),
+    });
+    const declaration = {
+      referenceVersion: "provider_original_v1",
+      providerKind: "dropbox_v1",
+      clientReferenceId: randomUUID(),
+      sourceContentHash: contentHash,
+      sourceByteLength: 24,
+      providerAccountIdHash: "7".repeat(64),
+      providerRootDirectoryIdHash: "8".repeat(64),
+      providerFileIdHash: "9".repeat(64),
+      providerRevision: "rev-synthetic",
+      providerContentHash: "a".repeat(64),
+      verifiedAt: NOW,
+      locatorBundle: {
+        bindingId: randomUUID(),
+        manifestFingerprint: "b".repeat(64),
+        recipientFingerprint: "c".repeat(64),
+        repositoryKeyDomainFingerprint: "d".repeat(64),
+        repositoryId: "e".repeat(64),
+        snapshotId: "f".repeat(64),
+        objectName: "synthetic-original.age",
+        ciphertextHash: "0".repeat(64),
+        ciphertextByteLength: 64,
+        readbackVerifiedAt: NOW,
+      },
+      createdAt: NOW,
+    };
+    const { reference } = await provenance.createAndBindProviderOriginal(
+      f.client,
+      {
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        sourceItemId: itemId,
+        sourceRevisionId: revision.id,
+        declaration,
+        requestDigest: await sha256Hex("provider request"),
+        userId: f.userId,
+        actorCredentialId: f.credential.id,
+        now: new Date(NOW),
+      },
+    );
+    const forgetEpoch = await provenance.beginSourceItemForget(f.client, {
+      spaceId: f.spaceId,
+      sourceItemId: itemId,
+      forgottenAt: new Date(NOW),
+      forgottenBy: f.userId,
+    });
+    const common = {
+      protocolVersion: 1,
+      spaceId: f.spaceId,
+      sourceAccountId: f.sourceAccountId,
+      sourceItemId: itemId,
+      expectedForgetEpoch: forgetEpoch,
+    };
+    const call = (work, now = NOW) => withWorkerTransaction(pool, work, now);
+    try {
+      const archiveTargets = await call((ctx) =>
+        getArchiveForgetTargets(ctx, f.principal, {
+          ...common,
+          operation: "archive.forgetTargets",
+          requestId: "archive-targets",
+          paginationOpts: { cursor: null, numItems: 10 },
+        }),
+      );
+      assert.deepEqual(
+        archiveTargets.targets.map((value) => value.receiptId),
+        [receipt.id],
+      );
+      const providerTargets = await call((ctx) =>
+        getProviderOriginalForgetTargets(ctx, f.principal, {
+          ...common,
+          operation: "providerOriginal.forgetTargets",
+          requestId: "provider-targets",
+          paginationOpts: { cursor: null, numItems: 10 },
+        }),
+      );
+      assert.deepEqual(
+        providerTargets.targets.map((value) => value.referenceId),
+        [reference.id],
+      );
+
+      const unauthorized = await makeApiKey(f.ctx(NOW), {
+        userId: f.userId,
+        capabilities: ["ingest"],
+        spaceIds: [f.spaceId],
+        sourceAccountIds: [],
+      });
+      await assert.rejects(
+        call((ctx) =>
+          getArchiveForgetTargets(
+            ctx,
+            { userId: f.userId, credentialId: unauthorized.id },
+            {
+              ...common,
+              operation: "archive.forgetTargets",
+              requestId: "denied",
+              paginationOpts: { cursor: null, numItems: 1 },
+            },
+          ),
+        ),
+        expectProtocolCode("not_authorized"),
+      );
+
+      const archiveAckRequest = {
+        ...common,
+        operation: "archive.ackDeletion",
+        requestId: "archive-ack",
+        deletionId: randomUUID(),
+        receiptId: receipt.id,
+        objectOutcome: "deleted",
+      };
+      let attempts = 0;
+      const archiveAck = await call(async (ctx) => {
+        const result = await acknowledgeArchiveDeletion(
+          ctx,
+          f.principal,
+          archiveAckRequest,
+        );
+        if (attempts++ === 0)
+          throw Object.assign(new Error("forced serialization"), {
+            code: "40001",
+          });
+        return result;
+      });
+      assert.equal(attempts, 2);
+      assert.equal(archiveAck.reused, false);
+      assert.equal(
+        Number(
+          (
+            await f.client.query(
+              "SELECT count(*) FROM kith.source_artifact_deletion_acks WHERE receipt_id=$1",
+              [receipt.id],
+            )
+          ).rows[0].count,
+        ),
+        1,
+      );
+      assert.equal(
+        (
+          await call((ctx) =>
+            acknowledgeArchiveDeletion(ctx, f.principal, archiveAckRequest),
+          )
+        ).reused,
+        true,
+      );
+      await f.client.query(
+        "UPDATE kith.source_artifact_deletion_acks SET ack_version='corrupt' WHERE receipt_id=$1",
+        [receipt.id],
+      );
+      await assert.rejects(
+        call((ctx) =>
+          acknowledgeArchiveDeletion(ctx, f.principal, archiveAckRequest),
+        ),
+        expectProtocolCode("request_conflict"),
+      );
+
+      const detachRequest = {
+        ...common,
+        operation: "providerOriginal.ackDetach",
+        requestId: "provider-detach",
+        detachId: randomUUID(),
+        referenceId: reference.id,
+        locatorBindingId: reference.locatorBindingId,
+        locatorRepositoryId: reference.locatorRepositoryId,
+        locatorSnapshotId: reference.locatorSnapshotId,
+        locatorObjectName: reference.locatorObjectName,
+        referenceOutcome: "detached",
+        locatorBundleOutcome: "deleted",
+        locatorAbsenceAuthority: "worker_asserted_live_repository_absence",
+        retentionDisclosure: "provider_retained_deleted_history_possible",
+        providerSourceOutcome: "retained_unchanged",
+      };
+      assert.equal(
+        (
+          await call((ctx) =>
+            acknowledgeProviderOriginalDetach(ctx, f.principal, detachRequest),
+          )
+        ).reused,
+        false,
+      );
+      assert.equal(
+        (
+          await call((ctx) =>
+            acknowledgeProviderOriginalDetach(ctx, f.principal, detachRequest),
+          )
+        ).reused,
+        true,
+      );
+      await assert.rejects(
+        call((ctx) =>
+          acknowledgeProviderOriginalDetach(ctx, f.principal, {
+            ...detachRequest,
+            locatorObjectName: "changed.age",
+          }),
+        ),
+        expectProtocolCode("request_conflict"),
+      );
+    } finally {
+      await pool.end();
+    }
+  },
+);
+
+test(
+  "processing assessment snapshots complete scans, replays pages, and expires stale work",
+  { skip },
+  async (t) => {
+    const f = await fixture(t);
+    const { scan } = await makeScan(f, 1);
+    await f.client.query(
+      `UPDATE kith.worker_source_scans SET state='enumerated', inventory_done=true,
+       completed_at=$2, reconcile_manifest_version=0 WHERE id=$1`,
+      [scan.id, new Date(NOW)],
+    );
+    await f.client.query(
+      `UPDATE kith.source_accounts SET inventory_epoch=1,
+       completed_inventory_epoch=1, last_enumerated_at=$2,
+       active_worker_scan_id=NULL WHERE id=$1`,
+      [f.sourceAccountId, new Date(NOW)],
+    );
+    const pool = createKithPool(f.databaseUrl, 2);
+    const common = {
+      protocolVersion: 1,
+      spaceId: f.spaceId,
+      sourceAccountId: f.sourceAccountId,
+    };
+    const call = (work, now = NOW) => withWorkerTransaction(pool, work, now);
+    try {
+      const beginRequest = {
+        ...common,
+        operation: "processing.assessBegin",
+        requestId: "assess-begin",
+        scanId: scan.id,
+        expectedInventoryEpoch: 1,
+        expectedManifestVersion: 0,
+      };
+      const begun = await call((ctx) =>
+        beginProcessingAssessment(ctx, f.principal, beginRequest),
+      );
+      assert.equal(begun.state, "running");
+      assert.equal(
+        (
+          await call((ctx) =>
+            beginProcessingAssessment(ctx, f.principal, beginRequest),
+          )
+        ).reused,
+        true,
+      );
+      const page0 = {
+        ...common,
+        operation: "processing.assessPage",
+        requestId: "assess-page-0",
+        assessmentId: begun.assessmentId,
+        ordinal: 0,
+        maxItems: 10,
+      };
+      assert.equal(
+        (
+          await call((ctx) =>
+            advanceProcessingAssessment(ctx, f.principal, page0),
+          )
+        ).phase,
+        "unresolved_entries",
+      );
+      const page1 = { ...page0, requestId: "assess-page-1", ordinal: 1 };
+      const completed = await call((ctx) =>
+        advanceProcessingAssessment(ctx, f.principal, page1),
+      );
+      assert.equal(completed.state, "complete");
+      assert.deepEqual(completed.counts, {
+        items: {
+          ready: 0,
+          pending: 0,
+          failed: 0,
+          parked: 0,
+          needsReview: 0,
+          explicitGap: 0,
+          unavailable: 0,
+          ignoredForgotten: 0,
+        },
+        unresolvedEntries: { needsReview: 0, ignoredForgotten: 0 },
+      });
+      assert.equal(
+        (
+          await call((ctx) =>
+            advanceProcessingAssessment(ctx, f.principal, page1),
+          )
+        ).reused,
+        true,
+      );
+
+      await f.client.query(
+        'UPDATE kith.worker_processing_assessments SET last_page_result=\'{"state":"complete"}\'::jsonb WHERE id=$1',
+        [begun.assessmentId],
+      );
+      const malformedReplay = await call((ctx) =>
+        advanceProcessingAssessment(ctx, f.principal, page1),
+      );
+      assert.equal(malformedReplay.state, "stale");
+      assert.equal(malformedReplay.staleReason, "detail_unavailable");
+
+      const { scan: scan2 } = await makeScan(f, 2);
+      const corruptItem = await provenance.createOrGetSourceItem(f.client, {
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        externalId: "fixture/corrupt-ready.txt",
+        title: "Corrupt ready",
+      });
+      const corruptRevision = await provenance.createOrGetRevision(f.client, {
+        spaceId: f.spaceId,
+        sourceItemId: corruptItem.id,
+        mediaType: "text/plain;charset=utf-8",
+        inlineText: "synthetic",
+        capturedAt: new Date(NOW),
+        userId: f.userId,
+      });
+      const generationId = newKithId();
+      const jobId = newKithId();
+      const entryId = newKithId();
+      await f.client.query(
+        `INSERT INTO kith.processing_generations
+        (id,space_id,created_at,source_account_id,source_item_id,source_revision_id,
+         desired_processing_epoch,card_generation,state,activated_at)
+        VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,1,false,'ready',$6)`,
+        [
+          generationId,
+          f.spaceId,
+          f.sourceAccountId,
+          corruptItem.id,
+          corruptRevision.id,
+          new Date(NOW),
+        ],
+      );
+      await f.client.query(
+        `INSERT INTO kith.ingest_jobs
+        (id,space_id,created_at,source_account_id,source_item_id,source_revision_id,
+         processing_generation_id,admitted_by_user_id,admitted_by_credential_id,
+         actor_user_id,actor_credential_id,desired_processing_epoch,state,
+         attempts,lease_epoch,lease_token,lease_expires_at,worker_managed,
+         worker_lease_owner_credential_id)
+        VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6,$7,$8,$7,$8,1,'ready',1,1,$9,$10,true,$8)`,
+        [
+          jobId,
+          f.spaceId,
+          f.sourceAccountId,
+          corruptItem.id,
+          corruptRevision.id,
+          generationId,
+          f.userId,
+          f.credential.id,
+          "f".repeat(64),
+          new Date(NOW + 60_000),
+        ],
+      );
+      await f.client.query(
+        `UPDATE kith.source_items SET uri='fs://synthetic/corrupt-ready.txt',
+        desired_revision_id=$2,desired_processing_epoch=1,active_revision_id=$2,
+        active_generation_id=$3,worker_observation_epoch=1,worker_processing_epoch=1,
+        worker_content_hash=$4,worker_source_modified_at=$5,worker_profile_id='fs-text:v1',
+        worker_last_seen_inventory_epoch=2 WHERE id=$1`,
+        [
+          corruptItem.id,
+          corruptRevision.id,
+          generationId,
+          corruptRevision.contentHash,
+          new Date(NOW),
+        ],
+      );
+      await f.client.query(
+        `INSERT INTO kith.worker_scan_entries
+        (id,space_id,source_account_id,scan_id,scan_page_id,source_item_id,
+         identity_key_hash,external_id_hash,uri_digest,inventory_metadata_digest,
+         processing_identity_digest,content_hash,byte_length,content_representation,
+         source_modified_at,observation_epoch,processing_epoch,state,observed_at,retire_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'inline_utf8_v1',$14,1,1,'unchanged',$14,$15)`,
+        [
+          entryId,
+          f.spaceId,
+          f.sourceAccountId,
+          scan2.id,
+          (
+            await f.client.query(
+              "SELECT id FROM kith.worker_scan_pages WHERE scan_id=$1",
+              [scan2.id],
+            )
+          ).rows[0].id,
+          corruptItem.id,
+          "1".repeat(64),
+          corruptItem.externalIdHash,
+          "2".repeat(64),
+          "3".repeat(64),
+          "4".repeat(64),
+          corruptRevision.contentHash,
+          corruptRevision.byteLength,
+          new Date(NOW),
+          new Date(NOW + 120_000),
+        ],
+      );
+      await f.client.query(
+        "UPDATE kith.worker_scan_pages SET entry_count=1 WHERE scan_id=$1",
+        [scan2.id],
+      );
+      await f.client.query(
+        "UPDATE kith.worker_source_scans SET state='enumerated', inventory_done=true, completed_at=$2, reconcile_manifest_version=0, entry_count=1 WHERE id=$1",
+        [scan2.id, new Date(NOW)],
+      );
+      await f.client.query(
+        "UPDATE kith.source_accounts SET inventory_epoch=2, completed_inventory_epoch=2, last_enumerated_at=$2, active_worker_scan_id=NULL, active_worker_assessment_id=NULL WHERE id=$1",
+        [f.sourceAccountId, new Date(NOW)],
+      );
+      const begun2 = await call((ctx) =>
+        beginProcessingAssessment(ctx, f.principal, {
+          ...beginRequest,
+          requestId: "assess-corrupt-ready",
+          scanId: scan2.id,
+          expectedInventoryEpoch: 2,
+        }),
+      );
+      const corrupt0 = await call((ctx) =>
+        advanceProcessingAssessment(ctx, f.principal, {
+          ...page0,
+          requestId: "assess-corrupt-0",
+          assessmentId: begun2.assessmentId,
+        }),
+      );
+      const corruptDone = await call((ctx) =>
+        advanceProcessingAssessment(ctx, f.principal, {
+          ...page1,
+          requestId: "assess-corrupt-1",
+          assessmentId: begun2.assessmentId,
+        }),
+      );
+      assert.equal(corrupt0.phase, "unresolved_entries");
+      assert.equal(corruptDone.state, "incomplete");
+      assert.equal(corruptDone.counts.items.unavailable, 1);
+
+      const { scan: scan3 } = await makeScan(f, 3);
+      await f.client.query(
+        "UPDATE kith.worker_source_scans SET state='enumerated', inventory_done=true, completed_at=$2, reconcile_manifest_version=0 WHERE id=$1",
+        [scan3.id, new Date(NOW)],
+      );
+      await f.client.query(
+        "UPDATE kith.source_accounts SET inventory_epoch=3, completed_inventory_epoch=3, last_enumerated_at=$2, active_worker_scan_id=NULL, active_worker_assessment_id=NULL WHERE id=$1",
+        [f.sourceAccountId, new Date(NOW)],
+      );
+      const begun3 = await call((ctx) =>
+        beginProcessingAssessment(ctx, f.principal, {
+          ...beginRequest,
+          requestId: "assess-expiring",
+          scanId: scan3.id,
+          expectedInventoryEpoch: 3,
+        }),
+      );
+      const expired = await call(
+        (ctx) =>
+          advanceProcessingAssessment(ctx, f.principal, {
+            ...page0,
+            requestId: "assess-expired-page",
+            assessmentId: begun3.assessmentId,
+          }),
+        NOW + 30 * 60 * 1_000,
+      );
+      assert.equal(expired.state, "stale");
+      assert.equal(expired.staleReason, "expired");
     } finally {
       await pool.end();
     }

@@ -5,6 +5,8 @@ import { workerCtx, type WorkerCtx } from "./db.js";
 
 export * from "./auth.js";
 export * from "./archivedDiscovery.js";
+export * from "./archiveForget.js";
+export * from "./assessment.js";
 export * from "./cursor.js";
 export * from "./db.js";
 export * from "./digests.js";
@@ -15,6 +17,7 @@ export * from "./errors.js";
 export * from "./jobs.js";
 export * from "./parsedJobs.js";
 export * from "./profile.js";
+export * from "./providerOriginalForget.js";
 export * from "./rateLimit.js";
 export * from "./rows.js";
 export * from "./scans.js";

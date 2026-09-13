@@ -36,7 +36,7 @@ import {
   type PrincipalRef,
 } from "../identity/authorization.js";
 import { row, type WorkerCtx } from "./db.js";
-import { workerProtocolError } from "./errors.js";
+import { isWorkerTransactionAbort, workerProtocolError } from "./errors.js";
 import { camelizeSourceAccount, type SourceAccountRow } from "./rows.js";
 
 export type WorkerPrincipal = {
@@ -55,7 +55,10 @@ export function requireWorkerPrincipal(
   principal: PrincipalRef,
 ): WorkerPrincipal {
   if (!principal.credentialId) workerProtocolError("not_authenticated");
-  if (!KITH_ID.test(principal.userId) || !KITH_ID.test(principal.credentialId)) {
+  if (
+    !KITH_ID.test(principal.userId) ||
+    !KITH_ID.test(principal.credentialId)
+  ) {
     workerProtocolError("not_authenticated");
   }
   return {
@@ -96,14 +99,16 @@ export async function requireWorkerSourceAccountAccess(
   let reloaded;
   try {
     reloaded = await reloadPrincipal(identity, workerPrincipal);
-  } catch {
+  } catch (error) {
+    if (isWorkerTransactionAbort(error)) throw error;
     workerProtocolError("not_authenticated");
   }
   const account = await loadSourceAccount(ctx, sourceAccountId);
   if (!account) workerProtocolError("not_authorized");
   try {
     await requireSpaceAccess(identity, reloaded, account.spaceId, "ingest");
-  } catch {
+  } catch (error) {
+    if (isWorkerTransactionAbort(error)) throw error;
     workerProtocolError("not_authorized");
   }
   if (
@@ -132,7 +137,10 @@ export async function requireWorkerSourceAccount(
   principal: PrincipalRef,
   request: { spaceId: string; sourceAccountId: string },
 ): Promise<LoadedWorkerSource> {
-  if (!KITH_ID.test(request.spaceId) || !KITH_ID.test(request.sourceAccountId)) {
+  if (
+    !KITH_ID.test(request.spaceId) ||
+    !KITH_ID.test(request.sourceAccountId)
+  ) {
     workerProtocolError("invalid_request");
   }
   const { principal: workerPrincipal, account } =
@@ -169,7 +177,8 @@ export async function requireOriginalActor(
     if (account.spaceId !== source.spaceId || account.connector !== "fs") {
       workerProtocolError("not_authorized");
     }
-  } catch {
+  } catch (error) {
+    if (isWorkerTransactionAbort(error)) throw error;
     workerProtocolError("not_authorized");
   }
 }
