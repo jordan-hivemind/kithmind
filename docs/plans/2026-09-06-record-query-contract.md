@@ -31,6 +31,20 @@ generation in that transaction. Connecting the document and card workers to
 this boundary, worker lease claims, card generation, routes, query sessions and
 the query engine remain separate components.
 
+### PostgreSQL worker publication boundary (P2-39f3)
+
+Inline and parsed worker activation now run complete record-generation
+validation after the current lease fence and before any publication effect, in
+the same caller-owned `SERIALIZABLE` transaction. Record validation runs even
+when both admitted counts are zero, and any count or semantic mismatch aborts
+the receipt, generation, document, embedding and snapshot-clock changes.
+
+The current worker protocols still admit zero typed records. Parsed sealing
+continues to require zero record rows, so this wiring does not permit record
+injection after a parsed manifest is sealed. A future worker record-staging
+protocol must explicitly admit nonzero counts before either worker lane can
+publish them.
+
 ## Storage and publication
 
 | Record        | Identity and behavior                                                                |

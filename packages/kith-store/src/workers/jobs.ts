@@ -19,6 +19,7 @@ import {
   sha256Hex,
 } from "../ingestion/inline.js";
 import { newKithId, KITH_ID } from "../ids.js";
+import { validateGenerationRecords } from "../records/model.js";
 import {
   activateSourceItemGeneration,
   createOrGetTextVersion,
@@ -1055,6 +1056,27 @@ export async function activateProcessingJob(
     counts.chunks !== current.generation.actualChunkCount
   )
     workerProtocolError("scan_conflict");
+  try {
+    const validated = await validateGenerationRecords(ctx.client, {
+      spaceId: source.spaceId,
+      processingGenerationId: current.generation.id,
+      expectedEventCount: current.generation.expectedEventCount ?? 0,
+      expectedObservationCount:
+        current.generation.expectedObservationCount ?? 0,
+    });
+    if (
+      validated.eventVersions.length !==
+        (current.generation.actualEventCount ?? 0) ||
+      validated.observations.length !==
+        (current.generation.actualObservationCount ?? 0)
+    ) {
+      workerProtocolError("scan_conflict");
+    }
+  } catch (error) {
+    if (isTransactionAbort(error)) throw error;
+    if (workerProtocolErrorCode(error)) throw error;
+    workerProtocolError("scan_conflict");
+  }
   let previousGenerationId: string | undefined;
   try {
     ({ previousGenerationId } = await activateSourceItemGeneration(ctx.client, {
