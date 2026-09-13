@@ -28,6 +28,14 @@ export type SourceItemRow = {
   title: string | null;
   docType: string | null;
   uri: string | null;
+  /**
+   * P2-39d2, migration 006: the accepted `card_kind` of the item's live
+   * card, ported from Convex's `sourceItemFields.cardDocType` (P2-80i).
+   * `effectiveDocType` in `../documents/model.ts` overlays this on an
+   * active document's own `docType`; it is not read anywhere else in this
+   * row, since writing it is the cards domain's job (row f, out of scope).
+   */
+  cardDocType: string | null;
   lifecycle: SourceLifecycle;
   originalLinkAvailable: boolean;
   desiredRevisionId: string | null;
@@ -148,7 +156,26 @@ export type ChunkRow = {
   publicationState: PublicationState;
 };
 
-export type ProcessingGenerationState = "staging" | "ready" | "superseded";
+/**
+ * P2-39d2 correction: PR206 declared this as `"staging" | "ready" |
+ * "superseded"`, a plausible-looking three-state guess nothing in that PR's
+ * own code branched on. The real column (`processing_generations.state`)
+ * carries Convex's `processingStateValidator`
+ * (`packages/convex/convex/models/ingestion/validators.ts`, the ingestion
+ * domain's own enum, row e) verbatim -- migration 004 copied the column as
+ * plain `text` with no CHECK, so the mistake was invisible until a caller
+ * needed to compare against a real value. `verifySealedParsedPayload`
+ * (parsedStaging.ts) is that caller: it distinguishes a staged, active and
+ * historical generation by `state === "staged"` and `state === "ready"`
+ * paired with `deactivatedAt`, exactly as the Convex original does.
+ */
+export type ProcessingGenerationState =
+  | "queued"
+  | "processing"
+  | "staged"
+  | "ready"
+  | "needs_review"
+  | "failed";
 
 export type ProcessingGenerationRow = {
   id: string;
@@ -369,4 +396,312 @@ export function camelizeSourceArtifactArchiveReceipt(
 
 export function camelizeSourceInventory(row: Record<string, unknown>): SourceInventoryRow {
   return camelize<SourceInventoryRow>(row, ["byteLength"]);
+}
+
+// P2-39d2 additions: archive bindings/deletion, provider originals, the
+// parsed-staging row and its sealed manifest. Same convention as above --
+// one row type and one camelizer per table, field names matching the Convex
+// validators in models/provenance/validators.ts one for one.
+
+export type SourceArtifactArchiveBindingRow = {
+  id: string;
+  spaceId: string;
+  createdAt: Date;
+  sourceAccountId: string;
+  sourceItemId: string;
+  sourceRevisionId: string;
+  parserArtifactId: string | null;
+  subjectKind: ArchiveSubjectKind;
+  subjectKey: string;
+  copyRole: ArchiveCopyRole;
+  receiptId: string;
+  archiveIdentityFingerprint: string;
+  bindingEpoch: number;
+  updatedAt: Date;
+  userId: string;
+  actorCredentialId: string;
+};
+
+export function camelizeSourceArtifactArchiveBinding(
+  row: Record<string, unknown>,
+): SourceArtifactArchiveBindingRow {
+  return camelize<SourceArtifactArchiveBindingRow>(row, ["bindingEpoch"]);
+}
+
+export type ArchiveAbsenceAuthority =
+  | "worker_asserted_physical_absence"
+  | "worker_asserted_live_repository_absence";
+
+export type SourceArtifactDeletionAckRow = {
+  id: string;
+  spaceId: string;
+  createdAt: Date;
+  sourceAccountId: string;
+  sourceItemId: string;
+  receiptId: string;
+  forgetEpoch: number;
+  deletionId: string;
+  requestId: string;
+  requestDigest: string;
+  ackVersion: "archive_deletion_ack_v1";
+  absenceAuthority: ArchiveAbsenceAuthority;
+  retentionDisclosure: "provider_retained_deleted_history_possible" | null;
+  clientReceiptId: string;
+  receiptRequestDigest: string;
+  sourceRevisionId: string;
+  parserArtifactId: string | null;
+  subjectKind: ArchiveSubjectKind;
+  copyRole: ArchiveCopyRole;
+  receiptVersion: "archive_receipt_v1";
+  archiveRepresentation: "age_encrypted_v1";
+  archiveProfileFingerprint: string;
+  archiveIdentityFingerprint: string;
+  recipientFingerprint: string;
+  repositoryKeyDomainFingerprint: string;
+  storageFailureDomainFingerprint: string;
+  archiveObjectId: string;
+  plaintextHash: string;
+  plaintextByteLength: number;
+  plaintextMediaType: string;
+  hashAuthority: "worker_asserted";
+  ciphertextHash: string;
+  ciphertextByteLength: number;
+  verificationKind: "ciphertext_readback_sha256";
+  readbackVerifiedAt: Date;
+  receiptUserId: string;
+  receiptActorCredentialId: string;
+  receiptCreatedAt: Date;
+  objectOutcome: "deleted" | "already_missing";
+  backupOutcome: "deleted" | "already_missing" | null;
+  actorUserId: string;
+  actorCredentialId: string;
+  completedAt: Date;
+};
+
+export function camelizeSourceArtifactDeletionAck(
+  row: Record<string, unknown>,
+): SourceArtifactDeletionAckRow {
+  return camelize<SourceArtifactDeletionAckRow>(row, [
+    "forgetEpoch",
+    "plaintextByteLength",
+    "ciphertextByteLength",
+  ]);
+}
+
+export type SourceProviderOriginalReferenceRow = {
+  id: string;
+  spaceId: string;
+  createdAt: Date;
+  sourceAccountId: string;
+  sourceItemId: string;
+  sourceRevisionId: string;
+  clientReferenceId: string;
+  requestDigest: string;
+  referenceVersion: "provider_original_v1";
+  providerKind: "dropbox_v1";
+  referenceFingerprint: string;
+  sourceContentHash: string;
+  sourceByteLength: number;
+  providerAccountIdHash: string;
+  providerRootDirectoryIdHash: string;
+  providerFileIdHash: string;
+  providerRevision: string;
+  providerContentHash: string;
+  verifiedAt: Date;
+  locatorBindingId: string;
+  locatorManifestFingerprint: string;
+  locatorRecipientFingerprint: string;
+  locatorRepositoryKeyDomainFingerprint: string;
+  locatorRepositoryId: string;
+  locatorSnapshotId: string;
+  locatorObjectName: string;
+  locatorCiphertextHash: string;
+  locatorCiphertextByteLength: number;
+  locatorReadbackVerifiedAt: Date;
+  verificationAuthority: "worker_asserted";
+  userId: string;
+  actorCredentialId: string;
+  createdAtField: Date;
+};
+
+export function camelizeSourceProviderOriginalReference(
+  row: Record<string, unknown>,
+): SourceProviderOriginalReferenceRow {
+  return camelize<SourceProviderOriginalReferenceRow>(row, [
+    "sourceByteLength",
+    "locatorCiphertextByteLength",
+  ]);
+}
+
+export type SourceProviderOriginalBindingRow = {
+  id: string;
+  spaceId: string;
+  createdAt: Date;
+  sourceAccountId: string;
+  sourceItemId: string;
+  sourceRevisionId: string;
+  referenceId: string;
+  bindingEpoch: number;
+  verifiedAt: Date;
+  userId: string;
+  actorCredentialId: string;
+  updatedAt: Date;
+};
+
+export function camelizeSourceProviderOriginalBinding(
+  row: Record<string, unknown>,
+): SourceProviderOriginalBindingRow {
+  return camelize<SourceProviderOriginalBindingRow>(row, ["bindingEpoch"]);
+}
+
+export type SourceProviderOriginalDetachAckRow = {
+  id: string;
+  spaceId: string;
+  createdAt: Date;
+  ackVersion: string;
+  sourceAccountId: string;
+  sourceItemId: string;
+  sourceRevisionId: string;
+  referenceId: string;
+  forgetEpoch: number;
+  detachId: string;
+  requestId: string;
+  requestDigest: string;
+  referenceFingerprint: string;
+  locatorBindingId: string;
+  locatorRepositoryId: string;
+  locatorSnapshotId: string;
+  locatorObjectName: string;
+  referenceOutcome: string;
+  locatorBundleOutcome: string;
+  locatorAbsenceAuthority: string;
+  retentionDisclosure: string | null;
+  providerSourceOutcome: string;
+  actorUserId: string;
+  actorCredentialId: string;
+  completedAt: Date;
+};
+
+export function camelizeSourceProviderOriginalDetachAck(
+  row: Record<string, unknown>,
+): SourceProviderOriginalDetachAckRow {
+  return camelize<SourceProviderOriginalDetachAckRow>(row, ["forgetEpoch"]);
+}
+
+export type WorkerParsedStagePhase =
+  | "collecting"
+  | "staged"
+  | "verified"
+  | "activated";
+
+export type WorkerParsedStageRow = {
+  id: string;
+  spaceId: string;
+  createdAt: Date;
+  sourceAccountId: string;
+  sourceItemId: string;
+  discoveryWorkId: string | null;
+  ingestJobId: string;
+  processingGenerationId: string;
+  sourceRevisionId: string;
+  sourceTextVersionId: string;
+  parserArtifactId: string;
+  archiveSetDigest: string | null;
+  normalizedBundleDigest: string | null;
+  mappingManifestHash: string;
+  phase: string;
+  nextOrdinal: number;
+  expectedPageCount: number;
+  expectedEvidenceSpanCount: number;
+  expectedDocumentCount: number;
+  expectedChunkCount: number;
+  acceptedPageCount: number;
+  acceptedEvidenceSpanCount: number;
+  acceptedDocumentCount: number;
+  acceptedChunkCount: number;
+  pageIds: string[];
+  evidenceSpanIds: string[];
+  documentIds: string[];
+  chunkIds: string[];
+  pageBytes: number;
+  evidenceBytes: number;
+  documentBytes: number;
+  chunkBytes: number;
+  payloadManifestId: string | null;
+  createdAtField: Date;
+  updatedAt: Date;
+  retireAt: Date | null;
+};
+
+export function camelizeWorkerParsedStage(
+  row: Record<string, unknown>,
+): WorkerParsedStageRow {
+  return camelize<WorkerParsedStageRow>(row, [
+    "nextOrdinal",
+    "expectedPageCount",
+    "expectedEvidenceSpanCount",
+    "expectedDocumentCount",
+    "expectedChunkCount",
+    "acceptedPageCount",
+    "acceptedEvidenceSpanCount",
+    "acceptedDocumentCount",
+    "acceptedChunkCount",
+    "pageBytes",
+    "evidenceBytes",
+    "documentBytes",
+    "chunkBytes",
+  ]);
+}
+
+export type ProcessingGenerationPayloadManifestRow = {
+  id: string;
+  spaceId: string;
+  createdAt: Date;
+  sourceAccountId: string;
+  sourceItemId: string;
+  sourceRevisionId: string;
+  sourceTextVersionId: string;
+  parserArtifactId: string;
+  processingGenerationId: string;
+  archiveSetDigest: string | null;
+  normalizedBundleDigest: string | null;
+  mappingManifestHash: string;
+  pageIds: string[];
+  evidenceSpanIds: string[];
+  documentIds: string[];
+  chunkIds: string[];
+  pageCount: number;
+  evidenceSpanCount: number;
+  documentCount: number;
+  chunkCount: number;
+  pageBytes: number;
+  evidenceBytes: number;
+  documentBytes: number;
+  chunkBytes: number;
+  pageDigest: string;
+  evidenceDigest: string;
+  documentDigest: string;
+  chunkDigest: string;
+  retainedTextHash: string;
+  retainedTextUtf8Length: number;
+  retainedTextUtf16Length: number;
+  manifestVersion: "parsed_payload_v1";
+  createdAtField: Date;
+};
+
+export function camelizeProcessingGenerationPayloadManifest(
+  row: Record<string, unknown>,
+): ProcessingGenerationPayloadManifestRow {
+  return camelize<ProcessingGenerationPayloadManifestRow>(row, [
+    "pageCount",
+    "evidenceSpanCount",
+    "documentCount",
+    "chunkCount",
+    "pageBytes",
+    "evidenceBytes",
+    "documentBytes",
+    "chunkBytes",
+    "retainedTextUtf8Length",
+    "retainedTextUtf16Length",
+  ]);
 }
