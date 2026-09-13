@@ -9,6 +9,15 @@ import test from "node:test";
 
 import { runPostgresDatabaseBackup, verifyPostgresBackup } from "./db-backup-postgres.mjs";
 import { runWithDatabaseBackupState } from "./run-database-backup.mjs";
+import pg from "../packages/kith-store/node_modules/pg/esm/index.mjs";
+import {
+  applyKithSchema,
+  KITH_SCHEMA_VERSION,
+} from "../packages/kith-store/dist/index.js";
+import {
+  applyPgSchema,
+  PG_SCHEMA_VERSION,
+} from "../packages/finance-archive/dist/index.js";
 
 const execute = promisify(execFile);
 const ADMIN = process.env.KITH_MIGRATE_TEST_DATABASE_URL;
@@ -36,10 +45,6 @@ async function proxy(root, name, executable) {
   await writeFile(path, `#!/bin/sh\nexec '${executable}' "$@"\n`, { mode: 0o700 });
   return path;
 }
-async function sql(connection, statement) {
-  await execute(join(PG, "psql"), [connection, "-X", "-v", "ON_ERROR_STOP=1", "-c", statement]);
-}
-
 test("postgres runner publishes, independently reads back, decrypts, and restores a synthetic database", { skip: !ADMIN }, async (t) => {
   const root = await mkdtemp(join(homedir(), ".kith-pg-runner-test-"));
   await chmod(root, 0o700);
@@ -55,7 +60,14 @@ test("postgres runner publishes, independently reads back, decrypts, and restore
     await rm(root, { recursive: true, force: true });
   });
   for (const name of [sourceName, destinationName]) await execute(join(PG, "createdb"), ["--maintenance-db", ADMIN, name]);
-  await sql(source, "create schema finance; create schema kith; create table finance.schema_version(version integer primary key, name text not null); create table kith.schema_version(version integer primary key, name text not null); create table finance.records(id text primary key, amount numeric not null); create table kith.notes(id text primary key, body text not null); insert into finance.schema_version values (3,'finance'); insert into kith.schema_version values (9,'kith'); insert into finance.records values ('r1',12.34); insert into kith.notes values ('n1',E'exact\\ntext');");
+  const client = new pg.Client({ connectionString: source });
+  await client.connect();
+  try {
+    await applyPgSchema(client, "finance");
+    await applyKithSchema(client);
+  } finally {
+    await client.end();
+  }
 
   const stateDirectory = join(root, "state");
   const stagingRoot = join(root, "staging");
@@ -80,7 +92,9 @@ test("postgres runner publishes, independently reads back, decrypts, and restore
   await writeFile(restoreConfigPath, JSON.stringify({
     version: 1, pgRestorePath, psqlPath,
     sourceConnectionCommand: connectionCommand, destinationConnectionCommand: destinationCommand,
-    expectedFinanceSchemaVersion: 3, expectedKithSchemaVersion: 9, timeoutMs: 60_000,
+    expectedFinanceSchemaVersion: PG_SCHEMA_VERSION,
+    expectedKithSchemaVersion: KITH_SCHEMA_VERSION,
+    timeoutMs: 60_000,
   }), { mode: 0o600 });
   const backupConfig = {
     version: 1, stateDirectory, stagingRoot, connectionCommand,
@@ -89,7 +103,9 @@ test("postgres runner publishes, independently reads back, decrypts, and restore
     resticRepositoryPath: repository, resticPasswordCommand: passwordCommand,
     expectedResticRepositoryId: repositoryId, host: "synthetic-host",
     operationId: "synthetic-proof", expectedDatabaseName: sourceName,
-    expectedFinanceSchemaVersion: 3, expectedKithSchemaVersion: 9, timeoutMs: 60_000,
+    expectedFinanceSchemaVersion: PG_SCHEMA_VERSION,
+    expectedKithSchemaVersion: KITH_SCHEMA_VERSION,
+    timeoutMs: 60_000,
     gitRevision: "b".repeat(40),
   };
   const verifyConfig = {
@@ -114,7 +130,11 @@ test("postgres runner publishes, independently reads back, decrypts, and restore
     },
   );
   assert.equal(managed.verification.status, "passed");
-  assert.equal(managed.verification.restore.tablesVerified, 4);
+  assert.equal(
+    managed.verification.restore.tablesVerified,
+    managed.result.manifest.parity.tables.length,
+  );
+  assert.ok(managed.verification.restore.tablesVerified > 70);
   const journal = JSON.parse(await readFile(join(stateDirectory, "database-backup-status.json"), "utf8"));
   assert.equal(journal.state, "succeeded");
   await assert.rejects(readFile(join(stateDirectory, "database-backup.lock")), { code: "ENOENT" });
