@@ -1054,6 +1054,117 @@ test(
   },
 );
 
+// F1-8l. A consolidated statement's household roll-up section, attributed to
+// no account by the parser and then to the document's own account by the
+// `?? document.accountId` fallback, made one document state two balances for
+// one (account, as_of). The parser refuses that section now; this refuses the
+// second row whatever produces it.
+test(
+  "one document stating two balances for one account and date inserts one and opens a review item",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seed(client);
+
+    const both = document("1a".padEnd(64, "0"), [], {
+      balances: [
+        {
+          asOf: "2026-03-31",
+          totalValueText: "10000",
+          totalValueNote: null,
+          cash: "500",
+          currency: "USD",
+          periodStartValue: null,
+          periodEndValue: "10000",
+          sourceLocator: "holdings:balance-own-section",
+        },
+        // The roll-up: a larger total and a different cash, stated by the
+        // same document for the same account and date.
+        {
+          asOf: "2026-03-31",
+          totalValueText: "98000",
+          totalValueNote: null,
+          cash: "4200",
+          currency: "USD",
+          periodStartValue: null,
+          periodEndValue: "98000",
+          sourceLocator: "holdings:balance-rollup-section",
+        },
+      ],
+    });
+
+    const summary = await importBatch(
+      client,
+      { source: "synthetic-pull", documents: [both] },
+      NOW,
+    );
+
+    assert.equal(summary.rowsInserted, 1);
+    assert.equal(summary.rowsRefused, 1);
+    assert.equal(await count(client, "balances"), 1);
+    // The first one stated is what stands; the second is not inserted and the
+    // first is not altered.
+    const stored = await one(client, "SELECT total_value, cash FROM balances");
+    assert.equal(stored.total_value, "10000");
+    assert.equal(stored.cash, "500");
+
+    const review = await one(
+      client,
+      "SELECT reason, raw_value FROM review_items WHERE kind = 'balance_duplicate_in_document'",
+    );
+    assert.match(review.reason, /already states a balance/);
+    assert.match(review.reason, /contradicting itself/);
+    assert.equal(review.raw_value, "98000");
+  },
+);
+
+test("a reparse refuses a second same-document balance even when another document owns the conflict-map entry", { skip }, async (t) => {
+  const client = await archive(t);
+  await seed(client);
+  const balance = (cash) => ({
+    asOf: "2026-03-31", totalValueText: "10000", totalValueNote: null,
+    cash, currency: "USD", periodStartValue: null, periodEndValue: "10000",
+    sourceLocator: "holdings:balance",
+  });
+  const original = document("1b".padEnd(64, "0"), [], {
+    parseNote: "Synthetic incomplete extraction permits a later reparse.",
+    balances: [balance("500")],
+  });
+  const other = document("1c".padEnd(64, "0"), [], { balances: [balance("600")] });
+  await importBatch(client, { source: "synthetic-pull", documents: [original, other] }, NOW);
+  const own = await one(client, "SELECT id FROM documents WHERE sha256 = $1", [original.sha256]);
+
+  // Make the formerly lossy map select the other document deterministically,
+  // without relying on PostgreSQL's unspecified row order.
+  const query = client.query.bind(client);
+  let reordered = false;
+  client.query = async (...args) => {
+    const result = await query(...args);
+    if (typeof args[0] === "string" && args[0].includes("FROM balances b")) {
+      result.rows.sort((a, b) => Number(a.source_document_id !== own.id) - Number(b.source_document_id !== own.id));
+      assert.equal(result.rows.length, 2);
+      assert.equal(result.rows[0].source_document_id, own.id);
+      assert.notEqual(result.rows[1].source_document_id, own.id);
+      reordered = true;
+    }
+    return result;
+  };
+  let result;
+  try {
+    result = await importBatch(client, {
+      source: "synthetic-pull", documents: [{ ...original, balances: [balance("700")] }],
+    }, NOW);
+  } finally {
+    client.query = query;
+  }
+  assert.equal(reordered, true);
+  assert.equal(result.rowsInserted, 0);
+  assert.equal(result.rowsRefused, 1);
+  assert.equal(await count(client, "balances"), 2);
+  assert.equal((await one(client, "SELECT cash FROM balances WHERE source_document_id = $1", [own.id])).cash, "500");
+  assert.equal((await one(client, "SELECT count(*)::int AS n FROM review_items WHERE source_document_id = $1 AND kind = 'balance_duplicate_in_document'", [own.id])).n, 1);
+});
+
 // F1-49. A parse-noted document is never eligible for the whole-document
 // skip (see the parsed_ok test above and importBatch's parseNote branch), so
 // every rerun reprocesses it in full -- which, before row_hash existed on
@@ -1471,6 +1582,13 @@ async function countQueries(client, body) {
  * not what this test measures.
  */
 function statement(sha256, n, asOf = "2026-03-31") {
+  // F1-8l: one document states one balance per account per date, so `n`
+  // balances in one document need `n` dates. They walk backwards from `asOf`,
+  // one day each, which keeps the two call sites' ranges disjoint as well.
+  const dayBefore = (iso, days) =>
+    new Date(Date.parse(`${iso}T00:00:00Z`) - days * 86_400_000)
+      .toISOString()
+      .slice(0, 10);
   const rows = [];
   const positions = [];
   const balances = [];
@@ -1488,7 +1606,7 @@ function statement(sha256, n, asOf = "2026-03-31") {
       position({ sourceLocator: `holdings:${k}`, quantity: `${k + 1}` }),
     );
     balances.push({
-      asOf,
+      asOf: dayBefore(asOf, i),
       totalValueText: `${1000 + k}`,
       totalValueNote: null,
       cash: `${k}`,
@@ -1529,7 +1647,7 @@ test(
     const large = await countQueries(client, () =>
       importBatch(
         client,
-        { source: "synthetic-pull", documents: [statement("d".repeat(64), 200, "2026-06-30")] },
+        { source: "synthetic-pull", documents: [statement("d".repeat(64), 200, "2025-12-31")] },
         NOW,
       ),
     );
