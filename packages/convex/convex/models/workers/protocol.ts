@@ -1,4 +1,13 @@
 import {
+  BINARY_CLASSES,
+  isBinaryClass,
+  isBinaryParserOutputMediaType,
+  type BinaryMediaType,
+  type BinaryParserOutputMediaType,
+  type BinaryParserProfileId,
+} from "@repo/worker-protocol";
+
+import {
   assertParsedRequestSize,
   MAX_PARSED_PAGE_BATCH,
   MAX_PARSED_ROW_BATCH,
@@ -128,8 +137,8 @@ export type FsDiscoveryEntry = {
         status: "ready_binary_v1";
         sha256: string;
         byteLength: number;
-        mediaType: "application/pdf";
-        parserProfileId: "pdf_docqa_v1";
+        mediaType: BinaryMediaType;
+        parserProfileId: BinaryParserProfileId;
         parserFingerprint: string;
         extractionConfigurationFingerprint: string;
         extractorFingerprint: string;
@@ -1201,9 +1210,19 @@ function discoveryEntry(value: unknown, mode: "normal" | "identity_recovery") {
       ],
       ["permissionsRestricted", "encryptionRevision"],
     );
+    // P2-70i2: one of the closed binary classes, and the media type must be
+    // that class's own. A PDF declared as a workbook, or a workbook declared
+    // as a PDF, is refused here rather than admitted and mis-parsed later.
+    if (!isBinaryClass(contentInput.parserProfileId, contentInput.mediaType)) {
+      invalid();
+    }
+    const parserProfileId: BinaryParserProfileId = contentInput.parserProfileId;
+    // P2-77's permissions-restriction fields describe the PDF security
+    // handler and mean nothing for any other class.
     if (
-      contentInput.mediaType !== "application/pdf" ||
-      contentInput.parserProfileId !== "pdf_docqa_v1"
+      parserProfileId !== "pdf_docqa_v1" &&
+      (contentInput.permissionsRestricted !== undefined ||
+        contentInput.encryptionRevision !== undefined)
     ) {
       invalid();
     }
@@ -1224,9 +1243,13 @@ function discoveryEntry(value: unknown, mode: "normal" | "identity_recovery") {
     content = {
       status: "ready_binary_v1",
       sha256: string(contentInput.sha256, { maxUtf16: 64, pattern: SHA256 }),
-      byteLength: integer(contentInput.byteLength, 1, 16 * 1_024 * 1_024),
-      mediaType: "application/pdf",
-      parserProfileId: "pdf_docqa_v1",
+      byteLength: integer(
+        contentInput.byteLength,
+        1,
+        BINARY_CLASSES[parserProfileId].maxOriginalBytes,
+      ),
+      mediaType: BINARY_CLASSES[parserProfileId].mediaType,
+      parserProfileId,
       parserFingerprint: string(contentInput.parserFingerprint, {
         maxUtf16: 64,
         pattern: SHA256,
@@ -1301,21 +1324,23 @@ function archivedWorkIdentity(value: unknown): ArchivedWorkIdentity {
     "chunkerFingerprint",
     "correctionRevision",
   ]);
-  if (
-    input.mediaType !== "application/pdf" ||
-    input.parserProfileId !== "pdf_docqa_v1"
-  ) {
+  if (!isBinaryClass(input.parserProfileId, input.mediaType)) {
     return invalid();
   }
+  const parserProfileId: BinaryParserProfileId = input.parserProfileId;
   return {
     sourceItemId: string(input.sourceItemId, { maxUtf16: 256 }),
     scanId: scanId(input.scanId),
     observationEpoch: epoch(input.observationEpoch),
     processingEpoch: epoch(input.processingEpoch),
     contentHash: string(input.contentHash, { maxUtf16: 64, pattern: SHA256 }),
-    byteLength: integer(input.byteLength, 1, 16 * 1_024 * 1_024),
-    mediaType: "application/pdf",
-    parserProfileId: "pdf_docqa_v1",
+    byteLength: integer(
+      input.byteLength,
+      1,
+      BINARY_CLASSES[parserProfileId].maxOriginalBytes,
+    ),
+    mediaType: BINARY_CLASSES[parserProfileId].mediaType,
+    parserProfileId,
     parserFingerprint: string(input.parserFingerprint, {
       maxUtf16: 64,
       pattern: SHA256,
@@ -1359,7 +1384,11 @@ function parserArtifactSelection(value: unknown): ParserArtifactSelection {
     "outputMediaType",
     "createdAt",
   ]);
-  if (input.outputMediaType !== "application/vnd.docling+json") invalid();
+  // One of the closed set. Which one this work may use is checked against the
+  // discovery work's own class in `resolveParserArtifact`, where the class is
+  // known; this request carries a work id, not a profile.
+  if (!isBinaryParserOutputMediaType(input.outputMediaType)) invalid();
+  const outputMediaType: BinaryParserOutputMediaType = input.outputMediaType;
   return {
     kind: "create",
     clientArtifactId: string(input.clientArtifactId, {
@@ -1368,7 +1397,7 @@ function parserArtifactSelection(value: unknown): ParserArtifactSelection {
     }),
     outputHash: string(input.outputHash, { maxUtf16: 64, pattern: SHA256 }),
     outputByteLength: integer(input.outputByteLength, 1, 64 * 1_024 * 1_024),
-    outputMediaType: "application/vnd.docling+json",
+    outputMediaType,
     createdAt: epoch(input.createdAt),
   };
 }
@@ -1990,12 +2019,7 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
         }),
       };
     case "discovery.failArchived":
-      exactKeys(input, [
-        ...baseKeys,
-        "requestId",
-        "identity",
-        "failureCode",
-      ]);
+      exactKeys(input, [...baseKeys, "requestId", "identity", "failureCode"]);
       return {
         ...base,
         operation: "discovery.failArchived",

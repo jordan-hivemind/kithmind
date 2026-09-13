@@ -13,7 +13,7 @@ import {
   upsertSourceInventoryRow,
 } from "../documents/inventory";
 import { workerProtocolError } from "./errors";
-import { FS_TEXT_PROFILE } from "./profile";
+import { accountAdmitsBinaryClass, FS_TEXT_PROFILE } from "./profile";
 import {
   type FsDiscoveryEntry,
   type WorkerInventoryPageResult,
@@ -1649,16 +1649,23 @@ export async function appendWorkerScanPage(
   now: number,
 ): Promise<WorkerScanAppendResult> {
   const source = await requireWorkerSourceAccount(ctx, principal, request);
+  // P2-70i2: the gate is per class. Every binary entry in this page must name
+  // a class this account is audited for, so enabling workbooks is an explicit
+  // owner decision and not a side effect of the PDF lane being open.
   if (
     request.entries.some(
-      (entry) => entry.content.status === "ready_binary_v1",
-    ) &&
-    (source.account.binaryProfileId !== "pdf_docqa_v1" ||
-      source.account.binaryProfileEnabledAt === undefined ||
-      !Number.isSafeInteger(source.account.binaryProfileEnabledAt) ||
-      source.account.binaryProfileEnabledAt < 0 ||
-      source.account.binaryProfileAuditDigest === undefined ||
-      !/^[0-9a-f]{64}$/.test(source.account.binaryProfileAuditDigest))
+      (entry) =>
+        entry.content.status === "ready_binary_v1" &&
+        (!accountAdmitsBinaryClass(
+          source.account,
+          entry.content.parserProfileId,
+        ) ||
+          source.account.binaryProfileEnabledAt === undefined ||
+          !Number.isSafeInteger(source.account.binaryProfileEnabledAt) ||
+          source.account.binaryProfileEnabledAt < 0 ||
+          source.account.binaryProfileAuditDigest === undefined ||
+          !/^[0-9a-f]{64}$/.test(source.account.binaryProfileAuditDigest)),
+    )
   ) {
     throw workerProtocolError("source_unavailable");
   }

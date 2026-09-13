@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
 import test from "node:test";
 import { crc32, deflateRawSync } from "node:zlib";
 
 import { readWorkbook, SpreadsheetError } from "../dist/spreadsheet.js";
-import { resolveSheetCell } from "@repo/worker-protocol";
+import {
+  mapSpreadsheetWorkbook,
+  SPREADSHEET_CHUNKING_FINGERPRINT,
+} from "../dist/parsedBundleMapping.js";
+import { resolveSheetCell, SPREADSHEET_V1_BOUNDS } from "@repo/worker-protocol";
 
 /**
  * P2-70i. The workbook is generated here, in the test, from the OOXML parts a
@@ -269,5 +274,257 @@ test("a zip that is not a workbook is refused", () => {
       assert.equal(error.code, "not_a_workbook");
       return true;
     },
+  );
+});
+
+// --- the measured `spreadsheet_v1` bounds ---------------------------------
+
+/**
+ * P2-70i2: acceptance at each declared bound and refusal past it, with the
+ * named failure code. Every workbook below is generated at a size the bound
+ * names, so the test fails if a bound moves without the measurement being
+ * redone.
+ */
+
+const COLUMN_NAME = (index) => {
+  let name = "";
+  let value = index + 1;
+  while (value > 0) {
+    name = String.fromCharCode(65 + ((value - 1) % 26)) + name;
+    value = Math.floor((value - 1) / 26);
+  }
+  return name;
+};
+
+function gridSheetXml(rows, columns, cellValue) {
+  let xml = '<?xml version="1.0"?><worksheet><sheetData>';
+  for (let row = 0; row < rows; row += 1) {
+    xml += `<row r="${row + 1}">`;
+    for (let column = 0; column < columns; column += 1) {
+      xml += `<c r="${COLUMN_NAME(column)}${row + 1}"><v>${cellValue(row, column)}</v></c>`;
+    }
+    xml += "</row>";
+  }
+  return `${xml}</sheetData></worksheet>`;
+}
+
+/** `sheetParts` is a list of `{ name, xml }`; `extraParts` are raw ZIP parts. */
+function workbookOf(sheetParts, extraParts = []) {
+  return zip([
+    [
+      "xl/workbook.xml",
+      `<?xml version="1.0"?><workbook><sheets>${sheetParts
+        .map(
+          (sheet, index) =>
+            `<sheet name="${sheet.name}" sheetId="${index + 1}" r:id="rId${index + 1}"/>`,
+        )
+        .join("")}</sheets></workbook>`,
+    ],
+    [
+      "xl/_rels/workbook.xml.rels",
+      `<?xml version="1.0"?><Relationships>${sheetParts
+        .map(
+          (_, index) =>
+            `<Relationship Id="rId${index + 1}" Target="worksheets/sheet${index + 1}.xml"/>`,
+        )
+        .join("")}</Relationships>`,
+    ],
+    ...sheetParts.map((sheet, index) => [
+      `xl/worksheets/sheet${index + 1}.xml`,
+      sheet.xml,
+    ]),
+    ...extraParts,
+  ]);
+}
+
+/** The failure code, or "accepted" when the reader read the workbook. */
+function refusal(bytes) {
+  try {
+    readWorkbook(bytes);
+  } catch (error) {
+    assert.ok(error instanceof SpreadsheetError);
+    return error.code;
+  }
+  return "accepted";
+}
+
+/**
+ * Every cell is exactly 12 characters, so a rendered row is
+ * `columns * 12 + (columns - 1)` characters and the page is the sheet name plus
+ * one newline and one row per row. That is what makes "at the bound" exact.
+ */
+const CELL_CHARS = 12;
+const ROW_CHARS = (columns) => columns * CELL_CHARS + (columns - 1);
+const paddedCell = (row, column) =>
+  String(row * 64 + column).padStart(CELL_CHARS, "0");
+const pageChars = (name, rows, columns) =>
+  name.length + rows * (ROW_CHARS(columns) + 1);
+
+function gridSheets(count, rows, columns) {
+  return Array.from({ length: count }, (_, index) => ({
+    name: `S${index}`,
+    xml: gridSheetXml(rows, columns, paddedCell),
+  }));
+}
+
+test("the sheet count bound accepts 64 sheets and refuses 65", () => {
+  const { maxSheets } = SPREADSHEET_V1_BOUNDS;
+  const accepted = readWorkbook(workbookOf(gridSheets(maxSheets, 4, 4)));
+  assert.equal(accepted.pages.length, maxSheets);
+  assert.equal(accepted.pages.at(-1).ordinal, maxSheets - 1);
+  assert.equal(
+    refusal(workbookOf(gridSheets(maxSheets + 1, 4, 4))),
+    "oversized",
+  );
+});
+
+test("one sheet's page is accepted at its character bound and refused past it", () => {
+  const { maxSheetPageChars } = SPREADSHEET_V1_BOUNDS;
+  const build = (rows) => workbookOf(gridSheets(1, rows, 8));
+  const rows = Math.floor((maxSheetPageChars - 2) / (ROW_CHARS(8) + 1));
+  const atBound = readWorkbook(build(rows));
+  assert.equal(atBound.pages[0].text.length, pageChars("S0", rows, 8));
+  assert.ok(atBound.pages[0].text.length <= maxSheetPageChars);
+  assert.ok(
+    atBound.pages[0].text.length > maxSheetPageChars - (ROW_CHARS(8) + 1),
+    "the accepted page is at the bound, not comfortably below it",
+  );
+  assert.equal(refusal(build(rows + 1)), "oversized");
+});
+
+test("a row or column index past its bound is refused", () => {
+  const { maxRowsPerSheet, maxColumnsPerSheet } = SPREADSHEET_V1_BOUNDS;
+  const oneCell = (reference) =>
+    workbookOf([
+      {
+        name: "S",
+        xml: `<?xml version="1.0"?><worksheet><sheetData><row r="1"><c r="${reference}"><v>1</v></c></row></sheetData></worksheet>`,
+      },
+    ]);
+  assert.equal(refusal(oneCell(`A${maxRowsPerSheet + 1}`)), "oversized");
+  assert.equal(
+    refusal(oneCell(`${COLUMN_NAME(maxColumnsPerSheet)}1`)),
+    "oversized",
+  );
+  // The last addressable column is still read. There is no matching case for
+  // the last addressable row: a sheet with 65,536 rendered rows is past the
+  // page character bound whatever its cells hold, so the row index bound only
+  // ever refuses a corrupt reference, which is what it is there for.
+  assert.equal(
+    readWorkbook(oneCell(`${COLUMN_NAME(maxColumnsPerSheet - 1)}1`)).pages[0]
+      .columnCount,
+    maxColumnsPerSheet,
+  );
+});
+
+test("the total rendered text bound refuses what no text version could hold", () => {
+  const { maxRenderedBytes, maxSheetPageChars } = SPREADSHEET_V1_BOUNDS;
+  // Each sheet renders about 10.4 KiB, so 64 of them stay under the bound.
+  // Raising every sheet to 80 rows takes the workbook past it even though no
+  // single sheet is anywhere near its own page bound.
+  const totalChars = (rows) =>
+    gridSheets(64, rows, 16).reduce(
+      (total, sheet) => total + pageChars(sheet.name, rows, 16),
+      0,
+    );
+  const under = readWorkbook(workbookOf(gridSheets(64, 50, 16)));
+  const rendered = under.pages.reduce(
+    (total, page) => total + Buffer.byteLength(page.text, "utf8"),
+    0,
+  );
+  assert.equal(rendered, totalChars(50));
+  assert.ok(rendered < maxRenderedBytes);
+  assert.ok(rendered > maxRenderedBytes / 2);
+  for (const page of under.pages) {
+    assert.ok(
+      page.text.length < maxSheetPageChars / 4,
+      "no single sheet is near its own page bound",
+    );
+  }
+  assert.ok(totalChars(80) > maxRenderedBytes);
+  assert.equal(refusal(workbookOf(gridSheets(64, 80, 16))), "oversized");
+});
+
+test("a workbook past the class's byte bound is refused before it is read", () => {
+  // Incompressible bytes take the ZIP past 8 MiB while every sheet stays tiny,
+  // so only the workbook's own size can refuse it.
+  const bytes = workbookOf(gridSheets(1, 2, 2), [
+    [
+      "xl/media/image1.bin",
+      randomBytes(SPREADSHEET_V1_BOUNDS.maxWorkbookBytes + 64 * 1_024),
+    ],
+  ]);
+  assert.ok(bytes.length > SPREADSHEET_V1_BOUNDS.maxWorkbookBytes);
+  assert.equal(refusal(bytes), "oversized");
+});
+
+test("an XML part that inflates past the per-part cap is refused, not grown", () => {
+  const bytes = workbookOf([{ name: "S", xml: " ".repeat(9 * 1_024 * 1_024) }]);
+  assert.ok(bytes.length < SPREADSHEET_V1_BOUNDS.maxWorkbookBytes);
+  assert.equal(refusal(bytes), "oversized");
+});
+
+test("a .docx is a ZIP and stays unsupported rather than being misread", () => {
+  const bytes = zip([
+    ["[Content_Types].xml", `<?xml version="1.0"?><Types/>`],
+    ["word/document.xml", `<?xml version="1.0"?><document/>`],
+  ]);
+  assert.equal(refusal(bytes), "not_a_workbook");
+});
+
+// --- the parsed mapping a workbook's pages become -------------------------
+
+test("a workbook maps to one retained page per sheet with page evidence", async () => {
+  const workbook = readWorkbook(workbookBytes());
+  const mapping = await mapSpreadsheetWorkbook({
+    pages: workbook.pages,
+    title: "quarterly.xlsx",
+    capturedAt: 1_700_000_000_000,
+    chunkingFingerprint: SPREADSHEET_CHUNKING_FINGERPRINT,
+  });
+
+  assert.deepEqual(
+    mapping.pages.map((page) => page.text),
+    [REVENUE_PAGE, NOTES_PAGE],
+  );
+  // Pages concatenate in workbook order and every offset is into that text.
+  assert.equal(mapping.pages[0].start, 0);
+  assert.equal(mapping.pages[1].start, REVENUE_PAGE.length);
+  assert.equal(
+    mapping.textUtf16Length,
+    REVENUE_PAGE.length + NOTES_PAGE.length,
+  );
+  assert.equal(mapping.documents.length, 1);
+  assert.equal(mapping.documents[0].docType, "spreadsheet");
+  // One evidence span per chunk, each a `parser_page_v1` locator over its page.
+  assert.equal(mapping.evidence.length, mapping.chunks.length);
+  for (const span of mapping.evidence) {
+    assert.equal(span.locator.kind, "parser_page_v1");
+    assert.equal(
+      span.locator.pageTextHash,
+      mapping.pages[span.pageOrdinal].textHash,
+    );
+  }
+  assert.match(mapping.mappingManifestHash, /^[0-9a-f]{64}$/u);
+
+  // A cited cell resolves into the mapped page, and the mapped page is the
+  // text a generation seals: scan -> parse -> retained page -> cell evidence.
+  const total = resolveSheetCell(mapping.pages[0].text, {
+    sheet: "Revenue",
+    row: 3,
+    column: 2,
+  });
+  assert.ok(total);
+  assert.equal(mapping.pages[0].text.slice(total.start, total.end), "2230.50");
+});
+
+test("the spreadsheet mapping refuses another class's chunking policy", async () => {
+  await assert.rejects(() =>
+    mapSpreadsheetWorkbook({
+      pages: readWorkbook(workbookBytes()).pages,
+      title: "quarterly.xlsx",
+      capturedAt: 1_700_000_000_000,
+      chunkingFingerprint: "0".repeat(64),
+    }),
   );
 });
