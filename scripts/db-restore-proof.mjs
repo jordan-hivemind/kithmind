@@ -66,12 +66,18 @@ async function snapshot(config, connection) {
   const kith = await run(config.psqlPath, [connection, "-v", "ON_ERROR_STOP=1", "-tAc", "select max(version) from kith.schema_version"], config.timeoutMs);
   return { tables: output.trim().split("\n").filter(Boolean), financeVersion: Number(finance.trim()), kithVersion: Number(kith.trim()) };
 }
+async function requirePostgres17(binary, timeoutMs) {
+  const version = await run(binary, ["--version"], timeoutMs);
+  if (!/PostgreSQL\) 17\./.test(version)) fail("postgres_client_version_mismatch");
+}
 export async function restorePostgresProof(config) {
   config = parseConfig(config);
   protectedFile(config.dumpPath); protectedExecutable(config.pgRestorePath); protectedExecutable(config.psqlPath); protectedExecutable(config.sourceConnectionCommand.path); protectedExecutable(config.destinationConnectionCommand.path);
   const source = await secret(config.sourceConnectionCommand, config.timeoutMs);
   const destination = await secret(config.destinationConnectionCommand, config.timeoutMs);
   if (source === destination) fail("restore_not_isolated");
+  await requirePostgres17(config.psqlPath, config.timeoutMs);
+  await requirePostgres17(config.pgRestorePath, config.timeoutMs);
   const before = await snapshot(config, source);
   if (before.financeVersion !== config.expectedFinanceSchemaVersion || before.kithVersion !== config.expectedKithSchemaVersion) fail("source_parity_failed");
   await run(config.pgRestorePath, ["--no-owner", "--no-acl", "--dbname", destination, config.dumpPath], config.timeoutMs);

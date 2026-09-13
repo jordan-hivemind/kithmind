@@ -88,6 +88,7 @@ const MAX_DUMP_BYTES = 2 * 1024 * 1024 * 1024;
 // archive's dump routinely nears it.
 const MAX_COMMAND_OUTPUT_BYTES = 262_144;
 const DEFAULT_TIMEOUT_MS = 600_000;
+const POSTGRES_MAJOR = "17";
 
 export class PostgresBackupError extends Error {
   constructor(code) {
@@ -365,6 +366,12 @@ async function requireResticVersion(resticBinary, timeoutMs) {
   if (!RESTIC_VERSION_RE.test(result.stdout.toString("utf8").trim()))
     fail("restic_version_mismatch");
 }
+async function requirePostgresClientVersion(binary, timeoutMs) {
+  const result = await runCapture(binary, ["--version"], { timeoutMs });
+  if (!new RegExp(`PostgreSQL\\) ${POSTGRES_MAJOR}\\.`).test(result.stdout.toString("utf8"))) {
+    fail("postgres_client_version_mismatch");
+  }
+}
 
 async function psqlScalar(config, connectionString, sql) {
   const result = await runCapture(
@@ -599,6 +606,8 @@ export async function runPostgresDatabaseBackup(config) {
   await validateBackupConfigPaths(config);
   await requireAgeVersion(config.ageBinary, config.timeoutMs);
   await requireResticVersion(config.resticBinary, config.timeoutMs);
+  await requirePostgresClientVersion(config.psqlPath, config.timeoutMs);
+  await requirePostgresClientVersion(config.pgDumpPath, config.timeoutMs);
   const connectionString = await secret(
     config.connectionCommand,
     config.timeoutMs,
