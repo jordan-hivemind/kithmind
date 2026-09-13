@@ -3,6 +3,8 @@ import { constants, type Stats } from "node:fs";
 import { lstat, open, opendir, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 
+import { SPREADSHEET_V1_BOUNDS } from "@repo/worker-protocol";
+
 import {
   readWorkbook,
   SpreadsheetError,
@@ -388,7 +390,11 @@ async function readFileBytes(
       }
       const selectedMax = header.equals(Buffer.from("%PDF-"))
         ? maxBytes
-        : sourceMaxTextBytes;
+        : header.subarray(0, 4).equals(ZIP_LOCAL_HEADER) ||
+            (header.subarray(0, 4).equals(OLE_HEADER) &&
+              relativePath.toLowerCase().endsWith(".xlsx"))
+          ? SPREADSHEET_V1_BOUNDS.maxWorkbookBytes
+          : sourceMaxTextBytes;
       if (before.size < 1) leafGapCode = "empty";
       else if (before.size > selectedMax) leafGapCode = "oversized";
     }
@@ -1138,7 +1144,10 @@ function looksLikeEncryptedWorkbook(file: SafeFileBytes): boolean {
  * magic bytes rather than by extension. It is bounded by the class's own
  * limits: nothing above 8 MiB is decoded and no part above 8 MiB is inflated.
  */
-function workbookObservation(file: SafeFileBytes): SourceObservation {
+function workbookObservation(
+  file: SafeFileBytes,
+  maxTextBytes: number,
+): SourceObservation {
   const {
     kind: _kind,
     bytes: _bytes,
@@ -1161,7 +1170,9 @@ function workbookObservation(file: SafeFileBytes): SourceObservation {
               ? "oversized"
               : error.code === "encrypted"
                 ? "encrypted"
-                : "unsupported",
+                : file.byteLength > maxTextBytes
+                  ? "oversized"
+                  : "unsupported",
         },
       };
     }
@@ -1205,7 +1216,7 @@ async function readSourceObservation(
     }
   }
   if (isZipContainer(file.bytes) || looksLikeEncryptedWorkbook(file)) {
-    return workbookObservation(file);
+    return workbookObservation(file, maxTextBytes);
   }
   try {
     return { kind: "utf8", file: utf8DiscoveryFile(file, maxTextBytes) };
