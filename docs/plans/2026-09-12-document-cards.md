@@ -604,6 +604,35 @@ an outage) does not silently burn through the rest of the backlog marking
 every remaining document failed. `provider_error` does not self-clear:
 `resumeExtractionQueue` lifts it, the same as a `manual` pause.
 
+#### Corrected in P2-85, P2-86 and P2-91
+
+The cursor is forward-only, which stranded any document whose retained text was
+not ready yet (or which was skipped for a then-true reason) when the cursor
+passed it. A sweep that reaches the end of the space's documents with nothing
+claimable now rewinds the cursor to null once and sweeps again, and only a
+rewound sweep that also finds nothing goes idle. One rewind is available per
+sweep that resolved something (`cursorRewoundAt`, cleared by every recorded
+outcome other than `refused`), so the rewinds are bounded by the number of
+documents and an idle queue cannot spin.
+
+A ladder run that ends by raising now writes the same two rows every other
+non-publishing outcome writes: a `cardExtractionAttempts` row whose
+`failureCodes` carry the closed error code, and a `card_gate_failed`
+`cardFieldDrops` row whose `code` is that same code and whose `reason` is the
+raised error's constructor name, never its message. Before this, a raised run
+moved a counter and left no row, so the document was invisible to
+`list_review_queue` and `rerunGateFailed` could never re-offer it.
+
+The lifetime counters are incremented per resolution and were never
+reconcilable against the rows. `reconcileExtractionQueueCounts` reports the
+documents (retained text, accepted card, gate-failed drop, extraction-error
+drop, never attempted), the stored counters, the counters the rows justify and
+the drift between them; `resetExtractionQueueCounters` writes the recomputed
+counters over the stored ones. Both return counts only. A document skipped at
+claim time, or refused before a runner ran, still writes no row, so a stored
+`skippedCount` above the recomputed one is expected rather than a second kind
+of skip.
+
 ## 7. Review queue
 
 | Item kind               | Raised when                                                 | Resolution                                              |
@@ -622,6 +651,14 @@ records the actor, and a worker cannot approve its own item by resubmitting it.
 Nothing is silently dropped. Every inventory row with an exclusion reason and
 every dropped field is reachable from a count in the review surface, and the
 counts are what the owner sees first.
+
+P2-86: a ladder run that raised is also a `card_gate_failed` item, carrying one
+of the queue's two closed error codes (`gate_error`, `provider_error`) as its
+`code` and the field key `card_extraction`, since the run failed as a whole
+rather than at one field. It is not a separate item kind: the review surface
+pages a class by the drop `kind` against a closed class set and already reports
+each row's `code`, so the existing kind makes the document visible and
+`rerunGateFailed` re-offers it with no new class, validator or MCP surface.
 
 ## 8. Embedding targets
 
