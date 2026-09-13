@@ -7,6 +7,25 @@ export * from "./representations.js";
 export * from "./binary.js";
 export * from "./artifacts.js";
 export * from "./rows.js";
+export * from "./archiveBindings.js";
+export * from "./archiveDeletion.js";
+export * from "./providerOriginals.js";
+export {
+  insertParsedPages,
+  insertParsedEvidence,
+  insertParsedDocuments,
+  insertParsedChunks,
+  requirePageChunkProfile,
+  sealParsedPayload,
+  verifySealedParsedPayload,
+  isParsedStoredPayloadWithinLimit,
+  isParsedProfileWithinLimits,
+  isParsedChunkTextWithinLimits,
+  MAX_PARSED_CHUNKS,
+  MAX_PARSED_STORED_PAYLOAD_BYTES,
+  type SealedPayloadSummary,
+  type VerifiedSealedPayload,
+} from "./parsedStaging.js";
 export {
   createOrGetRevision,
   createOrGetSourceItem,

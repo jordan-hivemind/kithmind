@@ -40,6 +40,8 @@ export {
 export * as provenance from "./provenance/index.js";
 export * as documents from "./documents/index.js";
 export * as memory from "./memory/index.js";
+export * as ingestion from "./ingestion/index.js";
+export * as workers from "./workers/index.js";
 
 const SHA256 = /^[0-9a-f]{64}$/;
 const UUID =

@@ -2,12 +2,8 @@
 -- `thoughts`, structurally created nullable and constraint-free by migration
 -- 004 (P2-39b), the same way migration 006 (P2-39c) tightened identity.
 --
--- Numbering note: this file is 007 in this worktree because, at the time it
--- was written, migrations 007 and 008 were reserved for P2-39d2 and P2-39e,
--- both in flight on other branches and neither merged yet. Whoever merges
--- this after one or both land must renumber this file (and its
--- `KITH_MIGRATIONS` entry in src/schema.ts) to the next free version so the
--- final sequence stays contiguous from 1 -- `applyKithSchema` refuses a gap.
+-- P2-39d2 and P2-39e occupy migrations 007 and 008. This memory migration is
+-- 009 so `applyKithSchema` retains its required contiguous history.
 --
 -- Three constraints are deliberately *not* declared, each because the typed
 -- surface in `src/memory/` depends on the state it would make unrepresentable:
