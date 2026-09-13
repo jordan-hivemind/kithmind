@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createKithPool, newKithId, provenance } from "../dist/index.js";
+import { listSources } from "../dist/documents/index.js";
 import {
   MAX_INLINE_TEXT_CHUNK_UTF8_BYTES,
   planInlineText,
@@ -927,6 +928,22 @@ test(
         active_generation_id: admitted.processingGenerationId,
         publication_state: "active",
       });
+      const sources = await listSources(f.client, [f.spaceId], {
+        sourceAccountId: f.sourceAccountId,
+      });
+      assert.equal(sources.partial, false);
+      assert.equal(sources.truncated, false);
+      assert.equal(sources.sources.length, 1);
+      assert.equal(sources.sources[0].pendingJobs, 0);
+      assert.equal(sources.sources[0].failedJobs, 0);
+      assert.equal(sources.sources[0].items.length, 1);
+      assert.equal(sources.sources[0].items[0].contentStatus, "ready");
+      assert.deepEqual(
+        await listSources(f.client, [f.spaceId], {
+          sourceAccountId: newKithId(),
+        }),
+        { sources: [], partial: false, truncated: false },
+      );
     } finally {
       await pool.end();
     }

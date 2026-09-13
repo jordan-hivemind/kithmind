@@ -1,7 +1,6 @@
 // Ported from packages/convex/convex/models/documents/model.ts (P2-39d2):
-// the read surface, `getDocument` and `searchDocuments`. `listSources` and
-// `sourceAccountMetadata` are not ported -- they belong to the ingestion
-// domain's own read surface (row e), which this row does not touch.
+// the read surface, `getDocument` and `searchDocuments`. P2-39e adds
+// `listSources` and its bounded source-account metadata below.
 //
 // Convex's `withSearchIndex("by_text", ...)` keyword leg becomes a
 // `websearch_to_tsquery` predicate over `chunks.text_search` (migration
@@ -37,6 +36,8 @@ import {
   parseSourceTextRepresentation,
 } from "../provenance/representations.js";
 import { loadProviderOriginalReference } from "../provenance/providerOriginals.js";
+import { spacePredicate } from "../spaces.js";
+import { camelizeSourceAccount } from "../workers/rows.js";
 import {
   camelizeChunk,
   camelizeDocument,
@@ -68,6 +69,9 @@ const MAX_CITATIONS_PER_RESULT = 16;
 const MAX_CITATION_OUTPUT_BYTES = 256 * 1024;
 const MAX_PAGES = 64;
 const MAX_EVIDENCE_SPANS = 256;
+const MAX_SOURCE_ACCOUNTS = 32;
+const MAX_SOURCE_ITEMS = 128;
+const MAX_SOURCE_METADATA_ROWS = 128;
 const MAX_QUERY_LENGTH = 500;
 const DOCUMENT_FUSION_RRF_K = 60;
 const DOCUMENT_FUSION_KEYWORD_WEIGHT = 1;
@@ -843,5 +847,232 @@ export async function getDocument(
     evidenceSpanIds: validatedEvidenceSpanIds,
     partial,
     vectorStatus: "unavailable",
+  };
+}
+
+type MetadataBudget = { remaining: number; overflow: boolean };
+
+function numberValue(value: unknown): number {
+  return Number(value);
+}
+
+function dateValue(value: unknown): Date {
+  return value instanceof Date ? value : new Date(String(value));
+}
+
+async function sourceAccountMetadata(
+  client: ClientBase,
+  account: ReturnType<typeof camelizeSourceAccount>,
+  asOf: number,
+  budget: MetadataBudget,
+) {
+  async function take(sql: string, values: unknown[]) {
+    if (budget.remaining === 0) {
+      budget.overflow = true;
+      return [];
+    }
+    const result = await client.query<QueryResultRow>(sql, [...values, budget.remaining + 1]);
+    if (result.rows.length > budget.remaining) budget.overflow = true;
+    const accepted = result.rows.slice(0, budget.remaining);
+    budget.remaining -= accepted.length;
+    return accepted;
+  }
+
+  let pendingJobs = 0;
+  let failedJobs = 0;
+  let invalidJobParent = false;
+  const jobStates = ["queued", "processing", "staged", "failed", "needs_review"] as const;
+  for (const state of jobStates) {
+    const jobs = await take(
+      `SELECT j.*, i.id AS parent_id, i.space_id AS parent_space_id,
+              i.source_account_id AS parent_source_account_id, i.lifecycle AS parent_lifecycle,
+              i.desired_revision_id AS parent_desired_revision_id,
+              i.desired_processing_epoch AS parent_desired_processing_epoch
+         FROM kith.ingest_jobs j LEFT JOIN kith.source_items i ON i.id = j.source_item_id
+        WHERE j.source_account_id = $1 AND j.state = $2 ORDER BY j.created_at, j.id LIMIT $3`,
+      [account.id, state],
+    );
+    for (const job of jobs) {
+      if (
+        job.space_id !== account.spaceId || job.parent_id === null ||
+        job.parent_space_id !== account.spaceId || job.parent_source_account_id !== account.id
+      ) {
+        invalidJobParent = true;
+        continue;
+      }
+      if (
+        job.parent_lifecycle === "forgetting" || job.parent_lifecycle === "forgotten" ||
+        job.source_revision_id !== job.parent_desired_revision_id ||
+        numberValue(job.desired_processing_epoch) !== numberValue(job.parent_desired_processing_epoch)
+      ) continue;
+      if (state === "queued" || state === "processing" || state === "staged") pendingJobs += 1;
+      else failedJobs += 1;
+    }
+  }
+
+  const fetches = await take(
+    `SELECT f.*, i.id AS parent_id, i.space_id AS parent_space_id,
+            i.source_account_id AS parent_source_account_id, i.lifecycle AS parent_lifecycle
+       FROM kith.source_fetch_requests f LEFT JOIN kith.source_items i ON i.id = f.source_item_id
+      WHERE f.source_account_id = $1 ORDER BY f.created_at, f.id LIMIT $2`,
+    [account.id],
+  );
+  for (const fetch of fetches) {
+    if (
+      fetch.space_id !== account.spaceId || fetch.parent_id === null ||
+      fetch.parent_space_id !== account.spaceId || fetch.parent_source_account_id !== account.id
+    ) invalidJobParent = true;
+    else if (fetch.parent_lifecycle !== "forgetting" && fetch.parent_lifecycle !== "forgotten") pendingJobs += 1;
+  }
+
+  let invalidCoverageParent = false;
+  const windows = await take(
+    `SELECT w.*, e.id AS parent_entity_id, e.space_id AS parent_entity_space_id
+       FROM kith.coverage_windows w LEFT JOIN kith.entities e ON e.id = w.entity_id
+      WHERE w.source_account_id = $1 ORDER BY w.created_at, w.id LIMIT $2`,
+    [account.id],
+  );
+  const validWindows = windows.filter((window) => {
+    const valid = window.space_id === account.spaceId &&
+      (window.entity_id === null || (window.parent_entity_id !== null && window.parent_entity_space_id === account.spaceId));
+    if (!valid) invalidCoverageParent = true;
+    return valid;
+  });
+  const gaps = await take(
+    `SELECT g.*, e.id AS parent_entity_id, e.space_id AS parent_entity_space_id
+       FROM kith.coverage_gaps g LEFT JOIN kith.entities e ON e.id = g.entity_id
+      WHERE g.source_account_id = $1 AND g.status = 'open' ORDER BY g.created_at, g.id LIMIT $2`,
+    [account.id],
+  );
+  const validGaps = gaps.filter((gap) => {
+    const valid = gap.space_id === account.spaceId &&
+      (gap.entity_id === null || (gap.parent_entity_id !== null && gap.parent_entity_space_id === account.spaceId));
+    if (!valid) invalidCoverageParent = true;
+    return valid;
+  });
+
+  const freshnessMs = account.freshnessMs ?? 0;
+  return {
+    pendingJobs,
+    failedJobs,
+    overflow: budget.overflow || invalidCoverageParent || invalidJobParent,
+    windows: validWindows
+      .slice(0, MAX_SOURCE_METADATA_ROWS)
+      .sort((left, right) => dateValue(left.from).getTime() - dateValue(right.from).getTime() || String(left.id).localeCompare(String(right.id)))
+      .map((window) => {
+        const lastEnumeratedAt = dateValue(window.last_enumerated_at);
+        const lastProcessedAt = dateValue(window.last_processed_at);
+        return {
+          coverageWindowId: String(window.id), recordType: String(window.record_type),
+          ...(window.entity_id === null ? {} : { entityId: String(window.entity_id) }),
+          from: dateValue(window.from), to: dateValue(window.to), state: String(window.state),
+          lastEnumeratedAt, lastProcessedAt,
+          fresh: account.enabled === true &&
+            (account.coverageInvalidatedAt === null ||
+              (lastEnumeratedAt > account.coverageInvalidatedAt && lastProcessedAt > account.coverageInvalidatedAt)) &&
+            lastEnumeratedAt.getTime() <= asOf && lastProcessedAt.getTime() <= asOf &&
+            lastEnumeratedAt.getTime() >= asOf - freshnessMs && lastProcessedAt.getTime() >= asOf - freshnessMs,
+          discoveredCount: numberValue(window.discovered_count), indexedCount: numberValue(window.indexed_count),
+          skippedCount: numberValue(window.skipped_count),
+        };
+      }),
+    gaps: validGaps
+      .slice(0, MAX_SOURCE_METADATA_ROWS)
+      .sort((left, right) => dateValue(left.detected_at).getTime() - dateValue(right.detected_at).getTime() || String(left.id).localeCompare(String(right.id)))
+      .map((gap) => ({
+        coverageGapId: String(gap.id), recordType: String(gap.record_type),
+        ...(gap.entity_id === null ? {} : { entityId: String(gap.entity_id) }),
+        ...(gap.from === null ? {} : { from: dateValue(gap.from), to: dateValue(gap.to) }),
+        reason: String(gap.reason), detectedAt: dateValue(gap.detected_at),
+      })),
+  };
+}
+
+export async function listSources(
+  client: ClientBase,
+  authorizedSpaceIds: readonly string[],
+  args: { sourceAccountId?: string; limit?: number },
+) {
+  validateSpaces(authorizedSpaceIds);
+  const limit = boundedLimit(args.limit);
+  const predicate = spacePredicate(authorizedSpaceIds, args.sourceAccountId === undefined ? 1 : 2);
+  const accountResult = args.sourceAccountId === undefined
+    ? await client.query<QueryResultRow>(
+        `SELECT * FROM kith.source_accounts WHERE ${predicate.sql}
+          ORDER BY name NULLS LAST, id LIMIT $2`,
+        [predicate.value, MAX_SOURCE_ACCOUNTS + 1],
+      )
+    : await client.query<QueryResultRow>(
+        `SELECT * FROM kith.source_accounts WHERE id = $1 AND ${predicate.sql} LIMIT 2`,
+        [args.sourceAccountId, predicate.value],
+      );
+  let accountOverflow = false;
+  if (args.sourceAccountId === undefined && accountResult.rows.length > MAX_SOURCE_ACCOUNTS) accountOverflow = true;
+  if (args.sourceAccountId !== undefined && accountResult.rows.length > 1) throw new Error("Source account is not unique");
+  const accounts = accountResult.rows.slice(0, MAX_SOURCE_ACCOUNTS).map(camelizeSourceAccount);
+  const results = [];
+  let itemOverflow = false;
+  let remainingItems = MAX_SOURCE_ITEMS;
+  const metadataBudget = { remaining: MAX_SOURCE_METADATA_ROWS, overflow: false };
+  const asOf = Date.now();
+  for (const account of accounts) {
+    if (remainingItems === 0) {
+      itemOverflow = true;
+      break;
+    }
+    const itemResult = await client.query<QueryResultRow>(
+      `SELECT * FROM kith.source_items WHERE source_account_id = $1
+        ORDER BY created_at, id LIMIT $2`,
+      [account.id, remainingItems + 1],
+    );
+    if (itemResult.rows.length > remainingItems) itemOverflow = true;
+    const itemRows = itemResult.rows.slice(0, remainingItems).map(camelizeSourceItem);
+    remainingItems -= itemRows.length;
+    const items = [];
+    for (const item of itemRows) {
+      if (item.spaceId !== account.spaceId || item.lifecycle === "forgetting" || item.lifecycle === "forgotten") continue;
+      const generation = item.activeGenerationId
+        ? await getRow(client, "processing_generations", item.activeGenerationId, camelizeProcessingGeneration)
+        : undefined;
+      const retainedTextAvailable = Boolean(
+        generation && generation.spaceId === item.spaceId && generation.sourceAccountId === account.id &&
+        generation.sourceItemId === item.id && generation.sourceRevisionId === item.activeRevisionId &&
+        generation.state === "ready" && generation.deactivatedAt === null,
+      );
+      const recovery = generation ? await originalRecoveryStatus(client, generation) : undefined;
+      items.push({
+        sourceItemId: item.id,
+        ...(item.externalId === null ? {} : { externalId: item.externalId }),
+        ...(item.title === null ? {} : { title: item.title }),
+        ...(item.docType === null ? {} : { docType: item.docType }),
+        lifecycle: item.lifecycle,
+        ...(retainedTextAvailable && item.activeRevisionId ? { activeRevisionId: item.activeRevisionId } : {}),
+        ...(retainedTextAvailable && item.activeGenerationId ? { activeGenerationId: item.activeGenerationId } : {}),
+        contentStatus: !retainedTextAvailable ? "none" :
+          item.desiredRevisionId !== item.activeRevisionId || generation!.desiredProcessingEpoch !== item.desiredProcessingEpoch || item.lastFailure
+            ? "stale" : "ready",
+        originalLinkAvailable: item.originalLinkAvailable,
+        retainedTextAvailable,
+        ...(recovery ? { originalRecovery: recovery } : {}),
+        ...(item.lastFailure === null ? {} : { lastFailure: item.lastFailure }),
+      });
+    }
+    const metadata = await sourceAccountMetadata(client, account, asOf, metadataBudget);
+    results.push({
+      sourceAccountId: account.id, spaceId: account.spaceId,
+      ...(account.connector === null ? {} : { connector: account.connector }),
+      ...(account.accountId === null ? {} : { accountId: account.accountId }),
+      ...(account.name === null ? {} : { name: account.name }),
+      enabled: account.enabled === true, cursorVersion: account.cursorVersion ?? 0,
+      ...(account.lastEnumeratedAt === null ? {} : { lastEnumeratedAt: account.lastEnumeratedAt }),
+      ...(account.lastProcessedAt === null ? {} : { lastProcessedAt: account.lastProcessedAt }),
+      freshnessMs: account.freshnessMs ?? 0, items, ...metadata,
+    });
+  }
+  const flattenedItemCount = results.reduce((count, result) => count + result.items.length, 0);
+  return {
+    sources: results.slice(0, limit),
+    partial: accountOverflow || itemOverflow || metadataBudget.overflow || results.some((result) => result.overflow),
+    truncated: results.length > limit || flattenedItemCount > MAX_SOURCE_ITEMS,
   };
 }
