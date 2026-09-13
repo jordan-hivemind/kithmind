@@ -118,6 +118,8 @@ test("thought transitions, authorized candidate hydration, and recall blending p
     assert.deepEqual((await memory.listBySpaces(ctx, [spaceId], 10)).map((thought) => thought.id).includes(currentThought), false);
     await ctx.client.query("UPDATE kith.thoughts SET supersedes = $1::jsonb WHERE id = $2", [JSON.stringify(Array(11).fill(oldThought)), currentThought]);
     assert.deepEqual((await memory.getThoughtsByIds(ctx, [spaceId], [currentThought], { includeHistorical: true })).map((thought) => thought.id), []);
+    await ctx.client.query("UPDATE kith.thoughts SET supersedes = $1::jsonb WHERE id = $2", [JSON.stringify(["z".repeat(26)]), currentThought]);
+    assert.deepEqual((await memory.getThoughtsByIds(ctx, [spaceId], [currentThought], { includeHistorical: true })).map((thought) => thought.id), []);
     await assert.rejects(
       memory.transitionMemory(ctx, userId, spaceId, { content: "Invalid status", metadata: metadata("invalid") }, [coreThought], "current", "bad", ctx.now),
       /superseded or retracted/,
