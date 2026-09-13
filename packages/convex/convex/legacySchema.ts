@@ -13,9 +13,7 @@ import { v } from "convex/values";
 
 import { apiKeyFields } from "./models/apiKeys/validators";
 import { entityFields, factFields } from "./models/facts/validators";
-import { listFields, listItemFields } from "./models/lists/validators";
 import { consumedOAuthCodeFields } from "./models/oauth/validators";
-import { insightFields, reportFields } from "./models/reports/validators";
 import {
   spaceFields,
   spaceMemberFields,
@@ -146,14 +144,4 @@ export default defineSchema({
     .index("by_codeHash", ["codeHash"])
     .index("by_userId_and_requestHash", ["userId", "requestHash"])
     .index("by_expiresAt", ["expiresAt"]),
-  reports: defineTable(reportFields).index("by_userId", ["userId"]),
-  insights: defineTable(insightFields)
-    .index("by_reportId", ["reportId"])
-    .index("by_userId_and_status", ["userId", "status"]),
-  lists: defineTable(listFields)
-    .index("by_userId", ["userId"])
-    .index("by_userId_and_pinned", ["userId", "pinned"]),
-  listItems: defineTable(listItemFields)
-    .index("by_listId", ["listId"])
-    .index("by_userId_and_status", ["userId", "status"]),
 });

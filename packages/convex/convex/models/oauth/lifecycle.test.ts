@@ -141,7 +141,7 @@ describe("OAuth grant lifecycle", () => {
       expiresAt: issued.grantExpiresAt,
     };
     await expect(
-      exchange.query(api.models.lists.mcpQueries.getLists, {}),
+      exchange.query(api.models.thoughts.mcpQueries.getStats, {}),
     ).rejects.toThrow("Not authenticated");
     expect(
       await exchange.mutation(

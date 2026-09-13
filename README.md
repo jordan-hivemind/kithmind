@@ -104,10 +104,9 @@ the [family spaces guide](docs/family-spaces.md).
 | `capture_thought`, `search_thoughts`, `recall_context` | Narrative memory and grounded recall  |
 | `search_documents`, `get_document`, `list_sources`     | Captured documents and retained text  |
 | `query_records`                                        | Typed lab, vehicle, and money records |
-| `create_list`, `get_open_items`, and the list tools    | Simple shared lists                   |
 
 Set `MCP_TOOL_PROFILE=memory` to expose the memory and document tools only.
-The default is the full set.
+The default is the full set, which is currently the same set.
 
 ## Where it stands
 

@@ -39,28 +39,6 @@ export const listAuthorizedReadSpaceIds = internalQuery({
     await getAuthorizedReadSpaceIds(ctx, args.principal, args.spaceIds),
 });
 
-export const authorizePersonal = internalQuery({
-  args: {
-    principal: principalRefValidator,
-    operation: spaceOperation,
-  },
-  returns: v.null(),
-  handler: async (ctx, args) => {
-    const settings = await ctx.db
-      .query("userSpaceSettings")
-      .withIndex("by_userId", (q) => q.eq("userId", args.principal.userId))
-      .take(2);
-    if (settings.length !== 1) throw new Error("Not authorized");
-    await requireSpaceAccess(
-      ctx,
-      args.principal,
-      settings[0]!.personalSpaceId,
-      args.operation,
-    );
-    return null;
-  },
-});
-
 export const resolveWriteDestination = internalMutation({
   args: {
     principal: principalRefValidator,
