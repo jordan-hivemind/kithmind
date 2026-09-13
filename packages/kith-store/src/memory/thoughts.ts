@@ -17,7 +17,7 @@
 // (writes) or `spaceIds` set (reads); space authorization is the caller's job.
 
 import { row, rows, exec, at, ms, type IdentityCtx } from "../identity/db.js";
-import { assertKithId, newKithId } from "../ids.js";
+import { assertKithId, KITH_ID, newKithId } from "../ids.js";
 import {
   assertValidMemoryValidity,
   isCurrentMemory,
@@ -32,6 +32,7 @@ export const DEFAULT_THOUGHT_LIMIT = 20;
 export const MAX_THOUGHT_LIMIT = 100;
 const MAX_FILTER_SCAN = 1_000;
 const MAX_CANDIDATE_READS = 1_000;
+const MAX_THOUGHT_HISTORY_LINKS = 10;
 
 export type ThoughtType =
   | "decision"
@@ -126,6 +127,36 @@ function toThought(record: ThoughtRow): Thought {
   };
 }
 
+/**
+ * A migration/import can bypass the transition writer, so `supersedes` is
+ * treated as untrusted on every read.  A corrupted link is not rendered: it
+ * could otherwise disclose an id from another space and make a thought's
+ * history falsely look complete.  This intentionally mirrors fact hydration.
+ */
+async function hydrateThought(ctx: IdentityCtx, record: ThoughtRow): Promise<Thought | null> {
+  const links = record.supersedes ?? [];
+  if (
+    links.length > MAX_THOUGHT_HISTORY_LINKS ||
+    new Set(links).size !== links.length ||
+    links.some((id) => !KITH_ID.test(id))
+  ) return null;
+  const linked = [];
+  for (const id of links) {
+    linked.push(await row<{ space_id: string }>(ctx, "SELECT space_id FROM kith.thoughts WHERE id = $1", [id]));
+  }
+  if (linked.some((thought) => !thought || thought.space_id !== record.space_id)) return null;
+  return toThought(record);
+}
+
+async function hydrateThoughtRows(ctx: IdentityCtx, records: readonly ThoughtRow[]): Promise<Thought[]> {
+  const hydrated = [];
+  for (const record of records) {
+    const thought = await hydrateThought(ctx, record);
+    if (thought) hydrated.push(thought);
+  }
+  return hydrated;
+}
+
 export function boundedThoughtLimit(
   requestedLimit: number | undefined,
   defaultLimit: number = DEFAULT_THOUGHT_LIMIT,
@@ -138,7 +169,7 @@ export function boundedThoughtLimit(
 }
 
 function compareNewestFirst(left: { createdAt: number; id: string }, right: { createdAt: number; id: string }) {
-  return right.createdAt - left.createdAt || left.id.localeCompare(right.id);
+  return right.createdAt - left.createdAt || right.id.localeCompare(left.id);
 }
 
 /** One thought row by id, unchecked against any space. Callers space-check. */
@@ -148,7 +179,7 @@ export async function getThoughtById(ctx: IdentityCtx, id: string): Promise<Thou
     `SELECT ${THOUGHT_COLUMNS} FROM kith.thoughts WHERE id = $1`,
     [assertKithId(id, "invalid_thought_id")],
   );
-  return record ? toThought(record) : null;
+  return record ? hydrateThought(ctx, record) : null;
 }
 
 /** Ported from `getByIdAuthorized`/`getByIdsAuthorized`, folded into one bulk read. */
@@ -165,7 +196,7 @@ export async function getThoughtsByAuthorizedIds(
     `SELECT ${THOUGHT_COLUMNS} FROM kith.thoughts WHERE id = ANY($1::text[])`,
     [ids.map((id) => assertKithId(id, "invalid_thought_id"))],
   );
-  return records.map(toThought).filter((thought) => authorized.has(thought.spaceId));
+  return (await hydrateThoughtRows(ctx, records)).filter((thought) => authorized.has(thought.spaceId));
 }
 
 export type ListBySpacesFilters = { type?: ThoughtType; topic?: string };
@@ -203,7 +234,7 @@ export async function listBySpaces(
       values.push(scanLimit);
       const sql = `SELECT ${THOUGHT_COLUMNS} FROM kith.thoughts
         WHERE ${where} ORDER BY created_at DESC, id DESC LIMIT $${values.length}`;
-      const candidates = (await rows<ThoughtRow>(ctx, sql, values)).map(toThought);
+      const candidates = await hydrateThoughtRows(ctx, await rows<ThoughtRow>(ctx, sql, values));
       if (candidates.length > MAX_FILTER_SCAN) {
         throw new Error("Thought topic filter exceeds the bounded scan");
       }
@@ -240,10 +271,10 @@ export async function listCoreBySpaces(
             AND (valid_to IS NULL OR $2 < valid_to)
           ORDER BY created_at DESC, id DESC LIMIT $3`,
         [spaceId, activeAt, limit],
-      )).map(toThought),
+      )),
     );
   }
-  return bySpace.flat().sort(compareNewestFirst).slice(0, limit);
+  return (await hydrateThoughtRows(ctx, bySpace.flat())).sort(compareNewestFirst).slice(0, limit);
 }
 
 export type CaptureThoughtArgs = {
@@ -315,6 +346,9 @@ export async function transitionMemory(
   transitionedAt: number,
 ): Promise<string> {
   assertValidMemoryValidity(args);
+  if (previousStatus !== "superseded" && previousStatus !== "retracted") {
+    throw new Error("Memory transition status must be superseded or retracted");
+  }
   const uniquePreviousIds = [...new Set(previousIds)];
   if (uniquePreviousIds.length === 0 || uniquePreviousIds.length > 10) {
     throw new Error("A memory transition requires 1-10 previous memories");
@@ -421,7 +455,7 @@ export async function getThoughtsByIds(
     `SELECT ${THOUGHT_COLUMNS} FROM kith.thoughts WHERE id = ANY($1::text[])`,
     [candidateIds.map((id) => assertKithId(id, "invalid_thought_id"))],
   );
-  const byId = new Map(records.map((record) => [record.id, toThought(record)]));
+  const byId = new Map((await hydrateThoughtRows(ctx, records)).map((thought) => [thought.id, thought]));
   const activeAt = ctx.now;
   return candidateIds
     .map((id) => byId.get(id))

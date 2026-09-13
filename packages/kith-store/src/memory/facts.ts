@@ -3,10 +3,10 @@
 // Every function here takes an already-authorized `spaceId` (writes) or
 // `spaceIds` set (reads) -- section 2.5's space check is the caller's job,
 // exactly as `src/provenance/model.ts` and `src/documents/inventory.ts`
-// already document for their own domains. `test/memoryFacts.test.mjs` proves
-// the composed property end to end: `getAuthorizedReadSpaceIds` /
-// `requireSpaceAccess` from `../identity/index.js` denying access, and these
-// functions never seeing a space id that denial withheld.
+// already document for their own domains. The service-level regressions in
+// `test/memory.test.mjs` prove row-space filtering and corrupted-link
+// withholding. Transport composition (HTTP/MCP principal loading followed by
+// this authorized-space input) is deliberately P2-39i work.
 //
 // `searchFacts`'s Convex original ran over a `tsvector`-equivalent search
 // index (`by_searchText`), which is P2-39g's column to add. That half of the
@@ -572,7 +572,7 @@ function assertBoundedHistoryHydration(facts: readonly StoredFact[]): void {
 }
 
 function compareNewestFirst(left: { createdAt: number; id: string }, right: { createdAt: number; id: string }) {
-  return right.createdAt - left.createdAt || left.id.localeCompare(right.id);
+  return right.createdAt - left.createdAt || right.id.localeCompare(left.id);
 }
 
 export type ListFactsOptions = {

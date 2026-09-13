@@ -7,7 +7,23 @@
 // composes them.
 
 export * from "./lifecycle.js";
-export * from "./entities.js";
+export {
+  normalizeEntityKey,
+  normalizeEntityName,
+  normalizeLiteralName,
+  resolveEntity,
+  loadSpaceEntityIndex,
+  resolveLiteralName,
+} from "./entities.js";
 export * from "./facts.js";
-export * from "./thoughts.js";
+export {
+  boundedThoughtLimit,
+  captureThought,
+  getThoughtsByAuthorizedIds,
+  getThoughtsByIds,
+  listBySpaces,
+  listCoreBySpaces,
+  setCoreStatus,
+  transitionMemory,
+} from "./thoughts.js";
 export * from "./recall.js";
