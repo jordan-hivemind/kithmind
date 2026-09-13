@@ -18,6 +18,15 @@ import {
   applyPgSchema,
   PG_SCHEMA_VERSION,
 } from "../packages/finance-archive/dist/index.js";
+import {
+  exportConvexData,
+  loadCsvDirectory,
+  runParityChecks,
+  transformExport,
+} from "../packages/kith-migrate/dist/index.js";
+import { writeConvexExportDir } from "../packages/kith-migrate/test/fixtures/buildFixture.mjs";
+import { createKithPool } from "../packages/kith-store/dist/index.js";
+import { authDenialSurfaceOnPool } from "../packages/kith-store/dist/identity/index.js";
 
 const execute = promisify(execFile);
 const ADMIN = process.env.KITH_MIGRATE_TEST_DATABASE_URL;
@@ -68,6 +77,17 @@ test("postgres runner publishes, independently reads back, decrypts, and restore
   } finally {
     await client.end();
   }
+  const convexFixture = join(root, "convex-fixture");
+  const exportDirectory = join(root, "convex-export");
+  const csvDirectory = join(root, "csv");
+  await writeConvexExportDir(convexFixture);
+  const exportManifest = await exportConvexData(
+    convexFixture,
+    exportDirectory,
+    { deploymentIdentity: "synthetic-restore", schemaVersion: 1, gitRevision: "abc1234" },
+  );
+  const transformReport = await transformExport(exportDirectory, csvDirectory);
+  await loadCsvDirectory({ connectionString: source }, csvDirectory);
 
   const stateDirectory = join(root, "state");
   const stagingRoot = join(root, "staging");
@@ -135,6 +155,32 @@ test("postgres runner publishes, independently reads back, decrypts, and restore
     managed.result.manifest.parity.tables.length,
   );
   assert.ok(managed.verification.restore.tablesVerified > 70);
+  const restoredPool = createKithPool(destination, 2);
+  restoredPool.on("error", () => {});
+  let parityReport;
+  try {
+    parityReport = await runParityChecks({
+      connectionString: destination,
+      exportDir: exportDirectory,
+      manifest: exportManifest,
+      transformReport,
+      authDenialSurface: authDenialSurfaceOnPool(restoredPool),
+    });
+  } finally {
+    await restoredPool.end();
+  }
+  const parityByName = Object.fromEntries(
+    parityReport.results.map((result) => [result.name, result.status]),
+  );
+  assert.deepEqual(parityByName, {
+    counts: "pass",
+    retained_text_hashes: "pass",
+    provenance_chains_sample: "pass",
+    space_isolation_data: "pass",
+    archive_references: "pending",
+    auth_denial_and_space_isolation_read_api: "pass",
+  });
+  assert.equal(parityReport.ok, true);
   const journal = JSON.parse(await readFile(join(stateDirectory, "database-backup-status.json"), "utf8"));
   assert.equal(journal.state, "succeeded");
   await assert.rejects(readFile(join(stateDirectory, "database-backup.lock")), { code: "ENOENT" });
