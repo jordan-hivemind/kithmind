@@ -15,6 +15,7 @@ import {
   generationOriginalRecoverySelectionIsClosed,
   isAssessmentSnapshotCurrent,
 } from "./assessment";
+import { requeueFailedDiscoveryWorkPage } from "./migrations";
 import { getWorkerSourceStatus } from "./model";
 import { FS_TEXT_PROFILE } from "./profile";
 import { parseWorkerRequest, type WorkerRequest } from "./protocol";
@@ -755,7 +756,7 @@ async function completeAssessment(
     ),
   );
   let result;
-  for (let ordinal = 0; ordinal < 5; ordinal += 1) {
+  for (let ordinal = 0; ordinal < 12; ordinal += 1) {
     result = await f.t.run((ctx) =>
       advanceProcessingAssessment(
         ctx,
@@ -1254,7 +1255,7 @@ describe("worker processing assessments", () => {
   // still points at its `failed` work row. It is not terminally ready, so the
   // assessment must report it as needing review rather than failing closed and
   // marking every later assessment stale.
-  test("reports a settled discovery failure behind an unchanged entry for review", async () => {
+  test("parks a settled discovery failure behind an unchanged entry", async () => {
     const f = await fixture();
     const pending = await seedPendingCurrent(f);
     await f.t.run(async (ctx) => {
@@ -1287,9 +1288,11 @@ describe("worker processing assessments", () => {
       f.principal,
       "settled-failure-assessment",
     );
+    // P2-80h: settled, so parked rather than review, and it no longer keeps
+    // the source `incomplete`.
     expect(result).toMatchObject({
-      state: "incomplete",
-      counts: { items: { needsReview: 1, pending: 0, ready: 0 } },
+      state: "complete",
+      counts: { items: { parked: 1, needsReview: 0, pending: 0, ready: 0 } },
     });
   });
 
@@ -1377,7 +1380,7 @@ describe("worker processing assessments", () => {
   // The state P2-80g settles a deterministic document failure into on the
   // pass that reports it: the entry is still `queued` from the scan, but the
   // work row is terminal, so it is valid and reads as needing review.
-  test("counts a settled archived parse failure behind a queued entry for review", async () => {
+  test("parks a settled archived parse failure behind a queued entry", async () => {
     const f = await fixture();
     const pending = await seedPendingCurrent(f);
     await f.t.run(async (ctx) => {
@@ -1403,8 +1406,259 @@ describe("worker processing assessments", () => {
       "settled-queued-assessment",
     );
     expect(result).toMatchObject({
+      state: "complete",
+      counts: {
+        items: { parked: 1, needsReview: 0, failed: 0, pending: 0, ready: 0 },
+      },
+    });
+  });
+
+  /**
+   * P2-80h: the production shape. One published document, one explicit gap,
+   * and one document whose parse failed for good. Both non-ready items are
+   * settled: nothing retries them, so the pass has nothing left to do.
+   */
+  async function seedParkedMixedScan(f: Fixture) {
+    const scanId = await seedReadyMetadataRebind(f);
+    const ids = await f.t.run(async (ctx) => {
+      const readyEntry = await ctx.db
+        .query("workerScanEntries")
+        .withIndex("by_scanId", (q) => q.eq("scanId", scanId))
+        .unique();
+      if (!readyEntry) throw new Error("missing ready entry");
+      const pageId = readyEntry.scanPageId;
+      const gapItemId = await ctx.db.insert("sourceItems", {
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        externalIdHash: "5".repeat(64),
+        externalId: "01890a5d-ac96-7cc4-bb7e-6f4f5ca5c141",
+        title: "Gap",
+        docType: "text",
+        uri: "fs://gap.txt",
+        lifecycle: "available",
+        originalLinkAvailable: true,
+        desiredProcessingEpoch: 0,
+        workerObservationEpoch: 1,
+        workerProcessingEpoch: 0,
+        workerLastSeenInventoryEpoch: 1,
+      });
+      await ctx.db.insert("workerScanEntries", {
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        scanId,
+        scanPageId: pageId,
+        sourceItemId: gapItemId,
+        identityKeyHash: "5".repeat(64),
+        externalIdHash: "5".repeat(64),
+        uriDigest: "w".repeat(64),
+        inventoryMetadataDigest: "k".repeat(64),
+        sourceModifiedAt: 20,
+        observationEpoch: 1,
+        processingEpoch: 0,
+        state: "gap",
+        issueCode: "unreadable",
+        observedAt: 80,
+        retireAt: 100_000,
+      });
+      const parkedItemId = await ctx.db.insert("sourceItems", {
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        externalIdHash: "6".repeat(64),
+        externalId: "01890a5d-ac96-7cc4-bb7e-6f4f5ca5c142",
+        title: "Parked",
+        docType: "statement",
+        uri: "fs://parked.pdf",
+        lifecycle: "available",
+        originalLinkAvailable: true,
+        desiredProcessingEpoch: 1,
+        workerObservationEpoch: 1,
+        workerProcessingEpoch: 1,
+        workerLastSeenInventoryEpoch: 1,
+      });
+      const parkedEntryId = await ctx.db.insert("workerScanEntries", {
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        scanId,
+        scanPageId: pageId,
+        sourceItemId: parkedItemId,
+        identityKeyHash: "6".repeat(64),
+        externalIdHash: "6".repeat(64),
+        uriDigest: "x".repeat(64),
+        inventoryMetadataDigest: "l".repeat(64),
+        contentRepresentation: "archived_binary_v1",
+        binaryParserProfileId: "pdf_docqa_v1",
+        binaryMediaType: "application/pdf",
+        contentHash: "8".repeat(64),
+        byteLength: 4_096,
+        sourceModifiedAt: 20,
+        observationEpoch: 1,
+        processingEpoch: 1,
+        // PR191: an exhausted failure settles its next scan entry as
+        // `unchanged` and keeps the failed work row bound to it.
+        state: "unchanged",
+        observedAt: 80,
+        retireAt: 100_000,
+      });
+      const parkedWorkId = await ctx.db.insert("workerDiscoveryWork", {
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        sourceItemId: parkedItemId,
+        scanId,
+        scanEntryId: parkedEntryId,
+        observationEpoch: 1,
+        processingEpoch: 1,
+        expectedDesiredProcessingEpoch: 0,
+        state: "failed",
+        failureCode: "page_limit_exceeded",
+        retryable: false,
+        attempts: 2,
+        leaseEpoch: 1,
+        contentHash: "8".repeat(64),
+        byteLength: 4_096,
+        capturedAt: 20,
+        sourceModifiedAt: 20,
+        mediaType: "application/pdf",
+        profileId: "pdf_docqa_v1",
+        contentRepresentation: "archived_binary_v1",
+        extractionFingerprint: "a".repeat(64),
+        extractorFingerprint: "b".repeat(64),
+        recordSchemaFingerprint: "c".repeat(64),
+        normalizationFingerprint: "d".repeat(64),
+        chunkerFingerprint: "e".repeat(64),
+        title: "Parked",
+        docType: "statement",
+        uri: "fs://parked.pdf",
+        actorUserId: f.userId,
+        actorCredentialId: f.credentialId,
+        createdAt: 20,
+        retireAt: 100_000,
+      });
+      await ctx.db.patch(parkedEntryId, { discoveryWorkId: parkedWorkId });
+      await ctx.db.patch(pageId, { entryCount: 3 });
+      await ctx.db.patch(scanId, { entryCount: 3, gapCount: 1 });
+      return { parkedItemId, parkedWorkId };
+    });
+    return { scanId, ...ids };
+  }
+
+  test("completes a scan whose only unfinished documents are parked or gapped", async () => {
+    const f = await fixture();
+    const { scanId } = await seedParkedMixedScan(f);
+    const { result } = await completeAssessment(
+      f,
+      scanId,
+      f.principal,
+      "parked",
+    );
+    expect(result).toMatchObject({
+      state: "complete",
+      counts: {
+        items: {
+          ready: 1,
+          parked: 1,
+          explicitGap: 1,
+          pending: 0,
+          failed: 0,
+          needsReview: 0,
+          unavailable: 0,
+        },
+        unresolvedEntries: { needsReview: 0 },
+      },
+    });
+    // The source publishes the same snapshot, parked count included, so a
+    // reader cannot take `complete` for "everything parsed".
+    const statusRequest = parseWorkerRequest({
+      ...source(f),
+      operation: "source.status",
+    });
+    if (statusRequest.operation !== "source.status")
+      throw new Error("bad request");
+    const status = await f.t.run((ctx) =>
+      getWorkerSourceStatus(ctx, f.principal, statusRequest, 400),
+    );
+    expect(status.processing).toMatchObject({
+      state: "complete",
+      counts: { items: { parked: 1, explicitGap: 1 } },
+    });
+  });
+
+  test("an unavailable item still keeps a parked scan incomplete", async () => {
+    const f = await fixture();
+    const { scanId } = await seedParkedMixedScan(f);
+    await f.t.run((ctx) =>
+      ctx.db.insert("sourceItems", {
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        externalIdHash: "7".repeat(64),
+        externalId: "01890a5d-ac96-7cc4-bb7e-6f4f5ca5c143",
+        title: "Unavailable",
+        docType: "text",
+        uri: "fs://unavailable.txt",
+        lifecycle: "unavailable",
+        originalLinkAvailable: true,
+        desiredProcessingEpoch: 0,
+        workerObservationEpoch: 1,
+        workerProcessingEpoch: 0,
+      }),
+    );
+    const { result } = await completeAssessment(
+      f,
+      scanId,
+      f.principal,
+      "parked-unavailable",
+    );
+    expect(result).toMatchObject({
       state: "incomplete",
-      counts: { items: { needsReview: 1, failed: 0, pending: 0, ready: 0 } },
+      counts: { items: { parked: 1, unavailable: 1 } },
+    });
+  });
+
+  test("stuck work still keeps a parked scan incomplete", async () => {
+    const f = await fixture();
+    const { scanId, parkedWorkId } = await seedParkedMixedScan(f);
+    await f.t.run((ctx) =>
+      ctx.db.patch(parkedWorkId, {
+        state: "needs_review",
+        failureCode: undefined,
+        retryable: undefined,
+      }),
+    );
+    const { result } = await completeAssessment(
+      f,
+      scanId,
+      f.principal,
+      "parked-review",
+    );
+    expect(result).toMatchObject({
+      state: "incomplete",
+      counts: { items: { parked: 0, needsReview: 1 } },
+    });
+  });
+
+  test("requeueing a parked row reopens it and the source reports incomplete again", async () => {
+    const f = await fixture();
+    const { scanId, parkedWorkId } = await seedParkedMixedScan(f);
+    const requeued = await f.t.run((ctx) =>
+      requeueFailedDiscoveryWorkPage(ctx, {
+        sourceAccountId: f.sourceAccountId,
+        dryRun: false,
+        limit: 50,
+        now: 300,
+      }),
+    );
+    expect(requeued).toMatchObject({ requeued: 1, skippedAttemptLimit: 0 });
+    const work = await f.t.run((ctx) => ctx.db.get(parkedWorkId));
+    expect(work).toMatchObject({ state: "queued", nextAttemptAt: 300 });
+    expect(work?.retryable).toBeUndefined();
+    const { result } = await completeAssessment(
+      f,
+      scanId,
+      f.principal,
+      "parked-requeued",
+    );
+    expect(result).toMatchObject({
+      state: "incomplete",
+      counts: { items: { parked: 0, pending: 1 } },
     });
   });
 
