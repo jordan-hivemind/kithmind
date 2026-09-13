@@ -171,6 +171,44 @@ describe("closed requests and trusted authorization", () => {
     rejects("invalid_response", () => parseExchange(contradictory));
   });
 
+  it("binds an ambiguous verified alias match without exposing its full number", () => {
+    const exchange = clone(syntheticFinanceReadExchanges[6]);
+    delete exchange.response.items[0].accountLast4;
+    exchange.response.items[0].matchedAccountLast4 = "1234";
+    exchange.response.items[0].disclosures.push({
+      field: "accountLast4",
+      reason: "ambiguous_aliases",
+    });
+    const parsed = parseExchange(exchange).response;
+    assert.equal(parsed.items[0].accountLast4, undefined);
+    assert.equal(parsed.items[0].matchedAccountLast4, "1234");
+    assert.deepEqual(parsed.items[0].disclosures[0], {
+      field: "accountLast4",
+      reason: "ambiguous_aliases",
+    });
+
+    const mismatched = clone(exchange);
+    mismatched.response.items[0].matchedAccountLast4 = "5678";
+    rejects("invalid_response", () => parseExchange(mismatched));
+
+    const unfiltered = clone(exchange);
+    delete unfiltered.request.accountLast4;
+    rejects("invalid_response", () => parseExchange(unfiltered));
+
+    const canonicalAndMatched = clone(exchange);
+    canonicalAndMatched.response.items[0].accountLast4 = "1234";
+    rejects("invalid_response", () => parseExchange(canonicalAndMatched));
+
+    const snapshot = clone(syntheticFinanceReadExchanges[7]);
+    snapshot.response.account.matchedAccountLast4 = "1234";
+    snapshot.response.account.disclosures.push({
+      field: "accountLast4",
+      reason: "ambiguous_aliases",
+    });
+    delete snapshot.response.account.accountLast4;
+    rejects("invalid_response", () => parseExchange(snapshot));
+  });
+
   it("pins a request to its expected dataset revision", () => {
     const exchange = clone(syntheticFinanceReadExchanges[7]);
     exchange.request.expectedDatasetRevision = "dataset-revision-other";

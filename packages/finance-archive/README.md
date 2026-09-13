@@ -1564,10 +1564,16 @@ FINANCE_ARCHIVE_DATABASE_URL=postgresql://<owner>@<host>/<db> \
 
 ### The reader role
 
-`account_aliases` gets no `GRANT`. `applyPgReaderRole` grants `SELECT` at
-the time it runs, and its own suite asserts that a table a later migration
-adds is not silently readable; the read surface (`src/mcp/pgRead.ts`) does
-not read this table. Re-run `applyPgReaderRole` if that ever changes.
+`account_aliases` gets no migration-time `GRANT`. `applyPgReaderRole` grants
+`SELECT` at the time it runs, and its own suite asserts that a table a later
+migration adds is not silently readable. F1-73e made the table a read-surface
+dependency. A reader role provisioned before migration 6 therefore needs the
+targeted grant below. Do not re-run `applyPgReaderRole` or
+`scripts/provision.mjs` for this: both rotate the gateway's reader password.
+
+```
+GRANT SELECT ON <schema>.account_aliases TO <schema>_reader;
+```
 
 ## Raw tree
 
@@ -1854,6 +1860,11 @@ one, in order, inside the same transaction and lock, and records each one.
 | 5   | holdings row_hash                       | `positions.row_hash`, `balances.row_hash`, `liabilities.row_hash` (nullable, unique per table).                               |
 | 6   | account_aliases                         | `accounts.id, institution_id` unique; `account_aliases` table (alternate external keys).                                      |
 | 7   | review_items dedupe key                 | Partial unique index on `(kind, source_document_id, COALESCE(source_locator, ''), raw_value)` where the document is non-null. |
+| 8   | weak instrument identity                | Institution-scoped weak-match identity and occurrence metadata.                                                               |
+| 9   | retained texts                          | Database-held retained text for gateway evidence verification.                                                                |
+| 10  | provider document identity              | Institution-scoped provider document IDs and supersession.                                                                    |
+| 11  | finance read revision                   | Transactional revision epoch, counter, and reader-visible table triggers.                                                     |
+| 12  | account alias read revision             | Revision trigger for the existing alias table and one-time continuation invalidation.                                         |
 
 Migration 2 (F1-29,
 [`docs/plans/2026-09-11-structured-evidence.md`](../../docs/plans/2026-09-11-structured-evidence.md))

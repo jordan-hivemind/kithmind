@@ -221,6 +221,16 @@ consumer must not guess a default currency. Its response reports `none`,
 response is a prompt for disambiguation, not permission to select the first row.
 Full account numbers are never stored or returned.
 
+Account last four uses an evidence-learned `statement_number` alias when one is
+available. The reader accepts only the statement parser's closed
+`###-######-###` format and derives the last four from the central account
+component. It never derives account digits from the unrelated timestamp-shaped
+API key. If one account has verified aliases with different last-four values,
+the descriptor reports `ambiguous_aliases`; a filtered result carries only the
+four digits it matched so the gateway can bind the response to the request.
+Collisions across accounts remain multiple matches. Full statement numbers do
+not enter the response or logs.
+
 `get_holdings_snapshot` requires an account ID and one closed selector:
 
 - `{ "mode": "exact", "asOf": "YYYY-MM-DD" }` selects only that date.
@@ -273,6 +283,16 @@ lock before table row locks also gives concurrent writers one lock order. A
 missing singleton fails the write rather than permitting an unrevisioned change.
 The reader fetches the epoch and counter in O(1) inside the same repeatable-read
 transaction as the response.
+
+Migration 12 adds the same revision trigger to the existing `account_aliases`
+table and advances the counter once while applying the migration. That one-time
+advance invalidates continuations issued before aliases became an account-read
+dependency. The table already exists, but a reader role provisioned before it
+was created needs one targeted grant without credential rotation:
+
+```
+GRANT SELECT ON <schema>.account_aliases TO <schema>_reader;
+```
 
 Apply the migration with the owner connection in development first, then in the
 approved target:

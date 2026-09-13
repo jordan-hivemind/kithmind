@@ -761,6 +761,127 @@ test(
 );
 
 test(
+  "account discovery derives last four only from verified statement aliases",
+  { skip },
+  async (t) => {
+    const { owner, reader: r, seeded } = await fixture(t);
+    const aliasPrivilege = await r.client.query(
+      "SELECT count(*)::text AS count FROM account_aliases",
+    );
+    assert.equal(aliasPrivilege.rows[0].count, "0");
+    const accountId = seeded.settled.accountIds[0];
+    const statementAlias = "123-450042-987";
+    await owner.query(
+      `UPDATE accounts
+          SET external_key = '2026-01-02-03.04.05.000001', acct_last4 = '7711'
+        WHERE id = $1`,
+      [accountId],
+    );
+    await owner.query(
+      `INSERT INTO account_aliases
+         (id, account_id, institution_id, external_key, kind)
+       VALUES ('alias-primary', $1, $2, $3, 'statement_number')`,
+      [accountId, seeded.settled.id, statementAlias],
+    );
+    await owner.query(
+      `INSERT INTO positions (id, account_id, as_of, currency)
+       VALUES ('alias-snapshot', $1, DATE '2026-04-30', 'USD')`,
+      [accountId],
+    );
+
+    const discovered = await serve(r, {
+      operation: "list_accounts",
+      accountLast4: "0042",
+    });
+    assert.equal(discovered.matchStatus, "unique");
+    assert.equal(discovered.items[0].accountId, accountId);
+    assert.equal(discovered.items[0].accountLast4, "0042");
+    assert.equal(discovered.items[0].matchedAccountLast4, undefined);
+    assert.doesNotMatch(JSON.stringify(discovered), /123-450042-987/);
+
+    const storedSuffix = await serve(r, {
+      operation: "list_accounts",
+      accountLast4: "7711",
+    });
+    assert.equal(storedSuffix.matchStatus, "none");
+    const branchTaintedSuffix = await serve(r, {
+      operation: "list_accounts",
+      accountLast4: "2987",
+    });
+    assert.equal(branchTaintedSuffix.matchStatus, "none");
+
+    const snapshot = await serve(r, {
+      operation: "get_holdings_snapshot",
+      accountId,
+      snapshot: { mode: "exact", asOf: "2026-04-30" },
+    });
+    assert.equal(snapshot.selectedSnapshot.status, "found");
+    assert.equal(snapshot.account.accountLast4, "0042");
+    assert.doesNotMatch(JSON.stringify(snapshot.account), /123-450042-987/);
+
+    const opaqueWithoutAliasId = seeded.unreconciled.accountIds[0];
+    await owner.query(
+      `UPDATE accounts
+          SET external_key = '2026-01-02-03.04.05.000002', acct_last4 = '8822'
+        WHERE id = $1`,
+      [opaqueWithoutAliasId],
+    );
+    const opaqueWithoutAlias = await serve(r, {
+      operation: "list_accounts",
+      institutionName: "Synthetic cedar-ridge",
+    });
+    assert.equal(opaqueWithoutAlias.matchStatus, "unique");
+    assert.equal(opaqueWithoutAlias.items[0].accountLast4, undefined);
+    assert.deepEqual(opaqueWithoutAlias.items[0].disclosures, [
+      { field: "accountLast4", reason: "not_reported" },
+    ]);
+    assert.equal(opaqueWithoutAlias.completeness, "partial");
+    assert.ok(opaqueWithoutAlias.coverage.reasons.includes("missing_value"));
+    const opaqueSuffix = await serve(r, {
+      operation: "list_accounts",
+      accountLast4: "8822",
+    });
+    assert.equal(opaqueSuffix.matchStatus, "none");
+
+    await owner.query(
+      `INSERT INTO account_aliases
+         (id, account_id, institution_id, external_key, kind)
+       VALUES ('alias-conflicting', $1, $2, '444-991177-555', 'statement_number')`,
+      [accountId, seeded.settled.id],
+    );
+    const ambiguousAlias = await serve(r, {
+      operation: "list_accounts",
+      accountLast4: "0042",
+    });
+    assert.equal(ambiguousAlias.matchStatus, "unique");
+    assert.equal(ambiguousAlias.items[0].accountLast4, undefined);
+    assert.equal(ambiguousAlias.items[0].matchedAccountLast4, "0042");
+    assert.deepEqual(ambiguousAlias.items[0].disclosures, [
+      { field: "accountLast4", reason: "ambiguous_aliases" },
+    ]);
+    assert.ok(ambiguousAlias.coverage.reasons.includes("unresolved_identity"));
+
+    const collidingAccountId = seeded.underReview.accountIds[0];
+    await owner.query(
+      `INSERT INTO account_aliases
+         (id, account_id, institution_id, external_key, kind)
+       VALUES ('alias-collision', $1, $2, '777-880042-333', 'statement_number')`,
+      [collidingAccountId, seeded.underReview.id],
+    );
+    const collision = await serve(r, {
+      operation: "list_accounts",
+      accountLast4: "0042",
+    });
+    assert.equal(collision.matchStatus, "ambiguous");
+    assert.equal(collision.totalMatches, 2);
+    assert.deepEqual(
+      new Set(collision.items.map((item) => item.accountId)),
+      new Set([accountId, collidingAccountId]),
+    );
+  },
+);
+
+test(
   "accounts with missing or unsupported base currency remain discoverable and snapshot-readable",
   { skip },
   async (t) => {

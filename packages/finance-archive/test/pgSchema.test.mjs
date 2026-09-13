@@ -110,8 +110,10 @@ test(
       assert.equal(PG_TABLES.length, 16);
 
       // Running it again is a no-op: one row per migration applied, no extra
-      // row and no error.
+      // row, revision bump, or error.
+      const revision = await oneRevision(client);
       assert.equal(await applyPgSchema(client), PG_SCHEMA_VERSION);
+      assert.deepEqual(await oneRevision(client), revision);
       const versions = await client.query(
         "SELECT count(*)::text AS n FROM schema_version",
       );
@@ -127,7 +129,8 @@ test(
     await withArchive(async (client) => {
       const initial = await oneRevision(client);
       assert.match(initial.epoch, /^[0-9a-f-]{36}$/);
-      assert.equal(initial.revision, "0");
+      const initialRevision = Number(initial.revision);
+      assert.ok(initialRevision >= 1);
 
       await client.query(
         "INSERT INTO institutions (id, name, slug) VALUES ('revision-inst', 'Revision Institution', 'revision-institution')",
@@ -139,16 +142,74 @@ test(
       await client.query("TRUNCATE retained_texts");
       assert.deepEqual(await oneRevision(client), {
         epoch: initial.epoch,
-        revision: "4",
+        revision: String(initialRevision + 4),
       });
 
       await client.query("BEGIN");
       await client.query(
         "INSERT INTO institutions (id, name, slug) VALUES ('rolled-back', 'Rolled Back', 'rolled-back')",
       );
-      assert.equal((await oneRevision(client)).revision, "5");
+      assert.equal(
+        (await oneRevision(client)).revision,
+        String(initialRevision + 5),
+      );
       await client.query("ROLLBACK");
-      assert.equal((await oneRevision(client)).revision, "4");
+      assert.equal(
+        (await oneRevision(client)).revision,
+        String(initialRevision + 4),
+      );
+    });
+  },
+);
+
+test(
+  "account alias writes invalidate finance reads and roll back atomically",
+  { skip },
+  async () => {
+    await withArchive(async (client) => {
+      const accountId = await seedAccount(client);
+      const before = Number((await oneRevision(client)).revision);
+      const values = [
+        "alias-revision",
+        accountId,
+        "inst-1",
+        "111-222222-333",
+      ];
+
+      await client.query(
+        `INSERT INTO account_aliases
+           (id, account_id, institution_id, external_key, kind)
+         VALUES ($1, $2, $3, $4, 'statement_number')`,
+        values,
+      );
+      assert.equal((await oneRevision(client)).revision, String(before + 1));
+      await client.query(
+        "UPDATE account_aliases SET learned_note = 'synthetic correction' WHERE id = $1",
+        [values[0]],
+      );
+      assert.equal((await oneRevision(client)).revision, String(before + 2));
+      await client.query("DELETE FROM account_aliases WHERE id = $1", [values[0]]);
+      assert.equal((await oneRevision(client)).revision, String(before + 3));
+
+      await client.query("BEGIN");
+      await client.query(
+        `INSERT INTO account_aliases
+           (id, account_id, institution_id, external_key, kind)
+         VALUES ($1, $2, $3, $4, 'statement_number')`,
+        values,
+      );
+      assert.equal((await oneRevision(client)).revision, String(before + 4));
+      await client.query("ROLLBACK");
+      assert.equal((await oneRevision(client)).revision, String(before + 3));
+
+      await client.query(
+        `INSERT INTO account_aliases
+           (id, account_id, institution_id, external_key, kind)
+         VALUES ($1, $2, $3, $4, 'statement_number')`,
+        values,
+      );
+      await client.query("TRUNCATE account_aliases");
+      assert.equal((await oneRevision(client)).revision, String(before + 5));
     });
   },
 );
@@ -184,6 +245,7 @@ test(
     try {
       await applyPgSchema(first);
       await applyPgSchema(second);
+      const initialRevision = Number((await oneRevision(first)).revision);
       await first.query("BEGIN");
       await second.query("BEGIN");
       await first.query(
@@ -203,7 +265,10 @@ test(
         "INSERT INTO instruments (id, symbol) VALUES ('revision-b', 'REVB')",
       );
       await second.query("COMMIT");
-      assert.equal((await oneRevision(first)).revision, "4");
+      assert.equal(
+        (await oneRevision(first)).revision,
+        String(initialRevision + 4),
+      );
     } finally {
       await Promise.allSettled([
         first.query("ROLLBACK"),
@@ -222,6 +287,65 @@ async function oneRevision(client) {
   assert.equal(result.rows.length, 1);
   return result.rows[0];
 }
+
+test(
+  "a version 11 archive preserves its epoch and advances once for the alias read dependency",
+  { skip },
+  async () => {
+    const schema = testSchemaName();
+    const client = createArchiveClient(url, schema);
+    await client.connect();
+    try {
+      await client.query(`CREATE SCHEMA ${schema}`);
+      await client.query(
+        `CREATE TABLE ${schema}.schema_version (
+           version INTEGER PRIMARY KEY, name TEXT NOT NULL,
+           applied_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
+      );
+      const version11 = PG_MIGRATIONS.slice(0, -1);
+      assert.equal(version11.at(-1).version, 11);
+      for (const migration of version11) {
+        await client.query(migration.sql);
+        await client.query(
+          `INSERT INTO ${schema}.schema_version (version, name) VALUES ($1, $2)`,
+          [migration.version, migration.name],
+        );
+      }
+      await client.query(
+        "INSERT INTO institutions (id, name, slug) VALUES ('alias-inst', 'Alias Institution', 'alias-institution')",
+      );
+      await client.query(
+        `INSERT INTO accounts (id, institution_id, external_key, base_currency)
+         VALUES ('alias-account', 'alias-inst', 'opaque-key', 'USD')`,
+      );
+      await client.query(
+        `INSERT INTO account_aliases
+           (id, account_id, institution_id, external_key, kind)
+         VALUES ('alias-before-v12', 'alias-account', 'alias-inst',
+                 '111-220042-333', 'statement_number')`,
+      );
+      const before = await oneRevision(client);
+
+      assert.equal(await applyPgSchema(client, schema), 12);
+      const migrated = await oneRevision(client);
+      assert.equal(migrated.epoch, before.epoch);
+      assert.equal(Number(migrated.revision), Number(before.revision) + 1);
+
+      assert.equal(await applyPgSchema(client, schema), 12);
+      assert.deepEqual(await oneRevision(client), migrated);
+      await client.query(
+        "UPDATE account_aliases SET learned_note = 'synthetic update' WHERE id = 'alias-before-v12'",
+      );
+      assert.equal(
+        Number((await oneRevision(client)).revision),
+        Number(migrated.revision) + 1,
+      );
+    } finally {
+      await client.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+      await client.end();
+    }
+  },
+);
 
 test(
   "NUMERIC arrives as decimal text, never as a float",
