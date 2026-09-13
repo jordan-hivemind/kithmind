@@ -21,6 +21,7 @@ import {
   encodeCursor,
   keysetTail,
   getWorkerDiagnosticsStatus,
+  getWorkerSourceStatus,
   recordWorkerHeartbeat,
   requireWorkerSourceAccount,
   reconcileWorkerScan,
@@ -964,6 +965,24 @@ test(
         spaceId: f.spaceId,
         sourceAccountId: f.sourceAccountId,
       };
+      assert.deepEqual(
+        await call((ctx) =>
+          getWorkerSourceStatus(ctx, f.principal, {
+            ...statusRequest,
+            operation: "source.status",
+          }),
+        ),
+        {
+          operation: "source.status",
+          sourceAccountId: f.sourceAccountId,
+          inventoryEpoch: 0,
+          completedInventoryEpoch: 0,
+          manifestVersion: 0,
+          enumeration: { state: "never" },
+          processing: { state: "not_assessed" },
+          recordCoverage: "not_established",
+        },
+      );
       assert.deepEqual(
         await call((ctx) =>
           getWorkerDiagnosticsStatus(ctx, f.principal, statusRequest),

@@ -405,12 +405,27 @@ export type WorkerProcessingAssessmentRow = {
   lastEnumeratedAt: Date | null;
   lastProcessedAtAtStart: Date | null;
   scanCompletedAt: Date | null;
+  scanStateAtStart: string | null;
+  scanEntryCount: number;
+  scanChangedCount: number;
+  scanGapCount: number;
+  scanReviewCount: number;
   state: "running" | "complete" | "incomplete" | "stale";
   staleReason: string | null;
+  phase: string | null;
+  nextOrdinal: number;
   counts: Record<string, unknown> | null;
+  accountedScanEntries: number;
+  queuedScanEntries: number;
+  gapScanEntries: number;
+  reviewScanEntries: number;
+  ignoredScanEntries: number;
+  unchangedScanEntries: number;
   startedAt: Date;
+  updatedAt: Date;
   expiresAt: Date;
   completedAt: Date | null;
+  lastProcessedAtAtCompletion: Date | null;
   retireAt: Date;
 };
 
@@ -422,6 +437,17 @@ export function camelizeAssessment(
     "completedInventoryEpoch",
     "manifestVersion",
     "assessmentEpoch",
+    "scanEntryCount",
+    "scanChangedCount",
+    "scanGapCount",
+    "scanReviewCount",
+    "nextOrdinal",
+    "accountedScanEntries",
+    "queuedScanEntries",
+    "gapScanEntries",
+    "reviewScanEntries",
+    "ignoredScanEntries",
+    "unchangedScanEntries",
   ]);
 }
 
