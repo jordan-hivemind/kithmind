@@ -532,9 +532,19 @@ test(
       )
     ).rows.map((row) => row.indexname);
     assert.deepEqual(indexNames, [
+      "records_event_entity_date_idx",
+      "records_event_entity_instant_idx",
+      "records_event_entity_precision_idx",
+      "records_event_entity_sort_idx",
       "records_event_item_key_idx",
       "records_event_version_generation_idx",
       "records_event_version_identity_idx",
+      "records_observation_account_precision_idx",
+      "records_observation_account_sort_idx",
+      "records_observation_entity_date_idx",
+      "records_observation_entity_instant_idx",
+      "records_observation_entity_precision_idx",
+      "records_observation_entity_sort_idx",
       "records_observation_generation_idx",
       "records_observation_identity_idx",
     ]);

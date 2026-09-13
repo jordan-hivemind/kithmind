@@ -16,7 +16,11 @@ const MIN_QUERY_TIME = -62_167_219_200_000;
 const MAX_QUERY_TIME = 253_402_300_799_999;
 
 export type RecordQueryOperation =
-  "observation_history" | "list_events" | "sum_money";
+  | "latest_observation"
+  | "observation_history"
+  | "latest_event"
+  | "list_events"
+  | "sum_money";
 export type RecordQueryConsistency = "snapshot" | "current";
 export type RecordQueryCursorTuple = {
   occurrenceDate: string;
@@ -194,9 +198,13 @@ function validateBinding(binding: AuthorizedRecordQueryBinding): void {
   if (binding.credentialId !== undefined)
     text(binding.credentialId, "credentialId");
   if (
-    !["observation_history", "list_events", "sum_money"].includes(
-      binding.operation,
-    )
+    ![
+      "latest_observation",
+      "observation_history",
+      "latest_event",
+      "list_events",
+      "sum_money",
+    ].includes(binding.operation)
   )
     throw new Error("operation is invalid");
   if (binding.consistency !== "snapshot" && binding.consistency !== "current")
@@ -557,6 +565,12 @@ export async function createRecordQuerySession(
   accumulator: QuerySessionAccumulator,
 ): Promise<string> {
   validateBinding(binding);
+  if (
+    binding.operation !== "observation_history" &&
+    binding.operation !== "list_events" &&
+    binding.operation !== "sum_money"
+  )
+    throw new Error("Record query operation does not support pagination");
   validateAccumulator(accumulator);
   safeClock(ctx.now, "now");
   safeClock(snapshot.snapshotAt, "snapshotAt");

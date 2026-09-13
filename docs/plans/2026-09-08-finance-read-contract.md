@@ -13,6 +13,59 @@ The `@repo/finance-contract` package contains dependency-light TypeScript types,
 closed runtime validators, and synthetic fixtures. It does not authorize database
 access by itself.
 
+## First-use-case priority: usable dated holdings queries
+
+Owner priority, 2026-09-13. Financial-services queries are the first user use
+case. Deliver this finance-archive capability before advancing to the remaining
+general PostgreSQL feature milestones. Preserve in-flight query and coverage
+work, but its completion alone does not satisfy this first-use-case acceptance.
+This is planned work, not a claim about the deployed read surface.
+
+A fresh agent must be able to resolve an account by institution, last four digits
+and display label, then retrieve one dated holdings snapshot with meaningful
+instrument identities. For public tests, use a synthetic request such as:
+“Give me the July 31, 2026 holdings for Example Broker account ending 1234,
+Income: instrument name or ticker, quantity, market value, cost basis,
+unrealized gain or loss, account totals, and the dataset revision.”
+
+Required behavior:
+
+- Expose authorized account discovery and instrument identity, through bounded
+  lookup operations or enriched responses. Retain stable opaque IDs alongside
+  institution, account label and last four digits, instrument name and symbol
+  when known. Never expose full account numbers or guess missing identities.
+  Ambiguous account matches require disambiguation.
+- Document the existing `accountId` and `asOf` filters in the agent-facing tool
+  schema and examples. The current implementation treats `asOf` as an upper
+  bound and can return historical snapshots oldest first. Define and implement
+  explicit exact-date and latest-eligible-snapshot selection; do not sum multiple
+  statement dates or silently substitute another date when an exact date is
+  requested. Missing snapshots must be reported clearly.
+- Return all positions in the selected snapshot through server-issued bounded
+  pagination. Bind continuation to authorization, account, snapshot selection,
+  normalized filters and dataset revision. An agent must not need to manufacture
+  a cursor or page through unrelated years to reach the requested snapshot.
+- Preserve quantity, market value, cost basis, valuation basis and retained
+  evidence. Provide an auditable path to exact unrealized gain/loss and account
+  totals by currency. Use canonical decimal arithmetic, disclose missing values
+  and incomplete coverage, and reconcile position-derived totals with stated
+  account totals when both are available. Do not convert missing cost basis to
+  zero or combine different currencies.
+- Update the shared contract, validators, finance reader and MCP descriptions
+  together. Coordinate contract changes through Issue 57 and define compatibility
+  for existing clients instead of silently changing version 1 behavior.
+
+Acceptance is an end-to-end query through the deployed scoped finance gateway
+from a fresh agent with only the advertised tools and documentation. It resolves
+an unambiguous synthetic account, selects exactly the requested snapshot,
+returns named positions in a spreadsheet-ready table with per-currency totals,
+citations and dataset revision, and traverses a multi-page snapshot without
+omissions or duplicates. Tests also cover ambiguous/missing identities, absent
+snapshot dates, withheld evidence, missing cost basis, revision changes and
+cross-space or revoked-access denial. Owner verification uses a privately
+specified real holdings request; no personal account data enters public fixtures.
+PostgreSQL consolidation alone must not be recorded as closing this usability gap.
+
 ## Operations
 
 | Operation           | Result                                                     |

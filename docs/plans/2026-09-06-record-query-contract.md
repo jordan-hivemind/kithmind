@@ -45,6 +45,23 @@ injection after a parsed manifest is sealed. A future worker record-staging
 protocol must explicitly admit nonzero counts before either worker lane can
 publish them.
 
+### PostgreSQL typed query engine (P2-39f5)
+
+`@repo/kith-store/records` now executes all five typed operations against the
+PostgreSQL store: latest observation, observation history, latest event, event
+list and exact money sum. Each request reloads the user, credential,
+membership and source grants, normalizes the authorized source inventory, and
+binds that scope to the snapshot or single-use continuation. The caller runs
+the complete authorize, reserve, scan and cursor mutation sequence in one
+`SERIALIZABLE` `withKithTransaction` call.
+
+Migration 013 adds bounded coverage lookup indexes. Migration 014 adds the
+ordered candidate indexes and makes ephemeral query sessions cascade
+when their credential or membership is revoked. Coverage is scoped by space,
+source inventory, record type, entity and time range; stale, missing, failed or
+truncated evidence cannot produce a complete result. External MCP and web
+routing to this service remains a later milestone.
+
 ## Storage and publication
 
 | Record        | Identity and behavior                                                                |
@@ -228,14 +245,12 @@ with unknown coverage mean no indexed match, not proof that no event occurred.
 
 ## Phase 1 limits
 
-The PostgreSQL consolidation now includes the query-session foundation. Migration
-012 adds nonunique bounded lookup indexes, while the runtime detects duplicate
-legacy state. The `kith-store` records export reserves snapshot epochs against
-the worker publication clock, binds single-use sessions to fresh authorization,
-and enforces absolute expiry, active-session, cursor and accumulator limits in a
-caller-owned `SERIALIZABLE` transaction. This accepts the session component only.
-The PostgreSQL record scans, hydration transport, principal reload, coverage and
-full query runner remain later P2-39f work.
+The PostgreSQL consolidation includes the query-session foundation, coverage
+model and complete typed query engine. Migration 012 adds nonunique bounded
+session lookup indexes, while the runtime detects duplicate legacy state. The
+records export reserves snapshot epochs against the worker publication clock,
+binds single-use sessions to fresh authorization, and enforces absolute expiry,
+active-session, cursor and accumulator limits in the caller-owned transaction.
 
 Each indexed candidate scan examines at most 256 rows. Latest operations
 inspect separate date and instant indexes so import order cannot establish
