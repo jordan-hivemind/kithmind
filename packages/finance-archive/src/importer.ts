@@ -1496,29 +1496,35 @@ export async function importBatch(
     // row, which is exactly the report the gate already refuses to compute
     // per-period. A review item names the other document at import time
     // instead, without changing which cash the gate reconciles against.
-    const cashConflicts =
-      table === "balances"
-        ? new Map(
-            (
-              await client.query<{
-                account_id: string;
-                as_of: string;
-                cash: string | null;
-                source_document_id: string | null;
-              }>(
-                `SELECT b.account_id, b.as_of::text AS as_of, b.cash, b.source_document_id
-                   FROM balances b
-                   JOIN (SELECT unnest($1::text[]) AS account_id,
-                                unnest($2::date[]) AS as_of) pairs
-                     ON pairs.account_id = b.account_id AND pairs.as_of = b.as_of`,
-                [
-                  prepared.map((p) => p.accountId),
-                  prepared.map((p) => p.values[2] as string),
-                ],
-              )
-            ).rows.map((r) => [`${r.account_id} ${r.as_of}`, r]),
-          )
-        : null;
+    const storedBalances = table === "balances"
+      ? (await client.query<{
+          account_id: string;
+          as_of: string;
+          cash: string | null;
+          source_document_id: string | null;
+        }>(
+          `SELECT b.account_id, b.as_of::text AS as_of, b.cash, b.source_document_id
+             FROM balances b
+             JOIN (SELECT unnest($1::text[]) AS account_id,
+                          unnest($2::date[]) AS as_of) pairs
+               ON pairs.account_id = b.account_id AND pairs.as_of = b.as_of`,
+          [prepared.map((p) => p.accountId), prepared.map((p) => p.values[2] as string)],
+        )).rows
+      : null;
+    const cashConflicts = storedBalances === null
+      ? null
+      : new Map(storedBalances.map((r) => [JSON.stringify([r.account_id, r.as_of]), r]));
+
+    // F1-8l. Keep every matching stored row when checking whether this
+    // document already supplied a balance. The cross-document conflict map
+    // retains only one row per account/date and cannot answer that question.
+    // This set also grows as this batch accepts rows, so a second statement
+    // of the same account/date is refused even when its amounts hash differently.
+    const balanceKeys = storedBalances === null
+      ? null
+      : new Set(storedBalances
+          .filter((r) => r.source_document_id === documentId)
+          .map((r) => JSON.stringify([r.account_id, r.as_of])));
 
     const toInsert: unknown[][] = [];
     let anySuccess = false;
@@ -1526,7 +1532,7 @@ export async function importBatch(
       if (cashConflicts !== null) {
         const asOf = p.values[2] as string;
         const cash = p.values[4] as string | null;
-        const existing = cashConflicts.get(`${p.accountId} ${asOf}`);
+        const existing = cashConflicts.get(JSON.stringify([p.accountId, asOf]));
         if (
           existing !== undefined &&
           existing.source_document_id !== documentId &&
@@ -1563,6 +1569,23 @@ export async function importBatch(
           );
         }
         continue;
+      }
+      if (balanceKeys !== null) {
+        const key = JSON.stringify([p.accountId, p.values[2] as string]);
+        if (balanceKeys.has(key)) {
+          openReview(p.accountId, documentId, p.sourceLocator, {
+            kind: "balance_duplicate_in_document",
+            rawValue: String(p.values[3] ?? ""),
+            reason:
+              `this document already states a balance for ${p.accountId} as of ` +
+              `${p.values[2] as string}, so this second one is the document ` +
+              "contradicting itself rather than a second stated fact; it is not " +
+              "inserted, and neither stated balance is altered (ground rule 5)",
+          });
+          rowsRefused += 1;
+          continue;
+        }
+        balanceKeys.add(key);
       }
       seen.set(p.hash, p.sourceLocator);
       if (changed !== null && p.changedKey !== null) changed.add(p.changedKey);

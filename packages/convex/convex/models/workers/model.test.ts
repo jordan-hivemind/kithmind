@@ -18,6 +18,11 @@ import { parseWorkerRequest, type FsDiscoveryEntry } from "./protocol";
 import { FS_TEXT_PROFILE } from "./profile";
 import { beginForgetFromWeb, continueForgetFromWeb } from "../ingestion/model";
 import { sha256Utf8 } from "../provenance/model";
+import { requireWorkerSourceAccount } from "./auth";
+import {
+  consumeWorkerMutationRateLimit,
+  WORKER_MUTATION_RATE_LIMIT,
+} from "./rateLimit";
 
 const HASH_A = "a".repeat(64);
 const HASH_B = "b".repeat(64);
@@ -1019,39 +1024,78 @@ describe("filesystem worker scans", () => {
 
   test("rate limits new mutations while exact receipts stay retryable", async () => {
     const f = await fixture();
-    for (let index = 0; index < 30; index += 1) {
-      const scan = await begin(
-        f,
-        `rate-begin-${index}`,
-        index,
-        "normal",
-        1_000 + index,
-      );
-      const sealed = await seal(
-        f,
-        scan.scanId,
-        `rate-seal-${index}`,
-        0,
-        { status: "failed", code: "unreadable" },
-        1_000 + index,
-      );
-      expect(
-        (
-          await seal(
-            f,
-            scan.scanId,
-            `rate-seal-${index}`,
-            0,
-            { status: "failed", code: "unreadable" },
-            1_000 + index,
-          )
-        ).reused,
-      ).toBe(true);
-      expect(sealed.state).toBe("failed");
-    }
+    // Seed the window one mutation short of a full budget directly instead
+    // of looping thousands of times through the full begin/seal mutation
+    // path (P2-80k raised WORKER_MUTATION_RATE_LIMIT well past what a real
+    // per-test loop should exercise).
+    await f.t.run(async (ctx) => {
+      const source = await requireWorkerSourceAccount(ctx, f.principal, {
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+      });
+      await ctx.db.insert("workerProtocolRateLimits", {
+        credentialId: source.principal.credentialId,
+        sourceAccountId: source.account._id,
+        windowStartedAt: 1_000,
+        count: WORKER_MUTATION_RATE_LIMIT - 2,
+      });
+    });
+    const scan = await begin(f, "rate-begin-last", 0, "normal", 1_000);
+    const sealed = await seal(
+      f,
+      scan.scanId,
+      "rate-seal-last",
+      0,
+      { status: "failed", code: "unreadable" },
+      1_000,
+    );
+    expect(
+      (
+        await seal(
+          f,
+          scan.scanId,
+          "rate-seal-last",
+          0,
+          { status: "failed", code: "unreadable" },
+          1_000,
+        )
+      ).reused,
+    ).toBe(true);
+    expect(sealed.state).toBe("failed");
     await expect(
-      begin(f, "rate-overflow", 30, "normal", 1_100),
+      begin(f, "rate-overflow", 1, "normal", 1_050),
     ).rejects.toMatchObject({ data: { code: "rate_limited" } });
+  });
+
+  test("the mutation rate limit budget admits a 1,000-file pass with 3x margin (P2-80k)", async () => {
+    const f = await fixture();
+    // Mirrors the arithmetic documented on WORKER_MUTATION_RATE_LIMIT in
+    // rateLimit.ts: a text-only pass of N files issues
+    // 3 + 2*ceil(N/50) + 2*ceil(N/4) + 2*N worker mutations (scan.begin +
+    // scan.seal + processing.assessBegin; source.inventoryPage +
+    // scan.reconcile paged by 50; scan.appendPage + discovery.reserve paged
+    // by 4; discovery.admitUtf8 + processing.assessPage, one per file).
+    const filesInPass = 1_000;
+    const passMutations =
+      3 +
+      2 * Math.ceil(filesInPass / 50) +
+      2 * Math.ceil(filesInPass / 4) +
+      2 * filesInPass;
+    expect(passMutations).toBe(2_543);
+    expect(WORKER_MUTATION_RATE_LIMIT).toBeGreaterThanOrEqual(
+      passMutations * 3,
+    );
+
+    await f.t.run(async (ctx) => {
+      const source = await requireWorkerSourceAccount(ctx, f.principal, {
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+      });
+      const now = 5_000;
+      for (let index = 0; index < passMutations; index += 1) {
+        await consumeWorkerMutationRateLimit(ctx, source, now);
+      }
+    });
   });
 });
 

@@ -102,7 +102,9 @@ export type PipelineConfig = {
   maxFileBytes: number;
   /** Minimum delay, in ms, between consecutive `processing.assessPage`
    * mutations. Lets a bounded backfill pace itself under the server's
-   * per-worker mutation rate limit instead of bouncing off it. */
+   * per-worker mutation rate limit instead of bouncing off it. Omitting
+   * this field applies `DEFAULT_ASSESSMENT_PACING_MS` (see runner.ts); pass
+   * `0` explicitly to disable pacing. */
   assessmentPacingMs?: number;
   pdfDocQa?: PdfDocQaConfig;
 };

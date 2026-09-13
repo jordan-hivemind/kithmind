@@ -27,3 +27,6 @@ export {
   transitionMemory,
 } from "./thoughts.js";
 export * from "./recall.js";
+
+export type * from "./entities.js";
+export type * from "./thoughts.js";

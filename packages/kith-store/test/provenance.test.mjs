@@ -520,6 +520,7 @@ test(
     assert.equal(parsedTextVersion.representation, "parsed_pages_v1");
     assert.equal(parsedTextVersion.parserArtifactId, parserArtifact.id);
 
+    const receiptTime = new Date("2026-01-01T00:00:00.000Z");
     const receipt = await provenance.createOrGetArchiveReceipt(client, {
       spaceId,
       sourceAccountId,
@@ -540,10 +541,10 @@ test(
       plaintextMediaType: "application/pdf",
       ciphertextHash: await sha256Utf8("ciphertext"),
       ciphertextByteLength: 2200,
-      readbackVerifiedAt: new Date(),
+      readbackVerifiedAt: receiptTime,
       userId,
       actorCredentialId,
-      createdAt: new Date(),
+      createdAt: receiptTime,
     });
     assert.equal(receipt.subjectKind, "original_bytes");
     assert.equal(receipt.plaintextHash, contentHash);

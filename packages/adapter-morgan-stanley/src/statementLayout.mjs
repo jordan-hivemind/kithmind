@@ -230,7 +230,10 @@ function spanLocator(kind, page, field, textMeta, start, end, quote) {
  * preceding `BARE_ACCOUNT_LINE` -- the account whose own pages that line was
  * printed on. `null` for any line before the first such marker (the
  * household-wide summary pages a consolidated statement prints before its
- * first account's own pages; nothing this parser reads lives there). A
+ * first account's own pages). F1-8l: something this parser reads does live
+ * there -- a `Consolidated Summary` BALANCE SHEET stating the roll-up across
+ * every account in the document -- and `parseRealStatement` refuses that
+ * section rather than letting the importer attribute it to one account. A
  * single-account statement has exactly one marker, repeated on every page,
  * so every line resolves to that one account -- unchanged behavior.
  */
@@ -959,6 +962,24 @@ export function parseRealStatement(text, kind) {
   // (disclosure text mentioning the phrase, say) has no TOTAL VALUE row
   // nearby and parseBalanceSheet returns null for it, contributing nothing.
   const sheets = [];
+  // F1-8l. A document that names accounts at all, and then prints a BALANCE
+  // SHEET section under no account header of its own, is a consolidated
+  // statement printing its `Consolidated Summary` roll-up: the household
+  // total across every account in the PDF, not any one account's balance.
+  // `accountKeysByLine` attributes that section to no account, which is
+  // correct, and `finance-archive`'s importer then falls back to the
+  // document's own account (`balance.accountId ?? document.accountId`) --
+  // recording the roll-up as that one account's own stated balance, beside
+  // that account's real section: two balances for one (account, as_of).
+  // There is no household-level snapshot in the schema, so this section
+  // is omitted and the parse note records the missing attribution.
+  //
+  // `namesAccounts` is what keeps this from swallowing the other reason a
+  // section carries no account key: a document that names no account anywhere
+  // states holdings for the one account the pull already named, which is the
+  // adapter contract an omitted `accountExternalKey` has always meant.
+  const namesAccounts = accountKeys.some((key) => key !== null);
+  let unattributedSections = 0;
   lines.forEach(({ text: line }, anchorIndex) => {
     if (!BALANCE_SHEET_ANCHOR.test(line)) return;
     const sheet = parseBalanceSheet(
@@ -969,7 +990,12 @@ export function parseRealStatement(text, kind) {
       markerLines,
       textMeta,
     );
-    if (sheet !== null) sheets.push(sheet);
+    if (sheet === null) return;
+    if (namesAccounts && sheet.balance.accountExternalKey === undefined) {
+      unattributedSections += 1;
+      return;
+    }
+    sheets.push(sheet);
   });
   const { positions, skipped } = parseHoldings(
     lines,
@@ -988,9 +1014,27 @@ export function parseRealStatement(text, kind) {
     sheets.length === 0
       ? parseTotalValueBanner(lines, kind, period.end, accountKeys, markerLines, textMeta)
       : null;
-  if (banner?.balance !== undefined) sheets.push({ balance: banner.balance, liabilities: [] });
+  if (banner?.balance !== undefined) {
+    // The same rule as above: on a statement that does name accounts, a
+    // banner printed before the first account header names none this parser
+    // can bind it to, so it is not recorded against whichever account the
+    // pull happened to name.
+    if (namesAccounts && banner.balance.accountExternalKey === undefined) {
+      unattributedSections += 1;
+    } else {
+      sheets.push({ balance: banner.balance, liabilities: [] });
+    }
+  }
 
   const notes = [];
+  if (unattributedSections > 0) {
+    notes.push(
+      `${unattributedSections} BALANCE SHEET section(s) printed before any account header ` +
+        "were not recorded: a consolidated statement's Consolidated Summary section states " +
+        "the household roll-up across every account in the document, not any one account's " +
+        "own balance, and this schema has no household-level snapshot to record it as",
+    );
+  }
   if (sheets.length === 0) {
     // The cover page stating the em dash is the statement saying this account
     // holds nothing, which -- with no holdings table either -- is a document
