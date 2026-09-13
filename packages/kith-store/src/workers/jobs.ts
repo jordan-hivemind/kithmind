@@ -75,6 +75,15 @@ type JobLeaseRequest = Extract<
 type JobOperation =
   "job_renew" | "job_stage_utf8" | "job_activate" | "job_fail";
 
+function isTransactionAbort(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error.code === "40001" || error.code === "40P01")
+  );
+}
+
 async function processingFingerprint(
   current: CurrentDiscovery,
 ): Promise<string> {
@@ -943,6 +952,7 @@ export async function stageProcessingUtf8(
     );
     return stageResult(receipt, false);
   } catch (error) {
+    if (isTransactionAbort(error)) throw error;
     if (workerProtocolErrorCode(error)) throw error;
     workerProtocolError("scan_conflict");
   }
@@ -1052,7 +1062,8 @@ export async function activateProcessingJob(
         : { expectedPreviousGenerationId: current.item.activeGenerationId }),
       expectedDesiredProcessingEpoch: current.job.desiredProcessingEpoch,
     }));
-  } catch {
+  } catch (error) {
+    if (isTransactionAbort(error)) throw error;
     workerProtocolError("scan_conflict");
   }
   const activatedAt = ctx.now;

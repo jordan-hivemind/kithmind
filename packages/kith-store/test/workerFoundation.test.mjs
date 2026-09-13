@@ -19,6 +19,8 @@ import {
   decodeCursor,
   encodeCursor,
   keysetTail,
+  getWorkerDiagnosticsStatus,
+  recordWorkerHeartbeat,
   requireWorkerSourceAccount,
   reconcileWorkerScan,
   renewProcessingJob,
@@ -847,10 +849,35 @@ test(
         "DROP TRIGGER reject_worker_document ON kith.documents",
       );
       await f.client.query("DROP FUNCTION kith.reject_worker_document() ");
+      await f.client.query("CREATE SEQUENCE kith.worker_stage_retry_seq");
+      await f.client
+        .query(`CREATE FUNCTION kith.retry_worker_document_once() RETURNS trigger
+        LANGUAGE plpgsql AS $$ BEGIN
+          IF nextval('kith.worker_stage_retry_seq') = 1 THEN
+            RAISE EXCEPTION 'synthetic serialization abort' USING ERRCODE = '40001';
+          END IF;
+          RETURN NEW;
+        END $$`);
+      await f.client
+        .query(`CREATE TRIGGER retry_worker_document_once BEFORE INSERT ON kith.documents
+        FOR EACH ROW EXECUTE FUNCTION kith.retry_worker_document_once()`);
       const staged = await call(
         (ctx) => stageProcessingUtf8(ctx, f.principal, stageRequest),
         reclaimedAt,
       );
+      assert.equal(
+        (
+          await f.client.query(
+            "SELECT last_value::int AS value FROM kith.worker_stage_retry_seq",
+          )
+        ).rows[0].value,
+        2,
+      );
+      await f.client.query(
+        "DROP TRIGGER retry_worker_document_once ON kith.documents",
+      );
+      await f.client.query("DROP FUNCTION kith.retry_worker_document_once() ");
+      await f.client.query("DROP SEQUENCE kith.worker_stage_retry_seq");
       assert.equal(staged.state, "staged");
       assert.equal(staged.reused, false);
       assert.equal(
@@ -900,6 +927,95 @@ test(
         active_generation_id: admitted.processingGenerationId,
         publication_state: "active",
       });
+    } finally {
+      await pool.end();
+    }
+  },
+);
+
+test(
+  "worker heartbeats suppress hot writes and reject watcher replacement",
+  { skip },
+  async (t) => {
+    const f = await fixture(t);
+    const pool = createKithPool(f.databaseUrl, 2);
+    const call = (work, now = NOW) => withWorkerTransaction(pool, work, now);
+    try {
+      const statusRequest = {
+        protocolVersion: 1,
+        operation: "diagnostics.status",
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+      };
+      assert.deepEqual(
+        await call((ctx) =>
+          getWorkerDiagnosticsStatus(ctx, f.principal, statusRequest),
+        ),
+        {
+          operation: "diagnostics.status",
+          diagnosticsVersion: 1,
+          sourceAccountId: f.sourceAccountId,
+          source: "enabled",
+          watcher: { state: "not_configured" },
+          incident: { state: "none" },
+        },
+      );
+      const heartbeatRequest = {
+        protocolVersion: 1,
+        operation: "diagnostics.heartbeat",
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        watcherId: "watcher-1",
+        connectorVersion: "fs-v1",
+      };
+      const first = await call((ctx) =>
+        recordWorkerHeartbeat(ctx, f.principal, heartbeatRequest),
+      );
+      assert.deepEqual(first, {
+        operation: "diagnostics.heartbeat",
+        sourceAccountId: f.sourceAccountId,
+        watcherId: "watcher-1",
+        receivedAt: NOW,
+        nextExpectedAt: NOW + 180_000,
+      });
+      assert.deepEqual(
+        await call(
+          (ctx) => recordWorkerHeartbeat(ctx, f.principal, heartbeatRequest),
+          NOW + 100,
+        ),
+        first,
+      );
+      assert.equal(
+        (
+          await call(
+            (ctx) =>
+              getWorkerDiagnosticsStatus(ctx, f.principal, statusRequest),
+            NOW + 179_999,
+          )
+        ).watcher.state,
+        "current",
+      );
+      assert.equal(
+        (
+          await call(
+            (ctx) =>
+              getWorkerDiagnosticsStatus(ctx, f.principal, statusRequest),
+            NOW + 180_000,
+          )
+        ).watcher.state,
+        "overdue",
+      );
+      await assert.rejects(
+        call(
+          (ctx) =>
+            recordWorkerHeartbeat(ctx, f.principal, {
+              ...heartbeatRequest,
+              watcherId: "watcher-2",
+            }),
+          NOW + 5_000,
+        ),
+        expectProtocolCode("identity_review_required"),
+      );
     } finally {
       await pool.end();
     }
