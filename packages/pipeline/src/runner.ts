@@ -3,11 +3,14 @@ import { lstat, mkdir, realpath } from "node:fs/promises";
 import { basename, join } from "node:path";
 
 import {
+  BINARY_CLASSES,
   MAX_PARSED_PAGE_BATCH,
   MAX_PARSED_REQUEST_BYTES,
   MAX_PARSED_ROW_BATCH,
   assertParsedRequestSize,
   type ArchivedWorkIdentity,
+  type BinaryMediaType,
+  type BinaryParserProfileId,
   type ParsedStagePhase,
 } from "@repo/worker-protocol";
 
@@ -48,6 +51,7 @@ import {
 } from "./archivedRequestMapping.js";
 import {
   capturePdfFile,
+  captureFileName,
   inspectCapturedPdf,
   removeCapturedPdfExact,
   type CapturedPdf,
@@ -69,19 +73,25 @@ import {
 } from "./filesystem.js";
 import {
   createParserProfileWorkDirectory,
-  inspectCapturedPdfParserOutput,
+  inspectCapturedParserOutput,
   inspectParserOutputIntent,
   preparePdfDocQaProfile,
   reclaimStaleParserOutputDirectory,
   removeParserProfileWorkDirectoryExact,
   removeParserOutputExact,
   runCapturedPdfParser,
+  runCapturedWorkbookParser,
   ParserProcessError,
   type DurableParserOutputArtifacts,
   type ParserOutputIntent,
+  type ParserOutputRecoveryInput,
   type PreparedPdfDocQaProfile,
 } from "./parserProcess.js";
-import { mapParsedBundle } from "./parsedBundleMapping.js";
+import {
+  mapParsedBundle,
+  mapSpreadsheetWorkbook,
+  SPREADSHEET_CHUNKING_FINGERPRINT,
+} from "./parsedBundleMapping.js";
 import {
   inspectNormalizedBundleSpool,
   inspectSpoolRoot,
@@ -114,10 +124,16 @@ import {
   type PdfFilePlan,
   type Utf8FilePlan,
 } from "./runnerState.js";
+import {
+  SPREADSHEET_EXTRACTION_CONFIGURATION_FINGERPRINT,
+  SPREADSHEET_PARSER_FINGERPRINT,
+  SPREADSHEET_READER_MANIFEST_SHA256,
+} from "./spreadsheet.js";
 import { parseWorkerResponse } from "./transport.js";
 import type {
   DiscoveryFile,
   IdentityBinding,
+  PdfDocQaProfile,
   PipelineConfig,
   PipelineRunResult,
   SourceObservation,
@@ -125,6 +141,31 @@ import type {
   WorkerResponse,
   WorkerTransport,
 } from "./types.js";
+
+/**
+ * P2-70i3: the `spreadsheet_v1` lane's own profile. Every field a plan needs
+ * that belongs to the class comes from the reader, not from configuration: the
+ * owner configures one docling profile, and a second class cannot ask the owner
+ * to write down fingerprints the worker already knows. The extractor, record
+ * schema, normalization and correction fields stay configured, because those
+ * describe extraction over retained text and are the same whatever produced it.
+ */
+type BinaryPlanProfile = Omit<PdfDocQaProfile, "parserProfileId"> & {
+  parserProfileId: BinaryParserProfileId;
+};
+
+function spreadsheetProfile(
+  config: NonNullable<PipelineConfig["pdfDocQa"]>,
+): BinaryPlanProfile {
+  return {
+    ...config.profile,
+    parserProfileId: "spreadsheet_v1",
+    parserFingerprint: SPREADSHEET_PARSER_FINGERPRINT,
+    extractionConfigurationFingerprint:
+      SPREADSHEET_EXTRACTION_CONFIGURATION_FINGERPRINT,
+    chunkerFingerprint: SPREADSHEET_CHUNKING_FINGERPRINT,
+  };
+}
 
 const MAX_INVENTORY_PAGES = 128;
 const MAX_INVENTORY_ITEMS = 4_096;
@@ -193,6 +234,10 @@ const SAFE_PARSER_FAILURE_CODES = new Set([
   "retained_text_too_large",
   "lossless_output_too_large",
   "bundle_too_large",
+  "workbook_invalid",
+  "workbook_encrypted",
+  "workbook_unsupported",
+  "workbook_oversized",
 ] as const);
 
 /**
@@ -208,6 +253,12 @@ const DOCUMENT_PARSER_FAILURE_CODES = new Set<string>([
   "conversion_output_invalid",
   "page_limit_exceeded",
   "bundle_too_large",
+  // P2-70i3: every workbook refusal is a property of that workbook, so it
+  // records a bounded per-document failure rather than ending the pass.
+  "workbook_invalid",
+  "workbook_encrypted",
+  "workbook_unsupported",
+  "workbook_oversized",
 ]);
 
 function parseAttemptsSpent(rows: readonly ProcessingCatalogRow[]): number {
@@ -237,6 +288,11 @@ function sha256Json(value: unknown): string {
     .digest("hex");
 }
 
+/** The class's media type. Both sides derive it from the class, never both. */
+function planMediaType(plan: PdfFilePlan): BinaryMediaType {
+  return BINARY_CLASSES[plan.parserProfileId].mediaType;
+}
+
 function archivedIdentity(
   checkpoint: ArchivedCheckpoint,
   plan: PdfFilePlan,
@@ -255,7 +311,7 @@ function archivedIdentity(
     processingEpoch: plan.processingEpoch,
     contentHash: plan.sha256,
     byteLength: plan.byteLength,
-    mediaType: "application/pdf",
+    mediaType: planMediaType(plan),
     parserProfileId: plan.parserProfileId,
     parserFingerprint: plan.parserFingerprint,
     extractionConfigurationFingerprint: plan.extractionConfigurationFingerprint,
@@ -287,9 +343,14 @@ function captureFromRows(
       path: config.captureDirectory,
       ...processing.captureIntent.directory,
     },
+    // The captured file's name comes from the class the catalog row records as
+    // the original's media type, so a resumed run rebuilds the same path.
     path: join(
       config.captureDirectory,
-      `${processing.captureIntent.captureId}.pdf`,
+      captureFileName(
+        processing.captureIntent.captureId,
+        original.origin.mediaType,
+      ),
     ),
     sha256: original.origin.sha256,
     byteLength: original.origin.byteLength,
@@ -338,7 +399,7 @@ export function parserOutputCatalogRecord(
     rawArtifact: {
       ...rawArtifact,
       opaqueName: basename(rawPath),
-      mediaType: "application/vnd.docling+json",
+      mediaType: rawArtifact.mediaType,
     },
     normalizedBundle: {
       ...normalizedBundle,
@@ -599,6 +660,10 @@ function observationPlan(
       code: observation.gap.code,
     };
   }
+  const profile: BinaryPlanProfile =
+    observation.file.mediaType === BINARY_CLASSES.spreadsheet_v1.mediaType
+      ? spreadsheetProfile(config)
+      : config.profile;
   return {
     rootAlias: observation.file.rootAlias,
     relativePath: observation.file.relativePath,
@@ -606,15 +671,15 @@ function observationPlan(
     kind: "pdf",
     sha256: observation.file.sha256,
     byteLength: observation.file.byteLength,
-    parserProfileId: config.profile.parserProfileId,
-    parserFingerprint: config.profile.parserFingerprint,
+    parserProfileId: profile.parserProfileId,
+    parserFingerprint: profile.parserFingerprint,
     extractionConfigurationFingerprint:
-      config.profile.extractionConfigurationFingerprint,
-    extractorFingerprint: config.profile.extractorFingerprint,
-    recordSchemaFingerprint: config.profile.recordSchemaFingerprint,
-    normalizationFingerprint: config.profile.normalizationFingerprint,
-    chunkerFingerprint: config.profile.chunkerFingerprint,
-    correctionRevision: config.profile.correctionRevision,
+      profile.extractionConfigurationFingerprint,
+    extractorFingerprint: profile.extractorFingerprint,
+    recordSchemaFingerprint: profile.recordSchemaFingerprint,
+    normalizationFingerprint: profile.normalizationFingerprint,
+    chunkerFingerprint: profile.chunkerFingerprint,
+    correctionRevision: profile.correctionRevision,
     ...(observation.file.permissionsRestricted === undefined
       ? {}
       : {
@@ -655,7 +720,7 @@ function scanEntry(
         status: "ready_binary_v1",
         sha256: plan.sha256,
         byteLength: plan.byteLength,
-        mediaType: "application/pdf",
+        mediaType: planMediaType(plan),
         parserProfileId: plan.parserProfileId,
         parserFingerprint: plan.parserFingerprint,
         extractionConfigurationFingerprint:
@@ -1102,7 +1167,7 @@ export class PipelineRunner {
       sourceExternalId: plan.externalId,
       sha256: plan.sha256,
       byteLength: plan.byteLength,
-      mediaType: "application/pdf",
+      mediaType: planMediaType(plan),
     });
     if (!original) return [];
     const fingerprints = this.processingFingerprints(plan);
@@ -1119,13 +1184,17 @@ export class PipelineRunner {
 
   private async processingArtifactsPresent(
     processing: ProcessingCatalogRow,
+    mediaType: BinaryMediaType,
   ): Promise<boolean> {
     if (!processing.capture || !processing.parserOutput || !processing.spool) {
       return false;
     }
     const pdf = this.requirePdfConfig();
     const candidates = [
-      join(pdf.captureDirectory, `${processing.captureIntent.captureId}.pdf`),
+      join(
+        pdf.captureDirectory,
+        captureFileName(processing.captureIntent.captureId, mediaType),
+      ),
       join(pdf.parserOutputRoot, processing.parserIntent.outputId),
       join(pdf.spoolDirectory, processing.spool.opaqueName),
     ];
@@ -1182,7 +1251,10 @@ export class PipelineRunner {
       throw new PipelineWorkerError("archive_catalog_revision_conflict");
     }
     if (matches[0]?.activation) {
-      return await this.processingArtifactsPresent(matches[0]);
+      return await this.processingArtifactsPresent(
+        matches[0],
+        planMediaType(plan),
+      );
     }
     return true;
   }
@@ -1220,7 +1292,7 @@ export class PipelineRunner {
       sourceExternalId: plan.externalId,
       sha256: plan.sha256,
       byteLength: plan.byteLength,
-      mediaType: "application/pdf",
+      mediaType: planMediaType(plan),
     });
     if (!original) {
       const provider = pdf.providerOriginal;
@@ -1232,7 +1304,7 @@ export class PipelineRunner {
           observationEpoch: identity.observationEpoch,
           sha256: plan.sha256,
           byteLength: plan.byteLength,
-          mediaType: "application/pdf",
+          mediaType: planMediaType(plan),
         },
         copies:
           provider === undefined
@@ -1670,7 +1742,7 @@ export class PipelineRunner {
               mapped.processing.parserIntent.parserArtifactClientId,
             parserOutputHash: output.rawArtifact.sha256,
             parserOutputByteLength: output.rawArtifact.byteLength,
-            parserOutputMediaType: "application/vnd.docling+json",
+            parserOutputMediaType: output.rawArtifact.mediaType,
             parsedText: mapped.declaration,
           },
         });
@@ -3606,6 +3678,7 @@ export class PipelineRunner {
     const plan = this.archivedPlan(checkpoint);
     const rows = this.archivedRows(checkpoint);
     let processing = rows.processing;
+    const mediaType = planMediaType(plan);
     if (processing.capture) {
       await inspectCapturedPdf({
         captureDirectory: pdf.captureDirectory,
@@ -3619,6 +3692,7 @@ export class PipelineRunner {
           path: pdf.captureDirectory,
           ...processing.captureIntent.directory,
         },
+        mediaType,
       });
     } else {
       const expected = {
@@ -3628,7 +3702,7 @@ export class PipelineRunner {
       };
       const capturePath = join(
         pdf.captureDirectory,
-        `${processing.captureIntent.captureId}.pdf`,
+        captureFileName(processing.captureIntent.captureId, mediaType),
       );
       const exists = await lstat(capturePath)
         .then(() => true)
@@ -3645,6 +3719,7 @@ export class PipelineRunner {
               path: pdf.captureDirectory,
               ...processing.captureIntent.directory,
             },
+            mediaType,
           })
         : await capturePdfFile({
             root: this.findRoot(
@@ -3655,6 +3730,7 @@ export class PipelineRunner {
             captureDirectory: pdf.captureDirectory,
             captureId: processing.captureIntent.captureId,
             expected,
+            mediaType,
           });
       processing = await this.requireCatalog().recordCapture({
         catalogId: processing.processingCatalogId,
@@ -3671,12 +3747,23 @@ export class PipelineRunner {
     });
   }
 
+  /**
+   * What a reopen of this document's artifact pair has to prove. The class
+   * chooses where the manifest slot comes from: the docling lane's prepared
+   * model manifest, or the workbook reader's own version digest, which is what
+   * a lane with no model assets has instead.
+   */
   private parserRecovery(
     original: OriginalCatalogRow,
     processing: ProcessingCatalogRow,
-  ) {
+    profileId: BinaryParserProfileId,
+  ): ParserOutputRecoveryInput & { profileId: BinaryParserProfileId } {
     const pdf = this.requirePdfConfig();
-    if (!this.preparedPdfProfile) {
+    const modelManifestSha256 =
+      profileId === "spreadsheet_v1"
+        ? SPREADSHEET_READER_MANIFEST_SHA256
+        : this.preparedPdfProfile?.modelManifestSha256;
+    if (modelManifestSha256 === undefined) {
       throw new PipelineWorkerError("parser_profile_unverified");
     }
     return {
@@ -3686,7 +3773,8 @@ export class PipelineRunner {
       expectedParserFingerprint: processing.fingerprints.parserFingerprint,
       expectedExtractionConfigurationFingerprint:
         processing.fingerprints.extractionConfigurationFingerprint,
-      expectedModelManifestSha256: this.preparedPdfProfile.modelManifestSha256,
+      expectedModelManifestSha256: modelManifestSha256,
+      profileId,
     };
   }
 
@@ -3697,10 +3785,11 @@ export class PipelineRunner {
     }
     const { original, processing: current } = this.archivedRows(checkpoint);
     const pdf = this.requirePdfConfig();
+    const profileId = this.archivedPlan(checkpoint).parserProfileId;
     let processing = current;
     if (processing.parserOutput) {
-      await inspectCapturedPdfParserOutput(
-        this.parserRecovery(original, processing),
+      await inspectCapturedParserOutput(
+        this.parserRecovery(original, processing, profileId),
       );
     } else {
       const intent = await inspectParserOutputIntent({
@@ -3744,15 +3833,24 @@ export class PipelineRunner {
         });
       }
       const output = outputPresence[0]
-        ? await inspectCapturedPdfParserOutput(
-            this.parserRecovery(original, processing),
+        ? await inspectCapturedParserOutput(
+            this.parserRecovery(original, processing, profileId),
           )
-        : await runCapturedPdfParser({
-            capture: captureFromRows(pdf, original, processing),
-            outputDirectory,
-            outputId: processing.parserIntent.outputId,
-            ...pdf.parser,
-          });
+        : profileId === "spreadsheet_v1"
+          ? // The sibling lane: the same capture in, the same artifact pair
+            // out, and no sandbox, model manifest or Python runtime, because
+            // the reader is this process.
+            await runCapturedWorkbookParser({
+              capture: captureFromRows(pdf, original, processing),
+              outputDirectory,
+              outputId: processing.parserIntent.outputId,
+            })
+          : await runCapturedPdfParser({
+              capture: captureFromRows(pdf, original, processing),
+              outputDirectory,
+              outputId: processing.parserIntent.outputId,
+              ...pdf.parser,
+            });
       processing = await this.requireCatalog().recordParserOutput({
         catalogId: processing.processingCatalogId,
         expectedRevision: processing.rowRevision,
@@ -3775,21 +3873,22 @@ export class PipelineRunner {
     }
     const { original, processing: current } = this.archivedRows(checkpoint);
     const pdf = this.requirePdfConfig();
+    const profileId = this.archivedPlan(checkpoint).parserProfileId;
     let processing = current;
     if (processing.spool) {
       await inspectNormalizedBundleSpool({
         spoolRoot: pdf.spoolDirectory,
         expectedRoot: processing.spoolIntent.root,
         spool: processing.spool,
-        parserRecovery: this.parserRecovery(original, processing),
+        parserRecovery: this.parserRecovery(original, processing, profileId),
       });
     } else {
       if (!processing.parserOutput) {
         throw new PipelineWorkerError("parser_output_missing");
       }
       if (!processing.spoolPrepared) {
-        const parserOutput = await inspectCapturedPdfParserOutput(
-          this.parserRecovery(original, processing),
+        const parserOutput = await inspectCapturedParserOutput(
+          this.parserRecovery(original, processing, profileId),
         );
         const prepared = await prepareNormalizedBundleSpool({
           spoolRoot: pdf.spoolDirectory,
@@ -3835,19 +3934,35 @@ export class PipelineRunner {
     const { original, processing } = this.archivedRows(checkpoint);
     if (!processing.spool) throw new PipelineWorkerError("spool_missing");
     const pdf = this.requirePdfConfig();
+    const plan = this.archivedPlan(checkpoint);
     const validated = await inspectNormalizedBundleSpool({
       spoolRoot: pdf.spoolDirectory,
       expectedRoot: processing.spoolIntent.root,
       spool: processing.spool,
-      parserRecovery: this.parserRecovery(original, processing),
+      parserRecovery: this.parserRecovery(
+        original,
+        processing,
+        plan.parserProfileId,
+      ),
     });
-    const plan = this.archivedPlan(checkpoint);
-    const mapping = await mapParsedBundle({
-      ...validated,
-      title: basename(plan.relativePath),
-      capturedAt: plan.sourceModifiedAt,
-      chunkingFingerprint: plan.chunkerFingerprint,
-    });
+    // A sheet page is already the retained page: the bundle carries one page
+    // per sheet under the shared rendering rule, so the workbook mapping has
+    // no layout document to reconcile against a page, only the same page-local
+    // chunk policy the PDF lane runs.
+    const mapping =
+      plan.parserProfileId === "spreadsheet_v1"
+        ? await mapSpreadsheetWorkbook({
+            pages: (validated.bundle as { pages: { text: string }[] }).pages,
+            title: basename(plan.relativePath),
+            capturedAt: plan.sourceModifiedAt,
+            chunkingFingerprint: plan.chunkerFingerprint,
+          })
+        : await mapParsedBundle({
+            ...validated,
+            title: basename(plan.relativePath),
+            capturedAt: plan.sourceModifiedAt,
+            chunkingFingerprint: plan.chunkerFingerprint,
+          });
     if (mapping.chunkingFingerprint !== plan.chunkerFingerprint) {
       throw new PipelineWorkerError("parsed_chunking_conflict");
     }
@@ -3885,7 +4000,7 @@ export class PipelineRunner {
               mapped.processing.parserIntent.parserArtifactClientId,
             parserOutputHash: output.rawArtifact.sha256,
             parserOutputByteLength: output.rawArtifact.byteLength,
-            parserOutputMediaType: "application/vnd.docling+json",
+            parserOutputMediaType: output.rawArtifact.mediaType,
             parsedText: mapped.declaration,
           },
         }),

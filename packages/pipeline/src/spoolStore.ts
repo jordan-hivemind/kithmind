@@ -7,14 +7,13 @@ import type {
   LocalDirectoryIdentity,
   LocalFileIdentity,
 } from "./archiveCatalogTypes.js";
-import type { CapturedPdf } from "./captureStore.js";
 import {
-  inspectCapturedPdfParserOutput,
-  type ParserOutputIntent,
-  type ParserProcessLimits,
+  inspectCapturedParserOutput,
+  type ParserOutputRecoveryInput,
   DurableParserOutputArtifacts,
   ValidatedNormalizedBundleResult,
 } from "./parserProcess.js";
+import type { BinaryParserProfileId } from "@repo/worker-protocol";
 
 const FILE_MODE = 0o600;
 const DIRECTORY_MODE = 0o700;
@@ -483,14 +482,10 @@ export async function inspectNormalizedBundleSpool(input: {
   spoolRoot: string;
   expectedRoot: LocalDirectoryIdentity;
   spool: LocalFileIdentity;
-  parserRecovery: {
-    capture: CapturedPdf;
-    outputRoot: string;
-    outputIntent: ParserOutputIntent;
-    expectedParserFingerprint: string;
-    expectedExtractionConfigurationFingerprint: string;
-    expectedModelManifestSha256: string;
-    limits?: ParserProcessLimits;
+  /** The class's own recovery input, so the spooled bundle is revalidated by
+   * the validator that produced it. */
+  parserRecovery: ParserOutputRecoveryInput & {
+    profileId: BinaryParserProfileId;
   };
 }): Promise<ValidatedNormalizedBundleResult> {
   const root = await protectedRoot(input.spoolRoot);
@@ -500,9 +495,7 @@ export async function inspectNormalizedBundleSpool(input: {
   opaqueId(matched[1]);
   const target = join(root.path, input.spool.opaqueName);
   const inspected = await readExact(target, MAX_SPOOL_BYTES, input.spool);
-  const parserOutput = await inspectCapturedPdfParserOutput(
-    input.parserRecovery,
-  );
+  const parserOutput = await inspectCapturedParserOutput(input.parserRecovery);
   const source = parserOutput.artifacts.normalizedBundle;
   if (
     inspected.bytes.length !== source.byteLength ||

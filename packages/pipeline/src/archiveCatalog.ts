@@ -10,6 +10,11 @@ import {
 } from "node:fs/promises";
 import { basename, join } from "node:path";
 
+import {
+  isBinaryMediaType,
+  isBinaryParserOutputMediaType,
+} from "@repo/worker-protocol";
+
 import type {
   ArchiveBoundaryRelocation,
   ArchiveBoundaryRelocationArtifact,
@@ -774,8 +779,10 @@ function durableParserOutput(value: unknown): DurableParserOutput {
     "byteLength",
     "mediaType",
   ]);
+  // P2-70i3: the raw artifact carries its class's parser output media type, so
+  // a docling artifact can never be recorded as a workbook's rendered grid.
   if (
-    raw.mediaType !== "application/vnd.docling+json" ||
+    !isBinaryParserOutputMediaType(raw.mediaType) ||
     bundle.mediaType !== "application/json"
   )
     fail("catalog_invalid");
@@ -792,7 +799,7 @@ function durableParserOutput(value: unknown): DurableParserOutput {
         sha256: raw.sha256,
         byteLength: raw.byteLength,
       }),
-      mediaType: "application/vnd.docling+json",
+      mediaType: raw.mediaType,
     },
     normalizedBundle: {
       ...localFile({
@@ -837,7 +844,7 @@ function originalRow(value: unknown): OriginalCatalogRow {
     "byteLength",
     "mediaType",
   ]);
-  if (origin.mediaType !== "application/pdf") fail("catalog_invalid");
+  if (!isBinaryMediaType(origin.mediaType)) fail("catalog_invalid");
   const provider =
     row.providerOriginal === undefined
       ? undefined
@@ -850,7 +857,7 @@ function originalRow(value: unknown): OriginalCatalogRow {
       observationEpoch: integer(origin.observationEpoch),
       sha256: sha(origin.sha256),
       byteLength: integer(origin.byteLength, 1, 16 * 1024 * 1024),
-      mediaType: "application/pdf",
+      mediaType: origin.mediaType,
     },
     copies: originalCopies(row.copies, provider !== undefined),
     ...(provider === undefined ? {} : { providerOriginal: provider }),
@@ -1886,10 +1893,9 @@ export class ArchiveCatalog {
       sourceExternalId: uuid(identity.sourceExternalId),
       sha256: sha(identity.sha256),
       byteLength: integer(identity.byteLength, 1, 16 * 1024 * 1024),
-      mediaType:
-        identity.mediaType === "application/pdf"
-          ? ("application/pdf" as const)
-          : fail("invalid_input"),
+      mediaType: isBinaryMediaType(identity.mediaType)
+        ? identity.mediaType
+        : fail("invalid_input"),
     };
     const matches = this.snapshot.originals.filter(
       (row) =>

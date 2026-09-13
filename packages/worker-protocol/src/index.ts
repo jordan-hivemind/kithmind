@@ -462,6 +462,17 @@ export function binaryMediaType(profileId: BinaryParserProfileId): string {
   return BINARY_CLASSES[profileId].mediaType;
 }
 
+/**
+ * True for a media type in the set. A class owns its media type, so this is
+ * also the check that a stored media type still names a class the worker and
+ * the server both know.
+ */
+export function isBinaryMediaType(value: unknown): value is BinaryMediaType {
+  return BINARY_PARSER_PROFILE_IDS.some(
+    (profileId) => BINARY_CLASSES[profileId].mediaType === value,
+  );
+}
+
 export function isBinaryParserOutputMediaType(
   value: unknown,
 ): value is BinaryParserOutputMediaType {

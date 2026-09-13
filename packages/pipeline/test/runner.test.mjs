@@ -2367,7 +2367,11 @@ test("provider admission sends three recovery selections and persists the provid
     },
     parserIntent: { parserArtifactClientId: randomUUID() },
     parserOutput: {
-      rawArtifact: { sha256: HASH, byteLength: 100 },
+      rawArtifact: {
+        sha256: HASH,
+        byteLength: 100,
+        mediaType: "application/vnd.docling+json",
+      },
       extractionFingerprint: HASH,
     },
   };
