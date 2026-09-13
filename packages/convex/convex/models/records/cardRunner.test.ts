@@ -628,6 +628,43 @@ describe("the tightened extraction prompt", () => {
   });
 
   test("names the prompt version the fingerprint records", () => {
-    expect(CARD_PROMPT_VERSION).toBe("card-prompt-v4");
+    expect(CARD_PROMPT_VERSION).toBe("card-prompt-v5");
+  });
+});
+
+describe("P2-82: the anchor and card_kind prompt rules", () => {
+  const prompt = cardExtractionSystemPrompt("document_card");
+
+  test("the anchor rule requires the document's own title or heading, verbatim", () => {
+    expect(prompt).toContain(
+      "anchor must quote the document's own title or heading line verbatim",
+    );
+    expect(prompt).toContain("not a paraphrase, and not a sentence from the body");
+  });
+
+  test("card_kind states its closed choices and needs no span", () => {
+    expect(prompt).toContain("no span is needed for this field");
+    for (const kind of [
+      "statement",
+      "tax_form",
+      "contract",
+      "investment_agreement",
+      "invoice",
+      "letter",
+      "report",
+      "spreadsheet",
+      "other",
+    ]) {
+      expect(prompt).toContain(kind);
+    }
+  });
+
+  test("the fields schema lets card_kind entries carry zero spans", () => {
+    const schema = cardExtractionInputSchema("document_card") as {
+      properties: {
+        fields: { items: { properties: { spans: { minItems: number } } } };
+      };
+    };
+    expect(schema.properties.fields.items.properties.spans.minItems).toBe(0);
   });
 });

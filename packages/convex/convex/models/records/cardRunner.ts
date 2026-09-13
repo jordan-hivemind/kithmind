@@ -37,7 +37,7 @@ import { SUPPORTED_CURRENCIES, type ObservationValue } from "./values";
 
 /** Bumped when the boundary statement, the schema rendering or the tool
  * contract changes. Section 4.6 puts it in the card extraction fingerprint. */
-export const CARD_PROMPT_VERSION = "card-prompt-v4";
+export const CARD_PROMPT_VERSION = "card-prompt-v5";
 
 /** Section 5.1: the ladder's steps, in order. `local` is optional. */
 export const CARD_LADDER_STEPS = ["local", "tier0", "tier1"] as const;
@@ -230,7 +230,7 @@ const NORMALIZER_EXPECTATIONS: Readonly<Record<CardNormalizerId, string>> = {
   text_v1:
     "the cited span text, with runs of whitespace collapsed, must equal the value exactly",
   name_v1:
-    "the cited span text must contain the literal name; cite the sentence that names it",
+    "the cited span must quote the literal name verbatim, never a paraphrase or a reworded form; if the name wraps a line break in the source, quote the words together as the name reads, not only the part on one line",
   money_v1:
     "cite a span holding only the amount and its currency indicator, for example $1,250.00 or 1250.00 USD; give amount as a plain decimal string and currency as an ISO 4217 code",
   money_or_number_v1:
@@ -247,6 +247,8 @@ const NORMALIZER_EXPECTATIONS: Readonly<Record<CardNormalizerId, string>> = {
     "cite a span that names the value exactly; the value must be one of the declared choices, quoted verbatim rather than paraphrased",
   money_usd_default_v1:
     "cite a span holding only the amount; give amount as a plain decimal string; when the span carries no currency symbol or code give currency as USD, otherwise give the currency the span states",
+  anchor_enum_v1:
+    "no span is needed for this field: the document's own anchor already proves it; give exactly one of the declared choices",
 };
 
 export type CardRunnerFieldSpec = {
@@ -336,7 +338,7 @@ export function cardExtractionSystemPrompt(kind: CardRecordKind): string {
     "- Copy a quote verbatim from the text of one page, character for character, including its punctuation and casing. A quote may not run from one page into the next; cite each page separately.",
     "- Cite the tightest span that still proves the value, not the paragraph around it. If that span appears more than once on its page, lengthen it until it appears exactly once: a quote that matches two places on a page proves neither.",
     "- A date value is YYYY-MM-DD and its span holds only the date, with nothing else inside the quote.",
-    "- anchor is the span that identifies the document as this card kind.",
+    "- anchor must quote the document's own title or heading line verbatim: not a paraphrase, and not a sentence from the body.",
     `- Currencies accepted: ${SUPPORTED_CURRENCIES.join(", ")}.`,
     "",
     `Call ${CARD_EXTRACTION_TOOL_NAME} exactly once. It is the only tool, it writes nothing, and it is the only way to return a result.`,
@@ -426,7 +428,11 @@ export function cardExtractionInputSchema(
                 unitCode: { type: ["string", "null"] },
               },
             },
-            spans: { type: "array", minItems: 1, items: spanSchema },
+            // Every field but card_kind (`anchor_enum_v1`) still needs at
+            // least one span to pass the gate, but that is stated in each
+            // field's own expectation text; `card_kind` is the one field the
+            // schema must let the model return with none.
+            spans: { type: "array", minItems: 0, items: spanSchema },
           },
         },
       },

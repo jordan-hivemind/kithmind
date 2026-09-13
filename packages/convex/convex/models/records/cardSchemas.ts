@@ -38,7 +38,27 @@ export type CardNormalizerId =
   | "integer_v1"
   | "clause_boolean_v1"
   | "enum_v1"
-  | "money_usd_default_v1";
+  | "money_usd_default_v1"
+  | "anchor_enum_v1";
+
+/**
+ * Section 4.2, decision 1 (P2-82): `card_kind` is a classification the
+ * runner declares, not a fact quoted from the page, so it is proven by the
+ * card's own anchor span resolving rather than by a span of its own. The
+ * list is deliberately short: the card kinds and the common document types
+ * the plan names.
+ */
+export const DOCUMENT_CARD_KINDS = [
+  "statement",
+  "tax_form",
+  "contract",
+  "investment_agreement",
+  "invoice",
+  "letter",
+  "report",
+  "spreadsheet",
+  "other",
+] as const;
 
 export type CardFieldSchema = {
   /** Value types the gate may store for this field. */
@@ -110,6 +130,20 @@ export function isEntityCapableField(field: CardFieldSchema): boolean {
 }
 
 /**
+ * Section 4.2, decision 1 (P2-82): a field proven by the card's own anchor
+ * evidence rather than by a span of its own. Declared only for `card_kind`:
+ * the gate accepts it once the value is one of its `enumValues` and the
+ * card's anchor has already resolved, and no `evidenceSpanIds` are read or
+ * required for it.
+ */
+export function isAnchorProvenField(
+  kind: CardRecordKind,
+  field: string,
+): boolean {
+  return CARD_SCHEMAS[kind].fields[field]?.normalizer === "anchor_enum_v1";
+}
+
+/**
  * Section 4.5. The observation type whose bound entity becomes the card
  * event's entity, or `undefined` when this kind's event belongs to the
  * source account's subject entity.
@@ -130,7 +164,13 @@ export function cardEntityKinds(
 export const CARD_SCHEMAS: Readonly<Record<CardRecordKind, CardKindSchema>> = {
   document_card: {
     fields: {
-      card_kind: { valueTypes: ["text"], normalizer: "text_v1" },
+      card_kind: {
+        valueTypes: ["text"],
+        normalizer: "anchor_enum_v1",
+        enumValues: DOCUMENT_CARD_KINDS,
+        description:
+          "The document's own kind, one of the declared choices. Proven by the card's anchor; it needs no span of its own.",
+      },
       card_title: {
         valueTypes: ["text"],
         normalizer: "text_v1",
