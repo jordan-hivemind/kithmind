@@ -2,7 +2,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import adapter, { MS_ACTIVITY_ROWS_KEY } from "../src/adapter.mjs";
 import { createFixtureSession } from "../fixtures/session.mjs";
-import { POSTED_ACTIVITY_COUNT, ROW_8_MISSING_CURRENCY } from "../fixtures/activity.mjs";
+import {
+  POSTED_ACTIVITY_COUNT,
+  ROW_8_MISSING_CURRENCY,
+  ROW_9_FOREIGN_CURRENCY,
+} from "../fixtures/activity.mjs";
 
 const SELECTION = { kind: "structured_api", periodStart: "2025-01-01", periodEnd: "2025-02-28" };
 
@@ -217,6 +221,43 @@ test("every key a parsed row carries is one discover() reports, so it resolves d
   for (const row of parsed.activity) {
     assert.ok(discovered.has(row.accountExternalKey), `${row.accountExternalKey} is not a discovered account`);
   }
+});
+
+test("F1-8b/F1-38: a foreign-currency row's stated FX rate is carried onto ParsedRow.fxRate", async () => {
+  const session = {
+    institutionSlug: "morgan-stanley",
+    async fetchText(path, query) {
+      assert.equal(path, "/activity");
+      assert.equal(query.page, "1");
+      return JSON.stringify({
+        Result: { postedActivityCount: 1, [MS_ACTIVITY_ROWS_KEY]: [ROW_9_FOREIGN_CURRENCY] },
+      });
+    },
+    async fetchBytes() {
+      throw new Error("not used");
+    },
+  };
+  const acquired = await adapter.acquire({ ...SELECTION, session });
+  const parsed = await adapter.parse({ kind: "structured_api", bytes: acquired.bytes });
+
+  assert.equal(parsed.activity.length, 1);
+  const [row] = parsed.activity;
+  assert.equal(row.currency, "EUR");
+  assert.equal(row.amount, "-100");
+  // The rate, not the unsigned fxSourceAmount: see resolveFxRate's own doc
+  // comment for why only the rate is safe to carry without inventing a sign.
+  assert.equal(row.fxRate, "1.0835");
+  assert.equal(row.amountBase, undefined);
+
+  const { resolveFxRate } = await import("../src/adapter.mjs");
+  // A rate stated for a currency this row is not denominated in is not this
+  // row's rate: nothing is carried rather than applying it anyway.
+  assert.equal(
+    resolveFxRate({ ...ROW_9_FOREIGN_CURRENCY, fxLocalCurrency: "GBP" }, "EUR"),
+    null,
+  );
+  // The account's own base currency never needs a conversion.
+  assert.equal(resolveFxRate(ROW_9_FOREIGN_CURRENCY, "USD"), null);
 });
 
 test("a window before last year, or spanning years, is a Custom date-range pull", async () => {

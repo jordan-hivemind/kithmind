@@ -731,6 +731,11 @@ function parsedRowToImportRow(
     amountText: classified.amount,
     amountNote: row.amountNote,
     currency: row.currency,
+    // F1-8b/F1-38. Widened straight through, same as every other field an
+    // adapter already resolved: importer.ts's resolveAmountBase is what
+    // validates and, when only a rate is given, derives amount_base.
+    amountBaseText: row.amountBase ?? null,
+    fxRateText: row.fxRate ?? null,
     runningBalance: row.runningBalance,
     // Widened, not discarded: every field-level locator parse() attached
     // (ground rule 2), not just the row-level one. transactions.source_locator

@@ -170,6 +170,7 @@ export {
   cashEffectiveDate,
   runReconciliationGate,
   type CashChange,
+  type CashCoverageGap,
   type CashGateScope,
   type ReconciliationGateSummary,
   type ReconciliationOutcome,

@@ -1276,7 +1276,8 @@ function printReparseSummary(
     console.log("whole-archive gate pass:");
     console.log(
       `  cash: checked=${wholeArchive.cash.periodsChecked} pass=${wholeArchive.cash.passed} ` +
-        `fail=${wholeArchive.cash.failed} unverified=${wholeArchive.cash.unverified}`,
+        `fail=${wholeArchive.cash.failed} unverified=${wholeArchive.cash.unverified} ` +
+        `coverage gaps=${wholeArchive.cash.coverageGaps.length}`,
     );
     console.log(
       `  positions: checked=${wholeArchive.positions.periodsChecked} ` +
@@ -2994,7 +2995,8 @@ function printSummary(
     console.log("whole-archive gate pass:");
     console.log(
       `  cash: checked=${cash.periodsChecked} pass=${cash.passed} ` +
-        `fail=${cash.failed} unverified=${cash.unverified}`,
+        `fail=${cash.failed} unverified=${cash.unverified} ` +
+        `coverage gaps=${cash.coverageGaps.length}`,
     );
     console.log(
       `  positions: checked=${positions.periodsChecked} pass=${positions.passed} ` +
