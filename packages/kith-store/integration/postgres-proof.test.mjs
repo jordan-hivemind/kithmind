@@ -639,6 +639,21 @@ test(
     await restoredOwner.query(
       "ALTER TABLE kith.api_keys DROP CONSTRAINT api_keys_id_space_unique",
     );
+    // Undo migration 4 too: every table it created (P2-39b's Convex-mapped
+    // tables) declares its id, space_id and reference columns over the
+    // kith_id domain, so the domain cannot be dropped while any of them
+    // exist. Found by the domain itself rather than a hardcoded table list,
+    // so this keeps working unmodified as later migrations add more of them.
+    const migratedTables = await restoredOwner.query(
+      `SELECT DISTINCT table_name FROM information_schema.columns
+        WHERE table_schema = 'kith' AND domain_schema = 'kith' AND domain_name = 'kith_id'`,
+    );
+    if (migratedTables.rows.length > 0) {
+      const names = migratedTables.rows
+        .map((row) => `kith.${row.table_name}`)
+        .join(", ");
+      await restoredOwner.query(`DROP TABLE ${names} CASCADE`);
+    }
     await restoredOwner.query("DROP DOMAIN kith.kith_id");
     await restoredOwner.query(
       "DELETE FROM kith.schema_version WHERE version > 1",
@@ -649,7 +664,7 @@ test(
     );
     assert.deepEqual(
       upgradedVersions.rows.map((row) => row.version),
-      [1, 2, 3],
+      [1, 2, 3, 4],
     );
     // A gap rather than a rollback: version 1 missing while 2 and 3 are
     // recorded is a history no build can migrate from, and guessing is how a
