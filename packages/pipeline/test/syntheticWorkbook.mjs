@@ -91,7 +91,7 @@ const SHARED = [
   "Paper &amp; ink",
 ];
 
-function workbookBytes() {
+function workbookBytes(extraParts = []) {
   const revenue = sheetXml([
     [
       { r: "A1", shared: 0 },
@@ -138,6 +138,7 @@ function workbookBytes() {
     ],
     ["xl/worksheets/sheet1.xml", revenue],
     ["xl/worksheets/sheet2.xml", notes],
+    ...extraParts,
   ]);
 }
 

@@ -264,6 +264,31 @@ posted-activity count, the row-level dates, `keyAccount`, `activity`,
 `fxLocalAmount`, `fxMarketRate`, `fxType`) are retained for evidence and later
 use -- `parse()` does not read them yet.
 
+F1-8i measured what two of those retained dates are actually worth as a cash
+posting date, because the cash gate's residual failures looked like a posting
+date the archive does not hold. Neither is one, so neither is mapped:
+
+| Fact | Count |
+| --- | --- |
+| retained activity rows carrying a `payDate` key | 50,700 |
+| of those, rows stating a `payDate` value | **0** |
+| retained rows stating an `activityDate` | 50,700 of 50,700 |
+| `activityDate` later than the row's cash-effective date | 63 |
+| `activityDate` on the same day | 27,973 |
+| `activityDate` earlier | 22,829 |
+
+`payDate` is a field this provider sends empty on every row captured so far,
+not a field the allowlist forgot: the projection writes a key only when the
+response carries one, so a key present and `null` came that way. `activityDate`
+is stated on every row and points the wrong way -- the misplaced rows need a
+*later* date. Preferring it in the gate flips 0 failing periods to a pass and
+breaks between 8 and 296 passing ones depending on how it is combined. The
+evidence and the next study are in `@repo/finance-archive`'s README, under
+"No posting date to import".
+
+Keep both declared. Retaining a field the provider leaves empty costs nothing
+and the day it starts arriving populated, the bytes will already have it.
+
 `runningBalances` is confirmed as a scalar (a JSON number), so it is retained
 directly rather than guessed at as a nested object.
 

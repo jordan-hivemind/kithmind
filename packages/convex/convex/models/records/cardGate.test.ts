@@ -533,4 +533,72 @@ describe("card evidence gate", () => {
     });
     expect(codeOf(lastFour, "account_identifier_last_four")).toBe("pass");
   });
+
+  // P2-89. Historical cardFieldDrops rows carry `field_not_declared` and a
+  // `:0` key on a non-repeated field, both retired by PR180's shape repair
+  // in `parseCardRunnerCandidate`: an undeclared field or value type is
+  // dropped before the gate ever sees it, and a non-repeated field never
+  // carries an ordinal. These fixtures pin that a correctly shaped candidate
+  // never resurfaces either artifact at the gate.
+  describe("P2-89: retired drop artifacts do not resurface", () => {
+    test("a correctly shaped document_card candidate never fails field_not_declared", () => {
+      const report = gateCard({
+        recordKind: "document_card",
+        fields: [
+          field("card_kind", { type: "text", value: "contract" }, "n/a"),
+          field("card_title", { type: "text", value: "A Title" }, "A Title"),
+          field(
+            "card_date",
+            { type: "date", value: "2025-03-04" },
+            "2025-03-04",
+          ),
+          field(
+            "card_summary",
+            { type: "text", value: "A summary" },
+            "A summary",
+          ),
+          field(
+            "card_party",
+            { type: "text", value: "Northwind Supply" },
+            "Northwind Supply",
+            { ordinal: 0 },
+          ),
+        ],
+      });
+      expect(
+        report.results.some(
+          (result) =>
+            result.status === "fail" && result.code === "field_not_declared",
+        ),
+      ).toBe(false);
+    });
+
+    test("document_card's non-repeated fields never carry a :0 ordinal artifact in their key", () => {
+      const report = gateCard({
+        recordKind: "document_card",
+        fields: [
+          field("card_kind", { type: "text", value: "contract" }, "n/a"),
+          field("card_title", { type: "text", value: "A Title" }, "A Title"),
+          field(
+            "card_date",
+            { type: "date", value: "2025-03-04" },
+            "2025-03-04",
+          ),
+          field(
+            "card_summary",
+            { type: "text", value: "A summary" },
+            "A summary",
+          ),
+        ],
+      });
+      const keys = report.results.map((result) => result.key);
+      expect(keys).toEqual([
+        "card_kind",
+        "card_title",
+        "card_date",
+        "card_summary",
+      ]);
+      expect(keys.some((key) => key.endsWith(":0"))).toBe(false);
+    });
+  });
 });

@@ -628,18 +628,19 @@ describe("the tightened extraction prompt", () => {
   });
 
   test("names the prompt version the fingerprint records", () => {
-    expect(CARD_PROMPT_VERSION).toBe("card-prompt-v5");
+    expect(CARD_PROMPT_VERSION).toBe("card-prompt-v6");
   });
 });
 
 describe("P2-82: the anchor and card_kind prompt rules", () => {
   const prompt = cardExtractionSystemPrompt("document_card");
 
-  test("the anchor rule requires the document's own title or heading, verbatim", () => {
+  test("the anchor rule requires the same heading line as card_title, or the document's own identifying first line, verbatim", () => {
     expect(prompt).toContain(
-      "anchor must quote the document's own title or heading line verbatim",
+      "anchor must quote the same heading line as card_title",
     );
-    expect(prompt).toContain("not a paraphrase, and not a sentence from the body");
+    expect(prompt).toContain("its own identifying first line");
+    expect(prompt).toContain("never a paraphrase, and never a sentence from the body");
   });
 
   test("card_kind states its closed choices and needs no span", () => {
