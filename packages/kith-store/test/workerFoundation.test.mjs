@@ -273,18 +273,12 @@ test(
     const f = await fixture(t);
     const pool = createKithPool(f.databaseUrl, 2);
     try {
-      for (let count = 0; count < 59; count += 1) {
-        await withWorkerTransaction(
-          pool,
-          (ctx) =>
-            consumeWorkerMutationRateLimit(
-              ctx,
-              f.credential.id,
-              f.sourceAccountId,
-            ),
-          NOW,
-        );
-      }
+      await f.client.query(
+        `INSERT INTO kith.worker_protocol_rate_limits
+           (id, created_at, credential_id, source_account_id, window_started_at, count)
+         VALUES ($1, $2, $3, $4, $2, 7999)`,
+        ["r".repeat(26), new Date(NOW), f.credential.id, f.sourceAccountId],
+      );
       const raced = await Promise.allSettled([
         withWorkerTransaction(
           pool,
@@ -324,7 +318,7 @@ test(
             [f.credential.id, f.sourceAccountId],
           )
         ).rows[0].count,
-        60,
+        8000,
       );
       await assert.doesNotReject(
         withWorkerTransaction(
