@@ -971,13 +971,8 @@ export function parseRealStatement(text, kind) {
   // document's own account (`balance.accountId ?? document.accountId`) --
   // recording the roll-up as that one account's own stated balance, beside
   // that account's real section: two balances for one (account, as_of).
-  // Measured over the owner's retained statement text: 141 of 1,237
-  // statements print exactly one such section, every one of them consolidated
-  // (2 to 13 per-account sections each), every one also stating that
-  // account's own section at the same as-of date, and every one headed by a
-  // bare `Consolidated Summary` line that never appears above any of the
-  // 1,874 per-account sections. There is no household-level snapshot in the
-  // schema to record it as, so it is not recorded, and the note says so.
+  // There is no household-level snapshot in the schema, so this section
+  // is omitted and the parse note records the missing attribution.
   //
   // `namesAccounts` is what keeps this from swallowing the other reason a
   // section carries no account key: a document that names no account anywhere

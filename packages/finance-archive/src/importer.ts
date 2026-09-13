@@ -1496,58 +1496,35 @@ export async function importBatch(
     // row, which is exactly the report the gate already refuses to compute
     // per-period. A review item names the other document at import time
     // instead, without changing which cash the gate reconciles against.
-    const cashConflicts =
-      table === "balances"
-        ? new Map(
-            (
-              await client.query<{
-                account_id: string;
-                as_of: string;
-                cash: string | null;
-                source_document_id: string | null;
-              }>(
-                `SELECT b.account_id, b.as_of::text AS as_of, b.cash, b.source_document_id
-                   FROM balances b
-                   JOIN (SELECT unnest($1::text[]) AS account_id,
-                                unnest($2::date[]) AS as_of) pairs
-                     ON pairs.account_id = b.account_id AND pairs.as_of = b.as_of`,
-                [
-                  prepared.map((p) => p.accountId),
-                  prepared.map((p) => p.values[2] as string),
-                ],
-              )
-            ).rows.map((r) => [`${r.account_id} ${r.as_of}`, r]),
-          )
-        : null;
+    const storedBalances = table === "balances"
+      ? (await client.query<{
+          account_id: string;
+          as_of: string;
+          cash: string | null;
+          source_document_id: string | null;
+        }>(
+          `SELECT b.account_id, b.as_of::text AS as_of, b.cash, b.source_document_id
+             FROM balances b
+             JOIN (SELECT unnest($1::text[]) AS account_id,
+                          unnest($2::date[]) AS as_of) pairs
+               ON pairs.account_id = b.account_id AND pairs.as_of = b.as_of`,
+          [prepared.map((p) => p.accountId), prepared.map((p) => p.values[2] as string)],
+        )).rows
+      : null;
+    const cashConflicts = storedBalances === null
+      ? null
+      : new Map(storedBalances.map((r) => [JSON.stringify([r.account_id, r.as_of]), r]));
 
-    // F1-8l. One (account, as_of) that this same document has already stated
-    // a balance for -- either a row of this batch, or a row already stored
-    // citing this document from an earlier parse of it. A document states one
-    // balance per account per date; a second is the document contradicting
-    // itself, which no `row_hash` catches because `cash` and `total_value`
-    // are in the preimage, and which the cash gate then reconciles against
-    // whichever of the two it happens to pair. The shape that produced it:
-    // a Morgan Stanley consolidated statement's household roll-up section,
-    // attributed to no account by the parser and then attributed to the
-    // document's own account by the `?? document.accountId` fallback below.
-    // The parser refuses that section now (adapter-morgan-stanley's
-    // `parseRealStatement`, F1-8l), and this refuses the second row for any
-    // other layout that ever does the same thing.
-    //
-    // ponytail: the already-stored half rides on `cashConflicts`, which keeps
-    // one row per (account, as_of), so where another document also states
-    // that pair this document's own stored row can be the one not kept and a
-    // reparse could still insert beside it -- a case `balance_cash_conflict`
-    // already reports. Give this its own query if that ever matters; the
-    // within-batch half, which is what the roll-up produced, is exact.
-    const balanceKeys =
-      cashConflicts === null
-        ? null
-        : new Set(
-            [...cashConflicts.values()]
-              .filter((r) => r.source_document_id === documentId)
-              .map((r) => `${r.account_id}/${r.as_of}`),
-          );
+    // F1-8l. Keep every matching stored row when checking whether this
+    // document already supplied a balance. The cross-document conflict map
+    // retains only one row per account/date and cannot answer that question.
+    // This set also grows as this batch accepts rows, so a second statement
+    // of the same account/date is refused even when its amounts hash differently.
+    const balanceKeys = storedBalances === null
+      ? null
+      : new Set(storedBalances
+          .filter((r) => r.source_document_id === documentId)
+          .map((r) => JSON.stringify([r.account_id, r.as_of])));
 
     const toInsert: unknown[][] = [];
     let anySuccess = false;
@@ -1555,7 +1532,7 @@ export async function importBatch(
       if (cashConflicts !== null) {
         const asOf = p.values[2] as string;
         const cash = p.values[4] as string | null;
-        const existing = cashConflicts.get(`${p.accountId} ${asOf}`);
+        const existing = cashConflicts.get(JSON.stringify([p.accountId, asOf]));
         if (
           existing !== undefined &&
           existing.source_document_id !== documentId &&
@@ -1594,7 +1571,7 @@ export async function importBatch(
         continue;
       }
       if (balanceKeys !== null) {
-        const key = `${p.accountId}/${p.values[2] as string}`;
+        const key = JSON.stringify([p.accountId, p.values[2] as string]);
         if (balanceKeys.has(key)) {
           openReview(p.accountId, documentId, p.sourceLocator, {
             kind: "balance_duplicate_in_document",

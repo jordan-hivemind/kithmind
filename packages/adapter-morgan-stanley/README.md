@@ -580,14 +580,6 @@ stated balance, beside that account's real section: two balances for one
 (account, as_of), disagreeing about cash and total value, with the roll-up's
 total larger than any single account's.
 
-Measured over the retained statement text of the owner's archive: 1,237
-statements, 141 of them consolidated, and every one of those 141 prints
-exactly one such section, always headed by that `Consolidated Summary` line
-(which never appears above any of the 1,874 per-account sections) and always
-alongside that account's own section at the same as-of date. Positions and
-liabilities were never affected: no position or liability parsed without an
-account key.
-
 `parseRealStatement` now records no balance it cannot attribute to an account,
 on a statement that names accounts at all, and says so in its `parseNote`.
 There is no household-level snapshot in the schema, so the roll-up is not

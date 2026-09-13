@@ -1118,6 +1118,53 @@ test(
   },
 );
 
+test("a reparse refuses a second same-document balance even when another document owns the conflict-map entry", { skip }, async (t) => {
+  const client = await archive(t);
+  await seed(client);
+  const balance = (cash) => ({
+    asOf: "2026-03-31", totalValueText: "10000", totalValueNote: null,
+    cash, currency: "USD", periodStartValue: null, periodEndValue: "10000",
+    sourceLocator: "holdings:balance",
+  });
+  const original = document("1b".padEnd(64, "0"), [], {
+    parseNote: "Synthetic incomplete extraction permits a later reparse.",
+    balances: [balance("500")],
+  });
+  const other = document("1c".padEnd(64, "0"), [], { balances: [balance("600")] });
+  await importBatch(client, { source: "synthetic-pull", documents: [original, other] }, NOW);
+  const own = await one(client, "SELECT id FROM documents WHERE sha256 = $1", [original.sha256]);
+
+  // Make the formerly lossy map select the other document deterministically,
+  // without relying on PostgreSQL's unspecified row order.
+  const query = client.query.bind(client);
+  let reordered = false;
+  client.query = async (...args) => {
+    const result = await query(...args);
+    if (typeof args[0] === "string" && args[0].includes("FROM balances b")) {
+      result.rows.sort((a, b) => Number(a.source_document_id !== own.id) - Number(b.source_document_id !== own.id));
+      assert.equal(result.rows.length, 2);
+      assert.equal(result.rows[0].source_document_id, own.id);
+      assert.notEqual(result.rows[1].source_document_id, own.id);
+      reordered = true;
+    }
+    return result;
+  };
+  let result;
+  try {
+    result = await importBatch(client, {
+      source: "synthetic-pull", documents: [{ ...original, balances: [balance("700")] }],
+    }, NOW);
+  } finally {
+    client.query = query;
+  }
+  assert.equal(reordered, true);
+  assert.equal(result.rowsInserted, 0);
+  assert.equal(result.rowsRefused, 1);
+  assert.equal(await count(client, "balances"), 2);
+  assert.equal((await one(client, "SELECT cash FROM balances WHERE source_document_id = $1", [own.id])).cash, "500");
+  assert.equal((await one(client, "SELECT count(*)::int AS n FROM review_items WHERE source_document_id = $1 AND kind = 'balance_duplicate_in_document'", [own.id])).n, 1);
+});
+
 // F1-49. A parse-noted document is never eligible for the whole-document
 // skip (see the parsed_ok test above and importBatch's parseNote branch), so
 // every rerun reprocesses it in full -- which, before row_hash existed on
