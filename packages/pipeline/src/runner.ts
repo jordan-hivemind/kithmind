@@ -5518,10 +5518,29 @@ export class PipelineRunner {
       this.archiveCatalog = await openArchiveCatalog({ journal: this.journal });
     }
     if (this.journal.pending) {
+      const pendingPhase = this.journal.checkpoint.phase;
       const replayed = await this.driveCheckpoint();
       if (replayed) return replayed;
-      if (this.journal.checkpoint.phase === "terminal") {
-        return resultFromTerminal(this.journal.checkpoint);
+      const afterReplay = this.journal.checkpoint;
+      if (afterReplay.phase === "terminal") {
+        const abandonedScan =
+          afterReplay.code === "scan_not_ready" &&
+          (pendingPhase === "inventory" ||
+            pendingPhase === "append" ||
+            pendingPhase === "seal_check" ||
+            pendingPhase === "seal");
+        if (!abandonedScan) {
+          return resultFromTerminal(afterReplay);
+        }
+        // The replayed scan operation was answered `scan_not_ready`: the
+        // server expired or sealed this scan server-side (idle past
+        // `WORKER_SCAN_IDLE_MS`) while the journal still had it pending.
+        // That is ordinary after any client crash long enough to miss the
+        // window, so abandon this scan and fall through to start a fresh
+        // one instead of reporting a failed run.
+        process.stderr.write(
+          `${JSON.stringify({ phase: pendingPhase, code: afterReplay.code })}\n`,
+        );
       }
     }
     const status = await this.sourceStatus();
