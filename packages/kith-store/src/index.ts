@@ -43,6 +43,7 @@ export * as memory from "./memory/index.js";
 export * as ingestion from "./ingestion/index.js";
 export * as workers from "./workers/index.js";
 export * as records from "./records/index.js";
+export * as coverage from "./coverage/index.js";
 
 const SHA256 = /^[0-9a-f]{64}$/;
 const UUID =
