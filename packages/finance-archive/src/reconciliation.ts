@@ -181,7 +181,12 @@ type PeriodResult = {
  * window between them is half-open, `(period_start, period_end]`, because
  * `period_start`'s own activity is already inside the balance stated there).
  * Re-running the gate replaces any prior row for the same account and
- * period, so it is idempotent after a corrected import.
+ * period, so it is idempotent after a corrected import. It also deletes any
+ * row for a period that no longer exists at all -- archive-wide with no
+ * `scope`, or within `scope`'s own accounts with one (F1-72) -- so a
+ * document collapse or account re-attribution that changes the window set
+ * cannot leave the old windows' verdicts behind counting toward every
+ * reader's failure totals.
  *
  * The whole gate is one transaction, and it joins the caller's transaction
  * when there is one -- which is how `publishImport` gets new transactions and
@@ -210,10 +215,11 @@ export async function runReconciliationGate(
   return withArchiveTransaction(client, async () => {
     await lockArchiveForWrite(client);
 
+    const scoped = scope === undefined ? undefined : await scopedPairs(client, scope);
     const pairs =
       scope === undefined
         ? (await client.query<BalancePairRow>(pairSql(""))).rows
-        : await scopedPairs(client, scope);
+        : scoped!.pairs;
 
     // F1-59. Every window is summed before the loop, in one round trip
     // rather than one per period: the archive is hosted, so a gate's cost is
@@ -275,6 +281,24 @@ export async function runReconciliationGate(
     // same rows would never produce it; deleting it is what keeps the two
     // forms producing the same table.
     if (scope !== undefined) await deleteSpannedVerdicts(client, scope);
+
+    // F1-72. `pairs`/`scoped.currentPairs` is every period that still exists
+    // under the archive's current balances -- for the whole archive, or for
+    // this run's accounts. A row outside that set is a period from an
+    // earlier run (a collapsed document, a re-attributed account) that the
+    // gate no longer evaluates at all, not merely one it left unrewritten.
+    // Never a "stale" status: this schema has none, and the row is simply
+    // wrong now.
+    if (scoped === undefined) {
+      await deleteVanishedVerdicts(client, pairs);
+    } else {
+      await deleteVanishedScopedVerdicts(
+        client,
+        scoped.accountIds,
+        scoped.currentPairs,
+      );
+    }
+
     await deleteVerdicts(client, [...verdicts.values()]);
     await insertRows(client, "reconciliations", VERDICT_COLUMNS, [
       ...verdicts.values(),
@@ -536,10 +560,24 @@ function periodKey(
  * the window, or the stored verdict is not a `pass` and this account's
  * acquired history may just have reached further back.
  */
+type ScopedPairs = {
+  /** Only the periods this run needs to recompute a verdict for. */
+  pairs: BalancePairRow[];
+  /** The accounts this run evaluated, and no others (F1-72). */
+  accountIds: string[];
+  /**
+   * Every period that currently exists for those accounts, recomputed or
+   * not. This is what a period no longer being in `pairs` cannot tell you --
+   * it is silent on whether the period still exists at all -- so vanished
+   * windows for this run's accounts are found from this set (F1-72).
+   */
+  currentPairs: BalancePairRow[];
+};
+
 async function scopedPairs(
   client: ArchiveClient,
   scope: CashGateScope,
-): Promise<BalancePairRow[]> {
+): Promise<ScopedPairs> {
   const accounts = new Set<string>();
   const changedDates = new Map<string, Set<string>>();
   const activityDates = new Map<string, string[]>();
@@ -556,7 +594,7 @@ async function scopedPairs(
     dates.push(change.date);
     activityDates.set(change.accountId, dates);
   }
-  if (accounts.size === 0) return [];
+  if (accounts.size === 0) return { pairs: [], accountIds: [], currentPairs: [] };
 
   const stale = await client.query<{
     account_id: string;
@@ -578,7 +616,7 @@ async function scopedPairs(
     pairSql(ACCOUNTS_IN_SCOPE),
     [[...accounts]],
   );
-  return paired.rows.filter((pair) => {
+  const pairs = paired.rows.filter((pair) => {
     const changed = changedDates.get(pair.account_id);
     if (changed?.has(pair.as_of) === true) return true;
     if (changed?.has(pair.prev_as_of) === true) return true;
@@ -591,6 +629,7 @@ async function scopedPairs(
     }
     return recheck.has(periodKey(pair.account_id, pair.prev_as_of, pair.as_of));
   });
+  return { pairs, accountIds: [...accounts], currentPairs: paired.rows };
 }
 
 /** One statement for every period about to be rewritten. */
@@ -609,6 +648,63 @@ async function deleteVerdicts(
       verdicts.map((v) => v[1]),
       verdicts.map((v) => v[2]),
       verdicts.map((v) => v[3]),
+    ],
+  );
+}
+
+/**
+ * Deletes every stored verdict whose (account, period) is not in `pairs`
+ * (F1-72). Called only for a whole-archive pass, where `pairs` is every
+ * period the archive currently has, so anything else in the table is a
+ * period from an earlier run -- an account re-attribution or a document
+ * collapse changed the window set -- that this gate no longer evaluates.
+ */
+async function deleteVanishedVerdicts(
+  client: ArchiveClient,
+  pairs: readonly BalancePairRow[],
+): Promise<void> {
+  await client.query(
+    `DELETE FROM reconciliations r
+     WHERE NOT EXISTS (
+       SELECT 1 FROM unnest($1::text[], $2::date[], $3::date[])
+         AS k(account_id, period_start, period_end)
+       WHERE r.account_id = k.account_id
+         AND r.period_start = k.period_start AND r.period_end = k.period_end
+     )`,
+    [
+      pairs.map((p) => p.account_id),
+      pairs.map((p) => p.prev_as_of),
+      pairs.map((p) => p.as_of),
+    ],
+  );
+}
+
+/**
+ * The same, but scoped to `accountIds` -- an incremental run's own accounts,
+ * never archive-wide (F1-72). `currentPairs` is `scopedPairs`' full current
+ * pairing for those accounts, not only the periods this run recomputed, so a
+ * period this run had no reason to recheck keeps its row.
+ */
+async function deleteVanishedScopedVerdicts(
+  client: ArchiveClient,
+  accountIds: readonly string[],
+  currentPairs: readonly BalancePairRow[],
+): Promise<void> {
+  if (accountIds.length === 0) return;
+  await client.query(
+    `DELETE FROM reconciliations r
+     WHERE r.account_id = ANY($4::text[])
+       AND NOT EXISTS (
+         SELECT 1 FROM unnest($1::text[], $2::date[], $3::date[])
+           AS k(account_id, period_start, period_end)
+         WHERE r.account_id = k.account_id
+           AND r.period_start = k.period_start AND r.period_end = k.period_end
+       )`,
+    [
+      currentPairs.map((p) => p.account_id),
+      currentPairs.map((p) => p.prev_as_of),
+      currentPairs.map((p) => p.as_of),
+      accountIds,
     ],
   );
 }

@@ -820,7 +820,7 @@ test(
 );
 
 test(
-  "verdicts for periods a departing snapshot bounded are deleted; a period still bounded by a row that stayed is not",
+  "verdicts for periods a departing snapshot bounded are deleted; a real period still bounded by a row that stayed survives, under whatever id the final recompute gives it",
   { skip },
   async (t) => {
     const { numbers, options } = duplicateCorpus();
@@ -831,6 +831,18 @@ test(
       (await one(client, "SELECT id FROM instruments WHERE symbol = $1", [symbol])).id;
     const sgh = await instrument("SGH"); // moves out of A
     const fke = await instrument("FKE"); // A keeps its own FKE position
+
+    // A's FKE position is otherwise stated only once (2025-02-28), which is
+    // no period at all. F1-72's whole-archive pass deletes any verdict that
+    // is not a currently evaluated period, departed snapshot or not, so a
+    // second, earlier stated FKE snapshot for A makes 2025-01-31..2025-02-28
+    // a real period -- the one this test needs to still exist afterward, not
+    // merely a row this suite invented.
+    await client.query(
+      `INSERT INTO positions (id, account_id, as_of, instrument_id, quantity, currency, row_hash)
+       VALUES ('pos_fke_opening', $1, '2025-01-31', $2, '11', 'USD', 'hash:pos_fke_opening')`,
+      [ACCOUNT_A.id, fke],
+    );
 
     // Two verdicts anchored on the departing SGH snapshot's own date -- the
     // periods that end and begin at it -- plus one anchored on the same date
@@ -868,15 +880,38 @@ test(
       /^verdicts deleted for periods that no longer exist: cash \d+ positions \d+$/m,
     );
 
-    const surviving = await all(
+    // The fabricated ids are gone either way: the two SGH ones because they
+    // departed, and v_keep_fke because the final whole-archive pass rewrites
+    // every row for a real period it recomputes, fabricated id included.
+    const survivingIds = await all(
       client,
       "SELECT id FROM position_reconciliations WHERE id = ANY($1::text[]) ORDER BY id",
       [verdicts.map(([id]) => id)],
     );
-    assert.deepEqual(
-      surviving.map((row) => row.id),
-      ["v_keep_fke"],
-      "only the periods bounded by a snapshot that actually left are deleted",
+    assert.deepEqual(survivingIds, [], "no fabricated id survives a recompute");
+
+    // What actually answers "only the periods bounded by a snapshot that
+    // left are gone": A's real FKE period is still there, under some id the
+    // whole-archive pass assigned it, and the SGH periods are not.
+    assert.equal(
+      await count(
+        client,
+        "position_reconciliations",
+        "WHERE account_id = $1 AND instrument_id = $2 AND period_start = $3 AND period_end = $4",
+        [ACCOUNT_A.id, fke, "2025-01-31", "2025-02-28"],
+      ),
+      1,
+      "A's real FKE period, still bounded by a position that stayed, survives",
+    );
+    assert.equal(
+      await count(
+        client,
+        "position_reconciliations",
+        "WHERE account_id = $1 AND instrument_id = $2",
+        [ACCOUNT_A.id, sgh],
+      ),
+      0,
+      "no period remains for the instrument that departed A",
     );
     assert.equal(
       await count(client, "reconciliations", "WHERE id = $1", ["v_cash"]),
