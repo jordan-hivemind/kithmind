@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createKithPool, newKithId } from "../dist/index.js";
+import { createKithPool, newKithId, provenance } from "../dist/index.js";
 import {
   MAX_INLINE_TEXT_CHUNK_UTF8_BYTES,
   planInlineText,
@@ -10,13 +10,17 @@ import {
 import {
   END_CURSOR,
   WorkerProtocolError,
+  appendWorkerScanPage,
+  beginWorkerScan,
   camelizeScan,
   consumeWorkerMutationRateLimit,
   decodeCursor,
   encodeCursor,
   keysetTail,
   requireWorkerSourceAccount,
+  reconcileWorkerScan,
   resolveAndPersistEntry,
+  sealWorkerScan,
   withWorkerTransaction,
   workerCtx,
 } from "../dist/workers/index.js";
@@ -337,6 +341,243 @@ test(
             ),
           NOW + 60_001,
         ),
+      );
+    } finally {
+      await pool.end();
+    }
+  },
+);
+
+test(
+  "scan operations replay safely, expire leases, and reconcile missing items",
+  { skip },
+  async (t) => {
+    const f = await fixture(t);
+    const pool = createKithPool(f.databaseUrl, 2);
+    const oldItem = await provenance.createOrGetSourceItem(f.client, {
+      spaceId: f.spaceId,
+      sourceAccountId: f.sourceAccountId,
+      externalId: "01890a5d-ac96-7cc4-bb7e-6f4f5ca5c140",
+      title: "Old",
+      docType: "text",
+      uri: "fs://synthetic/old.txt",
+    });
+    const call = (work, now = NOW) => withWorkerTransaction(pool, work, now);
+    try {
+      const beginRequest = {
+        protocolVersion: 1,
+        operation: "scan.begin",
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        requestId: "scan-begin-1",
+        watcherId: "watcher-1",
+        connectorVersion: "fs-v1",
+        mode: "normal",
+        expectedInventoryEpoch: 0,
+      };
+      const begun = await call((ctx) =>
+        beginWorkerScan(ctx, f.principal, beginRequest),
+      );
+      assert.equal(begun.reused, false);
+      assert.equal(begun.inventoryEpoch, 1);
+      assert.deepEqual(
+        await call((ctx) => beginWorkerScan(ctx, f.principal, beginRequest)),
+        { ...begun, reused: true },
+      );
+      await assert.rejects(
+        call((ctx) =>
+          beginWorkerScan(ctx, f.principal, {
+            ...beginRequest,
+            watcherId: "different-watcher",
+          }),
+        ),
+        expectProtocolCode("request_conflict"),
+      );
+
+      const appendRequest = {
+        protocolVersion: 1,
+        operation: "scan.appendPage",
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        scanId: begun.scanId,
+        requestId: "scan-page-1",
+        ordinal: 0,
+        entries: [readyEntry()],
+      };
+      const appended = await call((ctx) =>
+        appendWorkerScanPage(ctx, f.principal, appendRequest),
+      );
+      assert.equal(appended.reused, false);
+      assert.equal(appended.entries[0].state, "queued");
+      assert.deepEqual(
+        await call((ctx) =>
+          appendWorkerScanPage(ctx, f.principal, appendRequest),
+        ),
+        { ...appended, reused: true },
+      );
+
+      const sealRequest = {
+        protocolVersion: 1,
+        operation: "scan.seal",
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        scanId: begun.scanId,
+        requestId: "scan-seal-1",
+        expectedPageCount: 1,
+        health: { status: "healthy" },
+      };
+      assert.equal(
+        (await call((ctx) => sealWorkerScan(ctx, f.principal, sealRequest)))
+          .state,
+        "sealed",
+      );
+      assert.equal(
+        (await call((ctx) => sealWorkerScan(ctx, f.principal, sealRequest)))
+          .reused,
+        true,
+      );
+
+      const reconcileRequest = {
+        protocolVersion: 1,
+        operation: "scan.reconcile",
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        scanId: begun.scanId,
+        requestId: "scan-reconcile-1",
+        expectedInventoryEpoch: 1,
+        ordinal: 0,
+        maxItems: 10,
+      };
+      const reconciled = await call((ctx) =>
+        reconcileWorkerScan(ctx, f.principal, reconcileRequest),
+      );
+      assert.deepEqual(
+        {
+          state: reconciled.state,
+          unavailable: reconciled.unavailable,
+          done: reconciled.done,
+          reused: reconciled.reused,
+        },
+        { state: "enumerated", unavailable: 1, done: true, reused: false },
+      );
+      assert.equal(
+        (
+          await call((ctx) =>
+            reconcileWorkerScan(ctx, f.principal, reconcileRequest),
+          )
+        ).reused,
+        true,
+      );
+      assert.equal(
+        (
+          await f.client.query(
+            "SELECT lifecycle FROM kith.source_items WHERE id = $1",
+            [oldItem.id],
+          )
+        ).rows[0].lifecycle,
+        "unavailable",
+      );
+
+      const expired = await call(
+        (ctx) =>
+          beginWorkerScan(ctx, f.principal, {
+            ...beginRequest,
+            requestId: "scan-begin-expired",
+            expectedInventoryEpoch: 1,
+          }),
+        NOW + 1,
+      );
+      await assert.rejects(
+        call(
+          (ctx) =>
+            appendWorkerScanPage(ctx, f.principal, {
+              ...appendRequest,
+              scanId: expired.scanId,
+              requestId: "expired-page",
+            }),
+          NOW + 30 * 60 * 1_000 + 2,
+        ),
+        expectProtocolCode("scan_not_ready"),
+      );
+    } finally {
+      await pool.end();
+    }
+  },
+);
+
+test(
+  "a failed scan append rolls back its page, entry, and rate-limit unit",
+  { skip },
+  async (t) => {
+    const f = await fixture(t);
+    const pool = createKithPool(f.databaseUrl, 2);
+    const call = (work) => withWorkerTransaction(pool, work, NOW);
+    try {
+      const begun = await call((ctx) =>
+        beginWorkerScan(ctx, f.principal, {
+          protocolVersion: 1,
+          operation: "scan.begin",
+          spaceId: f.spaceId,
+          sourceAccountId: f.sourceAccountId,
+          requestId: "atomic-begin",
+          watcherId: "watcher-1",
+          connectorVersion: "fs-v1",
+          mode: "normal",
+          expectedInventoryEpoch: 0,
+        }),
+      );
+      const duplicateExternalId = "01890a5d-ac96-7cc4-bb7e-6f4f5ca5c141";
+      const first = await provenance.createOrGetSourceItem(f.client, {
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        externalId: duplicateExternalId,
+        title: "First",
+        docType: "text",
+        uri: "fs://synthetic/first.txt",
+      });
+      await f.client.query(
+        `INSERT INTO kith.source_items
+           (id, space_id, created_at, source_account_id, external_id_hash,
+            external_id, lifecycle, original_link_available,
+            desired_processing_epoch)
+         SELECT $1, space_id, transaction_timestamp(), source_account_id,
+                external_id_hash, external_id, 'available', true, 0
+           FROM kith.source_items WHERE id = $2`,
+        [newKithId(), first.id],
+      );
+      await assert.rejects(
+        call((ctx) =>
+          appendWorkerScanPage(ctx, f.principal, {
+            protocolVersion: 1,
+            operation: "scan.appendPage",
+            spaceId: f.spaceId,
+            sourceAccountId: f.sourceAccountId,
+            scanId: begun.scanId,
+            requestId: "atomic-page",
+            ordinal: 0,
+            entries: [readyEntry({ externalId: duplicateExternalId })],
+          }),
+        ),
+        expectProtocolCode("identity_review_required"),
+      );
+      assert.equal(
+        (
+          await f.client.query(
+            "SELECT count(*)::int AS count FROM kith.worker_scan_pages WHERE scan_id = $1",
+            [begun.scanId],
+          )
+        ).rows[0].count,
+        0,
+      );
+      assert.equal(
+        (
+          await f.client.query(
+            `SELECT count::int AS count FROM kith.worker_protocol_rate_limits
+              WHERE credential_id = $1 AND source_account_id = $2`,
+            [f.credential.id, f.sourceAccountId],
+          )
+        ).rows[0].count,
+        1,
       );
     } finally {
       await pool.end();

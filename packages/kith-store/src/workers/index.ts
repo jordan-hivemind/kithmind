@@ -12,6 +12,7 @@ export * from "./errors.js";
 export * from "./profile.js";
 export * from "./rateLimit.js";
 export * from "./rows.js";
+export * from "./scans.js";
 
 /**
  * Runs one worker operation with Convex-equivalent atomicity.
