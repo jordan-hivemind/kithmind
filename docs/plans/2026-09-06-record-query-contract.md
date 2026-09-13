@@ -15,6 +15,22 @@ after that transaction, after a visibility change, or for another request.
 Staging, publication, cards, query sessions and the query engine remain
 separate work.
 
+### PostgreSQL staging foundation (P2-39f2)
+
+`@repo/kith-store/records` also exports bounded record staging and complete
+generation validation. These are lower-level transaction APIs: the caller
+authenticates the actor, derives the authorized space from current grants, and
+runs every staging batch in a fresh `SERIALIZABLE` `withKithTransaction` call
+with lease fencing. Staging locks the source item before the generation so
+stable event identity is serialized across generations. A final transaction
+rechecks its fence, rereads and proves every stored row and its evidence, then
+publishes the generation. An earlier hydration cache is not valid proof.
+
+The existing lower-level generation activation can publish a validated record
+generation in that transaction. Connecting the document and card workers to
+this boundary, worker lease claims, card generation, routes, query sessions and
+the query engine remain separate components.
+
 ## Storage and publication
 
 | Record        | Identity and behavior                                                                |
@@ -58,15 +74,15 @@ field uses `<observationType>:<ordinal>` observation keys under one
 observation type, so `observation_history` lists every party, employer or
 payer in one call.
 
-| Constraint  | Cards                                                                                                                                                                            |
-| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Event kinds | Six added. Nothing is removed.                                                                                                                                                   |
-| Entity kind | `safe_note_card` is a person or organization. `tax_return_card`, `k1_card` and `brokerage_tax_package_card` are a person.                                                        |
-| Entity      | `document_card` and `spreadsheet_card` belong to the source account's configured `subjectEntityId`.                                                                              |
-| Value types | Money fields are `money`, rates are `decimal` with a unit code, clause flags are `boolean`, `tax_year` is `integer`, and a name field is always the literal `text` the document wrote. |
-| Bound entity | A resolved name sets `observations.boundEntityId` beside that literal value, never in place of it, so the evidenced name survives the binding (P2-70l, document cards section 4.4). |
-| Fields      | A field outside the kind's declared list is refused, as is a value of the wrong type.                                                                                            |
-| Evidence    | Every stored field binds to `evidenceSpans` rows. A field whose span does not resolve, or whose `quoteHash` does not match, is not stored at all, and the drop is recorded.      |
+| Constraint   | Cards                                                                                                                                                                                  |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Event kinds  | Six added. Nothing is removed.                                                                                                                                                         |
+| Entity kind  | `safe_note_card` is a person or organization. `tax_return_card`, `k1_card` and `brokerage_tax_package_card` are a person.                                                              |
+| Entity       | `document_card` and `spreadsheet_card` belong to the source account's configured `subjectEntityId`.                                                                                    |
+| Value types  | Money fields are `money`, rates are `decimal` with a unit code, clause flags are `boolean`, `tax_year` is `integer`, and a name field is always the literal `text` the document wrote. |
+| Bound entity | A resolved name sets `observations.boundEntityId` beside that literal value, never in place of it, so the evidenced name survives the binding (P2-70l, document cards section 4.4).    |
+| Fields       | A field outside the kind's declared list is refused, as is a value of the wrong type.                                                                                                  |
+| Evidence     | Every stored field binds to `evidenceSpans` rows. A field whose span does not resolve, or whose `quoteHash` does not match, is not stored at all, and the drop is recorded.            |
 
 A card version is a processing generation over the same source revision and
 the same sealed text version, taking a new record fingerprint built from the

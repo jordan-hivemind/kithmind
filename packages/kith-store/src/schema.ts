@@ -69,10 +69,7 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
   {
     version: 4,
     name: "@repo/kith-migrate's Convex-mapped tables (P2-39b)",
-    url: new URL(
-      "../migrations/004_kith_migrate_tables.sql",
-      import.meta.url,
-    ),
+    url: new URL("../migrations/004_kith_migrate_tables.sql", import.meta.url),
   },
   {
     version: 5,
@@ -106,6 +103,11 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
     version: 10,
     name: "worker processing: parsed staging constraints and lease claim indexes (P2-39e)",
     url: new URL("../migrations/010_worker_processing.sql", import.meta.url),
+  },
+  {
+    version: 11,
+    name: "record staging: stable identity and generation lookup indexes (P2-39f2)",
+    url: new URL("../migrations/011_record_staging.sql", import.meta.url),
   },
 ]);
 
