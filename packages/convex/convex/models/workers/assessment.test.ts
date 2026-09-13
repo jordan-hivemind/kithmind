@@ -1325,19 +1325,31 @@ describe("worker processing assessments", () => {
     return pending;
   }
 
-  test("fails the assessment closed on a retryable failure with no next attempt", async () => {
+  // P2-80h: the same invalid row that used to stale the whole assessment is
+  // now one unavailable item. The invariant it violates (a retryable failure
+  // names its next attempt) is proven in archivedDiscovery.test.ts.
+  test("counts a retryable failure with no next attempt as unavailable", async () => {
     const f = await fixture();
     const pending = await seedQueuedArchivedFailure(f, undefined);
-    const { result } = await completeAssessment(
+    const { begun, result } = await completeAssessment(
       f,
       pending.scanId,
       f.principal,
       "invalid-retryable-assessment",
     );
     expect(result).toMatchObject({
-      state: "stale",
-      staleReason: "detail_unavailable",
+      state: "incomplete",
+      counts: { items: { unavailable: 1, failed: 0, ready: 0 } },
     });
+    const stored = await f.t.run(async (ctx) =>
+      ctx.db.get(
+        ctx.db.normalizeId("workerProcessingAssessments", begun.assessmentId)!,
+      ),
+    );
+    // The entry is still accounted for, so the scan's own counters still prove
+    // the pass covered every entry.
+    expect(stored?.accountedScanEntries).toBe(1);
+    expect(stored?.queuedScanEntries).toBe(1);
   });
 
   test("counts a retryable archived parse failure behind a queued entry", async () => {
@@ -1475,7 +1487,9 @@ describe("worker processing assessments", () => {
     });
   });
 
-  test("fails closed when current source modification time disagrees with its entry", async () => {
+  // P2-80h: an item whose own chain does not hold together is one unavailable
+  // item, not a stale source.
+  test("counts an item whose modification time disagrees with its entry as unavailable", async () => {
     const f = await fixture();
     const scanId = await seedReadyMetadataRebind(f);
     await f.t.run(async (ctx) => {
@@ -1488,10 +1502,152 @@ describe("worker processing assessments", () => {
       if (!item) throw new Error("missing item");
       await ctx.db.patch(item._id, { workerSourceModifiedAt: 19 });
     });
-    const { result } = await completeAssessment(f, scanId);
+    const { begun, result } = await completeAssessment(f, scanId);
+    expect(result).toMatchObject({
+      state: "incomplete",
+      counts: { items: { unavailable: 1, ready: 0, needsReview: 0 } },
+    });
+    const stored = await f.t.run(async (ctx) =>
+      ctx.db.get(
+        ctx.db.normalizeId("workerProcessingAssessments", begun.assessmentId)!,
+      ),
+    );
+    expect(stored?.accountedScanEntries).toBe(1);
+    expect(stored?.unchangedScanEntries).toBe(1);
+  });
+
+  // P2-80h, the adopted contract: one unprovable item degrades to
+  // `counts.items.unavailable` and the assessment completes over the rest of
+  // the scan, while a source-level fault still stales the whole assessment.
+  test("degrades one unprovable item and still completes the scan", async () => {
+    const f = await fixture();
+    const scanId = await seedReadyMetadataRebind(f);
+    await f.t.run(async (ctx) => {
+      const scan = (await ctx.db.get(scanId))!;
+      const page = await ctx.db
+        .query("workerScanPages")
+        .withIndex("by_scanId", (q) => q.eq("scanId", scanId))
+        .unique();
+      if (!page) throw new Error("missing page");
+      const base = {
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        lifecycle: "available" as const,
+        originalLinkAvailable: true,
+        desiredProcessingEpoch: 0,
+        workerObservationEpoch: 1,
+        workerProcessingEpoch: 0,
+        workerLastSeenInventoryEpoch: 1,
+      };
+      const gapItemId = await ctx.db.insert("sourceItems", {
+        ...base,
+        externalIdHash: "7".repeat(64),
+        externalId: "01890a5d-ac96-7cc4-bb7e-6f4f5ca5c200",
+        title: "Gap",
+        docType: "text",
+        uri: "fs://gap.txt",
+      });
+      // No revision or generation, so this item is not terminally ready and its
+      // `unchanged` entry carries no discovery work: `classifyItem` raises
+      // scan_conflict on it, which used to stale every later assessment.
+      const unprovableItemId = await ctx.db.insert("sourceItems", {
+        ...base,
+        externalIdHash: "8".repeat(64),
+        externalId: "01890a5d-ac96-7cc4-bb7e-6f4f5ca5c201",
+        title: "Unprovable",
+        docType: "text",
+        uri: "fs://unprovable.txt",
+      });
+      const entry = {
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        scanId,
+        scanPageId: page._id,
+        uriDigest: "u".repeat(64),
+        inventoryMetadataDigest: "i".repeat(64),
+        sourceModifiedAt: 20,
+        observationEpoch: 1,
+        processingEpoch: 0,
+        observedAt: 80,
+        retireAt: 100_000,
+      };
+      await ctx.db.insert("workerScanEntries", {
+        ...entry,
+        sourceItemId: gapItemId,
+        identityKeyHash: "7".repeat(64),
+        externalIdHash: "7".repeat(64),
+        state: "gap",
+        issueCode: "unreadable",
+      });
+      await ctx.db.insert("workerScanEntries", {
+        ...entry,
+        sourceItemId: unprovableItemId,
+        identityKeyHash: "8".repeat(64),
+        externalIdHash: "8".repeat(64),
+        state: "unchanged",
+      });
+      await ctx.db.patch(page._id, { entryCount: 3 });
+      await ctx.db.patch(scanId, {
+        entryCount: scan.entryCount + 2,
+        gapCount: scan.gapCount + 1,
+      });
+    });
+    const { begun, result } = await completeAssessment(
+      f,
+      scanId,
+      f.principal,
+      "degraded-item-assessment",
+    );
+    expect(result).toMatchObject({
+      state: "incomplete",
+      counts: {
+        items: {
+          ready: 1,
+          explicitGap: 1,
+          unavailable: 1,
+          pending: 0,
+          failed: 0,
+          needsReview: 0,
+        },
+        unresolvedEntries: { needsReview: 0, ignoredForgotten: 0 },
+      },
+    });
+    const stored = await f.t.run(async (ctx) =>
+      ctx.db.get(
+        ctx.db.normalizeId("workerProcessingAssessments", begun.assessmentId)!,
+      ),
+    );
+    // Every entry is still accounted for, and against the scan's own counters.
+    expect(stored?.accountedScanEntries).toBe(3);
+    expect(stored?.gapScanEntries).toBe(1);
+    expect(stored?.unchangedScanEntries).toBe(2);
+  });
+
+  test("still stales the whole assessment on a source-level fault", async () => {
+    const f = await fixture();
+    const scanId = await seedReadyMetadataRebind(f);
+    const begun = await f.t.run((ctx) =>
+      beginProcessingAssessment(
+        ctx,
+        f.principal,
+        namedAssessBeginRequest(f, scanId, "source-fault-assessment"),
+        200,
+      ),
+    );
+    await f.t.run((ctx) =>
+      ctx.db.patch(f.sourceAccountId, { manifestVersion: 2 }),
+    );
+    const result = await f.t.run((ctx) =>
+      advanceProcessingAssessment(
+        ctx,
+        f.principal,
+        assessPageRequest(f, begun.assessmentId, 0),
+        201,
+      ),
+    );
     expect(result).toMatchObject({
       state: "stale",
-      staleReason: "detail_unavailable",
+      staleReason: "source_changed",
     });
   });
 
@@ -1544,14 +1700,22 @@ describe("worker processing assessments", () => {
           });
         }
       });
-      const result = await f.t.run((ctx) =>
-        advanceProcessingAssessment(
-          ctx,
-          f.principal,
-          assessPageRequest(f, begun.assessmentId, 0),
-          201,
-        ),
-      );
+      // P2-80h: a per-item throw degrades to one unavailable item, so a
+      // deleted entry now stales at finalization instead, where the scan's own
+      // counters prove the pass could not account for every entry. Cross-parent
+      // detail and an unsafe counter still stale on the page that reads them.
+      let result;
+      for (let ordinal = 0; ordinal < 5; ordinal += 1) {
+        result = await f.t.run((ctx) =>
+          advanceProcessingAssessment(
+            ctx,
+            f.principal,
+            assessPageRequest(f, begun.assessmentId, ordinal),
+            201 + ordinal,
+          ),
+        );
+        if (result.state !== "running") break;
+      }
       expect(result).toMatchObject({
         state: "stale",
         staleReason: "detail_unavailable",
