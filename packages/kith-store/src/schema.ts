@@ -84,6 +84,11 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
     name: "identity: plain spaces and api_keys names, domain constraints, sessions (P2-39c)",
     url: new URL("../migrations/006_identity.sql", import.meta.url),
   },
+  {
+    version: 7,
+    name: "memory: entities, facts and thoughts domain constraints and indexes (P2-39h)",
+    url: new URL("../migrations/007_memory.sql", import.meta.url),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */
