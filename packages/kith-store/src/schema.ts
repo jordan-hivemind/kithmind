@@ -84,8 +84,14 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
     name: "identity: plain spaces and api_keys names, domain constraints, sessions (P2-39c)",
     url: new URL("../migrations/006_identity.sql", import.meta.url),
   },
-  // P2-39d2 owns migration 007. This branch must merge that migration before
-  // this entry can be applied, keeping the schema history contiguous.
+  {
+    version: 7,
+    name: "source_items.card_doc_type and chunks.text_search: columns kith-migrate's snapshot lacked (P2-39d2)",
+    url: new URL(
+      "../migrations/007_parsed_staging_documents.sql",
+      import.meta.url,
+    ),
+  },
   {
     version: 8,
     name: "worker protocol: scan, discovery and receipt constraints and indexes (P2-39e)",
