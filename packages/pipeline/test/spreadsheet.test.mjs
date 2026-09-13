@@ -275,6 +275,15 @@ test("a row or column index past its bound is refused", () => {
   );
 });
 
+test("empty formatted cells outside the grid are ignored, but values and formulas are refused", () => {
+  const { maxColumnsPerSheet } = SPREADSHEET_V1_BOUNDS;
+  const beyond = `${COLUMN_NAME(maxColumnsPerSheet)}1`;
+  const sheet = (cell) => workbookOf([{ name: "S", xml: `<?xml version="1.0"?><worksheet><sheetData><row r="1">${cell}</row></sheetData></worksheet>` }]);
+  assert.doesNotThrow(() => readWorkbook(sheet(`<c r="${beyond}" s="1"/>`)));
+  assert.equal(refusal(sheet(`<c r="${beyond}"><v>1</v></c>`)), "oversized");
+  assert.equal(refusal(sheet(`<c r="${beyond}"><f>SUM(A1:A1)</f></c>`)), "oversized");
+});
+
 test("the total rendered text bound refuses what no text version could hold", () => {
   const { maxRenderedBytes, maxSheetPageChars } = SPREADSHEET_V1_BOUNDS;
   // Each sheet renders about 10.4 KiB, so 64 of them stay under the bound.
