@@ -11,6 +11,11 @@
       "types": "./src/index.ts",
       "node": "./dist/index.js",
       "default": "./src/index.ts"
+    },
+    "./identity": {
+      "types": "./src/identity/index.ts",
+      "node": "./dist/identity/index.js",
+      "default": "./src/identity/index.ts"
     }
   },
   "scripts": {

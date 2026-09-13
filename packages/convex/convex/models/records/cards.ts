@@ -786,6 +786,80 @@ export const recordSkippedCardAttempt = internalMutation({
 });
 
 /**
+ * The run failed as a whole, so the row names the run rather than one of the
+ * card's fields. Not a declared card field, so it can never be mistaken for
+ * one in a per-field report.
+ */
+export const CARD_EXTRACTION_ERROR_FIELD_KEY = "card_extraction";
+
+/**
+ * P2-86. A ladder run that ended by raising instead of returning an outcome
+ * used to leave no row at all: the queue counted it and moved on, so the
+ * document was invisible to `list_review_queue` and `rerunGateFailed` could
+ * never re-offer it. This writes the two rows every other non-publishing
+ * outcome writes, so a raised run is exactly as visible as a gate rejection.
+ *
+ * The drop is an ordinary `card_gate_failed` row rather than a new drop kind:
+ * the review surface pages a drop class by `kind` against the closed
+ * `ReviewQueueClass` set and already reports each row's `code`, so a new kind
+ * would need a validator, a class and an MCP surface change to be visible at
+ * all, while `code` (one of `classifyQueueTickFailure`'s two closed codes)
+ * distinguishes it with none. `hasReviewItem` and `rerunGateFailed` then treat
+ * it correctly with no change either.
+ *
+ * `errorName` is the raised error's constructor name, never its message: a
+ * message is not guaranteed to be free of document content.
+ */
+export async function recordCardExtractionError(
+  ctx: MutationCtx,
+  input: {
+    sourceItemId: Id<"sourceItems">;
+    recordKind: CardRecordKind;
+    fingerprint: CardExtractionFingerprint;
+    errorCode: string;
+    errorName?: string;
+    now: number;
+  },
+): Promise<{ recorded: boolean }> {
+  const item = await ctx.db.get(input.sourceItemId);
+  // Never raises: this runs inside the queue's own failure path, where a
+  // second raise would abandon the claimed document all over again.
+  if (!item || !item.activeGenerationId) return { recorded: false };
+  await recordAttempt(ctx, {
+    spaceId: item.spaceId,
+    sourceAccountId: item.sourceAccountId,
+    sourceItemId: item._id,
+    recordKind: input.recordKind,
+    fingerprint: input.fingerprint,
+    now: input.now,
+    // The run produced no candidate, so no field passed, dropped or failed
+    // the gate; `failureCodes` carries the closed error code instead, which
+    // is what tells this row apart from a real gate rejection at this step.
+    outcome: "review",
+    passedFieldCount: 0,
+    droppedFieldCount: 0,
+    failures: [{ key: CARD_EXTRACTION_ERROR_FIELD_KEY, code: input.errorCode }],
+  });
+  await recordDrops(ctx, {
+    spaceId: item.spaceId,
+    sourceAccountId: item.sourceAccountId,
+    sourceItemId: item._id,
+    processingGenerationId: item.activeGenerationId,
+    recordKind: input.recordKind,
+    now: input.now,
+    kind: "card_gate_failed",
+    drops: [
+      {
+        key: CARD_EXTRACTION_ERROR_FIELD_KEY,
+        code: input.errorCode,
+        reason: input.errorName ?? input.errorCode,
+      },
+    ],
+  });
+  return { recorded: true };
+}
+
+/**
  * Atomic activation without a worker lease. The item keeps its active text
  * generation and gains an active card generation; the previous card
  * generation is retired so its versions stay snapshot readable. No document

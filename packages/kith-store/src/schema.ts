@@ -81,9 +81,14 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
   },
   {
     version: 6,
-    name: "source_items.card_doc_type and chunks.text_search: two columns kith-migrate's snapshot lacked (P2-39d2). Filed as 006 rather than the task brief's 007: no migration 006 existed on origin/main at rebase time, and the runner below refuses a version gap, so this is the next free number -- whichever of this row or the parallel P2-39c identity port (which AGENTS.md reserves 006 for) merges second must renumber its own migration to stay gapless.",
+    name: "identity: plain spaces and api_keys names, domain constraints, sessions (P2-39c)",
+    url: new URL("../migrations/006_identity.sql", import.meta.url),
+  },
+  {
+    version: 7,
+    name: "source_items.card_doc_type and chunks.text_search: columns kith-migrate's snapshot lacked (P2-39d2)",
     url: new URL(
-      "../migrations/006_parsed_staging_documents.sql",
+      "../migrations/007_parsed_staging_documents.sql",
       import.meta.url,
     ),
   },

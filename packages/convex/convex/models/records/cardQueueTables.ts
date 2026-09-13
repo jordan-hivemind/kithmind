@@ -51,6 +51,17 @@ export const cardExtractionQueueStateFields = {
    * exactly where it was and the same document is reconsidered on replay.
    */
   cursor: v.union(v.number(), v.null()),
+  /**
+   * P2-85. The cursor is forward-only, so a document whose retained text was
+   * not ready yet (or which was skipped for a then-true reason) when the
+   * cursor passed it was never reconsidered. Set when a sweep that reached
+   * the end with nothing claimable rewound the cursor to null, and cleared by
+   * the next recorded outcome that changed anything, so exactly one rewind is
+   * allowed per sweep that did real work: a rewound sweep that also finds
+   * nothing goes idle instead of spinning. Optional because a queue that has
+   * never rewound has no such timestamp.
+   */
+  cursorRewoundAt: v.optional(v.number()),
   dailyDocumentBudget: v.number(),
   weeklyDocumentBudget: v.number(),
   weeklyCostBudgetMicroUsd: v.number(),

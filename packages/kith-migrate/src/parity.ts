@@ -18,8 +18,8 @@ export type ParityCheckResult = {
 export type ParityReport = {
   results: ParityCheckResult[];
   /** true only when every non-pending check passed. Pending checks never
-   * fail a report on their own (plan section 3 step 5's six checks; this
-   * row implements four and stubs two pending P2-39c, see the PR). */
+   * fail a report on their own (plan section 3 step 5's six checks; check 6's
+   * surface arrived with P2-39c and check 5 still needs the archive catalog). */
   ok: boolean;
 };
 
@@ -248,9 +248,12 @@ async function checkArchiveReferences(
  * Check 6, plan step 5 ("Auth denial" and the read-API half of "Space
  * isolation"): revoked-key denial, write-scope denial, cross-space denial,
  * removed-member denial, stale-session denial, and "the read API returns
- * nothing cross-space". All five need the session/credential/read surface
- * P2-39c builds. The interface is defined here so that row's tests can call
- * straight into this harness; until it lands this check is `pending`.
+ * nothing cross-space". All of them need the session/credential/read surface
+ * P2-39c builds, and it supplies one: `authDenialSurfaceOnPool` in
+ * `@repo/kith-store/identity` implements exactly these six predicates against the
+ * loaded database, each in its own rolled-back transaction. The interface stays
+ * declared here, so a caller that has no such surface still gets `pending` rather
+ * than a silent pass.
  */
 export type AuthDenialSurface = {
   revokedKeyDenied(): Promise<boolean>;

@@ -6,6 +6,9 @@ import test from "node:test";
 
 import pg from "pg";
 
+import { createKithPool } from "@repo/kith-store";
+import { authDenialSurfaceOnPool } from "@repo/kith-store/identity";
+
 import {
   exportConvexData,
   loadCsvDirectory,
@@ -41,12 +44,23 @@ test("export, transform, COPY-load and the parity harness round-trip on a throwa
 
     await loadCsvDirectory({ connectionString: database.connectionString }, csvDir);
 
-    const report = await runParityChecks({
-      connectionString: database.connectionString,
-      exportDir,
-      manifest,
-      transformReport,
-    });
+    // Check 6's surface, supplied by P2-39c. It drives the real identity
+    // functions against the loaded database, so the six denials are proven on the
+    // schema the migration produced rather than on a fixture.
+    const pool = createKithPool(database.connectionString, 2);
+    pool.on("error", () => {});
+    let report;
+    try {
+      report = await runParityChecks({
+        connectionString: database.connectionString,
+        exportDir,
+        manifest,
+        transformReport,
+        authDenialSurface: authDenialSurfaceOnPool(pool),
+      });
+    } finally {
+      await pool.end().catch(() => {});
+    }
 
     const byName = Object.fromEntries(report.results.map((r) => [r.name, r]));
     assert.equal(byName.counts.status, "pass", JSON.stringify(byName.counts.details));
@@ -66,7 +80,11 @@ test("export, transform, COPY-load and the parity harness round-trip on a throwa
       JSON.stringify(byName.space_isolation_data.details),
     );
     assert.equal(byName.archive_references.status, "pending");
-    assert.equal(byName.auth_denial_and_space_isolation_read_api.status, "pending");
+    assert.equal(
+      byName.auth_denial_and_space_isolation_read_api.status,
+      "pass",
+      JSON.stringify(byName.auth_denial_and_space_isolation_read_api.details),
+    );
     assert.equal(report.ok, true);
   } finally {
     await database.cleanup();

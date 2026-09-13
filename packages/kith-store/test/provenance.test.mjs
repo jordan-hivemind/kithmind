@@ -14,7 +14,7 @@
 // kithSchema.test.mjs does.
 
 import assert from "node:assert/strict";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import test from "node:test";
 
 import { applyKithSchema, newKithId } from "../dist/index.js";
@@ -63,7 +63,7 @@ async function seedGeneration(client, input) {
 }
 
 // The four tables outside this row's ownership that its foreign keys point
-// at (source_accounts: ingestion/P2-39e; users, brain_api_keys: identity/
+// at (source_accounts: ingestion/P2-39e; users, api_keys: identity/
 // P2-39c; worker_source_scans: ingestion/P2-39e). Every FK migration 004
 // added is DEFERRABLE INITIALLY DEFERRED, but each fixture call below still
 // runs in its own implicit autocommit transaction, so the referenced row
@@ -89,9 +89,16 @@ async function seedUser(client) {
 
 async function seedApiKey(client) {
   const id = opaqueId();
+  // `kith.api_keys`, not `kith.brain_api_keys`: migration 006 (P2-39c) gave the
+  // plain name to the kith_id-keyed table. That migration also makes `user_id`,
+  // `key_hash`, `key_prefix` and `name` required, so a credential fixture now has
+  // to be a credential -- a key with no owner and no hash authenticates nothing
+  // and should not be representable.
   await client.query(
-    "INSERT INTO kith.brain_api_keys (id, created_at) VALUES ($1,transaction_timestamp())",
-    [id],
+    `INSERT INTO kith.api_keys
+       (id, created_at, user_id, key_hash, key_prefix, name)
+       VALUES ($1, transaction_timestamp(), $2, $3, 'ob_prov', 'provenance fixture')`,
+    [id, await seedUser(client), createHash("sha256").update(id).digest("hex")],
   );
   return id;
 }

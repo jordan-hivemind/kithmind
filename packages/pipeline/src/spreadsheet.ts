@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { inflateRawSync } from "node:zlib";
 
 import {
@@ -70,6 +71,54 @@ export const {
 
 /** Per XML part, inflated. A workbook part past this is refused, not grown. */
 const MAX_PART_BYTES = 8 * 1_024 * 1_024;
+
+/**
+ * P2-70i3: the reader's version constant, and the parser identity derived
+ * from it.
+ *
+ * The PDF class takes its parser fingerprint from a pinned Python runtime and
+ * a hashed model manifest. This reader has neither: it is this file, running
+ * in the worker's own process. What can change what it produces from the same
+ * bytes is this version string, the rendering rule it renders under, and the
+ * bounds it refuses past, so those three are what the fingerprint covers.
+ * Bump `SPREADSHEET_READER_VERSION` whenever the rendering changes, which
+ * changes the fingerprint, which makes every affected document a new
+ * processing generation rather than a silent reinterpretation of an old one.
+ */
+export const SPREADSHEET_READER_VERSION = "kithmind_xlsx_reader_v1";
+
+function readerDigest(domain: string, value: unknown): string {
+  return createHash("sha256")
+    .update(`${domain}\0`, "utf8")
+    .update(JSON.stringify(value), "utf8")
+    .digest("hex");
+}
+
+export const SPREADSHEET_PARSER_FINGERPRINT = readerDigest(
+  "kith-spreadsheet-parser:v1",
+  [
+    "spreadsheet_v1",
+    SPREADSHEET_READER_VERSION,
+    SHEET_PAGE_RENDERING_VERSION,
+    SPREADSHEET_V1_BOUNDS,
+  ],
+);
+
+export const SPREADSHEET_EXTRACTION_CONFIGURATION_FINGERPRINT = readerDigest(
+  "kith-spreadsheet-extraction-config:v1",
+  [SPREADSHEET_PARSER_FINGERPRINT, SHEET_PAGE_RENDERING_VERSION],
+);
+
+/**
+ * The archived-binary lane records a `modelManifestSha256` for every parser
+ * output. A lane with no model assets still has to fill it, so it carries the
+ * digest of the reader's version constant: the thing that plays the manifest's
+ * role here, which is naming what produced the bytes.
+ */
+export const SPREADSHEET_READER_MANIFEST_SHA256 = readerDigest(
+  "kith-spreadsheet-reader-manifest:v1",
+  SPREADSHEET_READER_VERSION,
+);
 
 const LOCAL_HEADER_SIGNATURE = 0x04034b50;
 const CENTRAL_HEADER_SIGNATURE = 0x02014b50;

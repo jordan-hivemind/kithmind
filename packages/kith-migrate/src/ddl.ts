@@ -36,6 +36,36 @@ function spaceScopedByPgName(): Map<string, boolean> {
 }
 
 /**
+ * The name migration 4 creates a table under, which is not always the name the
+ * table ends up with.
+ *
+ * Migration 1 held `kith.spaces` and `kith.api_keys` as `uuid`-keyed prototype
+ * tables, so migration 4 had to create the Convex-mapped pair as `brain_spaces`
+ * and `brain_api_keys` to get past them. Migration 6 (P2-39c) retires the
+ * prototype's claim on those two names -- its tables become `proof_spaces` and
+ * `proof_api_keys` -- and renames these to the plain ones, because the plan's
+ * convention is that a kith table is keyed by the preserved Convex id.
+ *
+ * The mapping lives here rather than in `TABLES` so exactly one thing is true of
+ * `TableSpec.pg`: it is the name the table has once the schema is fully migrated.
+ * That is the name the transform, the COPY loader and the parity harness need,
+ * because they run against a fully migrated database. Only this generator needs
+ * the interim name, and only so migration 4's committed bytes do not change.
+ *
+ * `documents`, `source_revisions` and `chunks` are still prefixed in `TABLES`
+ * itself: P2-39d retires the prototype's claim on those three.
+ */
+const MIGRATION_4_NAME: Record<string, string> = {
+  spaces: "brain_spaces",
+  api_keys: "brain_api_keys",
+};
+
+/** The name migration 4 creates `pg` under. Usually `pg` itself. */
+export function migration4TableName(pg: string): string {
+  return MIGRATION_4_NAME[pg] ?? pg;
+}
+
+/**
  * Generates the table-and-foreign-key SQL body for `TABLES`, the same
  * declarative mapping `transform.ts` reads, so the DDL and the transform
  * cannot drift (this row's acceptance requirement, plan section 3 step 3).
@@ -68,8 +98,12 @@ function spaceScopedByPgName(): Map<string, boolean> {
  * names win for now; this row's Convex-mapped versions of the same five
  * domains land under a `brain_` prefix (`kith.brain_spaces`, and so on) so
  * the full 70-table pipeline still proves out end-to-end without touching or
- * risking kith-store's tested schema. P2-39c/P2-39d should absorb or rename
- * these into the final `kith.<name>` when they land.
+ * risking kith-store's tested schema. Two of those five are settled by
+ * migration 6 (P2-39c), which renames the prototype's pair to `proof_spaces` and
+ * `proof_api_keys` and promotes `brain_spaces` and `brain_api_keys` to the plain
+ * names, so `TABLES` now carries the plain names for those two and
+ * `migration4TableName` above holds the interim ones this file still emits.
+ * `documents`, `source_revisions` and `chunks` stay prefixed for P2-39d.
  */
 export function generateKithMigrateTablesSql(): string {
   const scoped = spaceScopedByPgName();
@@ -87,7 +121,7 @@ export function generateKithMigrateTablesSql(): string {
     }
     statements.push(
       "",
-      `CREATE TABLE kith.${q(t.pg)} (`,
+      `CREATE TABLE kith.${q(migration4TableName(t.pg))} (`,
       lines.join(",\n"),
       ");",
     );
@@ -113,19 +147,19 @@ export function generateKithMigrateTablesSql(): string {
     for (const c of t.columns) {
       if (c.kind !== "ref" || !c.refTable) continue;
       const targetScoped = scoped.get(c.refTable) ?? false;
-      const name = constraintName(`${t.pg}_${c.pg}_fkey`);
+      const name = constraintName(`${migration4TableName(t.pg)}_${c.pg}_fkey`);
       if (targetScoped && t.spaceScoped) {
         statements.push(
           "",
-          `ALTER TABLE kith.${q(t.pg)} ADD CONSTRAINT ${q(name)}`,
-          `  FOREIGN KEY (${q(c.pg)}, ${q("space_id")}) REFERENCES kith.${q(c.refTable)} (${q("id")}, ${q("space_id")})`,
+          `ALTER TABLE kith.${q(migration4TableName(t.pg))} ADD CONSTRAINT ${q(name)}`,
+          `  FOREIGN KEY (${q(c.pg)}, ${q("space_id")}) REFERENCES kith.${q(migration4TableName(c.refTable))} (${q("id")}, ${q("space_id")})`,
           "  DEFERRABLE INITIALLY DEFERRED;",
         );
       } else {
         statements.push(
           "",
-          `ALTER TABLE kith.${q(t.pg)} ADD CONSTRAINT ${q(name)}`,
-          `  FOREIGN KEY (${q(c.pg)}) REFERENCES kith.${q(c.refTable)} (${q("id")})`,
+          `ALTER TABLE kith.${q(migration4TableName(t.pg))} ADD CONSTRAINT ${q(name)}`,
+          `  FOREIGN KEY (${q(c.pg)}) REFERENCES kith.${q(migration4TableName(c.refTable))} (${q("id")})`,
           "  DEFERRABLE INITIALLY DEFERRED;",
         );
       }
@@ -134,11 +168,11 @@ export function generateKithMigrateTablesSql(): string {
       statements.push(
         "",
         `ALTER TABLE kith.${q(child.pg)} ADD CONSTRAINT ${q(`${child.pg}_parent_fkey`)}`,
-        `  FOREIGN KEY (${q(child.parentColumn)}) REFERENCES kith.${q(t.pg)} (${q("id")})`,
+        `  FOREIGN KEY (${q(child.parentColumn)}) REFERENCES kith.${q(migration4TableName(t.pg))} (${q("id")})`,
         "  DEFERRABLE INITIALLY DEFERRED;",
         "",
         `ALTER TABLE kith.${q(child.pg)} ADD CONSTRAINT ${q(`${child.pg}_value_fkey`)}`,
-        `  FOREIGN KEY (${q(child.valueColumn)}) REFERENCES kith.${q(child.valueRefTable)} (${q("id")})`,
+        `  FOREIGN KEY (${q(child.valueColumn)}) REFERENCES kith.${q(migration4TableName(child.valueRefTable))} (${q("id")})`,
         "  DEFERRABLE INITIALLY DEFERRED;",
       );
     }

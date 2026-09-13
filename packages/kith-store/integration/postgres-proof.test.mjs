@@ -11,6 +11,7 @@ import test from "node:test";
 import pg from "pg";
 
 import {
+  KITH_MIGRATIONS,
   PostgresProof,
   ProofError,
   addSyntheticApiKey,
@@ -412,7 +413,7 @@ test(
 
     const beforeState = await owner.query(
       `SELECT
-      (SELECT count(*)::int FROM kith.api_keys WHERE revoked_at IS NOT NULL) AS revoked_keys,
+      (SELECT count(*)::int FROM kith.proof_api_keys WHERE revoked_at IS NOT NULL) AS revoked_keys,
       (SELECT count(*)::int FROM kith.worker_jobs WHERE state='succeeded') AS succeeded_jobs,
       (SELECT count(*)::int FROM kith.worker_jobs WHERE state='failed') AS failed_jobs`,
     );
@@ -443,7 +444,7 @@ test(
     const restoredProof = new PostgresProof(restoredApp);
     const afterState = await restoredOwner.query(
       `SELECT
-      (SELECT count(*)::int FROM kith.api_keys WHERE revoked_at IS NOT NULL) AS revoked_keys,
+      (SELECT count(*)::int FROM kith.proof_api_keys WHERE revoked_at IS NOT NULL) AS revoked_keys,
       (SELECT count(*)::int FROM kith.worker_jobs WHERE state='succeeded') AS succeeded_jobs,
       (SELECT count(*)::int FROM kith.worker_jobs WHERE state='failed') AS failed_jobs`,
     );
@@ -458,7 +459,7 @@ test(
     );
     await restoredOwner.query("DROP TABLE kith.worker_jobs");
     await restoredOwner.query(
-      "ALTER TABLE kith.api_keys DROP CONSTRAINT api_keys_id_space_unique",
+      "ALTER TABLE kith.proof_api_keys DROP CONSTRAINT api_keys_id_space_unique",
     );
     // Undo migration 4 too: every table it created (P2-39b's Convex-mapped
     // tables) declares its id, space_id and reference columns over the
@@ -475,6 +476,15 @@ test(
         .join(", ");
       await restoredOwner.query(`DROP TABLE ${names} CASCADE`);
     }
+    // Undo migration 6's renames as well. It gave the plain `spaces` and
+    // `api_keys` names to the kith_id-keyed tables (just dropped above) and moved
+    // the prototype's uuid-keyed pair to `proof_*`. A database genuinely at
+    // version 1 has them under the plain names, and migration 2 alters
+    // `kith.api_keys`, so the replay needs them back.
+    await restoredOwner.query("ALTER TABLE kith.proof_spaces RENAME TO spaces");
+    await restoredOwner.query(
+      "ALTER TABLE kith.proof_api_keys RENAME TO api_keys",
+    );
     await restoredOwner.query("DROP DOMAIN kith.kith_id");
     await restoredOwner.query(
       "DELETE FROM kith.schema_version WHERE version > 1",
@@ -483,9 +493,12 @@ test(
     const upgradedVersions = await restoredOwner.query(
       "SELECT version::int AS version FROM kith.schema_version ORDER BY version",
     );
+    // Derived from the registered chain rather than written out, so a row that
+    // adds a migration does not have to edit this assertion (and cannot conflict
+    // with another row over it).
     assert.deepEqual(
       upgradedVersions.rows.map((row) => row.version),
-      [1, 2, 3, 4, 5, 6],
+      KITH_MIGRATIONS.map((migration) => migration.version),
     );
     // A gap rather than a rollback: version 1 missing while 2 and 3 are
     // recorded is a history no build can migrate from, and guessing is how a

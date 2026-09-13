@@ -477,6 +477,7 @@ describe("requeueFailedDiscoveryWork", () => {
       examined: 3,
       requeued: 2,
       skippedAttemptLimit: 1,
+      resetAtLimit: 0,
       byPriorState: { failed: 2, needs_review: 1 },
     });
     // Dry run changes nothing.
@@ -497,6 +498,7 @@ describe("requeueFailedDiscoveryWork", () => {
       examined: 3,
       requeued: 2,
       skippedAttemptLimit: 1,
+      resetAtLimit: 0,
       byPriorState: { failed: 2, needs_review: 1 },
     });
 
@@ -544,8 +546,52 @@ describe("requeueFailedDiscoveryWork", () => {
       examined: 1,
       requeued: 0,
       skippedAttemptLimit: 1,
+      resetAtLimit: 0,
       byPriorState: { failed: 1, needs_review: 0 },
     });
+  });
+
+  it("resets attempts on a capped row when resetAttempts is set, leaving a non-capped row's requeue unaffected", async () => {
+    const { t, sourceAccountId, belowLimitFailed, atLimitFailed } =
+      await requeueFixture();
+
+    const result = await t.run((ctx) =>
+      requeueFailedDiscoveryWorkPage(ctx, {
+        sourceAccountId,
+        dryRun: false,
+        limit: 50,
+        now: 700,
+        resetAttempts: true,
+      }),
+    );
+    expect(result).toEqual({
+      examined: 3,
+      requeued: 3,
+      skippedAttemptLimit: 0,
+      resetAtLimit: 1,
+      byPriorState: { failed: 2, needs_review: 1 },
+    });
+
+    const resetRow = await t.run((ctx) => ctx.db.get(atLimitFailed));
+    expect(resetRow).toMatchObject({
+      state: "queued",
+      nextAttemptAt: 700,
+      attempts: 0,
+      retryable: true,
+    });
+    expect(resetRow?.leaseToken).toBeUndefined();
+    expect(resetRow?.leaseOwnerCredentialId).toBeUndefined();
+    expect(resetRow?.leaseExpiresAt).toBeUndefined();
+    expect(resetRow?.failureCode).toBeUndefined();
+
+    // A row below the cap requeues the same way regardless of the flag.
+    const requeuedFailed = await t.run((ctx) => ctx.db.get(belowLimitFailed));
+    expect(requeuedFailed).toMatchObject({
+      state: "queued",
+      nextAttemptAt: 700,
+      attempts: MAX_WORKER_DISCOVERY_ATTEMPTS - 1,
+    });
+    expect(requeuedFailed?.retryable).toBeUndefined();
   });
 
   it("rejects an out-of-range limit", async () => {

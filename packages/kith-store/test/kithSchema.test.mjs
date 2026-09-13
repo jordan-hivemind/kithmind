@@ -35,15 +35,32 @@ import {
 } from "./helpers/pgDatabase.mjs";
 
 const KITH_TABLES = [
+  // The plain names belong to the `kith_id`-keyed ported tables (migration 006);
+  // the prototype's `uuid`-keyed pair kept the same names until then and now
+  // carries a `proof_` prefix.
   "spaces",
   "api_keys",
   "worker_jobs",
+  // P2-39c (migration 006): the prototype's uuid-keyed pair moved to `proof_*`
+  // so the plain `spaces` and `api_keys` above are migration 004's kith_id-keyed
+  // tables, and the rest of the identity domain lands with them.
+  "proof_spaces",
+  "proof_api_keys",
+  "sessions",
+  "users",
+  "auth_accounts",
+  "space_members",
+  "user_space_settings",
+  "api_key_spaces",
+  "api_key_source_accounts",
+  "family_invitations",
+  "consumed_oauth_codes",
   // P2-39d (migration 005): retires the prototype's uuid-keyed documents,
   // source_revisions and chunks (migration 001) and frees their names for
   // migration 004's kith_id-keyed brain_documents, brain_source_revisions
-  // and brain_chunks, renamed here to the plain names below. idempotency_receipts
+  // and brain_chunks, renamed there to the plain names below. idempotency_receipts
   // is retired with them: its operation CHECK named only the three document
-  // methods this row retired from `PostgresProof`.
+  // methods that row retired from `PostgresProof`.
   "source_items",
   "source_revisions",
   "source_parser_artifacts",

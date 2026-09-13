@@ -10,7 +10,8 @@
 -- version 6 present would fail `applyKithSchema` immediately, on this branch,
 -- for every test. 006 is the next free number in practice, so this uses it
 -- and is named accordingly; whichever of P2-39c or this row merges second
--- must rebase and renumber its own migration to keep the sequence gapless
+-- must rebase and renumber its own migration to keep the sequence gapless.
+-- P2-39c has since landed migration 006, so this is migration 007.
 -- (the same accommodation this row's brief already made in the other
 -- direction). Noted for the tracker and for GitHub Issue 57.
 --

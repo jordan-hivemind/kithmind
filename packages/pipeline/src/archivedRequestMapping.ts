@@ -133,7 +133,9 @@ export function createParserArtifactSelection(
     clientArtifactId: processing.parserIntent.parserArtifactClientId,
     outputHash: output.rawArtifact.sha256,
     outputByteLength: output.rawArtifact.byteLength,
-    outputMediaType: "application/vnd.docling+json",
+    // P2-70i3: the class that produced the artifact names its media type, and
+    // the server checks it against the discovery work's own class.
+    outputMediaType: output.rawArtifact.mediaType,
     createdAt: processing.createdAt,
   };
 }

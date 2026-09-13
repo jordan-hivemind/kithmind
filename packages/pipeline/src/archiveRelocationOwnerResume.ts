@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 
+import { isBinaryMediaType } from "@repo/worker-protocol";
+
 import { openArchiveCatalog, type ArchiveCatalog } from "./archiveCatalog.js";
 import {
   parseOwnerArchiveRelocationRecipe,
@@ -237,7 +239,8 @@ function frozenBaseline(
           Buffer.byteLength(file.text, "utf8") > config.maxFileBytes
         )
           fail("invalid_input");
-      } else if (file.mediaType !== "application/pdf") {
+        // P2-70i3: a binary observation carries the media type of its class.
+      } else if (!isBinaryMediaType(file.mediaType)) {
         fail("invalid_input");
       }
     } else {

@@ -3,6 +3,8 @@ import { constants, type Stats } from "node:fs";
 import { link, lstat, open, realpath, unlink } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 
+import { BINARY_CLASSES, type BinaryMediaType } from "@repo/worker-protocol";
+
 import type { SafeRoot } from "./filesystem.js";
 
 export const MAX_CAPTURED_PDF_BYTES = 16 * 1024 * 1024;
@@ -30,6 +32,54 @@ export class CaptureStoreError extends Error {
     super(`PDF capture failed: ${message}`);
     this.name = "CaptureStoreError";
   }
+}
+
+/**
+ * P2-70i3: what a captured original of each binary class is named on disk and
+ * how its first bytes identify it. The capture step is otherwise identical for
+ * every class, so this table is the whole difference: one file extension so a
+ * capture directory stays readable, and one magic prefix so bytes that stopped
+ * being what discovery observed are refused before they are archived.
+ */
+const CAPTURE_CLASSES: Record<
+  BinaryMediaType,
+  { extension: string; magic: Buffer }
+> = {
+  [BINARY_CLASSES.pdf_docqa_v1.mediaType]: {
+    extension: "pdf",
+    magic: Buffer.from("%PDF-", "utf8"),
+  },
+  [BINARY_CLASSES.spreadsheet_v1.mediaType]: {
+    extension: "xlsx",
+    magic: Buffer.from([0x50, 0x4b, 0x03, 0x04]),
+  },
+};
+
+const DEFAULT_CAPTURE_MEDIA_TYPE: BinaryMediaType =
+  BINARY_CLASSES.pdf_docqa_v1.mediaType;
+
+/** Absent means PDF: every capture recorded before the class set was one. */
+function captureClass(mediaType: BinaryMediaType | undefined) {
+  const entry = CAPTURE_CLASSES[mediaType ?? DEFAULT_CAPTURE_MEDIA_TYPE];
+  if (!entry) fail("invalid_input", "capture media type is not a binary class");
+  return entry;
+}
+
+export function captureFileName(
+  captureId: string,
+  mediaType?: BinaryMediaType,
+): string {
+  return `${captureId}.${captureClass(mediaType).extension}`;
+}
+
+/** The class a durable capture record describes, read from its own name. */
+function capturedMediaType(path: string): BinaryMediaType {
+  const extension = basename(path).split(".").pop();
+  const found = (Object.keys(CAPTURE_CLASSES) as BinaryMediaType[]).find(
+    (mediaType) => CAPTURE_CLASSES[mediaType].extension === extension,
+  );
+  if (!found) fail("invalid_input", "captured original name is invalid");
+  return found;
 }
 
 export type ExpectedPdfSource = {
@@ -60,6 +110,8 @@ export type CapturePdfInput = {
   captureDirectory: string;
   captureId: string;
   expected: ExpectedPdfSource;
+  /** The binary class of the bytes. Absent means `application/pdf`. */
+  mediaType?: BinaryMediaType;
   deadlineMs?: number;
 };
 
@@ -428,9 +480,10 @@ async function inspectCaptureFile(
   directory: DirectoryIdentity,
   captureId: string,
   expected: ExpectedPdfSource,
+  mediaType?: BinaryMediaType,
 ): Promise<CapturedPdf> {
   await recheckDirectory(directory, "capture directory");
-  const path = join(directory.path, `${captureId}.pdf`);
+  const path = join(directory.path, captureFileName(captureId, mediaType));
   const before = await lstat(path).catch(() =>
     fail("unsafe_path", "captured PDF is unavailable"),
   );
@@ -452,6 +505,7 @@ async function inspectCaptureFile(
     rethrowSafe(error, "unsafe_path", "captured PDF cannot be opened"),
   );
   const digest = createHash("sha256");
+  const magic = captureClass(mediaType).magic;
   let length = 0;
   let prefix = Buffer.alloc(0);
   try {
@@ -468,10 +522,13 @@ async function inspectCaptureFile(
         length,
       );
       if (read.bytesRead === 0) break;
-      if (prefix.length < 5) {
+      if (prefix.length < magic.length) {
         prefix = Buffer.concat([
           prefix,
-          buffer.subarray(0, Math.min(read.bytesRead, 5 - prefix.length)),
+          buffer.subarray(
+            0,
+            Math.min(read.bytesRead, magic.length - prefix.length),
+          ),
         ]);
       }
       digest.update(buffer.subarray(0, read.bytesRead));
@@ -489,8 +546,8 @@ async function inspectCaptureFile(
     ) {
       fail("unsafe_path", "captured PDF changed during inspection");
     }
-    if (!prefix.equals(Buffer.from("%PDF-"))) {
-      fail("invalid_input", "captured input is not a supported PDF");
+    if (!prefix.equals(magic)) {
+      fail("invalid_input", "captured input is not its declared binary class");
     }
     const sha256 = digest.digest("hex");
     if (sha256 !== expected.sha256) {
@@ -525,6 +582,7 @@ export async function capturePdfFile(
     requiredOpenConstants();
     const expected = expectedSource(input.expected);
     const captureId = captureIdentifier(input.captureId);
+    const binaryClass = captureClass(input.mediaType);
     const end = deadline(input.deadlineMs);
     const outputDirectory = await protectedDirectory(
       input.captureDirectory,
@@ -589,7 +647,10 @@ export async function capturePdfFile(
       outputDirectory.path,
       `.${captureId}.${randomUUID()}.tmp`,
     );
-    const finalPath = join(outputDirectory.path, `${captureId}.pdf`);
+    const finalPath = join(
+      outputDirectory.path,
+      captureFileName(captureId, input.mediaType),
+    );
     let temporaryIdentity: FileIdentity | undefined;
     let output: Awaited<ReturnType<typeof open>> | undefined;
     let published = false;
@@ -643,10 +704,16 @@ export async function capturePdfFile(
           );
           if (read.bytesRead === 0) break;
           const chunk = buffer.subarray(0, read.bytesRead);
-          if (prefix.length < 5) {
+          if (prefix.length < binaryClass.magic.length) {
             prefix = Buffer.concat([
               prefix,
-              chunk.subarray(0, Math.min(chunk.length, 5 - prefix.length)),
+              chunk.subarray(
+                0,
+                Math.min(
+                  chunk.length,
+                  binaryClass.magic.length - prefix.length,
+                ),
+              ),
             ]);
           }
           digest.update(chunk);
@@ -672,9 +739,12 @@ export async function capturePdfFile(
         buffer.fill(0);
         if (
           offset !== expected.byteLength ||
-          !prefix.equals(Buffer.from("%PDF-"))
+          !prefix.equals(binaryClass.magic)
         ) {
-          fail("source_changed", "source is incomplete or not a supported PDF");
+          fail(
+            "source_changed",
+            "source is incomplete or not the observed binary class",
+          );
         }
         const sha256 = digest.digest("hex");
         if (sha256 !== expected.sha256) {
@@ -743,7 +813,12 @@ export async function capturePdfFile(
         fail("unsafe_path", "capture temporary file changed before cleanup");
       }
       await syncDirectory(outputDirectory);
-      return await inspectCaptureFile(outputDirectory, captureId, expected);
+      return await inspectCaptureFile(
+        outputDirectory,
+        captureId,
+        expected,
+        input.mediaType,
+      );
     } finally {
       await source.close().catch(() => undefined);
       await output?.close().catch(() => undefined);
@@ -761,6 +836,7 @@ export async function inspectCapturedPdf(input: {
   captureId: string;
   expected: ExpectedPdfSource;
   expectedDirectory: CapturedPdf["captureDirectory"];
+  mediaType?: BinaryMediaType;
 }): Promise<CapturedPdf> {
   try {
     requiredOpenConstants();
@@ -779,6 +855,7 @@ export async function inspectCapturedPdf(input: {
       directory,
       captureIdentifier(input.captureId),
       expectedSource(input.expected),
+      input.mediaType,
     );
   } catch (error) {
     rethrowSafe(error, "io_failed", "captured PDF could not be inspected");
@@ -790,6 +867,7 @@ export async function inspectCaptureIntentState(input: {
   captureDirectory: string;
   captureId: string;
   expectedDirectory: CapturedPdf["captureDirectory"];
+  mediaType?: BinaryMediaType;
 }): Promise<{ state: "absent" | "present_unowned" }> {
   try {
     requiredOpenConstants();
@@ -804,7 +882,10 @@ export async function inspectCaptureIntentState(input: {
     )
       fail("unsafe_path", "capture directory identity changed");
     const captureId = captureIdentifier(input.captureId);
-    const path = join(directory.path, `${captureId}.pdf`);
+    const path = join(
+      directory.path,
+      captureFileName(captureId, input.mediaType),
+    );
     const present = await lstat(path).catch((error: unknown) => {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
       rethrowSafe(error, "io_failed", "capture intent cannot be checked");
@@ -822,7 +903,10 @@ function parsedCapture(value: CapturedPdf): CapturedPdf {
     typeof value !== "object" ||
     value.version !== 1 ||
     !CAPTURE_ID.test(value.captureId) ||
-    basename(value.path) !== `${value.captureId}.pdf` ||
+    !Object.values(CAPTURE_CLASSES).some(
+      (entry) =>
+        basename(value.path) === `${value.captureId}.${entry.extension}`,
+    ) ||
     !SHA256.test(value.sha256) ||
     !safeInteger(value.byteLength, 1, MAX_CAPTURED_PDF_BYTES) ||
     !safeInteger(value.sourceModifiedAt, 0, Number.MAX_SAFE_INTEGER) ||
@@ -866,11 +950,16 @@ export async function removeCapturedPdfExact(
       await recheckDirectory(directory, "capture directory");
       return { state: "already_missing" };
     }
-    const inspected = await inspectCaptureFile(directory, capture.captureId, {
-      sha256: capture.sha256,
-      byteLength: capture.byteLength,
-      sourceModifiedAt: capture.sourceModifiedAt,
-    });
+    const inspected = await inspectCaptureFile(
+      directory,
+      capture.captureId,
+      {
+        sha256: capture.sha256,
+        byteLength: capture.byteLength,
+        sourceModifiedAt: capture.sourceModifiedAt,
+      },
+      capturedMediaType(capture.path),
+    );
     if (
       inspected.path !== capture.path ||
       inspected.device !== capture.device ||

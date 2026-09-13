@@ -1,3 +1,8 @@
+import {
+  isBinaryParserProfileId,
+  type BinaryParserProfileId,
+} from "@repo/worker-protocol";
+
 import type { IdentityBinding, WorkerErrorCode } from "./types.js";
 
 const MAX_FILES = 256;
@@ -22,11 +27,20 @@ export type Utf8FilePlan = PlanLocation & {
   byteLength: number;
 };
 
+/**
+ * The archived-binary lane's plan, for any class in `BINARY_CLASSES`.
+ *
+ * P2-70i3: `parserProfileId` is the class, and `kind` stays `"pdf"` because it
+ * is the tag every version-1 journal already wrote for this lane. Renaming it
+ * would make a resumed journal unreadable for no gain: the class is the field
+ * beside it, and nothing reads `kind` for more than "this is the binary lane,
+ * not UTF-8 and not a gap".
+ */
 export type PdfFilePlan = PlanLocation & {
   kind: "pdf";
   sha256: string;
   byteLength: number;
-  parserProfileId: "pdf_docqa_v1";
+  parserProfileId: BinaryParserProfileId;
   parserFingerprint: string;
   extractionConfigurationFingerprint: string;
   extractorFingerprint: string;
@@ -410,7 +424,7 @@ function files(value: unknown): FilePlan[] {
         fail();
       return { ...location, kind: "gap" as const, code: row.code };
     }
-    if (row.parserProfileId !== "pdf_docqa_v1") fail();
+    if (!isBinaryParserProfileId(row.parserProfileId)) fail();
     const sourceItemId =
       row.sourceItemId === undefined ? undefined : id(row.sourceItemId);
     const observationEpoch =
@@ -454,7 +468,7 @@ function files(value: unknown): FilePlan[] {
       kind: "pdf" as const,
       sha256: string(row.sha256, 64, HEX_64),
       byteLength: integer(row.byteLength, 1, 16 * 1024 * 1024),
-      parserProfileId: "pdf_docqa_v1" as const,
+      parserProfileId: row.parserProfileId,
       parserFingerprint: string(row.parserFingerprint, 64, HEX_64),
       extractionConfigurationFingerprint: string(
         row.extractionConfigurationFingerprint,

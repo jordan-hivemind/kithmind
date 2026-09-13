@@ -327,7 +327,7 @@ export type WorkerRequest =
             clientArtifactId: string;
             parserOutputHash: string;
             parserOutputByteLength: number;
-            parserOutputMediaType: "application/vnd.docling+json";
+            parserOutputMediaType: BinaryParserOutputMediaType;
             parsedText: ParsedTextDeclaration;
           };
     })
@@ -2084,9 +2084,15 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
         "parserOutputMediaType",
         "parsedText",
       ]);
-      if (lookup.parserOutputMediaType !== "application/vnd.docling+json") {
+      // P2-70i3: one of the closed set. Which one this work may use is not
+      // decided here: the lookup compares the type against the artifact the
+      // class already accepted, so a workbook lookup cannot match a docling
+      // artifact and the reverse cannot either.
+      if (!isBinaryParserOutputMediaType(lookup.parserOutputMediaType)) {
         invalid();
       }
+      const lookupOutputMediaType: BinaryParserOutputMediaType =
+        lookup.parserOutputMediaType;
       return {
         ...base,
         operation: "discovery.lookupArchivedAdmission",
@@ -2107,7 +2113,7 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
             1,
             64 * 1_024 * 1_024,
           ),
-          parserOutputMediaType: "application/vnd.docling+json",
+          parserOutputMediaType: lookupOutputMediaType,
           parsedText: parsedTextDeclaration(lookup.parsedText),
         },
       };
