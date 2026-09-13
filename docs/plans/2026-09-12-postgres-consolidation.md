@@ -338,6 +338,9 @@ asks, so a host that is down reports itself stale without needing to be up.
 A single daily Vercel cron, which Hobby does allow, writes the durable incident
 row for alerting. That is the whole cloud-side dependency.
 
+The Hobby plan is confirmed, so the daemon is the scheduler and cloud cron is
+limited to one daily run for missing-worker detection.
+
 ### 2.7 Vector search: pgvector at 1536 dimensions
 
 The hosted provider supports `pgvector` on every plan with no add-on, and HNSW
@@ -670,6 +673,8 @@ measurement. The line counts it is applied to are counted.
 | P2-39m    | Parity run, independent security review, cutover, teardown and the cost line closed out.                                                                                                                                                                                           | 2    |      22 | all        |
 | **Total** |                                                                                                                                                                                                                                                                                    |      | **402** |            |
 
+Rows a, b and l started on 2026-09-13.
+
 Sequencing notes for the orchestrator. Rows a, b and l can start immediately and
 in parallel. Row e is the critical path and is more than a quarter of the work;
 it should not be split further across agents, because the 33 operations share one
@@ -712,6 +717,9 @@ review. Vectors add little: at 180 targets the pgvector column is about 1 MiB, a
 at 20,000 card-model targets about 120 MiB, because originals stay in the archive
 and never enter a row.
 
+The Hobby plan is confirmed, so the saving at cutover is 0.00 USD until the
+backfill, and the daemon is the scheduler.
+
 Two costs are outside this plan and should not be confused with it. The card
 extraction backfill is 285.60 USD one-time for the 10,000-file corpus under the
 document-cards sizing. Re-embedding the current 180 targets after cutover is
@@ -735,3 +743,13 @@ Only these five change the work materially.
 5. Accept deferring row level security, with the closed typed service surface as
    the only tenant boundary until a second person holds a database credential?
    Adding RLS now across the space-scoped tables is roughly 40 more agent hours.
+
+### Decisions, 2026-09-13
+
+| Question | Decision |
+| -------- | -------- |
+| 1. Retire `lists`, `listItems`, `reports` and `insights` | Retire with a JSONL export kept in the dated backup |
+| 2. Which plan is each vendor on today | Hobby plan is confirmed, so cloud cron is once a day and is not used |
+| 3. Accept one maintenance window | One maintenance window with a single re-login, no dual write, no shadow period |
+| 4. Accept the always-on Mac host as scheduler | The always-on worker host daemon runs sweeps and deferred work |
+| 5. Accept deferring row level security | Row level security deferred until a second person holds a database credential |
