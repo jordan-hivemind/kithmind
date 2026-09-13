@@ -37,14 +37,39 @@ import {
 const KITH_TABLES = [
   "spaces",
   "api_keys",
-  "documents",
+  "worker_jobs",
+  // P2-39d (migration 005): retires the prototype's uuid-keyed documents,
+  // source_revisions and chunks (migration 001) and frees their names for
+  // migration 004's kith_id-keyed brain_documents, brain_source_revisions
+  // and brain_chunks, renamed here to the plain names below. idempotency_receipts
+  // is retired with them: its operation CHECK named only the three document
+  // methods this row retired from `PostgresProof`.
+  "source_items",
   "source_revisions",
+  "source_parser_artifacts",
+  "source_artifact_archive_receipts",
+  "source_artifact_archive_bindings",
+  "source_artifact_deletion_acks",
+  "source_provider_original_references",
+  "source_provider_original_bindings",
+  "source_provider_original_detach_acks",
+  "source_text_versions",
+  "source_pages",
+  "evidence_spans",
+  "documents",
+  "chunks",
+  "processing_generations",
+  "processing_generation_payload_manifests",
+  "source_inventory",
+];
+
+// P2-39d: retired by migration 005, so this build must never re-create them.
+const RETIRED_PROOF_TABLES = [
   "generations",
   "pages",
   "evidence",
-  "chunks",
+  "synthetic_financial_attachments",
   "idempotency_receipts",
-  "worker_jobs",
 ];
 
 function history(client) {
@@ -86,6 +111,22 @@ test(
         [`kith.${table}`],
       );
       assert.equal(row.present, true, `kith.${table} should exist`);
+    }
+    for (const table of RETIRED_PROOF_TABLES) {
+      const [row] = await all(
+        client,
+        "SELECT to_regclass($1) IS NOT NULL AS present",
+        [`kith.${table}`],
+      );
+      assert.equal(row.present, false, `kith.${table} should be retired`);
+    }
+    for (const table of ["brain_documents", "brain_source_revisions", "brain_chunks"]) {
+      const [row] = await all(
+        client,
+        "SELECT to_regclass($1) IS NOT NULL AS present",
+        [`kith.${table}`],
+      );
+      assert.equal(row.present, false, `kith.${table} should be renamed away`);
     }
 
     // A database at a version this build does not have is refused rather than

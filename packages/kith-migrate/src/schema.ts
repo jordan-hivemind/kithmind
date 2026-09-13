@@ -1494,3 +1494,33 @@ export const NO_TARGET_CONVEX_TABLES = [
 export function findTable(convexTable: string): TableSpec | undefined {
   return TABLES.find((t) => t.convexTable === convexTable);
 }
+
+/**
+ * `pg` above names the shape the collision comment describes: what
+ * migration 004 actually creates, forever, since `ddl.test.mjs` requires
+ * `generateKithMigrateTablesSql()` to keep matching that checked-in file
+ * exactly. But `documents`, `sourceRevisions` and `chunks` do not keep that
+ * `brain_` name in a database with `@repo/kith-store`'s migration 005
+ * (P2-39d) applied: that row absorbed them into the plain names the
+ * collision comment already said P2-39d should. `spaces`/`apiKeys` are
+ * still `brain_spaces`/`brain_api_keys` pending P2-39c's equivalent
+ * migration -- add its renames here when it lands, the same way.
+ *
+ * Anything that builds SQL naming a *live* table -- `load.ts`'s `\copy`
+ * target, `parity.ts`'s counts and cross-space checks -- must resolve
+ * through this, not read `pg` directly, or it targets a name migration 005
+ * already renamed away. `transform.ts`'s CSV file names are not SQL and are
+ * untouched by this: the export/transform artifacts are this package's own
+ * bookkeeping, keyed by `pg` for stability across kith-store's later
+ * renames.
+ */
+const RENAMED_BY_LATER_KITH_STORE_MIGRATION: Readonly<Record<string, string>> =
+  {
+    brain_documents: "documents",
+    brain_source_revisions: "source_revisions",
+    brain_chunks: "chunks",
+  };
+
+export function currentPgName(pg: string): string {
+  return RENAMED_BY_LATER_KITH_STORE_MIGRATION[pg] ?? pg;
+}

@@ -4,7 +4,7 @@ import { createKithPool, withKithTransaction } from "@repo/kith-store";
 import type pg from "pg";
 
 import { readTableRows, type ExportManifest } from "./export.js";
-import { TABLES } from "./schema.js";
+import { currentPgName, TABLES } from "./schema.js";
 import type { TransformReport } from "./transform.js";
 
 export type ParityStatus = "pass" | "fail" | "pending";
@@ -57,7 +57,7 @@ async function checkCounts(
         ? (manifest.tables[t.convexTable]?.rowCount ?? 0)
         : 0;
       const result = await client.query<{ count: string }>(
-        `SELECT count(*)::text AS count FROM kith.${quoteIdent(t.pg)}`,
+        `SELECT count(*)::text AS count FROM kith.${quoteIdent(currentPgName(t.pg))}`,
       );
       const actual = Number(result.rows[0]!.count);
       if (actual !== expected) {
@@ -83,7 +83,7 @@ async function checkRetainedTextHashes(
   await withClient(connectionString, async (client) => {
     for (const entry of transformReport.retainedTextHashes) {
       const result = await client.query<{ text: string }>(
-        `SELECT text FROM kith.${quoteIdent(entry.pgTable)} WHERE id = $1`,
+        `SELECT text FROM kith.${quoteIdent(currentPgName(entry.pgTable))} WHERE id = $1`,
         [entry.id],
       );
       if (result.rowCount !== 1) {
@@ -122,17 +122,19 @@ async function checkProvenanceChains(
   sampleSize = 20,
 ): Promise<ParityCheckResult> {
   const details: string[] = [];
+  const documentsTable = currentPgName("brain_documents");
+  const sourceRevisionsTable = currentPgName("brain_source_revisions");
   await withClient(connectionString, async (client) => {
     const documents = await client.query<{ id: string }>(
-      `SELECT id FROM kith.brain_documents ORDER BY id LIMIT $1`,
+      `SELECT id FROM kith.${documentsTable} ORDER BY id LIMIT $1`,
       [sampleSize],
     );
     for (const { id } of documents.rows) {
       const chain = await client.query(
         `SELECT d.id AS document_id, r.id AS revision_id, g.id AS generation_id,
                 p.id AS page_id, e.id AS span_id
-           FROM kith.brain_documents d
-           JOIN kith.brain_source_revisions r
+           FROM kith.${documentsTable} d
+           JOIN kith.${sourceRevisionsTable} r
              ON r.id = d.source_revision_id AND r.space_id = d.space_id
            JOIN kith.processing_generations g
              ON g.id = d.processing_generation_id AND g.space_id = d.space_id
@@ -176,7 +178,7 @@ async function checkSpaceIsolationData(
         const id = row._id as string;
         const expectedSpaceId = row.spaceId as string;
         const result = await client.query<{ space_id: string }>(
-          `SELECT space_id FROM kith.${quoteIdent(t.pg)} WHERE id = $1`,
+          `SELECT space_id FROM kith.${quoteIdent(currentPgName(t.pg))} WHERE id = $1`,
           [id],
         );
         if (result.rowCount !== 1) {
@@ -196,8 +198,8 @@ async function checkSpaceIsolationData(
         if (!targetScoped) continue;
         const crossSpace = await client.query<{ count: string }>(
           `SELECT count(*)::text AS count
-             FROM kith.${quoteIdent(t.pg)} a
-             JOIN kith.${quoteIdent(c.refTable)} b ON a.${quoteIdent(c.pg)} = b.id
+             FROM kith.${quoteIdent(currentPgName(t.pg))} a
+             JOIN kith.${quoteIdent(currentPgName(c.refTable))} b ON a.${quoteIdent(c.pg)} = b.id
             WHERE a.space_id <> b.space_id`,
         );
         if (Number(crossSpace.rows[0]!.count) > 0) {

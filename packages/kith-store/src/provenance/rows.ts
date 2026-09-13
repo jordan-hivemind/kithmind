@@ -1,0 +1,372 @@
+// The camelCase row shapes this port hands back in place of a Convex
+// `Doc<"table">`. Field names match the Convex validators in
+// packages/convex/convex/models/provenance/validators.ts and
+// packages/convex/convex/models/documents/inventoryTables.ts one for one;
+// `id` and `spaceId` replace `_id`/`spaceId` as usual, and `createdAt` is the
+// row's own structural `created_at` (section 2.2's `_creationTime`
+// replacement), never to be confused with a domain `createdAt` field a table
+// also has -- those are named `createdAtField` here, matching the `_field`
+// suffix `packages/kith-migrate/src/schema.ts` gives the same collision.
+
+import { camelize } from "./sql.js";
+
+export type SourceLifecycle =
+  | "available"
+  | "unavailable"
+  | "forgetting"
+  | "forgotten";
+
+export type ProvenanceFailure = { code: string; message: string; at: number };
+
+export type SourceItemRow = {
+  id: string;
+  spaceId: string;
+  createdAt: Date;
+  sourceAccountId: string;
+  externalIdHash: string;
+  externalId: string | null;
+  title: string | null;
+  docType: string | null;
+  uri: string | null;
+  lifecycle: SourceLifecycle;
+  originalLinkAvailable: boolean;
+  desiredRevisionId: string | null;
+  desiredProcessingEpoch: number;
+  activeRevisionId: string | null;
+  activeGenerationId: string | null;
+  activeCardGenerationId: string | null;
+  embedFullChunks: boolean | null;
+  lastFailure: ProvenanceFailure | null;
+  forgottenAt: Date | null;
+  forgottenBy: string | null;
+  archiveDeletionForgetEpoch: number | null;
+  archiveDeletionReceiptCount: number | null;
+  archiveDeletionCompletedAt: Date | null;
+  workerObservationEpoch: number | null;
+  workerProcessingEpoch: number | null;
+  workerInventoryMetadataDigest: string | null;
+  workerProcessingIdentityDigest: string | null;
+  workerContentHash: string | null;
+  workerSourceModifiedAt: Date | null;
+  workerProfileId: string | null;
+  workerLastSeenInventoryEpoch: number | null;
+};
+
+export type SourceRevisionRow = {
+  id: string;
+  spaceId: string;
+  createdAt: Date;
+  sourceItemId: string;
+  contentHash: string;
+  byteLength: number;
+  mediaType: string;
+  representation: "inline_utf8_v1" | "archived_binary_v1" | null;
+  contentHashAuthority: "server_verified_utf8" | "worker_asserted" | null;
+  inlineText: string | null;
+  capturedAt: Date;
+  userId: string;
+  archiveRef: string | null;
+};
+
+export type EvidenceLocator = Record<string, unknown>;
+
+export type SourceTextVersionRow = {
+  id: string;
+  spaceId: string;
+  createdAt: Date;
+  sourceRevisionId: string;
+  extractionFingerprint: string;
+  representation: "inline_text_v1" | "parsed_pages_v1" | null;
+  text: string | null;
+  textHash: string;
+  textHashAuthority: "server_verified_retained_text" | null;
+  byteLength: number;
+  utf16Length: number | null;
+  pageCount: number | null;
+  mappingManifestHash: string | null;
+  parserArtifactId: string | null;
+  evidenceSealed: boolean;
+};
+
+export type SourcePageRow = {
+  id: string;
+  spaceId: string;
+  createdAt: Date;
+  sourceTextVersionId: string;
+  ordinal: number;
+  start: number;
+  end: number;
+  text: string;
+  textHash: string;
+};
+
+export type EvidenceSpanRow = {
+  id: string;
+  spaceId: string;
+  createdAt: Date;
+  sourceRevisionId: string;
+  sourceTextVersionId: string;
+  sourcePageId: string;
+  ordinal: number;
+  start: number;
+  end: number;
+  quoteHash: string;
+  locator: EvidenceLocator | null;
+  cardExtractionFingerprints: string[] | null;
+};
+
+export type PublicationState = "staged" | "active" | "historical";
+
+export type DocumentRow = {
+  id: string;
+  spaceId: string;
+  createdAt: Date;
+  processingGenerationId: string;
+  sourceItemId: string;
+  sourceRevisionId: string;
+  sourceTextVersionId: string;
+  documentKey: string;
+  title: string;
+  docType: string;
+  capturedAt: Date;
+  evidenceSpanIds: string[];
+  publicationState: PublicationState;
+};
+
+export type ChunkRow = {
+  id: string;
+  spaceId: string;
+  createdAt: Date;
+  processingGenerationId: string;
+  documentId: string;
+  ordinal: number;
+  sourceTextVersionId: string | null;
+  start: number | null;
+  end: number | null;
+  text: string;
+  evidenceSpanIds: string[];
+  publicationState: PublicationState;
+};
+
+export type ProcessingGenerationState = "staging" | "ready" | "superseded";
+
+export type ProcessingGenerationRow = {
+  id: string;
+  spaceId: string;
+  createdAt: Date;
+  sourceAccountId: string;
+  sourceItemId: string;
+  sourceRevisionId: string;
+  sourceTextVersionId: string | null;
+  processingFingerprint: string | null;
+  extractionFingerprint: string | null;
+  extractorFingerprint: string | null;
+  recordSchemaFingerprint: string | null;
+  normalizationFingerprint: string | null;
+  chunkerFingerprint: string | null;
+  correctionRevision: string | null;
+  parserArtifactId: string | null;
+  archiveSetDigest: string | null;
+  normalizedBundleDigest: string | null;
+  originalPrimaryReceiptId: string | null;
+  originalBackupReceiptId: string | null;
+  originalProviderReferenceId: string | null;
+  originalProviderBindingEpoch: number | null;
+  parserPrimaryReceiptId: string | null;
+  parserBackupReceiptId: string | null;
+  desiredProcessingEpoch: number | null;
+  cardGeneration: boolean;
+  state: ProcessingGenerationState;
+  expectedPageCount: number | null;
+  expectedEvidenceSpanCount: number | null;
+  expectedDocumentCount: number | null;
+  expectedChunkCount: number | null;
+  expectedEventCount: number | null;
+  expectedObservationCount: number | null;
+  actualPageCount: number | null;
+  actualEvidenceSpanCount: number | null;
+  actualDocumentCount: number | null;
+  actualChunkCount: number | null;
+  actualEventCount: number | null;
+  actualObservationCount: number | null;
+  payloadManifestId: string | null;
+  embeddingStatus: string | null;
+  activatedAt: Date | null;
+  deactivatedAt: Date | null;
+};
+
+export type SourceParserArtifactRow = {
+  id: string;
+  spaceId: string;
+  createdAt: Date;
+  sourceAccountId: string;
+  sourceItemId: string;
+  sourceRevisionId: string;
+  clientArtifactId: string;
+  parserFingerprint: string;
+  outputHash: string;
+  outputByteLength: number;
+  outputMediaType: string;
+  hashAuthority: "worker_asserted";
+  userId: string;
+  actorCredentialId: string;
+  createdAtField: Date;
+};
+
+export type ArchiveSubjectKind = "original_bytes" | "parser_output";
+export type ArchiveCopyRole = "primary" | "independent_backup";
+
+export type SourceArtifactArchiveReceiptRow = {
+  id: string;
+  spaceId: string;
+  createdAt: Date;
+  sourceAccountId: string;
+  sourceItemId: string;
+  sourceRevisionId: string;
+  parserArtifactId: string | null;
+  subjectKind: ArchiveSubjectKind;
+  copyRole: ArchiveCopyRole;
+  clientReceiptId: string;
+  requestDigest: string;
+  receiptVersion: "archive_receipt_v1";
+  archiveRepresentation: "age_encrypted_v1";
+  archiveProfileFingerprint: string;
+  archiveIdentityFingerprint: string;
+  recipientFingerprint: string;
+  repositoryKeyDomainFingerprint: string;
+  storageFailureDomainFingerprint: string;
+  archiveObjectId: string;
+  plaintextHash: string;
+  plaintextByteLength: number;
+  plaintextMediaType: string;
+  hashAuthority: "worker_asserted";
+  ciphertextHash: string;
+  ciphertextByteLength: number;
+  verificationKind: "ciphertext_readback_sha256";
+  readbackVerifiedAt: Date;
+  userId: string;
+  actorCredentialId: string;
+  createdAtField: Date;
+};
+
+export type SourceInventoryExclusionReason =
+  | "empty"
+  | "enumeration_interrupted"
+  | "oversized"
+  | "permission_denied"
+  | "unreadable"
+  | "unstable"
+  | "unsupported"
+  | "encrypted"
+  | "duplicate_of"
+  | "parse_failed"
+  | "extraction_pending";
+
+export type SourceInventoryRow = {
+  id: string;
+  spaceId: string;
+  createdAt: Date;
+  sourceAccountId: string;
+  sourceItemId: string | null;
+  identityKeyHash: string;
+  relativePath: string;
+  folderPath: string;
+  fileName: string;
+  byteLength: number | null;
+  contentHash: string | null;
+  mediaType: string | null;
+  modifiedAt: Date;
+  duplicateGroupId: string | null;
+  contentIndexed: boolean;
+  exclusionReason: SourceInventoryExclusionReason | null;
+  exclusionDetail: string | null;
+  permissionsRestricted: boolean | null;
+  permissionsDetail: string | null;
+  firstSeenScanId: string;
+  lastSeenScanId: string;
+  missingSinceScanId: string | null;
+};
+
+// One camelizer per ported table: every `numeric` column (section on
+// `camelize` in sql.ts explains why migration 004 typed them that way) is
+// listed here once, so a caller never has to repeat the field list at the
+// query site. `getRow`/every query in model.ts, binary.ts and
+// documents/inventory.ts goes through one of these instead of the generic
+// `camelize` directly.
+
+export function camelizeSourceItem(row: Record<string, unknown>): SourceItemRow {
+  return camelize<SourceItemRow>(row, [
+    "desiredProcessingEpoch",
+    "archiveDeletionForgetEpoch",
+    "archiveDeletionReceiptCount",
+    "workerObservationEpoch",
+    "workerProcessingEpoch",
+    "workerLastSeenInventoryEpoch",
+  ]);
+}
+
+export function camelizeSourceRevision(row: Record<string, unknown>): SourceRevisionRow {
+  return camelize<SourceRevisionRow>(row, ["byteLength"]);
+}
+
+export function camelizeSourceTextVersion(
+  row: Record<string, unknown>,
+): SourceTextVersionRow {
+  return camelize<SourceTextVersionRow>(row, ["byteLength", "utf16Length", "pageCount"]);
+}
+
+export function camelizeSourcePage(row: Record<string, unknown>): SourcePageRow {
+  return camelize<SourcePageRow>(row, ["ordinal", "start", "end"]);
+}
+
+export function camelizeEvidenceSpan(row: Record<string, unknown>): EvidenceSpanRow {
+  return camelize<EvidenceSpanRow>(row, ["ordinal", "start", "end"]);
+}
+
+export function camelizeDocument(row: Record<string, unknown>): DocumentRow {
+  return camelize<DocumentRow>(row, []);
+}
+
+export function camelizeChunk(row: Record<string, unknown>): ChunkRow {
+  return camelize<ChunkRow>(row, ["ordinal", "start", "end"]);
+}
+
+export function camelizeProcessingGeneration(
+  row: Record<string, unknown>,
+): ProcessingGenerationRow {
+  return camelize<ProcessingGenerationRow>(row, [
+    "originalProviderBindingEpoch",
+    "desiredProcessingEpoch",
+    "expectedPageCount",
+    "expectedEvidenceSpanCount",
+    "expectedDocumentCount",
+    "expectedChunkCount",
+    "expectedEventCount",
+    "expectedObservationCount",
+    "actualPageCount",
+    "actualEvidenceSpanCount",
+    "actualDocumentCount",
+    "actualChunkCount",
+    "actualEventCount",
+    "actualObservationCount",
+  ]);
+}
+
+export function camelizeSourceParserArtifact(
+  row: Record<string, unknown>,
+): SourceParserArtifactRow {
+  return camelize<SourceParserArtifactRow>(row, ["outputByteLength"]);
+}
+
+export function camelizeSourceArtifactArchiveReceipt(
+  row: Record<string, unknown>,
+): SourceArtifactArchiveReceiptRow {
+  return camelize<SourceArtifactArchiveReceiptRow>(row, [
+    "plaintextByteLength",
+    "ciphertextByteLength",
+  ]);
+}
+
+export function camelizeSourceInventory(row: Record<string, unknown>): SourceInventoryRow {
+  return camelize<SourceInventoryRow>(row, ["byteLength"]);
+}

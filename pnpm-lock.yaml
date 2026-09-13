@@ -241,6 +241,9 @@ importers:
       '@repo/pg':
         specifier: workspace:*
         version: link:../pg
+      '@repo/worker-protocol':
+        specifier: workspace:*
+        version: link:../worker-protocol
       pg:
         specifier: ^8.16.3
         version: 8.23.0
