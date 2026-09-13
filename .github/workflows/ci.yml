@@ -88,3 +88,8 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @repo/kith-store test:integration
+      # P2-39b's loader shells out to `psql \copy` (plan section 3 step 4)
+      # rather than add a pg-copy-streams dependency; ubuntu-latest ships it,
+      # but pin the install so a runner image change cannot silently drop it.
+      - run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - run: pnpm --filter @repo/kith-migrate test:integration
