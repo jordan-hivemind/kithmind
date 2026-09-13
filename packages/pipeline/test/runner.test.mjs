@@ -2656,6 +2656,21 @@ test("successive PDF reconciles skip activated unchanged work and resume incompl
     }
   }
 
+  function readyRow(suffix) {
+    return {
+      processingCatalogId: `processing-${suffix}`,
+      cloud: {
+        ingestJobId: `job-${suffix}`,
+        processingGenerationId: `generation-${suffix}`,
+      },
+      activation: {
+        state: "ready",
+        jobId: `job-${suffix}`,
+        processingGenerationId: `generation-${suffix}`,
+      },
+    };
+  }
+
   assert.equal((await reconcile("queued", [])).phase, "archived");
   assert.equal(
     (await reconcile("unchanged", [{ activation: { state: "ready" } }])).phase,
@@ -2664,6 +2679,42 @@ test("successive PDF reconciles skip activated unchanged work and resume incompl
   assert.equal(
     (await reconcile("unchanged", [{ activation: undefined }])).phase,
     "archived",
+  );
+  assert.equal(
+    (
+      await reconcile("unchanged", [
+        { processingCatalogId: "incomplete" },
+        readyRow("published"),
+      ])
+    ).phase,
+    "discovery_reserve",
+  );
+  await assert.rejects(
+    () =>
+      reconcile("unchanged", [readyRow("first"), readyRow("second")]),
+    (error) => error.code === "archive_catalog_revision_conflict",
+  );
+  await assert.rejects(
+    () =>
+      reconcile("unchanged", [
+        { processingCatalogId: "first" },
+        { processingCatalogId: "second" },
+      ]),
+    (error) => error.code === "archive_catalog_revision_conflict",
+  );
+  await assert.rejects(
+    () =>
+      reconcile("unchanged", [
+        { processingCatalogId: "incomplete" },
+        {
+          ...readyRow("incoherent"),
+          cloud: {
+            ingestJobId: "different-job",
+            processingGenerationId: "generation-incoherent",
+          },
+        },
+      ]),
+    (error) => error.code === "archive_catalog_revision_conflict",
   );
 });
 
@@ -2722,7 +2773,27 @@ test("journal loss after activation routes retained plaintext to cleanup only", 
     parserIntent: { outputId: randomUUID() },
     parserOutput: {},
     spool: { opaqueName: `${randomUUID()}.json` },
-    activation: { state: "ready" },
+    cloud: {
+      ingestJobId: "published-job",
+      processingGenerationId: "published-generation",
+    },
+    activation: {
+      state: "ready",
+      jobId: "published-job",
+      processingGenerationId: "published-generation",
+    },
+  };
+  const incomplete = {
+    ...processing,
+    processingCatalogId: randomUUID(),
+    currentObservation: {
+      ...processing.currentObservation,
+      scanId: "interrupted-prior-scan",
+    },
+    captureIntent: { captureId: randomUUID() },
+    capture: {},
+    cloud: undefined,
+    activation: undefined,
   };
   runner.archiveCatalog = {
     findOriginalExact() {
@@ -2732,7 +2803,7 @@ test("journal loss after activation routes retained plaintext to cleanup only", 
       return undefined;
     },
     listProcessings() {
-      return [processing];
+      return [incomplete, processing];
     },
   };
   try {

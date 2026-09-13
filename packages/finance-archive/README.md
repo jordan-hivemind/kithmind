@@ -791,6 +791,61 @@ scope uses. The script reports the count of in-scope rows carrying no
 assumed. It also leaves stored quantities alone: nulling those moves the
 position gate, which is a separate gate needing its own evidence.
 
+### No posting date to import (F1-8i)
+
+A residual set of cash periods fails on a single row each whose cash-effective
+date lands one statement period away from where the statement's own cash
+balance moved. The proposed fix was to import the provider's cash-posting date
+and prefer it: Morgan Stanley states two dates the archive does not hold,
+`activityDate` and `payDate`, both retained in the raw bytes (`ms-activity-3`)
+and mapped to no column. **Measured against the owner's archive, neither is a
+posting date, so no column was added and the cash-effective date rule is
+unchanged.**
+
+| Fact | Count |
+| --- | --- |
+| retained activity rows carrying a `payDate` key | 50,700 |
+| of those, rows stating a `payDate` value | **0** |
+| retained rows stating an `activityDate` | 50,700 of 50,700 |
+| `transactions` matched to a retained row by `provider_txn_id` | 50,865 of 50,865 |
+
+`payDate` is not a missing mapping, it is a field the provider sends empty. The
+retention projection is built out of the declaration by walking the source, so
+it writes a key only when the source carries one: a key present and `null` is
+the provider's own `null`, not something the projection dropped.
+
+`activityDate` is stated everywhere and still cannot help. Against the current
+cash-effective date it is the same day on 27,973 rows, earlier on 22,829, and
+later on only 63, and the misplaced rows need a date that is *later*.
+
+Every way of preferring it was run over all 929 periods, against the gate's own
+arithmetic and validated by reproducing the 639 / 15 / 275 verdicts the archive
+holds today:
+
+| Cash-effective date | pass | fail | unverified | Periods it moves |
+| --- | --- | --- | --- | --- |
+| `greatest(process, settle)` (today) | 639 | 15 | 275 | -- |
+| `activityDate` outright | 343 | 311 | 275 | 296 pass to fail, **0 fail to pass** |
+| `activityDate` inside the `greatest()` | 631 | 23 | 275 | 8 pass to fail, **0 fail to pass** |
+| `activityDate` inside a `least()` | 344 | 310 | 275 | 295 pass to fail, **0 fail to pass** |
+
+No candidate fixes one failing period, and each breaks passing ones. That is
+the whole decision: a date semantics change that helps nothing and costs
+hundreds of passes is not a fix.
+
+**What the residual is instead, and what to measure next.** 8 of the 15
+failures are each explained by exactly one row (6 are the coverage-gap account,
+which sums no candidate row at all, and 1 has two). Of the 8, three rows sit
+exactly on a snapshot date and four sit exactly one day before one, and in all
+seven the statement books the row in the period *after* that snapshot. All four
+one-day cases share one shape: the snapshot is a Saturday and the row is the
+preceding Friday. That points at the boundary, not the row -- but not at a
+global boundary rule either, because flipping the window to `[period_start,
+period_end)` breaks 559 passing periods and rolling both boundaries back to the
+previous weekday changes no verdict at all. The next study is therefore what
+`balances.as_of` means per statement, against the statement's own stated cash
+period, rather than another date column.
+
 ## Position quantity gate
 
 `runPositionReconciliationGate(client, importRunId?, scope?)`
