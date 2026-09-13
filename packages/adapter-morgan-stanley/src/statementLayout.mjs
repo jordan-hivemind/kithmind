@@ -52,6 +52,25 @@ const ACTIVITY_DATE_COLUMN = /^\s*Activity Date\b/;
 const CELL_GAP = /\s{2,}/;
 /** How far a cell edge may sit from a header edge and still be that column. */
 const EDGE_TOLERANCE = 3;
+/**
+ * F1-8c. The BALANCE SHEET's own two money columns ("Last Period (as of
+ * ...)"/"This Period (as of ...)") are printed under a header cell whose own
+ * text -- the parenthesised date -- is wider than most of the amounts bound
+ * under it. A short figure (Cash, BDP, MMFs is usually far smaller than
+ * TOTAL VALUE) right-aligns to the same print column but its far shorter
+ * text starts well clear of the header's own start, so neither edge lands
+ * within `EDGE_TOLERANCE` of the header cell -- the row still matches
+ * (`BALANCE_ROWS.cash`), and the cell is visibly a number, but it binds to no
+ * column, so `read()` reports "row or column not printed on this statement"
+ * for a cash figure the statement did print. Measured against the hosted
+ * archive's own BALANCE SHEET blocks, five character-widths covers every
+ * cash cell TOTAL VALUE and Total Assets already bind at three or fewer.
+ * The two BALANCE SHEET columns sit roughly twenty characters apart (see the
+ * fixture layout below), so doubling the tolerance here still cannot cross-
+ * bind Last Period and This Period into each other. Holdings columns run
+ * much closer together and keep the tighter default.
+ */
+const BALANCE_SHEET_EDGE_TOLERANCE = 5;
 /** "$1,234.56", "(1,234.56)", "1,234.56-" and the em dash for "none". */
 const NO_VALUE = new Set(["", "—", "–", "-", "N/A", "NA"]);
 /** A one- or two-letter footnote reference printed after a value. */
@@ -88,11 +107,11 @@ function splitCells(text) {
  * the two edge errors identifies the column and a long description that runs
  * under the next header does not get stolen by it.
  */
-function bindColumn(cell, columns) {
+function bindColumn(cell, columns, tolerance = EDGE_TOLERANCE) {
   let best = null;
   for (const column of columns) {
     const error = Math.min(Math.abs(cell.end - column.end), Math.abs(cell.start - column.start));
-    if (error > EDGE_TOLERANCE) continue;
+    if (error > tolerance) continue;
     if (best === null || error < best.error) best = { column, error };
   }
   return best?.column ?? null;
@@ -101,11 +120,14 @@ function bindColumn(cell, columns) {
 /** A line's cells keyed by the column each one binds to. A cell that lines up
  * with no column is dropped: every column this parser reads is named in
  * HOLDINGS_COLUMNS, so a cell outside all of them is a column it does not
- * read (an Est Ann Income, a Yield %), not a value going missing. */
-function bindRow(line, columns) {
+ * read (an Est Ann Income, a Yield %), not a value going missing. `tolerance`
+ * defaults to the tight holdings-table spacing; `parseBalanceSheet` passes
+ * `BALANCE_SHEET_EDGE_TOLERANCE` for its own, much more widely spaced pair of
+ * money columns (F1-8c). */
+function bindRow(line, columns, tolerance = EDGE_TOLERANCE) {
   const bound = new Map();
   for (const cell of splitCells(line)) {
-    const column = bindColumn(cell, columns);
+    const column = bindColumn(cell, columns, tolerance);
     if (column !== null && !bound.has(column.name)) bound.set(column.name, cell);
   }
   return { bound };
@@ -327,7 +349,10 @@ function parseBalanceSheet(lines, anchorIndex, kind, accountKey, markerLines, te
       if (rows[name] !== undefined) continue;
       const trimmed = text.trim();
       if (!pattern.test(trimmed)) continue;
-      rows[name] = { bound: bindRow(text, columns).bound, lineStart };
+      rows[name] = {
+        bound: bindRow(text, columns, BALANCE_SHEET_EDGE_TOLERANCE).bound,
+        lineStart,
+      };
     }
   }
   if (rows.totalValue === undefined) return null;
