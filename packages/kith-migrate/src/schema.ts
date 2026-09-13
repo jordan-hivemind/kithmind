@@ -33,10 +33,17 @@
  * Five names (`spaces`, `apiKeys`, `documents`, `sourceRevisions`, `chunks`)
  * collide with tables `@repo/kith-store`'s own prototype migrations already
  * created for its synthetic proof harness; those tables are `uuid`-keyed and
- * actively exercised by that package's own tests, so this file's versions of
- * the same five domains land under a `brain_` pg name instead
- * (`brain_spaces`, and so on). See `ddl.ts`'s module comment for the full
- * reasoning.
+ * actively exercised by that package's own tests, so migration 4 creates this
+ * file's versions of the same five domains under a `brain_` name.
+ *
+ * Migration 6 (P2-39c) settles two of them: the prototype's `spaces` and
+ * `api_keys` become `proof_spaces` and `proof_api_keys`, and `brain_spaces` and
+ * `brain_api_keys` are renamed to the plain names. So `pg` below is `spaces` and
+ * `api_keys` -- `pg` is always the name a table has once the schema is fully
+ * migrated, which is the name the transform, the loader and the parity harness
+ * address it by -- and `ddl.ts`'s `migration4TableName` holds the interim name
+ * migration 4 itself still creates. `documents`, `sourceRevisions` and `chunks`
+ * stay prefixed until P2-39d does the same for them.
  *
  * ponytail: every non-structural column is nullable in the generated DDL.
  * Convex's required/optional split, CHECK constraints, and the tsvector/
@@ -46,12 +53,7 @@
  */
 
 export type ColumnKind =
-  | "ref"
-  | "text"
-  | "number"
-  | "boolean"
-  | "jsonb"
-  | "timestamp";
+  "ref" | "text" | "number" | "boolean" | "jsonb" | "timestamp";
 
 export type ColumnSpec = {
   pg: string;
@@ -156,7 +158,7 @@ export const TABLES: TableSpec[] = [
   ]),
   table("consumedOAuthCodes", "consumed_oauth_codes", false, false, [
     ref("userId", "users"),
-    ref("apiKeyId", "brain_api_keys"),
+    ref("apiKeyId", "api_keys"),
     text("requestHash"),
     text("codeHash"),
     text("bindingHash"),
@@ -165,7 +167,7 @@ export const TABLES: TableSpec[] = [
   ]),
 
   // --- Spaces and membership
-  table("spaces", "brain_spaces", false, true, [
+  table("spaces", "spaces", false, true, [
     text("kind"),
     text("name"),
     ref("createdBy", "users"),
@@ -177,12 +179,12 @@ export const TABLES: TableSpec[] = [
   ]),
   table("userSpaceSettings", "user_space_settings", false, true, [
     ref("userId", "users"),
-    ref("personalSpaceId", "brain_spaces"),
-    ref("defaultWriteSpaceId", "brain_spaces"),
+    ref("personalSpaceId", "spaces"),
+    ref("defaultWriteSpaceId", "spaces"),
   ]),
   table(
     "apiKeys",
-    "brain_api_keys",
+    "api_keys",
     false,
     true,
     [
@@ -209,7 +211,7 @@ export const TABLES: TableSpec[] = [
           pg: "api_key_spaces",
           parentColumn: "api_key_id",
           valueColumn: "space_id",
-          valueRefTable: "brain_spaces",
+          valueRefTable: "spaces",
         },
         {
           convexField: "sourceAccountIds",
@@ -318,7 +320,7 @@ export const TABLES: TableSpec[] = [
     text("outputMediaType"),
     text("hashAuthority"),
     ref("userId", "users"),
-    ref("actorCredentialId", "brain_api_keys"),
+    ref("actorCredentialId", "api_keys"),
     ts("createdAt"),
   ]),
   table(
@@ -352,7 +354,7 @@ export const TABLES: TableSpec[] = [
       text("verificationKind"),
       ts("readbackVerifiedAt"),
       ref("userId", "users"),
-      ref("actorCredentialId", "brain_api_keys"),
+      ref("actorCredentialId", "api_keys"),
       ts("createdAt"),
     ],
   ),
@@ -374,7 +376,7 @@ export const TABLES: TableSpec[] = [
       num("bindingEpoch"),
       ts("updatedAt"),
       ref("userId", "users"),
-      ref("actorCredentialId", "brain_api_keys"),
+      ref("actorCredentialId", "api_keys"),
     ],
   ),
   table(
@@ -416,12 +418,12 @@ export const TABLES: TableSpec[] = [
       text("verificationKind"),
       ts("readbackVerifiedAt"),
       ref("receiptUserId", "users"),
-      ref("receiptActorCredentialId", "brain_api_keys"),
+      ref("receiptActorCredentialId", "api_keys"),
       ts("receiptCreatedAt"),
       text("objectOutcome"),
       text("backupOutcome"),
       ref("actorUserId", "users"),
-      ref("actorCredentialId", "brain_api_keys"),
+      ref("actorCredentialId", "api_keys"),
       ts("completedAt"),
     ],
   ),
@@ -459,7 +461,7 @@ export const TABLES: TableSpec[] = [
       ts("locatorReadbackVerifiedAt"),
       text("verificationAuthority"),
       ref("userId", "users"),
-      ref("actorCredentialId", "brain_api_keys"),
+      ref("actorCredentialId", "api_keys"),
       ts("createdAt"),
     ],
   ),
@@ -476,7 +478,7 @@ export const TABLES: TableSpec[] = [
       num("bindingEpoch"),
       ts("verifiedAt"),
       ref("userId", "users"),
-      ref("actorCredentialId", "brain_api_keys"),
+      ref("actorCredentialId", "api_keys"),
       ts("updatedAt"),
     ],
   ),
@@ -506,7 +508,7 @@ export const TABLES: TableSpec[] = [
       text("retentionDisclosure"),
       text("providerSourceOutcome"),
       ref("actorUserId", "users"),
-      ref("actorCredentialId", "brain_api_keys"),
+      ref("actorCredentialId", "api_keys"),
       ts("completedAt"),
     ],
   ),
@@ -654,7 +656,7 @@ export const TABLES: TableSpec[] = [
     ref("processingGenerationId", "processing_generations"),
     ref("ingestJobId", "ingest_jobs"),
     ref("actorUserId", "users"),
-    ref("actorCredentialId", "brain_api_keys"),
+    ref("actorCredentialId", "api_keys"),
   ]),
   table("ingestJobs", "ingest_jobs", true, true, [
     ref("sourceAccountId", "source_accounts"),
@@ -662,9 +664,9 @@ export const TABLES: TableSpec[] = [
     ref("sourceRevisionId", "brain_source_revisions"),
     ref("processingGenerationId", "processing_generations"),
     ref("admittedByUserId", "users"),
-    ref("admittedByCredentialId", "brain_api_keys"),
+    ref("admittedByCredentialId", "api_keys"),
     ref("actorUserId", "users"),
-    ref("actorCredentialId", "brain_api_keys"),
+    ref("actorCredentialId", "api_keys"),
     ts("actorReplacedAt"),
     ref("actorReplacedBy", "users"),
     num("desiredProcessingEpoch"),
@@ -674,7 +676,7 @@ export const TABLES: TableSpec[] = [
     text("leaseToken"),
     ts("leaseExpiresAt"),
     bool("workerManaged"),
-    ref("workerLeaseOwnerCredentialId", "brain_api_keys"),
+    ref("workerLeaseOwnerCredentialId", "api_keys"),
     ts("nextAttemptAt"),
     json("error"),
     ref("workerDiscoveryWorkId", "worker_discovery_work"),
@@ -688,7 +690,7 @@ export const TABLES: TableSpec[] = [
     ref("processingGenerationId", "processing_generations"),
     ref("ingestJobId", "ingest_jobs"),
     ref("actorUserId", "users"),
-    ref("actorCredentialId", "brain_api_keys"),
+    ref("actorCredentialId", "api_keys"),
     text("state"),
     num("attempts"),
     ts("nextAttemptAt"),
@@ -697,7 +699,7 @@ export const TABLES: TableSpec[] = [
     ts("updatedAt"),
   ]),
   table("ingestRateLimits", "ingest_rate_limits", false, false, [
-    ref("credentialId", "brain_api_keys"),
+    ref("credentialId", "api_keys"),
     ts("windowStartedAt"),
     num("count"),
   ]),
@@ -705,7 +707,7 @@ export const TABLES: TableSpec[] = [
     ref("sourceAccountId", "source_accounts"),
     ref("sourceItemId", "source_items"),
     ref("actorUserId", "users"),
-    ref("actorCredentialId", "brain_api_keys"),
+    ref("actorCredentialId", "api_keys"),
     text("requestId"),
     text("requestDigest"),
     text("url"),
@@ -850,7 +852,7 @@ export const TABLES: TableSpec[] = [
   // --- Query sessions
   table("recordQuerySessions", "record_query_sessions", true, false, [
     ref("userId", "users"),
-    ref("credentialId", "brain_api_keys"),
+    ref("credentialId", "api_keys"),
     ref("membershipId", "space_members"),
     text("authorizationSignature"),
     text("operation"),
@@ -1097,7 +1099,7 @@ export const TABLES: TableSpec[] = [
     num("inventoryEpoch"),
     num("manifestVersionAtBegin"),
     ref("actorUserId", "users"),
-    ref("actorCredentialId", "brain_api_keys"),
+    ref("actorCredentialId", "api_keys"),
     text("state"),
     num("nextPageOrdinal"),
     text("inventoryCursor"),
@@ -1203,11 +1205,11 @@ export const TABLES: TableSpec[] = [
     text("docType"),
     text("uri"),
     ref("actorUserId", "users"),
-    ref("actorCredentialId", "brain_api_keys"),
+    ref("actorCredentialId", "api_keys"),
     num("attempts"),
     num("leaseEpoch"),
     text("leaseToken"),
-    ref("leaseOwnerCredentialId", "brain_api_keys"),
+    ref("leaseOwnerCredentialId", "api_keys"),
     ts("leaseExpiresAt"),
     ts("nextAttemptAt"),
     text("failureCode"),
@@ -1233,25 +1235,31 @@ export const TABLES: TableSpec[] = [
     false,
     false,
     [
-      ref("credentialId", "brain_api_keys"),
+      ref("credentialId", "api_keys"),
       ref("sourceAccountId", "source_accounts"),
       ts("windowStartedAt"),
       num("count"),
     ],
   ),
-  table("workerReservationReceipts", "worker_reservation_receipts", true, true, [
-    ref("sourceAccountId", "source_accounts"),
-    text("kind"),
-    text("requestId"),
-    text("requestDigest"),
-    ref("actorUserId", "users"),
-    ref("actorCredentialId", "brain_api_keys"),
-    num("targetCount"),
-    ts("createdAt"),
-    ts("expiresAt"),
-    ts("invalidatedAt"),
-    ts("retireAt"),
-  ]),
+  table(
+    "workerReservationReceipts",
+    "worker_reservation_receipts",
+    true,
+    true,
+    [
+      ref("sourceAccountId", "source_accounts"),
+      text("kind"),
+      text("requestId"),
+      text("requestDigest"),
+      ref("actorUserId", "users"),
+      ref("actorCredentialId", "api_keys"),
+      num("targetCount"),
+      ts("createdAt"),
+      ts("expiresAt"),
+      ts("invalidatedAt"),
+      ts("retireAt"),
+    ],
+  ),
   table("workerReservationTargets", "worker_reservation_targets", true, true, [
     ref("sourceAccountId", "source_accounts"),
     ref("sourceItemId", "source_items"),
@@ -1272,7 +1280,7 @@ export const TABLES: TableSpec[] = [
     text("requestId"),
     text("requestDigest"),
     ref("actorUserId", "users"),
-    ref("actorCredentialId", "brain_api_keys"),
+    ref("actorCredentialId", "api_keys"),
     num("leaseEpoch"),
     text("leaseTokenHash"),
     ref("sourceRevisionId", "brain_source_revisions"),
@@ -1308,7 +1316,7 @@ export const TABLES: TableSpec[] = [
       text("requestId"),
       text("requestDigest"),
       ref("actorUserId", "users"),
-      ref("actorCredentialId", "brain_api_keys"),
+      ref("actorCredentialId", "api_keys"),
       num("leaseEpoch"),
       text("leaseTokenHash"),
       ts("leaseExpiresAtAtRequest"),
@@ -1319,10 +1327,7 @@ export const TABLES: TableSpec[] = [
       ref("ingestJobId", "ingest_jobs"),
       num("desiredProcessingEpoch"),
       text("archiveSetDigest"),
-      ref(
-        "originalProviderReferenceId",
-        "source_provider_original_references",
-      ),
+      ref("originalProviderReferenceId", "source_provider_original_references"),
       num("originalProviderBindingEpoch"),
       ref("stageId", "worker_parsed_stages"),
       text("stagePhase"),
@@ -1353,7 +1358,7 @@ export const TABLES: TableSpec[] = [
       text("requestId"),
       text("requestDigest"),
       ref("actorUserId", "users"),
-      ref("actorCredentialId", "brain_api_keys"),
+      ref("actorCredentialId", "api_keys"),
       num("inventoryEpoch"),
       num("completedInventoryEpoch"),
       num("manifestVersion"),
@@ -1398,7 +1403,7 @@ export const TABLES: TableSpec[] = [
     text("state"),
     text("connectorVersion"),
     ref("actorUserId", "users"),
-    ref("actorCredentialId", "brain_api_keys"),
+    ref("actorCredentialId", "api_keys"),
     ts("lastSeenAt"),
     ts("nextExpectedAt"),
     ts("sweepAfter"),

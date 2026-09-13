@@ -38,8 +38,12 @@ async function tryDocker() {
   }
   let dockerPostgres;
   try {
+    // `packages/kith-store`, not `packages/postgres-proof`: the prototype package
+    // was renamed by P2-39a and this import silently resolved to nothing, so the
+    // Docker path was never taken and the whole suite skipped in CI. Check 6's
+    // denial surface runs here now, so a silent skip is a silently unproven gate.
     dockerPostgres = await import(
-      "../../postgres-proof/integration/docker-postgres.mjs"
+      "../../kith-store/integration/docker-postgres.mjs"
     );
   } catch {
     return null;
