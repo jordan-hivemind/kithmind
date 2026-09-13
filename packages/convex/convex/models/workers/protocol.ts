@@ -302,6 +302,14 @@ export type WorkerRequest =
       requestId: string;
       identity: ArchivedWorkIdentity;
       failureCode: string;
+      /**
+       * P2-80g: the client has spent its own bounded parse budget on this
+       * document (`MAX_PARSE_ATTEMPTS` in the pipeline's archive catalog) and
+       * will not offer it again. The server's larger attempt bound then stops
+       * mattering: the failure is terminal because nobody is going to retry
+       * it. Absent means "the client may try again".
+       */
+      exhausted?: boolean;
     })
   | (WorkerSourceRequest & {
       operation: "discovery.reserveArchived";
@@ -2019,7 +2027,11 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
         }),
       };
     case "discovery.failArchived":
-      exactKeys(input, [...baseKeys, "requestId", "identity", "failureCode"]);
+      exactKeys(
+        input,
+        [...baseKeys, "requestId", "identity", "failureCode"],
+        ["exhausted"],
+      );
       return {
         ...base,
         operation: "discovery.failArchived",
@@ -2029,6 +2041,9 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
           maxUtf16: 64,
           pattern: PARSER_FAILURE_CODE,
         }),
+        ...(input.exhausted === undefined
+          ? {}
+          : { exhausted: optionalBoolean(input.exhausted) }),
       };
     case "discovery.reserveArchived":
       exactKeys(input, [...baseKeys, "requestId", "identity"]);

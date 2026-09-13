@@ -1293,6 +1293,109 @@ describe("worker processing assessments", () => {
     });
   });
 
+  // P2-80g: the production shape behind `staleReason: "detail_unavailable"`.
+  // `discovery.failArchived` wrote `state: "failed"`, `retryable: true` and
+  // cleared `nextAttemptAt`, but `validDiscoveryWorkRuntimeState` requires a
+  // retryable failure to name the instant it is next eligible (the invariant
+  // `jobs.fail` keeps). `classifyWork` therefore threw `scan_conflict`, the
+  // page loop swallowed it, and every pass ended `assessment_stale`. Scale is
+  // not load-bearing here: production had 7 such entries beside 77 unchanged
+  // and 24 gap entries, and one is enough to fail the whole assessment.
+  async function seedQueuedArchivedFailure(
+    f: Fixture,
+    nextAttemptAt: number | undefined,
+  ) {
+    const pending = await seedPendingCurrent(f);
+    await f.t.run(async (ctx) => {
+      const work = await ctx.db
+        .query("workerDiscoveryWork")
+        .withIndex("by_sourceItemId", (q) =>
+          q.eq("sourceItemId", pending.itemId),
+        )
+        .unique();
+      if (!work) throw new Error("missing work");
+      await ctx.db.patch(work._id, {
+        state: "failed",
+        attempts: 5,
+        retryable: true,
+        failureCode: "conversion_failed",
+        nextAttemptAt,
+      });
+    });
+    return pending;
+  }
+
+  test("fails the assessment closed on a retryable failure with no next attempt", async () => {
+    const f = await fixture();
+    const pending = await seedQueuedArchivedFailure(f, undefined);
+    const { result } = await completeAssessment(
+      f,
+      pending.scanId,
+      f.principal,
+      "invalid-retryable-assessment",
+    );
+    expect(result).toMatchObject({
+      state: "stale",
+      staleReason: "detail_unavailable",
+    });
+  });
+
+  test("counts a retryable archived parse failure behind a queued entry", async () => {
+    const f = await fixture();
+    const pending = await seedQueuedArchivedFailure(f, 100);
+    const { begun, result } = await completeAssessment(
+      f,
+      pending.scanId,
+      f.principal,
+      "retryable-failure-assessment",
+    );
+    expect(result).toMatchObject({
+      state: "incomplete",
+      counts: { items: { failed: 1, needsReview: 0, pending: 0, ready: 0 } },
+    });
+    const stored = await f.t.run(async (ctx) =>
+      ctx.db.get(
+        ctx.db.normalizeId("workerProcessingAssessments", begun.assessmentId)!,
+      ),
+    );
+    expect(stored?.accountedScanEntries).toBe(1);
+    expect(stored?.queuedScanEntries).toBe(1);
+  });
+
+  // The state P2-80g settles a deterministic document failure into on the
+  // pass that reports it: the entry is still `queued` from the scan, but the
+  // work row is terminal, so it is valid and reads as needing review.
+  test("counts a settled archived parse failure behind a queued entry for review", async () => {
+    const f = await fixture();
+    const pending = await seedPendingCurrent(f);
+    await f.t.run(async (ctx) => {
+      const work = await ctx.db
+        .query("workerDiscoveryWork")
+        .withIndex("by_sourceItemId", (q) =>
+          q.eq("sourceItemId", pending.itemId),
+        )
+        .unique();
+      if (!work) throw new Error("missing work");
+      await ctx.db.patch(work._id, {
+        state: "failed",
+        attempts: 1,
+        retryable: false,
+        failureCode: "conversion_failed",
+        nextAttemptAt: undefined,
+      });
+    });
+    const { result } = await completeAssessment(
+      f,
+      pending.scanId,
+      f.principal,
+      "settled-queued-assessment",
+    );
+    expect(result).toMatchObject({
+      state: "incomplete",
+      counts: { items: { needsReview: 1, failed: 0, pending: 0, ready: 0 } },
+    });
+  });
+
   test("classifies a revoked unfinished actor for review while retaining ready publication", async () => {
     const pendingFixture = await fixture();
     const pending = await seedPendingCurrent(pendingFixture);
