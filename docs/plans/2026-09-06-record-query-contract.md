@@ -214,6 +214,15 @@ with unknown coverage mean no indexed match, not proof that no event occurred.
 
 ## Phase 1 limits
 
+The PostgreSQL consolidation now includes the query-session foundation. Migration
+012 adds nonunique bounded lookup indexes, while the runtime detects duplicate
+legacy state. The `kith-store` records export reserves snapshot epochs against
+the worker publication clock, binds single-use sessions to fresh authorization,
+and enforces absolute expiry, active-session, cursor and accumulator limits in a
+caller-owned `SERIALIZABLE` transaction. This accepts the session component only.
+The PostgreSQL record scans, hydration transport, principal reload, coverage and
+full query runner remain later P2-39f work.
+
 Each indexed candidate scan examines at most 256 rows. Latest operations
 inspect separate date and instant indexes so import order cannot establish
 recency. History and event-list pages return at most 25 records. Query

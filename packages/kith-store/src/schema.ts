@@ -109,6 +109,14 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
     name: "record staging: stable identity and generation lookup indexes (P2-39f2)",
     url: new URL("../migrations/011_record_staging.sql", import.meta.url),
   },
+  {
+    version: 12,
+    name: "record query sessions: bounded active and visibility lookups (P2-39f4)",
+    url: new URL(
+      "../migrations/012_record_query_sessions.sql",
+      import.meta.url,
+    ),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */
