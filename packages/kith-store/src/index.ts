@@ -39,6 +39,7 @@ export {
 } from "./schema.js";
 export * as provenance from "./provenance/index.js";
 export * as documents from "./documents/index.js";
+export * as memory from "./memory/index.js";
 export * as ingestion from "./ingestion/index.js";
 export * as workers from "./workers/index.js";
 

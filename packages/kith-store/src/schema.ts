@@ -97,6 +97,11 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
     name: "worker protocol: scan, discovery and receipt constraints and indexes (P2-39e)",
     url: new URL("../migrations/008_worker_protocol.sql", import.meta.url),
   },
+  {
+    version: 9,
+    name: "memory: entities, facts and thoughts domain constraints and indexes (P2-39h)",
+    url: new URL("../migrations/009_memory.sql", import.meta.url),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */
