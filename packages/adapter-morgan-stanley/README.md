@@ -707,6 +707,8 @@ cash at all, not which way.
 | Redemption                 | yes  | yes | negative | A maturing or called instrument pays out and retires the position. |
 | Exchange Deliver Out       | no   | yes | negative | In-kind delivery out; the position leaves, no cash crosses.       |
 | Exchange Received In       | no   | yes | positive | In-kind receipt; the position arrives, no cash crosses.           |
+| Transfer out of Account    | no   | yes | negative | The same in-kind journal, the site's other wording; delivery side (F1-8d). |
+| Transfer into Account      | no   | yes | positive | The same in-kind journal, the site's other wording; receipt side (F1-8d).  |
 | Option Expired             | no   | yes | negative | An expiring contract leaves the position with no settlement.      |
 | Dividend Stock             | no   | yes | positive | The dividend is paid in shares, so quantity moves and cash does not. |
 | Dividend                   | yes  | no  | none     | An income credit against a holding; no quantity changes.          |
@@ -722,6 +724,20 @@ cash at all, not which way.
 | Withdrawal                 | yes  | no  | none     | Cash leaving the account.                                         |
 | Contribution               | yes  | no  | none     | Cash entering the account.                                        |
 | Automated Payment          | yes  | no  | none     | A scheduled cash debit to a payee.                                |
+
+`Transfer out of Account`/`Transfer into Account` were reviewed from the
+owner's archive in F1-8d, in counts only. Every `Transfer out of Account` row
+pairs with a `Transfer into Account` row on a *different* account at the same
+date, instrument and magnitude, and none pairs within one account, so the two
+labels are the delivery and receipt sides of one in-kind journal between two
+accounts -- the same event `Exchange Deliver Out`/`Exchange Received In` spell
+the other way. The site states no quantity and no price on these rows, only the
+value journalled, and it was that value the cash gate was summing as cash: the
+delta of 17 failing periods equalled exactly the window's sum of these two
+types, and no passing period contained a non-zero sum of them. Declaring them
+`movesCash: false` nulls that value with a `cash_on_noncash_activity` review
+item per row rather than dropping it silently, which is the point: the amount
+is real, it is just not cash.
 
 Load-bearing assumption for `Dividend Reinvestment`: the site is assumed to
 book a reinvested dividend as two rows -- the credit under `Dividend` or

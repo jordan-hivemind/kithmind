@@ -745,6 +745,51 @@ separate concern from checking it. Re-running after a corrected import is
 idempotent: any prior row for the same account and period is replaced, not
 added to.
 
+### Applying a taxonomy change to rows already stored (F1-8d)
+
+An adapter's `activityTaxonomy` is read at import time, so declaring an
+activity type `movesCash: false` changes what the importer *stores* and nothing
+about what is already stored. Three paths look as though they would carry the
+change onto existing rows, and none of them does:
+
+| Path | What actually happens |
+| --- | --- |
+| `run.js reparse --adapter <module>` | `REPARSEABLE_TIERS` is `pdf_statement` and `trade_confirmation` only. A structured activity pull can split one retained file across several `documents` rows sharing one `retained_sha256`, so `openRetainedDocument` returns null for it and the walk counts it in `documentsSkippedTier`. Activity-pull rows are never re-parsed. |
+| a fresh pull and import | An activity row carries `provider_txn_id`, and `importRows` treats a provider-id match as an authoritative identity match: `rowsDeduplicated += 1; continue`. A skip, not a rewrite. Nothing in `src/` issues an `UPDATE transactions` at all. |
+| falling back to `row_hash` | `amount` is in `rowHash`'s preimage, so a row whose amount the new declaration nulls hashes differently and would insert a *second* row rather than deduplicate. Worse than the skip, and avoided here only because every row in scope carries a provider id. |
+
+`scripts/nullNonCashAmounts.mjs` is what applies it. It reads the taxonomy off
+the adapter rather than naming activity types, so it cannot drift from the
+declaration it is applying and it serves the next declaration too. For every
+stored transaction of that institution whose type is now `movesCash: false` and
+whose `amount` is still set, it nulls the amount and opens the same
+`cash_on_noncash_activity` item with the same `raw_value` and wording
+`classifyActivity` would have opened -- deduplicated against
+`review_items_dedupe_key` exactly as `flushReviews` does, so a second run
+opens nothing. It ends with a cash-gate pass scoped to the rows it changed, so
+those periods' verdicts are rewritten in the same transaction and no others
+are touched.
+
+Development-first, and `--dry-run` reports every count and writes nothing:
+
+```
+FINANCE_ARCHIVE_DATABASE_URL=postgresql://<owner>@<host>/<db> \
+  node scripts/nullNonCashAmounts.mjs \
+  --adapter ../adapter-morgan-stanley/src/adapter.mjs --dry-run
+FINANCE_ARCHIVE_DATABASE_URL=postgresql://<owner>@<host>/<db> \
+  node scripts/nullNonCashAmounts.mjs \
+  --adapter ../adapter-morgan-stanley/src/adapter.mjs
+```
+
+It leaves `row_hash` alone: recomputing it would have to re-derive every row's
+per-document occurrence ordinal (two rows differing only in their amounts
+collapse to one content key once both are null), and getting that wrong breaks
+the `row_hash` UNIQUE invariant rather than a dedupe fallback that no row in
+scope uses. The script reports the count of in-scope rows carrying no
+`provider_txn_id` so an archive where that is not zero is visible rather than
+assumed. It also leaves stored quantities alone: nulling those moves the
+position gate, which is a separate gate needing its own evidence.
+
 ## Position quantity gate
 
 `runPositionReconciliationGate(client, importRunId?, scope?)`
