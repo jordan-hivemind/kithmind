@@ -12,6 +12,11 @@
 // `createdAt`, the locator bundle's `readbackVerifiedAt`, and the
 // bindings' own `updatedAt` -- cross into `Date`, matching every other
 // ported table in this package.
+//
+// The worker service owns authorization and transaction scope. This module
+// validates a declaration and its row relationships only after that service
+// has checked the declared source account, item and revision belong to the
+// caller's currently authorized space.
 
 import type { ProviderOriginalDeclaration } from "@repo/worker-protocol";
 import type { ClientBase, QueryResultRow } from "pg";

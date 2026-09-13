@@ -19,6 +19,16 @@
 // patched onto the sealed `documents` row -- patching it would change
 // `manifest.documentDigest` and break `verifySealedParsedPayload` for every
 // document a card had refined.
+//
+// This is a lower-level data service. Its callers must authenticate and derive
+// `spaceIds` from current grants before calling it; the array narrows reads but
+// is not an authorization decision. Callers that need a repeatable read across
+// several service calls must also provide a client inside their own transaction.
+// PostgreSQL values are surfaced as `Date`; the HTTP/MCP adapter serializes
+// them to ISO timestamps, whereas the Convex surface serialized its millisecond
+// numbers at that outer boundary. `ts_rank` supplies deterministic PostgreSQL
+// keyword ordering only. It is not claimed to reproduce Convex search scores;
+// retrieval-rank parity remains row g's acceptance work.
 
 import type { ClientBase, QueryResultRow } from "pg";
 

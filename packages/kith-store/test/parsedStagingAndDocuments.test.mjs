@@ -49,9 +49,13 @@ async function seedUser(client) {
   return id;
 }
 
-async function seedApiKey(client) {
+async function seedApiKey(client, userId) {
   const id = opaqueId();
-  await client.query("INSERT INTO kith.brain_api_keys (id, created_at) VALUES ($1,transaction_timestamp())", [id]);
+  await client.query(
+    `INSERT INTO kith.api_keys (id, user_id, key_hash, key_prefix, name, created_at)
+     VALUES ($1,$2,$3,'test_key','Synthetic test key',transaction_timestamp())`,
+    [id, userId, await sha256Utf8(id)],
+  );
   return id;
 }
 
@@ -161,7 +165,7 @@ test(
     const spaceId = seedSpace();
     const sourceAccountId = await seedSourceAccount(client, spaceId);
     const userId = await seedUser(client);
-    const actorCredentialId = await seedApiKey(client);
+    const actorCredentialId = await seedApiKey(client, userId);
 
     const item = await provenance.createOrGetSourceItem(client, {
       spaceId,
@@ -359,7 +363,7 @@ test(
     const spaceId = seedSpace();
     const sourceAccountId = await seedSourceAccount(client, spaceId);
     const userId = await seedUser(client);
-    const actorCredentialId = await seedApiKey(client);
+    const actorCredentialId = await seedApiKey(client, userId);
 
     const item = await provenance.createOrGetSourceItem(client, { spaceId, sourceAccountId, externalId: "fixture/archived.bin" });
     const revision = await provenance.createOrGetArchivedRevision(client, {
@@ -509,7 +513,7 @@ test("provider original references bind, rebind on a newer verification, and rej
   const spaceId = seedSpace();
   const sourceAccountId = await seedSourceAccount(client, spaceId);
   const userId = await seedUser(client);
-  const actorCredentialId = await seedApiKey(client);
+  const actorCredentialId = await seedApiKey(client, userId);
   const item = await provenance.createOrGetSourceItem(client, { spaceId, sourceAccountId, externalId: "fixture/dropbox.bin" });
   const revision = await provenance.createOrGetArchivedRevision(client, {
     spaceId,
@@ -720,12 +724,20 @@ test("getDocument and searchDocuments overlay the item's live card doc type onto
 
   const after = await documents.getDocument(client, [spaceId], document.id);
   assert.equal(after.docType, "invoice");
+  assert.deepEqual(JSON.parse(JSON.stringify(after)), {
+    ...JSON.parse(JSON.stringify(before)),
+    docType: "invoice",
+  });
   const documentRow = (await client.query("SELECT doc_type FROM kith.documents WHERE id = $1", [document.id])).rows[0];
   assert.equal(documentRow.doc_type, "statement", "the sealed document row itself is untouched");
 
   const searchAfter = await documents.searchDocuments(client, [spaceId], { query: "quarterly", docType: "invoice" });
   assert.equal(searchAfter.results.length, 1);
   assert.equal(searchAfter.results[0].docType, "invoice");
+  assert.equal(
+    JSON.parse(JSON.stringify(searchAfter.results[0])).capturedAt,
+    "2026-02-01T00:00:00.000Z",
+  );
 
   const filteredOut = await documents.searchDocuments(client, [spaceId], { query: "quarterly", docType: "statement" });
   assert.equal(filteredOut.results.length, 0);

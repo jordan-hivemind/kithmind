@@ -35,6 +35,12 @@
 // counts against the parser's manifest, so a document a card had staged
 // evidence over does not fail `scan_conflict` for content the parser never
 // produced.
+//
+// These functions are transaction and authorization agnostic. The worker
+// service authenticates the caller, checks the generation's current space and
+// lease, then supplies a client in its staging transaction. Parsed document
+// input keeps the worker protocol's epoch-millisecond `capturedAt`; this module
+// converts it to PostgreSQL `timestamptz` (`Date`) at the storage boundary.
 
 import type {
   ParsedChunkInput,

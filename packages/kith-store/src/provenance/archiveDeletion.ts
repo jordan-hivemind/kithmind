@@ -4,6 +4,10 @@
 // item it names so a forged or stale ack can never stand in for the real
 // one. `forgetEpoch` is the fence `beginSourceItemForget` (model.ts)
 // advances: an ack is only valid for the forget cycle that requested it.
+//
+// The caller is responsible for current authorization and transaction scope;
+// this module only validates and reads a supplied item/receipt/forget-epoch
+// tuple and cannot turn a caller-provided space into an access grant.
 
 import type { ClientBase, QueryResultRow } from "pg";
 

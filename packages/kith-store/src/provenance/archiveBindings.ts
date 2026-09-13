@@ -6,6 +6,11 @@
 // this port, like the original, never advances it (advancing it belongs to
 // the caller that re-selects a receipt after a successful new archive,
 // which is ingestion/worker-protocol territory, row e).
+//
+// This lower-level service does not authenticate an actor or open a
+// transaction. The worker service must authorize the supplied receipt and
+// actor against its current space and provide the transaction when binding is
+// part of a larger archive operation.
 
 import type { ClientBase, QueryResultRow } from "pg";
 

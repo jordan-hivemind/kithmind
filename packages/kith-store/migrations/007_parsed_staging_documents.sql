@@ -1,19 +1,8 @@
 -- P2-39d2: two columns kith-migrate's snapshot (migration 004) did not carry,
 -- needed by the provenance/documents read surface this row ports.
 --
--- AGENTS.md reserves 006 for the parallel P2-39c identity port. This row's
--- task brief asked for 007 on that basis, but `git fetch origin && git
--- checkout -b task/P2-39d2 origin/main` found no migration 006 registered in
--- src/schema.ts's KITH_MIGRATIONS -- P2-39c has not merged yet -- and the
--- runner in schema.ts refuses any gap (`migration.version !== current + 1`
--- throws `schema_version_gap`), so registering this as version 7 with no
--- version 6 present would fail `applyKithSchema` immediately, on this branch,
--- for every test. 006 is the next free number in practice, so this uses it
--- and is named accordingly; whichever of P2-39c or this row merges second
--- must rebase and renumber its own migration to keep the sequence gapless.
--- P2-39c has since landed migration 006, so this is migration 007.
--- (the same accommodation this row's brief already made in the other
--- direction). Noted for the tracker and for GitHub Issue 57.
+-- P2-39c landed the identity port as migration 006. This migration is 007,
+-- preserving the required contiguous registry.
 --
 -- 1. `source_items.card_doc_type`. Convex's `sourceItemFields` (P2-80i,
 --    models/provenance/validators.ts) added this column after the schema
