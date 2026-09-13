@@ -134,6 +134,43 @@ describe("closed requests and trusted authorization", () => {
     rejects("invalid_response", () => parseExchange(snapshot));
   });
 
+  it("preserves account identity when base currency is unknown", () => {
+    const compatible = clone(syntheticFinanceReadExchanges[6]);
+    delete compatible.response.items[0].disclosures;
+    assert.deepEqual(
+      parseExchange(compatible).response.items[0].disclosures,
+      [],
+    );
+
+    for (const index of [6, 7]) {
+      const exchange = clone(syntheticFinanceReadExchanges[index]);
+      const descriptor =
+        index === 6 ? exchange.response.items[0] : exchange.response.account;
+      delete descriptor.baseCurrency;
+      descriptor.disclosures = [
+        { field: "baseCurrency", reason: "not_reported" },
+      ];
+      const response = parseExchange(exchange).response;
+      const parsed =
+        response.operation === "list_accounts"
+          ? response.items[0]
+          : response.account;
+      assert.equal(parsed.accountId, "account-synthetic-001");
+      assert.equal(parsed.baseCurrency, undefined);
+      assert.deepEqual(parsed.disclosures, descriptor.disclosures);
+    }
+
+    const undisclosed = clone(syntheticFinanceReadExchanges[6]);
+    delete undisclosed.response.items[0].baseCurrency;
+    rejects("invalid_response", () => parseExchange(undisclosed));
+
+    const contradictory = clone(syntheticFinanceReadExchanges[6]);
+    contradictory.response.items[0].disclosures = [
+      { field: "baseCurrency", reason: "unsupported_value" },
+    ];
+    rejects("invalid_response", () => parseExchange(contradictory));
+  });
+
   it("pins a request to its expected dataset revision", () => {
     const exchange = clone(syntheticFinanceReadExchanges[7]);
     exchange.request.expectedDatasetRevision = "dataset-revision-other";

@@ -231,7 +231,11 @@ export type FinanceAccountDescriptor = {
   accountLast4?: string;
   displayLabel?: string;
   accountType?: string;
-  baseCurrency: FinanceCurrency;
+  baseCurrency?: FinanceCurrency;
+  disclosures: Array<{
+    field: "baseCurrency";
+    reason: "not_reported" | "unsupported_value";
+  }>;
 };
 
 export type FinanceHoldingsSnapshotSelector =
@@ -1505,15 +1509,49 @@ function accountDescriptor(value: unknown): FinanceAccountDescriptor {
   const input = object(value, "invalid_response");
   exact(
     input,
-    ["accountId", "sourceId", "institutionName", "baseCurrency"],
-    ["accountLast4", "displayLabel", "accountType"],
+    ["accountId", "sourceId", "institutionName"],
+    [
+      "accountLast4",
+      "displayLabel",
+      "accountType",
+      "baseCurrency",
+      "disclosures",
+    ],
     "invalid_response",
   );
+  const disclosures = denseArray(
+    input.disclosures === undefined ? [] : input.disclosures,
+    0,
+    1,
+    "invalid_response",
+  ).map((value) => {
+    const disclosure = object(value, "invalid_response");
+    exact(disclosure, ["field", "reason"], [], "invalid_response");
+    if (disclosure.field !== "baseCurrency") fail("invalid_response");
+    return {
+      field: "baseCurrency" as const,
+      reason: oneOf(
+        disclosure.reason,
+        ["not_reported", "unsupported_value"] as const,
+        "invalid_response",
+      ),
+    };
+  });
+  if ((input.baseCurrency === undefined) === (disclosures.length === 0))
+    fail("invalid_response");
   return {
     accountId: opaqueId<"account">(input.accountId, "invalid_response"),
     sourceId: opaqueId<"source">(input.sourceId, "invalid_response"),
     institutionName: text(input.institutionName, 256, "invalid_response"),
-    baseCurrency: parseFinanceCurrency(input.baseCurrency, "invalid_response"),
+    ...(input.baseCurrency === undefined
+      ? {}
+      : {
+          baseCurrency: parseFinanceCurrency(
+            input.baseCurrency,
+            "invalid_response",
+          ),
+        }),
+    disclosures,
     ...(input.accountLast4 === undefined
       ? {}
       : { accountLast4: accountLast4(input.accountLast4, "invalid_response") }),

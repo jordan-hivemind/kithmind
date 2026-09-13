@@ -921,18 +921,21 @@ type AccountDescriptorRow = {
   acct_last4: string | null;
   display_name: string | null;
   account_type: string | null;
-  base_currency: string;
+  base_currency: string | null;
 };
 
 function accountDescriptorOf(
   row: AccountDescriptorRow,
-): FinanceAccountDescriptor | null {
-  const baseCurrency = currencyOrNull(row.base_currency, {
-    withheld: new Set(),
-    spaceId: "" as FinanceSpaceId,
-    datasetRevision: "" as FinanceDatasetRevision,
-  });
-  if (baseCurrency === null) return null;
+  scope: ReadScope,
+): FinanceAccountDescriptor {
+  const baseCurrency =
+    row.base_currency !== null && supportedCurrencies.has(row.base_currency)
+      ? parseFinanceCurrency(row.base_currency)
+      : null;
+  if (baseCurrency === null)
+    scope.withheld.add(
+      row.base_currency === null ? "missing_value" : "unsupported_value",
+    );
   return {
     accountId: row.account_id as FinanceAccountId,
     sourceId: row.source_id as FinanceSourceId,
@@ -940,7 +943,19 @@ function accountDescriptorOf(
     ...(row.acct_last4 === null ? {} : { accountLast4: row.acct_last4 }),
     ...(row.display_name === null ? {} : { displayLabel: row.display_name }),
     ...(row.account_type === null ? {} : { accountType: row.account_type }),
-    baseCurrency,
+    ...(baseCurrency === null ? {} : { baseCurrency }),
+    disclosures:
+      baseCurrency === null
+        ? [
+            {
+              field: "baseCurrency",
+              reason:
+                row.base_currency === null
+                  ? ("not_reported" as const)
+                  : ("unsupported_value" as const),
+            },
+          ]
+        : [],
   };
 }
 
@@ -1002,8 +1017,7 @@ async function listAccounts(
   const totalMatches = Number(total.rows[0]!.count);
   const items = result.rows
     .slice(0, request.limit)
-    .map(accountDescriptorOf)
-    .filter((item): item is FinanceAccountDescriptor => item !== null);
+    .map((row) => accountDescriptorOf(row, scope));
   const truncated = result.rows.length > request.limit;
   const nextCursor = truncated
     ? issueFinanceCursor(
@@ -1361,9 +1375,10 @@ async function getHoldingsSnapshot(
       WHERE a.id = $1`,
     [request.accountId],
   );
-  const account =
-    accountResult.rows[0] && accountDescriptorOf(accountResult.rows[0]);
-  if (!account) throw new FinanceContractError("not_authorized");
+  const accountRow = accountResult.rows[0];
+  if (accountRow === undefined)
+    throw new FinanceContractError("not_authorized");
+  const account = accountDescriptorOf(accountRow, scope);
 
   const selected = await client.query<{ as_of: string | null }>(
     `SELECT max(as_of)::text AS as_of FROM positions
