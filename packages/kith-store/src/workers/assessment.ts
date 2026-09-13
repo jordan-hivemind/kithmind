@@ -13,12 +13,18 @@ import {
 import { newKithId, KITH_ID } from "../ids.js";
 import {
   camelizeProcessingGeneration,
+  camelizeSourceParserArtifact,
+  camelizeSourceTextVersion,
   camelizeSourceItem,
   camelizeSourceRevision,
+  loadCurrentArchiveBinding,
+  loadProviderOriginalBinding,
   requireInlineSourceRevision,
+  requireIndependentArchivePair,
   verifySealedParsedPayload,
   type SourceItemRow,
 } from "../provenance/index.js";
+import { requireArchiveReceiptChain } from "./archiveForget.js";
 import {
   ensureSameActor,
   requireOriginalActor,
@@ -33,7 +39,9 @@ import {
   workerProtocolError,
 } from "./errors.js";
 import { consumeWorkerMutationRateLimit } from "./rateLimit.js";
+import { artifactBoundExtractionFingerprint } from "./entries.js";
 import { FS_TEXT_PROFILE } from "./profile.js";
+import { requireProviderOriginalReferenceChain } from "./providerOriginalForget.js";
 import {
   camelizeAssessment,
   camelizeDiscoveryWork,
@@ -86,19 +94,79 @@ function emptyCounts(): ProcessingAssessmentCounts {
   };
 }
 
+function normalizedCounts(
+  value: Record<string, unknown> | null,
+): ProcessingAssessmentCounts | null {
+  if (
+    !value ||
+    typeof value.items !== "object" ||
+    value.items === null ||
+    typeof value.unresolvedEntries !== "object" ||
+    value.unresolvedEntries === null
+  )
+    return null;
+  const items = value.items as Record<string, unknown>;
+  const unresolved = value.unresolvedEntries as Record<string, unknown>;
+  const counts: ProcessingAssessmentCounts = {
+    items: {
+      ready: items.ready as number,
+      pending: items.pending as number,
+      failed: items.failed as number,
+      parked: (items.parked ?? 0) as number,
+      needsReview: items.needsReview as number,
+      explicitGap: items.explicitGap as number,
+      unavailable: items.unavailable as number,
+      ignoredForgotten: items.ignoredForgotten as number,
+    },
+    unresolvedEntries: {
+      needsReview: unresolved.needsReview as number,
+      ignoredForgotten: unresolved.ignoredForgotten as number,
+    },
+  };
+  return [
+    counts.items.ready,
+    counts.items.pending,
+    counts.items.failed,
+    counts.items.parked,
+    counts.items.needsReview,
+    counts.items.explicitGap,
+    counts.items.unavailable,
+    counts.items.ignoredForgotten,
+    counts.unresolvedEntries.needsReview,
+    counts.unresolvedEntries.ignoredForgotten,
+  ].every(safeInteger)
+    ? counts
+    : null;
+}
+
 function readCounts(
   value: Record<string, unknown> | null,
 ): ProcessingAssessmentCounts {
-  const counts = value as ProcessingAssessmentCounts | null;
-  if (!counts || !counts.items || !counts.unresolvedEntries) {
-    workerProtocolError("scan_conflict");
-  }
-  const values = [
-    ...Object.values(counts.items),
-    ...Object.values(counts.unresolvedEntries),
-  ];
-  if (!values.every(safeInteger)) workerProtocolError("scan_conflict");
-  return structuredClone(counts);
+  return normalizedCounts(value) ?? workerProtocolError("scan_conflict");
+}
+
+function countsEqual(
+  leftValue: Record<string, unknown> | null,
+  rightValue: Record<string, unknown> | null,
+): boolean {
+  const left = normalizedCounts(leftValue);
+  const right = normalizedCounts(rightValue);
+  return Boolean(
+    left &&
+    right &&
+    left.items.ready === right.items.ready &&
+    left.items.pending === right.items.pending &&
+    left.items.failed === right.items.failed &&
+    left.items.parked === right.items.parked &&
+    left.items.needsReview === right.items.needsReview &&
+    left.items.explicitGap === right.items.explicitGap &&
+    left.items.unavailable === right.items.unavailable &&
+    left.items.ignoredForgotten === right.items.ignoredForgotten &&
+    left.unresolvedEntries.needsReview ===
+      right.unresolvedEntries.needsReview &&
+    left.unresolvedEntries.ignoredForgotten ===
+      right.unresolvedEntries.ignoredForgotten,
+  );
 }
 
 function incrementItem(
@@ -226,10 +294,14 @@ function pageResult(
   result: StoredPage,
   reused: boolean,
 ): WorkerAssessmentPageResult {
+  const { counts, ...rest } = result;
   return {
     operation: "processing.assessPage",
     assessmentId,
-    ...result,
+    ...rest,
+    ...(counts === undefined
+      ? {}
+      : { counts: readCounts(counts as unknown as Record<string, unknown>) }),
     reused,
   };
 }
@@ -262,8 +334,12 @@ function validStoredPage(
         : terminal &&
           value.phase === "done" &&
           value.completedAt === assessment.completedAt?.getTime() &&
-          JSON.stringify(value.counts) ===
-            JSON.stringify(readCounts(assessment.counts)))
+          typeof value.counts === "object" &&
+          value.counts !== null &&
+          countsEqual(
+            value.counts as Record<string, unknown>,
+            assessment.counts,
+          ))
   );
 }
 
@@ -670,6 +746,14 @@ async function terminalReady(
       !generation.originalPrimaryReceiptId ||
       !generation.parserPrimaryReceiptId ||
       !generation.parserBackupReceiptId ||
+      item.workerProfileId !== entry.binaryParserProfileId ||
+      !entry.parserFingerprint ||
+      !entry.extractionConfigurationFingerprint ||
+      !entry.extractorFingerprint ||
+      !entry.recordSchemaFingerprint ||
+      !entry.normalizationFingerprint ||
+      !entry.chunkerFingerprint ||
+      !entry.correctionRevision ||
       Boolean(generation.originalBackupReceiptId) ===
         Boolean(generation.originalProviderReferenceId) ||
       (generation.originalProviderReferenceId !== null &&
@@ -677,6 +761,182 @@ async function terminalReady(
     )
       return false;
     try {
+      const artifactRaw = await row<Record<string, unknown>>(
+        ctx,
+        "SELECT * FROM kith.source_parser_artifacts WHERE id=$1",
+        [generation.parserArtifactId],
+      );
+      const textRaw = await row<Record<string, unknown>>(
+        ctx,
+        "SELECT * FROM kith.source_text_versions WHERE id=$1",
+        [generation.sourceTextVersionId],
+      );
+      if (!artifactRaw || !textRaw) return false;
+      const artifact = camelizeSourceParserArtifact(artifactRaw);
+      const text = camelizeSourceTextVersion(textRaw);
+      const expectedExtraction = await artifactBoundExtractionFingerprint(
+        artifact.parserFingerprint,
+        artifact.outputHash,
+        entry.extractionConfigurationFingerprint,
+      );
+      const expectedProcessing = await digestProcessingConfiguration({
+        extractionFingerprint: expectedExtraction,
+        extractorFingerprint: entry.extractorFingerprint,
+        recordSchemaFingerprint: entry.recordSchemaFingerprint,
+        normalizationFingerprint: entry.normalizationFingerprint,
+        chunkerFingerprint: entry.chunkerFingerprint,
+        correctionRevision: entry.correctionRevision,
+      });
+      if (
+        artifact.spaceId !== source.spaceId ||
+        artifact.sourceAccountId !== source.account.id ||
+        artifact.sourceItemId !== item.id ||
+        artifact.sourceRevisionId !== revision.id ||
+        artifact.parserFingerprint !== entry.parserFingerprint ||
+        text.spaceId !== source.spaceId ||
+        text.sourceRevisionId !== revision.id ||
+        text.parserArtifactId !== artifact.id ||
+        text.representation !== "parsed_pages_v1" ||
+        text.evidenceSealed !== true ||
+        text.textHashAuthority !== "server_verified_retained_text" ||
+        text.extractionFingerprint !== expectedExtraction ||
+        generation.extractionFingerprint !== expectedExtraction ||
+        generation.processingFingerprint !== expectedProcessing ||
+        generation.extractorFingerprint !== entry.extractorFingerprint ||
+        generation.recordSchemaFingerprint !== entry.recordSchemaFingerprint ||
+        generation.normalizationFingerprint !==
+          entry.normalizationFingerprint ||
+        generation.chunkerFingerprint !== entry.chunkerFingerprint ||
+        generation.correctionRevision !== entry.correctionRevision
+      )
+        return false;
+
+      const originalPrimary = await loadCurrentArchiveBinding(ctx.client, {
+        spaceId: source.spaceId,
+        sourceAccountId: source.account.id,
+        sourceItemId: item.id,
+        sourceRevisionId: revision.id,
+        subjectKind: "original_bytes",
+        copyRole: "primary",
+      });
+      const originalBackup = await loadCurrentArchiveBinding(ctx.client, {
+        spaceId: source.spaceId,
+        sourceAccountId: source.account.id,
+        sourceItemId: item.id,
+        sourceRevisionId: revision.id,
+        subjectKind: "original_bytes",
+        copyRole: "independent_backup",
+      });
+      const provider = await loadProviderOriginalBinding(
+        ctx.client,
+        revision.id,
+      );
+      const parserPrimary = await loadCurrentArchiveBinding(ctx.client, {
+        spaceId: source.spaceId,
+        sourceAccountId: source.account.id,
+        sourceItemId: item.id,
+        sourceRevisionId: revision.id,
+        parserArtifactId: artifact.id,
+        subjectKind: "parser_output",
+        copyRole: "primary",
+      });
+      const parserBackup = await loadCurrentArchiveBinding(ctx.client, {
+        spaceId: source.spaceId,
+        sourceAccountId: source.account.id,
+        sourceItemId: item.id,
+        sourceRevisionId: revision.id,
+        parserArtifactId: artifact.id,
+        subjectKind: "parser_output",
+        copyRole: "independent_backup",
+      });
+      if (
+        !originalPrimary ||
+        !parserPrimary ||
+        !parserBackup ||
+        Boolean(originalBackup) === Boolean(provider)
+      )
+        return false;
+      await requireArchiveReceiptChain(
+        ctx,
+        source,
+        item,
+        originalPrimary.receipt,
+      );
+      await requireArchiveReceiptChain(
+        ctx,
+        source,
+        item,
+        parserPrimary.receipt,
+      );
+      await requireArchiveReceiptChain(ctx, source, item, parserBackup.receipt);
+      requireIndependentArchivePair(
+        parserPrimary.receipt,
+        parserBackup.receipt,
+      );
+      if (originalBackup) {
+        await requireArchiveReceiptChain(
+          ctx,
+          source,
+          item,
+          originalBackup.receipt,
+        );
+        requireIndependentArchivePair(
+          originalPrimary.receipt,
+          originalBackup.receipt,
+        );
+      } else if (provider) {
+        await requireProviderOriginalReferenceChain(
+          ctx,
+          source,
+          item,
+          provider.reference,
+        );
+      }
+      const archiveSet = originalBackup
+        ? await digest(
+            "archive-set:v1",
+            [originalPrimary, originalBackup, parserPrimary, parserBackup].map(
+              ({ receipt, binding }) => [
+                receipt.subjectKind,
+                receipt.copyRole,
+                receipt.id,
+                binding.bindingEpoch,
+              ],
+            ),
+          )
+        : await digest("recovery-set:provider-original:v1", [
+            [
+              originalPrimary.receipt.subjectKind,
+              originalPrimary.receipt.copyRole,
+              originalPrimary.receipt.id,
+              originalPrimary.receipt.id,
+              originalPrimary.binding.bindingEpoch,
+            ],
+            [
+              "provider_original",
+              provider!.reference.id,
+              provider!.binding.bindingEpoch,
+            ],
+            ...[parserPrimary, parserBackup].map(({ receipt, binding }) => [
+              receipt.subjectKind,
+              receipt.copyRole,
+              receipt.id,
+              binding.bindingEpoch,
+            ]),
+          ]);
+      if (
+        generation.archiveSetDigest !== archiveSet ||
+        generation.originalPrimaryReceiptId !== originalPrimary.receipt.id ||
+        generation.originalBackupReceiptId !==
+          (originalBackup?.receipt.id ?? null) ||
+        generation.originalProviderReferenceId !==
+          (provider?.reference.id ?? null) ||
+        generation.originalProviderBindingEpoch !==
+          (provider?.binding.bindingEpoch ?? null) ||
+        generation.parserPrimaryReceiptId !== parserPrimary.receipt.id ||
+        generation.parserBackupReceiptId !== parserBackup.receipt.id
+      )
+        return false;
       const verified = await verifySealedParsedPayload(ctx.client, generation);
       return (
         generation.actualPageCount === verified.actualPageCount &&

@@ -56,7 +56,7 @@ function ackSummary(
   };
 }
 
-async function requireReferenceChain(
+export async function requireProviderOriginalReferenceChain(
   ctx: WorkerCtx,
   source: LoadedWorkerSource,
   item: SourceItemRow,
@@ -154,7 +154,7 @@ export async function getProviderOriginalForgetTargets(
   const targets: WorkerProviderOriginalForgetTarget[] = [];
   for (const wrapped of page.page) {
     const reference = wrapped.value;
-    await requireReferenceChain(ctx, source, item, reference);
+    await requireProviderOriginalReferenceChain(ctx, source, item, reference);
     const ackRows = (
       await rows<Record<string, unknown>>(
         ctx,
@@ -295,7 +295,7 @@ export async function acknowledgeProviderOriginalDetach(
     reference.locatorObjectName !== request.locatorObjectName
   )
     workerProtocolError("stale_observation");
-  await requireReferenceChain(ctx, source, item, reference);
+  await requireProviderOriginalReferenceChain(ctx, source, item, reference);
   await consumeWorkerMutationRateLimit(
     ctx,
     source.principal.credentialId,

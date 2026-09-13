@@ -1918,6 +1918,56 @@ test(
       assert.equal(published.lease_token, null);
       assert.equal(Number(published.activation_epoch), 1);
       assert.equal(published.activated_at.getTime(), snapshotClock + 1);
+
+      const accountSnapshot = (
+        await f.client.query(
+          "SELECT inventory_epoch, manifest_version FROM kith.source_accounts WHERE id=$1",
+          [f.sourceAccountId],
+        )
+      ).rows[0];
+      async function assessBinary(requestSuffix) {
+        const assessment = await parsedCall((ctx) =>
+          beginProcessingAssessment(ctx, f.principal, {
+            ...common,
+            operation: "processing.assessBegin",
+            requestId: `parsed-assess-${requestSuffix}`,
+            scanId: begun.scanId,
+            expectedInventoryEpoch: Number(accountSnapshot.inventory_epoch),
+            expectedManifestVersion: Number(accountSnapshot.manifest_version),
+          }),
+        );
+        await parsedCall((ctx) =>
+          advanceProcessingAssessment(ctx, f.principal, {
+            ...common,
+            operation: "processing.assessPage",
+            requestId: `parsed-assess-${requestSuffix}-items`,
+            assessmentId: assessment.assessmentId,
+            ordinal: 0,
+            maxItems: 10,
+          }),
+        );
+        return parsedCall((ctx) =>
+          advanceProcessingAssessment(ctx, f.principal, {
+            ...common,
+            operation: "processing.assessPage",
+            requestId: `parsed-assess-${requestSuffix}-unresolved`,
+            assessmentId: assessment.assessmentId,
+            ordinal: 1,
+            maxItems: 10,
+          }),
+        );
+      }
+      const validAssessment = await assessBinary("valid");
+      assert.equal(validAssessment.state, "complete");
+      assert.equal(validAssessment.counts.items.ready, 1);
+      await f.client.query(
+        `UPDATE kith.source_parser_artifacts SET parser_fingerprint=$2
+         WHERE id=(SELECT parser_artifact_id FROM kith.processing_generations WHERE id=$1)`,
+        [admitted.processingGenerationId, "f".repeat(64)],
+      );
+      const corruptAssessment = await assessBinary("corrupt-artifact");
+      assert.equal(corruptAssessment.state, "incomplete");
+      assert.equal(corruptAssessment.counts.items.needsReview, 1);
     } finally {
       await pool.end();
     }
@@ -2261,6 +2311,19 @@ test(
         ).reused,
         true,
       );
+
+      await f.client.query(
+        `UPDATE kith.worker_processing_assessments
+         SET counts=counts #- '{items,parked}',
+             last_page_result=last_page_result #- '{counts,items,parked}'
+         WHERE id=$1`,
+        [begun.assessmentId],
+      );
+      const legacyReplay = await call((ctx) =>
+        advanceProcessingAssessment(ctx, f.principal, page1),
+      );
+      assert.equal(legacyReplay.reused, true);
+      assert.equal(legacyReplay.counts.items.parked, 0);
 
       await f.client.query(
         'UPDATE kith.worker_processing_assessments SET last_page_result=\'{"state":"complete"}\'::jsonb WHERE id=$1',

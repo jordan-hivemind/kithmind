@@ -34,7 +34,7 @@ const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const MAX_ARCHIVE_CIPHERTEXT_BYTES = 65 * 1_024 * 1_024;
 
-async function requireReceiptChain(
+export async function requireArchiveReceiptChain(
   ctx: WorkerCtx,
   source: LoadedWorkerSource,
   item: SourceItemRow,
@@ -188,7 +188,7 @@ export async function getArchiveForgetTargets(
   const targets: WorkerArchiveForgetTarget[] = [];
   for (const wrapped of page.page) {
     const receipt = wrapped.value;
-    await requireReceiptChain(ctx, source, item, receipt);
+    await requireArchiveReceiptChain(ctx, source, item, receipt);
     let ack: SourceArtifactDeletionAckRow | null;
     try {
       ack = await loadArchiveDeletionAck(
@@ -347,7 +347,7 @@ export async function acknowledgeArchiveDeletion(
   );
   if (!receiptRaw) workerProtocolError("not_found");
   const receipt = camelizeSourceArtifactArchiveReceipt(receiptRaw);
-  await requireReceiptChain(ctx, source, item, receipt);
+  await requireArchiveReceiptChain(ctx, source, item, receipt);
   if (
     (receipt.copyRole === "independent_backup") !==
       (request.backupOutcome !== undefined) ||
