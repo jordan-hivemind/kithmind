@@ -74,6 +74,11 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
       import.meta.url,
     ),
   },
+  {
+    version: 5,
+    name: "provenance and documents: retire the synthetic proof tables, free documents/source_revisions/chunks (P2-39d)",
+    url: new URL("../migrations/005_provenance_documents.sql", import.meta.url),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */

@@ -24,12 +24,18 @@ test("the migration file registered with kith-store's runner matches the generat
   assert.equal(checkedIn, generateKithMigrateTablesSql());
 });
 
-test("kith-store's runner has this migration registered, numbered after its existing ones", () => {
-  const last = KITH_MIGRATIONS.at(-1);
-  assert.equal(last.version, 4);
-  assert.ok(last.url.pathname.endsWith("004_kith_migrate_tables.sql"));
+test("kith-store's runner has this migration registered as version 4, in step with its own history", () => {
+  // Not necessarily the *last* entry: a row that ports a domain on top of
+  // this table set (P2-39d, P2-39c, ...) registers its own migration after
+  // this one, exactly as this test's own title for row b anticipated
+  // ("numbered after its existing ones"). What this row still owns is that
+  // its migration is version 4, names the right file, and that history up
+  // to and including it has no gap.
+  const ours = KITH_MIGRATIONS.find((m) => m.version === 4);
+  assert.ok(ours, "version 4 must be registered");
+  assert.ok(ours.url.pathname.endsWith("004_kith_migrate_tables.sql"));
   assert.deepEqual(
-    KITH_MIGRATIONS.map((m) => m.version),
+    KITH_MIGRATIONS.map((m) => m.version).slice(0, 4),
     [1, 2, 3, 4],
   );
 });

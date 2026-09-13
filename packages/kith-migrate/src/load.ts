@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 import { applyKithSchema, createKithPool } from "@repo/kith-store";
 
 import { childColumnOrder, columnOrder } from "./columns.js";
-import { TABLES } from "./schema.js";
+import { currentPgName, TABLES } from "./schema.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -55,7 +55,7 @@ export function buildCopyScript(csvDir: string, presentFiles: Set<string>): stri
       const cols = columnOrder(t).map(quote).join(", ");
       const path = join(csvDir, `${t.pg}.csv`).replaceAll("'", "''");
       lines.push(
-        `\\copy kith.${quote(t.pg)} (${cols}) FROM '${path}' WITH (FORMAT csv)`,
+        `\\copy kith.${quote(currentPgName(t.pg))} (${cols}) FROM '${path}' WITH (FORMAT csv)`,
       );
     }
     for (const child of t.children ?? []) {
@@ -63,7 +63,7 @@ export function buildCopyScript(csvDir: string, presentFiles: Set<string>): stri
       const cols = childColumnOrder(child).map(quote).join(", ");
       const path = join(csvDir, `${child.pg}.csv`).replaceAll("'", "''");
       lines.push(
-        `\\copy kith.${quote(child.pg)} (${cols}) FROM '${path}' WITH (FORMAT csv)`,
+        `\\copy kith.${quote(currentPgName(child.pg))} (${cols}) FROM '${path}' WITH (FORMAT csv)`,
       );
     }
   }

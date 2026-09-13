@@ -30,43 +30,6 @@ import {
 
 const { Pool } = pg;
 
-function quoteRange(text, quote) {
-  const all = Array.from(text);
-  const wanted = Array.from(quote);
-  for (let start = 0; start <= all.length - wanted.length; start += 1) {
-    if (wanted.every((value, offset) => all[start + offset] === value))
-      return [start, start + wanted.length];
-  }
-  throw new Error("quote_not_found");
-}
-
-function generationInput(externalId, text, quote, amounts = []) {
-  const [startCodepoint, endCodepoint] = quoteRange(text, quote);
-  return {
-    requestId: randomUUID(),
-    documentExternalId: externalId,
-    sourceContentHash: sha256(`source:${text}`),
-    pages: [{ pageNumber: 1, text, textHash: sha256(text) }],
-    evidence: [
-      {
-        ordinal: 0,
-        pageNumber: 1,
-        startCodepoint,
-        endCodepoint,
-        quote,
-        quoteHash: sha256(quote),
-      },
-    ],
-    chunks: [{ ordinal: 0, evidenceOrdinal: 0, text }],
-    financialAttachments: amounts.map((amount, index) => ({
-      evidenceOrdinal: 0,
-      label: `synthetic fixture ${index}`,
-      amount,
-      currency: "USD",
-    })),
-  };
-}
-
 async function createAppRole(owner, suffix) {
   const role = `kith_app_${suffix}`;
   const password = randomBytes(24).toString("hex");
@@ -165,7 +128,7 @@ async function killAndWait(child) {
 }
 
 test(
-  "isolated PostgreSQL proves scoped publication, correction, forgetting and encrypted restore",
+  "isolated PostgreSQL proves scoped worker-job leasing and encrypted restore",
   { timeout: 180_000 },
   async (t) => {
     const pools = [];
@@ -243,45 +206,6 @@ test(
     );
     assert.equal(roleState.rows[0].current_user, role.role);
     assert.equal(roleState.rows[0].superuser, false);
-
-    const firstInput = generationInput(
-      "statement-a",
-      "Opening 😀 balance is 0.1 and adjustment 0.2.",
-      "😀 balance",
-      ["0.1", "0.2"],
-    );
-    const staged = await proof.stageGeneration(keyA, firstInput);
-    assert.deepEqual(await proof.stageGeneration(keyA, firstInput), staged);
-    await assert.rejects(
-      proof.stageGeneration(keyA, {
-        ...firstInput,
-        documentExternalId: "conflict",
-      }),
-      expectCode("idempotency_conflict"),
-    );
-    const activationRequest = {
-      requestId: randomUUID(),
-      generationId: staged.generationId,
-    };
-    const activated = await proof.activateGeneration(keyA, activationRequest);
-    assert.deepEqual(
-      await proof.activateGeneration(keyA, activationRequest),
-      activated,
-    );
-    const firstCitation = (await proof.search(keyA, "balance"))[0];
-    assert.equal(firstCitation.quote, "😀 balance");
-    assert.equal(firstCitation.pageTextHash, firstInput.pages[0].textHash);
-    assert.deepEqual(
-      await proof.readCitation(keyA, firstCitation.evidenceId),
-      firstCitation,
-    );
-    assert.equal(await proof.syntheticFinancialTotal(keyA, "USD"), "0.3");
-
-    assert.deepEqual(await proof.search(keyB, "balance"), []);
-    await assert.rejects(
-      proof.readCitation(keyB, firstCitation.evidenceId),
-      expectCode("citation_not_found"),
-    );
 
     const enqueueInput = {
       requestId: randomUUID(),
@@ -481,105 +405,13 @@ test(
       completedJob.jobId,
     );
 
-    const correctedInput = generationInput(
-      "statement-a",
-      "Corrected closing balance is 0.31.",
-      "balance",
-      ["0.31"],
-    );
-    const corrected = await proof.stageGeneration(keyA, correctedInput);
-    const finalInput = generationInput(
-      "statement-a",
-      "Final corrected balance is 0.32.",
-      "balance",
-      ["0.32"],
-    );
-    const finalRevision = await proof.stageGeneration(keyA, finalInput);
-    await assert.rejects(
-      proof.activateGeneration(keyA, {
-        requestId: randomUUID(),
-        generationId: corrected.generationId,
-      }),
-      expectCode("stale_generation"),
-    );
-    await proof.activateGeneration(keyA, {
-      requestId: randomUUID(),
-      generationId: finalRevision.generationId,
-    });
-    assert.deepEqual(await proof.search(keyA, "Opening"), []);
-    assert.deepEqual(
-      await proof.readCitation(keyA, firstCitation.evidenceId),
-      firstCitation,
-    );
-    const correctedCitation = (await proof.search(keyA, "Final"))[0];
-    assert.equal(correctedCitation.generationId, finalRevision.generationId);
-    assert.equal(await proof.syntheticFinancialTotal(keyA, "USD"), "0.32");
-
-    const retainedInput = generationInput(
-      "statement-b",
-      "Retained citation value is 42.",
-      "value is 42",
-    );
-    const retained = await proof.stageGeneration(keyB, retainedInput);
-    await proof.activateGeneration(keyB, {
-      requestId: randomUUID(),
-      generationId: retained.generationId,
-    });
-    const retainedCitation = (await proof.search(keyB, "Retained"))[0];
-
-    const crashingProof = new PostgresProof(app, {
-      afterDocumentWrite: async () => {
-        throw new Error("synthetic_crash");
-      },
-    });
-    await assert.rejects(
-      crashingProof.stageGeneration(
-        keyA,
-        generationInput("rolled-back", "Never committed.", "Never"),
-      ),
-      /synthetic_crash/,
-    );
-    const rollbackRows = await owner.query(
-      "SELECT count(*)::int AS count FROM kith.documents WHERE external_id='rolled-back'",
-    );
-    assert.equal(rollbackRows.rows[0].count, 0);
-
-    const forgetRequest = {
-      requestId: randomUUID(),
-      documentExternalId: "statement-a",
-    };
-    const forgotten = await proof.forgetDocument(keyA, forgetRequest);
-    assert.deepEqual(
-      await proof.forgetDocument(keyA, forgetRequest),
-      forgotten,
-    );
-    assert.deepEqual(await proof.search(keyA, "Corrected"), []);
-    await assert.rejects(
-      proof.readCitation(keyA, correctedCitation.evidenceId),
-      expectCode("citation_not_found"),
-    );
-    await assert.rejects(
-      proof.readCitation(keyA, firstCitation.evidenceId),
-      expectCode("citation_not_found"),
-    );
-    await assert.rejects(
-      proof.stageGeneration(
-        keyA,
-        generationInput("statement-a", "Forbidden resurrection.", "Forbidden"),
-      ),
-      expectCode("document_forgotten"),
-    );
-    await revokeSyntheticApiKey(owner, keyAId);
-    await assert.rejects(
-      proof.search(keyA, "anything"),
-      expectCode("unauthorized"),
-    );
+    // keyAId is unused past this point in the retired document-lifecycle
+    // scenario; the revoked-key count the backup/restore proof below checks
+    // is already exercised by reclaimKeyId and remainingKeyId above.
+    void keyAId;
 
     const beforeState = await owner.query(
       `SELECT
-      (SELECT count(*)::int FROM kith.documents) AS documents,
-      (SELECT count(*)::int FROM kith.generations) AS generations,
-      (SELECT count(*)::int FROM kith.evidence) AS evidence,
       (SELECT count(*)::int FROM kith.api_keys WHERE revoked_at IS NOT NULL) AS revoked_keys,
       (SELECT count(*)::int FROM kith.worker_jobs WHERE state='succeeded') AS succeeded_jobs,
       (SELECT count(*)::int FROM kith.worker_jobs WHERE state='failed') AS failed_jobs`,
@@ -611,22 +443,11 @@ test(
     const restoredProof = new PostgresProof(restoredApp);
     const afterState = await restoredOwner.query(
       `SELECT
-      (SELECT count(*)::int FROM kith.documents) AS documents,
-      (SELECT count(*)::int FROM kith.generations) AS generations,
-      (SELECT count(*)::int FROM kith.evidence) AS evidence,
       (SELECT count(*)::int FROM kith.api_keys WHERE revoked_at IS NOT NULL) AS revoked_keys,
       (SELECT count(*)::int FROM kith.worker_jobs WHERE state='succeeded') AS succeeded_jobs,
       (SELECT count(*)::int FROM kith.worker_jobs WHERE state='failed') AS failed_jobs`,
     );
     assert.deepEqual(afterState.rows, beforeState.rows);
-    assert.deepEqual(
-      await restoredProof.readCitation(keyB, retainedCitation.evidenceId),
-      retainedCitation,
-    );
-    await assert.rejects(
-      restoredProof.search(keyA, "anything"),
-      expectCode("unauthorized"),
-    );
     assert.deepEqual(
       await restoredProof.getWorkerJob(workerKey4, completedJob.jobId),
       completedState,
@@ -664,7 +485,7 @@ test(
     );
     assert.deepEqual(
       upgradedVersions.rows.map((row) => row.version),
-      [1, 2, 3, 4],
+      [1, 2, 3, 4, 5],
     );
     // A gap rather than a rollback: version 1 missing while 2 and 3 are
     // recorded is a history no build can migrate from, and guessing is how a
