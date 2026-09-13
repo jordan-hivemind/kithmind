@@ -37,6 +37,7 @@ import {
   type WorkerParsedStageRow,
 } from "../provenance/index.js";
 import { newKithId, KITH_ID } from "../ids.js";
+import { validateGenerationRecords } from "../records/model.js";
 import { requireWorkerSourceAccount, type LoadedWorkerSource } from "./auth.js";
 import {
   validateAdmittedArchiveChain,
@@ -1588,6 +1589,12 @@ export async function activateParsedJob(
     request,
   );
   try {
+    const records = await validateGenerationRecords(ctx.client, {
+      spaceId: source.spaceId,
+      processingGenerationId: loaded.generation.id,
+      expectedEventCount: loaded.generation.expectedEventCount ?? 0,
+      expectedObservationCount: loaded.generation.expectedObservationCount ?? 0,
+    });
     const verified = await verifySealedParsedPayload(
       ctx.client,
       loaded.generation,
@@ -1600,10 +1607,15 @@ export async function activateParsedJob(
       verified.actualChunkCount !== loaded.generation.actualChunkCount ||
       verified.actualEventCount !== (loaded.generation.actualEventCount ?? 0) ||
       verified.actualObservationCount !==
-        (loaded.generation.actualObservationCount ?? 0)
+        (loaded.generation.actualObservationCount ?? 0) ||
+      records.eventVersions.length !== verified.actualEventCount ||
+      records.observations.length !== verified.actualObservationCount
     )
       workerProtocolError("scan_conflict");
   } catch (error) {
+    if (!isTransactionAbort(error) && !(error instanceof ProofError)) {
+      workerProtocolError("scan_conflict");
+    }
     rethrowParsedMutationError(error);
   }
   let previousGenerationId: string | undefined;

@@ -4,7 +4,12 @@ import test from "node:test";
 
 import { digestParsedMappingManifest } from "@repo/worker-protocol";
 import { HttpWorkerTransport } from "../../pipeline/dist/transport.js";
-import { createKithPool, newKithId, provenance } from "../dist/index.js";
+import {
+  createKithPool,
+  newKithId,
+  provenance,
+  records,
+} from "../dist/index.js";
 import { listSources } from "../dist/documents/index.js";
 import {
   MAX_INLINE_TEXT_CHUNK_UTF8_BYTES,
@@ -14,6 +19,7 @@ import {
 import {
   END_CURSOR,
   WorkerProtocolError,
+  activateParsedJob,
   activateProcessingJob,
   acknowledgeArchiveDeletion,
   acknowledgeProviderOriginalDetach,
@@ -252,6 +258,80 @@ async function fixture(t) {
     principal,
     source,
   };
+}
+
+async function stageSyntheticWorkerRecord(ctx, f, generationId, eventKey) {
+  const entityId = newKithId();
+  await ctx.client.query(
+    `INSERT INTO kith.entities
+       (id,space_id,created_at,user_id,key,kind,canonical_name,
+        normalized_name,aliases,normalized_aliases)
+     VALUES ($1,$2,transaction_timestamp(),$3,$4,'other','Synthetic vehicle',
+       'synthetic vehicle','[]','[]')`,
+    [entityId, f.spaceId, f.userId, `vehicle:${eventKey}`],
+  );
+  const spanId = (
+    await ctx.client.query(
+      `SELECT id FROM kith.evidence_spans
+       WHERE source_text_version_id=(SELECT source_text_version_id
+         FROM kith.processing_generations WHERE id=$1)
+       ORDER BY ordinal LIMIT 1`,
+      [generationId],
+    )
+  ).rows[0]?.id;
+  assert.equal(typeof spanId, "string");
+  const staged = await records.stageRecordBatch(ctx.client, {
+    spaceId: f.spaceId,
+    processingGenerationId: generationId,
+    userId: f.userId,
+    records: [
+      {
+        eventKey,
+        entityId,
+        eventType: "vehicle_service",
+        schemaVersion: 1,
+        occurrence: { precision: "date", date: "2026-09-13" },
+        fieldEvidence: {
+          occurrence: [spanId],
+          entity: [spanId],
+          eventType: [spanId],
+        },
+        observations: [
+          {
+            observationKey: "odometer",
+            observationType: "odometer",
+            value: { type: "integer", value: "1", unitCode: "[mi_i]" },
+            valueEvidence: [spanId],
+          },
+        ],
+      },
+    ],
+  });
+  return { entityId, ...staged };
+}
+
+async function removeSyntheticWorkerRecord(client, staged, generationId) {
+  await client.query(
+    "DELETE FROM kith.observations WHERE processing_generation_id=$1",
+    [generationId],
+  );
+  await client.query(
+    "DELETE FROM kith.event_versions WHERE processing_generation_id=$1",
+    [generationId],
+  );
+  await client.query("DELETE FROM kith.events WHERE id=$1", [
+    staged.eventIds[0],
+  ]);
+  await client.query("DELETE FROM kith.entities WHERE id=$1", [
+    staged.entityId,
+  ]);
+  await client.query(
+    `UPDATE kith.processing_generations
+     SET expected_event_count=0,expected_observation_count=0,
+         actual_event_count=0,actual_observation_count=0
+     WHERE id=$1`,
+    [generationId],
+  );
 }
 
 async function makeScan(f, inventoryEpoch = 1) {
@@ -1042,6 +1122,133 @@ test(
           [admitted.processingGenerationId],
         )
       ).rows[0];
+      const malformedRecord = await call(
+        (ctx) =>
+          stageSyntheticWorkerRecord(
+            ctx,
+            f,
+            admitted.processingGenerationId,
+            "worker-inline-record",
+          ),
+        reclaimedAt,
+      );
+      const unexpectedRecordActivateRequest = {
+        protocolVersion: 1,
+        operation: "jobs.activate",
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        requestId: "job-activate-unexpected-record",
+        jobId: admitted.ingestJobId,
+        leaseEpoch: 2,
+        leaseToken: replacementToken,
+      };
+      await assert.rejects(
+        call(
+          (ctx) =>
+            activateProcessingJob(
+              ctx,
+              f.principal,
+              unexpectedRecordActivateRequest,
+            ),
+          reclaimedAt,
+        ),
+        expectProtocolCode("scan_conflict"),
+      );
+      await f.client.query(
+        "UPDATE kith.observations SET value=$1 WHERE id=$2",
+        [
+          { type: "integer", value: "01", unitCode: "[mi_i]" },
+          malformedRecord.observationIds[0],
+        ],
+      );
+      await f.client.query(
+        `UPDATE kith.processing_generations
+         SET expected_event_count=1,expected_observation_count=1,
+             actual_event_count=1,actual_observation_count=1
+         WHERE id=$1`,
+        [admitted.processingGenerationId],
+      );
+      const malformedStored = (
+        await f.client.query(
+          `SELECT o.value,g.expected_event_count,g.expected_observation_count,
+                  g.actual_event_count,g.actual_observation_count
+           FROM kith.observations o
+           JOIN kith.processing_generations g ON g.id=o.processing_generation_id
+           WHERE o.id=$1`,
+          [malformedRecord.observationIds[0]],
+        )
+      ).rows[0];
+      assert.equal(malformedStored.value.value, "01");
+      assert.equal(Number(malformedStored.expected_event_count), 1);
+      assert.equal(Number(malformedStored.expected_observation_count), 1);
+      assert.equal(Number(malformedStored.actual_event_count), 1);
+      assert.equal(Number(malformedStored.actual_observation_count), 1);
+      const malformedActivateRequest = {
+        protocolVersion: 1,
+        operation: "jobs.activate",
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        requestId: "job-activate-malformed-record",
+        jobId: admitted.ingestJobId,
+        leaseEpoch: 2,
+        leaseToken: replacementToken,
+      };
+      await assert.rejects(
+        call(
+          (ctx) =>
+            activateProcessingJob(ctx, f.principal, malformedActivateRequest),
+          reclaimedAt,
+        ),
+        expectProtocolCode("scan_conflict"),
+      );
+      const malformedRollback = (
+        await f.client.query(
+          `SELECT j.state,d.publication_state,i.active_generation_id,
+             (SELECT count(*)::int FROM kith.worker_operation_receipts
+              WHERE request_id=$1) receipt_count,
+             (SELECT count(*)::int FROM kith.space_processing_state
+              WHERE space_id=j.space_id) processing_state_count,
+             (SELECT count(*)::int FROM kith.space_embedding_states
+              WHERE space_id=j.space_id) embedding_state_count
+           FROM kith.ingest_jobs j
+           JOIN kith.documents d ON d.processing_generation_id=j.processing_generation_id
+           JOIN kith.source_items i ON i.id=j.source_item_id
+           WHERE j.id=$2`,
+          [malformedActivateRequest.requestId, admitted.ingestJobId],
+        )
+      ).rows[0];
+      assert.deepEqual(malformedRollback, {
+        state: "staged",
+        publication_state: "staged",
+        active_generation_id: null,
+        receipt_count: 0,
+        processing_state_count: 0,
+        embedding_state_count: 0,
+      });
+      await removeSyntheticWorkerRecord(
+        f.client,
+        malformedRecord,
+        admitted.processingGenerationId,
+      );
+      await f.client.query(
+        "UPDATE kith.processing_generations SET actual_event_count=1 WHERE id=$1",
+        [admitted.processingGenerationId],
+      );
+      await assert.rejects(
+        call(
+          (ctx) =>
+            activateProcessingJob(ctx, f.principal, {
+              ...unexpectedRecordActivateRequest,
+              requestId: "job-activate-actual-count-mismatch",
+            }),
+          reclaimedAt,
+        ),
+        expectProtocolCode("scan_conflict"),
+      );
+      await f.client.query(
+        "UPDATE kith.processing_generations SET actual_event_count=0 WHERE id=$1",
+        [admitted.processingGenerationId],
+      );
       const previousGenerationId = newKithId();
       const previousDocumentId = newKithId();
       const previousChunkId = newKithId();
@@ -2327,6 +2534,84 @@ test(
       const sealed = await httpCall(sealRequest);
       assert.equal(sealed.state, "staged");
       assert.equal((await httpCall(sealRequest)).reused, true);
+      const malformedRecord = await parsedCall((ctx) =>
+        stageSyntheticWorkerRecord(
+          ctx,
+          f,
+          admitted.processingGenerationId,
+          "worker-parsed-record",
+        ),
+      );
+      await f.client.query(
+        "UPDATE kith.observations SET value=$1 WHERE id=$2",
+        [
+          { type: "integer", value: "01", unitCode: "[mi_i]" },
+          malformedRecord.observationIds[0],
+        ],
+      );
+      await f.client.query(
+        `UPDATE kith.processing_generations
+         SET expected_event_count=1,expected_observation_count=1,
+             actual_event_count=1,actual_observation_count=1
+         WHERE id=$1`,
+        [admitted.processingGenerationId],
+      );
+      const malformedActivateRequest = {
+        ...leaseRequest,
+        operation: "jobs.activateParsed",
+        requestId: "parsed-activate-malformed-record",
+      };
+      const parsedMalformedStored = (
+        await f.client.query(
+          `SELECT o.value,g.expected_event_count,g.expected_observation_count,
+                  g.actual_event_count,g.actual_observation_count
+           FROM kith.observations o
+           JOIN kith.processing_generations g ON g.id=o.processing_generation_id
+           WHERE o.id=$1`,
+          [malformedRecord.observationIds[0]],
+        )
+      ).rows[0];
+      assert.equal(parsedMalformedStored.value.value, "01");
+      assert.equal(Number(parsedMalformedStored.expected_event_count), 1);
+      assert.equal(Number(parsedMalformedStored.expected_observation_count), 1);
+      assert.equal(Number(parsedMalformedStored.actual_event_count), 1);
+      assert.equal(Number(parsedMalformedStored.actual_observation_count), 1);
+      await assert.rejects(
+        parsedCall((ctx) =>
+          activateParsedJob(ctx, f.principal, malformedActivateRequest),
+        ),
+        expectProtocolCode("scan_conflict"),
+      );
+      const malformedRollback = (
+        await f.client.query(
+          `SELECT j.state,d.publication_state,i.active_generation_id,
+             (SELECT count(*)::int
+              FROM kith.worker_binary_operation_receipts
+              WHERE request_id=$1) receipt_count,
+             (SELECT count(*)::int FROM kith.space_processing_state
+              WHERE space_id=j.space_id) processing_state_count,
+             (SELECT count(*)::int FROM kith.space_embedding_states
+              WHERE space_id=j.space_id) embedding_state_count
+           FROM kith.ingest_jobs j
+           JOIN kith.documents d ON d.processing_generation_id=j.processing_generation_id
+           JOIN kith.source_items i ON i.id=j.source_item_id
+           WHERE j.id=$2`,
+          [malformedActivateRequest.requestId, admitted.ingestJobId],
+        )
+      ).rows[0];
+      assert.deepEqual(malformedRollback, {
+        state: "staged",
+        publication_state: "staged",
+        active_generation_id: null,
+        receipt_count: 0,
+        processing_state_count: 0,
+        embedding_state_count: 0,
+      });
+      await removeSyntheticWorkerRecord(
+        f.client,
+        malformedRecord,
+        admitted.processingGenerationId,
+      );
       await f.client.query(
         "UPDATE kith.source_accounts SET embed_full_chunks=false WHERE id=$1",
         [f.sourceAccountId],
