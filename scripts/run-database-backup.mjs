@@ -25,7 +25,7 @@ export class DatabaseBackupRunnerError extends Error {
 const fail = (code) => {
   throw new DatabaseBackupRunnerError(code);
 };
-function exact(value, keys, code = "config_invalid") {
+export function exact(value, keys, code = "config_invalid") {
   if (
     !value ||
     typeof value !== "object" ||
@@ -36,7 +36,7 @@ function exact(value, keys, code = "config_invalid") {
     fail(code);
   return value;
 }
-function text(value, max = 4_096) {
+export function text(value, max = 4_096) {
   if (
     typeof value !== "string" ||
     !value.length ||
@@ -46,12 +46,12 @@ function text(value, max = 4_096) {
     fail("config_invalid");
   return value;
 }
-function absolute(value) {
+export function absolute(value) {
   const path = text(value);
   if (!isAbsolute(path) || resolve(path) !== path) fail("config_invalid");
   return path;
 }
-async function protectedDirectory(path, ownerOnly = false) {
+export async function protectedDirectory(path, ownerOnly = false) {
   if (realpathSync(path) !== path) fail("path_not_canonical");
   let current = path;
   while (true) {
@@ -81,7 +81,7 @@ async function protectedDirectory(path, ownerOnly = false) {
     current = parent;
   }
 }
-async function protectedExecutable(path) {
+export async function protectedExecutable(path) {
   await protectedDirectory(dirname(path));
   if (realpathSync(path) !== path) fail("command_not_canonical");
   const stat = await lstat(path);
@@ -93,7 +93,7 @@ async function protectedExecutable(path) {
   )
     fail("command_not_protected");
 }
-async function readProtected(path, maximum) {
+export async function readProtected(path, maximum) {
   if (realpathSync(path) !== path) fail("file_not_protected");
   await protectedDirectory(dirname(path));
   const handle = await open(
@@ -201,7 +201,7 @@ export async function loadDatabaseBackupConfig(path) {
   await validateConfigPaths(config);
   return config;
 }
-async function fsyncDirectory(path) {
+export async function fsyncDirectory(path) {
   const handle = await open(path, constants.O_RDONLY | constants.O_DIRECTORY);
   try {
     await handle.sync();
@@ -209,7 +209,7 @@ async function fsyncDirectory(path) {
     await handle.close();
   }
 }
-async function writeAll(handle, bytes) {
+export async function writeAll(handle, bytes) {
   let offset = 0;
   while (offset < bytes.length) {
     const { bytesWritten } = await handle.write(
