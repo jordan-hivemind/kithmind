@@ -519,6 +519,10 @@ comparison. This is the tracker's P2-27 work, and it is a cutover gate, not a
 follow-up: a database with no proven restore is not a place to put the only copy
 of the provenance chain.
 
+The exact per-table source manifest and `pg_dump` use separate PostgreSQL
+sessions. Run this proof only after the cutover sequence has quiesced every
+writer; otherwise those sessions cannot claim one consistent exported state.
+
 - Acceptance: one dated encrypted dump published and verified by separate-process
   byte equality, plus one isolated restore that satisfies step 5's parity checks
   and returns a sampled cited answer.
