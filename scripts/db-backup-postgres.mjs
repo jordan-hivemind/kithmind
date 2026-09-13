@@ -703,6 +703,22 @@ export async function runPostgresDatabaseBackup(config) {
 
 async function runVerifyWorker(payload) {
   const { config, backupResult } = payload;
+  const names = ["kithmind.dump.age", "manifest.json.age"];
+  if (
+    !backupResult ||
+    typeof backupResult.snapshotId !== "string" ||
+    !/^[a-f0-9]{8,64}$/.test(backupResult.snapshotId) ||
+    !backupResult.ciphertexts || !backupResult.plaintexts ||
+    JSON.stringify(Object.keys(backupResult.ciphertexts).sort()) !== JSON.stringify(names) ||
+    JSON.stringify(Object.keys(backupResult.plaintexts).sort()) !== JSON.stringify(names) ||
+    names.some((name) => {
+      const cipher = backupResult.ciphertexts[name];
+      const plain = backupResult.plaintexts[name];
+      return !cipher || !plain || !HEX_64.test(cipher.sha256) || !HEX_64.test(plain.sha256) ||
+        !Number.isSafeInteger(cipher.byteLength) || !Number.isSafeInteger(plain.byteLength) ||
+        cipher.byteLength < 1 || plain.byteLength < 1 || cipher.byteLength > MAX_DUMP_BYTES || plain.byteLength > MAX_DUMP_BYTES;
+    })
+  ) fail("verify_payload_invalid");
   await protectedExecutable(config.resticBinary);
   await protectedExecutable(config.ageBinary);
   const passwordCommandArgument_ = await passwordCommandArgument(
