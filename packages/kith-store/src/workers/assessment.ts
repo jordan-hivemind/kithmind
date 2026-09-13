@@ -25,6 +25,7 @@ import {
   type SourceItemRow,
 } from "../provenance/index.js";
 import { requireArchiveReceiptChain } from "./archiveForget.js";
+import { archiveSetDigest } from "./archivedDiscovery.js";
 import {
   ensureSameActor,
   requireOriginalActor,
@@ -892,38 +893,18 @@ async function terminalReady(
           provider.reference,
         );
       }
-      const archiveSet = originalBackup
-        ? await digest(
-            "archive-set:v1",
-            [originalPrimary, originalBackup, parserPrimary, parserBackup].map(
-              ({ receipt, binding }) => [
-                receipt.subjectKind,
-                receipt.copyRole,
-                receipt.id,
-                binding.bindingEpoch,
-              ],
-            ),
-          )
-        : await digest("recovery-set:provider-original:v1", [
-            [
-              originalPrimary.receipt.subjectKind,
-              originalPrimary.receipt.copyRole,
-              originalPrimary.receipt.id,
-              originalPrimary.receipt.id,
-              originalPrimary.binding.bindingEpoch,
-            ],
-            [
-              "provider_original",
-              provider!.reference.id,
-              provider!.binding.bindingEpoch,
-            ],
-            ...[parserPrimary, parserBackup].map(({ receipt, binding }) => [
-              receipt.subjectKind,
-              receipt.copyRole,
-              receipt.id,
-              binding.bindingEpoch,
-            ]),
-          ]);
+      const archiveSet = await archiveSetDigest(
+        originalPrimary,
+        originalBackup,
+        provider
+          ? {
+              reference: provider.reference,
+              bindingEpoch: provider.binding.bindingEpoch,
+            }
+          : null,
+        parserPrimary,
+        parserBackup,
+      );
       if (
         generation.archiveSetDigest !== archiveSet ||
         generation.originalPrimaryReceiptId !== originalPrimary.receipt.id ||

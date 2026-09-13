@@ -76,7 +76,7 @@ type ArchivedRequest = Extract<
   { operation: "discovery.admitArchived" }
 >;
 
-type BoundArchive = {
+export type BoundArchive = {
   receipt: SourceArtifactArchiveReceiptRow;
   binding: SourceArtifactArchiveBindingRow;
 };
@@ -257,7 +257,7 @@ async function loadJob(
   return found ? camelizeIngestJob(found) : null;
 }
 
-async function archiveSetDigest(
+export async function archiveSetDigest(
   originalPrimary: BoundArchive,
   originalBackup: BoundArchive | undefined,
   provider: { reference: { id: string }; bindingEpoch: number } | null,
