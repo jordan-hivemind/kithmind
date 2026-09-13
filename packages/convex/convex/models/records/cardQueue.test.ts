@@ -28,6 +28,7 @@ import {
 import {
   claimNextForExtraction,
   classifyQueueTickFailure,
+  DEFAULT_WEEKLY_COST_BUDGET_MICRO_USD,
   recordExtractionOutcome,
   runCardExtractionQueueTick,
   type QueueTickOps,
@@ -634,6 +635,91 @@ describe("the card extraction queue", () => {
       ctx.db.query("cardExtractionQueueStates").collect(),
     );
     expect(rows).toEqual([]);
+  });
+
+  test("setExtractionQueueBudgets raises weekly document budget on paused state, leaving phase and counters untouched", async () => {
+    const t = convexTest(schema, modules);
+    const { userId, spaceId, sourceAccountId } = await seedSpace(t);
+    await seedItems(t, { spaceId, sourceAccountId, userId, count: 3 });
+    await startQueue(t, {
+      spaceId,
+      dailyDocumentBudget: 1,
+      weeklyDocumentBudget: 5,
+    });
+
+    // Pause the queue by exceeding the daily budget.
+    await runUntilStopped(() =>
+      tickOps({ t, spaceId, userId, now: MONDAY }),
+    );
+    const pausedStatus = await t.query(
+      internal.models.records.cardQueue.cardExtractionQueueStatus,
+      { spaceId, kind: "document_card" },
+    );
+    expect(pausedStatus.phase).toBe("paused");
+    expect(pausedStatus.pauseReason).toBe("daily_document_budget");
+    const originalExtracted = pausedStatus.extracted;
+    const originalDocumentsProcessedThisWeek = pausedStatus.documentsProcessedThisWeek;
+
+    // Raise the weekly document budget.
+    const result = await t.mutation(
+      internal.models.records.cardQueue.setExtractionQueueBudgets,
+      {
+        spaceId,
+        kind: "document_card",
+        weeklyDocumentBudget: 100,
+        now: MONDAY,
+      },
+    );
+    expect(result).toEqual({
+      dailyDocumentBudget: 1,
+      weeklyDocumentBudget: 100,
+      weeklyCostBudgetMicroUsd: DEFAULT_WEEKLY_COST_BUDGET_MICRO_USD,
+    });
+
+    // Verify phase, counters, and windows remain unchanged.
+    const afterBudgetUpdate = await t.query(
+      internal.models.records.cardQueue.cardExtractionQueueStatus,
+      { spaceId, kind: "document_card" },
+    );
+    expect(afterBudgetUpdate.phase).toBe("paused");
+    expect(afterBudgetUpdate.pauseReason).toBe("daily_document_budget");
+    expect(afterBudgetUpdate.extracted).toBe(originalExtracted);
+    expect(afterBudgetUpdate.documentsProcessedThisWeek).toBe(
+      originalDocumentsProcessedThisWeek,
+    );
+  });
+
+  test("setExtractionQueueBudgets rejects non-positive budgets", async () => {
+    const t = convexTest(schema, modules);
+    const { spaceId } = await seedSpace(t);
+    await startQueue(t, { spaceId });
+
+    await expect(
+      t.mutation(internal.models.records.cardQueue.setExtractionQueueBudgets, {
+        spaceId,
+        kind: "document_card",
+        dailyDocumentBudget: 0,
+        now: MONDAY,
+      }),
+    ).rejects.toThrow("dailyDocumentBudget must be a positive integer");
+
+    await expect(
+      t.mutation(internal.models.records.cardQueue.setExtractionQueueBudgets, {
+        spaceId,
+        kind: "document_card",
+        weeklyDocumentBudget: -5,
+        now: MONDAY,
+      }),
+    ).rejects.toThrow("weeklyDocumentBudget must be a positive integer");
+
+    await expect(
+      t.mutation(internal.models.records.cardQueue.setExtractionQueueBudgets, {
+        spaceId,
+        kind: "document_card",
+        weeklyCostBudgetMicroUsd: 3.5,
+        now: MONDAY,
+      }),
+    ).rejects.toThrow("weeklyCostBudgetMicroUsd must be a positive integer");
   });
 });
 

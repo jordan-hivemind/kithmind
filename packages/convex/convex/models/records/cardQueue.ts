@@ -669,6 +669,66 @@ export const rerunGateFailed = internalMutation({
   },
 });
 
+/** `npx convex run models/records/cardQueue:setExtractionQueueBudgets`. Sets one or more budgets on an existing queue, returning the three budgets after the patch. Does not change phase, cursor, counters, or windows: if paused on a budget, resumeExtractionQueue lifts the pause separately. */
+export const setExtractionQueueBudgets = internalMutation({
+  args: {
+    spaceId: v.id("spaces"),
+    kind: kindArg,
+    dailyDocumentBudget: v.optional(v.number()),
+    weeklyDocumentBudget: v.optional(v.number()),
+    weeklyCostBudgetMicroUsd: v.optional(v.number()),
+    now: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const kind = requireKind(args.kind);
+    const state = await requireQueueState(ctx, args.spaceId, kind);
+    const now = args.now ?? Date.now();
+
+    const budgets = [
+      { name: "dailyDocumentBudget" as const, value: args.dailyDocumentBudget },
+      { name: "weeklyDocumentBudget" as const, value: args.weeklyDocumentBudget },
+      {
+        name: "weeklyCostBudgetMicroUsd" as const,
+        value: args.weeklyCostBudgetMicroUsd,
+      },
+    ];
+
+    const patch: Partial<Doc<"cardExtractionQueueStates">> = {};
+    for (const budget of budgets) {
+      if (budget.value !== undefined) {
+        if (
+          !Number.isInteger(budget.value) ||
+          budget.value <= 0
+        ) {
+          throw new Error(
+            `${budget.name} must be a positive integer`,
+          );
+        }
+        patch[budget.name] = budget.value;
+      }
+    }
+
+    if (Object.keys(patch).length === 0) {
+      // No budgets to update; return current state
+      return {
+        dailyDocumentBudget: state.dailyDocumentBudget,
+        weeklyDocumentBudget: state.weeklyDocumentBudget,
+        weeklyCostBudgetMicroUsd: state.weeklyCostBudgetMicroUsd,
+      };
+    }
+
+    patch.updatedAt = now;
+    await ctx.db.patch(state._id, patch);
+
+    const updated = { ...state, ...patch };
+    return {
+      dailyDocumentBudget: updated.dailyDocumentBudget,
+      weeklyDocumentBudget: updated.weeklyDocumentBudget,
+      weeklyCostBudgetMicroUsd: updated.weeklyCostBudgetMicroUsd,
+    };
+  },
+});
+
 async function estimateQueueCounts(
   ctx: QueryCtx,
   input: { spaceId: Id<"spaces">; kind: CardRecordKind },
