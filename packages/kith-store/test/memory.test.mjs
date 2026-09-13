@@ -52,6 +52,15 @@ test("facts retain history, corrections stay withheld, and entity values cannot 
     assert.equal(correction.operation, "corrected");
     const historical = await memory.listFacts(ctx, [spaceId], { includeHistorical: true });
     assert.equal(historical.some((fact) => fact.id === second.factId), false, "retracted facts are never history");
+    await ctx.client.query("UPDATE kith.facts SET supersedes = $1::jsonb WHERE id = $2", [
+      JSON.stringify([123]),
+      correction.factId,
+    ]);
+    assert.equal(await memory.getFactById(ctx, [spaceId], correction.factId), null);
+    await ctx.client.query("UPDATE kith.facts SET supersedes = $1::jsonb WHERE id = $2", [
+      JSON.stringify([second.factId]),
+      correction.factId,
+    ]);
 
     const foreignEntity = await memory.resolveEntity(ctx, userId, otherSpaceId, {
       kind: "person",
