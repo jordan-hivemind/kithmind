@@ -17,10 +17,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { Journal, JournalLockedError } from "../dist/journal.js";
-import {
-  MAX_PARSE_ATTEMPTS,
-  openArchiveCatalog,
-} from "../dist/archiveCatalog.js";
+import { openArchiveCatalog } from "../dist/archiveCatalog.js";
 import { digestArchiveIntent } from "../dist/archivedRequestMapping.js";
 import {
   initialCheckpoint,
@@ -875,6 +872,9 @@ test("a document-level parser failure is recorded against that document and the 
       },
     });
     runner.archiveCatalog = {
+      findOriginalExact() {
+        return undefined;
+      },
       listOriginals() {
         return [
           { originalCatalogId: checkpoint.originalCatalogId, rowRevision: 1 },
@@ -974,6 +974,9 @@ test("a lost discovery.failArchived report does not block the pass from continui
       },
     });
     runner.archiveCatalog = {
+      findOriginalExact() {
+        return undefined;
+      },
       listOriginals() {
         return [
           { originalCatalogId: checkpoint.originalCatalogId, rowRevision: 1 },
@@ -1006,87 +1009,118 @@ test("a lost discovery.failArchived report does not block the pass from continui
   }
 });
 
-// P2-80g: the server's attempt bound (8) is larger than the client's parse
-// budget (MAX_PARSE_ATTEMPTS, 2). The last local attempt says so, so the
-// server can settle the work row instead of keeping a deterministic
-// document-level failure retryable for passes that will never happen.
-test("the last local parse attempt is reported to the server as exhausted", async () => {
-  const setup = await fixture(0);
-  const plans = [0, 1].map((index) =>
-    pdfPlan({ relativePath: `document-${index}.pdf` }),
-  );
-  const checkpoint = archivedCheckpoint(plans[1], {
-    files: plans,
-    pdfIndex: 1,
-    step: "parse",
-    archivedPublished: 0,
-    preflightAction: undefined,
-  });
-  const journal = await openJournal(setup.journalDir, checkpoint);
-  const submittedFailures = [];
-  try {
-    const runner = new PipelineRunner(setup.config, journal, {
-      async call(request) {
-        if (request.operation === "source.status") {
-          return { operation: "source.status", sourceAccountId: "source" };
-        }
-        if (request.operation === "discovery.failArchived") {
-          submittedFailures.push(request);
-          return {
-            operation: "discovery.failArchived",
-            sourceItemId: request.identity.sourceItemId,
-            workId: "work-1",
-            state: "failed",
-            retryable: false,
-            failureCode: request.failureCode,
-          };
-        }
-        throw new Error(`unexpected operation ${request.operation}`);
-      },
+// P2-80g2: the server's attempt bound (8) is larger than the client's parse
+// budget (MAX_PARSE_ATTEMPTS, 2), so the client tells the server when its own
+// budget is spent. The budget belongs to the document, not to one catalog row:
+// each pass probes `findProcessingExact` with its own scanId and a re-queued
+// document lands on a brand new row, so a per-row count stayed at 1 forever,
+// `exhausted` was never sent, and the same PDFs were re-parsed every pass.
+test("the same document failing in two passes reports the second as exhausted", async () => {
+  const plan = pdfPlan({ relativePath: "document-0.pdf" });
+  const original = { originalCatalogId: randomUUID(), rowRevision: 1 };
+  // One durable catalog across both passes. Every pass records its failure
+  // against a fresh processing row for the same document identity, which is
+  // exactly what `createArchivedIntents` does for a re-queued entry.
+  const rows = [];
+  // A fresh journal per pass, as a real pass has: only the durable archive
+  // catalog carries over.
+  async function pass(processingCatalogId) {
+    const setup = await fixture(0);
+    const checkpoint = archivedCheckpoint(plan, {
+      files: [plan],
+      pdfIndex: 0,
+      step: "parse",
+      archivedPublished: 0,
+      preflightAction: undefined,
+      originalCatalogId: original.originalCatalogId,
+      processingCatalogId,
     });
-    runner.archiveCatalog = {
-      listOriginals() {
-        return [
-          { originalCatalogId: checkpoint.originalCatalogId, rowRevision: 1 },
-        ];
-      },
-      listProcessings() {
-        return [
-          {
-            processingCatalogId: checkpoint.processingCatalogId,
-            originalCatalogId: checkpoint.originalCatalogId,
-            rowRevision: 1,
-          },
-        ];
-      },
-      async recordParseFailure(args) {
-        return {
-          parseFailure: {
+    const journal = await openJournal(setup.journalDir, checkpoint);
+    const submitted = [];
+    try {
+      const runner = new PipelineRunner(setup.config, journal, {
+        async call(request) {
+          if (request.operation === "source.status") {
+            return { operation: "source.status", sourceAccountId: "source" };
+          }
+          if (request.operation === "discovery.failArchived") {
+            submitted.push(request);
+            return {
+              operation: "discovery.failArchived",
+              sourceItemId: request.identity.sourceItemId,
+              workId: "work-1",
+              state: "failed",
+              retryable: request.exhausted !== true,
+              failureCode: request.failureCode,
+            };
+          }
+          throw new Error(`unexpected operation ${request.operation}`);
+        },
+      });
+      const fingerprints = runner.processingFingerprints(plan);
+      rows.push({
+        processingCatalogId,
+        originalCatalogId: original.originalCatalogId,
+        rowRevision: 1,
+        currentObservation: {
+          scanId: `scan-${processingCatalogId}`,
+          observationEpoch: plan.observationEpoch,
+          processingEpoch: plan.processingEpoch,
+        },
+        fingerprints,
+      });
+      runner.archiveCatalog = {
+        findOriginalExact() {
+          return original;
+        },
+        listOriginals() {
+          return [original];
+        },
+        listProcessings() {
+          return rows;
+        },
+        async recordParseFailure(args) {
+          const row = rows.find(
+            (candidate) => candidate.processingCatalogId === args.catalogId,
+          );
+          row.parseFailure = {
             code: args.code,
-            attempts: MAX_PARSE_ATTEMPTS,
-            failedAt: 1,
-          },
-        };
-      },
-    };
-    runner.driveCheckpoint = async () => {
-      if (journal.checkpoint.pdfIndex === 1) {
-        throw new ParserProcessError("page_limit_exceeded", "too many pages");
-      }
-      return { state: "complete", scanned: 2, published: 1 };
-    };
-    assert.deepEqual(await runner.run(), {
-      state: "complete",
-      scanned: 2,
-      published: 1,
-    });
-    assert.equal(submittedFailures.length, 1);
-    assert.equal(submittedFailures[0].failureCode, "page_limit_exceeded");
-    assert.equal(submittedFailures[0].exhausted, true);
-  } finally {
-    await journal.close();
-    await rm(setup.base, { recursive: true, force: true });
+            attempts: Math.min((row.parseFailure?.attempts ?? 0) + 1, 2),
+            failedAt: args.now,
+          };
+          return row;
+        },
+      };
+      let calls = 0;
+      runner.driveCheckpoint = async () => {
+        calls += 1;
+        // Stands in for `driveArchivedParse` raising a document-level failure
+        // while converting this PDF; the run's own loop records it and moves on.
+        if (calls === 1) {
+          throw new ParserProcessError("conversion_failed", "cannot convert");
+        }
+        return { state: "complete", scanned: 1, published: 0 };
+      };
+      assert.deepEqual(await runner.run(), {
+        state: "complete",
+        scanned: 1,
+        published: 0,
+      });
+      return submitted;
+    } finally {
+      await journal.close();
+      await rm(setup.base, { recursive: true, force: true });
+    }
   }
+  const first = await pass("11111111-1111-4111-8111-111111111111");
+  assert.equal(first.length, 1);
+  assert.equal(first[0].exhausted, undefined);
+  const second = await pass("22222222-2222-4222-8222-222222222222");
+  assert.equal(second.length, 1);
+  assert.equal(second[0].failureCode, "conversion_failed");
+  // Two rows, one attempt each: the document has spent its budget even though
+  // no single row ever reached it.
+  assert.equal(second[0].exhausted, true);
 });
 
 test("a document stops being selected for archived work once its local parse attempts are exhausted", async () => {
