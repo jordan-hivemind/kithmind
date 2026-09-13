@@ -542,8 +542,35 @@ document with the account number of the nearest one at or before it, so a
 `BALANCE SHEET` anchor or a holdings table occurring under a given header
 resolves to that account. Content before the first such header (a
 household-wide summary page some consolidated statements print first, under
-the `TOTAL FOR ALL ACCOUNTS` heading) resolves to no account; nothing this
-parser reads lives there.
+the `TOTAL FOR ALL ACCOUNTS` heading) resolves to no account.
+
+**The roll-up section is refused, not attributed (F1-8l).** Something this
+parser reads does live on those household pages: a `BALANCE SHEET` under a
+bare `Consolidated Summary` line, stating the total value, cash and liability
+across every account in the document. It carries no account header of its own,
+so it resolved to no account -- and `finance-archive`'s importer then filled
+that in with the document's own account (`balance.accountId ??
+document.accountId`), recording the household roll-up as that one account's
+stated balance, beside that account's real section: two balances for one
+(account, as_of), disagreeing about cash and total value, with the roll-up's
+total larger than any single account's.
+
+Measured over the retained statement text of the owner's archive: 1,237
+statements, 141 of them consolidated, and every one of those 141 prints
+exactly one such section, always headed by that `Consolidated Summary` line
+(which never appears above any of the 1,874 per-account sections) and always
+alongside that account's own section at the same as-of date. Positions and
+liabilities were never affected: no position or liability parsed without an
+account key.
+
+`parseRealStatement` now records no balance it cannot attribute to an account,
+on a statement that names accounts at all, and says so in its `parseNote`.
+There is no household-level snapshot in the schema, so the roll-up is not
+recorded anywhere rather than recorded against a stand-in. The
+"on a statement that names accounts at all" half matters: a document with no
+bare account-number line anywhere states holdings for the one account the
+pull already named, which is what an omitted `accountExternalKey` has always
+meant.
 
 ### Trade confirmations
 

@@ -1520,6 +1520,35 @@ export async function importBatch(
           )
         : null;
 
+    // F1-8l. One (account, as_of) that this same document has already stated
+    // a balance for -- either a row of this batch, or a row already stored
+    // citing this document from an earlier parse of it. A document states one
+    // balance per account per date; a second is the document contradicting
+    // itself, which no `row_hash` catches because `cash` and `total_value`
+    // are in the preimage, and which the cash gate then reconciles against
+    // whichever of the two it happens to pair. The shape that produced it:
+    // a Morgan Stanley consolidated statement's household roll-up section,
+    // attributed to no account by the parser and then attributed to the
+    // document's own account by the `?? document.accountId` fallback below.
+    // The parser refuses that section now (adapter-morgan-stanley's
+    // `parseRealStatement`, F1-8l), and this refuses the second row for any
+    // other layout that ever does the same thing.
+    //
+    // ponytail: the already-stored half rides on `cashConflicts`, which keeps
+    // one row per (account, as_of), so where another document also states
+    // that pair this document's own stored row can be the one not kept and a
+    // reparse could still insert beside it -- a case `balance_cash_conflict`
+    // already reports. Give this its own query if that ever matters; the
+    // within-batch half, which is what the roll-up produced, is exact.
+    const balanceKeys =
+      cashConflicts === null
+        ? null
+        : new Set(
+            [...cashConflicts.values()]
+              .filter((r) => r.source_document_id === documentId)
+              .map((r) => `${r.account_id}/${r.as_of}`),
+          );
+
     const toInsert: unknown[][] = [];
     let anySuccess = false;
     for (const p of prepared) {
@@ -1563,6 +1592,23 @@ export async function importBatch(
           );
         }
         continue;
+      }
+      if (balanceKeys !== null) {
+        const key = `${p.accountId}/${p.values[2] as string}`;
+        if (balanceKeys.has(key)) {
+          openReview(p.accountId, documentId, p.sourceLocator, {
+            kind: "balance_duplicate_in_document",
+            rawValue: String(p.values[3] ?? ""),
+            reason:
+              `this document already states a balance for ${p.accountId} as of ` +
+              `${p.values[2] as string}, so this second one is the document ` +
+              "contradicting itself rather than a second stated fact; it is not " +
+              "inserted, and neither stated balance is altered (ground rule 5)",
+          });
+          rowsRefused += 1;
+          continue;
+        }
+        balanceKeys.add(key);
       }
       seen.set(p.hash, p.sourceLocator);
       if (changed !== null && p.changedKey !== null) changed.add(p.changedKey);

@@ -670,6 +670,28 @@ fails the whole batch loudly rather than writing an orphaned row.
 `liabilities.account_id` may be `null` (an institution-level liability not
 tied to one account).
 
+### One document states one balance per account per date (F1-8l)
+
+A second `balances` row for the same `(account_id, as_of)` from the **same**
+document is refused and opens `balance_duplicate_in_document`. The first one
+stated stands, unaltered, and nothing about the other one is merged into it.
+
+No `row_hash` catches this: `cash` and `total_value` are in `balanceHash`'s
+preimage, so two contradicting balances hash differently and both insert. The
+cash gate then pairs whichever of the two it happens to pick with the
+neighbouring period's snapshot, which is a verdict computed against a number
+the document contradicted elsewhere on its own pages.
+
+The shape that produced it was a Morgan Stanley consolidated statement's
+household roll-up section: attributed to no account by the parser, then to the
+document's own account by the `balance.accountId ?? document.accountId`
+fallback above. The adapter refuses that section now (see
+[`packages/adapter-morgan-stanley`](../adapter-morgan-stanley), "Consolidated
+statements"), and this refuses the second row for any layout that ever does
+the same thing again. `balance_cash_conflict` (F1-8a) stays what it was: two
+*different* documents disagreeing, where both rows are kept because either
+could be the right one.
+
 ## Reconciliation gate
 
 `runReconciliationGate(client, importRunId?, scope?)` (`src/reconciliation.ts`) is ground
