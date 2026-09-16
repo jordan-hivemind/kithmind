@@ -98,6 +98,74 @@ describe("validateMcpEnvironment", () => {
     ]);
   });
 
+  // The three variables P2-39i adds (surface plan section 3.4). They are not in
+  // the required list while `KITH_POSTGRES_SURFACE` still defaults to `convex`,
+  // which is the whole point of the dark deploy.
+  it("does not require the kith variables under the convex surface", () => {
+    expect(validateMcpEnvironment(validEnvironment())).toEqual([]);
+
+    const convex = validEnvironment();
+    convex.KITH_POSTGRES_SURFACE = "convex";
+    expect(validateMcpEnvironment(convex)).toEqual([]);
+  });
+
+  it("requires the kith variables under the postgres surface", () => {
+    const environment = validEnvironment();
+    environment.KITH_POSTGRES_SURFACE = "postgres";
+
+    expect(validateMcpEnvironment(environment)).toEqual([
+      { name: "KITH_DATABASE_URL", problem: "missing" },
+      { name: "KITH_SESSION_SECRET", problem: "missing" },
+    ]);
+
+    environment.KITH_DATABASE_URL = "postgres://example.test/kith";
+    environment.KITH_SESSION_SECRET = "s".repeat(32);
+    expect(validateMcpEnvironment(environment)).toEqual([]);
+  });
+
+  it("rejects a malformed kith value in either surface mode", () => {
+    for (const surface of ["convex", "postgres"]) {
+      const environment = validEnvironment();
+      environment.KITH_POSTGRES_SURFACE = surface;
+      environment.KITH_DATABASE_URL = "not-a-connection-string";
+      // A secret too short to sign with under `convex` is a secret that would
+      // still be too short the moment the flag flips, so it is reported now.
+      environment.KITH_SESSION_SECRET = "s".repeat(31);
+
+      expect(validateMcpEnvironment(environment)).toEqual([
+        { name: "KITH_DATABASE_URL", problem: "invalid" },
+        { name: "KITH_SESSION_SECRET", problem: "invalid" },
+      ]);
+    }
+  });
+
+  it("rejects a surface value that is neither backend", () => {
+    const environment = validEnvironment();
+    environment.KITH_POSTGRES_SURFACE = "postgresql";
+
+    expect(validateMcpEnvironment(environment)).toEqual([
+      { name: "KITH_POSTGRES_SURFACE", problem: "invalid" },
+    ]);
+  });
+
+  it("names the kith variables without returning their values", () => {
+    const environment = validEnvironment();
+    environment.KITH_DATABASE_URL = "postgres://owner:do-not-leak@host/kith";
+    environment.KITH_SESSION_SECRET = "short";
+
+    const issues = validateMcpEnvironment(environment);
+    expect(issues).toEqual([
+      { name: "KITH_SESSION_SECRET", problem: "invalid" },
+    ]);
+    expect(JSON.stringify(issues)).not.toContain("do-not-leak");
+    try {
+      assertMcpEnvironment(environment);
+    } catch (error) {
+      expect(String(error)).not.toContain("do-not-leak");
+      expect(String(error)).not.toContain("short");
+    }
+  });
+
   it("throws an error containing names only", () => {
     const secretValue = "do-not-leak-this-value";
     const environment = validEnvironment();

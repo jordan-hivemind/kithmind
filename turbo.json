@@ -70,7 +70,8 @@
     },
     "@repo/web#test:once": {
       "cache": false,
-      "dependsOn": ["^build"]
+      "dependsOn": ["^build"],
+      "passThroughEnv": ["KITH_STORE_DATABASE_URL"]
     }
   },
   "globalPassThroughEnv": ["PORT", "WEB_PORT"],
@@ -86,6 +87,9 @@
     "MCP_OAUTH_ENCRYPTION_KEY",
     "MCP_TOOL_PROFILE",
     "FINANCE_ARCHIVE_READER_DATABASE_URL",
-    "FINANCE_ARCHIVE_SPACE_ID"
+    "FINANCE_ARCHIVE_SPACE_ID",
+    "KITH_DATABASE_URL",
+    "KITH_SESSION_SECRET",
+    "KITH_POSTGRES_SURFACE"
   ]
 }

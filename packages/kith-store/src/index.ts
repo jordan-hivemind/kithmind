@@ -43,6 +43,7 @@ export {
   kithSchemaVersion,
   kithSerializationBackoffDelayMs,
   setKithSerializationSleep,
+  withKithReadTransaction,
   withKithTransaction,
   type KithMigration,
 } from "./schema.js";
@@ -247,6 +248,41 @@ export async function grantProofAppRole(
     kith.space_embedding_states, kith.embedding_generations,
     kith.embedding_targets, kith.embedding_build_jobs,
     kith.thoughts TO "${appRole}"`);
+  // P2-39i adds the four groups the web and MCP surface writes, which were the
+  // gap section 4.2 of the surface plan found: "`kith.sessions` cannot be
+  // written by the app role as the code stands", and the same was true of every
+  // other table the dashboard touches. Until now the identity, memory, records
+  // and coverage services were reachable only through the owner role, which made
+  // a whole domain read-only for the application credential by accident.
+  //
+  // Identity is every table `src/identity/` writes: the account pair, the
+  // session row logout has to be able to revoke, the API key with its two grant
+  // tables, the OAuth code receipt, and the space, membership and settings rows
+  // `ensurePersonalSpace` creates on first sign-in.
+  await owner.query(`GRANT INSERT, UPDATE, DELETE ON
+    kith.users, kith.auth_accounts, kith.sessions,
+    kith.api_keys, kith.api_key_spaces, kith.api_key_source_accounts,
+    kith.consumed_oauth_codes, kith.spaces, kith.space_members,
+    kith.family_invitations, kith.user_space_settings TO "${appRole}"`);
+  // Memory: `entities` and `facts`. `thoughts` is already granted above, with
+  // P2-39g2's embedding tables.
+  await owner.query(`GRANT INSERT, UPDATE, DELETE ON
+    kith.entities, kith.facts TO "${appRole}"`);
+  // Records: the event stream `src/records/` writes and the query-session
+  // bookkeeping a paged record query keeps between requests.
+  await owner.query(`GRANT INSERT, UPDATE, DELETE ON
+    kith.events, kith.event_versions, kith.observations,
+    kith.record_query_sessions, kith.record_query_space_state TO "${appRole}"`);
+  // Coverage: the validated windows and the gaps between them.
+  await owner.query(`GRANT INSERT, UPDATE, DELETE ON
+    kith.coverage_windows, kith.coverage_gaps TO "${appRole}"`);
+  // Deliberately still absent, and each one is a table an application write
+  // would be a bug on: `kith.schema_version`, which only a migration runner
+  // writes; the `proof_*` prototype pair, which only the owner role seeds; and
+  // the worker receipt and reservation tables P2-39e owns and grants when the
+  // operations that write them land. `test/appRoleGrants.test.mjs` asserts the
+  // app role is refused on the first two, because a grant that had quietly
+  // become `ALL TABLES` would otherwise pass every assertion above.
   // pgvector lives in `public` (migration 015 says why), and every vector
   // read names its type and operators there. Applying the reader role revokes
   // PUBLIC's default USAGE on `public`, so the writer is granted it by name

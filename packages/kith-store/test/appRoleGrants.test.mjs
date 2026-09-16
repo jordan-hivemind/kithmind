@@ -1,0 +1,255 @@
+// What the application credential may write, asserted as that credential.
+//
+// Section 4.2 of the web and MCP surface plan found the gap this covers:
+// `grantProofAppRole` named 24 tables and none of them were the identity,
+// memory, records or coverage tables, so "`kith.sessions` cannot be written by
+// the app role as the code stands" and neither could anything else the
+// dashboard touches. Every one of those writes had only ever been exercised as
+// the owner role, which grants everything and therefore proves nothing about
+// the credential production actually uses.
+//
+// So this suite connects as the app role itself. One real write per table group
+// says the grant reaches the server, and `has_table_privilege` over the full
+// list says no table was left out of the GRANT statement, which is the failure
+// mode that is otherwise invisible until the first request that needs it.
+//
+// `kith.schema_version` is the deliberate control. Only a migration runner
+// writes it, so the app role must be refused there; without that assertion a
+// grant that accidentally said ALL TABLES would pass everything above.
+
+import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
+import test from "node:test";
+
+import pg from "pg";
+
+import {
+  applyKithSchema,
+  grantProofAppRole,
+  newKithId,
+} from "../dist/index.js";
+import { connect, skip, throwawayDatabase } from "./helpers/pgDatabase.mjs";
+
+/** Every table the four groups P2-39i adds must be writable on. */
+const GRANTED = Object.freeze({
+  identity: [
+    "users",
+    "auth_accounts",
+    "sessions",
+    "api_keys",
+    "api_key_spaces",
+    "api_key_source_accounts",
+    "consumed_oauth_codes",
+    "spaces",
+    "space_members",
+    "family_invitations",
+    "user_space_settings",
+  ],
+  memory: ["entities", "facts", "thoughts"],
+  records: [
+    "events",
+    "event_versions",
+    "observations",
+    "record_query_sessions",
+    "record_query_space_state",
+  ],
+  coverage: ["coverage_windows", "coverage_gaps"],
+});
+
+/** Tables no application write may reach. The control for the list above. */
+const WITHHELD = Object.freeze(["schema_version", "proof_spaces", "proof_api_keys"]);
+
+const INSUFFICIENT_PRIVILEGE = "42501";
+
+async function createAppRole(owner) {
+  const role = `kith_app_grants_${randomBytes(6).toString("hex")}`;
+  const password = randomBytes(24).toString("hex");
+  await owner.query(
+    `CREATE ROLE "${role}" LOGIN PASSWORD '${password}' NOSUPERUSER NOCREATEDB NOCREATEROLE`,
+  );
+  return { role, password };
+}
+
+/** The error a statement raised, or null when it succeeded. */
+async function attempt(client, sql, values = []) {
+  try {
+    await client.query(sql, values);
+    return null;
+  } catch (error) {
+    return error;
+  }
+}
+
+test(
+  "the app role writes every granted table group and nothing else",
+  { skip },
+  async (t) => {
+    const database = await throwawayDatabase(t);
+    const owner = await connect(database);
+    await applyKithSchema(owner);
+    const role = await createAppRole(owner);
+    await grantProofAppRole(owner, role.role);
+
+    const url = new URL(database.url);
+    url.username = role.role;
+    url.password = role.password;
+    const app = database.adopt(new pg.Client({ connectionString: url.toString() }));
+    await app.connect();
+
+    try {
+      // Identity. A user, then the session row logout has to be able to revoke,
+      // then the space records `ensurePersonalSpace` creates on first sign-in.
+      const userId = newKithId();
+      const spaceId = newKithId();
+      assert.equal(
+        await attempt(app, "INSERT INTO kith.users (id, email) VALUES ($1, $2)", [
+          userId,
+          "grants@example.test",
+        ]),
+        null,
+      );
+      const sessionId = newKithId();
+      assert.equal(
+        await attempt(
+          app,
+          `INSERT INTO kith.sessions (id, user_id, token_hash, expires_at, last_used_at)
+             VALUES ($1, $2, $3, transaction_timestamp() + interval '1 day',
+                     transaction_timestamp())`,
+          [sessionId, userId, "a".repeat(64)],
+        ),
+        null,
+      );
+      assert.equal(
+        await attempt(
+          app,
+          "UPDATE kith.sessions SET revoked_at = transaction_timestamp() WHERE id = $1",
+          [sessionId],
+        ),
+        null,
+      );
+      assert.equal(
+        await attempt(
+          app,
+          `INSERT INTO kith.spaces (id, kind, name, created_by)
+             VALUES ($1, 'personal', 'Personal', $2)`,
+          [spaceId, userId],
+        ),
+        null,
+      );
+      assert.equal(
+        await attempt(
+          app,
+          `INSERT INTO kith.space_members (id, space_id, user_id, role)
+             VALUES ($1, $2, $3, 'owner')`,
+          [newKithId(), spaceId, userId],
+        ),
+        null,
+      );
+      assert.equal(
+        await attempt(
+          app,
+          `INSERT INTO kith.user_space_settings (id, user_id, personal_space_id)
+             VALUES ($1, $2, $3)`,
+          [newKithId(), userId, spaceId],
+        ),
+        null,
+      );
+
+      // Memory.
+      const entityId = newKithId();
+      assert.equal(
+        await attempt(
+          app,
+          `INSERT INTO kith.entities
+             (id, space_id, created_at, user_id, key, kind, canonical_name, normalized_name)
+             VALUES ($1, $2, transaction_timestamp(), $3, 'person:ada', 'person', 'Ada', 'ada')`,
+          [entityId, spaceId, userId],
+        ),
+        null,
+      );
+      assert.equal(
+        await attempt(
+          app,
+          `INSERT INTO kith.facts
+             (id, space_id, created_at, user_id, subject_entity_id, predicate, value,
+              statement, search_text, source_type, confidence, status)
+             VALUES ($1, $2, transaction_timestamp(), $3, $4, 'works_at',
+                     '{"text":"here"}'::jsonb, 'Ada works here', 'ada works here',
+                     'user_stated', 1, 'current')`,
+          [newKithId(), spaceId, userId, entityId],
+        ),
+        null,
+      );
+
+      // Records.
+      assert.equal(
+        await attempt(
+          app,
+          `INSERT INTO kith.events (id, space_id, created_at, event_key)
+             VALUES ($1, $2, transaction_timestamp(), 'synthetic')`,
+          [newKithId(), spaceId],
+        ),
+        null,
+      );
+
+      // Coverage.
+      assert.equal(
+        await attempt(
+          app,
+          `INSERT INTO kith.coverage_windows (id, space_id, created_at, record_type, state)
+             VALUES ($1, $2, transaction_timestamp(), 'synthetic', 'validated')`,
+          [newKithId(), spaceId],
+        ),
+        null,
+      );
+
+      // Every table in every group, including the ones no write above reaches.
+      for (const [group, tables] of Object.entries(GRANTED)) {
+        for (const table of tables) {
+          for (const privilege of ["INSERT", "UPDATE", "DELETE", "SELECT"]) {
+            const granted = await app.query(
+              "SELECT has_table_privilege($1, $2) AS granted",
+              [`kith.${table}`, privilege],
+            );
+            assert.equal(
+              granted.rows[0].granted,
+              true,
+              `${group}: ${privilege} on kith.${table}`,
+            );
+          }
+        }
+      }
+
+      // The control. A table deliberately left out of the grant refuses the
+      // write at the server, with the code that says it was a privilege and not
+      // a constraint.
+      for (const table of WITHHELD) {
+        const refused = await attempt(
+          app,
+          `INSERT INTO kith.${table} SELECT * FROM kith.${table} WHERE false`,
+        );
+        assert.equal(
+          refused?.code,
+          INSUFFICIENT_PRIVILEGE,
+          `kith.${table} must not be writable by the app role`,
+        );
+        // Reading it is still allowed: the grant narrows writes, not reads.
+        assert.equal(
+          (
+            await app.query("SELECT has_table_privilege($1, 'SELECT') AS granted", [
+              `kith.${table}`,
+            ])
+          ).rows[0].granted,
+          true,
+        );
+      }
+    } finally {
+      await app.end().catch(() => {});
+      // Drop the role's privileges in this database before the role itself,
+      // because a role a grant still names cannot be dropped, and this database
+      // outlives the statement by one test hook.
+      await owner.query(`DROP OWNED BY "${role.role}"`).catch(() => {});
+      await owner.query(`DROP ROLE IF EXISTS "${role.role}"`).catch(() => {});
+    }
+  },
+);

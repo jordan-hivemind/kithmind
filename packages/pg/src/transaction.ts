@@ -77,6 +77,17 @@ const openTransactions = new WeakSet<object>();
  */
 export type SchemaTransactionOptions = {
   isolation?: "SERIALIZABLE" | "REPEATABLE READ" | "READ COMMITTED";
+  /**
+   * Adds `READ ONLY` to the `BEGIN`, so the *server* refuses a write in this
+   * transaction with SQLSTATE 25006 rather than the application promising not
+   * to issue one.
+   *
+   * That distinction is the whole point. A read path is read-only because a
+   * reviewer can see the `BEGIN`, not because every statement under it was
+   * audited, and the refusal arrives at the statement that broke the rule
+   * instead of as a row that should not exist.
+   */
+  readOnly?: boolean;
   statementTimeoutMs?: number;
   lockTimeoutMs?: number;
   idleInTransactionTimeoutMs?: number;
@@ -98,6 +109,13 @@ function positiveInteger(value: number, setting: string): number {
  * A nested call ignores `options`: the outer transaction has already begun, so
  * its isolation level and timeouts are the ones in force. Anything else would
  * silently claim a stronger guarantee than the transaction actually has.
+ *
+ * `readOnly` nests the same way and in the same direction. An inner read-only
+ * block inside an outer read-write transaction does not become read-only, so a
+ * caller must not treat nesting as a sandbox that takes write access away from
+ * the work inside it; only the outermost `BEGIN` decides. The reverse cannot
+ * happen, because the server refuses every write under a read-only transaction
+ * whether or not the code issuing it knew it was there.
  */
 export async function withSchemaTransaction<T>(
   client: SchemaClient,
@@ -108,9 +126,16 @@ export async function withSchemaTransaction<T>(
   const name = assertPgSchemaName(schema);
   if (openTransactions.has(client)) return body(client);
   openTransactions.add(client);
-  await client.query(
-    options.isolation ? `BEGIN ISOLATION LEVEL ${options.isolation}` : "BEGIN",
-  );
+  // `BEGIN [ISOLATION LEVEL <level>] [READ ONLY]`: both modes are closed
+  // allowlists in this file, never caller text, so neither is interpolated
+  // from anything a request can reach.
+  const modes = [
+    options.isolation ? `ISOLATION LEVEL ${options.isolation}` : "",
+    options.readOnly ? "READ ONLY" : "",
+  ]
+    .filter((mode) => mode !== "")
+    .join(" ");
+  await client.query(modes === "" ? "BEGIN" : `BEGIN ${modes}`);
   try {
     // The schema name is a validated identifier, which is why it can be
     // interpolated where a bind parameter is not allowed.

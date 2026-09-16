@@ -1,0 +1,65 @@
+// `POST /api/auth/sign-in`. Section 2.2 of the web and MCP surface plan.
+//
+// One transaction: `identity.signIn`, then `identity.ensurePersonalSpace`. Both
+// inside the same `withKithTransaction`, so a sign-in that opens a session
+// without the space records it needs, or the reverse, is not a state this can
+// reach.
+//
+// The route exists in both surface modes. It only ever writes `kith.sessions`
+// and the personal space records, so under `KITH_POSTGRES_SURFACE=convex` it is
+// harmless: nothing reads the cookie it sets until the middleware and the
+// layouts switch over.
+
+import { withKithTransaction } from "@repo/kith-store";
+import {
+  ensurePersonalSpace,
+  identityCtx,
+  sessionCookie,
+  signIn,
+} from "@repo/kith-store/identity";
+
+import {
+  authFailure,
+  noContent,
+  problem,
+  readCredentials,
+  readJsonBody,
+  tooManyAttempts,
+} from "@/lib/kith/auth-route";
+import { kithPool } from "@/lib/kith/pool";
+import { authRateLimiter, clientAddress } from "@/lib/kith/rate-limit";
+import { kithSessionConfig } from "@/lib/kith/session";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+export async function POST(request: Request): Promise<Response> {
+  const body = await readJsonBody(request);
+  const credentials = body === null ? null : readCredentials(body);
+  if (credentials === null) return problem(400, "Invalid request");
+
+  const decision = authRateLimiter().check({
+    address: clientAddress(request),
+    account: credentials.email,
+  });
+  if (!decision.allowed) return tooManyAttempts(decision.retryAfterSeconds);
+
+  try {
+    const config = kithSessionConfig();
+    const opened = await withKithTransaction(kithPool(), async (client) => {
+      const ctx = identityCtx(client);
+      const session = await signIn(ctx, {
+        email: credentials.email,
+        password: credentials.password,
+      });
+      // An account migrated from Convex may predate personal spaces, so this is
+      // not redundant with the same call in sign-up: it is the repair path for
+      // a user whose records were never created.
+      await ensurePersonalSpace(ctx, session.userId);
+      return session;
+    });
+    return noContent(sessionCookie(config, opened.token, opened.expiresAt));
+  } catch (error) {
+    return authFailure(error);
+  }
+}

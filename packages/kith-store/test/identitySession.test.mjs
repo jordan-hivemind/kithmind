@@ -13,12 +13,15 @@ import test from "node:test";
 
 import {
   SESSION_DURATION_MS,
+  SESSION_TOUCH_MIN_MS,
   changePassword,
   createSession,
+  ensurePersonalSpace,
   getPasswordAccount,
   removeExpiredSessions,
   requireMcpPrincipal,
   requireWebPrincipal,
+  requireWebSession,
   requireWebUserId,
   resolveSessionToken,
   revokeSession,
@@ -419,3 +422,138 @@ test("a revoked session stays revoked", { skip }, async (t) => {
     assert.deepEqual(second.rows[0].revoked_at, first.rows[0].revoked_at);
   });
 });
+
+test(
+  "resolving refreshes last_used_at, at most once per touch window",
+  { skip },
+  async (t) => {
+    const db = await identityDatabase(t);
+    await db.tx(async (ctx) => {
+      const userId = await makeUser(ctx);
+      const session = await createSession(ctx, userId);
+      const lastUsedAt = async () =>
+        (
+          await ctx.client.query(
+            "SELECT last_used_at FROM kith.sessions WHERE id = $1",
+            [session.sessionId],
+          )
+        ).rows[0].last_used_at.getTime();
+      const opened = await lastUsedAt();
+      assert.equal(opened, ctx.now);
+
+      // A read path never writes. That default is what keeps
+      // `withKithReadTransaction`'s `READ ONLY` usable on a page that
+      // authenticates: the server would refuse the write with 25006.
+      await resolveSessionToken(
+        db.ctx(ctx.now + SESSION_TOUCH_MIN_MS * 2),
+        session.token,
+      );
+      assert.equal(await lastUsedAt(), opened);
+
+      // Inside the window, an opted-in resolve still does not write: the column
+      // is already accurate to within one window, and a session resolved on
+      // every request must not mean a row written on every request.
+      const early = db.ctx(ctx.now + SESSION_TOUCH_MIN_MS - 1);
+      const unchanged = await resolveSessionToken(early, session.token, {
+        touch: true,
+      });
+      assert.equal(unchanged.lastUsedAt, opened);
+      assert.equal(await lastUsedAt(), opened);
+
+      // Past the window it writes once, and the refreshed value is the one the
+      // caller is handed rather than the stale one it read.
+      const later = db.ctx(ctx.now + SESSION_TOUCH_MIN_MS);
+      const touched = await resolveSessionToken(later, session.token, {
+        touch: true,
+      });
+      assert.equal(touched.lastUsedAt, later.now);
+      assert.equal(await lastUsedAt(), later.now);
+
+      // And having written, the next resolve in the new window does not.
+      await resolveSessionToken(db.ctx(later.now + 1), session.token, {
+        touch: true,
+      });
+      assert.equal(await lastUsedAt(), later.now);
+    });
+  },
+);
+
+test(
+  "a revoked session is never touched, and requireWebSession returns the session",
+  { skip },
+  async (t) => {
+    const db = await identityDatabase(t);
+    await db.tx(async (ctx) => {
+      const userId = await makeUser(ctx);
+      const session = await createSession(ctx, userId);
+      const cookieHeader = header(session.token, session.expiresAt);
+
+      const resolved = await requireWebSession(ctx, {
+        config: sessionConfig,
+        cookieHeader,
+      });
+      assert.equal(resolved.principal.userId, userId);
+      assert.equal(resolved.session.id, session.sessionId);
+
+      await revokeSession(ctx, session.sessionId);
+      const later = db.ctx(ctx.now + SESSION_TOUCH_MIN_MS * 4);
+      assert.equal(
+        await refusal(() =>
+          requireWebSession(later, {
+            config: sessionConfig,
+            cookieHeader,
+            touch: true,
+          }),
+        ),
+        NOT_AUTHENTICATED,
+      );
+      // The revoked row keeps the moment it was last genuinely used.
+      const stored = await later.client.query(
+        "SELECT last_used_at FROM kith.sessions WHERE id = $1",
+        [session.sessionId],
+      );
+      assert.equal(stored.rows[0].last_used_at.getTime(), ctx.now);
+    });
+  },
+);
+
+test(
+  "signing up creates the personal space records it documents",
+  { skip },
+  async (t) => {
+    const db = await identityDatabase(t);
+    await db.tx(async (ctx) => {
+      const created = await signUp(ctx, {
+        email: "personal@example.test",
+        password: "a strong enough password",
+      });
+
+      // The space, the owner membership and the settings row, all in the same
+      // transaction as the user row and the account row.
+      const settings = await ctx.client.query(
+        `SELECT s.kind, m.role, u.personal_space_id
+           FROM kith.user_space_settings u
+           JOIN kith.spaces s ON s.id = u.personal_space_id
+           JOIN kith.space_members m
+             ON m.space_id = s.id AND m.user_id = u.user_id
+          WHERE u.user_id = $1`,
+        [created.userId],
+      );
+      assert.equal(settings.rows.length, 1);
+      assert.equal(settings.rows[0].kind, "personal");
+      assert.equal(settings.rows[0].role, "owner");
+
+      // And the sign-up route calling `ensurePersonalSpace` again, per section
+      // 2.2 of the surface plan, is idempotent rather than a second space.
+      assert.equal(
+        await ensurePersonalSpace(ctx, created.userId),
+        settings.rows[0].personal_space_id,
+      );
+      const spaces = await ctx.client.query(
+        "SELECT count(*)::int AS count FROM kith.spaces WHERE created_by = $1",
+        [created.userId],
+      );
+      assert.equal(spaces.rows[0].count, 1);
+    });
+  },
+);

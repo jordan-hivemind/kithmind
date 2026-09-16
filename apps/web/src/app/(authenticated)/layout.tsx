@@ -1,75 +1,41 @@
-"use client";
+// The authenticated shell, now a server component that picks a surface.
+//
+// Under `KITH_POSTGRES_SURFACE=convex` it renders exactly what it always did:
+// the Convex `AuthLoading`/`Unauthenticated`/`Authenticated` gates, moved
+// verbatim into `ConvexAuthenticatedShell`. i1 must be observably unchanged in
+// that mode, because it lands before i5 moves the pages and `main` deploys.
+//
+// Under `postgres` the session is read here, on the server, and an
+// unauthenticated request is redirected rather than shown a client-side
+// "Redirecting to sign in..." while the page below it is already in the bundle.
+// This is also the layer that satisfies section 7's rule: the middleware checked
+// a MAC, and this checks the session row, in its own transaction, against the
+// live user.
 
-import { useAuthActions } from "@convex-dev/auth/react";
-import { Authenticated, AuthLoading, Unauthenticated } from "convex/react";
-import Link from "next/link";
+import { redirect } from "next/navigation";
 
-function Nav() {
-  const { signOut } = useAuthActions();
+import { ConvexAuthenticatedShell } from "@/components/convex-authenticated-shell";
+import { KithSignOutNav } from "@/components/kith-sign-out";
+import { currentWebPrincipal } from "@/lib/kith/server-session";
+import { kithPostgresSurface } from "@/lib/kith/surface";
 
-  return (
-    <nav
-      style={{
-        display: "flex",
-        gap: 16,
-        padding: "12px 24px",
-        borderBottom: "1px solid #eee",
-        alignItems: "center",
-        fontFamily: "system-ui, sans-serif",
-      }}
-    >
-      <strong>Kith Mind</strong>
-      <Link href="/">Dashboard</Link>
-      <Link href="/browse">Browse</Link>
-      <Link href="/settings">Settings</Link>
-      <Link href="/spaces">Spaces</Link>
-      <Link href="/getting-started">Getting Started</Link>
-      <div style={{ marginLeft: "auto" }}>
-        <button onClick={() => signOut()} style={{ cursor: "pointer" }}>
-          Sign Out
-        </button>
-      </div>
-    </nav>
-  );
-}
-
-export default function AuthenticatedLayout({
+export default async function AuthenticatedLayout({
   children,
 }: {
   children: React.ReactNode;
 }) {
+  if (kithPostgresSurface() !== "postgres") {
+    return <ConvexAuthenticatedShell>{children}</ConvexAuthenticatedShell>;
+  }
+
+  if ((await currentWebPrincipal()) === null) redirect("/sign-in");
+
   return (
     <>
-      <AuthLoading>
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "center",
-            padding: 48,
-            fontFamily: "system-ui, sans-serif",
-          }}
-        >
-          Loading...
-        </div>
-      </AuthLoading>
-      <Unauthenticated>
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "center",
-            padding: 48,
-            fontFamily: "system-ui, sans-serif",
-          }}
-        >
-          Redirecting to sign in...
-        </div>
-      </Unauthenticated>
-      <Authenticated>
-        <Nav />
-        <main style={{ padding: 24, fontFamily: "system-ui, sans-serif" }}>
-          {children}
-        </main>
-      </Authenticated>
+      <KithSignOutNav />
+      <main style={{ padding: 24, fontFamily: "system-ui, sans-serif" }}>
+        {children}
+      </main>
     </>
   );
 }
