@@ -217,6 +217,29 @@ test(
 );
 
 test(
+  "concurrent captures in one space still converge on one job",
+  { skip },
+  async (t) => {
+    const f = await poolFixture(t);
+    const space = await seedCountedSpace(f);
+    // The dedupe read and insert are now part of the capture's own
+    // `SERIALIZABLE` transaction, so six captures racing into one space
+    // contend on the same index range. `withKithTransaction`'s bounded retry
+    // is what makes that converge rather than fail; this pins that it does,
+    // because a capture that threw under concurrency would be a regression
+    // the single-writer tests above could not see.
+    const ids = await Promise.all(
+      [0, 1, 2, 3, 4, 5].map((n) =>
+        capture(f, space, `memory ${n}`, NOW + n),
+      ),
+    );
+    assert.equal(new Set(ids).size, 6);
+    const jobs = await fillJobs(f, space.spaceId);
+    assert.equal(jobs.length, 1);
+  },
+);
+
+test(
   "the default registry drains the fill, and the vector leg answers afterwards",
   { skip },
   async (t) => {
