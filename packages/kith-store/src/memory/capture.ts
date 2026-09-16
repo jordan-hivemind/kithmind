@@ -32,13 +32,22 @@
 //    made for a differing `replacementContent` have nothing to serve and are
 //    not ported.
 //
-//    The honest cost of that is recorded here rather than hidden: a space's
-//    thought index reports `thoughtStatus: "unavailable"` while eligible and
-//    covered counts disagree, and `searchThoughtVectorCandidates` is strict
-//    about it (I9), so between a capture and the next fill this gate sees no
-//    vector candidates. Duplicate and supersede detection is therefore only as
-//    fresh as the fill. The covering-fact leg is keyword-based and is
-//    unaffected.
+//    The cost of that is not a degradation, it is a hole, and the first
+//    version of this file understated it as staleness. A space's thought index
+//    reports `thoughtStatus: "unavailable"` while eligible and covered counts
+//    disagree (I9), and a stored capture is precisely what makes them
+//    disagree, so every capture blinded the next one -- until a fill ran, and
+//    `runEmbeddingFill` has no production caller yet. A retried capture stored
+//    a duplicate and a changed memory could not supersede its predecessor.
+//
+//    Two things close it, both below. `searchCaptureCandidates` falls back to
+//    the keyword leg whenever the index is incomplete, so the classifier is
+//    never asked to judge novelty against nothing, and `applyCaptureDecision`
+//    refuses a byte-identical retry by the same author inside
+//    `CAPTURE_RETRY_WINDOW_MS` without consulting anything at all. Neither
+//    replaces the vector leg. They make its absence cost recall instead of
+//    correctness. The covering-fact leg is keyword-based and was never
+//    affected.
 //
 // 2. The SUPERSEDE/RETRACT fallback is a precheck, not a `catch`. Convex
 //    wrapped the transition in `try`/`catch` and fell back to ADD when it
@@ -59,13 +68,15 @@
 
 import {
   searchFacts,
+  searchThoughtsByText,
   searchThoughtVectorCandidates,
 } from "../embeddings/search.js";
 import { getActiveTargets } from "../embeddings/targets.js";
-import type { IdentityCtx } from "../identity/db.js";
+import { row, type IdentityCtx } from "../identity/db.js";
 import { KITH_ID } from "../ids.js";
 import {
   fallbackThoughtMetadata,
+  MAX_CAPTURE_CONTENT_CHARS,
   type ThoughtAnalysis,
 } from "./captureAdmission.js";
 import {
@@ -82,6 +93,7 @@ import {
   setCoreStatus,
   transitionMemory,
   type MemorySourceType,
+  type Thought,
   type ThoughtMetadata,
 } from "./thoughts.js";
 
@@ -131,14 +143,74 @@ export async function searchCoveringFacts(
  * must compare against, and the prompt is given its `validFrom`/`validTo` so
  * the model can weigh it. Their historical mode drops the window but would let
  * a superseded row through, so the status test is restated below.
+ *
+ * ## Why there is a keyword leg here at all
+ *
+ * The vector leg alone made the gate structurally blind on PostgreSQL, and the
+ * mechanism is worth stating because nothing about it is obvious. A stored
+ * capture marks its target eligible and writes no vector (see the module
+ * comment), so `covered.thought` and `eligible.thought` disagree from that
+ * moment on. `getActiveEmbeddingTarget` reports `thoughtStatus: "unavailable"`
+ * for the *whole space* while they disagree (I9), and
+ * `searchThoughtVectorCandidates` drops every candidate when it is not
+ * `"ready"`. One capture therefore blinded the next one, for as long as the
+ * space went unfilled -- and `runEmbeddingFill` has no production caller yet,
+ * so that is until row j registers an `embedding_fill` handler. A retried
+ * capture stored a duplicate and a changed memory could not supersede its
+ * predecessor.
+ *
+ * So the index decides which leg runs, never whether a leg runs. When the
+ * thought index is complete the vector leg answers, as Convex's did. Otherwise
+ * the keyword leg over `content` answers, which is the same index
+ * `search_thoughts` falls back to when a vector outage degrades ranking. It is
+ * a weaker comparison set, not an empty one, and the gate is never asked to
+ * judge novelty with nothing in front of it.
+ *
+ * `vector` is `null` when the caller did not embed, which it does not do unless
+ * this same readiness test passed before it called the provider.
  */
 export async function searchCaptureCandidates(
   ctx: IdentityCtx,
   spaceId: string,
-  vector: readonly number[],
+  content: string,
+  vector: readonly number[] | null,
 ): Promise<CaptureClassifierCandidate[]> {
   const targets = await getActiveTargets(ctx, [spaceId]);
-  if (targets.length === 0) return [];
+  const ready =
+    vector !== null &&
+    targets.length === 1 &&
+    targets[0]!.thoughtStatus === "ready";
+
+  const hydrated = ready
+    ? await vectorCandidates(ctx, spaceId, targets, vector)
+    : await keywordCandidates(ctx, spaceId, content);
+
+  return hydrated
+    .filter((thought) => isCurrentMemory(thought.memoryStatus))
+    .slice(0, MAX_CANDIDATES)
+    .map((thought) => ({
+      id: thought.id,
+      content: thought.content,
+      metadata: {
+        type: thought.metadata.type,
+        topics: thought.metadata.topics,
+        people: thought.metadata.people,
+        summary: thought.metadata.summary,
+      },
+      createdAt: thought.createdAt,
+      ...(thought.validFrom === undefined
+        ? {}
+        : { validFrom: thought.validFrom }),
+      ...(thought.validTo === undefined ? {} : { validTo: thought.validTo }),
+    }));
+}
+
+async function vectorCandidates(
+  ctx: IdentityCtx,
+  spaceId: string,
+  targets: Awaited<ReturnType<typeof getActiveTargets>>,
+  vector: readonly number[],
+): Promise<Thought[]> {
   const scored = await searchThoughtVectorCandidates(ctx, targets, vector, {
     cap: MAX_CANDIDATES * 5,
     includeHistorical: true,
@@ -146,22 +218,70 @@ export async function searchCaptureCandidates(
   const ranked = scored
     .filter((candidate) => candidate.similarity >= SIMILARITY_THRESHOLD)
     .map((candidate) => candidate.thoughtId);
-  const hydrated = (
-    await getThoughtsByIds(ctx, [spaceId], ranked, { includeHistorical: true })
-  ).filter((thought) => isCurrentMemory(thought.memoryStatus));
-  return hydrated.slice(0, MAX_CANDIDATES).map((thought) => ({
-    id: thought.id,
-    content: thought.content,
-    metadata: {
-      type: thought.metadata.type,
-      topics: thought.metadata.topics,
-      people: thought.metadata.people,
-      summary: thought.metadata.summary,
-    },
-    createdAt: thought.createdAt,
-    ...(thought.validFrom === undefined ? {} : { validFrom: thought.validFrom }),
-    ...(thought.validTo === undefined ? {} : { validTo: thought.validTo }),
-  }));
+  return await getThoughtsByIds(ctx, [spaceId], ranked, {
+    includeHistorical: true,
+  });
+}
+
+/**
+ * The fallback leg. No similarity threshold applies: `ts_rank` is not cosine
+ * similarity and comparing it to `SIMILARITY_THRESHOLD` would be arithmetic on
+ * two different scales. The bound is the candidate count, as it is on the
+ * vector side after the threshold.
+ */
+async function keywordCandidates(
+  ctx: IdentityCtx,
+  spaceId: string,
+  content: string,
+): Promise<Thought[]> {
+  return await searchThoughtsByText(ctx, [spaceId], content, {
+    limit: MAX_CANDIDATES,
+    includeHistorical: true,
+  });
+}
+
+/**
+ * How long after a capture an identical one from the same author counts as a
+ * retry of it rather than a new memory.
+ *
+ * Ten minutes is chosen against what it defends: an MCP host retrying a call
+ * whose response it did not see, and a person pressing Quick Capture twice.
+ * Both happen in seconds. It is deliberately far too short to be a general
+ * deduplicator -- saying the same sentence again next week is a new memory, and
+ * deciding otherwise is the classifier's job, not a timestamp's.
+ */
+export const CAPTURE_RETRY_WINDOW_MS = 10 * 60 * 1000;
+
+/**
+ * The most recent current memory in this space, by this author, whose content
+ * is byte-identical to `content` and which was stored inside the retry window.
+ *
+ * `md5(content)` on both sides rather than `content = $n`: it compares a fixed
+ * 32 bytes instead of up to 2,000, and it is the expression an index would be
+ * built on if this ever needs one. It is not used as a security boundary, so
+ * its collision resistance is not load bearing; the window, the space and the
+ * author are what bound it, and `thoughts_space_status_created_idx` already
+ * covers `(space_id, memory_status, created_at)`.
+ */
+async function findRecentIdenticalThought(
+  ctx: IdentityCtx,
+  spaceId: string,
+  userId: string,
+  content: string,
+): Promise<Thought | null> {
+  const found = await row<{ id: string }>(
+    ctx,
+    `SELECT id FROM kith.thoughts
+       WHERE space_id = $1
+         AND user_id = $2
+         AND md5(content) = md5($3)
+         AND (memory_status IS NULL OR memory_status = 'current')
+         AND created_at >= $4
+       ORDER BY created_at DESC, id ASC
+       LIMIT 1`,
+    [spaceId, userId, content, new Date(ctx.now - CAPTURE_RETRY_WINDOW_MS)],
+  );
+  return found ? await getThoughtById(ctx, found.id) : null;
 }
 
 export type CaptureDisposition =
@@ -345,7 +465,15 @@ export async function applyCaptureDecision(
     classification &&
     (classification.action === "SUPERSEDE" ||
       classification.action === "RETRACT") &&
-    classification.replacementContent
+    classification.replacementContent &&
+    // A tightening the Convex original does not have. `replacementContent` is
+    // model output and nothing bounded it, so a transition could store a
+    // memory longer than `capture_thought` will accept from a client -- past
+    // the bound every other stored capture is held to, and past what the next
+    // capture's classifier can be shown. Over the bound the transition is
+    // treated as unusable and the capture falls back to ADD, which is the same
+    // answer an unusable citation gets.
+    classification.replacementContent.length <= MAX_CAPTURE_CONTENT_CHARS
   ) {
     const action = classification.action;
     const previousIds = await transitionableIds(
@@ -373,6 +501,43 @@ export async function applyCaptureDecision(
     }
     // The citations no longer name memories this space may retire. Convex fell
     // back to ADD here and so does this.
+  }
+
+  // The last thing before the write: a retry of a capture this author just
+  // made is not a second memory.
+  //
+  // The classifier is the gate for duplicates, and this is not a second one.
+  // It is the narrow case the classifier cannot see, because it does not
+  // depend on the classifier having been asked at all: an MCP host that
+  // retries a call whose response it lost, or a person who presses Quick
+  // Capture twice, produces two captures that are byte-identical, seconds
+  // apart, from one author, in one space. On Convex the vector index made the
+  // second one a NOOP; here the first capture leaves its target eligible and
+  // uncovered, which is exactly the state that makes the index report itself
+  // incomplete, so the second capture is the one least likely to see the
+  // first. See `searchCaptureCandidates` for that mechanism. The keyword leg
+  // closes most of it and this closes the rest, deterministically.
+  //
+  // It answers as NOOP does, in NOOP's own words, because that is what it is.
+  const retried = await findRecentIdenticalThought(
+    ctx,
+    spaceId,
+    userId,
+    input.content,
+  );
+  if (retried) {
+    if (input.isCore !== undefined) {
+      await setCoreStatus(ctx, spaceId, retried.id, input.isCore);
+    }
+    return {
+      thoughtId: retried.id,
+      metadata: retried.metadata,
+      disposition: "duplicate",
+      operationSummary:
+        input.isCore === undefined
+          ? "Thought already captured — no changes made"
+          : "Thought already captured — core status updated",
+    };
   }
 
   const metadata: ThoughtMetadata =

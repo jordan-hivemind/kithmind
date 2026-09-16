@@ -570,6 +570,7 @@ test("capture candidates come from the destination space alone", { skip }, async
     const candidates = await memory.searchCaptureCandidates(
       ctx,
       spaceId,
+      "exact axis",
       oneHot(0),
     );
     const ids = candidates.map((candidate) => candidate.id);
@@ -587,14 +588,277 @@ test("capture candidates come from the destination space alone", { skip }, async
     assert.equal(candidates[0].content, "exact axis");
     assert.equal(candidates[0].metadata.summary, "near");
 
-    // A space with no active index contributes no candidates rather than
-    // failing: that is a fresh space, and Convex's own vector search returned
-    // nothing there too.
+    // A space with no active index at all takes the keyword leg, so a memory
+    // that shares words with the new content is still a candidate.
     const bare = await makeSpace(ctx, { createdBy: userId, role: "owner" });
+    const bareThought = await memory.captureThought(ctx, userId, bare, {
+      content: "exact axis",
+      metadata: metadata("bare"),
+    });
     assert.deepEqual(
-      await memory.searchCaptureCandidates(ctx, bare, oneHot(0)),
-      [],
+      (
+        await memory.searchCaptureCandidates(ctx, bare, "exact axis", oneHot(0))
+      ).map((candidate) => candidate.id),
+      [bareThought],
+      "an unindexed space falls back to keyword rather than going blind",
     );
+  });
+});
+
+test("an incomplete thought index falls back to keyword candidates", { skip }, async (t) => {
+  const db = await identityDatabase(t);
+  await db.tx(async (ctx) => {
+    const userId = await makeUser(ctx);
+    const spaceId = await makeSpace(ctx, { createdBy: userId, role: "owner" });
+    const otherSpaceId = await makeSpace(ctx, {
+      createdBy: userId,
+      role: "owner",
+    });
+    const index = await seedActiveEmbeddingIndex(ctx, spaceId);
+    const covered = await memory.captureThought(ctx, userId, spaceId, {
+      content: "The synthetic ledger is reviewed each quarter.",
+      metadata: metadata("ledger"),
+    });
+    await seedThoughtVector(ctx, {
+      spaceId,
+      embeddingGenerationId: index.generationId,
+      fingerprint: index.fingerprint,
+      thoughtId: covered,
+      content: "The synthetic ledger is reviewed each quarter.",
+      vector: oneHot(0),
+    });
+    // A memory in another space that the keyword leg would match on every
+    // word. It must never be a candidate here, on either leg.
+    await memory.captureThought(ctx, userId, otherSpaceId, {
+      content: "The synthetic ledger is reviewed each quarter.",
+      metadata: metadata("foreign"),
+    });
+    await recountEmbeddingCounters(ctx, spaceId, index.fingerprint);
+    assert.equal(
+      (await embeddings.getActiveEmbeddingTarget(ctx, spaceId)).thoughtStatus,
+      "ready",
+    );
+
+    // This is the reproduction. Storing one more thought leaves an eligible,
+    // uncovered target, the counters disagree, and I9 turns the whole space's
+    // thought index off. Before the keyword leg existed the next capture saw
+    // nothing at all.
+    await memory.captureThought(ctx, userId, spaceId, {
+      content: "An unrelated synthetic note about a bicycle.",
+      metadata: metadata("bicycle"),
+    });
+    assert.equal(
+      (await embeddings.getActiveEmbeddingTarget(ctx, spaceId)).thoughtStatus,
+      "unavailable",
+      "a stored capture makes its own space's thought index incomplete",
+    );
+    assert.deepEqual(
+      await embeddings.searchThoughtVectorCandidates(
+        ctx,
+        await embeddings.getActiveTargets(ctx, [spaceId]),
+        oneHot(0),
+      ),
+      [],
+      "the vector leg is blind while the index is incomplete",
+    );
+
+    const candidates = await memory.searchCaptureCandidates(
+      ctx,
+      spaceId,
+      "The synthetic ledger is reviewed each quarter.",
+      oneHot(0),
+    );
+    const ids = candidates.map((candidate) => candidate.id);
+    assert.equal(
+      ids.includes(covered),
+      true,
+      "the keyword leg still finds the memory the vector leg dropped",
+    );
+    // Still one space. The fallback does not widen the read.
+    const spaces = await ctx.client.query(
+      "SELECT DISTINCT space_id FROM kith.thoughts WHERE id = ANY($1::text[])",
+      [ids],
+    );
+    assert.deepEqual(
+      spaces.rows.map((row) => row.space_id),
+      [spaceId],
+    );
+  });
+});
+
+test("a byte-identical retry by the same author is not a second memory", { skip }, async (t) => {
+  const db = await identityDatabase(t);
+  await db.tx(async (ctx) => {
+    const userId = await makeUser(ctx);
+    const spaceId = await makeSpace(ctx, { createdBy: userId, role: "owner" });
+    const content = "The synthetic household reviews the ledger each quarter.";
+
+    const first = await memory.applyCaptureDecision(
+      ctx,
+      userId,
+      spaceId,
+      baseInput(content, { analysis: decision("ADD") }),
+    );
+    assert.equal(first.disposition, "stored");
+
+    // The retry: the same content, the same author, the same space, and a
+    // classifier that saw no candidates and therefore said ADD -- which is
+    // exactly what happens when the thought index is incomplete and the
+    // keyword leg misses. Nothing is stored twice.
+    const retry = await memory.applyCaptureDecision(
+      ctx,
+      userId,
+      spaceId,
+      baseInput(content, { analysis: decision("ADD") }),
+    );
+    assert.equal(retry.disposition, "duplicate");
+    assert.equal(retry.thoughtId, first.thoughtId);
+    assert.equal(
+      retry.operationSummary,
+      "Thought already captured — no changes made",
+    );
+    assert.equal(await thoughtCount(ctx, spaceId), 1);
+
+    // `isCore` on a retry is applied to the memory that is already there,
+    // exactly as NOOP does.
+    const promoted = await memory.applyCaptureDecision(
+      ctx,
+      userId,
+      spaceId,
+      baseInput(content, { analysis: decision("ADD"), isCore: true }),
+    );
+    assert.equal(promoted.disposition, "duplicate");
+    assert.equal(
+      promoted.operationSummary,
+      "Thought already captured — core status updated",
+    );
+    assert.equal((await thoughtRow(ctx, first.thoughtId)).is_core, true);
+
+    // The window is a retry window, not a deduplicator. The same words outside
+    // it are a new memory, and the classifier owns that decision.
+    const later = memory.CAPTURE_RETRY_WINDOW_MS + 60_000;
+    const afterwards = await db.ctx(Date.now() + later);
+    const stored = await memory.applyCaptureDecision(
+      afterwards,
+      userId,
+      spaceId,
+      baseInput(content, { analysis: decision("ADD") }),
+    );
+    assert.equal(stored.disposition, "stored");
+    assert.notEqual(stored.thoughtId, first.thoughtId);
+    assert.equal(await thoughtCount(ctx, spaceId), 2);
+  });
+});
+
+test("the retry guard is scoped to one author and one space", { skip }, async (t) => {
+  const db = await identityDatabase(t);
+  await db.tx(async (ctx) => {
+    const userId = await makeUser(ctx);
+    const otherUserId = await makeUser(ctx);
+    const spaceId = await makeSpace(ctx, { createdBy: userId, role: "owner" });
+    const otherSpaceId = await makeSpace(ctx, {
+      createdBy: userId,
+      role: "owner",
+    });
+    const content = "The synthetic household reviews the ledger each quarter.";
+    const first = await memory.applyCaptureDecision(
+      ctx,
+      userId,
+      spaceId,
+      baseInput(content, { analysis: decision("ADD") }),
+    );
+
+    // A shared space has more than one author, and two people saying the same
+    // thing is two memories with two authors, not one retried call.
+    const byOther = await memory.applyCaptureDecision(
+      ctx,
+      otherUserId,
+      spaceId,
+      baseInput(content, { analysis: decision("ADD") }),
+    );
+    assert.equal(byOther.disposition, "stored");
+    assert.notEqual(byOther.thoughtId, first.thoughtId);
+
+    // And the guard never reaches across a space boundary.
+    const elsewhere = await memory.applyCaptureDecision(
+      ctx,
+      userId,
+      otherSpaceId,
+      baseInput(content, { analysis: decision("ADD") }),
+    );
+    assert.equal(elsewhere.disposition, "stored");
+    assert.equal(await thoughtCount(ctx, otherSpaceId), 1);
+    assert.equal(await thoughtCount(ctx, spaceId), 2);
+
+    // A retired memory is not something a retry may cite: the guard looks only
+    // at current rows, so a capture that repeats superseded content stores.
+    await ctx.client.query(
+      "UPDATE kith.thoughts SET memory_status = 'superseded' WHERE id = $1",
+      [first.thoughtId],
+    );
+    const afterRetirement = await memory.applyCaptureDecision(
+      ctx,
+      userId,
+      spaceId,
+      baseInput(content, { analysis: decision("ADD") }),
+    );
+    assert.equal(afterRetirement.disposition, "stored");
+  });
+});
+
+test("a replacement longer than the capture bound falls back to ADD", { skip }, async (t) => {
+  const db = await identityDatabase(t);
+  await db.tx(async (ctx) => {
+    const userId = await makeUser(ctx);
+    const spaceId = await makeSpace(ctx, { createdBy: userId, role: "owner" });
+    const previous = await memory.captureThought(ctx, userId, spaceId, {
+      content: "Rowan attends Lakeside School.",
+      metadata: metadata("School"),
+    });
+
+    // A tightening Convex does not have: `replacementContent` is model output
+    // and nothing bounded it, so a transition could store a memory longer than
+    // `capture_thought` accepts from a client.
+    const outcome = await memory.applyCaptureDecision(
+      ctx,
+      userId,
+      spaceId,
+      baseInput("Rowan attends Redwood Academy.", {
+        analysis: decision("SUPERSEDE", {
+          relatedThoughtIds: [previous],
+          replacementContent: "x".repeat(
+            memory.MAX_CAPTURE_CONTENT_CHARS + 1,
+          ),
+        }),
+      }),
+    );
+
+    assert.equal(outcome.disposition, "stored");
+    assert.equal(
+      (await thoughtRow(ctx, previous)).memory_status,
+      "current",
+      "an over-long replacement retires nothing",
+    );
+    assert.equal(
+      (await thoughtRow(ctx, outcome.thoughtId)).content,
+      "Rowan attends Redwood Academy.",
+    );
+
+    // At the bound exactly, the transition runs.
+    const atBound = "y".repeat(memory.MAX_CAPTURE_CONTENT_CHARS);
+    const transitioned = await memory.applyCaptureDecision(
+      ctx,
+      userId,
+      spaceId,
+      baseInput("Rowan attends Oakhill School.", {
+        analysis: decision("SUPERSEDE", {
+          relatedThoughtIds: [previous],
+          replacementContent: atBound,
+        }),
+      }),
+    );
+    assert.equal(transitioned.disposition, "superseded");
+    assert.equal((await thoughtRow(ctx, previous)).memory_status, "superseded");
   });
 });
 
@@ -618,16 +882,35 @@ test("a superseded memory is not a capture candidate", { skip }, async (t) => {
     });
     await recountEmbeddingCounters(ctx, spaceId, index.fingerprint);
     assert.equal(
-      (await memory.searchCaptureCandidates(ctx, spaceId, oneHot(0))).length,
+      (
+        await memory.searchCaptureCandidates(
+          ctx,
+          spaceId,
+          "exact axis",
+          oneHot(0),
+        )
+      ).length,
       1,
     );
 
+    // Retired on both legs: the vector leg drops it and so does the keyword
+    // one, which is the whole reason the status test is restated after
+    // hydration rather than left to the retrievability filter.
     await ctx.client.query(
       "UPDATE kith.thoughts SET memory_status = 'superseded' WHERE id = $1",
       [previous],
     );
     assert.deepEqual(
-      await memory.searchCaptureCandidates(ctx, spaceId, oneHot(0)),
+      await memory.searchCaptureCandidates(
+        ctx,
+        spaceId,
+        "exact axis",
+        oneHot(0),
+      ),
+      [],
+    );
+    assert.deepEqual(
+      await memory.searchCaptureCandidates(ctx, spaceId, "exact axis", null),
       [],
     );
   });

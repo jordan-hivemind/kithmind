@@ -73,6 +73,7 @@ export type {
 } from "./captureClassifier.js";
 export {
   applyCaptureDecision,
+  CAPTURE_RETRY_WINDOW_MS,
   COVERING_FACT_CANDIDATES,
   searchCaptureCandidates,
   searchCoveringFacts,
