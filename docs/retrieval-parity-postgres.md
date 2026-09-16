@@ -1,8 +1,11 @@
 # Retrieval parity, rerun against PostgreSQL
 
-P2-39g3. This document describes the retrieval parity instrument that
-`docs/plans/2026-09-12-postgres-consolidation.md` section 4.2 asks for,
-rerun against the PostgreSQL port, how to run it, and what it found.
+P2-39g3 and P2-39g4. This document describes the retrieval parity instrument
+that `docs/plans/2026-09-12-postgres-consolidation.md` section 4.2 asks for,
+rerun against the PostgreSQL port, how to run it, what it found, and what was
+changed in response. P2-39g3 built the instrument and reported a keyword
+recall regression. P2-39g4 fixed that regression in the keyword legs and
+reran; both runs' numbers are below.
 
 The instrument has two parts, matching the two things retrieval does in this
 system: the memory recall instrument (thoughts and facts, the frozen
@@ -78,24 +81,44 @@ is where that is measured and explained, not silently gated on.
 
 ### Keyword-mode results
 
-Run 2026-09-16 against local PostgreSQL 16 with pgvector 0.6.0, no active
-embedding index (`vectorStatus: "unavailable"` on every query, as expected
-with no `embedQuery` supplied):
+Two runs, both on 2026-09-16 against local PostgreSQL 16 with pgvector 0.6.0
+and no active embedding index (`vectorStatus: "unavailable"` on every query,
+as expected with no `embedQuery` supplied). The before run is P2-39g3, against
+the `websearch_to_tsquery` legs P2-39g1 ported. The after run is P2-39g4,
+against the shared keyword construction in
+`packages/kith-store/src/textSearch.ts`, on the same corpus and the same
+candidate budget.
 
-| Metric | Value |
-| --- | --- |
-| Queries scored | 9 (7 for "avery", 2 for "rowan") |
-| Recall@5 (mean) | 0.167 |
-| Recall@10 (mean) | 0.167 |
-| Tenant leaks | 0 |
-| Historical leaks (retracted/stale shown as current, or shown at all when retracted) | 0 |
-| Blocking failures | 0 (leaks are the only blocking condition; see below) |
+| Metric | Before (P2-39g3) | After (P2-39g4) |
+| --- | --- | --- |
+| Queries scored | 9 (7 for "avery", 2 for "rowan") | 9 (unchanged) |
+| Recall@5 (mean) | 0.167 | 0.889 |
+| Recall@10 (mean) | 0.167 | 0.889 |
+| Queries missing full recall | 8 | 1 |
+| Tenant leaks | 0 | 0 |
+| Historical leaks | 0 | 0 |
+| Blocking failures | 0 | 0 |
 
-Eight of the nine queries miss full recall at k=10. That is a larger gap
+Per query, at k=10:
+
+| Query | Before | After | Note |
+| --- | --- | --- | --- |
+| avery: exact product and ticket identifiers | 0 | 1 | `version` is absent from the memory; the other five terms carry it. |
+| avery: current school only | 0 | 1 | `go` is absent from both the thought and the fact. |
+| avery: school history when asked historically | 0 | 1 | `chang` and `time` are absent from both school thoughts. |
+| avery: paraphrase with no shared keywords | 0 | 0 | Still a miss, by design. See below. |
+| avery: correction never resurfaces as history | 0.5 | 1 | The fact's terse statement never uses `record`; the thought did. |
+| avery: multi-fact project status | 0 | 1 | `status` is absent from all three Foster Clarity thoughts. |
+| avery: enduring constraint reached by paraphrase | 1 | 1 | Passes as a core memory, which `recall_context` always surfaces. Still not an exercise of keyword search. |
+| rowan: other account sees only its own version | 0 | 1 | Same `version` gap as the "avery" version query. |
+| rowan: other account sees only its own school record | 0 | 1 | Same `go` gap as the "avery" school query. |
+
+#### What the before run found
+
+Eight of the nine queries missed full recall at k=10. That was a larger gap
 than section 2.7's framing ("Convex search is typo tolerant and prefix
 matching, PostgreSQL full-text search stems instead") suggested going in, and
-the dominant cause running this instrument actually found is different from
-stemming:
+the dominant cause the instrument actually found was different from stemming:
 
 **`websearch_to_tsquery` ANDs every significant query token together.** A
 short natural-language question routinely contains an ordinary word -- "go",
@@ -105,37 +128,64 @@ or thought text it is asking about ("Atlas Memory is currently on v2.7.1..."
 never spells out the word "version"; "Rowan attends Brightwater School."
 never says "go"). Convex's search index tolerated a query token with no
 match in the row and ranked on partial overlap; PostgreSQL's AND semantics
-require every token to match somewhere, so one absent word drops the whole
-row from the candidate set. This is a real, measured regression, not a
-scoring artifact -- confirmed by direct inspection of `content_search` and
-the resulting `websearch_to_tsquery` output for each miss below.
+require every token to match somewhere, so one absent word dropped the whole
+row from the candidate set.
 
-| Query | Recall@10 | Reason |
+#### What the after run changed
+
+Section 4.2's rule is that a measured regression is fixed by adjusting the
+query or by adding `pg_trgm`, never by lowering the bar. Adjusting the query
+was enough, so `pg_trgm` was not installed.
+
+All three keyword legs -- `thoughtTextCandidateIds` and `searchFacts` in
+`packages/kith-store/src/embeddings/search.ts`, and `keywordCandidates` in
+`packages/kith-store/src/documents/model.ts` -- now share one construction
+from `packages/kith-store/src/textSearch.ts`: the OR of the query's own
+stemmed lexemes, ranked by `ts_rank` so a row matching more of them sorts
+first. That is the same partial overlap Convex's index scored, expressed in
+PostgreSQL's terms. Nothing else moved: the space predicate, the
+retrievability and status filters, the per-space take, the merge and the
+limit are as P2-39g1 ported them, and the candidate budget is unchanged.
+
+Four choices in it were measured rather than assumed, on this corpus and on
+document-length text.
+
+| Choice | Alternative measured | Why the alternative lost |
 | --- | --- | --- |
-| avery: exact product and ticket identifiers | 0 | AND-of-terms. Tokenizes to require `version`; the memory spells it `v2.7.1`, never the word "version". |
-| avery: current school only | 0 | AND-of-terms. Tokenizes to `rowan` & `go` & `school`; `go` is not a stopword and appears in neither the matching thought nor the matching fact. |
-| avery: school history when asked historically | 0 | AND-of-terms. Tokenizes to include `chang`/`time`; neither school thought's wording uses either word. |
-| avery: paraphrase with no shared keywords | 0 | Not PostgreSQL-specific: this case is deliberately built to share no keyword with its answer at all, so no keyword search on any engine can answer it. It exists to prove the semantic leg once hybrid mode runs with a real provider. |
-| avery: correction never resurfaces as history | 0.5 | Partial. The corrected thought is found (`record` appears in its own wording); the paired fact's terse subject/predicate/value statement never uses `record`, so only the thought is found. |
-| avery: multi-fact project status | 0 | AND-of-terms. Tokenizes to include `status`; none of the three Foster Clarity thoughts use that word, even though `foster`, `clariti` and `rollout` each match individually. |
-| avery: enduring constraint reached by paraphrase | 1 (pass) | Passes, but coincidentally: the expected memory is a **core** memory, which `recall_context` always surfaces regardless of the query, so this case does not actually exercise keyword search. |
-| rowan: other account sees only its own version | 0 | Same `version` token gap as the "avery" version query. |
-| rowan: other account sees only its own school record | 0 | Same `go` token gap as the "avery" school query. |
+| Lexemes from `to_tsvector('english', $n)`, rendered with `quote_literal` | `replace(plainto_tsquery('english', $n)::text, '&', '|')` | The blind replace rewrites a `&` inside a lexeme as well as the operators between them, silently corrupting that term. |
+| `ts_rank` with the default normalization | `ts_rank_cd` | Under an OR query every lexeme is its own cover, so cover density counts repetition. One query word repeated eight times scored 0.8 against 0.3 for a row matching three distinct query words. |
+| `ts_rank` with the default normalization | `ts_rank(..., 1)` and the other length-normalizing flags | Length normalization promoted the shorter superseded "Rowan attends Lakeside School." over the longer current "Rowan currently attends Redwood Academy...", and on document-length text dropped a long chunk matching three query terms below a short one matching two. |
+| No prefix matching on the final term | `:*` on the highest-position lexeme | Measured against all nine queries: it added zero candidate rows on this corpus. Untested behavior for no measured gain, so it is not there. |
 
-`test/recallParity.test.mjs`'s `EXPECTED_MISSES` table pins exactly this set
-with the same reasons. The test fails if the set of missing queries changes
-in either direction, so a later fix (see "What remains owed") or a
-regression is visible immediately, rather than silently absorbed.
+`pg_trgm` remains available as the plan's named remedy if a later corpus
+measures a miss this construction cannot reach -- a real typo, which stemming
+and OR both still fail. Nothing in this run needed it.
 
-**Zero tenant leaks and zero historical leaks in every run.** These are
-asserted unconditionally, separately from recall, because they test the one
-thing this corpus exists to test: `avery` and `rowan` hold deliberately
-confusable rows in separate spaces, and every read in this suite queries only
-its own account's own space (`[spaceId]`, never the union). A leak here would
-mean the space predicate in `src/embeddings/search.ts` or
+#### The one remaining miss
+
+**"avery: paraphrase with no shared keywords" still recalls 0, and no keyword
+construction can change that.** The query ("Who should I call when the
+heating stops working?") and its expected memory ("Delgado Mechanical
+services the furnace and boiler; ask for Marisol.") share no term at all, so
+the OR of the query's lexemes matches zero rows exactly as the AND did. The
+case exists to prove the semantic leg, and it is still owed (see below).
+
+`test/recallParity.test.mjs`'s `EXPECTED_MISSES` table pins exactly this one
+miss with that reason. The test fails if the set of missing queries changes in
+either direction, so both a later regression and a later fix are visible
+rather than silently absorbed.
+
+**Zero tenant leaks and zero historical leaks in every run, before and
+after.** These are asserted unconditionally, separately from recall, because
+they test the one thing this corpus exists to test: `avery` and `rowan` hold
+deliberately confusable rows in separate spaces, and every read in this suite
+queries only its own account's own space (`[spaceId]`, never the union). A
+leak here would mean the space predicate in `src/embeddings/search.ts` or
 `src/memory/{facts,thoughts}.ts` let another space's row through -- not that
-the query happened to search more than one space. It did not happen in this
-run, at any k, for either account.
+the query happened to search more than one space. Broadening the keyword match
+to an OR widens which rows inside a space can answer a query; it does not
+touch the space predicate, the `retracted` exclusion or the validity window,
+and the after run confirms that empirically at every k for both accounts.
 
 ### What remains owed for section 4.2
 
@@ -160,19 +210,20 @@ to, close all three:
    `OPENAI_API_KEY`) set to complete this**, and this document should be
    updated with that run's numbers before section 4.2 is called satisfied.
 3. **"Any keyword-recall change must be explained by stemming rather than
-   by a lost row."** Explained above, but not met as stated: the dominant
-   cause is AND-of-terms query construction, not stemming, and it is a
-   larger drop (8 of 9 queries) than "explained by stemming" implies. This
-   is reported, not absorbed, per the plan's own fallback: `pg_trgm` fuzzy
-   matching or an OR-mode/ranked fallback in the keyword leg. Both are
-   changes to `src/embeddings/search.ts`, which is explicitly out of scope
-   for this slice (owned by a concurrent workstream building the embedding
-   write side) and is not touched here. **This is the primary finding this
-   instrument owes forward**: keyword parity, as currently constructed, is
-   not met, and closing it is real follow-on work, not a formality.
+   by a lost row."** Met as of P2-39g4. The P2-39g3 run did not meet it: the
+   dominant cause was AND-of-terms query construction, not stemming, and the
+   drop (8 of 9 queries) was far larger than "explained by stemming"
+   implies. That was reported rather than absorbed, and P2-39g4 fixed it in
+   the keyword legs with the OR-mode ranked construction the plan named as
+   the first fallback. Eight of the nine queries now recall in full, at the
+   same candidate budget. The ninth shares no term with its answer at all,
+   so it is not a lost row in any engine's sense; it is the case the corpus
+   reserves for the semantic leg. `pg_trgm`, the plan's second fallback, was
+   measured as unnecessary and is not installed.
 
-Do not read the keyword-mode pass in CI as semantic parity, or as the
-"explained by stemming" bar being met. Neither is true yet.
+Do not read the keyword-mode pass in CI as semantic parity. Point 2 above is
+still owed, and the corpus's one remaining miss is exactly the case that would
+prove it.
 
 ## Document retrieval: recording a rerun of the private question set
 
@@ -225,6 +276,26 @@ threshold set. That test passes, proving the shape end to end without
 inventing a parallel fixture format. It does not, and cannot, prove anything
 about the owner's actual private question set's recall -- only the owner,
 running the recorder against their own loaded corpus, can do that.
+
+### The document keyword leg after P2-39g4
+
+`keywordCandidates` in `src/documents/model.ts` had the same AND-of-terms
+construction the memory legs had, and it moved to the same shared helper. It
+has no frozen public corpus to measure recall against, so the behavior is
+proved directly instead, in
+`packages/kith-store/test/parsedStagingAndDocuments.test.mjs` ("the document
+keyword leg matches partial term overlap and ranks by how much matched"). It
+seeds two chunks through the real provenance chain, one carrying three of a
+four-term query and one carrying a single term, and asserts three things: a
+query with one ordinary word that appears in neither chunk still finds them
+(under AND-of-terms that one word returned nothing at all), the chunk matching
+three terms ranks above the chunk matching one, and a query sharing no term
+with either chunk still returns nothing, because this is an OR over the
+query's own lexemes and not a match-all. It also asserts that the broadened
+match does not widen the space boundary.
+
+What that test does not do is measure the owner's private question set, which
+is the paragraph below.
 
 ### What remains owed
 

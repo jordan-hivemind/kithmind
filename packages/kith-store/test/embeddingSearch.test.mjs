@@ -245,7 +245,7 @@ test(
 );
 
 test(
-  "the keyword legs stem, and neither one crosses a space boundary",
+  "the keyword legs stem, match partial term overlap, and neither one crosses a space boundary",
   { skip },
   async (t) => {
     const db = await identityDatabase(t);
@@ -304,8 +304,57 @@ test(
         [fact.factId],
       );
 
+      // P2-39g4: partial term overlap. "schedule" is in neither the thought
+      // nor the fact, and is not a PostgreSQL English stopword. Under the
+      // `websearch_to_tsquery` construction P2-39g1 ported, that one absent
+      // word ANDed both rows away; this is the shape that cost the frozen
+      // recall corpus eight of nine queries (docs/retrieval-parity-postgres.md).
+      assert.deepEqual(
+        (
+          await embeddings.searchThoughtsByText(
+            ctx,
+            [spaceId],
+            "which migrations did Rowan schedule",
+          )
+        ).map((thought) => thought.id),
+        [thoughtId],
+      );
+      assert.deepEqual(
+        (
+          await embeddings.searchFacts(
+            ctx,
+            [spaceId],
+            "which cities did Rowan relocate to",
+          )
+        ).map((found) => found.id),
+        [fact.factId],
+      );
+      // Still an OR over the query's own lexemes, not a match-all: a query
+      // sharing no term with either row returns nothing.
+      assert.equal(
+        (
+          await embeddings.searchThoughtsByText(
+            ctx,
+            [spaceId],
+            "hydroponic greenhouse irrigation",
+          )
+        ).length,
+        0,
+      );
+
       // The other space's identical rows are not reachable from this one, and
-      // are reachable from their own.
+      // are reachable from their own. Broadening the match does not widen the
+      // space boundary.
+      assert.deepEqual(
+        (
+          await embeddings.searchThoughtsByText(
+            ctx,
+            [otherSpaceId],
+            "which migrations did Rowan schedule",
+          )
+        ).map((thought) => thought.id),
+        [otherThoughtId],
+      );
       assert.deepEqual(
         (
           await embeddings.searchThoughtsByText(
