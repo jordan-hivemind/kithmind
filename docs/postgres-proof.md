@@ -256,6 +256,33 @@ Which Convex `migrations.ts` functions were ported, and which were not:
 | `deleteNonActiveGenerationVectors`, `cleanupEmbeddingGenerations`                             | No     | Retention and cleanup, which the capacity plan defers past the first backfill (P2-6e). Nothing here deletes a historical generation's rows. |
 | `setChunkEmbeddingOptIn`, `setSpaceTargetPolicy`                                              | No     | Operator switches over columns this slice reads and constrains but does not need a writer for. The policy's effect is proven by a test that sets the column directly. |
 
+## Source accounts for the settings page (P2-39i)
+
+`packages/kith-store/src/sources/model.ts` ports `models/sourceAccounts/public.ts`'s
+`create`, `update` and `list`, the row
+[the web/MCP surface plan](plans/2026-09-16-web-mcp-postgres-surface.md) section 1.5
+and question 1 of section 8 asked for: the settings page's owner-facing editor for
+`kith.source_accounts`, which `008_worker_protocol.sql` already migrates rows into
+but leaves without a UNIQUE index. `create` therefore enforces
+`(space_id, connector, account_id)` uniqueness with a `SELECT ... LIMIT 2` count
+check rather than a constraint, `update` writes only the fields it was given
+through `COALESCE`, and both route through `resolveWriteSpace` and
+`requireSpaceAccess` exactly as `../identity/apiKeys.ts` does, so a cross-space
+write and a missing row are refused with the same non-enumerating message. Two
+Convex side effects on `update` -- `advanceSourceAssessmentEpoch` and
+`onSourceEnabledChanged`, both fired only when `enabled` changes -- are not
+ported here: they reach into the worker-diagnostics and ingestion-assessment
+domains, which are separate, concurrently developed PostgreSQL work, and neither
+Convex test for `sourceAccounts/public.ts` exercises them. `test/sourceAccounts.test.mjs`
+proves create-then-list returns the Convex fields including the default and an
+explicit freshness, that a duplicate `(space, connector, account)` is refused,
+that update changes only the field it was given, that a stranger, a
+read-only member and an unknown id are all refused "Source account not found",
+that the same malformed connector, account id, name and freshness Convex
+refused are refused here, and that list is space-isolated, empty rather than an
+error for a principal with no readable space, and refused past the 100-row
+bound Convex enforced.
+
 ## Verification
 
 The default repository test remains independent of Docker:
