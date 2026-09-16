@@ -257,8 +257,67 @@ export const KITH_STATEMENT_TIMEOUT_MS = 5_000;
 export const KITH_LOCK_TIMEOUT_MS = 2_000;
 /** How long a transaction of ours may sit idle before the server ends it. */
 export const KITH_IDLE_TRANSACTION_TIMEOUT_MS = 5_000;
-/** Attempts a serialization failure is retried before it becomes an error. */
+/**
+ * Attempts a serialization failure is retried before it becomes an error.
+ *
+ * Kept at 3 rather than raised: the failure this backoff fixes was two
+ * transactions colliding on every attempt with no delay between them, not a
+ * shortage of attempts. Adding jitter fixes that; adding more attempts on top
+ * of no jitter would just push the same collision one round later.
+ */
 export const KITH_SERIALIZATION_ATTEMPTS = 3;
+
+/** Base delay before the first retry. Doubles per attempt, with full jitter. */
+export const KITH_SERIALIZATION_BACKOFF_BASE_MS = 10;
+
+/**
+ * Upper bound on the backoff delay. Well under `KITH_LOCK_TIMEOUT_MS` (2s) and
+ * `KITH_STATEMENT_TIMEOUT_MS` (5s), so a retry's wait is never what turns a
+ * conflict into a timeout.
+ */
+export const KITH_SERIALIZATION_BACKOFF_MAX_MS = 200;
+
+/**
+ * The delay before retrying after the attempt-th failure: full jitter (a
+ * uniform draw over `[0, cap]`, not just the doubled value itself) over
+ * `base * 2^(attempt - 1)`, capped at `KITH_SERIALIZATION_BACKOFF_MAX_MS`.
+ *
+ * Full jitter, specifically, because the failure this exists to fix was two
+ * concurrent upserts retried in lockstep: equal delays put both attempts back
+ * on the same clock tick, so they collided again on every retry. Spreading
+ * the delay is what actually separates them.
+ */
+export function kithSerializationBackoffDelayMs(attempt: number): number {
+  const cap = Math.min(
+    KITH_SERIALIZATION_BACKOFF_MAX_MS,
+    KITH_SERIALIZATION_BACKOFF_BASE_MS * 2 ** (attempt - 1),
+  );
+  return Math.random() * cap;
+}
+
+type Sleep = (ms: number) => Promise<void>;
+
+const defaultKithSerializationSleep: Sleep = (ms) =>
+  new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+
+let kithSerializationSleep: Sleep = defaultKithSerializationSleep;
+
+/**
+ * Test-only hook: replaces the delay `withKithTransaction` awaits between
+ * retries, so a test can observe that a delay happened (or make it
+ * instant) without a real timer. Returns a function that restores the
+ * previous sleep, for a test to call in `t.after` and avoid leaking the
+ * override into whatever runs next in the same process.
+ */
+export function setKithSerializationSleep(sleep: Sleep): () => void {
+  const previous = kithSerializationSleep;
+  kithSerializationSleep = sleep;
+  return () => {
+    kithSerializationSleep = previous;
+  };
+}
 
 function isSerializationFailure(error: unknown): boolean {
   return (
@@ -271,7 +330,8 @@ function isSerializationFailure(error: unknown): boolean {
 
 /**
  * One ported mutation: one `SERIALIZABLE` transaction on one checked-out
- * client, retried a bounded number of times on a serialization failure.
+ * client, retried a bounded number of times on a serialization failure, with
+ * a randomized backoff between attempts.
  *
  * Section 2.4's replacement for a Convex mutation's atomicity. `SERIALIZABLE`
  * can abort a transaction Convex would have serialized for us, so the retry is
@@ -279,6 +339,14 @@ function isSerializationFailure(error: unknown): boolean {
  * answer is a typed conflict rather than an unbounded wait. Every write path
  * behind this must therefore be idempotent, which the receipt tables are what
  * provide.
+ *
+ * The backoff (`kithSerializationBackoffDelayMs`) exists because two
+ * concurrent writers retried with no delay at all just collide again: under
+ * the full parallel test suite, two upserts on the same identity failed on
+ * every one of the three attempts, each retry landing back on the other
+ * transaction's snapshot. The delay is skipped on the final attempt, since
+ * nothing retries after it, and it runs after the client is released, so a
+ * retry's wait never holds a pool connection idle.
  *
  * A fresh client per attempt, from the pool: a rolled-back transaction's client
  * is reusable, but taking a fresh one keeps a retry from inheriting anything the
@@ -311,6 +379,10 @@ export async function withKithTransaction<T>(
     } finally {
       client.release();
     }
+    // Only reached when the catch above found a serialization failure with
+    // attempts left: the client is already back in the pool, so this wait
+    // does not hold a connection idle while it runs.
+    await kithSerializationSleep(kithSerializationBackoffDelayMs(attempt));
   }
   throw new ProofError("transaction_retry_exhausted");
 }
