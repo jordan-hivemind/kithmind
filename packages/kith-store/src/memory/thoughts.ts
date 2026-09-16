@@ -207,7 +207,7 @@ export function boundedThoughtLimit(
 }
 
 function compareNewestFirst(left: { createdAt: number; id: string }, right: { createdAt: number; id: string }) {
-  return right.createdAt - left.createdAt || right.id.localeCompare(left.id);
+  return right.createdAt - left.createdAt || left.id.localeCompare(right.id);
 }
 
 /** One thought row by id, unchecked against any space. Callers space-check. */
@@ -287,7 +287,7 @@ export async function listBySpaces(
       if (!includeHistorical) values.push(activeAt);
       values.push(scanLimit);
       const sql = `SELECT ${THOUGHT_COLUMNS} FROM kith.thoughts
-        WHERE ${where} ORDER BY created_at DESC, id DESC LIMIT $${values.length}`;
+        WHERE ${where} ORDER BY created_at DESC, id ASC LIMIT $${values.length}`;
       const candidates = await hydrateThoughtRows(ctx, await rows<ThoughtRow>(ctx, sql, values));
       if (candidates.length > MAX_FILTER_SCAN) {
         throw new Error("Thought topic filter exceeds the bounded scan");
@@ -323,7 +323,7 @@ export async function listCoreBySpaces(
             AND (memory_status IS NULL OR memory_status = 'current')
             AND (valid_from IS NULL OR valid_from <= $2)
             AND (valid_to IS NULL OR $2 < valid_to)
-          ORDER BY created_at DESC, id DESC LIMIT $3`,
+          ORDER BY created_at DESC, id ASC LIMIT $3`,
         [spaceId, activeAt, limit],
       )),
     );
