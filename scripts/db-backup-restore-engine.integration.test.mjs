@@ -28,9 +28,15 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 
-import { applyKithSchema, newKithId } from "../packages/kith-store/dist/index.js";
+import {
+  applyKithSchema,
+  newKithId,
+} from "../packages/kith-store/dist/index.js";
 import * as provenance from "../packages/kith-store/dist/provenance/index.js";
-import { connect, throwawayDatabase } from "../packages/kith-store/test/helpers/pgDatabase.mjs";
+import {
+  connect,
+  throwawayDatabase,
+} from "../packages/kith-store/test/helpers/pgDatabase.mjs";
 import { applyPgSchema } from "../packages/finance-archive/dist/index.js";
 
 import { requireNoActiveWriters } from "./db-backup-postgres.mjs";
@@ -42,6 +48,28 @@ const url = process.env.KITH_STORE_DATABASE_URL;
 const skip = url
   ? false
   : "set KITH_STORE_DATABASE_URL to a throwaway Postgres to run this test";
+
+// pg_dump and pg_restore refuse a server whose major version is newer than
+// their own ("aborting because of server version mismatch"). That is a
+// property of the machine, not of the code under test, so name it and skip
+// rather than fail: the pinned-17 suite above covers the case where the
+// versions are known, and CI installs the matching client explicitly.
+async function clientServerMajorMismatch() {
+  const { stdout: clientVersion } = await execute("pg_dump", ["--version"]);
+  const clientMajor = /\(PostgreSQL\) (\d+)/.exec(clientVersion)?.[1];
+  const { stdout: serverVersionNum } = await execute("psql", [
+    "-X",
+    "-tA",
+    "-c",
+    "show server_version_num",
+    url,
+  ]);
+  const serverMajor = String(
+    Math.floor(Number(serverVersionNum.trim()) / 10_000),
+  );
+  if (clientMajor === serverMajor) return null;
+  return `pg_dump is PostgreSQL ${clientMajor} but the server is ${serverMajor}; install the matching client to run this test`;
+}
 
 function opaqueId() {
   return newKithId();
@@ -59,7 +87,10 @@ async function seedSourceAccount(client, spaceId) {
 }
 async function seedUser(client) {
   const id = opaqueId();
-  await client.query("INSERT INTO kith.users (id, created_at) VALUES ($1,transaction_timestamp())", [id]);
+  await client.query(
+    "INSERT INTO kith.users (id, created_at) VALUES ($1,transaction_timestamp())",
+    [id],
+  );
   return id;
 }
 
@@ -67,6 +98,11 @@ test(
   "dated-recipe engine: dump both schemas, restore into a second throwaway database, pass the parity checks, refuse an active writer, and answer a sampled cited question",
   { skip },
   async (t) => {
+    const mismatch = await clientServerMajorMismatch();
+    if (mismatch) {
+      t.skip(mismatch);
+      return;
+    }
     const sourceDb = await throwawayDatabase(t);
     const destinationDb = await throwawayDatabase(t);
     const client = await connect(sourceDb);
@@ -76,7 +112,8 @@ test(
     const spaceId = seedSpace();
     const sourceAccountId = await seedSourceAccount(client, spaceId);
     const userId = await seedUser(client);
-    const text = "Invoice number 100 for the roof repair. Total due: 900.00 USD.";
+    const text =
+      "Invoice number 100 for the roof repair. Total due: 900.00 USD.";
     const quote = "Invoice number 100";
     assert.equal(text.slice(0, quote.length), quote);
 
@@ -109,7 +146,9 @@ test(
       spaceId,
       sourceRevisionId: revision.id,
       sourceTextVersionId: textVersion.id,
-      spans: [{ sourcePageId: page.id, ordinal: 0, start: 0, end: quote.length }],
+      spans: [
+        { sourcePageId: page.id, ordinal: 0, start: 0, end: quote.length },
+      ],
     });
     await provenance.setDesiredSourceRevision(client, {
       spaceId,
@@ -123,7 +162,14 @@ test(
            (id, space_id, created_at, source_account_id, source_item_id, source_revision_id, source_text_version_id,
             desired_processing_epoch, card_generation, state)
          VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6,1,false,'queued') RETURNING id`,
-        [opaqueId(), spaceId, sourceAccountId, item.id, revision.id, textVersion.id],
+        [
+          opaqueId(),
+          spaceId,
+          sourceAccountId,
+          item.id,
+          revision.id,
+          textVersion.id,
+        ],
       )
     ).rows[0].id;
     const [document] = await provenance.stageDocuments(client, {
@@ -145,7 +191,14 @@ test(
     await provenance.stageChunks(client, {
       spaceId,
       processingGenerationId: generationId,
-      chunks: [{ documentId: document.id, ordinal: 0, text, evidenceSpanIds: [span.id] }],
+      chunks: [
+        {
+          documentId: document.id,
+          ordinal: 0,
+          text,
+          evidenceSpanIds: [span.id],
+        },
+      ],
     });
     await provenance.activateSourceItemGeneration(client, {
       spaceId,
@@ -163,7 +216,8 @@ test(
     );
 
     // --- Writer quiescence (AGENTS.md's archive-writer quiescence rule) ---
-    const runQuery = async (sql) => String((await client.query(sql)).rows[0].count);
+    const runQuery = async (sql) =>
+      String((await client.query(sql)).rows[0].count);
     await requireNoActiveWriters(runQuery); // nothing running yet: resolves
     const deferredId = opaqueId();
     await client.query(
@@ -172,13 +226,20 @@ test(
     );
     await assert.rejects(
       requireNoActiveWriters(runQuery),
-      (error) => error.code === "writer_active" && /kith\.deferred_work/.test(error.detail),
+      (error) =>
+        error.code === "writer_active" &&
+        /kith\.deferred_work/.test(error.detail),
     );
-    await client.query("UPDATE kith.deferred_work SET state = 'done' WHERE id = $1", [deferredId]);
+    await client.query(
+      "UPDATE kith.deferred_work SET state = 'done' WHERE id = $1",
+      [deferredId],
+    );
     await requireNoActiveWriters(runQuery); // clears again once the writer finishes
 
     // --- Dump both schemas, restore into a second throwaway database ---
-    const root = await mkdtemp(join(homedir(), ".kith-backup-restore-integration-"));
+    const root = await mkdtemp(
+      join(homedir(), ".kith-backup-restore-integration-"),
+    );
     t.after(() => rm(root, { recursive: true, force: true }));
     const dumpPath = join(root, "kithmind.dump");
     await execute("pg_dump", [
@@ -204,11 +265,22 @@ test(
     ]);
 
     // --- Step 5's parity checks, as this row's engine runs them ---
-    const sourceParity = await capturePostgresParity("psql", sourceDb.url, 60_000);
-    const destinationParity = await capturePostgresParity("psql", destinationDb.url, 60_000);
+    const sourceParity = await capturePostgresParity(
+      "psql",
+      sourceDb.url,
+      60_000,
+    );
+    const destinationParity = await capturePostgresParity(
+      "psql",
+      destinationDb.url,
+      60_000,
+    );
     assert.equal(sourceParity.invalidConstraints, 0);
     assert.equal(destinationParity.invalidConstraints, 0);
-    assert.ok(sourceParity.tables.length > 70, "expected the full kith+finance table inventory");
+    assert.ok(
+      sourceParity.tables.length > 70,
+      "expected the full kith+finance table inventory",
+    );
     assert.ok(parityEquals(sourceParity, destinationParity));
 
     // --- One sampled cited question, answered from the restored database ---

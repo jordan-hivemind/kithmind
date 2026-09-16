@@ -67,6 +67,12 @@ jobs:
       - run: pnpm audit --prod --audit-level high
       - run: pnpm lint
       - run: pnpm check-types
+      # The backup engine's integration test (scripts/*.integration.test.mjs)
+      # shells out to pg_dump and pg_restore, which refuse a server whose major
+      # version is newer than their own. The runner image ships the 16 client;
+      # the service above is 17. Install the matching client so the test runs
+      # here rather than skipping on the mismatch it would otherwise report.
+      - run: sudo apt-get update && sudo apt-get install -y postgresql-client-17
       # No log scraping. FINANCE_ARCHIVE_REQUIRE_DATABASE above makes each
       # suite that needs a database fail to load rather than skip when the URL
       # is missing, so the guarantee lives in the tests instead of in a grep
