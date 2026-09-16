@@ -68,6 +68,7 @@ vi.mock("convex/browser", () => ({
   },
 }));
 
+import type { FinanceArchiveAccess } from "./finance";
 import { mcpPrincipalLoader } from "./principal";
 import { setMcpEmbedder } from "./reads";
 import { createMcpServer, type McpServerCredential } from "./server";
@@ -80,6 +81,8 @@ const DOCUMENT_TEXT = "The quarterly statement total is settled.";
 const SHARED_DOCUMENT_TEXT = "The quarterly statement total is shared.";
 /** Fixed capture times, one minute apart, so the timeline window is ordered. */
 const THOUGHT_EPOCH = Date.UTC(2026, 1, 1, 12, 0, 0);
+/** A fixed fact creation time, so the Convex comparison can state it. */
+const FACT_EPOCH = Date.UTC(2026, 1, 1, 13, 0, 0);
 
 type Fixture = {
   userId: string;
@@ -431,6 +434,13 @@ describeWithDatabase("MCP read tools on PostgreSQL", () => {
         sourceType: "user_stated",
       });
 
+      // A stated creation time, for the same reason the thoughts have one:
+      // `ctx.now` is fixed for the fixture transaction, and a comparison
+      // against hand-written Convex rows has to be able to name it.
+      await ctx.client.query(
+        "UPDATE kith.facts SET created_at = $2 WHERE id = $1",
+        [fact.factId, new Date(FACT_EPOCH)],
+      );
       const subject = await ctx.client.query<{ subject_entity_id: string }>(
         "SELECT subject_entity_id FROM kith.facts WHERE id = $1",
         [fact.factId],
@@ -527,10 +537,16 @@ describeWithDatabase("MCP read tools on PostgreSQL", () => {
     credential: McpServerCredential | string,
     name: string,
     args: Record<string, unknown>,
+    // No finance archive by default: `query_records`'s finance leg is
+    // unchanged by i3 and has its own suite, and `list_sources` must not gain
+    // a block from it in the cases that are about its own rows.
+    financeArchive: FinanceArchiveAccess | null = null,
   ) {
-    // No finance archive: `query_records`'s finance leg is unchanged by i3 and
-    // has its own suite, and `list_sources` must not gain a block from it here.
-    const server = createMcpServer(credential, "user-test:key-test", null);
+    const server = createMcpServer(
+      credential,
+      "user-test:key-test",
+      financeArchive,
+    );
     const client = new Client({ name: "postgres-reads", version: "1" });
     const [clientTransport, serverTransport] =
       InMemoryTransport.createLinkedPair();
@@ -600,30 +616,161 @@ describeWithDatabase("MCP read tools on PostgreSQL", () => {
   // One transaction per call
   // -------------------------------------------------------------------------
 
-  test("every read tool opens exactly one read-only transaction", async () => {
-    const readCalls: Array<[string, Record<string, unknown>]> = [
-      ["list_spaces", {}],
-      ["search_documents", { query: "quarterly" }],
-      ["get_document", { documentId: fixture.documentA }],
-      ["list_sources", {}],
-      ["list_inventory", { sourceAccountId: fixture.sourceAccountA }],
-      ["list_review_queue", { sourceAccountId: fixture.sourceAccountA }],
-      ["search_facts", { query: "Oakland" }],
-      ["search_thoughts", { query: "ledger" }],
-      ["recall_context", { query: "ledger" }],
-      ["browse_recent", {}],
-      ["get_thoughts", { ids: [fixture.coreThoughtA] }],
-      ["timeline_thoughts", { seedId: fixture.coreThoughtA }],
-      ["get_stats", {}],
+  const READ_ONLY_BEGIN = "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY";
+
+  test("every read tool opens only read-only transactions, and no more than it needs", async () => {
+    // One transaction each, except the three tools that may embed the query.
+    // Those open a short read-only transaction first to reload the credential,
+    // resolve the space set and check the index, so an unauthorized caller's
+    // text never reaches the embedding provider; the tool's own transaction
+    // follows and is still the authority. `search_documents` in `keyword` mode
+    // skips the probe entirely, which the last row asserts.
+    const readCalls: Array<[string, Record<string, unknown>, number]> = [
+      ["list_spaces", {}, 1],
+      ["get_document", { documentId: fixture.documentA }, 1],
+      ["list_sources", {}, 1],
+      ["list_inventory", { sourceAccountId: fixture.sourceAccountA }, 1],
+      ["list_review_queue", { sourceAccountId: fixture.sourceAccountA }, 1],
+      ["search_facts", { query: "Oakland" }, 1],
+      ["browse_recent", {}, 1],
+      ["get_thoughts", { ids: [fixture.coreThoughtA] }, 1],
+      ["timeline_thoughts", { seedId: fixture.coreThoughtA }, 1],
+      ["get_stats", {}, 1],
+      ["search_documents", { query: "quarterly", searchMode: "keyword" }, 1],
+      ["search_documents", { query: "quarterly" }, 2],
+      ["search_thoughts", { query: "ledger" }, 2],
+      ["recall_context", { query: "ledger" }, 2],
     ];
-    for (const [name, args] of readCalls) {
+    for (const [name, args, transactions] of readCalls) {
       transactionLog = [];
       const result = await onPostgres(name, args);
       expect(result.isError, `${name} failed: ${text(result)}`).not.toBe(true);
-      expect(transactionLog, name).toEqual([
-        "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
-      ]);
+      expect(transactionLog, `${name} ${JSON.stringify(args)}`).toEqual(
+        Array.from({ length: transactions }, () => READ_ONLY_BEGIN),
+      );
     }
+  });
+
+
+  test("an unauthorized query never reaches the embedding provider", async () => {
+    // The order the review asked for, asserted at the only place it is
+    // observable: the provider itself. `prepareEmbedQuery` reloads the
+    // credential, resolves the space set and checks the index in a short
+    // read-only transaction, and calls the provider only if that leaves one
+    // compatible fingerprint.
+    const embedded: string[] = [];
+    const restore = setMcpEmbedder(async (query) => {
+      embedded.push(query);
+      throw new Error("synthetic embedding provider outage");
+    });
+    try {
+      // A live credential on a deployment with no compatible index. This is
+      // the ordinary case and the expensive one: without the probe, every
+      // call would ship the text and throw the vector away.
+      for (const name of [
+        "search_thoughts",
+        "recall_context",
+        "search_documents",
+      ]) {
+        const answered = await onPostgres(name, { query: "ledger" });
+        expect(answered.isError, name).not.toBe(true);
+      }
+      expect(embedded).toEqual([]);
+
+      // A space this credential was not granted is refused before the call.
+      const denied = await onPostgres("search_thoughts", {
+        query: "ledger",
+        spaceIds: [fixture.spaceB],
+      });
+      expect(denied.isError).toBe(true);
+      expect(embedded).toEqual([]);
+
+      // And a credential revoked between two calls is refused before it too.
+      const revoked = await inTransaction(async (ctx) => {
+        const session = await signUp(ctx, {
+          email: `mcp-embed-${randomBytes(4).toString("hex")}@example.test`,
+          password: PASSWORD,
+        });
+        const spaceId = await ensurePersonalSpace(ctx, session.userId);
+        const key = await createApiKey(ctx, {
+          principal: { userId: session.userId, capabilities: ["read"] as const },
+          name: "Synthetic embedder client",
+          capabilities: ["read"],
+          spaceIds: [spaceId],
+        });
+        return { userId: session.userId, keyId: key.id };
+      });
+      await pool.query("DELETE FROM kith.api_keys WHERE id = $1", [
+        revoked.keyId,
+      ]);
+      const gone = await call(
+        {
+          surface: "postgres",
+          withPrincipal: mcpPrincipalLoader({
+            userId: revoked.userId,
+            credentialId: revoked.keyId,
+          }),
+        },
+        "search_thoughts",
+        { query: "ledger" },
+      );
+      expect(gone.isError).toBe(true);
+      expect(text(gone)).toContain("Not authenticated");
+      expect(embedded).toEqual([]);
+    } finally {
+      restore();
+    }
+  });
+
+  test("list_sources composes its finance block from the same transaction", async () => {
+    // The archive is the fixture's own second space, so the block is in scope
+    // and the membership check passes. What is under test is that resolving
+    // that membership costs no second transaction: the sources read already
+    // returned the authorized set.
+    const requests: unknown[] = [];
+    const archive = {
+      spaceId: fixture.spaceB,
+      read: async (request: unknown) => {
+        requests.push(request);
+        return {
+          contract: "finance.read.v1",
+          datasetRevision: "synthetic",
+          coverage: [],
+        } as never;
+      },
+    };
+    transactionLog = [];
+    const result = await call(
+      credentialFor(fixture.keyIdBoth),
+      "list_sources",
+      {},
+      archive,
+    );
+    expect(result.isError).not.toBe(true);
+    expect(transactionLog).toEqual([READ_ONLY_BEGIN]);
+    // The archive was asked, and whatever it said is carried in its own block
+    // rather than merged into `sources`. Whether the stub's response satisfies
+    // the read contract is `finance.test.ts`'s subject, not this one's.
+    expect(requests).toHaveLength(1);
+    const body = parsed(result) as { financeArchive?: unknown };
+    expect(body.financeArchive).toBeDefined();
+
+    // A credential without the archive's space never reaches the archive, and
+    // still opens one transaction.
+    requests.length = 0;
+    transactionLog = [];
+    const narrowed = await call(
+      credentialFor(fixture.keyIdA),
+      "list_sources",
+      {},
+      archive,
+    );
+    expect(narrowed.isError).not.toBe(true);
+    expect(transactionLog).toEqual([READ_ONLY_BEGIN]);
+    expect(requests).toEqual([]);
+    expect(
+      Object.hasOwn(parsed(narrowed) as object, "financeArchive"),
+    ).toBe(false);
   });
 
   test("a read tool's transaction refuses a write at the server", async () => {
@@ -844,21 +991,31 @@ describeWithDatabase("MCP read tools on PostgreSQL", () => {
     expect(Object.hasOwn(fact, "sourceRef")).toBe(false);
     expect(Object.hasOwn(fact, "supersededBy")).toBe(false);
 
+    // Every field written out from the fixture, not read back from the store's
+    // own answer: a mock built from the result under test would compare the
+    // formatter with itself. `statement` is what `rememberFact` composes and
+    // `confidence` is its default for a stated fact.
     await sameAsConvex("search_facts", { query: "Oakland" }, () => {
       convexMocks.query.mockResolvedValue([
         {
           id: fixture.factA,
           spaceId: fixture.spaceA,
           userId: fixture.userId,
-          statement: fact.statement,
-          subject: fact.subject,
+          statement: "Rowan — home city: Oakland.",
+          subject: {
+            id: fixture.entityA,
+            key: "person:rowan",
+            kind: "person",
+            name: "Rowan",
+            aliases: [],
+          },
           predicate: "home_city",
           value: { type: "text", value: "Oakland" },
           sourceType: "user_stated",
-          confidence: fact.confidence,
+          confidence: 1,
           isCore: true,
           status: "current",
-          createdAt: Date.parse(fact.createdAt as string),
+          createdAt: FACT_EPOCH,
         },
       ]);
     });
@@ -947,9 +1104,27 @@ describeWithDatabase("MCP read tools on PostgreSQL", () => {
     expect(result.context[1]!.id).toBe(fixture.coreThoughtA);
     // A relevance thought carries the ranker's score, as it does on Convex.
     expect(typeof result.context[2]!.score).toBe("number");
+  });
+
+  test("recall_context never blends in a space this credential cannot read", async () => {
+    // "ledger" is the word space B's thought carries, so the other space has
+    // something this query genuinely matches. A query it does not match would
+    // pass the assertion below whether or not the space filter existed.
+    const both = parsed(
+      await onBothSpaces("recall_context", { query: "ledger" }),
+    ) as { context: Array<{ id: string; source: string }> };
     expect(
-      result.context.every((row) => row.id !== fixture.thoughtB),
+      both.context.some((row) => row.id === fixture.thoughtB),
+      "the shared space's ledger thought is reachable with both grants",
     ).toBe(true);
+
+    const onlyA = parsed(
+      await onPostgres("recall_context", { query: "ledger" }),
+    ) as { context: Array<{ id: string; spaceId: string }> };
+    expect(onlyA.context.some((row) => row.id === fixture.thoughtB)).toBe(false);
+    expect(onlyA.context.every((row) => row.spaceId === fixture.spaceA)).toBe(
+      true,
+    );
   });
 
   test("recall_context tells an empty space to initialize itself", async () => {

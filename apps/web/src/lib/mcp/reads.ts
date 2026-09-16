@@ -20,11 +20,15 @@
 //     `getAuthorizedReadSpaceIds` is the only way a space id reaches a
 //     statement; a caller-supplied `spaceIds` is an argument to it, never a
 //     value passed through it.
-//   * Section 4.4, the embedding request happens before the transaction opens.
-//     `prepareEmbedQuery` does the provider round trip and hands the tool a
-//     resolved vector, so no `pg` connection is ever held across an outbound
-//     HTTP call. A failure there is `undefined`, which is what makes
-//     `vectorStatus` "unavailable" while the keyword leg still answers.
+//   * Section 4.4, the embedding request happens outside a transaction, and
+//     after the caller has been authorized. `prepareEmbedQuery` opens a short
+//     read-only transaction that reloads the credential, resolves the space set
+//     and checks the index, closes it, and only then calls the provider, so no
+//     `pg` connection is held across an outbound HTTP call and no unauthorized
+//     caller's text reaches the provider at all. A failure there is
+//     `undefined`, which is what makes `vectorStatus` "unavailable" while the
+//     keyword leg still answers. The three vector-backed tools therefore open
+//     two read-only transactions; every other read tool opens one.
 
 import { api } from "@repo/db/convex/_generated/api";
 import type { Id } from "@repo/db/convex/_generated/dataModel";
@@ -264,10 +268,24 @@ export type McpReads = {
   getDocument(
     args: ReadSpaces & { documentId: string; includeHistorical?: boolean },
   ): Promise<unknown>;
-  /** An object, because `list_sources` may add a `financeArchive` block. */
+  /**
+   * The sources, and the authorized set they were read under.
+   *
+   * `list_sources` may add a `financeArchive` block, which needs the same
+   * membership the sources were read with. On PostgreSQL that set comes free
+   * from the transaction that just read them, so returning it here is what
+   * keeps the tool to one transaction rather than opening a second one to ask
+   * the same question. On Convex it is `undefined`: the set is a separate query
+   * there, and issuing it unconditionally would add a round trip to every call
+   * whether or not an archive is configured, changing that surface's behaviour.
+   * The tool falls back to `authorizedSpaceIds()` when it is absent.
+   */
   listSources(
     args: ReadSpaces & { sourceAccountId?: string; limit?: number },
-  ): Promise<Record<string, unknown>>;
+  ): Promise<{
+    sources: Record<string, unknown>;
+    authorizedSpaceIds?: string[];
+  }>;
   listInventory(args: InventoryArgs): Promise<unknown>;
   listReviewQueue(args: ReviewQueueArgs): Promise<unknown>;
   searchFacts(
@@ -329,13 +347,20 @@ export function convexReads(convex: ConvexGateway): McpReads {
       });
     },
     async listSources({ spaceIds, sourceAccountId, ...args }) {
-      return (await convex.query(api.models.documents.mcpQueries.listSources, {
-        ...args,
-        ...scopedReads(spaceIds),
-        ...(sourceAccountId === undefined
-          ? {}
-          : { sourceAccountId: sourceAccountId as Id<"sourceAccounts"> }),
-      })) as Record<string, unknown>;
+      // No `authorizedSpaceIds`: on Convex that is a second query, and the tool
+      // only needs it when an archive is configured and in scope.
+      return {
+        sources: (await convex.query(
+          api.models.documents.mcpQueries.listSources,
+          {
+            ...args,
+            ...scopedReads(spaceIds),
+            ...(sourceAccountId === undefined
+              ? {}
+              : { sourceAccountId: sourceAccountId as Id<"sourceAccounts"> }),
+          },
+        )) as Record<string, unknown>,
+      };
     },
     async listInventory({ spaceIds, sourceAccountId, ...args }) {
       return await convex.query(
@@ -522,19 +547,66 @@ async function defaultEmbedder(query: string) {
 }
 
 /**
- * One provider round trip, outside the transaction, turned into an
- * `EmbedQuery` that resolves the already-obtained vector.
+ * The authorization and index check that decides whether the query text is
+ * worth sending to the embedding provider, then the provider round trip.
  *
- * `undefined` when the provider failed or is not configured. The search legs
- * treat an absent embedder exactly as `searchMode: "keyword"` does, which is
- * section 4.4's rule: a vector outage degrades ranking and never withholds
- * retained keyword evidence.
+ * Two rules meet here and the order matters more than either of them alone.
+ *
+ * Section 4.4 says the provider call must not happen inside a transaction: a
+ * `pg` connection held across an outbound HTTP call is what
+ * `KITH_IDLE_TRANSACTION_TIMEOUT_MS` exists to prevent. Convex's own ordering
+ * says the call must not happen before the caller has been authorized and the
+ * index found compatible: `mcpActions.search` resolved the space set, read the
+ * active targets and compared fingerprints, and only then embedded.
+ *
+ * Doing the provider call first satisfies the first rule and breaks the second.
+ * A revoked key, a credential with no readable space and a deployment with no
+ * compatible target would each still have sent the user's text to the provider,
+ * and in the last case every `search_thoughts` and `recall_context` would have
+ * shipped it and thrown the vector away. So this opens a short read-only
+ * transaction of its own first, reloads the credential, resolves the authorized
+ * set and reads the active targets, closes it, and embeds only if that set has
+ * one compatible fingerprint. The tool's own transaction opens afterwards and
+ * is still the authority: it resolves the set again and rechecks the targets,
+ * so a membership or index change between the two narrows the answer rather
+ * than widening it.
+ *
+ * The cost is one extra short read-only transaction on the three vector-backed
+ * tools, which the tests assert exactly.
+ *
+ * `undefined` means no vector leg: an incompatible index, a provider failure, a
+ * provider whose profile disagrees with the index, or no configuration at all.
+ * The search legs treat that exactly as `searchMode: "keyword"` does, which is
+ * the rest of section 4.4: a vector outage degrades ranking and never withholds
+ * retained keyword evidence. An authorization failure is not swallowed: it
+ * throws out of the probe, before any text leaves the process.
  */
 async function prepareEmbedQuery(
+  withPrincipal: WithMcpPrincipal,
+  requestedSpaceIds: string[] | undefined,
   query: string,
+  validate?: (authorizedSpaceIds: string[]) => void,
 ): Promise<EmbedQuery | undefined> {
+  const fingerprint = await withPrincipal(
+    async ({ ctx, principal }) => {
+      const authorized = await getAuthorizedReadSpaceIds(
+        ctx,
+        principal,
+        requestedSpaceIds,
+      );
+      validate?.(authorized);
+      if (authorized.length === 0) return null;
+      const targets = await embeddings.getActiveTargets(ctx, authorized);
+      return embeddings.compatibleSearchFingerprint(authorized, targets);
+    },
+    { readOnly: true },
+  );
+  if (!fingerprint) return undefined;
   try {
     const resolved = await (embedder ?? defaultEmbedder)(query);
+    // The configured profile has to agree with the index, not merely with
+    // itself. `searchThoughtsHybrid` checks this again on its own snapshot.
+    if (resolved.fingerprint !== fingerprint) return undefined;
     return async () => resolved;
   } catch {
     return undefined;
@@ -776,14 +848,10 @@ export function postgresReads(withPrincipal: WithMcpPrincipal): McpReads {
       );
     },
     async searchDocuments({ spaceIds, searchMode, ...args }) {
-      const embedQuery =
-        (searchMode ?? "hybrid") === "hybrid"
-          ? await prepareEmbedQuery(args.query)
-          : undefined;
-      return await read(async ({ ctx, spaces }) => {
-        const authorized = await spaces(spaceIds);
-        // `mcpActions.search`'s own gate, kept verbatim so a request the
-        // Convex path refuses is refused here too.
+      // `mcpActions.search`'s own gate, kept verbatim so a request the Convex
+      // path refuses is refused here too. It runs in the probe as well, so an
+      // invalid request is refused before the provider is called.
+      const gate = (authorized: string[]) => {
         if (
           !args.query.trim() ||
           args.query.trim().length > 500 ||
@@ -791,6 +859,14 @@ export function postgresReads(withPrincipal: WithMcpPrincipal): McpReads {
         ) {
           throw new Error("Document search request is invalid");
         }
+      };
+      const embedQuery =
+        (searchMode ?? "hybrid") === "hybrid"
+          ? await prepareEmbedQuery(withPrincipal, spaceIds, args.query, gate)
+          : undefined;
+      return await read(async ({ ctx, spaces }) => {
+        const authorized = await spaces(spaceIds);
+        gate(authorized);
         let semantic:
           | embeddings.DocumentSemanticCandidates
           | undefined;
@@ -833,13 +909,23 @@ export function postgresReads(withPrincipal: WithMcpPrincipal): McpReads {
       );
     },
     async listSources({ spaceIds, sourceAccountId, limit }) {
-      return await read(
-        async ({ ctx, spaces }) =>
-          (await documents.listSources(ctx.client, await spaces(spaceIds), {
-            ...(sourceAccountId === undefined ? {} : { sourceAccountId }),
-            ...(limit === undefined ? {} : { limit }),
-          })) as Record<string, unknown>,
-      );
+      // The authorized set comes back with the sources so the tool's finance
+      // block can use the same snapshot and the same membership, rather than
+      // opening a second transaction to resolve it again.
+      return await read(async ({ ctx, spaces }) => {
+        const authorizedSpaceIds = await spaces(spaceIds);
+        return {
+          sources: (await documents.listSources(
+            ctx.client,
+            authorizedSpaceIds,
+            {
+              ...(sourceAccountId === undefined ? {} : { sourceAccountId }),
+              ...(limit === undefined ? {} : { limit }),
+            },
+          )) as Record<string, unknown>,
+          authorizedSpaceIds,
+        };
+      });
     },
     async listInventory({ spaceIds, ...args }) {
       return await read(async ({ ctx, spaces }) =>
@@ -877,7 +963,7 @@ export function postgresReads(withPrincipal: WithMcpPrincipal): McpReads {
       limit,
       includeHistorical,
     }) {
-      const embedQuery = await prepareEmbedQuery(query);
+      const embedQuery = await prepareEmbedQuery(withPrincipal, spaceIds, query);
       return await read(async ({ ctx, spaces }) => {
         const authorized = await spaces(spaceIds);
         const found = await embeddings.searchThoughtsHybrid(
@@ -898,7 +984,7 @@ export function postgresReads(withPrincipal: WithMcpPrincipal): McpReads {
       });
     },
     async recallContext({ spaceIds, query, limit, includeHistorical }) {
-      const embedQuery = await prepareEmbedQuery(query);
+      const embedQuery = await prepareEmbedQuery(withPrincipal, spaceIds, query);
       return await read(async ({ ctx, spaces }) => {
         const authorized = await spaces(spaceIds);
         // Section 4.3's worked example: the candidates, the core halves and

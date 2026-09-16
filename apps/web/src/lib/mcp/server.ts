@@ -589,7 +589,7 @@ export function createMcpServer(
     },
     MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.listSources],
     async ({ spaceIds, sourceAccountId, ...args }) => {
-      const result = await reads.listSources({
+      const { sources: result, authorizedSpaceIds } = await reads.listSources({
         ...args,
         spaceIds,
         ...(sourceAccountId === undefined ? {} : { sourceAccountId }),
@@ -610,7 +610,15 @@ export function createMcpServer(
           content: [{ type: "text" as const, text: JSON.stringify(result) }],
         };
       }
-      const trusted = await financeTrustedContext();
+      // The membership the sources were read under, reused rather than
+      // re-resolved: on PostgreSQL the read already returned it, so the finance
+      // block answers from the same snapshot and the tool stays at one
+      // transaction. Convex returns nothing here and falls back to its own
+      // query, which is what that surface always did.
+      const trusted: FinanceTrustedGatewayContext =
+        authorizedSpaceIds === undefined
+          ? await financeTrustedContext()
+          : { principalId, authorizedSpaceIds };
       if (!trusted.authorizedSpaceIds.includes(financeArchive.spaceId)) {
         return {
           content: [{ type: "text" as const, text: JSON.stringify(result) }],
@@ -866,7 +874,16 @@ export function createMcpServer(
     "Use this when you need to search durable memory by meaning and keyword. Pass the user's exact wording when possible, especially names, identifiers, and version strings. Current memories are searched by default. Set includeHistorical for questions about prior states, corrections, or how something changed. Returns a compact index; use `get_thoughts` to fetch full content. Cite sources as `thought:<id>`.",
     {
       spaceIds: readSpacesSchema,
-      query: z.string().describe("Natural language or keyword query"),
+      // Bounded like every other embedded text argument, at the store's own
+      // bound (`MAX_THOUGHT_QUERY_CHARS` in `embeddings/search.ts`). An
+      // unbounded argument is one an untrusted client can use to send an
+      // arbitrarily large body to the embedding provider.
+      query: z
+        .string()
+        .trim()
+        .min(1)
+        .max(12_000)
+        .describe("Natural language or keyword query"),
       type: z
         .enum([
           "decision",
