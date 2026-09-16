@@ -13,6 +13,7 @@
 // to every request regardless of what it does once authenticated.
 
 import {
+  memory,
   ProofError,
   withKithReadTransaction,
   withKithTransaction,
@@ -115,8 +116,15 @@ function isSameOriginRequest(request: Request): boolean {
  *     bodyless `POST` such as approving an invitation -- a plain cross-site
  *     HTML form cannot set a custom header, so requiring one here is a second,
  *     independent barrier past the origin check, not a body format check.
+ *
+ * Exported since i7a: `/api/kith/thoughts/capture` cannot use `withPrincipal`
+ * or `withPrincipalRead`, because `captureThoughtFromWeb` opens its own one-
+ * to-three transactions internally (see `lib/kith/capture.ts`'s module
+ * comment) and neither wrapper's single transaction fits that shape. The
+ * route runs this gate directly and lets `captureThoughtFromWeb`'s own
+ * `webPrincipalLoader` (`lib/mcp/principal.ts`) authenticate.
  */
-function guardedRequest(request: Request): Response | null {
+export function guardedRequest(request: Request): Response | null {
   if (kithPostgresSurface() !== "postgres") {
     return problem(404, "Not found");
   }
@@ -209,6 +217,22 @@ const VALIDATION_MESSAGES = new Set([
   "Source account not found",
   "API key not found",
   "Personal space is not configured",
+  // `resolveWriteSpace` (`identity/authorization.ts`), reached by every
+  // `/api/kith/*` write that resolves a destination without one named
+  // explicitly, `/api/kith/thoughts/capture` included: a principal whose
+  // configured default write space was deleted or left gets a 400 that
+  // names no space id, rather than the opaque 500 this bare message fell
+  // through to before.
+  "Default write space is not available",
+  // `/api/kith/thoughts/capture` (`lib/kith/capture.ts`'s
+  // `captureThoughtFromWeb`, the narrative capture admission gate's web
+  // caller): the one bare message `runCaptureThought`'s transaction 1 can
+  // still throw before any row is touched, from `normalizeCaptureContent`'s
+  // length bound. Not "Invalid memory validity interval" or "Invalid memory
+  // provenance": this route's request body carries no `validFrom`/`validTo`
+  // and no provenance fields (`sourceRef`, `observedAt`, `batchId`), so the
+  // gate's validators for them never run long enough to throw.
+  `Memory content must contain 1-${memory.MAX_CAPTURE_CONTENT_CHARS} characters`,
 ]);
 
 /**

@@ -30,9 +30,11 @@ import {
   type Principal,
   type PrincipalRef,
   reloadPrincipal,
+  requireWebPrincipal,
 } from "@repo/kith-store/identity";
 
 import { kithPool } from "@/lib/kith/pool";
+import { kithSessionConfig } from "@/lib/kith/session";
 
 /** One transaction, one reloaded principal, one fixed `now`. */
 export type McpPrincipalSession = {
@@ -61,6 +63,35 @@ export function mcpPrincipalLoader(ref: PrincipalRef): WithMcpPrincipal {
     return await transaction(kithPool(), async (client) => {
       const ctx = identityCtx(client);
       const principal = await reloadPrincipal(ctx, ref);
+      return await run({ ctx, principal });
+    });
+  };
+}
+
+/**
+ * A web session's `WithMcpPrincipal`, i7a's sibling of `mcpPrincipalLoader`.
+ *
+ * `lib/kith/capture.ts`'s `captureThoughtFromWeb` (Quick Capture's gate) calls
+ * `withPrincipal` up to three times per capture, each its own transaction, so
+ * it cannot be handed a principal already loaded by an outer transaction --
+ * that would mean two clients open for one capture, or a stale principal for
+ * transactions 2 and 3. This binds the cookie header instead, the same way
+ * `mcpPrincipalLoader` binds a `PrincipalRef`: it is the only thing cached,
+ * and every call reloads the session fresh, so a session revoked between two
+ * of the gate's transactions denies on the next one exactly as a revoked API
+ * key does. No `touch: true`: the personal-space bootstrap and eight days of
+ * this cookie's ten-year life are not affected by a capture skipping the
+ * `last_used_at` refresh a page load already gives it.
+ */
+export function webPrincipalLoader(cookieHeader: string | null): WithMcpPrincipal {
+  return async (run, options = {}) => {
+    const config = kithSessionConfig();
+    const transaction = options.readOnly
+      ? withKithReadTransaction
+      : withKithTransaction;
+    return await transaction(kithPool(), async (client) => {
+      const ctx = identityCtx(client);
+      const principal = await requireWebPrincipal(ctx, { config, cookieHeader });
       return await run({ ctx, principal });
     });
   };
