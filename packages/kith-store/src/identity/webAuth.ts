@@ -541,12 +541,22 @@ export async function signUp(
 }
 
 /**
+ * A well-formed stored secret that no password produces. When the account
+ * does not exist, the sign-in verifies the supplied password against this
+ * value instead of skipping the KDF, so an unknown email costs the same
+ * Scrypt derivation as a wrong password. Without it the identical error
+ * message hides nothing: the response time alone said whether the account
+ * existed. Zeros, not a random value, so the cost is the same on every
+ * instance and nothing secret has to be generated or stored.
+ */
+const UNKNOWN_ACCOUNT_SECRET = `${"0".repeat(32)}:${"0".repeat(128)}`;
+
+/**
  * Verifies a password against the stored Scrypt hash and opens a session.
  *
- * One message for an unknown account and for a wrong password. The work is not
- * constant time between those two cases -- a missing account skips the KDF -- and
- * that is the same shape the library had; closing the timing channel is a
- * separate change from this port and is noted rather than smuggled in.
+ * One message for an unknown account and for a wrong password, and the same
+ * work: a missing account derives against `UNKNOWN_ACCOUNT_SECRET` rather
+ * than returning early, closing the timing channel the library left open.
  */
 export async function signIn(
   ctx: IdentityCtx,
@@ -560,7 +570,11 @@ export async function signIn(
   const email = requireValidEmail(args.email);
   const password = requireValidPassword(args.password);
   const account = await getPasswordAccount(ctx, email);
-  if (!account || !(await verifyPassword(account.secret, password))) {
+  const verified = await verifyPassword(
+    account ? account.secret : UNKNOWN_ACCOUNT_SECRET,
+    password,
+  );
+  if (!account || !verified) {
     throw new IdentityError("Invalid credentials");
   }
   if (!(await userExists(ctx, account.userId))) {
