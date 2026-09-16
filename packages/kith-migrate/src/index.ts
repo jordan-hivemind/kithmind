@@ -6,4 +6,5 @@ export * from "./ids.js";
 export * from "./export.js";
 export * from "./transform.js";
 export * from "./load.js";
+export * from "./audit.js";
 export * from "./parity.js";

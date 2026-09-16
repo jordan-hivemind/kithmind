@@ -569,9 +569,14 @@ export function syntheticConvexTables() {
 }
 
 /** Writes the synthetic corpus in the Convex export layout (one directory
- * per table, each holding `documents.jsonl`) under `dir`. */
-export async function writeConvexExportDir(dir) {
-  const { tables, ids, text } = syntheticConvexTables();
+ * per table, each holding `documents.jsonl`) under `dir`. `overrideTables`
+ * lets a caller substitute a mutated copy of the per-table row map (for
+ * example, `audit.test.mjs` corrupting one column after cloning
+ * `syntheticConvexTables().tables`) while still writing every other table
+ * exactly as `syntheticConvexTables` built it. */
+export async function writeConvexExportDir(dir, overrideTables) {
+  const { tables: builtTables, ids, text } = syntheticConvexTables();
+  const tables = overrideTables ?? builtTables;
   for (const [tableName, rows] of Object.entries(tables)) {
     const tableDir = join(dir, tableName);
     await mkdir(tableDir, { recursive: true });
