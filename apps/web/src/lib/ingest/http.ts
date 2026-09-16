@@ -1,9 +1,18 @@
-import {
-  type InlineIngestErrorCode,
-  inlineIngestErrorCode,
-  parseInlineIngestErrorData,
-} from "@repo/db/convex/models/ingestion/inlineErrors";
+// `InlineIngestErrorCode` and `inlineIngestErrorCode` are i7a's repoint: the
+// store's own `ingestion` module classifies the exact same closed code set
+// from the same thrown messages (`packages/kith-store/src/ingestion/errors.ts`),
+// and every message it matches is one the PostgreSQL lane can actually throw.
+// `parseInlineIngestErrorData` stays on `@repo/db`: it parses a `ConvexError`'s
+// `data` envelope, which only the Convex lane ever throws, and nothing on the
+// PostgreSQL side has a reason to model that shape. No kith-store equivalent
+// exists or should; it is listed for i7b, which removes the Convex lane this
+// still serves.
+import { parseInlineIngestErrorData } from "@repo/db/convex/models/ingestion/inlineErrors";
+import { ingestion } from "@repo/kith-store";
 import { z } from "zod";
+
+type InlineIngestErrorCode = ingestion.InlineIngestErrorCode;
+const inlineIngestErrorCode = ingestion.inlineIngestErrorCode;
 
 export const MAX_INGEST_JSON_BYTES = 512 * 1024;
 export const MAX_INGEST_TEXT_BYTES = 64 * 1024;

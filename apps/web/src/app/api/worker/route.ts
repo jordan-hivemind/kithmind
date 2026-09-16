@@ -11,9 +11,11 @@
 // Wire parity is a property of three things being shared rather than of this
 // file being careful:
 //
-//   * One parser. `parseWorkerRequest` is `@repo/worker-protocol`'s, and both
-//     `@repo/db/convex/models/workers/protocol` and the store re-export it, so
-//     a body that parses on one surface parses on the other and a body that
+//   * One parser. `parseWorkerRequest` is imported from `@repo/worker-protocol`
+//     directly as of i7a; `@repo/db/convex/models/workers/protocol` was always
+//     a pure re-export of it, kept for the Convex-side call sites that still
+//     import it by that name, and the store imports the same package, so a
+//     body that parses on one surface parses on the other and a body that
 //     does not is a 400 on both.
 //   * One error code set. `workerProtocolErrorCode` on the store side and
 //     `parseWorkerProtocolErrorData` on the Convex side both yield a
@@ -30,8 +32,8 @@
 // adapter calls, so there is one authentication and one authority.
 
 import { api } from "@repo/db/convex/_generated/api";
-import { parseWorkerRequest } from "@repo/db/convex/models/workers/protocol";
 import { workers } from "@repo/kith-store";
+import { parseWorkerRequest } from "@repo/worker-protocol/request";
 import { ConvexHttpClient } from "convex/browser";
 
 import {
