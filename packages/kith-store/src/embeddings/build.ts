@@ -50,6 +50,7 @@ import {
   upsertEligibleTarget,
   type EmbeddingTargetWriteRow,
 } from "./eligibility.js";
+import { scheduleEmbeddingFill } from "./fillWork.js";
 import { failEmbeddingGeneration } from "./generations.js";
 import {
   addKindCounts,
@@ -1008,6 +1009,20 @@ export async function runEmbeddingBuildPage(
         at(now),
       ],
     );
+    // `runFillPage` above only matches eligible targets to vectors that
+    // already exist under this fingerprint; it never calls a provider, and a
+    // target it cannot match stays eligible and uncovered, "so the provider
+    // fill can find it" (see its own comment). A build that completes with
+    // `eligible` ahead of `covered` for any kind has left exactly that behind,
+    // so queue the provider-backed fill here, in the same transaction, the way
+    // every other writer of this space's eligibility does.
+    if (
+      eligible.thought !== covered.thought ||
+      eligible.chunk !== covered.chunk ||
+      eligible.card !== covered.card
+    ) {
+      await scheduleEmbeddingFill(ctx, job.space_id);
+    }
   }
   await exec(
     ctx,

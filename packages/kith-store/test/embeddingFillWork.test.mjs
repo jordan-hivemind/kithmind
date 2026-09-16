@@ -32,7 +32,15 @@ import {
 import * as embeddings from "../dist/embeddings/index.js";
 import { identityCtx } from "../dist/identity/index.js";
 import * as memory from "../dist/memory/index.js";
-import { oneHot, seedActiveEmbeddingIndex } from "./helpers/embeddingFixture.mjs";
+import {
+  touchWorkerPublicationEmbedding,
+  withWorkerTransaction,
+} from "../dist/workers/index.js";
+import {
+  oneHot,
+  seedActiveEmbeddingIndex,
+  seedIndexableDocument,
+} from "./helpers/embeddingFixture.mjs";
 import {
   identityDatabase,
   makeSpace,
@@ -84,6 +92,35 @@ async function capture(f, space, content, now = NOW) {
       { content, metadata: metadata(content) },
     ),
   );
+}
+
+/**
+ * Publishes a fresh document of one chunk into a space, the way
+ * `activateProcessingJob`/`activateParsedJob` do: seed the source chain with
+ * raw SQL (the same fixture `embeddingBuild.test.mjs` builds its documents
+ * with), then run `touchWorkerPublicationEmbedding` in its own worker
+ * transaction, exactly as `src/workers/jobs.ts` and `src/workers/parsedJobs.ts`
+ * do after activation.
+ */
+async function publishDocument(f, space, text, now = NOW) {
+  const chain = await withKithTransaction(f.pool, (client) =>
+    seedIndexableDocument(identityCtx(client, now), space.spaceId, {
+      title: `Document ${text}`,
+      chunks: [text],
+    }),
+  );
+  await withWorkerTransaction(
+    f.pool,
+    (ctx) =>
+      touchWorkerPublicationEmbedding(ctx, {
+        spaceId: space.spaceId,
+        sourceItemId: chain.sourceItemId,
+        sourceAccountId: chain.sourceAccountId,
+        processingGenerationId: chain.generationId,
+      }),
+    now,
+  );
+  return chain;
 }
 
 /** One axis per text, chosen by the test rather than by call order, so the
@@ -636,3 +673,95 @@ test("a superseding transition schedules the fill too", { skip }, async (t) => {
     [supersededId],
   );
 });
+
+// P2-39j follow-up: `captureThought`/`transitionMemory` were the only writers
+// that scheduled a fill. A worker publish makes its chunk an eligible,
+// uncovered target through `touchWorkerPublicationEmbedding` exactly as a
+// capture makes a thought one, and until that function also calls
+// `scheduleEmbeddingFill`, the chunk sits owed until an unrelated thought
+// capture in the same space happens to schedule one. These tests pin the same
+// three links `embeddingFillWork.test.mjs` already pins for thoughts, for a
+// document publication instead.
+
+test(
+  "a document publication schedules one fill per space, and a burst converges on it",
+  { skip },
+  async (t) => {
+    const f = await poolFixture(t);
+    const alpha = await seedCountedSpace(f);
+    const beta = await seedCountedSpace(f);
+
+    const firstChain = await publishDocument(f, alpha, "alpha chunk one");
+    const afterFirst = await fillJobs(f, alpha.spaceId);
+    assert.equal(afterFirst.length, 1);
+    assert.equal(afterFirst[0].dedupe_key, `embedding_fill:${alpha.spaceId}`);
+    assert.deepEqual(afterFirst[0].payload, { spaceId: alpha.spaceId });
+    assert.equal(afterFirst[0].state, "queued");
+
+    // A same-generation replay of the first publication (every activation
+    // calls `touchWorkerPublicationEmbedding` again, not only the first one)
+    // and a second, distinct document both converge on the queued row rather
+    // than adding one.
+    await withWorkerTransaction(
+      f.pool,
+      (ctx) =>
+        touchWorkerPublicationEmbedding(ctx, {
+          spaceId: alpha.spaceId,
+          sourceItemId: firstChain.sourceItemId,
+          sourceAccountId: firstChain.sourceAccountId,
+          processingGenerationId: firstChain.generationId,
+        }),
+      NOW + 1,
+    );
+    await publishDocument(f, alpha, "alpha chunk two", NOW + 2);
+    const afterBurst = await fillJobs(f, alpha.spaceId);
+    assert.equal(afterBurst.length, 1);
+    assert.equal(afterBurst[0].id, afterFirst[0].id);
+
+    // The key is per space, so another space's publication is its own job.
+    await publishDocument(f, beta, "beta chunk one", NOW + 3);
+    const betaJobs = await fillJobs(f, beta.spaceId);
+    assert.equal(betaJobs.length, 1);
+    assert.notEqual(betaJobs[0].id, afterFirst[0].id);
+    assert.equal(betaJobs[0].dedupe_key, `embedding_fill:${beta.spaceId}`);
+  },
+);
+
+test(
+  "the default registry drains the fill after a document publication, and the chunk target is covered",
+  { skip },
+  async (t) => {
+    const f = await poolFixture(t);
+    const space = await seedCountedSpace(f);
+    const chain = await publishDocument(f, space, "alpha chunk text");
+
+    // Same shape as the thought case: until the fill runs, the chunk is
+    // eligible and uncovered.
+    assert.deepEqual(await targetRows(f, space.spaceId), [
+      {
+        target_kind: "chunk",
+        target_id: chain.chunkIds[0],
+        state: "eligible",
+        covered_fingerprint: null,
+      },
+    ]);
+
+    const embed = axisEmbedder(space.index.fingerprint, () => 3);
+    const summary = await drain(f.pool, defaultRegistry({ embedder: embed }), {
+      now: NOW,
+    });
+    assert.equal(summary.claimed, 1);
+    assert.equal(summary.completed, 1);
+    assert.equal(summary.outcomes[0].kind, "embedding_fill");
+    assert.deepEqual(embed.texts(), ["alpha chunk text"]);
+
+    const covered = await targetRows(f, space.spaceId);
+    assert.equal(covered.length, 1);
+    assert.equal(covered[0].state, "eligible");
+    assert.equal(covered[0].covered_fingerprint, space.index.fingerprint);
+    assert.equal(await vectorCount(f, space.spaceId), 1);
+
+    const job = await fillJobs(f, space.spaceId);
+    assert.equal(job[0].state, "done");
+  },
+);

@@ -1,3 +1,4 @@
+import { scheduleEmbeddingFill } from "../embeddings/fillWork.js";
 import { sha256Hex } from "../ingestion/inline.js";
 import { newKithId } from "../ids.js";
 import { at, exec, rows, type WorkerCtx } from "./db.js";
@@ -508,6 +509,15 @@ export async function touchWorkerPublicationEmbedding(
       fingerprint,
       counts,
     }));
+    // The chunk targets touched above are owed vectors the moment this
+    // transaction commits (a newly eligible chunk is uncovered, and a
+    // retirement can leave the space's covered count needing a recheck too).
+    // Queue the fill in the same transaction as the write that owed it, same
+    // as capture's `scheduleEmbeddingFill` call in `memory/thoughts.ts`: the
+    // job commits with the publication or not at all, and the per-space
+    // dedupe key collapses a burst of publishes into the one job that reads
+    // the owed index when it runs.
+    await scheduleEmbeddingFill(ctx, input.spaceId);
   }
 
   if (counted && nextEligible) {

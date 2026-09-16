@@ -814,3 +814,103 @@ test(
     });
   },
 );
+
+// P2-39j follow-up: `runFillPage` only matches an eligible target to a vector
+// that already exists under the build's fingerprint; it never calls a
+// provider. A target it cannot match stays eligible and uncovered on purpose,
+// "so the provider fill can find it" -- which means something has to queue
+// that fill once the build is done, or the target sits owed until an
+// unrelated write in the same space happens to schedule one.
+
+test(
+  "a build that completes with uncovered targets schedules a fill for the space",
+  { skip },
+  async (t) => {
+    const db = await identityDatabase(t);
+    await db.tx(async (ctx) => {
+      const userId = await makeUser(ctx);
+      const spaceId = await makeSpace(ctx, {
+        createdBy: userId,
+        role: "owner",
+      });
+      await seedActiveEmbeddingIndex(ctx, spaceId, {
+        eligible: { thought: 0, chunk: 0, card: 0 },
+      });
+      // No thoughts, and no vector in `kith.embedding_vectors`: the scan
+      // discovers the chunk fresh and the fill phase has nothing to match it
+      // to, exactly the shape a first backfill of a document-heavy space has.
+      await seedIndexableDocument(ctx, spaceId, {
+        title: "Uncovered",
+        chunks: ["a chunk nothing has embedded yet"],
+      });
+
+      const started = await embeddings.startEmbeddingBuild(ctx, { spaceId });
+      await runToCompletion(ctx, started.jobId, 4);
+
+      const jobs = (
+        await ctx.client.query(
+          `SELECT dedupe_key, space_id, payload, state FROM kith.deferred_work
+            WHERE kind = 'embedding_fill' AND space_id = $1`,
+          [spaceId],
+        )
+      ).rows;
+      assert.equal(jobs.length, 1);
+      assert.equal(jobs[0].dedupe_key, `embedding_fill:${spaceId}`);
+      assert.deepEqual(jobs[0].payload, { spaceId });
+      assert.equal(jobs[0].state, "queued");
+    });
+  },
+);
+
+test(
+  "a build that fully covers its targets schedules no fill",
+  { skip },
+  async (t) => {
+    const db = await identityDatabase(t);
+    await db.tx(async (ctx) => {
+      const userId = await makeUser(ctx);
+      const spaceId = await makeSpace(ctx, {
+        createdBy: userId,
+        role: "owner",
+      });
+      const index = await seedActiveEmbeddingIndex(ctx, spaceId, {
+        eligible: { thought: 0, chunk: 0, card: 0 },
+      });
+      const text = "a chunk that is already embedded";
+      const chain = await seedIndexableDocument(ctx, spaceId, {
+        title: "Covered",
+        chunks: [text],
+      });
+      // A vector already under the active fingerprint, matching the chunk's
+      // live text hash: what a fresh PostgreSQL space's imported vectors look
+      // like before the build reconciles the target table against them.
+      await seedEmbeddingVector(ctx, {
+        spaceId,
+        embeddingGenerationId: index.generationId,
+        fingerprint: index.fingerprint,
+        targetKind: "chunk",
+        chunkId: chain.chunkIds[0],
+        processingGenerationId: chain.generationId,
+        inputHash: await sha256Utf8(text),
+        vector: oneHot(1),
+      });
+
+      const started = await embeddings.startEmbeddingBuild(ctx, { spaceId });
+      await runToCompletion(ctx, started.jobId, 4);
+
+      assert.deepEqual(await recount(ctx, spaceId, index.fingerprint), {
+        eligible: { thought: 0, chunk: 1, card: 0 },
+        covered: { thought: 0, chunk: 1, card: 0 },
+      });
+
+      const jobs = (
+        await ctx.client.query(
+          `SELECT id FROM kith.deferred_work
+            WHERE kind = 'embedding_fill' AND space_id = $1`,
+          [spaceId],
+        )
+      ).rows;
+      assert.deepEqual(jobs, []);
+    });
+  },
+);
