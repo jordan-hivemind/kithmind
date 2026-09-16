@@ -992,6 +992,12 @@ export type RecallCandidateOptions = {
  * Facts come from the keyword leg alone, thoughts from the hybrid one,
  * matching `recall_context`'s Convex composition exactly: facts had one
  * search index and no vectors, thoughts had both.
+ *
+ * `thoughtScores` is the fused rank score for each returned thought id, keyed
+ * by id. `recall_context` reports a `score` on every relevance thought it
+ * returns, and hydration by id cannot recover it, so the ranker hands it back
+ * with the ids rather than making the caller run the search twice. Facts carry
+ * no score on that surface and none is returned for them.
  */
 export async function recallCandidates(
   ctx: IdentityCtx,
@@ -1001,10 +1007,16 @@ export async function recallCandidates(
 ): Promise<{
   factIds: string[];
   thoughtIds: string[];
+  thoughtScores: Map<string, number>;
   vectorStatus: VectorStatus;
 }> {
   if (spaceIds.length === 0) {
-    return { factIds: [], thoughtIds: [], vectorStatus: "unavailable" };
+    return {
+      factIds: [],
+      thoughtIds: [],
+      thoughtScores: new Map(),
+      vectorStatus: "unavailable",
+    };
   }
   const facts = await searchFacts(ctx, spaceIds, query, {
     ...(options.limit === undefined ? {} : { limit: options.limit }),
@@ -1024,6 +1036,9 @@ export async function recallCandidates(
   return {
     factIds: facts.map((fact) => fact.id),
     thoughtIds: thoughts.results.map((thought) => thought.id),
+    thoughtScores: new Map(
+      thoughts.results.map((thought) => [thought.id, thought.score]),
+    ),
     vectorStatus: thoughts.vectorStatus,
   };
 }

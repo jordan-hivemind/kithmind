@@ -107,7 +107,8 @@ export type Thought = {
   confidence: number | undefined;
 };
 
-type ThoughtRow = {
+/** Exported for `./timeline.ts`, which reads the same rows. */
+export type ThoughtRow = {
   id: string;
   space_id: string;
   created_at: Date;
@@ -130,7 +131,12 @@ type ThoughtRow = {
   confidence: string | number | null;
 };
 
-const THOUGHT_COLUMNS = `id, space_id, created_at, content, metadata, user_id, updated_at,
+/**
+ * Shared with `./timeline.ts`, which reads the same rows through the same
+ * hydration. A module seam, not part of the memory domain's public surface:
+ * `./index.js` does not re-export it.
+ */
+export const THOUGHT_COLUMNS = `id, space_id, created_at, content, metadata, user_id, updated_at,
        is_core, valid_from, valid_to, memory_status, superseded_at, superseded_by,
        supersedes, change_reason, source_type, source_ref, observed_at, batch_id, confidence`;
 
@@ -180,7 +186,7 @@ async function hydrateThought(ctx: IdentityCtx, record: ThoughtRow): Promise<Tho
   return toThought(record);
 }
 
-async function hydrateThoughtRows(ctx: IdentityCtx, records: readonly ThoughtRow[]): Promise<Thought[]> {
+export async function hydrateThoughtRows(ctx: IdentityCtx, records: readonly ThoughtRow[]): Promise<Thought[]> {
   const hydrated = [];
   for (const record of records) {
     const thought = await hydrateThought(ctx, record);
@@ -214,7 +220,17 @@ export async function getThoughtById(ctx: IdentityCtx, id: string): Promise<Thou
   return record ? hydrateThought(ctx, record) : null;
 }
 
-/** Ported from `getByIdAuthorized`/`getByIdsAuthorized`, folded into one bulk read. */
+/**
+ * Ported from `getByIdAuthorized`/`getByIdsAuthorized`, folded into one bulk
+ * read.
+ *
+ * The caller's id order is the result order. `getByIdsAuthorized` read
+ * `args.ids.map((id) => ctx.db.get(id))` and returned that array filtered, so
+ * its caller could hand it a ranked candidate list and get the ranking back;
+ * `get_thoughts` is documented as taking ids "from a prior search_thoughts
+ * call" and is the consumer that depends on it. One `id = ANY(...)` returns
+ * heap order, so the order is restored here rather than left to the plan.
+ */
 export async function getThoughtsByAuthorizedIds(
   ctx: IdentityCtx,
   spaceIds: readonly string[],
@@ -228,7 +244,13 @@ export async function getThoughtsByAuthorizedIds(
     `SELECT ${THOUGHT_COLUMNS} FROM kith.thoughts WHERE id = ANY($1::text[])`,
     [ids.map((id) => assertKithId(id, "invalid_thought_id"))],
   );
-  return (await hydrateThoughtRows(ctx, records)).filter((thought) => authorized.has(thought.spaceId));
+  const byId = new Map(
+    (await hydrateThoughtRows(ctx, records)).map((thought) => [thought.id, thought]),
+  );
+  return ids
+    .map((id) => byId.get(id))
+    .filter((thought): thought is Thought => thought !== undefined)
+    .filter((thought) => authorized.has(thought.spaceId));
 }
 
 export type ListBySpacesFilters = { type?: ThoughtType; topic?: string };

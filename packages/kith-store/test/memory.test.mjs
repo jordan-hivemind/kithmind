@@ -193,6 +193,11 @@ test("recallCandidates feeds recallContext from the real indexes", { skip }, asy
     assert.deepEqual(candidates.factIds, [relevantFact.factId]);
     assert.deepEqual(candidates.thoughtIds, [relevant]);
     assert.equal(candidates.thoughtIds.includes(foreignThought), false);
+    // P2-39i3: the fused score comes back with the ids, because hydration by
+    // id cannot recover it and `recall_context` reports it on every relevance
+    // thought it returns.
+    assert.deepEqual([...candidates.thoughtScores.keys()], [relevant]);
+    assert.equal(typeof candidates.thoughtScores.get(relevant), "number");
 
     const recall = await memory.recallContext(ctx, [spaceId], candidates, { limit: 5 });
     assert.deepEqual(recall.relevanceFacts.map((item) => item.id), [relevantFact.factId]);
@@ -202,6 +207,7 @@ test("recallCandidates feeds recallContext from the real indexes", { skip }, asy
     assert.deepEqual(await embeddings.recallCandidates(ctx, [], "migrations"), {
       factIds: [],
       thoughtIds: [],
+      thoughtScores: new Map(),
       vectorStatus: "unavailable",
     });
   });

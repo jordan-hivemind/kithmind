@@ -14,6 +14,12 @@
 import type { ClientBase, QueryResultRow } from "pg";
 
 import { newKithId } from "../ids.js";
+import {
+  decodeKeysetCursor,
+  encodeKeysetCursor,
+  keysetCursorColumn,
+  keysetCursorPredicate,
+} from "../keyset.js";
 import { spacePredicate } from "../spaces.js";
 import { camelizeSourceInventory, type SourceInventoryExclusionReason, type SourceInventoryRow } from "../provenance/rows.js";
 import { sha256Utf8 } from "../provenance/sql.js";
@@ -383,6 +389,16 @@ export async function listInventory(
     );
   }
 
+  // An empty authorized set is the same answer as an unauthorized account, and
+  // the Convex query returned an empty page for it. `spacePredicate` refuses an
+  // empty set outright, on the grounds that reaching a read with no authorized
+  // space is an authorization bug, and that is the right rule for a statement;
+  // here the caller is an MCP tool whose credential may legitimately hold no
+  // space grant, so the read answers empty rather than raising a `ProofError`
+  // the tool would surface verbatim.
+  if (authorizedSpaceIds.length === 0) {
+    return { rows: [], cursor: undefined, isDone: true, counts: emptyCounts() };
+  }
   const predicate = spacePredicate(authorizedSpaceIds, 1);
   const account = (
     await client.query<QueryResultRow>(
@@ -394,40 +410,43 @@ export async function listInventory(
     return { rows: [], cursor: undefined, isDone: true, counts: emptyCounts() };
   }
 
-  const scope = scopeClause(args, 4);
+  // `$1` and `$2` are the space and the account, so the scope filter is `$3`
+  // and the cursor follows whatever the scope bound. Both were previously
+  // written as fixed positions (`$4`, then `$5`/`$6`) while the bind array
+  // below appended them straight after `$2`, so every filter and every second
+  // page asked the server for a parameter that was never sent.
+  const values: unknown[] = [account.space_id, account.id];
+  const scope = scopeClause(args, values.length + 1);
+  values.push(...scope.values);
   let cursorClause = "";
-  let cursorValues: unknown[] = [];
   if (args.cursor !== undefined) {
-    const [createdAtIso, id] = JSON.parse(Buffer.from(args.cursor, "base64url").toString("utf8")) as [
-      string,
-      string,
-    ];
-    cursorClause = ` AND (created_at, id) > ($5, $6)`;
-    cursorValues = [new Date(createdAtIso), id];
+    const { keysetAt, id } = decodeKeysetCursor(args.cursor);
+    cursorClause = ` AND ${keysetCursorPredicate(values.length + 1, values.length + 2)}`;
+    values.push(keysetAt, id);
   }
   const page = (
     await client.query<QueryResultRow>(
-      `SELECT * FROM kith.source_inventory
+      `SELECT *, ${keysetCursorColumn()} FROM kith.source_inventory
         WHERE space_id = $1 AND source_account_id = $2 AND ${scope.sql}${cursorClause}
         ORDER BY created_at, id
         LIMIT ${limit + 1}`,
-      [account.space_id, account.id, ...scope.values, ...cursorValues],
+      values,
     )
-  ).rows.map((row) => camelizeSourceInventory(row));
+  ).rows;
   const isDone = page.length <= limit;
   const pageRows = page.slice(0, limit);
   const last = pageRows[pageRows.length - 1];
+  // The cursor carries the timestamp PostgreSQL rendered, never a round trip
+  // through a millisecond `Date`. See `../keyset.ts`.
   const cursor =
     isDone || !last
       ? undefined
-      : Buffer.from(JSON.stringify([last.createdAt.toISOString(), last.id]), "utf8").toString(
-          "base64url",
-        );
+      : encodeKeysetCursor(last.keyset_at as string, last.id as string);
 
   const counts = await inventoryScopeCounts(client, account.space_id as string, account.id as string, args);
 
   return {
-    rows: pageRows.map(projectInventoryRow),
+    rows: pageRows.map((row) => projectInventoryRow(camelizeSourceInventory(row))),
     cursor,
     isDone,
     counts,
