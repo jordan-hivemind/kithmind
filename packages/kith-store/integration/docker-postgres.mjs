@@ -3,8 +3,16 @@ import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
+// pgvector, not plain postgres. Both integration suites that use this
+// cluster apply the whole kith schema (`@repo/kith-store`'s
+// `applyProofMigration` here, `@repo/kith-migrate`'s loader through
+// `integration/resolveTestDatabase.mjs`), and migration 015 creates the
+// `vector` extension, so a plain `postgres` image cannot reach version 15.
+// PostgreSQL 18, the version this proof has always run against, and
+// digest-pinned like the image it replaces: a floating tag would let a
+// registry change alter what the proof ran against.
 const IMAGE =
-  "postgres@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280";
+  "pgvector/pgvector@sha256:2ba9ca5f2e7daa0f0e7723cba1ee9167bab54efd3640516a44ac1a928dd67e7a";
 const OWNER_LABEL = "com.kithmind.postgres-proof";
 
 async function runDocker(args, options = {}) {

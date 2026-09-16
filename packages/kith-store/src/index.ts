@@ -43,6 +43,7 @@ export {
 } from "./schema.js";
 export * as provenance from "./provenance/index.js";
 export * as documents from "./documents/index.js";
+export * as embeddings from "./embeddings/index.js";
 export * as memory from "./memory/index.js";
 export * as ingestion from "./ingestion/index.js";
 export * as workers from "./workers/index.js";
@@ -208,6 +209,12 @@ export async function grantProofAppRole(
   // surfaces write. P2-39e's first slice adds only the entry-resolution
   // foundation; scan, reservation, receipt and assessment tables stay
   // read-only until the operations that write them land.
+  //
+  // `embedding_vectors` joins the list with P2-39g1. The retrieval legs in
+  // `src/embeddings/search.ts` only read it, but the vector index has a
+  // writer -- the fill driver, and the tests that stand rows up for the
+  // search legs -- and a table no role can write is a table the next slice
+  // silently cannot fill.
   await owner.query(`GRANT INSERT, UPDATE, DELETE ON
     kith.worker_jobs, kith.source_items, kith.source_revisions,
     kith.source_parser_artifacts, kith.source_artifact_archive_receipts,
@@ -218,7 +225,13 @@ export async function grantProofAppRole(
     kith.processing_generations, kith.processing_generation_payload_manifests,
     kith.source_inventory, kith.source_alias_digests,
     kith.worker_scan_entries, kith.worker_discovery_work,
-    kith.worker_protocol_rate_limits, kith.ingest_jobs TO "${appRole}"`);
+    kith.worker_protocol_rate_limits, kith.ingest_jobs,
+    kith.embedding_vectors TO "${appRole}"`);
+  // pgvector lives in `public` (migration 015 says why), and every vector
+  // read names its type and operators there. Applying the reader role revokes
+  // PUBLIC's default USAGE on `public`, so the writer is granted it by name
+  // for the same reason the domains below are.
+  await owner.query(`GRANT USAGE ON SCHEMA public TO "${appRole}"`);
   // USAGE on a domain is granted to PUBLIC by default and revoked from PUBLIC
   // when the reader role is applied, so the writer is granted it by name.
   for (const domain of KITH_DOMAINS) {

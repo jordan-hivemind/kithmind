@@ -1401,12 +1401,17 @@ test(
         [activeVectorId, activeEmbeddingGenerationId],
         [retiredVectorId, retiredEmbeddingGenerationId],
       ]) {
+        // P2-39g1: `embedding` is `public.vector(1536)` and `scope_v2` is
+        // NOT NULL. This publication test does not read either -- it only
+        // checks which vector rows a publish retires -- so the vector is the
+        // cheapest well-formed one and the scope is the encoding a fill
+        // would have written.
         await f.client.query(
           `INSERT INTO kith.embedding_vectors
            (id,space_id,created_at,embedding_generation_id,
             embedding_fingerprint,target_kind,search_scope,chunk_id,
-            processing_generation_id,input_hash,embedding)
-           VALUES ($1,$2,$3,$4,$5,'chunk','documents',$6,$7,$8,$9)`,
+            processing_generation_id,input_hash,embedding,scope_v2)
+           VALUES ($1,$2,$3,$4,$5,'chunk','documents',$6,$7,$8,$9::public.vector,$10)`,
           [
             id,
             f.spaceId,
@@ -1416,7 +1421,13 @@ test(
             previousChunkId,
             previousGenerationId,
             previousInputHash,
-            JSON.stringify([0.5]),
+            `[${new Array(1536).fill(0).map((_, index) => (index === 0 ? 1 : 0)).join(",")}]`,
+            JSON.stringify([
+              "embedding-vector-scope-v2",
+              f.spaceId,
+              embeddingFingerprint,
+              "chunk",
+            ]),
           ],
         );
       }

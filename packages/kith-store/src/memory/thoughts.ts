@@ -3,12 +3,13 @@
 // embedding-target wiring: `_insertOne`/`_transitionMemory`'s calls into
 // `../embeddings/model` (`insertThoughtEmbedding`, `markEligibilityTargets`,
 // `bumpEmbeddingEligibilityEpoch`, `deleteActiveThoughtEmbeddingVectors`,
-// `requireActiveEmbeddingTarget`) are P2-39g's column and index to add
-// (section 2.7); `kith.thoughts` has no vector column yet (migration 004 did
-// not create one), so nothing here writes one. `_computeSpaceStats` is not
-// ported either: its digest reads `../embeddings/targets`' space counters,
-// which do not exist on this side yet, so it stays with the row that adds
-// them. `_listByUser`/`_listCoreByUser` (a legacy userId-scoped read, from
+// `requireActiveEmbeddingTarget`) are still not ported. P2-39g1 added the
+// vector column, the `thoughts.content_search` column and the *read* side in
+// `src/embeddings/` (section 2.7), but every one of those five calls is a
+// write into the embedding index, which the embedding build workstream owns;
+// a capture here leaves an uncovered target for the fill to pick up, exactly
+// as any other backlog row would. `_computeSpaceStats` is not ported either:
+// its digest reads the space counters that same writer maintains. `_listByUser`/`_listCoreByUser` (a legacy userId-scoped read, from
 // before the space model) are not ported: every read here goes through an
 // already-authorized space set, matching `docs/plans/2026-09-06-architecture.md`
 // section 3.1 ("Every read ... verifies the actual row's space").
@@ -432,12 +433,14 @@ export async function setCoreStatus(
 }
 
 /**
- * The seam P2-39g's text/vector index plugs into: given candidate thought ids
- * already ranked by whatever index produced them, authorize, filter by
+ * The seam P2-39g1's text and vector legs plug into: given candidate thought
+ * ids already ranked by whatever index produced them, authorize, filter by
  * retrievability (and optionally `type`), and return in the caller's order.
  * Ported from the intent of `hydrateHybridResultsAuthorized` and
- * `resolveThoughtVectorCandidatesAuthorized`, without the embedding-target
- * plumbing those carried (P2-39g's to add back for its own index kind).
+ * `resolveThoughtVectorCandidatesAuthorized`. The embedding-target plumbing
+ * those carried now lives beside the leg that needs it, in
+ * `src/embeddings/search.ts`, where the candidate and the vector row it came
+ * from are still in hand.
  */
 export async function getThoughtsByIds(
   ctx: IdentityCtx,

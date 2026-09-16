@@ -120,6 +120,43 @@ delayed retry/backoff scheduler, worker capability routing, or background sweep;
 expired work is reconciled only by a later claim in the same space. These are
 deliberate remaining integration gates.
 
+## Embedding and full-text search (P2-39g1)
+
+Migration 015 adds the retrieval indexes section 2.7 of the
+[consolidation plan](plans/2026-09-12-postgres-consolidation.md) specifies, and
+`packages/kith-store/src/embeddings/` adds the legs that read them.
+
+| Object                                                       | Purpose                                                                                  |
+| ------------------------------------------------------------ | ------------------------------------------------------------------------------------------ |
+| `CREATE EXTENSION vector` in `public`                        | pgvector, verified as a step rather than assumed. The migration fails loudly if it is absent or in another schema. |
+| `kith.embedding_vectors.embedding vector(1536)`              | Dropped and re-added from `jsonb`. Section 5.2 does not migrate vector rows, so the table is empty on every target and nothing is rounded in place. |
+| `embedding_vectors_scope_idx`                                | `(space_id, embedding_fingerprint, target_kind)`, the replacement for Convex's `scopeV2` filter field. |
+| `embedding_vectors_generation_{thought,chunk,event}_idx`     | Convex's `by_generation_and_*` per-target lookups.                                        |
+| `thoughts.content_search`, `facts.search_text_search`        | Generated stored `tsvector('english')` with GIN, named after their source columns like `chunks.text_search`. |
+
+Four decisions the plan left open are settled in the migration header and
+repeated here.
+
+| Decision              | Choice                                                                                                                                              |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Extension schema      | `public`, with every reference in code qualified (`public.vector`, `OPERATOR(public.<=>)`). `withKithTransaction` pins `search_path` to `kith` alone, so an unqualified name would not resolve. The writer role is granted `USAGE ON SCHEMA public` for the same reason it is granted the domains. |
+| `real[]` fallback     | Deferred, not implemented. The hosted provider ships pgvector on every plan and CI now runs a pgvector image, so a second untested cosine path would be a claim of a known-good degraded mode that nothing exercises. |
+| `scope_v2`            | Kept. It is no longer a filter, but the ported resolvers still recompute it from the row's own space, fingerprint and kind and drop a row that disagrees. Dropping the column would delete that check. |
+| Vector index          | None. At the pilot's 180 active targets an exact scan behind the scope predicate is correct. HNSW is added when a space passes about 2,000 targets.  |
+
+`test/embeddingSearch.test.mjs` proves the schema objects exist, that both
+keyword legs stem and neither crosses a space, that vector candidates order by
+cosine similarity with hand-built 1536-dimension vectors, that an identical
+vector in another space or under another fingerprint never appears, that an
+out-of-scope, retired or stale-generation candidate is dropped, that the
+hybrid fusion matches a hand-computed reciprocal rank, that `vectorStatus`
+reports "unavailable" on a fingerprint mismatch and on a provider failure
+while keyword results still return, and that a 1535-dimension or non-finite
+vector is refused before any statement is sent.
+
+This is not ranking parity. Section 4.2 of the consolidation plan owns that
+gate with its frozen question set, and it remains owed.
+
 ## Verification
 
 The default repository test remains independent of Docker:

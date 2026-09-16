@@ -128,6 +128,11 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
     name: "record queries: bounded candidate scan indexes (P2-39f5)",
     url: new URL("../migrations/014_record_queries.sql", import.meta.url),
   },
+  {
+    version: 15,
+    name: "embedding search: pgvector column, scope indexes, thought and fact tsvector columns (P2-39g1)",
+    url: new URL("../migrations/015_embedding_search.sql", import.meta.url),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */

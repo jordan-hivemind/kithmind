@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import * as embeddings from "../dist/embeddings/index.js";
 import * as memory from "../dist/memory/index.js";
 import { identityDatabase, makeSpace, makeUser, skip } from "./helpers/memoryFixture.mjs";
 
@@ -150,5 +151,58 @@ test("thought transitions, authorized candidate hydration, and recall blending p
     assert.deepEqual(recall.coreFacts.map((item) => item.id), [fact.factId]);
     assert.deepEqual(recall.coreThoughts.map((item) => item.id), [coreThought]);
     assert.deepEqual(recall.relevanceThoughts.map((item) => item.id), [currentThought]);
+  });
+});
+
+test("recallCandidates feeds recallContext from the real indexes", { skip }, async (t) => {
+  const db = await identityDatabase(t);
+  await db.tx(async (ctx) => {
+    const userId = await makeUser(ctx);
+    const spaceId = await makeSpace(ctx, { createdBy: userId, role: "owner" });
+    const otherSpaceId = await makeSpace(ctx, { createdBy: userId, role: "owner" });
+
+    const relevant = await memory.captureThought(ctx, userId, spaceId, {
+      content: "The archive migration runs on Sunday.",
+      metadata: metadata("archive migration"),
+    });
+    await memory.captureThought(ctx, userId, spaceId, {
+      content: "Lunch is at noon.",
+      metadata: metadata("lunch"),
+    });
+    const foreignThought = await memory.captureThought(ctx, userId, otherSpaceId, {
+      content: "The archive migration runs on Sunday.",
+      metadata: metadata("foreign archive migration"),
+    });
+    const relevantFact = await memory.rememberFact(ctx, userId, spaceId, {
+      subject: { kind: "project", name: "Archive" },
+      predicate: "migration_window",
+      value: { type: "text", value: "Sunday" },
+      sourceType: "user_confirmed",
+    });
+    await memory.rememberFact(ctx, userId, otherSpaceId, {
+      subject: { kind: "project", name: "Archive" },
+      predicate: "migration_window",
+      value: { type: "text", value: "Sunday" },
+      sourceType: "user_confirmed",
+    });
+
+    // No embedder: the vector leg is off, the keyword legs are the answer,
+    // and `vectorStatus` says so rather than pretending otherwise.
+    const candidates = await embeddings.recallCandidates(ctx, [spaceId], "migrations");
+    assert.equal(candidates.vectorStatus, "unavailable");
+    assert.deepEqual(candidates.factIds, [relevantFact.factId]);
+    assert.deepEqual(candidates.thoughtIds, [relevant]);
+    assert.equal(candidates.thoughtIds.includes(foreignThought), false);
+
+    const recall = await memory.recallContext(ctx, [spaceId], candidates, { limit: 5 });
+    assert.deepEqual(recall.relevanceFacts.map((item) => item.id), [relevantFact.factId]);
+    assert.deepEqual(recall.relevanceThoughts.map((item) => item.id), [relevant]);
+
+    // An empty authorized set is not a query that searches everything.
+    assert.deepEqual(await embeddings.recallCandidates(ctx, [], "migrations"), {
+      factIds: [],
+      thoughtIds: [],
+      vectorStatus: "unavailable",
+    });
   });
 });

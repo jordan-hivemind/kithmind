@@ -32,6 +32,11 @@
       "node": "./dist/records/index.js",
       "default": "./src/records/index.ts"
     },
+    "./embeddings": {
+      "types": "./src/embeddings/index.ts",
+      "node": "./dist/embeddings/index.js",
+      "default": "./src/embeddings/index.ts"
+    },
     "./coverage": {
       "types": "./src/coverage/index.ts",
       "node": "./dist/coverage/index.js",
