@@ -32,8 +32,12 @@ export {
   KITH_SCHEMA_LOCK_KEY,
   KITH_SCHEMA_VERSION,
   KITH_SERIALIZATION_ATTEMPTS,
+  KITH_SERIALIZATION_BACKOFF_BASE_MS,
+  KITH_SERIALIZATION_BACKOFF_MAX_MS,
   KITH_STATEMENT_TIMEOUT_MS,
   kithSchemaVersion,
+  kithSerializationBackoffDelayMs,
+  setKithSerializationSleep,
   withKithTransaction,
   type KithMigration,
 } from "./schema.js";
