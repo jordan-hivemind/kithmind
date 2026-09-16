@@ -56,19 +56,49 @@
 // unknown grounding is still refused, `preflightNarrativeAdmission` still
 // declines a derived age or a broad bucket, and an admitted capture is stored
 // with `fallbackThoughtMetadata` -- which is the metadata Convex itself stores
-// on ADD when the classifier returned no analysis. What is missing is the
-// model's half: duplicates are not detected, a changed fact does not supersede
-// its predecessor, and topics, people and the summary are not extracted. That
-// is a parity gap, it is recorded here rather than hidden, and it is owed
-// before `KITH_POSTGRES_SURFACE` flips in row m.
+// on ADD when the classifier returned no analysis.
+//
+// Five things are missing, and the first is the one that decides whether this
+// surface may carry traffic:
+//
+//  1. **Fail-closed becomes fail-open.** The Convex original is fail-closed. If
+//     the classifier is unavailable, errors or returns something unparseable,
+//     `actions.ts:300-308` returns `needs_confirmation` with "Memory was not
+//     stored because the admission check was unavailable" and writes nothing:
+//     no gate, no storage. This lane has no classifier at all and stores
+//     unconditionally once the deterministic preflight passes. The same absence
+//     that stops Convex storing is what lets this store. That inversion is the
+//     gap, not a smaller version of the gate.
+//  2. **SKIP for sensitive content is gone.** `classify.ts:95` makes SKIP cover
+//     content that is "transient, incidental, derived, speculative, sensitive",
+//     and `classify.ts:101-102` names credentials and secrets explicitly. The
+//     preflight covers none of that: it knows derived ages, bullet counts,
+//     sentence counts and a few broad headings. A password pasted into
+//     `capture_thought` is refused on Convex and stored here.
+//  3. Duplicates are not detected, so a repeated capture stores a second row.
+//  4. A changed fact does not supersede its predecessor, so contradictory
+//     memories accumulate as equally current.
+//  5. Topics, people, action items and the summary are not extracted; every
+//     stored thought is `type: "reference"` with empty lists.
+//
+// Two published claims are false on this surface while that is true, so both
+// are corrected rather than left standing. `tool-policy.ts`'s
+// `idempotentHint: true` for `capture_thought` is a claim that repeating a call
+// is safe, which (3) makes false: `mcpToolAnnotations` returns
+// `idempotentHint: false` for it under `postgres`. The tool description's "The
+// admission gate may decline storage or request confirmation. The server
+// deduplicates and preserves changed or corrected prior information as linked
+// history." is false in its second sentence and overstated in its first, so
+// `server.ts` sends a different sentence under `postgres` that says what this
+// deployment actually does. Both revert to the Convex wording the moment the
+// gate lands, which is the point of doing it at the seam.
+//
+// This is recorded here, in section 6 row i4 of the surface plan, and on row
+// P2-39m of the parent plan, because it blocks the flag flip and a tracker
+// reading only the slice row would not see it.
 
 import { api } from "@repo/db/convex/_generated/api";
 import type { Id } from "@repo/db/convex/_generated/dataModel";
-import {
-  fallbackThoughtMetadata,
-  normalizeCaptureContent,
-  preflightNarrativeAdmission,
-} from "@repo/db/convex/models/thoughts/memoryAnalysis";
 import { ingestion, memory } from "@repo/kith-store";
 import {
   requireSpaceAccess,
@@ -265,23 +295,23 @@ export function postgresWrites(withPrincipal: WithMcpPrincipal): McpWrites {
 
           memory.assertValidMemoryValidity(args);
           assertValidProvenance(args);
-          const content = normalizeCaptureContent(args.content);
+          const content = memory.normalizeCaptureContent(args.content);
 
           // A client connected before `sourceType` existed cannot supply it.
           // Absence is ungrounded rather than `user_stated`, which is the
           // laundering this field exists to prevent.
           if (args.sourceType === undefined) {
             return {
-              metadata: fallbackThoughtMetadata(content),
+              metadata: memory.fallbackThoughtMetadata(content),
               disposition: "needs_confirmation",
               operationSummary:
                 "Memory was not stored because its grounding is unknown. Resend with sourceType once the user has stated or confirmed it",
             };
           }
-          const preflight = preflightNarrativeAdmission(content);
+          const preflight = memory.preflightNarrativeAdmission(content);
           if (preflight) {
             return {
-              metadata: fallbackThoughtMetadata(content),
+              metadata: memory.fallbackThoughtMetadata(content),
               disposition:
                 preflight.action === "ASK" ? "needs_confirmation" : "skipped",
               operationSummary:
@@ -294,7 +324,7 @@ export function postgresWrites(withPrincipal: WithMcpPrincipal): McpWrites {
           // The ADD branch, with the metadata the Convex original also stores
           // when it has no analysis. See the module comment for the half of
           // the gate that is not ported.
-          const metadata = fallbackThoughtMetadata(content);
+          const metadata = memory.fallbackThoughtMetadata(content);
           const thoughtId = await memory.captureThought(
             ctx,
             principal.userId,

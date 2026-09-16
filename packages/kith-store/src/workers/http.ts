@@ -16,7 +16,19 @@ import {
 export const MAX_WORKER_JSON_BYTES = 512 * 1024;
 
 const RESPONSE_HEADERS = { "Cache-Control": "no-store" } as const;
-const WORKER_ERRORS: Record<
+
+/**
+ * One published protocol code, as its HTTP status and its published message.
+ *
+ * Exported because there is a second copy of it: `apps/web/src/lib/worker/http.ts`
+ * holds the same table for the route's Convex leg, and the two have to agree or
+ * one deployment answers a worker differently from the other for the same
+ * refusal. The web suite asserts itself against this table for all fourteen
+ * codes, which is only a real check while this is the table
+ * `handlePostgresWorkerRequest` actually answers from -- so it is exported
+ * rather than duplicated for the test.
+ */
+export const WORKER_ERRORS: Record<
   WorkerProtocolErrorCode,
   readonly [number, string]
 > = {

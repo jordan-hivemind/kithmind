@@ -413,7 +413,19 @@ describeWithDatabase("MCP write and ingest tools on PostgreSQL", () => {
   // Capability
   // -------------------------------------------------------------------------
 
+  /** Rows in one space, so "the refusal wrote nothing" can be a difference. */
+  async function rowCounts(spaceId: string) {
+    const counted = await pool.query<{ facts: number; thoughts: number }>(
+      `SELECT (SELECT count(*) FROM kith.facts WHERE space_id = $1)::int AS facts,
+              (SELECT count(*) FROM kith.thoughts WHERE space_id = $1)::int AS thoughts`,
+      [spaceId],
+    );
+    return counted.rows[0]!;
+  }
+
   test("remember_fact and capture_thought are denied without write", async () => {
+    const before = await rowCounts(fixture.spaceA);
+
     const fact = await callTool(
       fixture.keyReadOnly.id,
       "remember_fact",
@@ -433,12 +445,11 @@ describeWithDatabase("MCP write and ingest tools on PostgreSQL", () => {
       "Thought capture requires read and write capabilities",
     );
 
-    // Nothing was written by either refusal.
-    const written = await pool.query(
-      "SELECT count(*)::int AS n FROM kith.facts WHERE space_id = $1",
-      [fixture.spaceA],
-    );
-    expect(typeof written.rows[0]!.n).toBe("number");
+    // Neither refusal wrote a row. A count taken before and compared after,
+    // rather than a count inspected on its own: the destination is Personal,
+    // which other cases in this suite write to, so only the difference across
+    // these two calls says anything.
+    expect(await rowCounts(fixture.spaceA)).toEqual(before);
   });
 
   test("ingest_url is denied without the ingest capability", async () => {
@@ -676,6 +687,42 @@ describeWithDatabase("MCP write and ingest tools on PostgreSQL", () => {
   // capture_thought's provider-free admission gate
   // -------------------------------------------------------------------------
 
+  test("capture_thought advertises what this surface actually does", async () => {
+    // The two claims the missing admission gate makes false, checked where a
+    // client would read them rather than at the constant. Both revert when the
+    // gate lands, so this case is also the reminder to revert them.
+    const listed = async (credential: McpServerCredential | string) => {
+      const server = createMcpServer(credential, "user-test:key-test", null);
+      const client = new Client({ name: "postgres-writes", version: "1" });
+      const [clientTransport, serverTransport] =
+        InMemoryTransport.createLinkedPair();
+      try {
+        await Promise.all([
+          server.connect(serverTransport),
+          client.connect(clientTransport),
+        ]);
+        const { tools } = await client.listTools();
+        return tools.find((tool) => tool.name === "capture_thought")!;
+      } finally {
+        await client.close();
+        await server.close();
+      }
+    };
+
+    const onPostgres = await listed(credentialFor(fixture.keyWrite.id));
+    expect(onPostgres.annotations?.idempotentHint).toBe(false);
+    expect(onPostgres.description).not.toContain("The server deduplicates");
+    expect(onPostgres.description).toContain("does not deduplicate");
+    expect(onPostgres.description).toContain("never send credentials");
+
+    // The Convex surface is untouched: same hint, same sentence.
+    const onConvex = await listed("synthetic-convex-token");
+    expect(onConvex.annotations?.idempotentHint).toBe(true);
+    expect(onConvex.description).toContain(
+      "The server deduplicates and preserves changed or corrected prior information as linked history.",
+    );
+  });
+
   test("capture_thought keeps the gate branches that need no provider", async () => {
     const ungrounded = await callTool(fixture.keyWrite.id, "capture_thought", {
       content: "The synthetic ledger is reviewed every quarter.",
@@ -905,37 +952,36 @@ describeWithDatabase("MCP write and ingest tools on PostgreSQL", () => {
     expect(convexMocks.action).not.toHaveBeenCalled();
   });
 
-  test("/api/worker maps every protocol code the way the Convex leg does", async () => {
-    // Both legs now call one table. This is the assertion that keeps it one:
-    // the Convex classifier's output and the PostgreSQL classifier's output
-    // are the same code type, and this route turns either into the same
-    // status and message.
-    const codes: WorkerProtocolErrorCode[] = [
-      "not_authenticated",
-      "not_authorized",
-      "invalid_request",
-      "not_found",
-      "source_unavailable",
-      "request_conflict",
-      "scan_conflict",
-      "scan_not_ready",
-      "identity_review_required",
-      "rate_limited",
-      "reservation_expired",
-      "stale_observation",
-      "desired_processing_epoch_conflict",
-      "lease_conflict",
-    ];
+  test("the web route's error table matches the store adapter's, code for code", async () => {
+    // There really are two tables, and this compares them. `backendWorkerError`
+    // now delegates to `workerErrorForCode`, so checking one against the other
+    // would compare a function with itself; the second table is
+    // `packages/kith-store/src/workers/http.ts`'s `WORKER_ERRORS`, which is what
+    // `handlePostgresWorkerRequest` answers from. If the store adds a code or
+    // changes a status, a worker would get one answer from the adapter and
+    // another from this route, and this is where that shows up.
+    const codes = Object.keys(
+      workers.WORKER_ERRORS,
+    ) as WorkerProtocolErrorCode[];
+    expect(codes).toHaveLength(14);
+
     for (const code of codes) {
+      const [status, message] = workers.WORKER_ERRORS[code];
+      const web = workerErrorForCode(code);
+      expect([web.status, web.code, web.message], code).toEqual([
+        status,
+        code,
+        message,
+      ]);
+      // And the Convex classifier's output reaches the same row, so a refusal
+      // that arrives as `ConvexError` data lands where the store's own does.
       const fromConvex = backendWorkerError({
         data: { type: "worker_protocol_error", code },
       });
-      const fromPostgres = workerErrorForCode(code);
-      expect([fromConvex.status, fromConvex.code, fromConvex.message]).toEqual([
-        fromPostgres.status,
-        fromPostgres.code,
-        fromPostgres.message,
-      ]);
+      expect(
+        [fromConvex.status, fromConvex.code, fromConvex.message],
+        code,
+      ).toEqual([status, code, message]);
     }
   });
 
