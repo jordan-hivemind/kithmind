@@ -27,6 +27,21 @@ const errors: Record<WorkerProtocolErrorCode, readonly [number, string]> = {
   lease_conflict: [409, "Work lease is no longer current"],
 };
 
+/**
+ * One published code, as its published status and message.
+ *
+ * Exported since i4: the PostgreSQL leg of `/api/worker` classifies its own
+ * refusal with `@repo/kith-store`'s `workerProtocolErrorCode` over this same
+ * closed code set, and then reaches this same table, so the two surfaces answer
+ * one protocol from one mapping rather than from two that could drift.
+ */
+export function workerErrorForCode(
+  code: WorkerProtocolErrorCode,
+): IngestHttpError {
+  const [status, message] = errors[code];
+  return new IngestHttpError(status, code, message);
+}
+
 export function backendWorkerError(error: unknown): IngestHttpError {
   const data = parseWorkerProtocolErrorData(
     typeof error === "object" && error !== null && "data" in error
@@ -36,6 +51,5 @@ export function backendWorkerError(error: unknown): IngestHttpError {
   if (!data) {
     return new IngestHttpError(500, "worker_failed", "Worker operation failed");
   }
-  const [status, message] = errors[data.code];
-  return new IngestHttpError(status, data.code, message);
+  return workerErrorForCode(data.code);
 }

@@ -10,6 +10,14 @@
 
 export * from "./lifecycle.js";
 export {
+  fallbackThoughtMetadata,
+  MAX_CAPTURE_CONTENT_CHARS,
+  normalizeCaptureContent,
+  preflightNarrativeAdmission,
+  THOUGHT_TYPES,
+} from "./captureAdmission.js";
+export type * from "./captureAdmission.js";
+export {
   normalizeEntityKey,
   normalizeEntityName,
   normalizeLiteralName,

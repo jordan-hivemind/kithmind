@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   MCP_MEMORY_TOOL_NAMES,
   MCP_TOOL_ANNOTATIONS,
+  mcpToolAnnotations,
   resolveEnabledMcpToolNames,
   resolveMcpToolProfile,
 } from "./tool-policy";
@@ -32,6 +33,33 @@ describe("MCP tool profile", () => {
     expect([...resolveEnabledMcpToolNames("memory")].sort()).toEqual(
       [...MCP_MEMORY_TOOL_NAMES].sort(),
     );
+  });
+
+  it("keeps every annotation identical on the Convex surface", () => {
+    for (const name of MCP_TOOL_NAME_LIST) {
+      expect(mcpToolAnnotations(name, "convex")).toEqual(
+        MCP_TOOL_ANNOTATIONS[name],
+      );
+    }
+  });
+
+  it("drops only capture_thought's idempotent hint on PostgreSQL", () => {
+    // The hint says a repeat is safe. On PostgreSQL nothing detects a repeat
+    // until the admission gate is ported, so a host that retried a timed-out
+    // call would store the memory twice. Every other tool is unchanged, and
+    // the difference is one field: the surface must not become a licence to
+    // re-annotate the table.
+    for (const name of MCP_TOOL_NAME_LIST) {
+      const annotations = mcpToolAnnotations(name, "postgres");
+      if (name === "capture_thought") {
+        expect(annotations).toEqual({
+          ...MCP_TOOL_ANNOTATIONS[name],
+          idempotentHint: false,
+        });
+      } else {
+        expect(annotations, name).toEqual(MCP_TOOL_ANNOTATIONS[name]);
+      }
+    }
   });
 
   it("exposes every read-only memory/document tool in the memory profile", () => {

@@ -12,7 +12,10 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("@/lib/mcp/auth", () => ({
-  authenticateApiKeyOnConvex: mocks.authenticateApiKey,
+  // i4 deleted the flag-ignoring authenticator; the route now uses the one
+  // surface-aware entry point. These cases still describe the Convex leg,
+  // which is what `KITH_POSTGRES_SURFACE` defaults to.
+  authenticateApiKey: mocks.authenticateApiKey,
 }));
 vi.mock("@/lib/mcp/convex-auth", () => ({
   createConvexMcpToken: mocks.createConvexMcpToken,
@@ -51,6 +54,11 @@ function request(
 describe("POST /api/worker", () => {
   beforeEach(() => {
     vi.resetAllMocks();
+    // Pinned, not inherited. Since i4 this route reads the surface flag, so a
+    // process that exports KITH_POSTGRES_SURFACE=postgres (the store suites do)
+    // would send every case below down the PostgreSQL path and fail it for the
+    // wrong reason. These cases are the Convex leg.
+    vi.stubEnv("KITH_POSTGRES_SURFACE", "convex");
     vi.stubEnv("NEXT_PUBLIC_CONVEX_URL", "https://example.convex.cloud");
     mocks.authenticateApiKey.mockResolvedValue({
       userId: "user-1",
