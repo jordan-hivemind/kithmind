@@ -1,0 +1,411 @@
+name: Cutover
+
+# The executable form of docs/plans/2026-09-12-postgres-consolidation.md
+# section 3, steps 1 to 8 plus the load half of step 9. One manual run takes the
+# Convex export, transforms it, audits it, loads it into a throwaway database,
+# proves parity, and in `live` mode loads it into the hosted archive database
+# beside `finance`.
+#
+# Why a workflow rather than an agent session or a laptop. The Convex deploy key
+# and the hosted database URL are GitHub and Vercel secrets; they are not in any
+# agent session and must not be. The exported data is the owner's whole archive:
+# it must not pass through a chat, and it must not be published as an artifact of
+# a public repository. A `workflow_dispatch` job keeps the secrets in the runner,
+# keeps the data on the runner's disk, uploads only counts, hashes, constraint
+# names and parity verdicts, and leaves the owner two actions: add one secret,
+# click run. See docs/plans/2026-09-16-cutover-runbook.md.
+#
+# The `finance` schema is never written by this workflow. Nothing here runs a
+# finance migration, an import or any statement other than `SELECT` against it,
+# and `live` mode proves it by capturing `finance.schema_version` and every
+# `finance` table row count before and after the load and asserting they are
+# identical. `scripts/cutover-host-check.mjs` does that reading inside a
+# `BEGIN READ ONLY` transaction, so a mistake is refused by the server.
+#
+# Convex is never written either: `convex export` is the only Convex command
+# here. Step 9's remaining half (quiesce, deploy, sign in, restart, post-cutover
+# checks) stays manual and is written down in the runbook.
+#
+# There is no `skip_export` input. Re-running the later steps on an earlier
+# run's export would need that export to survive between runs, and a
+# `workflow_dispatch` runner is destroyed at the end of the job. The only places
+# it could survive are an artifact or the Actions cache, and both are readable by
+# anyone who can read this public repository. Staging the owner's archive in
+# either of them to save one export is not a trade worth making, so the export
+# runs every time.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "rehearsal loads only a throwaway database; live also loads the hosted archive database"
+        type: choice
+        options:
+          - rehearsal
+          - live
+        default: rehearsal
+        required: true
+      confirm:
+        description: "For live only: type exactly `load into the live archive database`"
+        type: string
+        default: ""
+        required: false
+
+# One cutover at a time, and never cancelled mid-load: a run interrupted between
+# the live load and its parity check leaves a half-answered question.
+concurrency:
+  group: cutover
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  cutover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    services:
+      # The same image and options as ci.yml's `verify` job: pgvector, not plain
+      # postgres, because `kith` migration 015 creates the `vector` extension and
+      # the schema does not apply without it. This container is the throwaway
+      # destination for step 3.5's audit and step 4's load. In `live` mode it is
+      # still where the audit and the isolated load run; the live database is
+      # touched only by step 8.
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    env:
+      MODE: ${{ inputs.mode }}
+      THROWAWAY_ADMIN_URL: postgres://postgres:postgres@localhost:5432/postgres
+      AUDIT_DATABASE: cutover_audit
+      ISOLATED_DATABASE: cutover_isolated
+
+    steps:
+      # 0. The gate. Nothing above this step touches the repository, the
+      # secrets or a database, so a wrong mode or a missing secret costs one
+      # failed step and no state.
+      - id: guard
+        name: Check the mode, the confirmation string and the required secrets
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+          HAS_CONVEX_DEPLOY_KEY: ${{ secrets.CONVEX_DEPLOY_KEY != '' }}
+          HAS_MIGRATION_DATABASE_URL: ${{ secrets.KITH_MIGRATION_DATABASE_URL != '' }}
+        run: |
+          echo "mode: $MODE"
+          if [ "$HAS_CONVEX_DEPLOY_KEY" != "true" ]; then
+            echo "::error::The repository secret CONVEX_DEPLOY_KEY is not set. Both modes need it to export Convex." >&2
+            exit 1
+          fi
+          if [ "$MODE" = "live" ]; then
+            if [ "$CONFIRM" != "load into the live archive database" ]; then
+              echo "::error::live mode requires the confirm input to be exactly: load into the live archive database" >&2
+              exit 1
+            fi
+            if [ "$HAS_MIGRATION_DATABASE_URL" != "true" ]; then
+              echo "::error::The repository secret KITH_MIGRATION_DATABASE_URL is not set. live mode needs it to load the hosted archive database." >&2
+              exit 1
+            fi
+          elif [ -n "$CONFIRM" ]; then
+            echo "::notice::rehearsal mode ignores the confirm input."
+          fi
+          echo "guard passed"
+
+      - id: checkout
+        name: Check out the revision to run
+        uses: actions/checkout@v4
+
+      - id: pnpm
+        name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.20.0
+
+      - id: node
+        name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      # 1. Preflight. Plan step 1's local half: what code is running, on what
+      # runtime, at what `kith` schema version. The host half of step 1 runs in
+      # the `host_before` step below, against the real host, in live mode only.
+      - id: preflight
+        name: Preflight and build
+        run: |
+          echo "revision: $GITHUB_SHA"
+          echo "mode: $MODE"
+          echo "node: $(node --version)"
+          echo "pnpm: $(pnpm --version)"
+          pnpm install --frozen-lockfile
+          # Builds @repo/kith-migrate and, through turbo's `^build`, every
+          # workspace package its CLI imports: @repo/kith-store (the migrations,
+          # the pool and the documents read surface), @repo/pg,
+          # @repo/finance-contract and @repo/worker-protocol.
+          pnpm --filter @repo/kith-migrate build
+          STAGE="$RUNNER_TEMP/cutover"
+          # Step 2's acceptance: the staging directory is mode 700. Every file
+          # written into it is 600, either by `exportConvexData` and the
+          # transform themselves or by the `umask` below.
+          umask 077
+          install -d -m 700 "$STAGE" "$STAGE/reports"
+          {
+            echo "STAGE=$STAGE"
+            echo "REPORTS=$STAGE/reports"
+            echo "KITH_MIGRATE=$GITHUB_WORKSPACE/packages/kith-migrate/dist/cli.js"
+          } >> "$GITHUB_ENV"
+          SCHEMA_VERSION="$(node --input-type=module -e \
+            'const m = await import(process.argv[1]); process.stdout.write(String(m.KITH_SCHEMA_VERSION));' \
+            "$GITHUB_WORKSPACE/packages/kith-store/dist/schema.js")"
+          echo "kith schema version: $SCHEMA_VERSION"
+          echo "SCHEMA_VERSION=$SCHEMA_VERSION" >> "$GITHUB_ENV"
+
+      # The loader shells out to `psql \copy`, and the runner image ships the 16
+      # client against a 17 server. Same install, same key, same source as
+      # ci.yml's `verify` job.
+      - id: postgres_client
+        name: Install the PostgreSQL 17 client
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl --fail --silent --show-error \
+            -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+          psql --version
+
+      # 2. Export Convex. The native ZIP with file storage, per plan step 2, then
+      # the per-table JSONL and the manifest.
+      #
+      # `pnpm -F @repo/db exec convex` rather than `npx convex`: the same CLI,
+      # from the version this repository already pins, the same way
+      # deploy-convex.yml reaches it. `npx` would resolve a version nobody chose.
+      #
+      # The ZIP does not leave the runner. It is the immutable export only for
+      # the length of this job; the retained, dated, encrypted export is the
+      # owner's backup recipe, not this workflow.
+      - id: export_convex
+        name: Export the Convex production deployment
+        env:
+          CONVEX_DEPLOY_KEY: ${{ secrets.CONVEX_DEPLOY_KEY }}
+        run: |
+          umask 077
+          pnpm -F @repo/db exec convex export --prod --include-file-storage \
+            --path "$STAGE/convex-export.zip"
+          chmod 600 "$STAGE/convex-export.zip"
+          # Size only. Never `ls` or `unzip -l` the archive: a file name in a
+          # Convex `_storage` listing is row data, and this log is public.
+          echo "export size: $(stat -c %s "$STAGE/convex-export.zip") bytes"
+
+      - id: export_stage
+        name: Stage the export as per-table JSONL with a manifest
+        run: |
+          umask 077
+          # `--deployment-identity redacted`, not the deployment slug: the
+          # manifest is published in the reports artifact and the slug names the
+          # owner's deployment. The deploy key is never passed here at all.
+          node "$KITH_MIGRATE" export \
+            --source "$STAGE/convex-export.zip" \
+            --out "$STAGE/export" \
+            --deployment-identity redacted \
+            --schema-version "$SCHEMA_VERSION" \
+            --git-revision "$GITHUB_SHA" \
+            > "$REPORTS/manifest.json"
+          # The manifest is counts, byte lengths and hashes. Step 2's acceptance
+          # says it is the record of the export, so it is printed and published.
+          cat "$REPORTS/manifest.json"
+
+      - id: export_verify
+        name: Verify the export manifest
+        run: |
+          umask 077
+          node "$KITH_MIGRATE" export --verify-manifest --dir "$STAGE/export" \
+            > "$REPORTS/manifest-verification.json"
+          cat "$REPORTS/manifest-verification.json"
+
+      # 3. Transform. No `--report-unmapped`: the default is the hard failure
+      # plan step 3's acceptance asks for.
+      - id: transform
+        name: Transform the export into COPY-ready CSV
+        run: |
+          umask 077
+          node "$KITH_MIGRATE" transform --export "$STAGE/export" --out "$STAGE/csv" > /dev/null
+          cp "$STAGE/csv/transform-report.json" "$REPORTS/transform-report.json"
+          node -e 'const r = require(process.argv[1]); console.log(JSON.stringify({tables: Object.keys(r.rowCounts).length, rows: Object.values(r.rowCounts).reduce((a,b)=>a+b,0), childRows: Object.values(r.childRowCounts).reduce((a,b)=>a+b,0), retainedTextHashes: r.retainedTextHashes.length, unmapped: r.unmapped}));' \
+            "$REPORTS/transform-report.json"
+
+      # 3.5. Audit, against a throwaway database in the service container. In
+      # live mode too: the audit applies the whole `kith` schema and a staging
+      # schema of its own, which is not something to do to the live database.
+      - id: audit
+        name: Audit the transformed rows against the kith constraints
+        run: |
+          umask 077
+          psql "$THROWAWAY_ADMIN_URL" -X -q -c "CREATE DATABASE $AUDIT_DATABASE"
+          AUDIT_URL="postgres://postgres:postgres@localhost:5432/$AUDIT_DATABASE"
+          # stdout goes to a file, not the log: a violation's detail quotes the
+          # offending column value out of a real row, and this log is public.
+          # The exit status is kept and re-raised after the redacted report is
+          # written, so a failing audit still reports every violation it found.
+          status=0
+          node "$KITH_MIGRATE" audit --csv "$STAGE/csv" --database-url "$AUDIT_URL" \
+            > "$STAGE/audit-stdout.json" || status=$?
+          cp "$STAGE/csv/audit-report.json" "$STAGE/audit-report.json" 2>/dev/null || true
+          node "$GITHUB_WORKSPACE/scripts/cutover-report.mjs" redact --staging "$STAGE" --reports "$REPORTS"
+          if [ -f "$REPORTS/audit-report.json" ]; then
+            node -e 'const r = require(process.argv[1]); console.log(JSON.stringify({ok: r.ok, violations: r.violationCount, byConstraint: r.violationsByConstraint, skipped: r.skipped.length}));' \
+              "$REPORTS/audit-report.json"
+          else
+            echo "::warning::The audit wrote no report; see the step's failure above."
+          fi
+          if [ "$status" -ne 0 ]; then
+            echo "::error::The audit found constraint violations. The redacted report is in the run's artifact." >&2
+            exit "$status"
+          fi
+
+      # 4. Load into an isolated destination. Never the live database.
+      - id: load_isolated
+        name: Load the CSV into the throwaway database
+        run: |
+          psql "$THROWAWAY_ADMIN_URL" -X -q -c "CREATE DATABASE $ISOLATED_DATABASE"
+          node "$KITH_MIGRATE" load --csv "$STAGE/csv" \
+            --database-url "postgres://postgres:postgres@localhost:5432/$ISOLATED_DATABASE"
+
+      # 5. Parity, against the isolated destination. The CLI exits non-zero on
+      # any failing check, so `set -e` is the gate.
+      - id: parity_isolated
+        name: Run the parity checks against the throwaway database
+        run: |
+          umask 077
+          node "$KITH_MIGRATE" parity \
+            --database-url "postgres://postgres:postgres@localhost:5432/$ISOLATED_DATABASE" \
+            --export "$STAGE/export" \
+            --csv "$STAGE/csv" \
+            > "$REPORTS/parity-isolated.json"
+          node -e 'const r = require(process.argv[1]); console.log(JSON.stringify({ok: r.ok, results: r.results.map(x=>`${x.name}:${x.status}`)}));' \
+            "$REPORTS/parity-isolated.json"
+
+      # 10, rehearsal half. The two halves of the backup proof that need no
+      # credential this run does not already hold: the per-relation parity
+      # capture and the sampled cited answer, both against the loaded throwaway.
+      # The dated encrypted dump and the isolated restore need `age`, `restic`
+      # and the owner's protected backup config; the script names that in the
+      # report rather than passing silently.
+      - id: rehearsal_proof
+        name: Capture the backup-shape parity and a sampled cited answer
+        if: inputs.mode == 'rehearsal'
+        env:
+          KITH_CUTOVER_DATABASE_URL: postgres://postgres:postgres@localhost:5432/${{ env.ISOLATED_DATABASE }}
+        run: |
+          umask 077
+          node "$GITHUB_WORKSPACE/scripts/cutover-rehearsal-proof.mjs" --out "$STAGE/rehearsal-proof.json"
+          node "$GITHUB_WORKSPACE/scripts/cutover-report.mjs" redact --staging "$STAGE" --reports "$REPORTS"
+
+      # 1, host half, and step 8's "before". Live only. Read-only: this is the
+      # last chance to find out that the host is not what anyone thought before
+      # a single row is written.
+      - id: host_before
+        name: Verify the live host and capture the finance baseline
+        if: inputs.mode == 'live'
+        env:
+          KITH_CUTOVER_DATABASE_URL: ${{ secrets.KITH_MIGRATION_DATABASE_URL }}
+        run: |
+          umask 077
+          # Defensive masking. GitHub masks the secret itself; it does not mask
+          # the host, user, password or database name taken out of it, and a
+          # `psql` or `pg` error message can quote any of them.
+          node -e 'const u = new URL(process.env.KITH_CUTOVER_DATABASE_URL); for (const v of [u.hostname, u.username, u.password, u.pathname.slice(1)]) if (v) console.log("::add-mask::" + v);'
+          # `--expect-empty-kith`: a `kith` schema that already holds rows means
+          # a load already ran, and loading again would duplicate the archive.
+          node "$GITHUB_WORKSPACE/scripts/cutover-host-check.mjs" capture \
+            --out "$REPORTS/host-before.json" --expect-empty-kith > /dev/null
+          node -e 'const r = require(process.argv[1]); console.log(JSON.stringify({ok: r.ok, server: r.server, vector: r.vector, kithVersion: r.kith.schemaVersion, kithExpected: r.kith.expectedVersion, readerRole: r.kith.readerRolePresent, readerReadOnly: r.kith.readerRoleReadOnly, financeVersion: r.finance.schemaVersion, financeTables: r.finance.tables.length, problems: r.problems}));' \
+            "$REPORTS/host-before.json"
+
+      # 8. The live load. Everything above it is green by the time this runs:
+      # `steps.<id>.conclusion` is not consulted because a failed step already
+      # failed the job.
+      - id: load_live
+        name: Load the CSV into the live archive database
+        if: inputs.mode == 'live'
+        env:
+          KITH_MIGRATION_DATABASE_URL: ${{ secrets.KITH_MIGRATION_DATABASE_URL }}
+        run: |
+          node -e 'const u = new URL(process.env.KITH_MIGRATION_DATABASE_URL); for (const v of [u.hostname, u.username, u.password, u.pathname.slice(1)]) if (v) console.log("::add-mask::" + v);'
+          # `loadCsvDirectory` applies the `kith` migrations and COPY-loads every
+          # CSV in one transaction with the foreign keys deferred to COMMIT. It
+          # creates and writes `kith` only. No statement it runs names `finance`.
+          node "$KITH_MIGRATE" load --csv "$STAGE/csv" \
+            --database-url "$KITH_MIGRATION_DATABASE_URL"
+
+      - id: parity_live
+        name: Rerun the parity checks against the live archive database
+        if: inputs.mode == 'live'
+        env:
+          KITH_MIGRATION_DATABASE_URL: ${{ secrets.KITH_MIGRATION_DATABASE_URL }}
+        run: |
+          umask 077
+          node -e 'const u = new URL(process.env.KITH_MIGRATION_DATABASE_URL); for (const v of [u.hostname, u.username, u.password, u.pathname.slice(1)]) if (v) console.log("::add-mask::" + v);'
+          node "$KITH_MIGRATE" parity \
+            --database-url "$KITH_MIGRATION_DATABASE_URL" \
+            --export "$STAGE/export" \
+            --csv "$STAGE/csv" \
+            > "$REPORTS/parity-live.json"
+          node -e 'const r = require(process.argv[1]); console.log(JSON.stringify({ok: r.ok, results: r.results.map(x=>`${x.name}:${x.status}`)}));' \
+            "$REPORTS/parity-live.json"
+
+      # Step 8's other acceptance line. The comparison is the proof that this
+      # workflow did not write `finance`: same schema version, same row count in
+      # every table, before and after the load.
+      - id: finance_unchanged
+        name: Assert finance is unchanged before and after the load
+        if: inputs.mode == 'live'
+        env:
+          KITH_CUTOVER_DATABASE_URL: ${{ secrets.KITH_MIGRATION_DATABASE_URL }}
+        run: |
+          umask 077
+          node -e 'const u = new URL(process.env.KITH_CUTOVER_DATABASE_URL); for (const v of [u.hostname, u.username, u.password, u.pathname.slice(1)]) if (v) console.log("::add-mask::" + v);'
+          node "$GITHUB_WORKSPACE/scripts/cutover-host-check.mjs" capture \
+            --out "$STAGE/host-after.json" > /dev/null
+          node "$GITHUB_WORKSPACE/scripts/cutover-host-check.mjs" compare \
+            --before "$REPORTS/host-before.json" \
+            --after "$STAGE/host-after.json" \
+            --out "$REPORTS/finance-comparison.json"
+
+      - id: summary
+        name: Write the run summary
+        if: always() && steps.preflight.conclusion == 'success'
+        run: |
+          node "$GITHUB_WORKSPACE/scripts/cutover-report.mjs" summary \
+            --reports "$REPORTS" \
+            --mode "$MODE" \
+            --run "$GITHUB_RUN_ID" \
+            --revision "$GITHUB_SHA" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # Reports only. The export, the ZIP and the CSV directory stay on the
+      # runner and die with it: this repository is public, so an artifact is a
+      # publication. What is uploaded is counts, byte lengths, hashes,
+      # constraint names, parity verdicts and the finance comparison, with the
+      # audit's offending values already redacted by the `audit` step.
+      - id: upload_reports
+        name: Upload the JSON reports
+        if: always() && steps.preflight.conclusion == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cutover-${{ inputs.mode }}-${{ github.run_id }}
+          path: ${{ env.REPORTS }}
+          if-no-files-found: warn
+          retention-days: 30
