@@ -233,7 +233,13 @@ export function authRateLimiter(): AuthRateLimiter {
  *     whatever entries it likes, but the last hop is the address of whoever
  *     connected to the edge itself, because that is the one entry the client
  *     never gets to write. Vercel also sets `x-real-ip` directly from the
- *     edge, as a single value rather than a chain.
+ *     edge, as a single value rather than a chain. Vercel's request-headers
+ *     documentation (https://vercel.com/docs/headers/request-headers) states
+ *     that on Vercel `x-real-ip` is identical to `x-forwarded-for`: the
+ *     platform sets both from the connecting client's address, so the
+ *     rightmost `x-forwarded-for` entry this function reads and the
+ *     `x-real-ip` value it falls back to are the same platform-set fact,
+ *     read two ways.
  *   - Locally (`pnpm dev`, a bare `node` process, this file's own tests)
  *     there is no proxy in front of the app at all, so neither header is
  *     trustworthy and a present one is exactly as attacker-controlled as an
