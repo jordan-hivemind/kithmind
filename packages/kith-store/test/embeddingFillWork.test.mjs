@@ -17,7 +17,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createKithPool, withKithTransaction } from "../dist/index.js";
+import {
+  createKithPool,
+  KITH_SERIALIZATION_ATTEMPTS,
+  withKithTransaction,
+} from "../dist/index.js";
 import {
   createRegistry,
   defaultRegistry,
@@ -223,17 +227,27 @@ test(
     const f = await poolFixture(t);
     const space = await seedCountedSpace(f);
     // The dedupe read and insert are now part of the capture's own
-    // `SERIALIZABLE` transaction, so six captures racing into one space
-    // contend on the same index range. `withKithTransaction`'s bounded retry
-    // is what makes that converge rather than fail; this pins that it does,
-    // because a capture that threw under concurrency would be a regression
-    // the single-writer tests above could not see.
-    const ids = await Promise.all(
-      [0, 1, 2, 3, 4, 5].map((n) =>
-        capture(f, space, `memory ${n}`, NOW + n),
-      ),
+    // `SERIALIZABLE` transaction, and every capture into one space also locks
+    // that space's embedding-state row, so captures racing into one space
+    // contend on both. `withKithTransaction`'s bounded retry is what makes
+    // that converge rather than fail; this pins that it does, because a
+    // capture that threw under concurrency would be a regression the
+    // single-writer tests above could not see.
+    //
+    // Exactly `KITH_SERIALIZATION_ATTEMPTS` writers, not more. A writer fails
+    // an attempt only because another writer committed after its snapshot,
+    // and each writer commits once, so N racing writers cost the unluckiest
+    // one at most N - 1 failures and N attempts. That is the convergence the
+    // budget guarantees; one writer past it can lose every round and
+    // legitimately exhaust the budget, which is what CI saw with six.
+    const writers = Array.from(
+      { length: KITH_SERIALIZATION_ATTEMPTS },
+      (_, n) => n,
     );
-    assert.equal(new Set(ids).size, 6);
+    const ids = await Promise.all(
+      writers.map((n) => capture(f, space, `memory ${n}`, NOW + n)),
+    );
+    assert.equal(new Set(ids).size, writers.length);
     const jobs = await fillJobs(f, space.spaceId);
     assert.equal(jobs.length, 1);
   },
