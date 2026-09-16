@@ -148,6 +148,11 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
     name: "inline ingestion: work, receipt, rate limit and fetch request indexes (P2-39e2)",
     url: new URL("../migrations/018_inline_ingestion.sql", import.meta.url),
   },
+  {
+    version: 19,
+    name: "auth_rate_limits: the durable table for the web session's sign-in/sign-up limiter (P2-39i follow-up)",
+    url: new URL("../migrations/019_auth_rate_limits.sql", import.meta.url),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */
