@@ -12,6 +12,7 @@
 
 import { useMemo, useState } from "react";
 
+import { WorkerHeartbeatStatus } from "@/components/kith-worker-heartbeat-status";
 import {
   type GrantableSpace,
   type KeyCapability,
@@ -456,10 +457,7 @@ function SourceAccountsSection({
                     Edit
                   </button>
                   {account.connector === "fs" && (
-                    <p style={{ color: "#666", fontSize: 13 }}>
-                      Worker heartbeat status is not available on this surface
-                      yet.
-                    </p>
+                    <WorkerHeartbeatStatus sourceAccountId={account.id} />
                   )}
                 </>
               )}

@@ -12,8 +12,11 @@
 // read side. `guardedRequest` below is the part of that rule that is common
 // to every request regardless of what it does once authenticated.
 
-import { ProofError } from "@repo/kith-store";
-import { withKithReadTransaction, withKithTransaction } from "@repo/kith-store";
+import {
+  ProofError,
+  withKithReadTransaction,
+  withKithTransaction,
+} from "@repo/kith-store";
 import {
   type IdentityCtx,
   identityCtx,
@@ -22,6 +25,7 @@ import {
   requireWebPrincipal,
 } from "@repo/kith-store/identity";
 
+import { kithNow } from "@/lib/kith/clock";
 import { kithPool } from "@/lib/kith/pool";
 import { kithSessionConfig } from "@/lib/kith/session";
 import { kithPostgresSurface } from "@/lib/kith/surface";
@@ -155,9 +159,18 @@ export async function withPrincipal(
 }
 
 /**
- * The read counterpart of `withPrincipal`, for the one `/api/kith/*` route
- * that reads rather than writes (`thoughts/search`). Same gate, same
- * denial mapping, `withKithReadTransaction` instead of `withKithTransaction`.
+ * The read counterpart of `withPrincipal`: same gate (surface, origin,
+ * content type), same denial mapping, `withKithReadTransaction` instead of
+ * `withKithTransaction`. Two callers share it -- the one `/api/kith/*` route
+ * that reads rather than writes (`thoughts/search`, because the search text
+ * must not travel in the URL -- see `lib/kith/browse.ts`) and i6's
+ * `app/api/status/*` routes, which need the same session check and the same
+ * `Cache-Control: no-store` shape but never write.
+ *
+ * `ctx.now` comes from `kithNow()` rather than a bare `Date.now()` default,
+ * so a caller that needs a fixed clock for a read-time predicate
+ * (`lib/kith/clock.ts`'s `setKithNow`, which i6's worker-status route uses)
+ * can get one without this function knowing it is under test.
  */
 export async function withPrincipalRead(
   request: Request,
@@ -168,7 +181,7 @@ export async function withPrincipalRead(
   try {
     const config = kithSessionConfig();
     return await withKithReadTransaction(kithPool(), async (client) => {
-      const ctx = identityCtx(client);
+      const ctx = identityCtx(client, kithNow());
       const principal = await requireWebPrincipal(ctx, {
         config,
         cookieHeader: request.headers.get("cookie"),

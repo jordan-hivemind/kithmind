@@ -1,5 +1,9 @@
 "use client";
 
+// The Convex-backed worker heartbeat status. Unchanged behavior, renamed from
+// `worker-heartbeat-status.tsx` so it can sit beside
+// `kith-worker-heartbeat-status.tsx` (i6); i7 deletes this.
+
 import { api } from "@repo/db/convex/_generated/api";
 import type { Id } from "@repo/db/convex/_generated/dataModel";
 import { useQuery } from "convex/react";
