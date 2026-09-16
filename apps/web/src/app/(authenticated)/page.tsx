@@ -4,7 +4,10 @@
 // Under `postgres` it loads `stats` and `recent` from one read-only
 // transaction (`loadDashboard`, which checks the session itself rather than
 // trusting the `(authenticated)` layout above it) and hands them to
-// `KithDashboard`, a server component with no Convex import.
+// `KithDashboard` as that component's initial poll value (i6): the first
+// paint comes from this server component and every ten-second refresh after
+// it comes from `GET /api/status/dashboard`, which calls the same
+// `loadDashboard`. `KithDashboard` imports nothing from Convex.
 
 import { headers } from "next/headers";
 import { redirect } from "next/navigation";

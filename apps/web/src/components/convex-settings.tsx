@@ -15,11 +15,11 @@ import {
 import Link from "next/link";
 import { Component, useEffect, useMemo, useState } from "react";
 
+import { WorkerHeartbeatStatus } from "@/components/convex-worker-heartbeat-status";
 import {
   type KeyCapability,
   SpaceGrantPicker,
 } from "@/components/space-grant-picker";
-import { WorkerHeartbeatStatus } from "@/components/worker-heartbeat-status";
 import { sourceAccountGrantsForCapabilities } from "@/lib/api-key-scopes";
 
 const settingsCapabilities: readonly KeyCapability[] = [

@@ -1,6 +1,14 @@
-// The PostgreSQL dashboard. A server component: `app/(authenticated)/page.tsx`
-// already loaded `stats` and `recent` from one read-only transaction, so this
-// file only renders them. It imports nothing from Convex.
+"use client";
+
+// The PostgreSQL dashboard. `app/(authenticated)/page.tsx` loads `stats` and
+// `recent` from one read-only transaction for the first paint and passes
+// them in as this component's initial poll value; from there this component
+// polls `GET /api/status/dashboard` every 10 seconds for a refresh (plan
+// section 5's live-surface design, wired in by i6), through the same
+// `useStatusPoll` hook `kith-worker-heartbeat-status.tsx` uses. A failed poll
+// keeps the last good stats and thoughts and marks them possibly stale rather
+// than blanking the page -- see that hook and `lib/kith/poll.ts` for why.
+// This file imports nothing from Convex.
 //
 // Quick Capture is not ported here. The Convex version's capture button calls
 // `thoughts.publicActions.capture`, which classifies raw text into a thought
@@ -10,17 +18,39 @@
 // takes metadata that is already classified). The section stays visible so the
 // gap is legible, not silently dropped.
 
-import type { memory } from "@repo/kith-store";
-
 import { ThoughtCard } from "@/features/thoughts/components/ThoughtCard";
+import { useStatusPoll } from "@/lib/kith/use-status-poll";
 
-export function KithDashboard({
-  stats,
-  recent,
-}: {
-  stats: memory.SpaceStats;
-  recent: readonly memory.Thought[];
-}) {
+type DashboardStats = {
+  totalFacts: number;
+  totalThoughts: number;
+  byType: Array<{ type: string; count: number }>;
+};
+
+type DashboardThought = {
+  id: string;
+  content: string;
+  createdAt: number;
+  metadata: {
+    type: string;
+    topics: readonly string[];
+    people: readonly string[];
+    actionItems: readonly string[];
+    summary: string;
+  };
+};
+
+type DashboardData = {
+  stats: DashboardStats;
+  recent: readonly DashboardThought[];
+};
+
+export function KithDashboard({ stats, recent }: DashboardData) {
+  const { value: data, possiblyStale } = useStatusPoll<DashboardData>(
+    "/api/status/dashboard",
+    { stats, recent },
+  );
+
   return (
     <div>
       <h1>Dashboard</h1>
@@ -29,7 +59,7 @@ export function KithDashboard({
         style={{
           display: "flex",
           gap: 24,
-          marginBottom: 24,
+          marginBottom: 8,
           flexWrap: "wrap",
         }}
       >
@@ -42,7 +72,7 @@ export function KithDashboard({
           }}
         >
           <div style={{ fontSize: 32, fontWeight: "bold" }}>
-            {stats.totalFacts}
+            {data.stats.totalFacts}
           </div>
           <div style={{ color: "#666" }}>facts</div>
         </div>
@@ -55,11 +85,11 @@ export function KithDashboard({
           }}
         >
           <div style={{ fontSize: 32, fontWeight: "bold" }}>
-            {stats.totalThoughts}
+            {data.stats.totalThoughts}
           </div>
           <div style={{ color: "#666" }}>thoughts</div>
         </div>
-        {stats.byType.slice(0, 3).map((t) => (
+        {data.stats.byType.slice(0, 3).map((t) => (
           <div
             key={t.type}
             style={{
@@ -74,6 +104,11 @@ export function KithDashboard({
           </div>
         ))}
       </div>
+      {possiblyStale && (
+        <p style={{ color: "#666", fontSize: 13, marginTop: 0 }}>
+          Could not refresh just now; showing the last known values.
+        </p>
+      )}
 
       <div
         style={{
@@ -81,6 +116,7 @@ export function KithDashboard({
           borderRadius: 8,
           padding: 16,
           backgroundColor: "#fafafa",
+          marginTop: 16,
         }}
       >
         <h3 style={{ marginTop: 0 }}>Quick Capture</h3>
@@ -92,7 +128,7 @@ export function KithDashboard({
       </div>
 
       <h2 style={{ marginTop: 32 }}>Recent Thoughts</h2>
-      {recent.length === 0 ? (
+      {data.recent.length === 0 ? (
         <p style={{ color: "#666" }}>
           No thoughts yet. Connect an AI client via MCP to capture one.{" "}
           <a href="/getting-started" style={{ color: "#0070f3" }}>
@@ -102,7 +138,7 @@ export function KithDashboard({
         </p>
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-          {recent.map((thought) => (
+          {data.recent.map((thought) => (
             <ThoughtCard
               key={thought.id}
               thought={{
