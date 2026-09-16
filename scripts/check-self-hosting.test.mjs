@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 import {
   formatIssues,
   parseArguments,
+  POSTGRES_WEB_REQUIRED_VARIABLES,
   validateConvexVariableNames,
   validateWebEnvironment,
 } from "./check-self-hosting.mjs";
@@ -149,6 +150,91 @@ test("formatted output cannot include a rejected secret value", () => {
   );
   assert.match(output, /web: invalid MCP_JWT_PRIVATE_JWK/u);
   assert.doesNotMatch(output, new RegExp(secretValue, "u"));
+});
+
+function validPostgresWebEnvironment() {
+  return {
+    KITH_POSTGRES_SURFACE: "postgres",
+    NEXT_PUBLIC_CONVEX_URL: "https://example.convex.cloud",
+    MCP_PUBLIC_ORIGIN: "https://brain.example.test",
+    MCP_OAUTH_ENCRYPTION_KEY: "A".repeat(43),
+    KITH_DATABASE_URL: "postgres://app@127.0.0.1:5432/kith",
+    KITH_SESSION_SECRET: "s".repeat(32),
+  };
+}
+
+test("web preflight under the postgres surface accepts complete configuration", () => {
+  assert.deepEqual(validateWebEnvironment(validPostgresWebEnvironment()), []);
+});
+
+test("web preflight under the postgres surface does not require the JWT bridge", () => {
+  const environment = validPostgresWebEnvironment();
+  // None of the four `MCP_JWT_*` names are set; the postgres surface must not
+  // report any of them missing, unlike the convex-era default.
+  assert.deepEqual(validateWebEnvironment(environment), []);
+});
+
+test("web preflight under the postgres surface reports its own missing variables", () => {
+  assert.deepEqual(
+    validateWebEnvironment({ KITH_POSTGRES_SURFACE: "postgres" }),
+    POSTGRES_WEB_REQUIRED_VARIABLES.map((name) => ({
+      name,
+      problem: "missing",
+    })),
+  );
+});
+
+test("web preflight under the postgres surface rejects malformed values", () => {
+  const environment = validPostgresWebEnvironment();
+  environment.MCP_PUBLIC_ORIGIN = "http://public.example.test";
+  environment.KITH_DATABASE_URL = "https://not-a-postgres-url.example.test";
+  environment.KITH_SESSION_SECRET = "too-short";
+  environment.MCP_OAUTH_ENCRYPTION_KEY = "short";
+
+  assert.deepEqual(validateWebEnvironment(environment), [
+    { name: "MCP_PUBLIC_ORIGIN", problem: "invalid" },
+    { name: "KITH_DATABASE_URL", problem: "invalid" },
+    { name: "KITH_SESSION_SECRET", problem: "invalid" },
+    { name: "MCP_OAUTH_ENCRYPTION_KEY", problem: "invalid" },
+  ]);
+});
+
+test("web preflight under the postgres surface still validates a present JWK's shape", () => {
+  const environment = validPostgresWebEnvironment();
+  environment.MCP_JWT_PRIVATE_JWK = "not-json";
+  assert.deepEqual(validateWebEnvironment(environment), [
+    { name: "MCP_JWT_PRIVATE_JWK", problem: "invalid" },
+  ]);
+});
+
+test("web preflight under the postgres surface still validates a present, unread MCP_JWT_ISSUER's shape", () => {
+  const environment = validPostgresWebEnvironment();
+  environment.MCP_JWT_ISSUER = "http://public.example.test";
+  assert.deepEqual(validateWebEnvironment(environment), [
+    { name: "MCP_JWT_ISSUER", problem: "invalid" },
+  ]);
+});
+
+test("an unrecognized surface value falls back to the convex-era required list", () => {
+  const environment = validWebEnvironment();
+  environment.KITH_POSTGRES_SURFACE = "not-a-real-surface";
+  assert.deepEqual(validateWebEnvironment(environment), []);
+});
+
+test("CLI output is ready for a complete postgres environment file", () => {
+  const environment = validPostgresWebEnvironment();
+  const result = spawnSync(
+    process.execPath,
+    [
+      fileURLToPath(new URL("./check-self-hosting.mjs", import.meta.url)),
+      "--web",
+      "--web-env-file",
+      "missing-synthetic-environment-file",
+    ],
+    { encoding: "utf8", env: { ...process.env, ...environment } },
+  );
+  assert.equal(result.status, 0);
+  assert.equal(result.stdout, "profile: full\nweb: ready\n");
 });
 
 test("Convex preflight checks names without needing values", () => {
