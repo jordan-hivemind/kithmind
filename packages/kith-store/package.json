@@ -51,7 +51,15 @@
       "types": "./src/sources/index.ts",
       "node": "./dist/sources/index.js",
       "default": "./src/sources/index.ts"
+    },
+    "./deferred": {
+      "types": "./src/deferred/index.ts",
+      "node": "./dist/deferred/index.js",
+      "default": "./src/deferred/index.ts"
     }
+  },
+  "bin": {
+    "kith-deferred-work": "./dist/deferred/cli.js"
   },
   "scripts": {
     "build": "node ../../scripts/run-package-task.mjs build tsc -p tsconfig.json",

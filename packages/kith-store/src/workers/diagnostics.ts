@@ -6,6 +6,7 @@ import type {
 import type { PrincipalRef } from "../identity/authorization.js";
 
 import { newKithId } from "../ids.js";
+import { sha256Utf8 } from "../provenance/sql.js";
 import { requireWorkerSourceAccount } from "./auth.js";
 import { at, exec, row, rows, type WorkerCtx } from "./db.js";
 import { workerProtocolError } from "./errors.js";
@@ -13,6 +14,8 @@ import { workerProtocolError } from "./errors.js";
 export const WORKER_HEARTBEAT_INTERVAL_MS = 30_000;
 export const WORKER_HEARTBEAT_OVERDUE_MS = 180_000;
 export const WORKER_HEARTBEAT_MIN_WRITE_MS = 5_000;
+/** How many active watchers the daily incident writer inspects per call. */
+export const WORKER_MISSING_INCIDENT_SWEEP_LIMIT = 500;
 
 type Watcher = {
   id: string;
@@ -307,5 +310,297 @@ export async function recordWorkerHeartbeat(
     watcherId: request.watcherId,
     receivedAt,
     nextExpectedAt,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// P2-39j: missing-worker detection, ported as section 2.6 adopts it -- "a
+// read-time predicate over `worker_watcher_states.lastHeartbeatAt`, computed
+// when the UI or `brain doctor` asks" -- plus one daily durable incident
+// record, rather than `models/diagnostics/private.ts` `sweepMissingWorkers`'
+// per-minute `sweepMissingWorkerHeartbeats`. That function inspected active
+// watchers on a `sweepAfter` schedule and opened or re-observed an incident on
+// every pass it found one overdue; it is not ported here, because the plan
+// retires the per-minute cadence itself, not just its implementation. What
+// carries over from it: an incident is `missing_worker`, keyed by
+// `(sourceAccountId, watcherId)`, and a heartbeat resolves the open one
+// (`recordWorkerHeartbeat` above already does that half).
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether an active watcher counts as overdue as of `now`. The boundary is
+ * inclusive of `nextExpectedAt` itself, matching `getWorkerDiagnosticsStatus`
+ * above (`now < nextExpectedAt ? "current" : "overdue"`): a watcher becomes
+ * overdue the instant its expected-by time passes, not one tick later.
+ */
+export function isWatcherOverdue(nextExpectedAt: number, now: number): boolean {
+  return now >= nextExpectedAt;
+}
+
+export type WatcherStaleness =
+  | "not_configured"
+  | "awaiting_heartbeat"
+  | "current"
+  | "overdue";
+
+/**
+ * The read-time predicate itself, over one watcher row (or its absence). This
+ * is what a status route or `brain doctor` calls instead of trusting a
+ * per-minute sweep to have run: a host that is down still reports itself
+ * stale, because nothing here depends on the sweep having executed.
+ */
+export function watcherStaleness(
+  watcher: Pick<Watcher, "state" | "nextExpectedAt"> | undefined,
+  now: number,
+): WatcherStaleness {
+  if (!watcher) return "not_configured";
+  if (watcher.state === "awaiting_heartbeat") return "awaiting_heartbeat";
+  if (!watcher.nextExpectedAt) return "awaiting_heartbeat";
+  return isWatcherOverdue(watcher.nextExpectedAt.getTime(), now)
+    ? "overdue"
+    : "current";
+}
+
+function dayKeyUtc(ms: number): string {
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+export type MissingWorkerIncidentSweepResult = {
+  inspected: number;
+  recorded: number;
+};
+
+/**
+ * The daily durable incident writer: `models/diagnostics/private.ts`
+ * `sweepMissingWorkers`'s replacement, run once a day rather than once a
+ * minute (section 2.6, and `docs/worker-service.md`'s cloud-cron section for
+ * where it actually runs from). For every `active` watcher whose
+ * `nextExpectedAt` is at or past `ctx.now`, writes one `missing_worker`
+ * incident row -- unless one was already opened for that watcher today
+ * (UTC), in which case the watcher is inspected and skipped: "at most one
+ * durable incident row per watcher per day".
+ *
+ * A heartbeat still resolves the open incident immediately
+ * (`recordWorkerHeartbeat`), so this writer's job is narrower than the
+ * per-minute sweep's was: recording that a watcher was missing today, for
+ * alerting, not maintaining an always-current open/resolved state machine.
+ */
+export async function recordMissingWorkerIncidents(
+  ctx: WorkerCtx,
+  options: { limit?: number } = {},
+): Promise<MissingWorkerIncidentSweepResult> {
+  validateNow(ctx.now);
+  const limit = options.limit ?? WORKER_MISSING_INCIDENT_SWEEP_LIMIT;
+  if (!Number.isInteger(limit) || limit < 1 || limit > 5_000) {
+    workerProtocolError("invalid_request");
+  }
+  const overdue = await rows<Record<string, unknown>>(
+    ctx,
+    `SELECT * FROM kith.worker_watcher_states
+       WHERE state = 'active' AND next_expected_at <= $1
+       ORDER BY next_expected_at, id
+       LIMIT $2`,
+    [at(ctx.now), limit],
+  );
+  const todayStart = at(Date.parse(`${dayKeyUtc(ctx.now)}T00:00:00.000Z`));
+  let recorded = 0;
+  for (const raw of overdue) {
+    const watcher = camel(raw) as Watcher;
+    // `worker_operational_incidents_open_idx` allows at most one `open`
+    // incident per source account, the same invariant `openIncident` (above)
+    // already assumes. A source that is already tracked as missing -- from
+    // today or an earlier day the watcher never recovered from -- is touched
+    // rather than duplicated: `observed_at` moves forward so an alert reading
+    // it knows the condition was still true as of this run.
+    const open = await row<{ id: string }>(
+      ctx,
+      `SELECT id FROM kith.worker_operational_incidents
+         WHERE source_account_id = $1 AND state = 'open' LIMIT 1`,
+      [watcher.sourceAccountId],
+    );
+    if (open) {
+      await exec(
+        ctx,
+        "UPDATE kith.worker_operational_incidents SET observed_at = $1 WHERE id = $2",
+        [at(ctx.now), open.id],
+      );
+      continue;
+    }
+    // No incident is open. If one for this watcher was already opened (and,
+    // presumably, resolved by a heartbeat) earlier today, this run does not
+    // reopen it: "at most one durable incident row per watcher per day"
+    // counts the row this loop would otherwise insert, not a bumped
+    // `observed_at` on one that already exists.
+    const openedToday = await row<{ id: string }>(
+      ctx,
+      `SELECT id FROM kith.worker_operational_incidents
+         WHERE source_account_id = $1 AND watcher_id = $2 AND kind = 'missing_worker'
+           AND opened_at >= $3
+         LIMIT 1`,
+      [watcher.sourceAccountId, watcher.watcherId, todayStart],
+    );
+    if (openedToday) continue;
+    await exec(
+      ctx,
+      `INSERT INTO kith.worker_operational_incidents
+         (id, space_id, created_at, source_account_id, watcher_id, kind, state,
+          opened_at, observed_at)
+         VALUES ($1, $2, transaction_timestamp(), $3, $4, 'missing_worker', 'open', $5, $5)`,
+      [newKithId(), watcher.spaceId, watcher.sourceAccountId, watcher.watcherId, at(ctx.now)],
+    );
+    recorded += 1;
+  }
+  return { inspected: overdue.length, recorded };
+}
+
+export type ResetWatcherArgs = {
+  requestId: string;
+  expectedWatcherId: string | null;
+  nextWatcherId: string | null;
+};
+
+export type ResetWatcherResult = {
+  sourceAccountId: string;
+  watcherId: string | null;
+  reused: boolean;
+  changedAt: number;
+};
+
+/**
+ * `models/diagnostics/model.ts` `resetWorkerWatcher`. Ported without its web
+ * caller (`models/diagnostics/public.ts` `resetWatcher`, an owner-only
+ * mutation that resolves `sourceAccountId` through `requireSourceAccountAccess`
+ * and `requireSpaceAccess` before calling this): that authorization belongs to
+ * the route that exposes this to the owner, which is `apps/web` and out of
+ * this package's scope. `account` here is the caller's already-authorized
+ * source account, matching the Convex function's own signature.
+ */
+export async function resetWorkerWatcher(
+  ctx: WorkerCtx,
+  account: { id: string; spaceId: string; enabled: boolean },
+  actorUserId: string,
+  args: ResetWatcherArgs,
+): Promise<ResetWatcherResult> {
+  validateNow(ctx.now);
+  const digest = await sha256Utf8(
+    `worker-watcher-reset:v1\0${JSON.stringify([
+      account.spaceId,
+      account.id,
+      args.requestId,
+      args.expectedWatcherId,
+      args.nextWatcherId,
+    ])}`,
+  );
+  const receipts = await rows<Record<string, unknown>>(
+    ctx,
+    `SELECT * FROM kith.worker_watcher_reset_receipts
+       WHERE source_account_id = $1 AND request_id = $2 LIMIT 2`,
+    [account.id, args.requestId],
+  );
+  if (receipts.length > 1) workerProtocolError("scan_conflict");
+  const current = await watcherForSource(ctx, account.id, true);
+  if (current) {
+    validateWatcher(current, {
+      spaceId: account.spaceId,
+      account: { id: account.id, enabled: account.enabled },
+    });
+  }
+  const currentIncident = await openIncident(ctx, account.id, true);
+  if (currentIncident) {
+    if (!current) workerProtocolError("scan_conflict");
+    validateIncident(
+      currentIncident,
+      { spaceId: account.spaceId, account: { id: account.id } },
+      current.watcherId,
+    );
+  }
+  const prior = receipts[0] ? camel(receipts[0]) : undefined;
+  if (prior) {
+    const priorRow = prior as {
+      spaceId: string;
+      actorUserId: string;
+      requestDigest: string;
+      expectedWatcherId: string | null;
+      nextWatcherId: string | null;
+      changedAt: Date;
+    };
+    if (
+      priorRow.spaceId !== account.spaceId ||
+      priorRow.actorUserId !== actorUserId ||
+      priorRow.requestDigest !== digest ||
+      priorRow.expectedWatcherId !== args.expectedWatcherId ||
+      priorRow.nextWatcherId !== args.nextWatcherId
+    ) {
+      workerProtocolError("request_conflict");
+    }
+    if ((current?.watcherId ?? null) !== args.nextWatcherId) {
+      workerProtocolError("request_conflict");
+    }
+    return {
+      sourceAccountId: account.id,
+      watcherId: args.nextWatcherId,
+      reused: true,
+      changedAt: priorRow.changedAt.getTime(),
+    };
+  }
+  if ((current?.watcherId ?? null) !== args.expectedWatcherId) {
+    workerProtocolError("identity_review_required");
+  }
+  if (current?.watcherId !== args.nextWatcherId) {
+    if (current && currentIncident) {
+      await exec(
+        ctx,
+        "UPDATE kith.worker_operational_incidents SET state = 'resolved', observed_at = $1, resolved_at = $1 WHERE id = $2",
+        [at(ctx.now), currentIncident.id],
+      );
+    }
+    if (args.nextWatcherId === null) {
+      if (current) {
+        await exec(ctx, "DELETE FROM kith.worker_watcher_states WHERE id = $1", [
+          current.id,
+        ]);
+      }
+    } else if (current) {
+      await exec(
+        ctx,
+        `UPDATE kith.worker_watcher_states SET watcher_id = $1, state = 'awaiting_heartbeat',
+          connector_version = NULL, actor_user_id = NULL, actor_credential_id = NULL,
+          last_seen_at = NULL, next_expected_at = NULL, sweep_after = NULL,
+          created_at_field = $2, updated_at = $2 WHERE id = $3`,
+        [args.nextWatcherId, at(ctx.now), current.id],
+      );
+    } else {
+      await exec(
+        ctx,
+        `INSERT INTO kith.worker_watcher_states
+          (id, space_id, created_at, source_account_id, watcher_id, state, created_at_field, updated_at)
+          VALUES ($1, $2, transaction_timestamp(), $3, $4, 'awaiting_heartbeat', $5, $5)`,
+        [newKithId(), account.spaceId, account.id, args.nextWatcherId, at(ctx.now)],
+      );
+    }
+  }
+  await exec(
+    ctx,
+    `INSERT INTO kith.worker_watcher_reset_receipts
+       (id, space_id, created_at, source_account_id, request_id, request_digest,
+        expected_watcher_id, next_watcher_id, actor_user_id, changed_at)
+       VALUES ($1, $2, transaction_timestamp(), $3, $4, $5, $6, $7, $8, $9)`,
+    [
+      newKithId(),
+      account.spaceId,
+      account.id,
+      args.requestId,
+      digest,
+      args.expectedWatcherId,
+      args.nextWatcherId,
+      actorUserId,
+      at(ctx.now),
+    ],
+  );
+  return {
+    sourceAccountId: account.id,
+    watcherId: args.nextWatcherId,
+    reused: false,
+    changedAt: ctx.now,
   };
 }

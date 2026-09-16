@@ -138,6 +138,11 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
     name: "embedding build: generation, target and job constraints, the owed-set index and the scan keysets (P2-39g2)",
     url: new URL("../migrations/016_embedding_build.sql", import.meta.url),
   },
+  {
+    version: 17,
+    name: "deferred work: kith.deferred_work, and diagnostics watcher/incident constraints (P2-39j)",
+    url: new URL("../migrations/017_deferred_work.sql", import.meta.url),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */

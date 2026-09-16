@@ -1,0 +1,55 @@
+Template only: copy the XML below into a real `.plist` file, replace every
+ALL-CAPS placeholder with an absolute path, and follow
+`docs/worker-service.md`'s "Deferred work daemon" section for the Keychain or
+credential wiring the wrapper script needs. No personal path, account name, or
+credential value belongs in this file or its copy.
+
+This mirrors `examples/worker-service/com.kithmind.filesystem-worker.plist`:
+same per-user LaunchAgent shape, same `ThrottleInterval`, same separation of a
+private wrapper script (reads `KITH_STORE_DATABASE_URL` the way the filesystem
+worker's wrapper reads its own credential) from the checked-in plist. Unlike
+the filesystem worker, this daemon takes its own interval as an argument
+(`--interval-ms`) rather than looping inside a `watch` command, so `KeepAlive`
+restarts a process that is meant to run forever either way: `once` per launch
+would need `StartInterval` instead, and `tick --interval-ms` is preferred so
+one long-lived process keeps its own pool warm rather than reconnecting every
+few minutes.
+
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.kithmind.deferred-work</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/ABSOLUTE/PATH/TO/kithmind-deferred-work-watch.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/ABSOLUTE/PATH/TO/REPOSITORY</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>StandardOutPath</key>
+  <string>/ABSOLUTE/PATH/TO/PRIVATE-LOG-DIRECTORY/deferred-work.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/ABSOLUTE/PATH/TO/PRIVATE-LOG-DIRECTORY/deferred-work.stderr.log</string>
+</dict>
+</plist>
+
+The wrapper script this `ProgramArguments` entry names is not templated here
+because it is one line different from the filesystem worker's own
+`macos-keychain-watch.sh`: it exports `KITH_STORE_DATABASE_URL` (from a
+dedicated Keychain item, the same way the existing wrapper reads
+`KITH_WORKER_KEY`) and execs:
+
+  exec /ABSOLUTE/PATH/TO/node /ABSOLUTE/PATH/TO/REPOSITORY/packages/kith-store/dist/deferred/cli.js tick --interval-ms 60000
+
+`--interval-ms 60000` matches the two Convex crons this daemon replaces that
+ran every minute (`recover inline ingestion`, `remove expired worker protocol
+state`); the third, `remove expired OAuth grants`, ran every five minutes in
+Convex and simply runs more often than it needs to here, which costs nothing
+because it is idempotent.
