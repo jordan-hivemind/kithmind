@@ -34,7 +34,9 @@ const token = randomBytes(32).toString("hex");
 describe("the edge session cookie check", () => {
   test("names the same cookie the routes set", () => {
     expect(KITH_SESSION_COOKIE_NAME).toBe(SESSION_COOKIE_NAME);
-    const header = sessionCookie(config, token, Date.now() + 1000).split(";")[0];
+    const header = sessionCookie(config, token, Date.now() + 1000).split(
+      ";",
+    )[0];
     expect(readKithSessionCookie(header)).toBe(
       serializeSessionToken(config, token),
     );
@@ -58,13 +60,10 @@ describe("the edge session cookie check", () => {
       // one valid cookie would have.
       `v1.${randomBytes(32).toString("hex")}.${value.split(".")[2]}`,
       // A signature made with a different key.
-      serializeSessionToken(
-        { secret: randomBytes(32).toString("hex") },
-        token,
-      ),
+      serializeSessionToken({ secret: randomBytes(32).toString("hex") }, token),
       // A flipped character in the MAC, and in the token.
       value.replace(/.$/, (last) => (last === "A" ? "B" : "A")),
-      `v1.${token.replace(/^./, "f")}.${value.split(".")[2]}`,
+      `v1.${token.replace(/^./, (first) => (first === "f" ? "0" : "f"))}.${value.split(".")[2]}`,
       // A version this code does not issue.
       value.replace(/^v1\./, "v2."),
       // Not hex, the right length.
@@ -82,6 +81,29 @@ describe("the edge session cookie check", () => {
         expect(parseSessionToken(config, value)).toBeNull();
       }
     }
+  });
+
+  test("rejects a non-canonical encoding of the real MAC bytes", async () => {
+    // The last base64url character of a 32-byte MAC carries two padding
+    // bits, so another character with the same top two bits decodes to the
+    // same bytes. Find a token whose MAC ends in one of the four such
+    // characters, then present the sibling encoding: same bytes, different
+    // text. The store compares text and refuses it; the edge check must too.
+    let sibling: string | null = null;
+    let value = "";
+    for (let attempt = 0; attempt < 512 && sibling === null; attempt += 1) {
+      const candidate = randomBytes(32).toString("hex");
+      value = serializeSessionToken(config, candidate);
+      const last = value.at(-1)!;
+      const group = "ABCD";
+      if (group.includes(last)) {
+        sibling = value.slice(0, -1) + (last === "A" ? "B" : "A");
+      }
+    }
+    expect(sibling).not.toBeNull();
+    expect(await verifyKithSessionCookie(secret, sibling!)).toBeNull();
+    expect(parseSessionToken(config, sibling!)).toBeNull();
+    expect(await verifyKithSessionCookie(secret, value)).not.toBeNull();
   });
 
   test("rejects every truncation of a valid cookie", async () => {
@@ -113,9 +135,7 @@ describe("the edge session cookie check", () => {
     ).toBe(value);
     // A prefixed or suffixed name is a different cookie, and a subdomain that
     // could set one must not be able to answer for this one.
-    expect(
-      readKithSessionCookie(`x__Host-kith_session=${value}`),
-    ).toBeNull();
+    expect(readKithSessionCookie(`x__Host-kith_session=${value}`)).toBeNull();
     expect(
       readKithSessionCookie(`${SESSION_COOKIE_NAME}_other=${value}`),
     ).toBeNull();

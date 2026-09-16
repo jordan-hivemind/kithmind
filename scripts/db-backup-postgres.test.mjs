@@ -6,9 +6,11 @@ import test from "node:test";
 
 import {
   PostgresBackupError,
+  WRITER_LEASE_TABLES,
   buildManifest,
   loadPostgresBackupConfig,
   loadPostgresVerifyConfig,
+  requireNoActiveWriters,
 } from "./db-backup-postgres.mjs";
 
 const HEX_64 = "a".repeat(64);
@@ -200,6 +202,73 @@ test("loadPostgresVerifyConfig accepts a protected age identity file", async (t)
   );
   const loaded = await loadPostgresVerifyConfig(configPath);
   assert.equal(loaded.ageIdentityPath, identityPath);
+});
+
+// requireNoActiveWriters exercised against a fake query function, not a real
+// database: AGENTS.md's writer-quiescence rule (P2-39k), applied every time
+// the dated-backup postgres engine runs, not only at cutover.
+
+function fakeQuery(counts) {
+  const calls = [];
+  const runQuery = async (sql) => {
+    calls.push(sql);
+    for (const [pattern, count] of Object.entries(counts)) {
+      if (sql.includes(pattern)) return String(count);
+    }
+    return "0";
+  };
+  runQuery.calls = calls;
+  return runQuery;
+}
+
+test("requireNoActiveWriters resolves when nothing is running or leased", async () => {
+  const runQuery = fakeQuery({});
+  await requireNoActiveWriters(runQuery);
+  assert.equal(runQuery.calls.length, 1 + WRITER_LEASE_TABLES.length);
+  assert.match(runQuery.calls[0], /kith\.deferred_work/);
+  assert.match(runQuery.calls[0], /state = 'running'/);
+});
+
+test("requireNoActiveWriters refuses and names kith.deferred_work when a row is running", async () => {
+  const runQuery = fakeQuery({ "kith.deferred_work": 2 });
+  await assert.rejects(
+    requireNoActiveWriters(runQuery),
+    (error) =>
+      error instanceof PostgresBackupError &&
+      error.code === "writer_active" &&
+      /kith\.deferred_work has 2 row\(s\) in state running/.test(error.detail),
+  );
+  // A deferred_work refusal stops before checking any lease table.
+  assert.equal(runQuery.calls.length, 1);
+});
+
+test("requireNoActiveWriters refuses and names the specific worker lease table", async () => {
+  const runQuery = fakeQuery({ "kith.worker_discovery_work": 1 });
+  await assert.rejects(
+    requireNoActiveWriters(runQuery),
+    (error) =>
+      error instanceof PostgresBackupError &&
+      error.code === "writer_active" &&
+      /kith\.worker_discovery_work has 1 unexpired worker lease\(s\)/.test(error.detail),
+  );
+});
+
+test("requireNoActiveWriters checks every known worker lease table", async () => {
+  for (const table of WRITER_LEASE_TABLES) {
+    const runQuery = fakeQuery({ [table]: 3 });
+    await assert.rejects(
+      requireNoActiveWriters(runQuery),
+      (error) => error.code === "writer_active" && error.detail.startsWith(table),
+    );
+  }
+});
+
+test("requireNoActiveWriters rejects a non-numeric count from the query function", async () => {
+  const runQuery = async () => "not-a-number";
+  await assert.rejects(
+    requireNoActiveWriters(runQuery),
+    (error) => error instanceof PostgresBackupError && error.code === "writer_check_failed",
+  );
 });
 
 test("loadPostgresVerifyConfig never accepts a database connection field", async (t) => {

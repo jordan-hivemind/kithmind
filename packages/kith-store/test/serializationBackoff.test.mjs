@@ -17,6 +17,7 @@ import {
   KITH_SERIALIZATION_BACKOFF_MAX_MS,
   kithSerializationBackoffDelayMs,
   setKithSerializationSleep,
+  withKithQueueTransaction,
   withKithTransaction,
 } from "../dist/index.js";
 
@@ -35,10 +36,11 @@ function serializationFailure() {
  * `COMMIT` and `ROLLBACK` always succeed, which is all `withSchemaTransaction`
  * needs to drive the transaction around it.
  */
-function fakeSerializationPool(failures) {
+function fakeSerializationPool(failures, makeFailure = serializationFailure) {
   let connectCount = 0;
   const pool = {
     connectCount: 0,
+    statements: [],
     async connect() {
       connectCount += 1;
       pool.connectCount = connectCount;
@@ -46,8 +48,9 @@ function fakeSerializationPool(failures) {
       return {
         released: false,
         async query(sql) {
+          pool.statements.push(typeof sql === "string" ? sql : sql.text);
           if (sql === "WORK") {
-            if (attempt <= failures) throw serializationFailure();
+            if (attempt <= failures) throw makeFailure();
             return { rows: [{ attempt }] };
           }
           // BEGIN [ISOLATION LEVEL ...], SET LOCAL ..., COMMIT, ROLLBACK.
@@ -72,7 +75,10 @@ test("kithSerializationBackoffDelayMs doubles per attempt with full jitter, capp
     );
     for (let sample = 0; sample < 20; sample += 1) {
       const delay = kithSerializationBackoffDelayMs(attempt);
-      assert.ok(delay >= 0, `delay ${delay} for attempt ${attempt} is negative`);
+      assert.ok(
+        delay >= 0,
+        `delay ${delay} for attempt ${attempt} is negative`,
+      );
       assert.ok(
         delay <= cap,
         `delay ${delay} for attempt ${attempt} exceeds cap ${cap}`,
@@ -134,7 +140,7 @@ test("withKithTransaction does not retry a non-serialization error", async (t) =
   t.after(restore);
 
   const pool = fakeSerializationPool(0);
-  const boom = new Error("syntax error at or near \"WORK\"");
+  const boom = new Error('syntax error at or near "WORK"');
   boom.code = "42601";
 
   await assert.rejects(
@@ -147,4 +153,48 @@ test("withKithTransaction does not retry a non-serialization error", async (t) =
 
   assert.equal(pool.connectCount, 1, "must not open a second attempt");
   assert.equal(delays.length, 0, "must not sleep for a non-40001 error");
+});
+
+function deadlock() {
+  const error = new Error("deadlock detected");
+  error.code = "40P01";
+  return error;
+}
+
+test("withKithTransaction retries a deadlock (40P01) under the same budget", async (t) => {
+  const delays = [];
+  const restore = setKithSerializationSleep(async (ms) => {
+    delays.push(ms);
+  });
+  t.after(restore);
+
+  const pool = fakeSerializationPool(1, deadlock);
+  const result = await withKithTransaction(pool, work);
+  assert.equal(result.rows[0].attempt, 2);
+  assert.equal(pool.connectCount, 2);
+  assert.equal(delays.length, 1);
+});
+
+test("withKithQueueTransaction opens READ COMMITTED and keeps the retry loop", async (t) => {
+  const restore = setKithSerializationSleep(async () => {});
+  t.after(restore);
+
+  const pool = fakeSerializationPool(1, deadlock);
+  const result = await withKithQueueTransaction(pool, work);
+  assert.equal(result.rows[0].attempt, 2);
+
+  const begins = pool.statements.filter((sql) => /^BEGIN/.test(sql));
+  assert.equal(begins.length, 2);
+  for (const begin of begins) {
+    assert.match(begin, /READ COMMITTED/);
+    assert.doesNotMatch(begin, /SERIALIZABLE|READ ONLY/);
+  }
+  // And the ordinary write wrapper still asks for SERIALIZABLE, so the two
+  // are not one function with two names.
+  const serializable = fakeSerializationPool(0);
+  await withKithTransaction(serializable, work);
+  assert.match(
+    serializable.statements.find((sql) => /^BEGIN/.test(sql)),
+    /SERIALIZABLE/,
+  );
 });

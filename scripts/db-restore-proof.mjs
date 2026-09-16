@@ -1,9 +1,26 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { lstatSync, realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { capturePostgresParity, hashFileSha256, parityEquals, postgresIdentity, validatePostgresParity } from "./db-postgres-parity.mjs";
+
+// The `pg` client and `@repo/kith-store`'s built documents read surface,
+// loaded from the sibling package rather than a scripts/-local dependency
+// (this script otherwise shells out to `psql`/`pg_restore` only, on purpose,
+// to keep the restore-proof's own footprint small). Both are resolved lazily
+// in `sampleCitedAnswer` and their absence degrades to "not available" rather
+// than failing the whole restore, so a restore-proof run never depends on a
+// build step succeeding to prove byte-exact restore parity.
+const PG_CLIENT_URL = new URL(
+  "../packages/kith-store/node_modules/pg/esm/index.mjs",
+  import.meta.url,
+);
+const KITH_STORE_DOCUMENTS_URL = new URL(
+  "../packages/kith-store/dist/documents/index.js",
+  import.meta.url,
+);
 
 const MAX_OUTPUT = 262_144;
 export class RestoreProofError extends Error {
@@ -104,6 +121,80 @@ async function readManifest(path) {
   return manifest;
 }
 
+function emptyCitationSample(reason) {
+  return {
+    attempted: true,
+    available: false,
+    reason,
+    documentId: null,
+    documentTitle: null,
+    question: null,
+    citationHashMatched: null,
+  };
+}
+
+/** Step 10's "returns a sampled cited answer": after an isolated restore
+ * passes its byte-exact parity, read one active synthetic document back
+ * through `@repo/kith-store`'s own `documents.getDocument` (the real read
+ * path, not a raw query) and recompute the SHA-256 of its first citation's
+ * quote against the stored `quoteHash`. A restored database that has no
+ * document -- most synthetic dump fixtures in this repo's own tests do not
+ * -- reports `available: false` rather than failing; a document whose
+ * citation hash does not match fails the whole restore, because that is
+ * exactly the kind of corruption this proof exists to catch. */
+export async function sampleCitedAnswer(destinationConnectionString, timeoutMs) {
+  let pgModule;
+  let documentsModule;
+  try {
+    [pgModule, documentsModule] = await Promise.all([
+      import(PG_CLIENT_URL),
+      import(KITH_STORE_DOCUMENTS_URL),
+    ]);
+  } catch (error) {
+    return emptyCitationSample(
+      `kith-store read surface unavailable: ${error?.message ?? "unknown error"}`,
+    );
+  }
+  const client = new pgModule.Client({
+    connectionString: destinationConnectionString,
+    connectionTimeoutMillis: timeoutMs,
+  });
+  try {
+    await client.connect();
+    let candidate;
+    try {
+      candidate = await client.query(
+        "select id, space_id, title from kith.documents where publication_state = 'active' order by id limit 1",
+      );
+    } catch {
+      return emptyCitationSample("kith.documents is not queryable in the restored database");
+    }
+    if (candidate.rowCount !== 1) {
+      return emptyCitationSample("no active document in the restored database");
+    }
+    const row = candidate.rows[0];
+    const document = await documentsModule.getDocument(client, [row.space_id], row.id);
+    const evidence = document?.pages?.[0]?.evidence?.[0];
+    if (!document || !evidence) {
+      return emptyCitationSample(`document ${row.id} has no readable citation`);
+    }
+    const recomputed = createHash("sha256").update(evidence.quote, "utf8").digest("hex");
+    if (recomputed !== evidence.quoteHash) fail("citation_hash_mismatch");
+    const title = typeof row.title === "string" ? row.title : row.id;
+    return {
+      attempted: true,
+      available: true,
+      reason: null,
+      documentId: row.id,
+      documentTitle: title,
+      question: `What does the citation for "${title}" (evidence span ${evidence.evidenceSpanId}) say?`,
+      citationHashMatched: true,
+    };
+  } finally {
+    await client.end().catch(() => {});
+  }
+}
+
 export async function restorePostgresProof(config, dumpPath, manifestPath) {
   config = parseConfig(config);
   dumpPath = absolute(dumpPath); manifestPath = absolute(manifestPath);
@@ -135,7 +226,14 @@ export async function restorePostgresProof(config, dumpPath, manifestPath) {
   const afterVersions = await schemaVersions(config, destination);
   const restoredParity = await capturePostgresParity(config.psqlPath, destination, config.timeoutMs);
   if (afterVersions.financeVersion !== beforeVersions.financeVersion || afterVersions.kithVersion !== beforeVersions.kithVersion || restoredParity.invalidConstraints !== 0 || !parityEquals(restoredParity, manifest.parity)) fail("restore_parity_failed");
-  return { status: "passed", source: beforeVersions, restored: afterVersions, tablesVerified: restoredParity.tables.length };
+  const citationSample = await sampleCitedAnswer(destination, config.timeoutMs);
+  return {
+    status: "passed",
+    source: beforeVersions,
+    restored: afterVersions,
+    tablesVerified: restoredParity.tables.length,
+    citationSample,
+  };
 }
 export async function loadRestoreProofConfig(path) {
   protectedFile(path);

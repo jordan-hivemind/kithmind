@@ -339,13 +339,59 @@ export function setKithSerializationSleep(sleep: Sleep): () => void {
   };
 }
 
+/**
+ * The two SQLSTATEs that mean "this attempt lost to a concurrent one; the
+ * same work may well succeed if run again": `40001` (serialization_failure,
+ * the `SERIALIZABLE` abort) and `40P01` (deadlock_detected, which the server
+ * resolves by killing one of the two transactions). Neither says anything is
+ * wrong with the work itself, and both leave the caller holding nothing, so
+ * both are retried under the same bounded budget.
+ */
 function isSerializationFailure(error: unknown): boolean {
   return (
     typeof error === "object" &&
     error !== null &&
     "code" in error &&
-    error.code === "40001"
+    (error.code === "40001" || error.code === "40P01")
   );
+}
+
+type KithWriteIsolation = "SERIALIZABLE" | "READ COMMITTED";
+
+async function withKithRetriedTransaction<T>(
+  pool: pg.Pool,
+  work: (client: pg.PoolClient) => Promise<T>,
+  isolation: KithWriteIsolation,
+): Promise<T> {
+  for (let attempt = 1; attempt <= KITH_SERIALIZATION_ATTEMPTS; attempt += 1) {
+    const client = await pool.connect();
+    try {
+      return await withSchemaTransaction(
+        client,
+        KITH_SCHEMA,
+        (inner) => work(inner as pg.PoolClient),
+        {
+          isolation,
+          statementTimeoutMs: KITH_STATEMENT_TIMEOUT_MS,
+          lockTimeoutMs: KITH_LOCK_TIMEOUT_MS,
+          idleInTransactionTimeoutMs: KITH_IDLE_TRANSACTION_TIMEOUT_MS,
+        },
+      );
+    } catch (error) {
+      if (
+        !isSerializationFailure(error) ||
+        attempt === KITH_SERIALIZATION_ATTEMPTS
+      )
+        throw error;
+    } finally {
+      client.release();
+    }
+    // Only reached when the catch above found a serialization failure with
+    // attempts left: the client is already back in the pool, so this wait
+    // does not hold a connection idle while it runs.
+    await kithSerializationSleep(kithSerializationBackoffDelayMs(attempt));
+  }
+  throw new ProofError("transaction_retry_exhausted");
 }
 
 /**
@@ -376,35 +422,35 @@ export async function withKithTransaction<T>(
   pool: pg.Pool,
   work: (client: pg.PoolClient) => Promise<T>,
 ): Promise<T> {
-  for (let attempt = 1; attempt <= KITH_SERIALIZATION_ATTEMPTS; attempt += 1) {
-    const client = await pool.connect();
-    try {
-      return await withSchemaTransaction(
-        client,
-        KITH_SCHEMA,
-        (inner) => work(inner as pg.PoolClient),
-        {
-          isolation: "SERIALIZABLE",
-          statementTimeoutMs: KITH_STATEMENT_TIMEOUT_MS,
-          lockTimeoutMs: KITH_LOCK_TIMEOUT_MS,
-          idleInTransactionTimeoutMs: KITH_IDLE_TRANSACTION_TIMEOUT_MS,
-        },
-      );
-    } catch (error) {
-      if (
-        !isSerializationFailure(error) ||
-        attempt === KITH_SERIALIZATION_ATTEMPTS
-      )
-        throw error;
-    } finally {
-      client.release();
-    }
-    // Only reached when the catch above found a serialization failure with
-    // attempts left: the client is already back in the pool, so this wait
-    // does not hold a connection idle while it runs.
-    await kithSerializationSleep(kithSerializationBackoffDelayMs(attempt));
-  }
-  throw new ProofError("transaction_retry_exhausted");
+  return withKithRetriedTransaction(pool, work, "SERIALIZABLE");
+}
+
+/**
+ * One queue step: one `READ COMMITTED` transaction on one checked-out client,
+ * with the same bounded retry and backoff as `withKithTransaction`.
+ *
+ * For `kith.deferred_work`'s claim, complete and fail steps only
+ * (`deferred/core.ts`, driven from `deferred/drain.ts`). Those steps are
+ * built on row locks -- `FOR UPDATE SKIP LOCKED` to pick a job, a
+ * `lease_token` match to finish one -- which is a protocol `READ COMMITTED`
+ * already makes correct: a concurrent claimer sees the row lock and skips
+ * the row, and a stale lease holder's update matches nothing. Under
+ * `SERIALIZABLE` the same statements also take predicate locks on the index
+ * range every claimer scans, so under load every drain aborts every other
+ * one with `40001`, the retry budget runs out, and a healthy queue reports
+ * `transaction_retry_exhausted` for no reason the row locks would ever have
+ * produced. `READ COMMITTED` is not weaker here, it is the isolation the
+ * protocol was written for.
+ *
+ * The job's handler does not run under this: `drain.ts` gives it its own
+ * `withKithTransaction`, because a handler stages rows the same way every
+ * other ported service does and needs the same guarantees.
+ */
+export async function withKithQueueTransaction<T>(
+  pool: pg.Pool,
+  work: (client: pg.PoolClient) => Promise<T>,
+): Promise<T> {
+  return withKithRetriedTransaction(pool, work, "READ COMMITTED");
 }
 
 /**

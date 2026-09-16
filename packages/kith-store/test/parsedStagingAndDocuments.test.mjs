@@ -461,6 +461,10 @@ test(
       capturedAt: new Date(),
       userId,
     });
+    // One instant for creation and readback. Two `new Date()` calls can
+    // straddle a millisecond boundary, and a readback earlier than creation is
+    // exactly what the receipt code refuses.
+    const receiptAt = new Date();
     const receipt = await provenance.createOrGetArchiveReceipt(client, {
       spaceId,
       sourceAccountId,
@@ -481,10 +485,10 @@ test(
       plaintextMediaType: "application/pdf",
       ciphertextHash: await sha256Utf8("ciphertext"),
       ciphertextByteLength: 4200,
-      readbackVerifiedAt: new Date(),
+      readbackVerifiedAt: receiptAt,
       userId,
       actorCredentialId,
-      createdAt: new Date(),
+      createdAt: receiptAt,
     });
 
     const binding = await provenance.bindInitialArchiveReceipt(client, {

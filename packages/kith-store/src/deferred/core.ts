@@ -11,8 +11,13 @@
 //
 // One clock, one transaction, same as every other ported surface in this
 // package: `DeferredCtx` is `{ client, now }`, and every function here assumes
-// its caller opened one `SERIALIZABLE` transaction (`withKithTransaction`)
-// around it.
+// its caller opened one transaction around it. For `schedule` that is the
+// caller's own `SERIALIZABLE` transaction (`withKithTransaction`), which is
+// what makes the row transactional with the write it follows. For `claim`,
+// `complete`, `fail` and `failWithoutAttempt` it is `withKithQueueTransaction`
+// (`READ COMMITTED`): these steps are row-lock protocols, and `SERIALIZABLE`'s
+// predicate locks on the scanned index range would make every concurrent
+// drain abort every other one. See `withKithQueueTransaction` in `schema.ts`.
 //
 // `attempts` increments in two places, not one: `fail` counts a handler that
 // ran and threw, and `claim` itself counts a reclaim of a `running` row whose
@@ -144,11 +149,7 @@ export async function schedule(
     throw new ProofError("deferred_work_invalid_dedupe_key");
   }
   const maxAttempts = input.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
-  if (
-    !Number.isInteger(maxAttempts) ||
-    maxAttempts < 1 ||
-    maxAttempts > 20
-  ) {
+  if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 20) {
     throw new ProofError("deferred_work_invalid_max_attempts");
   }
   const runAfter = input.runAfter ?? ctx.now;
@@ -388,7 +389,13 @@ export async function fail(
             lease_token = NULL, lease_expires_at = NULL, last_error = $3,
             updated_at = $4
       WHERE id = $5`,
-    [attempts, at(nextAttemptAt), args.error.slice(0, 2000), at(ctx.now), args.id],
+    [
+      attempts,
+      at(nextAttemptAt),
+      args.error.slice(0, 2000),
+      at(ctx.now),
+      args.id,
+    ],
   );
   return { status: "retrying", nextAttemptAt };
 }
