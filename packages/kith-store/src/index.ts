@@ -45,6 +45,7 @@ export * as provenance from "./provenance/index.js";
 export * as documents from "./documents/index.js";
 export * as embeddings from "./embeddings/index.js";
 export * as memory from "./memory/index.js";
+export * as eval from "./eval/index.js";
 export * as ingestion from "./ingestion/index.js";
 export * as workers from "./workers/index.js";
 export * as records from "./records/index.js";

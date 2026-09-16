@@ -616,6 +616,13 @@ change must be explained by stemming rather than by a lost row. A regression is
 reported, not absorbed: the fallback is to add `pg_trgm` or to adjust the blend,
 not to lower the bar.
 
+P2-39g3 ported the instrument and reran its keyword mode against PostgreSQL;
+see [`docs/retrieval-parity-postgres.md`](../retrieval-parity-postgres.md) for
+the results, the dominant miss cause it found (AND-of-terms query
+construction, not stemming), and what remains owed (the semantic rerun with a
+real embedding profile, and the private document question set's rerun), both
+of which need owner credentials or the loaded private corpus.
+
 ### 4.3 Independent security review
 
 Per the repository's security-sensitive rule, the session implementation, the
