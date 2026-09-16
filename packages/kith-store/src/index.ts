@@ -259,12 +259,17 @@ export async function grantProofAppRole(
   // Identity is every table `src/identity/` writes: the account pair, the
   // session row logout has to be able to revoke, the API key with its two grant
   // tables, the OAuth code receipt, and the space, membership and settings rows
-  // `ensurePersonalSpace` creates on first sign-in.
+  // `ensurePersonalSpace` creates on first sign-in. `kith.auth_rate_limits`
+  // joins the group as a P2-39i follow-up: the durable table section 8
+  // question 2 of the surface plan opened a row for, written by
+  // `identity/rateLimits.ts` `consumeAuthAttempt` from the same route that
+  // writes `kith.sessions`.
   await owner.query(`GRANT INSERT, UPDATE, DELETE ON
     kith.users, kith.auth_accounts, kith.sessions,
     kith.api_keys, kith.api_key_spaces, kith.api_key_source_accounts,
     kith.consumed_oauth_codes, kith.spaces, kith.space_members,
-    kith.family_invitations, kith.user_space_settings TO "${appRole}"`);
+    kith.family_invitations, kith.user_space_settings,
+    kith.auth_rate_limits TO "${appRole}"`);
   // Memory: `entities` and `facts`. `thoughts` is already granted above, with
   // P2-39g2's embedding tables.
   await owner.query(`GRANT INSERT, UPDATE, DELETE ON

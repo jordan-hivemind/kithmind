@@ -20,14 +20,15 @@ import {
 
 import {
   authFailure,
+  limiterUnavailable,
   noContent,
   problem,
   readCredentials,
   readJsonBody,
   tooManyAttempts,
 } from "@/lib/kith/auth-route";
+import { checkAuthRateLimit } from "@/lib/kith/durable-rate-limit";
 import { kithPool } from "@/lib/kith/pool";
-import { authRateLimiter, clientAddress } from "@/lib/kith/rate-limit";
 import { kithSessionConfig } from "@/lib/kith/session";
 
 export const runtime = "nodejs";
@@ -38,11 +39,14 @@ export async function POST(request: Request): Promise<Response> {
   const credentials = body === null ? null : readCredentials(body);
   if (credentials === null) return problem(400, "Invalid request");
 
-  const decision = authRateLimiter().check({
-    address: clientAddress(request),
-    account: credentials.email,
-  });
-  if (!decision.allowed) return tooManyAttempts(decision.retryAfterSeconds);
+  // See sign-in/route.ts: the limiter runs before the credential check, in
+  // its own transaction under `postgres`, and fails closed on its own
+  // failure rather than letting the attempt through.
+  const outcome = await checkAuthRateLimit(request, credentials.email);
+  if (outcome.kind === "unavailable") return limiterUnavailable();
+  if (outcome.kind === "denied") {
+    return tooManyAttempts(outcome.retryAfterSeconds);
+  }
 
   try {
     const config = kithSessionConfig();

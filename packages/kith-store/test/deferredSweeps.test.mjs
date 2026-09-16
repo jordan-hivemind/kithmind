@@ -15,10 +15,12 @@ import {
   createRegistry,
   deferredCtx,
   recoverInlineIngestion,
+  removeExpiredAuthRateLimits,
   removeExpiredOAuthGrants,
   removeExpiredWorkerProtocolState,
   tick,
 } from "../dist/deferred/index.js";
+import { consumeAuthAttempt } from "../dist/identity/index.js";
 import {
   isWatcherOverdue,
   recordMissingWorkerIncidents,
@@ -169,6 +171,60 @@ test("removeExpiredOAuthGrants reports the identity sweep's shape", { skip }, as
   );
   assert.equal(remaining.rows[0].n, 0);
 });
+
+test(
+  "removeExpiredAuthRateLimits deletes only rows past their own window, bounded",
+  { skip },
+  async (t) => {
+    const f = await sourceFixture(t);
+
+    // Three rows whose window is already over -- more than the bound below,
+    // so the first pass leaves one behind.
+    for (let index = 0; index < 3; index += 1) {
+      await consumeAuthAttempt(f.ctx(NOW - 20 * 60 * 1000), {
+        scope: "auth_address",
+        key: `stale-${index}`,
+        windowMs: 15 * 60 * 1000,
+        limit: 5,
+      });
+    }
+    // A live row, well inside its window.
+    await consumeAuthAttempt(f.ctx(NOW), {
+      scope: "auth_address",
+      key: "fresh",
+      windowMs: 15 * 60 * 1000,
+      limit: 5,
+    });
+
+    const total = await f.client.query(
+      "SELECT count(*)::int AS n FROM kith.auth_rate_limits",
+    );
+    assert.equal(total.rows[0].n, 4);
+
+    const bounded = await withKithTransaction(f.pool, (client) =>
+      removeExpiredAuthRateLimits(deferredCtx(client, NOW), {
+        limit: 2,
+        windowMs: 15 * 60 * 1000,
+      }),
+    );
+    assert.equal(bounded.removed, 2);
+    assert.equal(bounded.remaining, true);
+
+    const rest = await withKithTransaction(f.pool, (client) =>
+      removeExpiredAuthRateLimits(deferredCtx(client, NOW), {
+        limit: 10,
+        windowMs: 15 * 60 * 1000,
+      }),
+    );
+    assert.equal(rest.removed, 1);
+    assert.equal(rest.remaining, false);
+
+    const remaining = await f.client.query(
+      "SELECT count(*)::int AS n FROM kith.auth_rate_limits",
+    );
+    assert.equal(remaining.rows[0].n, 1);
+  },
+);
 
 async function insertOperationReceipt(client, spaceId, retireAt) {
   const id = newKithId();
@@ -606,18 +662,26 @@ test("a missed tick costs nothing: running tick twice is a no-op the second time
     f.spaceId,
     new Date(NOW - 1_000),
   );
+  await consumeAuthAttempt(f.ctx(NOW - 20 * 60 * 1000), {
+    scope: "auth_address",
+    key: "stale-tick-address",
+    windowMs: 15 * 60 * 1000,
+    limit: 5,
+  });
 
   const registry = createRegistry();
   const first = await tick(f.pool, registry, { now: NOW });
   assert.equal(first.sweeps.expiredOAuthGrants.removed, 1);
   assert.equal(first.sweeps.expiredWorkerProtocolState.removed, 1);
   assert.equal(first.sweeps.inlineIngestionRecovery.recovered, 0);
+  assert.equal(first.sweeps.expiredAuthRateLimits.removed, 1);
   assert.equal(first.drain.claimed, 0);
 
   const second = await tick(f.pool, registry, { now: NOW + 1 });
   assert.equal(second.sweeps.expiredOAuthGrants.removed, 0);
   assert.equal(second.sweeps.expiredWorkerProtocolState.removed, 0);
   assert.equal(second.sweeps.inlineIngestionRecovery.recovered, 0);
+  assert.equal(second.sweeps.expiredAuthRateLimits.removed, 0);
   assert.equal(second.drain.claimed, 0);
 
   const keyGone = await f.client.query(

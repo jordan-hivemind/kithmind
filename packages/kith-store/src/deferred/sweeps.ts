@@ -10,6 +10,7 @@
 
 import { WORKER_MUTATION_RATE_WINDOW_MS } from "@repo/worker-protocol";
 
+import { AUTH_RATE_LIMIT_SWEEP_WINDOW_MS } from "../identity/rateLimits.js";
 import { removeExpired as removeExpiredOAuth } from "../identity/oauth.js";
 import { at, rows, type DeferredCtx } from "./core.js";
 import { schedule } from "./core.js";
@@ -240,4 +241,49 @@ export async function removeExpiredWorkerProtocolState(
   if (doomedRateLimits.length === limit) remaining = true;
 
   return { removed, remaining };
+}
+
+const AUTH_RATE_LIMIT_SWEEP_BATCH_SIZE = 200;
+
+/**
+ * `kith.auth_rate_limits`'s own expiry sweep, wired into `tick` beside the
+ * worker protocol state sweep above rather than into that function itself,
+ * because the two tables are unrelated domains that happen to share the same
+ * "fixed window, no `retire_at`" shape.
+ *
+ * The table has no `retire_at` (migration 019): a row is doomed once its own
+ * `window_started_at` is far enough in the past that no caller could still be
+ * inside that window, the same test `removeExpiredWorkerProtocolState` applies
+ * to `kith.worker_protocol_rate_limits` a few lines up. `windowMs` defaults to
+ * `AUTH_RATE_LIMIT_SWEEP_WINDOW_MS`, which the comment on that constant says
+ * must be kept in lockstep with the auth routes' own window; a caller sweeping
+ * rows written with a different window may pass one explicitly.
+ */
+export async function removeExpiredAuthRateLimits(
+  ctx: DeferredCtx,
+  options: { limit?: number; windowMs?: number } = {},
+): Promise<SweepResult> {
+  const limit = options.limit ?? AUTH_RATE_LIMIT_SWEEP_BATCH_SIZE;
+  if (!Number.isInteger(limit) || limit < 1 || limit > 5_000) {
+    throw new Error("Auth rate limit sweep limit is invalid");
+  }
+  const windowMs = options.windowMs ?? AUTH_RATE_LIMIT_SWEEP_WINDOW_MS;
+  if (!Number.isFinite(windowMs) || windowMs <= 0) {
+    throw new Error("Auth rate limit sweep window is invalid");
+  }
+  const cutoff = at(ctx.now - windowMs);
+  const doomed = await rows<{ id: string }>(
+    ctx,
+    `WITH doomed AS (
+       SELECT id FROM kith.auth_rate_limits
+        WHERE window_started_at <= $1
+        ORDER BY window_started_at, id
+        LIMIT $2
+     )
+     DELETE FROM kith.auth_rate_limits w USING doomed d
+      WHERE w.id = d.id
+      RETURNING w.id`,
+    [cutoff, limit],
+  );
+  return { removed: doomed.length, remaining: doomed.length === limit };
 }

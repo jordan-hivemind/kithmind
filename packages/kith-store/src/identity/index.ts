@@ -167,3 +167,10 @@ export {
   authDenialSurfaceOnPool,
   type AuthDenialSurface,
 } from "./denials.js";
+
+export {
+  AUTH_RATE_LIMIT_SWEEP_WINDOW_MS,
+  consumeAuthAttempt,
+  type AuthRateLimitAttempt,
+  type AuthRateLimitConsumption,
+} from "./rateLimits.js";

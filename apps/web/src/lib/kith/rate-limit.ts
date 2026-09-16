@@ -215,16 +215,58 @@ export function authRateLimiter(): AuthRateLimiter {
 /**
  * The client address a request came from, or null.
  *
- * `x-forwarded-for`'s leftmost entry is the client as the first proxy saw it.
- * It is attacker-controlled when the deployment is not behind a proxy that
- * rewrites it, which is why it keys a rate limit and nothing else: a forged
- * value buys a fresh bucket, which is the same thing a new IP address buys, and
- * it is never used for authorization, logging as identity, or SQL.
+ * Trust boundary, fixed by review of i1: a request header is attacker-supplied
+ * unless something between the attacker and this process is known to strip or
+ * overwrite it, and the previous version of this function did not honour that
+ * -- it took `x-forwarded-for`'s *leftmost* entry, which on a real deployment
+ * is exactly the entry a client gets to write. A client that wants a fresh
+ * bucket, or wants to pin its budget onto an address it does not control,
+ * could simply set the header.
+ *
+ * What is actually trustworthy, and what this function relies on:
+ *
+ *   - On Vercel, the edge network is a proxy the app does not control and the
+ *     client cannot reach past. Vercel's own docs on request headers, and the
+ *     Next.js docs on reading a client IP behind a proxy, describe
+ *     `x-forwarded-for` as a hop chain a proxy *appends* the connecting
+ *     address to rather than a value it replaces: a client may prepend
+ *     whatever entries it likes, but the last hop is the address of whoever
+ *     connected to the edge itself, because that is the one entry the client
+ *     never gets to write. Vercel also sets `x-real-ip` directly from the
+ *     edge, as a single value rather than a chain.
+ *   - Locally (`pnpm dev`, a bare `node` process, this file's own tests)
+ *     there is no proxy in front of the app at all, so neither header is
+ *     trustworthy and a present one is exactly as attacker-controlled as an
+ *     absent one is common. This function cannot tell "no proxy" apart from
+ *     "a proxy that is not Vercel and does not append", and does not try to:
+ *     it trusts the shape Vercel is documented to produce, and produces the
+ *     safe fallback (see below) whenever that shape is not confirmable any
+ *     other way.
+ *
+ * So: the *rightmost* `x-forwarded-for` entry, never the first, because the
+ * first is exactly the entry a client controls and the previous version's
+ * defect. `x-real-ip` next, because the docs describe it as a single value
+ * the edge sets rather than a chain. Neither is validated as an IP address --
+ * the far end of a chain a client cannot append to does not need to look like
+ * one to be trustworthy, because it is trustworthy for where it came from, not
+ * its shape.
+ *
+ * When neither header is present at all, this returns null rather than
+ * guessing, and the caller (`AuthRateLimiter.check`, and the durable limiter
+ * in `durable-rate-limit.ts`) must fall back to one shared bucket for every
+ * such request rather than skipping the limit for it -- "no address" must
+ * never be the cheapest way past a rate limit. It is never used for
+ * authorization, logging as identity, or SQL.
  */
 export function clientAddress(request: Request): string | null {
   const forwarded = request.headers.get("x-forwarded-for");
-  const first = forwarded?.split(",")[0]?.trim();
-  if (first !== undefined && first !== "") return first.slice(0, 64);
+  if (forwarded !== null) {
+    const segments = forwarded.split(",");
+    const rightmost = segments[segments.length - 1]?.trim();
+    if (rightmost !== undefined && rightmost !== "") {
+      return rightmost.slice(0, 64);
+    }
+  }
   const real = request.headers.get("x-real-ip")?.trim();
   return real !== undefined && real !== "" ? real.slice(0, 64) : null;
 }

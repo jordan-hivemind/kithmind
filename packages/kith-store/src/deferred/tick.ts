@@ -15,6 +15,7 @@ import { drain, type DrainSummary } from "./drain.js";
 import type { DeferredWorkRegistry } from "./registry.js";
 import {
   recoverInlineIngestion,
+  removeExpiredAuthRateLimits,
   removeExpiredOAuthGrants,
   removeExpiredWorkerProtocolState,
   type RecoverySweepResult,
@@ -25,6 +26,7 @@ export type TickSweepSummary = {
   inlineIngestionRecovery: RecoverySweepResult;
   expiredOAuthGrants: SweepResult;
   expiredWorkerProtocolState: SweepResult;
+  expiredAuthRateLimits: SweepResult;
 };
 
 export type TickSummary = {
@@ -62,6 +64,11 @@ export async function tick(
         limit: sweepLimit,
       }),
   );
+  const expiredAuthRateLimits = await withKithTransaction(pool, (client) =>
+    removeExpiredAuthRateLimits(deferredCtx(client, now), {
+      limit: sweepLimit,
+    }),
+  );
   const drainSummary = await drain(pool, registry, {
     maxJobs: options.maxJobs,
     now,
@@ -71,6 +78,7 @@ export async function tick(
       inlineIngestionRecovery,
       expiredOAuthGrants,
       expiredWorkerProtocolState,
+      expiredAuthRateLimits,
     },
     drain: drainSummary,
   };

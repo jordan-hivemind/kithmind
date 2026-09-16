@@ -44,6 +44,7 @@ const GRANTED = Object.freeze({
     "space_members",
     "family_invitations",
     "user_space_settings",
+    "auth_rate_limits",
   ],
   memory: ["entities", "facts", "thoughts"],
   records: [
@@ -151,6 +152,17 @@ test(
           `INSERT INTO kith.user_space_settings (id, user_id, personal_space_id)
              VALUES ($1, $2, $3)`,
           [newKithId(), userId, spaceId],
+        ),
+        null,
+      );
+      // The durable auth rate limiter's own table (P2-39i follow-up).
+      assert.equal(
+        await attempt(
+          app,
+          `INSERT INTO kith.auth_rate_limits
+             (id, scope, key_hash, window_started_at, count)
+             VALUES ($1, 'auth_address', repeat('ab', 32), transaction_timestamp(), 1)`,
+          [newKithId()],
         ),
         null,
       );
