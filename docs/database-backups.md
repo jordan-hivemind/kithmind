@@ -73,6 +73,82 @@ Owner export and backup adapters remain private. The public setup does not
 install a schedule. Operators must configure and verify their own scheduler and
 adapter implementation.
 
+## PostgreSQL engine: both schemas in one dump
+
+[`docs/plans/2026-09-12-postgres-consolidation.md`](plans/2026-09-12-postgres-consolidation.md)
+step 10 replaces the native Convex export in the dated-backup recipe with a
+`pg_dump` of both schemas from the one PostgreSQL database. The engine
+component is `scripts/db-backup-postgres.mjs`; the public runner above still
+supplies the lock, staging directory, and durable status journal, and passes
+that directory to whatever export and backup commands the runner's own
+configuration names.
+
+The engine, in order:
+
+1. **Preflight.** Connects with the configured connection command, confirms
+   `current_database()` matches the expected name, and reads `finance.
+   schema_version` and `kith.schema_version` against the versions the
+   configuration expects. A mismatch on either fails closed before anything is
+   dumped.
+2. **Writer quiescence.** Refuses to start if `kith.deferred_work` has a row in
+   `running`, or if any of `kith.worker_jobs`, `kith.ingest_jobs`,
+   `kith.worker_discovery_work`, or `kith.worker_reservation_targets` has an
+   unexpired `lease_expires_at`. The failure names the exact table and count
+   that blocked it, matching AGENTS.md's archive-writer quiescence rule: a
+   dump started while a writer holds a lease cannot honestly claim one
+   consistent snapshot.
+3. **Dump.** `pg_dump --format=custom --no-owner --no-acl --schema=finance
+   --schema=kith --extension=vector`. `--extension=vector` is required, not
+   cosmetic: `--schema` alone excludes extensions, and
+   `kith.embedding_vectors.embedding` is `public.vector`, so without it an
+   isolated restore into a genuinely empty database fails restoring that one
+   table.
+4. **Manifest.** Records the export date, host, operation id, Git revision,
+   both schema versions (`financeSchemaVersion` from `finance.schema_version`,
+   `kithSchemaVersion` from `kith.schema_version`), the six-check parity
+   capture (see below), and the dump file's SHA-256 and byte length.
+5. **Encryption and publication.** Unchanged from the Convex-era recipe: `age`
+   encryption of the dump and manifest, a restic repository identity check
+   before publication, and `restic backup` tagged with the host and operation
+   id.
+6. **Separate-process verification.** A freshly spawned process, holding only
+   the verify-only age identity (never the encryption recipient's public key
+   path used to publish), re-downloads the ciphertext with a fresh `--no-cache`
+   restic invocation, decrypts, and compares bytes against what the backup
+   process itself hashed. It then drives an isolated restore (below) and
+   requires its exact `{status:"passed"}` result.
+
+## Isolated restore proof
+
+`scripts/db-restore-proof.mjs --isolated` is the engine's own restore check,
+invoked by the separate verify process above and runnable standalone against
+a downloaded dump and manifest. It:
+
+- refuses an alias of the source (same database identity) or a non-empty
+  target, so the restore can only ever land in a genuinely isolated database;
+- recomputes a full parity capture (every `finance`/`kith` table's row count
+  and a canonical content hash) against the source immediately before
+  restoring, and again against the restored database immediately after, and
+  requires them to be byte-identical;
+- reads one active document back through `@repo/kith-store`'s own
+  `documents.getDocument` — the real application read path, not a raw query —
+  recomputes the SHA-256 of its first citation's quote, and compares it with
+  the stored `quoteHash`. A restored database with no active document (most
+  synthetic fixtures in this repository's own tests have none) reports the
+  sample as unavailable rather than failing; a citation whose hash does not
+  match fails the whole restore proof, because that is exactly the kind of
+  corruption this check exists to catch.
+
+`@repo/kith-migrate`'s six parity checks (`packages/kith-migrate/src/
+parity.ts`) prove the Convex-to-PostgreSQL migration itself against the
+original Convex export (row b's own row); they are exercised in
+`scripts/db-backup-postgres.integration.test.mjs` against a synthetic
+migration fixture, but they are not what a routine backup restore proof runs,
+because a routine restore has no Convex export to check against once the
+database is the only store. This restore proof's own full-table content-hash
+parity (above) is the check that runs on every restore, source database
+versus restored database, not migration export versus destination.
+
 ## Archive changes
 
 Before an archive-root relocation, quiesce all archive writers that use the

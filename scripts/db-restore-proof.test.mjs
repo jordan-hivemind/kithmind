@@ -84,6 +84,12 @@ test("published dump restores every row exactly and refuses aliases, dirty targe
   const passed = await restorePostgresProof(baseConfig, dumpPath, manifestPath);
   assert.equal(passed.status, "passed");
   assert.equal(passed.tablesVerified, 4);
+  // This fixture's schema has no `kith.documents` table (only the two
+  // synthetic tables above), so the sampled-citation step degrades to
+  // "not available" rather than failing the whole restore.
+  assert.equal(passed.citationSample.attempted, true);
+  assert.equal(passed.citationSample.available, false);
+  assert.match(passed.citationSample.reason, /kith\.documents|kith-store read surface unavailable/);
 
   await assert.rejects(
     restorePostgresProof({ ...baseConfig, destinationConnectionCommand: await commandFile(root, "alias.sh", source.replace("127.0.0.1", "localhost")) }, dumpPath, manifestPath),

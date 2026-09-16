@@ -96,14 +96,15 @@ const DEFAULT_TIMEOUT_MS = 600_000;
 const POSTGRES_MAJOR = "17";
 
 export class PostgresBackupError extends Error {
-  constructor(code) {
-    super(code);
+  constructor(code, detail) {
+    super(detail ? `${code}: ${detail}` : code);
     this.name = "PostgresBackupError";
     this.code = code;
+    this.detail = detail;
   }
 }
-function fail(code) {
-  throw new PostgresBackupError(code);
+function fail(code, detail) {
+  throw new PostgresBackupError(code, detail);
 }
 
 function parseSecretCommand(value) {
@@ -249,6 +250,49 @@ function parseVerifyConfig(value) {
     operationId: row.operationId,
     timeoutMs: row.timeoutMs,
   };
+}
+
+// Validates the isolated restore worker's `citationSample` field (step 10's
+// "returns a sampled cited answer"): a fixed shape so this strict verify path
+// can check it without trusting the subprocess's JSON any further than the
+// rest of `restore`. `available` is only ever true here because
+// `db-restore-proof.mjs` itself fails the whole restore on a hash mismatch
+// rather than reporting one; this still asserts that invariant rather than
+// assuming it.
+function validCitationSample(value) {
+  const keys = [
+    "attempted",
+    "available",
+    "reason",
+    "documentId",
+    "documentTitle",
+    "question",
+    "citationHashMatched",
+  ];
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    Object.keys(value).sort().join() !== keys.sort().join() ||
+    typeof value.attempted !== "boolean" ||
+    typeof value.available !== "boolean" ||
+    (value.reason !== null && typeof value.reason !== "string")
+  )
+    return false;
+  if (value.available) {
+    return (
+      typeof value.documentId === "string" &&
+      typeof value.documentTitle === "string" &&
+      typeof value.question === "string" &&
+      value.citationHashMatched === true
+    );
+  }
+  return (
+    value.documentId === null &&
+    value.documentTitle === null &&
+    value.question === null &&
+    value.citationHashMatched === null
+  );
 }
 
 function protectedFile(path) {
@@ -475,6 +519,53 @@ async function preflight(config, connectionString) {
   return { database, financeVersion, kithVersion };
 }
 
+// Every kith table that carries a `lease_expires_at` column for its own
+// worker-claim protocol (migrations 002, 004, 008, 010). A backup started
+// while one of these is unexpired can dump a row mid-write, so the recipe
+// refuses to start rather than publish a torn snapshot.
+export const WRITER_LEASE_TABLES = [
+  "kith.worker_jobs",
+  "kith.ingest_jobs",
+  "kith.worker_discovery_work",
+  "kith.worker_reservation_targets",
+];
+
+/** AGENTS.md's archive-writer quiescence rule, applied to the dated-backup
+ * engine: refuse to start a dump while any kith writer looks active, and say
+ * exactly which one. Takes `runQuery(sql) => Promise<string>` (a scalar text
+ * result, matching `psqlScalar`'s shape) rather than a connection string, so
+ * it can be exercised with a fake query function in tests that never open a
+ * real database. */
+export async function requireNoActiveWriters(runQuery) {
+  const deferredRunning = Number(
+    await runQuery(
+      "select count(*) from kith.deferred_work where state = 'running'",
+    ),
+  );
+  if (!Number.isSafeInteger(deferredRunning) || deferredRunning < 0)
+    fail("writer_check_failed");
+  if (deferredRunning > 0) {
+    fail(
+      "writer_active",
+      `kith.deferred_work has ${deferredRunning} row(s) in state running`,
+    );
+  }
+  for (const table of WRITER_LEASE_TABLES) {
+    const active = Number(
+      await runQuery(
+        `select count(*) from ${table} where lease_expires_at is not null and lease_expires_at > now()`,
+      ),
+    );
+    if (!Number.isSafeInteger(active) || active < 0) fail("writer_check_failed");
+    if (active > 0) {
+      fail(
+        "writer_active",
+        `${table} has ${active} unexpired worker lease(s)`,
+      );
+    }
+  }
+}
+
 async function freshStagingDirectory(config, tag) {
   const directory = join(
     config.stagingRoot,
@@ -496,6 +587,15 @@ async function dumpBothSchemas(config, connectionString, stagingDirectory) {
       "--no-acl",
       "--schema=finance",
       "--schema=kith",
+      // pg_dump's `--schema` filter excludes extensions, which always live
+      // outside the schemas they are dumped for (`vector` lives in
+      // `public`). `kith.embedding_vectors.embedding` is `public.vector`, so
+      // without this an isolated restore into a genuinely empty database
+      // fails on that one table's CREATE TABLE with "type public.vector does
+      // not exist" -- proven by hand against this repo's own migrations
+      // before this line was added. `--extension` is additive with
+      // `--schema`, not a replacement for it.
+      "--extension=vector",
       connectionString,
       "-f",
       dumpPath,
@@ -676,6 +776,11 @@ export async function runPostgresDatabaseBackup(config) {
     config.timeoutMs,
   );
   const identity = await preflight(config, connectionString);
+  // AGENTS.md: quiesce every kith writer before a backup, or refuse and say
+  // which one is still active. This is checked every run, not only at
+  // cutover, since the dated recipe runs on a schedule against a live
+  // database that may have a worker or deferred-work drain mid-write.
+  await requireNoActiveWriters((sql) => psqlScalar(config, connectionString, sql));
   // The cutover recipe quiesces every writer before this proof. These
   // separately streamed table reads and pg_dump must observe that same stable
   // source; without quiescence, no collection of independent SQL sessions can
@@ -906,7 +1011,7 @@ async function runVerifyWorker(payload) {
     if (
       !restore ||
       Object.keys(restore).sort().join() !==
-        ["status", "source", "restored", "tablesVerified"].sort().join() ||
+        ["status", "source", "restored", "tablesVerified", "citationSample"].sort().join() ||
       restore.status !== "passed" ||
       !Number.isSafeInteger(restore.tablesVerified) ||
       restore.tablesVerified < 2 ||
@@ -916,7 +1021,8 @@ async function runVerifyWorker(payload) {
         JSON.stringify(["financeVersion", "kithVersion"]) ||
       restore.source.financeVersion !== publishedManifest.financeSchemaVersion ||
       restore.source.kithVersion !== publishedManifest.kithSchemaVersion ||
-      JSON.stringify(restore.source) !== JSON.stringify(restore.restored)
+      JSON.stringify(restore.source) !== JSON.stringify(restore.restored) ||
+      !validCitationSample(restore.citationSample)
     ) fail("restore_worker_output_invalid");
     return { status: "passed", repositoryId, mismatches: [], restore };
   } finally {
@@ -1001,6 +1107,9 @@ if (isMain())
   main().catch((error) => {
     const code =
       error instanceof PostgresBackupError ? error.code : "runner_failed";
-    process.stderr.write(`${JSON.stringify({ status: "failed", code })}\n`);
+    const detail = error instanceof PostgresBackupError ? error.detail : undefined;
+    process.stderr.write(
+      `${JSON.stringify({ status: "failed", code, ...(detail ? { detail } : {}) })}\n`,
+    );
     process.exitCode = 1;
   });

@@ -210,6 +210,25 @@ decision have been reviewed. Never use a successful native import as evidence
 that encrypted originals, citations, embeddings, worker replay, or physical
 forget completed.
 
+## PostgreSQL replacement (in progress)
+
+Everything above describes the native Convex recovery drill. The PostgreSQL
+consolidation plan (step 10 of
+[`docs/plans/2026-09-12-postgres-consolidation.md`](plans/2026-09-12-postgres-consolidation.md))
+replaces it with a `pg_dump` of both the `finance` and `kith` schemas from the
+one consolidated database, carrying the same preflight, protected staging,
+manifest, encryption, restic identity, and separate-process byte-equality
+steps this drill already required, plus one isolated restore. That engine and
+its own parity/citation checks are documented in
+[`docs/database-backups.md`](database-backups.md#postgresql-engine-both-schemas-in-one-dump).
+
+This is still a synthetic-fixture proof, not a production baseline. The
+production age recipient design, and the restic repository identity checks
+against the owner's real deployed repository, remain owed (plan section 4's
+"Encrypted dump and restore" gate). Until a Convex teardown (plan step 11),
+this document's Convex-side recovery drill remains the recovery path for
+whatever data still lives only in Convex.
+
 ## References
 
 - [Convex backup and restore](https://docs.convex.dev/database/backup-restore)
@@ -218,3 +237,5 @@ forget completed.
 - [Original-byte contract](plans/2026-09-07-original-byte-contract.md)
 - [PDF document-Q&A pipeline](pdf-pipeline-development.md)
 - [Filesystem worker](filesystem-worker.md)
+- [Database backups (PostgreSQL engine)](database-backups.md)
+- [PostgreSQL consolidation plan](plans/2026-09-12-postgres-consolidation.md)
