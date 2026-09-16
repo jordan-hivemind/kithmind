@@ -21,6 +21,11 @@ export {
 } from "./ids.js";
 export { spacePredicate, type SpacePredicate } from "./spaces.js";
 export {
+  keywordSearchSql,
+  TEXT_SEARCH_CONFIG,
+  type KeywordSearchSql,
+} from "./textSearch.js";
+export {
   applyKithReaderRole,
   applyKithSchema,
   createKithPool,

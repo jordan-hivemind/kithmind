@@ -2,11 +2,14 @@
 // the read surface, `getDocument` and `searchDocuments`. P2-39e adds
 // `listSources` and its bounded source-account metadata below.
 //
-// Convex's `withSearchIndex("by_text", ...)` keyword leg becomes a
-// `websearch_to_tsquery` predicate over `chunks.text_search` (migration
-// 006's generated `tsvector` column), ranked by `ts_rank`; every other Convex
-// index lookup here becomes a `SELECT ... WHERE id = $1` through this
-// package's usual camelizers. `ctx.db.get` calls that were `Promise.all`'d
+// Convex's `withSearchIndex("by_text", ...)` keyword leg becomes a full-text
+// predicate over `chunks.text_search` (migration 006's generated `tsvector`
+// column), ranked by `ts_rank`; every other Convex index lookup here becomes a
+// `SELECT ... WHERE id = $1` through this package's usual camelizers. P2-39g1
+// built that predicate with `websearch_to_tsquery`; P2-39g4 moved it to the
+// shared partial-overlap construction in `../textSearch.ts` after the recall
+// instrument measured what AND-of-terms costs (see that module and
+// docs/retrieval-parity-postgres.md). `ctx.db.get` calls that were `Promise.all`'d
 // in the original run sequentially instead, exactly as `model.ts` already
 // does elsewhere in this package: one `pg` client serializes queries over
 // one connection, so `Promise.all` on it adds nothing but a lint warning.
@@ -37,6 +40,7 @@ import {
 } from "../provenance/representations.js";
 import { loadProviderOriginalReference } from "../provenance/providerOriginals.js";
 import { spacePredicate } from "../spaces.js";
+import { keywordSearchSql } from "../textSearch.js";
 import { camelizeSourceAccount } from "../workers/rows.js";
 import {
   camelizeChunk,
@@ -503,7 +507,16 @@ export type SearchDocumentsResult = {
 
 /** One partition's worth of keyword candidates: `LIMIT remaining + 1` over
  * `chunks.text_search`, ranked by `ts_rank`, exactly mirroring Convex's
- * `.take(remainingCandidates + 1)` over its `by_text` search index. */
+ * `.take(remainingCandidates + 1)` over its `by_text` search index.
+ *
+ * P2-39g4 replaced this leg's `websearch_to_tsquery` with the shared partial
+ * overlap construction in `../textSearch.ts`, which every keyword leg in this
+ * package now uses. `websearch_to_tsquery` ANDs every significant token, so
+ * one ordinary query word the chunk happens not to contain dropped the chunk
+ * outright; the shared helper ORs the query's own stemmed lexemes and ranks so
+ * that a chunk matching more of them sorts first. The take, the partition and
+ * the `id ASC` tiebreak are unchanged. See that module for why `ts_rank`'s
+ * default normalization is the right rank here and `ts_rank_cd` is not. */
 async function keywordCandidates(
   client: ClientBase,
   spaceId: string,
@@ -511,11 +524,12 @@ async function keywordCandidates(
   query: string,
   limit: number,
 ): Promise<ChunkRow[]> {
+  const keyword = keywordSearchSql("text_search", 3);
   const result = await client.query<QueryResultRow>(
     `SELECT * FROM kith.chunks
       WHERE space_id = $1 AND publication_state = $2
-        AND text_search @@ websearch_to_tsquery('english', $3)
-      ORDER BY ts_rank(text_search, websearch_to_tsquery('english', $3)) DESC, id ASC
+        AND ${keyword.match}
+      ORDER BY ${keyword.rank} DESC, id ASC
       LIMIT $4`,
     [spaceId, publicationState, query, limit],
   );

@@ -890,3 +890,159 @@ test("getDocument and searchDocuments overlay the item's live card doc type onto
   assert.equal(historical.historical, true);
   assert.equal(historical.contentStatus, "historical");
 });
+
+// P2-39g4. The document keyword leg has no frozen public corpus the way the
+// memory legs do (`test/recallParity.test.mjs` over `src/eval/corpus.ts`), so
+// the behavior the shared construction in `src/textSearch.ts` restores is
+// proved here directly, on chunks seeded through the real provenance chain.
+//
+// Two things, both of which the previous `websearch_to_tsquery` leg got wrong
+// or could not express:
+//
+//   1. A query carrying one ordinary word the chunk does not contain still
+//      finds the chunk. Under AND-of-terms one absent word dropped the row
+//      outright, which is the regression the recall instrument measured at
+//      0.167 on the memory corpus (docs/retrieval-parity-postgres.md).
+//   2. Ranking prefers the chunk matching more of the query's terms, so
+//      broadening the match does not flatten the ordering into arbitrary.
+test("the document keyword leg matches partial term overlap and ranks by how much matched", { skip }, async (t) => {
+  const client = await connect(await throwawayDatabase(t));
+  await applyKithSchema(client);
+  const spaceId = seedSpace();
+  const sourceAccountId = await seedSourceAccount(client, spaceId);
+  const userId = await seedUser(client);
+
+  // "broad" carries three of the query's four significant terms; "narrow"
+  // carries one. Neither contains "overdue", the ordinary word that used to
+  // drop both rows on its own.
+  const broad = "The quarterly invoice reconciliation was approved by finance.";
+  const narrow = "A reconciliation meeting is on the calendar for spring.";
+  const text = `${broad}\n${narrow}`;
+
+  const item = await provenance.createOrGetSourceItem(client, {
+    spaceId,
+    sourceAccountId,
+    externalId: "fixture/keyword-overlap.txt",
+    title: "Keyword overlap fixture",
+  });
+  const revision = await provenance.createOrGetRevision(client, {
+    spaceId,
+    sourceItemId: item.id,
+    mediaType: "text/plain",
+    inlineText: text,
+    capturedAt: new Date("2026-03-01T00:00:00Z"),
+    userId,
+  });
+  const textVersion = await provenance.createOrGetTextVersion(client, {
+    spaceId,
+    sourceRevisionId: revision.id,
+    extractionFingerprint: "extract-v1",
+    text,
+  });
+  const [page] = await provenance.stagePages(client, {
+    spaceId,
+    sourceTextVersionId: textVersion.id,
+    pages: [{ ordinal: 0, start: 0, end: text.length, text }],
+  });
+  const spans = await provenance.stageEvidenceSpans(client, {
+    spaceId,
+    sourceRevisionId: revision.id,
+    sourceTextVersionId: textVersion.id,
+    spans: [
+      { sourcePageId: page.id, ordinal: 0, start: 0, end: broad.length },
+      { sourcePageId: page.id, ordinal: 1, start: broad.length + 1, end: text.length },
+    ],
+  });
+  await provenance.setDesiredSourceRevision(client, {
+    spaceId,
+    sourceItemId: item.id,
+    desiredRevisionId: revision.id,
+    expectedDesiredProcessingEpoch: 0,
+  });
+  const generationId = (
+    await client.query(
+      `INSERT INTO kith.processing_generations
+         (id, space_id, created_at, source_account_id, source_item_id, source_revision_id, source_text_version_id,
+          desired_processing_epoch, card_generation, state)
+       VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6,1,false,'queued') RETURNING id`,
+      [opaqueId(), spaceId, sourceAccountId, item.id, revision.id, textVersion.id],
+    )
+  ).rows[0].id;
+  // One document per chunk, so the ranking this test is about is visible in
+  // the result order the caller actually sees rather than buried in citations.
+  const [broadDocument, narrowDocument] = await provenance.stageDocuments(client, {
+    spaceId,
+    processingGenerationId: generationId,
+    sourceItemId: item.id,
+    sourceRevisionId: revision.id,
+    sourceTextVersionId: textVersion.id,
+    documents: [
+      {
+        documentKey: "doc-broad",
+        title: "Quarterly reconciliation",
+        docType: "statement",
+        capturedAt: new Date("2026-03-01T00:00:00Z"),
+        evidenceSpanIds: [spans[0].id],
+      },
+      {
+        documentKey: "doc-narrow",
+        title: "Reconciliation meeting",
+        docType: "statement",
+        capturedAt: new Date("2026-03-01T00:00:00Z"),
+        evidenceSpanIds: [spans[1].id],
+      },
+    ],
+  });
+  await provenance.stageChunks(client, {
+    spaceId,
+    processingGenerationId: generationId,
+    chunks: [
+      { documentId: broadDocument.id, ordinal: 0, text: broad, evidenceSpanIds: [spans[0].id] },
+      { documentId: narrowDocument.id, ordinal: 0, text: narrow, evidenceSpanIds: [spans[1].id] },
+    ],
+  });
+  await provenance.activateSourceItemGeneration(client, {
+    spaceId,
+    sourceItemId: item.id,
+    sourceRevisionId: revision.id,
+    processingGenerationId: generationId,
+    expectedDesiredProcessingEpoch: 1,
+  });
+  await client.query("UPDATE kith.processing_generations SET state = 'ready', activated_at = transaction_timestamp() WHERE id = $1", [
+    generationId,
+  ]);
+
+  // "overdue" appears in neither chunk, and "quarterly", "invoice" and
+  // "reconciliation" appear only in `broad`. Under AND-of-terms this returned
+  // nothing at all, because of the one word neither chunk contains.
+  const overlap = await documents.searchDocuments(client, [spaceId], {
+    query: "overdue quarterly invoice reconciliation",
+  });
+  const rankedIds = overlap.results.map((result) => result.documentId);
+  assert.ok(
+    rankedIds.includes(broadDocument.id),
+    `a query with one absent ordinary word must still find the chunk, got ${JSON.stringify(rankedIds)}`,
+  );
+  assert.equal(
+    rankedIds[0],
+    broadDocument.id,
+    `the chunk matching three query terms must rank above the chunk matching one, got ${JSON.stringify(rankedIds)}`,
+  );
+  assert.ok(
+    rankedIds.includes(narrowDocument.id),
+    "the single-term chunk is still a candidate, just a lower ranked one",
+  );
+
+  // A query sharing no term with either chunk still returns nothing. The
+  // broadened match is an OR over the query's own lexemes, not a match-all.
+  const unrelated = await documents.searchDocuments(client, [spaceId], {
+    query: "hydroponic greenhouse irrigation",
+  });
+  assert.deepEqual(unrelated.results, []);
+
+  // Broadening the match does not widen the space boundary.
+  const foreign = await documents.searchDocuments(client, [seedSpace()], {
+    query: "overdue quarterly invoice reconciliation",
+  });
+  assert.deepEqual(foreign.results, []);
+});

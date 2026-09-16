@@ -43,6 +43,18 @@
 //    below cannot see different generations, so there is nothing to recover
 //    from. The first `vectorStatus = "unavailable"` path is unchanged.
 //
+// Keyword query construction (P2-39g4). The two keyword legs below, and the
+// document leg in `../documents/model.ts`, share one construction from
+// `../textSearch.ts`: the query's own stemmed lexemes OR'd together, ranked by
+// `ts_rank` so a row matching more of them sorts first. P2-39g1 built all
+// three with `websearch_to_tsquery`, which ANDs every significant token; the
+// recall instrument then measured keyword recall@10 at 0.167 on the frozen
+// corpus, because one ordinary query word absent from a terse memory dropped
+// the whole row. That helper's comment carries the measurements behind the
+// construction and the rank function. Nothing else about either leg changed:
+// the space predicate, the retrievability and status filters, the per-space
+// take, the merge and the limit are all as P2-39g1 ported them.
+//
 // SQL construction. Every identifier below is a literal in this file; every
 // value is a bind parameter, including the query vector, which is bound as
 // the text literal pgvector accepts (`'[1,0,...]'`) and cast with
@@ -57,6 +69,7 @@ import type { CardSearchHit } from "../documents/model.js";
 import { row, rows, type IdentityCtx } from "../identity/db.js";
 import { camelizeChunk } from "../provenance/rows.js";
 import { sha256Utf8 } from "../provenance/sql.js";
+import { keywordSearchSql } from "../textSearch.js";
 import {
   assertBoundedFactRead,
   assertBoundedHistoryHydration,
@@ -186,12 +199,12 @@ function boundedSearchLimit(
  * `searchByTextAuthorized`: one bounded `take(limit)` per space, then the
  * same rank-then-id merge, then one `slice(limit)`.
  *
- * Convex ranked by its own search index's relevance; here it is
- * `ts_rank(content_search, websearch_to_tsquery('english', $query))`
- * descending, with `id` ascending as the tiebreak so the merge is
- * deterministic. This is PostgreSQL ordering, not a claim of Convex ranking
- * parity -- section 4.2 of the consolidation plan measures that, and this
- * slice does not assert it.
+ * Convex ranked by its own search index's relevance; here it is `ts_rank` over
+ * the shared partial-overlap query (`../textSearch.ts`) descending, with `id`
+ * ascending as the tiebreak so the merge is deterministic. This is PostgreSQL
+ * ordering, not a claim of Convex ranking parity: section 4.2 of the
+ * consolidation plan measures recall, which P2-39g4 restored, and score-level
+ * parity is not asserted here.
  */
 async function thoughtTextCandidateIds(
   ctx: IdentityCtx,
@@ -210,10 +223,11 @@ async function thoughtTextCandidateIds(
     "Thought search query",
     MAX_THOUGHT_QUERY_CHARS,
   );
+  const keyword = keywordSearchSql("content_search", 2);
   const ranked: Array<{ id: string; rank: number }> = [];
   for (const spaceId of [...new Set(spaceIds)]) {
     const values: unknown[] = [spaceId, cleaned];
-    let where = `space_id = $1 AND content_search @@ websearch_to_tsquery('english', $2)`;
+    let where = `space_id = $1 AND ${keyword.match}`;
     if (options.type) {
       values.push(options.type);
       where += ` AND metadata ->> 'type' = $${values.length}`;
@@ -224,7 +238,7 @@ async function thoughtTextCandidateIds(
     const found = await rows<{ id: string }>(
       ctx,
       `SELECT id FROM kith.thoughts WHERE ${where}
-        ORDER BY ts_rank(content_search, websearch_to_tsquery('english', $2)) DESC, id ASC
+        ORDER BY ${keyword.rank} DESC, id ASC
         LIMIT $${values.length}`,
       values,
     );
@@ -656,12 +670,13 @@ export async function searchFacts(
   const uniqueSpaceIds = [...new Set(spaceIds)];
   assertBoundedFactRead(uniqueSpaceIds.length, limit);
   const activeAt = new Date(ctx.now);
+  const keyword = keywordSearchSql("search_text_search", 2);
   const ranked: Array<{ fact: StoredFact; rank: number }> = [];
   for (const spaceId of uniqueSpaceIds) {
     const values: unknown[] = [spaceId, cleaned];
     const where = options.includeHistorical
-      ? "space_id = $1 AND search_text_search @@ websearch_to_tsquery('english', $2) AND status <> 'retracted'"
-      : `space_id = $1 AND search_text_search @@ websearch_to_tsquery('english', $2)
+      ? `space_id = $1 AND ${keyword.match} AND status <> 'retracted'`
+      : `space_id = $1 AND ${keyword.match}
            AND status = 'current'
            AND (valid_from IS NULL OR valid_from <= $3)
            AND (valid_to IS NULL OR $3 < valid_to)`;
@@ -670,7 +685,7 @@ export async function searchFacts(
     const found = await rows<FactRow>(
       ctx,
       `SELECT ${FACT_COLUMNS} FROM kith.facts WHERE ${where}
-        ORDER BY ts_rank(search_text_search, websearch_to_tsquery('english', $2)) DESC,
+        ORDER BY ${keyword.rank} DESC,
                  created_at DESC, id DESC
         LIMIT $${values.length}`,
       values,

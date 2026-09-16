@@ -144,8 +144,18 @@ CREATE INDEX space_embedding_states_space_idx
 --
 -- This is not equivalent to what Convex's search indexes did: Convex is typo
 -- tolerant and prefix matching, PostgreSQL full-text search stems. Section
--- 4.2 measures the difference with the frozen question set; this migration
--- does not claim parity, and `pg_trgm` is the named remedy if recall drops.
+-- 4.2 measured the difference with the frozen question set, and it found a
+-- larger gap than stemming: the legs originally queried these columns with
+-- `websearch_to_tsquery`, which ANDs every significant token, so one ordinary
+-- query word absent from a terse memory dropped the row outright and
+-- keyword recall@10 came out at 0.167.
+--
+-- P2-39g4 fixed that on the query side, not here. The columns and indexes
+-- below are unchanged; `src/textSearch.ts` now builds an OR of the query's own
+-- stemmed lexemes and ranks with `ts_rank`, which the GIN indexes below still
+-- serve. Recall@10 went to 0.889, so `pg_trgm` -- the plan's named remedy if
+-- adjusting the query had not been enough -- was measured as unnecessary and
+-- is not installed. See docs/retrieval-parity-postgres.md.
 
 ALTER TABLE kith.thoughts ADD COLUMN content_search tsvector
   GENERATED ALWAYS AS (to_tsvector('english', content)) STORED;
