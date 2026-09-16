@@ -7,10 +7,8 @@ import {
 import { ConvexHttpClient } from "convex/browser";
 import { z } from "zod";
 
-import type { PostgresSurface } from "@/lib/kith/surface";
 import {
   MCP_TOOL_ANNOTATIONS,
-  mcpToolAnnotations,
   type McpToolName,
   resolveEnabledMcpToolNames,
 } from "@/lib/mcp/tool-policy";
@@ -363,29 +361,6 @@ function financeToolError(error: unknown) {
 export type McpServerCredential =
   | { surface: "convex"; convexAuthToken: string }
   | { surface: "postgres"; withPrincipal: WithMcpPrincipal };
-
-/**
- * `capture_thought`'s description, per surface.
- *
- * Every other tool's description is surface independent, because every other
- * tool does the same thing on both. This one does not, and the description is
- * the only thing a client has to go on: it is read by the model that decides
- * what to send, so a sentence that is false is not a documentation defect but a
- * wrong instruction acted on every turn.
- *
- * The Convex sentence is unchanged, byte for byte. The PostgreSQL sentence says
- * what that surface actually does, and tells the client the two things it now
- * has to do itself: not repeat a call whose outcome it did not see, since
- * nothing detects the duplicate, and not send the sensitive content the ported
- * gate would have skipped. When the admission gate lands, this map collapses
- * back to the one string. See the module comment in `writes.ts`.
- */
-const CAPTURE_THOUGHT_DESCRIPTION: Record<PostgresSurface, string> = {
-  convex:
-    "Store one atomic durable narrative memory: a decision with rationale, coherent project state, commitment, or recurring pattern whose parts change together. Use remember_fact instead for precise attributes and relationships. Never send biographies, dossiers, mixed people/projects, completed-task catalogs, activity logs, connector observations, assistant guesses, or inferred user facts. The admission gate may decline storage or request confirmation. The server deduplicates and preserves changed or corrected prior information as linked history. Requires both read and write access to the destination space.",
-  postgres:
-    "Store one atomic durable narrative memory: a decision with rationale, coherent project state, commitment, or recurring pattern whose parts change together. Use remember_fact instead for precise attributes and relationships. Never send biographies, dossiers, mixed people/projects, completed-task catalogs, activity logs, connector observations, assistant guesses, or inferred user facts. A deterministic admission check may decline storage or request confirmation. This deployment does not yet run the full admission gate: it does not deduplicate, it does not supersede a memory that a later one replaces, and it does not extract topics or people. Send one atomic memory per call, do not repeat a call whose outcome you did not observe, and never send credentials, secrets or other sensitive content. Requires both read and write access to the destination space.",
-};
 
 export function createMcpServer(
   credential: McpServerCredential | string,
@@ -1411,7 +1386,7 @@ export function createMcpServer(
 
   const captureThoughtTool = server.tool(
     MCP_TOOL_NAMES.captureThought,
-    CAPTURE_THOUGHT_DESCRIPTION[bound.surface],
+    "Store one atomic durable narrative memory: a decision with rationale, coherent project state, commitment, or recurring pattern whose parts change together. Use remember_fact instead for precise attributes and relationships. Never send biographies, dossiers, mixed people/projects, completed-task catalogs, activity logs, connector observations, assistant guesses, or inferred user facts. The admission gate may decline storage or request confirmation. The server deduplicates and preserves changed or corrected prior information as linked history. Requires both read and write access to the destination space.",
     {
       spaceId: writeSpaceSchema,
       content: z
@@ -1462,9 +1437,7 @@ export function createMcpServer(
           "True only for the small set of enduring identity facts, constraints, and preferences useful across many conversations. False explicitly demotes an existing core memory. Omit for ordinary durable memories.",
         ),
     },
-    // The one annotation that is not true on both surfaces: `idempotentHint`
-    // drops to false under `postgres`, because nothing there detects a repeat.
-    mcpToolAnnotations(MCP_TOOL_NAMES.captureThought, bound.surface),
+    MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.captureThought],
     async ({
       spaceId,
       content,
