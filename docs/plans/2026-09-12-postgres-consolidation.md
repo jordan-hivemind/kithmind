@@ -439,6 +439,42 @@ by the existing finance decimal rules before they reach `NUMERIC`.
 - Verification shape: `pnpm --filter @repo/kith-store test:once` covering one
   synthetic fixture per table, plus `--dry-run --report-unmapped`.
 
+### Step 3.5. Audit the transform's output against the kith constraints
+
+A dry run of step 4's constraints, between Transform and Load: it belongs here
+rather than as a mode of step 4, because step 4's job is to prove the load a
+real cutover will run, on `--strict` semantics that must keep aborting on the
+first violation exactly as production loading would. This step's job is the
+opposite: find and name every violation the same schema would raise, before
+anyone pays for a `--strict` load that stops at the first one and forces a
+fix-one-row-rerun-whole-load cycle. `packages/kith-migrate`'s transform (step
+3) only checks JavaScript types; the `kith` schema migrations
+(`packages/kith-store/src/migrations/*.sql`) add `CHECK` constraints (enum
+states, integer bounds, hash formats, cross-column rules such as retired
+target coverage), foreign keys, `UNIQUE` constraints and `NOT NULL` columns a
+legacy Convex row can still violate. This step loads the transformed CSVs into
+an isolated destination's own shape, minus every constraint, then asks
+Postgres's own catalog (`pg_constraint`, `pg_index`) which staged rows would
+fail each one, and reports every violation rather than the first. It never
+re-encodes a constraint's rule in TypeScript: the expression it evaluates is
+read back from the schema itself, so a migration 018 (or later) `CHECK`
+constraint is covered with no change to this step.
+
+- Acceptance: every violation is reported, not just the first, naming the
+  table, row id, constraint and offending value; the audit never generates an
+  id and never writes to a live or unnamed database; a constraint the audit
+  cannot evaluate (one reaching a column outside the transform's mapped set)
+  is named in the report rather than silently skipped; exit status is
+  non-zero when any violation exists.
+- Verification shape:
+  `kith-migrate audit --csv <transform-out> --database-url <isolated>`, or
+  `auditCsvDirectory` directly. `pnpm --filter @repo/kith-migrate
+  test:integration` (env: `KITH_MIGRATE_TEST_DATABASE_URL`, or a local
+  throwaway Postgres) covers a clean fixture (zero violations) and a fixture
+  with deliberately bad rows across an invalid enum state, a bad integer
+  dimension, a malformed hash and a foreign key to a missing parent, all
+  reported in one pass.
+
 ### Step 4. Load into an isolated destination
 
 Load into a throwaway database or branch, never the live archive database.

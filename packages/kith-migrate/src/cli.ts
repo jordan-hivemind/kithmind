@@ -2,6 +2,7 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { parseArgs } from "node:util";
 
+import { auditCsvDirectory } from "./audit.js";
 import { generateKithMigrateTablesSql } from "./ddl.js";
 import { exportConvexData, verifyManifest, type ExportManifest } from "./export.js";
 import { loadCsvDirectory } from "./load.js";
@@ -74,6 +75,18 @@ async function main(): Promise<void> {
       if (!values["report-unmapped"] && report.unmapped.length) process.exit(1);
       return;
     }
+    case "audit": {
+      // Plan section 3, "Step 3.5": run before "load" (`--strict` still
+      // aborts on the first violation) against an isolated or throwaway
+      // destination, never the live archive database.
+      const csv = values.csv ?? fail("--csv required");
+      const databaseUrl = values["database-url"] ?? fail("--database-url required");
+      const report = await auditCsvDirectory({ connectionString: databaseUrl }, csv);
+      await writeFile(`${csv}/audit-report.json`, JSON.stringify(report, null, 2));
+      process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+      if (!report.ok) process.exit(1);
+      return;
+    }
     case "load": {
       const csv = values.csv ?? fail("--csv required");
       const databaseUrl = values["database-url"] ?? fail("--database-url required");
@@ -105,7 +118,7 @@ async function main(): Promise<void> {
     }
     default:
       fail(
-        "usage: kith-migrate <ddl:generate|export|transform|load|parity> [options]",
+        "usage: kith-migrate <ddl:generate|export|transform|audit|load|parity> [options]",
       );
   }
 }
