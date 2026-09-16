@@ -39,74 +39,46 @@
 // | `capture_thought` | `memory.captureThought`        | the explicit read+write check, then both grants    |
 // | `ingest_url`      | `ingestion.enqueueSourceFetch` | `resolveIngestSourceAccount` -> `(ingest)`         |
 //
-// ## What `capture_thought` does not carry across
+// ## `capture_thought`'s admission gate
 //
-// `models/thoughts/mcpActions.capture` runs a model-backed admission gate:
-// it embeds the content, vector-searches the destination space for similar
-// current thoughts, reads the structured facts that already cover the subject,
-// and asks a classifier for one of ADD, NOOP, SUPERSEDE, RETRACT, ASK or SKIP,
-// which is also where the stored metadata comes from. None of that lane is on
-// PostgreSQL: `searchCoveringFacts` and the capture-time vector candidate
-// search are not ported, and the classifier is a Convex action. It also cannot
-// run inside this call, because an embedding request and a model call are
-// outbound HTTP and section 4.4 forbids holding a `pg` connection across one.
+// `mcpActions.capture` runs a model-backed gate before it stores anything: it
+// embeds the content, vector-searches the destination space for similar current
+// memories, reads the structured facts that already cover the subject, and asks
+// a classifier for ADD, NOOP, SUPERSEDE, RETRACT, ASK or SKIP -- which is also
+// where the stored metadata comes from. That gate makes two outbound calls, and
+// section 4.4 forbids holding a `pg` connection across either, so it cannot be
+// the one transaction the rule above describes.
 //
-// So the PostgreSQL lane runs the whole provider-free half of the Convex
-// original, in the Convex original's order, and then takes its ADD branch:
-// unknown grounding is still refused, `preflightNarrativeAdmission` still
-// declines a derived age or a broad bucket, and an admitted capture is stored
-// with `fallbackThoughtMetadata` -- which is the metadata Convex itself stores
-// on ADD when the classifier returned no analysis.
-//
-// Five things are missing, and the first is the one that decides whether this
-// surface may carry traffic:
-//
-//  1. **Fail-closed becomes fail-open.** The Convex original is fail-closed. If
-//     the classifier is unavailable, errors or returns something unparseable,
-//     `actions.ts:300-308` returns `needs_confirmation` with "Memory was not
-//     stored because the admission check was unavailable" and writes nothing:
-//     no gate, no storage. This lane has no classifier at all and stores
-//     unconditionally once the deterministic preflight passes. The same absence
-//     that stops Convex storing is what lets this store. That inversion is the
-//     gap, not a smaller version of the gate.
-//  2. **SKIP for sensitive content is gone.** `classify.ts:95` makes SKIP cover
-//     content that is "transient, incidental, derived, speculative, sensitive",
-//     and `classify.ts:101-102` names credentials and secrets explicitly. The
-//     preflight covers none of that: it knows derived ages, bullet counts,
-//     sentence counts and a few broad headings. A password pasted into
-//     `capture_thought` is refused on Convex and stored here.
-//  3. Duplicates are not detected, so a repeated capture stores a second row.
-//  4. A changed fact does not supersede its predecessor, so contradictory
-//     memories accumulate as equally current.
-//  5. Topics, people, action items and the summary are not extracted; every
-//     stored thought is `type: "reference"` with empty lists.
-//
-// Two published claims are false on this surface while that is true, so both
-// are corrected rather than left standing. `tool-policy.ts`'s
-// `idempotentHint: true` for `capture_thought` is a claim that repeating a call
-// is safe, which (3) makes false: `mcpToolAnnotations` returns
-// `idempotentHint: false` for it under `postgres`. The tool description's "The
-// admission gate may decline storage or request confirmation. The server
-// deduplicates and preserves changed or corrected prior information as linked
-// history." is false in its second sentence and overstated in its first, so
-// `server.ts` sends a different sentence under `postgres` that says what this
-// deployment actually does. Both revert to the Convex wording the moment the
-// gate lands, which is the point of doing it at the seam.
-//
-// This is recorded here, in section 6 row i4 of the surface plan, and on row
-// P2-39m of the parent plan, because it blocks the flag flip and a tracker
-// reading only the slice row would not see it.
+// It is therefore the one exception, and its shape is authorize, call out,
+// re-authorize and apply: one `SERIALIZABLE` transaction that authorizes,
+// resolves the destination and runs every provider-free branch; the embedding
+// call; one `REPEATABLE READ READ ONLY` transaction that re-authorizes and
+// gathers candidates and covering facts from that destination alone; the
+// classification call; and one `SERIALIZABLE` transaction that re-authorizes
+// and applies the decision. A capture that stops at a provider-free branch, and
+// a denial, still cost one transaction. The pipeline lives in
+// `lib/kith/capture.ts`, because the web Quick Capture button runs the same one.
 
 import { api } from "@repo/db/convex/_generated/api";
 import type { Id } from "@repo/db/convex/_generated/dataModel";
 import { ingestion, memory } from "@repo/kith-store";
+import { resolveWriteSpace } from "@repo/kith-store/identity";
+
 import {
-  requireSpaceAccess,
-  resolveWriteSpace,
-} from "@repo/kith-store/identity";
+  type CaptureThoughtArgs,
+  type CaptureThoughtMetadata,
+  type CaptureThoughtResult,
+  runCaptureThought,
+} from "@/lib/kith/capture";
 
 import type { WithMcpPrincipal } from "./principal";
 import type { ConvexGateway } from "./reads";
+
+export type {
+  CaptureThoughtArgs,
+  CaptureThoughtMetadata,
+  CaptureThoughtResult,
+};
 
 /** The value `server.ts` hands over: a datetime is already epoch milliseconds. */
 export type FactValueArg =
@@ -145,39 +117,6 @@ export type RememberFactResult = {
   factId: string;
   statement: string;
   operation: "stored" | "noop" | "superseded" | "corrected";
-};
-
-export type CaptureThoughtArgs = {
-  spaceId?: string;
-  content: string;
-  sourceType?: "user_stated" | "user_confirmed" | "assistant_commitment";
-  sourceRef?: string;
-  observedAt?: number;
-  batchId?: string;
-  validFrom?: number;
-  validTo?: number;
-  isCore?: boolean;
-};
-
-export type CaptureThoughtMetadata = {
-  type: string;
-  topics: string[];
-  people: string[];
-  actionItems: string[];
-  summary: string;
-};
-
-export type CaptureThoughtResult = {
-  thoughtId?: string;
-  metadata: CaptureThoughtMetadata;
-  disposition:
-    | "stored"
-    | "duplicate"
-    | "superseded"
-    | "corrected"
-    | "needs_confirmation"
-    | "skipped";
-  operationSummary?: string;
 };
 
 export type IngestUrlArgs = {
@@ -234,19 +173,6 @@ export function convexWrites(convex: ConvexGateway): McpWrites {
 // The PostgreSQL surface
 // ---------------------------------------------------------------------------
 
-/** `mcpActions.capture`'s provenance bound, kept verbatim. */
-function assertValidProvenance(args: CaptureThoughtArgs): void {
-  if (
-    (args.observedAt !== undefined && !Number.isFinite(args.observedAt)) ||
-    (args.sourceRef !== undefined &&
-      (!args.sourceRef.trim() || args.sourceRef.length > 500)) ||
-    (args.batchId !== undefined &&
-      (!args.batchId.trim() || args.batchId.length > 160))
-  ) {
-    throw new Error("Invalid memory provenance");
-  }
-}
-
 export function postgresWrites(withPrincipal: WithMcpPrincipal): McpWrites {
   return {
     async rememberFact({ spaceId, ...args }) {
@@ -267,12 +193,15 @@ export function postgresWrites(withPrincipal: WithMcpPrincipal): McpWrites {
     },
 
     async captureThought(args) {
-      return await withPrincipal(
-        async ({ ctx, principal }): Promise<CaptureThoughtResult> => {
-          // `mcpActions.capture`'s own check, before anything else it does.
-          // It is by hand there and by hand here because capture needs *both*
-          // capabilities on the destination, which no single
-          // `requireSpaceAccess` call expresses.
+      // The admission gate, in `lib/kith/capture.ts` because the web Quick
+      // Capture button runs the same one. The only thing this surface adds is
+      // `mcpActions.capture`'s own capability check, which is by hand there and
+      // by hand here because capture needs *both* capabilities on the
+      // destination and no single `requireSpaceAccess` call expresses that. It
+      // runs inside the gate's first transaction, against the reloaded
+      // principal, before the destination is resolved: the original's order.
+      return await runCaptureThought(withPrincipal, args, {
+        authorize: (principal) => {
           if (
             !principal.capabilities.includes("read") ||
             !principal.capabilities.includes("write")
@@ -281,78 +210,8 @@ export function postgresWrites(withPrincipal: WithMcpPrincipal): McpWrites {
               "Thought capture requires read and write capabilities",
             );
           }
-          const destination = await resolveWriteSpace(
-            ctx,
-            principal,
-            args.spaceId,
-          );
-          // `requireCaptureAccessForAction`: both grants on the resolved
-          // space. `resolveWriteSpace` already proved `write`; `read` is the
-          // half it does not cover, and the repeat of `write` is kept so the
-          // two surfaces refuse in the same order.
-          await requireSpaceAccess(ctx, principal, destination, "read");
-          await requireSpaceAccess(ctx, principal, destination, "write");
-
-          memory.assertValidMemoryValidity(args);
-          assertValidProvenance(args);
-          const content = memory.normalizeCaptureContent(args.content);
-
-          // A client connected before `sourceType` existed cannot supply it.
-          // Absence is ungrounded rather than `user_stated`, which is the
-          // laundering this field exists to prevent.
-          if (args.sourceType === undefined) {
-            return {
-              metadata: memory.fallbackThoughtMetadata(content),
-              disposition: "needs_confirmation",
-              operationSummary:
-                "Memory was not stored because its grounding is unknown. Resend with sourceType once the user has stated or confirmed it",
-            };
-          }
-          const preflight = memory.preflightNarrativeAdmission(content);
-          if (preflight) {
-            return {
-              metadata: memory.fallbackThoughtMetadata(content),
-              disposition:
-                preflight.action === "ASK" ? "needs_confirmation" : "skipped",
-              operationSummary:
-                preflight.action === "ASK"
-                  ? `Memory was not stored: ${preflight.reason}`
-                  : `Memory was skipped: ${preflight.reason}`,
-            };
-          }
-
-          // The ADD branch, with the metadata the Convex original also stores
-          // when it has no analysis. See the module comment for the half of
-          // the gate that is not ported.
-          const metadata = memory.fallbackThoughtMetadata(content);
-          const thoughtId = await memory.captureThought(
-            ctx,
-            principal.userId,
-            destination,
-            {
-              content,
-              metadata,
-              ...(args.validFrom === undefined
-                ? {}
-                : { validFrom: args.validFrom }),
-              ...(args.validTo === undefined ? {} : { validTo: args.validTo }),
-              ...(args.isCore === undefined ? {} : { isCore: args.isCore }),
-              sourceType: args.sourceType,
-              ...(args.sourceRef === undefined
-                ? {}
-                : { sourceRef: args.sourceRef.trim() }),
-              ...(args.observedAt === undefined
-                ? {}
-                : { observedAt: args.observedAt }),
-              ...(args.batchId === undefined
-                ? {}
-                : { batchId: args.batchId.trim() }),
-              confidence: 1,
-            },
-          );
-          return { thoughtId, metadata, disposition: "stored" };
         },
-      );
+      });
     },
 
     async ingestUrl({ spaceId, ...input }) {
