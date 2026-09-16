@@ -53,6 +53,7 @@ export {
   PASSWORD_PROVIDER,
   SESSION_COOKIE_NAME,
   SESSION_DURATION_MS,
+  SESSION_TOUCH_MIN_MS,
   changePassword,
   clearedSessionCookie,
   createSession,
@@ -61,6 +62,7 @@ export {
   readSessionCookie,
   removeExpiredSessions,
   requireWebPrincipal,
+  requireWebSession,
   requireWebUserId,
   resolveSessionToken,
   revokeSession,
@@ -70,9 +72,12 @@ export {
   signIn,
   signOut,
   signUp,
+  touchSession,
   type AuthAccount,
   type SessionConfig,
   type SessionRecord,
+  type SessionRequest,
+  type SessionResolveOptions,
 } from "./webAuth.js";
 
 export {

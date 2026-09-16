@@ -408,6 +408,52 @@ export async function withKithTransaction<T>(
 }
 
 /**
+ * One read: one `REPEATABLE READ READ ONLY` transaction on one checked-out
+ * client, with no retry loop.
+ *
+ * Section 4.2 of the web and MCP surface plan splits the two transaction
+ * shapes. A read tool, a page or a `GET` route needs one snapshot across
+ * several service calls so that two halves of one answer cannot come from two
+ * different moments, and it needs nothing else.
+ *
+ * `REPEATABLE READ` rather than `SERIALIZABLE`, because that is exactly the
+ * snapshot a read needs: a read-only `SERIALIZABLE` transaction can still fail
+ * with a serialization error that the caller would then have to retry, and
+ * paying for a retry loop on a path that writes nothing buys no correctness.
+ * Hence no retry loop here, which is also why this is a plain
+ * `pool.connect()` rather than a copy of the attempt loop above.
+ *
+ * `READ ONLY` is the server's refusal, not a convention: a write inside this
+ * block fails with SQLSTATE 25006 at the statement that issued it. That is
+ * what makes "no page issues a write" a checkable property rather than a
+ * claim, and it is why a read path must never be handed a service function
+ * that touches a row -- `resolveSessionToken`'s `last_used_at` refresh being
+ * the first one, which is why that refresh is opt-in (`webAuth.ts`).
+ */
+export async function withKithReadTransaction<T>(
+  pool: pg.Pool,
+  work: (client: pg.PoolClient) => Promise<T>,
+): Promise<T> {
+  const client = await pool.connect();
+  try {
+    return await withSchemaTransaction(
+      client,
+      KITH_SCHEMA,
+      (inner) => work(inner as pg.PoolClient),
+      {
+        isolation: "REPEATABLE READ",
+        readOnly: true,
+        statementTimeoutMs: KITH_STATEMENT_TIMEOUT_MS,
+        lockTimeoutMs: KITH_LOCK_TIMEOUT_MS,
+        idleInTransactionTimeoutMs: KITH_IDLE_TRANSACTION_TIMEOUT_MS,
+      },
+    );
+  } finally {
+    client.release();
+  }
+}
+
+/**
  * `kith_reader`: the read-only role for owner SQL exploration, created through
  * the same code path as `finance_reader` (`@repo/pg`). The privilege state, and
  * the seventeen attacks it has to refuse, are proven by the finance archive's

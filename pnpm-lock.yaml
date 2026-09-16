@@ -41,6 +41,9 @@ importers:
       '@repo/finance-contract':
         specifier: workspace:*
         version: link:../../packages/finance-contract
+      '@repo/kith-store':
+        specifier: workspace:*
+        version: link:../../packages/kith-store
       convex:
         specifier: ^1.43.0
         version: 1.43.0(react@19.2.8)
@@ -50,6 +53,9 @@ importers:
       next:
         specifier: ^15.5.25
         version: 15.5.25(@types/node@25.3.3)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
+      pg:
+        specifier: ^8.23.0
+        version: 8.23.0
       react:
         specifier: ^19.0.0
         version: 19.2.8
@@ -72,6 +78,9 @@ importers:
       '@types/node':
         specifier: 25.3.3
         version: 25.3.3
+      '@types/pg':
+        specifier: ^8.23.1
+        version: 8.23.1
       '@types/react':
         specifier: ^19.0.0
         version: 19.2.18

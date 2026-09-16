@@ -30,7 +30,12 @@
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 
 import { newKithId } from "../ids.js";
-import { userExists, webPrincipal, type Principal } from "./authorization.js";
+import {
+  ensurePersonalSpace,
+  userExists,
+  webPrincipal,
+  type Principal,
+} from "./authorization.js";
 import { at, exec, ms, row, type IdentityCtx } from "./db.js";
 import { IdentityError, notAuthenticated } from "./errors.js";
 import { sha256 as sha256Hex } from "../hash.js";
@@ -44,6 +49,30 @@ export const SESSION_DURATION_MS = 1000 * 60 * 60 * 24 * 365 * 10;
 
 /** The cookie name. Host-prefixed, so a subdomain cannot set it. */
 export const SESSION_COOKIE_NAME = "__Host-kith_session";
+
+/**
+ * How stale `kith.sessions.last_used_at` may get before a resolve refreshes it.
+ *
+ * Five minutes. The column had no writer at all before P2-39i -- it was set at
+ * insert and never updated -- so every session looked last used at the moment it
+ * was created, which is the wrong answer for both of its readers: the owner
+ * looking at which sessions are still in use, and any future idle-session
+ * policy built on it.
+ *
+ * Refreshing it on every resolve is the obvious fix and the wrong one: a session
+ * is resolved once per page load and once per authenticated request, so an
+ * unthrottled refresh turns every read into a write, takes a row lock on the hot
+ * session row for the length of the request, and makes the write rate a function
+ * of traffic rather than of anything anyone wants to know.
+ *
+ * Five minutes bounds that to at most 12 writes an hour per session no matter
+ * how many requests arrive, while keeping the column accurate to within one
+ * window. Nothing reads it at finer resolution than "recently, or not": a
+ * shorter window would buy precision no consumer uses, and a longer one starts
+ * to make a session used twenty minutes ago indistinguishable from one used only
+ * at sign-in, which is the state this fixes.
+ */
+export const SESSION_TOUCH_MIN_MS = 5 * 60 * 1000;
 
 /** The library's own rule, kept: under 8 characters is not a password. */
 const MIN_PASSWORD_LENGTH = 8;
@@ -66,7 +95,29 @@ export type SessionRecord = {
   id: string;
   userId: string;
   expiresAt: number;
+  lastUsedAt: number | null;
   revokedAt: number | null;
+};
+
+/**
+ * Whether a resolve may refresh `last_used_at`.
+ *
+ * Off by default, and that default is the security-relevant part rather than a
+ * convenience. A read path runs inside `withKithReadTransaction`, which issues
+ * `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY`, and the server refuses any
+ * write under it with SQLSTATE 25006. A resolve that wrote unconditionally
+ * would therefore turn every read-only page into a 25006 failure, and the
+ * version of this that "fixed" that by catching the error would abort the
+ * transaction anyway, because a failed statement poisons the whole one.
+ *
+ * So the caller says. A route or a page already inside a read-write
+ * `withKithTransaction` passes `touch: true`; anything read-only leaves it
+ * alone and reads a `last_used_at` that is at most `SESSION_TOUCH_MIN_MS`
+ * stale. The decision is visible at each call site instead of being a property
+ * of a function three layers down.
+ */
+export type SessionResolveOptions = {
+  readonly touch?: boolean;
 };
 
 function requireSecret(config: SessionConfig): string {
@@ -197,16 +248,18 @@ export async function createSession(
 export async function resolveSessionToken(
   ctx: IdentityCtx,
   token: string | null,
+  options: SessionResolveOptions = {},
 ): Promise<SessionRecord | null> {
   if (token === null || !/^[0-9a-f]{64}$/.test(token)) return null;
   const record = await row<{
     id: string;
     user_id: string;
     expires_at: Date;
+    last_used_at: Date | null;
     revoked_at: Date | null;
   }>(
     ctx,
-    `SELECT id, user_id, expires_at, revoked_at FROM kith.sessions
+    `SELECT id, user_id, expires_at, last_used_at, revoked_at FROM kith.sessions
        WHERE token_hash = $1`,
     [sha256Hex(token)],
   );
@@ -215,10 +268,46 @@ export async function resolveSessionToken(
     id: record.id,
     userId: record.user_id,
     expiresAt: ms(record.expires_at)!,
+    lastUsedAt: ms(record.last_used_at),
     revokedAt: ms(record.revoked_at),
   };
   if (session.revokedAt !== null || session.expiresAt <= ctx.now) return null;
+  // Only a live session is touched. A revoked or expired one keeps the moment
+  // it was last genuinely used, which is what makes the column readable after
+  // the fact.
+  if (options.touch === true) return await touchSession(ctx, session);
   return session;
+}
+
+/**
+ * Refreshes `last_used_at` when it is at least `SESSION_TOUCH_MIN_MS` stale,
+ * and returns the session as it now stands.
+ *
+ * The throttle is in the `WHERE` as well as in the branch above it, so two
+ * concurrent requests reading the same stale row cannot both write: the second
+ * one's `UPDATE` matches nothing and it keeps the value it already had.
+ */
+export async function touchSession(
+  ctx: IdentityCtx,
+  session: SessionRecord,
+): Promise<SessionRecord> {
+  if (
+    session.lastUsedAt !== null &&
+    ctx.now - session.lastUsedAt < SESSION_TOUCH_MIN_MS
+  ) {
+    return session;
+  }
+  const updated = await row<{ last_used_at: Date | null }>(
+    ctx,
+    `UPDATE kith.sessions SET last_used_at = $2
+       WHERE id = $1
+         AND revoked_at IS NULL
+         AND (last_used_at IS NULL OR last_used_at <= $3)
+       RETURNING last_used_at`,
+    [session.id, at(ctx.now), at(ctx.now - SESSION_TOUCH_MIN_MS)],
+  );
+  if (!updated) return session;
+  return { ...session, lastUsedAt: ms(updated.last_used_at) };
 }
 
 /** Revokes one session. Logout, server side, not a cleared cookie. */
@@ -276,25 +365,59 @@ export async function removeExpiredSessions(
  */
 export async function requireWebUserId(
   ctx: IdentityCtx,
-  args: { config: SessionConfig; cookieHeader: string | null | undefined },
+  args: SessionRequest,
 ): Promise<string> {
+  return (await requireWebSession(ctx, args)).session.userId;
+}
+
+/**
+ * The authenticated caller, with the user's own unnarrowed authority.
+ *
+ * Both this and `requireWebUserId` check the live user row, as the Convex
+ * helper did. `requireWebUserId` did not before P2-39i; it does now, because
+ * two entry points to one credential that disagree about whether a deleted
+ * user's session still authenticates is exactly the kind of difference nobody
+ * notices until it matters.
+ */
+export async function requireWebPrincipal(
+  ctx: IdentityCtx,
+  args: SessionRequest,
+): Promise<Principal> {
+  return (await requireWebSession(ctx, args)).principal;
+}
+
+/** What every authenticated entry point takes: the key and the cookie header. */
+export type SessionRequest = SessionResolveOptions & {
+  config: SessionConfig;
+  cookieHeader: string | null | undefined;
+};
+
+/**
+ * The one path from a cookie to an authenticated caller: parse, resolve, check
+ * the live user row.
+ *
+ * `requireWebUserId` and `requireWebPrincipal` are both this function, so there
+ * is exactly one place where a cookie becomes authority and no second
+ * implementation to keep in step. It also returns the session itself, which
+ * `change-password` needs in order to keep the caller signed in on the session
+ * they are changing the password from while revoking every other one; deriving
+ * that by resolving the same token twice would be a second read of the same row
+ * that could, on a non-repeatable-read isolation level, disagree with the first.
+ */
+export async function requireWebSession(
+  ctx: IdentityCtx,
+  args: SessionRequest,
+): Promise<{ principal: Principal; session: SessionRecord }> {
   const token = parseSessionToken(
     args.config,
     readSessionCookie(args.cookieHeader),
   );
-  const session = await resolveSessionToken(ctx, token);
+  const session = await resolveSessionToken(ctx, token, {
+    touch: args.touch,
+  });
   if (!session) notAuthenticated();
-  return session.userId;
-}
-
-/** `requireWebUserId` plus the live user row, as the Convex helper did. */
-export async function requireWebPrincipal(
-  ctx: IdentityCtx,
-  args: { config: SessionConfig; cookieHeader: string | null | undefined },
-): Promise<Principal> {
-  const userId = await requireWebUserId(ctx, args);
-  if (!(await userExists(ctx, userId))) notAuthenticated();
-  return webPrincipal(userId);
+  if (!(await userExists(ctx, session.userId))) notAuthenticated();
+  return { principal: webPrincipal(session.userId), session };
 }
 
 export type AuthAccount = {
@@ -358,7 +481,26 @@ function requireValidEmail(email: unknown): string {
   return email;
 }
 
-/** A new account, its user, its personal space records and a session. */
+/**
+ * A new account, its user, its personal space records and a session.
+ *
+ * The personal space records are created here rather than only at the route,
+ * which is the defect P2-39i's plan found in section 1.5: this doc comment
+ * already promised them and the function did not create them. Both fixes keep
+ * one transaction per sign-up, because the route wraps the whole thing in one
+ * `withKithTransaction` either way, so that is not what decides it. What decides
+ * it is that this is the only place a `kith.users` row is created. If the
+ * personal space is the caller's job then every future creator of a user -- a
+ * seed script, a test, an invitation path -- has to remember a second call, and
+ * forgetting it fails silently: the user signs in, and the missing
+ * `user_space_settings` row surfaces much later and somewhere else as "Personal
+ * space is not configured". Making it unconditional here makes that
+ * unrepresentable.
+ *
+ * `ensurePersonalSpace` is idempotent, so the sign-up route calling it again per
+ * section 2.2 of the surface plan stays correct and costs one extra read in the
+ * same transaction.
+ */
 export async function signUp(
   ctx: IdentityCtx,
   args: { email: string; password: string; name?: string },
@@ -394,6 +536,7 @@ export async function signUp(
       await hashPassword(password),
     ],
   );
+  await ensurePersonalSpace(ctx, userId);
   return { userId, ...(await createSession(ctx, userId)) };
 }
 

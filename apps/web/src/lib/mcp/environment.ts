@@ -10,10 +10,43 @@ export const REQUIRED_MCP_ENVIRONMENT_VARIABLES = [
   "MCP_OAUTH_ENCRYPTION_KEY",
 ] as const;
 
+/**
+ * The three variables P2-39i adds (surface plan section 3.4).
+ *
+ * They are not in `REQUIRED_MCP_ENVIRONMENT_VARIABLES`, because that list is
+ * what every deployment must have and these are what the PostgreSQL surface
+ * must have. `KITH_POSTGRES_SURFACE` defaults to `convex` and the flag does not
+ * flip until row m, so requiring them now would report the current production
+ * deployment as misconfigured for not yet having been migrated.
+ *
+ * What is checked instead: the surface value itself is always validated, so a
+ * typo is named here rather than silently reading as `convex`; the two secrets
+ * are required only when the surface is `postgres`; and a value that is present
+ * but malformed is invalid in either mode, because a secret that is too short
+ * under `convex` is a secret that will be too short the moment the flag flips.
+ *
+ * i7 moves `KITH_DATABASE_URL` into the required list and removes
+ * `NEXT_PUBLIC_CONVEX_URL` from it.
+ */
 export type McpEnvironmentVariable =
   | (typeof REQUIRED_MCP_ENVIRONMENT_VARIABLES)[number]
   | "MCP_JWT_KEY_ID"
-  | "MCP_TOOL_PROFILE";
+  | "MCP_TOOL_PROFILE"
+  | "KITH_DATABASE_URL"
+  | "KITH_SESSION_SECRET"
+  | "KITH_POSTGRES_SURFACE";
+
+/** What `KITH_SESSION_SECRET` must be, restated from `lib/kith/session.ts`. */
+const MIN_KITH_SESSION_SECRET_LENGTH = 32;
+
+function isPostgresConnectionString(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "postgres:" || url.protocol === "postgresql:";
+  } catch {
+    return false;
+  }
+}
 
 export type McpEnvironmentIssue = {
   name: McpEnvironmentVariable;
@@ -155,6 +188,35 @@ export function validateMcpEnvironment(
     toolProfile !== "full"
   ) {
     issues.push({ name: "MCP_TOOL_PROFILE", problem: "invalid" });
+  }
+
+  const surface = environment.KITH_POSTGRES_SURFACE;
+  if (
+    surface !== undefined &&
+    surface !== "" &&
+    surface !== "convex" &&
+    surface !== "postgres"
+  ) {
+    issues.push({ name: "KITH_POSTGRES_SURFACE", problem: "invalid" });
+  }
+  const onPostgres = surface === "postgres";
+
+  const databaseUrl = environment.KITH_DATABASE_URL;
+  if (databaseUrl === undefined || databaseUrl === "") {
+    if (onPostgres) {
+      issues.push({ name: "KITH_DATABASE_URL", problem: "missing" });
+    }
+  } else if (!isPostgresConnectionString(databaseUrl)) {
+    issues.push({ name: "KITH_DATABASE_URL", problem: "invalid" });
+  }
+
+  const sessionSecret = environment.KITH_SESSION_SECRET;
+  if (sessionSecret === undefined || sessionSecret === "") {
+    if (onPostgres) {
+      issues.push({ name: "KITH_SESSION_SECRET", problem: "missing" });
+    }
+  } else if (sessionSecret.length < MIN_KITH_SESSION_SECRET_LENGTH) {
+    issues.push({ name: "KITH_SESSION_SECRET", problem: "invalid" });
   }
 
   return issues;
