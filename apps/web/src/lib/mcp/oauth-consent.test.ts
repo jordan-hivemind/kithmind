@@ -1,4 +1,5 @@
 import { api } from "@repo/db/convex/_generated/api";
+import { ConvexError } from "convex/values";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 const mocks = vi.hoisted(() => ({ token: vi.fn(), mutation: vi.fn() }));
 vi.mock("server-only", () => ({}));
@@ -157,6 +158,26 @@ describe("OAuth space consent", () => {
       request({ spaceIds: ["space"], capabilities: ["read"] }),
     );
     expect(response.status).toBe(409);
+    expect(mocks.mutation).toHaveBeenCalledTimes(1);
+  });
+
+  test("maps the typed space_not_found read denial to 403, naming no space", async () => {
+    // What `beginAuthorizationGrant` throws unchanged when
+    // `getAuthorizedReadSpaceIds` refuses a space the session cannot read: the
+    // same `ConvexError` shape the PostgreSQL port's `spaceReadNotFound()`
+    // carries. The route's `oauthMutationErrorResponse` switch must map this
+    // on both surfaces so the dark-deploy comparison stays valid.
+    mocks.mutation.mockReset();
+    mocks.mutation.mockRejectedValueOnce(
+      new ConvexError({ code: "space_not_found", message: "Space not found" }),
+    );
+    const response = await POST(
+      request({ spaceIds: ["space-the-session-cannot-read"], capabilities: ["read"] }),
+    );
+    expect(response.status).toBe(403);
+    const body = await response.json();
+    expect(body).toEqual({ error: "Selected space is not available" });
+    expect(JSON.stringify(body)).not.toContain("space-the-session-cannot-read");
     expect(mocks.mutation).toHaveBeenCalledTimes(1);
   });
 });

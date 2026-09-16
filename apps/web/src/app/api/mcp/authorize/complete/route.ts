@@ -98,6 +98,16 @@ function oauthMutationErrorResponse(error: unknown): Response | undefined {
       return errorResponse("Invalid authorization request", 400);
     case "authorization_revoked":
       return errorResponse("Selected access is no longer available", 403);
+    // The typed read denial `getAuthorizedReadSpaceIds` raises for a space the
+    // session cannot read. `beginAuthorizationGrant` rethrows it unchanged
+    // (both backends: `error.data !== undefined` on the PostgreSQL side,
+    // `error instanceof ConvexError` on the Convex one), so it reaches here
+    // as a typed code rather than falling into `authorization_revoked`, which
+    // is reserved for a scope that was granted and then lost. Same status as
+    // that case and the same rule: the body names no space id, so a caller
+    // cannot enumerate spaces by which ones come back 403 versus 500.
+    case "space_not_found":
+      return errorResponse("Selected space is not available", 403);
     case "grant_not_found":
     case "grant_expired":
     case "grant_consumed":

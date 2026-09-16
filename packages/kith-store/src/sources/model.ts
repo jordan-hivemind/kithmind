@@ -17,17 +17,23 @@
 // as `by_space_connector_account` is read by application code elsewhere in this
 // migrated set.
 //
-// Two Convex side effects on the `update` mutation are deliberately not ported
-// in this slice: `advanceSourceAssessmentEpoch` (models/ingestion/model.ts) and
-// `onSourceEnabledChanged` (models/diagnostics/model.ts), both called only when
-// `enabled` actually changes. Both reach into the worker-diagnostics and
-// ingestion-assessment domains, which are concurrently owned PostgreSQL work in
-// this repository; porting them here would either duplicate that work or race
-// it. The settings page's create/update/list behavior does not depend on
-// either -- neither Convex test file for `sourceAccounts` exercises them
-// through `public.ts` -- so `enabled` is written straight through and the two
-// side effects are left for whichever row ports `models/ingestion/model.ts` and
-// `models/diagnostics/model.ts` to PostgreSQL.
+// P2-39i0 (the create/update/list port below) left two Convex side effects of
+// the `update` mutation unported: `advanceSourceAssessmentEpoch`
+// (models/ingestion/model.ts) and `onSourceEnabledChanged`
+// (models/diagnostics/model.ts), both run only when a caller actually changes
+// `enabled`. This slice (P2-39i0 follow-up) ports both, now that
+// `../workers/diagnostics.ts` (P2-39j) owns the worker-watcher and
+// missing-worker-incident tables `onSourceEnabledChanged` touches.
+//
+// Both side effects run inside the same `withKithTransaction` this module
+// already runs in -- the caller's one transaction, not a second one -- exactly
+// as Convex ran them as two more statements inside one mutation. Neither
+// Convex function calls `ctx.scheduler.runAfter`: `advanceSourceAssessmentEpoch`
+// is one `UPDATE`, and `onSourceEnabledChanged` patches the watcher and
+// resolves an incident synchronously. So neither has a `kith.deferred_work`
+// row to schedule here; what changes on disable or re-enable is rows in
+// `kith.source_accounts`, `kith.worker_watcher_states` and
+// `kith.worker_operational_incidents`, not queued work.
 
 import { assertKithId, newKithId } from "../ids.js";
 import { spacePredicate } from "../spaces.js";
@@ -39,6 +45,7 @@ import {
 } from "../identity/authorization.js";
 import { exec, row, rows, type IdentityCtx } from "../identity/db.js";
 import { IdentityError } from "../identity/errors.js";
+import { onSourceEnabledChanged } from "../workers/diagnostics.js";
 
 /** Convex's default: `models/sourceAccounts/public.ts` `create`. */
 const DEFAULT_FRESHNESS_MS = 86_400_000;
@@ -190,6 +197,17 @@ export async function createSourceAccount(
  * for the `"write"` operation. A missing row and a row the caller has no write
  * access to are refused with the same message, so a caller cannot enumerate
  * source accounts by watching which error comes back.
+ *
+ * Locks the row (`FOR UPDATE`) because, unlike the i0 port, this may now also
+ * write `kith.worker_watcher_states` and `kith.worker_operational_incidents`
+ * for the same source account: the lock keeps a concurrent heartbeat or
+ * another `update` call from reading `enabled` mid-change, the same
+ * single-document atomicity a Convex mutation gave `ctx.db.patch` for free.
+ *
+ * `args.enabled` is read against `account.enabled` (the value before this
+ * call) exactly once: only an actual change runs `advanceSourceAssessmentEpoch`
+ * and `onSourceEnabledChanged`, both before the row's own `UPDATE` below,
+ * matching Convex's order -- read, validate, side effect, patch.
  */
 export async function updateSourceAccount(
   ctx: IdentityCtx,
@@ -202,9 +220,9 @@ export async function updateSourceAccount(
   },
 ): Promise<void> {
   const id = assertKithId(args.sourceAccountId, "invalid_source_account_id");
-  const account = await row<{ space_id: string }>(
+  const account = await row<{ space_id: string; enabled: boolean }>(
     ctx,
-    "SELECT space_id FROM kith.source_accounts WHERE id = $1",
+    "SELECT space_id, enabled FROM kith.source_accounts WHERE id = $1 FOR UPDATE",
     [id],
   );
   if (!account) sourceAccountNotFound();
@@ -216,6 +234,15 @@ export async function updateSourceAccount(
 
   if (args.name !== undefined) boundedText(args.name, "Name", NAME_MAX_CHARS);
   if (args.freshnessMs !== undefined) validateFreshness(args.freshnessMs);
+
+  if (args.enabled !== undefined && args.enabled !== account.enabled) {
+    await advanceSourceAssessmentEpoch(ctx, account.space_id, id);
+    await onSourceEnabledChanged(
+      ctx,
+      { id, spaceId: account.space_id, enabled: account.enabled },
+      args.enabled,
+    );
+  }
 
   await exec(
     ctx,
@@ -232,6 +259,34 @@ export async function updateSourceAccount(
       args.freshnessMs ?? null,
     ],
   );
+}
+
+/**
+ * `models/ingestion/model.ts` `advanceSourceAssessmentEpoch`, ported as a
+ * private helper the same way `../ingestion/inlineWork.ts` ports its own
+ * call site of the same Convex function: a plain increment, `COALESCE`d
+ * against a null `worker_assessment_epoch` (Convex's `?? 0`), scoped by
+ * `space_id` as every statement in this module is. Convex's extra bounds
+ * checks (`Number.isSafeInteger`, non-negative, no overflow) are not
+ * reproduced here, matching every other port of this same function in this
+ * package (`../workers/archivedDiscovery.ts`, `../workers/discovery.ts`): the
+ * column is a bounded `numeric` a single caller increments by one, so the
+ * failure those checks guarded against cannot occur through this surface.
+ */
+async function advanceSourceAssessmentEpoch(
+  ctx: IdentityCtx,
+  spaceId: string,
+  sourceAccountId: string,
+): Promise<void> {
+  const updated = await rows<{ id: string }>(
+    ctx,
+    `UPDATE kith.source_accounts
+        SET worker_assessment_epoch = COALESCE(worker_assessment_epoch, 0) + 1
+      WHERE id = $1 AND space_id = $2
+      RETURNING id`,
+    [sourceAccountId, spaceId],
+  );
+  if (updated.length !== 1) sourceAccountNotFound();
 }
 
 /**

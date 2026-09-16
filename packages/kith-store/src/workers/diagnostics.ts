@@ -453,6 +453,89 @@ export async function recordMissingWorkerIncidents(
   return { inspected: overdue.length, recorded };
 }
 
+export type SourceEnabledChangeAccount = {
+  readonly id: string;
+  readonly spaceId: string;
+  /** The account's `enabled` value *before* the caller's change. */
+  readonly enabled: boolean;
+};
+
+/**
+ * `models/diagnostics/model.ts` `onSourceEnabledChanged`.
+ *
+ * The `sourceAccounts.update` mutation's second side effect (alongside
+ * `advanceSourceAssessmentEpoch`, ported beside its caller in
+ * `../sources/model.ts`) whenever a caller actually changes `enabled`. Both
+ * run in that caller's own transaction, before `kith.source_accounts` itself
+ * is patched -- so `account.enabled` here is still the *old* value, which is
+ * what `validateWatcher` needs: its `sweepAfter` invariant differs by whether
+ * the account is currently enabled, not by what it is about to become.
+ *
+ * No `ctx.scheduler.runAfter` call exists in the Convex original to port to a
+ * `kith.deferred_work` row: every effect here is a synchronous patch to
+ * `kith.worker_watcher_states` or `kith.worker_operational_incidents` in the
+ * caller's transaction, exactly as Convex's `ctx.db.patch` was.
+ *
+ * Disabling clears `sweepAfter` (an inactive source is not staleness-swept)
+ * and resolves any open `missing_worker` incident for the watcher -- a source
+ * nobody is scanning cannot be reported missing. Re-enabling an already
+ * `active` watcher does the same incident resolution and restarts the
+ * staleness clock from `ctx.now`, the same heartbeat-shaped restart Convex
+ * gave it. An `awaiting_heartbeat` watcher, or no watcher row at all, is left
+ * untouched either way: there is nothing stale to resolve yet.
+ */
+export async function onSourceEnabledChanged(
+  ctx: WorkerCtx,
+  account: SourceEnabledChangeAccount,
+  enabled: boolean,
+): Promise<void> {
+  validateNow(ctx.now);
+  const watcher = await watcherForSource(ctx, account.id, true);
+  if (!watcher) return;
+  const source = {
+    spaceId: account.spaceId,
+    account: { id: account.id, enabled: account.enabled },
+  };
+  validateWatcher(watcher, source);
+  if (!enabled) {
+    await resolveOpenIncidentForWatcher(ctx, account, watcher.watcherId);
+    if (watcher.state === "active") {
+      await exec(
+        ctx,
+        "UPDATE kith.worker_watcher_states SET sweep_after = NULL, updated_at = $1 WHERE id = $2",
+        [at(ctx.now), watcher.id],
+      );
+    }
+  } else if (watcher.state === "active") {
+    await resolveOpenIncidentForWatcher(ctx, account, watcher.watcherId);
+    await exec(
+      ctx,
+      "UPDATE kith.worker_watcher_states SET sweep_after = $1, updated_at = $1 WHERE id = $2",
+      [at(ctx.now), watcher.id],
+    );
+  }
+}
+
+/** `resolveOpenIncidentForWatcher` in `models/diagnostics/model.ts`. */
+async function resolveOpenIncidentForWatcher(
+  ctx: WorkerCtx,
+  account: { id: string; spaceId: string },
+  watcherId: string,
+): Promise<void> {
+  const incident = await openIncident(ctx, account.id, true);
+  if (!incident) return;
+  validateIncident(
+    incident,
+    { spaceId: account.spaceId, account: { id: account.id } },
+    watcherId,
+  );
+  await exec(
+    ctx,
+    "UPDATE kith.worker_operational_incidents SET state = 'resolved', observed_at = $1, resolved_at = $1 WHERE id = $2",
+    [at(ctx.now), incident.id],
+  );
+}
+
 export type ResetWatcherArgs = {
   requestId: string;
   expectedWatcherId: string | null;
