@@ -1,14 +1,20 @@
 "use client";
 
-import { useConvexAuth, useMutation } from "convex/react";
+// The PostgreSQL invitation acceptance page.
+//
+// `app/invite/page.tsx` is a server component: it reads the session with
+// `currentWebPrincipal()` (one read-only transaction, the session checked
+// inside it) and passes down only whether anyone is signed in. This
+// component's only job is the part a server component cannot do -- read the
+// token out of the browser's address fragment, which never reaches the
+// server -- and post it to `/api/kith/family/invitations/accept`, which
+// reloads the session for itself rather than trusting this prop for the
+// actual accept.
+
 import Link from "next/link";
 import { useEffect, useState } from "react";
 
-import { familyApi } from "@/lib/family-api";
-
-export function InvitationAcceptance() {
-  const { isAuthenticated, isLoading } = useConvexAuth();
-  const acceptInvitation = useMutation(familyApi.acceptInvitation);
+export function KithInvitationAcceptance({ signedIn }: { signedIn: boolean }) {
   const [token, setToken] = useState<string | null | undefined>(undefined);
   const [fragment, setFragment] = useState("");
   const [error, setError] = useState("");
@@ -26,23 +32,26 @@ export function InvitationAcceptance() {
     setError("");
     setSubmitting(true);
     try {
-      await acceptInvitation({ token });
+      const response = await fetch("/api/kith/family/invitations/accept", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token }),
+      });
+      if (!response.ok) {
+        const body = (await response.json().catch(() => null)) as
+          | { error?: string }
+          | null;
+        setError(
+          body?.error === "Not authenticated"
+            ? "Sign in and try again."
+            : "This invitation could not be accepted. Ask the owner for a new link if it expired.",
+        );
+        return;
+      }
       setStatus(
         "Your acceptance is pending the space owner’s approval. They will confirm the account that accepted this invitation.",
       );
-    } catch (cause) {
-      if (typeof cause === "object" && cause !== null && "data" in cause) {
-        const data = cause.data;
-        if (
-          typeof data === "object" &&
-          data !== null &&
-          "message" in data &&
-          typeof data.message === "string"
-        ) {
-          setError(data.message);
-          return;
-        }
-      }
+    } catch {
       setError(
         "This invitation could not be accepted. Ask the owner for a new link if it expired.",
       );
@@ -71,9 +80,7 @@ export function InvitationAcceptance() {
           This invitation link is missing its secret. Ask the space owner for a
           new link.
         </p>
-      ) : isLoading ? (
-        <p>Checking your account...</p>
-      ) : !isAuthenticated ? (
+      ) : !signedIn ? (
         <>
           <p>
             Sign in or create an account to accept this invitation. The secret
@@ -93,8 +100,8 @@ export function InvitationAcceptance() {
       ) : (
         <>
           <p>
-            Accepting this link records your account for the owner to review. It
-            does not grant access until they approve it.
+            Accepting this link records your account for the owner to review.
+            It does not grant access until they approve it.
           </p>
           {error && (
             <p role="alert" style={{ color: "#b42318" }}>

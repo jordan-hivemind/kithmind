@@ -66,14 +66,8 @@ describe("web authentication middleware", () => {
     expect(isAuthenticated).not.toHaveBeenCalled();
   });
 
-  test("still redirects unauthenticated web and ingest subpaths", async () => {
-    for (const pathname of [
-      "/settings",
-      "/spaces",
-      "/invite/other",
-      "/api/ingest/other",
-      "/api/worker/other",
-    ]) {
+  test("still redirects unauthenticated web subpaths", async () => {
+    for (const pathname of ["/settings", "/spaces", "/invite/other"]) {
       const unauthenticated = request(pathname);
       expect(isPublicRoute(unauthenticated)).toBe(false);
 
@@ -85,6 +79,28 @@ describe("web authentication middleware", () => {
       expect(response?.headers.get("location")).toBe(
         "https://brain.example.test/sign-in",
       );
+    }
+  });
+
+  // `/api/ingest/other` and `/api/worker/other` are not the exact bearer
+  // endpoints (those are public), so they still hit the authentication gate,
+  // and being `/api/` paths they now get 401 JSON rather than a redirect --
+  // the same rule every other non-public `/api/` path gets, and the same
+  // shape `app/api/auth/*` has always answered a failure with.
+  test("an unauthenticated request to a non-public API subpath gets 401 JSON, not a redirect", async () => {
+    for (const pathname of ["/api/ingest/other", "/api/worker/other"]) {
+      const unauthenticated = request(pathname);
+      expect(isPublicRoute(unauthenticated)).toBe(false);
+
+      const response = await handleMiddlewareRequest(unauthenticated, {
+        convexAuth: { isAuthenticated: vi.fn().mockResolvedValue(false) },
+      });
+
+      expect(response?.status).toBe(401);
+      expect(await response?.json()).toEqual({
+        error: "Not authenticated",
+        code: "not_authenticated",
+      });
     }
   });
 
@@ -169,6 +185,26 @@ describe("web authentication middleware", () => {
       expect(response?.headers.get("location")).toBe(
         "https://brain.example.test/sign-in",
       );
+    }
+  });
+
+  test("an unauthenticated request to a non-public API route gets 401 JSON, not a redirect", async () => {
+    for (const env of [{}, POSTGRES]) {
+      const response = await handleMiddlewareRequest(
+        request("/api/kith/api-keys", "GET"),
+        {
+          convexAuth: { isAuthenticated: vi.fn().mockResolvedValue(false) },
+          env,
+        },
+      );
+      expect(response?.status).toBe(401);
+      expect(response?.headers.get("content-type")).toContain(
+        "application/json",
+      );
+      expect(await response?.json()).toEqual({
+        error: "Not authenticated",
+        code: "not_authenticated",
+      });
     }
   });
 

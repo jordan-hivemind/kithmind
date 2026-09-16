@@ -556,6 +556,92 @@ test("a family space keeps at least one owner", { skip }, async (t) => {
 });
 
 test(
+  "removing or leaving after an approved invitation does not fail its foreign key",
+  { skip },
+  async (t) => {
+    // `family_invitations.membership_id` points at the `space_members` row an
+    // approval created, through two foreign keys that both reference it
+    // (`family_invitations_membership_id_fkey` from migration 004 and
+    // `family_invitations_membership_space_fkey` from migration 006; see the
+    // `detachMembershipFromInvitations` doc comment). Deleting that row
+    // without clearing the pointer first fails when the deferred constraint
+    // is checked at commit -- not at the `DELETE` statement itself, which is
+    // why `SET CONSTRAINTS ALL IMMEDIATE` is forced below: without it, this
+    // test's own rollback (`identityFixture.mjs`'s `db.tx` never commits)
+    // would hide the violation exactly as it would in production if a
+    // caller's transaction happened to abort for an unrelated reason. With it,
+    // a regression here fails on the `DELETE`/rollback-to-savepoint line
+    // itself, which is a mistake P2-39i5 found building the settings and
+    // spaces pages on top of this module.
+    const db = await identityDatabase(t);
+    await db.tx(async (ctx) => {
+      await ctx.client.query("SET CONSTRAINTS ALL IMMEDIATE");
+      const { ownerId, spaceId } = await sharedSpace(ctx);
+      const secondOwnerId = await makeUser(ctx);
+      await makeMember(ctx, { spaceId, userId: secondOwnerId, role: "owner" });
+      const memberId = await makeUser(ctx, { email: "member@example.test" });
+
+      const invitation = await createInvitation(ctx, {
+        actorUserId: ownerId,
+        spaceId,
+        email: "member@example.test",
+        role: "editor",
+      });
+      await acceptInvitationByToken(ctx, {
+        userId: memberId,
+        token: invitation.token,
+      });
+      const approval = await approveInvitationForOwner(ctx, {
+        actorUserId: secondOwnerId,
+        invitationId: invitation.invitationId,
+      });
+      const stored = await ctx.client.query(
+        "SELECT membership_id FROM kith.family_invitations WHERE id = $1",
+        [invitation.invitationId],
+      );
+      assert.equal(stored.rows[0].membership_id, approval.membershipId);
+
+      await removeFamilyMember(ctx, {
+        actorUserId: ownerId,
+        membershipId: approval.membershipId,
+      });
+      const afterRemove = await ctx.client.query(
+        "SELECT membership_id FROM kith.family_invitations WHERE id = $1",
+        [invitation.invitationId],
+      );
+      assert.equal(afterRemove.rows[0].membership_id, null);
+
+      // The same path through `leaveSharedSpace`: reinvite, accept, approve,
+      // then leave rather than being removed.
+      const secondInvitation = await createInvitation(ctx, {
+        actorUserId: ownerId,
+        spaceId,
+        email: "member@example.test",
+        role: "editor",
+      });
+      await acceptInvitationByToken(ctx, {
+        userId: memberId,
+        token: secondInvitation.token,
+      });
+      await approveInvitationForOwner(ctx, {
+        actorUserId: secondOwnerId,
+        invitationId: secondInvitation.invitationId,
+      });
+      await leaveSharedSpace(ctx, { userId: memberId, spaceId });
+      assert.equal(
+        await refusalCode(() => requireSharedMembership(ctx, spaceId, memberId)),
+        "space_not_found",
+      );
+      const afterLeave = await ctx.client.query(
+        "SELECT membership_id FROM kith.family_invitations WHERE id = $1",
+        [secondInvitation.invitationId],
+      );
+      assert.equal(afterLeave.rows[0].membership_id, null);
+    });
+  },
+);
+
+test(
   "a transfer needs a real, unique membership in the same space",
   { skip },
   async (t) => {

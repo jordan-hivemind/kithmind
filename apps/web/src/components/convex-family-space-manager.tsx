@@ -1,12 +1,18 @@
 "use client";
 
+// The Convex-backed family space manager. Unchanged behavior, moved out of
+// `family-space-manager.tsx` and off the deleted `lib/family-api.ts` (whose
+// two re-exports are inlined below) so `app/(authenticated)/spaces/page.tsx`
+// can pick a surface; i7 deletes this.
+
 import { api } from "@repo/db/convex/_generated/api";
 import type { Id } from "@repo/db/convex/_generated/dataModel";
 import { useAction, useConvexAuth, useMutation, useQuery } from "convex/react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useState } from "react";
 
-import { familyApi, peopleApi } from "@/lib/family-api";
+const familyApi = api.models.family.public;
+const peopleApi = api.models.spaces.people;
 
 type Role = "editor" | "reader";
 
@@ -38,7 +44,7 @@ function messageFor(error: unknown, fallback: string) {
   return fallback;
 }
 
-export function FamilySpaceManager() {
+export function ConvexFamilySpaceManager() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const { isAuthenticated } = useConvexAuth();

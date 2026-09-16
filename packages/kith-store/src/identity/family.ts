@@ -754,6 +754,35 @@ export async function changeFamilyMemberRole(
   ]);
 }
 
+/**
+ * Clears `membership_id` on every approved invitation that names a
+ * membership row, before that row is deleted.
+ *
+ * Two foreign keys reference `space_members (id, space_id)` from this same
+ * `(membership_id, space_id)` pair, both still live on the table:
+ * `family_invitations_membership_id_fkey` (migration 004) and
+ * `family_invitations_membership_space_fkey` (migration 006, added rather
+ * than replacing the first). `membership_id` is nullable under both, and
+ * `storeInvitation` already clears it when an invitation is reissued.
+ * `removeFamilyMember` and `leaveSharedSpace` are the two paths that delete a
+ * `space_members` row directly rather than through `storeInvitation`, so each
+ * needs this call first; without it the delete succeeds but the *commit*
+ * fails on whichever of the two constraints is checked, and an approved
+ * member could never be removed or leave. This is `deleteApiKey`'s pattern
+ * for `consumed_oauth_codes.api_key_id`, applied to the other table that
+ * points at a row this module deletes.
+ */
+async function detachMembershipFromInvitations(
+  ctx: IdentityCtx,
+  membershipId: string,
+): Promise<void> {
+  await exec(
+    ctx,
+    "UPDATE kith.family_invitations SET membership_id = NULL WHERE membership_id = $1",
+    [membershipId],
+  );
+}
+
 /** `models/family/model.ts` `removeFamilyMember`. */
 export async function removeFamilyMember(
   ctx: IdentityCtx,
@@ -779,6 +808,7 @@ export async function removeFamilyMember(
     );
     if (owners.length <= 1) familyError("last_owner");
   }
+  await detachMembershipFromInvitations(ctx, target!.id);
   await exec(ctx, "DELETE FROM kith.space_members WHERE id = $1", [target!.id]);
 }
 
@@ -800,6 +830,7 @@ export async function leaveSharedSpace(
     );
     if (owners.length <= 1) familyError("last_owner");
   }
+  await detachMembershipFromInvitations(ctx, membership.id);
   await exec(ctx, "DELETE FROM kith.space_members WHERE id = $1", [
     membership.id,
   ]);
