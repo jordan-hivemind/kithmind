@@ -11,7 +11,7 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("@/lib/mcp/auth", () => ({
-  authenticateApiKey: mocks.authenticateApiKey,
+  authenticateApiKeyOnConvex: mocks.authenticateApiKey,
 }));
 
 vi.mock("@/lib/mcp/convex-auth", () => ({

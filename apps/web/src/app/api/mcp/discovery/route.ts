@@ -1,5 +1,5 @@
 import { createCorsHeaders, createCorsOptionsResponse } from "@/lib/mcp/cors";
-import { getMcpIssuer } from "@/lib/mcp/environment";
+import { getMcpPublicOrigin } from "@/lib/mcp/environment";
 import { resolveEnabledMcpToolNames } from "@/lib/mcp/tool-policy";
 
 const CORS_HEADERS = createCorsHeaders("GET, OPTIONS");
@@ -11,7 +11,7 @@ export async function OPTIONS() {
 }
 
 export async function GET() {
-  const baseUrl = getMcpIssuer();
+  const baseUrl = getMcpPublicOrigin();
 
   return Response.json(
     {

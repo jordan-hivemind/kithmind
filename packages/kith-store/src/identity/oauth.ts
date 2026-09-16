@@ -42,6 +42,7 @@ import {
   type Principal,
 } from "./authorization.js";
 import {
+  deleteApiKey,
   validateApiKeyName,
   validateApiKeyScopes,
   generateApiKeyMaterial,
@@ -348,7 +349,7 @@ export async function beginAuthorizationGrant(
     };
   }
   if (existing) {
-    await exec(ctx, "DELETE FROM kith.api_keys WHERE id = $1", [existing.id]);
+    await deleteApiKey(ctx, existing.id);
   }
 
   const live = await rows<{ oauth_lifecycle: string }>(
@@ -489,7 +490,16 @@ export async function finalizeAuthorizationGrant(
   );
 }
 
-/** `models/oauth/web.ts` `abandonAuthorizationGrant`. Silent by design. */
+/**
+ * `models/oauth/web.ts` `abandonAuthorizationGrant`. Silent by design.
+ *
+ * Silent about the grant, not about the transaction. The `catch` below returns
+ * null only for a modelled denial, such as an id that is not a kith id, because
+ * a `pg` failure caught here would read as "no such key", this function would
+ * return normally, and the caller would be told the compensation succeeded while
+ * the COMMIT that followed aborted. The compensation is best effort; reporting
+ * it as done when it was not is a different thing.
+ */
 export async function abandonAuthorizationGrant(
   ctx: IdentityCtx,
   args: {
@@ -499,7 +509,10 @@ export async function abandonAuthorizationGrant(
     preparationNonce: string;
   },
 ): Promise<void> {
-  const key = await getApiKey(ctx, args.keyId).catch(() => null);
+  const key = await getApiKey(ctx, args.keyId).catch((error: unknown) => {
+    if (error instanceof IdentityError) return null;
+    throw error;
+  });
   if (
     key &&
     key.userId === args.principal.userId &&
@@ -507,7 +520,7 @@ export async function abandonAuthorizationGrant(
     key.oauthRequestHash === args.requestHash &&
     key.oauthPreparationNonce === args.preparationNonce
   ) {
-    await exec(ctx, "DELETE FROM kith.api_keys WHERE id = $1", [key.id]);
+    await deleteApiKey(ctx, key.id);
   }
 }
 
@@ -629,9 +642,7 @@ export async function activateAuthorizationGrant(
     // A second exchange of the same code means the code leaked. The key that was
     // activated by the first exchange is deleted rather than left live.
     if (hasNoOAuthLifecycle(exchange.key)) {
-      await exec(ctx, "DELETE FROM kith.api_keys WHERE id = $1", [
-        exchange.key.id,
-      ]);
+      await deleteApiKey(ctx, exchange.key.id);
     }
     return { status: "replayed" };
   }
@@ -729,7 +740,7 @@ export async function removeExpired(
     );
     hasMore ||= doomed.length > remaining;
     for (const { id } of doomed.slice(0, remaining)) {
-      await exec(ctx, "DELETE FROM kith.api_keys WHERE id = $1", [id]);
+      await deleteApiKey(ctx, id);
       deleted += 1;
     }
   }

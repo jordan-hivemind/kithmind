@@ -29,6 +29,7 @@ import { assertKithId, newKithId } from "../ids.js";
 import { spacePredicate } from "../spaces.js";
 import { at, exec, ms, row, rows, type IdentityCtx } from "./db.js";
 import {
+  IdentityError,
   notAuthenticated,
   rethrowSpaceReadError,
   spaceNotFound,
@@ -296,6 +297,15 @@ export function hasNoOAuthLifecycle(key: ApiKeyRecord): boolean {
  * exchanged for it, and until that exchange completes it authenticates nothing.
  * A key with no capabilities is a legacy row and is refused with a distinguishable
  * message, because it is an operator problem rather than an authentication one.
+ * Distinguishable to an operator reading a log, not to a client: the MCP path
+ * collapses it into the same `null` every other refusal produces, which is what
+ * `identityAuthorization.test.mjs` asserts.
+ *
+ * It is an `IdentityError` rather than a bare one so that the boundary can tell
+ * a modelled refusal from an infrastructure failure. `authenticateApiKey` maps
+ * `IdentityError` to `null` and rethrows everything else, so a bare error here
+ * would turn a legacy key into a 503 instead of a 401. The message is unchanged
+ * and the typed code matches what `apiKeys.ts` already raises for the same row.
  */
 export function principalFromApiKey(
   key: ApiKeyRecord,
@@ -306,7 +316,10 @@ export function principalFromApiKey(
   }
   if (!hasNoOAuthLifecycle(key)) notAuthenticated();
   if (key.capabilities === null) {
-    throw new Error("API key migration required");
+    throw new IdentityError("API key migration required", {
+      code: "invalid_api_key_state",
+      message: "API key migration required",
+    });
   }
   return {
     userId: key.userId,

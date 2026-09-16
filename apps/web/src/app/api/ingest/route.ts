@@ -8,7 +8,11 @@ import {
   parseIngestRequest,
   readBoundedJson,
 } from "@/lib/ingest/http";
-import { authenticateApiKey } from "@/lib/mcp/auth";
+// Convex, whatever `KITH_POSTGRES_SURFACE` says: this route does all of its
+// work through Convex until row P2-39i4 ports it, and a credential resolved
+// against `kith.api_keys` must not authorize Convex work. i4 moves the
+// authentication and the work together.
+import { authenticateApiKeyOnConvex } from "@/lib/mcp/auth";
 import { createConvexMcpToken } from "@/lib/mcp/convex-auth";
 
 export const dynamic = "force-dynamic";
@@ -33,9 +37,9 @@ function errorResponse(error: IngestHttpError): Response {
 }
 
 export async function POST(req: Request): Promise<Response> {
-  let identity: Awaited<ReturnType<typeof authenticateApiKey>>;
+  let identity: Awaited<ReturnType<typeof authenticateApiKeyOnConvex>>;
   try {
-    identity = await authenticateApiKey(req.headers.get("authorization"));
+    identity = await authenticateApiKeyOnConvex(req.headers.get("authorization"));
   } catch {
     return errorResponse(
       new IngestHttpError(

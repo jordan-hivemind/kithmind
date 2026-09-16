@@ -32,7 +32,7 @@ import {
 } from "./authorization.js";
 import { exec, identityCtx, type IdentityCtx } from "./db.js";
 import { IdentityError } from "./errors.js";
-import { requireMcpPrincipal } from "./apiKeys.js";
+import { deleteApiKey, requireMcpPrincipal } from "./apiKeys.js";
 import {
   requireWebPrincipal,
   revokeSession,
@@ -200,7 +200,12 @@ export function authDenialSurface(
           rawKey: key.rawKey,
         });
         await requireSpaceAccess(ctx, principal, f.spaceId, "read");
-        await exec(ctx, "DELETE FROM kith.api_keys WHERE id = $1", [key.id]);
+        // The same call `revokeApiKey` makes, not a raw delete. `run` is
+        // caller-supplied and `authDenialSurfaceOnPool` rolls back, so a raw
+        // delete would never reach the deferred foreign key on
+        // `consumed_oauth_codes`; going through the real revocation keeps the
+        // check faithful for a caller whose `run` does commit.
+        await deleteApiKey(ctx, key.id);
         return (
           (await denied(
             () => requireMcpPrincipal(ctx, { rawKey: key.rawKey }),

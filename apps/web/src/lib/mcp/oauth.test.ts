@@ -6,7 +6,7 @@ vi.mock("server-only", () => ({}));
 
 import { POST as registerClient } from "../../app/api/mcp/register/route";
 import {
-  getMcpIssuer,
+  getMcpPublicOrigin,
   getMcpResourceUri,
   isMcpResourceUri,
 } from "./environment";
@@ -43,10 +43,10 @@ describe("MCP OAuth security", () => {
   });
 
   it("accepts only a canonical HTTPS issuer or loopback development origin", () => {
-    expect(getMcpIssuer()).toBe("https://brain.example.test");
+    expect(getMcpPublicOrigin()).toBe("https://brain.example.test");
 
     vi.stubEnv("MCP_JWT_ISSUER", "http://localhost:3000");
-    expect(getMcpIssuer()).toBe("http://localhost:3000");
+    expect(getMcpPublicOrigin()).toBe("http://localhost:3000");
 
     for (const invalid of [
       "http://brain.example.test",
@@ -55,7 +55,7 @@ describe("MCP OAuth security", () => {
       "https://user:pass@brain.example.test",
     ]) {
       vi.stubEnv("MCP_JWT_ISSUER", invalid);
-      expect(() => getMcpIssuer()).toThrow();
+      expect(() => getMcpPublicOrigin()).toThrow();
     }
   });
 

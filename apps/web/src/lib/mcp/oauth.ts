@@ -2,7 +2,7 @@ import "server-only";
 
 import crypto from "node:crypto";
 
-import { getMcpIssuer, requireEnvironmentVariable } from "./environment";
+import { getMcpPublicOrigin, requireEnvironmentVariable } from "./environment";
 import {
   type AuthorizationCodePayload,
   authorizationCodePayloadSchema,
@@ -145,7 +145,7 @@ export function hashOAuthBinding(
 }
 
 export function hasTrustedOAuthOrigin(req: Request): boolean {
-  return req.headers.get("origin") === getMcpIssuer();
+  return req.headers.get("origin") === getMcpPublicOrigin();
 }
 
 export async function readLimitedOAuthBody(req: Request): Promise<string> {

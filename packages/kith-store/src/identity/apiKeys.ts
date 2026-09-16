@@ -201,6 +201,37 @@ async function replaceGrants(
   }
 }
 
+/**
+ * Deletes a key and detaches the consumed-code receipts that name it.
+ *
+ * Every path that removes a key goes through here -- `revoke` below,
+ * `beginAuthorizationGrant`'s stale-grant delete, `abandonAuthorizationGrant`,
+ * `removeExpired` and the revoked-key denial probe -- and the detach is why.
+ * Convex had no referential integrity: deleting an `apiKeys`
+ * document left `consumedOAuthCodes.apiKeyId` pointing at nothing, which was
+ * harmless because the receipt only has to outlive the key. PostgreSQL has a
+ * foreign key, it is `DEFERRABLE INITIALLY DEFERRED`, and so the delete succeeds
+ * and the *commit* fails -- P2-39i2 found this from the token route, where the
+ * replay branch could not commit the revocation RFC 6749 section 4.1.2 requires.
+ *
+ * The receipt is kept and its `api_key_id` is cleared rather than the receipt
+ * being deleted with the key. That is what keeps the consent unusable for the
+ * rest of the code's lifetime: `beginAuthorizationGrant` looks a receipt up by
+ * user and request hash, not by key, so a receipt that disappeared with the key
+ * would turn a leaked code into a reissued one.
+ */
+export async function deleteApiKey(
+  ctx: IdentityCtx,
+  id: string,
+): Promise<void> {
+  await exec(
+    ctx,
+    "UPDATE kith.consumed_oauth_codes SET api_key_id = NULL WHERE api_key_id = $1",
+    [id],
+  );
+  await exec(ctx, "DELETE FROM kith.api_keys WHERE id = $1", [id]);
+}
+
 /** Active keys for one user. `models/apiKeys/model.ts` `_listByUser`. */
 export async function listByUser(
   ctx: IdentityCtx,
@@ -428,7 +459,7 @@ export async function revoke(
   ) {
     throw new Error("API key not found");
   }
-  await exec(ctx, "DELETE FROM kith.api_keys WHERE id = $1", [args.id]);
+  await deleteApiKey(ctx, args.id);
 }
 
 /**
@@ -463,6 +494,27 @@ export async function requireMcpPrincipal(
  * That action existed only so the gateway could mint a JWT from a key hash.
  * Nothing mints a JWT now, so this returns the principal itself and is not
  * exposed as an unauthenticated function; the route calls it.
+ *
+ * Only a modelled denial becomes `null`. Everything else is rethrown, and the
+ * difference is not cosmetic: this function runs inside `withKithTransaction`,
+ * `requireMcpPrincipal` writes `last_used_at` on every success, and two
+ * concurrent authentications with the same bearer therefore conflict on that one
+ * row. A blanket `catch` swallowed the resulting SQLSTATE 40001 before the
+ * retry loop above could see it, and the route answered 401 for a perfectly
+ * valid key -- the second reviewer of P2-39i2 reproduced one identity and seven
+ * nulls from eight concurrent calls. A statement timeout (57014) and a lock
+ * timeout (55P03) failed the same way, as would an unreachable database.
+ *
+ * So the rule is: an authentication failure is a fact about the credential, and
+ * nothing else may be dressed up as one. A caller that cannot be told apart from
+ * a revoked key is a caller who is told to re-run the OAuth flow over an outage.
+ *
+ * `IdentityError` is every denial `requireMcpPrincipal` can raise, including the
+ * legacy key with no capabilities. That one is an operator problem and stays
+ * distinguishable in the log by its message and its typed code, but it is still
+ * a fact about the credential, so the client gets the same `null` as everything
+ * else. `identityAuthorization.test.mjs` asserts exactly that, which is why
+ * `principalFromApiKey` raises an `IdentityError` for it rather than a bare one.
  */
 export async function authenticateApiKey(
   ctx: IdentityCtx,
@@ -475,10 +527,11 @@ export async function authenticateApiKey(
       keyId: principal.credentialId!,
       principal,
     };
-  } catch {
+  } catch (error) {
     // `null` rather than a throw, because the caller is an authentication route
     // and every failure it can distinguish is a failure it can leak.
-    return null;
+    if (error instanceof IdentityError) return null;
+    throw error;
   }
 }
 
