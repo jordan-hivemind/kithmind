@@ -142,6 +142,25 @@ test("a fixture with rows that violate several constraint kinds is fully reporte
       },
     ];
 
+    // 5. and 6. Legacy duplicates under migration 020's partial unique indexes.
+    // Convex could not declare an index unique, so the ported code asserts these
+    // identities by reading `LIMIT 2` and refusing the second row; an export
+    // carrying a pair that predates that check loads cleanly and then poisons
+    // every later read of it. Each is a verbatim copy of an existing row under a
+    // new id, so the *only* thing wrong with it is that the identity now repeats.
+    // Nothing in the audit knows about these indexes: it reads them back out of
+    // `pg_index`, so they are covered with no change to the audit itself.
+    const duplicateGenerationId = syntheticId("gen_rowan_1_legacy_duplicate");
+    bad.processingGenerations = [
+      ...bad.processingGenerations,
+      { ...bad.processingGenerations[0], _id: duplicateGenerationId },
+    ];
+    const duplicateRequestId = syntheticId("req_rowan_1_legacy_duplicate");
+    bad.ingestRequests = [
+      ...bad.ingestRequests,
+      { ...bad.ingestRequests[0], _id: duplicateRequestId },
+    ];
+
     const csvDir = await buildTransformedCsv(t, bad);
     const report = await auditCsvDirectory({ connectionString: database.connectionString }, csvDir);
 
@@ -175,10 +194,47 @@ test("a fixture with rows that violate several constraint kinds is fully reporte
     assert.equal(dimensionViolation.id, bad.embeddingProfiles[0]._id);
     assert.match(dimensionViolation.detail, /-5/);
 
-    // Every violation is reported, not just the first: four distinct rows
-    // across three tables, none of them stopping the others from being
+    // Both halves of a duplicate pair are named, not just the second: the audit
+    // reports one violation per row in the group, because a fix has to choose
+    // between two rows that are equally legal on their own.
+    const generationDuplicates = (byTable.processing_generations ?? []).filter(
+      (v) => v.kind === "unique",
+    );
+    assert.equal(
+      generationDuplicates.length,
+      2,
+      JSON.stringify(generationDuplicates, null, 2),
+    );
+    for (const violation of generationDuplicates) {
+      assert.equal(violation.constraint, "processing_generations_fingerprint_idx");
+      assert.match(violation.detail, /duplicate/);
+    }
+    assert.deepEqual(
+      generationDuplicates.map((v) => v.id).sort(),
+      [bad.processingGenerations[0]._id, duplicateGenerationId].sort(),
+    );
+
+    const requestDuplicates = (byTable.ingest_requests ?? []).filter(
+      (v) => v.kind === "unique",
+    );
+    assert.equal(
+      requestDuplicates.length,
+      2,
+      JSON.stringify(requestDuplicates, null, 2),
+    );
+    for (const violation of requestDuplicates) {
+      assert.equal(violation.constraint, "ingest_requests_request_idx");
+      assert.match(violation.detail, /duplicate/);
+    }
+    assert.deepEqual(
+      requestDuplicates.map((v) => v.id).sort(),
+      [bad.ingestRequests[0]._id, duplicateRequestId].sort(),
+    );
+
+    // Every violation is reported, not just the first: eight distinct rows
+    // across five tables, none of them stopping the others from being
     // checked.
-    assert.ok(report.violations.length >= 4, JSON.stringify(report.violations, null, 2));
+    assert.ok(report.violations.length >= 8, JSON.stringify(report.violations, null, 2));
 
     assert.equal(await auditSchemaExists(database.connectionString), false);
     const rowCounts = await realTableRowCounts(database.connectionString, [
@@ -186,6 +242,8 @@ test("a fixture with rows that violate several constraint kinds is fully reporte
       "space_members",
       "api_keys",
       "embedding_profiles",
+      "processing_generations",
+      "ingest_requests",
     ]);
     for (const [table, count] of Object.entries(rowCounts)) {
       assert.equal(count, 0, `kith.${table} must stay empty: the audit never writes to it`);

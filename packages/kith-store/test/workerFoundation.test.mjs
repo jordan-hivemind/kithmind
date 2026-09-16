@@ -737,24 +737,26 @@ test(
           expectedInventoryEpoch: 0,
         }),
       );
-      const duplicateExternalId = "01890a5d-ac96-7cc4-bb7e-6f4f5ca5c141";
+      // The append has to fail somewhere for the rollback to be observable, and
+      // `identity_review_required` is the cheapest way to make it fail. This
+      // fixture used to plant a second `source_items` row under one external id
+      // hash; migration 020's `source_items_external_identity_idx` makes that row
+      // unwritable, which is the point of the index. The other half of
+      // `itemByExternalIdentity`'s same refusal is still reachable and is what is
+      // planted instead: a live item whose stored external id is not the one that
+      // hashed to it, meaning a hash collision or a damaged identity column.
+      const reviewExternalId = "01890a5d-ac96-7cc4-bb7e-6f4f5ca5c141";
       const first = await provenance.createOrGetSourceItem(f.client, {
         spaceId: f.spaceId,
         sourceAccountId: f.sourceAccountId,
-        externalId: duplicateExternalId,
+        externalId: reviewExternalId,
         title: "First",
         docType: "text",
         uri: "fs://synthetic/first.txt",
       });
       await f.client.query(
-        `INSERT INTO kith.source_items
-           (id, space_id, created_at, source_account_id, external_id_hash,
-            external_id, lifecycle, original_link_available,
-            desired_processing_epoch)
-         SELECT $1, space_id, transaction_timestamp(), source_account_id,
-                external_id_hash, external_id, 'available', true, 0
-           FROM kith.source_items WHERE id = $2`,
-        [newKithId(), first.id],
+        "UPDATE kith.source_items SET external_id = $1 WHERE id = $2",
+        ["01890a5d-ac96-7cc4-bb7e-6f4f5ca5c999", first.id],
       );
       await assert.rejects(
         call((ctx) =>
@@ -766,7 +768,7 @@ test(
             scanId: begun.scanId,
             requestId: "atomic-page",
             ordinal: 0,
-            entries: [readyEntry({ externalId: duplicateExternalId })],
+            entries: [readyEntry({ externalId: reviewExternalId })],
           }),
         ),
         expectProtocolCode("identity_review_required"),
@@ -1249,9 +1251,19 @@ test(
         "UPDATE kith.processing_generations SET actual_event_count=0 WHERE id=$1",
         [admitted.processingGenerationId],
       );
+      // The superseded generation this activation has to retire. It carries a
+      // processing fingerprint of its own rather than a copy of the current
+      // one: migration 020 makes `(source_revision_id, processing_fingerprint)`
+      // unique, and a real prior generation of the same revision differs in
+      // exactly that column -- admission refuses a repeat of the pair and tells
+      // the caller to increment `correctionRevision`, which is folded into the
+      // fingerprint. Nothing here reads the retired generation's fingerprint;
+      // it is the `active_generation_id` pointer below that makes it the one to
+      // retire.
       const previousGenerationId = newKithId();
       const previousDocumentId = newKithId();
       const previousChunkId = newKithId();
+      const previousFingerprint = "a".repeat(64);
       await f.client.query(
         `INSERT INTO kith.processing_generations
          (id,space_id,created_at,source_account_id,source_item_id,
@@ -1267,7 +1279,7 @@ test(
           actual_chunk_count,actual_event_count,actual_observation_count,
           embedding_status,activated_at)
          SELECT $1,space_id,$2,source_account_id,source_item_id,
-          source_revision_id,source_text_version_id,processing_fingerprint,
+          source_revision_id,source_text_version_id,$4,
           extraction_fingerprint,extractor_fingerprint,
           record_schema_fingerprint,normalization_fingerprint,
           chunker_fingerprint,correction_revision,desired_processing_epoch,
@@ -1283,6 +1295,7 @@ test(
           previousGenerationId,
           new Date(reclaimedAt - 100),
           admitted.processingGenerationId,
+          previousFingerprint,
         ],
       );
       await f.client.query(
