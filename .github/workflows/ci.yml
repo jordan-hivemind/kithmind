@@ -29,7 +29,10 @@ jobs:
     # not a passing one.
     services:
       postgres:
-        image: postgres:17
+        # pgvector, not plain postgres: migration 015 creates the `vector`
+        # extension, so the brain schema does not apply on an image that
+        # lacks it. Same server version, same env, same health check.
+        image: pgvector/pgvector:pg17
         env:
           POSTGRES_PASSWORD: postgres
         options: >-

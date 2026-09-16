@@ -5,20 +5,21 @@
 // harness) precisely so neither could silently diverge from what the other
 // scores; keeping one copy here preserves that.
 //
-// `recallContext` below is new: it is the seam this port leaves for P2-39g.
-// `recall_context`'s Convex original gets its "relevant" half from a
-// `tsvector`-equivalent search index (facts) and a hybrid vector/full-text
-// search action (thoughts) -- both indexes this port deliberately does not
-// build (see the module comments on `facts.ts` and `thoughts.ts`). So
-// `recallContext` does not take a query string or run a search itself; it
-// takes `candidates`, the ranked ids *an index already produced*, and does
-// only what does not depend on which index kind produced them: authorize,
-// hydrate, and blend with the core (non-indexed) halves. P2-39g's job is to
-// add the function that turns a query into `candidates`; a deterministic fake
-// standing in for that function is `recallCandidates` in
-// `test/helpers/memoryFixture.mjs`, which ranks by a plain substring match
-// against `facts.search_text` / `thoughts.content` -- not pretending to be
-// `tsvector` ranking, just enough to prove this function's contract.
+// `recallContext` below was the seam P2-39h left for P2-39g. It still does
+// not take a query string or run a search itself: it takes `candidates`, the
+// ranked ids an index already produced, and does only what does not depend on
+// which index kind produced them -- authorize, hydrate, and blend with the
+// core (non-indexed) halves. That split is deliberate and survives P2-39g1,
+// because the evaluation harness scores a blend over candidate lists it
+// supplies itself.
+//
+// P2-39g1 supplied the other half. `recallCandidates` in
+// `src/embeddings/search.ts` is the real function that turns a query into
+// `candidates`: facts from the keyword leg over `facts.search_text_search`,
+// thoughts from the hybrid leg over `thoughts.content_search` and
+// `embedding_vectors`, which is exactly how `recall_context`'s Convex
+// original composed them. The deterministic fake that stood in for it while
+// it did not exist is gone; `test/memory.test.mjs` calls the real one.
 
 import type { IdentityCtx } from "../identity/db.js";
 import { getFactsByIds, listFacts, type HydratedFact } from "./facts.js";

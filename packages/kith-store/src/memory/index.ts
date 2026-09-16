@@ -2,9 +2,11 @@
 // packages/convex/convex/models/thoughts/*, models/facts/* and
 // models/records/cardEntityBinding.ts's entity alias scan. See the module
 // comment on each file for what was and was not ported and why: `facts.ts`
-// and `thoughts.ts` explain the P2-39g seam (`getFactsByIds`/
+// and `thoughts.ts` explain the by-id seams (`getFactsByIds`/
 // `getThoughtsByIds`), and `recall.ts` explains `recallContext`, which
-// composes them.
+// composes them. The query-to-candidates half is P2-39g1's
+// `src/embeddings/search.ts`; it lives there rather than here because it
+// composes the thought, fact and document legs into one ranker.
 
 export * from "./lifecycle.js";
 export {

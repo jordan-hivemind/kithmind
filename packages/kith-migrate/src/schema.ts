@@ -930,9 +930,12 @@ export const TABLES: TableSpec[] = [
     ref("missingSinceScanId", "worker_source_scans"),
   ]),
 
-  // --- Embeddings. pgvector and tsvector columns are P2-39g's job (plan
-  // section 6); embedding stays jsonb here and the table is not migrated
-  // (5.1: vectors are re-derived, content-addressed by inputHash).
+  // --- Embeddings. These columns describe migration 004's structural
+  // snapshot, which is frozen: `embedding` arrived there as jsonb. P2-39g1's
+  // migration 015 replaces it with `public.vector(1536)` and adds the
+  // tsvector columns (plan section 2.7). Neither changes anything here,
+  // because the table is not migrated either way (5.1: vectors are
+  // re-derived, content-addressed by inputHash).
   table("embeddingProfiles", "embedding_profiles", false, true, [
     text("fingerprint"),
     text("protocol"),

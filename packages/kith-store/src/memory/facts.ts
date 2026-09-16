@@ -9,10 +9,13 @@
 // this authorized-space input) is deliberately P2-39i work.
 //
 // `searchFacts`'s Convex original ran over a `tsvector`-equivalent search
-// index (`by_searchText`), which is P2-39g's column to add. That half of the
-// read is not ported; `getFactsByIds` is the seam P2-39g's index plugs into
-// instead (see the module comment on it below), and `listFacts` -- which
-// needs no index, only `status`/`is_core`/`created_at` -- is fully ported.
+// index (`by_searchText`). P2-39g1 added that column (`facts.search_text_search`,
+// migration 015) and the read now lives in `src/embeddings/search.ts` beside
+// the other search legs, because it composes with them. What it needs from
+// here -- the row shape, `storedFactFromRow`, `hydrateFact` and the two
+// bounded-read assertions -- is exported rather than copied, so the search
+// leg and `listFacts` cannot disagree about what a fact is or how much of one
+// a single read may pull. `getFactsByIds` remains the by-id seam.
 
 import { row, rows, exec, at, ms, type IdentityCtx } from "../identity/db.js";
 import { assertKithId, KITH_ID, newKithId } from "../ids.js";
@@ -60,7 +63,7 @@ export type FactValue =
   | { type: "boolean"; value: boolean }
   | { type: "entity"; entityId: string };
 
-type FactRow = {
+export type FactRow = {
   id: string;
   space_id: string;
   created_at: Date;
@@ -86,7 +89,7 @@ type FactRow = {
   updated_at: Date | null;
 };
 
-const FACT_COLUMNS = `id, space_id, created_at, user_id, subject_entity_id, predicate, value,
+export const FACT_COLUMNS = `id, space_id, created_at, user_id, subject_entity_id, predicate, value,
        statement, search_text, source_type, source_ref, observed_at, batch_id,
        confidence, is_core, valid_from, valid_to, status, superseded_at,
        superseded_by, supersedes, change_reason, updated_at`;
@@ -292,7 +295,7 @@ export async function rememberFact(
         LIMIT $4`,
       [spaceId, subject.id, predicate, MAX_CURRENT_FACTS_PER_PREDICATE + 1],
     )
-  ).map(toStoredFact);
+  ).map(storedFactFromRow);
   if (current.length > MAX_CURRENT_FACTS_PER_PREDICATE) {
     throw new Error(
       `Fact transition exceeds the ${MAX_CURRENT_FACTS_PER_PREDICATE}-record current-value limit`,
@@ -401,7 +404,7 @@ export async function rememberFact(
   };
 }
 
-type StoredFact = {
+export type StoredFact = {
   id: string;
   spaceId: string;
   createdAt: number;
@@ -428,7 +431,7 @@ type StoredFact = {
   updatedAt: number | undefined;
 };
 
-function toStoredFact(record: FactRow): StoredFact {
+export function storedFactFromRow(record: FactRow): StoredFact {
   const rawSupersedes = record.supersedes ?? [];
   const supersedes =
     Array.isArray(rawSupersedes) &&
@@ -567,16 +570,16 @@ async function getStoredFact(ctx: IdentityCtx, id: string): Promise<StoredFact |
   const record = await row<FactRow>(ctx, `SELECT ${FACT_COLUMNS} FROM kith.facts WHERE id = $1`, [
     assertKithId(id, "invalid_fact_id"),
   ]);
-  return record ? toStoredFact(record) : null;
+  return record ? storedFactFromRow(record) : null;
 }
 
-function assertBoundedFactRead(spaceCount: number, perSpaceLimit: number): void {
+export function assertBoundedFactRead(spaceCount: number, perSpaceLimit: number): void {
   if (spaceCount * perSpaceLimit > MAX_FACT_CANDIDATE_READS) {
     throw new Error("Fact read scope is too broad; narrow spaces or lower limit");
   }
 }
 
-function assertBoundedHistoryHydration(facts: readonly StoredFact[]): void {
+export function assertBoundedHistoryHydration(facts: readonly StoredFact[]): void {
   const linkCount = facts.reduce(
     (count, fact) => count + (fact.supersededBy ? 1 : 0) + fact.supersedes.length,
     0,
@@ -642,7 +645,7 @@ export async function listFacts(
       }
       values.push(limit);
       if (!options.includeHistorical) values.push(activeAt);
-    bySpace.push((await rows<FactRow>(ctx, sql, values)).map(toStoredFact));
+    bySpace.push((await rows<FactRow>(ctx, sql, values)).map(storedFactFromRow));
   }
   const selected = bySpace
     .flat()
@@ -667,14 +670,12 @@ export async function getFactById(
 }
 
 /**
- * The seam P2-39g's full-text (and any future vector) index plugs into: given
- * candidate fact ids already ranked by whatever index produced them, hydrate,
- * authorize and filter each one, preserving the caller's order (recall's blend
- * is order-sensitive, see `recall.ts`). `recallCandidates` in `test/helpers/
- * memoryFixture.mjs` is the deterministic fake that stands in for the real
- * index in tests -- it ranks by a plain substring match, which is enough to
- * prove the hydrate/authorize/order contract without pretending to be
- * `tsvector` ranking.
+ * The by-id seam: given candidate fact ids already ranked by whatever index
+ * produced them, hydrate, authorize and filter each one, preserving the
+ * caller's order (recall's blend is order-sensitive, see `recall.ts`).
+ * `searchFacts` in `src/embeddings/search.ts` is the real index that produces
+ * such a list from a query; this function stays separate from it because the
+ * evaluation harness supplies its own candidate lists.
  */
 export async function getFactsByIds(
   ctx: IdentityCtx,
@@ -692,7 +693,7 @@ export async function getFactsByIds(
     `SELECT ${FACT_COLUMNS} FROM kith.facts WHERE id = ANY($1::text[])`,
     [candidateIds.map((id) => assertKithId(id, "invalid_fact_id"))],
   );
-  const byId = new Map(records.map((record) => [record.id, toStoredFact(record)]));
+  const byId = new Map(records.map((record) => [record.id, storedFactFromRow(record)]));
   const activeAt = ctx.now;
   const ordered = candidateIds
     .map((id) => byId.get(id))
