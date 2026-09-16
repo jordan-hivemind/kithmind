@@ -103,6 +103,18 @@ describe("the postgres surface never imports Convex", () => {
   test.each(
     filesUnder("src/app/api/kith").filter((file) => !file.endsWith(".test.ts")),
   )("%s", assertNoConvexImport);
+
+  // Two named files rather than all of `src/lib/mcp`: that directory is
+  // dual-surface by design (`reads.ts`, `writes.ts`, `auth.ts`, ... each keep
+  // a `convex` branch until i7b), so scanning it wholesale would fail on
+  // every file that legitimately imports Convex for its own branch. These two
+  // are postgres-only seams i7a added -- `lib/mcp/principal.ts`'s
+  // `webPrincipalLoader` and `lib/mcp/embedder.ts` -- and neither has a reason
+  // to import Convex at all.
+  test.each(["src/lib/mcp/principal.ts", "src/lib/mcp/embedder.ts"])(
+    "%s",
+    assertNoConvexImport,
+  );
 });
 
 /**

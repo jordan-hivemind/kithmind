@@ -87,9 +87,12 @@
 // `setCaptureEmbedder` and `setCaptureClassifier` are set the way i3's
 // `setMcpEmbedder` is: nothing in the app calls either, and a test that wants a
 // stated decision or a failing provider says so rather than standing up an
-// endpoint. They are separate from `reads.ts`'s embedder seam because that one
-// is private to that module; unifying the two is follow-up work, not a
-// behavioral difference.
+// endpoint. i7a unifies the embedder half: `setCaptureEmbedder` is now the same
+// seam `reads.ts` injects into (`lib/mcp/embedder.ts`), re-exported under this
+// module's own name rather than redefined, so a test or a future caller can
+// never inject one embedder into the three vector-backed read tools and a
+// different one into this gate. There is no equivalent shared seam for the
+// classifier: nothing outside this gate calls a classifier yet.
 
 import { embeddings, memory } from "@repo/kith-store";
 import {
@@ -98,7 +101,13 @@ import {
   resolveWriteSpace,
 } from "@repo/kith-store/identity";
 
+import { resolveMcpEmbedder } from "@/lib/mcp/embedder";
 import type { WithMcpPrincipal } from "@/lib/mcp/principal";
+
+export {
+  type McpEmbedder as CaptureEmbedder,
+  setMcpEmbedder as setCaptureEmbedder,
+} from "@/lib/mcp/embedder";
 
 export type CaptureThoughtArgs = {
   spaceId?: string;
@@ -133,24 +142,9 @@ export type CaptureThoughtResult = {
   operationSummary?: string;
 };
 
-export type CaptureEmbedder = (text: string) => Promise<{
-  vector: readonly number[];
-  fingerprint: string;
-}>;
-
 /** Re-exported so a caller wires the seam without reaching into the store. */
 export type CaptureClassifier = memory.CaptureClassifier;
 export type CaptureClassifierInput = memory.CaptureClassifierInput;
-
-let embedder: CaptureEmbedder | undefined;
-
-export function setCaptureEmbedder(next: CaptureEmbedder | undefined) {
-  const previous = embedder;
-  embedder = next;
-  return () => {
-    embedder = previous;
-  };
-}
 
 let classifier: memory.CaptureClassifier | undefined;
 
@@ -162,14 +156,6 @@ export function setCaptureClassifier(
   return () => {
     classifier = previous;
   };
-}
-
-async function defaultEmbedder(text: string) {
-  const result = await embeddings.requestEmbedding(
-    text,
-    embeddings.loadEmbeddingConfig(process.env),
-  );
-  return { vector: result.vector, fingerprint: result.fingerprint };
 }
 
 async function defaultClassifier(input: memory.CaptureClassifierInput) {
@@ -334,7 +320,7 @@ export async function runCaptureThought(
   let vector: readonly number[] | null = null;
   if (indexReady && fingerprint) {
     try {
-      const embedded = await (embedder ?? defaultEmbedder)(content);
+      const embedded = await resolveMcpEmbedder()(content);
       // The configured profile has to agree with the index, not merely with
       // itself.
       vector = embedded.fingerprint === fingerprint ? embedded.vector : null;

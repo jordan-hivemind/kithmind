@@ -10,14 +10,14 @@
 // than blanking the page -- see that hook and `lib/kith/poll.ts` for why.
 // This file imports nothing from Convex.
 //
-// Quick Capture is not ported here. The Convex version's capture button calls
-// `thoughts.publicActions.capture`, which classifies raw text into a thought
-// (type, topics, people, summary) through an LLM call before it decides
-// whether anything is stored at all -- domain logic row i explicitly adds
-// none of, and no PostgreSQL equivalent exists yet (`memory.captureThought`
-// takes metadata that is already classified). The section stays visible so the
-// gap is legible, not silently dropped.
+// Quick Capture (i7a) posts to `POST /api/kith/thoughts/capture`, which runs
+// `lib/kith/capture.ts`'s `captureThoughtFromWeb` -- the same model-backed
+// admission gate the MCP `capture_thought` tool runs, classifier included,
+// not a provider-free approximation of it. See that module's comment for the
+// gate's shape (three transactions around two provider calls) and its own
+// fail-closed behavior.
 
+import { KithQuickCapture } from "@/components/kith-quick-capture";
 import { ThoughtCard } from "@/features/thoughts/components/ThoughtCard";
 import { useStatusPoll } from "@/lib/kith/use-status-poll";
 
@@ -110,21 +110,8 @@ export function KithDashboard({ stats, recent }: DashboardData) {
         </p>
       )}
 
-      <div
-        style={{
-          border: "1px solid #e0e0e0",
-          borderRadius: 8,
-          padding: 16,
-          backgroundColor: "#fafafa",
-          marginTop: 16,
-        }}
-      >
-        <h3 style={{ marginTop: 0 }}>Quick Capture</h3>
-        <p style={{ color: "#666", margin: 0 }}>
-          Quick Capture is not available on this surface yet. Use an MCP
-          client&apos;s <code>capture_thought</code> tool, or the Getting
-          Started guide, to add a thought.
-        </p>
+      <div style={{ marginTop: 16 }}>
+        <KithQuickCapture />
       </div>
 
       <h2 style={{ marginTop: 32 }}>Recent Thoughts</h2>

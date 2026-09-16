@@ -1,7 +1,10 @@
+// i7a repoints this from `@repo/db/convex/models/workers/protocol`, which was
+// always a pure `export * from "@repo/worker-protocol/request"` (see that
+// file's own comment), to the package it re-exported.
 import {
   parseWorkerProtocolErrorData,
   type WorkerProtocolErrorCode,
-} from "@repo/db/convex/models/workers/protocol";
+} from "@repo/worker-protocol/request";
 
 import { IngestHttpError } from "@/lib/ingest/http";
 

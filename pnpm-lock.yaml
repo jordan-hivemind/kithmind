@@ -44,6 +44,9 @@ importers:
       '@repo/kith-store':
         specifier: workspace:*
         version: link:../../packages/kith-store
+      '@repo/worker-protocol':
+        specifier: workspace:*
+        version: link:../../packages/worker-protocol
       convex:
         specifier: ^1.43.0
         version: 1.43.0(react@19.2.8)

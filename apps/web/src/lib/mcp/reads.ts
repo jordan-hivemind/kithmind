@@ -47,6 +47,7 @@ import {
 import type { ConvexHttpClient } from "convex/browser";
 import type { FunctionArgs } from "convex/server";
 
+import { resolveMcpEmbedder } from "./embedder";
 import type { WithMcpPrincipal } from "./principal";
 
 /** The snippet bound `models/thoughts/mcpActions.ts` applies to index rows. */
@@ -523,28 +524,12 @@ export function convexReads(convex: ConvexGateway): McpReads {
  *
  * Injectable the way `lib/kith/pool.ts` makes the pool injectable: nothing in
  * the app calls the setter, and a test that wants a failing provider says so
- * rather than standing up an HTTP endpoint that returns 500.
+ * rather than standing up an HTTP endpoint that returns 500. The seam itself
+ * moved to `./embedder` in i7a, which `lib/kith/capture.ts` also imports, so
+ * `setMcpEmbedder` is re-exported here rather than redefined: this module's
+ * own tests, and every other caller, keep importing it from `"./reads"`.
  */
-export type McpEmbedder = (query: string) => Promise<{
-  vector: readonly number[];
-  fingerprint: string;
-}>;
-
-let embedder: McpEmbedder | undefined;
-
-export function setMcpEmbedder(next: McpEmbedder | undefined): () => void {
-  const previous = embedder;
-  embedder = next;
-  return () => {
-    embedder = previous;
-  };
-}
-
-async function defaultEmbedder(query: string) {
-  const config = embeddings.loadEmbeddingConfig(process.env);
-  const result = await embeddings.requestEmbedding(query, config);
-  return { vector: result.vector, fingerprint: result.fingerprint };
-}
+export { type McpEmbedder, setMcpEmbedder } from "./embedder";
 
 /**
  * The authorization and index check that decides whether the query text is
@@ -603,7 +588,7 @@ async function prepareEmbedQuery(
   );
   if (!fingerprint) return undefined;
   try {
-    const resolved = await (embedder ?? defaultEmbedder)(query);
+    const resolved = await resolveMcpEmbedder()(query);
     // The configured profile has to agree with the index, not merely with
     // itself. `searchThoughtsHybrid` checks this again on its own snapshot.
     if (resolved.fingerprint !== fingerprint) return undefined;

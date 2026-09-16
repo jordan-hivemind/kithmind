@@ -19,6 +19,7 @@
     "@repo/finance-archive": "workspace:*",
     "@repo/finance-contract": "workspace:*",
     "@repo/kith-store": "workspace:*",
+    "@repo/worker-protocol": "workspace:*",
     "convex": "^1.43.0",
     "jose": "^6.2.8",
     "next": "^15.5.25",
