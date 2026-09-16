@@ -1,6 +1,20 @@
+// The JWT bridge. Deleted in i7, not here.
+//
+// Section 3.2 of the web and MCP surface plan deletes this file, the JWKS route,
+// `packages/convex/convex/auth.config.ts` and the four `MCP_JWT_*` variables,
+// because a PostgreSQL surface has no second backend to authenticate to. i2 was
+// the slice named for that deletion and moves it to i7 for one reason: the
+// surface has to stay dark. `main` deploys, `KITH_POSTGRES_SURFACE` still
+// defaults to `convex`, and every page and tool that has not moved yet reaches
+// Convex through a token minted here. Deleting the signer before i5 moves the
+// pages would take production down rather than leave it unchanged.
+//
+// So nothing here changes in i2 except the name of the origin variable it reads.
+// i7 deletes the file.
+
 import { importJWK, type JWK, SignJWT } from "jose";
 
-import { getMcpIssuer, requireEnvironmentVariable } from "./environment";
+import { getMcpPublicOrigin, requireEnvironmentVariable } from "./environment";
 
 export const MCP_JWT_AUDIENCE = "ai-brain-convex-mcp";
 export const MCP_JWT_ALGORITHM = "ES256";
@@ -57,7 +71,7 @@ export async function createConvexMcpToken(
   identity: McpIdentity,
   exchange?: OAuthExchangeClaims,
 ): Promise<string> {
-  const issuer = getMcpIssuer();
+  const issuer = getMcpPublicOrigin();
   const privateJwk = parseJwk(
     requireEnvironmentVariable("MCP_JWT_PRIVATE_JWK"),
     "MCP_JWT_PRIVATE_JWK",

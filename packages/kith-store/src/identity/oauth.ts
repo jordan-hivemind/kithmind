@@ -42,6 +42,7 @@ import {
   type Principal,
 } from "./authorization.js";
 import {
+  deleteApiKey,
   validateApiKeyName,
   validateApiKeyScopes,
   generateApiKeyMaterial,
@@ -348,7 +349,7 @@ export async function beginAuthorizationGrant(
     };
   }
   if (existing) {
-    await exec(ctx, "DELETE FROM kith.api_keys WHERE id = $1", [existing.id]);
+    await deleteApiKey(ctx, existing.id);
   }
 
   const live = await rows<{ oauth_lifecycle: string }>(
@@ -629,9 +630,7 @@ export async function activateAuthorizationGrant(
     // A second exchange of the same code means the code leaked. The key that was
     // activated by the first exchange is deleted rather than left live.
     if (hasNoOAuthLifecycle(exchange.key)) {
-      await exec(ctx, "DELETE FROM kith.api_keys WHERE id = $1", [
-        exchange.key.id,
-      ]);
+      await deleteApiKey(ctx, exchange.key.id);
     }
     return { status: "replayed" };
   }

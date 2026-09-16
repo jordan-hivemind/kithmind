@@ -7,9 +7,10 @@ import {
   coreLimitFor,
 } from "@repo/db/convex/models/recallBlend";
 import {
-  FinanceContractError,
   FINANCE_READ_TOOL_DESCRIPTION,
+  FinanceContractError,
 } from "@repo/finance-contract";
+import { listSpaces } from "@repo/kith-store/identity";
 import { ConvexHttpClient } from "convex/browser";
 import type { FunctionArgs } from "convex/server";
 import { z } from "zod";
@@ -28,6 +29,7 @@ import {
   readFinanceArchive,
   resolveFinanceArchive,
 } from "./finance";
+import type { WithMcpPrincipal } from "./principal";
 import { recordQuerySchema } from "./record-query";
 
 export const SERVER_INSTRUCTIONS = `Kith Mind stores family knowledge as structured facts, narrative thoughts, and indexed source documents with retained evidence.
@@ -372,24 +374,88 @@ function financeToolError(error: unknown) {
   };
 }
 
+/**
+ * What the server was handed to act as.
+ *
+ * Under `convex` it is the short-lived identity token `/api/mcp` mints, which is
+ * what the 17 tools still authenticate with until i3 and i4 port them. Under
+ * `postgres` it is a loader, not a principal: section 3.3's rule is that each
+ * call reloads the credential inside its own transaction, so the server is given
+ * the means to do that and never a snapshot to trust.
+ *
+ * A bare string is the `convex` form. It is accepted so that call sites written
+ * before the surface existed keep working unchanged, which is what makes i2
+ * observably a no-op in that mode.
+ */
+export type McpServerCredential =
+  | { surface: "convex"; convexAuthToken: string }
+  | { surface: "postgres"; withPrincipal: WithMcpPrincipal };
+
+/** The three Convex calls the tools make. Nothing here constructs a client. */
+type ConvexGateway = Pick<ConvexHttpClient, "query" | "mutation" | "action">;
+
+/**
+ * The gateway for a surface that has not ported its tools yet.
+ *
+ * i2 moves authentication, not tools. Under `postgres` the credential is checked
+ * against PostgreSQL and a tool call then has nothing to run against until i3
+ * and i4, so it fails with a message that says which rows own the port. It must
+ * not fall back to Convex: a deployment reading PostgreSQL identities would then
+ * answer tool calls with Convex data for a credential Convex never checked.
+ */
+function unportedConvexGateway(): ConvexGateway {
+  const refuse = (): never => {
+    throw new Error(
+      "MCP tools do not read PostgreSQL yet; rows P2-39i3 and P2-39i4 port them",
+    );
+  };
+  return { query: refuse, mutation: refuse, action: refuse };
+}
+
 export function createMcpServer(
-  convexAuthToken: string,
+  credential: McpServerCredential | string,
   principalId: string,
   financeArchive: FinanceArchiveAccess | null = resolveFinanceArchive(),
 ) {
-  const convexUrl = process.env.NEXT_PUBLIC_CONVEX_URL;
-  if (!convexUrl) {
-    throw new Error("NEXT_PUBLIC_CONVEX_URL is not set");
+  const bound: McpServerCredential =
+    typeof credential === "string"
+      ? { surface: "convex", convexAuthToken: credential }
+      : credential;
+
+  let convex: ConvexGateway;
+  if (bound.surface === "convex") {
+    const convexUrl = process.env.NEXT_PUBLIC_CONVEX_URL;
+    if (!convexUrl) {
+      throw new Error("NEXT_PUBLIC_CONVEX_URL is not set");
+    }
+    const client = new ConvexHttpClient(convexUrl);
+    client.setAuth(bound.convexAuthToken);
+    convex = client;
+  } else {
+    convex = unportedConvexGateway();
   }
-  const convex = new ConvexHttpClient(convexUrl);
-  convex.setAuth(convexAuthToken);
 
   /**
-   * The space set the finance provider is authorized against. Read from Convex
-   * on every call rather than cached, so a revoked membership takes effect on
-   * the next query rather than at the end of a session.
+   * The space set the finance provider is authorized against. Read on every call
+   * rather than cached, so a revoked membership takes effect on the next query
+   * rather than at the end of a session.
+   *
+   * The finance leg already runs on PostgreSQL, so it is the one caller that has
+   * a PostgreSQL answer in i2: `identity.listSpaces` inside the call's own
+   * read-only transaction, which is the same authorization the Convex query
+   * performs and the same reload rule section 3.3 states.
    */
   async function financeTrustedContext(): Promise<FinanceTrustedGatewayContext> {
+    if (bound.surface === "postgres") {
+      const spaces = await bound.withPrincipal(
+        ({ ctx, principal }) => listSpaces(ctx, { principal }),
+        { readOnly: true },
+      );
+      return {
+        principalId,
+        authorizedSpaceIds: spaces.map((space) => space.spaceId),
+      };
+    }
     const spaces = await convex.query(api.models.spaces.mcpQueries.list, {});
     return {
       principalId,

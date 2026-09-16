@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { assertMcpEnvironment, validateMcpEnvironment } from "./environment";
+import {
+  assertMcpEnvironment,
+  requiredMcpEnvironmentVariables,
+  validateMcpEnvironment,
+} from "./environment";
 
 const privateJwk = JSON.stringify({
   kty: "EC",
@@ -16,16 +20,25 @@ const publicJwk = JSON.stringify({
   y: `${"B".repeat(42)}E`,
 });
 
+/** A deployment on the new name for the public origin. */
 function validEnvironment(): Record<string, string> {
   return {
     NEXT_PUBLIC_CONVEX_URL: "https://example.convex.cloud",
-    MCP_JWT_ISSUER: "https://brain.example.test",
+    MCP_PUBLIC_ORIGIN: "https://brain.example.test",
     MCP_JWT_PRIVATE_JWK: privateJwk,
     MCP_JWT_PUBLIC_JWK: publicJwk,
     MCP_JWT_KEY_ID: "mcp-test-key",
     MCP_OAUTH_ENCRYPTION_KEY: "A".repeat(43),
     MCP_TOOL_PROFILE: "memory",
   };
+}
+
+/** The same deployment before the rename, which must still run under convex. */
+function legacyEnvironment(): Record<string, string> {
+  const environment = validEnvironment();
+  delete environment.MCP_PUBLIC_ORIGIN;
+  environment.MCP_JWT_ISSUER = "https://brain.example.test";
+  return environment;
 }
 
 describe("validateMcpEnvironment", () => {
@@ -44,7 +57,7 @@ describe("validateMcpEnvironment", () => {
   it("accepts HTTP only for loopback development origins", () => {
     const environment = validEnvironment();
     environment.NEXT_PUBLIC_CONVEX_URL = "http://127.0.0.1:3210";
-    environment.MCP_JWT_ISSUER = "http://localhost:3000";
+    environment.MCP_PUBLIC_ORIGIN = "http://localhost:3000";
 
     expect(validateMcpEnvironment(environment)).toEqual([]);
   });
@@ -54,7 +67,7 @@ describe("validateMcpEnvironment", () => {
 
     expect(issues).toEqual([
       { name: "NEXT_PUBLIC_CONVEX_URL", problem: "missing" },
-      { name: "MCP_JWT_ISSUER", problem: "missing" },
+      { name: "MCP_PUBLIC_ORIGIN", problem: "missing" },
       { name: "MCP_JWT_PRIVATE_JWK", problem: "missing" },
       { name: "MCP_JWT_PUBLIC_JWK", problem: "missing" },
       { name: "MCP_OAUTH_ENCRYPTION_KEY", problem: "missing" },
@@ -64,7 +77,7 @@ describe("validateMcpEnvironment", () => {
   it("rejects malformed origins, keys, and key IDs", () => {
     const environment = validEnvironment();
     environment.NEXT_PUBLIC_CONVEX_URL = "http://convex.example.test";
-    environment.MCP_JWT_ISSUER = "https://brain.example.test/path";
+    environment.MCP_PUBLIC_ORIGIN = "https://brain.example.test/path";
     environment.MCP_JWT_PRIVATE_JWK = "not-json";
     environment.MCP_JWT_PUBLIC_JWK = JSON.stringify({
       ...JSON.parse(publicJwk),
@@ -76,7 +89,7 @@ describe("validateMcpEnvironment", () => {
 
     expect(validateMcpEnvironment(environment)).toEqual([
       { name: "NEXT_PUBLIC_CONVEX_URL", problem: "invalid" },
-      { name: "MCP_JWT_ISSUER", problem: "invalid" },
+      { name: "MCP_PUBLIC_ORIGIN", problem: "invalid" },
       { name: "MCP_JWT_PRIVATE_JWK", problem: "invalid" },
       { name: "MCP_JWT_PUBLIC_JWK", problem: "invalid" },
       { name: "MCP_OAUTH_ENCRYPTION_KEY", problem: "invalid" },
@@ -95,6 +108,90 @@ describe("validateMcpEnvironment", () => {
     expect(validateMcpEnvironment(environment)).toEqual([
       { name: "MCP_JWT_PRIVATE_JWK", problem: "invalid" },
       { name: "MCP_JWT_PUBLIC_JWK", problem: "invalid" },
+    ]);
+  });
+
+  // Section 3.4 and question 5: `MCP_JWT_ISSUER` becomes `MCP_PUBLIC_ORIGIN`.
+  // The old name is still read under `convex`, where the JWT bridge is live, and
+  // the change is reported by name so a deployment is told to move it.
+  it("accepts the old origin name under convex and reports the rename", () => {
+    const environment = legacyEnvironment();
+
+    expect(validateMcpEnvironment(environment)).toEqual([
+      { name: "MCP_JWT_ISSUER", problem: "deprecated" },
+    ]);
+    // A rename notice is not a misconfiguration: the deployment works.
+    expect(() => assertMcpEnvironment(environment)).not.toThrow();
+  });
+
+  it("validates the old origin name when it is the one being read", () => {
+    const environment = legacyEnvironment();
+    environment.MCP_JWT_ISSUER = "https://brain.example.test/path";
+
+    expect(validateMcpEnvironment(environment)).toEqual([
+      { name: "MCP_JWT_ISSUER", problem: "invalid" },
+      { name: "MCP_JWT_ISSUER", problem: "deprecated" },
+    ]);
+  });
+
+  it("requires the new origin name under the postgres surface", () => {
+    const environment = legacyEnvironment();
+    environment.KITH_POSTGRES_SURFACE = "postgres";
+    environment.KITH_DATABASE_URL = "postgres://example.test/kith";
+    environment.KITH_SESSION_SECRET = "s".repeat(32);
+
+    expect(validateMcpEnvironment(environment)).toEqual([
+      { name: "MCP_PUBLIC_ORIGIN", problem: "missing" },
+    ]);
+
+    environment.MCP_PUBLIC_ORIGIN = "https://brain.example.test";
+    // The leftover old name is not reported: nothing reads it on this surface.
+    expect(validateMcpEnvironment(environment)).toEqual([]);
+  });
+
+  it("refuses two origin names that disagree while the bridge is live", () => {
+    const environment = validEnvironment();
+    environment.MCP_JWT_ISSUER = "https://other.example.test";
+
+    expect(validateMcpEnvironment(environment)).toEqual([
+      { name: "MCP_PUBLIC_ORIGIN", problem: "invalid" },
+      { name: "MCP_JWT_ISSUER", problem: "invalid" },
+    ]);
+
+    environment.MCP_JWT_ISSUER = environment.MCP_PUBLIC_ORIGIN!;
+    expect(validateMcpEnvironment(environment)).toEqual([]);
+  });
+
+  // The JWT bridge is dead under postgres, so its key material is not required
+  // there. i7 deletes both variables.
+  it("does not require the JWT key material under the postgres surface", () => {
+    const environment = validEnvironment();
+    environment.KITH_POSTGRES_SURFACE = "postgres";
+    environment.KITH_DATABASE_URL = "postgres://example.test/kith";
+    environment.KITH_SESSION_SECRET = "s".repeat(32);
+    delete environment.MCP_JWT_PRIVATE_JWK;
+    delete environment.MCP_JWT_PUBLIC_JWK;
+    delete environment.MCP_JWT_KEY_ID;
+
+    expect(validateMcpEnvironment(environment)).toEqual([]);
+  });
+
+  it("lists the required names for the configured surface", () => {
+    expect(requiredMcpEnvironmentVariables(validEnvironment())).toEqual([
+      "NEXT_PUBLIC_CONVEX_URL",
+      "MCP_OAUTH_ENCRYPTION_KEY",
+      "MCP_PUBLIC_ORIGIN",
+      "MCP_JWT_PRIVATE_JWK",
+      "MCP_JWT_PUBLIC_JWK",
+    ]);
+    expect(
+      requiredMcpEnvironmentVariables({ KITH_POSTGRES_SURFACE: "postgres" }),
+    ).toEqual([
+      "NEXT_PUBLIC_CONVEX_URL",
+      "MCP_OAUTH_ENCRYPTION_KEY",
+      "MCP_PUBLIC_ORIGIN",
+      "KITH_DATABASE_URL",
+      "KITH_SESSION_SECRET",
     ]);
   });
 
@@ -164,6 +261,17 @@ describe("validateMcpEnvironment", () => {
       expect(String(error)).not.toContain("do-not-leak");
       expect(String(error)).not.toContain("short");
     }
+  });
+
+  it("names the origin variables without returning their values", () => {
+    const environment = validEnvironment();
+    environment.MCP_PUBLIC_ORIGIN = "https://do-not-leak.example.test/path";
+
+    const issues = validateMcpEnvironment(environment);
+    expect(issues).toEqual([
+      { name: "MCP_PUBLIC_ORIGIN", problem: "invalid" },
+    ]);
+    expect(JSON.stringify(issues)).not.toContain("do-not-leak");
   });
 
   it("throws an error containing names only", () => {

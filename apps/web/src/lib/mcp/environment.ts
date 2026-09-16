@@ -1,40 +1,95 @@
+// The MCP gateway's configuration, validated by name and never by value.
+//
+// Section 3.4 of the web and MCP surface plan, plus question 5, which the owner
+// answered "rename": the public origin is `MCP_PUBLIC_ORIGIN` from i2 onward.
+// That variable is not the JWT issuer that happened to share its name. It is the
+// origin this gateway is published at -- the `WWW-Authenticate` resource
+// metadata URL, the OAuth metadata documents and the resource identifier -- and
+// it outlives the JWT bridge that i7 deletes.
+//
+// The rename is therefore a read preference rather than a cutover:
+//
+//   * `MCP_PUBLIC_ORIGIN` is read first, in both surface modes.
+//   * Under `convex`, `MCP_JWT_ISSUER` is still accepted when the new name is
+//     absent, and `validateMcpEnvironment` reports that by name as `deprecated`
+//     so the deployment is told to move it without being called misconfigured.
+//   * Under `postgres`, `MCP_PUBLIC_ORIGIN` is required. There is no signer left
+//     to share a name with, so accepting the old one would only preserve the
+//     confusion the rename exists to end.
+//
+// Only the variable that is actually read is validated. A `MCP_JWT_ISSUER` left
+// behind under `postgres` is not reported, because nothing reads it and an issue
+// about an unread variable sends an operator to fix the wrong thing.
+
+import { kithPostgresSurface, type PostgresSurface } from "@/lib/kith/surface";
+
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 const BASE64URL_32_BYTES = /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/;
 const KEY_ID = /^[A-Za-z0-9._~-]{1,128}$/;
 
-export const REQUIRED_MCP_ENVIRONMENT_VARIABLES = [
+type Environment = Readonly<Record<string, string | undefined>>;
+
+/**
+ * Required in every deployment, whichever surface it reads.
+ *
+ * `NEXT_PUBLIC_CONVEX_URL` is still here under `postgres`, deliberately: i2
+ * moves authentication off Convex and leaves the 17 tools on it until i3 and i4.
+ * A `postgres` deployment that dropped the variable today would authenticate and
+ * then fail at the first tool call. i7 removes it from this list, because i7 is
+ * the slice that removes the last Convex import from `apps/web`.
+ */
+const ALWAYS_REQUIRED = [
   "NEXT_PUBLIC_CONVEX_URL",
-  "MCP_JWT_ISSUER",
-  "MCP_JWT_PRIVATE_JWK",
-  "MCP_JWT_PUBLIC_JWK",
   "MCP_OAUTH_ENCRYPTION_KEY",
 ] as const;
 
 /**
- * The three variables P2-39i adds (surface plan section 3.4).
+ * The JWT bridge's key material. Required only under `convex`.
  *
- * They are not in `REQUIRED_MCP_ENVIRONMENT_VARIABLES`, because that list is
- * what every deployment must have and these are what the PostgreSQL surface
- * must have. `KITH_POSTGRES_SURFACE` defaults to `convex` and the flag does not
- * flip until row m, so requiring them now would report the current production
- * deployment as misconfigured for not yet having been migrated.
- *
- * What is checked instead: the surface value itself is always validated, so a
- * typo is named here rather than silently reading as `convex`; the two secrets
- * are required only when the surface is `postgres`; and a value that is present
- * but malformed is invalid in either mode, because a secret that is too short
- * under `convex` is a secret that will be too short the moment the flag flips.
- *
- * i7 moves `KITH_DATABASE_URL` into the required list and removes
- * `NEXT_PUBLIC_CONVEX_URL` from it.
+ * i7 deletes all four `MCP_JWT_*` variables together with `convex-auth.ts`, the
+ * JWKS route and `auth.config.ts`. i2 stops requiring them on the surface that
+ * has neither a signer nor a verifier, and stops nothing else: the bridge must
+ * keep working under `convex` until the pages move, which is what the dark
+ * deploy is for.
  */
+const CONVEX_ONLY_REQUIRED = [
+  "MCP_JWT_PRIVATE_JWK",
+  "MCP_JWT_PUBLIC_JWK",
+] as const;
+
+/** What the PostgreSQL surface cannot run without. Section 3.4. */
+const POSTGRES_ONLY_REQUIRED = [
+  "KITH_DATABASE_URL",
+  "KITH_SESSION_SECRET",
+] as const;
+
 export type McpEnvironmentVariable =
-  | (typeof REQUIRED_MCP_ENVIRONMENT_VARIABLES)[number]
+  | (typeof ALWAYS_REQUIRED)[number]
+  | (typeof CONVEX_ONLY_REQUIRED)[number]
+  | (typeof POSTGRES_ONLY_REQUIRED)[number]
+  | "MCP_PUBLIC_ORIGIN"
+  | "MCP_JWT_ISSUER"
   | "MCP_JWT_KEY_ID"
   | "MCP_TOOL_PROFILE"
-  | "KITH_DATABASE_URL"
-  | "KITH_SESSION_SECRET"
   | "KITH_POSTGRES_SURFACE";
+
+/**
+ * The names a deployment must set, for the surface it is configured to read.
+ *
+ * Exported so a health response or a deployment check can list them without
+ * reimplementing the surface rule, and so the rename has one source.
+ */
+export function requiredMcpEnvironmentVariables(
+  environment: Environment = process.env,
+): readonly McpEnvironmentVariable[] {
+  return [
+    ...ALWAYS_REQUIRED,
+    "MCP_PUBLIC_ORIGIN",
+    ...(kithPostgresSurface(environment) === "postgres"
+      ? POSTGRES_ONLY_REQUIRED
+      : CONVEX_ONLY_REQUIRED),
+  ];
+}
 
 /** What `KITH_SESSION_SECRET` must be, restated from `lib/kith/session.ts`. */
 const MIN_KITH_SESSION_SECRET_LENGTH = 32;
@@ -48,12 +103,18 @@ function isPostgresConnectionString(value: string): boolean {
   }
 }
 
+/**
+ * What is wrong with a variable.
+ *
+ * `deprecated` is the third kind and the only non-blocking one: the value is
+ * present, valid and being read, under a name i7 removes.
+ * `assertMcpEnvironment` and the health route ignore it, because a deployment
+ * that works must not be reported as broken for using the old spelling.
+ */
 export type McpEnvironmentIssue = {
   name: McpEnvironmentVariable;
-  problem: "missing" | "invalid";
+  problem: "missing" | "invalid" | "deprecated";
 };
-
-type Environment = Readonly<Record<string, string | undefined>>;
 
 type P256JwkCoordinates = {
   x: string;
@@ -87,6 +148,29 @@ function isAllowedOrigin(value: string): boolean {
   } catch {
     return false;
   }
+}
+
+type ResolvedOrigin = {
+  /** The variable the value came from, which is the name any issue carries. */
+  name: "MCP_PUBLIC_ORIGIN" | "MCP_JWT_ISSUER";
+  value: string;
+};
+
+/**
+ * The public origin and the variable it was read from, or null.
+ *
+ * One function, used by both the validator and `getMcpPublicOrigin`, so the
+ * fallback cannot be accepted in one place and refused in the other.
+ */
+function resolvePublicOrigin(
+  environment: Environment,
+  surface: PostgresSurface,
+): ResolvedOrigin | null {
+  const preferred = environment.MCP_PUBLIC_ORIGIN;
+  if (preferred) return { name: "MCP_PUBLIC_ORIGIN", value: preferred };
+  if (surface === "postgres") return null;
+  const legacy = environment.MCP_JWT_ISSUER;
+  return legacy ? { name: "MCP_JWT_ISSUER", value: legacy } : null;
 }
 
 function parseP256Jwk(
@@ -124,28 +208,57 @@ export function validateMcpEnvironment(
   environment: Environment = process.env,
 ): McpEnvironmentIssue[] {
   const issues: McpEnvironmentIssue[] = [];
-  const requiredValues = new Map<McpEnvironmentVariable, string>();
 
-  for (const name of REQUIRED_MCP_ENVIRONMENT_VARIABLES) {
-    const value = environment[name];
-    if (!value) {
-      issues.push({ name, problem: "missing" });
-    } else {
-      requiredValues.set(name, value);
-    }
-  }
+  const surfaceValue = environment.KITH_POSTGRES_SURFACE;
+  const surfaceIsNamed =
+    surfaceValue === undefined ||
+    surfaceValue === "" ||
+    surfaceValue === "convex" ||
+    surfaceValue === "postgres";
+  const surface = kithPostgresSurface(environment);
+  const onPostgres = surface === "postgres";
 
-  const convexUrl = requiredValues.get("NEXT_PUBLIC_CONVEX_URL");
-  if (convexUrl && !isAllowedOrigin(convexUrl)) {
+  const convexUrl = environment.NEXT_PUBLIC_CONVEX_URL;
+  if (!convexUrl) {
+    issues.push({ name: "NEXT_PUBLIC_CONVEX_URL", problem: "missing" });
+  } else if (!isAllowedOrigin(convexUrl)) {
     issues.push({ name: "NEXT_PUBLIC_CONVEX_URL", problem: "invalid" });
   }
 
-  const issuer = requiredValues.get("MCP_JWT_ISSUER");
-  if (issuer && !isAllowedOrigin(issuer)) {
-    issues.push({ name: "MCP_JWT_ISSUER", problem: "invalid" });
+  const origin = resolvePublicOrigin(environment, surface);
+  if (!origin) {
+    issues.push({ name: "MCP_PUBLIC_ORIGIN", problem: "missing" });
+  } else {
+    if (!isAllowedOrigin(origin.value)) {
+      issues.push({ name: origin.name, problem: "invalid" });
+    }
+    if (origin.name === "MCP_JWT_ISSUER") {
+      issues.push({ name: "MCP_JWT_ISSUER", problem: "deprecated" });
+    }
+    // Under `convex` the bridge is still live, and Convex verifies the token
+    // against its own `MCP_JWT_ISSUER`. Two names holding two different origins
+    // would mean the gateway signs one issuer and Convex expects another, which
+    // fails at the first tool call rather than at deployment. Naming it here is
+    // the only place that can see both.
+    if (
+      !onPostgres &&
+      origin.name === "MCP_PUBLIC_ORIGIN" &&
+      environment.MCP_JWT_ISSUER !== undefined &&
+      environment.MCP_JWT_ISSUER !== "" &&
+      environment.MCP_JWT_ISSUER !== origin.value
+    ) {
+      issues.push({ name: "MCP_PUBLIC_ORIGIN", problem: "invalid" });
+      issues.push({ name: "MCP_JWT_ISSUER", problem: "invalid" });
+    }
   }
 
-  const privateJwkValue = requiredValues.get("MCP_JWT_PRIVATE_JWK");
+  // Present is validated in both modes; required only under `convex`. A key that
+  // is malformed now is a key that is still malformed if the flag is flipped
+  // back, and reporting it is cheaper than discovering it during a rollback.
+  const privateJwkValue = environment.MCP_JWT_PRIVATE_JWK;
+  if (!privateJwkValue && !onPostgres) {
+    issues.push({ name: "MCP_JWT_PRIVATE_JWK", problem: "missing" });
+  }
   const privateJwk = privateJwkValue
     ? parseP256Jwk(privateJwkValue, true)
     : undefined;
@@ -153,7 +266,10 @@ export function validateMcpEnvironment(
     issues.push({ name: "MCP_JWT_PRIVATE_JWK", problem: "invalid" });
   }
 
-  const publicJwkValue = requiredValues.get("MCP_JWT_PUBLIC_JWK");
+  const publicJwkValue = environment.MCP_JWT_PUBLIC_JWK;
+  if (!publicJwkValue && !onPostgres) {
+    issues.push({ name: "MCP_JWT_PUBLIC_JWK", problem: "missing" });
+  }
   const publicJwk = publicJwkValue
     ? parseP256Jwk(publicJwkValue, false)
     : undefined;
@@ -170,8 +286,10 @@ export function validateMcpEnvironment(
     issues.push({ name: "MCP_JWT_PUBLIC_JWK", problem: "invalid" });
   }
 
-  const encryptionKey = requiredValues.get("MCP_OAUTH_ENCRYPTION_KEY");
-  if (encryptionKey && !BASE64URL_32_BYTES.test(encryptionKey)) {
+  const encryptionKey = environment.MCP_OAUTH_ENCRYPTION_KEY;
+  if (!encryptionKey) {
+    issues.push({ name: "MCP_OAUTH_ENCRYPTION_KEY", problem: "missing" });
+  } else if (!BASE64URL_32_BYTES.test(encryptionKey)) {
     issues.push({ name: "MCP_OAUTH_ENCRYPTION_KEY", problem: "invalid" });
   }
 
@@ -190,16 +308,9 @@ export function validateMcpEnvironment(
     issues.push({ name: "MCP_TOOL_PROFILE", problem: "invalid" });
   }
 
-  const surface = environment.KITH_POSTGRES_SURFACE;
-  if (
-    surface !== undefined &&
-    surface !== "" &&
-    surface !== "convex" &&
-    surface !== "postgres"
-  ) {
+  if (!surfaceIsNamed) {
     issues.push({ name: "KITH_POSTGRES_SURFACE", problem: "invalid" });
   }
-  const onPostgres = surface === "postgres";
 
   const databaseUrl = environment.KITH_DATABASE_URL;
   if (databaseUrl === undefined || databaseUrl === "") {
@@ -222,10 +333,19 @@ export function validateMcpEnvironment(
   return issues;
 }
 
+/** The issues that make a deployment unusable, without the rename notices. */
+export function blockingMcpEnvironmentIssues(
+  issues: readonly McpEnvironmentIssue[],
+): McpEnvironmentIssue[] {
+  return issues.filter((issue) => issue.problem !== "deprecated");
+}
+
 export function assertMcpEnvironment(
   environment: Environment = process.env,
 ): void {
-  const issues = validateMcpEnvironment(environment);
+  const issues = blockingMcpEnvironmentIssues(
+    validateMcpEnvironment(environment),
+  );
   if (issues.length > 0) {
     const summary = issues
       .map(({ name, problem }) => `${problem}: ${name}`)
@@ -234,39 +354,29 @@ export function assertMcpEnvironment(
   }
 }
 
-export function getMcpIssuer(): string {
-  const configuredIssuer = requireEnvironmentVariable("MCP_JWT_ISSUER");
-  let issuer: URL;
-
-  try {
-    issuer = new URL(configuredIssuer);
-  } catch {
-    throw new Error("MCP_JWT_ISSUER must be an absolute URL origin");
+/**
+ * The origin this gateway is published at.
+ *
+ * Named for what it is rather than for the JWT claim it used to fill. The error
+ * names the variable that was read, so an operator who still has the old name
+ * configured is told which one the process actually used, and neither error
+ * carries the configured value.
+ */
+export function getMcpPublicOrigin(): string {
+  const resolved = resolvePublicOrigin(process.env, kithPostgresSurface());
+  if (!resolved) {
+    throw new Error("MCP_PUBLIC_ORIGIN is not set");
   }
-
-  const isSecure = issuer.protocol === "https:";
-  const isLoopbackDevelopmentOrigin =
-    issuer.protocol === "http:" && LOOPBACK_HOSTS.has(issuer.hostname);
-
-  if (
-    (!isSecure && !isLoopbackDevelopmentOrigin) ||
-    issuer.username ||
-    issuer.password ||
-    issuer.pathname !== "/" ||
-    issuer.search ||
-    issuer.hash ||
-    configuredIssuer !== issuer.origin
-  ) {
+  if (!isAllowedOrigin(resolved.value)) {
     throw new Error(
-      "MCP_JWT_ISSUER must be an HTTPS origin without a path or trailing slash",
+      `${resolved.name} must be an HTTPS origin without a path or trailing slash`,
     );
   }
-
-  return issuer.origin;
+  return new URL(resolved.value).origin;
 }
 
 export function getMcpResourceUri(): string {
-  return `${getMcpIssuer()}/api/mcp`;
+  return `${getMcpPublicOrigin()}/api/mcp`;
 }
 
 export function isMcpResourceUri(value: string): boolean {

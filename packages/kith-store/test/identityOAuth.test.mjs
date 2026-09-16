@@ -164,6 +164,15 @@ test(
       assert.equal(await getApiKey(ctx, issued.keyId), null);
       assert.deepEqual(await listApiKeys(ctx, { principal }), []);
 
+      // The revocation has to be able to commit, and this suite never commits:
+      // it rolls every case back, so a `DEFERRABLE INITIALLY DEFERRED` foreign
+      // key is checked at a COMMIT these tests do not reach. P2-39i2 found the
+      // revocation failing there and not here. `SET CONSTRAINTS ALL IMMEDIATE`
+      // runs the deferred checks now, which is what makes the rollback fixture
+      // able to prove a commit would have succeeded.
+      await ctx.client.query("SET CONSTRAINTS ALL IMMEDIATE");
+      await ctx.client.query("SET CONSTRAINTS ALL DEFERRED");
+
       // And the consumed receipt makes the same consent unusable.
       assert.deepEqual(
         await beginAuthorizationGrant(ctx, {

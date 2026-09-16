@@ -1,19 +1,29 @@
 "use client";
 
+// The Convex-backed consent picker. Unchanged behavior; i7 deletes it.
+//
+// It now renders `SpaceGrantChoices` instead of owning the markup, because the
+// PostgreSQL authorize page shows the same choices from `identity.listSpaces`
+// and the two must not drift. What stays here is exactly the part that is
+// Convex: the auth gate, the `ensurePersonal` mutation and the `list` query.
+//
+// The settings page is the other caller and still runs on Convex until i5, which
+// is why this component keeps its signature rather than being folded into the
+// page that no longer needs it.
+
 import { api } from "@repo/db/convex/_generated/api";
 import type { Id } from "@repo/db/convex/_generated/dataModel";
 import { useConvexAuth, useMutation, useQuery } from "convex/react";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
-export type KeyCapability = "read" | "write" | "ingest";
+import {
+  type KeyCapability,
+  SpaceGrantChoices,
+} from "@/components/space-grant-choices";
+
+export type { KeyCapability };
 
 const defaultCapabilities: readonly KeyCapability[] = ["read", "write"];
-
-const capabilityCopy: Record<KeyCapability, string> = {
-  read: "Read records",
-  write: "Create and change records where your role permits",
-  ingest: "Admit content from the selected source accounts",
-};
 
 export function SpaceGrantPicker({
   spaceIds,
@@ -59,76 +69,22 @@ export function SpaceGrantPicker({
     };
   }, [isAuthenticated, ensurePersonal, onSpaceIdsChange]);
 
-  useEffect(() => {
-    if (!spaces) return;
-    const available = new Set(spaces.map((space) => space.spaceId));
-    const remaining = spaceIds.filter((id) => available.has(id));
-    if (remaining.length !== spaceIds.length) onSpaceIdsChange(remaining);
-  }, [spaces, spaceIds, onSpaceIdsChange]);
-
-  useEffect(() => {
-    const permitted = capabilities.filter((capability) =>
-      allowedCapabilities.includes(capability),
-    );
-    if (permitted.length !== capabilities.length) onCapabilitiesChange(permitted);
-  }, [allowedCapabilities, capabilities, onCapabilitiesChange]);
+  // The ids are Convex ids on the way in and out; the choices component only
+  // ever sees strings, which is what the PostgreSQL surface hands it.
+  const setSpaceIds = useCallback(
+    (ids: string[]) => onSpaceIdsChange(ids as Id<"spaces">[]),
+    [onSpaceIdsChange],
+  );
 
   return (
-    <fieldset
-      style={{
-        border: "1px solid #ddd",
-        borderRadius: 6,
-        padding: 12,
-        margin: "12px 0",
-      }}
-    >
-      <legend>Client access</legend>
-      <p style={{ marginTop: 0 }}>
-        Choose the spaces and operations this client may use.
-      </p>
-      {error && <p role="alert">{error}</p>}
-      {!spaces && !error && <p>Loading spaces...</p>}
-      {spaces?.map((space) => (
-        <label
-          key={space.spaceId}
-          style={{ display: "block", marginBottom: 8 }}
-        >
-          <input
-            type="checkbox"
-            checked={spaceIds.includes(space.spaceId)}
-            onChange={(event) =>
-              onSpaceIdsChange(
-                event.target.checked
-                  ? [...spaceIds, space.spaceId]
-                  : spaceIds.filter((id) => id !== space.spaceId),
-              )
-            }
-          />{" "}
-          {space.name} ({space.kind === "personal" ? "Personal" : space.role})
-          {space.role === "reader" && " · read only"}
-        </label>
-      ))}
-      {allowedCapabilities.map((capability) => (
-        <label key={capability} style={{ display: "block", marginTop: 8 }}>
-          <input
-            type="checkbox"
-            checked={capabilities.includes(capability)}
-            onChange={(event) =>
-              onCapabilitiesChange(
-                event.target.checked
-                  ? [...capabilities, capability]
-                  : capabilities.filter((value) => value !== capability),
-              )
-            }
-          />{" "}
-          {capabilityCopy[capability]}
-        </label>
-      ))}
-      <p style={{ color: "#666", fontSize: 13, marginBottom: 0 }}>
-        Access follows your current membership. Removing access to a space also
-        removes this client’s access. Narrative memory capture needs both read
-        and write access to check existing memories.
-      </p>
-    </fieldset>
+    <SpaceGrantChoices
+      spaces={spaces ?? null}
+      error={error}
+      spaceIds={spaceIds}
+      onSpaceIdsChange={setSpaceIds}
+      capabilities={capabilities}
+      onCapabilitiesChange={onCapabilitiesChange}
+      allowedCapabilities={allowedCapabilities}
+    />
   );
 }
