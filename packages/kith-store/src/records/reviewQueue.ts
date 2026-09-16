@@ -13,10 +13,11 @@
 //
 // Two mechanical differences from the Convex text, both forced by the store:
 //
-//   * Convex's `.paginate()` cursor becomes the same base64url keyset cursor
-//     over `(created_at, id)` that `documents/inventory.ts` uses. Both are
-//     opaque to the caller; neither is portable to the other surface, which is
-//     what an opaque cursor means.
+//   * Convex's `.paginate()` cursor becomes the shared base64url keyset cursor
+//     over `(created_at, id)` in `../keyset.ts`, which `documents/inventory.ts`
+//     uses too. Both are opaque to the caller; neither is portable to the other
+//     surface, which is what an opaque cursor means. That module explains why
+//     the boundary is rendered text rather than a `Date`.
 //   * `created_at` is the row's insert time and `created_at_field` is the
 //     domain's own `createdAt` (see `workers/rows.ts` for the convention).
 //     A projected row reports `created_at_field`, which is what the Convex
@@ -36,6 +37,12 @@ import {
   type SourceInventoryExclusionReason,
   type SourceInventoryRow,
 } from "../provenance/rows.js";
+import {
+  decodeKeysetCursor,
+  encodeKeysetCursor,
+  keysetCursorColumn,
+  keysetCursorPredicate,
+} from "../keyset.js";
 import { spacePredicate } from "../spaces.js";
 import type { RecordEventType } from "./model.js";
 
@@ -142,25 +149,6 @@ function epochMs(value: unknown): number | undefined {
   return value instanceof Date ? value.getTime() : undefined;
 }
 
-/** The keyset cursor `documents/inventory.ts` already uses, kept identical. */
-function encodeCursor(createdAt: Date, id: string): string {
-  return Buffer.from(
-    JSON.stringify([createdAt.toISOString(), id]),
-    "utf8",
-  ).toString("base64url");
-}
-
-function decodeCursor(cursor: string): [Date, string] {
-  const [createdAtIso, id] = JSON.parse(
-    Buffer.from(cursor, "base64url").toString("utf8"),
-  ) as [string, string];
-  const createdAt = new Date(createdAtIso);
-  if (Number.isNaN(createdAt.getTime()) || typeof id !== "string") {
-    throw new Error("Invalid cursor");
-  }
-  return [createdAt, id];
-}
-
 async function keysetPage(
   client: ClientBase,
   sql: string,
@@ -175,9 +163,9 @@ async function keysetPage(
   const bound = [...values];
   let clause = "";
   if (cursor !== undefined) {
-    const [createdAt, id] = decodeCursor(cursor);
-    clause = ` AND (created_at, id) > ($${bound.length + 1}, $${bound.length + 2})`;
-    bound.push(createdAt, id);
+    const { keysetAt, id } = decodeKeysetCursor(cursor);
+    clause = ` AND ${keysetCursorPredicate(bound.length + 1, bound.length + 2)}`;
+    bound.push(keysetAt, id);
   }
   const page = (
     await client.query<QueryResultRow>(
@@ -188,19 +176,24 @@ async function keysetPage(
   const isDone = page.length <= limit;
   const rows = page.slice(0, limit);
   const last = rows[rows.length - 1];
+  // The cursor carries the timestamp text the query rendered, never the
+  // parsed `Date`: that holds milliseconds, names an instant up to 999
+  // microseconds before the row, and makes `>` return the same page forever.
+  // See `../keyset.ts`.
   return {
     rows,
     cursor:
       isDone || !last
         ? undefined
-        : encodeCursor(last.created_at as Date, last.id as string),
+        : encodeKeysetCursor(last.keyset_at as string, last.id as string),
     isDone,
   };
 }
 
 /** Section 7's `skipped_by_type`: every inventory row carrying an exclusion. */
-const SKIPPED_INVENTORY_SQL = `SELECT * FROM kith.source_inventory
-   WHERE space_id = $1 AND source_account_id = $2 AND exclusion_reason IS NOT NULL`;
+const SKIPPED_INVENTORY_SQL = `SELECT *, ${keysetCursorColumn()}
+     FROM kith.source_inventory
+    WHERE space_id = $1 AND source_account_id = $2 AND exclusion_reason IS NOT NULL`;
 
 async function skippedByTypeCounts(
   client: ClientBase,
@@ -349,8 +342,9 @@ async function dropCounts(
  * name matched zero, or two or more, entities. A resolved row is an audit
  * note, not queued work, so it is never counted here.
  */
-const PENDING_BINDING_SQL = `SELECT * FROM kith.card_entity_bindings
-   WHERE space_id = $1 AND source_account_id = $2 AND status = 'pending'`;
+const PENDING_BINDING_SQL = `SELECT *, ${keysetCursorColumn()}
+     FROM kith.card_entity_bindings
+    WHERE space_id = $1 AND source_account_id = $2 AND status = 'pending'`;
 
 async function entityBindingCounts(
   client: ClientBase,
@@ -479,8 +473,9 @@ async function detailPage(
     case "card_gate_failed": {
       const page = await keysetPage(
         client,
-        `SELECT * FROM kith.card_field_drops
-           WHERE space_id = $1 AND source_account_id = $2 AND kind = $3`,
+        `SELECT *, ${keysetCursorColumn()}
+             FROM kith.card_field_drops
+            WHERE space_id = $1 AND source_account_id = $2 AND kind = $3`,
         [spaceId, sourceAccountId, cls],
         cursor,
         limit,

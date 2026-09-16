@@ -1009,6 +1009,13 @@ export async function listSources(
 ) {
   validateSpaces(authorizedSpaceIds);
   const limit = boundedLimit(args.limit);
+  // An empty authorized set answers empty, as the Convex query did, rather
+  // than raising `spacePredicate`'s `ProofError`. See the same note on
+  // `listInventory`: an MCP credential may legitimately hold no space grant,
+  // and that is an empty inventory, not a fault the tool should relay.
+  if (authorizedSpaceIds.length === 0) {
+    return { sources: [], partial: false, truncated: false };
+  }
   const predicate = spacePredicate(authorizedSpaceIds, args.sourceAccountId === undefined ? 1 : 2);
   const accountResult = args.sourceAccountId === undefined
     ? await client.query<QueryResultRow>(

@@ -29,7 +29,7 @@ async function seedInventory(ctx, fields) {
         relative_path, folder_path, file_name, modified_at, content_indexed,
         exclusion_reason, duplicate_group_id, first_seen_scan_id,
         last_seen_scan_id, byte_length, content_hash)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, transaction_timestamp(), $9, $10,
+     VALUES ($1, $2, ${fields.at ?? "$3"}, $4, $5, $6, $7, $8, $3, $9, $10,
              $11, $12, $12, 10, $5)`,
     [
       id,
@@ -59,7 +59,7 @@ async function seedDrop(ctx, fields) {
        (id, space_id, created_at, source_account_id, source_item_id,
         processing_generation_id, record_kind, kind, field_key, code,
         created_at_field)
-     VALUES ($1, $2, $3, $4, NULL, NULL, $5, $6, $7, $8, $3)`,
+     VALUES ($1, $2, ${fields.at ?? "$3"}, $4, NULL, NULL, $5, $6, $7, $8, $3)`,
     [
       id,
       fields.spaceId,
@@ -85,8 +85,8 @@ async function seedBinding(ctx, fields) {
         processing_generation_id, event_id, observation_id, record_kind,
         field_key, observation_type, literal_name, normalized_name,
         candidate_count, status, created_at_field)
-     VALUES ($1, $2, $3, $4, NULL, NULL, NULL, NULL, $5, 'patient',
-             'patient', $6, $7, $8, $9, $3)`,
+     VALUES ($1, $2, ${fields.at ?? "$3"}, $4, NULL, NULL, NULL, NULL, $5,
+             'patient', 'patient', $6, $7, $8, $9, $3)`,
     [
       id,
       fields.spaceId,
@@ -460,5 +460,159 @@ test("the limit and the cursor are validated", { skip }, async (t) => {
         }),
       /Invalid cursor/,
     );
+  });
+});
+
+/**
+ * Follows a class's cursor to `isDone`, returning every row seen.
+ *
+ * The guard is what turns the repeating-page fault into a failure rather than
+ * a hang: a cursor that names an instant before the row it came from re-selects
+ * that row forever, and `created_at` is `timestamptz` while a JavaScript `Date`
+ * is milliseconds, so the fault only appears when the stored timestamp has a
+ * microsecond part. Every seeder below therefore writes `clock_timestamp()` or
+ * `transaction_timestamp()` rather than a whole number of milliseconds.
+ */
+async function pageAll(ctx, spaceId, sourceAccountId, cls, limit) {
+  const rows = [];
+  let cursor;
+  for (let guard = 0; guard <= 32; guard += 1) {
+    const page = await records.listReviewQueue(ctx.client, [spaceId], {
+      sourceAccountId,
+      class: cls,
+      ...(cursor === undefined ? {} : { cursor }),
+      limit,
+    });
+    rows.push(...page.rows);
+    if (page.isDone) {
+      assert.equal(page.cursor, undefined, `${cls}: a finished page has no cursor`);
+      return rows;
+    }
+    assert.notEqual(page.cursor, undefined, `${cls}: an unfinished page has one`);
+    assert.notEqual(page.cursor, cursor, `${cls}: the cursor advanced`);
+    cursor = page.cursor;
+  }
+  throw new Error(`${cls} paging did not terminate`);
+}
+
+test(
+  "every keyset class pages to the end, reaching each row exactly once",
+  { skip },
+  async (t) => {
+    const db = await identityDatabase(t);
+    await db.tx(async (ctx) => {
+      const { spaceId, sourceAccountId, scanId } = await account(ctx);
+      const expected = {
+        skipped_by_type: [],
+        field_dropped: [],
+        card_gate_failed: [],
+        entity_binding_needed: [],
+      };
+      for (let index = 0; index < 5; index += 1) {
+        expected.skipped_by_type.push(
+          await seedInventory(ctx, {
+            spaceId,
+            sourceAccountId,
+            scanId,
+            at: "clock_timestamp()",
+            exclusionReason: "unsupported",
+          }),
+        );
+        expected.field_dropped.push(
+          await seedDrop(ctx, {
+            spaceId,
+            sourceAccountId,
+            at: "clock_timestamp()",
+            kind: "field_dropped",
+          }),
+        );
+        expected.card_gate_failed.push(
+          await seedDrop(ctx, {
+            spaceId,
+            sourceAccountId,
+            at: "clock_timestamp()",
+            kind: "card_gate_failed",
+          }),
+        );
+        expected.entity_binding_needed.push(
+          await seedBinding(ctx, {
+            spaceId,
+            sourceAccountId,
+            at: "clock_timestamp()",
+          }),
+        );
+      }
+
+      const idOf = {
+        skipped_by_type: (row) => row.inventoryId,
+        field_dropped: (row) => row.dropId,
+        card_gate_failed: (row) => row.dropId,
+        entity_binding_needed: (row) => row.bindingId,
+      };
+      for (const cls of Object.keys(expected)) {
+        const rows = await pageAll(ctx, spaceId, sourceAccountId, cls, 2);
+        const seen = rows.map(idOf[cls]);
+        assert.equal(new Set(seen).size, seen.length, `${cls}: no row twice`);
+        assert.deepEqual([...seen].sort(), [...expected[cls]].sort(), cls);
+      }
+    });
+  },
+);
+
+test(
+  "a keyset class pages to the end when every row shares one created_at",
+  { skip },
+  async (t) => {
+    const db = await identityDatabase(t);
+    await db.tx(async (ctx) => {
+      const { spaceId, sourceAccountId } = await account(ctx);
+      const seeded = [];
+      for (let index = 0; index < 5; index += 1) {
+        seeded.push(
+          await seedDrop(ctx, {
+            spaceId,
+            sourceAccountId,
+            // Every row in one transaction, so `created_at` ties and the `id`
+            // half of the keyset is the only thing that can order them.
+            at: "transaction_timestamp()",
+            kind: "field_dropped",
+          }),
+        );
+      }
+      const rows = await pageAll(
+        ctx,
+        spaceId,
+        sourceAccountId,
+        "field_dropped",
+        2,
+      );
+      assert.deepEqual(
+        rows.map((row) => row.dropId).sort(),
+        [...seeded].sort(),
+      );
+    });
+  },
+);
+
+test("a malformed review-queue keyset cursor is refused", { skip }, async (t) => {
+  const db = await identityDatabase(t);
+  await db.tx(async (ctx) => {
+    const { spaceId, sourceAccountId } = await account(ctx);
+    for (const cursor of [
+      "not-base64url-json",
+      Buffer.from(JSON.stringify(["not a timestamp", "id"]), "utf8").toString(
+        "base64url",
+      ),
+    ]) {
+      await assert.rejects(
+        () =>
+          records.listReviewQueue(ctx.client, [spaceId], {
+            sourceAccountId,
+            class: "field_dropped",
+            cursor,
+          }),
+        /Invalid cursor/,
+      );
+    }
   });
 });
