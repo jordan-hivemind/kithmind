@@ -212,3 +212,39 @@ test("recallCandidates feeds recallContext from the real indexes", { skip }, asy
     });
   });
 });
+
+test("thoughts with identical createdAt are ordered by id ascending", { skip }, async (t) => {
+  const db = await identityDatabase(t);
+  await db.tx(async (ctx) => {
+    const userId = await makeUser(ctx);
+    const spaceId = await makeSpace(ctx, { createdBy: userId, role: "owner" });
+
+    // Insert two thoughts in the same transaction with the same timestamp.
+    // Use fixed createdAt to ensure identical timestamps.
+    const fixedTimestamp = new Date(ctx.now);
+    const firstContent = "First thought content";
+    const secondContent = "Second thought content";
+
+    const ids = [];
+    for (const content of [firstContent, secondContent]) {
+      const id = await memory.captureThought(ctx, userId, spaceId, {
+        content,
+        metadata: metadata(content, "reference"),
+      });
+      ids.push(id);
+    }
+
+    // Ensure the test is meaningful: both thoughts should have the same created_at
+    const thoughts = await memory.listBySpaces(ctx, [spaceId], 10);
+    assert.equal(thoughts.length, 2, "Should have captured 2 thoughts");
+    const timestamps = thoughts.map(t => t.createdAt);
+    assert.equal(timestamps[0], timestamps[1], "Both thoughts should have same createdAt");
+
+    // The critical assertion: when createdAt is identical, results must be ordered by id ascending.
+    // localeCompare with string IDs provides lexicographic ordering, which is consistent
+    // with Convex's behavior where _id.localeCompare is used for the tie-break.
+    const sortedIds = thoughts.map(t => t.id);
+    const expectedIds = [...ids].sort();
+    assert.deepEqual(sortedIds, expectedIds, "Thoughts with same createdAt must be ordered by id ascending");
+  });
+});
