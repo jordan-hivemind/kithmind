@@ -32,6 +32,7 @@ import {
   seedActiveEmbeddingIndex,
   seedEmbeddingTarget,
   seedEmbeddingVector,
+  recountEmbeddingCounters,
   seedThoughtVector,
   sha256Utf8,
 } from "./helpers/embeddingFixture.mjs";
@@ -471,6 +472,13 @@ test(
         vector: oneHot(0),
       });
 
+      // `captureThought` maintains the counters now (P2-39g2), so the opening
+      // balance this test seeded no longer describes the rows it went on to
+      // write. A recount is what an audit would leave, and `ready` is a claim
+      // about the counters agreeing, so it has to be made against real ones.
+      await recountEmbeddingCounters(ctx, spaceId, index.fingerprint);
+      await recountEmbeddingCounters(ctx, otherSpaceId, otherIndex.fingerprint);
+
       const target = await embeddings.getActiveEmbeddingTarget(ctx, spaceId);
       assert.equal(target.thoughtStatus, "ready");
       assert.equal(target.fingerprint, index.fingerprint);
@@ -537,8 +545,14 @@ test(
       );
 
       // A retired target drops its vector even though the vector is intact.
+      // The marker goes with it: migration 016 makes a retired row that still
+      // claims coverage unrepresentable, which is what `retireEmbeddingTarget`
+      // has always done. The assertion below is unchanged either way, because
+      // the reader's recheck is on `state`, not on the marker.
       await ctx.client.query(
-        "UPDATE kith.embedding_targets SET state = 'retired' WHERE target_id = $1",
+        `UPDATE kith.embedding_targets
+            SET state = 'retired', covered_fingerprint = NULL
+          WHERE target_id = $1`,
         [half],
       );
       assert.deepEqual(
@@ -668,6 +682,10 @@ test(
         content: "quarterly migration plan",
         vector: mix(0, 1),
       });
+
+      // As above: the two captures above created their own target rows, so the
+      // counters are recounted before a `ready` status is asserted.
+      await recountEmbeddingCounters(ctx, spaceId, index.fingerprint);
 
       const ready = await embeddings.searchThoughtsHybrid(
         ctx,

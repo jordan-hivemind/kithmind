@@ -128,9 +128,14 @@ CREATE INDEX embedding_vectors_generation_event_idx
 CREATE INDEX embedding_targets_space_kind_target_idx
   ON kith.embedding_targets (space_id, target_kind, target_id);
 
--- `getActiveEmbeddingTarget`'s `.unique()` on `by_spaceId`. Not UNIQUE: the
--- read deliberately takes two rows and reports the duplicate as a fault,
+-- `getActiveEmbeddingTarget`'s `.unique()` on `by_spaceId`. Not UNIQUE here:
+-- the read deliberately takes two rows and reports the duplicate as a fault,
 -- exactly as Convex's `.take(2)` did.
+--
+-- Amended by P2-39g2. Migration 016 replaces this index, under the same name,
+-- with a UNIQUE one, because the write side gained two check-then-insert
+-- writers of this row. The `LIMIT 2` fault path stays in the code and becomes
+-- unreachable; section 1 of 016 gives the reasoning.
 CREATE INDEX space_embedding_states_space_idx
   ON kith.space_embedding_states (space_id);
 

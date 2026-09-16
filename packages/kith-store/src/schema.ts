@@ -133,6 +133,11 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
     name: "embedding search: pgvector column, scope indexes, thought and fact tsvector columns (P2-39g1)",
     url: new URL("../migrations/015_embedding_search.sql", import.meta.url),
   },
+  {
+    version: 16,
+    name: "embedding build: generation, target and job constraints, the owed-set index and the scan keysets (P2-39g2)",
+    url: new URL("../migrations/016_embedding_build.sql", import.meta.url),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */
