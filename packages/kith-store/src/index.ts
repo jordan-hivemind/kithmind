@@ -277,6 +277,15 @@ export async function grantProofAppRole(
   // Coverage: the validated windows and the gaps between them.
   await owner.query(`GRANT INSERT, UPDATE, DELETE ON
     kith.coverage_windows, kith.coverage_gaps TO "${appRole}"`);
+  // Inline ingestion (P2-39e2). `kith.ingest_jobs` was already granted with the
+  // worker protocol, but the four tables the inline lane owns were not, and one
+  // of them was already unreachable for a lane that had landed: `discovery.ts`
+  // writes `kith.ingest_requests` on every worker admission. The other three are
+  // this row's: the work row the deferred handler drains, the fixed-window
+  // admission limiter, and the queue-only `ingest_url` request.
+  await owner.query(`GRANT INSERT, UPDATE, DELETE ON
+    kith.ingest_requests, kith.inline_work, kith.ingest_rate_limits,
+    kith.source_fetch_requests TO "${appRole}"`);
   // Deliberately still absent, and each one is a table an application write
   // would be a bug on: `kith.schema_version`, which only a migration runner
   // writes; the `proof_*` prototype pair, which only the owner role seeds; and

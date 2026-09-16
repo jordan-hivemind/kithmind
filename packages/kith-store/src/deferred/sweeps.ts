@@ -20,28 +20,25 @@ export type RecoverySweepResult = { recovered: number; remaining: boolean };
 const INLINE_RECOVERY_BATCH_SIZE = 10;
 
 /**
- * `models/ingestion/inlineWorker.ts` `recover`, minus the part that cannot be
- * ported yet: it schedules `internal...inlineWorker.process` for each
- * candidate, and that action -- along with `admitInlineWork` and
- * `claimInlineWork`, which `process` depends on -- has not been ported into
- * `@repo/kith-store` as of this row (P2-39j). See the package report for
- * detail; this is the honest half of the port available today.
+ * `models/ingestion/inlineWorker.ts` `recover`.
  *
- * What this does: the same candidate selection as
- * `reserveRecoverableInlineWork` (bounded scan of `kith.inline_work` for
- * `queued`, `running` or `failed` rows whose `next_attempt_at` is due, oldest
- * due time first), and for each candidate, enqueues its continuation as an
- * `inline_ingestion` `kith.deferred_work` job keyed by the work row's id. The
- * `inline_ingestion` kind has no registered handler yet (the CHECK list in
- * `migrations/017_deferred_work.sql` documents why), so today this sweep only
- * keeps the queue itself from losing track of stranded work; the row that
- * ports admission and `process` registers the handler that actually resumes
- * it, the same way P2-39g2 registers `embedding_fill`.
+ * The same candidate selection as `reserveRecoverableInlineWork` (bounded scan
+ * of `kith.inline_work` for `queued`, `running` or `failed` rows whose
+ * `next_attempt_at` is due, oldest due time first), and for each candidate, its
+ * continuation enqueued as an `inline_ingestion` `kith.deferred_work` job keyed
+ * by the work row's id. P2-39e2 registered the handler that runs it
+ * (`inlineIngestionHandler` in `../ingestion/inlineWork.ts`, wired up in
+ * `registry.ts`), so a stranded row is now resumed rather than merely tracked;
+ * the payload shape the handler reads, `{ workId }`, is the one written below.
  *
- * Not ported from `reserveRecoverableInlineWork`: `requireWorkChain`'s
- * validation, which marks a candidate `needs_review` when its `ingestJobs`
- * chain is incoherent. That check reads through `admitInlineWork`'s own
- * tables and is meaningless to port ahead of the code that writes them.
+ * Still not ported from `reserveRecoverableInlineWork`: the reservation itself
+ * (Convex pushed a candidate's `next_attempt_at` out by one lease before
+ * scheduling it), `requireWorkChain`'s validation, and the terminal-state and
+ * revoked-authorization sync it did for each candidate. None is needed here for
+ * correctness and each would duplicate a check the handler already makes:
+ * `dedupeKey` keeps a candidate from being queued twice while it is pending, and
+ * `processInlineWork` re-reads the whole chain, re-checks the recorded actor and
+ * syncs the work row's state under the claim it takes.
  */
 export async function recoverInlineIngestion(
   ctx: DeferredCtx,

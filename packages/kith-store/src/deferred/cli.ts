@@ -24,7 +24,7 @@ import { pathToFileURL } from "node:url";
 
 import { createKithPool } from "../schema.js";
 import { drain, type DrainSummary } from "./drain.js";
-import { createRegistry, type DeferredWorkRegistry } from "./registry.js";
+import { defaultRegistry } from "./registry.js";
 import { tick, type TickSummary } from "./tick.js";
 
 function usage(): never {
@@ -101,15 +101,6 @@ function requireDatabaseUrl(): string {
 
 function writeSummary(summary: TickSummary | DrainSummary): void {
   process.stdout.write(`${JSON.stringify(summary)}\n`);
-}
-
-/** The registry this daemon drains with. Empty today: every kind in
- * `migrations/017_deferred_work.sql`'s CHECK list is documented as
- * unregistered by this row (see `sweeps.ts`'s header). The row that ports
- * inline admission, P2-39g2 or P2-39f registers a handler here as it lands;
- * nothing about the daemon command itself needs to change when it does. */
-function defaultRegistry(): DeferredWorkRegistry {
-  return createRegistry();
 }
 
 async function runLoop(

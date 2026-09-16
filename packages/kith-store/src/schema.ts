@@ -143,6 +143,11 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
     name: "deferred work: kith.deferred_work, and diagnostics watcher/incident constraints (P2-39j)",
     url: new URL("../migrations/017_deferred_work.sql", import.meta.url),
   },
+  {
+    version: 18,
+    name: "inline ingestion: work, receipt, rate limit and fetch request indexes (P2-39e2)",
+    url: new URL("../migrations/018_inline_ingestion.sql", import.meta.url),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */

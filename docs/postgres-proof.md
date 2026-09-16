@@ -283,6 +283,95 @@ refused are refused here, and that list is space-isolated, empty rather than an
 error for a principal with no readable space, and refused past the 100-row
 bound Convex enforced.
 
+## Inline ingestion (P2-39e2)
+
+`packages/kith-store/src/ingestion/` ports the lane the worker-protocol row did
+not cover: text a caller already has, admitted over `/api/ingest` and the
+`ingest_url` tool rather than discovered by a filesystem worker. The behaviour is
+[the bounded text capture contract](plans/2026-09-06-inline-ingestion-contract.md);
+the shape is sections 1.3, 1.4 and 2.4 of
+[the consolidation plan](plans/2026-09-12-postgres-consolidation.md).
+
+| Piece                     | Convex original                                                        | PostgreSQL target                                                                                              |
+| ------------------------- | ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| Validation and bounds     | `inlineInput.ts`, `inlineText.ts`, `hash.ts`                           | `input.ts` and the existing `inline.ts`. Pure, unchanged, same fingerprints.                                    |
+| Destination and grants    | `resolveIngestSourceAccount`, `lib/sourceAuth.ts`                      | `input.ts`, over `kith.spaces`, `kith.space_members`, `kith.api_keys` and `kith.source_accounts`.               |
+| Admission                 | `inlineWork.admitInlineWork`, `model.admitSourceRevision`              | `inlineWork.ts` `admitInlineWork`, one `SERIALIZABLE` transaction.                                              |
+| Lease                     | `inlineWork.claimInlineWork`, `model.claimJob`                         | `inlineWork.ts` `claimInlineWork`, on `kith.ingest_jobs`, the lease shape the worker lane already uses.        |
+| Staging and activation    | `inlineWorker.process`, `model.activateGeneration`                     | `inlineWork.ts` `processInlineWork`, through the existing provenance and publication functions.                 |
+| Failure and recovery      | `recordInlineWorkFailure`, `model.failJob`, `inlineWorker.recover`     | `inlineWork.ts` plus `src/deferred/sweeps.ts`, already landed, now with a registered handler.                   |
+| URL queue                 | `urlQueue.enqueueSourceFetch`                                          | `urlQueue.ts`. Still queue-only: no fetch, no redirect, no invented text.                                       |
+
+Four things are worth stating plainly, because each is a place the port is not a
+transcription.
+
+The pipeline reuses the publication path rather than repeating it. Staging goes
+through `src/provenance/model.ts`'s `stagePages`, `stageEvidenceSpans`,
+`stageDocuments` and `stageChunks` in the same 25-row batches the contract
+bounds, and activation goes through `inspectGenerationPayload`,
+`activateSourceItemGeneration` and `src/workers/publication.ts`'s
+`nextWorkerActivation`, `recordWorkerActivation` and
+`touchWorkerPublicationEmbedding`. An inline publish therefore advances the
+space's processing clock and leaves its chunk targets owed exactly as a
+filesystem publish does, which is what makes one embedding fill serve both lanes.
+
+Convex's `process` was an action calling seven mutations because a Convex
+mutation has a write budget. Section 2.4 removes that limit, so claim, stage and
+activate are one transaction here. The cost is that a failed statement aborts a
+PostgreSQL transaction, so the staging and activation step runs under a
+`SAVEPOINT`: a failure rolls back to it and records itself on the work row and
+the ingest job, while the claim, taken before the savepoint, commits either way.
+A serialization abort is rethrown instead of recorded, because it belongs to
+`withKithTransaction`'s retry.
+
+The deferred queue replaces `scheduler.runAfter` on both ends. Admission inserts
+the fallback `inline_ingestion` job in its own transaction, keyed by the work
+row's id; the recovery sweep P2-39j landed enqueues the same kind with the same
+payload and the same dedupe key, so a stranded row converges on one queued job
+rather than two. `defaultRegistry` in `src/deferred/registry.ts` is where the
+handler is registered, and `kith-deferred-work` now drains with it.
+
+The daemon carries no authority of its own. `processInlineWork` takes no caller
+principal: it re-reads the actor recorded on the ingest job and re-checks that
+actor's current space membership and source-account grant on every attempt, so a
+revoked credential stops publication and recovery cannot silently substitute an
+administrator.
+
+Migration `018_inline_ingestion.sql` adds indexes only. No column the port writes
+was missing. It indexes the work row by its ingest job (uniquely, which is what
+`admitInlineWork` was already enforcing by reading two rows), the recovery
+sweep's own due-candidate scan, the admission limiter's one row per credential,
+the URL queue's replay key, and the three parent lookups every admission makes
+that migration 004 left unindexed.
+
+`test/inlineIngestion.test.mjs` proves, against the migrated schema and through a
+real pool: admit then claim then process publishes one active document that
+`getDocument` returns and `searchDocuments` finds; the lease is busy while held
+and reclaimable once expired; a replayed request id returns the same receipt and
+changes no row, including the rate-limit counter; a differing payload under that
+id is a conflict; a capture addressed to a space the credential cannot ingest
+into, and one addressed to a space it holds but an account it was never granted,
+are both refused without writing anything; the 65,536-byte bound is refused while
+exactly 65,536 multibyte bytes are accepted; a failing staging step records a
+retryable failure, leaves no partial payload, and is then recovered by the sweep
+and the registered handler; a stranded work row is drained by `drain` alone; two
+concurrent admissions of one request id converge on one receipt, one job and one
+work row; and `ingest_url` queues a request without creating a revision,
+generation or document, refusing a credentialed URL and a URL carrying a control
+character.
+
+Not ported, and why. `replaceRevokedActorAndRequeueFromWeb` and `requeueJob` are
+the operator repair path the contract describes ("an authorized operator can
+explicitly replace the actor and requeue the job"); they belong to the web
+surface that will call them, and nothing in this row can exercise them. The
+Convex `internalMutation`/`internalAction` wrappers around each function are gone
+by design: there is no second runtime to call across, so the route imports the
+service function. `reserveRecoverableInlineWork`'s own reservation and
+chain-validation halves stay unported for the reason `src/deferred/sweeps.ts`
+now records: the deferred queue's dedupe key and the handler's own re-read cover
+both. `advanceSourceAssessmentEpoch` is ported here as the one statement
+admission needs, not as the shared helper the sourceAccounts row deferred.
+
 ## Verification
 
 The default repository test remains independent of Docker:
