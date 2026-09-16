@@ -99,6 +99,19 @@ export async function handleMiddlewareRequest(
     !isPublicRoute(request) &&
     !(await isAuthenticated(request, convexAuth, env))
   ) {
+    // An API path (today only the non-public `/api/kith/*` routes) answers
+    // JSON, never a redirect. The second-model review of P2-39i5 found that a
+    // redirect here means `fetch` follows it to `/sign-in`'s 200 HTML, which a
+    // caller that only checks `response.ok` reads as success; the four
+    // `app/api/auth/*` routes already answer JSON on every failure for the
+    // same reason, and this puts every other API route under the same rule
+    // rather than leaving it to whichever route remembers to opt in.
+    if (request.nextUrl.pathname.startsWith("/api/")) {
+      return NextResponse.json(
+        { error: "Not authenticated", code: "not_authenticated" },
+        { status: 401, headers: { "Cache-Control": "no-store" } },
+      );
+    }
     return nextjsMiddlewareRedirect(request, "/sign-in");
   }
 }

@@ -11,18 +11,20 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function POST(request: Request): Promise<Response> {
-  const body = await readJsonBody(request);
-  const spaceId = body?.spaceId;
-  const email = body?.email;
-  const role = body?.role;
-  if (
-    typeof spaceId !== "string" ||
-    typeof email !== "string" ||
-    typeof role !== "string"
-  ) {
-    return problem(400, "Invalid request");
-  }
+  // Read inside the callback, after `withPrincipal`'s guard has run -- see
+  // `family/spaces/[id]/route.ts` for why the order matters.
   return withPrincipal(request, async ({ ctx, principal }) => {
+    const body = await readJsonBody(request);
+    const spaceId = body?.spaceId;
+    const email = body?.email;
+    const role = body?.role;
+    if (
+      typeof spaceId !== "string" ||
+      typeof email !== "string" ||
+      typeof role !== "string"
+    ) {
+      return problem(400, "Invalid request");
+    }
     const created = await createInvitation(ctx, {
       actorUserId: principal.userId,
       spaceId,

@@ -9,13 +9,15 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function POST(request: Request): Promise<Response> {
-  const body = await readJsonBody(request);
-  if (body === null) return problem(400, "Invalid request");
-  const raw = body.spaceId;
-  if (raw !== null && raw !== undefined && typeof raw !== "string") {
-    return problem(400, "Invalid request");
-  }
+  // Read inside the callback, after `withPrincipal`'s guard has run -- see
+  // `api-keys/route.ts` for why the order matters.
   return withPrincipal(request, async ({ ctx, principal }) => {
+    const body = await readJsonBody(request);
+    if (body === null) return problem(400, "Invalid request");
+    const raw = body.spaceId;
+    if (raw !== null && raw !== undefined && typeof raw !== "string") {
+      return problem(400, "Invalid request");
+    }
     await setDefaultWriteSpace(ctx, {
       principal,
       spaceId: raw === undefined ? null : raw,

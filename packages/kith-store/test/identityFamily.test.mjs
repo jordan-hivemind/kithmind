@@ -560,12 +560,22 @@ test(
   { skip },
   async (t) => {
     // `family_invitations.membership_id` points at the `space_members` row an
-    // approval created. Deleting that row without clearing the pointer first
-    // fails on `family_invitations_membership_id_fkey`, which would mean an
-    // approved member could never be removed or leave -- P2-39i5 found this
-    // building the settings and spaces pages on top of this module.
+    // approval created, through two foreign keys that both reference it
+    // (`family_invitations_membership_id_fkey` from migration 004 and
+    // `family_invitations_membership_space_fkey` from migration 006; see the
+    // `detachMembershipFromInvitations` doc comment). Deleting that row
+    // without clearing the pointer first fails when the deferred constraint
+    // is checked at commit -- not at the `DELETE` statement itself, which is
+    // why `SET CONSTRAINTS ALL IMMEDIATE` is forced below: without it, this
+    // test's own rollback (`identityFixture.mjs`'s `db.tx` never commits)
+    // would hide the violation exactly as it would in production if a
+    // caller's transaction happened to abort for an unrelated reason. With it,
+    // a regression here fails on the `DELETE`/rollback-to-savepoint line
+    // itself, which is a mistake P2-39i5 found building the settings and
+    // spaces pages on top of this module.
     const db = await identityDatabase(t);
     await db.tx(async (ctx) => {
+      await ctx.client.query("SET CONSTRAINTS ALL IMMEDIATE");
       const { ownerId, spaceId } = await sharedSpace(ctx);
       const secondOwnerId = await makeUser(ctx);
       await makeMember(ctx, { spaceId, userId: secondOwnerId, role: "owner" });
@@ -622,6 +632,11 @@ test(
         await refusalCode(() => requireSharedMembership(ctx, spaceId, memberId)),
         "space_not_found",
       );
+      const afterLeave = await ctx.client.query(
+        "SELECT membership_id FROM kith.family_invitations WHERE id = $1",
+        [secondInvitation.invitationId],
+      );
+      assert.equal(afterLeave.rows[0].membership_id, null);
     });
   },
 );

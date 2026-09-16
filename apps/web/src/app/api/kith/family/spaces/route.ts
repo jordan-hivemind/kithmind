@@ -9,10 +9,12 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function POST(request: Request): Promise<Response> {
-  const body = await readJsonBody(request);
-  const name = body === null ? undefined : body.name;
-  if (typeof name !== "string") return problem(400, "Invalid request");
+  // Read inside the callback, after `withPrincipal`'s guard has run -- see
+  // `api-keys/route.ts` for why the order matters.
   return withPrincipal(request, async ({ ctx, principal }) => {
+    const body = await readJsonBody(request);
+    const name = body === null ? undefined : body.name;
+    if (typeof name !== "string") return problem(400, "Invalid request");
     const created = await createSharedSpace(ctx, {
       userId: principal.userId,
       name,

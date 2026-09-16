@@ -16,10 +16,12 @@ export async function PATCH(
   { params }: { params: Promise<{ id: string }> },
 ): Promise<Response> {
   const { id: membershipId } = await params;
-  const body = await readJsonBody(request);
-  const role = body?.role;
-  if (role !== "editor" && role !== "reader") return problem(400, "Invalid request");
+  // Read inside the callback, after `withPrincipal`'s guard has run -- see
+  // `family/spaces/[id]/route.ts` for why the order matters.
   return withPrincipal(request, async ({ ctx, principal }) => {
+    const body = await readJsonBody(request);
+    const role = body?.role;
+    if (role !== "editor" && role !== "reader") return problem(400, "Invalid request");
     await changeFamilyMemberRole(ctx, {
       actorUserId: principal.userId,
       membershipId,

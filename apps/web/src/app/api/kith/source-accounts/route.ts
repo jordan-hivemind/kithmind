@@ -17,16 +17,18 @@ function num(value: unknown): number | undefined {
 }
 
 export async function POST(request: Request): Promise<Response> {
-  const body = await readJsonBody(request);
-  const connector = body === null ? undefined : text(body.connector);
-  const accountId = body === null ? undefined : text(body.accountId);
-  const name = body === null ? undefined : text(body.name);
-  if (connector === undefined || accountId === undefined || name === undefined) {
-    return problem(400, "Invalid request");
-  }
-  const spaceId = body === null ? undefined : text(body.spaceId);
-  const freshnessMs = body === null ? undefined : num(body.freshnessMs);
+  // Read inside the callback, after `withPrincipal`'s guard has run -- see
+  // `api-keys/route.ts` for why the order matters.
   return withPrincipal(request, async ({ ctx, principal }) => {
+    const body = await readJsonBody(request);
+    const connector = body === null ? undefined : text(body.connector);
+    const accountId = body === null ? undefined : text(body.accountId);
+    const name = body === null ? undefined : text(body.name);
+    if (connector === undefined || accountId === undefined || name === undefined) {
+      return problem(400, "Invalid request");
+    }
+    const spaceId = body === null ? undefined : text(body.spaceId);
+    const freshnessMs = body === null ? undefined : num(body.freshnessMs);
     const id = await sources.createSourceAccount(ctx, {
       principal,
       connector,

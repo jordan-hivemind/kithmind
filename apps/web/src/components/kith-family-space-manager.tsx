@@ -55,7 +55,7 @@ async function requestJson(
 
 export function KithFamilySpaceManager({ overview }: { overview: FamilyOverview }) {
   const router = useRouter();
-  const { spaces, selected } = overview;
+  const { spaces, selected, selectedUnavailable } = overview;
   const [name, setName] = useState("");
   const [error, setError] = useState("");
   const [creating, setCreating] = useState(false);
@@ -153,6 +153,13 @@ export function KithFamilySpaceManager({ overview }: { overview: FamilyOverview 
         )}
       </section>
 
+      {selectedUnavailable && (
+        <p role="alert" style={{ color: "#b45309" }}>
+          {selectedUnavailable === "member_limit_reached"
+            ? "This space has too many members to display right now."
+            : "This space has too many pending invitations to display right now."}
+        </p>
+      )}
       {selected && (
         <SpaceDetail
           key={selected.space.spaceId}

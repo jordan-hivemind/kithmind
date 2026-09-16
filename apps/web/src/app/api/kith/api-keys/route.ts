@@ -64,16 +64,23 @@ function capabilityArray(value: unknown): Capability[] | null {
 }
 
 export async function POST(request: Request): Promise<Response> {
-  const body = await readJsonBody(request);
-  if (body === null) return problem(400, "Invalid request");
-  const name = typeof body.name === "string" ? body.name : null;
-  const spaceIds = stringArray(body.spaceIds);
-  const capabilities = capabilityArray(body.capabilities);
-  const sourceAccountIds = stringArray(body.sourceAccountIds) ?? [];
-  if (name === null || spaceIds === null || capabilities === null) {
-    return problem(400, "Invalid request");
-  }
+  // The body is read and validated inside `withPrincipal`'s callback, not
+  // before it: the second-model review of P2-39i5 found that reading it
+  // first let a request with the wrong content type reach this route's own
+  // validation and fail there with a 400 before `withPrincipal`'s same-origin
+  // and content-type guard ever ran, which is the guard silently skipped for
+  // every route shaped this way. The guard must run first regardless of what
+  // the route needs from the body.
   return withPrincipal(request, async ({ ctx, principal }) => {
+    const body = await readJsonBody(request);
+    if (body === null) return problem(400, "Invalid request");
+    const name = typeof body.name === "string" ? body.name : null;
+    const spaceIds = stringArray(body.spaceIds);
+    const capabilities = capabilityArray(body.capabilities);
+    const sourceAccountIds = stringArray(body.sourceAccountIds) ?? [];
+    if (name === null || spaceIds === null || capabilities === null) {
+      return problem(400, "Invalid request");
+    }
     // The service validates every capability and space against the
     // principal's own authority; the route's own check above only narrows the
     // capability strings to the closed set, never the spaces.

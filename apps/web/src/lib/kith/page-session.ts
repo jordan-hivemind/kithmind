@@ -22,6 +22,15 @@
 // and `consentSpaces`. An unmodelled failure -- the database being
 // unreachable -- is rethrown rather than turned into a sign-in redirect: that
 // would ask the owner for a password to fix an outage.
+//
+// The catch is scoped to `requireWebPrincipal` alone, not to the whole
+// transaction. The second-model review of P2-39i5 found that catching every
+// `IdentityError` from the whole block turned an authorization or state
+// failure raised by `run` -- `invalid_api_key_state` from
+// `listApiKeysPage`, for one -- into "not signed in", which signs a valid
+// session out and sends it back through a redirect loop for a problem that
+// has nothing to do with the session. Only `requireWebPrincipal`'s own
+// "Not authenticated" may become `null`; everything `run` raises propagates.
 
 import { withKithReadTransaction } from "@repo/kith-store";
 import {
@@ -46,17 +55,17 @@ export async function loadAuthenticatedPage<T>(
   run: (session: PageSession) => Promise<T>,
 ): Promise<T | null> {
   const config = kithSessionConfig();
-  try {
-    return await withKithReadTransaction(kithPool(), async (client) => {
-      const ctx = identityCtx(client);
-      const principal = await requireWebPrincipal(ctx, {
-        config,
-        cookieHeader,
-      });
-      return await run({ ctx, principal });
-    });
-  } catch (error) {
-    if (error instanceof IdentityError) return null;
-    throw error;
-  }
+  return await withKithReadTransaction(kithPool(), async (client) => {
+    const ctx = identityCtx(client);
+    let principal: Principal;
+    try {
+      principal = await requireWebPrincipal(ctx, { config, cookieHeader });
+    } catch (error) {
+      if (error instanceof IdentityError && error.message === "Not authenticated") {
+        return null;
+      }
+      throw error;
+    }
+    return await run({ ctx, principal });
+  });
 }

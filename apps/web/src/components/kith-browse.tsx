@@ -1,10 +1,12 @@
 // The PostgreSQL browse page. A server component fed by `loadBrowse`'s one
-// read-only transaction: it imports nothing from Convex and needs no client
-// JavaScript, because every filter is a plain `GET` form or link over the
-// page's own query string.
+// read-only transaction: it imports nothing from Convex. The type filter and
+// history toggle are a plain `GET` form over the page's own query string; the
+// thoughts tab's search box is not (see `components/kith-thought-search.tsx`
+// for why), so that one piece of the thoughts view is a client component.
 
 import type { memory } from "@repo/kith-store";
 
+import { KithThoughtSearch } from "@/components/kith-thought-search";
 import type { BrowseData, BrowseView } from "@/lib/kith/browse";
 
 const THOUGHT_TYPES = [
@@ -83,7 +85,7 @@ function FactRow({ fact }: { fact: memory.HydratedFact }) {
   );
 }
 
-function ThoughtRow({ thought }: { thought: memory.Thought & { score?: number } }) {
+export function ThoughtRow({ thought }: { thought: memory.Thought & { score?: number } }) {
   return (
     <div
       style={{
@@ -130,12 +132,10 @@ export function KithBrowse({
   data,
   includeHistorical,
   type,
-  query,
 }: {
   data: BrowseData;
   includeHistorical: boolean;
   type: string;
-  query: string;
 }) {
   return (
     <div>
@@ -212,19 +212,6 @@ export function KithBrowse({
             style={{ display: "flex", gap: 8, marginBottom: 16, flexWrap: "wrap" }}
           >
             <input type="hidden" name="view" value="thoughts" />
-            <input
-              type="text"
-              name="q"
-              defaultValue={query}
-              placeholder="Search your thoughts..."
-              style={{
-                flex: 1,
-                minWidth: 200,
-                padding: 10,
-                borderRadius: 4,
-                border: "1px solid #ddd",
-              }}
-            />
             <select
               name="type"
               defaultValue={type}
@@ -251,19 +238,12 @@ export function KithBrowse({
               Apply
             </button>
           </form>
-          {data.thoughts.length === 0 ? (
-            <p style={{ color: "#666" }}>
-              {data.searching
-                ? "No matching thoughts found."
-                : "No thoughts found."}
-            </p>
-          ) : (
-            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-              {data.thoughts.map((thought) => (
-                <ThoughtRow key={thought.id} thought={thought} />
-              ))}
-            </div>
-          )}
+          <KithThoughtSearch
+            key={`${type}-${includeHistorical}`}
+            initialThoughts={data.thoughts}
+            type={type}
+            includeHistorical={includeHistorical}
+          />
         </div>
       )}
     </div>

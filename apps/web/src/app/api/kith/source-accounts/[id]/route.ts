@@ -13,13 +13,15 @@ export async function PATCH(
   { params }: { params: Promise<{ id: string }> },
 ): Promise<Response> {
   const { id } = await params;
-  const body = await readJsonBody(request);
-  if (body === null) return problem(400, "Invalid request");
-  const name = typeof body.name === "string" ? body.name : undefined;
-  const enabled = typeof body.enabled === "boolean" ? body.enabled : undefined;
-  const freshnessMs =
-    typeof body.freshnessMs === "number" ? body.freshnessMs : undefined;
+  // Read inside the callback, after `withPrincipal`'s guard has run -- see
+  // `api-keys/route.ts` for why the order matters.
   return withPrincipal(request, async ({ ctx, principal }) => {
+    const body = await readJsonBody(request);
+    if (body === null) return problem(400, "Invalid request");
+    const name = typeof body.name === "string" ? body.name : undefined;
+    const enabled = typeof body.enabled === "boolean" ? body.enabled : undefined;
+    const freshnessMs =
+      typeof body.freshnessMs === "number" ? body.freshnessMs : undefined;
     await sources.updateSourceAccount(ctx, {
       principal,
       sourceAccountId: id,

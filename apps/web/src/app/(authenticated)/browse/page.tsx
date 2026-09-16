@@ -1,10 +1,12 @@
 // The browse page, now a server component that picks a surface.
 //
 // Under `convex` it renders `ConvexBrowse` verbatim; i7 deletes that path.
-// Under `postgres` the view, the history toggle, the type filter and the
-// search query are the page's own `?view=&historical=&type=&q=` query string,
-// so the whole page (including the "search") is one read-only transaction
-// (`loadBrowse`) with no client-side query of its own.
+// Under `postgres` the view, the history toggle and the type filter are the
+// page's own `?view=&historical=&type=` query string, so the default render
+// is one read-only transaction (`loadBrowse`). The thoughts tab's free-text
+// search is not part of this query string -- see `lib/kith/browse.ts` and
+// `components/kith-thought-search.tsx` -- so it never reaches this page's
+// `searchParams` at all.
 
 import { headers } from "next/headers";
 import { redirect } from "next/navigation";
@@ -31,22 +33,15 @@ export default async function BrowsePage({
   const view = one(params.view) === "thoughts" ? "thoughts" : "facts";
   const includeHistorical = one(params.historical) === "1";
   const type = one(params.type);
-  const query = one(params.q);
 
   const data = await loadBrowse((await headers()).get("cookie"), {
     view,
     includeHistorical,
     ...(type ? { type } : {}),
-    ...(query ? { query } : {}),
   });
   if (data === null) redirect("/sign-in");
 
   return (
-    <KithBrowse
-      data={data}
-      includeHistorical={includeHistorical}
-      type={type}
-      query={query}
-    />
+    <KithBrowse data={data} includeHistorical={includeHistorical} type={type} />
   );
 }

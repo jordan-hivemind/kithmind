@@ -138,6 +138,9 @@ describeWithDatabase("i5 page loaders on PostgreSQL", () => {
 
     vi.stubEnv("KITH_SESSION_SECRET", secret);
     process.env.KITH_SESSION_SECRET = secret;
+    // `/api/kith/thoughts/search`, exercised below, only answers under the
+    // postgres surface (finding 10 of the second-model review of P2-39i5).
+    process.env.KITH_POSTGRES_SURFACE = "postgres";
 
     const userA = await signedInUser();
     const userB = await signedInUser();
@@ -179,6 +182,7 @@ describeWithDatabase("i5 page loaders on PostgreSQL", () => {
   afterAll(async () => {
     restorePool?.();
     await pool?.end().catch(() => {});
+    delete process.env.KITH_POSTGRES_SURFACE;
     await onAdmin((admin) =>
       admin.query(`DROP DATABASE IF EXISTS ${databaseName} WITH (FORCE)`),
     ).catch(() => {});
@@ -239,6 +243,34 @@ describeWithDatabase("i5 page loaders on PostgreSQL", () => {
     expect(
       await loadBrowse(null, { view: "facts", includeHistorical: false }),
     ).toBeNull();
+  });
+
+  test("POST /api/kith/thoughts/search keeps the query out of the URL and scopes results to the caller's space", async () => {
+    resetLog();
+    const { POST } = await import("../../app/api/kith/thoughts/search/route");
+    const response = await POST(
+      new Request("https://kith.example.test/api/kith/thoughts/search", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          origin: "https://kith.example.test",
+          cookie: fixture.userA.cookie,
+        },
+        body: JSON.stringify({ query: "personal thought" }),
+      }),
+    );
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      thoughts: Array<{ content: string }>;
+      vectorStatus: "ready" | "unavailable";
+    };
+    expect(body.thoughts.map((t) => t.content)).toEqual([
+      "userA's personal thought, only visible to userA.",
+    ]);
+    // No injected `embedQuery`, so the vector leg never runs -- see
+    // `lib/kith/browse.ts`'s module comment.
+    expect(body.vectorStatus).toBe("unavailable");
+    expect(transactionLog).toEqual(["BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"]);
   });
 
   test("loadSettings lists only the caller's own spaces and source accounts, in one transaction", async () => {
