@@ -40,6 +40,7 @@ import {
   makeSpace,
   makeUser,
   refusal,
+  refusalCode,
   skip,
 } from "./helpers/identityFixture.mjs";
 
@@ -925,6 +926,42 @@ test(
         await authenticateApiKey(ctx, { rawKey: legacy.rawKey }),
         null,
       );
+
+      // But only a refusal becomes `null`. Finding 1 of the second-model review
+      // of P2-39i2: a blanket catch here swallowed the SQLSTATE 40001 that two
+      // concurrent authentications raise on the `last_used_at` write, the retry
+      // loop in `withKithTransaction` never saw it, and the route answered 401
+      // for a valid key. A driver failure is not a fact about the credential and
+      // must reach the caller.
+      const realQuery = ctx.client.query.bind(ctx.client);
+      for (const code of ["40001", "57014", "55P03"]) {
+        ctx.client.query = async (sql, values) => {
+          if (
+            typeof sql === "string" &&
+            sql.includes("SET last_used_at")
+          ) {
+            throw Object.assign(new Error(`synthetic ${code}`), { code });
+          }
+          return await realQuery(sql, values);
+        };
+        try {
+          assert.equal(
+            await refusalCode(() =>
+              authenticateApiKey(ctx, { rawKey: key.rawKey }),
+            ),
+            null,
+            `${code} must not be reported as a typed denial`,
+          );
+          assert.match(
+            await refusal(() =>
+              authenticateApiKey(ctx, { rawKey: key.rawKey }),
+            ),
+            new RegExp(`synthetic ${code}`),
+          );
+        } finally {
+          ctx.client.query = realQuery;
+        }
+      }
     });
   },
 );

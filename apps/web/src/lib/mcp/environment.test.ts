@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   assertMcpEnvironment,
+  MCP_JWT_ISSUER_RENAME_ADVICE,
   requiredMcpEnvironmentVariables,
   validateMcpEnvironment,
 } from "./environment";
@@ -118,10 +119,29 @@ describe("validateMcpEnvironment", () => {
     const environment = legacyEnvironment();
 
     expect(validateMcpEnvironment(environment)).toEqual([
-      { name: "MCP_JWT_ISSUER", problem: "deprecated" },
+      {
+        name: "MCP_JWT_ISSUER",
+        problem: "deprecated",
+        scope: "web-deployment",
+        advice: MCP_JWT_ISSUER_RENAME_ADVICE,
+      },
     ]);
     // A rename notice is not a misconfiguration: the deployment works.
     expect(() => assertMcpEnvironment(environment)).not.toThrow();
+  });
+
+  // The notice has to name the deployment it is about. `auth.config.ts` on the
+  // Convex deployment still reads `MCP_JWT_ISSUER` and drops the customJwt
+  // provider when it is absent, so an operator who read this as "delete the
+  // variable" would break every MCP tool call under `convex`.
+  it("scopes the rename notice to the web deployment", () => {
+    const [notice] = validateMcpEnvironment(legacyEnvironment());
+
+    expect(notice!.scope).toBe("web-deployment");
+    expect(notice!.advice).toContain("MCP_PUBLIC_ORIGIN on the web deployment");
+    expect(notice!.advice).toContain("Keep MCP_JWT_ISSUER set on the Convex");
+    // Still names variables only, no values.
+    expect(JSON.stringify(notice)).not.toContain("brain.example.test");
   });
 
   it("validates the old origin name when it is the one being read", () => {
@@ -130,7 +150,12 @@ describe("validateMcpEnvironment", () => {
 
     expect(validateMcpEnvironment(environment)).toEqual([
       { name: "MCP_JWT_ISSUER", problem: "invalid" },
-      { name: "MCP_JWT_ISSUER", problem: "deprecated" },
+      {
+        name: "MCP_JWT_ISSUER",
+        problem: "deprecated",
+        scope: "web-deployment",
+        advice: MCP_JWT_ISSUER_RENAME_ADVICE,
+      },
     ]);
   });
 
@@ -176,11 +201,14 @@ describe("validateMcpEnvironment", () => {
     expect(validateMcpEnvironment(environment)).toEqual([]);
   });
 
+  // The listing and the validator have to agree. Under `convex` either origin
+  // name satisfies the validator, so the listing offers the pair rather than
+  // naming a variable a working deployment is happy without.
   it("lists the required names for the configured surface", () => {
     expect(requiredMcpEnvironmentVariables(validEnvironment())).toEqual([
       "NEXT_PUBLIC_CONVEX_URL",
       "MCP_OAUTH_ENCRYPTION_KEY",
-      "MCP_PUBLIC_ORIGIN",
+      ["MCP_PUBLIC_ORIGIN", "MCP_JWT_ISSUER"],
       "MCP_JWT_PRIVATE_JWK",
       "MCP_JWT_PUBLIC_JWK",
     ]);
@@ -193,6 +221,19 @@ describe("validateMcpEnvironment", () => {
       "KITH_DATABASE_URL",
       "KITH_SESSION_SECRET",
     ]);
+  });
+
+  it("requires nothing the listing does not name, on either surface", () => {
+    for (const environment of [legacyEnvironment(), validEnvironment()]) {
+      // Every alternative in the listing is accepted by the validator: the
+      // legacy environment satisfies the pair with the old name, the current one
+      // with the new name, and neither is reported missing.
+      expect(
+        validateMcpEnvironment(environment).filter(
+          (issue) => issue.problem === "missing",
+        ),
+      ).toEqual([]);
+    }
   });
 
   // The three variables P2-39i adds (surface plan section 3.4). They are not in

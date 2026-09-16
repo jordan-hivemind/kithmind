@@ -47,6 +47,41 @@ function email(): string {
   return `mcp-owner-${accounts}-${randomBytes(4).toString("hex")}@example.test`;
 }
 
+/**
+ * The real pool, with one injected driver failure on the first statement that
+ * matches.
+ *
+ * A genuine 40001 needs two transactions racing on one row, which is what the
+ * concurrency case above exercises but cannot make deterministic. This makes the
+ * same class of failure reproducible: a failure that arrives from the driver,
+ * inside the transaction, at a statement authentication really issues. "Once"
+ * is what lets a retry succeed, so the case can tell a retry apart from a
+ * swallow.
+ */
+function failingOncePool(real: pg.Pool, code: string, match: RegExp): pg.Pool {
+  let fired = false;
+  return {
+    async connect() {
+      const client = await real.connect();
+      return new Proxy(client, {
+        get(target, property, receiver) {
+          if (property !== "query") {
+            const value: unknown = Reflect.get(target, property, receiver);
+            return typeof value === "function" ? value.bind(target) : value;
+          }
+          return async (sql: unknown, values?: unknown) => {
+            if (!fired && typeof sql === "string" && match.test(sql)) {
+              fired = true;
+              throw Object.assign(new Error(`synthetic ${code}`), { code });
+            }
+            return await target.query(sql as string, values as unknown[]);
+          };
+        },
+      });
+    },
+  } as unknown as pg.Pool;
+}
+
 describeWithDatabase("MCP bearer authentication on PostgreSQL", () => {
   let pool: pg.Pool;
   let restorePool: () => void;
@@ -273,7 +308,9 @@ describeWithDatabase("MCP bearer authentication on PostgreSQL", () => {
     });
 
     // Section 4.2: a read tool runs under `REPEATABLE READ READ ONLY`, so a tool
-    // that writes cannot do it through the read path by accident.
+    // that writes cannot do it through the read path by accident. SQLSTATE
+    // 25006 is `read_only_sql_transaction`, asserted by code rather than by
+    // message so the case cannot pass on some other failure.
     await expect(
       withPrincipal(
         async ({ ctx }) => {
@@ -284,6 +321,73 @@ describeWithDatabase("MCP bearer authentication on PostgreSQL", () => {
         },
         { readOnly: true },
       ),
-    ).rejects.toThrow();
+    ).rejects.toMatchObject({ code: "25006" });
+  });
+
+  // Finding 1 of the second-model review of P2-39i2, with the reproduction it
+  // used. `requireMcpPrincipal` writes `last_used_at` on success, so concurrent
+  // authentications with one bearer contend on one row under `SERIALIZABLE`.
+  // The retry loop in `withKithTransaction` handles that, but only if the
+  // 40001 escapes the authenticator rather than being swallowed into `null`.
+  test("concurrent authentications with one bearer all succeed", async () => {
+    onPostgres();
+    const account = await owner();
+
+    const results = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        authenticateApiKey(`Bearer ${account.rawKey}`),
+      ),
+    );
+
+    expect(results).toHaveLength(8);
+    for (const result of results) {
+      expect(result).toEqual({
+        userId: account.userId,
+        keyId: account.keyId,
+      });
+    }
+  });
+
+  test("a serialization failure is retried rather than answered as a denial", async () => {
+    onPostgres();
+    const account = await owner();
+
+    // One injected 40001, on the first attempt only. The point is that the
+    // authenticator lets it out: a swallowed one becomes `null`, and the route
+    // then tells a client with a perfectly good credential to re-run OAuth.
+    const restore = setKithPool(
+      failingOncePool(pool, "40001", /UPDATE kith\.api_keys SET last_used_at/),
+    );
+    try {
+      expect(await authenticateApiKey(`Bearer ${account.rawKey}`)).toEqual({
+        userId: account.userId,
+        keyId: account.keyId,
+      });
+    } finally {
+      restore();
+    }
+  });
+
+  test.each([
+    ["a statement timeout", "57014"],
+    ["a lock timeout", "55P03"],
+    ["an unreachable database", "ECONNREFUSED"],
+  ])("%s surfaces rather than becoming a denial", async (_name, code) => {
+    onPostgres();
+    const account = await owner();
+
+    // Not retryable and not a fact about the credential, so it must reach the
+    // caller. `/api/ingest` and `/api/worker` turn exactly this into their 503
+    // `authentication_unavailable`, which a `null` would have made unreachable.
+    const restore = setKithPool(
+      failingOncePool(pool, code, /UPDATE kith\.api_keys SET last_used_at/),
+    );
+    try {
+      await expect(
+        authenticateApiKey(`Bearer ${account.rawKey}`),
+      ).rejects.toMatchObject({ code });
+    } finally {
+      restore();
+    }
   });
 });

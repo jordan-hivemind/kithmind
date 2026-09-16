@@ -33,9 +33,19 @@
 // tool call then failed in `requireMcpPrincipal`. Same outcome, one hop earlier,
 // and nothing that was refused before is admitted now.
 //
-// An unmodelled failure -- the database being unreachable -- is not caught. A
-// 401 for an outage would tell a client its credential is bad and send it back
-// through the OAuth flow; a 500 says what is true.
+// An unmodelled failure is not caught, and that is load bearing rather than
+// tidy. `requireMcpPrincipal` writes `last_used_at` on every success, so two
+// concurrent calls with one valid bearer contend on one row under
+// `SERIALIZABLE`; the store used to swallow the resulting SQLSTATE 40001 into
+// `null` and this route answered 401 for a perfectly good key. Now the 40001
+// reaches `withKithTransaction`'s retry loop, and a statement timeout, a lock
+// timeout or an unreachable database reach the caller, which turns them into
+// 503 `authentication_unavailable`. A 401 for an outage would tell a client its
+// credential is bad and send it back through the OAuth flow.
+//
+// `/api/ingest` and `/api/worker` do not use this function. They still do all of
+// their work through Convex, so they call `authenticateApiKeyOnConvex` below
+// until row i4 ports them; see the comment there.
 
 import { api } from "@repo/db/convex/_generated/api";
 import { withKithTransaction } from "@repo/kith-store";
@@ -102,4 +112,25 @@ export async function authenticateApiKey(
   return kithPostgresSurface() === "postgres"
     ? await authenticateThroughPostgres(rawKey)
     : await authenticateThroughConvex(rawKey);
+}
+
+/**
+ * Authentication for a route whose work has not moved yet. i4 deletes it.
+ *
+ * `/api/ingest` and `/api/worker` resolve a bearer here and then do all of their
+ * work through Convex with a minted Convex token. If those two routes followed
+ * the surface flag they would, under `postgres`, check the credential against
+ * `kith.api_keys` and then act on Convex data on the strength of it. That is the
+ * cross-surface mix `server.ts` refuses for exactly the same reason: a
+ * credential one backend never checked must not authorize work in that backend.
+ *
+ * So they are pinned to Convex until row i4 ports them, which is the slice that
+ * moves both routes and can flip them together with the work they do. The flag
+ * is deliberately not read here; a route is not half-ported.
+ */
+export async function authenticateApiKeyOnConvex(
+  authHeader: string | null,
+): Promise<McpIdentity | null> {
+  if (!authHeader?.startsWith("Bearer ")) return null;
+  return await authenticateThroughConvex(authHeader.slice(7));
 }

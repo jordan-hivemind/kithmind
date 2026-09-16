@@ -349,7 +349,20 @@ describeWithDatabase("the OAuth flow on PostgreSQL", () => {
         account.cookie,
       ),
     );
-    expect(response.status).toBeGreaterThanOrEqual(400);
+    // The exact refusal, not merely "some error". This is 500 and not 403, and
+    // that is Convex parity rather than a port defect: `getAuthorizedReadSpaceIds`
+    // raises the typed `space_not_found` read denial, `beginAuthorizationGrant`
+    // rethrows a typed error unchanged, and neither this route's mapping nor the
+    // Convex one it was copied from has a `space_not_found` case, so both fall
+    // through to "Failed to create API key". Asserting the real status is what
+    // keeps the two surfaces comparable while the flag decides between them;
+    // mapping the read denial to 403 is a behavior change and belongs to a row
+    // that can make it on both surfaces at once.
+    const body = await response.json();
+    expect(response.status).toBe(500);
+    expect(body).toEqual({ error: "Failed to create API key" });
+    // Either way it says nothing about whether the other space exists.
+    expect(JSON.stringify(body)).not.toContain(other.spaceId);
     const created = await pool.query(
       "SELECT id FROM kith.api_keys WHERE user_id = $1",
       [account.userId],

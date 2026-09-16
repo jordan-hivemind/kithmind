@@ -113,4 +113,23 @@ describe("finance gateway credential binding", () => {
     ).toBe(401);
     expect(mocks.createServer).toHaveBeenCalledTimes(1);
   });
+
+  // Finding 1 of the second-model review: an authenticator that throws is an
+  // outage, not a denial, and a 401 would send a client with a valid key back
+  // through the OAuth flow.
+  test("an authenticator failure is 503, not 401, and builds no server", async () => {
+    mocks.authenticate.mockRejectedValue(
+      Object.assign(new Error("serialization failure"), { code: "40001" }),
+    );
+
+    const response = await POST(
+      requestNaming({ principalId: "forged", keyId: "forged" }),
+    );
+    expect(response.status).toBe(503);
+    expect(response.headers.get("www-authenticate")).toBeNull();
+    expect(await response.json()).toMatchObject({
+      error: "authentication_unavailable",
+    });
+    expect(mocks.createServer).not.toHaveBeenCalled();
+  });
 });

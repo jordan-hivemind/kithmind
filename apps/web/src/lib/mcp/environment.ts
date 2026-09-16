@@ -78,16 +78,22 @@ export type McpEnvironmentVariable =
  *
  * Exported so a health response or a deployment check can list them without
  * reimplementing the surface rule, and so the rename has one source.
+ *
+ * The public origin is one entry with two acceptable names under `convex` and
+ * one under `postgres`, which is exactly what `validateMcpEnvironment` accepts.
+ * A flat list that always said `MCP_PUBLIC_ORIGIN` would tell an operator a
+ * working deployment is missing a variable the validator is happy without.
  */
 export function requiredMcpEnvironmentVariables(
   environment: Environment = process.env,
-): readonly McpEnvironmentVariable[] {
+): readonly (McpEnvironmentVariable | readonly McpEnvironmentVariable[])[] {
+  const onPostgres = kithPostgresSurface(environment) === "postgres";
   return [
     ...ALWAYS_REQUIRED,
-    "MCP_PUBLIC_ORIGIN",
-    ...(kithPostgresSurface(environment) === "postgres"
-      ? POSTGRES_ONLY_REQUIRED
-      : CONVEX_ONLY_REQUIRED),
+    onPostgres
+      ? "MCP_PUBLIC_ORIGIN"
+      : (["MCP_PUBLIC_ORIGIN", "MCP_JWT_ISSUER"] as const),
+    ...(onPostgres ? POSTGRES_ONLY_REQUIRED : CONVEX_ONLY_REQUIRED),
   ];
 }
 
@@ -110,11 +116,27 @@ function isPostgresConnectionString(value: string): boolean {
  * present, valid and being read, under a name i7 removes.
  * `assertMcpEnvironment` and the health route ignore it, because a deployment
  * that works must not be reported as broken for using the old spelling.
+ *
+ * `scope` is what stops the notice from being read as "remove this variable".
+ * `MCP_JWT_ISSUER` is set on two deployments. On the web deployment it is the
+ * old spelling of the public origin and `MCP_PUBLIC_ORIGIN` replaces it. On the
+ * Convex deployment `auth.config.ts` still reads it, and drops the customJwt
+ * provider entirely when it is absent, which would break every MCP tool call
+ * under `convex`. The notice names the web deployment and says to leave the
+ * Convex one alone until i7 deletes the bridge.
  */
 export type McpEnvironmentIssue = {
   name: McpEnvironmentVariable;
   problem: "missing" | "invalid" | "deprecated";
+  /** Present on a `deprecated` notice: which deployment it is about. */
+  scope?: "web-deployment";
+  /** Present on a `deprecated` notice: the one-line instruction. */
+  advice?: string;
 };
+
+/** The one wording for the rename notice, so it cannot be half-stated. */
+export const MCP_JWT_ISSUER_RENAME_ADVICE =
+  "Set MCP_PUBLIC_ORIGIN on the web deployment. Keep MCP_JWT_ISSUER set on the Convex deployment until P2-39i7 deletes the JWT bridge.";
 
 type P256JwkCoordinates = {
   x: string;
@@ -233,7 +255,12 @@ export function validateMcpEnvironment(
       issues.push({ name: origin.name, problem: "invalid" });
     }
     if (origin.name === "MCP_JWT_ISSUER") {
-      issues.push({ name: "MCP_JWT_ISSUER", problem: "deprecated" });
+      issues.push({
+        name: "MCP_JWT_ISSUER",
+        problem: "deprecated",
+        scope: "web-deployment",
+        advice: MCP_JWT_ISSUER_RENAME_ADVICE,
+      });
     }
     // Under `convex` the bridge is still live, and Convex verifies the token
     // against its own `MCP_JWT_ISSUER`. Two names holding two different origins

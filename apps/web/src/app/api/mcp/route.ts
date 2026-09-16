@@ -42,7 +42,34 @@ export async function OPTIONS() {
 
 export async function POST(req: Request) {
   // Authenticate via API key (Bearer token from OAuth flow or direct)
-  const auth = await authenticateApiKey(req.headers.get("authorization"));
+  //
+  // A thrown error here is not an authentication failure. The authenticator
+  // returns null for every fact about the credential and lets everything else
+  // out -- a database that is unreachable, a statement that timed out, a
+  // serialization failure the retry loop could not clear. Answering 401 for
+  // those would tell a client with a valid key that its credential is bad and
+  // send it back through the OAuth flow over an outage, so this is a 503 with
+  // the same code `/api/ingest` and `/api/worker` already use, and it carries
+  // no `WWW-Authenticate`.
+  let auth: Awaited<ReturnType<typeof authenticateApiKey>>;
+  try {
+    auth = await authenticateApiKey(req.headers.get("authorization"));
+  } catch {
+    return new Response(
+      JSON.stringify({
+        error: "authentication_unavailable",
+        message: "Authentication service is unavailable",
+      }),
+      {
+        status: 503,
+        headers: {
+          ...CORS_HEADERS,
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+        },
+      },
+    );
+  }
   if (!auth) {
     const baseUrl = getMcpPublicOrigin();
     return new Response(JSON.stringify({ error: "Unauthorized" }), {
