@@ -153,6 +153,7 @@ export async function requireActiveEmbeddingTarget(
 async function targetVectorRows(
   ctx: IdentityCtx,
   input: {
+    spaceId: string;
     kind: EmbeddingTargetKind;
     targetId: string;
     limit?: number;
@@ -169,10 +170,9 @@ async function targetVectorRows(
   const found = await rows<EmbeddingVectorRow>(
     ctx,
     `SELECT ${VECTOR_COLUMNS} FROM kith.embedding_vectors
-      WHERE ${column} = $1 ORDER BY created_at, id LIMIT $2${
-        input.forUpdate ? " FOR UPDATE" : ""
-      }`,
-    [input.targetId, limit],
+      WHERE ${column} = $1 AND space_id = $3
+      ORDER BY created_at, id LIMIT $2${input.forUpdate ? " FOR UPDATE" : ""}`,
+    [input.targetId, limit, input.spaceId],
   );
   if (input.limit === undefined && found.length > MAX_TARGET_VECTOR_ROWS) {
     throw new Error("Embedding target exceeds its vector row budget");
@@ -218,8 +218,22 @@ export async function releaseVectorCoverage(
   });
 }
 
-async function deleteVectorRow(ctx: IdentityCtx, id: string): Promise<void> {
-  await exec(ctx, "DELETE FROM kith.embedding_vectors WHERE id = $1", [id]);
+/**
+ * Space-scoped by predicate, not only by the caller's check: section 2.5 of
+ * the consolidation plan wants every statement on a space-scoped table to
+ * carry its own space predicate, so a future caller that forgets the check
+ * cannot reach another space's row.
+ */
+async function deleteVectorRow(
+  ctx: IdentityCtx,
+  spaceId: string,
+  id: string,
+): Promise<void> {
+  await exec(
+    ctx,
+    "DELETE FROM kith.embedding_vectors WHERE id = $1 AND space_id = $2",
+    [id, spaceId],
+  );
 }
 
 /** Two pgvector literals are equal exactly when their texts are. */
@@ -291,6 +305,7 @@ async function insertVector(
   // I11, in full. See the module comment.
   const siblings = (
     await targetVectorRows(ctx, {
+      spaceId: input.spaceId,
       kind: input.kind,
       targetId,
       forUpdate: true,
@@ -312,7 +327,7 @@ async function insertVector(
   for (const record of siblings) {
     if (existing && record.id === existing.id) continue;
     await releaseVectorCoverage(ctx, record);
-    await deleteVectorRow(ctx, record.id);
+    await deleteVectorRow(ctx, record.space_id, record.id);
   }
   const parent = input.processingGenerationId ?? null;
   if (existing) {
@@ -552,6 +567,7 @@ async function deleteTargetVectors(
     MAX_VECTOR_DELETE_PAGE,
   );
   const found = await targetVectorRows(ctx, {
+    spaceId: input.spaceId,
     kind: input.kind,
     targetId: input.targetId,
     limit: limit + 1,
@@ -567,7 +583,7 @@ async function deleteTargetVectors(
       );
     }
     await releaseVectorCoverage(ctx, record);
-    await deleteVectorRow(ctx, record.id);
+    await deleteVectorRow(ctx, record.space_id, record.id);
   }
   return {
     deleted: Math.min(found.length, limit),
@@ -644,6 +660,7 @@ export async function deleteActiveThoughtEmbeddingVectors(
     }
     const found = (
       await targetVectorRows(ctx, {
+        spaceId: input.spaceId,
         kind: "thought",
         targetId: thoughtId,
         forUpdate: true,
@@ -671,7 +688,7 @@ export async function deleteActiveThoughtEmbeddingVectors(
         throw new Error("Active thought embedding vector has invalid identity");
       }
       await releaseVectorCoverage(ctx, record);
-      await deleteVectorRow(ctx, record.id);
+      await deleteVectorRow(ctx, record.space_id, record.id);
       deleted += 1;
     }
   }

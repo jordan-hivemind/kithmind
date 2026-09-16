@@ -247,9 +247,9 @@ async function targetVectorRowProbe(
   return await rows(
     ctx,
     `SELECT space_id, embedding_fingerprint, target_kind
-       FROM kith.embedding_vectors WHERE ${column} = $1
+       FROM kith.embedding_vectors WHERE ${column} = $1 AND space_id = $3
       ORDER BY created_at, id LIMIT $2`,
-    [record.target_id, MAX_TARGET_ROW_PROBE],
+    [record.target_id, MAX_TARGET_ROW_PROBE, record.space_id],
   );
 }
 
