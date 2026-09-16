@@ -487,6 +487,13 @@ test(
       "UPDATE kith.source_text_versions SET text_hash_authority='server_verified_retained_text' WHERE id=$1",
       [item.ids.textVersion],
     );
+    // A second, genuinely distinct artifact of the same revision: the check under
+    // test is `generation.parserArtifactId === text.parserArtifactId`, so what
+    // matters is that the text version points at another artifact *id*. Its
+    // parser fingerprint is varied because migration 020 makes
+    // `(source_revision_id, parser_fingerprint)` unique -- two artifacts sharing
+    // one fingerprint was never a legal state, and this fixture no longer needs
+    // to manufacture one to reach the mismatch it is asserting.
     const otherArtifact = newKithId();
     await client.query(
       `INSERT INTO kith.source_parser_artifacts
@@ -494,7 +501,7 @@ test(
           client_artifact_id,parser_fingerprint,output_hash,output_byte_length,
           output_media_type,hash_authority,user_id,created_at_field)
        SELECT $1,space_id,transaction_timestamp(),source_account_id,source_item_id,
-          source_revision_id,'other-artifact',parser_fingerprint,output_hash,
+          source_revision_id,'other-artifact',parser_fingerprint||'-other',output_hash,
           output_byte_length,output_media_type,hash_authority,user_id,
           transaction_timestamp()
        FROM kith.source_parser_artifacts WHERE id=$2`,

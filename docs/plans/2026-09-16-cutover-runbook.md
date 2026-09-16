@@ -85,7 +85,9 @@ hold.
 Then run `live` with the confirmation string. In `live` the summary adds the
 host verification table and the finance before and after comparison. The run
 fails if the comparison is not `unchanged`, if `kith` already held rows before
-the load, or if the live parity rerun is not `pass`.
+the load, if a `kith` schema exists at any version other than the current one
+(the host check accepts absent or current, nothing between), or if the live
+parity rerun is not `pass`.
 
 ## Local rehearsal
 

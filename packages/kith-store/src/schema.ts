@@ -153,6 +153,14 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
     name: "auth_rate_limits: the durable table for the web session's sign-in/sign-up limiter (P2-39i follow-up)",
     url: new URL("../migrations/019_auth_rate_limits.sql", import.meta.url),
   },
+  {
+    version: 20,
+    name: "partial unique indexes for every identity the store asserts unique at read time (P2-39)",
+    url: new URL(
+      "../migrations/020_identity_unique_indexes.sql",
+      import.meta.url,
+    ),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */
