@@ -2,11 +2,12 @@
 //
 // `worker` answers the read-time staleness predicate (P2-39j's
 // `workers.watcherStaleness`) for one source account; `dashboard` answers the
-// dashboard's live counters. Both reload the session from the cookie inside
-// their own `REPEATABLE READ READ ONLY` transaction, so these cases exercise
-// that path rather than the underlying loaders directly: a caller signed in
-// as `userB` must never see `userA`'s watcher, incident or space, no matter
-// what id the request names.
+// dashboard's live counters. Both run through `withPrincipalRead`, so these
+// cases exercise that path rather than the underlying loaders directly: a
+// caller signed in as `userB` must never see `userA`'s watcher, incident or
+// space, no matter what id the request names, and the same `guardedRequest`
+// gate the `/api/kith/*` mutation routes share (surface, origin, content
+// type) applies here too.
 
 import { randomBytes } from "node:crypto";
 
@@ -30,6 +31,7 @@ const describeWithDatabase = adminUrl ? describe : describe.skip;
 
 const PASSWORD = "a strong enough password";
 const secret = randomBytes(32).toString("hex");
+const ORIGIN = "https://kith.example.test";
 
 // One fixed instant the whole suite reads through `setKithNow`, so a
 // watcher's `next_expected_at` can be placed on either side of it without a
@@ -148,10 +150,25 @@ describeWithDatabase("the /api/status/* routes", () => {
     );
   }
 
-  function withCookie(url: string, cookie: string | null): Request {
-    const headers = new Headers();
+  /**
+   * Every header a same-origin `fetch` from `use-status-poll.ts` sends. A
+   * browser attaches `Sec-Fetch-Site: same-origin` on its own -- a `Request`
+   * built directly by a test cannot -- so `origin` stands in for it here,
+   * the same substitution `app/api/kith/mutations.test.ts`'s own
+   * `baseHeaders` makes for the mutation routes sharing the same
+   * `guardedRequest` gate.
+   */
+  function baseHeaders(cookie: string | null): Headers {
+    const headers = new Headers({
+      "Content-Type": "application/json",
+      origin: ORIGIN,
+    });
     if (cookie !== null) headers.set("cookie", cookie);
-    return new Request(url, { headers });
+    return headers;
+  }
+
+  function withCookie(url: string, cookie: string | null): Request {
+    return new Request(url, { headers: baseHeaders(cookie) });
   }
 
   beforeAll(async () => {
@@ -171,6 +188,10 @@ describeWithDatabase("the /api/status/* routes", () => {
     restorePool = setKithPool(recordingPool(pool));
     restoreNow = setKithNow(FIXED_NOW);
     process.env.KITH_SESSION_SECRET = secret;
+    // These routes only exist under the postgres surface (`guardedRequest`'s
+    // 404 gate); most of this file exercises that mode, and the one test
+    // that checks the convex-mode gate restores this value itself.
+    process.env.KITH_POSTGRES_SURFACE = "postgres";
 
     routes = {
       worker: (await import("./worker/route")).GET,
@@ -183,6 +204,7 @@ describeWithDatabase("the /api/status/* routes", () => {
     restorePool?.();
     await pool?.end().catch(() => {});
     delete process.env.KITH_SESSION_SECRET;
+    delete process.env.KITH_POSTGRES_SURFACE;
     await onAdmin((admin) =>
       admin.query(`DROP DATABASE IF EXISTS ${databaseName} WITH (FORCE)`),
     ).catch(() => {});
@@ -195,11 +217,47 @@ describeWithDatabase("the /api/status/* routes", () => {
   test("worker status: unauthenticated is refused with 401 and touches no row", async () => {
     resetLog();
     const response = await routes.worker(
-      withCookie("https://kith.example.test/api/status/worker?sourceAccountId=x", null),
+      withCookie(`${ORIGIN}/api/status/worker?sourceAccountId=x`, null),
     );
     expect(response.status).toBe(401);
-    expect(await response.json()).toEqual({ error: "Not authenticated" });
+    expect(await response.json()).toEqual({
+      error: "Not authenticated",
+      code: "not_authenticated",
+    });
     expect(response.headers.get("Cache-Control")).toBe("no-store");
+  });
+
+  test("worker status: a cross-origin request is refused before any transaction opens", async () => {
+    const owner = await signedInUser();
+    const request = withCookie(
+      `${ORIGIN}/api/status/worker?sourceAccountId=x`,
+      owner.cookie,
+    );
+    request.headers.set("origin", "https://attacker.example.test");
+    const response = await routes.worker(request);
+    expect(response.status).toBe(403);
+  });
+
+  test("worker status: a request without a JSON content type is refused", async () => {
+    const owner = await signedInUser();
+    const request = new Request(`${ORIGIN}/api/status/worker?sourceAccountId=x`, {
+      headers: { cookie: owner.cookie, origin: ORIGIN },
+    });
+    const response = await routes.worker(request);
+    expect(response.status).toBe(415);
+  });
+
+  test("worker status: answers a fixed 404 under the convex surface", async () => {
+    const owner = await signedInUser();
+    process.env.KITH_POSTGRES_SURFACE = "convex";
+    try {
+      const response = await routes.worker(
+        withCookie(`${ORIGIN}/api/status/worker?sourceAccountId=x`, owner.cookie),
+      );
+      expect(response.status).toBe(404);
+    } finally {
+      process.env.KITH_POSTGRES_SURFACE = "postgres";
+    }
   });
 
   test("worker status: current inside the window, overdue past it, from one fixed clock", async () => {
@@ -224,7 +282,7 @@ describeWithDatabase("the /api/status/* routes", () => {
     resetLog();
     const currentResponse = await routes.worker(
       withCookie(
-        `https://kith.example.test/api/status/worker?sourceAccountId=${currentAccount}`,
+        `${ORIGIN}/api/status/worker?sourceAccountId=${currentAccount}`,
         owner.cookie,
       ),
     );
@@ -243,7 +301,7 @@ describeWithDatabase("the /api/status/* routes", () => {
     resetLog();
     const overdueResponse = await routes.worker(
       withCookie(
-        `https://kith.example.test/api/status/worker?sourceAccountId=${overdueAccount}`,
+        `${ORIGIN}/api/status/worker?sourceAccountId=${overdueAccount}`,
         owner.cookie,
       ),
     );
@@ -271,7 +329,7 @@ describeWithDatabase("the /api/status/* routes", () => {
 
     const asB = await routes.worker(
       withCookie(
-        `https://kith.example.test/api/status/worker?sourceAccountId=${accountA}`,
+        `${ORIGIN}/api/status/worker?sourceAccountId=${accountA}`,
         ownerB.cookie,
       ),
     );
@@ -280,7 +338,7 @@ describeWithDatabase("the /api/status/* routes", () => {
 
     const asA = await routes.worker(
       withCookie(
-        `https://kith.example.test/api/status/worker?sourceAccountId=${accountA}`,
+        `${ORIGIN}/api/status/worker?sourceAccountId=${accountA}`,
         ownerA.cookie,
       ),
     );
@@ -293,7 +351,7 @@ describeWithDatabase("the /api/status/* routes", () => {
 
     const notConfigured = await routes.worker(
       withCookie(
-        `https://kith.example.test/api/status/worker?sourceAccountId=${account}`,
+        `${ORIGIN}/api/status/worker?sourceAccountId=${account}`,
         owner.cookie,
       ),
     );
@@ -302,15 +360,15 @@ describeWithDatabase("the /api/status/* routes", () => {
     expect(body.watcher.state).toBe("not_configured");
 
     const missingParam = await routes.worker(
-      withCookie("https://kith.example.test/api/status/worker", owner.cookie),
+      withCookie(`${ORIGIN}/api/status/worker`, owner.cookie),
     );
     expect(missingParam.status).toBe(400);
   });
 
-  test("dashboard status: unauthenticated is refused with 401, and the loader it reuses returns null for the same cookie", async () => {
+  test("dashboard status: unauthenticated is refused with 401, and the loader it shares returns null for the same cookie", async () => {
     resetLog();
     const response = await routes.dashboard(
-      withCookie("https://kith.example.test/api/status/dashboard", null),
+      withCookie(`${ORIGIN}/api/status/dashboard`, null),
     );
     expect(response.status).toBe(401);
     expect(response.headers.get("Cache-Control")).toBe("no-store");
@@ -319,11 +377,36 @@ describeWithDatabase("the /api/status/* routes", () => {
     expect(await loadDashboard(null)).toBeNull();
   });
 
+  test("dashboard status: a cross-origin request is refused, and a request without a JSON content type is refused", async () => {
+    const owner = await signedInUser();
+    const crossOrigin = withCookie(`${ORIGIN}/api/status/dashboard`, owner.cookie);
+    crossOrigin.headers.set("origin", "https://attacker.example.test");
+    expect((await routes.dashboard(crossOrigin)).status).toBe(403);
+
+    const noContentType = new Request(`${ORIGIN}/api/status/dashboard`, {
+      headers: { cookie: owner.cookie, origin: ORIGIN },
+    });
+    expect((await routes.dashboard(noContentType)).status).toBe(415);
+  });
+
+  test("dashboard status: answers a fixed 404 under the convex surface", async () => {
+    const owner = await signedInUser();
+    process.env.KITH_POSTGRES_SURFACE = "convex";
+    try {
+      const response = await routes.dashboard(
+        withCookie(`${ORIGIN}/api/status/dashboard`, owner.cookie),
+      );
+      expect(response.status).toBe(404);
+    } finally {
+      process.env.KITH_POSTGRES_SURFACE = "postgres";
+    }
+  });
+
   test("dashboard status: answers the caller's own stats, one read-only transaction, no-store", async () => {
     const owner = await signedInUser();
     resetLog();
     const response = await routes.dashboard(
-      withCookie("https://kith.example.test/api/status/dashboard", owner.cookie),
+      withCookie(`${ORIGIN}/api/status/dashboard`, owner.cookie),
     );
     expect(response.status).toBe(200);
     expect(response.headers.get("Cache-Control")).toBe("no-store");

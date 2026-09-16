@@ -6,6 +6,14 @@
 // the tab becomes visible again. Every response is requested with
 // `cache: "no-store"` to match the route's own `Cache-Control: no-store`.
 //
+// The fetch sends `Content-Type: application/json`, with no body, because
+// `/api/status/*` runs through `withPrincipalRead`'s `guardedRequest` (the
+// P2-39i5 review's finding 8), which requires that header on every request
+// regardless of method -- a plain cross-site request cannot set it, so
+// requiring it here is a second barrier past the same-origin check the
+// browser's own `Sec-Fetch-Site` header already gives a same-origin `fetch`
+// for free.
+//
 // The state transitions themselves -- what a hidden tab does, what a failed
 // fetch does to the displayed value -- are `lib/kith/poll.ts`'s pure
 // functions, unit tested there because this project has no jsdom to render a
@@ -51,7 +59,10 @@ export function useStatusPoll<T>(
   const poll = useCallback(async () => {
     let outcome: PollOutcome<T>;
     try {
-      const response = await fetch(url, { cache: "no-store" });
+      const response = await fetch(url, {
+        cache: "no-store",
+        headers: { "Content-Type": "application/json" },
+      });
       if (!response.ok) throw new Error(`status route failed: ${response.status}`);
       outcome = { ok: true, value: (await response.json()) as T };
     } catch {

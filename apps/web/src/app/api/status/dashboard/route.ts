@@ -3,21 +3,25 @@
 // `thoughts.public.getStats` and `thoughts.public.listRecent` gave the
 // `convex` surface for free.
 //
-// Reuses `loadDashboard` byte for byte -- the same loader
-// `app/(authenticated)/page.tsx` calls for the first paint, one
-// `withKithReadTransaction` with `requireWebPrincipal` reloaded from the
-// cookie inside it -- so the poll and the server component can never
-// disagree about how a stat is computed, and there is exactly one place that
-// resolves the caller's authorized space set for this surface.
+// One `withPrincipalRead` -- the same surface, origin and content-type gate
+// (`guardedRequest`) the `/api/kith/*` mutation routes and `thoughts/search`
+// share, then one `REPEATABLE READ READ ONLY` transaction with
+// `requireWebPrincipal` reloaded from the cookie inside it -- calling
+// `computeDashboardData` on that same session. That is the exact computation
+// `app/(authenticated)/page.tsx`'s `loadDashboard` runs for the first paint
+// (`lib/kith/dashboard.ts`'s one shared function, each caller's own
+// transaction), so the poll and the server component can never disagree
+// about how a stat is computed.
 
-import { noStoreJson, problem } from "@/lib/kith/api-route";
-import { loadDashboard } from "@/lib/kith/dashboard";
+import { noStoreJson, withPrincipalRead } from "@/lib/kith/api-route";
+import { computeDashboardData } from "@/lib/kith/dashboard";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function GET(request: Request): Promise<Response> {
-  const data = await loadDashboard(request.headers.get("cookie"));
-  if (data === null) return problem(401, "Not authenticated");
-  return noStoreJson(data);
+  return withPrincipalRead(request, async (session) => {
+    const data = await computeDashboardData(session);
+    return noStoreJson(data);
+  });
 }
