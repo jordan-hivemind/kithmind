@@ -286,6 +286,13 @@ by insertion. Every paged read becomes a keyset cursor over
 compare-and-set cursor guard already tolerates: the stored cursor is opaque to
 the caller either way.
 
+Two refinements from P2-39g2, which is the first row to implement this.
+
+| Refinement                      | What it changes                                                                                                                                                                                                                                                                                             |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| One page keys on identity       | The embedding build's audit phase pages `embedding_targets` by `(space_id, target_kind, target_id)` rather than by `(created_at, id)`, because that is the unique index the table already carries and the order it recounts in. `(created_at, id)` stays the default for every page whose table has no such identity to walk. |
+| `created_at` is carried as text | A cursor stores `created_at::text`, not the `Date` a driver parses. node-postgres rounds a `timestamptz` to milliseconds, and a rounded microsecond value lands either before the row it came from, repeating it forever, or after it, skipping its neighbours. Neither failure announces itself.            |
+
 ### 2.4 Atomicity replaces per-mutation atomicity
 
 A Convex mutation is one transaction. One ported mutation is one

@@ -31,7 +31,7 @@ export type EmbeddingKindCounts = {
   card: number;
 };
 
-const ZERO_KIND_COUNTS: EmbeddingKindCounts = {
+export const ZERO_KIND_COUNTS: EmbeddingKindCounts = {
   thought: 0,
   chunk: 0,
   card: 0,
@@ -60,7 +60,7 @@ export type ActiveEmbeddingTarget = {
   chunkCoverage: { eligible: number; covered: number };
 };
 
-type SpaceEmbeddingStateRow = {
+export type SpaceEmbeddingStateRow = {
   id: string;
   space_id: string;
   active_embedding_generation_id: string | null;
@@ -69,9 +69,16 @@ type SpaceEmbeddingStateRow = {
   covered_counts: unknown;
   counter_drift: boolean | null;
   last_audit_at: Date | null;
+  /** The remaining columns the write side (P2-39g2) reads and patches. */
+  eligibility_epoch?: string | number | null;
+  target_policy?: string | null;
+  counter_drift_reason?: string | null;
+  historical_thought_counts?: unknown;
+  activated_at?: Date | null;
+  last_eligibility_change_at?: Date | null;
 };
 
-type EmbeddingGenerationRow = {
+export type EmbeddingGenerationRow = {
   id: string;
   space_id: string;
   embedding_profile_id: string | null;
@@ -80,7 +87,7 @@ type EmbeddingGenerationRow = {
   deactivated_at: Date | null;
 };
 
-type EmbeddingProfileRow = {
+export type EmbeddingProfileRow = {
   id: string;
   fingerprint: string | null;
   protocol: string | null;
@@ -102,22 +109,28 @@ export type EmbeddingTargetRow = {
   covered_fingerprint: string | null;
 };
 
-function countOf(value: unknown): number {
+/** One counter, from a stored `jsonb` number. */
+export function embeddingCountOf(value: unknown): number {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
     throw new Error("Embedding counter is invalid");
   }
   return value;
 }
 
-function kindCounts(value: unknown): EmbeddingKindCounts {
+/**
+ * The three named kinds, from a stored `jsonb` counter. Exported for the write
+ * side (P2-39g2), which reads and adds to the same three numbers; a second
+ * parser would be a second opinion about what a counter is.
+ */
+export function embeddingKindCounts(value: unknown): EmbeddingKindCounts {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("Embedding counter is invalid");
   }
   const record = value as Record<string, unknown>;
   return {
-    thought: countOf(record.thought),
-    chunk: countOf(record.chunk),
-    card: countOf(record.card),
+    thought: embeddingCountOf(record.thought),
+    chunk: embeddingCountOf(record.chunk),
+    card: embeddingCountOf(record.card),
   };
 }
 
@@ -134,7 +147,9 @@ export function coveredCountsFor(
       throw new Error("Embedding counter is invalid");
     }
     const record = entry as Record<string, unknown>;
-    if (record.fingerprint === fingerprint) return kindCounts(record.counts);
+    if (record.fingerprint === fingerprint) {
+      return embeddingKindCounts(record.counts);
+    }
   }
   return { ...ZERO_KIND_COUNTS };
 }
@@ -148,7 +163,7 @@ export function usesTargetCounters(state: SpaceEmbeddingStateRow): boolean {
   return state.eligible_counts !== null && state.last_audit_at !== null;
 }
 
-function profileFromRow(record: EmbeddingProfileRow): EmbeddingProfile {
+export function profileFromRow(record: EmbeddingProfileRow): EmbeddingProfile {
   if (
     typeof record.protocol !== "string" ||
     typeof record.provider_id !== "string" ||
@@ -173,16 +188,34 @@ function profileFromRow(record: EmbeddingProfileRow): EmbeddingProfile {
   };
 }
 
-/** Ported from `uniqueSpaceState`: a second row is a fault, not a tiebreak. */
-async function uniqueSpaceState(
+/** Every column of the state row, named once. */
+export const SPACE_EMBEDDING_STATE_COLUMNS = `id, space_id, eligibility_epoch,
+  active_embedding_generation_id, active_fingerprint, activated_at,
+  eligible_counts, covered_counts, target_policy, counter_drift,
+  counter_drift_reason, historical_thought_counts, last_audit_at,
+  last_eligibility_change_at`;
+
+/**
+ * Ported from `uniqueSpaceState`: a second row is a fault, not a tiebreak.
+ *
+ * Migration 016 made `(space_id)` unique, so the fault is now unreachable; the
+ * `LIMIT 2` stays because a defensive read that costs one row is cheaper than
+ * an argument about which guarantee is holding it up.
+ *
+ * `forUpdate` is what a write path passes: the counters are one row per space
+ * and every eligibility write adds to them, so the read that decides the delta
+ * and the update that applies it have to be the same row lock.
+ */
+export async function uniqueSpaceState(
   ctx: IdentityCtx,
   spaceId: string,
+  forUpdate = false,
 ): Promise<SpaceEmbeddingStateRow | null> {
   const found = await rows<SpaceEmbeddingStateRow>(
     ctx,
-    `SELECT id, space_id, active_embedding_generation_id, active_fingerprint,
-            eligible_counts, covered_counts, counter_drift, last_audit_at
-       FROM kith.space_embedding_states WHERE space_id = $1 LIMIT 2`,
+    `SELECT ${SPACE_EMBEDDING_STATE_COLUMNS}
+       FROM kith.space_embedding_states WHERE space_id = $1
+      ORDER BY created_at, id LIMIT 2${forUpdate ? " FOR UPDATE" : ""}`,
     [spaceId],
   );
   if (found.length > 1) throw new Error("Duplicate space embedding state");
@@ -190,7 +223,7 @@ async function uniqueSpaceState(
 }
 
 /** Ported from `requireGenerationProfile`. */
-async function requireGenerationProfile(
+export async function requireGenerationProfile(
   ctx: IdentityCtx,
   generation: EmbeddingGenerationRow,
 ): Promise<EmbeddingProfile> {
@@ -248,7 +281,7 @@ export async function getActiveEmbeddingTarget(
   if (!usesTargetCounters(state)) {
     throw new Error(UNSEEDED_EMBEDDING_COUNTERS_ERROR);
   }
-  const eligible = kindCounts(state.eligible_counts);
+  const eligible = embeddingKindCounts(state.eligible_counts);
   const covered = coveredCountsFor(state, state.active_fingerprint);
   return {
     spaceId,

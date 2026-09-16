@@ -221,6 +221,15 @@ export async function grantProofAppRole(
   // writer -- the fill driver, and the tests that stand rows up for the
   // search legs -- and a table no role can write is a table the next slice
   // silently cannot fill.
+  //
+  // P2-39g2 adds the rest of that writer's tables and `thoughts`. Five of the
+  // six are the embedding index's own bookkeeping: the profile a fingerprint
+  // names, the space state holding the counters, the generation lifecycle, the
+  // target rows and the build job row. `thoughts` joins them because
+  // `captureThought` and `transitionMemory` in `src/memory/thoughts.ts` are
+  // exported writes of that table and were reachable only through the owner
+  // role until now, which made the memory domain a read-only surface for the
+  // application credential by accident rather than by decision.
   await owner.query(`GRANT INSERT, UPDATE, DELETE ON
     kith.worker_jobs, kith.source_items, kith.source_revisions,
     kith.source_parser_artifacts, kith.source_artifact_archive_receipts,
@@ -232,7 +241,10 @@ export async function grantProofAppRole(
     kith.source_inventory, kith.source_alias_digests,
     kith.worker_scan_entries, kith.worker_discovery_work,
     kith.worker_protocol_rate_limits, kith.ingest_jobs,
-    kith.embedding_vectors TO "${appRole}"`);
+    kith.embedding_vectors, kith.embedding_profiles,
+    kith.space_embedding_states, kith.embedding_generations,
+    kith.embedding_targets, kith.embedding_build_jobs,
+    kith.thoughts TO "${appRole}"`);
   // pgvector lives in `public` (migration 015 says why), and every vector
   // read names its type and operators there. Applying the reader role revokes
   // PUBLIC's default USAGE on `public`, so the writer is granted it by name

@@ -10,15 +10,29 @@
 // card still hashes to the `input_hash` the row was written with. That is the
 // whole point of the check, so the composition is ported rather than assumed.
 //
-// `chunkTargetsOptedIn` and `spaceEmbedsAllChunks` are not ported: both are
-// eligibility-write policy, which belongs to the writer the embedding build
-// workstream owns, not to a retrieval path.
+// P2-39g2 adds `chunkTargetsOptedIn` below, and `spaceEmbedsAllChunks` lives
+// in `./state.ts` beside the state row it reads. Both are eligibility-write
+// policy rather than retrieval, which is why g1 left them out; the writer that
+// needed them now exists.
 
 import { sha256Utf8 } from "../provenance/sql.js";
 import { rows, row, type IdentityCtx } from "../identity/db.js";
 
 /** The generic card. Typed cards ride on the same document and add no target. */
 export const CARD_TARGET_EVENT_KEY = "card:document_card";
+
+/**
+ * Section 8.2 of the document-card plan: whether this item's chunks are
+ * embedding targets at all. Ported verbatim. The item's own flag wins over the
+ * account's, and absent on both is false, so a space on the card policy embeds
+ * a chunk only where someone said to.
+ */
+export function chunkTargetsOptedIn(
+  item: { embed_full_chunks: boolean | null },
+  account: { embed_full_chunks: boolean | null } | null,
+): boolean {
+  return item.embed_full_chunks ?? account?.embed_full_chunks ?? false;
+}
 
 /** A card publishes at most 128 observations; the generic card holds a handful. */
 const MAX_CARD_OBSERVATIONS = 128;

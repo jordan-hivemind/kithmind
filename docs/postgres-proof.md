@@ -157,6 +157,105 @@ vector is refused before any statement is sent.
 This is not ranking parity. Section 4.2 of the consolidation plan owns that
 gate with its frozen question set, and it remains owed.
 
+### The write side (P2-39g2)
+
+Migration 016 and six more files in `packages/kith-store/src/embeddings/` add
+the half that fills the index g1 reads: generations, profiles, target rows,
+counters, the paged build, the provider fill, and the memory writes that keep
+eligibility in step. The design is
+[the index-capacity plan](plans/2026-09-12-index-capacity.md); the PostgreSQL
+translation is sections 2.3 and 2.4 of the consolidation plan.
+
+| Object                                                     | Purpose                                                                                                      |
+| ---------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `embedding_profiles_fingerprint_key`                       | One profile row per fingerprint. A second is a collision or damage, never a tiebreak.                        |
+| `space_embedding_states_space_idx`, now UNIQUE             | One state row per space. It is the row every reader derives its filter from, and two writers upsert it.       |
+| `embedding_targets_space_kind_target_idx`, now UNIQUE      | `(space_id, target_kind, target_id)` is the target's identity and the key every upsert lands on.             |
+| `embedding_targets_owed_idx`                               | Partial, `WHERE state = 'eligible' AND covered_fingerprint IS NULL`. The owed set is this index page.         |
+| `embedding_generations` state CHECK, `(space_id, state)`   | The six states, and the lookups that refuse a second staging or staged generation.                           |
+| `embedding_build_jobs` phase CHECK, terminal-cursor CHECK  | The five phases, and the rule that a `done` or `abandoned` job keeps no cursor for anything to resume.       |
+| `embedding_targets_retired_coverage_check`                 | I4 as a constraint: a retired target covers nothing.                                                          |
+| `thoughts_space_created_idx` and its chunk and event peers | The ascending `(created_at, id)` keysets the scan stages page over.                                           |
+
+Four more decisions the plan left open are settled in the migration header.
+
+| Decision                     | Choice                                                                                                                                                                                                                                |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| State row uniqueness         | UNIQUE. g1 left it plain so the read could report a duplicate as a fault. `SERIALIZABLE` would abort a concurrent second insert anyway, but that is a property of one isolation level rather than of the schema. The `LIMIT 2` fault path stays in code and becomes unreachable. |
+| `numeric` counter columns    | Not retyped. `@repo/kith-migrate` renders a Convex number with `String(value)` and constrains nothing, so retyping would move a validation into a `COPY` that cannot say which row it refused. The domain is stated as CHECK constraints instead, which hold on every write. |
+| Profile column nullability   | Only `fingerprint` is NOT NULL. `profileFromRow` already fails closed on a missing descriptive column, and the worker publish path legitimately writes a fingerprint-only row because it reads nothing else from a profile.            |
+| Cursor encoding              | `JSON.stringify([stage, keyset])`, with `created_at` carried as `created_at::text` rather than the `Date` node-pg rounds to milliseconds. A rounded microsecond timestamp would repeat a row forever or skip its neighbours, silently. |
+
+What the write side does, and where:
+
+| Module           | What it owns                                                                                                    |
+| ---------------- | --------------------------------------------------------------------------------------------------------------- |
+| `state.ts`       | The space state row, the profile row, the counter deltas (I4), and the per-space coverage a `list_spaces` row reports. |
+| `eligibility.ts` | Target upsert and retire, the coverage marker, and the per-write touch for thoughts, chunks and cards.          |
+| `write.ts`       | Vector insert, reuse, replace (I11) and delete, each with the coverage bookkeeping it owes.                     |
+| `generations.ts` | The profile-transition lifecycle: create, stage vectors, stage, activate, fail.                                 |
+| `build.ts`       | The paged scan, fill and audit with keyset cursors, plus `auditEmbeddingCounters` and the duplicate probe.      |
+| `fill.ts`        | The owed page, the idempotent commit, and the driver that runs pages until nothing is owed.                     |
+
+Three differences from the Convex originals are deliberate.
+
+1. No scheduler. Convex's fill commit scheduled its own successor inside its
+   transaction. `runEmbeddingFill` is a plain async driver instead, and each
+   page is its own `withKithTransaction`. The daemon that calls it on a
+   schedule is separate work.
+2. The provider is injected. The driver takes an embedder rather than reaching
+   for a Convex action, so a test needs no network and no transaction is held
+   open across an HTTP call.
+3. `captureThought` and `transitionMemory` never write a vector. They mark
+   eligibility, bump the epoch, and delete a superseded memory's active
+   vectors, which is where `_insertOne` and `_transitionMemory` made those same
+   three calls. Their fourth and fifth calls, the inline vector insert and its
+   completeness check, have no PostgreSQL branch: one ported mutation is one
+   `SERIALIZABLE` transaction on one checked-out client, and holding that open
+   across a provider call is not something a capture may do. The new thought is
+   an owed target and the fill covers it, which is section 3.1's incremental
+   admission. I9 still holds, because a covered-versus-eligible shortfall is
+   exactly what makes `getActiveEmbeddingTarget` report `thoughtStatus:
+   "unavailable"`.
+
+`test/embeddingLifecycle.test.mjs`, `test/embeddingBuild.test.mjs` and
+`test/embeddingFill.test.mjs` prove, against a real server: that ensuring a
+profile is idempotent and a fingerprint names one row; that a generation is
+created, filled, staged and activated, that a second activation retires the
+first and leaves exactly one active, and that the read side sees the new one;
+that a manifest whose epoch moved refuses to stage and a failed generation
+keeps its evidence and cannot activate; that capturing a thought creates an
+eligible, owed target and bumps the epoch, and that a superseding transition
+retires the old target, deletes its active vector and counts the superseded
+bucket; that `setCoreStatus` spends no epoch because it changes no
+eligibility; that a build over a space of more than one page per kind pages
+through every stage, that a page whose cursor is not the stored one is refused
+with the stored cursor and writes nothing, and that replaying the current
+cursor changes no row; that the counters after a full build equal an
+independent recount, and still do after a converging rerun and a target-policy
+flip; that the audit names a counter mismatch and a duplicate row separately
+and that a repair fixes only the counters; that the fill covers only owed
+targets, skips a target whose live text hash has moved, and that a replayed
+commit writes nothing; and that two concurrent commits of the same page
+converge on one vector per target with counters that still match a recount.
+
+The chunk and card retrieval leg gained the isolation control it was missing:
+an identical nearest-possible chunk vector and card vector in another space,
+and the same pair in this space under a retired fingerprint, none of which ever
+appears in `chunkIds` or `cardHits`. The thought leg already had that control;
+this is the same proof for the other two kinds.
+
+Which Convex `migrations.ts` functions were ported, and which were not:
+
+| Function                                                                                      | Ported | Why                                                                                                                   |
+| --------------------------------------------------------------------------------------------- | ------ | ----------------------------------------------------------------------------------------------------------------------- |
+| `startTargetBackfill`, `runTargetBackfillPage`, `abandonTargetBackfill`                       | Yes    | A fresh PostgreSQL space needs them to seed its counters and target rows at all. They are `startEmbeddingBuild`, `runEmbeddingBuildPage` and `abandonEmbeddingBuild`. |
+| `auditSpaceCoverage`                                                                          | Yes    | The recount an operator runs after any step, as `auditEmbeddingCounters`.                                             |
+| `prepareBaselineGeneration`, `backfillBaselineThoughtVectors`, `stageBaselineGeneration`, `activateBaselineGeneration`, `auditBaselineGeneration`, `ensureBaselineProfileAndState` | No | A one-time copy of a legacy `thoughts.embedding` field into vector rows. Section 5.1 exports that field to a cold audit file and does not create a column for it, so there is nothing to copy from. |
+| `backfillVectorScopeV2`                                                                       | No     | Backfills `scope_v2` onto rows written before it existed. Vector rows are not migrated, and every row this code writes carries it. |
+| `deleteNonActiveGenerationVectors`, `cleanupEmbeddingGenerations`                             | No     | Retention and cleanup, which the capacity plan defers past the first backfill (P2-6e). Nothing here deletes a historical generation's rows. |
+| `setChunkEmbeddingOptIn`, `setSpaceTargetPolicy`                                              | No     | Operator switches over columns this slice reads and constrains but does not need a writer for. The policy's effect is proven by a test that sets the column directly. |
+
 ## Verification
 
 The default repository test remains independent of Docker:

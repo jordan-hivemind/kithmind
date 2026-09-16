@@ -1,22 +1,53 @@
 // Ported from packages/convex/convex/models/thoughts/model.ts and the
-// `*Authorized` internal functions of models/thoughts/private.ts, minus the
-// embedding-target wiring: `_insertOne`/`_transitionMemory`'s calls into
-// `../embeddings/model` (`insertThoughtEmbedding`, `markEligibilityTargets`,
-// `bumpEmbeddingEligibilityEpoch`, `deleteActiveThoughtEmbeddingVectors`,
-// `requireActiveEmbeddingTarget`) are still not ported. P2-39g1 added the
-// vector column, the `thoughts.content_search` column and the *read* side in
-// `src/embeddings/` (section 2.7), but every one of those five calls is a
-// write into the embedding index, which the embedding build workstream owns;
-// a capture here leaves an uncovered target for the fill to pick up, exactly
-// as any other backlog row would. `_computeSpaceStats` is not ported either:
-// its digest reads the space counters that same writer maintains. `_listByUser`/`_listCoreByUser` (a legacy userId-scoped read, from
-// before the space model) are not ported: every read here goes through an
+// `*Authorized` internal functions of models/thoughts/private.ts.
+//
+// The embedding-target wiring is here as of P2-39g2: `captureThought` and
+// `transitionMemory` call `markEligibilityTargets`,
+// `bumpEmbeddingEligibilityEpoch` and `deleteActiveThoughtEmbeddingVectors`
+// from `../embeddings/` at exactly the points `_insertOne` and
+// `_transitionMemory` did.
+//
+// Two of the five calls the Convex originals make are deliberately absent, and
+// both are the same decision. `insertThoughtEmbedding` and
+// `requireActiveEmbeddingTarget` ran only on the branch where the caller
+// handed capture a vector it had already obtained from the provider. That
+// branch does not exist on PostgreSQL: one ported mutation is one
+// `SERIALIZABLE` transaction on one checked-out client (section 2.4 of
+// docs/plans/2026-09-12-postgres-consolidation.md), and holding that client
+// and its snapshot open across an HTTP call to an embedding provider is not
+// something a capture may do. So a capture marks its target eligible and
+// bumps the epoch, and the target is owed until `../embeddings/fill.ts`
+// covers it -- which is section 3.1 of the index-capacity plan's incremental
+// admission, not a gap. Both functions are ported and exported from
+// `../embeddings/write.ts`; the fill is what calls them.
+//
+// I9 is unaffected. It was never enforced by that branch for its own sake:
+// `getActiveEmbeddingTarget` reports `thoughtStatus: "unavailable"` while
+// covered and eligible thought counts disagree, and narrative capture reads
+// that. An uncovered new thought makes the counts disagree, so the index
+// reports itself incomplete until the fill catches up.
+//
+// `_computeSpaceStats` is still not ported: nothing in this package exports a
+// stats read for its digest to serve. The half of it that belongs to the
+// embedding index -- the per-space counters and the `list_spaces` coverage
+// label, which is all it reads from `readSpaceCounters` -- is ported, as
+// `readSpaceCounters` and `spaceEmbeddingCoverage` in
+// `../embeddings/state.ts`.
+//
+// `_listByUser`/`_listCoreByUser` (a legacy userId-scoped read, from before
+// the space model) are not ported: every read here goes through an
 // already-authorized space set, matching `docs/plans/2026-09-06-architecture.md`
 // section 3.1 ("Every read ... verifies the actual row's space").
 //
 // As in `facts.ts`, every function takes an already-authorized `spaceId`
 // (writes) or `spaceIds` set (reads); space authorization is the caller's job.
 
+import {
+  bumpEmbeddingEligibilityEpoch,
+  markEligibilityTargets,
+} from "../embeddings/eligibility.js";
+import { getActiveEmbeddingTarget } from "../embeddings/targets.js";
+import { deleteActiveThoughtEmbeddingVectors } from "../embeddings/write.js";
 import { row, rows, exec, at, ms, type IdentityCtx } from "../identity/db.js";
 import { assertKithId, KITH_ID, newKithId } from "../ids.js";
 import {
@@ -293,9 +324,9 @@ export type CaptureThoughtArgs = {
 
 /**
  * Ported from `_insertOne`/`insertOneAuthorized`. `spaceId` is already
- * authorized for write. No embedding is written (see the module comment);
- * P2-39g's index build picks up an unindexed thought the same way it would
- * pick up any other backlog row.
+ * authorized for write. No vector is written here (see the module comment);
+ * the new thought is an eligible, uncovered target and the provider fill
+ * covers it.
  */
 export async function captureThought(
   ctx: IdentityCtx,
@@ -328,6 +359,12 @@ export async function captureThought(
       args.confidence ?? null,
     ],
   );
+  // `_insertOne`'s order, kept: the eligibility mark comes first so a vector
+  // insert would find a target row to mark covered, and the epoch bump
+  // follows. On a space whose counters are not seeded the mark is a no-op and
+  // the bump is the whole of it, exactly as it was on Convex.
+  await markEligibilityTargets(ctx, spaceId, { thoughtIds: [id] });
+  await bumpEmbeddingEligibilityEpoch(ctx, spaceId, { thoughtIds: [id] });
   return id;
 }
 
@@ -393,6 +430,10 @@ export async function transitionMemory(
       args.confidence ?? null,
     ],
   );
+  // `_transitionMemory`'s order: the new memory is marked eligible before the
+  // previous ones are transitioned, so its target exists for the whole rest of
+  // this transaction.
+  await markEligibilityTargets(ctx, spaceId, { thoughtIds: [newId] });
 
   for (const previous of previousMemories) {
     const corrected = previousStatus === "retracted";
@@ -415,10 +456,61 @@ export async function transitionMemory(
     );
   }
 
+  // The previous memories left the current bucket in the statements above, so
+  // their vectors are no longer retrievable. `_transitionMemory` deleted them
+  // before the epoch bump and only on a space with an active index; a space
+  // with none has no vector to delete and the call would refuse.
+  const active = await activeIndexForWrite(ctx, spaceId);
+  if (active) {
+    await deleteActiveThoughtEmbeddingVectors(ctx, {
+      spaceId,
+      embeddingGenerationId: active.embeddingGenerationId,
+      fingerprint: active.fingerprint,
+      thoughtIds: uniquePreviousIds,
+    });
+  }
+  // Supersede and retract retire exactly the memories they transitioned, and
+  // the new memory above is marked in the same transaction.
+  await bumpEmbeddingEligibilityEpoch(ctx, spaceId, {
+    thoughtIds: [newId, ...uniquePreviousIds],
+  });
+
   return newId;
 }
 
-/** Ported from `_setCoreStatus`/`setCoreStatusAuthorized`. */
+/**
+ * The active index of a space, or null when it has none or its state is
+ * damaged.
+ *
+ * `_transitionMemory` reached the delete only on the branch where the caller
+ * had supplied a generation and fingerprint, which is precisely when the space
+ * had an active index. Here the caller supplies neither, so the transition
+ * reads the pointer itself and skips the delete when there is nothing to
+ * delete. A damaged pointer is swallowed for the same reason the read side
+ * swallows it: an unindexed or broken index must not make a memory transition
+ * fail.
+ */
+async function activeIndexForWrite(
+  ctx: IdentityCtx,
+  spaceId: string,
+): Promise<{ embeddingGenerationId: string; fingerprint: string } | null> {
+  try {
+    return await getActiveEmbeddingTarget(ctx, spaceId);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Ported from `_setCoreStatus`/`setCoreStatusAuthorized`.
+ *
+ * No embedding call, because `_setCoreStatus` makes none. `is_core` is not
+ * part of a thought's embedded text and it does not move the memory's
+ * lifecycle, so nothing about the target it names changes: its `input_hash`
+ * is the same, it is eligible before and after, and its vector still covers
+ * it. Marking or bumping here would spend an epoch on a write that changed no
+ * eligibility.
+ */
 export async function setCoreStatus(
   ctx: IdentityCtx,
   spaceId: string,
