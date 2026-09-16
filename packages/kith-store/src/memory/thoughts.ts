@@ -107,7 +107,8 @@ export type Thought = {
   confidence: number | undefined;
 };
 
-type ThoughtRow = {
+/** Exported for `./timeline.ts`, which reads the same rows. */
+export type ThoughtRow = {
   id: string;
   space_id: string;
   created_at: Date;
@@ -130,7 +131,12 @@ type ThoughtRow = {
   confidence: string | number | null;
 };
 
-const THOUGHT_COLUMNS = `id, space_id, created_at, content, metadata, user_id, updated_at,
+/**
+ * Shared with `./timeline.ts`, which reads the same rows through the same
+ * hydration. A module seam, not part of the memory domain's public surface:
+ * `./index.js` does not re-export it.
+ */
+export const THOUGHT_COLUMNS = `id, space_id, created_at, content, metadata, user_id, updated_at,
        is_core, valid_from, valid_to, memory_status, superseded_at, superseded_by,
        supersedes, change_reason, source_type, source_ref, observed_at, batch_id, confidence`;
 
@@ -180,7 +186,7 @@ async function hydrateThought(ctx: IdentityCtx, record: ThoughtRow): Promise<Tho
   return toThought(record);
 }
 
-async function hydrateThoughtRows(ctx: IdentityCtx, records: readonly ThoughtRow[]): Promise<Thought[]> {
+export async function hydrateThoughtRows(ctx: IdentityCtx, records: readonly ThoughtRow[]): Promise<Thought[]> {
   const hydrated = [];
   for (const record of records) {
     const thought = await hydrateThought(ctx, record);

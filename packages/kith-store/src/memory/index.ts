@@ -29,6 +29,15 @@ export {
   transitionMemory,
 } from "./thoughts.js";
 export * from "./recall.js";
+export {
+  computeSpaceStats,
+  MAX_STATS_DIGEST_ROWS,
+  MAX_STATS_FACT_ROWS,
+  MAX_THOUGHT_STATS_ROWS,
+} from "./stats.js";
+export { listAroundTime, MAX_TIMELINE_WINDOW } from "./timeline.js";
 
 export type * from "./entities.js";
 export type * from "./thoughts.js";
+export type * from "./stats.js";
+export type * from "./timeline.js";

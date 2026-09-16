@@ -3,16 +3,10 @@ import { api } from "@repo/db/convex/_generated/api";
 import type { Id } from "@repo/db/convex/_generated/dataModel";
 import { parseSpaceReadErrorData } from "@repo/db/convex/lib/spaceReadErrors";
 import {
-  blendRecallContext,
-  coreLimitFor,
-} from "@repo/db/convex/models/recallBlend";
-import {
   FINANCE_READ_TOOL_DESCRIPTION,
   FinanceContractError,
 } from "@repo/finance-contract";
-import { listSpaces } from "@repo/kith-store/identity";
 import { ConvexHttpClient } from "convex/browser";
-import type { FunctionArgs } from "convex/server";
 import { z } from "zod";
 
 import {
@@ -30,6 +24,16 @@ import {
   resolveFinanceArchive,
 } from "./finance";
 import type { WithMcpPrincipal } from "./principal";
+import {
+  type BrowseThought,
+  type ConvexGateway,
+  convexReads,
+  type FactResult,
+  type FullThought,
+  type McpReads,
+  postgresReads,
+  type TimelineRow,
+} from "./reads";
 import { recordQuerySchema } from "./record-query";
 
 export const SERVER_INSTRUCTIONS = `Kith Mind stores family knowledge as structured facts, narrative thoughts, and indexed source documents with retained evidence.
@@ -98,10 +102,6 @@ const writeSpaceSchema = spaceIdSchema
   .describe(
     "Explicit destination from list_spaces. If omitted, use the configured default or Personal. Joining a shared space never changes this default.",
   );
-function scopedReads(spaceIds?: string[]) {
-  return spaceIds === undefined ? {} : { spaceIds: spaceIds as Id<"spaces">[] };
-}
-
 function errorData(error: unknown): unknown {
   return typeof error === "object" && error !== null && "data" in error
     ? error.data
@@ -271,37 +271,6 @@ const factValueSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("entity"), entity: entitySelectorSchema }),
 ]);
 
-type FactResult = {
-  id: string;
-  spaceId?: string;
-  userId?: string;
-  statement: string;
-  subject: {
-    id: string;
-    key: string;
-    kind: string;
-    name: string;
-    aliases: string[];
-  } | null;
-  predicate: string;
-  value: unknown;
-  sourceType: "user_stated" | "user_confirmed";
-  sourceRef?: string;
-  observedAt?: number;
-  batchId?: string;
-  confidence: number;
-  isCore: boolean;
-  validFrom?: number;
-  validTo?: number;
-  status: "current" | "superseded" | "retracted";
-  supersededAt?: number;
-  supersededBy?: string;
-  supersedes?: string[];
-  changeReason?: string;
-  createdAt: number;
-  updatedAt?: number;
-};
-
 function isDatetimeFactValue(
   value: unknown,
 ): value is { type: "datetime"; value: number } {
@@ -378,10 +347,10 @@ function financeToolError(error: unknown) {
  * What the server was handed to act as.
  *
  * Under `convex` it is the short-lived identity token `/api/mcp` mints, which is
- * what the 17 tools still authenticate with until i3 and i4 port them. Under
- * `postgres` it is a loader, not a principal: section 3.3's rule is that each
- * call reloads the credential inside its own transaction, so the server is given
- * the means to do that and never a snapshot to trust.
+ * what the write and ingest tools still authenticate with until i4 ports them.
+ * Under `postgres` it is a loader, not a principal: section 3.3's rule is that
+ * each call reloads the credential inside its own transaction, so the server is
+ * given the means to do that and never a snapshot to trust.
  *
  * A bare string is the `convex` form. It is accepted so that call sites written
  * before the surface existed keep working unchanged, which is what makes i2
@@ -391,22 +360,19 @@ export type McpServerCredential =
   | { surface: "convex"; convexAuthToken: string }
   | { surface: "postgres"; withPrincipal: WithMcpPrincipal };
 
-/** The three Convex calls the tools make. Nothing here constructs a client. */
-type ConvexGateway = Pick<ConvexHttpClient, "query" | "mutation" | "action">;
-
 /**
- * The gateway for a surface that has not ported its tools yet.
+ * The gateway for the tools this surface has not ported yet.
  *
- * i2 moves authentication, not tools. Under `postgres` the credential is checked
- * against PostgreSQL and a tool call then has nothing to run against until i3
- * and i4, so it fails with a message that says which rows own the port. It must
- * not fall back to Convex: a deployment reading PostgreSQL identities would then
+ * i3 moves the 14 read tools. `remember_fact`, `capture_thought` and
+ * `ingest_url` are i4's, so under `postgres` they still have nothing to run
+ * against and fail with a message naming the row that owns them. They must not
+ * fall back to Convex: a deployment reading PostgreSQL identities would then
  * answer tool calls with Convex data for a credential Convex never checked.
  */
 function unportedConvexGateway(): ConvexGateway {
   const refuse = (): never => {
     throw new Error(
-      "MCP tools do not read PostgreSQL yet; rows P2-39i3 and P2-39i4 port them",
+      "MCP write and ingest tools do not reach PostgreSQL yet; row P2-39i4 ports them",
     );
   };
   return { query: refuse, mutation: refuse, action: refuse };
@@ -423,6 +389,7 @@ export function createMcpServer(
       : credential;
 
   let convex: ConvexGateway;
+  let reads: McpReads;
   if (bound.surface === "convex") {
     const convexUrl = process.env.NEXT_PUBLIC_CONVEX_URL;
     if (!convexUrl) {
@@ -431,8 +398,10 @@ export function createMcpServer(
     const client = new ConvexHttpClient(convexUrl);
     client.setAuth(bound.convexAuthToken);
     convex = client;
+    reads = convexReads(client);
   } else {
     convex = unportedConvexGateway();
+    reads = postgresReads(bound.withPrincipal);
   }
 
   /**
@@ -440,26 +409,15 @@ export function createMcpServer(
    * rather than cached, so a revoked membership takes effect on the next query
    * rather than at the end of a session.
    *
-   * The finance leg already runs on PostgreSQL, so it is the one caller that has
-   * a PostgreSQL answer in i2: `identity.listSpaces` inside the call's own
-   * read-only transaction, which is the same authorization the Convex query
-   * performs and the same reload rule section 3.3 states.
+   * The finance leg already runs on PostgreSQL. `authorizedSpaceIds` is the
+   * same membership read `list_spaces` performs on whichever surface is
+   * configured, inside that call's own read-only transaction under `postgres`,
+   * which is the reload rule section 3.3 states.
    */
   async function financeTrustedContext(): Promise<FinanceTrustedGatewayContext> {
-    if (bound.surface === "postgres") {
-      const spaces = await bound.withPrincipal(
-        ({ ctx, principal }) => listSpaces(ctx, { principal }),
-        { readOnly: true },
-      );
-      return {
-        principalId,
-        authorizedSpaceIds: spaces.map((space) => space.spaceId),
-      };
-    }
-    const spaces = await convex.query(api.models.spaces.mcpQueries.list, {});
     return {
       principalId,
-      authorizedSpaceIds: spaces.map((space) => space.spaceId as string),
+      authorizedSpaceIds: await reads.authorizedSpaceIds(),
     };
   }
 
@@ -478,10 +436,7 @@ export function createMcpServer(
     MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.listSpaces],
     async () => {
       try {
-        const spaces = await convex.query(
-          api.models.spaces.mcpQueries.list,
-          {},
-        );
+        const spaces = await reads.listSpaces();
         return {
           content: [
             { type: "text" as const, text: JSON.stringify(spaces, null, 2) },
@@ -531,11 +486,7 @@ export function createMcpServer(
           return financeToolError(error);
         }
       }
-      const result = await convex.mutation(api.models.records.queryMcp.run, {
-        query: query as FunctionArgs<
-          typeof api.models.records.queryMcp.run
-        >["query"],
-      });
+      const result = await reads.queryRecords(query);
       return {
         content: [{ type: "text" as const, text: JSON.stringify(result) }],
       };
@@ -563,10 +514,7 @@ export function createMcpServer(
     MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.searchDocuments],
     async ({ spaceIds, ...args }) => {
       try {
-        const result = await convex.action(
-          api.models.documents.mcpActions.search,
-          { ...args, ...scopedReads(spaceIds) },
-        );
+        const result = await reads.searchDocuments({ ...args, spaceIds });
         return {
           content: [{ type: "text" as const, text: JSON.stringify(result) }],
         };
@@ -585,10 +533,10 @@ export function createMcpServer(
     },
     MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.getDocument],
     async ({ documentId, spaceIds, ...args }) => {
-      const result = await convex.query(api.models.documents.mcpQueries.get, {
+      const result = await reads.getDocument({
         ...args,
-        documentId: documentId as Id<"documents">,
-        ...scopedReads(spaceIds),
+        documentId,
+        spaceIds,
       });
       return {
         content: [{ type: "text" as const, text: JSON.stringify(result) }],
@@ -641,17 +589,12 @@ export function createMcpServer(
     },
     MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.listSources],
     async ({ spaceIds, sourceAccountId, ...args }) => {
-      const result = await convex.query(
-        api.models.documents.mcpQueries.listSources,
-        {
-          ...args,
-          ...scopedReads(spaceIds),
-          ...(sourceAccountId === undefined
-            ? {}
-            : { sourceAccountId: sourceAccountId as Id<"sourceAccounts"> }),
-        },
-      );
-      // Two scope rules. A source-account filter selects one Convex source
+      const result = await reads.listSources({
+        ...args,
+        spaceIds,
+        ...(sourceAccountId === undefined ? {} : { sourceAccountId }),
+      });
+      // Two scope rules. A source-account filter selects one Kith Mind source
       // account, which the archive has no equivalent of, so the block is
       // omitted rather than answered for a filter it cannot honour. An omitted
       // or empty spaceIds means every readable space, which is what this
@@ -715,14 +658,11 @@ export function createMcpServer(
     MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.listInventory],
     async ({ spaceIds, sourceAccountId, ...args }) => {
       try {
-        const result = await convex.query(
-          api.models.documents.mcpQueries.listInventory,
-          {
-            ...args,
-            sourceAccountId: sourceAccountId as Id<"sourceAccounts">,
-            ...scopedReads(spaceIds),
-          },
-        );
+        const result = await reads.listInventory({
+          ...args,
+          sourceAccountId,
+          spaceIds,
+        });
         return {
           content: [{ type: "text" as const, text: JSON.stringify(result) }],
         };
@@ -745,14 +685,11 @@ export function createMcpServer(
     MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.listReviewQueue],
     async ({ spaceIds, sourceAccountId, ...args }) => {
       try {
-        const result = await convex.query(
-          api.models.records.mcpQueries.listReviewQueue,
-          {
-            ...args,
-            sourceAccountId: sourceAccountId as Id<"sourceAccounts">,
-            ...scopedReads(spaceIds),
-          },
-        );
+        const result = await reads.listReviewQueue({
+          ...args,
+          sourceAccountId,
+          spaceIds,
+        });
         return {
           content: [{ type: "text" as const, text: JSON.stringify(result) }],
         };
@@ -778,10 +715,12 @@ export function createMcpServer(
     },
     MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.searchFacts],
     async ({ spaceIds, query, limit, includeHistorical }) => {
-      const facts: FactResult[] = await convex.query(
-        api.models.facts.mcpQueries.search,
-        { query, limit, includeHistorical, ...scopedReads(spaceIds) },
-      );
+      const facts: FactResult[] = await reads.searchFacts({
+        query,
+        limit,
+        includeHistorical,
+        spaceIds,
+      });
       return {
         content: [
           {
@@ -954,28 +893,8 @@ export function createMcpServer(
     },
     MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.searchThoughts],
     async ({ spaceIds, query, type, limit, includeHistorical }) => {
-      type IndexRow = {
-        _id: string;
-        userId?: string;
-        spaceId?: string;
-        summary: string;
-        snippet: string;
-        type: string;
-        topics: string[];
-        score: number;
-        createdAt: number;
-        memoryStatus: "current" | "superseded" | "retracted";
-        isCore?: boolean;
-        validFrom?: number;
-        validTo?: number;
-        supersededAt?: number;
-        changeReason?: string;
-      };
-      const searchResult: {
-        results: IndexRow[];
-        vectorStatus: "ready" | "unavailable";
-      } = await convex.action(api.models.thoughts.mcpActions.searchWithStatus, {
-        ...scopedReads(spaceIds),
+      const searchResult = await reads.searchThoughts({
+        spaceIds,
         query,
         type,
         limit,
@@ -1067,83 +986,17 @@ export function createMcpServer(
     },
     MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.recallContext],
     async ({ spaceIds, query, limit, includeHistorical }) => {
-      type IndexRow = {
-        _id: string;
-        userId?: string;
-        spaceId?: string;
-        summary: string;
-        snippet: string;
-        type: string;
-        topics: string[];
-        score: number;
-        createdAt: number;
-        memoryStatus: "current" | "superseded" | "retracted";
-        isCore?: boolean;
-        validFrom?: number;
-        validTo?: number;
-        supersededAt?: number;
-        changeReason?: string;
-      };
-      type CoreThought = {
-        _id: string;
-        spaceId?: string;
-        _creationTime: number;
-        content: string;
-        metadata: {
-          type: string;
-          topics: string[];
-          people: string[];
-          actionItems: string[];
-          summary: string;
-        };
-        userId: string;
-        updatedAt?: number;
-        memoryStatus?: "current" | "superseded" | "retracted";
-        isCore?: boolean;
-        validFrom?: number;
-        validTo?: number;
-        supersededAt?: number;
-        supersededBy?: string;
-        supersedes?: string[];
-        changeReason?: string;
-      };
-      type ContextFact = FactResult;
-      const coreLimit = coreLimitFor(limit);
-      const [coreFacts, coreThoughts, relevantFacts, searchResult]: [
-        ContextFact[],
-        CoreThought[],
-        ContextFact[],
-        { results: IndexRow[]; vectorStatus: "ready" | "unavailable" },
-      ] = await Promise.all([
-        convex.query(api.models.facts.mcpQueries.listCore, {
-          ...scopedReads(spaceIds),
-          limit: coreLimit,
-        }),
-        convex.query(api.models.thoughts.mcpQueries.listCore, {
-          ...scopedReads(spaceIds),
-          limit: coreLimit,
-        }),
-        convex.query(api.models.facts.mcpQueries.search, {
-          ...scopedReads(spaceIds),
-          query,
-          limit,
-          includeHistorical,
-        }),
-        convex.action(api.models.thoughts.mcpActions.searchWithStatus, {
-          ...scopedReads(spaceIds),
-          query,
-          limit,
-          includeHistorical,
-        }),
-      ]);
-
-      const { results: index, vectorStatus } = searchResult;
-      if (
-        coreFacts.length === 0 &&
-        coreThoughts.length === 0 &&
-        relevantFacts.length === 0 &&
-        index.length === 0
-      ) {
+      // One call, one blend. Under `postgres` the five reads section 4.3 names
+      // run on one client inside one read-only transaction, so the facts and
+      // the thoughts come from one snapshot.
+      const blend = await reads.recallContext({
+        spaceIds,
+        query,
+        limit,
+        includeHistorical,
+      });
+      const vectorStatus = blend.vectorStatus;
+      if (blend.empty) {
         return {
           content: [
             {
@@ -1159,61 +1012,12 @@ export function createMcpServer(
         };
       }
 
-      const {
-        coreFacts: selectedCoreFacts,
-        coreThoughts: selectedCoreThoughts,
-        relevanceFacts,
-        relevanceThoughts: relevanceIndex,
-      } = blendRecallContext({
-        coreFacts,
-        coreThoughts,
-        relevantFacts,
-        relevantThoughts: index,
-        limit,
-        factId: (fact) => fact.id,
-        coreThoughtId: (thought) => thought._id,
-        relevantThoughtId: (row) => row._id,
-      });
-
-      type Thought = {
-        _id: string;
-        userId?: string;
-        spaceId?: string;
-        content: string;
-        metadata: {
-          type: string;
-          topics: string[];
-          people: string[];
-          actionItems: string[];
-          summary: string;
-        };
-        createdAt: number;
-        updatedAt?: number;
-        memoryStatus: "current" | "superseded" | "retracted";
-        isCore?: boolean;
-        validFrom?: number;
-        validTo?: number;
-        supersededAt?: number;
-        supersededBy?: string;
-        supersedes?: string[];
-        changeReason?: string;
-      };
-      const thoughts: Thought[] =
-        relevanceIndex.length === 0
-          ? []
-          : await convex.action(api.models.thoughts.mcpActions.getByIds, {
-              ...scopedReads(spaceIds),
-              ids: relevanceIndex.map((row) => row._id) as never,
-            });
-      const thoughtById = new Map(
-        thoughts.map((thought) => [thought._id, thought]),
-      );
-      const coreFactContext = selectedCoreFacts.map((fact) => ({
+      const coreFactContext = blend.coreFacts.map((fact) => ({
         ...formatFactForMcp(fact),
         memoryKind: "fact" as const,
         source: "core" as const,
       }));
-      const coreContext = selectedCoreThoughts.map((thought) => ({
+      const coreContext = blend.coreThoughts.map((thought) => ({
         id: thought._id,
         spaceId: thought.spaceId,
         userId: thought.userId,
@@ -1234,46 +1038,40 @@ export function createMcpServer(
             : undefined,
         createdAt: new Date(thought._creationTime).toISOString(),
       }));
-      const relevanceFactContext = relevanceFacts.map((fact) => ({
+      const relevanceFactContext = blend.relevanceFacts.map((fact) => ({
         ...formatFactForMcp(fact),
         memoryKind: "fact" as const,
         source: "relevance" as const,
       }));
-      const relevanceContext = relevanceIndex.flatMap((row) => {
-        const thought = thoughtById.get(row._id);
-        if (!thought) return [];
-        return [
-          {
-            id: thought._id,
-            spaceId: thought.spaceId,
-            userId: thought.userId,
-            citation: `thought:${thought._id}`,
-            content: truncateContext(thought.content),
-            metadata: thought.metadata,
-            memoryKind: "thought" as const,
-            source: "relevance" as const,
-            score: row.score,
-            memoryStatus: thought.memoryStatus,
-            isCore: thought.isCore ?? false,
-            validFrom:
-              thought.validFrom !== undefined
-                ? new Date(thought.validFrom).toISOString()
-                : undefined,
-            validTo:
-              thought.validTo !== undefined
-                ? new Date(thought.validTo).toISOString()
-                : undefined,
-            supersededAt:
-              thought.supersededAt !== undefined
-                ? new Date(thought.supersededAt).toISOString()
-                : undefined,
-            supersededBy: thought.supersededBy,
-            supersedes: thought.supersedes,
-            changeReason: thought.changeReason,
-            createdAt: new Date(thought.createdAt).toISOString(),
-          },
-        ];
-      });
+      const relevanceContext = blend.relevanceThoughts.map((thought) => ({
+        id: thought._id,
+        spaceId: thought.spaceId,
+        userId: thought.userId,
+        citation: `thought:${thought._id}`,
+        content: truncateContext(thought.content),
+        metadata: thought.metadata,
+        memoryKind: "thought" as const,
+        source: "relevance" as const,
+        score: thought.score,
+        memoryStatus: thought.memoryStatus,
+        isCore: thought.isCore ?? false,
+        validFrom:
+          thought.validFrom !== undefined
+            ? new Date(thought.validFrom).toISOString()
+            : undefined,
+        validTo:
+          thought.validTo !== undefined
+            ? new Date(thought.validTo).toISOString()
+            : undefined,
+        supersededAt:
+          thought.supersededAt !== undefined
+            ? new Date(thought.supersededAt).toISOString()
+            : undefined,
+        supersededBy: thought.supersededBy,
+        supersedes: thought.supersedes,
+        changeReason: thought.changeReason,
+        createdAt: new Date(thought.createdAt).toISOString(),
+      }));
       const context = [
         ...coreFactContext,
         ...coreContext,
@@ -1323,30 +1121,13 @@ export function createMcpServer(
     },
     MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.browseRecent],
     async ({ spaceIds, limit, type, topic, includeHistorical }) => {
-      type Thought = {
-        _id: string;
-        spaceId?: string;
-        _creationTime: number;
-        content: string;
-        metadata: {
-          type: string;
-          topics: string[];
-          people: string[];
-          actionItems: string[];
-          summary: string;
-        };
-        userId: string;
-        memoryStatus?: "current" | "superseded" | "retracted";
-        isCore?: boolean;
-        validFrom?: number;
-        validTo?: number;
-        supersededAt?: number;
-        changeReason?: string;
-      };
-      const results: Thought[] = await convex.query(
-        api.models.thoughts.mcpQueries.listByUser,
-        { limit, type, topic, includeHistorical, ...scopedReads(spaceIds) },
-      );
+      const results: BrowseThought[] = await reads.browseRecent({
+        limit,
+        type,
+        topic,
+        includeHistorical,
+        spaceIds,
+      });
 
       let filtered = results;
       if (type) {
@@ -1420,33 +1201,10 @@ export function createMcpServer(
     },
     MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.getThoughts],
     async ({ spaceIds, ids }) => {
-      type Thought = {
-        _id: string;
-        userId?: string;
-        spaceId?: string;
-        content: string;
-        metadata: {
-          type: string;
-          topics: string[];
-          people: string[];
-          actionItems: string[];
-          summary: string;
-        };
-        createdAt: number;
-        updatedAt?: number;
-        memoryStatus: "current" | "superseded" | "retracted";
-        isCore?: boolean;
-        validFrom?: number;
-        validTo?: number;
-        supersededAt?: number;
-        supersededBy?: string;
-        supersedes?: string[];
-        changeReason?: string;
-      };
-      const results: Thought[] = await convex.action(
-        api.models.thoughts.mcpActions.getByIds,
-        { ids: ids as never, ...scopedReads(spaceIds) },
-      );
+      const results: FullThought[] = await reads.getThoughts({
+        ids,
+        spaceIds,
+      });
 
       if (results.length === 0) {
         return {
@@ -1563,31 +1321,14 @@ export function createMcpServer(
         };
       }
 
-      type IndexRow = {
-        _id: string;
-        userId?: string;
-        spaceId?: string;
-        summary: string;
-        snippet: string;
-        type: string;
-        topics: string[];
-        createdAt: number;
-        memoryStatus: "current" | "superseded" | "retracted";
-        isCore?: boolean;
-        validFrom?: number;
-        validTo?: number;
-      };
-      const results: IndexRow[] = await convex.action(
-        api.models.thoughts.mcpActions.timeline,
-        {
-          ...scopedReads(spaceIds),
-          seedId: seedId as never,
-          aroundMs,
-          before,
-          after,
-          type,
-        },
-      );
+      const results: TimelineRow[] = await reads.timelineThoughts({
+        spaceIds,
+        seedId,
+        aroundMs,
+        before,
+        after,
+        type,
+      });
 
       if (results.length === 0) {
         return {
@@ -1641,10 +1382,7 @@ export function createMcpServer(
     { spaceIds: readSpacesSchema },
     MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.getStats],
     async ({ spaceIds }) => {
-      const stats = await convex.query(
-        api.models.thoughts.mcpQueries.getStats,
-        scopedReads(spaceIds),
-      );
+      const stats = await reads.getStats({ spaceIds });
 
       return {
         content: [
