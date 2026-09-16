@@ -80,6 +80,15 @@ function base64UrlToBytes(value: string): Uint8Array | null {
  * forgery filter, not the authorization boundary, and no page or route may
  * treat having passed it as having been authenticated.
  */
+function bytesToBase64Url(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary)
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replace(/=+$/, "");
+}
+
 export async function verifyKithSessionCookie(
   secret: string,
   value: string | null | undefined,
@@ -92,6 +101,13 @@ export async function verifyKithSessionCookie(
   if (!TOKEN.test(token) || !MAC.test(mac)) return null;
   const signature = base64UrlToBytes(mac);
   if (signature === null || signature.length !== 32) return null;
+  // The store compares the MAC as text. A 43-character base64url string
+  // carries two padding bits in its last character, so several strings
+  // decode to the same 32 bytes; Web Crypto would verify all of them, the
+  // store accepts exactly one. Requiring the presented text to be the
+  // canonical encoding of its own bytes keeps the two checks equivalent, and
+  // it compares public data, so timing does not matter here.
+  if (bytesToBase64Url(signature) !== mac) return null;
   const key = await crypto.subtle.importKey(
     "raw",
     new TextEncoder().encode(secret),
