@@ -13,6 +13,18 @@
 // package: `DeferredCtx` is `{ client, now }`, and every function here assumes
 // its caller opened one `SERIALIZABLE` transaction (`withKithTransaction`)
 // around it.
+//
+// `attempts` increments in two places, not one: `fail` counts a handler that
+// ran and threw, and `claim` itself counts a reclaim of a `running` row whose
+// lease expired without either `complete` or `fail` ever being called -- the
+// runner that held it died mid-handler (crashed, was killed, lost its
+// connection) rather than failing cleanly. Without the second counter, a job
+// that reliably crashes its runner reclaims forever: `max_attempts` never
+// arrives, because nothing ever increments toward it. `claim` also fails a
+// reclaim outright, without a further reclaim, once one more reclaim would
+// put `attempts` at or past `max_attempts` -- the same exhaustion boundary
+// `fail` itself applies -- so `deferred_work_attempts_check` (`attempts <=
+// max_attempts`) is never at risk from the claim path either.
 
 import { ProofError } from "../errors.js";
 import { newKithId } from "../ids.js";
@@ -203,6 +215,15 @@ export type ClaimedDeferredWork = DeferredWorkRow & {
 const DEFAULT_LEASE_MS = 60_000;
 
 /**
+ * How many expired-lease `running` rows one `claim` call fails outright, per
+ * call, before it does its own claim scan. Bounded the same way
+ * `claimWorkerJob`'s own `exhausted` CTE (`src/index.ts`) bounds its
+ * equivalent pass: this runs on every claim, so it must never hold more than
+ * a small page of rows locked.
+ */
+const RECLAIM_EXHAUSTION_BATCH_LIMIT = 25;
+
+/**
  * Claims at most one due job under `FOR UPDATE SKIP LOCKED`, the same
  * concurrency shape `kith.worker_jobs` already uses: two concurrent drains
  * racing this statement each get a different row, or one gets none, never the
@@ -210,13 +231,46 @@ const DEFAULT_LEASE_MS = 60_000;
  *
  * A row is due when it is `queued` with `run_after <= now`, or `running` with
  * an expired lease -- a drain that crashed mid-job leaves its row reclaimable
- * rather than stuck, with no separate sweep required.
+ * rather than stuck, with no separate sweep required. Reclaiming a `running`
+ * row is not free, though: it is scored as a consumed attempt the same way a
+ * handler that ran and called `fail` would be, via the `CASE` in the
+ * `UPDATE`'s `attempts` assignment below (only a `running` row's old state
+ * matches it; a freshly claimed `queued` row's attempts are untouched). Before
+ * that scan runs, a first pass moves any expired-lease `running` row that a
+ * further reclaim would push to or past `max_attempts` straight to `failed`
+ * with `last_error = 'lease expired'`, bounded by
+ * `RECLAIM_EXHAUSTION_BATCH_LIMIT` -- the same exhaustion check `fail` makes,
+ * applied here so the claim path can increment `attempts` without ever
+ * violating `deferred_work_attempts_check`.
  */
 export async function claim(
   ctx: DeferredCtx,
   options: { leaseMs?: number } = {},
 ): Promise<ClaimedDeferredWork | null> {
   const leaseMs = options.leaseMs ?? DEFAULT_LEASE_MS;
+  const now = at(ctx.now);
+
+  // A reclaim of these rows would put `attempts` at or past `max_attempts`:
+  // fail them now, without reclaiming, so the claim below never has to.
+  await exec(
+    ctx,
+    `WITH exhausted AS (
+       SELECT id FROM kith.deferred_work
+        WHERE state = 'running' AND lease_expires_at <= $1
+          AND attempts + 1 >= max_attempts
+        ORDER BY lease_expires_at, id
+        FOR UPDATE SKIP LOCKED
+        LIMIT ${RECLAIM_EXHAUSTION_BATCH_LIMIT}
+     )
+     UPDATE kith.deferred_work w
+        SET state = 'failed', attempts = attempts + 1, lease_token = NULL,
+            lease_expires_at = NULL, last_error = 'lease expired',
+            updated_at = $1
+       FROM exhausted e
+      WHERE w.id = e.id`,
+    [now],
+  );
+
   const leaseToken = randomBytes(24).toString("base64url");
   const leaseExpiresAt = ctx.now + leaseMs;
   const claimed = await row<Record<string, unknown>>(
@@ -231,11 +285,13 @@ export async function claim(
      )
      UPDATE kith.deferred_work w
         SET state = 'running', lease_token = $2, lease_expires_at = $3,
+            attempts = CASE WHEN w.state = 'running'
+                            THEN w.attempts + 1 ELSE w.attempts END,
             updated_at = $1
        FROM candidate c
       WHERE w.id = c.id
       RETURNING w.*`,
-    [at(ctx.now), leaseToken, at(leaseExpiresAt)],
+    [now, leaseToken, at(leaseExpiresAt)],
   );
   if (!claimed) return null;
   return camelRow(claimed) as ClaimedDeferredWork;

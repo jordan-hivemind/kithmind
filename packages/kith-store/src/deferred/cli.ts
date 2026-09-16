@@ -39,6 +39,10 @@ type Parsed =
   | { command: "tick"; intervalMs: number | null }
   | { command: "drain"; intervalMs: number | null; maxJobs: number | null };
 
+// The lowest `--interval-ms` this daemon accepts. Below this, a loop is a
+// busy poll against the pool rather than a periodic tick.
+const MIN_INTERVAL_MS = 1_000;
+
 function positiveInteger(value: string | undefined, flag: string): number {
   if (value === undefined || !/^[1-9][0-9]*$/.test(value)) {
     process.stderr.write(`${flag} requires a positive integer\n`);
@@ -46,6 +50,12 @@ function positiveInteger(value: string | undefined, flag: string): number {
   }
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed)) usage();
+  if (flag === "--interval-ms" && parsed < MIN_INTERVAL_MS) {
+    process.stderr.write(
+      `${flag} must be at least ${MIN_INTERVAL_MS} (busy-loops the pool below that)\n`,
+    );
+    usage();
+  }
   return parsed;
 }
 

@@ -194,6 +194,102 @@ test("a lost lease is reclaimed after it expires", { skip }, async (t) => {
   assert.equal(freshComplete.status, "completed");
 });
 
+test(
+  "a runner that dies mid-handler (not just throws) is reclaimed as one consumed attempt",
+  { skip },
+  async (t) => {
+    const f = await poolFixture(t);
+    const scheduled = await withKithTransaction(f.pool, (client) =>
+      schedule(deferredCtx(client, NOW), {
+        kind: "card_queue_tick",
+        payload: {},
+      }),
+    );
+    const firstClaim = await withKithTransaction(f.pool, (client) =>
+      claim(deferredCtx(client, NOW), { leaseMs: 100 }),
+    );
+    assert.equal(firstClaim.id, scheduled.id);
+    assert.equal(firstClaim.attempts, 0);
+
+    // The runner crashes: no complete, no fail. Once the lease expires, the
+    // next claim reclaims the row under a fresh lease token, and that
+    // reclaim itself counts as a consumed attempt -- a crash must cost the
+    // same retry budget a thrown error handled by `fail` would.
+    const reclaimed = await withKithTransaction(f.pool, (client) =>
+      claim(deferredCtx(client, NOW + 200), { leaseMs: 100 }),
+    );
+    assert.equal(reclaimed.id, scheduled.id);
+    assert.equal(reclaimed.attempts, 1);
+    assert.notEqual(reclaimed.leaseToken, firstClaim.leaseToken);
+
+    // Crash again; the second reclaim counts a second attempt.
+    const reclaimedAgain = await withKithTransaction(f.pool, (client) =>
+      claim(deferredCtx(client, NOW + 400), { leaseMs: 100 }),
+    );
+    assert.equal(reclaimedAgain.id, scheduled.id);
+    assert.equal(reclaimedAgain.attempts, 2);
+  },
+);
+
+test(
+  "a runner that keeps dying is failed, with 'lease expired', once max_attempts is reached, and is not claimed again",
+  { skip },
+  async (t) => {
+    const f = await poolFixture(t);
+    const scheduled = await withKithTransaction(f.pool, (client) =>
+      schedule(deferredCtx(client, NOW), {
+        kind: "card_queue_tick",
+        payload: {},
+        maxAttempts: 3,
+      }),
+    );
+
+    let now = NOW;
+    const claimed = await withKithTransaction(f.pool, (client) =>
+      claim(deferredCtx(client, now), { leaseMs: 100 }),
+    );
+    assert.equal(claimed.id, scheduled.id);
+
+    // Two crashes reclaim normally, each consuming one attempt.
+    now += 200;
+    const secondClaim = await withKithTransaction(f.pool, (client) =>
+      claim(deferredCtx(client, now), { leaseMs: 100 }),
+    );
+    assert.equal(secondClaim.attempts, 1);
+
+    now += 200;
+    const thirdClaim = await withKithTransaction(f.pool, (client) =>
+      claim(deferredCtx(client, now), { leaseMs: 100 }),
+    );
+    assert.equal(thirdClaim.attempts, 2);
+
+    // A further reclaim would push attempts to 3, at max_attempts: the row
+    // is failed instead of reclaimed a third time, so `claim` never has to
+    // write an `attempts` value the `deferred_work_attempts_check`
+    // constraint (attempts <= max_attempts) would reject.
+    now += 200;
+    const noCandidate = await withKithTransaction(f.pool, (client) =>
+      claim(deferredCtx(client, now)),
+    );
+    assert.equal(noCandidate, null);
+
+    const failed = await withKithTransaction(f.pool, (client) =>
+      get(deferredCtx(client, now), scheduled.id),
+    );
+    assert.equal(failed.state, "failed");
+    assert.equal(failed.attempts, 3);
+    assert.equal(failed.lastError, "lease expired");
+    assert.equal(failed.leaseToken, null);
+    assert.equal(failed.leaseExpiresAt, null);
+
+    // A failed, exhausted row is never claimed again.
+    const again = await withKithTransaction(f.pool, (client) =>
+      claim(deferredCtx(client, now + 10_000)),
+    );
+    assert.equal(again, null);
+  },
+);
+
 test("a failing handler backs off and stops at max attempts", { skip }, async (t) => {
   const f = await poolFixture(t);
   const scheduled = await withKithTransaction(f.pool, (client) =>

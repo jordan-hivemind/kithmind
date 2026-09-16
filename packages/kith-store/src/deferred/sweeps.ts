@@ -109,14 +109,20 @@ const WORKER_PROTOCOL_SWEEP_BATCH_SIZE = 200;
  * holds a table's rows locked for long, but not checkpointed across ticks the
  * way the Convex version had to be.
  *
- * Also not ported: the cross-reference checks Convex's sweep made before
- * deleting a row past its retire time (a live assessment still pinning a scan,
- * an `ingestJobs` row still owning a `workerDiscoveryWork` row, and so on).
- * `retire_at` on these tables is already the row's own liveness marker at
- * read time -- `src/workers/discovery.ts`, `jobs.ts` and `parsedJobs.ts` all
- * treat `retireAt <= now` as expired before this sweep ever runs -- so a
- * direct delete once a row is past it is safe by the same reasoning the write
- * paths already rely on, not a new assumption this sweep introduces.
+ * Two of Convex's cross-reference checks are ported after all, because they
+ * are not merely a liveness convention this sweep can trust the write paths
+ * to have already applied: they are `DEFERRABLE INITIALLY DEFERRED` foreign
+ * keys with no `ON DELETE` clause (migration 004), so a delete that ignores
+ * them does not fail loudly at the `DELETE` -- it fails silently until
+ * `COMMIT`, at which point the whole sweep transaction aborts, every tick,
+ * forever, until the referencing row itself goes away. `kith.source_inventory`
+ * (`first_seen_scan_id`, `last_seen_scan_id`, `missing_since_scan_id`) and
+ * `kith.ingest_jobs` (`worker_discovery_work_id`) both hold such references
+ * into the tables below, and neither is a table this sweep drains, so a scan
+ * or discovery-work row can age past `retire_at` while something durable
+ * still points to it. `deleteByRetireAt` below excludes exactly those two
+ * referenced sets with `NOT EXISTS` subqueries; every other cross-reference
+ * Convex checked is still not ported, for the reason above.
  *
  * Delete order matters where a foreign key has no `ON DELETE CASCADE`
  * (migration 008): children before parents, so a scan's pages and entries are
@@ -134,13 +140,17 @@ export async function removeExpiredWorkerProtocolState(
   let removed = 0;
   let remaining = false;
 
-  const deleteByRetireAt = async (table: string) => {
+  // `guard`, when given, is a `NOT EXISTS (...)` clause (referencing the
+  // candidate row as `t`) that excludes a row still referenced by a durable
+  // table this sweep does not itself drain -- see the module comment above.
+  const deleteByRetireAt = async (table: string, guard?: string) => {
+    const guardClause = guard ? ` AND ${guard}` : "";
     const doomed = await rows<{ id: string }>(
       ctx,
       `WITH doomed AS (
-         SELECT id FROM kith.${table}
-          WHERE retire_at <= $1
-          ORDER BY retire_at, id
+         SELECT t.id FROM kith.${table} t
+          WHERE t.retire_at <= $1${guardClause}
+          ORDER BY t.retire_at, t.id
           LIMIT $2
        )
        DELETE FROM kith.${table} w USING doomed d
@@ -173,10 +183,37 @@ export async function removeExpiredWorkerProtocolState(
   // Children before parents: worker_discovery_work references
   // worker_scan_entries, which references worker_scan_pages, which
   // references worker_source_scans (migration 008's FKs, none cascading).
-  await deleteByRetireAt("worker_discovery_work");
+  //
+  // Two of those parents are also referenced from outside this table set,
+  // by durable rows this sweep never deletes (migration 004's FKs, also
+  // none cascading): a discovery-work row an `ingest_jobs` row still points
+  // to via `worker_discovery_work_id`, and a scan a `source_inventory` row
+  // still points to via `first_seen_scan_id`, `last_seen_scan_id` or
+  // `missing_since_scan_id`. Deleting either past its own `retire_at`
+  // regardless would leave the referencing row dangling, which Postgres
+  // only catches at `COMMIT` (both FKs are `DEFERRABLE INITIALLY DEFERRED`)
+  // -- aborting this sweep's whole transaction, every tick, for as long as
+  // the reference exists. The guards below keep a referenced row past its
+  // own retirement instead; it becomes collectible the moment the reference
+  // is gone.
+  await deleteByRetireAt(
+    "worker_discovery_work",
+    `NOT EXISTS (
+       SELECT 1 FROM kith.ingest_jobs ij
+        WHERE ij.worker_discovery_work_id = t.id
+     )`,
+  );
   await deleteByRetireAt("worker_scan_entries");
   await deleteByRetireAt("worker_scan_pages");
-  await deleteByRetireAt("worker_source_scans");
+  await deleteByRetireAt(
+    "worker_source_scans",
+    `NOT EXISTS (
+       SELECT 1 FROM kith.source_inventory si
+        WHERE si.first_seen_scan_id = t.id
+           OR si.last_seen_scan_id = t.id
+           OR si.missing_since_scan_id = t.id
+     )`,
+  );
 
   // Independent tables: no other ported table's FK references these.
   await deleteByLeaseExpiresAt("worker_reservation_targets");

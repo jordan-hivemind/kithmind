@@ -192,6 +192,164 @@ async function insertReservationTarget(client, spaceId, leaseExpiresAt) {
   return id;
 }
 
+/** A `worker_source_scans` row with no pages or entries: the minimal valid
+ * row (migration 008's required columns), used both as a scan
+ * `source_inventory` still points to and as an unreferenced sibling. */
+async function insertScan(client, f, { retireAt, requestId }) {
+  const id = newKithId();
+  await client.query(
+    `INSERT INTO kith.worker_source_scans
+       (id, space_id, created_at, source_account_id, request_id, request_digest,
+        watcher_id, connector_version, mode, inventory_epoch, manifest_version_at_begin,
+        actor_user_id, actor_credential_id, state, next_page_ordinal,
+        next_reconcile_ordinal, inventory_done, page_count, entry_count,
+        changed_count, gap_count, review_count, started_at, expires_at, retire_at)
+     VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,
+       'fixture-watcher','fixture-connector','normal',0,0,$6,$7,'enumerated',
+       1,1,true,0,0,0,0,0,$8,$8,$9)`,
+    [
+      id,
+      f.spaceId,
+      f.sourceAccountId,
+      requestId,
+      `${requestId}-digest`,
+      f.userId,
+      f.principal.credentialId,
+      new Date(NOW),
+      retireAt,
+    ],
+  );
+  return id;
+}
+
+async function insertSourceItem(client, spaceId) {
+  const id = newKithId();
+  await client.query(
+    "INSERT INTO kith.source_items (id, space_id, created_at) VALUES ($1,$2,transaction_timestamp())",
+    [id, spaceId],
+  );
+  return id;
+}
+
+async function insertSourceInventory(client, spaceId, column, scanId) {
+  const id = newKithId();
+  await client.query(
+    `INSERT INTO kith.source_inventory (id, space_id, created_at, ${column})
+     VALUES ($1,$2,transaction_timestamp(),$3)`,
+    [id, spaceId, scanId],
+  );
+  return id;
+}
+
+/** A full `worker_discovery_work` chain (scan, page, entry, work row), the
+ * minimal valid rows migrations 008 and 010 require. `chainRetireAt` governs
+ * the backing scan/page/entry so the chain's own foreign keys stay
+ * satisfiable regardless of what this sweep does to the work row itself;
+ * `workRetireAt` governs only the work row, which is this test's actual
+ * subject. */
+async function insertDiscoveryWork(
+  client,
+  f,
+  sourceItemId,
+  { chainRetireAt, workRetireAt, requestId },
+) {
+  const scanId = newKithId();
+  const pageId = newKithId();
+  const entryId = newKithId();
+  const workId = newKithId();
+  const now = new Date(NOW);
+  await client.query(
+    `INSERT INTO kith.worker_source_scans
+       (id, space_id, created_at, source_account_id, request_id, request_digest,
+        watcher_id, connector_version, mode, inventory_epoch, manifest_version_at_begin,
+        actor_user_id, actor_credential_id, state, next_page_ordinal,
+        next_reconcile_ordinal, inventory_done, page_count, entry_count,
+        changed_count, gap_count, review_count, started_at, expires_at, retire_at)
+     VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,
+       'fixture-watcher','fixture-connector','normal',0,0,$6,$7,'enumerated',
+       1,1,true,1,1,0,0,0,$8,$9,$9)`,
+    [
+      scanId,
+      f.spaceId,
+      f.sourceAccountId,
+      requestId,
+      `${requestId}-digest`,
+      f.userId,
+      f.principal.credentialId,
+      now,
+      chainRetireAt,
+    ],
+  );
+  await client.query(
+    `INSERT INTO kith.worker_scan_pages
+       (id, space_id, created_at, source_account_id, scan_id, ordinal,
+        request_id, entry_count, created_at_field, retire_at)
+     VALUES ($1,$2,transaction_timestamp(),$3,$4,0,$5,1,$6,$7)`,
+    [pageId, f.spaceId, f.sourceAccountId, scanId, `${requestId}-page`, now, chainRetireAt],
+  );
+  await client.query(
+    `INSERT INTO kith.worker_scan_entries
+       (id, space_id, created_at, source_account_id, scan_id, scan_page_id,
+        source_item_id, identity_key_hash, uri_digest, inventory_metadata_digest,
+        source_modified_at, state, observed_at, retire_at)
+     VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6,$7,$8,$9,$10,'queued',$10,$11)`,
+    [
+      entryId,
+      f.spaceId,
+      f.sourceAccountId,
+      scanId,
+      pageId,
+      sourceItemId,
+      `${requestId}-identity`,
+      `${requestId}-uri`,
+      `${requestId}-meta`,
+      now,
+      chainRetireAt,
+    ],
+  );
+  await client.query(
+    `INSERT INTO kith.worker_discovery_work
+       (id, space_id, created_at, source_account_id, source_item_id, scan_id,
+        scan_entry_id, observation_epoch, processing_epoch, state, content_hash,
+        byte_length, captured_at, source_modified_at, media_type, profile_id,
+        extraction_fingerprint, extractor_fingerprint, record_schema_fingerprint,
+        normalization_fingerprint, chunker_fingerprint, uri, actor_user_id,
+        actor_credential_id, attempts, lease_epoch, created_at_field, retire_at)
+     VALUES ($1,$2,transaction_timestamp(),$3,$4,$5,$6,1,1,'admitted',$7,
+       1,$8,$8,'application/pdf','fixture-profile','fixture-extraction',
+       'fixture-extractor','fixture-records','fixture-normalization',
+       'fixture-chunker','fixture://parsed',$9,$10,1,1,$8,$11)`,
+    [
+      workId,
+      f.spaceId,
+      f.sourceAccountId,
+      sourceItemId,
+      scanId,
+      entryId,
+      "a".repeat(64),
+      now,
+      f.userId,
+      f.principal.credentialId,
+      workRetireAt,
+    ],
+  );
+  await client.query(
+    "UPDATE kith.worker_scan_entries SET discovery_work_id = $1 WHERE id = $2",
+    [workId, entryId],
+  );
+  return { workId, scanId, pageId, entryId };
+}
+
+async function insertIngestJobReferencingWork(client, f, workId) {
+  const id = newKithId();
+  await client.query(
+    `INSERT INTO kith.ingest_jobs (id, space_id, created_at, worker_discovery_work_id)
+     VALUES ($1,$2,transaction_timestamp(),$3)`,
+    [id, f.spaceId, workId],
+  );
+  return id;
+}
+
 test(
   "removeExpiredWorkerProtocolState deletes only rows past their own expiry, bounded",
   { skip },
@@ -258,6 +416,91 @@ test(
       [liveReceipt],
     );
     void expiredReceipts;
+  },
+);
+
+test(
+  "removeExpiredWorkerProtocolState keeps a scan or discovery-work row a durable row still references, and its transaction commits",
+  { skip },
+  async (t) => {
+    const f = await sourceFixture(t);
+    const past = new Date(NOW - 1_000);
+    const future = new Date(NOW + 60_000);
+
+    // A scan past its own retire_at, but still pointed to by a durable
+    // source_inventory row: without the guard, deleting it would leave that
+    // row's deferred foreign key dangling at COMMIT.
+    const referencedScanId = await insertScan(f.client, f, {
+      retireAt: past,
+      requestId: "referenced-scan",
+    });
+    await insertSourceInventory(
+      f.client,
+      f.spaceId,
+      "first_seen_scan_id",
+      referencedScanId,
+    );
+
+    // An unreferenced sibling scan past its own retire_at: nothing durable
+    // points to it, so the sweep is still free to delete it.
+    const unreferencedScanId = await insertScan(f.client, f, {
+      retireAt: past,
+      requestId: "unreferenced-scan",
+    });
+
+    // A discovery-work row past its own retire_at, but still pointed to by a
+    // durable ingest_jobs row. Its own backing scan/page/entry chain is kept
+    // live (a future retire_at) so this case isolates the defect under test:
+    // the work row's own foreign keys to that chain are not at risk here.
+    const referencedItemId = await insertSourceItem(f.client, f.spaceId);
+    const referencedWork = await insertDiscoveryWork(
+      f.client,
+      f,
+      referencedItemId,
+      { chainRetireAt: future, workRetireAt: past, requestId: "referenced-work" },
+    );
+    await insertIngestJobReferencingWork(f.client, f, referencedWork.workId);
+
+    // An unreferenced sibling discovery-work row, chain included, all past
+    // retirement: nothing durable points to any of it.
+    const unreferencedItemId = await insertSourceItem(f.client, f.spaceId);
+    const unreferencedWork = await insertDiscoveryWork(
+      f.client,
+      f,
+      unreferencedItemId,
+      { chainRetireAt: past, workRetireAt: past, requestId: "unreferenced-work" },
+    );
+
+    // Before the fix, this transaction would abort at COMMIT with a foreign
+    // key violation the moment the referenced scan or work row was deleted.
+    const result = await withKithTransaction(f.pool, (client) =>
+      removeExpiredWorkerProtocolState(deferredCtx(client, NOW)),
+    );
+    assert.equal(result.removed, 5); // unreferenced scan + work + entry + page + scan
+
+    const scans = await f.client.query(
+      "SELECT id FROM kith.worker_source_scans",
+    );
+    const scanIds = scans.rows.map((row) => row.id);
+    assert.ok(scanIds.includes(referencedScanId));
+    assert.ok(!scanIds.includes(unreferencedScanId));
+
+    const work = await f.client.query(
+      "SELECT id FROM kith.worker_discovery_work",
+    );
+    const workIds = work.rows.map((row) => row.id);
+    assert.ok(workIds.includes(referencedWork.workId));
+    assert.ok(!workIds.includes(unreferencedWork.workId));
+
+    // A second, unbounded pass is still a no-op on the referenced rows: they
+    // stay kept for as long as the reference exists, not just on the first
+    // pass.
+    const rest = await withKithTransaction(f.pool, (client) =>
+      removeExpiredWorkerProtocolState(deferredCtx(client, NOW), {
+        limit: 1_000,
+      }),
+    );
+    assert.equal(rest.removed, 0);
   },
 );
 
