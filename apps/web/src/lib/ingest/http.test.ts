@@ -11,7 +11,10 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("@/lib/mcp/auth", () => ({
-  authenticateApiKeyOnConvex: mocks.authenticateApiKey,
+  // i4 deleted the flag-ignoring authenticator; the route now uses the one
+  // surface-aware entry point. These cases still describe the Convex leg,
+  // which is what `KITH_POSTGRES_SURFACE` defaults to.
+  authenticateApiKey: mocks.authenticateApiKey,
 }));
 
 vi.mock("@/lib/mcp/convex-auth", () => ({

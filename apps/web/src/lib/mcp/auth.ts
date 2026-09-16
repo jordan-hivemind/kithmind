@@ -43,9 +43,11 @@
 // 503 `authentication_unavailable`. A 401 for an outage would tell a client its
 // credential is bad and send it back through the OAuth flow.
 //
-// `/api/ingest` and `/api/worker` do not use this function. They still do all of
-// their work through Convex, so they call `authenticateApiKeyOnConvex` below
-// until row i4 ports them; see the comment there.
+// `/api/ingest` and `/api/worker` use this function too, as of row i4. i2 had
+// pinned them to Convex with a second authenticator that ignored the flag,
+// because a credential resolved against `kith.api_keys` must not authorize work
+// on Convex data. i4 moves each route's work and its authentication together, so
+// the pin and the second authenticator are gone and there is one way in again.
 
 import { api } from "@repo/db/convex/_generated/api";
 import { withKithTransaction } from "@repo/kith-store";
@@ -112,25 +114,4 @@ export async function authenticateApiKey(
   return kithPostgresSurface() === "postgres"
     ? await authenticateThroughPostgres(rawKey)
     : await authenticateThroughConvex(rawKey);
-}
-
-/**
- * Authentication for a route whose work has not moved yet. i4 deletes it.
- *
- * `/api/ingest` and `/api/worker` resolve a bearer here and then do all of their
- * work through Convex with a minted Convex token. If those two routes followed
- * the surface flag they would, under `postgres`, check the credential against
- * `kith.api_keys` and then act on Convex data on the strength of it. That is the
- * cross-surface mix `server.ts` refuses for exactly the same reason: a
- * credential one backend never checked must not authorize work in that backend.
- *
- * So they are pinned to Convex until row i4 ports them, which is the slice that
- * moves both routes and can flip them together with the work they do. The flag
- * is deliberately not read here; a route is not half-ported.
- */
-export async function authenticateApiKeyOnConvex(
-  authHeader: string | null,
-): Promise<McpIdentity | null> {
-  if (!authHeader?.startsWith("Bearer ")) return null;
-  return await authenticateThroughConvex(authHeader.slice(7));
 }

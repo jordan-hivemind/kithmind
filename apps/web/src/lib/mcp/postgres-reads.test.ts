@@ -1382,36 +1382,10 @@ describeWithDatabase("MCP read tools on PostgreSQL", () => {
     });
   });
 
-  test("write and ingest tools still refuse, naming the row that ports them", async () => {
-    for (const [name, args] of [
-      [
-        "remember_fact",
-        {
-          subject: { kind: "person", name: "Rowan" },
-          predicate: "home_city",
-          value: { type: "text", value: "Albany" },
-          sourceType: "user_stated",
-        },
-      ],
-      ["capture_thought", { content: "Synthetic", sourceType: "user_stated" }],
-      [
-        "ingest_url",
-        {
-          requestId: "synthetic-1",
-          source: {
-            connector: "mcp-client",
-            accountId: "synthetic",
-            externalId: "synthetic",
-          },
-          url: "https://example.test/synthetic",
-        },
-      ],
-    ] as Array<[string, Record<string, unknown>]>) {
-      const result = await onPostgres(name, args);
-      expect(result.isError, name).toBe(true);
-      expect(text(result)).toContain("P2-39i4");
-    }
-  });
+  // i3's case here asserted that the write and ingest tools refused with a
+  // message naming row P2-39i4. i4 ported them, so the refusal is gone and the
+  // property moved to `postgres-writes.test.ts`, which drives all three
+  // against this same kind of fixture.
 
   test("a credential revoked between two calls denies on the second", async () => {
     const revoked = await inTransaction(async (ctx) => {

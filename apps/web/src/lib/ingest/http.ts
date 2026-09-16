@@ -290,7 +290,15 @@ export function backendIngestError(error: unknown): IngestHttpError {
   return new IngestHttpError(500, "ingest_failed", "Ingestion failed");
 }
 
-function structuredBackendIngestError(
+/**
+ * One published code, as its published status.
+ *
+ * Exported since i4: the PostgreSQL leg of `/api/ingest` classifies its own
+ * refusal with `@repo/kith-store`'s `inlineIngestErrorCode` -- the same closed
+ * code set, derived from the messages that package throws -- and then reaches
+ * this same table, so both surfaces answer one contract from one mapping.
+ */
+export function structuredBackendIngestError(
   code: InlineIngestErrorCode,
 ): IngestHttpError {
   switch (code) {

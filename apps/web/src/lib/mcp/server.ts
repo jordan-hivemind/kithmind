@@ -1,6 +1,4 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { api } from "@repo/db/convex/_generated/api";
-import type { Id } from "@repo/db/convex/_generated/dataModel";
 import { parseSpaceReadErrorData } from "@repo/db/convex/lib/spaceReadErrors";
 import {
   FINANCE_READ_TOOL_DESCRIPTION,
@@ -26,7 +24,6 @@ import {
 import type { WithMcpPrincipal } from "./principal";
 import {
   type BrowseThought,
-  type ConvexGateway,
   convexReads,
   type FactResult,
   type FullThought,
@@ -35,6 +32,12 @@ import {
   type TimelineRow,
 } from "./reads";
 import { recordQuerySchema } from "./record-query";
+import {
+  convexWrites,
+  type FactValueArg,
+  type McpWrites,
+  postgresWrites,
+} from "./writes";
 
 export const SERVER_INSTRUCTIONS = `Kith Mind stores family knowledge as structured facts, narrative thoughts, and indexed source documents with retained evidence.
 
@@ -346,10 +349,9 @@ function financeToolError(error: unknown) {
 /**
  * What the server was handed to act as.
  *
- * Under `convex` it is the short-lived identity token `/api/mcp` mints, which is
- * what the write and ingest tools still authenticate with until i4 ports them.
- * Under `postgres` it is a loader, not a principal: section 3.3's rule is that
- * each call reloads the credential inside its own transaction, so the server is
+ * Under `convex` it is the short-lived identity token `/api/mcp` mints. Under
+ * `postgres` it is a loader, not a principal: section 3.3's rule is that each
+ * call reloads the credential inside its own transaction, so the server is
  * given the means to do that and never a snapshot to trust.
  *
  * A bare string is the `convex` form. It is accepted so that call sites written
@@ -359,24 +361,6 @@ function financeToolError(error: unknown) {
 export type McpServerCredential =
   | { surface: "convex"; convexAuthToken: string }
   | { surface: "postgres"; withPrincipal: WithMcpPrincipal };
-
-/**
- * The gateway for the tools this surface has not ported yet.
- *
- * i3 moves the 14 read tools. `remember_fact`, `capture_thought` and
- * `ingest_url` are i4's, so under `postgres` they still have nothing to run
- * against and fail with a message naming the row that owns them. They must not
- * fall back to Convex: a deployment reading PostgreSQL identities would then
- * answer tool calls with Convex data for a credential Convex never checked.
- */
-function unportedConvexGateway(): ConvexGateway {
-  const refuse = (): never => {
-    throw new Error(
-      "MCP write and ingest tools do not reach PostgreSQL yet; row P2-39i4 ports them",
-    );
-  };
-  return { query: refuse, mutation: refuse, action: refuse };
-}
 
 export function createMcpServer(
   credential: McpServerCredential | string,
@@ -388,8 +372,8 @@ export function createMcpServer(
       ? { surface: "convex", convexAuthToken: credential }
       : credential;
 
-  let convex: ConvexGateway;
   let reads: McpReads;
+  let writes: McpWrites;
   if (bound.surface === "convex") {
     const convexUrl = process.env.NEXT_PUBLIC_CONVEX_URL;
     if (!convexUrl) {
@@ -397,11 +381,11 @@ export function createMcpServer(
     }
     const client = new ConvexHttpClient(convexUrl);
     client.setAuth(bound.convexAuthToken);
-    convex = client;
     reads = convexReads(client);
+    writes = convexWrites(client);
   } else {
-    convex = unportedConvexGateway();
     reads = postgresReads(bound.withPrincipal);
+    writes = postgresWrites(bound.withPrincipal);
   }
 
   /**
@@ -561,17 +545,10 @@ export function createMcpServer(
     },
     MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.ingestUrl],
     async ({ spaceId, ...input }) => {
-      const result = await convex.mutation(
-        api.models.ingestion.urlQueue.enqueue,
-        {
-          input: {
-            ...input,
-            ...(spaceId === undefined
-              ? {}
-              : { spaceId: spaceId as Id<"spaces"> }),
-          },
-        },
-      );
+      const result = await writes.ingestUrl({
+        ...input,
+        ...(spaceId === undefined ? {} : { spaceId }),
+      });
       return {
         content: [{ type: "text" as const, text: JSON.stringify(result) }],
       };
@@ -832,27 +809,22 @@ export function createMcpServer(
               value: parseValidityTimestamp(value.value),
             }
           : value;
-      const result: {
-        factId: string;
-        statement: string;
-        operation: "stored" | "noop" | "superseded" | "corrected";
-      } = await convex.mutation(api.models.facts.mcpActions.remember, {
-        spaceId: spaceId as Id<"spaces"> | undefined,
+      const result = await writes.rememberFact({
+        ...(spaceId === undefined ? {} : { spaceId }),
         subject,
         predicate,
-        value: convertedValue,
+        value: convertedValue as FactValueArg,
         sourceType,
-        sourceRef,
-        observedAt:
-          observedAt === undefined
-            ? undefined
-            : parseValidityTimestamp(observedAt),
-        batchId,
-        isCore,
+        ...(sourceRef === undefined ? {} : { sourceRef }),
+        ...(observedAt === undefined
+          ? {}
+          : { observedAt: parseValidityTimestamp(observedAt) }),
+        ...(batchId === undefined ? {} : { batchId }),
+        ...(isCore === undefined ? {} : { isCore }),
         ...validity,
         cardinality,
         changeKind,
-        changeReason,
+        ...(changeReason === undefined ? {} : { changeReason }),
       });
       return {
         content: [
@@ -1477,41 +1449,19 @@ export function createMcpServer(
       validTo,
       isCore,
     }) => {
-      type CaptureResult = {
-        thoughtId?: string;
-        metadata: {
-          type: string;
-          topics: string[];
-          people: string[];
-          actionItems: string[];
-          summary: string;
-        };
-        disposition:
-          | "stored"
-          | "duplicate"
-          | "superseded"
-          | "corrected"
-          | "needs_confirmation"
-          | "skipped";
-        operationSummary?: string;
-      };
       const validity = parseValidityWindow(validFrom, validTo);
-      const result: CaptureResult = await convex.action(
-        api.models.thoughts.mcpActions.capture,
-        {
-          spaceId: spaceId as Id<"spaces"> | undefined,
-          content,
-          ...validity,
-          isCore,
-          sourceType,
-          sourceRef,
-          observedAt:
-            observedAt === undefined
-              ? undefined
-              : parseValidityTimestamp(observedAt),
-          batchId,
-        },
-      );
+      const result = await writes.captureThought({
+        ...(spaceId === undefined ? {} : { spaceId }),
+        content,
+        ...validity,
+        ...(isCore === undefined ? {} : { isCore }),
+        ...(sourceType === undefined ? {} : { sourceType }),
+        ...(sourceRef === undefined ? {} : { sourceRef }),
+        ...(observedAt === undefined
+          ? {}
+          : { observedAt: parseValidityTimestamp(observedAt) }),
+        ...(batchId === undefined ? {} : { batchId }),
+      });
 
       const stored = [
         "stored",
