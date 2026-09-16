@@ -9,6 +9,12 @@
 // any lock, for longer than its own work needs, and a crash mid-handler must
 // leave the claim's lease -- not an open transaction -- as the only thing to
 // recover.
+//
+// A pooled handler (`registry.ts`) goes one step further and gets no
+// transaction at all, because its work includes an outbound call that no `pg`
+// connection may be held across. The claim and the outcome are still recorded
+// in their own transactions either way, so the queue protocol is identical for
+// both scopes.
 
 import type { Pool } from "pg";
 
@@ -21,7 +27,7 @@ import {
   deferredCtx,
   type DeferredWorkRow,
 } from "./core.js";
-import type { DeferredWorkRegistry } from "./registry.js";
+import { isPooledHandler, type DeferredWorkRegistry } from "./registry.js";
 
 export type DrainOutcome =
   | { id: string; kind: string; status: "completed" }
@@ -87,8 +93,8 @@ async function runOne(
   job: DeferredWorkRow & { leaseToken: string },
   fixedNow?: number,
 ): Promise<DrainOutcome> {
-  const handler = registry.get(job.kind);
-  if (!handler) {
+  const entry = registry.get(job.kind);
+  if (!entry) {
     await withKithQueueTransaction(pool, (client) =>
       failWithoutAttempt(deferredCtx(client, fixedNow ?? Date.now()), {
         id: job.id,
@@ -99,14 +105,21 @@ async function runOne(
     return { id: job.id, kind: job.kind, status: "unregistered_kind" };
   }
   try {
-    // The handler runs its own work in its own transaction(s): it receives a
-    // fresh `DeferredCtx` per call rather than sharing the claim's, because a
-    // handler that stages many rows needs the same per-statement transaction
-    // boundary every other ported service uses, not one transaction sized to
-    // the whole job.
-    await withKithTransaction(pool, (client) =>
-      handler(deferredCtx(client, fixedNow ?? Date.now()), job.payload, job),
-    );
+    if (isPooledHandler(entry)) {
+      // Nothing is open across this call. The handler owns every transaction
+      // its work needs and keeps each one on its own side of the outbound
+      // call it makes; see the scope table in `registry.ts`.
+      await entry.run(pool, job.payload, job);
+    } else {
+      // The handler runs its own work in its own transaction(s): it receives a
+      // fresh `DeferredCtx` per call rather than sharing the claim's, because a
+      // handler that stages many rows needs the same per-statement transaction
+      // boundary every other ported service uses, not one transaction sized to
+      // the whole job.
+      await withKithTransaction(pool, (client) =>
+        entry(deferredCtx(client, fixedNow ?? Date.now()), job.payload, job),
+      );
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const result = await withKithQueueTransaction(pool, (client) =>

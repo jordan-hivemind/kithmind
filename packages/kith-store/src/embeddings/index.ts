@@ -39,19 +39,29 @@ export {
   EMBEDDING_NORMALIZATION,
   EMBEDDING_PREPROCESSING,
   EMBEDDING_PROTOCOL,
+  EMBEDDING_PROVIDER_REQUEST_ERROR,
+  EMBEDDING_PROVIDER_UNCONFIGURED_ERROR,
   embeddingProfile,
   fingerprintEmbeddingConfig,
   loadEmbeddingConfig,
+  providerBatchEmbedder,
   requestEmbedding,
   utf8ByteLength,
 } from "./provider.js";
 export type {
+  BatchEmbedder,
   EmbeddingConfig,
   EmbeddingEnvironment,
   EmbeddingFetch,
   EmbeddingProfile,
   EmbeddingResult,
 } from "./provider.js";
+
+export {
+  embeddingFillDedupeKey,
+  runEmbeddingFillJob,
+  scheduleEmbeddingFill,
+} from "./fillWork.js";
 
 export { embeddingVectorScopeV2, embeddingVectorSearchScope } from "./scope.js";
 export type { EmbeddingTargetKind } from "./scope.js";
