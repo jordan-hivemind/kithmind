@@ -137,6 +137,28 @@ export async function upsertCoverageWindow(
     (f.skippedCount !== 0 || f.indexedCount !== f.discoveredCount)
   )
     throw new Error("Complete coverage must index every discovered item");
+  // Two concurrent upserts of one window identity must converge on one row.
+  // Nothing structural enforces that: `coverage_windows_lookup_idx` is not
+  // unique, and `ON CONFLICT (id)` below only catches a repeat of an id this
+  // read already found. Without this lock, two writers that both read "no
+  // row" each insert a fresh id, and it is left to SERIALIZABLE's rw-conflict
+  // detection to abort one of them; under load it can abort both, and their
+  // retries re-collide on the same empty read. A transaction-scoped advisory
+  // lock on the identity makes the second writer wait for the first to
+  // commit, so its (at most one) serialization retry starts from a snapshot
+  // that already holds the row and takes the update path. Transaction scoped,
+  // never session scoped: the pooled endpoint's caveat in the consolidation
+  // plan, section 2.8.
+  await ctx.client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [
+    [
+      "kith.coverage_windows",
+      f.sourceAccountId,
+      rt,
+      f.entityId ?? "",
+      date(f.from).toISOString(),
+      date(f.to).toISOString(),
+    ].join("\u001f"),
+  ]);
   const existing = await ctx.client.query<QueryResultRow>(
     'SELECT id,space_id FROM kith.coverage_windows WHERE source_account_id=$1 AND record_type=$2 AND entity_id IS NOT DISTINCT FROM $3 AND "from"=$4 AND "to"=$5 LIMIT 2',
     [f.sourceAccountId, rt, f.entityId ?? null, date(f.from), date(f.to)],

@@ -41,6 +41,11 @@
       "types": "./src/coverage/index.ts",
       "node": "./dist/coverage/index.js",
       "default": "./src/coverage/index.ts"
+    },
+    "./eval": {
+      "types": "./src/eval/index.ts",
+      "node": "./dist/eval/index.js",
+      "default": "./src/eval/index.ts"
     }
   },
   "scripts": {

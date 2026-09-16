@@ -265,22 +265,27 @@ export const KITH_IDLE_TRANSACTION_TIMEOUT_MS = 5_000;
 /**
  * Attempts a serialization failure is retried before it becomes an error.
  *
- * Kept at 3 rather than raised: the failure this backoff fixes was two
- * transactions colliding on every attempt with no delay between them, not a
- * shortage of attempts. Adding jitter fixes that; adding more attempts on top
- * of no jitter would just push the same collision one round later.
+ * Five, with the growing delay below, because the retry budget has to outlast
+ * a contending transaction on a loaded machine. The two failures that sized
+ * it: two writers colliding on every attempt with no delay between them, and
+ * a writer whose conflicting transaction was still open through three
+ * immediate retries on a CI runner where a commit round trip takes tens of
+ * milliseconds. Three attempts with a 10 ms base gave at most about 30 ms of
+ * total waiting, which is less than one such commit. Five attempts over the
+ * schedule below wait up to about 750 ms in total, still far inside the lock
+ * and statement timeouts, and only a conflicting request pays any of it.
  */
-export const KITH_SERIALIZATION_ATTEMPTS = 3;
+export const KITH_SERIALIZATION_ATTEMPTS = 5;
 
 /** Base delay before the first retry. Doubles per attempt, with full jitter. */
-export const KITH_SERIALIZATION_BACKOFF_BASE_MS = 10;
+export const KITH_SERIALIZATION_BACKOFF_BASE_MS = 25;
 
 /**
  * Upper bound on the backoff delay. Well under `KITH_LOCK_TIMEOUT_MS` (2s) and
  * `KITH_STATEMENT_TIMEOUT_MS` (5s), so a retry's wait is never what turns a
  * conflict into a timeout.
  */
-export const KITH_SERIALIZATION_BACKOFF_MAX_MS = 200;
+export const KITH_SERIALIZATION_BACKOFF_MAX_MS = 400;
 
 /**
  * The delay before retrying after the attempt-th failure: full jitter (a
