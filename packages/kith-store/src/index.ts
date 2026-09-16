@@ -43,6 +43,7 @@ export {
   kithSchemaVersion,
   kithSerializationBackoffDelayMs,
   setKithSerializationSleep,
+  withKithQueueTransaction,
   withKithReadTransaction,
   withKithTransaction,
   type KithMigration,

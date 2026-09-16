@@ -12,7 +12,7 @@
 
 import type { Pool } from "pg";
 
-import { withKithTransaction } from "../schema.js";
+import { withKithQueueTransaction, withKithTransaction } from "../schema.js";
 import {
   claim,
   complete,
@@ -66,7 +66,7 @@ export async function drain(
   };
   for (let index = 0; index < maxJobs; index += 1) {
     const now = options.now ?? Date.now();
-    const claimed = await withKithTransaction(pool, (client) =>
+    const claimed = await withKithQueueTransaction(pool, (client) =>
       claim(deferredCtx(client, now)),
     );
     if (!claimed) break;
@@ -89,7 +89,7 @@ async function runOne(
 ): Promise<DrainOutcome> {
   const handler = registry.get(job.kind);
   if (!handler) {
-    await withKithTransaction(pool, (client) =>
+    await withKithQueueTransaction(pool, (client) =>
       failWithoutAttempt(deferredCtx(client, fixedNow ?? Date.now()), {
         id: job.id,
         leaseToken: job.leaseToken,
@@ -109,7 +109,7 @@ async function runOne(
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const result = await withKithTransaction(pool, (client) =>
+    const result = await withKithQueueTransaction(pool, (client) =>
       fail(deferredCtx(client, fixedNow ?? Date.now()), {
         id: job.id,
         leaseToken: job.leaseToken,
@@ -126,7 +126,7 @@ async function runOne(
     }
     return { id: job.id, kind: job.kind, status: "exhausted" };
   }
-  await withKithTransaction(pool, (client) =>
+  await withKithQueueTransaction(pool, (client) =>
     complete(deferredCtx(client, fixedNow ?? Date.now()), {
       id: job.id,
       leaseToken: job.leaseToken,
