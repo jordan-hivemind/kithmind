@@ -19,14 +19,7 @@
 // surface plan forbids holding a `pg` connection across a provider call.
 
 export * from "./lifecycle.js";
-export {
-  fallbackThoughtMetadata,
-  MAX_CAPTURE_CONTENT_CHARS,
-  normalizeCaptureContent,
-  preflightNarrativeAdmission,
-  THOUGHT_TYPES,
-} from "./captureAdmission.js";
-export type * from "./captureAdmission.js";
+export * from "./captureAdmission.js";
 export {
   normalizeEntityKey,
   normalizeEntityName,
@@ -46,7 +39,6 @@ export {
   setCoreStatus,
   transitionMemory,
 } from "./thoughts.js";
-export * from "./captureAdmission.js";
 export {
   CAPTURE_ANALYSIS_JSON_SCHEMA,
   CAPTURE_CLASSIFIER_API_VERSION,

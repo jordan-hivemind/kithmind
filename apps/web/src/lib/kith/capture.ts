@@ -72,10 +72,15 @@
 // travel with it. The provider-free path stays exactly where Convex has it:
 // the branches taken before the classifier is consulted.
 //
-// A space with no active embedding index is not a failure. It has no vectors to
-// compare against, so the gate skips the embedding request entirely and
-// classifies against covering facts alone, which is what Convex's own vector
-// search returned on a fresh space.
+// A space whose thought index is absent or incomplete is not a failure, and it
+// is the common case rather than the edge one: a stored capture leaves its
+// target eligible and uncovered, which is exactly what makes the index report
+// itself incomplete, so the capture after any capture lands here until a fill
+// runs. The gate does not embed then -- the vector would be discarded, and the
+// memory would have been sent to a provider for nothing -- and
+// `searchCaptureCandidates` takes its keyword leg instead. The classifier is
+// never asked to judge novelty with an empty comparison set, and the store's
+// retry guard catches the byte-identical repeat that neither leg would.
 //
 // ## Seams
 //
@@ -227,7 +232,13 @@ function admissionUnavailable(content: string): CaptureThoughtResult {
 
 type Prepared =
   | { short: CaptureThoughtResult }
-  | { destination: string; content: string; fingerprint: string | null };
+  | {
+      destination: string;
+      content: string;
+      fingerprint: string | null;
+      /** One compatible fingerprint *and* a complete thought index. */
+      indexReady: boolean;
+    };
 
 export type RunCaptureOptions = {
   /**
@@ -290,34 +301,47 @@ export async function runCaptureThought(
         };
       }
 
+      // Both halves of "is there a vector search worth paying for": one
+      // compatible fingerprint across the destination, *and* a thought index
+      // that is actually complete. The second matters as much as the first,
+      // because `searchThoughtVectorCandidates` drops every candidate when
+      // `thoughtStatus` is not `"ready"` -- so without this test the memory
+      // went to the embedding provider on every capture that followed another
+      // capture, and the vector it came back with was then thrown away.
       const targets = await embeddings.getActiveTargets(ctx, [destination]);
+      const fingerprint = embeddings.compatibleSearchFingerprint(
+        [destination],
+        targets,
+      );
       return {
         destination,
         content,
-        fingerprint: embeddings.compatibleSearchFingerprint(
-          [destination],
-          targets,
-        ),
+        indexReady:
+          fingerprint !== null &&
+          targets.length === 1 &&
+          targets[0]!.thoughtStatus === "ready",
+        fingerprint,
       };
     },
   );
   if ("short" in prepared) return prepared.short;
-  const { destination, content, fingerprint } = prepared;
+  const { destination, content, fingerprint, indexReady } = prepared;
   const sourceType = args.sourceType!;
 
   // The first outbound call, outside every transaction. Skipped outright when
-  // the space has no index to search: there is nothing for the vector to find,
-  // and the memory never leaves the process.
+  // there is no complete thought index to search: `searchCaptureCandidates`
+  // takes its keyword leg instead, and the memory never leaves the process.
   let vector: readonly number[] | null = null;
-  if (fingerprint) {
+  if (indexReady && fingerprint) {
     try {
       const embedded = await (embedder ?? defaultEmbedder)(content);
       // The configured profile has to agree with the index, not merely with
       // itself.
       vector = embedded.fingerprint === fingerprint ? embedded.vector : null;
     } catch {
-      // Fail closed. Without candidates the classifier would call every
-      // duplicate new, which is worse than declining the capture.
+      // Fail closed. The index says it is complete, so the vector leg is the
+      // comparison set this capture was going to be judged against; losing it
+      // after asking for it is the admission check failing, not degrading.
       return admissionUnavailable(content);
     }
     if (!vector) return admissionUnavailable(content);
@@ -330,9 +354,14 @@ export async function runCaptureThought(
       await requireSpaceAccess(ctx, principal, destination, "read");
       await requireSpaceAccess(ctx, principal, destination, "write");
       return {
-        candidates: vector
-          ? await memory.searchCaptureCandidates(ctx, destination, vector)
-          : [],
+        // `vector` may be null; the store then takes its keyword leg, so the
+        // classifier always gets a comparison set.
+        candidates: await memory.searchCaptureCandidates(
+          ctx,
+          destination,
+          content,
+          vector,
+        ),
         coveringFacts: await memory.searchCoveringFacts(
           ctx,
           [destination],

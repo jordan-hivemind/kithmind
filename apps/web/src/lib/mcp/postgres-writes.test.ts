@@ -33,7 +33,7 @@
 //
 // The suite skips cleanly when `KITH_STORE_DATABASE_URL` is not set.
 
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -41,6 +41,7 @@ import type { WorkerProtocolErrorCode } from "@repo/db/convex/models/workers/pro
 import {
   applyKithSchema,
   createKithPool,
+  embeddings,
   newKithId,
   withKithTransaction,
   workers,
@@ -178,6 +179,249 @@ describeWithDatabase("MCP write and ingest tools on PostgreSQL", () => {
 
   function setEmbedder(next: CaptureEmbedder) {
     restoreSeams.push(setCaptureEmbedder(next));
+  }
+
+  // ---------------------------------------------------------------------------
+  // A real embedding index, seeded the way the store's own fixtures seed one.
+  //
+  // The gate's vector leg only runs when a space's thought index is complete,
+  // and a stored capture is what makes it incomplete, so a suite that never
+  // seeds one never reaches the embedder at all. These four helpers are the
+  // smallest thing that gets a space to `thoughtStatus: "ready"` and keeps it
+  // there. Raw SQL, like `seedSourceAccount` above: the writers that own these
+  // tables belong to other slices and a test that could only run after them
+  // would prove nothing about this one.
+  // ---------------------------------------------------------------------------
+
+  const DIMENSIONS = 1536;
+  /** A unit vector with a single 1. Cosine against itself is 1. */
+  function oneHot(index: number): number[] {
+    const vector = new Array<number>(DIMENSIONS).fill(0);
+    vector[index] = 1;
+    return vector;
+  }
+  const vectorLiteral = (vector: number[]) => `[${vector.join(",")}]`;
+  const sha256Hex = (value: string) =>
+    createHash("sha256").update(value, "utf8").digest("hex");
+  const scopeV2 = (spaceId: string, fingerprint: string) =>
+    JSON.stringify(["embedding-vector-scope-v2", spaceId, fingerprint, "thought"]);
+  const searchScope = (
+    spaceId: string,
+    fingerprint: string,
+    generationId: string,
+  ) =>
+    JSON.stringify([
+      "embedding-vector-scope-v1",
+      spaceId,
+      fingerprint,
+      generationId,
+      "thought",
+    ]);
+
+  type SeededIndex = { fingerprint: string; generationId: string };
+
+  /**
+   * A synthetic profile, deliberately not the production one: nothing here may
+   * pass by accidentally matching the real embedding identity. The fingerprint
+   * is computed rather than invented, because `requireGenerationProfile`
+   * recomputes it from the profile's own columns and refuses a generation
+   * whose stored fingerprint does not match.
+   */
+  const SYNTHETIC_PROFILE = {
+    protocol: "openai-embeddings-v1",
+    providerId: "synthetic",
+    model: "synthetic-embed-small",
+    modelRevision: "synthetic-rev-1",
+    dimensions: DIMENSIONS,
+    normalization: "none-v1",
+    preprocessing: "none-v1",
+  } as const;
+
+  /** An active generation with zeroed counters, so captures build the counts. */
+  async function seedActiveIndex(spaceId: string): Promise<SeededIndex> {
+    const fingerprint =
+      await embeddings.fingerprintEmbeddingConfig(SYNTHETIC_PROFILE);
+    const profileId = newKithId();
+    const generationId = newKithId();
+    // One row per fingerprint, which migration 016 enforces: two spaces on one
+    // profile share it, exactly as `ensureEmbeddingProfile` would leave them.
+    await pool.query(
+      `INSERT INTO kith.embedding_profiles
+         (id, created_at, fingerprint, protocol, provider_id, model,
+          model_revision, dimensions, normalization, preprocessing)
+       VALUES ($1, transaction_timestamp(), $2, $3, $4, $5, $6, $7, $8, $9)
+       ON CONFLICT (fingerprint) DO NOTHING`,
+      [
+        profileId,
+        fingerprint,
+        SYNTHETIC_PROFILE.protocol,
+        SYNTHETIC_PROFILE.providerId,
+        SYNTHETIC_PROFILE.model,
+        SYNTHETIC_PROFILE.modelRevision,
+        SYNTHETIC_PROFILE.dimensions,
+        SYNTHETIC_PROFILE.normalization,
+        SYNTHETIC_PROFILE.preprocessing,
+      ],
+    );
+    const profile = await pool.query<{ id: string }>(
+      "SELECT id FROM kith.embedding_profiles WHERE fingerprint = $1",
+      [fingerprint],
+    );
+    await pool.query(
+      `INSERT INTO kith.embedding_generations
+         (id, space_id, created_at, embedding_profile_id, fingerprint, state)
+       VALUES ($1, $2, transaction_timestamp(), $3, $4, 'active')`,
+      [generationId, spaceId, profile.rows[0]!.id, fingerprint],
+    );
+    const zero = JSON.stringify({ thought: 0, chunk: 0, card: 0 });
+    await pool.query(
+      `INSERT INTO kith.space_embedding_states
+         (id, space_id, created_at, eligibility_epoch,
+          active_embedding_generation_id, active_fingerprint, eligible_counts,
+          covered_counts, counter_drift, last_audit_at)
+       VALUES ($1, $2, transaction_timestamp(), 1, $3, $4, $5::jsonb, $6::jsonb,
+               false, transaction_timestamp())
+       ON CONFLICT (space_id) DO UPDATE
+         SET active_embedding_generation_id = EXCLUDED.active_embedding_generation_id,
+             active_fingerprint = EXCLUDED.active_fingerprint,
+             eligible_counts = EXCLUDED.eligible_counts,
+             covered_counts = EXCLUDED.covered_counts,
+             counter_drift = false,
+             last_audit_at = EXCLUDED.last_audit_at`,
+      [
+        newKithId(),
+        spaceId,
+        generationId,
+        fingerprint,
+        zero,
+        JSON.stringify([{ fingerprint, counts: { thought: 0, chunk: 0, card: 0 } }]),
+      ],
+    );
+    return { fingerprint, generationId };
+  }
+
+  /**
+   * Covers every eligible, uncovered thought target in the space, then makes
+   * the counters say so. A miniature `runEmbeddingFill` -- which has no
+   * production caller yet, which is the whole reason the gate needed a keyword
+   * leg. Every vector is the same axis, so every covered memory is a candidate
+   * for a query on that axis and the assertions are about *which* memories are
+   * reachable, never about ranking.
+   */
+  async function makeIndexReady(
+    spaceId: string,
+    index: SeededIndex,
+  ): Promise<void> {
+    const owed = await pool.query<{ id: string; content: string }>(
+      `SELECT t.id, t.content FROM kith.thoughts t
+         WHERE t.space_id = $1
+           AND (t.memory_status IS NULL OR t.memory_status = 'current')`,
+      [spaceId],
+    );
+    for (const { id, content } of owed.rows) {
+      const inputHash = sha256Hex(content);
+      await pool.query(
+        `INSERT INTO kith.embedding_targets
+           (id, space_id, created_at, target_kind, target_id, input_hash,
+            state, covered_fingerprint, updated_at)
+         VALUES ($1, $2, transaction_timestamp(), 'thought', $3, $4,
+                 'eligible', $5, transaction_timestamp())
+         ON CONFLICT (space_id, target_kind, target_id) DO UPDATE
+           SET input_hash = EXCLUDED.input_hash,
+               state = 'eligible',
+               covered_fingerprint = EXCLUDED.covered_fingerprint,
+               updated_at = EXCLUDED.updated_at`,
+        [newKithId(), spaceId, id, inputHash, index.fingerprint],
+      );
+      await pool.query(
+        `DELETE FROM kith.embedding_vectors
+           WHERE space_id = $1 AND target_kind = 'thought' AND thought_id = $2`,
+        [spaceId, id],
+      );
+      await pool.query(
+        `INSERT INTO kith.embedding_vectors
+           (id, space_id, created_at, embedding_generation_id,
+            embedding_fingerprint, target_kind, search_scope, thought_id,
+            input_hash, embedding, scope_v2)
+         VALUES ($1, $2, transaction_timestamp(), $3, $4, 'thought', $5, $6, $7,
+                 $8::public.vector, $9)`,
+        [
+          newKithId(),
+          spaceId,
+          index.generationId,
+          index.fingerprint,
+          searchScope(spaceId, index.fingerprint, index.generationId),
+          id,
+          inputHash,
+          vectorLiteral(oneHot(0)),
+          scopeV2(spaceId, index.fingerprint),
+        ],
+      );
+    }
+    // What a clean audit would leave behind.
+    const counted = await pool.query<{
+      target_kind: string;
+      eligible: number;
+      covered: number;
+    }>(
+      `SELECT target_kind,
+              count(*) FILTER (WHERE state = 'eligible')::int AS eligible,
+              count(*) FILTER (WHERE state = 'eligible'
+                                 AND covered_fingerprint = $2)::int AS covered
+         FROM kith.embedding_targets WHERE space_id = $1
+        GROUP BY target_kind`,
+      [spaceId, index.fingerprint],
+    );
+    const eligible = { thought: 0, chunk: 0, card: 0 };
+    const covered = { thought: 0, chunk: 0, card: 0 };
+    for (const row of counted.rows) {
+      eligible[row.target_kind as keyof typeof eligible] = row.eligible;
+      covered[row.target_kind as keyof typeof covered] = row.covered;
+    }
+    await pool.query(
+      `UPDATE kith.space_embedding_states
+          SET eligible_counts = $2::jsonb, covered_counts = $3::jsonb,
+              counter_drift = false, counter_drift_reason = NULL,
+              last_audit_at = transaction_timestamp()
+        WHERE space_id = $1`,
+      [
+        spaceId,
+        JSON.stringify(eligible),
+        JSON.stringify([{ fingerprint: index.fingerprint, counts: covered }]),
+      ],
+    );
+  }
+
+  /** A second account with its own personal and shared space, and one key. */
+  async function isolatedWriter() {
+    return await inTransaction(async (ctx) => {
+      const session = await signUp(ctx, {
+        email: `mcp-writes-index-${randomBytes(4).toString("hex")}@example.test`,
+        password: PASSWORD,
+      });
+      const personal = await ensurePersonalSpace(ctx, session.userId);
+      const shared = newKithId();
+      await ctx.client.query(
+        `INSERT INTO kith.spaces (id, kind, name, created_by)
+           VALUES ($1, 'shared', 'Indexed shared archive', $2)`,
+        [shared, session.userId],
+      );
+      await ctx.client.query(
+        `INSERT INTO kith.space_members (id, space_id, user_id, role)
+           VALUES ($1, $2, $3, 'owner')`,
+        [newKithId(), shared, session.userId],
+      );
+      const key = await createApiKey(ctx, {
+        principal: {
+          userId: session.userId,
+          capabilities: ["read", "write"] as const,
+        },
+        name: "indexed writer",
+        capabilities: ["read", "write"],
+        spaceIds: [personal, shared],
+      });
+      return { userId: session.userId, keyId: key.id, personal, shared };
+    });
   }
 
   async function onAdmin<T>(
@@ -407,13 +651,19 @@ describeWithDatabase("MCP write and ingest tools on PostgreSQL", () => {
   // Tool plumbing
   // -------------------------------------------------------------------------
 
-  function credentialFor(keyId: string): McpServerCredential {
+  /**
+   * `userId` defaults to the fixture's owner, which is who nearly every case
+   * writes as. The cases that seed their own embedding index sign up a second
+   * account, and a credential reference is a user *and* a key: passing the key
+   * alone would reload it against the wrong user and deny.
+   */
+  function credentialFor(
+    keyId: string,
+    userId: string = fixture.userId,
+  ): McpServerCredential {
     return {
       surface: "postgres",
-      withPrincipal: mcpPrincipalLoader({
-        userId: fixture.userId,
-        credentialId: keyId,
-      }),
+      withPrincipal: mcpPrincipalLoader({ userId, credentialId: keyId }),
     };
   }
 
@@ -421,9 +671,10 @@ describeWithDatabase("MCP write and ingest tools on PostgreSQL", () => {
     keyId: string,
     name: string,
     args: Record<string, unknown>,
+    userId: string = fixture.userId,
   ) {
     const server = createMcpServer(
-      credentialFor(keyId),
+      credentialFor(keyId, userId),
       "user-test:key-test",
       null,
     );
@@ -1105,14 +1356,208 @@ describeWithDatabase("MCP write and ingest tools on PostgreSQL", () => {
     expect(seen[0]!.coveringFacts.some((fact) => fact.id === factId)).toBe(
       true,
     );
+  });
+
+  test("the vector leg runs on a complete index and reaches one space only", async () => {
+    // The case that needs a real index: without one the gate takes its keyword
+    // leg, the embedder is never called, and a candidate-isolation assertion
+    // over an empty list proves nothing.
+    const writer = await isolatedWriter();
+    const call = (name: string, args: Record<string, unknown>) =>
+      callTool(writer.keyId, name, args, writer.userId);
+    const personalIndex = await seedActiveIndex(writer.personal);
+    const sharedIndex = await seedActiveIndex(writer.shared);
+
+    // A freshly seeded index has zero eligible and zero covered targets, which
+    // is "complete" and therefore ready, so even the seeding captures reach the
+    // embedder. That is the behaviour under test; it just means the embedder
+    // has to be wired before them.
+    const subject = `quarterly ledger review ${randomBytes(3).toString("hex")}`;
+    setEmbedder(async () => ({
+      vector: oneHot(0),
+      fingerprint: personalIndex.fingerprint,
+    }));
+    setClassifier(async () => classified("ADD"));
+    const mine = await call("capture_thought", captureArgs({ content: subject }));
+    // The isolation control: the same words, in the other space, with its own
+    // complete index. It is the nearest possible row and must never appear.
+    const foreign = await call(
+      "capture_thought",
+      captureArgs({ content: subject, spaceId: writer.shared }),
+    );
+    expect(text(mine)).toContain("Disposition: stored");
+    expect(text(foreign)).toContain("Disposition: stored");
+    const mineId = citationOf(mine)!;
+    const foreignId = citationOf(foreign)!;
+
+    await makeIndexReady(writer.personal, personalIndex);
+    await makeIndexReady(writer.shared, sharedIndex);
+
+    let embedded = 0;
+    setEmbedder(async () => {
+      embedded += 1;
+      return { vector: oneHot(0), fingerprint: personalIndex.fingerprint };
+    });
+    const seen = setClassifier(async () => classified("ADD"));
+    const next = await call(
+      "capture_thought",
+      captureArgs({ content: `${subject} and its cadence` }),
+    );
+    expect(text(next)).toContain("Disposition: stored");
+
+    // The embedder was reached, which is what a complete index buys.
+    expect(embedded).toBe(1);
     const ids = seen[0]!.candidates.map((candidate) => candidate.id);
-    if (ids.length > 0) {
-      const spaces = await pool.query<{ space_id: string }>(
-        "SELECT DISTINCT space_id FROM kith.thoughts WHERE id = ANY($1::text[])",
-        [ids],
-      );
-      expect(spaces.rows.map((row) => row.space_id)).toEqual([fixture.spaceA]);
-    }
+    expect(ids).toContain(mineId);
+    expect(ids).not.toContain(foreignId);
+    const spaces = await pool.query<{ space_id: string }>(
+      "SELECT DISTINCT space_id FROM kith.thoughts WHERE id = ANY($1::text[])",
+      [ids],
+    );
+    expect(spaces.rows.map((row) => row.space_id)).toEqual([writer.personal]);
+  });
+
+  test("an incomplete index takes the keyword leg without calling the embedder", async () => {
+    // The reproduction, through the tool. A stored capture leaves an eligible,
+    // uncovered target, so its own space's thought index reports itself
+    // incomplete and the vector leg would drop every candidate. Before the
+    // keyword leg existed the next capture was blind, and a retried one stored
+    // a duplicate.
+    const writer = await isolatedWriter();
+    const index = await seedActiveIndex(writer.personal);
+    const subject = `synthetic bicycle maintenance ${randomBytes(3).toString("hex")}`;
+
+    setEmbedder(async () => ({
+      vector: oneHot(0),
+      fingerprint: index.fingerprint,
+    }));
+    setClassifier(async () => classified("ADD"));
+    const first = await callTool(
+      writer.keyId,
+      "capture_thought",
+      captureArgs({ content: subject }),
+      writer.userId,
+    );
+    expect(text(first)).toContain("Disposition: stored");
+    const firstId = citationOf(first)!;
+
+    // That store left an eligible, uncovered target. No fill runs, so the
+    // index is incomplete from here on.
+    let embedded = 0;
+    setEmbedder(async () => {
+      embedded += 1;
+      return { vector: oneHot(0), fingerprint: index.fingerprint };
+    });
+    const seen = setClassifier(async () => classified("ADD"));
+    const second = await callTool(
+      writer.keyId,
+      "capture_thought",
+      captureArgs({ content: `${subject} continues` }),
+      writer.userId,
+    );
+    expect(text(second)).toContain("Disposition: stored");
+
+    // The memory text never went to the provider, and the gate still saw the
+    // first memory.
+    expect(embedded).toBe(0);
+    expect(seen[0]!.candidates.map((candidate) => candidate.id)).toContain(
+      firstId,
+    );
+  });
+
+  test("a retried identical capture stores one memory, not two", async () => {
+    // What the keyword leg cannot be relied on for. Two byte-identical
+    // captures seconds apart from one author is a host retrying a call whose
+    // response it lost; the classifier may still say ADD, and the store
+    // refuses the second write on its own.
+    const writer = await isolatedWriter();
+    const content = `The synthetic household files receipts weekly (${randomBytes(4).toString("hex")}).`;
+    setClassifier(async () => classified("ADD"));
+
+    const first = await callTool(
+      writer.keyId,
+      "capture_thought",
+      captureArgs({ content }),
+      writer.userId,
+    );
+    expect(text(first)).toContain("Disposition: stored");
+    const retry = await callTool(
+      writer.keyId,
+      "capture_thought",
+      captureArgs({ content }),
+      writer.userId,
+    );
+    expect(text(retry)).toContain("Disposition: duplicate");
+    expect(text(retry)).toContain("Thought already captured");
+    expect(citationOf(retry)).toBe(citationOf(first));
+    expect(await thoughtsIn(writer.personal)).toBe(1);
+  });
+
+  test("an embedder that fails or disagrees with the index fails closed", async () => {
+    const writer = await isolatedWriter();
+    const index = await seedActiveIndex(writer.personal);
+    setEmbedder(async () => ({
+      vector: oneHot(0),
+      fingerprint: index.fingerprint,
+    }));
+    setClassifier(async () => classified("ADD"));
+    const seed = await callTool(
+      writer.keyId,
+      "capture_thought",
+      captureArgs({
+        content: `A seeded memory ${randomBytes(3).toString("hex")}.`,
+      }),
+      writer.userId,
+    );
+    expect(text(seed)).toContain("Disposition: stored");
+    await makeIndexReady(writer.personal, index);
+    const before = await thoughtsIn(writer.personal);
+
+    // The index says it is complete, so the vector leg is the comparison set
+    // this capture was going to be judged against. Losing it after asking for
+    // it is the admission check failing, not degrading.
+    let classified_calls = 0;
+    setClassifier(async () => {
+      classified_calls += 1;
+      return classified("ADD");
+    });
+    setEmbedder(async () => {
+      throw new Error("provider said: synthetic-key is invalid");
+    });
+    const threw = await callTool(
+      writer.keyId,
+      "capture_thought",
+      captureArgs(),
+      writer.userId,
+    );
+    expect(threw.isError).not.toBe(true);
+    expect(text(threw)).toContain("Disposition: needs_confirmation");
+    expect(text(threw)).toContain(
+      "Memory was not stored because the admission check was unavailable",
+    );
+    expect(text(threw)).not.toContain("synthetic-key");
+    expect(text(threw)).not.toContain("provider said");
+
+    // A provider whose profile disagrees with the index is the same answer: a
+    // vector from another profile is not comparable with these rows.
+    setEmbedder(async () => ({
+      vector: oneHot(0),
+      fingerprint: "f".repeat(64),
+    }));
+    const mismatched = await callTool(
+      writer.keyId,
+      "capture_thought",
+      captureArgs(),
+      writer.userId,
+    );
+    expect(text(mismatched)).toContain("Disposition: needs_confirmation");
+    expect(text(mismatched)).toContain(
+      "Memory was not stored because the admission check was unavailable",
+    );
+
+    // Neither reached the classifier, and neither stored anything.
+    expect(classified_calls).toBe(0);
+    expect(await thoughtsIn(writer.personal)).toBe(before);
   });
 
   test("a key revoked during the provider calls denies the write", async () => {

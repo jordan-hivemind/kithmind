@@ -52,12 +52,13 @@
 // It is therefore the one exception, and its shape is authorize, call out,
 // re-authorize and apply: one `SERIALIZABLE` transaction that authorizes,
 // resolves the destination and runs every provider-free branch; the embedding
-// call; one `REPEATABLE READ READ ONLY` transaction that re-authorizes and
-// gathers candidates and covering facts from that destination alone; the
-// classification call; and one `SERIALIZABLE` transaction that re-authorizes
-// and applies the decision. A capture that stops at a provider-free branch, and
-// a denial, still cost one transaction. The pipeline lives in
-// `lib/kith/capture.ts`, because the web Quick Capture button runs the same one.
+// call, which happens only when that destination has a complete thought index;
+// one `REPEATABLE READ READ ONLY` transaction that re-authorizes and gathers
+// candidates and covering facts from that destination alone; the classification
+// call; and one `SERIALIZABLE` transaction that re-authorizes and applies the
+// decision. A capture that stops at a provider-free branch, and a denial, still
+// cost one transaction. The pipeline lives in `lib/kith/capture.ts`, because the
+// web Quick Capture button runs the same one.
 
 import { api } from "@repo/db/convex/_generated/api";
 import type { Id } from "@repo/db/convex/_generated/dataModel";
