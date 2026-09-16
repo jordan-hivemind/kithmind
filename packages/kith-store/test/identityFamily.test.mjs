@@ -556,6 +556,77 @@ test("a family space keeps at least one owner", { skip }, async (t) => {
 });
 
 test(
+  "removing or leaving after an approved invitation does not fail its foreign key",
+  { skip },
+  async (t) => {
+    // `family_invitations.membership_id` points at the `space_members` row an
+    // approval created. Deleting that row without clearing the pointer first
+    // fails on `family_invitations_membership_id_fkey`, which would mean an
+    // approved member could never be removed or leave -- P2-39i5 found this
+    // building the settings and spaces pages on top of this module.
+    const db = await identityDatabase(t);
+    await db.tx(async (ctx) => {
+      const { ownerId, spaceId } = await sharedSpace(ctx);
+      const secondOwnerId = await makeUser(ctx);
+      await makeMember(ctx, { spaceId, userId: secondOwnerId, role: "owner" });
+      const memberId = await makeUser(ctx, { email: "member@example.test" });
+
+      const invitation = await createInvitation(ctx, {
+        actorUserId: ownerId,
+        spaceId,
+        email: "member@example.test",
+        role: "editor",
+      });
+      await acceptInvitationByToken(ctx, {
+        userId: memberId,
+        token: invitation.token,
+      });
+      const approval = await approveInvitationForOwner(ctx, {
+        actorUserId: secondOwnerId,
+        invitationId: invitation.invitationId,
+      });
+      const stored = await ctx.client.query(
+        "SELECT membership_id FROM kith.family_invitations WHERE id = $1",
+        [invitation.invitationId],
+      );
+      assert.equal(stored.rows[0].membership_id, approval.membershipId);
+
+      await removeFamilyMember(ctx, {
+        actorUserId: ownerId,
+        membershipId: approval.membershipId,
+      });
+      const afterRemove = await ctx.client.query(
+        "SELECT membership_id FROM kith.family_invitations WHERE id = $1",
+        [invitation.invitationId],
+      );
+      assert.equal(afterRemove.rows[0].membership_id, null);
+
+      // The same path through `leaveSharedSpace`: reinvite, accept, approve,
+      // then leave rather than being removed.
+      const secondInvitation = await createInvitation(ctx, {
+        actorUserId: ownerId,
+        spaceId,
+        email: "member@example.test",
+        role: "editor",
+      });
+      await acceptInvitationByToken(ctx, {
+        userId: memberId,
+        token: secondInvitation.token,
+      });
+      await approveInvitationForOwner(ctx, {
+        actorUserId: secondOwnerId,
+        invitationId: secondInvitation.invitationId,
+      });
+      await leaveSharedSpace(ctx, { userId: memberId, spaceId });
+      assert.equal(
+        await refusalCode(() => requireSharedMembership(ctx, spaceId, memberId)),
+        "space_not_found",
+      );
+    });
+  },
+);
+
+test(
   "a transfer needs a real, unique membership in the same space",
   { skip },
   async (t) => {
