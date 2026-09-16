@@ -214,7 +214,17 @@ export async function getThoughtById(ctx: IdentityCtx, id: string): Promise<Thou
   return record ? hydrateThought(ctx, record) : null;
 }
 
-/** Ported from `getByIdAuthorized`/`getByIdsAuthorized`, folded into one bulk read. */
+/**
+ * Ported from `getByIdAuthorized`/`getByIdsAuthorized`, folded into one bulk
+ * read.
+ *
+ * The caller's id order is the result order. `getByIdsAuthorized` read
+ * `args.ids.map((id) => ctx.db.get(id))` and returned that array filtered, so
+ * its caller could hand it a ranked candidate list and get the ranking back;
+ * `get_thoughts` is documented as taking ids "from a prior search_thoughts
+ * call" and is the consumer that depends on it. One `id = ANY(...)` returns
+ * heap order, so the order is restored here rather than left to the plan.
+ */
 export async function getThoughtsByAuthorizedIds(
   ctx: IdentityCtx,
   spaceIds: readonly string[],
@@ -228,7 +238,13 @@ export async function getThoughtsByAuthorizedIds(
     `SELECT ${THOUGHT_COLUMNS} FROM kith.thoughts WHERE id = ANY($1::text[])`,
     [ids.map((id) => assertKithId(id, "invalid_thought_id"))],
   );
-  return (await hydrateThoughtRows(ctx, records)).filter((thought) => authorized.has(thought.spaceId));
+  const byId = new Map(
+    (await hydrateThoughtRows(ctx, records)).map((thought) => [thought.id, thought]),
+  );
+  return ids
+    .map((id) => byId.get(id))
+    .filter((thought): thought is Thought => thought !== undefined)
+    .filter((thought) => authorized.has(thought.spaceId));
 }
 
 export type ListBySpacesFilters = { type?: ThoughtType; topic?: string };
