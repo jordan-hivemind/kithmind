@@ -199,9 +199,64 @@ The unit and wrapper both set a restrictive umask and use a 30-second restart
 delay. Service-manager status proves only that a process is supervised. Use
 the worker doctor and authorized source status for point-in-time checks.
 
+## Deferred work daemon
+
+Section 2.6 of the [PostgreSQL consolidation
+plan](plans/2026-09-12-postgres-consolidation.md) runs Convex's four
+maintenance crons and its ten `scheduler.runAfter` call sites from this same
+always-on host instead of from Convex, through `kith.deferred_work`
+(`packages/kith-store/src/deferred/`) and the `kith-deferred-work` command
+(`packages/kith-store/src/deferred/cli.ts`). It reads `KITH_STORE_DATABASE_URL`
+and needs no other credential.
+
+Run one round by hand to check the command before installing a service:
+
+```sh
+pnpm exec turbo run build --filter=@repo/kith-store
+KITH_STORE_DATABASE_URL=postgres://... node packages/kith-store/dist/deferred/cli.js once
+```
+
+`once` runs every sweep (stranded inline ingestion recovery, expired OAuth
+grants, expired worker protocol state) and then drains due jobs once, prints
+one JSON summary line, and exits. `tick --interval-ms 60000` does the same on
+a loop and is what the service below runs continuously; `drain
+[--interval-ms N] [--max-jobs N]` drains jobs without running the sweeps, for
+an operator who wants to catch up a backlog without waiting on the sweep
+schedule.
+
+A missed round costs nothing: every sweep and every drained job is
+idempotent, and scheduling the same job twice while it is still queued is a
+no-op (`dedupeKey`). There is no equivalent of the filesystem worker's cloud
+heartbeat for this daemon; its liveness is `docs/worker-doctor.md`'s concern
+for the process that runs it, not this one's.
+
+The fourth Convex cron, `detect missing filesystem workers`, is not a sweep
+here at all. It becomes a read-time predicate
+(`isWatcherOverdue`/`watcherStaleness` in
+`packages/kith-store/src/workers/diagnostics.ts`) that a status route or
+`brain doctor` calls directly, so a host that is down still reports itself
+stale. The one piece that still needs to run on a schedule is the durable
+incident record for alerting
+(`recordMissingWorkerIncidents`, same file): at most one open
+`missing_worker` incident row per watcher, written once a day. That is a
+Vercel Hobby cron, not this daemon -- the Hobby plan allows exactly one run
+per day, which is what a once-daily incident write needs and per-minute sweeps
+do not fit into.
+
+### macOS LaunchAgent
+
+`docs/kithmind-deferred-work.launchd.plist.txt` is a copy-and-fill template
+for a per-user LaunchAgent running `kith-deferred-work tick --interval-ms
+60000` continuously, the same `RunAtLoad`/`KeepAlive`/`ThrottleInterval` shape
+the filesystem worker's own LaunchAgent above uses. Follow that section's
+Keychain, wrapper, `plutil -lint`, and `launchctl bootstrap`/`kickstart`
+steps, substituting the deferred-work label, wrapper, and `KITH_STORE_DATABASE_URL`
+Keychain item for the filesystem worker's own.
+
 ## Template validation
 
 The macOS plist and both shell wrappers are syntax-checked in this repository.
 The Linux unit is reviewed as a template, but systemd runtime validation is not
 performed on macOS. Validate the edited unit on its target Linux host with the
-installed systemd tools before enabling it.
+installed systemd tools before enabling it. The deferred-work plist template
+in `docs/` is text only and is not part of that check.

@@ -55,6 +55,7 @@ export * as ingestion from "./ingestion/index.js";
 export * as workers from "./workers/index.js";
 export * as records from "./records/index.js";
 export * as sources from "./sources/index.js";
+export * as deferred from "./deferred/index.js";
 
 const SHA256 = /^[0-9a-f]{64}$/;
 const UUID =
