@@ -493,6 +493,13 @@ all three through to the client unchanged, because T14 requires a degraded
 semantic leg to be labelled rather than silently returned as complete. A failing
 embedder yields `vectorStatus: "unavailable"` and the keyword leg still answers.
 
+A capture is the other way that status goes to `"unavailable"`, because the new
+thought is an eligible uncovered target, and as of P2-39j2 the capture schedules
+in its own transaction the `embedding_fill` job that covers it, which the daemon
+drains out of transaction so the provider call still holds no `pg` connection.
+The vector leg therefore restores itself after a write instead of waiting for an
+operator to run the fill by hand.
+
 The vector legs qualify pgvector's type and operators as `public.vector` and
 `OPERATOR(public.<=>)`, because `withKithTransaction` pins `search_path` to
 `kith` alone. Nothing in row i changes that, and nothing in row i may widen the

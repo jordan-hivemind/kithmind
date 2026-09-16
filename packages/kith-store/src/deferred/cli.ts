@@ -125,7 +125,14 @@ export async function main(argv: string[]): Promise<number> {
   const parsed = argumentsFor(argv);
   const url = requireDatabaseUrl();
   const pool = createKithPool(url);
-  const registry = defaultRegistry();
+  // The one place in this package that reads the provider environment. The
+  // names are `loadEmbeddingConfig`'s (`src/embeddings/provider.ts`): the
+  // `BRAIN_EMBED_*` set, falling back to `OPENAI_API_KEY` on the default
+  // endpoint. Nothing is read here and nothing is validated here, so a daemon
+  // whose provider is unset or misconfigured still starts and still sweeps;
+  // only an `embedding_fill` job fails, and it fails with a fixed string that
+  // carries no key and no provider message.
+  const registry = defaultRegistry({ env: process.env });
   const stop = new AbortController();
   const shutdown = () => stop.abort();
   process.once("SIGINT", shutdown);

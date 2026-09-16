@@ -380,3 +380,100 @@ export async function requestEmbedding(
     clearTimeout(timeout);
   }
 }
+
+// --- The daemon's batch embedder -------------------------------------------
+//
+// P2-39j2. `runEmbeddingFill` (`fill.ts`) takes an injected `FillEmbedder`:
+// one call per page, at most `MAX_FILL_VECTORS` texts, one result per text in
+// order. The web app builds its single-text equivalent from
+// `loadEmbeddingConfig(process.env)` and `requestEmbedding` (section 4.4 of
+// docs/plans/2026-09-16-web-mcp-postgres-surface.md); the daemon needs the
+// same provider from the same environment, batched.
+//
+// Three properties this wrapper owes its caller.
+//
+//   * The environment is an argument, not a read. This module still reads no
+//     `process.env` of its own; `src/deferred/cli.ts` is the one process that
+//     passes it, exactly as the web app's route does.
+//   * The configuration is loaded on the first batch, not when the embedder is
+//     built. A daemon with no provider configured must still start, sweep and
+//     drain every other kind; a misconfigured provider fails the one
+//     `embedding_fill` job through `fail`'s ordinary backoff instead of taking
+//     the process down at boot.
+//   * No provider text escapes. `requestEmbedding` is already generic by
+//     construction, but a `fetch` rejection, a DNS failure or a future
+//     provider client is not, so every error out of this wrapper is one of the
+//     two fixed strings below. The job's `last_error` column, which an
+//     operator reads, therefore never carries a key, an endpoint, a response
+//     body or a provider diagnostic.
+//
+// One request per text, sequentially. `requestEmbedding` is pinned to a single
+// input per request (its parse requires `data.length === 1`) because the
+// fingerprint it computes has to equal the one Convex computed, and a batched
+// request body would be a different call than the one that was ported. One at
+// a time also keeps a page from opening 32 concurrent sockets from the worker
+// host.
+
+/** What an `embedding_fill` job reports when the environment configures no
+ * usable provider. Fixed text: it is written to `deferred_work.last_error`. */
+export const EMBEDDING_PROVIDER_UNCONFIGURED_ERROR =
+  "Embedding provider is not configured";
+
+/** What an `embedding_fill` job reports when a provider call fails, whatever
+ * the underlying cause. Fixed text, for the same reason. */
+export const EMBEDDING_PROVIDER_REQUEST_ERROR =
+  "Embedding provider request failed";
+
+/**
+ * The batch shape `fill.ts`'s `FillEmbedder` names, declared here so this
+ * module keeps its own dependencies. The two are structurally the same type.
+ */
+export type BatchEmbedder = (
+  texts: readonly string[],
+) => Promise<ReadonlyArray<{ vector: number[]; fingerprint: string }>>;
+
+/** The fill's own page is 32 texts. This is the wrapper's own refusal bound,
+ * so a caller that passes an unbounded array is refused before the first
+ * request rather than after the thirty-third. */
+const MAX_BATCH_TEXTS = 64;
+
+/**
+ * The provider-backed embedder the daemon drains `embedding_fill` with.
+ *
+ * `env` is the environment to read the provider configuration from: the same
+ * `BRAIN_EMBED_*` names `loadEmbeddingConfig` documents, falling back to
+ * `OPENAI_API_KEY` on the default endpoint. `fetchImpl` is the test seam, so
+ * no test in this package ever reaches a provider.
+ */
+export function providerBatchEmbedder(
+  env: EmbeddingEnvironment,
+  fetchImpl: EmbeddingFetch = fetch,
+): BatchEmbedder {
+  let config: EmbeddingConfig | undefined;
+  return async (texts) => {
+    if (texts.length === 0) return [];
+    if (texts.length > MAX_BATCH_TEXTS) {
+      throw new Error("Embedding batch exceeds its input bound");
+    }
+    if (!config) {
+      try {
+        config = loadEmbeddingConfig(env);
+      } catch {
+        throw new Error(EMBEDDING_PROVIDER_UNCONFIGURED_ERROR);
+      }
+    }
+    const results: { vector: number[]; fingerprint: string }[] = [];
+    for (const text of texts) {
+      try {
+        const result = await requestEmbedding(text, config, fetchImpl);
+        results.push({
+          vector: result.vector,
+          fingerprint: result.fingerprint,
+        });
+      } catch {
+        throw new Error(EMBEDDING_PROVIDER_REQUEST_ERROR);
+      }
+    }
+    return results;
+  };
+}

@@ -21,6 +21,13 @@
 // admission, not a gap. Both functions are ported and exported from
 // `../embeddings/write.ts`; the fill is what calls them.
 //
+// P2-39j2 closed the other half of that sentence. "Until the fill covers it"
+// used to mean "until an operator ran the fill by hand", because nothing
+// scheduled one. Both writes below now call `scheduleEmbeddingFill`
+// (`../embeddings/fillWork.ts`) in their own transaction, so the job that
+// covers the target commits with the write that owed it, and the daemon drains
+// it on its next round.
+//
 // I9 is unaffected. It was never enforced by that branch for its own sake:
 // `getActiveEmbeddingTarget` reports `thoughtStatus: "unavailable"` while
 // covered and eligible thought counts disagree, and narrative capture reads
@@ -46,6 +53,7 @@ import {
   bumpEmbeddingEligibilityEpoch,
   markEligibilityTargets,
 } from "../embeddings/eligibility.js";
+import { scheduleEmbeddingFill } from "../embeddings/fillWork.js";
 import { getActiveEmbeddingTarget } from "../embeddings/targets.js";
 import { deleteActiveThoughtEmbeddingVectors } from "../embeddings/write.js";
 import { row, rows, exec, at, ms, type IdentityCtx } from "../identity/db.js";
@@ -385,8 +393,17 @@ export async function captureThought(
   // insert would find a target row to mark covered, and the epoch bump
   // follows. On a space whose counters are not seeded the mark is a no-op and
   // the bump is the whole of it, exactly as it was on Convex.
-  await markEligibilityTargets(ctx, spaceId, { thoughtIds: [id] });
+  const counted = await markEligibilityTargets(ctx, spaceId, {
+    thoughtIds: [id],
+  });
   await bumpEmbeddingEligibilityEpoch(ctx, spaceId, { thoughtIds: [id] });
+  // P2-39j2. The target this capture just made eligible is uncovered, which is
+  // exactly what makes `getActiveEmbeddingTarget` report
+  // `thoughtStatus: "unavailable"` for the space. Queue the fill that covers
+  // it, in this same transaction, so the job commits with the thought or not
+  // at all. An uncounted space owes nothing and is skipped: its fill would
+  // return on its first read page.
+  if (counted) await scheduleEmbeddingFill(ctx, spaceId);
   return id;
 }
 
@@ -455,7 +472,9 @@ export async function transitionMemory(
   // `_transitionMemory`'s order: the new memory is marked eligible before the
   // previous ones are transitioned, so its target exists for the whole rest of
   // this transaction.
-  await markEligibilityTargets(ctx, spaceId, { thoughtIds: [newId] });
+  const counted = await markEligibilityTargets(ctx, spaceId, {
+    thoughtIds: [newId],
+  });
 
   for (const previous of previousMemories) {
     const corrected = previousStatus === "retracted";
@@ -496,6 +515,10 @@ export async function transitionMemory(
   await bumpEmbeddingEligibilityEpoch(ctx, spaceId, {
     thoughtIds: [newId, ...uniquePreviousIds],
   });
+  // The new memory is an uncovered target for the same reason a capture's is,
+  // and the vectors deleted above leave the space's counts disagreeing until
+  // it is covered. Same transaction, same per-space key.
+  if (counted) await scheduleEmbeddingFill(ctx, spaceId);
 
   return newId;
 }
