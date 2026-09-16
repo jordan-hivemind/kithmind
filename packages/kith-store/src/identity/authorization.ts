@@ -769,7 +769,31 @@ export async function resolveWriteSpace(
   return personalSpaceId;
 }
 
-/** Touches `last_used_at`. Used by the MCP authenticator, as Convex does. */
+/**
+ * How stale `kith.api_keys.last_used_at` may get before a touch refreshes it.
+ *
+ * Mirrors `SESSION_TOUCH_MIN_MS` in `./webAuth.ts`, at the same five minutes,
+ * for the same reason: `touchApiKey` runs on every successful `/api/mcp`
+ * request under `SERIALIZABLE`, so an unthrottled write turns every call
+ * against one key into a write to that key's row, and two concurrent calls on
+ * one bearer contend on it (see the second-model review finding recorded on
+ * `authenticateApiKey`). Nothing reads this column at finer resolution than
+ * "recently, or not", so bounding the write rate costs no precision anyone
+ * consumes.
+ */
+export const API_KEY_TOUCH_MIN_MS = 5 * 60 * 1000;
+
+/**
+ * Touches `last_used_at`, at most once per `API_KEY_TOUCH_MIN_MS`. Used by
+ * the MCP authenticator, as Convex does.
+ *
+ * Returns `true` for a live, usable key whether or not this call actually
+ * wrote, and `false` only for the credential-shape refusals `requireMcpPrincipal`
+ * turns into a denial: revoked (deleted), OAuth-lifecycle-bound, or belonging to
+ * a deleted user. A key in any of those states is never touched, throttle or
+ * not. The throttle only ever suppresses the write on an already-live key, so
+ * it cannot turn a valid authentication into a denial.
+ */
 export async function touchApiKey(
   ctx: IdentityCtx,
   id: string,
@@ -782,9 +806,22 @@ export async function touchApiKey(
   ) {
     return false;
   }
-  await exec(ctx, "UPDATE kith.api_keys SET last_used_at = $2 WHERE id = $1", [
-    id,
-    at(ctx.now),
-  ]);
+  if (
+    key.lastUsedAt !== null &&
+    ctx.now - key.lastUsedAt < API_KEY_TOUCH_MIN_MS
+  ) {
+    return true;
+  }
+  // The throttle is in the `WHERE` as well as in the branch above it, so two
+  // concurrent authentications reading the same stale row cannot both write:
+  // the second one's `UPDATE` matches nothing and it keeps the value it
+  // already had, the same shape `touchSession` in `./webAuth.ts` uses.
+  await exec(
+    ctx,
+    `UPDATE kith.api_keys SET last_used_at = $2
+       WHERE id = $1
+         AND (last_used_at IS NULL OR last_used_at <= $3)`,
+    [id, at(ctx.now), at(ctx.now - API_KEY_TOUCH_MIN_MS)],
+  );
   return true;
 }

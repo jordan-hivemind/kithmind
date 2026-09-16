@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  API_KEY_TOUCH_MIN_MS,
   authenticateApiKey,
   authorizedSpacePredicate,
   ensurePersonalSpace,
@@ -22,6 +23,7 @@ import {
   requireSpaceAccess,
   resolveWriteSpace,
   setDefaultWriteSpace,
+  touchApiKey,
   validateApiKeyScopes,
   webPrincipal,
   createApiKey,
@@ -876,6 +878,51 @@ test(
 );
 
 test(
+  "touching an API key refreshes last_used_at, at most once per touch window",
+  { skip },
+  async (t) => {
+    const db = await identityDatabase(t);
+    await db.tx(async (ctx) => {
+      const userId = await makeUser(ctx);
+      const key = await makeApiKey(ctx, { userId, capabilities: ["read"] });
+      const lastUsedAt = async () => (await getApiKey(ctx, key.id)).lastUsedAt;
+
+      assert.equal(await lastUsedAt(), null);
+
+      // No prior timestamp, so the first touch always writes.
+      assert.equal(await touchApiKey(ctx, key.id), true);
+      const opened = await lastUsedAt();
+      assert.equal(opened, ctx.now);
+
+      // Inside the window, a second touch reports the key live but does not
+      // write again: the column is already accurate to within one window, and
+      // a key authenticated on every request must not mean a row written on
+      // every request.
+      const early = db.ctx(ctx.now + API_KEY_TOUCH_MIN_MS - 1);
+      assert.equal(await touchApiKey(early, key.id), true);
+      assert.equal(await lastUsedAt(), opened);
+
+      // Past the window it writes once, to the new clock.
+      const later = db.ctx(ctx.now + API_KEY_TOUCH_MIN_MS);
+      assert.equal(await touchApiKey(later, key.id), true);
+      assert.equal(await lastUsedAt(), later.now);
+
+      // And having written, the next touch in the new window does not.
+      assert.equal(await touchApiKey(db.ctx(later.now + 1), key.id), true);
+      assert.equal(await lastUsedAt(), later.now);
+
+      // A revoked (deleted) or lifecycle-bound key is never touched, throttle
+      // or not: `touchApiKey` still returns `false` for it rather than
+      // reporting it live because the throttle window has not elapsed.
+      await ctx.client.query("DELETE FROM kith.api_keys WHERE id = $1", [
+        key.id,
+      ]);
+      assert.equal(await touchApiKey(db.ctx(later.now + 2), key.id), false);
+    });
+  },
+);
+
+test(
   "the route authenticator returns a principal or null, never a distinguishable error",
   { skip },
   async (t) => {
@@ -933,9 +980,18 @@ test(
       // loop in `withKithTransaction` never saw it, and the route answered 401
       // for a valid key. A driver failure is not a fact about the credential and
       // must reach the caller.
+      //
+      // The touch throttle added for the same finding's follow-up means a
+      // second authentication in the same instant would not attempt the write
+      // at all, so this uses a clock past `API_KEY_TOUCH_MIN_MS` for every call
+      // below. `db.ctx` shares `ctx.client`'s connection, only the injected
+      // clock differs, and the injected write always throws rather than
+      // committing, so `last_used_at` never advances and one later clock
+      // clears the throttle for the whole loop.
       const realQuery = ctx.client.query.bind(ctx.client);
+      const touchCtx = db.ctx(ctx.now + API_KEY_TOUCH_MIN_MS);
       for (const code of ["40001", "57014", "55P03"]) {
-        ctx.client.query = async (sql, values) => {
+        touchCtx.client.query = async (sql, values) => {
           if (
             typeof sql === "string" &&
             sql.includes("SET last_used_at")
@@ -947,19 +1003,19 @@ test(
         try {
           assert.equal(
             await refusalCode(() =>
-              authenticateApiKey(ctx, { rawKey: key.rawKey }),
+              authenticateApiKey(touchCtx, { rawKey: key.rawKey }),
             ),
             null,
             `${code} must not be reported as a typed denial`,
           );
           assert.match(
             await refusal(() =>
-              authenticateApiKey(ctx, { rawKey: key.rawKey }),
+              authenticateApiKey(touchCtx, { rawKey: key.rawKey }),
             ),
             new RegExp(`synthetic ${code}`),
           );
         } finally {
-          ctx.client.query = realQuery;
+          touchCtx.client.query = realQuery;
         }
       }
     });

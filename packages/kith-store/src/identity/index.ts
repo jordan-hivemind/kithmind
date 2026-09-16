@@ -15,6 +15,7 @@ export { IdentityError, notAuthenticated, spaceNotFound } from "./errors.js";
 export { identityCtx, type IdentityCtx } from "./db.js";
 
 export {
+  API_KEY_TOUCH_MIN_MS,
   // The boundary itself.
   requireSpaceAccess,
   getAuthorizedReadSpaceIds,
