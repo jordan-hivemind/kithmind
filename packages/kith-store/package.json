@@ -46,6 +46,11 @@
       "types": "./src/eval/index.ts",
       "node": "./dist/eval/index.js",
       "default": "./src/eval/index.ts"
+    },
+    "./sources": {
+      "types": "./src/sources/index.ts",
+      "node": "./dist/sources/index.js",
+      "default": "./src/sources/index.ts"
     }
   },
   "scripts": {
