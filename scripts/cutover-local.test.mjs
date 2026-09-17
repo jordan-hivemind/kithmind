@@ -82,6 +82,17 @@ test(
     ]);
     assert.match(proof.datedBackup, /^skipped: /);
 
+    const appRole = await readJson(join(reports, "app-role.json"));
+    assert.equal(appRole.ok, true, JSON.stringify(appRole.problems));
+    assert.equal(appRole.role, "kith_app");
+    assert.equal(appRole.appRoleCanRead, true);
+    assert.equal(appRole.appRoleCannotCreate, true);
+    assert.deepEqual(appRole.problems, []);
+    // No password and no connection string ever reach a published report.
+    const appRoleText = await readFile(join(reports, "app-role.json"), "utf8");
+    assert.equal(/password/i.test(appRoleText), false);
+    assert.equal(appRoleText.includes("postgres://"), false);
+
     const summary = await readFile(join(stage, "summary.md"), "utf8");
     for (const heading of [
       "## Step 2. Export manifest",
@@ -89,6 +100,7 @@ test(
       "## Step 3.5. Audit",
       "## Steps 4 and 5. Isolated load and parity",
       "## Step 10. Backup-shape rehearsal",
+      "## Runbook step 9, role half. App role",
       "## What stays manual",
     ]) {
       assert.equal(summary.includes(heading), true, `summary is missing ${heading}`);

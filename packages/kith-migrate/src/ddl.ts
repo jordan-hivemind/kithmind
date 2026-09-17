@@ -114,6 +114,8 @@ export function generateKithMigrateTablesSql(): string {
     if (t.spaceScoped) lines.push(`  ${q("space_id")} kith.kith_id NOT NULL`);
     lines.push(`  ${q("created_at")} timestamptz NOT NULL`);
     for (const c of t.columns) {
+      // Columns a later kith-store migration added are not migration 004's.
+      if (c.addedIn !== undefined) continue;
       lines.push(`  ${q(c.pg)} ${PG_KIND[c.kind]}`);
     }
     if (t.spaceScoped) {
@@ -145,6 +147,8 @@ export function generateKithMigrateTablesSql(): string {
   // section 3 step 4) can load every table before any reference is checked.
   for (const t of TABLES) {
     for (const c of t.columns) {
+      // Columns a later kith-store migration added are not migration 004's.
+      if (c.addedIn !== undefined) continue;
       if (c.kind !== "ref" || !c.refTable) continue;
       const targetScoped = scoped.get(c.refTable) ?? false;
       const name = constraintName(`${migration4TableName(t.pg)}_${c.pg}_fkey`);

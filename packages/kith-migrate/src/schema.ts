@@ -61,6 +61,15 @@ export type ColumnSpec = {
   kind: ColumnKind;
   /** Postgres table this ref column points to (bare name, no `kith.` prefix). */
   refTable?: string;
+  /**
+   * The kith-store migration that added this column, when it was not part of
+   * migration 004. `ddl.ts` regenerates 004 from this spec and the drift test
+   * holds the checked-in file to it, so a column that arrived later must say
+   * so or the generator would rewrite history. The transform, audit and load
+   * still carry it: by the time they run, `applyKithSchema` has applied every
+   * migration and the column exists.
+   */
+  addedIn?: number;
 };
 
 export type ChildTableSpec = {
@@ -104,23 +113,25 @@ function pgName(convex: string): string {
   return RESERVED_PG_NAMES.has(base) ? `${base}_field` : base;
 }
 
-function ref(convex: string, refTable: string): ColumnSpec {
-  return { pg: pgName(convex), convex, kind: "ref", refTable };
+type ColumnOpts = { addedIn?: number };
+
+function ref(convex: string, refTable: string, opts: ColumnOpts = {}): ColumnSpec {
+  return { pg: pgName(convex), convex, kind: "ref", refTable, ...opts };
 }
-function text(convex: string): ColumnSpec {
-  return { pg: pgName(convex), convex, kind: "text" };
+function text(convex: string, opts: ColumnOpts = {}): ColumnSpec {
+  return { pg: pgName(convex), convex, kind: "text", ...opts };
 }
-function num(convex: string): ColumnSpec {
-  return { pg: pgName(convex), convex, kind: "number" };
+function num(convex: string, opts: ColumnOpts = {}): ColumnSpec {
+  return { pg: pgName(convex), convex, kind: "number", ...opts };
 }
-function bool(convex: string): ColumnSpec {
-  return { pg: pgName(convex), convex, kind: "boolean" };
+function bool(convex: string, opts: ColumnOpts = {}): ColumnSpec {
+  return { pg: pgName(convex), convex, kind: "boolean", ...opts };
 }
-function json(convex: string): ColumnSpec {
-  return { pg: pgName(convex), convex, kind: "jsonb" };
+function json(convex: string, opts: ColumnOpts = {}): ColumnSpec {
+  return { pg: pgName(convex), convex, kind: "jsonb", ...opts };
 }
-function ts(convex: string): ColumnSpec {
-  return { pg: pgName(convex), convex, kind: "timestamp" };
+function ts(convex: string, opts: ColumnOpts = {}): ColumnSpec {
+  return { pg: pgName(convex), convex, kind: "timestamp", ...opts };
 }
 
 function table(
@@ -273,6 +284,10 @@ export const TABLES: TableSpec[] = [
     text("externalId"),
     text("title"),
     text("docType"),
+    // P2-80i: the accepted `card_kind` of the item's live card. Migration 007
+    // added `source_items.card_doc_type`; the production export carries it on
+    // every carded item, which the first hosted rehearsal found unmapped.
+    text("cardDocType", { addedIn: 7 }),
     text("uri"),
     text("lifecycle"),
     bool("originalLinkAvailable"),
@@ -828,6 +843,9 @@ export const TABLES: TableSpec[] = [
       text("kind"),
       text("phase"),
       num("cursor"),
+      // P2-85's one-rewind marker; migration 021 added the column after the
+      // first hosted rehearsal found this field unmapped.
+      ts("cursorRewoundAt", { addedIn: 21 }),
       num("dailyDocumentBudget"),
       num("weeklyDocumentBudget"),
       num("weeklyCostBudgetMicroUsd"),
