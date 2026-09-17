@@ -94,13 +94,39 @@ test(
     const appRole = await readJson(join(reports, "app-role.json"));
     assert.equal(appRole.ok, true, JSON.stringify(appRole.problems));
     assert.equal(appRole.role, "kith_app");
+    // `created` is not asserted here: `kith_app` is a role, not a database,
+    // so it is cluster-wide rather than scoped to the throwaway database this
+    // run creates and drops, and this script does not drop it either. On a
+    // machine that already ran this rehearsal, the role from that earlier run
+    // is still there, so this first pass legitimately updates it instead of
+    // creating it. The rerun below is what proves the update path, using
+    // whatever this pass actually did as its starting point.
+    assert.equal(appRole.passwordManaged, "workflow");
     assert.equal(appRole.appRoleCanRead, true);
     assert.equal(appRole.appRoleCannotCreate, true);
     assert.deepEqual(appRole.problems, []);
     // No password and no connection string ever reach a published report.
+    // `passwordManaged` is the one field allowed to hold the word "password";
+    // it names who manages it ("workflow" or "provider"), never the secret
+    // itself, so the check looks for a bare `"password"` key, not that field.
     const appRoleText = await readFile(join(reports, "app-role.json"), "utf8");
-    assert.equal(/password/i.test(appRoleText), false);
+    assert.equal(/"password"\s*:/i.test(appRoleText), false);
     assert.equal(appRoleText.includes("postgres://"), false);
+
+    // The rerun (the local twin of `mode: app-role`, run with the same role
+    // and the same password): the role already exists, so this pass updates
+    // it rather than recreating it.
+    const appRoleSecond = await readJson(join(reports, "app-role-second.json"));
+    assert.equal(appRoleSecond.ok, true, JSON.stringify(appRoleSecond.problems));
+    assert.equal(appRoleSecond.role, "kith_app");
+    assert.equal(appRoleSecond.created, false, "the second pass updates rather than creates");
+    assert.equal(appRoleSecond.passwordManaged, "workflow");
+    assert.equal(appRoleSecond.appRoleCanRead, true);
+    assert.equal(appRoleSecond.appRoleCannotCreate, true);
+    assert.deepEqual(appRoleSecond.problems, []);
+    const appRoleSecondText = await readFile(join(reports, "app-role-second.json"), "utf8");
+    assert.equal(/"password"\s*:/i.test(appRoleSecondText), false);
+    assert.equal(appRoleSecondText.includes("postgres://"), false);
 
     const summary = await readFile(join(stage, "summary.md"), "utf8");
     for (const heading of [

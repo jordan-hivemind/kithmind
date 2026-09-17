@@ -11,7 +11,7 @@ rest of step 9 stays manual and is listed at the end.
 
 | Action                             | What it is                                                                                                                                                                                      |
 | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 1. Add two repository secrets      | `KITH_MIGRATION_DATABASE_URL`, pointing at the hosted archive database with a role that can create the `vector` extension and the `kith` schema. `KITH_APP_ROLE_PASSWORD`, at least 16 characters, the password for the web app's login role. Both needed for `live` only. |
+| 1. Add two repository secrets      | `KITH_MIGRATION_DATABASE_URL`, pointing at the hosted archive database with a role that can create the `vector` extension and the `kith` schema. `KITH_APP_ROLE_PASSWORD`, at least 16 characters: either the password the workflow itself sets on the role, or, on a host whose migration role cannot `CREATE ROLE`, the password of the role created by hand in the provider's console. Both secrets are needed for `live`; `app-role` mode needs the same two. |
 | 2. Run the workflow, twice         | Actions, Cutover, Run workflow. First in `rehearsal`. Read the summary. Then in `live`, typing the confirmation string.                                                                          |
 
 `CONVEX_DEPLOY_KEY` is already a repository secret; the Convex deploy workflow
@@ -55,12 +55,19 @@ the deployment as `KITH_DATABASE_URL` in the manual half below.
 | Isolated parity    | `kith-migrate parity`                                                       | throwaway service database |
 | Backup rehearsal   | `scripts/cutover-rehearsal-proof.mjs` (`rehearsal` only)                    | throwaway service database |
 | App role (rehearsal) | `scripts/cutover-app-role.mjs` (`rehearsal` only)                         | throwaway service database |
-| Host verification  | `scripts/cutover-host-check.mjs capture` (`live` only)                      | live database, read only   |
+| Host verification  | `scripts/cutover-host-check.mjs capture` (`live` and `app-role`)            | live database, read only   |
 | Live load          | `kith-migrate load`                                                         | live database, `kith` only |
 | Live parity        | `kith-migrate parity`                                                       | live database, read only   |
 | Finance unchanged  | `scripts/cutover-host-check.mjs compare` (`live` only)                      | live database, read only   |
-| App role (live)    | `scripts/cutover-app-role.mjs` (`live` only)                                | live database, role only   |
+| App role (live or app-role) | `scripts/cutover-app-role.mjs` (`live` and `app-role`)               | live database, role only   |
 | Summary and upload | Markdown summary plus the JSON reports                                      | run summary and artifact   |
+
+`app-role` mode runs only three of the steps above: preflight, host
+verification (without `--expect-empty-kith`, because `kith` is expected to
+already hold the archive) and the app role step, plus the summary and the
+upload. It needs no `CONVEX_DEPLOY_KEY` and no confirmation input, because it
+exports nothing and loads nothing. See "If the live run stops at the app
+role" below.
 
 ## What the workflow does not do
 
@@ -72,6 +79,7 @@ the deployment as `KITH_DATABASE_URL` in the manual half below.
 | Publishes an offending value        | The audit's violation details are redacted to table, row id, constraint and kind before anything is printed or uploaded.                                   |
 | Retains the export                  | The runner is destroyed at the end of the job. The retained, dated, encrypted export stays the owner's backup recipe.                                      |
 | Re-uses a previous run's export     | There is no `skip_export` input. The only places an export could survive between runs are an artifact and the Actions cache, and both are readable by anyone who can read this public repository. |
+| `app-role` mode loads anything      | It runs no export, transform, audit or load step. It only reads the live host and provisions the login role and its grants.                               |
 
 The uploaded artifact is named `cutover-<mode>-<run id>` and holds counts, byte
 lengths, hashes, transform row counts, redacted audit violations, parity
@@ -101,6 +109,56 @@ fails if the comparison is not `unchanged`, if `kith` already held rows before
 the load, if a `kith` schema exists at any version other than the current one
 (the host check accepts absent or current, nothing between), or if the live
 parity rerun is not `pass`.
+
+## If the live run stops at the app role
+
+If a `live` run's load, its parity rerun and the finance comparison all
+succeeded and only the app role step failed, the archive is already loaded.
+Do not dispatch `live` again: `kith` now holds rows, and a second `live` run's
+host check would refuse to proceed for that reason, as it should.
+
+The app role step fails this way when the role behind
+`KITH_MIGRATION_DATABASE_URL` is a hosted provider's project-owner role
+without `CREATEROLE`. `scripts/cutover-app-role.mjs` cannot create the login
+role there, and it says so in the failed report rather than throwing:
+`app_role_create_forbidden:42501`, with a hint naming the fix.
+
+To finish:
+
+1. In the provider's console, create a role named exactly what the `app_role`
+   input names (default `kith_app`), with `LOGIN` and no other attribute: no
+   `CREATEDB`, no `CREATEROLE`, no `SUPERUSER`.
+2. Set that role's password as the repository secret `KITH_APP_ROLE_PASSWORD`,
+   replacing whatever was there before.
+3. Dispatch the workflow again with `mode: app-role`. It needs no confirmation
+   input. It runs no export, transform, audit or load; it reads the live host,
+   then grants the role exactly what `grantProofAppRole` names and verifies
+   the grant from a connection opened as that role, using the password from
+   the secret.
+
+Because the console, not this workflow, owns the password in this case, the
+step does not attempt `ALTER ROLE ... PASSWORD` a second time. It records
+`passwordManaged: "provider"` in the report and proves the secret is correct
+by connecting as the role and reading `kith`: a wrong password fails that
+connection and the report says `app_role_login_failed:<code>` rather than
+reporting success.
+
+Read the run summary and confirm it shows:
+
+| Fact                | Expected  |
+| -------------------- | --------- |
+| `appRoleCanRead`     | `true`    |
+| `appRoleCannotCreate` | `true`   |
+| `passwordManaged`    | `provider` |
+
+If the migration role also cannot `GRANT`/`REVOKE` on the `kith` schema (it
+must own that schema), the report says `app_role_grant_forbidden:42501`
+instead, with its own hint. That is a different, rarer problem: the migration
+role's own privileges need fixing in the provider's console before `app-role`
+mode can do anything.
+
+Once the summary shows the table above, continue with "What stays manual: the
+rest of step 9" below; the archive load and the role are both done.
 
 ## Local rehearsal
 

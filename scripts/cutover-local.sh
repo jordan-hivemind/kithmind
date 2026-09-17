@@ -150,6 +150,19 @@ KITH_CUTOVER_DATABASE_URL="$ISOLATED_URL" KITH_APP_ROLE_PASSWORD="$APP_ROLE_PASS
   node "$ROOT/scripts/cutover-app-role.mjs" --role kith_app --out "$REPORTS/app-role.json"
 cat "$REPORTS/app-role.json"
 
+# --- Runbook step 9, role half, rerun -----------------------------------------
+# The local twin of `mode: app-role`: rerunning the script against the same
+# database, the same role and the same password. Against a local superuser
+# this always takes the ALTER ROLE branch, so what this proves is that a
+# second run updates the existing role instead of recreating it, leaves
+# `created: false`, and still passes both verifications. The provider-managed
+# branch (ALTER refused with 42501) needs a connection that lacks CREATEROLE,
+# which scripts/cutover-app-role.test.mjs arranges directly.
+step "step 9 (role half, rerun): the same role and password again"
+KITH_CUTOVER_DATABASE_URL="$ISOLATED_URL" KITH_APP_ROLE_PASSWORD="$APP_ROLE_PASSWORD" \
+  node "$ROOT/scripts/cutover-app-role.mjs" --role kith_app --out "$REPORTS/app-role-second.json"
+cat "$REPORTS/app-role-second.json"
+
 # --- Summary -----------------------------------------------------------------
 step "summary"
 node "$ROOT/scripts/cutover-report.mjs" redact --staging "$STAGE" --reports "$REPORTS"
