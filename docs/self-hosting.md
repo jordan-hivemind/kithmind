@@ -105,26 +105,26 @@ The list below is derived from `apps/web/src/lib/mcp/environment.ts`
 guessed. "Set where" is `Vercel` (the web deployment's environment), `Daemon`
 (the always-on worker host that runs `kith-deferred-work`), or `Both`.
 
-| Variable                              | Read by                                          | Set where | Required                                        |
-| -------------------------------------- | ------------------------------------------------- | --------- | ------------------------------------------------ |
-| `KITH_POSTGRES_SURFACE`               | `lib/kith/surface.ts`, `lib/mcp/environment.ts`    | Vercel    | Optional; `postgres` selects this surface, anything else (including unset) reads as `convex` |
-| `KITH_DATABASE_URL`                   | `lib/kith/pool.ts`                                 | Vercel    | Required under `postgres`. The app role's connection string, not the migration role's -- `createKithPool` pins two connections and `search_path`, and the app role only has the grants `packages/kith-store/src/index.ts`'s `grantProofAppRole` names. `docs/plans/2026-09-16-cutover-runbook.md` says how that role is provisioned: `.github/workflows/cutover.yml` creates or updates it from the `app_role` input and the `KITH_APP_ROLE_PASSWORD` secret |
-| `KITH_SESSION_SECRET`                 | `lib/kith/session.ts`                              | Vercel    | Required under `postgres`; at least 32 characters, no default -- a missing one is a loud 500, never a silently shared signing key |
-| `MCP_PUBLIC_ORIGIN`                   | `lib/mcp/environment.ts` (`getMcpPublicOrigin`)    | Vercel    | Required under `postgres`. Under `convex`, `MCP_JWT_ISSUER` is still accepted as a deprecated fallback name for the same value; see "Kept from the Convex era" below |
-| `MCP_OAUTH_ENCRYPTION_KEY`            | `lib/mcp/oauth.ts`                                 | Vercel    | Required on both surfaces; unchanged from the Convex era |
-| `MCP_TOOL_PROFILE`                    | `lib/mcp/tool-policy.ts`                           | Vercel    | Optional on both surfaces; `full` by default, `memory` narrows the runtime tool set |
-| `FINANCE_ARCHIVE_READER_DATABASE_URL` | `lib/mcp/finance.ts`                               | Vercel    | Optional on both surfaces; the financial archive as its reader role, unchanged from the Convex era |
-| `FINANCE_ARCHIVE_SPACE_ID`            | `lib/mcp/finance.ts`                               | Vercel    | Optional; required together with the URL above |
-| `FINANCE_ARCHIVE_CURSOR_SECRET`       | `lib/mcp/finance.ts`                               | Vercel    | Optional; required together with the URL above -- at least 32 bytes, signs the archive's paging continuations |
-| `BRAIN_EMBED_API_KEY`                 | `packages/kith-store/src/embeddings/provider.ts` (`loadEmbeddingConfig`), reached through `lib/mcp/embedder.ts`'s shared seam | Vercel | Optional; takes precedence over `OPENAI_API_KEY` when set |
-| `OPENAI_API_KEY`                      | Same, via `lib/mcp/embedder.ts`                    | Vercel    | Optional; the default embedding key when `BRAIN_EMBED_ENDPOINT` is unset or is still the default OpenAI endpoint |
-| `BRAIN_EMBED_ENDPOINT`                | Same                                               | Vercel    | Optional; a custom endpoint requires `BRAIN_EMBED_PROVIDER_ID` and `BRAIN_EMBED_MODEL_REVISION` together with it |
-| `BRAIN_EMBED_PROVIDER_ID`             | Same                                               | Vercel    | Required together with `BRAIN_EMBED_ENDPOINT`; otherwise optional |
-| `BRAIN_EMBED_MODEL`                   | Same                                               | Vercel    | Optional; selects a compatible model |
-| `BRAIN_EMBED_MODEL_REVISION`          | Same                                               | Vercel    | Required together with `BRAIN_EMBED_ENDPOINT`; otherwise optional |
-| `BRAIN_EMBED_DIMENSIONS`              | Same                                               | Vercel    | Optional; must be `1536` for the current vector index when set |
-| `ANTHROPIC_API_KEY`                   | `packages/kith-store/src/memory/captureClassifier.ts` (`loadCaptureClassifierConfig`), reached through `lib/kith/capture.ts`'s classifier seam | Vercel | Optional; see below |
-| `KITH_STORE_DATABASE_URL`             | `packages/kith-store/src/deferred/cli.ts` (`kith-deferred-work`) | Daemon | Required for the daemon. A broader-privilege connection string than `KITH_DATABASE_URL`: the daemon and the migration tooling use it, the web app's narrower app role never does |
+| Variable                              | Read by                                                                                                                                        | Set where | Required                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `KITH_POSTGRES_SURFACE`               | `lib/kith/surface.ts`, `lib/mcp/environment.ts`                                                                                                | Vercel    | Optional; `postgres` selects this surface, anything else (including unset) reads as `convex`                                                                                                                                                                                                                                                                                                                                                                 |
+| `KITH_DATABASE_URL`                   | `lib/kith/pool.ts`                                                                                                                             | Vercel    | Required under `postgres`. The app role's connection string, not the migration role's -- `createKithPool` pins two connections and `search_path`, and the app role only has the grants `packages/kith-store/src/index.ts`'s `grantProofAppRole` names. `docs/plans/2026-09-16-cutover-runbook.md` says how that role is provisioned: `.github/workflows/cutover.yml` creates or updates it from the `app_role` input and the `KITH_APP_ROLE_PASSWORD` secret |
+| `KITH_SESSION_SECRET`                 | `lib/kith/session.ts`                                                                                                                          | Vercel    | Required under `postgres`; at least 32 characters, no default -- a missing one is a loud 500, never a silently shared signing key                                                                                                                                                                                                                                                                                                                            |
+| `MCP_PUBLIC_ORIGIN`                   | `lib/mcp/environment.ts` (`getMcpPublicOrigin`)                                                                                                | Vercel    | Required under `postgres`. Under `convex`, `MCP_JWT_ISSUER` is still accepted as a deprecated fallback name for the same value; see "Kept from the Convex era" below                                                                                                                                                                                                                                                                                         |
+| `MCP_OAUTH_ENCRYPTION_KEY`            | `lib/mcp/oauth.ts`                                                                                                                             | Vercel    | Required on both surfaces; unchanged from the Convex era                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `MCP_TOOL_PROFILE`                    | `lib/mcp/tool-policy.ts`                                                                                                                       | Vercel    | Optional on both surfaces; `full` by default, `memory` narrows the runtime tool set                                                                                                                                                                                                                                                                                                                                                                          |
+| `FINANCE_ARCHIVE_READER_DATABASE_URL` | `lib/mcp/finance.ts`                                                                                                                           | Vercel    | Optional on both surfaces; the financial archive as its reader role, unchanged from the Convex era                                                                                                                                                                                                                                                                                                                                                           |
+| `FINANCE_ARCHIVE_SPACE_ID`            | `lib/mcp/finance.ts`                                                                                                                           | Vercel    | Optional; required together with the URL above                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `FINANCE_ARCHIVE_CURSOR_SECRET`       | `lib/mcp/finance.ts`                                                                                                                           | Vercel    | Optional; required together with the URL above -- at least 32 bytes, signs the archive's paging continuations                                                                                                                                                                                                                                                                                                                                                |
+| `BRAIN_EMBED_API_KEY`                 | `packages/kith-store/src/embeddings/provider.ts` (`loadEmbeddingConfig`), reached through `lib/mcp/embedder.ts`'s shared seam                  | Both      | Optional; takes precedence over `OPENAI_API_KEY` when set; on the daemon host it is what `embedding_fill` jobs use                                                                                                                                                                                                                                                                                                                                           |
+| `OPENAI_API_KEY`                      | Same, via `lib/mcp/embedder.ts`                                                                                                                | Both      | Optional; the default embedding key when `BRAIN_EMBED_ENDPOINT` is unset or is still the default OpenAI endpoint; on the daemon host it is what `embedding_fill` jobs use                                                                                                                                                                                                                                                                                    |
+| `BRAIN_EMBED_ENDPOINT`                | Same                                                                                                                                           | Vercel    | Optional; a custom endpoint requires `BRAIN_EMBED_PROVIDER_ID` and `BRAIN_EMBED_MODEL_REVISION` together with it                                                                                                                                                                                                                                                                                                                                             |
+| `BRAIN_EMBED_PROVIDER_ID`             | Same                                                                                                                                           | Vercel    | Required together with `BRAIN_EMBED_ENDPOINT`; otherwise optional                                                                                                                                                                                                                                                                                                                                                                                            |
+| `BRAIN_EMBED_MODEL`                   | Same                                                                                                                                           | Vercel    | Optional; selects a compatible model                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `BRAIN_EMBED_MODEL_REVISION`          | Same                                                                                                                                           | Vercel    | Required together with `BRAIN_EMBED_ENDPOINT`; otherwise optional                                                                                                                                                                                                                                                                                                                                                                                            |
+| `BRAIN_EMBED_DIMENSIONS`              | Same                                                                                                                                           | Vercel    | Optional; must be `1536` for the current vector index when set                                                                                                                                                                                                                                                                                                                                                                                               |
+| `ANTHROPIC_API_KEY`                   | `packages/kith-store/src/memory/captureClassifier.ts` (`loadCaptureClassifierConfig`), reached through `lib/kith/capture.ts`'s classifier seam | Vercel    | Optional; see below                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `KITH_STORE_DATABASE_URL`             | `packages/kith-store/src/deferred/cli.ts` (`kith-deferred-work`)                                                                               | Daemon    | Required for the daemon. A broader-privilege connection string than `KITH_DATABASE_URL`: the daemon and the migration tooling use it, the web app's narrower app role never does                                                                                                                                                                                                                                                                             |
 
 The embedding provider row is read by the three vector-backed MCP read tools
 (`search_documents`, `search_thoughts`, `recall_context`) and by narrative
@@ -139,7 +139,7 @@ is complete enough to search (`lib/kith/capture.ts`'s module comment,
 complete index also never reaches the embedder, by design, not as a
 degradation.
 
-`ANTHROPIC_API_KEY` on this row is the *web* deployment's key, distinct from
+`ANTHROPIC_API_KEY` on this row is the _web_ deployment's key, distinct from
 the Convex-era row of the same name earlier in this document: under
 `convex`, narrative capture's admission gate runs on the Convex deployment
 and reads its own `ANTHROPIC_API_KEY` there; under `postgres`, the same gate
@@ -161,11 +161,11 @@ Vercel as well.
 MCP authentication off Convex, but the 17 MCP tools stay on it until i3 and
 i4's ported services are reached from `postgres`'s branch of each tool, and a
 `postgres` deployment that dropped this variable today would authenticate and
-then fail at the first tool call. `MCP_JWT_ISSUER` on the *Convex* deployment
+then fail at the first tool call. `MCP_JWT_ISSUER` on the _Convex_ deployment
 (set with `convex env set MCP_JWT_ISSUER`, read by `auth.config.ts`,
 `lib/mcpAuth.ts` and `lib/webAuth.ts`) stays required regardless of which
 surface the web deployment reads, because those three files must still agree
-on one issuer until i7b deletes the JWT bridge entirely. Only the *web*
+on one issuer until i7b deletes the JWT bridge entirely. Only the _web_
 deployment's spelling renamed, to `MCP_PUBLIC_ORIGIN`.
 
 ### Read only under `convex`
@@ -175,7 +175,7 @@ required under `convex` and validated for shape whenever present under
 `postgres`, but nothing on the `postgres` branch of any route reads them:
 `lib/mcp/convex-auth.ts`, the only place that mints a token from them, is
 reached only from each dual-surface route's `convex` branch.
-`MCP_JWT_ISSUER` on the *web* deployment is the deprecated spelling of
+`MCP_JWT_ISSUER` on the _web_ deployment is the deprecated spelling of
 `MCP_PUBLIC_ORIGIN`; it is still accepted there under `convex` and reported by
 `validateMcpEnvironment` as `deprecated` (not `missing` or `invalid`) so a
 working deployment is not told it is broken, but nothing reads it at all
@@ -197,24 +197,21 @@ kith-deferred-work tick [--interval-ms N]
 kith-deferred-work drain [--interval-ms N] [--max-jobs N]
 ```
 
-`KITH_STORE_DATABASE_URL` is the only environment variable it reads today;
-there is no default connection string. `docs/kithmind-deferred-work.launchd.plist.txt`
+The daemon reads `KITH_STORE_DATABASE_URL` (required, no default) and, for
+`embedding_fill` jobs, the same embedding provider variables the web deployment
+reads: the `BRAIN_EMBED_*` set or `OPENAI_API_KEY`, set independently on the
+daemon host because the two processes share no environment. See the embedding
+provider configuration table above. `docs/kithmind-deferred-work.launchd.plist.txt`
 is the per-user LaunchAgent template: a private wrapper script (not the
-checked-in plist) exports `KITH_STORE_DATABASE_URL` from a Keychain item, the
-same pattern `docs/worker-service.md`'s filesystem-worker wrapper uses for its
-own credential, and execs `kith-deferred-work tick --interval-ms 60000` --
-matching the per-minute cadence of the two Convex crons this daemon replaces
-that ran that often.
+checked-in plist) exports these variables from Keychain items, the same pattern
+`docs/worker-service.md`'s filesystem-worker wrapper uses for its own credential,
+and execs `kith-deferred-work tick --interval-ms 60000` -- matching the
+per-minute cadence of the two Convex crons this daemon replaces that ran that often.
 
-The `embedding_fill` deferred-work kind is registered in
-`packages/kith-store/src/deferred/registry.ts` but has no handler wired in
-yet (see that file's own comment). Once a fill handler lands, it will call
-the same embedding provider `lib/mcp/embedder.ts` calls from the web
-deployment, which means the daemon's environment will need the same
-`BRAIN_EMBED_*`/`OPENAI_API_KEY` rows documented above, set independently on
-the daemon host -- the two processes share no environment. This runbook will
-gain that requirement in the row that lands the handler; it is not required
-today.
+The `embedding_fill` deferred-work handler is wired in `packages/kith-store/src/deferred/cli.ts`
+and `packages/kith-store/src/deferred/registry.ts`. A daemon with the embedding provider
+unset still starts and runs every sweep; only `embedding_fill` jobs fail in that case,
+without leaking the key or provider message.
 
 ## 1. Prepare the fork locally
 
