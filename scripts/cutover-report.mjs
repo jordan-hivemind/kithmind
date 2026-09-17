@@ -378,6 +378,7 @@ export function buildSummary(context, data) {
           ["Role name", data.appRole.role],
           ["Verdict", data.appRole.ok ? "ok" : "FAILED"],
           ["Role state", data.appRole.created ? "created" : "updated"],
+          ["Password managed", data.appRole.passwordManaged ?? "n/a"],
           ["Can read `kith`", String(data.appRole.appRoleCanRead)],
           ["Refused CREATE", String(data.appRole.appRoleCannotCreate)],
           [
@@ -387,6 +388,9 @@ export function buildSummary(context, data) {
         ],
       ),
     );
+    if (data.appRole.hint) {
+      lines.push(`Hint: ${data.appRole.hint}`, "");
+    }
   }
 
   lines.push(

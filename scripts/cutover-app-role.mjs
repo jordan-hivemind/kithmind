@@ -106,6 +106,22 @@ export function validateAppRolePassword(password) {
  * it. `grantProofAppRole` runs after that transaction commits: it is already
  * idempotent (it revokes before it grants) and issues its own statements
  * against the pool, the same way every existing caller uses it.
+ *
+ * Three privilege shapes this handles, because a hosted provider's project
+ * role is often the database's owner without `CREATEROLE`:
+ *
+ * - The role does not exist and this connection cannot create one (`42501`):
+ *   nothing is created and nothing is granted. The report names the operator
+ *   action (create the role in the provider's console, store its password,
+ *   rerun the workflow in `app-role` mode) and this never throws.
+ * - The role exists and this connection cannot `ALTER ROLE ... PASSWORD`
+ *   (also `42501`, the shape a provider-managed role produces): the password
+ *   is left exactly as the provider's console set it, `passwordManaged`
+ *   records `"provider"`, and the grants and the two verifications still run
+ *   with the password the caller supplied. The verification connection below
+ *   is what proves that supplied password matches the console's password.
+ * - The role exists and this connection can `ALTER ROLE`: unchanged from
+ *   before, and `passwordManaged` records `"workflow"`.
  */
 export async function provisionAppRole(connectionString, role, password) {
   validateAppRoleName(role);
@@ -123,6 +139,7 @@ export async function provisionAppRole(connectionString, role, password) {
 
   try {
     let created = false;
+    let passwordManaged = "workflow";
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
@@ -138,35 +155,98 @@ export async function provisionAppRole(connectionString, role, password) {
         await client.query("SELECT quote_literal($1::text) AS q", [password])
       ).rows[0].q;
       if (!exists) {
-        await client.query(
-          `CREATE ROLE "${role}" LOGIN PASSWORD ${quotedPassword} NOINHERIT NOCREATEDB NOCREATEROLE NOSUPERUSER`,
-        );
-        created = true;
+        try {
+          await client.query(
+            `CREATE ROLE "${role}" LOGIN PASSWORD ${quotedPassword} NOINHERIT NOCREATEDB NOCREATEROLE NOSUPERUSER`,
+          );
+          created = true;
+          await client.query("COMMIT");
+        } catch (error) {
+          await client.query("ROLLBACK").catch(() => {});
+          if (error?.code !== INSUFFICIENT_PRIVILEGE) throw error;
+          // The migration role cannot CREATEROLE on this host. Nothing was
+          // created and nothing below runs: there is no role to grant on or
+          // verify against yet.
+          return {
+            ok: false,
+            role,
+            created: false,
+            grants: "not_applied",
+            passwordManaged: null,
+            appRoleCanRead: false,
+            appRoleCannotCreate: false,
+            problems: ["app_role_create_forbidden:42501"],
+            hint:
+              "The migration role cannot create roles on this host. Create the role " +
+              `"${role}" in the provider's console with LOGIN and no other attribute, ` +
+              "store that role's password as the KITH_APP_ROLE_PASSWORD secret, and " +
+              "rerun the workflow in app-role mode.",
+          };
+        }
       } else {
-        await client.query(`ALTER ROLE "${role}" WITH PASSWORD ${quotedPassword}`);
-        created = false;
+        try {
+          await client.query(`ALTER ROLE "${role}" WITH PASSWORD ${quotedPassword}`);
+          await client.query("COMMIT");
+        } catch (error) {
+          await client.query("ROLLBACK").catch(() => {});
+          if (error?.code !== INSUFFICIENT_PRIVILEGE) throw error;
+          // The role exists but this connection cannot re-password it: the
+          // provider's console owns the password. Trust the supplied
+          // password and let the verification connection below prove it.
+          passwordManaged = "provider";
+        }
       }
-      await client.query("COMMIT");
-    } catch (error) {
-      await client.query("ROLLBACK").catch(() => {});
-      throw error;
     } finally {
       client.release();
     }
 
     // The grant list itself lives in exactly one place: grantProofAppRole.
-    await kithStore.grantProofAppRole(pool, role);
+    try {
+      await kithStore.grantProofAppRole(pool, role);
+    } catch (error) {
+      if (error?.code !== INSUFFICIENT_PRIVILEGE) throw error;
+      return {
+        ok: false,
+        role,
+        created,
+        grants: "not_applied",
+        passwordManaged,
+        appRoleCanRead: false,
+        appRoleCannotCreate: false,
+        problems: ["app_role_grant_forbidden:42501"],
+        hint:
+          "The migration role cannot GRANT or REVOKE on schema kith. It must own the " +
+          "kith schema for this step to run.",
+      };
+    }
 
     // A second connection, as the app role itself, built from the owner URL's
-    // host, port and database -- only the credentials change.
+    // host, port and database -- only the credentials change. When
+    // `passwordManaged` is `"provider"` this connection is also the proof
+    // that the supplied `KITH_APP_ROLE_PASSWORD` matches the console's
+    // password: it is never written by this script in that case.
     const appUrl = new URL(connectionString);
     appUrl.username = role;
     appUrl.password = password;
     const appClient = new pgModule.Client({ connectionString: appUrl.toString() });
 
+    try {
+      await appClient.connect();
+    } catch (error) {
+      return {
+        ok: false,
+        role,
+        created,
+        grants: "applied",
+        passwordManaged,
+        appRoleCanRead: false,
+        appRoleCannotCreate: false,
+        problems: [`app_role_login_failed:${error?.code ?? error?.message ?? "unknown"}`],
+      };
+    }
+
     let appRoleCanRead = false;
     let appRoleCannotCreate = false;
-    await appClient.connect();
     try {
       try {
         await appClient.query("SELECT count(*) FROM kith.users");
@@ -201,6 +281,7 @@ export async function provisionAppRole(connectionString, role, password) {
       role,
       created,
       grants: "applied",
+      passwordManaged,
       appRoleCanRead,
       appRoleCannotCreate,
       problems,

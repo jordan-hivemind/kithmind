@@ -33,16 +33,26 @@ name: Cutover
 # anyone who can read this public repository. Staging the owner's archive in
 # either of them to save one export is not a trade worth making, so the export
 # runs every time.
+#
+# `app-role` mode exists for a live run that already loaded the archive but
+# could not provision the login role, because the migration role is a hosted
+# provider's project-owner role without `CREATEROLE`. It runs no export, no
+# transform, no audit and no load -- it does not touch Convex and it does not
+# write `kith` -- and its host check does not require an empty `kith`, because
+# on this path `kith` is expected to already hold the archive. See
+# `docs/plans/2026-09-16-cutover-runbook.md`, "If the live run stops at the app
+# role".
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "rehearsal loads only a throwaway database; live also loads the hosted archive database"
+        description: "rehearsal loads only a throwaway database; live also loads the hosted archive database; app-role only provisions the web app's login role against the live archive database"
         type: choice
         options:
           - rehearsal
           - live
+          - app-role
         default: rehearsal
         required: true
       confirm:
@@ -118,8 +128,10 @@ jobs:
             echo "::error::app_role must match ^[a-z][a-z0-9_]{0,62}$ (a plain PostgreSQL role name); refusing before anything runs." >&2
             exit 1
           fi
-          if [ "$HAS_CONVEX_DEPLOY_KEY" != "true" ]; then
-            echo "::error::The repository secret CONVEX_DEPLOY_KEY is not set. Both modes need it to export Convex." >&2
+          # app-role mode runs no export, so it does not need the Convex deploy
+          # key. rehearsal and live both export and need it.
+          if [ "$MODE" != "app-role" ] && [ "$HAS_CONVEX_DEPLOY_KEY" != "true" ]; then
+            echo "::error::The repository secret CONVEX_DEPLOY_KEY is not set. rehearsal and live mode need it to export Convex." >&2
             exit 1
           fi
           if [ "$MODE" = "live" ]; then
@@ -134,6 +146,20 @@ jobs:
             if [ "$HAS_APP_ROLE_PASSWORD" != "true" ]; then
               echo "::error::The repository secret KITH_APP_ROLE_PASSWORD is not set. live mode needs it to provision the web app's login role." >&2
               exit 1
+            fi
+          elif [ "$MODE" = "app-role" ]; then
+            # No confirm input: app-role never writes kith or finance, it only
+            # provisions the login role and its grants.
+            if [ "$HAS_MIGRATION_DATABASE_URL" != "true" ]; then
+              echo "::error::The repository secret KITH_MIGRATION_DATABASE_URL is not set. app-role mode needs it to read the archive host and provision the role." >&2
+              exit 1
+            fi
+            if [ "$HAS_APP_ROLE_PASSWORD" != "true" ]; then
+              echo "::error::The repository secret KITH_APP_ROLE_PASSWORD is not set. app-role mode needs it to provision the web app's login role." >&2
+              exit 1
+            fi
+            if [ -n "$CONFIRM" ]; then
+              echo "::notice::app-role mode ignores the confirm input."
             fi
           elif [ -n "$CONFIRM" ]; then
             echo "::notice::rehearsal mode ignores the confirm input."
@@ -192,9 +218,11 @@ jobs:
 
       # The loader shells out to `psql \copy`, and the runner image ships the 16
       # client against a 17 server. Same install, same key, same source as
-      # ci.yml's `verify` job.
+      # ci.yml's `verify` job. app-role mode runs no `kith-migrate` command
+      # that shells out to `psql`, so it skips this install.
       - id: postgres_client
         name: Install the PostgreSQL 17 client
+        if: inputs.mode != 'app-role'
         run: |
           sudo install -d /usr/share/postgresql-common/pgdg
           sudo curl --fail --silent --show-error \
@@ -218,6 +246,7 @@ jobs:
       # owner's backup recipe, not this workflow.
       - id: export_convex
         name: Export the Convex production deployment
+        if: inputs.mode != 'app-role'
         env:
           CONVEX_DEPLOY_KEY: ${{ secrets.CONVEX_DEPLOY_KEY }}
         run: |
@@ -231,6 +260,7 @@ jobs:
 
       - id: export_stage
         name: Stage the export as per-table JSONL with a manifest
+        if: inputs.mode != 'app-role'
         run: |
           umask 077
           # `--deployment-identity redacted`, not the deployment slug: the
@@ -249,6 +279,7 @@ jobs:
 
       - id: export_verify
         name: Verify the export manifest
+        if: inputs.mode != 'app-role'
         run: |
           umask 077
           node "$KITH_MIGRATE" export --verify-manifest --dir "$STAGE/export" \
@@ -259,6 +290,7 @@ jobs:
       # plan step 3's acceptance asks for.
       - id: transform
         name: Transform the export into COPY-ready CSV
+        if: inputs.mode != 'app-role'
         run: |
           umask 077
           node "$KITH_MIGRATE" transform --export "$STAGE/export" --out "$STAGE/csv" > /dev/null
@@ -271,6 +303,7 @@ jobs:
       # schema of its own, which is not something to do to the live database.
       - id: audit
         name: Audit the transformed rows against the kith constraints
+        if: inputs.mode != 'app-role'
         run: |
           umask 077
           psql "$THROWAWAY_ADMIN_URL" -X -q -c "CREATE DATABASE $AUDIT_DATABASE"
@@ -298,6 +331,7 @@ jobs:
       # 4. Load into an isolated destination. Never the live database.
       - id: load_isolated
         name: Load the CSV into the throwaway database
+        if: inputs.mode != 'app-role'
         run: |
           psql "$THROWAWAY_ADMIN_URL" -X -q -c "CREATE DATABASE $ISOLATED_DATABASE"
           node "$KITH_MIGRATE" load --csv "$STAGE/csv" \
@@ -307,6 +341,7 @@ jobs:
       # any failing check, so `set -e` is the gate.
       - id: parity_isolated
         name: Run the parity checks against the throwaway database
+        if: inputs.mode != 'app-role'
         run: |
           umask 077
           node "$KITH_MIGRATE" parity \
@@ -349,15 +384,22 @@ jobs:
             KITH_APP_ROLE_PASSWORD="$APP_ROLE_PASSWORD" \
             node "$GITHUB_WORKSPACE/scripts/cutover-app-role.mjs" \
               --role "$APP_ROLE" --out "$REPORTS/app-role.json" > /dev/null
-          node -e 'const r = require(process.argv[1]); console.log(JSON.stringify({ok: r.ok, role: r.role, created: r.created, appRoleCanRead: r.appRoleCanRead, appRoleCannotCreate: r.appRoleCannotCreate, problems: r.problems}));' \
+          node -e 'const r = require(process.argv[1]); console.log(JSON.stringify({ok: r.ok, role: r.role, created: r.created, passwordManaged: r.passwordManaged, appRoleCanRead: r.appRoleCanRead, appRoleCannotCreate: r.appRoleCannotCreate, problems: r.problems}));' \
             "$REPORTS/app-role.json"
 
-      # 1, host half, and step 8's "before". Live only. Read-only: this is the
-      # last chance to find out that the host is not what anyone thought before
-      # a single row is written.
+      # 1, host half, and step 8's "before". Live and app-role. Read-only: this
+      # is the last chance to find out that the host is not what anyone
+      # thought before a single row is written, in live mode, or before
+      # granting anything, in app-role mode.
+      #
+      # `--expect-empty-kith` only in live mode: a `kith` schema that already
+      # holds rows there means a load already ran, and loading again would
+      # duplicate the archive. app-role mode runs after that load, so `kith`
+      # holding rows is the point, and this check only asserts the schema is
+      # present at the expected version.
       - id: host_before
         name: Verify the live host and capture the finance baseline
-        if: inputs.mode == 'live'
+        if: inputs.mode == 'live' || inputs.mode == 'app-role'
         env:
           KITH_CUTOVER_DATABASE_URL: ${{ secrets.KITH_MIGRATION_DATABASE_URL }}
         run: |
@@ -366,10 +408,12 @@ jobs:
           # the host, user, password or database name taken out of it, and a
           # `psql` or `pg` error message can quote any of them.
           node -e 'const u = new URL(process.env.KITH_CUTOVER_DATABASE_URL); for (const v of [u.hostname, u.username, u.password, u.pathname.slice(1)]) if (v) console.log("::add-mask::" + v);'
-          # `--expect-empty-kith`: a `kith` schema that already holds rows means
-          # a load already ran, and loading again would duplicate the archive.
+          EXPECT_EMPTY_KITH=""
+          if [ "$MODE" = "live" ]; then
+            EXPECT_EMPTY_KITH="--expect-empty-kith"
+          fi
           node "$GITHUB_WORKSPACE/scripts/cutover-host-check.mjs" capture \
-            --out "$REPORTS/host-before.json" --expect-empty-kith > /dev/null
+            --out "$REPORTS/host-before.json" $EXPECT_EMPTY_KITH > /dev/null
           node -e 'const r = require(process.argv[1]); console.log(JSON.stringify({ok: r.ok, server: r.server, vector: r.vector, kithVersion: r.kith.schemaVersion, kithExpected: r.kith.expectedVersion, readerRole: r.kith.readerRolePresent, readerReadOnly: r.kith.readerRoleReadOnly, financeVersion: r.finance.schemaVersion, financeTables: r.finance.tables.length, problems: r.problems}));' \
             "$REPORTS/host-before.json"
 
@@ -426,12 +470,15 @@ jobs:
       # Runbook step 9's role half. Creates or updates the login role
       # `KITH_DATABASE_URL` names on Vercel and grants it exactly what
       # `grantProofAppRole` in `packages/kith-store/src/index.ts` names.
-      # Deliberately after the live parity rerun and the finance comparison: the
-      # load and its own proof come first, and provisioning a role a failed load
-      # should never have reached is not worth doing early.
-      - id: app_role_live
+      # In live mode this is deliberately after the live parity rerun and the
+      # finance comparison: the load and its own proof come first, and
+      # provisioning a role a failed load should never have reached is not
+      # worth doing early. app-role mode runs this same step alone, against
+      # an archive `live` already loaded and verified in an earlier run --
+      # see the runbook's "If the live run stops at the app role".
+      - id: app_role_provision
         name: Provision the web app's login role on the live archive database
-        if: inputs.mode == 'live'
+        if: inputs.mode == 'live' || inputs.mode == 'app-role'
         env:
           KITH_CUTOVER_DATABASE_URL: ${{ secrets.KITH_MIGRATION_DATABASE_URL }}
           KITH_APP_ROLE_PASSWORD: ${{ secrets.KITH_APP_ROLE_PASSWORD }}
@@ -441,7 +488,7 @@ jobs:
           echo "::add-mask::$KITH_APP_ROLE_PASSWORD"
           node "$GITHUB_WORKSPACE/scripts/cutover-app-role.mjs" \
             --role "$APP_ROLE" --out "$REPORTS/app-role.json" > /dev/null
-          node -e 'const r = require(process.argv[1]); console.log(JSON.stringify({ok: r.ok, role: r.role, created: r.created, appRoleCanRead: r.appRoleCanRead, appRoleCannotCreate: r.appRoleCannotCreate, problems: r.problems}));' \
+          node -e 'const r = require(process.argv[1]); console.log(JSON.stringify({ok: r.ok, role: r.role, created: r.created, passwordManaged: r.passwordManaged, appRoleCanRead: r.appRoleCanRead, appRoleCannotCreate: r.appRoleCannotCreate, problems: r.problems, hint: r.hint}));' \
             "$REPORTS/app-role.json"
 
       - id: summary

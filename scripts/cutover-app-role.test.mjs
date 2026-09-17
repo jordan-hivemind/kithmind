@@ -183,3 +183,132 @@ test(
     }
   },
 );
+
+test(
+  "a provider-managed role: ALTER ROLE is refused, but the grants and both verifications still run",
+  { skip },
+  async (t) => {
+    const pg = await pgClientModule();
+    const providerRole = `kith_provider_owner_${Math.random().toString(16).slice(2, 8)}`;
+    const appRole = `kith_app_provider_${Math.random().toString(16).slice(2, 8)}`;
+    const providerRolePassword = "provider-owner-pw-abcdef12";
+    const appRolePassword = "provider-console-password-1";
+
+    // Registered before `throwawayKithDatabase` registers the database drop,
+    // for the same reason the earlier test in this file does: both roles'
+    // owned objects (the whole `kith` schema, in `providerRole`'s case) must
+    // be dropped while the database that holds them still exists.
+    let target = null;
+    t.after(async () => {
+      if (!target) return;
+      const admin = new pg.default.Client({ connectionString: target });
+      await admin.connect();
+      // CASCADE: `providerRole` owns the `kith` schema itself (reassigned
+      // below), and a plain `DROP OWNED BY` refuses to drop a schema that
+      // still has dependent objects in it (here, the schema's own domain
+      // types) -- the same as `DROP SCHEMA ... RESTRICT` would. This is a
+      // throwaway database this test's own `t.after` drops next, so cascading
+      // is safe.
+      await admin.query(`DROP OWNED BY "${providerRole}" CASCADE`).catch(() => {});
+      await admin.query(`DROP ROLE IF EXISTS "${providerRole}"`).catch(() => {});
+      await admin.query(`DROP OWNED BY "${appRole}" CASCADE`).catch(() => {});
+      await admin.query(`DROP ROLE IF EXISTS "${appRole}"`).catch(() => {});
+      await admin.end();
+    });
+    target = await throwawayKithDatabase(t);
+
+    const admin = new pg.default.Client({ connectionString: target });
+    await admin.connect();
+
+    // The role a provider's console would have created by hand: LOGIN and a
+    // known password, nothing else.
+    await admin.query(
+      `CREATE ROLE "${appRole}" LOGIN PASSWORD '${appRolePassword}'`,
+    );
+
+    // The role this test stands in for the migration role on a hosted
+    // provider: no CREATEROLE (so it can create or re-password neither
+    // role above), but the owner of `kith` and every table in it (so it can
+    // still GRANT and REVOKE on them) -- the same split a provider's
+    // project-owner role has. Made by handing it ownership of the schema
+    // `throwawayKithDatabase` already applied, rather than by revoking
+    // CREATEROLE from an existing role: the local superuser connecting to
+    // this suite needs to keep CREATEROLE itself, to create and drop the
+    // throwaway databases and roles every test in this file uses.
+    await admin.query(
+      `CREATE ROLE "${providerRole}" LOGIN PASSWORD '${providerRolePassword}' NOCREATEROLE NOCREATEDB NOSUPERUSER`,
+    );
+    await admin.query(`ALTER SCHEMA kith OWNER TO "${providerRole}"`);
+    const tables = (
+      await admin.query(`SELECT tablename FROM pg_tables WHERE schemaname = 'kith'`)
+    ).rows;
+    for (const { tablename } of tables) {
+      await admin.query(`ALTER TABLE kith."${tablename}" OWNER TO "${providerRole}"`);
+    }
+    await admin.end();
+
+    const providerUrl = new URL(target);
+    providerUrl.username = providerRole;
+    providerUrl.password = providerRolePassword;
+
+    const result = await provisionAppRole(providerUrl.toString(), appRole, appRolePassword);
+    assert.equal(result.ok, true, JSON.stringify(result.problems));
+    assert.equal(result.role, appRole);
+    assert.equal(result.created, false, "the role already existed");
+    assert.equal(result.passwordManaged, "provider");
+    assert.equal(result.grants, "applied");
+    assert.equal(result.appRoleCanRead, true);
+    assert.equal(result.appRoleCannotCreate, true, "CREATE was still refused for the app role");
+    assert.deepEqual(result.problems, []);
+    assert.equal(JSON.stringify(result).includes(appRolePassword), false);
+    assert.equal(JSON.stringify(result).includes(target), false);
+  },
+);
+
+test(
+  "the create-forbidden path returns a report instead of throwing, and names the fix",
+  { skip },
+  async (t) => {
+    const pg = await pgClientModule();
+    const restrictedRole = `kith_no_createrole_${Math.random().toString(16).slice(2, 8)}`;
+    const restrictedRolePassword = "restricted-role-pw-abcdef12";
+    const appRole = `kith_app_forbidden_${Math.random().toString(16).slice(2, 8)}`;
+    const name = `kith_cutover_app_role_forbid_${Math.random().toString(16).slice(2, 12)}`;
+
+    t.after(async () => {
+      const cleaner = new pg.default.Client({ connectionString: DATABASE_URL });
+      await cleaner.connect();
+      await cleaner.query(`DROP ROLE IF EXISTS "${restrictedRole}"`).catch(() => {});
+      await cleaner.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`).catch(() => {});
+      await cleaner.end();
+    });
+
+    const admin = new pg.default.Client({ connectionString: DATABASE_URL });
+    await admin.connect();
+    await admin.query(`CREATE DATABASE ${name}`);
+    // No `kith` schema is applied here: the create-forbidden path returns
+    // before `grantProofAppRole` ever runs, so nothing downstream needs it.
+    await admin.query(
+      `CREATE ROLE "${restrictedRole}" LOGIN PASSWORD '${restrictedRolePassword}' NOCREATEROLE NOCREATEDB NOSUPERUSER`,
+    );
+    await admin.end();
+
+    const restrictedUrl = new URL(DATABASE_URL);
+    restrictedUrl.pathname = `/${name}`;
+    restrictedUrl.username = restrictedRole;
+    restrictedUrl.password = restrictedRolePassword;
+
+    const result = await provisionAppRole(restrictedUrl.toString(), appRole, "a".repeat(24));
+    assert.equal(result.ok, false);
+    assert.equal(result.role, appRole);
+    assert.equal(result.created, false);
+    assert.equal(result.grants, "not_applied");
+    assert.equal(result.passwordManaged, null);
+    assert.equal(result.appRoleCanRead, false);
+    assert.equal(result.appRoleCannotCreate, false);
+    assert.deepEqual(result.problems, ["app_role_create_forbidden:42501"]);
+    assert.match(result.hint, /provider/i);
+    assert.match(result.hint, /KITH_APP_ROLE_PASSWORD/);
+    assert.match(result.hint, /app-role/);
+  },
+);
