@@ -228,6 +228,25 @@ function verifyConfig({ tool, restoreProofConfigPath }, overrides = {}) {
   };
 }
 
+test("loadPostgresVerifyConfig accepts restic's rclone repository spec", async (t) => {
+  const fixtureState = await fixture(t);
+  const identityPath = join(fixtureState.root, "identity.txt");
+  await writeFile(identityPath, "AGE-SECRET-KEY-1FAKE\n", { mode: 0o600 });
+  const configPath = join(fixtureState.root, "verify.json");
+  await writeFile(
+    configPath,
+    JSON.stringify(
+      verifyConfig(fixtureState, {
+        ageIdentityPath: identityPath,
+        resticRepositoryPath: "rclone:kith_remote:backups/restic-v1",
+      }),
+    ),
+    { mode: 0o600 },
+  );
+  const loaded = await loadPostgresVerifyConfig(configPath);
+  assert.equal(loaded.resticRepositoryPath, "rclone:kith_remote:backups/restic-v1");
+});
+
 test("loadPostgresVerifyConfig requires the age identity file to be mode 0600", async (t) => {
   const fixtureState = await fixture(t);
   const identityPath = join(fixtureState.root, "identity.txt");
