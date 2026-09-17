@@ -44,6 +44,43 @@ test("export, transform, COPY-load and the parity harness round-trip on a throwa
 
     await loadCsvDirectory({ connectionString: database.connectionString }, csvDir);
 
+    // The cleared references arrive as NULL on rows that are otherwise whole:
+    // the deferred foreign keys hold at COMMIT, and the row keeps every
+    // pointer the export could still satisfy.
+    const { ids } = syntheticConvexTables();
+    const clearedPool = new pg.Pool({
+      connectionString: database.connectionString,
+      max: 1,
+    });
+    try {
+      const inventory = await clearedPool.query(
+        `SELECT first_seen_scan_id, last_seen_scan_id, source_item_id
+           FROM kith.source_inventory WHERE id = $1`,
+        [ids.sourceInventoryRowan],
+      );
+      assert.equal(inventory.rows[0].first_seen_scan_id, null);
+      assert.equal(inventory.rows[0].last_seen_scan_id, null);
+      assert.equal(inventory.rows[0].source_item_id, ids.sourceItemRowan);
+
+      const job = await clearedPool.query(
+        `SELECT worker_discovery_work_id, source_item_id
+           FROM kith.ingest_jobs WHERE id = $1`,
+        [ids.ingestJobRowan],
+      );
+      assert.equal(job.rows[0].worker_discovery_work_id, null);
+      assert.equal(job.rows[0].source_item_id, ids.sourceItemRowan);
+
+      const receipt = await clearedPool.query(
+        `SELECT actor_credential_id, actor_user_id
+           FROM kith.worker_reservation_receipts WHERE id = $1`,
+        [ids.reservationReceiptRowan],
+      );
+      assert.equal(receipt.rows[0].actor_credential_id, null);
+      assert.notEqual(receipt.rows[0].actor_user_id, null);
+    } finally {
+      await clearedPool.end();
+    }
+
     // Check 6's surface, supplied by P2-39c. It drives the real identity
     // functions against the loaded database, so the six denials are proven on the
     // schema the migration produced rather than on a fixture.

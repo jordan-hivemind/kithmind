@@ -205,6 +205,25 @@ export function buildSummary(context, data) {
         rowCounts.sort(([a], [b]) => a.localeCompare(b)).map(([n, c]) => [n, String(c)]),
       ),
     );
+    // Reference columns written as NULL instead of the id the export held.
+    // Counts and reasons only, never an id: this summary is published.
+    const cleared = Object.entries(data.transform.clearedReferences ?? {});
+    lines.push(
+      "Cleared references:",
+      "",
+      ...(cleared.length
+        ? table(
+            ["Column", "Count", "Reason"],
+            cleared
+              .sort(([a], [b]) => a.localeCompare(b))
+              .map(([column, entry]) => [
+                column,
+                String(entry.count),
+                entry.reason,
+              ]),
+          )
+        : ["none", ""]),
+    );
   } else {
     lines.push("_no transform report_", "");
   }

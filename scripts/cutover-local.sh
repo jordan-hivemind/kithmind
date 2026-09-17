@@ -104,7 +104,7 @@ cat "$REPORTS/manifest-verification.json"
 step "step 3: transform"
 node "$KITH_MIGRATE" transform --export "$STAGE/export" --out "$STAGE/csv" >/dev/null
 cp "$STAGE/csv/transform-report.json" "$REPORTS/transform-report.json"
-node -e 'const r = require(process.argv[1]); console.log(JSON.stringify({tables: Object.keys(r.rowCounts).length, rows: Object.values(r.rowCounts).reduce((a,b)=>a+b,0), unmapped: r.unmapped}));' \
+node -e 'const r = require(process.argv[1]); const cleared = Object.fromEntries(Object.entries(r.clearedReferences ?? {}).map(([k, v]) => [k, v.count])); console.log(JSON.stringify({tables: Object.keys(r.rowCounts).length, rows: Object.values(r.rowCounts).reduce((a,b)=>a+b,0), unmapped: r.unmapped, clearedReferences: cleared}));' \
   "$REPORTS/transform-report.json"
 
 # --- Step 3.5. Audit ---------------------------------------------------------

@@ -165,6 +165,15 @@ retry idempotent, and the always-on host's journal still holds the request ids
 that index them. Queue and scan state is drained instead, because a quiesced
 worker has no in-flight work to preserve.
 
+A migrated row may still point into a drained table. The transform writes NULL
+for such a reference and counts it in the transform report under
+`clearedReferences`, keyed by column with the reason `target drained`. It is the
+pointer that is gone, not the row that holds it, and every one of those columns
+is nullable. A credential pointer is cleared the same way when the export holds
+no `apiKeys` row for it, because Convex deletes a revoked key outright rather
+than retiring it. Nothing else is cleared, so any other dangling reference is
+still a foreign-key violation the audit reports.
+
 ### 1.3 Function groups and their PostgreSQL targets
 
 | Group                            | Functions | PostgreSQL target                                                                                            |

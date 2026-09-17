@@ -87,6 +87,7 @@ hold.
 | Export manifest      | One row per Convex table, with a count, a byte length and a SHA-256 for each                  |
 | Manifest verification | `ok`, with an empty problem list                                                             |
 | Transform            | `Unmapped fields: none`. Any unmapped field is a hard failure and the step will have failed.  |
+| Cleared references   | Two kinds only. Reason `target drained`: a pointer into a drained worker table, which is `source_accounts.active_worker_scan_id`, either `source_accounts.*_worker_assessment_id`, any `source_inventory.*_scan_id`, `ingest_jobs.worker_discovery_work_id`, any `*.discovery_work_id`, or `worker_binary_operation_receipts.stage_id`. Reason `referenced api key no longer exists in the export`: any `*_credential_id` column. Any other column in that table is a stop, because it means a reference was dropped that the load should have kept. |
 | Audit                | `no violations`. If there are violations, fix the rows in Convex and rerun; every violation is reported in one pass, so there is no fix-one-rerun cycle. |
 | Skipped constraints  | Empty, or each entry understood. A skipped constraint is a gap, not a pass.                   |
 | Parity               | `pass`, with `counts`, `retained_text_hashes`, `provenance_chains_sample` and `space_isolation_data` all `pass` |
