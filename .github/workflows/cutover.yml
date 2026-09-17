@@ -486,10 +486,20 @@ jobs:
           umask 077
           node -e 'const u = new URL(process.env.KITH_CUTOVER_DATABASE_URL); for (const v of [u.hostname, u.username, u.password, u.pathname.slice(1)]) if (v) console.log("::add-mask::" + v);'
           echo "::add-mask::$KITH_APP_ROLE_PASSWORD"
+          # The exit status is kept and re-raised after the report line is
+          # printed: a failed provisioning still names its problem and hint in
+          # the log, not only in the summary. The report carries no secret.
+          status=0
           node "$GITHUB_WORKSPACE/scripts/cutover-app-role.mjs" \
-            --role "$APP_ROLE" --out "$REPORTS/app-role.json" > /dev/null
-          node -e 'const r = require(process.argv[1]); console.log(JSON.stringify({ok: r.ok, role: r.role, created: r.created, passwordManaged: r.passwordManaged, appRoleCanRead: r.appRoleCanRead, appRoleCannotCreate: r.appRoleCannotCreate, problems: r.problems, hint: r.hint}));' \
-            "$REPORTS/app-role.json"
+            --role "$APP_ROLE" --out "$REPORTS/app-role.json" > /dev/null || status=$?
+          if [ -f "$REPORTS/app-role.json" ]; then
+            node -e 'const r = require(process.argv[1]); console.log(JSON.stringify({ok: r.ok, role: r.role, created: r.created, passwordManaged: r.passwordManaged, appRoleCanRead: r.appRoleCanRead, appRoleCannotCreate: r.appRoleCannotCreate, problems: r.problems, hint: r.hint}));' \
+              "$REPORTS/app-role.json"
+          fi
+          if [ "$status" -ne 0 ]; then
+            echo "::error::App role provisioning failed; the problems and hint above and in the summary say why." >&2
+            exit "$status"
+          fi
 
       - id: summary
         name: Write the run summary
