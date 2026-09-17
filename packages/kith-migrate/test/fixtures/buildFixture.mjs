@@ -39,6 +39,11 @@ const SAGE_QUOTE = "Garden notes:";
  * (`inlineWork`) row to prove the "not migrated" tables load as zero rows
  * even when the export itself still holds one.
  *
+ * It also carries the two shapes the first hosted rehearsal found: migrated
+ * rows referencing a drained worker table (`sourceInventory` and
+ * `ingestJobs`), and a receipt naming an API key Convex has already deleted
+ * (`workerReservationReceipts`). Both are cleared at transform.
+ *
  * Returns the plain per-table row map (what `documents.jsonl` holds, one
  * table per key) plus a few ids the tests assert against directly.
  */
@@ -492,6 +497,86 @@ export function syntheticConvexTables() {
         state: "ready",
         attempts: 1,
         leaseEpoch: 1,
+        // Points at a `workerDiscoveryWork` row the export holds and the
+        // load never writes, because that table is drained. The transform
+        // clears this column rather than carrying a dangling pointer.
+        workerDiscoveryWorkId: id("wdw_rowan_1"),
+      },
+    ],
+    // Drained before cutover (`migrated: false`), and still referenced: the
+    // `sourceInventory` and `ingestJobs` rows below point into these two the
+    // way the owner's real export does.
+    workerSourceScans: [
+      {
+        _id: id("wss_rowan_1"),
+        _creationTime: T0,
+        spaceId: id("spc_rowan"),
+        sourceAccountId: id("acc_rowan_docs"),
+        requestId: "scan-1",
+        requestDigest: sha256("scan-1"),
+        mode: "inventory",
+        inventoryEpoch: 1,
+        actorUserId: id("usr_rowan"),
+        state: "completed",
+        startedAt: T0,
+        completedAt: T0,
+      },
+    ],
+    workerDiscoveryWork: [
+      {
+        _id: id("wdw_rowan_1"),
+        _creationTime: T0,
+        spaceId: id("spc_rowan"),
+        sourceAccountId: id("acc_rowan_docs"),
+        sourceItemId: id("itm_rowan_invoice"),
+        scanId: id("wss_rowan_1"),
+        observationEpoch: 1,
+        processingEpoch: 1,
+        state: "done",
+        contentHash: sha256("rowan-invoice-bytes"),
+        actorUserId: id("usr_rowan"),
+        attempts: 1,
+        createdAt: T0,
+      },
+    ],
+    sourceInventory: [
+      {
+        _id: id("inv_rowan_1"),
+        _creationTime: T0,
+        spaceId: id("spc_rowan"),
+        sourceAccountId: id("acc_rowan_docs"),
+        sourceItemId: id("itm_rowan_invoice"),
+        identityKeyHash: sha256("invoice-001-identity"),
+        relativePath: "invoices/invoice-001.pdf",
+        folderPath: "invoices",
+        fileName: "invoice-001.pdf",
+        byteLength: 2048,
+        contentHash: sha256("rowan-invoice-bytes"),
+        mediaType: "application/pdf",
+        modifiedAt: T0,
+        contentIndexed: true,
+        firstSeenScanId: id("wss_rowan_1"),
+        lastSeenScanId: id("wss_rowan_1"),
+      },
+    ],
+    // Migrated (a receipt is idempotency evidence), and naming a credential
+    // Convex has already hard-deleted: `models/apiKeys/model.ts` deletes a
+    // revoked key outright, so the export holds no `apiKeys` row for it.
+    workerReservationReceipts: [
+      {
+        _id: id("wrr_rowan_1"),
+        _creationTime: T0,
+        spaceId: id("spc_rowan"),
+        sourceAccountId: id("acc_rowan_docs"),
+        kind: "discovery",
+        requestId: "reserve-1",
+        requestDigest: sha256("reserve-1"),
+        actorUserId: id("usr_rowan"),
+        actorCredentialId: id("key_rowan_revoked"),
+        targetCount: 1,
+        createdAt: T0,
+        expiresAt: T0 + DAY,
+        retireAt: T0 + DAY,
       },
     ],
     // Drained before cutover (`migrated: false`): the export still holding a
@@ -591,6 +676,12 @@ export function syntheticConvexTables() {
       sourceItemRowan: id("itm_rowan_invoice"),
       sourceItemSage: id("itm_sage_note"),
       thoughtRowan: id("tht_rowan_1"),
+      workerScanRowan: id("wss_rowan_1"),
+      workerDiscoveryWorkRowan: id("wdw_rowan_1"),
+      sourceInventoryRowan: id("inv_rowan_1"),
+      ingestJobRowan: id("job_rowan_1"),
+      reservationReceiptRowan: id("wrr_rowan_1"),
+      revokedCredential: id("key_rowan_revoked"),
     },
     text: { rowan: ROWAN_TEXT, sage: SAGE_TEXT },
   };

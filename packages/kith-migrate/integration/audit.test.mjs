@@ -87,6 +87,18 @@ test("a clean synthetic fixture audits with zero violations", async (t) => {
     assert.deepEqual(report.violations, []);
     assert.equal(report.ok, true);
     assert.ok(report.rowsAudited.users > 0);
+
+    // The three constraints the first hosted rehearsal failed on, audited
+    // here with rows present rather than skipped for lack of them: the
+    // transform cleared the pointers into the drained worker tables and the
+    // pointer to the deleted API key, so nothing dangles.
+    for (const table of [
+      "source_inventory",
+      "ingest_jobs",
+      "worker_reservation_receipts",
+    ]) {
+      assert.ok(report.rowsAudited[table] > 0, `${table} audited no rows`);
+    }
     assert.equal(await auditSchemaExists(database.connectionString), false);
 
     const rowCounts = await realTableRowCounts(database.connectionString, [
@@ -150,6 +162,13 @@ test("a fixture with rows that violate several constraint kinds is fully reporte
     // new id, so the *only* thing wrong with it is that the identity now repeats.
     // Nothing in the audit knows about these indexes: it reads them back out of
     // `pg_index`, so they are covered with no change to the audit itself.
+    // 7. A dangling reference neither clearing rule covers, on the very row
+    // whose credential pointer is cleared: `actor_user_id` names a `users`
+    // row nothing in the export holds. Only the columns the spec marks are
+    // emptied, so this one still reaches the audit as a violation.
+    const missingActorUserId = syntheticId("usr_missing_receipt_actor");
+    bad.workerReservationReceipts[0].actorUserId = missingActorUserId;
+
     const duplicateGenerationId = syntheticId("gen_rowan_1_legacy_duplicate");
     bad.processingGenerations = [
       ...bad.processingGenerations,
@@ -231,10 +250,23 @@ test("a fixture with rows that violate several constraint kinds is fully reporte
       [bad.ingestRequests[0]._id, duplicateRequestId].sort(),
     );
 
-    // Every violation is reported, not just the first: eight distinct rows
-    // across five tables, none of them stopping the others from being
+    const receiptViolations = byTable.worker_reservation_receipts ?? [];
+    const actorViolation = receiptViolations.find((v) => v.kind === "foreign_key");
+    assert.ok(actorViolation, "expected a foreign key violation on the receipt");
+    assert.match(actorViolation.constraint, /actor_user_id_fkey/);
+    assert.match(actorViolation.detail, new RegExp(missingActorUserId));
+    // The cleared credential pointer is not reported as anything: it is NULL,
+    // and a NULL reference is not checked.
+    assert.equal(
+      receiptViolations.some((v) => /actor_credential_id/.test(v.constraint)),
+      false,
+      JSON.stringify(receiptViolations, null, 2),
+    );
+
+    // Every violation is reported, not just the first: nine distinct rows
+    // across six tables, none of them stopping the others from being
     // checked.
-    assert.ok(report.violations.length >= 8, JSON.stringify(report.violations, null, 2));
+    assert.ok(report.violations.length >= 9, JSON.stringify(report.violations, null, 2));
 
     assert.equal(await auditSchemaExists(database.connectionString), false);
     const rowCounts = await realTableRowCounts(database.connectionString, [

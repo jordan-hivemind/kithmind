@@ -54,6 +54,15 @@ test(
     assert.deepEqual(transform.unmapped, []);
     assert.equal(Object.keys(transform.rowCounts).length > 0, true);
     assert.equal(transform.retainedTextHashes.length > 0, true);
+    // The two rules that keep the audit clean, end to end: pointers into the
+    // drained worker tables and a pointer to a deleted API key are cleared,
+    // and nothing else is.
+    assert.deepEqual(Object.keys(transform.clearedReferences).sort(), [
+      "ingest_jobs.worker_discovery_work_id",
+      "source_inventory.first_seen_scan_id",
+      "source_inventory.last_seen_scan_id",
+      "worker_reservation_receipts.actor_credential_id",
+    ]);
 
     const audit = await readJson(join(reports, "audit-report.json"));
     assert.equal(audit.redacted, true);
@@ -176,6 +185,45 @@ test("the summary names the finance comparison and the two things the workflow n
   assert.equal(summary.includes("the export and the CSV directory stay on the runner"), true);
   assert.equal(summary.includes("**unchanged**"), true);
   assert.equal(summary.includes("| transactions | 7 | 7 |"), true);
+});
+
+test("the summary names every cleared reference column, and says none when there are none", () => {
+  const withCleared = buildSummary(
+    { mode: "rehearsal" },
+    {
+      transform: {
+        rowCounts: { ingest_jobs: 90 },
+        childRowCounts: {},
+        retainedTextHashes: [],
+        unmapped: [],
+        clearedReferences: {
+          "ingest_jobs.worker_discovery_work_id": {
+            count: 90,
+            reason: "target drained",
+          },
+        },
+      },
+    },
+  );
+  assert.equal(withCleared.includes("Cleared references:"), true);
+  assert.equal(
+    withCleared.includes("| ingest_jobs.worker_discovery_work_id | 90 | target drained |"),
+    true,
+  );
+
+  const withoutCleared = buildSummary(
+    { mode: "rehearsal" },
+    {
+      transform: {
+        rowCounts: { users: 2 },
+        childRowCounts: {},
+        retainedTextHashes: [],
+        unmapped: [],
+        clearedReferences: {},
+      },
+    },
+  );
+  assert.match(withoutCleared, /Cleared references:\n\nnone\n/);
 });
 
 test(

@@ -70,6 +70,16 @@ export type ColumnSpec = {
    * migration and the column exists.
    */
   addedIn?: number;
+  /**
+   * `"clear"`: a reference this column holds may name a row the Convex export
+   * does not contain, because Convex hard-deletes the target rather than
+   * retiring it (`models/apiKeys/model.ts` deletes a revoked key outright).
+   * The transform writes NULL for such a value and counts it in the report's
+   * `clearedReferences` instead of carrying a pointer the load would reject.
+   * Every other dangling reference stays as it is, so the audit still reports
+   * it as a foreign-key violation.
+   */
+  dangling?: "clear";
 };
 
 export type ChildTableSpec = {
@@ -113,10 +123,23 @@ function pgName(convex: string): string {
   return RESERVED_PG_NAMES.has(base) ? `${base}_field` : base;
 }
 
-type ColumnOpts = { addedIn?: number };
+type ColumnOpts = { addedIn?: number; dangling?: "clear" };
 
 function ref(convex: string, refTable: string, opts: ColumnOpts = {}): ColumnSpec {
   return { pg: pgName(convex), convex, kind: "ref", refTable, ...opts };
+}
+/**
+ * A pointer to the API key that acted, on a row the cutover migrates. Convex
+ * deletes a revoked key outright, so the export can hold a receipt naming a
+ * key that no longer exists; `dangling: "clear"` is what lets the transform
+ * drop that pointer instead of failing the load. Every `api_keys` reference
+ * whose field name ends in `CredentialId` is declared through this helper, so
+ * the rule is stated once rather than repeated at every call site. The four
+ * that are not (`apiKeyId`, `credentialId`) sit on drained tables, which
+ * write no rows at all.
+ */
+function credentialRef(convex: string, opts: ColumnOpts = {}): ColumnSpec {
+  return ref(convex, "api_keys", { dangling: "clear", ...opts });
 }
 function text(convex: string, opts: ColumnOpts = {}): ColumnSpec {
   return { pg: pgName(convex), convex, kind: "text", ...opts };
@@ -335,7 +358,7 @@ export const TABLES: TableSpec[] = [
     text("outputMediaType"),
     text("hashAuthority"),
     ref("userId", "users"),
-    ref("actorCredentialId", "api_keys"),
+    credentialRef("actorCredentialId"),
     ts("createdAt"),
   ]),
   table(
@@ -369,7 +392,7 @@ export const TABLES: TableSpec[] = [
       text("verificationKind"),
       ts("readbackVerifiedAt"),
       ref("userId", "users"),
-      ref("actorCredentialId", "api_keys"),
+      credentialRef("actorCredentialId"),
       ts("createdAt"),
     ],
   ),
@@ -391,7 +414,7 @@ export const TABLES: TableSpec[] = [
       num("bindingEpoch"),
       ts("updatedAt"),
       ref("userId", "users"),
-      ref("actorCredentialId", "api_keys"),
+      credentialRef("actorCredentialId"),
     ],
   ),
   table(
@@ -433,12 +456,12 @@ export const TABLES: TableSpec[] = [
       text("verificationKind"),
       ts("readbackVerifiedAt"),
       ref("receiptUserId", "users"),
-      ref("receiptActorCredentialId", "api_keys"),
+      credentialRef("receiptActorCredentialId"),
       ts("receiptCreatedAt"),
       text("objectOutcome"),
       text("backupOutcome"),
       ref("actorUserId", "users"),
-      ref("actorCredentialId", "api_keys"),
+      credentialRef("actorCredentialId"),
       ts("completedAt"),
     ],
   ),
@@ -476,7 +499,7 @@ export const TABLES: TableSpec[] = [
       ts("locatorReadbackVerifiedAt"),
       text("verificationAuthority"),
       ref("userId", "users"),
-      ref("actorCredentialId", "api_keys"),
+      credentialRef("actorCredentialId"),
       ts("createdAt"),
     ],
   ),
@@ -493,7 +516,7 @@ export const TABLES: TableSpec[] = [
       num("bindingEpoch"),
       ts("verifiedAt"),
       ref("userId", "users"),
-      ref("actorCredentialId", "api_keys"),
+      credentialRef("actorCredentialId"),
       ts("updatedAt"),
     ],
   ),
@@ -523,7 +546,7 @@ export const TABLES: TableSpec[] = [
       text("retentionDisclosure"),
       text("providerSourceOutcome"),
       ref("actorUserId", "users"),
-      ref("actorCredentialId", "api_keys"),
+      credentialRef("actorCredentialId"),
       ts("completedAt"),
     ],
   ),
@@ -671,7 +694,7 @@ export const TABLES: TableSpec[] = [
     ref("processingGenerationId", "processing_generations"),
     ref("ingestJobId", "ingest_jobs"),
     ref("actorUserId", "users"),
-    ref("actorCredentialId", "api_keys"),
+    credentialRef("actorCredentialId"),
   ]),
   table("ingestJobs", "ingest_jobs", true, true, [
     ref("sourceAccountId", "source_accounts"),
@@ -679,9 +702,9 @@ export const TABLES: TableSpec[] = [
     ref("sourceRevisionId", "brain_source_revisions"),
     ref("processingGenerationId", "processing_generations"),
     ref("admittedByUserId", "users"),
-    ref("admittedByCredentialId", "api_keys"),
+    credentialRef("admittedByCredentialId"),
     ref("actorUserId", "users"),
-    ref("actorCredentialId", "api_keys"),
+    credentialRef("actorCredentialId"),
     ts("actorReplacedAt"),
     ref("actorReplacedBy", "users"),
     num("desiredProcessingEpoch"),
@@ -691,7 +714,7 @@ export const TABLES: TableSpec[] = [
     text("leaseToken"),
     ts("leaseExpiresAt"),
     bool("workerManaged"),
-    ref("workerLeaseOwnerCredentialId", "api_keys"),
+    credentialRef("workerLeaseOwnerCredentialId"),
     ts("nextAttemptAt"),
     json("error"),
     ref("workerDiscoveryWorkId", "worker_discovery_work"),
@@ -705,7 +728,7 @@ export const TABLES: TableSpec[] = [
     ref("processingGenerationId", "processing_generations"),
     ref("ingestJobId", "ingest_jobs"),
     ref("actorUserId", "users"),
-    ref("actorCredentialId", "api_keys"),
+    credentialRef("actorCredentialId"),
     text("state"),
     num("attempts"),
     ts("nextAttemptAt"),
@@ -722,7 +745,7 @@ export const TABLES: TableSpec[] = [
     ref("sourceAccountId", "source_accounts"),
     ref("sourceItemId", "source_items"),
     ref("actorUserId", "users"),
-    ref("actorCredentialId", "api_keys"),
+    credentialRef("actorCredentialId"),
     text("requestId"),
     text("requestDigest"),
     text("url"),
@@ -1120,7 +1143,7 @@ export const TABLES: TableSpec[] = [
     num("inventoryEpoch"),
     num("manifestVersionAtBegin"),
     ref("actorUserId", "users"),
-    ref("actorCredentialId", "api_keys"),
+    credentialRef("actorCredentialId"),
     text("state"),
     num("nextPageOrdinal"),
     text("inventoryCursor"),
@@ -1226,11 +1249,11 @@ export const TABLES: TableSpec[] = [
     text("docType"),
     text("uri"),
     ref("actorUserId", "users"),
-    ref("actorCredentialId", "api_keys"),
+    credentialRef("actorCredentialId"),
     num("attempts"),
     num("leaseEpoch"),
     text("leaseToken"),
-    ref("leaseOwnerCredentialId", "api_keys"),
+    credentialRef("leaseOwnerCredentialId"),
     ts("leaseExpiresAt"),
     ts("nextAttemptAt"),
     text("failureCode"),
@@ -1273,7 +1296,7 @@ export const TABLES: TableSpec[] = [
       text("requestId"),
       text("requestDigest"),
       ref("actorUserId", "users"),
-      ref("actorCredentialId", "api_keys"),
+      credentialRef("actorCredentialId"),
       num("targetCount"),
       ts("createdAt"),
       ts("expiresAt"),
@@ -1301,7 +1324,7 @@ export const TABLES: TableSpec[] = [
     text("requestId"),
     text("requestDigest"),
     ref("actorUserId", "users"),
-    ref("actorCredentialId", "api_keys"),
+    credentialRef("actorCredentialId"),
     num("leaseEpoch"),
     text("leaseTokenHash"),
     ref("sourceRevisionId", "brain_source_revisions"),
@@ -1337,7 +1360,7 @@ export const TABLES: TableSpec[] = [
       text("requestId"),
       text("requestDigest"),
       ref("actorUserId", "users"),
-      ref("actorCredentialId", "api_keys"),
+      credentialRef("actorCredentialId"),
       num("leaseEpoch"),
       text("leaseTokenHash"),
       ts("leaseExpiresAtAtRequest"),
@@ -1379,7 +1402,7 @@ export const TABLES: TableSpec[] = [
       text("requestId"),
       text("requestDigest"),
       ref("actorUserId", "users"),
-      ref("actorCredentialId", "api_keys"),
+      credentialRef("actorCredentialId"),
       num("inventoryEpoch"),
       num("completedInventoryEpoch"),
       num("manifestVersion"),
@@ -1424,7 +1447,7 @@ export const TABLES: TableSpec[] = [
     text("state"),
     text("connectorVersion"),
     ref("actorUserId", "users"),
-    ref("actorCredentialId", "api_keys"),
+    credentialRef("actorCredentialId"),
     ts("lastSeenAt"),
     ts("nextExpectedAt"),
     ts("sweepAfter"),
