@@ -153,6 +153,64 @@ test("loadPostgresBackupConfig rejects a world- or group-writable staging root",
   await assert.rejects(loadPostgresBackupConfig(configPath));
 });
 
+test("loadPostgresBackupConfig accepts a long plugin age recipient and rejects a malformed one", async (t) => {
+  const fixtureState = await fixture(t);
+  const configPath = join(fixtureState.root, "backup.json");
+  const plugin = `age1pq1${"q".repeat(1950)}`;
+  await writeFile(
+    configPath,
+    JSON.stringify(backupConfig(fixtureState, { ageRecipient: plugin })),
+    { mode: 0o600 },
+  );
+  assert.equal((await loadPostgresBackupConfig(configPath)).ageRecipient, plugin);
+  for (const ageRecipient of ["age1short", "AGE-SECRET-KEY-1QQQQ", `x${plugin}`]) {
+    await writeFile(
+      configPath,
+      JSON.stringify(backupConfig(fixtureState, { ageRecipient })),
+      { mode: 0o600 },
+    );
+    await assert.rejects(
+      loadPostgresBackupConfig(configPath),
+      (error) => error.code === "config_invalid",
+    );
+  }
+});
+
+test("loadPostgresBackupConfig accepts restic's rclone repository spec", async (t) => {
+  const fixtureState = await fixture(t);
+  const configPath = join(fixtureState.root, "backup.json");
+  await writeFile(
+    configPath,
+    JSON.stringify(
+      backupConfig(fixtureState, {
+        resticRepositoryPath: "rclone:kith_remote:Kith Mind/backups/database/restic-v1",
+      }),
+    ),
+    { mode: 0o600 },
+  );
+  const config = await loadPostgresBackupConfig(configPath);
+  assert.equal(
+    config.resticRepositoryPath,
+    "rclone:kith_remote:Kith Mind/backups/database/restic-v1",
+  );
+});
+
+test("loadPostgresBackupConfig rejects a relative or non-rclone remote repository", async (t) => {
+  const fixtureState = await fixture(t);
+  for (const resticRepositoryPath of ["relative/repo", "sftp:host:/repo", "rclone:bad remote:x"]) {
+    const configPath = join(fixtureState.root, "backup.json");
+    await writeFile(
+      configPath,
+      JSON.stringify(backupConfig(fixtureState, { resticRepositoryPath })),
+      { mode: 0o600 },
+    );
+    await assert.rejects(
+      loadPostgresBackupConfig(configPath),
+      (error) => error.code === "config_invalid",
+    );
+  }
+});
+
 function verifyConfig({ tool, restoreProofConfigPath }, overrides = {}) {
   return {
     version: 1,
