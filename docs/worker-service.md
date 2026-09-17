@@ -206,8 +206,9 @@ plan](plans/2026-09-12-postgres-consolidation.md) runs Convex's four
 maintenance crons and its ten `scheduler.runAfter` call sites from this same
 always-on host instead of from Convex, through `kith.deferred_work`
 (`packages/kith-store/src/deferred/`) and the `kith-deferred-work` command
-(`packages/kith-store/src/deferred/cli.ts`). It reads `KITH_STORE_DATABASE_URL`
-and needs no other credential.
+(`packages/kith-store/src/deferred/cli.ts`). It reads `KITH_STORE_DATABASE_URL`,
+plus the embedding provider key (`OPENAI_API_KEY` or the `BRAIN_EMBED_*` set) that
+`embedding_fill` jobs use; nothing else.
 
 Run one round by hand to check the command before installing a service:
 
