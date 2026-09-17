@@ -161,6 +161,14 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
       import.meta.url,
     ),
   },
+  {
+    version: 21,
+    name: "card_extraction_queue_states.cursor_rewound_at: the one Convex field the first hosted rehearsal found unmapped (P2-39m)",
+    url: new URL(
+      "../migrations/021_card_queue_cursor_rewound_at.sql",
+      import.meta.url,
+    ),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */

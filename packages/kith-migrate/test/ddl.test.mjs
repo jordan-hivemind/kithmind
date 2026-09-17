@@ -60,7 +60,7 @@ test("every table's DDL column list matches id, [space_id], created_at, then the
       "id",
       ...(t.spaceScoped ? ["space_id"] : []),
       "created_at",
-      ...t.columns.map((c) => c.pg),
+      ...t.columns.filter((c) => c.addedIn === undefined).map((c) => c.pg),
     ];
     assert.deepEqual(declared, expected, `column order mismatch for ${t.pg}`);
   }
