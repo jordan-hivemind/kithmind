@@ -209,6 +209,22 @@ export async function grantProofAppRole(
 ): Promise<void> {
   if (!/^[a-z][a-z0-9_]{0,62}$/.test(appRole))
     throw new ProofError("invalid_app_role");
+  // CONNECT on the database itself, first. PostgreSQL grants CONNECT to
+  // PUBLIC on a new database, so a fresh throwaway never needed this; the
+  // hosted archive database is not fresh. `packages/pg/src/readerRole.ts`
+  // hardens the finance reader by revoking PUBLIC's CONNECT and TEMPORARY on
+  // the whole database and granting CONNECT back to the reader alone, and
+  // `kith` shares that database. Without this line every grant below applies
+  // and the role still cannot log in (42501 at connection), which is exactly
+  // what the first hosted app-role run reported. TEMPORARY is deliberately
+  // not granted: the app role has no reason to stage data in the server.
+  const database = (
+    await owner.query<{ db: string }>("SELECT current_database() AS db")
+  ).rows[0]?.db;
+  if (!database) throw new ProofError("invalid_app_role");
+  await owner.query(
+    `GRANT CONNECT ON DATABASE "${database.replaceAll('"', '""')}" TO "${appRole}"`,
+  );
   await owner.query(`REVOKE ALL ON SCHEMA kith FROM PUBLIC`);
   await owner.query(`REVOKE ALL ON ALL TABLES IN SCHEMA kith FROM PUBLIC`);
   await owner.query(`GRANT USAGE ON SCHEMA kith TO "${appRole}"`);

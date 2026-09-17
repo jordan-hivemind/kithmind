@@ -82,6 +82,48 @@ async function attempt(client, sql, values = []) {
 }
 
 test(
+  "the app role can connect to a database whose PUBLIC CONNECT was revoked",
+  { skip },
+  async (t) => {
+    // The hosted archive database is hardened by `packages/pg/src/readerRole.ts`:
+    // PUBLIC loses CONNECT and TEMPORARY on the database, and only the finance
+    // reader gets CONNECT back. `grantProofAppRole` must grant CONNECT itself,
+    // or every schema grant applies to a role that cannot log in.
+    const database = await throwawayDatabase(t);
+    const owner = await connect(database);
+    await applyKithSchema(owner);
+    const role = await createAppRole(owner);
+    const name = new URL(database.url).pathname.slice(1);
+    await owner.query(`REVOKE ALL ON DATABASE "${name}" FROM PUBLIC`);
+
+    const url = new URL(database.url);
+    url.username = role.role;
+    url.password = role.password;
+    const before = database.adopt(new pg.Client({ connectionString: url.toString() }));
+    const refused = await before.connect().then(
+      () => null,
+      (error) => error,
+    );
+    assert.equal(refused?.code, INSUFFICIENT_PRIVILEGE, "the revoke must bite before the grant");
+    await before.end().catch(() => {});
+
+    await grantProofAppRole(owner, role.role);
+    const app = database.adopt(new pg.Client({ connectionString: url.toString() }));
+    await app.connect();
+    try {
+      assert.equal((await app.query("SELECT count(*)::int AS n FROM kith.users")).rows[0].n, 0);
+      // TEMPORARY stays revoked: the app role must not stage data in the server.
+      const temp = await attempt(app, "CREATE TEMPORARY TABLE probe_temp (id int)");
+      assert.equal(temp?.code, INSUFFICIENT_PRIVILEGE);
+    } finally {
+      await app.end();
+      await owner.query(`DROP OWNED BY "${role.role}"`).catch(() => {});
+      await owner.query(`DROP ROLE IF EXISTS "${role.role}"`).catch(() => {});
+    }
+  },
+);
+
+test(
   "the app role writes every granted table group and nothing else",
   { skip },
   async (t) => {
