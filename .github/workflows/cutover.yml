@@ -91,6 +91,11 @@ jobs:
 
     env:
       MODE: ${{ inputs.mode }}
+      # Through the environment, never interpolated into a script: a dispatch
+      # input is text a collaborator typed, and every shell below must see it
+      # as data. The guard step validates it against `grantProofAppRole`'s own
+      # pattern before anything runs.
+      APP_ROLE: ${{ inputs.app_role }}
       THROWAWAY_ADMIN_URL: postgres://postgres:postgres@localhost:5432/postgres
       AUDIT_DATABASE: cutover_audit
       ISOLATED_DATABASE: cutover_isolated
@@ -108,7 +113,11 @@ jobs:
           HAS_APP_ROLE_PASSWORD: ${{ secrets.KITH_APP_ROLE_PASSWORD != '' }}
         run: |
           echo "mode: $MODE"
-          echo "app role: ${{ inputs.app_role }}"
+          echo "app role: $APP_ROLE"
+          if ! printf '%s' "$APP_ROLE" | grep -Eq '^[a-z][a-z0-9_]{0,62}$'; then
+            echo "::error::app_role must match ^[a-z][a-z0-9_]{0,62}$ (a plain PostgreSQL role name); refusing before anything runs." >&2
+            exit 1
+          fi
           if [ "$HAS_CONVEX_DEPLOY_KEY" != "true" ]; then
             echo "::error::The repository secret CONVEX_DEPLOY_KEY is not set. Both modes need it to export Convex." >&2
             exit 1
@@ -339,7 +348,7 @@ jobs:
           KITH_CUTOVER_DATABASE_URL="postgres://postgres:postgres@localhost:5432/${{ env.ISOLATED_DATABASE }}" \
             KITH_APP_ROLE_PASSWORD="$APP_ROLE_PASSWORD" \
             node "$GITHUB_WORKSPACE/scripts/cutover-app-role.mjs" \
-              --role "${{ inputs.app_role }}" --out "$REPORTS/app-role.json" > /dev/null
+              --role "$APP_ROLE" --out "$REPORTS/app-role.json" > /dev/null
           node -e 'const r = require(process.argv[1]); console.log(JSON.stringify({ok: r.ok, role: r.role, created: r.created, appRoleCanRead: r.appRoleCanRead, appRoleCannotCreate: r.appRoleCannotCreate, problems: r.problems}));' \
             "$REPORTS/app-role.json"
 
@@ -431,7 +440,7 @@ jobs:
           node -e 'const u = new URL(process.env.KITH_CUTOVER_DATABASE_URL); for (const v of [u.hostname, u.username, u.password, u.pathname.slice(1)]) if (v) console.log("::add-mask::" + v);'
           echo "::add-mask::$KITH_APP_ROLE_PASSWORD"
           node "$GITHUB_WORKSPACE/scripts/cutover-app-role.mjs" \
-            --role "${{ inputs.app_role }}" --out "$REPORTS/app-role.json" > /dev/null
+            --role "$APP_ROLE" --out "$REPORTS/app-role.json" > /dev/null
           node -e 'const r = require(process.argv[1]); console.log(JSON.stringify({ok: r.ok, role: r.role, created: r.created, appRoleCanRead: r.appRoleCanRead, appRoleCannotCreate: r.appRoleCannotCreate, problems: r.problems}));' \
             "$REPORTS/app-role.json"
 
