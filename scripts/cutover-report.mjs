@@ -350,6 +350,26 @@ export function buildSummary(context, data) {
     );
   }
 
+  if (data.appRole) {
+    lines.push("## Runbook step 9, role half. App role", "");
+    lines.push(
+      ...table(
+        ["Fact", "Value"],
+        [
+          ["Role name", data.appRole.role],
+          ["Verdict", data.appRole.ok ? "ok" : "FAILED"],
+          ["Role state", data.appRole.created ? "created" : "updated"],
+          ["Can read `kith`", String(data.appRole.appRoleCanRead)],
+          ["Refused CREATE", String(data.appRole.appRoleCannotCreate)],
+          [
+            "Problems",
+            data.appRole.problems.length ? data.appRole.problems.join("<br>") : "none",
+          ],
+        ],
+      ),
+    );
+  }
+
   lines.push(
     "## What stays manual",
     "",
@@ -373,6 +393,7 @@ async function summary(argv) {
     rehearsalProof: await readJsonIfPresent(join(reports, "rehearsal-proof.json")),
     financeComparison: await readJsonIfPresent(join(reports, "finance-comparison.json")),
     hostBefore: await readJsonIfPresent(join(reports, "host-before.json")),
+    appRole: await readJsonIfPresent(join(reports, "app-role.json")),
   };
   const text = buildSummary(
     {

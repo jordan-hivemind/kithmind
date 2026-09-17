@@ -11,12 +11,21 @@ rest of step 9 stays manual and is listed at the end.
 
 | Action                             | What it is                                                                                                                                                                                      |
 | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 1. Add one repository secret       | `KITH_MIGRATION_DATABASE_URL`, pointing at the hosted archive database with a role that can create the `vector` extension and the `kith` schema. Needed for `live` only.                         |
+| 1. Add two repository secrets      | `KITH_MIGRATION_DATABASE_URL`, pointing at the hosted archive database with a role that can create the `vector` extension and the `kith` schema. `KITH_APP_ROLE_PASSWORD`, at least 16 characters, the password for the web app's login role. Both needed for `live` only. |
 | 2. Run the workflow, twice         | Actions, Cutover, Run workflow. First in `rehearsal`. Read the summary. Then in `live`, typing the confirmation string.                                                                          |
 
 `CONVEX_DEPLOY_KEY` is already a repository secret; the Convex deploy workflow
-uses the same one. Both modes need it. If either secret is missing, the first
-step fails and names it, before anything is exported, transformed or loaded.
+uses the same one. Both modes need it. If any required secret is missing, the
+first step fails and names it, before anything is exported, transformed or
+loaded.
+
+`KITH_APP_ROLE_PASSWORD` belongs to the login role the `app_role` workflow
+input names (default `kith_app`). In `live` mode the workflow creates that
+role if it does not exist, or updates its password if it does, and grants it
+exactly what `grantProofAppRole` in `packages/kith-store/src/index.ts` names.
+`scripts/cutover-app-role.mjs` is the step that does it, and it runs in
+`rehearsal` too, against the throwaway database, with a password generated for
+that run only and never reused.
 
 The confirmation string for `live` is exactly:
 
@@ -45,10 +54,12 @@ the deployment as `KITH_DATABASE_URL` in the manual half below.
 | Isolated load      | `kith-migrate load`                                                         | throwaway service database |
 | Isolated parity    | `kith-migrate parity`                                                       | throwaway service database |
 | Backup rehearsal   | `scripts/cutover-rehearsal-proof.mjs` (`rehearsal` only)                    | throwaway service database |
+| App role (rehearsal) | `scripts/cutover-app-role.mjs` (`rehearsal` only)                         | throwaway service database |
 | Host verification  | `scripts/cutover-host-check.mjs capture` (`live` only)                      | live database, read only   |
 | Live load          | `kith-migrate load`                                                         | live database, `kith` only |
 | Live parity        | `kith-migrate parity`                                                       | live database, read only   |
 | Finance unchanged  | `scripts/cutover-host-check.mjs compare` (`live` only)                      | live database, read only   |
+| App role (live)    | `scripts/cutover-app-role.mjs` (`live` only)                                | live database, role only   |
 | Summary and upload | Markdown summary plus the JSON reports                                      | run summary and artifact   |
 
 ## What the workflow does not do
@@ -81,6 +92,7 @@ hold.
 | Parity               | `pass`, with `counts`, `retained_text_hashes`, `provenance_chains_sample` and `space_isolation_data` all `pass` |
 | Pending parity checks | `archive_references` and `auth_denial_and_space_isolation_read_api` report `pending` from the CLI. Pending is not passing. Run them separately before the cutover window. |
 | Backup rehearsal     | A parity capture with zero unvalidated constraints, and a sampled cited answer that either matched its citation hash or names why it was unavailable |
+| App role             | Verdict `ok`, "Can read kith" true, "Refused CREATE" true, and an empty problem list |
 
 Then run `live` with the confirmation string. In `live` the summary adds the
 host verification table and the finance before and after comparison. The run
@@ -128,6 +140,17 @@ cutover window is the owner's, in this order.
    | `KITH_SESSION_SECRET`    | A fresh secret                                               |
    | `MCP_PUBLIC_ORIGIN`      | The deployment's public origin                               |
    | Provider keys            | The model and embedding provider keys the deployment needs   |
+
+   `KITH_DATABASE_URL` is composed, not copied from anywhere: the migration
+   URL's host, port and database name, with the `app_role` input's value
+   (default `kith_app`) as the user and `KITH_APP_ROLE_PASSWORD` as the
+   password. The workflow's `live` run already created or updated that role
+   and granted it what `grantProofAppRole` names, so the value only needs
+   assembling:
+
+   ```
+   postgres://<app_role>:<KITH_APP_ROLE_PASSWORD>@<host>:<port>/<database>?sslmode=require
+   ```
 
    Before any deployment operation, verify the authenticated identity and the
    intended team and project in that same credential context, and state the

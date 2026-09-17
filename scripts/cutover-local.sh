@@ -143,6 +143,13 @@ step "step 10: backup-shape rehearsal against the loaded throwaway"
 KITH_CUTOVER_DATABASE_URL="$ISOLATED_URL" \
   node "$ROOT/scripts/cutover-rehearsal-proof.mjs" --out "$STAGE/rehearsal-proof.json"
 
+# --- Runbook step 9, role half ------------------------------------------------
+step "step 9 (role half): provision the app role against the loaded throwaway"
+APP_ROLE_PASSWORD="$(openssl rand -hex 16)"
+KITH_CUTOVER_DATABASE_URL="$ISOLATED_URL" KITH_APP_ROLE_PASSWORD="$APP_ROLE_PASSWORD" \
+  node "$ROOT/scripts/cutover-app-role.mjs" --role kith_app --out "$REPORTS/app-role.json"
+cat "$REPORTS/app-role.json"
+
 # --- Summary -----------------------------------------------------------------
 step "summary"
 node "$ROOT/scripts/cutover-report.mjs" redact --staging "$STAGE" --reports "$REPORTS"

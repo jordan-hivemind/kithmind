@@ -50,6 +50,11 @@ on:
         type: string
         default: ""
         required: false
+      app_role:
+        description: "The login role the web app uses as KITH_DATABASE_URL. Created or updated in both modes."
+        type: string
+        default: "kith_app"
+        required: false
 
 # One cutover at a time, and never cancelled mid-load: a run interrupted between
 # the live load and its parity check leaves a half-answered question.
@@ -100,8 +105,10 @@ jobs:
           CONFIRM: ${{ inputs.confirm }}
           HAS_CONVEX_DEPLOY_KEY: ${{ secrets.CONVEX_DEPLOY_KEY != '' }}
           HAS_MIGRATION_DATABASE_URL: ${{ secrets.KITH_MIGRATION_DATABASE_URL != '' }}
+          HAS_APP_ROLE_PASSWORD: ${{ secrets.KITH_APP_ROLE_PASSWORD != '' }}
         run: |
           echo "mode: $MODE"
+          echo "app role: ${{ inputs.app_role }}"
           if [ "$HAS_CONVEX_DEPLOY_KEY" != "true" ]; then
             echo "::error::The repository secret CONVEX_DEPLOY_KEY is not set. Both modes need it to export Convex." >&2
             exit 1
@@ -113,6 +120,10 @@ jobs:
             fi
             if [ "$HAS_MIGRATION_DATABASE_URL" != "true" ]; then
               echo "::error::The repository secret KITH_MIGRATION_DATABASE_URL is not set. live mode needs it to load the hosted archive database." >&2
+              exit 1
+            fi
+            if [ "$HAS_APP_ROLE_PASSWORD" != "true" ]; then
+              echo "::error::The repository secret KITH_APP_ROLE_PASSWORD is not set. live mode needs it to provision the web app's login role." >&2
               exit 1
             fi
           elif [ -n "$CONFIRM" ]; then
@@ -313,6 +324,25 @@ jobs:
           node "$GITHUB_WORKSPACE/scripts/cutover-rehearsal-proof.mjs" --out "$STAGE/rehearsal-proof.json"
           node "$GITHUB_WORKSPACE/scripts/cutover-report.mjs" redact --staging "$STAGE" --reports "$REPORTS"
 
+      # Runbook step 9's role half, rehearsed. Same script as the live step
+      # below, against the throwaway database this run already loaded, with a
+      # password generated for this run only and never reused anywhere. This is
+      # what exercises `scripts/cutover-app-role.mjs` before `live` ever runs it
+      # against the hosted database.
+      - id: app_role_rehearsal
+        name: Provision the app role against the throwaway database
+        if: inputs.mode == 'rehearsal'
+        run: |
+          umask 077
+          APP_ROLE_PASSWORD="$(openssl rand -hex 16)"
+          echo "::add-mask::$APP_ROLE_PASSWORD"
+          KITH_CUTOVER_DATABASE_URL="postgres://postgres:postgres@localhost:5432/${{ env.ISOLATED_DATABASE }}" \
+            KITH_APP_ROLE_PASSWORD="$APP_ROLE_PASSWORD" \
+            node "$GITHUB_WORKSPACE/scripts/cutover-app-role.mjs" \
+              --role "${{ inputs.app_role }}" --out "$REPORTS/app-role.json" > /dev/null
+          node -e 'const r = require(process.argv[1]); console.log(JSON.stringify({ok: r.ok, role: r.role, created: r.created, appRoleCanRead: r.appRoleCanRead, appRoleCannotCreate: r.appRoleCannotCreate, problems: r.problems}));' \
+            "$REPORTS/app-role.json"
+
       # 1, host half, and step 8's "before". Live only. Read-only: this is the
       # last chance to find out that the host is not what anyone thought before
       # a single row is written.
@@ -383,6 +413,27 @@ jobs:
             --before "$REPORTS/host-before.json" \
             --after "$STAGE/host-after.json" \
             --out "$REPORTS/finance-comparison.json"
+
+      # Runbook step 9's role half. Creates or updates the login role
+      # `KITH_DATABASE_URL` names on Vercel and grants it exactly what
+      # `grantProofAppRole` in `packages/kith-store/src/index.ts` names.
+      # Deliberately after the live parity rerun and the finance comparison: the
+      # load and its own proof come first, and provisioning a role a failed load
+      # should never have reached is not worth doing early.
+      - id: app_role_live
+        name: Provision the web app's login role on the live archive database
+        if: inputs.mode == 'live'
+        env:
+          KITH_CUTOVER_DATABASE_URL: ${{ secrets.KITH_MIGRATION_DATABASE_URL }}
+          KITH_APP_ROLE_PASSWORD: ${{ secrets.KITH_APP_ROLE_PASSWORD }}
+        run: |
+          umask 077
+          node -e 'const u = new URL(process.env.KITH_CUTOVER_DATABASE_URL); for (const v of [u.hostname, u.username, u.password, u.pathname.slice(1)]) if (v) console.log("::add-mask::" + v);'
+          echo "::add-mask::$KITH_APP_ROLE_PASSWORD"
+          node "$GITHUB_WORKSPACE/scripts/cutover-app-role.mjs" \
+            --role "${{ inputs.app_role }}" --out "$REPORTS/app-role.json" > /dev/null
+          node -e 'const r = require(process.argv[1]); console.log(JSON.stringify({ok: r.ok, role: r.role, created: r.created, appRoleCanRead: r.appRoleCanRead, appRoleCannotCreate: r.appRoleCannotCreate, problems: r.problems}));' \
+            "$REPORTS/app-role.json"
 
       - id: summary
         name: Write the run summary
