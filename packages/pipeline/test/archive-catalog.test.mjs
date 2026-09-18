@@ -1043,6 +1043,242 @@ test("persists and replays an initial provider binding epoch of zero", async () 
   }
 });
 
+/** A provider original whose locator is durable but never admitted (P2-31a). */
+async function durableProviderOriginal(catalog, verifiedAt) {
+  const input = original();
+  input.copies = { primary: input.copies.primary };
+  input.providerOriginal = {
+    clientReferenceId: randomUUID(),
+    bindingId: randomUUID(),
+    locator: copy("independent_backup", "3"),
+  };
+  let row = await catalog.createOriginalIntent(input);
+  row = await catalog.recordProviderVerified({
+    catalogId: row.originalCatalogId,
+    expectedRevision: row.rowRevision,
+    verified: {
+      providerAccountIdHash: hash("1"),
+      providerRootDirectoryIdHash: hash("2"),
+      providerFileIdHash: hash("3"),
+      providerRevision: "rev1",
+      providerContentHash: hash("4"),
+      sourceContentHash: row.origin.sha256,
+      sourceByteLength: row.origin.byteLength,
+      verifiedAt,
+      manifestFingerprint: hash("5"),
+      manifestByteLength: 200,
+    },
+  });
+  row = await catalog.recordArchivePreparationIntent({
+    subject: "original_bytes",
+    catalogId: row.originalCatalogId,
+    expectedRevision: row.rowRevision,
+    role: "primary",
+    tempName: `${row.copies.primary.archiveObjectId}.tmp`,
+  });
+  row = await catalog.recordArchivePrepared({
+    subject: "original_bytes",
+    catalogId: row.originalCatalogId,
+    expectedRevision: row.rowRevision,
+    role: "primary",
+    prepared: {
+      state: "prepared",
+      tempName: row.copies.primary.preparationIntent.tempName,
+      source: { sha256: row.origin.sha256, byteLength: row.origin.byteLength },
+      ciphertext: { sha256: hash("6"), byteLength: 300 },
+      ciphertextDevice: 20,
+      ciphertextInode: 21,
+      archiveDirectoryDevice: 20,
+      archiveDirectoryInode: 22,
+      ageVersion: "v1.3.2",
+    },
+  });
+  row = await catalog.recordArchivePublished({
+    subject: "original_bytes",
+    catalogId: row.originalCatalogId,
+    expectedRevision: row.rowRevision,
+    role: "primary",
+    published: {
+      state: "published",
+      source: row.copies.primary.prepared.source,
+      ciphertext: row.copies.primary.prepared.ciphertext,
+      ciphertextDevice: row.copies.primary.prepared.ciphertextDevice,
+      ciphertextInode: row.copies.primary.prepared.ciphertextInode,
+      ageVersion: "v1.3.2",
+    },
+    readbackVerifiedAt: verifiedAt,
+  });
+  row = await catalog.recordCloudReceipt({
+    subject: "original_bytes",
+    catalogId: row.originalCatalogId,
+    expectedRevision: row.rowRevision,
+    role: "primary",
+    receiptId: "receipt_primary",
+    requestDigest: hash("7"),
+    recordedAt: verifiedAt,
+  });
+  return await catalog.updateProviderLocator({
+    catalogId: row.originalCatalogId,
+    expectedRevision: row.rowRevision,
+    update(locator) {
+      locator.preparationIntent = { tempName: `${locator.archiveObjectId}.tmp` };
+      locator.prepared = {
+        state: "prepared",
+        tempName: locator.preparationIntent.tempName,
+        source: { sha256: hash("5"), byteLength: 200 },
+        ciphertext: { sha256: hash("8"), byteLength: 400 },
+        ciphertextDevice: 30,
+        ciphertextInode: 31,
+        archiveDirectoryDevice: 30,
+        archiveDirectoryInode: 32,
+        ageVersion: "v1.3.2",
+      };
+      locator.published = {
+        state: "published",
+        source: locator.prepared.source,
+        ciphertext: locator.prepared.ciphertext,
+        ciphertextDevice: locator.prepared.ciphertextDevice,
+        ciphertextInode: locator.prepared.ciphertextInode,
+        ageVersion: "v1.3.2",
+      };
+      locator.backup = {
+        operationId: locator.restic.operationId,
+        snapshotId: hash("9"),
+        objectName: locator.objectName,
+        ciphertext: locator.published.ciphertext,
+        resticVersion: "0.19.1",
+        repositoryId: locator.restic.repositoryId,
+        verification: "destination_ciphertext_readback",
+        boundary: {
+          mode: "independent_backup",
+          readiness: "remote_repository_verified",
+          backend: "rclone_dropbox_v1",
+          remoteName: "kithmind_dropbox",
+          rootPath: "Kith Mind Backups/Processing",
+          rootDirectoryIdHash: hash("a"),
+          configIdentityFingerprint: hash("b"),
+          repositoryId: locator.restic.repositoryId,
+          resticVersion: "0.19.1",
+          rcloneVersion: "v1.74.4",
+        },
+      };
+      locator.readbackVerifiedAt = verifiedAt;
+    },
+  });
+}
+
+function refreshArguments(row, overrides = {}) {
+  const verified = row.providerOriginal.verified;
+  const backup = row.providerOriginal.locator.backup;
+  return {
+    catalogId: row.originalCatalogId,
+    expectedRevision: row.rowRevision,
+    verified: {
+      providerAccountIdHash: verified.providerAccountIdHash,
+      providerRootDirectoryIdHash: verified.providerRootDirectoryIdHash,
+      providerFileIdHash: verified.providerFileIdHash,
+      providerRevision: verified.providerRevision,
+      providerContentHash: verified.providerContentHash,
+      sourceContentHash: verified.sourceContentHash,
+      sourceByteLength: verified.sourceByteLength,
+      verifiedAt: Date.now(),
+      ...overrides.verified,
+    },
+    readback: { ...backup, ...overrides.readback },
+  };
+}
+
+test("refreshes a never admitted provider proof without moving its identity", async () => {
+  const f = await setup();
+  try {
+    const row = await durableProviderOriginal(f.catalog, 20);
+    const before = row.providerOriginal;
+    const refreshed = await f.catalog.refreshProviderProof(
+      refreshArguments(row),
+    );
+    assert.ok(refreshed.providerOriginal.verified.verifiedAt > 20);
+    assert.ok(refreshed.providerOriginal.locator.readbackVerifiedAt > 20);
+    assert.deepEqual(
+      { ...refreshed.providerOriginal.verified, verifiedAt: 20 },
+      before.verified,
+      "only the verification timestamp moves",
+    );
+    assert.deepEqual(
+      refreshed.providerOriginal.locator.backup,
+      before.locator.backup,
+      "the published locator and its snapshot are untouched",
+    );
+    assert.equal(
+      refreshed.providerOriginal.clientReferenceId,
+      before.clientReferenceId,
+      "the reference keeps the identity the server binds it under",
+    );
+  } finally {
+    await f.journal.close();
+    await rm(f.directory, { recursive: true, force: true });
+  }
+});
+
+test("a provider proof refresh fails closed on any moved identity", async () => {
+  const f = await setup();
+  try {
+    const row = await durableProviderOriginal(f.catalog, 20);
+    for (const overrides of [
+      { verified: { sourceContentHash: hash("e") } },
+      { verified: { sourceByteLength: 101 } },
+      { verified: { providerContentHash: hash("e") } },
+      { verified: { providerAccountIdHash: hash("e") } },
+      { verified: { providerRootDirectoryIdHash: hash("e") } },
+      { verified: { providerFileIdHash: hash("e") } },
+      { verified: { providerRevision: "rev2" } },
+      { verified: { verifiedAt: 19 } },
+      { readback: { snapshotId: hash("e") } },
+      { readback: { repositoryId: hash("e") } },
+      { readback: { ciphertext: { sha256: hash("e"), byteLength: 400 } } },
+    ]) {
+      await assert.rejects(
+        () => f.catalog.refreshProviderProof(refreshArguments(row, overrides)),
+        (error) =>
+          error instanceof ArchiveCatalogError &&
+          error.code === "catalog_conflict",
+        JSON.stringify(overrides),
+      );
+    }
+    assert.equal(f.catalog.listOriginals()[0].rowRevision, row.rowRevision);
+  } finally {
+    await f.journal.close();
+    await rm(f.directory, { recursive: true, force: true });
+  }
+});
+
+test("an admitted provider original cannot refresh its recorded proof", async () => {
+  const f = await setup();
+  try {
+    let row = await durableProviderOriginal(f.catalog, 20);
+    row = await f.catalog.recordOriginalCloud({
+      catalogId: row.originalCatalogId,
+      expectedRevision: row.rowRevision,
+      cloud: {
+        sourceItemId: "source_item",
+        sourceRevisionId: "source_revision",
+        primaryReceiptId: row.copies.primary.cloudReceipt.receiptId,
+        providerReferenceId: "provider_reference",
+        providerBindingEpoch: 0,
+        admittedAt: 24,
+      },
+    });
+    await assert.rejects(
+      () => f.catalog.refreshProviderProof(refreshArguments(row)),
+      (error) =>
+        error instanceof ArchiveCatalogError &&
+        error.code === "invalid_transition",
+    );
+  } finally {
+    await f.journal.close();
+    await rm(f.directory, { recursive: true, force: true });
+  }
+});
+
 test("persists archive preparation intent before encryption result", async () => {
   const f = await setup();
   let journal = f.journal;

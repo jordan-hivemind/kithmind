@@ -2515,6 +2515,262 @@ test("provider admission sends three recovery selections and persists the provid
   }
 });
 
+/**
+ * An original whose locator is durable but never admitted, with both proof
+ * timestamps set to `verifiedAt` (P2-31a).
+ */
+function durableProviderRows(checkpoint, verifiedAt) {
+  const durable = (role, seed) => {
+    const value = archiveCopy(role);
+    value.preparationIntent = { tempName: `${value.archiveObjectId}.tmp` };
+    value.prepared = {
+      state: "prepared",
+      tempName: value.preparationIntent.tempName,
+      source: { sha256: HASH, byteLength: 100 },
+      ciphertext: { sha256: seed.repeat(64), byteLength: 200 },
+      ciphertextDevice: 1,
+      ciphertextInode: 2,
+      archiveDirectoryDevice: 1,
+      archiveDirectoryInode: 3,
+      ageVersion: "v1.3.2",
+    };
+    value.published = {
+      state: "published",
+      source: { sha256: HASH, byteLength: 100 },
+      ciphertext: { sha256: seed.repeat(64), byteLength: 200 },
+      ciphertextDevice: 1,
+      ciphertextInode: 2,
+      ageVersion: "v1.3.2",
+    };
+    value.readbackVerifiedAt = verifiedAt;
+    if (role === "independent_backup")
+      value.backup = {
+        operationId: value.restic.operationId,
+        snapshotId: `${seed}`.repeat(64),
+        objectName: value.objectName,
+        ciphertext: value.published.ciphertext,
+        resticVersion: "0.19.1",
+        repositoryId: value.restic.repositoryId,
+        verification: "destination_ciphertext_readback",
+      };
+    return value;
+  };
+  return {
+    original: {
+      originalCatalogId: checkpoint.originalCatalogId,
+      rowRevision: 1,
+      createdAt: 1,
+      origin: { sha256: HASH, byteLength: 100 },
+      copies: { primary: durable("primary", "1") },
+      providerOriginal: {
+        clientReferenceId: randomUUID(),
+        bindingId: randomUUID(),
+        locator: durable("independent_backup", "4"),
+        verified: {
+          providerAccountIdHash: "1".repeat(64),
+          providerRootDirectoryIdHash: "2".repeat(64),
+          providerFileIdHash: "3".repeat(64),
+          providerRevision: "rev1",
+          providerContentHash: "4".repeat(64),
+          sourceContentHash: HASH,
+          sourceByteLength: 100,
+          verifiedAt,
+          manifestFingerprint: "5".repeat(64),
+          manifestByteLength: 300,
+        },
+      },
+    },
+    processing: {
+      processingCatalogId: checkpoint.processingCatalogId,
+      rowRevision: 1,
+      createdAt: 1,
+      copies: {
+        primary: durable("primary", "2"),
+        independent_backup: durable("independent_backup", "3"),
+      },
+    },
+  };
+}
+
+function admitCheckpoint(plan) {
+  return archivedCheckpoint(plan, {
+    step: "admit",
+    preflightAction: undefined,
+    discoveryLease: {
+      workId: "work",
+      sourceItemId: plan.sourceItemId,
+      observationEpoch: 1,
+      processingEpoch: 1,
+      leaseEpoch: 1,
+      leaseToken: TOKEN,
+      leaseExpiresAt: Date.now() + 60_000,
+    },
+  });
+}
+
+test("an interrupted provider admission re-verifies instead of wedging every later pass", async () => {
+  const setup = await fixture(0);
+  const plan = pdfPlan();
+  const checkpoint = admitCheckpoint(plan);
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  // Verified and read back before something interrupted the admission, then
+  // resumed on a later pass with the proof long past the server's window.
+  const rows = durableProviderRows(checkpoint, Date.now() - 45 * 60_000);
+  const runner = new PipelineRunner(setup.config, journal, {
+    async call() {
+      throw new Error("a stale declaration must not reach the transport");
+    },
+  });
+  runner.archivedRows = () => rows;
+  runner.mappedProcessing = async () => {
+    throw new Error("a stale declaration must not be built");
+  };
+  try {
+    await runner.driveArchivedAdmit();
+    assert.equal(journal.checkpoint.phase, "archived");
+    assert.equal(journal.checkpoint.step, "parser_archive");
+    assert.equal(journal.checkpoint.discoveryLease, undefined);
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("an admitted original still fails closed when its recorded proof is stale", async () => {
+  const setup = await fixture(0);
+  const plan = pdfPlan();
+  const checkpoint = admitCheckpoint(plan);
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  const rows = durableProviderRows(checkpoint, Date.now() - 45 * 60_000);
+  rows.original.cloud = {
+    sourceItemId: plan.sourceItemId,
+    sourceRevisionId: "revision",
+    primaryReceiptId: "original-primary",
+    providerReferenceId: "provider-reference",
+    providerBindingEpoch: 0,
+    admittedAt: 1,
+  };
+  const runner = new PipelineRunner(setup.config, journal, {
+    async call() {
+      throw new Error("a stale declaration must not reach the transport");
+    },
+  });
+  runner.archivedRows = () => rows;
+  runner.mappedProcessing = async () => ({
+    ...rows,
+    declaration: { textHash: HASH },
+  });
+  try {
+    await assert.rejects(
+      () => runner.driveArchivedAdmit(),
+      (error) => error.code === "provider_verification_stale_review_required",
+    );
+    assert.equal(journal.checkpoint.step, "admit");
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a durable admit replay keeps its persisted declaration instead of refreshing", async () => {
+  const setup = await fixture(0);
+  const plan = pdfPlan();
+  const checkpoint = admitCheckpoint(plan);
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  const rows = durableProviderRows(checkpoint, Date.now() - 45 * 60_000);
+  const runner = new PipelineRunner(setup.config, journal, {
+    async call() {
+      throw new Error("unused");
+    },
+  });
+  runner.archivedRows = () => rows;
+  runner.mappedProcessing = async () => ({
+    ...rows,
+    declaration: { textHash: HASH },
+  });
+  let requireFresh;
+  runner.providerDeclaration = (_row, fresh) => {
+    requireFresh = fresh;
+    throw new Error("declaration reached");
+  };
+  const requestId = randomUUID();
+  await journal.planRequest({
+    operation: "discovery.admitArchived",
+    requestId,
+    requestBody: JSON.stringify({
+      protocolVersion: 1,
+      operation: "discovery.admitArchived",
+      spaceId: "space",
+      sourceAccountId: "source",
+      requestId,
+    }),
+    createdAt: 1,
+  });
+  try {
+    // A replayed call reuses its journaled body, so it must not be rerouted
+    // into a refresh that would abandon the request the server may have run.
+    await assert.rejects(
+      () => runner.driveArchivedAdmit(),
+      /declaration reached/,
+    );
+    assert.equal(requireFresh, false);
+    assert.equal(journal.checkpoint.step, "admit");
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a complete but stale provider locator asks for a refresh, a fresh one reserves", async () => {
+  const setup = await fixture(0);
+  const registryPath = join(setup.base, "provider-registry");
+  await mkdir(registryPath, { mode: 0o700 });
+  const registryDirectory = await realpath(registryPath);
+  await chmod(registryDirectory, 0o700);
+  const plan = pdfPlan();
+  const checkpoint = archivedCheckpoint(plan, {
+    step: "parser_archive",
+    preflightAction: undefined,
+  });
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  const runner = new PipelineRunner(
+    {
+      ...setup.config,
+      pdfDocQa: {
+        archive: { independentBackup: { repository: {} } },
+        providerOriginal: {
+          registryDirectory,
+          rootAlias: plan.rootAlias,
+          providerAccountIdHash: "1".repeat(64),
+          providerRootDirectoryIdHash: "2".repeat(64),
+          providerRootDirectoryId: "id:root",
+        },
+      },
+    },
+    journal,
+    { async call() {} },
+  );
+  try {
+    for (const [verifiedAt, step, preflightAction] of [
+      [Date.now() - 45 * 60_000, "preflight", "provider_refresh"],
+      [Date.now(), "reserve", undefined],
+    ]) {
+      const rows = durableProviderRows(checkpoint, verifiedAt);
+      await runner.driveProviderOriginal(
+        checkpoint,
+        rows.original,
+        rows.processing,
+        join(setup.root, plan.relativePath),
+      );
+      assert.equal(journal.checkpoint.step, step);
+      assert.equal(journal.checkpoint.preflightAction, preflightAction);
+    }
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
 test("archived pending bodies are rebuilt from catalog and spool state", async () => {
   const setup = await fixture(0);
   const plan = pdfPlan();

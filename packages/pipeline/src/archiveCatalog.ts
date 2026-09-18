@@ -2490,6 +2490,76 @@ export class ArchiveCatalog {
     )) as OriginalCatalogRow;
   }
 
+  /**
+   * P2-31a. Advances only the two timestamps a provider original declaration
+   * must carry fresh (`verified.verifiedAt` and the locator's
+   * `readbackVerifiedAt`) after the worker redid both checks, for an original
+   * whose admission was interrupted before the server recorded a reference.
+   * Every identifying field must match what is already recorded, so a changed
+   * file, a moved account or root, or a replaced backup object fails closed
+   * here rather than reaching the server. A row that already carries `cloud`
+   * is admitted: its reference is immutable server side, so re-binding it is
+   * P2-31's multi-reference work and not this recovery.
+   */
+  async refreshProviderProof(args: {
+    catalogId: string;
+    expectedRevision: number;
+    verified: Omit<
+      NonNullable<
+        NonNullable<OriginalCatalogRow["providerOriginal"]>["verified"]
+      >,
+      "manifestFingerprint" | "manifestByteLength"
+    >;
+    readback: Omit<NonNullable<ArchiveCopyRecord["backup"]>, "boundary">;
+  }): Promise<OriginalCatalogRow> {
+    return (await this.updateRow(
+      "original_bytes",
+      args.catalogId,
+      args.expectedRevision,
+      (value) => {
+        const row = value as OriginalCatalogRow;
+        const provider = row.providerOriginal;
+        const stored = provider?.verified;
+        const backup = provider?.locator.backup;
+        if (
+          row.cloud ||
+          !provider ||
+          !stored ||
+          !backup ||
+          provider.locator.readbackVerifiedAt === undefined
+        )
+          fail("invalid_transition");
+        const readbackVerifiedAt = Date.now();
+        if (
+          args.verified.providerAccountIdHash !==
+            stored.providerAccountIdHash ||
+          args.verified.providerRootDirectoryIdHash !==
+            stored.providerRootDirectoryIdHash ||
+          args.verified.providerFileIdHash !== stored.providerFileIdHash ||
+          args.verified.providerRevision !== stored.providerRevision ||
+          args.verified.providerContentHash !== stored.providerContentHash ||
+          args.verified.sourceContentHash !== stored.sourceContentHash ||
+          args.verified.sourceByteLength !== stored.sourceByteLength ||
+          args.verified.sourceContentHash !== row.origin.sha256 ||
+          args.verified.sourceByteLength !== row.origin.byteLength ||
+          args.verified.verifiedAt < stored.verifiedAt ||
+          readbackVerifiedAt < provider.locator.readbackVerifiedAt ||
+          args.readback.operationId !== backup.operationId ||
+          args.readback.snapshotId !== backup.snapshotId ||
+          args.readback.objectName !== backup.objectName ||
+          args.readback.resticVersion !== backup.resticVersion ||
+          args.readback.repositoryId !== backup.repositoryId ||
+          args.readback.verification !== backup.verification ||
+          !equal(args.readback.ciphertext, backup.ciphertext)
+        )
+          fail("catalog_conflict");
+        stored.verifiedAt = integer(args.verified.verifiedAt);
+        provider.locator.readbackVerifiedAt = readbackVerifiedAt;
+        row.providerOriginal = providerOriginal(provider);
+      },
+    )) as OriginalCatalogRow;
+  }
+
   async updateProviderLocator(args: {
     catalogId: string;
     expectedRevision: number;
