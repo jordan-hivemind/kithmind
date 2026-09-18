@@ -9,6 +9,7 @@ import {
   newKithId,
   provenance,
   records,
+  withKithTransaction,
 } from "../dist/index.js";
 import { listSources } from "../dist/documents/index.js";
 import {
@@ -51,6 +52,7 @@ import {
   renewProcessingJob,
   renewParsedJob,
   reserveArchivedDiscovery,
+  resetExhaustedDiscoveryWork,
   reserveDiscoveryWork,
   reserveProcessingJobs,
   reserveParsedJobs,
@@ -3287,6 +3289,257 @@ test(
       );
       assert.equal(expired.state, "stale");
       assert.equal(expired.staleReason, "expired");
+    } finally {
+      await pool.end();
+    }
+  },
+);
+
+// P2-31a. The wedged live row was `leased` with an expired lease and attempts at
+// the cap, which both reserve paths refuse, so the only way back is an operator
+// reset of the counter. This proves the reset makes exactly that row reservable
+// again, refuses a row a live worker may still hold, and leaves everything else
+// alone.
+test(
+  "resetting exhausted discovery work restores one reserve and keeps the lease fence",
+  { skip },
+  async (t) => {
+    const f = await fixture(t);
+    const pool = createKithPool(f.databaseUrl, 2);
+    const call = (work, now = NOW) => withWorkerTransaction(pool, work, now);
+    const reset = (args) =>
+      withKithTransaction(pool, (client) =>
+        resetExhaustedDiscoveryWork(client, {
+          spaceId: f.spaceId,
+          now: NOW,
+          ...args,
+        }),
+      );
+    const fingerprint = "b".repeat(64);
+    const workRow = async () =>
+      (
+        await f.client.query(
+          "SELECT * FROM kith.worker_discovery_work WHERE source_account_id = $1",
+          [f.sourceAccountId],
+        )
+      ).rows[0];
+    try {
+      await f.client.query(
+        `UPDATE kith.source_accounts SET binary_profile_ids = $1, binary_profile_audit_digest = $2,
+        binary_profile_enabled_at = $3 WHERE id = $4`,
+        [
+          JSON.stringify(["pdf_docqa_v1"]),
+          fingerprint,
+          new Date(NOW),
+          f.sourceAccountId,
+        ],
+      );
+      const begun = await call((ctx) =>
+        beginWorkerScan(ctx, f.principal, {
+          protocolVersion: 1,
+          operation: "scan.begin",
+          spaceId: f.spaceId,
+          sourceAccountId: f.sourceAccountId,
+          requestId: "reset-begin",
+          watcherId: "watcher-1",
+          connectorVersion: "fs-v1",
+          mode: "normal",
+          expectedInventoryEpoch: 0,
+        }),
+      );
+      await call((ctx) =>
+        appendWorkerScanPage(ctx, f.principal, {
+          protocolVersion: 1,
+          operation: "scan.appendPage",
+          spaceId: f.spaceId,
+          sourceAccountId: f.sourceAccountId,
+          scanId: begun.scanId,
+          requestId: "reset-page",
+          ordinal: 0,
+          entries: [
+            {
+              ...readyEntry(),
+              uri: "fs://synthetic/a.pdf",
+              docType: "pdf",
+              content: {
+                status: "ready_binary_v1",
+                sha256: HASH_A,
+                byteLength: 10,
+                mediaType: "application/pdf",
+                parserProfileId: "pdf_docqa_v1",
+                parserFingerprint: fingerprint,
+                extractionConfigurationFingerprint: "c".repeat(64),
+                extractorFingerprint: "extractor-v1",
+                recordSchemaFingerprint: "schema-v1",
+                normalizationFingerprint: "normalization-v1",
+                chunkerFingerprint: "chunker-v1",
+                correctionRevision: "correction-v1",
+              },
+            },
+          ],
+        }),
+      );
+      await call((ctx) =>
+        sealWorkerScan(ctx, f.principal, {
+          protocolVersion: 1,
+          operation: "scan.seal",
+          spaceId: f.spaceId,
+          sourceAccountId: f.sourceAccountId,
+          scanId: begun.scanId,
+          requestId: "reset-seal",
+          expectedPageCount: 1,
+          health: { status: "healthy" },
+        }),
+      );
+      await call((ctx) =>
+        reconcileWorkerScan(ctx, f.principal, {
+          protocolVersion: 1,
+          operation: "scan.reconcile",
+          spaceId: f.spaceId,
+          sourceAccountId: f.sourceAccountId,
+          scanId: begun.scanId,
+          requestId: "reset-reconcile",
+          expectedInventoryEpoch: 1,
+          ordinal: 0,
+          maxItems: 10,
+        }),
+      );
+      const seeded = await workRow();
+      const reserveRequest = {
+        protocolVersion: 1,
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        operation: "discovery.reserveArchived",
+        requestId: "reset-reserve-1",
+        identity: {
+          sourceItemId: seeded.source_item_id,
+          scanId: begun.scanId,
+          observationEpoch: Number(seeded.observation_epoch),
+          processingEpoch: Number(seeded.processing_epoch),
+          contentHash: HASH_A,
+          byteLength: 10,
+          mediaType: "application/pdf",
+          parserProfileId: "pdf_docqa_v1",
+          parserFingerprint: fingerprint,
+          extractionConfigurationFingerprint: "c".repeat(64),
+          extractorFingerprint: "extractor-v1",
+          recordSchemaFingerprint: "schema-v1",
+          normalizationFingerprint: "normalization-v1",
+          chunkerFingerprint: "chunker-v1",
+          correctionRevision: "correction-v1",
+        },
+      };
+      // A row under the cap is not the reset's business, whatever state it is
+      // in. This one is `queued` with seven attempts spent.
+      await f.client.query(
+        "UPDATE kith.worker_discovery_work SET attempts = 7 WHERE id = $1",
+        [seeded.id],
+      );
+      assert.deepEqual(await reset({ apply: true }), {
+        spaceId: f.spaceId,
+        eligible: 0,
+        reset: 0,
+      });
+      assert.equal(Number((await workRow()).attempts), 7);
+      // The wedged shape: leased, lease long expired, every attempt spent.
+      await f.client.query(
+        `UPDATE kith.worker_discovery_work
+            SET attempts = 8, state = 'leased', lease_epoch = 4,
+                lease_token = $2, lease_owner_credential_id = $3,
+                lease_expires_at = $4
+          WHERE id = $1`,
+        [
+          seeded.id,
+          "7".repeat(64),
+          f.credential.id,
+          new Date(NOW - 60 * 60 * 1_000),
+        ],
+      );
+      await assert.rejects(
+        () =>
+          call((ctx) =>
+            reserveArchivedDiscovery(
+              ctx,
+              f.principal,
+              reserveRequest,
+              "8".repeat(64),
+            ),
+          ),
+        expectProtocolCode("lease_conflict"),
+      );
+      // A lease that has not expired may still be held by a live worker.
+      await f.client.query(
+        "UPDATE kith.worker_discovery_work SET lease_expires_at = $2 WHERE id = $1",
+        [seeded.id, new Date(NOW + 60 * 1_000)],
+      );
+      assert.deepEqual(await reset({ apply: true }), {
+        spaceId: f.spaceId,
+        eligible: 0,
+        reset: 0,
+      });
+      assert.equal(Number((await workRow()).attempts), 8);
+      await f.client.query(
+        "UPDATE kith.worker_discovery_work SET lease_expires_at = $2 WHERE id = $1",
+        [seeded.id, new Date(NOW - 60 * 60 * 1_000)],
+      );
+      // A dry run counts the row and writes nothing.
+      assert.deepEqual(await reset({ apply: false }), {
+        spaceId: f.spaceId,
+        eligible: 1,
+        reset: 0,
+      });
+      assert.equal(Number((await workRow()).attempts), 8);
+      assert.deepEqual(await reset({ apply: true }), {
+        spaceId: f.spaceId,
+        eligible: 1,
+        reset: 1,
+      });
+      const after = await workRow();
+      assert.equal(after.state, "queued");
+      assert.equal(Number(after.attempts), 0);
+      assert.equal(after.lease_token, null);
+      assert.equal(after.lease_owner_credential_id, null);
+      assert.equal(after.lease_expires_at, null);
+      assert.equal(after.next_attempt_at, null);
+      assert.equal(after.failure_code, null);
+      assert.equal(after.retryable, null);
+      // The fence only ever rises: the reset left `lease_epoch` alone and the
+      // reserve that follows raises it past every lease the row ever issued.
+      assert.equal(Number(after.lease_epoch), 4);
+      const reserved = await call((ctx) =>
+        reserveArchivedDiscovery(
+          ctx,
+          f.principal,
+          reserveRequest,
+          "9".repeat(64),
+        ),
+      );
+      assert.equal(reserved.leaseEpoch, 5);
+      const leased = await workRow();
+      assert.equal(leased.state, "leased");
+      assert.equal(Number(leased.attempts), 1);
+      // Idempotent: a reset row is below the cap, so a second call is a no-op.
+      assert.deepEqual(await reset({ apply: true }), {
+        spaceId: f.spaceId,
+        eligible: 0,
+        reset: 0,
+      });
+      // A successfully admitted row and superseded history are never requeued.
+      for (const state of ["admitted", "obsolete"]) {
+        await f.client.query(
+          `UPDATE kith.worker_discovery_work
+              SET attempts = 8, state = $2, lease_token = NULL,
+                  lease_owner_credential_id = NULL, lease_expires_at = NULL
+            WHERE id = $1`,
+          [seeded.id, state],
+        );
+        assert.deepEqual(
+          await reset({ apply: true }),
+          { spaceId: f.spaceId, eligible: 0, reset: 0 },
+          state,
+        );
+        assert.equal(Number((await workRow()).attempts), 8);
+      }
     } finally {
       await pool.end();
     }

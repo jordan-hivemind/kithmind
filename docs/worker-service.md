@@ -254,6 +254,30 @@ Keychain, wrapper, `plutil -lint`, and `launchctl bootstrap`/`kickstart`
 steps, substituting the deferred-work label, wrapper, and `KITH_STORE_DATABASE_URL`
 Keychain item for the filesystem worker's own.
 
+## Discovery work stuck at the attempt cap
+
+A discovery work row is refused once its `attempts` reaches
+`MAX_WORKER_DISCOVERY_ATTEMPTS` (8). Both reserve paths return `lease_conflict`
+at the cap, and nothing in the protocol lowers the counter, so a document whose
+attempts were spent on a client defect stays unreachable after the defect is
+fixed. Use `kith-discovery-reset` (`packages/kith-store/src/workers/cli.ts`)
+when a pass reports `lease_conflict` on an item and that item is at the cap. It
+resets the counter and returns the row to `queued`, so the next pass reserves it
+once in the normal way. It refuses a row whose lease has not expired, because a
+live worker may still hold it, and it never touches a successfully admitted row,
+superseded history, `lease_epoch`, or anything outside the work row. It counts
+and writes nothing unless `--apply` is given, and a second run is a no-op.
+
+```sh
+pnpm exec turbo run build --filter=@repo/kith-store
+KITH_STORE_DATABASE_URL=postgres://... node packages/kith-store/dist/workers/cli.js
+KITH_STORE_DATABASE_URL=postgres://... node packages/kith-store/dist/workers/cli.js --apply
+```
+
+Add `--space <id>` to limit either run to one space. Output is one JSON line per
+space carrying the space id, the eligible count and the reset count, and nothing
+else.
+
 ## Template validation
 
 The macOS plist and both shell wrappers are syntax-checked in this repository.

@@ -14,6 +14,7 @@ export * from "./diagnostics.js";
 export * from "./dispatch.js";
 export * from "./discovery.js";
 export * from "./entries.js";
+export * from "./exhaustedWork.js";
 export * from "./errors.js";
 export * from "./http.js";
 export * from "./jobs.js";
