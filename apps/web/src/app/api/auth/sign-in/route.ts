@@ -4,11 +4,6 @@
 // inside the same `withKithTransaction`, so a sign-in that opens a session
 // without the space records it needs, or the reverse, is not a state this can
 // reach.
-//
-// The route exists in both surface modes. It only ever writes `kith.sessions`
-// and the personal space records, so under `KITH_POSTGRES_SURFACE=convex` it is
-// harmless: nothing reads the cookie it sets until the middleware and the
-// layouts switch over.
 
 import { withKithTransaction } from "@repo/kith-store";
 import {

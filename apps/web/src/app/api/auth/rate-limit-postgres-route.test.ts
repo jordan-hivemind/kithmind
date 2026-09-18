@@ -1,12 +1,9 @@
-// The sign-in and sign-up routes' rate limiting under
-// `KITH_POSTGRES_SURFACE=postgres`, where the durable
-// `kith.auth_rate_limits` table is spent from instead of the in-process token
-// bucket `rate-limit-route.test.ts` covers.
+// The sign-in and sign-up routes' rate limiting, spent from the durable
+// `kith.auth_rate_limits` table.
 //
-// `rate-limit-route.test.ts` stays unchanged and still exercises the token
-// bucket, because `KITH_POSTGRES_SURFACE` is unset there and defaults to
-// `convex`. This file sets it to `postgres` for the whole suite, so every
-// case here goes through `checkAuthRateLimit`'s durable branch.
+// This is the whole of it since i7b: the in-process token bucket i1 shipped was
+// only ever selected by the `convex` surface, so both routes now reach
+// `checkAuthRateLimit`'s one branch.
 //
 // A throwaway database per run, matching `auth-routes.test.ts`'s own
 // convention: this suite skips cleanly when `KITH_STORE_DATABASE_URL` is not
@@ -41,14 +38,16 @@ function address(): string {
   return `203.0.113.${addresses % 250}`;
 }
 
-function signIn(
+function attempt(
+  route: (request: Request) => Promise<Response>,
+  path: string,
   address: string | null,
   email: string,
 ): Promise<Response> {
   const headers = new Headers({ "Content-Type": "application/json" });
   if (address !== null) headers.set("x-forwarded-for", address);
-  return signInRoute(
-    new Request("https://brain.example.test/api/auth/sign-in", {
+  return route(
+    new Request(`https://brain.example.test${path}`, {
       method: "POST",
       headers,
       body: JSON.stringify({ email, password: "not the password" }),
@@ -56,15 +55,21 @@ function signIn(
   );
 }
 
-let signInRoute: (request: Request) => Promise<Response>;
+function signIn(address: string | null, email: string): Promise<Response> {
+  return attempt(signInRoute, "/api/auth/sign-in", address, email);
+}
 
-describeWithDatabase(
-  "the durable auth rate limiter, under KITH_POSTGRES_SURFACE=postgres",
-  () => {
+function signUp(address: string | null, email: string): Promise<Response> {
+  return attempt(signUpRoute, "/api/auth/sign-up", address, email);
+}
+
+let signInRoute: (request: Request) => Promise<Response>;
+let signUpRoute: (request: Request) => Promise<Response>;
+
+describeWithDatabase("the durable auth rate limiter", () => {
     let pool: pg.Pool;
     let restorePool: () => void;
     let databaseName: string;
-    let previousSurface: string | undefined;
 
     async function onAdmin<T>(
       work: (admin: pg.Client) => Promise<T>,
@@ -91,24 +96,18 @@ describeWithDatabase(
       await migrator.end();
 
       process.env.KITH_SESSION_SECRET = secret;
-      previousSurface = process.env.KITH_POSTGRES_SURFACE;
-      process.env.KITH_POSTGRES_SURFACE = "postgres";
       pool = createKithPool(url.toString());
       pool.on("error", () => {});
       restorePool = setKithPool(pool);
 
       signInRoute = (await import("./sign-in/route")).POST;
+      signUpRoute = (await import("./sign-up/route")).POST;
     }, 60_000);
 
     afterAll(async () => {
       restorePool?.();
       await pool?.end().catch(() => {});
       delete process.env.KITH_SESSION_SECRET;
-      if (previousSurface === undefined) {
-        delete process.env.KITH_POSTGRES_SURFACE;
-      } else {
-        process.env.KITH_POSTGRES_SURFACE = previousSurface;
-      }
       await onAdmin((admin) =>
         admin.query(`DROP DATABASE IF EXISTS ${databaseName} WITH (FORCE)`),
       ).catch(() => {});
@@ -145,6 +144,16 @@ describeWithDatabase(
       expect((await signIn(second, account())).status).not.toBe(429);
     }, 30_000);
 
+    // The wiring fact: sign-up spends from the same budget as sign-in, so a
+    // burst cannot sidestep the limit by changing which route it calls.
+    test("sign-up spends from the same address budget as sign-in", async () => {
+      const clientAddress = address();
+      for (let attempt = 0; attempt < 30; attempt += 1) {
+        expect((await signIn(clientAddress, account())).status).not.toBe(429);
+      }
+      expect((await signUp(clientAddress, account())).status).toBe(429);
+    }, 30_000);
+
     test("fails closed, with a 503 that names nothing, when the limiter's own transaction cannot run", async () => {
       const rejecting = new pg.Pool({
         connectionString: "postgres://nobody:nowhere@127.0.0.1:1/does-not-exist",
@@ -162,5 +171,4 @@ describeWithDatabase(
         await rejecting.end().catch(() => {});
       }
     }, 15_000);
-  },
-);
+});

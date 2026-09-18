@@ -138,9 +138,6 @@ describeWithDatabase("i5 page loaders on PostgreSQL", () => {
 
     vi.stubEnv("KITH_SESSION_SECRET", secret);
     process.env.KITH_SESSION_SECRET = secret;
-    // `/api/kith/thoughts/search`, exercised below, only answers under the
-    // postgres surface (finding 10 of the second-model review of P2-39i5).
-    process.env.KITH_POSTGRES_SURFACE = "postgres";
 
     const userA = await signedInUser();
     const userB = await signedInUser();
@@ -182,7 +179,6 @@ describeWithDatabase("i5 page loaders on PostgreSQL", () => {
   afterAll(async () => {
     restorePool?.();
     await pool?.end().catch(() => {});
-    delete process.env.KITH_POSTGRES_SURFACE;
     await onAdmin((admin) =>
       admin.query(`DROP DATABASE IF EXISTS ${databaseName} WITH (FORCE)`),
     ).catch(() => {});

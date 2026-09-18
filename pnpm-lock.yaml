@@ -26,15 +26,9 @@ importers:
 
   apps/web:
     dependencies:
-      '@convex-dev/auth':
-        specifier: ^0.0.94
-        version: 0.0.94(@auth/core@0.41.3)(convex@1.43.0(react@19.2.8))(react@19.2.8)
       '@modelcontextprotocol/sdk':
         specifier: ^1.30.0
         version: 1.30.0(zod@3.25.76)
-      '@repo/db':
-        specifier: workspace:*
-        version: link:../../packages/convex
       '@repo/finance-archive':
         specifier: workspace:*
         version: link:../../packages/finance-archive
@@ -47,9 +41,6 @@ importers:
       '@repo/worker-protocol':
         specifier: workspace:*
         version: link:../../packages/worker-protocol
-      convex:
-        specifier: ^1.43.0
-        version: 1.43.0(react@19.2.8)
       jose:
         specifier: ^6.2.8
         version: 6.2.8

@@ -1,23 +1,8 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
-const convexMocks = vi.hoisted(() => ({
-  action: vi.fn(),
-  mutation: vi.fn(),
-  query: vi.fn(),
-  setAuth: vi.fn(),
-}));
-
-vi.mock("convex/browser", () => ({
-  ConvexHttpClient: class {
-    action = convexMocks.action;
-    mutation = convexMocks.mutation;
-    query = convexMocks.query;
-    setAuth = convexMocks.setAuth;
-  },
-}));
-
+import type { WithMcpPrincipal } from "./principal";
 import {
   createMcpServer,
   parseValidityTimestamp,
@@ -28,18 +13,25 @@ import { MCP_TOOL_NAME_LIST } from "./tools";
 
 describe("MCP memory quality contract", () => {
   beforeEach(() => {
-    process.env.NEXT_PUBLIC_CONVEX_URL = "https://example.convex.cloud";
     delete process.env.MCP_TOOL_PROFILE;
-    vi.resetAllMocks();
   });
 
   afterEach(() => {
-    delete process.env.NEXT_PUBLIC_CONVEX_URL;
     delete process.env.MCP_TOOL_PROFILE;
   });
 
+  // Every case below lists tools and reads descriptions, so the loader is
+  // never called. It throws rather than returning a stub, so a case that grew
+  // a tool call would fail instead of quietly reading nothing.
+  const credential = {
+    surface: "postgres",
+    withPrincipal: (() => {
+      throw new Error("no tool call expected in this suite");
+    }) as unknown as WithMcpPrincipal,
+  } as const;
+
   test("tells capable clients to recall verbatim and capture only grounded facts", async () => {
-    const server = createMcpServer("test-convex-auth-token", "user-test");
+    const server = createMcpServer(credential, "user-test");
     const client = new Client({ name: "memory-quality-test", version: "1" });
     const [clientTransport, serverTransport] =
       InMemoryTransport.createLinkedPair();
@@ -119,7 +111,7 @@ describe("MCP memory quality contract", () => {
 
   test("narrows to the memory surface only when explicitly opted in", async () => {
     process.env.MCP_TOOL_PROFILE = "memory";
-    const server = createMcpServer("test-convex-auth-token", "user-test");
+    const server = createMcpServer(credential, "user-test");
     const client = new Client({ name: "memory-profile-test", version: "1" });
     const [clientTransport, serverTransport] =
       InMemoryTransport.createLinkedPair();
@@ -138,370 +130,6 @@ describe("MCP memory quality contract", () => {
           MCP_TOOL_ANNOTATIONS[tool.name as keyof typeof MCP_TOOL_ANNOTATIONS],
         );
       }
-    } finally {
-      await client.close();
-      await server.close();
-    }
-  });
-
-  test("returns current core context before deduplicated relevance hits", async () => {
-    const query = "What changed in Atlas Memory v2.7.1 for ticket ATLAS-184?";
-    const coreThoughts = [
-      {
-        _id: "core-preference",
-        _creationTime: Date.UTC(2026, 7, 1),
-        content: "Alex prefers concise, direct answers.",
-        metadata: {
-          type: "person_note",
-          topics: ["communication"],
-          people: ["Alex"],
-          actionItems: [],
-          summary: "Communication preference",
-        },
-        userId: "alex",
-        memoryStatus: "current",
-        isCore: true,
-      },
-      {
-        _id: "core-home",
-        _creationTime: Date.UTC(2026, 6, 31),
-        content: "Alex lives in Los Angeles.",
-        metadata: {
-          type: "person_note",
-          topics: ["location"],
-          people: ["Alex"],
-          actionItems: [],
-          summary: "Home location",
-        },
-        userId: "alex",
-        memoryStatus: "current",
-        isCore: true,
-      },
-      {
-        _id: "core-constraint",
-        _creationTime: Date.UTC(2026, 6, 30),
-        content: "Alex avoids meetings before 9 AM.",
-        metadata: {
-          type: "person_note",
-          topics: ["scheduling"],
-          people: ["Alex"],
-          actionItems: [],
-          summary: "Scheduling constraint",
-        },
-        userId: "alex",
-        memoryStatus: "current",
-        isCore: true,
-      },
-    ];
-    convexMocks.query
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce(coreThoughts)
-      .mockResolvedValueOnce([]);
-    convexMocks.action
-      .mockResolvedValueOnce({
-        vectorStatus: "ready",
-        results: [
-          {
-            _id: "core-preference",
-            summary: "Communication preference",
-            snippet: "Alex prefers concise, direct answers.",
-            type: "person_note",
-            topics: ["communication"],
-            score: 0.03,
-            createdAt: Date.UTC(2026, 7, 1),
-            memoryStatus: "current",
-            isCore: true,
-          },
-          {
-            _id: "atlas-version",
-            summary: "Atlas Memory release",
-            snippet: "Atlas Memory v2.7.1 addresses ATLAS-184.",
-            type: "reference",
-            topics: ["Atlas Memory"],
-            score: 0.02,
-            createdAt: Date.UTC(2026, 7, 2),
-            memoryStatus: "current",
-          },
-          {
-            _id: "atlas-migration",
-            summary: "Atlas migration",
-            snippet: "ATLAS-184 tracks the active migration.",
-            type: "task",
-            topics: ["Atlas Memory"],
-            score: 0.019,
-            createdAt: Date.UTC(2026, 7, 3),
-            memoryStatus: "current",
-          },
-          {
-            _id: "atlas-older-release",
-            summary: "Atlas prior release",
-            snippet: "Atlas Memory v2.7.0 preceded v2.7.1.",
-            type: "reference",
-            topics: ["Atlas Memory"],
-            score: 0.018,
-            createdAt: Date.UTC(2026, 6, 15),
-            memoryStatus: "current",
-          },
-          {
-            _id: "atlas-owner",
-            summary: "Atlas project owner",
-            snippet: "Noam owns Atlas Memory.",
-            type: "person_note",
-            topics: ["Atlas Memory"],
-            score: 0.017,
-            createdAt: Date.UTC(2026, 6, 10),
-            memoryStatus: "current",
-          },
-        ],
-      })
-      .mockResolvedValueOnce([
-        {
-          _id: "atlas-version",
-          content: "Atlas Memory v2.7.1 addresses ATLAS-184.",
-          metadata: {
-            type: "reference",
-            topics: ["Atlas Memory"],
-            people: [],
-            actionItems: [],
-            summary: "Atlas Memory release",
-          },
-          createdAt: Date.UTC(2026, 7, 2),
-          memoryStatus: "current",
-        },
-        {
-          _id: "atlas-migration",
-          content: "ATLAS-184 tracks the active migration.",
-          metadata: {
-            type: "task",
-            topics: ["Atlas Memory"],
-            people: [],
-            actionItems: ["Complete ATLAS-184"],
-            summary: "Atlas migration",
-          },
-          createdAt: Date.UTC(2026, 7, 3),
-          memoryStatus: "current",
-        },
-      ]);
-
-    const server = createMcpServer("test-convex-auth-token", "user-test");
-    const client = new Client({ name: "memory-quality-test", version: "1" });
-    const [clientTransport, serverTransport] =
-      InMemoryTransport.createLinkedPair();
-
-    try {
-      await Promise.all([
-        server.connect(serverTransport),
-        client.connect(clientTransport),
-      ]);
-      const result = await client.callTool({
-        name: "recall_context",
-        arguments: { query, limit: 5, includeHistorical: false },
-      });
-      const firstContent = (result as { content?: unknown[] }).content?.[0];
-      expect(firstContent).toMatchObject({ type: "text" });
-      const context = JSON.parse(
-        (firstContent as { type: "text"; text: string }).text,
-      ).context as Array<{ id: string; source: string; content: string }>;
-
-      expect(context).toEqual([
-        expect.objectContaining({
-          id: "core-preference",
-          source: "core",
-        }),
-        expect.objectContaining({ id: "core-home", source: "core" }),
-        expect.objectContaining({ id: "core-constraint", source: "core" }),
-        expect.objectContaining({
-          id: "atlas-version",
-          source: "relevance",
-          content: "Atlas Memory v2.7.1 addresses ATLAS-184.",
-        }),
-        expect.objectContaining({
-          id: "atlas-migration",
-          source: "relevance",
-        }),
-      ]);
-      expect(convexMocks.action.mock.calls[0]?.[1]).toMatchObject({
-        query,
-        limit: 5,
-        includeHistorical: false,
-      });
-      expect(convexMocks.query.mock.calls[0]?.[1]).toEqual({ limit: 3 });
-      expect(convexMocks.query.mock.calls[1]?.[1]).toEqual({ limit: 3 });
-      expect(convexMocks.query.mock.calls[2]?.[1]).toEqual({
-        query,
-        limit: 5,
-        includeHistorical: false,
-      });
-      expect(convexMocks.action.mock.calls[1]?.[1]).toEqual({
-        ids: ["atlas-version", "atlas-migration"],
-      });
-    } finally {
-      await client.close();
-      await server.close();
-    }
-  });
-
-  test("guides an empty brain to initialization without inventing a citation", async () => {
-    convexMocks.query.mockResolvedValue([]);
-    convexMocks.action.mockResolvedValue({
-      results: [],
-      vectorStatus: "unavailable",
-    });
-    const server = createMcpServer("test-convex-auth-token", "user-test");
-    const client = new Client({ name: "memory-quality-test", version: "1" });
-    const [clientTransport, serverTransport] =
-      InMemoryTransport.createLinkedPair();
-
-    try {
-      await Promise.all([
-        server.connect(serverTransport),
-        client.connect(clientTransport),
-      ]);
-      const result = await client.callTool({
-        name: "recall_context",
-        arguments: { query: "What do you remember?" },
-      });
-
-      expect((result as { content?: unknown[] }).content).toEqual([
-        {
-          type: "text",
-          text: JSON.stringify({
-            context: [],
-            vectorStatus: "unavailable",
-            message:
-              "Run /brain-init to add initial context, then try recall_context again.",
-          }),
-        },
-      ]);
-      expect(convexMocks.action).toHaveBeenCalledTimes(1);
-    } finally {
-      await client.close();
-      await server.close();
-    }
-  });
-
-  test("passes explicit validity and core status through capture", async () => {
-    convexMocks.action.mockResolvedValue({
-      thoughtId: "captured",
-      disposition: "stored",
-      metadata: {
-        type: "reference",
-        topics: ["Atlas Memory"],
-        people: [],
-        actionItems: [],
-        summary: "Atlas Memory release",
-      },
-    });
-    const server = createMcpServer("test-convex-auth-token", "user-test");
-    const client = new Client({ name: "memory-quality-test", version: "1" });
-    const [clientTransport, serverTransport] =
-      InMemoryTransport.createLinkedPair();
-
-    try {
-      await Promise.all([
-        server.connect(serverTransport),
-        client.connect(clientTransport),
-      ]);
-      const result = await client.callTool({
-        name: "capture_thought",
-        arguments: {
-          content: "Atlas Memory v2.7.1 became current on August 10.",
-          validFrom: "2026-08-10",
-          validTo: "2026-08-11T12:00:00Z",
-          isCore: false,
-          sourceType: "user_stated",
-        },
-      });
-
-      expect(result.isError).not.toBe(true);
-      expect(convexMocks.action.mock.calls[0]?.[1]).toEqual({
-        content: "Atlas Memory v2.7.1 became current on August 10.",
-        validFrom: Date.UTC(2026, 7, 10),
-        validTo: Date.parse("2026-08-11T12:00:00Z"),
-        isCore: false,
-        sourceType: "user_stated",
-        sourceRef: undefined,
-        observedAt: undefined,
-        batchId: undefined,
-      });
-    } finally {
-      await client.close();
-      await server.close();
-    }
-  });
-
-  test("passes a typed relationship fact with explicit provenance and time", async () => {
-    convexMocks.mutation.mockResolvedValue({
-      factId: "pcp-fact",
-      statement: "Alex — primary care provider: Dr. Rivera.",
-      operation: "stored",
-    });
-    const server = createMcpServer("test-convex-auth-token", "user-test");
-    const client = new Client({ name: "memory-quality-test", version: "1" });
-    const [clientTransport, serverTransport] =
-      InMemoryTransport.createLinkedPair();
-
-    try {
-      await Promise.all([
-        server.connect(serverTransport),
-        client.connect(clientTransport),
-      ]);
-      const result = await client.callTool({
-        name: "remember_fact",
-        arguments: {
-          subject: {
-            key: "person:alex",
-            kind: "person",
-            name: "Alex",
-          },
-          predicate: "primary_care_provider",
-          value: {
-            type: "entity",
-            entity: {
-              key: "person:dr-rivera",
-              kind: "person",
-              name: "Dr. Rivera",
-            },
-          },
-          sourceType: "user_stated",
-          sourceRef: "current conversation",
-          observedAt: "2026-08-11T14:00:00-07:00",
-          validFrom: "2026-08-01",
-          cardinality: "single",
-          changeKind: "changed",
-        },
-      });
-
-      expect(result.isError).not.toBe(true);
-      expect(convexMocks.mutation.mock.calls[0]?.[1]).toEqual({
-        subject: {
-          key: "person:alex",
-          kind: "person",
-          name: "Alex",
-        },
-        predicate: "primary_care_provider",
-        value: {
-          type: "entity",
-          entity: {
-            key: "person:dr-rivera",
-            kind: "person",
-            name: "Dr. Rivera",
-          },
-        },
-        sourceType: "user_stated",
-        sourceRef: "current conversation",
-        observedAt: Date.parse("2026-08-11T21:00:00Z"),
-        batchId: undefined,
-        isCore: undefined,
-        validFrom: Date.UTC(2026, 7, 1),
-        validTo: undefined,
-        cardinality: "single",
-        changeKind: "changed",
-        changeReason: undefined,
-      });
-      expect(
-        (result as { content?: Array<{ text?: string }> }).content?.[0]?.text,
-      ).toContain("fact:pcp-fact");
     } finally {
       await client.close();
       await server.close();

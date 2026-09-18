@@ -1,12 +1,11 @@
 // The OAuth token endpoint: an authorization code becomes the API key.
 //
-// Section 3.2. Under `convex` the exchange is authorized by a purpose-scoped
-// ES256 token this route mints and Convex verifies. Under `postgres` there is no
-// token: `identity.requireOAuthExchangeIdentity` takes the same four hashes as
-// arguments and runs the same checks on them, and the activation that follows
-// runs on the same client inside the same transaction.
+// Section 3.2. There is no token: `identity.requireOAuthExchangeIdentity` takes
+// the four hashes the purpose-scoped ES256 token used to carry as arguments and
+// runs the same checks on them, and the activation that follows runs on the same
+// client inside the same transaction. i7b deleted the minting half.
 //
-// Two properties the exchange has to keep, in both modes:
+// Two properties the exchange has to keep:
 //
 //   * A consumed code that is presented again revokes the key it issued. The
 //     store does that inside `activateAuthorizationGrant` and reports
@@ -19,18 +18,14 @@
 //     `pending` until this activation clears it, and `requireMcpPrincipal`
 //     refuses a key whose lifecycle is set.
 
-import { api } from "@repo/db/convex/_generated/api";
 import { withKithTransaction } from "@repo/kith-store";
 import {
   activateAuthorizationGrant,
   identityCtx,
   requireOAuthExchangeIdentity,
 } from "@repo/kith-store/identity";
-import { ConvexHttpClient } from "convex/browser";
 
 import { kithPool } from "@/lib/kith/pool";
-import { kithPostgresSurface } from "@/lib/kith/surface";
-import { createConvexMcpToken } from "@/lib/mcp/convex-auth";
 import { getMcpResourceUri, isMcpResourceUri } from "@/lib/mcp/environment";
 import {
   assertOAuthEncryptionConfigured,
@@ -46,7 +41,7 @@ import { tokenRequestSchema } from "@/lib/mcp/oauth-validation";
 
 export const runtime = "nodejs";
 
-/** Everything the exchange is authorized by. No token, on either surface. */
+/** Everything the exchange is authorized by. No token. */
 type ExchangeArgs = {
   apiKeyId: string;
   userId: string;
@@ -70,34 +65,6 @@ async function activateOnPostgres(
     await requireOAuthExchangeIdentity(ctx, exchange);
     return await activateAuthorizationGrant(ctx, exchange);
   });
-}
-
-/** The JWT bridge. Deleted in i7 with `convex-auth.ts`. */
-async function activateOnConvex(
-  convexUrl: string,
-  exchange: ExchangeArgs,
-): Promise<{ status: string }> {
-  const convexToken = await createConvexMcpToken(
-    { userId: exchange.userId, keyId: exchange.apiKeyId },
-    {
-      keyHash: exchange.keyHash,
-      codeHash: exchange.codeHash,
-      bindingHash: exchange.bindingHash,
-      requestHash: exchange.requestHash,
-    },
-  );
-  const convex = new ConvexHttpClient(convexUrl);
-  convex.setAuth(convexToken);
-  return await convex.mutation(
-    api.models.oauth.mcpMutations.activateAuthorizationGrant,
-    {
-      codeHash: exchange.codeHash,
-      keyHash: exchange.keyHash,
-      bindingHash: exchange.bindingHash,
-      requestHash: exchange.requestHash,
-      expiresAt: exchange.expiresAt,
-    },
-  );
 }
 
 function tokenError(
@@ -168,15 +135,6 @@ export async function POST(req: Request) {
     return tokenError("invalid_grant", "Invalid code verifier");
   }
 
-  const onPostgres = kithPostgresSurface() === "postgres";
-  const convexUrl = process.env.NEXT_PUBLIC_CONVEX_URL;
-  if (!onPostgres && !convexUrl) {
-    return tokenError(
-      "invalid_grant",
-      "Authorization grant is no longer valid",
-    );
-  }
-
   try {
     const codeHash = hashAuthorizationCode(request.code);
     const keyHash = hashApiKeyCredential(data.apiKey);
@@ -191,9 +149,7 @@ export async function POST(req: Request) {
       expiresAt: data.exp,
     };
 
-    const result = onPostgres
-      ? await activateOnPostgres(exchange)
-      : await activateOnConvex(convexUrl!, exchange);
+    const result = await activateOnPostgres(exchange);
 
     // `replayed` is a committed outcome, not a failure to throw past: the store
     // deleted the key the leaked code had activated, and rolling that back would

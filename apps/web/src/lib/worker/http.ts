@@ -1,14 +1,16 @@
-// i7a repoints this from `@repo/db/convex/models/workers/protocol`, which was
+// The worker protocol's published status table.
+//
+// i7a repointed this from `@repo/db/convex/models/workers/protocol`, which was
 // always a pure `export * from "@repo/worker-protocol/request"` (see that
-// file's own comment), to the package it re-exported.
-import {
-  parseWorkerProtocolErrorData,
-  type WorkerProtocolErrorCode,
-} from "@repo/worker-protocol/request";
+// file's own comment), to the package it re-exported. i7b deleted
+// `backendWorkerError`, which read the code off a `ConvexError`'s `data`
+// envelope; the store's `workerProtocolErrorCode` is the only classifier left
+// and `/api/worker` calls this table with what it returns.
+import type { WorkerProtocolErrorCode } from "@repo/worker-protocol/request";
 
 import { IngestHttpError } from "@/lib/ingest/http";
 
-// Only published codes cross the boundary. Convex messages and arbitrary error
+// Only published codes cross the boundary. Backend messages and arbitrary error
 // data may contain source paths or implementation details.
 const errors: Record<WorkerProtocolErrorCode, readonly [number, string]> = {
   not_authenticated: [401, "Not authenticated"],
@@ -33,26 +35,14 @@ const errors: Record<WorkerProtocolErrorCode, readonly [number, string]> = {
 /**
  * One published code, as its published status and message.
  *
- * Exported since i4: the PostgreSQL leg of `/api/worker` classifies its own
- * refusal with `@repo/kith-store`'s `workerProtocolErrorCode` over this same
- * closed code set, and then reaches this same table, so the two surfaces answer
- * one protocol from one mapping rather than from two that could drift.
+ * `/api/worker` classifies its refusal with `@repo/kith-store`'s
+ * `workerProtocolErrorCode` over this closed code set and then reaches this
+ * table, so the route and the store's own adapter answer one protocol from one
+ * mapping rather than from two that could drift.
  */
 export function workerErrorForCode(
   code: WorkerProtocolErrorCode,
 ): IngestHttpError {
   const [status, message] = errors[code];
   return new IngestHttpError(status, code, message);
-}
-
-export function backendWorkerError(error: unknown): IngestHttpError {
-  const data = parseWorkerProtocolErrorData(
-    typeof error === "object" && error !== null && "data" in error
-      ? error.data
-      : undefined,
-  );
-  if (!data) {
-    return new IngestHttpError(500, "worker_failed", "Worker operation failed");
-  }
-  return workerErrorForCode(data.code);
 }

@@ -1,22 +1,16 @@
 // The gateway's configuration health, by variable name and never by value.
 //
-// i2 splits the report in two. A `deprecated` issue means the deployment is
-// working and reading the public origin from `MCP_JWT_ISSUER`, which i7 removes;
-// that is a notice, not a fault, and reporting it as `misconfigured` with a 503
-// would take a healthy deployment out of rotation over a variable name. Every
-// other issue still fails the check.
+// i2 split the report in two, so that the `MCP_JWT_ISSUER` rename notice could
+// not take a working deployment out of rotation. i7b deleted that variable with
+// the JWT bridge, and with it the only non-blocking issue there was, so every
+// issue left is a fault again.
 
-import {
-  blockingMcpEnvironmentIssues,
-  validateMcpEnvironment,
-} from "@/lib/mcp/environment";
+import { validateMcpEnvironment } from "@/lib/mcp/environment";
 
 export const dynamic = "force-dynamic";
 
 export async function GET() {
-  const reported = validateMcpEnvironment();
-  const issues = blockingMcpEnvironmentIssues(reported);
-  const notices = reported.filter((issue) => issue.problem === "deprecated");
+  const issues = validateMcpEnvironment();
 
   if (issues.length > 0) {
     return Response.json(
@@ -24,7 +18,6 @@ export async function GET() {
         status: "misconfigured",
         service: "open-brain-mcp",
         issues,
-        ...(notices.length > 0 ? { notices } : {}),
         timestamp: new Date().toISOString(),
       },
       { status: 503 },
@@ -34,7 +27,6 @@ export async function GET() {
   return Response.json({
     status: "ok",
     service: "open-brain-mcp",
-    ...(notices.length > 0 ? { notices } : {}),
     timestamp: new Date().toISOString(),
   });
 }

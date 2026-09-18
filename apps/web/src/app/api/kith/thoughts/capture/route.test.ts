@@ -157,7 +157,6 @@ describeWithDatabase("POST /api/kith/thoughts/capture", () => {
     pool.on("error", () => {});
     restorePool = setKithPool(pool);
     process.env.KITH_SESSION_SECRET = secret;
-    process.env.KITH_POSTGRES_SURFACE = "postgres";
   }, 60_000);
 
   afterEach(() => {
@@ -168,7 +167,6 @@ describeWithDatabase("POST /api/kith/thoughts/capture", () => {
     restorePool?.();
     await pool?.end().catch(() => {});
     delete process.env.KITH_SESSION_SECRET;
-    delete process.env.KITH_POSTGRES_SURFACE;
     await onAdmin((admin) =>
       admin.query(`DROP DATABASE IF EXISTS ${databaseName} WITH (FORCE)`),
     ).catch(() => {});
@@ -372,16 +370,5 @@ describeWithDatabase("POST /api/kith/thoughts/capture", () => {
     request.headers.set("origin", "https://attacker.example.test");
     const response = await POST(request);
     expect(response.status).toBe(403);
-  });
-
-  test("under the convex surface the route does not exist", async () => {
-    const user = await signedInUser();
-    process.env.KITH_POSTGRES_SURFACE = "convex";
-    try {
-      const response = await POST(jsonRequest({ content: "anything at all" }, user.cookie));
-      expect(response.status).toBe(404);
-    } finally {
-      process.env.KITH_POSTGRES_SURFACE = "postgres";
-    }
   });
 });

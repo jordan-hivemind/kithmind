@@ -1,20 +1,7 @@
-// The root layout, which decides whether the Convex providers are mounted.
+// The root layout: the plain document and nothing else.
 //
-// `ConvexClientProvider` constructs a `ConvexReactClient` from
-// `NEXT_PUBLIC_CONVEX_URL` at module scope, so mounting it under the PostgreSQL
-// surface would mean a deployment that no longer configures that variable
-// throws before anything renders. Under `postgres` the tree is the plain
-// document and nothing else.
-//
-// Neither the provider nor `ConvexClientProvider` is deleted here. Every page
-// that still calls a Convex hook needs them until i5 moves those pages, and i2
-// and i7 own the deletion.
-
-import { ConvexAuthNextjsServerProvider } from "@convex-dev/auth/nextjs/server";
-
-import { kithPostgresSurface } from "@/lib/kith/surface";
-
-import { ConvexClientProvider } from "./ConvexClientProvider";
+// i7b deleted the Convex providers this used to mount under
+// `KITH_POSTGRES_SURFACE=convex`, together with the client they configured.
 
 export const metadata = {
   title: "Kith Mind",
@@ -26,21 +13,9 @@ export default function RootLayout({
 }: {
   children: React.ReactNode;
 }) {
-  if (kithPostgresSurface() === "postgres") {
-    return (
-      <html lang="en">
-        <body>{children}</body>
-      </html>
-    );
-  }
-
   return (
-    <ConvexAuthNextjsServerProvider>
-      <html lang="en">
-        <body>
-          <ConvexClientProvider>{children}</ConvexClientProvider>
-        </body>
-      </html>
-    </ConvexAuthNextjsServerProvider>
+    <html lang="en">
+      <body>{children}</body>
+    </html>
   );
 }

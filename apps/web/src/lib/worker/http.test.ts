@@ -1,31 +1,35 @@
-import { WORKER_PROTOCOL_ERROR_CODES } from "@repo/db/convex/models/workers/protocol";
-import { getFunctionName } from "convex/server";
+// `/api/worker`'s envelope, with the dispatcher stubbed.
+//
+// i7b repointed these cases from the Convex action to
+// `workers.dispatchWorkerRequest`, which is what the route calls now. What they
+// pin is the route rather than the dispatcher: authentication happens before
+// the body is read, an authentication outage is a 503 and not a 401, the
+// content type and body bounds are enforced before dispatch, and a refusal
+// leaves the route as its published code with no backend detail in it. The
+// dispatcher's own behavior against a real database is `postgres-writes.test.ts`.
+import { WORKER_PROTOCOL_ERROR_CODES } from "@repo/worker-protocol/request";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { MAX_INGEST_JSON_BYTES } from "@/lib/ingest/http";
 
 const mocks = vi.hoisted(() => ({
-  action: vi.fn(),
   authenticateApiKey: vi.fn(),
-  createConvexMcpToken: vi.fn(),
-  setAuth: vi.fn(),
+  dispatch: vi.fn(),
 }));
 
 vi.mock("@/lib/mcp/auth", () => ({
-  // i4 deleted the flag-ignoring authenticator; the route now uses the one
-  // surface-aware entry point. These cases still describe the Convex leg,
-  // which is what `KITH_POSTGRES_SURFACE` defaults to.
   authenticateApiKey: mocks.authenticateApiKey,
 }));
-vi.mock("@/lib/mcp/convex-auth", () => ({
-  createConvexMcpToken: mocks.createConvexMcpToken,
-}));
-vi.mock("convex/browser", () => ({
-  ConvexHttpClient: class {
-    action = mocks.action;
-    setAuth = mocks.setAuth;
-  },
-}));
+// The real `workerProtocolErrorCode` is kept: it is the classifier under test
+// in the last two cases, and stubbing it would compare the route with itself.
+vi.mock("@repo/kith-store", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@repo/kith-store")>();
+  return {
+    ...actual,
+    workers: { ...actual.workers, dispatchWorkerRequest: mocks.dispatch },
+  };
+});
+vi.mock("@/lib/kith/pool", () => ({ kithPool: () => ({}) }));
 
 import { POST } from "../../app/api/worker/route";
 
@@ -54,18 +58,11 @@ function request(
 describe("POST /api/worker", () => {
   beforeEach(() => {
     vi.resetAllMocks();
-    // Pinned, not inherited. Since i4 this route reads the surface flag, so a
-    // process that exports KITH_POSTGRES_SURFACE=postgres (the store suites do)
-    // would send every case below down the PostgreSQL path and fail it for the
-    // wrong reason. These cases are the Convex leg.
-    vi.stubEnv("KITH_POSTGRES_SURFACE", "convex");
-    vi.stubEnv("NEXT_PUBLIC_CONVEX_URL", "https://example.convex.cloud");
     mocks.authenticateApiKey.mockResolvedValue({
       userId: "user-1",
       keyId: "key-1",
     });
-    mocks.createConvexMcpToken.mockResolvedValue("signed-token");
-    mocks.action.mockResolvedValue({
+    mocks.dispatch.mockResolvedValue({
       protocolVersion: 1,
       operation: "source.status",
       inventoryEpoch: 0,
@@ -81,8 +78,7 @@ describe("POST /api/worker", () => {
       'Bearer realm="worker"',
     );
     expect(response.headers.get("cache-control")).toBe("no-store");
-    expect(mocks.createConvexMcpToken).not.toHaveBeenCalled();
-    expect(mocks.action).not.toHaveBeenCalled();
+    expect(mocks.dispatch).not.toHaveBeenCalled();
   });
 
   test("distinguishes unavailable authentication from an invalid credential", async () => {
@@ -97,7 +93,7 @@ describe("POST /api/worker", () => {
         message: "Authentication service is unavailable",
       },
     });
-    expect(mocks.action).not.toHaveBeenCalled();
+    expect(mocks.dispatch).not.toHaveBeenCalled();
   });
 
   test.each([
@@ -111,14 +107,14 @@ describe("POST /api/worker", () => {
         request(body, { "Content-Type": contentType }),
       );
       expect(response.status).toBe(status);
-      expect(mocks.action).not.toHaveBeenCalled();
+      expect(mocks.dispatch).not.toHaveBeenCalled();
     },
   );
 
   test("rejects malformed UTF-8", async () => {
     const response = await POST(request(new Uint8Array([0xc3, 0x28])));
     expect(response.status).toBe(400);
-    expect(mocks.action).not.toHaveBeenCalled();
+    expect(mocks.dispatch).not.toHaveBeenCalled();
   });
 
   test.each([
@@ -130,7 +126,7 @@ describe("POST /api/worker", () => {
   ])("rejects unknown commands and injected fields %j", async (payload) => {
     const response = await POST(request(JSON.stringify(payload)));
     expect(response.status).toBe(400);
-    expect(mocks.action).not.toHaveBeenCalled();
+    expect(mocks.dispatch).not.toHaveBeenCalled();
   });
 
   test("bounds declared and streamed bodies before dispatch", async () => {
@@ -156,10 +152,10 @@ describe("POST /api/worker", () => {
     } as RequestInit & { duplex: "half" });
     expect((await POST(streamed)).status).toBe(413);
     expect(cancel).toHaveBeenCalledOnce();
-    expect(mocks.action).not.toHaveBeenCalled();
+    expect(mocks.dispatch).not.toHaveBeenCalled();
   });
 
-  test("uses only the fixed dispatch action and current bearer identity", async () => {
+  test("dispatches the parsed request under the current bearer identity", async () => {
     const response = await POST(request());
     expect(response.status).toBe(200);
     expect(response.headers.get("cache-control")).toBe("no-store");
@@ -171,27 +167,19 @@ describe("POST /api/worker", () => {
     expect(mocks.authenticateApiKey).toHaveBeenCalledWith(
       "Bearer synthetic-key",
     );
-    expect(mocks.createConvexMcpToken).toHaveBeenCalledWith({
+    // The principal reference is the two identifiers the bearer resolved to,
+    // and the request is the parsed one, not the raw body.
+    expect(mocks.dispatch.mock.calls[0]![1]).toEqual({
       userId: "user-1",
-      keyId: "key-1",
+      credentialId: "key-1",
     });
-    expect(mocks.setAuth).toHaveBeenCalledWith("signed-token");
-    expect(getFunctionName(mocks.action.mock.calls[0]![0])).toBe(
-      "models/workers/mcp:dispatch",
-    );
-    expect(mocks.action.mock.calls[0]![1]).toEqual({ request: validPayload });
-  });
-
-  test("fails safely when the backend URL is missing", async () => {
-    vi.stubEnv("NEXT_PUBLIC_CONVEX_URL", "");
-    expect((await POST(request())).status).toBe(503);
-    expect(mocks.action).not.toHaveBeenCalled();
+    expect(mocks.dispatch.mock.calls[0]![2]).toEqual(validPayload);
   });
 
   test.each(WORKER_PROTOCOL_ERROR_CODES)(
     "maps only the published backend code %s",
     async (code) => {
-      mocks.action.mockRejectedValue(
+      mocks.dispatch.mockRejectedValue(
         Object.assign(new Error("private source path"), {
           data: {
             type: "worker_protocol_error",
@@ -229,7 +217,7 @@ describe("POST /api/worker", () => {
       data: { type: "different_error", code: "not_authorized" },
     }),
   ])("does not expose unexpected backend failures", async (error) => {
-    mocks.action.mockRejectedValue(error);
+    mocks.dispatch.mockRejectedValue(error);
     const response = await POST(request());
     expect(response.status).toBe(500);
     expect(await response.json()).toEqual({

@@ -157,12 +157,7 @@ describeWithDatabase("MCP bearer authentication on PostgreSQL", () => {
 
   afterEach(() => vi.unstubAllEnvs());
 
-  function onPostgres() {
-    vi.stubEnv("KITH_POSTGRES_SURFACE", "postgres");
-  }
-
   test("a live bearer authenticates and a revoked key does not", async () => {
-    onPostgres();
     const account = await owner();
 
     const authenticated = await authenticateApiKey(`Bearer ${account.rawKey}`);
@@ -187,7 +182,6 @@ describeWithDatabase("MCP bearer authentication on PostgreSQL", () => {
   });
 
   test("a key in an OAuth lifecycle authenticates nothing", async () => {
-    onPostgres();
     for (const lifecycle of ["preparing", "pending"] as const) {
       const account = await owner();
       // The lifecycle column is what `hasNoOAuthLifecycle` reads. A key holding
@@ -213,7 +207,6 @@ describeWithDatabase("MCP bearer authentication on PostgreSQL", () => {
   });
 
   test("a key whose user row is gone does not authenticate", async () => {
-    onPostgres();
     const account = await owner();
 
     // A foreign key normally makes this state unreachable, which is why the
@@ -265,12 +258,10 @@ describeWithDatabase("MCP bearer authentication on PostgreSQL", () => {
     ["a bearer that is not a key", "Bearer not-an-api-key"],
     ["a bearer that looks like one", `Bearer ob_${"a".repeat(64)}`],
   ])("a malformed bearer authenticates nothing: %s", async (_name, header) => {
-    onPostgres();
     expect(await authenticateApiKey(header)).toBeNull();
   });
 
   test("the per-call loader denies on the call after a revocation", async () => {
-    onPostgres();
     const account = await owner();
     const authenticated = await authenticateApiKey(`Bearer ${account.rawKey}`);
     expect(authenticated).not.toBeNull();
@@ -300,7 +291,6 @@ describeWithDatabase("MCP bearer authentication on PostgreSQL", () => {
   });
 
   test("the loader's read transaction refuses a write", async () => {
-    onPostgres();
     const account = await owner();
     const withPrincipal = mcpPrincipalLoader({
       userId: account.userId,
@@ -330,7 +320,6 @@ describeWithDatabase("MCP bearer authentication on PostgreSQL", () => {
   // The retry loop in `withKithTransaction` handles that, but only if the
   // 40001 escapes the authenticator rather than being swallowed into `null`.
   test("concurrent authentications with one bearer all succeed", async () => {
-    onPostgres();
     const account = await owner();
 
     const results = await Promise.all(
@@ -349,7 +338,6 @@ describeWithDatabase("MCP bearer authentication on PostgreSQL", () => {
   });
 
   test("a serialization failure is retried rather than answered as a denial", async () => {
-    onPostgres();
     const account = await owner();
 
     // One injected 40001, on the first attempt only. The point is that the
@@ -373,7 +361,6 @@ describeWithDatabase("MCP bearer authentication on PostgreSQL", () => {
     ["a lock timeout", "55P03"],
     ["an unreachable database", "ECONNREFUSED"],
   ])("%s surfaces rather than becoming a denial", async (_name, code) => {
-    onPostgres();
     const account = await owner();
 
     // Not retryable and not a fact about the credential, so it must reach the

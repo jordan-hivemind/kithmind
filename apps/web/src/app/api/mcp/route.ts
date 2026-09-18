@@ -1,30 +1,25 @@
-// The MCP endpoint. One authentication per request, on either surface.
+// The MCP endpoint. One authentication per request.
 //
-// The invariant this route exists to hold is the same in both modes: the server
-// is built from the credential that authenticated, and from nothing in the body.
-// The transport parses the body after this function has already decided who the
-// caller is, so a JSON-RPC payload naming a user, a key or a principal changes
-// nothing. `authenticateApiKey` reads one header and no body at all.
+// The invariant this route exists to hold: the server is built from the
+// credential that authenticated, and from nothing in the body. The transport
+// parses the body after this function has already decided who the caller is, so
+// a JSON-RPC payload naming a user, a key or a principal changes nothing.
+// `authenticateApiKey` reads one header and no body at all.
 //
-// Under `convex` the validated key is bound to a short-lived Convex identity,
-// which is what the 17 tools authenticate with until i3 and i4 port them.
-//
-// Under `postgres` nothing is minted. The route keeps `{ userId, credentialId }`
-// -- a `PrincipalRef`, which carries no authority -- and hands the server a
-// loader that reads the credential again inside each call's own transaction.
+// Nothing is minted. The route keeps `{ userId, credentialId }` -- a
+// `PrincipalRef`, which carries no authority -- and hands the server a loader
+// that reads the credential again inside each call's own transaction.
 // Section 3.3: a key revoked between two tool calls denies on the second.
 
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 
-import { kithPostgresSurface } from "@/lib/kith/surface";
 import { authenticateApiKey } from "@/lib/mcp/auth";
-import { createConvexMcpToken } from "@/lib/mcp/convex-auth";
 import { createCorsHeaders, createCorsOptionsResponse } from "@/lib/mcp/cors";
 import { getMcpPublicOrigin } from "@/lib/mcp/environment";
 import { mcpPrincipalLoader } from "@/lib/mcp/principal";
 import { createMcpServer, type McpServerCredential } from "@/lib/mcp/server";
 
-// `pg` does not run on the edge runtime, and under `postgres` this route reaches
+// `pg` does not run on the edge runtime, and this route reaches
 // it through the principal loader. Stated rather than left to the default.
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -82,21 +77,13 @@ export async function POST(req: Request) {
     });
   }
 
-  const credential: McpServerCredential =
-    kithPostgresSurface() === "postgres"
-      ? {
-          surface: "postgres",
-          withPrincipal: mcpPrincipalLoader({
-            userId: auth.userId,
-            credentialId: auth.keyId,
-          }),
-        }
-      : {
-          // Bind the validated API key to a short-lived Convex identity. Convex
-          // functions derive ownership from this token, never from caller input.
-          surface: "convex",
-          convexAuthToken: await createConvexMcpToken(auth),
-        };
+  const credential: McpServerCredential = {
+    surface: "postgres",
+    withPrincipal: mcpPrincipalLoader({
+      userId: auth.userId,
+      credentialId: auth.keyId,
+    }),
+  };
 
   // Finance continuations belong to this authenticated user and credential.
   // Another key for the same user cannot replay them. Neither ID is supplied

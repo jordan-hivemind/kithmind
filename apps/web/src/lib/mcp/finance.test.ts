@@ -10,8 +10,7 @@ import {
   syntheticFinanceReadExchanges,
   syntheticFinanceTrustedContext,
 } from "@repo/finance-contract/fixtures";
-import { getFunctionName } from "convex/server";
-import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { beforeEach, describe, expect, test, vi } from "vitest";
 
 import {
   type FinanceArchiveAccess,
@@ -20,20 +19,30 @@ import {
   resolveFinanceArchive,
 } from "./finance";
 
+// The archive leg is unchanged by i7b. What moved is where its
+// `authorizedSpaceIds` comes from: the membership read the tools already
+// perform, which i7b left as the PostgreSQL one. Only that read and
+// `query_records`' own Kith Mind leg are stubbed here.
 const mocks = vi.hoisted(() => ({
-  query: vi.fn(),
-  action: vi.fn(),
-  mutation: vi.fn(),
+  authorizedSpaceIds: vi.fn(),
+  queryRecords: vi.fn(),
+  listSources: vi.fn(),
 }));
-vi.mock("convex/browser", () => ({
-  ConvexHttpClient: class {
-    query = mocks.query;
-    action = mocks.action;
-    mutation = mocks.mutation;
-    setAuth() {}
-  },
-}));
-import { createMcpServer } from "./server";
+vi.mock("./reads", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./reads")>();
+  return { ...actual, postgresReads: () => mocks };
+});
+
+import { mcpPrincipalLoader } from "./principal";
+import { createMcpServer, type McpServerCredential } from "./server";
+
+const CREDENTIAL: McpServerCredential = {
+  surface: "postgres",
+  withPrincipal: mcpPrincipalLoader({
+    userId: "user-test",
+    credentialId: "key-test",
+  }),
+};
 
 const ARCHIVE_SPACE = syntheticFinanceTrustedContext.authorizedSpaceIds[0]!;
 const PRINCIPAL = syntheticFinanceTrustedContext.principalId;
@@ -218,7 +227,7 @@ async function call(
   name: string,
   args: Record<string, unknown>,
 ) {
-  const server = createMcpServer("signed-test-token", PRINCIPAL, archive);
+  const server = createMcpServer(CREDENTIAL, PRINCIPAL, archive);
   const client = new Client({ name: "finance-provider", version: "1" });
   const [clientTransport, serverTransport] =
     InMemoryTransport.createLinkedPair();
@@ -240,23 +249,14 @@ function textOf(result: Awaited<ReturnType<typeof call>>): string {
 
 describe("query_records finance provider", () => {
   beforeEach(() => {
-    vi.stubEnv("NEXT_PUBLIC_CONVEX_URL", "https://example.convex.cloud");
     vi.resetAllMocks();
-    mocks.query.mockResolvedValue([
-      {
-        spaceId: ARCHIVE_SPACE,
-        name: "Personal",
-        kind: "personal",
-        role: "owner",
-      },
-    ]);
-    mocks.mutation.mockResolvedValue({ items: [] });
+    mocks.authorizedSpaceIds.mockResolvedValue([ARCHIVE_SPACE]);
+    mocks.queryRecords.mockResolvedValue({ items: [] });
   });
-  afterEach(() => vi.unstubAllEnvs());
 
   test("new finance capabilities cross the advertised gateway unchanged", async () => {
     const server = createMcpServer(
-      "signed-test-token",
+      CREDENTIAL,
       PRINCIPAL,
       fakeArchive((request) => exchangeFor(request.operation).response),
     );
@@ -296,7 +296,7 @@ describe("query_records finance provider", () => {
         ).toEqual(exchange.response);
       }
       // A later call in the same MCP session must reload live membership.
-      mocks.query.mockResolvedValue([]);
+      mocks.authorizedSpaceIds.mockResolvedValue([]);
       const denied = await client.callTool({
         name: "query_records",
         arguments: {
@@ -325,7 +325,7 @@ describe("query_records finance provider", () => {
     expect(result.isError).not.toBe(true);
     expect(JSON.parse(textOf(result))).toEqual(exchange.response);
     // Nothing went to Kith Mind's own record store.
-    expect(mocks.mutation).not.toHaveBeenCalled();
+    expect(mocks.queryRecords).not.toHaveBeenCalled();
   });
 
   test("a partial archive response stays partial", async () => {
@@ -347,7 +347,7 @@ describe("query_records finance provider", () => {
   });
 
   test("Kith Mind records still answer without a provider", async () => {
-    mocks.mutation.mockResolvedValue({ records: [], complete: true });
+    mocks.queryRecords.mockResolvedValue({ records: [], complete: true });
     const archive = fakeArchive(() => exchangeFor("list_balances").response);
     const result = await call(archive, "query_records", {
       query: {
@@ -373,9 +373,7 @@ describe("query_records finance provider", () => {
   });
 
   test("a principal with no membership in the archive space is refused", async () => {
-    mocks.query.mockResolvedValue([
-      { spaceId: OTHER_SPACE, name: "Other", kind: "personal", role: "owner" },
-    ]);
+    mocks.authorizedSpaceIds.mockResolvedValue([OTHER_SPACE]);
     const archive = fakeArchive(
       () => exchangeFor("list_transactions").response,
     );
@@ -412,29 +410,19 @@ describe("query_records finance provider", () => {
 
 describe("list_sources finance archive block", () => {
   beforeEach(() => {
-    vi.stubEnv("NEXT_PUBLIC_CONVEX_URL", "https://example.convex.cloud");
     vi.resetAllMocks();
-    mocks.query.mockImplementation(
-      async (fn: Parameters<typeof getFunctionName>[0]) =>
-        getFunctionName(fn).endsWith(":listSources")
-          ? {
-              sources: [{ sourceAccountId: "account-1" }],
-              partial: false,
-              truncated: false,
-            }
-          : [
-              {
-                spaceId: ARCHIVE_SPACE,
-                name: "Personal",
-                kind: "personal",
-                role: "owner",
-              },
-            ],
-    );
+    mocks.authorizedSpaceIds.mockResolvedValue([ARCHIVE_SPACE]);
+    mocks.listSources.mockResolvedValue({
+      sources: {
+        sources: [{ sourceAccountId: "account-1" }],
+        partial: false,
+        truncated: false,
+      },
+      authorizedSpaceIds: [ARCHIVE_SPACE],
+    });
   });
-  afterEach(() => vi.unstubAllEnvs());
 
-  test("archive coverage is reported beside the Convex sources, never inside them", async () => {
+  test("archive coverage is reported beside Kith Mind's sources, never inside them", async () => {
     const coverage = exchangeFor("get_coverage").response;
     const archive = fakeArchive(() => coverage);
     const result = await call(archive, "list_sources", {});

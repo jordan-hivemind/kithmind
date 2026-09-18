@@ -1,32 +1,28 @@
-import { getFunctionName } from "convex/server";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { MAX_INGEST_JSON_BYTES, MAX_INGEST_TEXT_BYTES } from "./http";
 
 const mocks = vi.hoisted(() => ({
-  action: vi.fn(),
+  ingest: vi.fn(),
   authenticateApiKey: vi.fn(),
-  createConvexMcpToken: vi.fn(),
-  setAuth: vi.fn(),
 }));
 
 vi.mock("@/lib/mcp/auth", () => ({
-  // i4 deleted the flag-ignoring authenticator; the route now uses the one
-  // surface-aware entry point. These cases still describe the Convex leg,
-  // which is what `KITH_POSTGRES_SURFACE` defaults to.
   authenticateApiKey: mocks.authenticateApiKey,
 }));
 
-vi.mock("@/lib/mcp/convex-auth", () => ({
-  createConvexMcpToken: mocks.createConvexMcpToken,
-}));
+// The route opens no pool of its own: the store takes one and this suite is
+// about the transport in front of it, so the lane is stubbed and the pool is
+// never touched.
+vi.mock("@/lib/kith/pool", () => ({ kithPool: () => ({}) }));
 
-vi.mock("convex/browser", () => ({
-  ConvexHttpClient: class {
-    action = mocks.action;
-    setAuth = mocks.setAuth;
-  },
-}));
+vi.mock("@repo/kith-store", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@repo/kith-store")>();
+  return {
+    ...actual,
+    ingestion: { ...actual.ingestion, ingestInlineText: mocks.ingest },
+  };
+});
 
 import { POST } from "../../app/api/ingest/route";
 
@@ -79,18 +75,11 @@ async function responseBody(response: Response) {
 describe("POST /api/ingest", () => {
   beforeEach(() => {
     vi.resetAllMocks();
-    // Pinned, not inherited. Since i4 this route reads the surface flag, so a
-    // process that exports KITH_POSTGRES_SURFACE=postgres (the store suites do)
-    // would send every case below down the PostgreSQL path and fail it for the
-    // wrong reason. These cases are the Convex leg.
-    vi.stubEnv("KITH_POSTGRES_SURFACE", "convex");
-    vi.stubEnv("NEXT_PUBLIC_CONVEX_URL", "https://example.convex.cloud");
     mocks.authenticateApiKey.mockResolvedValue({
       userId: "user-1",
       keyId: "key-1",
     });
-    mocks.createConvexMcpToken.mockResolvedValue("signed-convex-token");
-    mocks.action.mockResolvedValue(readyResult);
+    mocks.ingest.mockResolvedValue(readyResult);
   });
 
   afterEach(() => vi.unstubAllEnvs());
@@ -107,8 +96,7 @@ describe("POST /api/ingest", () => {
     expect(await responseBody(response)).toEqual({
       error: { code: "unauthorized", message: "Unauthorized" },
     });
-    expect(mocks.createConvexMcpToken).not.toHaveBeenCalled();
-    expect(mocks.action).not.toHaveBeenCalled();
+    expect(mocks.ingest).not.toHaveBeenCalled();
   });
 
   test("stops an oversized streamed body before JSON parsing", async () => {
@@ -141,7 +129,7 @@ describe("POST /api/ingest", () => {
       error: { code: "payload_too_large" },
     });
     expect(cancel).toHaveBeenCalledOnce();
-    expect(mocks.action).not.toHaveBeenCalled();
+    expect(mocks.ingest).not.toHaveBeenCalled();
   });
 
   test.each([
@@ -157,7 +145,7 @@ describe("POST /api/ingest", () => {
 
       expect(response.status).toBe(status);
       expect(await responseBody(response)).toMatchObject({ error: { code } });
-      expect(mocks.action).not.toHaveBeenCalled();
+      expect(mocks.ingest).not.toHaveBeenCalled();
     },
   );
 
@@ -171,7 +159,7 @@ describe("POST /api/ingest", () => {
         message: "Request body must be valid UTF-8 JSON",
       },
     });
-    expect(mocks.action).not.toHaveBeenCalled();
+    expect(mocks.ingest).not.toHaveBeenCalled();
   });
 
   test("rejects text above the decoded UTF-8 limit", async () => {
@@ -188,7 +176,7 @@ describe("POST /api/ingest", () => {
     expect(await responseBody(response)).toMatchObject({
       error: { code: "text_too_large" },
     });
-    expect(mocks.action).not.toHaveBeenCalled();
+    expect(mocks.ingest).not.toHaveBeenCalled();
   });
 
   test("enforces the configured source-account identity byte limit", async () => {
@@ -208,7 +196,7 @@ describe("POST /api/ingest", () => {
     expect(await responseBody(response)).toMatchObject({
       error: { code: "invalid_request" },
     });
-    expect(mocks.action).not.toHaveBeenCalled();
+    expect(mocks.ingest).not.toHaveBeenCalled();
   });
 
   test("enforces byte limits on request and external identities", async () => {
@@ -224,7 +212,7 @@ describe("POST /api/ingest", () => {
     ]) {
       const response = await POST(request(JSON.stringify(payload)));
       expect(response.status).toBe(400);
-      expect(mocks.action).not.toHaveBeenCalled();
+      expect(mocks.ingest).not.toHaveBeenCalled();
     }
   });
 
@@ -243,7 +231,7 @@ describe("POST /api/ingest", () => {
     );
 
     expect(response.status).toBe(400);
-    expect(mocks.action).not.toHaveBeenCalled();
+    expect(mocks.ingest).not.toHaveBeenCalled();
   });
 
   test("rejects whitespace-only inline text", async () => {
@@ -252,7 +240,7 @@ describe("POST /api/ingest", () => {
     );
 
     expect(response.status).toBe(400);
-    expect(mocks.action).not.toHaveBeenCalled();
+    expect(mocks.ingest).not.toHaveBeenCalled();
   });
 
   test("rejects an escaped unpaired surrogate instead of hashing replacement bytes", async () => {
@@ -267,28 +255,28 @@ describe("POST /api/ingest", () => {
         message: "text must contain valid Unicode",
       },
     });
-    expect(mocks.action).not.toHaveBeenCalled();
+    expect(mocks.ingest).not.toHaveBeenCalled();
   });
 
-  test("forwards the validated contract through an authenticated Convex action", async () => {
-    mocks.action.mockResolvedValue({
+  test("forwards the validated contract to the lane under the authenticated principal", async () => {
+    mocks.ingest.mockResolvedValue({
       ...readyResult,
       internalWorkId: "secret",
     });
     const response = await POST(request());
 
     expect(response.status).toBe(200);
+    // Only the published fields are serialized: `internalWorkId` does not
+    // cross the boundary because the route builds the body field by field.
     expect(await responseBody(response)).toEqual(readyResult);
     expect(mocks.authenticateApiKey).toHaveBeenCalledWith("Bearer test-key");
-    expect(mocks.createConvexMcpToken).toHaveBeenCalledWith({
+    // The principal reference is the two identifiers the authenticator
+    // returned, never anything the body named.
+    expect(mocks.ingest.mock.calls[0]![1]).toEqual({
       userId: "user-1",
-      keyId: "key-1",
+      credentialId: "key-1",
     });
-    expect(mocks.setAuth).toHaveBeenCalledWith("signed-convex-token");
-    expect(getFunctionName(mocks.action.mock.calls[0]![0])).toBe(
-      "models/ingestion/inlineMcp:ingest",
-    );
-    expect(mocks.action.mock.calls[0]![1]).toEqual({ input: validPayload });
+    expect(mocks.ingest.mock.calls[0]![2]).toEqual(validPayload);
   });
 
   test.each([
@@ -298,7 +286,7 @@ describe("POST /api/ingest", () => {
   ])(
     "returns a suitable HTTP status for backend state %s",
     async (state, status) => {
-      mocks.action.mockResolvedValue({
+      mocks.ingest.mockResolvedValue({
         ...readyResult,
         documentId: undefined,
         isActive: false,
@@ -328,111 +316,28 @@ describe("POST /api/ingest", () => {
     expect(await responseBody(response)).toMatchObject({
       error: { code: "invalid_request" },
     });
-    expect(mocks.action).not.toHaveBeenCalled();
+    expect(mocks.ingest).not.toHaveBeenCalled();
   });
 
-  test("returns a structured 400 when the backend rejects an opaque space ID", async () => {
-    mocks.action.mockRejectedValue(
-      Object.assign(new Error("Server Error"), {
-        data: { type: "inline_ingest_error", code: "invalid_request" },
-      }),
-    );
-
-    const response = await POST(
-      request(JSON.stringify({ ...validPayload, spaceId: "not-a-convex-id" })),
-    );
-
-    expect(response.status).toBe(400);
-    expect(await responseBody(response)).toEqual({
-      error: { code: "invalid_request", message: "Invalid ingest request" },
-    });
-    expect(mocks.action.mock.calls[0]![1]).toMatchObject({
-      input: { spaceId: "not-a-convex-id" },
-    });
-  });
-
-  test.each([
-    ["not_authenticated", 401, "unauthorized", "Not authenticated"],
-    ["source_account_not_found", 403, "forbidden", "Source account not found"],
-    ["space_not_found", 403, "forbidden", "Space not found"],
-    [
-      "default_ingest_space_unavailable",
-      403,
-      "forbidden",
-      "Default ingest space is not available",
-    ],
-    [
-      "request_conflict",
-      409,
-      "conflict",
-      "requestId conflicts with a different request",
-    ],
-    [
-      "desired_processing_epoch_conflict",
-      409,
-      "conflict",
-      "Desired processing epoch conflict",
-    ],
-    ["invalid_request", 400, "invalid_request", "Invalid ingest request"],
-    ["ingest_rate_limited", 429, "rate_limited", "Ingest rate limit exceeded"],
-    [
-      "source_item_unavailable",
-      409,
-      "conflict",
-      "Source item is not available for admission",
-    ],
-  ])(
-    "maps structured production backend code %s",
-    async (backendCode, status, responseCode, message) => {
-      mocks.action.mockRejectedValue(
-        Object.assign(new Error("Server Error"), {
-          data: {
-            type: "inline_ingest_error",
-            code: backendCode,
-            message: "must never cross the HTTP boundary",
-          },
-        }),
-      );
-
-      const response = await POST(request());
-
-      expect(response.status).toBe(status);
-      expect(await responseBody(response)).toEqual({
-        error: { code: responseCode, message },
-      });
-    },
-  );
-
-  test.each([
-    { type: "inline_ingest_error", code: "unknown_code" },
-    { type: "different_error", code: "request_conflict" },
-    { type: "inline_ingest_error", code: 409 },
-  ])("rejects unrecognized structured backend data: %j", async (data) => {
-    mocks.action.mockRejectedValue(
-      Object.assign(new Error("Server Error"), { data }),
-    );
-
-    const response = await POST(request());
-
-    expect(response.status).toBe(500);
-    expect(await responseBody(response)).toEqual({
-      error: { code: "ingest_failed", message: "Ingestion failed" },
-    });
-  });
-
+  // Every code in the published table, by the message the lane throws for it.
+  // `inlineIngestErrorCode` matches these exactly, so a message changed in the
+  // store without changing its classifier turns one of these into a 500.
   test.each([
     ["Not authenticated", 401, "unauthorized"],
     ["Source account not found", 403, "forbidden"],
+    ["Space not found", 403, "forbidden"],
     ["Default ingest space is not available", 403, "forbidden"],
+    ["requestId conflicts with a different request", 409, "conflict"],
     ["Desired processing epoch conflict", 409, "conflict"],
+    ["Source item is not available for admission", 409, "conflict"],
     ["Source item is forgetting", 409, "conflict"],
     ["Source item is forgotten", 409, "conflict"],
     ["Ingest rate limit exceeded", 429, "rate_limited"],
     ["source.externalId is invalid", 400, "invalid_request"],
     ["source.capturedAt must be an RFC3339 instant", 400, "invalid_request"],
     ["title contains malformed UTF-16", 400, "invalid_request"],
-  ])("maps the public backend error %s", async (message, status, code) => {
-    mocks.action.mockRejectedValue(new Error(message));
+  ])("maps the public lane error %s", async (message, status, code) => {
+    mocks.ingest.mockRejectedValue(new Error(message));
 
     const response = await POST(request());
 
@@ -451,29 +356,11 @@ describe("POST /api/ingest", () => {
     });
   });
 
-  test("extracts only an approved message from a wrapped Convex error", async () => {
-    mocks.action.mockRejectedValue(
-      new Error(
-        "[CONVEX A(models/ingestion/inlineMcp:ingest)] internal trace: Desired processing epoch conflict",
-      ),
-    );
-
-    const response = await POST(request());
-
-    expect(response.status).toBe(409);
-    expect(await responseBody(response)).toEqual({
-      error: {
-        code: "conflict",
-        message: "Desired processing epoch conflict",
-      },
-    });
-  });
-
   test.each([
     "secret database table and stack details",
     "Internal database index must be unique",
   ])("does not expose unexpected backend failure: %s", async (message) => {
-    mocks.action.mockRejectedValue(new Error(message));
+    mocks.ingest.mockRejectedValue(new Error(message));
 
     const response = await POST(request());
 

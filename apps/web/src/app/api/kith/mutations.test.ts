@@ -160,10 +160,6 @@ describeWithDatabase("the /api/kith/* mutation routes", () => {
     pool.on("error", () => {});
     restorePool = setKithPool(pool);
     process.env.KITH_SESSION_SECRET = secret;
-    // These routes only exist under the postgres surface (finding 10); most
-    // of this file exercises that mode, and the one test that checks the
-    // convex-mode gate restores this value itself.
-    process.env.KITH_POSTGRES_SURFACE = "postgres";
 
     routes = {
       apiKeysList: (await import("./api-keys/route")).GET,
@@ -187,7 +183,6 @@ describeWithDatabase("the /api/kith/* mutation routes", () => {
     restorePool?.();
     await pool?.end().catch(() => {});
     delete process.env.KITH_SESSION_SECRET;
-    delete process.env.KITH_POSTGRES_SURFACE;
     await onAdmin((admin) =>
       admin.query(`DROP DATABASE IF EXISTS ${databaseName} WITH (FORCE)`),
     ).catch(() => {});
@@ -230,20 +225,6 @@ describeWithDatabase("the /api/kith/* mutation routes", () => {
     });
     const response = await routes.familySpaceAction(request, params(owner.spaceId));
     expect(response.status).toBe(415);
-  });
-
-  test("under the convex surface every /api/kith/* route answers a fixed 404", async () => {
-    const owner = await signedInUser();
-    process.env.KITH_POSTGRES_SURFACE = "convex";
-    try {
-      const response = await routes.apiKeysList(
-        getRequest(`${ORIGIN}/api/kith/api-keys?numItems=25`, owner.cookie),
-      );
-      expect(response.status).toBe(404);
-      expect(await bodyOf(response)).toEqual({ error: "Not found" });
-    } finally {
-      process.env.KITH_POSTGRES_SURFACE = "postgres";
-    }
   });
 
   test("a malformed id in the URL is a 400, not a 500", async () => {

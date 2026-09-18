@@ -1,30 +1,20 @@
-// Section 6 row i5, rule 1: every page renders under `postgres` "with no
-// Convex import on that path".
+// i7b's standing guard: nothing under `apps/web/src` imports Convex.
 //
-// "That path" is narrower than "the file": under `postgres` a `page.tsx`
-// still statically imports its sibling `convex-*` component so it can render
-// it under `convex` -- `app/(authenticated)/page.tsx` imports
-// `ConvexDashboard`, which imports `convex/react`, and that import is
-// reachable from every build regardless of which surface answers a given
-// request. That is by design until i7 deletes the Convex branch entirely, so
-// this test does not (and cannot, by construction) prove a `page.tsx` file
-// has zero Convex imports; it proves the postgres path's *own* files -- the
-// `kith-*` components, the `lib/kith/*` loaders and route handlers, and the
-// five `page.tsx` files' non-component code -- have none. The five
-// `page.tsx` files are checked with a narrower pattern than the rest for
-// exactly that reason: it would otherwise fail on the `convex-*` import
-// every one of them legitimately has.
+// Row i5 shipped a narrower version of this, which had to exempt each
+// `page.tsx`'s `convex-*` sibling and could only name two files under
+// `src/lib/mcp`, because that directory was dual-surface by design. i7b
+// deleted the Convex branch, so the exemptions are gone and the whole source
+// tree is scanned instead.
 //
-// The pattern covers the ways this codebase reaches Convex: `convex/*`
+// The pattern covers the ways this codebase used to reach Convex: `convex/*`
 // (`convex/react`, `convex/browser`, `convex/server`, ...), `@repo/db` bare
-// or with a subpath (`@repo/db/convex/_generated/api`), and
-// `@convex-dev/*` (`@convex-dev/auth/nextjs/server`, the one other Convex
-// package this app imports). It matches a dynamic `import(...)` the same way
-// it matches a static one, since either reaches the same module.
+// or with a subpath (`@repo/db/convex/_generated/api`), and `@convex-dev/*`
+// (`@convex-dev/auth/nextjs/server`). It matches a dynamic `import(...)` the
+// same way it matches a static one, since either reaches the same module.
 //
-// The directories are scanned rather than hand-listed, so a new file dropped
-// into `src/components`, `src/lib/kith` or `src/app/api/kith` is covered
-// without this test needing to be told about it by name.
+// The tree is scanned rather than hand-listed, so a new file is covered
+// without this test needing to be told about it by name. Its own text would
+// match, so it excludes itself.
 
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
@@ -32,33 +22,11 @@ import path from "node:path";
 import { describe, expect, test } from "vitest";
 
 const ROOT = path.resolve(__dirname, "../../..");
+const SELF = "src/lib/kith/no-convex-import.test.ts";
 
-const PAGE_FILES = [
-  "src/app/(authenticated)/page.tsx",
-  "src/app/(authenticated)/browse/page.tsx",
-  "src/app/(authenticated)/settings/page.tsx",
-  "src/app/(authenticated)/spaces/page.tsx",
-  "src/app/invite/page.tsx",
-];
-
-/** Every spelling this codebase uses to reach Convex, static or dynamic. */
+/** Every spelling this codebase used to reach Convex, static or dynamic. */
 const CONVEX_IMPORT =
   /(?:from\s+["']|import\(\s*["'])(convex\/|convex["']|@repo\/db(?:\/|["'])|@convex-dev\/)/;
-
-/**
- * The `convex-*` sibling a `page.tsx` imports for its `convex` branch. Only
- * that one import is allowed to name Convex indirectly; the module comment
- * above says why.
- */
-const CONVEX_SIBLING_IMPORT = /from\s+["']@\/components\/convex-/;
-
-function fileText(relativePath: string): string {
-  return readFileSync(path.join(ROOT, relativePath), "utf8");
-}
-
-function assertNoConvexImport(relativePath: string): void {
-  expect(fileText(relativePath)).not.toMatch(CONVEX_IMPORT);
-}
 
 /** Every file under `dir` (recursively), as paths relative to `ROOT`. */
 function filesUnder(dir: string): string[] {
@@ -71,50 +39,16 @@ function filesUnder(dir: string): string[] {
   });
 }
 
-describe("the postgres surface never imports Convex", () => {
-  test.each(PAGE_FILES)(
-    "%s imports Convex only through its convex-* sibling",
-    (relativePath) => {
-      // Drop the one allowed import line (the `convex-*` sibling this page
-      // renders under `convex`), then require every remaining line to be
-      // free of a Convex import: anything left over would be this page
-      // reaching Convex on its own account rather than through the
-      // component that owns that branch.
-      const withoutSibling = fileText(relativePath)
-        .split("\n")
-        .filter((line) => !CONVEX_SIBLING_IMPORT.test(line))
-        .join("\n");
-      expect(withoutSibling).not.toMatch(CONVEX_IMPORT);
-    },
-  );
-
+describe("apps/web never imports Convex", () => {
   test.each(
-    readdirSync(path.join(ROOT, "src/components")).filter(
-      (name) => name.startsWith("kith-") && !name.startsWith("convex-"),
+    filesUnder("src").filter(
+      (file) => file !== SELF && /\.tsx?$/.test(file),
     ),
-  )("components/%s", (file) => assertNoConvexImport(`src/components/${file}`));
-
-  test.each(
-    readdirSync(path.join(ROOT, "src/lib/kith")).filter(
-      (name) => name.endsWith(".ts") && !name.endsWith(".test.ts"),
-    ),
-  )("lib/kith/%s", (file) => assertNoConvexImport(`src/lib/kith/${file}`));
-
-  test.each(
-    filesUnder("src/app/api/kith").filter((file) => !file.endsWith(".test.ts")),
-  )("%s", assertNoConvexImport);
-
-  // Two named files rather than all of `src/lib/mcp`: that directory is
-  // dual-surface by design (`reads.ts`, `writes.ts`, `auth.ts`, ... each keep
-  // a `convex` branch until i7b), so scanning it wholesale would fail on
-  // every file that legitimately imports Convex for its own branch. These two
-  // are postgres-only seams i7a added -- `lib/mcp/principal.ts`'s
-  // `webPrincipalLoader` and `lib/mcp/embedder.ts` -- and neither has a reason
-  // to import Convex at all.
-  test.each(["src/lib/mcp/principal.ts", "src/lib/mcp/embedder.ts"])(
-    "%s",
-    assertNoConvexImport,
-  );
+  )("%s", (relativePath) => {
+    expect(readFileSync(path.join(ROOT, relativePath), "utf8")).not.toMatch(
+      CONVEX_IMPORT,
+    );
+  });
 });
 
 /**
@@ -122,8 +56,8 @@ describe("the postgres surface never imports Convex", () => {
  * page's own check, not only middleware." `postgres-pages.test.ts` proves the
  * loader half of that in a real read-only transaction -- a forged or missing
  * cookie returns `null` -- for every one of these loaders. This proves the
- * other half statically: each page's `postgres` branch is wired to redirect
- * on exactly that `null`, so the two together are the whole path from a
+ * other half statically: each page is wired to redirect on exactly that
+ * `null`, so the two together are the whole path from a
  * forged cookie to a `/sign-in` redirect, with no middleware anywhere in
  * either test.
  */
