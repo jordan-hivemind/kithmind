@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
+import { mkdtemp, realpath, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
 import {
+  PYTHON_LINK_NAME,
   ParserSetupError,
   configBlock,
+  isSingleHopExecutable,
   parseParserSetupArgs,
   runParserSetup,
 } from "./parser-runtime-setup.mjs";
@@ -171,5 +174,40 @@ test("table structure options are rejected when invalid or contradictory", () =>
         "{}",
       ]),
     (error) => error.code === "bypass_requires_tables",
+  );
+});
+
+// P2-104c. uv's venv links python3.12 -> python -> the real interpreter. The
+// runner readlinks `pythonExecutable` exactly once and requires the result to
+// equal the fully resolved path, so a two hop name is refused as
+// `unsafe_path`. Printing `python3.12` took the live watcher down.
+test("the printed interpreter is the single hop name the runner accepts", async () => {
+  assert.equal(PYTHON_LINK_NAME, "python");
+
+  // realpath first: macOS tmpdir is itself a symlink, and the runner compares
+  // the link target against the fully resolved path, so a symlinked ancestor
+  // would make even a one hop link look like two.
+  const directory = await realpath(
+    await mkdtemp(join(tmpdir(), "parser-python-path-")),
+  );
+  const real = join(directory, "cpython3.12");
+  await writeFile(real, "#!/bin/sh\n", { mode: 0o755 });
+  await symlink(real, join(directory, "python"));
+  await symlink("python", join(directory, "python3.12"));
+
+  assert.equal(
+    await isSingleHopExecutable(join(directory, "python")),
+    true,
+    "one hop to the interpreter is what the runner accepts",
+  );
+  assert.equal(
+    await isSingleHopExecutable(join(directory, "python3.12")),
+    false,
+    "two hops is the shape that was refused",
+  );
+  assert.equal(
+    await isSingleHopExecutable(real),
+    true,
+    "a plain file is acceptable too",
   );
 });

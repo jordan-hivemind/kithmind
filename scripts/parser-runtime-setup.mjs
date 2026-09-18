@@ -36,9 +36,16 @@
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFile, stat } from "node:fs/promises";
+import { readFile, readlink, realpath, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+
+/**
+ * The interpreter name to point the config at. uv's venv makes `python3.12`
+ * and `python3` links to `python`, and `python` the link to the real
+ * interpreter, so only this one is a single hop.
+ */
+export const PYTHON_LINK_NAME = "python";
 
 const PARSER_ROOT = resolve(
   dirname(fileURLToPath(import.meta.url)),
@@ -181,6 +188,20 @@ function run(executable, args, cwd) {
   }
 }
 
+/**
+ * The runner's own rule for `pythonExecutable`, in one place so it can be
+ * checked without a parser runtime: a path is acceptable when it is not a
+ * symlink at all, or when reading it once lands exactly on its fully resolved
+ * target. `preparePdfDocQaProfile` refuses anything else as `unsafe_path`.
+ */
+export async function isSingleHopExecutable(path) {
+  const canonical = await realpath(path);
+  if (canonical === path) return true;
+  const target = await readlink(path).catch(() => undefined);
+  if (target === undefined) return false;
+  return resolve(dirname(path), target) === canonical;
+}
+
 async function digestOf(path) {
   return createHash("sha256")
     .update(await readFile(path))
@@ -196,7 +217,14 @@ export async function runParserSetup(args) {
     );
   }
   const paths = {
-    pythonExecutable: join(root, ".venv", "bin", "python3.12"),
+    // P2-104c: `python`, not `python3.12`. uv's venv links `python3.12` and
+    // `python3` at `python`, which links at the real interpreter, and the
+    // runner accepts exactly one hop: it readlinks the requested path once and
+    // requires the result to equal the fully resolved path
+    // (`preparePdfDocQaProfile`, packages/pipeline/src/parserProcess.ts). A two
+    // hop path is refused as `unsafe_path`, which took the live watcher down.
+    // All three names are the same interpreter and the same digest.
+    pythonExecutable: join(root, ".venv", "bin", PYTHON_LINK_NAME),
     launcherPath: join(root, "src", "parser_eval", "production_launcher.py"),
     packageRoot: join(root, "src"),
     modelAssetsPath: join(root, "artifacts", "models"),
@@ -271,6 +299,14 @@ export async function runParserSetup(args) {
     );
   }
 
+  // Fail here, with the reason, rather than letting the operator paste a path
+  // the runner will refuse as `unsafe_path` on the next restart.
+  if (!(await isSingleHopExecutable(paths.pythonExecutable))) {
+    throw new ParserSetupError(
+      "python_path_not_single_hop",
+      `${paths.pythonExecutable} is not a single symlink hop to its target; the runner will refuse it`,
+    );
+  }
   const [python, launcher, modelLock] = await Promise.all([
     digestOf(paths.pythonExecutable),
     digestOf(paths.launcherPath),
