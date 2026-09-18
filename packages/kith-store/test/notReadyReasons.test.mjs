@@ -172,6 +172,67 @@ test("a provider binding with no verification names the loader and TypeError", a
   });
 });
 
+// P2-100c. `payload_verify_error:scan_conflict` named a 250-line function.
+// Every detail it can now report has to be a key the tally will keep, or the
+// next pass loses the answer again.
+test("every payload verify detail is a kind the tally accepts", () => {
+  assert.ok(provenance.PAYLOAD_VERIFY_DETAILS.length > 40);
+  for (const detail of provenance.PAYLOAD_VERIFY_DETAILS) {
+    assert.ok(ERROR_KINDS.includes(detail), detail);
+    assert.ok(
+      isNotReadyReason(`payload_verify_error:${detail}`),
+      `payload_verify_error:${detail}`,
+    );
+    // Fixed literals only: nothing that could carry an id, hash or count.
+    assert.match(detail, /^[a-z_]+(:[a-z_]+)?$/);
+  }
+  assert.equal(
+    new Set(provenance.PAYLOAD_VERIFY_DETAILS).size,
+    provenance.PAYLOAD_VERIFY_DETAILS.length,
+  );
+});
+
+test("the verifier names its check and still throws what it always threw", async () => {
+  // A generation missing the three ids refuses at the first check. The note
+  // fires, and the error is the same ProofError with the same code.
+  const seen = [];
+  await assert.rejects(
+    provenance.verifySealedParsedPayload(stubClient([]), { id: "g" }, (detail) =>
+      seen.push(detail),
+    ),
+    (error) => {
+      assert.equal(error.name, "ProofError");
+      assert.equal(error.code, "scan_conflict");
+      return true;
+    },
+  );
+  assert.deepEqual(seen, ["missing_ids"]);
+
+  // The same call with no note behaves identically, which is what the seal and
+  // activate callers rely on.
+  await assert.rejects(
+    provenance.verifySealedParsedPayload(stubClient([]), { id: "g" }),
+    (error) => error.name === "ProofError" && error.code === "scan_conflict",
+  );
+
+  // A later site: the ids are present, the manifest row is not.
+  const later = [];
+  await assert.rejects(
+    provenance.verifySealedParsedPayload(
+      stubClient([[], []]),
+      {
+        id: "g",
+        payloadManifestId: "m",
+        sourceTextVersionId: "t",
+        parserArtifactId: "a",
+      },
+      (detail) => later.push(detail),
+    ),
+    (error) => error.code === "scan_conflict",
+  );
+  assert.deepEqual(later, ["manifest_or_text_missing"]);
+});
+
 test("the key set stays bounded and overflows into one bucket", () => {
   let reasons = {};
   for (let index = 0; index < MAX_REASON_KEYS + 10; index += 1) {
