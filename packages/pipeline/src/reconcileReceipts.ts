@@ -7,6 +7,8 @@ import {
   requireCredential,
 } from "./config.js";
 import { Journal, JournalLockedError } from "./journal.js";
+import type { AdmissionBlockCode } from "./archiveCatalogTypes.js";
+import { receiptClearRowRefusal } from "./receiptClearSafety.js";
 import type { JsonValue } from "./journalTypes.js";
 import {
   archivedCheckpointIdentity,
@@ -33,6 +35,8 @@ export type ReconcileRefusalCode =
   | "checkpoint_plan_missing"
   | "processing_receipt_conflict"
   | "processing_already_activated"
+  /** P2-31f: another processing row of the same original is activated. */
+  | "sibling_processing_activated"
   | "lookup_refused"
   | "lookup_invalid";
 
@@ -43,6 +47,15 @@ export type ReconcileReceiptsResult = {
   applied: boolean;
   /** Local originals carrying a `cloud` receipt, across the whole catalog. */
   originalsWithReceipts: number;
+  /**
+   * P2-31f. Documents the pass has parked, across the whole catalog. The pass
+   * walks past a parked document, so it is no longer the checkpoint's own
+   * original and this command cannot address it. Reporting the count and the
+   * codes is what makes it the dry run for `run --retry-parked
+   * --operator-clear`, which is the deliberate route for clearing one.
+   */
+  parkedOriginals: number;
+  parkedCodes: AdmissionBlockCode[];
   /** How many of those the lookup could address. Never more than one. */
   receiptsChecked: number;
   receiptsConfirmed: number;
@@ -137,10 +150,15 @@ export async function runReconcileReceipts(input: {
   const originalsWithReceipts = input.catalog
     .listOriginals()
     .filter((row) => row.cloud).length;
+  const parked = input.catalog
+    .listOriginals()
+    .flatMap((row) => (row.admissionBlock ? [row.admissionBlock.code] : []));
   const base = {
     scope: "checkpoint_original",
     applied: false,
     originalsWithReceipts,
+    parkedOriginals: parked.length,
+    parkedCodes: [...new Set(parked)].sort(),
     receiptsChecked: 0,
     receiptsConfirmed: 0,
     receiptsUnknown: 0,
@@ -157,6 +175,11 @@ export async function runReconcileReceipts(input: {
   const checkpoint = input.journal.checkpoint;
   if (checkpoint.phase !== "archived") {
     if (input.journal.pending) return refuse("journal_request_pending");
+    // P2-31f: `parkedOriginals` and `parkedCodes` ride on every answer,
+    // including this one, because a pass that parked a document walks past it
+    // and leaves the checkpoint somewhere this command cannot act. An operator
+    // who sees a nonzero count here has the dry run for
+    // `run --retry-parked --operator-clear`.
     return originalsWithReceipts === 0
       ? { ...base, state: "clean" }
       : refuse("checkpoint_not_archived");
@@ -184,7 +207,8 @@ export async function runReconcileReceipts(input: {
   // the original's note is what marks the pair done. A rerun that finds the
   // note without a receipt is finishing an interrupted checkpoint move, so it
   // asks the server nothing and repeats two no-op catalog writes.
-  const resuming = !original.cloud && original.receiptReconcile !== undefined;
+  const resuming =
+    !original.cloud && (original.receiptReconcile?.length ?? 0) > 0;
   let receiptsChecked = 0;
   let receiptsUnknown = 0;
   if (original.cloud) {
@@ -221,24 +245,24 @@ export async function runReconcileReceipts(input: {
   } else if (!resuming) {
     return { ...base, state: "clean" };
   }
-  // The receipt is void from here on, so both refusals below apply to the dry
+  // The receipt is void from here on, so the refusals below apply to the dry
   // run as well: an operator reading a count must see what `--apply` would hit.
   //
-  // An activated processing row means a generation is live server side under
-  // this admission. Retiring its receipt would leave that generation with no
-  // local record of the admission it came from, which this command cannot
-  // repair and P2-31's multi-reference work must.
-  if (processing.activation) return refuse("processing_already_activated");
-  // One `discovery.admitArchived` commits both legs, so a processing receipt
-  // naming the same revision is void with the original's. One naming a
-  // different revision is a shape nothing in this pipeline produces, and
-  // guessing at it would retire a receipt that may be real.
-  if (
-    original.cloud &&
-    processing.cloud &&
-    processing.cloud.sourceRevisionId !== original.cloud.sourceRevisionId
-  )
-    return refuse("processing_receipt_conflict");
+  // P2-31f moved these conditions into `receiptClearRowRefusal`, shared with
+  // the pass that now makes the same clear for itself, so the two routes
+  // cannot drift. That move also fixed a hole both copies had: the checks
+  // looked only at the checkpoint's own processing row, so a sibling row of
+  // the same original could be live server side while its receipt was retired
+  // underneath it. The circuit breakers on top of these are the automatic
+  // route's alone: an operator here has read the counts and decided.
+  const rowRefusal = receiptClearRowRefusal({
+    original,
+    processing,
+    processings: input.catalog.listProcessings(),
+  });
+  // Only the row conditions reach this command; the automatic-route limits are
+  // never evaluated here, so their codes cannot appear.
+  if (rowRefusal) return refuse(rowRefusal as ReconcileRefusalCode);
   const found = { ...base, receiptsChecked, receiptsUnknown };
   if (!input.apply)
     return {
@@ -258,12 +282,14 @@ export async function runReconcileReceipts(input: {
     catalogId: processing.processingCatalogId,
     expectedRevision: processing.rowRevision,
     clearedAt,
+    by: "operator",
   });
   const nextOriginal = await input.catalog.clearVoidAdmission({
     subject: "original_bytes",
     catalogId: original.originalCatalogId,
     expectedRevision: original.rowRevision,
     clearedAt,
+    by: "operator",
   });
   // Back to the read-only lookup with the question unasked, the dead lease
   // dropped, and both expected revisions in step with what was just written.
@@ -318,6 +344,9 @@ export async function reconcileReceiptsFromPath(
         scope: "checkpoint_original",
         applied: false,
         originalsWithReceipts: 0,
+        // The catalog is behind the same lock, so nothing can be counted here.
+        parkedOriginals: 0,
+        parkedCodes: [],
         receiptsChecked: 0,
         receiptsConfirmed: 0,
         receiptsUnknown: 0,
@@ -338,8 +367,19 @@ export async function reconcileReceiptsFromPath(
   }
 }
 
+/**
+ * P2-31f. Parked documents are printed on every answer, refusals included, so
+ * an operator meeting `checkpoint_not_archived` still learns there is work
+ * this command cannot reach and what route clears it.
+ */
+function parkedSuffix(value: ReconcileReceiptsResult): string {
+  return value.parkedOriginals === 0
+    ? ""
+    : ` parked=${value.parkedOriginals} (${value.parkedCodes.join(",")}); clear with: run --retry-parked --operator-clear`;
+}
+
 export function formatReconcileResult(value: ReconcileReceiptsResult): string {
   return value.state === "refused"
-    ? `reconcile-receipts: refused (${value.code}${value.lookupCode ? `: ${value.lookupCode}` : ""})`
-    : `reconcile-receipts: ${value.state} receipts=${value.originalsWithReceipts} checked=${value.receiptsChecked} confirmed=${value.receiptsConfirmed} unknown=${value.receiptsUnknown} applied=${value.applied}`;
+    ? `reconcile-receipts: refused (${value.code}${value.lookupCode ? `: ${value.lookupCode}` : ""})${parkedSuffix(value)}`
+    : `reconcile-receipts: ${value.state} receipts=${value.originalsWithReceipts} checked=${value.receiptsChecked} confirmed=${value.receiptsConfirmed} unknown=${value.receiptsUnknown} applied=${value.applied}${parkedSuffix(value)}`;
 }

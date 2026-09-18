@@ -149,7 +149,7 @@ test("fresh scoped setup is operationally ready before coverage exists", async (
   );
 
   assert.equal(result.state, "ready");
-  assert.equal(result.version, 2);
+  assert.equal(result.version, 3);
   assert.deepEqual(
     result.checks.map(({ id, state }) => [id, state]),
     [
@@ -159,6 +159,7 @@ test("fresh scoped setup is operationally ready before coverage exists", async (
       ["heartbeat", "pass"],
       ["roots", "pass"],
       ["journal", "pass"],
+      ["archive", "pass"],
     ],
   );
   assert.deepEqual(result.source, {
@@ -622,7 +623,7 @@ test("invalid and oversized config files return the same closed bounded object",
   for (const path of [invalid, oversized, join(files.base, "missing.json")]) {
     const result = await doctorFromPath(path, () => transport(source()));
     assert.equal(result.state, "blocked");
-    assert.equal(result.checks.length, 6);
+    assert.equal(result.checks.length, 7);
     assert.equal(check(result, "config").code, "invalid_config");
     assert.equal(JSON.stringify(result).includes(files.base), false);
   }
@@ -679,8 +680,107 @@ test("human output is a bounded rendering of fixed diagnostics", async (context)
       "heartbeat: pass current",
       "roots: pass safe",
       "journal: pass not_initialized",
+      "archive: pass none_parked",
       "source: enumeration=not_started processing=not_assessed recordCoverage=not_established",
       "capabilities: embeddings=unverified daemon=unverified",
     ].join("\n"),
   );
+});
+
+/**
+ * P2-31f. The archive check reads the catalog file directly, so a synthetic
+ * one is enough: the doctor never takes the journal lock for it.
+ */
+async function writeCatalog(files, originals) {
+  await mkdir(files.journal, { mode: 0o700, recursive: true });
+  await writeFile(
+    join(files.journal, "archive-catalog.json"),
+    JSON.stringify({ version: 1, revision: 1, originals }),
+    { mode: 0o600 },
+  );
+}
+
+function parkedOriginal(code, attempts = 1, blockedAt = Date.now()) {
+  return {
+    originalCatalogId: "00000000-0000-4000-8000-000000000001",
+    admissionBlock: {
+      code,
+      blockedAt,
+      runnerCapability: "0".repeat(16),
+      attempts,
+    },
+  };
+}
+
+test("parked documents are reported, and ones nothing will free fail the check", async (context) => {
+  const files = await fixture();
+  context.after(() => rm(files.base, { recursive: true, force: true }));
+  const blockedAt = Date.now() - 3 * 60 * 60_000;
+
+  // Inside its retry budget: the worker is healthy, so this only warns.
+  await writeCatalog(files, [parkedOriginal("catalog_conflict", 1, blockedAt)]);
+  const retrying = await doctor(
+    config(files.root, files.journal),
+    transport(source()),
+    "synthetic-token",
+    isolated,
+  );
+  assert.equal(retrying.state, "degraded");
+  assert.deepEqual(check(retrying, "archive"), {
+    id: "archive",
+    state: "warn",
+    code: "items_parked",
+    parked: 1,
+    parkedEscalated: 0,
+    parkedCodes: ["catalog_conflict"],
+    parkedOldestAgeMs: check(retrying, "archive").parkedOldestAgeMs,
+  });
+  assert.ok(check(retrying, "archive").parkedOldestAgeMs >= 3 * 60 * 60_000);
+
+  // A code with no automatic recovery needs a person however long nobody
+  // looks, so the report says so rather than warning for ever.
+  await writeCatalog(files, [
+    parkedOriginal("catalog_conflict", 1, blockedAt),
+    {
+      ...parkedOriginal("receipt_clear_refused_by_safety_limit"),
+      originalCatalogId: "00000000-0000-4000-8000-000000000002",
+    },
+  ]);
+  const escalated = await doctor(
+    config(files.root, files.journal),
+    transport(source()),
+    "synthetic-token",
+    isolated,
+  );
+  assert.equal(escalated.state, "blocked");
+  assert.equal(check(escalated, "archive").state, "fail");
+  assert.equal(check(escalated, "archive").code, "items_escalated");
+  assert.equal(check(escalated, "archive").parked, 2);
+  assert.equal(check(escalated, "archive").parkedEscalated, 1);
+  assert.deepEqual(check(escalated, "archive").parkedCodes, [
+    "catalog_conflict",
+    "receipt_clear_refused_by_safety_limit",
+  ]);
+  // The guidance is fixed text per code and never names a document.
+  const text = formatDoctorResult(escalated);
+  assert.match(text, /archive: fail items_escalated/);
+  assert.match(text, /parked items: 2 \(1 need attention/);
+  assert.equal(text.includes(files.base), false);
+
+  // A catalog that exists and cannot be parsed is not a clean count.
+  await writeFile(join(files.journal, "archive-catalog.json"), "{not-json", {
+    mode: 0o600,
+  });
+  const unreadable = await doctor(
+    config(files.root, files.journal),
+    transport(source()),
+    "synthetic-token",
+    isolated,
+  );
+  assert.deepEqual(check(unreadable, "archive"), {
+    id: "archive",
+    state: "warn",
+    code: "not_checked",
+  });
+  assert.equal(unreadable.state, "degraded");
 });

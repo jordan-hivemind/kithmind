@@ -47,8 +47,34 @@ The result uses fixed diagnostic codes and bounded source status. It omits
 credentials, server error messages, file contents, filenames, source URLs,
 and journal request or lease details.
 
-The JSON doctor result is version 2. Version 2 adds the separate heartbeat
-check while leaving the worker `source.status` protocol unchanged.
+The JSON doctor result is version 3. Version 2 added the separate heartbeat
+check. Version 3 adds a seventh check, `archive`, and leaves the worker
+`source.status` protocol unchanged.
+
+## Parked documents
+
+The `archive` check reports documents the archived pass could not file and set
+aside, so one of them cannot hold up the rest. It reads the local archive
+catalog without taking the journal lock, so it works while a watcher runs.
+`docs/worker-service.md` explains what each parked code means and how a
+document is released.
+
+| Check                 | Meaning                                                                                         | Doctor readiness |
+| --------------------- | ----------------------------------------------------------------------------------------------- | ---------------- |
+| `pass none_parked`    | Nothing is set aside.                                                                            | unaffected       |
+| `warn items_parked`   | Documents are set aside and every one is inside its automatic retry budget.                     | `degraded`       |
+| `fail items_escalated`| At least one will not free itself: its code has no automatic recovery, or its retries are spent. | `blocked`        |
+| `warn not_checked`    | The catalog is present and could not be read. This is not the same as nothing being parked.     | `degraded`       |
+
+The check carries `parked`, `parkedEscalated`, `parkedCodes` and
+`parkedOldestAgeMs`. Counts and closed-enum codes only: no file name, path or
+document content appears. The human output adds one line per code with what it
+means and what to do. An operator wrapper that filters diagnostic codes needs
+`none_parked`, `items_parked`, `items_escalated` and `not_checked`.
+
+A pass whose only problem is an escalated document ends `incomplete` with code
+`items_need_attention` and a nonzero exit, rather than `complete` with a count
+buried in it.
 
 ## Journal inspection and recovery
 

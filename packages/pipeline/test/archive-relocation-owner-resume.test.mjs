@@ -45,7 +45,7 @@ function observation(text = "unchanged synthetic note") {
 
 function doctorResult() {
   return {
-    version: 2,
+    version: 3,
     state: "degraded",
     checks: [
       { id: "config", state: "pass", code: "valid" },
@@ -54,6 +54,7 @@ function doctorResult() {
       { id: "heartbeat", state: "warn", code: "awaiting_heartbeat" },
       { id: "roots", state: "pass", code: "safe" },
       { id: "journal", state: "warn", code: "contended" },
+      { id: "archive", state: "pass", code: "none_parked" },
     ],
     source: {
       enumeration: "complete",
@@ -272,7 +273,7 @@ function setup(options = {}) {
       return { ...current, sha256: sha(JSON.stringify(current)) };
     },
     transport: () => underlying,
-    doctor: async () => doctorResult(),
+    doctor: async () => options.doctor?.() ?? doctorResult(),
     run: async (_config, _session, transport) => {
       await transport.call({ operation: "source.status" });
       await transport.call({ operation: "scan.begin" });
@@ -484,4 +485,58 @@ test("rejects a non-closed owner reset result", async () => {
       error.code === "watcher_reset_failed",
   );
   assert.deepEqual(f.operations, []);
+});
+
+test("a document waiting for a person stops the relocation before the root moves", async () => {
+  // P2-31f. A parked document inside its retry budget is still moving, so it
+  // does not gate the relocation. One that needs a person does: the report
+  // fails that check, which makes it `blocked`, and this gate wants
+  // `degraded`. Dealing with it first is the point.
+  for (const [archive, expected] of [
+    [
+      {
+        id: "archive",
+        state: "warn",
+        code: "items_parked",
+        parked: 1,
+        parkedEscalated: 0,
+        parkedCodes: ["catalog_conflict"],
+      },
+      "ok",
+    ],
+    [
+      {
+        id: "archive",
+        state: "fail",
+        code: "items_escalated",
+        parked: 1,
+        parkedEscalated: 1,
+        parkedCodes: ["original_receipt_revision_conflict"],
+      },
+      "doctor_failed",
+    ],
+    [{ id: "archive", state: "warn", code: "not_checked" }, "doctor_failed"],
+  ]) {
+    const f = setup({
+      doctor: () => {
+        const value = doctorResult();
+        value.checks[6] = archive;
+        if (archive.state === "fail") value.state = "blocked";
+        return value;
+      },
+    });
+    if (expected === "ok") {
+      const proof = await __testOnlyVerifyArchiveRelocationOwnerResume(
+        f.input,
+        f.adapters,
+      );
+      assert.equal(proof.doctor.checks[6].code, "items_parked");
+      continue;
+    }
+    await assert.rejects(
+      () =>
+        __testOnlyVerifyArchiveRelocationOwnerResume(f.input, f.adapters),
+      (error) => error.code === expected,
+    );
+  }
 });

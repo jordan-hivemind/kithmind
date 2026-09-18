@@ -1571,14 +1571,19 @@ test("clearing a void admission retires the receipt and leaves the archive alone
       catalogId: admitted.originalCatalogId,
       expectedRevision: admitted.rowRevision,
       clearedAt: 25,
+      by: "operator",
     });
     assert.equal(cleared.cloud, undefined);
     assert.equal(cleared.copies.primary.cloudReceipt, undefined);
     assert.equal(cleared.rowRevision, admitted.rowRevision + 1);
-    assert.deepEqual(cleared.receiptReconcile, {
-      code: "original_receipt_unknown_to_server",
-      clearedAt: 25,
-    });
+    // P2-31f: an append-only history, so a repeat clear cannot hide.
+    assert.deepEqual(cleared.receiptReconcile, [
+      {
+        code: "original_receipt_unknown_to_server",
+        clearedAt: 25,
+        by: "operator",
+      },
+    ]);
     assert.deepEqual(
       cleared.providerOriginal,
       admitted.providerOriginal,
@@ -1589,13 +1594,15 @@ test("clearing a void admission retires the receipt and leaves the archive alone
       admitted.copies.primary.published,
       "the published object stays exactly where it is",
     );
-    // The note is written once, so a repeat is free and bumps no revision.
+    // A repeat clear of a row that holds no receipt is free and bumps no
+    // revision, which the interrupted-move rerun relies on.
     assert.deepEqual(
       await f.catalog.clearVoidAdmission({
         subject: "original_bytes",
         catalogId: cleared.originalCatalogId,
         expectedRevision: cleared.rowRevision,
         clearedAt: 99,
+        by: "operator",
       }),
       cleared,
     );
@@ -1626,6 +1633,50 @@ test("clearing a void admission retires the receipt and leaves the archive alone
     assert.deepEqual(readmitted.receiptReconcile, cleared.receiptReconcile);
   } finally {
     await f.journal.close();
+    await rm(f.directory, { recursive: true, force: true });
+  }
+});
+
+test("a catalog written before P2-31f reads its single reconcile note as a one-entry history", async () => {
+  // PR 276 shipped, so live catalogs hold `receiptReconcile` as one object.
+  // Refusing those closed would make a worker unable to open its own catalog.
+  const f = await setup();
+  let journal = f.journal;
+  try {
+    const row = await f.catalog.createOriginalIntent(original());
+    await f.catalog.clearVoidAdmission({
+      subject: "original_bytes",
+      catalogId: row.originalCatalogId,
+      expectedRevision: row.rowRevision,
+      clearedAt: 41,
+      by: "operator",
+    });
+    await journal.close();
+    const path = join(f.directory, "archive-catalog.json");
+    const legacy = JSON.parse(await readFile(path, "utf8"));
+    // The old shape: one note, and no `by`, which did not exist then.
+    legacy.originals[0].receiptReconcile = {
+      code: "original_receipt_unknown_to_server",
+      clearedAt: 41,
+    };
+    await writeFile(path, JSON.stringify(legacy), { mode: 0o600 });
+    journal = await Journal.open({
+      directory: f.directory,
+      binding: f.authority,
+      credential: "km_synthetic_high_entropy_credential",
+      initialCheckpoint: { version: 1, phase: "idle" },
+      codec,
+    });
+    const catalog = await openArchiveCatalog({ journal });
+    const [reopened] = catalog.listOriginals();
+    assert.deepEqual(reopened.receiptReconcile, [
+      { code: "original_receipt_unknown_to_server", clearedAt: 41 },
+    ]);
+    // The safety limits read this history back, so a legacy note must count
+    // as one clear rather than as none.
+    assert.equal(reopened.receiptReconcile.length, 1);
+  } finally {
+    await journal.close();
     await rm(f.directory, { recursive: true, force: true });
   }
 });

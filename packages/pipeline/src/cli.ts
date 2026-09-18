@@ -27,11 +27,18 @@ import type { RunnerCheckpoint } from "./runnerState.js";
 
 function usage(): never {
   throw new Error(
-    "Usage: pnpm brain:worker -- <run|watch|doctor> --config <path> [--json], or reconcile-receipts --config <path> [--apply] [--json], or forget-archive --config <path> --source-item <id> --source-external-id <uuid> --forget-epoch <n> [--json]",
+    "Usage: pnpm brain:worker -- <run|watch|doctor> --config <path> [--json], run also takes [--retry-parked [--operator-clear --max-clears <n>]], or reconcile-receipts --config <path> [--apply] [--json], or forget-archive --config <path> --source-item <id> --source-external-id <uuid> --forget-epoch <n> [--json]",
   );
 }
 export function argumentsFor(argv: string[]):
-  | { command: "run" | "watch"; configPath: string }
+  | {
+      command: "run";
+      configPath: string;
+      retryParked: boolean;
+      operatorClear: boolean;
+      maxClears?: number;
+    }
+  | { command: "watch"; configPath: string }
   | { command: "doctor"; configPath: string; json: boolean }
   | {
       command: "reconcile-receipts";
@@ -94,13 +101,30 @@ export function argumentsFor(argv: string[]):
       json,
     };
   }
-  const [command, flag, configPath, ...extra] = forwarded;
+  const [command, flag, configPath, ...rest] = forwarded;
+  // P2-31f: `--max-clears <n>` is the only `run` flag that takes a value, so
+  // it comes out before the remainder is checked against the bare-flag list.
+  const extra: string[] = [];
+  let maxClearsText: string | undefined;
+  for (let index = 0; index < rest.length; index += 1) {
+    if (command === "run" && rest[index] === "--max-clears") {
+      if (maxClearsText !== undefined) usage();
+      maxClearsText = rest[index + 1];
+      index += 1;
+      continue;
+    }
+    extra.push(rest[index]!);
+  }
   const allowed =
     command === "doctor"
       ? ["--json"]
       : command === "reconcile-receipts"
         ? ["--json", "--apply"]
-        : [];
+        : // P2-31f: the operator release for parked items, and the
+          // deliberate receipt clear that only makes sense with it.
+          command === "run"
+          ? ["--retry-parked", "--operator-clear"]
+          : [];
   if (
     (command !== "run" &&
       command !== "watch" &&
@@ -119,9 +143,33 @@ export function argumentsFor(argv: string[]):
       apply: extra.includes("--apply"),
       json: extra.includes("--json"),
     };
-  return command === "doctor"
-    ? { command, configPath, json: extra.includes("--json") }
-    : { command, configPath };
+  if (command === "doctor")
+    return { command, configPath, json: extra.includes("--json") };
+  if (command !== "run") {
+    if (maxClearsText !== undefined) usage();
+    return { command, configPath };
+  }
+  const retryParked = extra.includes("--retry-parked");
+  const operatorClear = extra.includes("--operator-clear");
+  // `--operator-clear` drops safety limits that exist because a pass decides
+  // alone, so it is only meaningful on a pass an operator started to retry
+  // parked documents. On its own it is a typo, not an instruction.
+  if (operatorClear && !retryParked) usage();
+  // And it is never open ended. Against a backend that is simply the wrong
+  // one, every document it reaches would have its receipt voided and be
+  // re-admitted there, so the operator states how many clears they meant,
+  // from the dry run's count. No flag, no relaxed rules.
+  if (operatorClear !== (maxClearsText !== undefined)) usage();
+  if (maxClearsText === undefined)
+    return { command, configPath, retryParked, operatorClear };
+  if (!/^[1-9][0-9]{0,3}$/.test(maxClearsText)) usage();
+  return {
+    command,
+    configPath,
+    retryParked,
+    operatorClear,
+    maxClears: Number(maxClearsText),
+  };
 }
 
 async function executeForget(
@@ -160,6 +208,11 @@ async function executeConfig(
   config: Awaited<ReturnType<typeof loadPipelineConfig>>,
   credential: string,
   journal?: Journal<RunnerCheckpoint, JsonValue>,
+  options: {
+    retryParked?: boolean;
+    operatorClear?: boolean;
+    maxClears?: number;
+  } = {},
 ): Promise<PipelineRunResult> {
   const ownedJournal =
     journal ??
@@ -175,6 +228,8 @@ async function executeConfig(
       config,
       ownedJournal,
       new HttpWorkerTransport(config, credential),
+      undefined,
+      options,
     );
     return await runner.runSafely();
   } finally {
@@ -182,9 +237,16 @@ async function executeConfig(
   }
 }
 
-async function execute(configPath: string): Promise<PipelineRunResult> {
+async function execute(
+  configPath: string,
+  options: {
+    retryParked?: boolean;
+    operatorClear?: boolean;
+    maxClears?: number;
+  } = {},
+): Promise<PipelineRunResult> {
   const config = await loadPipelineConfig(configPath);
-  return executeConfig(config, requireCredential(config));
+  return executeConfig(config, requireCredential(config), undefined, options);
 }
 
 async function waitForWatchInterval(
@@ -339,7 +401,13 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     return;
   }
   if (command === "run") {
-    const result = await execute(configPath);
+    const result = await execute(configPath, {
+      retryParked: parsed.retryParked,
+      operatorClear: parsed.operatorClear,
+      ...(parsed.maxClears === undefined
+        ? {}
+        : { maxClears: parsed.maxClears }),
+    });
     process.stdout.write(`${JSON.stringify(result)}\n`);
     if (result.state !== "complete") process.exitCode = 1;
     return;

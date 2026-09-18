@@ -318,10 +318,21 @@ function validateOwnerReset(
 
 function doctorCheck(result: DoctorResult): void {
   const heartbeat = result.checks[3];
+  // P2-31f: a parked archived item is not settled the way a parked parse
+  // failure is. It is retried, and it can still publish. `items_parked` means
+  // every one of them is inside that retry budget, which does not gate the
+  // relocation: the marker carries no path, so moving the root cannot
+  // invalidate it. `items_escalated` is a `fail`, which makes the report
+  // `blocked` and refuses here, deliberately: a document waiting for a person
+  // should be dealt with before the archive root moves under it. So does
+  // `not_checked`, because the report did not look.
+  const archive = result.checks[6];
   if (
-    result.version !== 2 ||
+    result.version !== 3 ||
     result.state !== "degraded" ||
-    result.checks.length !== 6 ||
+    result.checks.length !== 7 ||
+    archive?.id !== "archive" ||
+    archive.code === "not_checked" ||
     !isDeepStrictEqual(result.checks[0], {
       id: "config",
       state: "pass",
