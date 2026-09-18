@@ -134,6 +134,12 @@ const CLIENT_SAFE_TOOL_ERRORS: ReadonlySet<string> = new Set([
   "Seed thought not found",
   "Thought capture requires read and write capabilities",
   "validFrom must be earlier than validTo",
+  // Fixed argument-validation literals. A client is a model that corrects
+  // itself from this text, and none of them names anything stored.
+  "Invalid cursor",
+  "order is invalid",
+  "Entity not found",
+  "Provide exactly one of seedId or aroundMs",
 ]);
 
 function toolErrorResult(text: string) {
