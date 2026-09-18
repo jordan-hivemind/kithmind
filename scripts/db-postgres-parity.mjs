@@ -28,7 +28,16 @@ function run(psqlPath, connection, sql, timeoutMs, hashOutput = false) {
       [connection, "-X", "-v", "ON_ERROR_STOP=1", "-tA", "-c", sql],
       {
         stdio: ["ignore", "pipe", "pipe"],
-        env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "" },
+        // `to_jsonb` renders timestamptz in the session time zone and text
+        // in the client encoding, so pin both: a capture must hash the same
+        // on a hosted UTC server and on a laptop restore target whose
+        // server default is the local zone.
+        env: {
+          PATH: process.env.PATH ?? "",
+          HOME: process.env.HOME ?? "",
+          PGTZ: "UTC",
+          PGCLIENTENCODING: "UTF8",
+        },
       },
     );
     const output = [];
