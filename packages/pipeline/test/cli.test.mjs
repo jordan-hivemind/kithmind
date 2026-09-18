@@ -54,7 +54,8 @@ test("run takes --retry-parked and no other command does", () => {
       operatorClear: false,
     },
   );
-  // The deliberate receipt clear rides on the release and never alone.
+  // The deliberate receipt clear rides on the release, never alone, and never
+  // without the number of clears the operator meant to authorize.
   assert.deepEqual(
     argumentsFor([
       "run",
@@ -62,17 +63,33 @@ test("run takes --retry-parked and no other command does", () => {
       "/tmp/config.json",
       "--retry-parked",
       "--operator-clear",
+      "--max-clears",
+      "3",
     ]),
     {
       command: "run",
       configPath: "/tmp/config.json",
       retryParked: true,
       operatorClear: true,
+      maxClears: 3,
     },
   );
   assert.throws(() =>
     argumentsFor(["run", "--config", "/tmp/config.json", "--operator-clear"]),
   );
+  for (const extra of [
+    ["--retry-parked", "--operator-clear"],
+    ["--retry-parked", "--operator-clear", "--max-clears", "0"],
+    ["--retry-parked", "--operator-clear", "--max-clears", "-1"],
+    ["--retry-parked", "--operator-clear", "--max-clears", "all"],
+    ["--retry-parked", "--operator-clear", "--max-clears"],
+    ["--retry-parked", "--max-clears", "3"],
+    ["--max-clears", "3"],
+  ])
+    assert.throws(
+      () => argumentsFor(["run", "--config", "/tmp/config.json", ...extra]),
+      `run ${extra.join(" ")}`,
+    );
   for (const command of ["watch", "doctor", "reconcile-receipts"])
     assert.throws(() =>
       argumentsFor([command, "--config", "/tmp/config.json", "--retry-parked"]),

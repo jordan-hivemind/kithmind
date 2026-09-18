@@ -176,6 +176,8 @@ export type PipelineRunResult = {
   parkedEscalated?: number;
   parkedCodes?: string[];
   parkedOldestAgeMs?: number;
+  /** P2-31f: receipts `run --operator-clear` retired in this pass. */
+  operatorClears?: number;
 };
 
 export type WorkerErrorCode =

@@ -1153,16 +1153,19 @@ function resultFromTerminal(
 export class PipelineRunner {
   private preparedPdfProfile: PreparedPdfDocQaProfile | undefined;
   private archiveCatalog: ArchiveCatalog | undefined;
+  /** P2-31f: receipts `--operator-clear` has retired in this pass. */
+  private operatorClears = 0;
 
   constructor(
     private readonly config: PipelineConfig,
     private readonly journal: Journal<RunnerCheckpoint, JsonValue>,
     private readonly transport: WorkerTransport,
     private readonly rateLimitBackoff: RateLimitBackoff = DEFAULT_RATE_LIMIT_BACKOFF,
-    /** P2-31f: the two `run` operator flags. */
+    /** P2-31f: the `run` operator flags. */
     private readonly options: {
       retryParked?: boolean;
       operatorClear?: boolean;
+      maxClears?: number;
     } = {},
   ) {}
 
@@ -4036,9 +4039,14 @@ export class PipelineRunner {
     };
     // `--operator-clear` is a person standing in for the limits that exist
     // only because a pass decides alone. The conditions about this document
-    // still hold either way.
+    // still hold either way, and so does the count they asked for: the
+    // relaxed rules apply to every document whose own lookup comes back not
+    // found, which is not the same set as the parked ones, so the pass stops
+    // at the number the operator stated rather than at whatever it meets.
     const refusal = this.options.operatorClear
-      ? operatorReceiptClearRefusal(shared)
+      ? (this.operatorClears >= (this.options.maxClears ?? 0)
+          ? "operator_clear_limit"
+          : undefined) ?? operatorReceiptClearRefusal(shared)
       : await automaticReceiptClearRefusal({
           ...shared,
           originals: catalog.listOriginals(),
@@ -4047,6 +4055,23 @@ export class PipelineRunner {
         });
     if (refusal) return refusal;
     const by = this.options.operatorClear ? "operator" : "pass";
+    if (by === "operator") {
+      if (this.operatorClears === 0) {
+        // Printed once, before the first clear, so the operator sees what they
+        // are acting on rather than only what happened. Counts only.
+        process.stderr.write(
+          `${JSON.stringify({
+            event: "operator_clear_begin",
+            parkedOriginals: catalog
+              .listOriginals()
+              .filter((row) => row.admissionBlock).length,
+            maxClears: this.options.maxClears ?? 0,
+            note: "relaxed rules apply to every document in this pass whose own lookup returns a well-formed not found, which can exceed the parked count",
+          })}\n`,
+        );
+      }
+      this.operatorClears += 1;
+    }
     const clearedAt = Date.now();
     const nextProcessing = (await catalog.clearVoidAdmission({
       subject: "parser_output",
@@ -4152,7 +4177,8 @@ export class PipelineRunner {
               current,
               healed === "positive_control_failed" ||
                 healed === "positive_control_unavailable" ||
-                healed === "daily_clear_limit"
+                healed === "daily_clear_limit" ||
+                healed === "operator_clear_limit"
                 ? "receipt_clear_refused_by_safety_limit"
                 : "original_receipt_unknown_to_server",
             );
@@ -6334,10 +6360,14 @@ export class PipelineRunner {
           .listOriginals()
           .flatMap((row) => (row.admissionBlock ? [row.admissionBlock] : []))
       : [];
-    if (parked.length === 0) return result;
+    const withClears =
+      this.operatorClears === 0
+        ? result
+        : { ...result, operatorClears: this.operatorClears };
+    if (parked.length === 0) return withClears;
     const escalated = parked.filter(admissionBlockEscalated).length;
     const summarized: PipelineRunResult = {
-      ...result,
+      ...withClears,
       parked: parked.length,
       parkedEscalated: escalated,
       parkedCodes: [...new Set(parked.map((block) => block.code))].sort(),

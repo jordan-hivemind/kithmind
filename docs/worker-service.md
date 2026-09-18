@@ -425,21 +425,44 @@ reach it. It reports parked documents by count and code on every answer,
 including a refusal, which makes it the dry run. The apply step is a pass an
 operator starts.
 
+This command is the sharpest tool here. Against a wrong or empty backend it
+voids every receipt it reaches, and each of those documents is then re-admitted
+to that backend on the same pass. The relaxed rules apply to every document in
+the pass whose own lookup returns a well-formed "not found", which is not the
+same set as the parked ones and can be larger. Work through these
+preconditions in order, and do not skip one:
+
+1. Run `doctor` and confirm the report is healthy apart from the parked items.
+2. Confirm the web deployment and its database are the intended ones: check the
+   health endpoint, and confirm a known document is still retrievable through
+   MCP. A backend that answers but holds nothing is the case this guards.
+3. Run the `reconcile-receipts` dry run and read `parkedOriginals` and
+   `parkedCodes`.
+4. Run with `--max-clears` set to exactly that `parkedOriginals` count.
+
 ```sh
 launchctl bootout gui/$(id -u)/<watcher-label>
+pnpm --silent brain:worker -- doctor --config /absolute/path/to/pipeline.json --json
 pnpm --silent brain:worker -- reconcile-receipts --config /absolute/path/to/pipeline.json --json
-pnpm --silent brain:worker -- run --config /absolute/path/to/pipeline.json --retry-parked --operator-clear
+pnpm --silent brain:worker -- run --config /absolute/path/to/pipeline.json --retry-parked --operator-clear --max-clears <parkedOriginals>
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<watcher-label>.plist
 ```
 
-Read the dry run first and check the server is the right deployment. The second
-command clears every marker, retries each parked document, and repairs a
+The run clears every marker, retries each parked document, and repairs a
 receipt the server denies when the document's own state allows it: the
 processing row and its siblings are not activated, no processing receipt names
-another revision, and the server's answer is a well-formed "not found". It does
+another revision, and the server's answer is a well-formed "not found". A
+refused or unanswered lookup is not a "not found" and retires nothing. It does
 not apply the once-ever or once-per-day limits, which exist only because a pass
-decides alone. Every clear it makes is recorded against the document as an
-operator clear. `--operator-clear` is refused without `--retry-parked`.
+decides alone. Once `--max-clears` is spent the rest of the pass parks as
+usual. Before the first clear the pass writes one line to stderr with the
+counts it is about to act on, and the result reports `operatorClears`. Every
+clear is recorded against the document as an operator clear.
+
+`--operator-clear` is refused without `--retry-parked`, and refused without
+`--max-clears`; `--max-clears` is refused on its own. The per-document record
+keeps the last 16 clears, so a document cleared repeatedly shows its recent
+history rather than all of it.
 
 ### Documents that need attention
 

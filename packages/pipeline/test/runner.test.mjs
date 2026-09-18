@@ -4245,7 +4245,7 @@ test("the operator route repairs a receipt the automatic route would not touch",
   // run has, so `--operator-clear` keeps only the conditions about the
   // document itself.
   const f = await voidBackendFixture(3);
-  f.runner.options = { retryParked: true, operatorClear: true };
+  f.runner.options = { retryParked: true, operatorClear: true, maxClears: 5 };
   try {
     await f.runner.driveArchivedLookupOriginal();
     assert.deepEqual(
@@ -4257,6 +4257,95 @@ test("the operator route repairs a receipt the automatic route would not touch",
   } finally {
     await f.journal.close();
     await rm(f.setup.base, { recursive: true, force: true });
+  }
+});
+
+test("the operator clear stops at the number the operator authorized", async () => {
+  // The relaxed rules reach every document whose own lookup comes back not
+  // found, which is not the same set as the parked ones, so the cap is what
+  // bounds the damage against a backend that is simply the wrong one.
+  const f = await voidBackendFixture(3);
+  f.runner.options = { retryParked: true, operatorClear: true, maxClears: 1 };
+  try {
+    for (let index = 0; index < 3; index += 1) {
+      f.runner.archivedRows = () => ({
+        original: f.originals[index],
+        processing: { ...f.processing, rowRevision: 1 },
+      });
+      f.runner.archiveCatalog.recordAdmissionBlock = async (args) => {
+        f.parked.push(args);
+        f.originals[index].admissionBlock = {
+          code: args.code,
+          blockedAt: args.now,
+          runnerCapability: args.runnerCapability,
+          attempts: 1,
+        };
+        f.originals[index].rowRevision += 1;
+        return f.originals[index];
+      };
+      await f.journal.transitionCheckpoint({
+        checkpoint: parseRunnerCheckpoint({
+          ...f.journal.checkpoint,
+          version: 1,
+          phase: "archived",
+          pdfIndex: index,
+          step: "lookup_original",
+          receiptChecked: true,
+          originalCatalogId: f.originals[index].originalCatalogId,
+          expectedOriginalRevision: 1,
+          processingCatalogId: f.processing.processingCatalogId,
+          expectedProcessingRevision: 1,
+          reservationRound: 0,
+          archivedPublished: 0,
+        }),
+        credentialSessionActive: true,
+      });
+      await f.runner.driveArchivedLookupOriginal();
+    }
+    // One document repaired, the other two parked rather than swept along.
+    assert.deepEqual(
+      f.cleared.map((entry) => entry.subject),
+      ["parser_output", "original_bytes"],
+    );
+    assert.deepEqual(
+      f.parked.map((entry) => entry.code),
+      [
+        "receipt_clear_refused_by_safety_limit",
+        "receipt_clear_refused_by_safety_limit",
+      ],
+    );
+    const summarized = f.runner.withParked({ state: "complete", scanned: 3 });
+    assert.equal(summarized.operatorClears, 1);
+  } finally {
+    await f.journal.close();
+    await rm(f.setup.base, { recursive: true, force: true });
+  }
+});
+
+test("an operator clear pass that cannot ask the server clears nothing", async () => {
+  // A refused or unanswered lookup is not a not-found answer. Neither shape
+  // may retire a receipt, whoever started the pass.
+  for (const respond of [
+    async () => ({ error: { code: "source_unavailable" } }),
+    async () => {
+      throw new Error("timed out");
+    },
+  ]) {
+    const f = await voidBackendFixture(2);
+    f.runner.options = { retryParked: true, operatorClear: true, maxClears: 5 };
+    f.runner.transport = { call: respond };
+    try {
+      await f.runner.driveArchivedLookupOriginal().catch(() => undefined);
+      assert.deepEqual(f.cleared, []);
+      assert.deepEqual(f.parked, []);
+      assert.equal(
+        f.runner.withParked({ state: "complete" }).operatorClears,
+        undefined,
+      );
+    } finally {
+      await f.journal.close();
+      await rm(f.setup.base, { recursive: true, force: true });
+    }
   }
 });
 
@@ -4278,7 +4367,7 @@ test("the operator route still refuses what no route may repair", async () => {
     },
   ]) {
     const f = await voidBackendFixture(2);
-    f.runner.options = { retryParked: true, operatorClear: true };
+    f.runner.options = { retryParked: true, operatorClear: true, maxClears: 5 };
     mutate(f);
     try {
       await f.runner.driveArchivedLookupOriginal();

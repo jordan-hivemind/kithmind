@@ -36,7 +36,9 @@ export type ReceiptClearRefusal =
   /** Automatic only: no receipt this worker knows is good can be asked about. */
   | "positive_control_unavailable"
   /** Automatic only: the server does not know a receipt that should be good. */
-  | "positive_control_failed";
+  | "positive_control_failed"
+  /** Operator only: `--max-clears` is spent for this pass. */
+  | "operator_clear_limit";
 
 /**
  * P2-31f, second review. There is no read this worker can make, mid pass, that
