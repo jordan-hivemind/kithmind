@@ -19,12 +19,14 @@ import test from "node:test";
 import { Journal, JournalLockedError } from "../dist/journal.js";
 import {
   ADMISSION_BLOCK_CODES,
+  admissionBlockEscalated,
   ArchiveCatalogError,
   MAX_ADMISSION_BLOCK_ATTEMPTS,
   openArchiveCatalog,
 } from "../dist/archiveCatalog.js";
 import { digestArchiveIntent } from "../dist/archivedRequestMapping.js";
 import {
+  archivedCheckpointIdentity,
   initialCheckpoint,
   journalCodec,
   PipelineRunner,
@@ -2756,22 +2758,30 @@ function admissionCatalog(read, write) {
         }),
       );
       const { cloud, ...withoutCloud } = row;
-      // The real catalog writes the note once and bumps the revision only when
-      // the row actually changed, so a repeat call is free.
-      const changed =
+      // P2-31f: the real catalog appends a note whenever the row still held a
+      // receipt, and bumps the revision only when the row actually changed, so
+      // a repeat call on an already cleared row is free.
+      const held =
         cloud !== undefined ||
-        row.receiptReconcile === undefined ||
         Object.values(row.copies).some((copy) => copy.cloudReceipt);
+      const changed = held || row.receiptReconcile === undefined;
       write({
         ...rows,
         [key]: {
           ...withoutCloud,
           copies,
           rowRevision: row.rowRevision + (changed ? 1 : 0),
-          receiptReconcile: row.receiptReconcile ?? {
-            code: "original_receipt_unknown_to_server",
-            clearedAt: args.clearedAt,
-          },
+          receiptReconcile:
+            !held && row.receiptReconcile !== undefined
+              ? row.receiptReconcile
+              : [
+                  ...(row.receiptReconcile ?? []),
+                  {
+                    code: "original_receipt_unknown_to_server",
+                    clearedAt: args.clearedAt,
+                    ...(args.by === undefined ? {} : { by: args.by }),
+                  },
+                ],
         },
       });
       return read()[key];
@@ -2939,10 +2949,13 @@ test("an operator reconcile clears a void receipt and the next pass admits exact
       rows.processing.copies.independent_backup.cloudReceipt,
       undefined,
     );
-    assert.equal(
-      rows.original.receiptReconcile.code,
-      "original_receipt_unknown_to_server",
-    );
+    assert.deepEqual(rows.original.receiptReconcile, [
+      {
+        code: "original_receipt_unknown_to_server",
+        clearedAt: rows.original.receiptReconcile[0].clearedAt,
+        by: "operator",
+      },
+    ]);
     // The bytes stay archived. Only the server-side receipt was void.
     assert.deepEqual(rows.original.copies.primary.published, before.published);
     assert.deepEqual(rows.original.providerOriginal.locator, before.locator);
@@ -3726,6 +3739,7 @@ test("a parked document is offered again only when its revision, the build, or a
       "original_receipt_unknown_to_server",
       "provider_original_reference_already_bound",
       "provider_verification_stale_review_required",
+      "receipt_clear_refused_by_safety_limit",
     ]);
     await runner.parkPlan(plan, "original_receipt_revision_conflict");
     const parkedWith = original.admissionBlock.runnerCapability;
@@ -3856,6 +3870,384 @@ test("a global failure still fails the pass, and a parkable code never parks ove
     assert.equal(wedging.result.state, "failed");
     assert.deepEqual(wedging.parked, []);
   } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+/** The catalog requires the two roles to be separated in every dimension. */
+function distinctCopy(copy) {
+  return {
+    ...copy,
+    archiveIdentityFingerprint: "b".repeat(64),
+    recipientFingerprint: "c".repeat(64),
+    repositoryKeyDomainFingerprint: "d".repeat(64),
+    storageFailureDomainFingerprint: "e".repeat(64),
+  };
+}
+
+/**
+ * P2-31f. The circuit breaker on the automatic receipt clear. A catalog of
+ * `count` in-flight originals, a server that answers not found to every one of
+ * them, and the pass resumed on the first.
+ */
+async function voidBackendFixture(count) {
+  const setup = await fixture(0);
+  const plans = Array.from({ length: count }, (_, index) =>
+    pdfPlan({
+      discoveryState: "unchanged",
+      relativePath: `document-${index}.pdf`,
+      sha256: `${index}`.repeat(64),
+    }),
+  );
+  const checkpoint = parseRunnerCheckpoint({
+    ...archivedCheckpoint(plans[0], {
+      step: "lookup_original",
+      preflightAction: undefined,
+      receiptChecked: true,
+    }),
+    files: plans,
+  });
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  const sent = [];
+  const runner = new PipelineRunner(setup.config, journal, {
+    async call(request) {
+      sent.push(request.operation);
+      return lookupResponse(false);
+    },
+  });
+  // Every original is admitted against the backend that no longer answers.
+  const originals = plans.map((plan, index) => {
+    const row = familyOriginal(
+      plan,
+      index === 0 ? checkpoint.originalCatalogId : randomUUID(),
+      "revision-from-the-other-backend",
+    );
+    row.origin.sha256 = plan.sha256;
+    row.origin.byteLength = plan.byteLength;
+    return row;
+  });
+  const processing = {
+    processingCatalogId: checkpoint.processingCatalogId,
+    originalCatalogId: originals[0].originalCatalogId,
+    rowRevision: 1,
+    copies: {
+      primary: archiveCopy("primary"),
+      independent_backup: archiveCopy("independent_backup"),
+    },
+  };
+  const processings = [processing];
+  const cleared = [];
+  const parked = [];
+  runner.archivedRows = () => ({ original: originals[0], processing });
+  runner.archiveCatalog = {
+    listOriginals: () => originals,
+    listProcessings: () => processings,
+    findOriginalExact: (probe) =>
+      originals.find((row) => row.origin.sha256 === probe.sha256),
+    async clearVoidAdmission(args) {
+      cleared.push(args);
+      const row =
+        args.subject === "original_bytes" ? originals[0] : processing;
+      delete row.cloud;
+      row.receiptReconcile = [
+        ...(row.receiptReconcile ?? []),
+        {
+          code: "original_receipt_unknown_to_server",
+          clearedAt: args.clearedAt,
+          by: args.by,
+        },
+      ];
+      row.rowRevision += 1;
+      return row;
+    },
+    async recordAdmissionBlock(args) {
+      parked.push(args);
+      originals[0].rowRevision += 1;
+      originals[0].admissionBlock = {
+        code: args.code,
+        blockedAt: args.now,
+        runnerCapability: args.runnerCapability,
+        attempts: 1,
+      };
+      return originals[0];
+    },
+  };
+  return {
+    setup,
+    journal,
+    runner,
+    originals,
+    processing,
+    processings,
+    cleared,
+    parked,
+    sent,
+  };
+}
+
+test("a backend that has lost every receipt clears nothing and parks on the safety limit", async () => {
+  // The 2026-09-18 failure, but worse: three originals in flight and a server
+  // that answers not found to all of them. The operator's dry-run count is
+  // what used to stand between that and three re-admissions on the wrong
+  // backend, and a pass does not read counts. The positive control does.
+  const f = await voidBackendFixture(3);
+  try {
+    await f.runner.driveArchivedLookupOriginal();
+    assert.deepEqual(f.cleared, [], "not one receipt is retired");
+    assert.deepEqual(
+      f.parked.map((entry) => entry.code),
+      ["receipt_clear_refused_by_safety_limit"],
+    );
+    assert.equal(f.journal.pending, undefined, "the answer is settled");
+    // The item's own lookup, then the control on a sibling that should have
+    // been found. Both read-only, neither spends a discovery attempt.
+    assert.deepEqual(f.sent, [
+      "discovery.lookupArchivedAdmission",
+      "discovery.lookupArchivedAdmission",
+    ]);
+  } finally {
+    await f.journal.close();
+    await rm(f.setup.base, { recursive: true, force: true });
+  }
+});
+
+test("the automatic clear refuses a second time on the same row, a recent clear elsewhere, and a live sibling", async () => {
+  for (const [name, mutate, expected] of [
+    [
+      "already cleared once",
+      (f) => {
+        f.originals[0].receiptReconcile = [
+          {
+            code: "original_receipt_unknown_to_server",
+            clearedAt: Date.now() - 400 * 60 * 60_000,
+            by: "pass",
+          },
+        ];
+      },
+      "original_receipt_unknown_to_server",
+    ],
+    [
+      "another row cleared today",
+      (f) => {
+        f.originals[1].receiptReconcile = [
+          {
+            code: "original_receipt_unknown_to_server",
+            clearedAt: Date.now() - 60_000,
+            by: "pass",
+          },
+        ];
+      },
+      "receipt_clear_refused_by_safety_limit",
+    ],
+    [
+      "a sibling processing row is activated",
+      (f) => {
+        f.processings.push({
+          processingCatalogId: randomUUID(),
+          originalCatalogId: f.originals[0].originalCatalogId,
+          rowRevision: 1,
+          activation: { state: "ready" },
+        });
+      },
+      "original_receipt_unknown_to_server",
+    ],
+    [
+      "this processing row is activated",
+      (f) => {
+        f.processing.activation = { state: "ready" };
+      },
+      "original_receipt_unknown_to_server",
+    ],
+    [
+      "a processing receipt names another revision",
+      (f) => {
+        f.processing.cloud = { sourceRevisionId: "some-other-revision" };
+      },
+      "original_receipt_unknown_to_server",
+    ],
+  ]) {
+    const f = await voidBackendFixture(2);
+    mutate(f);
+    try {
+      await f.runner.driveArchivedLookupOriginal();
+      assert.deepEqual(f.cleared, [], `${name}: nothing is cleared`);
+      assert.deepEqual(
+        f.parked.map((entry) => entry.code),
+        [expected],
+        name,
+      );
+    } finally {
+      await f.journal.close();
+      await rm(f.setup.base, { recursive: true, force: true });
+    }
+  }
+});
+
+test("the automatic clear proceeds when the server still knows a receipt this worker knows is good", async () => {
+  const f = await voidBackendFixture(2);
+  let asked = 0;
+  // The one real misrouting: this original's receipt is void, and the sibling
+  // the control asks about is confirmed, so the backend is the right one.
+  f.runner.transport = {
+    async call(request) {
+      f.sent.push(request.operation);
+      asked += 1;
+      return lookupResponse(asked > 1);
+    },
+  };
+  try {
+    await f.runner.driveArchivedLookupOriginal();
+    assert.deepEqual(
+      f.cleared.map((entry) => `${entry.subject}:${entry.by}`),
+      ["parser_output:pass", "original_bytes:pass"],
+    );
+    assert.deepEqual(f.parked, []);
+    assert.equal(f.journal.checkpoint.step, "capture");
+    assert.equal(f.journal.pending, undefined);
+  } finally {
+    await f.journal.close();
+    await rm(f.setup.base, { recursive: true, force: true });
+  }
+});
+
+test("parking through the real catalog counts attempts across codes and escalates at the cap", async () => {
+  const setup = await fixture(0);
+  const plan = pdfPlan({ discoveryState: "unchanged" });
+  const journal = await openJournal(
+    setup.journalDir,
+    reconcileCheckpoint(plan),
+  );
+  const runner = new PipelineRunner(setup.config, journal, {
+    async call() {
+      throw new Error("parking asks the server nothing");
+    },
+  });
+  const catalog = await openArchiveCatalog({ journal });
+  runner.archiveCatalog = catalog;
+  try {
+    const original = await catalog.createOriginalIntent({
+      originalCatalogId: randomUUID(),
+      sourceExternalId: plan.externalId,
+      origin: {
+        scanId: "scan-1",
+        observationEpoch: plan.observationEpoch,
+        sha256: plan.sha256,
+        byteLength: plan.byteLength,
+        mediaType: "application/pdf",
+      },
+      copies: {
+        primary: archiveCopy("primary"),
+        independent_backup: distinctCopy(archiveCopy("independent_backup")),
+      },
+      createdAt: 1,
+    });
+    assert.equal(original.admissionBlock, undefined);
+    // Alternating codes used to reset the count, so the document retried every
+    // six hours for ever and never reached the cap.
+    const codes = [
+      "catalog_conflict",
+      "provider_verification_stale_review_required",
+      "catalog_conflict",
+    ];
+    for (const [index, code] of codes.entries()) {
+      await runner.parkPlan(plan, code);
+      const [row] = catalog.listOriginals();
+      assert.equal(row.admissionBlock.code, code);
+      assert.equal(row.admissionBlock.attempts, index + 1);
+    }
+    const [row] = catalog.listOriginals();
+    assert.equal(row.admissionBlock.attempts, MAX_ADMISSION_BLOCK_ATTEMPTS);
+    assert.equal(admissionBlockEscalated(row.admissionBlock), true);
+    // Escalated, so the retry window no longer releases it.
+    assert.equal(await runner.pdfNeedsArchivedWork(plan), false);
+    // A code that never recovers escalates on its first park instead.
+    assert.equal(
+      admissionBlockEscalated({
+        code: "original_receipt_revision_conflict",
+        attempts: 1,
+      }),
+      true,
+    );
+    assert.equal(
+      admissionBlockEscalated({ code: "catalog_conflict", attempts: 1 }),
+      false,
+    );
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a reconcile still drains a lookup left answered and pending by an older build", async () => {
+  // P2-31c's wedge: the throw happened inside the journaled transition, so the
+  // answered lookup stayed unresolved and every later pass replayed it into
+  // the same throw. This build repairs the state before it can happen, but a
+  // journal written by the build that could is exactly what an operator
+  // upgrading arrives with, so the command must still drain it.
+  const setup = await fixture(0);
+  const plan = pdfPlan();
+  const checkpoint = archivedCheckpoint(plan, {
+    step: "lookup_original",
+    preflightAction: undefined,
+    receiptChecked: true,
+  });
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  let rows = voidReceiptRows(checkpoint, Date.now() - 120 * 60_000);
+  const catalog = admissionCatalog(
+    () => rows,
+    (next) => (rows = next),
+  );
+  const sent = [];
+  const transport = {
+    async call(request) {
+      sent.push(request.operation);
+      throw new Error("the recorded answer is reused");
+    },
+  };
+  // The exact leftover: the request recorded, the server's not-found answer
+  // recorded with it, and no checkpoint move.
+  const requestId = randomUUID();
+  await journal.planRequest({
+    operation: "discovery.lookupArchivedAdmission",
+    requestId,
+    requestBody: JSON.stringify({
+      protocolVersion: 1,
+      operation: "discovery.lookupArchivedAdmission",
+      spaceId: setup.config.spaceId,
+      sourceAccountId: setup.config.sourceAccountId,
+      requestId,
+      identity: archivedCheckpointIdentity(checkpoint),
+      lookup: { mode: "original" },
+    }),
+    createdAt: Date.now(),
+  });
+  await journal.recordValidatedResult(lookupResponse(false), Date.now());
+  try {
+    assert.equal(
+      journal.pending.operation,
+      "discovery.lookupArchivedAdmission",
+    );
+    const result = await runReconcileReceipts({
+      config: setup.config,
+      journal,
+      catalog,
+      transport,
+      apply: true,
+    });
+    assert.equal(result.state, "reconciled");
+    assert.equal(result.receiptsUnknown, 1);
+    assert.deepEqual(sent, [], "the recorded answer stands in for the call");
+    assert.equal(rows.original.cloud, undefined);
+    assert.deepEqual(
+      rows.original.receiptReconcile.map((note) => note.by),
+      ["operator"],
+    );
+    // The checkpoint is left alone: a transition refuses while a request is
+    // unresolved, and the pending replay makes the same move by itself.
+    assert.equal(journal.checkpoint.step, "lookup_original");
+    assert.notEqual(journal.pending, undefined);
+  } finally {
+    await journal.close();
     await rm(setup.base, { recursive: true, force: true });
   }
 });
@@ -4114,9 +4506,9 @@ test("a receipt the server does not know is named for what it is, not as a provi
     assert.equal(journal.pending, undefined);
     assert.equal(current.original.cloud, undefined);
     assert.equal(current.original.copies.primary.cloudReceipt, undefined);
-    assert.equal(
-      current.original.receiptReconcile.code,
-      "original_receipt_unknown_to_server",
+    assert.deepEqual(
+      current.original.receiptReconcile.map((note) => note.by),
+      ["pass"],
     );
     assert.equal(current.original.admissionBlock, undefined);
   } finally {

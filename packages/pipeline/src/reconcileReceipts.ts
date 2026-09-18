@@ -7,6 +7,7 @@ import {
   requireCredential,
 } from "./config.js";
 import { Journal, JournalLockedError } from "./journal.js";
+import { receiptClearRowRefusal } from "./receiptClearSafety.js";
 import type { JsonValue } from "./journalTypes.js";
 import {
   archivedCheckpointIdentity,
@@ -33,6 +34,8 @@ export type ReconcileRefusalCode =
   | "checkpoint_plan_missing"
   | "processing_receipt_conflict"
   | "processing_already_activated"
+  /** P2-31f: another processing row of the same original is activated. */
+  | "sibling_processing_activated"
   | "lookup_refused"
   | "lookup_invalid";
 
@@ -184,7 +187,8 @@ export async function runReconcileReceipts(input: {
   // the original's note is what marks the pair done. A rerun that finds the
   // note without a receipt is finishing an interrupted checkpoint move, so it
   // asks the server nothing and repeats two no-op catalog writes.
-  const resuming = !original.cloud && original.receiptReconcile !== undefined;
+  const resuming =
+    !original.cloud && (original.receiptReconcile?.length ?? 0) > 0;
   let receiptsChecked = 0;
   let receiptsUnknown = 0;
   if (original.cloud) {
@@ -221,24 +225,24 @@ export async function runReconcileReceipts(input: {
   } else if (!resuming) {
     return { ...base, state: "clean" };
   }
-  // The receipt is void from here on, so both refusals below apply to the dry
+  // The receipt is void from here on, so the refusals below apply to the dry
   // run as well: an operator reading a count must see what `--apply` would hit.
   //
-  // An activated processing row means a generation is live server side under
-  // this admission. Retiring its receipt would leave that generation with no
-  // local record of the admission it came from, which this command cannot
-  // repair and P2-31's multi-reference work must.
-  if (processing.activation) return refuse("processing_already_activated");
-  // One `discovery.admitArchived` commits both legs, so a processing receipt
-  // naming the same revision is void with the original's. One naming a
-  // different revision is a shape nothing in this pipeline produces, and
-  // guessing at it would retire a receipt that may be real.
-  if (
-    original.cloud &&
-    processing.cloud &&
-    processing.cloud.sourceRevisionId !== original.cloud.sourceRevisionId
-  )
-    return refuse("processing_receipt_conflict");
+  // P2-31f moved these conditions into `receiptClearRowRefusal`, shared with
+  // the pass that now makes the same clear for itself, so the two routes
+  // cannot drift. That move also fixed a hole both copies had: the checks
+  // looked only at the checkpoint's own processing row, so a sibling row of
+  // the same original could be live server side while its receipt was retired
+  // underneath it. The circuit breakers on top of these are the automatic
+  // route's alone: an operator here has read the counts and decided.
+  const rowRefusal = receiptClearRowRefusal({
+    original,
+    processing,
+    processings: input.catalog.listProcessings(),
+  });
+  // Only the row conditions reach this command; the automatic-route limits are
+  // never evaluated here, so their codes cannot appear.
+  if (rowRefusal) return refuse(rowRefusal as ReconcileRefusalCode);
   const found = { ...base, receiptsChecked, receiptsUnknown };
   if (!input.apply)
     return {
@@ -258,12 +262,14 @@ export async function runReconcileReceipts(input: {
     catalogId: processing.processingCatalogId,
     expectedRevision: processing.rowRevision,
     clearedAt,
+    by: "operator",
   });
   const nextOriginal = await input.catalog.clearVoidAdmission({
     subject: "original_bytes",
     catalogId: original.originalCatalogId,
     expectedRevision: original.rowRevision,
     clearedAt,
+    by: "operator",
   });
   // Back to the read-only lookup with the question unasked, the dead lease
   // dropped, and both expected revisions in step with what was just written.

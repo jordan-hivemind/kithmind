@@ -149,7 +149,7 @@ test("fresh scoped setup is operationally ready before coverage exists", async (
   );
 
   assert.equal(result.state, "ready");
-  assert.equal(result.version, 2);
+  assert.equal(result.version, 3);
   assert.deepEqual(
     result.checks.map(({ id, state }) => [id, state]),
     [

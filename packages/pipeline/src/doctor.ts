@@ -126,17 +126,24 @@ export type HeartbeatCheck = {
 };
 
 /**
- * P2-31f. Documents the archived pass parked on a per-item condition. `warn`,
- * never `fail`: the pass itself is healthy and every other file went through,
- * but a parked document stays parked until something changes, so it must not
- * be invisible either. Counts and closed-enum codes only, with no names, paths
- * or content.
+ * P2-31f. Documents the archived pass parked on a per-item condition, split by
+ * whether anything will free them.
+ *
+ * `items_parked` is `warn`: every one of them is inside its automatic retry
+ * budget, the worker is healthy and every other file is being filed.
+ * `items_escalated` is `fail`: a code with no automatic recovery, or retries
+ * already spent, so the document waits for a person however long nobody looks.
+ * `not_checked` is `warn` and means the catalog is there and could not be
+ * read, which is not the same as nothing being parked.
+ *
+ * Counts and closed-enum codes only, with no names, paths or content.
  */
 export type ArchiveCheck = {
   id: "archive";
   state: CheckState;
-  code: "none_parked" | "items_parked" | "not_checked";
+  code: "none_parked" | "items_parked" | "items_escalated" | "not_checked";
   parked?: number;
+  parkedEscalated?: number;
   parkedCodes?: AdmissionBlockCode[];
   parkedOldestAgeMs?: number;
 };
@@ -160,6 +167,12 @@ export const PARKED_ITEM_GUIDANCE: Record<
   AdmissionBlockCode,
   { means: string; action: string }
 > = {
+  receipt_clear_refused_by_safety_limit: {
+    means:
+      "A filing receipt looked wrong, and this computer stopped rather than repair it, because the server may be the thing that is wrong.",
+    action:
+      "Report this one before anything else. Check that the server is the right deployment and still holds this account's earlier documents.",
+  },
   archive_catalog_revision_conflict: {
     means:
       "One document's local records disagree about which version of it was published.",
@@ -228,7 +241,7 @@ export type DoctorSource = {
 };
 
 export type DoctorResult = {
-  version: 2;
+  version: 3;
   state: State;
   checks: [
     ConfigCheck,
@@ -314,7 +327,7 @@ function result(
   source = unavailableSource(),
 ): DoctorResult {
   return {
-    version: 2,
+    version: 3,
     state: resultState(checks),
     checks,
     source,
@@ -337,13 +350,17 @@ export function invalidConfigDoctorResult(): DoctorResult {
 /** P2-31f. Reads parked items from the catalog without taking the lock. */
 async function archiveCheck(config: PipelineConfig): Promise<ArchiveCheck> {
   const summary = await inspectParkedItems(config.journalDir);
+  if (!summary.readable)
+    return { id: "archive", state: "warn", code: "not_checked" };
   if (summary.parked === 0)
     return { id: "archive", state: "pass", code: "none_parked" };
+  const escalated = summary.escalated;
   return {
     id: "archive",
-    state: "warn",
-    code: "items_parked",
+    state: escalated > 0 ? "fail" : "warn",
+    code: escalated > 0 ? "items_escalated" : "items_parked",
     parked: summary.parked,
+    parkedEscalated: escalated,
     parkedCodes: summary.codes,
     ...(summary.oldestBlockedAt === undefined
       ? {}
@@ -980,13 +997,14 @@ export async function doctorFromPath(
  * nothing is parked.
  */
 function parkedLines(check: ArchiveCheck): string[] {
-  if (check.code !== "items_parked") return [];
+  if (check.code !== "items_parked" && check.code !== "items_escalated")
+    return [];
   const hours =
     check.parkedOldestAgeMs === undefined
       ? "unknown"
       : `${Math.floor(check.parkedOldestAgeMs / 3_600_000)}h`;
   return [
-    `parked items: ${check.parked} (oldest ${hours})`,
+    `parked items: ${check.parked} (${check.parkedEscalated ?? 0} need attention, oldest ${hours})`,
     ...(check.parkedCodes ?? []).map(
       (code) =>
         `  ${code}: ${PARKED_ITEM_GUIDANCE[code].means} ${PARKED_ITEM_GUIDANCE[code].action}`,

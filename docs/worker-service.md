@@ -372,15 +372,45 @@ on their own before anyone is asked to look.
 | Code | What it means | Automatic recovery |
 | ---- | ------------- | ------------------ |
 | `provider_verification_stale_review_required` | The proof that the document matches its cloud copy expired. | Refreshed in place on a never-admitted original. Parks only if the refresh still yields a stale proof, or if the original is already admitted, which needs P2-31. |
-| `original_receipt_unknown_to_server` | The document has a filing receipt the server has no record of. | Repaired in the pass by the `reconcile-receipts` logic. Parks when the processing row is activated or a processing receipt names another revision, because retiring the receipt then cannot be undone. |
+| `original_receipt_unknown_to_server` | The document has a filing receipt the server has no record of. | Repaired in the pass by the `reconcile-receipts` logic, subject to the safety limits below. Parks when this document's own state forbids the repair: its processing row or a sibling row is activated, a processing receipt names another revision, or its receipt has been cleared once before. |
 | `catalog_conflict` | The document changed on disk while it was being filed. | None needed. The bounded retry clears it once the file stops changing. |
 | `original_receipt_revision_conflict` | The server and this computer disagree about which version was accepted. | None. Choosing a version could file the wrong document, so a person decides. |
 | `archive_catalog_revision_conflict` | The document's local records disagree about which version was published. | None. Picking one risks the wrong generation, so a person decides. |
 | `provider_original_reference_already_bound` | The document is already filed under a reference the server will not accept twice. | None. Admitting against an existing reference has no protocol shape yet; this is P2-31. |
+| `receipt_clear_refused_by_safety_limit` | A receipt looked wrong and the pass stopped rather than repair it, because the server itself may be wrong. | None, deliberately. Check the deployment first. |
 
 No condition that means the whole run is in trouble is ever parked. Credential,
 journal, archive repository, server unavailable, rate limit and scan conflict
 failures still end the pass.
+
+### Safety limits on the automatic receipt repair
+
+Retiring a filing receipt is the one repair a pass makes that cannot be undone,
+and the failure it repairs -- a server that has never heard of a document this
+computer believes it filed -- looks from one document exactly like a server
+that has lost everything. The operator command has a person reading the counts
+first. The automatic route has these limits instead, and refuses with
+`receipt_clear_refused_by_safety_limit` unless all of them hold:
+
+- the document's receipt has never been cleared before, at most one automatic
+  repair per document ever;
+- no other document was repaired in the last 24 hours, at most one per day;
+- the server can still confirm a receipt this computer knows is good. The pass
+  asks the same read-only question about a different file in the same scan that
+  the catalog also records as filed. A `found` answer proves this is the right
+  server. A `not found` answer, an error, or no other file to ask about all
+  refuse.
+
+A repair a pass makes and one an operator asks for are both appended to the
+document's own record, so a second one is visible rather than silent.
+
+### Documents that need attention
+
+A parked document is `escalated` when its code has no automatic recovery, or
+when its retries are spent. A pass carrying one ends `incomplete` with code
+`items_need_attention` and a nonzero exit, so it does not read as a clean
+`complete`. Documents still inside their retry budget are counted and leave the
+pass as it was.
 
 A parked document is offered to the pass again when any of these happens, in
 order of how often they do:
@@ -401,20 +431,21 @@ document is parked, and none of the three when none is. A watcher writes one
 result object per pass, so its log is the durable record:
 
 ```json
-{"state":"complete","scanned":42,"published":41,"parked":1,"parkedCodes":["original_receipt_revision_conflict"],"parkedOldestAgeMs":93600000}
+{"state":"incomplete","code":"items_need_attention","scanned":42,"published":41,"parked":1,"parkedEscalated":1,"parkedCodes":["original_receipt_revision_conflict"],"parkedOldestAgeMs":93600000}
 ```
 
 `doctor` reports the same thing without taking the journal lock, so it works
 while the watcher runs. The report carries a seventh check, `archive`, whose
-code is `none_parked`, `items_parked` or `not_checked`. `items_parked` is
-`warn`, which makes the whole report `degraded` and never `blocked`: the worker
-is healthy and every other file is being filed. The check carries `parked`,
-`parkedCodes` and `parkedOldestAgeMs`, and the text output adds one line per
-code saying what it means and what to do. Counts and codes only: no file name,
-no path and nothing a document contains ever appears in a result or a report.
+code is `none_parked`, `items_parked`, `items_escalated` or `not_checked`. The
+check carries `parked`, `parkedEscalated`, `parkedCodes` and
+`parkedOldestAgeMs`, and the text output adds one line per code saying what it
+means and what to do. See `worker-doctor.md` for the readiness each code
+implies. Counts and codes only: no file name, no path and nothing a document
+contains ever appears in a result or a report.
 
-Alert on `parked` above zero, or on `parkedOldestAgeMs` past a threshold. A
-document whose code has no automatic recovery is the one to report.
+Alert on `parkedEscalated` above zero, and on `parkedOldestAgeMs` past a
+threshold. A `receipt_clear_refused_by_safety_limit` is the one to look at
+first: it says this computer suspects the server rather than the document.
 
 To retry everything that is parked, stop the watcher, run one pass with the
 flag, and start it again:

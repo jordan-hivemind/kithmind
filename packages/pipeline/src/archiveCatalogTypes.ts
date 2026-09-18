@@ -87,14 +87,19 @@ export type ArchiveCopyRecord = ArchiveCopyIntent & {
 };
 
 /**
- * P2-31d. Records that an operator cleared an admission receipt the
- * authoritative server does not hold, so a row left looking never admitted can
- * still be told apart from one that never was. It carries no ids: the receipt
- * it replaces named a deployment that no longer serves this account.
+ * P2-31d. Records that an admission receipt the authoritative server does not
+ * hold was cleared, so a row left looking never admitted can still be told
+ * apart from one that never was. It carries no ids: the receipt it replaces
+ * named a deployment that no longer serves this account.
+ *
+ * P2-31f: `by` separates a clear a pass made for itself from one an operator
+ * asked for, because the safety limits on the automatic route read these notes
+ * back. A note without it was written before the distinction existed.
  */
 export type ReceiptReconcileNote = {
   code: "original_receipt_unknown_to_server";
   clearedAt: number;
+  by?: "pass" | "operator";
 };
 
 /**
@@ -104,8 +109,9 @@ export type ReceiptReconcileNote = {
  *
  * `runnerCapability` fingerprints the parking build's handling of these codes,
  * so a build that handles one differently releases every marker it meets
- * automatically. `attempts` bounds the automatic retries the runner paces;
- * past the bound the item waits for new bytes, a new build, or an operator.
+ * automatically. `attempts` counts every automatic retry this row has spent,
+ * across codes rather than per code, so a document that alternates between two
+ * conditions still reaches the cap instead of retrying forever.
  */
 export type AdmissionBlock = {
   code: AdmissionBlockCode;
@@ -121,6 +127,7 @@ export type AdmissionBlockCode =
   | "original_receipt_revision_conflict"
   | "original_receipt_unknown_to_server"
   | "provider_original_reference_already_bound"
+  | "receipt_clear_refused_by_safety_limit"
   | "provider_verification_stale_review_required";
 
 export type OriginalCatalogIdentity = {
@@ -164,7 +171,13 @@ export type OriginalCatalogRow = Omit<OriginalCatalogIdentity, "copies"> & {
         providerBindingEpoch: number;
       }
   );
-  receiptReconcile?: ReceiptReconcileNote;
+  /**
+   * P2-31f: every clear of this row's receipt, oldest first, rather than only
+   * the first one. A repeat clear used to leave no trace, which is exactly
+   * what the automatic route's safety limits have to be able to see. A legacy
+   * single note reads back as a one-element list.
+   */
+  receiptReconcile?: ReceiptReconcileNote[];
   /** P2-31f: set while this document is parked; absent means it is not. */
   admissionBlock?: AdmissionBlock;
   updatedAt: number;
@@ -290,7 +303,7 @@ export type ProcessingCatalogRow = Omit<ProcessingCatalogIdentity, "copies"> & {
     reused: boolean;
     previousGenerationId?: string;
   };
-  receiptReconcile?: ReceiptReconcileNote;
+  receiptReconcile?: ReceiptReconcileNote[];
   updatedAt: number;
 };
 

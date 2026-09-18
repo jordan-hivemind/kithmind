@@ -32,6 +32,7 @@ import type {
 } from "./archiveTypes.js";
 import {
   ADMISSION_BLOCK_CODES,
+  admissionBlockEscalated,
   ArchiveCatalogError,
   MAX_ADMISSION_BLOCK_ATTEMPTS,
   MAX_PARSE_ATTEMPTS,
@@ -48,6 +49,12 @@ import type {
   OriginalCatalogRow,
   ProcessingCatalogRow,
 } from "./archiveCatalogTypes.js";
+import {
+  automaticReceiptClearRefusal,
+  positiveControlRequired,
+  type PositiveControl,
+  type ReceiptClearRefusal,
+} from "./receiptClearSafety.js";
 import {
   createArchiveReceiptSelection,
   createParserArtifactSelection,
@@ -1480,7 +1487,14 @@ export class PipelineRunner {
         // caller may be inside a journaled transition, so this must not throw.
         const code = parkable(error);
         if (code === undefined) throw error;
-        await this.parkPlan(plan, code);
+        try {
+          await this.parkPlan(plan, code);
+        } catch {
+          // The marker could not be written, so the condition is unhandled.
+          // Raise what actually happened rather than the bookkeeping failure
+          // on top of it.
+          throw error;
+        }
         continue;
       }
       if (needsWork) return index;
@@ -3965,42 +3979,109 @@ export class PipelineRunner {
   }
 
   /**
-   * P2-31f. Retires an admission receipt the authoritative server says it does
-   * not hold, and returns the checkpoint that carries on to `capture`, or
-   * `undefined` when the receipt may not be retired without a person.
+   * P2-31f. The positive control on the automatic receipt clear: proof that
+   * the server this pass is talking to still knows a receipt this worker knows
+   * is good. Without it, a backend that has lost everything is indistinguishable
+   * from the one misrouted original this repairs, and the repair would retire
+   * every receipt in the catalog one pass at a time.
    *
-   * These are the conditions `runReconcileReceipts` (P2-31d) enforces, applied
-   * to the checkpoint's own original and nothing else, against the same
-   * read-only answer that command reuses. An activated processing row means a
-   * generation is live server side under this admission, and a processing
-   * receipt naming a different revision is a shape this pipeline does not
-   * produce: both stay parked because retiring the receipt could not be
-   * undone. Everything else is the state a misrouted admission leaves behind,
-   * and `clearVoidAdmission` is the write that command already makes.
+   * The control is the same read-only `discovery.lookupArchivedAdmission` the
+   * pass itself uses, asked about a different file. That is the strongest probe
+   * available: same operation, same authority, same backend, and a `found` for
+   * a receipt the catalog also holds is direct evidence rather than an
+   * inference from a count. It reserves nothing and spends no discovery
+   * attempt.
+   *
+   * It can only be addressed for a file in the current scan, because the
+   * lookup takes the whole archived work identity and only a scan plan carries
+   * one (the catalog row holds neither the parser fingerprints nor a live
+   * `scanId`). A catalog whose other admitted originals are all outside this
+   * scan therefore answers `unavailable`, which refuses: a probe that cannot be
+   * made is not a probe that passed. `source.status` counts were the
+   * alternative and are weaker -- they are absent before an assessment, they
+   * lag, and a count says nothing about this worker's own receipts.
+   *
+   * Never throws. It runs inside a journaled transition, where a throw would
+   * leave the answered request unresolved, so every failure is `"failed"`.
+   */
+  private async receiptPositiveControl(
+    checkpoint: ArchivedCheckpoint,
+  ): Promise<PositiveControl> {
+    const catalog = this.requireCatalog();
+    if (
+      !positiveControlRequired(
+        catalog.listOriginals(),
+        checkpoint.originalCatalogId ?? "",
+      )
+    )
+      return "ok";
+    for (const [index, plan] of checkpoint.files.entries()) {
+      if (index === checkpoint.pdfIndex || !isPdfPlan(plan)) continue;
+      const sibling = this.matchingOriginal(plan);
+      if (!sibling?.cloud) continue;
+      let identity: ArchivedWorkIdentity;
+      try {
+        identity = archivedIdentity(checkpoint, plan);
+      } catch {
+        continue;
+      }
+      try {
+        const response = await this.transport.call(
+          request(this.config, "discovery.lookupArchivedAdmission", {
+            requestId: randomUUID(),
+            identity,
+            lookup: { mode: "original" },
+          }),
+        );
+        const value = success(response);
+        if (!value || value.mode !== "original") return "failed";
+        return value.found === true ? "ok" : "failed";
+      } catch {
+        return "failed";
+      }
+    }
+    return "unavailable";
+  }
+
+  /**
+   * P2-31f. Retires an admission receipt the authoritative server says it does
+   * not hold, and returns the checkpoint that carries on to `capture`, or the
+   * refusal that says why it may not be retired without a person.
+   *
+   * `automaticReceiptClearRefusal` holds the conditions, shared with the
+   * `reconcile-receipts` command so the two routes cannot drift: the row
+   * conditions P2-31d proved, plus the three limits that make this safe to do
+   * unattended. Nothing here decides anything on its own.
    */
   private async selfHealVoidReceipt(
     checkpoint: ArchivedCheckpoint,
-  ): Promise<RunnerCheckpoint | undefined> {
+  ): Promise<RunnerCheckpoint | ReceiptClearRefusal> {
+    const catalog = this.requireCatalog();
     const { original, processing } = this.archivedRows(checkpoint);
-    if (!original.cloud) return undefined;
-    if (processing.activation) return undefined;
-    if (
-      processing.cloud &&
-      processing.cloud.sourceRevisionId !== original.cloud.sourceRevisionId
-    )
-      return undefined;
+    if (!original.cloud) return "already_reconciled";
+    const refusal = await automaticReceiptClearRefusal({
+      original,
+      processing,
+      processings: catalog.listProcessings(),
+      originals: catalog.listOriginals(),
+      now: Date.now(),
+      positiveControl: () => this.receiptPositiveControl(checkpoint),
+    });
+    if (refusal) return refusal;
     const clearedAt = Date.now();
-    const nextProcessing = (await this.requireCatalog().clearVoidAdmission({
+    const nextProcessing = (await catalog.clearVoidAdmission({
       subject: "parser_output",
       catalogId: processing.processingCatalogId,
       expectedRevision: processing.rowRevision,
       clearedAt,
+      by: "pass",
     })) as ProcessingCatalogRow;
-    const nextOriginal = (await this.requireCatalog().clearVoidAdmission({
+    const nextOriginal = (await catalog.clearVoidAdmission({
       subject: "original_bytes",
       catalogId: original.originalCatalogId,
       expectedRevision: original.rowRevision,
       clearedAt,
+      by: "pass",
     })) as OriginalCatalogRow;
     return archivedBase(checkpoint, {
       step: "capture",
@@ -4069,20 +4150,25 @@ export class PipelineRunner {
           //
           // P2-31f. P2-31d made clearing the receipt an operator command
           // because a pass that dropped `cloud` on a server's silence would
-          // re-admit anything a temporary misrouting touched. The narrow
-          // conditions that command enforces are what make the clear safe, and
-          // they are checkable right here, so the pass now runs the same
-          // logic itself (`selfHealVoidReceipt`) rather than throwing and
-          // waiting for a person to type the command. Outside those
-          // conditions the document is parked, not cleared.
+          // re-admit anything a temporary misrouting touched. The conditions
+          // that command enforces are checkable right here, so the pass runs
+          // them itself (`selfHealVoidReceipt`) rather than throwing and
+          // waiting for a person. What the command also had and a pass does
+          // not is the operator reading the dry-run counts first, so the
+          // automatic route carries its own limits. Outside any of them the
+          // document is parked, not cleared, and the code says which kind of
+          // refusal it was: this row needs a person, or stop, the backend
+          // itself may be wrong.
           if (this.archivedRows(current).original.cloud) {
             const healed = await this.selfHealVoidReceipt(current);
-            return (
-              healed ??
-              (await this.parkedCheckpoint(
-                current,
-                "original_receipt_unknown_to_server",
-              ))
+            if (typeof healed !== "string") return healed;
+            return await this.parkedCheckpoint(
+              current,
+              healed === "positive_control_failed" ||
+                healed === "positive_control_unavailable" ||
+                healed === "daily_clear_limit"
+                ? "receipt_clear_refused_by_safety_limit"
+                : "original_receipt_unknown_to_server",
             );
           }
           return archivedBase(current, { step: "capture", receiptChecked: true });
@@ -6263,16 +6349,23 @@ export class PipelineRunner {
           .flatMap((row) => (row.admissionBlock ? [row.admissionBlock] : []))
       : [];
     if (parked.length === 0) return result;
-    const now = Date.now();
-    return {
+    const escalated = parked.filter(admissionBlockEscalated).length;
+    const summarized: PipelineRunResult = {
       ...result,
       parked: parked.length,
+      parkedEscalated: escalated,
       parkedCodes: [...new Set(parked.map((block) => block.code))].sort(),
       parkedOldestAgeMs: Math.max(
         0,
-        now - Math.min(...parked.map((block) => block.blockedAt)),
+        Date.now() - Math.min(...parked.map((block) => block.blockedAt)),
       ),
     };
+    // A document nothing will free on its own must not leave the pass reading
+    // `complete` with a nonzero count buried in it, because that is what a
+    // monitor and an exit status both read. Documents still inside their retry
+    // budget are counted and leave the pass as it was.
+    if (escalated === 0 || summarized.state !== "complete") return summarized;
+    return { ...summarized, state: "incomplete", code: "items_need_attention" };
   }
 
   /**

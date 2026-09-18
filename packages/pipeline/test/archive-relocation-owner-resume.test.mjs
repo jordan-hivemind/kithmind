@@ -45,7 +45,7 @@ function observation(text = "unchanged synthetic note") {
 
 function doctorResult() {
   return {
-    version: 2,
+    version: 3,
     state: "degraded",
     checks: [
       { id: "config", state: "pass", code: "valid" },

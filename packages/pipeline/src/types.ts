@@ -168,6 +168,12 @@ export type PipelineRunResult = {
    * items": a monitor alerts on the count, the codes, or the age.
    */
   parked?: number;
+  /**
+   * Of those, the ones nothing will free on their own: a code with no
+   * automatic recovery, or retries already spent. Any at all ends the pass
+   * `incomplete` with code `items_need_attention`, and so with a nonzero exit.
+   */
+  parkedEscalated?: number;
   parkedCodes?: string[];
   parkedOldestAgeMs?: number;
 };

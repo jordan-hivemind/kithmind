@@ -76,9 +76,40 @@ export const ADMISSION_BLOCK_CODES: readonly AdmissionBlockCode[] = [
   "original_receipt_unknown_to_server",
   "provider_original_reference_already_bound",
   "provider_verification_stale_review_required",
+  "receipt_clear_refused_by_safety_limit",
 ];
 /** Bounded automatic retries of a parked item; see `AdmissionBlock`. */
 export const MAX_ADMISSION_BLOCK_ATTEMPTS = 3;
+/** Bounded clear history per row; see `receiptReconcile`. */
+const MAX_RECEIPT_RECONCILE_NOTES = 16;
+
+/**
+ * P2-31f. The parkable codes with no automatic recovery. A document parked on
+ * one of these will not free itself however long it waits, so it is escalated
+ * the moment it is parked rather than once its retries run out.
+ */
+const ESCALATE_ONLY_CODES: readonly AdmissionBlockCode[] = [
+  "archive_catalog_revision_conflict",
+  "original_receipt_revision_conflict",
+  "original_receipt_unknown_to_server",
+  "provider_original_reference_already_bound",
+  "receipt_clear_refused_by_safety_limit",
+];
+
+/**
+ * Whether a parked document needs a person: either its code has no automatic
+ * recovery, or it has spent every retry it was going to get. A pass carrying
+ * one of these does not read as plain `complete`, and `doctor` fails on it.
+ */
+export function admissionBlockEscalated(block: {
+  code: AdmissionBlockCode;
+  attempts: number;
+}): boolean {
+  return (
+    ESCALATE_ONLY_CODES.includes(block.code) ||
+    block.attempts >= MAX_ADMISSION_BLOCK_ATTEMPTS
+  );
+}
 const PARSER_FAILURE_CODE = /^[a-z_]{1,64}$/;
 const TEMP_FILE = /^\.archive-catalog\.json\.[0-9a-f-]{36}\.tmp$/;
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -845,13 +876,28 @@ function durableParserOutput(value: unknown): DurableParserOutput {
 
 function receiptReconcileNote(value: unknown): ReceiptReconcileNote {
   const note = object(value);
-  exact(note, ["code", "clearedAt"]);
+  exact(note, ["code", "clearedAt"], ["by"]);
   if (note.code !== "original_receipt_unknown_to_server")
+    fail("catalog_invalid");
+  if (note.by !== undefined && note.by !== "pass" && note.by !== "operator")
     fail("catalog_invalid");
   return {
     code: "original_receipt_unknown_to_server",
     clearedAt: integer(note.clearedAt),
+    ...(note.by === undefined ? {} : { by: note.by }),
   };
+}
+
+/**
+ * P2-31f. The clear history, oldest first. A catalog written before this read
+ * back one note rather than a list, so a bare object still parses as a
+ * one-element history instead of failing a live catalog closed.
+ */
+function receiptReconcileNotes(value: unknown): ReceiptReconcileNote[] {
+  const notes = Array.isArray(value) ? value : [value];
+  if (notes.length < 1 || notes.length > MAX_RECEIPT_RECONCILE_NOTES)
+    fail("catalog_invalid");
+  return notes.map(receiptReconcileNote);
 }
 
 function admissionBlock(value: unknown): AdmissionBlock {
@@ -936,7 +982,7 @@ function originalRow(value: unknown): OriginalCatalogRow {
           };
   }
   if (row.receiptReconcile !== undefined)
-    result.receiptReconcile = receiptReconcileNote(row.receiptReconcile);
+    result.receiptReconcile = receiptReconcileNotes(row.receiptReconcile);
   if (row.admissionBlock !== undefined)
     result.admissionBlock = admissionBlock(row.admissionBlock);
   return result;
@@ -1122,7 +1168,7 @@ function processingRow(value: unknown): ProcessingCatalogRow {
     };
   }
   if (row.receiptReconcile !== undefined)
-    result.receiptReconcile = receiptReconcileNote(row.receiptReconcile);
+    result.receiptReconcile = receiptReconcileNotes(row.receiptReconcile);
   return result;
 }
 
@@ -2270,9 +2316,12 @@ export class ArchiveCatalog {
       args.expectedRevision,
       (value) => {
         const row = value as OriginalCatalogRow;
+        // Counted across codes, not per code: a document that alternates
+        // between two conditions reset the count on every park and retried
+        // every six hours for good. Only a build that handles these codes
+        // differently starts the count over.
         const prior =
-          row.admissionBlock?.runnerCapability === args.runnerCapability &&
-          row.admissionBlock.code === args.code
+          row.admissionBlock?.runnerCapability === args.runnerCapability
             ? row.admissionBlock.attempts
             : 0;
         row.admissionBlock = admissionBlock({
@@ -2721,28 +2770,45 @@ export class ArchiveCatalog {
    * Everything that proves the bytes are archived stays: the prepared and
    * published objects, the restic backup, the provider locator and its proof,
    * the capture and the spool. Only the server-side receipt is void, and the
-   * note says so without naming the ids it replaces. The note is written once,
-   * so a repeat call is a no-op and does not bump the revision.
+   * note says so without naming the ids it replaces.
+   *
+   * P2-31f: every clear appends a note. The old single note was written with
+   * `??=`, so a second clear of the same row left no trace at all, and the
+   * automatic route's safety limits are built out of exactly that history.
+   * Appending only when the row still held a receipt keeps a repeat of the
+   * same clear a no-op, which is what the interrupted-move rerun relies on.
    */
   async clearVoidAdmission(args: {
     subject: ArchiveSubject;
     catalogId: string;
     expectedRevision: number;
     clearedAt: number;
+    by: "pass" | "operator";
   }): Promise<OriginalCatalogRow | ProcessingCatalogRow> {
     const note: ReceiptReconcileNote = {
       code: "original_receipt_unknown_to_server",
       clearedAt: integer(args.clearedAt),
+      // Spread rather than assigned: an explicit `undefined` is a key the
+      // snapshot normalizer refuses, not an absent one.
+      ...(args.by === undefined ? {} : { by: args.by }),
     };
     return await this.updateRow(
       args.subject,
       args.catalogId,
       args.expectedRevision,
       (row) => {
+        const held =
+          row.cloud !== undefined ||
+          (["primary", "independent_backup"] as const).some(
+            (role) => row.copies[role]?.cloudReceipt !== undefined,
+          );
         delete row.cloud;
         for (const role of ["primary", "independent_backup"] as const)
           delete row.copies[role]?.cloudReceipt;
-        row.receiptReconcile ??= note;
+        if (!held && row.receiptReconcile !== undefined) return;
+        row.receiptReconcile = [...(row.receiptReconcile ?? []), note].slice(
+          -MAX_RECEIPT_RECONCILE_NOTES,
+        );
       },
     );
   }
@@ -2935,22 +3001,33 @@ export async function openArchiveCatalog<
 }
 
 export type ParkedItemSummary = {
+  /** `false` when the catalog exists but could not be read or parsed. */
+  readable: boolean;
   parked: number;
+  /** Of those, the ones nothing will free on their own. */
+  escalated: number;
   codes: AdmissionBlockCode[];
   oldestBlockedAt?: number;
 };
 
 /**
  * P2-31f. Counts parked items without taking the journal lock, so `doctor` can
- * report them while the watcher holds the journal. Deliberately tolerant: a
- * missing, busy or unreadable catalog reads as nothing parked rather than
- * turning a report into a failure. Only closed-enum codes and timestamps are
+ * report them while the watcher holds the journal. A catalog that is not there
+ * yet is genuinely nothing parked; one that is there and cannot be read or
+ * parsed is `readable: false`, which the report says out loud rather than
+ * passing off as a clean count. Only closed-enum codes and timestamps are
  * read, so nothing here can carry a name or a path.
  */
 export async function inspectParkedItems(
   directory: string,
 ): Promise<ParkedItemSummary> {
-  const empty: ParkedItemSummary = { parked: 0, codes: [] };
+  const none: ParkedItemSummary = {
+    readable: true,
+    parked: 0,
+    escalated: 0,
+    codes: [],
+  };
+  const unreadable: ParkedItemSummary = { ...none, readable: false };
   let text: string;
   try {
     const handle = await open(
@@ -2959,32 +3036,44 @@ export async function inspectParkedItems(
     );
     try {
       const stats = await handle.stat();
-      if (!stats.isFile() || stats.size > MAX_CATALOG_BYTES) return empty;
+      if (!stats.isFile() || stats.size > MAX_CATALOG_BYTES) return unreadable;
       text = (await handle.readFile()).toString("utf8");
     } finally {
       await handle.close();
     }
-  } catch {
-    return empty;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT"
+      ? none
+      : unreadable;
   }
   let originals: unknown;
   try {
     originals = (JSON.parse(text) as { originals?: unknown }).originals;
   } catch {
-    return empty;
+    return unreadable;
   }
-  if (!Array.isArray(originals)) return empty;
+  if (!Array.isArray(originals)) return unreadable;
   const codes = new Set<AdmissionBlockCode>();
   let parked = 0;
+  let escalated = 0;
   let oldestBlockedAt: number | undefined;
   for (const row of originals) {
     const block = (row as { admissionBlock?: unknown }).admissionBlock as
-      | { code?: unknown; blockedAt?: unknown }
+      | { code?: unknown; blockedAt?: unknown; attempts?: unknown }
       | undefined;
     if (!block || !ADMISSION_BLOCK_CODES.includes(block.code as never))
       continue;
     parked += 1;
     codes.add(block.code as AdmissionBlockCode);
+    if (
+      admissionBlockEscalated({
+        code: block.code as AdmissionBlockCode,
+        attempts: Number.isSafeInteger(block.attempts)
+          ? (block.attempts as number)
+          : MAX_ADMISSION_BLOCK_ATTEMPTS,
+      })
+    )
+      escalated += 1;
     if (
       Number.isSafeInteger(block.blockedAt) &&
       (oldestBlockedAt === undefined ||
@@ -2993,7 +3082,9 @@ export async function inspectParkedItems(
       oldestBlockedAt = block.blockedAt as number;
   }
   return {
+    readable: true,
     parked,
+    escalated,
     codes: [...codes].sort(),
     ...(oldestBlockedAt === undefined ? {} : { oldestBlockedAt }),
   };

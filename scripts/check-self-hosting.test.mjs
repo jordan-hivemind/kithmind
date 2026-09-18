@@ -190,7 +190,7 @@ test("worker wrapper emits only one doctor JSON object without web preflight", (
     assert.equal(result.status, 1);
     assert.doesNotMatch(result.stdout, /profile:/u);
     const parsed = JSON.parse(result.stdout);
-    assert.equal(parsed.version, 2);
+    assert.equal(parsed.version, 3);
     assert.equal(parsed.state, "blocked");
     assert.equal(parsed.checks.length, 7);
     assert.doesNotMatch(
