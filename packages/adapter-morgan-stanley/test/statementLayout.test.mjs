@@ -298,6 +298,43 @@ test("an unreadable market value is null with a note and a marketValue locator",
   assert.equal(position.locators.marketValue.source, kind);
 });
 
+// F1-76. Three different reasons a position has no market value used to share
+// one note, `no value stated ("")`, which told a reviewer nothing about which
+// of them it was: the note is the `ambiguous_market_value` review item's whole
+// reason (importer.ts). None of them is read as a value here either.
+function unvaluedPosition(options) {
+  const text = [
+    "        Page 1 of 1",
+    "        CLIENT STATEMENT   For the Period March 1-31, 2026",
+    "        Synthetic Active Assets Account    123-456789-012",
+    "        HOLDINGS",
+    ...equityBlockLines(options),
+  ].join("\n");
+  const [position] = parseStatementLines(text, kind).holdings.positions;
+  assert.equal(position.marketValue, null);
+  return position.marketValueNote;
+}
+
+test("a market value the statement itself states none for quotes what it printed", () => {
+  // The source's own answer, and the em dash is the evidence it is the
+  // source's: nothing here is a parser gap to go and fix.
+  assert.equal(unvaluedPosition({ marketValue: "—" }), 'no value stated ("—")');
+});
+
+test("a market value column no row of the block binds says so, not that none was stated", () => {
+  assert.equal(
+    unvaluedPosition({ marketValue: "", lotMarketValues: ["", ""] }),
+    "no Market Value cell bound on this security's 3 row(s)",
+  );
+});
+
+test("a position row stating no market value over lots that disagree says that instead", () => {
+  assert.match(
+    unvaluedPosition({ marketValue: "" }),
+    /^this position's row states no Market Value and the security's other 2 row\(s\) do not agree/,
+  );
+});
+
 // --- evidence spans (F1-53) --------------------------------------------------
 
 /** Every `retained_text_span_v1` binding a `locators` map carries. */

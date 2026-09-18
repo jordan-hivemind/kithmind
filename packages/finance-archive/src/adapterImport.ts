@@ -235,6 +235,12 @@ type InstrumentResolver = {
   resolve(instrument: ParsedInstrument): string;
   /** Rows `resolve` minted, in the order it minted them. */
   readonly created: unknown[][];
+  /**
+   * F1-76. Instrument id -> the name a cusip- or isin-strong match named a
+   * row that is on file with none. `flushInstruments` writes these; nothing
+   * else fills `instruments.name` after the row is minted.
+   */
+  readonly namesLearned: ReadonlyMap<string, string>;
 };
 
 /**
@@ -293,6 +299,29 @@ async function prefetchInstruments(
   // comparisons, far below the one round trip it replaces. Index by cusip,
   // isin and symbol if a document ever carries thousands.
   const created: unknown[][] = [];
+  const namesLearned = new Map<string, string>();
+  /**
+   * F1-76. A strong match is the one place a name can be filled in safely.
+   * The two tiers that reach here matched on a cusip or an isin, so the
+   * descriptor and the row on file are the same instrument by an identifier
+   * that says so; the name it carries is therefore this row's name, and a
+   * row that has none is missing a fact, not disagreeing about one. (The
+   * symbol-only tier is exactly the case where that is not true, which is
+   * why it opens a review item instead and why nothing here touches it.)
+   *
+   * A name already on file is never overwritten, here or in the UPDATE
+   * `flushInstruments` writes: two spellings of the same instrument's name
+   * is not a conflict this import is entitled to settle, and silently
+   * rewriting a name a person may have corrected would be worse than
+   * leaving the older spelling. Updating the in-memory row too keeps the
+   * candidate list honest for the rest of this document, the same way a
+   * minted row is appended for later descriptors to find.
+   */
+  function learnName(found: InstrumentRow, instrument: ParsedInstrument): void {
+    if (found.name !== null || !instrument.name) return;
+    found.name = instrument.name;
+    namesLearned.set(found.id, instrument.name);
+  }
   function mint(instrument: ParsedInstrument): string {
     const id = randomUUID();
     rows.push({
@@ -314,14 +343,19 @@ async function prefetchInstruments(
 
   return {
     created,
+    namesLearned,
     resolve(instrument) {
       if (instrument.cusip) {
         const found = rows.find((row) => row.cusip === instrument.cusip);
-        return found ? found.id : mint(instrument);
+        if (!found) return mint(instrument);
+        learnName(found, instrument);
+        return found.id;
       }
       if (instrument.isin) {
         const found = rows.find((row) => row.isin === instrument.isin);
-        return found ? found.id : mint(instrument);
+        if (!found) return mint(instrument);
+        learnName(found, instrument);
+        return found.id;
       }
       if (instrument.symbol && instrument.name) {
         const found = rows.find(
@@ -384,9 +418,11 @@ async function prefetchInstruments(
 
 /**
  * Writes what resolution produced: new `instruments` rows first, then the
- * review items, both as one multi-row INSERT each. Instruments go first
- * because `transactions.instrument_id` and `positions.instrument_id`
- * reference them, and `importBatch` runs next.
+ * names a strong match taught about rows already on file, then the review
+ * items. Instruments go first because `transactions.instrument_id` and
+ * `positions.instrument_id` reference them, and `importBatch` runs next; the
+ * name fill goes after the insert so a row minted earlier in this same flush
+ * is already there to be updated.
  */
 async function flushInstruments(
   client: ArchiveClient,
@@ -394,6 +430,24 @@ async function flushInstruments(
   reviews: ReviewBuffer,
 ): Promise<void> {
   await insertRows(client, "instruments", INSTRUMENT_COLUMNS, resolver.created);
+  // F1-76. One statement for the whole pull. `WHERE name IS NULL` is the
+  // guard that matters and it is stated here as well as in `learnName`: the
+  // in-memory candidate list was read before this transaction's other
+  // writes, so the database is the only place that can say, at the moment of
+  // writing, that this row still has no name.
+  //
+  // ponytail: unchunked, like the insert above it -- a pull learns at most as
+  // many names as it has distinct instruments. Chunk it the way `insertRows`
+  // does if a single pull ever approaches the bind-parameter ceiling.
+  if (resolver.namesLearned.size > 0) {
+    const learned = [...resolver.namesLearned];
+    await client.query(
+      `UPDATE instruments AS i SET name = fill.name
+         FROM (SELECT unnest($1::text[]) AS id, unnest($2::text[]) AS name) AS fill
+        WHERE i.id = fill.id AND i.name IS NULL`,
+      [learned.map(([id]) => id), learned.map(([, name]) => name)],
+    );
+  }
   await insertRows(
     client,
     "review_items",

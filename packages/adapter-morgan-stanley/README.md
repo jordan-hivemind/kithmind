@@ -536,6 +536,19 @@ Ambiguity is always a null with a note and a locator, never a guess:
 
 - An amount that will not canonicalize -> null, `amountNote`/`marketValueNote`/
   `totalValueNote`, and a field locator naming the cell.
+- A position with no market value -> null and a `marketValueNote` naming which
+  of three absences it is, because that note is the whole reason of the
+  `ambiguous_market_value` item the importer opens:
+
+  | What happened | `marketValueNote` |
+  | --- | --- |
+  | The statement printed its own "none" | `no value stated ("—")`, quoting the cell |
+  | No row of the block bound a cell under the column | `no Market Value cell bound on this security's N row(s)` |
+  | The position's row states none and the block's other rows do not agree on one | `this position's row states no Market Value and the security's other N row(s) do not agree on one, so none is read` |
+
+  Only the second is a parser gap. `ParsedPosition` carries no note field for
+  quantity, price, cost basis or unrealized, so the same three absences are
+  not told apart for those.
 - A security block with several valued lots and no `Total` row -> no position,
   and a `parseNote` counting the blocks and naming the first reason. Once the
   page-split and section-totals shapes above are read, this is about 0.6% of

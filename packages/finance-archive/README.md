@@ -980,6 +980,16 @@ caller cannot do by combining the other two files alone:
   descriptor, matched instrument), not one per document that restates it --
   see "weak_instrument_match is instrument-level, not row-level (F1-58)"
   under Account aliases below.
+
+  F1-76: a `cusip` or `isin` match carrying a name fills `instruments.name`
+  when the row on file has none, in one `UPDATE` per pull guarded by
+  `WHERE name IS NULL`. One institution can describe the same instrument two
+  ways -- an activity feed stating a cusip and a symbol and no name, a
+  statement naming it -- and the name was dropped every time. A name already
+  on file is never overwritten: two spellings of one name is not a conflict
+  an import is entitled to settle. The `symbol`-alone tier never fills a
+  name, because that tier is exactly the case where the two descriptors may
+  not be the same instrument, which is what its review item asks.
 - **Document splitting.** `ParsedRow.sourceDocument` tells the wiring layer
   which underlying document (a page of a paginated pull, or the one file for
   a statement, confirmation or tabular export) each row belongs to. A pull

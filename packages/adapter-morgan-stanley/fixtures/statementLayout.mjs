@@ -186,7 +186,14 @@ function equityRow({ description, tradeDate, quantity, unitCost, sharePrice, tot
 
 /** Two tax lots and the Total row that states the position, exactly as an
  * equity block is printed. */
-export function equityBlockLines({ marketValue = "3,184.00" } = {}) {
+export function equityBlockLines({
+  marketValue = "3,184.00",
+  // F1-76. What the two tax lots print under Market Value. An empty string
+  // omits the cell, which is how a block no row of which states the column
+  // at all is written -- a different fact from a row printing the
+  // statement's own "none", and now a different note.
+  lotMarketValues = ["$1,910.40", "1,273.60"],
+} = {}) {
   return [
     "        COMMON STOCKS",
     EQUITY_HEADER,
@@ -197,7 +204,7 @@ export function equityBlockLines({ marketValue = "3,184.00" } = {}) {
       unitCost: "$300.000",
       sharePrice: "$318.400",
       totalCost: "$1,800.00",
-      marketValue: "$1,910.40",
+      marketValue: lotMarketValues[0],
       gainLoss: "$110.40 NA",
     }),
     equityRow({
@@ -206,7 +213,7 @@ export function equityBlockLines({ marketValue = "3,184.00" } = {}) {
       unitCost: "300.000",
       sharePrice: "318.400",
       totalCost: "1,200.00",
-      marketValue: "1,273.60",
+      marketValue: lotMarketValues[1],
       gainLoss: "73.60 NA",
     }),
     equityRow({

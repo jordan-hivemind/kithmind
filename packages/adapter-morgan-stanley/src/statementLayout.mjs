@@ -688,6 +688,52 @@ function positionCells(block) {
   return { row, merged };
 }
 
+/** The label this table actually printed over the column the position's value
+ * is read from: `Market Value`, or the NAV-priced fund table's bare `Value`
+ * (F1-61). Used only to name the column in a note. */
+function valueColumnLabel(columns) {
+  return columns.find((column) => column.name === "marketValue")?.text ?? "Market Value";
+}
+
+/**
+ * F1-76. Why this position states no value, told apart. `boundCell` returns
+ * null for a column no row of the block states a value in, and passing that
+ * through `resolveStatementMoney("")` collapsed three different facts into
+ * the one note `no value stated ("")`:
+ *
+ * - the statement printed its own "none" here (an em dash, an empty cell),
+ * - this parser bound no cell under the column on any of the security's rows,
+ * - the position's own row states none and the security's other rows do not
+ *   agree on one, which `positionCells` already refused to choose between.
+ *
+ * Only the second is a parser gap a reviewer can do anything about, and
+ * `importer.ts` carries this note verbatim as the `ambiguous_market_value`
+ * item's reason, so the three have to read differently. None of them is a
+ * value, and none is inferred into one: this only names the absence.
+ */
+function unstatedValue(block, name, label) {
+  const printed = block.flatMap(({ bound }) => {
+    const cell = bound.get(name);
+    return cell === undefined ? [] : [cell];
+  });
+  if (printed.length === 0) {
+    return {
+      value: null,
+      note: `no ${label} cell bound on this security's ${block.length} row(s)`,
+    };
+  }
+  const blank = printed.find((cell) => !statesValue(cell));
+  // Quoted exactly as the statement printed it, which is the evidence that
+  // the source stated no value rather than that this parser found no cell.
+  if (blank !== undefined) return resolveStatementMoney(blank.text);
+  return {
+    value: null,
+    note:
+      `this position's row states no ${label} and the security's other ${block.length - 1} ` +
+      "row(s) do not agree on one, so none is read",
+  };
+}
+
 function positionFromBlock(block, columns, context) {
   const resolved = positionCells(block);
   if (resolved === null) {
@@ -721,7 +767,11 @@ function positionFromBlock(block, columns, context) {
       c.text,
     );
   };
-  const marketValue = resolveStatementMoney(boundCell("marketValue")?.text ?? "");
+  const marketValueCell = boundCell("marketValue");
+  const marketValue =
+    marketValueCell === null
+      ? unstatedValue(block, "marketValue", valueColumnLabel(columns))
+      : resolveStatementMoney(marketValueCell.text);
   const quantityCell = boundCell("quantity");
   const quantity = quantityCell === null ? null : resolveStatementMoney(quantityCell.text);
   const priceCell = boundCell("price");

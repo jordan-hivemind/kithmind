@@ -741,6 +741,70 @@ test(
   },
 );
 
+test(
+  "resolveInstrumentId: a cusip-strong match names a row on file with none, and never renames one that has a name",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedPg(client);
+    const name = async (id) =>
+      (await one(client, "SELECT name FROM instruments WHERE id = $1", [id]))
+        .name;
+
+    // How this institution's two tiers describe one instrument: the activity
+    // feed knows its cusip and its symbol and no name at all, and the
+    // statement's holdings table names it. Before F1-76 the second sighting
+    // matched the first on the cusip and then dropped the name it carried, so
+    // `instruments.name` stayed null for good and nothing ever filled it.
+    const fromActivity = {
+      symbol: "ZZZ",
+      cusip: "111111ZZ1",
+      isin: null,
+      name: null,
+    };
+    const fromStatement = { ...fromActivity, name: "Synthetic Zephyr Fund" };
+
+    const id = await resolveInstrumentId(client, fromActivity);
+    assert.equal(await name(id), null);
+
+    assert.equal(await resolveInstrumentId(client, fromStatement), id);
+    assert.equal(await count(client, "instruments"), 1);
+    assert.equal(await name(id), "Synthetic Zephyr Fund");
+
+    // A second spelling of the same instrument's name is not a conflict this
+    // import is entitled to settle, so the name already on file stands.
+    assert.equal(
+      await resolveInstrumentId(client, {
+        ...fromActivity,
+        name: "Zephyr Fund (synthetic)",
+      }),
+      id,
+    );
+    assert.equal(await name(id), "Synthetic Zephyr Fund");
+
+    // A name is a strong match's fact and only ever that: none of the above
+    // was flagged, and the symbol-only tier still resolves and flags exactly
+    // as it did, without naming the row it merged into.
+    assert.equal(await count(client, "review_items"), 0);
+    assert.equal(
+      await resolveInstrumentId(client, {
+        symbol: "ZZZ",
+        cusip: null,
+        isin: null,
+        name: "Unrelated Zeta Corp",
+      }),
+      id,
+    );
+    assert.equal(await name(id), "Synthetic Zephyr Fund");
+    assert.equal(
+      await count(client, "review_items", "WHERE kind = $1", [
+        "weak_instrument_match",
+      ]),
+      1,
+    );
+  },
+);
+
 // --- F1-19: activity taxonomy --------------------------------------------
 //
 // Two reconciliation gates depend on conventions nothing enforced and no
