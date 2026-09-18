@@ -44,8 +44,10 @@ import {
   incrementReason,
   reasonSink,
   readNotReadyReasons,
+  stagedReason,
   type NotReadyReason,
   type NotReadyReasons,
+  type ReasonStage,
 } from "./notReady.js";
 import { consumeWorkerMutationRateLimit } from "./rateLimit.js";
 import { artifactBoundExtractionFingerprint } from "./entries.js";
@@ -757,6 +759,29 @@ function binaryFingerprints(
 }
 
 /**
+ * Runs one loader and, if it throws, names the stage and the kind of error
+ * before rethrowing it unchanged.
+ *
+ * Rethrowing is what keeps this diagnostic: the caller's behaviour is exactly
+ * what it was when the whole region shared one catch, because every throw
+ * still reaches that catch. The sink keeps the first reason, so the stage
+ * recorded here wins over the fallback the outer catch would record.
+ */
+async function staged<T>(
+  note: (reason: NotReadyReason) => void,
+  stage: ReasonStage,
+  run: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await run();
+  } catch (error) {
+    if (isWorkerTransactionAbort(error)) throw error;
+    note(stagedReason(stage, error));
+    throw error;
+  }
+}
+
+/**
  * `note` receives the first condition group that refused the item. It is
  * diagnostic: no branch below changes because of it, and the returned boolean
  * is the same one this function returned before reasons existed.
@@ -775,26 +800,45 @@ async function terminalReady(
   };
   const precondition = itemPreconditionReason(assessment, item, entry);
   if (precondition) return no(precondition);
-  const revisionRaw = await row<Record<string, unknown>>(
-    ctx,
-    "SELECT * FROM kith.source_revisions WHERE id=$1",
-    [item.desiredRevisionId],
+  // Each read is staged with the row it is for, so a database fault or a row
+  // the camelizer refuses names the table rather than the whole region.
+  const revisionRaw = await staged(note, "row_parse_error:revision", async () =>
+    row<Record<string, unknown>>(
+      ctx,
+      "SELECT * FROM kith.source_revisions WHERE id=$1",
+      [item.desiredRevisionId],
+    ),
   );
-  const generationRaw = await row<Record<string, unknown>>(
-    ctx,
-    "SELECT * FROM kith.processing_generations WHERE id=$1",
-    [item.activeGenerationId],
+  const generationRaw = await staged(
+    note,
+    "row_parse_error:generation",
+    async () =>
+      row<Record<string, unknown>>(
+        ctx,
+        "SELECT * FROM kith.processing_generations WHERE id=$1",
+        [item.activeGenerationId],
+      ),
   );
-  const jobRows = await rows<Record<string, unknown>>(
-    ctx,
-    "SELECT * FROM kith.ingest_jobs WHERE processing_generation_id=$1 LIMIT 2",
-    [item.activeGenerationId],
+  const jobRows = await staged(note, "row_parse_error:job", async () =>
+    rows<Record<string, unknown>>(
+      ctx,
+      "SELECT * FROM kith.ingest_jobs WHERE processing_generation_id=$1 LIMIT 2",
+      [item.activeGenerationId],
+    ),
   );
   if (!revisionRaw || !generationRaw) return no("detail_missing");
   if (jobRows.length !== 1) return no("job_count");
-  const revision = camelizeSourceRevision(revisionRaw);
-  const generation = camelizeProcessingGeneration(generationRaw);
-  const job = camelizeIngestJob(jobRows[0]!);
+  const revision = await staged(note, "row_parse_error:revision", async () =>
+    camelizeSourceRevision(revisionRaw),
+  );
+  const generation = await staged(
+    note,
+    "row_parse_error:generation",
+    async () => camelizeProcessingGeneration(generationRaw),
+  );
+  const job = await staged(note, "row_parse_error:job", async () =>
+    camelizeIngestJob(jobRows[0]!),
+  );
   if (
     revision.spaceId !== source.spaceId ||
     revision.sourceItemId !== item.id ||
@@ -856,32 +900,59 @@ async function terminalReady(
     )
       return no("archive_selection");
     try {
-      const artifactRaw = await row<Record<string, unknown>>(
-        ctx,
-        "SELECT * FROM kith.source_parser_artifacts WHERE id=$1",
-        [generation.parserArtifactId],
+      const artifactRaw = await staged(
+        note,
+        "row_parse_error:parser_artifact",
+        async () =>
+          row<Record<string, unknown>>(
+            ctx,
+            "SELECT * FROM kith.source_parser_artifacts WHERE id=$1",
+            [generation.parserArtifactId],
+          ),
       );
-      const textRaw = await row<Record<string, unknown>>(
-        ctx,
-        "SELECT * FROM kith.source_text_versions WHERE id=$1",
-        [generation.sourceTextVersionId],
+      const textRaw = await staged(
+        note,
+        "row_parse_error:text_version",
+        async () =>
+          row<Record<string, unknown>>(
+            ctx,
+            "SELECT * FROM kith.source_text_versions WHERE id=$1",
+            [generation.sourceTextVersionId],
+          ),
       );
       if (!artifactRaw || !textRaw) return no("artifact_missing");
-      const artifact = camelizeSourceParserArtifact(artifactRaw);
-      const text = camelizeSourceTextVersion(textRaw);
-      const expectedExtraction = await artifactBoundExtractionFingerprint(
-        artifact.parserFingerprint,
-        artifact.outputHash,
-        fingerprints.extraction,
+      const artifact = await staged(
+        note,
+        "row_parse_error:parser_artifact",
+        async () => camelizeSourceParserArtifact(artifactRaw),
       );
-      const expectedProcessing = await digestProcessingConfiguration({
-        extractionFingerprint: expectedExtraction,
-        extractorFingerprint: fingerprints.extractor,
-        recordSchemaFingerprint: fingerprints.recordSchema,
-        normalizationFingerprint: fingerprints.normalization,
-        chunkerFingerprint: fingerprints.chunker,
-        correctionRevision: fingerprints.correctionRevision,
-      });
+      const text = await staged(
+        note,
+        "row_parse_error:text_version",
+        async () => camelizeSourceTextVersion(textRaw),
+      );
+      const [expectedExtraction, expectedProcessing] = await staged(
+        note,
+        "fingerprint_digest_error",
+        async () => {
+          const extraction = await artifactBoundExtractionFingerprint(
+            artifact.parserFingerprint,
+            artifact.outputHash,
+            fingerprints.extraction,
+          );
+          return [
+            extraction,
+            await digestProcessingConfiguration({
+              extractionFingerprint: extraction,
+              extractorFingerprint: fingerprints.extractor,
+              recordSchemaFingerprint: fingerprints.recordSchema,
+              normalizationFingerprint: fingerprints.normalization,
+              chunkerFingerprint: fingerprints.chunker,
+              correctionRevision: fingerprints.correctionRevision,
+            }),
+          ] as const;
+        },
+      );
       if (
         artifact.spaceId !== source.spaceId ||
         artifact.sourceAccountId !== source.account.id ||
@@ -909,44 +980,59 @@ async function terminalReady(
       )
         return no("fingerprint_mismatch:derived");
 
-      const originalPrimary = await loadCurrentArchiveBinding(ctx.client, {
+      const subject = {
         spaceId: source.spaceId,
         sourceAccountId: source.account.id,
         sourceItemId: item.id,
         sourceRevisionId: revision.id,
-        subjectKind: "original_bytes",
-        copyRole: "primary",
-      });
-      const originalBackup = await loadCurrentArchiveBinding(ctx.client, {
-        spaceId: source.spaceId,
-        sourceAccountId: source.account.id,
-        sourceItemId: item.id,
-        sourceRevisionId: revision.id,
-        subjectKind: "original_bytes",
-        copyRole: "independent_backup",
-      });
-      const provider = await loadProviderOriginalBinding(
-        ctx.client,
-        revision.id,
+      };
+      const originalPrimary = await staged(
+        note,
+        "binding_load_error:original_bytes/primary",
+        async () =>
+          loadCurrentArchiveBinding(ctx.client, {
+            ...subject,
+            subjectKind: "original_bytes",
+            copyRole: "primary",
+          }),
       );
-      const parserPrimary = await loadCurrentArchiveBinding(ctx.client, {
-        spaceId: source.spaceId,
-        sourceAccountId: source.account.id,
-        sourceItemId: item.id,
-        sourceRevisionId: revision.id,
-        parserArtifactId: artifact.id,
-        subjectKind: "parser_output",
-        copyRole: "primary",
-      });
-      const parserBackup = await loadCurrentArchiveBinding(ctx.client, {
-        spaceId: source.spaceId,
-        sourceAccountId: source.account.id,
-        sourceItemId: item.id,
-        sourceRevisionId: revision.id,
-        parserArtifactId: artifact.id,
-        subjectKind: "parser_output",
-        copyRole: "independent_backup",
-      });
+      const originalBackup = await staged(
+        note,
+        "binding_load_error:original_bytes/independent_backup",
+        async () =>
+          loadCurrentArchiveBinding(ctx.client, {
+            ...subject,
+            subjectKind: "original_bytes",
+            copyRole: "independent_backup",
+          }),
+      );
+      const provider = await staged(
+        note,
+        "provider_binding_load_error",
+        async () => loadProviderOriginalBinding(ctx.client, revision.id),
+      );
+      const parserPrimary = await staged(
+        note,
+        "binding_load_error:parser_output/primary",
+        async () =>
+          loadCurrentArchiveBinding(ctx.client, {
+            ...subject,
+            parserArtifactId: artifact.id,
+            subjectKind: "parser_output",
+            copyRole: "primary",
+          }),
+      );
+      const parserBackup = await staged(
+        note,
+        "binding_load_error:parser_output/independent_backup",
+        async () =>
+          loadCurrentArchiveBinding(ctx.client, {
+            ...subject,
+            parserArtifactId: artifact.id,
+            subjectKind: "parser_output",
+            copyRole: "independent_backup",
+          }),
+      );
       if (!originalPrimary) return no("binding_missing:original/primary");
       if (!parserPrimary) return no("binding_missing:parser/primary");
       if (!parserBackup) return no("binding_missing:parser/backup");
@@ -956,9 +1042,7 @@ async function terminalReady(
             ? "binding_missing:original/backup"
             : "binding_missing:provider",
         );
-      // Split from the block below only to tell a refused receipt chain apart
-      // from a failed independence pair; both still refuse the item.
-      try {
+      await staged(note, "receipt_chain", async () => {
         await requireArchiveReceiptChain(
           ctx,
           source,
@@ -984,19 +1068,17 @@ async function terminalReady(
             item,
             originalBackup.receipt,
           );
-        else if (provider)
-          await requireProviderOriginalReferenceChain(
+      });
+      if (provider)
+        await staged(note, "provider_reference_load_error", async () =>
+          requireProviderOriginalReferenceChain(
             ctx,
             source,
             item,
             provider.reference,
-          );
-      } catch (error) {
-        if (isWorkerTransactionAbort(error)) throw error;
-        note("receipt_chain");
-        throw error;
-      }
-      try {
+          ),
+        );
+      await staged(note, "archive_independence", async () => {
         requireIndependentArchivePair(
           parserPrimary.receipt,
           parserBackup.receipt,
@@ -1006,22 +1088,23 @@ async function terminalReady(
             originalPrimary.receipt,
             originalBackup.receipt,
           );
-      } catch (error) {
-        if (isWorkerTransactionAbort(error)) throw error;
-        note("archive_independence");
-        throw error;
-      }
-      const archiveSet = await archiveSetDigest(
-        originalPrimary,
-        originalBackup,
-        provider
-          ? {
-              reference: provider.reference,
-              bindingEpoch: provider.binding.bindingEpoch,
-            }
-          : null,
-        parserPrimary,
-        parserBackup,
+      });
+      const archiveSet = await staged(
+        note,
+        "archive_set_digest_error",
+        async () =>
+          archiveSetDigest(
+            originalPrimary,
+            originalBackup,
+            provider
+              ? {
+                  reference: provider.reference,
+                  bindingEpoch: provider.binding.bindingEpoch,
+                }
+              : null,
+            parserPrimary,
+            parserBackup,
+          ),
       );
       if (
         generation.archiveSetDigest !== archiveSet ||
@@ -1040,7 +1123,9 @@ async function terminalReady(
             ? "archive_set_digest_mismatch"
             : "generation_receipt_mismatch",
         );
-      const verified = await verifySealedParsedPayload(ctx.client, generation);
+      const verified = await staged(note, "payload_verify_error", async () =>
+        verifySealedParsedPayload(ctx.client, generation),
+      );
       return (
         generation.actualPageCount === verified.actualPageCount &&
         generation.actualEvidenceSpanCount ===
