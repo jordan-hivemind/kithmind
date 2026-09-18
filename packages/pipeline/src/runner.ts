@@ -3741,7 +3741,32 @@ export class PipelineRunner {
           throw new PipelineWorkerError("archived_lookup_mode_conflict");
         }
         if (value.found !== true) {
-          return archivedBase(current, { step: "capture" });
+          // P2-31c. The server does not know this revision, yet this catalog
+          // row holds an admission receipt for it. The two cannot both be
+          // true of the same backend.
+          //
+          // It happened on 2026-09-18. A web build carried both a Convex and a
+          // PostgreSQL leg behind a surface flag that fell back to Convex for
+          // any value but the exact string `postgres`, and a dashboard
+          // redeploy served the Convex leg for about ten minutes. An admit
+          // committed there and returned Convex ids, which `recordOriginalCloud`
+          // stored as `cloud`. The next build removed that leg, so every later
+          // pass met a PostgreSQL deployment that had never seen the item while
+          // the catalog still claimed it was admitted. That leg is gone from
+          // main and cannot recur, but the receipt it left behind is durable.
+          //
+          // Fail closed, and before anything downstream can mistake this for a
+          // provider problem: the P2-31b refusal at `admit` would otherwise be
+          // the first thing an operator saw, and it names a reference the
+          // authoritative server does not hold. Nothing further is sent and no
+          // discovery attempt is spent. Clearing a receipt is an operator
+          // action, not something a pass may decide: `cloud` is the record that
+          // original bytes were accepted somewhere, and a pass that dropped it
+          // on a server's silence would re-admit anything a temporary
+          // misrouting touched.
+          if (this.archivedRows(current).original.cloud)
+            throw new PipelineWorkerError("original_receipt_unknown_to_server");
+          return archivedBase(current, { step: "capture", receiptChecked: true });
         }
         let { original } = this.archivedRows(current);
         const provider = original.providerOriginal !== undefined;
@@ -4407,10 +4432,31 @@ export class PipelineRunner {
       admitting.providerOriginal &&
       admitting.cloud &&
       "providerReferenceId" in admitting.cloud
-    )
+    ) {
+      // P2-31c. Before refusing, ask the server whether it actually holds this
+      // receipt. A pass resumed straight into `admit` has never asked, and the
+      // two answers need different codes: a receipt the server knows is
+      // `provider_original_reference_already_bound` (P2-31b), and one it does
+      // not know is `original_receipt_unknown_to_server`, which is what a
+      // misrouted admission leaves behind. `lookup_original` is read-only and
+      // spends no discovery attempt. `receiptChecked` keeps it to one question
+      // per cycle, so a row whose receipt the server does confirm walks its
+      // normal recovery instead of looping back here.
+      if (!checkpoint.receiptChecked) {
+        await this.journal.transitionCheckpoint({
+          checkpoint: archivedBase(checkpoint, {
+            step: "lookup_original",
+            receiptChecked: true,
+            discoveryLease: undefined,
+          }),
+          credentialSessionActive: true,
+        });
+        return;
+      }
       throw new PipelineWorkerError(
         "provider_original_reference_already_bound",
       );
+    }
     // P2-31a. A pass that resumes here after an interrupted admission holds a
     // durable locator whose proof has aged past what the server accepts. Redo
     // both checks in place rather than throwing

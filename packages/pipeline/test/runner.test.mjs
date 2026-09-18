@@ -2846,6 +2846,130 @@ test("a refresh whose catalog write already committed is not repeated on the nex
   }
 });
 
+test("a receipt the server does not know is named for what it is, not as a provider fault", async () => {
+  const setup = await fixture(0);
+  const plan = pdfPlan();
+  // The live 2026-09-18 state. A misrouted web build admitted this original
+  // against a backend that no longer serves the account, so the catalog holds a
+  // receipt whose ids the authoritative server has never seen. The proof is two
+  // hours old, the lease expired, and the checkpoint resumes straight at admit.
+  const checkpoint = archivedCheckpoint(plan, {
+    step: "admit",
+    preflightAction: undefined,
+    discoveryLease: {
+      workId: "work",
+      sourceItemId: plan.sourceItemId,
+      observationEpoch: 1,
+      processingEpoch: 1,
+      leaseEpoch: 9,
+      leaseToken: TOKEN,
+      leaseExpiresAt: Date.now() - 60 * 60_000,
+    },
+  });
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  const rows = durableProviderRows(checkpoint, Date.now() - 120 * 60_000);
+  rows.original.cloud = {
+    sourceItemId: "item-from-the-other-backend",
+    sourceRevisionId: "revision-from-the-other-backend",
+    primaryReceiptId: "original-primary",
+    providerReferenceId: "provider-reference",
+    providerBindingEpoch: 0,
+    admittedAt: Date.now() - 120 * 60_000,
+  };
+  const sent = [];
+  const runner = new PipelineRunner(setup.config, journal, {
+    async call(request) {
+      sent.push(request.operation);
+      return {
+        operation: "discovery.lookupArchivedAdmission",
+        mode: "original",
+        found: false,
+      };
+    },
+  });
+  runner.archivedRows = () => rows;
+  runner.mappedProcessing = async () => ({
+    ...rows,
+    declaration: parsedDeclaration(),
+  });
+  runner.refreshProviderProof = async () => {
+    throw new Error("a receipt question must be settled before any refresh");
+  };
+  try {
+    // The admit asks the server instead of refusing blind, and drops the dead
+    // lease rather than renewing it.
+    await runner.driveArchivedAdmit();
+    assert.deepEqual(sent, []);
+    assert.equal(journal.checkpoint.step, "lookup_original");
+    assert.equal(journal.checkpoint.receiptChecked, true);
+    assert.equal(journal.checkpoint.discoveryLease, undefined);
+    // The server says it has never seen this revision. The catalog says it was
+    // admitted. That contradiction is its own code, and it is the one the
+    // operator sees rather than the provider refusal from P2-31b.
+    await assert.rejects(
+      () => runner.driveArchivedLookupOriginal(),
+      (error) => error.code === "original_receipt_unknown_to_server",
+    );
+    assert.deepEqual(sent, ["discovery.lookupArchivedAdmission"]);
+    assert.equal(journal.checkpoint.step, "lookup_original");
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a receipt the server does confirm still refuses at admit, and asks only once", async () => {
+  const setup = await fixture(0);
+  const plan = pdfPlan();
+  const checkpoint = archivedCheckpoint(plan, {
+    step: "admit",
+    preflightAction: undefined,
+    receiptChecked: true,
+    discoveryLease: {
+      workId: "work",
+      sourceItemId: plan.sourceItemId,
+      observationEpoch: 1,
+      processingEpoch: 1,
+      leaseEpoch: 9,
+      leaseToken: TOKEN,
+      leaseExpiresAt: Date.now() - 60 * 60_000,
+    },
+  });
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  const rows = durableProviderRows(checkpoint, Date.now() - 120 * 60_000);
+  rows.original.cloud = {
+    sourceItemId: plan.sourceItemId,
+    sourceRevisionId: "revision",
+    primaryReceiptId: "original-primary",
+    providerReferenceId: "provider-reference",
+    providerBindingEpoch: 0,
+    admittedAt: 1,
+  };
+  const sent = [];
+  const runner = new PipelineRunner(setup.config, journal, {
+    async call(request) {
+      sent.push(request.operation);
+      throw new Error("the question has already been asked this cycle");
+    },
+  });
+  runner.archivedRows = () => rows;
+  runner.mappedProcessing = async () => ({
+    ...rows,
+    declaration: parsedDeclaration(),
+  });
+  try {
+    await assert.rejects(
+      () => runner.driveArchivedAdmit(),
+      (error) => error.code === "provider_original_reference_already_bound",
+    );
+    assert.deepEqual(sent, [], "no attempt and no round trip on the retry");
+    assert.equal(journal.checkpoint.step, "admit");
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
 test("an already bound provider reference stops the admit before it spends a lease", async () => {
   const setup = await fixture(0);
   const plan = pdfPlan();
@@ -2895,15 +3019,29 @@ test("an already bound provider reference stops the admit before it spends a lea
     // Pass one. Before this fix the expired lease sent the pass to `reserve`,
     // which spent one of the row's eight discovery attempts, and only then did
     // `providerDeclaration` throw a stale-proof code for a row whose proof was
-    // never the problem.
-    await assert.rejects(
-      () => runner.driveArchivedAdmit(),
-      (error) => error.code === "provider_original_reference_already_bound",
-    );
+    // never the problem. Now the receipt question is asked first (P2-31c) and
+    // the dead lease is dropped rather than renewed.
+    await runner.driveArchivedAdmit();
     assert.deepEqual(sent, [], "no attempt is spent on an unadmittable row");
-    assert.equal(journal.checkpoint.step, "admit");
-    assert.notEqual(journal.checkpoint.discoveryLease, undefined);
-    // Pass two, minutes later: the same refusal, still free.
+    assert.equal(journal.checkpoint.step, "lookup_original");
+    assert.equal(journal.checkpoint.discoveryLease, undefined);
+    // Once the question has been asked, the refusal stands and stays free.
+    await journal.transitionCheckpoint({
+      checkpoint: parseRunnerCheckpoint({
+        ...journal.checkpoint,
+        step: "admit",
+        discoveryLease: {
+          workId: "work",
+          sourceItemId: plan.sourceItemId,
+          observationEpoch: 1,
+          processingEpoch: 1,
+          leaseEpoch: 1,
+          leaseToken: TOKEN,
+          leaseExpiresAt: Date.now() - 60 * 60_000,
+        },
+      }),
+      credentialSessionActive: true,
+    });
     await assert.rejects(
       () => runner.driveArchivedAdmit(),
       (error) => error.code === "provider_original_reference_already_bound",
