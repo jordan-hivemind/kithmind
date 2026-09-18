@@ -69,6 +69,7 @@ import {
 import {
   coveredCountsFor,
   embeddingKindCounts,
+  usesTargetCounters,
   type EmbeddingKindCounts,
 } from "./targets.js";
 
@@ -1188,6 +1189,120 @@ export async function auditEmbeddingCounters(
     storedCovered,
     repaired,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Coverage recovery (cutover step 8)
+// ---------------------------------------------------------------------------
+
+/** One recovery pass reads at most this many covered targets. */
+export const MAX_COVERAGE_RECOVERY_ROWS = 4096;
+
+/**
+ * The eligible targets this fingerprint claims to cover with no vector row
+ * behind the claim. The vector match is `findCoveringVector`'s, as one set
+ * query rather than a lookup per target: same columns, same `input_hash`
+ * condition, so a target whose text moved on is reported here too.
+ */
+const VECTORLESS_COVERED_TARGETS = `SELECT ${EMBEDDING_TARGET_COLUMNS}
+   FROM kith.embedding_targets t
+  WHERE t.space_id = $1 AND t.state = 'eligible'
+    AND t.covered_fingerprint = $2
+    AND NOT EXISTS (
+      SELECT 1 FROM kith.embedding_vectors v
+       WHERE v.space_id = t.space_id
+         AND v.embedding_fingerprint = t.covered_fingerprint
+         AND v.target_kind = t.target_kind
+         AND v.input_hash = t.input_hash
+         AND ((t.target_kind = 'thought' AND v.thought_id = t.target_id)
+           OR (t.target_kind = 'chunk' AND v.chunk_id = t.target_id)
+           OR (t.target_kind = 'card' AND v.event_id = t.target_id)))
+  ORDER BY t.created_at, t.id LIMIT $3`;
+
+export type CoverageRecoveryResult = {
+  spaceId: string;
+  /** Null when the space has no active index or no seeded counters. */
+  fingerprint: string | null;
+  /** Covered targets with no vector row, up to `maxRows`. */
+  vectorless: number;
+  /** How many of those this call put back on the owed index. */
+  invalidated: number;
+  /** False when `maxRows` was reached, so a rerun has more to do. */
+  complete: boolean;
+  scheduled: boolean;
+};
+
+/**
+ * Cutover step 8, "Re-embed". Section 5.2 of the consolidation plan derives
+ * vectors again after cutover rather than migrating them, but `kith-migrate`
+ * loads `covered_fingerprint` as Convex left it, so a migrated space can claim
+ * coverage no vector row backs. Such a target is not owed -- the owed index of
+ * `owedTargetsPage` is "eligible and unmarked" -- so the provider fill treats
+ * it as done and the reader never finds a vector for it.
+ *
+ * Clearing the marker is what puts those targets back on the owed index, which
+ * is the same repair `runFillPage` already makes for a marker naming another
+ * fingerprint; this one covers the case that marker names the active one. The
+ * clear goes through `setTargetCoverage`, so the covered counter loses the
+ * target here and regains it when the fill's insert covers it for real. No
+ * count is added twice and a recount agrees at every point in between, which
+ * is why nothing here touches `counter_drift` or `last_audit_at`.
+ *
+ * Idempotent: a space whose covered targets all have vectors invalidates
+ * nothing and schedules nothing. `apply` defaults to false, which counts
+ * without writing.
+ */
+export async function recoverEmbeddingCoverage(
+  ctx: IdentityCtx,
+  input: {
+    spaceId: string;
+    apply?: boolean;
+    maxRows?: number;
+    now?: number;
+  },
+): Promise<CoverageRecoveryResult> {
+  const now = input.now ?? ctx.now;
+  const apply = input.apply ?? false;
+  const maxRows = Math.min(
+    Math.max(input.maxRows ?? MAX_COVERAGE_RECOVERY_ROWS, 1),
+    MAX_COVERAGE_RECOVERY_ROWS,
+  );
+  // The counters are one row per space and this writes them, so an applying
+  // pass takes the same row lock every other counter writer does.
+  const state = await uniqueSpaceState(ctx, input.spaceId, apply);
+  const fingerprint = state?.active_fingerprint ?? null;
+  if (!state || !fingerprint || !usesTargetCounters(state)) {
+    return {
+      spaceId: input.spaceId,
+      fingerprint,
+      vectorless: 0,
+      invalidated: 0,
+      complete: true,
+      scheduled: false,
+    };
+  }
+  const found = await rows<EmbeddingTargetWriteRow>(
+    ctx,
+    VECTORLESS_COVERED_TARGETS,
+    [input.spaceId, fingerprint, maxRows + 1],
+  );
+  const page = found.slice(0, maxRows);
+  const result: CoverageRecoveryResult = {
+    spaceId: input.spaceId,
+    fingerprint,
+    vectorless: page.length,
+    invalidated: 0,
+    complete: found.length <= maxRows,
+    scheduled: false,
+  };
+  if (!apply || page.length === 0) return result;
+  const delta = emptyCounterDelta();
+  for (const record of page) {
+    await setTargetCoverage(ctx, record, null, now, delta);
+  }
+  await commitCounterDelta(ctx, state, delta, now);
+  await scheduleEmbeddingFill(ctx, input.spaceId);
+  return { ...result, invalidated: page.length, scheduled: true };
 }
 
 export type { EmbeddingCounterDelta };

@@ -222,6 +222,23 @@ cutover window is the owner's, in this order.
 8. Re-embed, then run the post-cutover checks: one full scan and one document
    publication without re-acquiring bytes, one MCP query returning a historical
    citation minted before the migration, and `pnpm brain:doctor` green.
+
+   Vectors were not migrated, but `covered_fingerprint` was, so a migrated
+   target claims coverage no vector row backs and the provider fill skips it.
+   `kith-reembed` clears exactly that claim. Run it from a built clone with
+   `KITH_STORE_DATABASE_URL` set to the migration role's connection string:
+
+   ```
+   KITH_STORE_DATABASE_URL=... node packages/kith-store/dist/embeddings/cli.js
+   KITH_STORE_DATABASE_URL=... node packages/kith-store/dist/embeddings/cli.js --apply
+   ```
+
+   The first prints one JSON line per space and writes nothing; the second
+   invalidates the coverage it counted and queues the fill. Both print space
+   ids and counts only. `--space <id>` narrows it to one space. The fill itself
+   is the daemon's, so leave `kith-deferred-work drain` running afterwards and
+   confirm `vectorless` is zero on a rerun. The step is idempotent, so a rerun
+   on a healthy deployment changes nothing.
 9. Run the backup proof on the new shape (plan step 10) once every writer is
    quiesced. The workflow's rehearsal covers the parity capture and the sampled
    cited answer only; the dated encrypted dump and the isolated restore need

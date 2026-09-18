@@ -223,12 +223,15 @@ export {
   EMBEDDING_TARGET_PAGE,
   EMBEDDING_THOUGHT_SCAN_PAGE,
   getEmbeddingBuildJob,
+  MAX_COVERAGE_RECOVERY_ROWS,
   probeDuplicateRows,
+  recoverEmbeddingCoverage,
   runEmbeddingBuildPage,
   startEmbeddingBuild,
 } from "./build.js";
 export type {
   BuildPageResult,
+  CoverageRecoveryResult,
   DuplicateRowProbe,
   EmbeddingBuildJobRow,
   EmbeddingBuildPhase,

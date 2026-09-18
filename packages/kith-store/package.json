@@ -59,7 +59,8 @@
     }
   },
   "bin": {
-    "kith-deferred-work": "./dist/deferred/cli.js"
+    "kith-deferred-work": "./dist/deferred/cli.js",
+    "kith-reembed": "./dist/embeddings/cli.js"
   },
   "scripts": {
     "build": "node ../../scripts/run-package-task.mjs build tsc -p tsconfig.json",
