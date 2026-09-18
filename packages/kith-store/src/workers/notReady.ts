@@ -21,6 +21,8 @@
 
 import { WORKER_PROTOCOL_ERROR_CODES } from "@repo/worker-protocol/request";
 
+import { PAYLOAD_VERIFY_DETAILS } from "../provenance/parsedStaging.js";
+
 export const NOT_READY_REASONS = [
   // Shared preconditions on the item and its scan entry.
   "item_state",
@@ -208,6 +210,9 @@ const SQLSTATE = /^[0-9A-Za-z]{5}$/;
 export const ERROR_KINDS = [
   ...WORKER_PROTOCOL_ERROR_CODES,
   ...LOADER_ERROR_MESSAGES.map((entry) => entry.kind),
+  // P2-100c: `verifySealedParsedPayload` names the check that refused, and
+  // that literal arrives as the kind half of `payload_verify_error:<detail>`.
+  ...PAYLOAD_VERIFY_DETAILS,
   ...ERROR_CONSTRUCTORS,
   "unmapped_error",
 ];

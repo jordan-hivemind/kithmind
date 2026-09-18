@@ -1123,8 +1123,13 @@ async function terminalReady(
             ? "archive_set_digest_mismatch"
             : "generation_receipt_mismatch",
         );
+      // The verifier names the check that refused before it throws. The sink
+      // keeps the first reason, so that detail wins over the `scan_conflict`
+      // code the stage would otherwise record on its own.
       const verified = await staged(note, "payload_verify_error", async () =>
-        verifySealedParsedPayload(ctx.client, generation),
+        verifySealedParsedPayload(ctx.client, generation, (detail) =>
+          note(`payload_verify_error:${detail}`),
+        ),
       );
       return (
         generation.actualPageCount === verified.actualPageCount &&

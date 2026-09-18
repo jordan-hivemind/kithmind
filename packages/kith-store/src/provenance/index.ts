@@ -23,6 +23,9 @@ export {
   isParsedChunkTextWithinLimits,
   MAX_PARSED_CHUNKS,
   MAX_PARSED_STORED_PAYLOAD_BYTES,
+  PAYLOAD_VERIFY_DETAILS,
+  type PayloadVerifyDetail,
+  type PayloadVerifyNote,
   type SealedPayloadSummary,
   type VerifiedSealedPayload,
 } from "./parsedStaging.js";

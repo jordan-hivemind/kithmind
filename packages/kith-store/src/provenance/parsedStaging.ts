@@ -160,10 +160,88 @@ function rowSize(row: Record<string, unknown>, maximum = MAX_ROW_BYTES): number 
   return size;
 }
 
-function storedRowSize(row: Record<string, unknown>, maximum: number): number {
+/**
+ * P2-100c. Which check inside `verifySealedParsedPayload` refused, as a fixed
+ * literal. The verifier's behaviour does not change: it still throws
+ * `ProofError("scan_conflict")` from every site, and `note` is optional, so
+ * callers that do not pass one (the seal and activate paths) are untouched.
+ *
+ * The literals below are the whole closed set. Never interpolate a row value,
+ * an id, a count or a hash into one: an assessment row carrying these is read
+ * by operators and copied into reports.
+ */
+export const PAYLOAD_VERIFY_DETAILS = [
+  "missing_ids",
+  "manifest_or_text_missing",
+  "manifest_identity",
+  "id_sets",
+  "row_counts",
+  "page_loop:ordinal",
+  "page_loop:scope",
+  "page_loop:offsets",
+  "page_loop:hash",
+  "span_loop:page",
+  "span_loop:ordinal",
+  "span_loop:scope",
+  "span_loop:bounds",
+  "span_loop:locator_kind",
+  "span_loop:locator_artifact",
+  "span_loop:locator_page",
+  "span_loop:quote_hash",
+  "locator_kinds_mixed",
+  "profile_limits",
+  "retained_text_bytes",
+  "retained_text_hash",
+  "mapping_manifest_hash",
+  "publication_state_undecidable",
+  "document_loop:scope",
+  "document_loop:publication_state",
+  "document_loop:span_ids",
+  "document_loop:duplicate_key",
+  "chunk_loop:document",
+  "chunk_loop:scope",
+  "chunk_loop:ordinal",
+  "chunk_loop:bounds",
+  "chunk_loop:text",
+  "chunk_loop:publication_state",
+  "chunk_loop:span_ids",
+  "chunk_coverage_gap",
+  "chunk_coverage_end",
+  "chunk_text_limit",
+  "chunk_ordinals",
+  "manifest_byte_sizes",
+  "stored_payload_limit",
+  "page_digest",
+  "evidence_digest",
+  "document_digest",
+  "chunk_digest",
+  "retained_text_fields",
+  "row_size:page",
+  "row_size:evidence",
+  "row_size:document",
+  "row_size:chunk",
+] as const;
+
+export type PayloadVerifyDetail = (typeof PAYLOAD_VERIFY_DETAILS)[number];
+
+export type PayloadVerifyNote = (detail: PayloadVerifyDetail) => void;
+
+/** Names the site, then throws exactly what this site always threw. */
+function refuse(note: PayloadVerifyNote | undefined, detail: PayloadVerifyDetail): never {
+  note?.(detail);
+  throw new ProofError("scan_conflict");
+}
+
+function storedRowSize(
+  row: Record<string, unknown>,
+  maximum: number,
+  note?: PayloadVerifyNote,
+  detail?: PayloadVerifyDetail,
+): number {
   try {
     return rowSize(row, maximum);
   } catch {
+    if (detail) refuse(note, detail);
     throw new ProofError("scan_conflict");
   }
 }
@@ -877,12 +955,20 @@ export type VerifiedSealedPayload = {
  * database holds for this generation right now, and rejects on the first
  * mismatch. This is the read side of the seal: nothing here writes.
  */
+/**
+ * `note`, when given, receives the fixed literal naming the check that
+ * refused, immediately before the throw that always happened there. It changes
+ * nothing else: the error, its code and every branch are what they were, and a
+ * caller that passes no note cannot tell this parameter exists.
+ */
 export async function verifySealedParsedPayload(
   client: ClientBase,
   generation: ProcessingGenerationRow,
+  note?: PayloadVerifyNote,
 ): Promise<VerifiedSealedPayload> {
+  const no: (detail: PayloadVerifyDetail) => never = (detail) => refuse(note, detail);
   if (!generation.payloadManifestId || !generation.sourceTextVersionId || !generation.parserArtifactId) {
-    throw new ProofError("scan_conflict");
+    no("missing_ids");
   }
   const manifestRow = (
     await client.query<QueryResultRow>(`SELECT * FROM kith.processing_generation_payload_manifests WHERE id = $1`, [
@@ -895,7 +981,7 @@ export async function verifySealedParsedPayload(
       generation.sourceTextVersionId,
     ])
   ).rows[0];
-  if (!manifest || !textRow) throw new ProofError("scan_conflict");
+  if (!manifest || !textRow) no("manifest_or_text_missing");
   const text = camelizeSourceTextVersion(textRow);
   if (
     manifest.processingGenerationId !== generation.id ||
@@ -913,15 +999,20 @@ export async function verifySealedParsedPayload(
     text.evidenceSealed !== true ||
     text.textHashAuthority !== "server_verified_retained_text"
   )
-    throw new ProofError("scan_conflict");
+    no("manifest_identity");
   const collected = await collectPayloadRows(client, text.id, generation.id);
+  // Split from the counts below only so a failure can be named. The order of
+  // the conditions, and so the answer, is what it was.
   if (
     collected.eventVersionCount !== 0 ||
     collected.observationCount !== 0 ||
     !exactIdSet(manifest.pageIds, collected.pages.map((row) => row.id)) ||
     !exactIdSet(manifest.evidenceSpanIds, collected.spans.map((row) => row.id)) ||
     !exactIdSet(manifest.documentIds, collected.documents.map((row) => row.id)) ||
-    !exactIdSet(manifest.chunkIds, collected.chunks.map((row) => row.id)) ||
+    !exactIdSet(manifest.chunkIds, collected.chunks.map((row) => row.id))
+  )
+    no("id_sets");
+  if (
     collected.pages.length !== manifest.pageCount ||
     collected.spans.length !== manifest.evidenceSpanCount ||
     collected.documents.length !== manifest.documentCount ||
@@ -931,7 +1022,7 @@ export async function verifySealedParsedPayload(
     collected.documents.length !== generation.expectedDocumentCount ||
     collected.chunks.length !== generation.expectedChunkCount
   )
-    throw new ProofError("scan_conflict");
+    no("row_counts");
   const pages = orderRowsByIds(manifest.pageIds, collected.pages);
   const spans = orderRowsByIds(manifest.evidenceSpanIds, collected.spans);
   const documents = orderRowsByIds(manifest.documentIds, collected.documents);
@@ -940,15 +1031,12 @@ export async function verifySealedParsedPayload(
   const pageInputs: ParsedPageInput[] = [];
   for (let ordinal = 0; ordinal < pages.length; ordinal += 1) {
     const page = pages[ordinal]!;
-    if (
-      page.ordinal !== ordinal ||
-      page.spaceId !== generation.spaceId ||
-      page.sourceTextVersionId !== text.id ||
-      page.start !== completeText.length ||
-      page.end !== page.start + page.text.length ||
-      (await sha256Utf8(page.text)) !== page.textHash
-    )
-      throw new ProofError("scan_conflict");
+    if (page.ordinal !== ordinal) no("page_loop:ordinal");
+    if (page.spaceId !== generation.spaceId || page.sourceTextVersionId !== text.id)
+      no("page_loop:scope");
+    if (page.start !== completeText.length || page.end !== page.start + page.text.length)
+      no("page_loop:offsets");
+    if ((await sha256Utf8(page.text)) !== page.textHash) no("page_loop:hash");
     completeText += page.text;
     pageInputs.push({ ordinal, start: page.start, end: page.end, text: page.text, textHash: page.textHash });
   }
@@ -958,24 +1046,36 @@ export async function verifySealedParsedPayload(
     const span = spans[ordinal]!;
     const page = pageById.get(span.sourcePageId);
     const locator = span.locator;
+    if (!page) no("span_loop:page");
+    if (span.ordinal !== ordinal) no("span_loop:ordinal");
     if (
-      !page ||
-      span.ordinal !== ordinal ||
       span.spaceId !== generation.spaceId ||
       span.sourceRevisionId !== generation.sourceRevisionId ||
-      span.sourceTextVersionId !== text.id ||
+      span.sourceTextVersionId !== text.id
+    )
+      no("span_loop:scope");
+    if (
       !Number.isSafeInteger(span.start) ||
       !Number.isSafeInteger(span.end) ||
       span.start < 0 ||
       span.end <= span.start ||
-      span.end > page.text.length ||
-      !locator ||
-      (locator.kind !== "parser_page_v1" && locator.kind !== "parser_item_v1" && locator.kind !== "parser_table_row_v1") ||
-      locator.parserArtifactId !== generation.parserArtifactId ||
-      (locator.kind === "parser_page_v1" && (locator.pageNumber !== page.ordinal + 1 || locator.pageTextHash !== page.textHash)) ||
-      (await sha256Utf8(page.text.slice(span.start, span.end))) !== span.quoteHash
+      span.end > page.text.length
     )
-      throw new ProofError("scan_conflict");
+      no("span_loop:bounds");
+    if (
+      !locator ||
+      (locator.kind !== "parser_page_v1" && locator.kind !== "parser_item_v1" && locator.kind !== "parser_table_row_v1")
+    )
+      no("span_loop:locator_kind");
+    if (locator.parserArtifactId !== generation.parserArtifactId)
+      no("span_loop:locator_artifact");
+    if (
+      locator.kind === "parser_page_v1" &&
+      (locator.pageNumber !== page.ordinal + 1 || locator.pageTextHash !== page.textHash)
+    )
+      no("span_loop:locator_page");
+    if ((await sha256Utf8(page.text.slice(span.start, span.end))) !== span.quoteHash)
+      no("span_loop:quote_hash");
     evidenceInputs.push({
       ordinal,
       pageOrdinal: page.ordinal,
@@ -988,7 +1088,7 @@ export async function verifySealedParsedPayload(
   const textBytes = utf8Length(completeText);
   const usesPageLocators = evidenceInputs.some((input) => input.locator.kind === "parser_page_v1");
   if (usesPageLocators && evidenceInputs.some((input) => input.locator.kind !== "parser_page_v1")) {
-    throw new ProofError("scan_conflict");
+    no("locator_kinds_mixed");
   }
   if (
     !isParsedProfileWithinLimits({
@@ -999,13 +1099,11 @@ export async function verifySealedParsedPayload(
       chunkCount: chunks.length,
     })
   )
-    throw new ProofError("scan_conflict");
-  if (
-    textBytes > MAX_RETAINED_TEXT_BYTES ||
-    text.textHash !== (await sha256Utf8(completeText)) ||
-    (await digestParsedMappingManifest(pageInputs, evidenceInputs)) !== manifest.mappingManifestHash
-  )
-    throw new ProofError("scan_conflict");
+    no("profile_limits");
+  if (textBytes > MAX_RETAINED_TEXT_BYTES) no("retained_text_bytes");
+  if (text.textHash !== (await sha256Utf8(completeText))) no("retained_text_hash");
+  if ((await digestParsedMappingManifest(pageInputs, evidenceInputs)) !== manifest.mappingManifestHash)
+    no("mapping_manifest_hash");
   const spanIds = new Set(spans.map((row) => row.id));
   const documentById = new Map(documents.map((row) => [row.id, row]));
   const expectedPublicationState =
@@ -1016,7 +1114,7 @@ export async function verifySealedParsedPayload(
         : generation.state === "ready" && generation.deactivatedAt !== null
           ? "historical"
           : undefined;
-  if (!expectedPublicationState) throw new ProofError("scan_conflict");
+  if (!expectedPublicationState) no("publication_state_undecidable");
   const documentKeys = new Set<string>();
   for (const document of documents) {
     if (
@@ -1024,13 +1122,17 @@ export async function verifySealedParsedPayload(
       document.processingGenerationId !== generation.id ||
       document.sourceItemId !== generation.sourceItemId ||
       document.sourceRevisionId !== generation.sourceRevisionId ||
-      document.sourceTextVersionId !== text.id ||
-      document.publicationState !== expectedPublicationState ||
+      document.sourceTextVersionId !== text.id
+    )
+      no("document_loop:scope");
+    if (document.publicationState !== expectedPublicationState)
+      no("document_loop:publication_state");
+    if (
       new Set(document.evidenceSpanIds).size !== document.evidenceSpanIds.length ||
       document.evidenceSpanIds.some((id) => !spanIds.has(id))
     )
-      throw new ProofError("scan_conflict");
-    if (documentKeys.has(document.documentKey)) throw new ProofError("scan_conflict");
+      no("document_loop:span_ids");
+    if (documentKeys.has(document.documentKey)) no("document_loop:duplicate_key");
     documentKeys.add(document.documentKey);
   }
   let chunkTextBytes = 0;
@@ -1039,26 +1141,32 @@ export async function verifySealedParsedPayload(
   const chunkOrdinals = new Map<string, number[]>();
   for (const chunk of chunks) {
     const document = documentById.get(chunk.documentId);
+    if (!document) no("chunk_loop:document");
     if (
-      !document ||
       chunk.spaceId !== generation.spaceId ||
       chunk.processingGenerationId !== generation.id ||
-      chunk.sourceTextVersionId !== text.id ||
-      !Number.isSafeInteger(chunk.ordinal) ||
-      chunk.ordinal < 0 ||
+      chunk.sourceTextVersionId !== text.id
+    )
+      no("chunk_loop:scope");
+    if (!Number.isSafeInteger(chunk.ordinal) || chunk.ordinal < 0) no("chunk_loop:ordinal");
+    if (
       chunk.start === null ||
       chunk.end === null ||
       !Number.isSafeInteger(chunk.start) ||
       !Number.isSafeInteger(chunk.end) ||
       chunk.start < 0 ||
       chunk.end <= chunk.start ||
-      chunk.end > completeText.length ||
-      completeText.slice(chunk.start, chunk.end) !== chunk.text ||
-      chunk.publicationState !== expectedPublicationState ||
+      chunk.end > completeText.length
+    )
+      no("chunk_loop:bounds");
+    if (completeText.slice(chunk.start, chunk.end) !== chunk.text) no("chunk_loop:text");
+    if (chunk.publicationState !== expectedPublicationState)
+      no("chunk_loop:publication_state");
+    if (
       new Set(chunk.evidenceSpanIds).size !== chunk.evidenceSpanIds.length ||
       chunk.evidenceSpanIds.some((id) => !document.evidenceSpanIds.includes(id))
     )
-      throw new ProofError("scan_conflict");
+      no("chunk_loop:span_ids");
     chunkTextBytes = checkedAdd(chunkTextBytes, utf8Length(chunk.text));
     coverage.push([chunk.start, chunk.end]);
     const ordinals = chunkOrdinals.get(chunk.documentId) ?? [];
@@ -1070,51 +1178,89 @@ export async function verifySealedParsedPayload(
   coverage.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
   let cursor = 0;
   for (const [start, end] of coverage) {
-    if (start > cursor) throw new ProofError("scan_conflict");
+    if (start > cursor) no("chunk_coverage_gap");
     cursor = Math.max(cursor, end);
   }
-  if (cursor !== completeText.length || !isParsedChunkTextWithinLimits(usesPageLocators, chunkTextBytes)) {
-    throw new ProofError("scan_conflict");
-  }
+  if (cursor !== completeText.length) no("chunk_coverage_end");
+  if (!isParsedChunkTextWithinLimits(usesPageLocators, chunkTextBytes)) no("chunk_text_limit");
   for (const ordinals of chunkOrdinals.values()) {
     ordinals.sort((left, right) => left - right);
-    if (ordinals.some((value, index) => value !== index)) throw new ProofError("scan_conflict");
+    if (ordinals.some((value, index) => value !== index)) no("chunk_ordinals");
   }
-  const pageBytes = pages.reduce((sum, row) => checkedAdd(sum, storedRowSize(row, MAX_PAGE_ROW_BYTES)), 0);
-  const evidenceBytes = spans.reduce((sum, row) => checkedAdd(sum, storedRowSize(row, MAX_EVIDENCE_ROW_BYTES)), 0);
+  const pageBytes = pages.reduce(
+    (sum, row) => checkedAdd(sum, storedRowSize(row, MAX_PAGE_ROW_BYTES, note, "row_size:page")),
+    0,
+  );
+  const evidenceBytes = spans.reduce(
+    (sum, row) => checkedAdd(sum, storedRowSize(row, MAX_EVIDENCE_ROW_BYTES, note, "row_size:evidence")),
+    0,
+  );
   const documentBytes = documents.reduce(
-    (sum, row) => checkedAdd(sum, storedRowSize({ ...row, publicationState: "staged" }, MAX_DOCUMENT_ROW_BYTES)),
+    (sum, row) =>
+      checkedAdd(
+        sum,
+        storedRowSize({ ...row, publicationState: "staged" }, MAX_DOCUMENT_ROW_BYTES, note, "row_size:document"),
+      ),
     0,
   );
   const chunkBytes = chunks.reduce(
-    (sum, row) => checkedAdd(sum, storedRowSize({ ...row, publicationState: "staged" }, MAX_CHUNK_ROW_BYTES)),
+    (sum, row) =>
+      checkedAdd(
+        sum,
+        storedRowSize({ ...row, publicationState: "staged" }, MAX_CHUNK_ROW_BYTES, note, "row_size:chunk"),
+      ),
     0,
   );
+  // These four are `utf8Length(JSON.stringify(row))` over whole rows, so they
+  // depend on how a row serializes and not only on what it contains. Named
+  // apart from the digests below, which are computed over explicit field lists
+  // and so do not.
   if (
     manifest.pageBytes !== pageBytes ||
     manifest.evidenceBytes !== evidenceBytes ||
     manifest.documentBytes !== documentBytes ||
-    manifest.chunkBytes !== chunkBytes ||
-    (usesPageLocators &&
-      !isParsedStoredPayloadWithinLimit(pageBytes, evidenceBytes, documentBytes, chunkBytes, storedRowSize(manifest, MAX_MANIFEST_BYTES))) ||
+    manifest.chunkBytes !== chunkBytes
+  )
+    no("manifest_byte_sizes");
+  if (
+    usesPageLocators &&
+    !isParsedStoredPayloadWithinLimit(
+      pageBytes,
+      evidenceBytes,
+      documentBytes,
+      chunkBytes,
+      storedRowSize(manifest, MAX_MANIFEST_BYTES),
+    )
+  )
+    no("stored_payload_limit");
+  if (
     manifest.pageDigest !==
-      (await digestRows(
-        "parsed-pages:v1",
-        pageInputs.map(({ ordinal, start, end, textHash }) => [ordinal, start, end, textHash]),
-      )) ||
+    (await digestRows(
+      "parsed-pages:v1",
+      pageInputs.map(({ ordinal, start, end, textHash }) => [ordinal, start, end, textHash]),
+    ))
+  )
+    no("page_digest");
+  if (
     manifest.evidenceDigest !==
-      (await digestRows("parsed-evidence:v1", canonicalParsedMappingManifestInput([], evidenceInputs)[2] as unknown[])) ||
+    (await digestRows("parsed-evidence:v1", canonicalParsedMappingManifestInput([], evidenceInputs)[2] as unknown[]))
+  )
+    no("evidence_digest");
+  if (
     manifest.documentDigest !==
-      (await digestRows(
-        "parsed-documents:v1",
-        documents.map((row) => [row.documentKey, row.title, row.docType, row.capturedAt, row.evidenceSpanIds]),
-      )) ||
-    manifest.chunkDigest !== (await digestRows("parsed-chunks:v1", chunkDigestRows)) ||
+    (await digestRows(
+      "parsed-documents:v1",
+      documents.map((row) => [row.documentKey, row.title, row.docType, row.capturedAt, row.evidenceSpanIds]),
+    ))
+  )
+    no("document_digest");
+  if (manifest.chunkDigest !== (await digestRows("parsed-chunks:v1", chunkDigestRows))) no("chunk_digest");
+  if (
     manifest.retainedTextHash !== text.textHash ||
     manifest.retainedTextUtf8Length !== textBytes ||
     manifest.retainedTextUtf16Length !== completeText.length
   )
-    throw new ProofError("scan_conflict");
+    no("retained_text_fields");
   return {
     actualPageCount: pages.length,
     actualEvidenceSpanCount: spans.length,
