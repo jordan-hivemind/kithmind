@@ -28,8 +28,12 @@
 // hash, the coverage-without-gaps check, and the manifest's four content
 // digests from the rows it is given, and `verifySealedParsedPayload` redoes
 // every one of those computations against whatever rows the database holds
-// *now* and rejects on any mismatch -- byte-for-byte, digest-for-digest, the
-// same as the original. `collectPayloadRows` keeps PR199's rule: a card
+// *now* and rejects on any mismatch, digest for digest, the same as the
+// original. The one thing it deliberately does not redo is the manifest's
+// four stored-byte totals, which measure a row's serialized shape rather than
+// its content; see P2-100d at that site.
+//
+// `collectPayloadRows` keeps PR199's rule: a card
 // runner's own evidence span (the only kind carrying
 // `cardExtractionFingerprints`, which is `NULL` for every parser span) never
 // counts against the parser's manifest, so a document a card had staged
@@ -209,17 +213,11 @@ export const PAYLOAD_VERIFY_DETAILS = [
   "chunk_coverage_end",
   "chunk_text_limit",
   "chunk_ordinals",
-  "manifest_byte_sizes",
-  "stored_payload_limit",
   "page_digest",
   "evidence_digest",
   "document_digest",
   "chunk_digest",
   "retained_text_fields",
-  "row_size:page",
-  "row_size:evidence",
-  "row_size:document",
-  "row_size:chunk",
 ] as const;
 
 export type PayloadVerifyDetail = (typeof PAYLOAD_VERIFY_DETAILS)[number];
@@ -232,16 +230,10 @@ function refuse(note: PayloadVerifyNote | undefined, detail: PayloadVerifyDetail
   throw new ProofError("scan_conflict");
 }
 
-function storedRowSize(
-  row: Record<string, unknown>,
-  maximum: number,
-  note?: PayloadVerifyNote,
-  detail?: PayloadVerifyDetail,
-): number {
+function storedRowSize(row: Record<string, unknown>, maximum: number): number {
   try {
     return rowSize(row, maximum);
   } catch {
-    if (detail) refuse(note, detail);
     throw new ProofError("scan_conflict");
   }
 }
@@ -1187,52 +1179,29 @@ export async function verifySealedParsedPayload(
     ordinals.sort((left, right) => left - right);
     if (ordinals.some((value, index) => value !== index)) no("chunk_ordinals");
   }
-  const pageBytes = pages.reduce(
-    (sum, row) => checkedAdd(sum, storedRowSize(row, MAX_PAGE_ROW_BYTES, note, "row_size:page")),
-    0,
-  );
-  const evidenceBytes = spans.reduce(
-    (sum, row) => checkedAdd(sum, storedRowSize(row, MAX_EVIDENCE_ROW_BYTES, note, "row_size:evidence")),
-    0,
-  );
-  const documentBytes = documents.reduce(
-    (sum, row) =>
-      checkedAdd(
-        sum,
-        storedRowSize({ ...row, publicationState: "staged" }, MAX_DOCUMENT_ROW_BYTES, note, "row_size:document"),
-      ),
-    0,
-  );
-  const chunkBytes = chunks.reduce(
-    (sum, row) =>
-      checkedAdd(
-        sum,
-        storedRowSize({ ...row, publicationState: "staged" }, MAX_CHUNK_ROW_BYTES, note, "row_size:chunk"),
-      ),
-    0,
-  );
-  // These four are `utf8Length(JSON.stringify(row))` over whole rows, so they
-  // depend on how a row serializes and not only on what it contains. Named
-  // apart from the digests below, which are computed over explicit field lists
-  // and so do not.
-  if (
-    manifest.pageBytes !== pageBytes ||
-    manifest.evidenceBytes !== evidenceBytes ||
-    manifest.documentBytes !== documentBytes ||
-    manifest.chunkBytes !== chunkBytes
-  )
-    no("manifest_byte_sizes");
-  if (
-    usesPageLocators &&
-    !isParsedStoredPayloadWithinLimit(
-      pageBytes,
-      evidenceBytes,
-      documentBytes,
-      chunkBytes,
-      storedRowSize(manifest, MAX_MANIFEST_BYTES),
-    )
-  )
-    no("stored_payload_limit");
+  // P2-100d. The verifier does not re-measure stored row bytes, and does not
+  // compare the manifest's four byte totals with a recomputation.
+  //
+  // Those totals are `utf8Length(JSON.stringify(<whole row>))`, so they depend
+  // on a row's *shape* and not only on its content: a row migrated from Convex
+  // (`_id`, `_creationTime`, absent empty fields) and the same row on
+  // PostgreSQL (`id`, `space_id`, an ISO `created_at`, an explicit `null` per
+  // nullable column) serialize to different lengths, and adding one nullable
+  // column to any of the four tables changes the length of every existing row.
+  // Re-deriving a shape-dependent number and calling a mismatch a proof
+  // failure refuses payloads whose content is intact, which is what buried
+  // every migrated document in `unavailable`.
+  //
+  // Nothing is lost. The byte totals are a write-time budget, enforced where a
+  // budget belongs: per row against its ceiling in `insertParsed*`, and again
+  // at `sealParsedPayload`, which recomputes all four from the rows it seals,
+  // requires them to equal what staging accumulated, and rejects a sealed
+  // payload over `MAX_PARSED_STORED_PAYLOAD_BYTES`. They were never an
+  // integrity check: a byte count cannot detect an edit that preserves length,
+  // and every edit it could detect is already caught by the id sets, the row
+  // counts, the page and quote hashes, the retained-text hash, the mapping
+  // manifest hash and the four content digests below, each computed over an
+  // explicit field list and so shape independent.
   if (
     manifest.pageDigest !==
     (await digestRows(
