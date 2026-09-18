@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import {
@@ -134,6 +137,39 @@ test("runDbBackup routes --engine postgres to the postgres adapter only, and --v
     result: { status: "passed", snapshotId: "s1" },
     verification: { status: "passed" },
   });
+});
+
+// P2-101: the restore proof's own code has to survive two process boundaries
+// and the state runner to be worth reporting at all. This proves the last
+// hop: a verify failure carrying `restore_proof_failed:<code>` reaches the
+// caller and the durable status file instead of being flattened.
+test("a restore-proof failure code reaches the caller and the status file", async (t) => {
+  const stateDirectory = await mkdtemp(join(homedir(), ".kith-db-backup-state-"));
+  t.after(() => rm(stateDirectory, { recursive: true, force: true }));
+  const failure = Object.assign(new Error("verify failed"), {
+    code: "restore_proof_failed:restore_parity_failed",
+  });
+  const postgresModule = {
+    loadPostgresBackupConfig: async () => ({ stateDirectory }),
+    loadPostgresVerifyConfig: async () => ({}),
+    runPostgresDatabaseBackup: async () => ({ status: "passed", snapshotId: "s1" }),
+    verifyPostgresBackup: async () => {
+      throw failure;
+    },
+  };
+  await assert.rejects(
+    runDbBackup(
+      ["--engine", "postgres", "--config", "/abs/pg.json", "--verify", "--verify-config", "/abs/verify.json"],
+      { postgresModule },
+    ),
+    (error) => error.code === "restore_proof_failed:restore_parity_failed",
+  );
+  const journal = JSON.parse(
+    await readFile(join(stateDirectory, "database-backup-status.json"), "utf8"),
+  );
+  assert.equal(journal.state, "failed");
+  assert.equal(journal.stage, "verify");
+  assert.equal(journal.failureCode, "restore_proof_failed:restore_parity_failed");
 });
 
 test("postgres CLI cannot report success without restore verification", () => {

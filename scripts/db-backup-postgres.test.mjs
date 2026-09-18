@@ -8,6 +8,7 @@ import {
   PostgresBackupError,
   WRITER_LEASE_TABLES,
   buildManifest,
+  exportSnapshot,
   loadPostgresBackupConfig,
   loadPostgresVerifyConfig,
   requireNoActiveWriters,
@@ -362,4 +363,43 @@ test("loadPostgresVerifyConfig never accepts a database connection field", async
     loadPostgresVerifyConfig(configPath),
     (error) => error.code === "config_invalid",
   );
+});
+
+// P2-101: the snapshot holder is the one long-lived session in the recipe. A
+// fake psql stands in for a hosted server here, so both failure modes are
+// covered without a database: an answer that is not a snapshot id, and a
+// session that is gone by the time the dump finishes.
+async function fakePsql(root, name, body) {
+  const path = join(root, name);
+  await writeFile(path, `#!/bin/sh\n${body}\n`, { mode: 0o700 });
+  return path;
+}
+
+test("a holder that answers with something other than a snapshot id fails closed", async (t) => {
+  const { root } = await fixture(t);
+  // Reads the script on stdin, answers with a line that is not an id.
+  const psql = await fakePsql(root, "not-an-id.sh", "printf 'ERROR: pooled\\n'\nexec cat >/dev/null");
+  await assert.rejects(
+    exportSnapshot(psql, "postgres://fake/db", 5_000),
+    (error) => error.code === "snapshot_export_failed",
+  );
+});
+
+test("a holder that exits before the dump finishes fails the run rather than publishing", async (t) => {
+  const { root } = await fixture(t);
+  const psql = await fakePsql(root, "dies.sh", "printf '00000003-0000001B-1\\n'\nexit 1");
+  const snapshot = await exportSnapshot(psql, "postgres://fake/db", 5_000);
+  assert.equal(snapshot.id, "00000003-0000001B-1");
+  await new Promise((wake) => setTimeout(wake, 50));
+  await assert.rejects(
+    snapshot.release(),
+    (error) => error.code === "snapshot_holder_lost",
+  );
+});
+
+test("a holder that survives the dump releases cleanly", async (t) => {
+  const { root } = await fixture(t);
+  const psql = await fakePsql(root, "holds.sh", "printf '00000003-0000001B-1\\n'\nexec cat >/dev/null");
+  const snapshot = await exportSnapshot(psql, "postgres://fake/db", 5_000);
+  await snapshot.release();
 });

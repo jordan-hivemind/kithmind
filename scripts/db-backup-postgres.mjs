@@ -40,7 +40,8 @@ import {
   text as sharedText,
   writeAll,
 } from "./run-database-backup.mjs";
-import { capturePostgresParity } from "./db-postgres-parity.mjs";
+import { capturePostgresParity, SNAPSHOT_ID } from "./db-postgres-parity.mjs";
+import { RESTORE_PROOF_CODES } from "./db-restore-proof.mjs";
 
 process.umask(0o077);
 
@@ -105,6 +106,74 @@ export class PostgresBackupError extends Error {
 }
 function fail(code, detail) {
   throw new PostgresBackupError(code, detail);
+}
+
+// Every code this module can report, including the restore proof's own codes
+// re-exported under a prefix so the verify worker can say which check inside
+// the proof failed without inventing new text. `db-backup-failure-codes.
+// test.mjs` asserts this set stays complete as the module changes.
+export const POSTGRES_BACKUP_CODES = new Set([
+  "age_version_mismatch",
+  "command_failed",
+  "command_not_canonical",
+  "command_not_protected",
+  "command_output_too_large",
+  "command_spawn_failed",
+  "command_timeout",
+  "config_invalid",
+  "constraint_inventory_invalid",
+  "database_identity_invalid",
+  "directory_not_private",
+  "dump_size_out_of_bounds",
+  "file_not_protected",
+  "parity_manifest_invalid",
+  "path_not_canonical",
+  "path_not_protected",
+  "postgres_client_version_mismatch",
+  "preflight_constraints_invalid",
+  "preflight_database_mismatch",
+  "preflight_finance_schema_mismatch",
+  "preflight_kith_schema_mismatch",
+  "preflight_query_failed",
+  "published_manifest_invalid",
+  "restic_backup_summary_missing",
+  "restic_repository_identity_mismatch",
+  "restic_repository_unreadable",
+  "restic_version_mismatch",
+  "restore_worker_output_invalid",
+  "row_count_invalid",
+  "runner_failed",
+  "secret_command_empty",
+  "snapshot_export_failed",
+  "snapshot_holder_lost",
+  "snapshot_id_invalid",
+  "snapshot_not_importable",
+  "table_inventory_invalid",
+  "unknown",
+  "usage_invalid",
+  "verify_payload_invalid",
+  "verify_readback_mismatch",
+  "verify_worker_output_invalid",
+  "writer_active",
+  "writer_check_failed",
+  ...[...RESTORE_PROOF_CODES, "unknown"].map((code) => `restore_proof_failed:${code}`),
+]);
+
+/** Reads a failed child's own `{"status":"failed","code":...}` line and
+ * returns that code, accepting only codes the child is known to emit. An
+ * unreadable or unknown answer becomes `unknown` rather than free text, so a
+ * failure code is always one of a closed set. */
+function childFailureCode(error, allowed, prefix = "") {
+  const lines = String(error?.stderr ?? "").trim().split("\n");
+  let parsed;
+  try {
+    parsed = JSON.parse(lines[lines.length - 1]);
+  } catch {
+    parsed = undefined;
+  }
+  const code =
+    parsed?.status === "failed" && allowed.has(parsed.code) ? parsed.code : "unknown";
+  return `${prefix}${code}`;
 }
 
 // A restic repository is either a local absolute path or restic's rclone
@@ -406,10 +475,14 @@ function runCapture(command, args, options = {}) {
     );
     child.once("close", (code, signal) => {
       if (signal || code !== 0) {
-        finish(
-          new PostgresBackupError("command_failed"),
-          undefined,
-        );
+        // Carry the child's own stderr on the error. A child of this recipe
+        // reports a closed-enum failure code as JSON there, and dropping it
+        // here is what turned every restore-proof failure into a bare
+        // `command_failed`. Only `childFailureCode` reads it, and only through
+        // an allowlist, so nothing free-form escapes.
+        const failure = new PostgresBackupError("command_failed");
+        failure.stderr = Buffer.concat(stderr);
+        finish(failure, undefined);
         return;
       }
       finish(undefined, {
@@ -586,6 +659,134 @@ export async function requireNoActiveWriters(runQuery) {
   }
 }
 
+// How often the holder proves it is still there. The session sits idle in a
+// transaction for the whole capture and dump, about seven minutes on the
+// owner's archive, which a hosted platform is entitled to cut off.
+const SNAPSHOT_KEEPALIVE_MS = 60_000;
+
+/** Opens a REPEATABLE READ transaction on the source and exports its
+ * snapshot, then holds that transaction open until `release()`. `pg_dump
+ * --snapshot` and the parity capture both import the same id, so the dump and
+ * the manifest parity that the restore proof compares against describe one
+ * consistent instant. Without this the two read a database that never stops
+ * being written to, and no restore could ever match the manifest.
+ *
+ * The session clears its own `idle_in_transaction_session_timeout` and
+ * `statement_timeout`, and runs a trivial statement every minute besides: a
+ * hosted source may cap or ignore what a session asks for, and a holder killed
+ * mid-dump would fail the run every day. The connection must be a direct one,
+ * not a pooled endpoint, because one session has to hold the snapshot open
+ * while others import it.
+ *
+ * `release()` fails if the holding session died in the meantime, because a
+ * snapshot whose exporting transaction ended no longer guarantees anything. */
+export function exportSnapshot(psqlPath, connectionString, timeoutMs) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    let child;
+    try {
+      child = spawn(
+        psqlPath,
+        [connectionString, "-X", "-q", "-v", "ON_ERROR_STOP=1", "-tA", "-f", "-"],
+        {
+          stdio: ["pipe", "pipe", "pipe"],
+          env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "" },
+        },
+      );
+    } catch {
+      rejectPromise(new PostgresBackupError("command_spawn_failed"));
+      return;
+    }
+    let settled = false;
+    let output = "";
+    let keepalive;
+    const stopKeepalive = () => clearInterval(keepalive);
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) {
+        stopKeepalive();
+        child.kill("SIGKILL");
+        rejectPromise(error);
+      } else resolvePromise(value);
+    };
+    const timer = setTimeout(
+      () => finish(new PostgresBackupError("command_timeout")),
+      timeoutMs,
+    );
+    child.stderr.resume();
+    child.stdin.on("error", () => {});
+    child.stdout.on("data", (chunk) => {
+      output += chunk.toString("utf8");
+      if (!output.includes("\n")) return;
+      const id = output.split("\n")[0].trim();
+      if (!SNAPSHOT_ID.test(id)) {
+        finish(new PostgresBackupError("snapshot_export_failed"));
+        return;
+      }
+      keepalive = setInterval(() => {
+        if (child.exitCode === null && child.signalCode === null) {
+          child.stdin.write("select 1;\n");
+        }
+      }, SNAPSHOT_KEEPALIVE_MS);
+      keepalive.unref();
+      finish(undefined, {
+        id,
+        abort: () => {
+          stopKeepalive();
+          child.kill("SIGKILL");
+        },
+        release: () =>
+          new Promise((resolveRelease, rejectRelease) => {
+            stopKeepalive();
+            if (child.exitCode !== null || child.signalCode !== null) {
+              rejectRelease(new PostgresBackupError("snapshot_holder_lost"));
+              return;
+            }
+            const releaseTimer = setTimeout(() => {
+              child.kill("SIGKILL");
+            }, timeoutMs);
+            child.once("close", (code, signal) => {
+              clearTimeout(releaseTimer);
+              if (signal || code !== 0)
+                rejectRelease(new PostgresBackupError("snapshot_holder_lost"));
+              else resolveRelease();
+            });
+            child.stdin.end("commit;\n");
+          }),
+      });
+    });
+    child.once("error", () =>
+      finish(new PostgresBackupError("command_spawn_failed")),
+    );
+    child.once("close", () =>
+      finish(new PostgresBackupError("snapshot_export_failed")),
+    );
+    child.stdin.write(
+      "set idle_in_transaction_session_timeout = 0;\nset statement_timeout = 0;\nbegin transaction isolation level repeatable read;\nselect pg_export_snapshot();\n",
+    );
+  });
+}
+
+/** Proves a second session can import the snapshot before the dump commits to
+ * it. A pooled endpoint hands each session a different backend, so the import
+ * fails there; failing here names that cause instead of surfacing a generic
+ * command failure seven minutes into the run. */
+async function requireImportableSnapshot(config, connectionString, snapshotId) {
+  try {
+    await runCapture(
+      config.psqlPath,
+      [connectionString, "-X", "-q", "-v", "ON_ERROR_STOP=1", "-tA", "-f", "-"],
+      {
+        timeoutMs: config.timeoutMs,
+        input: `begin transaction isolation level repeatable read;\nset transaction snapshot '${snapshotId}';\nselect 1;\ncommit;\n`,
+      },
+    );
+  } catch {
+    fail("snapshot_not_importable");
+  }
+}
+
 async function freshStagingDirectory(config, tag) {
   const directory = join(
     config.stagingRoot,
@@ -597,11 +798,12 @@ async function freshStagingDirectory(config, tag) {
   return directory;
 }
 
-async function dumpBothSchemas(config, connectionString, stagingDirectory) {
+async function dumpBothSchemas(config, connectionString, stagingDirectory, snapshotId) {
   const dumpPath = join(stagingDirectory, "kithmind.dump");
   await runCapture(
     config.pgDumpPath,
     [
+      `--snapshot=${snapshotId}`,
       "--format=custom",
       "--no-owner",
       "--no-acl",
@@ -801,16 +1003,6 @@ export async function runPostgresDatabaseBackup(config) {
   // cutover, since the dated recipe runs on a schedule against a live
   // database that may have a worker or deferred-work drain mid-write.
   await requireNoActiveWriters((sql) => psqlScalar(config, connectionString, sql));
-  // The cutover recipe quiesces every writer before this proof. These
-  // separately streamed table reads and pg_dump must observe that same stable
-  // source; without quiescence, no collection of independent SQL sessions can
-  // honestly claim one exported snapshot.
-  const parity = await capturePostgresParity(
-    config.psqlPath,
-    connectionString,
-    config.timeoutMs,
-  );
-  if (parity.invalidConstraints !== 0) fail("preflight_constraints_invalid");
   const passwordCommandArgument_ = await passwordCommandArgument(
     config.resticPasswordCommand,
   );
@@ -825,11 +1017,38 @@ export async function runPostgresDatabaseBackup(config) {
     config,
     "postgres-backup",
   );
-  const dumpPath = await dumpBothSchemas(
-    config,
+  // One exported snapshot covers both the parity capture and pg_dump, so the
+  // manifest describes exactly the database state the dump contains even
+  // though a watcher, the deferred-work daemon or an MCP write may commit at
+  // any moment. Everything that can fail cheaply has already run, so the
+  // holding transaction stays open only for the capture and the dump.
+  const snapshot = await exportSnapshot(
+    config.psqlPath,
     connectionString,
-    stagingDirectory,
+    config.timeoutMs,
   );
+  let parity;
+  let dumpPath;
+  try {
+    await requireImportableSnapshot(config, connectionString, snapshot.id);
+    parity = await capturePostgresParity(
+      config.psqlPath,
+      connectionString,
+      config.timeoutMs,
+      snapshot.id,
+    );
+    if (parity.invalidConstraints !== 0) fail("preflight_constraints_invalid");
+    dumpPath = await dumpBothSchemas(
+      config,
+      connectionString,
+      stagingDirectory,
+      snapshot.id,
+    );
+  } catch (error) {
+    snapshot.abort();
+    throw error;
+  }
+  await snapshot.release();
   const dumpDigest = await requireBoundedFile(dumpPath);
   const manifest = buildManifest({
     createdAt: new Date().toISOString(),
@@ -988,7 +1207,7 @@ async function runVerifyWorker(payload) {
         mismatches.push(`${objectName}: plaintext byte mismatch`);
       }
     }
-    if (mismatches.length) return { status: "failed", repositoryId, mismatches };
+    if (mismatches.length) fail("verify_readback_mismatch", mismatches.join("; "));
     let publishedManifest;
     try {
       publishedManifest = JSON.parse(
@@ -1008,20 +1227,26 @@ async function runVerifyWorker(payload) {
       dumpFile.sha256 !== backupResult.plaintexts["kithmind.dump.age"].sha256 ||
       dumpFile.byteLength !== backupResult.plaintexts["kithmind.dump.age"].byteLength
     ) fail("published_manifest_invalid");
-    const restoreResult = await runCapture(
-      process.execPath,
-      [
-        fileURLToPath(new URL("./db-restore-proof.mjs", import.meta.url)),
-        "--isolated",
-        "--config",
-        config.restoreProofConfigPath,
-        "--dump",
-        join(workDirectory, "kithmind.dump.age.plain"),
-        "--manifest",
-        join(workDirectory, "manifest.json.age.plain"),
-      ],
-      { timeoutMs: config.timeoutMs, maxOutputBytes: MAX_COMMAND_OUTPUT_BYTES },
-    );
+    let restoreResult;
+    try {
+      restoreResult = await runCapture(
+        process.execPath,
+        [
+          fileURLToPath(new URL("./db-restore-proof.mjs", import.meta.url)),
+          "--isolated",
+          "--config",
+          config.restoreProofConfigPath,
+          "--dump",
+          join(workDirectory, "kithmind.dump.age.plain"),
+          "--manifest",
+          join(workDirectory, "manifest.json.age.plain"),
+        ],
+        { timeoutMs: config.timeoutMs, maxOutputBytes: MAX_COMMAND_OUTPUT_BYTES },
+      );
+    } catch (error) {
+      if (error?.code !== "command_failed") throw error;
+      fail(childFailureCode(error, RESTORE_PROOF_CODES, "restore_proof_failed:"));
+    }
     let restore;
     try {
       restore = JSON.parse(restoreResult.stdout.toString("utf8"));
@@ -1063,15 +1288,24 @@ export async function verifyPostgresBackup(verifyConfig, backupResult) {
     JSON.stringify({ config, backupResult }),
     "utf8",
   );
-  const result = await runCapture(
-    process.execPath,
-    [workerPath, "--verify-worker"],
-    {
-      timeoutMs: config.timeoutMs,
-      maxOutputBytes: MAX_COMMAND_OUTPUT_BYTES,
-      input: payload,
-    },
-  );
+  let result;
+  try {
+    result = await runCapture(
+      process.execPath,
+      [workerPath, "--verify-worker"],
+      {
+        timeoutMs: config.timeoutMs,
+        maxOutputBytes: MAX_COMMAND_OUTPUT_BYTES,
+        input: payload,
+      },
+    );
+  } catch (error) {
+    // The worker's own code, including a `restore_proof_failed:<code>` it
+    // passed up from the restore proof, so the status file and the operator's
+    // log name the check that failed instead of `command_failed`.
+    if (error?.code !== "command_failed") throw error;
+    fail(childFailureCode(error, POSTGRES_BACKUP_CODES));
+  }
   let parsed;
   try {
     parsed = JSON.parse(result.stdout.toString("utf8"));
@@ -1125,8 +1359,11 @@ async function main() {
 }
 if (isMain())
   main().catch((error) => {
-    const code =
-      error instanceof PostgresBackupError ? error.code : "runner_failed";
+    // Membership, not class: a `PostgresParityError` from the parity capture
+    // carries a code from this same enum and deserves to be reported by it.
+    const code = POSTGRES_BACKUP_CODES.has(error?.code)
+      ? error.code
+      : "runner_failed";
     const detail = error instanceof PostgresBackupError ? error.detail : undefined;
     process.stderr.write(
       `${JSON.stringify({ status: "failed", code, ...(detail ? { detail } : {}) })}\n`,

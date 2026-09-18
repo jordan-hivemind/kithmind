@@ -11,7 +11,10 @@
 // plan's 14-day read-only window.
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { runWithDatabaseBackupState } from "./run-database-backup.mjs";
+import {
+  DatabaseBackupRunnerError,
+  runWithDatabaseBackupState,
+} from "./run-database-backup.mjs";
 
 export class DbBackupCliError extends Error {
   constructor(code) {
@@ -102,7 +105,15 @@ async function main() {
 }
 if (isMain())
   main().catch((error) => {
-    const code = error instanceof DbBackupCliError ? error.code : "runner_failed";
+    // `runWithDatabaseBackupState` already recorded this code in the status
+    // file and rethrows it. Reporting `runner_failed` here instead is what
+    // hid every engine failure, including the restore proof's own code, from
+    // the operator's log.
+    const code =
+      error instanceof DbBackupCliError ||
+      error instanceof DatabaseBackupRunnerError
+        ? error.code
+        : "runner_failed";
     process.stderr.write(`${JSON.stringify({ status: "failed", code })}\n`);
     process.exitCode = 1;
   });

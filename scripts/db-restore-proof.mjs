@@ -6,6 +6,41 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { capturePostgresParity, hashFileSha256, parityEquals, postgresIdentity, validatePostgresParity } from "./db-postgres-parity.mjs";
 
+// Every code this script can report, so a caller can pass one through without
+// echoing free text from a child process. `db-backup-failure-codes.test.mjs`
+// asserts this set stays complete as the script changes.
+export const RESTORE_PROOF_CODES = new Set([
+  "citation_hash_mismatch",
+  "command_failed",
+  "command_output_too_large",
+  "command_timeout",
+  "config_invalid",
+  "constraint_inventory_invalid",
+  "database_identity_invalid",
+  "dump_manifest_mismatch",
+  "file_not_protected",
+  "manifest_invalid",
+  "parity_manifest_invalid",
+  "postgres_client_version_mismatch",
+  "restore_not_isolated",
+  "restore_parity_failed",
+  "restore_target_not_empty",
+  "row_count_invalid",
+  "runner_failed",
+  "scratch_database_name_invalid",
+  "scratch_reset_failed",
+  "secret_command_empty",
+  "snapshot_id_invalid",
+  "source_schema_mismatch",
+  "table_inventory_invalid",
+  "usage_invalid",
+]);
+
+// A restore target this proof is allowed to empty by itself. The operator opts
+// in with `scratchDatabase: true` and a database named with this prefix; any
+// other name is refused rather than touched.
+const SCRATCH_DATABASE = /^kith_restore_proof[a-z0-9_]*$/;
+
 // The `pg` client and `@repo/kith-store`'s built documents read surface,
 // loaded from the sibling package rather than a scripts/-local dependency
 // (this script otherwise shells out to `psql`/`pg_restore` only, on purpose,
@@ -49,9 +84,14 @@ function command(value) {
   return { path: absolute(row.path), args: row.args };
 }
 function parseConfig(value) {
-  const row = exact(value, ["version", "pgRestorePath", "psqlPath", "sourceConnectionCommand", "destinationConnectionCommand", "expectedFinanceSchemaVersion", "expectedKithSchemaVersion", "timeoutMs"]);
+  // `scratchDatabase` is optional, so a configuration written before this key
+  // existed still parses and still behaves exactly as it did: an empty target
+  // is required and is left populated.
+  const optional = value && typeof value === "object" && "scratchDatabase" in value ? ["scratchDatabase"] : [];
+  const row = exact(value, ["version", "pgRestorePath", "psqlPath", "sourceConnectionCommand", "destinationConnectionCommand", "expectedFinanceSchemaVersion", "expectedKithSchemaVersion", "timeoutMs", ...optional]);
   if (row.version !== 1 || !Number.isSafeInteger(row.expectedFinanceSchemaVersion) || !Number.isSafeInteger(row.expectedKithSchemaVersion) || row.expectedFinanceSchemaVersion < 1 || row.expectedKithSchemaVersion < 1 || !Number.isSafeInteger(row.timeoutMs) || row.timeoutMs < 1000 || row.timeoutMs > 3_600_000) fail("config_invalid");
-  return { version: 1, pgRestorePath: absolute(row.pgRestorePath), psqlPath: absolute(row.psqlPath), sourceConnectionCommand: command(row.sourceConnectionCommand), destinationConnectionCommand: command(row.destinationConnectionCommand), expectedFinanceSchemaVersion: row.expectedFinanceSchemaVersion, expectedKithSchemaVersion: row.expectedKithSchemaVersion, timeoutMs: row.timeoutMs };
+  if (optional.length && typeof row.scratchDatabase !== "boolean") fail("config_invalid");
+  return { version: 1, pgRestorePath: absolute(row.pgRestorePath), psqlPath: absolute(row.psqlPath), sourceConnectionCommand: command(row.sourceConnectionCommand), destinationConnectionCommand: command(row.destinationConnectionCommand), expectedFinanceSchemaVersion: row.expectedFinanceSchemaVersion, expectedKithSchemaVersion: row.expectedKithSchemaVersion, timeoutMs: row.timeoutMs, scratchDatabase: row.scratchDatabase === true };
 }
 function run(path, args, timeoutMs) {
   return new Promise((resolve, reject) => {
@@ -81,17 +121,48 @@ async function schemaVersions(config, connection) {
     kithVersion: Number(await scalar(config, connection, "select max(version) from kith.schema_version")),
   };
 }
+// A session's own temporary schemas (`pg_temp_N` and its `pg_toast_temp_N`)
+// are neither leftovers to drop nor evidence that the target is dirty: they
+// belong to a live backend and vanish with it.
+const SYSTEM_SCHEMAS = "and nspname !~ '^pg_(toast|temp)'";
 async function assertEmptyTarget(config, connection) {
   const count = Number(await scalar(config, connection, `
     select
       (select count(*) from pg_namespace
         where nspname not in ('pg_catalog','information_schema','public')
-          and nspname !~ '^pg_toast') +
+          ${SYSTEM_SCHEMAS}) +
       (select count(*) from pg_class c join pg_namespace n on n.oid=c.relnamespace
         where c.relkind in ('r','p','v','m','S')
           and n.nspname not in ('pg_catalog','information_schema')
-          and n.nspname !~ '^pg_toast')`));
+          and n.nspname !~ '^pg_(toast|temp)')`));
   if (count !== 0) fail("restore_target_not_empty");
+}
+/** Empties an opted-in scratch target so a run can start where the previous
+ * run's restored copy was left behind, and so a passing run leaves nothing
+ * behind either. It drops schemas through the destination connection only, so
+ * it can reach no other database; the caller has already proven this
+ * connection is not the source and that the name is allowlisted. Dropping
+ * `public` takes the restored `vector` extension with it, which the dump's own
+ * `CREATE EXTENSION` puts back. */
+async function resetScratchTarget(config, connection) {
+  try {
+    await run(config.psqlPath, [connection, "-X", "-v", "ON_ERROR_STOP=1", "-c", `
+      drop schema if exists public cascade;
+      create schema public;
+      do $$
+      declare target text;
+      begin
+        for target in select nspname from pg_namespace
+          where nspname not in ('pg_catalog','information_schema','public')
+            ${SYSTEM_SCHEMAS}
+        loop
+          execute format('drop schema %I cascade', target);
+        end loop;
+      end
+      $$;`], config.timeoutMs);
+  } catch {
+    fail("scratch_reset_failed");
+  }
 }
 async function requirePostgres17(binary, timeoutMs) {
   if (!/PostgreSQL\) 17\./.test(await run(binary, ["--version"], timeoutMs))) fail("postgres_client_version_mismatch");
@@ -213,20 +284,35 @@ export async function restorePostgresProof(config, dumpPath, manifestPath) {
     postgresIdentity(config.psqlPath, destination, config.timeoutMs),
   ]);
   if (sameDatabase(sourceIdentity, destinationIdentity)) fail("restore_not_isolated");
+  if (config.scratchDatabase) {
+    if (!SCRATCH_DATABASE.test(destinationIdentity.database)) fail("scratch_database_name_invalid");
+    // A second guard before anything is dropped, by name rather than by
+    // server identity: a target carrying the source's name, or the name the
+    // manifest records, is refused even if the identity check let it through.
+    if (destinationIdentity.database === sourceIdentity.database ||
+      destinationIdentity.database === manifest.database) fail("restore_not_isolated");
+    await resetScratchTarget(config, destination);
+  }
   await assertEmptyTarget(config, destination);
+  // Source-side checks that still hold on a database being written to: it is
+  // reachable, it is the database the dump came from, and its migrations are
+  // where this recipe expects them. Its row contents are deliberately not
+  // compared with the manifest: the source has moved on since the dump, and
+  // the manifest's parity was captured inside the dump's own exported
+  // snapshot, so the restored-versus-manifest comparison below is what proves
+  // the published dump restores to what was dumped.
   const beforeVersions = await schemaVersions(config, source);
   if (manifest.database !== sourceIdentity.database ||
     beforeVersions.financeVersion !== config.expectedFinanceSchemaVersion ||
     beforeVersions.kithVersion !== config.expectedKithSchemaVersion ||
     manifest.financeSchemaVersion !== beforeVersions.financeVersion ||
-    manifest.kithSchemaVersion !== beforeVersions.kithVersion) fail("source_parity_failed");
-  const sourceParity = await capturePostgresParity(config.psqlPath, source, config.timeoutMs);
-  if (!parityEquals(sourceParity, manifest.parity) || sourceParity.invalidConstraints !== 0) fail("source_parity_failed");
+    manifest.kithSchemaVersion !== beforeVersions.kithVersion) fail("source_schema_mismatch");
   await run(config.pgRestorePath, ["--exit-on-error", "--no-owner", "--no-acl", "--dbname", destination, dumpPath], config.timeoutMs);
   const afterVersions = await schemaVersions(config, destination);
   const restoredParity = await capturePostgresParity(config.psqlPath, destination, config.timeoutMs);
-  if (afterVersions.financeVersion !== beforeVersions.financeVersion || afterVersions.kithVersion !== beforeVersions.kithVersion || restoredParity.invalidConstraints !== 0 || !parityEquals(restoredParity, manifest.parity)) fail("restore_parity_failed");
+  if (afterVersions.financeVersion !== manifest.financeSchemaVersion || afterVersions.kithVersion !== manifest.kithSchemaVersion || restoredParity.invalidConstraints !== 0 || !parityEquals(restoredParity, manifest.parity)) fail("restore_parity_failed");
   const citationSample = await sampleCitedAnswer(destination, config.timeoutMs);
+  if (config.scratchDatabase) await resetScratchTarget(config, destination);
   return {
     status: "passed",
     source: beforeVersions,
@@ -245,4 +331,7 @@ async function main() {
   const result = await restorePostgresProof(await loadRestoreProofConfig(process.argv[4]), process.argv[6], process.argv[8]);
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }
-if (process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) main().catch((error) => { process.stderr.write(`${JSON.stringify({ status: "failed", code: error.code ?? "runner_failed" })}\n`); process.exitCode = 1; });
+// Only a code from the closed enum above ever leaves this process: a driver
+// (or a library) error carrying its own `code` must not become the reported
+// failure code.
+if (process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) main().catch((error) => { process.stderr.write(`${JSON.stringify({ status: "failed", code: RESTORE_PROOF_CODES.has(error?.code) ? error.code : "runner_failed" })}\n`); process.exitCode = 1; });

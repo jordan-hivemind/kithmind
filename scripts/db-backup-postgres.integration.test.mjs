@@ -134,6 +134,35 @@ test("postgres runner publishes, independently reads back, decrypts, and restore
     expectedResticRepositoryId: repositoryId, host: "synthetic-host",
     operationId: "synthetic-proof", timeoutMs: 60_000,
   };
+  // The owner's source is never idle: a watcher heartbeats, the deferred-work
+  // daemon ticks, MCP writes land at any time. Keep writing to it for the
+  // whole backup and verification, so this proves the published dump and the
+  // manifest parity describe one snapshot rather than a quiet moment.
+  const writer = new pg.Client({ connectionString: source });
+  // The cleanup below drops this database with --force, which terminates this
+  // connection; that is expected, not a test failure.
+  writer.on("error", () => {});
+  await writer.connect();
+  let writing = true;
+  let written = 0;
+  const writes = (async () => {
+    while (writing) {
+      // A native operational table, not one the Convex export below counts,
+      // so the migration parity report still describes the fixture.
+      await writer.query(
+        "INSERT INTO kith.deferred_work (id, kind, state) VALUES ($1, 'card_queue_tick', 'done')",
+        [`livewrite${String(written).padStart(16, "0")}`],
+      );
+      written += 1;
+      await new Promise((wake) => setTimeout(wake, 25));
+    }
+  })();
+  t.after(async () => {
+    writing = false;
+    await writes.catch(() => {});
+    await writer.end().catch(() => {});
+  });
+
   const managed = await runWithDatabaseBackupState(
     backupConfig,
     async ({ setStage }) => {
@@ -141,7 +170,7 @@ test("postgres runner publishes, independently reads back, decrypts, and restore
       const altered = structuredClone(result);
       altered.plaintexts["kithmind.dump.age"].sha256 = "0".repeat(64);
       await assert.rejects(verifyPostgresBackup(verifyConfig, altered), {
-        code: "command_failed",
+        code: "verify_readback_mismatch",
       });
       const stillEmpty = (await execute(join(PG, "psql"), [destination, "-tAc", "select count(*) from pg_tables where schemaname in ('finance','kith')"])).stdout.trim();
       assert.equal(stillEmpty, "0");
@@ -149,12 +178,31 @@ test("postgres runner publishes, independently reads back, decrypts, and restore
       return { result, verification: await verifyPostgresBackup(verifyConfig, result) };
     },
   );
+  writing = false;
+  await writes;
+  await writer.end();
   assert.equal(managed.verification.status, "passed");
+  // The proof passed even though the source gained rows after the snapshot
+  // was taken: the manifest counts the snapshot's rows, not today's.
+  const snapshotted = managed.result.manifest.parity.tables.find(
+    (row) => row.name === "kith.deferred_work",
+  );
+  const live = Number(
+    (await execute(join(PG, "psql"), [source, "-X", "-tAc", "select count(*) from kith.deferred_work"])).stdout.trim(),
+  );
+  assert.ok(written > 0);
+  assert.ok(live > snapshotted.rowCount, `source moved: ${live} now, ${snapshotted.rowCount} at snapshot`);
   assert.equal(
     managed.verification.restore.tablesVerified,
     managed.result.manifest.parity.tables.length,
   );
   assert.ok(managed.verification.restore.tablesVerified > 70);
+  // The restore target is populated now, so the proof child refuses to start.
+  // Its own code has to survive both process boundaries: this is the failure
+  // the owner's daily run saw every day as a bare `command_failed`.
+  await assert.rejects(verifyPostgresBackup(verifyConfig, managed.result), {
+    code: "restore_proof_failed:restore_target_not_empty",
+  });
   const restoredPool = createKithPool(destination, 2);
   restoredPool.on("error", () => {});
   let parityReport;

@@ -21,13 +21,34 @@ export function hashFileSha256(path) {
   });
 }
 
-function run(psqlPath, connection, sql, timeoutMs, hashOutput = false) {
+// The textual form of `pg_export_snapshot()` (hex groups and digits joined by
+// dashes). Validated before it is interpolated into SQL: nothing else may
+// reach the string literal below.
+export const SNAPSHOT_ID = /^[-0-9A-F]{1,64}$/i;
+
+// Each capture query runs in its own psql session, so a parity capture only
+// describes one instant of a database that is still being written to when
+// every session reads the same exported snapshot. `snapshotId` is the id the
+// dump's own transaction exported; without it the queries read whatever is
+// committed when they run, which is all a restored (idle) database needs.
+function script(sql, snapshotId) {
+  if (!snapshotId) return `${sql};\n`;
+  if (!SNAPSHOT_ID.test(snapshotId)) throw new PostgresParityError("snapshot_id_invalid");
+  return `begin transaction isolation level repeatable read;\nset transaction snapshot '${snapshotId}';\n${sql};\ncommit;\n`;
+}
+
+function run(psqlPath, connection, sql, timeoutMs, hashOutput = false, snapshotId) {
+  const input = script(sql, snapshotId);
   return new Promise((resolve, reject) => {
+    // The statements arrive on stdin rather than through `-c`, because a
+    // snapshot can only be imported by an explicit transaction block. `-q`
+    // keeps psql's `BEGIN`/`SET`/`COMMIT` command tags out of the hashed
+    // stream; query results and COPY data are unaffected.
     const child = spawn(
       psqlPath,
-      [connection, "-X", "-v", "ON_ERROR_STOP=1", "-tA", "-c", sql],
+      [connection, "-X", "-q", "-v", "ON_ERROR_STOP=1", "-tA", "-f", "-"],
       {
-        stdio: ["ignore", "pipe", "pipe"],
+        stdio: ["pipe", "pipe", "pipe"],
         // `to_jsonb` renders timestamptz in the session time zone and text
         // in the client encoding, so pin both: a capture must hash the same
         // on a hosted UTC server and on a laptop restore target whose
@@ -72,6 +93,8 @@ function run(psqlPath, connection, sql, timeoutMs, hashOutput = false) {
         resolve(Buffer.concat(output).toString("utf8").trim());
       }
     });
+    child.stdin.on("error", () => {});
+    child.stdin.end(input);
   });
 }
 
@@ -91,12 +114,14 @@ export async function postgresIdentity(psqlPath, connection, timeoutMs) {
   }
 }
 
-export async function capturePostgresParity(psqlPath, connection, timeoutMs) {
+export async function capturePostgresParity(psqlPath, connection, timeoutMs, snapshotId) {
   const names = await run(
     psqlPath,
     connection,
     "select schemaname||'.'||tablename from pg_tables where schemaname in ('finance','kith') order by schemaname collate \"C\", tablename collate \"C\"",
     timeoutMs,
+    false,
+    snapshotId,
   );
   const tables = [];
   for (const qualified of names ? names.split("\n") : []) {
@@ -105,7 +130,7 @@ export async function capturePostgresParity(psqlPath, connection, timeoutMs) {
     }
     const [schema, table] = qualified.split(".");
     const relation = `\"${schema}\".\"${table}\"`;
-    const count = Number(await run(psqlPath, connection, `select count(*)::text from ${relation}`, timeoutMs));
+    const count = Number(await run(psqlPath, connection, `select count(*)::text from ${relation}`, timeoutMs, false, snapshotId));
     if (!Number.isSafeInteger(count) || count < 0) throw new PostgresParityError("row_count_invalid");
     // psql streams one canonical JSONB value per row. Hashing the stream keeps
     // memory bounded even for the largest archive table.
@@ -115,6 +140,7 @@ export async function capturePostgresParity(psqlPath, connection, timeoutMs) {
       `copy (select to_jsonb(t)::text from ${relation} t order by to_jsonb(t)::text collate \"C\") to stdout`,
       timeoutMs,
       true,
+      snapshotId,
     );
     tables.push({ name: qualified, rowCount: count, sha256: digest.sha256 });
   }
@@ -123,6 +149,8 @@ export async function capturePostgresParity(psqlPath, connection, timeoutMs) {
     connection,
     "select count(*)::text from pg_constraint c join pg_namespace n on n.oid=c.connamespace where n.nspname in ('finance','kith') and not c.convalidated",
     timeoutMs,
+    false,
+    snapshotId,
   ));
   if (!Number.isSafeInteger(invalidConstraints)) throw new PostgresParityError("constraint_inventory_invalid");
   return { version: 1, tables, invalidConstraints };
