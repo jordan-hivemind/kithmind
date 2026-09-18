@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, rm, symlink } from "node:fs/promises";
+import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -327,4 +327,52 @@ test("stopping watch during a pass stops future heartbeats and closes its journa
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(heartbeatCalls, 1);
   assert.equal(closed, true);
+});
+
+/**
+ * P2-104b. A startup failure used to throw straight past `main` into a bare
+ * "Pipeline worker failed" on stderr, with nothing on stdout. The wrapper and
+ * the health check saw a nonzero exit and no code, so a journal the worker
+ * merely could not open read as "the worker is broken". `run` now answers with
+ * the same shaped JSON as a failed pass, carrying the journal's own code.
+ */
+test("run reports an unopenable journal as a closed JSON result", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "kithmind-cli-run-"));
+  try {
+    const configPath = join(directory, "config.json");
+    const journalPath = join(directory, "journal");
+    // A regular file where the journal directory belongs: `Journal.open`
+    // cannot create or own it, which is a `JournalSafetyError`.
+    await writeFile(journalPath, "not a directory\n", { mode: 0o600 });
+    await writeFile(
+      configPath,
+      `${JSON.stringify({ ...watchConfig, journalDir: journalPath })}\n`,
+      { mode: 0o600 },
+    );
+    const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
+    const result = spawnSync(
+      process.execPath,
+      [cli, "run", "--config", configPath],
+      {
+        encoding: "utf8",
+        env: { ...process.env, PIPELINE_TOKEN: "km_synthetic_credential" },
+      },
+    );
+    assert.equal(result.status, 1, "a failed start is still a failed exit");
+    assert.equal(
+      result.stderr,
+      "",
+      "nothing is left only on stderr for a wrapper to guess at",
+    );
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.state, "failed");
+    assert.equal(
+      typeof parsed.code,
+      "string",
+      "the wrapper can name what happened",
+    );
+    assert.match(parsed.code, /^(journal_|worker_start_failed$)/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });

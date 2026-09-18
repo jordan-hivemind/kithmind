@@ -240,7 +240,20 @@ function bindingEqual(left: JournalBinding, right: JournalBinding): boolean {
   );
 }
 
-function relocationBindingPair(
+/**
+ * True when two bindings name the same worker identity and differ only in the
+ * configuration fingerprint.
+ *
+ * P2-104b: `configFingerprint` hashes the whole `pdfDocQa` block
+ * (`journalBindingForConfig`), so a parser path or fingerprint edit produces a
+ * binding the journal refused to open. That locked the operator out of the
+ * journal directory, which also holds the archive catalog, on exactly the
+ * change a parser upgrade requires. Identity is what the binding must pin;
+ * the configuration fingerprint says "this journal was last written under a
+ * different config", which is a fact to adopt when nothing is in flight, not
+ * a reason to refuse.
+ */
+function sameAuthorityDifferentConfig(
   previous: JournalBinding,
   proposed: JournalBinding,
 ): boolean {
@@ -252,6 +265,35 @@ function relocationBindingPair(
     previous.credentialSlot === proposed.credentialSlot &&
     previous.configFingerprint !== proposed.configFingerprint
   );
+}
+
+/**
+ * P2-104b. Whether a journal is between passes, and so safe to rebind onto a
+ * new configuration.
+ *
+ * Deliberately weaker than `archiveCheckpointIsQuiescent`, which additionally
+ * requires the last pass to have ended `complete`. That is right for moving an
+ * archive root, and wrong here: a pass that ends `incomplete` because some
+ * documents are parked is finished, nothing is in flight, and the next pass
+ * starts a new scan whatever the previous outcome was. Requiring `complete`
+ * would mean a worker with one parked document could never take a new parser,
+ * which is the failure this change exists to remove.
+ *
+ * What it does require is that no scan or job is half done, because a pass
+ * resumed under a different parser would mix two fingerprints inside one scan.
+ */
+function betweenPasses(state: StoredState): boolean {
+  if (state.pending !== undefined || state.credentialSessionActive)
+    return false;
+  const checkpoint = state.checkpoint;
+  if (
+    !checkpoint ||
+    typeof checkpoint !== "object" ||
+    Array.isArray(checkpoint)
+  )
+    return false;
+  const phase = (checkpoint as Record<string, JsonValue>).phase;
+  return phase === "idle" || phase === "terminal";
 }
 
 export function archiveCheckpointIsQuiescent(value: JsonValue): boolean {
@@ -848,8 +890,20 @@ async function inspectExistingJournal<C extends JsonValue, R extends JsonValue>(
       } catch {
         inspectionFailure("invalid_state");
       }
+      // P2-104b: mirrors `open`. A configuration change over the same worker
+      // identity is reported, not treated as an unsafe journal, so `doctor`
+      // says which of the two it is instead of refusing to look further.
+      let configBinding: Extract<
+        JournalInspection,
+        { state: "safe" }
+      >["configBinding"] = "current";
       if (!bindingEqual(parsed.state.binding, binding)) {
-        inspectionFailure("binding_mismatch");
+        if (!sameAuthorityDifferentConfig(parsed.state.binding, binding)) {
+          inspectionFailure("binding_mismatch");
+        }
+        configBinding = betweenPasses(parsed.state)
+          ? "changed_quiescent"
+          : "changed_active";
       }
       let credentialBinding: Extract<
         JournalInspection,
@@ -883,6 +937,7 @@ async function inspectExistingJournal<C extends JsonValue, R extends JsonValue>(
         cachedResult: parsed.state.pending?.result !== undefined,
         credentialSessionActive: parsed.state.credentialSessionActive,
         credentialBinding,
+        configBinding,
         recoveryArtifactCount,
         manualRecoveryRequired: manualRecoveryRequired(parsed.checkpoint),
       };
@@ -1132,7 +1187,20 @@ export class Journal<C extends JsonValue, R extends JsonValue> {
         return journal;
       }
       const parsed = parseState(stored, args.codec);
-      if (!bindingEqual(parsed.state.binding, binding))
+      // P2-104b: a journal written under a different configuration reopens
+      // when the worker identity is unchanged and nothing is in flight. The
+      // new binding is adopted and persisted here, so the next open is an
+      // ordinary equal-binding open. Anything else, including a changed
+      // endpoint, space, account or credential slot, still refuses: those name
+      // a different worker, and its journal is not this one's to continue.
+      const adoptConfigBinding = !bindingEqual(parsed.state.binding, binding);
+      if (
+        adoptConfigBinding &&
+        !(
+          sameAuthorityDifferentConfig(parsed.state.binding, binding) &&
+          betweenPasses(parsed.state)
+        )
+      )
         fail("journal binding changed");
       const candidateFingerprint = fingerprintCredential(
         parsed.state.credentialSalt,
@@ -1148,19 +1216,35 @@ export class Journal<C extends JsonValue, R extends JsonValue> {
           parsed.state.credentialSessionActive)
       )
         throw new JournalCredentialChangedError();
-      return new Journal<C, R>({
+      const state: StoredState = adoptConfigBinding
+        ? { ...parsed.state, binding }
+        : parsed.state;
+      const journal = new Journal<C, R>({
         directory,
         binding,
         codec: args.codec,
         locks,
         directoryIdentity,
-        state: parsed.state,
+        state,
         checkpoint: parsed.checkpoint,
         result: parsed.result,
         ...(changed
           ? { candidateCredentialFingerprint: candidateFingerprint }
           : {}),
       });
+      if (adoptConfigBinding) {
+        // Durable before the first transition, and read back, so a crash here
+        // cannot leave the state file naming a configuration no longer in use.
+        await journal.persistCandidate(state);
+        const storedAfter = await readStoredState(join(directory, STATE_FILE));
+        if (
+          storedAfter === undefined ||
+          serializeState(parseState(storedAfter, args.codec).state) !==
+            serializeState(state)
+        )
+          fail("journal binding rebind readback changed");
+      }
+      return journal;
     } catch (error) {
       await closeServers(locks).catch(() => undefined);
       if (
@@ -1193,7 +1277,7 @@ export class Journal<C extends JsonValue, R extends JsonValue> {
     );
     const previousBinding = parseBinding(validated.previousBinding);
     const proposedBinding = parseBinding(validated.proposedBinding);
-    if (!relocationBindingPair(previousBinding, proposedBinding))
+    if (!sameAuthorityDifferentConfig(previousBinding, proposedBinding))
       fail("archive rebind bindings are invalid");
     const requestedDirectory = resolve(args.directory);
     let locks: Server[] = [];
@@ -1306,7 +1390,7 @@ export class Journal<C extends JsonValue, R extends JsonValue> {
     const previousBinding = parseBinding(validated.previousBinding);
     const proposedBinding = parseBinding(validated.proposedBinding);
     if (
-      !relocationBindingPair(previousBinding, proposedBinding) ||
+      !sameAuthorityDifferentConfig(previousBinding, proposedBinding) ||
       (!bindingEqual(this.binding, previousBinding) &&
         !bindingEqual(this.binding, proposedBinding)) ||
       this.state.pending !== undefined ||

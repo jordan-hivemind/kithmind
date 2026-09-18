@@ -229,6 +229,7 @@ test("safe inspection is byte and metadata preserving and reports recovery artif
       cachedResult: false,
       credentialSessionActive: false,
       credentialBinding: "current",
+      configBinding: "current",
       recoveryArtifactCount: 1,
       manualRecoveryRequired: false,
     });

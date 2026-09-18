@@ -115,3 +115,61 @@ test("runParserSetup refuses a parser root that is not there", async () => {
       error instanceof ParserSetupError && error.code === "parser_root_missing",
   );
 });
+
+// P2-104b: `tableStructure` and `tableStructureBypass` are part of the parser
+// fingerprint's configuration (measured: on, off and a bypass policy each give
+// a different fingerprint). A config that sets them must pass them here, and
+// they must survive into the printed block, or the pasted config names
+// fingerprints the worker refuses.
+test("table structure options are accepted and printed back", () => {
+  const bypass = { [`${"5".repeat(64)}`]: [1, 3] };
+  assert.equal(
+    parseParserSetupArgs(["--table-structure", "off"]).tableStructure,
+    "off",
+  );
+  assert.deepEqual(
+    parseParserSetupArgs(["--table-structure-bypass", JSON.stringify(bypass)])
+      .tableStructureBypass,
+    bypass,
+  );
+  const block = configBlock(READY, PATHS, DIGESTS, {
+    tableStructure: "on",
+    tableStructureBypass: bypass,
+  });
+  assert.equal(block.parser.tableStructure, "on");
+  assert.deepEqual(block.parser.tableStructureBypass, bypass);
+});
+
+test("table structure options are omitted when unset, matching the parser default", () => {
+  const args = parseParserSetupArgs([]);
+  assert.equal(args.tableStructure, undefined);
+  assert.equal(args.tableStructureBypass, undefined);
+  const block = configBlock(READY, PATHS, DIGESTS);
+  assert.equal("tableStructure" in block.parser, false);
+  assert.equal("tableStructureBypass" in block.parser, false);
+});
+
+test("table structure options are rejected when invalid or contradictory", () => {
+  for (const argv of [
+    ["--table-structure", "maybe"],
+    ["--table-structure"],
+    ["--table-structure-bypass", "{not json"],
+  ]) {
+    assert.throws(
+      () => parseParserSetupArgs(argv),
+      (error) =>
+        error instanceof ParserSetupError && error.code === "value_required",
+      argv.join(" "),
+    );
+  }
+  assert.throws(
+    () =>
+      parseParserSetupArgs([
+        "--table-structure",
+        "off",
+        "--table-structure-bypass",
+        "{}",
+      ]),
+    (error) => error.code === "bypass_requires_tables",
+  );
+});

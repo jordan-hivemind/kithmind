@@ -14,7 +14,13 @@ import {
   formatReconcileResult,
   reconcileReceiptsFromPath,
 } from "./reconcileReceipts.js";
-import { Journal, JournalCredentialChangedError } from "./journal.js";
+import {
+  Journal,
+  JournalCredentialChangedError,
+  JournalLockedError,
+  JournalSafetyError,
+  inspectJournalReadOnly,
+} from "./journal.js";
 import { initialCheckpoint, journalCodec, PipelineRunner } from "./runner.js";
 import { HttpWorkerTransport } from "./transport.js";
 import type {
@@ -249,6 +255,57 @@ async function execute(
   return executeConfig(config, requireCredential(config), undefined, options);
 }
 
+/**
+ * P2-104b. `runSafely` already turns a failure inside a pass into a closed
+ * result, but everything before it (reading the config, resolving the
+ * credential, opening the journal) threw straight past `main` into a bare
+ * "Pipeline worker failed" on stderr with no JSON at all. A watcher wrapper
+ * and a health check then had a nonzero exit and nothing to name, which is
+ * how a journal `binding_mismatch` read as "the worker is broken".
+ *
+ * Every startup failure now produces the same shaped result as a failed pass.
+ * The journal is inspected for its own code where it can be, so the result
+ * says `binding_mismatch` rather than a generic refusal, exactly as `doctor`
+ * would report it.
+ */
+async function executeWithClosedResult(
+  configPath: string,
+  options: Parameters<typeof execute>[1] = {},
+): Promise<PipelineRunResult> {
+  try {
+    return await execute(configPath, options);
+  } catch (error) {
+    if (error instanceof JournalCredentialChangedError) {
+      return { state: "failed", code: "credential_recovery_required" };
+    }
+    if (error instanceof JournalLockedError) {
+      return { state: "failed", code: "journal_contended" };
+    }
+    if (!(error instanceof JournalSafetyError)) {
+      return { state: "failed", code: "worker_start_failed" };
+    }
+    const inspection = await inspectJournalForConfig(configPath).catch(
+      () => undefined,
+    );
+    return {
+      state: "failed",
+      code:
+        inspection?.state === "unsafe"
+          ? `journal_${inspection.code}`
+          : "journal_unsafe",
+    };
+  }
+}
+
+async function inspectJournalForConfig(configPath: string) {
+  const config = await loadPipelineConfig(configPath);
+  return inspectJournalReadOnly({
+    directory: config.journalDir,
+    binding: journalBindingForConfig(config),
+    codec: journalCodec,
+  });
+}
+
 async function waitForWatchInterval(
   interval: number,
   signal: AbortSignal,
@@ -401,7 +458,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     return;
   }
   if (command === "run") {
-    const result = await execute(configPath, {
+    const result = await executeWithClosedResult(configPath, {
       retryParked: parsed.retryParked,
       operatorClear: parsed.operatorClear,
       ...(parsed.maxClears === undefined

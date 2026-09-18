@@ -24,6 +24,12 @@
 //   node scripts/parser-runtime-setup.mjs
 //   node scripts/parser-runtime-setup.mjs --skip-models   (venv and print only)
 //
+// If the existing config sets `pdfDocQa.parser.tableStructure` or
+// `tableStructureBypass`, pass the same values here. They are part of the
+// parser fingerprint, so omitting them prints fingerprints the worker refuses:
+//
+//   node scripts/parser-runtime-setup.mjs --table-structure off
+//
 // The parser then belongs to that checkout. Pointing the config at a pinned
 // worker checkout instead of the root workspace is exactly this: run it there,
 // paste what it prints.
@@ -56,8 +62,8 @@ export function parseParserSetupArgs(argv) {
       args.skipModels = true;
       continue;
     }
+    const value = argv[index + 1];
     if (flag === "--parser-root") {
-      const value = argv[index + 1];
       if (!value || value.startsWith("--")) {
         throw new ParserSetupError(
           "value_required",
@@ -68,7 +74,52 @@ export function parseParserSetupArgs(argv) {
       index += 1;
       continue;
     }
+    // P2-104b: both of these go into the parser fingerprint's `configuration`
+    // (`_fingerprint` in production.py), and so into the extraction
+    // configuration fingerprint derived from it. Measured: `on` and `off`
+    // give different fingerprints, and a bypass policy gives a third. A run
+    // that omits a value the config sets therefore prints fingerprints the
+    // worker will refuse. They must be passed here exactly as the config
+    // carries them, and they are printed back so the pasted block stays whole.
+    if (flag === "--table-structure") {
+      if (value !== "on" && value !== "off") {
+        throw new ParserSetupError(
+          "value_required",
+          "--table-structure requires on or off",
+        );
+      }
+      args.tableStructure = value;
+      index += 1;
+      continue;
+    }
+    if (flag === "--table-structure-bypass") {
+      if (!value || value.startsWith("--")) {
+        throw new ParserSetupError(
+          "value_required",
+          "--table-structure-bypass requires a JSON policy",
+        );
+      }
+      try {
+        args.tableStructureBypass = JSON.parse(value);
+      } catch {
+        throw new ParserSetupError(
+          "value_required",
+          "--table-structure-bypass must be JSON",
+        );
+      }
+      index += 1;
+      continue;
+    }
     throw new ParserSetupError("flag_unknown", `unknown flag ${flag}`);
+  }
+  if (
+    args.tableStructure === "off" &&
+    args.tableStructureBypass !== undefined
+  ) {
+    throw new ParserSetupError(
+      "bypass_requires_tables",
+      "--table-structure-bypass requires --table-structure on",
+    );
   }
   return args;
 }
@@ -77,7 +128,7 @@ export function parseParserSetupArgs(argv) {
  * Turn the launcher's `--mode profile` answer into the two config objects.
  * Pure, so the shape of what gets pasted is tested without a parser runtime.
  */
-export function configBlock(profile, paths, digests) {
+export function configBlock(profile, paths, digests, options = {}) {
   if (profile?.state !== "ready") {
     throw new ParserSetupError(
       "profile_failed",
@@ -103,6 +154,12 @@ export function configBlock(profile, paths, digests) {
       modelAssetsPath: paths.modelAssetsPath,
       modelLockPath: paths.modelLockPath,
       expectedModelLockSha256: digests.modelLock,
+      ...(options.tableStructure === undefined
+        ? {}
+        : { tableStructure: options.tableStructure }),
+      ...(options.tableStructureBypass === undefined
+        ? {}
+        : { tableStructureBypass: options.tableStructureBypass }),
     },
     profile: {
       parserProfileId: "pdf_docqa_v1",
@@ -187,6 +244,15 @@ export async function runParserSetup(args) {
       paths.modelLockPath,
       "--conversion-timeout-seconds",
       "480",
+      ...(args.tableStructure === undefined
+        ? []
+        : ["--table-structure", args.tableStructure]),
+      ...(args.tableStructureBypass === undefined
+        ? []
+        : [
+            "--table-structure-bypass",
+            JSON.stringify(args.tableStructureBypass),
+          ]),
     ],
     {
       cwd: root,
@@ -210,7 +276,19 @@ export async function runParserSetup(args) {
     digestOf(paths.launcherPath),
     digestOf(paths.modelLockPath),
   ]);
-  return configBlock(profile, paths, { python, launcher, modelLock });
+  return configBlock(
+    profile,
+    paths,
+    { python, launcher, modelLock },
+    {
+      ...(args.tableStructure === undefined
+        ? {}
+        : { tableStructure: args.tableStructure }),
+      ...(args.tableStructureBypass === undefined
+        ? {}
+        : { tableStructureBypass: args.tableStructureBypass }),
+    },
+  );
 }
 
 if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {

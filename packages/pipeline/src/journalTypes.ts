@@ -69,6 +69,14 @@ export type JournalInspection =
       credentialSessionActive: boolean;
       credentialBinding:
         "current" | "changed_quiescent" | "changed_active" | "unverified";
+      /**
+       * P2-104b. Whether the stored journal was written under a different
+       * pipeline configuration than the one inspected. `changed_quiescent` is
+       * adopted on the next open; `changed_active` waits for in-flight work to
+       * settle first. A changed worker *identity* is never reported here: that
+       * is still `binding_mismatch`.
+       */
+      configBinding: "current" | "changed_quiescent" | "changed_active";
       recoveryArtifactCount: number;
       manualRecoveryRequired: boolean;
     }

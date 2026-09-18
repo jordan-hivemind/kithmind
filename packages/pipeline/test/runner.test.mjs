@@ -1494,8 +1494,7 @@ test("abandons a scan_not_ready replay and starts a fresh scan in the same run",
     assert.equal(second.published, 1);
     assert.equal(journal.pending, undefined);
     assert.equal(
-      cloud.operations.filter((operation) => operation === "scan.begin")
-        .length,
+      cloud.operations.filter((operation) => operation === "scan.begin").length,
       2,
     );
   } finally {
@@ -3957,8 +3956,7 @@ async function voidBackendFixture(count) {
       originals.find((row) => row.origin.sha256 === probe.sha256),
     async clearVoidAdmission(args) {
       cleared.push(args);
-      const row =
-        args.subject === "original_bytes" ? originals[0] : processing;
+      const row = args.subject === "original_bytes" ? originals[0] : processing;
       delete row.cloud;
       row.receiptReconcile = [
         ...(row.receiptReconcile ?? []),
@@ -4204,9 +4202,10 @@ test("a pass that meets a void backend parks all three documents and ends needin
     }
     assert.deepEqual(f.cleared, [], "not one receipt is retired");
     assert.equal(f.parked.length, 3);
-    assert.deepEqual(new Set(f.parked.map((entry) => entry.code)), new Set([
-      "receipt_clear_refused_by_safety_limit",
-    ]));
+    assert.deepEqual(
+      new Set(f.parked.map((entry) => entry.code)),
+      new Set(["receipt_clear_refused_by_safety_limit"]),
+    );
     assert.equal(f.journal.pending, undefined);
 
     // The pass result an operator and a monitor read.
@@ -4630,7 +4629,10 @@ test("a stale proof refreshes before any new lease and the recovery pass reserve
     processing: rows.processing,
     declaration: parsedDeclaration(),
   });
-  runner.archiveCatalog = admissionCatalog(() => rows, (next) => (rows = next));
+  runner.archiveCatalog = admissionCatalog(
+    () => rows,
+    (next) => (rows = next),
+  );
   let refreshes = 0;
   runner.refreshProviderProof = async (current) => {
     refreshes += 1;
@@ -4691,7 +4693,10 @@ test("a refresh whose catalog write already committed is not repeated on the nex
     processing: rows.processing,
     declaration: parsedDeclaration(),
   });
-  runner.archiveCatalog = admissionCatalog(() => rows, (next) => (rows = next));
+  runner.archiveCatalog = admissionCatalog(
+    () => rows,
+    (next) => (rows = next),
+  );
   runner.refreshProviderProof = async () => {
     throw new Error("a fresh proof must not be refreshed again");
   };
@@ -5036,15 +5041,13 @@ test("a provider proof refresh fails closed before reading the provider", async 
     rows.original.providerOriginal.locator.reviewCode = "replacement_detected";
     await assert.rejects(
       () => runner.refreshProviderProof(checkpoint),
-      (error) =>
-        error.code === "provider_locator_recovery_review_required",
+      (error) => error.code === "provider_locator_recovery_review_required",
     );
   } finally {
     await journal.close();
     await rm(setup.base, { recursive: true, force: true });
   }
 });
-
 
 test("archived pending bodies are rebuilt from catalog and spool state", async () => {
   const setup = await fixture(0);
@@ -5675,3 +5678,106 @@ test(
     }
   },
 );
+
+/**
+ * P2-104b. After a parser upgrade the catalog holds an activated row from the
+ * old parser and, once the document is re-parsed, an activated row from the
+ * new one. Both are internally coherent and both answer to the same original
+ * receipt revision, which is exactly the shape PR 277 taught
+ * `reusableProcessingRow` to refuse.
+ *
+ * It must not refuse this one. `matchingProcessingRows` narrows on the whole
+ * fingerprint tuple before `reusableProcessingRow` ever sees a row, so a row
+ * produced by a different parser is not a competing answer about this
+ * processing identity: it is a record of a previous one. If that narrowing
+ * ever stops happening, every upgraded document parks on
+ * `archive_catalog_revision_conflict` on the pass after the upgrade.
+ */
+function twoParserGenerations(runner, plan, originalCatalogId) {
+  const current = runner.processingFingerprints(plan);
+  const previous = { ...current, parserFingerprint: "9".repeat(64) };
+  const row = (fingerprints) => ({
+    processingCatalogId: randomUUID(),
+    originalCatalogId,
+    rowRevision: 1,
+    createdAt: 1,
+    currentObservation: {
+      scanId: "scan-0",
+      observationEpoch: plan.observationEpoch,
+      processingEpoch: plan.processingEpoch,
+    },
+    fingerprints,
+    copies: {
+      primary: archiveCopy("primary"),
+      independent_backup: archiveCopy("independent_backup"),
+    },
+    cloud: {
+      sourceItemId: plan.sourceItemId,
+      sourceRevisionId: "revision",
+      parserArtifactId: "artifact",
+      sourceTextVersionId: "text",
+      processingGenerationId: "generation",
+      ingestJobId: "job",
+      processingFingerprint: HASH,
+      admissionRequestDigest: HASH,
+      admittedAt: 1,
+    },
+    activation: {
+      requestId: randomUUID(),
+      requestDigest: HASH,
+      jobId: "job",
+      processingGenerationId: "generation",
+      state: "ready",
+      activatedAt: 1,
+      reused: false,
+    },
+  });
+  return [row(previous), row(current)];
+}
+
+test("an activated row from the previous parser is history, not a conflicting answer", async () => {
+  const f = await reconcileFixture("revision", twoParserGenerations);
+  try {
+    await f.runner.driveReconcile();
+    assert.equal(f.journal.pending, undefined);
+    assert.deepEqual(
+      f.parked,
+      [],
+      "an upgraded document must not park on a revision conflict",
+    );
+    assert.equal(f.journal.checkpoint.phase, "discovery_reserve");
+  } finally {
+    await f.journal.close();
+    await rm(f.setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a plan under a new parser fingerprint needs work while old rows are retained", async () => {
+  const f = await reconcileFixture("revision", twoParserGenerations);
+  try {
+    // The upgrade itself: the same document, now planned under a parser
+    // fingerprint neither stored row carries.
+    const upgraded = { ...f.plan, parserFingerprint: "7".repeat(64) };
+    assert.deepEqual(
+      f.runner.matchingProcessingRows(upgraded),
+      [],
+      "no prior row answers for the new parser",
+    );
+    assert.equal(
+      await f.runner.pdfNeedsArchivedWork({
+        ...upgraded,
+        discoveryState: "unchanged",
+      }),
+      true,
+      "so the document is re-parsed rather than treated as published",
+    );
+    assert.equal(
+      f.rows.length,
+      2,
+      "and the rows from the previous parser are still in the catalog",
+    );
+  } finally {
+    await f.journal.close();
+    await rm(f.setup.base, { recursive: true, force: true });
+  }
+});
