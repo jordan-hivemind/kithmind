@@ -39,6 +39,14 @@ import {
   WorkerProtocolError,
   workerProtocolError,
 } from "./errors.js";
+import {
+  countsWithReasons,
+  incrementReason,
+  reasonSink,
+  readNotReadyReasons,
+  type NotReadyReason,
+  type NotReadyReasons,
+} from "./notReady.js";
 import { consumeWorkerMutationRateLimit } from "./rateLimit.js";
 import { artifactBoundExtractionFingerprint } from "./entries.js";
 import { FS_TEXT_PROFILE } from "./profile.js";
@@ -662,31 +670,103 @@ async function inlineEntryDigests(
   };
 }
 
+/**
+ * The shared preconditions of `terminalReady`, split only so a failure can
+ * name which group disagreed. The conditions and their order are exactly the
+ * single `if` this replaced, so the boolean answer is unchanged.
+ */
+function itemPreconditionReason(
+  assessment: WorkerProcessingAssessmentRow,
+  item: SourceItemRow,
+  entry: WorkerScanEntryRow,
+): NotReadyReason | null {
+  if (item.lifecycle !== "available" || item.lastFailure !== null)
+    return "item_state";
+  if (
+    item.workerLastSeenInventoryEpoch !== assessment.inventoryEpoch ||
+    item.workerObservationEpoch !== entry.observationEpoch ||
+    item.workerProcessingEpoch !== entry.processingEpoch
+  )
+    return "item_epoch_mismatch";
+  if (
+    item.workerContentHash !== entry.contentHash ||
+    item.workerSourceModifiedAt?.getTime() !== entry.sourceModifiedAt.getTime()
+  )
+    return "content_hash_mismatch";
+  if (
+    !item.desiredRevisionId ||
+    item.activeRevisionId !== item.desiredRevisionId ||
+    !item.activeGenerationId
+  )
+    return "revision_not_active";
+  if (
+    !safeInteger(item.desiredProcessingEpoch) ||
+    !safeInteger(entry.observationEpoch) ||
+    !safeInteger(entry.processingEpoch) ||
+    !safeInteger(entry.byteLength)
+  )
+    return "epoch_not_integer";
+  return null;
+}
+
+type BinaryFingerprints = {
+  parser: string;
+  extraction: string;
+  extractor: string;
+  recordSchema: string;
+  normalization: string;
+  chunker: string;
+  correctionRevision: string;
+};
+
+/**
+ * The seven per-entry fingerprints the archived-binary path needs, or which
+ * one was missing. Same conditions and same order as the single `if` this
+ * replaced; it also does the narrowing that `if` used to do.
+ */
+function binaryFingerprints(
+  entry: WorkerScanEntryRow,
+): BinaryFingerprints | NotReadyReason {
+  if (!entry.parserFingerprint) return "fingerprint_mismatch:parser";
+  if (!entry.extractionConfigurationFingerprint)
+    return "fingerprint_mismatch:extraction";
+  if (!entry.extractorFingerprint) return "fingerprint_mismatch:extractor";
+  if (!entry.recordSchemaFingerprint)
+    return "fingerprint_mismatch:record_schema";
+  if (!entry.normalizationFingerprint)
+    return "fingerprint_mismatch:normalization";
+  if (!entry.chunkerFingerprint) return "fingerprint_mismatch:chunker";
+  if (!entry.correctionRevision) return "fingerprint_mismatch:correction";
+  return {
+    parser: entry.parserFingerprint,
+    extraction: entry.extractionConfigurationFingerprint,
+    extractor: entry.extractorFingerprint,
+    recordSchema: entry.recordSchemaFingerprint,
+    normalization: entry.normalizationFingerprint,
+    chunker: entry.chunkerFingerprint,
+    correctionRevision: entry.correctionRevision,
+  };
+}
+
+/**
+ * `note` receives the first condition group that refused the item. It is
+ * diagnostic: no branch below changes because of it, and the returned boolean
+ * is the same one this function returned before reasons existed.
+ */
 async function terminalReady(
   ctx: WorkerCtx,
   source: LoadedWorkerSource,
   assessment: WorkerProcessingAssessmentRow,
   item: SourceItemRow,
   entry: WorkerScanEntryRow,
+  note: (reason: NotReadyReason) => void,
 ): Promise<boolean> {
-  if (
-    item.lifecycle !== "available" ||
-    item.lastFailure !== null ||
-    item.workerLastSeenInventoryEpoch !== assessment.inventoryEpoch ||
-    item.workerObservationEpoch !== entry.observationEpoch ||
-    item.workerProcessingEpoch !== entry.processingEpoch ||
-    item.workerContentHash !== entry.contentHash ||
-    item.workerSourceModifiedAt?.getTime() !==
-      entry.sourceModifiedAt.getTime() ||
-    !item.desiredRevisionId ||
-    item.activeRevisionId !== item.desiredRevisionId ||
-    !item.activeGenerationId ||
-    !safeInteger(item.desiredProcessingEpoch) ||
-    !safeInteger(entry.observationEpoch) ||
-    !safeInteger(entry.processingEpoch) ||
-    !safeInteger(entry.byteLength)
-  )
+  const no = (reason: NotReadyReason): false => {
+    note(reason);
     return false;
+  };
+  const precondition = itemPreconditionReason(assessment, item, entry);
+  if (precondition) return no(precondition);
   const revisionRaw = await row<Record<string, unknown>>(
     ctx,
     "SELECT * FROM kith.source_revisions WHERE id=$1",
@@ -702,7 +782,8 @@ async function terminalReady(
     "SELECT * FROM kith.ingest_jobs WHERE processing_generation_id=$1 LIMIT 2",
     [item.activeGenerationId],
   );
-  if (!revisionRaw || !generationRaw || jobRows.length !== 1) return false;
+  if (!revisionRaw || !generationRaw) return no("detail_missing");
+  if (jobRows.length !== 1) return no("job_count");
   const revision = camelizeSourceRevision(revisionRaw);
   const generation = camelizeProcessingGeneration(generationRaw);
   const job = camelizeIngestJob(jobRows[0]!);
@@ -716,7 +797,10 @@ async function terminalReady(
     generation.desiredProcessingEpoch !== item.desiredProcessingEpoch ||
     generation.state !== "ready" ||
     !generation.activatedAt ||
-    generation.deactivatedAt !== null ||
+    generation.deactivatedAt !== null
+  )
+    return no("generation_shape");
+  if (
     job.spaceId !== source.spaceId ||
     job.sourceAccountId !== source.account.id ||
     job.sourceItemId !== item.id ||
@@ -731,14 +815,17 @@ async function terminalReady(
     job.nextAttemptAt !== null ||
     job.error !== null
   )
-    return false;
+    return no("job_shape");
   if (entry.contentRepresentation === "archived_binary_v1") {
     if (
       revision.representation !== "archived_binary_v1" ||
       revision.contentHashAuthority !== "worker_asserted" ||
       revision.contentHash !== entry.contentHash ||
       revision.byteLength !== entry.byteLength ||
-      revision.mediaType !== entry.binaryMediaType ||
+      revision.mediaType !== entry.binaryMediaType
+    )
+      return no("revision_shape");
+    if (
       !generation.sourceTextVersionId ||
       !generation.parserArtifactId ||
       !generation.archiveSetDigest ||
@@ -746,21 +833,20 @@ async function terminalReady(
       !generation.payloadManifestId ||
       !generation.originalPrimaryReceiptId ||
       !generation.parserPrimaryReceiptId ||
-      !generation.parserBackupReceiptId ||
-      item.workerProfileId !== entry.binaryParserProfileId ||
-      !entry.parserFingerprint ||
-      !entry.extractionConfigurationFingerprint ||
-      !entry.extractorFingerprint ||
-      !entry.recordSchemaFingerprint ||
-      !entry.normalizationFingerprint ||
-      !entry.chunkerFingerprint ||
-      !entry.correctionRevision ||
+      !generation.parserBackupReceiptId
+    )
+      return no("generation_shape");
+    if (item.workerProfileId !== entry.binaryParserProfileId)
+      return no("profile_mismatch");
+    const fingerprints = binaryFingerprints(entry);
+    if (typeof fingerprints === "string") return no(fingerprints);
+    if (
       Boolean(generation.originalBackupReceiptId) ===
         Boolean(generation.originalProviderReferenceId) ||
       (generation.originalProviderReferenceId !== null &&
         !safeInteger(generation.originalProviderBindingEpoch))
     )
-      return false;
+      return no("archive_selection");
     try {
       const artifactRaw = await row<Record<string, unknown>>(
         ctx,
@@ -772,21 +858,21 @@ async function terminalReady(
         "SELECT * FROM kith.source_text_versions WHERE id=$1",
         [generation.sourceTextVersionId],
       );
-      if (!artifactRaw || !textRaw) return false;
+      if (!artifactRaw || !textRaw) return no("artifact_missing");
       const artifact = camelizeSourceParserArtifact(artifactRaw);
       const text = camelizeSourceTextVersion(textRaw);
       const expectedExtraction = await artifactBoundExtractionFingerprint(
         artifact.parserFingerprint,
         artifact.outputHash,
-        entry.extractionConfigurationFingerprint,
+        fingerprints.extraction,
       );
       const expectedProcessing = await digestProcessingConfiguration({
         extractionFingerprint: expectedExtraction,
-        extractorFingerprint: entry.extractorFingerprint,
-        recordSchemaFingerprint: entry.recordSchemaFingerprint,
-        normalizationFingerprint: entry.normalizationFingerprint,
-        chunkerFingerprint: entry.chunkerFingerprint,
-        correctionRevision: entry.correctionRevision,
+        extractorFingerprint: fingerprints.extractor,
+        recordSchemaFingerprint: fingerprints.recordSchema,
+        normalizationFingerprint: fingerprints.normalization,
+        chunkerFingerprint: fingerprints.chunker,
+        correctionRevision: fingerprints.correctionRevision,
       });
       if (
         artifact.spaceId !== source.spaceId ||
@@ -799,7 +885,10 @@ async function terminalReady(
         text.parserArtifactId !== artifact.id ||
         text.representation !== "parsed_pages_v1" ||
         text.evidenceSealed !== true ||
-        text.textHashAuthority !== "server_verified_retained_text" ||
+        text.textHashAuthority !== "server_verified_retained_text"
+      )
+        return no("text_version_shape");
+      if (
         text.extractionFingerprint !== expectedExtraction ||
         generation.extractionFingerprint !== expectedExtraction ||
         generation.processingFingerprint !== expectedProcessing ||
@@ -810,7 +899,7 @@ async function terminalReady(
         generation.chunkerFingerprint !== entry.chunkerFingerprint ||
         generation.correctionRevision !== entry.correctionRevision
       )
-        return false;
+        return no("fingerprint_mismatch:derived");
 
       const originalPrimary = await loadCurrentArchiveBinding(ctx.client, {
         spaceId: source.spaceId,
@@ -850,48 +939,69 @@ async function terminalReady(
         subjectKind: "parser_output",
         copyRole: "independent_backup",
       });
-      if (
-        !originalPrimary ||
-        !parserPrimary ||
-        !parserBackup ||
-        Boolean(originalBackup) === Boolean(provider)
-      )
-        return false;
-      await requireArchiveReceiptChain(
-        ctx,
-        source,
-        item,
-        originalPrimary.receipt,
-      );
-      await requireArchiveReceiptChain(
-        ctx,
-        source,
-        item,
-        parserPrimary.receipt,
-      );
-      await requireArchiveReceiptChain(ctx, source, item, parserBackup.receipt);
-      requireIndependentArchivePair(
-        parserPrimary.receipt,
-        parserBackup.receipt,
-      );
-      if (originalBackup) {
+      if (!originalPrimary) return no("binding_missing:original/primary");
+      if (!parserPrimary) return no("binding_missing:parser/primary");
+      if (!parserBackup) return no("binding_missing:parser/backup");
+      if (Boolean(originalBackup) === Boolean(provider))
+        return no(
+          originalBackup
+            ? "binding_missing:original/backup"
+            : "binding_missing:provider",
+        );
+      // Split from the block below only to tell a refused receipt chain apart
+      // from a failed independence pair; both still refuse the item.
+      try {
         await requireArchiveReceiptChain(
           ctx,
           source,
           item,
-          originalBackup.receipt,
-        );
-        requireIndependentArchivePair(
           originalPrimary.receipt,
-          originalBackup.receipt,
         );
-      } else if (provider) {
-        await requireProviderOriginalReferenceChain(
+        await requireArchiveReceiptChain(
           ctx,
           source,
           item,
-          provider.reference,
+          parserPrimary.receipt,
         );
+        await requireArchiveReceiptChain(
+          ctx,
+          source,
+          item,
+          parserBackup.receipt,
+        );
+        if (originalBackup)
+          await requireArchiveReceiptChain(
+            ctx,
+            source,
+            item,
+            originalBackup.receipt,
+          );
+        else if (provider)
+          await requireProviderOriginalReferenceChain(
+            ctx,
+            source,
+            item,
+            provider.reference,
+          );
+      } catch (error) {
+        if (isWorkerTransactionAbort(error)) throw error;
+        note("receipt_chain");
+        throw error;
+      }
+      try {
+        requireIndependentArchivePair(
+          parserPrimary.receipt,
+          parserBackup.receipt,
+        );
+        if (originalBackup)
+          requireIndependentArchivePair(
+            originalPrimary.receipt,
+            originalBackup.receipt,
+          );
+      } catch (error) {
+        if (isWorkerTransactionAbort(error)) throw error;
+        note("archive_independence");
+        throw error;
       }
       const archiveSet = await archiveSetDigest(
         originalPrimary,
@@ -917,7 +1027,11 @@ async function terminalReady(
         generation.parserPrimaryReceiptId !== parserPrimary.receipt.id ||
         generation.parserBackupReceiptId !== parserBackup.receipt.id
       )
-        return false;
+        return no(
+          generation.archiveSetDigest !== archiveSet
+            ? "archive_set_digest_mismatch"
+            : "generation_receipt_mismatch",
+        );
       const verified = await verifySealedParsedPayload(ctx.client, generation);
       return (
         generation.actualPageCount === verified.actualPageCount &&
@@ -925,17 +1039,17 @@ async function terminalReady(
           verified.actualEvidenceSpanCount &&
         generation.actualDocumentCount === verified.actualDocumentCount &&
         generation.actualChunkCount === verified.actualChunkCount
-      );
+      ) || no("sealed_payload_counts");
     } catch (error) {
       if (isWorkerTransactionAbort(error)) throw error;
-      return false;
+      return no("archive_chain_error");
     }
   }
   if (
     entry.contentRepresentation !== "inline_utf8_v1" ||
     item.workerProfileId !== FS_TEXT_PROFILE.profileId
   )
-    return false;
+    return no("profile_mismatch");
   const calculated = await inlineEntryDigests(item, entry);
   if (
     !calculated ||
@@ -948,12 +1062,12 @@ async function terminalReady(
     entry.inventoryMetadataDigest !== calculated.inventoryMetadataDigest ||
     entry.processingIdentityDigest !== calculated.processingIdentityDigest
   )
-    return false;
+    return no("inline_digest_mismatch");
   let text: string;
   try {
     text = requireInlineSourceRevision(revision).text;
   } catch {
-    return false;
+    return no("inline_text_missing");
   }
   const plan = planInlineText(text);
   const processingFingerprint = await digestProcessingConfiguration({
@@ -964,24 +1078,35 @@ async function terminalReady(
     chunkerFingerprint: FS_TEXT_PROFILE.chunkerFingerprint,
     correctionRevision: `filesystem-observation-v1:${entry.processingEpoch}`,
   });
+  if (
+    !(
+      revision.contentHash === entry.contentHash &&
+      revision.byteLength === entry.byteLength &&
+      revision.contentHash === (await sha256Hex(text)) &&
+      revision.byteLength === Buffer.byteLength(text, "utf8") &&
+      revision.mediaType === FS_TEXT_PROFILE.mediaType
+    )
+  )
+    return no("inline_text_rehash");
+  if (
+    !(
+      generation.processingFingerprint === processingFingerprint &&
+      generation.extractionFingerprint ===
+        FS_TEXT_PROFILE.extractionFingerprint &&
+      generation.extractorFingerprint ===
+        FS_TEXT_PROFILE.extractorFingerprint &&
+      generation.recordSchemaFingerprint ===
+        FS_TEXT_PROFILE.recordSchemaFingerprint &&
+      generation.normalizationFingerprint ===
+        FS_TEXT_PROFILE.normalizationFingerprint &&
+      generation.chunkerFingerprint === FS_TEXT_PROFILE.chunkerFingerprint &&
+      generation.correctionRevision ===
+        `filesystem-observation-v1:${entry.processingEpoch}`
+    )
+  )
+    return no("fingerprint_mismatch:inline");
   return (
-    revision.contentHash === entry.contentHash &&
-    revision.byteLength === entry.byteLength &&
-    revision.contentHash === (await sha256Hex(text)) &&
-    revision.byteLength === Buffer.byteLength(text, "utf8") &&
-    revision.mediaType === FS_TEXT_PROFILE.mediaType &&
-    generation.processingFingerprint === processingFingerprint &&
-    generation.extractionFingerprint ===
-      FS_TEXT_PROFILE.extractionFingerprint &&
-    generation.extractorFingerprint === FS_TEXT_PROFILE.extractorFingerprint &&
-    generation.recordSchemaFingerprint ===
-      FS_TEXT_PROFILE.recordSchemaFingerprint &&
-    generation.normalizationFingerprint ===
-      FS_TEXT_PROFILE.normalizationFingerprint &&
-    generation.chunkerFingerprint === FS_TEXT_PROFILE.chunkerFingerprint &&
-    generation.correctionRevision ===
-      `filesystem-observation-v1:${entry.processingEpoch}` &&
-    generation.expectedPageCount === plan.expectedPageCount &&
+    (generation.expectedPageCount === plan.expectedPageCount &&
     generation.expectedEvidenceSpanCount === plan.expectedEvidenceSpanCount &&
     generation.expectedDocumentCount === plan.expectedDocumentCount &&
     generation.expectedChunkCount === plan.expectedChunkCount &&
@@ -993,7 +1118,8 @@ async function terminalReady(
     generation.expectedEventCount === 0 &&
     generation.actualEventCount === 0 &&
     generation.expectedObservationCount === 0 &&
-    generation.actualObservationCount === 0
+    generation.actualObservationCount === 0) ||
+    no("plan_counts")
   );
 }
 
@@ -1086,6 +1212,7 @@ async function classifyItem(
   source: LoadedWorkerSource,
   assessment: WorkerProcessingAssessmentRow,
   item: SourceItemRow,
+  note: (reason: NotReadyReason) => void,
 ): Promise<{ bucket: ItemBucket; proof?: Proof }> {
   if (
     item.spaceId !== source.spaceId ||
@@ -1112,7 +1239,7 @@ async function classifyItem(
   if (entry.state === "needs_review")
     return { bucket: "needsReview", proof: "reviewScanEntries" };
   if (entry.state === "ignored_forgotten") workerProtocolError("scan_conflict");
-  if (await terminalReady(ctx, source, assessment, item, entry))
+  if (await terminalReady(ctx, source, assessment, item, entry, note))
     return { bucket: "ready", proof: proofForEntry(entry) };
   if (entry.state === "unchanged" && !entry.discoveryWorkId)
     workerProtocolError("scan_conflict");
@@ -1255,6 +1382,8 @@ export async function advanceProcessingAssessment(
     source.account.id,
   );
   let counts = readCounts(assessment.counts);
+  // Diagnostic tally, carried across pages in the same jsonb column.
+  let reasons: NotReadyReasons = readNotReadyReasons(assessment.counts);
   let accounted = assessment.accountedScanEntries;
   let queued = assessment.queuedScanEntries;
   let gap = assessment.gapScanEntries;
@@ -1282,18 +1411,26 @@ export async function advanceProcessingAssessment(
     );
     for (const wrapped of page.page) {
       const item = wrapped.value;
+      const sink = reasonSink();
       let classified: { bucket: ItemBucket; proof?: Proof };
       try {
-        classified = await classifyItem(ctx, source, assessment, item);
+        classified = await classifyItem(ctx, source, assessment, item, sink.note);
       } catch (error) {
         if (isWorkerTransactionAbort(error)) throw error;
         if (!(error instanceof WorkerProtocolError)) throw error;
+        // The swallow that turns any protocol error into `unavailable`. It
+        // keeps the readiness reason when there is one (that is the condition
+        // that led here) and otherwise names the code it ate.
+        sink.note(`protocol_error:${error.code}`);
         const entry = await exactEntry(ctx, assessment, item);
         classified = {
           bucket: "unavailable",
           ...(entry ? { proof: proofForEntry(entry) } : {}),
         };
       }
+      const reason = sink.first();
+      if (reason && classified.bucket !== "ready")
+        reasons = incrementReason(reasons, reason);
       counts = incrementItem(counts, classified.bucket);
       if (classified.proof === "queuedScanEntries") queued += 1;
       else if (classified.proof === "gapScanEntries") gap += 1;
@@ -1423,7 +1560,7 @@ export async function advanceProcessingAssessment(
       phase,
       cursor,
       nextOrdinal,
-      JSON.stringify(counts),
+      JSON.stringify(countsWithReasons(counts, reasons)),
       accounted,
       queued,
       gap,
