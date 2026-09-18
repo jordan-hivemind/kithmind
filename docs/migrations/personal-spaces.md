@@ -1,5 +1,10 @@
 # Personal-space migration
 
+Status, 2026-09-18: historical. This P1-1 migration ran against Convex before
+the PostgreSQL cutover; P2-39m2 removed `packages/convex` (and these Convex
+functions) from the repository, so the procedure below can no longer be run
+from this checkout.
+
 P1-1 adds optional space ownership and internal migration tools. Existing web
 and MCP reads and writes remain user-scoped. This migration does not enable
 family sharing. API-key scopes and required space ownership belong to P1-2.

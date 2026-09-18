@@ -12,7 +12,7 @@ It stores three kinds of knowledge:
 | Thoughts  | A decision and why you made it, a project's state    |
 | Documents | A statement or note you captured, with the text kept |
 
-You host it yourself. The data sits in your own Convex deployment, not in a
+You host it yourself. The data sits in your own PostgreSQL database, not in a
 shared service. Assistants reach it over MCP, so no browser extension or
 copy-paste is involved.
 
@@ -23,18 +23,18 @@ Steps 1 through 3 happen once. Step 4 is the daily part.
 ### Step 1. Deploy your own instance
 
 Fork the repository, then follow
-[`docs/self-hosting.md`](./docs/self-hosting.md). It walks through one Convex
-project, one Vercel project, and the environment variables that connect them.
-Node.js 22 or newer and pnpm 10.20 are the only prerequisites.
+[`docs/self-hosting.md`](./docs/self-hosting.md). It walks through one
+PostgreSQL database, one Vercel project, and the environment variables that
+connect them. Node.js 22 or newer and pnpm 10.20 are the only prerequisites.
 
 You finish this step with an HTTPS address such as
 `https://your-project.vercel.app`. Your MCP endpoint is that address plus
 `/api/mcp`.
 
-Expect a small monthly bill at most. Convex and Vercel free tiers cover light
-personal use. Semantic search and narrative analysis call OpenAI and Anthropic
-and are metered, but both are optional. Keyword search and capture work without
-either key.
+Expect a small monthly bill at most. A small hosted PostgreSQL instance and
+the Vercel free tier cover light personal use. Semantic search and narrative
+analysis call OpenAI and Anthropic and are metered, but both are optional.
+Keyword search and capture work without either key.
 
 ### Step 2. Create your account
 
@@ -128,9 +128,7 @@ covers mobile clients that support it. There is no native app planned.
 
 ```sh
 pnpm install
-cd packages/convex && npx convex dev --once && cd ../..
-pnpm --filter @repo/db exec auth --web-server-url http://localhost:3000
-cp apps/web/.env.example apps/web/.env.local   # then set the dev Convex URL
+cp apps/web/.env.example apps/web/.env.local   # then set KITH_DATABASE_URL and friends
 pnpm dev
 ```
 

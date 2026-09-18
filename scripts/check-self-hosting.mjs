@@ -15,8 +15,9 @@ const BASE64URL_32_BYTES = /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/;
  * TypeScript.
  *
  * i7b dropped `NEXT_PUBLIC_CONVEX_URL` and the four `MCP_JWT_*` names with the
- * last Convex import and the JWT bridge. There is one web surface now, so
- * there is one list.
+ * last Convex import and the JWT bridge. P2-39m2 removed packages/convex and
+ * the `--convex` preflight mode along with it. There is one web surface and
+ * one database now, so there is one list.
  */
 export const WEB_REQUIRED_VARIABLES = [
   "MCP_OAUTH_ENCRYPTION_KEY",
@@ -27,19 +28,6 @@ export const WEB_REQUIRED_VARIABLES = [
 
 /** `apps/web/src/lib/kith/session.ts`'s own floor, restated for the preflight. */
 const MIN_KITH_SESSION_SECRET_LENGTH = 32;
-
-export const CORE_CONVEX_REQUIRED_VARIABLES = [
-  "MCP_JWT_ISSUER",
-  "SITE_URL",
-  "JWT_PRIVATE_KEY",
-  "JWKS",
-];
-
-export const CONVEX_REQUIRED_VARIABLES = [
-  "OPENAI_API_KEY",
-  "ANTHROPIC_API_KEY",
-  ...CORE_CONVEX_REQUIRED_VARIABLES,
-];
 
 function isAllowedOrigin(value) {
   try {
@@ -114,20 +102,6 @@ export function validateWebEnvironment(environment) {
   return issues;
 }
 
-export function validateConvexVariableNames(names, profile = "full") {
-  if (profile !== "core" && profile !== "full") {
-    throw new Error("--profile must be core or full");
-  }
-  const configured = new Set(names);
-  const required =
-    profile === "core"
-      ? CORE_CONVEX_REQUIRED_VARIABLES
-      : CONVEX_REQUIRED_VARIABLES;
-  return required
-    .filter((name) => !configured.has(name))
-    .map((name) => ({ name, problem: "missing" }));
-}
-
 export function formatIssues(scope, issues) {
   return issues.map(({ name, problem }) => `${scope}: ${problem} ${name}`);
 }
@@ -135,11 +109,7 @@ export function formatIssues(scope, issues) {
 export function parseArguments(arguments_) {
   const options = {
     web: false,
-    convex: false,
-    production: false,
-    deployment: undefined,
     envFile: "apps/web/.env.local",
-    profile: "full",
     worker: false,
     workerConfig: undefined,
     json: false,
@@ -158,25 +128,6 @@ export function parseArguments(arguments_) {
     } else if (argument === "--web") {
       once("--web");
       options.web = true;
-    } else if (argument === "--convex") {
-      once("--convex");
-      options.convex = true;
-    } else if (argument === "--prod") {
-      once("--prod");
-      options.production = true;
-    } else if (argument === "--profile") {
-      once("--profile");
-      const profile = arguments_[index + 1];
-      index += 1;
-      if (profile !== "core" && profile !== "full") {
-        throw new Error("--profile must be core or full");
-      }
-      options.profile = profile;
-    } else if (argument === "--deployment") {
-      once("--deployment");
-      options.deployment = arguments_[index + 1];
-      index += 1;
-      if (!options.deployment) throw new Error("--deployment requires a name");
     } else if (argument === "--env-file" || argument === "--web-env-file") {
       once("--web-env-file");
       options.envFile = arguments_[index + 1];
@@ -201,15 +152,10 @@ export function parseArguments(arguments_) {
     }
   }
 
-  if (!options.web && !options.convex && !options.worker) options.web = true;
+  if (!options.web && !options.worker) options.web = true;
   if (
     options.worker &&
-    (options.web ||
-      options.convex ||
-      options.production ||
-      options.deployment !== undefined ||
-      seen.has("--profile") ||
-      seen.has("--web-env-file"))
+    (options.web || seen.has("--web-env-file"))
   ) {
     throw new Error(
       "Worker diagnostics cannot be combined with operator checks",
@@ -224,9 +170,6 @@ export function parseArguments(arguments_) {
   if (options.help && seen.size !== 1) {
     throw new Error("--help cannot be combined with other options");
   }
-  if (options.production && options.deployment) {
-    throw new Error("Use either --prod or --deployment, not both");
-  }
   return options;
 }
 
@@ -240,49 +183,13 @@ function loadEnvironmentFile(path) {
   }
 }
 
-function getConvexVariableNames(options) {
-  const arguments_ = [
-    "--filter",
-    "@repo/db",
-    "exec",
-    "convex",
-    "env",
-    "list",
-    "--names-only",
-  ];
-  if (options.production) arguments_.push("--prod");
-  if (options.deployment) {
-    arguments_.push("--deployment", options.deployment);
-  }
-
-  const result = spawnSync("pnpm", arguments_, {
-    cwd: fileURLToPath(new URL("..", import.meta.url)),
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  if (result.status !== 0) {
-    throw new Error(
-      "Unable to inspect Convex environment names; link the intended deployment first",
-    );
-  }
-
-  return result.stdout
-    .split(/\r?\n/u)
-    .map((name) => name.trim())
-    .filter((name) => /^[A-Z][A-Z0-9_]*$/u.test(name));
-}
-
 function printHelp() {
   process.stdout.write(
     [
-      "Usage: pnpm check:self-hosting [--web] [--convex] [--prod]",
+      "Usage: pnpm check:self-hosting [--web]",
       "",
       "--web                 Validate apps/web/.env.local (default)",
       "--web-env-file PATH   Validate another web environment file",
-      "--convex              Inspect Convex environment names only",
-      "--prod                Inspect the default production deployment",
-      "--deployment NAME     Inspect a specific Convex deployment",
-      "--profile PROFILE     Validate core or full requirements (default: full)",
       "--worker --config PATH Run the scoped pipeline doctor only",
       "--json                Emit the worker doctor JSON unchanged",
     ].join("\n") + "\n",
@@ -296,15 +203,6 @@ export function runPreflight(options) {
     results.push({
       scope: "web",
       issues: validateWebEnvironment(process.env),
-    });
-  }
-  if (options.convex) {
-    results.push({
-      scope: "convex",
-      issues: validateConvexVariableNames(
-        getConvexVariableNames(options),
-        options.profile,
-      ),
     });
   }
   return results;
@@ -354,12 +252,6 @@ if (invokedDirectly) {
         process.exitCode = worker.status;
       }
     } else {
-      process.stdout.write(`profile: ${options.profile}\n`);
-      if (options.profile === "core") {
-        process.stdout.write(
-          "core: validates configuration only; live source access is not checked\n",
-        );
-      }
       const results = runPreflight(options);
       let hasIssues = false;
       for (const result of results) {
