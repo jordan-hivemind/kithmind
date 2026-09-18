@@ -1,9 +1,15 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import {
+  McpServer,
+  type ToolCallback,
+} from "@modelcontextprotocol/sdk/server/mcp.js";
+import type {
+  CallToolResult,
+  ToolAnnotations,
+} from "@modelcontextprotocol/sdk/types.js";
 import {
   FINANCE_READ_TOOL_DESCRIPTION,
   FinanceContractError,
 } from "@repo/finance-contract";
-import { IdentityError } from "@repo/kith-store/identity";
 import { z } from "zod";
 
 import {
@@ -99,32 +105,82 @@ const writeSpaceSchema = spaceIdSchema
     "Explicit destination from list_spaces. If omitted, use the configured default or Personal. Joining a shared space never changes this default.",
   );
 /**
- * The one typed read denial a tool turns into an `isError` result.
+ * The closed set of messages a tool may repeat to a client verbatim.
  *
- * i7b replaced `@repo/db`'s `parseSpaceReadErrorData` with the store's own
- * carrier. It is the same payload by construction: `spaceReadNotFound` in
- * `@repo/kith-store/identity`'s `errors.ts` throws an `IdentityError` whose
- * `data.code` is `space_not_found`, which is what the Convex `ConvexError`
- * carried. Anything else is a defect rather than an authorization answer and is
- * rethrown masked, so a bug cannot arrive at a client as "Space not found" or
- * carry its own message there.
+ * The SDK turns a thrown error into a tool result carrying `error.message`, so
+ * without this every store, driver or `pg` message is a client-visible string,
+ * and those name space ids, source accounts, rows and connection targets.
+ * `guardToolErrors` therefore masks by default and this set is the only way out.
  *
- * The text is the literal the store throws, restated here rather than read off
- * the error, so a message that changed upstream cannot change what a tool says.
+ * Two kinds of message are in it and nothing else is:
+ *
+ *   * The non-enumerating denials. `errors.ts` in `@repo/kith-store/identity`
+ *     documents why they are fixed words: a caller must not be able to tell a
+ *     target that does not exist from one it may not see. `Thought capture
+ *     requires read and write capabilities` is `writes.ts`'s own by-hand
+ *     capability check and belongs to the same group.
+ *   * The one argument error this file raises that no tool schema can express,
+ *     because `validFrom` and `validTo` are only wrong relative to each other.
+ *     Masking it would tell a client to fix its input without saying what.
+ *
+ * Every entry is a literal, never a string built from data, and the match is on
+ * the whole message so a longer message that merely contains one of these is
+ * still masked.
  */
-function spaceReadToolError(error: unknown) {
-  if (
-    !(error instanceof IdentityError) ||
-    error.data?.code !== "space_not_found"
-  ) {
-    // The SDK sends a thrown message to the client, and a defect's message can
-    // name a space. The original stays on `cause` for the server log.
-    throw new Error("Internal error", { cause: error });
-  }
+const CLIENT_SAFE_TOOL_ERRORS: ReadonlySet<string> = new Set([
+  "Not authenticated",
+  "Space not found",
+  "Source account not found",
+  "Seed thought not found",
+  "Thought capture requires read and write capabilities",
+  "validFrom must be earlier than validTo",
+]);
+
+function toolErrorResult(text: string) {
   return {
-    content: [{ type: "text" as const, text: "Space not found" }],
-    isError: true,
+    content: [{ type: "text" as const, text }],
+    isError: true as const,
   };
+}
+
+/**
+ * One boundary for every tool handler's thrown error.
+ *
+ * Applied by `registerTool` below, so a tool cannot be added without it and no
+ * handler needs a `try`/`catch` of its own for this. Argument errors the SDK
+ * raises are unaffected: it validates against the tool schema before the
+ * handler runs, outside what this wraps.
+ *
+ * The original never reaches the client and is written to the server log
+ * instead, as the tool name, the error name and the error message. Not the
+ * arguments and not the result, so a log line cannot become the copy of a
+ * caller's query or a row that the response itself refused to carry.
+ */
+function guardToolErrors<Shape extends z.ZodRawShape>(
+  tool: McpToolName,
+  handler: ToolCallback<Shape>,
+): ToolCallback<Shape> {
+  // `ToolCallback` is a conditional type over the tool's own argument shape,
+  // which does not survive being re-expressed generically, so the wrapper is
+  // written against the one thing every shape agrees on and cast back.
+  const call = handler as unknown as (
+    ...args: unknown[]
+  ) => Promise<CallToolResult>;
+  const guarded = async (...args: unknown[]): Promise<CallToolResult> => {
+    try {
+      return await call(...args);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (CLIENT_SAFE_TOOL_ERRORS.has(message)) return toolErrorResult(message);
+      console.error("MCP tool error", {
+        tool,
+        name: error instanceof Error ? error.name : typeof error,
+        message,
+      });
+      return toolErrorResult("Internal error");
+    }
+  };
+  return guarded as unknown as ToolCallback<Shape>;
 }
 
 /** Parse an explicit real-world validity date without using the server's timezone. */
@@ -330,18 +386,11 @@ function truncateContext(content: string, maxChars = 4_000): string {
  * string out of the archive in an error message.
  */
 function financeToolError(error: unknown) {
-  return {
-    content: [
-      {
-        type: "text" as const,
-        text:
-          error instanceof FinanceContractError
-            ? error.code
-            : "the financial archive failed to serve this request",
-      },
-    ],
-    isError: true as const,
-  };
+  return toolErrorResult(
+    error instanceof FinanceContractError
+      ? error.code
+      : "the financial archive failed to serve this request",
+  );
 }
 
 /**
@@ -390,26 +439,43 @@ export function createMcpServer(
     { instructions: SERVER_INSTRUCTIONS },
   );
 
-  const listSpacesTool = server.tool(
+  /**
+   * `server.tool`, with `guardToolErrors` on the handler. Every tool below is
+   * registered through this and none calls `server.tool` directly, so the error
+   * boundary is a property of registration rather than of remembering.
+   */
+  function registerTool<Shape extends z.ZodRawShape>(
+    name: McpToolName,
+    description: string,
+    paramsSchema: Shape,
+    annotations: ToolAnnotations,
+    handler: ToolCallback<Shape>,
+  ) {
+    return server.tool(
+      name,
+      description,
+      paramsSchema,
+      annotations,
+      guardToolErrors(name, handler),
+    );
+  }
+
+  const listSpacesTool = registerTool(
     MCP_TOOL_NAMES.listSpaces,
     "List the spaces this credential can currently read, with IDs, names, membership roles and embedding index coverage. Coverage is reported from the space counters: status unknown means the space has never been counted, not that it is empty. Use these IDs to select a destination or narrow a search.",
     {},
     MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.listSpaces],
     async () => {
-      try {
-        const spaces = await reads.listSpaces();
-        return {
-          content: [
-            { type: "text" as const, text: JSON.stringify(spaces, null, 2) },
-          ],
-        };
-      } catch (error) {
-        return spaceReadToolError(error);
-      }
+      const spaces = await reads.listSpaces();
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(spaces, null, 2) },
+        ],
+      };
     },
   );
 
-  const queryRecordsTool = server.tool(
+  const queryRecordsTool = registerTool(
     MCP_TOOL_NAMES.queryRecords,
     "Query exact indexed records and retained evidence for one explicit space. Use latest_observation, observation_history, latest_event, list_events or sum_money. Entity IDs must be resolved explicitly. Dates are occurrence dates, money totals stay grouped by currency, and partial pages or incomplete coverage are never exhaustive. Resume by repeating the same query with the returned cursor; invalid cursors require a fresh query. " +
       "Two providers answer through this tool and their results are never combined. Omit provider for Kith Mind's own records. Set provider to finance_archive to read the financial archive, which owns canonical transaction, holding and balance identity: request is a finance read contract request and the archive's own response is returned unchanged, with its dataset revision, coverage, completeness, truncation, issues and evidence. Archive money is always a decimal string, never a number. Zero items with coverage status unknown means nothing in the archive vouches for the range, not that no event occurred; call get_coverage before reading an empty result as absence. " +
@@ -419,15 +485,9 @@ export function createMcpServer(
     async ({ query }) => {
       if ("provider" in query) {
         if (!financeArchive) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: "the financial archive is not configured for this deployment",
-              },
-            ],
-            isError: true as const,
-          };
+          return toolErrorResult(
+            "the financial archive is not configured for this deployment",
+          );
         }
         try {
           // Returned verbatim. The archive is authoritative for these rows, so
@@ -454,7 +514,7 @@ export function createMcpServer(
     },
   );
 
-  const searchDocumentsTool = server.tool(
+  const searchDocumentsTool = registerTool(
     MCP_TOOL_NAMES.searchDocuments,
     "Search indexed source documents. searchMode defaults to hybrid, which uses compatible semantic vectors and keywords and falls back to keywords when vectors are unavailable. Use keyword to bypass embedding providers and vector retrieval. Returns retained citations, vector availability and freshness flags. Empty results are not proof of complete coverage.",
     {
@@ -474,17 +534,13 @@ export function createMcpServer(
     },
     MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.searchDocuments],
     async ({ spaceIds, ...args }) => {
-      try {
-        const result = await reads.searchDocuments({ ...args, spaceIds });
-        return {
-          content: [{ type: "text" as const, text: JSON.stringify(result) }],
-        };
-      } catch (error) {
-        return spaceReadToolError(error);
-      }
+      const result = await reads.searchDocuments({ ...args, spaceIds });
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(result) }],
+      };
     },
   );
-  const getDocumentTool = server.tool(
+  const getDocumentTool = registerTool(
     MCP_TOOL_NAMES.getDocument,
     "Read an indexed document and its retained evidence. Historical revisions require includeHistorical; forgotten and unauthorized documents are unavailable. Original files may require desktop access even when evidence is retained.",
     {
@@ -504,7 +560,7 @@ export function createMcpServer(
       };
     },
   );
-  const ingestUrlTool = server.tool(
+  const ingestUrlTool = registerTool(
     MCP_TOOL_NAMES.ingestUrl,
     "Queue a URL for a configured source account with an ingest-scoped credential. This version does not fetch URLs. The response is queued with workerRequired true; it is not indexed content. The title remains on the pending request until fetched. Reuse the requestId only with identical arguments.",
     {
@@ -532,7 +588,7 @@ export function createMcpServer(
     },
   );
 
-  const listSourcesTool = server.tool(
+  const listSourcesTool = registerTool(
     MCP_TOOL_NAMES.listSources,
     "List authorized source accounts and bounded processing status. Partial or truncated results must not be presented as a complete source inventory. " +
       "When the financial archive is configured and in scope, a separate financeArchive block reports its own sources at coverage granularity: source, record kind and period, with gaps. It is the archive's get_coverage response and is never merged into sources.",
@@ -603,7 +659,7 @@ export function createMcpServer(
     },
   );
 
-  const listInventoryTool = server.tool(
+  const listInventoryTool = registerTool(
     MCP_TOOL_NAMES.listInventory,
     "Read the per-file source inventory for one source account: is a named file present, what is in a folder, what was excluded and why, and which files are duplicates of which. Every file under an admitted source has a row, including files that were never content indexed or that failed to parse; an absent row means the file was never observed, not that it was skipped. Give at most one of fileName, folderPath, exclusionReason or duplicateGroupId. counts reports the exclusion-reason breakdown for the selected scope even when the row page itself is truncated, so a partial page of rows is never mistaken for a complete folder or duplicate group.",
     {
@@ -618,22 +674,18 @@ export function createMcpServer(
     },
     MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.listInventory],
     async ({ spaceIds, sourceAccountId, ...args }) => {
-      try {
-        const result = await reads.listInventory({
-          ...args,
-          sourceAccountId,
-          spaceIds,
-        });
-        return {
-          content: [{ type: "text" as const, text: JSON.stringify(result) }],
-        };
-      } catch (error) {
-        return spaceReadToolError(error);
-      }
+      const result = await reads.listInventory({
+        ...args,
+        sourceAccountId,
+        spaceIds,
+      });
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(result) }],
+      };
     },
   );
 
-  const listReviewQueueTool = server.tool(
+  const listReviewQueueTool = registerTool(
     MCP_TOOL_NAMES.listReviewQueue,
     "Read the review queue for one source account: counts of skipped files by exclusion reason, dropped card fields by gate failure code, gate-failed cards by card kind, duplicate file groups, card fields whose entity name needs a person to bind it, and the P2-70f extraction queue's status per card kind. Every skipped file, dropped field, duplicate group and unbound name is reachable from these counts, even when a detail page is truncated. Name one class (skipped_by_type, field_dropped, card_gate_failed, duplicate_group, entity_binding_needed or queue_status) to page its rows; drop rows carry a document reference, the field name and the closed gate failure code, never the field's value, and entity_binding_needed rows carry the literal name the document used and how many entities it matched.",
     {
@@ -645,22 +697,18 @@ export function createMcpServer(
     },
     MCP_TOOL_ANNOTATIONS[MCP_TOOL_NAMES.listReviewQueue],
     async ({ spaceIds, sourceAccountId, ...args }) => {
-      try {
-        const result = await reads.listReviewQueue({
-          ...args,
-          sourceAccountId,
-          spaceIds,
-        });
-        return {
-          content: [{ type: "text" as const, text: JSON.stringify(result) }],
-        };
-      } catch (error) {
-        return spaceReadToolError(error);
-      }
+      const result = await reads.listReviewQueue({
+        ...args,
+        sourceAccountId,
+        spaceIds,
+      });
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(result) }],
+      };
     },
   );
 
-  const searchFactsTool = server.tool(
+  const searchFactsTool = registerTool(
     MCP_TOOL_NAMES.searchFacts,
     "Search precise structured facts such as names, exact dates, relationships, providers, schools, employers, and stable preferences. Use this for direct factual questions and use search_thoughts for narrative decisions or project context. Current facts are returned by default. Set includeHistorical for what used to be true. Cite results as fact:<id>.",
     {
@@ -697,7 +745,7 @@ export function createMcpServer(
     },
   );
 
-  const rememberFactTool = server.tool(
+  const rememberFactTool = registerTool(
     MCP_TOOL_NAMES.rememberFact,
     "Store one precise, independently changeable fact explicitly stated or confirmed by the user. Use one subject, one snake_case predicate, and one typed value. Use an entity value for relationships. Never store a derived age: store date_of_birth only if an exact date is known. Never use this directly for connector-derived or inferred information; preview those candidates and call only after user confirmation. Single-valued predicates preserve prior values as history; use changeKind corrected when the prior value was inaccurate.",
     {
@@ -817,7 +865,7 @@ export function createMcpServer(
     },
   );
 
-  const searchThoughtsTool = server.tool(
+  const searchThoughtsTool = registerTool(
     MCP_TOOL_NAMES.searchThoughts,
     "Use this when you need to search durable memory by meaning and keyword. Pass the user's exact wording when possible, especially names, identifiers, and version strings. Current memories are searched by default. Set includeHistorical for questions about prior states, corrections, or how something changed. Returns a compact index; use `get_thoughts` to fetch full content. Cite sources as `thought:<id>`.",
     {
@@ -926,7 +974,7 @@ export function createMcpServer(
     },
   );
 
-  const recallContextTool = server.tool(
+  const recallContextTool = registerTool(
     MCP_TOOL_NAMES.recallContext,
     "Use this at the start of a relevant turn to recall precise facts and narrative context before answering. Pass the user's complete current message verbatim; do not paraphrase or normalize exact names, identifiers, project names, or version strings. Returns a bounded blend of current core facts/memories and relevant results. Set includeHistorical only for an explicitly historical question. Cite sources as fact:<id> or thought:<id>.",
     {
@@ -1056,7 +1104,7 @@ export function createMcpServer(
     },
   );
 
-  const browseRecentTool = server.tool(
+  const browseRecentTool = registerTool(
     MCP_TOOL_NAMES.browseRecent,
     "Browse most recent current thoughts, optionally filtered by type or topic. Set includeHistorical to include superseded and corrected memories. Cite sources as `thought:<id>`.",
     {
@@ -1153,7 +1201,7 @@ export function createMcpServer(
     },
   );
 
-  const getThoughtsTool = server.tool(
+  const getThoughtsTool = registerTool(
     MCP_TOOL_NAMES.getThoughts,
     "Fetch full content and lifecycle links for specific thought IDs. Use after `search_thoughts` and batch multiple IDs in one call. Treat current memories as authoritative; superseded memories were formerly current, while retracted memories were inaccurate.",
     {
@@ -1224,7 +1272,7 @@ export function createMcpServer(
     },
   );
 
-  const timelineThoughtsTool = server.tool(
+  const timelineThoughtsTool = registerTool(
     MCP_TOOL_NAMES.timelineThoughts,
     "Fetch thoughts captured around a specific point in time. Provide either `seedId` (anchor on another thought) or `aroundMs` (epoch ms). Returns compact index rows ordered oldest→newest — use `get_thoughts` for full content. Cite sources as `thought:<id>`.",
     {
@@ -1341,7 +1389,7 @@ export function createMcpServer(
     },
   );
 
-  const getStatsTool = server.tool(
+  const getStatsTool = registerTool(
     MCP_TOOL_NAMES.getStats,
     "Get overview statistics of what's stored in your brain. Counts and per-space embedding coverage come from the space counters; totals count lifecycle-current memories. partial true means the byType, topTopics and topPeople digest, or an uncounted space's totals, hit a scan bound and are a sample.",
     { spaceIds: readSpacesSchema },
@@ -1360,7 +1408,7 @@ export function createMcpServer(
     },
   );
 
-  const captureThoughtTool = server.tool(
+  const captureThoughtTool = registerTool(
     MCP_TOOL_NAMES.captureThought,
     "Store one atomic durable narrative memory: a decision with rationale, coherent project state, commitment, or recurring pattern whose parts change together. Use remember_fact instead for precise attributes and relationships. Never send biographies, dossiers, mixed people/projects, completed-task catalogs, activity logs, connector observations, assistant guesses, or inferred user facts. The admission gate may decline storage or request confirmation. The server deduplicates and preserves changed or corrected prior information as linked history. Requires both read and write access to the destination space.",
     {
