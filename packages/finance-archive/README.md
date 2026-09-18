@@ -997,13 +997,17 @@ caller cannot do by combining the other two files alone:
   (instrument, institution) whose parsed descriptor actually stated a cusip or
   isin, written at mint and at every identifier-strong match. Asking instead
   which institutions' `transactions` or `positions` rows reference the
-  instrument is circular -- a refused statement holding still writes its
-  position, carrying no identifier at all, and that position would then vouch
-  for the next match. Two institutions on record, or none, is refused rather
-  than resolved by majority. An archive whose instruments predate the table
-  runs `scripts/backfillInstrumentIdentifierSources.mjs` once, which
-  reconstructs sources from `transactions` only, and says why a position never
-  counts.
+  instrument is circular -- a refused holding still writes its position,
+  stating no identifier, and that position would then vouch for the next
+  match. (Not every statement holding is identifier-free: a bond block prints
+  its CUSIP and matches on it like any other. The gap is specific to rows that
+  state a ticker and nothing stronger.) Two institutions on record, or none, is
+  refused rather than resolved by majority. An archive whose instruments
+  predate the table runs
+  `scripts/backfillInstrumentIdentifierSources.mjs --apply` once, which counts
+  only a feed transaction -- a provider transaction id and an export-tier
+  source document -- skips any instrument two institutions qualify for, and is
+  a dry run until `--apply`.
 
   An acceptance is written durably as a `resolved`
   `review_items` row of kind `institution_symbol_match`, carrying

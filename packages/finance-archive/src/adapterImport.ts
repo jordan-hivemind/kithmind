@@ -346,13 +346,13 @@ async function prefetchInstruments(
   //
   // Read from `instrument_identifier_sources` and from nothing else. Asking
   // instead which institutions' `transactions` or `positions` rows reference
-  // the instrument looks equivalent and is circular: a statement holding
-  // refused by this rule still writes its `positions` row, carrying no
-  // identifier at all, and the next statement -- or the next reparse of the
-  // same one -- would find exactly one institution referencing the instrument
-  // and accept the match, with no feed ever having vouched for the identifier.
-  // A row is evidence only if the descriptor behind it actually stated one,
-  // which is what that table records and what no other column does.
+  // the instrument looks equivalent and is circular: a holding refused by this
+  // rule still writes its `positions` row, stating no identifier, and the next
+  // statement -- or the next reparse of the same one -- would find exactly one
+  // institution referencing the instrument and accept the match, with no feed
+  // ever having vouched for the identifier. A row is evidence only if the
+  // descriptor behind it actually stated one, which is what that table records
+  // and what no other column does.
   //
   // Exactly one institution, and it must be this pull's own. Two is refused
   // rather than resolved by majority: once two institutions have both stated

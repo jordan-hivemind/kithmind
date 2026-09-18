@@ -1,14 +1,21 @@
 // F1-76 phase 3. The same-institution symbol rule, and the closed vocabulary
 // every decision it makes is recorded under.
 //
-// The problem it exists for: this institution's statements name an equity
+// The problem it exists for: this institution's statements name an *equity*
 // holding by symbol and name only, and its activity feed mints the same
-// instrument with a symbol and a cusip and no name. So a statement holding can
+// instrument with a symbol and a cusip and no name. So such a holding can
 // never reach the cusip or isin tier, never matches on (symbol AND name), and
 // always lands in the symbol-only tier, which is flagged for review
 // (`weak_instrument_match`). On the owner's archive that is 1,330 instruments
-// carrying an open weak match, 1,319 of them already holding a cusip nobody
-// disputes.
+// carrying an open weak match, 1,327 of them already holding an identifier
+// nobody disputes.
+//
+// Not every statement holding is identifier-free, and nothing here assumes so:
+// a bond block prints "CUSIP <nine characters>" on its detail line and the
+// statement parser reads it (`statementLayout.mjs`'s `resolveInstrument`).
+// Such a holding matches on its cusip like any other and never reaches this
+// rule. The gap is specific to the rows that state a ticker and nothing
+// stronger.
 //
 // The owner's decision (2026-09-18) is to accept such a match as strong, under
 // its own identity kind, when all three conditions hold:

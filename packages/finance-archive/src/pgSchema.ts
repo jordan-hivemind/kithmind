@@ -852,13 +852,13 @@ $$;
 // `instrument_identifier_sources` is the third, and it is the rule's whole
 // evidence base. The obvious way to ask "did this institution's own data
 // establish this instrument's identifier" is to ask which institutions' rows
-// reference the instrument, and that answer is circular: a statement holding
-// matched by symbol alone writes a `positions` row referencing the instrument
-// while carrying no identifier at all, and the next statement would then see
-// exactly one institution referencing it and accept the very match the first
-// one was refused, with no feed ever having vouched for anything. A row is
-// evidence only if it could have *carried* the identifier, and neither
-// `transactions` nor `positions` records whether the descriptor behind it did.
+// reference the instrument, and that answer is circular: a holding matched by
+// symbol alone writes a `positions` row referencing the instrument while
+// stating no identifier, and the next statement would then see exactly one
+// institution referencing it and accept the very match the first one was
+// refused, with no feed ever having vouched for anything. A row is evidence
+// only if the descriptor behind it stated an identifier, and neither
+// `transactions` nor `positions` records whether it did.
 //
 // So it is recorded rather than inferred. One row per (instrument,
 // institution) whose parsed descriptor actually stated a cusip or an isin,

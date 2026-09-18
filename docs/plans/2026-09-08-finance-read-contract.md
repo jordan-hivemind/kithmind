@@ -355,8 +355,11 @@ The rule's evidence is `instrument_identifier_sources`: one row per
 (instrument, institution) whose parsed descriptor stated a cusip or isin. An
 instrument no institution is on record for is refused, so an archive migrated
 from before that table runs
-`scripts/backfillInstrumentIdentifierSources.mjs` once, before the reparse, or
-every affected position keeps reporting `ambiguous`.
+`scripts/backfillInstrumentIdentifierSources.mjs --apply` once, before the
+reparse, or every affected position keeps reporting `ambiguous`. That pass is a
+dry run without `--apply`, counts only transactions carrying a provider
+transaction id from an export-tier source document, and skips any instrument
+two institutions qualify for.
 
 The archive records each decision durably in `review_items`: an acceptance as a
 `resolved` `institution_symbol_match` naming the rule, a refusal as an open
