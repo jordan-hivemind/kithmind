@@ -2515,6 +2515,497 @@ test("provider admission sends three recovery selections and persists the provid
   }
 });
 
+/**
+ * An original whose locator is durable but never admitted, with both proof
+ * timestamps set to `verifiedAt` (P2-31a).
+ */
+function durableProviderRows(checkpoint, verifiedAt) {
+  const durable = (role, seed) => {
+    const value = archiveCopy(role);
+    value.preparationIntent = { tempName: `${value.archiveObjectId}.tmp` };
+    value.prepared = {
+      state: "prepared",
+      tempName: value.preparationIntent.tempName,
+      source: { sha256: HASH, byteLength: 100 },
+      ciphertext: { sha256: seed.repeat(64), byteLength: 200 },
+      ciphertextDevice: 1,
+      ciphertextInode: 2,
+      archiveDirectoryDevice: 1,
+      archiveDirectoryInode: 3,
+      ageVersion: "v1.3.2",
+    };
+    value.published = {
+      state: "published",
+      source: { sha256: HASH, byteLength: 100 },
+      ciphertext: { sha256: seed.repeat(64), byteLength: 200 },
+      ciphertextDevice: 1,
+      ciphertextInode: 2,
+      ageVersion: "v1.3.2",
+    };
+    value.readbackVerifiedAt = verifiedAt;
+    if (role === "independent_backup")
+      value.backup = {
+        operationId: value.restic.operationId,
+        snapshotId: `${seed}`.repeat(64),
+        objectName: value.objectName,
+        ciphertext: value.published.ciphertext,
+        resticVersion: "0.19.1",
+        repositoryId: value.restic.repositoryId,
+        verification: "destination_ciphertext_readback",
+      };
+    return value;
+  };
+  return {
+    original: {
+      originalCatalogId: checkpoint.originalCatalogId,
+      rowRevision: 1,
+      createdAt: 1,
+      origin: { sha256: HASH, byteLength: 100 },
+      copies: { primary: durable("primary", "1") },
+      providerOriginal: {
+        clientReferenceId: randomUUID(),
+        bindingId: randomUUID(),
+        locator: durable("independent_backup", "4"),
+        verified: {
+          providerAccountIdHash: "1".repeat(64),
+          providerRootDirectoryIdHash: "2".repeat(64),
+          providerFileIdHash: "3".repeat(64),
+          providerRevision: "rev1",
+          providerContentHash: "4".repeat(64),
+          sourceContentHash: HASH,
+          sourceByteLength: 100,
+          verifiedAt,
+          manifestFingerprint: "5".repeat(64),
+          manifestByteLength: 300,
+        },
+      },
+    },
+    processing: {
+      processingCatalogId: checkpoint.processingCatalogId,
+      rowRevision: 1,
+      createdAt: 1,
+      copies: {
+        primary: durable("primary", "2"),
+        independent_backup: durable("independent_backup", "3"),
+      },
+      parserIntent: { parserArtifactClientId: randomUUID() },
+      parserOutput: {
+        rawArtifact: {
+          sha256: HASH,
+          byteLength: 100,
+          mediaType: "application/vnd.docling+json",
+        },
+        extractionFingerprint: HASH,
+      },
+    },
+  };
+}
+
+function admitCheckpoint(plan) {
+  return archivedCheckpoint(plan, {
+    step: "admit",
+    preflightAction: undefined,
+    discoveryLease: {
+      workId: "work",
+      sourceItemId: plan.sourceItemId,
+      observationEpoch: 1,
+      processingEpoch: 1,
+      leaseEpoch: 1,
+      leaseToken: TOKEN,
+      leaseExpiresAt: Date.now() + 60_000,
+    },
+  });
+}
+
+function parsedDeclaration() {
+  return {
+    extractionFingerprint: HASH,
+    textHash: HASH,
+    byteLength: 10,
+    utf16Length: 10,
+    pageCount: 1,
+    mappingManifestHash: HASH,
+    normalizedBundleDigest: HASH,
+    expectedEvidenceSpanCount: 1,
+    expectedDocumentCount: 1,
+    expectedChunkCount: 1,
+  };
+}
+
+function admittedResponse(plan) {
+  return {
+    operation: "discovery.admitArchived",
+    workId: "work",
+    sourceItemId: plan.sourceItemId,
+    sourceRevisionId: "revision",
+    parserArtifactId: "artifact",
+    sourceTextVersionId: "text",
+    processingGenerationId: "generation",
+    ingestJobId: "job",
+    desiredProcessingEpoch: 1,
+    archiveSetDigest: HASH,
+    originalPrimaryReceiptId: "original-primary",
+    originalPrimaryBindingEpoch: 0,
+    originalProviderReferenceId: "provider-reference",
+    originalProviderBindingEpoch: 1,
+    parserPrimaryReceiptId: "parser-primary",
+    parserPrimaryBindingEpoch: 0,
+    parserBackupReceiptId: "parser-backup",
+    parserBackupBindingEpoch: 0,
+    state: "admitted",
+    reused: false,
+  };
+}
+
+/** Both proof timestamps advanced, as a completed refresh leaves them. */
+function freshenProviderProof(rows) {
+  const provider = rows.original.providerOriginal;
+  return {
+    ...rows,
+    original: {
+      ...rows.original,
+      rowRevision: rows.original.rowRevision + 1,
+      providerOriginal: {
+        ...provider,
+        locator: { ...provider.locator, readbackVerifiedAt: Date.now() },
+        verified: { ...provider.verified, verifiedAt: Date.now() },
+      },
+    },
+  };
+}
+
+function admissionCatalog(read, write) {
+  return {
+    async recordCloudReceipt(args) {
+      const rows = read();
+      const key = args.subject === "original_bytes" ? "original" : "processing";
+      const row = rows[key];
+      write({
+        ...rows,
+        [key]: {
+          ...row,
+          rowRevision: row.rowRevision + 1,
+          copies: {
+            ...row.copies,
+            [args.role]: {
+              ...row.copies[args.role],
+              cloudReceipt: {
+                receiptId: args.receiptId,
+                requestDigest: args.requestDigest,
+                recordedAt: args.recordedAt,
+              },
+            },
+          },
+        },
+      });
+      return read()[key];
+    },
+    async recordOriginalCloud(args) {
+      const rows = read();
+      write({
+        ...rows,
+        original: {
+          ...rows.original,
+          rowRevision: rows.original.rowRevision + 1,
+          cloud: args.cloud,
+        },
+      });
+      return read().original;
+    },
+    async recordProcessingCloud(args) {
+      const rows = read();
+      write({
+        ...rows,
+        processing: {
+          ...rows.processing,
+          rowRevision: rows.processing.rowRevision + 1,
+          cloud: args.cloud,
+        },
+      });
+      return read().processing;
+    },
+  };
+}
+
+test("a stale proof refreshes before any new lease and the recovery pass reserves once", async () => {
+  const setup = await fixture(0);
+  const plan = pdfPlan();
+  const checkpoint = archivedCheckpoint(plan, {
+    step: "admit",
+    preflightAction: undefined,
+    discoveryLease: {
+      workId: "work",
+      sourceItemId: plan.sourceItemId,
+      observationEpoch: 1,
+      processingEpoch: 1,
+      leaseEpoch: 1,
+      leaseToken: TOKEN,
+      // The wedged row's lease expired many passes ago.
+      leaseExpiresAt: Date.now() - 60 * 60_000,
+    },
+  });
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  let rows = durableProviderRows(checkpoint, Date.now() - 45 * 60_000);
+  const sent = [];
+  const runner = new PipelineRunner(setup.config, journal, {
+    async call(request) {
+      sent.push(request.operation);
+      if (request.operation === "discovery.reserveArchived")
+        return {
+          operation: "discovery.reserveArchived",
+          workId: "work",
+          sourceItemId: plan.sourceItemId,
+          observationEpoch: plan.observationEpoch,
+          processingEpoch: plan.processingEpoch,
+          leaseEpoch: 2,
+          leaseToken: TOKEN,
+          leaseExpiresAt: Date.now() + 60_000,
+          reused: false,
+        };
+      return admittedResponse(plan);
+    },
+  });
+  runner.archivedRows = () => rows;
+  runner.mappedProcessing = async () => ({
+    original: rows.original,
+    processing: rows.processing,
+    declaration: parsedDeclaration(),
+  });
+  runner.archiveCatalog = admissionCatalog(() => rows, (next) => (rows = next));
+  let refreshes = 0;
+  runner.refreshProviderProof = async (current) => {
+    refreshes += 1;
+    // The real method reads the provider and the snapshot again, then commits
+    // the two timestamps before the checkpoint.
+    rows = freshenProviderProof(rows);
+    await journal.transitionCheckpoint({
+      checkpoint: parseRunnerCheckpoint({ ...current }),
+      credentialSessionActive: true,
+    });
+  };
+  try {
+    // The expired lease must not be renewed before the proof is refreshed.
+    // Every reserve spends one of the row's bounded discovery attempts, and a
+    // lease taken here would sit idle across two provider round trips.
+    await runner.driveArchivedAdmit();
+    assert.equal(refreshes, 1);
+    assert.deepEqual(sent, []);
+    assert.equal(journal.checkpoint.step, "admit");
+    // The refreshed pass then takes exactly one lease and admits under it.
+    await runner.driveArchivedAdmit();
+    assert.equal(journal.checkpoint.step, "reserve");
+    await runner.driveArchivedReserve();
+    assert.equal(journal.checkpoint.step, "admit");
+    await runner.driveArchivedAdmit();
+    assert.equal(refreshes, 1);
+    assert.deepEqual(sent, [
+      "discovery.reserveArchived",
+      "discovery.admitArchived",
+    ]);
+    assert.equal(rows.original.cloud.providerReferenceId, "provider-reference");
+    assert.equal(journal.checkpoint.step, "parsed_reserve");
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a refresh whose catalog write already committed is not repeated on the next pass", async () => {
+  const setup = await fixture(0);
+  const plan = pdfPlan();
+  const checkpoint = admitCheckpoint(plan);
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  // A crash between the refresh's catalog write and its checkpoint commit
+  // leaves a fresh proof behind. The next pass must admit under it, not read
+  // the provider and the snapshot again.
+  let rows = durableProviderRows(checkpoint, Date.now());
+  const sent = [];
+  const runner = new PipelineRunner(setup.config, journal, {
+    async call(request) {
+      sent.push(request.operation);
+      return admittedResponse(plan);
+    },
+  });
+  runner.archivedRows = () => rows;
+  runner.mappedProcessing = async () => ({
+    original: rows.original,
+    processing: rows.processing,
+    declaration: parsedDeclaration(),
+  });
+  runner.archiveCatalog = admissionCatalog(() => rows, (next) => (rows = next));
+  runner.refreshProviderProof = async () => {
+    throw new Error("a fresh proof must not be refreshed again");
+  };
+  try {
+    await runner.driveArchivedAdmit();
+    assert.deepEqual(sent, ["discovery.admitArchived"]);
+    assert.equal(journal.checkpoint.step, "parsed_reserve");
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("an admitted original still fails closed when its recorded proof is stale", async () => {
+  const setup = await fixture(0);
+  const plan = pdfPlan();
+  const checkpoint = admitCheckpoint(plan);
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  const rows = durableProviderRows(checkpoint, Date.now() - 45 * 60_000);
+  rows.original.cloud = {
+    sourceItemId: plan.sourceItemId,
+    sourceRevisionId: "revision",
+    primaryReceiptId: "original-primary",
+    providerReferenceId: "provider-reference",
+    providerBindingEpoch: 0,
+    admittedAt: 1,
+  };
+  const runner = new PipelineRunner(setup.config, journal, {
+    async call() {
+      throw new Error("a stale declaration must not reach the transport");
+    },
+  });
+  runner.archivedRows = () => rows;
+  runner.mappedProcessing = async () => ({
+    ...rows,
+    declaration: parsedDeclaration(),
+  });
+  runner.refreshProviderProof = async () => {
+    throw new Error("an admitted original must not be refreshed");
+  };
+  try {
+    await assert.rejects(
+      () => runner.driveArchivedAdmit(),
+      (error) => error.code === "provider_verification_stale_review_required",
+    );
+    assert.equal(journal.checkpoint.step, "admit");
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a durable admit replay keeps its persisted declaration instead of refreshing", async () => {
+  const setup = await fixture(0);
+  const plan = pdfPlan();
+  const checkpoint = admitCheckpoint(plan);
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  const rows = durableProviderRows(checkpoint, Date.now() - 45 * 60_000);
+  const runner = new PipelineRunner(setup.config, journal, {
+    async call() {
+      throw new Error("unused");
+    },
+  });
+  runner.archivedRows = () => rows;
+  runner.mappedProcessing = async () => ({
+    ...rows,
+    declaration: parsedDeclaration(),
+  });
+  runner.refreshProviderProof = async () => {
+    throw new Error("a replayed admission must not be refreshed");
+  };
+  let requireFresh;
+  runner.providerDeclaration = (_row, fresh) => {
+    requireFresh = fresh;
+    throw new Error("declaration reached");
+  };
+  const requestId = randomUUID();
+  await journal.planRequest({
+    operation: "discovery.admitArchived",
+    requestId,
+    requestBody: JSON.stringify({
+      protocolVersion: 1,
+      operation: "discovery.admitArchived",
+      spaceId: "space",
+      sourceAccountId: "source",
+      requestId,
+    }),
+    createdAt: 1,
+  });
+  try {
+    // A replayed call reuses its journaled body, so it must not be rerouted
+    // into a refresh that would abandon the request the server may have run.
+    await assert.rejects(
+      () => runner.driveArchivedAdmit(),
+      /declaration reached/,
+    );
+    assert.equal(requireFresh, false);
+    assert.equal(journal.checkpoint.step, "admit");
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a provider proof refresh fails closed before reading the provider", async () => {
+  const setup = await fixture(0);
+  const registryPath = join(setup.base, "provider-registry");
+  await mkdir(registryPath, { mode: 0o700 });
+  const registryDirectory = await realpath(registryPath);
+  await chmod(registryDirectory, 0o700);
+  const plan = pdfPlan();
+  const checkpoint = admitCheckpoint(plan);
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  const rows = durableProviderRows(checkpoint, Date.now() - 45 * 60_000);
+  rows.processing.captureIntent = {
+    captureId: randomUUID(),
+    directory: { device: 1, inode: 2 },
+  };
+  rows.processing.capture = {
+    sourceModifiedAt: 1,
+    device: 1,
+    inode: 2,
+    mode: 0o600,
+  };
+  const providerConfig = {
+    registryDirectory,
+    rootAlias: plan.rootAlias,
+    providerAccountIdHash: "1".repeat(64),
+    providerRootDirectoryIdHash: "2".repeat(64),
+    providerRootDirectoryId: "id:root",
+  };
+  const pdfDocQa = {
+    captureDirectory: setup.root,
+    archive: { independentBackup: { repository: {} } },
+    providerOriginal: providerConfig,
+  };
+  const runner = new PipelineRunner({ ...setup.config, pdfDocQa }, journal, {
+    async call() {
+      throw new Error("a refresh must not call the transport");
+    },
+  });
+  runner.archivedRows = () => rows;
+  try {
+    // No registry manifest backs the recorded fingerprint, so the refresh stops
+    // before it reads Dropbox or the snapshot.
+    await assert.rejects(
+      () => runner.refreshProviderProof(checkpoint),
+      (error) => error.code === "provider_locator_registry_missing",
+    );
+    // A root the configuration no longer binds stops it even earlier.
+    runner.config.pdfDocQa.providerOriginal = {
+      ...providerConfig,
+      rootAlias: "other",
+    };
+    await assert.rejects(
+      () => runner.refreshProviderProof(checkpoint),
+      (error) => error.code === "provider_original_root_mismatch",
+    );
+    // So does a locator already held for replacement review.
+    runner.config.pdfDocQa.providerOriginal = providerConfig;
+    rows.original.providerOriginal.locator.reviewCode = "replacement_detected";
+    await assert.rejects(
+      () => runner.refreshProviderProof(checkpoint),
+      (error) =>
+        error.code === "provider_locator_recovery_review_required",
+    );
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+
 test("archived pending bodies are rebuilt from catalog and spool state", async () => {
   const setup = await fixture(0);
   const plan = pdfPlan();

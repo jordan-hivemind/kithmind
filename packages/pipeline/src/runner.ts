@@ -283,6 +283,27 @@ function parseAttemptsSpent(rows: readonly ProcessingCatalogRow[]): number {
   );
 }
 
+/**
+ * The server refuses a provider original declaration whose verification or
+ * locator readback is older than `PROVIDER_VERIFICATION_MAX_AGE_MS` (ten
+ * minutes) or further ahead than `PROVIDER_VERIFICATION_FUTURE_SKEW_MS` (five
+ * minutes); see `validateProviderOriginalDeclaration` in
+ * `@repo/kith-store`. The worker keeps a minute of margin on both ends so a
+ * declaration it decides to send survives the admit round trip.
+ */
+function providerProofFresh(
+  provider: NonNullable<OriginalCatalogRow["providerOriginal"]>,
+  now = Date.now(),
+): boolean {
+  const verifiedAt = provider.verified?.verifiedAt;
+  const readbackVerifiedAt = provider.locator.readbackVerifiedAt;
+  if (verifiedAt === undefined || readbackVerifiedAt === undefined)
+    return false;
+  return [verifiedAt, readbackVerifiedAt].every(
+    (at) => at >= now - 9 * 60_000 && at <= now + 4 * 60_000,
+  );
+}
+
 type ArchivedCheckpoint = Extract<RunnerCheckpoint, { phase: "archived" }>;
 
 function stableUuid(...parts: readonly unknown[]): string {
@@ -2775,13 +2796,7 @@ export class PipelineRunner {
       locator.readbackVerifiedAt === undefined
     )
       throw new PipelineWorkerError("provider_original_not_durable");
-    if (
-      requireFresh &&
-      (verified.verifiedAt < Date.now() - 9 * 60_000 ||
-        verified.verifiedAt > Date.now() + 4 * 60_000 ||
-        locator.readbackVerifiedAt < Date.now() - 9 * 60_000 ||
-        locator.readbackVerifiedAt > Date.now() + 4 * 60_000)
-    )
+    if (requireFresh && !providerProofFresh(provider))
       throw new PipelineWorkerError(
         "provider_verification_stale_review_required",
       );
@@ -3592,6 +3607,104 @@ export class PipelineRunner {
     });
   }
 
+  /**
+   * P2-31a. Redoes the two checks a provider original declaration must carry
+   * fresh, for an original whose admission was interrupted after its locator
+   * was durable. Nothing else in the archived flow re-verifies once the locator
+   * is complete, so a resumed pass would otherwise declare a proof the server
+   * refuses, forever.
+   *
+   * This reads the provider and the backup snapshot again and writes two local
+   * timestamps. It mutates no archive object and nothing server side, so unlike
+   * the locator actions it needs no `discovery.preflightArchived` round trip to
+   * authorize it. That is also the only route that works here:
+   * `preflightArchivedDiscovery` refuses a row that holds any lease, expired or
+   * not, and a row resumed at `admit` always holds one.
+   *
+   * The registry manifest is deliberately not rewritten. Its `verifiedAt`
+   * records the first successful verification, which stays true, and rewriting
+   * it would change `manifestFingerprint` and invalidate the published
+   * ciphertext and its snapshot. Only an original this space has never admitted
+   * may refresh; the caller checks that, and `refreshProviderProof` on the
+   * catalog refuses an admitted row and any moved identity.
+   *
+   * The catalog write commits before the checkpoint does. A crash in between is
+   * harmless: the next pass sees a fresh proof and skips straight to admitting.
+   */
+  private async refreshProviderProof(
+    checkpoint: ArchivedCheckpoint,
+  ): Promise<void> {
+    const { original, processing } = this.archivedRows(checkpoint);
+    const pdf = this.requirePdfConfig();
+    const provider = pdf.providerOriginal;
+    const state = original.providerOriginal;
+    if (!provider || !state || !("repository" in pdf.archive.independentBackup))
+      throw new PipelineWorkerError("provider_original_configuration_missing");
+    const verified = state.verified;
+    const copy = state.locator;
+    if (!verified || !copy.published || !copy.backup || !copy.restic)
+      throw new PipelineWorkerError("provider_original_not_durable");
+    if (copy.reviewCode)
+      throw new PipelineWorkerError(
+        "provider_locator_recovery_review_required",
+      );
+    const plan = this.archivedPlan(checkpoint);
+    if (plan.rootAlias !== provider.rootAlias)
+      throw new PipelineWorkerError("provider_original_root_mismatch");
+    const remoteRepository = pdf.archive.independentBackup.repository!;
+    const configured = pdf.archive.independentBackup;
+    const loaded = await loadProviderBinding({
+      registryDirectory: provider.registryDirectory,
+      bindingId: state.bindingId,
+    });
+    if (loaded?.persisted.manifestFingerprint !== verified.manifestFingerprint)
+      throw new PipelineWorkerError("provider_locator_registry_missing");
+    const reverified = await verifyDropboxOriginal({
+      credentials: {
+        rcloneBinary: remoteRepository.rcloneBinary,
+        configPath: remoteRepository.configPath,
+        remoteName: remoteRepository.remoteName,
+        configIdentityFingerprint: remoteRepository.configIdentityFingerprint,
+      },
+      refreshPath: provider.refreshPath,
+      capturePath: captureFromRows(pdf, original, processing).path,
+      sourceContentHash: original.origin.sha256,
+      sourceByteLength: original.origin.byteLength,
+      providerAccountIdHash: provider.providerAccountIdHash,
+      providerRootDirectoryIdHash: provider.providerRootDirectoryIdHash,
+      providerRootDirectoryId: provider.providerRootDirectoryId,
+      relativePath: plan.relativePath,
+      bindingId: state.bindingId,
+      expectedProviderFileIdHash: verified.providerFileIdHash,
+    });
+    const readback = await recoverResticBackup({
+      resticBinary: configured.resticBinary,
+      repository: remoteRepository,
+      expectedRepositoryId: configured.expectedRepositoryId,
+      passwordCommand: configured.passwordCommand,
+      operationId: copy.restic.operationId,
+      host: copy.restic.host,
+      objectName: copy.objectName,
+      expectedCiphertext: copy.published.ciphertext,
+    });
+    const next = await this.requireCatalog().refreshProviderProof({
+      catalogId: original.originalCatalogId,
+      expectedRevision: original.rowRevision,
+      verified: reverified.metadata,
+      readback,
+    });
+    if (!providerProofFresh(next.providerOriginal!))
+      throw new PipelineWorkerError(
+        "provider_verification_stale_review_required",
+      );
+    await this.journal.transitionCheckpoint({
+      checkpoint: archivedBase(checkpoint, {
+        expectedOriginalRevision: next.rowRevision,
+      }),
+      credentialSessionActive: true,
+    });
+  }
+
   private async driveArchivedLookupOriginal(): Promise<void> {
     const checkpoint = this.journal.checkpoint;
     if (
@@ -4254,6 +4367,29 @@ export class PipelineRunner {
     }
     const lease = checkpoint.discoveryLease;
     if (!lease) throw new PipelineWorkerError("archived_lease_missing");
+    const admitting = this.archivedRows(checkpoint).original;
+    // P2-31a. A pass that resumes here after an interrupted admission holds a
+    // durable locator whose proof has aged past what the server accepts. Redo
+    // both checks in place rather than throwing
+    // `provider_verification_stale_review_required`, which failed this pass and
+    // every later one over the same row. A pending call replays its persisted
+    // declaration instead, which is exempt from the freshness rule.
+    //
+    // This runs before the lease check on purpose. `discovery.reserveArchived`
+    // counts an attempt against `MAX_WORKER_DISCOVERY_ATTEMPTS` every time it
+    // hands out a lease, and it only re-leases work whose lease has expired.
+    // Renewing the expired lease first and then leaving it idle across two
+    // provider round trips would spend an attempt and could expire again, so
+    // the recovery pass refreshes first and then reserves exactly once.
+    if (
+      !this.journal.pending &&
+      admitting.providerOriginal &&
+      !admitting.cloud &&
+      !providerProofFresh(admitting.providerOriginal)
+    ) {
+      await this.refreshProviderProof(checkpoint);
+      return;
+    }
     if (
       !this.journal.pending &&
       lease.leaseExpiresAt <= Date.now() + LEASE_SAFETY_MARGIN_MS
