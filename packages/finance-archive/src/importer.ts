@@ -36,6 +36,14 @@ import { randomUUID } from "node:crypto";
 
 import { multiplyDecimal } from "./decimal.js";
 import {
+  emptyInstrumentMatchSummary,
+  INSTITUTION_SYMBOL_INVALIDATED,
+  INSTITUTION_SYMBOL_RULE,
+  type InstitutionSymbolRefusalReason,
+  type InstrumentMatchReasonCode,
+  type InstrumentMatchSummary,
+} from "./instrumentMatch.js";
+import {
   DERIVED_ROUNDING_RULE,
   fromMinorUnits,
   type RoundingRule,
@@ -338,6 +346,15 @@ export type AdapterReviewItem = {
    */
   readonly institutionId?: string | null;
   readonly matchedInstrumentId?: string | null;
+  /**
+   * F1-76 phase 3. Which condition of the same-institution symbol rule this
+   * item records (instrumentMatch.ts): the rule's own name on an
+   * `institution_symbol_match`, or the refusal that kept a
+   * `weak_instrument_match` flagged. Written to `review_items.reason_code`,
+   * whose CHECK is the same closed list, so a decision is counted rather than
+   * only read. Absent when the rule did not run at all.
+   */
+  readonly reasonCode?: InstrumentMatchReasonCode;
 };
 
 export type ImportBatch = {
@@ -372,9 +389,11 @@ export type ImportSummary = {
   /**
    * F1-55. A `document_unparsed` item this run closed because the same
    * document, reimported, no longer carries a parse note (see the
-   * `parseNote`-less branch below). Never a count of items dismissed or
-   * resolved by a person -- this importer only ever resolves the one kind it
-   * itself opens, and only when its own reason for opening it no longer
+   * `parseNote`-less branch below). F1-76 phase 3 adds the second kind this
+   * importer closes on its own: a `weak_instrument_match` whose match the
+   * same-institution symbol rule now accepts. Never a count of items dismissed
+   * or resolved by a person -- this importer only ever resolves kinds it
+   * itself opens, and only when its own reason for opening them no longer
    * holds.
    */
   reviewItemsResolved: number;
@@ -386,6 +405,15 @@ export type ImportSummary = {
    * touched.
    */
   reviewItemsUpdated: number;
+  /**
+   * F1-76 phase 3. Every symbol-only instrument match this run decided, and
+   * how: accepted under the same-institution symbol rule, refused by which
+   * condition, or withdrawn because later data stopped satisfying the rule.
+   * The owner's requirement is that nothing is accepted or left broken
+   * silently, so these are counts an operator sees on every run rather than a
+   * query somebody has to think to write.
+   */
+  instrumentMatches: InstrumentMatchSummary;
   /** Always 0 here; `publishImport` reports what the gates found. */
   reconciliationsPassed: number;
   reconciliationsFailed: number;
@@ -660,6 +688,20 @@ export async function importBatch(
   // sighting into the same row rather than a plain insert.
   let weakInstrumentReviews: WeakInstrumentCandidate[] = [];
 
+  // F1-76 phase 3. Matches the same-institution symbol rule accepted, buffered
+  // like the weak ones and written by `flushInstitutionSymbolMatches`.
+  let institutionSymbolReviews: WeakInstrumentCandidate[] = [];
+
+  /**
+   * F1-76 phase 3. Every symbol-only match decision this run made, counted
+   * once per (institution, descriptor, matched instrument) rather than once
+   * per sighting: one statement per month restating the same holding is one
+   * decision, and a per-sighting number would report the corpus size instead
+   * of the outcome.
+   */
+  const instrumentMatches = emptyInstrumentMatchSummary();
+  const decidedMatches = new Set<string>();
+
   function openReview(
     accountId: string | null,
     documentId: string | null,
@@ -772,6 +814,7 @@ export async function importBatch(
     reason: string;
     institutionId: string | null;
     matchedInstrumentId: string | null;
+    reasonCode: InstrumentMatchReasonCode | null;
   };
 
   /** This kind's identity (F1-58): (institution, descriptor, matched
@@ -896,23 +939,32 @@ export async function importBatch(
       const reason = `$${values.push(candidate.reason)}`;
       const institutionId = `$${values.push(candidate.institutionId)}`;
       const matchedInstrumentId = `$${values.push(candidate.matchedInstrumentId)}`;
+      const reasonCode = `$${values.push(candidate.reasonCode)}`;
       // account_id and source_locator: always NULL for this kind, same as
       // the generic path. source_document_id (first-seen) and
       // last_seen_document_id both start at this document on first insert;
       // only the DO UPDATE branch moves last_seen_document_id forward.
-      return `(${id}, 'weak_instrument_match', NULL, ${doc}, NULL, ${rawValue}, ${reason}, ${institutionId}, ${matchedInstrumentId}, 1, ${doc})`;
+      return `(${id}, 'weak_instrument_match', NULL, ${doc}, NULL, ${rawValue}, ${reason}, ${institutionId}, ${matchedInstrumentId}, 1, ${doc}, ${reasonCode})`;
     });
 
+    // F1-76 phase 3: `reason_code` and `reason` are refreshed on the DO UPDATE
+    // branch, not only written on insert. Which condition of the rule an open
+    // item fails can change between runs, and an open item still naming last
+    // month's condition is the review queue quietly describing something that
+    // is no longer true.
     const result = await client.query<{ occurrence_count: number }>(
       `INSERT INTO review_items
          (id, kind, account_id, source_document_id, source_locator, raw_value, reason,
-          institution_id, matched_instrument_id, occurrence_count, last_seen_document_id)
+          institution_id, matched_instrument_id, occurrence_count, last_seen_document_id,
+          reason_code)
        VALUES ${tuples.join(", ")}
        ON CONFLICT (kind, institution_id, raw_value, matched_instrument_id)
-         WHERE kind = 'weak_instrument_match'
+         WHERE kind IN ('weak_instrument_match', 'institution_symbol_match')
        DO UPDATE SET
          occurrence_count = review_items.occurrence_count + 1,
-         last_seen_document_id = EXCLUDED.last_seen_document_id
+         last_seen_document_id = EXCLUDED.last_seen_document_id,
+         reason = EXCLUDED.reason,
+         reason_code = EXCLUDED.reason_code
          WHERE review_items.status = 'open'
        RETURNING occurrence_count`,
       values,
@@ -920,6 +972,283 @@ export async function importBatch(
     reviewItemsOpened += result.rows.filter(
       (row) => row.occurrence_count === 1,
     ).length;
+  }
+
+  /**
+   * F1-76 phase 3. Writes what the same-institution symbol rule accepted, and
+   * closes what it supersedes.
+   *
+   * Two statements, in this order, because they are two different facts. The
+   * first records the decision: one `institution_symbol_match` row per
+   * (institution, descriptor, matched instrument), written already `resolved`
+   * and naming the rule, because an acceptance asks nobody anything and has no
+   * business sitting in a queue. `DO NOTHING` on conflict -- the same rule
+   * reaching the same conclusion on the next statement adds nothing to the row
+   * it already wrote, which is also what makes a reimport idempotent.
+   *
+   * The second closes the `weak_instrument_match` this match used to be. The
+   * owner's archive carries 1,330 of them; leaving them open beside an
+   * acceptance would say the archive is unsure about a match it just accepted.
+   * The row is resolved rather than deleted (nothing here ever deletes a
+   * review item) and the resolution note names the rule, so "why did this
+   * close" is answerable a year from now. Only an `open` item is touched: a
+   * person's own dismissal is never overruled by a rule.
+   */
+  async function flushInstitutionSymbolMatches(
+    documentId: string | null,
+  ): Promise<void> {
+    const pending = institutionSymbolReviews;
+    institutionSymbolReviews = [];
+    if (pending.length === 0) return;
+
+    const seen = new Set<string>();
+    const accepted = pending.filter((candidate) => {
+      const key = weakInstrumentKey(
+        candidate.institutionId,
+        candidate.rawValue,
+        candidate.matchedInstrumentId,
+      );
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+    const values: unknown[] = [];
+    const tuples = accepted.map((candidate) => {
+      const id = `$${values.push(randomUUID())}`;
+      const doc = `$${values.push(documentId)}`;
+      const rawValue = `$${values.push(candidate.rawValue)}`;
+      const reason = `$${values.push(candidate.reason)}`;
+      const institutionId = `$${values.push(candidate.institutionId)}`;
+      const matchedInstrumentId = `$${values.push(candidate.matchedInstrumentId)}`;
+      const reasonCode = `$${values.push(candidate.reasonCode)}`;
+      return (
+        `(${id}, 'institution_symbol_match', NULL, ${doc}, NULL, ${rawValue}, ${reason}, ` +
+        `'resolved', $${values.push(now.toISOString())}, ` +
+        `$${values.push(`accepted by ${INSTITUTION_SYMBOL_RULE} (import_runs.id=${importRunId})`)}, ` +
+        `${reasonCode}, ${institutionId}, ${matchedInstrumentId}, 1, ${doc})`
+      );
+    });
+    await client.query(
+      `INSERT INTO review_items
+         (id, kind, account_id, source_document_id, source_locator, raw_value, reason,
+          status, resolved_at, resolution_note, reason_code,
+          institution_id, matched_instrument_id, occurrence_count, last_seen_document_id)
+       VALUES ${tuples.join(", ")}
+       ON CONFLICT (kind, institution_id, raw_value, matched_instrument_id)
+         WHERE kind IN ('weak_instrument_match', 'institution_symbol_match')
+       DO NOTHING`,
+      values,
+    );
+
+    const resolved = await client.query(
+      `UPDATE review_items AS r
+          SET status = 'resolved', resolved_at = $1, resolution_note = $2,
+              reason_code = $3
+         FROM (SELECT unnest($4::text[]) AS institution_id,
+                      unnest($5::text[]) AS raw_value,
+                      unnest($6::text[]) AS matched_instrument_id) AS accepted
+        WHERE r.kind = 'weak_instrument_match' AND r.status = 'open'
+          AND r.institution_id = accepted.institution_id
+          AND r.raw_value = accepted.raw_value
+          AND r.matched_instrument_id = accepted.matched_instrument_id`,
+      [
+        now.toISOString(),
+        `resolved by ${INSTITUTION_SYMBOL_RULE}: this institution supplied both the holding ` +
+          `and the matched instrument's identifier, and the symbol names exactly one ` +
+          `instrument (import_runs.id=${importRunId})`,
+        INSTITUTION_SYMBOL_RULE,
+        accepted.map((candidate) => candidate.institutionId),
+        accepted.map((candidate) => candidate.rawValue),
+        accepted.map((candidate) => candidate.matchedInstrumentId),
+      ],
+    );
+    reviewItemsResolved += resolved.rowCount ?? 0;
+    instrumentMatches.resolvedByRule += resolved.rowCount ?? 0;
+  }
+
+  /**
+   * F1-76 phase 3, the owner's self-correction requirement: an accepted match
+   * must never stay accepted on stale evidence.
+   *
+   * Two later imports can make an acceptance unsafe. A second instrument can
+   * appear carrying the same symbol, which breaks condition 1; or another
+   * institution's rows can start referencing the matched instrument, which
+   * breaks the only evidence this archive has for conditions 2 and 3. Both are
+   * caused by writes, so this runs after each document's own writes and asks
+   * the question only about matches that document could have disturbed: one on
+   * an instrument it referenced, or on an instrument sharing a symbol with one
+   * it referenced. The second half is what catches a document that minted the
+   * colliding instrument itself, which the first half would miss -- its rows
+   * point at the new row, never at the accepted one.
+   *
+   * A withdrawal is two writes for the same reason an acceptance is: the
+   * accepted row is dismissed with a note saying what stopped holding, and the
+   * `weak_instrument_match` beside it is reopened carrying
+   * `institution_symbol_match_invalidated`. The read surface then reports the
+   * positions as ambiguous again with no per-position rewrite, because a
+   * position never stored the match kind -- it is derived from these rows.
+   */
+  async function invalidateStaleInstitutionSymbolMatches(
+    instrumentIds: readonly string[],
+  ): Promise<void> {
+    if (instrumentIds.length === 0) return;
+    const stale = await client.query<{
+      id: string;
+      institution_id: string | null;
+      raw_value: string | null;
+      matched_instrument_id: string | null;
+      reason_code: InstitutionSymbolRefusalReason;
+    }>(
+      `WITH touched AS (
+         SELECT id, symbol FROM instruments WHERE id = ANY($1::text[])
+       ),
+       item AS (
+         SELECT r.id, r.institution_id, r.raw_value, r.matched_instrument_id, i.symbol
+           FROM review_items r
+           JOIN instruments i ON i.id = r.matched_instrument_id
+          WHERE r.kind = 'institution_symbol_match' AND r.status = 'resolved'
+            AND (r.matched_instrument_id IN (SELECT id FROM touched)
+                 OR (i.symbol IS NOT NULL AND i.symbol IN
+                       (SELECT symbol FROM touched WHERE symbol IS NOT NULL)))
+       ),
+       sharing AS (
+         SELECT i.symbol, count(*) AS n FROM instruments i
+          WHERE i.symbol IN (SELECT symbol FROM item WHERE symbol IS NOT NULL)
+          GROUP BY i.symbol
+       ),
+       refs AS (
+         SELECT s.instrument_id, count(DISTINCT s.institution_id) AS institutions,
+                min(s.institution_id) AS institution_id
+           FROM (
+             SELECT t.instrument_id, a.institution_id
+               FROM transactions t JOIN accounts a ON a.id = t.account_id
+              WHERE t.instrument_id IN (SELECT matched_instrument_id FROM item)
+             UNION
+             SELECT p.instrument_id, a.institution_id
+               FROM positions p JOIN accounts a ON a.id = p.account_id
+              WHERE p.instrument_id IN (SELECT matched_instrument_id FROM item)
+           ) AS s
+          GROUP BY s.instrument_id
+       )
+       SELECT * FROM (
+         SELECT item.id, item.institution_id, item.raw_value, item.matched_instrument_id,
+                CASE
+                  WHEN coalesce(sharing.n, 1) > 1
+                    THEN 'symbol_matches_several_instruments'
+                  WHEN refs.instrument_id IS NULL
+                    THEN 'instrument_has_no_institution_evidence'
+                  WHEN refs.institutions > 1
+                    THEN 'instrument_referenced_by_several_institutions'
+                  WHEN refs.institution_id IS DISTINCT FROM item.institution_id
+                    THEN 'instrument_vouched_by_another_institution'
+                END AS reason_code
+           FROM item
+           LEFT JOIN sharing ON sharing.symbol = item.symbol
+           LEFT JOIN refs ON refs.instrument_id = item.matched_instrument_id
+       ) AS verdict
+        WHERE reason_code IS NOT NULL`,
+      [[...instrumentIds]],
+    );
+    if (stale.rows.length === 0) return;
+
+    await client.query(
+      `UPDATE review_items SET status = 'dismissed', resolved_at = $2,
+              resolution_note = $3
+        WHERE id = ANY($1::text[]) AND status = 'resolved'`,
+      [
+        stale.rows.map((row) => row.id),
+        now.toISOString(),
+        `withdrawn by ${INSTITUTION_SYMBOL_RULE}: later imported data stopped satisfying the ` +
+          `rule, so this acceptance no longer stands (import_runs.id=${importRunId})`,
+      ],
+    );
+
+    const values: unknown[] = [];
+    const tuples = stale.rows.map((row) => {
+      const id = `$${values.push(randomUUID())}`;
+      const rawValue = `$${values.push(row.raw_value)}`;
+      const reason = `$${values.push(
+        "a match accepted under the same-institution symbol rule no longer satisfies it " +
+          `(${row.reason_code}); the acceptance was withdrawn and this match is flagged again ` +
+          "-- confirm or correct it",
+      )}`;
+      const institutionId = `$${values.push(row.institution_id)}`;
+      const matchedInstrumentId = `$${values.push(row.matched_instrument_id)}`;
+      return (
+        `(${id}, 'weak_instrument_match', NULL, NULL, NULL, ${rawValue}, ${reason}, ` +
+        `'open', $${values.push(INSTITUTION_SYMBOL_INVALIDATED)}, ` +
+        `${institutionId}, ${matchedInstrumentId}, 1)`
+      );
+    });
+    // A reopened item is never one a person dismissed: dismissal is their
+    // answer to this same question, and a rule that reopened it would be
+    // relitigating a decision it does not own.
+    const reopened = await client.query(
+      `INSERT INTO review_items
+         (id, kind, account_id, source_document_id, source_locator, raw_value, reason,
+          status, reason_code, institution_id, matched_instrument_id, occurrence_count)
+       VALUES ${tuples.join(", ")}
+       ON CONFLICT (kind, institution_id, raw_value, matched_instrument_id)
+         WHERE kind IN ('weak_instrument_match', 'institution_symbol_match')
+       DO UPDATE SET status = 'open', resolved_at = NULL, resolution_note = NULL,
+                     reason = EXCLUDED.reason, reason_code = EXCLUDED.reason_code
+         WHERE review_items.status <> 'dismissed'`,
+      values,
+    );
+    reviewItemsOpened += reopened.rowCount ?? 0;
+    instrumentMatches.invalidated += stale.rows.length;
+  }
+
+  /**
+   * F1-76 phase 3. Routes one document's instrument-match items onto their
+   * buffers and counts the decision, once per (institution, descriptor,
+   * matched instrument) across the whole run. Shared by the ordinary import
+   * path and the already-`parsed_ok` skip below, which is the path a
+   * whole-archive reparse actually takes: without it a reparse would re-derive
+   * every decision and write none of them.
+   */
+  function routeInstrumentMatch(item: AdapterReviewItem): boolean {
+    const accepted = item.kind === "institution_symbol_match";
+    if (!accepted && item.kind !== "weak_instrument_match") return false;
+    const candidate: WeakInstrumentCandidate = {
+      rawValue: item.rawValue,
+      reason: item.reason,
+      institutionId: item.institutionId ?? null,
+      matchedInstrumentId: item.matchedInstrumentId ?? null,
+      reasonCode: item.reasonCode ?? null,
+    };
+    if (accepted) institutionSymbolReviews.push(candidate);
+    else weakInstrumentReviews.push(candidate);
+
+    const key = `${item.kind} ${weakInstrumentKey(
+      candidate.institutionId,
+      candidate.rawValue,
+      candidate.matchedInstrumentId,
+    )}`;
+    if (!decidedMatches.has(key)) {
+      decidedMatches.add(key);
+      if (accepted) instrumentMatches.accepted += 1;
+      else if (candidate.reasonCode !== null) {
+        instrumentMatches.refused[
+          candidate.reasonCode as InstitutionSymbolRefusalReason
+        ] += 1;
+      }
+    }
+    return true;
+  }
+
+  /** Every instrument one document's rows and holdings point at: what
+   * `invalidateStaleInstitutionSymbolMatches` asks its question about. */
+  function documentInstrumentIds(document: ImportDocument): string[] {
+    const ids = new Set<string>();
+    for (const row of document.rows) {
+      if (row.instrumentId !== null) ids.add(row.instrumentId);
+    }
+    for (const position of document.positions ?? []) {
+      if (position.instrumentId !== null) ids.add(position.instrumentId);
+    }
+    return [...ids];
   }
 
   /**
@@ -1753,6 +2082,18 @@ export async function importBatch(
         // this archive already has.
         rowsDeduplicated += document.rows.length;
         await processHoldings(document, existing.id);
+        // F1-76 phase 3. Instrument-match decisions are re-derived on every
+        // reparse (resolution happens in adapterImport.ts, before this skip),
+        // and this is the path a whole-archive reparse of already-imported
+        // statements takes, so it is the only place those decisions can land.
+        // Only these two kinds: every other kind stays skipped exactly as it
+        // was, which is what F1-56 made this branch for.
+        for (const item of document.reviewItems ?? []) routeInstrumentMatch(item);
+        await flushWeakInstrumentMatches(existing.id);
+        await flushInstitutionSymbolMatches(existing.id);
+        await invalidateStaleInstitutionSymbolMatches(
+          documentInstrumentIds(document),
+        );
         continue;
       }
 
@@ -1828,15 +2169,7 @@ export async function importBatch(
       // its identity and write path (`flushWeakInstrumentMatches`) are both
       // different from every other kind here.
       for (const item of document.reviewItems ?? []) {
-        if (item.kind === "weak_instrument_match") {
-          weakInstrumentReviews.push({
-            rawValue: item.rawValue,
-            reason: item.reason,
-            institutionId: item.institutionId ?? null,
-            matchedInstrumentId: item.matchedInstrumentId ?? null,
-          });
-          continue;
-        }
+        if (routeInstrumentMatch(item)) continue;
         reviews.push([
           randomUUID(),
           item.kind,
@@ -1941,6 +2274,10 @@ export async function importBatch(
 
       await flushReviews(documentId);
       await flushWeakInstrumentMatches(documentId);
+      await flushInstitutionSymbolMatches(documentId);
+      await invalidateStaleInstitutionSymbolMatches(
+        documentInstrumentIds(document),
+      );
 
       // F1-49. `parsed_ok` used to be `!documentRefused`: any single
       // refusal anywhere in the document (even alongside 1000 clean rows)
@@ -1993,6 +2330,7 @@ export async function importBatch(
       reviewItemsOpened,
       reviewItemsResolved,
       reviewItemsUpdated,
+      instrumentMatches,
       reconciliationsPassed: 0,
       reconciliationsFailed: 0,
       changed: {

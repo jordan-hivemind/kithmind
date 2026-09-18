@@ -430,6 +430,34 @@ describe("response truth and evidence", () => {
     );
   });
 
+  it("carries an institution-symbol identity as its own state, counted apart from resolved", () => {
+    // F1-76 phase 3. A match made on a ticker symbol alone and accepted under
+    // the archive's same-institution symbol rule is a usable identity and is
+    // not the same fact as an identifier match, so it neither reads as
+    // `resolved` nor makes the snapshot incomplete.
+    const exchange = clone(syntheticFinanceReadExchanges[7]);
+    exchange.response.items[0].instrument.status = "institution_symbol";
+    exchange.response.summary.resolvedInstrumentCount = 0;
+    exchange.response.summary.institutionSymbolInstrumentCount = 1;
+    assert.equal(
+      parseExchange(exchange).response.items[0].instrument.status,
+      "institution_symbol",
+    );
+
+    // The three counts must still add up to the position count: a summary that
+    // silently dropped one would be a snapshot claiming fewer positions than
+    // it returned.
+    const miscounted = clone(exchange);
+    miscounted.response.summary.institutionSymbolInstrumentCount = 0;
+    rejects("invalid_response", () => parseExchange(miscounted));
+
+    // And the field is required, so a producer cannot omit the number that
+    // says how much of a snapshot rests on the rule.
+    const omitted = clone(exchange);
+    delete omitted.response.summary.institutionSymbolInstrumentCount;
+    rejects("invalid_response", () => parseExchange(omitted));
+  });
+
   it("discloses an evidence-memory bound when a snapshot summary is unavailable", () => {
     const exchange = clone(syntheticFinanceReadExchanges[7]);
     exchange.response.summary = {

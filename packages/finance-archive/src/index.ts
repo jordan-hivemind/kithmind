@@ -184,6 +184,18 @@ export {
   type PositionReconciliationGateSummary,
 } from "./positionReconciliation.js";
 export {
+  addInstrumentMatchSummary,
+  emptyInstrumentMatchSummary,
+  INSTITUTION_SYMBOL_INVALIDATED,
+  INSTITUTION_SYMBOL_REFUSAL_REASONS,
+  INSTITUTION_SYMBOL_RULE,
+  INSTRUMENT_MATCH_REASON_CODES,
+  INSTRUMENT_MATCH_REASON_TEXT,
+  type InstitutionSymbolRefusalReason,
+  type InstrumentMatchReasonCode,
+  type InstrumentMatchSummary,
+} from "./instrumentMatch.js";
+export {
   ACCOUNT_ALIAS_KINDS,
   maskAccountKey,
   planAccountAliases,

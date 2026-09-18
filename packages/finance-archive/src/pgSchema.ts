@@ -824,6 +824,61 @@ END;
 $$;
 `;
 
+// F1-76 phase 3. The same-institution symbol rule (instrumentMatch.ts) needs
+// three things the schema did not have.
+//
+// `reason_code` is the first. A review item has always explained itself in free
+// text, which a person can read and nothing can count. The owner's requirement
+// is that no match is accepted or refused without being countable and
+// explainable later, so the decision itself becomes a column, constrained to
+// the closed list `INSTRUMENT_MATCH_REASON_CODES` spells. The CHECK is the
+// point: a code this build does not know is refused at write time rather than
+// stored and silently counted as "other" by whatever reads it next. It stays
+// nullable with no backfill -- every existing item predates the vocabulary and
+// honestly has no code -- and every other kind may adopt it later by extending
+// this list in a migration of its own.
+//
+// The identity index is the second. `review_items_weak_instrument_match_key`
+// (migration 8) gave `weak_instrument_match` an instrument-level identity --
+// (institution, descriptor, matched instrument) rather than which statement
+// restated it -- which is exactly the identity an accepted match has too. The
+// index is replaced by one covering both kinds so `institution_symbol_match`
+// gets the same one-row-per-match guarantee instead of one row per statement
+// per holding (the 73,247-row shape migration 8 exists to have fixed). `kind`
+// is already the leading column, so the two kinds simply occupy separate slots
+// and a match can hold one of each: an accepted row and, after an
+// invalidation, the reflagged weak row beside it.
+//
+// The two instrument indexes are the third. Deciding whether an institution
+// vouched for an instrument's identifier means asking which institutions' rows
+// reference it, and neither table could answer that without a sequential scan
+// (`transactions` is indexed on account and date, `positions` on account and
+// as_of). A whole-archive reparse asks it once per document, so the scan is
+// the difference between a query and a reparse that does not finish.
+const INSTRUMENT_MATCH_AUDIT = `
+ALTER TABLE review_items
+  ADD COLUMN reason_code TEXT
+    CHECK (reason_code IS NULL OR reason_code IN (
+      'same_institution_symbol_v1',
+      'institution_symbol_match_invalidated',
+      'symbol_matches_several_instruments',
+      'instrument_has_no_strong_identifier',
+      'instrument_has_no_institution_evidence',
+      'instrument_vouched_by_another_institution',
+      'instrument_referenced_by_several_institutions'));
+
+DROP INDEX review_items_weak_instrument_match_key;
+
+CREATE UNIQUE INDEX review_items_instrument_match_key
+  ON review_items (kind, institution_id, raw_value, matched_instrument_id)
+  WHERE kind IN ('weak_instrument_match', 'institution_symbol_match');
+
+CREATE INDEX transactions_instrument ON transactions (instrument_id)
+  WHERE instrument_id IS NOT NULL;
+CREATE INDEX positions_instrument ON positions (instrument_id)
+  WHERE instrument_id IS NOT NULL;
+`;
+
 /** Every migration, in order. The last one's version is the current schema. */
 export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
   {
@@ -885,6 +940,11 @@ export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
     version: 12,
     name: "account aliases invalidate finance reads",
     sql: ACCOUNT_ALIAS_READ_REVISION,
+  },
+  {
+    version: 13,
+    name: "review_items.reason_code, a shared instrument-match identity index, and instrument reference indexes",
+    sql: INSTRUMENT_MATCH_AUDIT,
   },
 ]);
 

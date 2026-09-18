@@ -45,6 +45,10 @@ import type {
   ImportRow,
 } from "./importer.js";
 import { REVIEW_COLUMNS } from "./importer.js";
+import {
+  INSTITUTION_SYMBOL_RULE,
+  type InstitutionSymbolRefusalReason,
+} from "./instrumentMatch.js";
 import { toMinorUnits } from "./money.js";
 import { toNumericText } from "./pgNumeric.js";
 import {
@@ -192,7 +196,8 @@ export async function resolveInstitution(
  * plan: a real identifier is preferred over a symbol.
  *
  * Precedence: `cusip`, then `isin`, then `symbol` and `name` together, then
- * `symbol` alone, then a new row. A bare symbol never *merges silently* --
+ * the same-institution symbol rule (F1-76 phase 3, see instrumentMatch.ts),
+ * then `symbol` alone, then a new row. A bare symbol never *merges silently* --
  * matching on it alone opens a `review_items` entry recording the weak
  * identity and what it matched, the same way a cross-document row_hash
  * collapse is made visible rather than happening quietly -- but it does
@@ -294,6 +299,81 @@ async function prefetchInstruments(
     rows.push(...found.rows);
   }
 
+  // F1-76 phase 3. Which institutions' stored rows reference each instrument a
+  // symbol-only descriptor in this pull could match. This is the whole
+  // evidence base for the rule's condition 2, and it is the most this schema
+  // can honestly offer: `instruments` carries no provenance columns at all, so
+  // nothing records which pull minted a row or which source supplied its
+  // cusip. What is recorded is which rows point at it, and every one of those
+  // rows belongs to an account, and every account belongs to an institution.
+  //
+  // So the predicate is: exactly one institution's transactions or positions
+  // reference this instrument, and that institution is the one this pull came
+  // from. Two institutions referencing it is refused rather than resolved by
+  // majority -- with no provenance column there is no way to tell the one that
+  // supplied the identifier from the one that merely matched against it, and a
+  // rule that guesses here is exactly the silent merge the review item exists
+  // to prevent. Zero rows is refused too: an instrument nothing references yet
+  // has an identifier that arrived from somewhere this archive cannot name.
+  //
+  // ponytail: a cusip typed onto an otherwise single-institution instrument by
+  // hand is indistinguishable here from one that institution's own feed
+  // supplied, and would be accepted. Closing that needs a provenance column on
+  // `instruments` written at mint time; add one if manual edits ever become a
+  // real source.
+  //
+  // Scoped to descriptors that can actually reach the rule (symbol, no cusip,
+  // no isin) and to candidates that could satisfy it (a cusip or isin on
+  // file), so an activity pull -- where every descriptor carries a cusip --
+  // runs no query at all.
+  const vouching = new Map<
+    string,
+    { institutionId: string; institutions: number }
+  >();
+  const symbolOnly = new Set(
+    instruments
+      .filter((i) => !i.cusip && !i.isin && i.symbol)
+      .map((i) => i.symbol as string),
+  );
+  const vouchCandidates =
+    institutionId === null
+      ? []
+      : rows
+          .filter(
+            (row) =>
+              row.symbol !== null &&
+              symbolOnly.has(row.symbol) &&
+              (row.cusip !== null || row.isin !== null),
+          )
+          .map((row) => row.id);
+  if (vouchCandidates.length > 0) {
+    const referenced = await client.query<{
+      instrument_id: string;
+      institution_id: string;
+      institutions: string;
+    }>(
+      `SELECT instrument_id, min(institution_id) AS institution_id,
+              count(DISTINCT institution_id)::text AS institutions
+         FROM (
+           SELECT t.instrument_id, a.institution_id
+             FROM transactions t JOIN accounts a ON a.id = t.account_id
+            WHERE t.instrument_id = ANY($1::text[])
+           UNION
+           SELECT p.instrument_id, a.institution_id
+             FROM positions p JOIN accounts a ON a.id = p.account_id
+            WHERE p.instrument_id = ANY($1::text[])
+         ) AS referencing
+        GROUP BY instrument_id`,
+      [vouchCandidates],
+    );
+    for (const row of referenced.rows) {
+      vouching.set(row.instrument_id, {
+        institutionId: row.institution_id,
+        institutions: Number(row.institutions),
+      });
+    }
+  }
+
   // ponytail: `resolve` scans the candidate list linearly, so a document is
   // O(holdings * distinct instruments) in memory -- 200 holdings is 40k string
   // comparisons, far below the one round trip it replaces. Index by cusip,
@@ -341,6 +421,33 @@ async function prefetchInstruments(
     return id;
   }
 
+  /**
+   * F1-76 phase 3. Which of the rule's conditions a symbol-only match fails,
+   * or null when it passes and the match may be accepted. Checked in the
+   * order the conditions are written, so a refusal names the first thing that
+   * was wrong rather than summarizing several.
+   *
+   * `sharing` is every candidate carrying this symbol, including rows minted
+   * earlier in this same pull -- a second instrument this pull just created
+   * under the symbol makes the symbol ambiguous now, not on the next run.
+   */
+  function refuseReason(
+    sharing: readonly InstrumentRow[],
+  ): InstitutionSymbolRefusalReason | null {
+    if (sharing.length !== 1) return "symbol_matches_several_instruments";
+    const only = sharing[0]!;
+    if (only.cusip === null && only.isin === null)
+      return "instrument_has_no_strong_identifier";
+    const referenced = vouching.get(only.id);
+    if (referenced === undefined)
+      return "instrument_has_no_institution_evidence";
+    if (referenced.institutions > 1)
+      return "instrument_referenced_by_several_institutions";
+    if (referenced.institutionId !== institutionId)
+      return "instrument_vouched_by_another_institution";
+    return null;
+  }
+
   return {
     created,
     namesLearned,
@@ -366,15 +473,46 @@ async function prefetchInstruments(
       }
       if (instrument.symbol) {
         // ponytail: ctid orders by physical position, which for this
-        // insert-only table is insertion order, so this is the first
-        // instrument row created for this symbol. A rewrite (VACUUM FULL, a
-        // future UPDATE) could reorder it; add an inserted_at column if that
-        // ever matters. Either way it is a naive heuristic -- there is no way
-        // to know if it is the *right* row without a stronger identifier --
-        // which is exactly why the match is flagged for review rather than
-        // trusted silently.
-        const weak = rows.find((row) => row.symbol === instrument.symbol);
+        // insert-only table is insertion order, so the first of these is the
+        // first instrument row created for this symbol. A rewrite (VACUUM
+        // FULL, a future UPDATE) could reorder it; add an inserted_at column
+        // if that ever matters. Either way it is a naive heuristic -- there is
+        // no way to know if it is the *right* row without a stronger
+        // identifier -- which is exactly why the match is flagged for review
+        // rather than trusted silently, unless the rule below can say more.
+        const sharing = rows.filter((row) => row.symbol === instrument.symbol);
+        const weak = sharing[0];
         if (weak) {
+          // F1-76 phase 3. The same-institution symbol rule, between the
+          // (symbol AND name) tier and the bare-symbol one. `institutionId`
+          // null means the caller named no institution at all, so condition 3
+          // cannot be evaluated and the rule is not run: the match falls
+          // through to the flagged tier with no reason code, because "the rule
+          // refused it" would be a claim about a rule that never ran.
+          const refusal =
+            institutionId === null ? null : refuseReason(sharing);
+          if (institutionId !== null && refusal === null) {
+            // The institution vouches for both halves, so the name it prints
+            // for this instrument is this instrument's name -- filled under
+            // the same never-overwrite guard a cusip-strong match uses.
+            learnName(weak, instrument);
+            openReviewItem(reviews, {
+              kind: "institution_symbol_match",
+              accountId: null,
+              institutionId,
+              matchedInstrumentId: weak.id,
+              reasonCode: INSTITUTION_SYMBOL_RULE,
+              rawValue: JSON.stringify(instrument),
+              reason:
+                `resolved by symbol "${instrument.symbol}" alone to existing instrument ` +
+                `${weak.id}, and accepted under the same-institution symbol rule ` +
+                `(${INSTITUTION_SYMBOL_RULE}): this symbol names exactly one instrument in ` +
+                "the archive, that instrument carries a cusip or isin, and only this " +
+                "institution's own rows reference it -- so the institution that stated the " +
+                "holding is the same one that established the identifier",
+            });
+            return weak.id;
+          }
           openReviewItem(reviews, {
             kind: "weak_instrument_match",
             accountId: null,
@@ -383,12 +521,16 @@ async function prefetchInstruments(
             // instrument-level item on, instead of one row per document.
             institutionId,
             matchedInstrumentId: weak.id,
+            ...(refusal === null ? {} : { reasonCode: refusal }),
             rawValue: JSON.stringify(instrument),
             reason:
               `resolved by symbol "${instrument.symbol}" alone (no cusip, isin, or matching name) ` +
               `to existing instrument ${weak.id} (cusip=${weak.cusip ?? "null"}, isin=${weak.isin ?? "null"}, ` +
               `name=${JSON.stringify(weak.name)}); two different instruments sharing this symbol ` +
-              "would incorrectly merge here -- confirm or correct this match",
+              "would incorrectly merge here -- confirm or correct this match" +
+              (refusal === null
+                ? ""
+                : `; the same-institution symbol rule did not accept it (${refusal})`),
           });
           return weak.id;
         }
@@ -456,16 +598,51 @@ async function flushInstruments(
     // `source_document_id` is the honest answer for a pull whose retention
     // declaration dropped a field, or whose pagination total the provider
     // never stated, neither of which is about one document's rows.
-    reviews.map((item) => [
-      randomUUID(),
-      item.kind,
-      item.accountId,
-      null,
-      null,
-      item.rawValue,
-      item.reason,
-    ]),
+    reviews
+      .filter((item) => item.kind !== "institution_symbol_match")
+      .map((item) => [
+        randomUUID(),
+        item.kind,
+        item.accountId,
+        null,
+        null,
+        item.rawValue,
+        item.reason,
+      ]),
   );
+  // F1-76 phase 3. An acceptance is not a question, so it is never written as
+  // an open item: it is written already resolved, naming the rule that settled
+  // it, and it carries the identity columns the read surface reads it back by.
+  // `collectDocuments` routes these onto the `ImportDocument` instead, where
+  // `importer.ts` writes them with a document id; this path exists for
+  // `resolveInstrumentId`, which has no document, and writes the same decision
+  // with none. `DO NOTHING` because the decision is the row: the same rule
+  // reaching the same conclusion again has nothing to add to it.
+  const accepted = reviews.filter(
+    (item) => item.kind === "institution_symbol_match",
+  );
+  for (const item of accepted) {
+    await client.query(
+      `INSERT INTO review_items
+         (id, kind, account_id, source_document_id, source_locator, raw_value, reason,
+          status, resolved_at, resolution_note, reason_code,
+          institution_id, matched_instrument_id, occurrence_count)
+       VALUES ($1, 'institution_symbol_match', NULL, NULL, NULL, $2, $3,
+               'resolved', now(), $4, $5, $6, $7, 1)
+       ON CONFLICT (kind, institution_id, raw_value, matched_instrument_id)
+         WHERE kind IN ('weak_instrument_match', 'institution_symbol_match')
+       DO NOTHING`,
+      [
+        randomUUID(),
+        item.rawValue,
+        item.reason,
+        `accepted by ${INSTITUTION_SYMBOL_RULE}`,
+        item.reasonCode ?? INSTITUTION_SYMBOL_RULE,
+        item.institutionId,
+        item.matchedInstrumentId,
+      ],
+    );
+  }
 }
 
 /**

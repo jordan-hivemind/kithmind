@@ -644,6 +644,7 @@ test(
       "changed",
       "filesSeen",
       "importRunId",
+      "instrumentMatches",
       "reconciliationsFailed",
       "reconciliationsPassed",
       "reviewItemsOpened",
@@ -654,6 +655,21 @@ test(
       "rowsRefused",
       "rowsSkipped",
     ]);
+    // F1-76 phase 3. `instrumentMatches` is counts too: how many symbol-only
+    // matches the same-institution symbol rule accepted, resolved, withdrew or
+    // refused, and by which condition. No descriptor, no symbol, no id.
+    assert.deepEqual(summary.instrumentMatches, {
+      accepted: 0,
+      resolvedByRule: 0,
+      invalidated: 0,
+      refused: {
+        symbol_matches_several_instruments: 0,
+        instrument_has_no_strong_identifier: 0,
+        instrument_has_no_institution_evidence: 0,
+        instrument_vouched_by_another_institution: 0,
+        instrument_referenced_by_several_institutions: 0,
+      },
+    });
     // F1-59. `changed` is what the gates need to check only the periods this
     // import moved, and it is still not row content: opaque ids and dates
     // the summary's own verdict lines already print, never a description, an

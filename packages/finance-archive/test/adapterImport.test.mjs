@@ -7,6 +7,10 @@ import test from "node:test";
 import {
   adapterPullToImportDocuments,
   createSyntheticSession,
+  INSTITUTION_SYMBOL_INVALIDATED,
+  INSTITUTION_SYMBOL_RULE,
+  INSTRUMENT_MATCH_REASON_CODES,
+  INSTRUMENT_MATCH_REASON_TEXT,
   importBatch,
   persistAcquiredDocument,
   resolveInstrumentId,
@@ -2174,5 +2178,476 @@ test(
     );
     // Every instrument really was resolved to its own row, not collapsed.
     assert.equal(await count(client, "instruments"), 210);
+  },
+);
+
+// --- F1-76 phase 3: the same-institution symbol rule --------------------------
+//
+// Every test below is synthetic: two invented institutions, invented tickers,
+// invented identifiers. The shape is the one the owner's archive actually has
+// -- an activity feed that mints an instrument with a symbol and a cusip and no
+// name, and a statement that names the same holding by symbol and name with no
+// identifier at all -- because that shape is the whole reason the rule exists.
+
+const OTHER_INSTITUTION = {
+  id: "inst_mistvale",
+  name: "Mistvale Securities (synthetic)",
+  slug: "mistvale-securities",
+};
+const OTHER_ACCOUNT = { id: "acct_mistvale", last4: "0777" };
+
+async function seedOtherInstitution(client) {
+  await client.query(
+    "INSERT INTO institutions (id, name, slug) VALUES ($1, $2, $3)",
+    [OTHER_INSTITUTION.id, OTHER_INSTITUTION.name, OTHER_INSTITUTION.slug],
+  );
+  await client.query(
+    `INSERT INTO accounts (id, institution_id, acct_last4, display_name, base_currency)
+     VALUES ($1, $2, $3, $4, 'USD')`,
+    [OTHER_ACCOUNT.id, OTHER_INSTITUTION.id, OTHER_ACCOUNT.last4, "Other account"],
+  );
+}
+
+/** A statement holding: symbol and name, never an identifier -- exactly what
+ * this institution's statements print. */
+function statementPosition(instrument, asOf = "2025-03-31") {
+  return {
+    sourceDocument: "statement",
+    asOf,
+    instrument,
+    quantity: "10",
+    price: "12",
+    marketValue: "120",
+    marketValueNote: null,
+    costBasis: "100",
+    unrealized: "20",
+    currency: "USD",
+    valuationBasis: "market_price",
+    valuationNote: null,
+    locators: { row: { source: "pdf_statement", index: 1 } },
+  };
+}
+
+/** One pull through the real seam and importer, the way every other test in
+ * this file publishes: no hand-written ImportDocument anywhere. */
+async function publish(
+  t,
+  client,
+  { label, institutionId, accountId, rows = [], positions = [], docDate },
+) {
+  const acquired = buildTabularPull(label);
+  const documents = await adapterPullToImportDocuments(client, {
+    institutionId,
+    accountId,
+    acquired,
+    rows,
+    holdings: { positions, balances: [], liabilities: [] },
+    docType: "tabular_export",
+    docDate,
+    persisted: persist(t, acquired, "tabular_export"),
+  });
+  return importBatch(
+    client,
+    { source: "synthetic", documents },
+    new Date("2025-05-01"),
+  );
+}
+
+/** The activity feed's descriptor: a symbol and a cusip, and no name at all. */
+const FEED = { symbol: "ZZZ", cusip: "111111ZZ1", isin: null, name: null };
+/** The statement's descriptor for the same holding: symbol and name, nothing
+ * that identifies it. */
+const STATEMENT = {
+  symbol: "ZZZ",
+  cusip: null,
+  isin: null,
+  name: "Synthetic Zephyr Fund",
+};
+
+/** This institution's activity feed, which is what mints the instrument and
+ * establishes its cusip under this institution's own rows. */
+function feedPull(t, client, label, overrides = {}) {
+  return publish(t, client, {
+    label,
+    institutionId: INSTITUTION.id,
+    accountId: ACCOUNT.id,
+    rows: [activityRow({ instrument: FEED, processDate: "2025-01-15", ...overrides })],
+    docDate: "2025-01-31",
+  });
+}
+
+const matchItems = (client) =>
+  all(
+    client,
+    `SELECT kind, status, reason_code, institution_id, matched_instrument_id, resolution_note
+       FROM review_items
+      WHERE kind IN ('weak_instrument_match', 'institution_symbol_match')
+      ORDER BY kind`,
+  );
+
+test(
+  "F1-76: a statement holding matched by symbol alone is accepted when the same institution supplied the identifier, under its own kind, and fills the missing name",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedPg(client);
+
+    await feedPull(t, client, "f1-76 activity feed");
+    const instrumentId = (
+      await one(client, "SELECT id, name FROM instruments")
+    ).id;
+
+    const summary = await publish(t, client, {
+      label: "f1-76 march statement",
+      institutionId: INSTITUTION.id,
+      accountId: ACCOUNT.id,
+      positions: [statementPosition(STATEMENT)],
+      docDate: "2025-03-31",
+    });
+
+    assert.equal(
+      await count(client, "instruments"),
+      1,
+      "the statement holding resolves to the feed's instrument rather than minting a second",
+    );
+    const items = await matchItems(client);
+    assert.equal(items.length, 1);
+    assert.deepEqual(
+      {
+        kind: items[0].kind,
+        status: items[0].status,
+        reasonCode: items[0].reason_code,
+        institutionId: items[0].institution_id,
+        instrumentId: items[0].matched_instrument_id,
+      },
+      {
+        kind: "institution_symbol_match",
+        status: "resolved",
+        reasonCode: INSTITUTION_SYMBOL_RULE,
+        institutionId: INSTITUTION.id,
+        instrumentId,
+      },
+    );
+    assert.equal(summary.instrumentMatches.accepted, 1);
+    assert.equal(
+      Object.values(summary.instrumentMatches.refused).reduce((a, b) => a + b),
+      0,
+    );
+    // The institution vouches for both halves, so the name it prints is this
+    // instrument's name -- the same never-overwrite fill a cusip-strong match
+    // performs.
+    assert.equal(
+      (await one(client, "SELECT name FROM instruments WHERE id = $1", [instrumentId]))
+        .name,
+      STATEMENT.name,
+    );
+  },
+);
+
+test(
+  "F1-76: a symbol two instruments share is refused and stays flagged, naming the condition that failed",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedPg(client);
+
+    await feedPull(t, client, "f1-76 ambiguous feed one");
+    // A second instrument under the same ticker, from the same institution.
+    // Nothing about the rule can say which one a bare symbol means.
+    await feedPull(t, client, "f1-76 ambiguous feed two", {
+      instrument: { ...FEED, cusip: "222222ZZ2" },
+      processDate: "2025-01-16",
+    });
+    assert.equal(await count(client, "instruments"), 2);
+
+    const summary = await publish(t, client, {
+      label: "f1-76 ambiguous statement",
+      institutionId: INSTITUTION.id,
+      accountId: ACCOUNT.id,
+      positions: [statementPosition(STATEMENT)],
+      docDate: "2025-03-31",
+    });
+
+    const items = await matchItems(client);
+    assert.equal(items.length, 1);
+    assert.equal(items[0].kind, "weak_instrument_match");
+    assert.equal(items[0].status, "open");
+    assert.equal(items[0].reason_code, "symbol_matches_several_instruments");
+    assert.equal(summary.instrumentMatches.accepted, 0);
+    assert.equal(
+      summary.instrumentMatches.refused.symbol_matches_several_instruments,
+      1,
+    );
+  },
+);
+
+test(
+  "F1-76: an identifier only another institution's rows vouch for is refused, and so is a holding from another institution",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedPg(client);
+    await seedOtherInstitution(client);
+
+    // The instrument and its cusip come from the other institution's feed.
+    await publish(t, client, {
+      label: "f1-76 other institution feed",
+      institutionId: OTHER_INSTITUTION.id,
+      accountId: OTHER_ACCOUNT.id,
+      rows: [activityRow({ instrument: FEED, processDate: "2025-01-15" })],
+      docDate: "2025-01-31",
+    });
+
+    // Condition 2 from this institution's side: the identifier came from
+    // somewhere else, so this institution is vouching for nothing.
+    const foreignIdentifier = await publish(t, client, {
+      label: "f1-76 statement against a foreign identifier",
+      institutionId: INSTITUTION.id,
+      accountId: ACCOUNT.id,
+      positions: [statementPosition(STATEMENT)],
+      docDate: "2025-03-31",
+    });
+    assert.equal(foreignIdentifier.instrumentMatches.accepted, 0);
+    assert.equal(
+      foreignIdentifier.instrumentMatches.refused
+        .instrument_vouched_by_another_institution,
+      1,
+    );
+    const afterForeign = await matchItems(client);
+    assert.equal(afterForeign.length, 1);
+    assert.equal(afterForeign[0].kind, "weak_instrument_match");
+    assert.equal(afterForeign[0].institution_id, INSTITUTION.id);
+
+    // Condition 3 from the other side, in a fresh archive so the two refusals
+    // cannot be read out of each other: the identifier is this institution's,
+    // and the holding is not.
+    const second = await archive(t);
+    await seedPg(second);
+    await seedOtherInstitution(second);
+    await feedPull(t, second, "f1-76 home feed");
+    const foreignHolding = await publish(t, second, {
+      label: "f1-76 foreign holding",
+      institutionId: OTHER_INSTITUTION.id,
+      accountId: OTHER_ACCOUNT.id,
+      positions: [statementPosition(STATEMENT)],
+      docDate: "2025-03-31",
+    });
+    assert.equal(foreignHolding.instrumentMatches.accepted, 0);
+    assert.equal(
+      foreignHolding.instrumentMatches.refused
+        .instrument_vouched_by_another_institution,
+      1,
+    );
+    const items = await matchItems(second);
+    assert.equal(items.length, 1);
+    assert.equal(items[0].kind, "weak_instrument_match");
+    assert.equal(
+      items[0].institution_id,
+      OTHER_INSTITUTION.id,
+      "the refusal belongs to the institution whose holding was refused",
+    );
+  },
+);
+
+test(
+  "F1-76: an instrument nothing references yet, and one with no identifier at all, are both refused by name",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedPg(client);
+    // A cusip on file that no stored row vouches for: nothing in this archive
+    // says where it came from.
+    await client.query(
+      "INSERT INTO instruments (id, symbol, cusip) VALUES ('instr_unreferenced', 'ZZZ', '111111ZZ1')",
+    );
+    const unreferenced = await publish(t, client, {
+      label: "f1-76 unreferenced identifier",
+      institutionId: INSTITUTION.id,
+      accountId: ACCOUNT.id,
+      positions: [statementPosition(STATEMENT)],
+      docDate: "2025-03-31",
+    });
+    assert.equal(
+      unreferenced.instrumentMatches.refused
+        .instrument_has_no_institution_evidence,
+      1,
+    );
+
+    const second = await archive(t);
+    await seedPg(second);
+    // Referenced by this institution, but with no cusip or isin: there is no
+    // identifier for the institution to have vouched for.
+    await feedPull(t, second, "f1-76 identifierless feed", {
+      instrument: { symbol: "ZZZ", cusip: null, isin: null, name: null },
+    });
+    const identifierless = await publish(t, second, {
+      label: "f1-76 identifierless statement",
+      institutionId: INSTITUTION.id,
+      accountId: ACCOUNT.id,
+      positions: [statementPosition(STATEMENT)],
+      docDate: "2025-03-31",
+    });
+    assert.equal(
+      identifierless.instrumentMatches.refused
+        .instrument_has_no_strong_identifier,
+      1,
+    );
+  },
+);
+
+test(
+  "F1-76: a reparse of an already-imported statement resolves the open weak item the rule now accepts, naming the rule, and never deletes it",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedPg(client);
+    // The instrument and its cusip are on file, but nothing references them
+    // yet -- so the first import of this statement is refused and flagged,
+    // exactly as every statement holding is today.
+    await client.query(
+      "INSERT INTO instruments (id, symbol, cusip) VALUES ('instr_zephyr', 'ZZZ', '111111ZZ1')",
+    );
+    const statement = {
+      label: "f1-76 reparsed statement",
+      institutionId: INSTITUTION.id,
+      accountId: ACCOUNT.id,
+      positions: [statementPosition(STATEMENT)],
+      docDate: "2025-03-31",
+    };
+    await publish(t, client, statement);
+    const flagged = await matchItems(client);
+    assert.equal(flagged.length, 1);
+    assert.equal(flagged[0].kind, "weak_instrument_match");
+    assert.equal(flagged[0].status, "open");
+
+    // The feed lands, which is what makes the institution's own data vouch for
+    // the identifier.
+    await feedPull(t, client, "f1-76 late feed");
+
+    // The same bytes again: the document is already parsed_ok, so this is the
+    // whole-document skip a whole-archive reparse takes.
+    const reparse = await publish(t, client, statement);
+    assert.equal(reparse.instrumentMatches.accepted, 1);
+    assert.equal(reparse.instrumentMatches.resolvedByRule, 1);
+    assert.equal(reparse.reviewItemsResolved, 1);
+
+    const after = await matchItems(client);
+    assert.equal(after.length, 2, "the weak item is resolved, never deleted");
+    const weak = after.find((item) => item.kind === "weak_instrument_match");
+    const accepted = after.find(
+      (item) => item.kind === "institution_symbol_match",
+    );
+    assert.equal(weak.status, "resolved");
+    assert.equal(weak.reason_code, INSTITUTION_SYMBOL_RULE);
+    assert.match(weak.resolution_note, new RegExp(INSTITUTION_SYMBOL_RULE));
+    assert.equal(accepted.status, "resolved");
+
+    // Reparsed again: the same conclusion adds nothing.
+    const again = await publish(t, client, statement);
+    assert.equal(again.instrumentMatches.resolvedByRule, 0);
+    assert.equal(again.instrumentMatches.invalidated, 0);
+    assert.deepEqual(await matchItems(client), after);
+  },
+);
+
+test(
+  "F1-76: a later import that makes an accepted match unsafe withdraws it and flags it again, rather than leaving it accepted on stale evidence",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedPg(client);
+    await feedPull(t, client, "f1-76 self-correction feed");
+    await publish(t, client, {
+      label: "f1-76 self-correction statement",
+      institutionId: INSTITUTION.id,
+      accountId: ACCOUNT.id,
+      positions: [statementPosition(STATEMENT)],
+      docDate: "2025-03-31",
+    });
+    assert.equal(
+      await count(client, "review_items", "WHERE kind = $1 AND status = $2", [
+        "institution_symbol_match",
+        "resolved",
+      ]),
+      1,
+    );
+
+    // A second instrument appears under the same ticker. Condition 1 stopped
+    // holding, and it stopped holding on this import.
+    const later = await feedPull(t, client, "f1-76 colliding feed", {
+      instrument: { ...FEED, cusip: "222222ZZ2" },
+      processDate: "2025-02-15",
+    });
+    assert.equal(later.instrumentMatches.invalidated, 1);
+
+    const items = await matchItems(client);
+    const accepted = items.find(
+      (item) => item.kind === "institution_symbol_match",
+    );
+    const weak = items.find((item) => item.kind === "weak_instrument_match");
+    assert.equal(accepted.status, "dismissed");
+    assert.match(accepted.resolution_note, /withdrawn/);
+    assert.equal(weak.status, "open");
+    assert.equal(weak.reason_code, INSTITUTION_SYMBOL_INVALIDATED);
+  },
+);
+
+test(
+  "F1-76: another institution's rows arriving on an accepted instrument withdraw the acceptance too",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedPg(client);
+    await seedOtherInstitution(client);
+    await feedPull(t, client, "f1-76 shared instrument feed");
+    await publish(t, client, {
+      label: "f1-76 shared instrument statement",
+      institutionId: INSTITUTION.id,
+      accountId: ACCOUNT.id,
+      positions: [statementPosition(STATEMENT)],
+      docDate: "2025-03-31",
+    });
+
+    // The other institution's feed names the same cusip, so its rows land on
+    // the same instrument and provenance stops being one institution's.
+    const shared = await publish(t, client, {
+      label: "f1-76 other institution shares the instrument",
+      institutionId: OTHER_INSTITUTION.id,
+      accountId: OTHER_ACCOUNT.id,
+      rows: [activityRow({ instrument: FEED, processDate: "2025-02-20" })],
+      docDate: "2025-02-28",
+    });
+    assert.equal(shared.instrumentMatches.invalidated, 1);
+
+    const items = await matchItems(client);
+    assert.equal(
+      items.find((item) => item.kind === "institution_symbol_match").status,
+      "dismissed",
+    );
+    const weak = items.find((item) => item.kind === "weak_instrument_match");
+    assert.equal(weak.status, "open");
+    assert.equal(weak.reason_code, INSTITUTION_SYMBOL_INVALIDATED);
+  },
+);
+
+test(
+  "F1-76: every reason code carries a fixed explanation and action, and none of them quotes the archive",
+  { skip: false },
+  () => {
+    for (const code of INSTRUMENT_MATCH_REASON_CODES) {
+      const text = INSTRUMENT_MATCH_REASON_TEXT[code];
+      assert.ok(text.explanation.length > 0 && text.action.length > 0, code);
+      // Fixed literals only: a queue can print these without becoming a second
+      // place the owner's data lives.
+      assert.doesNotMatch(
+        `${text.explanation} ${text.action}`,
+        /[0-9]{4}|\$/,
+        code,
+      );
+    }
+    assert.equal(
+      new Set(INSTRUMENT_MATCH_REASON_CODES).size,
+      INSTRUMENT_MATCH_REASON_CODES.length,
+    );
   },
 );

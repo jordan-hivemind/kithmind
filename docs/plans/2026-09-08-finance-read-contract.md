@@ -314,3 +314,46 @@ REVOKE ALL ON FUNCTION <schema>.bump_finance_read_revision() FROM PUBLIC;
 Do not rerun `scripts/provision.mjs` for this grant. That script calls
 `applyPgReaderRole` with a newly generated password and rotates the credential
 held by the gateway.
+
+## Update 2026-09-18: institution-symbol instrument identity
+
+F1-76 phase 3 adds one instrument identity state and one summary count to
+contract version 1. This is an additive extension. Every existing operation,
+request and response meaning is unchanged, and no existing field changes what
+it reports.
+
+The archive gains an instrument match tier between "symbol and name together"
+and "symbol alone": the same-institution symbol rule. A symbol-only match is
+accepted when the symbol names exactly one instrument in the archive, that
+instrument carries a CUSIP or an ISIN, and only the institution that stated the
+holding has rows referencing it. Anything the rule refuses stays an open
+`weak_instrument_match` review item, and owner confirmation through the review
+queue remains the fallback.
+
+| Change | Where | Meaning |
+| --- | --- | --- |
+| `institution_symbol` | `FinanceSnapshotInstrument.status` | The instrument was matched on a ticker symbol alone and accepted under the rule. A usable identity, and not the same fact as `resolved`. |
+| `institutionSymbolInstrumentCount` | `FinanceHoldingsSnapshotSummary` | Positions in this snapshot whose identity rests on the rule. Required, and counted apart from both other totals. |
+
+Compatibility rules for existing clients:
+
+- A client that switches on `resolved`, `ambiguous` and `missing` now sees a
+  fourth value and must not treat it as `ambiguous`. Citing such a position as
+  identified by a CUSIP or ISIN is wrong; citing it as identified by the
+  institution's own symbol is correct.
+- `resolvedInstrumentCount` still counts only identifier matches.
+  `unresolvedInstrumentCount` still counts open weak matches and missing
+  instruments. The three counts sum to `positionCount`, which the validator
+  enforces.
+- An accepted match does not make a snapshot `partial` and does not add
+  `unresolved_identity` to coverage. A withdrawn one does, immediately.
+- `resolvedInstrumentCount + institutionSymbolInstrumentCount` is the old
+  `resolvedInstrumentCount` for a client that only wants "identities I can
+  use".
+
+The archive records each decision durably in `review_items`: an acceptance as a
+`resolved` `institution_symbol_match` naming the rule, a refusal as an open
+`weak_instrument_match` carrying a closed `reason_code` for the condition that
+failed. A later import that makes an acceptance unsafe dismisses it and reopens
+the weak item with `institution_symbol_match_invalidated`, so the read surface
+reports `ambiguous` again with no position rewritten.

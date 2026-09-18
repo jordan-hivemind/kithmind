@@ -981,6 +981,35 @@ caller cannot do by combining the other two files alone:
   see "weak_instrument_match is instrument-level, not row-level (F1-58)"
   under Account aliases below.
 
+  F1-76 phase 3: between the (symbol AND name) tier and the bare-symbol one
+  sits the **same-institution symbol rule**
+  (`src/instrumentMatch.ts`). A symbol-only match is accepted as its own
+  identity kind when all three hold: the symbol names exactly one instrument
+  in the archive, that instrument carries a cusip or isin, and the only
+  institution whose stored rows reference it is the institution this holding
+  came from. The institution is then vouching for both halves. The evidence
+  for the second and third conditions is which institutions' `transactions`
+  and `positions` rows point at the instrument -- `instruments` carries no
+  provenance columns, so that is the most this schema can honestly say.
+  Two institutions referencing it, or none, is refused rather than resolved
+  by majority.
+
+  An acceptance is written durably as a `resolved`
+  `review_items` row of kind `institution_symbol_match`, carrying
+  `reason_code = 'same_institution_symbol_v1'` and the same (institution,
+  descriptor, matched instrument) identity a weak match has; the open
+  `weak_instrument_match` it supersedes is resolved, never deleted, with a
+  resolution note naming the rule. A refusal keeps its open weak item and
+  records which condition failed in the closed `reason_code` column (see
+  `INSTRUMENT_MATCH_REASON_TEXT` for the fixed one-sentence explanation and
+  recommended action per code). A later import that makes an acceptance
+  unsafe -- a second instrument under the same symbol, another institution's
+  rows on the same instrument -- dismisses the acceptance and reopens the
+  weak item with `reason_code = 'institution_symbol_match_invalidated'`, so a
+  match is never left accepted on stale evidence. Every import and reparse
+  prints the counts: accepted, resolved by the rule, withdrawn, and refused
+  per condition.
+
   F1-76: a `cusip` or `isin` match carrying a name fills `instruments.name`
   when the row on file has none, in one `UPDATE` per pull guarded by
   `WHERE name IS NULL`. One institution can describe the same instrument two
@@ -989,7 +1018,9 @@ caller cannot do by combining the other two files alone:
   on file is never overwritten: two spellings of one name is not a conflict
   an import is entitled to settle. The `symbol`-alone tier never fills a
   name, because that tier is exactly the case where the two descriptors may
-  not be the same instrument, which is what its review item asks.
+  not be the same instrument, which is what its review item asks. The
+  same-institution symbol rule does fill it, because an accepted match is
+  precisely the case where the institution has vouched for both halves.
 - **Document splitting.** `ParsedRow.sourceDocument` tells the wiring layer
   which underlying document (a page of a paginated pull, or the one file for
   a statement, confirmation or tabular export) each row belongs to. A pull
@@ -1509,9 +1540,13 @@ holdings every month, so the same weak match reopened a fresh row every
 month too: 73,247 open items on the owner's archive, one per holding per
 statement, all asking the identical question.
 
-`review_items_weak_instrument_match_key` (migration 8) is a second partial
-unique index, additive to migration 7's: `(kind, institution_id, raw_value,
-matched_instrument_id) WHERE kind = 'weak_instrument_match'`. Migration 7's
+`review_items_instrument_match_key` (migration 13, replacing migration 8's
+`review_items_weak_instrument_match_key`) is a second partial unique index,
+additive to migration 7's: `(kind, institution_id, raw_value,
+matched_instrument_id) WHERE kind IN ('weak_instrument_match',
+'institution_symbol_match')`. `kind` leads the key, so the two kinds occupy
+separate slots and one match may hold an accepted row and, after a
+withdrawal, the reflagged weak row beside it. Migration 7's
 key still governs every other kind exactly as before. Four columns make the
 new key possible: `institution_id` and `matched_instrument_id` were never
 queryable before this (`weak_instrument_match`'s own `account_id` is always

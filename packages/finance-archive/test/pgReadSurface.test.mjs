@@ -2284,3 +2284,80 @@ test(
   assert.ok(after.coverage.reasons.includes("retained_evidence_unavailable"));
   },
 );
+
+test(
+  "F1-76: a position accepted under the same-institution symbol rule reports its own identity state, and the snapshot counts it separately",
+  { skip },
+  async (t) => {
+    const { owner, reader: r, seeded } = await fixture(t);
+    const snapshot = await citedSnapshot(owner, seeded);
+
+    const baseline = await serve(r, {
+      operation: "get_holdings_snapshot",
+      accountId: snapshot.accountId,
+      snapshot: { mode: "exact", asOf: snapshot.asOf },
+    });
+    assert.equal(baseline.summary.institutionSymbolInstrumentCount, 0);
+
+    // The decision row the importer writes when the rule accepts a match. The
+    // read surface derives the position's identity state from it; a position
+    // never stores the match kind itself.
+    await owner.query(
+      `INSERT INTO review_items
+         (id, kind, raw_value, reason, status, resolved_at, resolution_note,
+          reason_code, institution_id, matched_instrument_id, occurrence_count)
+       VALUES ('accepted-usd', 'institution_symbol_match', 'descriptor',
+               'accepted under the same-institution symbol rule', 'resolved',
+               now(), 'accepted by same_institution_symbol_v1',
+               'same_institution_symbol_v1', $1, 'instrument-usd', 1)`,
+      [seeded.settled.id],
+    );
+
+    const accepted = await serve(r, {
+      operation: "get_holdings_snapshot",
+      accountId: snapshot.accountId,
+      snapshot: { mode: "exact", asOf: snapshot.asOf },
+    });
+    const byRecord = new Map(
+      accepted.items.map((item) => [item.recordId, item.instrument.status]),
+    );
+    assert.equal(byRecord.get("pos:cited-usd"), "institution_symbol");
+    assert.equal(byRecord.get("pos:cited-usd-2"), "resolved");
+    assert.equal(accepted.summary.institutionSymbolInstrumentCount, 1);
+    assert.equal(accepted.summary.resolvedInstrumentCount, 2);
+    assert.equal(accepted.summary.unresolvedInstrumentCount, 0);
+    // An accepted identity is usable, so it does not by itself make the
+    // snapshot incomplete or the coverage partial.
+    assert.equal(accepted.summary.status, baseline.summary.status);
+    assert.equal(accepted.completeness, baseline.completeness);
+
+    // Withdrawing the acceptance reopens the weak item beside it, and the
+    // position goes straight back to ambiguous with nothing else rewritten.
+    await owner.query(
+      "UPDATE review_items SET status = 'dismissed' WHERE id = 'accepted-usd'",
+    );
+    await owner.query(
+      `INSERT INTO review_items
+         (id, kind, raw_value, reason, status, reason_code,
+          institution_id, matched_instrument_id, occurrence_count)
+       VALUES ('reflagged-usd', 'weak_instrument_match', 'descriptor',
+               'the acceptance was withdrawn', 'open',
+               'institution_symbol_match_invalidated', $1, 'instrument-usd', 1)`,
+      [seeded.settled.id],
+    );
+    const withdrawn = await serve(r, {
+      operation: "get_holdings_snapshot",
+      accountId: snapshot.accountId,
+      snapshot: { mode: "exact", asOf: snapshot.asOf },
+    });
+    assert.equal(
+      new Map(
+        withdrawn.items.map((item) => [item.recordId, item.instrument.status]),
+      ).get("pos:cited-usd"),
+      "ambiguous",
+    );
+    assert.equal(withdrawn.summary.institutionSymbolInstrumentCount, 0);
+    assert.equal(withdrawn.summary.unresolvedInstrumentCount, 1);
+    assert.ok(withdrawn.coverage.reasons.includes("unresolved_identity"));
+  },
+);

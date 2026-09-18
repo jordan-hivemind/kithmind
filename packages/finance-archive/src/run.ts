@@ -121,6 +121,12 @@ import {
 } from "./accountAliases.js";
 import { readCaptureManifestById, type CaptureManifest } from "./captures.js";
 import {
+  addInstrumentMatchSummary,
+  emptyInstrumentMatchSummary,
+  INSTITUTION_SYMBOL_REFUSAL_REASONS,
+  type InstrumentMatchSummary,
+} from "./instrumentMatch.js";
+import {
   publishImport,
   REVIEW_COLUMNS,
   type ImportBatch,
@@ -535,6 +541,9 @@ type RunOutcome = {
   /** Conversion (adapterImport.ts) plus publish (importer.ts) -- every
    * review item this run opened, not only the publish-time ones. */
   readonly reviewItemsOpened: number;
+  /** F1-76 phase 3. What the same-institution symbol rule decided during this
+   * run's publications. */
+  readonly instrumentMatches: InstrumentMatchSummary;
   readonly currencySums: readonly CurrencySum[];
   readonly cashVerdicts: readonly CashVerdict[];
   readonly positionVerdicts: readonly PositionVerdict[];
@@ -962,6 +971,9 @@ type ReparseOutcome = {
   /** F1-60: items whose reason this reparse rewrote in place, because the
    * same document now reports a different parse note. */
   reviewItemsUpdated: number;
+  /** F1-76 phase 3: what the same-institution symbol rule decided across this
+   * whole reparse, summed from each document's own transaction. */
+  instrumentMatches: InstrumentMatchSummary;
 };
 
 /**
@@ -1134,6 +1146,7 @@ async function runReparse(args: readonly string[]): Promise<void> {
     reviewItemsOpened: 0,
     reviewItemsResolved: 0,
     reviewItemsUpdated: 0,
+    instrumentMatches: emptyInstrumentMatchSummary(),
   };
 
   try {
@@ -1234,6 +1247,10 @@ async function runReparse(args: readonly string[]): Promise<void> {
         outcome.reviewItemsOpened += summary.reviewItemsOpened;
         outcome.reviewItemsResolved += summary.reviewItemsResolved;
         outcome.reviewItemsUpdated += summary.reviewItemsUpdated;
+        addInstrumentMatchSummary(
+          outcome.instrumentMatches,
+          summary.instrumentMatches,
+        );
       }));
     }
 
@@ -1250,6 +1267,25 @@ async function runReparse(args: readonly string[]): Promise<void> {
     printReparseSummary(outcome, onlyUnparsed, wholeArchive);
   } finally {
     await closeArchiveClient(pgClient);
+  }
+}
+
+/**
+ * F1-76 phase 3. Every symbol-only instrument match decision this run made,
+ * printed whether or not any were made. A zero line is the point: "the rule
+ * accepted nothing" and "the rule was never consulted" look identical when the
+ * section is omitted, and the owner's requirement is that nothing is accepted
+ * or left broken without a number saying so.
+ */
+export function printInstrumentMatchSummary(
+  matches: InstrumentMatchSummary,
+): void {
+  console.log("instrument matches (same-institution symbol rule):");
+  console.log(`  accepted: ${matches.accepted}`);
+  console.log(`  weak items resolved by the rule: ${matches.resolvedByRule}`);
+  console.log(`  acceptances withdrawn: ${matches.invalidated}`);
+  for (const reason of INSTITUTION_SYMBOL_REFUSAL_REASONS) {
+    console.log(`  refused (${reason}): ${matches.refused[reason]}`);
   }
 }
 
@@ -1270,6 +1306,7 @@ function printReparseSummary(
   console.log(`review items opened: ${outcome.reviewItemsOpened}`);
   console.log(`review items resolved: ${outcome.reviewItemsResolved}`);
   console.log(`review items updated: ${outcome.reviewItemsUpdated}`);
+  printInstrumentMatchSummary(outcome.instrumentMatches);
   if (wholeArchive === null) {
     console.log("whole-archive gate pass: skipped (nothing reparsed)");
   } else {
@@ -2310,6 +2347,7 @@ async function main(): Promise<void> {
     let rowsDeduplicated = 0;
     let rowsRefused = 0;
     let reviewItemsOpened = 0;
+    const instrumentMatches = emptyInstrumentMatchSummary();
     let incrementalCashPeriods = 0;
     let incrementalPositionPeriods = 0;
     let wholeArchiveGates: WholeArchiveGates | null = null;
@@ -2602,6 +2640,7 @@ async function main(): Promise<void> {
         rowsDeduplicated += publishSummary.rowsDeduplicated;
         rowsRefused += publishSummary.rowsRefused;
         reviewItemsOpened += conversionReviewItemsOpened + publishSummary.reviewItemsOpened;
+        addInstrumentMatchSummary(instrumentMatches, publishSummary.instrumentMatches);
         // F1-59: what the incremental gates checked for this publication.
         incrementalCashPeriods += publishSummary.cash.periodsChecked;
         incrementalPositionPeriods += publishSummary.positions.periodsChecked;
@@ -2841,6 +2880,7 @@ async function main(): Promise<void> {
         rowsDeduplicated,
         rowsRefused,
         reviewItemsOpened,
+        instrumentMatches,
         currencySums,
         cashVerdicts,
         positionVerdicts,
@@ -2982,6 +3022,7 @@ function printSummary(
   console.log(`rows deduplicated: ${outcome.rowsDeduplicated}`);
   console.log(`rows refused: ${outcome.rowsRefused}`);
   console.log(`review items opened: ${outcome.reviewItemsOpened}`);
+  printInstrumentMatchSummary(outcome.instrumentMatches);
   console.log(
     `incremental gate periods checked: cash=${outcome.incrementalPeriodsChecked.cash} ` +
       `positions=${outcome.incrementalPeriodsChecked.positions}`,
