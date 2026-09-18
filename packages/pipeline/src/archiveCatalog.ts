@@ -2550,6 +2550,11 @@ export class ArchiveCatalog {
           args.readback.resticVersion !== backup.resticVersion ||
           args.readback.repositoryId !== backup.repositoryId ||
           args.readback.verification !== backup.verification ||
+          // `recoverResticBackup` echoes back the ciphertext it was told to
+          // expect, so this equality only catches a caller passing the wrong
+          // copy's readback. The durability proof is the readback itself: it
+          // dumps every matching snapshot and fails `readback_failed` unless
+          // the restored bytes hash to what the locator recorded.
           !equal(args.readback.ciphertext, backup.ciphertext)
         )
           fail("catalog_conflict");

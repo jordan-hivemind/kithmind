@@ -3363,9 +3363,7 @@ export class PipelineRunner {
           ? "provider_locator_publish"
           : !state.locator.backup
             ? "provider_locator_snapshot"
-            : providerProofFresh(state)
-              ? undefined
-              : "provider_refresh";
+            : undefined;
     if (authorizedAction === undefined) {
       if (requiredAction === undefined) {
         await this.journal.transitionCheckpoint({
@@ -3562,17 +3560,17 @@ export class PipelineRunner {
         expectedOriginalRevision: next.rowRevision,
       });
     }
-    const common = {
-      resticBinary: configured.resticBinary,
-      repository: remoteRepository,
-      expectedRepositoryId: configured.expectedRepositoryId,
-      passwordCommand: configured.passwordCommand,
-      operationId: copy.restic!.operationId,
-      host: copy.restic!.host,
-      objectName: copy.objectName,
-      expectedCiphertext: copy.published.ciphertext,
-    };
     if (!copy.backup) {
+      const common = {
+        resticBinary: configured.resticBinary,
+        repository: remoteRepository,
+        expectedRepositoryId: configured.expectedRepositoryId,
+        passwordCommand: configured.passwordCommand,
+        operationId: copy.restic!.operationId,
+        host: copy.restic!.host,
+        objectName: copy.objectName,
+        expectedCiphertext: copy.published.ciphertext,
+      };
       let backup: RecoveredResticBackup | ResticBackupResult | undefined;
       try {
         backup = await recoverResticBackup(common);
@@ -3603,64 +3601,107 @@ export class PipelineRunner {
         expectedOriginalRevision: next.rowRevision,
       });
     }
-    if (authorizedAction === "provider_refresh") {
-      // P2-31a. The locator is durable but the proof this pass would declare
-      // has aged out of the server's freshness window, because an admission
-      // was interrupted after the locator was published and resumed on a
-      // later pass. Nothing between `parser_archive` and `admit` re-verifies,
-      // so without this the declaration is stale forever and every later pass
-      // fails on the same row. Redo both checks against the recorded identity
-      // and advance only the two timestamps.
-      //
-      // The registry manifest is deliberately not rewritten. Its `verifiedAt`
-      // records the first successful verification, which stays true, and
-      // rewriting it would change `manifestFingerprint` and invalidate the
-      // published ciphertext and its snapshot. Only an original this space has
-      // never admitted may refresh: replacing a reference the server already
-      // recorded needs P2-31's multi-reference history, and the server refuses
-      // it anyway because a reference is immutable under its client ID.
-      if (original.cloud)
-        throw new PipelineWorkerError(
-          "provider_verification_stale_review_required",
-        );
-      const reverified = await verifyDropboxOriginal({
-        credentials: {
-          rcloneBinary: remoteRepository.rcloneBinary,
-          configPath: remoteRepository.configPath,
-          remoteName: remoteRepository.remoteName,
-          configIdentityFingerprint: remoteRepository.configIdentityFingerprint,
-        },
-        refreshPath: provider.refreshPath,
-        capturePath,
-        sourceContentHash: original.origin.sha256,
-        sourceByteLength: original.origin.byteLength,
-        providerAccountIdHash: provider.providerAccountIdHash,
-        providerRootDirectoryIdHash: provider.providerRootDirectoryIdHash,
-        providerRootDirectoryId: provider.providerRootDirectoryId,
-        relativePath: plan.relativePath,
-        bindingId: state.bindingId,
-        expectedProviderFileIdHash: state.verified.providerFileIdHash,
-      });
-      const readback = await recoverResticBackup(common);
-      const next = await this.requireCatalog().refreshProviderProof({
-        catalogId: original.originalCatalogId,
-        expectedRevision: original.rowRevision,
-        verified: reverified.metadata,
-        readback,
-      });
-      if (!providerProofFresh(next.providerOriginal!))
-        throw new PipelineWorkerError(
-          "provider_verification_stale_review_required",
-        );
-      return archivedBase(checkpoint, {
-        step: "reserve",
-        preflightAction: undefined,
-        expectedOriginalRevision: next.rowRevision,
-      });
-    }
     return archivedBase(checkpoint, {
       step: "reserve",
       preflightAction: undefined,
+    });
+  }
+
+  /**
+   * P2-31a. Redoes the two checks a provider original declaration must carry
+   * fresh, for an original whose admission was interrupted after its locator
+   * was durable. Nothing else in the archived flow re-verifies once the locator
+   * is complete, so a resumed pass would otherwise declare a proof the server
+   * refuses, forever.
+   *
+   * This reads the provider and the backup snapshot again and writes two local
+   * timestamps. It mutates no archive object and nothing server side, so unlike
+   * the locator actions it needs no `discovery.preflightArchived` round trip to
+   * authorize it. That is also the only route that works here:
+   * `preflightArchivedDiscovery` refuses a row that holds any lease, expired or
+   * not, and a row resumed at `admit` always holds one.
+   *
+   * The registry manifest is deliberately not rewritten. Its `verifiedAt`
+   * records the first successful verification, which stays true, and rewriting
+   * it would change `manifestFingerprint` and invalidate the published
+   * ciphertext and its snapshot. Only an original this space has never admitted
+   * may refresh; the caller checks that, and `refreshProviderProof` on the
+   * catalog refuses an admitted row and any moved identity.
+   *
+   * The catalog write commits before the checkpoint does. A crash in between is
+   * harmless: the next pass sees a fresh proof and skips straight to admitting.
+   */
+  private async refreshProviderProof(
+    checkpoint: ArchivedCheckpoint,
+  ): Promise<void> {
+    const { original, processing } = this.archivedRows(checkpoint);
+    const pdf = this.requirePdfConfig();
+    const provider = pdf.providerOriginal;
+    const state = original.providerOriginal;
+    if (!provider || !state || !("repository" in pdf.archive.independentBackup))
+      throw new PipelineWorkerError("provider_original_configuration_missing");
+    const verified = state.verified;
+    const copy = state.locator;
+    if (!verified || !copy.published || !copy.backup || !copy.restic)
+      throw new PipelineWorkerError("provider_original_not_durable");
+    if (copy.reviewCode)
+      throw new PipelineWorkerError(
+        "provider_locator_recovery_review_required",
+      );
+    const plan = this.archivedPlan(checkpoint);
+    if (plan.rootAlias !== provider.rootAlias)
+      throw new PipelineWorkerError("provider_original_root_mismatch");
+    const remoteRepository = pdf.archive.independentBackup.repository!;
+    const configured = pdf.archive.independentBackup;
+    const loaded = await loadProviderBinding({
+      registryDirectory: provider.registryDirectory,
+      bindingId: state.bindingId,
+    });
+    if (loaded?.persisted.manifestFingerprint !== verified.manifestFingerprint)
+      throw new PipelineWorkerError("provider_locator_registry_missing");
+    const reverified = await verifyDropboxOriginal({
+      credentials: {
+        rcloneBinary: remoteRepository.rcloneBinary,
+        configPath: remoteRepository.configPath,
+        remoteName: remoteRepository.remoteName,
+        configIdentityFingerprint: remoteRepository.configIdentityFingerprint,
+      },
+      refreshPath: provider.refreshPath,
+      capturePath: captureFromRows(pdf, original, processing).path,
+      sourceContentHash: original.origin.sha256,
+      sourceByteLength: original.origin.byteLength,
+      providerAccountIdHash: provider.providerAccountIdHash,
+      providerRootDirectoryIdHash: provider.providerRootDirectoryIdHash,
+      providerRootDirectoryId: provider.providerRootDirectoryId,
+      relativePath: plan.relativePath,
+      bindingId: state.bindingId,
+      expectedProviderFileIdHash: verified.providerFileIdHash,
+    });
+    const readback = await recoverResticBackup({
+      resticBinary: configured.resticBinary,
+      repository: remoteRepository,
+      expectedRepositoryId: configured.expectedRepositoryId,
+      passwordCommand: configured.passwordCommand,
+      operationId: copy.restic.operationId,
+      host: copy.restic.host,
+      objectName: copy.objectName,
+      expectedCiphertext: copy.published.ciphertext,
+    });
+    const next = await this.requireCatalog().refreshProviderProof({
+      catalogId: original.originalCatalogId,
+      expectedRevision: original.rowRevision,
+      verified: reverified.metadata,
+      readback,
+    });
+    if (!providerProofFresh(next.providerOriginal!))
+      throw new PipelineWorkerError(
+        "provider_verification_stale_review_required",
+      );
+    await this.journal.transitionCheckpoint({
+      checkpoint: archivedBase(checkpoint, {
+        expectedOriginalRevision: next.rowRevision,
+      }),
+      credentialSessionActive: true,
     });
   }
 
@@ -4326,6 +4367,29 @@ export class PipelineRunner {
     }
     const lease = checkpoint.discoveryLease;
     if (!lease) throw new PipelineWorkerError("archived_lease_missing");
+    const admitting = this.archivedRows(checkpoint).original;
+    // P2-31a. A pass that resumes here after an interrupted admission holds a
+    // durable locator whose proof has aged past what the server accepts. Redo
+    // both checks in place rather than throwing
+    // `provider_verification_stale_review_required`, which failed this pass and
+    // every later one over the same row. A pending call replays its persisted
+    // declaration instead, which is exempt from the freshness rule.
+    //
+    // This runs before the lease check on purpose. `discovery.reserveArchived`
+    // counts an attempt against `MAX_WORKER_DISCOVERY_ATTEMPTS` every time it
+    // hands out a lease, and it only re-leases work whose lease has expired.
+    // Renewing the expired lease first and then leaving it idle across two
+    // provider round trips would spend an attempt and could expire again, so
+    // the recovery pass refreshes first and then reserves exactly once.
+    if (
+      !this.journal.pending &&
+      admitting.providerOriginal &&
+      !admitting.cloud &&
+      !providerProofFresh(admitting.providerOriginal)
+    ) {
+      await this.refreshProviderProof(checkpoint);
+      return;
+    }
     if (
       !this.journal.pending &&
       lease.leaseExpiresAt <= Date.now() + LEASE_SAFETY_MARGIN_MS
@@ -4333,28 +4397,6 @@ export class PipelineRunner {
       await this.journal.transitionCheckpoint({
         checkpoint: archivedBase(checkpoint, {
           step: "reserve",
-          discoveryLease: undefined,
-        }),
-        credentialSessionActive: true,
-      });
-      return;
-    }
-    const admitting = this.archivedRows(checkpoint).original;
-    // P2-31a. A pass that resumes here after an interrupted admission holds a
-    // durable locator whose proof has aged past what the server accepts.
-    // Re-enter the provider preflight so the proof is redone, rather than
-    // throwing `provider_verification_stale_review_required` and failing this
-    // pass and every later one over the same row. A pending call replays its
-    // persisted declaration instead, which is exempt from the freshness rule.
-    if (
-      !this.journal.pending &&
-      admitting.providerOriginal &&
-      !admitting.cloud &&
-      !providerProofFresh(admitting.providerOriginal)
-    ) {
-      await this.journal.transitionCheckpoint({
-        checkpoint: archivedBase(checkpoint, {
-          step: "parser_archive",
           discoveryLease: undefined,
         }),
         credentialSessionActive: true,
