@@ -31,22 +31,29 @@ async function sql(connection, statement) {
   await execute(join(PG, "psql"), [connection, "-X", "-v", "ON_ERROR_STOP=1", "-c", statement]);
 }
 
-test("published dump restores every row exactly and refuses aliases, dirty targets, and changed source data", { skip: !ADMIN }, async (t) => {
+async function tableCount(connection) {
+  const { stdout } = await execute(join(PG, "psql"), [connection, "-X", "-tAc", "select count(*) from pg_tables where schemaname not in ('pg_catalog','information_schema')"]);
+  return Number(stdout.trim());
+}
+
+test("published dump restores every row exactly while the source keeps moving, and refuses aliases, dirty targets, and a drifted manifest", { skip: !ADMIN }, async (t) => {
   const root = await mkdtemp(join(homedir(), ".kith-restore-proof-test-"));
   const suffix = Math.random().toString(16).slice(2, 12);
   const sourceName = `kith_restore_src_${suffix}`;
   const destinationName = `kith_restore_dst_${suffix}`;
   const changedName = `kith_restore_changed_${suffix}`;
+  const scratchName = `kith_restore_proof_${suffix}`;
   const source = databaseUrl(ADMIN, sourceName);
   const destination = databaseUrl(ADMIN, destinationName);
   const changed = databaseUrl(ADMIN, changedName);
+  const scratch = databaseUrl(ADMIN, scratchName);
   t.after(async () => {
-    for (const name of [sourceName, destinationName, changedName]) {
+    for (const name of [sourceName, destinationName, changedName, scratchName]) {
       await execute(join(PG, "dropdb"), ["--if-exists", "--force", "--maintenance-db", ADMIN, name]).catch(() => {});
     }
     await rm(root, { recursive: true, force: true });
   });
-  for (const name of [sourceName, destinationName, changedName]) {
+  for (const name of [sourceName, destinationName, changedName, scratchName]) {
     await execute(join(PG, "createdb"), ["--maintenance-db", ADMIN, name]);
   }
   await sql(source, "create schema finance; create schema kith; create table finance.schema_version(version integer primary key, name text not null); create table kith.schema_version(version integer primary key, name text not null); create table kith.parent(id text primary key, body text not null); create table kith.child(id text primary key, parent_id text not null references kith.parent(id)); insert into finance.schema_version values (3,'finance'); insert into kith.schema_version values (9,'kith'); insert into kith.parent values ('p1',E'bounded\\ntext'),('p2','other'); insert into kith.child values ('c1','p1');");
@@ -81,6 +88,12 @@ test("published dump restores every row exactly and refuses aliases, dirty targe
     restorePostgresProof(baseConfig, corruptDumpPath, manifestPath),
     { code: "dump_manifest_mismatch" },
   );
+
+  // The live source keeps being written to between the dump and the proof
+  // (a watcher heartbeat, the deferred-work daemon, an MCP write). The proof
+  // compares the restored database with the manifest captured at dump time,
+  // so this must not affect it.
+  await sql(source, "update kith.parent set body='altered' where id='p1'; insert into kith.parent values ('p3','new');");
   const passed = await restorePostgresProof(baseConfig, dumpPath, manifestPath);
   assert.equal(passed.status, "passed");
   assert.equal(passed.tablesVerified, 4);
@@ -100,16 +113,51 @@ test("published dump restores every row exactly and refuses aliases, dirty targe
     { code: "restore_target_not_empty" },
   );
   await sql(changed, "create schema existing");
+  const changedCommand = await commandFile(root, "dirty.sh", changed);
   await assert.rejects(
-    restorePostgresProof({ ...baseConfig, destinationConnectionCommand: await commandFile(root, "dirty.sh", changed) }, dumpPath, manifestPath),
+    restorePostgresProof({ ...baseConfig, destinationConnectionCommand: changedCommand }, dumpPath, manifestPath),
     { code: "restore_target_not_empty" },
   );
-  await sql(source, "update kith.parent set body='altered' where id='p1'");
+
+  // A manifest whose parity no longer describes the dump it names: the
+  // restored database cannot match it, and the proof says exactly that.
+  const driftedManifestPath = join(root, "drifted.json");
+  await writeFile(driftedManifestPath, JSON.stringify(buildManifest({
+    ...manifest,
+    parity: await capturePostgresParity(join(PG, "psql"), source, 60_000),
+    files: manifest.files,
+  })), { mode: 0o600 });
   const freshName = `kith_restore_fresh_${suffix}`;
   await execute(join(PG, "createdb"), ["--maintenance-db", ADMIN, freshName]);
   t.after(() => execute(join(PG, "dropdb"), ["--if-exists", "--force", "--maintenance-db", ADMIN, freshName]).catch(() => {}));
   await assert.rejects(
-    restorePostgresProof({ ...baseConfig, destinationConnectionCommand: await commandFile(root, "fresh.sh", databaseUrl(ADMIN, freshName)) }, dumpPath, manifestPath),
-    { code: "source_parity_failed" },
+    restorePostgresProof({ ...baseConfig, destinationConnectionCommand: await commandFile(root, "fresh.sh", databaseUrl(ADMIN, freshName)) }, dumpPath, driftedManifestPath),
+    { code: "restore_parity_failed" },
   );
+
+  // --- The opted-in scratch target recycles itself ---
+  const scratchConfig = {
+    ...baseConfig,
+    destinationConnectionCommand: await commandFile(root, "scratch.sh", scratch),
+  };
+  // A run without the opt-in leaves the restored copy behind, exactly as a
+  // previous day's run would.
+  assert.equal((await restorePostgresProof(scratchConfig, dumpPath, manifestPath)).status, "passed");
+  assert.ok((await tableCount(scratch)) > 0);
+  await assert.rejects(
+    restorePostgresProof(scratchConfig, dumpPath, manifestPath),
+    { code: "restore_target_not_empty" },
+  );
+  // With the opt-in the next run starts anyway, and leaves the target empty.
+  const recycled = await restorePostgresProof({ ...scratchConfig, scratchDatabase: true }, dumpPath, manifestPath);
+  assert.equal(recycled.status, "passed");
+  assert.equal(recycled.tablesVerified, 4);
+  assert.equal(await tableCount(scratch), 0);
+  // A target that is not named as a scratch database is refused, not emptied.
+  await assert.rejects(
+    restorePostgresProof({ ...baseConfig, destinationConnectionCommand: changedCommand, scratchDatabase: true }, dumpPath, manifestPath),
+    { code: "scratch_database_name_invalid" },
+  );
+  const { stdout: survivors } = await execute(join(PG, "psql"), [changed, "-X", "-tAc", "select count(*) from pg_namespace where nspname='existing'"]);
+  assert.equal(survivors.trim(), "1");
 });
