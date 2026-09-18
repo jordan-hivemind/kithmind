@@ -16,7 +16,6 @@ import { fileURLToPath } from "node:url";
 import {
   formatIssues,
   parseArguments,
-  validateConvexVariableNames,
   validateWebEnvironment,
   WEB_REQUIRED_VARIABLES,
 } from "./check-self-hosting.mjs";
@@ -150,47 +149,7 @@ test("CLI output is ready for a complete environment file", () => {
     { encoding: "utf8", env: { ...process.env, ...environment } },
   );
   assert.equal(result.status, 0);
-  assert.equal(result.stdout, "profile: full\nweb: ready\n");
-});
-
-test("Convex preflight checks names without needing values", () => {
-  assert.deepEqual(
-    validateConvexVariableNames(["OPENAI_API_KEY", "MCP_JWT_ISSUER"]),
-    [
-      { name: "ANTHROPIC_API_KEY", problem: "missing" },
-      { name: "SITE_URL", problem: "missing" },
-      { name: "JWT_PRIVATE_KEY", problem: "missing" },
-      { name: "JWKS", problem: "missing" },
-    ],
-  );
-});
-
-test("full is the default profile and preserves provider requirements", () => {
-  assert.equal(parseArguments(["--convex"]).profile, "full");
-  assert.deepEqual(
-    validateConvexVariableNames([
-      "MCP_JWT_ISSUER",
-      "SITE_URL",
-      "JWT_PRIVATE_KEY",
-      "JWKS",
-    ]),
-    [
-      { name: "OPENAI_API_KEY", problem: "missing" },
-      { name: "ANTHROPIC_API_KEY", problem: "missing" },
-    ],
-  );
-});
-
-test("core profile requires auth configuration without model providers", () => {
-  const options = parseArguments(["--convex", "--profile", "core"]);
-  assert.equal(options.profile, "core");
-  assert.deepEqual(
-    validateConvexVariableNames(
-      ["MCP_JWT_ISSUER", "SITE_URL", "JWT_PRIVATE_KEY", "JWKS"],
-      options.profile,
-    ),
-    [],
-  );
+  assert.equal(result.stdout, "web: ready\n");
 });
 
 test("web environment file alias avoids Node's reserved option", () => {
@@ -200,33 +159,12 @@ test("web environment file alias avoids Node's reserved option", () => {
   );
 });
 
-test("core profile reports missing authentication variables", () => {
-  assert.deepEqual(validateConvexVariableNames(["MCP_JWT_ISSUER"], "core"), [
-    { name: "SITE_URL", problem: "missing" },
-    { name: "JWT_PRIVATE_KEY", problem: "missing" },
-    { name: "JWKS", problem: "missing" },
-  ]);
-});
-
-test("invalid or missing profiles are rejected without echoing other input", () => {
-  assert.throws(() => parseArguments(["--profile", "enterprise-secret"]), {
-    message: "--profile must be core or full",
-  });
-  assert.throws(() => parseArguments(["--profile"]), {
-    message: "--profile must be core or full",
-  });
-  assert.throws(() => validateConvexVariableNames([], "enterprise-secret"), {
-    message: "--profile must be core or full",
-  });
-});
-
 test("worker wrapper arguments reject duplicate and mixed option sets", () => {
   for (const arguments_ of [
     ["--worker", "--worker", "--config", "/tmp/config.json"],
     ["--worker", "--config", "/tmp/a.json", "--config", "/tmp/b.json"],
     ["--worker", "--config", "/tmp/config.json", "--json", "--json"],
     ["--worker", "--config", "/tmp/config.json", "--web"],
-    ["--worker", "--config", "/tmp/config.json", "--profile", "core"],
     ["--worker", "--config", "/tmp/config.json", "--web-env-file", "/tmp/env"],
     ["--worker", "--config", "/tmp/config.json", "--", "--"],
   ]) {
@@ -237,31 +175,11 @@ test("worker wrapper arguments reject duplicate and mixed option sets", () => {
   });
 });
 
-test("CLI output identifies core mode and its configuration-only scope", () => {
-  const result = runCli([
-    "--web",
-    "--web-env-file",
-    "missing-synthetic-environment-file",
-    "--profile",
-    "core",
-  ]);
-  assert.equal(result.status, 0);
-  assert.equal(
-    result.stdout,
-    [
-      "profile: core",
-      "core: validates configuration only; live source access is not checked",
-      "web: ready",
-      "",
-    ].join("\n"),
-  );
-});
-
-test("CLI output identifies the default full profile", () => {
+test("CLI output is ready with no profile banner", () => {
   const result = runCli(["--web"]);
   assert.equal(result.status, 0);
-  assert.equal(result.stdout, "profile: full\nweb: ready\n");
-  assert.doesNotMatch(result.stdout, /configuration only/u);
+  assert.equal(result.stdout, "web: ready\n");
+  assert.doesNotMatch(result.stdout, /profile:|configuration only/u);
 });
 
 test("worker wrapper emits only one doctor JSON object without web preflight", () => {

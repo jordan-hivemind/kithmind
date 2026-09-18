@@ -27,8 +27,7 @@ node packages/pipeline/dist/cli.js doctor --config /absolute/path/to/pipeline.js
 Omit `--json` for the human-readable result. These commands use the credential
 named by `credentialEnv` in the configuration. A worker host needs only its
 scoped credential and the configured gateway. Deployment environment files
-and a Convex administrator session are optional operator checks, described
-below.
+are an optional operator check, described below.
 
 ## Interpret the result
 
@@ -80,17 +79,14 @@ identity recovery continue in P2-4 and P2-12.
 ## Check deployment configuration separately
 
 On the deployment operator's configured checkout, the existing preflight
-commands remain available:
+command remains available:
 
 ```sh
 pnpm check:self-hosting
-pnpm check:self-hosting:convex
 ```
 
-The Convex command checks the production deployment by default. Use the
-existing checker's explicit deployment options for another environment.
-These checks validate configuration presence and shape within their documented
-scope. They do not establish provider reachability or complete vector coverage.
+This check validates configuration presence and shape within its documented
+scope. It does not establish provider reachability or complete vector coverage.
 
 The doctor also reads separate cloud diagnostics status. It never sends a
 heartbeat. A current heartbeat proves only that an authorized `watch` worker

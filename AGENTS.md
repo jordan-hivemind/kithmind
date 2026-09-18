@@ -87,11 +87,13 @@ models ship.
 
 ## Security-sensitive work
 
-`packages/convex/convex/lib/*Auth.ts`, `lib/spaces.ts`, and
+`packages/kith-store/src/identity/*.ts` (especially `webAuth.ts`,
+`authorization.ts`, `spaces.ts`, `apiKeys.ts`, and `oauth.ts`), and
 `apps/web/src/lib/mcp/*` require tier 2 or above and a second-model review
-before merge. Run Convex-side migrations with `npx convex run` against the
-development deployment first, then record the exact command in the owner
-tracker or a public issue or plan.
+before merge. Apply `kith` and `finance` schema migrations
+(`packages/kith-store/migrations`, `applyKithSchema`) against the development
+database first, then record the exact command in the owner tracker or a
+public issue or plan.
 
 Before any Vercel operation, verify the authenticated Vercel identity and the
 intended team and project in that same credential context. State the intended

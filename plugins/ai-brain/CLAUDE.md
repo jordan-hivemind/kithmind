@@ -45,7 +45,7 @@ All skills follow these invariants. If you break one of them, fix it before comm
 
 ## Relationship to the server
 
-The server lives in the same repo at `apps/web/` + `packages/convex/`. A breaking server change (tool rename, return-shape change) requires a coordinated plugin update in the same PR. The drift check catches tool renames; return-shape changes are caught manually.
+The server lives in the same repo at `apps/web/` + `packages/kith-store/`. A breaking server change (tool rename, return-shape change) requires a coordinated plugin update in the same PR. The drift check catches tool renames; return-shape changes are caught manually.
 
 ## Related docs
 

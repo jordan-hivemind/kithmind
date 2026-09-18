@@ -598,6 +598,15 @@ writer; otherwise those sessions cannot claim one consistent exported state.
 
 ### Step 11. Convex teardown and the point billing stops
 
+Status, 2026-09-18: step 11.3's repository half landed in P2-39m2 (`chore:
+remove Convex from the repository`). `packages/convex`, `legacySchema.ts`,
+`auth.config.ts` and the Convex deploy workflow are gone; `MCP_JWT_ISSUER` was
+already dropped from the web deployment in i7b, and P2-39m2 removed its last
+reads, which lived in `packages/convex`. Steps 11.1, 11.2 and 11.4 (the
+deployment rollback window, the independent restore confirmation, and
+removing the Convex project from the vendor account) are owner-operational
+and are tracked in the owner tracker, not by this document.
+
 1. Keep the read-only Convex deployment for 14 days after step 9 as the
    rollback source. Nothing writes to it.
 2. After the 14 days, confirm the encrypted Convex export is in the restic

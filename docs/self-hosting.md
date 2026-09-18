@@ -15,8 +15,8 @@ package-manager version). No private tracker, owner account, or private file is
 needed for a public-clone setup.
 
 This runbook is for a small personal deployment shared by a few independent
-accounts. It keeps the operational surface deliberately narrow: one Convex
-project, one Next.js/Vercel project, and one set of server-side AI provider
+accounts. It keeps the operational surface deliberately narrow: one PostgreSQL
+database, one Next.js/Vercel project, and one set of server-side AI provider
 credentials. Each person still creates a separate Kith Mind account and
 authorizes their own MCP client.
 
@@ -24,73 +24,36 @@ The deployment can fit within hosted free tiers at low usage, but it is not
 guaranteed to be completely free. OpenAI embeddings and Anthropic memory
 analysis are metered API calls. Connecting a ChatGPT or Claude
 consumer account does not provide or pay for those backend API calls. Qdrant is
-not required because Convex already stores and searches the vectors.
+not required because PostgreSQL's `vector` extension already stores and
+searches the vectors.
 
 ## Stop point before deployment
 
 Repository setup and all local tests can be completed without accounts or
 credentials. The first actions that require external access are:
 
-- creating or selecting Convex and Vercel projects;
+- creating or selecting a PostgreSQL database and a Vercel project;
 - creating OpenAI and Anthropic API keys;
 - setting production environment variables;
-- deploying Convex or Vercel; and
+- deploying Vercel; and
 - connecting ChatGPT and Claude accounts.
 
 Do not paste credentials into an issue, pull request, chat, shell command, or
 tracked file. Use the provider dashboards or an interactive CLI prompt.
 
-## Configuration map
-
-| Variable                              | Location          | Purpose                                                               |
-| ------------------------------------- | ----------------- | --------------------------------------------------------------------- |
-| `MCP_PUBLIC_ORIGIN`                   | Vercel only       | Stable HTTPS origin of the Next.js gateway, no path or trailing slash |
-| `MCP_JWT_ISSUER`                      | Convex only       | Convex Auth's own issuer; the web app stopped reading it in i7b       |
-| `MCP_OAUTH_ENCRYPTION_KEY`            | Vercel only       | Encrypts OAuth registrations and authorization codes; secret          |
-| `MCP_TOOL_PROFILE`                    | Vercel only       | `full` by default; `memory` is an optional narrower runtime profile   |
-| `FINANCE_ARCHIVE_READER_DATABASE_URL` | Vercel only       | Optional; the financial archive as its read-only reader role; secret  |
-| `FINANCE_ARCHIVE_SPACE_ID`            | Vercel only       | Optional; the one space that archive holds; required with the URL     |
-| `OPENAI_API_KEY`                      | Convex only       | Creates embeddings; secret and billed to the self-host                |
-| `ANTHROPIC_API_KEY`                   | Convex only       | Extracts and classifies memories; secret and billed to the self-host  |
-| `SITE_URL`                            | Convex only       | Stable HTTPS origin of the Next.js app used by Convex Auth            |
-| `JWT_PRIVATE_KEY`                     | Convex only       | Signs Convex Auth session tokens; generated secret                    |
-| `JWKS`                                | Convex only       | Public key set used to verify Convex Auth session tokens              |
-
-Bounded inline text capture, retained evidence, and keyword search work without
-provider calls. Anthropic is optional for narrative classification and metadata
-extraction, and OpenAI is optional for semantic embeddings. Provider-backed
-features add those external calls and costs; they are not required to verify
-the core capture and family-space workflow.
-
-`CONVEX_SITE_URL` is supplied by Convex and should not be created manually.
-`CONVEX_DEPLOYMENT` is local Convex CLI linkage, not an application secret and
-not a Convex backend environment variable. Convex backend variables are scoped
-to a Convex deployment and are not sourced from the Next.js `.env.local` file.
-
-Platform references:
-
-- [Convex environment variables](https://docs.convex.dev/production/environment-variables)
-- [Convex environment CLI](https://docs.convex.dev/cli/reference/env)
-- [Convex deployment CLI](https://docs.convex.dev/cli/reference/deploy)
-- [Vercel environment variables](https://vercel.com/docs/environment-variables)
-
 Reference templates live at
 [`apps/web/.env.example`](../apps/web/.env.example). Create provider keys in
-the provider dashboards only when enabling their optional features. Set them
-through the interactive Convex CLI, which avoids placing a secret in shell
-history or a tracked file:
-
-```sh
-pnpm --filter @repo/db exec convex env --prod set OPENAI_API_KEY
-pnpm --filter @repo/db exec convex env --prod set ANTHROPIC_API_KEY
-```
+the provider dashboards only when enabling their optional features, and paste
+secrets straight into the Vercel dashboard rather than through shell history
+or a tracked file. [Vercel environment
+variables](https://vercel.com/docs/environment-variables) documents that
+mechanism.
 
 ## The web deployment's variables
 
 Row m flipped production to the PostgreSQL surface and i7b removed Convex from
-`apps/web` entirely, so there is one surface and one list. `packages/convex`
-is still in the tree and its own variables above are still set until the
-Convex deployment is torn down; nothing in the web app reads it.
+`apps/web` entirely; P2-39m2 removed `packages/convex` from the repository.
+There is one deployment and one list.
 
 The list below is derived from `apps/web/src/lib/mcp/environment.ts`
 (`requiredMcpEnvironmentVariables`, `validateMcpEnvironment`) and from every
@@ -131,29 +94,24 @@ is complete enough to search (`lib/kith/capture.ts`'s module comment,
 complete index also never reaches the embedder, by design, not as a
 degradation.
 
-`ANTHROPIC_API_KEY` on this row is the _web_ deployment's key, distinct from
-the Convex deployment's row of the same name earlier in this document.
 Narrative capture's admission gate (`lib/kith/capture.ts`'s
 `captureThoughtFromWeb`, shared by the MCP `capture_thought` tool and the
 dashboard's Quick Capture button) runs on the web deployment and reads this
-one. Optional in the sense this document already uses for the Convex key: the
-gate fails closed without it, so a `capture_thought` call or a Quick Capture
-submission returns `needs_confirmation` ("Memory was not stored because the
-admission check was unavailable") and stores nothing, rather than storing
-unclassified. Provider-free inline capture and keyword search remain
-unaffected. Setting the key only on the Convex deployment does not enable
-narrative capture; it has to be set on Vercel.
+one. It is optional in the sense that the gate fails closed without it, so a
+`capture_thought` call or a Quick Capture submission returns
+`needs_confirmation` ("Memory was not stored because the admission check was
+unavailable") and stores nothing, rather than storing unclassified.
+Provider-free inline capture and keyword search remain unaffected.
 
 ### Removed by i7b
 
-`NEXT_PUBLIC_CONVEX_URL`, `MCP_JWT_PRIVATE_JWK`, `MCP_JWT_PUBLIC_JWK` and
-`MCP_JWT_KEY_ID` are gone from the web deployment with the last Convex import
-and the JWT bridge that minted identity tokens from them. `MCP_JWT_ISSUER` on
-the _web_ deployment is gone too; `MCP_PUBLIC_ORIGIN` is the name for that
-value. Setting any of the five changes nothing and the preflight no longer
-reports them, in either direction. `MCP_JWT_ISSUER` on the _Convex_
-deployment is a different variable and stays until that deployment is torn
-down.
+`NEXT_PUBLIC_CONVEX_URL`, `MCP_JWT_ISSUER`, `MCP_JWT_PRIVATE_JWK`,
+`MCP_JWT_PUBLIC_JWK` and `MCP_JWT_KEY_ID` are gone from the web deployment with
+the last Convex import and the JWT bridge that minted identity tokens from
+them; `MCP_PUBLIC_ORIGIN` is the name for the origin `MCP_JWT_ISSUER` used to
+carry. Setting any of the five changes nothing and the preflight no longer
+reports them, in either direction. P2-39m2 removed `packages/convex`, so none
+of these names are read anywhere in the repository any more.
 
 ### The daemon host: `kith-deferred-work`
 
@@ -198,64 +156,26 @@ pnpm test:once
 pnpm build
 ```
 
-For local development, link `packages/convex` to a development deployment and
-run Convex once to publish the generated client types and local URL:
-
-```sh
-cd packages/convex
-npx convex dev --once
-cd ../..
-```
-
-Configure Convex Auth for the local web origin, preserving the repository's
-existing auth provider configuration:
-
-```sh
-pnpm --filter @repo/db exec auth --web-server-url http://localhost:3000
-```
-
-Copy `apps/web/.env.example` to the ignored `apps/web/.env.local`, fill in the
-development values, and run `pnpm dev`. `MCP_PUBLIC_ORIGIN` may be
-`http://localhost:3000` locally; anywhere else it has to be HTTPS.
+Point `KITH_DATABASE_URL` at a local PostgreSQL 17 or newer database with the
+`vector` extension available, copy `apps/web/.env.example` to the ignored
+`apps/web/.env.local`, fill in the development values, and run `pnpm dev`.
+`MCP_PUBLIC_ORIGIN` may be `http://localhost:3000` locally; anywhere else it
+has to be HTTPS.
 
 Never fill in or commit the example file.
 
-## 2. Create and configure Convex
+## 2. Create and configure PostgreSQL
 
-Create a Convex project for the fork and link `packages/convex` to it. The
-provider-free core configuration does not require `OPENAI_API_KEY` or
-`ANTHROPIC_API_KEY`; add either key only when enabling its optional semantic
-or narrative feature. Once the stable Vercel origin is known, configure Convex
-Auth using its official setup command:
-
-```sh
-pnpm --filter @repo/db exec auth --prod --web-server-url https://your-project.vercel.app
-```
-
-This sets `SITE_URL` and generates a matched `JWT_PRIVATE_KEY`/`JWKS` pair on
-the production Convex deployment. Treat the private key as a secret. The CLI
-preserves configured custom providers and may offer auth-template suggestions;
-do not replace an existing provider configuration unless that is intentional.
-If either key variable already exists, the command asks before rotating it;
-routine rotation is unnecessary and signs out existing sessions.
-
-Set the separate MCP issuer to the same stable origin:
-
-```sh
-pnpm --filter @repo/db exec convex env --prod set MCP_JWT_ISSUER
-```
-
-Enter the final stable Vercel origin for `MCP_JWT_ISSUER`, for example
-`https://your-project.vercel.app`, with no path or trailing slash. This is the
-Convex deployment's own variable; the web deployment spells the same origin
-`MCP_PUBLIC_ORIGIN`. Do not deploy until the Convex names pass
-the production preflight and any optional provider variables needed by enabled
-features are set. Deploying Convex is a production action;
-perform it only after reviewing the target project:
-
-```sh
-pnpm --filter @repo/db deploy:prod
-```
+Create a PostgreSQL 17 or newer database, or reuse the one that already holds
+the financial archive, with the `vector` extension available. Apply the `kith`
+schema migrations in `packages/kith-store/migrations` (`applyKithSchema` in
+`packages/kith-store/src/schema.ts`) with a role that can create objects, then
+provision the narrower `KITH_DATABASE_URL` app role with only the grants
+`packages/kith-store/src/index.ts`'s `grantProofAppRole` names -- the web
+deployment never connects with the migration role. The provider-free core
+configuration does not require `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`; add
+either key only when enabling its optional semantic or narrative feature, as a
+Vercel environment variable in the next step.
 
 ## 3. Create and configure Vercel
 
@@ -264,7 +184,7 @@ Directory and Next.js as the Framework Preset. Vercel still installs workspace
 dependencies from the pnpm monorepo; pointing the project at the repository
 root instead leaves the project on the generic framework preset and does not
 identify the web app's build output. Use a stable production domain before
-setting the issuer. Configure all of these for Production; use separate Preview
+setting `MCP_PUBLIC_ORIGIN`. Configure all of these for Production; use separate Preview
 values if preview deployments need a working OAuth flow:
 
 - `MCP_PUBLIC_ORIGIN`
@@ -302,39 +222,17 @@ registrations and requires each MCP client to reconnect. Rotating
 ## 4. Run the safe preflight
 
 The web preflight reads the ignored `apps/web/.env.local` by default. It checks
-origins, P-256 key shape and pairing, the OAuth key shape, and required names.
-Its output contains variable names only, never values:
+origin shape, the connection string shape, the OAuth key shape, and required
+names. Its output contains variable names only, never values:
 
 ```sh
 pnpm check:self-hosting
 ```
 
-`core` and `full` are preflight profiles, not runtime MCP tool profiles. Use
-`pnpm check:self-hosting -- --profile core` to validate a provider-free core
-deployment or `pnpm check:self-hosting -- --profile full` for the default full
-provider check. Core omits provider keys only; gateway authentication and
-Convex Auth settings remain required. At runtime, `MCP_TOOL_PROFILE` is
-separately `memory` or `full`. When selecting a custom web environment file,
-use the preflight's `--web-env-file` option.
-
-The Convex preflight asks the Convex CLI for environment variable names only;
-it never requests their values:
-
-```sh
-pnpm check:self-hosting:convex
-```
-
-For a provider-free production Convex preflight, use:
-
-```sh
-pnpm check:self-hosting:convex -- --profile core
-```
-
-To check a non-production Convex deployment, run:
-
-```sh
-node scripts/check-self-hosting.mjs --convex --deployment dev
-```
+When selecting a custom web environment file, use the preflight's
+`--web-env-file` option. At runtime, `MCP_TOOL_PROFILE` is separately `memory`
+or `full`; the preflight checks that it is one of those two values (or unset)
+and is otherwise unrelated to it.
 
 After deployment, the public health endpoint returns HTTP 503 with missing or
 invalid variable names if the Next.js gateway is misconfigured. It never
@@ -393,7 +291,8 @@ KITHMIND_SOURCE_ACCOUNT_ID=
 ```
 
 `KITHMIND_SOURCE_ACCOUNT_ID` is the configured source `accountId` identity
-string, not a Convex row ID. Load the ignored file before starting the script:
+string, not a database row id. Load the ignored file before starting the
+script:
 
 ```sh
 node --env-file=.env.demo.local scripts/demo-brain.mjs
@@ -434,9 +333,11 @@ would not change this limitation.
 
 ## Personal-operation policy
 
-Treat Convex data as durable. Before any real-data or bulk-ingestion work,
-complete the Phase 2 recovery gate, including backup/export and restore into
-an isolated deployment. Code rollback does not roll back memory transitions.
+Treat the database as durable. Before any real-data or bulk-ingestion work,
+complete the Phase 2 recovery gate, including the backup and restore
+procedures in [database backups](database-backups.md) and [PostgreSQL
+publication proof](postgres-proof.md). Code rollback does not roll back
+memory transitions.
 
 Keep routine operations minimal:
 
@@ -465,15 +366,14 @@ when its build artifacts were created with Preview-scoped variables.
 | Health endpoint returns 503                  | Fix only the variable names listed in `issues`                                                                           |
 | OAuth metadata has the wrong host            | Make `MCP_PUBLIC_ORIGIN` the final stable HTTPS origin and redeploy Vercel                                               |
 | AI-assisted capture or semantic search fails | Confirm provider variables and embedding configuration; provider-free inline capture and keyword search remain available |
-| Core capture or gateway calls fail           | Confirm Convex Auth/JWKS settings, MCP issuer, API-key capability, and current space membership                          |
-| Account creation fails after saving a user   | Confirm `SITE_URL`, `JWT_PRIVATE_KEY`, and `JWKS` exist on the production Convex deployment                              |
+| Core capture or gateway calls fail           | Confirm `KITH_DATABASE_URL`, API-key capability, and current space membership                                            |
 | Clients must authorize again unexpectedly    | Check whether `MCP_OAUTH_ENCRYPTION_KEY` changed                                                                         |
 | Automatic capture is inconsistent            | Verify the client enabled the MCP server and inspect whether it called `remember_fact` or `capture_thought`              |
 | Bootstrap creates broad or noisy memories    | Update/reinstall the bundled plugin, rerun `/brain-init`, and approve only the atomic preview                            |
 
 ## Embedding provider configuration
 
-Configure embeddings on the Convex backend. The default remains OpenAI
+Configure embeddings on the web deployment. The default remains OpenAI
 `text-embedding-3-small` with 1,536 dimensions and `OPENAI_API_KEY`. Optional
 `BRAIN_EMBED_API_KEY` takes precedence. A custom `BRAIN_EMBED_ENDPOINT` requires
 explicit `BRAIN_EMBED_PROVIDER_ID` and `BRAIN_EMBED_MODEL_REVISION`; it never

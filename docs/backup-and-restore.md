@@ -1,5 +1,14 @@
 # Backup and restore
 
+Status, 2026-09-18: P2-39m2 removed `packages/convex` from the repository
+(plan step 11.3), so the native-Convex recovery drill this document describes
+below can no longer be run from this repository -- there is no installed
+Convex CLI or schema to deploy to a restore target. It is kept as a historical
+record of the drill's proof shape. The "PostgreSQL replacement (in progress)"
+section already names the successor; see
+[`docs/database-backups.md`](database-backups.md) for the current recovery
+path.
+
 ## Status
 
 Kith Mind recovery has two separate parts. A native Convex snapshot preserves

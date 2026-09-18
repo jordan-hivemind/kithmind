@@ -1,5 +1,12 @@
 # Scoped credentials and space authorization
 
+Status, 2026-09-18: historical. This P1-2 migration ran against Convex before
+the PostgreSQL cutover; P2-39m2 removed `packages/convex` (and these Convex
+functions) from the repository, so the procedure below can no longer be run
+from this checkout. The current authorization model lives in
+`packages/kith-store/src/identity/authorization.ts` and
+`packages/kith-store/src/identity/spaces.ts`.
+
 P1-2 rolls out in two deployments. The first changes every ordinary content writer
 and reader while keeping transitional schema fields optional. The second makes
 ownership and credential scopes required after both deployments pass the audits.
