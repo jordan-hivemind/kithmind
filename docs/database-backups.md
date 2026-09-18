@@ -106,6 +106,21 @@ The engine, in order:
    guarantees nothing. Writer quiescence (step 2) still applies; the snapshot
    is what makes the manifest honest about the writes quiescence cannot cover,
    such as a filesystem watcher heartbeat or an MCP write.
+
+   The connection command must return a direct connection string, not a pooled
+   endpoint. One session has to hold the snapshot open while others import it,
+   which a transaction pooler cannot provide. The engine proves a second
+   session can import the snapshot before the dump starts, and fails with
+   `snapshot_not_importable` when it cannot, rather than failing obscurely
+   minutes later.
+
+   The holding session clears its own `idle_in_transaction_session_timeout`
+   and `statement_timeout`, and runs a trivial statement every 60 seconds
+   while the capture and dump proceed. The session is idle inside a
+   transaction for as long as the dump takes, and a hosted platform may cap or
+   ignore what a session asks for. A holder cut off anyway fails the run with
+   `snapshot_holder_lost` instead of publishing a dump whose manifest cannot
+   be trusted.
 4. **Dump.** `pg_dump --snapshot=<id> --format=custom --no-owner --no-acl
    --schema=finance --schema=kith --extension=vector`. `--extension=vector` is
    required, not cosmetic: `--schema` alone excludes extensions, and
@@ -186,8 +201,12 @@ operator opts in by name:
 The name is the restore target's own `current_database()`, and it must match
 `kith_restore_proof[a-z0-9_]*`. The reset runs through the destination
 connection only, so it can reach no other database, and it runs after the
-isolation check, so it can never reach the source. It drops every non-system
-schema, including `public`, which the dump's own `CREATE EXTENSION` restores.
+isolation check. A target whose name equals the source's, or the name the
+manifest records, is refused as `restore_not_isolated` before any drop. It
+drops every non-system schema, including `public`, which the dump's own
+`CREATE EXTENSION` restores. Temporary schemas (`pg_temp_N`,
+`pg_toast_temp_N`) belong to live backends and are neither dropped nor counted
+as leftovers.
 A failing proof leaves the restored copy in place for inspection; the next
 run's reset clears it.
 
@@ -201,6 +220,8 @@ instead of a generic command failure:
 | Isolated restore proof child   | `restore_proof_failed:<code>`, where `<code>` is one of the proof's own codes, such as `restore_parity_failed`, `restore_target_not_empty`, `source_schema_mismatch`, `scratch_database_name_invalid` |
 | Ciphertext or plaintext readback | `verify_readback_mismatch`      |
 | Unreadable child answer        | `restore_proof_failed:unknown`    |
+| Pooled source connection       | `snapshot_not_importable`         |
+| Holding session cut off        | `snapshot_holder_lost`            |
 
 Codes are closed enums on both sides, and the child's own output is never
 echoed. The code reaches the runner's result, the state directory's

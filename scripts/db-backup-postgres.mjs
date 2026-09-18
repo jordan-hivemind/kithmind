@@ -147,6 +147,7 @@ export const POSTGRES_BACKUP_CODES = new Set([
   "snapshot_export_failed",
   "snapshot_holder_lost",
   "snapshot_id_invalid",
+  "snapshot_not_importable",
   "table_inventory_invalid",
   "unknown",
   "usage_invalid",
@@ -658,6 +659,11 @@ export async function requireNoActiveWriters(runQuery) {
   }
 }
 
+// How often the holder proves it is still there. The session sits idle in a
+// transaction for the whole capture and dump, about seven minutes on the
+// owner's archive, which a hosted platform is entitled to cut off.
+const SNAPSHOT_KEEPALIVE_MS = 60_000;
+
 /** Opens a REPEATABLE READ transaction on the source and exports its
  * snapshot, then holds that transaction open until `release()`. `pg_dump
  * --snapshot` and the parity capture both import the same id, so the dump and
@@ -665,9 +671,16 @@ export async function requireNoActiveWriters(runQuery) {
  * consistent instant. Without this the two read a database that never stops
  * being written to, and no restore could ever match the manifest.
  *
+ * The session clears its own `idle_in_transaction_session_timeout` and
+ * `statement_timeout`, and runs a trivial statement every minute besides: a
+ * hosted source may cap or ignore what a session asks for, and a holder killed
+ * mid-dump would fail the run every day. The connection must be a direct one,
+ * not a pooled endpoint, because one session has to hold the snapshot open
+ * while others import it.
+ *
  * `release()` fails if the holding session died in the meantime, because a
  * snapshot whose exporting transaction ended no longer guarantees anything. */
-function exportSnapshot(psqlPath, connectionString, timeoutMs) {
+export function exportSnapshot(psqlPath, connectionString, timeoutMs) {
   return new Promise((resolvePromise, rejectPromise) => {
     let child;
     try {
@@ -685,11 +698,14 @@ function exportSnapshot(psqlPath, connectionString, timeoutMs) {
     }
     let settled = false;
     let output = "";
+    let keepalive;
+    const stopKeepalive = () => clearInterval(keepalive);
     const finish = (error, value) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       if (error) {
+        stopKeepalive();
         child.kill("SIGKILL");
         rejectPromise(error);
       } else resolvePromise(value);
@@ -708,11 +724,21 @@ function exportSnapshot(psqlPath, connectionString, timeoutMs) {
         finish(new PostgresBackupError("snapshot_export_failed"));
         return;
       }
+      keepalive = setInterval(() => {
+        if (child.exitCode === null && child.signalCode === null) {
+          child.stdin.write("select 1;\n");
+        }
+      }, SNAPSHOT_KEEPALIVE_MS);
+      keepalive.unref();
       finish(undefined, {
         id,
-        abort: () => child.kill("SIGKILL"),
+        abort: () => {
+          stopKeepalive();
+          child.kill("SIGKILL");
+        },
         release: () =>
           new Promise((resolveRelease, rejectRelease) => {
+            stopKeepalive();
             if (child.exitCode !== null || child.signalCode !== null) {
               rejectRelease(new PostgresBackupError("snapshot_holder_lost"));
               return;
@@ -737,9 +763,28 @@ function exportSnapshot(psqlPath, connectionString, timeoutMs) {
       finish(new PostgresBackupError("snapshot_export_failed")),
     );
     child.stdin.write(
-      "begin transaction isolation level repeatable read;\nselect pg_export_snapshot();\n",
+      "set idle_in_transaction_session_timeout = 0;\nset statement_timeout = 0;\nbegin transaction isolation level repeatable read;\nselect pg_export_snapshot();\n",
     );
   });
+}
+
+/** Proves a second session can import the snapshot before the dump commits to
+ * it. A pooled endpoint hands each session a different backend, so the import
+ * fails there; failing here names that cause instead of surfacing a generic
+ * command failure seven minutes into the run. */
+async function requireImportableSnapshot(config, connectionString, snapshotId) {
+  try {
+    await runCapture(
+      config.psqlPath,
+      [connectionString, "-X", "-q", "-v", "ON_ERROR_STOP=1", "-tA", "-f", "-"],
+      {
+        timeoutMs: config.timeoutMs,
+        input: `begin transaction isolation level repeatable read;\nset transaction snapshot '${snapshotId}';\nselect 1;\ncommit;\n`,
+      },
+    );
+  } catch {
+    fail("snapshot_not_importable");
+  }
 }
 
 async function freshStagingDirectory(config, tag) {
@@ -985,6 +1030,7 @@ export async function runPostgresDatabaseBackup(config) {
   let parity;
   let dumpPath;
   try {
+    await requireImportableSnapshot(config, connectionString, snapshot.id);
     parity = await capturePostgresParity(
       config.psqlPath,
       connectionString,
@@ -1313,10 +1359,11 @@ async function main() {
 }
 if (isMain())
   main().catch((error) => {
-    const code =
-      error instanceof PostgresBackupError && POSTGRES_BACKUP_CODES.has(error.code)
-        ? error.code
-        : "runner_failed";
+    // Membership, not class: a `PostgresParityError` from the parity capture
+    // carries a code from this same enum and deserves to be reported by it.
+    const code = POSTGRES_BACKUP_CODES.has(error?.code)
+      ? error.code
+      : "runner_failed";
     const detail = error instanceof PostgresBackupError ? error.detail : undefined;
     process.stderr.write(
       `${JSON.stringify({ status: "failed", code, ...(detail ? { detail } : {}) })}\n`,

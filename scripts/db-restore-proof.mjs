@@ -121,16 +121,20 @@ async function schemaVersions(config, connection) {
     kithVersion: Number(await scalar(config, connection, "select max(version) from kith.schema_version")),
   };
 }
+// A session's own temporary schemas (`pg_temp_N` and its `pg_toast_temp_N`)
+// are neither leftovers to drop nor evidence that the target is dirty: they
+// belong to a live backend and vanish with it.
+const SYSTEM_SCHEMAS = "and nspname !~ '^pg_(toast|temp)'";
 async function assertEmptyTarget(config, connection) {
   const count = Number(await scalar(config, connection, `
     select
       (select count(*) from pg_namespace
         where nspname not in ('pg_catalog','information_schema','public')
-          and nspname !~ '^pg_toast') +
+          ${SYSTEM_SCHEMAS}) +
       (select count(*) from pg_class c join pg_namespace n on n.oid=c.relnamespace
         where c.relkind in ('r','p','v','m','S')
           and n.nspname not in ('pg_catalog','information_schema')
-          and n.nspname !~ '^pg_toast')`));
+          and n.nspname !~ '^pg_(toast|temp)')`));
   if (count !== 0) fail("restore_target_not_empty");
 }
 /** Empties an opted-in scratch target so a run can start where the previous
@@ -150,7 +154,7 @@ async function resetScratchTarget(config, connection) {
       begin
         for target in select nspname from pg_namespace
           where nspname not in ('pg_catalog','information_schema','public')
-            and nspname !~ '^pg_toast'
+            ${SYSTEM_SCHEMAS}
         loop
           execute format('drop schema %I cascade', target);
         end loop;
@@ -282,6 +286,11 @@ export async function restorePostgresProof(config, dumpPath, manifestPath) {
   if (sameDatabase(sourceIdentity, destinationIdentity)) fail("restore_not_isolated");
   if (config.scratchDatabase) {
     if (!SCRATCH_DATABASE.test(destinationIdentity.database)) fail("scratch_database_name_invalid");
+    // A second guard before anything is dropped, by name rather than by
+    // server identity: a target carrying the source's name, or the name the
+    // manifest records, is refused even if the identity check let it through.
+    if (destinationIdentity.database === sourceIdentity.database ||
+      destinationIdentity.database === manifest.database) fail("restore_not_isolated");
     await resetScratchTarget(config, destination);
   }
   await assertEmptyTarget(config, destination);

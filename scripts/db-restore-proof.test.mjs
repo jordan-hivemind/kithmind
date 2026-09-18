@@ -153,6 +153,13 @@ test("published dump restores every row exactly while the source keeps moving, a
   assert.equal(recycled.status, "passed");
   assert.equal(recycled.tablesVerified, 4);
   assert.equal(await tableCount(scratch), 0);
+  // The reset must never reach the source, opt-in or not: the isolation check
+  // runs first, and the source keeps every table.
+  await assert.rejects(
+    restorePostgresProof({ ...baseConfig, destinationConnectionCommand: baseConfig.sourceConnectionCommand, scratchDatabase: true }, dumpPath, manifestPath),
+    { code: "restore_not_isolated" },
+  );
+  assert.equal(await tableCount(source), 4);
   // A target that is not named as a scratch database is refused, not emptied.
   await assert.rejects(
     restorePostgresProof({ ...baseConfig, destinationConnectionCommand: changedCommand, scratchDatabase: true }, dumpPath, manifestPath),
