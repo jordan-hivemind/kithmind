@@ -14,8 +14,12 @@
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import {
+  syntheticFinanceReadExchanges,
+  syntheticFinanceTrustedContext,
+} from "@repo/finance-contract/fixtures";
 import { IdentityError } from "@repo/kith-store/identity";
-import { beforeEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   reads: {} as Record<string, ReturnType<typeof vi.fn>>,
@@ -31,6 +35,7 @@ vi.mock("./writes", async (importOriginal) => {
   return { ...actual, postgresWrites: () => mocks.writes };
 });
 
+import type { FinanceArchiveAccess } from "./finance";
 import { mcpPrincipalLoader } from "./principal";
 import { createMcpServer, type McpServerCredential } from "./server";
 
@@ -42,8 +47,13 @@ const credential: McpServerCredential = {
   }),
 };
 
-async function call(name: string, args: Record<string, unknown>) {
-  const server = createMcpServer(credential, "user-test:key-test", null);
+async function call(
+  name: string,
+  args: Record<string, unknown>,
+  financeArchive: FinanceArchiveAccess | null = null,
+  principalId = "user-test:key-test",
+) {
+  const server = createMcpServer(credential, principalId, financeArchive);
   const client = new Client({ name: "space-contract", version: "1" });
   const [clientTransport, serverTransport] =
     InMemoryTransport.createLinkedPair();
@@ -346,5 +356,192 @@ describe("MCP space routing", () => {
     expect(result.isError).toBe(true);
     expect(JSON.stringify(result.content)).not.toContain("Space not found");
     expect(JSON.stringify(result.content)).not.toContain("sensitive-space-id");
+  });
+});
+
+// The boundary `registerTool` puts on every handler.
+//
+// The SDK's tool-call catch sends a thrown error's own `message` to the client,
+// so the property under test is one property for every tool: whatever a store,
+// a driver or `pg` puts in that message, the client is told "Internal error"
+// and nothing else. The four tools that used to carry a `try`/`catch` for the
+// space denial are no longer a separate case, which is why the read rows below
+// include both a tool that had one and tools that never did.
+describe("MCP tool error masking", () => {
+  const LEAK = "relation kith.thoughts does not exist for sensitive-space-id";
+
+  const factArgs = {
+    subject: { kind: "person", name: "Alex" },
+    predicate: "favorite_color",
+    value: { type: "text", value: "blue" },
+    sourceType: "user_stated",
+  };
+  const ingestArgs = {
+    requestId: "request-1",
+    source: {
+      connector: "mcp-client",
+      accountId: "account-1",
+      externalId: "external-1",
+    },
+    url: "https://example.test/synthetic",
+  };
+  const recordQuery = {
+    operation: "latest_observation",
+    spaceId: "sensitive-space-id",
+    entityId: "entity-1",
+    observationType: "lab_result",
+  };
+
+  let logged: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    for (const method of [
+      "listSpaces",
+      "searchDocuments",
+      "browseRecent",
+      "searchThoughts",
+      "queryRecords",
+      "authorizedSpaceIds",
+    ]) {
+      mocks.reads[method] = vi.fn();
+    }
+    for (const method of ["rememberFact", "captureThought", "ingestUrl"]) {
+      mocks.writes[method] = vi.fn();
+    }
+    mocks.reads.authorizedSpaceIds!.mockResolvedValue([]);
+    logged = vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    logged.mockRestore();
+  });
+
+  test.each([
+    ["reads", "search_documents", { query: "clinic" }, "searchDocuments"],
+    ["reads", "list_spaces", {}, "listSpaces"],
+    ["reads", "search_thoughts", { query: "ledger" }, "searchThoughts"],
+    ["reads", "browse_recent", {}, "browseRecent"],
+    ["writes", "remember_fact", factArgs, "rememberFact"],
+    [
+      "writes",
+      "capture_thought",
+      { content: "One decision." },
+      "captureThought",
+    ],
+    ["writes", "ingest_url", ingestArgs, "ingestUrl"],
+    ["records", "query_records", { query: recordQuery }, "queryRecords"],
+  ] as const)(
+    "%s: %s masks an unexpected failure",
+    async (family, toolName, args, method) => {
+      const target = family === "writes" ? mocks.writes : mocks.reads;
+      target[method]!.mockRejectedValueOnce(new Error(LEAK));
+
+      const result = await call(toolName, args);
+
+      expect(result.isError).toBe(true);
+      const serialized = JSON.stringify(result);
+      expect(serialized).not.toContain("sensitive-space-id");
+      expect(serialized).not.toContain("kith.thoughts");
+      expect(result.content).toEqual([
+        { type: "text", text: "Internal error" },
+      ]);
+    },
+  );
+
+  test("finance: query_records masks an archive failure", async () => {
+    // The archive leg keeps its own closed-code mapping, so what a non-contract
+    // failure becomes is the bare archive text and never the archive's own
+    // words. Same property, different fixed string.
+    const archiveSpace = syntheticFinanceTrustedContext.authorizedSpaceIds[0]!;
+    mocks.reads.authorizedSpaceIds!.mockResolvedValue([archiveSpace]);
+    const request = syntheticFinanceReadExchanges.find(
+      (exchange) => exchange.request.operation === "list_transactions",
+    )!.request;
+
+    const result = await call(
+      "query_records",
+      { query: { provider: "finance_archive", request } },
+      {
+        spaceId: archiveSpace,
+        read: async () => {
+          throw new Error(LEAK);
+        },
+      },
+      syntheticFinanceTrustedContext.principalId,
+    );
+
+    // The exact text also proves the archive was reached: an authorization
+    // refusal would have answered with a closed code instead.
+    expect(result).toMatchObject({
+      isError: true,
+      content: [
+        {
+          type: "text",
+          text: "the financial archive failed to serve this request",
+        },
+      ],
+    });
+    expect(JSON.stringify(result)).not.toContain("sensitive-space-id");
+  });
+
+  test.each([
+    ["list_spaces", {}, "listSpaces"],
+    ["browse_recent", {}, "browseRecent"],
+  ] as const)(
+    "%s reports a revoked credential with the same words",
+    async (toolName, args, method) => {
+      // Consistency is the point. `list_spaces` routed its errors through the
+      // space-denial helper and `browse_recent` did not, so the same revocation
+      // used to reach a client as two different answers.
+      mocks.reads[method]!.mockRejectedValueOnce(
+        new IdentityError("Not authenticated"),
+      );
+
+      const result = await call(toolName, args);
+
+      expect(result).toMatchObject({
+        isError: true,
+        content: [{ type: "text", text: "Not authenticated" }],
+      });
+    },
+  );
+
+  test("a write denial keeps the store's non-enumerating words", async () => {
+    mocks.writes.rememberFact!.mockRejectedValueOnce(
+      new IdentityError("Space not found"),
+    );
+
+    const result = await call("remember_fact", {
+      ...factArgs,
+      spaceId: "sensitive-space-id",
+    });
+
+    expect(result).toMatchObject({
+      isError: true,
+      content: [{ type: "text", text: "Space not found" }],
+    });
+  });
+
+  test("the masked original reaches the server log, without the request", async () => {
+    mocks.reads.listSpaces!.mockRejectedValueOnce(new Error(LEAK));
+
+    await call("list_spaces", { spaceIds: ["sensitive-space-id"] });
+
+    expect(logged).toHaveBeenCalledWith("MCP tool error", {
+      tool: "list_spaces",
+      name: "Error",
+      message: LEAK,
+    });
+  });
+
+  test("a message that merely contains a safe literal is still masked", async () => {
+    mocks.reads.listSpaces!.mockRejectedValueOnce(
+      new Error("Space not found: sensitive-space-id"),
+    );
+
+    const result = await call("list_spaces", {});
+
+    expect(result.content).toEqual([{ type: "text", text: "Internal error" }]);
+    expect(JSON.stringify(result)).not.toContain("sensitive-space-id");
   });
 });
