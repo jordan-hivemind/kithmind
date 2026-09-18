@@ -384,6 +384,33 @@ test(
     stage.chunkIds = chunkInsert.ids;
     stage.chunkBytes = chunkInsert.bytes;
 
+    // P2-100d. Staging still refuses a row over its own byte ceiling. The
+    // ceiling is checked after the INSERT, so the attempt runs in a
+    // transaction that is rolled back rather than leaving a page behind.
+    const oversizePage = "z".repeat(96 * 1024 + 1);
+    await client.query("BEGIN");
+    await assert.rejects(
+      provenance.insertParsedPages(client, stage, [
+        {
+          ordinal: 1,
+          start: 2,
+          end: 2 + oversizePage.length,
+          text: oversizePage,
+          textHash: await sha256Utf8(oversizePage),
+        },
+      ]),
+      /invalid_request/,
+    );
+    await client.query("ROLLBACK");
+
+    // P2-100d. Seal still requires the four byte totals it recomputes to equal
+    // what staging accumulated. The check runs before the manifest is written,
+    // so the refused attempt leaves nothing sealed.
+    await assert.rejects(
+      provenance.sealParsedPayload(client, { ...stage, pageBytes: stage.pageBytes + 1 }, new Date()),
+      /scan_conflict/,
+    );
+
     const summary = await provenance.sealParsedPayload(client, stage, new Date());
     assert.equal(summary.pageCount, 1);
     assert.equal(summary.evidenceSpanCount, 2);
@@ -433,10 +460,79 @@ test(
     const verifiedWithCardSpan = await provenance.verifySealedParsedPayload(client, generation);
     assert.equal(verifiedWithCardSpan.actualEvidenceSpanCount, 2);
 
+    // P2-100d. A manifest whose four byte totals were measured under a
+    // different row shape -- every Convex manifest the migration carried over
+    // verbatim -- still verifies, because every content proof still holds.
+    await client.query(
+      `UPDATE kith.processing_generation_payload_manifests
+          SET page_bytes = 1, evidence_bytes = 2, document_bytes = 3, chunk_bytes = 4
+        WHERE id = $1`,
+      [summary.manifestId],
+    );
+    assert.equal((await provenance.verifySealedParsedPayload(client, generation)).actualPageCount, 1);
+
+    // P2-100d. Nor does adding a nullable column, which changes
+    // `JSON.stringify(row)` for every existing row of that table.
+    await client.query("ALTER TABLE kith.source_pages ADD COLUMN p2_100d_probe text");
+    assert.equal((await provenance.verifySealedParsedPayload(client, generation)).actualPageCount, 1);
+
+    // Every content proof still refuses, and still names the check it was.
+    const manifestChunkDigest = (
+      await client.query("SELECT chunk_digest FROM kith.processing_generation_payload_manifests WHERE id = $1", [
+        summary.manifestId,
+      ])
+    ).rows[0].chunk_digest;
+    const sql = (text, values) => () => client.query(text, values);
+    const noop = () => Promise.resolve();
+    const refusesWith = async (detail, apply, undo, tamperedGeneration = generation) => {
+      await apply();
+      const seen = [];
+      await assert.rejects(
+        provenance.verifySealedParsedPayload(client, tamperedGeneration, (named) => seen.push(named)),
+        /scan_conflict/,
+      );
+      assert.deepEqual(seen, [detail]);
+      await undo();
+      assert.equal((await provenance.verifySealedParsedPayload(client, generation)).actualPageCount, 1);
+    };
+    const setManifest = (column, value) =>
+      sql(`UPDATE kith.processing_generation_payload_manifests SET ${column} = $2 WHERE id = $1`, [
+        summary.manifestId,
+        value,
+      ]);
+    const [chunkA] = stage.chunkIds;
+    const [spanA] = stage.evidenceSpanIds;
+    await refusesWith(
+      "id_sets",
+      setManifest("chunk_ids", JSON.stringify([chunkA])),
+      setManifest("chunk_ids", JSON.stringify(stage.chunkIds)),
+    );
+    await refusesWith("row_counts", noop, noop, { ...generation, expectedChunkCount: 3 });
+    await refusesWith(
+      "span_loop:quote_hash",
+      sql("UPDATE kith.evidence_spans SET quote_hash = $2 WHERE id = $1", [spanA, await sha256Utf8("X")]),
+      sql("UPDATE kith.evidence_spans SET quote_hash = $2 WHERE id = $1", [spanA, await sha256Utf8("A")]),
+    );
+    await refusesWith(
+      "chunk_loop:text",
+      sql("UPDATE kith.chunks SET text = 'X' WHERE id = $1", [chunkA]),
+      sql("UPDATE kith.chunks SET text = 'A' WHERE id = $1", [chunkA]),
+    );
+    await refusesWith(
+      "chunk_digest",
+      setManifest("chunk_digest", await sha256Utf8("not-the-chunk-digest")),
+      setManifest("chunk_digest", manifestChunkDigest),
+    );
+
     // Tampering with a sealed page's retained text is caught: the digest the
     // manifest recorded no longer reproduces.
     await client.query("UPDATE kith.source_pages SET text = 'AX' WHERE id = $1", [stage.pageIds[0]]);
-    await assert.rejects(provenance.verifySealedParsedPayload(client, generation), /scan_conflict/);
+    const sawPageTamper = [];
+    await assert.rejects(
+      provenance.verifySealedParsedPayload(client, generation, (named) => sawPageTamper.push(named)),
+      /scan_conflict/,
+    );
+    assert.deepEqual(sawPageTamper, ["page_loop:hash"]);
   },
 );
 
