@@ -2768,6 +2768,389 @@ test(
   },
 );
 
+// A client-side positive control that asks the server about an already-published
+// sibling cannot work, and this pins the server behaviour that makes it
+// impossible. A later scan sees the published file as unchanged, so it creates
+// no new discovery work and obsoletes the old row. Every archived lookup for
+// that item is then refused, whichever scan the client names.
+test(
+  "archived admission lookup answers inside its own scan and is refused once the next scan re-enumerates the published file",
+  { skip },
+  async (t) => {
+    const f = await fixture(t);
+    const pool = createKithPool(f.databaseUrl, 2);
+    const call = (work, now = NOW) => withWorkerTransaction(pool, work, now);
+    const parserFingerprint = "1".repeat(64);
+    const extractionConfigurationFingerprint = "3".repeat(64);
+    const outputHash = "b".repeat(64);
+    const parsedTextHash = await sha256Hex("abcdefgh");
+    const page = {
+      ordinal: 0,
+      start: 0,
+      end: 8,
+      text: "abcdefgh",
+      textHash: parsedTextHash,
+    };
+    const evidence = {
+      ordinal: 0,
+      pageOrdinal: 0,
+      start: 0,
+      end: 8,
+      quoteHash: parsedTextHash,
+      locator: {
+        kind: "parser_page_v1",
+        pageNumber: 1,
+        pageTextHash: parsedTextHash,
+      },
+    };
+    const mappingHash = await digestParsedMappingManifest([page], [evidence]);
+    const bundleHash = "e".repeat(64);
+    const receipt = (subjectKind, copyRole, offset) => {
+      const digit = ((offset % 14) + 1).toString(16);
+      return {
+        kind: "create",
+        subjectKind,
+        copyRole,
+        clientReceiptId: `01890a5d-ac96-7cc4-bb7e-6f4f5ca5c1${50 + offset}`,
+        archiveProfileFingerprint: digit.repeat(64),
+        archiveIdentityFingerprint: ((offset + 2) % 15).toString(16).repeat(64),
+        recipientFingerprint: ((offset + 3) % 15).toString(16).repeat(64),
+        repositoryKeyDomainFingerprint: ((offset + 4) % 15)
+          .toString(16)
+          .repeat(64),
+        storageFailureDomainFingerprint: ((offset + 5) % 15)
+          .toString(16)
+          .repeat(64),
+        archiveObjectId: `01890a5d-ac96-7cc4-bb7e-6f4f5ca5c1${60 + offset}`,
+        ciphertextHash: ((offset + 6) % 15).toString(16).repeat(64),
+        ciphertextByteLength: subjectKind === "original_bytes" ? 20 : 30,
+        createdAt: NOW,
+        readbackVerifiedAt: NOW,
+      };
+    };
+    const binaryEntry = {
+      ...readyEntry(),
+      uri: "fs://synthetic/admit.pdf",
+      docType: "pdf",
+      content: {
+        status: "ready_binary_v1",
+        sha256: HASH_A,
+        byteLength: 10,
+        mediaType: "application/pdf",
+        parserProfileId: "pdf_docqa_v1",
+        parserFingerprint,
+        extractionConfigurationFingerprint,
+        extractorFingerprint: "docling-document-qa:v1",
+        recordSchemaFingerprint: "no-records:v1",
+        normalizationFingerprint: "docling-pages:v1",
+        chunkerFingerprint: "page-aware:v1",
+        correctionRevision: "correction:1",
+      },
+    };
+    const common = {
+      protocolVersion: 1,
+      spaceId: f.spaceId,
+      sourceAccountId: f.sourceAccountId,
+    };
+    async function enumerateScan(label, expectedInventoryEpoch) {
+      const begun = await call((ctx) =>
+        beginWorkerScan(ctx, f.principal, {
+          ...common,
+          operation: "scan.begin",
+          requestId: `${label}-begin`,
+          watcherId: "watcher-1",
+          connectorVersion: "fs-v1",
+          mode: "normal",
+          expectedInventoryEpoch,
+        }),
+      );
+      await call((ctx) =>
+        appendWorkerScanPage(ctx, f.principal, {
+          ...common,
+          operation: "scan.appendPage",
+          scanId: begun.scanId,
+          requestId: `${label}-page`,
+          ordinal: 0,
+          entries: [binaryEntry],
+        }),
+      );
+      await call((ctx) =>
+        sealWorkerScan(ctx, f.principal, {
+          ...common,
+          operation: "scan.seal",
+          scanId: begun.scanId,
+          requestId: `${label}-seal`,
+          expectedPageCount: 1,
+          health: { status: "healthy" },
+        }),
+      );
+      await call((ctx) =>
+        reconcileWorkerScan(ctx, f.principal, {
+          ...common,
+          operation: "scan.reconcile",
+          scanId: begun.scanId,
+          requestId: `${label}-reconcile`,
+          expectedInventoryEpoch: expectedInventoryEpoch + 1,
+          ordinal: 0,
+          maxItems: 10,
+        }),
+      );
+      return begun.scanId;
+    }
+    try {
+      await f.client.query(
+        `UPDATE kith.source_accounts SET binary_profile_ids = $1,
+         binary_profile_audit_digest = $2, binary_profile_enabled_at = $3
+         WHERE id = $4`,
+        [
+          JSON.stringify(["pdf_docqa_v1"]),
+          parserFingerprint,
+          new Date(NOW),
+          f.sourceAccountId,
+        ],
+      );
+      const scanA = await enumerateScan("sibling-scan-a", 0);
+      const work = (
+        await f.client.query(
+          "SELECT * FROM kith.worker_discovery_work WHERE source_account_id = $1",
+          [f.sourceAccountId],
+        )
+      ).rows[0];
+      const identity = {
+        sourceItemId: work.source_item_id,
+        scanId: scanA,
+        observationEpoch: Number(work.observation_epoch),
+        processingEpoch: Number(work.processing_epoch),
+        contentHash: HASH_A,
+        byteLength: 10,
+        mediaType: "application/pdf",
+        parserProfileId: "pdf_docqa_v1",
+        parserFingerprint,
+        extractionConfigurationFingerprint,
+        extractorFingerprint: "docling-document-qa:v1",
+        recordSchemaFingerprint: "no-records:v1",
+        normalizationFingerprint: "docling-pages:v1",
+        chunkerFingerprint: "page-aware:v1",
+        correctionRevision: "correction:1",
+      };
+      const leased = await call((ctx) =>
+        reserveArchivedDiscovery(
+          ctx,
+          f.principal,
+          {
+            ...common,
+            operation: "discovery.reserveArchived",
+            requestId: "sibling-reserve",
+            identity,
+          },
+          "7".repeat(64),
+        ),
+      );
+      const extractionFingerprint = await artifactBoundExtractionFingerprint(
+        parserFingerprint,
+        outputHash,
+        extractionConfigurationFingerprint,
+      );
+      const admitted = await call((ctx) =>
+        admitArchivedDiscovery(ctx, f.principal, {
+          ...common,
+          operation: "discovery.admitArchived",
+          requestId: "sibling-admit",
+          workId: leased.workId,
+          leaseEpoch: leased.leaseEpoch,
+          leaseToken: leased.leaseToken,
+          parserArtifact: {
+            kind: "create",
+            clientArtifactId: "01890a5d-ac96-7cc4-bb7e-6f4f5ca5c140",
+            outputHash,
+            outputByteLength: 20,
+            outputMediaType: "application/vnd.docling+json",
+            createdAt: NOW,
+          },
+          archives: [
+            receipt("original_bytes", "primary", 1),
+            receipt("parser_output", "primary", 3),
+            receipt("parser_output", "independent_backup", 4),
+          ],
+          providerOriginal: {
+            referenceVersion: "provider_original_v1",
+            providerKind: "dropbox_v1",
+            clientReferenceId: "01890a5d-ac96-7cc4-bb7e-6f4f5ca5c149",
+            sourceContentHash: HASH_A,
+            sourceByteLength: 10,
+            providerAccountIdHash: "4".repeat(64),
+            providerRootDirectoryIdHash: "5".repeat(64),
+            providerFileIdHash: "6".repeat(64),
+            providerRevision: "rev-synthetic-provider",
+            providerContentHash: "7".repeat(64),
+            verifiedAt: NOW,
+            locatorBundle: {
+              bindingId: "01890a5d-ac96-7cc4-bb7e-6f4f5ca5c148",
+              manifestFingerprint: "8".repeat(64),
+              recipientFingerprint: "9".repeat(64),
+              repositoryKeyDomainFingerprint: "a".repeat(64),
+              repositoryId: "b".repeat(64),
+              snapshotId: "c".repeat(64),
+              objectName: "provider-locator.json.age",
+              ciphertextHash: "d".repeat(64),
+              ciphertextByteLength: 512,
+              readbackVerifiedAt: NOW,
+            },
+            createdAt: NOW,
+          },
+          parsedText: {
+            extractionFingerprint,
+            textHash: parsedTextHash,
+            byteLength: 8,
+            utf16Length: 8,
+            pageCount: 1,
+            mappingManifestHash: mappingHash,
+            normalizedBundleDigest: bundleHash,
+            expectedEvidenceSpanCount: 1,
+            expectedDocumentCount: 1,
+            expectedChunkCount: 1,
+          },
+        }),
+      );
+      assert.equal(admitted.state, "admitted");
+
+      const endpoint = await listenWorker(t, pool, NOW);
+      const transport = new HttpWorkerTransport(
+        { endpoint },
+        f.credential.rawKey,
+      );
+      const httpCall = (request) => transport.call(request);
+      const reserved = await call((ctx) =>
+        reserveParsedJobs(
+          ctx,
+          f.principal,
+          {
+            ...common,
+            operation: "jobs.reserveParsed",
+            requestId: "sibling-parsed-reserve",
+            maxItems: 1,
+            jobId: admitted.ingestJobId,
+          },
+          ["9".repeat(64)],
+        ),
+      );
+      const lease = reserved.targets[0];
+      const leaseRequest = {
+        ...common,
+        jobId: lease.jobId,
+        leaseEpoch: lease.leaseEpoch,
+        leaseToken: lease.leaseToken,
+      };
+      const stage = await httpCall({
+        ...leaseRequest,
+        operation: "jobs.stageParsedBegin",
+        requestId: "sibling-parsed-begin",
+        extractionFingerprint,
+        mappingManifestHash: mappingHash,
+        normalizedBundleDigest: bundleHash,
+        expectedPageCount: 1,
+        expectedEvidenceSpanCount: 1,
+        expectedDocumentCount: 1,
+        expectedChunkCount: 1,
+      });
+      const batch = (requestId, phase, rows) =>
+        httpCall({
+          ...leaseRequest,
+          operation: "jobs.stageParsedBatch",
+          requestId,
+          stageId: stage.stageId,
+          phase,
+          ordinal: 0,
+          rows,
+        });
+      await batch("sibling-parsed-pages", "pages", [page]);
+      await batch("sibling-parsed-evidence", "evidence", [evidence]);
+      await batch("sibling-parsed-documents", "documents", [
+        {
+          documentKey: "document-1",
+          title: "Synthetic document",
+          docType: "pdf",
+          capturedAt: NOW,
+          evidence: [{ pageOrdinal: 0, evidenceOrdinal: 0 }],
+        },
+      ]);
+      await batch("sibling-parsed-chunks", "chunks", [
+        {
+          documentKey: "document-1",
+          ordinal: 0,
+          start: 0,
+          end: 8,
+          text: "abcdefgh",
+          evidence: [{ pageOrdinal: 0, evidenceOrdinal: 0 }],
+        },
+      ]);
+      await httpCall({
+        ...leaseRequest,
+        operation: "jobs.stageParsedSeal",
+        requestId: "sibling-parsed-seal",
+        stageId: stage.stageId,
+        normalizedBundleDigest: bundleHash,
+      });
+      assert.equal(
+        (
+          await httpCall({
+            ...leaseRequest,
+            operation: "jobs.activateParsed",
+            requestId: "sibling-parsed-activate",
+          })
+        ).state,
+        "ready",
+      );
+
+      const sameScan = await call((ctx) =>
+        lookupArchivedAdmission(ctx, f.principal, {
+          ...common,
+          operation: "discovery.lookupArchivedAdmission",
+          requestId: "sibling-lookup-same-scan",
+          identity,
+          lookup: { mode: "original" },
+        }),
+      );
+      assert.equal(sameScan.found, true);
+      assert.equal(sameScan.mode, "original");
+
+      const scanB = await enumerateScan("sibling-scan-b", 1);
+      assert.equal(
+        (
+          await f.client.query(
+            "SELECT state FROM kith.worker_scan_entries WHERE scan_id = $1",
+            [scanB],
+          )
+        ).rows[0].state,
+        "unchanged",
+      );
+      assert.equal(
+        (
+          await f.client.query(
+            "SELECT count(*)::int AS count FROM kith.worker_discovery_work WHERE source_account_id = $1",
+            [f.sourceAccountId],
+          )
+        ).rows[0].count,
+        1,
+      );
+      await assert.rejects(
+        call((ctx) =>
+          lookupArchivedAdmission(ctx, f.principal, {
+            ...common,
+            operation: "discovery.lookupArchivedAdmission",
+            requestId: "sibling-lookup-next-scan",
+            identity: { ...identity, scanId: scanB },
+            lookup: { mode: "original" },
+          }),
+        ),
+        expectProtocolCode("stale_observation"),
+      );
+    } finally {
+      await pool.end();
+    }
+  },
+);
+
 test(
   "forget operations fence, replay, preserve malformed-history denial, and retry atomically",
   { skip },

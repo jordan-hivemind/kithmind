@@ -169,9 +169,9 @@ export const PARKED_ITEM_GUIDANCE: Record<
 > = {
   receipt_clear_refused_by_safety_limit: {
     means:
-      "A filing receipt looked wrong, and this computer stopped rather than repair it, because the server may be the thing that is wrong.",
+      "A filing receipt looked wrong, and this computer stopped rather than repair it on its own, because it cannot tell from here whether the document or the server is at fault.",
     action:
-      "Report this one before anything else. Check that the server is the right deployment and still holds this account's earlier documents.",
+      "Check the server is the right one and still holds this account's earlier documents, then run the repair yourself: see the parked documents section of the worker service guide.",
   },
   archive_catalog_revision_conflict: {
     means:
@@ -191,8 +191,10 @@ export const PARKED_ITEM_GUIDANCE: Record<
       "Report this one. Picking the wrong version could file the wrong document.",
   },
   original_receipt_unknown_to_server: {
-    means: "One document has a filing receipt the server has no record of.",
-    action: "Usually repaired automatically. If it stays parked, report it.",
+    means:
+      "One document has a filing receipt the server has no record of, and its own state rules out the automatic repair.",
+    action:
+      "Report this one. Repairing it needs a person, and the worker service guide has the command.",
   },
   provider_original_reference_already_bound: {
     means:

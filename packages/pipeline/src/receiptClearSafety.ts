@@ -38,10 +38,36 @@ export type ReceiptClearRefusal =
   /** Automatic only: the server does not know a receipt that should be good. */
   | "positive_control_failed";
 
+/**
+ * P2-31f, second review. There is no read this worker can make, mid pass, that
+ * proves the server it is talking to still holds this account's earlier
+ * receipts. Three were traced and none works:
+ *
+ *   * `discovery.lookupArchivedAdmission` about a published sibling. The
+ *     server resolves it through the sibling's live discovery work row, and an
+ *     already-published file gets no new row in a later scan: the old one is
+ *     obsoleted and still names the old scan, so the lookup is refused
+ *     `stale_observation`. Proved against the real handler in
+ *     `packages/kith-store/test/workerFoundation.test.mjs`.
+ *   * `source.status` counts. `snapshotCurrent` requires the assessment's
+ *     inventory epoch to equal the account's, and `scan.begin` bumps the
+ *     account's, so from the first step of the pass the counts read
+ *     `not_assessed`. They are absent exactly when this would need them.
+ *   * `source.inventoryPage`. It is refused unless the scan is an open
+ *     identity-recovery scan, it consumes the mutation rate limit, and it
+ *     advances the scan's own inventory cursor. Not a probe.
+ *
+ * So the automatic route does not guess. It clears only when there is no other
+ * receipt in the catalog for a mass void to be hiding, and everything else is
+ * parked for the operator route, which is a person deciding with the dry run
+ * in front of them. A control that cannot run is not a control that passed.
+ */
+export const POSITIVE_CONTROL_UNAVAILABLE_BY_DESIGN = true;
+
 /** One automatic clear per source per day. */
 export const AUTOMATIC_CLEAR_INTERVAL_MS = 24 * 60 * 60_000;
 
-/** The positive control's answer; see `receiptClearRefusal`. */
+/** The positive control's answer; see `automaticReceiptClearRefusal`. */
 export type PositiveControl = "ok" | "unavailable" | "failed";
 
 export type ReceiptClearInput = {
@@ -59,6 +85,23 @@ export type ReceiptClearInput = {
    */
   positiveControl?: () => Promise<PositiveControl>;
 };
+
+/**
+ * P2-31f. The deliberate operator route, `run --retry-parked --operator-clear`.
+ *
+ * It keeps the conditions about this document, because those describe state
+ * that no route can repair, and drops the three that exist only because a pass
+ * decides alone: a person ran this after reading the dry run's parked count,
+ * which is the judgement the automatic limits stand in for. Without it a
+ * document parked on `already_reconciled` had no route at all: the pass walks
+ * past it, so `reconcile-receipts` cannot address it, and `--retry-parked`
+ * just re-ran the same limits and parked it again.
+ */
+export function operatorReceiptClearRefusal(
+  input: Pick<ReceiptClearInput, "original" | "processing" | "processings">,
+): ReceiptClearRefusal | undefined {
+  return receiptClearRowRefusal(input);
+}
 
 /**
  * The conditions on the row itself. Both routes apply these, and neither may

@@ -51,6 +51,7 @@ import type {
 } from "./archiveCatalogTypes.js";
 import {
   automaticReceiptClearRefusal,
+  operatorReceiptClearRefusal,
   positiveControlRequired,
   type PositiveControl,
   type ReceiptClearRefusal,
@@ -1158,8 +1159,11 @@ export class PipelineRunner {
     private readonly journal: Journal<RunnerCheckpoint, JsonValue>,
     private readonly transport: WorkerTransport,
     private readonly rateLimitBackoff: RateLimitBackoff = DEFAULT_RATE_LIMIT_BACKOFF,
-    /** P2-31f: `retryParked` is `run --retry-parked`. */
-    private readonly options: { retryParked?: boolean } = {},
+    /** P2-31f: the two `run` operator flags. */
+    private readonly options: {
+      retryParked?: boolean;
+      operatorClear?: boolean;
+    } = {},
   ) {}
 
   /**
@@ -3981,66 +3985,32 @@ export class PipelineRunner {
   /**
    * P2-31f. The positive control on the automatic receipt clear: proof that
    * the server this pass is talking to still knows a receipt this worker knows
-   * is good. Without it, a backend that has lost everything is indistinguishable
-   * from the one misrouted original this repairs, and the repair would retire
-   * every receipt in the catalog one pass at a time.
+   * is good. Without one, a backend that has lost everything is
+   * indistinguishable from the one misrouted original the repair exists for,
+   * and the repair would retire every receipt in the catalog, one pass at a
+   * time.
    *
-   * The control is the same read-only `discovery.lookupArchivedAdmission` the
-   * pass itself uses, asked about a different file. That is the strongest probe
-   * available: same operation, same authority, same backend, and a `found` for
-   * a receipt the catalog also holds is direct evidence rather than an
-   * inference from a count. It reserves nothing and spends no discovery
-   * attempt.
+   * No such read exists mid pass. `POSITIVE_CONTROL_UNAVAILABLE_BY_DESIGN` in
+   * `receiptClearSafety.ts` records the three that were traced and why each is
+   * refused, unavailable or not a probe at all. The first of them was tried in
+   * this method and is now proved impossible against the real server, so
+   * rather than send a request that can only come back refused and read that
+   * as evidence about the backend, this answers honestly.
    *
-   * It can only be addressed for a file in the current scan, because the
-   * lookup takes the whole archived work identity and only a scan plan carries
-   * one (the catalog row holds neither the parser fingerprints nor a live
-   * `scanId`). A catalog whose other admitted originals are all outside this
-   * scan therefore answers `unavailable`, which refuses: a probe that cannot be
-   * made is not a probe that passed. `source.status` counts were the
-   * alternative and are weaker -- they are absent before an assessment, they
-   * lag, and a count says nothing about this worker's own receipts.
-   *
-   * Never throws. It runs inside a journaled transition, where a throw would
-   * leave the answered request unresolved, so every failure is `"failed"`.
+   * `"ok"` therefore means only one thing: there is no other receipt in the
+   * catalog, so there is nothing a mass void could be hiding and nothing to
+   * prove the backend with. Every other catalog gets `"unavailable"`, which
+   * refuses and routes the document to `run --retry-parked --operator-clear`.
    */
   private async receiptPositiveControl(
     checkpoint: ArchivedCheckpoint,
   ): Promise<PositiveControl> {
-    const catalog = this.requireCatalog();
-    if (
-      !positiveControlRequired(
-        catalog.listOriginals(),
-        checkpoint.originalCatalogId ?? "",
-      )
+    return positiveControlRequired(
+      this.requireCatalog().listOriginals(),
+      checkpoint.originalCatalogId ?? "",
     )
-      return "ok";
-    for (const [index, plan] of checkpoint.files.entries()) {
-      if (index === checkpoint.pdfIndex || !isPdfPlan(plan)) continue;
-      const sibling = this.matchingOriginal(plan);
-      if (!sibling?.cloud) continue;
-      let identity: ArchivedWorkIdentity;
-      try {
-        identity = archivedIdentity(checkpoint, plan);
-      } catch {
-        continue;
-      }
-      try {
-        const response = await this.transport.call(
-          request(this.config, "discovery.lookupArchivedAdmission", {
-            requestId: randomUUID(),
-            identity,
-            lookup: { mode: "original" },
-          }),
-        );
-        const value = success(response);
-        if (!value || value.mode !== "original") return "failed";
-        return value.found === true ? "ok" : "failed";
-      } catch {
-        return "failed";
-      }
-    }
-    return "unavailable";
+      ? "unavailable"
+      : "ok";
   }
 
   /**
@@ -4059,29 +4029,38 @@ export class PipelineRunner {
     const catalog = this.requireCatalog();
     const { original, processing } = this.archivedRows(checkpoint);
     if (!original.cloud) return "already_reconciled";
-    const refusal = await automaticReceiptClearRefusal({
+    const shared = {
       original,
       processing,
       processings: catalog.listProcessings(),
-      originals: catalog.listOriginals(),
-      now: Date.now(),
-      positiveControl: () => this.receiptPositiveControl(checkpoint),
-    });
+    };
+    // `--operator-clear` is a person standing in for the limits that exist
+    // only because a pass decides alone. The conditions about this document
+    // still hold either way.
+    const refusal = this.options.operatorClear
+      ? operatorReceiptClearRefusal(shared)
+      : await automaticReceiptClearRefusal({
+          ...shared,
+          originals: catalog.listOriginals(),
+          now: Date.now(),
+          positiveControl: () => this.receiptPositiveControl(checkpoint),
+        });
     if (refusal) return refusal;
+    const by = this.options.operatorClear ? "operator" : "pass";
     const clearedAt = Date.now();
     const nextProcessing = (await catalog.clearVoidAdmission({
       subject: "parser_output",
       catalogId: processing.processingCatalogId,
       expectedRevision: processing.rowRevision,
       clearedAt,
-      by: "pass",
+      by,
     })) as ProcessingCatalogRow;
     const nextOriginal = (await catalog.clearVoidAdmission({
       subject: "original_bytes",
       catalogId: original.originalCatalogId,
       expectedRevision: original.rowRevision,
       clearedAt,
-      by: "pass",
+      by,
     })) as OriginalCatalogRow;
     return archivedBase(checkpoint, {
       step: "capture",
@@ -4162,6 +4141,13 @@ export class PipelineRunner {
           if (this.archivedRows(current).original.cloud) {
             const healed = await this.selfHealVoidReceipt(current);
             if (typeof healed !== "string") return healed;
+            // The exact refusal reaches the watcher log, because the park code
+            // deliberately does not separate "the probe never ran" from "the
+            // server denied a receipt it should know", and that difference is
+            // the first thing worth knowing. A closed enum, no names.
+            process.stderr.write(
+              `${JSON.stringify({ event: "receipt_clear_refused", reason: healed })}\n`,
+            );
             return await this.parkedCheckpoint(
               current,
               healed === "positive_control_failed" ||

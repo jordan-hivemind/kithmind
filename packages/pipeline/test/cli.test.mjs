@@ -31,6 +31,7 @@ test("the root pnpm alias forwarding separator is consumed exactly once", () => 
       command: "run",
       configPath: "/tmp/config.json",
       retryParked: false,
+      operatorClear: false,
     },
   );
   assert.deepEqual(argumentsFor(["watch", "--config", "/tmp/config.json"]), {
@@ -50,7 +51,27 @@ test("run takes --retry-parked and no other command does", () => {
       command: "run",
       configPath: "/tmp/config.json",
       retryParked: true,
+      operatorClear: false,
     },
+  );
+  // The deliberate receipt clear rides on the release and never alone.
+  assert.deepEqual(
+    argumentsFor([
+      "run",
+      "--config",
+      "/tmp/config.json",
+      "--retry-parked",
+      "--operator-clear",
+    ]),
+    {
+      command: "run",
+      configPath: "/tmp/config.json",
+      retryParked: true,
+      operatorClear: true,
+    },
+  );
+  assert.throws(() =>
+    argumentsFor(["run", "--config", "/tmp/config.json", "--operator-clear"]),
   );
   for (const command of ["watch", "doctor", "reconcile-receipts"])
     assert.throws(() =>

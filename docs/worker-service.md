@@ -291,14 +291,17 @@ the reset count, and nothing else.
 
 A pass that meets `original_receipt_unknown_to_server` has met a contradiction:
 the local archive catalog records an admission for the original, and the
-authoritative server says it has never seen that revision. Since P2-31f the
-pass repairs this itself when the narrow conditions below hold, so this command
-is a fallback rather than the usual route. It retires the receipt only when the
-processing row is not activated and no processing receipt names a different
-revision; outside those conditions the document is parked (see the next
-section) rather than cleared, because a receipt records that original bytes
-were accepted somewhere and dropping one on a server's silence would re-admit
-anything a temporary misrouting had touched.
+authoritative server says it has never seen that revision. A receipt records
+that original bytes were accepted somewhere, and dropping one on a server's
+silence would re-admit anything a temporary misrouting had touched.
+
+Since P2-31f a pass repairs this itself only in the one case where it is
+provably safe: the catalog holds no other filing receipt, so there is nothing a
+wider failure could be hiding. Every other case is parked, and the route for it
+is in the parked documents section below, not this command: `reconcile-receipts`
+addresses only the document the pass is currently on, and a parked document is
+one the pass has walked past. Use this command while the pass is still stopped
+on the document, and the parked route otherwise.
 
 It is client only. It sends one `discovery.lookupArchivedAdmission`, the same
 read-only lookup the pass itself uses, which reserves nothing and spends no
@@ -395,14 +398,48 @@ first. The automatic route has these limits instead, and refuses with
 - the document's receipt has never been cleared before, at most one automatic
   repair per document ever;
 - no other document was repaired in the last 24 hours, at most one per day;
-- the server can still confirm a receipt this computer knows is good. The pass
-  asks the same read-only question about a different file in the same scan that
-  the catalog also records as filed. A `found` answer proves this is the right
-  server. A `not found` answer, an error, or no other file to ask about all
-  refuse.
+- nothing else in the catalog could be hidden by the failure. The repair is
+  safe on its own only when this receipt is the only one the catalog holds:
+  with others present, a server that has lost everything and the one genuinely
+  misrouted document look identical from here, and no read this worker can make
+  during a pass can tell them apart. Three were tried. Asking the server about
+  an already filed document is refused, because the server answers that
+  question through a work row that a filed document no longer has. The status
+  counts are absent from the moment a pass starts its scan. The inventory page
+  is refused outside a recovery scan. So a catalog with more than one filing
+  receipt always parks, and an operator decides.
 
 A repair a pass makes and one an operator asks for are both appended to the
 document's own record, so a second one is visible rather than silent.
+
+Three automatic retries six hours apart lapse well inside the one-per-day
+limit, so a document parked on that limit spends its retries without ever being
+eligible again and is escalated. That is by design: the second and third
+attempts would be the same guess, and the answer is an operator decision.
+
+### Repairing a parked receipt yourself
+
+`reconcile-receipts` only ever addresses the document the pass is currently on,
+and a parked document is one the pass has walked past, so the command cannot
+reach it. It reports parked documents by count and code on every answer,
+including a refusal, which makes it the dry run. The apply step is a pass an
+operator starts.
+
+```sh
+launchctl bootout gui/$(id -u)/<watcher-label>
+pnpm --silent brain:worker -- reconcile-receipts --config /absolute/path/to/pipeline.json --json
+pnpm --silent brain:worker -- run --config /absolute/path/to/pipeline.json --retry-parked --operator-clear
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<watcher-label>.plist
+```
+
+Read the dry run first and check the server is the right deployment. The second
+command clears every marker, retries each parked document, and repairs a
+receipt the server denies when the document's own state allows it: the
+processing row and its siblings are not activated, no processing receipt names
+another revision, and the server's answer is a well-formed "not found". It does
+not apply the once-ever or once-per-day limits, which exist only because a pass
+decides alone. Every clear it makes is recorded against the document as an
+operator clear. `--operator-clear` is refused without `--retry-parked`.
 
 ### Documents that need attention
 

@@ -7,6 +7,7 @@ import {
   requireCredential,
 } from "./config.js";
 import { Journal, JournalLockedError } from "./journal.js";
+import type { AdmissionBlockCode } from "./archiveCatalogTypes.js";
 import { receiptClearRowRefusal } from "./receiptClearSafety.js";
 import type { JsonValue } from "./journalTypes.js";
 import {
@@ -46,6 +47,15 @@ export type ReconcileReceiptsResult = {
   applied: boolean;
   /** Local originals carrying a `cloud` receipt, across the whole catalog. */
   originalsWithReceipts: number;
+  /**
+   * P2-31f. Documents the pass has parked, across the whole catalog. The pass
+   * walks past a parked document, so it is no longer the checkpoint's own
+   * original and this command cannot address it. Reporting the count and the
+   * codes is what makes it the dry run for `run --retry-parked
+   * --operator-clear`, which is the deliberate route for clearing one.
+   */
+  parkedOriginals: number;
+  parkedCodes: AdmissionBlockCode[];
   /** How many of those the lookup could address. Never more than one. */
   receiptsChecked: number;
   receiptsConfirmed: number;
@@ -140,10 +150,15 @@ export async function runReconcileReceipts(input: {
   const originalsWithReceipts = input.catalog
     .listOriginals()
     .filter((row) => row.cloud).length;
+  const parked = input.catalog
+    .listOriginals()
+    .flatMap((row) => (row.admissionBlock ? [row.admissionBlock.code] : []));
   const base = {
     scope: "checkpoint_original",
     applied: false,
     originalsWithReceipts,
+    parkedOriginals: parked.length,
+    parkedCodes: [...new Set(parked)].sort(),
     receiptsChecked: 0,
     receiptsConfirmed: 0,
     receiptsUnknown: 0,
@@ -160,6 +175,11 @@ export async function runReconcileReceipts(input: {
   const checkpoint = input.journal.checkpoint;
   if (checkpoint.phase !== "archived") {
     if (input.journal.pending) return refuse("journal_request_pending");
+    // P2-31f: `parkedOriginals` and `parkedCodes` ride on every answer,
+    // including this one, because a pass that parked a document walks past it
+    // and leaves the checkpoint somewhere this command cannot act. An operator
+    // who sees a nonzero count here has the dry run for
+    // `run --retry-parked --operator-clear`.
     return originalsWithReceipts === 0
       ? { ...base, state: "clean" }
       : refuse("checkpoint_not_archived");
@@ -324,6 +344,9 @@ export async function reconcileReceiptsFromPath(
         scope: "checkpoint_original",
         applied: false,
         originalsWithReceipts: 0,
+        // The catalog is behind the same lock, so nothing can be counted here.
+        parkedOriginals: 0,
+        parkedCodes: [],
         receiptsChecked: 0,
         receiptsConfirmed: 0,
         receiptsUnknown: 0,
@@ -344,8 +367,19 @@ export async function reconcileReceiptsFromPath(
   }
 }
 
+/**
+ * P2-31f. Parked documents are printed on every answer, refusals included, so
+ * an operator meeting `checkpoint_not_archived` still learns there is work
+ * this command cannot reach and what route clears it.
+ */
+function parkedSuffix(value: ReconcileReceiptsResult): string {
+  return value.parkedOriginals === 0
+    ? ""
+    : ` parked=${value.parkedOriginals} (${value.parkedCodes.join(",")}); clear with: run --retry-parked --operator-clear`;
+}
+
 export function formatReconcileResult(value: ReconcileReceiptsResult): string {
   return value.state === "refused"
-    ? `reconcile-receipts: refused (${value.code}${value.lookupCode ? `: ${value.lookupCode}` : ""})`
-    : `reconcile-receipts: ${value.state} receipts=${value.originalsWithReceipts} checked=${value.receiptsChecked} confirmed=${value.receiptsConfirmed} unknown=${value.receiptsUnknown} applied=${value.applied}`;
+    ? `reconcile-receipts: refused (${value.code}${value.lookupCode ? `: ${value.lookupCode}` : ""})${parkedSuffix(value)}`
+    : `reconcile-receipts: ${value.state} receipts=${value.originalsWithReceipts} checked=${value.receiptsChecked} confirmed=${value.receiptsConfirmed} unknown=${value.receiptsUnknown} applied=${value.applied}${parkedSuffix(value)}`;
 }

@@ -27,11 +27,16 @@ import type { RunnerCheckpoint } from "./runnerState.js";
 
 function usage(): never {
   throw new Error(
-    "Usage: pnpm brain:worker -- <run|watch|doctor> --config <path> [--json], run also takes [--retry-parked], or reconcile-receipts --config <path> [--apply] [--json], or forget-archive --config <path> --source-item <id> --source-external-id <uuid> --forget-epoch <n> [--json]",
+    "Usage: pnpm brain:worker -- <run|watch|doctor> --config <path> [--json], run also takes [--retry-parked [--operator-clear]], or reconcile-receipts --config <path> [--apply] [--json], or forget-archive --config <path> --source-item <id> --source-external-id <uuid> --forget-epoch <n> [--json]",
   );
 }
 export function argumentsFor(argv: string[]):
-  | { command: "run"; configPath: string; retryParked: boolean }
+  | {
+      command: "run";
+      configPath: string;
+      retryParked: boolean;
+      operatorClear: boolean;
+    }
   | { command: "watch"; configPath: string }
   | { command: "doctor"; configPath: string; json: boolean }
   | {
@@ -101,9 +106,10 @@ export function argumentsFor(argv: string[]):
       ? ["--json"]
       : command === "reconcile-receipts"
         ? ["--json", "--apply"]
-        : // P2-31f: the operator release for parked items.
+        : // P2-31f: the operator release for parked items, and the
+          // deliberate receipt clear that only makes sense with it.
           command === "run"
-          ? ["--retry-parked"]
+          ? ["--retry-parked", "--operator-clear"]
           : [];
   if (
     (command !== "run" &&
@@ -125,9 +131,14 @@ export function argumentsFor(argv: string[]):
     };
   if (command === "doctor")
     return { command, configPath, json: extra.includes("--json") };
-  return command === "run"
-    ? { command, configPath, retryParked: extra.includes("--retry-parked") }
-    : { command, configPath };
+  if (command !== "run") return { command, configPath };
+  const retryParked = extra.includes("--retry-parked");
+  const operatorClear = extra.includes("--operator-clear");
+  // `--operator-clear` drops safety limits that exist because a pass decides
+  // alone, so it is only meaningful on a pass an operator started to retry
+  // parked documents. On its own it is a typo, not an instruction.
+  if (operatorClear && !retryParked) usage();
+  return { command, configPath, retryParked, operatorClear };
 }
 
 async function executeForget(
@@ -166,7 +177,7 @@ async function executeConfig(
   config: Awaited<ReturnType<typeof loadPipelineConfig>>,
   credential: string,
   journal?: Journal<RunnerCheckpoint, JsonValue>,
-  options: { retryParked?: boolean } = {},
+  options: { retryParked?: boolean; operatorClear?: boolean } = {},
 ): Promise<PipelineRunResult> {
   const ownedJournal =
     journal ??
@@ -193,7 +204,7 @@ async function executeConfig(
 
 async function execute(
   configPath: string,
-  options: { retryParked?: boolean } = {},
+  options: { retryParked?: boolean; operatorClear?: boolean } = {},
 ): Promise<PipelineRunResult> {
   const config = await loadPipelineConfig(configPath);
   return executeConfig(config, requireCredential(config), undefined, options);
@@ -353,6 +364,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   if (command === "run") {
     const result = await execute(configPath, {
       retryParked: parsed.retryParked,
+      operatorClear: parsed.operatorClear,
     });
     process.stdout.write(`${JSON.stringify(result)}\n`);
     if (result.state !== "complete") process.exitCode = 1;

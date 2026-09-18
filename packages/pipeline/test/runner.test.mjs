@@ -34,6 +34,7 @@ import {
 import { ParserProcessError } from "../dist/parserProcess.js";
 import { persistProviderBinding } from "../dist/providerRegistry.js";
 import {
+  formatReconcileResult,
   reconcileReceiptsFromPath,
   runReconcileReceipts,
 } from "../dist/reconcileReceipts.js";
@@ -2935,6 +2936,8 @@ test("an operator reconcile clears a void receipt and the next pass admits exact
       scope: "checkpoint_original",
       applied: true,
       originalsWithReceipts: 1,
+      parkedOriginals: 0,
+      parkedCodes: [],
       receiptsChecked: 1,
       receiptsConfirmed: 0,
       receiptsUnknown: 1,
@@ -3039,6 +3042,8 @@ test("a reconcile dry run counts the void receipt and writes nothing", async () 
       scope: "checkpoint_original",
       applied: false,
       originalsWithReceipts: 1,
+      parkedOriginals: 0,
+      parkedCodes: [],
       receiptsChecked: 1,
       receiptsConfirmed: 0,
       receiptsUnknown: 1,
@@ -3078,6 +3083,8 @@ test("a receipt the server confirms is never cleared, even under --apply", async
       scope: "checkpoint_original",
       applied: false,
       originalsWithReceipts: 1,
+      parkedOriginals: 0,
+      parkedCodes: [],
       receiptsChecked: 1,
       receiptsConfirmed: 1,
       receiptsUnknown: 0,
@@ -3147,6 +3154,8 @@ test("a reconcile interrupted before its checkpoint move finishes on the rerun",
       scope: "checkpoint_original",
       applied: false,
       originalsWithReceipts: 0,
+      parkedOriginals: 0,
+      parkedCodes: [],
       receiptsChecked: 0,
       receiptsConfirmed: 0,
       receiptsUnknown: 0,
@@ -3180,6 +3189,8 @@ test("a reconcile refuses a journal the watcher still holds", async () => {
       scope: "checkpoint_original",
       applied: false,
       originalsWithReceipts: 0,
+      parkedOriginals: 0,
+      parkedCodes: [],
       receiptsChecked: 0,
       receiptsConfirmed: 0,
       receiptsUnknown: 0,
@@ -3999,12 +4010,10 @@ test("a backend that has lost every receipt clears nothing and parks on the safe
       ["receipt_clear_refused_by_safety_limit"],
     );
     assert.equal(f.journal.pending, undefined, "the answer is settled");
-    // The item's own lookup, then the control on a sibling that should have
-    // been found. Both read-only, neither spends a discovery attempt.
-    assert.deepEqual(f.sent, [
-      "discovery.lookupArchivedAdmission",
-      "discovery.lookupArchivedAdmission",
-    ]);
+    // Only the item's own read-only lookup. Nothing else is asked, because
+    // there is nothing this worker can ask mid pass that would settle whether
+    // the server or the document is at fault.
+    assert.deepEqual(f.sent, ["discovery.lookupArchivedAdmission"]);
   } finally {
     await f.journal.close();
     await rm(f.setup.base, { recursive: true, force: true });
@@ -4083,18 +4092,11 @@ test("the automatic clear refuses a second time on the same row, a recent clear 
   }
 });
 
-test("the automatic clear proceeds when the server still knows a receipt this worker knows is good", async () => {
-  const f = await voidBackendFixture(2);
-  let asked = 0;
-  // The one real misrouting: this original's receipt is void, and the sibling
-  // the control asks about is confirmed, so the backend is the right one.
-  f.runner.transport = {
-    async call(request) {
-      f.sent.push(request.operation);
-      asked += 1;
-      return lookupResponse(asked > 1);
-    },
-  };
+test("the automatic clear proceeds only when this receipt is the only one in the catalog", async () => {
+  // The one case a pass can settle alone: with no other receipt, there is
+  // nothing a wider failure could be hiding, so the not-found answer can only
+  // be about this document.
+  const f = await voidBackendFixture(1);
   try {
     await f.runner.driveArchivedLookupOriginal();
     assert.deepEqual(
@@ -4104,9 +4106,191 @@ test("the automatic clear proceeds when the server still knows a receipt this wo
     assert.deepEqual(f.parked, []);
     assert.equal(f.journal.checkpoint.step, "capture");
     assert.equal(f.journal.pending, undefined);
+    assert.deepEqual(f.sent, ["discovery.lookupArchivedAdmission"]);
   } finally {
     await f.journal.close();
     await rm(f.setup.base, { recursive: true, force: true });
+  }
+});
+
+test("the reconcile command reports parked documents it cannot itself reach", async () => {
+  // The pass walks past a parked document, so the checkpoint is no longer on
+  // it and this command cannot address it. Saying so, with the count and the
+  // codes, is what makes this the dry run for the operator route.
+  const setup = await fixture(0);
+  const journal = await openJournal(setup.journalDir, {
+    version: 1,
+    phase: "idle",
+  });
+  const original = familyOriginal(pdfPlan(), randomUUID(), "revision");
+  original.admissionBlock = {
+    code: "receipt_clear_refused_by_safety_limit",
+    blockedAt: Date.now(),
+    runnerCapability: "0".repeat(16),
+    attempts: 1,
+  };
+  try {
+    const result = await runReconcileReceipts({
+      config: setup.config,
+      journal,
+      catalog: {
+        listOriginals: () => [original],
+        listProcessings: () => [],
+      },
+      transport: {
+        async call() {
+          throw new Error("a dry run outside the archived phase asks nothing");
+        },
+      },
+      apply: false,
+    });
+    assert.equal(result.state, "refused");
+    assert.equal(result.code, "checkpoint_not_archived");
+    assert.equal(result.parkedOriginals, 1);
+    assert.deepEqual(result.parkedCodes, [
+      "receipt_clear_refused_by_safety_limit",
+    ]);
+    const text = formatReconcileResult(result);
+    assert.match(text, /parked=1/);
+    assert.match(text, /run --retry-parked --operator-clear/);
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a pass that meets a void backend parks all three documents and ends needing attention", async () => {
+  // The whole pass, not one document. Every original in flight is denied, so
+  // every one parks, nothing is cleared, and the pass does not report itself
+  // complete with the count buried in it.
+  const f = await voidBackendFixture(3);
+  try {
+    for (let index = 0; index < 3; index += 1) {
+      // Each document in turn, exactly as the pass walks them: park, move to
+      // the next, ask again.
+      f.runner.archivedRows = () => ({
+        original: f.originals[index],
+        processing: { ...f.processing, rowRevision: 1 },
+      });
+      f.runner.archiveCatalog.recordAdmissionBlock = async (args) => {
+        f.parked.push(args);
+        f.originals[index].admissionBlock = {
+          code: args.code,
+          blockedAt: args.now,
+          runnerCapability: args.runnerCapability,
+          attempts: 1,
+        };
+        f.originals[index].rowRevision += 1;
+        return f.originals[index];
+      };
+      await f.journal.transitionCheckpoint({
+        checkpoint: parseRunnerCheckpoint({
+          ...f.journal.checkpoint,
+          version: 1,
+          phase: "archived",
+          pdfIndex: index,
+          step: "lookup_original",
+          receiptChecked: true,
+          originalCatalogId: f.originals[index].originalCatalogId,
+          expectedOriginalRevision: 1,
+          processingCatalogId: f.processing.processingCatalogId,
+          expectedProcessingRevision: 1,
+          reservationRound: 0,
+          archivedPublished: 0,
+        }),
+        credentialSessionActive: true,
+      });
+      await f.runner.driveArchivedLookupOriginal();
+    }
+    assert.deepEqual(f.cleared, [], "not one receipt is retired");
+    assert.equal(f.parked.length, 3);
+    assert.deepEqual(new Set(f.parked.map((entry) => entry.code)), new Set([
+      "receipt_clear_refused_by_safety_limit",
+    ]));
+    assert.equal(f.journal.pending, undefined);
+
+    // The pass result an operator and a monitor read.
+    const summarized = f.runner.withParked({ state: "complete", scanned: 3 });
+    assert.equal(summarized.parked, 3);
+    assert.equal(summarized.parkedEscalated, 3);
+    assert.deepEqual(summarized.parkedCodes, [
+      "receipt_clear_refused_by_safety_limit",
+    ]);
+    // `cli.ts` sets a nonzero exit for any state but `complete`, so this is
+    // the exit status as well as the report.
+    assert.equal(summarized.state, "incomplete");
+    assert.equal(summarized.code, "items_need_attention");
+
+    // A document still inside its retry budget is counted and leaves the pass
+    // exactly as it was.
+    for (const original of f.originals)
+      original.admissionBlock = {
+        ...original.admissionBlock,
+        code: "catalog_conflict",
+      };
+    const retrying = f.runner.withParked({ state: "complete", scanned: 3 });
+    assert.equal(retrying.state, "complete");
+    assert.equal(retrying.code, undefined);
+    assert.equal(retrying.parked, 3);
+    assert.equal(retrying.parkedEscalated, 0);
+  } finally {
+    await f.journal.close();
+    await rm(f.setup.base, { recursive: true, force: true });
+  }
+});
+
+test("the operator route repairs a receipt the automatic route would not touch", async () => {
+  // The same catalog the automatic route parks: other receipts present, so it
+  // cannot tell the server from the document. An operator who has read the dry
+  // run has, so `--operator-clear` keeps only the conditions about the
+  // document itself.
+  const f = await voidBackendFixture(3);
+  f.runner.options = { retryParked: true, operatorClear: true };
+  try {
+    await f.runner.driveArchivedLookupOriginal();
+    assert.deepEqual(
+      f.cleared.map((entry) => `${entry.subject}:${entry.by}`),
+      ["parser_output:operator", "original_bytes:operator"],
+    );
+    assert.deepEqual(f.parked, []);
+    assert.equal(f.journal.checkpoint.step, "capture");
+  } finally {
+    await f.journal.close();
+    await rm(f.setup.base, { recursive: true, force: true });
+  }
+});
+
+test("the operator route still refuses what no route may repair", async () => {
+  for (const mutate of [
+    (f) => {
+      f.processing.activation = { state: "ready" };
+    },
+    (f) => {
+      f.processings.push({
+        processingCatalogId: randomUUID(),
+        originalCatalogId: f.originals[0].originalCatalogId,
+        rowRevision: 1,
+        activation: { state: "ready" },
+      });
+    },
+    (f) => {
+      f.processing.cloud = { sourceRevisionId: "some-other-revision" };
+    },
+  ]) {
+    const f = await voidBackendFixture(2);
+    f.runner.options = { retryParked: true, operatorClear: true };
+    mutate(f);
+    try {
+      await f.runner.driveArchivedLookupOriginal();
+      assert.deepEqual(f.cleared, []);
+      assert.deepEqual(
+        f.parked.map((entry) => entry.code),
+        ["original_receipt_unknown_to_server"],
+      );
+    } finally {
+      await f.journal.close();
+      await rm(f.setup.base, { recursive: true, force: true });
+    }
   }
 });
 
