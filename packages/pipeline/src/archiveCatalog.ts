@@ -31,6 +31,7 @@ import type {
   OriginalReuseIdentity,
   ProcessingCatalogIdentity,
   ProcessingCatalogRow,
+  ReceiptReconcileNote,
 } from "./archiveCatalogTypes.js";
 import {
   ArchiveBoundaryRelocationError,
@@ -821,6 +822,17 @@ function durableParserOutput(value: unknown): DurableParserOutput {
   };
 }
 
+function receiptReconcileNote(value: unknown): ReceiptReconcileNote {
+  const note = object(value);
+  exact(note, ["code", "clearedAt"]);
+  if (note.code !== "original_receipt_unknown_to_server")
+    fail("catalog_invalid");
+  return {
+    code: "original_receipt_unknown_to_server",
+    clearedAt: integer(note.clearedAt),
+  };
+}
+
 function originalRow(value: unknown): OriginalCatalogRow {
   const row = object(value);
   exact(
@@ -834,7 +846,7 @@ function originalRow(value: unknown): OriginalCatalogRow {
       "rowRevision",
       "updatedAt",
     ],
-    ["cloud", "providerOriginal"],
+    ["cloud", "providerOriginal", "receiptReconcile"],
   );
   const origin = object(row.origin);
   exact(origin, [
@@ -889,6 +901,8 @@ function originalRow(value: unknown): OriginalCatalogRow {
             providerBindingEpoch: integer(cloud.providerBindingEpoch),
           };
   }
+  if (row.receiptReconcile !== undefined)
+    result.receiptReconcile = receiptReconcileNote(row.receiptReconcile);
   return result;
 }
 
@@ -917,6 +931,7 @@ function processingRow(value: unknown): ProcessingCatalogRow {
       "cloud",
       "activation",
       "parseFailure",
+      "receiptReconcile",
     ],
   );
   const current = object(row.currentObservation);
@@ -1070,6 +1085,8 @@ function processingRow(value: unknown): ProcessingCatalogRow {
       failedAt: integer(parseFailure.failedAt),
     };
   }
+  if (row.receiptReconcile !== undefined)
+    result.receiptReconcile = receiptReconcileNote(row.receiptReconcile);
   return result;
 }
 
@@ -2605,6 +2622,43 @@ export class ArchiveCatalog {
         row.cloud = cloud;
       },
     )) as ProcessingCatalogRow;
+  }
+
+  /**
+   * P2-31d. Undoes, on one row, exactly what an admission wrote: the `cloud`
+   * record from `recordOriginalCloud`/`recordProcessingCloud` and the
+   * per-copy `cloudReceipt` each `recordCloudReceipt` left behind. A fresh
+   * admission writes a receipt only when the copy holds none and a `cloud`
+   * only when the row holds none, so leaving either would make the next
+   * admission fail `catalog_conflict` against the void ids.
+   *
+   * Everything that proves the bytes are archived stays: the prepared and
+   * published objects, the restic backup, the provider locator and its proof,
+   * the capture and the spool. Only the server-side receipt is void, and the
+   * note says so without naming the ids it replaces. The note is written once,
+   * so a repeat call is a no-op and does not bump the revision.
+   */
+  async clearVoidAdmission(args: {
+    subject: ArchiveSubject;
+    catalogId: string;
+    expectedRevision: number;
+    clearedAt: number;
+  }): Promise<OriginalCatalogRow | ProcessingCatalogRow> {
+    const note: ReceiptReconcileNote = {
+      code: "original_receipt_unknown_to_server",
+      clearedAt: integer(args.clearedAt),
+    };
+    return await this.updateRow(
+      args.subject,
+      args.catalogId,
+      args.expectedRevision,
+      (row) => {
+        delete row.cloud;
+        for (const role of ["primary", "independent_backup"] as const)
+          delete row.copies[role]?.cloudReceipt;
+        row.receiptReconcile ??= note;
+      },
+    );
   }
 
   async recordActivation(args: {

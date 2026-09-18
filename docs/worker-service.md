@@ -287,6 +287,72 @@ KITH_STORE_DATABASE_URL=postgres://... node packages/kith-store/dist/workers/cli
 Output is one JSON line per space carrying the space id, the eligible count and
 the reset count, and nothing else.
 
+## A local receipt the server does not hold
+
+A pass that fails `original_receipt_unknown_to_server` has met a contradiction:
+the local archive catalog records an admission for the original, and the
+authoritative server says it has never seen that revision. No pass may resolve
+it, because a receipt records that original bytes were accepted somewhere and
+dropping one on a server's silence would re-admit anything a temporary
+misrouting had touched. `reconcile-receipts` is the operator route.
+
+It is client only. It sends one `discovery.lookupArchivedAdmission`, the same
+read-only lookup the pass itself uses, which reserves nothing and spends no
+discovery attempt, and it changes nothing server side. A receipt the server
+does confirm is never touched.
+
+That lookup is addressed by the whole archived work identity, and only the
+checkpoint's scan plan carries it, so the command asks about the checkpoint's
+current original and no other row. It reports how many local originals hold a
+receipt so a wider problem is still visible in the counts.
+
+Stop the watcher first. The command takes the journal lock the way `run` does
+and refuses `journal_contended` while the watcher holds it.
+
+```sh
+launchctl bootout gui/$(id -u)/<watcher-label>
+pnpm exec turbo run build --filter=@repo/pipeline
+pnpm --silent brain:worker -- reconcile-receipts --config /absolute/path/to/pipeline.json --json
+pnpm --silent brain:worker -- reconcile-receipts --config /absolute/path/to/pipeline.json --apply --json
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<watcher-label>.plist
+```
+
+A dry run reports counts only, for example
+`{"state":"unknown_receipt_found","scope":"checkpoint_original","applied":false,"originalsWithReceipts":1,"receiptsChecked":1,"receiptsConfirmed":0,"receiptsUnknown":1}`.
+`--apply` answers `"state":"reconciled"` with `"applied":true`. A second run
+answers `"state":"clean"` with every count at zero, and a run with nothing to
+do answers the same.
+
+With `--apply` it clears, on the original row and its processing row, exactly
+what an admission wrote: each row's `cloud` record and every per-copy
+`cloudReceipt`. The archive copies, the restic backup, the provider locator and
+its proof, the capture and the spool all stay, because the bytes are archived
+and only the server-side receipt is void. It leaves a note on each row carrying
+a code and the time, and no ids. The journal checkpoint rewinds to the
+read-only lookup with the dead lease dropped, so the next pass takes the
+ordinary first-admission path: the original lookup, the processing lookup, one
+reserve and one admit.
+
+The failing pass usually leaves that original lookup unresolved in the journal,
+with the server's not-found answer already recorded. The throw happens inside
+the journaled transition, so the result is never committed, and every later
+pass replays it into the same throw; no `run` can drain it. The command expects
+this state. It uses the recorded answer rather than asking again, clears the
+catalog, and leaves the checkpoint alone, because that replay makes the same
+move by itself once the row holds no receipt. Any other unresolved request
+still refuses.
+
+A refusal writes nothing and names why: `journal_contended` (stop the watcher),
+`journal_request_pending` (an unresolved request that is not the lookup above;
+run one `run`), `checkpoint_not_archived`, `checkpoint_rows_missing`,
+`checkpoint_plan_missing`, `processing_receipt_conflict` (the processing
+receipt names a different revision), `processing_already_activated` (a
+generation is live server side under this admission, which is P2-31's work),
+`lookup_refused` (the server's own code is in `lookupCode`) or
+`lookup_invalid`. The two processing refusals apply to the dry run as well, so
+a count never hides what `--apply` would have met. Exit status is 1 on a
+refusal and 0 otherwise.
+
 ## Template validation
 
 The macOS plist and both shell wrappers are syntax-checked in this repository.

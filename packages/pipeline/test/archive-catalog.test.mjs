@@ -1549,3 +1549,83 @@ test("binds forget deletion targets and results to the exact epoch", async () =>
     await rm(f.directory, { recursive: true, force: true });
   }
 });
+
+test("clearing a void admission retires the receipt and leaves the archive alone", async () => {
+  const f = await setup();
+  try {
+    const row = await durableProviderOriginal(f.catalog, 20);
+    const admitted = await f.catalog.recordOriginalCloud({
+      catalogId: row.originalCatalogId,
+      expectedRevision: row.rowRevision,
+      cloud: {
+        sourceItemId: "source_item",
+        sourceRevisionId: "source_revision",
+        primaryReceiptId: row.copies.primary.cloudReceipt.receiptId,
+        providerReferenceId: "provider_reference",
+        providerBindingEpoch: 0,
+        admittedAt: 24,
+      },
+    });
+    const cleared = await f.catalog.clearVoidAdmission({
+      subject: "original_bytes",
+      catalogId: admitted.originalCatalogId,
+      expectedRevision: admitted.rowRevision,
+      clearedAt: 25,
+    });
+    assert.equal(cleared.cloud, undefined);
+    assert.equal(cleared.copies.primary.cloudReceipt, undefined);
+    assert.equal(cleared.rowRevision, admitted.rowRevision + 1);
+    assert.deepEqual(cleared.receiptReconcile, {
+      code: "original_receipt_unknown_to_server",
+      clearedAt: 25,
+    });
+    assert.deepEqual(
+      cleared.providerOriginal,
+      admitted.providerOriginal,
+      "the locator, its snapshot and the provider proof are untouched",
+    );
+    assert.deepEqual(
+      cleared.copies.primary.published,
+      admitted.copies.primary.published,
+      "the published object stays exactly where it is",
+    );
+    // The note is written once, so a repeat is free and bumps no revision.
+    assert.deepEqual(
+      await f.catalog.clearVoidAdmission({
+        subject: "original_bytes",
+        catalogId: cleared.originalCatalogId,
+        expectedRevision: cleared.rowRevision,
+        clearedAt: 99,
+      }),
+      cleared,
+    );
+    // A fresh admission now writes both fields again, which is the whole
+    // point of clearing them: neither write is conditional on the other.
+    let readmitted = await f.catalog.recordCloudReceipt({
+      subject: "original_bytes",
+      catalogId: cleared.originalCatalogId,
+      expectedRevision: cleared.rowRevision,
+      role: "primary",
+      receiptId: "receipt_primary_again",
+      requestDigest: hash("c"),
+      recordedAt: 26,
+    });
+    readmitted = await f.catalog.recordOriginalCloud({
+      catalogId: readmitted.originalCatalogId,
+      expectedRevision: readmitted.rowRevision,
+      cloud: {
+        sourceItemId: "source_item_again",
+        sourceRevisionId: "source_revision_again",
+        primaryReceiptId: "receipt_primary_again",
+        providerReferenceId: "provider_reference_again",
+        providerBindingEpoch: 0,
+        admittedAt: 27,
+      },
+    });
+    assert.equal(readmitted.cloud.sourceItemId, "source_item_again");
+    assert.deepEqual(readmitted.receiptReconcile, cleared.receiptReconcile);
+  } finally {
+    await f.journal.close();
+    await rm(f.directory, { recursive: true, force: true });
+  }
+});

@@ -86,6 +86,17 @@ export type ArchiveCopyRecord = ArchiveCopyIntent & {
     | "delete_failed";
 };
 
+/**
+ * P2-31d. Records that an operator cleared an admission receipt the
+ * authoritative server does not hold, so a row left looking never admitted can
+ * still be told apart from one that never was. It carries no ids: the receipt
+ * it replaces named a deployment that no longer serves this account.
+ */
+export type ReceiptReconcileNote = {
+  code: "original_receipt_unknown_to_server";
+  clearedAt: number;
+};
+
 export type OriginalCatalogIdentity = {
   originalCatalogId: string;
   sourceExternalId: string;
@@ -127,6 +138,7 @@ export type OriginalCatalogRow = Omit<OriginalCatalogIdentity, "copies"> & {
         providerBindingEpoch: number;
       }
   );
+  receiptReconcile?: ReceiptReconcileNote;
   updatedAt: number;
 };
 
@@ -250,6 +262,7 @@ export type ProcessingCatalogRow = Omit<ProcessingCatalogIdentity, "copies"> & {
     reused: boolean;
     previousGenerationId?: string;
   };
+  receiptReconcile?: ReceiptReconcileNote;
   updatedAt: number;
 };
 
