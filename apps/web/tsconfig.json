@@ -3,8 +3,7 @@
   "compilerOptions": {
     "baseUrl": ".",
     "paths": {
-      "@/*": ["./src/*"],
-      "@repo/db/*": ["../../packages/convex/*"]
+      "@/*": ["./src/*"]
     },
     "plugins": [{ "name": "next" }]
   },

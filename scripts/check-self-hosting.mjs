@@ -7,28 +7,18 @@ import { fileURLToPath } from "node:url";
 
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 const BASE64URL_32_BYTES = /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/;
-const KEY_ID = /^[A-Za-z0-9._~-]{1,128}$/;
-
-export const WEB_REQUIRED_VARIABLES = [
-  "NEXT_PUBLIC_CONVEX_URL",
-  "MCP_JWT_ISSUER",
-  "MCP_JWT_PRIVATE_JWK",
-  "MCP_JWT_PUBLIC_JWK",
-  "MCP_OAUTH_ENCRYPTION_KEY",
-];
 
 /**
- * i7a: `apps/web/src/lib/mcp/environment.ts`'s required set under
- * `KITH_POSTGRES_SURFACE=postgres` (`requiredMcpEnvironmentVariables`,
- * `ALWAYS_REQUIRED` plus `POSTGRES_ONLY_REQUIRED`). `NEXT_PUBLIC_CONVEX_URL`
- * stays required on this surface too: the 17 MCP tools still reach Convex
- * until i3 and i4's ported services are on the `postgres` branch of each one,
- * so a `postgres` deployment without it would authenticate and then fail at
- * the first tool call. It is removed from this list only in i7b, together
- * with the last Convex import.
+ * `apps/web/src/lib/mcp/environment.ts`'s `requiredMcpEnvironmentVariables`,
+ * kept here as a second, independent implementation because this script runs
+ * standalone against a plain `.env` file rather than importing application
+ * TypeScript.
+ *
+ * i7b dropped `NEXT_PUBLIC_CONVEX_URL` and the four `MCP_JWT_*` names with the
+ * last Convex import and the JWT bridge. There is one web surface now, so
+ * there is one list.
  */
-export const POSTGRES_WEB_REQUIRED_VARIABLES = [
-  "NEXT_PUBLIC_CONVEX_URL",
+export const WEB_REQUIRED_VARIABLES = [
   "MCP_OAUTH_ENCRYPTION_KEY",
   "MCP_PUBLIC_ORIGIN",
   "KITH_DATABASE_URL",
@@ -80,123 +70,36 @@ function isPostgresConnectionString(value) {
   }
 }
 
-function parseP256Jwk(value, privateKey) {
-  try {
-    const key = JSON.parse(value);
-    if (
-      !key ||
-      typeof key !== "object" ||
-      key.kty !== "EC" ||
-      key.crv !== "P-256" ||
-      typeof key.x !== "string" ||
-      !BASE64URL_32_BYTES.test(key.x) ||
-      typeof key.y !== "string" ||
-      !BASE64URL_32_BYTES.test(key.y) ||
-      (privateKey
-        ? typeof key.d !== "string" || !BASE64URL_32_BYTES.test(key.d)
-        : "d" in key)
-    ) {
-      return undefined;
-    }
-    return { x: key.x, y: key.y };
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * `--web`'s validation, aware of `KITH_POSTGRES_SURFACE`: the postgres list
- * under `postgres`, the existing (convex-era) list otherwise -- exactly as
- * `apps/web/src/lib/mcp/environment.ts`'s `requiredMcpEnvironmentVariables`
- * picks its required set, kept here as a second, independent implementation
- * because this script runs standalone against a plain `.env` file rather than
- * importing application TypeScript.
- */
+/** `--web`'s validation. Issues carry variable names and never their values. */
 export function validateWebEnvironment(environment) {
-  const onPostgres = environment.KITH_POSTGRES_SURFACE === "postgres";
   const issues = [];
-  const required = onPostgres
-    ? POSTGRES_WEB_REQUIRED_VARIABLES
-    : WEB_REQUIRED_VARIABLES;
-  for (const name of required) {
+  for (const name of WEB_REQUIRED_VARIABLES) {
     if (!environment[name]) issues.push({ name, problem: "missing" });
   }
 
   if (
-    environment.NEXT_PUBLIC_CONVEX_URL &&
-    !isAllowedOrigin(environment.NEXT_PUBLIC_CONVEX_URL)
-  ) {
-    issues.push({ name: "NEXT_PUBLIC_CONVEX_URL", problem: "invalid" });
-  }
-  // Present is validated on both surfaces, matching the JWK branches below --
-  // a malformed value left over from a `convex` deployment is worth flagging
-  // even though `postgres` does not read it once `MCP_PUBLIC_ORIGIN` is set.
-  // Required only under `convex` (it is not in `POSTGRES_WEB_REQUIRED_VARIABLES`).
-  if (
-    environment.MCP_JWT_ISSUER &&
-    !isAllowedOrigin(environment.MCP_JWT_ISSUER)
-  ) {
-    issues.push({ name: "MCP_JWT_ISSUER", problem: "invalid" });
-  }
-  if (
-    onPostgres &&
     environment.MCP_PUBLIC_ORIGIN &&
     !isAllowedOrigin(environment.MCP_PUBLIC_ORIGIN)
   ) {
     issues.push({ name: "MCP_PUBLIC_ORIGIN", problem: "invalid" });
   }
   if (
-    onPostgres &&
     environment.KITH_DATABASE_URL &&
     !isPostgresConnectionString(environment.KITH_DATABASE_URL)
   ) {
     issues.push({ name: "KITH_DATABASE_URL", problem: "invalid" });
   }
   if (
-    onPostgres &&
     environment.KITH_SESSION_SECRET &&
     environment.KITH_SESSION_SECRET.length < MIN_KITH_SESSION_SECRET_LENGTH
   ) {
     issues.push({ name: "KITH_SESSION_SECRET", problem: "invalid" });
   }
-
-  // Present is validated in both modes -- a malformed key today is still a
-  // malformed key if the surface flag is flipped back -- but required only
-  // under `convex`, matching `environment.ts`'s own `CONVEX_ONLY_REQUIRED`.
-  const privateJwk = environment.MCP_JWT_PRIVATE_JWK
-    ? parseP256Jwk(environment.MCP_JWT_PRIVATE_JWK, true)
-    : undefined;
-  if (environment.MCP_JWT_PRIVATE_JWK && !privateJwk) {
-    issues.push({ name: "MCP_JWT_PRIVATE_JWK", problem: "invalid" });
-  }
-
-  const publicJwk = environment.MCP_JWT_PUBLIC_JWK
-    ? parseP256Jwk(environment.MCP_JWT_PUBLIC_JWK, false)
-    : undefined;
-  if (environment.MCP_JWT_PUBLIC_JWK && !publicJwk) {
-    issues.push({ name: "MCP_JWT_PUBLIC_JWK", problem: "invalid" });
-  }
-
-  if (
-    privateJwk &&
-    publicJwk &&
-    (privateJwk.x !== publicJwk.x || privateJwk.y !== publicJwk.y)
-  ) {
-    issues.push({ name: "MCP_JWT_PRIVATE_JWK", problem: "invalid" });
-    issues.push({ name: "MCP_JWT_PUBLIC_JWK", problem: "invalid" });
-  }
-
   if (
     environment.MCP_OAUTH_ENCRYPTION_KEY &&
     !BASE64URL_32_BYTES.test(environment.MCP_OAUTH_ENCRYPTION_KEY)
   ) {
     issues.push({ name: "MCP_OAUTH_ENCRYPTION_KEY", problem: "invalid" });
-  }
-  if (
-    environment.MCP_JWT_KEY_ID !== undefined &&
-    !KEY_ID.test(environment.MCP_JWT_KEY_ID)
-  ) {
-    issues.push({ name: "MCP_JWT_KEY_ID", problem: "invalid" });
   }
 
   if (

@@ -1,40 +1,31 @@
-// The worker protocol endpoint, on either surface.
+// The worker protocol endpoint.
 //
 // Row i4 of the web and MCP surface plan. The route keeps every step it had --
 // authenticate, require JSON, read a bounded body, parse the request against
 // the protocol, dispatch, map a protocol refusal to its published status -- and
-// changes only which dispatcher runs. Under `convex` it is
-// `models.workers.mcp.dispatch`; under `postgres` it is
-// `workers.dispatchWorkerRequest` from `@repo/kith-store`, which P2-39d wrote
-// and which switches on the same `operation` over the same parsed request.
+// i7b left it with one dispatcher, `workers.dispatchWorkerRequest` from
+// `@repo/kith-store`, which P2-39d wrote and which switches on the same
+// `operation` over the same parsed request the Convex one did.
 //
-// Wire parity is a property of three things being shared rather than of this
-// file being careful:
+// Wire parity with what it replaced is a property of two things being shared
+// rather than of this file being careful:
 //
-//   * One parser. `parseWorkerRequest` is imported from `@repo/worker-protocol`
-//     directly as of i7a; `@repo/db/convex/models/workers/protocol` was always
-//     a pure re-export of it, kept for the Convex-side call sites that still
-//     import it by that name, and the store imports the same package, so a
-//     body that parses on one surface parses on the other and a body that
-//     does not is a 400 on both.
-//   * One error code set. `workerProtocolErrorCode` on the store side and
-//     `parseWorkerProtocolErrorData` on the Convex side both yield a
-//     `WorkerProtocolErrorCode`, and `backendWorkerError` is the single table
+//   * One parser. `parseWorkerRequest` comes from `@repo/worker-protocol`, the
+//     package the Convex protocol module was always a pure re-export of, and
+//     the store imports the same package.
+//   * One error code set. `workerProtocolErrorCode` yields a
+//     `WorkerProtocolErrorCode`, and `workerErrorForCode` is the single table
 //     from that code to a status and a message.
-//   * One result shape. Both dispatchers return `WorkerResult`, which this
-//     route serializes unchanged.
 //
 // The store also ships `handlePostgresWorkerRequest`, a complete web-standard
 // adapter. It is not used here: it authenticates the bearer itself, which would
 // mean two authentications per request on this route and a second spelling of
-// the credential check that the surface flag does not reach. The route
-// authenticates once through `authenticateApiKey` and calls the dispatcher the
-// adapter calls, so there is one authentication and one authority.
+// the credential check. The route authenticates once through
+// `authenticateApiKey` and calls the dispatcher the adapter calls, so there is
+// one authentication and one authority.
 
-import { api } from "@repo/db/convex/_generated/api";
 import { workers } from "@repo/kith-store";
 import { parseWorkerRequest } from "@repo/worker-protocol/request";
-import { ConvexHttpClient } from "convex/browser";
 
 import {
   hasJsonContentType,
@@ -42,10 +33,8 @@ import {
   readBoundedJson,
 } from "@/lib/ingest/http";
 import { kithPool } from "@/lib/kith/pool";
-import { kithPostgresSurface } from "@/lib/kith/surface";
 import { authenticateApiKey, type McpIdentity } from "@/lib/mcp/auth";
-import { createConvexMcpToken } from "@/lib/mcp/convex-auth";
-import { backendWorkerError, workerErrorForCode } from "@/lib/worker/http";
+import { workerErrorForCode } from "@/lib/worker/http";
 
 export const dynamic = "force-dynamic";
 
@@ -69,11 +58,10 @@ function errorResponse(error: IngestHttpError): Response {
 /**
  * The store's refusal, as the protocol's published status.
  *
- * `workerProtocolErrorCode` is the store's classifier over the same closed code
- * set `parseWorkerProtocolErrorData` reads off a `ConvexError`, so both
- * surfaces land on the same row of `backendWorkerError`'s table. An
- * unclassified failure is a defect and gets the same 500 the Convex leg gives
- * one.
+ * `workerProtocolErrorCode` is the store's classifier over the protocol's closed
+ * code set, and `workerErrorForCode` is the one table from a code to a status
+ * and a message. An unclassified failure is a defect and gets a 500: this must
+ * not invent a friendlier status for one.
  */
 function postgresWorkerError(error: unknown): IngestHttpError {
   const code = workers.workerProtocolErrorCode(error);
@@ -84,7 +72,6 @@ function postgresWorkerError(error: unknown): IngestHttpError {
 }
 
 export async function POST(req: Request): Promise<Response> {
-  const surface = kithPostgresSurface();
 
   let identity: McpIdentity | null;
   try {
@@ -124,44 +111,18 @@ export async function POST(req: Request): Promise<Response> {
     );
   }
 
-  if (surface === "postgres") {
-    try {
-      // The dispatcher opens its own `SERIALIZABLE` transaction per request and
-      // revalidates the command and the credential's current source-specific
-      // access inside it. The principal reference carries no authority of its
-      // own: it is the two identifiers `authenticateApiKey` returned.
-      const result = await workers.dispatchWorkerRequest(
-        kithPool(),
-        { userId: identity.userId, credentialId: identity.keyId },
-        request,
-      );
-      return Response.json(result, { status: 200, headers: RESPONSE_HEADERS });
-    } catch (error) {
-      return errorResponse(postgresWorkerError(error));
-    }
-  }
-
-  const convexUrl = process.env.NEXT_PUBLIC_CONVEX_URL;
-  if (!convexUrl) {
-    return errorResponse(
-      new IngestHttpError(
-        503,
-        "worker_unavailable",
-        "Worker service is unavailable",
-      ),
-    );
-  }
-
   try {
-    const convex = new ConvexHttpClient(convexUrl);
-    convex.setAuth(await createConvexMcpToken(identity));
-    // The backend revalidates the command and current source-specific access.
-    // A request can never select an arbitrary Convex function or principal.
-    const result = await convex.action(api.models.workers.mcp.dispatch, {
+    // The dispatcher opens its own `SERIALIZABLE` transaction per request and
+    // revalidates the command and the credential's current source-specific
+    // access inside it. The principal reference carries no authority of its
+    // own: it is the two identifiers `authenticateApiKey` returned.
+    const result = await workers.dispatchWorkerRequest(
+      kithPool(),
+      { userId: identity.userId, credentialId: identity.keyId },
       request,
-    });
+    );
     return Response.json(result, { status: 200, headers: RESPONSE_HEADERS });
   } catch (error) {
-    return errorResponse(backendWorkerError(error));
+    return errorResponse(postgresWorkerError(error));
   }
 }

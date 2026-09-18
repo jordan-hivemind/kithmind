@@ -1,18 +1,19 @@
-// `InlineIngestErrorCode` and `inlineIngestErrorCode` are i7a's repoint: the
-// store's own `ingestion` module classifies the exact same closed code set
-// from the same thrown messages (`packages/kith-store/src/ingestion/errors.ts`),
-// and every message it matches is one the PostgreSQL lane can actually throw.
-// `parseInlineIngestErrorData` stays on `@repo/db`: it parses a `ConvexError`'s
-// `data` envelope, which only the Convex lane ever throws, and nothing on the
-// PostgreSQL side has a reason to model that shape. No kith-store equivalent
-// exists or should; it is listed for i7b, which removes the Convex lane this
-// still serves.
-import { parseInlineIngestErrorData } from "@repo/db/convex/models/ingestion/inlineErrors";
+// The `/api/ingest` transport: the bounded body, the request schema and the
+// published status table.
+//
+// `InlineIngestErrorCode` is i7a's repoint. The store's own `ingestion` module
+// classifies the contract's closed code set from the messages the PostgreSQL
+// lane throws (`packages/kith-store/src/ingestion/errors.ts`), and the route
+// maps that code through `structuredBackendIngestError` below.
+//
+// i7b deleted `backendIngestError`, which parsed a `ConvexError`'s `data`
+// envelope and then fell back to substring matching on the message. Only the
+// Convex lane threw that envelope, and only the Convex lane reached the
+// fallback.
 import { ingestion } from "@repo/kith-store";
 import { z } from "zod";
 
 type InlineIngestErrorCode = ingestion.InlineIngestErrorCode;
-const inlineIngestErrorCode = ingestion.inlineIngestErrorCode;
 
 export const MAX_INGEST_JSON_BYTES = 512 * 1024;
 export const MAX_INGEST_TEXT_BYTES = 64 * 1024;
@@ -235,68 +236,6 @@ export function parseIngestRequest(input: unknown): IngestRequest {
     );
   }
   return parsed.data;
-}
-
-export function backendIngestError(error: unknown): IngestHttpError {
-  const structured = parseInlineIngestErrorData(
-    typeof error === "object" && error !== null && "data" in error
-      ? error.data
-      : undefined,
-  );
-  if (structured) return structuredBackendIngestError(structured.code);
-
-  const legacyCode = inlineIngestErrorCode(error);
-  if (legacyCode) return structuredBackendIngestError(legacyCode);
-
-  const message = error instanceof Error ? error.message : "";
-  if (message.includes("Not authenticated")) {
-    return new IngestHttpError(401, "unauthorized", "Not authenticated");
-  }
-  if (message.includes("Source account not found")) {
-    return new IngestHttpError(403, "forbidden", "Source account not found");
-  }
-  if (message.includes("Space not found")) {
-    return new IngestHttpError(403, "forbidden", "Space not found");
-  }
-  if (
-    /default (?:destination|ingest space).*(?:unavailable|not available|not found)/i.test(
-      message,
-    )
-  ) {
-    return new IngestHttpError(
-      403,
-      "forbidden",
-      "Default ingest space is not available",
-    );
-  }
-  if (message.includes("requestId conflicts with a different request")) {
-    return new IngestHttpError(
-      409,
-      "conflict",
-      "requestId conflicts with a different request",
-    );
-  }
-  if (message.includes("Desired processing epoch conflict")) {
-    return new IngestHttpError(
-      409,
-      "conflict",
-      "Desired processing epoch conflict",
-    );
-  }
-  if (message.includes("Source item is forgetting")) {
-    return new IngestHttpError(409, "conflict", "Source item is forgetting");
-  }
-  if (message.includes("Source item is forgotten")) {
-    return new IngestHttpError(409, "conflict", "Source item is forgotten");
-  }
-  if (message.includes("Ingest rate limit exceeded")) {
-    return new IngestHttpError(
-      429,
-      "rate_limited",
-      "Ingest rate limit exceeded",
-    );
-  }
-  return new IngestHttpError(500, "ingest_failed", "Ingestion failed");
 }
 
 /**

@@ -44,11 +44,8 @@ tracked file. Use the provider dashboards or an interactive CLI prompt.
 
 | Variable                              | Location          | Purpose                                                               |
 | ------------------------------------- | ----------------- | --------------------------------------------------------------------- |
-| `NEXT_PUBLIC_CONVEX_URL`              | Vercel/Next.js    | Public Convex client origin; intentionally browser-visible            |
-| `MCP_JWT_ISSUER`                      | Vercel and Convex | Stable HTTPS origin of the Next.js gateway; values must match exactly |
-| `MCP_JWT_PRIVATE_JWK`                 | Vercel only       | Signs 60-second Convex identity tokens; secret                        |
-| `MCP_JWT_PUBLIC_JWK`                  | Vercel only       | Published through the MCP JWKS endpoint                               |
-| `MCP_JWT_KEY_ID`                      | Vercel only       | Optional signing-key identifier; runtime defaults to `mcp-1`          |
+| `MCP_PUBLIC_ORIGIN`                   | Vercel only       | Stable HTTPS origin of the Next.js gateway, no path or trailing slash |
+| `MCP_JWT_ISSUER`                      | Convex only       | Convex Auth's own issuer; the web app stopped reading it in i7b       |
 | `MCP_OAUTH_ENCRYPTION_KEY`            | Vercel only       | Encrypts OAuth registrations and authorization codes; secret          |
 | `MCP_TOOL_PROFILE`                    | Vercel only       | `full` by default; `memory` is an optional narrower runtime profile   |
 | `FINANCE_ARCHIVE_READER_DATABASE_URL` | Vercel only       | Optional; the financial archive as its read-only reader role; secret  |
@@ -88,16 +85,12 @@ pnpm --filter @repo/db exec convex env --prod set OPENAI_API_KEY
 pnpm --filter @repo/db exec convex env --prod set ANTHROPIC_API_KEY
 ```
 
-## The PostgreSQL surface (`KITH_POSTGRES_SURFACE`)
+## The web deployment's variables
 
-Everything above this section describes the Convex-era deployment, which is
-still what a fresh self-host and `main`'s production traffic run. The rest of
-this section documents the PostgreSQL surface i7a adds behind
-`KITH_POSTGRES_SURFACE=postgres`: it exists in the tree, is exercised by
-tests and by preview deployments, and is dark in production until row m of
-the web and MCP surface plan flips the flag. Convex is not removed by this
-row; `packages/convex` and the variables above stay required. i7b, after the
-flip, is what removes them.
+Row m flipped production to the PostgreSQL surface and i7b removed Convex from
+`apps/web` entirely, so there is one surface and one list. `packages/convex`
+is still in the tree and its own variables above are still set until the
+Convex deployment is torn down; nothing in the web app reads it.
 
 The list below is derived from `apps/web/src/lib/mcp/environment.ts`
 (`requiredMcpEnvironmentVariables`, `validateMcpEnvironment`) and from every
@@ -107,13 +100,12 @@ guessed. "Set where" is `Vercel` (the web deployment's environment), `Daemon`
 
 | Variable                              | Read by                                                                                                                                        | Set where | Required                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `KITH_POSTGRES_SURFACE`               | `lib/kith/surface.ts`, `lib/mcp/environment.ts`                                                                                                | Vercel    | Optional; `postgres` selects this surface, anything else (including unset) reads as `convex`                                                                                                                                                                                                                                                                                                                                                                 |
-| `KITH_DATABASE_URL`                   | `lib/kith/pool.ts`                                                                                                                             | Vercel    | Required under `postgres`. The app role's connection string, not the migration role's -- `createKithPool` pins two connections and `search_path`, and the app role only has the grants `packages/kith-store/src/index.ts`'s `grantProofAppRole` names. `docs/plans/2026-09-16-cutover-runbook.md` says how that role is provisioned: `.github/workflows/cutover.yml` creates or updates it from the `app_role` input and the `KITH_APP_ROLE_PASSWORD` secret |
-| `KITH_SESSION_SECRET`                 | `lib/kith/session.ts`                                                                                                                          | Vercel    | Required under `postgres`; at least 32 characters, no default -- a missing one is a loud 500, never a silently shared signing key                                                                                                                                                                                                                                                                                                                            |
-| `MCP_PUBLIC_ORIGIN`                   | `lib/mcp/environment.ts` (`getMcpPublicOrigin`)                                                                                                | Vercel    | Required under `postgres`. Under `convex`, `MCP_JWT_ISSUER` is still accepted as a deprecated fallback name for the same value; see "Kept from the Convex era" below                                                                                                                                                                                                                                                                                         |
-| `MCP_OAUTH_ENCRYPTION_KEY`            | `lib/mcp/oauth.ts`                                                                                                                             | Vercel    | Required on both surfaces; unchanged from the Convex era                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `MCP_TOOL_PROFILE`                    | `lib/mcp/tool-policy.ts`                                                                                                                       | Vercel    | Optional on both surfaces; `full` by default, `memory` narrows the runtime tool set                                                                                                                                                                                                                                                                                                                                                                          |
-| `FINANCE_ARCHIVE_READER_DATABASE_URL` | `lib/mcp/finance.ts`                                                                                                                           | Vercel    | Optional on both surfaces; the financial archive as its reader role, unchanged from the Convex era                                                                                                                                                                                                                                                                                                                                                           |
+| `KITH_DATABASE_URL`                   | `lib/kith/pool.ts`                                                                                                                             | Vercel    | Required. The app role's connection string, not the migration role's -- `createKithPool` pins two connections and `search_path`, and the app role only has the grants `packages/kith-store/src/index.ts`'s `grantProofAppRole` names. `docs/plans/2026-09-16-cutover-runbook.md` says how that role is provisioned: `.github/workflows/cutover.yml` creates or updates it from the `app_role` input and the `KITH_APP_ROLE_PASSWORD` secret |
+| `KITH_SESSION_SECRET`                 | `lib/kith/session.ts`                                                                                                                          | Vercel    | Required; at least 32 characters, no default -- a missing one is a loud 500, never a silently shared signing key                                                                                                                                                                                                                                                                                                                            |
+| `MCP_PUBLIC_ORIGIN`                   | `lib/mcp/environment.ts` (`getMcpPublicOrigin`)                                                                                                | Vercel    | Required. The origin this gateway is published at, used by the `WWW-Authenticate` resource metadata URL, the OAuth metadata documents and the resource identifier                                                                                                                                                                                                                                                                                            |
+| `MCP_OAUTH_ENCRYPTION_KEY`            | `lib/mcp/oauth.ts`                                                                                                                             | Vercel    | Required; unchanged from the Convex era                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `MCP_TOOL_PROFILE`                    | `lib/mcp/tool-policy.ts`                                                                                                                       | Vercel    | Optional; `full` by default, `memory` narrows the runtime tool set                                                                                                                                                                                                                                                                                                                                                                                           |
+| `FINANCE_ARCHIVE_READER_DATABASE_URL` | `lib/mcp/finance.ts`                                                                                                                           | Vercel    | Optional; the financial archive as its reader role, unchanged from the Convex era                                                                                                                                                                                                                                                                                                                                                                            |
 | `FINANCE_ARCHIVE_SPACE_ID`            | `lib/mcp/finance.ts`                                                                                                                           | Vercel    | Optional; required together with the URL above                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `FINANCE_ARCHIVE_CURSOR_SECRET`       | `lib/mcp/finance.ts`                                                                                                                           | Vercel    | Optional; required together with the URL above -- at least 32 bytes, signs the archive's paging continuations                                                                                                                                                                                                                                                                                                                                                |
 | `BRAIN_EMBED_API_KEY`                 | `packages/kith-store/src/embeddings/provider.ts` (`loadEmbeddingConfig`), reached through `lib/mcp/embedder.ts`'s shared seam                  | Both      | Optional; takes precedence over `OPENAI_API_KEY` when set; on the daemon host it is what `embedding_fill` jobs use                                                                                                                                                                                                                                                                                                                                           |
@@ -140,47 +132,28 @@ complete index also never reaches the embedder, by design, not as a
 degradation.
 
 `ANTHROPIC_API_KEY` on this row is the _web_ deployment's key, distinct from
-the Convex-era row of the same name earlier in this document: under
-`convex`, narrative capture's admission gate runs on the Convex deployment
-and reads its own `ANTHROPIC_API_KEY` there; under `postgres`, the same gate
-(`lib/kith/capture.ts`'s `captureThoughtFromWeb`, shared by the MCP
-`capture_thought` tool and the dashboard's Quick Capture button) runs on the
-web deployment and reads this one instead. Optional in the sense the
-self-hosting doc already uses for the Convex-era key: the gate fails closed
-without it, so a `capture_thought` call or a Quick Capture submission returns
-`needs_confirmation` ("Memory was not stored because the admission check was
-unavailable") and stores nothing, rather than storing unclassified. Provider-
-free inline capture and keyword search remain unaffected. Setting the key
-only on the Convex deployment while running `KITH_POSTGRES_SURFACE=postgres`
-does not enable narrative capture on this surface; it has to be set on
-Vercel as well.
+the Convex deployment's row of the same name earlier in this document.
+Narrative capture's admission gate (`lib/kith/capture.ts`'s
+`captureThoughtFromWeb`, shared by the MCP `capture_thought` tool and the
+dashboard's Quick Capture button) runs on the web deployment and reads this
+one. Optional in the sense this document already uses for the Convex key: the
+gate fails closed without it, so a `capture_thought` call or a Quick Capture
+submission returns `needs_confirmation` ("Memory was not stored because the
+admission check was unavailable") and stores nothing, rather than storing
+unclassified. Provider-free inline capture and keyword search remain
+unaffected. Setting the key only on the Convex deployment does not enable
+narrative capture; it has to be set on Vercel.
 
-### Kept from the Convex era, still required
+### Removed by i7b
 
-`NEXT_PUBLIC_CONVEX_URL` (Vercel) stays required under both surfaces. i2 moves
-MCP authentication off Convex, but the 17 MCP tools stay on it until i3 and
-i4's ported services are reached from `postgres`'s branch of each tool, and a
-`postgres` deployment that dropped this variable today would authenticate and
-then fail at the first tool call. `MCP_JWT_ISSUER` on the _Convex_ deployment
-(set with `convex env set MCP_JWT_ISSUER`, read by `auth.config.ts`,
-`lib/mcpAuth.ts` and `lib/webAuth.ts`) stays required regardless of which
-surface the web deployment reads, because those three files must still agree
-on one issuer until i7b deletes the JWT bridge entirely. Only the _web_
-deployment's spelling renamed, to `MCP_PUBLIC_ORIGIN`.
-
-### Read only under `convex`
-
-`MCP_JWT_PRIVATE_JWK`, `MCP_JWT_PUBLIC_JWK` and `MCP_JWT_KEY_ID` (Vercel) are
-required under `convex` and validated for shape whenever present under
-`postgres`, but nothing on the `postgres` branch of any route reads them:
-`lib/mcp/convex-auth.ts`, the only place that mints a token from them, is
-reached only from each dual-surface route's `convex` branch.
-`MCP_JWT_ISSUER` on the _web_ deployment is the deprecated spelling of
-`MCP_PUBLIC_ORIGIN`; it is still accepted there under `convex` and reported by
-`validateMcpEnvironment` as `deprecated` (not `missing` or `invalid`) so a
-working deployment is not told it is broken, but nothing reads it at all
-under `postgres`, so a `postgres` deployment that never had it set is told
-nothing about it either.
+`NEXT_PUBLIC_CONVEX_URL`, `MCP_JWT_PRIVATE_JWK`, `MCP_JWT_PUBLIC_JWK` and
+`MCP_JWT_KEY_ID` are gone from the web deployment with the last Convex import
+and the JWT bridge that minted identity tokens from them. `MCP_JWT_ISSUER` on
+the _web_ deployment is gone too; `MCP_PUBLIC_ORIGIN` is the name for that
+value. Setting any of the five changes nothing and the preflight no longer
+reports them, in either direction. `MCP_JWT_ISSUER` on the _Convex_
+deployment is a different variable and stays until that deployment is torn
+down.
 
 ### The daemon host: `kith-deferred-work`
 
@@ -241,11 +214,9 @@ existing auth provider configuration:
 pnpm --filter @repo/db exec auth --web-server-url http://localhost:3000
 ```
 
-Copy `apps/web/.env.example` to the ignored `apps/web/.env.local`, set the
-development `NEXT_PUBLIC_CONVEX_URL`, and run `pnpm dev`. The web application
-works locally with the development Convex deployment. A cloud Convex
-deployment cannot fetch a localhost MCP issuer or JWKS endpoint, so complete
-MCP/OAuth acceptance requires a reachable HTTPS web deployment.
+Copy `apps/web/.env.example` to the ignored `apps/web/.env.local`, fill in the
+development values, and run `pnpm dev`. `MCP_PUBLIC_ORIGIN` may be
+`http://localhost:3000` locally; anywhere else it has to be HTTPS.
 
 Never fill in or commit the example file.
 
@@ -275,8 +246,9 @@ pnpm --filter @repo/db exec convex env --prod set MCP_JWT_ISSUER
 ```
 
 Enter the final stable Vercel origin for `MCP_JWT_ISSUER`, for example
-`https://your-project.vercel.app`, with no path or trailing slash. The Convex
-and Vercel values must be identical. Do not deploy until the Convex names pass
+`https://your-project.vercel.app`, with no path or trailing slash. This is the
+Convex deployment's own variable; the web deployment spells the same origin
+`MCP_PUBLIC_ORIGIN`. Do not deploy until the Convex names pass
 the production preflight and any optional provider variables needed by enabled
 features are set. Deploying Convex is a production action;
 perform it only after reviewing the target project:
@@ -295,11 +267,9 @@ identify the web app's build output. Use a stable production domain before
 setting the issuer. Configure all of these for Production; use separate Preview
 values if preview deployments need a working OAuth flow:
 
-- `NEXT_PUBLIC_CONVEX_URL`
-- `MCP_JWT_ISSUER`
-- `MCP_JWT_PRIVATE_JWK`
-- `MCP_JWT_PUBLIC_JWK`
-- `MCP_JWT_KEY_ID` (optional; defaults to `mcp-1`)
+- `MCP_PUBLIC_ORIGIN`
+- `KITH_DATABASE_URL`
+- `KITH_SESSION_SECRET`
 - `MCP_OAUTH_ENCRYPTION_KEY`
 - `MCP_TOOL_PROFILE` (optional; defaults to `full`)
 - `FINANCE_ARCHIVE_READER_DATABASE_URL` (optional; see below)
@@ -313,23 +283,21 @@ missing the provider stays off and a finance query is refused explicitly rather
 than answered empty. The connection string is a secret and never enters the
 repository.
 
-Generate the signing pair and OAuth encryption key once on a trusted local
-machine. Prefer writing them directly to the ignored local environment file so
-the secret values do not pass through terminal history or logs:
+Generate the OAuth encryption key and the session secret once on a trusted
+local machine, 32 random bytes each, and paste them straight into the Vercel
+dashboard rather than through terminal history or logs:
 
 ```sh
-pnpm generate:mcp-jwks -- --env-file apps/web/.env.local
+node -e "console.log(require('node:crypto').randomBytes(32).toString('base64url'))"
 ```
 
-The command refuses to replace configured values; clear a value explicitly if
-you intentionally need to rotate it. Running without `--env-file` prints the
-values for manual setup, so do not save or paste that output into the
-repository or a conversation. Only `NEXT_PUBLIC_CONVEX_URL` may be exposed
-through a `NEXT_PUBLIC_` variable.
+No `NEXT_PUBLIC_` variable is needed by this deployment, and nothing here may
+be exposed through one.
 
-Do not rotate the signing or encryption values as routine maintenance for this
-personal deployment. Rotating the OAuth encryption key invalidates existing
-client registrations and requires each MCP client to reconnect.
+Do not rotate these values as routine maintenance for this personal
+deployment. Rotating the OAuth encryption key invalidates existing client
+registrations and requires each MCP client to reconnect. Rotating
+`KITH_SESSION_SECRET` signs every browser session out.
 
 ## 4. Run the safe preflight
 
@@ -495,8 +463,7 @@ when its build artifacts were created with Preview-scoped variables.
 | Symptom                                      | Check                                                                                                                    |
 | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
 | Health endpoint returns 503                  | Fix only the variable names listed in `issues`                                                                           |
-| OAuth metadata has the wrong host            | Make `MCP_JWT_ISSUER` the final stable HTTPS origin and redeploy Vercel                                                  |
-| Convex rejects MCP identity tokens           | Match `MCP_JWT_ISSUER` in both systems, then redeploy Convex                                                             |
+| OAuth metadata has the wrong host            | Make `MCP_PUBLIC_ORIGIN` the final stable HTTPS origin and redeploy Vercel                                               |
 | AI-assisted capture or semantic search fails | Confirm provider variables and embedding configuration; provider-free inline capture and keyword search remain available |
 | Core capture or gateway calls fail           | Confirm Convex Auth/JWKS settings, MCP issuer, API-key capability, and current space membership                          |
 | Account creation fails after saving a user   | Confirm `SITE_URL`, `JWT_PRIVATE_KEY`, and `JWKS` exist on the production Convex deployment                              |

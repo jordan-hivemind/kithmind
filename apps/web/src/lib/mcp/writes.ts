@@ -1,11 +1,11 @@
-// The write and ingest half of the MCP tool surface, once per backend.
+// The write and ingest half of the MCP tool surface.
 //
-// Slice i4 of the web and MCP surface plan moves `remember_fact`,
-// `capture_thought` and `ingest_url` onto `@repo/kith-store` under
-// `KITH_POSTGRES_SURFACE=postgres`. It is `reads.ts`'s shape for the other
-// direction: one method per tool, returning exactly what the Convex function
-// returned, so `server.ts` keeps its schemas, its descriptions, its error
-// mapping and its formatters and changes only which implementation it calls.
+// Slice i4 of the web and MCP surface plan moved `remember_fact`,
+// `capture_thought` and `ingest_url` onto `@repo/kith-store`, and i7b deleted
+// the Convex implementation. It is `reads.ts`'s shape for the other direction:
+// one method per tool, returning exactly what the Convex function returned, so
+// `server.ts` keeps its schemas, its descriptions, its error mapping and its
+// formatters.
 //
 // Four rules from the plan are enforced here rather than in the tools:
 //
@@ -60,8 +60,6 @@
 // cost one transaction. The pipeline lives in `lib/kith/capture.ts`, because the
 // web Quick Capture button runs the same one.
 
-import { api } from "@repo/db/convex/_generated/api";
-import type { Id } from "@repo/db/convex/_generated/dataModel";
 import { ingestion, memory } from "@repo/kith-store";
 import { resolveWriteSpace } from "@repo/kith-store/identity";
 
@@ -73,7 +71,6 @@ import {
 } from "@/lib/kith/capture";
 
 import type { WithMcpPrincipal } from "./principal";
-import type { ConvexGateway } from "./reads";
 
 export type {
   CaptureThoughtArgs,
@@ -138,37 +135,6 @@ export type McpWrites = {
   captureThought(args: CaptureThoughtArgs): Promise<CaptureThoughtResult>;
   ingestUrl(args: IngestUrlArgs): Promise<unknown>;
 };
-
-// ---------------------------------------------------------------------------
-// The Convex surface
-// ---------------------------------------------------------------------------
-
-export function convexWrites(convex: ConvexGateway): McpWrites {
-  return {
-    async rememberFact({ spaceId, ...args }) {
-      return await convex.mutation(api.models.facts.mcpActions.remember, {
-        ...args,
-        spaceId: spaceId as Id<"spaces"> | undefined,
-      });
-    },
-    async captureThought({ spaceId, ...args }) {
-      return await convex.action(api.models.thoughts.mcpActions.capture, {
-        ...args,
-        spaceId: spaceId as Id<"spaces"> | undefined,
-      });
-    },
-    async ingestUrl({ spaceId, ...input }) {
-      return await convex.mutation(api.models.ingestion.urlQueue.enqueue, {
-        input: {
-          ...input,
-          ...(spaceId === undefined
-            ? {}
-            : { spaceId: spaceId as Id<"spaces"> }),
-        },
-      });
-    },
-  };
-}
 
 // ---------------------------------------------------------------------------
 // The PostgreSQL surface

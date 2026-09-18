@@ -18,7 +18,6 @@
 // fail-closed behavior.
 
 import { KithQuickCapture } from "@/components/kith-quick-capture";
-import { ThoughtCard } from "@/features/thoughts/components/ThoughtCard";
 import { useStatusPoll } from "@/lib/kith/use-status-poll";
 
 type DashboardStats = {
@@ -44,6 +43,101 @@ type DashboardData = {
   stats: DashboardStats;
   recent: readonly DashboardThought[];
 };
+
+const typeColors: Record<string, string> = {
+  decision: "#e3f2fd",
+  person_note: "#f3e5f5",
+  idea: "#fff3e0",
+  meeting_note: "#e8f5e9",
+  task: "#fce4ec",
+  reference: "#f5f5f5",
+};
+
+// `features/thoughts/components/ThoughtCard.tsx` unchanged except for the row
+// shape, which is the store's rather than a Convex document's. It had no
+// Convex import and only this one caller, so i7b moved it here instead of
+// keeping a directory for it.
+function ThoughtCard({ thought }: { thought: DashboardThought }) {
+  const date = new Date(thought.createdAt).toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+
+  return (
+    <div
+      style={{
+        border: "1px solid #e0e0e0",
+        borderRadius: 8,
+        padding: 16,
+        backgroundColor: "#fff",
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          gap: 8,
+          marginBottom: 8,
+          alignItems: "center",
+          flexWrap: "wrap",
+        }}
+      >
+        <span
+          style={{
+            padding: "2px 8px",
+            borderRadius: 4,
+            fontSize: 12,
+            backgroundColor:
+              typeColors[thought.metadata.type] ?? typeColors.reference,
+          }}
+        >
+          {thought.metadata.type.replace("_", " ")}
+        </span>
+        {thought.metadata.topics.map((topic) => (
+          <span
+            key={topic}
+            style={{
+              padding: "2px 8px",
+              borderRadius: 4,
+              fontSize: 12,
+              backgroundColor: "#e8eaf6",
+            }}
+          >
+            {topic}
+          </span>
+        ))}
+        {thought.metadata.people.map((person) => (
+          <span
+            key={person}
+            style={{
+              padding: "2px 8px",
+              borderRadius: 4,
+              fontSize: 12,
+              backgroundColor: "#fce4ec",
+            }}
+          >
+            @{person}
+          </span>
+        ))}
+        <span style={{ marginLeft: "auto", fontSize: 12, color: "#999" }}>
+          {date}
+        </span>
+      </div>
+      <p style={{ margin: 0, lineHeight: 1.5 }}>{thought.content}</p>
+      {thought.metadata.actionItems.length > 0 && (
+        <ul style={{ margin: "8px 0 0", paddingLeft: 20, color: "#666" }}>
+          {thought.metadata.actionItems.map((item) => (
+            <li key={item} style={{ fontSize: 14 }}>
+              {item}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
 
 export function KithDashboard({ stats, recent }: DashboardData) {
   const { value: data, possiblyStale } = useStatusPoll<DashboardData>(
@@ -126,21 +220,7 @@ export function KithDashboard({ stats, recent }: DashboardData) {
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
           {data.recent.map((thought) => (
-            <ThoughtCard
-              key={thought.id}
-              thought={{
-                _id: thought.id,
-                _creationTime: thought.createdAt,
-                content: thought.content,
-                metadata: {
-                  type: thought.metadata.type,
-                  topics: [...thought.metadata.topics],
-                  people: [...thought.metadata.people],
-                  actionItems: [...thought.metadata.actionItems],
-                  summary: thought.metadata.summary,
-                },
-              }}
-            />
+            <ThoughtCard key={thought.id} thought={thought} />
           ))}
         </div>
       )}

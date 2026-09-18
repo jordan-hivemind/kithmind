@@ -1,16 +1,47 @@
-import {
-  convexAuthNextjsMiddleware,
-  createRouteMatcher,
-  nextjsMiddlewareRedirect,
-} from "@convex-dev/auth/nextjs/server";
 import { type NextRequest, NextResponse } from "next/server";
 
 import {
   readKithSessionCookie,
   verifyKithSessionCookie,
 } from "@/lib/kith/cookie";
-import { kithPostgresSurface } from "@/lib/kith/surface";
 import { shouldRewriteMcpRootRequest } from "@/lib/mcp/root-alias";
+
+/**
+ * The route matcher, in place of `@convex-dev/auth`'s, which i7b removed.
+ *
+ * It answers the same for every pattern this file uses. A pattern ending in
+ * `(.*)` is a prefix and anything else is that exact path, with an optional
+ * trailing slash and case-insensitively, which is what `path-to-regexp` did for
+ * these eight patterns. Widening it would make a gated route public, so the
+ * shapes it accepts are deliberately only the ones below.
+ */
+function createRouteMatcher(patterns: readonly string[]) {
+  const prefixes = patterns
+    .filter((pattern) => pattern.endsWith("(.*)"))
+    .map((pattern) => pattern.slice(0, -"(.*)".length).toLowerCase());
+  const exact = new Set(
+    patterns
+      .filter((pattern) => !pattern.endsWith("(.*)"))
+      .flatMap((pattern) => [
+        pattern.toLowerCase(),
+        `${pattern.toLowerCase()}/`,
+      ]),
+  );
+  return (request: NextRequest) => {
+    const pathname = request.nextUrl.pathname.toLowerCase();
+    return (
+      exact.has(pathname) || prefixes.some((prefix) => pathname.startsWith(prefix))
+    );
+  };
+}
+
+/** `nextjsMiddlewareRedirect`, which took the path and dropped the query. */
+function redirectTo(request: NextRequest, pathname: string) {
+  const url = request.nextUrl.clone();
+  url.pathname = pathname;
+  url.search = "";
+  return NextResponse.redirect(url);
+}
 
 const isSignInPage = createRouteMatcher(["/sign-in", "/sign-up"]);
 export const isPublicRoute = createRouteMatcher([
@@ -27,17 +58,11 @@ export const isPublicRoute = createRouteMatcher([
   "/mcp/authorize",
 ]);
 
-type MiddlewareAuth = {
-  isAuthenticated(): Promise<boolean>;
-};
-
 /**
  * The middleware's own view of who is asking.
  *
- * Under `KITH_POSTGRES_SURFACE=convex` this is `convexAuth.isAuthenticated()`
- * and nothing changes. Under `postgres` it is the session cookie's MAC, checked
- * with no database behind it, because Next.js middleware runs on the edge
- * runtime and `pg` does not.
+ * The session cookie's MAC, checked with no database behind it, because Next.js
+ * middleware runs on the edge runtime and `pg` does not.
  *
  * A valid MAC over an unknown, expired or revoked token passes here and is
  * refused by the page or route, which does call `requireWebPrincipal` inside its
@@ -48,12 +73,8 @@ type MiddlewareAuth = {
  */
 async function isAuthenticated(
   request: NextRequest,
-  convexAuth: MiddlewareAuth,
   env: Readonly<Record<string, string | undefined>>,
 ): Promise<boolean> {
-  if (kithPostgresSurface(env) !== "postgres") {
-    return await convexAuth.isAuthenticated();
-  }
   const secret = env.KITH_SESSION_SECRET;
   // No secret means no cookie can be verified, so nothing is authenticated.
   // Failing closed here is the only safe direction: the alternative is a
@@ -69,12 +90,10 @@ async function isAuthenticated(
 export async function handleMiddlewareRequest(
   request: NextRequest,
   {
-    convexAuth,
     env = process.env,
   }: {
-    convexAuth: MiddlewareAuth;
     env?: Readonly<Record<string, string | undefined>>;
-  },
+  } = {},
 ) {
   if (
     shouldRewriteMcpRootRequest(
@@ -89,16 +108,10 @@ export async function handleMiddlewareRequest(
     return NextResponse.rewrite(target);
   }
 
-  if (
-    isSignInPage(request) &&
-    (await isAuthenticated(request, convexAuth, env))
-  ) {
-    return nextjsMiddlewareRedirect(request, "/");
+  if (isSignInPage(request) && (await isAuthenticated(request, env))) {
+    return redirectTo(request, "/");
   }
-  if (
-    !isPublicRoute(request) &&
-    !(await isAuthenticated(request, convexAuth, env))
-  ) {
+  if (!isPublicRoute(request) && !(await isAuthenticated(request, env))) {
     // An API path (today only the non-public `/api/kith/*` routes) answers
     // JSON, never a redirect. The second-model review of P2-39i5 found that a
     // redirect here means `fetch` follows it to `/sign-in`'s 200 HTML, which a
@@ -112,11 +125,13 @@ export async function handleMiddlewareRequest(
         { status: 401, headers: { "Cache-Control": "no-store" } },
       );
     }
-    return nextjsMiddlewareRedirect(request, "/sign-in");
+    return redirectTo(request, "/sign-in");
   }
 }
 
-export default convexAuthNextjsMiddleware(handleMiddlewareRequest);
+export default function middleware(request: NextRequest) {
+  return handleMiddlewareRequest(request);
+}
 
 export const config = {
   matcher: ["/((?!.*\\..*|_next).*)"],

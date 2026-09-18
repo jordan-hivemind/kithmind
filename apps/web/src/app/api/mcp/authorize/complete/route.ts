@@ -14,16 +14,12 @@
 //     route's own transaction rather than on the strength of the middleware, and
 //     resolving it in a separate transaction would let a sign-out that commits
 //     between the two produce a grant for a session that no longer exists.
-//   * Begin and finalize stay two transactions, as they are two mutations under
-//     `convex`, with `abandonAuthorizationGrant` as the compensation. One
+//   * Begin and finalize stay two transactions, as they were two mutations on
+//     Convex, with `abandonAuthorizationGrant` as the compensation. One
 //     transaction would be simpler and would make the compensation unnecessary,
-//     but the point of a dark deploy is that the two surfaces can be compared:
-//     a `preparing` key that survives a failed finalize is observable state, and
-//     it must appear in both modes or in neither.
+//     but a `preparing` key that survives a failed finalize is observable state
+//     the port was compared against, so it was kept rather than designed away.
 
-import { convexAuthNextjsToken } from "@convex-dev/auth/nextjs/server";
-import { api } from "@repo/db/convex/_generated/api";
-import type { Id } from "@repo/db/convex/_generated/dataModel";
 import { withKithTransaction } from "@repo/kith-store";
 import {
   abandonAuthorizationGrant,
@@ -37,11 +33,9 @@ import {
   type Principal,
   requireWebPrincipal,
 } from "@repo/kith-store/identity";
-import { ConvexHttpClient } from "convex/browser";
 
 import { kithPool } from "@/lib/kith/pool";
 import { kithSessionConfig } from "@/lib/kith/session";
-import { kithPostgresSurface } from "@/lib/kith/surface";
 import { getMcpResourceUri, isMcpResourceUri } from "@/lib/mcp/environment";
 import {
   assertOAuthEncryptionConfigured,
@@ -65,12 +59,11 @@ function errorResponse(message: string, status: number) {
 }
 
 /**
- * The typed code on a failure, from either backend.
+ * The typed code on a failure.
  *
- * A `ConvexError` carries `{ data: { code } }` and an `IdentityError` carries the
- * same payload under the same name, which is why the port kept the shape. One
- * reader serves both, so the response mapping below cannot drift between the two
- * surfaces.
+ * `IdentityError` carries `{ data: { code } }`, the payload a `ConvexError`
+ * carried under the same name, which is why the port kept the shape. The
+ * structural branch below is kept for any other carrier of that same payload.
  */
 function typedErrorCode(error: unknown): string | undefined {
   if (error instanceof IdentityError) return error.data?.code;
@@ -84,7 +77,7 @@ function typedErrorCode(error: unknown): string | undefined {
 }
 
 function oauthMutationErrorResponse(error: unknown): Response | undefined {
-  // The bare "Not authenticated" both surfaces throw for a session that is gone,
+  // The bare "Not authenticated" the store throws for a session that is gone,
   // which carries no typed code by design.
   if (error instanceof IdentityError && error.data === undefined) {
     return error.message === "Not authenticated"
@@ -100,8 +93,7 @@ function oauthMutationErrorResponse(error: unknown): Response | undefined {
       return errorResponse("Selected access is no longer available", 403);
     // The typed read denial `getAuthorizedReadSpaceIds` raises for a space the
     // session cannot read. `beginAuthorizationGrant` rethrows it unchanged
-    // (both backends: `error.data !== undefined` on the PostgreSQL side,
-    // `error instanceof ConvexError` on the Convex one), so it reaches here
+    // (`error.data !== undefined`), so it reaches here
     // as a typed code rather than falling into `authorization_revoked`, which
     // is reserved for a scope that was granted and then lost. Same status as
     // that case and the same rule: the body names no space id, so a caller
@@ -121,7 +113,7 @@ function oauthMutationErrorResponse(error: unknown): Response | undefined {
   }
 }
 
-/** What the two surfaces agree to return from consent. */
+/** What consent returns. */
 type Grant =
   | {
       status: "issued";
@@ -166,11 +158,11 @@ type AbandonArgs = {
 };
 
 /**
- * The three grant calls for one surface.
+ * The three grant calls.
  *
- * The seam is here rather than three `if`s in the handler so that the order of
- * the calls, the compensation and every response code are written once and are
- * identical in both modes.
+ * Kept as a named seam rather than inlined: the order of the calls, the
+ * compensation and every response code are written once, in the handler, and
+ * the transactions they run in are written once here.
  */
 type GrantBackend = {
   begin(consent: ConsentRequest): Promise<Grant>;
@@ -212,46 +204,6 @@ function postgresGrantBackend(cookieHeader: string | null): GrantBackend {
           principal: await principal(ctx),
         });
       }),
-  };
-}
-
-/** The Convex surface, unchanged. i7 deletes it. */
-async function convexGrantBackend(): Promise<GrantBackend | Response> {
-  const token = await convexAuthNextjsToken();
-  if (!token) return errorResponse("Not authenticated", 401);
-
-  const convexUrl = process.env.NEXT_PUBLIC_CONVEX_URL;
-  if (!convexUrl) {
-    return errorResponse("Authorization service is not configured", 500);
-  }
-  const convex = new ConvexHttpClient(convexUrl);
-  convex.setAuth(token);
-
-  return {
-    begin: async (consent) =>
-      (await convex.mutation(api.models.oauth.web.beginAuthorizationGrant, {
-        clientId: consent.clientId,
-        redirectUri: consent.redirectUri,
-        resource: consent.resource,
-        codeChallenge: consent.codeChallenge,
-        scope: consent.scope,
-        ...(consent.state === undefined ? {} : { state: consent.state }),
-        name: consent.name,
-        capabilities: consent.capabilities as ("read" | "write" | "ingest")[],
-        spaceIds: consent.spaceIds as Id<"spaces">[],
-      })) as Grant,
-    finalize: async (args) => {
-      await convex.mutation(api.models.oauth.web.finalizeAuthorizationGrant, {
-        ...args,
-        keyId: args.keyId as Id<"apiKeys">,
-      });
-    },
-    abandon: async (args) => {
-      await convex.mutation(api.models.oauth.web.abandonAuthorizationGrant, {
-        ...args,
-        keyId: args.keyId as Id<"apiKeys">,
-      });
-    },
   };
 }
 
@@ -297,13 +249,7 @@ export async function POST(req: Request) {
 
   let backend: GrantBackend;
   try {
-    if (kithPostgresSurface() === "postgres") {
-      backend = postgresGrantBackend(req.headers.get("cookie"));
-    } else {
-      const resolved = await convexGrantBackend();
-      if (resolved instanceof Response) return resolved;
-      backend = resolved;
-    }
+    backend = postgresGrantBackend(req.headers.get("cookie"));
   } catch {
     return errorResponse("Authorization service is not configured", 500);
   }

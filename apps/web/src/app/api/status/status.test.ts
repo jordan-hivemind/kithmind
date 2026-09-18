@@ -188,10 +188,6 @@ describeWithDatabase("the /api/status/* routes", () => {
     restorePool = setKithPool(recordingPool(pool));
     restoreNow = setKithNow(FIXED_NOW);
     process.env.KITH_SESSION_SECRET = secret;
-    // These routes only exist under the postgres surface (`guardedRequest`'s
-    // 404 gate); most of this file exercises that mode, and the one test
-    // that checks the convex-mode gate restores this value itself.
-    process.env.KITH_POSTGRES_SURFACE = "postgres";
 
     routes = {
       worker: (await import("./worker/route")).GET,
@@ -204,7 +200,6 @@ describeWithDatabase("the /api/status/* routes", () => {
     restorePool?.();
     await pool?.end().catch(() => {});
     delete process.env.KITH_SESSION_SECRET;
-    delete process.env.KITH_POSTGRES_SURFACE;
     await onAdmin((admin) =>
       admin.query(`DROP DATABASE IF EXISTS ${databaseName} WITH (FORCE)`),
     ).catch(() => {});
@@ -245,19 +240,6 @@ describeWithDatabase("the /api/status/* routes", () => {
     });
     const response = await routes.worker(request);
     expect(response.status).toBe(415);
-  });
-
-  test("worker status: answers a fixed 404 under the convex surface", async () => {
-    const owner = await signedInUser();
-    process.env.KITH_POSTGRES_SURFACE = "convex";
-    try {
-      const response = await routes.worker(
-        withCookie(`${ORIGIN}/api/status/worker?sourceAccountId=x`, owner.cookie),
-      );
-      expect(response.status).toBe(404);
-    } finally {
-      process.env.KITH_POSTGRES_SURFACE = "postgres";
-    }
   });
 
   test("worker status: current inside the window, overdue past it, from one fixed clock", async () => {
@@ -387,19 +369,6 @@ describeWithDatabase("the /api/status/* routes", () => {
       headers: { cookie: owner.cookie, origin: ORIGIN },
     });
     expect((await routes.dashboard(noContentType)).status).toBe(415);
-  });
-
-  test("dashboard status: answers a fixed 404 under the convex surface", async () => {
-    const owner = await signedInUser();
-    process.env.KITH_POSTGRES_SURFACE = "convex";
-    try {
-      const response = await routes.dashboard(
-        withCookie(`${ORIGIN}/api/status/dashboard`, owner.cookie),
-      );
-      expect(response.status).toBe(404);
-    } finally {
-      process.env.KITH_POSTGRES_SURFACE = "postgres";
-    }
   });
 
   test("dashboard status: answers the caller's own stats, one read-only transaction, no-store", async () => {

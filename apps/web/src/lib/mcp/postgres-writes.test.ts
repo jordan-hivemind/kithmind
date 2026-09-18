@@ -29,7 +29,7 @@
 //     admission's rows rather than admitting again.
 //   * Wire parity. `/api/worker` answers the worker protocol's own synthetic
 //     fixtures with the same status and the same body as the store's own
-//     adapter, and its error table is the one the Convex leg uses.
+//     adapter, and the two share one error table.
 //
 // The suite skips cleanly when `KITH_STORE_DATABASE_URL` is not set.
 
@@ -37,7 +37,6 @@ import { createHash, randomBytes } from "node:crypto";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import type { WorkerProtocolErrorCode } from "@repo/db/convex/models/workers/protocol";
 import {
   applyKithSchema,
   createKithPool,
@@ -53,6 +52,7 @@ import {
   identityCtx,
   signUp,
 } from "@repo/kith-store/identity";
+import type { WorkerProtocolErrorCode } from "@repo/worker-protocol/request";
 import pg from "pg";
 import {
   afterAll,
@@ -66,22 +66,9 @@ import {
 } from "vitest";
 
 import { setKithPool } from "@/lib/kith/pool";
-import { backendWorkerError, workerErrorForCode } from "@/lib/worker/http";
+import { workerErrorForCode } from "@/lib/worker/http";
 
-const convexMocks = vi.hoisted(() => ({
-  query: vi.fn(),
-  action: vi.fn(),
-  mutation: vi.fn(),
-}));
 vi.mock("server-only", () => ({}));
-vi.mock("convex/browser", () => ({
-  ConvexHttpClient: class {
-    query = convexMocks.query;
-    action = convexMocks.action;
-    mutation = convexMocks.mutation;
-    setAuth() {}
-  },
-}));
 
 import { POST as ingestRoute } from "../../app/api/ingest/route";
 import { POST as workerRoute } from "../../app/api/worker/route";
@@ -627,8 +614,6 @@ describeWithDatabase("MCP write and ingest tools on PostgreSQL", () => {
   }, 60_000);
 
   beforeEach(() => {
-    vi.stubEnv("KITH_POSTGRES_SURFACE", "postgres");
-    vi.stubEnv("NEXT_PUBLIC_CONVEX_URL", "https://synthetic.convex.cloud");
     vi.resetAllMocks();
     transactionLog = [];
     // Nothing in this suite may reach a provider. The classifier is stated per
@@ -1055,13 +1040,12 @@ describeWithDatabase("MCP write and ingest tools on PostgreSQL", () => {
   // capture_thought's admission gate
   // -------------------------------------------------------------------------
 
-  test("capture_thought advertises the same contract on both surfaces", async () => {
-    // The i4 follow-up made the hint and the description differ under
-    // `postgres`, because that lane stored a duplicate and skipped nothing
-    // sensitive. The admission gate is ported, so both claims are true again
-    // and both surfaces say the same thing. Checked where a client reads them
-    // rather than at the constant.
-    const listed = async (credential: McpServerCredential | string) => {
+  test("capture_thought advertises the deduplicating contract it honors", async () => {
+    // The i4 follow-up made the hint and the description untrue of the
+    // PostgreSQL lane, which stored a duplicate and skipped nothing sensitive.
+    // The admission gate is ported, so both claims hold again. Checked where a
+    // client reads them rather than at the constant.
+    const listed = async (credential: McpServerCredential) => {
       const server = createMcpServer(credential, "user-test:key-test", null);
       const client = new Client({ name: "postgres-writes", version: "1" });
       const [clientTransport, serverTransport] =
@@ -1079,12 +1063,9 @@ describeWithDatabase("MCP write and ingest tools on PostgreSQL", () => {
       }
     };
 
-    const onPostgres = await listed(credentialFor(fixture.keyWrite.id));
-    const onConvex = await listed("synthetic-convex-token");
-    expect(onPostgres.annotations?.idempotentHint).toBe(true);
-    expect(onConvex.annotations?.idempotentHint).toBe(true);
-    expect(onPostgres.description).toBe(onConvex.description);
-    expect(onPostgres.description).toContain(
+    const advertised = await listed(credentialFor(fixture.keyWrite.id));
+    expect(advertised.annotations?.idempotentHint).toBe(true);
+    expect(advertised.description).toContain(
       "The server deduplicates and preserves changed or corrected prior information as linked history.",
     );
   });
@@ -1313,8 +1294,8 @@ describeWithDatabase("MCP write and ingest tools on PostgreSQL", () => {
     expect(text(declined)).not.toContain("Citation:");
     expect(await thoughtsIn(fixture.spaceA)).toBe(before);
 
-    // A classifier that throws is the same answer. Convex's `analyzeThought`
-    // catches and returns null; nothing about the failure reaches the client.
+    // A classifier that throws is the same answer: it is caught and read as
+    // null, and nothing about the failure reaches the client.
     setClassifier(async () => {
       throw new Error("provider said: synthetic-key is invalid");
     });
@@ -1716,9 +1697,6 @@ describeWithDatabase("MCP write and ingest tools on PostgreSQL", () => {
       [firstBody.sourceItemId],
     );
     expect(rows.rows[0]!.n).toBe(1);
-
-    // Convex was not asked anything.
-    expect(convexMocks.action).not.toHaveBeenCalled();
   });
 
   test("/api/ingest refuses a credential without ingest, naming no space id", async () => {
@@ -1845,17 +1823,13 @@ describeWithDatabase("MCP write and ingest tools on PostgreSQL", () => {
     expect(malformed.route.status).toBe(malformed.adapter.status);
     expect(malformed.route.body).toEqual(malformed.adapter.body);
     expect(malformed.route.status).toBe(400);
-
-    expect(convexMocks.action).not.toHaveBeenCalled();
   });
 
   test("the web route's error table matches the store adapter's, code for code", async () => {
-    // There really are two tables, and this compares them. `backendWorkerError`
-    // now delegates to `workerErrorForCode`, so checking one against the other
-    // would compare a function with itself; the second table is
-    // `packages/kith-store/src/workers/http.ts`'s `WORKER_ERRORS`, which is what
-    // `handlePostgresWorkerRequest` answers from. If the store adds a code or
-    // changes a status, a worker would get one answer from the adapter and
+    // There really are two tables, and this compares them. The second is
+    // `packages/kith-store/src/workers/http.ts`'s `WORKER_ERRORS`, which is
+    // what `handlePostgresWorkerRequest` answers from. If the store adds a code
+    // or changes a status, a worker would get one answer from the adapter and
     // another from this route, and this is where that shows up.
     const codes = Object.keys(
       workers.WORKER_ERRORS,
@@ -1870,15 +1844,16 @@ describeWithDatabase("MCP write and ingest tools on PostgreSQL", () => {
         code,
         message,
       ]);
-      // And the Convex classifier's output reaches the same row, so a refusal
-      // that arrives as `ConvexError` data lands where the store's own does.
-      const fromConvex = backendWorkerError({
-        data: { type: "worker_protocol_error", code },
-      });
+      // And the store's own classifier reaches the same row, so a refusal the
+      // dispatcher raises lands where the adapter's does.
       expect(
-        [fromConvex.status, fromConvex.code, fromConvex.message],
+        workers.workerProtocolErrorCode(
+          Object.assign(new Error("private detail"), {
+            data: { type: "worker_protocol_error", code },
+          }),
+        ),
         code,
-      ).toEqual([status, code, message]);
+      ).toBe(code);
     }
   });
 

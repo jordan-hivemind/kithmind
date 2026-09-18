@@ -14,7 +14,6 @@
     "check:self-hosting": "node scripts/check-self-hosting.mjs --web",
     "check:self-hosting:convex": "node scripts/check-self-hosting.mjs --convex --prod",
     "test:self-hosting": "node --test scripts/check-self-hosting.test.mjs",
-    "generate:mcp-jwks": "node scripts/generate-mcp-jwks.mjs",
     "demo:brain": "node scripts/demo-brain.mjs",
     "brain:worker": "pnpm --filter @repo/pipeline pipeline",
     "brain:doctor": "node scripts/check-self-hosting.mjs --worker",

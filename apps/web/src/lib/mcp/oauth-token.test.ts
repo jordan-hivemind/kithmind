@@ -1,18 +1,30 @@
+// The token endpoint's own decisions, with the exchange stubbed.
+//
+// i7b deleted the purpose-scoped JWT the route used to mint, so what it asserts
+// is the pair that replaced it: `requireOAuthExchangeIdentity` and
+// `activateAuthorizationGrant` both run, on the same hashes, and neither runs
+// before PKCE has been verified. The full flow against a real database is
+// `oauth-postgres.test.ts`.
+
 import crypto from "node:crypto";
 
-import { api } from "@repo/db/convex/_generated/api";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
-const mocks = vi.hoisted(() => ({ mutation: vi.fn(), sign: vi.fn() }));
+const mocks = vi.hoisted(() => ({ requireExchange: vi.fn(), activate: vi.fn() }));
 vi.mock("server-only", () => ({}));
-vi.mock("convex/browser", () => ({
-  ConvexHttpClient: class {
-    mutation = mocks.mutation;
-    setAuth() {}
-  },
+vi.mock("@/lib/kith/pool", () => ({ kithPool: () => ({}) }));
+vi.mock("@repo/kith-store", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@repo/kith-store")>()),
+  withKithTransaction: async (
+    _pool: unknown,
+    work: (client: unknown) => Promise<unknown>,
+  ) => await work({}),
 }));
-vi.mock("./convex-auth", () => ({
-  createConvexMcpToken: mocks.sign,
+vi.mock("@repo/kith-store/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@repo/kith-store/identity")>()),
+  identityCtx: () => ({}),
+  requireOAuthExchangeIdentity: mocks.requireExchange,
+  activateAuthorizationGrant: mocks.activate,
 }));
 
 import { POST } from "../../app/api/mcp/token/route";
@@ -62,36 +74,34 @@ function request(code: string, codeVerifier = verifier) {
 describe("OAuth token exchange", () => {
   beforeEach(() => {
     vi.resetAllMocks();
-    vi.stubEnv("MCP_JWT_ISSUER", "https://brain.example.test");
+    vi.stubEnv("MCP_PUBLIC_ORIGIN", "https://brain.example.test");
     vi.stubEnv(
       "MCP_OAUTH_ENCRYPTION_KEY",
       Buffer.alloc(32, 9).toString("base64url"),
     );
-    vi.stubEnv("NEXT_PUBLIC_CONVEX_URL", "https://example.convex.cloud");
-    mocks.sign.mockResolvedValue("exchange-jwt");
-    mocks.mutation.mockResolvedValue({ status: "activated" });
+    mocks.requireExchange.mockResolvedValue(undefined);
+    mocks.activate.mockResolvedValue({ status: "activated" });
   });
   afterEach(() => vi.unstubAllEnvs());
 
-  test("uses a purpose-scoped exchange JWT and activates before returning the key", async () => {
+  test("proves the exchange identity and activates before returning the key", async () => {
     const code = makeCode();
     const codeHash = hashAuthorizationCode(code);
     const bindingHash = hashOAuthBinding("c".repeat(64), codeHash);
     const response = await POST(request(code));
     expect(response.status).toBe(200);
-    expect(mocks.sign).toHaveBeenCalledWith(
-      { userId: "user-id", keyId: "key-id" },
-      {
-        keyHash: hashAuthorizationCode(`ob_${"a".repeat(64)}`),
-        codeHash,
-        bindingHash,
-        requestHash: "b".repeat(64),
-      },
-    );
-    expect(mocks.mutation).toHaveBeenCalledWith(
-      api.models.oauth.mcpMutations.activateAuthorizationGrant,
-      expect.objectContaining({ codeHash, bindingHash }),
-    );
+    const exchange = {
+      apiKeyId: "key-id",
+      userId: "user-id",
+      codeHash,
+      keyHash: hashAuthorizationCode(`ob_${"a".repeat(64)}`),
+      bindingHash,
+      requestHash: "b".repeat(64),
+      expiresAt: expect.any(Number),
+    };
+    expect(mocks.requireExchange.mock.calls[0]?.[1]).toEqual(exchange);
+    // The same hashes, on the same client, in the same transaction.
+    expect(mocks.activate.mock.calls[0]?.[1]).toEqual(exchange);
     expect(await response.json()).toMatchObject({
       access_token: `ob_${"a".repeat(64)}`,
       token_type: "Bearer",
@@ -99,16 +109,16 @@ describe("OAuth token exchange", () => {
   });
 
   test("never returns token success for a consumed-code replay", async () => {
-    mocks.mutation.mockResolvedValue({ status: "replayed" });
+    mocks.activate.mockResolvedValue({ status: "replayed" });
     const response = await POST(request(makeCode()));
     expect(response.status).toBe(400);
     expect(await response.json()).toMatchObject({ error: "invalid_grant" });
   });
 
-  test("rejects invalid PKCE before signing or mutating", async () => {
+  test("rejects invalid PKCE before proving or activating anything", async () => {
     const response = await POST(request(makeCode(), "x".repeat(43)));
     expect(response.status).toBe(400);
-    expect(mocks.sign).not.toHaveBeenCalled();
-    expect(mocks.mutation).not.toHaveBeenCalled();
+    expect(mocks.requireExchange).not.toHaveBeenCalled();
+    expect(mocks.activate).not.toHaveBeenCalled();
   });
 });

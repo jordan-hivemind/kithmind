@@ -1,10 +1,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { parseSpaceReadErrorData } from "@repo/db/convex/lib/spaceReadErrors";
 import {
   FINANCE_READ_TOOL_DESCRIPTION,
   FinanceContractError,
 } from "@repo/finance-contract";
-import { ConvexHttpClient } from "convex/browser";
+import { IdentityError } from "@repo/kith-store/identity";
 import { z } from "zod";
 
 import {
@@ -24,7 +23,6 @@ import {
 import type { WithMcpPrincipal } from "./principal";
 import {
   type BrowseThought,
-  convexReads,
   type FactResult,
   type FullThought,
   type McpReads,
@@ -32,12 +30,7 @@ import {
   type TimelineRow,
 } from "./reads";
 import { recordQuerySchema } from "./record-query";
-import {
-  convexWrites,
-  type FactValueArg,
-  type McpWrites,
-  postgresWrites,
-} from "./writes";
+import { type FactValueArg, type McpWrites, postgresWrites } from "./writes";
 
 export const SERVER_INSTRUCTIONS = `Kith Mind stores family knowledge as structured facts, narrative thoughts, and indexed source documents with retained evidence.
 
@@ -105,26 +98,28 @@ const writeSpaceSchema = spaceIdSchema
   .describe(
     "Explicit destination from list_spaces. If omitted, use the configured default or Personal. Joining a shared space never changes this default.",
   );
-function errorData(error: unknown): unknown {
-  return typeof error === "object" && error !== null && "data" in error
-    ? error.data
-    : undefined;
-}
-
-const SPACE_READ_ERROR_MESSAGES = {
-  space_not_found: "Space not found",
-} as const;
-
+/**
+ * The one typed read denial a tool turns into an `isError` result.
+ *
+ * i7b replaced `@repo/db`'s `parseSpaceReadErrorData` with the store's own
+ * carrier. It is the same payload by construction: `spaceReadNotFound` in
+ * `@repo/kith-store/identity`'s `errors.ts` throws an `IdentityError` whose
+ * `data.code` is `space_not_found`, which is what the Convex `ConvexError`
+ * carried. Anything else is a defect rather than an authorization answer and is
+ * rethrown, so a bug cannot arrive at a client as "Space not found".
+ *
+ * The text is the literal the store throws, restated here rather than read off
+ * the error, so a message that changed upstream cannot change what a tool says.
+ */
 function spaceReadToolError(error: unknown) {
-  const parsed = parseSpaceReadErrorData(errorData(error));
-  if (!parsed) throw error;
+  if (
+    !(error instanceof IdentityError) ||
+    error.data?.code !== "space_not_found"
+  ) {
+    throw error;
+  }
   return {
-    content: [
-      {
-        type: "text" as const,
-        text: SPACE_READ_ERROR_MESSAGES[parsed.code],
-      },
-    ],
+    content: [{ type: "text" as const, text: "Space not found" }],
     isError: true,
   };
 }
@@ -349,44 +344,23 @@ function financeToolError(error: unknown) {
 /**
  * What the server was handed to act as.
  *
- * Under `convex` it is the short-lived identity token `/api/mcp` mints. Under
- * `postgres` it is a loader, not a principal: section 3.3's rule is that each
- * call reloads the credential inside its own transaction, so the server is
- * given the means to do that and never a snapshot to trust.
- *
- * A bare string is the `convex` form. It is accepted so that call sites written
- * before the surface existed keep working unchanged, which is what makes i2
- * observably a no-op in that mode.
+ * A loader, not a principal: section 3.3's rule is that each call reloads the
+ * credential inside its own transaction, so the server is given the means to do
+ * that and never a snapshot to trust. i7b deleted the `convex` alternative,
+ * which was a short-lived identity token `/api/mcp` minted.
  */
-export type McpServerCredential =
-  | { surface: "convex"; convexAuthToken: string }
-  | { surface: "postgres"; withPrincipal: WithMcpPrincipal };
+export type McpServerCredential = {
+  surface: "postgres";
+  withPrincipal: WithMcpPrincipal;
+};
 
 export function createMcpServer(
-  credential: McpServerCredential | string,
+  credential: McpServerCredential,
   principalId: string,
   financeArchive: FinanceArchiveAccess | null = resolveFinanceArchive(),
 ) {
-  const bound: McpServerCredential =
-    typeof credential === "string"
-      ? { surface: "convex", convexAuthToken: credential }
-      : credential;
-
-  let reads: McpReads;
-  let writes: McpWrites;
-  if (bound.surface === "convex") {
-    const convexUrl = process.env.NEXT_PUBLIC_CONVEX_URL;
-    if (!convexUrl) {
-      throw new Error("NEXT_PUBLIC_CONVEX_URL is not set");
-    }
-    const client = new ConvexHttpClient(convexUrl);
-    client.setAuth(bound.convexAuthToken);
-    reads = convexReads(client);
-    writes = convexWrites(client);
-  } else {
-    reads = postgresReads(bound.withPrincipal);
-    writes = postgresWrites(bound.withPrincipal);
-  }
+  const reads: McpReads = postgresReads(credential.withPrincipal);
+  const writes: McpWrites = postgresWrites(credential.withPrincipal);
 
   /**
    * The space set the finance provider is authorized against. Read on every call
@@ -588,10 +562,9 @@ export function createMcpServer(
         };
       }
       // The membership the sources were read under, reused rather than
-      // re-resolved: on PostgreSQL the read already returned it, so the finance
-      // block answers from the same snapshot and the tool stays at one
-      // transaction. Convex returns nothing here and falls back to its own
-      // query, which is what that surface always did.
+      // re-resolved: the read already returned it, so the finance block answers
+      // from the same snapshot and the tool stays at one transaction. The
+      // fallback below is kept for a read that returns no space set at all.
       const trusted: FinanceTrustedGatewayContext =
         authorizedSpaceIds === undefined
           ? await financeTrustedContext()

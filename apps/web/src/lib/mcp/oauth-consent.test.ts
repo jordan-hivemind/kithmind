@@ -1,19 +1,57 @@
-import { api } from "@repo/db/convex/_generated/api";
-import { ConvexError } from "convex/values";
+// The consent route's own decisions, with the three grant calls stubbed.
+//
+// i7b repointed this from the Convex mutations onto
+// `identity.{begin,finalize,abandon}AuthorizationGrant`, which is what the route
+// calls now. What it pins is the route: which refusals are 400 before anything
+// is written, that a request without a web session writes nothing, that a failed
+// finalize compensates, and that a typed denial keeps its status and names no
+// space. The flow against a real database is `oauth-postgres.test.ts`.
+
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-const mocks = vi.hoisted(() => ({ token: vi.fn(), mutation: vi.fn() }));
+
+const mocks = vi.hoisted(() => ({
+  principal: vi.fn(),
+  begin: vi.fn(),
+  finalize: vi.fn(),
+  abandon: vi.fn(),
+}));
 vi.mock("server-only", () => ({}));
-vi.mock("@convex-dev/auth/nextjs/server", () => ({
-  convexAuthNextjsToken: mocks.token,
+vi.mock("@/lib/kith/pool", () => ({ kithPool: () => ({}) }));
+vi.mock("@repo/kith-store", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@repo/kith-store")>()),
+  withKithTransaction: async (
+    _pool: unknown,
+    work: (client: unknown) => Promise<unknown>,
+  ) => await work({}),
 }));
-vi.mock("convex/browser", () => ({
-  ConvexHttpClient: class {
-    mutation = mocks.mutation;
-    setAuth() {}
-  },
+vi.mock("@repo/kith-store/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@repo/kith-store/identity")>()),
+  identityCtx: () => ({}),
+  requireWebPrincipal: mocks.principal,
+  beginAuthorizationGrant: mocks.begin,
+  finalizeAuthorizationGrant: mocks.finalize,
+  abandonAuthorizationGrant: mocks.abandon,
 }));
+
+import { IdentityError } from "@repo/kith-store/identity";
+
 import { POST } from "../../app/api/mcp/authorize/complete/route";
 import { encryptClientRegistration } from "./oauth";
+
+const PRINCIPAL = { userId: "owner-user", capabilities: ["read"] as const };
+
+function issuedGrant() {
+  return {
+    status: "issued" as const,
+    keyId: "created-key",
+    userId: "owner-user",
+    rawKey: "ob_" + "a".repeat(64),
+    requestHash: "b".repeat(64),
+    bindingSeedHash: "c".repeat(64),
+    preparationNonce: "d".repeat(64),
+    grantExpiresAt: Date.now() + 5 * 60 * 1000,
+  };
+}
 
 function request(grants: Record<string, unknown>) {
   const clientId = encryptClientRegistration({
@@ -41,25 +79,16 @@ function request(grants: Record<string, unknown>) {
 describe("OAuth space consent", () => {
   beforeEach(() => {
     vi.resetAllMocks();
-    vi.stubEnv("MCP_JWT_ISSUER", "https://brain.example.test");
+    vi.stubEnv("MCP_PUBLIC_ORIGIN", "https://brain.example.test");
     vi.stubEnv(
       "MCP_OAUTH_ENCRYPTION_KEY",
       Buffer.alloc(32, 7).toString("base64url"),
     );
-    vi.stubEnv("NEXT_PUBLIC_CONVEX_URL", "https://example.convex.cloud");
-    mocks.token.mockResolvedValue("web-session-token");
-    mocks.mutation
-      .mockResolvedValueOnce({
-        status: "issued",
-        keyId: "created-key",
-        userId: "owner-user",
-        rawKey: "ob_" + "a".repeat(64),
-        requestHash: "b".repeat(64),
-        bindingSeedHash: "c".repeat(64),
-        preparationNonce: "d".repeat(64),
-        grantExpiresAt: Date.now() + 5 * 60 * 1000,
-      })
-      .mockResolvedValueOnce(null);
+    vi.stubEnv("KITH_SESSION_SECRET", "s".repeat(32));
+    mocks.principal.mockResolvedValue(PRINCIPAL);
+    mocks.begin.mockResolvedValue(issuedGrant());
+    mocks.finalize.mockResolvedValue(undefined);
+    mocks.abandon.mockResolvedValue(undefined);
   });
   afterEach(() => vi.unstubAllEnvs());
 
@@ -70,9 +99,10 @@ describe("OAuth space consent", () => {
     { spaceIds: ["space"], capabilities: ["ingest"] },
   ])("requires explicit nonempty supported grants", async (grants) => {
     expect((await POST(request(grants))).status).toBe(400);
-    expect(mocks.mutation).not.toHaveBeenCalled();
+    expect(mocks.begin).not.toHaveBeenCalled();
   });
-  test("issues exactly the selected grants through the authenticated mutation", async () => {
+
+  test("issues exactly the selected grants through the authenticated call", async () => {
     const response = await POST(
       request({
         spaceIds: ["space"],
@@ -81,7 +111,7 @@ describe("OAuth space consent", () => {
       }),
     );
     expect(response.status).toBe(200);
-    expect(mocks.mutation.mock.calls[0]?.[1]).toEqual({
+    expect(mocks.begin.mock.calls[0]?.[1]).toEqual({
       clientId: expect.any(String),
       redirectUri: "https://client.example.test/callback",
       resource: "https://brain.example.test/api/mcp",
@@ -90,57 +120,44 @@ describe("OAuth space consent", () => {
       name: "MCP (Synthetic client)",
       spaceIds: ["space"],
       capabilities: ["read"],
+      // The session's principal, never the body's `userId`.
+      principal: PRINCIPAL,
     });
   });
+
   test("does not issue credentials without a web session", async () => {
-    mocks.token.mockResolvedValue(null);
+    mocks.principal.mockRejectedValue(new IdentityError("Not authenticated"));
     expect(
       (await POST(request({ spaceIds: ["space"], capabilities: ["read"] })))
         .status,
     ).toBe(401);
-    expect(mocks.mutation).not.toHaveBeenCalled();
+    expect(mocks.begin).not.toHaveBeenCalled();
   });
+
   test("abandons the fenced preparation when authorization-code creation fails", async () => {
-    mocks.mutation.mockReset();
-    mocks.mutation
-      .mockImplementationOnce(async () => {
-        vi.stubEnv("MCP_OAUTH_ENCRYPTION_KEY", "invalid-after-create");
-        return {
-          status: "issued",
-          keyId: "created-key",
-          userId: "owner-user",
-          rawKey: "ob_" + "a".repeat(64),
-          requestHash: "b".repeat(64),
-          bindingSeedHash: "c".repeat(64),
-          preparationNonce: "d".repeat(64),
-          grantExpiresAt: Date.now() + 5 * 60 * 1000,
-        };
-      })
-      .mockResolvedValueOnce(null);
+    mocks.begin.mockImplementation(async () => {
+      vi.stubEnv("MCP_OAUTH_ENCRYPTION_KEY", "invalid-after-create");
+      return issuedGrant();
+    });
 
     const response = await POST(
       request({ spaceIds: ["space"], capabilities: ["read"] }),
     );
 
     expect(response.status).toBe(500);
-    expect(mocks.mutation).toHaveBeenNthCalledWith(
-      2,
-      api.models.oauth.web.abandonAuthorizationGrant,
-      {
-        keyId: "created-key",
-        requestHash: "b".repeat(64),
-        preparationNonce: "d".repeat(64),
-      },
-    );
+    expect(mocks.finalize).not.toHaveBeenCalled();
+    expect(mocks.abandon.mock.calls[0]?.[1]).toEqual({
+      keyId: "created-key",
+      requestHash: "b".repeat(64),
+      preparationNonce: "d".repeat(64),
+      principal: PRINCIPAL,
+    });
   });
 
   test("returns the exact stored code for an idempotent pending retry", async () => {
-    mocks.mutation.mockReset();
-    mocks.mutation.mockResolvedValueOnce({
+    mocks.begin.mockResolvedValue({
       status: "pending",
-      keyId: "created-key",
       encryptedCode: "obac1.stored-code",
-      grantExpiresAt: Date.now() + 60_000,
     });
     const response = await POST(
       request({ spaceIds: ["space"], capabilities: ["read"] }),
@@ -148,36 +165,39 @@ describe("OAuth space consent", () => {
     expect(response.status).toBe(200);
     const location = new URL((await response.json()).redirect_url);
     expect(location.searchParams.get("code")).toBe("obac1.stored-code");
-    expect(mocks.mutation).toHaveBeenCalledTimes(1);
+    expect(mocks.finalize).not.toHaveBeenCalled();
   });
 
   test("requires a fresh authorization request after consumption", async () => {
-    mocks.mutation.mockReset();
-    mocks.mutation.mockResolvedValueOnce({ status: "consumed" });
+    mocks.begin.mockResolvedValue({ status: "consumed" });
     const response = await POST(
       request({ spaceIds: ["space"], capabilities: ["read"] }),
     );
     expect(response.status).toBe(409);
-    expect(mocks.mutation).toHaveBeenCalledTimes(1);
+    expect(mocks.finalize).not.toHaveBeenCalled();
   });
 
   test("maps the typed space_not_found read denial to 403, naming no space", async () => {
-    // What `beginAuthorizationGrant` throws unchanged when
-    // `getAuthorizedReadSpaceIds` refuses a space the session cannot read: the
-    // same `ConvexError` shape the PostgreSQL port's `spaceReadNotFound()`
-    // carries. The route's `oauthMutationErrorResponse` switch must map this
-    // on both surfaces so the dark-deploy comparison stays valid.
-    mocks.mutation.mockReset();
-    mocks.mutation.mockRejectedValueOnce(
-      new ConvexError({ code: "space_not_found", message: "Space not found" }),
+    // What `beginAuthorizationGrant` rethrows unchanged when
+    // `getAuthorizedReadSpaceIds` refuses a space the session cannot read.
+    // `oauthMutationErrorResponse` must map it rather than letting it fall into
+    // the 500 default, where a caller could not tell it from an outage.
+    mocks.begin.mockRejectedValue(
+      new IdentityError("Space not found", {
+        type: "space_read_error",
+        code: "space_not_found",
+        message: "Space not found",
+      } as ConstructorParameters<typeof IdentityError>[1]),
     );
     const response = await POST(
-      request({ spaceIds: ["space-the-session-cannot-read"], capabilities: ["read"] }),
+      request({
+        spaceIds: ["space-the-session-cannot-read"],
+        capabilities: ["read"],
+      }),
     );
     expect(response.status).toBe(403);
     const body = await response.json();
     expect(body).toEqual({ error: "Selected space is not available" });
     expect(JSON.stringify(body)).not.toContain("space-the-session-cannot-read");
-    expect(mocks.mutation).toHaveBeenCalledTimes(1);
   });
 });

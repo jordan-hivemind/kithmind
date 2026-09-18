@@ -1,13 +1,13 @@
-// The read half of the MCP tool surface, once per backend.
+// The read half of the MCP tool surface.
 //
-// Slice i3 of the web and MCP surface plan moves the 14 read tools onto
-// `@repo/kith-store` under `KITH_POSTGRES_SURFACE=postgres`. The tools
-// themselves keep their schemas, their descriptions and their presentation:
-// what changes is where the rows come from. So the rows are what this module
-// is about. `McpReads` is one method per read tool, returning exactly the
-// shape the Convex function returned, and `server.ts` formats that shape the
-// way it always has. Parity is then a property of this file rather than
-// something restated at fourteen call sites.
+// Slice i3 of the web and MCP surface plan moved the 14 read tools onto
+// `@repo/kith-store`, and i7b deleted the Convex implementation they used to
+// share this file with. The tools keep their schemas, their descriptions and
+// their presentation: what changed is where the rows come from. So the rows are
+// what this module is about. `McpReads` is one method per read tool, returning
+// exactly the shape the Convex function returned, and `server.ts` formats that
+// shape the way it always has. Parity is then a property of this file rather
+// than something restated at fourteen call sites.
 //
 // Three rules from the plan are enforced here rather than in the tools:
 //
@@ -30,12 +30,6 @@
 //     keyword leg still answers. The three vector-backed tools therefore open
 //     two read-only transactions; every other read tool opens one.
 
-import { api } from "@repo/db/convex/_generated/api";
-import type { Id } from "@repo/db/convex/_generated/dataModel";
-import {
-  blendRecallContext,
-  coreLimitFor,
-} from "@repo/db/convex/models/recallBlend";
 import { documents, embeddings, memory, records } from "@repo/kith-store";
 import type { EmbedQuery } from "@repo/kith-store/embeddings";
 import {
@@ -44,8 +38,6 @@ import {
   listSpaces as listIdentitySpaces,
   type Principal,
 } from "@repo/kith-store/identity";
-import type { ConvexHttpClient } from "convex/browser";
-import type { FunctionArgs } from "convex/server";
 
 import { resolveMcpEmbedder } from "./embedder";
 import type { WithMcpPrincipal } from "./principal";
@@ -307,213 +299,6 @@ export type McpReads = {
   /** The space set the finance provider is authorized against, per call. */
   authorizedSpaceIds(): Promise<string[]>;
 };
-
-// ---------------------------------------------------------------------------
-// The Convex surface
-// ---------------------------------------------------------------------------
-
-/** The three Convex calls the tools make. Nothing here constructs a client. */
-export type ConvexGateway = Pick<
-  ConvexHttpClient,
-  "query" | "mutation" | "action"
->;
-
-function scopedReads(spaceIds?: string[]) {
-  return spaceIds === undefined ? {} : { spaceIds: spaceIds as Id<"spaces">[] };
-}
-
-export function convexReads(convex: ConvexGateway): McpReads {
-  return {
-    async listSpaces() {
-      return await convex.query(api.models.spaces.mcpQueries.list, {});
-    },
-    async queryRecords(query) {
-      return await convex.mutation(api.models.records.queryMcp.run, {
-        query: query as FunctionArgs<
-          typeof api.models.records.queryMcp.run
-        >["query"],
-      });
-    },
-    async searchDocuments({ spaceIds, ...args }) {
-      return await convex.action(api.models.documents.mcpActions.search, {
-        ...args,
-        ...scopedReads(spaceIds),
-      });
-    },
-    async getDocument({ spaceIds, documentId, ...args }) {
-      return await convex.query(api.models.documents.mcpQueries.get, {
-        ...args,
-        documentId: documentId as Id<"documents">,
-        ...scopedReads(spaceIds),
-      });
-    },
-    async listSources({ spaceIds, sourceAccountId, ...args }) {
-      // No `authorizedSpaceIds`: on Convex that is a second query, and the tool
-      // only needs it when an archive is configured and in scope.
-      return {
-        sources: (await convex.query(
-          api.models.documents.mcpQueries.listSources,
-          {
-            ...args,
-            ...scopedReads(spaceIds),
-            ...(sourceAccountId === undefined
-              ? {}
-              : { sourceAccountId: sourceAccountId as Id<"sourceAccounts"> }),
-          },
-        )) as Record<string, unknown>,
-      };
-    },
-    async listInventory({ spaceIds, sourceAccountId, ...args }) {
-      return await convex.query(
-        api.models.documents.mcpQueries.listInventory,
-        {
-          ...(args as FunctionArgs<
-            typeof api.models.documents.mcpQueries.listInventory
-          >),
-          sourceAccountId: sourceAccountId as Id<"sourceAccounts">,
-          ...scopedReads(spaceIds),
-        },
-      );
-    },
-    async listReviewQueue({ spaceIds, sourceAccountId, ...args }) {
-      return await convex.query(
-        api.models.records.mcpQueries.listReviewQueue,
-        {
-          ...(args as FunctionArgs<
-            typeof api.models.records.mcpQueries.listReviewQueue
-          >),
-          sourceAccountId: sourceAccountId as Id<"sourceAccounts">,
-          ...scopedReads(spaceIds),
-        },
-      );
-    },
-    async searchFacts({ spaceIds, query, limit, includeHistorical }) {
-      return (await convex.query(api.models.facts.mcpQueries.search, {
-        query,
-        limit,
-        includeHistorical,
-        ...scopedReads(spaceIds),
-      })) as FactResult[];
-    },
-    async searchThoughts({ spaceIds, query, type, limit, includeHistorical }) {
-      return (await convex.action(
-        api.models.thoughts.mcpActions.searchWithStatus,
-        {
-          ...scopedReads(spaceIds),
-          query,
-          type,
-          limit,
-          includeHistorical,
-        },
-      )) as { results: ThoughtIndexRow[]; vectorStatus: VectorStatus };
-    },
-    async recallContext({ spaceIds, query, limit, includeHistorical }) {
-      // The four reads stay one `Promise.all` in this order. They are four
-      // round trips to one Convex deployment, so issuing them together is what
-      // keeps the tool's latency what it was.
-      const [coreFacts, coreThoughts, relevantFacts, searchResult] =
-        (await Promise.all([
-          convex.query(api.models.facts.mcpQueries.listCore, {
-            ...scopedReads(spaceIds),
-            limit: coreLimitFor(limit),
-          }),
-          convex.query(api.models.thoughts.mcpQueries.listCore, {
-            ...scopedReads(spaceIds),
-            limit: coreLimitFor(limit),
-          }),
-          convex.query(api.models.facts.mcpQueries.search, {
-            ...scopedReads(spaceIds),
-            query,
-            limit,
-            includeHistorical,
-          }),
-          convex.action(api.models.thoughts.mcpActions.searchWithStatus, {
-            ...scopedReads(spaceIds),
-            query,
-            limit,
-            includeHistorical,
-          }),
-        ])) as [
-          FactResult[],
-          CoreThought[],
-          FactResult[],
-          { results: ThoughtIndexRow[]; vectorStatus: VectorStatus },
-        ];
-      const { results: index, vectorStatus } = searchResult;
-      const blend = blendRecallContext({
-        coreFacts,
-        coreThoughts,
-        relevantFacts,
-        relevantThoughts: index,
-        limit,
-        factId: (fact) => fact.id,
-        coreThoughtId: (thought) => thought._id,
-        relevantThoughtId: (row) => row._id,
-      });
-      const hydrated =
-        blend.relevanceThoughts.length === 0
-          ? []
-          : ((await convex.action(api.models.thoughts.mcpActions.getByIds, {
-              ...scopedReads(spaceIds),
-              ids: blend.relevanceThoughts.map((row) => row._id) as never,
-            })) as FullThought[]);
-      const byId = new Map(hydrated.map((thought) => [thought._id, thought]));
-      return {
-        coreFacts: blend.coreFacts,
-        coreThoughts: blend.coreThoughts,
-        relevanceFacts: blend.relevanceFacts,
-        relevanceThoughts: blend.relevanceThoughts.flatMap((row) => {
-          const thought = byId.get(row._id);
-          return thought ? [{ ...thought, score: row.score }] : [];
-        }),
-        vectorStatus,
-        empty:
-          coreFacts.length === 0 &&
-          coreThoughts.length === 0 &&
-          relevantFacts.length === 0 &&
-          index.length === 0,
-      };
-    },
-    async browseRecent({ spaceIds, limit, type, topic, includeHistorical }) {
-      return (await convex.query(api.models.thoughts.mcpQueries.listByUser, {
-        limit,
-        type,
-        topic,
-        includeHistorical,
-        ...scopedReads(spaceIds),
-      })) as BrowseThought[];
-    },
-    async getThoughts({ spaceIds, ids }) {
-      return (await convex.action(api.models.thoughts.mcpActions.getByIds, {
-        ids: ids as never,
-        ...scopedReads(spaceIds),
-      })) as FullThought[];
-    },
-    async timelineThoughts({ spaceIds, seedId, aroundMs, before, after, type }) {
-      return (await convex.action(api.models.thoughts.mcpActions.timeline, {
-        ...scopedReads(spaceIds),
-        seedId: seedId as never,
-        aroundMs,
-        before,
-        after,
-        type,
-      })) as TimelineRow[];
-    },
-    async getStats({ spaceIds }) {
-      return await convex.query(
-        api.models.thoughts.mcpQueries.getStats,
-        scopedReads(spaceIds),
-      );
-    },
-    async authorizedSpaceIds() {
-      const spaces = (await convex.query(
-        api.models.spaces.mcpQueries.list,
-        {},
-      )) as Array<{ spaceId: string }>;
-      return spaces.map((space) => space.spaceId);
-    },
-  };
-}
 
 // ---------------------------------------------------------------------------
 // The PostgreSQL surface

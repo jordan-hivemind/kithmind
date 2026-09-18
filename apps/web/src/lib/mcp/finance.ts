@@ -32,10 +32,10 @@ import { createArchivePool } from "@repo/finance-archive/store";
 import {
   authorizeFinanceReadRequest,
   FinanceContractError,
-  parseAuthorizedFinanceReadExchange,
   type FinancePrincipalId,
   type FinanceReadRequest,
   type FinanceReadResponse,
+  parseAuthorizedFinanceReadExchange,
 } from "@repo/finance-contract";
 
 /**
@@ -56,7 +56,7 @@ export type FinanceArchiveAccess = {
 /**
  * The gateway's own authenticated context. Never deserialized from a request
  * body: the principal comes from the validated API key and the space list from
- * Convex membership, checked live on every call.
+ * the caller's current membership, checked live on every call.
  */
 export type FinanceTrustedGatewayContext = {
   principalId: string;
@@ -135,8 +135,8 @@ export function financeCoverageRequest(spaceId: string): unknown {
  * One authorized finance read.
  *
  * Three checks, none of them the same check twice. The caller must currently
- * be a member of the archive's space, from Convex rather than from anything
- * the caller sent. The contract's own authorization must then accept the
+ * be a member of the archive's space, read from the store rather than from
+ * anything the caller sent. The contract's own authorization must then accept the
  * request against a trusted context naming only that space, so a request
  * pointing at any other space the caller can read is still refused. And
  * `serveFinanceRead` checks the space once more against the archive it is

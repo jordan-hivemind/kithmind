@@ -8,11 +8,11 @@
 //
 // Three properties are asserted for every tool rather than described:
 //
-//   * Content. The tool's own JSON is compared against the Convex path's JSON
-//     for the same rows. `sameAsConvex` drives the Convex-mocked server with
-//     the Convex-shaped rows this fixture holds and requires the two answers to
-//     be identical text, so a field that is renamed, dropped, reordered or
-//     turned from `undefined` into `null` fails here.
+//   * Content. Each tool's own JSON, against rows written out from the fixture.
+//     i7b removed the `sameAsConvex` half of this, which drove a second,
+//     Convex-mocked server with the same rows and required identical text: the
+//     implementation it compared against is deleted, so the comparison could no
+//     longer run. The per-tool assertions below are what is left.
 //   * Space isolation. A credential granted space A never sees a space B row,
 //     and naming space B explicitly is refused rather than silently narrowed.
 //   * One transaction. `transactionLog` records every `BEGIN` the pool issues,
@@ -54,20 +54,6 @@ import {
 
 import { setKithPool } from "@/lib/kith/pool";
 
-const convexMocks = vi.hoisted(() => ({
-  query: vi.fn(),
-  action: vi.fn(),
-  mutation: vi.fn(),
-}));
-vi.mock("convex/browser", () => ({
-  ConvexHttpClient: class {
-    query = convexMocks.query;
-    action = convexMocks.action;
-    mutation = convexMocks.mutation;
-    setAuth() {}
-  },
-}));
-
 import type { FinanceArchiveAccess } from "./finance";
 import { mcpPrincipalLoader } from "./principal";
 import { setMcpEmbedder } from "./reads";
@@ -81,7 +67,7 @@ const DOCUMENT_TEXT = "The quarterly statement total is settled.";
 const SHARED_DOCUMENT_TEXT = "The quarterly statement total is shared.";
 /** Fixed capture times, one minute apart, so the timeline window is ordered. */
 const THOUGHT_EPOCH = Date.UTC(2026, 1, 1, 12, 0, 0);
-/** A fixed fact creation time, so the Convex comparison can state it. */
+/** A fixed fact creation time, so the expected row can state it. */
 const FACT_EPOCH = Date.UTC(2026, 1, 1, 13, 0, 0);
 
 type Fixture = {
@@ -435,8 +421,8 @@ describeWithDatabase("MCP read tools on PostgreSQL", () => {
       });
 
       // A stated creation time, for the same reason the thoughts have one:
-      // `ctx.now` is fixed for the fixture transaction, and a comparison
-      // against hand-written Convex rows has to be able to name it.
+      // `ctx.now` is fixed for the fixture transaction, and a hand-written
+      // expectation has to be able to name it.
       await ctx.client.query(
         "UPDATE kith.facts SET created_at = $2 WHERE id = $1",
         [fact.factId, new Date(FACT_EPOCH)],
@@ -525,8 +511,6 @@ describeWithDatabase("MCP read tools on PostgreSQL", () => {
   }, 60_000);
 
   beforeEach(() => {
-    vi.stubEnv("KITH_POSTGRES_SURFACE", "postgres");
-    vi.stubEnv("NEXT_PUBLIC_CONVEX_URL", "https://synthetic.convex.cloud");
     vi.resetAllMocks();
     transactionLog = [];
   });
@@ -534,7 +518,7 @@ describeWithDatabase("MCP read tools on PostgreSQL", () => {
   afterEach(() => vi.unstubAllEnvs());
 
   async function call(
-    credential: McpServerCredential | string,
+    credential: McpServerCredential,
     name: string,
     args: Record<string, unknown>,
     // No finance archive by default: `query_records`'s finance leg is
@@ -581,10 +565,6 @@ describeWithDatabase("MCP read tools on PostgreSQL", () => {
     return call(credentialFor(fixture.keyIdBoth), name, args);
   }
 
-  function onConvex(name: string, args: Record<string, unknown> = {}) {
-    return call("synthetic-convex-token", name, args);
-  }
-
   function text(result: unknown): string {
     const content = (result as { content?: Array<{ text?: string }> }).content;
     return content?.[0]?.text ?? "";
@@ -592,24 +572,6 @@ describeWithDatabase("MCP read tools on PostgreSQL", () => {
 
   function parsed(result: unknown): unknown {
     return JSON.parse(text(result));
-  }
-
-  /**
-   * The same tool, the same arguments, on both surfaces, with the Convex path
-   * fed the Convex-shaped rows this fixture holds. The two answers have to be
-   * identical text.
-   */
-  async function sameAsConvex(
-    name: string,
-    args: Record<string, unknown>,
-    convexRows: () => void,
-  ) {
-    const postgres = await onPostgres(name, args);
-    transactionLog = [];
-    convexRows();
-    const convex = await onConvex(name, args);
-    expect(text(convex)).toBe(text(postgres));
-    return postgres;
   }
 
   // -------------------------------------------------------------------------
@@ -822,17 +784,7 @@ describeWithDatabase("MCP read tools on PostgreSQL", () => {
   // -------------------------------------------------------------------------
 
   test("list_spaces returns the granted spaces with coverage, and only those", async () => {
-    const result = await sameAsConvex("list_spaces", {}, () => {
-      convexMocks.query.mockResolvedValue([
-        {
-          spaceId: fixture.spaceA,
-          name: fixture.personalName,
-          kind: "personal",
-          role: "owner",
-          coverage: { spaceId: fixture.spaceA, status: "unknown", drift: false },
-        },
-      ]);
-    });
+    const result = await onPostgres("list_spaces", {});
     expect(parsed(result)).toEqual([
       {
         spaceId: fixture.spaceA,
@@ -969,7 +921,7 @@ describeWithDatabase("MCP read tools on PostgreSQL", () => {
     expect(foreign.counts.skippedByType.total).toBe(0);
   });
 
-  test("search_facts formats a fact exactly as the Convex path does", async () => {
+  test("search_facts formats a fact field for field", async () => {
     const found = parsed(
       await onPostgres("search_facts", { query: "Oakland" }),
     ) as Array<Record<string, unknown>>;
@@ -986,38 +938,27 @@ describeWithDatabase("MCP read tools on PostgreSQL", () => {
       isCore: true,
       citation: `fact:${fixture.factA}`,
     });
-    // `undefined`, never `null`: the Convex path omits an absent optional and
-    // a `null` here would be a visible difference in the tool's own JSON.
+    // `undefined`, never `null`: an absent optional is omitted, and a `null`
+    // here would be a visible difference in the tool's own JSON.
     expect(Object.hasOwn(fact, "sourceRef")).toBe(false);
     expect(Object.hasOwn(fact, "supersededBy")).toBe(false);
 
-    // Every field written out from the fixture, not read back from the store's
-    // own answer: a mock built from the result under test would compare the
-    // formatter with itself. `statement` is what `rememberFact` composes and
-    // `confidence` is its default for a stated fact.
-    await sameAsConvex("search_facts", { query: "Oakland" }, () => {
-      convexMocks.query.mockResolvedValue([
-        {
-          id: fixture.factA,
-          spaceId: fixture.spaceA,
-          userId: fixture.userId,
-          statement: "Rowan — home city: Oakland.",
-          subject: {
-            id: fixture.entityA,
-            key: "person:rowan",
-            kind: "person",
-            name: "Rowan",
-            aliases: [],
-          },
-          predicate: "home_city",
-          value: { type: "text", value: "Oakland" },
-          sourceType: "user_stated",
-          confidence: 1,
-          isCore: true,
-          status: "current",
-          createdAt: FACT_EPOCH,
-        },
-      ]);
+    // The rest of the row, written out from the fixture rather than read back
+    // from the store's own answer: an expectation built from the result under
+    // test would compare the formatter with itself. `statement` is what
+    // `rememberFact` composes and `confidence` is its default for a stated
+    // fact. `createdAt` is ISO because `formatFactForMcp` converts it.
+    expect(fact).toMatchObject({
+      statement: "Rowan — home city: Oakland.",
+      subject: {
+        id: fixture.entityA,
+        key: "person:rowan",
+        kind: "person",
+        name: "Rowan",
+        aliases: [],
+      },
+      confidence: 1,
+      createdAt: new Date(FACT_EPOCH).toISOString(),
     });
 
     // The other space's fact is never reachable from this credential, and an
@@ -1164,52 +1105,6 @@ describeWithDatabase("MCP read tools on PostgreSQL", () => {
     });
   });
 
-  /**
-   * The Convex rows this fixture's two personal-space thoughts would have
-   * been, written out rather than derived from the store's answer. Comparing
-   * against rows the store produced would only prove the formatter is a
-   * function; these state independently what Convex returned.
-   */
-  function convexThoughtDocs() {
-    return [
-      {
-        _id: fixture.taskThoughtA,
-        spaceId: fixture.spaceA,
-        userId: fixture.userId,
-        _creationTime: THOUGHT_EPOCH + 60_000,
-        createdAt: THOUGHT_EPOCH + 60_000,
-        content:
-          "Book the synthetic clinic appointment before the quarter ends.",
-        metadata: {
-          type: "task",
-          topics: ["clinic"],
-          people: [],
-          actionItems: [],
-          summary: "Clinic booking",
-        },
-        memoryStatus: "current" as const,
-        isCore: false,
-      },
-      {
-        _id: fixture.coreThoughtA,
-        spaceId: fixture.spaceA,
-        userId: fixture.userId,
-        _creationTime: THOUGHT_EPOCH,
-        createdAt: THOUGHT_EPOCH,
-        content: "Keep the synthetic household ledger current each quarter.",
-        metadata: {
-          type: "decision",
-          topics: ["ledger"],
-          people: ["Rowan"],
-          actionItems: [],
-          summary: "Ledger upkeep",
-        },
-        memoryStatus: "current" as const,
-        isCore: true,
-      },
-    ];
-  }
-
   test("browse_recent returns the granted space's thoughts newest first", async () => {
     const rows = parsed(await onPostgres("browse_recent", {})) as Array<{
       id: string;
@@ -1231,10 +1126,6 @@ describeWithDatabase("MCP read tools on PostgreSQL", () => {
       id: string;
     }>;
     expect(both.map((row) => row.id)).toContain(fixture.thoughtB);
-
-    await sameAsConvex("browse_recent", {}, () => {
-      convexMocks.query.mockResolvedValue(convexThoughtDocs());
-    });
   });
 
   test("get_thoughts returns full content in the caller's id order", async () => {
@@ -1260,14 +1151,6 @@ describeWithDatabase("MCP read tools on PostgreSQL", () => {
     expect(
       text(await onPostgres("get_thoughts", { ids: [fixture.thoughtB] })),
     ).toBe("No thoughts found for the provided IDs.");
-
-    await sameAsConvex(
-      "get_thoughts",
-      { ids: [fixture.taskThoughtA, fixture.coreThoughtA] },
-      () => {
-        convexMocks.action.mockResolvedValue(convexThoughtDocs());
-      },
-    );
   });
 
   test("timeline_thoughts anchors a window and refuses a seed it may not read", async () => {
@@ -1297,30 +1180,6 @@ describeWithDatabase("MCP read tools on PostgreSQL", () => {
     const badArgs = await onPostgres("timeline_thoughts", {});
     expect(badArgs.isError).toBe(true);
     expect(text(badArgs)).toBe("Error: provide either `seedId` or `aroundMs`.");
-
-    await sameAsConvex(
-      "timeline_thoughts",
-      { seedId: fixture.coreThoughtA },
-      () => {
-        convexMocks.action.mockResolvedValue(
-          convexThoughtDocs()
-            .slice()
-            .reverse()
-            .map((doc) => ({
-              _id: doc._id,
-              userId: doc.userId,
-              spaceId: doc.spaceId,
-              summary: doc.metadata.summary,
-              snippet: doc.content,
-              type: doc.metadata.type,
-              topics: doc.metadata.topics,
-              createdAt: doc.createdAt,
-              memoryStatus: doc.memoryStatus,
-              isCore: doc.isCore,
-            })),
-        );
-      },
-    );
   });
 
   test("get_stats counts the granted spaces only and drops dateRange", async () => {
@@ -1356,30 +1215,10 @@ describeWithDatabase("MCP read tools on PostgreSQL", () => {
     expect(both.totalThoughts).toBe(3);
     expect(both.totalFacts).toBe(2);
     expect(both.coverage).toHaveLength(2);
-
-    await sameAsConvex("get_stats", {}, () => {
-      convexMocks.query.mockResolvedValue({
-        totalThoughts: 2,
-        totalFacts: 1,
-        historicalThoughts: 0,
-        historicalFacts: 0,
-        retractedThoughts: 0,
-        retractedFacts: 0,
-        byType: [
-          { type: "decision", count: 1 },
-          { type: "task", count: 1 },
-        ],
-        topTopics: [
-          { topic: "clinic", count: 1 },
-          { topic: "ledger", count: 1 },
-        ],
-        topPeople: [{ person: "Rowan", count: 1 }],
-        partial: false,
-        coverage: [
-          { spaceId: fixture.spaceA, status: "unknown", drift: false },
-        ],
-      });
-    });
+    expect(stats.topTopics).toEqual([
+      { topic: "clinic", count: 1 },
+      { topic: "ledger", count: 1 },
+    ]);
   });
 
   // i3's case here asserted that the write and ingest tools refused with a

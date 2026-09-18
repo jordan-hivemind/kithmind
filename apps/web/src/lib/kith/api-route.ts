@@ -1,4 +1,4 @@
-// What the `/api/kith/*` routes share: the surface gate, the same-origin and
+// What the `/api/kith/*` routes share: the same-origin and
 // content-type checks, the session check, and the response shapes.
 //
 // Every route below is the write half of a page i5 ported (settings' API
@@ -29,7 +29,6 @@ import {
 import { kithNow } from "@/lib/kith/clock";
 import { kithPool } from "@/lib/kith/pool";
 import { kithSessionConfig } from "@/lib/kith/session";
-import { kithPostgresSurface } from "@/lib/kith/surface";
 
 export function noStoreJson(data: unknown, status = 200): Response {
   return Response.json(data, {
@@ -103,13 +102,6 @@ function isSameOriginRequest(request: Request): boolean {
  * transaction, regardless of what the route does: `null` to proceed, or the
  * response to send instead.
  *
- *   * The surface gate (finding 10 of the second-model review of P2-39i5):
- *     these routes exist to write PostgreSQL, and under `KITH_POSTGRES_SURFACE
- *     =convex` a valid Kith session cookie can still exist (i1 issues one in
- *     both modes), so without this gate a `convex` deployment would let that
- *     session write rows nothing under `convex` reads. The response is a
- *     fixed 404 body, the same shape the route would have if it simply did
- *     not exist.
  *   * Same-origin (finding 8): a state-changing request from another origin
  *     is refused before it is ever handed a transaction.
  *   * Content type (finding 8): required on every method, including a
@@ -125,9 +117,6 @@ function isSameOriginRequest(request: Request): boolean {
  * `webPrincipalLoader` (`lib/mcp/principal.ts`) authenticate.
  */
 export function guardedRequest(request: Request): Response | null {
-  if (kithPostgresSurface() !== "postgres") {
-    return problem(404, "Not found");
-  }
   if (!isSameOriginRequest(request)) {
     return problem(403, "Cross-origin request refused", "cross_origin_refused");
   }
@@ -167,7 +156,7 @@ export async function withPrincipal(
 }
 
 /**
- * The read counterpart of `withPrincipal`: same gate (surface, origin,
+ * The read counterpart of `withPrincipal`: same gate (origin,
  * content type), same denial mapping, `withKithReadTransaction` instead of
  * `withKithTransaction`. Two callers share it -- the one `/api/kith/*` route
  * that reads rather than writes (`thoughts/search`, because the search text

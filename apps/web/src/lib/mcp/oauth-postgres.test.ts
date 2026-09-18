@@ -37,15 +37,7 @@ import {
 
 import { setKithPool } from "@/lib/kith/pool";
 
-const mocks = vi.hoisted(() => ({ convexToken: vi.fn() }));
 vi.mock("server-only", () => ({}));
-// The complete route still imports the Convex session reader for its `convex`
-// branch, and that module does not load under vitest. Mocking it lets the route
-// load; asserting it is never called is what proves the PostgreSQL branch does
-// not fall back to it.
-vi.mock("@convex-dev/auth/nextjs/server", () => ({
-  convexAuthNextjsToken: mocks.convexToken,
-}));
 
 import { authenticateApiKey } from "./auth";
 import { decryptAuthCode, encryptClientRegistration } from "./oauth";
@@ -216,7 +208,6 @@ describeWithDatabase("the OAuth flow on PostgreSQL", () => {
   }, 60_000);
 
   beforeEach(() => {
-    vi.stubEnv("KITH_POSTGRES_SURFACE", "postgres");
     vi.stubEnv("MCP_PUBLIC_ORIGIN", ORIGIN);
     vi.stubEnv("MCP_OAUTH_ENCRYPTION_KEY", encryptionKey);
     vi.stubEnv("KITH_SESSION_SECRET", sessionSecret);
@@ -282,8 +273,6 @@ describeWithDatabase("the OAuth flow on PostgreSQL", () => {
       userId: account.userId,
       keyId: payload!.apiKeyId,
     });
-    // And the Convex session reader was never consulted on this surface.
-    expect(mocks.convexToken).not.toHaveBeenCalled();
   });
 
   test("a consumed-code replay is refused and revokes the issued key", async () => {

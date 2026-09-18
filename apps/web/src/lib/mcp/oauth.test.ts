@@ -31,7 +31,7 @@ const challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
 
 describe("MCP OAuth security", () => {
   beforeEach(() => {
-    vi.stubEnv("MCP_JWT_ISSUER", "https://brain.example.test");
+    vi.stubEnv("MCP_PUBLIC_ORIGIN", "https://brain.example.test");
     vi.stubEnv(
       "MCP_OAUTH_ENCRYPTION_KEY",
       crypto.randomBytes(32).toString("base64url"),
@@ -45,7 +45,7 @@ describe("MCP OAuth security", () => {
   it("accepts only a canonical HTTPS issuer or loopback development origin", () => {
     expect(getMcpPublicOrigin()).toBe("https://brain.example.test");
 
-    vi.stubEnv("MCP_JWT_ISSUER", "http://localhost:3000");
+    vi.stubEnv("MCP_PUBLIC_ORIGIN", "http://localhost:3000");
     expect(getMcpPublicOrigin()).toBe("http://localhost:3000");
 
     for (const invalid of [
@@ -54,7 +54,7 @@ describe("MCP OAuth security", () => {
       "https://brain.example.test/path",
       "https://user:pass@brain.example.test",
     ]) {
-      vi.stubEnv("MCP_JWT_ISSUER", invalid);
+      vi.stubEnv("MCP_PUBLIC_ORIGIN", invalid);
       expect(() => getMcpPublicOrigin()).toThrow();
     }
   });

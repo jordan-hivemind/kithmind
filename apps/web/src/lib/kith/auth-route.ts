@@ -56,10 +56,9 @@ export function tooManyAttempts(retryAfterSeconds: number): Response {
 }
 
 /**
- * 503 with no detail, for the durable rate limiter's own failure under
- * `KITH_POSTGRES_SURFACE=postgres` -- the database is unreachable, or the
- * limiter's transaction otherwise failed, before the credential check ever
- * ran. This is section 8 question 2's fail-closed rule: a limiter that cannot
+ * 503 with no detail, for the durable rate limiter's own failure -- the
+ * database is unreachable, or the limiter's transaction otherwise failed,
+ * before the credential check ever ran. This is section 8 question 2's fail-closed rule: a limiter that cannot
  * be consulted must refuse the attempt, never wave it through as though it
  * had been allowed. Distinct from `problem(500, "Server error")`, which is an
  * unexpected failure *inside* the credential transaction: the caller must not
