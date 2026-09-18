@@ -3353,6 +3353,296 @@ test("a reconcile refuses an activated processing row", async () => {
   }
 });
 
+/**
+ * The 2026-09-18 aftermath. One original with eight processing rows: six the
+ * wedged passes left never admitted, and two activated, each internally
+ * coherent. One was activated against the decommissioned backend during the
+ * misrouted window, the other by the pass that followed the receipt reconcile.
+ */
+function twoActivatedFamily(runner, plan, originalCatalogId) {
+  const fingerprints = runner.processingFingerprints(plan);
+  const row = (revision) => ({
+    processingCatalogId: randomUUID(),
+    originalCatalogId,
+    rowRevision: 1,
+    createdAt: 1,
+    currentObservation: {
+      scanId: "scan-0",
+      observationEpoch: plan.observationEpoch,
+      processingEpoch: plan.processingEpoch,
+    },
+    fingerprints,
+    copies: {
+      primary: archiveCopy("primary"),
+      independent_backup: archiveCopy("independent_backup"),
+    },
+    ...(revision === undefined
+      ? {}
+      : {
+          cloud: {
+            sourceItemId: plan.sourceItemId,
+            sourceRevisionId: revision,
+            parserArtifactId: "artifact",
+            sourceTextVersionId: "text",
+            processingGenerationId: `generation-${revision}`,
+            ingestJobId: `job-${revision}`,
+            processingFingerprint: HASH,
+            admissionRequestDigest: HASH,
+            admittedAt: 1,
+          },
+          activation: {
+            requestId: randomUUID(),
+            requestDigest: HASH,
+            jobId: `job-${revision}`,
+            processingGenerationId: `generation-${revision}`,
+            state: "ready",
+            activatedAt: 1,
+            reused: false,
+          },
+        }),
+  });
+  return [
+    row("revision"),
+    row("revision-from-the-other-backend"),
+    ...Array.from({ length: 6 }, () => row(undefined)),
+  ];
+}
+
+function familyOriginal(plan, originalCatalogId, sourceRevisionId) {
+  return {
+    originalCatalogId,
+    sourceExternalId: plan.externalId,
+    rowRevision: 1,
+    createdAt: 1,
+    origin: {
+      scanId: "scan-0",
+      observationEpoch: plan.observationEpoch,
+      sha256: plan.sha256,
+      byteLength: plan.byteLength,
+      mediaType: "application/pdf",
+    },
+    copies: { primary: archiveCopy("primary") },
+    ...(sourceRevisionId === undefined
+      ? {}
+      : {
+          cloud: {
+            sourceItemId: plan.sourceItemId,
+            sourceRevisionId,
+            primaryReceiptId: "original-primary",
+            providerReferenceId: "provider-reference",
+            providerBindingEpoch: 0,
+            admittedAt: 1,
+          },
+        }),
+  };
+}
+
+function reconcileResponse(scanId) {
+  return {
+    operation: "scan.reconcile",
+    scanId,
+    state: "enumerated",
+    inspected: 0,
+    unavailable: 0,
+    done: true,
+    reused: false,
+  };
+}
+
+function reconcileCheckpoint(plan) {
+  return parseRunnerCheckpoint({
+    version: 1,
+    phase: "reconcile",
+    mode: "normal",
+    scanId: "scan-1",
+    inventoryEpoch: 1,
+    manifestVersion: 1,
+    missingBindings: [],
+    files: [plan],
+    ordinal: 0,
+    reviewSeen: false,
+  });
+}
+
+/** The live journal: an answered reconcile page the old build left unresolved. */
+async function plantReconcilePage(journal, config, checkpoint) {
+  const requestId = randomUUID();
+  await journal.planRequest({
+    operation: "scan.reconcile",
+    requestId,
+    requestBody: JSON.stringify({
+      protocolVersion: 1,
+      operation: "scan.reconcile",
+      spaceId: config.spaceId,
+      sourceAccountId: config.sourceAccountId,
+      scanId: checkpoint.scanId,
+      requestId,
+      expectedInventoryEpoch: checkpoint.inventoryEpoch,
+      ordinal: checkpoint.ordinal,
+      maxItems: 50,
+    }),
+    createdAt: Date.now(),
+  });
+  await journal.recordValidatedResult(
+    reconcileResponse(checkpoint.scanId),
+    Date.now(),
+  );
+}
+
+async function reconcileFixture(sourceRevisionId, family) {
+  const setup = await fixture(0);
+  const plan = pdfPlan({ discoveryState: "unchanged" });
+  const checkpoint = reconcileCheckpoint(plan);
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  const originalCatalogId = randomUUID();
+  const sent = [];
+  const runner = new PipelineRunner(setup.config, journal, {
+    async call(request) {
+      sent.push(request.operation);
+      return reconcileResponse(checkpoint.scanId);
+    },
+  });
+  const original = familyOriginal(plan, originalCatalogId, sourceRevisionId);
+  const rows = (family ?? twoActivatedFamily)(runner, plan, originalCatalogId);
+  runner.archiveCatalog = {
+    listOriginals: () => [original],
+    listProcessings: () => rows,
+    findOriginalExact: () => original,
+  };
+  runner.processingArtifactsPresent = async () => false;
+  await plantReconcilePage(journal, setup.config, checkpoint);
+  return { setup, plan, checkpoint, journal, runner, rows, original, sent };
+}
+
+test("the original settles two activated rows and the answered page resolves", async () => {
+  // The live state. The original was re-admitted by the pass that followed the
+  // receipt reconcile, so it names the live revision and exactly one of the two
+  // activations agrees with it. Six never-admitted rows sit alongside them.
+  const f = await reconcileFixture("revision");
+  try {
+    await f.runner.driveReconcile();
+    assert.equal(f.journal.pending, undefined, "the answer is not left owing");
+    assert.equal(f.journal.checkpoint.phase, "discovery_reserve");
+    assert.deepEqual(f.sent, [], "the recorded page answer is reused");
+  } finally {
+    await f.journal.close();
+    await rm(f.setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a dead activation is never reused for an original the server re-admitted", async () => {
+  // The original names the revision the server is serving, and the only
+  // activated row names the dead one. Selecting it would send a document the
+  // server is still waiting for to cleanup, and it would never publish.
+  const f = await reconcileFixture(
+    "revision-the-server-serves",
+    (runner, plan, id) => twoActivatedFamily(runner, plan, id).slice(1),
+  );
+  try {
+    await f.runner.driveReconcile();
+    assert.equal(f.journal.pending, undefined);
+    assert.equal(
+      f.journal.checkpoint.phase,
+      "archived",
+      "the document is treated as needing work, not as published",
+    );
+    assert.equal(f.journal.checkpoint.step, "intent");
+  } finally {
+    await f.journal.close();
+    await rm(f.setup.base, { recursive: true, force: true });
+  }
+});
+
+test("an ambiguity the original cannot settle fails closed without wedging", async () => {
+  // No receipt on the original, so nothing narrows the two activations. That is
+  // a genuinely ambiguous history and still fails closed. Before this fix the
+  // throw happened inside the journaled transition, so the answered page stayed
+  // unresolved and every later pass replayed it into the same throw; only a
+  // hand edit cleared that.
+  const f = await reconcileFixture(undefined);
+  try {
+    await f.runner.driveReconcile();
+    assert.equal(f.journal.pending, undefined, "the answer is not left owing");
+    assert.equal(f.journal.checkpoint.phase, "terminal");
+    assert.equal(f.journal.checkpoint.outcome, "failed");
+    assert.equal(
+      f.journal.checkpoint.code,
+      "archive_catalog_revision_conflict",
+    );
+    assert.deepEqual(f.sent, []);
+    // Bounded: the scan is over, so the next pass starts a clean one rather
+    // than re-asking a page the server has already finished.
+    assert.equal(f.journal.checkpoint.scanned, 1);
+  } finally {
+    await f.journal.close();
+    await rm(f.setup.base, { recursive: true, force: true });
+  }
+});
+
+test("no activated row at all still fails closed on an ambiguous history", async () => {
+  const f = await reconcileFixture("revision", (runner, plan, id) =>
+    twoActivatedFamily(runner, plan, id).slice(2),
+  );
+  try {
+    await f.runner.driveReconcile();
+    assert.equal(f.journal.checkpoint.phase, "terminal");
+    assert.equal(
+      f.journal.checkpoint.code,
+      "archive_catalog_revision_conflict",
+    );
+  } finally {
+    await f.journal.close();
+    await rm(f.setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a server answer that renames an admitted revision ends the scan closed", async () => {
+  const setup = await fixture(0);
+  const plan = pdfPlan();
+  const checkpoint = archivedCheckpoint(plan, {
+    step: "lookup_original",
+    preflightAction: undefined,
+  });
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  const rows = durableProviderRows(checkpoint, Date.now());
+  rows.original.cloud = {
+    sourceItemId: plan.sourceItemId,
+    sourceRevisionId: "revision",
+    primaryReceiptId: "original-primary",
+    providerReferenceId: "provider-reference",
+    providerBindingEpoch: 0,
+    admittedAt: 1,
+  };
+  const runner = new PipelineRunner(setup.config, journal, {
+    async call() {
+      return {
+        operation: "discovery.lookupArchivedAdmission",
+        mode: "original",
+        found: true,
+        // A revision is immutable once admitted, so this cannot be both true
+        // and the receipt the catalog holds. Reaching it means one of the two
+        // beliefs is wrong, and nothing downstream may read either as a fact.
+        sourceRevisionId: "a-revision-the-catalog-never-recorded",
+        originalPrimaryReceiptId: "original-primary",
+        originalPrimaryBindingEpoch: 0,
+        originalProviderReferenceId: "provider-reference",
+        originalProviderBindingEpoch: 0,
+      };
+    },
+  });
+  runner.archivedRows = () => rows;
+  try {
+    await runner.driveArchivedLookupOriginal();
+    assert.equal(journal.pending, undefined, "the answer is not left owing");
+    assert.equal(journal.checkpoint.phase, "terminal");
+    assert.equal(journal.checkpoint.outcome, "failed");
+    assert.equal(journal.checkpoint.code, "original_receipt_revision_conflict");
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
 test("a stale proof refreshes before any new lease and the recovery pass reserves once", async () => {
   const setup = await fixture(0);
   const plan = pdfPlan();
@@ -4007,33 +4297,30 @@ test("successive PDF reconciles skip activated unchanged work and resume incompl
     ).phase,
     "discovery_reserve",
   );
-  await assert.rejects(
-    () =>
-      reconcile("unchanged", [readyRow("first"), readyRow("second")]),
-    (error) => error.code === "archive_catalog_revision_conflict",
-  );
-  await assert.rejects(
-    () =>
-      reconcile("unchanged", [
-        { processingCatalogId: "first" },
-        { processingCatalogId: "second" },
-      ]),
-    (error) => error.code === "archive_catalog_revision_conflict",
-  );
-  await assert.rejects(
-    () =>
-      reconcile("unchanged", [
-        { processingCatalogId: "incomplete" },
-        {
-          ...readyRow("incoherent"),
-          cloud: {
-            ingestJobId: "different-job",
-            processingGenerationId: "generation-incoherent",
-          },
-        },
-      ]),
-    (error) => error.code === "archive_catalog_revision_conflict",
-  );
+  // P2-31e. Both histories still fail closed with the same code. The refusal is
+  // now committed as a terminal scan instead of thrown, because a throw from
+  // inside the journaled transition left the answered page unresolved forever.
+  for (const rows of [
+    [readyRow("first"), readyRow("second")],
+    [{ processingCatalogId: "first" }, { processingCatalogId: "second" }],
+  ]) {
+    const checkpoint = await reconcile("unchanged", rows);
+    assert.equal(checkpoint.phase, "terminal");
+    assert.equal(checkpoint.outcome, "failed");
+    assert.equal(checkpoint.code, "archive_catalog_revision_conflict");
+  }
+  const incoherent = await reconcile("unchanged", [
+    { processingCatalogId: "incomplete" },
+    {
+      ...readyRow("incoherent"),
+      cloud: {
+        ingestJobId: "different-job",
+        processingGenerationId: "generation-incoherent",
+      },
+    },
+  ]);
+  assert.equal(incoherent.phase, "terminal");
+  assert.equal(incoherent.code, "archive_catalog_revision_conflict");
 });
 
 test("journal loss after activation routes retained plaintext to cleanup only", async () => {
