@@ -986,13 +986,24 @@ caller cannot do by combining the other two files alone:
   (`src/instrumentMatch.ts`). A symbol-only match is accepted as its own
   identity kind when all three hold: the symbol names exactly one instrument
   in the archive, that instrument carries a cusip or isin, and the only
-  institution whose stored rows reference it is the institution this holding
-  came from. The institution is then vouching for both halves. The evidence
-  for the second and third conditions is which institutions' `transactions`
-  and `positions` rows point at the instrument -- `instruments` carries no
-  provenance columns, so that is the most this schema can honestly say.
-  Two institutions referencing it, or none, is refused rather than resolved
-  by majority.
+  institution on record as having stated that identifier is the institution
+  this holding came from. The institution is then vouching for both halves.
+  The symbol comparison is trimmed and upper-cased, so two rows spelling one
+  ticker differently count as sharing it and refuse; a share-class suffix is
+  never stripped, and no stored symbol is rewritten.
+
+  The evidence for the second and third conditions is
+  `instrument_identifier_sources` (migration 13) and nothing else: one row per
+  (instrument, institution) whose parsed descriptor actually stated a cusip or
+  isin, written at mint and at every identifier-strong match. Asking instead
+  which institutions' `transactions` or `positions` rows reference the
+  instrument is circular -- a refused statement holding still writes its
+  position, carrying no identifier at all, and that position would then vouch
+  for the next match. Two institutions on record, or none, is refused rather
+  than resolved by majority. An archive whose instruments predate the table
+  runs `scripts/backfillInstrumentIdentifierSources.mjs` once, which
+  reconstructs sources from `transactions` only, and says why a position never
+  counts.
 
   An acceptance is written durably as a `resolved`
   `review_items` row of kind `institution_symbol_match`, carrying
@@ -1006,7 +1017,12 @@ caller cannot do by combining the other two files alone:
   unsafe -- a second instrument under the same symbol, another institution's
   rows on the same instrument -- dismisses the acceptance and reopens the
   weak item with `reason_code = 'institution_symbol_match_invalidated'`, so a
-  match is never left accepted on stale evidence. Every import and reparse
+  match is never left accepted on stale evidence. That reopen is
+  unconditional, including over an item a person had dismissed, because the
+  dismissal answered a question about evidence that has since changed. The
+  reason stands while the item is open; a reparse re-deriving the ordinary
+  refusal never overwrites it, and only the rule accepting the match again
+  clears it. Every import and reparse
   prints the counts: accepted, resolved by the rule, withdrawn, and refused
   per condition.
 

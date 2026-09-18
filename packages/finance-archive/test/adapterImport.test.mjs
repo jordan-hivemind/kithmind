@@ -2651,3 +2651,214 @@ test(
     );
   },
 );
+
+test(
+  "F1-76: a refused match's own position is never evidence for the next one, so no evidence stays no evidence across imports and reparses",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedPg(client);
+    // A cusip on file that no descriptor in this archive ever stated. The rule
+    // must refuse it, and must keep refusing it however many statements land:
+    // each refused statement writes its own `positions` row referencing the
+    // instrument, and if a position counted as evidence the second statement
+    // would accept the very match the first one was refused, with no feed
+    // having vouched for anything.
+    await client.query(
+      "INSERT INTO instruments (id, symbol, cusip) VALUES ('instr_zephyr', 'ZZZ', '111111ZZ1')",
+    );
+    const statement = (label, docDate) => ({
+      label,
+      institutionId: INSTITUTION.id,
+      accountId: ACCOUNT.id,
+      positions: [statementPosition(STATEMENT, docDate)],
+      docDate,
+    });
+
+    const first = await publish(t, client, statement("f1-76 circular one", "2025-03-31"));
+    assert.equal(
+      first.instrumentMatches.refused.instrument_has_no_institution_evidence,
+      1,
+    );
+    assert.ok((await count(client, "positions")) > 0);
+
+    const second = await publish(t, client, statement("f1-76 circular two", "2025-04-30"));
+    assert.equal(second.instrumentMatches.accepted, 0);
+    assert.equal(
+      second.instrumentMatches.refused.instrument_has_no_institution_evidence,
+      1,
+    );
+
+    const reparse = await publish(t, client, statement("f1-76 circular one", "2025-03-31"));
+    assert.equal(reparse.instrumentMatches.accepted, 0);
+
+    const items = await matchItems(client);
+    assert.equal(items.length, 1);
+    assert.equal(items[0].kind, "weak_instrument_match");
+    assert.equal(items[0].status, "open");
+    assert.equal(items[0].reason_code, "instrument_has_no_institution_evidence");
+    assert.equal(await count(client, "instrument_identifier_sources"), 0);
+  },
+);
+
+test(
+  "F1-76: two symbols differing only by case or padding count as one shared symbol, and refuse",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedPg(client);
+    await feedPull(t, client, "f1-76 case feed");
+    // Same ticker, differently spelled. Nothing about a bare symbol can say
+    // which of the two a holding means, so the rule must refuse rather than
+    // read two unique symbols where there is one.
+    await feedPull(t, client, "f1-76 case variant feed", {
+      instrument: { symbol: " zzz ", cusip: "222222ZZ2", isin: null, name: null },
+      processDate: "2025-01-16",
+    });
+    assert.equal(await count(client, "instruments"), 2);
+
+    const summary = await publish(t, client, {
+      label: "f1-76 case statement",
+      institutionId: INSTITUTION.id,
+      accountId: ACCOUNT.id,
+      positions: [statementPosition(STATEMENT)],
+      docDate: "2025-03-31",
+    });
+    assert.equal(summary.instrumentMatches.accepted, 0);
+    assert.equal(
+      summary.instrumentMatches.refused.symbol_matches_several_instruments,
+      1,
+    );
+  },
+);
+
+test(
+  "F1-76: a withdrawal always leaves an open item, even over a dismissal, and a reparse never overwrites the reason that says so",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedPg(client);
+    await client.query(
+      "INSERT INTO instruments (id, symbol, cusip) VALUES ('instr_zephyr', 'ZZZ', '111111ZZ1')",
+    );
+    // A descriptor with no name at all, so every reparse re-derives the match
+    // through the rule rather than short-circuiting on the (symbol AND name)
+    // tier -- which is what makes the reason-preservation assertion below test
+    // anything.
+    const statement = {
+      label: "f1-76 dismissal statement",
+      institutionId: INSTITUTION.id,
+      accountId: ACCOUNT.id,
+      positions: [
+        statementPosition({ symbol: "ZZZ", cusip: null, isin: null, name: null }),
+      ],
+      docDate: "2025-03-31",
+    };
+    await publish(t, client, statement);
+    // A person answers the question the weak item asked.
+    await client.query(
+      "UPDATE review_items SET status = 'dismissed' WHERE kind = 'weak_instrument_match'",
+    );
+
+    await feedPull(t, client, "f1-76 dismissal feed");
+    await publish(t, client, statement);
+    assert.equal(
+      (await one(client, "SELECT status FROM review_items WHERE kind = 'institution_symbol_match'"))
+        .status,
+      "resolved",
+    );
+
+    // The evidence the dismissal was given changes. That is a new question,
+    // not the old one asked again, so the item is open regardless.
+    const later = await feedPull(t, client, "f1-76 dismissal collision", {
+      instrument: { ...FEED, cusip: "222222ZZ2" },
+      processDate: "2025-02-15",
+    });
+    assert.equal(later.instrumentMatches.invalidated, 1);
+    const weak = () =>
+      one(
+        client,
+        "SELECT status, reason_code FROM review_items WHERE kind = 'weak_instrument_match'",
+      );
+    assert.deepEqual(await weak(), {
+      status: "open",
+      reason_code: INSTITUTION_SYMBOL_INVALIDATED,
+    });
+
+    // A reparse re-derives the ordinary refusal for the same match. It must
+    // not overwrite the reason that says this archive took an acceptance back.
+    const reparse = await publish(t, client, statement);
+    assert.equal(
+      reparse.instrumentMatches.refused.symbol_matches_several_instruments,
+      1,
+    );
+    assert.deepEqual(await weak(), {
+      status: "open",
+      reason_code: INSTITUTION_SYMBOL_INVALIDATED,
+    });
+  },
+);
+
+test(
+  "F1-76: a withdrawn acceptance is not re-established through the name the rule taught",
+  { skip },
+  async (t) => {
+    const client = await archive(t);
+    await seedPg(client);
+    await feedPull(t, client, "f1-76 name tier feed");
+    await publish(t, client, {
+      label: "f1-76 name tier statement",
+      institutionId: INSTITUTION.id,
+      accountId: ACCOUNT.id,
+      positions: [statementPosition(STATEMENT)],
+      docDate: "2025-03-31",
+    });
+    const instrumentId = (
+      await one(client, "SELECT id FROM instruments WHERE cusip = '111111ZZ1'")
+    ).id;
+    // The acceptance filled the name, so every later statement now matches on
+    // (symbol AND name) and never reaches the rule again.
+    assert.equal(
+      (await one(client, "SELECT name FROM instruments WHERE id = $1", [instrumentId]))
+        .name,
+      STATEMENT.name,
+    );
+
+    await feedPull(t, client, "f1-76 name tier collision", {
+      instrument: { ...FEED, cusip: "222222ZZ2" },
+      processDate: "2025-02-15",
+    });
+
+    // A later statement resolves through the name tier, which opens nothing.
+    // The downgrade still holds, because it is recorded against the instrument
+    // and institution rather than against whichever tier matched a position.
+    const later = await publish(t, client, {
+      label: "f1-76 name tier later statement",
+      institutionId: INSTITUTION.id,
+      accountId: ACCOUNT.id,
+      positions: [statementPosition(STATEMENT, "2025-04-30")],
+      docDate: "2025-04-30",
+    });
+    assert.equal(later.instrumentMatches.accepted, 0);
+
+    const items = await matchItems(client);
+    assert.equal(
+      items.find((item) => item.kind === "institution_symbol_match").status,
+      "dismissed",
+      "the acceptance stays withdrawn",
+    );
+    const weak = items.find((item) => item.kind === "weak_instrument_match");
+    assert.equal(weak.status, "open");
+    assert.equal(weak.reason_code, INSTITUTION_SYMBOL_INVALIDATED);
+    // Which is exactly what the read surface keys the ambiguous state on.
+    assert.equal(
+      await count(
+        client,
+        "review_items",
+        "WHERE kind = $1 AND status = 'open' AND matched_instrument_id = $2 AND institution_id = $3",
+        ["weak_instrument_match", instrumentId, INSTITUTION.id],
+      ),
+      1,
+    );
+  },
+);

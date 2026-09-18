@@ -107,7 +107,7 @@ test(
         [[...PG_TABLES]],
       );
       assert.equal(Number(tables.rows[0].n), PG_TABLES.length);
-      assert.equal(PG_TABLES.length, 16);
+      assert.equal(PG_TABLES.length, 17);
 
       // Running it again is a no-op: one row per migration applied, no extra
       // row, revision bump, or error.

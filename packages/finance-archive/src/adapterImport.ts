@@ -221,11 +221,32 @@ export async function resolveInstrumentId(
     institutionId,
   );
   const id = resolver.resolve(instrument);
-  await flushInstruments(client, resolver, reviews);
+  await flushInstruments(client, resolver, reviews, institutionId);
   return id;
 }
 
 const INSTRUMENT_COLUMNS = ["id", "symbol", "cusip", "isin", "name"] as const;
+
+/**
+ * F1-76 phase 3. How the same-institution symbol rule compares two tickers:
+ * trimmed and upper-cased, and nothing else. A share-class suffix is part of
+ * the ticker and is never stripped -- two classes of one issuer are two
+ * instruments, and collapsing them is precisely the wrong merge this whole
+ * tier exists to avoid.
+ *
+ * Only the comparison is normalized. `instruments.symbol` keeps whatever
+ * spelling the source stated, because rewriting a stored symbol is a
+ * correction this import is not entitled to make (ground rule 5), and because
+ * the read surface quotes it. The effect is one-directional: two rows whose
+ * symbols differ only by case or padding count as *sharing* a symbol, so the
+ * rule refuses them, and the bare-symbol tier below still picks its row by the
+ * exact spelling it always did.
+ */
+function normalizeSymbol(symbol: string | null): string | null {
+  if (symbol === null) return null;
+  const trimmed = symbol.trim().toUpperCase();
+  return trimmed.length === 0 ? null : trimmed;
+}
 
 type InstrumentRow = {
   id: string;
@@ -246,6 +267,14 @@ type InstrumentResolver = {
    * else fills `instruments.name` after the row is minted.
    */
   readonly namesLearned: ReadonlyMap<string, string>;
+  /**
+   * F1-76 phase 3. Instruments this pull's descriptors stated a cusip or an
+   * isin for. `flushInstruments` records them in
+   * `instrument_identifier_sources` against this pull's institution, which is
+   * the only evidence the same-institution symbol rule accepts for "this
+   * institution established that identifier".
+   */
+  readonly identifierStated: ReadonlySet<string>;
 };
 
 /**
@@ -290,37 +319,52 @@ async function prefetchInstruments(
   const rows: InstrumentRow[] = [];
   if (cusips.length + isins.length + symbols.length + namesOnly.length > 0) {
     const found = await client.query<InstrumentRow>(
+      // F1-76 phase 3: the `upper(btrim(...))` arm is what makes two rows
+      // differing only by case or padding both candidates, so the rule's
+      // uniqueness check can see the collision and refuse. Nothing else in
+      // resolution uses it -- every tier below still matches on the exact
+      // spelling.
       `SELECT id, symbol, cusip, isin, name FROM instruments
         WHERE cusip = ANY($1::text[]) OR isin = ANY($2::text[]) OR symbol = ANY($3::text[])
+           OR upper(btrim(symbol)) = ANY($5::text[])
            OR (cusip IS NULL AND isin IS NULL AND symbol IS NULL AND name = ANY($4::text[]))
         ORDER BY ctid`,
-      [cusips, isins, symbols, namesOnly],
+      [
+        cusips,
+        isins,
+        symbols,
+        namesOnly,
+        [...new Set(symbols.map((one) => normalizeSymbol(one) as string))],
+      ],
     );
     rows.push(...found.rows);
   }
 
-  // F1-76 phase 3. Which institutions' stored rows reference each instrument a
-  // symbol-only descriptor in this pull could match. This is the whole
-  // evidence base for the rule's condition 2, and it is the most this schema
-  // can honestly offer: `instruments` carries no provenance columns at all, so
-  // nothing records which pull minted a row or which source supplied its
-  // cusip. What is recorded is which rows point at it, and every one of those
-  // rows belongs to an account, and every account belongs to an institution.
+  // F1-76 phase 3. Which institutions have ever stated a cusip or an isin for
+  // each instrument a symbol-only descriptor in this pull could match. This is
+  // the rule's whole evidence base for conditions 2 and 3.
   //
-  // So the predicate is: exactly one institution's transactions or positions
-  // reference this instrument, and that institution is the one this pull came
-  // from. Two institutions referencing it is refused rather than resolved by
-  // majority -- with no provenance column there is no way to tell the one that
-  // supplied the identifier from the one that merely matched against it, and a
-  // rule that guesses here is exactly the silent merge the review item exists
-  // to prevent. Zero rows is refused too: an instrument nothing references yet
-  // has an identifier that arrived from somewhere this archive cannot name.
+  // Read from `instrument_identifier_sources` and from nothing else. Asking
+  // instead which institutions' `transactions` or `positions` rows reference
+  // the instrument looks equivalent and is circular: a statement holding
+  // refused by this rule still writes its `positions` row, carrying no
+  // identifier at all, and the next statement -- or the next reparse of the
+  // same one -- would find exactly one institution referencing the instrument
+  // and accept the match, with no feed ever having vouched for the identifier.
+  // A row is evidence only if the descriptor behind it actually stated one,
+  // which is what that table records and what no other column does.
   //
-  // ponytail: a cusip typed onto an otherwise single-institution instrument by
-  // hand is indistinguishable here from one that institution's own feed
-  // supplied, and would be accepted. Closing that needs a provenance column on
-  // `instruments` written at mint time; add one if manual edits ever become a
-  // real source.
+  // Exactly one institution, and it must be this pull's own. Two is refused
+  // rather than resolved by majority: once two institutions have both stated
+  // an identifier there is no "the institution that established it" left to
+  // name. None is refused too, which is also the honest answer for every
+  // instrument minted before this table existed and never reparsed.
+  //
+  // ponytail: an identifier typed onto an instrument by hand records no
+  // source, so the rule refuses such an instrument rather than accepting it --
+  // the conservative direction. An operator who wants a hand-entered
+  // identifier to count must say which institution stated it, by inserting the
+  // source row.
   //
   // Scoped to descriptors that can actually reach the rule (symbol, no cusip,
   // no isin) and to candidates that could satisfy it (a cusip or isin on
@@ -333,7 +377,7 @@ async function prefetchInstruments(
   const symbolOnly = new Set(
     instruments
       .filter((i) => !i.cusip && !i.isin && i.symbol)
-      .map((i) => i.symbol as string),
+      .map((i) => normalizeSymbol(i.symbol) as string),
   );
   const vouchCandidates =
     institutionId === null
@@ -341,32 +385,25 @@ async function prefetchInstruments(
       : rows
           .filter(
             (row) =>
-              row.symbol !== null &&
-              symbolOnly.has(row.symbol) &&
+              normalizeSymbol(row.symbol) !== null &&
+              symbolOnly.has(normalizeSymbol(row.symbol) as string) &&
               (row.cusip !== null || row.isin !== null),
           )
           .map((row) => row.id);
   if (vouchCandidates.length > 0) {
-    const referenced = await client.query<{
+    const stated = await client.query<{
       instrument_id: string;
       institution_id: string;
       institutions: string;
     }>(
       `SELECT instrument_id, min(institution_id) AS institution_id,
-              count(DISTINCT institution_id)::text AS institutions
-         FROM (
-           SELECT t.instrument_id, a.institution_id
-             FROM transactions t JOIN accounts a ON a.id = t.account_id
-            WHERE t.instrument_id = ANY($1::text[])
-           UNION
-           SELECT p.instrument_id, a.institution_id
-             FROM positions p JOIN accounts a ON a.id = p.account_id
-            WHERE p.instrument_id = ANY($1::text[])
-         ) AS referencing
+              count(*)::text AS institutions
+         FROM instrument_identifier_sources
+        WHERE instrument_id = ANY($1::text[])
         GROUP BY instrument_id`,
       [vouchCandidates],
     );
-    for (const row of referenced.rows) {
+    for (const row of stated.rows) {
       vouching.set(row.instrument_id, {
         institutionId: row.institution_id,
         institutions: Number(row.institutions),
@@ -380,6 +417,20 @@ async function prefetchInstruments(
   // isin and symbol if a document ever carries thousands.
   const created: unknown[][] = [];
   const namesLearned = new Map<string, string>();
+  const identifierStated = new Set<string>();
+  /**
+   * F1-76 phase 3. This descriptor stated an identifier, so this institution
+   * is on record as having stated it for this instrument. Recorded in memory
+   * too, so a symbol-only descriptor later in the same pull sees the identifier
+   * its own feed just supplied rather than waiting for the next run.
+   */
+  function stateIdentifier(id: string): void {
+    if (institutionId === null) return;
+    identifierStated.add(id);
+    const known = vouching.get(id);
+    if (known === undefined) vouching.set(id, { institutionId, institutions: 1 });
+    else if (known.institutionId !== institutionId) known.institutions += 1;
+  }
   /**
    * F1-76. A strong match is the one place a name can be filled in safely.
    * The two tiers that reach here matched on a cusip or an isin, so the
@@ -433,9 +484,10 @@ async function prefetchInstruments(
    */
   function refuseReason(
     sharing: readonly InstrumentRow[],
+    only: InstrumentRow,
   ): InstitutionSymbolRefusalReason | null {
-    if (sharing.length !== 1) return "symbol_matches_several_instruments";
-    const only = sharing[0]!;
+    if (sharing.length !== 1 || sharing[0] !== only)
+      return "symbol_matches_several_instruments";
     if (only.cusip === null && only.isin === null)
       return "instrument_has_no_strong_identifier";
     const referenced = vouching.get(only.id);
@@ -451,17 +503,28 @@ async function prefetchInstruments(
   return {
     created,
     namesLearned,
+    identifierStated,
     resolve(instrument) {
       if (instrument.cusip) {
         const found = rows.find((row) => row.cusip === instrument.cusip);
-        if (!found) return mint(instrument);
+        if (!found) {
+          const minted = mint(instrument);
+          stateIdentifier(minted);
+          return minted;
+        }
         learnName(found, instrument);
+        stateIdentifier(found.id);
         return found.id;
       }
       if (instrument.isin) {
         const found = rows.find((row) => row.isin === instrument.isin);
-        if (!found) return mint(instrument);
+        if (!found) {
+          const minted = mint(instrument);
+          stateIdentifier(minted);
+          return minted;
+        }
         learnName(found, instrument);
+        stateIdentifier(found.id);
         return found.id;
       }
       if (instrument.symbol && instrument.name) {
@@ -480,8 +543,15 @@ async function prefetchInstruments(
         // no way to know if it is the *right* row without a stronger
         // identifier -- which is exactly why the match is flagged for review
         // rather than trusted silently, unless the rule below can say more.
-        const sharing = rows.filter((row) => row.symbol === instrument.symbol);
-        const weak = sharing[0];
+        // The rule's uniqueness check is normalized; the row the bare-symbol
+        // tier resolves to is still the first exact-spelling match, exactly as
+        // before. So a case-variant row can only ever add a refusal, never
+        // move a match onto a different instrument.
+        const wanted = normalizeSymbol(instrument.symbol);
+        const sharing = rows.filter(
+          (row) => normalizeSymbol(row.symbol) === wanted,
+        );
+        const weak = rows.find((row) => row.symbol === instrument.symbol);
         if (weak) {
           // F1-76 phase 3. The same-institution symbol rule, between the
           // (symbol AND name) tier and the bare-symbol one. `institutionId`
@@ -490,7 +560,7 @@ async function prefetchInstruments(
           // through to the flagged tier with no reason code, because "the rule
           // refused it" would be a claim about a rule that never ran.
           const refusal =
-            institutionId === null ? null : refuseReason(sharing);
+            institutionId === null ? null : refuseReason(sharing, weak);
           if (institutionId !== null && refusal === null) {
             // The institution vouches for both halves, so the name it prints
             // for this instrument is this instrument's name -- filled under
@@ -570,6 +640,7 @@ async function flushInstruments(
   client: ArchiveClient,
   resolver: InstrumentResolver,
   reviews: ReviewBuffer,
+  institutionId: string | null = null,
 ): Promise<void> {
   await insertRows(client, "instruments", INSTRUMENT_COLUMNS, resolver.created);
   // F1-76. One statement for the whole pull. `WHERE name IS NULL` is the
@@ -588,6 +659,19 @@ async function flushInstruments(
          FROM (SELECT unnest($1::text[]) AS id, unnest($2::text[]) AS name) AS fill
         WHERE i.id = fill.id AND i.name IS NULL`,
       [learned.map(([id]) => id), learned.map(([, name]) => name)],
+    );
+  }
+  // F1-76 phase 3. Written after the instrument insert above, because the
+  // foreign key points at rows this same flush may have just minted. One row
+  // per (instrument, institution); a repeat statement of the same identifier
+  // by the same institution adds nothing, which is what makes a reimport and a
+  // reparse leave this table exactly as they found it.
+  if (institutionId !== null && resolver.identifierStated.size > 0) {
+    await client.query(
+      `INSERT INTO instrument_identifier_sources (instrument_id, institution_id)
+       SELECT unnest($1::text[]), $2
+       ON CONFLICT (instrument_id, institution_id) DO NOTHING`,
+      [[...resolver.identifierStated], institutionId],
     );
   }
   await insertRows(
@@ -1360,7 +1444,7 @@ async function collectDocuments(
       liabilities,
     });
   }
-  await flushInstruments(client, resolver, reviews);
+  await flushInstruments(client, resolver, reviews, pull.institutionId);
   return documents;
 }
 

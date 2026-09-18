@@ -952,6 +952,13 @@ export async function importBatch(
     // item fails can change between runs, and an open item still naming last
     // month's condition is the review queue quietly describing something that
     // is no longer true.
+    //
+    // One reason is never overwritten.
+    // `institution_symbol_match_invalidated` says this archive had accepted
+    // the match and took the acceptance back, which no refusal code says and
+    // which a reparse re-deriving the ordinary refusal would erase. It stands
+    // as long as the item is open; the rule accepting the match again is what
+    // clears it, in `flushInstitutionSymbolMatches`.
     const result = await client.query<{ occurrence_count: number }>(
       `INSERT INTO review_items
          (id, kind, account_id, source_document_id, source_locator, raw_value, reason,
@@ -963,8 +970,10 @@ export async function importBatch(
        DO UPDATE SET
          occurrence_count = review_items.occurrence_count + 1,
          last_seen_document_id = EXCLUDED.last_seen_document_id,
-         reason = EXCLUDED.reason,
-         reason_code = EXCLUDED.reason_code
+         reason = CASE WHEN review_items.reason_code = '${INSTITUTION_SYMBOL_INVALIDATED}'
+                       THEN review_items.reason ELSE EXCLUDED.reason END,
+         reason_code = CASE WHEN review_items.reason_code = '${INSTITUTION_SYMBOL_INVALIDATED}'
+                            THEN review_items.reason_code ELSE EXCLUDED.reason_code END
          WHERE review_items.status = 'open'
        RETURNING occurrence_count`,
       values,
@@ -984,7 +993,13 @@ export async function importBatch(
    * and naming the rule, because an acceptance asks nobody anything and has no
    * business sitting in a queue. `DO NOTHING` on conflict -- the same rule
    * reaching the same conclusion on the next statement adds nothing to the row
-   * it already wrote, which is also what makes a reimport idempotent.
+   * it already wrote, which is also what makes a reimport idempotent. The one
+   * exception is a row this rule itself withdrew
+   * (`institution_symbol_match_invalidated`): if the broken condition holds
+   * again, the acceptance is restored rather than left dismissed beside a
+   * resolved weak item, which together would read as a full identifier match.
+   * A row a *person* dismissed carries the rule's own reason code, never the
+   * withdrawal's, and is never touched.
    *
    * The second closes the `weak_instrument_match` this match used to be. The
    * owner's archive carries 1,330 of them; leaving them open beside an
@@ -1037,7 +1052,11 @@ export async function importBatch(
        VALUES ${tuples.join(", ")}
        ON CONFLICT (kind, institution_id, raw_value, matched_instrument_id)
          WHERE kind IN ('weak_instrument_match', 'institution_symbol_match')
-       DO NOTHING`,
+       DO UPDATE SET status = 'resolved', resolved_at = EXCLUDED.resolved_at,
+                     resolution_note = EXCLUDED.resolution_note,
+                     reason = EXCLUDED.reason, reason_code = EXCLUDED.reason_code
+         WHERE review_items.status = 'dismissed'
+           AND review_items.reason_code = '${INSTITUTION_SYMBOL_INVALIDATED}'`,
       values,
     );
 
@@ -1101,34 +1120,30 @@ export async function importBatch(
       reason_code: InstitutionSymbolRefusalReason;
     }>(
       `WITH touched AS (
-         SELECT id, symbol FROM instruments WHERE id = ANY($1::text[])
+         SELECT id, upper(btrim(symbol)) AS symbol FROM instruments
+          WHERE id = ANY($1::text[])
        ),
        item AS (
-         SELECT r.id, r.institution_id, r.raw_value, r.matched_instrument_id, i.symbol
+         SELECT r.id, r.institution_id, r.raw_value, r.matched_instrument_id,
+                upper(btrim(i.symbol)) AS symbol
            FROM review_items r
            JOIN instruments i ON i.id = r.matched_instrument_id
           WHERE r.kind = 'institution_symbol_match' AND r.status = 'resolved'
             AND (r.matched_instrument_id IN (SELECT id FROM touched)
-                 OR (i.symbol IS NOT NULL AND i.symbol IN
+                 OR (i.symbol IS NOT NULL AND upper(btrim(i.symbol)) IN
                        (SELECT symbol FROM touched WHERE symbol IS NOT NULL)))
        ),
        sharing AS (
-         SELECT i.symbol, count(*) AS n FROM instruments i
-          WHERE i.symbol IN (SELECT symbol FROM item WHERE symbol IS NOT NULL)
-          GROUP BY i.symbol
+         SELECT upper(btrim(i.symbol)) AS symbol, count(*) AS n FROM instruments i
+          WHERE upper(btrim(i.symbol)) IN
+                (SELECT symbol FROM item WHERE symbol IS NOT NULL)
+          GROUP BY upper(btrim(i.symbol))
        ),
        refs AS (
-         SELECT s.instrument_id, count(DISTINCT s.institution_id) AS institutions,
+         SELECT s.instrument_id, count(*) AS institutions,
                 min(s.institution_id) AS institution_id
-           FROM (
-             SELECT t.instrument_id, a.institution_id
-               FROM transactions t JOIN accounts a ON a.id = t.account_id
-              WHERE t.instrument_id IN (SELECT matched_instrument_id FROM item)
-             UNION
-             SELECT p.instrument_id, a.institution_id
-               FROM positions p JOIN accounts a ON a.id = p.account_id
-              WHERE p.instrument_id IN (SELECT matched_instrument_id FROM item)
-           ) AS s
+           FROM instrument_identifier_sources s
+          WHERE s.instrument_id IN (SELECT matched_instrument_id FROM item)
           GROUP BY s.instrument_id
        )
        SELECT * FROM (
@@ -1154,7 +1169,7 @@ export async function importBatch(
 
     await client.query(
       `UPDATE review_items SET status = 'dismissed', resolved_at = $2,
-              resolution_note = $3
+              resolution_note = $3, reason_code = '${INSTITUTION_SYMBOL_INVALIDATED}'
         WHERE id = ANY($1::text[]) AND status = 'resolved'`,
       [
         stale.rows.map((row) => row.id),
@@ -1181,9 +1196,13 @@ export async function importBatch(
         `${institutionId}, ${matchedInstrumentId}, 1)`
       );
     });
-    // A reopened item is never one a person dismissed: dismissal is their
-    // answer to this same question, and a rule that reopened it would be
-    // relitigating a decision it does not own.
+    // Unconditional, including over an item a person dismissed. A dismissal
+    // answered "is this weak match acceptable" against evidence that has since
+    // changed, and this is a different question about different evidence, not
+    // the same one asked again. Leaving a dismissed item alone here would let
+    // the position keep reading as a settled identity while this run counted
+    // the acceptance as withdrawn -- exactly the silence the owner's
+    // requirement forbids. A withdrawal always leaves an open item.
     const reopened = await client.query(
       `INSERT INTO review_items
          (id, kind, account_id, source_document_id, source_locator, raw_value, reason,
@@ -1192,8 +1211,7 @@ export async function importBatch(
        ON CONFLICT (kind, institution_id, raw_value, matched_instrument_id)
          WHERE kind IN ('weak_instrument_match', 'institution_symbol_match')
        DO UPDATE SET status = 'open', resolved_at = NULL, resolution_note = NULL,
-                     reason = EXCLUDED.reason, reason_code = EXCLUDED.reason_code
-         WHERE review_items.status <> 'dismissed'`,
+                     reason = EXCLUDED.reason, reason_code = EXCLUDED.reason_code`,
       values,
     );
     reviewItemsOpened += reopened.rowCount ?? 0;

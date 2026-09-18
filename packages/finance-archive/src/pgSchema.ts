@@ -849,12 +849,31 @@ $$;
 // and a match can hold one of each: an accepted row and, after an
 // invalidation, the reflagged weak row beside it.
 //
-// The two instrument indexes are the third. Deciding whether an institution
-// vouched for an instrument's identifier means asking which institutions' rows
-// reference it, and neither table could answer that without a sequential scan
-// (`transactions` is indexed on account and date, `positions` on account and
-// as_of). A whole-archive reparse asks it once per document, so the scan is
-// the difference between a query and a reparse that does not finish.
+// `instrument_identifier_sources` is the third, and it is the rule's whole
+// evidence base. The obvious way to ask "did this institution's own data
+// establish this instrument's identifier" is to ask which institutions' rows
+// reference the instrument, and that answer is circular: a statement holding
+// matched by symbol alone writes a `positions` row referencing the instrument
+// while carrying no identifier at all, and the next statement would then see
+// exactly one institution referencing it and accept the very match the first
+// one was refused, with no feed ever having vouched for anything. A row is
+// evidence only if it could have *carried* the identifier, and neither
+// `transactions` nor `positions` records whether the descriptor behind it did.
+//
+// So it is recorded rather than inferred. One row per (instrument,
+// institution) whose parsed descriptor actually stated a cusip or an isin,
+// written by `flushInstruments` (adapterImport.ts) at mint and at every cusip-
+// or isin-strong match. The composite primary key is the whole constraint:
+// "how many institutions have stated an identifier for this instrument" is
+// `count(*)`, and "none" and "several" are both representable, which a single
+// column on `instruments` could not do.
+//
+// No backfill here, the same honest-null policy every migration above uses. An
+// instrument minted before this table existed has no recorded source, and the
+// rule refuses it (`instrument_has_no_institution_evidence`) rather than
+// guessing. `scripts/backfillInstrumentIdentifierSources.mjs` reconstructs them
+// for an existing archive, from `transactions` only -- see that script for why
+// a position is never evidence.
 const INSTRUMENT_MATCH_AUDIT = `
 ALTER TABLE review_items
   ADD COLUMN reason_code TEXT
@@ -873,10 +892,12 @@ CREATE UNIQUE INDEX review_items_instrument_match_key
   ON review_items (kind, institution_id, raw_value, matched_instrument_id)
   WHERE kind IN ('weak_instrument_match', 'institution_symbol_match');
 
-CREATE INDEX transactions_instrument ON transactions (instrument_id)
-  WHERE instrument_id IS NOT NULL;
-CREATE INDEX positions_instrument ON positions (instrument_id)
-  WHERE instrument_id IS NOT NULL;
+CREATE TABLE instrument_identifier_sources (
+  instrument_id TEXT NOT NULL REFERENCES instruments(id) ON DELETE CASCADE,
+  institution_id TEXT NOT NULL REFERENCES institutions(id),
+  first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (instrument_id, institution_id)
+);
 `;
 
 /** Every migration, in order. The last one's version is the current schema. */
@@ -943,7 +964,7 @@ export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
   },
   {
     version: 13,
-    name: "review_items.reason_code, a shared instrument-match identity index, and instrument reference indexes",
+    name: "review_items.reason_code, a shared instrument-match identity index, and instrument_identifier_sources",
     sql: INSTRUMENT_MATCH_AUDIT,
   },
 ]);
@@ -968,6 +989,7 @@ export const PG_TABLES: readonly string[] = Object.freeze([
   "position_reconciliations",
   "review_items",
   "account_aliases",
+  "instrument_identifier_sources",
   "retained_texts",
   "finance_read_revision",
 ]);
