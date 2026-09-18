@@ -10,6 +10,10 @@ import { WatchHeartbeat } from "./diagnostics.js";
 import { runArchiveForget } from "./archiveForget.js";
 import { openArchiveCatalog } from "./archiveCatalog.js";
 import { doctorFromPath, formatDoctorResult } from "./doctor.js";
+import {
+  formatReconcileResult,
+  reconcileReceiptsFromPath,
+} from "./reconcileReceipts.js";
 import { Journal, JournalCredentialChangedError } from "./journal.js";
 import { initialCheckpoint, journalCodec, PipelineRunner } from "./runner.js";
 import { HttpWorkerTransport } from "./transport.js";
@@ -23,12 +27,18 @@ import type { RunnerCheckpoint } from "./runnerState.js";
 
 function usage(): never {
   throw new Error(
-    "Usage: pnpm brain:worker -- <run|watch|doctor> --config <path> [--json], or forget-archive --config <path> --source-item <id> --source-external-id <uuid> --forget-epoch <n> [--json]",
+    "Usage: pnpm brain:worker -- <run|watch|doctor> --config <path> [--json], or reconcile-receipts --config <path> [--apply] [--json], or forget-archive --config <path> --source-item <id> --source-external-id <uuid> --forget-epoch <n> [--json]",
   );
 }
 export function argumentsFor(argv: string[]):
   | { command: "run" | "watch"; configPath: string }
   | { command: "doctor"; configPath: string; json: boolean }
+  | {
+      command: "reconcile-receipts";
+      configPath: string;
+      apply: boolean;
+      json: boolean;
+    }
   | {
       command: "forget-archive";
       configPath: string;
@@ -85,15 +95,30 @@ export function argumentsFor(argv: string[]):
     };
   }
   const [command, flag, configPath, ...extra] = forwarded;
+  const allowed =
+    command === "doctor"
+      ? ["--json"]
+      : command === "reconcile-receipts"
+        ? ["--json", "--apply"]
+        : [];
   if (
-    (command !== "run" && command !== "watch" && command !== "doctor") ||
+    (command !== "run" &&
+      command !== "watch" &&
+      command !== "doctor" &&
+      command !== "reconcile-receipts") ||
     flag !== "--config" ||
     !configPath ||
-    extra.some((value) => value !== "--json") ||
-    extra.length > 1 ||
-    (command !== "doctor" && extra.length)
+    extra.some((value) => !allowed.includes(value)) ||
+    new Set(extra).size !== extra.length
   )
     usage();
+  if (command === "reconcile-receipts")
+    return {
+      command,
+      configPath,
+      apply: extra.includes("--apply"),
+      json: extra.includes("--json"),
+    };
   return command === "doctor"
     ? { command, configPath, json: extra.includes("--json") }
     : { command, configPath };
@@ -284,6 +309,20 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           : `archive forget: ${result.state} (${result.code})\n`,
     );
     if (result.state !== "owner_finalization_required") process.exitCode = 1;
+    return;
+  }
+  if (command === "reconcile-receipts") {
+    const result = await reconcileReceiptsFromPath(
+      configPath,
+      parsed.apply,
+      (config, credential) => new HttpWorkerTransport(config, credential),
+    );
+    process.stdout.write(
+      parsed.json
+        ? `${JSON.stringify(result)}\n`
+        : `${formatReconcileResult(result)}\n`,
+    );
+    if (result.state === "refused") process.exitCode = 1;
     return;
   }
   if (command === "doctor") {

@@ -26,6 +26,10 @@ import {
 } from "../dist/runner.js";
 import { ParserProcessError } from "../dist/parserProcess.js";
 import { persistProviderBinding } from "../dist/providerRegistry.js";
+import {
+  reconcileReceiptsFromPath,
+  runReconcileReceipts,
+} from "../dist/reconcileReceipts.js";
 import { parseRunnerCheckpoint } from "../dist/runnerState.js";
 
 const HASH = "a".repeat(64);
@@ -2724,8 +2728,446 @@ function admissionCatalog(read, write) {
       });
       return read().processing;
     },
+    listOriginals() {
+      return [read().original];
+    },
+    listProcessings() {
+      return [read().processing];
+    },
+    async clearVoidAdmission(args) {
+      const rows = read();
+      const key = args.subject === "original_bytes" ? "original" : "processing";
+      const row = rows[key];
+      const copies = Object.fromEntries(
+        Object.entries(row.copies).map(([role, copy]) => {
+          const { cloudReceipt, ...rest } = copy;
+          return [role, rest];
+        }),
+      );
+      const { cloud, ...withoutCloud } = row;
+      // The real catalog writes the note once and bumps the revision only when
+      // the row actually changed, so a repeat call is free.
+      const changed =
+        cloud !== undefined ||
+        row.receiptReconcile === undefined ||
+        Object.values(row.copies).some((copy) => copy.cloudReceipt);
+      write({
+        ...rows,
+        [key]: {
+          ...withoutCloud,
+          copies,
+          rowRevision: row.rowRevision + (changed ? 1 : 0),
+          receiptReconcile: row.receiptReconcile ?? {
+            code: "original_receipt_unknown_to_server",
+            clearedAt: args.clearedAt,
+          },
+        },
+      });
+      return read()[key];
+    },
   };
 }
+
+/** The 2026-09-18 receipt: ids from a deployment that no longer serves this account. */
+function voidReceiptRows(checkpoint, admittedAt) {
+  const rows = durableProviderRows(checkpoint, admittedAt);
+  const plan = checkpoint.files[checkpoint.pdfIndex];
+  rows.processing.currentObservation = {
+    scanId: checkpoint.scanId,
+    observationEpoch: plan.observationEpoch,
+    processingEpoch: plan.processingEpoch,
+  };
+  rows.original.copies.primary.cloudReceipt = {
+    receiptId: "original-primary",
+    requestDigest: HASH,
+    recordedAt: admittedAt,
+  };
+  rows.original.cloud = {
+    sourceItemId: "item-from-the-other-backend",
+    sourceRevisionId: "revision-from-the-other-backend",
+    primaryReceiptId: "original-primary",
+    providerReferenceId: "provider-reference",
+    providerBindingEpoch: 0,
+    admittedAt,
+  };
+  return rows;
+}
+
+/** The live checkpoint: resumed at admit, question asked, lease long dead. */
+function voidReceiptCheckpoint(plan) {
+  return archivedCheckpoint(plan, {
+    step: "admit",
+    preflightAction: undefined,
+    receiptChecked: true,
+    discoveryLease: {
+      workId: "work",
+      sourceItemId: plan.sourceItemId,
+      observationEpoch: 1,
+      processingEpoch: 1,
+      leaseEpoch: 9,
+      leaseToken: TOKEN,
+      leaseExpiresAt: Date.now() - 60 * 60_000,
+    },
+  });
+}
+
+function lookupResponse(found) {
+  return {
+    operation: "discovery.lookupArchivedAdmission",
+    mode: "original",
+    found,
+    ...(found
+      ? {
+          sourceRevisionId: "revision",
+          originalPrimaryReceiptId: "original-primary",
+          originalProviderReferenceId: "provider-reference",
+          originalProviderBindingEpoch: 0,
+        }
+      : {}),
+  };
+}
+
+test("an operator reconcile clears a void receipt and the next pass admits exactly once", async () => {
+  const setup = await fixture(0);
+  const plan = pdfPlan();
+  const checkpoint = voidReceiptCheckpoint(plan);
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  let rows = voidReceiptRows(checkpoint, Date.now() - 120 * 60_000);
+  const locator = rows.original.providerOriginal.locator;
+  const before = {
+    published: structuredClone(rows.original.copies.primary.published),
+    locator: structuredClone(locator),
+    verified: structuredClone(rows.original.providerOriginal.verified),
+  };
+  const catalog = admissionCatalog(
+    () => rows,
+    (next) => (rows = next),
+  );
+  const sent = [];
+  const transport = {
+    async call(request) {
+      sent.push(request.operation);
+      if (request.operation === "discovery.lookupArchivedAdmission")
+        return lookupResponse(false);
+      if (request.operation === "discovery.reserveArchived")
+        return {
+          operation: "discovery.reserveArchived",
+          workId: "work",
+          sourceItemId: plan.sourceItemId,
+          observationEpoch: plan.observationEpoch,
+          processingEpoch: plan.processingEpoch,
+          leaseEpoch: 2,
+          leaseToken: TOKEN,
+          leaseExpiresAt: Date.now() + 60_000,
+          reused: false,
+        };
+      if (request.operation === "jobs.reserveParsed")
+        return {
+          operation: "jobs.reserveParsed",
+          receiptId: randomUUID(),
+          expiresAt: Date.now() + 60_000,
+          reused: false,
+          targets: [
+            {
+              jobId: "job",
+              workId: "work",
+              sourceItemId: plan.sourceItemId,
+              observationEpoch: plan.observationEpoch,
+              processingEpoch: plan.processingEpoch,
+              state: "processing",
+              leaseEpoch: 1,
+              leaseToken: TOKEN,
+              leaseExpiresAt: Date.now() + 60_000,
+            },
+          ],
+        };
+      return admittedResponse(plan);
+    },
+  };
+  const runner = new PipelineRunner(setup.config, journal, transport);
+  runner.archivedRows = () => rows;
+  runner.mappedProcessing = async () => ({
+    original: rows.original,
+    processing: rows.processing,
+    declaration: parsedDeclaration(),
+  });
+  runner.archiveCatalog = catalog;
+  let refreshes = 0;
+  runner.refreshProviderProof = async (current) => {
+    refreshes += 1;
+    rows = freshenProviderProof(rows);
+    await journal.transitionCheckpoint({
+      checkpoint: parseRunnerCheckpoint({ ...current }),
+      credentialSessionActive: true,
+    });
+  };
+  try {
+    const result = await runReconcileReceipts({
+      config: setup.config,
+      journal,
+      catalog,
+      transport,
+      apply: true,
+    });
+    assert.deepEqual(result, {
+      state: "reconciled",
+      scope: "checkpoint_original",
+      applied: true,
+      originalsWithReceipts: 1,
+      receiptsChecked: 1,
+      receiptsConfirmed: 0,
+      receiptsUnknown: 1,
+    });
+    assert.deepEqual(sent, ["discovery.lookupArchivedAdmission"]);
+    // Everything a fresh admission must rewrite is gone.
+    assert.equal(rows.original.cloud, undefined);
+    assert.equal(rows.original.copies.primary.cloudReceipt, undefined);
+    assert.equal(rows.processing.cloud, undefined);
+    assert.equal(rows.processing.copies.primary.cloudReceipt, undefined);
+    assert.equal(
+      rows.processing.copies.independent_backup.cloudReceipt,
+      undefined,
+    );
+    assert.equal(
+      rows.original.receiptReconcile.code,
+      "original_receipt_unknown_to_server",
+    );
+    // The bytes stay archived. Only the server-side receipt was void.
+    assert.deepEqual(rows.original.copies.primary.published, before.published);
+    assert.deepEqual(rows.original.providerOriginal.locator, before.locator);
+    assert.deepEqual(rows.original.providerOriginal.verified, before.verified);
+    // The checkpoint rewinds to the read-only lookup with the question
+    // unasked, the dead lease dropped and both revisions in step.
+    assert.equal(journal.checkpoint.step, "lookup_original");
+    assert.equal(journal.checkpoint.receiptChecked, undefined);
+    assert.equal(journal.checkpoint.discoveryLease, undefined);
+    assert.equal(
+      journal.checkpoint.expectedOriginalRevision,
+      rows.original.rowRevision,
+    );
+    assert.equal(
+      journal.checkpoint.expectedProcessingRevision,
+      rows.processing.rowRevision,
+    );
+
+    // The next normal pass. The same not-found answer is now the ordinary
+    // "never admitted" one, because no local receipt contradicts it.
+    await runner.driveArchivedLookupOriginal();
+    assert.equal(journal.checkpoint.step, "capture");
+    // Capture, parse and archive rebuild the durable rows unchanged; the
+    // reconcile touched none of them. The pass arrives at `reserve`.
+    await journal.transitionCheckpoint({
+      checkpoint: parseRunnerCheckpoint({
+        ...journal.checkpoint,
+        step: "reserve",
+      }),
+      credentialSessionActive: true,
+    });
+    await runner.driveArchivedReserve();
+    assert.equal(journal.checkpoint.step, "admit");
+    // The proof is two hours old, so P2-31a refreshes it in place first.
+    await runner.driveArchivedAdmit();
+    assert.equal(refreshes, 1);
+    assert.equal(journal.checkpoint.step, "admit");
+    await runner.driveArchivedAdmit();
+    assert.equal(journal.checkpoint.step, "parsed_reserve");
+    await runner.driveParsedReserve();
+    assert.equal(journal.checkpoint.step, "parsed_begin");
+    assert.deepEqual(sent, [
+      "discovery.lookupArchivedAdmission",
+      "discovery.lookupArchivedAdmission",
+      "discovery.reserveArchived",
+      "discovery.admitArchived",
+      "jobs.reserveParsed",
+    ]);
+    assert.equal(rows.original.cloud.sourceItemId, plan.sourceItemId);
+    assert.equal(rows.original.cloud.providerReferenceId, "provider-reference");
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a reconcile dry run counts the void receipt and writes nothing", async () => {
+  const setup = await fixture(0);
+  const plan = pdfPlan();
+  const checkpoint = voidReceiptCheckpoint(plan);
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  let rows = voidReceiptRows(checkpoint, Date.now() - 120 * 60_000);
+  const before = structuredClone(rows);
+  try {
+    const result = await runReconcileReceipts({
+      config: setup.config,
+      journal,
+      catalog: admissionCatalog(
+        () => rows,
+        (next) => (rows = next),
+      ),
+      transport: {
+        async call() {
+          return lookupResponse(false);
+        },
+      },
+      apply: false,
+    });
+    assert.deepEqual(result, {
+      state: "unknown_receipt_found",
+      scope: "checkpoint_original",
+      applied: false,
+      originalsWithReceipts: 1,
+      receiptsChecked: 1,
+      receiptsConfirmed: 0,
+      receiptsUnknown: 1,
+    });
+    assert.deepEqual(rows, before);
+    assert.deepEqual(journal.checkpoint, checkpoint);
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a receipt the server confirms is never cleared, even under --apply", async () => {
+  const setup = await fixture(0);
+  const plan = pdfPlan();
+  const checkpoint = voidReceiptCheckpoint(plan);
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  let rows = voidReceiptRows(checkpoint, Date.now() - 120 * 60_000);
+  const before = structuredClone(rows);
+  try {
+    const result = await runReconcileReceipts({
+      config: setup.config,
+      journal,
+      catalog: admissionCatalog(
+        () => rows,
+        (next) => (rows = next),
+      ),
+      transport: {
+        async call() {
+          return lookupResponse(true);
+        },
+      },
+      apply: true,
+    });
+    assert.deepEqual(result, {
+      state: "clean",
+      scope: "checkpoint_original",
+      applied: false,
+      originalsWithReceipts: 1,
+      receiptsChecked: 1,
+      receiptsConfirmed: 1,
+      receiptsUnknown: 0,
+    });
+    assert.deepEqual(rows, before);
+    assert.deepEqual(journal.checkpoint, checkpoint);
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a reconcile interrupted before its checkpoint move finishes on the rerun", async () => {
+  const setup = await fixture(0);
+  const plan = pdfPlan();
+  const checkpoint = voidReceiptCheckpoint(plan);
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  // The crash window: both catalog writes committed, the checkpoint did not.
+  let rows = voidReceiptRows(checkpoint, Date.now() - 120 * 60_000);
+  const catalog = admissionCatalog(
+    () => rows,
+    (next) => (rows = next),
+  );
+  const clearedAt = Date.now();
+  for (const subject of ["parser_output", "original_bytes"])
+    await catalog.clearVoidAdmission({
+      subject,
+      catalogId:
+        subject === "original_bytes"
+          ? rows.original.originalCatalogId
+          : rows.processing.processingCatalogId,
+      expectedRevision: 1,
+      clearedAt,
+    });
+  const committed = structuredClone(rows);
+  const sent = [];
+  const transport = {
+    async call(request) {
+      sent.push(request.operation);
+      throw new Error("a cleared row has nothing left to ask about");
+    },
+  };
+  try {
+    const first = await runReconcileReceipts({
+      config: setup.config,
+      journal,
+      catalog,
+      transport,
+      apply: true,
+    });
+    assert.equal(first.state, "reconciled");
+    assert.equal(first.originalsWithReceipts, 0);
+    assert.deepEqual(sent, [], "the answer is already recorded in the note");
+    assert.deepEqual(rows, committed, "the catalog writes are not repeated");
+    assert.equal(journal.checkpoint.step, "lookup_original");
+    assert.equal(journal.checkpoint.discoveryLease, undefined);
+    // Idempotent: nothing is left to reconcile.
+    const second = await runReconcileReceipts({
+      config: setup.config,
+      journal,
+      catalog,
+      transport,
+      apply: true,
+    });
+    assert.deepEqual(second, {
+      state: "clean",
+      scope: "checkpoint_original",
+      applied: false,
+      originalsWithReceipts: 0,
+      receiptsChecked: 0,
+      receiptsConfirmed: 0,
+      receiptsUnknown: 0,
+    });
+    assert.deepEqual(rows, committed);
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a reconcile refuses a journal the watcher still holds", async () => {
+  const setup = await fixture(0);
+  const plan = pdfPlan();
+  const journal = await openJournal(
+    setup.journalDir,
+    voidReceiptCheckpoint(plan),
+  );
+  const configPath = join(setup.base, "pipeline.json");
+  await writeFile(configPath, JSON.stringify(setup.config), { mode: 0o600 });
+  const previous = process.env.PIPELINE_TOKEN;
+  process.env.PIPELINE_TOKEN = "test-credential";
+  try {
+    const result = await reconcileReceiptsFromPath(configPath, true, () => ({
+      async call() {
+        throw new Error("a contended journal is never read");
+      },
+    }));
+    assert.deepEqual(result, {
+      state: "refused",
+      scope: "checkpoint_original",
+      applied: false,
+      originalsWithReceipts: 0,
+      receiptsChecked: 0,
+      receiptsConfirmed: 0,
+      receiptsUnknown: 0,
+      code: "journal_contended",
+    });
+  } finally {
+    if (previous === undefined) delete process.env.PIPELINE_TOKEN;
+    else process.env.PIPELINE_TOKEN = previous;
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
 
 test("a stale proof refreshes before any new lease and the recovery pass reserves once", async () => {
   const setup = await fixture(0);

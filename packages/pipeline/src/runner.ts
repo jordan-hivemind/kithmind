@@ -359,6 +359,32 @@ function archivedIdentity(
   };
 }
 
+/**
+ * P2-31d. The identity `driveArchivedLookupOriginal` addresses its read-only
+ * lookup with, for whatever original the checkpoint is currently on. The
+ * server resolves that lookup through `resolveCurrentArchivedWork` and then
+ * `requireIdentity`, which match a live `worker_discovery_work` row field for
+ * field, so the whole identity is required and only the scan plan carries it:
+ * the catalog rows hold the scan, observation epoch, hash and byte length but
+ * none of the six parser and extraction fingerprints, the correction revision
+ * or the processing epoch. An arbitrary catalog row therefore cannot be asked
+ * about; the checkpoint's own original can.
+ */
+export function archivedCheckpointIdentity(
+  checkpoint: RunnerCheckpoint,
+): ArchivedWorkIdentity | undefined {
+  if (checkpoint.phase !== "archived") return undefined;
+  const plan = checkpoint.files[checkpoint.pdfIndex];
+  if (!plan || !isPdfPlan(plan)) return undefined;
+  try {
+    return archivedIdentity(checkpoint, plan);
+  } catch {
+    // `archived_parent_missing`: the plan has no parent yet, so no admission
+    // against it can exist and there is nothing to ask the server about.
+    return undefined;
+  }
+}
+
 function archivedBase(
   checkpoint: ArchivedCheckpoint,
   updates: Partial<ArchivedCheckpoint> = {},

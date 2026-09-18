@@ -41,6 +41,48 @@ test("the root pnpm alias forwarding separator is consumed exactly once", () => 
   );
 });
 
+test("reconcile-receipts takes only its own two optional flags", () => {
+  assert.deepEqual(
+    argumentsFor(["reconcile-receipts", "--config", "/tmp/config.json"]),
+    {
+      command: "reconcile-receipts",
+      configPath: "/tmp/config.json",
+      apply: false,
+      json: false,
+    },
+  );
+  assert.deepEqual(
+    argumentsFor([
+      "--",
+      "reconcile-receipts",
+      "--config",
+      "/tmp/config.json",
+      "--apply",
+      "--json",
+    ]),
+    {
+      command: "reconcile-receipts",
+      configPath: "/tmp/config.json",
+      apply: true,
+      json: true,
+    },
+  );
+  for (const args of [
+    [
+      "reconcile-receipts",
+      "--config",
+      "/tmp/config.json",
+      "--apply",
+      "--apply",
+    ],
+    ["reconcile-receipts", "--config", "/tmp/config.json", "--space", "x"],
+    ["reconcile-receipts", "--apply"],
+    ["run", "--config", "/tmp/config.json", "--apply"],
+    ["doctor", "--config", "/tmp/config.json", "--apply"],
+  ])
+    assert.throws(() => argumentsFor(args));
+});
+
 test("archive forget requires an exact source identity and epoch", () => {
   const parsed = argumentsFor([
     "forget-archive",
