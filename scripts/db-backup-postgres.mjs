@@ -107,6 +107,26 @@ function fail(code, detail) {
   throw new PostgresBackupError(code, detail);
 }
 
+// A restic repository is either a local absolute path or restic's rclone
+// backend spec (`rclone:<remote>:<path>`), which is how the owner's
+// Dropbox-independent repository is reached. restic finds `rclone` on PATH.
+const RCLONE_REPOSITORY = /^rclone:[A-Za-z0-9][A-Za-z0-9_-]{0,63}:[^\0]{1,1024}$/;
+function resticRepository(value) {
+  const spec = text(value, 1100);
+  if (RCLONE_REPOSITORY.test(spec)) return spec;
+  return absolute(spec);
+}
+
+// An age recipient is a bech32 string; plugin recipients (`age1<plugin>1...`,
+// such as the post-quantum plugin's) run to a few thousand characters, so
+// the bound is well above a native X25519 recipient's 62.
+const AGE_RECIPIENT = /^age1[a-z0-9]{58,4000}$/;
+function ageRecipient(value) {
+  const recipient = text(value, 4096);
+  if (!AGE_RECIPIENT.test(recipient)) fail("config_invalid");
+  return recipient;
+}
+
 function parseSecretCommand(value) {
   const row = exact(value, ["path", "args"]);
   if (!Array.isArray(row.args) || row.args.length > 16) fail("config_invalid");
@@ -165,9 +185,9 @@ function parseBackupConfig(value) {
     psqlPath: absolute(row.psqlPath),
     pgDumpPath: absolute(row.pgDumpPath),
     ageBinary: absolute(row.ageBinary),
-    ageRecipient: text(row.ageRecipient, 200),
+    ageRecipient: ageRecipient(row.ageRecipient),
     resticBinary: absolute(row.resticBinary),
-    resticRepositoryPath: absolute(row.resticRepositoryPath),
+    resticRepositoryPath: resticRepository(row.resticRepositoryPath),
     resticPasswordCommand: parseSecretCommand(row.resticPasswordCommand),
     expectedResticRepositoryId: row.expectedResticRepositoryId,
     host: row.host,
@@ -243,7 +263,7 @@ function parseVerifyConfig(value) {
     ageIdentityPath: absolute(row.ageIdentityPath),
     restoreProofConfigPath: absolute(row.restoreProofConfigPath),
     resticBinary: absolute(row.resticBinary),
-    resticRepositoryPath: absolute(row.resticRepositoryPath),
+    resticRepositoryPath: resticRepository(row.resticRepositoryPath),
     resticPasswordCommand: parseSecretCommand(row.resticPasswordCommand),
     expectedResticRepositoryId: row.expectedResticRepositoryId,
     host: row.host,

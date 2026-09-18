@@ -111,6 +111,15 @@ The engine, in order:
    encryption of the dump and manifest, a restic repository identity check
    before publication, and `restic backup` tagged with the host and operation
    id.
+   `resticRepositoryPath` is either a local absolute path or restic's rclone
+   backend spec, `rclone:<remote>:<path>`, which is how the
+   [Dropbox-independent repository](plans/2026-09-08-dropbox-independent-backup.md)
+   is reached. The engine does not vet `rclone` itself: restic resolves it
+   from `PATH`, so the operator puts a protected wrapper named `rclone`, one
+   that execs the pinned rclone binary with the dedicated `--config`, first on
+   the `PATH` the engine runs under. A wrong or hostile rclone only ever sees
+   ciphertext, and the repository identity check plus the separate-process
+   readback below still fail closed.
 6. **Separate-process verification.** A freshly spawned process, holding only
    the verify-only age identity (never the encryption recipient's public key
    path used to publish), re-downloads the ciphertext with a fresh `--no-cache`
