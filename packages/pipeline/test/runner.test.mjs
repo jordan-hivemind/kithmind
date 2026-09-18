@@ -3169,6 +3169,190 @@ test("a reconcile refuses a journal the watcher still holds", async () => {
   }
 });
 
+test("a reconcile clears the lookup the P2-31c throw leaves pending forever", async () => {
+  const setup = await fixture(0);
+  const plan = pdfPlan();
+  // The true live shape: resumed at admit, the receipt question never asked.
+  const checkpoint = archivedCheckpoint(plan, {
+    step: "admit",
+    preflightAction: undefined,
+    discoveryLease: {
+      workId: "work",
+      sourceItemId: plan.sourceItemId,
+      observationEpoch: 1,
+      processingEpoch: 1,
+      leaseEpoch: 9,
+      leaseToken: TOKEN,
+      leaseExpiresAt: Date.now() - 60 * 60_000,
+    },
+  });
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  let rows = voidReceiptRows(checkpoint, Date.now() - 120 * 60_000);
+  const catalog = admissionCatalog(
+    () => rows,
+    (next) => (rows = next),
+  );
+  const sent = [];
+  const transport = {
+    async call(request) {
+      sent.push(request.operation);
+      return lookupResponse(false);
+    },
+  };
+  const runner = new PipelineRunner(setup.config, journal, transport);
+  runner.archivedRows = () => rows;
+  runner.mappedProcessing = async () => ({
+    original: rows.original,
+    processing: rows.processing,
+    declaration: parsedDeclaration(),
+  });
+  runner.archiveCatalog = catalog;
+  try {
+    // A real pass reaches the contradiction, exactly as P2-31c intends.
+    await runner.driveArchivedAdmit();
+    assert.equal(journal.checkpoint.step, "lookup_original");
+    await assert.rejects(
+      () => runner.driveArchivedLookupOriginal(),
+      (error) => error.code === "original_receipt_unknown_to_server",
+    );
+    // The throw happens inside the journaled transition, so `commitResult` is
+    // never reached and the answered lookup stays unresolved. Every later pass
+    // replays it into the same throw without a second round trip, so no `run`
+    // can drain it and a blanket pending refusal would strand the operator.
+    assert.equal(
+      journal.pending.operation,
+      "discovery.lookupArchivedAdmission",
+    );
+    assert.equal(journal.pending.result.value.found, false);
+    await assert.rejects(
+      () => runner.driveArchivedLookupOriginal(),
+      (error) => error.code === "original_receipt_unknown_to_server",
+    );
+    assert.deepEqual(sent, ["discovery.lookupArchivedAdmission"]);
+
+    const result = await runReconcileReceipts({
+      config: setup.config,
+      journal,
+      catalog,
+      transport,
+      apply: true,
+    });
+    assert.equal(result.state, "reconciled");
+    assert.equal(result.receiptsUnknown, 1);
+    assert.deepEqual(
+      sent,
+      ["discovery.lookupArchivedAdmission"],
+      "the recorded answer is reused",
+    );
+    assert.equal(rows.original.cloud, undefined);
+    assert.equal(rows.original.copies.primary.cloudReceipt, undefined);
+    // The checkpoint is left alone: a transition refuses while a request is
+    // unresolved, and the pending replay makes the same move by itself.
+    assert.equal(journal.checkpoint.step, "lookup_original");
+    assert.notEqual(journal.pending, undefined);
+
+    // The next pass. The same recorded answer now walks the ordinary path.
+    await runner.driveArchivedLookupOriginal();
+    assert.equal(journal.checkpoint.step, "capture");
+    assert.equal(journal.pending, undefined);
+    assert.deepEqual(sent, ["discovery.lookupArchivedAdmission"]);
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a reconcile dry run refuses a processing receipt naming another revision", async () => {
+  const setup = await fixture(0);
+  const plan = pdfPlan();
+  const checkpoint = voidReceiptCheckpoint(plan);
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  let rows = voidReceiptRows(checkpoint, Date.now() - 120 * 60_000);
+  rows.processing.cloud = {
+    sourceItemId: "item-from-the-other-backend",
+    sourceRevisionId: "a-revision-the-original-never-named",
+    parserArtifactId: "artifact",
+    sourceTextVersionId: "text",
+    processingGenerationId: "generation",
+    ingestJobId: "job",
+    processingFingerprint: HASH,
+    admissionRequestDigest: HASH,
+    admittedAt: 1,
+  };
+  const before = structuredClone(rows);
+  try {
+    // The dry run must name it too: an operator reading a count has to see
+    // what `--apply` would have hit.
+    for (const apply of [false, true]) {
+      const result = await runReconcileReceipts({
+        config: setup.config,
+        journal,
+        catalog: admissionCatalog(
+          () => rows,
+          (next) => (rows = next),
+        ),
+        transport: {
+          async call() {
+            return lookupResponse(false);
+          },
+        },
+        apply,
+      });
+      assert.equal(result.state, "refused");
+      assert.equal(result.code, "processing_receipt_conflict");
+      assert.deepEqual(rows, before);
+      assert.deepEqual(journal.checkpoint, checkpoint);
+    }
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a reconcile refuses an activated processing row", async () => {
+  const setup = await fixture(0);
+  const plan = pdfPlan();
+  const checkpoint = voidReceiptCheckpoint(plan);
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  let rows = voidReceiptRows(checkpoint, Date.now() - 120 * 60_000);
+  // A live generation server side. Retiring its receipt is P2-31's work.
+  rows.processing.activation = {
+    requestId: randomUUID(),
+    requestDigest: HASH,
+    jobId: "job",
+    processingGenerationId: "generation",
+    state: "ready",
+    activatedAt: 1,
+    reused: false,
+  };
+  const before = structuredClone(rows);
+  try {
+    for (const apply of [false, true]) {
+      const result = await runReconcileReceipts({
+        config: setup.config,
+        journal,
+        catalog: admissionCatalog(
+          () => rows,
+          (next) => (rows = next),
+        ),
+        transport: {
+          async call() {
+            return lookupResponse(false);
+          },
+        },
+        apply,
+      });
+      assert.equal(result.state, "refused");
+      assert.equal(result.code, "processing_already_activated");
+      assert.deepEqual(rows, before);
+      assert.deepEqual(journal.checkpoint, checkpoint);
+    }
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
 test("a stale proof refreshes before any new lease and the recovery pass reserves once", async () => {
   const setup = await fixture(0);
   const plan = pdfPlan();

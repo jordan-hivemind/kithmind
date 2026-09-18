@@ -330,14 +330,28 @@ its proof, the capture and the spool all stay, because the bytes are archived
 and only the server-side receipt is void. It leaves a note on each row carrying
 a code and the time, and no ids. The journal checkpoint rewinds to the
 read-only lookup with the dead lease dropped, so the next pass takes the
-ordinary first-admission path: one lookup, one reserve, one admit.
+ordinary first-admission path: the original lookup, the processing lookup, one
+reserve and one admit.
+
+The failing pass usually leaves that original lookup unresolved in the journal,
+with the server's not-found answer already recorded. The throw happens inside
+the journaled transition, so the result is never committed, and every later
+pass replays it into the same throw; no `run` can drain it. The command expects
+this state. It uses the recorded answer rather than asking again, clears the
+catalog, and leaves the checkpoint alone, because that replay makes the same
+move by itself once the row holds no receipt. Any other unresolved request
+still refuses.
 
 A refusal writes nothing and names why: `journal_contended` (stop the watcher),
-`journal_request_pending` (run one `run` to replay it first),
-`checkpoint_not_archived`, `checkpoint_rows_missing`, `checkpoint_plan_missing`,
-`processing_receipt_conflict`, `lookup_refused` (the server's own code is in
-`lookupCode`) or `lookup_invalid`. Exit status is 1 on a refusal and 0
-otherwise.
+`journal_request_pending` (an unresolved request that is not the lookup above;
+run one `run`), `checkpoint_not_archived`, `checkpoint_rows_missing`,
+`checkpoint_plan_missing`, `processing_receipt_conflict` (the processing
+receipt names a different revision), `processing_already_activated` (a
+generation is live server side under this admission, which is P2-31's work),
+`lookup_refused` (the server's own code is in `lookupCode`) or
+`lookup_invalid`. The two processing refusals apply to the dry run as well, so
+a count never hides what `--apply` would have met. Exit status is 1 on a
+refusal and 0 otherwise.
 
 ## Template validation
 
