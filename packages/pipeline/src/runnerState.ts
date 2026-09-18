@@ -162,6 +162,11 @@ type ArchivedRun = ActiveScan & {
     | "provider_locator_prepare"
     | "provider_locator_publish"
     | "provider_locator_snapshot";
+  /**
+   * P2-31c. Set once a pass has asked the server whether it knows this row's
+   * admission receipt, so the question is asked at most once per cycle.
+   */
+  receiptChecked?: boolean;
   discoveryLease?: ArchivedDiscoveryLease;
   jobLease?: JobLease;
   resumeStep?:
@@ -808,6 +813,7 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
         "processingCatalogId",
         "expectedProcessingRevision",
         "preflightAction",
+        "receiptChecked",
         "discoveryLease",
         "jobLease",
         "resumeStep",
@@ -890,6 +896,9 @@ export function parseRunnerCheckpoint(value: unknown): RunnerCheckpoint {
                 ? input.preflightAction
                 : fail(),
           }),
+      ...(input.receiptChecked === undefined
+        ? {}
+        : { receiptChecked: boolean(input.receiptChecked) }),
       ...(input.discoveryLease === undefined
         ? {}
         : { discoveryLease: archivedDiscoveryLease(input.discoveryLease) }),
