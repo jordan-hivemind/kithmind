@@ -101,6 +101,8 @@ export type JournalCheck = {
     | "contended"
     | "recovery_pending"
     | "credential_rebind_pending"
+    | "config_rebind_pending"
+    | "config_rebind_blocked"
     | "credential_recovery_required"
     | "credential_comparison_unavailable"
     | "manual_recovery_required"
@@ -745,6 +747,12 @@ function journalResult(inspection: JournalInspection): JournalCheck {
       code: "credential_recovery_required",
     };
   }
+  // P2-104b: the configuration changed while work is in flight. The next open
+  // refuses, so this is a failure, but it is a self-clearing one: finish the
+  // pass under the old config, then switch.
+  if (inspection.configBinding === "changed_active") {
+    return { id: "journal", state: "fail", code: "config_rebind_blocked" };
+  }
   const active =
     inspection.pending ||
     inspection.cachedResult ||
@@ -769,6 +777,11 @@ function journalResult(inspection: JournalInspection): JournalCheck {
       state: "warn",
       code: "credential_rebind_pending",
     };
+  }
+  // The next open adopts this. It is worth saying out loud, because it is how
+  // the operator confirms a pasted parser config is the one about to be used.
+  if (inspection.configBinding === "changed_quiescent") {
+    return { id: "journal", state: "warn", code: "config_rebind_pending" };
   }
   return { id: "journal", state: "pass", code: "safe" };
 }

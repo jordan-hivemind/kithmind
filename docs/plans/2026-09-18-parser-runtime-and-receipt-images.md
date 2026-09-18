@@ -41,12 +41,22 @@ a parser directory in another checkout.
 | 1    | Pull and build the worker checkout that will own the parser.                                                                                                                                                                |
 | 2    | `node scripts/parser-runtime-setup.mjs` in that checkout.                                                                                                                                                                   |
 | 3    | Paste the printed `parser` and `profile` values into the private config, keeping the existing `extractorFingerprint`, `recordSchemaFingerprint`, `normalizationFingerprint`, `chunkerFingerprint` and `correctionRevision`. |
-| 4    | Restart the watcher.                                                                                                                                                                                                        |
+| 4    | Restart the watcher once the current pass has finished.                                                                                                                                                                     |
 
-The next pass recomputes the parser fingerprint, matches the pasted one, and
-proceeds. Nothing else has to be done: the server already treats a changed
-parser fingerprint as a new processing identity (see below), so the existing
-documents are re-parsed on their own and no row is orphaned.
+If the config sets `pdfDocQa.parser.tableStructure` or `tableStructureBypass`,
+pass the same values to the setup script (`--table-structure off`,
+`--table-structure-bypass '<json>'`). Both feed the parser fingerprint's
+configuration and therefore the extraction configuration fingerprint derived
+from it, so a run that omits them prints fingerprints the worker will refuse.
+Measured: `on` and `off` give different fingerprints, and a bypass policy gives
+a third. The script prints back whatever it was given, so the pasted block
+stays whole.
+
+Step 4 waits for the pass to finish because the journal adopts a changed
+configuration only while it is quiescent (P2-104b). `doctor` names which it is:
+`config_rebind_pending` means the next start adopts it, `config_rebind_blocked`
+means work is still in flight. Restoring the previous config is always
+available and reopens the journal the same way, so a bad paste is recoverable.
 
 ### What a profile transition does today
 
@@ -67,7 +77,16 @@ the full fingerprint tuple, so no prior row matches and
 `createArchivedIntents` starts a fresh processing row. Prior rows are retained,
 never deleted, which is what keeps the archive catalog history intact.
 
-No manual SQL, no migration and no quiescing is required for a parser change.
+No manual SQL and no migration is required for a parser change.
+
+The client side has one more gate, and the first version of this document
+missed it. `journalBindingForConfig` (`packages/pipeline/src/config.ts:944-973`)
+hashes the whole `pdfDocQa` object into the journal's `configFingerprint`, so
+the config edit above produces a binding the journal refused to open, and the
+journal directory also holds the archive catalog. P2-104b makes the journal
+adopt a changed configuration when the worker identity (endpoint, space,
+account, credential slot) is unchanged and nothing is in flight, and rewrites
+the stored binding. A changed identity is still refused.
 
 ## Receipt images
 

@@ -32,7 +32,9 @@ const codec = {
     if (
       value.version !== 1 ||
       typeof value.phase !== "string" ||
-      keys.some((key) => !["version", "phase", "count"].includes(key))
+      keys.some(
+        (key) => !["version", "phase", "count", "outcome"].includes(key),
+      )
     )
       throw new Error("bad checkpoint");
     if (
@@ -44,6 +46,7 @@ const codec = {
       version: 1,
       phase: value.phase,
       ...(value.count === undefined ? {} : { count: value.count }),
+      ...(value.outcome === undefined ? {} : { outcome: value.outcome }),
     };
   },
   parseResult(operation, value) {
@@ -491,4 +494,128 @@ test("SIGKILL releases the kernel source lock for automatic restart", async (t) 
     credential: "credential",
   });
   await restarted.close();
+});
+
+// P2-104b: `configFingerprint` hashes the whole `pdfDocQa` block, so editing a
+// parser path or fingerprint produced a binding the journal refused to open,
+// locking the operator out of the directory that also holds the archive
+// catalog. A configuration change over the same worker identity is now
+// adopted when nothing is in flight.
+
+function reconfigured(authority, fingerprint = "b".repeat(64)) {
+  return { ...authority, configFingerprint: fingerprint };
+}
+
+test("a changed configuration reopens a quiescent journal and rewrites the binding", async () => {
+  const path = await directory();
+  const authority = binding();
+  const first = await openJournal(path, { binding: authority });
+  await first.transitionCheckpoint({
+    checkpoint: { version: 1, phase: "idle", count: 3 },
+    credentialSessionActive: false,
+  });
+  await first.close();
+
+  const next = reconfigured(authority);
+  const reopened = await openJournal(path, { binding: next });
+  assert.equal(reopened.checkpoint.count, 3, "checkpoint survives the rebind");
+  await reopened.close();
+
+  const stored = JSON.parse(await readFile(join(path, "state.json"), "utf8"));
+  assert.equal(stored.binding.configFingerprint, next.configFingerprint);
+  assert.equal(stored.checkpoint.count, 3);
+
+  // The adopted binding is durable: the next open is an ordinary
+  // equal-binding open.
+  const again = await openJournal(path, { binding: next });
+  await again.close();
+
+  // Rolling back to the previous configuration is the same move in reverse,
+  // and must also work: restoring the old config is how an operator recovers
+  // from a bad parser paste without losing the journal.
+  const rolledBack = await openJournal(path, { binding: authority });
+  assert.equal(rolledBack.checkpoint.count, 3);
+  await rolledBack.close();
+  assert.equal(
+    JSON.parse(await readFile(join(path, "state.json"), "utf8")).binding
+      .configFingerprint,
+    authority.configFingerprint,
+  );
+});
+
+test("a changed configuration is refused while a request is pending", async () => {
+  const path = await directory();
+  const authority = binding();
+  const journal = await openJournal(path, { binding: authority });
+  await journal.planRequest(request(authority));
+  await journal.close();
+
+  await assert.rejects(
+    () => openJournal(path, { binding: reconfigured(authority) }),
+    (error) => error instanceof JournalSafetyError,
+    "in-flight work must settle under the configuration that started it",
+  );
+  const stored = JSON.parse(await readFile(join(path, "state.json"), "utf8"));
+  assert.equal(stored.binding.configFingerprint, authority.configFingerprint);
+});
+
+test("a changed configuration is refused mid scan", async () => {
+  const path = await directory();
+  const authority = binding();
+  const journal = await openJournal(path, { binding: authority });
+  await journal.transitionCheckpoint({
+    checkpoint: { version: 1, phase: "scan_begin" },
+    credentialSessionActive: false,
+  });
+  await journal.close();
+  await assert.rejects(
+    () => openJournal(path, { binding: reconfigured(authority) }),
+    (error) => error instanceof JournalSafetyError,
+  );
+});
+
+test("a changed worker identity is still refused, however quiescent", async () => {
+  const path = await directory();
+  const authority = binding();
+  const journal = await openJournal(path, { binding: authority });
+  await journal.close();
+  for (const changed of [
+    { ...authority, spaceId: `space_${randomUUID()}` },
+    { ...authority, sourceAccountId: `source_${randomUUID()}` },
+    { ...authority, endpoint: "https://other.example/api/worker" },
+    { ...authority, credentialSlot: "KITHMIND_OTHER_KEY" },
+  ]) {
+    await assert.rejects(
+      () => openJournal(path, { binding: changed }),
+      (error) => error instanceof JournalSafetyError,
+      `identity field must not rebind: ${JSON.stringify(changed)}`,
+    );
+  }
+});
+
+test("a pass that ended incomplete is still between passes and rebinds", async () => {
+  // A parked document ends a pass `incomplete`. Nothing is in flight, so the
+  // next start may take a new parser. Requiring `complete` here would mean one
+  // parked document could freeze the parser version forever.
+  for (const outcome of ["complete", "incomplete", "failed"]) {
+    const path = await directory();
+    const authority = binding();
+    const journal = await openJournal(path, { binding: authority });
+    await journal.transitionCheckpoint({
+      checkpoint: { version: 1, phase: "terminal", outcome },
+      credentialSessionActive: false,
+    });
+    await journal.close();
+    const reopened = await openJournal(path, {
+      binding: reconfigured(authority),
+    });
+    assert.equal(reopened.checkpoint.outcome, outcome);
+    await reopened.close();
+    assert.equal(
+      JSON.parse(await readFile(join(path, "state.json"), "utf8")).binding
+        .configFingerprint,
+      "b".repeat(64),
+      `terminal ${outcome} must adopt the new configuration`,
+    );
+  }
 });
