@@ -4368,6 +4368,49 @@ export class PipelineRunner {
     const lease = checkpoint.discoveryLease;
     if (!lease) throw new PipelineWorkerError("archived_lease_missing");
     const admitting = this.archivedRows(checkpoint).original;
+    // P2-31b. The original's provider reference is already recorded server
+    // side, and this step would declare it again. It cannot succeed and must
+    // not be attempted.
+    //
+    // `createAndBindProviderOriginal` keys a reference by
+    // `(source_account_id, client_reference_id)` and, when one exists, requires
+    // the declaration to match it field for field *including* `requestDigest`,
+    // which is derived from the whole admit request and so from its `requestId`.
+    // A fresh admit carries a fresh `requestId`, so it can never reproduce the
+    // stored digest: only the journal replaying its own persisted call can. The
+    // declaration this step would build is therefore refused server side no
+    // matter how fresh its proof is.
+    //
+    // This state is reachable and was live: `driveArchivedLookupOriginal`
+    // records `cloud` when the server reports the original already admitted and
+    // continues to capture, and if `lookup_processing` then reports the
+    // processing leg *not* admitted the pass walks to `reserve` and `admit`
+    // anyway. Before this check, that pass spent a lease -- one of the row's
+    // eight discovery attempts -- and then threw
+    // `provider_verification_stale_review_required` from `providerDeclaration`,
+    // naming a stale proof for a row whose proof was never the problem. The
+    // P2-31a refresh does not fire here either, by design: refreshing an
+    // admitted original is P2-31's multi-reference work.
+    //
+    // Checked before the lease branch so a wedged row stops spending attempts,
+    // and thrown rather than parked so the checkpoint stays at `admit` instead
+    // of sending the next pass around a fresh cycle that would reserve again.
+    // Admitting the processing leg against a reference the server already holds
+    // needs a protocol shape that does not exist yet: `ArchiveReceiptSelection`
+    // has `kind: "existing"` for receipts, and `providerOriginal` on
+    // `discovery.admitArchived` has no counterpart. That is P2-31.
+    // A pending call is exempt: a replay sends the persisted request under its
+    // original `requestId`, which is the one shape the server does accept
+    // against a recorded reference.
+    if (
+      !this.journal.pending &&
+      admitting.providerOriginal &&
+      admitting.cloud &&
+      "providerReferenceId" in admitting.cloud
+    )
+      throw new PipelineWorkerError(
+        "provider_original_reference_already_bound",
+      );
     // P2-31a. A pass that resumes here after an interrupted admission holds a
     // durable locator whose proof has aged past what the server accepts. Redo
     // both checks in place rather than throwing

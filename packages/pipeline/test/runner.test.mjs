@@ -2846,10 +2846,26 @@ test("a refresh whose catalog write already committed is not repeated on the nex
   }
 });
 
-test("an admitted original still fails closed when its recorded proof is stale", async () => {
+test("an already bound provider reference stops the admit before it spends a lease", async () => {
   const setup = await fixture(0);
   const plan = pdfPlan();
-  const checkpoint = admitCheckpoint(plan);
+  // The live P2-31b shape: the server already recorded this original's provider
+  // reference (`driveArchivedLookupOriginal` wrote `cloud` from a `found`
+  // lookup), the processing leg was never admitted, the proof aged out long
+  // ago, and the lease expired several passes back.
+  const checkpoint = archivedCheckpoint(plan, {
+    step: "admit",
+    preflightAction: undefined,
+    discoveryLease: {
+      workId: "work",
+      sourceItemId: plan.sourceItemId,
+      observationEpoch: 1,
+      processingEpoch: 1,
+      leaseEpoch: 1,
+      leaseToken: TOKEN,
+      leaseExpiresAt: Date.now() - 60 * 60_000,
+    },
+  });
   const journal = await openJournal(setup.journalDir, checkpoint);
   const rows = durableProviderRows(checkpoint, Date.now() - 45 * 60_000);
   rows.original.cloud = {
@@ -2860,9 +2876,11 @@ test("an admitted original still fails closed when its recorded proof is stale",
     providerBindingEpoch: 0,
     admittedAt: 1,
   };
+  const sent = [];
   const runner = new PipelineRunner(setup.config, journal, {
-    async call() {
-      throw new Error("a stale declaration must not reach the transport");
+    async call(request) {
+      sent.push(request.operation);
+      throw new Error("a bound reference must not be re-declared");
     },
   });
   runner.archivedRows = () => rows;
@@ -2874,11 +2892,23 @@ test("an admitted original still fails closed when its recorded proof is stale",
     throw new Error("an admitted original must not be refreshed");
   };
   try {
+    // Pass one. Before this fix the expired lease sent the pass to `reserve`,
+    // which spent one of the row's eight discovery attempts, and only then did
+    // `providerDeclaration` throw a stale-proof code for a row whose proof was
+    // never the problem.
     await assert.rejects(
       () => runner.driveArchivedAdmit(),
-      (error) => error.code === "provider_verification_stale_review_required",
+      (error) => error.code === "provider_original_reference_already_bound",
     );
+    assert.deepEqual(sent, [], "no attempt is spent on an unadmittable row");
     assert.equal(journal.checkpoint.step, "admit");
+    assert.notEqual(journal.checkpoint.discoveryLease, undefined);
+    // Pass two, minutes later: the same refusal, still free.
+    await assert.rejects(
+      () => runner.driveArchivedAdmit(),
+      (error) => error.code === "provider_original_reference_already_bound",
+    );
+    assert.deepEqual(sent, []);
   } finally {
     await journal.close();
     await rm(setup.base, { recursive: true, force: true });
