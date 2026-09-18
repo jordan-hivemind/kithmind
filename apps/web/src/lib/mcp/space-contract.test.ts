@@ -289,7 +289,9 @@ describe("MCP space routing", () => {
       value: { type: "text", value: "blue" },
       sourceType: "user_stated",
     });
-    expect(mocks.writes.rememberFact!.mock.calls[0]?.[0].spaceId).toBe("shared");
+    expect(mocks.writes.rememberFact!.mock.calls[0]?.[0].spaceId).toBe(
+      "shared",
+    );
 
     await call("capture_thought", {
       spaceId: "shared",
@@ -343,5 +345,6 @@ describe("MCP space routing", () => {
 
     expect(result.isError).toBe(true);
     expect(JSON.stringify(result.content)).not.toContain("Space not found");
+    expect(JSON.stringify(result.content)).not.toContain("sensitive-space-id");
   });
 });

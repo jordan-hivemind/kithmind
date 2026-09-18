@@ -106,7 +106,8 @@ const writeSpaceSchema = spaceIdSchema
  * `@repo/kith-store/identity`'s `errors.ts` throws an `IdentityError` whose
  * `data.code` is `space_not_found`, which is what the Convex `ConvexError`
  * carried. Anything else is a defect rather than an authorization answer and is
- * rethrown, so a bug cannot arrive at a client as "Space not found".
+ * rethrown masked, so a bug cannot arrive at a client as "Space not found" or
+ * carry its own message there.
  *
  * The text is the literal the store throws, restated here rather than read off
  * the error, so a message that changed upstream cannot change what a tool says.
@@ -116,7 +117,9 @@ function spaceReadToolError(error: unknown) {
     !(error instanceof IdentityError) ||
     error.data?.code !== "space_not_found"
   ) {
-    throw error;
+    // The SDK sends a thrown message to the client, and a defect's message can
+    // name a space. The original stays on `cause` for the server log.
+    throw new Error("Internal error", { cause: error });
   }
   return {
     content: [{ type: "text" as const, text: "Space not found" }],
