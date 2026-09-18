@@ -31,11 +31,16 @@ import type {
   ResticBackupResult,
 } from "./archiveTypes.js";
 import {
+  ADMISSION_BLOCK_CODES,
+  ArchiveCatalogError,
+  MAX_ADMISSION_BLOCK_ATTEMPTS,
   MAX_PARSE_ATTEMPTS,
   openArchiveCatalog,
   type ArchiveCatalog,
 } from "./archiveCatalog.js";
 import type {
+  AdmissionBlock,
+  AdmissionBlockCode,
   ArchiveCopyIntent,
   ArchiveCopyRole,
   ArchiveSubject,
@@ -281,6 +286,52 @@ function parseAttemptsSpent(rows: readonly ProcessingCatalogRow[]): number {
     (total, row) => total + (row.parseFailure?.attempts ?? 0),
     0,
   );
+}
+
+/**
+ * P2-31f. Bumped whenever a build changes how it handles one of
+ * `ADMISSION_BLOCK_CODES`, which releases every item parked by an earlier
+ * build so the new handling gets a turn.
+ */
+const PARK_HANDLING_VERSION = 1;
+
+/** How long a parked item waits before the next automatic retry. */
+const PARK_RETRY_INTERVAL_MS = 6 * 60 * 60_000;
+
+/**
+ * Fingerprints this build's handling of the parkable codes.
+ *
+ * ponytail: one fingerprint over the whole list, so adding or re-handling any
+ * code releases items parked on every other code too. They are simply retried
+ * and re-park if nothing changed for them, which costs one pass and no server
+ * attempt. Split per code if that ever gets expensive.
+ */
+const RUNNER_PARK_CAPABILITY = sha256Json({
+  version: PARK_HANDLING_VERSION,
+  codes: [...ADMISSION_BLOCK_CODES].sort(),
+}).slice(0, 16);
+
+function parkable(error: unknown): AdmissionBlockCode | undefined {
+  const code =
+    error instanceof PipelineWorkerError || error instanceof ArchiveCatalogError
+      ? error.code
+      : undefined;
+  return ADMISSION_BLOCK_CODES.includes(code as AdmissionBlockCode)
+    ? (code as AdmissionBlockCode)
+    : undefined;
+}
+
+/**
+ * Whether a recorded marker still parks its item. A marker written by a build
+ * that handled these codes differently never holds, so a new build releases
+ * what an old one parked; otherwise the item is retried once per
+ * `PARK_RETRY_INTERVAL_MS` until its attempts run out, and then waits for new
+ * bytes, a new build, or `run --retry-parked`.
+ */
+function admissionBlockHolds(block: AdmissionBlock, now = Date.now()): boolean {
+  if (block.runnerCapability !== RUNNER_PARK_CAPABILITY) return false;
+  if (block.attempts >= MAX_ADMISSION_BLOCK_ATTEMPTS) return true;
+  return now < block.blockedAt + PARK_RETRY_INTERVAL_MS;
 }
 
 /**
@@ -1100,6 +1151,8 @@ export class PipelineRunner {
     private readonly journal: Journal<RunnerCheckpoint, JsonValue>,
     private readonly transport: WorkerTransport,
     private readonly rateLimitBackoff: RateLimitBackoff = DEFAULT_RATE_LIMIT_BACKOFF,
+    /** P2-31f: `retryParked` is `run --retry-parked`. */
+    private readonly options: { retryParked?: boolean } = {},
   ) {}
 
   /**
@@ -1393,10 +1446,14 @@ export class PipelineRunner {
     // catalogs and an exhausted document must stay skipped rather than fail
     // the pass over them.
     if (parseAttemptsSpent(matches) >= MAX_PARSE_ATTEMPTS) return false;
-    const reusable = this.reusableProcessingRow(
-      matches,
-      this.matchingOriginal(plan),
-    );
+    const original = this.matchingOriginal(plan);
+    // P2-31f: a parked document is skipped exactly as an exhausted one is.
+    // The marker lives on the original row, which is keyed by content, so new
+    // bytes land on a fresh row with no marker and release the item here
+    // without anything having to notice that it changed.
+    if (original?.admissionBlock && admissionBlockHolds(original.admissionBlock))
+      return false;
+    const reusable = this.reusableProcessingRow(matches, original);
     if (reusable?.activation) {
       return await this.processingArtifactsPresent(
         reusable,
@@ -1412,11 +1469,112 @@ export class PipelineRunner {
   ): Promise<number> {
     for (let index = start; index < files.length; index += 1) {
       const plan = files[index];
-      if (plan && isPdfPlan(plan) && (await this.pdfNeedsArchivedWork(plan))) {
-        return index;
+      if (!plan || !isPdfPlan(plan)) continue;
+      let needsWork: boolean;
+      try {
+        needsWork = await this.pdfNeedsArchivedWork(plan);
+      } catch (error) {
+        // P2-31f. `reusableProcessingRow` fails closed on a catalog history it
+        // cannot judge. That is a fact about this one document, so park it and
+        // keep looking instead of failing the scan for every other file. The
+        // caller may be inside a journaled transition, so this must not throw.
+        const code = parkable(error);
+        if (code === undefined) throw error;
+        await this.parkPlan(plan, code);
+        continue;
       }
+      if (needsWork) return index;
     }
     return -1;
+  }
+
+  /**
+   * P2-31f. Records the park marker for one document. Every parkable code is
+   * terminal for this file alone, so the marker is what lets the pass walk on;
+   * `pdfNeedsArchivedWork` reads it back and `admissionBlockHolds` decides when
+   * it stops holding.
+   */
+  private async parkRow(
+    original: OriginalCatalogRow,
+    code: AdmissionBlockCode,
+  ): Promise<void> {
+    await this.requireCatalog().recordAdmissionBlock({
+      catalogId: original.originalCatalogId,
+      expectedRevision: original.rowRevision,
+      code,
+      runnerCapability: RUNNER_PARK_CAPABILITY,
+      now: Date.now(),
+    });
+  }
+
+  private async parkPlan(
+    plan: PdfFilePlan,
+    code: AdmissionBlockCode,
+  ): Promise<void> {
+    const original = this.matchingOriginal(plan);
+    if (!original) {
+      throw new PipelineWorkerError("archive_catalog_reference_missing");
+    }
+    await this.parkRow(original, code);
+  }
+
+  /**
+   * Parks the checkpoint's own document and returns the checkpoint that walks
+   * past it, exactly as `driveArchivedCleanup` does after a published one
+   * except that nothing was published.
+   *
+   * Returned rather than committed, so a caller inside a journaled transition
+   * settles the answered request with it. A throw there would leave the
+   * request pending with its answer recorded and wedge the journal for good
+   * (P2-31e), which is the failure mode this task exists to stop repeating.
+   * For the same reason the row is found by the checkpoint's own id first and
+   * only then by the plan's content, so this cannot throw over a row the
+   * checkpoint is demonstrably already on.
+   */
+  private async parkedCheckpoint(
+    checkpoint: ArchivedCheckpoint,
+    code: AdmissionBlockCode,
+  ): Promise<RunnerCheckpoint> {
+    const original =
+      this.requireCatalog()
+        .listOriginals()
+        .find((row) => row.originalCatalogId === checkpoint.originalCatalogId) ??
+      this.matchingOriginal(this.archivedPlan(checkpoint));
+    if (!original) {
+      throw new PipelineWorkerError("archive_catalog_reference_missing");
+    }
+    await this.parkRow(original, code);
+    return await this.afterArchivedItem(checkpoint, 0);
+  }
+
+  /** The checkpoint that moves to the next document needing archived work. */
+  private async afterArchivedItem(
+    checkpoint: ArchivedCheckpoint,
+    publicationIncrement: number,
+  ): Promise<RunnerCheckpoint> {
+    const nextPdf = await this.nextPdfWorkIndex(
+      checkpoint.files,
+      checkpoint.pdfIndex + 1,
+    );
+    const archivedPublished =
+      checkpoint.archivedPublished + publicationIncrement;
+    return nextPdf >= 0
+      ? {
+          version: 1,
+          phase: "archived",
+          ...activeScanBase(checkpoint),
+          pdfIndex: nextPdf,
+          step: "intent",
+          reservationRound: 0,
+          archivedPublished,
+        }
+      : {
+          version: 1,
+          phase: "discovery_reserve",
+          ...activeScanBase(checkpoint),
+          round: 0,
+          archivedPublished,
+        };
   }
 
   private async createArchivedIntents(
@@ -3806,6 +3964,53 @@ export class PipelineRunner {
     });
   }
 
+  /**
+   * P2-31f. Retires an admission receipt the authoritative server says it does
+   * not hold, and returns the checkpoint that carries on to `capture`, or
+   * `undefined` when the receipt may not be retired without a person.
+   *
+   * These are the conditions `runReconcileReceipts` (P2-31d) enforces, applied
+   * to the checkpoint's own original and nothing else, against the same
+   * read-only answer that command reuses. An activated processing row means a
+   * generation is live server side under this admission, and a processing
+   * receipt naming a different revision is a shape this pipeline does not
+   * produce: both stay parked because retiring the receipt could not be
+   * undone. Everything else is the state a misrouted admission leaves behind,
+   * and `clearVoidAdmission` is the write that command already makes.
+   */
+  private async selfHealVoidReceipt(
+    checkpoint: ArchivedCheckpoint,
+  ): Promise<RunnerCheckpoint | undefined> {
+    const { original, processing } = this.archivedRows(checkpoint);
+    if (!original.cloud) return undefined;
+    if (processing.activation) return undefined;
+    if (
+      processing.cloud &&
+      processing.cloud.sourceRevisionId !== original.cloud.sourceRevisionId
+    )
+      return undefined;
+    const clearedAt = Date.now();
+    const nextProcessing = (await this.requireCatalog().clearVoidAdmission({
+      subject: "parser_output",
+      catalogId: processing.processingCatalogId,
+      expectedRevision: processing.rowRevision,
+      clearedAt,
+    })) as ProcessingCatalogRow;
+    const nextOriginal = (await this.requireCatalog().clearVoidAdmission({
+      subject: "original_bytes",
+      catalogId: original.originalCatalogId,
+      expectedRevision: original.rowRevision,
+      clearedAt,
+    })) as OriginalCatalogRow;
+    return archivedBase(checkpoint, {
+      step: "capture",
+      receiptChecked: true,
+      discoveryLease: undefined,
+      expectedOriginalRevision: nextOriginal.rowRevision,
+      expectedProcessingRevision: nextProcessing.rowRevision,
+    });
+  }
+
   private async driveArchivedLookupOriginal(): Promise<void> {
     const checkpoint = this.journal.checkpoint;
     if (
@@ -3856,17 +4061,30 @@ export class PipelineRunner {
           // the catalog still claimed it was admitted. That leg is gone from
           // main and cannot recur, but the receipt it left behind is durable.
           //
-          // Fail closed, and before anything downstream can mistake this for a
+          // Answered before anything downstream can mistake this for a
           // provider problem: the P2-31b refusal at `admit` would otherwise be
           // the first thing an operator saw, and it names a reference the
           // authoritative server does not hold. Nothing further is sent and no
-          // discovery attempt is spent. Clearing a receipt is an operator
-          // action, not something a pass may decide: `cloud` is the record that
-          // original bytes were accepted somewhere, and a pass that dropped it
-          // on a server's silence would re-admit anything a temporary
-          // misrouting touched.
-          if (this.archivedRows(current).original.cloud)
-            throw new PipelineWorkerError("original_receipt_unknown_to_server");
+          // discovery attempt is spent.
+          //
+          // P2-31f. P2-31d made clearing the receipt an operator command
+          // because a pass that dropped `cloud` on a server's silence would
+          // re-admit anything a temporary misrouting touched. The narrow
+          // conditions that command enforces are what make the clear safe, and
+          // they are checkable right here, so the pass now runs the same
+          // logic itself (`selfHealVoidReceipt`) rather than throwing and
+          // waiting for a person to type the command. Outside those
+          // conditions the document is parked, not cleared.
+          if (this.archivedRows(current).original.cloud) {
+            const healed = await this.selfHealVoidReceipt(current);
+            return (
+              healed ??
+              (await this.parkedCheckpoint(
+                current,
+                "original_receipt_unknown_to_server",
+              ))
+            );
+          }
           return archivedBase(current, { step: "capture", receiptChecked: true });
         }
         let { original } = this.archivedRows(current);
@@ -3874,12 +4092,15 @@ export class PipelineRunner {
         const responseProvider = "originalProviderReferenceId" in value;
         if (provider !== responseProvider)
           throw new PipelineWorkerError("archived_recovery_branch_conflict");
+        // P2-31f: two admissions disagree about which revision was accepted
+        // for this one file. Nothing about any other file is in doubt, so the
+        // document is parked and the pass walks on. Parked rather than healed:
+        // picking a revision could publish the wrong bytes under a receipt
+        // that names the other, which is a decision a person has to make.
         if (admissionRevisionConflict(original, value))
-          return scanTerminal(
+          return await this.parkedCheckpoint(
             current,
-            "failed",
             "original_receipt_revision_conflict",
-            true,
           );
         const originalReceipts = [
           ["primary", "originalPrimaryReceiptId"],
@@ -4312,12 +4533,15 @@ export class PipelineRunner {
         const responseProvider = "originalProviderReferenceId" in value;
         if (provider !== responseProvider)
           throw new PipelineWorkerError("archived_recovery_branch_conflict");
+        // P2-31f: two admissions disagree about which revision was accepted
+        // for this one file. Nothing about any other file is in doubt, so the
+        // document is parked and the pass walks on. Parked rather than healed:
+        // picking a revision could publish the wrong bytes under a receipt
+        // that names the other, which is a decision a person has to make.
         if (admissionRevisionConflict(original, value))
-          return scanTerminal(
+          return await this.parkedCheckpoint(
             current,
-            "failed",
             "original_receipt_revision_conflict",
-            true,
           );
         const receipts = [
           ["original_bytes", original, "primary", "originalPrimaryReceiptId"],
@@ -4532,13 +4756,17 @@ export class PipelineRunner {
     // P2-31a refresh does not fire here either, by design: refreshing an
     // admitted original is P2-31's multi-reference work.
     //
-    // Checked before the lease branch so a wedged row stops spending attempts,
-    // and thrown rather than parked so the checkpoint stays at `admit` instead
-    // of sending the next pass around a fresh cycle that would reserve again.
+    // Checked before the lease branch so a wedged row stops spending attempts.
     // Admitting the processing leg against a reference the server already holds
     // needs a protocol shape that does not exist yet: `ArchiveReceiptSelection`
     // has `kind: "existing"` for receipts, and `providerOriginal` on
     // `discovery.admitArchived` has no counterpart. That is P2-31.
+    //
+    // P2-31f. Thrown here and parked by `run`, which records the marker and
+    // moves to the next file. The marker is what stops the next pass coming
+    // back around a fresh cycle and reserving again, which is what the throw
+    // alone used to achieve by leaving the checkpoint at `admit` -- at the
+    // cost of every other file in the pass.
     // A pending call is exempt: a replay sends the persisted request under its
     // original `requestId`, which is the one shape the server does accept
     // against a recorded reference.
@@ -4681,12 +4909,15 @@ export class PipelineRunner {
         const responseProvider = "originalProviderReferenceId" in value;
         if ((providerOriginal !== undefined) !== responseProvider)
           throw new PipelineWorkerError("archived_recovery_branch_conflict");
+        // P2-31f: two admissions disagree about which revision was accepted
+        // for this one file. Nothing about any other file is in doubt, so the
+        // document is parked and the pass walks on. Parked rather than healed:
+        // picking a revision could publish the wrong bytes under a receipt
+        // that names the other, which is a decision a person has to make.
         if (admissionRevisionConflict(original, value))
-          return scanTerminal(
+          return await this.parkedCheckpoint(
             current,
-            "failed",
             "original_receipt_revision_conflict",
-            true,
           );
         for (const [subject, role, receiptField] of [
           ["original_bytes", "primary", "originalPrimaryReceiptId"],
@@ -5332,35 +5563,19 @@ export class PipelineRunner {
       },
     });
     await removeCapturedPdfExact(captureFromRows(pdf, original, processing));
-    const nextPdf = await this.nextPdfWorkIndex(
-      checkpoint.files,
-      checkpoint.pdfIndex + 1,
-    );
-    const publicationIncrement = checkpoint.countPublication === false ? 0 : 1;
-    if (nextPdf >= 0) {
-      await this.journal.transitionCheckpoint({
-        checkpoint: {
-          version: 1,
-          phase: "archived",
-          ...activeScanBase(checkpoint),
-          pdfIndex: nextPdf,
-          step: "intent",
-          reservationRound: 0,
-          archivedPublished:
-            checkpoint.archivedPublished + publicationIncrement,
-        },
-        credentialSessionActive: true,
+    // P2-31f: publishing is what resolves a park, so a document that got here
+    // after being parked stops being reported as parked.
+    if (original.admissionBlock) {
+      await this.requireCatalog().clearAdmissionBlock({
+        catalogId: original.originalCatalogId,
+        expectedRevision: original.rowRevision,
       });
-      return;
     }
     await this.journal.transitionCheckpoint({
-      checkpoint: {
-        version: 1,
-        phase: "discovery_reserve",
-        ...activeScanBase(checkpoint),
-        round: 0,
-        archivedPublished: checkpoint.archivedPublished + publicationIncrement,
-      },
+      checkpoint: await this.afterArchivedItem(
+        checkpoint,
+        checkpoint.countPublication === false ? 0 : 1,
+      ),
       credentialSessionActive: true,
     });
   }
@@ -5398,33 +5613,8 @@ export class PipelineRunner {
       this.documentParseAttempts(this.archivedPlan(checkpoint)) >=
         MAX_PARSE_ATTEMPTS,
     );
-    const nextPdf = await this.nextPdfWorkIndex(
-      checkpoint.files,
-      checkpoint.pdfIndex + 1,
-    );
-    if (nextPdf >= 0) {
-      await this.journal.transitionCheckpoint({
-        checkpoint: {
-          version: 1,
-          phase: "archived",
-          ...activeScanBase(checkpoint),
-          pdfIndex: nextPdf,
-          step: "intent",
-          reservationRound: 0,
-          archivedPublished: checkpoint.archivedPublished,
-        },
-        credentialSessionActive: true,
-      });
-      return;
-    }
     await this.journal.transitionCheckpoint({
-      checkpoint: {
-        version: 1,
-        phase: "discovery_reserve",
-        ...activeScanBase(checkpoint),
-        round: 0,
-        archivedPublished: checkpoint.archivedPublished,
-      },
+      checkpoint: await this.afterArchivedItem(checkpoint, 0),
       credentialSessionActive: true,
     });
   }
@@ -6057,9 +6247,58 @@ export class PipelineRunner {
   }
 
   async run(): Promise<PipelineRunResult> {
+    return this.withParked(await this.runPass());
+  }
+
+  /**
+   * P2-31f. Adds the parked summary to a pass result. A pass that ends
+   * `complete` with items parked is not the same thing as a clean one, and a
+   * monitor needs the count, the codes and the age to say so without reading
+   * the catalog.
+   */
+  private withParked(result: PipelineRunResult): PipelineRunResult {
+    const parked = this.archiveCatalog
+      ? this.archiveCatalog
+          .listOriginals()
+          .flatMap((row) => (row.admissionBlock ? [row.admissionBlock] : []))
+      : [];
+    if (parked.length === 0) return result;
+    const now = Date.now();
+    return {
+      ...result,
+      parked: parked.length,
+      parkedCodes: [...new Set(parked.map((block) => block.code))].sort(),
+      parkedOldestAgeMs: Math.max(
+        0,
+        now - Math.min(...parked.map((block) => block.blockedAt)),
+      ),
+    };
+  }
+
+  /**
+   * P2-31f. The operator release: `run --retry-parked` drops every marker so
+   * the pass tries all of them once more. The automatic releases (new bytes, a
+   * new build, the bounded backoff) are `admissionBlockHolds`, and they leave
+   * the marker in place on purpose, because it carries the attempt count that
+   * bounds them.
+   */
+  private async clearParkedItems(): Promise<void> {
+    const catalog = this.archiveCatalog;
+    if (!catalog || !this.options.retryParked) return;
+    for (const row of catalog.listOriginals()) {
+      if (!row.admissionBlock) continue;
+      await catalog.clearAdmissionBlock({
+        catalogId: row.originalCatalogId,
+        expectedRevision: row.rowRevision,
+      });
+    }
+  }
+
+  private async runPass(): Promise<PipelineRunResult> {
     await this.preparePdfProfile();
     if (this.config.pdfDocQa) {
       this.archiveCatalog = await openArchiveCatalog({ journal: this.journal });
+      await this.clearParkedItems();
     }
     if (this.journal.pending) {
       const pendingPhase = this.journal.checkpoint.phase;
@@ -6124,6 +6363,27 @@ export class PipelineRunner {
           await this.recordArchivedParseFailure(checkpoint, error.code);
           continue;
         }
+        // P2-31f. A per-item condition raised outside a journaled call: park
+        // the document and carry on with the rest of the pass.
+        //
+        // `this.journal.pending` is the whole safety rule. A parkable code
+        // raised from inside a transition leaves the request answered but
+        // unresolved, and parking on top of that would commit a checkpoint
+        // move over a call the journal has not settled. Those sites return a
+        // parked checkpoint instead (`parkedCheckpoint`); anything that still
+        // reaches here with a request in flight fails the pass as before.
+        const parkCode = parkable(error);
+        if (
+          parkCode !== undefined &&
+          checkpoint.phase === "archived" &&
+          !this.journal.pending
+        ) {
+          await this.journal.transitionCheckpoint({
+            checkpoint: await this.parkedCheckpoint(checkpoint, parkCode),
+            credentialSessionActive: true,
+          });
+          continue;
+        }
         throw error;
       }
       if (result) return result;
@@ -6158,11 +6418,11 @@ export class PipelineRunner {
         process.stderr.write(`${JSON.stringify(detail)}\n`);
         await this.journal.recordFailure(detail);
       }
-      return {
+      return this.withParked({
         state:
           error instanceof PipelineRetryableError ? "incomplete" : "failed",
         code,
-      };
+      });
     }
   }
 }

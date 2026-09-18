@@ -97,6 +97,32 @@ export type ReceiptReconcileNote = {
   clearedAt: number;
 };
 
+/**
+ * P2-31f. One parked item, recorded on the original catalog row. It carries a
+ * closed-enum code and nothing that could name a file: no path, no title, no
+ * bytes.
+ *
+ * `runnerCapability` fingerprints the parking build's handling of these codes,
+ * so a build that handles one differently releases every marker it meets
+ * automatically. `attempts` bounds the automatic retries the runner paces;
+ * past the bound the item waits for new bytes, a new build, or an operator.
+ */
+export type AdmissionBlock = {
+  code: AdmissionBlockCode;
+  blockedAt: number;
+  runnerCapability: string;
+  attempts: number;
+};
+
+/** See `ADMISSION_BLOCK_CODES` in `archiveCatalog.ts` for the closed list. */
+export type AdmissionBlockCode =
+  | "archive_catalog_revision_conflict"
+  | "catalog_conflict"
+  | "original_receipt_revision_conflict"
+  | "original_receipt_unknown_to_server"
+  | "provider_original_reference_already_bound"
+  | "provider_verification_stale_review_required";
+
 export type OriginalCatalogIdentity = {
   originalCatalogId: string;
   sourceExternalId: string;
@@ -139,6 +165,8 @@ export type OriginalCatalogRow = Omit<OriginalCatalogIdentity, "copies"> & {
       }
   );
   receiptReconcile?: ReceiptReconcileNote;
+  /** P2-31f: set while this document is parked; absent means it is not. */
+  admissionBlock?: AdmissionBlock;
   updatedAt: number;
 };
 

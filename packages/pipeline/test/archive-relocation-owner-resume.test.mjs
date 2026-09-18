@@ -54,6 +54,7 @@ function doctorResult() {
       { id: "heartbeat", state: "warn", code: "awaiting_heartbeat" },
       { id: "roots", state: "pass", code: "safe" },
       { id: "journal", state: "warn", code: "contended" },
+      { id: "archive", state: "pass", code: "none_parked" },
     ],
     source: {
       enumeration: "complete",

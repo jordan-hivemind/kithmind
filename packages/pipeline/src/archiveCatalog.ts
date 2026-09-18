@@ -16,6 +16,8 @@ import {
 } from "@repo/worker-protocol";
 
 import type {
+  AdmissionBlock,
+  AdmissionBlockCode,
   ArchiveBoundaryRelocation,
   ArchiveBoundaryRelocationArtifact,
   ArchiveBoundaryRelocationArtifactBinding,
@@ -60,6 +62,23 @@ const MAX_BOUNDARY_RELOCATIONS = 16;
 const MAX_DIRECTORY_ENTRIES = 64;
 /** Bounded per-document parser attempt count; see `parseFailure` on `ProcessingCatalogRow`. */
 export const MAX_PARSE_ATTEMPTS = 2;
+/**
+ * P2-31f. The closed set of per-item conditions a pass may park on. Each one
+ * is terminal for one document and says nothing about any other, so parking it
+ * lets the rest of the pass run. A condition that means the whole run is in
+ * trouble (credential, journal, archive repository, server unavailable, rate
+ * limit, scan conflict) is deliberately absent and still fails the pass.
+ */
+export const ADMISSION_BLOCK_CODES: readonly AdmissionBlockCode[] = [
+  "archive_catalog_revision_conflict",
+  "catalog_conflict",
+  "original_receipt_revision_conflict",
+  "original_receipt_unknown_to_server",
+  "provider_original_reference_already_bound",
+  "provider_verification_stale_review_required",
+];
+/** Bounded automatic retries of a parked item; see `AdmissionBlock`. */
+export const MAX_ADMISSION_BLOCK_ATTEMPTS = 3;
 const PARSER_FAILURE_CODE = /^[a-z_]{1,64}$/;
 const TEMP_FILE = /^\.archive-catalog\.json\.[0-9a-f-]{36}\.tmp$/;
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -69,6 +88,8 @@ const ID = /^[A-Za-z0-9_-]{1,256}$/;
 const OPAQUE_NAME =
   /^(?:[0-9a-f-]{36}(?:\.age|\.json|\.tmp)?|lossless\.json|bundle\.json|\.[0-9a-f-]{36}\.[0-9a-f-]{36}\.tmp)$/;
 const SAFE_CODE = /^[a-z][a-z0-9_]{0,63}$/;
+/** P2-31f: the parking build's capability fingerprint. */
+const CAPABILITY = /^[0-9a-f]{16}$/;
 
 export type ArchiveCatalogFailureCode =
   | "invalid_input"
@@ -833,6 +854,19 @@ function receiptReconcileNote(value: unknown): ReceiptReconcileNote {
   };
 }
 
+function admissionBlock(value: unknown): AdmissionBlock {
+  const block = object(value);
+  exact(block, ["code", "blockedAt", "runnerCapability", "attempts"]);
+  if (!ADMISSION_BLOCK_CODES.includes(block.code as AdmissionBlockCode))
+    fail("catalog_invalid");
+  return {
+    code: block.code as AdmissionBlockCode,
+    blockedAt: integer(block.blockedAt),
+    runnerCapability: string(block.runnerCapability, 16, CAPABILITY),
+    attempts: integer(block.attempts, 1, MAX_ADMISSION_BLOCK_ATTEMPTS),
+  };
+}
+
 function originalRow(value: unknown): OriginalCatalogRow {
   const row = object(value);
   exact(
@@ -846,7 +880,7 @@ function originalRow(value: unknown): OriginalCatalogRow {
       "rowRevision",
       "updatedAt",
     ],
-    ["cloud", "providerOriginal", "receiptReconcile"],
+    ["cloud", "providerOriginal", "receiptReconcile", "admissionBlock"],
   );
   const origin = object(row.origin);
   exact(origin, [
@@ -903,6 +937,8 @@ function originalRow(value: unknown): OriginalCatalogRow {
   }
   if (row.receiptReconcile !== undefined)
     result.receiptReconcile = receiptReconcileNote(row.receiptReconcile);
+  if (row.admissionBlock !== undefined)
+    result.admissionBlock = admissionBlock(row.admissionBlock);
   return result;
 }
 
@@ -2214,6 +2250,56 @@ export class ArchiveCatalog {
     )) as ProcessingCatalogRow;
   }
 
+  /**
+   * P2-31f. Parks one document on a per-item admission condition, bounded at
+   * `MAX_ADMISSION_BLOCK_ATTEMPTS`. Re-parking the same row counts one more
+   * attempt and moves `blockedAt`, which is what paces the automatic retry.
+   * New bytes land on a fresh original row with no marker, so a changed
+   * source releases the item without anything here running.
+   */
+  async recordAdmissionBlock(args: {
+    catalogId: string;
+    expectedRevision: number;
+    code: AdmissionBlockCode;
+    runnerCapability: string;
+    now: number;
+  }): Promise<OriginalCatalogRow> {
+    return (await this.updateRow(
+      "original_bytes",
+      args.catalogId,
+      args.expectedRevision,
+      (value) => {
+        const row = value as OriginalCatalogRow;
+        const prior =
+          row.admissionBlock?.runnerCapability === args.runnerCapability &&
+          row.admissionBlock.code === args.code
+            ? row.admissionBlock.attempts
+            : 0;
+        row.admissionBlock = admissionBlock({
+          code: args.code,
+          blockedAt: integer(args.now),
+          runnerCapability: args.runnerCapability,
+          attempts: Math.min(prior + 1, MAX_ADMISSION_BLOCK_ATTEMPTS),
+        });
+      },
+    )) as OriginalCatalogRow;
+  }
+
+  /** P2-31f. Releases a parked document. A row with no marker is unchanged. */
+  async clearAdmissionBlock(args: {
+    catalogId: string;
+    expectedRevision: number;
+  }): Promise<OriginalCatalogRow> {
+    return (await this.updateRow(
+      "original_bytes",
+      args.catalogId,
+      args.expectedRevision,
+      (value) => {
+        delete (value as OriginalCatalogRow).admissionBlock;
+      },
+    )) as OriginalCatalogRow;
+  }
+
   async recordSpool(args: {
     catalogId: string;
     expectedRevision: number;
@@ -2846,4 +2932,69 @@ export async function openArchiveCatalog<
   return await ArchiveCatalog.open({
     journal: args.journal as unknown as Journal<JsonValue, JsonValue>,
   });
+}
+
+export type ParkedItemSummary = {
+  parked: number;
+  codes: AdmissionBlockCode[];
+  oldestBlockedAt?: number;
+};
+
+/**
+ * P2-31f. Counts parked items without taking the journal lock, so `doctor` can
+ * report them while the watcher holds the journal. Deliberately tolerant: a
+ * missing, busy or unreadable catalog reads as nothing parked rather than
+ * turning a report into a failure. Only closed-enum codes and timestamps are
+ * read, so nothing here can carry a name or a path.
+ */
+export async function inspectParkedItems(
+  directory: string,
+): Promise<ParkedItemSummary> {
+  const empty: ParkedItemSummary = { parked: 0, codes: [] };
+  let text: string;
+  try {
+    const handle = await open(
+      join(directory, CATALOG_FILE),
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+    try {
+      const stats = await handle.stat();
+      if (!stats.isFile() || stats.size > MAX_CATALOG_BYTES) return empty;
+      text = (await handle.readFile()).toString("utf8");
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return empty;
+  }
+  let originals: unknown;
+  try {
+    originals = (JSON.parse(text) as { originals?: unknown }).originals;
+  } catch {
+    return empty;
+  }
+  if (!Array.isArray(originals)) return empty;
+  const codes = new Set<AdmissionBlockCode>();
+  let parked = 0;
+  let oldestBlockedAt: number | undefined;
+  for (const row of originals) {
+    const block = (row as { admissionBlock?: unknown }).admissionBlock as
+      | { code?: unknown; blockedAt?: unknown }
+      | undefined;
+    if (!block || !ADMISSION_BLOCK_CODES.includes(block.code as never))
+      continue;
+    parked += 1;
+    codes.add(block.code as AdmissionBlockCode);
+    if (
+      Number.isSafeInteger(block.blockedAt) &&
+      (oldestBlockedAt === undefined ||
+        (block.blockedAt as number) < oldestBlockedAt)
+    )
+      oldestBlockedAt = block.blockedAt as number;
+  }
+  return {
+    parked,
+    codes: [...codes].sort(),
+    ...(oldestBlockedAt === undefined ? {} : { oldestBlockedAt }),
+  };
 }

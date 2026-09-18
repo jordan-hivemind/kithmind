@@ -289,12 +289,16 @@ the reset count, and nothing else.
 
 ## A local receipt the server does not hold
 
-A pass that fails `original_receipt_unknown_to_server` has met a contradiction:
+A pass that meets `original_receipt_unknown_to_server` has met a contradiction:
 the local archive catalog records an admission for the original, and the
-authoritative server says it has never seen that revision. No pass may resolve
-it, because a receipt records that original bytes were accepted somewhere and
-dropping one on a server's silence would re-admit anything a temporary
-misrouting had touched. `reconcile-receipts` is the operator route.
+authoritative server says it has never seen that revision. Since P2-31f the
+pass repairs this itself when the narrow conditions below hold, so this command
+is a fallback rather than the usual route. It retires the receipt only when the
+processing row is not activated and no processing receipt names a different
+revision; outside those conditions the document is parked (see the next
+section) rather than cleared, because a receipt records that original bytes
+were accepted somewhere and dropping one on a server's silence would re-admit
+anything a temporary misrouting had touched.
 
 It is client only. It sends one `discovery.lookupArchivedAdmission`, the same
 read-only lookup the pass itself uses, which reserves nothing and spends no
@@ -333,14 +337,13 @@ read-only lookup with the dead lease dropped, so the next pass takes the
 ordinary first-admission path: the original lookup, the processing lookup, one
 reserve and one admit.
 
-The failing pass usually leaves that original lookup unresolved in the journal,
-with the server's not-found answer already recorded. The throw happens inside
-the journaled transition, so the result is never committed, and every later
-pass replays it into the same throw; no `run` can drain it. The command expects
-this state. It uses the recorded answer rather than asking again, clears the
-catalog, and leaves the checkpoint alone, because that replay makes the same
-move by itself once the row holds no receipt. Any other unresolved request
-still refuses.
+Builds before P2-31f left that original lookup unresolved in the journal, with
+the server's not-found answer already recorded, because the throw happened
+inside the journaled transition and no `run` could drain it. The command still
+expects and handles that state: it uses the recorded answer rather than asking
+again, clears the catalog, and leaves the checkpoint alone, because the replay
+makes the same move by itself once the row holds no receipt. Any other
+unresolved request still refuses.
 
 A refusal writes nothing and names why: `journal_contended` (stop the watcher),
 `journal_request_pending` (an unresolved request that is not the lookup above;
@@ -352,6 +355,83 @@ generation is live server side under this admission, which is P2-31's work),
 `lookup_invalid`. The two processing refusals apply to the dry run as well, so
 a count never hides what `--apply` would have met. Exit status is 1 on a
 refusal and 0 otherwise.
+
+## Parked documents
+
+One document can meet a condition that is terminal for it and says nothing
+about any other file. Before P2-31f such a condition ended the whole pass, so
+one stuck document stopped every other file from being filed, on every pass,
+until an operator intervened. A pass now records a marker on that document and
+carries on. It ends `complete` or `incomplete` by the ordinary rules and never
+`failed` when parked documents are the only problem.
+
+Parking is the last resort, not the first move. Each condition is repaired
+automatically where a repair is provably safe, and parked documents are retried
+on their own before anyone is asked to look.
+
+| Code | What it means | Automatic recovery |
+| ---- | ------------- | ------------------ |
+| `provider_verification_stale_review_required` | The proof that the document matches its cloud copy expired. | Refreshed in place on a never-admitted original. Parks only if the refresh still yields a stale proof, or if the original is already admitted, which needs P2-31. |
+| `original_receipt_unknown_to_server` | The document has a filing receipt the server has no record of. | Repaired in the pass by the `reconcile-receipts` logic. Parks when the processing row is activated or a processing receipt names another revision, because retiring the receipt then cannot be undone. |
+| `catalog_conflict` | The document changed on disk while it was being filed. | None needed. The bounded retry clears it once the file stops changing. |
+| `original_receipt_revision_conflict` | The server and this computer disagree about which version was accepted. | None. Choosing a version could file the wrong document, so a person decides. |
+| `archive_catalog_revision_conflict` | The document's local records disagree about which version was published. | None. Picking one risks the wrong generation, so a person decides. |
+| `provider_original_reference_already_bound` | The document is already filed under a reference the server will not accept twice. | None. Admitting against an existing reference has no protocol shape yet; this is P2-31. |
+
+No condition that means the whole run is in trouble is ever parked. Credential,
+journal, archive repository, server unavailable, rate limit and scan conflict
+failures still end the pass.
+
+A parked document is offered to the pass again when any of these happens, in
+order of how often they do:
+
+- its bytes change, which lands it on a fresh catalog row with no marker;
+- the runner's handling of these codes changes, which a new build records as a
+  different capability fingerprint;
+- its bounded retry comes round, at most once every six hours and at most three
+  times, after which it waits;
+- an operator runs `run --retry-parked`, which clears every marker.
+
+Publishing a document clears its marker.
+
+### What an operator sees
+
+A pass result carries `parked`, `parkedCodes` and `parkedOldestAgeMs` when any
+document is parked, and none of the three when none is. A watcher writes one
+result object per pass, so its log is the durable record:
+
+```json
+{"state":"complete","scanned":42,"published":41,"parked":1,"parkedCodes":["original_receipt_revision_conflict"],"parkedOldestAgeMs":93600000}
+```
+
+`doctor` reports the same thing without taking the journal lock, so it works
+while the watcher runs. The report carries a seventh check, `archive`, whose
+code is `none_parked`, `items_parked` or `not_checked`. `items_parked` is
+`warn`, which makes the whole report `degraded` and never `blocked`: the worker
+is healthy and every other file is being filed. The check carries `parked`,
+`parkedCodes` and `parkedOldestAgeMs`, and the text output adds one line per
+code saying what it means and what to do. Counts and codes only: no file name,
+no path and nothing a document contains ever appears in a result or a report.
+
+Alert on `parked` above zero, or on `parkedOldestAgeMs` past a threshold. A
+document whose code has no automatic recovery is the one to report.
+
+To retry everything that is parked, stop the watcher, run one pass with the
+flag, and start it again:
+
+```sh
+launchctl bootout gui/$(id -u)/<watcher-label>
+pnpm --silent brain:worker -- run --config /absolute/path/to/pipeline.json --retry-parked
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<watcher-label>.plist
+```
+
+The flag clears every marker, including the attempt counts, so a document that
+still meets its condition is parked again with one attempt recorded.
+
+A parked document is not reported to the server, so the server-side processing
+assessment still counts it under `pending`, or under `unavailable` when it was
+never admitted. An assessment carrying a parked document therefore reads
+`incomplete`, which is correct: that document has not been filed.
 
 ## Template validation
 

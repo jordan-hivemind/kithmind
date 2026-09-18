@@ -161,6 +161,15 @@ export type PipelineRunResult = {
   code?: string;
   scanned?: number;
   published?: number;
+  /**
+   * P2-31f. Documents held back by a per-item admission condition. All three
+   * are absent when nothing is parked, so a healthy pass reads exactly as it
+   * did before and a `complete` pass carrying them is "healthy with parked
+   * items": a monitor alerts on the count, the codes, or the age.
+   */
+  parked?: number;
+  parkedCodes?: string[];
+  parkedOldestAgeMs?: number;
 };
 
 export type WorkerErrorCode =

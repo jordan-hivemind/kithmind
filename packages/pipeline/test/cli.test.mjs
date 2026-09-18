@@ -30,6 +30,7 @@ test("the root pnpm alias forwarding separator is consumed exactly once", () => 
     {
       command: "run",
       configPath: "/tmp/config.json",
+      retryParked: false,
     },
   );
   assert.deepEqual(argumentsFor(["watch", "--config", "/tmp/config.json"]), {
@@ -38,6 +39,31 @@ test("the root pnpm alias forwarding separator is consumed exactly once", () => 
   });
   assert.throws(() =>
     argumentsFor(["--", "--", "run", "--config", "/tmp/config.json"]),
+  );
+});
+
+// P2-31f: the operator release, on `run` and nowhere else.
+test("run takes --retry-parked and no other command does", () => {
+  assert.deepEqual(
+    argumentsFor(["run", "--config", "/tmp/config.json", "--retry-parked"]),
+    {
+      command: "run",
+      configPath: "/tmp/config.json",
+      retryParked: true,
+    },
+  );
+  for (const command of ["watch", "doctor", "reconcile-receipts"])
+    assert.throws(() =>
+      argumentsFor([command, "--config", "/tmp/config.json", "--retry-parked"]),
+    );
+  assert.throws(() =>
+    argumentsFor([
+      "run",
+      "--config",
+      "/tmp/config.json",
+      "--retry-parked",
+      "--retry-parked",
+    ]),
   );
 });
 

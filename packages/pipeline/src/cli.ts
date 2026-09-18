@@ -27,11 +27,12 @@ import type { RunnerCheckpoint } from "./runnerState.js";
 
 function usage(): never {
   throw new Error(
-    "Usage: pnpm brain:worker -- <run|watch|doctor> --config <path> [--json], or reconcile-receipts --config <path> [--apply] [--json], or forget-archive --config <path> --source-item <id> --source-external-id <uuid> --forget-epoch <n> [--json]",
+    "Usage: pnpm brain:worker -- <run|watch|doctor> --config <path> [--json], run also takes [--retry-parked], or reconcile-receipts --config <path> [--apply] [--json], or forget-archive --config <path> --source-item <id> --source-external-id <uuid> --forget-epoch <n> [--json]",
   );
 }
 export function argumentsFor(argv: string[]):
-  | { command: "run" | "watch"; configPath: string }
+  | { command: "run"; configPath: string; retryParked: boolean }
+  | { command: "watch"; configPath: string }
   | { command: "doctor"; configPath: string; json: boolean }
   | {
       command: "reconcile-receipts";
@@ -100,7 +101,10 @@ export function argumentsFor(argv: string[]):
       ? ["--json"]
       : command === "reconcile-receipts"
         ? ["--json", "--apply"]
-        : [];
+        : // P2-31f: the operator release for parked items.
+          command === "run"
+          ? ["--retry-parked"]
+          : [];
   if (
     (command !== "run" &&
       command !== "watch" &&
@@ -119,8 +123,10 @@ export function argumentsFor(argv: string[]):
       apply: extra.includes("--apply"),
       json: extra.includes("--json"),
     };
-  return command === "doctor"
-    ? { command, configPath, json: extra.includes("--json") }
+  if (command === "doctor")
+    return { command, configPath, json: extra.includes("--json") };
+  return command === "run"
+    ? { command, configPath, retryParked: extra.includes("--retry-parked") }
     : { command, configPath };
 }
 
@@ -160,6 +166,7 @@ async function executeConfig(
   config: Awaited<ReturnType<typeof loadPipelineConfig>>,
   credential: string,
   journal?: Journal<RunnerCheckpoint, JsonValue>,
+  options: { retryParked?: boolean } = {},
 ): Promise<PipelineRunResult> {
   const ownedJournal =
     journal ??
@@ -175,6 +182,8 @@ async function executeConfig(
       config,
       ownedJournal,
       new HttpWorkerTransport(config, credential),
+      undefined,
+      options,
     );
     return await runner.runSafely();
   } finally {
@@ -182,9 +191,12 @@ async function executeConfig(
   }
 }
 
-async function execute(configPath: string): Promise<PipelineRunResult> {
+async function execute(
+  configPath: string,
+  options: { retryParked?: boolean } = {},
+): Promise<PipelineRunResult> {
   const config = await loadPipelineConfig(configPath);
-  return executeConfig(config, requireCredential(config));
+  return executeConfig(config, requireCredential(config), undefined, options);
 }
 
 async function waitForWatchInterval(
@@ -339,7 +351,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     return;
   }
   if (command === "run") {
-    const result = await execute(configPath);
+    const result = await execute(configPath, {
+      retryParked: parsed.retryParked,
+    });
     process.stdout.write(`${JSON.stringify(result)}\n`);
     if (result.state !== "complete") process.exitCode = 1;
     return;

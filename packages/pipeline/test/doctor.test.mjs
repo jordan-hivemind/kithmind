@@ -159,6 +159,7 @@ test("fresh scoped setup is operationally ready before coverage exists", async (
       ["heartbeat", "pass"],
       ["roots", "pass"],
       ["journal", "pass"],
+      ["archive", "pass"],
     ],
   );
   assert.deepEqual(result.source, {
@@ -622,7 +623,7 @@ test("invalid and oversized config files return the same closed bounded object",
   for (const path of [invalid, oversized, join(files.base, "missing.json")]) {
     const result = await doctorFromPath(path, () => transport(source()));
     assert.equal(result.state, "blocked");
-    assert.equal(result.checks.length, 6);
+    assert.equal(result.checks.length, 7);
     assert.equal(check(result, "config").code, "invalid_config");
     assert.equal(JSON.stringify(result).includes(files.base), false);
   }
@@ -679,6 +680,7 @@ test("human output is a bounded rendering of fixed diagnostics", async (context)
       "heartbeat: pass current",
       "roots: pass safe",
       "journal: pass not_initialized",
+      "archive: pass none_parked",
       "source: enumeration=not_started processing=not_assessed recordCoverage=not_established",
       "capabilities: embeddings=unverified daemon=unverified",
     ].join("\n"),

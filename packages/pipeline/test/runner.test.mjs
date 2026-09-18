@@ -17,7 +17,12 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { Journal, JournalLockedError } from "../dist/journal.js";
-import { openArchiveCatalog } from "../dist/archiveCatalog.js";
+import {
+  ADMISSION_BLOCK_CODES,
+  ArchiveCatalogError,
+  MAX_ADMISSION_BLOCK_ATTEMPTS,
+  openArchiveCatalog,
+} from "../dist/archiveCatalog.js";
 import { digestArchiveIntent } from "../dist/archivedRequestMapping.js";
 import {
   initialCheckpoint,
@@ -1149,7 +1154,7 @@ test("a document stops being selected for archived work once its local parse att
       reviewSeen: false,
     });
     const journal = await openJournal(setup.journalDir, checkpoint);
-    const original = { originalCatalogId: randomUUID() };
+    const original = { originalCatalogId: randomUUID(), rowRevision: 1 };
     const runner = new PipelineRunner(setup.config, journal, {
       async call() {
         return {
@@ -1166,6 +1171,12 @@ test("a document stops being selected for archived work once its local parse att
     const fingerprints = runner.processingFingerprints(plan);
     runner.archiveCatalog = {
       findOriginalExact() {
+        return original;
+      },
+      listOriginals() {
+        return [original];
+      },
+      async recordAdmissionBlock() {
         return original;
       },
       listProcessings() {
@@ -3169,7 +3180,7 @@ test("a reconcile refuses a journal the watcher still holds", async () => {
   }
 });
 
-test("a reconcile clears the lookup the P2-31c throw leaves pending forever", async () => {
+test("the live mid-flight shape repairs itself in one pass and leaves the reconcile nothing to do", async () => {
   const setup = await fixture(0);
   const plan = pdfPlan();
   // The true live shape: resumed at admit, the receipt question never asked.
@@ -3211,51 +3222,33 @@ test("a reconcile clears the lookup the P2-31c throw leaves pending forever", as
     // A real pass reaches the contradiction, exactly as P2-31c intends.
     await runner.driveArchivedAdmit();
     assert.equal(journal.checkpoint.step, "lookup_original");
-    await assert.rejects(
-      () => runner.driveArchivedLookupOriginal(),
-      (error) => error.code === "original_receipt_unknown_to_server",
-    );
-    // The throw happens inside the journaled transition, so `commitResult` is
-    // never reached and the answered lookup stays unresolved. Every later pass
-    // replays it into the same throw without a second round trip, so no `run`
-    // can drain it and a blanket pending refusal would strand the operator.
-    assert.equal(
-      journal.pending.operation,
-      "discovery.lookupArchivedAdmission",
-    );
-    assert.equal(journal.pending.result.value.found, false);
-    await assert.rejects(
-      () => runner.driveArchivedLookupOriginal(),
-      (error) => error.code === "original_receipt_unknown_to_server",
-    );
+    // P2-31f. The pass repairs it in place instead of throwing. The lookup is
+    // settled, the void receipt is retired under the same narrow conditions
+    // the operator command enforces, and the document continues to capture.
+    await runner.driveArchivedLookupOriginal();
+    assert.equal(journal.checkpoint.step, "capture");
+    assert.equal(journal.pending, undefined);
     assert.deepEqual(sent, ["discovery.lookupArchivedAdmission"]);
+    assert.equal(rows.original.cloud, undefined);
+    assert.equal(rows.original.copies.primary.cloudReceipt, undefined);
+    // Nothing was parked: the repair is what a park is for, when it is safe.
+    assert.equal(rows.original.admissionBlock, undefined);
 
+    // The operator command still works and now finds nothing to clear.
     const result = await runReconcileReceipts({
       config: setup.config,
       journal,
       catalog,
       transport,
-      apply: true,
+      apply: false,
     });
-    assert.equal(result.state, "reconciled");
-    assert.equal(result.receiptsUnknown, 1);
+    assert.equal(result.state, "clean");
+    assert.equal(result.receiptsUnknown, 0);
     assert.deepEqual(
       sent,
       ["discovery.lookupArchivedAdmission"],
-      "the recorded answer is reused",
+      "no second round trip",
     );
-    assert.equal(rows.original.cloud, undefined);
-    assert.equal(rows.original.copies.primary.cloudReceipt, undefined);
-    // The checkpoint is left alone: a transition refuses while a request is
-    // unresolved, and the pending replay makes the same move by itself.
-    assert.equal(journal.checkpoint.step, "lookup_original");
-    assert.notEqual(journal.pending, undefined);
-
-    // The next pass. The same recorded answer now walks the ordinary path.
-    await runner.driveArchivedLookupOriginal();
-    assert.equal(journal.checkpoint.step, "capture");
-    assert.equal(journal.pending, undefined);
-    assert.deepEqual(sent, ["discovery.lookupArchivedAdmission"]);
   } finally {
     await journal.close();
     await rm(setup.base, { recursive: true, force: true });
@@ -3504,14 +3497,36 @@ async function reconcileFixture(sourceRevisionId, family) {
   });
   const original = familyOriginal(plan, originalCatalogId, sourceRevisionId);
   const rows = (family ?? twoActivatedFamily)(runner, plan, originalCatalogId);
+  const parked = [];
   runner.archiveCatalog = {
     listOriginals: () => [original],
     listProcessings: () => rows,
     findOriginalExact: () => original,
+    async recordAdmissionBlock(args) {
+      parked.push(args);
+      original.rowRevision += 1;
+      original.admissionBlock = {
+        code: args.code,
+        blockedAt: args.now,
+        runnerCapability: args.runnerCapability,
+        attempts: 1,
+      };
+      return original;
+    },
   };
   runner.processingArtifactsPresent = async () => false;
   await plantReconcilePage(journal, setup.config, checkpoint);
-  return { setup, plan, checkpoint, journal, runner, rows, original, sent };
+  return {
+    setup,
+    plan,
+    checkpoint,
+    journal,
+    runner,
+    rows,
+    original,
+    sent,
+    parked,
+  };
 }
 
 test("the original settles two activated rows and the answered page resolves", async () => {
@@ -3553,42 +3568,40 @@ test("a dead activation is never reused for an original the server re-admitted",
   }
 });
 
-test("an ambiguity the original cannot settle fails closed without wedging", async () => {
+test("an ambiguity the original cannot settle parks that document, not the scan", async () => {
   // No receipt on the original, so nothing narrows the two activations. That is
-  // a genuinely ambiguous history and still fails closed. Before this fix the
-  // throw happened inside the journaled transition, so the answered page stayed
-  // unresolved and every later pass replayed it into the same throw; only a
-  // hand edit cleared that.
+  // a genuinely ambiguous history and it is still not judged. P2-31e stopped it
+  // wedging the journal by ending the scan; P2-31f keeps the answer settled and
+  // parks the one document instead, so the scan runs on for every other file.
   const f = await reconcileFixture(undefined);
   try {
     await f.runner.driveReconcile();
     assert.equal(f.journal.pending, undefined, "the answer is not left owing");
-    assert.equal(f.journal.checkpoint.phase, "terminal");
-    assert.equal(f.journal.checkpoint.outcome, "failed");
     assert.equal(
-      f.journal.checkpoint.code,
-      "archive_catalog_revision_conflict",
+      f.journal.checkpoint.phase,
+      "discovery_reserve",
+      "the pass carries on past the parked document",
     );
     assert.deepEqual(f.sent, []);
-    // Bounded: the scan is over, so the next pass starts a clean one rather
-    // than re-asking a page the server has already finished.
-    assert.equal(f.journal.checkpoint.scanned, 1);
+    assert.equal(f.parked.length, 1);
+    assert.equal(f.parked[0].code, "archive_catalog_revision_conflict");
+    assert.equal(f.original.admissionBlock.attempts, 1);
   } finally {
     await f.journal.close();
     await rm(f.setup.base, { recursive: true, force: true });
   }
 });
 
-test("no activated row at all still fails closed on an ambiguous history", async () => {
+test("no activated row at all parks the same ambiguous history", async () => {
   const f = await reconcileFixture("revision", (runner, plan, id) =>
     twoActivatedFamily(runner, plan, id).slice(2),
   );
   try {
     await f.runner.driveReconcile();
-    assert.equal(f.journal.checkpoint.phase, "terminal");
-    assert.equal(
-      f.journal.checkpoint.code,
-      "archive_catalog_revision_conflict",
+    assert.equal(f.journal.checkpoint.phase, "discovery_reserve");
+    assert.deepEqual(
+      f.parked.map((entry) => entry.code),
+      ["archive_catalog_revision_conflict"],
     );
   } finally {
     await f.journal.close();
@@ -3596,7 +3609,258 @@ test("no activated row at all still fails closed on an ambiguous history", async
   }
 });
 
-test("a server answer that renames an admitted revision ends the scan closed", async () => {
+// ---------------------------------------------------------------------------
+// P2-31f. Parking one item instead of failing the pass.
+// ---------------------------------------------------------------------------
+
+/** A catalog stub that records parks and releases against one original row. */
+function parkingCatalog(original, processings = []) {
+  const parked = [];
+  const cleared = [];
+  return {
+    parked,
+    cleared,
+    catalog: {
+      listOriginals: () => [original],
+      listProcessings: () => processings,
+      findOriginalExact: (probe) =>
+        probe.sha256 === original.origin.sha256 &&
+        probe.byteLength === original.origin.byteLength
+          ? original
+          : undefined,
+      async recordAdmissionBlock(args) {
+        parked.push(args);
+        original.rowRevision += 1;
+        original.admissionBlock = {
+          code: args.code,
+          blockedAt: args.now,
+          runnerCapability: args.runnerCapability,
+          attempts: Math.min(
+            (original.admissionBlock?.attempts ?? 0) + 1,
+            MAX_ADMISSION_BLOCK_ATTEMPTS,
+          ),
+        };
+        return original;
+      },
+      async clearAdmissionBlock(args) {
+        cleared.push(args);
+        delete original.admissionBlock;
+        return original;
+      },
+    },
+  };
+}
+
+test("a parked document lets the next file publish in the same pass, with no request owing and no attempt spent", async () => {
+  const setup = await fixture(0);
+  // Two files. The first has the ambiguous history nothing can judge; the
+  // second is ordinary work that the old behaviour would never have reached.
+  const stuck = pdfPlan({ discoveryState: "unchanged" });
+  const healthy = pdfPlan({
+    discoveryState: "unchanged",
+    relativePath: "second.pdf",
+    sha256: "b".repeat(64),
+  });
+  const checkpoint = parseRunnerCheckpoint({
+    ...reconcileCheckpoint(stuck),
+    files: [stuck, healthy],
+  });
+  const journal = await openJournal(setup.journalDir, checkpoint);
+  const sent = [];
+  const runner = new PipelineRunner(setup.config, journal, {
+    async call(request) {
+      sent.push(request.operation);
+      return reconcileResponse(checkpoint.scanId);
+    },
+  });
+  const original = familyOriginal(stuck, randomUUID(), undefined);
+  const stub = parkingCatalog(
+    original,
+    twoActivatedFamily(runner, stuck, original.originalCatalogId),
+  );
+  runner.archiveCatalog = stub.catalog;
+  await plantReconcilePage(journal, setup.config, checkpoint);
+  try {
+    await runner.driveReconcile();
+    assert.deepEqual(
+      stub.parked.map((entry) => entry.code),
+      ["archive_catalog_revision_conflict"],
+    );
+    // The pass walks straight on to the second file.
+    assert.equal(journal.checkpoint.phase, "archived");
+    assert.equal(journal.checkpoint.pdfIndex, 1);
+    assert.equal(journal.checkpoint.step, "intent");
+    // PR 277's lesson: the answered page is settled, not left owing.
+    assert.equal(journal.pending, undefined);
+    // Nothing was sent, so no discovery attempt was spent on the parked file.
+    assert.deepEqual(sent, []);
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a parked document is offered again only when its revision, the build, or an operator releases it", async () => {
+  const setup = await fixture(0);
+  const plan = pdfPlan({ discoveryState: "unchanged" });
+  const journal = await openJournal(
+    setup.journalDir,
+    reconcileCheckpoint(plan),
+  );
+  const runner = new PipelineRunner(setup.config, journal, {
+    async call() {
+      throw new Error("the release rules ask the server nothing");
+    },
+  });
+  const original = familyOriginal(plan, randomUUID(), "revision");
+  const stub = parkingCatalog(original);
+  runner.archiveCatalog = stub.catalog;
+  const capability = "0".repeat(16);
+  try {
+    // The list is closed on purpose: nothing global may be parked. A code
+    // added here must be a per-item condition and nothing else.
+    assert.deepEqual(ADMISSION_BLOCK_CODES, [
+      "archive_catalog_revision_conflict",
+      "catalog_conflict",
+      "original_receipt_revision_conflict",
+      "original_receipt_unknown_to_server",
+      "provider_original_reference_already_bound",
+      "provider_verification_stale_review_required",
+    ]);
+    await runner.parkPlan(plan, "original_receipt_revision_conflict");
+    const parkedWith = original.admissionBlock.runnerCapability;
+    // Parked and inside the backoff window: not offered.
+    assert.equal(await runner.pdfNeedsArchivedWork(plan), false);
+    // Restart idempotence: asking again changes nothing and parks nothing
+    // more, so a pass that restarts leaves the same one attempt recorded.
+    assert.equal(await runner.pdfNeedsArchivedWork(plan), false);
+    assert.equal(stub.parked.length, 1);
+    assert.equal(original.admissionBlock.attempts, 1);
+
+    // Released by the bounded backoff once the window has passed.
+    original.admissionBlock.blockedAt = Date.now() - 7 * 60 * 60_000;
+    assert.equal(await runner.pdfNeedsArchivedWork(plan), true);
+    // ...but not past the attempt bound: then it waits for a person.
+    original.admissionBlock.attempts = MAX_ADMISSION_BLOCK_ATTEMPTS;
+    assert.equal(await runner.pdfNeedsArchivedWork(plan), false);
+
+    // Released by a build that handles these codes differently.
+    original.admissionBlock.runnerCapability = capability;
+    assert.notEqual(parkedWith, capability);
+    assert.equal(await runner.pdfNeedsArchivedWork(plan), true);
+    original.admissionBlock.runnerCapability = parkedWith;
+
+    // Released by new bytes: the marker lives on a content-keyed row, so a
+    // changed file finds no row of its own and nothing to skip.
+    assert.equal(
+      await runner.pdfNeedsArchivedWork(
+        pdfPlan({ discoveryState: "unchanged", sha256: "c".repeat(64) }),
+      ),
+      true,
+    );
+
+    // Released by the operator flag, and only by it.
+    await runner.clearParkedItems();
+    assert.deepEqual(stub.cleared, []);
+    assert.notEqual(original.admissionBlock, undefined);
+    const releasing = new PipelineRunner(
+      setup.config,
+      journal,
+      runner.transport,
+      undefined,
+      { retryParked: true },
+    );
+    releasing.archiveCatalog = stub.catalog;
+    await releasing.clearParkedItems();
+    assert.equal(stub.cleared.length, 1);
+    assert.equal(original.admissionBlock, undefined);
+    assert.equal(await runner.pdfNeedsArchivedWork(plan), true);
+  } finally {
+    await journal.close();
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a global failure still fails the pass, and a parkable code never parks over an unresolved request", async () => {
+  const setup = await fixture(0);
+  const plan = pdfPlan({ discoveryState: "unchanged" });
+  const checkpoint = archivedCheckpoint(plan, {
+    step: "capture",
+    preflightAction: undefined,
+  });
+  async function runWith(failure, wedged = false) {
+    const journal = await openJournal(setup.journalDir, checkpoint);
+    const runner = new PipelineRunner(setup.config, journal, {
+      async call() {
+        throw new Error("no request is sent");
+      },
+    });
+    const original = familyOriginal(plan, randomUUID(), "revision");
+    const stub = parkingCatalog(original);
+    // `run` opens the real catalog, so the stub is pinned past that write.
+    Object.defineProperty(runner, "archiveCatalog", {
+      configurable: true,
+      get: () => stub.catalog,
+      set: () => undefined,
+    });
+    runner.preparePdfProfile = async () => undefined;
+    runner.sourceStatus = async () => ({
+      sourceAccountId: setup.config.sourceAccountId,
+    });
+    // The journal starts settled, so the pass reaches its driving loop; the
+    // wedged case leaves a request unresolved exactly as a throw from inside a
+    // journaled transition does.
+    let pending = false;
+    Object.defineProperty(journal, "pending", {
+      configurable: true,
+      get: () => (pending ? { operation: "scan.reconcile" } : undefined),
+    });
+    runner.driveCheckpoint = async () => {
+      pending = wedged;
+      throw failure;
+    };
+    try {
+      return { result: await runner.runSafely(), parked: stub.parked };
+    } finally {
+      pending = false;
+      await journal.close();
+    }
+  }
+  try {
+    // A credential problem is about the whole run, not one file: it is not on
+    // the parkable list and still ends the pass.
+    // Not on the parkable list: it says nothing about one file, so the pass
+    // ends exactly as it did before.
+    const global = await runWith(new ArchiveCatalogError("durability_failed"));
+    assert.equal(global.result.state, "failed");
+    assert.deepEqual(global.parked, []);
+    assert.equal(global.result.parked, undefined);
+
+    // The same code, settled journal: parked, and the pass carries on.
+    const parking = await runWith(new ArchiveCatalogError("catalog_conflict"));
+    assert.deepEqual(
+      parking.parked.map((entry) => entry.code),
+      ["catalog_conflict"],
+    );
+    assert.equal(parking.result.parked, 1);
+    assert.deepEqual(parking.result.parkedCodes, ["catalog_conflict"]);
+    assert.equal(typeof parking.result.parkedOldestAgeMs, "number");
+
+    // A parkable code raised with a journaled request still unresolved is not
+    // parked either: committing a move over an unsettled call is what wedged
+    // the journal in PR 277.
+    const wedging = await runWith(
+      new ArchiveCatalogError("catalog_conflict"),
+      true,
+    );
+    assert.equal(wedging.result.state, "failed");
+    assert.deepEqual(wedging.parked, []);
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a server answer that renames an admitted revision parks that document", async () => {
   const setup = await fixture(0);
   const plan = pdfPlan();
   const checkpoint = archivedCheckpoint(plan, {
@@ -3631,12 +3895,26 @@ test("a server answer that renames an admitted revision ends the scan closed", a
     },
   });
   runner.archivedRows = () => rows;
+  const parked = [];
+  runner.archiveCatalog = {
+    listOriginals: () => [rows.original],
+    listProcessings: () => [rows.processing],
+    findOriginalExact: () => rows.original,
+    async recordAdmissionBlock(args) {
+      parked.push(args);
+      return rows.original;
+    },
+  };
   try {
     await runner.driveArchivedLookupOriginal();
     assert.equal(journal.pending, undefined, "the answer is not left owing");
-    assert.equal(journal.checkpoint.phase, "terminal");
-    assert.equal(journal.checkpoint.outcome, "failed");
-    assert.equal(journal.checkpoint.code, "original_receipt_revision_conflict");
+    // P2-31f: the disagreement is about this one document, so it is parked and
+    // the pass walks on rather than every other file paying for it.
+    assert.equal(journal.checkpoint.phase, "discovery_reserve");
+    assert.deepEqual(
+      parked.map((entry) => entry.code),
+      ["original_receipt_revision_conflict"],
+    );
   } finally {
     await journal.close();
     await rm(setup.base, { recursive: true, force: true });
@@ -3811,6 +4089,12 @@ test("a receipt the server does not know is named for what it is, not as a provi
   runner.refreshProviderProof = async () => {
     throw new Error("a receipt question must be settled before any refresh");
   };
+  let current = rows;
+  runner.archiveCatalog = admissionCatalog(
+    () => current,
+    (next) => (current = next),
+  );
+  runner.archivedRows = () => current;
   try {
     // The admit asks the server instead of refusing blind, and drops the dead
     // lease rather than renewing it.
@@ -3819,15 +4103,22 @@ test("a receipt the server does not know is named for what it is, not as a provi
     assert.equal(journal.checkpoint.step, "lookup_original");
     assert.equal(journal.checkpoint.receiptChecked, true);
     assert.equal(journal.checkpoint.discoveryLease, undefined);
-    // The server says it has never seen this revision. The catalog says it was
-    // admitted. That contradiction is its own code, and it is the one the
-    // operator sees rather than the provider refusal from P2-31b.
-    await assert.rejects(
-      () => runner.driveArchivedLookupOriginal(),
-      (error) => error.code === "original_receipt_unknown_to_server",
-    );
+    // P2-31f. The server says it has never seen this revision and the catalog
+    // says it was admitted. P2-31d proved which narrow conditions make
+    // retiring that receipt safe, and they hold here, so the pass runs the
+    // same clear itself and carries straight on to capture. No throw, no
+    // wedged journal, and no operator command.
+    await runner.driveArchivedLookupOriginal();
     assert.deepEqual(sent, ["discovery.lookupArchivedAdmission"]);
-    assert.equal(journal.checkpoint.step, "lookup_original");
+    assert.equal(journal.checkpoint.step, "capture");
+    assert.equal(journal.pending, undefined);
+    assert.equal(current.original.cloud, undefined);
+    assert.equal(current.original.copies.primary.cloudReceipt, undefined);
+    assert.equal(
+      current.original.receiptReconcile.code,
+      "original_receipt_unknown_to_server",
+    );
+    assert.equal(current.original.admissionBlock, undefined);
   } finally {
     await journal.close();
     await rm(setup.base, { recursive: true, force: true });
@@ -4223,7 +4514,7 @@ test("successive PDF reconciles skip activated unchanged work and resume incompl
       reviewSeen: false,
     });
     const journal = await openJournal(setup.journalDir, checkpoint);
-    const original = { originalCatalogId: randomUUID() };
+    const original = { originalCatalogId: randomUUID(), rowRevision: 1 };
     const runner = new PipelineRunner(setup.config, journal, {
       async call() {
         return {
@@ -4240,6 +4531,12 @@ test("successive PDF reconciles skip activated unchanged work and resume incompl
     const fingerprints = runner.processingFingerprints(plan);
     runner.archiveCatalog = {
       findOriginalExact() {
+        return original;
+      },
+      listOriginals() {
+        return [original];
+      },
+      async recordAdmissionBlock() {
         return original;
       },
       listProcessings() {
@@ -4297,17 +4594,15 @@ test("successive PDF reconciles skip activated unchanged work and resume incompl
     ).phase,
     "discovery_reserve",
   );
-  // P2-31e. Both histories still fail closed with the same code. The refusal is
-  // now committed as a terminal scan instead of thrown, because a throw from
-  // inside the journaled transition left the answered page unresolved forever.
+  // P2-31e settled the answered page instead of throwing out of the journaled
+  // transition. P2-31f goes one step further: neither history is judged, but
+  // the refusal is now per document, so the scan moves on with that one parked.
   for (const rows of [
     [readyRow("first"), readyRow("second")],
     [{ processingCatalogId: "first" }, { processingCatalogId: "second" }],
   ]) {
     const checkpoint = await reconcile("unchanged", rows);
-    assert.equal(checkpoint.phase, "terminal");
-    assert.equal(checkpoint.outcome, "failed");
-    assert.equal(checkpoint.code, "archive_catalog_revision_conflict");
+    assert.equal(checkpoint.phase, "discovery_reserve");
   }
   const incoherent = await reconcile("unchanged", [
     { processingCatalogId: "incomplete" },
@@ -4319,8 +4614,7 @@ test("successive PDF reconciles skip activated unchanged work and resume incompl
       },
     },
   ]);
-  assert.equal(incoherent.phase, "terminal");
-  assert.equal(incoherent.code, "archive_catalog_revision_conflict");
+  assert.equal(incoherent.phase, "discovery_reserve");
 });
 
 test("journal loss after activation routes retained plaintext to cleanup only", async () => {

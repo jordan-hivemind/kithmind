@@ -318,10 +318,17 @@ function validateOwnerReset(
 
 function doctorCheck(result: DoctorResult): void {
   const heartbeat = result.checks[3];
+  // P2-31f: a parked archived item is a settled per-item outcome, like the
+  // parked parse failure below. It is recorded, it will not change while the
+  // root moves, and it does not gate the relocation. A check that never looked
+  // does gate it.
+  const archive = result.checks[6];
   if (
     result.version !== 2 ||
     result.state !== "degraded" ||
-    result.checks.length !== 6 ||
+    result.checks.length !== 7 ||
+    archive?.id !== "archive" ||
+    archive.code === "not_checked" ||
     !isDeepStrictEqual(result.checks[0], {
       id: "config",
       state: "pass",

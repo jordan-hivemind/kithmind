@@ -12,6 +12,8 @@ import {
   FilesystemFailure,
   type SafeRoot,
 } from "./filesystem.js";
+import { inspectParkedItems } from "./archiveCatalog.js";
+import type { AdmissionBlockCode } from "./archiveCatalogTypes.js";
 import { inspectJournalReadOnly } from "./journal.js";
 import type { JournalInspection } from "./journalTypes.js";
 import { journalCodec } from "./runner.js";
@@ -123,13 +125,74 @@ export type HeartbeatCheck = {
     | "unavailable";
 };
 
+/**
+ * P2-31f. Documents the archived pass parked on a per-item condition. `warn`,
+ * never `fail`: the pass itself is healthy and every other file went through,
+ * but a parked document stays parked until something changes, so it must not
+ * be invisible either. Counts and closed-enum codes only, with no names, paths
+ * or content.
+ */
+export type ArchiveCheck = {
+  id: "archive";
+  state: CheckState;
+  code: "none_parked" | "items_parked" | "not_checked";
+  parked?: number;
+  parkedCodes?: AdmissionBlockCode[];
+  parkedOldestAgeMs?: number;
+};
+
 export type DoctorCheck =
   | ConfigCheck
   | CredentialCheck
   | DeploymentCheck
   | RootsCheck
   | JournalCheck
-  | HeartbeatCheck;
+  | HeartbeatCheck
+  | ArchiveCheck;
+
+/**
+ * P2-31f. What a parked item means and what to do about it, one sentence each
+ * and written for whoever reads the report rather than whoever wrote the code.
+ * Fixed literals per code: nothing here is built from a file name, a path, or
+ * anything a document contains.
+ */
+export const PARKED_ITEM_GUIDANCE: Record<
+  AdmissionBlockCode,
+  { means: string; action: string }
+> = {
+  archive_catalog_revision_conflict: {
+    means:
+      "One document's local records disagree about which version of it was published.",
+    action:
+      "Report this one. It needs a maintainer to decide which record is right.",
+  },
+  catalog_conflict: {
+    means: "One document changed on disk while it was being filed.",
+    action:
+      "Nothing to do. It is retried on its own and clears once the file stops changing.",
+  },
+  original_receipt_revision_conflict: {
+    means:
+      "The server and this computer disagree about which version of one document was accepted.",
+    action:
+      "Report this one. Picking the wrong version could file the wrong document.",
+  },
+  original_receipt_unknown_to_server: {
+    means: "One document has a filing receipt the server has no record of.",
+    action: "Usually repaired automatically. If it stays parked, report it.",
+  },
+  provider_original_reference_already_bound: {
+    means:
+      "One document is already filed under a reference the server will not accept twice.",
+    action: "Report this one. It needs a maintainer and is tracked as P2-31.",
+  },
+  provider_verification_stale_review_required: {
+    means:
+      "The proof that one document matches its cloud copy expired before it could be used.",
+    action:
+      "Usually repaired automatically on the next pass. If it stays parked, report it.",
+  },
+};
 
 export type ProcessingCounts = {
   items: {
@@ -174,6 +237,7 @@ export type DoctorResult = {
     HeartbeatCheck,
     RootsCheck,
     JournalCheck,
+    ArchiveCheck,
   ];
   source: DoctorSource;
   capabilities: { embeddings: "unverified"; daemon: "unverified" };
@@ -266,7 +330,27 @@ export function invalidConfigDoctorResult(): DoctorResult {
     { id: "heartbeat", state: "warn", code: "unavailable" },
     { id: "roots", state: "warn", code: "not_checked" },
     { id: "journal", state: "warn", code: "not_checked" },
+    { id: "archive", state: "warn", code: "not_checked" },
   ]);
+}
+
+/** P2-31f. Reads parked items from the catalog without taking the lock. */
+async function archiveCheck(config: PipelineConfig): Promise<ArchiveCheck> {
+  const summary = await inspectParkedItems(config.journalDir);
+  if (summary.parked === 0)
+    return { id: "archive", state: "pass", code: "none_parked" };
+  return {
+    id: "archive",
+    state: "warn",
+    code: "items_parked",
+    parked: summary.parked,
+    parkedCodes: summary.codes,
+    ...(summary.oldestBlockedAt === undefined
+      ? {}
+      : {
+          parkedOldestAgeMs: Math.max(0, Date.now() - summary.oldestBlockedAt),
+        }),
+  };
 }
 
 function heartbeatCheck(status: DiagnosticsStatus): HeartbeatCheck {
@@ -823,10 +907,11 @@ export async function doctor(
   credential: string | undefined,
   adapters: DoctorAdapters = {},
 ): Promise<DoctorResult> {
-  const [remote, roots, journal] = await Promise.all([
+  const [remote, roots, journal, archive] = await Promise.all([
     remoteChecks(config, transport, credential, adapters.diagnosticDeadlineMs),
     rootCheck(config, adapters.inspectRoots),
     inspectJournal(config, credential, adapters.inspectJournal),
+    archiveCheck(config),
   ]);
   return result(
     [
@@ -836,6 +921,7 @@ export async function doctor(
       remote.heartbeat,
       roots,
       journal,
+      archive,
     ],
     remote.source,
   );
@@ -888,10 +974,31 @@ export async function doctorFromPath(
   );
 }
 
+/**
+ * P2-31f. The lines a person reads when documents are parked: how many, for
+ * how long, and per code what it means and what to do. Nothing is printed when
+ * nothing is parked.
+ */
+function parkedLines(check: ArchiveCheck): string[] {
+  if (check.code !== "items_parked") return [];
+  const hours =
+    check.parkedOldestAgeMs === undefined
+      ? "unknown"
+      : `${Math.floor(check.parkedOldestAgeMs / 3_600_000)}h`;
+  return [
+    `parked items: ${check.parked} (oldest ${hours})`,
+    ...(check.parkedCodes ?? []).map(
+      (code) =>
+        `  ${code}: ${PARKED_ITEM_GUIDANCE[code].means} ${PARKED_ITEM_GUIDANCE[code].action}`,
+    ),
+  ];
+}
+
 export function formatDoctorResult(value: DoctorResult): string {
   return [
     `doctor: ${value.state}`,
     ...value.checks.map((check) => `${check.id}: ${check.state} ${check.code}`),
+    ...parkedLines(value.checks[6]),
     `source: enumeration=${value.source.enumeration} processing=${value.source.processing} recordCoverage=${value.source.recordCoverage}`,
     `capabilities: embeddings=${value.capabilities.embeddings} daemon=${value.capabilities.daemon}`,
   ].join("\n");
