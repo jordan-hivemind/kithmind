@@ -3,7 +3,10 @@ import { randomUUID } from "node:crypto";
 import test from "node:test";
 
 import { digestParsedMappingManifest } from "@repo/worker-protocol";
-import { HttpWorkerTransport } from "../../pipeline/dist/transport.js";
+import {
+  HttpWorkerTransport,
+  parseWorkerResponse,
+} from "../../pipeline/dist/transport.js";
 import {
   createKithPool,
   newKithId,
@@ -3347,6 +3350,26 @@ test(
       assert.deepEqual(swallowed.row.counts.notReadyReasons, {
         "protocol_error:scan_conflict": 1,
       });
+
+      // The latest completed assessment now carries a tally in its `counts`
+      // column, and `source.status` reports that row's counts. The worker's own
+      // parser refuses any key beyond `items` and `unresolvedEntries`, so the
+      // response is parsed with it rather than shape-asserted by hand.
+      const status = await call((ctx) =>
+        getWorkerSourceStatus(ctx, f.principal, {
+          protocolVersion: 1,
+          operation: "source.status",
+          spaceId: f.spaceId,
+          sourceAccountId: f.sourceAccountId,
+        }),
+      );
+      assert.equal(status.processing.state, "incomplete");
+      assert.deepEqual(Object.keys(status.processing.counts).sort(), [
+        "items",
+        "unresolvedEntries",
+      ]);
+      parseWorkerResponse(JSON.stringify(status), "source.status");
+
       await f.client.query(
         "UPDATE kith.worker_scan_entries SET state='unchanged' WHERE id=$1",
         [entryId],

@@ -6,6 +6,7 @@ import type {
 } from "@repo/worker-protocol/request";
 import type { PrincipalRef } from "../identity/authorization.js";
 
+import { normalizedCounts } from "./assessment.js";
 import { requireWorkerSourceAccount, type LoadedWorkerSource } from "./auth.js";
 import { row, rows, type WorkerCtx } from "./db.js";
 import { workerProtocolError } from "./errors.js";
@@ -59,19 +60,18 @@ function snapshotCurrent(
   );
 }
 
+/**
+ * P2-100a: this shape-checked the stored jsonb and then cast it straight into
+ * the response. A cast carries whatever extra keys the column holds, and the
+ * worker's parser refuses a `counts` object with any key beyond `items` and
+ * `unresolvedEntries`, so the diagnostic tally now stored beside the counts
+ * would have wedged `source.status`, doctor and relocation resume. Share
+ * `normalizedCounts`, which rebuilds the protocol shape field by field.
+ */
 function readCounts(
   value: Record<string, unknown> | null,
 ): ProcessingAssessmentCounts {
-  if (
-    !value ||
-    typeof value.items !== "object" ||
-    value.items === null ||
-    typeof value.unresolvedEntries !== "object" ||
-    value.unresolvedEntries === null
-  ) {
-    workerProtocolError("scan_conflict");
-  }
-  return value as ProcessingAssessmentCounts;
+  return normalizedCounts(value) ?? workerProtocolError("scan_conflict");
 }
 
 export async function getProcessingAssessmentStatus(

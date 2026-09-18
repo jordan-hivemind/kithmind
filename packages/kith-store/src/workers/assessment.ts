@@ -103,7 +103,15 @@ function emptyCounts(): ProcessingAssessmentCounts {
   };
 }
 
-function normalizedCounts(
+/**
+ * The protocol-shaped counts, rebuilt field by field. Rebuilding rather than
+ * casting is what keeps a stored extra key (today `notReadyReasons`, see
+ * `notReady.ts`) out of every response: the worker's own parser refuses a
+ * `counts` object carrying any key beyond `items` and `unresolvedEntries`
+ * (`packages/pipeline/src/transport.ts`), so every reader of an assessment's
+ * `counts` column must come through here rather than cast the row value.
+ */
+export function normalizedCounts(
   value: Record<string, unknown> | null,
 ): ProcessingAssessmentCounts | null {
   if (
