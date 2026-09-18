@@ -34,6 +34,36 @@ async function sha256Utf8(value) {
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+/**
+ * P2-100e. The Convex canonical form, reimplemented here from the original at
+ * 5a922e4 rather than imported from the package, so a drift inside the
+ * package's own digest helpers cannot make this suite agree with them.
+ */
+async function convexDigest(domain, rows) {
+  return sha256Utf8(`${domain}\0${JSON.stringify(rows)}`);
+}
+
+async function convexMappingManifestHash(pages, evidence) {
+  return sha256Utf8(
+    "kith-parsed-cloud-mapping:v1\0" +
+      JSON.stringify([
+        1,
+        pages.map((page) => [page.ordinal, page.start, page.end, page.textHash]),
+        evidence.map((span) => [
+          span.pageOrdinal,
+          span.ordinal,
+          span.start,
+          span.end,
+          span.quoteHash,
+          [span.locator.kind, span.locator.pageNumber, span.locator.pageTextHash],
+        ]),
+      ]),
+  );
+}
+
+/** A fixed instant, so every digest below is reproducible by hand. */
+const capturedAtMs = 1_757_000_000_000;
+
 async function seedSourceAccount(client, spaceId) {
   const id = opaqueId();
   await client.query("INSERT INTO kith.source_accounts (id, space_id, created_at) VALUES ($1,$2,transaction_timestamp())", [
@@ -367,7 +397,9 @@ test(
         documentKey: "doc-1",
         title: "Fixture document",
         docType: "note",
-        capturedAt: Date.now(),
+        // P2-100e. Fixed rather than `Date.now()`: the digests asserted below
+        // are recomputed by hand from these exact inputs.
+        capturedAt: capturedAtMs,
         evidence: [
           { pageOrdinal: 0, evidenceOrdinal: 0 },
           { pageOrdinal: 0, evidenceOrdinal: 1 },
@@ -416,6 +448,40 @@ test(
     assert.equal(summary.evidenceSpanCount, 2);
     assert.equal(summary.documentCount, 1);
     assert.equal(summary.chunkCount, 2);
+
+    // P2-100e. A new seal records the protocol canonical form: every digest it
+    // wrote equals the Convex form recomputed by hand above from the fixture's
+    // own inputs. `capturedAt` is the epoch-millisecond number the protocol
+    // carries, not the ISO string the `timestamptz` column reads back as.
+    const sealedManifest = (
+      await client.query("SELECT * FROM kith.processing_generation_payload_manifests WHERE id = $1", [
+        summary.manifestId,
+      ])
+    ).rows[0];
+    const [spanA, spanB] = stage.evidenceSpanIds;
+    const [documentId] = stage.documentIds;
+    const quoteHashA = await sha256Utf8("A");
+    const quoteHashB = await sha256Utf8("B");
+    assert.equal(sealedManifest.page_digest, await convexDigest("parsed-pages:v1", [[0, 0, 2, pageTextHash]]));
+    assert.equal(
+      sealedManifest.evidence_digest,
+      await convexDigest("parsed-evidence:v1", [
+        [0, 0, 0, 1, quoteHashA, ["parser_page_v1", 1, pageTextHash]],
+        [0, 1, 1, 2, quoteHashB, ["parser_page_v1", 1, pageTextHash]],
+      ]),
+    );
+    assert.equal(
+      sealedManifest.document_digest,
+      await convexDigest("parsed-documents:v1", [["doc-1", "Fixture document", "note", capturedAtMs, [spanA, spanB]]]),
+    );
+    assert.equal(
+      sealedManifest.chunk_digest,
+      await convexDigest("parsed-chunks:v1", [
+        [documentId, 0, 0, 1, quoteHashA, [spanA]],
+        [documentId, 1, 1, 2, quoteHashB, [spanB]],
+      ]),
+    );
+    assert.equal(sealedManifest.mapping_manifest_hash, await convexMappingManifestHash(pageInputs, evidenceInputs));
 
     // The seal flips the text version's sealed flag. (Inline text's own
     // sealed-rows-are-immutable case is exercised in provenance.test.mjs;
@@ -501,7 +567,6 @@ test(
         value,
       ]);
     const [chunkA] = stage.chunkIds;
-    const [spanA] = stage.evidenceSpanIds;
     await refusesWith(
       "id_sets",
       setManifest("chunk_ids", JSON.stringify([chunkA])),
@@ -511,7 +576,7 @@ test(
     await refusesWith(
       "span_loop:quote_hash",
       sql("UPDATE kith.evidence_spans SET quote_hash = $2 WHERE id = $1", [spanA, await sha256Utf8("X")]),
-      sql("UPDATE kith.evidence_spans SET quote_hash = $2 WHERE id = $1", [spanA, await sha256Utf8("A")]),
+      sql("UPDATE kith.evidence_spans SET quote_hash = $2 WHERE id = $1", [spanA, quoteHashA]),
     );
     await refusesWith(
       "chunk_loop:text",
@@ -523,6 +588,52 @@ test(
       setManifest("chunk_digest", await sha256Utf8("not-the-chunk-digest")),
       setManifest("chunk_digest", manifestChunkDigest),
     );
+
+    // P2-100e. The four document fields the digest covers, under whichever
+    // canonicalization the manifest holds. `documentTampers` is run twice: once
+    // against the canonical digest the seal wrote, and once against the legacy
+    // digest a payload sealed natively on PostgreSQL before P2-100e recorded.
+    const documentTampers = async () => {
+      await refusesWith(
+        "document_digest",
+        sql("UPDATE kith.documents SET title = 'Renamed' WHERE id = $1", [documentId]),
+        sql("UPDATE kith.documents SET title = 'Fixture document' WHERE id = $1", [documentId]),
+      );
+      await refusesWith(
+        "document_digest",
+        sql("UPDATE kith.documents SET doc_type = 'statement' WHERE id = $1", [documentId]),
+        sql("UPDATE kith.documents SET doc_type = 'note' WHERE id = $1", [documentId]),
+      );
+      await refusesWith(
+        "document_digest",
+        sql("UPDATE kith.documents SET captured_at = $2 WHERE id = $1", [documentId, new Date(capturedAtMs + 1000)]),
+        sql("UPDATE kith.documents SET captured_at = $2 WHERE id = $1", [documentId, new Date(capturedAtMs)]),
+      );
+      await refusesWith(
+        "document_digest",
+        sql("UPDATE kith.documents SET evidence_span_ids = $2 WHERE id = $1", [
+          documentId,
+          JSON.stringify([spanB, spanA]),
+        ]),
+        sql("UPDATE kith.documents SET evidence_span_ids = $2 WHERE id = $1", [
+          documentId,
+          JSON.stringify([spanA, spanB]),
+        ]),
+      );
+    };
+    await documentTampers();
+
+    // The legacy canonicalization: the same five fields with `capturedAt` left
+    // as the ISO string `JSON.stringify` writes a Date as. It is a distinct
+    // digest, it is accepted, and it still proves every one of those fields.
+    const legacyDocumentDigest = await convexDigest("parsed-documents:v1", [
+      ["doc-1", "Fixture document", "note", new Date(capturedAtMs).toISOString(), [spanA, spanB]],
+    ]);
+    assert.notEqual(legacyDocumentDigest, sealedManifest.document_digest);
+    await setManifest("document_digest", legacyDocumentDigest)();
+    assert.equal((await provenance.verifySealedParsedPayload(client, generation)).actualDocumentCount, 1);
+    await documentTampers();
+    await setManifest("document_digest", sealedManifest.document_digest)();
 
     // Tampering with a sealed page's retained text is caught: the digest the
     // manifest recorded no longer reproduces.

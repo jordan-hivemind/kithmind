@@ -45,6 +45,41 @@
 // lease, then supplies a client in its staging transaction. Parsed document
 // input keeps the worker protocol's epoch-millisecond `capturedAt`; this module
 // converts it to PostgreSQL `timestamptz` (`Date`) at the storage boundary.
+//
+// P2-100e. A digest is computed over the protocol form, never over whatever a
+// column happens to deserialize to. The audit of every digest and hash this
+// module recomputes, against the Convex implementation at 5a922e4:
+//
+//   parsed-pages:v1      ordinal, start, end are `numeric` columns, and
+//                        `camelizeSourcePage` coerces all three with
+//                        `Number`; `textHash` is `text`. No drift.
+//   parsed-evidence:v1   built by `canonicalParsedMappingManifestInput`,
+//                        which re-validates every field and refuses a wrong
+//                        type instead of digesting it. The locator is rebuilt
+//                        field by field, so `jsonb` key order cannot reach
+//                        the digest. No drift.
+//   parsed-documents:v1  `captured_at` is `timestamptz`, so the row's
+//                        `capturedAt` is a `Date` that `JSON.stringify`
+//                        writes as an ISO string, while Convex stored and
+//                        digested `v.number()` epoch milliseconds. DRIFT,
+//                        fixed here. `title` and `doc_type` are `text NOT
+//                        NULL` and the protocol requires both, and an absent
+//                        Convex optional and a SQL `NULL` both serialize to
+//                        `null` inside an array, so neither drifts.
+//   parsed-chunks:v1     ordinal, start, end are `numeric` and
+//                        `camelizeChunk` coerces all three; `documentId` is
+//                        `text`, the text is hashed, and `evidenceSpanIds` is
+//                        a `jsonb` array, whose element order `jsonb` keeps.
+//                        No drift.
+//   mapping manifest     `digestParsedMappingManifest`, the same protocol
+//                        canonicalization as the evidence digest. No drift.
+//   retained text hash   a hash of a `text` column. No drift.
+//   archive set digest   `workers/archivedDiscovery.ts`, over receipt ids,
+//                        fixed role literals and `bindingEpoch`, which
+//                        `camelizeSourceArtifactArchiveBinding` coerces. No
+//                        drift.
+//   normalized bundle    stored and compared as a string; nothing recomputes
+//                        it. No drift.
 
 import type {
   ParsedChunkInput,
@@ -630,6 +665,62 @@ async function digestRows(domain: string, rows: unknown[]): Promise<string> {
   return sha256Utf8(`${domain}\0${JSON.stringify(rows)}`);
 }
 
+// P2-100e. The canonical input of each digest, in one place, so seal and
+// verify cannot drift apart and so no column's storage type can leak into a
+// digest again.
+//
+// The canonical form is the worker protocol's form, which is what the Convex
+// implementation digested and what this module's header documents as the form
+// the input keeps: `capturedAt` is an epoch-millisecond number, offsets and
+// ordinals are numbers, ids and hashes are strings. `parsed-evidence:v1` and
+// the mapping manifest hash need no helper here: they go through
+// `canonicalParsedMappingManifestInput`, which re-validates every field and
+// refuses a wrong type rather than digesting it.
+
+function pageDigestRows(pages: readonly ParsedPageInput[]): unknown[] {
+  return pages.map(({ ordinal, start, end, textHash }) => [ordinal, start, end, textHash]);
+}
+
+function documentDigestRows(documents: readonly DocumentRow[]): unknown[] {
+  return documents.map((row) => [
+    row.documentKey,
+    row.title,
+    row.docType,
+    row.capturedAt.getTime(),
+    row.evidenceSpanIds,
+  ]);
+}
+
+/**
+ * The same five fields, with `capturedAt` left as the `timestamptz` Date this
+ * package reads back, which `JSON.stringify` writes as an ISO string.
+ *
+ * Every payload sealed natively on PostgreSQL before P2-100e recorded this
+ * form, because seal and verify both read the column and both drifted the same
+ * way. It stays accepted, named, and second: `verifySealedParsedPayload` tries
+ * the canonical form first and only falls back here. Both are full content
+ * proofs over the same five fields of the same rows, so accepting either
+ * weakens nothing; they differ only in how one timestamp is written down. New
+ * seals record the canonical form, and no stored manifest is rewritten.
+ */
+function legacyDocumentDigestRows(documents: readonly DocumentRow[]): unknown[] {
+  return documents.map((row) => [
+    row.documentKey,
+    row.title,
+    row.docType,
+    row.capturedAt,
+    row.evidenceSpanIds,
+  ]);
+}
+
+async function chunkDigestRows(chunks: readonly ChunkRow[]): Promise<unknown[]> {
+  const rows: unknown[] = [];
+  for (const row of chunks) {
+    rows.push([row.documentId, row.ordinal, row.start, row.end, await sha256Utf8(row.text), row.evidenceSpanIds]);
+  }
+  return rows;
+}
+
 export type SealedPayloadSummary = {
   manifestId: string;
   pageCount: number;
@@ -831,24 +922,15 @@ export async function sealParsedPayload(
     chunkBytes !== stage.chunkBytes
   )
     throw new ProofError("scan_conflict");
-  const chunkDigestRows: unknown[] = [];
-  for (const row of chunks) {
-    chunkDigestRows.push([row.documentId, row.ordinal, row.start, row.end, await sha256Utf8(row.text), row.evidenceSpanIds]);
-  }
   const manifestId = newKithId();
-  const pageDigest = await digestRows(
-    "parsed-pages:v1",
-    pageInputs.map(({ ordinal, start, end, textHash: hash }) => [ordinal, start, end, hash]),
-  );
+  const pageDigest = await digestRows("parsed-pages:v1", pageDigestRows(pageInputs));
   const evidenceDigest = await digestRows(
     "parsed-evidence:v1",
     canonicalParsedMappingManifestInput([], evidenceInputs)[2] as unknown[],
   );
-  const documentDigest = await digestRows(
-    "parsed-documents:v1",
-    documents.map((row) => [row.documentKey, row.title, row.docType, row.capturedAt, row.evidenceSpanIds]),
-  );
-  const chunkDigest = await digestRows("parsed-chunks:v1", chunkDigestRows);
+  // The canonical form only. A new seal never records the legacy form.
+  const documentDigest = await digestRows("parsed-documents:v1", documentDigestRows(documents));
+  const chunkDigest = await digestRows("parsed-chunks:v1", await chunkDigestRows(chunks));
   const manifestResult = await client.query<QueryResultRow>(
     `INSERT INTO kith.processing_generation_payload_manifests
        (id, space_id, created_at, source_account_id, source_item_id, source_revision_id, source_text_version_id,
@@ -1129,7 +1211,6 @@ export async function verifySealedParsedPayload(
   }
   let chunkTextBytes = 0;
   const coverage: Array<readonly [number, number]> = [];
-  const chunkDigestRows: unknown[] = [];
   const chunkOrdinals = new Map<string, number[]>();
   for (const chunk of chunks) {
     const document = documentById.get(chunk.documentId);
@@ -1164,7 +1245,6 @@ export async function verifySealedParsedPayload(
     const ordinals = chunkOrdinals.get(chunk.documentId) ?? [];
     ordinals.push(chunk.ordinal);
     chunkOrdinals.set(chunk.documentId, ordinals);
-    chunkDigestRows.push([chunk.documentId, chunk.ordinal, chunk.start, chunk.end, await sha256Utf8(chunk.text), chunk.evidenceSpanIds]);
   }
   if (usesPageLocators) await requirePageChunkProfile(pages, spans, documents, chunks);
   coverage.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
@@ -1202,28 +1282,24 @@ export async function verifySealedParsedPayload(
   // counts, the page and quote hashes, the retained-text hash, the mapping
   // manifest hash and the four content digests below, each computed over an
   // explicit field list and so shape independent.
-  if (
-    manifest.pageDigest !==
-    (await digestRows(
-      "parsed-pages:v1",
-      pageInputs.map(({ ordinal, start, end, textHash }) => [ordinal, start, end, textHash]),
-    ))
-  )
+  if (manifest.pageDigest !== (await digestRows("parsed-pages:v1", pageDigestRows(pageInputs))))
     no("page_digest");
   if (
     manifest.evidenceDigest !==
     (await digestRows("parsed-evidence:v1", canonicalParsedMappingManifestInput([], evidenceInputs)[2] as unknown[]))
   )
     no("evidence_digest");
-  if (
-    manifest.documentDigest !==
-    (await digestRows(
-      "parsed-documents:v1",
-      documents.map((row) => [row.documentKey, row.title, row.docType, row.capturedAt, row.evidenceSpanIds]),
-    ))
-  )
-    no("document_digest");
-  if (manifest.chunkDigest !== (await digestRows("parsed-chunks:v1", chunkDigestRows))) no("chunk_digest");
+  // P2-100e. The canonical form first. A manifest sealed natively on
+  // PostgreSQL before P2-100e recorded `capturedAt` as an ISO string, so that
+  // form is tried second rather than refused. Both cover the same five fields
+  // of the same rows, so a document whose key, title, doc type, captured-at
+  // instant or evidence span ids were altered fails both.
+  if (manifest.documentDigest !== (await digestRows("parsed-documents:v1", documentDigestRows(documents)))) {
+    if (manifest.documentDigest !== (await digestRows("parsed-documents:v1", legacyDocumentDigestRows(documents))))
+      no("document_digest");
+  }
+  if (manifest.chunkDigest !== (await digestRows("parsed-chunks:v1", await chunkDigestRows(chunks))))
+    no("chunk_digest");
   if (
     manifest.retainedTextHash !== text.textHash ||
     manifest.retainedTextUtf8Length !== textBytes ||
