@@ -41,9 +41,12 @@ test("no flags is every space, dry run", () => {
   assert.deepEqual(argumentsFor([]), { spaceId: null, apply: false });
 });
 
-test("--apply writes, --space narrows to one space", () => {
+test("--space narrows to one space, and --apply writes that space", () => {
   const spaceId = newKithId();
-  assert.deepEqual(argumentsFor(["--apply"]), { spaceId: null, apply: true });
+  assert.deepEqual(argumentsFor(["--space", spaceId]), {
+    spaceId,
+    apply: false,
+  });
   assert.deepEqual(argumentsFor(["--space", spaceId, "--apply"]), {
     spaceId,
     apply: true,
@@ -52,6 +55,12 @@ test("--apply writes, --space narrows to one space", () => {
     spaceId,
     apply: false,
   });
+});
+
+test("--apply without --space exits rather than writing to every space", () => {
+  // Counting every space has no consequence and stays allowed. Writing to every
+  // space is not something this command's output would let anyone review first.
+  assert.equal(exitCodeOf(() => argumentsFor(["--apply"])), 2);
 });
 
 test("a missing or malformed space id exits rather than sweeping every space", () => {

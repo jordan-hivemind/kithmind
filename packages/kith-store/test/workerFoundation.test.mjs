@@ -3524,21 +3524,38 @@ test(
         eligible: 0,
         reset: 0,
       });
-      // A successfully admitted row and superseded history are never requeued.
-      for (const state of ["admitted", "obsolete"]) {
+      // Only a row that ran out of attempts without anything having judged the
+      // document is in reach. `admitted` succeeded and `obsolete` is superseded
+      // history. `failed` at the cap is a settled parse failure and
+      // `needs_review` is parked for a review: sweeping either from a command
+      // whose dry run reports counts only would retry or step around a judgment
+      // no operator got to see.
+      for (const state of ["admitted", "obsolete", "failed", "needs_review"]) {
         await f.client.query(
           `UPDATE kith.worker_discovery_work
               SET attempts = 8, state = $2, lease_token = NULL,
-                  lease_owner_credential_id = NULL, lease_expires_at = NULL
+                  lease_owner_credential_id = NULL, lease_expires_at = NULL,
+                  retryable = $3, failure_code = $4
             WHERE id = $1`,
-          [seeded.id, state],
+          [
+            seeded.id,
+            state,
+            state === "failed" ? false : null,
+            state === "failed" ? "conversion_failed" : null,
+          ],
         );
         assert.deepEqual(
           await reset({ apply: true }),
           { spaceId: f.spaceId, eligible: 0, reset: 0 },
           state,
         );
-        assert.equal(Number((await workRow()).attempts), 8);
+        const untouched = await workRow();
+        assert.equal(untouched.state, state, state);
+        assert.equal(Number(untouched.attempts), 8, state);
+        if (state === "failed") {
+          assert.equal(untouched.retryable, false);
+          assert.equal(untouched.failure_code, "conversion_failed");
+        }
       }
     } finally {
       await pool.end();

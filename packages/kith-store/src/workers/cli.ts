@@ -7,9 +7,14 @@
 // attempts were spent on a client defect stays unreachable after the defect is
 // fixed. `resetExhaustedDiscoveryWork` beside this file is what it calls.
 //
-//   kith-discovery-reset                  count per space, write nothing
-//   kith-discovery-reset --apply          reset the counted rows
-//   kith-discovery-reset --space <id>     one space instead of every space
+//   kith-discovery-reset                         count every space, write nothing
+//   kith-discovery-reset --space <id>            count one space
+//   kith-discovery-reset --space <id> --apply    reset that space's counted rows
+//
+// A dry run may sweep every space, because counting has no consequence. A write
+// may not: `--apply` requires `--space`, so the operator names the space they
+// read a count for. Nothing here reports which rows it would touch, so a
+// repository-wide write would be one nobody could have reviewed first.
 //
 // Argument shape follows `../embeddings/cli.ts`, which follows
 // `packages/pipeline/src/cli.ts`: explicit flags and a `usage()` that exits, no
@@ -32,7 +37,8 @@ import {
 
 function usage(): never {
   process.stderr.write(
-    "Usage: kith-discovery-reset [--space <id>] [--apply]\n",
+    "Usage: kith-discovery-reset [--space <id>] [--apply]\n" +
+      "       --apply requires --space\n",
   );
   process.exit(2);
 }
@@ -58,6 +64,10 @@ export function argumentsFor(argv: string[]): Parsed {
     } else {
       usage();
     }
+  }
+  if (apply && spaceId === null) {
+    process.stderr.write("--apply requires --space\n");
+    usage();
   }
   return { spaceId, apply };
 }

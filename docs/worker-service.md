@@ -263,20 +263,29 @@ attempts were spent on a client defect stays unreachable after the defect is
 fixed. Use `kith-discovery-reset` (`packages/kith-store/src/workers/cli.ts`)
 when a pass reports `lease_conflict` on an item and that item is at the cap. It
 resets the counter and returns the row to `queued`, so the next pass reserves it
-once in the normal way. It refuses a row whose lease has not expired, because a
-live worker may still hold it, and it never touches a successfully admitted row,
-superseded history, `lease_epoch`, or anything outside the work row. It counts
-and writes nothing unless `--apply` is given, and a second run is a no-op.
+once in the normal way.
+
+It reaches only rows that ran out of attempts without anything having judged the
+document: `queued` and `leased`. A `failed` row at the cap is a settled parse
+failure and a `needs_review` row is parked for a review, so neither is swept
+here; retrying those is a per-row decision that wants to see what the row is
+holding, which this command does not report. It refuses a row whose lease has
+not expired, because a live worker may still hold it, and it never touches a
+successfully admitted row, superseded history, `lease_epoch`, or anything
+outside the work row. A second run is a no-op.
+
+A run counts and writes nothing unless `--apply` is given. A count may sweep
+every space; a write may not, so `--apply` requires `--space`.
 
 ```sh
 pnpm exec turbo run build --filter=@repo/kith-store
 KITH_STORE_DATABASE_URL=postgres://... node packages/kith-store/dist/workers/cli.js
-KITH_STORE_DATABASE_URL=postgres://... node packages/kith-store/dist/workers/cli.js --apply
+KITH_STORE_DATABASE_URL=postgres://... node packages/kith-store/dist/workers/cli.js --space <id>
+KITH_STORE_DATABASE_URL=postgres://... node packages/kith-store/dist/workers/cli.js --space <id> --apply
 ```
 
-Add `--space <id>` to limit either run to one space. Output is one JSON line per
-space carrying the space id, the eligible count and the reset count, and nothing
-else.
+Output is one JSON line per space carrying the space id, the eligible count and
+the reset count, and nothing else.
 
 ## Template validation
 

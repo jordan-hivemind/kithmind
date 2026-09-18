@@ -32,15 +32,30 @@ export const RESET_DEFAULT_LIMIT = 50;
 export const RESET_MAX_LIMIT = 500;
 
 /**
- * The states a reset can move out of. `admitted` is the successful terminal
- * state and `obsolete` is superseded history that the current-work unique index
- * excludes; requeueing either would invent work the protocol already settled.
- * The remaining four are all reachable at the cap: `leased` when a pass died
- * holding the lease, `failed` when attempts ran out, `needs_review` when the
- * generic reserve path parked it (`discovery.ts`), and `queued` when the cap was
- * reached by a lease that expired without a recorded failure.
+ * The only two states a reset moves out of, both of which mean the row ran out
+ * of attempts without anything having judged the document itself: `leased` when
+ * a pass died holding the lease, and `queued` when the last lease expired
+ * without a recorded failure. That is the shape a client defect leaves behind,
+ * and it is the whole of what this command is for.
+ *
+ * The other four are deliberately out of reach.
+ *
+ * `admitted` is the successful terminal state and `obsolete` is superseded
+ * history that the current-work unique index excludes; requeueing either would
+ * invent work the protocol already settled.
+ *
+ * `failed` at the cap is a settled parse failure: something read the document
+ * and could not process it, and `failArchivedDiscovery` spent the attempts
+ * saying so. Resetting it would buy eight more paid parse attempts against a
+ * document that has already refused eight. `needs_review` is a row the generic
+ * reserve path parked (`discovery.ts`) and requeueing it would step around the
+ * review rather than answer it. Neither is safe to sweep from a command whose
+ * dry run reports counts only, because an operator cannot see from a count
+ * which rows they would be agreeing to retry. A future operator flow for those
+ * two wants to name the row and show what it is holding, not batch them in
+ * here.
  */
-const RESETTABLE_STATES = ["queued", "leased", "failed", "needs_review"];
+const RESETTABLE_STATES = ["queued", "leased"];
 
 export type DiscoveryWorkResetResult = {
   spaceId: string;
@@ -51,12 +66,12 @@ export type DiscoveryWorkResetResult = {
 /**
  * Makes exhausted discovery work reservable again for one space.
  *
- * A row is eligible when it has reached the attempt cap, is in a state a
- * re-attempt can start from, and holds no live lease. The live-lease refusal is
- * the important one: a worker that still owns an unexpired lease may be mid
- * operation, and clearing its lease underneath it would let a second worker
- * claim the same item. An expired lease is already claimable by the protocol's
- * own rules, so taking it here changes nothing a reserve would not.
+ * A row is eligible when it has reached the attempt cap, is `queued` or
+ * `leased` (see `RESETTABLE_STATES`), and holds no live lease. The live-lease
+ * refusal is the important one: a worker that still owns an unexpired lease may
+ * be mid operation, and clearing its lease underneath it would let a second
+ * worker claim the same item. An expired lease is already claimable by the
+ * protocol's own rules, so taking it here changes nothing a reserve would not.
  *
  * Idempotent: a reset row is below the cap, so a second call finds nothing.
  * `apply` false counts without writing.
