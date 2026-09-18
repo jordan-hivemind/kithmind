@@ -3,7 +3,10 @@ import { randomUUID } from "node:crypto";
 import test from "node:test";
 
 import { digestParsedMappingManifest } from "@repo/worker-protocol";
-import { HttpWorkerTransport } from "../../pipeline/dist/transport.js";
+import {
+  HttpWorkerTransport,
+  parseWorkerResponse,
+} from "../../pipeline/dist/transport.js";
 import {
   createKithPool,
   newKithId,
@@ -3260,6 +3263,121 @@ test(
       assert.equal(corrupt0.phase, "unresolved_entries");
       assert.equal(corruptDone.state, "incomplete");
       assert.equal(corruptDone.counts.items.unavailable, 1);
+
+      // P2-100a. Why an item is not terminal ready, as counts. The tally rides
+      // in the `counts` jsonb and must never reach the protocol response, so it
+      // is read back from the row rather than from the result.
+      const storedCounts = async (assessmentId) =>
+        (
+          await f.client.query(
+            "SELECT counts, last_page_result FROM kith.worker_processing_assessments WHERE id=$1",
+            [assessmentId],
+          )
+        ).rows[0];
+      // A pass with nothing to explain writes no tally at all.
+      assert.equal(
+        (await storedCounts(begun.assessmentId)).counts.notReadyReasons,
+        undefined,
+      );
+      // This item is one held lease short of terminal, and the `unchanged`
+      // entry with no discovery work then makes `classifyItem` throw
+      // `scan_conflict`, which the page loop swallows into `unavailable`. The
+      // readiness reason wins over the swallowed code: it is the condition that
+      // led there.
+      const corruptRow = await storedCounts(begun2.assessmentId);
+      assert.deepEqual(corruptRow.counts.notReadyReasons, { job_shape: 1 });
+      assert.equal(
+        corruptRow.last_page_result.counts.notReadyReasons,
+        undefined,
+      );
+      assert.equal(corruptDone.counts.notReadyReasons, undefined);
+
+      const reassess = async (requestId) => {
+        await f.client.query(
+          "UPDATE kith.source_accounts SET active_worker_assessment_id=NULL WHERE id=$1",
+          [f.sourceAccountId],
+        );
+        const begunNext = await call((ctx) =>
+          beginProcessingAssessment(ctx, f.principal, {
+            ...beginRequest,
+            requestId: `${requestId}-begin`,
+            scanId: scan2.id,
+            expectedInventoryEpoch: 2,
+          }),
+        );
+        await call((ctx) =>
+          advanceProcessingAssessment(ctx, f.principal, {
+            ...page0,
+            requestId: `${requestId}-0`,
+            assessmentId: begunNext.assessmentId,
+          }),
+        );
+        const done = await call((ctx) =>
+          advanceProcessingAssessment(ctx, f.principal, {
+            ...page1,
+            requestId: `${requestId}-1`,
+            assessmentId: begunNext.assessmentId,
+          }),
+        );
+        return { done, row: await storedCounts(begunNext.assessmentId) };
+      };
+
+      // The same fixture one condition further on: with the lease cleared the
+      // job is terminal and the next refusal is the entry's planted digests.
+      // The bucket and the pass state are unchanged either way.
+      await f.client.query(
+        `UPDATE kith.ingest_jobs SET lease_token=NULL, lease_expires_at=NULL,
+         worker_lease_owner_credential_id=NULL WHERE id=$1`,
+        [jobId],
+      );
+      const digestPass = await reassess("assess-reason-digest");
+      assert.equal(digestPass.done.state, "incomplete");
+      assert.equal(digestPass.done.counts.items.unavailable, 1);
+      assert.deepEqual(digestPass.row.counts.notReadyReasons, {
+        inline_digest_mismatch: 1,
+      });
+
+      // The swallowed-protocol-error path with no readiness reason to report:
+      // an `ignored_forgotten` entry on an available item refuses before
+      // `terminalReady` runs, so the tally names the code that was eaten.
+      await f.client.query(
+        "UPDATE kith.worker_scan_entries SET state='ignored_forgotten' WHERE id=$1",
+        [entryId],
+      );
+      const swallowed = await reassess("assess-reason-swallowed");
+      assert.equal(swallowed.done.state, "incomplete");
+      assert.equal(swallowed.done.counts.items.unavailable, 1);
+      assert.deepEqual(swallowed.row.counts.notReadyReasons, {
+        "protocol_error:scan_conflict": 1,
+      });
+
+      // The latest completed assessment now carries a tally in its `counts`
+      // column, and `source.status` reports that row's counts. The worker's own
+      // parser refuses any key beyond `items` and `unresolvedEntries`, so the
+      // response is parsed with it rather than shape-asserted by hand.
+      const status = await call((ctx) =>
+        getWorkerSourceStatus(ctx, f.principal, {
+          protocolVersion: 1,
+          operation: "source.status",
+          spaceId: f.spaceId,
+          sourceAccountId: f.sourceAccountId,
+        }),
+      );
+      assert.equal(status.processing.state, "incomplete");
+      assert.deepEqual(Object.keys(status.processing.counts).sort(), [
+        "items",
+        "unresolvedEntries",
+      ]);
+      parseWorkerResponse(JSON.stringify(status), "source.status");
+
+      await f.client.query(
+        "UPDATE kith.worker_scan_entries SET state='unchanged' WHERE id=$1",
+        [entryId],
+      );
+      await f.client.query(
+        "UPDATE kith.source_accounts SET active_worker_assessment_id=NULL WHERE id=$1",
+        [f.sourceAccountId],
+      );
 
       const { scan: scan3 } = await makeScan(f, 3);
       await f.client.query(
