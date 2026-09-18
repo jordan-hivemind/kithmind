@@ -385,6 +385,28 @@ export function archivedCheckpointIdentity(
   }
 }
 
+/**
+ * P2-31e. `recordOriginalCloud` writes only when the row holds no receipt, and
+ * nothing ever compared a later server answer against one already stored. The
+ * whole pipeline reads `cloud.sourceRevisionId` as naming the admission the
+ * server is serving, and `reusableProcessingRow` settles an ambiguous
+ * processing history by it, so a silent disagreement would be read as a fact.
+ * It should be unreachable, since a revision is immutable once admitted, and
+ * the point of checking is that reaching it means one of those beliefs is
+ * wrong. Callers end the scan on it rather than throwing, so a fail-closed
+ * refusal never leaves an answered request unresolved.
+ */
+function admissionRevisionConflict(
+  original: OriginalCatalogRow,
+  value: Record<string, unknown>,
+): boolean {
+  return (
+    original.cloud !== undefined &&
+    original.cloud.sourceRevisionId !==
+      text(value.sourceRevisionId, "source_revision_id")
+  );
+}
+
 function archivedBase(
   checkpoint: ArchivedCheckpoint,
   updates: Partial<ArchivedCheckpoint> = {},
@@ -1217,20 +1239,24 @@ export class PipelineRunner {
     };
   }
 
-  private matchingProcessingRows(plan: PdfFilePlan): ProcessingCatalogRow[] {
+  private matchingOriginal(plan: PdfFilePlan): OriginalCatalogRow | undefined {
     if (
       !plan.externalId ||
       plan.observationEpoch === undefined ||
       plan.processingEpoch === undefined
     ) {
-      return [];
+      return undefined;
     }
-    const original = this.requireCatalog().findOriginalExact({
+    return this.requireCatalog().findOriginalExact({
       sourceExternalId: plan.externalId,
       sha256: plan.sha256,
       byteLength: plan.byteLength,
       mediaType: planMediaType(plan),
     });
+  }
+
+  private matchingProcessingRows(plan: PdfFilePlan): ProcessingCatalogRow[] {
+    const original = this.matchingOriginal(plan);
     if (!original) return [];
     const fingerprints = this.processingFingerprints(plan);
     return this.requireCatalog()
@@ -1295,12 +1321,44 @@ export class PipelineRunner {
    * Select the sole authoritative row from an otherwise ambiguous history.
    * Callers supply only rows already matched on original, epochs and the full
    * processing fingerprint tuple; this is not a general latest-row selector.
+   *
+   * P2-31e. Two activated rows, each internally coherent, is reachable and was
+   * live: a misrouted admission activated one row against a backend that no
+   * longer serves the account, and a later pass activated another against the
+   * authoritative one. Both pass the cloud coherence check below, because each
+   * is self-consistent about the backend it came from.
+   *
+   * `original` settles it. `discovery.admitArchived` writes the original's and
+   * the processing row's `cloud.sourceRevisionId` from the same
+   * `value.sourceRevisionId` in one transition, and `admissionRevisionConflict`
+   * ends the scan on any later answer that disagrees with a receipt the
+   * original already holds, so a processing row naming a different revision
+   * than its own original records is by construction from a different
+   * admission. That is a fact about this client's own writes, not a guess
+   * about the server.
+   *
+   * When the original names a revision and no activated row matches it, there
+   * is no authoritative row to reuse and none is returned. The callers read
+   * that as "not activated yet": the document needs work, and
+   * `createArchivedIntents` starts a fresh row rather than reusing a dead one.
+   * Returning a stale activation instead would send a document the server is
+   * still waiting for straight to cleanup, and it would never publish.
+   *
+   * Everything else stays strict. A history with no activated row at all, or
+   * with two that both answer to the original's revision, still fails closed.
    */
   private reusableProcessingRow(
     rows: readonly ProcessingCatalogRow[],
+    original?: OriginalCatalogRow,
   ): ProcessingCatalogRow | undefined {
     if (rows.length <= 1) return rows[0];
-    const activated = rows.filter((row) => row.activation !== undefined);
+    const all = rows.filter((row) => row.activation !== undefined);
+    const revision = original?.cloud?.sourceRevisionId;
+    const activated =
+      revision === undefined
+        ? all
+        : all.filter((row) => row.cloud?.sourceRevisionId === revision);
+    if (all.length > 0 && activated.length === 0) return undefined;
     if (activated.length !== 1) {
       throw new PipelineWorkerError("archive_catalog_revision_conflict");
     }
@@ -1335,7 +1393,10 @@ export class PipelineRunner {
     // catalogs and an exhausted document must stay skipped rather than fail
     // the pass over them.
     if (parseAttemptsSpent(matches) >= MAX_PARSE_ATTEMPTS) return false;
-    const reusable = this.reusableProcessingRow(matches);
+    const reusable = this.reusableProcessingRow(
+      matches,
+      this.matchingOriginal(plan),
+    );
     if (reusable?.activation) {
       return await this.processingArtifactsPresent(
         reusable,
@@ -1445,7 +1506,7 @@ export class PipelineRunner {
     let processing = catalog.findProcessingExact(processingProbe);
     if (!processing && plan.discoveryState === "unchanged") {
       const prior = this.matchingProcessingRows(plan);
-      processing = this.reusableProcessingRow(prior);
+      processing = this.reusableProcessingRow(prior, original);
     }
     if (!processing) {
       const processingId = stableUuid(
@@ -2575,7 +2636,21 @@ export class PipelineRunner {
           if (value.state !== "enumerated") {
             throw new PipelineWorkerError("reconcile_state_invalid");
           }
-          const pdfIndex = await this.nextPdfWorkIndex(current.files, 0);
+          let pdfIndex: number;
+          try {
+            pdfIndex = await this.nextPdfWorkIndex(current.files, 0);
+          } catch (error) {
+            // P2-31e. Fail closed, but settle the answered page first. A throw
+            // from inside a journaled transition never reaches `commitResult`,
+            // so `scan.reconcile` stayed unresolved with its answer recorded
+            // and every later pass replayed it into the same throw with no
+            // round trip. Nothing could drain that but a hand edit, which a
+            // refusal must never require. Ending the scan terminal reports the
+            // same code, keeps the answer, and lets the next pass start a
+            // clean scan instead of re-asking a page the server has finished.
+            if (!(error instanceof PipelineWorkerError)) throw error;
+            return scanTerminal(current, "failed", error.code, true);
+          }
           if (pdfIndex >= 0) {
             return {
               version: 1,
@@ -3799,6 +3874,13 @@ export class PipelineRunner {
         const responseProvider = "originalProviderReferenceId" in value;
         if (provider !== responseProvider)
           throw new PipelineWorkerError("archived_recovery_branch_conflict");
+        if (admissionRevisionConflict(original, value))
+          return scanTerminal(
+            current,
+            "failed",
+            "original_receipt_revision_conflict",
+            true,
+          );
         const originalReceipts = [
           ["primary", "originalPrimaryReceiptId"],
           ...(provider
@@ -4230,6 +4312,13 @@ export class PipelineRunner {
         const responseProvider = "originalProviderReferenceId" in value;
         if (provider !== responseProvider)
           throw new PipelineWorkerError("archived_recovery_branch_conflict");
+        if (admissionRevisionConflict(original, value))
+          return scanTerminal(
+            current,
+            "failed",
+            "original_receipt_revision_conflict",
+            true,
+          );
         const receipts = [
           ["original_bytes", original, "primary", "originalPrimaryReceiptId"],
           ...(provider
@@ -4592,6 +4681,13 @@ export class PipelineRunner {
         const responseProvider = "originalProviderReferenceId" in value;
         if ((providerOriginal !== undefined) !== responseProvider)
           throw new PipelineWorkerError("archived_recovery_branch_conflict");
+        if (admissionRevisionConflict(original, value))
+          return scanTerminal(
+            current,
+            "failed",
+            "original_receipt_revision_conflict",
+            true,
+          );
         for (const [subject, role, receiptField] of [
           ["original_bytes", "primary", "originalPrimaryReceiptId"],
           ...(providerOriginal === undefined
