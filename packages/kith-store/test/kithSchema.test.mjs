@@ -302,7 +302,9 @@ test(
     await archive.connect();
     assert.equal(await applyPgSchema(archive, "finance"), PG_SCHEMA_VERSION);
     // The extraction of the shared helpers must not move the archive's schema on.
-    assert.equal(PG_SCHEMA_VERSION, 12);
+    // A pin, moved deliberately with each archive migration: 13 is F1-76's
+    // instrument identifier sources and review item reason codes.
+    assert.equal(PG_SCHEMA_VERSION, 13);
 
     const financeShape = () =>
       all(

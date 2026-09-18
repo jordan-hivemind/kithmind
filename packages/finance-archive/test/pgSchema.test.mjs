@@ -107,7 +107,7 @@ test(
         [[...PG_TABLES]],
       );
       assert.equal(Number(tables.rows[0].n), PG_TABLES.length);
-      assert.equal(PG_TABLES.length, 16);
+      assert.equal(PG_TABLES.length, 17);
 
       // Running it again is a no-op: one row per migration applied, no extra
       // row, revision bump, or error.
@@ -302,7 +302,7 @@ test(
            version INTEGER PRIMARY KEY, name TEXT NOT NULL,
            applied_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
       );
-      const version11 = PG_MIGRATIONS.slice(0, -1);
+      const version11 = PG_MIGRATIONS.filter((one) => one.version <= 11);
       assert.equal(version11.at(-1).version, 11);
       for (const migration of version11) {
         await client.query(migration.sql);
@@ -326,12 +326,12 @@ test(
       );
       const before = await oneRevision(client);
 
-      assert.equal(await applyPgSchema(client, schema), 12);
+      assert.equal(await applyPgSchema(client, schema), PG_SCHEMA_VERSION);
       const migrated = await oneRevision(client);
       assert.equal(migrated.epoch, before.epoch);
       assert.equal(Number(migrated.revision), Number(before.revision) + 1);
 
-      assert.equal(await applyPgSchema(client, schema), 12);
+      assert.equal(await applyPgSchema(client, schema), PG_SCHEMA_VERSION);
       assert.deepEqual(await oneRevision(client), migrated);
       await client.query(
         "UPDATE account_aliases SET learned_note = 'synthetic update' WHERE id = 'alias-before-v12'",
@@ -1156,7 +1156,7 @@ test(
              (id, kind, source_document_id, raw_value, reason, institution_id, matched_instrument_id, occurrence_count, last_seen_document_id)
            VALUES ('weak-2', 'weak_instrument_match', 'doc-2', 'ZEPHYR-descriptor', 'second sighting', 'inst-1', 'instr-1', 1, 'doc-2')`,
         ),
-        /review_items_weak_instrument_match_key/,
+        /review_items_instrument_match_key/,
       );
 
       // A different matched instrument: not a conflict, this is a distinct

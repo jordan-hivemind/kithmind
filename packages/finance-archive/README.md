@@ -981,6 +981,55 @@ caller cannot do by combining the other two files alone:
   see "weak_instrument_match is instrument-level, not row-level (F1-58)"
   under Account aliases below.
 
+  F1-76 phase 3: between the (symbol AND name) tier and the bare-symbol one
+  sits the **same-institution symbol rule**
+  (`src/instrumentMatch.ts`). A symbol-only match is accepted as its own
+  identity kind when all three hold: the symbol names exactly one instrument
+  in the archive, that instrument carries a cusip or isin, and the only
+  institution on record as having stated that identifier is the institution
+  this holding came from. The institution is then vouching for both halves.
+  The symbol comparison is trimmed and upper-cased, so two rows spelling one
+  ticker differently count as sharing it and refuse; a share-class suffix is
+  never stripped, and no stored symbol is rewritten.
+
+  The evidence for the second and third conditions is
+  `instrument_identifier_sources` (migration 13) and nothing else: one row per
+  (instrument, institution) whose parsed descriptor actually stated a cusip or
+  isin, written at mint and at every identifier-strong match. Asking instead
+  which institutions' `transactions` or `positions` rows reference the
+  instrument is circular -- a refused holding still writes its position,
+  stating no identifier, and that position would then vouch for the next
+  match. (Not every statement holding is identifier-free: a bond block prints
+  its CUSIP and matches on it like any other. The gap is specific to rows that
+  state a ticker and nothing stronger.) Two institutions on record, or none, is
+  refused rather than resolved by majority. An archive whose instruments
+  predate the table runs
+  `scripts/backfillInstrumentIdentifierSources.mjs --apply` once, which counts
+  only a feed transaction -- a provider transaction id and an export-tier
+  source document -- skips any instrument two institutions qualify for, and is
+  a dry run until `--apply`.
+
+  An acceptance is written durably as a `resolved`
+  `review_items` row of kind `institution_symbol_match`, carrying
+  `reason_code = 'same_institution_symbol_v1'` and the same (institution,
+  descriptor, matched instrument) identity a weak match has; the open
+  `weak_instrument_match` it supersedes is resolved, never deleted, with a
+  resolution note naming the rule. A refusal keeps its open weak item and
+  records which condition failed in the closed `reason_code` column (see
+  `INSTRUMENT_MATCH_REASON_TEXT` for the fixed one-sentence explanation and
+  recommended action per code). A later import that makes an acceptance
+  unsafe -- a second instrument under the same symbol, another institution's
+  rows on the same instrument -- dismisses the acceptance and reopens the
+  weak item with `reason_code = 'institution_symbol_match_invalidated'`, so a
+  match is never left accepted on stale evidence. That reopen is
+  unconditional, including over an item a person had dismissed, because the
+  dismissal answered a question about evidence that has since changed. The
+  reason stands while the item is open; a reparse re-deriving the ordinary
+  refusal never overwrites it, and only the rule accepting the match again
+  clears it. Every import and reparse
+  prints the counts: accepted, resolved by the rule, withdrawn, and refused
+  per condition.
+
   F1-76: a `cusip` or `isin` match carrying a name fills `instruments.name`
   when the row on file has none, in one `UPDATE` per pull guarded by
   `WHERE name IS NULL`. One institution can describe the same instrument two
@@ -989,7 +1038,9 @@ caller cannot do by combining the other two files alone:
   on file is never overwritten: two spellings of one name is not a conflict
   an import is entitled to settle. The `symbol`-alone tier never fills a
   name, because that tier is exactly the case where the two descriptors may
-  not be the same instrument, which is what its review item asks.
+  not be the same instrument, which is what its review item asks. The
+  same-institution symbol rule does fill it, because an accepted match is
+  precisely the case where the institution has vouched for both halves.
 - **Document splitting.** `ParsedRow.sourceDocument` tells the wiring layer
   which underlying document (a page of a paginated pull, or the one file for
   a statement, confirmation or tabular export) each row belongs to. A pull
@@ -1509,9 +1560,13 @@ holdings every month, so the same weak match reopened a fresh row every
 month too: 73,247 open items on the owner's archive, one per holding per
 statement, all asking the identical question.
 
-`review_items_weak_instrument_match_key` (migration 8) is a second partial
-unique index, additive to migration 7's: `(kind, institution_id, raw_value,
-matched_instrument_id) WHERE kind = 'weak_instrument_match'`. Migration 7's
+`review_items_instrument_match_key` (migration 13, replacing migration 8's
+`review_items_weak_instrument_match_key`) is a second partial unique index,
+additive to migration 7's: `(kind, institution_id, raw_value,
+matched_instrument_id) WHERE kind IN ('weak_instrument_match',
+'institution_symbol_match')`. `kind` leads the key, so the two kinds occupy
+separate slots and one match may hold an accepted row and, after a
+withdrawal, the reflagged weak row beside it. Migration 7's
 key still governs every other kind exactly as before. Four columns make the
 new key possible: `institution_id` and `matched_instrument_id` were never
 queryable before this (`weak_instrument_match`'s own `account_id` is always

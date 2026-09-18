@@ -1255,6 +1255,7 @@ type SnapshotRow = EvidenceRow & {
   unrealized: string | null;
   valuation_basis: string | null;
   weak_match_open: boolean;
+  institution_symbol_match: boolean;
   source_locator_oversized: boolean;
 };
 
@@ -1274,6 +1275,19 @@ const SNAPSHOT_COLUMNS = `p.id, p.account_id, p.as_of::text,
                  AND ri.matched_instrument_id = p.instrument_id
                  AND ri.institution_id = a.institution_id
             ) AS weak_match_open,
+            -- F1-76 phase 3. The same-institution symbol rule accepted this
+            -- instrument's match for this institution, and the acceptance
+            -- still stands (a withdrawn one is 'dismissed', not 'resolved').
+            -- Reported as its own identity state rather than folded into
+            -- 'resolved': the match really was made on a symbol, and a client
+            -- citing it should be able to say so.
+            EXISTS (
+              SELECT 1 FROM review_items ri
+               WHERE ri.kind = 'institution_symbol_match'
+                 AND ri.status = 'resolved'
+                 AND ri.matched_instrument_id = p.instrument_id
+                 AND ri.institution_id = a.institution_id
+            ) AS institution_symbol_match,
             ${EVIDENCE_COLUMNS}`;
 
 function snapshotPosition(
@@ -1292,7 +1306,13 @@ function snapshotPosition(
       row.instrument_id === null
         ? { status: "missing" }
         : {
-            status: row.weak_match_open ? "ambiguous" : "resolved",
+            // An open weak match still wins: a withdrawn acceptance reopens
+            // one, and the honest answer while both exist is the doubt.
+            status: row.weak_match_open
+              ? "ambiguous"
+              : row.institution_symbol_match
+                ? "institution_symbol"
+                : "resolved",
             instrumentId: row.instrument_id as FinanceInstrumentId,
             ...(row.instrument_name === null || row.instrument_name.length > 512
               ? {}
@@ -1506,6 +1526,7 @@ async function getHoldingsSnapshot(
         status: "complete",
         positionCount: 0,
         resolvedInstrumentCount: 0,
+        institutionSymbolInstrumentCount: 0,
         unresolvedInstrumentCount: 0,
         quantityCoverage: {
           availablePositionCount: 0,
@@ -1764,11 +1785,20 @@ async function getHoldingsSnapshot(
     const resolvedInstrumentCount = allItems.filter(
       (item) => item.instrument.status === "resolved",
     ).length;
+    // F1-76 phase 3. Counted separately rather than merged into either side:
+    // an accepted same-institution symbol match is a usable identity, so it
+    // must not read as unresolved, and it was not made on an identifier, so it
+    // must not read as resolved. This is the number that answers "how many
+    // positions in this snapshot rest on the rule".
+    const institutionSymbolInstrumentCount = allItems.filter(
+      (item) => item.instrument.status === "institution_symbol",
+    ).length;
     const availableQuantityCount = allItems.filter(
       (item) => item.quantity !== undefined,
     ).length;
     const fullyUsable =
-      resolvedInstrumentCount === allItems.length &&
+      resolvedInstrumentCount + institutionSymbolInstrumentCount ===
+        allItems.length &&
       availableQuantityCount === allItems.length &&
       currencies.every(
         (item) =>
@@ -1785,7 +1815,11 @@ async function getHoldingsSnapshot(
       status: fullyUsable ? "complete" : "partial",
       positionCount: allItems.length,
       resolvedInstrumentCount,
-      unresolvedInstrumentCount: allItems.length - resolvedInstrumentCount,
+      institutionSymbolInstrumentCount,
+      unresolvedInstrumentCount:
+        allItems.length -
+        resolvedInstrumentCount -
+        institutionSymbolInstrumentCount,
       quantityCoverage: {
         availablePositionCount: availableQuantityCount,
         missingPositionCount: allItems.length - availableQuantityCount,

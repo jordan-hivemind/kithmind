@@ -313,6 +313,7 @@ export const syntheticFinanceReadExchanges = [
         status: "complete",
         positionCount: 1,
         resolvedInstrumentCount: 1,
+        institutionSymbolInstrumentCount: 0,
         unresolvedInstrumentCount: 0,
         quantityCoverage: {
           availablePositionCount: 1,

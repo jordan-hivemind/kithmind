@@ -824,6 +824,82 @@ END;
 $$;
 `;
 
+// F1-76 phase 3. The same-institution symbol rule (instrumentMatch.ts) needs
+// three things the schema did not have.
+//
+// `reason_code` is the first. A review item has always explained itself in free
+// text, which a person can read and nothing can count. The owner's requirement
+// is that no match is accepted or refused without being countable and
+// explainable later, so the decision itself becomes a column, constrained to
+// the closed list `INSTRUMENT_MATCH_REASON_CODES` spells. The CHECK is the
+// point: a code this build does not know is refused at write time rather than
+// stored and silently counted as "other" by whatever reads it next. It stays
+// nullable with no backfill -- every existing item predates the vocabulary and
+// honestly has no code -- and every other kind may adopt it later by extending
+// this list in a migration of its own.
+//
+// The identity index is the second. `review_items_weak_instrument_match_key`
+// (migration 8) gave `weak_instrument_match` an instrument-level identity --
+// (institution, descriptor, matched instrument) rather than which statement
+// restated it -- which is exactly the identity an accepted match has too. The
+// index is replaced by one covering both kinds so `institution_symbol_match`
+// gets the same one-row-per-match guarantee instead of one row per statement
+// per holding (the 73,247-row shape migration 8 exists to have fixed). `kind`
+// is already the leading column, so the two kinds simply occupy separate slots
+// and a match can hold one of each: an accepted row and, after an
+// invalidation, the reflagged weak row beside it.
+//
+// `instrument_identifier_sources` is the third, and it is the rule's whole
+// evidence base. The obvious way to ask "did this institution's own data
+// establish this instrument's identifier" is to ask which institutions' rows
+// reference the instrument, and that answer is circular: a holding matched by
+// symbol alone writes a `positions` row referencing the instrument while
+// stating no identifier, and the next statement would then see exactly one
+// institution referencing it and accept the very match the first one was
+// refused, with no feed ever having vouched for anything. A row is evidence
+// only if the descriptor behind it stated an identifier, and neither
+// `transactions` nor `positions` records whether it did.
+//
+// So it is recorded rather than inferred. One row per (instrument,
+// institution) whose parsed descriptor actually stated a cusip or an isin,
+// written by `flushInstruments` (adapterImport.ts) at mint and at every cusip-
+// or isin-strong match. The composite primary key is the whole constraint:
+// "how many institutions have stated an identifier for this instrument" is
+// `count(*)`, and "none" and "several" are both representable, which a single
+// column on `instruments` could not do.
+//
+// No backfill here, the same honest-null policy every migration above uses. An
+// instrument minted before this table existed has no recorded source, and the
+// rule refuses it (`instrument_has_no_institution_evidence`) rather than
+// guessing. `scripts/backfillInstrumentIdentifierSources.mjs` reconstructs them
+// for an existing archive, from `transactions` only -- see that script for why
+// a position is never evidence.
+const INSTRUMENT_MATCH_AUDIT = `
+ALTER TABLE review_items
+  ADD COLUMN reason_code TEXT
+    CHECK (reason_code IS NULL OR reason_code IN (
+      'same_institution_symbol_v1',
+      'institution_symbol_match_invalidated',
+      'symbol_matches_several_instruments',
+      'instrument_has_no_strong_identifier',
+      'instrument_has_no_institution_evidence',
+      'instrument_vouched_by_another_institution',
+      'instrument_referenced_by_several_institutions'));
+
+DROP INDEX review_items_weak_instrument_match_key;
+
+CREATE UNIQUE INDEX review_items_instrument_match_key
+  ON review_items (kind, institution_id, raw_value, matched_instrument_id)
+  WHERE kind IN ('weak_instrument_match', 'institution_symbol_match');
+
+CREATE TABLE instrument_identifier_sources (
+  instrument_id TEXT NOT NULL REFERENCES instruments(id) ON DELETE CASCADE,
+  institution_id TEXT NOT NULL REFERENCES institutions(id),
+  first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (instrument_id, institution_id)
+);
+`;
+
 /** Every migration, in order. The last one's version is the current schema. */
 export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
   {
@@ -886,6 +962,11 @@ export const PG_MIGRATIONS: readonly PgMigration[] = Object.freeze([
     name: "account aliases invalidate finance reads",
     sql: ACCOUNT_ALIAS_READ_REVISION,
   },
+  {
+    version: 13,
+    name: "review_items.reason_code, a shared instrument-match identity index, and instrument_identifier_sources",
+    sql: INSTRUMENT_MATCH_AUDIT,
+  },
 ]);
 
 /** The version an archive reaches once every migration has been applied. */
@@ -908,6 +989,7 @@ export const PG_TABLES: readonly string[] = Object.freeze([
   "position_reconciliations",
   "review_items",
   "account_aliases",
+  "instrument_identifier_sources",
   "retained_texts",
   "finance_read_revision",
 ]);

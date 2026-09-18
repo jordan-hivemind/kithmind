@@ -269,9 +269,28 @@ export type FinanceSnapshotFieldDisclosure = {
     | "precision_overflow";
 };
 
+/**
+ * How the archive knows which instrument a position is.
+ *
+ * `resolved` means a real identifier (a CUSIP or an ISIN) said so.
+ * `institution_symbol` means the match was made on a ticker symbol alone and
+ * accepted under the archive's same-institution symbol rule: the symbol names
+ * exactly one instrument, the one institution that stated the holding is also
+ * the one whose own data established that instrument's identifier, and no
+ * other institution's data is mixed in. It is a usable identity and it is not
+ * the same fact as `resolved`, so a client citing such a position should say
+ * which of the two it has. `ambiguous` means an open weak-match review item
+ * still stands and the identity is not settled. `missing` means there is no
+ * instrument, and no identifier is invented for one.
+ */
+export type FinanceSnapshotInstrumentStatus =
+  | "resolved"
+  | "institution_symbol"
+  | "ambiguous";
+
 export type FinanceSnapshotInstrument =
   | {
-      status: "resolved" | "ambiguous";
+      status: FinanceSnapshotInstrumentStatus;
       instrumentId: FinanceInstrumentId;
       name?: string;
       symbol?: string;
@@ -344,7 +363,13 @@ export type FinanceHoldingsSnapshotSummary =
   | {
       status: "complete" | "partial";
       positionCount: number;
+      /** Positions whose instrument a CUSIP or ISIN identified. */
       resolvedInstrumentCount: number;
+      /** Positions whose instrument the same-institution symbol rule accepted
+       * on a ticker symbol alone. Counted apart from both other totals so a
+       * reader can see, per snapshot, how much of it rests on that rule. */
+      institutionSymbolInstrumentCount: number;
+      /** Positions with an open weak match or no instrument at all. */
       unresolvedInstrumentCount: number;
       quantityCoverage: {
         availablePositionCount: number;
@@ -1657,7 +1682,7 @@ function snapshotInstrument(value: unknown): FinanceSnapshotInstrument {
   );
   const status = oneOf(
     input.status,
-    ["resolved", "ambiguous"] as const,
+    ["resolved", "institution_symbol", "ambiguous"] as const,
     "invalid_response",
   );
   return {
@@ -2155,6 +2180,7 @@ function snapshotSummary(value: unknown): FinanceHoldingsSnapshotSummary {
       "status",
       "positionCount",
       "resolvedInstrumentCount",
+      "institutionSymbolInstrumentCount",
       "unresolvedInstrumentCount",
       "quantityCoverage",
       "currencies",
@@ -2170,13 +2196,24 @@ function snapshotSummary(value: unknown): FinanceHoldingsSnapshotSummary {
     positionCount,
     "invalid_response",
   );
+  const institutionSymbolInstrumentCount = integer(
+    input.institutionSymbolInstrumentCount,
+    0,
+    positionCount,
+    "invalid_response",
+  );
   const unresolvedInstrumentCount = integer(
     input.unresolvedInstrumentCount,
     0,
     positionCount,
     "invalid_response",
   );
-  if (resolvedInstrumentCount + unresolvedInstrumentCount !== positionCount)
+  if (
+    resolvedInstrumentCount +
+      institutionSymbolInstrumentCount +
+      unresolvedInstrumentCount !==
+    positionCount
+  )
     fail("invalid_response");
   const quantityInput = object(input.quantityCoverage, "invalid_response");
   exact(
@@ -2233,6 +2270,7 @@ function snapshotSummary(value: unknown): FinanceHoldingsSnapshotSummary {
     status,
     positionCount,
     resolvedInstrumentCount,
+    institutionSymbolInstrumentCount,
     unresolvedInstrumentCount,
     quantityCoverage: { availablePositionCount, missingPositionCount },
     currencies,
@@ -2695,7 +2733,11 @@ export function parseFinanceReadResponseShape(
       (summary.status === "complete" &&
         parsedItems.some(
           (item) =>
-            item.instrument.status !== "resolved" ||
+            // F1-76 phase 3: an accepted same-institution symbol match is a
+            // settled identity, so it does not by itself make a snapshot
+            // incomplete. It is still reported as its own status per position.
+            (item.instrument.status !== "resolved" &&
+              item.instrument.status !== "institution_symbol") ||
             item.quantity === undefined ||
             item.marketValue === undefined ||
             item.costBasis === undefined ||
