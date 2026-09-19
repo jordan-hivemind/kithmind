@@ -726,10 +726,19 @@ export type WorkerDiagnosticsPassOutcomeResult = {
   operation: "diagnostics.passOutcome";
   sourceAccountId: string;
   watcherId: string;
-  /** The outcome the row now holds, which an out-of-order report leaves alone. */
+  /**
+   * The outcome the row now holds. Clamped to the server's own clock and never
+   * moved backwards: a report that is not newer than the stored one leaves the
+   * row alone and is echoed back unchanged.
+   */
   finishedAt: number;
-  /** Consecutive non-`complete` outcomes ending here, `0` after a clean pass. */
-  unhealthyPasses: number;
+  /**
+   * When the current run of non-`complete` outcomes began, or null after a
+   * clean pass. A duration rather than a count of passes, because the pass
+   * interval is the host's own setting and only elapsed time means the same
+   * thing on a five-minute watcher and a nightly one.
+   */
+  unhealthySince: number | null;
 };
 
 export type WorkerInventoryItem =

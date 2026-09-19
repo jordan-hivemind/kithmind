@@ -52,8 +52,12 @@ export type WatcherFact = {
   lastPassState: "complete" | "incomplete" | "failed" | null;
   lastPassCode: string | null;
   lastPassAt: number | null;
-  /** Consecutive non-`complete` outcomes ending at `lastPassState`. */
-  unhealthyPasses: number;
+  /**
+   * When the current run of non-`complete` outcomes began, null after a clean
+   * pass. How long a watcher has been getting nowhere is the question; how
+   * many passes that took is the host's cadence, not a fact about health.
+   */
+  unhealthySince: number | null;
 };
 
 export type IndexFact = {
@@ -132,7 +136,7 @@ type WatcherDbRow = {
   last_pass_state: string | null;
   last_pass_code: string | null;
   last_pass_finished_at: Date | null;
-  last_pass_unhealthy_streak: number | string | null;
+  last_pass_unhealthy_since: Date | null;
 };
 
 type CountsDbRow = Record<string, string | number | null>;
@@ -158,7 +162,7 @@ export async function readHealthFacts(
     `SELECT a.id AS source_account_id, a.name, a.enabled,
             w.state AS watcher_state, w.last_seen_at, w.next_expected_at,
             w.last_pass_state, w.last_pass_code, w.last_pass_finished_at,
-            w.last_pass_unhealthy_streak,
+            w.last_pass_unhealthy_since,
             s.state AS assessment_state,
             coalesce(s.completed_at, s.updated_at, s.started_at)
               AS assessment_at,
@@ -271,7 +275,7 @@ export async function readHealthFacts(
           ? record.last_pass_code
           : null,
       lastPassAt: epoch(record.last_pass_finished_at),
-      unhealthyPasses: number(record.last_pass_unhealthy_streak),
+      unhealthySince: epoch(record.last_pass_unhealthy_since),
     })),
     index: {
       eligible: number(counts.eligible),

@@ -905,6 +905,29 @@ function records(value: unknown, label: string): Record<string, unknown>[] {
 /** ADM-9. `WORKER_PASS_CODE` in the protocol, applied before the send. */
 const PASS_CODE = /^[a-z0-9_]{1,64}$/;
 
+/**
+ * ADM-9. The pass-outcome report's own deadline, well under the transport's
+ * 30s: it runs after the pass is already decided, so every second of it is a
+ * second added to the pass's return and to a SIGTERM shutdown.
+ */
+const PASS_OUTCOME_TIMEOUT_MS = 5_000;
+
+/**
+ * ADM-9. Said once per process, not once per pass.
+ *
+ * A server that will never accept this operation -- one running older code
+ * than the watcher -- refuses every report there will ever be. Warning on each
+ * one turns a five-minute watch loop into a log nobody reads.
+ */
+let passOutcomeWarned = false;
+function warnPassOutcomeOnce(reason: string): void {
+  if (passOutcomeWarned) return;
+  passOutcomeWarned = true;
+  console.warn(
+    `[pipeline] the pass outcome could not be reported (${reason}); not repeating this warning`,
+  );
+}
+
 function request(
   config: PipelineConfig,
   operation:
@@ -7503,15 +7526,26 @@ export class PipelineRunner {
    * were just as invisible, so all of them travel through here.
    *
    * Never changes the pass result, ever. The result is already decided when
-   * this runs; the send is best-effort, its refusal is a warning on stderr,
-   * and an old server that has never heard of the operation answers
-   * `invalid_request`, which is exactly that case. The owner's live watcher
-   * runs several commits behind on purpose, so "the server refused it" is the
-   * ordinary case and not an error.
+   * this runs; the send is best-effort, and an old server that has never heard
+   * of the operation answers `invalid_request`, which is the ordinary case
+   * while the owner's watcher runs behind and not an error.
+   *
+   * Two bounds the first review asked for, both about not making a healthy
+   * pass wait on this. The send gets `PASS_OUTCOME_TIMEOUT_MS` of its own
+   * rather than the transport's 30s, because it runs on the way out of every
+   * pass and on the way to a SIGTERM shutdown. And it says so once per process
+   * rather than once per pass: a server that will never accept this operation
+   * would otherwise write the same line every five minutes forever, which is
+   * how a real warning goes unread.
    */
   private async reportPassOutcome(result: PipelineRunResult): Promise<void> {
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(),
+      PASS_OUTCOME_TIMEOUT_MS,
+    );
     try {
-      await this.transport.call(
+      const response = await this.transport.call(
         request(this.config, "diagnostics.passOutcome", {
           watcherId: this.journal.watcherId,
           state: result.state,
@@ -7525,13 +7559,21 @@ export class PipelineRunner {
           published: result.published ?? 0,
           finishedAt: Date.now(),
         }),
+        controller.signal,
       );
+      // A refused report is a returned error envelope, not a throw, so the
+      // quiet case needs looking at rather than catching.
+      if (response && typeof response === "object" && "error" in response) {
+        warnPassOutcomeOnce(
+          (response as { error: { code: string } }).error.code,
+        );
+      }
     } catch (error) {
-      console.warn(
-        `[pipeline] the pass outcome could not be reported (${
-          error instanceof Error ? error.message : "unknown error"
-        })`,
+      warnPassOutcomeOnce(
+        error instanceof Error ? error.message : "unknown error",
       );
+    } finally {
+      clearTimeout(timeout);
     }
   }
 

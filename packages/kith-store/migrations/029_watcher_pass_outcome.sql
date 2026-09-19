@@ -24,10 +24,18 @@
 -- renders. Belt and braces, the same way migration 028's path CHECKs sit under
 -- `assertSourceRootLocation`.
 --
--- `last_pass_unhealthy_streak` is a counter and not a second history table.
--- The screen's rule needs one bit of history -- "a non-complete outcome
--- repeated on two consecutive passes" -- and a counter the writer maintains is
--- the whole of it. `recordWorkerPassOutcome` resets it to 0 on `complete`.
+-- `last_pass_unhealthy_since` is one timestamp and not a second history table.
+-- The screen's rule needs one bit of history -- how long this watcher has been
+-- getting nowhere -- and the instant the current run of non-`complete`
+-- outcomes began is the whole of it. `recordWorkerPassOutcome` carries it
+-- forward while the outcomes stay non-`complete` and nulls it on `complete`.
+--
+-- A duration and not a count of passes, which is the first review's finding:
+-- the pass interval is the host's own setting, so "two passes in a row" is ten
+-- minutes on a five-minute watcher and two days on a nightly one. Only the
+-- elapsed time means the same thing on both, and only the elapsed time can
+-- tell an initial backlog (hours of legitimate `incomplete` passes) from a
+-- watcher that is stuck.
 
 ALTER TABLE kith.worker_watcher_states
   ADD COLUMN last_pass_state text
@@ -42,12 +50,17 @@ ALTER TABLE kith.worker_watcher_states
     CHECK (last_pass_published IS NULL
            OR last_pass_published BETWEEN 0 AND 100000000),
   ADD COLUMN last_pass_finished_at timestamptz,
-  ADD COLUMN last_pass_unhealthy_streak integer NOT NULL DEFAULT 0
-    CHECK (last_pass_unhealthy_streak >= 0);
+  ADD COLUMN last_pass_unhealthy_since timestamptz;
 
 -- A code with no state is a half-written row: the two are written together or
--- not at all, and the screen reads the code only through the state.
+-- not at all, and the screen reads the code only through the state. Likewise
+-- a `complete` pass owes nothing, so it can never leave an unhealthy-since
+-- behind.
 ALTER TABLE kith.worker_watcher_states
   ADD CONSTRAINT worker_watcher_states_last_pass_check
-    CHECK (last_pass_state IS NOT NULL
-           OR (last_pass_code IS NULL AND last_pass_finished_at IS NULL));
+    CHECK ((last_pass_state IS NOT NULL
+            OR (last_pass_code IS NULL AND last_pass_finished_at IS NULL))
+           AND (last_pass_state IS DISTINCT FROM 'complete'
+                OR last_pass_unhealthy_since IS NULL)
+           AND (last_pass_unhealthy_since IS NULL
+                OR last_pass_unhealthy_since <= last_pass_finished_at));

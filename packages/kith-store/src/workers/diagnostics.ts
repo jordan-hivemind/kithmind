@@ -35,7 +35,7 @@ type Watcher = {
   updatedAt: Date;
   /** ADM-9, migration 029. Null until a pass has reported one. */
   lastPassFinishedAt: Date | null;
-  lastPassUnhealthyStreak: number | null;
+  lastPassUnhealthySince: Date | null;
 };
 
 type Incident = {
@@ -365,38 +365,50 @@ export async function recordWorkerPassOutcome(
   validateWatcher(current, source);
   if (current.watcherId !== request.watcherId)
     workerProtocolError("identity_review_required");
+  // `finishedAt` is the watcher host's clock, and the gate below refuses
+  // anything not newer than what is stored. Together those would let one
+  // forward clock jump on the host park the row at a future instant that no
+  // later pass can beat: the pill and the age would freeze permanently, which
+  // is the opposite of what this operation is for. So the host's clock is only
+  // ever believed up to the server's own.
+  const finishedAt = Math.min(request.finishedAt, ctx.now);
   // A report that is not newer than the one already stored changes nothing.
-  // Retries and out-of-order arrivals are ordinary on this path -- the send is
+  // Retries and out-of-order arrivals are ordinary here -- the send is
   // best-effort and never retried in order -- and without this an at-least-once
-  // delivery of one pass would count as two towards the streak below.
+  // delivery of one pass would restart the run below at its own timestamp.
   const stored = current.lastPassFinishedAt;
-  if (stored instanceof Date && request.finishedAt <= stored.getTime()) {
+  if (stored instanceof Date && finishedAt <= stored.getTime()) {
     return {
       operation: "diagnostics.passOutcome",
       sourceAccountId: source.account.id,
       watcherId: current.watcherId,
       finishedAt: stored.getTime(),
-      unhealthyPasses: current.lastPassUnhealthyStreak ?? 0,
+      unhealthySince: current.lastPassUnhealthySince?.getTime() ?? null,
     };
   }
-  const unhealthyPasses =
+  // When the current run of non-`complete` outcomes began: carried forward
+  // while they keep arriving, and dropped the moment a pass completes.
+  const unhealthySince =
     request.state === "complete"
-      ? 0
-      : Math.min((current.lastPassUnhealthyStreak ?? 0) + 1, 1_000_000);
+      ? null
+      : Math.min(
+          current.lastPassUnhealthySince?.getTime() ?? finishedAt,
+          finishedAt,
+        );
   await exec(
     ctx,
     `UPDATE kith.worker_watcher_states
         SET last_pass_state = $1, last_pass_code = $2, last_pass_scanned = $3,
             last_pass_published = $4, last_pass_finished_at = $5,
-            last_pass_unhealthy_streak = $6, updated_at = $7
+            last_pass_unhealthy_since = $6, updated_at = $7
       WHERE id = $8`,
     [
       request.state,
       request.code ?? null,
       request.scanned,
       request.published,
-      at(request.finishedAt),
-      unhealthyPasses,
+      at(finishedAt),
+      unhealthySince === null ? null : at(unhealthySince),
       at(ctx.now),
       current.id,
     ],
@@ -405,8 +417,8 @@ export async function recordWorkerPassOutcome(
     operation: "diagnostics.passOutcome",
     sourceAccountId: source.account.id,
     watcherId: current.watcherId,
-    finishedAt: request.finishedAt,
-    unhealthyPasses,
+    finishedAt,
+    unhealthySince,
   };
 }
 

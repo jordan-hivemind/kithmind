@@ -1403,6 +1403,79 @@ test("the request deadline aborts an unresolved fetch", async () => {
   }
 });
 
+// ADM-9, first review finding 1. `parseWorkerResponse` refuses an operation it
+// has no case for, so a new operation the runner sends and the parser does not
+// know throws client-side on a 200 the server already stored -- once per pass,
+// forever, while the row lands every time. Every runner test until now used a
+// transport double that returns objects rather than bytes, so none of them
+// reached this parser at all. This one drives the real HttpWorkerTransport.
+test("a stored pass outcome parses through the real transport", async () => {
+  const originalFetch = globalThis.fetch;
+  const accepted = {
+    operation: "diagnostics.passOutcome",
+    sourceAccountId: "j1234567890123456789012345678902",
+    watcherId: "0f1e2d3c-4b5a-4968-8776-655443322110",
+    finishedAt: 1_758_196_800_000,
+    unhealthySince: 1_758_196_000_000,
+  };
+  let body = accepted;
+  let status = 200;
+  try {
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify(body), {
+        status,
+        headers: { "content-type": "application/json" },
+      });
+    const transport = new HttpWorkerTransport(
+      transportConfig("http://127.0.0.1:3100/api/worker"),
+      "credential",
+    );
+    const request = {
+      protocolVersion: 1,
+      operation: "diagnostics.passOutcome",
+      spaceId: "space",
+      sourceAccountId: "source",
+      watcherId: accepted.watcherId,
+      state: "incomplete",
+      code: "root_contents_collapsed",
+      scanned: 0,
+      published: 0,
+      finishedAt: accepted.finishedAt,
+    };
+    assert.deepEqual(await transport.call(request), accepted);
+    // A clean pass owes nothing, so `unhealthySince` comes back null.
+    body = { ...accepted, unhealthySince: null };
+    assert.deepEqual(await transport.call(request), body);
+
+    // An old server that has never heard of the operation. Its refusal is a
+    // safe error envelope, which must come back as a value rather than a
+    // throw: the watcher's report is best-effort and the pass carries on.
+    body = { error: { code: "invalid_request", message: "unknown operation" } };
+    status = 400;
+    assert.deepEqual(await transport.call(request), {
+      error: { code: "invalid_request" },
+    });
+
+    // And a malformed success is still refused, field by field.
+    status = 200;
+    for (const bad of [
+      { ...accepted, watcherId: "not-a-uuid" },
+      { ...accepted, finishedAt: "soon" },
+      { ...accepted, unhealthySince: 1.5 },
+      { ...accepted, extra: 1 },
+    ]) {
+      body = bad;
+      await assert.rejects(() => transport.call(request));
+    }
+    const missing = { ...accepted };
+    delete missing.unhealthySince;
+    body = missing;
+    await assert.rejects(() => transport.call(request));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 // ADM-4c. More than one watched root, and more than one provider folder.
 
 function multiRootBase() {

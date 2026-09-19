@@ -5802,18 +5802,21 @@ function identityTransport({ failAt, entries, requests }) {
     async call(request) {
       requests.push(request);
       // ADM-9. Every pass reports how it ended, including the ones that never
-      // open a scan. `failAt: "passOutcome"` is the server that refuses it,
-      // which is what an old server answering an unknown operation looks like.
+      // open a scan. `failAt: "passOutcome"` is the server that refuses it --
+      // an old one answering an unknown operation -- as the safe error
+      // envelope a real server sends, which the transport returns rather than
+      // throws.
       if (request.operation === "diagnostics.passOutcome") {
         if (failAt === "passOutcome") {
-          throw new Error("worker request failed: invalid_request");
+          return { error: { code: "invalid_request" } };
         }
         return {
           operation: "diagnostics.passOutcome",
           sourceAccountId: "source",
           watcherId: request.watcherId,
           finishedAt: request.finishedAt,
-          unhealthyPasses: request.state === "complete" ? 0 : 1,
+          unhealthySince:
+            request.state === "complete" ? null : request.finishedAt,
         };
       }
       if (request.operation === "source.status") {
@@ -7192,13 +7195,52 @@ test("a refused pass tells the server how it ended", async () => {
     // of the operation, or one that is simply unreachable -- leaves the pass
     // exactly as it was. The owner's watcher runs behind on purpose, so this
     // is the ordinary case and not an error.
-    const refusedReport = await identityPass({
-      setup,
-      bindings: remembered,
-      providers: [],
-      failAt: "passOutcome",
-    });
+    //
+    // It is also said once per process and not once per pass (first review,
+    // finding 4): a server that will never accept the operation refuses every
+    // report there will ever be, and a five-minute watch loop would write the
+    // same line forever. The assertion is about the *second* refusal rather
+    // than a count from zero, because any earlier test in this file may
+    // already have latched the warning.
+    // Only this warning: a refused pass writes two of its own, about the
+    // folder list and about the refusal itself, and both are meant to repeat.
+    const warnings = [];
+    const originalWarn = console.warn;
+    console.warn = (...args) => {
+      const line = args.join(" ");
+      if (line.includes("pass outcome could not be reported"))
+        warnings.push(line);
+    };
+    let refusedReport;
+    let repeated;
+    try {
+      refusedReport = await identityPass({
+        setup,
+        bindings: remembered,
+        providers: [],
+        failAt: "passOutcome",
+      });
+      const afterFirst = warnings.length;
+      assert.ok(
+        afterFirst <= 1,
+        "a refused report says so at most once per process",
+      );
+      repeated = await identityPass({
+        setup,
+        bindings: remembered,
+        providers: [],
+        failAt: "passOutcome",
+      });
+      assert.equal(
+        warnings.length,
+        afterFirst,
+        "and says nothing at all on the refusals after it",
+      );
+    } finally {
+      console.warn = originalWarn;
+    }
     assert.deepEqual(refusedReport.result, pass.result);
+    assert.deepEqual(repeated.result, pass.result);
     assert.deepEqual(
       refusedReport.bindings.map((row) => row.externalId).sort(),
       remembered.map((row) => row.externalId).sort(),

@@ -46,7 +46,7 @@ function watcher(overrides = {}) {
     lastPassState: "complete",
     lastPassCode: null,
     lastPassAt: NOW - MINUTE,
-    unhealthyPasses: 0,
+    unhealthySince: null,
     ...overrides,
   };
 }
@@ -127,6 +127,36 @@ test("an overdue watcher is a problem and a disabled source is not", () => {
   assert.equal(checkById(awaiting, "documents_watcher").status, "unknown");
 });
 
+// ADM-9 follow-up, from the hosted incident: a watcher whose heartbeat has
+// been refused for 16 hours while its passes kept completing. The pass pill
+// reads `complete` and every other fact about it is healthy, so this is the
+// one case where a green pass must not be allowed to speak for the host.
+test("a stale heartbeat is a problem however well the passes are going", () => {
+  const stale = deriveHealthChecks(
+    facts({
+      watchers: [
+        watcher({
+          lastSeenAt: NOW - 17 * HOUR,
+          nextExpectedAt: NOW - 17 * HOUR + 3 * MINUTE,
+          lastPassState: "complete",
+          lastPassAt: NOW - MINUTE,
+          unhealthySince: null,
+        }),
+      ],
+    }),
+    NOW,
+  );
+  const check = checkById(stale, "documents_watcher");
+  assert.equal(check.status, "problem");
+  assert.match(check.detail, /1 overdue/);
+  assert.equal(check.detail.includes("stuck"), false);
+  assert.deepEqual(check.pass, {
+    state: "complete",
+    code: null,
+    problem: false,
+  });
+});
+
 // ADM-9. The gap PR #313 opened: a pass that trips a circuit breaker writes
 // no scan and so no assessment, and the heartbeat keeps arriving, so before
 // this the whole screen read `ok` while the watcher ingested nothing.
@@ -141,7 +171,9 @@ test("a refused pass is a problem even while the heartbeat is current", () => {
           watcher({
             lastPassState: "incomplete",
             lastPassCode: code,
-            unhealthyPasses: 1,
+            // A breaker is a problem on sight, on the very first pass that
+            // trips it: no waiting, no duration.
+            unhealthySince: NOW - MINUTE,
           }),
         ],
       }),
@@ -159,34 +191,46 @@ test("a refused pass is a problem even while the heartbeat is current", () => {
   }
 });
 
-test("a failed pass is a problem, and one incomplete pass is not", () => {
+// First review, finding 5. `enumeration_not_complete` and
+// `processing_incomplete` are what a healthy watcher reports while it chews
+// through a first ingest of several hundred documents. Counting two in a row
+// as a fault would paint the screen red for the whole first day, so an
+// ordinary `incomplete` is shown and not counted until it stops ending.
+test("a failed pass is a problem; an ordinary incomplete one is not until it lasts a day", () => {
   const status = (overrides) =>
     checkById(
       deriveHealthChecks(facts({ watchers: [watcher(overrides)] }), NOW),
       "documents_watcher",
     );
-  assert.equal(status({ lastPassState: "failed", unhealthyPasses: 1 }).status,
-    "problem");
-  // One incomplete pass is ordinary: work left over, a retryable error, a
-  // parked document. The same answer twice running is a stuck watcher.
-  const once = status({
-    lastPassState: "incomplete",
-    lastPassCode: "items_need_attention",
-    unhealthyPasses: 1,
-  });
-  assert.equal(once.status, "ok");
-  assert.deepEqual(once.pass, {
-    state: "incomplete",
-    code: "items_need_attention",
-    problem: false,
-  });
   assert.equal(
-    status({
-      lastPassState: "incomplete",
-      lastPassCode: "items_need_attention",
-      unhealthyPasses: 2,
-    }).status,
+    status({ lastPassState: "failed", unhealthySince: NOW - MINUTE }).status,
     "problem",
+  );
+  const backlog = {
+    lastPassState: "incomplete",
+    lastPassCode: "processing_incomplete",
+  };
+  // Hours of backlog passes: shown on the pill, not a fault.
+  for (const since of [NOW - MINUTE, NOW - 6 * HOUR, NOW - 23 * HOUR]) {
+    const check = status({ ...backlog, unhealthySince: since });
+    assert.equal(check.status, "ok", `${since} must not be a fault yet`);
+    assert.deepEqual(check.pass, {
+      state: "incomplete",
+      code: "processing_incomplete",
+      problem: false,
+    });
+    assert.equal(check.detail.includes("stuck"), false);
+  }
+  // A day of them and nothing finishing is a different thing.
+  const stuck = status({ ...backlog, unhealthySince: NOW - DAY - MINUTE });
+  assert.equal(stuck.status, "problem");
+  assert.equal(stuck.pass.problem, true);
+  assert.match(stuck.detail, /1 stuck/);
+  // A pass that completed clears the run, whatever came before it.
+  assert.equal(
+    status({ lastPassState: "complete", lastPassCode: null, unhealthySince: null })
+      .status,
+    "ok",
   );
   // Nothing reported yet is not a pill and not a failure.
   const never = status({

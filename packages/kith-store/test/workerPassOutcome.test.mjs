@@ -162,7 +162,7 @@ async function storedOutcome(f, sourceAccountId = f.sourceAccountId) {
   const found = await f.client.query(
     `SELECT last_pass_state, last_pass_code, last_pass_scanned,
             last_pass_published, last_pass_finished_at,
-            last_pass_unhealthy_streak
+            last_pass_unhealthy_since
        FROM kith.worker_watcher_states WHERE source_account_id = $1`,
     [sourceAccountId],
   );
@@ -181,7 +181,7 @@ test("a refused pass reaches the server even though it opened no scan", { skip }
     sourceAccountId: f.sourceAccountId,
     watcherId: HOST,
     finishedAt: NOW,
-    unhealthyPasses: 1,
+    unhealthySince: NOW,
   });
   const stored = await storedOutcome(f);
   assert.equal(stored.last_pass_state, "incomplete");
@@ -189,49 +189,86 @@ test("a refused pass reaches the server even though it opened no scan", { skip }
   assert.equal(stored.last_pass_scanned, 0);
   assert.equal(stored.last_pass_published, 0);
   assert.equal(stored.last_pass_finished_at.getTime(), NOW);
-  assert.equal(stored.last_pass_unhealthy_streak, 1);
+  assert.equal(stored.last_pass_unhealthy_since.getTime(), NOW);
 });
 
-test("the streak counts consecutive passes and a clean one clears it", { skip }, async (t) => {
+test("the unhealthy run starts once, carries forward, and a clean pass ends it", { skip }, async (t) => {
   const f = await fixture(t);
-  const send = (overrides) =>
-    recordWorkerPassOutcome(workerCtx(f.client, NOW), f.worker, {
+  const send = (now, overrides) =>
+    recordWorkerPassOutcome(workerCtx(f.client, now), f.worker, {
       ...outcome(f),
+      finishedAt: now,
+      code: "processing_incomplete",
       ...overrides,
     });
 
-  await send({ finishedAt: NOW, code: "items_need_attention" });
-  const second = await send({
-    finishedAt: NOW + MINUTE,
-    code: "items_need_attention",
-  });
-  assert.equal(second.unhealthyPasses, 2);
+  const first = await send(NOW);
+  assert.equal(first.unhealthySince, NOW);
+  // A later pass that is still not complete keeps the *original* instant: the
+  // question the screen asks is how long this has been going on.
+  const second = await send(NOW + MINUTE);
+  assert.equal(second.unhealthySince, NOW);
+  assert.equal(second.finishedAt, NOW + MINUTE);
 
-  // An at-least-once delivery of a pass already recorded is not a second pass.
-  const replayed = await send({
-    finishedAt: NOW + MINUTE,
-    code: "items_need_attention",
-  });
-  assert.equal(replayed.unhealthyPasses, 2);
+  // An at-least-once delivery of a pass already recorded changes nothing.
+  const replayed = await send(NOW + MINUTE);
+  assert.equal(replayed.unhealthySince, NOW);
   assert.equal(replayed.finishedAt, NOW + MINUTE);
-  // Nor is a report that arrives after a newer one.
-  const stale = await send({ finishedAt: NOW - MINUTE, state: "failed" });
-  assert.equal(stale.unhealthyPasses, 2);
+  // Nor does a report that arrives after a newer one.
+  const stale = await recordWorkerPassOutcome(
+    workerCtx(f.client, NOW + 2 * MINUTE),
+    f.worker,
+    { ...outcome(f), finishedAt: NOW - MINUTE, state: "failed" },
+  );
+  assert.equal(stale.finishedAt, NOW + MINUTE);
   assert.equal((await storedOutcome(f)).last_pass_state, "incomplete");
 
-  const clean = await send({
-    finishedAt: NOW + 2 * MINUTE,
+  const clean = await send(NOW + 3 * MINUTE, {
     state: "complete",
     code: undefined,
     scanned: 12,
     published: 3,
   });
-  assert.equal(clean.unhealthyPasses, 0);
+  assert.equal(clean.unhealthySince, null);
   const stored = await storedOutcome(f);
   assert.equal(stored.last_pass_state, "complete");
   assert.equal(stored.last_pass_code, null);
   assert.equal(stored.last_pass_scanned, 12);
-  assert.equal(stored.last_pass_unhealthy_streak, 0);
+  assert.equal(stored.last_pass_unhealthy_since, null);
+
+  // And the next non-complete pass starts a fresh run rather than resuming
+  // the old one.
+  const restarted = await send(NOW + 4 * MINUTE);
+  assert.equal(restarted.unhealthySince, NOW + 4 * MINUTE);
+});
+
+// First review, finding 2. `finishedAt` is the watcher host's clock and the
+// stale-write gate refuses anything not newer than what is stored, so one
+// forward clock jump on the host would park the row at an instant no later
+// pass could beat: the pill and the age would freeze permanently.
+test("a watcher clock running ahead cannot freeze the row", { skip }, async (t) => {
+  const f = await fixture(t);
+  const YEAR = 365 * 24 * 60 * 60 * 1000;
+  const jumped = await recordWorkerPassOutcome(
+    workerCtx(f.client, NOW),
+    f.worker,
+    { ...outcome(f), finishedAt: NOW + YEAR },
+  );
+  assert.equal(jumped.finishedAt, NOW, "clamped to the server's own clock");
+  assert.equal(jumped.unhealthySince, NOW);
+  assert.equal(
+    (await storedOutcome(f)).last_pass_finished_at.getTime(),
+    NOW,
+    "and it is the clamped instant that is stored",
+  );
+  // The very next pass, on the server's clock, is still accepted.
+  const next = await recordWorkerPassOutcome(
+    workerCtx(f.client, NOW + MINUTE),
+    f.worker,
+    { ...outcome(f), finishedAt: NOW + YEAR, state: "complete", code: undefined },
+  );
+  assert.equal(next.finishedAt, NOW + MINUTE);
+  assert.equal((await storedOutcome(f)).last_pass_state, "complete");
 });
 
 test("a worker key writes its own account's outcome and no other", { skip }, async (t) => {
@@ -324,7 +361,7 @@ test("the health screen reads the refused pass and calls it a problem", { skip }
   assert.equal(watcher.lastPassState, "incomplete");
   assert.equal(watcher.lastPassCode, "root_contents_collapsed");
   assert.equal(watcher.lastPassAt, NOW);
-  assert.equal(watcher.unhealthyPasses, 1);
+  assert.equal(watcher.unhealthySince, NOW);
 
   // The heartbeat is current and there is no assessment at all, which is
   // exactly the state that read `ok` before ADM-9.
@@ -351,4 +388,16 @@ test("the column refuses a code the wire would never send", { skip }, async (t) 
       /last_pass_code/,
     );
   }
+  // A `complete` pass owes nothing, so it can never carry an unhealthy run.
+  await assert.rejects(
+    f.client.query(
+      `UPDATE kith.worker_watcher_states
+          SET last_pass_state = 'complete',
+              last_pass_finished_at = now(),
+              last_pass_unhealthy_since = now()
+        WHERE source_account_id = $1`,
+      [f.sourceAccountId],
+    ),
+    /worker_watcher_states_last_pass_check/,
+  );
 });

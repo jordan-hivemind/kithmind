@@ -117,22 +117,40 @@ export const PASS_BREAKER_CODES: readonly string[] = [
 ];
 
 /**
+ * ADM-9. How long an ordinary `incomplete` run may last before it is a fault.
+ *
+ * First review, finding 5. An `incomplete` pass carrying `enumeration_not_
+ * complete` or `processing_incomplete` is how a healthy watcher chews through
+ * a backlog: a first ingest of several hundred documents is hours of them, and
+ * counting two in a row as a fault would paint the screen red for the whole
+ * first day. A day of them and nothing finishing is a different thing.
+ */
+export const PASS_STUCK_MS = 24 * 60 * 60 * 1000;
+
+/**
  * ADM-9. Whether the last pass is something to act on.
  *
- * Three ways in, and the third is why the streak is stored. A single
- * `incomplete` pass is ordinary -- work left over, a retryable error, a
- * document parked -- and the next pass usually finishes it. The same thing
- * twice running is not a pass in progress, it is a watcher that is stuck.
+ * Three ways in, and the shapes differ on purpose. The first two are faults on
+ * sight: a `failed` pass and a tripped circuit breaker both mean the watcher
+ * will not get further without someone doing something. The third is the
+ * ordinary `incomplete` -- work left over, a retryable error, a parked
+ * document -- which is not a fault at all until it stops ending, and `since`
+ * rather than a count of passes is what makes that judgement mean the same
+ * thing on a five-minute watcher and a nightly one.
  */
-export function passProblem(watcher: WatcherFact): boolean {
-  if (watcher.lastPassState === null) return false;
+export function passProblem(watcher: WatcherFact, now: number): boolean {
+  if (watcher.lastPassState === null || watcher.lastPassState === "complete")
+    return false;
   if (watcher.lastPassState === "failed") return true;
   if (
     watcher.lastPassCode !== null &&
     PASS_BREAKER_CODES.includes(watcher.lastPassCode)
   )
     return true;
-  return watcher.lastPassState !== "complete" && watcher.unhealthyPasses >= 2;
+  return (
+    watcher.unhealthySince !== null &&
+    now - watcher.unhealthySince > PASS_STUCK_MS
+  );
 }
 
 /**
@@ -150,7 +168,7 @@ function watcherStatus(watcher: WatcherFact, now: number): HealthStatus {
   if (!watcher.enabled) return "not_configured";
   if (watcher.watcherState === null) return "unknown";
   if (watcher.watcherState === "awaiting_heartbeat") return "unknown";
-  if (passProblem(watcher)) return "problem";
+  if (passProblem(watcher, now)) return "problem";
   if (watcher.nextExpectedAt === null) return "unknown";
   return watcher.nextExpectedAt < now ? "problem" : "ok";
 }
@@ -186,7 +204,7 @@ function watcherCheck(
       watcher.nextExpectedAt !== null &&
       watcher.nextExpectedAt < now,
   ).length;
-  const stuck = watching.filter(passProblem).length;
+  const stuck = watching.filter((watcher) => passProblem(watcher, now)).length;
   const detail = [
     `last pass ${ago(lastCheckedAt, now)}`,
     `${watching.length} watched`,
@@ -216,7 +234,7 @@ function watcherCheck(
   // The pill shows one pass, so it shows the one worth acting on: a stuck
   // watcher if there is one, otherwise the most recent pass reported.
   const shown =
-    watching.find(passProblem) ??
+    watching.find((watcher) => passProblem(watcher, now)) ??
     watching
       .filter((watcher) => watcher.lastPassState !== null)
       .sort(
@@ -235,7 +253,7 @@ function watcherCheck(
           pass: {
             state: shown.lastPassState,
             code: shown.lastPassCode,
-            problem: passProblem(shown),
+            problem: passProblem(shown, now),
           },
         }),
   };

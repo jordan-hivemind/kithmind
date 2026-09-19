@@ -560,6 +560,31 @@ function status(value: Record<string, unknown>): void {
   }
 }
 
+/**
+ * ADM-9. A successful pass-outcome report.
+ *
+ * This parser refuses an operation it has no `case` for, so an operation the
+ * runner sends and the switch below does not know is a thrown client-side
+ * error on a 200 the server actually stored -- forever, once per pass. A
+ * transport double that returns objects instead of bytes never reaches here,
+ * which is why the parse path has a test of its own.
+ */
+function diagnosticsPassOutcome(value: Record<string, unknown>): void {
+  exact(value, [
+    "operation",
+    "sourceAccountId",
+    "watcherId",
+    "finishedAt",
+    "unhealthySince",
+  ]);
+  id(value.sourceAccountId, "sourceAccountId");
+  text(value.watcherId, "watcherId", { maxUtf16: 36, pattern: UUID });
+  integer(value.finishedAt, "finishedAt");
+  // Null is the answer after a clean pass: nothing is owed and nothing is old.
+  if (value.unhealthySince !== null)
+    integer(value.unhealthySince, "unhealthySince");
+}
+
 function diagnosticsHeartbeat(value: Record<string, unknown>): void {
   exact(value, [
     "operation",
@@ -1374,6 +1399,9 @@ export function parseWorkerResponse(
       break;
     case "diagnostics.heartbeat":
       diagnosticsHeartbeat(result);
+      break;
+    case "diagnostics.passOutcome":
+      diagnosticsPassOutcome(result);
       break;
     case "diagnostics.status":
       diagnosticsStatus(result);

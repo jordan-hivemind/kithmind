@@ -176,6 +176,32 @@ export function parseHeartbeatResponse(
   if (nextExpectedAt !== receivedAt + HEARTBEAT_DEADLINE_MS) fail();
 }
 
+/**
+ * ADM-9 follow-up. A heartbeat that is being refused says so, once.
+ *
+ * `ping` used to swallow every failure with a bare `catch {}`, and that hid a
+ * real incident: a watcher whose `watcherId` no longer matches the registered
+ * one is answered `identity_review_required` by `recordWorkerHeartbeat` on
+ * every tick, forever. The id is derived from a random salt in the journal's
+ * state file (`credentialSalt`, journal.ts), so recreating the journal
+ * directory changes it; passes carry on working, because no other operation in
+ * the protocol carries a `watcherId`, and the only symptom is
+ * `worker_watcher_states.last_seen_at` frozen at the instant the journal
+ * changed while the watcher looks busy and healthy from the host.
+ *
+ * Once per process rather than once per tick: at 30 seconds a repeating line
+ * is a log nobody reads, and none of the conditions worth naming here resolve
+ * on their own.
+ */
+let heartbeatWarned = false;
+function warnHeartbeatOnce(reason: string): void {
+  if (heartbeatWarned) return;
+  heartbeatWarned = true;
+  console.warn(
+    `[pipeline] the watcher heartbeat is not being accepted (${reason}); passes continue but this host will read as missing until it is re-registered. Not repeating this warning.`,
+  );
+}
+
 export class WatchHeartbeat {
   private stopped = false;
   private inFlight = false;
@@ -225,14 +251,25 @@ export class WatchHeartbeat {
         },
         controller.signal,
       );
-      if (!this.stopped)
+      // ADM-9 follow-up. The refusal code, before the parser turns every
+      // failure into one indistinguishable throw: it is the only thing that
+      // tells a stopped heartbeat apart from a broken one.
+      const refused = errorCode(result);
+      if (refused !== undefined) warnHeartbeatOnce(refused);
+      if (!this.stopped && refused === undefined)
         parseHeartbeatResponse(
           result,
           this.config.sourceAccountId,
           this.watcherId,
         );
-    } catch {
-      // A worker heartbeat has no durable replay state and exposes no remote detail.
+    } catch (error) {
+      // A worker heartbeat has no durable replay state and exposes no remote
+      // detail, so this stays broad and the loop carries on: the next tick
+      // tries again in 30 seconds.
+      if (!this.stopped)
+        warnHeartbeatOnce(
+          error instanceof Error ? error.message : "unknown error",
+        );
     } finally {
       clearTimeout(timeout);
       if (this.controller === controller) this.controller = undefined;
