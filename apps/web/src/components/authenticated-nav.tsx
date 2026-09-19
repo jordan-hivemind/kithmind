@@ -30,6 +30,7 @@ export function AuthenticatedNav({
       <strong>Kith Mind</strong>
       <Link href="/">Dashboard</Link>
       <Link href="/browse">Browse</Link>
+      <Link href="/admin/sources">Admin</Link>
       <Link href="/settings">Settings</Link>
       <Link href="/spaces">Spaces</Link>
       <Link href="/getting-started">Getting Started</Link>
