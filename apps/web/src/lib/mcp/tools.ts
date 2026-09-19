@@ -16,6 +16,8 @@ export const MCP_TOOL_NAMES = {
   timelineThoughts: "timeline_thoughts",
   getStats: "get_stats",
   captureThought: "capture_thought",
+  listInvestments: "list_investments",
+  getInvestment: "get_investment",
 } as const;
 
 export const MCP_TOOL_NAME_LIST = Object.values(MCP_TOOL_NAMES);

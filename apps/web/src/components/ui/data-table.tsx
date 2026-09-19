@@ -40,6 +40,11 @@ export type RowAction<T> = {
   label: string;
   onSelect: (row: T) => void;
   disabled?: (row: T) => boolean;
+  /** Left out of this row's kebab entirely. A table whose rows are of two
+   * kinds (ADM-3's investments over their entries) offers each kind its own
+   * actions; `disabled` would show the other kind's greyed out, which reads as
+   * "not yet" rather than "not applicable". */
+  hidden?: (row: T) => boolean;
 };
 
 export type DataTableProps<T> = {
@@ -152,6 +157,7 @@ export function DataTable<T>({
     onSortingChange: setSorting,
     onExpandedChange: setExpanded,
     onGlobalFilterChange: setSearch,
+    ...(getSubRows === undefined ? {} : { getSubRows }),
     globalFilterFn: (row, _columnId, value: string) =>
       rowMatchesSearch(Object.values(row.original as object), value),
     ...(getSubRows === undefined ? {} : { getSubRows }),
@@ -360,7 +366,12 @@ export function DataTable<T>({
                               sideOffset={2}
                               className="z-50 min-w-36 rounded-tag border border-gray-200 bg-white py-1 text-xs shadow-md"
                             >
-                              {actions.map((action) => (
+                              {actions
+                                .filter(
+                                  (action) =>
+                                    !(action.hidden?.(row.original) ?? false),
+                                )
+                                .map((action) => (
                                 <DropdownMenu.Item
                                   key={action.label}
                                   disabled={action.disabled?.(row.original) ?? false}

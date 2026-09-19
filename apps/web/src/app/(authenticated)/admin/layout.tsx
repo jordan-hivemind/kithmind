@@ -31,7 +31,7 @@ const SCREENS = [
   { href: "/admin/sources", label: "Sources", ready: true },
   { href: "/admin/institutions", label: "Institutions", ready: true },
   { href: "/admin/coverage", label: "Coverage", ready: true },
-  { href: "/admin/investments", label: "Investments", ready: false },
+  { href: "/admin/investments", label: "Investments", ready: true },
   { href: "/admin/types", label: "Types and fields", ready: false },
   { href: "/admin/corrections", label: "Corrections", ready: false },
 ] as const;

@@ -118,3 +118,59 @@ Dropped from the earlier card design: closed kind enums, the model tier ladder, 
 ## 11. Acceptance for the first use case
 
 Through the MCP connector the owner can ask, and get exact, cited answers to: committed versus sent versus outstanding per investment, which investments returned capital, exposure by category, what was signed with a given company and its key terms, and the tax forms for a given year.
+
+## 12. Linking investment documents (ADM-3)
+
+The owner does not file documents by hand: he enters the investment dollars
+and drops the supporting files in the watched Investing folder. Step 3 built
+the entry side of that and the suggestion side of it. Step 5's extraction
+writer supplies the rest, and this section fixes the rule so that step does not
+have to re-decide it.
+
+### What exists now
+
+| Piece | Behaviour |
+| --- | --- |
+| `investment_entries.document_id` | Optional. One entry cites at most one document. |
+| `suggestDocumentsForEntry` | Computed on read, never stored. Ranks the space's published, unlinked documents by three signals: the investment's name in the document title (3), an exact string form of the entry amount in its text chunks, tried as `25000.00`, `25,000.00`, `25000` and `25,000` (2), and a capture date within 45 days of the entry date (1). A document scoring zero is not offered. |
+| Unlinked count | Per investment: published documents whose title contains the investment's name and that no entry links to. The screen shows it as a gap, not a total. |
+| Upload | Present and disabled, with the tooltip "Drop files in the watched Investing folder". |
+
+### The automatic rule, for when extraction lands
+
+An extracted document is linked to an entry without asking when all four hold:
+
+1. The document's kind is a capital call notice or a distribution notice.
+2. An extracted party matches the investment's `entities` row, by the entity
+   the investment already points at or by the same exact normalized name.
+3. An extracted money value equals an entry's amount exactly, in the same
+   currency. No tolerance: an amount that does not match is not this document.
+4. The document's stated date is within 45 days of that entry's date, and
+   exactly one entry of the matching type satisfies 2 to 4.
+
+Anything short of that is a suggestion, not a link. In particular: two entries
+matching the same document, an amount matching no entry, a party matching no
+investment, or a kind outside the two above. A document that is already linked
+is never relinked, and a link is only ever added to an entry whose
+`document_id` is null, so a correction the owner made by hand outranks the
+rule.
+
+Uploads later write into a managed subfolder of the watched provider folder
+rather than into a second intake path, so the watcher stays the one way a
+document enters the system and a file added from the UI is ingested, hashed and
+deduplicated exactly like one dropped in by hand.
+
+### Import
+
+The one-time spreadsheet import takes CSV exports of the `Summary` and `Ledger`
+tabs, client side, with no Google API. Its sign and currency rule is stated in
+the preview the operator approves: a negative `Amount` is a capital call paid
+and a positive one a distribution; a value in the `GBP` column makes the entry
+GBP with that column as its amount and `Exchange Rate` as the rate to USD, and
+otherwise the entry is USD. Every type can be flipped per row before importing.
+Before importing, the preview reconciles each investment's imported entry
+totals against the `Summary` tab's own `Sent` and `Received` and reports
+differences rather than trusting either side. The import is idempotent: each
+source row carries a stable key stored on the entry
+(`investment_entries.import_key`, migration 024), and a second import of the
+same file creates nothing.

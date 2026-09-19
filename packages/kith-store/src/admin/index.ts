@@ -5,5 +5,6 @@
 export * from "./areas.js";
 export * from "./changes.js";
 export * from "./health.js";
+export * from "./investments.js";
 export * from "./model.js";
 export * from "./status.js";
