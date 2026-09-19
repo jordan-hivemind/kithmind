@@ -27,10 +27,10 @@ import { QueryProvider } from "@/components/query-provider";
 import { loadAdminAccess } from "@/lib/kith/sources-data";
 
 const SCREENS = [
-  { href: "/admin/health", label: "Health", ready: false },
+  { href: "/admin/health", label: "Health", ready: true },
   { href: "/admin/sources", label: "Sources", ready: true },
-  { href: "/admin/institutions", label: "Institutions", ready: false },
-  { href: "/admin/coverage", label: "Coverage", ready: false },
+  { href: "/admin/institutions", label: "Institutions", ready: true },
+  { href: "/admin/coverage", label: "Coverage", ready: true },
   { href: "/admin/investments", label: "Investments", ready: false },
   { href: "/admin/types", label: "Types and fields", ready: false },
   { href: "/admin/corrections", label: "Corrections", ready: false },

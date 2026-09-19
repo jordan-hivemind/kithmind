@@ -109,7 +109,7 @@ describe("finance provider authorization", () => {
         }).response,
       ).toEqual(exchange.response);
     }
-    expect(syntheticFinanceReadExchanges).toHaveLength(8);
+    expect(syntheticFinanceReadExchanges).toHaveLength(9);
   });
 
   test("money crosses the provider as decimal strings", async () => {
