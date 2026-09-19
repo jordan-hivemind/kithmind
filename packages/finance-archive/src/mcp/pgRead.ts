@@ -38,6 +38,7 @@ import {
   canonicalizeFinanceDecimal,
   type FinanceAccountId,
   type FinanceAccountDescriptor,
+  type FinanceAccountInventoryRecord,
   type FinanceAggregateRecord,
   type FinanceBalanceRecord,
   type FinanceCaptureId,
@@ -65,6 +66,7 @@ import {
   FinanceContractError,
   type GetCoverageRequest,
   type GetEvidenceRequest,
+  type ListAccountInventoryRequest,
   type ListBalancesRequest,
   type ListAccountsRequest,
   type GetHoldingsSnapshotRequest,
@@ -1132,6 +1134,107 @@ async function listAccounts(
     matchStatus:
       totalMatches === 0 ? "none" : totalMatches === 1 ? "unique" : "ambiguous",
     totalMatches,
+    items,
+  } as FinanceReadResponse;
+}
+
+type AccountInventoryRow = AccountDescriptorRow & {
+  statement_count: string;
+  record_count: string;
+  activity_from: string | null;
+  activity_to: string | null;
+  latest_snapshot_as_of: string | null;
+  open_review_count: string;
+};
+
+/**
+ * ADM-2: one page of per-account inventory counts.
+ *
+ * The descriptor half is `ACCOUNT_DESCRIPTOR_CTES` and `accountDescriptorOf`
+ * unchanged, so an account is identified and disclosed here exactly as
+ * `list_accounts` identifies and discloses it, and the last-four rules are not
+ * reimplemented. What is added is five aggregates, and nothing else about the
+ * account's contents: no amount, no instrument, no description. An inventory
+ * screen asks how much is held, not what is in it.
+ *
+ * `activity_from`/`activity_to` span all three record kinds because a cash
+ * account has balances and no positions and a brokerage account has both, and
+ * an inventory row that reported only one kind's range would say an account was
+ * emptier than it is.
+ *
+ * ponytail: correlated subqueries, one set per account row on the page, rather
+ * than five grouped joins. The page is at most 100 accounts and each subquery
+ * is an index lookup on `(account_id, date)`. Upgrade path if an archive ever
+ * has thousands of accounts: group each aggregate once and join on account_id.
+ */
+async function listAccountInventory(
+  client: pg.ClientBase,
+  scope: ReadScope,
+  request: ListAccountInventoryRequest,
+  options: FinanceReadOptions,
+): Promise<FinanceReadResponse> {
+  const cursorKey = readCursorKey(scope, request, options);
+  const result = await client.query<AccountInventoryRow>(
+    `${ACCOUNT_DESCRIPTOR_CTES}
+     SELECT d.*,
+            (SELECT count(*) FROM documents doc
+              WHERE doc.account_id = d.account_id)::text AS statement_count,
+            (  (SELECT count(*) FROM transactions t WHERE t.account_id = d.account_id)
+             + (SELECT count(*) FROM positions p WHERE p.account_id = d.account_id)
+             + (SELECT count(*) FROM balances b WHERE b.account_id = d.account_id)
+            )::text AS record_count,
+            least(
+              (SELECT min(t.process_date) FROM transactions t WHERE t.account_id = d.account_id),
+              (SELECT min(p.as_of) FROM positions p WHERE p.account_id = d.account_id),
+              (SELECT min(b.as_of) FROM balances b WHERE b.account_id = d.account_id)
+            )::text AS activity_from,
+            greatest(
+              (SELECT max(t.process_date) FROM transactions t WHERE t.account_id = d.account_id),
+              (SELECT max(p.as_of) FROM positions p WHERE p.account_id = d.account_id),
+              (SELECT max(b.as_of) FROM balances b WHERE b.account_id = d.account_id)
+            )::text AS activity_to,
+            (SELECT max(p.as_of) FROM positions p
+              WHERE p.account_id = d.account_id)::text AS latest_snapshot_as_of,
+            (SELECT count(*) FROM review_items r
+              WHERE r.account_id = d.account_id
+                AND r.status = 'open')::text AS open_review_count
+       FROM account_descriptors d
+      WHERE ($1::text IS NULL OR d.account_id > $1)
+      ORDER BY d.account_id
+      LIMIT $2`,
+    [cursorKey?.[0] ?? null, request.limit + 1],
+  );
+  const page = result.rows.slice(0, request.limit);
+  const items = page.map((row): FinanceAccountInventoryRecord => {
+    // Both endpoints or neither: `least`/`greatest` ignore nulls, so an
+    // account with rows of one kind only still has both, and an account with
+    // no rows at all has neither.
+    const ranged = row.activity_from !== null && row.activity_to !== null;
+    return {
+      account: accountDescriptorOf(row, scope),
+      statementCount: Number(row.statement_count),
+      recordCount: Number(row.record_count),
+      openReviewCount: Number(row.open_review_count),
+      ...(ranged
+        ? { activityFrom: row.activity_from!, activityTo: row.activity_to! }
+        : {}),
+      ...(ranged && row.latest_snapshot_as_of !== null
+        ? { latestSnapshotAsOf: row.latest_snapshot_as_of }
+        : {}),
+    };
+  });
+  const truncated = result.rows.length > request.limit;
+  const last = page[page.length - 1];
+  return {
+    ...envelope(
+      scope,
+      "list_account_inventory",
+      truncated,
+      truncated && last
+        ? writeCursor(scope, request, options, [last.account_id])
+        : undefined,
+    ),
+    operation: "list_account_inventory",
     items,
   } as FinanceReadResponse;
 }
@@ -2713,6 +2816,8 @@ export async function serveFinanceRead(
       }
       case "get_coverage":
         return getCoverage(client, scope, request, options);
+      case "list_account_inventory":
+        return listAccountInventory(client, scope, request, options);
     }
   });
   return parseFinanceReadResponseShape(response);

@@ -29,7 +29,8 @@ export const FINANCE_READ_REQUEST_DESCRIPTION =
 export const FINANCE_READ_TOOL_DESCRIPTION =
   "Read authorized finance data through bounded typed operations: " +
   "list_accounts, get_holdings_snapshot, list_transactions, list_holdings, " +
-  "list_balances, aggregate_money, get_evidence, and get_coverage. " +
+  "list_balances, aggregate_money, get_evidence, get_coverage, and " +
+  "list_account_inventory. " +
   "The legacy list_holdings asOf field is an upper bound over historical rows; " +
   "use get_holdings_snapshot for exact-date or latest-snapshot selection.";
 
@@ -396,6 +397,29 @@ export type FinanceAggregateRecord = {
   };
 };
 
+/**
+ * ADM-2: one account's inventory, as counts over what the archive holds.
+ *
+ * `activityFrom` and `activityTo` are the earliest and latest dates the
+ * archive actually has a record on for this account, both inclusive. They are
+ * deliberately not a `from`/`toExclusive` range: a coverage window is a claim
+ * that a span was collected, and these two are only the endpoints of rows that
+ * exist. A consumer that needs the claim reads `get_coverage`.
+ */
+export type FinanceAccountInventoryRecord = {
+  account: FinanceAccountDescriptor;
+  /** `documents` rows attributed to the account, whatever their type. */
+  statementCount: number;
+  /** Transactions plus positions plus balances held for the account. */
+  recordCount: number;
+  activityFrom?: string;
+  activityTo?: string;
+  /** The latest `positions.as_of` the account has, if it has one. */
+  latestSnapshotAsOf?: string;
+  /** `review_items` for this account still in the `open` status. */
+  openReviewCount: number;
+};
+
 export type FinanceCoverageRecord = {
   sourceId: FinanceSourceId;
   recordKind: FinanceRecordKind;
@@ -525,6 +549,19 @@ export type GetCoverageRequest = PageRequest &
     recordKinds?: FinanceRecordKind[];
   };
 
+/**
+ * ADM-2: what an inventory screen shows beside an account's name, so that
+ * "how much of this account does the archive hold" is one page rather than one
+ * `get_holdings_snapshot` per account plus a coverage read keyed by source
+ * rather than by account.
+ *
+ * No filters. A consumer of this operation wants the whole inventory; one that
+ * wants a single account already has `list_accounts`.
+ */
+export type ListAccountInventoryRequest = PageRequest & {
+  operation: "list_account_inventory";
+};
+
 export type FinanceReadRequest =
   | ListAccountsRequest
   | GetHoldingsSnapshotRequest
@@ -533,7 +570,8 @@ export type FinanceReadRequest =
   | ListBalancesRequest
   | AggregateMoneyRequest
   | GetEvidenceRequest
-  | GetCoverageRequest;
+  | GetCoverageRequest
+  | ListAccountInventoryRequest;
 
 type FinanceReadResponseBase<
   Operation extends FinanceReadRequest["operation"],
@@ -584,6 +622,10 @@ export type GetEvidenceResponse = FinanceReadResponseBase<"get_evidence"> & {
 export type GetCoverageResponse = FinanceReadResponseBase<"get_coverage"> & {
   items: FinanceCoverageRecord[];
 };
+export type ListAccountInventoryResponse =
+  FinanceReadResponseBase<"list_account_inventory"> & {
+    items: FinanceAccountInventoryRecord[];
+  };
 
 export type FinanceReadResponse =
   | ListAccountsResponse
@@ -593,7 +635,8 @@ export type FinanceReadResponse =
   | ListBalancesResponse
   | AggregateMoneyResponse
   | GetEvidenceResponse
-  | GetCoverageResponse;
+  | GetCoverageResponse
+  | ListAccountInventoryResponse;
 
 export type FinanceTrustedContext = {
   principalId: FinancePrincipalId;
@@ -1365,6 +1408,10 @@ function parseFinanceReadRequestShape(value: unknown): FinanceReadRequest {
       operation: "get_evidence",
       recordId: opaqueId<"record">(input.recordId, "invalid_request"),
     };
+  }
+  if (input.operation === "list_account_inventory") {
+    exact(input, shared, pageOptional, "invalid_request");
+    return { ...base, operation: "list_account_inventory" };
   }
   if (input.operation === "get_coverage") {
     exact(
@@ -2403,6 +2450,61 @@ function coverageRecord(value: unknown): FinanceCoverageRecord {
   };
 }
 
+/**
+ * ADM-2. Counts are bounded integers and the three dates are plain ISO dates.
+ *
+ * The two ordering rules are what stop a nonsense row: activity cannot end
+ * before it began, and a snapshot the archive reports as its latest cannot sit
+ * outside the activity the same row claims. A row with a snapshot but no
+ * activity range is refused for the same reason.
+ */
+function accountInventoryRecord(
+  value: unknown,
+): FinanceAccountInventoryRecord {
+  const input = object(value, "invalid_response");
+  exact(
+    input,
+    ["account", "statementCount", "recordCount", "openReviewCount"],
+    ["activityFrom", "activityTo", "latestSnapshotAsOf"],
+    "invalid_response",
+  );
+  const count = (raw: unknown) =>
+    integer(raw, 0, Number.MAX_SAFE_INTEGER, "invalid_response");
+  const activityFrom =
+    input.activityFrom === undefined
+      ? undefined
+      : isoDate(input.activityFrom, "invalid_response");
+  const activityTo =
+    input.activityTo === undefined
+      ? undefined
+      : isoDate(input.activityTo, "invalid_response");
+  const latestSnapshotAsOf =
+    input.latestSnapshotAsOf === undefined
+      ? undefined
+      : isoDate(input.latestSnapshotAsOf, "invalid_response");
+  if (
+    (activityFrom === undefined) !== (activityTo === undefined) ||
+    (activityFrom !== undefined &&
+      activityTo !== undefined &&
+      activityFrom > activityTo) ||
+    (latestSnapshotAsOf !== undefined &&
+      (activityFrom === undefined ||
+        activityTo === undefined ||
+        latestSnapshotAsOf < activityFrom ||
+        latestSnapshotAsOf > activityTo))
+  )
+    fail("invalid_response");
+  return {
+    account: accountDescriptor(input.account),
+    statementCount: count(input.statementCount),
+    recordCount: count(input.recordCount),
+    openReviewCount: count(input.openReviewCount),
+    ...(activityFrom === undefined ? {} : { activityFrom }),
+    ...(activityTo === undefined ? {} : { activityTo }),
+    ...(latestSnapshotAsOf === undefined ? {} : { latestSnapshotAsOf }),
+  };
+}
+
 function coverageSummary(value: unknown): FinanceCoverageSummary {
   const input = object(value, "invalid_response");
   if (input.status === "complete") {
@@ -2592,6 +2694,7 @@ export function parseFinanceReadResponseShape(
       "aggregate_money",
       "get_evidence",
       "get_coverage",
+      "list_account_inventory",
     ] as const,
     "invalid_response",
   );
@@ -2796,6 +2899,12 @@ export function parseFinanceReadResponseShape(
       MAX_FINANCE_RESPONSE_BYTES,
       "invalid_response",
     );
+  if (operation === "list_account_inventory")
+    return boundedNormalizedSize(
+      { ...common, operation, items: items.map(accountInventoryRecord) },
+      MAX_FINANCE_RESPONSE_BYTES,
+      "invalid_response",
+    );
   const coverageItems = items.map(coverageRecord);
   if (
     operation === "get_coverage" &&
@@ -2947,6 +3056,20 @@ function responseMatchesRequest(
     if (
       response.operation !== "get_evidence" ||
       response.recordId !== request.recordId
+    )
+      fail("invalid_response");
+    return;
+  }
+  if (request.operation === "list_account_inventory") {
+    if (response.operation !== "list_account_inventory")
+      fail("invalid_response");
+    // The operation takes no last-four filter, so no row may claim it matched
+    // one: `matchedAccountLast4` binds a descriptor to a filtered request, and
+    // there is nothing here for it to be bound to.
+    if (
+      response.items.some(
+        (item) => item.account.matchedAccountLast4 !== undefined,
+      )
     )
       fail("invalid_response");
     return;
