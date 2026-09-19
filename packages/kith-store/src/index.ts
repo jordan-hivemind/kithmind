@@ -324,6 +324,40 @@ export async function grantProofAppRole(
   // already granted above with the records group.
   await owner.query(`GRANT INSERT, UPDATE, DELETE ON
     kith.document_extractions TO "${appRole}"`);
+  // The worker protocol's own tables (ADM-9, and its independent review).
+  //
+  // The comment further down said these would be granted "when the operations
+  // that write them land". They landed. Thirteen tables that a handler in
+  // `src/workers/` writes were in no group above, and reading the handlers is
+  // the only way to find that: `worker_source_scans`, `worker_scan_pages`,
+  // `worker_reservation_receipts`, `worker_reservation_targets`,
+  // `worker_operation_receipts`, `worker_binary_operation_receipts`,
+  // `worker_parsed_stages`, `worker_processing_assessments`,
+  // `worker_watcher_states`, `worker_operational_incidents`,
+  // `worker_watcher_reset_receipts`, `space_processing_state` and
+  // `source_accounts` -- the last of which every epoch bump goes through, so
+  // the gap reaches almost the whole protocol rather than one corner of it.
+  //
+  // This has never fired in production, and the reason is worth writing down
+  // rather than guessing at: the hosted web app connects as the database OWNER
+  // role, not as `kith_app`. The app-role cutover was started and never
+  // finished. So this list is latent, not live -- it is what would break the
+  // watcher on the day someone completes that cutover, which is exactly the
+  // failure mode `test/appRoleGrants.test.mjs` exists to make visible before
+  // it happens rather than after.
+  //
+  // `test/appRoleGrants.test.mjs` now derives its assertion from the same
+  // place this list comes from: every `kith.` table named by an INSERT, UPDATE
+  // or DELETE anywhere in `src/workers/`.
+  await owner.query(`GRANT INSERT, UPDATE, DELETE ON
+    kith.source_accounts, kith.space_processing_state,
+    kith.worker_source_scans, kith.worker_scan_pages,
+    kith.worker_reservation_receipts, kith.worker_reservation_targets,
+    kith.worker_operation_receipts, kith.worker_binary_operation_receipts,
+    kith.worker_parsed_stages, kith.worker_processing_assessments,
+    kith.worker_watcher_states, kith.worker_operational_incidents,
+    kith.worker_watcher_reset_receipts
+    TO "${appRole}"`);
   // The change feed (migration 023) is deliberately not in the list above.
   //
   // Nothing in the application writes `kith.changes`: rows arrive only through
@@ -344,9 +378,10 @@ export async function grantProofAppRole(
   await owner.query(`GRANT DELETE ON kith.changes TO "${appRole}"`);
   // Deliberately still absent, and each one is a table an application write
   // would be a bug on: `kith.schema_version`, which only a migration runner
-  // writes; the `proof_*` prototype pair, which only the owner role seeds; and
-  // the worker receipt and reservation tables P2-39e owns and grants when the
-  // operations that write them land. `test/appRoleGrants.test.mjs` asserts the
+  // writes, and the `proof_*` prototype pair, which only the owner role seeds.
+  // (The worker receipt and reservation tables this note used to defer are
+  // granted above as of ADM-9; their operations have all landed.)
+  // `test/appRoleGrants.test.mjs` asserts the
   // app role is refused on the first two, because a grant that had quietly
   // become `ALL TABLES` would otherwise pass every assertion above.
   // pgvector lives in `public` (migration 015 says why), and every vector

@@ -169,3 +169,57 @@ test("watch heartbeat is bounded, non-overlapping, and stops its request", async
   assert.equal(aborted, true);
   assert.equal(calls, 1);
 });
+
+// ADM-9 follow-up. `ping` swallowed every failure with a bare `catch {}`, and
+// that hid a real incident on the owner's host: a watcher whose `watcherId` no
+// longer matches the registered one is answered `identity_review_required` on
+// every tick forever, passes keep completing because no other operation in the
+// protocol carries a `watcherId`, and the only symptom is `last_seen_at`
+// frozen at the moment the journal was recreated. The refusal now names itself
+// -- once per process, because at 30 seconds a repeating line is a log nobody
+// reads and this condition never clears on its own.
+//
+// One test for both failure shapes, because the "once" is a module-level fact
+// about the process and splitting it in two would make the second test depend
+// on the first having run. `ping` is reached directly: `private` is a
+// TypeScript-only marker and this suite drives the compiled class.
+test("a refused heartbeat says so once and keeps beating", async () => {
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => {
+    const line = args.join(" ");
+    if (line.includes("watcher heartbeat is not being accepted"))
+      warnings.push(line);
+  };
+  let calls = 0;
+  let mode = "refused";
+  const heartbeat = new WatchHeartbeat(
+    config,
+    {
+      call: async () => {
+        calls += 1;
+        if (mode === "thrown")
+          throw new Error("worker request could not be completed");
+        return { error: { code: "identity_review_required" } };
+      },
+    },
+    watcherId,
+  );
+  try {
+    await heartbeat.ping();
+    assert.equal(calls, 1);
+    assert.equal(warnings.length, 1, "the refusal is reported");
+    assert.match(warnings[0], /identity_review_required/);
+    assert.match(warnings[0], /re-registered/);
+
+    // Every refusal after it is silent, and the loop has not stopped.
+    await heartbeat.ping();
+    mode = "thrown";
+    await heartbeat.ping();
+    assert.equal(calls, 3, "the heartbeat keeps trying");
+    assert.equal(warnings.length, 1, "and does not repeat itself");
+  } finally {
+    heartbeat.stop();
+    console.warn = originalWarn;
+  }
+});

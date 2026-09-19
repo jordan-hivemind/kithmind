@@ -27,6 +27,7 @@ import {
 import {
   getWorkerDiagnosticsStatus,
   recordWorkerHeartbeat,
+  recordWorkerPassOutcome,
 } from "./diagnostics.js";
 import { admitDiscoveryUtf8, reserveDiscoveryWork } from "./discovery.js";
 import {
@@ -88,6 +89,8 @@ export async function dispatchWorkerRequest(
         return getWorkerDiagnosticsStatus(ctx, principal, request);
       case "diagnostics.heartbeat":
         return recordWorkerHeartbeat(ctx, principal, request);
+      case "diagnostics.passOutcome":
+        return recordWorkerPassOutcome(ctx, principal, request);
       case "archive.forgetTargets":
         return getArchiveForgetTargets(ctx, principal, request);
       case "archive.ackDeletion":

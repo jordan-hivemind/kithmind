@@ -19,6 +19,7 @@
 
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
+import { readdirSync, readFileSync } from "node:fs";
 import test from "node:test";
 
 import pg from "pg";
@@ -65,6 +66,26 @@ const GRANTED = Object.freeze({
     "corrections",
   ],
   extraction: ["document_extractions"],
+  // ADM-9. The worker protocol's own tables. Thirteen of them were in no
+  // group at all, including the watcher row two diagnostics operations write
+  // and `source_accounts`, which every epoch bump in the protocol goes
+  // through. `WORKER_WRITE_PATH` below is the assertion that keeps the list
+  // honest as handlers are added; this group is the grant it checks.
+  worker: [
+    "source_accounts",
+    "space_processing_state",
+    "worker_source_scans",
+    "worker_scan_pages",
+    "worker_reservation_receipts",
+    "worker_reservation_targets",
+    "worker_operation_receipts",
+    "worker_binary_operation_receipts",
+    "worker_parsed_stages",
+    "worker_processing_assessments",
+    "worker_watcher_states",
+    "worker_operational_incidents",
+    "worker_watcher_reset_receipts",
+  ],
 });
 
 /**
@@ -90,6 +111,37 @@ const EXTRACTION_WRITE_PATH = Object.freeze([
   "document_extractions",
   "corrections",
 ]);
+
+/**
+ * Every `kith` table a worker operation writes, read out of the handlers
+ * themselves (ADM-9, first review finding 3).
+ *
+ * A hand-maintained list is the thing that went wrong here: thirteen tables
+ * the worker protocol writes were in no GRANT group, and nothing said so,
+ * because every test in the repository runs as the owner role. So this list
+ * is not maintained -- it is derived, from every INSERT, UPDATE and DELETE
+ * naming a `kith.` table anywhere in `src/workers/`. A handler that starts
+ * writing a new table fails this suite until the grant follows it.
+ *
+ * Deliberately coarse. It over-approximates (a table named in a rolled-back
+ * statement or a dead branch still counts) and that is the right direction to
+ * be wrong in: an extra grant on a table the app already reads is cheap, and a
+ * missing one is a 42501 in production and nowhere else.
+ */
+function workerWritePath() {
+  const directory = new URL("../src/workers/", import.meta.url);
+  const tables = new Set();
+  for (const entry of readdirSync(directory)) {
+    if (!entry.endsWith(".ts")) continue;
+    const source = readFileSync(new URL(entry, directory), "utf8");
+    for (const match of source.matchAll(
+      /(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+kith\.([a-z_]+)/gs,
+    )) {
+      tables.add(match[1]);
+    }
+  }
+  return [...tables].sort();
+}
 
 /** Tables no application write may reach. The control for the list above. */
 const WITHHELD = Object.freeze(["schema_version", "proof_spaces", "proof_api_keys"]);
@@ -372,6 +424,30 @@ test(
               `${group}: ${privilege} on kith.${table}`,
             );
           }
+        }
+      }
+
+      // Every table a worker operation writes, derived from the handlers.
+      // This is the assertion the first review of ADM-9 asked for: the worker
+      // protocol runs entirely on this credential, and until now most of its
+      // tables had no grant and no test that would have said so.
+      const workerTables = workerWritePath();
+      assert.ok(
+        workerTables.length > 20,
+        "the worker write path was not derived; the source directory moved",
+      );
+      for (const table of workerTables) {
+        for (const privilege of ["INSERT", "UPDATE", "DELETE", "SELECT"]) {
+          assert.equal(
+            (
+              await app.query("SELECT has_table_privilege($1, $2) AS granted", [
+                `kith.${table}`,
+                privilege,
+              ])
+            ).rows[0].granted,
+            true,
+            `worker write path: ${privilege} on kith.${table}`,
+          );
         }
       }
 

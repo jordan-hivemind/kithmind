@@ -1694,7 +1694,11 @@ test("a missing known root fails before any mutating request", async () => {
       transport,
     ).runSafely();
     assert.equal(result.state, "failed");
-    assert.deepEqual(operations, ["source.status"]);
+    // Nothing that could change what the server holds about this account. The
+    // report of how the pass ended (ADM-9) is the one write, and it is sent
+    // after the pass is already decided; the scan, the inventory and the
+    // reconcile are all untouched.
+    assert.deepEqual(operations, ["source.status", "diagnostics.passOutcome"]);
     assert.equal(journal.checkpoint.phase, "terminal");
   } finally {
     await journal.close();
@@ -5797,6 +5801,24 @@ function identityTransport({ failAt, entries, requests }) {
   return {
     async call(request) {
       requests.push(request);
+      // ADM-9. Every pass reports how it ended, including the ones that never
+      // open a scan. `failAt: "passOutcome"` is the server that refuses it --
+      // an old one answering an unknown operation -- as the safe error
+      // envelope a real server sends, which the transport returns rather than
+      // throws.
+      if (request.operation === "diagnostics.passOutcome") {
+        if (failAt === "passOutcome") {
+          return { error: { code: "invalid_request" } };
+        }
+        return {
+          operation: "diagnostics.passOutcome",
+          sourceAccountId: "source",
+          watcherId: request.watcherId,
+          finishedAt: request.finishedAt,
+          unhealthySince:
+            request.state === "complete" ? null : request.finishedAt,
+        };
+      }
       if (request.operation === "source.status") {
         return {
           operation: "source.status",
@@ -5920,6 +5942,7 @@ async function identityPass({
       entries,
       asked,
       askedByRoot,
+      requests,
       bindings: journal.checkpoint.bindings,
     };
   } finally {
@@ -7124,6 +7147,104 @@ test("a root that is still watched but has lost its contents refuses", async () 
     assert.equal(pass.result.code, "root_contents_collapsed");
     assert.equal(pass.mode, undefined, "the scan never opened");
     assert.equal(pass.bindings.length, 41, "and nothing was forgotten");
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+// ADM-9. A refused pass writes no scan and so no processing assessment, and
+// those are the only two things the health screen reads about a watcher
+// besides the heartbeat. So the refusal has to travel on its own, or a watcher
+// that refuses every pass keeps heartbeating and reads as healthy.
+test("a refused pass tells the server how it ended", async () => {
+  const setup = await fixture(0);
+  await writeFile(join(setup.root, "statement.txt"), "synthetic");
+  const remembered = [
+    {
+      rootAlias: "fixture",
+      relativePath: "statement.txt",
+      externalId: randomUUID(),
+    },
+    ...Array.from({ length: 40 }, (_, index) => ({
+      rootAlias: "fixture",
+      relativePath: `gone-${index}.txt`,
+      externalId: randomUUID(),
+    })),
+  ];
+  try {
+    const pass = await identityPass({
+      setup,
+      bindings: remembered,
+      providers: [],
+    });
+    assert.equal(pass.result.code, "root_contents_collapsed");
+    assert.equal(pass.mode, undefined, "the scan never opened");
+    const reported = pass.requests.filter(
+      (row) => row.operation === "diagnostics.passOutcome",
+    );
+    assert.equal(reported.length, 1);
+    assert.equal(reported[0].state, "incomplete");
+    assert.equal(reported[0].code, "root_contents_collapsed");
+    assert.equal(reported[0].scanned, 0);
+    assert.equal(reported[0].published, 0);
+    assert.equal(typeof reported[0].finishedAt, "number");
+    assert.equal(reported[0].spaceId, setup.config.spaceId);
+    assert.equal(reported[0].sourceAccountId, setup.config.sourceAccountId);
+
+    // And a server that refuses the report -- an old one that has never heard
+    // of the operation, or one that is simply unreachable -- leaves the pass
+    // exactly as it was. The owner's watcher runs behind on purpose, so this
+    // is the ordinary case and not an error.
+    //
+    // It is also said once per process and not once per pass (first review,
+    // finding 4): a server that will never accept the operation refuses every
+    // report there will ever be, and a five-minute watch loop would write the
+    // same line forever. The assertion is about the *second* refusal rather
+    // than a count from zero, because any earlier test in this file may
+    // already have latched the warning.
+    // Only this warning: a refused pass writes two of its own, about the
+    // folder list and about the refusal itself, and both are meant to repeat.
+    const warnings = [];
+    const originalWarn = console.warn;
+    console.warn = (...args) => {
+      const line = args.join(" ");
+      if (line.includes("pass outcome could not be reported"))
+        warnings.push(line);
+    };
+    let refusedReport;
+    let repeated;
+    try {
+      refusedReport = await identityPass({
+        setup,
+        bindings: remembered,
+        providers: [],
+        failAt: "passOutcome",
+      });
+      const afterFirst = warnings.length;
+      assert.ok(
+        afterFirst <= 1,
+        "a refused report says so at most once per process",
+      );
+      repeated = await identityPass({
+        setup,
+        bindings: remembered,
+        providers: [],
+        failAt: "passOutcome",
+      });
+      assert.equal(
+        warnings.length,
+        afterFirst,
+        "and says nothing at all on the refusals after it",
+      );
+    } finally {
+      console.warn = originalWarn;
+    }
+    assert.deepEqual(refusedReport.result, pass.result);
+    assert.deepEqual(repeated.result, pass.result);
+    assert.deepEqual(
+      refusedReport.bindings.map((row) => row.externalId).sort(),
+      remembered.map((row) => row.externalId).sort(),
+    );
   } finally {
     await rm(setup.base, { recursive: true, force: true });
   }

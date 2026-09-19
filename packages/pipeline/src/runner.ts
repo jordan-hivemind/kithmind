@@ -902,10 +902,40 @@ function records(value: unknown, label: string): Record<string, unknown>[] {
   return value as Record<string, unknown>[];
 }
 
+/** ADM-9. `WORKER_PASS_CODE` in the protocol, applied before the send. */
+const PASS_CODE = /^[a-z0-9_]{1,64}$/;
+
+/**
+ * ADM-9. The pass-outcome report's own deadline, well under the transport's
+ * 30s: it runs after the pass is already decided, so every second of it is a
+ * second added to the pass's return and to a SIGTERM shutdown.
+ */
+const PASS_OUTCOME_TIMEOUT_MS = 5_000;
+
+/**
+ * ADM-9. Said once per process, not once per pass.
+ *
+ * A server that will never accept this operation -- one running older code
+ * than the watcher -- refuses every report there will ever be. Warning on each
+ * one turns a five-minute watch loop into a log nobody reads.
+ */
+let passOutcomeWarned = false;
+function warnPassOutcomeOnce(reason: string): void {
+  if (passOutcomeWarned) return;
+  passOutcomeWarned = true;
+  console.warn(
+    `[pipeline] the pass outcome could not be reported (${reason}); not repeating this warning`,
+  );
+}
+
 function request(
   config: PipelineConfig,
   operation:
-    JournalOperation | "source.status" | "source.roots" | "source.rootReport",
+    | JournalOperation
+    | "source.status"
+    | "source.roots"
+    | "source.rootReport"
+    | "diagnostics.passOutcome",
   extra: Record<string, unknown> = {},
 ): Record<string, unknown> {
   return {
@@ -7485,9 +7515,73 @@ export class PipelineRunner {
     throw new PipelineWorkerError("worker_step_limit");
   }
 
+  /**
+   * ADM-9. Tells the server how this pass ended.
+   *
+   * One send, from the one place every pass ends, rather than a send per
+   * terminal branch. The refusal path is why this exists -- `refuseRetirement`
+   * returns before a scan is opened, so the pass writes no scan and no
+   * processing assessment, and the health screen reads only those two things
+   * plus the heartbeat -- but a `failed` pass and every other terminal code
+   * were just as invisible, so all of them travel through here.
+   *
+   * Never changes the pass result, ever. The result is already decided when
+   * this runs; the send is best-effort, and an old server that has never heard
+   * of the operation answers `invalid_request`, which is the ordinary case
+   * while the owner's watcher runs behind and not an error.
+   *
+   * Two bounds the first review asked for, both about not making a healthy
+   * pass wait on this. The send gets `PASS_OUTCOME_TIMEOUT_MS` of its own
+   * rather than the transport's 30s, because it runs on the way out of every
+   * pass and on the way to a SIGTERM shutdown. And it says so once per process
+   * rather than once per pass: a server that will never accept this operation
+   * would otherwise write the same line every five minutes forever, which is
+   * how a real warning goes unread.
+   */
+  private async reportPassOutcome(result: PipelineRunResult): Promise<void> {
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(),
+      PASS_OUTCOME_TIMEOUT_MS,
+    );
+    try {
+      const response = await this.transport.call(
+        request(this.config, "diagnostics.passOutcome", {
+          watcherId: this.journal.watcherId,
+          state: result.state,
+          // The codes are the pipeline's own literals, but the wire pattern is
+          // narrower than `string`; a code that does not fit is dropped rather
+          // than being allowed to make the whole report invalid.
+          ...(result.code !== undefined && PASS_CODE.test(result.code)
+            ? { code: result.code }
+            : {}),
+          scanned: result.scanned ?? 0,
+          published: result.published ?? 0,
+          finishedAt: Date.now(),
+        }),
+        controller.signal,
+      );
+      // A refused report is a returned error envelope, not a throw, so the
+      // quiet case needs looking at rather than catching.
+      if (response && typeof response === "object" && "error" in response) {
+        warnPassOutcomeOnce(
+          (response as { error: { code: string } }).error.code,
+        );
+      }
+    } catch (error) {
+      warnPassOutcomeOnce(
+        error instanceof Error ? error.message : "unknown error",
+      );
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
   async runSafely(): Promise<PipelineRunResult> {
     try {
-      return await this.run();
+      const result = await this.run();
+      await this.reportPassOutcome(result);
+      return result;
     } catch (error) {
       const code =
         error instanceof FilesystemFailure ||
@@ -7512,11 +7606,13 @@ export class PipelineRunner {
         process.stderr.write(`${JSON.stringify(detail)}\n`);
         await this.journal.recordFailure(detail);
       }
-      return this.withParked({
+      const failure = this.withParked({
         state:
           error instanceof PipelineRetryableError ? "incomplete" : "failed",
         code,
       });
+      await this.reportPassOutcome(failure);
+      return failure;
     }
   }
 }
