@@ -10,8 +10,9 @@ Do not require `docs/private/` to contribute. It is intentionally untracked
 and is absent from public clones.
 
 1. Read the public architecture and the issue or plan that defines the work.
-2. Work on a focused branch named `task/<id>` (or `codex/<topic>` when no task
-   ID exists).
+2. Small docs-only changes may go straight to `main`. Everything else goes
+   through a pull request on a short-lived branch named `task/<id>` (or
+   `<topic>` when no task ID exists), deleted after merge.
 3. Do not add real personal, family, health, financial, account, credential,
    or production data to the repository. Use synthetic fixtures.
 4. Run the relevant checks. Before requesting review for a code change, run:
@@ -98,7 +99,8 @@ public issue or plan.
 Before any Vercel operation, verify the authenticated Vercel identity and the
 intended team and project in that same credential context. State the intended
 scope explicitly in the command or operation; do not infer it from the current
-directory, a previous login, or a cached project link. Do not put personal
+directory, a previous login, or a cached project link. The owner uses
+separate personal and business accounts. Do not put personal
 emails, team names, or project IDs in public files.
 
 ### Standing pre-launch deployment approval
@@ -112,15 +114,6 @@ owner revokes it or declares the system live. Keep development-first migration
 checks, required tests, independent security review, and deployment verification.
 This approval does not apply to upstream or other contributors' deployments.
 
-The required verification commands are:
-
-```
-pnpm lint
-pnpm check-types
-pnpm test:once
-pnpm build
-```
-
 ## Conventions
 
 - Keep plans in `docs/plans/`, dated and consistent with implemented behavior.
@@ -128,21 +121,7 @@ pnpm build
 - Use conventional commits (`feat:`, `fix:`, `docs:`, `tracker:`) with a body
   that explains why.
 
-## Shared boundary coordination
-
-For shared archive boundaries, layout, decimal or identity conventions, and typed
-contracts, read GitHub Issue 57 in `jordan-hivemind/kithmind` before work, after
-landing, and when blocked. Keep ordinary changes within a workstream in that
-workstream's PR. Sign coordination updates with the workstream and date, and
-correct inaccurate claims in issue bodies that you introduced. GitHub does not
-push notifications to the agents. Use these checkpoints and any configured
-heartbeat to poll; post actionable boundary updates directly on the issue.
-
-Before every Vercel operation, verify the live account, team, and project against
-the owner deployment configuration, using the same credentials for verification
-and execution. The owner uses separate personal and business accounts. Never
-assume the CLI is still signed into the correct account; keep owner account
-identifiers in private configuration, outside this public repository.
+## Archive writers
 
 Before an archive-root relocation, or a change to an archive writer’s runtime
 or dependencies, identify and quiesce the affected archive writers, including
