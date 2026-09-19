@@ -159,6 +159,68 @@ export function ImportDrawer({
               </tbody>
             </table>
 
+            {preview.topLineCheck === null ? null : (
+              <table className="w-full text-[11px]">
+                <caption className="pb-1 text-left text-gray-500">
+                  The sheet&apos;s own Total row, line {preview.topLineCheck.line}
+                </caption>
+                <tbody>
+                  {(
+                    ["committed", "sent", "received"] as const
+                  ).map((field) => {
+                    const check = preview.topLineCheck![field];
+                    return (
+                      <tr key={field} className="border-b border-gray-100">
+                        <td className="h-row capitalize">{field}</td>
+                        <td className="h-row text-right tabular-nums">
+                          {check.totalRow ?? "—"}
+                        </td>
+                        <td className="h-row text-right tabular-nums text-gray-500">
+                          rows sum to {check.summarySum}
+                          {check.ledgerSum === null
+                            ? ""
+                            : `, Ledger sums to ${check.ledgerSum}`}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+
+            {preview.ledgerOnlyInvestments.length === 0 ? null : (
+              <div className="flex flex-col gap-0.5">
+                <p className="text-[11px] font-medium text-gray-700">
+                  In the Ledger but not the Summary
+                </p>
+                {preview.ledgerOnlyInvestments.map((name) => (
+                  <p
+                    key={name}
+                    className="rounded-tag border border-gray-200 px-1.5 py-0.5 text-[11px] text-gray-500"
+                  >
+                    {name} — created with no commitment
+                  </p>
+                ))}
+              </div>
+            )}
+
+            {preview.sentWithNoLedgerRows.length === 0 ? null : (
+              <div className="flex flex-col gap-0.5">
+                <p className="text-[11px] font-medium text-gray-700">
+                  Sent amount has no Ledger rows
+                </p>
+                {preview.sentWithNoLedgerRows.map((row) => (
+                  <p
+                    key={row.investmentName}
+                    className="rounded-tag border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[11px] text-amber-800"
+                  >
+                    {row.line}: {row.investmentName} — sheet says sent{" "}
+                    {row.amount} USD
+                  </p>
+                ))}
+              </div>
+            )}
+
             {preview.reconciliation.map((row) => (
               <p
                 key={`${row.investmentName}:${row.field}`}
