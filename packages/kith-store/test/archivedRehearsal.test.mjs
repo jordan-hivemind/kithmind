@@ -25,6 +25,7 @@ import test from "node:test";
 
 import { createKithPool, newKithId } from "../dist/index.js";
 import {
+  installFakeDropbox,
   rehearsalConfig,
   rehearsalPass,
   rehearsalProfile,
@@ -453,5 +454,132 @@ test(
         "and its own archived parser output",
       );
     }
+  },
+);
+
+// P2-104e. The owner's source is a provider-original source: the original
+// lives in Dropbox and a `provider_original_v1` reference stands where its
+// backup receipt would. The rehearsal above never had one, and the live pass
+// failed on exactly that: `lease_conflict`, one attempt spent, nothing
+// published. A re-queued provider document walked to `admit`, was sent back to
+// `lookup_original` with its live lease dropped, and was refused at the second
+// `reserve` by its own lease.
+test(
+  "a provider-original source re-processes under a changed extraction configuration, and a held lease defers one document instead of failing the pass",
+  { skip },
+  async (t) => {
+    const f = await fixture(t);
+    const transport = inProcessWorkerTransport(f.pool, {
+      userId: f.userId,
+      credentialId: f.credential.id,
+    });
+    const workspace = await rehearsalWorkspace(t, { documents: DOCUMENTS });
+    installFakeDropbox(t, workspace);
+    const pass = (runtime) => ({
+      config: rehearsalConfig({
+        endpoint: "http://127.0.0.1:0/api/worker",
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        workspace,
+        runtime,
+        provider: true,
+      }),
+      credential: f.credential.rawKey,
+      transport,
+      runtime,
+    });
+    const providerReferences = async () =>
+      (
+        await f.client.query(
+          `SELECT g.original_provider_reference_id AS id
+             FROM kith.source_items i
+             JOIN kith.processing_generations g ON g.id = i.active_generation_id
+            WHERE i.source_account_id = $1 ORDER BY i.id`,
+          [f.sourceAccountId],
+        )
+      ).rows.map((row) => row.id);
+
+    const profileA = rehearsalProfile({ mapping: "docling_utf16_pages_v2" });
+    const first = await rehearsalUntilSettled(pass(profileA));
+    assert.equal(first.at(-1).state, "complete", JSON.stringify(first));
+    const referencesA = await providerReferences();
+    assert.equal(referencesA.length, DOCUMENTS);
+    for (const id of referencesA) assert.ok(id, "a provider original");
+    const extractionA = new Set(
+      (await activeGenerations(f)).map((row) => row.extraction_fingerprint),
+    );
+
+    // The live shape: a failed pass under the new configuration left its
+    // never-activated row behind and one work row leased, expired, one
+    // attempt spent.
+    const profileB = rehearsalProfile({ mapping: "docling_utf16_pages_v3" });
+    const stranded = await strandOneWorkRow(f, pass(profileB), transport);
+    // And one more document whose lease is still live: an earlier pass of
+    // this same worker died holding it a minute ago.
+    const { rows: held } = await f.client.query(
+      `UPDATE kith.worker_discovery_work
+          SET state = 'leased', attempts = 1, lease_epoch = 1,
+              lease_token = $2, lease_owner_credential_id = $3,
+              lease_expires_at = transaction_timestamp() + interval '1 hour'
+        WHERE id = (SELECT id FROM kith.worker_discovery_work
+                     WHERE source_account_id = $1 AND state = 'queued'
+                     ORDER BY created_at DESC, id DESC LIMIT 1)
+        RETURNING id`,
+      [f.sourceAccountId, randomBytes(32).toString("hex"), f.credential.id],
+    );
+    assert.equal(held.length, 1);
+
+    const deferred = await rehearsalPass(pass(profileB));
+    assert.deepEqual(
+      deferred,
+      {
+        state: "incomplete",
+        code: "processing_incomplete",
+        scanned: DOCUMENTS,
+        published: DOCUMENTS - 1,
+      },
+      "every other document published; the held one waited, and the pass says so",
+    );
+    const after = new Map((await workRows(f)).map((row) => [row.id, row]));
+    assert.equal(after.get(held[0].id).state, "leased");
+    assert.equal(
+      Number(after.get(held[0].id).attempts),
+      1,
+      "a refused reserve spends no attempt",
+    );
+    assert.ok(
+      Number(after.get(stranded).attempts) <= 2,
+      "the expired lease was reclaimed once",
+    );
+
+    await f.client.query(
+      `UPDATE kith.worker_discovery_work
+          SET lease_expires_at = transaction_timestamp() - interval '1 minute'
+        WHERE id = $1`,
+      [held[0].id],
+    );
+    const rest = await rehearsalUntilSettled(pass(profileB));
+    assert.deepEqual(rest, [
+      { state: "complete", scanned: DOCUMENTS, published: 1 },
+      { state: "complete", scanned: DOCUMENTS, published: 0 },
+    ]);
+
+    const reprocessed = await activeGenerations(f);
+    assert.equal(reprocessed.length, DOCUMENTS);
+    for (const row of reprocessed) {
+      assert.equal(row.state, "ready");
+      assert.equal(row.publication_state, "active");
+      assert.ok(!extractionA.has(row.extraction_fingerprint));
+    }
+    assert.deepEqual(
+      await providerReferences(),
+      referencesA,
+      "the bound provider reference was selected, not declared again",
+    );
+    for (const row of await workRows(f)) {
+      assert.ok(["admitted", "obsolete"].includes(row.state));
+      assert.ok(Number(row.attempts) <= 2, `attempts: ${row.attempts}`);
+    }
+    assert.equal(await assessment(f), "complete");
   },
 );

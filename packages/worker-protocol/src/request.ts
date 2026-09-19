@@ -350,6 +350,16 @@ export type WorkerRequest =
       archives: ArchiveReceiptSelection[];
       parsedText: ParsedTextDeclaration;
       providerOriginal?: ProviderOriginalDeclaration;
+      /**
+       * P2-104e. Select the provider original reference already bound to this
+       * revision instead of declaring it again. A declaration is keyed to the
+       * admission that created it, so a second processing generation over the
+       * same bytes can never reproduce it; it names the bound reference, as
+       * `kind: "existing"` does for an archive receipt. Exclusive with
+       * `providerOriginal`, and like it stands in for the original's
+       * independent backup receipt.
+       */
+      existingProviderOriginal?: { referenceId: string; bindingEpoch: number };
     })
   | (WorkerSourceRequest & {
       operation: "jobs.reserve";
@@ -2179,9 +2189,31 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
           "archives",
           "parsedText",
         ],
-        ["providerOriginal"],
+        ["providerOriginal", "existingProviderOriginal"],
       );
-      const provider = input.providerOriginal !== undefined;
+      if (
+        input.providerOriginal !== undefined &&
+        input.existingProviderOriginal !== undefined
+      ) {
+        invalid();
+      }
+      let existingProviderOriginal:
+        { referenceId: string; bindingEpoch: number } | undefined;
+      if (input.existingProviderOriginal !== undefined) {
+        const selected = object(input.existingProviderOriginal);
+        exactKeys(selected, ["referenceId", "bindingEpoch"]);
+        existingProviderOriginal = {
+          referenceId: string(selected.referenceId, { maxUtf16: 256 }),
+          bindingEpoch: integer(
+            selected.bindingEpoch,
+            0,
+            Number.MAX_SAFE_INTEGER,
+          ),
+        };
+      }
+      const provider =
+        input.providerOriginal !== undefined ||
+        existingProviderOriginal !== undefined;
       if (
         !Array.isArray(input.archives) ||
         input.archives.length !== (provider ? 3 : 4)
@@ -2216,13 +2248,16 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
         parserArtifact: parserArtifactSelection(input.parserArtifact),
         archives,
         parsedText: parsedTextDeclaration(input.parsedText),
-        ...(provider
+        ...(input.providerOriginal !== undefined
           ? {
               providerOriginal: providerOriginalDeclaration(
                 input.providerOriginal,
               ),
             }
           : {}),
+        ...(existingProviderOriginal === undefined
+          ? {}
+          : { existingProviderOriginal }),
       };
     }
     case "jobs.reserve":
