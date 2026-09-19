@@ -162,6 +162,21 @@ Point `KITH_DATABASE_URL` at a local PostgreSQL 17 or newer database with the
 `MCP_PUBLIC_ORIGIN` may be `http://localhost:3000` locally; anywhere else it
 has to be HTTPS.
 
+The Postgres-backed tests in `packages/kith-store` and `apps/web` run when
+`KITH_STORE_DATABASE_URL` points at a throwaway server. Each test file applies
+the whole `kith` schema in one transaction, which holds about 2,100 locks, and
+the files run in parallel. PostgreSQL's default lock table fits only about three
+applies at once, so a machine with more cores fails with `53200 out of shared
+memory`. Start the test server with a larger lock table:
+
+```sh
+docker run -d --rm -e POSTGRES_PASSWORD=postgres -p 5432:5432 \
+  pgvector/pgvector:pg17 -c max_locks_per_transaction=1024
+```
+
+A production database applies the schema once at a time and does not need this
+setting.
+
 Never fill in or commit the example file.
 
 ## 2. Create and configure PostgreSQL

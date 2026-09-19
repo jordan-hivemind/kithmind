@@ -85,6 +85,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y postgresql-client-17
           pg_dump --version
+      # Each test file applies the whole kith schema in one transaction
+      # (about 2,100 locks), and the kith-store and web suites run files in
+      # parallel against this server. The default lock table (64 x 100 slots)
+      # fits about three applies, so raise it. A service container cannot take
+      # server flags, and the setting only applies at server start, hence
+      # ALTER SYSTEM and a restart. See docs/self-hosting.md.
+      - name: Raise the test server's lock table
+        run: |
+          psql postgres://postgres:postgres@localhost:5432/postgres \
+            -c "ALTER SYSTEM SET max_locks_per_transaction = 1024"
+          docker restart ${{ job.services.postgres.id }}
+          until pg_isready -h localhost -p 5432; do sleep 1; done
+          test "$(psql postgres://postgres:postgres@localhost:5432/postgres -tAc 'SHOW max_locks_per_transaction')" = 1024
       # No log scraping. FINANCE_ARCHIVE_REQUIRE_DATABASE above makes each
       # suite that needs a database fail to load rather than skip when the URL
       # is missing, so the guarantee lives in the tests instead of in a grep
