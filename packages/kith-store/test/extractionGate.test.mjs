@@ -501,3 +501,143 @@ test("the starter set is well formed and every field name is usable", () => {
   assert.ok(kinds.has("receipt"));
   assert.ok(kinds.has("schedule_k1"));
 });
+
+// ---------------------------------------------------------------------------
+// The amount grammar, as one table.
+//
+// Every adversarial input the reviews of #298, #312, #320 and #323 turned up,
+// with what it must read as or that it must refuse. This table is the spec:
+// a change to `parseAmount` that moves a row here is a change to what the
+// system believes a document says, and should be argued for as one.
+// ---------------------------------------------------------------------------
+
+/** `undefined` means the grammar must refuse the input. */
+const AMOUNT_SPEC = [
+  // Plain amounts.
+  ["12.99", "12.99"],
+  ["1,234.56", "1234.56"],
+  ["1,234,567.89", "1234567.89"],
+  ["USD 42", "42"],
+  ["USD13.20", "13.2"],
+  ["13.20 USD", "13.2"],
+  ["42", "42"],
+
+  // Signs, in every shape a ledger prints one.
+  ["-12.00", "-12"],
+  ["-$42.00", "-42"],
+  ["$-42.00", "-42"],
+  ["250.00-", "-250"],
+  ["(250.00)", "-250"],
+  ["(1,234.56)", "-1234.56"],
+  ["(-5)", undefined],
+  ["(+5)", undefined],
+
+  // Grouping. A single dot group is a decimal point; two or more, or a
+  // decimal comma after them, make it grouping.
+  ["3.499", "3.499"],
+  ["$3.499", "3.499"],
+  ["0.125", "0.125"],
+  ["1.075", "1.075"],
+  ["1.234.567", "1234567"],
+  ["1.234.567,89", "1234567.89"],
+  ["178,20", "178.2"],
+
+  // Whitespace inside one value is a rendering artifact of its column.
+  ["$ 165 .00", "165"],
+  ["$ 10 .80", "10.8"],
+  ["USD 13 .20", "13.2"],
+
+  // Magnitudes are applied, never dropped and never refused.
+  ["2.5M", "2500000"],
+  ["2.5 M", "2500000"],
+  ["$2.5MM", "2500000"],
+  ["1.2K", "1200"],
+  ["3.4B", "3400000000"],
+  ["1,250K", "1250000"],
+  ["0.75bn", "750000000"],
+  ["1.2345M", "1234500"],
+  ["2.5 million", "2500000"],
+  ["40 thousand", "40000"],
+  ["1.5 billions", "1500000000"],
+  ["($2.5M)", "-2500000"],
+  ["2.5mn", "2500000"],
+
+  // A tax or status flag: an allowed letter, exactly two decimals, and
+  // nothing after it. All three conditions, every time.
+  ["12.99T", "12.99"],
+  ["12.99 A", "12.99"],
+  ["1,234.56F", "1234.56"],
+  ["0.50X", "0.5"],
+  ["9.00N", "9"],
+  ["12.5T", undefined],
+  ["1299T", undefined],
+  ["12.99TX", undefined],
+  ["12.99 T 3.00", undefined],
+  // A lone C is a credit marker. Dropping it would lose a sign, so it
+  // refuses rather than storing a charge where the page states a credit.
+  ["45.00 C", undefined],
+
+  // Exponents are not magnitudes and not flags.
+  ["1E5", undefined],
+  ["12.99E5", undefined],
+
+  // Words and units that merely start with a magnitude letter.
+  ["12.99Total", undefined],
+  ["2.5Meters", undefined],
+  ["12.99kg", undefined],
+  ["12.99x2", undefined],
+  ["12.99%", undefined],
+  ["A12.99", undefined],
+  ["1.2e3", undefined],
+  ["about ten dollars", undefined],
+  ["", undefined],
+];
+
+test("the amount grammar reads exactly what the table says", () => {
+  for (const [input, expected] of AMOUNT_SPEC) {
+    assert.equal(
+      parseAmount(input),
+      expected,
+      `${JSON.stringify(input)} must ${
+        expected === undefined ? "refuse" : `read as ${expected}`
+      }`,
+    );
+  }
+});
+
+test("a magnitude token has one value, and it is the scaled one", () => {
+  // The safety property. A suffix understood is only safe if it is understood
+  // everywhere: a quote that offered both 2.5 and 2500000 would let a model
+  // store either under the same citation.
+  assert.deepEqual(amountsInText("Fund size 2.5M"), ["2500000"]);
+  assert.deepEqual(amountsInText("$2.5M"), ["2500000"]);
+  assert.deepEqual(amountsInText("Committed 1.2K total"), ["1200"]);
+  assert.deepEqual(amountsInText("Raised 40 million"), ["40000000"]);
+  // Not a magnitude, so not scaled.
+  assert.deepEqual(amountsInText("Span 2.5Meters"), ["2.5"]);
+  assert.deepEqual(amountsInText("Total 12.99"), ["12.99"]);
+  // And the sign still composes.
+  assert.deepEqual(amountsInText("Loss (2.5M)"), ["-2500000"]);
+});
+
+test("the scaled value is the only one a citation supports", () => {
+  const gateMoney = (value, quote) =>
+    checkValue({
+      valueType: "money",
+      value,
+      candidates: asCandidates(quote),
+      pageText: quote,
+      defaultCurrency: "USD",
+    });
+  // The mirror pair: neither reading may borrow the other's citation.
+  assert.equal(gateMoney("2500000", "Fund size $2.5M").ok, true);
+  assert.deepEqual(gateMoney("2.5", "Fund size $2.5M"), {
+    ok: false,
+    reason: "value_not_in_quote",
+  });
+  assert.equal(gateMoney("2.5", "Fund size $2.5").ok, true);
+  assert.deepEqual(gateMoney("2500000", "Fund size $2.5"), {
+    ok: false,
+    reason: "value_not_in_quote",
+  });
+});

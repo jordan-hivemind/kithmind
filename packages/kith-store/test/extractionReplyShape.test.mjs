@@ -400,16 +400,23 @@ for (const [kind, text, external] of [
         ORDER BY observation_key`,
       [f.spaceId],
     );
+    // ADM-5g: an item's key follows its evidence, so the list is counted.
     assert.deepEqual(
-      stored.map((row) => row.observation_key).sort(),
+      stored
+        .map((row) => row.observation_key)
+        .filter((key) => !key.startsWith("line_items:"))
+        .sort(),
       [
-        "line_items:0",
-        "line_items:1",
         kind === "receipt" ? "purchase_date" : "invoice_date",
         "subtotal",
         "total",
         "vendor",
       ].sort(),
+    );
+    assert.equal(
+      stored.filter((row) => row.observation_key.startsWith("line_items:"))
+        .length,
+      2,
     );
     assert.equal(
       stored.find((row) => row.observation_key === "vendor").value.value,
