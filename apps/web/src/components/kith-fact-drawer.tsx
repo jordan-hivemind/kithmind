@@ -1,15 +1,27 @@
 "use client";
 
-// The edit form for a fact's value. Editing is a correction
-// (`PATCH /api/kith/facts/:id`, `memory.updateFact` with
-// `changeKind: "corrected"`): the old value stays in history, and only the
-// value changes -- subject and predicate are the fact's own and are shown as
-// read-only context, not editable fields.
+// The edit form for a fact's value. Only the value changes -- subject and
+// predicate are the fact's own and are shown as read-only context, not
+// editable fields.
+//
+// Editing goes through the existing versioning path
+// (`PATCH /api/kith/facts/:id`, `memory.updateFact`) under one of its two
+// `changeKind`s, chosen by the "Changed" / "Was wrong" segmented control:
+//
+//   * "Changed" (default): the old value was true once and stays reachable
+//     as history (`status: 'superseded'`).
+//   * "Was wrong": the old value was never true and is withheld even from
+//     history (`status: 'retracted'`).
+//
+// See `memory.UpdateFactArgs`'s own comment for the store-side rule this
+// mirrors. `validFrom` is optional and travels with either choice, though it
+// is most meaningful for "Changed" (when the new value took effect).
 //
 // Only `text`, `date`, `number` and `boolean` values have a form here.
 // `entity` and `datetime` are not offered an Edit action at all (see the
 // browse table's kebab), so this component never has to render one.
 
+import * as Tooltip from "@radix-ui/react-tooltip";
 import { type memory } from "@repo/kith-store";
 import { useEffect, useState } from "react";
 
@@ -26,12 +38,66 @@ export type EditableFactValue = Extract<
   { type: "text" | "date" | "number" | "boolean" }
 >;
 
+export type FactChangeKind = "changed" | "corrected";
+
 export type FactDraft = {
   statement: string;
   subject: string;
   predicate: string;
   value: EditableFactValue;
+  changeKind: FactChangeKind;
+  /** `YYYY-MM-DD`, or empty for none. */
+  validFrom: string;
 };
+
+const CHANGE_KIND_OPTIONS: { value: FactChangeKind; label: string; detail: string }[] = [
+  { value: "changed", label: "Changed", detail: "The old value was true once and stays in history" },
+  { value: "corrected", label: "Was wrong", detail: "The old value was never true and is withheld, even from history" },
+];
+
+/** Square segmented control, matching the browse page's own `Segment`
+ * (`kith-browse.tsx`) but buttons rather than links, and with a tooltip per
+ * option instead of explanatory text. */
+function ChangeKindControl({
+  value,
+  onChange,
+}: {
+  value: FactChangeKind;
+  onChange: (value: FactChangeKind) => void;
+}) {
+  return (
+    <Tooltip.Provider delayDuration={200}>
+      <div className="flex rounded-tag border border-gray-300 text-xs">
+        {CHANGE_KIND_OPTIONS.map((option) => (
+          <Tooltip.Root key={option.value}>
+            <Tooltip.Trigger asChild>
+              <button
+                type="button"
+                aria-pressed={value === option.value}
+                onClick={() => onChange(option.value)}
+                className={`px-3 py-1 ${
+                  value === option.value
+                    ? "bg-accent-600 text-white"
+                    : "bg-white text-gray-700 hover:bg-gray-50"
+                }`}
+              >
+                {option.label}
+              </button>
+            </Tooltip.Trigger>
+            <Tooltip.Portal>
+              <Tooltip.Content
+                sideOffset={4}
+                className="z-50 max-w-xs rounded-tag border border-gray-200 bg-white px-2 py-1 text-xs text-gray-700 shadow-md"
+              >
+                {option.detail}
+              </Tooltip.Content>
+            </Tooltip.Portal>
+          </Tooltip.Root>
+        ))}
+      </div>
+    </Tooltip.Provider>
+  );
+}
 
 export function FactDrawer({
   open,
@@ -43,7 +109,10 @@ export function FactDrawer({
   onOpenChange: (open: boolean) => void;
   initial: FactDraft;
   /** Resolves when the write has been sent. The drawer closes on success. */
-  onSave: (value: EditableFactValue) => Promise<void>;
+  onSave: (
+    value: EditableFactValue,
+    options: { changeKind: FactChangeKind; validFrom?: number },
+  ) => Promise<void>;
 }) {
   const [draft, setDraft] = useState<FactDraft>(initial);
   useEffect(() => {
@@ -54,7 +123,12 @@ export function FactDrawer({
 
   const submit = async () => {
     if (!valid) return;
-    await onSave(draft.value);
+    await onSave(draft.value, {
+      changeKind: draft.changeKind,
+      ...(draft.validFrom === ""
+        ? {}
+        : { validFrom: new Date(`${draft.validFrom}T00:00:00.000Z`).getTime() }),
+    });
     onOpenChange(false);
   };
 
@@ -146,6 +220,18 @@ export function FactDrawer({
             />
           </Field>
         )}
+        <ChangeKindControl
+          value={draft.changeKind}
+          onChange={(changeKind) => setDraft({ ...draft, changeKind })}
+        />
+        <Field label="Effective from">
+          <input
+            type="date"
+            className={inputClass}
+            value={draft.validFrom}
+            onChange={(event) => setDraft({ ...draft, validFrom: event.target.value })}
+          />
+        </Field>
         <div className="flex items-center justify-end gap-2 pt-1">
           <button
             type="button"

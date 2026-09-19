@@ -26,6 +26,7 @@ import { useCallback, useMemo, useState } from "react";
 
 import {
   type EditableFactValue,
+  type FactChangeKind,
   type FactDraft,
   FactDrawer,
 } from "@/components/kith-fact-drawer";
@@ -62,13 +63,22 @@ function editableValue(
   return value.type === "entity" || value.type === "datetime" ? null : value;
 }
 
-function factValueBody(value: EditableFactValue): {
+function factValueBody(
+  value: EditableFactValue,
+  options: { changeKind: FactChangeKind; validFrom?: number },
+): {
   value: unknown;
   unit?: string;
+  changeKind: FactChangeKind;
+  validFrom?: number;
 } {
-  return value.type === "number" && value.unit !== undefined
-    ? { value: value.value, unit: value.unit }
-    : { value: value.value };
+  return {
+    ...(value.type === "number" && value.unit !== undefined
+      ? { value: value.value, unit: value.unit }
+      : { value: value.value }),
+    changeKind: options.changeKind,
+    ...(options.validFrom === undefined ? {} : { validFrom: options.validFrom }),
+  };
 }
 
 function displayedValue(value: EditableFactValue): string {
@@ -164,7 +174,11 @@ function FactsTable({
 }: {
   facts: readonly memory.HydratedFact[];
   includeHistorical: boolean;
-  onEdit: (id: string, value: EditableFactValue) => Promise<void>;
+  onEdit: (
+    id: string,
+    value: EditableFactValue,
+    options: { changeKind: FactChangeKind; validFrom?: number },
+  ) => Promise<void>;
   onRetire: (id: string) => Promise<void>;
 }) {
   const [editing, setEditing] = useState<{
@@ -263,6 +277,8 @@ function FactsTable({
           subject: fact.subject.name,
           predicate: row.predicate,
           value,
+          changeKind: "changed",
+          validFrom: "",
         },
       });
     },
@@ -320,8 +336,8 @@ function FactsTable({
             if (!open) setEditing(null);
           }}
           initial={editing.draft}
-          onSave={async (value) => {
-            await onEdit(editing.id, value);
+          onSave={async (value, options) => {
+            await onEdit(editing.id, value, options);
           }}
         />
       )}
@@ -347,13 +363,18 @@ export function KithBrowse({
 
   const editFact = useOptimisticMutation<
     BrowseData,
-    { id: string; value: EditableFactValue }
+    {
+      id: string;
+      value: EditableFactValue;
+      changeKind: FactChangeKind;
+      validFrom?: number;
+    }
   >({
     queryKey,
-    mutationFn: ({ id, value }) =>
+    mutationFn: ({ id, value, ...options }) =>
       mutateJson(`/api/kith/facts/${id}`, {
         method: "PATCH",
-        body: JSON.stringify(factValueBody(value)),
+        body: JSON.stringify(factValueBody(value, options)),
       }),
     apply: (current, { id, value }) =>
       current.view !== "facts"
@@ -461,8 +482,8 @@ export function KithBrowse({
         <FactsTable
           facts={data.facts}
           includeHistorical={includeHistorical}
-          onEdit={async (id, value) => {
-            await editFact.mutateAsync({ id, value });
+          onEdit={async (id, value, options) => {
+            await editFact.mutateAsync({ id, value, ...options });
           }}
           onRetire={async (id) => {
             await retireFact.mutateAsync(id);

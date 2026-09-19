@@ -141,7 +141,7 @@ describeWithDatabase("/api/kith/facts/[id]", () => {
     ).catch(() => {});
   }, 60_000);
 
-  test("owner may correct a fact's value: the old value stays in history, not erased", async () => {
+  test("owner's edit defaults to changeKind 'changed': the old value stays in history, not erased", async () => {
     const owner = await signedInUser();
     const id = await makeFact(owner, "home_city", "Oakland");
 
@@ -151,19 +151,57 @@ describeWithDatabase("/api/kith/facts/[id]", () => {
     );
     expect(response.status).toBe(200);
     const body = (await response.json()) as { factId: string; operation: string };
-    expect(body.operation).toBe("corrected");
+    expect(body.operation).toBe("superseded");
     expect(body.factId).not.toBe(id);
 
-    const corrected = await getFact(body.factId);
-    expect(corrected).toMatchObject({ status: "current", value: { type: "text", value: "Berkeley" } });
+    const changed = await getFact(body.factId);
+    expect(changed).toMatchObject({ status: "current", value: { type: "text", value: "Berkeley" } });
 
-    // History preserved: the old row survives with its original value.
+    // History preserved: the old row survives, reachable, with its original
+    // value -- 'changed' means the old value was true once, not erased.
     const previous = await getFact(id);
     expect(previous).toMatchObject({
-      status: "retracted",
+      status: "superseded",
       value: { type: "text", value: "Oakland" },
       supersededBy: body.factId,
     });
+  });
+
+  test("changeKind 'corrected' withholds the old value even from history, and validFrom passes through", async () => {
+    const owner = await signedInUser();
+    const id = await makeFact(owner, "home_city", "Oakland");
+    const validFrom = Date.parse("2026-01-01T00:00:00.000Z");
+
+    const response = await PATCH(
+      request(`/${id}`, owner.cookie, "PATCH", {
+        value: "Berkeley",
+        changeKind: "corrected",
+        validFrom,
+      }),
+      on(id),
+    );
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { factId: string; operation: string };
+    expect(body.operation).toBe("corrected");
+
+    const corrected = await getFact(body.factId);
+    expect(corrected).toMatchObject({
+      status: "current",
+      value: { type: "text", value: "Berkeley" },
+      validFrom,
+    });
+
+    // The old value is retracted, not superseded, and withheld even from a
+    // historical read (see the store test for that assertion); it still
+    // survives on its own row, unerased.
+    const previous = await getFact(id);
+    expect(previous).toMatchObject({ status: "retracted", value: { type: "text", value: "Oakland" } });
+
+    const invalid = await PATCH(
+      request(`/${body.factId}`, owner.cookie, "PATCH", { value: "Elsewhere", changeKind: "sideways" }),
+      on(body.factId),
+    );
+    expect(invalid.status).toBe(400);
   });
 
   test("owner may retire a fact: validity ends, nothing is erased", async () => {

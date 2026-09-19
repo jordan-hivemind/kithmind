@@ -586,9 +586,16 @@ export type UpdateThoughtArgs = {
  * nothing extra is needed here for that.
  *
  * Only the fields the edit form offers change. `actionItems` and `summary`
- * carry over from the edited thought untouched, and `isCore` carries over the
- * way every other `transitionMemory` caller's does (the previous thought's
- * own value, since none is passed here).
+ * carry over from the edited thought untouched, and so does everything else
+ * `transitionMemory`'s args accept but this form does not ask about --
+ * `sourceType`, `sourceRef`, `observedAt`, `batchId`, `confidence`,
+ * `validFrom`, `validTo` -- because leaving them off `transitionMemory`'s
+ * call is not "unset", it is a fresh capture's own defaults: an edit would
+ * silently drop the new row's link to whatever document or conversation the
+ * thought came from and reopen a business-time window the owner had closed.
+ * `isCore` is the one exception, and does not need carrying here: it already
+ * carries over inside `transitionMemory` itself (the previous thought's own
+ * value, since none is passed here), the way every other caller's does.
  */
 export async function updateThought(
   ctx: IdentityCtx,
@@ -614,6 +621,13 @@ export async function updateThought(
         actionItems: previous.metadata.actionItems,
         summary: previous.metadata.summary,
       },
+      ...(previous.sourceType === undefined ? {} : { sourceType: previous.sourceType }),
+      ...(previous.sourceRef === null ? {} : { sourceRef: previous.sourceRef }),
+      ...(previous.observedAt === undefined ? {} : { observedAt: previous.observedAt }),
+      ...(previous.batchId === null ? {} : { batchId: previous.batchId }),
+      ...(previous.confidence === undefined ? {} : { confidence: previous.confidence }),
+      ...(previous.validFrom === undefined ? {} : { validFrom: previous.validFrom }),
+      ...(previous.validTo === undefined ? {} : { validTo: previous.validTo }),
     },
     [id],
     "superseded",

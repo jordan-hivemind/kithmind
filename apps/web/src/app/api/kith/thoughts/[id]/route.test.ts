@@ -172,6 +172,47 @@ describeWithDatabase("/api/kith/thoughts/[id]", () => {
     });
   });
 
+  test("content is bounded like a capture, and topics/people are capped rather than rejected", async () => {
+    const owner = await signedInUser();
+    const id = await makeThought(owner, "Bounded edit.");
+
+    const tooLong = await PATCH(
+      request(`/${id}`, owner.cookie, "PATCH", { ...editBody, content: "x".repeat(2_001) }),
+      on(id),
+    );
+    expect(tooLong.status).toBe(400);
+    expect(await tooLong.json()).toMatchObject({
+      error: "Memory content must contain 1-2000 characters",
+    });
+
+    const empty = await PATCH(
+      request(`/${id}`, owner.cookie, "PATCH", { ...editBody, content: "   " }),
+      on(id),
+    );
+    expect(empty.status).toBe(400);
+
+    // At the bound, and untouched by the edit: the row PATCH refused above
+    // must not have changed anything.
+    const unchanged = await getThought(id);
+    expect(unchanged).toMatchObject({ memoryStatus: "current", content: "Bounded edit." });
+
+    const capped = await PATCH(
+      request(`/${id}`, owner.cookie, "PATCH", {
+        ...editBody,
+        content: "x".repeat(2_000),
+        topics: ["a", "b", "c", "d", "e"],
+        people: Array.from({ length: 15 }, (_, i) => `person-${i}`),
+      }),
+      on(id),
+    );
+    expect(capped.status).toBe(200);
+    const { thoughtId } = (await capped.json()) as { thoughtId: string };
+    const edited = await getThought(thoughtId);
+    expect(edited!.content.length).toBe(2_000);
+    expect(edited!.metadata.topics.length).toBe(3);
+    expect(edited!.metadata.people.length).toBe(10);
+  });
+
   test("owner may delete: the row survives, retracted, with its content preserved", async () => {
     const owner = await signedInUser();
     const id = await makeThought(owner, "A thought to be deleted.");

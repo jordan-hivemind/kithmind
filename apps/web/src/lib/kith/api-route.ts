@@ -243,6 +243,16 @@ const VALIDATION_MESSAGES = new Set([
   // and no provenance fields (`sourceRef`, `observedAt`, `batchId`), so the
   // gate's validators for them never run long enough to throw.
   `Memory content must contain 1-${memory.MAX_CAPTURE_CONTENT_CHARS} characters`,
+  // `memory.updateThought`/`deleteThought`/`updateFact`/`retireFact`
+  // (`lib/kith/memory-write.ts`'s `writableThought`/`writableFact` read the
+  // row once to authorize it, and the store re-reads it inside the write to
+  // check it is still current). A second edit or delete that lands between
+  // those two reads throws one of these two bare messages, and without this
+  // entry it fell through to the opaque 500 below instead of the 400 that
+  // lets the UI roll back its optimistic change and show a toast for what is
+  // an ordinary lost-update race, not a server failure.
+  "Current thought not found",
+  "Current fact not found",
 ]);
 
 /**

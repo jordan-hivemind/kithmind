@@ -96,7 +96,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function uniqueStrings(value: unknown, limit: number): string[] {
+/**
+ * Deduplicated, trimmed, 200-characters-per-item, capped at `limit` items.
+ * Exported for `updateThought`'s web route (`api/kith/thoughts/[id]`), which
+ * bounds an edit's `topics`/`people` the same way a capture's metadata
+ * always has (3 topics, 10 people -- see `normalizeThoughtMetadata`) rather
+ * than inventing a second, looser rule for the same two fields.
+ */
+export function uniqueStrings(value: unknown, limit: number): string[] {
   if (!Array.isArray(value)) return [];
   return [
     ...new Set(

@@ -6,6 +6,13 @@
 // `lib/kith/memory-write.ts` applies the same `requireSpaceAccess(write)`
 // rule every other `/api/kith/*` write does, and a thought in a space this
 // principal may not write answers the same "not found" a missing id would.
+//
+// `content` is bounded by `memory.normalizeCaptureContent`, the same 2,000
+// character cap and empty-string refusal `POST .../thoughts/capture` applies
+// -- an edit is not exempt from the bound a fresh capture has always had.
+// `topics`/`people` are bounded by `memory.uniqueStrings`, the same
+// dedup/trim/200-characters-per-item/count-capped (3 topics, 10 people) rule
+// `normalizeThoughtMetadata` uses for a captured thought's own metadata.
 
 import { memory } from "@repo/kith-store";
 
@@ -30,12 +37,8 @@ const THOUGHT_TYPES = new Set<string>([
   "reference",
 ]);
 
-function stringArray(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  return value.every((item): item is string => typeof item === "string")
-    ? value
-    : undefined;
-}
+const MAX_TOPICS = 3;
+const MAX_PEOPLE = 10;
 
 export async function PATCH(
   request: Request,
@@ -45,18 +48,13 @@ export async function PATCH(
   return withPrincipal(request, async ({ ctx, principal }) => {
     const body = await readJsonBody(request);
     if (body === null) return problem(400, "Invalid request");
-    const content = typeof body.content === "string" ? body.content.trim() : "";
     const type = typeof body.type === "string" ? body.type : "";
-    const topics = stringArray(body.topics);
-    const people = stringArray(body.people);
-    if (
-      content === "" ||
-      !THOUGHT_TYPES.has(type) ||
-      topics === undefined ||
-      people === undefined
-    ) {
+    if (typeof body.content !== "string" || !THOUGHT_TYPES.has(type)) {
       return problem(400, "Invalid request", "invalid_input");
     }
+    const content = memory.normalizeCaptureContent(body.content);
+    const topics = memory.uniqueStrings(body.topics, MAX_TOPICS);
+    const people = memory.uniqueStrings(body.people, MAX_PEOPLE);
     const target = await writableThought(ctx, principal, id);
     // The edit is a supersession (see `memory.updateThought`), so it stores
     // under a new id rather than this one. The caller needs that id back to

@@ -715,14 +715,31 @@ export type UpdateFactArgs = {
   value: FactValueInput;
   sourceType?: FactSourceType;
   changeReason?: string;
+  /**
+   * Which of `rememberFact`'s two history branches this edit takes.
+   *
+   * "changed" (the default): the old value was true once and remains
+   * reachable as history -- `status` becomes `superseded`, returned by a
+   * `listFacts({ includeHistorical: true })` read. "corrected": the old
+   * value was never true and is withheld even from history -- `status`
+   * becomes `retracted`, which `isMemoryRetrievable` refuses regardless of
+   * `includeHistorical` (see `lifecycle.ts`). The two are not the same
+   * "stays in history" claim, and a caller that needs the old value
+   * reachable later must pass "changed".
+   */
+  changeKind?: "changed" | "corrected";
+  /** When the new value took effect. Passed through to `rememberFact`
+   * either way; most meaningful for "changed", where it can close the old
+   * value's open window at exactly this point (`safeSupersededValidTo`). */
+  validFrom?: number;
 };
 
 /**
- * Edits one fact through the existing correction path: `rememberFact` with
- * `changeKind: "corrected"`, which retracts the old value (kept in history via
- * `supersedes`/`supersededBy`, never erased -- `status` becomes `retracted`,
- * not deleted) and stores the edited value as a new current fact under the
- * same subject and predicate.
+ * Edits one fact through the existing versioning path: `rememberFact` with
+ * `changeKind` defaulting to "changed" (see `UpdateFactArgs`), which stores
+ * the edited value as a new current fact under the same subject and
+ * predicate and moves the old one to history -- never erased, and never a
+ * second row inserted for the same value twice.
  *
  * `rememberFact` targets a (subject, predicate) tuple, not a fact id -- with
  * `cardinality: "single"` it retires *every* current fact under that tuple,
@@ -731,7 +748,11 @@ export type UpdateFactArgs = {
  * `cardinality: "multiple"` predicate this fact happens to share. Cardinality
  * is a call-time argument to `rememberFact`, never persisted, so it cannot be
  * recovered from the fact row to tell those two cases apart; the guard below
- * refuses rather than guessing.
+ * refuses rather than guessing. The sibling count excludes a value already
+ * past its own `valid_to`: a fact `retireFact` ended stays `status: 'current'`
+ * (see that function's own comment) and must not count as still active here,
+ * or a retired sibling would block every future edit of this predicate
+ * forever.
  */
 export async function updateFact(
   ctx: IdentityCtx,
@@ -748,11 +769,13 @@ export async function updateFact(
   if (!subject || subject.spaceId !== spaceId) {
     throw new Error("Current fact not found");
   }
+  const activeAt = new Date(ctx.now);
   const siblings = await row<{ count: string }>(
     ctx,
     `SELECT count(*) AS count FROM kith.facts
-      WHERE space_id = $1 AND subject_entity_id = $2 AND predicate = $3 AND status = 'current'`,
-    [spaceId, fact.subjectEntityId, fact.predicate],
+      WHERE space_id = $1 AND subject_entity_id = $2 AND predicate = $3 AND status = 'current'
+        AND (valid_to IS NULL OR valid_to > $4)`,
+    [spaceId, fact.subjectEntityId, fact.predicate, activeAt],
   );
   if (Number(siblings?.count ?? "0") > 1) {
     throw new Error(
@@ -771,7 +794,8 @@ export async function updateFact(
     sourceType: args.sourceType ?? fact.sourceType,
     ...(fact.isCore === null ? {} : { isCore: fact.isCore }),
     cardinality: "single",
-    changeKind: "corrected",
+    changeKind: args.changeKind ?? "changed",
+    ...(args.validFrom === undefined ? {} : { validFrom: args.validFrom }),
     ...(args.changeReason === undefined ? {} : { changeReason: args.changeReason }),
   });
 }
