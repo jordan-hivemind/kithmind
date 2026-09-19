@@ -228,7 +228,9 @@ export async function addRehearsalRoot(
     };
   };
   for (let index = 0; index < documents; index += 1) {
-    files.push(await write(`${alias}-${index}.pdf`, pdfBytes(`${alias}${index}`)));
+    files.push(
+      await write(`${alias}-${index}.pdf`, pdfBytes(`${alias}${index}`)),
+    );
   }
   const skipped = [];
   if (unsupported) {
@@ -261,7 +263,7 @@ export function rehearsalConfig({
     spaceId,
     sourceAccountId,
     credentialEnv: "SYNTHETIC_WORKER_TOKEN",
-  roots: [
+    roots: [
       { alias: "fixture", path: workspace.root },
       ...workspace.extraRoots.map((root) => ({
         alias: root.alias,
@@ -312,7 +314,8 @@ export function rehearsalConfig({
                       {
                         rootAlias: "fixture",
                         providerRootDirectoryId: PROVIDER_ROOT_ID,
-                        providerRootDirectoryIdHash: sha256Hex(PROVIDER_ROOT_ID),
+                        providerRootDirectoryIdHash:
+                          sha256Hex(PROVIDER_ROOT_ID),
                       },
                       ...workspace.extraRoots.map((root) => ({
                         rootAlias: root.alias,

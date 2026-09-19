@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, realpath } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { basename, join, relative, sep } from "node:path";
 
 import {
   BINARY_CLASSES,
@@ -128,6 +128,7 @@ import {
 } from "./spoolStore.js";
 import { providerRootFor, providerRootsOf } from "./config.js";
 import { Journal } from "./journal.js";
+import { JournalScanCache } from "./scanCache.js";
 import {
   runJournaledCall,
   resumePendingCall,
@@ -420,6 +421,33 @@ function providerBinding(
   const root = providerRootFor(account, rootAlias);
   if (!root) throw new PipelineWorkerError("provider_original_root_mismatch");
   return { ...account, ...root };
+}
+
+/**
+ * ADM-4c review. Whether a remembered item's location is still one this pass
+ * reads: its root is in the list, and inside a selected subtree when the root
+ * has any.
+ */
+function watchedLocation(roots: SafeRoot[], binding: IdentityBinding): boolean {
+  const root = roots.find((candidate) => candidate.alias === binding.rootAlias);
+  if (!root) return false;
+  if (root.includePrefixes === undefined) return true;
+  return root.includePrefixes.some(
+    (prefix) =>
+      binding.relativePath === prefix ||
+      binding.relativePath.startsWith(`${prefix}${sep}`),
+  );
+}
+
+/**
+ * ADM-4c review. How many remembered items may leave the watched set in one
+ * pass before the pass refuses instead: ten, or a quarter of what the journal
+ * remembers, whichever is larger. Ten so a small source can still have a
+ * folder removed on purpose; a quarter so a large one cannot lose a
+ * meaningful share of itself to one bad answer.
+ */
+function retirementCircuitBreaker(remembered: number): number {
+  return Math.max(10, Math.ceil(remembered * 0.25));
 }
 
 /** ADM-4c. What one pass will tell the server about one of its roots. */
@@ -814,10 +842,7 @@ function records(value: unknown, label: string): Record<string, unknown>[] {
 function request(
   config: PipelineConfig,
   operation:
-    | JournalOperation
-    | "source.status"
-    | "source.roots"
-    | "source.rootReport",
+    JournalOperation | "source.status" | "source.roots" | "source.rootReport",
   extra: Record<string, unknown> = {},
 ): Record<string, unknown> {
   return {
@@ -1283,6 +1308,9 @@ export type ProviderFileIdSource = {
 
 export class PipelineRunner {
   private preparedPdfProfile: PreparedPdfDocQaProfile | undefined;
+  /** ADM-4c review: resolved once per pass; see `currentRoots`. */
+  private effectiveRoots: SafeRoot[] | undefined;
+  private pendingRootReports: SourceRootReport[] = [];
   private archiveCatalog: ArchiveCatalog | undefined;
   /** P2-31f: receipts `--operator-clear` has retired in this pass. */
   private operatorClears = 0;
@@ -1305,8 +1333,7 @@ export class PipelineRunner {
      * none at all.
      */
     private readonly providerFileIdSources:
-      | ProviderFileIdSource[]
-      | undefined = undefined,
+      ProviderFileIdSource[] | undefined = undefined,
   ) {}
 
   /**
@@ -1977,11 +2004,11 @@ export class PipelineRunner {
   ): Promise<{ roots: SafeRoot[]; reports: SourceRootReport[] }> {
     const byAlias = new Map(allowed.map((root) => [root.alias, root]));
     const prefixes = new Map<string, string[]>();
+    /** Aliases a row selects whole, which no other row may then narrow. */
+    const whole = new Set<string>();
     const reports: SourceRootReport[] = [];
-    let narrowed = false;
     for (const row of rows) {
       if (row.kind !== "folder") continue;
-      narrowed = true;
       const host = row.rootAlias ? byAlias.get(row.rootAlias) : undefined;
       if (!host) {
         reports.push({ sourceRootId: row.sourceRootId, state: "missing" });
@@ -2018,42 +2045,70 @@ export class PipelineRunner {
         reports.push({ sourceRootId: row.sourceRootId, state: "unreadable" });
         continue;
       }
+      // ADM-4c review: the subtree is named by the path the host actually
+      // has, derived from the resolved directory, never by the row's raw
+      // text. On a case-insensitive filesystem, or one that stores NFD where
+      // the row says NFC, `realpath` succeeds for a spelling discovery never
+      // produces, and a raw-text prefix would then match no file at all --
+      // which reads as every document under the root vanishing.
+      const prefix = relative(host.canonicalPath, resolved);
       reports.push({
         sourceRootId: row.sourceRootId,
         state: "ok",
         rootAlias: host.alias,
-        relativePath,
+        relativePath: prefix,
         ...(row.providerFolderId === undefined
           ? {}
           : { providerFolderId: row.providerFolderId }),
       });
-      // A paused root is read but not narrowed away: leaving it out of the
-      // scan would make the server's reconcile mark every item under it
-      // unavailable, and pausing a folder must not read as deleting it.
-      if (row.state === "paused") continue;
-      if (relativePath === "") prefixes.delete(host.alias);
+      // A paused row still selects its subtree. Only its state is reported.
+      // Dropping it from the selection would leave its items out of the scan,
+      // and the server's reconcile marks anything not in the scan
+      // unavailable, so pausing a folder would read as deleting it.
+      if (prefix === "") whole.add(host.alias);
       else if (prefixes.has(host.alias)) {
-        prefixes.get(host.alias)!.push(relativePath);
-      } else prefixes.set(host.alias, [relativePath]);
+        prefixes.get(host.alias)!.push(prefix);
+      } else prefixes.set(host.alias, [prefix]);
     }
-    if (!narrowed) return { roots: allowed, reports };
-    const covered = new Set(
-      reports
-        .filter((report) => report.state === "ok")
-        .map((report) => report.rootAlias),
-    );
-    const roots = allowed
-      .filter((root) => covered.has(root.alias))
-      .map((root) => {
-        const selected = prefixes.get(root.alias);
-        return selected === undefined
-          ? root
-          : { ...root, includePrefixes: [...new Set(selected)].sort() };
-      });
-    // Every row named a root this host does not have. Reading nothing would
-    // retire the whole source, so the allow-list stands and the reports say
-    // what the host could not find.
-    return { roots: roots.length === 0 ? allowed : roots, reports };
+    // ADM-4c review: rows may only NARROW a root they name. A root no row
+    // names is watched whole, exactly as it is with no rows at all. Dropping
+    // an unnamed root would take every item under it out of the scan, and
+    // `reconcileWorkerScan` is account-wide: the first pass after the owner
+    // adds one folder in the UI would mark every existing document
+    // unavailable. No server answer may ever remove a root from this list.
+    const roots = allowed.map((root) => {
+      const selected = whole.has(root.alias)
+        ? undefined
+        : prefixes.get(root.alias);
+      return selected === undefined || selected.length === 0
+        ? root
+        : { ...root, includePrefixes: [...new Set(selected)].sort() };
+    });
+    return { roots, reports };
+  }
+
+  /**
+   * ADM-4c review. The roots this pass reads, resolved once and reused.
+   *
+   * Every phase that re-enumerates has to see the same set the scan was
+   * planned from. `driveSealCheck` in particular re-discovers and compares
+   * against the sealed manifest: given the allow-list rather than the
+   * selection, it found files the scan deliberately left out and called the
+   * whole scan `unstable`. A pass resumed in a new process re-reads the
+   * server's list, which is right -- a selection that changed mid-pass should
+   * fail the seal check.
+   */
+  private async currentRoots(): Promise<SafeRoot[]> {
+    if (this.effectiveRoots) return this.effectiveRoots;
+    const allowed = await canonicalRoots(this.config);
+    const rows = await this.serverRoots();
+    const plan =
+      rows === undefined
+        ? { roots: allowed, reports: [] as SourceRootReport[] }
+        : await this.resolveServerRoots(allowed, rows);
+    this.effectiveRoots = plan.roots;
+    this.pendingRootReports = plan.reports;
+    return plan.roots;
   }
 
   /** ADM-4c. Tells the server what this pass saw at each of its roots. */
@@ -2132,9 +2187,19 @@ export class PipelineRunner {
     if (this.preparedPdfProfile === undefined) {
       throw new PipelineWorkerError("parser_profile_unverified");
     }
-    return (await discoverSourceObservations(this.config, roots)).map(
-      (observation) => observationPlan(observation, this.config.pdfDocQa!),
-    );
+    // ADM-4c review: the scan cache spares an unchanged file its read and its
+    // hash. It is advisory only; see `scanCache.ts`.
+    const cache = await JournalScanCache.open({
+      journalDir: this.config.journalDir,
+      authority: `${this.config.spaceId}\0${this.config.sourceAccountId}`,
+    }).catch(() => undefined);
+    try {
+      return (await discoverSourceObservations(this.config, roots, cache)).map(
+        (observation) => observationPlan(observation, this.config.pdfDocQa!),
+      );
+    } finally {
+      await cache?.flush();
+    }
   }
 
   private async sameDiscoveredSnapshot(
@@ -2877,6 +2942,37 @@ export class PipelineRunner {
         "identity binding capacity exceeded",
       );
     }
+    const retiring = missingBindings.filter(
+      (binding) => !watchedLocation(roots, binding),
+    ).length;
+    if (retiring > retirementCircuitBreaker(prior.length)) {
+      // ADM-4c review. `reconcileWorkerScan` marks every item not in the scan
+      // unavailable, and it runs over the whole account. So a root that is
+      // simply not in this pass's list is indistinguishable, to the server,
+      // from every file under it being deleted at once. A server answer or a
+      // config edit must never be able to say that by accident.
+      //
+      // Only items whose *location* stopped being watched count here. Files
+      // that vanished from a location this pass still reads are an ordinary
+      // removal and go through as they always have, however many there are.
+      console.warn(
+        `[pipeline] ${retiring} of ${prior.length} remembered items are no longer under any watched root; refusing the scan rather than retiring them`,
+      );
+      await this.journal.transitionCheckpoint({
+        checkpoint: {
+          version: 1,
+          phase: "terminal",
+          outcome: "incomplete",
+          credentialSessionActive: false,
+          code: "root_selection_would_retire_items",
+          scanned: 0,
+          published: 0,
+          bindings: prior,
+        },
+        credentialSessionActive: false,
+      });
+      return [];
+    }
     await this.journal.transitionCheckpoint({
       checkpoint: {
         version: 1,
@@ -3213,7 +3309,7 @@ export class PipelineRunner {
     }
     let health: { status: "healthy" } | { status: "failed"; code: string };
     try {
-      const roots = await canonicalRoots(this.config);
+      const roots = await this.currentRoots();
       health = (await this.sameDiscoveredSnapshot(roots, checkpoint.files))
         ? { status: "healthy" }
         : { status: "failed", code: "unstable" };
@@ -7187,14 +7283,10 @@ export class PipelineRunner {
       this.journal.checkpoint.phase === "idle" ||
       this.journal.checkpoint.phase === "terminal"
     ) {
-      const allowed = await canonicalRoots(this.config);
-      const rows = await this.serverRoots();
-      const plan =
-        rows === undefined
-          ? { roots: allowed, reports: [] as SourceRootReport[] }
-          : await this.resolveServerRoots(allowed, rows);
-      const plans = await this.startCycle(plan.roots, status);
-      if (plan.reports.length > 0) await this.reportRoots(plan.reports, plans);
+      const plans = await this.startCycle(await this.currentRoots(), status);
+      if (this.pendingRootReports.length > 0) {
+        await this.reportRoots(this.pendingRootReports, plans);
+      }
     }
 
     for (let steps = 0; steps < 10_000; steps += 1) {

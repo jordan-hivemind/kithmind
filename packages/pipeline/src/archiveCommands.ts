@@ -1205,7 +1205,11 @@ async function passwordCommandArgument(
   return [command.executable, ...args].map(quoteShellWord).join(" ");
 }
 
-function resticBaseArgs(repository: string, passwordCommand: string, options: readonly string[] = []): string[] {
+function resticBaseArgs(
+  repository: string,
+  passwordCommand: string,
+  options: readonly string[] = [],
+): string[] {
   return [
     "--repo",
     repository,
@@ -1252,20 +1256,44 @@ async function readResticRepositoryIdentity(
 function location(input: ResticRepositoryLocation): ResticRepositoryLocation {
   const local = typeof input.repositoryPath === "string";
   const remote = input.repository !== undefined;
-  if (local === remote) fail("invalid_input", "exactly one restic repository is required");
-  return remote ? { repository: input.repository! } : { repositoryPath: input.repositoryPath! };
+  if (local === remote)
+    fail("invalid_input", "exactly one restic repository is required");
+  return remote
+    ? { repository: input.repository! }
+    : { repositoryPath: input.repositoryPath! };
 }
 
-async function resolveRepository(input: ResticRepositoryLocation, commandLimits: ArchiveCommandLimits): Promise<ResolvedRepository> {
+async function resolveRepository(
+  input: ResticRepositoryLocation,
+  commandLimits: ArchiveCommandLimits,
+): Promise<ResolvedRepository> {
   const selected = location(input);
   if (selected.repositoryPath !== undefined) {
-    const localPath = safeAbsolutePath(selected.repositoryPath, "restic repository");
+    const localPath = safeAbsolutePath(
+      selected.repositoryPath,
+      "restic repository",
+    );
     await safeDirectory(localPath, "restic repository");
     return { locator: localPath, options: [], localPath };
   }
   const remote: RcloneDropboxRepository = selected.repository!;
-  if (remote.kind !== "rclone_dropbox_v1" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(remote.remoteName) || !/^[A-Za-z0-9 _.-]+(?:\/[A-Za-z0-9 _.-]+)+$/.test(remote.rootPath) || /[:\\]/.test(remote.rootPath) || remote.rootPath.split("/").some((part) => !part || part === "." || part === ".." || part.trim() !== part) || !HEX_64.test(remote.configIdentityFingerprint) || !HEX_64.test(remote.expectedRootDirectoryIdHash)) fail("invalid_input", "rclone Dropbox repository is invalid");
-  if (/\s|[\x00-\x1f\x7f]/.test(remote.rcloneBinary)) fail("invalid_input", "rclone binary path is unsafe");
+  if (
+    remote.kind !== "rclone_dropbox_v1" ||
+    !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(remote.remoteName) ||
+    !/^[A-Za-z0-9 _.-]+(?:\/[A-Za-z0-9 _.-]+)+$/.test(remote.rootPath) ||
+    /[:\\]/.test(remote.rootPath) ||
+    remote.rootPath
+      .split("/")
+      .some(
+        (part) =>
+          !part || part === "." || part === ".." || part.trim() !== part,
+      ) ||
+    !HEX_64.test(remote.configIdentityFingerprint) ||
+    !HEX_64.test(remote.expectedRootDirectoryIdHash)
+  )
+    fail("invalid_input", "rclone Dropbox repository is invalid");
+  if (/\s|[\x00-\x1f\x7f]/.test(remote.rcloneBinary))
+    fail("invalid_input", "rclone binary path is unsafe");
   try {
     await verifyDropboxDirectoryBinding({
       rcloneBinary: remote.rcloneBinary,
@@ -1281,17 +1309,34 @@ async function resolveRepository(input: ResticRepositoryLocation, commandLimits:
   const environment = { RCLONE_CONFIG: remote.configPath } as const;
   return {
     locator: `rclone:${remote.remoteName}:${remote.rootPath}`,
-    options: ["-o", `rclone.program=${remote.rcloneBinary}`, "-o", "rclone.args=serve restic --stdio --cache-objects=false"],
+    options: [
+      "-o",
+      `rclone.program=${remote.rcloneBinary}`,
+      "-o",
+      "rclone.args=serve restic --stdio --cache-objects=false",
+    ],
     environment,
-    remoteBoundary: { mode: "independent_backup", readiness: "remote_repository_verified", backend: "rclone_dropbox_v1", remoteName: remote.remoteName, rootPath: remote.rootPath, rootDirectoryIdHash: remote.expectedRootDirectoryIdHash, configIdentityFingerprint: remote.configIdentityFingerprint, resticVersion: RESTIC_VERSION, rcloneVersion: RCLONE_VERSION },
+    remoteBoundary: {
+      mode: "independent_backup",
+      readiness: "remote_repository_verified",
+      backend: "rclone_dropbox_v1",
+      remoteName: remote.remoteName,
+      rootPath: remote.rootPath,
+      rootDirectoryIdHash: remote.expectedRootDirectoryIdHash,
+      configIdentityFingerprint: remote.configIdentityFingerprint,
+      resticVersion: RESTIC_VERSION,
+      rcloneVersion: RCLONE_VERSION,
+    },
   };
 }
 
-async function probeResticRepositoryInternal(input: ResticRepositoryLocation & {
-  resticBinary: string;
-  passwordCommand: PasswordCommand;
-  limits?: ArchiveCommandLimits;
-}): Promise<ResticRepositoryIdentity> {
+async function probeResticRepositoryInternal(
+  input: ResticRepositoryLocation & {
+    resticBinary: string;
+    passwordCommand: PasswordCommand;
+    limits?: ArchiveCommandLimits;
+  },
+): Promise<ResticRepositoryIdentity> {
   const commandLimits = limits(input.limits ?? DEFAULT_ARCHIVE_COMMAND_LIMITS);
   await validateExecutable(input.resticBinary, "restic binary");
   await requireResticVersion(input.resticBinary, commandLimits);
@@ -1497,15 +1542,27 @@ async function decryptAgeRecoveryInternal(
   const commandLimits = limits(input.limits ?? DEFAULT_ARCHIVE_COMMAND_LIMITS);
   if (!HEX_64.test(input.expectedPlaintextSha256))
     fail("invalid_input", "expected plaintext hash is invalid");
-  const expected = expectedFile(input.expectedCiphertext, commandLimits.maxCipherBytes);
+  const expected = expectedFile(
+    input.expectedCiphertext,
+    commandLimits.maxCipherBytes,
+  );
   await validateExecutable(input.ageBinary, "age binary");
   await requireAgeVersion(input.ageBinary, commandLimits);
-  const ciphertextPath = safeAbsolutePath(input.ciphertextPath, "ciphertext path");
+  const ciphertextPath = safeAbsolutePath(
+    input.ciphertextPath,
+    "ciphertext path",
+  );
   const outputPath = safeAbsolutePath(input.outputPath, "recovery output path");
-  const identityPath = safeAbsolutePath(input.identityPath, "recovery identity path");
+  const identityPath = safeAbsolutePath(
+    input.identityPath,
+    "recovery identity path",
+  );
   if (outputPath === ciphertextPath || outputPath === identityPath)
     fail("invalid_input", "recovery paths must differ");
-  const directory = await safeDirectory(dirname(outputPath), "recovery output directory");
+  const directory = await safeDirectory(
+    dirname(outputPath),
+    "recovery output directory",
+  );
   const key = await readExactFile(identityPath, 16 * 1024, true);
   let ciphertext: Awaited<ReturnType<typeof readExactFile>> | undefined;
   let ownedOutput: FileIdentity | undefined;
@@ -1513,29 +1570,67 @@ async function decryptAgeRecoveryInternal(
     const keyStats = await lstat(identityPath);
     if (keyStats.nlink !== 1 || (keyStats.mode & 0o777) !== FILE_MODE)
       fail("unsafe_path", "recovery identity permissions or links are invalid");
-    const lines = decodeUtf8(key.bytes).split(/\r?\n/).filter(line => line && !line.startsWith("#"));
-    if (lines.length < 1 || lines.length > 8 || lines.some(line => !/^AGE-SECRET-KEY-(?:PQ-)?1[0-9A-Z]+$/.test(line)))
-      fail("invalid_input", "only native unencrypted recovery identities are supported");
-    ciphertext = await readExactFile(ciphertextPath, commandLimits.maxCipherBytes, true);
-    if (ciphertext.digest.sha256 !== expected.sha256 || ciphertext.digest.byteLength !== expected.byteLength)
+    const lines = decodeUtf8(key.bytes)
+      .split(/\r?\n/)
+      .filter((line) => line && !line.startsWith("#"));
+    if (
+      lines.length < 1 ||
+      lines.length > 8 ||
+      lines.some((line) => !/^AGE-SECRET-KEY-(?:PQ-)?1[0-9A-Z]+$/.test(line))
+    )
+      fail(
+        "invalid_input",
+        "only native unencrypted recovery identities are supported",
+      );
+    ciphertext = await readExactFile(
+      ciphertextPath,
+      commandLimits.maxCipherBytes,
+      true,
+    );
+    if (
+      ciphertext.digest.sha256 !== expected.sha256 ||
+      ciphertext.digest.byteLength !== expected.byteLength
+    )
       fail("digest_mismatch", "recovery ciphertext identity changed");
     // Feed the key through stdin. No key value or identity path enters argv/env.
-    ownedOutput = await streamAgeOutput(input.ageBinary,
-      ["--decrypt", "--identity", "-", ciphertextPath], key.bytes, outputPath,
-      { ...commandLimits, maxCipherBytes: commandLimits.maxSourceBytes });
+    ownedOutput = await streamAgeOutput(
+      input.ageBinary,
+      ["--decrypt", "--identity", "-", ciphertextPath],
+      key.bytes,
+      outputPath,
+      { ...commandLimits, maxCipherBytes: commandLimits.maxSourceBytes },
+    );
     await recheckFile(ciphertextPath, ciphertext.identity);
-    const plain = await readExactFile(outputPath, commandLimits.maxSourceBytes, true);
+    const plain = await readExactFile(
+      outputPath,
+      commandLimits.maxSourceBytes,
+      true,
+    );
     plain.bytes.fill(0);
-    const after = await safeDirectory(dirname(outputPath), "recovery output directory");
+    const after = await safeDirectory(
+      dirname(outputPath),
+      "recovery output directory",
+    );
     const stats = await lstat(outputPath);
-    if (!sameDirectoryIdentity(directory, after) || stats.nlink !== 1 || (stats.mode & 0o777) !== FILE_MODE || plain.identity.device !== ownedOutput.device || plain.identity.inode !== ownedOutput.inode)
+    if (
+      !sameDirectoryIdentity(directory, after) ||
+      stats.nlink !== 1 ||
+      (stats.mode & 0o777) !== FILE_MODE ||
+      plain.identity.device !== ownedOutput.device ||
+      plain.identity.inode !== ownedOutput.inode
+    )
       fail("unsafe_path", "recovery output identity changed");
     if (plain.digest.sha256 !== input.expectedPlaintextSha256)
       fail("digest_mismatch", "recovered plaintext does not match");
     await dirSync(dirname(outputPath));
-    return { outputPath, plaintext: plain.digest, plaintextDevice: plain.identity.device,
-      plaintextInode: plain.identity.inode, ageVersion: AGE_VERSION,
-      verification: "decrypted_plaintext_hash" };
+    return {
+      outputPath,
+      plaintext: plain.digest,
+      plaintextDevice: plain.identity.device,
+      plaintextInode: plain.identity.inode,
+      ageVersion: AGE_VERSION,
+      verification: "decrypted_plaintext_hash",
+    };
   } catch (error) {
     if (ownedOutput) await unlinkExact(outputPath, ownedOutput);
     throw error;
@@ -1938,12 +2033,17 @@ async function restoreResticSnapshotPathInternal(
   const commandLimits = limits(input.limits ?? DEFAULT_ARCHIVE_COMMAND_LIMITS);
   await validateExecutable(input.resticBinary, "restic binary");
   await requireResticVersion(input.resticBinary, commandLimits);
-  if (!HEX_64.test(input.snapshotId) ||
+  if (
+    !HEX_64.test(input.snapshotId) ||
     typeof input.objectPath !== "string" ||
     Buffer.byteLength(input.objectPath, "utf8") > 4096 ||
     !input.objectPath.startsWith("/") ||
     /[\x00-\x1f\x7f\\]/.test(input.objectPath) ||
-    input.objectPath.slice(1).split("/").some(part => !part || part === "." || part === ".."))
+    input.objectPath
+      .slice(1)
+      .split("/")
+      .some((part) => !part || part === "." || part === "..")
+  )
     fail("invalid_input", "restic restore identity is invalid");
   const expected = expectedFile(
     input.expectedCiphertext,
@@ -2061,7 +2161,10 @@ async function restoreResticSnapshotPathInternal(
     )
       fail("readback_failed", "restore temporary changed");
     const temporaryStats = await handle.stat();
-    if (temporaryStats.nlink !== 1 || (temporaryStats.mode & 0o777) !== FILE_MODE)
+    if (
+      temporaryStats.nlink !== 1 ||
+      (temporaryStats.mode & 0o777) !== FILE_MODE
+    )
       fail("unsafe_path", "restore temporary permissions or links changed");
     await handle.close();
     const currentDirectory = await safeDirectory(
@@ -2101,12 +2204,20 @@ async function restoreResticSnapshotPathInternal(
       await dir.close();
     }
     const publishedStats = await lstat(destinationPath);
-    if (publishedStats.nlink !== 2 || (publishedStats.mode & 0o777) !== FILE_MODE)
+    if (
+      publishedStats.nlink !== 2 ||
+      (publishedStats.mode & 0o777) !== FILE_MODE
+    )
       fail("unsafe_path", "restore publication permissions or links changed");
     await unlinkExact(tempPath, tempIdentity!);
     await dirSync(dirname(destinationPath));
     const finalStats = await lstat(destinationPath);
-    if (finalStats.dev !== tempIdentity.device || finalStats.ino !== tempIdentity.inode || finalStats.nlink !== 1 || (finalStats.mode & 0o777) !== FILE_MODE)
+    if (
+      finalStats.dev !== tempIdentity.device ||
+      finalStats.ino !== tempIdentity.inode ||
+      finalStats.nlink !== 1 ||
+      (finalStats.mode & 0o777) !== FILE_MODE
+    )
       fail("unsafe_path", "restore final identity changed");
     return {
       destinationPath,
@@ -2157,11 +2268,25 @@ async function backupResticObjectInternal(
     input.expectedRepositoryId,
   );
   const boundary = repository.remoteBoundary
-    ? { ...repository.remoteBoundary, repositoryId: repositoryIdentity.repositoryId }
-    : await assessLocalBackupBoundaryInternal(input.primaryArchiveRoot, repository.localPath!, input.backupMode);
+    ? {
+        ...repository.remoteBoundary,
+        repositoryId: repositoryIdentity.repositoryId,
+      }
+    : await assessLocalBackupBoundaryInternal(
+        input.primaryArchiveRoot,
+        repository.localPath!,
+        input.backupMode,
+      );
   if (repository.localPath !== undefined) {
-    const repositoryEntry = await safeDirectory(repository.localPath, "restic repository");
-    if ("backupDevice" in boundary && repositoryEntry.dev !== boundary.backupDevice) fail("unsafe_path", "backup repository device changed");
+    const repositoryEntry = await safeDirectory(
+      repository.localPath,
+      "restic repository",
+    );
+    if (
+      "backupDevice" in boundary &&
+      repositoryEntry.dev !== boundary.backupDevice
+    )
+      fail("unsafe_path", "backup repository device changed");
   }
   const cipherPath = safeAbsolutePath(input.ciphertextPath, "ciphertext path");
   const objectName = basename(cipherPath);
@@ -2309,7 +2434,12 @@ async function recoverResticBackupInternal(
     verification: "destination_ciphertext_readback",
     ...(repository.remoteBoundary === undefined
       ? {}
-      : { boundary: { ...repository.remoteBoundary, repositoryId: repositoryIdentity.repositoryId } }),
+      : {
+          boundary: {
+            ...repository.remoteBoundary,
+            repositoryId: repositoryIdentity.repositoryId,
+          },
+        }),
   };
 }
 
@@ -2531,7 +2661,11 @@ async function forgetResticBackupExactInternal(
     input.expectedRepositoryId,
   );
   const password = await passwordCommandArgument(input.passwordCommand);
-  const baseArgs = resticBaseArgs(repository.locator, password, repository.options);
+  const baseArgs = resticBaseArgs(
+    repository.locator,
+    password,
+    repository.options,
+  );
   const identity = {
     resticBinary: input.resticBinary,
     baseArgs,
@@ -2599,11 +2733,13 @@ export async function probeArchiveTools(
   );
 }
 
-export async function probeResticRepository(input: ResticRepositoryLocation & {
-  resticBinary: string;
-  passwordCommand: PasswordCommand;
-  limits?: ArchiveCommandLimits;
-}): Promise<ResticRepositoryIdentity> {
+export async function probeResticRepository(
+  input: ResticRepositoryLocation & {
+    resticBinary: string;
+    passwordCommand: PasswordCommand;
+    limits?: ArchiveCommandLimits;
+  },
+): Promise<ResticRepositoryIdentity> {
   return publicOperation(() => probeResticRepositoryInternal(input));
 }
 
@@ -2682,9 +2818,11 @@ export async function restoreResticObject(
     if (!OBJECT_NAME.test(input.objectName))
       fail("invalid_input", "restic restore object name is invalid");
     const { objectName, ...shared } = input;
-    const { objectPath: _path, ...restored } = await restoreResticSnapshotPathInternal({
-      ...shared, objectPath: `/${objectName}`,
-    });
+    const { objectPath: _path, ...restored } =
+      await restoreResticSnapshotPathInternal({
+        ...shared,
+        objectPath: `/${objectName}`,
+      });
     return { ...restored, objectName };
   });
 }

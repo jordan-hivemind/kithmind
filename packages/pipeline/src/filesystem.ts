@@ -3,7 +3,10 @@ import { constants, type Stats } from "node:fs";
 import { lstat, open, opendir, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 
-import { SPREADSHEET_V1_BOUNDS } from "@repo/worker-protocol";
+import {
+  SPREADSHEET_V1_BOUNDS,
+  type BinaryMediaType,
+} from "@repo/worker-protocol";
 
 import {
   readWorkbook,
@@ -21,7 +24,61 @@ import type {
 } from "./types.js";
 
 const MAX_VISITED_ENTRIES = 4_096;
+/**
+ * ADM-4c review. Thirty seconds was the whole enumeration's budget and it was
+ * sized for 256 small files. It now scales with the configured ceiling, at
+ * roughly 120ms a file, so a 1024-file pass is not cut off mid-scan and
+ * reported as `enumeration_interrupted` for reasons that are only its size.
+ */
 const FILESYSTEM_DEADLINE_MS = 30_000;
+export function enumerationDeadlineMs(maxFiles: number): number {
+  return Math.min(600_000, Math.max(FILESYSTEM_DEADLINE_MS, maxFiles * 120));
+}
+
+/**
+ * ADM-4c review. What a pass remembers about one file so the next pass need
+ * not read and hash it again.
+ *
+ * The key is the four things that change when a file's bytes do:
+ * `(device, inode, size, mtimeMs)`. All four matching means the same inode,
+ * the same length, written no later than last time -- which is the same
+ * evidence a sync client, `make` and `rsync` act on. The content-hash identity
+ * rules are untouched: a hit supplies the same sha256 the read would have
+ * produced, and every safety check around the read still runs.
+ *
+ * `verifiedAt` is the safety net. An entry older than
+ * `SCAN_CACHE_REHASH_MS` is ignored and the file is read again, so a
+ * filesystem that reuses an inode with identical metadata, or a clock that
+ * moved, costs one stale pass a day rather than forever.
+ */
+export const SCAN_CACHE_REHASH_MS = 24 * 60 * 60 * 1000;
+export type ScanCacheKey = {
+  device: number;
+  inode: number;
+  size: number;
+  mtimeMs: number;
+};
+/** The classification a cache hit stands in for. */
+export type ScanCacheValue =
+  | { kind: "gap"; code: DiscoveryGap["code"] }
+  | {
+      kind: "utf8";
+      sha256: string;
+      byteLength: number;
+      text: string;
+    }
+  | {
+      kind: "binary";
+      sha256: string;
+      byteLength: number;
+      mediaType: BinaryMediaType;
+      permissionsRestricted?: boolean;
+      encryptionRevision?: number;
+    };
+export type ScanCache = {
+  get(key: ScanCacheKey, now: number): ScanCacheValue | undefined;
+  set(key: ScanCacheKey, value: ScanCacheValue, now: number): void;
+};
 export const MAX_DISCOVERED_PDF_BYTES = 16 * 1024 * 1024;
 
 export class FilesystemFailure extends Error {
@@ -287,6 +344,8 @@ type SafeFileBytes = Omit<DiscoveryFile, "text"> & {
   kind: "bytes";
   bytes: Buffer;
   linkCount: number;
+  /** ADM-4c review: the stat this read was taken under, for the scan cache. */
+  cacheKey: ScanCacheKey;
 };
 
 type SafeLeafGap = {
@@ -294,17 +353,89 @@ type SafeLeafGap = {
   gap: DiscoveryGap;
 };
 
+/** ADM-4c review. A file whose classification came from the scan cache. */
+type SafeCachedFile = Omit<DiscoveryFile, "text" | "sha256" | "byteLength"> & {
+  kind: "cached";
+  cached: ScanCacheValue;
+};
+
 /**
  * Portable local-trust fallback. It detects ordinary symlink/replacement races
  * but does not claim protection from hostile same-user ancestor replacement.
  */
+/**
+ * ADM-4c review. A gap names a location and a reason, nothing else. Spreading
+ * the byte record into it carried `sha256`, `byteLength` and the scan cache's
+ * own key along for the ride, which nothing reads and which made a cached gap
+ * and a freshly read one differ for no reason.
+ */
+function gapAt(
+  file: Pick<
+    DiscoveryFile,
+    "rootAlias" | "relativePath" | "uri" | "sourceModifiedAt"
+  >,
+  code: DiscoveryGap["code"],
+): DiscoveryGap {
+  return {
+    rootAlias: file.rootAlias,
+    relativePath: file.relativePath,
+    uri: file.uri,
+    sourceModifiedAt: file.sourceModifiedAt,
+    code,
+  };
+}
+
+function leafGap(
+  root: SafeRoot,
+  relativePath: string,
+  entry: Stats,
+  code: DiscoveryGap["code"],
+): SafeLeafGap {
+  const sourceModifiedAt = Math.trunc(entry.mtimeMs);
+  if (!Number.isSafeInteger(sourceModifiedAt) || sourceModifiedAt < 0) {
+    throw new FilesystemFailure(
+      "unstable",
+      "file modification time is invalid",
+    );
+  }
+  return {
+    kind: "gap",
+    gap: {
+      rootAlias: root.alias,
+      relativePath,
+      uri: toFsUri(root.alias, relativePath),
+      sourceModifiedAt,
+      code,
+    },
+  };
+}
+
+/**
+ * ADM-4c review. A provider placeholder: the directory entry is there and has
+ * a length, but no block of it is on this disk. Reading it would make the sync
+ * client fetch the whole file, which on a watched folder of online-only
+ * originals means downloading the folder on every pass, or hanging when the
+ * provider is unreachable.
+ *
+ * `st_blocks === 0` with a nonzero length is what macOS reports for a dataless
+ * file and what every network and sparse-placeholder filesystem reports too.
+ * Node does not expose `st_flags`, so `SF_DATALESS` cannot be read directly;
+ * this is the same observation by its effect, and it needs no native code.
+ */
+export function isProviderPlaceholder(
+  entry: Pick<Stats, "size" | "blocks">,
+): boolean {
+  return entry.size > 0 && entry.blocks === 0;
+}
+
 async function readFileBytes(
   root: SafeRoot,
   relativePath: string,
   maxBytes: number,
   deadline = Date.now() + FILESYSTEM_DEADLINE_MS,
   sourceMaxTextBytes?: number,
-): Promise<SafeFileBytes | SafeLeafGap> {
+  cache?: ScanCache,
+): Promise<SafeFileBytes | SafeLeafGap | SafeCachedFile> {
   pathParts(relativePath);
   const candidate = join(root.canonicalPath, relativePath);
   if (!contains(root.canonicalPath, candidate)) {
@@ -386,6 +517,50 @@ async function readFileBytes(
         "unstable",
         "opened entry changed before read",
       );
+    }
+    // ADM-4c review. Before any byte is read: a placeholder is reported, not
+    // fetched, and a cache hit answers without a read at all. Everything that
+    // proves the file did not move or change underneath still runs below.
+    if (sourceMaxTextBytes !== undefined && isProviderPlaceholder(before)) {
+      return leafGap(root, relativePath, before, "not_downloaded");
+    }
+    if (sourceMaxTextBytes !== undefined && cache) {
+      const hit = cache.get(
+        {
+          device: before.dev,
+          inode: before.ino,
+          size: before.size,
+          mtimeMs: before.mtimeMs,
+        },
+        Date.now(),
+      );
+      if (hit) {
+        const after = await beforeDeadline(
+          handle.stat(),
+          deadline,
+          "enumeration_interrupted",
+          "file stat timed out",
+        );
+        if (
+          after.dev === before.dev &&
+          after.ino === before.ino &&
+          after.size === before.size &&
+          after.mtimeMs === before.mtimeMs &&
+          after.ctimeMs === before.ctimeMs
+        ) {
+          const sourceModifiedAt = Math.trunc(before.mtimeMs);
+          if (Number.isSafeInteger(sourceModifiedAt) && sourceModifiedAt >= 0) {
+            return {
+              kind: "cached",
+              rootAlias: root.alias,
+              relativePath,
+              uri: toFsUri(root.alias, relativePath),
+              sourceModifiedAt,
+              cached: hit,
+            };
+          }
+        }
+      }
     }
     let leafGapCode: DiscoveryGap["code"] | undefined;
     if (sourceMaxTextBytes !== undefined) {
@@ -504,6 +679,12 @@ async function readFileBytes(
       byteLength: bytes!.length,
       bytes: bytes!,
       linkCount: before.nlink,
+      cacheKey: {
+        device: before.dev,
+        inode: before.ino,
+        size: before.size,
+        mtimeMs: before.mtimeMs,
+      },
     };
   } finally {
     if (!abandoned) await handle.close();
@@ -530,6 +711,7 @@ function utf8DiscoveryFile(
     kind: _kind,
     bytes: _bytes,
     linkCount: _linkCount,
+    cacheKey: _cacheKey,
     ...descriptor
   } = file;
   return { ...descriptor, text };
@@ -778,7 +960,12 @@ function pdfStringAt(
         if (e >= 0x30 && e <= 0x37) {
           let oct = "";
           let k = i + 1;
-          while (oct.length < 3 && bytes[k] !== undefined && bytes[k]! >= 0x30 && bytes[k]! <= 0x37) {
+          while (
+            oct.length < 3 &&
+            bytes[k] !== undefined &&
+            bytes[k]! >= 0x30 &&
+            bytes[k]! <= 0x37
+          ) {
             oct += String.fromCharCode(bytes[k]!);
             k += 1;
           }
@@ -787,14 +974,30 @@ function pdfStringAt(
           continue;
         }
         switch (e) {
-          case 0x6e: out.push(0x0a); break;
-          case 0x72: out.push(0x0d); break;
-          case 0x74: out.push(0x09); break;
-          case 0x62: out.push(0x08); break;
-          case 0x66: out.push(0x0c); break;
-          case 0x28: out.push(0x28); break;
-          case 0x29: out.push(0x29); break;
-          case 0x5c: out.push(0x5c); break;
+          case 0x6e:
+            out.push(0x0a);
+            break;
+          case 0x72:
+            out.push(0x0d);
+            break;
+          case 0x74:
+            out.push(0x09);
+            break;
+          case 0x62:
+            out.push(0x08);
+            break;
+          case 0x66:
+            out.push(0x0c);
+            break;
+          case 0x28:
+            out.push(0x28);
+            break;
+          case 0x29:
+            out.push(0x29);
+            break;
+          case 0x5c:
+            out.push(0x5c);
+            break;
           case 0x0d:
             i += bytes[i + 2] === 0x0a ? 1 : 0;
             break;
@@ -871,9 +1074,7 @@ function locateIndirectObjectDict(
   gen: number,
 ): { start: number; end: number } | undefined {
   const text = bytes.toString("latin1");
-  const match = new RegExp(`(?:^|[^0-9])${num}\\s+${gen}\\s+obj\\b`).exec(
-    text,
-  );
+  const match = new RegExp(`(?:^|[^0-9])${num}\\s+${gen}\\s+obj\\b`).exec(text);
   if (!match) return undefined;
   const searchFrom = match.index + match[0].length;
   const searchLimit = Math.min(bytes.length, searchFrom + MAX_PDF_DICT_BYTES);
@@ -940,7 +1141,11 @@ function hardenedHash(password: Buffer, salt: Buffer, extra: Buffer): Buffer {
   for (let round = 0; ; round += 1) {
     const k1Block = Buffer.concat([password, k, extra]);
     const k1 = Buffer.concat(Array<Buffer>(64).fill(k1Block));
-    const cipher = createCipheriv("aes-128-cbc", k.subarray(0, 16), k.subarray(16, 32));
+    const cipher = createCipheriv(
+      "aes-128-cbc",
+      k.subarray(0, 16),
+      k.subarray(16, 32),
+    );
     cipher.setAutoPadding(false);
     const e = Buffer.concat([cipher.update(k1), cipher.final()]);
     let sum = 0;
@@ -1030,7 +1235,8 @@ function classifyPdfEncryption(bytes: Buffer): PdfEncryptionClassification {
       if (!Number.isInteger(keyLen) || keyLen < 5 || keyLen > 16) {
         return { status: "password_required" };
       }
-      const encryptMetadata = pdfDictBoolean(encryptDict, "EncryptMetadata") ?? true;
+      const encryptMetadata =
+        pdfDictBoolean(encryptDict, "EncryptMetadata") ?? true;
       const key = standardEncryptionKeyR234(
         oValue,
         pValue,
@@ -1042,7 +1248,9 @@ function classifyPdfEncryption(bytes: Buffer): PdfEncryptionClassification {
       const valid =
         revision === 2
           ? standardUserValueR2(key).equals(uValue.subarray(0, 32))
-          : standardUserValueR3Plus(key, idValue).equals(uValue.subarray(0, 16));
+          : standardUserValueR3Plus(key, idValue).equals(
+              uValue.subarray(0, 16),
+            );
       return valid
         ? { status: "permissions_only", revision }
         : { status: "password_required" };
@@ -1080,6 +1288,7 @@ function pdfDiscoveryFile(file: SafeFileBytes): PdfDiscoveryFile {
     kind: _kind,
     bytes: _bytes,
     linkCount: _linkCount,
+    cacheKey: _cacheKey,
     ...descriptor
   } = file;
   return {
@@ -1104,6 +1313,9 @@ export async function readUtf8File(
   if (result.kind === "gap") {
     throw new FilesystemFailure(result.gap.code, "file is not readable");
   }
+  // The scan cache is only offered to the observation lane, so this caller
+  // cannot be answered from it.
+  if (result.kind === "cached") throw new Error("unreachable cached read");
   return utf8DiscoveryFile(result, maxBytes);
 }
 
@@ -1121,6 +1333,7 @@ export async function readPdfFile(
   if (result.kind === "gap") {
     throw new FilesystemFailure(result.gap.code, "file is not readable");
   }
+  if (result.kind === "cached") throw new Error("unreachable cached read");
   return pdfDiscoveryFile(result);
 }
 
@@ -1165,6 +1378,7 @@ function workbookObservation(
     kind: _kind,
     bytes: _bytes,
     linkCount: _linkCount,
+    cacheKey: _cacheKey,
     ...descriptor
   } = file;
   try {
@@ -1176,17 +1390,16 @@ function workbookObservation(
     if (error instanceof SpreadsheetError) {
       return {
         kind: "gap",
-        gap: {
-          ...descriptor,
-          code:
-            error.code === "oversized"
-              ? "oversized"
-              : error.code === "encrypted"
-                ? "encrypted"
-                : file.byteLength > maxTextBytes
-                  ? "oversized"
-                  : "unsupported",
-        },
+        gap: gapAt(
+          file,
+          error.code === "oversized"
+            ? "oversized"
+            : error.code === "encrypted"
+              ? "encrypted"
+              : file.byteLength > maxTextBytes
+                ? "oversized"
+                : "unsupported",
+        ),
       };
     }
     throw error;
@@ -1197,11 +1410,60 @@ function workbookObservation(
   };
 }
 
+/** ADM-4c review. A cache hit, rebuilt into the observation it stands for. */
+function cachedObservation(file: SafeCachedFile): SourceObservation {
+  const { kind: _kind, cached, ...descriptor } = file;
+  if (cached.kind === "gap") {
+    return { kind: "gap", gap: gapAt(descriptor, cached.code) };
+  }
+  if (cached.kind === "utf8") {
+    return {
+      kind: "utf8",
+      file: {
+        ...descriptor,
+        sha256: cached.sha256,
+        byteLength: cached.byteLength,
+        text: cached.text,
+      },
+    };
+  }
+  const { kind: _binary, ...rest } = cached;
+  return { kind: "pdf", file: { ...descriptor, ...rest } };
+}
+
+/** The classification of one observation, as the cache remembers it. */
+function cacheValue(observation: SourceObservation): ScanCacheValue {
+  if (observation.kind === "gap")
+    return { kind: "gap", code: observation.gap.code };
+  if (observation.kind === "utf8") {
+    return {
+      kind: "utf8",
+      sha256: observation.file.sha256,
+      byteLength: observation.file.byteLength,
+      text: observation.file.text,
+    };
+  }
+  const file = observation.file;
+  return {
+    kind: "binary",
+    sha256: file.sha256,
+    byteLength: file.byteLength,
+    mediaType: file.mediaType,
+    ...(file.permissionsRestricted === undefined
+      ? {}
+      : {
+          permissionsRestricted: file.permissionsRestricted,
+          encryptionRevision: file.encryptionRevision,
+        }),
+  };
+}
+
 async function readSourceObservation(
   root: SafeRoot,
   relativePath: string,
   maxTextBytes: number,
   deadline: number,
+  cache?: ScanCache,
 ): Promise<SourceObservation> {
   const result = await readFileBytes(
     root,
@@ -1209,41 +1471,38 @@ async function readSourceObservation(
     MAX_DISCOVERED_PDF_BYTES,
     deadline,
     maxTextBytes,
+    cache,
   );
   if (result.kind === "gap") return result;
+  if (result.kind === "cached") return cachedObservation(result);
   const file = result;
+  const remember = (observation: SourceObservation): SourceObservation => {
+    cache?.set(file.cacheKey, cacheValue(observation), Date.now());
+    return observation;
+  };
   if (file.bytes.subarray(0, 5).equals(Buffer.from("%PDF-"))) {
     try {
-      return { kind: "pdf", file: pdfDiscoveryFile(file) };
+      return remember({ kind: "pdf", file: pdfDiscoveryFile(file) });
     } catch (error) {
       if (!(error instanceof FilesystemFailure) || error.code !== "encrypted") {
         throw error;
       }
-      const {
-        kind: _kind,
-        bytes: _bytes,
-        linkCount: _linkCount,
-        ...descriptor
-      } = file;
-      return { kind: "gap", gap: { ...descriptor, code: "encrypted" } };
+      return remember({ kind: "gap", gap: gapAt(file, "encrypted") });
     }
   }
   if (isZipContainer(file.bytes) || looksLikeEncryptedWorkbook(file)) {
-    return workbookObservation(file, maxTextBytes);
+    return remember(workbookObservation(file, maxTextBytes));
   }
   try {
-    return { kind: "utf8", file: utf8DiscoveryFile(file, maxTextBytes) };
+    return remember({
+      kind: "utf8",
+      file: utf8DiscoveryFile(file, maxTextBytes),
+    });
   } catch (error) {
     if (!(error instanceof FilesystemFailure) || error.code !== "unsupported") {
       throw error;
     }
-    const {
-      kind: _kind,
-      bytes: _bytes,
-      linkCount: _linkCount,
-      ...descriptor
-    } = file;
-    return { kind: "gap", gap: { ...descriptor, code: "unsupported" } };
+    return remember({ kind: "gap", gap: gapAt(file, "unsupported") });
   }
 }
 
@@ -1255,7 +1514,7 @@ async function discoverWith<T extends DiscoveryFile | SourceObservation>(
   const found: T[] = [];
   const uris = new Set<string>();
   let encountered = 0;
-  const deadline = Date.now() + FILESYSTEM_DEADLINE_MS;
+  const deadline = Date.now() + enumerationDeadlineMs(config.maxFiles);
 
   function inclusion(root: SafeRoot):
     | {
@@ -1494,8 +1753,15 @@ export async function discoverFiles(
 export async function discoverSourceObservations(
   config: PipelineConfig,
   roots: SafeRoot[],
+  cache?: ScanCache,
 ): Promise<SourceObservation[]> {
   return discoverWith(config, roots, (root, relativePath, deadline) =>
-    readSourceObservation(root, relativePath, config.maxFileBytes, deadline),
+    readSourceObservation(
+      root,
+      relativePath,
+      config.maxFileBytes,
+      deadline,
+      cache,
+    ),
   );
 }

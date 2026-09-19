@@ -1428,7 +1428,7 @@ function providerRootEntry(id) {
   };
 }
 
-test("provider originals are per root, and a root without one is not an error", () => {
+test("provider originals are per root", () => {
   const base = multiRootBase();
   const pdf = pdfDocQaConfig();
   delete pdf.archive.independentBackup.repositoryPath;
@@ -1450,17 +1450,17 @@ test("provider originals are per root, and a root without one is not an error", 
       { rootAlias: "investing", ...providerRootEntry("id:investing_root") },
     ],
   };
+  // Review finding 3: once one root has a provider folder, every watched root
+  // must, so `medical` gets one here. The case where none does is the
+  // provider-less config, which is unchanged.
+  pdf.providerOriginal.roots.push({
+    rootAlias: "medical",
+    ...providerRootEntry("id:medical_root"),
+  });
   const parsed = parseConfig({ ...base, pdfDocQa: pdf });
   assert.deepEqual(
     parsed.pdfDocQa.providerOriginal.roots.map((root) => root.rootAlias),
-    ["notes", "investing"],
-  );
-  assert.equal(
-    parsed.pdfDocQa.providerOriginal.roots.some(
-      (root) => root.rootAlias === "medical",
-    ),
-    false,
-    "a watched root may have no provider folder at all",
+    ["notes", "investing", "medical"],
   );
 
   const unknownAlias = structuredClone(pdf);
@@ -1530,10 +1530,7 @@ test("the watched-folder list and its report are validated against closed shapes
       },
     ],
   };
-  assert.deepEqual(
-    parseWorkerResponse(JSON.stringify(ok), "source.roots"),
-    ok,
-  );
+  assert.deepEqual(parseWorkerResponse(JSON.stringify(ok), "source.roots"), ok);
   assert.deepEqual(
     parseWorkerResponse(
       JSON.stringify({
@@ -1589,4 +1586,53 @@ test("the watched-folder list and its report are validated against closed shapes
       "source.rootReport",
     ),
   );
+});
+
+// Review finding 3. A provider original config forces a remote independent
+// backup, and the runner refuses a remote repository for original bytes on
+// purpose. A root with no provider entry then has nowhere to put its
+// independent copy and would fail `archive_remote_original_unsupported` on
+// every pass, for every document under it. Refuse it where it can be read.
+test("every watched root must have a provider folder once one root does", () => {
+  const base = multiRootBase();
+  const pdf = pdfDocQaConfig();
+  delete pdf.archive.independentBackup.repositoryPath;
+  pdf.archive.independentBackup.repository = {
+    kind: "rclone_dropbox_v1",
+    remoteName: "kithmind_dropbox",
+    rootPath: "Kith Mind Backups/Processing",
+    rcloneBinary: "/tools/rclone",
+    configPath: "/credentials/kithmind-rclone.conf",
+    configIdentityFingerprint: "c".repeat(64),
+    expectedRootDirectoryIdHash: "d".repeat(64),
+  };
+  pdf.providerOriginal = {
+    providerAccountIdHash: "e".repeat(64),
+    refreshPath: "Kith Mind/Inbox",
+    registryDirectory: "/private/provider-registry",
+    roots: [
+      { rootAlias: "notes", ...providerRootEntry("id:notes_root") },
+      { rootAlias: "investing", ...providerRootEntry("id:investing_root") },
+    ],
+  };
+  // `medical` is watched but has no provider folder.
+  assert.throws(
+    () => parseConfig({ ...base, pdfDocQa: pdf }),
+    /medical has no provider folder/,
+  );
+  const complete = structuredClone(pdf);
+  complete.providerOriginal.roots.push({
+    rootAlias: "medical",
+    ...providerRootEntry("id:medical_root"),
+  });
+  assert.equal(
+    parseConfig({ ...base, pdfDocQa: complete }).pdfDocQa.providerOriginal.roots
+      .length,
+    3,
+  );
+  // With no provider original at all, a root needs nothing: both archive
+  // copies are the pipeline's own, which is how every non-provider source runs.
+  const noProvider = structuredClone(pdf);
+  delete noProvider.providerOriginal;
+  assert.equal(parseConfig({ ...base, pdfDocQa: noProvider }).roots.length, 3);
 });

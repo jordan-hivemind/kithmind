@@ -1954,9 +1954,7 @@ function bodyTextRefs(
           typeof (caption as Record<string, unknown>).$ref !== "string"
         )
           fail("output_invalid", "raw picture traversal is invalid");
-        captionRefs.add(
-          (caption as Record<string, unknown>).$ref as string,
-        );
+        captionRefs.add((caption as Record<string, unknown>).$ref as string);
       }
       if (captionRefs.size !== node.captions.length)
         fail("output_invalid", "raw picture traversal is invalid");

@@ -285,6 +285,12 @@ export type SourceInventoryExclusionReason =
   | "unstable"
   | "unsupported"
   | "encrypted"
+  /**
+   * ADM-4c. A provider placeholder the sync client has not downloaded. It
+   * clears itself when the file syncs, unlike every other reason here, so the
+   * sources screen should read it as waiting rather than as a problem.
+   */
+  | "not_downloaded"
   | "duplicate_of"
   | "parse_failed"
   | "extraction_pending";

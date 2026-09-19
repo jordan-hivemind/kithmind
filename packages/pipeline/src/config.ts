@@ -734,6 +734,23 @@ function pdfDocQa(value: unknown, roots: RootConfig[], journalDir: string) {
       : providerOriginalConfig(input.providerOriginal, roots);
   if (providerOriginal !== undefined && !("repository" in independentBackup))
     fail("pdfDocQa provider original requires remote independent backup");
+  // ADM-4c review. A provider original config forces a remote independent
+  // backup, and `resticLocation` refuses a remote repository for original
+  // bytes on purpose: the provider reference is what holds the original, so
+  // there is nowhere for a provider-less root's independent copy to go. Such a
+  // root would fail `archive_remote_original_unsupported` on every pass, for
+  // every document under it. Refuse it here, where the operator can see why,
+  // rather than in the middle of a pass.
+  if (providerOriginal !== undefined) {
+    const bound = new Set(providerOriginal.roots.map((root) => root.rootAlias));
+    const unbound = roots.filter((root) => !bound.has(root.alias));
+    if (unbound.length > 0)
+      fail(
+        `pdfDocQa provider original must name every watched root; ${unbound
+          .map((root) => root.alias)
+          .join(", ")} has no provider folder`,
+      );
+  }
   const privatePaths = [
     captureDirectory,
     parserOutputRoot,

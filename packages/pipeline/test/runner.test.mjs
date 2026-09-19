@@ -6536,8 +6536,10 @@ test("a whole root's worth of vanished items does not exhaust binding capacity",
   try {
     const pass = await identityPass({
       setup,
-      // Removing a 600-file root leaves 600 bindings with nothing to match.
-      // Summed with the surviving plan that used to refuse the pass outright.
+      // 600 files deleted from a root this pass still reads. Summed with the
+      // surviving plan that used to refuse the pass outright. They are under a
+      // watched root, so this is a real removal and the retirement circuit
+      // breaker is not what is being measured here.
       bindings: [
         {
           rootAlias: "fixture",
@@ -6545,7 +6547,7 @@ test("a whole root's worth of vanished items does not exhaust binding capacity",
           externalId: randomUUID(),
         },
         ...Array.from({ length: 600 }, (_, index) => ({
-          rootAlias: "investing",
+          rootAlias: "fixture",
           relativePath: `gone-${index}.txt`,
           externalId: randomUUID(),
         })),
@@ -6553,7 +6555,11 @@ test("a whole root's worth of vanished items does not exhaust binding capacity",
       providers: [],
     });
     assert.equal(pass.result.code, "source_unavailable");
-    assert.notEqual(pass.mode, undefined, "the scan opened rather than failing");
+    assert.notEqual(
+      pass.mode,
+      undefined,
+      "the scan opened rather than failing",
+    );
   } finally {
     await rm(setup.base, { recursive: true, force: true });
   }
@@ -6878,7 +6884,10 @@ test("a subtree that is gone or is not a directory is reported, not failed", asy
   await writeFile(join(setup.root, "statement.txt"), "synthetic");
   try {
     const gone = folderRow({ rootAlias: "fixture", relativePath: "gone" });
-    assert.equal((await resolvePass(setup, [gone])).reports[0].state, "missing");
+    assert.equal(
+      (await resolvePass(setup, [gone])).reports[0].state,
+      "missing",
+    );
     const file = folderRow({
       rootAlias: "fixture",
       relativePath: "statement.txt",
@@ -6892,7 +6901,7 @@ test("a subtree that is gone or is not a directory is reported, not failed", asy
   }
 });
 
-test("a paused root is reported but never narrowed away", async () => {
+test("a paused root keeps its subtree selected; only its state is reported", async () => {
   const setup = await fixture(0);
   await mkdir(join(setup.root, "investing"), { mode: 0o700 });
   await mkdir(join(setup.root, "medical"), { mode: 0o700 });
@@ -6912,13 +6921,87 @@ test("a paused root is reported but never narrowed away", async () => {
       ["ok", "ok"],
       "a paused root is reported on, not hidden",
     );
-    assert.deepEqual(plan.roots[0].includePrefixes, ["investing"]);
-    // And a root whose every row is paused keeps its whole allow-listed
-    // directory, because dropping it would make the server's reconcile mark
-    // every item under it unavailable. See the PR body.
+    // The review's finding 2: leaving the paused subtree out of the selection
+    // takes its items out of the scan, and the server's reconcile marks
+    // anything not in the scan unavailable. Pausing must not read as deleting.
+    assert.deepEqual(plan.roots[0].includePrefixes, ["investing", "medical"]);
     const onlyPaused = await resolvePass(setup, [paused]);
     assert.equal(onlyPaused.reports[0].state, "ok");
-    assert.deepEqual(onlyPaused.roots[0].includePrefixes, undefined);
+    assert.deepEqual(onlyPaused.roots[0].includePrefixes, ["medical"]);
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+// Review finding 1. The admin API cannot create a whole-root row at all
+// (`assertSourceRootLocation` refuses an empty path, and migration 028's CHECK
+// requires length >= 1), so the owner's existing root can never be named by a
+// row. Dropping unnamed roots therefore meant the first pass after adding one
+// folder in the UI would take every existing document out of the scan, and
+// `reconcileWorkerScan` is account-wide.
+test("a root no server row names is watched whole, not dropped", async () => {
+  const setup = await fixture(0);
+  await writeFile(join(setup.root, "statement.txt"), "synthetic");
+  const added = await secondRoot(setup, "investing", {
+    "term-sheet.txt": "synthetic",
+  });
+  await mkdir(join(added.path, "2026"), { mode: 0o700 });
+  await writeFile(join(added.path, "2026", "call.txt"), "synthetic");
+  try {
+    // The only row the UI can write: a subtree of the new root.
+    const row = folderRow({ rootAlias: "investing", relativePath: "2026" });
+    const plan = await resolvePass(setup, [row], [added]);
+    assert.deepEqual(
+      plan.roots.map((root) => [root.alias, root.includePrefixes]),
+      [
+        ["fixture", undefined],
+        ["investing", ["2026"]],
+      ],
+      "the named root narrows; the unnamed one is read exactly as before",
+    );
+    const observed = await discoverFiles(
+      { ...setup.config, roots: [] },
+      plan.roots,
+    );
+    assert.deepEqual(
+      observed.map((file) => file.uri).sort(),
+      ["fs://fixture/statement.txt", "fs://investing/2026/call.txt"],
+      "so the first root's items are still in the scan",
+    );
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("the prefix is the path the host has, not the row's spelling of it", async () => {
+  const setup = await fixture(0);
+  await mkdir(join(setup.root, "Investing"), { mode: 0o700 });
+  await writeFile(join(setup.root, "Investing", "note.txt"), "synthetic");
+  try {
+    // On a case-insensitive filesystem `realpath` resolves "investing" to the
+    // directory spelled "Investing", and discovery only ever produces the
+    // on-disk spelling. A raw-text prefix would match no file at all, which
+    // reads as every document under the root vanishing at once.
+    const row = folderRow({ rootAlias: "fixture", relativePath: "investing" });
+    const plan = await resolvePass(setup, [row]);
+    if (plan.reports[0].state !== "ok") {
+      // A case-sensitive filesystem: the row names nothing, which is the other
+      // correct answer, and the root is still watched whole.
+      assert.equal(plan.reports[0].state, "missing");
+      assert.deepEqual(plan.roots[0].includePrefixes, undefined);
+      return;
+    }
+    assert.deepEqual(plan.roots[0].includePrefixes, ["Investing"]);
+    assert.equal(plan.reports[0].relativePath, "Investing");
+    const observed = await discoverFiles(
+      { ...setup.config, roots: [] },
+      plan.roots,
+    );
+    assert.deepEqual(
+      observed.map((file) => file.uri),
+      ["fs://fixture/Investing/note.txt"],
+      "and the subtree is actually read",
+    );
   } finally {
     await rm(setup.base, { recursive: true, force: true });
   }
@@ -6934,6 +7017,160 @@ test("no server rows means the host's allow-listed roots, exactly as before", as
       plan.roots.map((root) => [root.alias, root.includePrefixes]),
       [["fixture", undefined]],
     );
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+// Review finding 1, second half. Whatever the root-selection logic does, a
+// pass that would take a large share of the account out of the scan refuses
+// instead. `reconcileWorkerScan` marks everything not in the scan unavailable,
+// so a config or server mistake would otherwise look exactly like the owner's
+// documents being deleted.
+test("a pass that would retire most of the account refuses to scan", async () => {
+  const setup = await fixture(0);
+  await writeFile(join(setup.root, "statement.txt"), "synthetic");
+  try {
+    const remembered = [
+      {
+        rootAlias: "fixture",
+        relativePath: "statement.txt",
+        externalId: randomUUID(),
+      },
+      // Forty items under a root this config no longer lists.
+      ...Array.from({ length: 40 }, (_, index) => ({
+        rootAlias: "investing",
+        relativePath: `gone-${index}.txt`,
+        externalId: randomUUID(),
+      })),
+    ];
+    const pass = await identityPass({
+      setup,
+      bindings: remembered,
+      providers: [],
+    });
+    assert.equal(pass.result.state, "incomplete");
+    assert.equal(pass.result.code, "root_selection_would_retire_items");
+    assert.equal(pass.mode, undefined, "the scan never opened");
+    assert.deepEqual(
+      pass.bindings.map((row) => row.externalId).sort(),
+      remembered.map((row) => row.externalId).sort(),
+      "and nothing was forgotten: the next pass sees the same journal",
+    );
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("files vanishing from a root this pass still reads are an ordinary removal", async () => {
+  const setup = await fixture(0);
+  await writeFile(join(setup.root, "statement.txt"), "synthetic");
+  try {
+    // The same forty gone items, but under a root that is still watched: they
+    // really were deleted, and the breaker must not stand in the way.
+    const pass = await identityPass({
+      setup,
+      bindings: [
+        {
+          rootAlias: "fixture",
+          relativePath: "statement.txt",
+          externalId: randomUUID(),
+        },
+        ...Array.from({ length: 40 }, (_, index) => ({
+          rootAlias: "fixture",
+          relativePath: `gone-${index}.txt`,
+          externalId: randomUUID(),
+        })),
+      ],
+      providers: [],
+    });
+    assert.equal(
+      pass.result.code,
+      "source_unavailable",
+      "the only failure is the one this transport injects at append",
+    );
+    assert.equal(
+      pass.mode,
+      "normal",
+      "nothing took their place, so this is a plain removal",
+    );
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a small source can still have a whole folder removed on purpose", async () => {
+  const setup = await fixture(0);
+  await writeFile(join(setup.root, "statement.txt"), "synthetic");
+  try {
+    // Nine items under a root that is gone: under the floor of ten, so the
+    // pass proceeds and the server retires them as it always has.
+    const pass = await identityPass({
+      setup,
+      bindings: [
+        {
+          rootAlias: "fixture",
+          relativePath: "statement.txt",
+          externalId: randomUUID(),
+        },
+        ...Array.from({ length: 9 }, (_, index) => ({
+          rootAlias: "investing",
+          relativePath: `gone-${index}.txt`,
+          externalId: randomUUID(),
+        })),
+      ],
+      providers: [],
+    });
+    assert.equal(pass.result.code, "source_unavailable");
+    assert.notEqual(pass.mode, undefined, "the scan opened");
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a subtree selection that watches nothing it used to also refuses", async () => {
+  const setup = await fixture(0);
+  await mkdir(join(setup.root, "investing"), { mode: 0o700 });
+  await writeFile(join(setup.root, "investing", "kept.txt"), "synthetic");
+  for (let index = 0; index < 40; index += 1) {
+    await writeFile(join(setup.root, `loose-${index}.txt`), "synthetic");
+  }
+  try {
+    const row = folderRow({ rootAlias: "fixture", relativePath: "investing" });
+    const journal = await openJournal(
+      setup.journalDir,
+      terminalCheckpoint([
+        {
+          rootAlias: "fixture",
+          relativePath: "investing/kept.txt",
+          externalId: randomUUID(),
+        },
+        ...Array.from({ length: 40 }, (_, index) => ({
+          rootAlias: "fixture",
+          relativePath: `loose-${index}.txt`,
+          externalId: randomUUID(),
+        })),
+      ]),
+    );
+    try {
+      const runner = new PipelineRunner(
+        setup.config,
+        journal,
+        identityTransport({ failAt: "append", entries: [], requests: [] }),
+      );
+      const allowed = await canonicalRoots(setup.config);
+      const plan = await runner.resolveServerRoots(allowed, [row]);
+      await runner.startCycle(plan.roots, { inventoryEpoch: 1 });
+      assert.equal(journal.checkpoint.phase, "terminal");
+      assert.equal(journal.checkpoint.outcome, "incomplete");
+      assert.equal(
+        journal.checkpoint.code,
+        "root_selection_would_retire_items",
+        "narrowing a root away from where the items are is the same mistake",
+      );
+    } finally {
+      await journal.close();
+    }
   } finally {
     await rm(setup.base, { recursive: true, force: true });
   }

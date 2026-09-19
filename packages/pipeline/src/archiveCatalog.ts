@@ -53,11 +53,33 @@ import type { JsonValue } from "./journalTypes.js";
 const CATALOG_FILE = "archive-catalog.json";
 const FILE_MODE = 0o600;
 const DIRECTORY_MODE = 0o700;
-const MAX_CATALOG_BYTES = 8 * 1024 * 1024;
+/**
+ * ADM-4c review. Measured: 1024 originals beside 1024 processings is 4.49 MiB
+ * and loads in under a millisecond, so 8 MiB no longer had room for a second
+ * processing row per document, which one parser change produces.
+ *
+ * ponytail: the catalog is rewritten whole on every row write, so the write
+ * cost grows with the catalog: 2048 row writes at this size took 223s
+ * cumulative, about 0.4s for the last one. That is the real ceiling here, not
+ * the byte bound, and it is pre-existing. A backfill of several hundred
+ * documents gets slower as it goes. Fix it with an append-only log and periodic
+ * compaction if a backfill ever spends more time in the catalog than in the
+ * parser.
+ */
+const MAX_CATALOG_BYTES = 32 * 1024 * 1024;
 const MAX_JSON_DEPTH = 48;
-const MAX_JSON_NODES = 100_000;
-const MAX_ORIGINALS = 256;
-const MAX_PROCESSINGS = 512;
+const MAX_JSON_NODES = 1_000_000;
+/**
+ * ADM-4c review. The catalog is never pruned, so these bound the lifetime of
+ * one journal rather than one pass: 256 originals refused the owner's third
+ * watched folder somewhere around its first two hundred and fifty-sixth file.
+ * Raised with the scan ceiling, four to one for processings because a
+ * document takes a new processing row on every parser or extraction change.
+ * `MAX_CATALOG_BYTES` (8 MiB) and `MAX_JSON_NODES` were raised with them; see
+ * `archive-catalog.test.mjs`, which measures a 1024-original catalog.
+ */
+const MAX_ORIGINALS = 4_096;
+const MAX_PROCESSINGS = 8_192;
 const MAX_BOUNDARY_RELOCATIONS = 16;
 const MAX_DIRECTORY_ENTRIES = 64;
 /** Bounded per-document parser attempt count; see `parseFailure` on `ProcessingCatalogRow`. */
@@ -1290,11 +1312,7 @@ function parseSnapshot(value: unknown, authorityDigest: string) {
     for (const artifact of relocation.artifacts) {
       if (
         copies.filter((copy) =>
-          copyMatchesRelocationArtifact(
-            copy,
-            relocation.oldBoundary,
-            artifact,
-          ),
+          copyMatchesRelocationArtifact(copy, relocation.oldBoundary, artifact),
         ).length !== 1
       )
         fail("catalog_invalid");
@@ -1892,9 +1910,7 @@ export class ArchiveCatalog {
         )
       )
         fail("catalog_conflict");
-      if (
-        this.snapshot.boundaryRelocations.length >= MAX_BOUNDARY_RELOCATIONS
-      )
+      if (this.snapshot.boundaryRelocations.length >= MAX_BOUNDARY_RELOCATIONS)
         fail("catalog_capacity_exceeded");
 
       const catalogArtifacts: ArchiveBoundaryRelocationArtifact[] = [];

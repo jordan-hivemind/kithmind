@@ -534,8 +534,7 @@ test("a document waiting for a person stops the relocation before the root moves
       continue;
     }
     await assert.rejects(
-      () =>
-        __testOnlyVerifyArchiveRelocationOwnerResume(f.input, f.adapters),
+      () => __testOnlyVerifyArchiveRelocationOwnerResume(f.input, f.adapters),
       (error) => error.code === expected,
     );
   }

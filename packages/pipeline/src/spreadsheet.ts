@@ -420,7 +420,8 @@ export function readWorkbook(bytes: Buffer): Workbook {
       // XFD and the final row. They contribute no page text or formula, so
       // ignore them before grid bounds; values and formulas remain bounded.
       if (text.length === 0 && !hasFormula) continue;
-      if (row >= MAX_SHEET_ROWS || column >= MAX_SHEET_COLUMNS) fail("oversized");
+      if (row >= MAX_SHEET_ROWS || column >= MAX_SHEET_COLUMNS)
+        fail("oversized");
       if (hasFormula) {
         formulas.push({ row, column, formula: formulaText });
       }

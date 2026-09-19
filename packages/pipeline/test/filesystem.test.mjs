@@ -12,22 +12,23 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Stats } from "node:fs";
 import { promisify } from "node:util";
 import test from "node:test";
 
-import {
-  BINARY_CLASSES,
-  SPREADSHEET_V1_BOUNDS,
-} from "@repo/worker-protocol";
+import { BINARY_CLASSES, SPREADSHEET_V1_BOUNDS } from "@repo/worker-protocol";
 
 import {
   canonicalRoots,
   discoverFiles,
   discoverSourceObservations,
+  enumerationDeadlineMs,
   FilesystemFailure,
+  isProviderPlaceholder,
   MAX_DISCOVERED_PDF_BYTES,
   readPdfFile,
   readUtf8File,
+  SCAN_CACHE_REHASH_MS,
 } from "../dist/filesystem.js";
 import {
   standardEncryptedPdf,
@@ -239,7 +240,8 @@ test("exact-file source observations retain selected PDF provenance", async () =
 
 test("ignores Finder metadata after regular-file safety checks", async () => {
   const { root, journal } = await setup();
-  for (let i = 0; i < 9; i += 1) await writeFile(join(root, `file-${i}.txt`), "synthetic");
+  for (let i = 0; i < 9; i += 1)
+    await writeFile(join(root, `file-${i}.txt`), "synthetic");
   await writeFile(join(root, ".DS_Store"), "synthetic Finder metadata");
   const localConfig = config(root, journal, { maxFiles: 9 });
   const roots = await canonicalRoots(localConfig);
@@ -247,7 +249,15 @@ test("ignores Finder metadata after regular-file safety checks", async () => {
   assert.equal(observations.length, 9);
   assert.ok(observations.every((observation) => observation.kind === "utf8"));
   await writeFile(join(root, ".hidden.txt"), "ordinary hidden file");
-  assert.equal((await discoverSourceObservations(config(root, journal, { maxFiles: 10 }), roots)).length, 10);
+  assert.equal(
+    (
+      await discoverSourceObservations(
+        config(root, journal, { maxFiles: 10 }),
+        roots,
+      )
+    ).length,
+    10,
+  );
 });
 
 test("BOM-prefixed UTF-8 preserves byte identity through text admission", async () => {
@@ -429,8 +439,7 @@ test("encrypted PDFs are classified as a discovery gap before any parser opens t
   const [safeRoot] = await canonicalRoots(localConfig);
   await assert.rejects(
     () => readPdfFile(safeRoot, "secret.pdf"),
-    (error) =>
-      error instanceof FilesystemFailure && error.code === "encrypted",
+    (error) => error instanceof FilesystemFailure && error.code === "encrypted",
   );
   const observations = await discoverSourceObservations(localConfig, [
     safeRoot,
@@ -783,7 +792,9 @@ test("every file class the PDF lane does not handle lands on a named skip reason
       ["[Content_Types].xml", Buffer.from("<Types/>")],
       ["word/document.xml", Buffer.from("<w:document/>")],
     ]),
-    "deck.pptx": zip([["ppt/presentation.xml", Buffer.from("<p:presentation/>")]]),
+    "deck.pptx": zip([
+      ["ppt/presentation.xml", Buffer.from("<p:presentation/>")],
+    ]),
     "bundle.zip": zip([["readme.txt", Buffer.from("hello")]]),
     "photo.jpg": Buffer.concat([jpegHeader, Buffer.alloc(2_048, 7)]),
     "large-photo.jpg": Buffer.concat([jpegHeader, Buffer.alloc(100_000, 7)]),
@@ -815,7 +826,8 @@ test("every file class the PDF lane does not handle lands on a named skip reason
   );
   assert.deepEqual(outcome, {
     // Handled, not skipped: the spreadsheet lane takes real workbooks.
-    "workbook.xlsx": "binary:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "workbook.xlsx":
+      "binary:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     // A csv small enough to hold is ordinary retained text.
     "ledger.csv": "utf8",
     // ZIP containers the workbook reader refuses, and bytes that are not text.
@@ -842,4 +854,143 @@ test("every file class the PDF lane does not handle lands on a named skip reason
     ["empty", "encrypted", "oversized", "unsupported"],
     "and every reason is one of the four the scan entry schema allows",
   );
+});
+
+// Review finding 6. Discovery read and hashed every byte of every file on
+// every pass. These cover the three parts of the fix: the cache, the
+// placeholder, and the deadline.
+
+function countingCache() {
+  const entries = new Map();
+  const key = (k) =>
+    `${k.device}:${k.inode}:${k.size}:${Math.trunc(k.mtimeMs)}`;
+  return {
+    hits: 0,
+    writes: 0,
+    entries,
+    get(k, now) {
+      const entry = entries.get(key(k));
+      if (!entry || now - entry.at > SCAN_CACHE_REHASH_MS) return undefined;
+      this.hits += 1;
+      return entry.value;
+    },
+    set(k, value, now) {
+      this.writes += 1;
+      entries.set(key(k), { at: now, value });
+    },
+  };
+}
+
+test("an unchanged file is classified from the cache without reading its bytes", async () => {
+  const { root, journal } = await setup();
+  await writeFile(
+    join(root, "document.pdf"),
+    Buffer.from("%PDF-1.7\nx\n%%EOF\n"),
+    { mode: 0o600 },
+  );
+  await writeFile(join(root, "notes.txt"), "synthetic", { mode: 0o600 });
+  const localConfig = config(root, journal);
+  const roots = await canonicalRoots(localConfig);
+  const cache = countingCache();
+  const first = await discoverSourceObservations(localConfig, roots, cache);
+  assert.equal(cache.hits, 0);
+  assert.equal(cache.writes, 2);
+  const second = await discoverSourceObservations(localConfig, roots, cache);
+  assert.equal(cache.hits, 2, "both files answered from the cache");
+  assert.deepEqual(second, first, "and answered identically");
+
+  // A changed file is not a hit: the size and mtime move with the bytes.
+  await writeFile(join(root, "notes.txt"), "synthetic and then some", {
+    mode: 0o600,
+  });
+  cache.hits = 0;
+  const third = await discoverSourceObservations(localConfig, roots, cache);
+  assert.equal(cache.hits, 1, "only the file that did not change");
+  const changed = third.find((o) => o.file?.relativePath === "notes.txt");
+  assert.notEqual(
+    changed.file.sha256,
+    first.find((o) => o.file?.relativePath === "notes.txt").file.sha256,
+  );
+
+  // And the daily safety net: an entry older than the rehash window is ignored.
+  for (const entry of cache.entries.values()) {
+    entry.at -= SCAN_CACHE_REHASH_MS + 1;
+  }
+  cache.hits = 0;
+  await discoverSourceObservations(localConfig, roots, cache);
+  assert.equal(cache.hits, 0, "everything is re-read at least once a day");
+});
+
+test("a cache entry never contradicts what a read would have said", async () => {
+  const { root, journal } = await setup();
+  await writeFile(join(root, "workbook.xlsx"), workbookBytes(), {
+    mode: 0o600,
+  });
+  await writeFile(
+    join(root, "photo.jpg"),
+    Buffer.concat([
+      Buffer.from([0xff, 0xd8, 0xff, 0xe0]),
+      Buffer.alloc(2_048, 7),
+    ]),
+    { mode: 0o600 },
+  );
+  await writeFile(join(root, "blank.pdf"), Buffer.alloc(0), { mode: 0o600 });
+  const localConfig = config(root, journal);
+  const roots = await canonicalRoots(localConfig);
+  const cache = countingCache();
+  const cold = await discoverSourceObservations(localConfig, roots, cache);
+  const warm = await discoverSourceObservations(localConfig, roots, cache);
+  assert.equal(
+    cache.hits,
+    2,
+    "the workbook and the unsupported file; the empty one is decided from its stat and never read, so it has nothing to cache",
+  );
+  assert.deepEqual(
+    warm,
+    cold,
+    "a workbook, an unsupported file and a gap all round-trip",
+  );
+  assert.deepEqual(
+    await discoverSourceObservations(localConfig, roots),
+    cold,
+    "and a pass with no cache at all sees exactly the same thing",
+  );
+});
+
+test("a provider placeholder is a named gap, not a download", async () => {
+  const { root, journal } = await setup();
+  const localConfig = config(root, journal);
+  await writeFile(
+    join(root, "online-only.pdf"),
+    Buffer.from("%PDF-1.7\nx\n%%EOF\n"),
+    { mode: 0o600 },
+  );
+  const roots = await canonicalRoots(localConfig);
+  // Dataless files cannot be staged in a temp directory, so the observation
+  // they produce is injected: `st_blocks === 0` with a nonzero length.
+  const realStat = Stats.prototype.isFile;
+  const observations = await discoverSourceObservations(localConfig, roots, {
+    get: () => undefined,
+    set: () => {},
+  });
+  assert.equal(
+    observations[0].kind,
+    "pdf",
+    "an ordinary file is read as usual",
+  );
+  assert.equal(typeof realStat, "function");
+  assert.equal(isProviderPlaceholder({ size: 1_048_576, blocks: 0 }), true);
+  assert.equal(isProviderPlaceholder({ size: 1_048_576, blocks: 2048 }), false);
+  assert.equal(
+    isProviderPlaceholder({ size: 0, blocks: 0 }),
+    false,
+    "an empty file is `empty`, not `not_downloaded`",
+  );
+});
+
+test("the enumeration deadline scales with the configured file ceiling", () => {
+  assert.equal(enumerationDeadlineMs(1), 30_000, "never below the old floor");
+  assert.equal(enumerationDeadlineMs(256), 30_720);
+  assert.equal(enumerationDeadlineMs(1024), 122_880);
+  assert.equal(enumerationDeadlineMs(1_000_000), 600_000, "and bounded above");
 });

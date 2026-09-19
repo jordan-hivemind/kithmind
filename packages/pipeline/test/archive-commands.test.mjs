@@ -68,7 +68,9 @@ function digest(bytes) {
 
 const configIdentity = (path, remoteName) =>
   createHash("sha256")
-    .update(`dropbox-config:v1\0${JSON.stringify([path, remoteName, "dropbox"])}`)
+    .update(
+      `dropbox-config:v1\0${JSON.stringify([path, remoteName, "dropbox"])}`,
+    )
     .digest("hex");
 
 function limits(overrides = {}) {
@@ -270,7 +272,11 @@ process.exit(2);
 `,
   );
   const rcloneConfig = join(base, "rclone.conf");
-  await writeFile(rcloneConfig, `[kithmind_dropbox]\ntype = dropbox\ntoken = ${JSON.stringify({ access_token: "synthetic-token", token_type: "bearer" })}\n`, { mode: 0o600 });
+  await writeFile(
+    rcloneConfig,
+    `[kithmind_dropbox]\ntype = dropbox\ntoken = ${JSON.stringify({ access_token: "synthetic-token", token_type: "bearer" })}\n`,
+    { mode: 0o600 },
+  );
   const passwordExecutable = await executable(
     join(tools, "password-command"),
     `process.stdout.write("synthetic-password\\n");`,
@@ -1303,7 +1309,10 @@ test("rclone Dropbox repository binds the real directory and performs a separate
     rootPath: "Kith Mind Backups/Processing",
     rcloneBinary: fixture.rcloneBinary,
     configPath: fixture.rcloneConfig,
-    configIdentityFingerprint: configIdentity(fixture.rcloneConfig, "kithmind_dropbox"),
+    configIdentityFingerprint: configIdentity(
+      fixture.rcloneConfig,
+      "kithmind_dropbox",
+    ),
     expectedRootDirectoryIdHash: fixture.directoryIdHash,
   };
   const result = await backupResticObject({
@@ -1356,27 +1365,34 @@ test("rclone Dropbox repository binds the real directory and performs a separate
     },
   );
   await assert.rejects(
-    () => probeResticRepository({
-      resticBinary: fixture.resticBinary,
-      repository: { ...repository, expectedRootDirectoryIdHash: "f".repeat(64) },
-      passwordCommand: fixture.passwordCommand,
-      limits: limits(),
-    }),
-    (error) => error instanceof ArchiveCommandError && error.code === "digest_mismatch",
+    () =>
+      probeResticRepository({
+        resticBinary: fixture.resticBinary,
+        repository: {
+          ...repository,
+          expectedRootDirectoryIdHash: "f".repeat(64),
+        },
+        passwordCommand: fixture.passwordCommand,
+        limits: limits(),
+      }),
+    (error) =>
+      error instanceof ArchiveCommandError && error.code === "digest_mismatch",
   );
   assert.equal(
-    (await forgetResticBackupExact({
-      resticBinary: fixture.resticBinary,
-      repository,
-      expectedRepositoryId: REPOSITORY,
-      passwordCommand: fixture.passwordCommand,
-      operationId: "operation_1",
-      host: "kith-original-archive",
-      snapshotId: SNAPSHOT,
-      objectName: "remote.age",
-      expectedCiphertext: digest(bytes),
-      limits: limits(),
-    })).outcome,
+    (
+      await forgetResticBackupExact({
+        resticBinary: fixture.resticBinary,
+        repository,
+        expectedRepositoryId: REPOSITORY,
+        passwordCommand: fixture.passwordCommand,
+        operationId: "operation_1",
+        host: "kith-original-archive",
+        snapshotId: SNAPSHOT,
+        objectName: "remote.age",
+        expectedCiphertext: digest(bytes),
+        limits: limits(),
+      })
+    ).outcome,
     "deleted",
   );
 });

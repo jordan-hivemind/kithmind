@@ -8,7 +8,8 @@ export type GapCode =
   | "unreadable"
   | "unstable"
   | "unsupported"
-  | "encrypted";
+  | "encrypted"
+  | "not_downloaded";
 
 export type RootConfig = {
   alias: string;
@@ -164,7 +165,7 @@ export type DiscoveryGap = Pick<
   DiscoveryFile,
   "rootAlias" | "relativePath" | "uri" | "sourceModifiedAt"
 > & {
-  code: "empty" | "oversized" | "unsupported" | "encrypted";
+  code: "empty" | "oversized" | "unsupported" | "encrypted" | "not_downloaded";
 };
 
 export type SourceObservation =
