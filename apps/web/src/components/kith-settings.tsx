@@ -21,6 +21,7 @@ import { WorkerHeartbeatStatus } from "@/components/kith-worker-heartbeat-status
 import {
   type GrantableSpace,
   type KeyCapability,
+  type SensitivityChoice,
   SpaceGrantChoices,
 } from "@/components/space-grant-choices";
 import {
@@ -152,6 +153,7 @@ type NewKey = {
     spaceIds: string[];
     capabilities: KeyCapability[];
     sourceAccountIds: string[];
+    maxSensitivity: SensitivityChoice;
   };
 };
 
@@ -367,6 +369,9 @@ function NewKeyForm({
   const [spaceIds, setSpaceIds] = useState<string[]>([]);
   const [capabilities, setCapabilities] = useState<KeyCapability[]>(["read"]);
   const [sourceAccountIds, setSourceAccountIds] = useState<string[]>([]);
+  // SENS-1. Defaults to the full-access option; see the consent screen.
+  const [maxSensitivity, setMaxSensitivity] =
+    useState<SensitivityChoice>("restricted");
   const [error, setError] = useState("");
 
   const grantableSpaces: GrantableSpace[] = spaces.map((space) => ({
@@ -400,8 +405,15 @@ function NewKeyForm({
         capabilities,
         spaceIds,
         sourceAccountIds: grantedSources,
+        maxSensitivity,
       },
-      body: { name: trimmed, spaceIds, capabilities, sourceAccountIds: grantedSources },
+      body: {
+        name: trimmed,
+        spaceIds,
+        capabilities,
+        sourceAccountIds: grantedSources,
+        maxSensitivity,
+      },
     });
   }
 
@@ -425,6 +437,8 @@ function NewKeyForm({
           capabilities={capabilities}
           onCapabilitiesChange={setCapabilities}
           allowedCapabilities={settingsCapabilities}
+          maxSensitivity={maxSensitivity}
+          onMaxSensitivityChange={setMaxSensitivity}
         />
         {needsSource && (
           <fieldset className="my-3 rounded-tag border border-gray-200 p-3 text-xs">

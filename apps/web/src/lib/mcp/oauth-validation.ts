@@ -73,6 +73,11 @@ export const authorizationConsentSchema = authorizationRequestSchema.extend({
       (values) => new Set(values).size === values.length,
       "Permissions must be unique",
     ),
+  // SENS-1. Optional, and absent means `restricted` -- no withholding. A
+  // client cannot widen its own grant with this: `restricted` is already the
+  // maximum, so the only thing this field can do is narrow what the owner
+  // hands out.
+  maxSensitivity: z.enum(["normal", "sensitive", "restricted"]).optional(),
 });
 
 /**

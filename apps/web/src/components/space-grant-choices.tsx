@@ -13,9 +13,89 @@
 // This component fetches nothing and imports nothing from Convex. The space list
 // arrives as a prop, already authorized by whoever loaded it.
 
+import * as Tooltip from "@radix-ui/react-tooltip";
 import { useEffect } from "react";
 
 export type KeyCapability = "read" | "write" | "ingest";
+
+export type SensitivityChoice = "normal" | "sensitive" | "restricted";
+
+/**
+ * SENS-1. The ceiling, highest first, so the default sits where the eye starts.
+ *
+ * "Everything" is the default and is what every credential gets unless the
+ * owner picks one of the other two here. The other two exist for a third-party
+ * tool or a client trusted less than the owner's own: they do not protect the
+ * owner from himself, they narrow what he chooses to hand out.
+ *
+ * Tooltips rather than a paragraph, per the house style: the labels carry the
+ * choice and the detail is available on hover.
+ */
+const SENSITIVITY_OPTIONS: {
+  value: SensitivityChoice;
+  label: string;
+  detail: string;
+}[] = [
+  {
+    value: "restricted",
+    label: "Everything",
+    detail: "No limit. This client reads every document you can read.",
+  },
+  {
+    value: "sensitive",
+    label: "Up to sensitive",
+    detail:
+      "Withholds documents marked restricted, such as tax returns. The client is told how many were withheld, not what they were.",
+  },
+  {
+    value: "normal",
+    label: "Ordinary only",
+    detail:
+      "Withholds documents marked sensitive or restricted, such as financial and medical records.",
+  },
+];
+
+/** Square segmented control, the same shape as `kith-fact-drawer.tsx`'s. */
+function SensitivityControl({
+  value,
+  onChange,
+}: {
+  value: SensitivityChoice;
+  onChange: (value: SensitivityChoice) => void;
+}) {
+  return (
+    <Tooltip.Provider delayDuration={200}>
+      <div className="flex rounded-tag border border-gray-300 text-xs">
+        {SENSITIVITY_OPTIONS.map((option) => (
+          <Tooltip.Root key={option.value}>
+            <Tooltip.Trigger asChild>
+              <button
+                type="button"
+                aria-pressed={value === option.value}
+                onClick={() => onChange(option.value)}
+                className={`px-3 py-1 ${
+                  value === option.value
+                    ? "bg-accent-600 text-white"
+                    : "bg-white text-gray-700 hover:bg-gray-50"
+                }`}
+              >
+                {option.label}
+              </button>
+            </Tooltip.Trigger>
+            <Tooltip.Portal>
+              <Tooltip.Content
+                sideOffset={4}
+                className="z-50 max-w-xs rounded-tag border border-gray-200 bg-white px-2 py-1 text-xs text-gray-700 shadow-md"
+              >
+                {option.detail}
+              </Tooltip.Content>
+            </Tooltip.Portal>
+          </Tooltip.Root>
+        ))}
+      </div>
+    </Tooltip.Provider>
+  );
+}
 
 /** One space the caller may grant. The shape both sources already return. */
 export type GrantableSpace = {
@@ -39,6 +119,8 @@ export function SpaceGrantChoices({
   capabilities,
   onCapabilitiesChange,
   allowedCapabilities,
+  maxSensitivity,
+  onMaxSensitivityChange,
 }: {
   /** `null` while the list is still loading. */
   spaces: readonly GrantableSpace[] | null;
@@ -48,6 +130,8 @@ export function SpaceGrantChoices({
   capabilities: readonly KeyCapability[];
   onCapabilitiesChange: (values: KeyCapability[]) => void;
   allowedCapabilities: readonly KeyCapability[];
+  maxSensitivity: SensitivityChoice;
+  onMaxSensitivityChange: (value: SensitivityChoice) => void;
 }) {
   // A space that is no longer listed is a space the user has lost access to
   // between opening this screen and now. Dropping it here keeps the request
@@ -122,6 +206,12 @@ export function SpaceGrantChoices({
             <span>{capabilityCopy[capability]}</span>
           </label>
         ))}
+      </div>
+      <div className="mt-3 border-t border-gray-100 pt-3">
+        <SensitivityControl
+          value={maxSensitivity}
+          onChange={onMaxSensitivityChange}
+        />
       </div>
       <p className="mt-3 text-[11px] text-gray-600">
         Access follows your current membership. Removing access to a space also
