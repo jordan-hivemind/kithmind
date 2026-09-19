@@ -12,6 +12,12 @@
 // Keyboard: Enter saves (the form's own submit), and "Save and add another"
 // returns focus to the amount, because the next entry is almost always the
 // same investment on a different date for a different amount.
+//
+// What counts as a valid draft is decided by the very schemas the route will
+// validate the request with, imported rather than restated. The hand-written
+// copies they replace had already drifted: the amount pattern was unsigned,
+// so a reduced commitment -- the one entry type that may be negative -- could
+// be typed but never saved, with the Save button simply staying dead.
 
 import type { admin } from "@repo/kith-store";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -23,6 +29,12 @@ import {
   inputClass,
   primaryButtonClass,
 } from "@/components/ui/drawer";
+import {
+  amountSchema,
+  amountSchemaFor,
+  isoDateSchema,
+  rateSchema,
+} from "@/lib/kith/investment-schemas";
 
 export type EntryDraft = {
   investmentId: string;
@@ -105,9 +117,12 @@ export function EntryDrawer({
         method: "POST",
         headers: { "Content-Type": "application/json" },
         signal: controller.signal,
+        // The magnitude, not the sign: a suggestion looks for the amount as a
+        // document prints it, and a document prints a reduced commitment of
+        // -250 as 250.
         body: JSON.stringify({
-          ...(/^\d+(\.\d{1,6})?$/.test(draft.amount)
-            ? { amount: draft.amount }
+          ...(amountSchema.safeParse(draft.amount.replace(/^-/, "")).success
+            ? { amount: draft.amount.replace(/^-/, "") }
             : {}),
           ...(draft.entryDate === "" ? {} : { entryDate: draft.entryDate }),
         }),
@@ -127,9 +142,9 @@ export function EntryDrawer({
   const needsRate = draft.currency !== "USD";
   const valid =
     draft.investmentId !== "" &&
-    /^\d{1,20}(\.\d{1,6})?$/.test(draft.amount) &&
-    /^\d{4}-\d{2}-\d{2}$/.test(draft.entryDate) &&
-    (!needsRate || /^\d{1,10}(\.\d{1,10})?$/.test(draft.exchangeRate));
+    amountSchemaFor(draft.entryType).safeParse(draft.amount).success &&
+    isoDateSchema.safeParse(draft.entryDate).success &&
+    (!needsRate || rateSchema.safeParse(draft.exchangeRate).success);
 
   const visible = useMemo(
     () =>

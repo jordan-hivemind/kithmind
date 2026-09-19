@@ -22,6 +22,39 @@ import {
   planImport,
   runImport,
 } from "./investment-import";
+import { amountSchemaFor } from "./investment-schemas";
+
+describe("the amount rule the drawer and the routes share", () => {
+  it("accepts a negative amount for a commitment change and no other type", () => {
+    // The drawer's Save button asks this, and so does the route. They used to
+    // disagree: the drawer carried an unsigned copy, so a reduced commitment
+    // could be typed and never saved.
+    expect(amountSchemaFor("commitment_change").safeParse("-250.00").success).toBe(
+      true,
+    );
+    for (const entryType of [
+      "capital_call_paid",
+      "distribution",
+      "commitment",
+      "fee",
+      "write_off",
+      "other",
+    ]) {
+      expect(
+        amountSchemaFor(entryType).safeParse("-250.00").success,
+        entryType,
+      ).toBe(false);
+      expect(amountSchemaFor(entryType).safeParse("250.00").success).toBe(true);
+    }
+    expect(amountSchemaFor("commitment_change").safeParse("250.00").success).toBe(
+      true,
+    );
+    // Still a decimal string, signed or not.
+    expect(amountSchemaFor("commitment_change").safeParse("-2.5e3").success).toBe(
+      false,
+    );
+  });
+});
 
 const SUMMARY_CSV = [
   "Investment,Docs Signed,Category,Committed,Sent,Outstanding Commitment,Received,Status,Comment,Comment 2",
@@ -255,6 +288,31 @@ describe("the preview", () => {
     ).toEqual([]);
   });
 
+  it("sums converted rows unrounded, the way the store does", () => {
+    // Two 100.00 GBP calls at 1.00005 are 100.005 USD each. Rounding per row
+    // first gives 200.02; the store converts, sums and rounds once, which
+    // gives 200.01. The sheet agrees with the store, so the preview must say
+    // nothing -- an acknowledgement demanded for a rounding artifact teaches
+    // the operator to tick the box without reading it.
+    const summary = [
+      "Investment,Docs Signed,Category,Committed,Sent,Outstanding Commitment,Received,Status",
+      "Alpha,2024-01-01,Direct,1000,200.01,799.99,0,Active",
+    ].join("\n");
+    const ledger = [
+      "Date,Investment,Amount,GBP,Exchange Rate,Comment",
+      "2024-02-01,Alpha,,-100,1.00005,",
+      "2024-03-01,Alpha,,-100,1.00005,",
+    ].join("\n");
+    const preview = buildPreview(summary, ledger);
+    expect(preview.ledger[0]!.usdAmount).toBe("100.005");
+    expect(preview.reconciliation).toEqual([]);
+
+    // And the per-row rate check still compares at cents, which is the
+    // precision the sheet's own USD column carries.
+    expect(multiplyDecimals("100.00", "1.00005")).toBe("100.01");
+    expect(multiplyDecimals("100.00", "1.00005", 6)).toBe("100.005");
+  });
+
   it("reports the difference with its sign and a label when the tabs disagree", () => {
     const summary = [
       "Investment,Docs Signed,Category,Committed,Sent,Outstanding Commitment,Received,Status",
@@ -330,17 +388,19 @@ describe("planning", () => {
 });
 
 describe("running", () => {
-  function writer(
-    overrides: Partial<ImportWriter> = {},
-  ): ImportWriter & { entries: [string, EntryBody][] } {
+  function writer(overrides: Partial<ImportWriter> = {}): ImportWriter & {
+    entries: [string, EntryBody][];
+    created: InvestmentFields[];
+  } {
     const entries: [string, EntryBody][] = [];
-    const investments: InvestmentFields[] = [];
+    const created: InvestmentFields[] = [];
     let next = 0;
     return {
       entries,
+      created,
       existing: new Map(),
       createInvestment: async (fields) => {
-        investments.push(fields);
+        created.push(fields);
         next += 1;
         return { id: `investment-${next}`, created: true };
       },
@@ -382,13 +442,37 @@ describe("running", () => {
   });
 
   it("reuses an investment that already exists rather than creating it", async () => {
+    // `existing` is built including archived investments. One the owner
+    // archived is still the investment the sheet names, and creating a live
+    // second one beside it is what the partial unique index cannot refuse.
     const io = writer({ existing: new Map([["alpha", "already-here"]]) });
     const outcome = await runImport(
       planImport(buildPreview(SMALL_SUMMARY, SMALL_LEDGER)),
       io,
     );
     expect(outcome.investmentsCreated).toBe(1);
-    expect(io.entries[0]![0]).toBe("already-here");
+    expect(outcome.investmentsExisting).toBe(1);
+    expect(io.created.map((fields) => fields.name)).toEqual(["Beta"]);
+    // Every Alpha row lands on the row that was already there.
+    expect(io.entries.filter(([id]) => id === "already-here")).toHaveLength(2);
+  });
+
+  it("counts an investment once however many rows name it", async () => {
+    const ledger = [
+      "Date,Investment,Amount,GBP,Exchange Rate,Comment",
+      "2024-02-01,Alpha,-100,,,",
+      "2024-03-01,Alpha,-100,,,",
+      "2024-04-01,Alpha,-100,,,",
+      "2024-05-01,Beta,-100,,,",
+    ].join("\n");
+    const io = writer({ existing: new Map([["alpha", "already-here"]]) });
+    const outcome = await runImport(
+      planImport(buildPreview(SMALL_SUMMARY, ledger)),
+      io,
+    );
+    // Not four: the Summary row and three Ledger rows resolve one name.
+    expect(outcome.investmentsExisting).toBe(1);
+    expect(outcome.investmentsCreated).toBe(1);
   });
 
   it("counts a row the import key already covered as existing, not created", async () => {

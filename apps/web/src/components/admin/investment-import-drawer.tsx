@@ -31,6 +31,7 @@ import {
   type ImportPreview,
   type LedgerDraft,
   planImport,
+  roundToScale,
 } from "@/lib/kith/investment-import";
 
 export function ImportDrawer({
@@ -217,7 +218,12 @@ export function ImportDrawer({
                     }
                   >
                     {row.amount} {row.currency}
-                    {row.currency === "USD" ? "" : ` → ${row.usdAmount}`}
+                    {/* Converted at this row's own rate, shown at cents. The
+                        reconciliation adds the unrounded values, the way the
+                        store does. */}
+                    {row.currency === "USD"
+                      ? ""
+                      : ` → ${roundToScale(row.usdAmount, 2).value}`}
                   </span>
                   <button
                     type="button"

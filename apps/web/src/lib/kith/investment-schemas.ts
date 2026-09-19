@@ -33,6 +33,19 @@ export const amountSchema = z.string().regex(/^\d{1,20}(\.\d{1,6})?$/);
 export const signedAmountSchema = z
   .string()
   .regex(/^-?\d{1,20}(\.\d{1,6})?$/);
+
+/**
+ * The amount rule for one entry type.
+ *
+ * One function, so the drawer's Save button and the route's validation cannot
+ * disagree about what a valid amount is. They did: the drawer carried its own
+ * unsigned copy of the pattern, so a reduced commitment could be typed and
+ * never saved, with Save staying dead and saying nothing about why.
+ */
+export function amountSchemaFor(entryType: string): z.ZodType<string> {
+  return entryType === "commitment_change" ? signedAmountSchema : amountSchema;
+}
+
 export const rateSchema = z.string().regex(/^\d{1,10}(\.\d{1,10})?$/);
 export const isoDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
 export const currencySchema = z.string().regex(/^[A-Z]{3}$/);

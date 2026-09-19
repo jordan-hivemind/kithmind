@@ -72,7 +72,15 @@ export type LedgerDraft = {
   note: string | null;
   /** Which branch of the rule produced the type, for the preview. */
   why: string;
-  /** This row's value in USD: the amount itself, or amount times rate. */
+  /**
+   * This row's value in USD: the amount itself, or amount times rate, at the
+   * money column's own scale rather than rounded to cents.
+   *
+   * Unrounded because the reconciliation adds these and the store adds the
+   * unrounded products too, rounding once at the end. Rounding per row here
+   * made a sheet the store accepts as balanced show a difference of a few
+   * cents, which forced the operator to acknowledge a rounding artifact.
+   */
   usdAmount: string;
   /**
    * The sheet's own USD `Amount` beside what the rate produces, for a row that
@@ -259,16 +267,28 @@ export function subtractDecimals(left: string, right: string): string {
   );
 }
 
-/** `amount * rate`, rounded to two places. The conversion the store performs
- * in `numeric`, performed here for the preview's reconciliation only. */
-export function multiplyDecimals(amount: string, rate: string): string {
+/**
+ * `amount * rate`, at `scale` decimal places.
+ *
+ * The store converts each entry and sums the unrounded products, rounding
+ * once at the end. The preview has to convert the same way, or a sheet the
+ * store would call balanced shows a difference of a few cents here and the
+ * operator is made to acknowledge a rounding artifact. So rows are converted
+ * at `MONEY_SCALE` and the reconciliation rounds its own totals once; only
+ * the figure shown beside a row is rounded to cents.
+ */
+export function multiplyDecimals(
+  amount: string,
+  rate: string,
+  scale = 2,
+): string {
   const product = units(amount, MONEY_SCALE) * units(rate, RATE_SCALE);
-  const divisor = 10n ** BigInt(MONEY_SCALE + RATE_SCALE - 2);
+  const divisor = 10n ** BigInt(MONEY_SCALE + RATE_SCALE - scale);
   const half = divisor / 2n;
   const negative = product < 0n;
-  const absolute = negative ? -product : product;
-  const cents = (absolute + half) / divisor;
-  return fromUnits(negative ? -cents : cents, 2);
+  const magnitude = negative ? -product : product;
+  const scaled = (magnitude + half) / divisor;
+  return fromUnits(negative ? -scaled : scaled, scale);
 }
 
 function absolute(value: string): string {
@@ -458,15 +478,22 @@ export function mapLedger(
       notes.push("exchange rate rounded to 10 decimal places");
     }
 
+    // Kept at the money column's scale: the reconciliation adds these, and
+    // the store adds the unrounded products too.
     const convertedUsd =
       currency === "USD"
         ? amountSource.amount
-        : multiplyDecimals(amountSource.amount, rate!.rate);
+        : multiplyDecimals(amountSource.amount, rate!.rate, MONEY_SCALE);
     // Both columns stated: the sheet is checkable against itself, and an
-    // inverted rate shows up here rather than in a total months later.
+    // inverted rate shows up here rather than in a total months later. The
+    // comparison itself is at cents, because that is the precision the sheet's
+    // own USD column carries.
     const rateCheck =
       currency === "GBP" && usd !== null
-        ? checkRate(usd.amount, convertedUsd)
+        ? checkRate(
+            usd.amount,
+            multiplyDecimals(amountSource.amount, rate!.rate),
+          )
         : null;
 
     const identity = `ledger:${investmentName.toLowerCase()}:${entryDate}:${currency}:${
@@ -530,6 +557,12 @@ function checkRate(
  * compared only USD rows, which meant any investment with a GBP call always
  * showed a difference the size of that call -- a warning that fires every time
  * is a warning nobody reads.
+ *
+ * The conversion is summed unrounded and rounded once at the end, which is
+ * what the store does. Rounding each row first put the preview a few cents
+ * away from the totals the screen would go on to show, and an acknowledgement
+ * demanded for a rounding artifact teaches the operator to tick the box
+ * without reading it.
  */
 export function reconcile(
   summary: readonly SummaryDraft[],
@@ -541,17 +574,18 @@ export function reconcile(
       (entry) =>
         entry.investmentName.toLowerCase() === investment.name.toLowerCase(),
     );
+    const sumAs = (entryType: LedgerDraft["entryType"]) =>
+      roundToScale(
+        addDecimals(
+          mine
+            .filter((entry) => entry.entryType === entryType)
+            .map((entry) => entry.usdAmount),
+        ),
+        2,
+      ).value;
     const totals = {
-      sent: addDecimals(
-        mine
-          .filter((entry) => entry.entryType === "capital_call_paid")
-          .map((entry) => entry.usdAmount),
-      ),
-      received: addDecimals(
-        mine
-          .filter((entry) => entry.entryType === "distribution")
-          .map((entry) => entry.usdAmount),
-      ),
+      sent: sumAs("capital_call_paid"),
+      received: sumAs("distribution"),
     };
     const stated = {
       sent: investment.statedSent,
@@ -777,7 +811,14 @@ function pushEntry(
 /** What `runImport` needs from the outside world. Three functions, so the
  * orchestration is testable without a network. */
 export type ImportWriter = {
-  /** The investments that already exist, by lower-cased name. */
+  /**
+   * The investments that already exist, by lower-cased name.
+   *
+   * Archived ones included. The screen's ordinary read excludes them, and
+   * building this map from that read meant a sheet naming an investment the
+   * owner had archived created a live second one beside it -- the partial
+   * unique index only covers live rows, so nothing refused it.
+   */
   existing: ReadonlyMap<string, string>;
   createInvestment: (
     fields: InvestmentFields,
@@ -815,15 +856,27 @@ export async function runImport(
     results,
   };
 
+  // Counted once per investment, not once per row that mentions one: the
+  // Summary row and every Ledger row for the same fund resolve the same name,
+  // and counting each of them would report thirty "existing" investments for
+  // one that was already here.
+  const counted = new Set<string>();
   const ensure = async (
     name: string,
     fields?: InvestmentFields,
   ): Promise<string> => {
     const key = name.toLowerCase();
     const known = byName.get(key);
-    if (known !== undefined) return known;
+    if (known !== undefined) {
+      if (!counted.has(key)) {
+        counted.add(key);
+        outcome.investmentsExisting += 1;
+      }
+      return known;
+    }
     const created = await writer.createInvestment(fields ?? { name });
     byName.set(key, created.id);
+    counted.add(key);
     if (created.created) outcome.investmentsCreated += 1;
     else outcome.investmentsExisting += 1;
     return created.id;

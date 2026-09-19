@@ -327,9 +327,20 @@ export function InvestmentsTable({
    */
   const performImport = useCallback(
     async (preview: ImportPreview) => {
+      // Read again, including the archived. The screen's own list excludes
+      // them, and a sheet naming an investment the owner archived would then
+      // create a live second one beside it: the unique index is partial on
+      // live rows, so nothing would have refused the duplicate.
+      const response = await fetch("/api/kith/investments?includeArchived=1", {
+        headers: { "Content-Type": "application/json" },
+        cache: "no-store",
+      });
+      if (!response.ok) throw new Error("investments fetch failed");
+      const all = ((await response.json()) as { investments: Investment[] })
+        .investments;
       const writer: ImportWriter = {
         existing: new Map(
-          investments.map((investment) => [
+          all.map((investment) => [
             investment.name.toLowerCase(),
             investment.id,
           ]),
@@ -358,7 +369,7 @@ export function InvestmentsTable({
       await queryClient.invalidateQueries({ queryKey: ENTRIES_KEY });
       return outcome;
     },
-    [investments, queryClient, spaceId],
+    [queryClient, spaceId],
   );
 
   const columns = useMemo<ColumnDef<Row, unknown>[]>(
