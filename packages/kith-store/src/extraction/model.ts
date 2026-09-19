@@ -1246,6 +1246,19 @@ async function store(
     (page) => page.lines.length > MAX_PAGE_LINES,
   );
   const truncated = droppedPages || droppedLines;
+  // Hoisted: both the row below and every `openCorrection` call past it need
+  // the kind this run read the document as (ADM-8a: a document-kind mute
+  // checks against exactly this value), so it is computed once rather than
+  // repeating `type ? type.kind : "other"` at each site.
+  const documentKind = type ? type.kind : "other";
+  // ADM-8a: the source root this document's account watches, when that is
+  // unambiguous -- see the function for why "unambiguous" is as far as this
+  // goes.
+  const sourceRootId = await resolveUnambiguousSourceRoot(
+    client,
+    loaded.spaceId,
+    loaded.sourceAccountId,
+  );
   await client.query(
     `INSERT INTO kith.document_extractions
        (id,space_id,source_item_id,processing_generation_id,event_id,kind,
@@ -1267,7 +1280,7 @@ async function store(
       loaded.sourceItemId,
       loaded.processingGenerationId,
       eventId,
-      type ? type.kind : "other",
+      documentKind,
       type?.id ?? null,
       type?.version ?? null,
       reading.summary || null,
@@ -1323,6 +1336,8 @@ async function store(
       fieldName: failure.field,
       reason: failure.reason,
       reading: failure.reading,
+      documentKind,
+      sourceRootId,
     });
   }
   if (refusedModel !== null) {
@@ -1334,6 +1349,8 @@ async function store(
       fieldName: null,
       reason: "extraction_model_refused",
       reading: { requestedModel: refusedModel, usedModel: modelName },
+      documentKind,
+      sourceRootId,
     });
   }
   if (truncated) {
@@ -1351,15 +1368,47 @@ async function store(
           ...loaded.pages.map((page) => page.lines.length),
         ),
       },
+      documentKind,
+      sourceRootId,
     });
   }
   return {
     sourceItemId: loaded.sourceItemId,
-    kind: type ? type.kind : "other",
+    kind: documentKind,
     stored: prepared.observations.length,
     failed: prepared.failures.length,
     truncated,
   };
+}
+
+/**
+ * The one source root a document's account watches, when that is
+ * unambiguous (ADM-8a: a `source_root` attention mute needs a root id per
+ * document).
+ *
+ * `source_items` carries no direct root column -- a real resolution would
+ * match the item's `fs://<alias>/<path>` URI against `source_roots`' own
+ * alias and relative path, the way the watcher itself does, and that is
+ * genuine matching logic this slice is deliberately not building. When an
+ * account has exactly one root there is nothing to disambiguate and this is
+ * exact; with more than one (or none) it returns `null` rather than
+ * guessing, so a `source_root` mute simply does not fire for that document
+ * instead of firing on the wrong one.
+ *
+ * ponytail: upgrade path is the alias/relative-path resolution above, once a
+ * real need for per-subtree mutes on a multi-root account shows up.
+ */
+async function resolveUnambiguousSourceRoot(
+  client: ClientBase,
+  spaceId: string,
+  sourceAccountId: string,
+): Promise<string | null> {
+  const found = await client.query<{ id: string }>(
+    `SELECT id FROM kith.source_roots
+      WHERE space_id = $1 AND source_account_id = $2 LIMIT 2`,
+    [spaceId, sourceAccountId],
+  );
+  return found.rows.length === 1 ? found.rows[0]!.id : null;
 }
 
 // ---------------------------------------------------------------------------

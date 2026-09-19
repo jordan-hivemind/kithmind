@@ -52,12 +52,23 @@ export const DISMISS_REASONS = [
 ] as const;
 export type DismissReason = (typeof DISMISS_REASONS)[number];
 
+/**
+ * What a mute may be scoped to, in this slice.
+ *
+ * Migration 030's `attention_mutes.scope_kind` CHECK allows two more values,
+ * `investment` and `before_date`, and is deliberately left that way (a
+ * narrower application-level list costs no migration to widen later). They
+ * are refused here rather than accepted: no detector in this slice writes a
+ * correction whose target is an investment, and `isAttentionMuted` has no
+ * SQL branch for `before_date` at all, so creating either kind today would
+ * be a mute that silently never fires -- worse than refusing it, because a
+ * mute is a promise the owner is relying on. `investment` arrives with the
+ * matching slice that gives it something to scope.
+ */
 export const MUTE_SCOPE_KINDS = [
   "detector",
-  "investment",
   "source_root",
   "document_kind",
-  "before_date",
 ] as const;
 export type MuteScopeKind = (typeof MUTE_SCOPE_KINDS)[number];
 
@@ -452,6 +463,33 @@ async function writableAttentionItem(
 }
 
 /**
+ * The state machine every single-row transition below agrees to: `open` and
+ * `snoozed` accept both dismiss and snooze; `dismissed` accepts dismiss
+ * (idempotent) but refuses snooze (undo it first -- snoozing a permanently
+ * dismissed row would be a back door around "remembered forever"); and
+ * `resolved` -- an owner correction, or a condition `supersedeOpenCorrections`
+ * already cleared -- refuses both, because there is nothing open about it to
+ * act on. Refusing rather than silently clearing `resolved_at` also means no
+ * caller can hit `corrections_resolved_check` or `corrections_snoozed_check`:
+ * every UPDATE below fully owns the columns the other states use, but only
+ * ever runs from a state where crossing into it is a real decision.
+ */
+function refuseUnlessTransitionAllowed(
+  action: "dismiss" | "snooze",
+  state: AttentionState,
+): void {
+  if (state === "resolved") {
+    typedError(
+      "already_resolved",
+      `This item is already resolved and cannot be ${action === "dismiss" ? "dismissed" : "snoozed"}`,
+    );
+  }
+  if (action === "snooze" && state === "dismissed") {
+    typedError("already_dismissed", "This item is dismissed; undo it before snoozing");
+  }
+}
+
+/**
  * Dismiss, permanently: "not worth backfilling" and the other closed
  * reasons. Remembered forever by `dedupe_key` -- `openCorrection`'s lookup
  * refuses to reopen a `dismissed` row, so a detector re-finding the same
@@ -460,20 +498,26 @@ async function writableAttentionItem(
  *
  * Idempotent: dismissing an already-dismissed row updates the reason and
  * leaves `dismissed_at` where it was, because "when was this dismissed"
- * should not move because the owner clicked twice.
+ * should not move because the owner clicked twice. Dismissing a `snoozed`
+ * row is also allowed (the owner snoozed it, then decided not to see it
+ * again) and clears `snoozed_until` in the same statement -- left set, it
+ * would violate `corrections_snoozed_check` the moment `state` stopped
+ * being `snoozed`.
  */
 export async function dismissAttention(
   ctx: IdentityCtx,
   args: { principal: Principal; id: string; reason: DismissReason },
 ): Promise<void> {
   const target = await writableAttentionItem(ctx, args.principal, args.id);
+  refuseUnlessTransitionAllowed("dismiss", target.state);
   const reason = oneOf(args.reason, DISMISS_REASONS, "Dismiss reason");
   await exec(
     ctx,
     `UPDATE kith.corrections SET
        state = 'dismissed',
        dismissed_at = coalesce(dismissed_at, transaction_timestamp()),
-       dismissed_by = $2, dismiss_reason = $3
+       dismissed_by = $2, dismiss_reason = $3,
+       snoozed_until = NULL, resolved_at = NULL
      WHERE id = $1`,
     [target.id, args.principal.userId, reason],
   );
@@ -499,18 +543,31 @@ export async function undoDismissAttention(
   );
 }
 
-/** Hides a row from the default view and from every alert until `until`
- * (an ISO date) passes. Section 5: "hides the row from the default filter and
- * from every alert until it passes." */
+/**
+ * Hides a row from the default view and from every alert until `until` (an
+ * ISO date) passes. Section 5: "hides the row from the default filter and
+ * from every alert until it passes."
+ *
+ * Re-snoozing an already-`snoozed` row (to change the date) is allowed and
+ * clears nothing extra -- only `snoozed_until` itself changes. Snoozing a
+ * `dismissed` row is refused (see `refuseUnlessTransitionAllowed`); an
+ * `open` row snoozing for the first time clears `dismissed_at`,
+ * `dismissed_by`, `dismiss_reason` and `resolved_at` defensively, though an
+ * `open` row's invariants already guarantee all four are null.
+ */
 export async function snoozeAttention(
   ctx: IdentityCtx,
   args: { principal: Principal; id: string; until: string },
 ): Promise<void> {
   const target = await writableAttentionItem(ctx, args.principal, args.id);
+  refuseUnlessTransitionAllowed("snooze", target.state);
   const until = isoDate(args.until, "Snooze until");
   await exec(
     ctx,
-    `UPDATE kith.corrections SET state = 'snoozed', snoozed_until = $2
+    `UPDATE kith.corrections SET
+       state = 'snoozed', snoozed_until = $2,
+       dismissed_at = NULL, dismissed_by = NULL, dismiss_reason = NULL,
+       resolved_at = NULL
       WHERE id = $1`,
     [target.id, until],
   );
@@ -518,8 +575,9 @@ export async function snoozeAttention(
 
 /**
  * One filter, four shapes: an explicit id list, or a class the plan names --
- * a whole detector, a whole document kind, a whole investment, or everything
- * created before a date.
+ * a whole detector, a whole document kind, a whole investment, or every
+ * document dated before a date (see the `beforeDate` case below for what
+ * "dated" means -- it is never `corrections.created_at`).
  *
  * `investment` is accepted and validated here for the same forward-
  * compatibility reason `kith.attention_mutes.scope_kind` includes it: no
@@ -561,10 +619,60 @@ function filterClause(
       // See the module comment above: never matches today.
       values.push(assertKithId(filter.investmentId, "invalid_investment_id"));
       return `c.target_kind = 'investment' AND c.target_id = $${values.length}`;
-    case "beforeDate":
+    case "beforeDate": {
+      // The *document's* date, not `corrections.created_at` (when the row
+      // was opened, which can be long after the paper itself and says
+      // nothing about "how old is the stuff I never filed"). Preferred:
+      // the extraction's own occurrence date -- the first date-typed field
+      // the model read off the document (`prepared.occurrence` in
+      // `model.ts`), carried on the `document_statement` event's current
+      // version. Falls back to the source item's own provider-reported
+      // modified time when the document states no date, or has not been
+      // extracted at all. A document offering neither is skipped -- never
+      // matched -- rather than judged by when this table happened to open
+      // a row for it.
       values.push(isoDate(filter.beforeDate, "Before date"));
-      return `c.created_at < $${values.length}::date`;
+      const at = values.length;
+      return `c.target_kind = 'document' AND EXISTS (
+        SELECT 1 FROM kith.source_items si
+         WHERE si.id = c.target_id AND si.space_id = c.space_id
+           AND coalesce(
+             (
+               SELECT ev.occurrence_date::date
+                 FROM kith.document_extractions de
+                 JOIN kith.event_versions ev
+                   ON ev.event_id = de.event_id AND ev.space_id = de.space_id
+                WHERE de.source_item_id = si.id AND de.space_id = si.space_id
+                ORDER BY ev.created_at DESC LIMIT 1
+             ),
+             si.worker_source_modified_at::date
+           ) < $${at}::date
+      )`;
+    }
   }
+}
+
+/**
+ * How many open-or-snoozed rows a filter would touch, without touching them.
+ * The "Dismiss everything before [date]" control is unbounded and owner-
+ * visible, so its confirm dialog states a real count rather than "some" --
+ * this is what it calls first.
+ */
+export async function countAttentionByFilter(
+  ctx: IdentityCtx,
+  args: { principal: Principal; spaceId: string; filter: AttentionFilter },
+): Promise<number> {
+  const spaceId = assertKithId(args.spaceId, "invalid_space_id");
+  await requireSpaceAccess(ctx, args.principal, spaceId, "write");
+  const values: unknown[] = [spaceId];
+  const clause = filterClause(args.filter, values);
+  const counted = await row<{ n: string }>(
+    ctx,
+    `SELECT count(*)::text AS n FROM kith.corrections c
+      WHERE c.space_id = $1 AND c.state IN ('open', 'snoozed') AND ${clause}`,
+    values,
+  );
+  return Number(counted?.n ?? 0);
 }
 
 /**
@@ -588,9 +696,12 @@ export async function bulkDismissAttention(
   const values: unknown[] = [spaceId, args.principal.userId, reason];
   const clause = filterClause(args.filter, values);
   const result = await ctx.client.query(
+    // `snoozed_until = NULL`: the WHERE below matches `snoozed` rows too,
+    // and leaving it set on a row that is about to become `dismissed`
+    // violates `corrections_snoozed_check` the instant the UPDATE commits.
     `UPDATE kith.corrections c SET
        state = 'dismissed', dismissed_at = transaction_timestamp(),
-       dismissed_by = $2, dismiss_reason = $3
+       dismissed_by = $2, dismiss_reason = $3, snoozed_until = NULL
      WHERE c.space_id = $1 AND c.state IN ('open', 'snoozed') AND ${clause}`,
     values,
   );
@@ -672,10 +783,7 @@ export async function addAttentionMute(
   const spaceId = assertKithId(args.spaceId, "invalid_space_id");
   await requireSpaceAccess(ctx, args.principal, spaceId, "write");
   const scopeKind = oneOf(args.scopeKind, MUTE_SCOPE_KINDS, "Scope kind");
-  const scopeValue =
-    scopeKind === "before_date"
-      ? isoDate(args.scopeValue, "Scope value")
-      : boundedText(args.scopeValue, "Scope value", 512);
+  const scopeValue = boundedText(args.scopeValue, "Scope value", 512);
   const reason =
     args.reason === null || args.reason === undefined || args.reason === ""
       ? null
