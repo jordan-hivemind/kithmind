@@ -18,11 +18,14 @@ import test from "node:test";
 import { newKithId } from "../dist/index.js";
 import {
   applyCeiling,
+  ceilingWhereSql,
   documentSensitivity,
   DEFAULT_MAX_SENSITIVITY,
   maxSensitivity,
+  sourceItemSensitivity,
   withinCeiling,
 } from "../dist/sensitivity/index.js";
+import { setApiKeyMaxSensitivity } from "../dist/identity/index.js";
 import {
   identityDatabase,
   makeMember,
@@ -350,4 +353,191 @@ test("the level comparison helpers are total and ordered", { skip: false }, () =
   assert.equal(withinCeiling("restricted", "sensitive"), false);
   assert.equal(withinCeiling("normal", "normal"), true);
   assert.equal(withinCeiling("sensitive", "normal"), false);
+});
+
+// ---------------------------------------------------------------------------
+// Coverage beyond search_documents (review follow-up)
+// ---------------------------------------------------------------------------
+
+test("the item view and the document view agree about one document", { skip }, async (t) => {
+  const { ctx, spaceId } = await fixture(t);
+  await seedType(ctx, spaceId, "tax_return", "restricted");
+  const tax = await seedDocument(ctx, spaceId, {
+    title: "1040",
+    docType: "tax_return",
+  });
+  const ordinary = await seedDocument(ctx, spaceId, { title: "Receipt" });
+
+  // The document view resolves the kind from `doc_type`; the item view cannot
+  // see `doc_type` at all, so for a document whose level comes only from its
+  // kind name the two legitimately differ -- and that is exactly why the
+  // document view exists on top of the item view rather than instead of it.
+  const byDocument = await documentSensitivity(ctx.client, [tax.documentId]);
+  assert.equal(byDocument.get(tax.documentId), "restricted");
+
+  // An owner override on the ITEM is visible to both, which is the path the
+  // record queries and the inventory depend on.
+  await ctx.client.query(
+    "UPDATE kith.source_items SET sensitivity = $2 WHERE id = $1",
+    [ordinary.sourceItemId, "restricted"],
+  );
+  const byItem = await sourceItemSensitivity(ctx.client, [
+    ordinary.sourceItemId,
+  ]);
+  assert.equal(byItem.get(ordinary.sourceItemId), "restricted");
+  const alsoByDocument = await documentSensitivity(ctx.client, [
+    ordinary.documentId,
+  ]);
+  assert.equal(
+    alsoByDocument.get(ordinary.documentId),
+    "restricted",
+    "an item override must reach the document view too",
+  );
+});
+
+test("applyCeiling at source-item grain withholds and counts", { skip }, async (t) => {
+  const { ctx, spaceId } = await fixture(t);
+  const open = await seedDocument(ctx, spaceId, { title: "Receipt" });
+  const closed = await seedDocument(ctx, spaceId, { title: "Statement" });
+  await ctx.client.query(
+    "UPDATE kith.source_items SET sensitivity = $2 WHERE id = $1",
+    [closed.sourceItemId, "restricted"],
+  );
+  const rows = [open, closed];
+
+  const full = await applyCeiling(
+    ctx.client,
+    rows,
+    (row) => row.sourceItemId,
+    "restricted",
+    "sourceItem",
+  );
+  assert.equal(full.visible.length, 2, "the default ceiling hides nothing");
+  assert.equal(full.withheld, 0);
+
+  const narrowed = await applyCeiling(
+    ctx.client,
+    rows,
+    (row) => row.sourceItemId,
+    "sensitive",
+    "sourceItem",
+  );
+  assert.deepEqual(narrowed.visible.map((row) => row.sourceItemId), [
+    open.sourceItemId,
+  ]);
+  assert.equal(narrowed.withheld, 1);
+});
+
+test("the record-query SQL fragment excludes above-ceiling source items", { skip }, async (t) => {
+  const { ctx, spaceId } = await fixture(t);
+  const open = await seedDocument(ctx, spaceId, { title: "Receipt" });
+  const closed = await seedDocument(ctx, spaceId, { title: "1040" });
+  await ctx.client.query(
+    "UPDATE kith.source_items SET sensitivity = $2 WHERE id = $1",
+    [closed.sourceItemId, "restricted"],
+  );
+
+  // The default ceiling produces no SQL at all, so the query the owner's own
+  // credential runs is byte for byte the one that ran before this feature.
+  assert.equal(
+    ceilingWhereSql("restricted", "kith.source_items.id"),
+    "",
+  );
+
+  // A narrowed ceiling filters in SQL, which is what `sum_money` needs: the
+  // aggregation must never see the withheld row.
+  const fragment = ceilingWhereSql("sensitive", "kith.source_items.id");
+  const rows = await ctx.client.query(
+    `SELECT id FROM kith.source_items WHERE space_id = $1${fragment} ORDER BY id`,
+    [spaceId],
+  );
+  assert.deepEqual(
+    rows.rows.map((row) => row.id).sort(),
+    [open.sourceItemId].sort(),
+    "the restricted item must not reach the aggregation",
+  );
+
+  // The fragment refuses anything that is not a qualified column reference.
+  assert.throws(() =>
+    ceilingWhereSql("normal", "kith.source_items.id; DROP TABLE"),
+  );
+  // And it refuses a BARE column, which would silently bind to the subquery's
+  // own `source_item_id` and filter every row away instead of filtering right.
+  assert.throws(
+    () => ceilingWhereSql("normal", "source_item_id"),
+    /qualified/,
+  );
+});
+
+test("only an owner session may change a key's ceiling", { skip }, async (t) => {
+  const { ctx, userId } = await fixture(t);
+  const keyId = newKithId();
+  await ctx.client.query(
+    `INSERT INTO kith.api_keys (id, user_id, key_hash, key_prefix, name, capabilities)
+       VALUES ($1, $2, $3, 'kith_test_', 'Test key', '["read"]'::jsonb)`,
+    [keyId, userId, "a".repeat(64)],
+  );
+
+  // A web session has no credentialId, and may narrow the key.
+  await setApiKeyMaxSensitivity(ctx, {
+    principal: { userId, capabilities: ["read", "write", "ingest"] },
+    id: keyId,
+    maxSensitivity: "normal",
+  });
+  const after = await ctx.client.query(
+    "SELECT max_sensitivity FROM kith.api_keys WHERE id = $1",
+    [keyId],
+  );
+  assert.equal(after.rows[0].max_sensitivity, "normal");
+
+  // A bearer-authenticated principal carries a credentialId and is refused --
+  // including when it is the very key it is trying to widen. A credential that
+  // could raise its own ceiling would make the ceiling decorative.
+  await assert.rejects(
+    setApiKeyMaxSensitivity(ctx, {
+      principal: { userId, credentialId: keyId, capabilities: ["read"] },
+      id: keyId,
+      maxSensitivity: "restricted",
+    }),
+    /API key not found/,
+  );
+  const unchanged = await ctx.client.query(
+    "SELECT max_sensitivity FROM kith.api_keys WHERE id = $1",
+    [keyId],
+  );
+  assert.equal(
+    unchanged.rows[0].max_sensitivity,
+    "normal",
+    "the bearer attempt must not have widened anything",
+  );
+
+  // Another user's session cannot touch it either.
+  const strangerId = await makeUser(ctx, { name: "Stranger" });
+  await assert.rejects(
+    setApiKeyMaxSensitivity(ctx, {
+      principal: { userId: strangerId, capabilities: ["read"] },
+      id: keyId,
+      maxSensitivity: "restricted",
+    }),
+    /API key not found/,
+  );
+});
+
+test("a new key defaults to full access", { skip }, async (t) => {
+  const { ctx, userId } = await fixture(t);
+  const keyId = newKithId();
+  await ctx.client.query(
+    `INSERT INTO kith.api_keys (id, user_id, key_hash, key_prefix, name, capabilities)
+       VALUES ($1, $2, $3, 'kith_test_', 'Test key', '["read"]'::jsonb)`,
+    [keyId, userId, "b".repeat(64)],
+  );
+  const row = await ctx.client.query(
+    "SELECT max_sensitivity FROM kith.api_keys WHERE id = $1",
+    [keyId],
+  );
+  assert.equal(
+    row.rows[0].max_sensitivity,
+    "restricted",
+    "the column default is the owner's decision: no withholding",
+  );
 });

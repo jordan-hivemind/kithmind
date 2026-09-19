@@ -452,6 +452,49 @@ export async function update(
   await replaceGrants(ctx, args.id, args.spaceIds, args.sourceAccountIds ?? []);
 }
 
+/**
+ * Change one key's sensitivity ceiling (SENS-1).
+ *
+ * Its own function rather than a field on `update`, because `update` replaces
+ * the whole grant -- name, capabilities and spaces -- and the settings kebab
+ * wants to change this one thing without restating the rest.
+ *
+ * THE SECURITY PROPERTY, and why it is enforced here rather than at the route:
+ * a credential must never be able to raise its own ceiling, or the ceiling is
+ * decorative. `/api/kith/*` authenticates from the session cookie only and has
+ * no bearer path at all today, so the route is already safe -- but "already
+ * safe" is a property of one file that a future route could get wrong. A web
+ * session's principal has no `credentialId` (see `webPrincipal`), and every
+ * API-key and OAuth principal has one, so refusing a principal that carries one
+ * is exactly "owner session only", checked where every caller must pass.
+ */
+export async function setMaxSensitivity(
+  ctx: IdentityCtx,
+  args: {
+    principal: Principal;
+    id: string;
+    maxSensitivity: SensitivityLevel;
+  },
+): Promise<void> {
+  if (args.principal.credentialId !== undefined) {
+    throw new IdentityError("API key not found", {
+      code: "unauthorized",
+      message: "API key not found",
+    });
+  }
+  const key = await getApiKey(ctx, args.id);
+  // The same conflation `revoke` uses: someone else's key, a missing key and
+  // an in-flight OAuth key are all "not found", so this cannot enumerate keys.
+  if (!key || key.userId !== args.principal.userId) {
+    throw new Error("API key not found");
+  }
+  await exec(
+    ctx,
+    `UPDATE kith.api_keys SET max_sensitivity = $2 WHERE id = $1`,
+    [args.id, args.maxSensitivity],
+  );
+}
+
 /** `models/apiKeys/public.ts` `revoke`. The grant rows cascade with it. */
 export async function revoke(
   ctx: IdentityCtx,

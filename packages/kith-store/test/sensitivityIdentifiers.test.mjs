@@ -97,6 +97,19 @@ test("a routing number needs the ABA check AND a Federal Reserve prefix", () => 
   const stray = "994829135";
   assert.equal(abaValid(stray), true, "fixture must actually pass the ABA check");
   assert.deepEqual(kinds(`Meter reading ${stray}`), []);
+
+  // Review follow-up: checksum AND a real Federal Reserve prefix are still not
+  // enough without the word. 011000015 is a genuine routing number, and an
+  // unlabelled nine-digit reference that happens to look like one is common
+  // enough (roughly one in twenty-five) that masking it would muddy the very
+  // diagnostics these log lines exist for.
+  assert.deepEqual(
+    kinds("Reference 011000015 processed"),
+    [],
+    "a valid routing number with no label is left alone",
+  );
+  assert.deepEqual(kinds("ABA 011000015"), ["routing_number"]);
+  assert.deepEqual(kinds("RTN: 011000015"), ["routing_number"]);
 });
 
 test("EIN, passport, licence and date of birth are label-only", () => {

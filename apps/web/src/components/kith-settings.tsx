@@ -22,6 +22,7 @@ import {
   type GrantableSpace,
   type KeyCapability,
   type SensitivityChoice,
+  SensitivityControl,
   SpaceGrantChoices,
 } from "@/components/space-grant-choices";
 import {
@@ -192,6 +193,30 @@ function ApiKeysSection({ data }: { data: SettingsData }) {
     }),
   });
 
+  // SENS-1. Narrowing a key that already exists, without deleting it and
+  // re-authorizing every client that uses it.
+  const setCeiling = useOptimisticMutation<
+    SettingsData,
+    { id: string; maxSensitivity: SensitivityChoice }
+  >({
+    queryKey: KEY,
+    mutationFn: ({ id, maxSensitivity }) =>
+      mutateJson(`/api/kith/api-keys/${id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ maxSensitivity }),
+      }),
+    apply: (current, { id, maxSensitivity }) => ({
+      ...current,
+      apiKeys: {
+        ...current.apiKeys,
+        page: current.apiKeys.page.map((key) =>
+          key.id === id ? { ...key, maxSensitivity } : key,
+        ),
+      },
+    }),
+  });
+  const [editing, setEditing] = useState<ApiKeyRow | null>(null);
+
   // ponytail: a resync from the server render collapses loaded pages back to
   // the first 25 keys. Keep extra pages across resyncs if anyone has more.
   async function loadMore() {
@@ -293,6 +318,11 @@ function ApiKeysSection({ data }: { data: SettingsData }) {
         disabled: (key) => isPendingId(key.id),
       },
       {
+        label: "Edit",
+        onSelect: (key) => setEditing(key),
+        disabled: (key) => isPendingId(key.id),
+      },
+      {
         label: "Revoke",
         danger: true,
         onSelect: (key) => revoke.mutate(key.id),
@@ -322,6 +352,19 @@ function ApiKeysSection({ data }: { data: SettingsData }) {
             setCreating(false);
           }}
         />
+      )}
+      {editing && (
+        <Panel>
+          <Field label="Access level" htmlFor="api-key-ceiling">
+            <SensitivityControl
+              value={editing.maxSensitivity}
+              onChange={(value) => {
+                setCeiling.mutate({ id: editing.id, maxSensitivity: value });
+                setEditing(null);
+              }}
+            />
+          </Field>
+        </Panel>
       )}
       {newRawKey && (
         <Panel tone="accent">

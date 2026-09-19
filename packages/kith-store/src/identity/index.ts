@@ -92,6 +92,7 @@ export {
   requireMcpPrincipal,
   revoke as revokeApiKey,
   update as updateApiKey,
+  setMaxSensitivity as setApiKeyMaxSensitivity,
   validateApiKeyName,
   validateApiKeyScopes,
   type ApiKeySummary,
