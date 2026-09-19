@@ -65,6 +65,11 @@ const GRANTED = Object.freeze({
     "corrections",
   ],
   extraction: ["document_extractions"],
+  // ADM-9. Both worker operations that write the watcher row -- the heartbeat
+  // that registers a host, and the pass outcome migration 029 adds beside it
+  // -- run on this credential through the worker endpoint, and neither table
+  // was in any group until now.
+  diagnostics: ["worker_watcher_states", "worker_operational_incidents"],
 });
 
 /**

@@ -61,9 +61,23 @@ export function HealthTable({ initial }: { initial: { checks: Check[] } }) {
         accessorKey: "status",
         header: "Status",
         cell: ({ row }) => (
-          <Tag tone={TONE[row.original.status]}>
-            {LABEL[row.original.status]}
-          </Tag>
+          // ADM-9: the watcher row carries a second pill, how its last pass
+          // ended, with the pass code as its tooltip. A pass that trips one of
+          // the watcher's circuit breakers writes no scan and no assessment,
+          // so this pill is the only place that pass is visible at all.
+          <span className="inline-flex items-center gap-1">
+            <Tag tone={TONE[row.original.status]}>
+              {LABEL[row.original.status]}
+            </Tag>
+            {row.original.pass && (
+              <Tag
+                tone={row.original.pass.problem ? "warn" : "neutral"}
+                title={row.original.pass.code ?? undefined}
+              >
+                {row.original.pass.state}
+              </Tag>
+            )}
+          </span>
         ),
       },
       {

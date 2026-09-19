@@ -42,6 +42,11 @@ function watcher(overrides = {}) {
     assessmentState: "complete",
     assessmentAt: NOW - MINUTE,
     notReadyReasons: {},
+    // ADM-9. A watcher whose last pass finished cleanly.
+    lastPassState: "complete",
+    lastPassCode: null,
+    lastPassAt: NOW - MINUTE,
+    unhealthyPasses: 0,
     ...overrides,
   };
 }
@@ -120,6 +125,77 @@ test("an overdue watcher is a problem and a disabled source is not", () => {
     NOW,
   );
   assert.equal(checkById(awaiting, "documents_watcher").status, "unknown");
+});
+
+// ADM-9. The gap PR #313 opened: a pass that trips a circuit breaker writes
+// no scan and so no assessment, and the heartbeat keeps arriving, so before
+// this the whole screen read `ok` while the watcher ingested nothing.
+test("a refused pass is a problem even while the heartbeat is current", () => {
+  for (const code of [
+    "root_selection_would_retire_items",
+    "root_contents_collapsed",
+  ]) {
+    const checks = deriveHealthChecks(
+      facts({
+        watchers: [
+          watcher({
+            lastPassState: "incomplete",
+            lastPassCode: code,
+            unhealthyPasses: 1,
+          }),
+        ],
+      }),
+      NOW,
+    );
+    const check = checkById(checks, "documents_watcher");
+    assert.equal(check.status, "problem", `${code} must count as a problem`);
+    assert.match(check.detail, /1 stuck/);
+    assert.equal(check.detail.includes("overdue"), false);
+    assert.deepEqual(check.pass, {
+      state: "incomplete",
+      code,
+      problem: true,
+    });
+  }
+});
+
+test("a failed pass is a problem, and one incomplete pass is not", () => {
+  const status = (overrides) =>
+    checkById(
+      deriveHealthChecks(facts({ watchers: [watcher(overrides)] }), NOW),
+      "documents_watcher",
+    );
+  assert.equal(status({ lastPassState: "failed", unhealthyPasses: 1 }).status,
+    "problem");
+  // One incomplete pass is ordinary: work left over, a retryable error, a
+  // parked document. The same answer twice running is a stuck watcher.
+  const once = status({
+    lastPassState: "incomplete",
+    lastPassCode: "items_need_attention",
+    unhealthyPasses: 1,
+  });
+  assert.equal(once.status, "ok");
+  assert.deepEqual(once.pass, {
+    state: "incomplete",
+    code: "items_need_attention",
+    problem: false,
+  });
+  assert.equal(
+    status({
+      lastPassState: "incomplete",
+      lastPassCode: "items_need_attention",
+      unhealthyPasses: 2,
+    }).status,
+    "problem",
+  );
+  // Nothing reported yet is not a pill and not a failure.
+  const never = status({
+    lastPassState: null,
+    lastPassCode: null,
+    lastPassAt: null,
+  });
+  assert.equal(never.status, "ok");
+  assert.equal(never.pass, undefined);
 });
 
 test("the index check escalates only when it owes more than it covers", () => {

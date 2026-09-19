@@ -902,10 +902,17 @@ function records(value: unknown, label: string): Record<string, unknown>[] {
   return value as Record<string, unknown>[];
 }
 
+/** ADM-9. `WORKER_PASS_CODE` in the protocol, applied before the send. */
+const PASS_CODE = /^[a-z0-9_]{1,64}$/;
+
 function request(
   config: PipelineConfig,
   operation:
-    JournalOperation | "source.status" | "source.roots" | "source.rootReport",
+    | JournalOperation
+    | "source.status"
+    | "source.roots"
+    | "source.rootReport"
+    | "diagnostics.passOutcome",
   extra: Record<string, unknown> = {},
 ): Record<string, unknown> {
   return {
@@ -7485,9 +7492,54 @@ export class PipelineRunner {
     throw new PipelineWorkerError("worker_step_limit");
   }
 
+  /**
+   * ADM-9. Tells the server how this pass ended.
+   *
+   * One send, from the one place every pass ends, rather than a send per
+   * terminal branch. The refusal path is why this exists -- `refuseRetirement`
+   * returns before a scan is opened, so the pass writes no scan and no
+   * processing assessment, and the health screen reads only those two things
+   * plus the heartbeat -- but a `failed` pass and every other terminal code
+   * were just as invisible, so all of them travel through here.
+   *
+   * Never changes the pass result, ever. The result is already decided when
+   * this runs; the send is best-effort, its refusal is a warning on stderr,
+   * and an old server that has never heard of the operation answers
+   * `invalid_request`, which is exactly that case. The owner's live watcher
+   * runs several commits behind on purpose, so "the server refused it" is the
+   * ordinary case and not an error.
+   */
+  private async reportPassOutcome(result: PipelineRunResult): Promise<void> {
+    try {
+      await this.transport.call(
+        request(this.config, "diagnostics.passOutcome", {
+          watcherId: this.journal.watcherId,
+          state: result.state,
+          // The codes are the pipeline's own literals, but the wire pattern is
+          // narrower than `string`; a code that does not fit is dropped rather
+          // than being allowed to make the whole report invalid.
+          ...(result.code !== undefined && PASS_CODE.test(result.code)
+            ? { code: result.code }
+            : {}),
+          scanned: result.scanned ?? 0,
+          published: result.published ?? 0,
+          finishedAt: Date.now(),
+        }),
+      );
+    } catch (error) {
+      console.warn(
+        `[pipeline] the pass outcome could not be reported (${
+          error instanceof Error ? error.message : "unknown error"
+        })`,
+      );
+    }
+  }
+
   async runSafely(): Promise<PipelineRunResult> {
     try {
-      return await this.run();
+      const result = await this.run();
+      await this.reportPassOutcome(result);
+      return result;
     } catch (error) {
       const code =
         error instanceof FilesystemFailure ||
@@ -7512,11 +7564,13 @@ export class PipelineRunner {
         process.stderr.write(`${JSON.stringify(detail)}\n`);
         await this.journal.recordFailure(detail);
       }
-      return this.withParked({
+      const failure = this.withParked({
         state:
           error instanceof PipelineRetryableError ? "incomplete" : "failed",
         code,
       });
+      await this.reportPassOutcome(failure);
+      return failure;
     }
   }
 }

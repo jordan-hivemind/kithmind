@@ -324,6 +324,17 @@ export async function grantProofAppRole(
   // already granted above with the records group.
   await owner.query(`GRANT INSERT, UPDATE, DELETE ON
     kith.document_extractions TO "${appRole}"`);
+  // Watcher diagnostics (ADM-9, and `diagnostics.heartbeat` before it). Both
+  // worker operations that write this row -- the heartbeat that registers a
+  // host and the pass outcome migration 029 adds beside it -- run through the
+  // worker endpoint on the application credential, and neither table was in
+  // any list above. The incident row is here with it because
+  // `recordWorkerHeartbeat` resolves an open incident in the same transaction,
+  // so granting one without the other leaves that path failing on its second
+  // statement.
+  await owner.query(`GRANT INSERT, UPDATE, DELETE ON
+    kith.worker_watcher_states, kith.worker_operational_incidents
+    TO "${appRole}"`);
   // The change feed (migration 023) is deliberately not in the list above.
   //
   // Nothing in the application writes `kith.changes`: rows arrive only through

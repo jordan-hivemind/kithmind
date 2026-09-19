@@ -43,6 +43,17 @@ export type HealthCheck = {
   /** The breakdown, for the tooltip. Null when there is none. */
   tooltip: string | null;
   lastCheckedAt: number | null;
+  /**
+   * ADM-9. A second pill beside the status one, for a check with a second
+   * fact worth one word. Only the watcher check sets it, with how the last
+   * pass ended; `code` is that pill's tooltip and is a closed-shape literal
+   * (`[a-z0-9_]{1,64}`), never a path, a file name or free text.
+   */
+  pass?: {
+    state: "complete" | "incomplete" | "failed";
+    code: string | null;
+    problem: boolean;
+  };
 };
 
 const MINUTE = 60_000;
@@ -91,23 +102,63 @@ export function countsLine(
 }
 
 /**
+ * ADM-9. The two client-side circuit breakers PR #313 added to the watcher.
+ *
+ * A pass that trips one of these ends `incomplete` and writes no scan at all,
+ * on purpose: neither a config mistake nor a half-synced folder may mark
+ * documents unavailable. That is the right refusal and the wrong silence --
+ * the owner has to go and fix something, and until they do the watcher is
+ * reading nothing. So either code is a problem on sight, without waiting for
+ * a second pass to agree.
+ */
+export const PASS_BREAKER_CODES: readonly string[] = [
+  "root_selection_would_retire_items",
+  "root_contents_collapsed",
+];
+
+/**
+ * ADM-9. Whether the last pass is something to act on.
+ *
+ * Three ways in, and the third is why the streak is stored. A single
+ * `incomplete` pass is ordinary -- work left over, a retryable error, a
+ * document parked -- and the next pass usually finishes it. The same thing
+ * twice running is not a pass in progress, it is a watcher that is stuck.
+ */
+export function passProblem(watcher: WatcherFact): boolean {
+  if (watcher.lastPassState === null) return false;
+  if (watcher.lastPassState === "failed") return true;
+  if (
+    watcher.lastPassCode !== null &&
+    PASS_BREAKER_CODES.includes(watcher.lastPassCode)
+  )
+    return true;
+  return watcher.lastPassState !== "complete" && watcher.unhealthyPasses >= 2;
+}
+
+/**
  * One source account's watcher status.
  *
  * A disabled source is `not_configured` rather than a failure: nothing is
  * supposed to be watching it, which is the same rule `inventoryStatus` in
  * `model.ts` applies to the sources screen. A watcher past its
  * `nextExpectedAt` is `problem` because a host that stopped reporting is the
- * one failure on this screen that silently stops ingestion.
+ * one failure on this screen that silently stops ingestion -- and since ADM-9,
+ * so is one whose passes are getting nowhere, which is the other way ingestion
+ * stops silently.
  */
 function watcherStatus(watcher: WatcherFact, now: number): HealthStatus {
   if (!watcher.enabled) return "not_configured";
   if (watcher.watcherState === null) return "unknown";
   if (watcher.watcherState === "awaiting_heartbeat") return "unknown";
+  if (passProblem(watcher)) return "problem";
   if (watcher.nextExpectedAt === null) return "unknown";
   return watcher.nextExpectedAt < now ? "problem" : "ok";
 }
 
-function watcherCheck(watchers: readonly WatcherFact[], now: number): HealthCheck {
+function watcherCheck(
+  watchers: readonly WatcherFact[],
+  now: number,
+): HealthCheck {
   const watching = watchers.filter((watcher) => watcher.enabled);
   if (watching.length === 0) {
     return {
@@ -126,27 +177,51 @@ function watcherCheck(watchers: readonly WatcherFact[], now: number): HealthChec
     .map((watcher) => watcher.lastSeenAt)
     .filter((at): at is number => at !== null);
   const lastCheckedAt = lastSeen.length === 0 ? null : Math.max(...lastSeen);
-  const late = watching.filter(
-    (watcher) => watcherStatus(watcher, now) === "problem",
+  // Two different failures, counted separately because they need different
+  // things done about them: a host that stopped reporting, and a host that
+  // reports and gets nowhere. Before ADM-9 only the first was visible.
+  const overdue = watching.filter(
+    (watcher) =>
+      watcher.watcherState === "active" &&
+      watcher.nextExpectedAt !== null &&
+      watcher.nextExpectedAt < now,
   ).length;
+  const stuck = watching.filter(passProblem).length;
   const detail = [
     `last pass ${ago(lastCheckedAt, now)}`,
     `${watching.length} watched`,
-    ...(late > 0 ? [`${late} overdue`] : []),
+    ...(overdue > 0 ? [`${overdue} overdue`] : []),
+    ...(stuck > 0 ? [`${stuck} stuck`] : []),
   ].join(", ");
   // One line per source: its latest assessment's state, then why items were
-  // not ready. These are closed literals (`workers/notReady.ts` forbids
-  // interpolating a row value into one), so the tooltip carries no document
-  // title, path or id.
+  // not ready, then how its last pass ended. These are closed literals
+  // (`workers/notReady.ts` forbids interpolating a row value into a reason,
+  // and a pass code is `[a-z0-9_]{1,64}` on the wire and in the column), so
+  // the tooltip carries no document title, path or id.
   const tooltip = watching
     .map((watcher) => {
       const reasons = countsLine(watcher.notReadyReasons);
       const state = watcher.assessmentState ?? "no pass";
+      const pass =
+        watcher.lastPassState === null
+          ? ""
+          : `, last pass ${watcher.lastPassState}${
+              watcher.lastPassCode === null ? "" : ` (${watcher.lastPassCode})`
+            }`;
       return `${watcher.name || watcher.sourceAccountId}: ${state}${
         reasons === "" ? "" : ` (${reasons})`
-      }`;
+      }${pass}`;
     })
     .join("\n");
+  // The pill shows one pass, so it shows the one worth acting on: a stuck
+  // watcher if there is one, otherwise the most recent pass reported.
+  const shown =
+    watching.find(passProblem) ??
+    watching
+      .filter((watcher) => watcher.lastPassState !== null)
+      .sort(
+        (left, right) => (right.lastPassAt ?? 0) - (left.lastPassAt ?? 0),
+      )[0];
   return {
     id: "documents_watcher",
     name: "Documents watcher",
@@ -154,6 +229,15 @@ function watcherCheck(watchers: readonly WatcherFact[], now: number): HealthChec
     detail,
     tooltip: tooltip === "" ? null : tooltip,
     lastCheckedAt,
+    ...(shown === undefined || shown.lastPassState === null
+      ? {}
+      : {
+          pass: {
+            state: shown.lastPassState,
+            code: shown.lastPassCode,
+            problem: passProblem(shown),
+          },
+        }),
   };
 }
 

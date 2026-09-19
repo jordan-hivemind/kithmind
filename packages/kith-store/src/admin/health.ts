@@ -38,6 +38,22 @@ export type WatcherFact = {
   assessmentAt: number | null;
   /** The diagnostic tally `workers/notReady.ts` stores in `counts`. */
   notReadyReasons: NotReadyReasons;
+  /**
+   * ADM-9, migration 029: how this watcher's last pass ended. It is the only
+   * fact a pass that opened no scan produces, which is exactly what PR #313's
+   * two circuit breakers do, so without it a watcher that refuses every pass
+   * reads as healthy here.
+   *
+   * `lastPassCode` is a closed-shape value and not free text: the wire pattern
+   * (`WORKER_PASS_CODE`) and the column's own CHECK both hold it to
+   * `[a-z0-9_]{1,64}`, which is what makes it safe in a tooltip -- the same
+   * rule `notReadyReasons` follows.
+   */
+  lastPassState: "complete" | "incomplete" | "failed" | null;
+  lastPassCode: string | null;
+  lastPassAt: number | null;
+  /** Consecutive non-`complete` outcomes ending at `lastPassState`. */
+  unhealthyPasses: number;
 };
 
 export type IndexFact = {
@@ -113,6 +129,10 @@ type WatcherDbRow = {
   assessment_state: string | null;
   assessment_at: Date | null;
   counts: unknown;
+  last_pass_state: string | null;
+  last_pass_code: string | null;
+  last_pass_finished_at: Date | null;
+  last_pass_unhealthy_streak: number | string | null;
 };
 
 type CountsDbRow = Record<string, string | number | null>;
@@ -137,6 +157,8 @@ export async function readHealthFacts(
     ctx,
     `SELECT a.id AS source_account_id, a.name, a.enabled,
             w.state AS watcher_state, w.last_seen_at, w.next_expected_at,
+            w.last_pass_state, w.last_pass_code, w.last_pass_finished_at,
+            w.last_pass_unhealthy_streak,
             s.state AS assessment_state,
             coalesce(s.completed_at, s.updated_at, s.started_at)
               AS assessment_at,
@@ -234,6 +256,22 @@ export async function readHealthFacts(
       assessmentState: record.assessment_state,
       assessmentAt: epoch(record.assessment_at),
       notReadyReasons: assessmentReasons(record.counts),
+      // The column's CHECK already holds these to the closed state and the
+      // code pattern; the narrowing here is what makes that a type rather
+      // than a promise, for the same reason `assessmentReasons` re-filters.
+      lastPassState:
+        record.last_pass_state === "complete" ||
+        record.last_pass_state === "incomplete" ||
+        record.last_pass_state === "failed"
+          ? record.last_pass_state
+          : null,
+      lastPassCode:
+        typeof record.last_pass_code === "string" &&
+        /^[a-z0-9_]{1,64}$/.test(record.last_pass_code)
+          ? record.last_pass_code
+          : null,
+      lastPassAt: epoch(record.last_pass_finished_at),
+      unhealthyPasses: number(record.last_pass_unhealthy_streak),
     })),
     index: {
       eligible: number(counts.eligible),

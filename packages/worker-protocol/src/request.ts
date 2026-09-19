@@ -256,6 +256,30 @@ export type WorkerSourceRootKind = (typeof SOURCE_ROOT_KINDS)[number];
 /** A bound on the roots one source account may hand a watcher in one pass. */
 export const MAX_WORKER_SOURCE_ROOTS = 100;
 
+/**
+ * ADM-9. How one watcher pass ended, reported once the pass is over. The same
+ * three words `PipelineRunResult.state` uses, because this operation carries
+ * that result and nothing else.
+ */
+export const WORKER_PASS_STATES = ["complete", "incomplete", "failed"] as const;
+export type WorkerPassState = (typeof WORKER_PASS_STATES)[number];
+
+/**
+ * ADM-9. The shape a pass code must have.
+ *
+ * Bounded lower-case ASCII rather than a closed enum, because the codes are
+ * the pipeline's own literals and it mints new ones as it grows; a closed list
+ * here would wedge a pass rather than show its new code. What the pattern
+ * forbids is what must never arrive: free text, a path, a file name, anything
+ * carrying a space, a slash, a dot or a capital. The health screen puts this
+ * value in a tooltip, so "never a path" is a display rule as much as a wire
+ * rule.
+ */
+export const WORKER_PASS_CODE = /^[a-z0-9_]{1,64}$/;
+
+/** A bound on the counts one pass may report. Matches `source.rootReport`. */
+export const MAX_WORKER_PASS_COUNT = 100_000_000;
+
 export type WorkerRequest =
   | (WorkerSourceRequest & {
       operation: "source.status";
@@ -278,6 +302,15 @@ export type WorkerRequest =
       operation: "diagnostics.heartbeat";
       watcherId: string;
       connectorVersion: string;
+    })
+  | (WorkerSourceRequest & {
+      operation: "diagnostics.passOutcome";
+      watcherId: string;
+      state: WorkerPassState;
+      code?: string;
+      scanned: number;
+      published: number;
+      finishedAt: number;
     })
   | (WorkerSourceRequest & {
       operation: "archive.forgetTargets";
@@ -687,6 +720,16 @@ export type WorkerDiagnosticsHeartbeatResult = {
   watcherId: string;
   receivedAt: number;
   nextExpectedAt: number;
+};
+
+export type WorkerDiagnosticsPassOutcomeResult = {
+  operation: "diagnostics.passOutcome";
+  sourceAccountId: string;
+  watcherId: string;
+  /** The outcome the row now holds, which an out-of-order report leaves alone. */
+  finishedAt: number;
+  /** Consecutive non-`complete` outcomes ending here, `0` after a clean pass. */
+  unhealthyPasses: number;
 };
 
 export type WorkerInventoryItem =
@@ -1141,6 +1184,7 @@ export type WorkerResult =
   | WorkerSourceRootReportResult
   | WorkerDiagnosticsStatusResult
   | WorkerDiagnosticsHeartbeatResult
+  | WorkerDiagnosticsPassOutcomeResult
   | WorkerArchiveForgetTargetsResult
   | WorkerArchiveAckDeletionResult
   | WorkerProviderOriginalForgetTargetsResult
@@ -1874,6 +1918,46 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
         operation: "diagnostics.heartbeat",
         watcherId: string(input.watcherId, { maxUtf16: 36, pattern: UUID }),
         connectorVersion: string(input.connectorVersion, { maxUtf8: 100 }),
+      };
+    // ADM-9. The terminal outcome of one pass, sent after the pass is over.
+    // `code` is optional because a `complete` pass has none, and an old server
+    // that has never heard of this operation answers `invalid_request` -- which
+    // the watcher treats as "not reported this pass" and nothing more.
+    case "diagnostics.passOutcome":
+      exactKeys(
+        input,
+        [
+          ...baseKeys,
+          "watcherId",
+          "state",
+          "scanned",
+          "published",
+          "finishedAt",
+        ],
+        ["code"],
+      );
+      if (
+        typeof input.state !== "string" ||
+        !(WORKER_PASS_STATES as readonly string[]).includes(input.state)
+      ) {
+        invalid();
+      }
+      return {
+        ...base,
+        operation: "diagnostics.passOutcome",
+        watcherId: string(input.watcherId, { maxUtf16: 36, pattern: UUID }),
+        state: input.state as WorkerPassState,
+        ...(input.code === undefined
+          ? {}
+          : {
+              code: string(input.code, {
+                maxUtf16: 64,
+                pattern: WORKER_PASS_CODE,
+              }),
+            }),
+        scanned: integer(input.scanned, 0, MAX_WORKER_PASS_COUNT),
+        published: integer(input.published, 0, MAX_WORKER_PASS_COUNT),
+        finishedAt: epoch(input.finishedAt),
       };
     case "archive.forgetTargets":
       exactKeys(input, [

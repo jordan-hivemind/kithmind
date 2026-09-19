@@ -1,5 +1,6 @@
 import type {
   WorkerDiagnosticsHeartbeatResult,
+  WorkerDiagnosticsPassOutcomeResult,
   WorkerDiagnosticsStatusResult,
   WorkerRequest,
 } from "@repo/worker-protocol/request";
@@ -10,6 +11,7 @@ import { sha256Utf8 } from "../provenance/sql.js";
 import { requireWorkerSourceAccount } from "./auth.js";
 import { at, exec, row, rows, type WorkerCtx } from "./db.js";
 import { workerProtocolError } from "./errors.js";
+import { consumeWorkerMutationRateLimit } from "./rateLimit.js";
 
 export const WORKER_HEARTBEAT_INTERVAL_MS = 30_000;
 export const WORKER_HEARTBEAT_OVERDUE_MS = 180_000;
@@ -31,6 +33,9 @@ type Watcher = {
   sweepAfter: Date | null;
   createdAtField: Date;
   updatedAt: Date;
+  /** ADM-9, migration 029. Null until a pass has reported one. */
+  lastPassFinishedAt: Date | null;
+  lastPassUnhealthyStreak: number | null;
 };
 
 type Incident = {
@@ -310,6 +315,98 @@ export async function recordWorkerHeartbeat(
     watcherId: request.watcherId,
     receivedAt,
     nextExpectedAt,
+  };
+}
+
+/**
+ * ADM-9. How the last pass ended, on the watcher row.
+ *
+ * The gap this closes: PR #313's two circuit breakers end a pass `incomplete`
+ * and write nothing -- no scan, so no processing assessment -- and the health
+ * screen reads only the heartbeat and the latest assessment. A watcher
+ * refusing every pass therefore kept heartbeating and read as healthy. This is
+ * the one write that reaches the server on a pass that opened nothing.
+ *
+ * Authorized exactly as every other operation in this directory is:
+ * `requireWorkerSourceAccount` (auth.ts) reloads the credential, requires
+ * `ingest` on the space, requires this credential's grant for *this* source
+ * account, requires the request's `spaceId` to be the account's, and requires
+ * the `fs` connector. Then the only row this can reach is the watcher row of
+ * that authorized account (`watcherForSource` selects by
+ * `source_account_id`, `validateWatcher` re-checks the row's own `space_id`
+ * and `source_account_id`), so a credential for another account or another
+ * space can write nothing here. It is a mutation, so it takes the same
+ * per-credential-per-source rate limit every other mutation does.
+ *
+ * `watcherId` is required and must match, for the same reason
+ * `recordWorkerHeartbeat` requires it: a second host on the same account is an
+ * identity question, not a race to write last.
+ *
+ * No watcher row means no heartbeat has ever registered a host, and this
+ * operation does not create one -- a pass outcome is a fact about a registered
+ * watcher, and inventing the registration from it would make the heartbeat's
+ * own identity check meaningless. The watcher treats the refusal as "not
+ * reported this pass"; the next pass, after a heartbeat, records it.
+ */
+export async function recordWorkerPassOutcome(
+  ctx: WorkerCtx,
+  principal: PrincipalRef,
+  request: Extract<WorkerRequest, { operation: "diagnostics.passOutcome" }>,
+): Promise<WorkerDiagnosticsPassOutcomeResult> {
+  validateNow(ctx.now);
+  const source = await requireWorkerSourceAccount(ctx, principal, request);
+  await consumeWorkerMutationRateLimit(
+    ctx,
+    source.principal.credentialId,
+    source.account.id,
+  );
+  const current = await watcherForSource(ctx, source.account.id, true);
+  if (!current) workerProtocolError("not_found");
+  validateWatcher(current, source);
+  if (current.watcherId !== request.watcherId)
+    workerProtocolError("identity_review_required");
+  // A report that is not newer than the one already stored changes nothing.
+  // Retries and out-of-order arrivals are ordinary on this path -- the send is
+  // best-effort and never retried in order -- and without this an at-least-once
+  // delivery of one pass would count as two towards the streak below.
+  const stored = current.lastPassFinishedAt;
+  if (stored instanceof Date && request.finishedAt <= stored.getTime()) {
+    return {
+      operation: "diagnostics.passOutcome",
+      sourceAccountId: source.account.id,
+      watcherId: current.watcherId,
+      finishedAt: stored.getTime(),
+      unhealthyPasses: current.lastPassUnhealthyStreak ?? 0,
+    };
+  }
+  const unhealthyPasses =
+    request.state === "complete"
+      ? 0
+      : Math.min((current.lastPassUnhealthyStreak ?? 0) + 1, 1_000_000);
+  await exec(
+    ctx,
+    `UPDATE kith.worker_watcher_states
+        SET last_pass_state = $1, last_pass_code = $2, last_pass_scanned = $3,
+            last_pass_published = $4, last_pass_finished_at = $5,
+            last_pass_unhealthy_streak = $6, updated_at = $7
+      WHERE id = $8`,
+    [
+      request.state,
+      request.code ?? null,
+      request.scanned,
+      request.published,
+      at(request.finishedAt),
+      unhealthyPasses,
+      at(ctx.now),
+      current.id,
+    ],
+  );
+  return {
+    operation: "diagnostics.passOutcome",
+    sourceAccountId: source.account.id,
+    watcherId: current.watcherId,
+    finishedAt: request.finishedAt,
+    unhealthyPasses,
   };
 }
 
