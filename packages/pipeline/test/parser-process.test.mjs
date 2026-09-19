@@ -1797,18 +1797,49 @@ test(
 );
 
 test(
-  "keeps destination_exists fatal for a work directory that holds more than empty scaffolding",
+  "reclaims scaffolding that a killed parser left scratch inside",
   { skip: process.platform !== "darwin" },
   async () => {
     const f = await reclaimFixture();
     try {
       const outputId = randomUUID();
       const output = await outputDirectory(f, outputId);
-      const home = join(output, `.home-${outputId}`);
-      await mkdir(home, { mode: 0o700 });
-      // Not the ordinary interrupted-run shape: the scaffolding is not
-      // empty. This must be surfaced, not silently cleared and retried.
-      await writeFile(join(home, "leftover"), "x", { mode: 0o600 });
+      const tmp = join(output, `.tmp-${outputId}`);
+      await mkdir(join(tmp, "torchinductor_scratch"), {
+        recursive: true,
+        mode: 0o700,
+      });
+      await writeFile(join(tmp, "torchinductor_scratch", "partial"), "x", {
+        mode: 0o600,
+      });
+      const intent = await inspectParserOutputIntent({
+        outputRoot: f.outputRoot,
+        outputId,
+        requireEmpty: false,
+      });
+      assert.deepEqual(
+        await reclaimStaleParserOutputDirectory({
+          outputRoot: f.outputRoot,
+          outputIntent: intent,
+        }),
+        { state: "reclaimed" },
+      );
+      assert.deepEqual(await readdir(output), []);
+    } finally {
+      await rm(f.base, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "keeps destination_exists fatal for an entry that is not known scaffolding",
+  { skip: process.platform !== "darwin" },
+  async () => {
+    const f = await reclaimFixture();
+    try {
+      const outputId = randomUUID();
+      const output = await outputDirectory(f, outputId);
+      await writeFile(join(output, "leftover"), "x", { mode: 0o600 });
       const intent = await inspectParserOutputIntent({
         outputRoot: f.outputRoot,
         outputId,
@@ -1824,7 +1855,7 @@ test(
           error instanceof ParserProcessError &&
           error.code === "destination_exists",
       );
-      assert.deepEqual(await readdir(home), ["leftover"]);
+      assert.deepEqual(await readdir(output), ["leftover"]);
     } finally {
       await rm(f.base, { recursive: true, force: true });
     }

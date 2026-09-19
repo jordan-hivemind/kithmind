@@ -9,6 +9,7 @@ import {
   opendir,
   realpath,
   readlink,
+  rm,
   rmdir,
   unlink,
 } from "node:fs/promises";
@@ -48,6 +49,7 @@ const MAX_JSON_NODES = 500_000;
 const MAX_JSON_DEPTH = 48;
 const MAX_MODEL_LOCK_BYTES = 4 * 1024 * 1024;
 const PROCESS_MONITOR_TIMEOUT_MS = 1_000;
+const MAX_MISSED_MONITOR_SAMPLES = 3;
 const EXPECTED_RUNTIME_VERSIONS = {
   docling: "2.126.0",
   "docling-core": "2.95.0",
@@ -846,6 +848,7 @@ async function runSandboxed(
       );
   });
   const monitor = (async () => {
+    let missedSamples = 0;
     while (!closed && !failure) {
       if (Date.now() - started > limits.wallDeadlineMs) {
         failure = new ParserProcessError(
@@ -857,6 +860,7 @@ async function runSandboxed(
       if (child.pid !== undefined) {
         try {
           const usage = await processTree(child.pid);
+          missedSamples = 0;
           peakRssBytes = Math.max(peakRssBytes, usage.rssBytes);
           if (!failure && usage.count > limits.maxProcessCount) {
             failure = new ParserProcessError(
@@ -870,13 +874,17 @@ async function runSandboxed(
             );
           }
         } catch (error) {
-          failure ??=
-            error instanceof ParserProcessError
-              ? error
-              : new ParserProcessError(
-                  "monitor_failed",
-                  "process monitor failed",
-                );
+          // A loaded machine can make one `ps` sample miss its deadline. The
+          // wall deadline still bounds the run; only repeated misses fail it.
+          missedSamples += 1;
+          if (missedSamples >= MAX_MISSED_MONITOR_SAMPLES)
+            failure ??=
+              error instanceof ParserProcessError
+                ? error
+                : new ParserProcessError(
+                    "monitor_failed",
+                    "process monitor failed",
+                  );
         }
       }
       if (!closed && !failure)
@@ -2540,34 +2548,28 @@ export async function inspectParserOutputIntent(input: {
   };
 }
 
-async function emptyAuxiliaryDirectory(path: string): Promise<boolean> {
+async function ownedAuxiliaryDirectory(path: string): Promise<boolean> {
   const entry = await lstat(path).catch(() => null);
-  if (
-    entry === null ||
-    entry.isSymbolicLink() ||
-    !entry.isDirectory() ||
-    entry.uid !== uid() ||
-    (entry.mode & 0o777) !== 0o700
-  )
-    return false;
-  const directory = await opendir(path).catch(() =>
-    fail("output_invalid", "parser auxiliary output cannot be inspected"),
+  return (
+    entry !== null &&
+    !entry.isSymbolicLink() &&
+    entry.isDirectory() &&
+    entry.uid === uid() &&
+    (entry.mode & 0o777) === 0o700
   );
-  try {
-    return (await directory.read()) === null;
-  } finally {
-    await directory.close().catch(() => undefined);
-  }
 }
 
 /**
  * A run interrupted between reserving a document's parser work directory
  * and writing its evidence (`lossless.json` / `bundle.json`) leaves behind
- * only the parser's empty private scaffolding (`.home-<id>` / `.tmp-<id>`).
+ * only the parser's private scaffolding (`.home-<id>` / `.tmp-<id>`). A
+ * parser killed mid-run (monitor, timeout, crash, power loss) leaves scratch
+ * inside it, such as torch's compile cache directory, so the scaffolding is
+ * removed with its contents; it never holds evidence.
  * The work ID is deterministic, so a resumed run re-targets the same
  * directory, and `runCapturedPdfParser` requires it to be entirely empty.
  * Clear that leftover scaffolding so the resume can proceed. Anything else
- * -- real evidence, or entries that are not empty known scaffolding -- is
+ * -- real evidence, or entries that are not known scaffolding -- is
  * left untouched so `destination_exists` still surfaces genuinely
  * unexpected state instead of this silently deleting it.
  */
@@ -2624,13 +2626,14 @@ export async function reclaimStaleParserOutputDirectory(input: {
   for (const name of names) {
     if (
       !auxiliary.has(name) ||
-      !(await emptyAuxiliaryDirectory(join(directory.path, name)))
+      !(await ownedAuxiliaryDirectory(join(directory.path, name)))
     )
       fail("destination_exists", "parser output directory is not empty");
   }
   await recheckDirectory(directory, "parser output directory");
   for (const name of names) {
-    await rmdir(join(directory.path, name)).catch(() =>
+    // rm does not follow symbolic links inside the scaffolding.
+    await rm(join(directory.path, name), { recursive: true }).catch(() =>
       fail("unsafe_path", "parser auxiliary output could not be removed"),
     );
   }
