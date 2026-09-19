@@ -52,7 +52,8 @@ import { ProofError } from "../errors.js";
 import { KITH_ID, newKithId } from "../ids.js";
 import { locateCardQuote } from "../provenance/model.js";
 import {
-  citationRange,
+  areContiguous,
+  citedLines,
   numberedPage,
   pageLines,
   MAX_PAGE_LINES,
@@ -70,7 +71,9 @@ import {
 } from "./corrections.js";
 import { seedDocumentTypes } from "./seed.js";
 import {
+  candidatesFor,
   checkValue,
+  type Candidate,
   type DateOrder,
   isObservationFieldName,
   itemsSumToTotal,
@@ -600,7 +603,7 @@ Reply with JSON only, in exactly this shape:
 
 Rules:
 - Every statement names a field in "field". Never leave it out, never rename it, and never use the field name as a key of its own.
-- "lines" holds one to three line numbers from the page named in "page". Cite the line the value is printed on. If a label and its amount are on different lines, cite both.
+- "lines" holds one to three line numbers from the page named in "page". Cite the line that prints the value. You may also cite the line that prints its label, even if it is far away; they do not need to be next to each other.
 - Only use fields listed under the kind you chose. Omit a field the document does not state.
 - Copy a value exactly as the line prints it, including the currency symbol. Dates may be copied as printed.
 - A line_item_list field puts its lines in "line_items" and sets "value" to null. Every other field puts its value in "value" and sets "line_items" to null.
@@ -611,19 +614,23 @@ Worked example. Given this page:
 2| 2 Apr 2026
 3| Chisel            12.00
 4| Mallet             8.00
-5| Subtotal   Tax   Total
-6| 20.00      1.60  21.60
+5| Subtotal
+6| Tax
+7| Total
+8| 20.00
+9| 1.60
+10| 21.60
 the reply is:
 {"kind": "receipt",
  "summary": "Hardware receipt from Bracken Tools for 21.60.",
  "statements": [
-   {"field": "vendor", "value": "Bracken Tools", "line_items": null, "page": 0, "lines": [1]},
-   {"field": "purchase_date", "value": "2 Apr 2026", "line_items": null, "page": 0, "lines": [2]},
-   {"field": "line_items", "value": null, "page": 0, "lines": [3, 4],
+   {"field": "vendor", "value": "Bracken Tools", "line_items": null, "page": 1, "lines": [1]},
+   {"field": "purchase_date", "value": "2 Apr 2026", "line_items": null, "page": 1, "lines": [2]},
+   {"field": "line_items", "value": null, "page": 1, "lines": [3, 4],
     "line_items": [{"description": "Chisel", "amount": "12.00"}, {"description": "Mallet", "amount": "8.00"}]},
-   {"field": "subtotal", "value": "20.00", "line_items": null, "page": 0, "lines": [5, 6]},
-   {"field": "tax", "value": "1.60", "line_items": null, "page": 0, "lines": [5, 6]},
-   {"field": "total", "value": "21.60", "line_items": null, "page": 0, "lines": [5, 6]}]}
+   {"field": "subtotal", "value": "20.00", "line_items": null, "page": 1, "lines": [5, 8]},
+   {"field": "tax", "value": "1.60", "line_items": null, "page": 1, "lines": [6, 9]},
+   {"field": "total", "value": "21.60", "line_items": null, "page": 1, "lines": [7, 10]}]}
 
 Kinds:
 ${catalog}
@@ -648,6 +655,8 @@ export type StoredStatement = {
   observationKeys: string[];
   evidenceSpanId: string;
   currencyAssumed?: true;
+  /** What this statement cited. See {@link StatementCitation}. */
+  citation: StatementCitation;
   /**
    * What the model read, as stored at extraction time.
    *
@@ -679,6 +688,9 @@ type Prepared = {
     field: string | null;
     reason: CorrectionReason;
     reading: unknown;
+    /** Present when the failure belongs to a statement that cited something.
+     * A document-level item (an unknown field, a truncated input) has none. */
+    citation?: StatementCitation;
   }>;
   occurrence: Occurrence;
 };
@@ -691,21 +703,76 @@ type Prepared = {
  * never asked to reproduce anything. A reply that carried the older `quote`
  * shape instead still locates, which is what the non-schema fallback path has.
  */
+/**
+ * What a statement cited, as integers.
+ *
+ * Recorded on every stored statement and on every correction a gate opens.
+ * Without it a failed reading says only "value_not_in_quote" and the scalar
+ * the model returned, which is not enough to tell a model that cited the
+ * wrong line from a page whose layout the reader cannot handle -- the live
+ * trial stalled on exactly that. Integers only, so a diagnostic can print it
+ * without printing the document.
+ */
+export type StatementCitation = {
+  /** The page number the model was shown and cited. */
+  shownPage: number;
+  /** That page's own ordinal in the sealed text. */
+  pageOrdinal: number;
+  /** The line ids cited, in the order given. */
+  lines: number[];
+  /** How many citable lines that page has. */
+  pageLineCount: number;
+  /** Whether those ids run consecutively. A column layout cites lines far
+   * apart, which is legitimate and worth being able to see. */
+  contiguous: boolean;
+};
+
+function citationOf(
+  page: LoadedPage,
+  statement: { lines?: readonly number[] },
+): StatementCitation {
+  const lines = (
+    Array.isArray(statement.lines) ? statement.lines : []
+  ).filter((id): id is number => Number.isInteger(id));
+  return {
+    shownPage: page.shown,
+    pageOrdinal: page.ordinal,
+    lines,
+    pageLineCount: page.lines.length,
+    contiguous: areContiguous(lines),
+  };
+}
+
+type ResolvedCitation = {
+  /** The cited lines, in id order. Empty on the legacy quote path. */
+  cited: PageLine[];
+  /** The one range the legacy quote path resolved to, if that is what was
+   * used. Line citations produce a range per matched value instead. */
+  legacy?: { start: number; end: number };
+  reason?: CorrectionReason;
+};
+
+/**
+ * Which lines one statement cites, and the text at them.
+ *
+ * Line ids first: they resolve arithmetically against the page's own line
+ * offsets, so a citation in range always produces text and the model is never
+ * asked to reproduce anything. A reply that carried the older `quote` shape
+ * instead still locates, which is what the non-schema fallback path has.
+ */
 function resolveCitation(
   page: LoadedPage,
   statement: { lines?: readonly number[]; quote?: string },
-): { start: number; end: number; quote: string; reason?: CorrectionReason } {
-  const cited = Array.isArray(statement.lines) ? statement.lines : [];
+): ResolvedCitation {
+  const ids = Array.isArray(statement.lines) ? statement.lines : [];
   const quoted = typeof statement.quote === "string" ? statement.quote : "";
-  if (cited.length > 0) {
-    const range = citationRange(page.lines, cited);
-    if (!range) {
-      return { start: 0, end: 0, quote: "", reason: "citation_out_of_range" };
-    }
-    return { ...range, quote: page.text.slice(range.start, range.end) };
+  if (ids.length > 0) {
+    const cited = citedLines(page.lines, ids);
+    if (!cited) return { cited: [], reason: "citation_out_of_range" };
+    return { cited };
   }
   if (!quoted.trim()) {
-    return { start: 0, end: 0, quote: "", reason: "quote_not_found" };
+    return { cited: [], reason: "quote_not_found" };
   }
   const located = locateCardQuote(page.text, quoted);
   if (
@@ -715,19 +782,13 @@ function resolveCitation(
     located.end > page.text.length
   ) {
     return {
-      start: 0,
-      end: 0,
-      quote: "",
+      cited: [],
       reason: normalizeForMatch(page.text).includes(normalizeForMatch(quoted))
         ? "span_unresolved"
         : "quote_not_found",
     };
   }
-  return {
-    start: located.start,
-    end: located.end,
-    quote: page.text.slice(located.start, located.end),
-  };
+  return { cited: [], legacy: { start: located.start, end: located.end } };
 }
 
 async function findOrCreateSpan(
@@ -822,7 +883,10 @@ async function prepare(
     page: number;
     quote: string;
     lines: number[];
-    spanId: string;
+    citation: StatementCitation;
+    /** One per value, aligned with `values`: the span for the line that
+     * supported it. */
+    spanIds: string[];
     values: ObservationValue[];
     itemsTotal?: string;
     currencyAssumed?: true;
@@ -861,31 +925,31 @@ async function prepare(
       });
       continue;
     }
+    const citation = citationOf(page, statement);
     const located = resolveCitation(page, statement);
     if (located.reason) {
       prepared.failures.push({
         field: field.name,
         reason: located.reason,
         reading: statement.value,
+        citation,
       });
       continue;
     }
-    const spanId = await findOrCreateSpan(client, loaded, page, located);
-    if (!spanId) {
-      prepared.failures.push({
-        field: field.name,
-        reason: "span_unresolved",
-        reading: statement.value,
-      });
-      continue;
-    }
-    // The quote is the server's own text at the cited offsets, so the gates
-    // below check the value against what the page says rather than against
-    // what the model typed.
+    // Each cited line on its own, and for a text field each adjacent pair.
+    // The lines between two cited ones are deliberately absent.
+    const candidates: Candidate[] = located.legacy
+      ? [
+          {
+            text: page.text.slice(located.legacy.start, located.legacy.end),
+            ...located.legacy,
+          },
+        ]
+      : candidatesFor(located.cited, field.valueType);
     const gated = checkValue({
       valueType: field.valueType,
       value: statement.value,
-      quote: located.quote,
+      candidates,
       pageText: page.text,
       defaultCurrency: "USD",
       ...(type?.dateOrder ? { dateOrder: type.dateOrder } : {}),
@@ -895,15 +959,39 @@ async function prepare(
         field: field.name,
         reason: gated.reason,
         reading: statement.value,
+        citation,
+      });
+      continue;
+    }
+    // One span per line that supported a value, so an observation cites the
+    // line that prints it rather than the region it was found in.
+    const spanIds: string[] = [];
+    let spanFailed = false;
+    for (const index of gated.support) {
+      const candidate = candidates[index]!;
+      const spanId = await findOrCreateSpan(client, loaded, page, candidate);
+      if (!spanId) {
+        spanFailed = true;
+        break;
+      }
+      spanIds.push(spanId);
+    }
+    if (spanFailed) {
+      prepared.failures.push({
+        field: field.name,
+        reason: "span_unresolved",
+        reading: statement.value,
+        citation,
       });
       continue;
     }
     accepted.push({
       field,
       page: statement.page,
-      quote: located.quote,
+      quote: candidates[gated.support[0] ?? 0]?.text ?? "",
       lines: [...(statement.lines ?? [])],
-      spanId,
+      citation,
+      spanIds,
       values: gated.values,
       ...(gated.itemsTotal === undefined
         ? {}
@@ -983,7 +1071,7 @@ async function prepare(
         key,
         type: name,
         value,
-        evidence: [entry.spanId],
+        evidence: [entry.spanIds[index] ?? entry.spanIds[0]!],
       });
       if (value.type === "money" && !moneyByField.has(name)) {
         moneyByField.set(name, value.amount);
@@ -1001,7 +1089,8 @@ async function prepare(
       page: entry.page,
       quote: entry.quote,
       observationKeys: keys,
-      evidenceSpanId: entry.spanId,
+      evidenceSpanId: entry.spanIds[0]!,
+      citation: entry.citation,
       modelValue: entry.values.length > 1 ? entry.values : entry.values[0]!,
       ...(entry.currencyAssumed ? { currencyAssumed: true as const } : {}),
     });
@@ -1322,7 +1411,11 @@ async function store(
       sourceItemId: loaded.sourceItemId,
       fieldName: failure.field,
       reason: failure.reason,
-      reading: failure.reading,
+      // The scalar the model returned, and what it cited. The citation is
+      // what makes a failure diagnosable without reading the document.
+      reading: failure.citation
+        ? { value: failure.reading, citation: failure.citation }
+        : failure.reading,
     });
   }
   if (refusedModel !== null) {

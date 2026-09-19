@@ -2,6 +2,7 @@
 
 export * from "./seed.js";
 export * from "./lines.js";
+export * from "./diagnose.js";
 export * from "./gate.js";
 export * from "./provider.js";
 export * from "./model.js";

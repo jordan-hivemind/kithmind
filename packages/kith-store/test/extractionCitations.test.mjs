@@ -33,7 +33,9 @@ import {
 import {
   amountsInText,
   checkValue,
-  citationRange,
+  diagnoseExtractions,
+  valueSignature,
+  citedLines,
   pageLines,
   readPrintedDate,
   numberedPage,
@@ -54,6 +56,12 @@ import {
   makeUser,
   skip,
 } from "./helpers/identityFixture.mjs";
+
+/** The gate takes cited lines now, not one quote. A test that names a quote
+ * means one cited line, so this is the same claim said the new way. */
+function asCandidates(quote) {
+  return [{ text: quote, start: 0, end: quote.length }];
+}
 
 const NOW = Date.parse("2026-09-22T12:00:00Z");
 
@@ -241,34 +249,27 @@ test("a page splits into addressable lines and numbers them from one", () => {
   }
   assert.match(numberedPage(lines), /^1\| BRACKEN TOOLS\n2\| 12 Mill Lane/);
 
-  // A citation is a covering range, so two ids take the line between them.
-  assert.deepEqual(citationRange(lines, [6, 7]), {
-    start: lines[5].start,
-    end: lines[6].end,
-  });
-  assert.equal(
-    COLUMN_RECEIPT.slice(
-      citationRange(lines, [6, 7]).start,
-      citationRange(lines, [6, 7]).end,
-    ),
-    "Subtotal   Tax    Total\n20.00      1.60   21.60",
+  // A citation names lines, in id order, whether or not they are adjacent.
+  assert.deepEqual(
+    citedLines(lines, [6, 7]).map((line) => line.text),
+    ["Subtotal   Tax    Total", "20.00      1.60   21.60"],
   );
-  // Out of range, too many, and too wide are all refused.
-  assert.equal(citationRange(lines, [0]), null);
-  assert.equal(citationRange(lines, [9]), null);
-  assert.equal(citationRange(lines, [1, 2, 3, 4]), null);
-  assert.equal(citationRange(lines, [1, 8]), null);
-  assert.equal(citationRange(lines, []), null);
-  // Non-adjacent ids are refused: the covering range would hand the gates a
-  // line nobody cited, and on a receipt that line holds another item's amount.
-  assert.equal(citationRange(lines, [2, 5]), null);
-  assert.equal(citationRange(lines, [2, 4]), null);
-  // Adjacent ones, in any order, are fine.
-  assert.deepEqual(citationRange(lines, [3, 2]), {
-    start: lines[1].start,
-    end: lines[2].end,
-  });
-  assert.ok(citationRange(lines, [1, 2, 3]));
+  // ADM-5f: far-apart ids are legitimate. A column receipt prints labels in
+  // one block and amounts in another, and the only honest citation of a total
+  // is two lines that are not neighbours.
+  assert.deepEqual(
+    citedLines(lines, [1, 8]).map((line) => line.id),
+    [1, 8],
+  );
+  assert.deepEqual(
+    citedLines(lines, [5, 2]).map((line) => line.id),
+    [2, 5],
+  );
+  // Out of range and too many are still refused.
+  assert.equal(citedLines(lines, [0]), null);
+  assert.equal(citedLines(lines, [9]), null);
+  assert.equal(citedLines(lines, [1, 2, 3, 4]), null);
+  assert.equal(citedLines(lines, []), null);
 });
 
 test("a rendering space closes only next to a currency mark", () => {
@@ -316,7 +317,7 @@ test("the four fabrications cannot be stored", () => {
       checkValue({
         valueType: "money",
         value,
-        quote,
+        candidates: asCandidates(quote),
         pageText: quote,
         defaultCurrency: "USD",
       }),
@@ -333,7 +334,7 @@ test("the four fabrications cannot be stored", () => {
       checkValue({
         valueType: "money",
         value,
-        quote,
+        candidates: asCandidates(quote),
         pageText: quote,
         defaultCurrency: "USD",
       }).ok,
@@ -507,7 +508,7 @@ test("a citation outside the page is a named failure, not a wrong fact", { skip 
         statement("vendor", "BRACKEN TOOLS", [1]),
         // Past the end of the page.
         statement("total", "21.60", [99]),
-        // A range too wide to be a citation.
+        // Two real lines, far apart, neither of which prints the value.
         statement("subtotal", "20.00", [1, 8]),
         // A page that does not exist.
         { ...statement("tax", "1.60", [1]), page: 9 },
@@ -518,10 +519,12 @@ test("a citation outside the page is a named failure, not a wrong fact", { skip 
   assert.equal(outcome.stored, 1);
   // A page the document does not have is its own reason, so the counts can
   // tell "we number pages differently" from "that line id is off the end".
+  // ADM-5f: a line id off the end of the page is still out of range; two
+  // real-but-wrong lines are a value the citation does not support.
   assert.deepEqual(await f.corrections(), [
-    { field_name: "subtotal", reason: "citation_out_of_range" },
     { field_name: "total", reason: "citation_out_of_range" },
     { field_name: "tax", reason: "citation_page_unknown" },
+    { field_name: "subtotal", reason: "value_not_in_quote" },
   ]);
 });
 
@@ -739,12 +742,14 @@ test("an ambiguous printed date waits for the kind to say which order", { skip }
   );
 });
 
-test("a non-adjacent citation cannot borrow a line it did not cite", { skip }, async (t) => {
+test("a line between two cited lines cannot support a value", { skip }, async (t) => {
   const f = await fixture(t);
   const ids = await f.ingest(TABLE_RECEIPT, "synthetic-noncontiguous");
   // Lines 4 and 6 are "Chisel | 12.00" and "Subtotal | 20.00"; line 5 in
-  // between is "Mallet | 8.00". Citing 4 and 6 must not let the 8.00 on line
-  // 5 support a value.
+  // between is "Mallet | 8.00". Citing 4 and 6 is allowed now -- a column
+  // receipt needs exactly that -- and the 8.00 on line 5 must still not
+  // support anything, because the value is checked against the cited lines
+  // themselves and never against what lies between them.
   const outcome = await f.extract(
     fakeModel({
       kind: "receipt",
@@ -758,7 +763,7 @@ test("a non-adjacent citation cannot borrow a line it did not cite", { skip }, a
   );
   assert.equal(outcome.stored, 1);
   assert.deepEqual(await f.corrections(), [
-    { field_name: "total", reason: "citation_out_of_range" },
+    { field_name: "total", reason: "value_not_in_quote" },
   ]);
 });
 
@@ -1026,10 +1031,265 @@ test("a very long line becomes several citable pieces", { skip }, async (t) => {
     checkValue({
       valueType: "money",
       value: "4242.00",
-      quote: lines[0].text,
+      candidates: asCandidates(lines[0].text),
       pageText: page,
       defaultCurrency: "USD",
     }),
     { ok: false, reason: "value_not_in_quote" },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// The column receipt the live trial lost every money field on (ADM-5f).
+// ---------------------------------------------------------------------------
+
+/**
+ * A till receipt as the parser emits one: no table rows, a short median line,
+ * and the totals block printing its labels together and its amounts together.
+ * The label for a total is seven lines from the amount.
+ */
+const COLUMN_TOTALS_RECEIPT = [
+  "BRACKEN",          // 1  vendor, split over two lines, as a logo often is
+  "TOOLS LTD.",       // 2
+  "12 Mill Lane",     // 3
+  "09/18/26 14:32",   // 4
+  "Chisel",           // 5
+  "12.00",            // 6
+  "Mallet",           // 7
+  "8.00",             // 8
+  "Subtotal",         // 9
+  "Tax",              // 10
+  "Total",            // 11
+  "20.00",            // 12
+  "1.60",             // 13
+  "21.60",            // 14
+].join("\n");
+
+test("a column receipt stores its money fields from far-apart lines", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(COLUMN_TOTALS_RECEIPT, "synthetic-column-totals");
+  await f.client.query(
+    `UPDATE kith.document_types
+        SET examples = '[{"setting":"date_order","value":"MDY"}]'::jsonb
+      WHERE space_id = $1 AND kind = 'receipt'`,
+    [f.spaceId],
+  );
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        // The vendor is split across two adjacent lines, which text fields
+        // may span.
+        statement("vendor", "BRACKEN TOOLS LTD.", [1, 2]),
+        statement("purchase_date", "09/18/26 14:32", [4]),
+        statement("line_items", null, [6, 8], {
+          line_items: [
+            { description: "Chisel", amount: "12.00" },
+            { description: "Mallet", amount: "8.00" },
+          ],
+        }),
+        // Label and amount, five lines apart. Every one of these was
+        // citation_out_of_range under the contiguity rule.
+        statement("subtotal", "20.00", [9, 12]),
+        statement("tax", "1.60", [10, 13]),
+        statement("total", "21.60", [11, 14]),
+      ],
+    }),
+    ids,
+  );
+  assert.equal(outcome.failed, 0, "no corrections");
+  assert.deepEqual(
+    (await f.stored()).map((row) => row.observation_key).sort(),
+    [
+      "line_items:0",
+      "line_items:1",
+      "purchase_date",
+      "subtotal",
+      "tax",
+      "total",
+      "vendor",
+    ],
+  );
+  const stored = await f.stored();
+  assert.equal(
+    stored.find((row) => row.observation_key === "total").value.amount,
+    "21.6",
+  );
+  assert.equal(
+    stored.find((row) => row.observation_key === "purchase_date").value.value,
+    "2026-09-18",
+  );
+  // Each line item cites the line that prints its own amount, not a range.
+  const spans = await f.rows(
+    `SELECT o.observation_key, s."start", s."end" FROM kith.observations o
+       JOIN kith.evidence_spans s ON s.id = (o.value_evidence->>0)
+      WHERE o.space_id = $1 AND o.observation_type = 'line_items'
+      ORDER BY o.observation_key`,
+    [f.spaceId],
+  );
+  assert.equal(spans.length, 2);
+  assert.notEqual(spans[0].start, spans[1].start);
+});
+
+test("a value on neither cited line is still refused", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(COLUMN_TOTALS_RECEIPT, "synthetic-column-wrong");
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        // Lines 9 and 14 are "Subtotal" and "21.60". Claiming the subtotal is
+        // 20.00 cites two real lines, neither of which prints it, and the
+        // 20.00 sitting on line 12 in between must not rescue it.
+        statement("subtotal", "20.00", [9, 14]),
+      ],
+    }),
+    ids,
+  );
+  assert.equal(outcome.stored, 0);
+  assert.deepEqual(await f.corrections(), [
+    { field_name: "subtotal", reason: "value_not_in_quote" },
+  ]);
+});
+
+test("a vendor may be folded and split, but a number may not", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(COLUMN_TOTALS_RECEIPT, "synthetic-vendor-folding");
+  const outcome = await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        // Case and punctuation folded, and spanning the two adjacent lines.
+        statement("vendor", "Bracken Tools Ltd", [1, 2]),
+        // The same latitude must NOT reach money: 12.00 on line 6 and 8.00 on
+        // line 8 are two amounts, and 128.00 is neither of them.
+        statement("total", "128.00", [6, 8]),
+      ],
+    }),
+    ids,
+  );
+  assert.equal(outcome.stored, 1);
+  assert.equal(
+    (await f.stored()).find((row) => row.observation_key === "vendor").value
+      .value,
+    "Bracken Tools Ltd",
+  );
+  assert.deepEqual(await f.corrections(), [
+    { field_name: "total", reason: "value_not_in_quote" },
+  ]);
+});
+
+test("every statement and every correction records what it cited", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(COLUMN_TOTALS_RECEIPT, "synthetic-citation-record");
+  await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        statement("subtotal", "20.00", [9, 12]),
+        statement("total", "999.00", [11, 14]),
+      ],
+    }),
+    ids,
+  );
+  const stored = (
+    await f.rows(
+      "SELECT statements FROM kith.document_extractions WHERE space_id = $1",
+      [f.spaceId],
+    )
+  )[0].statements;
+  assert.equal(stored.length, 1);
+  assert.deepEqual(stored[0].citation, {
+    shownPage: 1,
+    pageOrdinal: 0,
+    lines: [9, 12],
+    pageLineCount: 14,
+    contiguous: false,
+  });
+  const correction = (
+    await f.rows(
+      "SELECT original_value FROM kith.corrections WHERE space_id = $1",
+      [f.spaceId],
+    )
+  )[0].original_value;
+  assert.equal(correction.value, "999.00");
+  assert.deepEqual(correction.citation, {
+    shownPage: 1,
+    pageOrdinal: 0,
+    lines: [11, 14],
+    pageLineCount: 14,
+    contiguous: false,
+  });
+});
+
+test("the diagnostic answers in numbers and never in text", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ids = await f.ingest(COLUMN_TOTALS_RECEIPT, "synthetic-diagnose");
+  await f.extract(
+    fakeModel({
+      kind: "receipt",
+      summary: "Hardware receipt.",
+      statements: [
+        statement("vendor", "BRACKEN TOOLS LTD.", [1, 2]),
+        // Cited the label lines only: the amount is on 12, not on 9 or 11.
+        statement("subtotal", "20.00", [9, 11]),
+      ],
+    }),
+    ids,
+    NOW + 2_000,
+  );
+  const summary = await withKithTransaction(f.pool, (client) =>
+    diagnoseExtractions(client, { kind: "receipt", limit: 5 }),
+  );
+  assert.equal(summary.documents.length, 1);
+  const document = summary.documents[0];
+  assert.equal(document.kind, "receipt");
+  assert.equal(document.model, "synthetic-line-model");
+  assert.equal(document.storedStatements, 1);
+  assert.equal(document.lineCount, 14);
+  // The column layout's fingerprint: a short median beside a longer maximum.
+  assert.ok(document.medianLineChars < document.maxLineChars);
+  assert.equal(document.failures.length, 1);
+  const failure = document.failures[0];
+  assert.equal(failure.field, "subtotal");
+  assert.equal(failure.reason, "value_not_in_quote");
+  assert.equal(failure.shownPage, 1);
+  assert.equal(failure.pageOrdinal, 0);
+  assert.deepEqual(failure.citedLines, [9, 11]);
+  assert.equal(failure.pageLineCount, 14);
+  assert.equal(failure.contiguous, false);
+  // This is the answer the live trial could not get: the value IS on the
+  // page, on line 12, and the model cited 9 and 11.
+  assert.equal(failure.onCitedPage, true);
+  assert.deepEqual(failure.onLines, [12]);
+  assert.equal(failure.onOtherPage, false);
+  assert.equal(failure.signature, "99.99");
+  assert.deepEqual(summary.reasonCounts, { value_not_in_quote: 1 });
+  assert.deepEqual(summary.byKind, { receipt: { value_not_in_quote: 1 } });
+
+  // Nothing the document says can reach the output.
+  const printed = JSON.stringify(summary);
+  for (const secret of ["BRACKEN", "TOOLS", "Mill Lane", "Chisel", "Mallet"]) {
+    assert.equal(printed.includes(secret), false, secret);
+  }
+});
+
+test("a value signature keeps the shape and drops the content", () => {
+  assert.equal(valueSignature("$1,234.56"), "$9,999.99");
+  assert.equal(valueSignature("Bracken Tools"), "aaaaaaa aaaaa");
+  assert.equal(valueSignature("09/18/26 14:32"), "99/99/99 99:99");
+  assert.equal(valueSignature("12 Mill Lane, Apt #4"), "99 aaaa aaaa, aaa 9");
+  // Bounded, so a long value cannot become a long quotation.
+  assert.equal(valueSignature("x".repeat(500)).length, 24);
+  assert.equal(valueSignature(null), "");
+  // A structured value is folded the same way, so even a JSON envelope
+  // cannot carry its own strings out.
+  assert.equal(
+    valueSignature({ type: "money", amount: "1.00" }),
+    "aaaa:aaaaa,aaaaaa:9.99",
   );
 });

@@ -239,6 +239,23 @@ A line longer than 240 characters is split into citable pieces at whitespace,
 with exact offsets, so a 2,000-character line does not become one citation
 holding dozens of numbers.
 
+**Cited lines need not be adjacent.** A column receipt prints its labels in
+one block and its amounts in another, so the only honest citation of a total
+is two lines several apart. The value is checked against each cited line on
+its own, never against the lines between them, so an unrelated amount in
+between can never support a value. A value must sit entirely inside one cited
+line; only a text field may span two adjacent cited ones, and only a text
+field is matched case- and punctuation-folded. Money, numbers and dates keep
+their exact reading.
+
+Every stored statement and every gate correction records what it cited: shown
+page, page ordinal, line ids, the page's line count and whether the ids are
+contiguous. `kith-extraction-diagnose [--kind k] [--limit N]` reads those back
+and reports, per failure, whether the value occurs on the cited page and on
+which line ids, whether it occurs on another page, and the character-class
+signature of the value. Its output is integers, booleans, enum reasons and
+field names only: operators debug extraction without reading the documents.
+
 | Knob | Where | Effect |
 | --- | --- | --- |
 | `KITH_EXTRACT_MODEL` | daemon environment | The default model. Unchanged. |

@@ -18,15 +18,22 @@ import {
 const PAGE = "Acme Hardware\nTotal $15.50 paid on 2026-09-01\n";
 
 function gate(overrides) {
+  const { quote = "Acme Hardware", ...rest } = overrides ?? {};
   return checkValue({
     valueType: "text",
     value: "Acme Hardware",
-    quote: "Acme Hardware",
+    candidates: asCandidates(quote),
     pageText: PAGE,
     defaultCurrency: "USD",
-    ...overrides,
+    ...rest,
   });
 }
+/** The gate takes cited lines now, not one quote. A test that names a quote
+ * means one cited line, so this is the same claim said the new way. */
+function asCandidates(quote) {
+  return [{ text: quote, start: 0, end: quote.length }];
+}
+
 
 test("money parses exactly, in the shapes a document actually prints", () => {
   assert.equal(parseAmount("$15.50"), "15.5");
@@ -270,6 +277,7 @@ test("a percentage keeps its decimal comma", () => {
   assert.deepEqual(gate({ valueType: "number", value: "3,5%", quote: "3,5%" }), {
     ok: true,
     values: [{ type: "decimal", value: "3.5", unitCode: "1" }],
+    support: [0],
   });
 });
 
@@ -284,7 +292,7 @@ test("a money value keeps its currency and flags an assumed one", () => {
   const bare = checkValue({
     valueType: "money",
     value: "15.50",
-    quote: "Total 15.50",
+    candidates: asCandidates("Total 15.50"),
     pageText: "Total 15.50\n",
     defaultCurrency: "USD",
   });
@@ -318,6 +326,7 @@ test("dates must be real ISO calendar dates", () => {
   assert.deepEqual(gate({ valueType: "date", value: "2026-09-01", quote }), {
     ok: true,
     values: [{ type: "date", value: "2026-09-01" }],
+    support: [0],
   });
   // ADM-5d: a printed form the cited text also carries is normalized rather
   // than refused. The prompt now asks the model to copy a date as printed,
@@ -326,6 +335,7 @@ test("dates must be real ISO calendar dates", () => {
     assert.deepEqual(gate({ valueType: "date", value: printed, quote }), {
       ok: true,
       values: [{ type: "date", value: "2026-09-01" }],
+      support: [0],
     });
   }
   // ADM-5d: an all-numeric one needs the kind to say which order it uses.
@@ -340,7 +350,7 @@ test("dates must be real ISO calendar dates", () => {
       quote,
       dateOrder: "MDY",
     }),
-    { ok: true, values: [{ type: "date", value: "2026-09-01" }] },
+    { ok: true, values: [{ type: "date", value: "2026-09-01" }], support: [0] },
   );
   // What is not a date is still not a date.
   for (const bad of ["2026-02-30", "sometime in September", "the 1st"]) {
@@ -357,6 +367,7 @@ test("numbers parse exactly and carry the dimensionless unit", () => {
     {
       ok: true,
       values: [{ type: "decimal", value: "81204", unitCode: "1" }],
+      support: [0],
     },
   );
   assert.deepEqual(

@@ -98,6 +98,10 @@ export type RawStatement = {
 
 export type GateFailure = { ok: false; reason: CorrectionReason };
 
+/** One piece of page text a value may be checked against, with the range it
+ * occupies so a match can become an evidence span. */
+export type Candidate = { text: string; start: number; end: number };
+
 export type GateSuccess = {
   ok: true;
   /** The observations this statement becomes. More than one only for line
@@ -110,6 +114,15 @@ export type GateSuccess = {
   /** Line item sums carry their total forward so the caller can compare it
    * against a separately stated total field. */
   itemsTotal?: string;
+  /**
+   * Which candidate supports each value, aligned with `values`.
+   *
+   * One value is supported by one cited line, never by an assembly of
+   * several: that is what keeps a citation checkable. Line items may each be
+   * on a different cited line, so this is per value rather than per
+   * statement, and the caller makes one evidence span per distinct line.
+   */
+  support: number[];
 };
 
 export type GateResult = GateSuccess | GateFailure;
@@ -385,10 +398,10 @@ function namesMonth(month: number, word: string): boolean {
 const NUMERIC_DATE = /\d+[^\w]{1,2}\d+[^\w]{1,2}\d+/g;
 /** `September 1, 2026`, `Sep 1 2026`, `Sept. 1st, 2026`. */
 const MONTH_FIRST_DATE =
-  /([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4}|\d{2})\b/g;
+  /([A-Za-z]{3,9})\.?[\s-]+(\d{1,2})(?:st|nd|rd|th)?,?[\s-]+'?(\d{4}|\d{2})(?!\d)/g;
 /** `1 September 2026`, `1st Sep. 2026`. */
 const DAY_FIRST_DATE =
-  /(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})\.?,?\s+(\d{4}|\d{2})\b/g;
+  /(\d{1,2})(?:st|nd|rd|th)?[\s-]+([A-Za-z]{3,9})\.?,?[\s-]+'?(\d{4}|\d{2})(?!\d)/g;
 
 /**
  * Whether the quote prints this ISO date.
@@ -465,7 +478,10 @@ export function readPrintedDate(raw: string, order?: DateOrder): PrintedDate {
   const text = raw.normalize("NFKC").trim();
   if (!text) return { kind: "none" };
 
-  const isoLike = /^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})\b/.exec(text);
+  // `(?!\d)` rather than `\b`, so an ISO date with a time glued to it
+  // ("2026-09-18T14:32") reads: `T` is a word character, so `\b` refused the
+  // very form a machine-written timestamp takes.
+  const isoLike = /^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?!\d)/.exec(text);
   if (isoLike) {
     const iso = isoFrom(
       Number(isoLike[1]),
@@ -475,7 +491,9 @@ export function readPrintedDate(raw: string, order?: DateOrder): PrintedDate {
     return iso ? { kind: "date", iso } : { kind: "none" };
   }
 
-  const numeric = /^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4}|\d{2})\b/.exec(text);
+  const numeric = /^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4}|\d{2})(?!\d)/.exec(
+    text,
+  );
   if (numeric) {
     const resolved = resolveNumericParts(
       Number(numeric[1]),
@@ -488,8 +506,10 @@ export function readPrintedDate(raw: string, order?: DateOrder): PrintedDate {
     return iso ? { kind: "date", iso } : { kind: "none" };
   }
 
+  // Separators may be spaces or hyphens ("18-Sep-2026"), the comma is
+  // optional, and a two-digit year may wear an apostrophe ("Sep 18 '26").
   const monthFirst =
-    /^([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4}|\d{2})\b/.exec(
+    /^([A-Za-z]{3,9})\.?[\s-]+(\d{1,2})(?:st|nd|rd|th)?,?[\s-]+'?(\d{4}|\d{2})(?!\d)/.exec(
       text,
     );
   if (monthFirst) {
@@ -505,7 +525,7 @@ export function readPrintedDate(raw: string, order?: DateOrder): PrintedDate {
   }
 
   const dayFirst =
-    /^(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})\.?,?\s+(\d{4}|\d{2})\b/.exec(
+    /^(\d{1,2})(?:st|nd|rd|th)?[\s-]+([A-Za-z]{3,9})\.?,?[\s-]+'?(\d{4}|\d{2})(?!\d)/.exec(
       text,
     );
   if (dayFirst) {
@@ -629,7 +649,12 @@ function asLineItems(value: unknown): LineItem[] | undefined {
 export type GateInput = {
   valueType: DocumentFieldValueType;
   value: unknown;
-  quote: string;
+  /**
+   * The cited lines, each on its own, and for text fields each adjacent pair
+   * as well. A value must sit entirely inside one of these; the lines between
+   * two cited ones are not here, so they cannot support anything.
+   */
+  candidates: readonly Candidate[];
   pageText: string;
   /** The document type's declared currency, or USD. Used only when the page
    * states none, and flagged when it is. */
@@ -640,32 +665,103 @@ export type GateInput = {
 };
 
 /**
- * The per-value-type check. The caller has already confirmed the quote is on
- * the page (that is the evidence span's job, and it happens first because a
- * statement with no span cannot be cited whatever its value parses to).
+ * Candidate texts for one citation.
+ *
+ * Each cited line on its own, always. For a text field, each pair of
+ * *adjacent* cited lines as well: a vendor on a receipt is regularly split
+ * across two printed lines, and refusing that costs the field. Money, numbers
+ * and dates never get the pairs -- assembling `12` on one line and `.99` on
+ * the next into an amount is inventing a number, which is the failure this
+ * whole gate exists to prevent.
+ *
+ * The lines *between* two cited lines never appear here. That is what lets a
+ * citation name lines seven apart without an unrelated amount in between
+ * standing in for the value.
+ */
+export function candidatesFor(
+  cited: ReadonlyArray<{ id: number; text: string; start: number; end: number }>,
+  valueType: DocumentFieldValueType,
+): Candidate[] {
+  const candidates: Candidate[] = cited.map((line) => ({
+    text: line.text,
+    start: line.start,
+    end: line.end,
+  }));
+  const textual =
+    valueType === "text" ||
+    valueType === "organization" ||
+    valueType === "person" ||
+    valueType === "identifier";
+  if (!textual) return candidates;
+  for (let index = 1; index < cited.length; index += 1) {
+    const previous = cited[index - 1]!;
+    const line = cited[index]!;
+    // Adjacent by line id, so the span stays a contiguous range of the page
+    // and covers nothing that was not cited.
+    if (line.id === previous.id + 1) {
+      candidates.push({
+        text: `${previous.text}\n${line.text}`,
+        start: previous.start,
+        end: line.end,
+      });
+    }
+  }
+  return candidates;
+}
+
+/**
+ * How a text value is compared with the line that should print it.
+ *
+ * Case and whitespace were already folded. Punctuation joins them here,
+ * because a receipt prints `BRACKEN TOOLS,` or `Bracken Tools.` or
+ * `BRACKEN  TOOLS` for the same vendor, and a comma is not a difference of
+ * fact. Only text fields are read this way; a money or date value keeps its
+ * exact reading.
+ */
+export function foldTextForMatch(value: string): string {
+  return normalizeForMatch(value)
+    .replace(/[.,;:!?'"`()[\]{}*_+\\/|-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * The per-value-type check, against the cited lines.
+ *
+ * A value must sit entirely inside one candidate. The caller turns the
+ * candidate that supported it into the evidence span, so what is stored cites
+ * the line that prints it rather than the region it was found somewhere in.
  */
 export function checkValue(input: GateInput): GateResult {
-  const { valueType, value, quote, pageText, defaultCurrency } = input;
-  const normalizedQuote = normalizeForMatch(quote);
+  const { valueType, value, candidates, pageText, defaultCurrency } = input;
+  if (candidates.length === 0) return fail("value_not_in_quote");
+
+  const firstMatch = (predicate: (text: string) => boolean): number =>
+    candidates.findIndex((candidate) => predicate(candidate.text));
 
   if (valueType === "line_item_list") {
     const items = asLineItems(value);
     if (!items) return fail("malformed_statement");
     const values: ObservationValue[] = [];
+    const support: number[] = [];
     let total = "0";
     const pageCurrency = currencyOnPage(pageText);
     const currency = pageCurrency ?? defaultCurrency;
     for (const item of items) {
       const amount = parseAmount(item.amount);
       if (amount === undefined) return fail("money_unparsable");
-      // Same rule as a single money value: the quote has to print it.
-      if (!amountInQuote(amount, quote)) return fail("value_not_in_quote");
+      // Same rule as a single money value, per item: one cited line has to
+      // print it. Different items may be on different cited lines.
+      const at = firstMatch((text) => amountInQuote(amount, text));
+      if (at < 0) return fail("value_not_in_quote");
       total = addDecimals(total, amount);
       values.push({ type: "money", amount, currency });
+      support.push(at);
     }
     return {
       ok: true,
       values,
+      support,
       itemsTotal: total,
       ...(pageCurrency === undefined ? { currencyAssumed: true as const } : {}),
     };
@@ -678,21 +774,23 @@ export function checkValue(input: GateInput): GateResult {
   if (!literal || literal.length > 1000) return fail("malformed_statement");
 
   switch (valueType) {
-    // The three parsed types check the quote as well as the value. A value
-    // that parses is only half the claim; the other half is that the document
-    // says it. Without this, `1500.00` cited to "Total $15.50" is a stored
-    // fact with a citation that contradicts it -- the worst outcome this
-    // feature has, because the citation is what makes the number trustworthy.
+    // The three parsed types check the cited line as well as the value. A
+    // value that parses is only half the claim; the other half is that the
+    // document says it. Without this, `1500.00` cited to "Total $15.50" is a
+    // stored fact with a citation that contradicts it -- the worst outcome
+    // this feature has, because the citation is what makes it trustworthy.
     case "money": {
       const amount = parseAmount(literal);
       if (amount === undefined) return fail("money_unparsable");
-      if (!amountInQuote(amount, quote)) return fail("value_not_in_quote");
+      const at = firstMatch((text) => amountInQuote(amount, text));
+      if (at < 0) return fail("value_not_in_quote");
       const pageCurrency = currencyOnPage(pageText);
       return {
         ok: true,
         values: [
           { type: "money", amount, currency: pageCurrency ?? defaultCurrency },
         ],
+        support: [at],
         ...(pageCurrency === undefined
           ? { currencyAssumed: true as const }
           : {}),
@@ -701,21 +799,19 @@ export function checkValue(input: GateInput): GateResult {
     case "date": {
       // ISO first, then the printed forms a document actually uses. The value
       // is normalized here and checked against the cited lines afterwards, so
-      // a date can only be stored when the page prints it, in the order the
-      // page prints it.
-      if (realIsoDate(literal)) {
-        if (!dateInQuote(literal, quote, input.dateOrder)) {
-          return fail("value_not_in_quote");
-        }
-        return { ok: true, values: [{ type: "date", value: literal }] };
-      }
-      const printed = readPrintedDate(literal, input.dateOrder);
-      if (printed.kind === "ambiguous") return fail("date_ambiguous");
-      if (printed.kind === "none") return fail("date_unparsable");
-      if (!dateInQuote(printed.iso, quote, input.dateOrder)) {
-        return fail("value_not_in_quote");
-      }
-      return { ok: true, values: [{ type: "date", value: printed.iso }] };
+      // a date can only be stored when a cited line prints it, in the order
+      // that line prints it.
+      const iso = realIsoDate(literal)
+        ? literal
+        : (() => {
+            const printed = readPrintedDate(literal, input.dateOrder);
+            return printed.kind === "date" ? printed.iso : printed.kind;
+          })();
+      if (iso === "ambiguous") return fail("date_ambiguous");
+      if (iso === "none") return fail("date_unparsable");
+      const at = firstMatch((text) => dateInQuote(iso, text, input.dateOrder));
+      if (at < 0) return fail("value_not_in_quote");
+      return { ok: true, values: [{ type: "date", value: iso }], support: [at] };
     }
     case "number": {
       // Through `parseAmount`, not a bare canonicalize: a percentage prints as
@@ -723,24 +819,44 @@ export function checkValue(input: GateInput): GateResult {
       // three and a half into thirty-five.
       const canonical = parseAmount(literal.replace(/%/g, ""));
       if (canonical === undefined) return fail("number_unparsable");
-      if (!amountInQuote(canonical, quote)) return fail("value_not_in_quote");
+      const at = firstMatch((text) => amountInQuote(canonical, text));
+      if (at < 0) return fail("value_not_in_quote");
       // `unitCode: "1"` is UCUM's dimensionless unit: these are counts,
       // percentages and odometer readings, not quantities this schema converts.
       return {
         ok: true,
         values: [{ type: "decimal", value: canonical, unitCode: "1" }],
+        support: [at],
       };
     }
     default: {
       // text, organization, person, identifier: names are stored as written
       // (the entity binding gate is dropped), so the only check is that the
-      // value is actually part of the quote that is supposed to support it.
-      if (!normalizeForMatch(literal)) return fail("malformed_statement");
-      if (!normalizedQuote.includes(normalizeForMatch(literal))) {
-        return fail("value_not_in_quote");
-      }
-      return { ok: true, values: [{ type: "text", value: literal }] };
+      // value is actually part of a cited line, read the way a printed name
+      // has to be read.
+      const folded = foldTextForMatch(literal);
+      if (!folded) return fail("malformed_statement");
+      const at = firstMatch((text) => foldTextForMatch(text).includes(folded));
+      if (at < 0) return fail("value_not_in_quote");
+      return {
+        ok: true,
+        values: [{ type: "text", value: literal }],
+        support: [at],
+      };
     }
+  }
+}
+
+/** `compareDecimals` throws on anything that is not a decimal. The diagnostic
+ * compares strings it did not produce, so it needs the total version. */
+export function compareDecimalsSafely(
+  left: string,
+  right: string,
+): -1 | 0 | 1 | null {
+  try {
+    return compareDecimals(left, right);
+  } catch {
+    return null;
   }
 }
 

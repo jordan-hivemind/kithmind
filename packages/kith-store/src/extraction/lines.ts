@@ -41,10 +41,10 @@ export type PageLine = {
   text: string;
 };
 
-/** How many lines one citation may cover between its lowest and highest id.
- * Three ids are allowed; a label and its amount two lines apart is ordinary,
- * a citation spanning half a page is not a citation. */
-export const MAX_CITATION_SPAN = 4;
+/** How many lines one citation may name. A label, its amount and one more is
+ * as much as a single value ever needs; beyond that it is a region, not a
+ * citation. */
+export const MAX_CITED_LINES = 3;
 
 /**
  * How long a citable unit may be before it is split.
@@ -136,41 +136,41 @@ export function numberedPage(lines: readonly PageLine[]): string {
 export type CitationRange = { start: number; end: number };
 
 /**
- * The offsets one citation covers, or null when it cites nothing real.
+ * The lines one citation names, in id order, or null when it names something
+ * the page does not have.
  *
- * The range runs from the first character of the lowest cited line to the last
- * of the highest, so two ids that are not adjacent take the line between them
- * with them. That is deliberate: an evidence span is one contiguous range of
- * the sealed text, and a citation that skipped a line would either need two
- * spans or a quote that does not appear on the page -- which is the thing this
- * whole file exists to stop.
+ * **Not contiguous.** The first version of this required the ids to be
+ * adjacent, because the quote was built as the range covering them and a
+ * non-adjacent pair silently dragged in the lines between -- on a receipt,
+ * another item's amount, which is enough to satisfy a check the citation did
+ * not support. Requiring adjacency closed that hole and opened a bigger one:
+ * a column receipt prints "Subtotal / Tax / Total" on lines 8 to 10 and their
+ * amounts on 15 to 17, so the only honest citation of a total is two lines
+ * seven apart. Every money field on the owner's receipt failed as
+ * `citation_out_of_range`.
+ *
+ * The rule that keeps both: cite up to three lines wherever they are, and
+ * check the value against **each cited line on its own**. A line between two
+ * cited ones is never part of the text a value is checked against, so it can
+ * never support anything; the reviewer's property holds without adjacency.
+ * The caller owns that half -- see `candidatesFor` in `./gate.ts`.
  */
-export function citationRange(
+export function citedLines(
   lines: readonly PageLine[],
   ids: readonly number[],
-): CitationRange | null {
+): PageLine[] | null {
   if (ids.length === 0 || ids.length > 3) return null;
-  const unique = new Set<number>();
-  let lowest = Number.POSITIVE_INFINITY;
-  let highest = Number.NEGATIVE_INFINITY;
+  const seen = new Set<number>();
   for (const id of ids) {
     if (!Number.isInteger(id) || id < 1 || id > lines.length) return null;
-    unique.add(id);
-    if (id < lowest) lowest = id;
-    if (id > highest) highest = id;
+    seen.add(id);
   }
-  if (highest - lowest + 1 > MAX_CITATION_SPAN) return null;
-  // Contiguous, or it is not a citation.
-  //
-  // The range covers everything between the lowest and highest id, so lines
-  // [2, 5] would hand the value gates lines 3 and 4 as well -- and a receipt's
-  // line 3 holds a different item's amount, which is enough to satisfy a check
-  // the cited lines do not. Requiring the ids to be adjacent makes the quote
-  // exactly what was cited. A model that means two separate places says so in
-  // two statements.
-  if (highest - lowest + 1 !== unique.size) return null;
-  const first = lines[lowest - 1]!;
-  const last = lines[highest - 1]!;
-  if (last.end <= first.start) return null;
-  return { start: first.start, end: last.end };
+  return [...seen].sort((left, right) => left - right).map((id) => lines[id - 1]!);
+}
+
+/** Whether the ids run consecutively. Reported by the diagnostic, not enforced. */
+export function areContiguous(ids: readonly number[]): boolean {
+  const unique = [...new Set(ids)].sort((left, right) => left - right);
+  if (unique.length === 0) return false;
+  return unique[unique.length - 1]! - unique[0]! + 1 === unique.length;
 }
