@@ -127,7 +127,7 @@ function stubExtraction() {
     extractionModel: {
       name: "synthetic-extraction-model",
       async read() {
-        return { kind: "other", summary: "", statements: [] };
+        return { kind: "other", summary: "", statements: [], unnamed: 0 };
       },
     },
   };

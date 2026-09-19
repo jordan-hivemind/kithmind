@@ -95,13 +95,21 @@ function goodReading(overrides = {}) {
 
 function stubModel(reading, options = {}) {
   const calls = [];
+  const requests = [];
   return {
     calls,
+    requests,
     name: options.name ?? "synthetic-model",
-    async read(prompt) {
-      calls.push(prompt);
+    async read(request) {
+      calls.push(request.prompt);
+      requests.push(request);
       if (options.before) await options.before();
-      return typeof reading === "function" ? reading(calls.length) : reading;
+      const next =
+        typeof reading === "function" ? reading(calls.length) : reading;
+      // The stub stands in for the provider, so it owes the job the shape the
+      // provider's parser produces, including the count of entries that named
+      // no field.
+      return { unnamed: 0, ...next };
     },
   };
 }
@@ -434,7 +442,9 @@ test("a failed gate opens a correction instead of storing a guess", { skip }, as
   });
   assert.deepEqual(
     corrections.find((row) => row.reason === "unknown_field").original_value,
-    { fields: ["warranty"] },
+    // ADM-5c added the counts: the names alone could not tell one stray field
+    // from a reply where every entry was unreadable.
+    { fields: ["warranty"], unnamed: 0, unusable: 1 },
   );
 
   // Re-running on an unchanged document does not grow the queue.
