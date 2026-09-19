@@ -160,6 +160,12 @@ export function DataTable<T>({
     getFilteredRowModel: getFilteredRowModel(),
     getGroupedRowModel: getGroupedRowModel(),
     getExpandedRowModel: getExpandedRowModel(),
+    // Off: the row models queue these resets from render onto a microtask,
+    // which can set state before the first mount completes (React logs
+    // "Can't perform a React state update on a component that hasn't mounted
+    // yet"). There is no pagination to reset, and collapsing expanded rows on
+    // every live refetch would be wrong anyway.
+    autoResetAll: false,
   });
 
   // Chips come from the whole data set, not the filtered rows: a chip that
