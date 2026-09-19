@@ -176,9 +176,84 @@ type WorkerSourceRequest = {
   sourceAccountId: string;
 };
 
+/**
+ * ADM-4b. The alias naming one of the watcher host's allow-listed top-level
+ * directories, as it appears in the `fs://<alias>/<path>` URI of every item
+ * scanned under it (`canonicalFsUri` below) and in `source_roots.root_alias`.
+ *
+ * Exported so the store's own root validation
+ * (`assertSourceRootLocation`, packages/kith-store/src/admin/model.ts) is the
+ * same rule rather than a second copy of it that drifts: a root the UI adds
+ * and the item URIs the watcher then reports for it have to name the host
+ * directory identically or nothing joins.
+ *
+ * ## What a `source.roots` client MUST do with an alias and a path
+ *
+ * The server guarantees *text safety* and nothing more. It has never seen the
+ * watcher host's filesystem, so it cannot know that an alias names a directory
+ * the operator allowed, and it cannot know what a path resolves to once
+ * symbolic links are followed. The plan's rule -- "A database row can never
+ * point it outside them" (section 6) -- is therefore enforced on the host, by
+ * the client, in three steps that are not optional:
+ *
+ * 1. **Allow-list the alias.** The host keeps its own list of top-level
+ *    directories it may read. Accept a root only when its `rootAlias` is a key
+ *    in that list; skip the root otherwise and report it. Never guess at a
+ *    directory for an alias the host does not know, and never derive one from
+ *    the alias text.
+ * 2. **Re-run the path rule on the stored text, decoding nothing.** Refuse a
+ *    `relativePath` that is absolute, that has any `.` or `..` segment, that
+ *    has an empty segment, or that contains a control character or a
+ *    backslash. The database column is text a future writer could put anything
+ *    in; treat it as untrusted input, and do not percent-decode or otherwise
+ *    transform it before checking, because a rule applied before a decode is a
+ *    rule an encoded `..` walks straight through.
+ * 3. **Prove containment after resolution.** Join the path onto the
+ *    allow-listed directory, resolve it (`realpath`), and assert the result is
+ *    a *separator-aligned* descendant of the resolved allow-listed root -- a
+ *    prefix comparison alone lets `/data/roots-evil` pass for `/data/roots`.
+ *    This is the step the first two cannot cover: a symbolic link *inside* an
+ *    allowed root can point anywhere, and nothing the server stores reveals
+ *    that. A client that would rather not rely on a resolve-then-check race
+ *    opens each segment with `O_NOFOLLOW` instead.
+ */
+export const FS_ROOT_ALIAS = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+
+/**
+ * ADM-4b. What one watcher pass saw at one root: readable, gone, present but
+ * unreadable, or too large to enumerate. Closed, because a state the UI has no
+ * pill for is a state nobody sees.
+ */
+export const SOURCE_ROOT_REPORT_STATES = [
+  "ok",
+  "missing",
+  "unreadable",
+  "over_limit",
+] as const;
+export type SourceRootReportState =
+  (typeof SOURCE_ROOT_REPORT_STATES)[number];
+
+/** The kinds `kith.source_roots.kind` allows, as the worker reads them. */
+export const SOURCE_ROOT_KINDS = ["folder", "institution", "manual"] as const;
+export type WorkerSourceRootKind = (typeof SOURCE_ROOT_KINDS)[number];
+
+/** A bound on the roots one source account may hand a watcher in one pass. */
+export const MAX_WORKER_SOURCE_ROOTS = 100;
+
 export type WorkerRequest =
   | (WorkerSourceRequest & {
       operation: "source.status";
+    })
+  | (WorkerSourceRequest & {
+      operation: "source.roots";
+    })
+  | (WorkerSourceRequest & {
+      operation: "source.rootReport";
+      sourceRootId: string;
+      observedAt: number;
+      itemCount: number;
+      state: SourceRootReportState;
+      providerFolderId?: string;
     })
   | (WorkerSourceRequest & {
       operation: "diagnostics.status";
@@ -533,6 +608,38 @@ export type WorkerSourceStatusResult = {
       };
   processing: WorkerProcessingStatus;
   recordCoverage: "not_established";
+};
+
+/**
+ * ADM-4b. One row of the desired list a watcher pulls each pass.
+ *
+ * `rootAlias` and `relativePath` are absent on a root that has none -- an
+ * institution or a manual source, and the folder rows migration 022 wrote
+ * before there was a place to put them. A watcher skips a root it cannot
+ * locate rather than guessing at one.
+ */
+export type WorkerSourceRoot = {
+  sourceRootId: string;
+  kind: WorkerSourceRootKind;
+  state: "active" | "paused";
+  rootAlias?: string;
+  relativePath?: string;
+  providerFolderId?: string;
+  area?: string;
+  expectedTypes: string[];
+};
+
+export type WorkerSourceRootsResult = {
+  operation: "source.roots";
+  sourceAccountId: string;
+  roots: WorkerSourceRoot[];
+};
+
+export type WorkerSourceRootReportResult = {
+  operation: "source.rootReport";
+  sourceRootId: string;
+  reportId: string;
+  observedAt: number;
 };
 
 export type WorkerDiagnosticsWatcher =
@@ -1014,6 +1121,8 @@ export type WorkerProviderOriginalAckDetachResult =
 
 export type WorkerResult =
   | WorkerSourceStatusResult
+  | WorkerSourceRootsResult
+  | WorkerSourceRootReportResult
   | WorkerDiagnosticsStatusResult
   | WorkerDiagnosticsHeartbeatResult
   | WorkerArchiveForgetTargetsResult
@@ -1662,7 +1771,7 @@ function canonicalFsUri(value: unknown): string {
   const separator = uri.indexOf("/", 5);
   if (separator < 0) return invalid();
   const rootAlias = uri.slice(5, separator);
-  if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(rootAlias)) return invalid();
+  if (!FS_ROOT_ALIAS.test(rootAlias)) return invalid();
   const segments = uri.slice(separator + 1).split("/");
   if (
     segments.length === 0 ||
@@ -1705,6 +1814,39 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
     case "source.status":
       exactKeys(input, baseKeys);
       return { ...base, operation: "source.status" };
+    case "source.roots":
+      exactKeys(input, baseKeys);
+      return { ...base, operation: "source.roots" };
+    case "source.rootReport": {
+      exactKeys(
+        input,
+        [...baseKeys, "sourceRootId", "observedAt", "itemCount", "state"],
+        ["providerFolderId"],
+      );
+      if (
+        typeof input.state !== "string" ||
+        !(SOURCE_ROOT_REPORT_STATES as readonly string[]).includes(input.state)
+      ) {
+        invalid();
+      }
+      return {
+        ...base,
+        operation: "source.rootReport",
+        sourceRootId: string(input.sourceRootId, { maxUtf16: 256 }),
+        observedAt: epoch(input.observedAt),
+        // A watcher host counts files, not galaxies. The bound is what makes
+        // a wrong count a refusal rather than a stored absurdity.
+        itemCount: integer(input.itemCount, 0, 100_000_000),
+        state: input.state as SourceRootReportState,
+        ...(input.providerFolderId === undefined
+          ? {}
+          : {
+              providerFolderId: string(input.providerFolderId, {
+                maxUtf8: 256,
+              }),
+            }),
+      };
+    }
     case "diagnostics.status":
       exactKeys(input, baseKeys);
       return { ...base, operation: "diagnostics.status" };

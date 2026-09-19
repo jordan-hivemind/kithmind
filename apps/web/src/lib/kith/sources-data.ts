@@ -8,13 +8,19 @@ import { admin } from "@repo/kith-store";
 
 import { loadAuthenticatedPage } from "@/lib/kith/page-session";
 
-export type SourcesPageData = { sources: admin.SourceInventoryRow[] };
+export type SourcesPageData = {
+  sources: admin.SourceInventoryRow[];
+  /** The watched folders under those sources (ADM-4b), each with the latest
+   * thing the watcher host said about it. */
+  roots: admin.SourceRoot[];
+};
 
 export async function loadSources(
   cookieHeader: string | null,
 ): Promise<SourcesPageData | null> {
   return await loadAuthenticatedPage(cookieHeader, async ({ ctx, principal }) => ({
     sources: await admin.listSourcesInventory(ctx, { principal }),
+    roots: await admin.listSourceRoots(ctx, { principal }),
   }));
 }
 

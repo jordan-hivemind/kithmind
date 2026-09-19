@@ -46,6 +46,21 @@ export const FINANCE_AREA = "brokerage";
 /** A bound on the rows an unexpected area explosion could add. */
 const MAX_AREAS = 50;
 
+/**
+ * The account's first root, as a lateral subquery.
+ *
+ * Since migration 028 an account may have several roots, and this screen
+ * counts accounts: joined plainly, an account with two folders would be
+ * counted twice and its documents and records counted twice with it. The
+ * account's area is therefore its first root's, which is what it was when an
+ * account could only have one root. (A second root naming a different area is
+ * a shape this screen will have to grow a rule for; it has no rows yet, and
+ * inventing one now would be inventing it blind.)
+ */
+const FIRST_ROOT = `SELECT y.area FROM kith.source_roots y
+   WHERE y.source_account_id = a.id AND y.space_id = a.space_id
+   ORDER BY y.created_at, y.id LIMIT 1`;
+
 export type AreaCoverageRow = {
   area: string;
   /** Source accounts whose root names this area. */
@@ -182,8 +197,7 @@ export async function listAreaCoverage(
                     AND g.space_id = a.space_id
                     AND g.status = 'open') AS gaps
            FROM kith.source_accounts a
-           LEFT JOIN kith.source_roots r
-             ON r.source_account_id = a.id AND r.space_id = a.space_id
+           LEFT JOIN LATERAL (${FIRST_ROOT}) r ON true
           WHERE ${inSpaces("a.space_id")}
        ) s
       WHERE s.area <> ''
@@ -204,8 +218,7 @@ export async function listAreaCoverage(
        FROM kith.coverage_gaps g
        JOIN kith.source_accounts a
          ON a.id = g.source_account_id AND a.space_id = g.space_id
-       LEFT JOIN kith.source_roots r
-         ON r.source_account_id = a.id AND r.space_id = a.space_id
+       LEFT JOIN LATERAL (${FIRST_ROOT}) r ON true
       WHERE ${inSpaces("g.space_id")} AND g.status = 'open'
       GROUP BY 1, 2
       ORDER BY 1, 2
