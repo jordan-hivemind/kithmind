@@ -86,6 +86,7 @@ const GRANTED = Object.freeze({
     "worker_operational_incidents",
     "worker_watcher_reset_receipts",
   ],
+  attention: ["attention_mutes"],
 });
 
 /**

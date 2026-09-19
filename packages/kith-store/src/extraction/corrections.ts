@@ -23,6 +23,7 @@
 
 import type { ClientBase } from "pg";
 
+import { isAttentionMuted } from "../admin/attention.js";
 import { ProofError } from "../errors.js";
 import { newKithId } from "../ids.js";
 import { occurrenceSortKey } from "../records/model.js";
@@ -32,6 +33,11 @@ import {
   type ObservationValue,
 } from "../records/values.js";
 import type { CorrectionReason } from "./gate.js";
+
+/** The one detector name every extraction gate failure carries (ADM-8a).
+ * `openCorrection` has one caller, `model.ts`, so this is not yet a
+ * parameter -- see the module comment on `openCorrection` for why. */
+const EXTRACTION_DETECTOR = "extraction";
 
 /** The seven `ObservationValue` discriminants, as a set. Kept beside its one
  * caller rather than exported from `values.ts`, which states them as a union
@@ -57,11 +63,40 @@ export type CorrectionRow = {
   resolvedAt: Date | null;
 };
 
+/** The one attention-queue key a gate failure ever carries: the document,
+ * the field it failed on (or none, for a document-level reason such as
+ * `input_truncated`), and why. Doubles as `corrections.dedupe_key` (ADM-8a),
+ * so "the same target+field+reason must never reopen" and "the same
+ * dedupe_key must never reopen" are the same rule rather than two to keep in
+ * sync. */
+function extractionDedupeKey(
+  sourceItemId: string,
+  fieldName: string | null,
+  reason: CorrectionReason,
+): string {
+  return `extraction:${sourceItemId}:${fieldName ?? "_"}:${reason}`;
+}
+
 /**
  * Opens one item for a statement the gate refused.
  *
- * De-duplicated on (document, field, reason): re-running extraction on an
- * unchanged document must not grow the queue by one row per run.
+ * De-duplicated on `dedupe_key` (document, field, reason), which the partial
+ * unique index in migration 030 enforces at most one open-or-snoozed row for:
+ * re-running extraction on an unchanged document must not grow the queue by
+ * one row per run.
+ *
+ * Two ADM-8a rules on top of that:
+ *
+ *   * A mute on the `extraction` detector (`kith.attention_mutes`,
+ *     space-wide) refuses the whole write. Prospective, the same as every
+ *     mute: it stops a row from being opened, it does not go looking for one
+ *     already open.
+ *   * A row the owner dismissed ("not worth backfilling" or one of the other
+ *     closed reasons) is never reopened, however many times the same field
+ *     fails the gate again. A row this function itself auto-cleared
+ *     (`supersedeOpenCorrections`, `resolved`/`cleared`) is not the same
+ *     case -- the condition came back, so it reopens -- and a `snoozed` row
+ *     keeps its snooze rather than popping back open under the owner.
  */
 export async function openCorrection(
   client: ClientBase,
@@ -73,19 +108,42 @@ export async function openCorrection(
     reading: unknown;
   },
 ): Promise<string | null> {
+  if (await isAttentionMuted(client, input.spaceId, { detector: EXTRACTION_DETECTOR })) {
+    return null;
+  }
+  const dedupeKey = extractionDedupeKey(
+    input.sourceItemId,
+    input.fieldName,
+    input.reason,
+  );
   const existing = (
-    await client.query<{ id: string }>(
-      `SELECT id FROM kith.corrections
-        WHERE space_id = $1 AND target_kind = 'document' AND target_id = $2
-          AND field_name IS NOT DISTINCT FROM $3 AND reason = $4
-          AND state = 'open' LIMIT 1`,
-      [input.spaceId, input.sourceItemId, input.fieldName, input.reason],
+    await client.query<{ id: string; state: string }>(
+      `SELECT id, state FROM kith.corrections
+        WHERE space_id = $1 AND dedupe_key = $2
+        ORDER BY created_at DESC, id DESC LIMIT 1`,
+      [input.spaceId, dedupeKey],
     )
   ).rows[0];
-  if (existing) {
+  if (existing?.state === "dismissed") return existing.id;
+  if (existing?.state === "snoozed") {
     await client.query(
       `UPDATE kith.corrections SET original_value = $2 WHERE id = $1`,
       [existing.id, JSON.stringify(input.reading ?? null)],
+    );
+    return existing.id;
+  }
+  if (existing) {
+    // `reason` is reset here too, not just `state`: `supersedeOpenCorrections`
+    // overwrites it to `'cleared'` on the same row when the failure stops
+    // reproducing, and `dedupe_key` (which does encode the reason) is not
+    // parsed back out of, so without this a failure that recurs would reopen
+    // with the *previous* run's "why" still showing `cleared`.
+    await client.query(
+      `UPDATE kith.corrections
+          SET original_value = $2, state = 'open', resolved_at = NULL,
+              reason = $3
+        WHERE id = $1`,
+      [existing.id, JSON.stringify(input.reading ?? null), input.reason],
     );
     return existing.id;
   }
@@ -93,8 +151,8 @@ export async function openCorrection(
   await client.query(
     `INSERT INTO kith.corrections
        (id, space_id, target_kind, target_id, field_name, original_value,
-        reason, state)
-     VALUES ($1,$2,'document',$3,$4,$5,$6,'open')`,
+        reason, state, dedupe_key)
+     VALUES ($1,$2,'document',$3,$4,$5,$6,'open',$7)`,
     [
       id,
       input.spaceId,
@@ -102,6 +160,7 @@ export async function openCorrection(
       input.fieldName,
       JSON.stringify(input.reading ?? null),
       input.reason,
+      dedupeKey,
     ],
   );
   return id;
@@ -367,30 +426,36 @@ async function insertCorrected(
 }
 
 /**
- * Clears the previous run's open items before the current run writes its own.
+ * Auto-closes the previous run's open items before the current run writes its
+ * own.
  *
  * Without this the queue is cumulative rather than current: a field that
  * failed in March and is read correctly in June keeps its March row forever,
  * and a failure that recurs every run keeps exactly one row only because
- * `openCorrection` deduplicates on the reason. The owner reads this queue, and
- * a queue that never shrinks is one nobody opens.
+ * `openCorrection` deduplicates on `dedupe_key`. The owner reads this queue,
+ * and a queue that never shrinks is one nobody opens.
  *
  * Only `open` rows the owner has not touched. A `resolved` row is the owner's
- * own answer and outlives every extraction; an `open` row that already carries
- * a `corrected_value` is one they are partway through and is left alone too.
+ * own answer and outlives every extraction; a `dismissed` or `snoozed` row is
+ * untouched by this on purpose (a dismissal is permanent, a snooze is the
+ * owner's own wait); an `open` row that already carries a `corrected_value`
+ * is one the owner is partway through and is left alone too.
  *
- * ponytail: deleted rather than marked superseded, which loses "how long has
- * this been wrong". The alternative is a third `state`, which `corrections`
- * constrains in the schema and so would cost a migration for a column no
- * screen reads yet. Upgrade path if that history is ever wanted: add
- * `superseded` to the CHECK and update these rows instead of deleting them.
+ * ADM-8a: resolved with reason `cleared` rather than deleted, which is the
+ * "auto-close when the condition clears ... not by the owner" the attention
+ * queue needs -- a screen that shows resolved items keeps the history of what
+ * was once wrong, and `openCorrection`'s `dedupe_key` lookup finds this same
+ * row and reopens it (never as `dismissed`) if the same field fails again on
+ * a later run, so nothing is lost by not deleting.
  */
 export async function supersedeOpenCorrections(
   client: ClientBase,
   input: { spaceId: string; sourceItemId: string },
 ): Promise<number> {
   const cleared = await client.query(
-    `DELETE FROM kith.corrections
+    `UPDATE kith.corrections
+        SET state = 'resolved', resolved_at = transaction_timestamp(),
+            reason = 'cleared'
       WHERE space_id = $1 AND target_kind = 'document' AND target_id = $2
         AND state = 'open' AND corrected_value IS NULL`,
     [input.spaceId, input.sourceItemId],
@@ -454,6 +519,13 @@ async function currentReading(
  * Two readers. The extraction writer uses the keys, so a re-run never re-opens
  * a field the owner has fixed; `reapplyCorrections` uses the values, so the
  * fix survives the observations being replaced.
+ *
+ * `corrected_value IS NOT NULL` on top of `state = 'resolved'` (ADM-8a):
+ * `supersedeOpenCorrections` also leaves a row `resolved` -- with reason
+ * `cleared` and no `corrected_value` -- when a gate failure simply stops
+ * reproducing. Without this filter that row reads as "the owner fixed
+ * `total`" forever after, and `settled()` in `model.ts` would refuse to ever
+ * open a `total` item again even though nothing was ever owner-corrected.
  */
 export async function resolvedCorrections(
   client: ClientBase,
@@ -464,7 +536,7 @@ export async function resolvedCorrections(
     await client.query<{ field_name: string | null; corrected_value: unknown }>(
       `SELECT field_name, corrected_value FROM kith.corrections
         WHERE space_id = $1 AND target_kind = 'document' AND target_id = $2
-          AND state = 'resolved'
+          AND state = 'resolved' AND corrected_value IS NOT NULL
         ORDER BY resolved_at, id LIMIT 512`,
       [spaceId, sourceItemId],
     )

@@ -218,6 +218,11 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
     name: "watcher pass outcome: the last pass's state, code and counts on worker_watcher_states (ADM-9)",
     url: new URL("../migrations/029_watcher_pass_outcome.sql", import.meta.url),
   },
+  {
+    version: 30,
+    name: "the attention queue: corrections gains dismissed/snoozed states and severity, and kith.attention_mutes (ADM-8a)",
+    url: new URL("../migrations/030_attention_queue.sql", import.meta.url),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */
