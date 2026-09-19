@@ -12,6 +12,7 @@ import type {
   WorkerArchivedLookupResult,
   WorkerArchivedPreflightResult,
   WorkerArchivedReserveResult,
+  WorkerExistingParserArtifact,
   WorkerRequest,
 } from "@repo/worker-protocol/request";
 import type { PrincipalRef } from "../identity/authorization.js";
@@ -633,6 +634,42 @@ async function resolveCurrentArchivedWork(
   return current;
 }
 
+/**
+ * Whether this worker may take this archived work row now.
+ *
+ * P2-104d. One predicate, used by both `preflightArchivedDiscovery` and
+ * `reserveArchivedDiscovery`, because they disagreed and the disagreement was
+ * live. Reserve has always treated an expired lease as claimable -- that is
+ * how a pass that died holding one is recovered -- and preflight required no
+ * lease at all. Preflight is the gate reserve sits behind, so a row left
+ * `leased` with an expired lease answered `stale_observation` at preflight
+ * forever and took the whole pass down with it, while the reserve that would
+ * have reclaimed it was never reached.
+ *
+ * This grants nothing. Preflight hands out no lease, writes nothing and fences
+ * nothing; it authorizes the archive intent for work this credential could
+ * claim in the very next call. Saying no to work reserve would say yes to was
+ * never a safety property, only a missing case.
+ */
+function claimableArchivedWork(
+  work: CurrentDiscovery["work"],
+  now: number,
+): boolean {
+  return (
+    ((work.state === "queued" ||
+      (work.state === "failed" && work.retryable === true)) &&
+      work.leaseToken === null &&
+      work.leaseExpiresAt === null &&
+      work.leaseOwnerCredentialId === null &&
+      (work.nextAttemptAt === null || work.nextAttemptAt.getTime() <= now)) ||
+    (work.state === "leased" &&
+      work.leaseToken !== null &&
+      work.leaseExpiresAt !== null &&
+      work.leaseOwnerCredentialId !== null &&
+      work.leaseExpiresAt.getTime() <= now)
+  );
+}
+
 export async function preflightArchivedDiscovery(
   ctx: WorkerCtx,
   principal: PrincipalRef,
@@ -646,16 +683,10 @@ export async function preflightArchivedDiscovery(
     request.identity,
   );
   if (
-    (current.work.state !== "queued" &&
-      !(current.work.state === "failed" && current.work.retryable === true)) ||
-    current.work.leaseToken !== null ||
-    current.work.leaseExpiresAt !== null ||
-    current.work.leaseOwnerCredentialId !== null ||
+    !claimableArchivedWork(current.work, ctx.now) ||
     !Number.isSafeInteger(current.work.attempts) ||
     current.work.attempts < 0 ||
-    current.work.attempts >= MAX_WORKER_DISCOVERY_ATTEMPTS ||
-    (current.work.nextAttemptAt !== null &&
-      current.work.nextAttemptAt.getTime() > ctx.now)
+    current.work.attempts >= MAX_WORKER_DISCOVERY_ATTEMPTS
   )
     workerProtocolError("stale_observation");
   if (current.work.expectedDesiredProcessingEpoch === null)
@@ -803,21 +834,8 @@ export async function reserveArchivedDiscovery(
     request.identity,
   );
   const work = current.work;
-  const claimable =
-    ((work.state === "queued" ||
-      (work.state === "failed" && work.retryable === true)) &&
-      work.leaseToken === null &&
-      work.leaseExpiresAt === null &&
-      work.leaseOwnerCredentialId === null &&
-      (work.nextAttemptAt === null ||
-        work.nextAttemptAt.getTime() <= ctx.now)) ||
-    (work.state === "leased" &&
-      work.leaseToken !== null &&
-      work.leaseExpiresAt !== null &&
-      work.leaseOwnerCredentialId !== null &&
-      work.leaseExpiresAt.getTime() <= ctx.now);
   if (
-    !claimable ||
+    !claimableArchivedWork(work, ctx.now) ||
     work.leaseEpoch < 0 ||
     work.attempts < 0 ||
     work.attempts >= MAX_WORKER_DISCOVERY_ATTEMPTS
@@ -898,6 +916,86 @@ export async function reserveArchivedDiscovery(
   };
 }
 
+/**
+ * P2-104d. The parser artifact this revision already has under this parser
+ * fingerprint, with the archive receipts currently bound to its parser output,
+ * or `undefined` when there is nothing to reuse.
+ *
+ * `(source_revision_id, parser_fingerprint)` is the artifact's identity
+ * because the archived parser output is the raw conversion, and the extraction
+ * configuration maps that raw output into the bundle rather than changing it.
+ * Re-processing under a new extraction configuration therefore re-parses to
+ * the same bytes: the client has to select this artifact and its archived
+ * copies, not archive a second copy of bytes that are already archived and
+ * then be refused by artifact immutability.
+ *
+ * Offered only when the output the client just produced *is* this artifact's
+ * output. A parser that produced different bytes under an unchanged
+ * fingerprint is not a reuse case, and saying nothing lets the ordinary
+ * create path refuse it where the conflict is visible.
+ */
+async function existingParserArtifact(
+  ctx: WorkerCtx,
+  source: LoadedWorkerSource,
+  current: CurrentDiscovery,
+  revision: SourceRevisionRow,
+  lookup: {
+    parserOutputHash: string;
+    parserOutputByteLength: number;
+    parserOutputMediaType: string;
+  },
+): Promise<WorkerExistingParserArtifact | undefined> {
+  if (current.work.parserFingerprint === null) return undefined;
+  const found = (
+    await rows<Record<string, unknown>>(
+      ctx,
+      `SELECT * FROM kith.source_parser_artifacts
+       WHERE source_revision_id = $1 AND parser_fingerprint = $2
+       ORDER BY created_at, id LIMIT 2`,
+      [revision.id, current.work.parserFingerprint],
+    )
+  ).map(camelizeSourceParserArtifact);
+  if (found.length > 1) workerProtocolError("scan_conflict");
+  const artifact = found[0];
+  if (
+    !artifact ||
+    artifact.spaceId !== source.spaceId ||
+    artifact.sourceAccountId !== source.account.id ||
+    artifact.sourceItemId !== current.item.id ||
+    artifact.outputHash !== lookup.parserOutputHash ||
+    artifact.outputByteLength !== lookup.parserOutputByteLength ||
+    artifact.outputMediaType !== lookup.parserOutputMediaType
+  )
+    return undefined;
+  const subject = {
+    spaceId: source.spaceId,
+    sourceAccountId: source.account.id,
+    sourceItemId: current.item.id,
+    sourceRevisionId: revision.id,
+    parserArtifactId: artifact.id,
+    subjectKind: "parser_output" as const,
+  };
+  const primary = await loadCurrentArchiveBinding(ctx.client, {
+    ...subject,
+    copyRole: "primary",
+  });
+  const backup = await loadCurrentArchiveBinding(ctx.client, {
+    ...subject,
+    copyRole: "independent_backup",
+  });
+  // Both copies or nothing. A half-archived artifact is not reusable: the
+  // client would skip the archive step for a copy that was never durable.
+  if (!primary || !backup) return undefined;
+  requireIndependentArchivePair(primary.receipt, backup.receipt);
+  return {
+    parserArtifactId: artifact.id,
+    primaryReceiptId: primary.receipt.id,
+    primaryBindingEpoch: primary.binding.bindingEpoch,
+    backupReceiptId: backup.receipt.id,
+    backupBindingEpoch: backup.binding.bindingEpoch,
+  };
+}
+
 export async function lookupArchivedAdmission(
   ctx: WorkerCtx,
   principal: PrincipalRef,
@@ -965,6 +1063,19 @@ export async function lookupArchivedAdmission(
     };
   }
   const lookup = request.lookup;
+  // P2-104d. Computed once, attached to every not-found processing answer,
+  // and only for a client that asked for it. A not-found answer is exactly
+  // when the client needs it: it is about to archive and admit, and this is
+  // what tells it there is nothing to archive.
+  const reusable = lookup.reuseParserArtifact
+    ? await existingParserArtifact(ctx, source, current, revision, lookup)
+    : undefined;
+  const processingNotFound = (): WorkerArchivedLookupResult => ({
+    operation: "discovery.lookupArchivedAdmission",
+    mode: "processing",
+    found: false,
+    ...(reusable === undefined ? {} : { existingParserArtifact: reusable }),
+  });
   const artifacts = (
     await rows<Record<string, unknown>>(
       ctx,
@@ -987,11 +1098,7 @@ export async function lookupArchivedAdmission(
     artifact.outputByteLength !== lookup.parserOutputByteLength ||
     artifact.outputMediaType !== lookup.parserOutputMediaType
   )
-    return {
-      operation: "discovery.lookupArchivedAdmission",
-      mode: "processing",
-      found: false,
-    };
+    return processingNotFound();
   const expectedExtraction = await artifactBoundExtractionFingerprint(
     current.work.parserFingerprint!,
     artifact.outputHash,
@@ -1025,11 +1132,7 @@ export async function lookupArchivedAdmission(
     [revision.id, lookup.parsedText.extractionFingerprint],
   );
   if (!parserPrimary || !parserBackup || textRows.length !== 1)
-    return {
-      operation: "discovery.lookupArchivedAdmission",
-      mode: "processing",
-      found: false,
-    };
+    return processingNotFound();
   requireIndependentArchivePair(parserPrimary.receipt, parserBackup.receipt);
   const text = camelizeSourceTextVersion(textRows[0]!);
   let textRepresentation;
@@ -1066,12 +1169,7 @@ export async function lookupArchivedAdmission(
       [revision.id, processingFingerprint],
     )
   ).map(camelizeProcessingGeneration);
-  if (generations.length !== 1)
-    return {
-      operation: "discovery.lookupArchivedAdmission",
-      mode: "processing",
-      found: false,
-    };
+  if (generations.length !== 1) return processingNotFound();
   const generation = generations[0]!;
   const jobs = (
     await rows<Record<string, unknown>>(
@@ -1081,12 +1179,7 @@ export async function lookupArchivedAdmission(
       [generation.id],
     )
   ).map(camelizeIngestJob);
-  if (jobs.length !== 1)
-    return {
-      operation: "discovery.lookupArchivedAdmission",
-      mode: "processing",
-      found: false,
-    };
+  if (jobs.length !== 1) return processingNotFound();
   const job = jobs[0]!;
   const expectedArchiveSet = await archiveSetDigest(
     recovery.originalPrimary,

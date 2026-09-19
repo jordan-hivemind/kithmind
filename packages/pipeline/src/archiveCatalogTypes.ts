@@ -77,6 +77,15 @@ export type ArchiveCopyRecord = ArchiveCopyIntent & {
     /** Digest of the local archived admission/lookup HTTP request. */
     requestDigest: string;
     recordedAt: number;
+    /**
+     * P2-104d. The receipt names bytes another row archived. A processing
+     * generation whose extraction configuration changed re-parses to the same
+     * raw conversion, so it selects the existing parser artifact and the
+     * archive copies already bound to it rather than writing a second copy of
+     * identical bytes. This row therefore holds a receipt and no object,
+     * which is why `published` may be absent here and only here.
+     */
+    reused?: true;
   };
   deletion?: ArchiveDeletion;
   reviewCode?:

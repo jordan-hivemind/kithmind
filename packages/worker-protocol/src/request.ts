@@ -329,6 +329,15 @@ export type WorkerRequest =
             parserOutputByteLength: number;
             parserOutputMediaType: BinaryParserOutputMediaType;
             parsedText: ParsedTextDeclaration;
+            /**
+             * P2-104d. Opt in to `existingParserArtifact` on a not-found
+             * processing answer. It gates a response field, not a behaviour:
+             * the answer is otherwise identical. A client built before this
+             * field validates a not-found answer against an exact key set, so
+             * a server that volunteered the field unasked would break every
+             * such client. Absent means the answer this operation always gave.
+             */
+            reuseParserArtifact?: true;
           };
     })
   | (WorkerSourceRequest & {
@@ -694,12 +703,35 @@ export type WorkerOriginalRecoverySelection =
       originalBackupBindingEpoch?: never;
     };
 
+/**
+ * P2-104d. The parser artifact the server already holds for this revision and
+ * parser fingerprint, with the archive receipts currently bound to its parser
+ * output. Present only on a not-found processing answer to a lookup that asked
+ * for it (`lookup.reuseParserArtifact`), and only when the artifact's output
+ * matches the one the client just produced.
+ *
+ * It exists because one parser artifact per (source revision, parser
+ * fingerprint) is the right identity: the archived parser output is the raw
+ * conversion, and the extraction configuration maps that raw output into the
+ * bundle without changing it. Re-processing under a new extraction
+ * configuration therefore re-parses to the same bytes, and must select this
+ * artifact rather than archive a second copy of them.
+ */
+export type WorkerExistingParserArtifact = {
+  parserArtifactId: string;
+  primaryReceiptId: string;
+  primaryBindingEpoch: number;
+  backupReceiptId: string;
+  backupBindingEpoch: number;
+};
+
 export type WorkerArchivedLookupResult =
   | (
       | {
           operation: "discovery.lookupArchivedAdmission";
           mode: "original" | "processing";
           found: false;
+          existingParserArtifact?: WorkerExistingParserArtifact;
         }
       | ({
           operation: "discovery.lookupArchivedAdmission";
@@ -2076,14 +2108,27 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
         };
       }
       if (lookup.mode !== "processing") return invalid();
-      exactKeys(lookup, [
-        "mode",
-        "clientArtifactId",
-        "parserOutputHash",
-        "parserOutputByteLength",
-        "parserOutputMediaType",
-        "parsedText",
-      ]);
+      exactKeys(
+        lookup,
+        [
+          "mode",
+          "clientArtifactId",
+          "parserOutputHash",
+          "parserOutputByteLength",
+          "parserOutputMediaType",
+          "parsedText",
+        ],
+        ["reuseParserArtifact"],
+      );
+      // P2-104d. Additive and opt-in: `true` or absent, never `false`, so the
+      // request has one encoding per meaning and an old client's request is
+      // still exactly what it always was.
+      if (
+        lookup.reuseParserArtifact !== undefined &&
+        lookup.reuseParserArtifact !== true
+      ) {
+        invalid();
+      }
       // P2-70i3: one of the closed set. Which one this work may use is not
       // decided here: the lookup compares the type against the artifact the
       // class already accepted, so a workbook lookup cannot match a docling
@@ -2115,6 +2160,9 @@ export function parseWorkerRequest(value: unknown): WorkerRequest {
           ),
           parserOutputMediaType: lookupOutputMediaType,
           parsedText: parsedTextDeclaration(lookup.parsedText),
+          ...(lookup.reuseParserArtifact === true
+            ? { reuseParserArtifact: true as const }
+            : {}),
         },
       };
     }
