@@ -1506,3 +1506,87 @@ test("the maxFiles ceiling is the scan manifest's, and the default is unchanged"
   assert.throws(() => parseConfig({ ...base, maxFiles: 1025 }));
   assert.equal(MAX_WORKER_SCAN_ENTRIES, 1024);
 });
+
+test("the watched-folder list and its report are validated against closed shapes", () => {
+  const ok = {
+    operation: "source.roots",
+    sourceAccountId: "source_1",
+    roots: [
+      {
+        sourceRootId: "root_1",
+        kind: "folder",
+        state: "active",
+        rootAlias: "investing",
+        relativePath: "Investing/2026",
+        providerFolderId: "id:abc",
+        area: "finance",
+        expectedTypes: ["capital_call_notice"],
+      },
+      {
+        sourceRootId: "root_2",
+        kind: "manual",
+        state: "paused",
+        expectedTypes: [],
+      },
+    ],
+  };
+  assert.deepEqual(
+    parseWorkerResponse(JSON.stringify(ok), "source.roots"),
+    ok,
+  );
+  assert.deepEqual(
+    parseWorkerResponse(
+      JSON.stringify({
+        operation: "source.roots",
+        sourceAccountId: "source_1",
+        roots: [],
+      }),
+      "source.roots",
+    ).roots,
+    [],
+    "no rows is a valid answer and means the host's allow-list stands",
+  );
+  for (const mutate of [
+    (value) => {
+      value.roots[0].kind = "drive";
+    },
+    (value) => {
+      value.roots[0].state = "retired";
+    },
+    (value) => {
+      value.roots[0].rootAlias = "Investing";
+    },
+    (value) => {
+      value.roots[0].unexpected = true;
+    },
+    (value) => {
+      delete value.roots[0].expectedTypes;
+    },
+    (value) => {
+      value.roots = Array.from({ length: 101 }, () => value.roots[0]);
+    },
+  ]) {
+    const invalid = structuredClone(ok);
+    mutate(invalid);
+    assert.throws(() =>
+      parseWorkerResponse(JSON.stringify(invalid), "source.roots"),
+    );
+  }
+
+  const report = {
+    operation: "source.rootReport",
+    sourceRootId: "root_1",
+    reportId: "report_1",
+    observedAt: 1_758_000_000_000,
+  };
+  assert.deepEqual(
+    parseWorkerResponse(JSON.stringify(report), "source.rootReport"),
+    report,
+  );
+  assert.throws(() =>
+    parseWorkerResponse(
+      JSON.stringify({ ...report, state: "ok" }),
+      "source.rootReport",
+    ),
+  );
+});

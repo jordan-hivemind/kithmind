@@ -27,6 +27,7 @@ import test from "node:test";
 
 import { createKithPool, newKithId } from "../dist/index.js";
 import {
+  addRehearsalRoot,
   installFakeDropbox,
   rehearsalConfig,
   rehearsalPass,
@@ -711,3 +712,156 @@ test(
     );
   },
 );
+
+// ADM-4c. A second watched root added to a journal that already has a
+// published history. Three claims, against the real handlers and a real
+// database:
+//
+//   1. the first root's documents are untouched: no identity recovery, no
+//      re-parse, no re-publish;
+//   2. the second root's PDFs publish once, each bound to its own provider
+//      folder;
+//   3. the files the PDF lane does not handle are counted and skipped by name,
+//      and a third pass publishes nothing.
+test(
+  "a second watched root publishes its own documents and leaves the first alone",
+  { skip },
+  async (t) => {
+    const f = await fixture(t);
+    const transport = inProcessWorkerTransport(f.pool, {
+      userId: f.userId,
+      credentialId: f.credential.id,
+    });
+    const workspace = await rehearsalWorkspace(t, { documents: 2 });
+    const dropbox = installFakeDropbox(t, workspace);
+    const runtime = rehearsalProfile();
+    const pass = () => ({
+      config: rehearsalConfig({
+        endpoint: "http://127.0.0.1:0/api/worker",
+        spaceId: f.spaceId,
+        sourceAccountId: f.sourceAccountId,
+        workspace,
+        runtime,
+        provider: true,
+      }),
+      credential: f.credential.rawKey,
+      transport,
+      runtime,
+    });
+
+    // One root, published, under the pre-ADM-4c single-root provider config.
+    const first = await rehearsalUntilSettled(pass());
+    assert.equal(first.at(-1).state, "complete", JSON.stringify(first));
+    const before = await activeGenerations(f);
+    assert.equal(before.length, 2);
+    const untouched = new Map(
+      before.map((row) => [row.item_id, row.active_generation_id]),
+    );
+    const firstRootItems = (await sourceItems(f)).map((row) => row.external_id);
+
+    // Now the owner adds a folder: two more documents and three files the PDF
+    // lane cannot read.
+    const added = await addRehearsalRoot(workspace, "investing", {
+      documents: 2,
+      unsupported: true,
+    });
+    dropbox.addRoot(added);
+
+    const second = await rehearsalUntilSettled(pass());
+    assert.equal(second.at(-1).state, "complete", JSON.stringify(second));
+    assert.equal(
+      second.reduce((total, result) => total + (result.published ?? 0), 0),
+      2,
+      `only the new root's documents published: ${JSON.stringify(second)}`,
+    );
+
+    // 1. The first root's documents are the ones they were.
+    const after = await activeGenerations(f);
+    for (const [itemId, generationId] of untouched) {
+      const row = after.find((candidate) => candidate.item_id === itemId);
+      assert.ok(row, "the first root's item is still here");
+      assert.equal(
+        row.active_generation_id,
+        generationId,
+        "and its published generation was neither re-parsed nor replaced",
+      );
+      assert.equal(row.publication_state, "active");
+    }
+    assert.deepEqual(
+      (await reviewEntries(f)).filter((row) => row.state !== "gap"),
+      [],
+      "adding a root is not an identity failure for the root already there",
+    );
+
+    // 2. The new root's PDFs published exactly once each.
+    const items = await sourceItems(f);
+    const fresh = items.filter(
+      (row) => !firstRootItems.includes(row.external_id),
+    );
+    const published = fresh.filter((row) =>
+      after.some(
+        (generation) =>
+          generation.item_id === row.id &&
+          generation.publication_state === "active",
+      ),
+    );
+    assert.deepEqual(
+      published.map((row) => row.uri).sort(),
+      ["fs://investing/investing-0.pdf", "fs://investing/investing-1.pdf"],
+      "the second root's two documents, and only those",
+    );
+
+    // 3. Its unsupported files are items with a named skip reason and no
+    // processing at all.
+    const skippedUris = added.skipped
+      .map((file) => `fs://investing/${file.relativePath}`)
+      .sort();
+    assert.deepEqual(
+      fresh
+        .filter((row) => skippedUris.includes(row.uri))
+        .map((row) => row.uri)
+        .sort(),
+      skippedUris,
+      "every skipped file is still an item the sources screen can count",
+    );
+    assert.deepEqual(
+      await gapEntries(f),
+      [
+        { uri: "fs://investing/blank.pdf", code: "empty" },
+        { uri: "fs://investing/large-photo.jpg", code: "oversized" },
+        { uri: "fs://investing/photo.jpg", code: "unsupported" },
+      ],
+      "each under its own closed-enum reason",
+    );
+    for (const row of fresh.filter((candidate) =>
+      skippedUris.includes(candidate.uri),
+    )) {
+      assert.equal(
+        after.some((generation) => generation.item_id === row.id),
+        false,
+        "and none of them produced a processing generation",
+      );
+    }
+
+    // And the world has stopped moving.
+    const third = await rehearsalUntilSettled(pass());
+    assert.deepEqual(
+      third,
+      [{ state: "complete", scanned: 7, published: 0 }],
+      `a third pass publishes nothing: ${JSON.stringify(third)}`,
+    );
+  },
+);
+
+/** The skip reason the server recorded for each gap entry, by item. */
+async function gapEntries(f) {
+  const { rows } = await f.client.query(
+    `SELECT DISTINCT i.uri, e.issue_code
+       FROM kith.worker_scan_entries e
+       JOIN kith.source_items i ON i.id = e.source_item_id
+      WHERE e.source_account_id = $1 AND e.state = 'gap'
+      ORDER BY i.uri`,
+    [f.sourceAccountId],
+  );
+  return rows.map((row) => ({ uri: row.uri, code: row.issue_code }));
+}

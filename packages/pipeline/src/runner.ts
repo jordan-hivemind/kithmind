@@ -15,7 +15,11 @@ import {
   type ParsedStagePhase,
   type ParserArtifactSelection,
 } from "@repo/worker-protocol";
-import { MAX_WORKER_SCAN_ENTRIES } from "@repo/worker-protocol/request";
+import {
+  MAX_WORKER_SCAN_ENTRIES,
+  type SourceRootReportState,
+  type WorkerSourceRoot,
+} from "@repo/worker-protocol/request";
 
 import {
   ArchiveCommandError,
@@ -76,6 +80,7 @@ import {
 } from "./captureStore.js";
 import {
   lookupDropboxFileIds,
+  validRelativePath,
   verifyDropboxOriginal,
 } from "./dropboxOriginal.js";
 import {
@@ -85,6 +90,7 @@ import {
 
 import {
   canonicalRoots,
+  contains,
   discoverFiles,
   discoverSourceObservations,
   FilesystemFailure,
@@ -415,6 +421,15 @@ function providerBinding(
   if (!root) throw new PipelineWorkerError("provider_original_root_mismatch");
   return { ...account, ...root };
 }
+
+/** ADM-4c. What one pass will tell the server about one of its roots. */
+type SourceRootReport = {
+  sourceRootId: string;
+  state: SourceRootReportState;
+  rootAlias?: string;
+  relativePath?: string;
+  providerFolderId?: string;
+};
 
 type ArchivedCheckpoint = Extract<RunnerCheckpoint, { phase: "archived" }>;
 
@@ -798,7 +813,11 @@ function records(value: unknown, label: string): Record<string, unknown>[] {
 
 function request(
   config: PipelineConfig,
-  operation: JournalOperation | "source.status",
+  operation:
+    | JournalOperation
+    | "source.status"
+    | "source.roots"
+    | "source.rootReport",
   extra: Record<string, unknown> = {},
 ): Record<string, unknown> {
   return {
@@ -1904,6 +1923,179 @@ export class PipelineRunner {
     );
   }
 
+  /**
+   * ADM-4c. The watched-folder list the server holds, or `undefined` when this
+   * pass could not read it.
+   *
+   * Never fails the pass. A server that has no rows, or that this worker
+   * cannot ask, means "watch the host's allow-listed roots as today", which is
+   * every pass before ADM-4b and the safe answer for every pass after it.
+   */
+  private async serverRoots(): Promise<WorkerSourceRoot[] | undefined> {
+    try {
+      const result = object(
+        await this.transport.call(request(this.config, "source.roots")),
+        "source.roots",
+      );
+      if (result.sourceAccountId !== this.config.sourceAccountId) {
+        throw new PipelineWorkerError("source_mismatch");
+      }
+      return result.roots as WorkerSourceRoot[];
+    } catch (error) {
+      console.warn(
+        `[pipeline] watched-folder list unavailable this pass; the host's allow-listed roots stand (${
+          error instanceof Error ? error.message : "unknown error"
+        })`,
+      );
+      return undefined;
+    }
+  }
+
+  /**
+   * ADM-4c. The roots this pass reads, and what to report about each server
+   * row.
+   *
+   * The host's JSON config is the allow-list and the server's rows select
+   * subtrees inside it. The three steps the protocol requires of a client (see
+   * the contract above `FS_ROOT_ALIAS` in `@repo/worker-protocol/request`) all
+   * happen here, in order, on text this worker treats as untrusted:
+   *
+   * 1. the alias must be a key in the host's own list, or the row is skipped;
+   * 2. the stored relative path is re-checked as text, decoding nothing;
+   * 3. the joined path is resolved and must be a separator-aligned descendant
+   *    of the resolved allow-listed root, so a symlink inside an allowed root
+   *    cannot point the watcher somewhere else.
+   *
+   * A row that fails any of them is reported `missing` or `unreadable` and
+   * left out of the pass. None of it fails the pass: a folder the owner
+   * mistyped in the UI must show a problem on the sources screen, not stop the
+   * watcher reading the folders that are fine.
+   */
+  private async resolveServerRoots(
+    allowed: SafeRoot[],
+    rows: WorkerSourceRoot[],
+  ): Promise<{ roots: SafeRoot[]; reports: SourceRootReport[] }> {
+    const byAlias = new Map(allowed.map((root) => [root.alias, root]));
+    const prefixes = new Map<string, string[]>();
+    const reports: SourceRootReport[] = [];
+    let narrowed = false;
+    for (const row of rows) {
+      if (row.kind !== "folder") continue;
+      narrowed = true;
+      const host = row.rootAlias ? byAlias.get(row.rootAlias) : undefined;
+      if (!host) {
+        reports.push({ sourceRootId: row.sourceRootId, state: "missing" });
+        continue;
+      }
+      const relativePath = row.relativePath ?? "";
+      if (relativePath !== "" && !validRelativePath(relativePath)) {
+        reports.push({ sourceRootId: row.sourceRootId, state: "missing" });
+        continue;
+      }
+      const joined =
+        relativePath === ""
+          ? host.canonicalPath
+          : join(host.canonicalPath, relativePath);
+      let resolved: string;
+      try {
+        resolved = await realpath(joined);
+      } catch (error) {
+        reports.push({
+          sourceRootId: row.sourceRootId,
+          state:
+            (error as NodeJS.ErrnoException).code === "ENOENT"
+              ? "missing"
+              : "unreadable",
+        });
+        continue;
+      }
+      if (!contains(host.canonicalPath, resolved)) {
+        reports.push({ sourceRootId: row.sourceRootId, state: "unreadable" });
+        continue;
+      }
+      const entry = await lstat(resolved).catch(() => undefined);
+      if (!entry?.isDirectory()) {
+        reports.push({ sourceRootId: row.sourceRootId, state: "unreadable" });
+        continue;
+      }
+      reports.push({
+        sourceRootId: row.sourceRootId,
+        state: "ok",
+        rootAlias: host.alias,
+        relativePath,
+        ...(row.providerFolderId === undefined
+          ? {}
+          : { providerFolderId: row.providerFolderId }),
+      });
+      // A paused root is read but not narrowed away: leaving it out of the
+      // scan would make the server's reconcile mark every item under it
+      // unavailable, and pausing a folder must not read as deleting it.
+      if (row.state === "paused") continue;
+      if (relativePath === "") prefixes.delete(host.alias);
+      else if (prefixes.has(host.alias)) {
+        prefixes.get(host.alias)!.push(relativePath);
+      } else prefixes.set(host.alias, [relativePath]);
+    }
+    if (!narrowed) return { roots: allowed, reports };
+    const covered = new Set(
+      reports
+        .filter((report) => report.state === "ok")
+        .map((report) => report.rootAlias),
+    );
+    const roots = allowed
+      .filter((root) => covered.has(root.alias))
+      .map((root) => {
+        const selected = prefixes.get(root.alias);
+        return selected === undefined
+          ? root
+          : { ...root, includePrefixes: [...new Set(selected)].sort() };
+      });
+    // Every row named a root this host does not have. Reading nothing would
+    // retire the whole source, so the allow-list stands and the reports say
+    // what the host could not find.
+    return { roots: roots.length === 0 ? allowed : roots, reports };
+  }
+
+  /** ADM-4c. Tells the server what this pass saw at each of its roots. */
+  private async reportRoots(
+    reports: SourceRootReport[],
+    files: FilePlan[],
+  ): Promise<void> {
+    const observedAt = Date.now();
+    for (const report of reports) {
+      const itemCount =
+        report.state !== "ok"
+          ? 0
+          : files.filter(
+              (file) =>
+                file.rootAlias === report.rootAlias &&
+                (report.relativePath === "" ||
+                  file.relativePath === report.relativePath ||
+                  file.relativePath.startsWith(`${report.relativePath}/`)),
+            ).length;
+      try {
+        await this.transport.call(
+          request(this.config, "source.rootReport", {
+            sourceRootId: report.sourceRootId,
+            observedAt,
+            itemCount,
+            state: report.state,
+            ...(report.providerFolderId === undefined
+              ? {}
+              : { providerFolderId: report.providerFolderId }),
+          }),
+        );
+      } catch (error) {
+        console.warn(
+          `[pipeline] a watched-folder report could not be sent (${
+            error instanceof Error ? error.message : "unknown error"
+          })`,
+        );
+        return;
+      }
+    }
+  }
+
   private async preparePdfProfile(): Promise<void> {
     const pdf = this.config.pdfDocQa;
     if (pdf === undefined) return;
@@ -2642,7 +2834,7 @@ export class PipelineRunner {
   private async startCycle(
     roots: SafeRoot[],
     status: Record<string, unknown>,
-  ): Promise<void> {
+  ): Promise<FilePlan[]> {
     const prior =
       this.journal.checkpoint.phase === "terminal"
         ? this.journal.checkpoint.bindings
@@ -2699,6 +2891,7 @@ export class PipelineRunner {
       },
       credentialSessionActive: true,
     });
+    return plans;
   }
 
   private async driveScanBegin(): Promise<void> {
@@ -6994,8 +7187,14 @@ export class PipelineRunner {
       this.journal.checkpoint.phase === "idle" ||
       this.journal.checkpoint.phase === "terminal"
     ) {
-      const roots = await canonicalRoots(this.config);
-      await this.startCycle(roots, status);
+      const allowed = await canonicalRoots(this.config);
+      const rows = await this.serverRoots();
+      const plan =
+        rows === undefined
+          ? { roots: allowed, reports: [] as SourceRootReport[] }
+          : await this.resolveServerRoots(allowed, rows);
+      const plans = await this.startCycle(plan.roots, status);
+      if (plan.reports.length > 0) await this.reportRoots(plan.reports, plans);
     }
 
     for (let steps = 0; steps < 10_000; steps += 1) {

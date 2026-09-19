@@ -18,8 +18,14 @@ function fail(message: string): never {
   throw new DropboxVerificationError(message);
 }
 
-/** A relative path the provider can be asked about without escaping the root. */
-function validRelativePath(value: string): boolean {
+/**
+ * A relative path the provider can be asked about without escaping the root.
+ *
+ * Exported for ADM-4c: a `source.roots` row's `relative_path` is database text
+ * a future writer could put anything in, and it is checked against this same
+ * rule before it is joined to an allow-listed directory.
+ */
+export function validRelativePath(value: string): boolean {
   return (
     value.length > 0 &&
     value.length <= 2048 &&

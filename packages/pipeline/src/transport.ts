@@ -1,3 +1,9 @@
+import {
+  FS_ROOT_ALIAS,
+  MAX_WORKER_SOURCE_ROOTS,
+  SOURCE_ROOT_KINDS,
+} from "@repo/worker-protocol/request";
+
 import type {
   PipelineConfig,
   WorkerErrorCode,
@@ -15,6 +21,8 @@ const MAX_PAGE_ITEMS = 4;
 const MAX_URI_ALIASES = 8;
 const MAX_FILE_BYTES = 65_536;
 const MAX_ARCHIVE_CIPHER_BYTES = 65 * 1024 * 1024;
+const MAX_SOURCE_ROOTS = MAX_WORKER_SOURCE_ROOTS;
+const MAX_SOURCE_ROOT_EXPECTED_TYPES = 64;
 const ID = /^[A-Za-z0-9_-]{1,256}$/;
 const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -405,6 +413,63 @@ function counts(value: unknown): void {
   for (const key of Object.keys(unresolved)) {
     integer(unresolved[key], `counts.unresolvedEntries.${key}`);
   }
+}
+
+/**
+ * ADM-4c. The desired watched-folder list, as `source.roots` reports it.
+ *
+ * Text safety only. The alias and the relative path are validated again on the
+ * host before either is joined to a directory, because this server has never
+ * seen the host's filesystem; see the contract above `FS_ROOT_ALIAS` in
+ * `@repo/worker-protocol/request` and `resolveServerRoots` in runner.ts.
+ */
+function sourceRoots(value: Record<string, unknown>): void {
+  exact(value, ["operation", "sourceAccountId", "roots"]);
+  id(value.sourceAccountId, "sourceAccountId");
+  if (!Array.isArray(value.roots) || value.roots.length > MAX_SOURCE_ROOTS) {
+    failure("roots is invalid");
+  }
+  for (const entry of value.roots) {
+    const root = record(entry);
+    exact(
+      root,
+      ["sourceRootId", "kind", "state", "expectedTypes"],
+      ["rootAlias", "relativePath", "providerFolderId", "area"],
+    );
+    id(root.sourceRootId, "sourceRootId");
+    enumValue(root.kind, "root kind", SOURCE_ROOT_KINDS);
+    enumValue(root.state, "root state", ["active", "paused"] as const);
+    if (root.rootAlias !== undefined) {
+      text(root.rootAlias, "rootAlias", {
+        maxUtf16: 64,
+        pattern: FS_ROOT_ALIAS,
+      });
+    }
+    if (root.relativePath !== undefined) {
+      text(root.relativePath, "relativePath", { maxUtf8: MAX_URI_BYTES });
+    }
+    if (root.providerFolderId !== undefined) {
+      text(root.providerFolderId, "providerFolderId", { maxUtf16: 256 });
+    }
+    if (root.area !== undefined) text(root.area, "area", { maxUtf16: 256 });
+    if (
+      !Array.isArray(root.expectedTypes) ||
+      root.expectedTypes.length > MAX_SOURCE_ROOT_EXPECTED_TYPES
+    ) {
+      failure("expectedTypes is invalid");
+    }
+    for (const type of root.expectedTypes) {
+      text(type, "expectedTypes entry", { maxUtf16: 256 });
+    }
+  }
+}
+
+/** ADM-4c. The acknowledgement of one root's report from one pass. */
+function sourceRootReport(value: Record<string, unknown>): void {
+  exact(value, ["operation", "sourceRootId", "reportId", "observedAt"]);
+  id(value.sourceRootId, "sourceRootId");
+  id(value.reportId, "reportId");
+  integer(value.observedAt, "observedAt");
 }
 
 function status(value: Record<string, unknown>): void {
@@ -1300,6 +1365,12 @@ export function parseWorkerResponse(
   switch (expectedOperation) {
     case "source.status":
       status(result);
+      break;
+    case "source.roots":
+      sourceRoots(result);
+      break;
+    case "source.rootReport":
+      sourceRootReport(result);
       break;
     case "diagnostics.heartbeat":
       diagnosticsHeartbeat(result);

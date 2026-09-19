@@ -10,6 +10,7 @@ import {
   realpath,
   rename,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -32,6 +33,7 @@ import {
   PipelineRunner,
 } from "../dist/runner.js";
 import { ParserProcessError } from "../dist/parserProcess.js";
+import { canonicalRoots, discoverFiles } from "../dist/filesystem.js";
 import { persistProviderBinding } from "../dist/providerRegistry.js";
 import {
   formatReconcileResult,
@@ -6712,6 +6714,225 @@ test("a second root of files the PDF lane cannot read is skipped, never failed",
       pass.result.code,
       "source_unavailable",
       "the only failure is the one this transport injects at append",
+    );
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+// ADM-4c. The server's watched-folder list, resolved on the host.
+//
+// The host's JSON config is the allow-list; a row selects a subtree inside it.
+// These cases are the three steps the protocol contract requires of a client,
+// run against a real directory rather than a mock filesystem, because the one
+// they exist for -- a symbolic link inside an allowed root -- is invisible to
+// anything that does not resolve paths.
+
+async function resolvePass(setup, rows, extraRoots = []) {
+  const journal = await openJournal(setup.journalDir, terminalCheckpoint([]));
+  try {
+    const runner = new PipelineRunner(
+      { ...setup.config, roots: [...setup.config.roots, ...extraRoots] },
+      journal,
+      {
+        async call() {
+          throw new Error("no transport in this case");
+        },
+      },
+    );
+    const allowed = await canonicalRoots(runner.config);
+    return await runner.resolveServerRoots(allowed, rows);
+  } finally {
+    await journal.close();
+  }
+}
+
+function folderRow(overrides) {
+  return {
+    sourceRootId: randomUUID().replaceAll("-", ""),
+    kind: "folder",
+    state: "active",
+    expectedTypes: [],
+    ...overrides,
+  };
+}
+
+test("a server row narrows an allow-listed root to a subtree, keeping its alias", async () => {
+  const setup = await fixture(0);
+  await mkdir(join(setup.root, "investing"), { mode: 0o700 });
+  await mkdir(join(setup.root, "elsewhere"), { mode: 0o700 });
+  await writeFile(join(setup.root, "investing", "term-sheet.txt"), "synthetic");
+  await writeFile(join(setup.root, "elsewhere", "other.txt"), "synthetic");
+  try {
+    const row = folderRow({ rootAlias: "fixture", relativePath: "investing" });
+    const plan = await resolvePass(setup, [row]);
+    assert.deepEqual(plan.reports, [
+      {
+        sourceRootId: row.sourceRootId,
+        state: "ok",
+        rootAlias: "fixture",
+        relativePath: "investing",
+      },
+    ]);
+    assert.equal(plan.roots.length, 1);
+    assert.deepEqual(plan.roots[0].includePrefixes, ["investing"]);
+    assert.equal(
+      plan.roots[0].alias,
+      "fixture",
+      "the alias stays the host's, so item URIs keep joining",
+    );
+    // And the narrowing is real: only the chosen subtree is read.
+    const observed = await discoverFiles(setup.config, plan.roots);
+    assert.deepEqual(
+      observed.map((file) => file.uri),
+      ["fs://fixture/investing/term-sheet.txt"],
+    );
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("an alias the host does not allow-list is skipped and reported missing", async () => {
+  const setup = await fixture(0);
+  await writeFile(join(setup.root, "statement.txt"), "synthetic");
+  try {
+    const row = folderRow({ rootAlias: "not-a-host-root" });
+    const plan = await resolvePass(setup, [row]);
+    assert.deepEqual(plan.reports, [
+      { sourceRootId: row.sourceRootId, state: "missing" },
+    ]);
+    assert.deepEqual(
+      plan.roots.map((root) => root.alias),
+      ["fixture"],
+      "reading nothing would retire the source, so the allow-list stands",
+    );
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a stored relative path is re-checked as text, decoding nothing", async () => {
+  const setup = await fixture(0);
+  await mkdir(join(setup.root, "investing"), { mode: 0o700 });
+  try {
+    for (const relativePath of [
+      "/etc",
+      "..",
+      "investing/../../etc",
+      "investing/./notes",
+      "investing//notes",
+      "investing\\notes",
+      `investing/notes${String.fromCharCode(0)}`,
+      " investing",
+      "investing ",
+      // Not decoded before the check: an encoded traversal stays text and
+      // simply names a directory that is not there.
+      "%2e%2e/%2e%2e/etc",
+    ]) {
+      const row = folderRow({ rootAlias: "fixture", relativePath });
+      const plan = await resolvePass(setup, [row]);
+      assert.equal(
+        plan.reports[0].state,
+        "missing",
+        `${JSON.stringify(relativePath)} must not resolve to a watched root`,
+      );
+      assert.deepEqual(
+        plan.roots.map((root) => root.includePrefixes),
+        [undefined],
+      );
+    }
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a symlink inside an allowed root cannot point the watcher out of it", async () => {
+  const setup = await fixture(0);
+  const outside = join(setup.base, "outside");
+  await mkdir(outside, { mode: 0o700 });
+  await writeFile(join(outside, "secret.txt"), "synthetic");
+  await symlink(outside, join(setup.root, "escape"));
+  // The sibling a prefix comparison alone would let through.
+  await mkdir(`${setup.root}-evil`, { mode: 0o700 });
+  await symlink(`${setup.root}-evil`, join(setup.root, "sibling"));
+  try {
+    for (const relativePath of ["escape", "sibling"]) {
+      const row = folderRow({ rootAlias: "fixture", relativePath });
+      const plan = await resolvePass(setup, [row]);
+      assert.deepEqual(plan.reports, [
+        { sourceRootId: row.sourceRootId, state: "unreadable" },
+      ]);
+      assert.deepEqual(
+        plan.roots.map((root) => root.includePrefixes),
+        [undefined],
+        "and the pass falls back to the whole allow-listed root",
+      );
+    }
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a subtree that is gone or is not a directory is reported, not failed", async () => {
+  const setup = await fixture(0);
+  await writeFile(join(setup.root, "statement.txt"), "synthetic");
+  try {
+    const gone = folderRow({ rootAlias: "fixture", relativePath: "gone" });
+    assert.equal((await resolvePass(setup, [gone])).reports[0].state, "missing");
+    const file = folderRow({
+      rootAlias: "fixture",
+      relativePath: "statement.txt",
+    });
+    assert.equal(
+      (await resolvePass(setup, [file])).reports[0].state,
+      "unreadable",
+    );
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("a paused root is reported but never narrowed away", async () => {
+  const setup = await fixture(0);
+  await mkdir(join(setup.root, "investing"), { mode: 0o700 });
+  await mkdir(join(setup.root, "medical"), { mode: 0o700 });
+  try {
+    const active = folderRow({
+      rootAlias: "fixture",
+      relativePath: "investing",
+    });
+    const paused = folderRow({
+      rootAlias: "fixture",
+      relativePath: "medical",
+      state: "paused",
+    });
+    const plan = await resolvePass(setup, [active, paused]);
+    assert.deepEqual(
+      plan.reports.map((report) => report.state),
+      ["ok", "ok"],
+      "a paused root is reported on, not hidden",
+    );
+    assert.deepEqual(plan.roots[0].includePrefixes, ["investing"]);
+    // And a root whose every row is paused keeps its whole allow-listed
+    // directory, because dropping it would make the server's reconcile mark
+    // every item under it unavailable. See the PR body.
+    const onlyPaused = await resolvePass(setup, [paused]);
+    assert.equal(onlyPaused.reports[0].state, "ok");
+    assert.deepEqual(onlyPaused.roots[0].includePrefixes, undefined);
+  } finally {
+    await rm(setup.base, { recursive: true, force: true });
+  }
+});
+
+test("no server rows means the host's allow-listed roots, exactly as before", async () => {
+  const setup = await fixture(0);
+  await writeFile(join(setup.root, "statement.txt"), "synthetic");
+  try {
+    const plan = await resolvePass(setup, []);
+    assert.deepEqual(plan.reports, []);
+    assert.deepEqual(
+      plan.roots.map((root) => [root.alias, root.includePrefixes]),
+      [["fixture", undefined]],
     );
   } finally {
     await rm(setup.base, { recursive: true, force: true });

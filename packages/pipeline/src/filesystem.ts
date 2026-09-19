@@ -37,9 +37,22 @@ export type SafeRoot = RootConfig & {
   canonicalPath: string;
   device: number;
   inode: number;
+  /**
+   * ADM-4c. Subtrees of this root the pass may read, as normalized paths
+   * relative to the root. Absent means the whole root, which is what every
+   * config-only pass has. Set from the server's watched-folder list; the alias
+   * and so the `fs://<alias>/<path>` URI stay the root's, because narrowing a
+   * root must not rename the items already under it.
+   */
+  includePrefixes?: string[];
 };
 
-function contains(root: string, candidate: string): boolean {
+/**
+ * Separator-aligned containment: `/data/roots-evil` is not inside
+ * `/data/roots`. Exported for ADM-4c, which checks a server-supplied subtree
+ * against its allow-listed root after `realpath`.
+ */
+export function contains(root: string, candidate: string): boolean {
   return candidate === root || candidate.startsWith(`${root}${sep}`);
 }
 
@@ -1343,6 +1356,19 @@ async function discoverWith<T extends DiscoveryFile | SourceObservation>(
     for (const entry of entries) {
       const fullPath = join(directory, entry.name);
       const rel = relative(root.canonicalPath, fullPath);
+      // ADM-4c: a root narrowed to subtrees reads only what is inside one of
+      // them, and walks only the directories on the way there. A name outside
+      // every subtree is not looked at at all, so a symlink beside a watched
+      // folder is neither followed nor a reason to fail the pass.
+      if (root.includePrefixes !== undefined) {
+        const inside = root.includePrefixes.some(
+          (prefix) => rel === prefix || rel.startsWith(`${prefix}${sep}`),
+        );
+        const onTheWay = root.includePrefixes.some((prefix) =>
+          prefix.startsWith(`${rel}${sep}`),
+        );
+        if (!inside && !onTheWay) continue;
+      }
       const selectedLeaf = selected?.leaves.has(rel) ?? false;
       const selectedAncestor = selected?.ancestors.has(rel) ?? false;
       if (selected !== undefined && !selectedLeaf && !selectedAncestor) {
