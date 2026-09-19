@@ -195,6 +195,11 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
       import.meta.url,
     ),
   },
+  {
+    version: 26,
+    name: "change feed trigger on space_members for the spaces page (UI-restyle)",
+    url: new URL("../migrations/026_space_members_change_feed.sql", import.meta.url),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */
