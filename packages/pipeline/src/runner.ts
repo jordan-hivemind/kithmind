@@ -15,6 +15,7 @@ import {
   type ParsedStagePhase,
   type ParserArtifactSelection,
 } from "@repo/worker-protocol";
+import { MAX_WORKER_SCAN_ENTRIES } from "@repo/worker-protocol/request";
 
 import {
   ArchiveCommandError,
@@ -119,6 +120,7 @@ import {
   recoverNormalizedBundleSpool,
   removeNormalizedBundleSpoolExact,
 } from "./spoolStore.js";
+import { providerRootFor, providerRootsOf } from "./config.js";
 import { Journal } from "./journal.js";
 import {
   runJournaledCall,
@@ -132,6 +134,7 @@ import type {
   JsonValue,
 } from "./journalTypes.js";
 import {
+  MAX_IDENTITY_BINDINGS,
   parseRunnerCheckpoint,
   workerErrorCode,
   type DiscoveryLease,
@@ -155,6 +158,8 @@ import type {
   DiscoveryFile,
   IdentityBinding,
   PdfDocQaProfile,
+  PdfDocQaProviderOriginal,
+  PdfDocQaProviderRoot,
   PipelineConfig,
   PipelineRunResult,
   SourceObservation,
@@ -389,6 +394,26 @@ function providerProofFresh(
   return [verifiedAt, readbackVerifiedAt].every(
     (at) => at >= now - 9 * 60_000 && at <= now + 4 * 60_000,
   );
+}
+
+/**
+ * ADM-4c. The account fields plus the folder bound to this plan's root, as one
+ * object, for the two drivers that work on an original already carrying
+ * provider state.
+ *
+ * Reaching either of those with an unbound root means an original was given a
+ * provider binding under a configuration that no longer binds its root, so
+ * `provider_original_root_mismatch` still stands. A root that was never bound
+ * never gets provider state in the first place (`createArchivedIntents`), so it
+ * never arrives here.
+ */
+function providerBinding(
+  account: PdfDocQaProviderOriginal,
+  rootAlias: string,
+): PdfDocQaProviderOriginal & PdfDocQaProviderRoot {
+  const root = providerRootFor(account, rootAlias);
+  if (!root) throw new PipelineWorkerError("provider_original_root_mismatch");
+  return { ...account, ...root };
 }
 
 type ArchivedCheckpoint = Extract<RunnerCheckpoint, { phase: "archived" }>;
@@ -1033,7 +1058,10 @@ function bindingsFromScan(checkpoint: {
   const result = [...byExternalId.values()].sort((left, right) =>
     Buffer.compare(Buffer.from(fileKey(left)), Buffer.from(fileKey(right))),
   );
-  if (result.length > 256) {
+  // ADM-4c: bindings are bounded by `MAX_IDENTITIES`, not by the plan count.
+  // The union is what is here now plus what is remembered and gone, and a
+  // removed root leaves a whole root's worth of the second kind behind.
+  if (result.length > MAX_IDENTITY_BINDINGS) {
     throw new PipelineWorkerError("identity_capacity_exceeded");
   }
   const paths = new Set<string>();
@@ -1252,12 +1280,14 @@ export class PipelineRunner {
       maxClears?: number;
     } = {},
     /**
-     * ADM-4a. The provider identity source, when the caller supplies its own.
-     * The runner builds the Dropbox one from its configuration otherwise, and
-     * a source with no provider configured has none at all.
+     * ADM-4a, a list since ADM-4c. The provider identity sources, when the
+     * caller supplies its own. The runner builds one Dropbox source per bound
+     * root from its configuration otherwise, and a root with no provider has
+     * none at all.
      */
-    private readonly providerFileIdSource:
-      ProviderFileIdSource | undefined = undefined,
+    private readonly providerFileIdSources:
+      | ProviderFileIdSource[]
+      | undefined = undefined,
   ) {}
 
   /**
@@ -1740,7 +1770,10 @@ export class PipelineRunner {
       mediaType: planMediaType(plan),
     });
     if (!original) {
-      const provider = pdf.providerOriginal;
+      // ADM-4c: a watched root with no provider entry archives its own
+      // independent copy, exactly as every root does when `providerOriginal`
+      // is absent. Only a root that is bound gets a provider original.
+      const provider = providerRootFor(pdf.providerOriginal, plan.rootAlias);
       original = await catalog.createOriginalIntent({
         originalCatalogId: originalSeed,
         sourceExternalId: plan.externalId,
@@ -2430,33 +2463,36 @@ export class PipelineRunner {
     return asWorkerResponse(result);
   }
 
-  /** ADM-4a. The configured provider identity source, if there is one. */
-  private providerFileIds(): ProviderFileIdSource | undefined {
-    if (this.providerFileIdSource) return this.providerFileIdSource;
+  /**
+   * ADM-4a, widened in ADM-4c: one identity source per bound root. A watched
+   * root with no provider entry has none, and keeps path identity.
+   */
+  private providerFileIds(): ProviderFileIdSource[] {
+    if (this.providerFileIdSources) return this.providerFileIdSources;
     const pdf = this.config.pdfDocQa;
-    const provider = pdf?.providerOriginal;
-    const backup = pdf?.archive.independentBackup;
-    const repository = backup?.repository;
-    if (!provider || !repository) return undefined;
-    return {
-      rootAlias: provider.rootAlias,
+    const account = pdf?.providerOriginal;
+    const repository = pdf?.archive.independentBackup.repository;
+    if (!account || !repository) return [];
+    const credentials = {
+      rcloneBinary: repository.rcloneBinary,
+      configPath: repository.configPath,
+      remoteName: repository.remoteName,
+      configIdentityFingerprint: repository.configIdentityFingerprint,
+    };
+    return providerRootsOf(account).map((root) => ({
+      rootAlias: root.rootAlias,
       lookup: async (relativePaths) =>
         await lookupDropboxFileIds(
           {
-            credentials: {
-              rcloneBinary: repository.rcloneBinary,
-              configPath: repository.configPath,
-              remoteName: repository.remoteName,
-              configIdentityFingerprint: repository.configIdentityFingerprint,
-            },
-            refreshPath: provider.refreshPath,
-            providerAccountIdHash: provider.providerAccountIdHash,
-            providerRootDirectoryId: provider.providerRootDirectoryId,
-            providerRootDirectoryIdHash: provider.providerRootDirectoryIdHash,
+            credentials,
+            refreshPath: account.refreshPath,
+            providerAccountIdHash: account.providerAccountIdHash,
+            providerRootDirectoryId: root.providerRootDirectoryId,
+            providerRootDirectoryIdHash: root.providerRootDirectoryIdHash,
           },
           relativePaths,
         ),
-    };
+    }));
   }
 
   /**
@@ -2478,9 +2514,10 @@ export class PipelineRunner {
     plans: FilePlan[],
     byPath: Map<string, IdentityBinding>,
   ): Promise<void> {
-    const source = this.providerFileIds();
-    if (!source) return;
-    const under = plans.filter((plan) => plan.rootAlias === source.rootAlias);
+    const sources = this.providerFileIds();
+    if (sources.length === 0) return;
+    const bound = new Map(sources.map((source) => [source.rootAlias, source]));
+    const under = plans.filter((plan) => bound.has(plan.rootAlias));
     for (const plan of under) {
       const remembered = byPath.get(fileKey(plan))?.providerFileId;
       if (remembered !== undefined) plan.providerFileId = remembered;
@@ -2496,25 +2533,33 @@ export class PipelineRunner {
           Number(byPath.has(fileKey(left))) -
           Number(byPath.has(fileKey(right))),
       );
+    // ADM-4c: the budget is the pass's, not each root's, so adding a root
+    // cannot multiply the provider calls one pass makes. One root's provider
+    // being unreachable leaves that root on path identity and does not stop
+    // the others.
     const ask = new Set(wanted.slice(0, MAX_PROVIDER_LOOKUPS_PER_PASS));
     if (ask.size === 0) return;
-    let ids: Map<string, string>;
-    try {
-      ids = await source.lookup([...ask].map((plan) => plan.relativePath));
-    } catch (error) {
-      console.warn(
-        `[pipeline] provider file ids unavailable this pass; identity falls back to paths (${
-          error instanceof Error ? error.message : "unknown error"
-        })`,
-      );
-      return;
-    }
     const fresh = new Set<string>();
-    for (const plan of ask) {
-      const id = ids.get(plan.relativePath);
-      if (id === undefined) continue;
-      plan.providerFileId = id;
-      fresh.add(id);
+    for (const [rootAlias, source] of bound) {
+      const asking = [...ask].filter((plan) => plan.rootAlias === rootAlias);
+      if (asking.length === 0) continue;
+      let ids: Map<string, string>;
+      try {
+        ids = await source.lookup(asking.map((plan) => plan.relativePath));
+      } catch (error) {
+        console.warn(
+          `[pipeline] provider file ids unavailable this pass for root ${rootAlias}; identity falls back to paths (${
+            error instanceof Error ? error.message : "unknown error"
+          })`,
+        );
+        continue;
+      }
+      for (const plan of asking) {
+        const id = ids.get(plan.relativePath);
+        if (id === undefined) continue;
+        plan.providerFileId = id;
+        fresh.add(id);
+      }
     }
     // A remembered id the provider has just answered for another path belongs
     // to that path now: the file moved and something else took its place. The
@@ -2627,7 +2672,14 @@ export class PipelineRunner {
         plan.externalId = retained ?? randomUUID();
       }
     }
-    if (plans.length + missingBindings.length > 256) {
+    // ADM-4c: each side is checked against the checkpoint validator's own
+    // bound rather than their sum. The sum refused a full scan beside a whole
+    // watched root's worth of vanished items, which is exactly what removing a
+    // root looks like: that must become ordinary gaps, not a failed pass.
+    if (
+      plans.length > MAX_WORKER_SCAN_ENTRIES ||
+      missingBindings.length > MAX_IDENTITY_BINDINGS
+    ) {
       throw new FilesystemFailure(
         "oversized",
         "identity binding capacity exceeded",
@@ -3897,14 +3949,13 @@ export class PipelineRunner {
     authorizedAction?: NonNullable<ArchivedCheckpoint["preflightAction"]>,
   ): Promise<RunnerCheckpoint | void> {
     const pdf = this.requirePdfConfig();
-    const provider = pdf.providerOriginal;
+    const account = pdf.providerOriginal;
     const state = original.providerOriginal;
-    if (!provider || !state || !("repository" in pdf.archive.independentBackup))
+    if (!account || !state || !("repository" in pdf.archive.independentBackup))
       throw new PipelineWorkerError("provider_original_configuration_missing");
     const remoteRepository = pdf.archive.independentBackup.repository!;
     const plan = this.archivedPlan(checkpoint);
-    if (plan.rootAlias !== provider.rootAlias)
-      throw new PipelineWorkerError("provider_original_root_mismatch");
+    const provider = providerBinding(account, plan.rootAlias);
     if (state.locator.reviewCode)
       throw new PipelineWorkerError(
         "provider_locator_recovery_review_required",
@@ -4194,9 +4245,9 @@ export class PipelineRunner {
   ): Promise<void> {
     const { original, processing } = this.archivedRows(checkpoint);
     const pdf = this.requirePdfConfig();
-    const provider = pdf.providerOriginal;
+    const account = pdf.providerOriginal;
     const state = original.providerOriginal;
-    if (!provider || !state || !("repository" in pdf.archive.independentBackup))
+    if (!account || !state || !("repository" in pdf.archive.independentBackup))
       throw new PipelineWorkerError("provider_original_configuration_missing");
     const verified = state.verified;
     const copy = state.locator;
@@ -4207,8 +4258,7 @@ export class PipelineRunner {
         "provider_locator_recovery_review_required",
       );
     const plan = this.archivedPlan(checkpoint);
-    if (plan.rootAlias !== provider.rootAlias)
-      throw new PipelineWorkerError("provider_original_root_mismatch");
+    const provider = providerBinding(account, plan.rootAlias);
     const remoteRepository = pdf.archive.independentBackup.repository!;
     const configured = pdf.archive.independentBackup;
     const loaded = await loadProviderBinding({

@@ -766,3 +766,80 @@ test("filesystem traversal has a hard node bound separate from file count", asyn
     (error) => error instanceof FilesystemFailure && error.code === "oversized",
   );
 });
+
+/**
+ * ADM-4c. The owner's two new folders hold xlsx, docx, pptx, zip, jpg and csv
+ * beside their PDFs. Every one of them must land on a named code in the closed
+ * `DiscoveryGap["code"]` enum, and none of them may fail discovery: a folder is
+ * added to watch its documents, not to have one holiday photo stop the pass.
+ */
+test("every file class the PDF lane does not handle lands on a named skip reason", async () => {
+  const { root, journal } = await setup();
+  const jpegHeader = Buffer.from([0xff, 0xd8, 0xff, 0xe0]);
+  const oleHeader = Buffer.from([0xd0, 0xcf, 0x11, 0xe0]);
+  const written = {
+    "workbook.xlsx": workbookBytes(),
+    "letter.docx": zip([
+      ["[Content_Types].xml", Buffer.from("<Types/>")],
+      ["word/document.xml", Buffer.from("<w:document/>")],
+    ]),
+    "deck.pptx": zip([["ppt/presentation.xml", Buffer.from("<p:presentation/>")]]),
+    "bundle.zip": zip([["readme.txt", Buffer.from("hello")]]),
+    "photo.jpg": Buffer.concat([jpegHeader, Buffer.alloc(2_048, 7)]),
+    "large-photo.jpg": Buffer.concat([jpegHeader, Buffer.alloc(100_000, 7)]),
+    "ledger.csv": Buffer.from("a,b\n1,2\n"),
+    "large-ledger.csv": Buffer.from(`a,b\n${"1,2\n".repeat(30_000)}`),
+    "legacy.xls": Buffer.concat([oleHeader, Buffer.alloc(512, 0)]),
+    "locked.xlsx": Buffer.concat([oleHeader, Buffer.alloc(512, 0)]),
+    "blank.pdf": Buffer.alloc(0),
+  };
+  for (const [name, bytes] of Object.entries(written)) {
+    await writeFile(join(root, name), bytes, { mode: 0o600 });
+  }
+  const localConfig = config(root, journal);
+  const observations = await discoverSourceObservations(
+    localConfig,
+    await canonicalRoots(localConfig),
+  );
+  const outcome = Object.fromEntries(
+    observations.map((observation) =>
+      observation.kind === "gap"
+        ? [observation.gap.relativePath, `gap:${observation.gap.code}`]
+        : [
+            observation.file.relativePath,
+            observation.kind === "pdf"
+              ? `binary:${observation.file.mediaType}`
+              : "utf8",
+          ],
+    ),
+  );
+  assert.deepEqual(outcome, {
+    // Handled, not skipped: the spreadsheet lane takes real workbooks.
+    "workbook.xlsx": "binary:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    // A csv small enough to hold is ordinary retained text.
+    "ledger.csv": "utf8",
+    // ZIP containers the workbook reader refuses, and bytes that are not text.
+    "letter.docx": "gap:unsupported",
+    "deck.pptx": "gap:unsupported",
+    "bundle.zip": "gap:unsupported",
+    "photo.jpg": "gap:unsupported",
+    "legacy.xls": "gap:unsupported",
+    // Past `maxFileBytes`, refused before the bytes are read.
+    "large-photo.jpg": "gap:oversized",
+    "large-ledger.csv": "gap:oversized",
+    // An OLE container named .xlsx is a password-protected workbook.
+    "locked.xlsx": "gap:encrypted",
+    "blank.pdf": "gap:empty",
+  });
+  assert.deepEqual(
+    [
+      ...new Set(
+        observations
+          .filter((observation) => observation.kind === "gap")
+          .map((observation) => observation.gap.code),
+      ),
+    ].sort(),
+    ["empty", "encrypted", "oversized", "unsupported"],
+    "and every reason is one of the four the scan entry schema allows",
+  );
+});

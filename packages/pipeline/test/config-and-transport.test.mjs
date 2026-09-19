@@ -14,6 +14,7 @@ import {
   PDF_DOCQA_LEGACY_CHUNKING_FINGERPRINT,
 } from "../dist/parsedBundleMapping.js";
 import { HttpWorkerTransport, parseWorkerResponse } from "../dist/transport.js";
+import { MAX_WORKER_SCAN_ENTRIES } from "@repo/worker-protocol/request";
 
 test("config accepts only bounded absolute worker config", () => {
   const config = parseConfig({
@@ -338,7 +339,18 @@ test("PDF document-Q&A config is closed, bound, and keeps legacy bindings stable
     registryDirectory: "/private/provider-registry",
   };
   const parsedProvider = parseConfig({ ...base, pdfDocQa: providerPdf });
-  assert.equal(parsedProvider.pdfDocQa.providerOriginal.rootAlias, "notes");
+  // ADM-4c: the pre-ADM-4c single-root shape is accepted verbatim and becomes
+  // a one-element `roots`, so the owner's config file needs no edit.
+  assert.deepEqual(parsedProvider.pdfDocQa.providerOriginal.roots, [
+    {
+      rootAlias: "notes",
+      providerRootDirectoryId: providerRootId,
+      providerRootDirectoryIdHash: createHash("sha256")
+        .update(providerRootId)
+        .digest("hex"),
+    },
+  ]);
+  assert.equal(parsedProvider.pdfDocQa.providerOriginal.rootAlias, undefined);
   assert.notEqual(
     journalBindingForConfig(parsedProvider).configFingerprint,
     journalBindingForConfig(parsedRemote).configFingerprint,
@@ -1389,4 +1401,108 @@ test("the request deadline aborts an unresolved fetch", async () => {
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+// ADM-4c. More than one watched root, and more than one provider folder.
+
+function multiRootBase() {
+  return {
+    protocolVersion: 1,
+    endpoint: "http://127.0.0.1:3100/api/worker",
+    spaceId: "space_1",
+    sourceAccountId: "source_1",
+    credentialEnv: "PIPELINE_TOKEN",
+    roots: [
+      { alias: "notes", path: "/tmp/root" },
+      { alias: "investing", path: "/tmp/investing" },
+      { alias: "medical", path: "/tmp/medical" },
+    ],
+    journalDir: "/tmp/journal",
+  };
+}
+
+function providerRootEntry(id) {
+  return {
+    providerRootDirectoryId: id,
+    providerRootDirectoryIdHash: createHash("sha256").update(id).digest("hex"),
+  };
+}
+
+test("provider originals are per root, and a root without one is not an error", () => {
+  const base = multiRootBase();
+  const pdf = pdfDocQaConfig();
+  delete pdf.archive.independentBackup.repositoryPath;
+  pdf.archive.independentBackup.repository = {
+    kind: "rclone_dropbox_v1",
+    remoteName: "kithmind_dropbox",
+    rootPath: "Kith Mind Backups/Processing",
+    rcloneBinary: "/tools/rclone",
+    configPath: "/credentials/kithmind-rclone.conf",
+    configIdentityFingerprint: "c".repeat(64),
+    expectedRootDirectoryIdHash: "d".repeat(64),
+  };
+  pdf.providerOriginal = {
+    providerAccountIdHash: "e".repeat(64),
+    refreshPath: "Kith Mind/Inbox",
+    registryDirectory: "/private/provider-registry",
+    roots: [
+      { rootAlias: "notes", ...providerRootEntry("id:notes_root") },
+      { rootAlias: "investing", ...providerRootEntry("id:investing_root") },
+    ],
+  };
+  const parsed = parseConfig({ ...base, pdfDocQa: pdf });
+  assert.deepEqual(
+    parsed.pdfDocQa.providerOriginal.roots.map((root) => root.rootAlias),
+    ["notes", "investing"],
+  );
+  assert.equal(
+    parsed.pdfDocQa.providerOriginal.roots.some(
+      (root) => root.rootAlias === "medical",
+    ),
+    false,
+    "a watched root may have no provider folder at all",
+  );
+
+  const unknownAlias = structuredClone(pdf);
+  unknownAlias.providerOriginal.roots[1].rootAlias = "not-a-watched-root";
+  assert.throws(() => parseConfig({ ...base, pdfDocQa: unknownAlias }));
+
+  const duplicateAlias = structuredClone(pdf);
+  duplicateAlias.providerOriginal.roots[1].rootAlias = "notes";
+  assert.throws(() => parseConfig({ ...base, pdfDocQa: duplicateAlias }));
+
+  const duplicateFolder = structuredClone(pdf);
+  duplicateFolder.providerOriginal.roots[1] = {
+    rootAlias: "investing",
+    ...providerRootEntry("id:notes_root"),
+  };
+  assert.throws(() => parseConfig({ ...base, pdfDocQa: duplicateFolder }));
+
+  const mismatchedHash = structuredClone(pdf);
+  mismatchedHash.providerOriginal.roots[0].providerRootDirectoryIdHash =
+    "f".repeat(64);
+  assert.throws(() => parseConfig({ ...base, pdfDocQa: mismatchedHash }));
+
+  const emptyList = structuredClone(pdf);
+  emptyList.providerOriginal.roots = [];
+  assert.throws(() => parseConfig({ ...base, pdfDocQa: emptyList }));
+
+  const mixedShape = structuredClone(pdf);
+  mixedShape.providerOriginal.rootAlias = "notes";
+  assert.throws(
+    () => parseConfig({ ...base, pdfDocQa: mixedShape }),
+    "the two shapes are alternatives, never a merge",
+  );
+
+  const extraField = structuredClone(pdf);
+  extraField.providerOriginal.roots[0].refreshPath = "Kith Mind/Inbox";
+  assert.throws(() => parseConfig({ ...base, pdfDocQa: extraField }));
+});
+
+test("the maxFiles ceiling is the scan manifest's, and the default is unchanged", () => {
+  const base = multiRootBase();
+  assert.equal(parseConfig(base).maxFiles, 256, "the default did not move");
+  assert.equal(parseConfig({ ...base, maxFiles: 1024 }).maxFiles, 1024);
+  assert.throws(() => parseConfig({ ...base, maxFiles: 1025 }));
+  assert.equal(MAX_WORKER_SCAN_ENTRIES, 1024);
 });

@@ -34,6 +34,35 @@ export type PdfDocQaArchiveIdentity = {
   storageFailureDomainFingerprint: string;
 };
 
+/**
+ * ADM-4c. One watched root bound to one provider folder. The account-level
+ * fields live on `PdfDocQaProviderOriginal` because one Dropbox account, one
+ * refresh credential and one binding registry serve every root.
+ */
+export type PdfDocQaProviderRoot = {
+  rootAlias: string;
+  providerRootDirectoryId: string;
+  providerRootDirectoryIdHash: string;
+};
+
+/**
+ * ADM-4c. A watched root with no entry here is archived exactly as it would be
+ * with `providerOriginal` absent: both archive copies are the pipeline's own,
+ * and no provider binding is created. That is not an error, so nothing may
+ * throw `provider_original_root_mismatch` for it.
+ *
+ * `parseConfig` also accepts the pre-ADM-4c shape, which carried `rootAlias`,
+ * `providerRootDirectoryId` and `providerRootDirectoryIdHash` beside the
+ * account fields, and normalizes it to a one-element `roots`. The owner's
+ * existing config file therefore needs no edit.
+ */
+export type PdfDocQaProviderOriginal = {
+  providerAccountIdHash: string;
+  refreshPath: string;
+  registryDirectory: string;
+  roots: PdfDocQaProviderRoot[];
+};
+
 export type PdfDocQaConfig = {
   captureDirectory: string;
   parserOutputRoot: string;
@@ -51,14 +80,7 @@ export type PdfDocQaConfig = {
     tableStructureBypass?: Record<string, number[]>;
   };
   profile: PdfDocQaProfile;
-  providerOriginal?: {
-    rootAlias: string;
-    providerRootDirectoryId: string;
-    providerAccountIdHash: string;
-    providerRootDirectoryIdHash: string;
-    refreshPath: string;
-    registryDirectory: string;
-  };
+  providerOriginal?: PdfDocQaProviderOriginal;
   archive: {
     ageBinary: string;
     primary: PdfDocQaArchiveIdentity & { directory: string; recipient: string };

@@ -82,7 +82,16 @@ export class WorkerProtocolParseError extends Error {
 }
 
 export const MAX_WORKER_PAGE_ITEMS = 4;
-export const MAX_WORKER_SCAN_PAGES = 64;
+/**
+ * ADM-4c: raised from 64 so a scan can carry 1024 entries. The page size is
+ * deliberately unchanged: a journal that crashed mid-append resumes by page
+ * ordinal, and `ordinal * MAX_WORKER_PAGE_ITEMS` must name the same slice of
+ * the plan after an upgrade as it did before.
+ */
+export const MAX_WORKER_SCAN_PAGES = 256;
+/** The most entries one sealed scan can describe. */
+export const MAX_WORKER_SCAN_ENTRIES =
+  MAX_WORKER_PAGE_ITEMS * MAX_WORKER_SCAN_PAGES;
 export const MAX_WORKER_INVENTORY_PAGE_ITEMS = 50;
 export const MAX_WORKER_RECONCILE_ITEMS = 50;
 export const MAX_WORKER_RESERVATION_ITEMS = 4;

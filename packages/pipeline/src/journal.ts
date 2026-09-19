@@ -40,10 +40,18 @@ const FILE_MODE = 0o600;
 const DIRECTORY_MODE = 0o700;
 const MAX_REQUEST_BODY_BYTES = 512 * 1024;
 const MAX_RESULT_BYTES = 512 * 1024;
-const MAX_CHECKPOINT_BYTES = 768 * 1024;
-const MAX_STATE_BYTES = 2 * 1024 * 1024;
+/**
+ * ADM-4c. Sized for the largest checkpoint the runner can now hold: 1024
+ * binary plans, each carrying seven 64-hex fingerprints, beside up to 4096
+ * identity bindings. `journal.test.mjs` measures both. The three bounds below
+ * were 768 KiB, 2 MiB and 20,000, which fit 256 plans and nothing more. They
+ * are structural guards on a local file, not a protocol contract, so raising
+ * them costs a larger atomic write and nothing else.
+ */
+const MAX_CHECKPOINT_BYTES = 3 * 1024 * 1024;
+const MAX_STATE_BYTES = 6 * 1024 * 1024;
 const MAX_JSON_DEPTH = 32;
-const MAX_JSON_NODES = 20_000;
+const MAX_JSON_NODES = 60_000;
 const LOCK_PORT_BASE = 16_384;
 const LOCK_PORT_COUNT = 16_384;
 const HEX_64 = /^[a-f0-9]{64}$/;
