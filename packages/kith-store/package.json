@@ -71,6 +71,7 @@
   "bin": {
     "kith-deferred-work": "./dist/deferred/cli.js",
     "kith-discovery-reset": "./dist/workers/cli.js",
+    "kith-extraction-backfill": "./dist/extraction/cli.js",
     "kith-reembed": "./dist/embeddings/cli.js"
   },
   "scripts": {

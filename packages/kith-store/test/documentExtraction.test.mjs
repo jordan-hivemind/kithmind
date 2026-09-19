@@ -25,6 +25,7 @@ import {
   applyCorrection,
   runDocumentExtractionJob,
   scheduleDocumentExtraction,
+  scheduleExtractionBackfill,
   scheduleReextraction,
   seedDocumentTypes,
 } from "../dist/extraction/index.js";
@@ -669,6 +670,56 @@ test("the daemon drains the queued job through the registry", { skip }, async (t
       scheduleReextraction(ctx, { spaceId: f.spaceId, kind: "invoice" }),
     ),
     [],
+  );
+});
+
+test("backfill schedules the unextracted document and does not double-enqueue", { skip }, async (t) => {
+  const f = await fixture(t);
+  await f.seed();
+  const extracted = await f.ingest(RECEIPT, "synthetic-receipt-backfill-a");
+  const unextracted = await f.ingest(RECEIPT, "synthetic-receipt-backfill-b");
+
+  // Simulate documents that activated before the typed extraction backend
+  // landed: no queued job survives activation for either one.
+  await f.client.query(
+    "DELETE FROM kith.deferred_work WHERE kind = 'document_extraction'",
+  );
+
+  await f.extract(
+    stubModel(goodReading()),
+    extracted.sourceItemId,
+    extracted.generationId,
+  );
+
+  const first = await f.run(NOW + 6_000, (ctx) =>
+    scheduleExtractionBackfill(ctx, { spaceId: f.spaceId }),
+  );
+  assert.deepEqual(first, [unextracted.sourceItemId]);
+
+  const queued = await f.rows(
+    "SELECT dedupe_key, payload FROM kith.deferred_work WHERE kind = 'document_extraction'",
+  );
+  assert.equal(queued.length, 1);
+  assert.equal(
+    queued[0].dedupe_key,
+    `document_extraction:${unextracted.sourceItemId}`,
+  );
+  assert.equal(queued[0].payload.sourceItemId, unextracted.sourceItemId);
+
+  // Running it again finds the same candidate (still unextracted). The
+  // dedupe key collapses the second call onto the same queued row instead of
+  // inserting a second one.
+  const second = await f.run(NOW + 7_000, (ctx) =>
+    scheduleExtractionBackfill(ctx, { spaceId: f.spaceId }),
+  );
+  assert.deepEqual(second, [unextracted.sourceItemId]);
+  assert.equal(
+    (
+      await f.rows(
+        "SELECT id FROM kith.deferred_work WHERE kind = 'document_extraction'",
+      )
+    ).length,
+    1,
   );
 });
 
