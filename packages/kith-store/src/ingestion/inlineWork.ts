@@ -40,6 +40,7 @@
 //    `recoverInlineIngestion` in `../deferred/sweeps.ts` already writes, so the
 //    fallback and the recovery sweep converge on one queued job rather than two.
 
+import { scheduleDocumentExtraction } from "../extraction/model.js";
 import type { Pool } from "pg";
 
 import {
@@ -1495,6 +1496,12 @@ async function activateInlineGeneration(
     sourceAccountId: chain.job.sourceAccountId,
     processingGenerationId: generation.id,
     ...(previousGenerationId ? { previousGenerationId } : {}),
+  });
+  // ADM-5a: see the note at the same point in `../workers/parsedJobs.ts`.
+  await scheduleDocumentExtraction(ctx, {
+    spaceId,
+    sourceItemId: item.id,
+    processingGenerationId: generation.id,
   });
 }
 

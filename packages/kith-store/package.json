@@ -57,6 +57,11 @@
       "node": "./dist/admin/index.js",
       "default": "./src/admin/index.ts"
     },
+    "./extraction": {
+      "types": "./src/extraction/index.ts",
+      "node": "./dist/extraction/index.js",
+      "default": "./src/extraction/index.ts"
+    },
     "./deferred": {
       "types": "./src/deferred/index.ts",
       "node": "./dist/deferred/index.js",

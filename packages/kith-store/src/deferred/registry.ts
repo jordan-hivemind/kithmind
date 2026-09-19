@@ -32,6 +32,11 @@ import {
   type EmbeddingEnvironment,
   type EmbeddingFetch,
 } from "../embeddings/provider.js";
+import { runDocumentExtractionJob } from "../extraction/model.js";
+import {
+  providerExtractionModel,
+  type ExtractionModel,
+} from "../extraction/provider.js";
 import { inlineIngestionHandler } from "../ingestion/inlineWork.js";
 import type { DeferredCtx, DeferredWorkKind, DeferredWorkRow } from "./core.js";
 
@@ -91,6 +96,12 @@ export type DefaultRegistryOptions = {
   /** The default embedder's `fetch`, for a test that wants to prove what the
    * daemon does with a provider failure without making one. */
   fetchImpl?: EmbeddingFetch;
+  /**
+   * The model `document_extraction` reads documents with. Injected the same
+   * way and for the same reason as `embedder`: no test in this package makes a
+   * real completion. Omitted, the provider-backed one is built from `env`.
+   */
+  extractionModel?: ExtractionModel;
 };
 
 /**
@@ -129,6 +140,21 @@ export function defaultRegistry(
   registry.set("embedding_fill", {
     scope: "pool",
     run: (pool, payload, job) => runEmbeddingFillJob(pool, payload, job, embed),
+  });
+  // `document_extraction` is registered by ADM-5a. Its scheduler is the three
+  // activation points (`scheduleDocumentExtraction`, called beside
+  // `scheduleEmbeddingFill` in the publication's own transaction) and its
+  // payload is `{ spaceId, sourceItemId, processingGenerationId }`, keyed per
+  // source item. Pooled for the same reason `embedding_fill` is: one model
+  // call sits between its two transactions and no `pg` connection may be held
+  // across it.
+  const extract =
+    options.extractionModel ??
+    providerExtractionModel(options.env ?? {}, options.fetchImpl);
+  registry.set("document_extraction", {
+    scope: "pool",
+    run: (pool, payload, job) =>
+      runDocumentExtractionJob(pool, payload, job, extract).then(() => undefined),
   });
   // `card_queue_tick` waits on a PostgreSQL port of `cardQueue.ts`: the
   // extraction queue state, cursor and budget tables of `cardQueueTables.ts`,

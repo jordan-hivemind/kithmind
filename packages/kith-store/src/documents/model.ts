@@ -35,6 +35,10 @@
 import type { ClientBase, QueryResultRow } from "pg";
 
 import {
+  readDocumentExtraction,
+  type DocumentExtraction,
+} from "../extraction/read.js";
+import {
   parseSourceRevisionRepresentation,
   parseSourceTextRepresentation,
 } from "../provenance/representations.js";
@@ -761,6 +765,16 @@ export type GetDocumentResult = {
   evidenceSpanIds: string[];
   partial: boolean;
   vectorStatus: "unavailable";
+  /**
+   * ADM-5a. The typed reading of this document: its kind, its one-line summary
+   * and its statements, each citing the page and quote it came from. Absent
+   * when the document has not been extracted (extraction is queued at
+   * activation, so a document read seconds after ingestion has none yet).
+   * `partial` is true when the document was longer than the extraction bound,
+   * and `openCorrections` lists readings that failed their gate. A value a
+   * human corrected reads corrected, with the model's original beside it.
+   */
+  extraction?: DocumentExtraction;
 };
 
 export async function getDocument(
@@ -834,6 +848,11 @@ export async function getDocument(
   const partial =
     pages.length !== pageRows.length || validatedEvidenceSpanIds.length !== allowedEvidence.size || citationBudgetTruncated;
   const recovery = await originalRecoveryStatus(client, chain.generation);
+  const extraction = await readDocumentExtraction(
+    client,
+    document.spaceId,
+    chain.item.id,
+  );
   return {
     spaceId: document.spaceId,
     sourceAccountId: chain.account.id,
@@ -861,6 +880,10 @@ export async function getDocument(
     evidenceSpanIds: validatedEvidenceSpanIds,
     partial,
     vectorStatus: "unavailable",
+    // Read under the space this document was already authorized in, never
+    // under the caller's wider `spaceIds`: a source item in another space
+    // returns nothing rather than that space's reading.
+    ...(extraction ? { extraction } : {}),
   };
 }
 

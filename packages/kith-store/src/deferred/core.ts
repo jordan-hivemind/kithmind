@@ -57,6 +57,7 @@ export const DEFERRED_WORK_KINDS = [
   "inline_ingestion",
   "embedding_fill",
   "card_queue_tick",
+  "document_extraction",
 ] as const;
 
 export type DeferredWorkKind = (typeof DEFERRED_WORK_KINDS)[number];

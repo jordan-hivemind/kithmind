@@ -1,3 +1,4 @@
+import { scheduleDocumentExtraction } from "../extraction/model.js";
 import type {
   WorkerParsedActivateResult,
   WorkerParsedFailResult,
@@ -1680,6 +1681,14 @@ export async function activateParsedJob(
     sourceAccountId: source.account.id,
     processingGenerationId: loaded.generation.id,
     ...(previousGenerationId ? { previousGenerationId } : {}),
+  });
+  // ADM-5a: the sealed text that just became active is what typed extraction
+  // reads. Queued in this transaction, beside the embedding fill, for the same
+  // reason: the job commits with the activation or not at all.
+  await scheduleDocumentExtraction(ctx, {
+    spaceId: source.spaceId,
+    sourceItemId: loaded.current.item.id,
+    processingGenerationId: loaded.generation.id,
   });
   await exec(
     ctx,
