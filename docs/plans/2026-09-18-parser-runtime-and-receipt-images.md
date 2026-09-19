@@ -175,13 +175,34 @@ KITH_REHEARSAL=1 KITH_STORE_DATABASE_URL=postgres://... \
   node --test packages/kith-store/test/archivedRehearsal.test.mjs
 ```
 
+### P2-104e: provider originals, and a lease that is still held
+
+The first live pass after P2-104d failed with `lease_conflict`. The owner's
+source keeps originals in Dropbox, and the rehearsal had no provider original.
+A re-queued provider document reached `admit`, the P2-31b guard sent it back to
+`lookup_original` and dropped its live lease, and the second `reserve` was
+refused by that lease. One attempt was spent and the pass failed.
+
+| Change                                                                        | Where            |
+| ----------------------------------------------------------------------------- | ---------------- |
+| `discovery.admitArchived` takes `existingProviderOriginal`                    | protocol, server |
+| The worker selects the bound reference the `original` lookup reports          | runner           |
+| A journaled lease that is still valid is reused, never re-reserved            | runner           |
+| Preflight answers `lease_conflict`, not `stale_observation`, for a live lease | server           |
+| `lease_conflict` at preflight or reserve defers that document only            | runner           |
+
+A deferred document leaves the pass `incomplete` with
+`processing_incomplete` and logs `archived_lease_held`. It spends no attempt.
+The lease is five minutes, so the next pass takes it. Deploy the web server
+before running the new worker: an older server refuses the new admit field.
+
 ### Operator steps after this lands
 
-| Pass | Command                      | Expected                                                                                                                                  |
-| ---- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| 0    | `pnpm brain:worker -- doctor --config <path>`           | `config_rebind_pending` or nothing pending. Not `config_rebind_blocked`.                                                                  |
-| 1    | `pnpm brain:worker -- run --config <path>`              | `state: "complete"`, `published` equal to the number of re-queued documents. Each one re-parses, reuses its artifact, and activates.       |
-| 2    | `pnpm brain:worker -- run --config <path>`              | `state: "complete"`, `published: 0`. Nothing left to do.                                                                                   |
+| Pass | Command                                       | Expected                                                                                                                             |
+| ---- | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| 0    | `pnpm brain:worker -- doctor --config <path>` | `config_rebind_pending` or nothing pending. Not `config_rebind_blocked`.                                                             |
+| 1    | `pnpm brain:worker -- run --config <path>`    | `state: "complete"`, `published` equal to the number of re-queued documents. Each one re-parses, reuses its artifact, and activates. |
+| 2    | `pnpm brain:worker -- run --config <path>`    | `state: "complete"`, `published: 0`. Nothing left to do.                                                                             |
 
 Run the watcher again only after pass 2 reads `published: 0`.
 
@@ -201,11 +222,11 @@ deleted, and no work row left `queued` or `leased`.
 If a document parks, the pass says so: `parked`, `parkedCodes` and
 `parkedOldestAgeMs` are on the result. Read the code before acting.
 
-| Code                                        | What it means                                                  | What to do                                                                             |
-| ------------------------------------------- | ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| `original_receipt_revision_conflict`        | Two admissions name different revisions for one file.          | A person decides which bytes are the document. Do not clear it automatically.          |
-| `original_receipt_unknown_to_server`        | The receipt names a deployment that no longer serves this.     | `pnpm brain:worker -- run --retry-parked --operator-clear --max-clears 1` once, then a normal pass.                              |
-| `provider_original_reference_already_bound` | The provider reference is already recorded server side.        | Nothing; the next pass walks past it. Escalate only if it repeats past its retry budget. |
+| Code                                        | What it means                                              | What to do                                                                                          |
+| ------------------------------------------- | ---------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `original_receipt_revision_conflict`        | Two admissions name different revisions for one file.      | A person decides which bytes are the document. Do not clear it automatically.                       |
+| `original_receipt_unknown_to_server`        | The receipt names a deployment that no longer serves this. | `pnpm brain:worker -- run --retry-parked --operator-clear --max-clears 1` once, then a normal pass. |
+| `provider_original_reference_already_bound` | The provider reference is already recorded server side.    | Nothing; the next pass walks past it. Escalate only if it repeats past its retry budget.            |
 
 `pnpm brain:worker -- run --retry-parked` drops every marker and tries all of them once
 more. Reach for it only after the underlying cause is understood: the marker

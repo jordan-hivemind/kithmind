@@ -682,6 +682,16 @@ export async function preflightArchivedDiscovery(
     source,
     request.identity,
   );
+  // P2-104e. A live lease is not a stale observation: the identity is current
+  // and the row will be claimable when the lease runs out. Saying so lets the
+  // client leave this one document for a later pass instead of failing every
+  // other document with it. It is the answer `reserve` already gives.
+  if (
+    current.work.state === "leased" &&
+    current.work.leaseExpiresAt !== null &&
+    current.work.leaseExpiresAt.getTime() > ctx.now
+  )
+    workerProtocolError("lease_conflict");
   if (
     !claimableArchivedWork(current.work, ctx.now) ||
     !Number.isSafeInteger(current.work.attempts) ||
@@ -1717,7 +1727,7 @@ export async function admitArchivedDiscovery(
         request.providerOriginal.sourceByteLength !== revision.byteLength)
     )
       workerProtocolError("stale_observation");
-    const providerOriginal = request.providerOriginal
+    const declaredProvider = request.providerOriginal
       ? await createAndBindProviderOriginal(ctx.client, {
           spaceId: source.spaceId,
           sourceAccountId: source.account.id,
@@ -1730,6 +1740,27 @@ export async function admitArchivedDiscovery(
           now: at(ctx.now)!,
         })
       : null;
+    // P2-104e. A later processing generation over bytes whose provider
+    // reference is already bound selects that binding. It is loaded from the
+    // revision this lease's own work row resolved to, never from the request,
+    // and the ids the client names must be the ones currently bound: a
+    // selection can only confirm what the server already holds for this item.
+    const boundProvider = request.existingProviderOriginal
+      ? await loadProviderOriginalBinding(ctx.client, revision.id)
+      : null;
+    if (
+      request.existingProviderOriginal &&
+      (!boundProvider ||
+        boundProvider.binding.spaceId !== source.spaceId ||
+        boundProvider.binding.sourceAccountId !== source.account.id ||
+        boundProvider.binding.sourceItemId !== current.item.id ||
+        boundProvider.reference.id !==
+          request.existingProviderOriginal.referenceId ||
+        boundProvider.binding.bindingEpoch !==
+          request.existingProviderOriginal.bindingEpoch)
+    )
+      workerProtocolError("stale_observation");
+    const providerOriginal = declaredProvider ?? boundProvider;
     if (
       (!originalBackup && !providerOriginal) ||
       (originalBackup && providerOriginal)

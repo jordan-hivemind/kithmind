@@ -44,6 +44,52 @@ import {
 } from "../../../pipeline/test/syntheticDoclingOutput.mjs";
 import { archiveConfig, archiveTools } from "./archiveTools.mjs";
 
+// P2-104e. The owner's source keeps its originals in Dropbox: a
+// `provider_original_v1` reference stands where the original's independent
+// backup receipt would. Synthetic ids; the API is a stub on `fetch`.
+const PROVIDER_ACCOUNT_ID = "dbid:synthetic_rehearsal_account";
+const PROVIDER_ROOT_ID = "id:synthetic_rehearsal_root";
+const PROVIDER_ROOT_PATH = "/rehearsal root";
+const sha256Hex = (value) => createHash("sha256").update(value).digest("hex");
+
+/**
+ * Stands in for the two Dropbox API routes `verifyDropboxOriginal` reads, and
+ * nothing else: the worker transport here is in process and never fetches.
+ * Every rehearsal file is far below one 4 MiB block, so the Dropbox content
+ * hash is the hash of the one block hash.
+ */
+export function installFakeDropbox(t, workspace) {
+  const files = workspace.files.map((file, index) => ({
+    ".tag": "file",
+    id: `id:synthetic_rehearsal_file_${index}`,
+    rev: `rev${index}`,
+    size: file.byteLength,
+    content_hash: sha256Hex(Buffer.from(file.sha256, "hex")),
+    path_lower: `${PROVIDER_ROOT_PATH}/${file.relativePath}`,
+  }));
+  const root = {
+    ".tag": "folder",
+    id: PROVIDER_ROOT_ID,
+    path_lower: PROVIDER_ROOT_PATH,
+  };
+  const real = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = real;
+  });
+  globalThis.fetch = async (url, options) => {
+    const body = JSON.parse(options.body ?? "null");
+    const found = `${url}`.endsWith("/users/get_current_account")
+      ? { account_id: PROVIDER_ACCOUNT_ID, disabled: false }
+      : [root, ...files].find(
+          (row) => row.id === body.path || row.path_lower === body.path,
+        );
+    return new Response(JSON.stringify(found ?? { error: "not_found" }), {
+      status: found ? 200 : 409,
+      headers: { "content-type": "application/json" },
+    });
+  };
+}
+
 /** The synthetic PDF every rehearsal document is a copy of, bar its text. */
 function pdfBytes(index) {
   return Buffer.from(`%PDF-1.7\nsynthetic document ${index}\n%%EOF\n`);
@@ -101,6 +147,7 @@ export async function rehearsalWorkspace(t, { documents = 3 } = {}) {
     captureDirectory: join(base, "captures"),
     parserOutputRoot: join(base, "outputs"),
     spoolDirectory: join(base, "spool"),
+    registryDirectory: join(base, "registry"),
   };
   for (const path of Object.values(paths)) {
     if (path === base) continue;
@@ -113,6 +160,7 @@ export async function rehearsalWorkspace(t, { documents = 3 } = {}) {
     await writeFile(join(paths.root, relativePath), bytes, { mode: 0o600 });
     files.push({
       relativePath,
+      byteLength: bytes.byteLength,
       sha256: createHash("sha256").update(bytes).digest("hex"),
     });
   }
@@ -127,6 +175,7 @@ export function rehearsalConfig({
   sourceAccountId,
   workspace,
   runtime,
+  provider = false,
 }) {
   return {
     protocolVersion: 1,
@@ -156,6 +205,18 @@ export function rehearsalConfig({
       },
       profile: runtime.profile,
       archive: archiveConfig(workspace.tools),
+      ...(provider
+        ? {
+            providerOriginal: {
+              rootAlias: "fixture",
+              providerRootDirectoryId: PROVIDER_ROOT_ID,
+              providerAccountIdHash: sha256Hex(PROVIDER_ACCOUNT_ID),
+              providerRootDirectoryIdHash: sha256Hex(PROVIDER_ROOT_ID),
+              refreshPath: "Processing",
+              registryDirectory: workspace.registryDirectory,
+            },
+          }
+        : {}),
     },
   };
 }
