@@ -248,3 +248,253 @@ test("thoughts with identical createdAt are ordered by id ascending", { skip }, 
     assert.deepEqual(sortedIds, expectedIds, "Thoughts with same createdAt must be ordered by id ascending");
   });
 });
+
+test("updateThought edits through supersession and deleteThought retracts without a replacement", { skip }, async (t) => {
+  const db = await identityDatabase(t);
+  await db.tx(async (ctx) => {
+    const userId = await makeUser(ctx);
+    const spaceId = await makeSpace(ctx, { createdBy: userId, role: "owner" });
+    const otherSpaceId = await makeSpace(ctx, { createdBy: userId, role: "owner" });
+
+    const original = await memory.captureThought(ctx, userId, spaceId, {
+      content: "The archive lives on the old drive.",
+      metadata: metadata("archive location", "reference"),
+      isCore: true,
+      sourceType: "user_confirmed",
+      sourceRef: "chat:2026-09-01",
+      observedAt: 1_700_000_000_000,
+      batchId: "batch-42",
+      confidence: 0.75,
+      validFrom: 1_700_000_000_000,
+      validTo: 1_800_000_000_000,
+    });
+
+    const edited = await memory.updateThought(ctx, userId, spaceId, original, {
+      content: "The archive lives on the new drive.",
+      type: "reference",
+      topics: ["archive", "storage"],
+      people: [],
+    });
+    assert.notEqual(edited, original);
+
+    // The edit is a supersession: the old content survives as history and a
+    // current read returns only the new content.
+    const current = await memory.listBySpaces(ctx, [spaceId], 10);
+    assert.deepEqual(current.map((thought) => thought.id), [edited]);
+    assert.equal(current[0].content, "The archive lives on the new drive.");
+    assert.equal(current[0].isCore, true, "isCore carries over from the edited thought");
+    // The edit form never asks about provenance or validity, so the new
+    // version carries every one of them over from the thought it replaces
+    // rather than silently resetting them to a fresh capture's defaults.
+    assert.equal(current[0].sourceType, "user_confirmed");
+    assert.equal(current[0].sourceRef, "chat:2026-09-01");
+    assert.equal(current[0].observedAt, 1_700_000_000_000);
+    assert.equal(current[0].batchId, "batch-42");
+    assert.equal(current[0].confidence, 0.75);
+    assert.equal(current[0].validFrom, 1_700_000_000_000);
+    assert.equal(current[0].validTo, 1_800_000_000_000);
+
+    const historical = await memory.listBySpaces(ctx, [spaceId], 10, true);
+    assert.deepEqual(historical.map((thought) => thought.id).sort(), [edited, original].sort());
+    const previous = await memory.getThoughtById(ctx, original);
+    assert.equal(previous.memoryStatus, "superseded");
+    assert.equal(previous.content, "The archive lives on the old drive.");
+
+    // Editing a thought that is no longer current, or not in this space, is
+    // refused.
+    await assert.rejects(
+      memory.updateThought(ctx, userId, spaceId, original, {
+        content: "second edit",
+        type: "reference",
+        topics: [],
+        people: [],
+      }),
+      /Current thought not found/,
+    );
+    const foreign = await memory.captureThought(ctx, userId, otherSpaceId, {
+      content: "Not this space's thought.",
+      metadata: metadata("foreign"),
+    });
+    await assert.rejects(
+      memory.updateThought(ctx, userId, spaceId, foreign, {
+        content: "stolen edit",
+        type: "reference",
+        topics: [],
+        people: [],
+      }),
+      /Current thought not found/,
+    );
+
+    // Delete retracts without a replacement: the row survives, a current read
+    // withholds it, and its content is preserved rather than erased. It is
+    // withheld from history too, unlike `original`, which is superseded (was
+    // true once) rather than retracted (never was) and so still appears.
+    await memory.deleteThought(ctx, spaceId, edited);
+    assert.deepEqual(await memory.listBySpaces(ctx, [spaceId], 10), []);
+    assert.deepEqual(
+      (await memory.listBySpaces(ctx, [spaceId], 10, true)).map((thought) => thought.id),
+      [original],
+    );
+    const deleted = await memory.getThoughtById(ctx, edited);
+    assert.equal(deleted.memoryStatus, "retracted");
+    assert.equal(
+      deleted.content,
+      "The archive lives on the new drive.",
+      "content is preserved, not erased",
+    );
+
+    await assert.rejects(
+      memory.deleteThought(ctx, spaceId, edited),
+      /Current thought not found/,
+      "deleting an already-retracted thought is refused, not a silent no-op",
+    );
+  });
+});
+
+test("updateFact defaults to changeKind 'changed' (old value stays in history) and 'corrected' withholds it", { skip }, async (t) => {
+  const db = await identityDatabase(t);
+  await db.tx(async (ctx) => {
+    const userId = await makeUser(ctx);
+    const spaceId = await makeSpace(ctx, { createdBy: userId, role: "owner" });
+
+    const first = await memory.rememberFact(ctx, userId, spaceId, {
+      subject: { kind: "person", name: "Rowan" },
+      predicate: "home_city",
+      value: { type: "text", value: "Oakland" },
+      sourceType: "user_stated",
+      isCore: true,
+    });
+
+    // No changeKind given: defaults to "changed". The old value was true
+    // once and stays reachable -- `status: 'superseded'`, returned by an
+    // `includeHistorical: true` read.
+    const changed = await memory.updateFact(ctx, userId, spaceId, first.factId, {
+      value: { type: "text", value: "Berkeley" },
+      sourceType: "user_confirmed",
+    });
+    assert.equal(changed.operation, "superseded");
+    assert.notEqual(changed.factId, first.factId);
+
+    const currentAfterChange = await memory.listFacts(ctx, [spaceId], { includeHistorical: false });
+    assert.deepEqual(currentAfterChange.map((fact) => fact.id), [changed.factId]);
+    assert.equal(currentAfterChange[0].value.value, "Berkeley");
+    assert.equal(currentAfterChange[0].isCore, true, "isCore carries over from the new value");
+
+    const historicalAfterChange = await memory.listFacts(ctx, [spaceId], { includeHistorical: true });
+    assert.deepEqual(
+      historicalAfterChange.map((fact) => fact.id).sort(),
+      [first.factId, changed.factId].sort(),
+      "'changed' keeps the old value reachable as history",
+    );
+    const oldValue = historicalAfterChange.find((fact) => fact.id === first.factId);
+    assert.equal(oldValue.status, "superseded");
+    assert.equal(oldValue.value.value, "Oakland", "the old value is preserved, not erased");
+
+    // changeKind: "corrected" on the new current fact: the value it replaces
+    // was never true and is withheld even from history -- `status:
+    // 'retracted'`, which `listFacts({ includeHistorical: true })` refuses.
+    const corrected = await memory.updateFact(ctx, userId, spaceId, changed.factId, {
+      value: { type: "text", value: "Albany" },
+      sourceType: "user_confirmed",
+      changeKind: "corrected",
+    });
+    assert.equal(corrected.operation, "corrected");
+
+    const historicalAfterCorrection = await memory.listFacts(ctx, [spaceId], {
+      includeHistorical: true,
+    });
+    assert.deepEqual(
+      historicalAfterCorrection.map((fact) => fact.id).sort(),
+      [first.factId, corrected.factId].sort(),
+      "'corrected' withholds the value it replaces, even from history",
+    );
+    assert.equal(
+      historicalAfterCorrection.some((fact) => fact.id === changed.factId),
+      false,
+    );
+    const erased = await memory.getStoredFact(ctx, changed.factId);
+    assert.equal(erased.status, "retracted");
+    assert.equal(erased.value.value, "Berkeley", "the row survives, only withheld from reads");
+
+    // Editing a fact that is no longer current is refused.
+    await assert.rejects(
+      memory.updateFact(ctx, userId, spaceId, first.factId, {
+        value: { type: "text", value: "Oakland again" },
+      }),
+      /Current fact not found/,
+    );
+
+    // Two current values under the same predicate: editing either refuses
+    // rather than silently retracting the sibling.
+    const nicknameA = await memory.rememberFact(ctx, userId, spaceId, {
+      subject: { kind: "person", name: "Rowan" },
+      predicate: "nickname",
+      value: { type: "text", value: "Ro" },
+      sourceType: "user_stated",
+      cardinality: "multiple",
+    });
+    const nicknameB = await memory.rememberFact(ctx, userId, spaceId, {
+      subject: { kind: "person", name: "Rowan" },
+      predicate: "nickname",
+      value: { type: "text", value: "Rowie" },
+      sourceType: "user_stated",
+      cardinality: "multiple",
+    });
+    await assert.rejects(
+      memory.updateFact(ctx, userId, spaceId, nicknameA.factId, {
+        value: { type: "text", value: "Ro-Ro" },
+      }),
+      /more than one current value/,
+    );
+
+    // Retiring the sibling (still `status: 'current'`, but past its own
+    // `valid_to`) frees the predicate: the sibling count excludes it, so the
+    // remaining value is editable again rather than blocked forever.
+    await memory.retireFact(ctx, spaceId, nicknameB.factId);
+    const editedAfterRetire = await memory.updateFact(ctx, userId, spaceId, nicknameA.factId, {
+      value: { type: "text", value: "Ro-Ro" },
+    });
+    assert.equal(editedAfterRetire.operation, "superseded");
+  });
+});
+
+test("retireFact ends a fact's validity without erasing it", { skip }, async (t) => {
+  const db = await identityDatabase(t);
+  await db.tx(async (ctx) => {
+    const userId = await makeUser(ctx);
+    const spaceId = await makeSpace(ctx, { createdBy: userId, role: "owner" });
+    const otherSpaceId = await makeSpace(ctx, { createdBy: userId, role: "owner" });
+
+    const fact = await memory.rememberFact(ctx, userId, spaceId, {
+      subject: { kind: "person", name: "Rowan" },
+      predicate: "employer",
+      value: { type: "text", value: "Acme" },
+      sourceType: "user_stated",
+    });
+
+    await memory.retireFact(ctx, spaceId, fact.factId);
+
+    assert.deepEqual(await memory.listFacts(ctx, [spaceId], { includeHistorical: false }), []);
+    const historical = await memory.listFacts(ctx, [spaceId], { includeHistorical: true });
+    assert.equal(historical.length, 1);
+    assert.equal(historical[0].id, fact.factId);
+    assert.equal(historical[0].value.value, "Acme", "value is preserved, not erased");
+    assert.equal(historical[0].status, "current", "retirement ends validity, it does not retract");
+
+    // Retiring again is idempotent -- the same rule `archiveInvestment` uses:
+    // "when was this retired" should not move because someone clicked twice.
+    // `retireFact` never advances `validTo` past its first value.
+    await memory.retireFact(ctx, spaceId, fact.factId);
+    const retiredAgain = await memory.listFacts(ctx, [spaceId], { includeHistorical: true });
+    assert.equal(retiredAgain[0].validTo, historical[0].validTo);
+
+    // A fact in another space is refused rather than a cross-space write.
+    const foreign = await memory.rememberFact(ctx, userId, otherSpaceId, {
+      subject: { kind: "person", name: "Rowan" },
+      predicate: "employer",
+      value: { type: "text", value: "Acme" },
+      sourceType: "user_stated",
+    });
+    await assert.rejects(memory.retireFact(ctx, spaceId, foreign.factId), /Current fact not found/);
+  });
+});

@@ -32,12 +32,15 @@ export * from "./facts.js";
 export {
   boundedThoughtLimit,
   captureThought,
+  deleteThought,
+  getThoughtById,
   getThoughtsByAuthorizedIds,
   getThoughtsByIds,
   listBySpaces,
   listCoreBySpaces,
   setCoreStatus,
   transitionMemory,
+  updateThought,
 } from "./thoughts.js";
 export {
   CAPTURE_ANALYSIS_JSON_SCHEMA,

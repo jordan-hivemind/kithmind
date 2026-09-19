@@ -566,7 +566,13 @@ export async function hydrateFact(
   };
 }
 
-async function getStoredFact(ctx: IdentityCtx, id: string): Promise<StoredFact | null> {
+/**
+ * One fact row by id, unchecked against any space. Callers space-check --
+ * the same "unchecked, caller authorizes" seam `thoughts.ts`'s
+ * `getThoughtById` is, exported for `updateFact`/`retireFact`'s web-layer
+ * callers to resolve a fact's own space before authorizing a write against it.
+ */
+export async function getStoredFact(ctx: IdentityCtx, id: string): Promise<StoredFact | null> {
   const record = await row<FactRow>(ctx, `SELECT ${FACT_COLUMNS} FROM kith.facts WHERE id = $1`, [
     assertKithId(id, "invalid_fact_id"),
   ]);
@@ -703,4 +709,122 @@ export async function getFactsByIds(
   const hydrated = [];
   for (const fact of ordered) hydrated.push(await hydrateFact(ctx, fact, authorized));
   return hydrated.filter((fact): fact is HydratedFact => fact !== null);
+}
+
+export type UpdateFactArgs = {
+  value: FactValueInput;
+  sourceType?: FactSourceType;
+  changeReason?: string;
+  /**
+   * Which of `rememberFact`'s two history branches this edit takes.
+   *
+   * "changed" (the default): the old value was true once and remains
+   * reachable as history -- `status` becomes `superseded`, returned by a
+   * `listFacts({ includeHistorical: true })` read. "corrected": the old
+   * value was never true and is withheld even from history -- `status`
+   * becomes `retracted`, which `isMemoryRetrievable` refuses regardless of
+   * `includeHistorical` (see `lifecycle.ts`). The two are not the same
+   * "stays in history" claim, and a caller that needs the old value
+   * reachable later must pass "changed".
+   */
+  changeKind?: "changed" | "corrected";
+  /** When the new value took effect. Passed through to `rememberFact`
+   * either way; most meaningful for "changed", where it can close the old
+   * value's open window at exactly this point (`safeSupersededValidTo`). */
+  validFrom?: number;
+};
+
+/**
+ * Edits one fact through the existing versioning path: `rememberFact` with
+ * `changeKind` defaulting to "changed" (see `UpdateFactArgs`), which stores
+ * the edited value as a new current fact under the same subject and
+ * predicate and moves the old one to history -- never erased, and never a
+ * second row inserted for the same value twice.
+ *
+ * `rememberFact` targets a (subject, predicate) tuple, not a fact id -- with
+ * `cardinality: "single"` it retires *every* current fact under that tuple,
+ * which is correct when there is exactly one (the common case, and the one
+ * this edit form assumes) but would silently retract sibling values of a
+ * `cardinality: "multiple"` predicate this fact happens to share. Cardinality
+ * is a call-time argument to `rememberFact`, never persisted, so it cannot be
+ * recovered from the fact row to tell those two cases apart; the guard below
+ * refuses rather than guessing. The sibling count excludes a value already
+ * past its own `valid_to`: a fact `retireFact` ended stays `status: 'current'`
+ * (see that function's own comment) and must not count as still active here,
+ * or a retired sibling would block every future edit of this predicate
+ * forever.
+ */
+export async function updateFact(
+  ctx: IdentityCtx,
+  userId: string,
+  spaceId: string,
+  factId: string,
+  args: UpdateFactArgs,
+): Promise<RememberFactResult> {
+  const fact = await getStoredFact(ctx, factId);
+  if (!fact || fact.spaceId !== spaceId || fact.status !== "current") {
+    throw new Error("Current fact not found");
+  }
+  const subject = await getEntity(ctx, fact.subjectEntityId);
+  if (!subject || subject.spaceId !== spaceId) {
+    throw new Error("Current fact not found");
+  }
+  const activeAt = new Date(ctx.now);
+  const siblings = await row<{ count: string }>(
+    ctx,
+    `SELECT count(*) AS count FROM kith.facts
+      WHERE space_id = $1 AND subject_entity_id = $2 AND predicate = $3 AND status = 'current'
+        AND (valid_to IS NULL OR valid_to > $4)`,
+    [spaceId, fact.subjectEntityId, fact.predicate, activeAt],
+  );
+  if (Number(siblings?.count ?? "0") > 1) {
+    throw new Error(
+      "This predicate has more than one current value; editing it here would retract the others too",
+    );
+  }
+  return rememberFact(ctx, userId, spaceId, {
+    subject: {
+      key: subject.key,
+      kind: subject.kind,
+      name: subject.canonicalName,
+      aliases: subject.aliases,
+    },
+    predicate: fact.predicate,
+    value: args.value,
+    sourceType: args.sourceType ?? fact.sourceType,
+    ...(fact.isCore === null ? {} : { isCore: fact.isCore }),
+    cardinality: "single",
+    changeKind: args.changeKind ?? "changed",
+    ...(args.validFrom === undefined ? {} : { validFrom: args.validFrom }),
+    ...(args.changeReason === undefined ? {} : { changeReason: args.changeReason }),
+  });
+}
+
+/**
+ * Ends a fact's validity without erasing it: sets `valid_to` to now (or keeps
+ * an earlier one already there), which is the same mechanism a fact's window
+ * lapsing has always been -- `listFacts`'s current-facts query excludes it
+ * from this moment on, `includeHistorical` still returns it, and every column
+ * including `value` is untouched.
+ *
+ * Deliberately not `status = 'retracted'`: retracted means the fact was never
+ * true (`isMemoryRetrievable` withholds it even from history, see
+ * `lifecycle.ts`), and a retirement is the opposite claim -- the value was
+ * accurate and simply stopped applying.
+ */
+export async function retireFact(
+  ctx: IdentityCtx,
+  spaceId: string,
+  factId: string,
+): Promise<void> {
+  const fact = await getStoredFact(ctx, factId);
+  if (!fact || fact.spaceId !== spaceId || fact.status !== "current") {
+    throw new Error("Current fact not found");
+  }
+  const validTo = fact.validTo !== undefined && fact.validTo <= ctx.now ? fact.validTo : ctx.now;
+  await exec(ctx, "UPDATE kith.facts SET valid_to = $2, updated_at = $3 WHERE id = $1", [
+    factId,
+    at(validTo),
+    new Date(ctx.now),
+  ]);
 }

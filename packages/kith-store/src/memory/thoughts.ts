@@ -569,6 +569,118 @@ export async function setCoreStatus(
   await exec(ctx, "UPDATE kith.thoughts SET is_core = $2 WHERE id = $1", [id, isCore]);
 }
 
+export type UpdateThoughtArgs = {
+  content: string;
+  type: ThoughtType;
+  topics: readonly string[];
+  people: readonly string[];
+};
+
+/**
+ * Edits a thought through `transitionMemory`, the same supersession
+ * mechanism `SUPERSEDE` captures use: the edit is stored as a new current
+ * thought and this one is marked superseded, so its prior content stays in
+ * history rather than being overwritten. `transitionMemory` already refreshes
+ * the embedding target (marks the new thought eligible, deletes the old
+ * thought's active vector, bumps the eligibility epoch, schedules a fill), so
+ * nothing extra is needed here for that.
+ *
+ * Only the fields the edit form offers change. `actionItems` and `summary`
+ * carry over from the edited thought untouched, and so does everything else
+ * `transitionMemory`'s args accept but this form does not ask about --
+ * `sourceType`, `sourceRef`, `observedAt`, `batchId`, `confidence`,
+ * `validFrom`, `validTo` -- because leaving them off `transitionMemory`'s
+ * call is not "unset", it is a fresh capture's own defaults: an edit would
+ * silently drop the new row's link to whatever document or conversation the
+ * thought came from and reopen a business-time window the owner had closed.
+ * `isCore` is the one exception, and does not need carrying here: it already
+ * carries over inside `transitionMemory` itself (the previous thought's own
+ * value, since none is passed here), the way every other caller's does.
+ */
+export async function updateThought(
+  ctx: IdentityCtx,
+  userId: string,
+  spaceId: string,
+  id: string,
+  args: UpdateThoughtArgs,
+): Promise<string> {
+  const previous = await getThoughtById(ctx, id);
+  if (!previous || previous.spaceId !== spaceId || !isCurrentMemory(previous.memoryStatus)) {
+    throw new Error("Current thought not found");
+  }
+  return transitionMemory(
+    ctx,
+    userId,
+    spaceId,
+    {
+      content: args.content,
+      metadata: {
+        type: args.type,
+        topics: args.topics,
+        people: args.people,
+        actionItems: previous.metadata.actionItems,
+        summary: previous.metadata.summary,
+      },
+      ...(previous.sourceType === undefined ? {} : { sourceType: previous.sourceType }),
+      ...(previous.sourceRef === null ? {} : { sourceRef: previous.sourceRef }),
+      ...(previous.observedAt === undefined ? {} : { observedAt: previous.observedAt }),
+      ...(previous.batchId === null ? {} : { batchId: previous.batchId }),
+      ...(previous.confidence === undefined ? {} : { confidence: previous.confidence }),
+      ...(previous.validFrom === undefined ? {} : { validFrom: previous.validFrom }),
+      ...(previous.validTo === undefined ? {} : { validTo: previous.validTo }),
+    },
+    [id],
+    "superseded",
+    "Edited",
+    ctx.now,
+  );
+}
+
+/**
+ * Soft-deletes a thought: marks it `retracted`, which `isMemoryRetrievable`
+ * withholds everywhere -- current and historical alike, exactly like a
+ * `transitionMemory` RETRACT's previous memory -- without erasing the row,
+ * its content or its `supersedes` links.
+ *
+ * This is `transitionMemory`'s retract branch with the insert removed: a UI
+ * delete has no replacement content to store, so there is no new thought to
+ * mark eligible and nothing to schedule a fill for. What remains is exactly
+ * what a RETRACT's previous-memory update does -- `memory_status`,
+ * `superseded_at`, `change_reason`, `valid_from`/`valid_to` cleared -- plus
+ * the same embedding-target cleanup: delete the active vector (if the space
+ * has one) and bump the eligibility epoch so a stale target is not left
+ * pointing at a memory that no longer exists.
+ */
+export async function deleteThought(
+  ctx: IdentityCtx,
+  spaceId: string,
+  id: string,
+  reason: string = "Deleted",
+): Promise<void> {
+  const thought = await getThoughtById(ctx, id);
+  if (!thought || thought.spaceId !== spaceId || !isCurrentMemory(thought.memoryStatus)) {
+    throw new Error("Current thought not found");
+  }
+  await exec(
+    ctx,
+    `UPDATE kith.thoughts
+        SET memory_status = 'retracted', superseded_at = $2, change_reason = $3,
+            valid_from = NULL, valid_to = NULL
+      WHERE id = $1`,
+    [id, new Date(ctx.now), reason],
+  );
+  const active = await activeIndexForWrite(ctx, spaceId);
+  if (active) {
+    await deleteActiveThoughtEmbeddingVectors(ctx, {
+      spaceId,
+      embeddingGenerationId: active.embeddingGenerationId,
+      fingerprint: active.fingerprint,
+      thoughtIds: [id],
+    });
+  }
+  await bumpEmbeddingEligibilityEpoch(ctx, spaceId, { thoughtIds: [id] });
+}
+
 /**
  * The seam P2-39g1's text and vector legs plug into: given candidate thought
  * ids already ranked by whatever index produced them, authorize, filter by
