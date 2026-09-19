@@ -1,13 +1,27 @@
-// The PostgreSQL browse page. A server component fed by `loadBrowse`'s one
-// read-only transaction: it imports nothing from Convex. The type filter and
-// history toggle are a plain `GET` form over the page's own query string; the
-// thoughts tab's search box is not (see `components/kith-thought-search.tsx`
-// for why), so that one piece of the thoughts view is a client component.
+"use client";
+
+// The browse page: facts or thoughts, fed by `loadBrowse`'s one read-only
+// transaction and refreshed live when either table changes.
+//
+// The view, the history toggle and the thought type are the page's own
+// `?view=&historical=&type=` query string, as before, so each is a link or a
+// navigation rather than client state: the loader filters on the server and a
+// type with more than one page of thoughts is still reachable. The thoughts
+// view's free-text search is not in the URL (`lib/kith/browse.ts` says why);
+// `kith-thought-search.tsx` posts it instead.
 
 import type { memory } from "@repo/kith-store";
+import { type ColumnDef } from "@tanstack/react-table";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { useMemo } from "react";
 
 import { KithThoughtSearch } from "@/components/kith-thought-search";
+import { inputClass, PageHeader } from "@/components/ui/controls";
+import { DataTable, Tag } from "@/components/ui/data-table";
 import type { BrowseData, BrowseView } from "@/lib/kith/browse";
+import { label, shortDate } from "@/lib/kith/format";
+import { useServerData } from "@/lib/kith/use-server-data";
 
 const THOUGHT_TYPES = [
   "decision",
@@ -18,118 +32,158 @@ const THOUGHT_TYPES = [
   "reference",
 ] as const;
 
-function tabLink(view: BrowseView, current: BrowseView) {
-  const active = view === current;
-  return (
-    <a
-      href={`/browse?view=${view}`}
-      style={{
-        padding: "6px 16px",
-        background: active ? "#333" : "transparent",
-        color: active ? "#fff" : "#666",
-        textDecoration: "none",
-      }}
-    >
-      {view === "facts" ? "Facts" : "Thoughts"}
-    </a>
-  );
+const LIVE_TABLES = ["thoughts", "facts"] as const;
+
+function href(view: BrowseView, historical: boolean, type = ""): string {
+  const params = new URLSearchParams({ view });
+  if (historical) params.set("historical", "1");
+  if (type) params.set("type", type);
+  return `/browse?${params.toString()}`;
 }
 
-function FactRow({ fact }: { fact: memory.HydratedFact }) {
+/** Square segmented links: the current one filled blue. */
+function Segment({
+  options,
+}: {
+  options: readonly { href: string; label: string; active: boolean }[];
+}) {
   return (
-    <div
-      style={{
-        border: "1px solid #e0e0e0",
-        borderRadius: 8,
-        padding: "14px 16px",
-        background: fact.status === "current" ? "#fff" : "#fafafa",
-        opacity: fact.status === "current" ? 1 : 0.72,
-      }}
-    >
-      <div style={{ fontSize: 16 }}>{fact.statement}</div>
-      <div
-        style={{
-          display: "flex",
-          gap: 8,
-          flexWrap: "wrap",
-          marginTop: 8,
-          fontSize: 12,
-          color: "#666",
-        }}
-      >
-        <span>{fact.subject?.key ?? "unknown subject"}</span>
-        <span>·</span>
-        <span>{fact.predicate}</span>
-        <span>·</span>
-        <span>{fact.status}</span>
-        {fact.isCore && (
-          <>
-            <span>·</span>
-            <span>core</span>
-          </>
-        )}
-        {fact.validFrom !== undefined && (
-          <>
-            <span>·</span>
-            <span>from {new Date(fact.validFrom).toLocaleDateString()}</span>
-          </>
-        )}
-        {fact.validTo !== undefined && (
-          <>
-            <span>·</span>
-            <span>until {new Date(fact.validTo).toLocaleDateString()}</span>
-          </>
-        )}
-      </div>
-    </div>
-  );
-}
-
-export function ThoughtRow({ thought }: { thought: memory.Thought & { score?: number } }) {
-  return (
-    <div
-      style={{
-        border: "1px solid #e0e0e0",
-        borderRadius: 8,
-        padding: 16,
-        backgroundColor: "#fff",
-      }}
-    >
-      <div style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
-        <span
-          style={{
-            padding: "2px 8px",
-            borderRadius: 4,
-            fontSize: 12,
-            backgroundColor: "#e8eaf6",
-          }}
+    <div className="flex rounded-tag border border-gray-300 text-xs">
+      {options.map((option) => (
+        <Link
+          key={option.label}
+          href={option.href}
+          aria-current={option.active ? "page" : undefined}
+          className={`px-3 py-1 focus-visible:outline-2 focus-visible:outline-accent-600 ${
+            option.active
+              ? "bg-accent-600 text-white"
+              : "bg-white text-gray-700 hover:bg-gray-50"
+          }`}
         >
-          {thought.metadata.type.replace("_", " ")}
-        </span>
-        {thought.metadata.topics.map((topic) => (
-          <span
-            key={topic}
-            style={{
-              padding: "2px 8px",
-              borderRadius: 4,
-              fontSize: 12,
-              backgroundColor: "#e8eaf6",
-            }}
-          >
-            {topic}
-          </span>
-        ))}
-        <span style={{ marginLeft: "auto", fontSize: 12, color: "#999" }}>
-          {new Date(thought.createdAt).toLocaleDateString()}
-        </span>
-      </div>
-      <p style={{ margin: 0, lineHeight: 1.5 }}>{thought.content}</p>
+          {option.label}
+        </Link>
+      ))}
     </div>
+  );
+}
+
+/** History on or off: a link to the other state, styled like a chip. */
+function HistoryToggle({ on, to }: { on: boolean; to: string }) {
+  return (
+    <Link
+      href={to}
+      aria-label={on ? "Hide history" : "Show history"}
+      className={`rounded-tag border px-1.5 py-0.5 text-[11px] leading-none focus-visible:outline-2 focus-visible:outline-accent-600 ${
+        on
+          ? "border-accent-600 bg-accent-600 text-white"
+          : "border-gray-200 bg-gray-50 text-gray-700 hover:border-gray-300"
+      }`}
+    >
+      History
+    </Link>
+  );
+}
+
+type FactRow = {
+  id: string;
+  statement: string;
+  subject: string;
+  predicate: string;
+  status: string;
+  core: string;
+  validFrom: number | null;
+  validTo: number | null;
+};
+
+function FactsTable({
+  facts,
+  includeHistorical,
+}: {
+  facts: readonly memory.HydratedFact[];
+  includeHistorical: boolean;
+}) {
+  const rows = useMemo<FactRow[]>(
+    () =>
+      facts.map((fact) => ({
+        id: fact.id,
+        statement: fact.statement,
+        subject: fact.subject?.key ?? "",
+        predicate: fact.predicate,
+        status: fact.status,
+        core: fact.isCore ? "core" : "",
+        validFrom: fact.validFrom ?? null,
+        validTo: fact.validTo ?? null,
+      })),
+    [facts],
+  );
+  const columns = useMemo<ColumnDef<FactRow, unknown>[]>(
+    () => [
+      {
+        id: "statement",
+        accessorKey: "statement",
+        header: "Fact",
+        cell: ({ row }) => (
+          <span className={row.original.status === "current" ? "" : "text-gray-500"}>
+            {row.original.statement}
+          </span>
+        ),
+      },
+      { id: "subject", accessorKey: "subject", header: "Subject" },
+      { id: "predicate", accessorKey: "predicate", header: "Predicate" },
+      {
+        id: "status",
+        accessorKey: "status",
+        header: "Status",
+        cell: ({ row }) => (
+          <Tag tone={row.original.status === "current" ? "accent" : "neutral"}>
+            {row.original.status}
+          </Tag>
+        ),
+      },
+      {
+        id: "core",
+        accessorKey: "core",
+        header: "Core",
+        cell: ({ row }) => (row.original.core ? <Tag>core</Tag> : null),
+      },
+      {
+        id: "validFrom",
+        accessorKey: "validFrom",
+        header: "From",
+        cell: ({ row }) => (
+          <span className="text-gray-600 tabular-nums">{shortDate(row.original.validFrom)}</span>
+        ),
+      },
+      {
+        id: "validTo",
+        accessorKey: "validTo",
+        header: "Until",
+        cell: ({ row }) => (
+          <span className="text-gray-600 tabular-nums">{shortDate(row.original.validTo)}</span>
+        ),
+      },
+    ],
+    [],
+  );
+  return (
+    <DataTable
+      data={rows}
+      columns={columns}
+      filterColumns={["status", "core", "predicate"]}
+      initialSorting={[{ id: "subject", desc: false }]}
+      searchPlaceholder="Search facts"
+      empty="No facts"
+      toolbar={
+        <span className="ml-auto">
+          <HistoryToggle on={includeHistorical} to={href("facts", !includeHistorical)} />
+        </span>
+      }
+    />
   );
 }
 
 export function KithBrowse({
-  data,
+  data: server,
   includeHistorical,
   type,
 }: {
@@ -137,114 +191,63 @@ export function KithBrowse({
   includeHistorical: boolean;
   type: string;
 }) {
+  const router = useRouter();
+  const data = useServerData<BrowseData>(
+    ["browse", server.view, type, includeHistorical],
+    server,
+    LIVE_TABLES,
+  );
+
   return (
     <div>
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          marginBottom: 24,
-        }}
-      >
-        <h1 style={{ margin: 0 }}>Browse</h1>
-        <div
-          style={{
-            display: "flex",
-            background: "#f0f0f0",
-            borderRadius: 6,
-            overflow: "hidden",
-            fontSize: 14,
-          }}
-        >
-          {tabLink("facts", data.view)}
-          {tabLink("thoughts", data.view)}
-        </div>
-      </div>
+      <PageHeader title="Browse">
+        <Segment
+          options={[
+            { href: href("facts", includeHistorical), label: "Facts", active: data.view === "facts" },
+            {
+              href: href("thoughts", includeHistorical, type),
+              label: "Thoughts",
+              active: data.view === "thoughts",
+            },
+          ]}
+        />
+      </PageHeader>
 
       {data.view === "facts" ? (
-        <div>
-          <form
-            method="get"
-            style={{
-              display: "flex",
-              justifyContent: "space-between",
-              alignItems: "center",
-              marginBottom: 16,
-            }}
-          >
-            <input type="hidden" name="view" value="facts" />
-            <p style={{ color: "#666", margin: 0 }}>
-              Precise attributes and relationships. Changed values remain
-              available as history.
-            </p>
-            <label style={{ fontSize: 13, color: "#666" }}>
-              <input
-                type="checkbox"
-                name="historical"
-                value="1"
-                defaultChecked={includeHistorical}
-                style={{ marginRight: 6 }}
-              />
-              Show history{" "}
-              <button type="submit" style={{ marginLeft: 8 }}>
-                Apply
-              </button>
-            </label>
-          </form>
-          {data.facts.length === 0 ? (
-            <p style={{ color: "#666" }}>
-              No structured facts yet. AI clients can add exact dates,
-              relationships, providers, schools, and other durable attributes.
-            </p>
-          ) : (
-            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-              {data.facts.map((fact) => (
-                <FactRow key={fact.id} fact={fact} />
-              ))}
-            </div>
-          )}
-        </div>
+        <FactsTable facts={data.facts} includeHistorical={includeHistorical} />
       ) : (
-        <div>
-          <form
-            method="get"
-            style={{ display: "flex", gap: 8, marginBottom: 16, flexWrap: "wrap" }}
-          >
-            <input type="hidden" name="view" value="thoughts" />
-            <select
-              name="type"
-              defaultValue={type}
-              style={{ padding: 8, borderRadius: 4, border: "1px solid #ddd" }}
-            >
-              <option value="">All types</option>
-              {THOUGHT_TYPES.map((t) => (
-                <option key={t} value={t}>
-                  {t.replace("_", " ")}
-                </option>
-              ))}
-            </select>
-            <label style={{ fontSize: 13, color: "#666", alignSelf: "center" }}>
-              <input
-                type="checkbox"
-                name="historical"
-                value="1"
-                defaultChecked={includeHistorical}
-                style={{ marginRight: 6 }}
+        <KithThoughtSearch
+          key={`${type}-${includeHistorical}`}
+          initialThoughts={data.thoughts}
+          type={type}
+          includeHistorical={includeHistorical}
+          toolbar={
+            <span className="ml-auto flex items-center gap-2">
+              <label htmlFor="thought-type" className="sr-only">
+                Type
+              </label>
+              <select
+                id="thought-type"
+                value={type}
+                onChange={(event) =>
+                  router.push(href("thoughts", includeHistorical, event.target.value))
+                }
+                className={inputClass}
+              >
+                <option value="">All types</option>
+                {THOUGHT_TYPES.map((value) => (
+                  <option key={value} value={value}>
+                    {label(value)}
+                  </option>
+                ))}
+              </select>
+              <HistoryToggle
+                on={includeHistorical}
+                to={href("thoughts", !includeHistorical, type)}
               />
-              Show history
-            </label>
-            <button type="submit" style={{ padding: "10px 20px", borderRadius: 4 }}>
-              Apply
-            </button>
-          </form>
-          <KithThoughtSearch
-            key={`${type}-${includeHistorical}`}
-            initialThoughts={data.thoughts}
-            type={type}
-            includeHistorical={includeHistorical}
-          />
-        </div>
+            </span>
+          }
+        />
       )}
     </div>
   );

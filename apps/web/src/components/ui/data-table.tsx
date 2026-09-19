@@ -88,6 +88,12 @@ export type DataTableProps<T> = {
   searchPlaceholder?: string;
   /** Rendered in place of the rows when there are none. */
   empty?: React.ReactNode;
+  /** Extra controls at the end of the toolbar, after the chips. */
+  toolbar?: React.ReactNode;
+  /** When set, the search box reports to the caller, which searches on the
+   * server and passes the matching rows back in `data`; the table then does
+   * not filter on the text itself. */
+  onSearchChange?: (value: string) => void;
 };
 
 /** Square tags (2px), gray by default, blue when they carry the selection. */
@@ -155,6 +161,8 @@ export function DataTable<T>({
   actions = [],
   searchPlaceholder = "Search",
   empty = "Nothing here",
+  toolbar,
+  onSearchChange,
 }: DataTableProps<T>) {
   const [sorting, setSorting] = useState<SortingState>(initialSorting);
   const [search, setSearch] = useState("");
@@ -168,7 +176,12 @@ export function DataTable<T>({
   const table = useReactTable({
     data,
     columns,
-    state: { sorting, expanded, grouping, globalFilter: search },
+    state: {
+      sorting,
+      expanded,
+      grouping,
+      globalFilter: onSearchChange === undefined ? search : "",
+    },
     onSortingChange: setSorting,
     onExpandedChange: setExpanded,
     onGlobalFilterChange: setSearch,
@@ -237,7 +250,10 @@ export function DataTable<T>({
           <input
             type="search"
             value={search}
-            onChange={(event) => setSearch(event.target.value)}
+            onChange={(event) => {
+              setSearch(event.target.value);
+              onSearchChange?.(event.target.value);
+            }}
             placeholder={searchPlaceholder}
             aria-label={searchPlaceholder}
             className="h-7 w-56 rounded-tag border border-gray-300 px-2 text-xs outline-none focus:border-accent-500"
@@ -263,6 +279,7 @@ export function DataTable<T>({
               );
             }),
           )}
+          {toolbar}
         </div>
 
         <table className="w-full border-collapse text-xs">

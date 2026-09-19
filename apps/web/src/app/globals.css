@@ -1,10 +1,8 @@
 /* The owner's style decision, as tokens: white, gray and blue, Inter, compact
  * tables, square tags. Section 1 of docs/plans/2026-09-18-admin-panel-and-
- * ingestion.md. Nothing here is a component library; the admin screens compose
- * Tailwind utilities over these tokens.
- *
- * The pages that predate the admin panel style themselves with inline `style`
- * props and are untouched by this file beyond the preflight reset. */
+ * ingestion.md. Nothing here is a component library; every page composes
+ * Tailwind utilities over these tokens (`components/ui/controls.tsx` holds the
+ * shared form control classes). */
 @import "tailwindcss";
 
 @theme {

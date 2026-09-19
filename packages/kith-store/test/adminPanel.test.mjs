@@ -290,11 +290,12 @@ test("the change feed records every write and never another space's", { skip }, 
   assert.ok(mine.every((change) => typeof change.id === "string"));
   assert.ok(BigInt(mine[1].id) > BigInt(mine[0].id));
 
-  // The stranger's own feed holds the stranger's row and nothing of ours.
+  // The stranger's own feed holds the stranger's rows and nothing of ours:
+  // their membership (the space_members trigger) and their source account.
   const theirs = await listChangesSince(ctx, [strangerSpace], "0");
   assert.deepEqual(
     theirs.map((change) => change.table),
-    ["source_accounts"],
+    ["space_members", "source_accounts"],
   );
 
   // The cursor is exclusive: reading from the last id returns nothing.
@@ -306,6 +307,25 @@ test("the change feed records every write and never another space's", { skip }, 
   assert.deepEqual(
     after.map((change) => [change.table, change.rowId, change.op]),
     [["source_roots", rootId, "delete"]],
+  );
+});
+
+test("a membership change reaches the change feed", { skip }, async (t) => {
+  const f = await fixture(t);
+  const ctx = f.ctx(NOW);
+  const cursor = await latestChangeId(ctx, [f.spaceId]);
+
+  const readerId = await makeUser(ctx, { name: "Reader" });
+  const membershipId = await makeMember(ctx, {
+    spaceId: f.spaceId,
+    userId: readerId,
+    role: "reader",
+  });
+
+  const changes = await listChangesSince(ctx, [f.spaceId], cursor);
+  assert.deepEqual(
+    changes.map((change) => [change.table, change.rowId, change.op]),
+    [["space_members", membershipId, "insert"]],
   );
 });
 

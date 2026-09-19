@@ -4,9 +4,8 @@
 // `KITH_POSTGRES_SURFACE=convex`, together with the client they configured.
 //
 // ADM-1 adds `globals.css` (Tailwind v4 plus the owner's tokens) and Inter,
-// self-hosted through `next/font` so nothing the admin screens paint needs a
-// request to a font CDN. The pages that predate the admin panel keep their
-// inline styles; Tailwind's preflight is all this changes for them.
+// self-hosted through `next/font` so nothing a page paints needs a request to
+// a font CDN.
 
 import "./globals.css";
 
