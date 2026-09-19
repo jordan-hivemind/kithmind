@@ -20,6 +20,7 @@ import type { ClientBase } from "pg";
 
 import {
   amountsInText,
+  CORRECTION_REASONS,
   valueSignature,
   compareDecimalsSafely,
   foldTextForMatch,
@@ -289,16 +290,21 @@ export async function diagnoseExtractions(
       const items = shapes
         ? shapes.slice(0, 32).map((entry) => {
             const item = (entry ?? {}) as Record<string, unknown>;
-            const folded = typeof item.reason === "string";
+            // Both fields always fold. The recorded shapes are already
+            // folded, so folding them again is a no-op; an entry read off an
+            // untrusted array is not, and a `reason` it carries is only
+            // honoured when it is one this code knows -- otherwise a stored
+            // description could have printed itself as a reason.
+            const reason =
+              typeof item.reason === "string" &&
+              (CORRECTION_REASONS as readonly string[]).includes(item.reason)
+                ? item.reason
+                : undefined;
             return {
-              amount: folded
-                ? String(item.amount ?? "")
-                : valueSignature(item.amount),
-              description: folded
-                ? String(item.description ?? "")
-                : valueSignature(item.description),
+              amount: valueSignature(item.amount),
+              description: valueSignature(item.description),
               lines: integers(item.lines),
-              ...(folded ? { reason: String(item.reason) } : {}),
+              ...(reason ? { reason } : {}),
             };
           })
         : undefined;

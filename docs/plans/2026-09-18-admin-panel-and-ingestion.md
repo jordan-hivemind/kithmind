@@ -253,10 +253,34 @@ line; only a text field may span two adjacent cited ones, and only a text
 field is matched case- and punctuation-folded. Money, numbers and dates keep
 their exact reading.
 
+The amount grammar is one explicit rule, written out in
+`packages/kith-store/src/extraction/gate.ts` and pinned by a table in
+`test/extractionGate.test.mjs` that holds every adversarial input the reviews
+have found. A magnitude suffix is **applied**, not dropped and not refused:
+`k` is a thousand, `M`, `MM` and `mn` a million, `B` and `bn` a billion, and
+the words with them. The scaling is exact, by moving the decimal point. A
+token carrying a suffix has exactly one value, the scaled one, on both the
+value side and the quote side, so `2.5` can never borrow a citation that says
+`$2.5M`. **Known ambiguity:** some banking conventions read a bare `M` as the
+Roman thousand and `MM` as the million; this reads `M` as a million, because
+the documents are venture and personal finance. If a kind ever needs the
+other reading it becomes a setting beside `date_order`.
+
+A tax or status flag is a separate rule: one letter from a small documented
+set, exactly two decimal places, and nothing after it. `K`, `M` and `B` are
+not in that set, and a lone `C` is refused rather than dropped, because a
+credit marker silently removed loses a sign.
+
 Each entry of a `line_item_list` carries its own citation and is gated on its
 own: its amount must occur within one cited line, its description folds like
 any name and may span two adjacent cited lines, and its evidence span is the
-line that prints the amount. An entry that fails is one entry, not the list:
+line that prints the amount. An entry's observation key is derived from its own evidence -- the cited line
+its amount sits on, and a fold of its description -- so a correction made on
+one line does not move onto another when the model reorders the list between
+runs. Two entries with the same description on the same line still collide,
+and a key moves if the page is re-parsed into different lines.
+
+An entry that fails is one entry, not the list:
 the rest store and a single `line_items_partial` correction says how many are
 missing. An amount is the decimal string the line prints, with its decimal
 point; a trailing tax or status letter is dropped as a flag; `1299` is one

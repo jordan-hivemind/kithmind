@@ -77,6 +77,7 @@ import { seedDocumentTypes } from "./seed.js";
 import {
   candidatesFor,
   checkLineItem,
+  foldTextForMatch,
   checkValue,
   readLineItems,
   valueSignature,
@@ -860,9 +861,34 @@ async function findOrCreateSpan(
   return id;
 }
 
+/**
+ * A short, stable tag for one line item.
+ *
+ * The cited line the amount sits on, plus a fold of the description. Position
+ * in the surviving array was what this used to be, and it moved under the
+ * owner's feet: an entry failing, or the model listing the same receipt in a
+ * different order, shifted every later key by one and landed a correction
+ * made on one line onto another.
+ *
+ * ponytail: a 32-bit FNV-1a of the folded description, not a cryptographic
+ * hash -- this is a key, not a commitment. Two entries with the same folded
+ * description *and* the same amount line still collide, and a key still moves
+ * if the page is re-parsed into different lines. Upgrade path if either
+ * matters: carry the item's own span id into the key.
+ */
+function lineItemKey(lineId: number, description: string): string {
+  let hash = 0x811c9dc5;
+  for (const unit of foldTextForMatch(description)) {
+    hash ^= unit.codePointAt(0)!;
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return `${lineId}-${hash.toString(36).padStart(7, "0").slice(-7)}`;
+}
+
 type GatedLineItems = {
   values: ObservationValue[];
   spanIds: string[];
+  valueKeys: string[];
   /** The sum of the entries that passed. A partial list must not be compared
    * against a stated total, so the caller only carries this when nothing
    * failed. */
@@ -914,6 +940,7 @@ async function gateLineItems(
   const empty: GatedLineItems = {
     values: [],
     spanIds: [],
+    valueKeys: [],
     quote: "",
     failed: 1,
     total: 1,
@@ -931,6 +958,7 @@ async function gateLineItems(
 
   const values: ObservationValue[] = [];
   const spanIds: string[] = [];
+  const valueKeys: string[] = [];
   let itemsTotal = "0";
   let currencyAssumed: true | undefined;
   let quote = "";
@@ -956,12 +984,18 @@ async function gateLineItems(
       note({}, entry.reason);
       continue;
     }
-    // The entry's own lines when it gave any, the statement's otherwise: a
-    // one-line list is ordinary and re-citing it per entry is noise.
+    // The entry's own lines when it gave any. The statement's stand in only
+    // when they name exactly one line: on a multi-line citation there is no
+    // way to say which of them this entry is about, and falling back to all
+    // of them let an item's description on one line pair with a different
+    // item's amount on another -- the cross-item validation per-entry
+    // citations exist to remove.
     const own =
       entry.item.lines.length > 0
         ? citedLines(page.lines, entry.item.lines)
-        : [...input.cited];
+        : input.cited.length === 1
+          ? [...input.cited]
+          : null;
     if (!own || own.length === 0) {
       note(entry.item, "citation_missing");
       continue;
@@ -983,6 +1017,7 @@ async function gateLineItems(
     }
     values.push(checked.value);
     spanIds.push(spanId);
+    valueKeys.push(lineItemKey(checked.lineId, entry.item.description));
     itemsTotal = addDecimals(itemsTotal, checked.amount);
     if (checked.currencyAssumed) currencyAssumed = true;
     if (!quote) quote = checked.span.text;
@@ -991,6 +1026,7 @@ async function gateLineItems(
   return {
     values,
     spanIds,
+    valueKeys,
     ...(failed === 0 ? { itemsTotal } : {}),
     ...(currencyAssumed ? { currencyAssumed } : {}),
     quote,
@@ -1039,6 +1075,11 @@ async function prepare(
     /** One per value, aligned with `values`: the span for the line that
      * supported it. */
     spanIds: string[];
+    /** One per value: the suffix its observation key takes. A list keys by
+     * the entry's own evidence rather than by its position, so a correction
+     * made on one line does not land on another when the model reorders the
+     * list on the next run. */
+    valueKeys?: string[];
     values: ObservationValue[];
     itemsTotal?: string;
     currencyAssumed?: true;
@@ -1138,6 +1179,7 @@ async function prepare(
           lines: [...(statement.lines ?? [])],
           citation,
           spanIds: listed.spanIds,
+          valueKeys: listed.valueKeys,
           values: listed.values,
           itemsTotal: listed.itemsTotal,
           ...(listed.currencyAssumed ? { currencyAssumed: true as const } : {}),
@@ -1274,7 +1316,10 @@ async function prepare(
     const name = entry.field.name;
     const keys: string[] = [];
     entry.values.forEach((value, index) => {
-      const key = entry.values.length > 1 ? `${name}:${index}` : name;
+      const key =
+        entry.values.length > 1
+          ? `${name}:${entry.valueKeys?.[index] ?? index}`
+          : name;
       keys.push(key);
       prepared.observations.push({
         key,
