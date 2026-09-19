@@ -178,7 +178,14 @@ test(
     });
     await pool.end();
 
-    const { code, summary } = await runDaemon(database.databaseUrl, ["drain"]);
+    // One job, not a full drain: the failed job's first retry is full jitter
+    // over 0-2s, so an unbounded drain can claim the same job again before it
+    // runs dry and report `claimed: 2`.
+    const { code, summary } = await runDaemon(database.databaseUrl, [
+      "drain",
+      "--max-jobs",
+      "1",
+    ]);
 
     // The round itself succeeded; the job inside it failed, which is ordinary
     // operation and not a nonzero exit.
