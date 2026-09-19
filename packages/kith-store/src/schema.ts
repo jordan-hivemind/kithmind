@@ -179,6 +179,14 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
     name: "change feed: kith.changes, the generic record_change trigger, and triggers on the tables the first admin screens read (ADM-1)",
     url: new URL("../migrations/023_change_feed.sql", import.meta.url),
   },
+  {
+    version: 24,
+    name: "change feed: triggers on the tables the health and coverage screens read (ADM-2)",
+    url: new URL(
+      "../migrations/024_health_coverage_change_feed.sql",
+      import.meta.url,
+    ),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */
