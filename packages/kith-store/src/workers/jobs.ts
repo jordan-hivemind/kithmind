@@ -1,3 +1,4 @@
+import { scheduleDocumentExtraction } from "../extraction/model.js";
 import type {
   WorkerJobActivateResult,
   WorkerJobFailResult,
@@ -1132,6 +1133,12 @@ export async function activateProcessingJob(
     sourceAccountId: source.account.id,
     processingGenerationId: current.generation.id,
     ...(previousGenerationId ? { previousGenerationId } : {}),
+  });
+  // ADM-5a: see the note at the same point in `parsedJobs.ts`.
+  await scheduleDocumentExtraction(ctx, {
+    spaceId: source.spaceId,
+    sourceItemId: current.item.id,
+    processingGenerationId: current.generation.id,
   });
   const receipt = await insertReceipt(ctx, source, current, identity, request, {
     state: "ready",

@@ -73,6 +73,9 @@ const EVENT_TYPES = new Set([
   "k1_card",
   "brokerage_tax_package_card",
   "spreadsheet_card",
+  // ADM-5a: the read side of the generic extraction event type. Keep in step
+  // with `EVENT_TYPES` in ./model.ts.
+  "document_statement",
 ]);
 
 type QueryCtx = { readonly client: ClientBase; readonly now: number };

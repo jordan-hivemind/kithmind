@@ -64,7 +64,32 @@ const GRANTED = Object.freeze({
     "investment_entries",
     "corrections",
   ],
+  extraction: ["document_extractions"],
 });
+
+/**
+ * Every table one `document_extraction` job writes, end to end (ADM-5a).
+ *
+ * The groups above are per migration, so a table can be in the GRANT and the
+ * job can still fail on a table that is not. This list is the other axis: it
+ * follows one job through `src/extraction/model.ts` -- it seeds the type rows,
+ * creates a placeholder entity, stages an evidence span, mints the stable
+ * event and its version, writes the observations, upserts the extraction row
+ * and opens corrections -- and asserts the credential the daemon actually uses
+ * can write all of it. The failure it exists to catch is invisible in every
+ * other test in the repository, because every other test runs as the owner.
+ */
+const EXTRACTION_WRITE_PATH = Object.freeze([
+  "document_types",
+  "document_type_fields",
+  "entities",
+  "evidence_spans",
+  "events",
+  "event_versions",
+  "observations",
+  "document_extractions",
+  "corrections",
+]);
 
 /** Tables no application write may reach. The control for the list above. */
 const WITHHELD = Object.freeze(["schema_version", "proof_spaces", "proof_api_keys"]);
@@ -347,6 +372,22 @@ test(
               `${group}: ${privilege} on kith.${table}`,
             );
           }
+        }
+      }
+
+      // One job's whole write path, as the credential that runs it.
+      for (const table of EXTRACTION_WRITE_PATH) {
+        for (const privilege of ["INSERT", "UPDATE", "DELETE", "SELECT"]) {
+          assert.equal(
+            (
+              await app.query("SELECT has_table_privilege($1, $2) AS granted", [
+                `kith.${table}`,
+                privilege,
+              ])
+            ).rows[0].granted,
+            true,
+            `document_extraction write path: ${privilege} on kith.${table}`,
+          );
         }
       }
 

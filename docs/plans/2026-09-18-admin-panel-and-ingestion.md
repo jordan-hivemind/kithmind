@@ -90,6 +90,8 @@ The watcher host keeps one local setting: the top-level directories it may read 
 
 One pass per document over the sealed text produces typed statements: party, date, money, identifier, line item, term. Each carries its evidence span and a confidence, plus a kind label and a one-line summary. Checks are per value type, not per kind: a value must appear in the cited text, money and dates must parse exactly, line items must sum to a stated total where both exist. A failed check opens a correction item instead of storing a guess. Kinds are rows in `document_types`. Adding a kind is a row, not a release. Editing guidance bumps the version and re-extraction is on demand. Image receipts are normalized to PDF before intake and go through OCR. Strict typed records remain for ledgers and statements, fed by deterministic parsers or by extraction with arithmetic checks.
 
+The `sums_to_total` check spans two fields, so it needs one naming convention. A document type whose field carries that check states the sum in a money field named `subtotal`, or in one named `total` when the type has no subtotal. The preference matters on a taxed receipt: the items sum to the subtotal and the total carries the tax. A type that names its sum anything else gets no sum check, which is the same as declaring none.
+
 Dropped from the earlier card design: closed kind enums, the model tier ladder, weekly budgets and the pausing queue, the rule that a source publishes nothing until a subject entity exists, and the entity binding gate. Names are stored as written and bound to entities later.
 
 ## 9. Screens

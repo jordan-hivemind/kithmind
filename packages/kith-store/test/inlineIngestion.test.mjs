@@ -120,6 +120,19 @@ function inlineInput(spaceId, overrides = {}) {
   };
 }
 
+/** ADM-5a's `document_extraction` runs behind every activation. These tests
+ * are about ingestion, so its model reads nothing and returns nothing. */
+function stubExtraction() {
+  return {
+    extractionModel: {
+      name: "synthetic-extraction-model",
+      async read() {
+        return { kind: "other", summary: "", statements: [] };
+      },
+    },
+  };
+}
+
 async function count(client, table, where = "", values = []) {
   const result = await client.query(
     `SELECT count(*)::int AS n FROM kith.${table} ${where}`,
@@ -485,10 +498,18 @@ test(
     // queue holds one job rather than two.
     assert.equal(await count(f.client, "deferred_work"), 1);
 
-    const drained = await drain(f.pool, defaultRegistry(), { now: later + 1 });
-    assert.equal(drained.claimed, 1);
-    assert.equal(drained.completed, 1);
-    assert.equal(drained.outcomes[0].kind, "inline_ingestion");
+    // Two jobs, not one: the inline handler activates the generation, which
+    // queues ADM-5a's `document_extraction` in the same transaction. The model
+    // is stubbed, as it is everywhere in this package.
+    const drained = await drain(f.pool, defaultRegistry(stubExtraction()), {
+      now: later + 1,
+    });
+    assert.equal(drained.claimed, 2);
+    assert.equal(drained.completed, 2);
+    assert.deepEqual(
+      drained.outcomes.map((outcome) => outcome.kind),
+      ["inline_ingestion", "document_extraction"],
+    );
 
     const result = await f.run(later + 2, (ctx) =>
       getInlineIngestResult(ctx, {
@@ -515,11 +536,12 @@ test(
     );
     // Nothing processed it inline. The fallback job comes due and the daemon
     // picks it up with no further help.
-    const drained = await drain(f.pool, defaultRegistry(), {
+    const drained = await drain(f.pool, defaultRegistry(stubExtraction()), {
       now: NOW + INLINE_WORK_FALLBACK_DELAY_MS + 1,
     });
-    assert.equal(drained.claimed, 1);
-    assert.equal(drained.completed, 1);
+    // The activation's own `document_extraction` job is the second one.
+    assert.equal(drained.claimed, 2);
+    assert.equal(drained.completed, 2);
     assert.equal(drained.unregisteredKind, 0);
 
     const result = await f.run(NOW + 20_000, (ctx) =>

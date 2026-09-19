@@ -315,6 +315,15 @@ export async function grantProofAppRole(
     kith.source_roots, kith.source_root_reports,
     kith.investments, kith.investment_entries, kith.corrections
     TO "${appRole}"`);
+  // Typed extraction (ADM-5a). The daemon that drains
+  // `document_extraction` connects as this role, so without this grant every
+  // extraction fails with 42501 on its first INSERT -- and only in production,
+  // because every test runs as the owner role, which is exactly the failure
+  // mode this whole function exists to make visible. The `kith.events`,
+  // `kith.event_versions` and `kith.observations` the same job writes are
+  // already granted above with the records group.
+  await owner.query(`GRANT INSERT, UPDATE, DELETE ON
+    kith.document_extractions TO "${appRole}"`);
   // The change feed (migration 023) is deliberately not in the list above.
   //
   // Nothing in the application writes `kith.changes`: rows arrive only through

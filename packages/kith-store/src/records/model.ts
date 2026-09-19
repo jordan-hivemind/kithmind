@@ -60,6 +60,16 @@ const EVENT_TYPES = [
   "k1_card",
   "brokerage_tax_package_card",
   "spreadsheet_card",
+  // ADM-5a. One generic event type for every typed extraction, rather than one
+  // per document kind: the kind is a row in `document_types` and "adding a kind
+  // is a row, not a release" (section 8 of the admin plan), so a per-kind event
+  // type would put the closed enum this array is straight back in code. Being
+  // outside `isCardRecordKind` is what lets these records live on the ordinary
+  // parsed generation; the card lane's `cardGeneration` pairing is untouched.
+  // Its fields are unconstrained here on purpose -- the per-value-type gate in
+  // `src/extraction/gate.ts` is what decides whether a reading may be stored at
+  // all, and a statement that fails it opens a correction instead.
+  "document_statement",
 ] as const;
 
 export type RecordEventType = (typeof EVENT_TYPES)[number];
@@ -604,7 +614,10 @@ function sortableInstant(instant: number): string {
     .padStart(17, "0");
 }
 
-function occurrenceSortKey(
+/** Exported for `../extraction/model.ts`, which writes `document_statement`
+ * rows directly (see the storage note there) and must derive the same index
+ * fields `validateOccurrenceIndexes` checks on the way back out. */
+export function occurrenceSortKey(
   occurrence: Occurrence,
   stableIdentity: string,
 ): string | null {
@@ -1451,7 +1464,8 @@ async function findObservation(
     : undefined;
 }
 
-function occurrenceColumns(occurrence: Occurrence): {
+/** Exported alongside {@link occurrenceSortKey}, for the same reason. */
+export function occurrenceColumns(occurrence: Occurrence): {
   date: string | null;
   instant: Date | null;
 } {

@@ -200,6 +200,11 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
     name: "change feed trigger on space_members for the spaces page (UI-restyle)",
     url: new URL("../migrations/026_space_members_change_feed.sql", import.meta.url),
   },
+  {
+    version: 27,
+    name: "typed extraction: the document_extraction deferred-work kind and kith.document_extractions (ADM-5a)",
+    url: new URL("../migrations/027_document_extraction.sql", import.meta.url),
+  },
 ]);
 
 /** The version the schema reaches once every migration has been applied. */
