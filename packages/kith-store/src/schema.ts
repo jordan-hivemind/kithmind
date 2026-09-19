@@ -188,6 +188,11 @@ export const KITH_MIGRATIONS: readonly KithMigration[] = Object.freeze([
     ),
   },
   {
+    // ADM-5a. PR #294 (investments) also claims 025 and merges first; whichever
+    // lands second renumbers on rebase. It cannot be pre-renumbered to 026 on
+    // this branch: `applyKithSchema` below refuses a gap in the version chain
+    // (`schema_version_gap`), so a 24-to-26 list would fail every database test
+    // here until #294 exists in the same tree.
     version: 25,
     name: "investments: archived_at, the unique live name, the import row key, the exchange rate a non-USD amount needs and the amount sign rule (ADM-3)",
     url: new URL(

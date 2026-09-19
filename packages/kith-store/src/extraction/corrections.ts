@@ -24,7 +24,24 @@
 import type { ClientBase } from "pg";
 
 import { newKithId } from "../ids.js";
+import {
+  canonicalizeObservationValue,
+  type ObservationValue,
+} from "../records/values.js";
 import type { CorrectionReason } from "./gate.js";
+
+/** The seven `ObservationValue` discriminants, as a set. Kept beside its one
+ * caller rather than exported from `values.ts`, which states them as a union
+ * type that has no runtime form. */
+const OBSERVATION_VALUE_TYPES = new Set([
+  "decimal",
+  "money",
+  "integer",
+  "text",
+  "boolean",
+  "date",
+  "entity",
+]);
 
 export type CorrectionRow = {
   id: string;
@@ -141,6 +158,7 @@ export async function applyCorrection(
         JSON.stringify(original ?? null),
       ],
     );
+    await writeThrough(client, input);
     return existing.id;
   }
   const id = newKithId();
@@ -161,7 +179,61 @@ export async function applyCorrection(
       at,
     ],
   );
+  await writeThrough(client, input);
   return id;
+}
+
+/**
+ * Pushes the corrected value onto the observation the correction replaces, in
+ * the same transaction as the correction row.
+ *
+ * Without this the two halves of the system disagree about the same fact:
+ * `get_document` would read the correction and say 250,000 while `sum_money`
+ * and `latest_observation` kept totalling the model's 25,000, and both would
+ * cite the same span. One number, one transaction.
+ *
+ * A corrected value that is not a valid `ObservationValue` updates nothing and
+ * is not an error. The correction row still stands and the document read still
+ * prefers it; what it cannot do is enter the exact-arithmetic side of the
+ * store, where a malformed value would be worse than an un-updated one. The
+ * evidence stays as it was: the span is what the document says, and correcting
+ * a reading does not change the document.
+ */
+async function writeThrough(
+  client: ClientBase,
+  input: {
+    spaceId: string;
+    sourceItemId: string;
+    fieldName: string;
+    correctedValue: unknown;
+  },
+): Promise<number> {
+  let value: ObservationValue;
+  try {
+    // The shape check comes first and is not optional.
+    // `canonicalizeObservationValue` switches on `value.type` with no default,
+    // so a value that is not one of the seven falls out of the switch as
+    // `undefined` rather than throwing -- and `undefined` binds as SQL NULL,
+    // which would blank the observation instead of leaving it alone.
+    const candidate = input.correctedValue as { type?: unknown } | null;
+    if (
+      !candidate ||
+      typeof candidate !== "object" ||
+      !OBSERVATION_VALUE_TYPES.has(candidate.type as string)
+    ) {
+      return 0;
+    }
+    value = canonicalizeObservationValue(candidate as ObservationValue);
+  } catch {
+    return 0;
+  }
+  const updated = await client.query(
+    `UPDATE kith.observations SET value = $4
+      WHERE space_id = $1 AND source_item_id = $2
+        AND event_type = 'document_statement' AND observation_type = $3`,
+    [input.spaceId, input.sourceItemId, input.fieldName, JSON.stringify(value)],
+  );
+  return updated.rowCount ?? 0;
 }
 
 /** What the extraction currently says about one field, for the record of what

@@ -413,9 +413,11 @@ test("a failed gate opens a correction instead of storing a guess", { skip }, as
   assert.deepEqual(
     corrections.map((row) => [row.field_name, row.reason]),
     [
-      ["total", "line_items_mismatch"],
+      // The subtotal is stated, so that is what the items are compared to.
+      ["subtotal", "line_items_mismatch"],
       ["total", "money_unparsable"],
-      ["warranty", "unknown_field"],
+      // One row for every field the kind does not have, not one per name.
+      [null, "unknown_field"],
       ["vendor", "quote_not_found"],
     ].sort((left, right) => (left[1] < right[1] ? -1 : 1)),
   );
@@ -427,7 +429,12 @@ test("a failed gate opens a correction instead of storing a guess", { skip }, as
   assert.deepEqual(mismatch.original_value, {
     statedTotal: "15.5",
     itemsTotal: "10",
+    against: "subtotal",
   });
+  assert.deepEqual(
+    corrections.find((row) => row.reason === "unknown_field").original_value,
+    { fields: ["warranty"] },
+  );
 
   // Re-running on an unchanged document does not grow the queue.
   await f.extract(stubModel(reading), ingested.sourceItemId, ingested.generationId);
@@ -663,4 +670,182 @@ test("the daemon drains the queued job through the registry", { skip }, async (t
     ),
     [],
   );
+});
+
+const TAXED = [
+  "Acme Hardware",
+  "Widget",
+  "  10.00",
+  "Gadget",
+  "  20.00",
+  "Subtotal $30.00",
+  "Sales tax $2.40",
+  "Total due $32.40",
+].join("\n");
+
+test("taxed line items are compared to the subtotal, not the total", { skip }, async (t) => {
+  const f = await fixture(t);
+  await f.seed();
+  const ingested = await f.ingest(TAXED, "synthetic-taxed-1");
+  const outcome = await f.extract(
+    stubModel({
+      kind: "receipt",
+      summary: "A taxed receipt.",
+      statements: [
+        {
+          field: "line_items",
+          value: [
+            { description: "Widget", amount: "10.00" },
+            { description: "Gadget", amount: "20.00" },
+          ],
+          page: 0,
+          quote: "Widget\n  10.00\nGadget\n  20.00",
+        },
+        { field: "subtotal", value: "$30.00", page: 0, quote: "Subtotal $30.00" },
+        { field: "tax", value: "$2.40", page: 0, quote: "Sales tax $2.40" },
+        { field: "total", value: "$32.40", page: 0, quote: "Total due $32.40" },
+      ],
+    }),
+    ingested.sourceItemId,
+    ingested.generationId,
+  );
+  // Items sum to the subtotal; the total carries the tax. Comparing the items
+  // to the total was a false mismatch on every taxed receipt.
+  assert.equal(outcome.failed, 0);
+  assert.equal(outcome.stored, 5);
+  assert.equal(
+    (
+      await f.rows(
+        "SELECT id FROM kith.corrections WHERE space_id = $1 AND reason = 'line_items_mismatch'",
+        [f.spaceId],
+      )
+    ).length,
+    0,
+  );
+});
+
+test("two readings of one field store neither and open a correction", { skip }, async (t) => {
+  const f = await fixture(t);
+  await f.seed();
+  const ingested = await f.ingest();
+  const outcome = await f.extract(
+    stubModel({
+      kind: "receipt",
+      summary: "A receipt the model could not settle.",
+      statements: [
+        { field: "total", value: "$15.50", page: 0, quote: "Total due $15.50" },
+        { field: "total", value: "$15.50", page: 0, quote: "Subtotal $15.50" },
+        { field: "vendor", value: "Acme Hardware", page: 0, quote: "Acme Hardware" },
+        { field: "vendor", value: "Acme", page: 0, quote: "Acme Hardware" },
+      ],
+    }),
+    ingested.sourceItemId,
+    ingested.generationId,
+  );
+  // `total` was read twice with the same value: one observation, no item.
+  // `vendor` was read two different ways: neither is stored.
+  assert.equal(outcome.stored, 1);
+  const stored = await f.rows(
+    `SELECT observation_type FROM kith.observations
+      WHERE space_id = $1 AND event_type = 'document_statement'`,
+    [f.spaceId],
+  );
+  assert.deepEqual(
+    stored.map((row) => row.observation_type),
+    ["total"],
+  );
+  const conflict = await f.rows(
+    "SELECT field_name, original_value FROM kith.corrections WHERE space_id = $1 AND reason = 'conflicting_values'",
+    [f.spaceId],
+  );
+  assert.equal(conflict.length, 1);
+  assert.equal(conflict[0].field_name, "vendor");
+  // Both readings are on the row, so the owner can pick one.
+  assert.equal(conflict[0].original_value.length, 2);
+});
+
+test("a correction reaches query_records, not only get_document", { skip }, async (t) => {
+  const f = await fixture(t);
+  await f.seed();
+  const ingested = await f.ingest();
+  await f.extract(
+    stubModel(goodReading()),
+    ingested.sourceItemId,
+    ingested.generationId,
+  );
+  await withKithTransaction(f.pool, (client) =>
+    applyCorrection(client, {
+      spaceId: f.spaceId,
+      sourceItemId: ingested.sourceItemId,
+      fieldName: "total",
+      correctedValue: { type: "money", amount: "16.50", currency: "USD" },
+      actorUserId: f.userId,
+      reason: "the tax line was missed",
+      now: NOW + 4_000,
+    }),
+  );
+  // The observation carries the corrected value, so the exact-arithmetic side
+  // of the store agrees with the document read instead of contradicting it.
+  // The placeholder entity is minted by the extraction, so it is read now
+  // rather than at ingest.
+  const entityId = (
+    await f.rows(
+      "SELECT id FROM kith.entities WHERE space_id = $1 AND key = 'other:document'",
+      [f.spaceId],
+    )
+  )[0].id;
+  const latest = await withKithTransaction(f.pool, (client) =>
+    executeRecordQuery(
+      { client, now: NOW + 5_000 },
+      {
+        principal: {
+          userId: f.userId,
+          credentialId: f.principal.credentialId,
+        },
+        query: {
+          operation: "latest_observation",
+          spaceId: f.spaceId,
+          entityId,
+          observationType: "total",
+        },
+      },
+    ),
+  );
+  assert.equal(latest.status, "match");
+  assert.deepEqual(latest.candidates[0].value, {
+    type: "money",
+    amount: "16.5",
+    currency: "USD",
+  });
+  const document = await getDocument(f.client, [f.spaceId], ingested.documentId);
+  const total = document.extraction.statements.find(
+    (statement) => statement.field === "total",
+  );
+  assert.deepEqual(total.value, {
+    type: "money",
+    amount: "16.50",
+    currency: "USD",
+  });
+  // A corrected value that is not an observation value leaves the observation
+  // alone rather than writing something the exact side cannot read.
+  await withKithTransaction(f.pool, (client) =>
+    applyCorrection(client, {
+      spaceId: f.spaceId,
+      sourceItemId: ingested.sourceItemId,
+      fieldName: "total",
+      correctedValue: "sixteen fifty",
+      actorUserId: f.userId,
+      now: NOW + 6_000,
+    }),
+  );
+  const unchanged = await f.rows(
+    `SELECT value FROM kith.observations
+      WHERE space_id = $1 AND observation_type = 'total'`,
+    [f.spaceId],
+  );
+  assert.deepEqual(unchanged[0].value, {
+    type: "money",
+    amount: "16.5",
+    currency: "USD",
+  });
 });

@@ -58,6 +58,7 @@ import { openCorrection, resolvedCorrections } from "./corrections.js";
 import { seedDocumentTypes } from "./seed.js";
 import {
   checkValue,
+  isObservationFieldName,
   itemsSumToTotal,
   normalizeForMatch,
   type CorrectionReason,
@@ -409,7 +410,7 @@ type Prepared = {
     evidence: string[];
   }>;
   failures: Array<{
-    field: string;
+    field: string | null;
     reason: CorrectionReason;
     reading: unknown;
   }>;
@@ -440,15 +441,17 @@ async function findOrCreateSpan(
     )
   ).rows[0];
   if (existing) return existing.id;
-  const used = (
-    await client.query<{ ordinal: string }>(
-      `SELECT ordinal FROM kith.evidence_spans WHERE source_page_id = $1
-        LIMIT 512`,
+  // One aggregate rather than a scan of the page's spans: the ordinal only has
+  // to be free, not the smallest free one, and a page whose spans outgrew a
+  // scan bound would otherwise start reusing ordinal 0.
+  const next = (
+    await client.query<{ next: string }>(
+      `SELECT COALESCE(max(ordinal), -1) + 1 AS next FROM kith.evidence_spans
+        WHERE source_page_id = $1`,
       [page.id],
     )
-  ).rows.map((row) => Number(row.ordinal));
-  let ordinal = 0;
-  while (used.includes(ordinal)) ordinal += 1;
+  ).rows[0];
+  const ordinal = Number(next?.next ?? 0);
   const id = newKithId();
   // `card_extraction_fingerprints` stays null on purpose: a null marks a span
   // that `sweepCardEvidenceSpans` must never collect, and these spans are
@@ -491,21 +494,34 @@ async function prepare(
   };
   const fields = new Map(type ? type.fields.map((f) => [f.name, f]) : []);
   const pages = new Map(loaded.pages.map((page) => [page.ordinal, page]));
-  const ordinals = new Map<string, number>();
-  const itemTotals = new Map<string, string>();
-  const moneyByField = new Map<string, string>();
+  const unknownFields: string[] = [];
+
+  // Pass one: gate every statement. Nothing is materialised yet, because
+  // whether a reading may be stored depends on what the *other* statements
+  // said about the same field, and that is not known until the loop ends.
+  type Accepted = {
+    field: TypeField;
+    page: number;
+    quote: string;
+    spanId: string;
+    values: ObservationValue[];
+    itemsTotal?: string;
+    currencyAssumed?: true;
+  };
+  const accepted: Accepted[] = [];
 
   for (const statement of reading.statements.slice(
     0,
     MAX_EXTRACTION_STATEMENTS,
   )) {
     const field = fields.get(statement.field);
-    if (!field) {
-      prepared.failures.push({
-        field: statement.field || "(unnamed)",
-        reason: "unknown_field",
-        reading: statement.value,
-      });
+    // A field the type does not have, or one whose name could never be an
+    // observation type. Both are the same thing to the owner -- the model
+    // named something this kind cannot hold -- so they share a reason and,
+    // below, a single correction row.
+    if (!field || !isObservationFieldName(field.name)) {
+      const named = (field?.name ?? statement.field) || "(unnamed)";
+      if (!unknownFields.includes(named)) unknownFields.push(named);
       continue;
     }
     const page = pages.get(statement.page);
@@ -550,56 +566,127 @@ async function prepare(
       });
       continue;
     }
-    const keys: string[] = [];
-    for (const value of gated.values) {
-      const index = ordinals.get(field.name) ?? 0;
-      ordinals.set(field.name, index + 1);
-      const key =
-        gated.values.length > 1 || index > 0
-          ? `${field.name}:${index}`
-          : field.name;
-      keys.push(key);
-      prepared.observations.push({
-        key,
-        type: field.name,
-        value,
-        evidence: [spanId],
-      });
-      if (value.type === "money" && !moneyByField.has(field.name)) {
-        moneyByField.set(field.name, value.amount);
-      }
-      if (
-        value.type === "date" &&
-        prepared.occurrence.precision === "unknown"
-      ) {
-        prepared.occurrence = { precision: "date", date: value.value };
-      }
-    }
-    if (gated.itemsTotal !== undefined) {
-      itemTotals.set(field.name, gated.itemsTotal);
-    }
-    prepared.statements.push({
-      field: field.name,
-      valueType: field.valueType,
+    accepted.push({
+      field,
       page: statement.page,
       quote: statement.quote,
-      observationKeys: keys,
-      evidenceSpanId: spanId,
+      spanId,
+      values: gated.values,
+      ...(gated.itemsTotal === undefined
+        ? {}
+        : { itemsTotal: gated.itemsTotal }),
       ...(gated.currencyAssumed ? { currencyAssumed: true as const } : {}),
     });
   }
 
-  // `sums_to_total`, the one check that spans two fields. Zero tolerance: the
-  // items are kept and the total opens a correction, which is what "keep the
-  // items and open a correction item on the total" means.
-  for (const [, itemsTotal] of itemTotals) {
-    const stated = moneyByField.get("total") ?? moneyByField.get("subtotal");
-    if (stated === undefined) continue;
-    if (!itemsSumToTotal(itemsTotal, stated)) {
+  if (unknownFields.length > 0) {
+    // One row for the whole document, not one per name: this is a sign the
+    // kind is wrong or the guidance is stale, and it is one thing for the
+    // owner to look at, not fifteen.
+    prepared.failures.push({
+      field: null,
+      reason: "unknown_field",
+      reading: { fields: unknownFields.slice(0, 64) },
+    });
+  }
+
+  // Pass two: one observation per field per document.
+  //
+  // Two statements naming the same field with the same value are one reading
+  // said twice, and the second is dropped. Two statements naming it with
+  // *different* values are a document the model did not understand, and
+  // neither value is stored: picking one would be a coin flip presented as a
+  // cited fact. The owner gets a correction and both readings.
+  const byField = new Map<string, Accepted[]>();
+  for (const entry of accepted) {
+    const group = byField.get(entry.field.name);
+    if (group) group.push(entry);
+    else byField.set(entry.field.name, [entry]);
+  }
+
+  const keep: Accepted[] = [];
+  for (const [name, group] of byField) {
+    const first = group[0]!;
+    const shape = JSON.stringify(first.values);
+    const disagreeing = group.filter(
+      (entry) => JSON.stringify(entry.values) !== shape,
+    );
+    if (disagreeing.length > 0) {
       prepared.failures.push({
-        field: "total",
+        field: name,
+        reason: "conflicting_values",
+        reading: group.map((entry) => ({
+          value: entry.values,
+          page: entry.page,
+          quote: entry.quote,
+        })),
+      });
+      continue;
+    }
+    keep.push(first);
+  }
+
+  // Pass three: materialise, in the order the model gave them, so the stored
+  // statements read down the document rather than by field name.
+  const kept = new Set(keep);
+  const moneyByField = new Map<string, string>();
+  const itemTotals = new Map<string, { total: string; check: string | null }>();
+  for (const entry of accepted) {
+    if (!kept.has(entry)) continue;
+    kept.delete(entry);
+    const name = entry.field.name;
+    const keys: string[] = [];
+    entry.values.forEach((value, index) => {
+      const key = entry.values.length > 1 ? `${name}:${index}` : name;
+      keys.push(key);
+      prepared.observations.push({
+        key,
+        type: name,
+        value,
+        evidence: [entry.spanId],
+      });
+      if (value.type === "money" && !moneyByField.has(name)) {
+        moneyByField.set(name, value.amount);
+      }
+      if (value.type === "date" && prepared.occurrence.precision === "unknown") {
+        prepared.occurrence = { precision: "date", date: value.value };
+      }
+    });
+    if (entry.itemsTotal !== undefined) {
+      itemTotals.set(name, { total: entry.itemsTotal, check: entry.field.check });
+    }
+    prepared.statements.push({
+      field: name,
+      valueType: entry.field.valueType,
+      page: entry.page,
+      quote: entry.quote,
+      observationKeys: keys,
+      evidenceSpanId: entry.spanId,
+      ...(entry.currencyAssumed ? { currencyAssumed: true as const } : {}),
+    });
+  }
+
+  // `sums_to_total`, the one check that spans two fields.
+  //
+  // Driven by the field's own declared check, not by a field called
+  // `line_items`, because the check is data like everything else here. The
+  // comparison is against the subtotal when the document states one and the
+  // total otherwise: on a taxed receipt the items sum to the subtotal and the
+  // total carries the tax, so comparing to the total was a false mismatch on
+  // every receipt with sales tax on it.
+  //
+  // Zero tolerance. The items are kept and the compared field opens the
+  // correction.
+  for (const [, items] of itemTotals) {
+    if (items.check !== "sums_to_total") continue;
+    const against = moneyByField.has("subtotal") ? "subtotal" : "total";
+    const stated = moneyByField.get(against);
+    if (stated === undefined) continue;
+    if (!itemsSumToTotal(items.total, stated)) {
+      prepared.failures.push({
+        field: against,
         reason: "line_items_mismatch",
-        reading: { statedTotal: stated, itemsTotal },
+        reading: { statedTotal: stated, itemsTotal: items.total, against },
       });
     }
   }
@@ -830,7 +917,7 @@ async function store(
     loaded.sourceItemId,
   );
   for (const failure of prepared.failures) {
-    if (corrected.has(failure.field)) continue;
+    if (failure.field !== null && corrected.has(failure.field)) continue;
     await openCorrection(client, {
       spaceId: loaded.spaceId,
       sourceItemId: loaded.sourceItemId,
