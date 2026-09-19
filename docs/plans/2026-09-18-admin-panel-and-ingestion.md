@@ -237,7 +237,29 @@ in the map is `citation_page_unknown` and nothing is shifted to make it fit.
 
 A line longer than 240 characters is split into citable pieces at whitespace,
 with exact offsets, so a 2,000-character line does not become one citation
-holding dozens of numbers.
+holding dozens of numbers. No cut falls inside a number or a date: a cut that
+would land in one moves to the token's edge, taking a leading `(` or currency
+symbol and a trailing `)` or `CR` with it, and the bound softens by up to 64
+characters rather than divide a value. A dot leader is filler, not a number,
+so an invoice line still splits. A single token wider than the allowance
+leaves its line whole.
+
+**Cited lines need not be adjacent.** A column receipt prints its labels in
+one block and its amounts in another, so the only honest citation of a total
+is two lines several apart. The value is checked against each cited line on
+its own, never against the lines between them, so an unrelated amount in
+between can never support a value. A value must sit entirely inside one cited
+line; only a text field may span two adjacent cited ones, and only a text
+field is matched case- and punctuation-folded. Money, numbers and dates keep
+their exact reading.
+
+Every stored statement and every gate correction records what it cited: shown
+page, page ordinal, line ids, the page's line count and whether the ids are
+contiguous. `kith-extraction-diagnose [--kind k] [--limit N]` reads those back
+and reports, per failure, whether the value occurs on the cited page and on
+which line ids, whether it occurs on another page, and the character-class
+signature of the value. Its output is integers, booleans, enum reasons and
+field names only: operators debug extraction without reading the documents.
 
 | Knob | Where | Effect |
 | --- | --- | --- |

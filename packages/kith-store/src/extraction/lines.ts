@@ -41,10 +41,10 @@ export type PageLine = {
   text: string;
 };
 
-/** How many lines one citation may cover between its lowest and highest id.
- * Three ids are allowed; a label and its amount two lines apart is ordinary,
- * a citation spanning half a page is not a citation. */
-export const MAX_CITATION_SPAN = 4;
+/** How many lines one citation may name. A label, its amount and one more is
+ * as much as a single value ever needs; beyond that it is a region, not a
+ * citation. */
+export const MAX_CITED_LINES = 3;
 
 /**
  * How long a citable unit may be before it is split.
@@ -97,32 +97,126 @@ export function pageLines(text: string): PageLine[] {
   return lines;
 }
 
-/** One physical line as one or more citable pieces, cut at whitespace when it
- * is longer than {@link MAX_LINE_CHARS}. Pieces are contiguous and cover the
- * line exactly, so nothing is lost and no offset moves. */
+/** How far past the bound a piece may run rather than cut a token in half.
+ * A cut inside a number is not a smaller piece, it is a different number. */
+const MAX_LINE_OVERFLOW = 64;
+
+/** The characters a number or a date is made of. A cut with one of these on
+ * both sides is a cut through the middle of a value. */
+const TOKEN_CHAR = /[0-9.,:/'-]/;
+
+/** What may stand immediately before a number and belong to it. Separating
+ * `(` from its digits turns a credit into a charge. */
+const OPENERS = new Set(["(", "$", "\u20ac", "\u00a3", "\u00a5", "\u20b9", "\u20a9", "+", "-"]);
+
+/**
+ * Positions covered by filler rather than by a value.
+ *
+ * A dot leader (`Consulting services .......... 1,234.56`) is made of the same
+ * characters a number is, so without this every leader would read as one
+ * enormous token and no line with one could ever be split. Three or more
+ * identical punctuation characters in a row are a rule, not a number.
+ */
+function fillerPositions(text: string, from: number, to: number): Set<number> {
+  const filler = new Set<number>();
+  let runStart = from;
+  for (let at = from + 1; at <= to; at += 1) {
+    if (at === to || text[at] !== text[runStart]) {
+      const unit = text[runStart]!;
+      if (at - runStart >= 3 && /[^\w\s]/.test(unit)) {
+        for (let index = runStart; index < at; index += 1) filler.add(index);
+      }
+      runStart = at;
+    }
+  }
+  return filler;
+}
+
+/**
+ * One physical line as one or more citable pieces, cut at whitespace when it
+ * is longer than {@link MAX_LINE_CHARS}.
+ *
+ * Pieces are contiguous and cover the line exactly, so nothing is lost and no
+ * offset moves. **And no cut falls inside a number or a date.** The first
+ * version of this cut at the bound whenever the lookback found no space, which
+ * split `1,234.56` into `1,` and `234.56` -- and the second piece is then
+ * shown to the model as a line of its own, cited in good faith, and stored as
+ * 234.56 with a valid span on a document that says 1,234.56. A fabricated
+ * value with a real citation is the one outcome this whole gate exists to
+ * prevent, and it shipped.
+ *
+ * So a cut that would land inside a token walks forward past the whole token,
+ * including a closing parenthesis or a trailing `CR`. The bound softens by up
+ * to {@link MAX_LINE_OVERFLOW}; a single token longer than that leaves the
+ * line unsplit, because one long citation is a weak check and a wrong number
+ * is a wrong number.
+ */
 function splitLongLine(
   text: string,
   start: number,
   end: number,
 ): Array<{ start: number; end: number }> {
   if (end - start <= MAX_LINE_CHARS) return [{ start, end }];
+  const filler = fillerPositions(text, start, end);
+  const tokenAt = (at: number): boolean =>
+    at >= start && at < end && TOKEN_CHAR.test(text[at]!) && !filler.has(at);
+
+  /** Whether a cut here would separate a value from part of itself. */
+  const insideToken = (cut: number): boolean => {
+    if (cut <= start || cut >= end) return false;
+    const before = text[cut - 1]!;
+    if (tokenAt(cut - 1) && tokenAt(cut)) return true;
+    if (OPENERS.has(before) && tokenAt(cut)) return true;
+    if (tokenAt(cut - 1) && text[cut] === ")") return true;
+    return false;
+  };
+
+  /** The first cut at or after this one that is not inside a token. */
+  const clear = (cut: number): number => {
+    let at = cut;
+    while (at < end && insideToken(at)) at += 1;
+    // A trailing `CR` belongs to the amount before it: leaving it behind
+    // turns a credit into a charge just as a lost parenthesis does.
+    if (at < end && (tokenAt(at - 1) || text[at - 1] === ")")) {
+      const trailing = /^(\s*)CR(?![A-Za-z])/i.exec(text.slice(at, at + 5));
+      if (trailing) at += trailing[0].length;
+    }
+    return at;
+  };
+
   const pieces: Array<{ start: number; end: number }> = [];
   let at = start;
   while (end - at > MAX_LINE_CHARS) {
     const bound = at + MAX_LINE_CHARS;
     let cut = -1;
-    for (let probe = bound; probe > bound - SPLIT_LOOKBACK && probe > at; probe -= 1) {
+    for (
+      let probe = bound;
+      probe > bound - SPLIT_LOOKBACK && probe > at;
+      probe -= 1
+    ) {
       if (/\s/.test(text[probe - 1]!)) {
         cut = probe;
         break;
       }
     }
     if (cut <= at) cut = bound;
+    if (insideToken(cut)) {
+      // Backwards first: the start of the token is a cut that splits nothing
+      // and keeps the piece under the bound. Forwards only when the token
+      // begins at or before where this piece does.
+      let back = cut;
+      while (back > at && insideToken(back)) back -= 1;
+      cut = back > at ? back : clear(cut);
+    }
+    // One token wider than the allowance: leave the line whole rather than
+    // cut it somewhere that changes what it says.
+    if (cut > bound + MAX_LINE_OVERFLOW) return [{ start, end }];
+    if (cut <= at || cut >= end) break;
     pieces.push({ start: at, end: cut });
     at = cut;
   }
   if (at < end) pieces.push({ start: at, end });
-  return pieces;
+  return pieces.length > 0 ? pieces : [{ start, end }];
 }
 
 /** How the page is shown to the model: one line per line, its id in front. */
@@ -136,41 +230,41 @@ export function numberedPage(lines: readonly PageLine[]): string {
 export type CitationRange = { start: number; end: number };
 
 /**
- * The offsets one citation covers, or null when it cites nothing real.
+ * The lines one citation names, in id order, or null when it names something
+ * the page does not have.
  *
- * The range runs from the first character of the lowest cited line to the last
- * of the highest, so two ids that are not adjacent take the line between them
- * with them. That is deliberate: an evidence span is one contiguous range of
- * the sealed text, and a citation that skipped a line would either need two
- * spans or a quote that does not appear on the page -- which is the thing this
- * whole file exists to stop.
+ * **Not contiguous.** The first version of this required the ids to be
+ * adjacent, because the quote was built as the range covering them and a
+ * non-adjacent pair silently dragged in the lines between -- on a receipt,
+ * another item's amount, which is enough to satisfy a check the citation did
+ * not support. Requiring adjacency closed that hole and opened a bigger one:
+ * a column receipt prints "Subtotal / Tax / Total" on lines 8 to 10 and their
+ * amounts on 15 to 17, so the only honest citation of a total is two lines
+ * seven apart. Every money field on the owner's receipt failed as
+ * `citation_out_of_range`.
+ *
+ * The rule that keeps both: cite up to three lines wherever they are, and
+ * check the value against **each cited line on its own**. A line between two
+ * cited ones is never part of the text a value is checked against, so it can
+ * never support anything; the reviewer's property holds without adjacency.
+ * The caller owns that half -- see `candidatesFor` in `./gate.ts`.
  */
-export function citationRange(
+export function citedLines(
   lines: readonly PageLine[],
   ids: readonly number[],
-): CitationRange | null {
+): PageLine[] | null {
   if (ids.length === 0 || ids.length > 3) return null;
-  const unique = new Set<number>();
-  let lowest = Number.POSITIVE_INFINITY;
-  let highest = Number.NEGATIVE_INFINITY;
+  const seen = new Set<number>();
   for (const id of ids) {
     if (!Number.isInteger(id) || id < 1 || id > lines.length) return null;
-    unique.add(id);
-    if (id < lowest) lowest = id;
-    if (id > highest) highest = id;
+    seen.add(id);
   }
-  if (highest - lowest + 1 > MAX_CITATION_SPAN) return null;
-  // Contiguous, or it is not a citation.
-  //
-  // The range covers everything between the lowest and highest id, so lines
-  // [2, 5] would hand the value gates lines 3 and 4 as well -- and a receipt's
-  // line 3 holds a different item's amount, which is enough to satisfy a check
-  // the cited lines do not. Requiring the ids to be adjacent makes the quote
-  // exactly what was cited. A model that means two separate places says so in
-  // two statements.
-  if (highest - lowest + 1 !== unique.size) return null;
-  const first = lines[lowest - 1]!;
-  const last = lines[highest - 1]!;
-  if (last.end <= first.start) return null;
-  return { start: first.start, end: last.end };
+  return [...seen].sort((left, right) => left - right).map((id) => lines[id - 1]!);
+}
+
+/** Whether the ids run consecutively. Reported by the diagnostic, not enforced. */
+export function areContiguous(ids: readonly number[]): boolean {
+  const unique = [...new Set(ids)].sort((left, right) => left - right);
+  if (unique.length === 0) return false;
+  return unique[unique.length - 1]! - unique[0]! + 1 === unique.length;
 }
