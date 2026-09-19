@@ -12,6 +12,7 @@ import { type ColumnDef } from "@tanstack/react-table";
 import { useMemo } from "react";
 
 import { useAdminScreen } from "@/components/admin/admin-query";
+import { TRUNCATED_DETAIL } from "@/components/admin/institutions-table";
 import { DataTable, Detail, Tag } from "@/components/ui/data-table";
 
 type Area = admin.AreaCoverageRow;
@@ -42,7 +43,11 @@ function number(value: number) {
   return <span className="tabular-nums">{value}</span>;
 }
 
-export function CoverageTable({ initial }: { initial: { areas: Area[] } }) {
+export function CoverageTable({
+  initial,
+}: {
+  initial: { areas: Area[]; truncated: boolean };
+}) {
   const data = useAdminScreen("coverage", WATCHED, initial);
 
   const columns = useMemo<ColumnDef<Area, unknown>[]>(
@@ -102,13 +107,24 @@ export function CoverageTable({ initial }: { initial: { areas: Area[] } }) {
   );
 
   return (
-    <DataTable
-      data={data.areas}
-      columns={columns}
-      filterColumns={["status"]}
-      searchPlaceholder="Search areas"
-      empty="No areas"
-    />
+    <div className="flex flex-col gap-2">
+      {/* The brokerage row's archive contribution is short when the inventory
+          read stopped at its page bound, so the totals below understate it. */}
+      {data.truncated ? (
+        <div>
+          <Tag tone="warn" title={TRUNCATED_DETAIL}>
+            partial
+          </Tag>
+        </div>
+      ) : null}
+      <DataTable
+        data={data.areas}
+        columns={columns}
+        filterColumns={["status"]}
+        searchPlaceholder="Search areas"
+        empty="No areas"
+      />
+    </div>
   );
 }
 

@@ -72,10 +72,17 @@ export function worstStatus(statuses: readonly HealthStatus[]): HealthStatus {
   return worst;
 }
 
-/** `{ a: 2, b: 1 }` as `a 2, b 1`, biggest first. Empty string for none. */
-export function countsLine(counts: Readonly<Record<string, number>>): string {
+/**
+ * `{ a: 2, b: 1 }` as `a 2, b 1`, biggest first. Empty string for none.
+ *
+ * The value is optional because `NotReadyReasons` is a `Partial` record: a
+ * key present with no count is dropped the same way a zero is.
+ */
+export function countsLine(
+  counts: Readonly<Record<string, number | undefined>>,
+): string {
   return Object.entries(counts)
-    .filter(([, count]) => count > 0)
+    .filter((entry): entry is [string, number] => (entry[1] ?? 0) > 0)
     .sort(([leftName, left], [rightName, right]) =>
       right - left || leftName.localeCompare(rightName),
     )

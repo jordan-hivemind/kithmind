@@ -35,6 +35,10 @@ const EMPTY: Record<InstitutionsPageData["state"], string> = {
   unavailable: "Finance archive unavailable",
 };
 
+/** The one place the partial-read tooltip's wording lives. */
+export const TRUNCATED_DETAIL =
+  "The archive holds more accounts than this read followed. Rows below are a prefix, not the whole inventory.";
+
 function number(value: number | null) {
   return value === null ? null : (
     <span className="tabular-nums">{value}</span>
@@ -132,18 +136,29 @@ export function InstitutionsTable({
   );
 
   return (
-    <DataTable
-      data={data.institutions}
-      columns={columns}
-      getSubRows={(row) => row.children}
-      filterColumns={["status"]}
-      initialSorting={[{ id: "name", desc: false }]}
-      searchPlaceholder="Search institutions"
-      empty={
-        data.state === "unavailable" && data.reason !== null
-          ? `${EMPTY.unavailable}: ${data.reason}`
-          : EMPTY[data.state]
-      }
-    />
+    <div className="flex flex-col gap-2">
+      {/* A short read says so. A table quietly missing accounts is the exact
+          failure an inventory screen exists to prevent. */}
+      {data.truncated ? (
+        <div>
+          <Tag tone="warn" title={TRUNCATED_DETAIL}>
+            partial
+          </Tag>
+        </div>
+      ) : null}
+      <DataTable
+        data={data.institutions}
+        columns={columns}
+        getSubRows={(row) => row.children}
+        filterColumns={["status"]}
+        initialSorting={[{ id: "name", desc: false }]}
+        searchPlaceholder="Search institutions"
+        empty={
+          data.state === "unavailable" && data.reason !== null
+            ? `${EMPTY.unavailable}: ${data.reason}`
+            : EMPTY[data.state]
+        }
+      />
+    </div>
   );
 }

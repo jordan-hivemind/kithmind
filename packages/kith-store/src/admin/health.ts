@@ -14,6 +14,10 @@
 import type { Principal } from "../identity/authorization.js";
 import { type IdentityCtx, rows } from "../identity/db.js";
 import { spacePredicate } from "../spaces.js";
+import {
+  type NotReadyReasons,
+  readNotReadyReasons,
+} from "../workers/notReady.js";
 import { getAdminSpaceIds } from "./model.js";
 
 /** Enough sources to describe; past this the tooltip is a wall rather than a
@@ -33,7 +37,7 @@ export type WatcherFact = {
   assessmentState: string | null;
   assessmentAt: number | null;
   /** The diagnostic tally `workers/notReady.ts` stores in `counts`. */
-  notReadyReasons: Record<string, number>;
+  notReadyReasons: NotReadyReasons;
 };
 
 export type IndexFact = {
@@ -80,19 +84,23 @@ function epoch(value: Date | null): number | null {
   return value === null ? null : value.getTime();
 }
 
-/** The `notReadyReasons` tally, or an empty one for anything else in `counts`. */
-function notReadyReasons(counts: unknown): Record<string, number> {
-  if (counts === null || typeof counts !== "object") return {};
-  const tally = (counts as Record<string, unknown>).notReadyReasons;
-  if (tally === null || typeof tally !== "object") return {};
-  const result: Record<string, number> = {};
-  for (const [reason, value] of Object.entries(
-    tally as Record<string, unknown>,
-  )) {
-    const count = Number(value);
-    if (Number.isFinite(count) && count > 0) result[reason] = count;
-  }
-  return result;
+/**
+ * The `notReadyReasons` tally out of an assessment's `counts` column.
+ *
+ * `readNotReadyReasons` is `workers/notReady.ts`'s own reader and the one this
+ * goes through, rather than a second pass over the same jsonb: it keeps only
+ * closed-enum keys (`isNotReadyReason`) with safe integer counts, and caps
+ * them. That filter is what makes the tooltip safe to render -- a stale or
+ * hand-edited row cannot put an arbitrary string on the screen, which matters
+ * because the module's own rule is that a reason is a fixed literal and never
+ * a row value.
+ */
+function assessmentReasons(counts: unknown): NotReadyReasons {
+  return readNotReadyReasons(
+    counts === null || typeof counts !== "object" || Array.isArray(counts)
+      ? null
+      : (counts as Record<string, unknown>),
+  );
 }
 
 type WatcherDbRow = {
@@ -225,7 +233,7 @@ export async function readHealthFacts(
       nextExpectedAt: epoch(record.next_expected_at),
       assessmentState: record.assessment_state,
       assessmentAt: epoch(record.assessment_at),
-      notReadyReasons: notReadyReasons(record.counts),
+      notReadyReasons: assessmentReasons(record.counts),
     })),
     index: {
       eligible: number(counts.eligible),

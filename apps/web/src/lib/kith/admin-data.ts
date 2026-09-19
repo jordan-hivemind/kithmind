@@ -44,7 +44,20 @@ const MAX_ARCHIVE_PAGES = 5;
 export type ArchiveInventory =
   | { state: "not_configured" }
   | { state: "unavailable"; reason: string }
-  | { state: "read"; records: FinanceAccountInventoryRecord[] };
+  | {
+      state: "read";
+      records: FinanceAccountInventoryRecord[];
+      /**
+       * The archive had more accounts than `MAX_ARCHIVE_PAGES` pages carry and
+       * the rest were not read.
+       *
+       * Carried rather than swallowed: a screen showing 500 of 700 accounts
+       * with no sign of the other 200 is the exact failure the inventory
+       * exists to prevent, and a coverage total quietly short by 200 accounts
+       * is worse than one labelled partial.
+       */
+      truncated: boolean;
+    };
 
 async function readAccountInventory(
   archive: FinanceArchiveAccess,
@@ -60,6 +73,7 @@ async function readAccountInventory(
   };
   const records: FinanceAccountInventoryRecord[] = [];
   let cursor: string | undefined;
+  let truncated = false;
   try {
     for (let page = 0; page < MAX_ARCHIVE_PAGES; page += 1) {
       const response = await readFinanceArchive(
@@ -77,6 +91,9 @@ async function readAccountInventory(
       records.push(...response.items);
       if (response.nextCursor === undefined) break;
       cursor = response.nextCursor;
+      // The page bound was reached with a cursor still in hand: there is more
+      // and this read stops here.
+      truncated = page === MAX_ARCHIVE_PAGES - 1;
     }
   } catch (error: unknown) {
     // An archive that cannot be reached says so, for the reason the MCP
@@ -88,7 +105,7 @@ async function readAccountInventory(
         error instanceof FinanceContractError ? error.code : "unavailable",
     };
   }
-  return { state: "read", records };
+  return { state: "read", records, truncated };
 }
 
 /**
@@ -182,6 +199,8 @@ export type InstitutionsPageData = {
   /** What the screen says when there is nothing to group. */
   state: ArchiveInventory["state"];
   reason: string | null;
+  /** More accounts exist than this read followed; the table says so. */
+  truncated: boolean;
 };
 
 export async function loadInstitutions(
@@ -204,6 +223,7 @@ export async function loadInstitutions(
         : [],
     state: inventory.state,
     reason: inventory.state === "unavailable" ? inventory.reason : null,
+    truncated: inventory.state === "read" && inventory.truncated,
   };
 }
 
@@ -211,7 +231,11 @@ export async function loadInstitutions(
 // Screen 4: Coverage
 // ---------------------------------------------------------------------------
 
-export type CoveragePageData = { areas: admin.AreaCoverageRow[] };
+export type CoveragePageData = {
+  areas: admin.AreaCoverageRow[];
+  /** The archive contribution is short: more accounts exist than were read. */
+  truncated: boolean;
+};
 
 export async function loadCoverage(
   cookieHeader: string | null,
@@ -231,6 +255,7 @@ export async function loadCoverage(
       loaded.areas,
       inventory.state === "read" ? financeContribution(inventory.records) : null,
     ),
+    truncated: inventory.state === "read" && inventory.truncated,
   };
 }
 
