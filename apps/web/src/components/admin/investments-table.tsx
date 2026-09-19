@@ -407,6 +407,7 @@ export function InvestmentsTable({
         accessorFn: (row) =>
           row.kind === "investment" ? (row.signedOn ?? "") : row.amount,
         header: "Signed",
+        meta: { nowrap: true },
         cell: ({ row }) =>
           row.original.kind === "investment" ? (
             <span className="tabular-nums text-gray-600">
@@ -421,6 +422,7 @@ export function InvestmentsTable({
       {
         id: "committed",
         header: "Committed",
+        meta: { nowrap: true },
         accessorFn: (row) =>
           row.kind === "investment" ? row.totals.usd.committed : "",
         cell: ({ row }) =>
@@ -440,6 +442,7 @@ export function InvestmentsTable({
       {
         id: "sent",
         header: "Sent",
+        meta: { nowrap: true },
         accessorFn: (row) =>
           row.kind === "investment" ? row.totals.usd.sent : "",
         cell: ({ row }) =>
@@ -457,6 +460,7 @@ export function InvestmentsTable({
       {
         id: "outstanding",
         header: "Outstanding",
+        meta: { nowrap: true },
         accessorFn: (row) =>
           row.kind === "investment" ? row.totals.usd.outstanding : "",
         cell: ({ row }) => {
@@ -483,6 +487,7 @@ export function InvestmentsTable({
       {
         id: "received",
         header: "Received",
+        meta: { nowrap: true },
         accessorFn: (row) =>
           row.kind === "investment" ? row.totals.usd.received : "",
         cell: ({ row }) =>
@@ -493,6 +498,7 @@ export function InvestmentsTable({
       {
         id: "documents",
         header: "Docs",
+        meta: { nowrap: true },
         accessorFn: (row) =>
           row.kind === "investment" ? row.documentCount : (row.documentId ?? ""),
         cell: ({ row }) =>
@@ -530,38 +536,43 @@ export function InvestmentsTable({
     [],
   );
 
+  // Shared by the kebab's Edit item and clicking the row: opening the same
+  // drawer either way is the point of making the row itself a target.
+  const openEdit = useCallback((row: Row) => {
+    if (row.kind === "investment") {
+      setEditingInvestmentId(row.id);
+      setInvestmentDraft({
+        name: row.name,
+        category: row.category ?? "",
+        signedOn: row.signedOn ?? "",
+        status: row.status,
+        notes: row.notes ?? "",
+      });
+    } else {
+      setEditingEntryId(row.id);
+      setEntryDraft({
+        investmentId: row.investmentId,
+        entryType: row.entryType,
+        entryDate: row.entryDate,
+        amount: row.amount,
+        currency: row.currency,
+        exchangeRate: row.exchangeRate ?? "",
+        note: row.note ?? "",
+        documentId: row.documentId,
+      });
+    }
+  }, []);
+
   const actions = useMemo<RowAction<Row>[]>(
     () => [
       {
         label: "Edit",
-        onSelect: (row) => {
-          if (row.kind === "investment") {
-            setEditingInvestmentId(row.id);
-            setInvestmentDraft({
-              name: row.name,
-              category: row.category ?? "",
-              signedOn: row.signedOn ?? "",
-              status: row.status,
-              notes: row.notes ?? "",
-            });
-          } else {
-            setEditingEntryId(row.id);
-            setEntryDraft({
-              investmentId: row.investmentId,
-              entryType: row.entryType,
-              entryDate: row.entryDate,
-              amount: row.amount,
-              currency: row.currency,
-              exchangeRate: row.exchangeRate ?? "",
-              note: row.note ?? "",
-              documentId: row.documentId,
-            });
-          }
-        },
+        onSelect: openEdit,
       },
       {
         label: "Archive",
         hidden: (row) => row.kind !== "investment",
+        danger: true,
         onSelect: (row) => {
           if (row.kind !== "investment") return;
           void optimistic.mutateAsync({
@@ -578,6 +589,7 @@ export function InvestmentsTable({
       {
         label: "Delete",
         hidden: (row) => row.kind !== "entry",
+        danger: true,
         onSelect: (row) => {
           if (row.kind !== "entry") return;
           void optimistic.mutateAsync({
@@ -595,7 +607,7 @@ export function InvestmentsTable({
         },
       },
     ],
-    [optimistic, patchEntries, queryClient],
+    [openEdit, optimistic, patchEntries, queryClient],
   );
 
   return (
@@ -643,6 +655,7 @@ export function InvestmentsTable({
       </div>
 
       <DataTable
+        id="admin-investments"
         data={rows}
         columns={columns}
         getSubRows={(row) =>
@@ -662,6 +675,7 @@ export function InvestmentsTable({
         filterColumns={["category", "status", "hasDocuments"]}
         initialSorting={[{ id: "name", desc: false }]}
         actions={actions}
+        onRowClick={openEdit}
         searchPlaceholder="Search investments"
         empty="No investments"
       />

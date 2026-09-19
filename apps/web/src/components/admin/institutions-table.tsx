@@ -80,42 +80,49 @@ export function InstitutionsTable({
         id: "accounts",
         accessorKey: "accounts",
         header: "Accounts",
+        meta: { nowrap: true },
         cell: ({ row }) => number(row.original.accounts),
       },
       {
         id: "statements",
         accessorKey: "statements",
         header: "Statements",
+        meta: { nowrap: true },
         cell: ({ row }) => number(row.original.statements),
       },
       {
         id: "records",
         accessorKey: "records",
         header: "Records",
+        meta: { nowrap: true },
         cell: ({ row }) => number(row.original.records),
       },
       {
         id: "activityFrom",
         accessorKey: "activityFrom",
         header: "Activity from",
+        meta: { nowrap: true },
         cell: ({ row }) => date(row.original.activityFrom),
       },
       {
         id: "activityTo",
         accessorKey: "activityTo",
         header: "Activity to",
+        meta: { nowrap: true },
         cell: ({ row }) => date(row.original.activityTo),
       },
       {
         id: "latestSnapshotAsOf",
         accessorKey: "latestSnapshotAsOf",
         header: "Latest snapshot",
+        meta: { nowrap: true },
         cell: ({ row }) => date(row.original.latestSnapshotAsOf),
       },
       {
         id: "openReviews",
         accessorKey: "openReviews",
         header: "Open reviews",
+        meta: { nowrap: true },
         cell: ({ row }) => number(row.original.openReviews),
       },
       {
@@ -147,6 +154,7 @@ export function InstitutionsTable({
         </div>
       ) : null}
       <DataTable
+        id="admin-institutions"
         data={data.institutions}
         columns={columns}
         getSubRows={(row) => row.children}

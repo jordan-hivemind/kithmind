@@ -15,7 +15,7 @@
 
 import { useQueryClient } from "@tanstack/react-query";
 import type { ColumnDef } from "@tanstack/react-table";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { WorkerHeartbeatStatus } from "@/components/kith-worker-heartbeat-status";
 import {
@@ -249,6 +249,7 @@ function ApiKeysSection({ data }: { data: SettingsData }) {
         id: "spaces",
         accessorFn: (row) => row.spaceIds.length,
         header: "Spaces",
+        meta: { nowrap: true },
         cell: ({ row }) => (
           <Detail
             label={<span className="tabular-nums">{row.original.spaceIds.length}</span>}
@@ -262,6 +263,7 @@ function ApiKeysSection({ data }: { data: SettingsData }) {
         id: "lastUsedAt",
         accessorKey: "lastUsedAt",
         header: "Last used",
+        meta: { nowrap: true },
         cell: ({ row }) => (
           <span className="text-gray-600 tabular-nums">
             {row.original.lastUsedAt ? shortDate(row.original.lastUsedAt) : "never"}
@@ -272,6 +274,7 @@ function ApiKeysSection({ data }: { data: SettingsData }) {
         id: "createdAt",
         accessorKey: "createdAt",
         header: "Created",
+        meta: { nowrap: true },
         cell: ({ row }) => (
           <span className="text-gray-600 tabular-nums">{shortDate(row.original.createdAt)}</span>
         ),
@@ -283,7 +286,13 @@ function ApiKeysSection({ data }: { data: SettingsData }) {
   const actions = useMemo<RowAction<ApiKeyRow>[]>(
     () => [
       {
+        label: "Copy ID",
+        onSelect: (key) => void navigator.clipboard.writeText(key.id),
+        disabled: (key) => isPendingId(key.id),
+      },
+      {
         label: "Revoke",
+        danger: true,
         onSelect: (key) => revoke.mutate(key.id),
         disabled: (key) => isPendingId(key.id),
       },
@@ -327,6 +336,7 @@ function ApiKeysSection({ data }: { data: SettingsData }) {
         </Panel>
       )}
       <DataTable
+        id="settings-api-keys"
         data={data.apiKeys.page}
         columns={columns}
         actions={actions}
@@ -583,12 +593,14 @@ function SourceAccountsSection({
         id: "freshness",
         accessorFn: (row) => row.freshnessMs / 60_000,
         header: "Freshness (min)",
+        meta: { nowrap: true },
         cell: ({ getValue }) => <span className="tabular-nums">{getValue() as number}</span>,
       },
       {
         id: "status",
         accessorKey: "status",
         header: "Status",
+        meta: { nowrap: true },
         cell: ({ row }) => (
           <Tag tone={row.original.enabled ? "accent" : "neutral"}>{row.original.status}</Tag>
         ),
@@ -616,22 +628,26 @@ function SourceAccountsSection({
     [sourceAccounts],
   );
 
+  // Shared by the kebab's Edit item and clicking the row.
+  const openEdit = useCallback((account: SourceView) => {
+    if (isPendingId(account.id)) return;
+    setError("");
+    setDraft({
+      id: account.id,
+      name: account.name,
+      connector: account.connector as keyof typeof sourceKinds,
+      accountId: account.accountId,
+      spaceId: account.spaceId,
+      freshnessMinutes: String(account.freshnessMs / 60_000),
+    });
+  }, []);
+
   const actions = useMemo<RowAction<SourceView>[]>(
     () => [
       {
         label: "Edit",
         disabled: (account) => isPendingId(account.id),
-        onSelect: (account) => {
-          setError("");
-          setDraft({
-            id: account.id,
-            name: account.name,
-            connector: account.connector as keyof typeof sourceKinds,
-            accountId: account.accountId,
-            spaceId: account.spaceId,
-            freshnessMinutes: String(account.freshnessMs / 60_000),
-          });
-        },
+        onSelect: openEdit,
       },
       {
         label: "Enable or disable",
@@ -640,7 +656,7 @@ function SourceAccountsSection({
           update.mutate({ id: account.id, patch: { enabled: !account.enabled } }),
       },
     ],
-    [update],
+    [openEdit, update],
   );
 
   return (
@@ -755,9 +771,11 @@ function SourceAccountsSection({
         </Panel>
       )}
       <DataTable
+        id="settings-source-accounts"
         data={rows}
         columns={columns}
         actions={actions}
+        onRowClick={openEdit}
         filterColumns={["kind", "status"]}
         initialSorting={[{ id: "name", desc: false }]}
         searchPlaceholder="Search sources"
@@ -836,6 +854,7 @@ function ConnectSection() {
   return (
     <Section id="connect" title="Connect">
       <DataTable
+        id="settings-connect"
         data={rows}
         columns={columns}
         actions={actions}

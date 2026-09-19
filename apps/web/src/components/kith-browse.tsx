@@ -150,6 +150,7 @@ function FactsTable({
         id: "validFrom",
         accessorKey: "validFrom",
         header: "From",
+        meta: { nowrap: true },
         cell: ({ row }) => (
           <span className="text-gray-600 tabular-nums">{shortDate(row.original.validFrom)}</span>
         ),
@@ -158,6 +159,7 @@ function FactsTable({
         id: "validTo",
         accessorKey: "validTo",
         header: "Until",
+        meta: { nowrap: true },
         cell: ({ row }) => (
           <span className="text-gray-600 tabular-nums">{shortDate(row.original.validTo)}</span>
         ),
@@ -167,6 +169,7 @@ function FactsTable({
   );
   return (
     <DataTable
+      id="browse-facts"
       data={rows}
       columns={columns}
       filterColumns={["status", "core", "predicate"]}

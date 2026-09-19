@@ -78,6 +78,7 @@ export function HealthTable({ initial }: { initial: { checks: Check[] } }) {
         id: "lastCheckedAt",
         accessorKey: "lastCheckedAt",
         header: "Last checked",
+        meta: { nowrap: true },
         cell: ({ row }) => (
           <span className="tabular-nums text-gray-600">
             {when(row.original.lastCheckedAt)}
@@ -90,6 +91,7 @@ export function HealthTable({ initial }: { initial: { checks: Check[] } }) {
 
   return (
     <DataTable
+      id="admin-health"
       data={data.checks}
       columns={columns}
       filterColumns={["status"]}
