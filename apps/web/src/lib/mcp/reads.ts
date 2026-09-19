@@ -37,6 +37,7 @@ import {
   type IdentityCtx,
   listSpaces as listIdentitySpaces,
   type Principal,
+  principalMaxSensitivity,
 } from "@repo/kith-store/identity";
 
 import { resolveMcpEmbedder } from "./embedder";
@@ -707,7 +708,7 @@ export function postgresReads(withPrincipal: WithMcpPrincipal): McpReads {
         (searchMode ?? "hybrid") === "hybrid"
           ? await prepareEmbedQuery(withPrincipal, spaceIds, args.query, gate)
           : undefined;
-      return await read(async ({ ctx, spaces }) => {
+      return await read(async ({ ctx, principal, spaces }) => {
         const authorized = await spaces(spaceIds);
         gate(authorized);
         let semantic:
@@ -738,16 +739,22 @@ export function postgresReads(withPrincipal: WithMcpPrincipal): McpReads {
           authorized,
           args,
           semantic,
+          // SENS-1. The ceiling comes off the principal this transaction just
+          // reloaded, never off anything the caller sent. For every credential
+          // the owner has not narrowed this is `restricted`, and the store
+          // returns everything without issuing an extra query.
+          principalMaxSensitivity(principal),
         );
       });
     },
     async getDocument({ spaceIds, documentId, includeHistorical }) {
-      return await read(async ({ ctx, spaces }) =>
+      return await read(async ({ ctx, principal, spaces }) =>
         documents.getDocument(
           ctx.client,
           await spaces(spaceIds),
           documentId,
           includeHistorical,
+          principalMaxSensitivity(principal),
         ),
       );
     },

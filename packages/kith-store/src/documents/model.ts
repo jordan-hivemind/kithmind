@@ -43,6 +43,12 @@ import {
   parseSourceTextRepresentation,
 } from "../provenance/representations.js";
 import { loadProviderOriginalReference } from "../provenance/providerOriginals.js";
+import {
+  applyCeiling,
+  documentSensitivity,
+  type SensitivityLevel,
+  withinCeiling,
+} from "../sensitivity/model.js";
 import { spacePredicate } from "../spaces.js";
 import { keywordSearchSql } from "../textSearch.js";
 import { camelizeSourceAccount } from "../workers/rows.js";
@@ -559,11 +565,19 @@ export async function searchDocuments(
     /** Chunk targets the active fingerprint still owes (D3 B). */
     coverageIncomplete?: boolean;
   },
+  /**
+   * SENS-1. The reading credential's ceiling. Omitted, or `restricted`, means
+   * no withholding at all and costs not one extra query -- which is the state
+   * every one of the owner's credentials is in unless he narrowed it himself.
+   */
+  ceiling: SensitivityLevel = "restricted",
 ): Promise<{
   results: SearchDocumentsResult[];
   vectorStatus: "ready" | "unavailable";
   partial: boolean;
   truncated: boolean;
+  /** How many hits this credential's ceiling hid. Always 0 on the default. */
+  withheld: number;
 }> {
   validateSpaces(spaceIds);
   validateTimeRange(args.from, args.to);
@@ -713,12 +727,17 @@ export async function searchDocuments(
       citationsTruncated: citationResult.citationsTruncated,
     });
   }
-  const truncated = results.length > limit;
+  // SENS-1. Before the limit slice, so `withheld` counts what the ceiling hid
+  // rather than what the page happened to cut, and so a page is not left short
+  // by rows removed after it was filled.
+  const gated = await applyCeiling(client, results, (hit) => hit.documentId, ceiling);
+  const truncated = gated.visible.length > limit;
   return {
-    results: results.slice(0, limit),
+    results: gated.visible.slice(0, limit),
     vectorStatus: semanticReady ? "ready" : "unavailable",
     partial: candidateOverflow || citationPartial || (semanticReady && semantic?.coverageIncomplete === true),
     truncated,
+    withheld: gated.withheld,
   };
 }
 
@@ -782,12 +801,23 @@ export async function getDocument(
   spaceIds: readonly string[],
   documentId: string,
   includeHistorical = false,
+  /** SENS-1. See `searchDocuments`; the default withholds nothing. */
+  ceiling: SensitivityLevel = "restricted",
 ): Promise<GetDocumentResult | null> {
   validateSpaces(spaceIds);
   const document = await getRow(client, "documents", documentId, camelizeDocument);
   if (!document) return null;
   const chain = await loadReadableDocument(client, document, new Set(spaceIds), includeHistorical);
   if (!chain) return null;
+  // SENS-1. `null`, exactly as an unreadable space gives, rather than a
+  // distinct "above your ceiling" error: a narrowed credential should not be
+  // able to probe which document ids exist above its own ceiling. The space
+  // check above already answers `null` for the same reason.
+  if (ceiling !== "restricted") {
+    const levels = await documentSensitivity(client, [document.id]);
+    const level = levels.get(document.id) ?? "normal";
+    if (!withinCeiling(level, ceiling)) return null;
+  }
   const pageResult = await client.query<QueryResultRow>(
     `SELECT * FROM kith.source_pages WHERE source_text_version_id = $1 LIMIT $2`,
     [chain.textVersion.id, MAX_PAGES + 1],

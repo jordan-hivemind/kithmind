@@ -76,11 +76,19 @@ export function readAuthorizeRequest(
  */
 export function submitConsent(
   request: AuthorizeRequest,
-  grant: { spaceIds: readonly string[]; capabilities: readonly string[] },
+  grant: {
+    spaceIds: readonly string[];
+    capabilities: readonly string[];
+    /** SENS-1. Omitted is `restricted`: no withholding. */
+    maxSensitivity?: string;
+  },
 ): Promise<string> {
   return submitDecision(request, {
     spaceIds: grant.spaceIds,
     capabilities: grant.capabilities,
+    ...(grant.maxSensitivity === undefined
+      ? {}
+      : { maxSensitivity: grant.maxSensitivity }),
   });
 }
 

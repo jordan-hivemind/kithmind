@@ -39,6 +39,7 @@ import {
 } from "./authorization.js";
 import { at, exec, row, rows, type IdentityCtx } from "./db.js";
 import { IdentityError, notAuthenticated } from "./errors.js";
+import type { SensitivityLevel } from "../sensitivity/model.js";
 
 export type ApiKeySummary = {
   id: string;
@@ -48,6 +49,7 @@ export type ApiKeySummary = {
   lastUsedAt: number | null;
   capabilities: readonly Capability[];
   spaceIds: readonly string[];
+  maxSensitivity: SensitivityLevel;
   sourceAccountIds: readonly string[];
 };
 
@@ -71,6 +73,7 @@ function summarize(key: ApiKeyRecord): ApiKeySummary {
     lastUsedAt: key.lastUsedAt,
     capabilities: key.capabilities,
     spaceIds: key.spaceIds,
+    maxSensitivity: key.maxSensitivity,
     sourceAccountIds: key.sourceAccountIds,
   };
 }
@@ -379,6 +382,8 @@ export async function create(
     capabilities: readonly Capability[];
     spaceIds: readonly string[];
     sourceAccountIds?: readonly string[];
+    /** SENS-1. Absent is `restricted`: the key withholds nothing. */
+    maxSensitivity?: SensitivityLevel;
   },
 ): Promise<{ id: string; rawKey: string }> {
   const { principal } = args;
@@ -397,8 +402,8 @@ export async function create(
   await exec(
     ctx,
     `INSERT INTO kith.api_keys
-       (id, user_id, key_hash, key_prefix, name, capabilities)
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
+       (id, user_id, key_hash, key_prefix, name, capabilities, max_sensitivity)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)`,
     [
       id,
       principal.userId,
@@ -406,6 +411,7 @@ export async function create(
       rawKey.slice(0, 11),
       args.name,
       JSON.stringify([...args.capabilities]),
+      args.maxSensitivity ?? "restricted",
     ],
   );
   await replaceGrants(ctx, id, args.spaceIds, args.sourceAccountIds ?? []);
