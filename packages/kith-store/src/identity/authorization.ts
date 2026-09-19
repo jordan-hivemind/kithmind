@@ -26,6 +26,11 @@
 //     error comes back.
 
 import { assertKithId, newKithId } from "../ids.js";
+import {
+  DEFAULT_MAX_SENSITIVITY,
+  readLevel,
+  type SensitivityLevel,
+} from "../sensitivity/model.js";
 import { spacePredicate } from "../spaces.js";
 import { at, exec, ms, row, rows, type IdentityCtx } from "./db.js";
 import {
@@ -51,6 +56,16 @@ export type Principal = {
   capabilities: readonly Capability[];
   credentialSpaceIds?: readonly string[];
   credentialSourceAccountIds?: readonly string[];
+  /**
+   * SENS-1. The highest sensitivity level this credential may read.
+   *
+   * Absent means unnarrowed, which is what a web session always is: the owner
+   * signed in reads everything, and the ceiling exists only so he can hand a
+   * deliberately narrowed credential to a tool he trusts less. An API key or
+   * OAuth grant carries `restricted` unless he lowered it on the form, so
+   * absent and `restricted` mean the same thing and both mean "no withholding".
+   */
+  maxSensitivity?: SensitivityLevel;
 };
 
 export type PrincipalRef = {
@@ -83,6 +98,20 @@ const ROLES = new Set<string>(["owner", "editor", "reader"]);
 /** A web session's principal: the user's own authority, unnarrowed. */
 export function webPrincipal(userId: string): Principal {
   return { userId, capabilities: ALL_CAPABILITIES };
+}
+
+/**
+ * This principal's sensitivity ceiling (SENS-1).
+ *
+ * The single place the default is applied, so "no ceiling recorded" cannot mean
+ * different things in different callers. A web session has none and gets
+ * `restricted`: the owner signed into his own archive is never narrowed by
+ * this feature, which is the point of the whole design.
+ */
+export function principalMaxSensitivity(
+  principal: Principal,
+): SensitivityLevel {
+  return principal.maxSensitivity ?? DEFAULT_MAX_SENSITIVITY;
 }
 
 export function principalRef(principal: Principal): PrincipalRef {
@@ -151,6 +180,9 @@ export type ApiKeyRecord = {
   oauthGrantExpiresAt: number | null;
   oauthPreparationExpiresAt: number | null;
   oauthPreparationNonce: string | null;
+  /** SENS-1: the highest level this credential may read. `restricted` is the
+   * column default and means no withholding. */
+  maxSensitivity: SensitivityLevel;
 };
 
 type ApiKeyRow = {
@@ -173,6 +205,7 @@ type ApiKeyRow = {
   oauth_grant_expires_at: Date | null;
   oauth_preparation_expires_at: Date | null;
   oauth_preparation_nonce: string | null;
+  max_sensitivity: string | null;
 };
 
 /**
@@ -201,7 +234,7 @@ const API_KEY_SELECT = `
          k.oauth_lifecycle, k.oauth_request_hash, k.oauth_code_hash,
          k.oauth_binding_hash, k.oauth_binding_seed_hash, k.oauth_encrypted_code,
          k.oauth_grant_expires_at, k.oauth_preparation_expires_at,
-         k.oauth_preparation_nonce
+         k.oauth_preparation_nonce, k.max_sensitivity
     FROM kith.api_keys k`;
 
 export function toApiKey(record: ApiKeyRow): ApiKeyRecord {
@@ -245,6 +278,12 @@ export function toApiKey(record: ApiKeyRow): ApiKeyRecord {
     oauthGrantExpiresAt: ms(record.oauth_grant_expires_at),
     oauthPreparationExpiresAt: ms(record.oauth_preparation_expires_at),
     oauthPreparationNonce: record.oauth_preparation_nonce,
+    // SENS-1. Falls back to `restricted`, not to `normal`: an absent or
+    // unreadable value must mean "the owner narrowed nothing", because the
+    // alternative silently hides his own documents from his own key. The column
+    // is NOT NULL with a CHECK, so this only fires for a row written by a build
+    // older than migration 029.
+    maxSensitivity: readLevel(record.max_sensitivity, "restricted"),
   };
 }
 
@@ -327,6 +366,11 @@ export function principalFromApiKey(
     capabilities: unique(key.capabilities),
     credentialSpaceIds: unique(key.spaceIds),
     credentialSourceAccountIds: unique(key.sourceAccountIds),
+    // SENS-1. Carried on the principal, which `reloadPrincipal` rebuilds inside
+    // every call's own transaction, so lowering a key's ceiling takes effect on
+    // the next tool call rather than at the end of the session -- the same
+    // reload rule that already governs capabilities and space grants.
+    maxSensitivity: key.maxSensitivity,
   };
 }
 

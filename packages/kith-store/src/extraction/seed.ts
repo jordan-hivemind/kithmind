@@ -26,6 +26,7 @@ import type {
 } from "../admin/model.js";
 import { newKithId } from "../ids.js";
 import { exec, row, type DeferredCtx } from "../deferred/core.js";
+import type { SensitivityLevel } from "../sensitivity/model.js";
 
 export type SeedField = {
   name: string;
@@ -40,6 +41,8 @@ export type SeedDocumentType = {
   area: string;
   description: string;
   guidance: string;
+  /** SENS-1. Omitted is `normal`. */
+  sensitivity?: SensitivityLevel;
   fields: readonly SeedField[];
 };
 
@@ -84,6 +87,7 @@ const required = (field: SeedField): SeedField => ({ ...field, required: true })
 export const STARTER_DOCUMENT_TYPES: readonly SeedDocumentType[] = [
   {
     kind: "investment_agreement",
+    sensitivity: "sensitive",
     area: "finance",
     description:
       "A subscription agreement, SAFE, or convertible note for an investment.",
@@ -103,6 +107,7 @@ export const STARTER_DOCUMENT_TYPES: readonly SeedDocumentType[] = [
   },
   {
     kind: "capital_call_notice",
+    sensitivity: "sensitive",
     area: "finance",
     description: "A fund's notice that a portion of a commitment is now due.",
     guidance:
@@ -119,6 +124,7 @@ export const STARTER_DOCUMENT_TYPES: readonly SeedDocumentType[] = [
   },
   {
     kind: "distribution_notice",
+    sensitivity: "sensitive",
     area: "finance",
     description: "A fund's notice that capital or proceeds are being returned.",
     guidance:
@@ -134,6 +140,7 @@ export const STARTER_DOCUMENT_TYPES: readonly SeedDocumentType[] = [
   },
   {
     kind: "schedule_k1",
+    sensitivity: "restricted",
     area: "tax",
     description: "A Schedule K-1 reporting a partner's share for a tax year.",
     guidance:
@@ -154,6 +161,7 @@ export const STARTER_DOCUMENT_TYPES: readonly SeedDocumentType[] = [
   },
   {
     kind: "brokerage_statement",
+    sensitivity: "sensitive",
     area: "finance",
     description: "A periodic statement from a brokerage or bank account.",
     guidance:
@@ -170,6 +178,7 @@ export const STARTER_DOCUMENT_TYPES: readonly SeedDocumentType[] = [
   },
   {
     kind: "credit_card_statement",
+    sensitivity: "sensitive",
     area: "finance",
     description: "A periodic credit card statement.",
     guidance:
@@ -249,6 +258,7 @@ export const STARTER_DOCUMENT_TYPES: readonly SeedDocumentType[] = [
   },
   {
     kind: "medical_visit_summary",
+    sensitivity: "sensitive",
     area: "health",
     description: "A summary of a clinical visit.",
     guidance:
@@ -265,6 +275,7 @@ export const STARTER_DOCUMENT_TYPES: readonly SeedDocumentType[] = [
   },
   {
     kind: "lab_result",
+    sensitivity: "sensitive",
     area: "health",
     description: "A laboratory result report.",
     guidance:
@@ -280,6 +291,7 @@ export const STARTER_DOCUMENT_TYPES: readonly SeedDocumentType[] = [
   },
   {
     kind: "explanation_of_benefits",
+    sensitivity: "sensitive",
     area: "health",
     description: "An insurer's explanation of benefits for a claim.",
     guidance:
@@ -369,9 +381,18 @@ export async function seedDocumentTypes(
     await exec(
       ctx,
       `INSERT INTO kith.document_types
-         (id, space_id, kind, description, area, guidance, version, active)
-       VALUES ($1,$2,$3,$4,$5,$6,1,true)`,
-      [id, spaceId, type.kind, type.description, type.area, type.guidance],
+         (id, space_id, kind, description, area, guidance, version, active,
+          sensitivity)
+       VALUES ($1,$2,$3,$4,$5,$6,1,true,$7)`,
+      [
+        id,
+        spaceId,
+        type.kind,
+        type.description,
+        type.area,
+        type.guidance,
+        type.sensitivity ?? "normal",
+      ],
     );
     for (const field of type.fields) {
       await exec(
